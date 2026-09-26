@@ -143,6 +143,12 @@ class VacuumOptions:
     fragmentation_threshold: float
     """Minimum fragmentation ratio [0.0, 1.0] for a file to be eligible."""
 
+    retain_after: int
+    """Keep entries above this sequence even when dead, so ``changes_since``
+    from any sequence >= *retain_after* stays complete. Set by the
+    replication service to the lowest ``durable_sequence()`` among its
+    followers; -1, the default, means no restriction."""
+
     def __init__(self) -> None: ...
 
 # ---------------------------------------------------------------------------

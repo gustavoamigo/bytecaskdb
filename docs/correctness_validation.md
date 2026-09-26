@@ -1027,7 +1027,7 @@ ManifestFailureClass). The scenario matrix is defined in
 | `mixed_sync_nosync` | — | No | Yes | changes_since yields only entries up to durable_sequence; unsync'd entries excluded |
 | `nosync_only` | 256 | No | Yes | Entries replicable only after rotation triggers fdatasync; replication lag bounded by max_file_bytes |
 | `nosync_then_sync` | — | No | Yes | The sync's fdatasync covers all prior nosync entries; durable_sequence catches up |
-| `vacuumed_batches` | 256 | Yes | No | changes_since over vacuumed file yields BulkBegin/BulkEnd markers; ingest writes atomically |
+| `vacuumed_batches` | 256 | Yes | No | changes_since over vacuumed file yields BulkBegin/BulkEnd markers; ingest writes atomically. The follower is seeded with the history up to a point, and the leader vacuums with `retain_after` there, as a replication service would |
 
 #### Ops shapes
 

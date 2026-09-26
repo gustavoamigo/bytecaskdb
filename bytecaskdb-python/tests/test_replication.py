@@ -217,3 +217,25 @@ def test_entry_type_enum_values():
 def test_mode_enum_values():
     assert bc.Mode.Leader is not None
     assert bc.Mode.Follower is not None
+
+
+def test_vacuum_retain_after_keeps_history(tmp_path):
+    opts = bc.Options()
+    opts.max_file_bytes = 128
+    db = bc.DB.open(str(tmp_path / "retained"), opts)
+    vopts = bc.VacuumOptions()
+    assert vopts.retain_after == -1  # no restriction by default
+    for i in range(10):
+        db.put(f"k{i}".encode(), b"old")
+    retain = db.durable_sequence()
+    for i in range(10):
+        db.put(f"k{i}".encode(), b"new")
+    vopts.fragmentation_threshold = 0.0
+    vopts.retain_after = retain
+    while db.vacuum(vopts):
+        pass
+    snap = db.snapshot()
+    seqs = [e.sequence for e in db.changes_since(snap, retain)]
+    assert seqs == list(range(retain + 1, db.durable_sequence() + 1))
+    with pytest.raises(ValueError):
+        vopts.retain_after = -2

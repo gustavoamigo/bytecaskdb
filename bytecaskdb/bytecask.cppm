@@ -80,11 +80,25 @@ export using BytesView = std::span<const std::byte>;
 // ---------------------------------------------------------------------------
 // VacuumOptions — controls vacuum file selection.
 // ---------------------------------------------------------------------------
+// VacuumOptions::retain_after value meaning no restriction: -1 as an
+// unsigned sequence, above every sequence the engine assigns.
+export inline constexpr std::uint64_t kNoRetention =
+    std::numeric_limits<std::uint64_t>::max();
+
 export struct VacuumOptions {
   // Minimum fragmentation ratio a sealed file must exceed to be eligible for
   // vacuum: 1 − (live + tombstone + marker bytes) / total bytes, the share
   // of dead Puts compaction is sure to reclaim. Range [0.0, 1.0].
   double fragmentation_threshold{0.5};
+  // Entries with a sequence above this are kept even when dead: a dead Put
+  // or a tombstone vacuum could otherwise drop is copied into the compacted
+  // file, and a file holding one is never removed whole. changes_since from
+  // any sequence >= retain_after then still yields the complete history.
+  // Vacuum has to be coordinated with replication: the replication service
+  // passes the lowest durable_sequence() among the followers it counts on,
+  // on every node, since a follower can become leader. kNoRetention (-1),
+  // the default, means no restriction.
+  std::uint64_t retain_after{kNoRetention};
 };
 
 
@@ -1189,8 +1203,8 @@ private:
   static auto vacuum_scan_and_copy(
       const std::shared_ptr<const EngineState> &snap,
       const DataFile &source_file, WritableDataFile &dest_file,
-      std::uint32_t source_file_id, const NeededTombstones &needed)
-      -> VacuumScanResult;
+      std::uint32_t source_file_id, const NeededTombstones &needed,
+      std::uint64_t retain_after) -> VacuumScanResult;
   // Remaps key_dir entries, updates file registry, publishes new state. Caller must hold write_mu_.
   void vacuum_commit(std::uint32_t old_file_id, const VacuumScanResult &scan,
                      std::shared_ptr<DataFile> new_sealed_file,
@@ -1199,7 +1213,8 @@ private:
   void vacuum_unlink_old_file(const std::shared_ptr<const EngineState> &snap,
                               std::uint32_t file_id);
   // Rewrites a sealed file into a new sealed file containing only live entries.
-  [[nodiscard]] auto vacuum_compact_file(std::uint32_t file_id) -> bool;
+  [[nodiscard]] auto vacuum_compact_file(std::uint32_t file_id,
+                                         std::uint64_t retain_after) -> bool;
   // Appends live entries from a sealed file into the active file, then removes the sealed file.
   void vacuum_remove_file(std::uint32_t file_id);
 
@@ -3299,39 +3314,40 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
     active_id = s->active_file_id;
   }
 
-  // Find the highest-fragmentation sealed file above threshold. Tombstones
-  // and batch markers count as kept, not as fragmentation: a file is
-  // compacted for its dead Puts, so a file holding nothing else has nothing
-  // to reclaim.
-  std::uint32_t target_id{};
-  double worst_frag = 0.0;
+  // Sealed files above the threshold, most fragmented first. Tombstones and
+  // batch markers count as kept, not as fragmentation: a file is compacted
+  // for its dead Puts, so a file holding nothing else has nothing to
+  // reclaim. Nor has a file whose every entry is above retain_after.
+  std::vector<std::pair<double, std::uint32_t>> candidates;
   for (const auto [fid, fs] : stats_snap) {
     if (fid == active_id) continue;
     if (fs.total_bytes == 0) continue;
+    if (fs.min_sequence > opts.retain_after) continue;
     const auto frag = static_cast<double>(fs.reclaimable_bytes()) /
                       static_cast<double>(fs.total_bytes);
-    if (frag > worst_frag && frag > opts.fragmentation_threshold) {
-      worst_frag = frag;
-      target_id = fid;
+    if (frag > 0.0 && frag > opts.fragmentation_threshold)
+      candidates.emplace_back(frag, fid);
+  }
+  std::ranges::sort(candidates, std::greater<>{});
+
+  for (const auto &[frag, fid] : candidates) {
+    const auto &target = *stats_snap.get(fid);
+    // Fast path: nothing in the file needs keeping — skip the scan and drop
+    // it. A tombstone may need keeping even with no live key left: dropping
+    // it could let recovery resurrect a Put it shadows in an older file, and
+    // only compaction decides which tombstones can go. Nor may a file go
+    // whole while it holds an entry above retain_after.
+    if (target.live_bytes == 0 && target.tombstone_bytes == 0 &&
+        target.max_sequence <= opts.retain_after) {
+      vacuum_remove_file(fid);
+      return true;
     }
+    // Compaction returns false when it cannot make the file smaller: every
+    // dead entry in it may be above retain_after. The next candidate may
+    // still have something to reclaim.
+    if (vacuum_compact_file(fid, opts.retain_after)) return true;
   }
-
-  if (target_id == 0 && worst_frag == 0.0) return false;
-
-  const auto &target = *stats_snap.get(target_id);
-
-  // Fast path: nothing in the file needs keeping — skip the scan and drop it.
-  // A tombstone may need keeping even with no live key left: dropping it
-  // could let recovery resurrect a Put it shadows in an older file, and only
-  // compaction decides which tombstones can go.
-  if (target.live_bytes == 0 && target.tombstone_bytes == 0) {
-    vacuum_remove_file(target_id);
-    return true;
-  }
-
-  // All other files are compacted (sealed→sealed). Returns false when the
-  // scan finds nothing to reclaim.
-  return vacuum_compact_file(target_id);
+  return false;
 }
 
 #pragma endregion
@@ -3550,8 +3566,8 @@ void DB::flush_hints() {
 auto DB::vacuum_scan_and_copy(
     const std::shared_ptr<const EngineState> &snap,
     const DataFile &source_file, WritableDataFile &dest_file,
-    std::uint32_t source_file_id, const NeededTombstones &needed)
-    -> VacuumScanResult {
+    std::uint32_t source_file_id, const NeededTombstones &needed,
+    std::uint64_t retain_after) -> VacuumScanResult {
   VacuumScanResult result;
 
   auto track_seq = [&](std::uint64_t seq) {
@@ -3578,13 +3594,21 @@ auto DB::vacuum_scan_and_copy(
         result.mappings.push_back({std::vector<std::byte>{entry.key.begin(),
                                                           entry.key.end()},
                                    new_off, entry.sequence, val_size});
+      } else if (entry.sequence > retain_after) {
+        // Dead, but a follower may still need it: kept as history. It is
+        // counted in total_bytes and not in live_bytes, so it stays
+        // reclaimable for a later vacuum that may drop it.
+        std::ignore = dest_file.append_entry(entry.sequence, EntryType::Put,
+                                             entry.key, entry.value);
+        result.total_bytes += entry_size(entry.key.size(), entry.value.size());
+        track_seq(entry.sequence);
       }
       break;
     }
     case EntryType::Delete:
     case EntryType::RangeDel: {
       // A tombstone no older Put in another file needs goes with its file.
-      if (needed.droppable(entry.sequence)) {
+      if (entry.sequence <= retain_after && needed.droppable(entry.sequence)) {
         ++result.tombstones_dropped;
         break;
       }
@@ -3657,7 +3681,8 @@ void DB::vacuum_unlink_old_file(
 // not write_mu_.
 // The new data file is written to .data.tmp, then renamed atomically.
 // The old file is deferred for cleanup when no readers reference it.
-auto DB::vacuum_compact_file(std::uint32_t file_id) -> bool {
+auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
+    -> bool {
   auto snap = load_state_for_write();
   const auto &old_file = **snap->files.get(file_id);
 
@@ -3674,7 +3699,7 @@ auto DB::vacuum_compact_file(std::uint32_t file_id) -> bool {
         dir_, stem, ".data.tmp", rotation_threshold_,
         stagingBackend(io_backend_));
     scan = vacuum_scan_and_copy(snap, old_file, *tmp_file, file_id,
-                                needed_tombstones_);
+                                needed_tombstones_, retain_after);
     tmp_file->sync();
     tmp_file->shrink_to_fit();
   }

@@ -20,7 +20,7 @@ on:
         description: "Rounds per job (three histories each)"
         default: "4"
       cluster_rounds:
-        description: "Cluster rounds per job (two histories each)"
+        description: "Cluster rounds per job (three histories each)"
         default: "8"
       topology_rounds:
         description: "Topology rounds per job (two histories each)"
@@ -130,9 +130,9 @@ jobs:
           python3 scripts/run_isolation_check.py $ARGS
 
       # Leader plus two followers through bootstrap and tailing
-      # (docs/replication_checking_design.md). cluster-vacuum must detect
-      # #168 at least once per run; it does in about half the rounds, so the
-      # run is longer than the single-node one.
+      # (docs/replication_checking_design.md). cluster-vacuum vacuums with
+      # retain_after and must pass; cluster-vacuum-unretained must detect
+      # #168 at least once per run.
       - name: Run cluster check
         env:
           ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}

@@ -32,6 +32,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -76,7 +77,7 @@ auto to_module(const bytecask::internal::ReadOptions& o) noexcept -> bytecask::R
 }
 
 auto to_module(bytecask::internal::VacuumOptions o) noexcept -> bytecask::VacuumOptions {
-  return {o.fragmentation_threshold};
+  return {o.fragmentation_threshold, o.retain_after};
 }
 
 auto to_module(bytecask::internal::IoBackend b) noexcept -> bytecask::IoBackend {

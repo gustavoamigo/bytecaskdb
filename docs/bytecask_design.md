@@ -686,10 +686,10 @@ Deleting C is safe on exactly what step 2 checks: everything in C is also in S. 
 The public `vacuum()` method orchestrates file selection and dispatches to exactly one primitive:
 
 1. **Acquire `vacuum_mu_`** — prevents two `vacuum()` calls from running concurrently.
-2. **Select a target file** — copy `file_stats_` under a brief `write_mu_` acquisition (O(sealed files), then release). Iterate sealed files, compute `fragmentation` (see **Fragmentation**; O(1) per file, no I/O), pick the highest-fragmentation sealed file above `fragmentation_threshold`. If no file qualifies, return immediately.
-3. **Branch**:
-   - If `file_stats_[target].live_bytes == 0` and `tombstone_bytes == 0` → call `vacuum_remove_file(target)` (fast path, no I/O).
-   - Otherwise → call `vacuum_compact_file(target)` (sealed→sealed compaction).
+2. **Order the candidates** — copy `file_stats_` under a brief `write_mu_` acquisition (O(sealed files), then release). Iterate sealed files, compute `fragmentation` (see **Fragmentation**; O(1) per file, no I/O), and keep those above `fragmentation_threshold`, most fragmented first. A file whose `min_sequence` is above `retain_after` is left out: everything in it is kept (see **Retention**). If no file qualifies, return immediately.
+3. **Branch**, for each candidate in turn:
+   - If `live_bytes == 0`, `tombstone_bytes == 0` and `max_sequence <= retain_after` → call `vacuum_remove_file(target)` (fast path, no I/O) and return.
+   - Otherwise → call `vacuum_compact_file(target)` (sealed→sealed compaction). If it made the file smaller, return; if not (every dead entry in it may be above `retain_after`), try the next candidate. Every `true` still removes bytes, so a `while (vacuum(...))` loop terminates.
 4. **Release `vacuum_mu_`**.
 
 #### Tombstone handling
@@ -718,7 +718,22 @@ Every entry has its own sequence, so a sequence names one tombstone exactly: the
 
 The original sequence number of every copied tombstone is preserved verbatim so recovery's sequence comparison still works correctly on the compacted file.
 
-**Replication.** A dropped tombstone is no longer in the `changes_since` stream, the same way a dropped dead Put is not. A follower that already holds `Put(K)` and resumes from a sequence before the delete does not learn about it. `changes_since` has no lower bound on how far back it can resume (#168).
+**Replication.** A dropped tombstone is no longer in the `changes_since` stream, the same way a dropped dead Put is not. A follower that already holds `Put(K)` and resumed from a sequence before the delete would never learn about it. Retention prevents that (next section).
+
+#### Retention
+
+Vacuum removes history, and a follower resuming `changes_since` below what it removed would get a stream with gaps: a batch missing its dead Puts, a delete it never sees (#168). Whether a follower still needs that history is a replication decision, not a storage one: only the replication service knows which followers count and where they are. So the engine takes the decision as an argument and keeps no state for it.
+
+`VacuumOptions::retain_after` is a sequence. Vacuum drops nothing above it:
+
+- A dead Put above it is copied into the compacted file instead of dropped. It is counted in `total_bytes` and not in `live_bytes`, so it stays reclaimable, and a later vacuum with a higher `retain_after` drops it. It has no key-directory mapping; recovery resolves it by sequence like any overwritten Put.
+- A tombstone above it is kept even when recovery marked it droppable.
+- A file is removed whole only when its `max_sequence` is at or below it; a file whose `min_sequence` is above it is not a candidate.
+- Batch markers are always kept, as before.
+
+`changes_since(snap, from)` is then complete for any `from >= retain_after` of every vacuum since `from`. The replication service passes the lowest `durable_sequence()` among the followers it counts on, on every node, since a follower can become leader, and counts a node it is bootstrapping from the manifest's `through_sequence` on. A follower it leaves out has to be re-bootstrapped. The default, `kNoRetention` (−1 as an unsigned sequence), restricts nothing, so a single-node database vacuums as before.
+
+The alternative was an engine-side record of the highest sequence vacuum dropped, with `changes_since` refusing to resume below it. It detects the gap but decides availability on its own: a follower below the record has to re-bootstrap, and a node bootstrapped from copied files, which lack the record, has to assume the worst and push every follower behind it into a re-bootstrap at once. Retention avoids the gap instead of reporting it.
 
 #### Space accounting
 

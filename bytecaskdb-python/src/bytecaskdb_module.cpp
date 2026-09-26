@@ -459,7 +459,25 @@ NB_MODULE(_bytecaskdb, m) {
       .def(nb::init<>())
       .def_rw("fragmentation_threshold",
               &bytecask::VacuumOptions::fragmentation_threshold,
-              "Minimum fragmentation ratio for a file to be eligible.");
+              "Minimum fragmentation ratio for a file to be eligible.")
+      .def_prop_rw(
+          "retain_after",
+          [](const bytecask::VacuumOptions &o) -> std::int64_t {
+            return o.retain_after == bytecask::kNoRetention
+                       ? -1
+                       : static_cast<std::int64_t>(o.retain_after);
+          },
+          [](bytecask::VacuumOptions &o, std::int64_t v) {
+            if (v < -1)
+              throw std::invalid_argument{
+                  "retain_after must be a sequence, or -1 for no restriction"};
+            o.retain_after = v == -1 ? bytecask::kNoRetention
+                                     : static_cast<std::uint64_t>(v);
+          },
+          "Keep entries above this sequence even when dead, so "
+          "changes_since from any sequence >= retain_after stays "
+          "complete. Set by the replication service; -1, the default, "
+          "means no restriction.");
 
   // -------------------------------------------------------------------------
   // Iterators

@@ -3694,7 +3694,14 @@ TEST_CASE("Vacuum model-based: dropping tombstones never resurrects a key",
         constexpr std::array kThresholds{0.3, 0.5, 0.7};
         const auto threshold =
             kThresholds[static_cast<std::size_t>(pick(0, 2))];
-        std::ignore = db.vacuum({.fragmentation_threshold = threshold});
+        // Half the passes keep history above a random point, as a
+        // replication service would: dead entries above it stay on disk.
+        const auto retain =
+            pick(0, 1) == 0
+                ? std::numeric_limits<std::uint64_t>::max()
+                : db.durable_sequence() * static_cast<std::uint64_t>(pick(0, 100)) / 100;
+        std::ignore = db.vacuum(
+            {.fragmentation_threshold = threshold, .retain_after = retain});
         verify(db, std::format("session {} op {}", session, op));
       }
     }
@@ -3706,6 +3713,88 @@ TEST_CASE("Vacuum model-based: dropping tombstones never resurrects a key",
   }
   // The test proves nothing unless tombstones were actually dropped.
   CHECK(dropped > 0);
+}
+
+// The replication contract of retain_after: a follower that resumes
+// changes_since from its own durable_sequence() converges with the leader,
+// as long as every vacuum kept what lies above that point — across leader
+// restarts, with dead Puts, tombstones, range deletes and batches in the
+// history.
+TEST_CASE("Vacuum model-based: a follower resuming at retain_after converges",
+          "[vacuum][replication][model]") {
+  std::mt19937 gen(19316);
+  auto pick = [&](int lo, int hi) {
+    return std::uniform_int_distribution<int>(lo, hi)(gen);
+  };
+  constexpr int kKeys = 120;
+  auto key_at = [](int i) { return std::format("k{:03d}", i); };
+  auto rand_value = [&] {
+    return std::string(static_cast<std::size_t>(pick(1, 200)), 'v') +
+           std::to_string(pick(0, 999));
+  };
+
+  TempDir td;
+  auto follower = bytecask::DB::open(
+      td.path / "follower", {.max_file_bytes = 2048,
+                             .initial_mode = bytecask::Mode::Follower});
+  auto catch_up = [&](bytecask::DB &leader) {
+    auto snap = leader.snapshot();
+    std::vector<bytecask::DataEntry> owned;
+    for (const auto &e : leader.changes_since(snap, follower.durable_sequence()))
+      owned.push_back({e.sequence, e.entry_type,
+                       {e.key.begin(), e.key.end()},
+                       {e.value.begin(), e.value.end()}});
+    std::vector<bytecask::DataEntryView> views;
+    for (const auto &e : owned)
+      views.push_back({e.sequence, e.entry_type, e.key, e.value});
+    if (!views.empty()) follower.ingest(views);
+    CHECK(follower.durable_sequence() == leader.durable_sequence());
+    CHECK(collect_kv(follower) == collect_kv(leader));
+  };
+
+  std::int64_t reclaimed = 0;
+  for (int session = 0; session < 10; ++session) {
+    auto leader = bytecask::DB::open(td.path / "leader",
+                                     {.max_file_bytes = 2048});
+    for (int op = 0; op < 120; ++op) {
+      const auto r = pick(0, 99);
+      if (r < 50) {
+        leader.put({}, to_bytes(key_at(pick(0, kKeys - 1))),
+                   to_bytes(rand_value()));
+      } else if (r < 75) {
+        std::ignore = leader.del({}, to_bytes(key_at(pick(0, kKeys - 1))));
+      } else if (r < 80) {
+        const auto lo = pick(0, kKeys - 2);
+        leader.del_range({}, to_bytes(key_at(lo)),
+                         to_bytes(key_at(lo + pick(1, 4))));
+      } else {
+        bytecask::WritePlan plan;
+        for (int b = pick(2, 5); b > 0; --b) {
+          const auto k = key_at(pick(0, kKeys - 1));
+          if (pick(0, 2) == 0) plan.del(to_bytes(k));
+          else plan.put(to_bytes(k), to_bytes(rand_value()));
+        }
+        REQUIRE(leader.apply_batch({}, std::move(plan)));
+      }
+      // The follower lags: it catches up only now and then, while the
+      // leader vacuums everything its position allows.
+      if (op % 7 == 6) {
+        while (leader.vacuum({.fragmentation_threshold = 0.0,
+                              .retain_after = follower.durable_sequence()})) {
+        }
+      }
+      if (op % 30 == 29) catch_up(leader);
+    }
+    reclaimed += leader.stats().at("bytecask.vacuum_bytes_reclaimed");
+  }
+  {
+    auto leader = bytecask::DB::open(td.path / "leader",
+                                     {.max_file_bytes = 2048});
+    catch_up(leader);
+  }
+  // The test proves nothing unless vacuum dropped history below the
+  // follower while it lagged.
+  CHECK(reclaimed > 0);
 }
 
 // Recovery rebuilds tombstone_bytes and marker_bytes from the hint files to
@@ -3741,6 +3830,131 @@ TEST_CASE("FileStats: tombstone and marker bytes survive reopen",
     CHECK(std::get<4>(t) > 0);  // every file holds tombstones
     CHECK(std::get<5>(t) > 0);  // and a batch's markers
   }
+}
+
+// ---------------------------------------------------------------------------
+// VacuumOptions::retain_after: history a follower still needs is kept.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+auto stream_sequences(const bytecask::DB &db, std::uint64_t from)
+    -> std::vector<std::uint64_t> {
+  auto snap = db.snapshot();
+  std::vector<std::uint64_t> seqs;
+  for (const auto &e : db.changes_since(snap, from)) seqs.push_back(e.sequence);
+  return seqs;
+}
+
+// Every sequence in (from, durable_sequence()] is in the stream: each write
+// below is a single sync put, so the leader assigned them without gaps.
+void check_complete_from(const bytecask::DB &db, std::uint64_t from) {
+  const auto seqs = stream_sequences(db, from);
+  REQUIRE(seqs.size() == db.durable_sequence() - from);
+  for (std::size_t i = 0; i < seqs.size(); ++i) CHECK(seqs[i] == from + 1 + i);
+}
+
+} // namespace
+
+TEST_CASE("vacuum keeps dead entries above retain_after", "[vacuum][retain]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  std::uint64_t retain = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 128});
+    for (int i = 0; i < 10; ++i) {
+      const auto seq =
+          db.put({}, to_bytes(std::format("k{}", i)), to_bytes("old")).sequence;
+      if (i == 4) retain = seq;
+    }
+    for (int i = 0; i < 10; ++i)
+      db.put({}, to_bytes(std::format("k{}", i)), to_bytes("new"));
+
+    while (db.vacuum({.fragmentation_threshold = 0.0, .retain_after = retain})) {
+    }
+    CHECK(db.stats().at("bytecask.vacuum_bytes_reclaimed") > 0);
+    // Dropped at or below retain_after, kept above it.
+    CHECK(stream_sequences(db, 0).front() > 1);
+    check_complete_from(db, retain);
+    CHECK(collect_kv(db).at("k7") == "new");
+  }
+  // The kept dead Puts are history, not live data, after recovery too.
+  auto db = bytecask::DB::open(dir, {.max_file_bytes = 128});
+  check_complete_from(db, retain);
+  for (int i = 0; i < 10; ++i)
+    CHECK(collect_kv(db).at(std::format("k{}", i)) == "new");
+  // Once the follower moves on, the rest can go.
+  while (db.vacuum({.fragmentation_threshold = 0.0})) {
+  }
+  CHECK(collect_kv(db).at("k9") == "new");
+}
+
+TEST_CASE("vacuum keeps tombstones above retain_after",
+          "[vacuum][retain][tombstone]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  std::uint64_t retain = 0;
+  {
+    auto db = bytecask::DB::open(dir);
+    retain = db.put({}, to_bytes("a"), to_bytes("1")).sequence;
+    seal(db);
+    for (int i = 0; i < 6; ++i) {
+      db.put({}, to_bytes(std::format("t{}", i)), to_bytes("v"));
+      (void)db.del({}, to_bytes(std::format("t{}", i)));
+    }
+    seal(db);
+  }
+  // Recovery decides at open which tombstones may go: these hide only Puts
+  // in their own file, so all six may.
+  auto db = bytecask::DB::open(dir);
+  while (db.vacuum({.fragmentation_threshold = 0.0, .retain_after = retain})) {
+  }
+  CHECK(db.stats().at("bytecask.vacuum_tombstones_dropped") == 0);
+  check_complete_from(db, retain);
+  // Without the restriction they go.
+  while (db.vacuum({.fragmentation_threshold = 0.0})) {
+  }
+  CHECK(db.stats().at("bytecask.vacuum_tombstones_dropped") == 6);
+}
+
+TEST_CASE("vacuum is not stalled by a file whose dead entries are all above "
+          "retain_after",
+          "[vacuum][retain]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  // File 1: six keys, one of them later overwritten — a little to reclaim,
+  // all of it at or below the retention point.
+  for (int i = 0; i < 6; ++i)
+    db.put({}, to_bytes(std::format("a{}", i)), to_bytes("xxxxxxxx"));
+  seal(db);
+  // File 2: two keys that stay live, then four that die, above the point.
+  db.put({}, to_bytes("l0"), to_bytes("xxxxxxxx"));
+  const auto retain =
+      db.put({}, to_bytes("l1"), to_bytes("xxxxxxxx")).sequence;
+  for (int i = 0; i < 4; ++i)
+    db.put({}, to_bytes(std::format("d{}", i)), to_bytes("xxxxxxxx"));
+  seal(db);
+  db.put({}, to_bytes("a0"), to_bytes("yyyyyyyy"));
+  for (int i = 0; i < 4; ++i)
+    db.put({}, to_bytes(std::format("d{}", i)), to_bytes("yyyyyyyy"));
+
+  // File 2 is the more fragmented but has nothing vacuum may drop; file 1
+  // is compacted instead.
+  CHECK(db.vacuum({.fragmentation_threshold = 0.0, .retain_after = retain}));
+  CHECK(stream_sequences(db, 0).front() == 2);  // a0's first write went
+  check_complete_from(db, retain);
+  CHECK_FALSE(db.vacuum({.fragmentation_threshold = 0.0, .retain_after = retain}));
+}
+
+TEST_CASE("vacuum with retain_after 0 drops nothing", "[vacuum][retain]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 128});
+  for (int round = 0; round < 3; ++round)
+    for (int i = 0; i < 5; ++i)
+      db.put({}, to_bytes(std::format("k{}", i)), to_bytes("v"));
+  CHECK_FALSE(db.vacuum({.fragmentation_threshold = 0.0, .retain_after = 0}));
+  check_complete_from(db, 0);
+  CHECK(bytecask::VacuumOptions{}.retain_after == bytecask::kNoRetention);
 }
 
 // ---------------------------------------------------------------------------

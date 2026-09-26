@@ -118,14 +118,15 @@ but not older than".
 | Config | Leader vacuum | Events | Expected |
 |---|---|---|---|
 | `cluster` | off | all | every check passes |
-| `cluster-vacuum` | on | all, with lag | **detects #168**: a follower that resumes `changes_since` below a compacted file receives a batch with entries missing |
+| `cluster-vacuum` | on | all, with lag; every vacuum, leader or follower, passes `retain_after` = the lowest position a serving or joining node could resume from | every check passes |
+| `cluster-vacuum-unretained` | on | as `cluster-vacuum`, without `retain_after` | **detects #168** in at least one round of the run: a follower that resumes `changes_since` below a compacted file receives a batch with entries missing |
 | `topology` | off | tailing, planned transfers, unplanned promotions of the most advanced follower, re-bootstrap | every check passes |
 | `topology-behind` | off | as `topology`, but an unplanned promotion takes the least advanced follower | **detects the fork** below in at least one round of the run |
 
-`cluster-vacuum` plays the role `blind` plays in #94: it shows that the
-harness finds the failure it is aimed at. It is an expected failure until
-#168 is fixed, and a regression check after that. `topology-behind` does
-the same for the promotion rule: without it, the checks must find a fork.
+`cluster-vacuum-unretained` plays the role `blind` plays in #94: it shows
+that the harness finds the failure retention prevents. `topology-behind`
+does the same for the promotion rule: without it, the checks must find a
+fork.
 Once a forked node leads in turn, the fork reaches the leader history too,
 so any finding counts there.
 
@@ -137,10 +138,16 @@ so any finding counts there.
    caller must cut at batch boundaries, and the harness does.
    [#188](https://github.com/gustavoamigo/bytecaskdb/issues/188) tracks
    having `ingest` hold back or refuse a trailing incomplete batch.
-2. **#168's fix shape** decides the flipped expectation for
-   `cluster-vacuum`. If `changes_since` refuses to resume below a lower
-   bound, the harness must treat that as "re-bootstrap this follower", not
-   as a failure. Bootstrap is already an event, so the path exists.
+2. **#168's fix shape.** Settled: the replication service owns
+   retention. Every vacuum takes `retain_after`, the lowest position a
+   follower it counts on could resume from, and drops nothing above it.
+   The harness computes it over the nodes that are serving or joining: a
+   bootstrap records the manifest's `through_sequence` while it still holds
+   the vacuum gate, so a vacuum between the manifest and the install counts
+   the new node. An engine-side record that refused resumes below what
+   vacuum dropped was tried first and rejected: it detected the gap but
+   forced re-bootstraps, all at once after a promotion of a bootstrapped
+   node, which lacks the record.
 3. **Promotion target.** Settled by the fork finding below: the protocol
    promotes the most advanced follower, and `topology-behind`, which
    promotes the least advanced, is the sensitivity check. A random target
@@ -232,7 +239,7 @@ is legitimate. What must hold is that the follower opens at exactly
 
 ## Findings
 
-**#168 reproduces.** `cluster-vacuum` reports prefix and session violations
+**#168 reproduces.** Without retention, `cluster-vacuum` reported prefix and session violations
 in about half its rounds (3 of 6 in the first local run). `cluster`, with
 leader vacuum off, stayed clean in all 6 rounds, including the rounds with
 the degrade nemesis.
@@ -242,6 +249,11 @@ a committed append at or below S on another key. Or a follower whose
 `durable_sequence()` has passed W lacks an append committed at or below W.
 Vacuum dropped the dead entry before the lagging follower's `changes_since`
 reached it. The follower shows the gap until the newer version arrives.
+
+**#168 fixed by retention.** With `retain_after` set to the lowest follower
+position, `cluster-vacuum` was clean in all 6 local rounds (2–83 vacuums a
+round), and `cluster-vacuum-unretained`, the same run without it, showed
+#168 in all 6.
 
 **A write one reader had seen was invisible to a later reader.** The first
 local run with Elle reported `G-single-item-realtime` on the leader of a
@@ -290,8 +302,8 @@ With both fixes, `topology` passed every local round.
 
 - `cluster` passes nightly in release and under ASan, or every failure it
   finds is filed and fixed.
-- `cluster-vacuum` detects #168 on the current engine, and the nightly
-  asserts that it does.
+- `cluster-vacuum` passes with retention, and `cluster-vacuum-unretained`
+  detects #168 at least once per run.
 - Seeds are printed, and a failure uploads the histories and the event log.
 - `replication_primitives_design.md` cites the checked guarantees, the
   #168 result and whatever the fork case settles.

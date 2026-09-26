@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -98,8 +99,17 @@ struct ReadOptions {
   bool verify_checksums{true};
 };
 
+// VacuumOptions::retain_after value meaning no restriction (-1).
+inline constexpr std::uint64_t kNoRetention =
+    std::numeric_limits<std::uint64_t>::max();
+
 struct VacuumOptions {
   double fragmentation_threshold{0.5};
+  // Entries above this sequence are kept even when dead, so changes_since
+  // from any sequence >= retain_after stays complete. Set by the
+  // replication service; kNoRetention (-1), the default, means no
+  // restriction.
+  std::uint64_t retain_after{kNoRetention};
 };
 
 struct Options {
@@ -521,6 +531,7 @@ using WriteOptions         = internal::WriteOptions;
 using CommitResult         = internal::CommitResult;
 using ReadOptions          = internal::ReadOptions;
 using VacuumOptions        = internal::VacuumOptions;
+using internal::kNoRetention;
 using Options              = internal::Options;
 using SizeLimits           = internal::SizeLimits;
 using FileInfo             = internal::FileInfo;
