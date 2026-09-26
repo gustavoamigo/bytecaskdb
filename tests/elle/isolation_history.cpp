@@ -27,6 +27,7 @@
 //                     [--seed S] [--threads N] [--txns N] [--dir PATH]
 //                     [--no-vacuum] [--force-vacuum] [--no-degrade]
 //                     [--followers N] [--follower-readers N] [--lag]
+//                     [--kill-epochs N]
 //
 // With --followers N (#178, docs/replication_checking_design.md) the leader
 // gains N followers, each bootstrapped from a manifest under load and tailed
@@ -34,11 +35,18 @@
 // operation carries a "node" (0 = leader); a session read carries "wait",
 // the durable_sequence it waited for. Bootstraps and nemesis counts go to
 // <out>.cluster.json.
+//
+// With --kill-epochs N (#176) the writers run in a child process that the
+// parent SIGKILLs at a random point of its workload, N times, each child
+// reopening what the last left, before one final read of every key. See
+// "Kill nemesis" below. Kill counts go to <out>.kill.json.
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -53,15 +61,23 @@
 #include <random>
 #include <shared_mutex>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
 #include <vector>
 
+#include <poll.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include "fault_injector.h"
 
 import bytecask;
+
+extern char **environ; // NOLINT(readability-redundant-declaration)
 
 namespace {
 
@@ -98,6 +114,15 @@ struct RunOptions {
   bool force_vacuum{false}; // leader vacuum on whatever the seed draws
   bool topology{false};     // planned transfers, promotions, re-bootstraps
   bool promote_least{false}; // unplanned promotion takes the least advanced
+  // --kill-epochs N (#176): N child processes in turn, each SIGKILLed at a
+  // random point of its workload, the next one reopening what the last left.
+  int kill_epochs{0};
+  // Set on the child only, by the parent.
+  bool kill_child{false};
+  int child_fd{-1};
+  int process_base{0};
+  std::int64_t element_base{0};
+  std::int64_t key_base{0};
 };
 
 // Per-run engine and nemesis configuration, derived from the seed.
@@ -199,7 +224,9 @@ public:
   static constexpr int kSlots = 8;
   static constexpr int kAppendsPerKey = 64;
 
-  KeyPool() {
+  // Slots start at first_key: a process that continues a killed one's
+  // history starts on the keys it was last appending to.
+  explicit KeyPool(std::int64_t first_key = 0) : next_key_{first_key} {
     for (int i = 0; i < kSlots; ++i) {
       slots_[static_cast<std::size_t>(i)] = next_key_++;
     }
@@ -394,6 +421,7 @@ struct TxnOutcome {
   EventType type{EventType::Ok};
   std::uint64_t sequence{0};
   std::string error;
+  bool durable{false}; // Ok: CommitResult.durable
 };
 
 // Runs mops as one transaction. Fills each read mop's result. Keys the
@@ -439,8 +467,11 @@ auto execute_txn(bytecask::DB &db, Mode mode, std::vector<Mop> &mops,
     }
   }
   const auto r = db.apply_batch(wo, std::move(plan));
-  if (!r) return {.type = EventType::Fail, .sequence = 0, .error = {}};
-  return {.type = EventType::Ok, .sequence = r->sequence, .error = {}};
+  if (!r) return {.type = EventType::Fail, .sequence = 0, .error = {}, .durable = false};
+  return {.type = EventType::Ok,
+          .sequence = r->sequence,
+          .error = {},
+          .durable = r->durable};
 }
 
 // ---------------------------------------------------------------------------
@@ -493,9 +524,9 @@ auto run_one(bytecask::DB &db, Mode mode, Placement at, Recorder &rec,
   } catch (const bytecask::DbFollowerMode &e) {
     // Refused at admission, before anything is appended: the node was
     // demoted under the client. If the write ever shows up, it is G1a.
-    outcome = {.type = EventType::Fail, .sequence = 0, .error = e.what()};
+    outcome = {.type = EventType::Fail, .sequence = 0, .error = e.what(), .durable = false};
   } catch (const std::exception &e) {
-    outcome = {.type = EventType::Info, .sequence = 0, .error = e.what()};
+    outcome = {.type = EventType::Info, .sequence = 0, .error = e.what(), .durable = false};
   }
 
   Event done;
@@ -1071,6 +1102,451 @@ auto write_cluster_summary(const fs::path &path, ClusterStats &stats,
   out << "\n";
 }
 
+// ---------------------------------------------------------------------------
+// Kill nemesis (#176): SIGKILL the process under concurrent group-commit
+// writers, reopen, go on. See docs/isolation_checking_design.md.
+//
+// A SIGKILL takes the history recorded in memory with it, so the workload
+// runs in a child process that streams every operation to the parent as it
+// happens, one line each:
+//   I <process> <time_ns> <sync> <n> <mop>...           before the call
+//   C <process> <time_ns> <type> <sequence> <durable> <n> <mop>...  after it
+//   D <sequence>                                         durable_sequence()
+// with <mop> = A <key> <element> or R <key> <len> <element>... (a read's
+// result, on C only; N <key> for a read with none). Lines are written whole,
+// under a mutex; a line the kill cut short is discarded. Times are
+// CLOCK_MONOTONIC, the same clock in every process.
+// ---------------------------------------------------------------------------
+
+auto monotonic_ns() -> std::int64_t {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             Clock::now().time_since_epoch())
+      .count();
+}
+
+// The kill configuration: the seed's engine configuration, with enough sync
+// writers that several share each fdatasync, and no degrade nemesis.
+auto kill_config(std::uint64_t seed) -> Config {
+  auto c = config_for(seed);
+  c.sync_percent = c.sync_percent < 50 ? 50 : 90;
+  c.degrade = false;
+  return c;
+}
+
+class LineWriter {
+public:
+  explicit LineWriter(int fd) : fd_{fd} {}
+
+  auto write(const std::string &line) -> void {
+    std::lock_guard<std::mutex> g{mu_};
+    std::size_t done = 0;
+    while (done < line.size()) {
+      const auto n = ::write(fd_, line.data() + done, line.size() - done);
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        std::_Exit(3); // the parent is gone
+      }
+      done += static_cast<std::size_t>(n);
+    }
+  }
+
+private:
+  std::mutex mu_;
+  int fd_;
+};
+
+auto append_mops(std::string &line, const std::vector<Mop> &mops,
+                 bool with_reads) -> void {
+  line += std::format(" {}", mops.size());
+  for (const auto &m : mops) {
+    if (m.append) {
+      line += std::format(" A {} {}", m.key, m.element);
+    } else if (with_reads && m.read) {
+      line += std::format(" R {} {}", m.key, m.read->size());
+      for (const auto e : *m.read) line += std::format(" {}", e);
+    } else {
+      line += std::format(" N {}", m.key);
+    }
+  }
+}
+
+// The child: opens the directory (recovering from the last kill), runs the
+// writers, the vacuum nemesis and a durable_sequence() watcher, and streams
+// everything until the parent kills it. After its share of transactions it
+// idles, so a late kill does not grow the history without bound.
+auto run_kill_child(const RunOptions &o) -> int {
+  const auto cfg = kill_config(o.seed);
+  auto db = bytecask::DB::open(o.dir, db_options(cfg));
+  LineWriter out{o.child_fd};
+  KeyPool keys{o.key_base};
+  std::atomic<std::int64_t> next_element{o.element_base};
+  std::atomic<int> remaining{o.txns};
+  std::atomic<bool> stop{false};
+
+  std::jthread vacuum_thread;
+  if (cfg.vacuum) {
+    vacuum_thread = std::jthread{[&] {
+      std::mt19937_64 vrng{o.seed + 1};
+      while (!stop.load(std::memory_order_relaxed)) {
+        const auto threshold = static_cast<double>(vrng() % 60) / 100.0;
+        try {
+          std::ignore = db.vacuum({.fragmentation_threshold = threshold});
+        } catch (const std::exception &) {
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(vrng() % 5000));
+      }
+    }};
+  }
+  std::jthread durable_thread{[&] {
+    std::uint64_t last = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      const auto d = db.durable_sequence(last + 1, std::chrono::milliseconds(5));
+      if (d > last) {
+        last = d;
+        out.write(std::format("D {}\n", d));
+      }
+    }
+  }};
+
+  std::vector<std::jthread> writers;
+  for (int t = 0; t < o.threads; ++t) {
+    writers.emplace_back([&, t] {
+      std::mt19937_64 rng{o.seed + 100 + static_cast<std::uint64_t>(t)};
+      const auto process = o.process_base + t;
+      while (remaining.fetch_sub(1, std::memory_order_relaxed) > 0) {
+        auto mops = random_txn(rng, keys, next_element);
+        const auto sync =
+            static_cast<int>(rng() % 100) < cfg.sync_percent;
+        std::string line = std::format("I {} {} {}", process, monotonic_ns(),
+                                       sync ? 1 : 0);
+        append_mops(line, mops, false);
+        out.write(line + "\n");
+        TxnOutcome r;
+        try {
+          r = execute_txn(db, o.mode, mops, {.sync = sync});
+        } catch (const std::exception &e) {
+          r = {.type = EventType::Info, .sequence = 0, .error = e.what(),
+               .durable = false};
+        }
+        line = std::format("C {} {} {} {} {}", process, monotonic_ns(),
+                           event_type_name(r.type), r.sequence,
+                           r.durable ? 1 : 0);
+        append_mops(line, mops, r.type == EventType::Ok);
+        out.write(line + "\n");
+      }
+    });
+  }
+  for (auto &w : writers) w.join();
+  for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
+}
+
+auto spawn_kill_child(const RunOptions &o, int epoch, int write_fd) -> pid_t {
+  const auto self = fs::read_symlink("/proc/self/exe").string();
+  std::vector<std::string> args{
+      self,
+      "--kill-child",
+      "--config", std::string{mode_name(o.mode)},
+      "--seed", std::to_string(o.seed + static_cast<std::uint64_t>(epoch)),
+      "--threads", std::to_string(o.threads),
+      "--txns", std::to_string(std::max(1, o.txns / o.kill_epochs)),
+      "--dir", o.dir.string(),
+      "--fd", std::to_string(write_fd),
+      "--process-base", std::to_string(o.process_base),
+      "--element-base", std::to_string(o.element_base),
+      "--key-base", std::to_string(o.key_base)};
+  std::vector<char *> argv;
+  for (auto &a : args) argv.push_back(a.data());
+  argv.push_back(nullptr);
+  pid_t pid = 0;
+  if (const auto rc = posix_spawn(&pid, self.c_str(), nullptr, nullptr,
+                                  argv.data(), environ);
+      rc != 0) {
+    throw std::system_error{rc, std::generic_category(), "posix_spawn"};
+  }
+  return pid;
+}
+
+// Runs one child until it has reported `kill_after` completions, SIGKILLs
+// it, and returns what it streamed and when it was killed. Counting
+// completions rather than time puts the kill inside the workload however
+// fast the machine is; the time limit only guards against a stuck child.
+// Throws if the child exited on its own.
+auto run_and_kill(const RunOptions &o, int epoch, int kill_after)
+    -> std::pair<std::string, std::int64_t> {
+  int fds[2];
+  if (::pipe(fds) != 0)
+    throw std::system_error{errno, std::generic_category(), "pipe"};
+  const auto pid = spawn_kill_child(o, epoch, fds[1]);
+  ::close(fds[1]);
+
+  std::string stream;
+  std::array<char, 1 << 16> buf{};
+  const auto deadline = Clock::now() + std::chrono::minutes(2);
+  std::int64_t killed_at = 0;
+  auto completions = 0;
+  std::size_t scanned = 0;
+  auto eof = false;
+  while (!eof) {
+    int timeout_ms = -1;
+    if (killed_at == 0) {
+      for (; scanned < stream.size(); ++scanned) {
+        if (stream[scanned] == 'C' &&
+            (scanned == 0 || stream[scanned - 1] == '\n'))
+          ++completions;
+      }
+      const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+          deadline - Clock::now());
+      if (completions >= kill_after || left.count() <= 0) {
+        ::kill(pid, SIGKILL);
+        killed_at = monotonic_ns();
+      } else {
+        timeout_ms = static_cast<int>(left.count());
+      }
+    }
+    pollfd pfd{.fd = fds[0], .events = POLLIN, .revents = 0};
+    const auto ready =
+        ::poll(&pfd, 1, killed_at != 0 ? -1 : std::max(timeout_ms, 1));
+    if (ready < 0 && errno != EINTR)
+      throw std::system_error{errno, std::generic_category(), "poll"};
+    if (ready <= 0) continue;
+    const auto n = ::read(fds[0], buf.data(), buf.size());
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      throw std::system_error{errno, std::generic_category(), "read"};
+    }
+    if (n == 0) {
+      eof = true;
+    } else {
+      stream.append(buf.data(), static_cast<std::size_t>(n));
+    }
+  }
+  ::close(fds[0]);
+  if (killed_at == 0) ::kill(pid, SIGKILL);
+  int status = 0;
+  while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  }
+  if (killed_at == 0 || !WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
+    throw std::runtime_error{std::format(
+        "epoch {}: child exited before the kill (status {:#x}); see its "
+        "stderr above",
+        epoch, status)};
+  }
+  return {std::move(stream), killed_at};
+}
+
+struct KillStats {
+  int epochs{0};
+  int in_flight{0};        // invoked, not completed, at a kill
+  int downgraded{0};       // acknowledged, not durable at a kill
+  int group_kills{0};      // kills with two or more sync writers in flight
+  std::int64_t ok{0};
+  std::int64_t fail{0};
+};
+
+// Turns one child's stream into history events: completions as they were
+// reported, except that an acknowledged write not known durable at the kill
+// becomes :info (a crash may lose it), and every operation still in flight
+// gets an :info completion at the kill.
+auto absorb_epoch(std::string_view stream, int epoch, std::int64_t killed_at,
+                  std::int64_t start_ns, std::vector<Event> &events,
+                  std::uint64_t &next_index, std::int64_t &max_element,
+                  std::int64_t &max_key, KillStats &stats) -> void {
+  struct Pending {
+    std::vector<Mop> mops;
+    bool sync{false};
+  };
+  std::map<int, Pending> pending;
+  struct Done {
+    Event event;
+    std::vector<Mop> invoked;
+    bool durable{false};
+  };
+  std::vector<Done> completions;
+  std::uint64_t durable = 0;
+
+  auto parse_mops = [&](std::istringstream &in) -> std::vector<Mop> {
+    std::size_t n = 0;
+    in >> n;
+    std::vector<Mop> mops(n);
+    for (auto &m : mops) {
+      char kind = 0;
+      in >> kind >> m.key;
+      max_key = std::max(max_key, m.key);
+      if (kind == 'A') {
+        m.append = true;
+        in >> m.element;
+        max_element = std::max(max_element, m.element);
+      } else if (kind == 'R') {
+        std::size_t len = 0;
+        in >> len;
+        List l(len);
+        for (auto &e : l) in >> e;
+        m.read = std::move(l);
+      }
+    }
+    if (!in) throw std::runtime_error{"malformed line from the child"};
+    return mops;
+  };
+
+  std::size_t pos = 0;
+  while (true) {
+    const auto end = stream.find('\n', pos);
+    if (end == std::string_view::npos) break; // cut short by the kill
+    std::istringstream in{std::string{stream.substr(pos, end - pos)}};
+    pos = end + 1;
+    char tag = 0;
+    in >> tag;
+    if (tag == 'D') {
+      std::uint64_t d = 0;
+      in >> d;
+      durable = std::max(durable, d);
+      continue;
+    }
+    Event e;
+    std::int64_t t = 0;
+    in >> e.process >> t;
+    e.time_ns = t - start_ns;
+    e.epoch = epoch;
+    e.index = next_index++;
+    if (tag == 'I') {
+      int sync = 0;
+      in >> sync;
+      e.type = EventType::Invoke;
+      e.value = parse_mops(in);
+      pending[e.process] = {e.value, sync != 0};
+      events.push_back(std::move(e));
+    } else if (tag == 'C') {
+      std::string type;
+      int dur = 0;
+      in >> type >> e.sequence >> dur;
+      e.type = type == "ok" ? EventType::Ok
+               : type == "fail" ? EventType::Fail
+                                : EventType::Info;
+      e.value = parse_mops(in);
+      auto it = pending.find(e.process);
+      if (it == pending.end())
+        throw std::runtime_error{"completion without an invoke"};
+      completions.push_back({std::move(e), std::move(it->second.mops), dur != 0});
+      pending.erase(it);
+    } else {
+      throw std::runtime_error{std::format("unknown line tag {}", tag)};
+    }
+  }
+
+  for (auto &[event, invoked, dur] : completions) {
+    if (event.type == EventType::Ok && event.sequence != 0 && !dur &&
+        event.sequence > durable) {
+      event.type = EventType::Info;
+      event.value = invoked;
+      event.sequence = 0;
+      event.error = "acknowledged, not durable at the kill";
+      ++stats.downgraded;
+    }
+    if (event.type == EventType::Ok) ++stats.ok;
+    if (event.type == EventType::Fail) ++stats.fail;
+    events.push_back(std::move(event));
+  }
+  int sync_in_flight = 0;
+  for (auto &[process, p] : pending) {
+    Event e;
+    e.index = next_index++;
+    e.process = process;
+    e.epoch = epoch;
+    e.type = EventType::Info;
+    e.time_ns = killed_at - start_ns;
+    e.value = std::move(p.mops);
+    e.error = "in flight at the kill";
+    events.push_back(std::move(e));
+    ++stats.in_flight;
+    if (p.sync) ++sync_in_flight;
+  }
+  if (sync_in_flight >= 2) ++stats.group_kills;
+  ++stats.epochs;
+}
+
+// The parent: kill_epochs children in turn on one directory, then a final
+// read of every key after one more recovery, in this process.
+auto run_kill(const RunOptions &o) -> int {
+  const auto cfg = kill_config(o.seed);
+  std::printf("isolation_history: config=%s seed=%llu threads=%d txns=%d "
+              "backend=%s max_file_bytes=%llu sync%%=%d vacuum=%d "
+              "kill_epochs=%d\n",
+              mode_name(o.mode).data(),
+              static_cast<unsigned long long>(o.seed), o.threads, o.txns,
+              backend_name(cfg.backend).data(),
+              static_cast<unsigned long long>(cfg.max_file_bytes),
+              cfg.sync_percent, cfg.vacuum ? 1 : 0, o.kill_epochs);
+  std::fflush(stdout);
+
+  fs::remove_all(o.dir);
+  std::mt19937_64 rng{o.seed + 7};
+  const auto start_ns = monotonic_ns();
+  std::vector<Event> events;
+  std::uint64_t next_index = 0;
+  std::int64_t max_element = -1;
+  std::int64_t max_key = -1;
+  KillStats stats;
+  auto child = o;
+  for (int epoch = 0; epoch < o.kill_epochs; ++epoch) {
+    // A process that saw an :info cannot be reused, so every child gets
+    // fresh process ids, fresh elements, and the keys the last one was on.
+    child.process_base = epoch * o.threads;
+    child.element_base = max_element + 1;
+    child.key_base = std::max<std::int64_t>(0, max_key + 1 - KeyPool::kSlots);
+    // Somewhere between 10% and 95% of the child's transactions.
+    const auto share = std::max(1, o.txns / o.kill_epochs);
+    const auto kill_after =
+        share / 10 +
+        static_cast<int>(rng() % static_cast<std::uint64_t>(
+                                     share * 85 / 100 + 1));
+    const auto [stream, killed_at] = run_and_kill(child, epoch, kill_after);
+    absorb_epoch(stream, epoch, killed_at, start_ns, events, next_index, max_element,
+                 max_key, stats);
+  }
+
+  // One more recovery, then every key in one read-only transaction.
+  {
+    auto db = bytecask::DB::open(o.dir, db_options(cfg));
+    Event inv;
+    inv.process = o.kill_epochs * o.threads;
+    inv.epoch = o.kill_epochs;
+    inv.index = next_index++;
+    inv.time_ns = monotonic_ns() - start_ns;
+    for (std::int64_t k = 0; k <= max_key; ++k)
+      inv.value.push_back({.append = false, .key = k, .element = 0, .read = {}});
+    auto done = inv;
+    auto snap = db.snapshot();
+    bytecask::Bytes buf;
+    for (auto &m : done.value) {
+      const auto kb = key_bytes(m.key);
+      m.read = snap.get({}, as_view(kb), buf) ? decode_list(buf) : List{};
+    }
+    done.type = EventType::Ok;
+    done.index = next_index++;
+    done.time_ns = monotonic_ns() - start_ns;
+    inv.type = EventType::Invoke;
+    events.push_back(std::move(inv));
+    events.push_back(std::move(done));
+  }
+
+  write_history(o.out, std::move(events));
+  auto summary = o.out;
+  summary += ".kill.json";
+  std::ofstream{summary} << std::format(
+      R"({{"epochs":{},"in_flight":{},"downgraded":{},"group_kills":{},)"
+      R"("ok":{},"fail":{}}})"
+      "\n",
+      stats.epochs, stats.in_flight, stats.downgraded, stats.group_kills,
+      stats.ok, stats.fail);
+  std::printf("  kill: epochs=%d ok=%lld fail=%lld in_flight=%d "
+              "downgraded=%d group_kills=%d keys=%lld -> %s\n",
+              stats.epochs, static_cast<long long>(stats.ok),
+              static_cast<long long>(stats.fail), stats.in_flight,
+              stats.downgraded, stats.group_kills,
+              static_cast<long long>(max_key + 1), o.out.c_str());
+  return 0;
+}
+
 auto parse_mode(std::string_view s) -> Mode {
   if (s == "guarded") return Mode::Guarded;
   if (s == "unguarded") return Mode::Unguarded;
@@ -1119,12 +1595,28 @@ auto parse_args(int argc, char **argv) -> RunOptions {
       o.topology = true;
     } else if (a == "--promote-least") {
       o.promote_least = true;
+    } else if (a == "--kill-epochs") {
+      o.kill_epochs = std::stoi(std::string{next()});
+    } else if (a == "--kill-child") {
+      o.kill_child = true;
+    } else if (a == "--fd") {
+      o.child_fd = std::stoi(std::string{next()});
+    } else if (a == "--process-base") {
+      o.process_base = std::stoi(std::string{next()});
+    } else if (a == "--element-base") {
+      o.element_base = std::stoll(std::string{next()});
+    } else if (a == "--key-base") {
+      o.key_base = std::stoll(std::string{next()});
     } else {
       throw std::runtime_error{std::format("unknown argument {}", a)};
     }
   }
-  if (!have_config || o.out.empty())
+  if (!have_config || (o.out.empty() && !o.kill_child))
     throw std::runtime_error{"--config and --out are required"};
+  if (o.kill_epochs < 0)
+    throw std::runtime_error{"--kill-epochs must be >= 0"};
+  if (o.kill_epochs > 0 && o.followers > 0)
+    throw std::runtime_error{"--kill-epochs runs a single node"};
   if (o.threads < 1 || o.txns < 1)
     throw std::runtime_error{"--threads and --txns must be positive"};
   if (o.followers < 0 || o.follower_readers < 1)
@@ -1540,7 +2032,10 @@ auto run(const RunOptions &o) -> int {
 
 auto main(int argc, char **argv) -> int {
   try {
-    return run(parse_args(argc, argv));
+    const auto o = parse_args(argc, argv);
+    if (o.kill_child) return run_kill_child(o);
+    if (o.kill_epochs > 0) return run_kill(o);
+    return run(o);
   } catch (const std::exception &e) {
     std::fprintf(stderr, "isolation_history: %s\n", e.what());
     return 2;
