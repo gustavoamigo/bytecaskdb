@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: MIT
+# Nightly crash-consistency run: tests/crash/crash_consistency.cpp SIGKILLs a
+# writer process at random points and checks the durable prefix on reopen.
+#
+# ci.yml only compiles the harness on every push/PR. The timed run lives here,
+# on a schedule plus manual dispatch, and on pushes that change the harness
+# itself. The run's seed is printed first; rerun with --seed to replay the
+# same workloads and kill delays (kill timing still varies with the machine).
+
+name: Crash consistency (nightly)
+
+on:
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "Iterations per job (release; the ASan job runs a quarter)"
+        default: "400"
+      seed:
+        description: "Seed to replay (empty = random)"
+        default: ""
+  push:
+    paths:
+      - "tests/crash/**"
+      - ".github/workflows/crash-nightly.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  crash:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+      CLANG_TARGET_TRIPLE: x86_64-redhat-linux-gnu
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release
+            mode: releasedbg
+            sanitizer: ""
+            divisor: 1
+          - name: asan
+            mode: debug
+            sanitizer: address
+            divisor: 4
+    name: crash (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            clang llvm llvm-devel lld \
+            libcxx libcxx-devel \
+            xmake \
+            python3-pip python3-devel \
+            git ninja-build
+          # xmake f loads every target, and bytecaskdb_python's on_load asks
+          # nanobind for its include dir.
+          pip3 install nanobind
+
+      - name: Configure xmake
+        run: |
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          SAN=""
+          if [ -n "${{ matrix.sanitizer }}" ]; then SAN="--sanitizer=${{ matrix.sanitizer }}"; fi
+          xmake f --toolchain=clang \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            $SAN -m ${{ matrix.mode }} -y
+
+      - name: Build
+        run: xmake build crash_consistency
+
+      - name: Run crash_consistency
+        env:
+          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
+          ITERATIONS: ${{ github.event.inputs.iterations || '400' }}
+          SEED: ${{ github.event.inputs.seed || '' }}
+        run: |
+          N=$(( ITERATIONS / ${{ matrix.divisor }} ))
+          ARGS="--iterations $N --dir $RUNNER_TEMP/crash"
+          if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
+          build/linux/x86_64/${{ matrix.mode }}/crash_consistency $ARGS
+
+      - name: Upload failing directories and history
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-failure-${{ matrix.name }}
+          path: ${{ runner.temp }}/crash/failure
+          if-no-files-found: ignore
