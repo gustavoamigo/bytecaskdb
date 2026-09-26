@@ -303,7 +303,9 @@ public:
 
     // Atomically applies all operations in plan. nullopt on conflict (guard
     // failure or implicit W-W check) — nothing was written. An empty or
-    // guard-only plan that passes commits as a no-op: {sequence = 0, durable = true}.
+    // guard-only plan that passes writes nothing and returns {sequence = 0,
+    // durable = true}. With sync it first makes every earlier write durable, so
+    // apply_batch({.sync = true}, WritePlan{}) flushes earlier sync=false writes.
     // Throws std::system_error on I/O failure or DbDegraded if the engine is degraded.
     [[nodiscard]] auto apply_batch(WriteOptions opts,
                                    WritePlan plan) -> std::optional<CommitResult>;

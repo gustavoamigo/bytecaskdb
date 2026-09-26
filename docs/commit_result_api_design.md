@@ -58,8 +58,8 @@ discarding it.
 // guaranteed to see every entry of this write.
 export struct CommitResult {
   // Highest sequence assigned to this write. 0 means nothing was written
-  // (empty plan, guard-only plan, or empty-range del_range) — there is
-  // nothing to wait for.
+  // (empty plan, guard-only plan, or empty-range del_range). With sync=true
+  // such a write still returns only once every earlier write is durable.
   std::uint64_t sequence{0};
 
   // True if fdatasync confirmed durability of this write before return.
@@ -103,6 +103,7 @@ public:
   // W-W check detected a conflict — nothing was written.
   // An empty plan returns {sequence = 0, durable = true}.
   // A guard-only plan that passes returns {sequence = 0, durable = true}.
+  // With sync, both first wait until every earlier write is durable.
   [[nodiscard]] auto apply_batch(WriteOptions opts, WritePlan plan)
       -> std::optional<CommitResult>;
 
@@ -254,6 +255,15 @@ export struct EngineSlot : Slot {
   batches that skip phase 3 entirely. This is the zero-entry durability fix:
   every successful zero-entry result is `{sequence = 0, durable = true}`,
   regardless of which return path in `execute_slots` produced it.
+- A zero-entry slot with `sync=true` makes the promise every synced write
+  makes: on return, every earlier write is durable. When the head holds
+  sequences above the published `durable_seq` (earlier `sync=false` writes),
+  `execute_slots` records the head's last sequence in the slot's
+  `sync_through`, raises the head's `sync_requested_seq` to it, and
+  `apply_batch` sends the slot through `commit_wait` with that target. Its
+  result keeps `sequence = 0` — it wrote nothing — and `durable` is set once
+  the flush lands. This is how `apply_batch({.sync = true}, WritePlan{})`
+  flushes earlier unsynced writes.
 - `execute_slots` phase 3: after the final `apply_sync`/`store_state`, set
   `slot->result->durable = (t.durable_seq() >= slot->result->sequence)` for
   each committed slot. This naturally covers group-coalesced syncs and

@@ -182,6 +182,17 @@ end and is published with the next `flush_once`, which fdatasyncs only if a
 mixed case; unchanged in a pure NoSync workload. `CommitResult::durable`
 keeps its meaning: `durable_seq >= sequence` at publish.
 
+**Sync-only write** (`apply_batch({.sync = true}, WritePlan{})`, or any
+synced plan that appends nothing): stage 1 appends nothing but, if the head
+holds sequences above the published `durable_seq`, raises the head's
+`sync_requested_seq` to its last sequence; stage 2 then waits in
+`commit_wait` for that target like a synced writer. `flush_pending` runs
+when the head asks for a sync even if it holds no new entries — the
+unsynced writes may all be published already, by flushes that did not sync
+them. A caller writing with `sync=false` uses it to bound what an OS crash
+can lose. It holds the flush role across its fdatasync like any synced
+flush, so `sync=false` writers arriving meanwhile wait for it.
+
 **Snapshot conflict checks** (`validate_preconditions`) run against `head_`,
 so a plan sees every earlier stage-1 write including ones not yet durable.
 That is the serial order, exactly as slot 2 sees slot 1 inside today's batch.
