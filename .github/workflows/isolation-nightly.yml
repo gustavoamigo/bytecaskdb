@@ -72,9 +72,12 @@ jobs:
             xmake \
             python3-pip python3-devel \
             git ninja-build \
-            java-21-openjdk-headless
+            java-21-openjdk-headless \
+            graphviz
           # xmake f loads every target, and bytecaskdb_python's on_load asks
-          # nanobind for its include dir.
+          # nanobind for its include dir. graphviz: elle-cli renders every
+          # cycle it finds with dot, including the write skew the unguarded
+          # configuration is expected to show, and crashes without it.
           pip3 install nanobind
 
       - name: Cache elle-cli
