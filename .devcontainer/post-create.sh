@@ -14,7 +14,7 @@ RESOURCE_DIR=$(/usr/bin/clang --print-resource-dir)
 # by xmake's "clang" toolchain, breaking native builds ("unknown target triple").
 xmake f --toolchain=clang --cc=/usr/bin/clang --cxx=/usr/bin/clang++ --cxflags="-resource-dir=${RESOURCE_DIR}" -y
 
-# graft — repo context graph (see .github/copilot-instructions.md).
+# graft — repo context graph (see CLAUDE.md).
 # Install under the devcontainer user's home so the post-create step does not
 # require write access to the system npm prefix used by the base image.
 NPM_PREFIX="${HOME}/.npm-global"
