@@ -179,6 +179,12 @@ struct VacuumOptions {
     // 1 − (live + tombstone + marker bytes) / total bytes, the share of dead
     // Puts compaction is sure to reclaim. Range [0.0, 1.0]. Default 0.5.
     double fragmentation_threshold{0.5};
+    // Entries above this sequence are kept even when dead, so changes_since
+    // from any sequence >= retain_after stays complete. Set by the
+    // replication service to the lowest durable_sequence() among its
+    // followers, on every node. kNoRetention (-1), the default, means no
+    // restriction.
+    std::uint64_t retain_after{kNoRetention};
 };
 ```
 

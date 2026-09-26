@@ -32,6 +32,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -76,7 +77,7 @@ auto to_module(const bytecask::internal::ReadOptions& o) noexcept -> bytecask::R
 }
 
 auto to_module(bytecask::internal::VacuumOptions o) noexcept -> bytecask::VacuumOptions {
-  return {o.fragmentation_threshold};
+  return {o.fragmentation_threshold, o.retain_after};
 }
 
 auto to_module(bytecask::internal::IoBackend b) noexcept -> bytecask::IoBackend {
@@ -143,8 +144,6 @@ auto translate_exceptions(F&& f) -> decltype(std::forward<F>(f)()) {
     throw bytecask::internal::DbDegraded(e.what());
   } catch (const bytecask::DbFollowerMode& e) {
     throw bytecask::internal::DbFollowerMode(e.what());
-  } catch (const bytecask::DbInvalidSequence& e) {
-    throw bytecask::internal::DbInvalidSequence(e.what());
   }
 }
 
@@ -654,10 +653,6 @@ auto DB::durable_sequence(std::uint64_t min_sequence,
   return impl_->db.durable_sequence(min_sequence, timeout);
 }
 
-auto DB::min_resumable_sequence() const -> std::uint64_t {
-  return impl_->db.min_resumable_sequence();
-}
-
 auto DB::create_manifest() -> FileManifest {
   auto m = impl_->db.create_manifest();
   std::vector<FileInfo> files;
@@ -674,8 +669,7 @@ auto DB::create_manifest() -> FileManifest {
 
 auto DB::changes_since(const Snapshot& snap, std::uint64_t from_sequence) const
     -> std::ranges::subrange<ChangeIterator, std::default_sentinel_t> {
-  auto r = translate_exceptions(
-      [&] { return impl_->db.changes_since(snap.impl_->snap, from_sequence); });
+  auto r = impl_->db.changes_since(snap.impl_->snap, from_sequence);
   return {
     ChangeIterator{std::make_unique<ChangeIterator::Impl>(std::move(r).begin())},
     std::default_sentinel

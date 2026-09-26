@@ -90,6 +90,7 @@ struct RunOptions {
   fs::path dir{"isolation_history_db"};
   fs::path out;
   bool no_vacuum{false};
+  bool no_retention{false}; // vacuum ignores where followers are (#168)
   bool no_degrade{false};
   int followers{0};        // 0: leader only (#94); N: a cluster (#178)
   int follower_readers{4}; // reader threads per follower
@@ -558,6 +559,11 @@ struct Node {
   // for good, since the readers were waiting on data only it would ingest.
   std::atomic<int> exclusive_wanted{0};
   std::unique_ptr<DbHolder> holder; // null while not bootstrapped
+  // Set by bootstrap, under the vacuum gate, to the manifest's
+  // through_sequence: the node resumes there once installed, so vacuum must
+  // keep what lies above it before the node is serving.
+  std::atomic<bool> joining{false};
+  std::atomic<std::uint64_t> joining_at{0};
   // Where replicate() last gave up on an iteration, for the stuck report.
   std::atomic<int> repl_stall{0};
 };
@@ -656,9 +662,6 @@ struct ClusterStats {
   std::atomic<int> duplicates{0};
   std::atomic<int> lag_pauses{0};
   std::atomic<int> follower_vacuums{0};
-  // Followers that re-bootstrapped because their source's vacuum had
-  // dropped history they had not yet received.
-  std::atomic<int> history_rebootstraps{0};
   std::atomic<int> session_reads{0};
 
   void error(std::string what) {
@@ -706,6 +709,8 @@ auto bootstrap(Node &source, Node &n, std::mutex &vacuum_gate,
         if (!sg.owns_lock()) throw std::runtime_error{"source unavailable"};
         std::unique_lock<std::mutex> vl{vacuum_gate};
         auto m = source.holder->db.create_manifest();
+        n.joining_at.store(m.through_sequence, std::memory_order_release);
+        n.joining.store(true, std::memory_order_release);
         fs::remove_all(n.dir);
         fs::create_directories(n.dir);
         for (const auto &fi : m.files) {
@@ -745,10 +750,37 @@ auto bootstrap(Node &source, Node &n, std::mutex &vacuum_gate,
 // lag pauses, duplicate delivery, vacuum on n and restarts of n. The view
 // is read with n's gate held, so a promotion (which changes n's source
 // while holding n exclusively) never races an ingest into n.
+// The retain_after a vacuum on node `self` must use: the lowest position a
+// node could resume changes_since from, over every node that is serving or
+// joining, `self` aside. This is the replication service's decision, not
+// the engine's. A node whose position cannot be read right now (restarting,
+// being installed) counts as 0, which keeps everything. Without retention
+// (the sensitivity configuration) vacuum drops what it can.
+auto retention_point(std::vector<std::unique_ptr<Node>> &nodes,
+                     const ClusterView &view, int self, bool retain)
+    -> std::uint64_t {
+  if (!retain) return bytecask::kNoRetention;
+  const auto v = view.get();
+  auto point = bytecask::kNoRetention;
+  for (std::size_t i = 0; i < nodes.size(); ++i) {
+    auto &node = *nodes[i];
+    if (node.id == self) continue;
+    if (node.joining.load(std::memory_order_acquire)) {
+      point = std::min(point, node.joining_at.load(std::memory_order_acquire));
+      continue;
+    }
+    if (!v.serving[i]) continue;
+    std::uint64_t at = 0;
+    if (auto g = enter(node); g.owns_lock()) at = node.holder->db.durable_sequence();
+    point = std::min(point, at);
+  }
+  return point;
+}
+
 auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
-               const ClusterView &view, bool lag, std::uint64_t seed,
-               const std::atomic<bool> &stop, std::mutex &vacuum_gate,
-               const KeyPool &keys, ClusterStats &stats) -> void {
+               const ClusterView &view, bool lag, bool retain,
+               std::uint64_t seed, const std::atomic<bool> &stop,
+               ClusterStats &stats) -> void {
   std::mt19937_64 rng{seed};
   // A run lasts a few seconds, so the nemeses fire every few hundred ms.
   auto next_restart =
@@ -796,11 +828,12 @@ auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
     }
     auto &fdb = n.holder->db;
     auto &leader = sn.holder->db;
-    auto behind_history = false;
     try {
       if (rng() % 50 == 0) {
         const auto threshold = static_cast<double>(rng() % 60) / 100.0;
-        if (fdb.vacuum({.fragmentation_threshold = threshold}))
+        const auto retain_after = retention_point(nodes, view, n.id, retain);
+        if (fdb.vacuum({.fragmentation_threshold = threshold,
+                        .retain_after = retain_after}))
           stats.follower_vacuums.fetch_add(1, std::memory_order_relaxed);
       }
       auto from = fdb.durable_sequence();
@@ -842,12 +875,6 @@ auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
         ingest_owned(fdb, buf);
         stats.ingests.fetch_add(1, std::memory_order_relaxed);
       }
-    } catch (const bytecask::DbInvalidSequence &) {
-      // The source's vacuum dropped history n still needs (#168). A
-      // duplicate-delivery rewind can land below the source's
-      // min_resumable_sequence() too; that one just retries from where n is.
-      behind_history =
-          fdb.durable_sequence() < leader.min_resumable_sequence();
     } catch (const std::exception &) {
       // Restart from n's durable_sequence(), as the protocol says. A
       // degraded node recovers through resume().
@@ -858,17 +885,6 @@ auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
         } catch (const std::exception &) {
         }
       }
-    }
-    if (behind_history) {
-      // Resuming is refused, so n starts over from a manifest.
-      sg.unlock();
-      g.unlock();
-      stats.history_rebootstraps.fetch_add(1, std::memory_order_relaxed);
-      {
-        NodeExclusive x{n};
-        n.holder.reset();
-      }
-      bootstrap(sn, n, vacuum_gate, keys, stats);
     }
   }
 }
@@ -1047,11 +1063,11 @@ auto write_cluster_summary(const fs::path &path, ClusterStats &stats,
   out << std::format(
       R"(],"final_leader":{},"ingests":{},"ingest_errors":{},"restarts":{},)"
       R"("duplicates":{},"lag_pauses":{},"follower_vacuums":{},)"
-      R"("session_reads":{},"history_rebootstraps":{}}})",
+      R"("session_reads":{}}})",
       final_leader, stats.ingests.load(), stats.ingest_errors.load(),
       stats.restarts.load(), stats.duplicates.load(),
       stats.lag_pauses.load(), stats.follower_vacuums.load(),
-      stats.session_reads.load(), stats.history_rebootstraps.load());
+      stats.session_reads.load());
   out << "\n";
 }
 
@@ -1087,6 +1103,8 @@ auto parse_args(int argc, char **argv) -> RunOptions {
       o.out = next();
     } else if (a == "--no-vacuum") {
       o.no_vacuum = true;
+    } else if (a == "--no-retention") {
+      o.no_retention = true;
     } else if (a == "--no-degrade") {
       o.no_degrade = true;
     } else if (a == "--followers") {
@@ -1187,8 +1205,13 @@ auto run(const RunOptions &o) -> int {
         try {
           auto g = enter(ln);
           if (g.owns_lock()) {
+            // Under the gate, so a bootstrap between its manifest and its
+            // install is counted as joining.
             std::lock_guard<std::mutex> vg{vacuum_gate};
-            if (ln.holder->db.vacuum({.fragmentation_threshold = threshold}))
+            const auto retain_after =
+                retention_point(nodes, view, ln.id, !o.no_retention);
+            if (ln.holder->db.vacuum({.fragmentation_threshold = threshold,
+                                      .retain_after = retain_after}))
               totals.vacuums.fetch_add(1, std::memory_order_relaxed);
           }
         } catch (const std::exception &) {
@@ -1270,9 +1293,10 @@ auto run(const RunOptions &o) -> int {
             v.serving[static_cast<std::size_t>(i)] = true;
             at(v.source, i) = v.leader;
           });
+          node(i).joining.store(false, std::memory_order_release);
         }
-        replicate(nodes, node(i), view, o.lag, brng(), repl_stop, vacuum_gate,
-                  keys, cluster);
+        replicate(nodes, node(i), view, o.lag, !o.no_retention, brng(),
+                  repl_stop, cluster);
       });
       for (int r = 0; r < o.follower_readers; ++r) {
         reader_threads.emplace_back([&, i, r] {
@@ -1336,6 +1360,7 @@ auto run(const RunOptions &o) -> int {
         w.serving[static_cast<std::size_t>(i)] = true;
         at(w.source, i) = w.leader;
       });
+      node(i).joining.store(false, std::memory_order_release);
     }
   };
   if (o.topology && o.followers > 0) {
@@ -1488,14 +1513,13 @@ auto run(const RunOptions &o) -> int {
     write_cluster_summary(summary, cluster, final_leader);
     std::printf("  cluster: bootstraps=%zu events=%zu ingests=%d "
                 "ingest_errors=%d restarts=%d duplicates=%d lag_pauses=%d "
-                "follower_vacuums=%d session_reads=%d "
-                "history_rebootstraps=%d errors=%zu final_leader=%d\n",
+                "follower_vacuums=%d session_reads=%d errors=%zu "
+                "final_leader=%d\n",
                 cluster.bootstraps.size(), cluster.events.size(),
                 cluster.ingests.load(), cluster.ingest_errors.load(),
                 cluster.restarts.load(), cluster.duplicates.load(),
                 cluster.lag_pauses.load(), cluster.follower_vacuums.load(),
-                cluster.session_reads.load(),
-                cluster.history_rebootstraps.load(), cluster.errors.size(),
+                cluster.session_reads.load(), cluster.errors.size(),
                 final_leader);
   }
   nodes.clear();

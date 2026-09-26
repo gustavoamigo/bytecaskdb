@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -98,8 +99,17 @@ struct ReadOptions {
   bool verify_checksums{true};
 };
 
+// VacuumOptions::retain_after value meaning no restriction (-1).
+inline constexpr std::uint64_t kNoRetention =
+    std::numeric_limits<std::uint64_t>::max();
+
 struct VacuumOptions {
   double fragmentation_threshold{0.5};
+  // Entries above this sequence are kept even when dead, so changes_since
+  // from any sequence >= retain_after stays complete. Set by the
+  // replication service; kNoRetention (-1), the default, means no
+  // restriction.
+  std::uint64_t retain_after{kNoRetention};
 };
 
 struct Options {
@@ -166,16 +176,6 @@ public:
   DbFollowerMode(const DbFollowerMode&) = default;
   DbFollowerMode& operator=(const DbFollowerMode&) = default;
   ~DbFollowerMode() override = default;
-};
-
-// Thrown by changes_since when from_sequence is below
-// min_resumable_sequence(): vacuum has dropped history above it.
-class DbInvalidSequence : public std::runtime_error {
-public:
-  using std::runtime_error::runtime_error;
-  DbInvalidSequence(const DbInvalidSequence&) = default;
-  DbInvalidSequence& operator=(const DbInvalidSequence&) = default;
-  ~DbInvalidSequence() override = default;
 };
 #pragma clang diagnostic pop
 
@@ -493,9 +493,6 @@ public:
       std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const
       -> std::uint64_t;
 
-  // The lowest from_sequence changes_since accepts.
-  [[nodiscard]] auto min_resumable_sequence() const -> std::uint64_t;
-
   [[nodiscard]] auto create_manifest() -> FileManifest;
 
   [[nodiscard]] auto changes_since(const Snapshot& snap,
@@ -534,6 +531,7 @@ using WriteOptions         = internal::WriteOptions;
 using CommitResult         = internal::CommitResult;
 using ReadOptions          = internal::ReadOptions;
 using VacuumOptions        = internal::VacuumOptions;
+using internal::kNoRetention;
 using Options              = internal::Options;
 using SizeLimits           = internal::SizeLimits;
 using FileInfo             = internal::FileInfo;
@@ -541,7 +539,6 @@ using DataEntryView        = internal::DataEntryView;
 using EntryView            = internal::EntryView;
 using DbDegraded           = internal::DbDegraded;
 using DbFollowerMode       = internal::DbFollowerMode;
-using DbInvalidSequence    = internal::DbInvalidSequence;
 using DB                   = internal::DB;
 using Snapshot             = internal::Snapshot;
 using WritePlan            = internal::WritePlan;

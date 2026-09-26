@@ -43,14 +43,16 @@ from tests.proof.replication.scenario_matrix import (
 
 
 def baseline_call(state: StateShape) -> str:
-    """The leader baseline; a vacuumed leader needs its pre-vacuum stream."""
+    """The leader baseline; below stream_from it comes from the pre-vacuum
+    stream, which the follower is seeded with."""
     if state.needs_vacuum:
-        return "capture_replication_baseline(leader, &pre_vacuum)"
+        return "capture_replication_baseline(leader, &pre_vacuum, stream_from)"
     return "capture_replication_baseline(leader)"
 
 
 def seed_call(state: StateShape, indent: str) -> List[str]:
-    """Seeds a fresh follower below the leader's min_resumable_sequence()."""
+    """Seeds a fresh follower up to stream_from, the position the leader's
+    vacuum kept history above."""
     if state.needs_vacuum:
         return [f"{indent}seed_follower(follower, pre_vacuum, stream_from);"]
     return []
@@ -64,6 +66,8 @@ def gen_leader_workload(state: StateShape) -> str:
 
     lines: List[str] = []
     lines.append(f"    auto leader = bytecask::DB::open(leader_dir{opts});")
+    # Where a follower streams from: 0, unless the workload vacuums.
+    lines.append("    [[maybe_unused]] std::uint64_t stream_from = 0;")
     if state.needs_vacuum:
         lines.append("    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;")
 
@@ -155,6 +159,10 @@ def gen_leader_workload(state: StateShape) -> str:
         lines.append('      auto key = std::format("pre{:02d}", i);')
         lines.append("      leader.put({}, to_bytes(key), to_bytes(key));")
         lines.append("    }")
+        # The follower's position when the leader vacuums: it already holds
+        # the pre-keys, so the vacuum may drop their dead versions and must
+        # keep everything above.
+        lines.append("    stream_from = leader.durable_sequence();")
         lines.append("    {")
         lines.append("      bytecask::WritePlan plan;")
         lines.append('      plan.put(to_bytes("b1"), to_bytes("v1"));')
@@ -172,7 +180,7 @@ def gen_leader_workload(state: StateShape) -> str:
         )
         lines.append("    }")
         # The stream as it stood before the vacuum dropped part of it: what a
-        # follower holds below the leader's min_resumable_sequence().
+        # follower holds below stream_from.
         lines.append("    {")
         lines.append("      auto pre_snap = leader.snapshot();")
         lines.append(
@@ -180,17 +188,13 @@ def gen_leader_workload(state: StateShape) -> str:
         )
         lines.append("    }")
         lines.append(
-            "    (void)leader.vacuum({.fragmentation_threshold = 0.0});"
+            "    (void)leader.vacuum({.fragmentation_threshold = 0.0,"
+            " .retain_after = stream_from});"
         )
 
     else:
         raise ValueError(f"Unknown state label: {state.label}")
 
-    # Where a follower streams from: 0, unless vacuum has dropped history.
-    lines.append(
-        "    [[maybe_unused]] const auto stream_from ="
-        " leader.min_resumable_sequence();"
-    )
     return "\n".join(lines)
 
 

@@ -5,7 +5,6 @@
 
 module;
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -58,7 +57,6 @@ import bytecask.data_file;
 import bytecask.hint_entry;
 import bytecask.hint_file;
 import bytecask.radix_tree;
-import bytecask.serialization;
 export import bytecask.types;
 import bytecask.u32_map;
 import bytecask.util;
@@ -82,11 +80,25 @@ export using BytesView = std::span<const std::byte>;
 // ---------------------------------------------------------------------------
 // VacuumOptions — controls vacuum file selection.
 // ---------------------------------------------------------------------------
+// VacuumOptions::retain_after value meaning no restriction: -1 as an
+// unsigned sequence, above every sequence the engine assigns.
+export inline constexpr std::uint64_t kNoRetention =
+    std::numeric_limits<std::uint64_t>::max();
+
 export struct VacuumOptions {
   // Minimum fragmentation ratio a sealed file must exceed to be eligible for
   // vacuum: 1 − (live + tombstone + marker bytes) / total bytes, the share
   // of dead Puts compaction is sure to reclaim. Range [0.0, 1.0].
   double fragmentation_threshold{0.5};
+  // Entries with a sequence above this are kept even when dead: a dead Put
+  // or a tombstone vacuum could otherwise drop is copied into the compacted
+  // file, and a file holding one is never removed whole. changes_since from
+  // any sequence >= retain_after then still yields the complete history.
+  // Vacuum has to be coordinated with replication: the replication service
+  // passes the lowest durable_sequence() among the followers it counts on,
+  // on every node, since a follower can become leader. kNoRetention (-1),
+  // the default, means no restriction.
+  std::uint64_t retain_after{kNoRetention};
 };
 
 
@@ -691,7 +703,6 @@ private:
                        std::uint64_t next_seq,
                        std::uint64_t durable_seq,
                        std::uint64_t sync_requested_seq,
-                       std::uint64_t min_resumable_seq,
                        Mode mode,
                        bool degraded,
                        std::string degraded_reason);
@@ -707,7 +718,6 @@ private:
   std::uint64_t next_seq_;
   std::uint64_t durable_seq_;
   std::uint64_t sync_requested_seq_;
-  std::uint64_t min_resumable_seq_;
   Mode mode_;
   bool degraded_;
   std::string degraded_reason_;
@@ -742,19 +752,6 @@ public:
   DbFollowerMode(const DbFollowerMode &) = default;
   auto operator=(const DbFollowerMode &) -> DbFollowerMode & = default;
   ~DbFollowerMode() override;
-};
-
-// ---------------------------------------------------------------------------
-// DbInvalidSequence — thrown by changes_since when from_sequence is below
-// min_resumable_sequence(): vacuum has dropped entries above it, so the
-// stream would have gaps. The follower re-bootstraps from a manifest.
-// ---------------------------------------------------------------------------
-export class DbInvalidSequence : public std::runtime_error {
-public:
-  using std::runtime_error::runtime_error;
-  DbInvalidSequence(const DbInvalidSequence &) = default;
-  auto operator=(const DbInvalidSequence &) -> DbInvalidSequence & = default;
-  ~DbInvalidSequence() override;
 };
 
 // Default group-write byte-size threshold: plans above this size are routed
@@ -1127,10 +1124,6 @@ public:
       std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const
       -> std::uint64_t;
 
-  // The lowest from_sequence changes_since accepts: every entry above it is
-  // still on disk. Raised by vacuum as it drops entries; never decreases.
-  [[nodiscard]] auto min_resumable_sequence() const -> std::uint64_t;
-
   // Rotates the active file, waits for all hint files, and returns a
   // manifest of sealed files with a snapshot. Forces file rotation.
   // Vacuum must not run between create_manifest() and file transfer
@@ -1142,9 +1135,6 @@ public:
   // sequence order. Used for replication.
   // The upper bound is min(snap.sequence(), durable_sequence) — entries visible
   // in the snapshot but not yet fdatasync'd are excluded.
-  // Throws DbInvalidSequence when from_sequence is below the snapshot's
-  // min_resumable_sequence(): vacuum dropped entries above it, and the
-  // stream would have gaps.
   [[nodiscard]] auto changes_since(const Snapshot& snap, std::uint64_t from_sequence) const
       -> std::ranges::subrange<ChangeIterator, std::default_sentinel_t>;
 
@@ -1213,8 +1203,8 @@ private:
   static auto vacuum_scan_and_copy(
       const std::shared_ptr<const EngineState> &snap,
       const DataFile &source_file, WritableDataFile &dest_file,
-      std::uint32_t source_file_id, const NeededTombstones &needed)
-      -> VacuumScanResult;
+      std::uint32_t source_file_id, const NeededTombstones &needed,
+      std::uint64_t retain_after) -> VacuumScanResult;
   // Remaps key_dir entries, updates file registry, publishes new state. Caller must hold write_mu_.
   void vacuum_commit(std::uint32_t old_file_id, const VacuumScanResult &scan,
                      std::shared_ptr<DataFile> new_sealed_file,
@@ -1223,10 +1213,10 @@ private:
   void vacuum_unlink_old_file(const std::shared_ptr<const EngineState> &snap,
                               std::uint32_t file_id);
   // Rewrites a sealed file into a new sealed file containing only live entries.
-  [[nodiscard]] auto vacuum_compact_file(std::uint32_t file_id) -> bool;
+  [[nodiscard]] auto vacuum_compact_file(std::uint32_t file_id,
+                                         std::uint64_t retain_after) -> bool;
   // Appends live entries from a sealed file into the active file, then removes the sealed file.
   void vacuum_remove_file(std::uint32_t file_id);
-  void persist_min_resumable(std::uint64_t seq);
 
   // State access helpers — raw state_ access is confined here.
   // Per-thread read cache behind load_state_for_read (see ReadCacheSlot).
@@ -1481,10 +1471,6 @@ private:
   // Tombstones compaction must keep. Set by recovery during open, read-only
   // afterwards.
   NeededTombstones needed_tombstones_;
-  // Recovery left a data file out (lenient open): its history is gone.
-  bool recovery_skipped_files_{false};
-  // The min_resumable_seq on disk. Guarded by vacuum_mu_ after open.
-  std::uint64_t persisted_min_resumable_{0};
   // Solo writer — single-slot execution under write_mu_. Same submit()
   // interface as WriteGroup. Used for large batches or opts.solo benchmarking.
   SoloWriter solo_writer_{[this](auto &b) { execute_slots(b); }};
@@ -1804,104 +1790,8 @@ export struct EngineSlot : Slot {
 
 DbDegraded::~DbDegraded() = default;
 DbFollowerMode::~DbFollowerMode() = default;
-DbInvalidSequence::~DbInvalidSequence() = default;
 
 #pragma region Internal helpers
-
-#ifdef __APPLE__
-static inline int portable_fdatasync(int fd) { return fcntl(fd, F_FULLFSYNC); }
-#else
-static inline int portable_fdatasync(int fd) { return fdatasync(fd); }
-#endif
-
-// The file holding EngineState::min_resumable_seq: magic, the sequence and
-// a CRC-32C of both, little-endian. Replaced whole (write, fdatasync,
-// rename, directory fsync), so a reader sees the old value or the new one.
-constexpr std::string_view kMinResumableFile = "MIN_RESUMABLE_SEQUENCE";
-constexpr std::uint32_t kMinResumableMagic = 0x524D4342; // "BCMR"
-constexpr std::size_t kMinResumableFileSize = 4 + 8 + 4;
-
-[[noreturn]] void throw_errno(int err, const std::string &what) {
-  throw std::system_error{err, std::generic_category(), what};
-}
-
-void write_min_resumable_file(const std::filesystem::path &dir,
-                              std::uint64_t seq) {
-#ifdef BYTECASK_TESTING
-  FAULT_INJECTION(io_min_resumable_write);
-#endif
-  std::array<std::byte, kMinResumableFileSize> buf{};
-  Crc32 crc;
-  ByteWriter w{buf, &crc};
-  w.put(kMinResumableMagic);
-  w.put(seq);
-  write_le(std::span{buf}, w.pos(), crc.finalize());
-
-  const auto path = dir / kMinResumableFile;
-  auto tmp = path;
-  tmp += ".tmp";
-  const int fd =
-      ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-  if (fd == -1) throw_errno(errno, std::format("cannot create '{}'", tmp.string()));
-  std::size_t done = 0;
-  while (done < buf.size()) {
-    const auto n = ::write(fd, buf.data() + done, buf.size() - done);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      const auto err = errno;
-      ::close(fd);
-      throw_errno(err, std::format("cannot write '{}'", tmp.string()));
-    }
-    done += static_cast<std::size_t>(n);
-  }
-  if (portable_fdatasync(fd) != 0) {
-    const auto err = errno;
-    ::close(fd);
-    throw_errno(err, std::format("cannot sync '{}'", tmp.string()));
-  }
-  ::close(fd);
-  std::filesystem::rename(tmp, path);
-#ifndef __EMSCRIPTEN__
-  // The rename must be durable before vacuum unlinks the file whose entries
-  // this value accounts for. (Emscripten's filesystem layer has no
-  // directory fsync.)
-  const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  if (dfd == -1) throw_errno(errno, std::format("cannot open '{}'", dir.string()));
-  if (::fsync(dfd) != 0) {
-    const auto err = errno;
-    ::close(dfd);
-    throw_errno(err, std::format("cannot sync '{}'", dir.string()));
-  }
-  ::close(dfd);
-#endif
-}
-
-// nullopt when the file is missing or unreadable; the caller then assumes
-// the worst.
-auto read_min_resumable_file(const std::filesystem::path &dir)
-    -> std::optional<std::uint64_t> {
-  const auto path = dir / kMinResumableFile;
-  std::error_code ec;
-  if (!std::filesystem::exists(path, ec)) return std::nullopt;
-  std::array<std::byte, kMinResumableFileSize> buf{};
-  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd == -1) return std::nullopt;
-  const auto n = ::read(fd, buf.data(), buf.size());
-  std::array<std::byte, 1> extra{};
-  const auto more = ::read(fd, extra.data(), extra.size());
-  ::close(fd);
-  Crc32 crc;
-  crc.update(std::span{buf}.first(12));
-  if (n != static_cast<ssize_t>(buf.size()) || more != 0 ||
-      read_le<std::uint32_t>(buf, 0) != kMinResumableMagic ||
-      read_le<std::uint32_t>(buf, 12) != crc.finalize()) {
-    std::cerr << std::format("bytecask: '{}' is damaged; assuming every "
-                             "recovered sequence may have gaps below it\n",
-                             path.string());
-    return std::nullopt;
-  }
-  return read_le<std::uint64_t>(buf, 4);
-}
 
 namespace {
 
@@ -1950,21 +1840,20 @@ TransientEngineState::TransientEngineState(
     TransientU32Map<FileStats> file_stats,
     std::uint32_t active_file_id, std::uint32_t next_file_id,
     std::uint64_t next_seq, std::uint64_t durable_seq,
-    std::uint64_t sync_requested_seq, std::uint64_t min_resumable_seq,
+    std::uint64_t sync_requested_seq,
     Mode mode, bool degraded, std::string degraded_reason)
     : key_dir_{std::move(key_dir)}, files_{std::move(files)},
       file_stats_{std::move(file_stats)}, active_file_id_{active_file_id},
       next_file_id_{next_file_id}, next_seq_{next_seq},
       durable_seq_{durable_seq}, sync_requested_seq_{sync_requested_seq},
-      min_resumable_seq_{min_resumable_seq}, mode_{mode}, degraded_{degraded},
+      mode_{mode}, degraded_{degraded},
       degraded_reason_{std::move(degraded_reason)} {}
 
 auto EngineState::transient() const -> TransientEngineState {
   return TransientEngineState{
       key_dir.transient(), files.transient(), file_stats.transient(),
       active_file_id, next_file_id, next_seq, durable_seq,
-      sync_requested_seq, min_resumable_seq, mode, degraded,
-      degraded_reason};
+      sync_requested_seq, mode, degraded, degraded_reason};
 }
 
 auto TransientEngineState::validate_preconditions(
@@ -2412,7 +2301,6 @@ void TransientEngineState::apply_vacuum(
   }
 
   files_.erase(old_file_id);
-  min_resumable_seq_ = std::max(min_resumable_seq_, scan.max_dropped_sequence);
 
   file_stats_.erase(old_file_id);
   if (dest_file_id != active_file_id_) {
@@ -2591,7 +2479,6 @@ auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
   s->next_seq = next_seq_;
   s->durable_seq = durable_seq_;
   s->sync_requested_seq = sync_requested_seq_;
-  s->min_resumable_seq = min_resumable_seq_;
   s->mode = mode_;
   s->degraded = degraded_;
   s->degraded_reason = std::move(degraded_reason_);
@@ -2690,18 +2577,6 @@ DB::DB(std::filesystem::path dir, Options opts)
     initial->durable_seq =
         initial->next_seq > 0 ? initial->next_seq - 1 : 0;
     initial->mode = opts.initial_mode;
-    // Without a readable record of what vacuum dropped (a database from
-    // before the record existed, a node bootstrapped from copied files, a
-    // damaged record) or after a lenient open left a file out, any
-    // recovered sequence may have gaps below it: only resuming from the
-    // last one is safe.
-    const auto last_seq = initial->next_seq > 0 ? initial->next_seq - 1 : 0;
-    const auto recorded = read_min_resumable_file(dir_);
-    initial->min_resumable_seq =
-        recorded && !recovery_skipped_files_ ? *recorded : last_seq;
-    if (!recorded || *recorded != initial->min_resumable_seq)
-      write_min_resumable_file(dir_, initial->min_resumable_seq);
-    persisted_min_resumable_ = initial->min_resumable_seq;
     validate_state_consistency(*initial);
     store_initial_state(std::move(initial));
   } catch (...) {
@@ -3406,39 +3281,40 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
     active_id = s->active_file_id;
   }
 
-  // Find the highest-fragmentation sealed file above threshold. Tombstones
-  // and batch markers count as kept, not as fragmentation: a file is
-  // compacted for its dead Puts, so a file holding nothing else has nothing
-  // to reclaim.
-  std::uint32_t target_id{};
-  double worst_frag = 0.0;
+  // Sealed files above the threshold, most fragmented first. Tombstones and
+  // batch markers count as kept, not as fragmentation: a file is compacted
+  // for its dead Puts, so a file holding nothing else has nothing to
+  // reclaim. Nor has a file whose every entry is above retain_after.
+  std::vector<std::pair<double, std::uint32_t>> candidates;
   for (const auto [fid, fs] : stats_snap) {
     if (fid == active_id) continue;
     if (fs.total_bytes == 0) continue;
+    if (fs.min_sequence > opts.retain_after) continue;
     const auto frag = static_cast<double>(fs.reclaimable_bytes()) /
                       static_cast<double>(fs.total_bytes);
-    if (frag > worst_frag && frag > opts.fragmentation_threshold) {
-      worst_frag = frag;
-      target_id = fid;
+    if (frag > 0.0 && frag > opts.fragmentation_threshold)
+      candidates.emplace_back(frag, fid);
+  }
+  std::ranges::sort(candidates, std::greater<>{});
+
+  for (const auto &[frag, fid] : candidates) {
+    const auto &target = *stats_snap.get(fid);
+    // Fast path: nothing in the file needs keeping — skip the scan and drop
+    // it. A tombstone may need keeping even with no live key left: dropping
+    // it could let recovery resurrect a Put it shadows in an older file, and
+    // only compaction decides which tombstones can go. Nor may a file go
+    // whole while it holds an entry above retain_after.
+    if (target.live_bytes == 0 && target.tombstone_bytes == 0 &&
+        target.max_sequence <= opts.retain_after) {
+      vacuum_remove_file(fid);
+      return true;
     }
+    // Compaction returns false when it cannot make the file smaller: every
+    // dead entry in it may be above retain_after. The next candidate may
+    // still have something to reclaim.
+    if (vacuum_compact_file(fid, opts.retain_after)) return true;
   }
-
-  if (target_id == 0 && worst_frag == 0.0) return false;
-
-  const auto &target = *stats_snap.get(target_id);
-
-  // Fast path: nothing in the file needs keeping — skip the scan and drop it.
-  // A tombstone may need keeping even with no live key left: dropping it
-  // could let recovery resurrect a Put it shadows in an older file, and only
-  // compaction decides which tombstones can go.
-  if (target.live_bytes == 0 && target.tombstone_bytes == 0) {
-    vacuum_remove_file(target_id);
-    return true;
-  }
-
-  // All other files are compacted (sealed→sealed). Returns false when the
-  // scan finds nothing to reclaim.
-  return vacuum_compact_file(target_id);
+  return false;
 }
 
 #pragma endregion
@@ -3657,17 +3533,14 @@ void DB::flush_hints() {
 auto DB::vacuum_scan_and_copy(
     const std::shared_ptr<const EngineState> &snap,
     const DataFile &source_file, WritableDataFile &dest_file,
-    std::uint32_t source_file_id, const NeededTombstones &needed)
-    -> VacuumScanResult {
+    std::uint32_t source_file_id, const NeededTombstones &needed,
+    std::uint64_t retain_after) -> VacuumScanResult {
   VacuumScanResult result;
 
   auto track_seq = [&](std::uint64_t seq) {
     if (result.min_sequence == 0 || seq < result.min_sequence)
       result.min_sequence = seq;
     if (seq > result.max_sequence) result.max_sequence = seq;
-  };
-  auto track_dropped = [&](std::uint64_t seq) {
-    result.max_dropped_sequence = std::max(result.max_dropped_sequence, seq);
   };
 
   auto emit_entry = [&](const DataEntry &entry, Offset entry_off) {
@@ -3688,17 +3561,22 @@ auto DB::vacuum_scan_and_copy(
         result.mappings.push_back({std::vector<std::byte>{entry.key.begin(),
                                                           entry.key.end()},
                                    new_off, entry.sequence, val_size});
-      } else {
-        track_dropped(entry.sequence);
+      } else if (entry.sequence > retain_after) {
+        // Dead, but a follower may still need it: kept as history. It is
+        // counted in total_bytes and not in live_bytes, so it stays
+        // reclaimable for a later vacuum that may drop it.
+        std::ignore = dest_file.append_entry(entry.sequence, EntryType::Put,
+                                             entry.key, entry.value);
+        result.total_bytes += entry_size(entry.key.size(), entry.value.size());
+        track_seq(entry.sequence);
       }
       break;
     }
     case EntryType::Delete:
     case EntryType::RangeDel: {
       // A tombstone no older Put in another file needs goes with its file.
-      if (needed.droppable(entry.sequence)) {
+      if (entry.sequence <= retain_after && needed.droppable(entry.sequence)) {
         ++result.tombstones_dropped;
-        track_dropped(entry.sequence);
         break;
       }
       std::ignore = dest_file.append_entry(entry.sequence, entry.entry_type,
@@ -3748,14 +3626,6 @@ void DB::vacuum_commit(std::uint32_t old_file_id,
   store_state(current, std::move(t).persistent());
 }
 
-// Makes seq the recorded min_resumable_seq if it is higher. Called under
-// vacuum_mu_, before the vacuum that drops entries up to seq publishes.
-void DB::persist_min_resumable(std::uint64_t seq) {
-  if (seq <= persisted_min_resumable_) return;
-  write_min_resumable_file(dir_, seq);
-  persisted_min_resumable_ = seq;
-}
-
 // Unlinks the old data and hint files from the filesystem. Existing readers
 // continue via their open fds (POSIX: pread succeeds on unlinked files).
 void DB::vacuum_unlink_old_file(
@@ -3778,7 +3648,8 @@ void DB::vacuum_unlink_old_file(
 // not write_mu_.
 // The new data file is written to .data.tmp, then renamed atomically.
 // The old file is deferred for cleanup when no readers reference it.
-auto DB::vacuum_compact_file(std::uint32_t file_id) -> bool {
+auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
+    -> bool {
   auto snap = load_state_for_write();
   const auto &old_file = **snap->files.get(file_id);
 
@@ -3795,7 +3666,7 @@ auto DB::vacuum_compact_file(std::uint32_t file_id) -> bool {
         dir_, stem, ".data.tmp", rotation_threshold_,
         stagingBackend(io_backend_));
     scan = vacuum_scan_and_copy(snap, old_file, *tmp_file, file_id,
-                                needed_tombstones_);
+                                needed_tombstones_, retain_after);
     tmp_file->sync();
     tmp_file->shrink_to_fit();
   }
@@ -3819,17 +3690,6 @@ auto DB::vacuum_compact_file(std::uint32_t file_id) -> bool {
         static_cast<std::int64_t>(scan.tombstones_dropped),
         std::memory_order_relaxed);
     return true;
-  }
-
-  // Recorded before anything is published or unlinked: a crash from here
-  // on leaves the record ahead of the files, which costs a follower a
-  // re-bootstrap, never a gap it is not told about.
-  try {
-    persist_min_resumable(scan.max_dropped_sequence);
-  } catch (...) {
-    std::error_code ec;
-    std::filesystem::remove(tmp_data_path, ec);
-    throw;
   }
 
 #ifdef BYTECASK_TESTING
@@ -3888,14 +3748,10 @@ auto DB::vacuum_compact_file(std::uint32_t file_id) -> bool {
 // change and unlink the files. Called under vacuum_mu_.
 void DB::vacuum_remove_file(std::uint32_t file_id) {
   auto snap = load_state_for_write();
-  const auto &old_stats = *snap->file_stats.get(file_id);
-  const auto old_total = old_stats.total_bytes;
-  // Every entry of the file goes, so the history loses up to its last one.
-  persist_min_resumable(old_stats.max_sequence);
+  auto old_total = snap->file_stats.get(file_id)->total_bytes;
   {
     WriteBarrier barrier{*this};
     VacuumScanResult empty{};
-    empty.max_dropped_sequence = old_stats.max_sequence;
     // No new sealed file, so no id is consumed.
     vacuum_commit(file_id, empty, nullptr, 0);
   }
@@ -3990,8 +3846,6 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.hint_backpressure_stall_us.load(std::memory_order_relaxed)},
       // Gauges — current state, not monotonic.
       {"bytecask.degraded", s->degraded ? 1 : 0},
-      {"bytecask.min_resumable_sequence",
-       narrow<std::int64_t>(s->min_resumable_seq)},
       // Sealed files whose hint is queued or being written. What close must
       // still write, and what an open after a crash would rebuild.
       {"bytecask.hint_backlog", narrow<std::int64_t>(worker_.pending())},
@@ -4175,10 +4029,6 @@ void DB::wait_published(std::uint64_t sequence) const {
   });
 }
 
-auto DB::min_resumable_sequence() const -> std::uint64_t {
-  return load_state()->min_resumable_seq;
-}
-
 auto DB::durable_sequence(std::uint64_t min_sequence,
                          std::chrono::milliseconds timeout) const
     -> std::uint64_t {
@@ -4331,12 +4181,6 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
     deem_as_degraded(std::format(
         "invariant violation: next_file_id regressed from {} to {}",
         old_state->next_file_id, new_state->next_file_id));
-    return;
-  }
-  if (new_state->min_resumable_seq < old_state->min_resumable_seq) {
-    deem_as_degraded(std::format(
-        "invariant violation: min_resumable_seq regressed from {} to {}",
-        old_state->min_resumable_seq, new_state->min_resumable_seq));
     return;
   }
   if (new_state->durable_seq < old_state->durable_seq) {
@@ -4599,7 +4443,6 @@ auto DB::recovery_open(const Options &opts) -> EngineState {
     // A rerun after undoing an interrupted vacuum decides afresh; an empty
     // directory leaves it empty, which keeps every tombstone.
     needed_tombstones_ = {};
-    recovery_skipped_files_ = false;
     {
       EngineState s;
       auto files = recovery_prepare_files(s);
@@ -5129,7 +4972,6 @@ auto DB::recovery_load_parallel(EngineState s,
   plog.mark("live_bytes pass");
 
   // Phase 5: assembly.
-  recovery_skipped_files_ = final_result.skipped_files;
   needed_tombstones_ = recovery_needed_tombstones(
       std::move(final_result.needed_tombstones),
       final_result.range_tombstones, final_result.max_seq,
@@ -5741,7 +5583,6 @@ auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
     needed.insert(needed.end(), o.needed.begin(), o.needed.end());
     for (const auto idx : o.needed_ranges) range_tombstones[idx].needed = true;
   }
-  recovery_skipped_files_ = skipped_files;
   needed_tombstones_ = recovery_needed_tombstones(
       std::move(needed), range_tombstones, max_seq, skipped_files);
 
@@ -6109,7 +5950,6 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
   }
   const auto skipped_files =
       std::ranges::any_of(runs, [](const FileRun &run) { return !run.hint; });
-  recovery_skipped_files_ = skipped_files;
   needed_tombstones_ =
       recovery_needed_tombstones(std::move(needed), {}, max_seq, skipped_files);
   auto fstats_t = PersistentU32Map<FileStats>{}.transient();
@@ -6280,12 +6120,6 @@ auto DB::changes_since(const Snapshot& snap, std::uint64_t from_sequence) const
     -> std::ranges::subrange<ChangeIterator, std::default_sentinel_t> {
 
   auto state = snap.state();
-  if (from_sequence < state->min_resumable_seq) {
-    throw DbInvalidSequence{std::format(
-        "changes_since: from_sequence {} is below min_resumable_sequence {}; "
-        "vacuum has dropped entries above it. Re-bootstrap from a manifest.",
-        from_sequence, state->min_resumable_seq)};
-  }
   auto begin = ChangeIterator{state, from_sequence, state->durable_seq};
   return {std::move(begin), std::default_sentinel};
 }

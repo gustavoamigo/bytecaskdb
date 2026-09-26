@@ -372,15 +372,14 @@ Recovery decides this once per open and compaction applies it; a
 tombstone written since the open is always kept. A file whose Puts are all
 dead may be removed without a scan only if it holds no tombstone.
 
-### History Bound
+### Retention
 
-Before it publishes or unlinks anything, a vacuum that drops entries
-durably raises `min_resumable_sequence` to the highest sequence it drops
-(a whole-file removal: the file's `max_sequence`). If that write fails,
-the vacuum throws before anything is published and drops nothing; the
-engine is not degraded. The value never decreases and survives a
-restart; without a readable record, an open assumes the highest
-recovered sequence.
+Vacuum drops no entry with a sequence above `VacuumOptions::retain_after`:
+a dead Put or a droppable tombstone above it is copied into the compacted
+file, and a file is removed whole only when its `max_sequence` is at or
+below it. `kNoRetention` (−1), the default, restricts nothing. The value is
+the caller's: the replication service passes the lowest position a follower
+it counts on could resume from, on every node.
 
 ### Size Accounting
 
@@ -399,8 +398,9 @@ A file is eligible only for its dead Put bytes (`total_bytes` minus
 live, tombstone and marker bytes), so a file that is live data,
 tombstones and markers and nothing else is never selected. If a
 selected file's compaction still cannot make it smaller, the engine
-discards the staged copy and returns `false` rather than publishing an
-identical file.
+discards the staged copy and tries the next eligible file, returning
+`false` when none gets smaller, rather than publishing an identical file.
+A file whose every entry is above `retain_after` is not eligible.
 
 This is a termination guarantee, not only an efficiency one: every
 `true` removes bytes, so
@@ -734,11 +734,10 @@ tests, not through standalone `changes_since` proof tests.
 | Property | Contract |
 |----------|----------|
 | **Durable boundary** | Only entries confirmed by `fdatasync` are yielded. The upper bound is `min(snap.sequence(), durable_sequence)`. Entries from NoSync writes not yet covered by a subsequent `fdatasync` are excluded, even if visible via snapshots. |
-| **Completeness** | Every committed durable entry with `sequence > from_sequence` at snapshot time is yielded exactly once. |
-| **History bound** | Throws `DbInvalidSequence` when `from_sequence` is below the snapshot's `min_resumable_sequence()`: vacuum has dropped entries above it, and the stream would have gaps. At or above it, completeness holds. The caller re-bootstraps from a manifest. |
+| **Completeness** | Every committed durable entry with `sequence > from_sequence` at snapshot time is yielded exactly once, provided every vacuum since `from_sequence` was written ran with `retain_after <= from_sequence`. A vacuum with a higher `retain_after` (or none) may have dropped dead Puts and tombstones above `from_sequence`; the stream then skips them silently, and the caller must re-bootstrap instead (#168). |
 | **Ordering** | Entries are yielded in strictly ascending sequence order. |
 | **Batch integrity** | Incomplete batches (orphaned `BulkBegin` without `BulkEnd`) are excluded. `BulkBegin`/`BulkEnd` markers are preserved in the output. |
-| **Vacuum transparency** | After `vacuum_compact_file`, entries retain original sequences and batch markers. Above `min_resumable_sequence()`, `changes_since` over a vacuumed file yields the same entries as over the pre-vacuum file. |
+| **Vacuum transparency** | After `vacuum_compact_file`, entries retain original sequences and batch markers. Above the vacuum's `retain_after`, `changes_since` over a vacuumed file yields the same entries as over the pre-vacuum file. |
 | **Snapshot safety** | The iterator holds a `Snapshot` reference, keeping file descriptors open. Safe to run concurrently with vacuum (reads via fd, not path). |
 
 ---

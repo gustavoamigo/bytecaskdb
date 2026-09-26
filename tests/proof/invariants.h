@@ -505,12 +505,9 @@ inline auto count_structural_entries(const DB &db) -> std::map<EntryType, int> {
   std::map<EntryType, int> counts{{EntryType::BulkBegin, 0},
                                   {EntryType::BulkEnd, 0},
                                   {EntryType::RangeDel, 0}};
-  // Every entry on disk, below min_resumable_sequence() too: changes_since
-  // refuses to start there once vacuum has dropped anything.
-  auto state = db.engine_state();
-  for (ChangeIterator ci{state, 0, state->durable_seq};
-       ci != std::default_sentinel; ++ci) {
-    auto it = counts.find((*ci).entry_type);
+  auto snap = db.snapshot();
+  for (const auto &e : db.changes_since(snap, 0)) {
+    auto it = counts.find(e.entry_type);
     if (it != counts.end()) ++it->second;
   }
   return counts;
@@ -766,18 +763,18 @@ inline void apply_replicated(std::map<std::string, Bytes> &kv, EntryType type,
   }
 }
 
-// The state a follower replicating db ends in. Once vacuum has dropped
-// history, changes_since resumes only from db.min_resumable_sequence(), and
-// what lies below it comes from `history`: the leader's stream captured
-// before the vacuum, as a bootstrapped follower would hold it.
+// The state a follower replicating db ends in. A follower resuming at
+// `from` holds the history up to it already; when db has vacuumed with
+// retain_after = from, that part may be gone from db, so it comes from
+// `history`: the leader's stream captured before the vacuum.
 inline auto capture_replication_baseline(const DB &db,
-                                         const OwnedEntries *history = nullptr)
+                                         const OwnedEntries *history = nullptr,
+                                         std::uint64_t from = 0)
     -> ReplicationBaseline {
   ReplicationBaseline bl;
   auto state = db.engine_state();
   bl.durable_seq = state->durable_seq;
   bl.next_seq = state->next_seq;
-  const auto from = db.min_resumable_sequence();
   if (from > 0) {
     REQUIRE(history != nullptr);
     for (const auto &e : history->entries) {
@@ -794,8 +791,8 @@ inline auto capture_replication_baseline(const DB &db,
 }
 
 // Gives a fresh follower the leader's history up to `upto`, standing in for
-// the bootstrap a follower needs before it can resume at the leader's
-// min_resumable_sequence(). The cut must fall between batches.
+// the replication it did before the leader vacuumed with retain_after =
+// upto. The cut must fall between batches.
 inline void seed_follower(DB &follower, const OwnedEntries &history,
                           std::uint64_t upto) {
   if (upto == 0) return;

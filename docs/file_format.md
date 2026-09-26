@@ -16,7 +16,6 @@ my_db/
 ├── data_20260407123455_3b1e04c9f7a2e8b0_V01.hint   ← companion hint file (read-only)
 ├── data_20260407123454_c904f18255de7a63_V01.data
 ├── data_20260407123454_c904f18255de7a63_V01.hint
-├── MIN_RESUMABLE_SEQUENCE                           ← how far back history is complete
 └── ...
 ```
 
@@ -26,8 +25,6 @@ my_db/
 | `.hint`      | Compact index for a sealed data file. Stores the key and file offset, but not the value. Used to rebuild the in-memory key directory at startup without re-reading values. |
 | `.data.tmp`  | Partial data file being written by vacuum. Discarded at startup. |
 | `.hint.tmp`  | Partial hint file being written. Discarded at startup. |
-| `MIN_RESUMABLE_SEQUENCE` | The highest sequence vacuum has dropped; see [below](#min_resumable_sequence). |
-| `MIN_RESUMABLE_SEQUENCE.tmp` | Partial write of the above. Ignored, and overwritten by the next write. |
 
 ### File Naming
 
@@ -327,32 +324,9 @@ frame as well, before any frame is decoded.
 
 ---
 
-## MIN_RESUMABLE_SEQUENCE
-
-One per database directory, 16 bytes:
-
-| Offset | Size | Field | Value |
-|---:|---:|---|---|
-| 0 | 4 | magic | `0x524D4342` ("BCMR" read as bytes) |
-| 4 | 8 | sequence | the highest sequence vacuum has dropped; 0 if none |
-| 12 | 4 | CRC-32C | over bytes 0–11, not inverted |
-
-`changes_since` refuses a `from_sequence` below this value: every entry above
-it is still in the data files. Vacuum replaces the file before it publishes or
-unlinks anything (write `MIN_RESUMABLE_SEQUENCE.tmp`, `fdatasync`, `rename(2)`,
-`fsync` the directory), so the recorded value is never below what the data
-files are missing.
-
-A directory without the file, or with one of the wrong size, magic or CRC, is
-opened with the highest recovered sequence as the value, and that value is
-written. Databases from before the file existed open that way, and so does a
-directory assembled from a manifest's files.
-
----
-
 ## Byte Order
 
-All multi-byte integer fields in these file formats are **little-endian**.
+All multi-byte integer fields in both file formats are **little-endian**.
 
 ---
 

@@ -23,18 +23,20 @@ Each round runs the three configurations from one seed:
 
 With --cluster each round instead runs a leader with two followers
 (bootstrapped from a manifest under load, tailed with lag, duplicate delivery
-and restarts, and read from), in two configurations:
+and restarts, and read from), in three configurations:
 
     cluster         leader vacuum off. The leader's operations must pass the
                     guarded checks above; the whole history must be
                     serializable (follower reads may be stale, not
                     inconsistent) and pass the replication checks: prefix,
                     session, monotonic reads, convergence and bootstrap.
-    cluster-vacuum  leader vacuum on. Must pass everything cluster does.
-                    A follower that falls behind what vacuum kept is refused
-                    by changes_since (DbInvalidSequence) and re-bootstraps;
-                    at least one round over the run has to show that, or
-                    the configuration never reached the case (#168).
+    cluster-vacuum  leader vacuum on, with retain_after set to the lowest
+                    position a follower could resume from, as a replication
+                    service must. Must pass everything cluster does.
+    cluster-vacuum-unretained
+                    the same without retain_after. Expected to detect #168
+                    at least once over the run: a follower resuming below a
+                    compacted file receives a batch with entries missing.
 
 With --topology each round runs the same cluster while leadership moves:
 planned transfers to a random node, unplanned promotions, re-targeting of
@@ -66,7 +68,7 @@ from collections import defaultdict
 from pathlib import Path
 
 CONFIGS = ("guarded", "unguarded", "blind")
-CLUSTER_CONFIGS = ("cluster", "cluster-vacuum")
+CLUSTER_CONFIGS = ("cluster", "cluster-vacuum", "cluster-vacuum-unretained")
 TOPOLOGY_CONFIGS = ("topology", "topology-behind")
 
 # Anomalies write skew may show up as under strict-serializable. Anything
@@ -372,8 +374,10 @@ def check_cluster_round(args: argparse.Namespace, seed: int,
                "--followers", "2", "--lag",
                "--dir", str(round_dir / f"db-{config}"),
                "--out", str(history_path)]
-        cmd.append("--force-vacuum" if config == "cluster-vacuum"
+        cmd.append("--force-vacuum" if config.startswith("cluster-vacuum")
                    else "--no-vacuum")
+        if config == "cluster-vacuum-unretained":
+            cmd.append("--no-retention")
         if config.startswith("topology"):
             cmd.append("--topology")
         if config == "topology-behind":
@@ -422,9 +426,11 @@ def check_cluster_round(args: argparse.Namespace, seed: int,
                          round_dir / f"elle-{config}-all")
             print(f"  {config}: all nodes serializable {describe(a)}")
             elle_found = a.get("valid?") is not True
-        if config == "cluster-vacuum":
-            args.history_rebootstraps += summary.get("history_rebootstraps", 0)
-        if config == "topology-behind":
+        if config == "cluster-vacuum-unretained":
+            if leader_problems or not leader_valid:
+                raise CheckFailed(f"{config}: leader checks failed")
+            args.v168_seen |= bool(problems) or elle_found
+        elif config == "topology-behind":
             # A forked follower can later lead, so the fork may show in the
             # leader history too: any finding counts.
             args.fork_seen |= (bool(leader_problems) or not leader_valid
@@ -525,7 +531,7 @@ def main() -> int:
 
     shutil.rmtree(args.out, ignore_errors=True)
     args.write_skew_seen = False
-    args.history_rebootstraps = 0
+    args.v168_seen = False
     args.fork_seen = False
     rng = random.Random(seed)
     try:
@@ -537,12 +543,11 @@ def main() -> int:
                 check_cluster_round(args, round_seed, args.out / f"round-{r}")
             else:
                 check_round(args, round_seed, args.out / f"round-{r}")
-        if (args.cluster and not args.topology
-                and args.history_rebootstraps == 0):
+        if args.cluster and not args.topology and not args.v168_seen:
             raise CheckFailed(
-                "cluster-vacuum: no follower fell behind what vacuum kept; "
-                "the run never reached the case min_resumable_sequence "
-                "guards (#168)")
+                "cluster-vacuum-unretained: no round detected #168; the "
+                "harness is not shown to be sensitive to gaps in "
+                "changes_since")
         if args.topology and not args.fork_seen:
             raise CheckFailed(
                 "topology-behind: no round detected a fork; the harness is "

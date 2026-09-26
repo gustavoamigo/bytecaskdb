@@ -219,22 +219,23 @@ def test_mode_enum_values():
     assert bc.Mode.Follower is not None
 
 
-def test_changes_since_refuses_history_vacuum_dropped(tmp_path):
+def test_vacuum_retain_after_keeps_history(tmp_path):
     opts = bc.Options()
     opts.max_file_bytes = 128
-    db = bc.DB.open(str(tmp_path / "vacuumed"), opts)
-    assert db.min_resumable_sequence() == 0
-    for value in (b"old", b"new"):
-        for i in range(10):
-            db.put(f"k{i}".encode(), value)
+    db = bc.DB.open(str(tmp_path / "retained"), opts)
     vopts = bc.VacuumOptions()
+    assert vopts.retain_after == -1  # no restriction by default
+    for i in range(10):
+        db.put(f"k{i}".encode(), b"old")
+    retain = db.durable_sequence()
+    for i in range(10):
+        db.put(f"k{i}".encode(), b"new")
     vopts.fragmentation_threshold = 0.0
+    vopts.retain_after = retain
     while db.vacuum(vopts):
         pass
-    floor = db.min_resumable_sequence()
-    assert floor > 0
     snap = db.snapshot()
-    with pytest.raises(bc.DbInvalidSequence):
-        db.changes_since(snap, 0)
-    entries = list(db.changes_since(snap, floor))
-    assert entries[0].sequence == floor + 1
+    seqs = [e.sequence for e in db.changes_since(snap, retain)]
+    assert seqs == list(range(retain + 1, db.durable_sequence() + 1))
+    with pytest.raises(ValueError):
+        vopts.retain_after = -2
