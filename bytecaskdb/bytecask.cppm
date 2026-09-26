@@ -1770,6 +1770,10 @@ export struct EngineSlot : Slot {
   // which then reports the conflict only once that write is published.
   std::uint64_t conflict_lost_to{0};
   std::uint64_t conflict_snap_next{0};
+  // A sync slot that appended nothing: the sequence every earlier write
+  // reaches, which commit_wait makes durable before the slot returns. Its
+  // result keeps sequence 0 — the write itself wrote nothing.
+  std::uint64_t sync_through{0};
 };
 
 
@@ -2694,7 +2698,11 @@ auto DB::apply_batch(WriteOptions opts,
     if (s->degraded) throw DbDegraded{s->degraded_reason};
     throw DbFollowerMode{"write rejected: engine is in follower mode"};
   }
-  if (plan.empty()) return CommitResult{.sequence = 0, .durable = true};
+  // With sync, even an empty plan goes through the pipeline: it returns once
+  // every earlier write is durable (see execute_slots).
+  if (plan.empty() && !opts.sync) {
+    return CommitResult{.sequence = 0, .durable = true};
+  }
 
   EngineSlot slot;
   slot.plan = std::move(plan);
@@ -2716,7 +2724,9 @@ auto DB::apply_batch(WriteOptions opts,
 #ifdef BYTECASK_TESTING
   if (test_before_commit_wait_) test_before_commit_wait_();
 #endif
-  if (slot.result && slot.result->sequence != 0) commit_wait(slot);
+  if (slot.result && (slot.result->sequence != 0 || slot.sync_through != 0)) {
+    commit_wait(slot);
+  }
 
   // A conflict against a write the head holds but no snapshot can see yet.
   // Plans are validated against the head, which is right — two in-flight
@@ -2840,13 +2850,32 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     any_sync |= slot.opts.sync;
   }
 
+  // A sync slot that appended nothing (an empty, guard-only or no-op plan)
+  // still makes the promise every sync=true write makes: on return, every
+  // write before it is durable. It waits for the head's last sequence, which
+  // is how a caller that writes with sync=false bounds what a crash can lose.
+  const auto head_last_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
+  auto sync_only_pending = false;
+  for (auto *s : batch) {
+    auto &slot = static_cast<EngineSlot &>(*s);
+    if (slot.opts.sync && slot.result && slot.result->sequence == 0 &&
+        head_last_seq > published->durable_seq) {
+      slot.sync_through = head_last_seq;
+      sync_only_pending = true;
+    }
+  }
+
   if (all_entries.empty()) {
-    // No entry was appended by any slot (empty/guard-only plans only) —
-    // nothing to flush or publish. Every committed slot's {sequence = 0}
-    // result is trivially durable.
+    // No entry was appended by any slot: every result is {sequence = 0}.
+    // durable is true once nothing earlier is unsynced — at once, or after
+    // the flush this head now asks for (commit_wait).
     for (auto *s : batch) {
       auto &slot = static_cast<EngineSlot &>(*s);
-      if (slot.result) slot.result->durable = true;
+      if (slot.result) slot.result->durable = slot.sync_through == 0;
+    }
+    if (sync_only_pending) {
+      t.note_sync_requested(head_last_seq);
+      store_head(std::move(t).persistent());
     }
     return;
   }
@@ -2987,9 +3016,12 @@ void DB::flush_pending() {
   auto head = load_head();
   auto published = load_state();
   if (published->degraded) return;
-  if (head->next_seq <= published->next_seq) return;  // nothing pending
-
   const bool need_sync = head->sync_requested_seq > published->durable_seq;
+  // Nothing appended and no sync asked for. A sync-only write appends
+  // nothing but asks for one: the entries it covers may all be published
+  // already, by flushes that did not sync them.
+  if (head->next_seq <= published->next_seq && !need_sync) return;
+
   if (need_sync) {
 #ifdef BYTECASK_TESTING
     if (test_before_flush_sync_) test_before_flush_sync_();
@@ -3076,7 +3108,8 @@ auto DB::quiesce() -> FlushRole {
 
 void DB::commit_wait(EngineSlot &slot) {
   auto &result = *slot.result;
-  const auto target = result.sequence;
+  const auto target =
+      result.sequence != 0 ? result.sequence : slot.sync_through;
   const bool want_durable = slot.opts.sync;
   for (;;) {
     auto published = load_state();

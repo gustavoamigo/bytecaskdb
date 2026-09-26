@@ -4419,6 +4419,101 @@ TEST_CASE("apply_batch empty plan is a no-op", "[apply_batch]") {
   CHECK(to_string(*get_val(db, to_bytes("k"))) == "v0");
 }
 
+// A sync=true plan that writes nothing makes every earlier write durable:
+// how a caller writing with sync=false bounds what an OS crash can lose.
+TEST_CASE("apply_batch: an empty sync plan makes earlier unsynced writes "
+          "durable with one fdatasync", "[apply_batch][sync]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  const auto w1 = db.put({.sync = false}, to_bytes("k1"), to_bytes("v1"));
+  const auto w2 = db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+  REQUIRE_FALSE(w2.durable);
+  REQUIRE(db.durable_sequence() < w2.sequence);
+  const auto fsyncs_before = db.stats().at("bytecask.fsyncs");
+
+  const auto r = db.apply_batch({.sync = true}, bytecask::WritePlan{});
+
+  REQUIRE(r.has_value());
+  CHECK(r->durable);
+  CHECK(r->sequence == 0);  // it wrote nothing itself
+  CHECK(db.durable_sequence() >= w2.sequence);
+  CHECK(db.stats().at("bytecask.fsyncs") - fsyncs_before == 1);
+  CHECK(w1.sequence < w2.sequence);
+  const auto s = db.engine_state();
+  CHECK(s->durable_seq >= s->sync_requested_seq);
+
+  SECTION("a second one finds nothing to sync") {
+    const auto again = db.apply_batch({.sync = true}, bytecask::WritePlan{});
+    REQUIRE(again.has_value());
+    CHECK(again->durable);
+    CHECK(again->sequence == 0);
+    CHECK(db.stats().at("bytecask.fsyncs") - fsyncs_before == 1);
+  }
+}
+
+TEST_CASE("apply_batch: an empty plan without sync is still a no-op",
+          "[apply_batch][sync]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  const auto w = db.put({.sync = false}, to_bytes("k"), to_bytes("v"));
+  const auto fsyncs_before = db.stats().at("bytecask.fsyncs");
+
+  const auto r = db.apply_batch({.sync = false}, bytecask::WritePlan{});
+
+  REQUIRE(r.has_value());
+  CHECK(r->sequence == 0);
+  CHECK(r->durable);
+  CHECK(db.durable_sequence() < w.sequence);
+  CHECK(db.stats().at("bytecask.fsyncs") == fsyncs_before);
+}
+
+TEST_CASE("apply_batch: an empty sync plan on a fresh DB does not sync",
+          "[apply_batch][sync]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  const auto fsyncs_before = db.stats().at("bytecask.fsyncs");
+
+  const auto r = db.apply_batch({.sync = true}, bytecask::WritePlan{});
+
+  REQUIRE(r.has_value());
+  CHECK(r->sequence == 0);
+  CHECK(r->durable);
+  CHECK(db.stats().at("bytecask.fsyncs") == fsyncs_before);
+}
+
+TEST_CASE("apply_batch: a guard-only sync plan makes earlier unsynced writes "
+          "durable", "[apply_batch][sync]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  const auto w = db.put({.sync = false}, to_bytes("k"), to_bytes("v"));
+
+  bytecask::WritePlan plan;
+  plan.ensure_present(to_bytes("k"));
+  const auto r = db.apply_batch({.sync = true}, std::move(plan));
+
+  REQUIRE(r.has_value());
+  CHECK(r->durable);
+  CHECK(db.durable_sequence() >= w.sequence);
+}
+
+TEST_CASE("apply_batch: an empty sync plan whose fdatasync fails degrades "
+          "the engine", "[apply_batch][sync][degraded]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  const auto w = db.put({.sync = false}, to_bytes("k"), to_bytes("v"));
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    REQUIRE_THROWS_AS(db.apply_batch({.sync = true}, bytecask::WritePlan{}),
+                      std::system_error);
+  }
+  REQUIRE(db.is_degraded());
+  CHECK(db.durable_sequence() < w.sequence);
+  REQUIRE_THROWS_AS(db.apply_batch({.sync = true}, bytecask::WritePlan{}),
+                    bytecask::DbDegraded);
+  // The unsynced write was published before the failure and stays readable.
+  CHECK(db.contains_key({}, to_bytes("k")));
+}
+
 // ---------------------------------------------------------------------------
 // WritePlan guard tests
 // ---------------------------------------------------------------------------
@@ -9416,6 +9511,48 @@ auto blocked_count(const bytecask::DB &db) -> std::int64_t {
 }
 
 } // namespace
+
+// The periodic sync of a caller that writes with sync=false: while a
+// synced commit's fdatasync is in flight, a sync-only write waits behind it
+// like any synced writer, and the next flush covers it and the unsynced
+// writes before it with one more fdatasync.
+TEST_CASE("pipeline: a sync-only write joins group commit behind an "
+          "in-flight flush", "[pipeline][concurrency][sync]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("seed"), to_bytes("s"));
+  const auto fsyncs_before = db.stats().at("bytecask.fsyncs");
+
+  FlushGate gate;
+  db.test_before_flush_sync_ = gate.hook();
+
+  std::optional<bytecask::CommitResult> ra;
+  std::optional<bytecask::CommitResult> rs;
+  std::thread ta([&] { ra = db.put({.sync = true}, to_bytes("k1"), to_bytes("v1")); });
+  gate.wait_in_flush();
+
+  // Appended under the open flush, unsynced: published by the next flush.
+  bytecask::CommitResult unsynced;
+  std::thread tu([&] {
+    unsynced = db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+  });
+  wait_until([&] { return blocked_count(db) >= 1; });
+  std::thread ts([&] { rs = db.apply_batch({.sync = true}, bytecask::WritePlan{}); });
+  wait_until([&] { return blocked_count(db) >= 2; });
+
+  gate.open();
+  ta.join();
+  tu.join();
+  ts.join();
+  db.test_before_flush_sync_ = nullptr;
+
+  REQUIRE(ra.has_value());
+  REQUIRE(rs.has_value());
+  CHECK(rs->durable);
+  CHECK(db.durable_sequence() >= unsynced.sequence);
+  // k1's fdatasync, then one covering k2 and the sync-only write.
+  CHECK(db.stats().at("bytecask.fsyncs") - fsyncs_before == 2);
+}
 
 TEST_CASE("pipeline: sync write is invisible until its fdatasync returns; a "
           "writer appended behind it lands in the next flush",

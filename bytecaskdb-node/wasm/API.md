@@ -132,7 +132,7 @@ Atomically apply all operations in a `WritePlan`. Returns `null` on conflict whe
 
 - **plan** `WritePlan` — consumed by this call
 - **opts** `WriteOptions?`
-- **returns** `CommitResult | null` — `null` on conflict; an empty or guard-only plan that passes commits as a no-op (`{ sequence: 0n, durable: true }`)
+- **returns** `CommitResult | null` — `null` on conflict; an empty or guard-only plan that passes writes nothing and returns `{ sequence: 0n, durable: true }`; with `sync` (the default) it first makes every earlier write durable, so an empty plan flushes earlier `sync: false` writes
 - **throws** on I/O failure or `DbDegraded`
 
 ---

@@ -344,7 +344,13 @@ and `apply_batch`, which can report `nullopt` on an absent key or a
 conflict). `sequence` is the highest sequence assigned to the write (the
 `BulkEnd` marker's sequence for a multi-op batch); `0` means nothing was
 written (empty plan, guard-only plan, or empty-range `del_range`) —
-`durable` is always `true` in that case. `durable` reports whether
+`durable` is always `true` in that case. Such a write with `sync=true` still
+returns only once every earlier write is durable: if an earlier `sync=false`
+write left the active file unsynced, it waits for an `fdatasync` covering
+it, coalesced with group commit like any synced write. So
+`apply_batch({.sync = true}, WritePlan{})` is how a caller that writes with
+`sync=false` bounds what an OS crash can lose. With `sync=false` it returns
+at once. `durable` reports whether
 `fdatasync` confirmed the write before return: always `true` for
 `sync=true`, and possibly `true` for `sync=false` writes coalesced with a
 sync writer in the same group-commit batch or a rotation sync. A reader —
