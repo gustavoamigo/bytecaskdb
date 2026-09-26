@@ -83,13 +83,13 @@ static constexpr int kRangeLen1000 = 1000;
 // Batch size: number of write operations grouped into a single atomic batch.
 static constexpr int kBatchSize = 100;
 
-static const std::size_t kDatasetSize = [] {
-  const char *env = std::getenv("BC_DATASET_SIZE");
-  if (env && *env) {
-    return static_cast<std::size_t>(std::stoul(env));
-  }
-  return std::size_t{50'000};
-}();
+// Reads a size from the environment, or returns fallback when it is unset.
+static auto env_size(const char *name, std::size_t fallback) -> std::size_t {
+  const char *env = std::getenv(name);
+  return env && *env ? static_cast<std::size_t>(std::stoull(env)) : fallback;
+}
+
+static const std::size_t kDatasetSize = env_size("BC_DATASET_SIZE", 50'000);
 
 static constexpr std::size_t kMaxSamples = 1'000'000;
 static const int kCasStockItems = [] {
@@ -309,8 +309,15 @@ inline void cas_backoff(std::uint64_t failed_attempts) {
 // dataset resident once warmed, so the rows measure the hit path (the
 // pool_hit_ratio counter on the read rows confirms it), and the 256 MiB
 // floor clears DB::open's 2 x max_file_bytes minimum with room to spare.
-static const std::size_t kPoolCapacityBytes =
-    std::max(std::size_t{256} << 20, kDatasetSize * 512);
+// BC_POOL_BYTES overrides it, to measure a pool smaller than the dataset.
+static const std::size_t kPoolCapacityBytes = env_size(
+    "BC_POOL_BYTES", std::max(std::size_t{256} << 20, kDatasetSize * 512));
+
+// Data file rotation threshold for the ByteCaskDB adapters. BC_MAX_FILE_BYTES
+// overrides the engine default; a small pool needs it, since DB::open requires
+// the pool to hold at least two files.
+static const std::size_t kMaxFileBytes =
+    env_size("BC_MAX_FILE_BYTES", bytecask::Options{}.max_file_bytes);
 
 template <bytecask::IoBackend Backend>
 struct BcAdapterBase {
@@ -318,6 +325,7 @@ struct BcAdapterBase {
 
   static auto open_options() -> bytecask::Options {
     bytecask::Options opts;
+    opts.max_file_bytes = kMaxFileBytes;
     opts.io_backend = Backend;
     if constexpr (Backend == bytecask::IoBackend::BufferPool) {
       opts.buffer_pool = {.capacity_bytes = kPoolCapacityBytes,
@@ -1517,12 +1525,18 @@ BENCH(BM_Range<Bc, kRangeLen>)    ->Name("ByteCaskDB/Range50");
 BENCH(BM_MixedBatch<Bc, true>)      ->Name("ByteCaskDB/MixedBatch/Sync");
 
 // --- mmap read path, the bar for the pool's hit path ---
+// WASM has no mmap; there the bar is pread, which crosses into JS per read.
+#ifndef __EMSCRIPTEN__
 BENCH(BM_Get<BcMmap>)             ->Name("ByteCaskDB_Mmap/Get");
 BENCH(BM_Range<BcMmap, kRangeLen>)->Name("ByteCaskDB_Mmap/Range50");
+#else
+BENCH(BM_Get<BcPread>)             ->Name("ByteCaskDB_Pread/Get");
+BENCH(BM_Range<BcPread, kRangeLen>)->Name("ByteCaskDB_Pread/Range50");
+#endif
 
-// --- UnorderedView ---
-BENCH(BM_Put<BcUV, false>)          ->Name("ByteCaskDB_UnorderedView/Put/NoSync")->Iterations(kDatasetSize);
-BENCH(BM_Get<BcUV>)                 ->Name("ByteCaskDB_UnorderedView/Get");
+// --- UnorderedView (legacy, disabled; slated for removal) ---
+// BENCH(BM_Put<BcUV, false>)          ->Name("ByteCaskDB_UnorderedView/Put/NoSync")->Iterations(kDatasetSize);
+// BENCH(BM_Get<BcUV>)                 ->Name("ByteCaskDB_UnorderedView/Get");
 
 // --- RocksDB with UUIDv4 keys (apples-to-apples with UnorderedView) ---
 #ifndef BENCH_NO_ROCKSDB
@@ -1593,12 +1607,12 @@ BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(8
 BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(16);
 BENCH(BM_GetMT<Rdb>)                ->Name("RocksDB/GetMT")           ->Threads(32);
 #endif
-// --- UnorderedView GetMT ---
-BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(2);
-BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(4);
-BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(8);
-BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(16);
-BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(32);
+// --- UnorderedView GetMT (legacy, disabled; slated for removal) ---
+// BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(2);
+// BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(4);
+// BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(8);
+// BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(16);
+// BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(32);
 
 // --- ReadAndWriteLoad (read throughput with 1 background writer) ---
 BENCH(BM_ReadWhileWriting<Bc, true>)            ->Name("ByteCaskDB/ReadAndWriteLoad/Sync")            ->Threads(2);
@@ -1708,6 +1722,8 @@ BENCH(BM_CasMT<RdbCas, true>)  ->Name("RocksDB/CasMT/Sync")      ->Threads(32);
 // NOLINTNEXTLINE(cert-err58-cpp)
 const bool kDatasetSizeContext = [] {
   benchmark::AddCustomContext("dataset_size", std::to_string(kDatasetSize));
+  benchmark::AddCustomContext("pool_bytes", std::to_string(kPoolCapacityBytes));
+  benchmark::AddCustomContext("max_file_bytes", std::to_string(kMaxFileBytes));
   return true;
 }();
 

@@ -48,6 +48,15 @@ auto to_bytes(std::string_view sv) -> std::span<const std::byte> {
   return std::as_bytes(std::span{sv.data(), sv.size()});
 }
 
+// Skips the calling test where dies_by_panic cannot run: WASM has no fork(),
+// and a panic there ends the whole instance. Call it first thing in the test
+// body; a SKIP from inside a CHECK expression is reported as a failure.
+void skip_without_fork() {
+#ifdef __EMSCRIPTEN__
+  SKIP("panic() cannot be observed without fork()");
+#endif
+}
+
 // Runs fn in a forked child and reports whether it died on SIGABRT.
 // panic() aborts by design — it must not be catchable — so proving it fires
 // needs a separate process rather than a REQUIRE_THROWS. The child's stderr is
@@ -732,6 +741,7 @@ TEST_CASE("ReadOnlyMmapDataFile::scan returns nullopt on truncated entry body",
 
 TEST_CASE("createDataFileForWrite panics when the data file already exists",
           "[data_file][panic]") {
+  skip_without_fork();
   const auto dir = std::filesystem::temp_directory_path() / "bc_test_stem_data";
   std::filesystem::remove_all(dir);
   std::filesystem::create_directories(dir);
@@ -761,6 +771,7 @@ TEST_CASE("createDataFileForWrite panics when the data file already exists",
 
 TEST_CASE("createDataFileForWrite panics when the stem was already hinted",
           "[data_file][panic]") {
+  skip_without_fork();
   const auto dir = std::filesystem::temp_directory_path() / "bc_test_stem_hint";
   std::filesystem::remove_all(dir);
   std::filesystem::create_directories(dir);
@@ -825,6 +836,7 @@ TEST_CASE("renameDataFileExclusive places a staged file", "[data_file]") {
 
 TEST_CASE("renameDataFileExclusive panics rather than replacing a live file",
           "[data_file][panic]") {
+  skip_without_fork();
   const auto dir = std::filesystem::temp_directory_path() / "bc_test_place_bad";
   std::filesystem::remove_all(dir);
   std::filesystem::create_directories(dir);

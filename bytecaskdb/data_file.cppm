@@ -579,11 +579,6 @@ struct WritableFileOps {
   // here; the next sync covers them. A 1 MiB scratch buffer is enough,
   // since the cost is the page-cache memcpy, not the call count.
   void ensure_zeroed(Offset write_end) {
-#ifdef __EMSCRIPTEN__
-    // MEMFS holds files in memory: nothing to gain, and a zero tail would
-    // be resident memory.
-    (void)write_end;
-#else
     if (capacity_ == 0 || write_end <= zeroed_end_) return;
     const auto chunk_end = (write_end + kZeroFillChunkBytes - 1) /
                            kZeroFillChunkBytes * kZeroFillChunkBytes;
@@ -604,7 +599,6 @@ struct WritableFileOps {
       off += len;
     }
     zeroed_end_ = target;
-#endif
   }
 
   // See WritableDataFile::shrink_to_fit. ftruncate + fdatasync: the size
@@ -1805,11 +1799,11 @@ export [[nodiscard]] inline auto openDataFileForRead(
     std::filesystem::path path, IoBackend backend = IoBackend::Pread,
     std::shared_ptr<BufferPool> pool = nullptr, std::uint32_t file_id = 0)
     -> std::shared_ptr<DataFile> {
-#ifndef __EMSCRIPTEN__
   if (backend == IoBackend::BufferPool) {
     return ReadOnlyBufferPoolDataFile::openForRead(
         std::move(path), file_id, require_pool(std::move(pool), "openDataFileForRead"));
   }
+#ifndef __EMSCRIPTEN__
   if (backend == IoBackend::Mmap) {
     struct stat st {};
     if (::stat(path.c_str(), &st) == 0 && st.st_size > 0) {
@@ -1829,12 +1823,12 @@ export [[nodiscard]] inline auto openDataFileForWrite(
     std::filesystem::path path, std::size_t capacity, IoBackend backend,
     std::shared_ptr<BufferPool> pool = nullptr, std::uint32_t file_id = 0)
     -> std::shared_ptr<WritableDataFile> {
-#ifndef __EMSCRIPTEN__
   if (backend == IoBackend::BufferPool) {
     return WritableBufferPoolDataFile::create(
         std::move(path), capacity, /*exclusive=*/false,
         PoolIo{require_pool(std::move(pool), "openDataFileForWrite"), file_id});
   }
+#ifndef __EMSCRIPTEN__
   if (backend == IoBackend::Mmap && capacity > 0) {
     return WritableMmapDataFile::create(std::move(path), capacity);
   }
@@ -1870,12 +1864,12 @@ export [[nodiscard]] inline auto createDataFileForWrite(
         stem, hint_path.string()));
   }
   auto path = dir / (stem + std::string{suffix});
-#ifndef __EMSCRIPTEN__
   if (backend == IoBackend::BufferPool) {
     return WritableBufferPoolDataFile::create(
         std::move(path), capacity, /*exclusive=*/true,
         PoolIo{require_pool(std::move(pool), "createDataFileForWrite"), file_id});
   }
+#ifndef __EMSCRIPTEN__
   if (backend == IoBackend::Mmap && capacity > 0) {
     return WritableMmapDataFile::create(std::move(path), capacity,
                                         /*exclusive=*/true);

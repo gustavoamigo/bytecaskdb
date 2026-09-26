@@ -101,7 +101,7 @@ Each pool-backed sealed file opens a second descriptor for frame fills through `
 
 **Vacuum needs no invalidation.** File ids are strictly monotonic and never reused within a process, so when vacuum unlinks a file nothing will ever look up its frames again. They are orphans, not stale entries, and the hand reclaims them on its next pass since their visited bits stay clear. *If file ids ever become reusable, this reasoning breaks* and a per-frame generation stamp becomes a correctness requirement.
 
-**`truncate()`** (from `resume()`) needs nothing either: every published entry lies below the truncation point, and the file is sealed immediately afterwards. **Snapshots** hold files open, so nothing they reference can be unlinked. **Recovery** reads hint files and is untouched. **Emscripten** rejects the back-end at open: MEMFS is already memory.
+**`truncate()`** (from `resume()`) needs nothing either: every published entry lies below the truncation point, and the file is sealed immediately afterwards. **Snapshots** hold files open, so nothing they reference can be unlinked. **Recovery** reads hint files and is untouched. **Emscripten** accepts the back-end without `O_DIRECT`: `open_uncached` reports no uncached read there, so every file fills through the buffered path. The Node builds use `NODERAWFS`, where every `pread` is a call out to Node's `fs`; a hit skips it, which is the reason to run the pool on WASM. At 100k keys the WASM `Get` went from 468 K to 1.25 M ops/s, and `Range50` from 16 K to 214 K scans/s. WASM linear memory never shrinks, so the pool's frames stay reserved until the process exits.
 
 | Path | Uses the pool? |
 |---|---|

@@ -672,6 +672,8 @@ end
 -- Common WASM source files and crc32c dependency.
 local function add_wasm_sources()
     add_files("bytecaskdb/*.cppm")
+    -- Real link() under NODERAWFS; see the file.
+    add_files(path.join(wasm_dir, "node_linkat.c"))
     add_includedirs(path.join(wasm_crc32c, "include"))
     add_linkdirs(path.join(wasm_crc32c, "lib"))
     add_links("crc32c")
@@ -756,7 +758,7 @@ target("wasm_tests")
     remove_files("tests/bytecask_c_test.cpp")
     add_files("bytecaskdb-node/wasm/catch2_stringmakers.cpp")
     add_includedirs("bytecaskdb", "tests")
-    add_defines("BYTECASK_TESTING")
+    add_defines("BYTECASK_TESTING", "BYTECASK_RADIX_ACCOUNTING")
     on_config(function(t)
         local catch2_prefix = path.join(wasm_dir, "build", "catch2-wasm")
         t:add("includedirs", path.join(catch2_prefix, "include"))

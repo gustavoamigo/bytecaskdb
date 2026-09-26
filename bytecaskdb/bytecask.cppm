@@ -2426,12 +2426,6 @@ DB::DB(std::filesystem::path dir, Options opts)
         "heap instead of avoiding a copy, so this build always uses the "
         "pread-based data file regardless of this option"};
   }
-  if (opts.io_backend == IoBackend::BufferPool) {
-    throw std::invalid_argument{
-        "IoBackend::BufferPool is not supported on WASM/Emscripten builds: "
-        "MEMFS is already memory, so there is no page cache to bound and the "
-        "pool would only add a second copy of every value"};
-  }
 #endif
   if (opts.io_backend == IoBackend::BufferPool) {
     // The active file is pinned in the pool by a later phase; until then the

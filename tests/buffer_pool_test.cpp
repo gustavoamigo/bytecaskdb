@@ -92,7 +92,8 @@ constexpr std::size_t kRoomyCapacity = 4 * 1024 * 1024;
 // readers do not serialise on one cache line. What makes that a counter
 // rather than an estimate: every increment lands, whichever stripe a thread
 // draws, and more threads than stripes share them without losing any.
-TEST_CASE("StripedCounter: concurrent adds sum exactly", "[buffer_pool]") {
+TEST_CASE("StripedCounter: concurrent adds sum exactly",
+          "[buffer_pool][concurrency]") {
   bytecask::StripedCounter counter;
   constexpr int kThreads = 40;  // more than the stripe count
   constexpr int kAddsPerThread = 10'000;
@@ -418,7 +419,7 @@ TEST_CASE("BufferPool: a partial miss reads only the missing frames",
 }
 
 TEST_CASE("BufferPool: concurrent readers never observe a torn frame",
-          "[buffer_pool]") {
+          "[buffer_pool][concurrency]") {
   // Frames are reused memory, so a reader racing evict-then-refill would get
   // bytes that are part old and part new. This is what the seqlock is for.
   ScratchFile file{1024 * 1024};
@@ -454,7 +455,7 @@ TEST_CASE("BufferPool: concurrent readers never observe a torn frame",
 
 TEST_CASE("BufferPool: every frame is claimable and pinnable again once "
           "readers stop",
-          "[buffer_pool]") {
+          "[buffer_pool][concurrency]") {
   // A reader that loaded a slot just before eviction claimed its frame pins
   // a dead frame: the pin fails and is dropped again. If the refill cleared
   // the dead bit with a store of zero in between, that drop would wrap the
@@ -650,7 +651,7 @@ TEST_CASE("BufferPool: block fills against pread under constant eviction",
 }
 
 TEST_CASE("BufferPool: concurrent block fills never tear a frame",
-          "[buffer_pool]") {
+          "[buffer_pool][concurrency]") {
   ScratchFile file{8 * 1024 * 1024};
   const std::size_t capacity = 12 * bytecask::kPoolFillBlockBytes;
   bytecask::BufferPool pool{

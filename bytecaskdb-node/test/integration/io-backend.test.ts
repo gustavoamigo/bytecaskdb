@@ -1,10 +1,9 @@
 // IoBackend / BufferPoolOptions tests for ByteCaskDB (buffer pool bindings).
 //
-// The WASM backend only supports IoBackend.Pread: DB::open rejects both
-// 'mmap' and 'bufferPool' on Emscripten builds (mmap emulation would
-// double-buffer into the WASM heap, and MEMFS is already memory, so there
-// is no page cache for the pool to bound — see docs/buffer_pool_design.md).
-// The native backend supports all three.
+// The native backend supports all three back-ends. The WASM backend supports
+// 'pread' and 'bufferPool' and rejects 'mmap': mmap emulation would
+// double-buffer the data file into the WASM heap. There the pool's value is
+// that a hit skips the per-read call out to Node's fs.
 import { join } from 'node:path'
 import { test, expect, encodeString, decodeBytes } from '../fixtures/index.js'
 
@@ -42,31 +41,23 @@ test.skipIf(isNative)('mmap ioBackend is rejected on the WASM backend', async ({
   expect(() => wasmBackend.open(dbPath, { ioBackend: 'mmap' })).toThrow()
 })
 
-test.skipIf(isNative)('bufferPool ioBackend is rejected on the WASM backend', async ({ tmpDir, wasmBackend }) => {
-  const dbPath = join(tmpDir, 'buffer-pool-io-backend-wasm.db')
-  expect(() =>
-    wasmBackend.open(dbPath, {
-      ioBackend: 'bufferPool',
-      bufferPool: { capacityBytes: 16 * 1024 * 1024 },
-    }),
-  ).toThrow()
-})
-
-test.skipIf(!isNative)(
+test(
   'bufferPool ioBackend rejects a capacity below 2x maxFileBytes',
   async ({ tmpDir, wasmBackend }) => {
     const dbPath = join(tmpDir, 'buffer-pool-too-small.db')
-    expect(() =>
+    const open = () =>
       wasmBackend.open(dbPath, {
         maxFileBytes: 4 * 1024 * 1024,
         ioBackend: 'bufferPool',
         bufferPool: { capacityBytes: 1024 * 1024 },
-      }),
-    ).toThrow(/buffer.?pool|capacity/i)
+      })
+    // The WASM backend surfaces C++ exceptions without their message.
+    if (isNative) expect(open).toThrow(/buffer.?pool|capacity/i)
+    else expect(open).toThrow()
   },
 )
 
-test.skipIf(!isNative)(
+test(
   'bufferPool ioBackend serves reads and reports pool counters in stats',
   async ({ tmpDir, wasmBackend }) => {
     const dbPath = join(tmpDir, 'buffer-pool.db')
