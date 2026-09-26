@@ -1630,7 +1630,10 @@ direct cross-check against each write's commit sequence, and
 `isolation-nightly.yml` runs it every night. Its first runs, on a base
 without #170, hung on the rotation-barrier bug that the chaos soak had
 found independently (listed in its findings table above). See
-[`isolation_checking_design.md`](isolation_checking_design.md).
+[`isolation_checking_design.md`](isolation_checking_design.md). Its extension
+to the whole replication protocol (bootstrap, tailing, planned transfer,
+promotion, re-targeting) is designed in
+[`replication_checking_design.md`](replication_checking_design.md).
 
 ---
 

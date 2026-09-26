@@ -149,7 +149,9 @@ Each run draws from these per seed:
   entries for writes refused at entry.
 - **I/O backend.** `Pread`, `Mmap`, or `BufferPool`, drawn per run.
 
-Replication and SIGKILL are not nemeses here. #178 and #176 add them.
+Replication and SIGKILL are not nemeses here. #178 adds replication, and
+[`replication_checking_design.md`](replication_checking_design.md) designs
+it. #176 adds SIGKILL.
 
 ## Implementation
 
