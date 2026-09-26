@@ -21,6 +21,13 @@ class DbFollowerMode(RuntimeError):
     Use ``DB.ingest()`` for replication writes in follower mode.
     """
 
+class DbInvalidSequence(RuntimeError):
+    """Raised by ``DB.changes_since()`` when *from_sequence* is below
+    ``DB.min_resumable_sequence()``: vacuum has dropped entries above it.
+
+    The follower re-bootstraps from a manifest.
+    """
+
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
@@ -495,6 +502,11 @@ class DB:
         """
         ...
 
+    def min_resumable_sequence(self) -> int:
+        """The lowest *from_sequence* ``changes_since`` accepts: vacuum has
+        dropped no entry above it."""
+        ...
+
     def create_manifest(self) -> FileManifest:
         """Return a manifest of sealed files with a snapshot."""
         ...
@@ -502,7 +514,11 @@ class DB:
     def changes_since(
         self, snapshot: Snapshot, from_sequence: int
     ) -> ChangeIterator:
-        """Iterate data entries with sequence > from_sequence."""
+        """Iterate data entries with sequence > from_sequence.
+
+        Raises ``DbInvalidSequence`` when *from_sequence* is below
+        ``min_resumable_sequence()``.
+        """
         ...
 
     def ingest(self, entries: list[DataEntry]) -> None:

@@ -505,9 +505,12 @@ inline auto count_structural_entries(const DB &db) -> std::map<EntryType, int> {
   std::map<EntryType, int> counts{{EntryType::BulkBegin, 0},
                                   {EntryType::BulkEnd, 0},
                                   {EntryType::RangeDel, 0}};
-  auto snap = db.snapshot();
-  for (const auto &e : db.changes_since(snap, 0)) {
-    auto it = counts.find(e.entry_type);
+  // Every entry on disk, below min_resumable_sequence() too: changes_since
+  // refuses to start there once vacuum has dropped anything.
+  auto state = db.engine_state();
+  for (ChangeIterator ci{state, 0, state->durable_seq};
+       ci != std::default_sentinel; ++ci) {
+    auto it = counts.find((*ci).entry_type);
     if (it != counts.end()) ++it->second;
   }
   return counts;
@@ -739,38 +742,74 @@ struct ReplicationBaseline {
   std::map<std::string, Bytes> key_values;
 };
 
-inline auto capture_replication_baseline(const DB &db) -> ReplicationBaseline {
+// Applies one replicated entry to an expected key-value map.
+inline void apply_replicated(std::map<std::string, Bytes> &kv, EntryType type,
+                             std::span<const std::byte> key,
+                             std::span<const std::byte> value) {
+  auto key_str = to_string(key);
+  switch (type) {
+    case EntryType::Put:
+      kv[key_str] = Bytes{value.begin(), value.end()};
+      break;
+    case EntryType::Delete:
+      kv.erase(key_str);
+      break;
+    case EntryType::RangeDel: {
+      auto to_str = to_string(value);
+      auto it = kv.lower_bound(key_str);
+      while (it != kv.end() && it->first < to_str) it = kv.erase(it);
+      break;
+    }
+    case EntryType::BulkBegin:
+    case EntryType::BulkEnd:
+      break;
+  }
+}
+
+// The state a follower replicating db ends in. Once vacuum has dropped
+// history, changes_since resumes only from db.min_resumable_sequence(), and
+// what lies below it comes from `history`: the leader's stream captured
+// before the vacuum, as a bootstrapped follower would hold it.
+inline auto capture_replication_baseline(const DB &db,
+                                         const OwnedEntries *history = nullptr)
+    -> ReplicationBaseline {
   ReplicationBaseline bl;
   auto state = db.engine_state();
   bl.durable_seq = state->durable_seq;
   bl.next_seq = state->next_seq;
-  // Replay changes_since to build the exact key-value set that the
-  // replication pipeline would deliver. This respects the durable_seq
-  // boundary — unsync'd entries are excluded.
-  auto snap = db.snapshot();
-  for (const auto &e : db.changes_since(snap, 0)) {
-    auto key_str = to_string(e.key);
-    switch (e.entry_type) {
-      case EntryType::Put:
-        bl.key_values[key_str] = Bytes{e.value.begin(), e.value.end()};
-        break;
-      case EntryType::Delete:
-        bl.key_values.erase(key_str);
-        break;
-      case EntryType::RangeDel: {
-        auto to_str = to_string(e.value);
-        auto it = bl.key_values.lower_bound(key_str);
-        while (it != bl.key_values.end() && it->first < to_str) {
-          it = bl.key_values.erase(it);
-        }
-        break;
-      }
-      case EntryType::BulkBegin:
-      case EntryType::BulkEnd:
-        break;
+  const auto from = db.min_resumable_sequence();
+  if (from > 0) {
+    REQUIRE(history != nullptr);
+    for (const auto &e : history->entries) {
+      if (e.sequence > from) break;
+      apply_replicated(bl.key_values, e.entry_type, e.key, e.value);
     }
   }
+  // Respects the durable_seq boundary: unsync'd entries are excluded.
+  auto snap = db.snapshot();
+  for (const auto &e : db.changes_since(snap, from)) {
+    apply_replicated(bl.key_values, e.entry_type, e.key, e.value);
+  }
   return bl;
+}
+
+// Gives a fresh follower the leader's history up to `upto`, standing in for
+// the bootstrap a follower needs before it can resume at the leader's
+// min_resumable_sequence(). The cut must fall between batches.
+inline void seed_follower(DB &follower, const OwnedEntries &history,
+                          std::uint64_t upto) {
+  if (upto == 0) return;
+  std::vector<DataEntryView> seed;
+  bool in_batch = false;
+  for (const auto &e : history.entries) {
+    if (e.sequence > upto) break;
+    if (e.entry_type == EntryType::BulkBegin) in_batch = true;
+    if (e.entry_type == EntryType::BulkEnd) in_batch = false;
+    seed.push_back({e.sequence, e.entry_type, e.key, e.value});
+  }
+  REQUIRE_FALSE(in_batch);
+  follower.ingest(seed);
+  REQUIRE(follower.durable_sequence() == upto);
 }
 
 // Asserts that the follower matches the leader's baseline (SUCCESS case).

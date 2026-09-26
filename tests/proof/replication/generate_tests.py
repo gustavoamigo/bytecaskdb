@@ -42,6 +42,20 @@ from tests.proof.replication.scenario_matrix import (
 # ---------------------------------------------------------------------------
 
 
+def baseline_call(state: StateShape) -> str:
+    """The leader baseline; a vacuumed leader needs its pre-vacuum stream."""
+    if state.needs_vacuum:
+        return "capture_replication_baseline(leader, &pre_vacuum)"
+    return "capture_replication_baseline(leader)"
+
+
+def seed_call(state: StateShape, indent: str) -> List[str]:
+    """Seeds a fresh follower below the leader's min_resumable_sequence()."""
+    if state.needs_vacuum:
+        return [f"{indent}seed_follower(follower, pre_vacuum, stream_from);"]
+    return []
+
+
 def gen_leader_workload(state: StateShape) -> str:
     """Generate C++ to create leader DB and apply the workload."""
     opts = ""
@@ -50,6 +64,8 @@ def gen_leader_workload(state: StateShape) -> str:
 
     lines: List[str] = []
     lines.append(f"    auto leader = bytecask::DB::open(leader_dir{opts});")
+    if state.needs_vacuum:
+        lines.append("    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;")
 
     if state.label == "single_key":
         lines.append('    leader.put({}, to_bytes("k1"), to_bytes("v1"));')
@@ -155,6 +171,14 @@ def gen_leader_workload(state: StateShape) -> str:
             '      leader.put({}, to_bytes(key), to_bytes("updated"));'
         )
         lines.append("    }")
+        # The stream as it stood before the vacuum dropped part of it: what a
+        # follower holds below the leader's min_resumable_sequence().
+        lines.append("    {")
+        lines.append("      auto pre_snap = leader.snapshot();")
+        lines.append(
+            "      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));"
+        )
+        lines.append("    }")
         lines.append(
             "    (void)leader.vacuum({.fragmentation_threshold = 0.0});"
         )
@@ -162,6 +186,11 @@ def gen_leader_workload(state: StateShape) -> str:
     else:
         raise ValueError(f"Unknown state label: {state.label}")
 
+    # Where a follower streams from: 0, unless vacuum has dropped history.
+    lines.append(
+        "    [[maybe_unused]] const auto stream_from ="
+        " leader.min_resumable_sequence();"
+    )
     return "\n".join(lines)
 
 
@@ -280,9 +309,9 @@ def gen_full_stream_test(
 
     # Leader setup.
     parts.append(gen_leader_workload(state))
-    parts.append("    leader_bl = capture_replication_baseline(leader);")
+    parts.append(f"    leader_bl = {baseline_call(state)};")
     parts.append("    auto snap = leader.snapshot();")
-    parts.append("    auto owned = collect_changes(leader.changes_since(snap, 0));")
+    parts.append("    auto owned = collect_changes(leader.changes_since(snap, stream_from));")
     parts.append("    auto views = owned.views();")
     parts.append("")
 
@@ -294,6 +323,7 @@ def gen_full_stream_test(
         f"    auto follower = bytecask::DB::open(follower_dir,"
         f"\n        {{{follower_opts}.initial_mode = bytecask::Mode::Follower}});"
     )
+    parts.extend(seed_call(state, "    "))
     if not delta.keys_match:
         parts.append("    auto follower_bl = capture_baseline(follower);")
     parts.append("")
@@ -332,9 +362,9 @@ def gen_incremental_test(
 
     # Leader setup.
     parts.append(gen_leader_workload(state))
-    parts.append("    leader_bl = capture_replication_baseline(leader);")
+    parts.append(f"    leader_bl = {baseline_call(state)};")
     parts.append("    auto snap = leader.snapshot();")
-    parts.append("    auto owned = collect_changes(leader.changes_since(snap, 0));")
+    parts.append("    auto owned = collect_changes(leader.changes_since(snap, stream_from));")
     parts.append("    auto views = owned.views();")
     parts.append("")
 
@@ -346,6 +376,7 @@ def gen_incremental_test(
         f"    auto follower = bytecask::DB::open(follower_dir,"
         f"\n        {{{follower_opts}.initial_mode = bytecask::Mode::Follower}});"
     )
+    parts.extend(seed_call(state, "    "))
     parts.append("")
 
     # Split into two chunks. Find a safe split point (not inside a batch).
@@ -433,9 +464,9 @@ def gen_restart_midstream_test(
 
     # Leader setup.
     parts.append(gen_leader_workload(state))
-    parts.append("    leader_bl = capture_replication_baseline(leader);")
+    parts.append(f"    leader_bl = {baseline_call(state)};")
     parts.append("    auto snap = leader.snapshot();")
-    parts.append("    auto owned = collect_changes(leader.changes_since(snap, 0));")
+    parts.append("    auto owned = collect_changes(leader.changes_since(snap, stream_from));")
     parts.append("    auto views = owned.views();")
     parts.append("")
 
@@ -475,6 +506,7 @@ def gen_restart_midstream_test(
         f"      auto follower = bytecask::DB::open(follower_dir,"
         f"\n          {{{follower_opts}.initial_mode = bytecask::Mode::Follower}});"
     )
+    parts.extend(seed_call(state, "      "))
     parts.append("      if (!chunk1.empty()) follower.ingest(chunk1);")
     parts.append("    }")
     parts.append("")
@@ -539,9 +571,9 @@ def gen_duplicate_delivery_test(state: StateShape) -> str:
 
     # Leader setup.
     parts.append(gen_leader_workload(state))
-    parts.append("    leader_bl = capture_replication_baseline(leader);")
+    parts.append(f"    leader_bl = {baseline_call(state)};")
     parts.append("    auto snap = leader.snapshot();")
-    parts.append("    auto owned = collect_changes(leader.changes_since(snap, 0));")
+    parts.append("    auto owned = collect_changes(leader.changes_since(snap, stream_from));")
     parts.append("    auto views = owned.views();")
     parts.append("")
 
@@ -554,6 +586,7 @@ def gen_duplicate_delivery_test(state: StateShape) -> str:
         f"    auto follower = bytecask::DB::open(follower_dir,"
         f"\n        {{{follower_opts}.initial_mode = bytecask::Mode::Follower}});"
     )
+    parts.extend(seed_call(state, "    "))
     parts.append("    follower.ingest(views);")
     parts.append("    auto seq_after = follower.durable_sequence();")
     parts.append("")
@@ -579,10 +612,10 @@ def gen_planned_promotion_test(state: StateShape) -> str:
     # NodeA (leader) applies workload.
     parts.append(gen_leader_workload(state))
     parts.append(
-        "    auto init_leader_bl = capture_replication_baseline(leader);"
+        f"    auto init_leader_bl = {baseline_call(state)};"
     )
     parts.append("    auto snap = leader.snapshot();")
-    parts.append("    auto owned = collect_changes(leader.changes_since(snap, 0));")
+    parts.append("    auto owned = collect_changes(leader.changes_since(snap, stream_from));")
     parts.append("    auto views = owned.views();")
     parts.append("")
 
@@ -591,6 +624,7 @@ def gen_planned_promotion_test(state: StateShape) -> str:
         f"    auto follower = bytecask::DB::open(follower_dir,"
         f"\n        {{{follower_opts}.initial_mode = bytecask::Mode::Follower}});"
     )
+    parts.extend(seed_call(state, "    "))
     parts.append("    follower.ingest(views);")
     parts.append("    assert_replication_match(init_leader_bl, follower);")
     parts.append("")
@@ -604,9 +638,9 @@ def gen_planned_promotion_test(state: StateShape) -> str:
         parts.append('    leader.put({.sync = true}, to_bytes("__flush__"), to_bytes(""));')
         parts.append('    (void)leader.del({.sync = true}, to_bytes("__flush__"));')
         parts.append("    // Re-capture baseline after flush — all entries now durable.")
-        parts.append("    init_leader_bl = capture_replication_baseline(leader);")
+        parts.append(f"    init_leader_bl = {baseline_call(state)};")
         parts.append("    snap = leader.snapshot();")
-        parts.append("    owned = collect_changes(leader.changes_since(snap, 0));")
+        parts.append("    owned = collect_changes(leader.changes_since(snap, stream_from));")
         parts.append("    views = owned.views();")
         parts.append("    follower.ingest(views);")
         parts.append("")

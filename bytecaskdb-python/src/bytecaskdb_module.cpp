@@ -345,6 +345,8 @@ NB_MODULE(_bytecaskdb, m) {
   nb::exception<bytecask::DbDegraded>(m, "DbDegraded", PyExc_RuntimeError);
   nb::exception<bytecask::DbFollowerMode>(m, "DbFollowerMode",
                                           PyExc_RuntimeError);
+  nb::exception<bytecask::DbInvalidSequence>(m, "DbInvalidSequence",
+                                             PyExc_RuntimeError);
 
   nb::register_exception_translator(
       [](const std::exception_ptr &p, void *) {
@@ -353,6 +355,8 @@ NB_MODULE(_bytecaskdb, m) {
         } catch (const bytecask::DbDegraded &) {
           throw;
         } catch (const bytecask::DbFollowerMode &) {
+          throw;
+        } catch (const bytecask::DbInvalidSequence &) {
           throw;
         } catch (const std::system_error &e) {
           PyErr_SetString(PyExc_OSError, e.what());
@@ -855,6 +859,13 @@ NB_MODULE(_bytecaskdb, m) {
           "expires; returns the durable sequence. min_sequence=0, an "
           "already-reached target, or timeout_ms=0 return immediately.",
           "min_sequence"_a = 0, "timeout_ms"_a = 0)
+      .def(
+          "min_resumable_sequence",
+          [](PyDB &self) -> std::uint64_t {
+            return self.db.min_resumable_sequence();
+          },
+          "The lowest from_sequence changes_since accepts: vacuum has "
+          "dropped no entry above it.")
       .def(
           "create_manifest",
           [](PyDB &self) -> PyFileManifest * {

@@ -30,9 +30,11 @@ and restarts, and read from), in two configurations:
                     serializable (follower reads may be stale, not
                     inconsistent) and pass the replication checks: prefix,
                     session, monotonic reads, convergence and bootstrap.
-    cluster-vacuum  leader vacuum on. Expected to detect #168 at least once
-                    over the run: a follower resuming below a compacted file
-                    receives a batch with entries missing.
+    cluster-vacuum  leader vacuum on. Must pass everything cluster does.
+                    A follower that falls behind what vacuum kept is refused
+                    by changes_since (DbInvalidSequence) and re-bootstraps;
+                    at least one round over the run has to show that, or
+                    the configuration never reached the case (#168).
 
 With --topology each round runs the same cluster while leadership moves:
 planned transfers to a random node, unplanned promotions, re-targeting of
@@ -421,10 +423,8 @@ def check_cluster_round(args: argparse.Namespace, seed: int,
             print(f"  {config}: all nodes serializable {describe(a)}")
             elle_found = a.get("valid?") is not True
         if config == "cluster-vacuum":
-            if leader_problems or not leader_valid:
-                raise CheckFailed(f"{config}: leader checks failed")
-            args.v168_seen |= bool(problems) or elle_found
-        elif config == "topology-behind":
+            args.history_rebootstraps += summary.get("history_rebootstraps", 0)
+        if config == "topology-behind":
             # A forked follower can later lead, so the fork may show in the
             # leader history too: any finding counts.
             args.fork_seen |= (bool(leader_problems) or not leader_valid
@@ -525,7 +525,7 @@ def main() -> int:
 
     shutil.rmtree(args.out, ignore_errors=True)
     args.write_skew_seen = False
-    args.v168_seen = False
+    args.history_rebootstraps = 0
     args.fork_seen = False
     rng = random.Random(seed)
     try:
@@ -537,10 +537,12 @@ def main() -> int:
                 check_cluster_round(args, round_seed, args.out / f"round-{r}")
             else:
                 check_round(args, round_seed, args.out / f"round-{r}")
-        if args.cluster and not args.topology and not args.v168_seen:
+        if (args.cluster and not args.topology
+                and args.history_rebootstraps == 0):
             raise CheckFailed(
-                "cluster-vacuum: no round detected #168; the harness is not "
-                "shown to be sensitive to gaps in changes_since")
+                "cluster-vacuum: no follower fell behind what vacuum kept; "
+                "the run never reached the case min_resumable_sequence "
+                "guards (#168)")
         if args.topology and not args.fork_seen:
             raise CheckFailed(
                 "topology-behind: no round detected a fork; the harness is "

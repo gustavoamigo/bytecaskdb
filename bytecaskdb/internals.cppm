@@ -780,6 +780,10 @@ export struct EngineState {
   // sync_requested_seq exceeds its durable_seq owes an fdatasync and must
   // not be published — store_state enforces durable_seq >= sync_requested_seq.
   std::uint64_t sync_requested_seq{0};
+  // The lowest from_sequence changes_since accepts: the highest sequence
+  // vacuum has dropped from the history. Every entry above it is still on
+  // disk. Never decreases; persisted in kMinResumableFile.
+  std::uint64_t min_resumable_seq{0};
   Mode mode{Mode::Leader};
   bool degraded{false};
   std::string degraded_reason;
@@ -857,6 +861,9 @@ export struct VacuumScanResult {
   std::uint64_t tombstone_bytes{0};
   std::uint64_t marker_bytes{0};
   std::uint64_t tombstones_dropped{0};
+  // Highest sequence among the entries the scan left out: dead Puts and
+  // droppable tombstones. 0 when it dropped nothing.
+  std::uint64_t max_dropped_sequence{0};
 };
 
 // RecoveredFile and RecoveryResult are private to bytecask.cpp.

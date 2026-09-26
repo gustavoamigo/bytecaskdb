@@ -118,14 +118,17 @@ but not older than".
 | Config | Leader vacuum | Events | Expected |
 |---|---|---|---|
 | `cluster` | off | all | every check passes |
-| `cluster-vacuum` | on | all, with lag | **detects #168**: a follower that resumes `changes_since` below a compacted file receives a batch with entries missing |
+| `cluster-vacuum` | on | all, with lag | every check passes, and at least one follower over the run falls behind what vacuum kept and re-bootstraps (#168) |
 | `topology` | off | tailing, planned transfers, unplanned promotions of the most advanced follower, re-bootstrap | every check passes |
 | `topology-behind` | off | as `topology`, but an unplanned promotion takes the least advanced follower | **detects the fork** below in at least one round of the run |
 
-`cluster-vacuum` plays the role `blind` plays in #94: it shows that the
-harness finds the failure it is aimed at. It is an expected failure until
-#168 is fixed, and a regression check after that. `topology-behind` does
-the same for the promotion rule: without it, the checks must find a fork.
+`cluster-vacuum` detected #168 until the fix: a follower resuming below
+a compacted file received a stream with entries missing. Now
+`changes_since` refuses that resume with `DbInvalidSequence`, the
+follower re-bootstraps from its source, and every check must pass. The run
+must also record such a re-bootstrap, or it never reached the case.
+`topology-behind` plays the role `blind` plays in #94 for the promotion
+rule: without the rule, the checks must find a fork.
 Once a forked node leads in turn, the fork reaches the leader history too,
 so any finding counts there.
 
@@ -137,10 +140,12 @@ so any finding counts there.
    caller must cut at batch boundaries, and the harness does.
    [#188](https://github.com/gustavoamigo/bytecaskdb/issues/188) tracks
    having `ingest` hold back or refuse a trailing incomplete batch.
-2. **#168's fix shape** decides the flipped expectation for
-   `cluster-vacuum`. If `changes_since` refuses to resume below a lower
-   bound, the harness must treat that as "re-bootstrap this follower", not
-   as a failure. Bootstrap is already an event, so the path exists.
+2. **#168's fix shape.** Settled: `changes_since` refuses to resume below
+   `min_resumable_sequence()`, and the harness treats `DbInvalidSequence`
+   as "re-bootstrap this follower from its source". A duplicate-delivery
+   rewind can land below the bound too; that one retries from the
+   follower's own `durable_sequence()` instead, so the count of
+   re-bootstraps is only followers that were really behind.
 3. **Promotion target.** Settled by the fork finding below: the protocol
    promotes the most advanced follower, and `topology-behind`, which
    promotes the least advanced, is the sensitivity check. A random target
@@ -243,6 +248,10 @@ a committed append at or below S on another key. Or a follower whose
 Vacuum dropped the dead entry before the lagging follower's `changes_since`
 reached it. The follower shows the gap until the newer version arrives.
 
+**#168 fixed.** With `min_resumable_sequence`, `cluster-vacuum` is clean in
+every round, and a lagging follower re-bootstraps 2–21 times a round (6
+local rounds, cross-check only).
+
 **A write one reader had seen was invisible to a later reader.** The first
 local run with Elle reported `G-single-item-realtime` on the leader of a
 `cluster` round, with leader vacuum off. The monotonic cross-check flagged
@@ -290,8 +299,8 @@ With both fixes, `topology` passed every local round.
 
 - `cluster` passes nightly in release and under ASan, or every failure it
   finds is filed and fixed.
-- `cluster-vacuum` detects #168 on the current engine, and the nightly
-  asserts that it does.
+- `cluster-vacuum` passes, and the nightly asserts that some follower
+  re-bootstrapped because vacuum dropped history it needed.
 - Seeds are printed, and a failure uploads the histories and the event log.
 - `replication_primitives_design.md` cites the checked guarantees, the
   #168 result and whatever the fork case settles.

@@ -54,9 +54,10 @@ TEST_CASE("prove_repl__single_key__full_stream__success", "[prove_repl]") {
   {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -80,9 +81,10 @@ TEST_CASE("prove_repl__single_key__full_stream__append_fails_nothing_written", "
   {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -114,9 +116,10 @@ TEST_CASE("prove_repl__single_key__full_stream__append_fails_partial_write", "[p
   {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -149,9 +152,10 @@ TEST_CASE("prove_repl__single_key__full_stream__sync_fails", "[prove_repl]") {
   {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -181,9 +185,10 @@ TEST_CASE("prove_repl__single_key__incremental__success", "[prove_repl]") {
   {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -228,9 +233,10 @@ TEST_CASE("prove_repl__single_key__incremental__append_fails_nothing_written", "
   {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -293,9 +299,10 @@ TEST_CASE("prove_repl__single_key__incremental__append_fails_partial_write", "[p
   {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -359,9 +366,10 @@ TEST_CASE("prove_repl__single_key__incremental__sync_fails", "[prove_repl]") {
   {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -422,9 +430,10 @@ TEST_CASE("prove_repl__single_key__restart_midstream__success", "[prove_repl]") 
   {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -475,9 +484,10 @@ TEST_CASE("prove_repl__single_key__restart_midstream__append_fails_nothing_writt
   {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -546,9 +556,10 @@ TEST_CASE("prove_repl__single_key__restart_midstream__append_fails_partial_write
   {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -618,9 +629,10 @@ TEST_CASE("prove_repl__single_key__restart_midstream__sync_fails", "[prove_repl]
   {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -687,9 +699,10 @@ TEST_CASE("prove_repl__single_key__duplicate_delivery__success", "[prove_repl]")
   {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -713,9 +726,10 @@ TEST_CASE("prove_repl__single_key__planned_promotion__success", "[prove_repl]") 
   {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     auto init_leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -759,9 +773,10 @@ TEST_CASE("prove_repl__multi_key__full_stream__success", "[prove_repl]") {
     leader.put({}, to_bytes("k3"), to_bytes("v3"));
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -789,9 +804,10 @@ TEST_CASE("prove_repl__multi_key__full_stream__append_fails_nothing_written", "[
     leader.put({}, to_bytes("k3"), to_bytes("v3"));
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -827,9 +843,10 @@ TEST_CASE("prove_repl__multi_key__full_stream__append_fails_partial_write", "[pr
     leader.put({}, to_bytes("k3"), to_bytes("v3"));
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -866,9 +883,10 @@ TEST_CASE("prove_repl__multi_key__full_stream__sync_fails", "[prove_repl]") {
     leader.put({}, to_bytes("k3"), to_bytes("v3"));
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -902,9 +920,10 @@ TEST_CASE("prove_repl__multi_key__incremental__success", "[prove_repl]") {
     leader.put({}, to_bytes("k3"), to_bytes("v3"));
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -953,9 +972,10 @@ TEST_CASE("prove_repl__multi_key__incremental__append_fails_nothing_written", "[
     leader.put({}, to_bytes("k3"), to_bytes("v3"));
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -1022,9 +1042,10 @@ TEST_CASE("prove_repl__multi_key__incremental__append_fails_partial_write", "[pr
     leader.put({}, to_bytes("k3"), to_bytes("v3"));
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -1092,9 +1113,10 @@ TEST_CASE("prove_repl__multi_key__incremental__sync_fails", "[prove_repl]") {
     leader.put({}, to_bytes("k3"), to_bytes("v3"));
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -1159,9 +1181,10 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__success", "[prove_repl]") {
     leader.put({}, to_bytes("k3"), to_bytes("v3"));
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -1216,9 +1239,10 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__append_fails_nothing_writte
     leader.put({}, to_bytes("k3"), to_bytes("v3"));
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -1291,9 +1315,10 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__append_fails_partial_write"
     leader.put({}, to_bytes("k3"), to_bytes("v3"));
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -1367,9 +1392,10 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__sync_fails", "[prove_repl]"
     leader.put({}, to_bytes("k3"), to_bytes("v3"));
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -1440,9 +1466,10 @@ TEST_CASE("prove_repl__multi_key__duplicate_delivery__success", "[prove_repl]") 
     leader.put({}, to_bytes("k3"), to_bytes("v3"));
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -1470,9 +1497,10 @@ TEST_CASE("prove_repl__multi_key__planned_promotion__success", "[prove_repl]") {
     leader.put({}, to_bytes("k3"), to_bytes("v3"));
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     auto init_leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -1513,9 +1541,10 @@ TEST_CASE("prove_repl__overwrites__full_stream__success", "[prove_repl]") {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("old"));
     leader.put({}, to_bytes("k1"), to_bytes("new"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -1540,9 +1569,10 @@ TEST_CASE("prove_repl__overwrites__full_stream__append_fails_nothing_written", "
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("old"));
     leader.put({}, to_bytes("k1"), to_bytes("new"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -1575,9 +1605,10 @@ TEST_CASE("prove_repl__overwrites__full_stream__append_fails_partial_write", "[p
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("old"));
     leader.put({}, to_bytes("k1"), to_bytes("new"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -1611,9 +1642,10 @@ TEST_CASE("prove_repl__overwrites__full_stream__sync_fails", "[prove_repl]") {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("old"));
     leader.put({}, to_bytes("k1"), to_bytes("new"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -1644,9 +1676,10 @@ TEST_CASE("prove_repl__overwrites__incremental__success", "[prove_repl]") {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("old"));
     leader.put({}, to_bytes("k1"), to_bytes("new"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -1692,9 +1725,10 @@ TEST_CASE("prove_repl__overwrites__incremental__append_fails_nothing_written", "
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("old"));
     leader.put({}, to_bytes("k1"), to_bytes("new"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -1758,9 +1792,10 @@ TEST_CASE("prove_repl__overwrites__incremental__append_fails_partial_write", "[p
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("old"));
     leader.put({}, to_bytes("k1"), to_bytes("new"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -1825,9 +1860,10 @@ TEST_CASE("prove_repl__overwrites__incremental__sync_fails", "[prove_repl]") {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("old"));
     leader.put({}, to_bytes("k1"), to_bytes("new"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -1889,9 +1925,10 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__success", "[prove_repl]") 
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("old"));
     leader.put({}, to_bytes("k1"), to_bytes("new"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -1943,9 +1980,10 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__append_fails_nothing_writt
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("old"));
     leader.put({}, to_bytes("k1"), to_bytes("new"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -2015,9 +2053,10 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__append_fails_partial_write
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("old"));
     leader.put({}, to_bytes("k1"), to_bytes("new"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -2088,9 +2127,10 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__sync_fails", "[prove_repl]
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("old"));
     leader.put({}, to_bytes("k1"), to_bytes("new"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -2158,9 +2198,10 @@ TEST_CASE("prove_repl__overwrites__duplicate_delivery__success", "[prove_repl]")
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("old"));
     leader.put({}, to_bytes("k1"), to_bytes("new"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -2185,9 +2226,10 @@ TEST_CASE("prove_repl__overwrites__planned_promotion__success", "[prove_repl]") 
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("old"));
     leader.put({}, to_bytes("k1"), to_bytes("new"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     auto init_leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -2228,9 +2270,10 @@ TEST_CASE("prove_repl__deletes__full_stream__success", "[prove_repl]") {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
     (void)leader.del({}, to_bytes("k1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -2255,9 +2298,10 @@ TEST_CASE("prove_repl__deletes__full_stream__append_fails_nothing_written", "[pr
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
     (void)leader.del({}, to_bytes("k1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -2290,9 +2334,10 @@ TEST_CASE("prove_repl__deletes__full_stream__append_fails_partial_write", "[prov
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
     (void)leader.del({}, to_bytes("k1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -2326,9 +2371,10 @@ TEST_CASE("prove_repl__deletes__full_stream__sync_fails", "[prove_repl]") {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
     (void)leader.del({}, to_bytes("k1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -2359,9 +2405,10 @@ TEST_CASE("prove_repl__deletes__incremental__success", "[prove_repl]") {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
     (void)leader.del({}, to_bytes("k1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -2407,9 +2454,10 @@ TEST_CASE("prove_repl__deletes__incremental__append_fails_nothing_written", "[pr
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
     (void)leader.del({}, to_bytes("k1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -2473,9 +2521,10 @@ TEST_CASE("prove_repl__deletes__incremental__append_fails_partial_write", "[prov
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
     (void)leader.del({}, to_bytes("k1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -2540,9 +2589,10 @@ TEST_CASE("prove_repl__deletes__incremental__sync_fails", "[prove_repl]") {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
     (void)leader.del({}, to_bytes("k1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -2604,9 +2654,10 @@ TEST_CASE("prove_repl__deletes__restart_midstream__success", "[prove_repl]") {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
     (void)leader.del({}, to_bytes("k1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -2658,9 +2709,10 @@ TEST_CASE("prove_repl__deletes__restart_midstream__append_fails_nothing_written"
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
     (void)leader.del({}, to_bytes("k1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -2730,9 +2782,10 @@ TEST_CASE("prove_repl__deletes__restart_midstream__append_fails_partial_write", 
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
     (void)leader.del({}, to_bytes("k1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -2803,9 +2856,10 @@ TEST_CASE("prove_repl__deletes__restart_midstream__sync_fails", "[prove_repl]") 
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
     (void)leader.del({}, to_bytes("k1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -2873,9 +2927,10 @@ TEST_CASE("prove_repl__deletes__duplicate_delivery__success", "[prove_repl]") {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
     (void)leader.del({}, to_bytes("k1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -2900,9 +2955,10 @@ TEST_CASE("prove_repl__deletes__planned_promotion__success", "[prove_repl]") {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
     (void)leader.del({}, to_bytes("k1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     auto init_leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -2947,9 +3003,10 @@ TEST_CASE("prove_repl__range_deletes__full_stream__success", "[prove_repl]") {
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -2978,9 +3035,10 @@ TEST_CASE("prove_repl__range_deletes__full_stream__append_fails_nothing_written"
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -3017,9 +3075,10 @@ TEST_CASE("prove_repl__range_deletes__full_stream__append_fails_partial_write", 
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -3057,9 +3116,10 @@ TEST_CASE("prove_repl__range_deletes__full_stream__sync_fails", "[prove_repl]") 
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -3094,9 +3154,10 @@ TEST_CASE("prove_repl__range_deletes__incremental__success", "[prove_repl]") {
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -3146,9 +3207,10 @@ TEST_CASE("prove_repl__range_deletes__incremental__append_fails_nothing_written"
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -3216,9 +3278,10 @@ TEST_CASE("prove_repl__range_deletes__incremental__append_fails_partial_write", 
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -3287,9 +3350,10 @@ TEST_CASE("prove_repl__range_deletes__incremental__sync_fails", "[prove_repl]") 
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -3355,9 +3419,10 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__success", "[prove_repl]
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -3413,9 +3478,10 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__append_fails_nothing_wr
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -3489,9 +3555,10 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__append_fails_partial_wr
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -3566,9 +3633,10 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__sync_fails", "[prove_re
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -3640,9 +3708,10 @@ TEST_CASE("prove_repl__range_deletes__duplicate_delivery__success", "[prove_repl
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -3671,9 +3740,10 @@ TEST_CASE("prove_repl__range_deletes__planned_promotion__success", "[prove_repl]
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     auto init_leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -3719,9 +3789,10 @@ TEST_CASE("prove_repl__batches__full_stream__success", "[prove_repl]") {
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -3751,9 +3822,10 @@ TEST_CASE("prove_repl__batches__full_stream__append_fails_nothing_written", "[pr
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -3791,9 +3863,10 @@ TEST_CASE("prove_repl__batches__full_stream__append_fails_partial_write", "[prov
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -3832,9 +3905,10 @@ TEST_CASE("prove_repl__batches__full_stream__sync_fails", "[prove_repl]") {
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -3870,9 +3944,10 @@ TEST_CASE("prove_repl__batches__full_stream__crash_mid_batch", "[prove_repl]") {
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -3910,9 +3985,10 @@ TEST_CASE("prove_repl__batches__incremental__success", "[prove_repl]") {
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -3963,9 +4039,10 @@ TEST_CASE("prove_repl__batches__incremental__append_fails_nothing_written", "[pr
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -4034,9 +4111,10 @@ TEST_CASE("prove_repl__batches__incremental__append_fails_partial_write", "[prov
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -4106,9 +4184,10 @@ TEST_CASE("prove_repl__batches__incremental__sync_fails", "[prove_repl]") {
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -4175,9 +4254,10 @@ TEST_CASE("prove_repl__batches__incremental__crash_mid_batch", "[prove_repl]") {
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -4246,9 +4326,10 @@ TEST_CASE("prove_repl__batches__restart_midstream__success", "[prove_repl]") {
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -4305,9 +4386,10 @@ TEST_CASE("prove_repl__batches__restart_midstream__append_fails_nothing_written"
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -4382,9 +4464,10 @@ TEST_CASE("prove_repl__batches__restart_midstream__append_fails_partial_write", 
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -4460,9 +4543,10 @@ TEST_CASE("prove_repl__batches__restart_midstream__sync_fails", "[prove_repl]") 
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -4535,9 +4619,10 @@ TEST_CASE("prove_repl__batches__restart_midstream__crash_mid_batch", "[prove_rep
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -4612,9 +4697,10 @@ TEST_CASE("prove_repl__batches__duplicate_delivery__success", "[prove_repl]") {
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -4644,9 +4730,10 @@ TEST_CASE("prove_repl__batches__planned_promotion__success", "[prove_repl]") {
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     auto init_leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -4690,9 +4777,10 @@ TEST_CASE("prove_repl__multi_file__full_stream__success", "[prove_repl]") {
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -4720,9 +4808,10 @@ TEST_CASE("prove_repl__multi_file__full_stream__append_fails_nothing_written", "
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -4758,9 +4847,10 @@ TEST_CASE("prove_repl__multi_file__full_stream__append_fails_partial_write", "[p
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -4797,9 +4887,10 @@ TEST_CASE("prove_repl__multi_file__full_stream__sync_fails", "[prove_repl]") {
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -4833,9 +4924,10 @@ TEST_CASE("prove_repl__multi_file__full_stream__rotation_sync_fails", "[prove_re
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -4869,9 +4961,10 @@ TEST_CASE("prove_repl__multi_file__full_stream__rotation_file_creation_fails", "
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -4907,9 +5000,10 @@ TEST_CASE("prove_repl__multi_file__incremental__success", "[prove_repl]") {
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -4958,9 +5052,10 @@ TEST_CASE("prove_repl__multi_file__incremental__append_fails_nothing_written", "
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -5027,9 +5122,10 @@ TEST_CASE("prove_repl__multi_file__incremental__append_fails_partial_write", "[p
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -5097,9 +5193,10 @@ TEST_CASE("prove_repl__multi_file__incremental__sync_fails", "[prove_repl]") {
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -5164,9 +5261,10 @@ TEST_CASE("prove_repl__multi_file__incremental__rotation_sync_fails", "[prove_re
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -5231,9 +5329,10 @@ TEST_CASE("prove_repl__multi_file__incremental__rotation_file_creation_fails", "
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -5300,9 +5399,10 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__success", "[prove_repl]") 
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -5357,9 +5457,10 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__append_fails_nothing_writt
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -5432,9 +5533,10 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__append_fails_partial_write
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -5508,9 +5610,10 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__sync_fails", "[prove_repl]
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -5581,9 +5684,10 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__rotation_sync_fails", "[pr
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -5654,9 +5758,10 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__rotation_file_creation_fai
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -5729,9 +5834,10 @@ TEST_CASE("prove_repl__multi_file__duplicate_delivery__success", "[prove_repl]")
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -5759,9 +5865,10 @@ TEST_CASE("prove_repl__multi_file__planned_promotion__success", "[prove_repl]") 
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     auto init_leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -5804,9 +5911,10 @@ TEST_CASE("prove_repl__mixed_sync_nosync__full_stream__success", "[prove_repl]")
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -5833,9 +5941,10 @@ TEST_CASE("prove_repl__mixed_sync_nosync__full_stream__append_fails_nothing_writ
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -5870,9 +5979,10 @@ TEST_CASE("prove_repl__mixed_sync_nosync__full_stream__append_fails_partial_writ
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -5908,9 +6018,10 @@ TEST_CASE("prove_repl__mixed_sync_nosync__full_stream__sync_fails", "[prove_repl
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -5943,9 +6054,10 @@ TEST_CASE("prove_repl__mixed_sync_nosync__incremental__success", "[prove_repl]")
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -5993,9 +6105,10 @@ TEST_CASE("prove_repl__mixed_sync_nosync__incremental__append_fails_nothing_writ
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -6061,9 +6174,10 @@ TEST_CASE("prove_repl__mixed_sync_nosync__incremental__append_fails_partial_writ
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -6130,9 +6244,10 @@ TEST_CASE("prove_repl__mixed_sync_nosync__incremental__sync_fails", "[prove_repl
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -6196,9 +6311,10 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__success", "[prove_r
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -6252,9 +6368,10 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__append_fails_nothin
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -6326,9 +6443,10 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__append_fails_partia
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -6401,9 +6519,10 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__sync_fails", "[prov
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -6473,9 +6592,10 @@ TEST_CASE("prove_repl__mixed_sync_nosync__duplicate_delivery__success", "[prove_
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -6502,9 +6622,10 @@ TEST_CASE("prove_repl__mixed_sync_nosync__planned_promotion__success", "[prove_r
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     auto init_leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -6518,7 +6639,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__planned_promotion__success", "[prove_r
     // Re-capture baseline after flush — all entries now durable.
     init_leader_bl = capture_replication_baseline(leader);
     snap = leader.snapshot();
-    owned = collect_changes(leader.changes_since(snap, 0));
+    owned = collect_changes(leader.changes_since(snap, stream_from));
     views = owned.views();
     follower.ingest(views);
 
@@ -6558,9 +6679,10 @@ TEST_CASE("prove_repl__nosync_only__full_stream__success", "[prove_repl]") {
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -6588,9 +6710,10 @@ TEST_CASE("prove_repl__nosync_only__full_stream__append_fails_nothing_written", 
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -6626,9 +6749,10 @@ TEST_CASE("prove_repl__nosync_only__full_stream__append_fails_partial_write", "[
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -6665,9 +6789,10 @@ TEST_CASE("prove_repl__nosync_only__full_stream__sync_fails", "[prove_repl]") {
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -6701,9 +6826,10 @@ TEST_CASE("prove_repl__nosync_only__full_stream__rotation_sync_fails", "[prove_r
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -6737,9 +6863,10 @@ TEST_CASE("prove_repl__nosync_only__full_stream__rotation_file_creation_fails", 
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -6775,9 +6902,10 @@ TEST_CASE("prove_repl__nosync_only__incremental__success", "[prove_repl]") {
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -6826,9 +6954,10 @@ TEST_CASE("prove_repl__nosync_only__incremental__append_fails_nothing_written", 
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -6895,9 +7024,10 @@ TEST_CASE("prove_repl__nosync_only__incremental__append_fails_partial_write", "[
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -6965,9 +7095,10 @@ TEST_CASE("prove_repl__nosync_only__incremental__sync_fails", "[prove_repl]") {
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -7032,9 +7163,10 @@ TEST_CASE("prove_repl__nosync_only__incremental__rotation_sync_fails", "[prove_r
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -7099,9 +7231,10 @@ TEST_CASE("prove_repl__nosync_only__incremental__rotation_file_creation_fails", 
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -7168,9 +7301,10 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__success", "[prove_repl]")
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -7225,9 +7359,10 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__append_fails_nothing_writ
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -7300,9 +7435,10 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__append_fails_partial_writ
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -7376,9 +7512,10 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__sync_fails", "[prove_repl
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -7449,9 +7586,10 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__rotation_sync_fails", "[p
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -7522,9 +7660,10 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__rotation_file_creation_fa
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -7597,9 +7736,10 @@ TEST_CASE("prove_repl__nosync_only__duplicate_delivery__success", "[prove_repl]"
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -7627,9 +7767,10 @@ TEST_CASE("prove_repl__nosync_only__planned_promotion__success", "[prove_repl]")
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     auto init_leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -7643,7 +7784,7 @@ TEST_CASE("prove_repl__nosync_only__planned_promotion__success", "[prove_repl]")
     // Re-capture baseline after flush — all entries now durable.
     init_leader_bl = capture_replication_baseline(leader);
     snap = leader.snapshot();
-    owned = collect_changes(leader.changes_since(snap, 0));
+    owned = collect_changes(leader.changes_since(snap, stream_from));
     views = owned.views();
     follower.ingest(views);
 
@@ -7682,9 +7823,10 @@ TEST_CASE("prove_repl__nosync_then_sync__full_stream__success", "[prove_repl]") 
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -7711,9 +7853,10 @@ TEST_CASE("prove_repl__nosync_then_sync__full_stream__append_fails_nothing_writt
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -7748,9 +7891,10 @@ TEST_CASE("prove_repl__nosync_then_sync__full_stream__append_fails_partial_write
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -7786,9 +7930,10 @@ TEST_CASE("prove_repl__nosync_then_sync__full_stream__sync_fails", "[prove_repl]
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -7821,9 +7966,10 @@ TEST_CASE("prove_repl__nosync_then_sync__incremental__success", "[prove_repl]") 
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -7871,9 +8017,10 @@ TEST_CASE("prove_repl__nosync_then_sync__incremental__append_fails_nothing_writt
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -7939,9 +8086,10 @@ TEST_CASE("prove_repl__nosync_then_sync__incremental__append_fails_partial_write
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -8008,9 +8156,10 @@ TEST_CASE("prove_repl__nosync_then_sync__incremental__sync_fails", "[prove_repl]
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -8074,9 +8223,10 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__success", "[prove_re
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -8130,9 +8280,10 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__append_fails_nothing
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -8204,9 +8355,10 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__append_fails_partial
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -8279,9 +8431,10 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__sync_fails", "[prove
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -8351,9 +8504,10 @@ TEST_CASE("prove_repl__nosync_then_sync__duplicate_delivery__success", "[prove_r
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -8380,9 +8534,10 @@ TEST_CASE("prove_repl__nosync_then_sync__planned_promotion__success", "[prove_re
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
     auto init_leader_bl = capture_replication_baseline(leader);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
@@ -8396,7 +8551,7 @@ TEST_CASE("prove_repl__nosync_then_sync__planned_promotion__success", "[prove_re
     // Re-capture baseline after flush — all entries now durable.
     init_leader_bl = capture_replication_baseline(leader);
     snap = leader.snapshot();
-    owned = collect_changes(leader.changes_since(snap, 0));
+    owned = collect_changes(leader.changes_since(snap, stream_from));
     views = owned.views();
     follower.ingest(views);
 
@@ -8431,6 +8586,7 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__success", "[prove_repl]") 
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -8446,14 +8602,20 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__success", "[prove_repl]") 
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+    seed_follower(follower, pre_vacuum, stream_from);
 
       {
         follower.ingest(views);
@@ -8472,6 +8634,7 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__append_fails_nothing_writt
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -8487,14 +8650,20 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__append_fails_nothing_writt
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+    seed_follower(follower, pre_vacuum, stream_from);
     auto follower_bl = capture_baseline(follower);
 
       {
@@ -8521,6 +8690,7 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__append_fails_partial_write
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -8536,14 +8706,20 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__append_fails_partial_write
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+    seed_follower(follower, pre_vacuum, stream_from);
     auto follower_bl = capture_baseline(follower);
 
       {
@@ -8571,6 +8747,7 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__sync_fails", "[prove_repl]
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -8586,14 +8763,20 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__sync_fails", "[prove_repl]
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+    seed_follower(follower, pre_vacuum, stream_from);
     auto follower_bl = capture_baseline(follower);
 
       {
@@ -8618,6 +8801,7 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__crash_mid_batch", "[prove_
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -8633,14 +8817,20 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__crash_mid_batch", "[prove_
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+    seed_follower(follower, pre_vacuum, stream_from);
     auto follower_bl = capture_baseline(follower);
 
       {
@@ -8667,6 +8857,7 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__rotation_sync_fails", "[pr
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -8682,14 +8873,20 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__rotation_sync_fails", "[pr
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+    seed_follower(follower, pre_vacuum, stream_from);
     auto follower_bl = capture_baseline(follower);
 
       {
@@ -8714,6 +8911,7 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__rotation_file_creation_fai
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -8729,14 +8927,20 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__rotation_file_creation_fai
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+    seed_follower(follower, pre_vacuum, stream_from);
     auto follower_bl = capture_baseline(follower);
 
       {
@@ -8763,6 +8967,7 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__success", "[prove_repl]") 
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -8778,14 +8983,20 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__success", "[prove_repl]") 
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+    seed_follower(follower, pre_vacuum, stream_from);
 
     // Split views into two chunks at a safe boundary.
     std::size_t split = views.size() / 2;
@@ -8825,6 +9036,7 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__append_fails_nothing_writt
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -8840,14 +9052,20 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__append_fails_nothing_writt
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+    seed_follower(follower, pre_vacuum, stream_from);
 
     // Split views into two chunks at a safe boundary.
     std::size_t split = views.size() / 2;
@@ -8905,6 +9123,7 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__append_fails_partial_write
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -8920,14 +9139,20 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__append_fails_partial_write
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+    seed_follower(follower, pre_vacuum, stream_from);
 
     // Split views into two chunks at a safe boundary.
     std::size_t split = views.size() / 2;
@@ -8986,6 +9211,7 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__sync_fails", "[prove_repl]
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -9001,14 +9227,20 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__sync_fails", "[prove_repl]
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+    seed_follower(follower, pre_vacuum, stream_from);
 
     // Split views into two chunks at a safe boundary.
     std::size_t split = views.size() / 2;
@@ -9064,6 +9296,7 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__crash_mid_batch", "[prove_
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -9079,14 +9312,20 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__crash_mid_batch", "[prove_
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+    seed_follower(follower, pre_vacuum, stream_from);
 
     // Split views into two chunks at a safe boundary.
     std::size_t split = views.size() / 2;
@@ -9144,6 +9383,7 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__rotation_sync_fails", "[pr
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -9159,14 +9399,20 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__rotation_sync_fails", "[pr
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+    seed_follower(follower, pre_vacuum, stream_from);
 
     // Split views into two chunks at a safe boundary.
     std::size_t split = views.size() / 2;
@@ -9222,6 +9468,7 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__rotation_file_creation_fai
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -9237,14 +9484,20 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__rotation_file_creation_fai
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+    seed_follower(follower, pre_vacuum, stream_from);
 
     // Split views into two chunks at a safe boundary.
     std::size_t split = views.size() / 2;
@@ -9302,6 +9555,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__success", "[prove_re
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -9317,10 +9571,15 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__success", "[prove_re
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -9342,6 +9601,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__success", "[prove_re
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+      seed_follower(follower, pre_vacuum, stream_from);
       if (!chunk1.empty()) follower.ingest(chunk1);
     }
 
@@ -9370,6 +9630,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__append_fails_nothing
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -9385,10 +9646,15 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__append_fails_nothing
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -9410,6 +9676,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__append_fails_nothing
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+      seed_follower(follower, pre_vacuum, stream_from);
       if (!chunk1.empty()) follower.ingest(chunk1);
     }
 
@@ -9456,6 +9723,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__append_fails_partial
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -9471,10 +9739,15 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__append_fails_partial
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -9496,6 +9769,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__append_fails_partial
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+      seed_follower(follower, pre_vacuum, stream_from);
       if (!chunk1.empty()) follower.ingest(chunk1);
     }
 
@@ -9543,6 +9817,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__sync_fails", "[prove
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -9558,10 +9833,15 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__sync_fails", "[prove
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -9583,6 +9863,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__sync_fails", "[prove
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+      seed_follower(follower, pre_vacuum, stream_from);
       if (!chunk1.empty()) follower.ingest(chunk1);
     }
 
@@ -9627,6 +9908,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__crash_mid_batch", "[
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -9642,10 +9924,15 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__crash_mid_batch", "[
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -9667,6 +9954,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__crash_mid_batch", "[
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+      seed_follower(follower, pre_vacuum, stream_from);
       if (!chunk1.empty()) follower.ingest(chunk1);
     }
 
@@ -9713,6 +10001,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__rotation_sync_fails"
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -9728,10 +10017,15 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__rotation_sync_fails"
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -9753,6 +10047,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__rotation_sync_fails"
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+      seed_follower(follower, pre_vacuum, stream_from);
       if (!chunk1.empty()) follower.ingest(chunk1);
     }
 
@@ -9797,6 +10092,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__rotation_file_creati
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -9812,10 +10108,15 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__rotation_file_creati
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     std::size_t split = views.size() / 2;
@@ -9837,6 +10138,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__rotation_file_creati
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+      seed_follower(follower, pre_vacuum, stream_from);
       if (!chunk1.empty()) follower.ingest(chunk1);
     }
 
@@ -9883,6 +10185,7 @@ TEST_CASE("prove_repl__vacuumed_batches__duplicate_delivery__success", "[prove_r
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -9898,14 +10201,20 @@ TEST_CASE("prove_repl__vacuumed_batches__duplicate_delivery__success", "[prove_r
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+    seed_follower(follower, pre_vacuum, stream_from);
     follower.ingest(views);
     auto seq_after = follower.durable_sequence();
 
@@ -9924,6 +10233,7 @@ TEST_CASE("prove_repl__vacuumed_batches__planned_promotion__success", "[prove_re
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -9939,14 +10249,20 @@ TEST_CASE("prove_repl__vacuumed_batches__planned_promotion__success", "[prove_re
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
-    auto init_leader_bl = capture_replication_baseline(leader);
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
+    auto init_leader_bl = capture_replication_baseline(leader, &pre_vacuum);
     auto snap = leader.snapshot();
-    auto owned = collect_changes(leader.changes_since(snap, 0));
+    auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
+    seed_follower(follower, pre_vacuum, stream_from);
     follower.ingest(views);
     assert_replication_match(init_leader_bl, follower);
 
@@ -9980,6 +10296,7 @@ TEST_CASE("prove_manifest__single_key__success", "[prove_manifest]") {
   {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     auto manifest = leader.create_manifest();
     CHECK(manifest.through_sequence == leader.durable_sequence());
@@ -9999,6 +10316,7 @@ TEST_CASE("prove_manifest__single_key__rotation_fails", "[prove_manifest]") {
   {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
@@ -10023,6 +10341,7 @@ TEST_CASE("prove_manifest__single_key__hint_gen_fails", "[prove_manifest]") {
   {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
@@ -10047,6 +10366,7 @@ TEST_CASE("prove_manifest__multi_key__success", "[prove_manifest]") {
     leader.put({}, to_bytes("k3"), to_bytes("v3"));
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     auto manifest = leader.create_manifest();
     CHECK(manifest.through_sequence == leader.durable_sequence());
@@ -10070,6 +10390,7 @@ TEST_CASE("prove_manifest__multi_key__rotation_fails", "[prove_manifest]") {
     leader.put({}, to_bytes("k3"), to_bytes("v3"));
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
@@ -10098,6 +10419,7 @@ TEST_CASE("prove_manifest__multi_key__hint_gen_fails", "[prove_manifest]") {
     leader.put({}, to_bytes("k3"), to_bytes("v3"));
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
@@ -10119,6 +10441,7 @@ TEST_CASE("prove_manifest__overwrites__success", "[prove_manifest]") {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("old"));
     leader.put({}, to_bytes("k1"), to_bytes("new"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     auto manifest = leader.create_manifest();
     CHECK(manifest.through_sequence == leader.durable_sequence());
@@ -10139,6 +10462,7 @@ TEST_CASE("prove_manifest__overwrites__rotation_fails", "[prove_manifest]") {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("old"));
     leader.put({}, to_bytes("k1"), to_bytes("new"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
@@ -10164,6 +10488,7 @@ TEST_CASE("prove_manifest__overwrites__hint_gen_fails", "[prove_manifest]") {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("old"));
     leader.put({}, to_bytes("k1"), to_bytes("new"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
@@ -10185,6 +10510,7 @@ TEST_CASE("prove_manifest__deletes__success", "[prove_manifest]") {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
     (void)leader.del({}, to_bytes("k1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     auto manifest = leader.create_manifest();
     CHECK(manifest.through_sequence == leader.durable_sequence());
@@ -10205,6 +10531,7 @@ TEST_CASE("prove_manifest__deletes__rotation_fails", "[prove_manifest]") {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
     (void)leader.del({}, to_bytes("k1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
@@ -10230,6 +10557,7 @@ TEST_CASE("prove_manifest__deletes__hint_gen_fails", "[prove_manifest]") {
     auto leader = bytecask::DB::open(leader_dir);
     leader.put({}, to_bytes("k1"), to_bytes("v1"));
     (void)leader.del({}, to_bytes("k1"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
@@ -10255,6 +10583,7 @@ TEST_CASE("prove_manifest__range_deletes__success", "[prove_manifest]") {
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     auto manifest = leader.create_manifest();
     CHECK(manifest.through_sequence == leader.durable_sequence());
@@ -10279,6 +10608,7 @@ TEST_CASE("prove_manifest__range_deletes__rotation_fails", "[prove_manifest]") {
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
@@ -10308,6 +10638,7 @@ TEST_CASE("prove_manifest__range_deletes__hint_gen_fails", "[prove_manifest]") {
     leader.put({}, to_bytes("k4"), to_bytes("v4"));
     leader.put({}, to_bytes("k5"), to_bytes("v5"));
     leader.del_range({}, to_bytes("k2"), to_bytes("k5"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
@@ -10334,6 +10665,7 @@ TEST_CASE("prove_manifest__batches__success", "[prove_manifest]") {
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     auto manifest = leader.create_manifest();
     CHECK(manifest.through_sequence == leader.durable_sequence());
@@ -10359,6 +10691,7 @@ TEST_CASE("prove_manifest__batches__rotation_fails", "[prove_manifest]") {
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
@@ -10389,6 +10722,7 @@ TEST_CASE("prove_manifest__batches__hint_gen_fails", "[prove_manifest]") {
       plan.put(to_bytes("b3"), to_bytes("v3"));
       (void)leader.apply_batch({}, std::move(plan));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
@@ -10413,6 +10747,7 @@ TEST_CASE("prove_manifest__multi_file__success", "[prove_manifest]") {
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     auto manifest = leader.create_manifest();
     CHECK(manifest.through_sequence == leader.durable_sequence());
@@ -10436,6 +10771,7 @@ TEST_CASE("prove_manifest__multi_file__rotation_fails", "[prove_manifest]") {
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
@@ -10464,6 +10800,7 @@ TEST_CASE("prove_manifest__multi_file__hint_gen_fails", "[prove_manifest]") {
       auto val = std::format("v{:04d}", i);
       leader.put({}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
@@ -10487,6 +10824,7 @@ TEST_CASE("prove_manifest__mixed_sync_nosync__success", "[prove_manifest]") {
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     auto manifest = leader.create_manifest();
     CHECK(manifest.through_sequence == leader.durable_sequence());
@@ -10509,6 +10847,7 @@ TEST_CASE("prove_manifest__mixed_sync_nosync__rotation_fails", "[prove_manifest]
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
@@ -10536,6 +10875,7 @@ TEST_CASE("prove_manifest__mixed_sync_nosync__hint_gen_fails", "[prove_manifest]
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
@@ -10560,6 +10900,7 @@ TEST_CASE("prove_manifest__nosync_only__success", "[prove_manifest]") {
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     auto manifest = leader.create_manifest();
     CHECK(manifest.through_sequence == leader.durable_sequence());
@@ -10583,6 +10924,7 @@ TEST_CASE("prove_manifest__nosync_only__rotation_fails", "[prove_manifest]") {
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
@@ -10611,6 +10953,7 @@ TEST_CASE("prove_manifest__nosync_only__hint_gen_fails", "[prove_manifest]") {
       auto val = std::format("v{:04d}", i);
       leader.put({.sync = false}, to_bytes(key), to_bytes(val));
     }
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
@@ -10634,6 +10977,7 @@ TEST_CASE("prove_manifest__nosync_then_sync__success", "[prove_manifest]") {
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     auto manifest = leader.create_manifest();
     CHECK(manifest.through_sequence == leader.durable_sequence());
@@ -10656,6 +11000,7 @@ TEST_CASE("prove_manifest__nosync_then_sync__rotation_fails", "[prove_manifest]"
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
@@ -10683,6 +11028,7 @@ TEST_CASE("prove_manifest__nosync_then_sync__hint_gen_fails", "[prove_manifest]"
     leader.put({.sync = false}, to_bytes("ns2"), to_bytes("v2"));
     leader.put({.sync = false}, to_bytes("ns3"), to_bytes("v3"));
     leader.put({.sync = true}, to_bytes("s1"), to_bytes("v4"));
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
@@ -10702,6 +11048,7 @@ TEST_CASE("prove_manifest__vacuumed_batches__success", "[prove_manifest]") {
   auto leader_dir = td.path / "leader";
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -10717,7 +11064,12 @@ TEST_CASE("prove_manifest__vacuumed_batches__success", "[prove_manifest]") {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     auto manifest = leader.create_manifest();
     CHECK(manifest.through_sequence == leader.durable_sequence());
@@ -10736,6 +11088,7 @@ TEST_CASE("prove_manifest__vacuumed_batches__rotation_fails", "[prove_manifest]"
   auto leader_dir = td.path / "leader";
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -10751,7 +11104,12 @@ TEST_CASE("prove_manifest__vacuumed_batches__rotation_fails", "[prove_manifest]"
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
@@ -10775,6 +11133,7 @@ TEST_CASE("prove_manifest__vacuumed_batches__hint_gen_fails", "[prove_manifest]"
   auto leader_dir = td.path / "leader";
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
+    [[maybe_unused]] bytecask::testing::OwnedEntries pre_vacuum;
     for (int i = 0; i < 10; ++i) {
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes(key));
@@ -10790,7 +11149,12 @@ TEST_CASE("prove_manifest__vacuumed_batches__hint_gen_fails", "[prove_manifest]"
       auto key = std::format("pre{:02d}", i);
       leader.put({}, to_bytes(key), to_bytes("updated"));
     }
+    {
+      auto pre_snap = leader.snapshot();
+      pre_vacuum = collect_changes(leader.changes_since(pre_snap, 0));
+    }
     (void)leader.vacuum({.fragmentation_threshold = 0.0});
+    [[maybe_unused]] const auto stream_from = leader.min_resumable_sequence();
 
     {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};

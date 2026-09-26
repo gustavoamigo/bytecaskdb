@@ -167,6 +167,16 @@ public:
   DbFollowerMode& operator=(const DbFollowerMode&) = default;
   ~DbFollowerMode() override = default;
 };
+
+// Thrown by changes_since when from_sequence is below
+// min_resumable_sequence(): vacuum has dropped history above it.
+class DbInvalidSequence : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+  DbInvalidSequence(const DbInvalidSequence&) = default;
+  DbInvalidSequence& operator=(const DbInvalidSequence&) = default;
+  ~DbInvalidSequence() override = default;
+};
 #pragma clang diagnostic pop
 
 // ---------------------------------------------------------------------------
@@ -483,6 +493,9 @@ public:
       std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const
       -> std::uint64_t;
 
+  // The lowest from_sequence changes_since accepts.
+  [[nodiscard]] auto min_resumable_sequence() const -> std::uint64_t;
+
   [[nodiscard]] auto create_manifest() -> FileManifest;
 
   [[nodiscard]] auto changes_since(const Snapshot& snap,
@@ -528,6 +541,7 @@ using DataEntryView        = internal::DataEntryView;
 using EntryView            = internal::EntryView;
 using DbDegraded           = internal::DbDegraded;
 using DbFollowerMode       = internal::DbFollowerMode;
+using DbInvalidSequence    = internal::DbInvalidSequence;
 using DB                   = internal::DB;
 using Snapshot             = internal::Snapshot;
 using WritePlan            = internal::WritePlan;

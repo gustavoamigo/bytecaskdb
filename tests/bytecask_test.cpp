@@ -3103,10 +3103,13 @@ TEST_CASE("recovery undoes a vacuum killed before the source was unlinked",
 
     // Each sequence once: the copy's duplicates are gone from changes_since
     // too (#129).
-    auto snap = db.snapshot();
+    // Every entry on disk: changes_since itself refuses to start below
+    // min_resumable_sequence().
+    auto state = db.engine_state();
     std::vector<std::uint64_t> seqs;
-    for (const auto &entry : db.changes_since(snap, 0)) {
-      seqs.push_back(entry.sequence);
+    for (bytecask::ChangeIterator it{state, 0, state->durable_seq};
+         it != std::default_sentinel; ++it) {
+      seqs.push_back((*it).sequence);
     }
     auto sorted = seqs;
     std::ranges::sort(sorted);
@@ -7486,6 +7489,216 @@ TEST_CASE("set_mode(Follower): a failed fdatasync degrades and keeps the mode",
   CHECK(db.mode() == bytecask::Mode::Follower);
 }
 
+// ---------------------------------------------------------------------------
+// min_resumable_sequence (#168): changes_since refuses to resume where
+// vacuum has dropped history.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Fills sealed files with k0..k9, then overwrites every key, so the first
+// files hold only dead Puts. Returns the highest sequence of the first pass.
+auto write_then_overwrite(bytecask::DB &db) -> std::uint64_t {
+  std::uint64_t first_pass = 0;
+  for (int i = 0; i < 10; ++i) {
+    const auto k = std::format("k{}", i);
+    first_pass = db.put({}, to_bytes(k), to_bytes("old")).sequence;
+  }
+  for (int i = 0; i < 10; ++i) {
+    const auto k = std::format("k{}", i);
+    db.put({}, to_bytes(k), to_bytes("new"));
+  }
+  return first_pass;
+}
+
+auto stream_sequences(const bytecask::DB &db, std::uint64_t from)
+    -> std::vector<std::uint64_t> {
+  auto snap = db.snapshot();
+  std::vector<std::uint64_t> seqs;
+  for (const auto &e : db.changes_since(snap, from)) seqs.push_back(e.sequence);
+  return seqs;
+}
+
+} // namespace
+
+TEST_CASE("min_resumable_sequence: 0 until vacuum drops history",
+          "[replication][min_resumable]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 128});
+  (void)write_then_overwrite(db);
+  CHECK(db.min_resumable_sequence() == 0);
+  CHECK(db.stats().at("bytecask.min_resumable_sequence") == 0);
+  CHECK_FALSE(stream_sequences(db, 0).empty());
+}
+
+TEST_CASE("min_resumable_sequence: vacuum raises it and changes_since refuses "
+          "to resume below it",
+          "[replication][min_resumable]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 128});
+  const auto first_pass = write_then_overwrite(db);
+  auto before = db.snapshot();
+  while (db.vacuum({.fragmentation_threshold = 0.0})) {
+  }
+  const auto floor = db.min_resumable_sequence();
+  REQUIRE(floor > 0);
+  CHECK(floor <= first_pass);
+  CHECK(db.stats().at("bytecask.min_resumable_sequence") ==
+        static_cast<std::int64_t>(floor));
+
+  auto snap = db.snapshot();
+  CHECK_THROWS_AS((void)db.changes_since(snap, floor - 1),
+                  bytecask::DbInvalidSequence);
+  CHECK_THROWS_AS((void)db.changes_since(snap, 0),
+                  bytecask::DbInvalidSequence);
+
+  // From the floor on, the stream is complete: every sequence above it that
+  // the leader assigned, up to the last write.
+  const auto seqs = stream_sequences(db, floor);
+  REQUIRE_FALSE(seqs.empty());
+  CHECK(seqs.front() == floor + 1);
+  for (std::size_t i = 1; i < seqs.size(); ++i) CHECK(seqs[i] == seqs[i - 1] + 1);
+  CHECK(seqs.back() == db.durable_sequence());
+
+  // A snapshot from before the vacuum still has the files it pinned, and
+  // still streams from 0.
+  auto old_seqs = std::vector<std::uint64_t>{};
+  for (const auto &e : db.changes_since(before, 0)) old_seqs.push_back(e.sequence);
+  CHECK(old_seqs.front() == 1);
+}
+
+TEST_CASE("min_resumable_sequence: a follower resuming at it converges",
+          "[replication][min_resumable]") {
+  TempDir td;
+  auto leader = bytecask::DB::open(td.path / "leader", {.max_file_bytes = 128});
+  auto follower = bytecask::DB::open(
+      td.path / "follower", {.initial_mode = bytecask::Mode::Follower});
+  (void)write_then_overwrite(leader);
+  {
+    // The follower takes the history before the vacuum drops any of it.
+    auto snap = leader.snapshot();
+    std::vector<bytecask::DataEntry> owned;
+    for (const auto &e : leader.changes_since(snap, 0))
+      owned.push_back({e.sequence, e.entry_type,
+                       {e.key.begin(), e.key.end()},
+                       {e.value.begin(), e.value.end()}});
+    std::vector<bytecask::DataEntryView> views;
+    for (const auto &e : owned)
+      views.push_back({e.sequence, e.entry_type, e.key, e.value});
+    follower.ingest(views);
+  }
+  while (leader.vacuum({.fragmentation_threshold = 0.0})) {
+  }
+  leader.put({}, to_bytes("after"), to_bytes("vacuum"));
+  REQUIRE(follower.durable_sequence() >= leader.min_resumable_sequence());
+
+  auto snap = leader.snapshot();
+  std::vector<bytecask::DataEntry> owned;
+  for (const auto &e :
+       leader.changes_since(snap, follower.durable_sequence()))
+    owned.push_back({e.sequence, e.entry_type, {e.key.begin(), e.key.end()},
+                     {e.value.begin(), e.value.end()}});
+  std::vector<bytecask::DataEntryView> views;
+  for (const auto &e : owned)
+    views.push_back({e.sequence, e.entry_type, e.key, e.value});
+  follower.ingest(views);
+  CHECK(follower.durable_sequence() == leader.durable_sequence());
+  CHECK(collect_kv(follower) == collect_kv(leader));
+}
+
+TEST_CASE("min_resumable_sequence: survives reopen",
+          "[replication][min_resumable]") {
+  TempDir td;
+  std::uint64_t floor = 0;
+  {
+    auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 128});
+    (void)write_then_overwrite(db);
+    while (db.vacuum({.fragmentation_threshold = 0.0})) {
+    }
+    floor = db.min_resumable_sequence();
+    REQUIRE(floor > 0);
+    db.put({}, to_bytes("later"), to_bytes("v"));
+  }
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 128});
+  CHECK(db.min_resumable_sequence() == floor);
+  auto snap = db.snapshot();
+  CHECK_THROWS_AS((void)db.changes_since(snap, floor - 1),
+                  bytecask::DbInvalidSequence);
+}
+
+TEST_CASE("min_resumable_sequence: without a readable record, only the last "
+          "sequence is safe",
+          "[replication][min_resumable]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  const auto record = dir / "MIN_RESUMABLE_SEQUENCE";
+  std::uint64_t last = 0;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({}, to_bytes("a"), to_bytes("1"));
+    last = db.put({}, to_bytes("b"), to_bytes("2")).sequence;
+    CHECK(db.min_resumable_sequence() == 0);
+  }
+  REQUIRE(std::filesystem::exists(record));
+
+  SECTION("missing: a database from before the record, or copied files") {
+    std::filesystem::remove(record);
+  }
+  SECTION("damaged") {
+    std::ofstream{record, std::ios::binary | std::ios::trunc} << "garbage!";
+  }
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(db.min_resumable_sequence() == last);
+    auto snap = db.snapshot();
+    CHECK_THROWS_AS((void)db.changes_since(snap, 0), bytecask::DbInvalidSequence);
+    CHECK(stream_sequences(db, last).empty());
+  }
+  // The assumption is recorded, so it does not rise with later writes.
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({}, to_bytes("c"), to_bytes("3"));
+  }
+  auto db = bytecask::DB::open(dir);
+  CHECK(db.min_resumable_sequence() == last);
+}
+
+TEST_CASE("min_resumable_sequence: a fresh directory starts at 0",
+          "[replication][min_resumable]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  CHECK(db.min_resumable_sequence() == 0);
+  CHECK(std::filesystem::exists(td.path / "db" / "MIN_RESUMABLE_SEQUENCE"));
+}
+
+TEST_CASE("min_resumable_sequence: a vacuum that cannot record it drops "
+          "nothing",
+          "[replication][min_resumable]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 128});
+  (void)write_then_overwrite(db);
+  const auto kv = collect_kv(db);
+  const auto files = db.engine_state()->file_stats;
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_min_resumable_write"};
+    CHECK_THROWS_AS((void)db.vacuum({.fragmentation_threshold = 0.0}),
+                    std::system_error);
+  }
+  CHECK(db.min_resumable_sequence() == 0);
+  CHECK_FALSE(db.is_degraded());
+  CHECK(collect_kv(db) == kv);
+  CHECK(stream_sequences(db, 0).front() == 1);
+  // Nothing was published: every file is still the one it was.
+  for (const auto [id, fs] : files) {
+    const auto now = db.engine_state()->file_stats.get(id);
+    REQUIRE(now);
+    CHECK(now->total_bytes == fs.total_bytes);
+  }
+  // The next vacuum succeeds.
+  CHECK(db.vacuum({.fragmentation_threshold = 0.0}));
+  CHECK(db.min_resumable_sequence() > 0);
+}
+
 TEST_CASE("basic ingest: entries from changes_since are ingested correctly",
           "[replication]") {
   TempDir td;
@@ -8463,6 +8676,7 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.hint_backpressure_stalls",
       "bytecask.hint_backpressure_stall_us",
       "bytecask.degraded",
+      "bytecask.min_resumable_sequence",
       "bytecask.hint_backlog",
       "bytecask.open_files",
   };

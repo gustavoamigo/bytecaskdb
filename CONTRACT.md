@@ -372,6 +372,16 @@ Recovery decides this once per open and compaction applies it; a
 tombstone written since the open is always kept. A file whose Puts are all
 dead may be removed without a scan only if it holds no tombstone.
 
+### History Bound
+
+Before it publishes or unlinks anything, a vacuum that drops entries
+durably raises `min_resumable_sequence` to the highest sequence it drops
+(a whole-file removal: the file's `max_sequence`). If that write fails,
+the vacuum throws before anything is published and drops nothing; the
+engine is not degraded. The value never decreases and survives a
+restart; without a readable record, an open assumes the highest
+recovered sequence.
+
 ### Size Accounting
 
 A published file's `total_bytes` equals its size on disk. Recovery
@@ -725,9 +735,10 @@ tests, not through standalone `changes_since` proof tests.
 |----------|----------|
 | **Durable boundary** | Only entries confirmed by `fdatasync` are yielded. The upper bound is `min(snap.sequence(), durable_sequence)`. Entries from NoSync writes not yet covered by a subsequent `fdatasync` are excluded, even if visible via snapshots. |
 | **Completeness** | Every committed durable entry with `sequence > from_sequence` at snapshot time is yielded exactly once. |
+| **History bound** | Throws `DbInvalidSequence` when `from_sequence` is below the snapshot's `min_resumable_sequence()`: vacuum has dropped entries above it, and the stream would have gaps. At or above it, completeness holds. The caller re-bootstraps from a manifest. |
 | **Ordering** | Entries are yielded in strictly ascending sequence order. |
 | **Batch integrity** | Incomplete batches (orphaned `BulkBegin` without `BulkEnd`) are excluded. `BulkBegin`/`BulkEnd` markers are preserved in the output. |
-| **Vacuum transparency** | After `vacuum_compact_file`, entries retain original sequences and batch markers. `changes_since` over a vacuumed file yields the same logical content as the pre-vacuum file. |
+| **Vacuum transparency** | After `vacuum_compact_file`, entries retain original sequences and batch markers. Above `min_resumable_sequence()`, `changes_since` over a vacuumed file yields the same entries as over the pre-vacuum file. |
 | **Snapshot safety** | The iterator holds a `Snapshot` reference, keeping file descriptors open. Safe to run concurrently with vacuum (reads via fd, not path). |
 
 ---

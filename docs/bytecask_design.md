@@ -718,7 +718,18 @@ Every entry has its own sequence, so a sequence names one tombstone exactly: the
 
 The original sequence number of every copied tombstone is preserved verbatim so recovery's sequence comparison still works correctly on the compacted file.
 
-**Replication.** A dropped tombstone is no longer in the `changes_since` stream, the same way a dropped dead Put is not. A follower that already holds `Put(K)` and resumes from a sequence before the delete does not learn about it. `changes_since` has no lower bound on how far back it can resume (#168).
+**Replication.** A dropped tombstone is no longer in the `changes_since` stream, the same way a dropped dead Put is not. A follower that already holds `Put(K)` and resumed from a sequence before the delete would never learn about it. That is why vacuum raises `min_resumable_sequence` to the highest sequence it drops, a Put or a tombstone, and `changes_since` refuses to resume below it (next section).
+
+#### How far back history is complete
+
+`EngineState::min_resumable_seq` is the highest sequence vacuum has dropped: every entry above it is still on disk, so `changes_since(snap, from)` is complete for `from >= snap`'s value and throws `DbInvalidSequence` below it. The public accessor is `min_resumable_sequence()`; `stats()` exports it as `bytecask.min_resumable_sequence`.
+
+- **Compaction** tracks the highest sequence among the entries its scan leaves out, dead Puts and droppable tombstones (`VacuumScanResult::max_dropped_sequence`). **Whole-file removal** drops everything, so it uses the file's `max_sequence`. Batch markers are never dropped.
+- **Order.** Under `vacuum_mu_`, the value is written to `MIN_RESUMABLE_SEQUENCE` (write, `fdatasync`, rename, directory `fsync`) before the compacted file is renamed into place, the state is published, or the old file is unlinked. A crash from there on leaves the record ahead of the files, which only costs a follower a re-bootstrap. A failed write aborts the vacuum before anything is published: the staged copy is deleted and the error propagates, with the engine not degraded.
+- **Publication.** `apply_vacuum` raises the field in the state vacuum publishes, so a snapshot taken earlier keeps both its files and its lower bound. `store_state` treats a decrease as an invariant violation.
+- **Open.** The record is read after recovery. Missing or damaged (a directory from before the record, one assembled from manifest files, a torn write the rename should make impossible), or after a lenient open left a data file out, the value is the highest recovered sequence, since nothing below it is known to be complete, and that value is recorded. A fresh directory records 0.
+
+The alternatives were weaker. Sequences are not dense (a failed write consumes them), so a gap proves nothing; the hint header has no room that survives a hint rebuild; and a marker entry in the data file would be a larger format change for the same value.
 
 #### Space accounting
 

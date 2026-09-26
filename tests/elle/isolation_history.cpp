@@ -656,6 +656,9 @@ struct ClusterStats {
   std::atomic<int> duplicates{0};
   std::atomic<int> lag_pauses{0};
   std::atomic<int> follower_vacuums{0};
+  // Followers that re-bootstrapped because their source's vacuum had
+  // dropped history they had not yet received.
+  std::atomic<int> history_rebootstraps{0};
   std::atomic<int> session_reads{0};
 
   void error(std::string what) {
@@ -744,7 +747,8 @@ auto bootstrap(Node &source, Node &n, std::mutex &vacuum_gate,
 // while holding n exclusively) never races an ingest into n.
 auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
                const ClusterView &view, bool lag, std::uint64_t seed,
-               const std::atomic<bool> &stop, ClusterStats &stats) -> void {
+               const std::atomic<bool> &stop, std::mutex &vacuum_gate,
+               const KeyPool &keys, ClusterStats &stats) -> void {
   std::mt19937_64 rng{seed};
   // A run lasts a few seconds, so the nemeses fire every few hundred ms.
   auto next_restart =
@@ -792,6 +796,7 @@ auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
     }
     auto &fdb = n.holder->db;
     auto &leader = sn.holder->db;
+    auto behind_history = false;
     try {
       if (rng() % 50 == 0) {
         const auto threshold = static_cast<double>(rng() % 60) / 100.0;
@@ -837,6 +842,12 @@ auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
         ingest_owned(fdb, buf);
         stats.ingests.fetch_add(1, std::memory_order_relaxed);
       }
+    } catch (const bytecask::DbInvalidSequence &) {
+      // The source's vacuum dropped history n still needs (#168). A
+      // duplicate-delivery rewind can land below the source's
+      // min_resumable_sequence() too; that one just retries from where n is.
+      behind_history =
+          fdb.durable_sequence() < leader.min_resumable_sequence();
     } catch (const std::exception &) {
       // Restart from n's durable_sequence(), as the protocol says. A
       // degraded node recovers through resume().
@@ -847,6 +858,17 @@ auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
         } catch (const std::exception &) {
         }
       }
+    }
+    if (behind_history) {
+      // Resuming is refused, so n starts over from a manifest.
+      sg.unlock();
+      g.unlock();
+      stats.history_rebootstraps.fetch_add(1, std::memory_order_relaxed);
+      {
+        NodeExclusive x{n};
+        n.holder.reset();
+      }
+      bootstrap(sn, n, vacuum_gate, keys, stats);
     }
   }
 }
@@ -1025,11 +1047,11 @@ auto write_cluster_summary(const fs::path &path, ClusterStats &stats,
   out << std::format(
       R"(],"final_leader":{},"ingests":{},"ingest_errors":{},"restarts":{},)"
       R"("duplicates":{},"lag_pauses":{},"follower_vacuums":{},)"
-      R"("session_reads":{}}})",
+      R"("session_reads":{},"history_rebootstraps":{}}})",
       final_leader, stats.ingests.load(), stats.ingest_errors.load(),
       stats.restarts.load(), stats.duplicates.load(),
       stats.lag_pauses.load(), stats.follower_vacuums.load(),
-      stats.session_reads.load());
+      stats.session_reads.load(), stats.history_rebootstraps.load());
   out << "\n";
 }
 
@@ -1249,7 +1271,8 @@ auto run(const RunOptions &o) -> int {
             at(v.source, i) = v.leader;
           });
         }
-        replicate(nodes, node(i), view, o.lag, brng(), repl_stop, cluster);
+        replicate(nodes, node(i), view, o.lag, brng(), repl_stop, vacuum_gate,
+                  keys, cluster);
       });
       for (int r = 0; r < o.follower_readers; ++r) {
         reader_threads.emplace_back([&, i, r] {
@@ -1465,13 +1488,14 @@ auto run(const RunOptions &o) -> int {
     write_cluster_summary(summary, cluster, final_leader);
     std::printf("  cluster: bootstraps=%zu events=%zu ingests=%d "
                 "ingest_errors=%d restarts=%d duplicates=%d lag_pauses=%d "
-                "follower_vacuums=%d session_reads=%d errors=%zu "
-                "final_leader=%d\n",
+                "follower_vacuums=%d session_reads=%d "
+                "history_rebootstraps=%d errors=%zu final_leader=%d\n",
                 cluster.bootstraps.size(), cluster.events.size(),
                 cluster.ingests.load(), cluster.ingest_errors.load(),
                 cluster.restarts.load(), cluster.duplicates.load(),
                 cluster.lag_pauses.load(), cluster.follower_vacuums.load(),
-                cluster.session_reads.load(), cluster.errors.size(),
+                cluster.session_reads.load(),
+                cluster.history_rebootstraps.load(), cluster.errors.size(),
                 final_leader);
   }
   nodes.clear();
