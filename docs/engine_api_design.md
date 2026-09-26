@@ -182,8 +182,8 @@ struct ReadOptions {
 // Controls which sealed files are eligible for vacuum.
 struct VacuumOptions {
     // Minimum fragmentation ratio a sealed file must exceed to be eligible:
-    // 1 − (live + tombstone bytes) / total bytes, the share compaction can
-    // reclaim. Range [0.0, 1.0]. Default 0.5.
+    // 1 − (live + tombstone + marker bytes) / total bytes, the share of dead
+    // Puts compaction is sure to reclaim. Range [0.0, 1.0]. Default 0.5.
     double fragmentation_threshold{0.5};
 };
 ```
@@ -346,8 +346,9 @@ public:
     // ── Vacuum ────────────────────────────────────────────────────────────
 
     // Selects the highest-fragmentation sealed file above the threshold and
-    // either removes it (if it has no live entries) or compacts it into a 
-    // new sealed file.
+    // either removes it (if it holds no live entry and no tombstone) or
+    // compacts it into a new sealed file, dropping the tombstones recovery
+    // found no longer needed.
     // Returns true if a file was vacuumed, false if no file qualified.
     // Thread-safe: safe to call from a dedicated background thread without
     // any external synchronisation; only the brief commit step blocks writers.
