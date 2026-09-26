@@ -7,10 +7,21 @@ add_requires("crc32c")
 -- Under MemorySanitizer zstd is instrumented too (see msan_libcxx_prefix
 -- below): its stores into the output buffer are otherwise invisible to MSan,
 -- and every compressed hint frame reads as uninitialized.
+-- CLANG_TARGET_TRIPLE is passed for the same reason as in apply_sanitizer
+-- below: xmake's package toolchain adds --target=x86_64-linux-gnu, and on
+-- Fedora the MSan runtime lives only under x86_64-redhat-linux-gnu, so
+-- zstd's CMake compiler check fails to link. These flags come after xmake's,
+-- and Clang takes the last --target.
 if (get_config("sanitizer") or ""):find("memory", 1, true) then
+    local zstd_cflags = {"-fsanitize=memory", "-fsanitize-memory-track-origins=2"}
+    local zstd_ldflags = {"-fsanitize=memory"}
+    local triple = os.getenv("CLANG_TARGET_TRIPLE")
+    if triple then
+        table.insert(zstd_cflags, "--target=" .. triple)
+        table.insert(zstd_ldflags, "--target=" .. triple)
+    end
     add_requires("zstd", {system = false, configs = {
-        cflags = {"-fsanitize=memory", "-fsanitize-memory-track-origins=2"},
-        ldflags = "-fsanitize=memory"}})
+        cflags = zstd_cflags, ldflags = zstd_ldflags}})
 else
     add_requires("zstd", {system = false})
 end
