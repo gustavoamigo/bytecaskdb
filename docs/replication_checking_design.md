@@ -222,6 +222,24 @@ a committed append at or below S on another key. Or a follower whose
 Vacuum dropped the dead entry before the lagging follower's `changes_since`
 reached it. The follower shows the gap until the newer version arrives.
 
+**A write one reader had seen was invisible to a later reader.** The first
+local run with Elle reported `G-single-item-realtime` on the leader of a
+`cluster` round, with leader vacuum off. The monotonic cross-check flagged
+the same thing on node 0. Transaction T13 was still in flight. Reader T12
+saw its append to one key. Reader T14, which began after T12 finished, did
+not see T13's append to another key.
+
+#180 had closed the gap for a writer that returns in the middle of another
+thread's publication, but here no writer had returned. T12's thread loaded
+the new state directly, while T14's thread served its cached state because
+the publisher had not yet stored `state_time_`.
+
+The fix replaces the timestamp in session mode with a publication counter
+and a generation, described in `bytecask_design.md` under *Why session mode
+needs more than a timestamp*. The regression test is "pipeline: a write one
+reader has seen is visible to every later reader, while its publication is
+still in progress". It fails on `main` 3 times out of 3.
+
 Step 2 is still to come, including the fork case above.
 
 ## Acceptance

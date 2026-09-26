@@ -257,6 +257,13 @@ cross-check gained the real-time rule above. With it, the pre-fix binary
 failed in round 3 of a local run, and the fixed one passed 16 rounds on the
 same seed.
 
+The replication check later found the reader-to-reader version of the same
+gap: one reader saw an in-flight write, and a later reader did not. Session
+reads now use a publication counter and a generation instead of the
+timestamp, which also replaces the `state_time_` advance in `commit_wait`
+(see [`replication_checking_design.md`](replication_checking_design.md),
+*Findings*).
+
 ## Acceptance
 
 - `guarded` is valid under `strict-serializable` on every nightly run.

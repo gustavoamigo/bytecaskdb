@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -56,6 +57,10 @@ CLUSTER_CONFIGS = ("cluster", "cluster-vacuum")
 # else in the unguarded configuration is a bug in the implicit W-W check or
 # in snapshot reads.
 WRITE_SKEW = {"G2-item", "G2-item-process", "G2-item-realtime"}
+
+
+ELLE_LOG_LINE = re.compile(
+    r"(?:TRACE|DEBUG|INFO|WARN|ERROR) \[\d{4}-\d\d-\d\d [^\]]*\] [^\n]*\n")
 
 
 class CheckFailed(Exception):
@@ -146,11 +151,14 @@ def run_elle(jar: Path, history: Path, models: str, out_dir: Path) -> dict:
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     (out_dir / "elle.stdout").write_text(proc.stdout)
     (out_dir / "elle.stderr").write_text(proc.stderr)
+    # Elle's plotting threads log to stdout and can land mid-line in the
+    # JSON ("INFO [...] elle.viz Skipping plot of N bytes").
+    stdout = ELLE_LOG_LINE.sub("", proc.stdout)
     # elle-cli pretty-prints the analysis as the last JSON object on stdout.
-    if proc.stdout.startswith("{"):
+    if stdout.startswith("{"):
         start = 0
     else:
-        start = proc.stdout.find("\n{")
+        start = stdout.find("\n{")
         start = start + 1 if start >= 0 else -1
     if start < 0 or proc.returncode not in (0, 1):
         for name, text in (("stdout", proc.stdout), ("stderr", proc.stderr)):
@@ -163,7 +171,7 @@ def run_elle(jar: Path, history: Path, models: str, out_dir: Path) -> dict:
             f"elle-cli failed (exit {proc.returncode}) on {history}; "
             f"see {out_dir}")
     try:
-        return json.loads(proc.stdout[start:])
+        return json.loads(stdout[start:])
     except json.JSONDecodeError as e:
         raise CheckFailed(f"cannot parse elle-cli output in {out_dir}: {e}")
 
