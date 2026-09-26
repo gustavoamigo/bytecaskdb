@@ -28,7 +28,6 @@ GitHub Issues are the repository's task tracker, for work not already captured b
 
 - Track follow-up work as GitHub issues rather than in a repo file. Don't open one just to mirror a PR that's already tracking its own task.
 - Add follow-up work discovered during implementation as a new issue.
-- Target the current milestone when the work is planned for the next release.
 
 ## Benchmarking rules
 
@@ -218,9 +217,7 @@ The README targets an experienced systems/database engineering audience. They kn
 
 ## Tips
 
-* xmake can take a while to run, wait for the build to run before trying to do something else. 
-* Don't run any command while the terminal is running as the integration with terminal is sending a ^C killing the previous process when you send a new command.
-* After running a long command (build, benchmark, test suite), do NOT immediately send another command. Wait for the command to finish and return output before proceeding. If the output is truncated or the command appears to still be running, ask the user to confirm completion rather than sending a follow-up command. 
+* Build and run the test suite with `xmake build bytecask_tests && xmake run bytecask_tests`. xmake can take a while; wait for it to finish before doing anything else.
 
 <!-- graft:start -->
 ## Graft — repo context graph
