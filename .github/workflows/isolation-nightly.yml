@@ -19,6 +19,9 @@ on:
       rounds:
         description: "Rounds per job (three histories each)"
         default: "4"
+      cluster_rounds:
+        description: "Cluster rounds per job (two histories each)"
+        default: "8"
       seed:
         description: "Seed to replay (empty = random)"
         default: ""
@@ -123,10 +126,28 @@ jobs:
           if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
           python3 scripts/run_isolation_check.py $ARGS
 
+      # Leader plus two followers through bootstrap and tailing
+      # (docs/replication_checking_design.md). cluster-vacuum must detect
+      # #168 at least once per run; it does in about half the rounds, so the
+      # run is longer than the single-node one.
+      - name: Run cluster check
+        env:
+          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
+          ROUNDS: ${{ github.event.inputs.cluster_rounds || '8' }}
+          SEED: ${{ github.event.inputs.seed || '' }}
+        run: |
+          ARGS="--binary build/linux/x86_64/${{ matrix.mode }}/isolation_history"
+          ARGS="$ARGS --elle-jar elle-cli.jar --cluster --rounds $ROUNDS"
+          ARGS="$ARGS --txns ${{ matrix.txns }} --out $RUNNER_TEMP/isolation-cluster"
+          if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
+          python3 scripts/run_isolation_check.py $ARGS
+
       - name: Upload histories and Elle output
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: isolation-failure-${{ matrix.name }}
-          path: ${{ runner.temp }}/isolation
+          path: |
+            ${{ runner.temp }}/isolation
+            ${{ runner.temp }}/isolation-cluster
           if-no-files-found: ignore

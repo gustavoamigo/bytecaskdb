@@ -2,12 +2,13 @@
 """Generate list-append histories with isolation_history and check them with
 Elle (elle-cli) and a direct commit-sequence cross-check.
 
-See docs/isolation_checking_design.md.
+See docs/isolation_checking_design.md, and for --cluster
+docs/replication_checking_design.md.
 
 Usage:
     python3 scripts/run_isolation_check.py --binary PATH [--elle-jar PATH]
         [--seed S] [--rounds N] [--txns N] [--threads N] [--out DIR]
-        [--no-vacuum] [--no-degrade]
+        [--no-vacuum] [--no-degrade] [--cluster]
 
 Each round runs the three configurations from one seed:
 
@@ -19,6 +20,19 @@ Each round runs the three configurations from one seed:
                checker can see the anomaly the guards exist to prevent.
     blind      must fail: the cross-check or Elle has to find a lost or
                out-of-order append.
+
+With --cluster each round instead runs a leader with two followers
+(bootstrapped from a manifest under load, tailed with lag, duplicate delivery
+and restarts, and read from), in two configurations:
+
+    cluster         leader vacuum off. The leader's operations must pass the
+                    guarded checks above; the whole history must be
+                    serializable (follower reads may be stale, not
+                    inconsistent) and pass the replication checks: prefix,
+                    session, monotonic reads, convergence and bootstrap.
+    cluster-vacuum  leader vacuum on. Expected to detect #168 at least once
+                    over the run: a follower resuming below a compacted file
+                    receives a batch with entries missing.
 
 Without --elle-jar only the cross-check runs. Exit status is non-zero on any
 failed expectation. Histories and Elle's output stay under --out.
@@ -36,6 +50,7 @@ from collections import defaultdict
 from pathlib import Path
 
 CONFIGS = ("guarded", "unguarded", "blind")
+CLUSTER_CONFIGS = ("cluster", "cluster-vacuum")
 
 # Anomalies write skew may show up as under strict-serializable. Anything
 # else in the unguarded configuration is a bug in the implicit W-W check or
@@ -159,6 +174,156 @@ def describe(analysis: dict) -> str:
             f"not={analysis.get('not', [])}")
 
 
+def replication_checks(history: list[dict]) -> list[str]:
+    """Checks follower reads against the leader's commit order.
+
+    prefix       a follower read is a prefix of the leader's history: if it
+                 shows an append committed at sequence S, it shows every
+                 committed append at or below S on the keys it read.
+    session      a read made after durable_sequence(W) returned >= W shows
+                 every committed append at or below W.
+    monotonic    a read on a node shows no less of a key than any read on the
+                 same node that completed before it was invoked.
+    convergence  every node's final value of every key equals the leader's.
+    """
+    elem_seq: dict[int, int] = {}
+    ok_by_key: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for op in history:
+        if op["type"] == "ok" and op.get("node", 0) == 0:
+            seq = op.get("sequence", 0)
+            for m in op["value"]:
+                if m[0] == "append":
+                    elem_seq[m[2]] = seq
+                    ok_by_key[m[1]].append((seq, m[2]))
+
+    found: dict[str, list[str]] = defaultdict(list)
+    longest: dict[tuple[int, int], int] = defaultdict(int)
+    floors: dict[int, dict[int, int]] = {}
+    final: dict[int, dict[int, list[int]]] = defaultdict(dict)
+    for op in history:
+        node = op.get("node", 0)
+        reads = [m for m in op["value"] if m[0] == "r"]
+        if op["type"] == "invoke":
+            floors[op["process"]] = {m[1]: longest[(node, m[1])] for m in reads}
+            continue
+        floor = floors.pop(op["process"], {})
+        if op["type"] != "ok":
+            continue
+        for m in reads:
+            key, lst = m[1], m[2]
+            if len(lst) < floor.get(key, 0):
+                found["monotonic"].append(
+                    f"node {node} key {key}: read {lst} after a completed read "
+                    f"of length {floor[key]}")
+            longest[(node, key)] = max(longest[(node, key)], len(lst))
+            if len(lst) >= len(final[node].get(key, [])):
+                final[node][key] = lst
+        if node == 0 or not reads:
+            continue
+        cut = max((elem_seq[e] for m in reads for e in m[2] if e in elem_seq),
+                  default=0)
+        wait = op.get("wait", 0)
+        for m in reads:
+            have = set(m[2])
+            gap = [e for s, e in ok_by_key[m[1]] if s <= cut and e not in have]
+            if gap:
+                found["prefix"].append(
+                    f"node {node} key {m[1]}: read {m[2]} shows sequence {cut} "
+                    f"elsewhere but misses committed appends {gap[:8]}")
+            late = [e for s, e in ok_by_key[m[1]] if s <= wait and e not in have]
+            if late:
+                found["session"].append(
+                    f"node {node} key {m[1]}: read {m[2]} after waiting for "
+                    f"sequence {wait} misses committed appends {late[:8]}")
+    for node in final:
+        if node == 0:
+            continue
+        for key in sorted(set(final[0]) | set(final[node])):
+            if final[node].get(key, []) != final[0].get(key, []):
+                found["convergence"].append(
+                    f"node {node} key {key}: final {final[node].get(key)} but "
+                    f"leader final {final[0].get(key)}")
+
+    problems = []
+    for kind, items in sorted(found.items()):
+        problems.append(f"{kind}: {len(items)} violations")
+        problems.extend(f"  {i}" for i in items[:5])
+    return problems
+
+
+def cluster_summary_problems(summary: dict) -> list[str]:
+    problems = [f"error: {e}" for e in summary["errors"]]
+    for b in summary["bootstraps"]:
+        if b["mismatches"] != 0:
+            problems.append(
+                f"bootstrap node {b['node']}: {b['mismatches']} of "
+                f"{b['keys_compared']} keys differ from the manifest snapshot")
+        if b["durable_after_open"] != b["through_sequence"]:
+            problems.append(
+                f"bootstrap node {b['node']}: durable_sequence() "
+                f"{b['durable_after_open']} after open, manifest through "
+                f"{b['through_sequence']}")
+    if not summary["bootstraps"]:
+        problems.append("no follower was bootstrapped")
+    return problems
+
+
+def check_cluster_round(args: argparse.Namespace, seed: int,
+                        round_dir: Path) -> None:
+    for config in CLUSTER_CONFIGS:
+        history_path = round_dir / f"{config}.json"
+        cmd = [str(args.binary), "--config", "guarded", "--seed", str(seed),
+               "--txns", str(args.txns), "--threads", str(args.threads),
+               "--followers", "2", "--lag",
+               "--dir", str(round_dir / f"db-{config}"),
+               "--out", str(history_path)]
+        cmd.append("--force-vacuum" if config == "cluster-vacuum"
+                   else "--no-vacuum")
+        if args.no_degrade:
+            cmd.append("--no-degrade")
+        subprocess.run(cmd, check=True)
+        shutil.rmtree(round_dir / f"db-{config}", ignore_errors=True)
+
+        history = json.loads(history_path.read_text())
+        summary = json.loads(
+            Path(str(history_path) + ".cluster.json").read_text())
+        leader = [op for op in history if op.get("node", 0) == 0]
+        leader_problems = cross_check(leader)
+        print(f"  {config}: leader cross-check "
+              f"{'clean' if not leader_problems else leader_problems[:3]}")
+        if leader_problems:
+            raise CheckFailed(f"{config}: leader cross-check failed")
+        setup = cluster_summary_problems(summary)
+        if setup:
+            for p in setup[:10]:
+                print(f"    {p}")
+            raise CheckFailed(f"{config}: bootstrap or replication errors")
+
+        problems = replication_checks(history)
+        print(f"  {config}: replication checks "
+              f"{'clean' if not problems else ''}")
+        for p in problems[:12]:
+            print(f"    {p}")
+        elle_found = False
+        if args.elle_jar:
+            leader_path = round_dir / f"{config}-leader.json"
+            leader_path.write_text(json.dumps(leader))
+            a = run_elle(args.elle_jar, leader_path, "strict-serializable",
+                         round_dir / f"elle-{config}-leader")
+            print(f"  {config}: leader strict-serializable {describe(a)}")
+            if a.get("valid?") is not True:
+                raise CheckFailed(f"{config}: leader not strict-serializable")
+            a = run_elle(args.elle_jar, history_path, "serializable",
+                         round_dir / f"elle-{config}-all")
+            print(f"  {config}: all nodes serializable {describe(a)}")
+            elle_found = a.get("valid?") is not True
+        if config == "cluster":
+            if problems or elle_found:
+                raise CheckFailed("cluster: replication checks failed")
+        else:
+            args.v168_seen |= bool(problems) or elle_found
+
+
 def check_round(args: argparse.Namespace, seed: int, round_dir: Path) -> None:
     for config in CONFIGS:
         history_path = round_dir / f"{config}.json"
@@ -231,6 +396,7 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=Path("isolation_check"))
     parser.add_argument("--no-vacuum", action="store_true")
     parser.add_argument("--no-degrade", action="store_true")
+    parser.add_argument("--cluster", action="store_true")
     args = parser.parse_args()
 
     seed = args.seed if args.seed is not None else random.SystemRandom().getrandbits(63)
@@ -240,19 +406,28 @@ def main() -> int:
     print(f"  rerun: {' '.join(sys.argv[:1])} --binary {args.binary} "
           f"--seed {seed} --rounds {args.rounds} --txns {args.txns} "
           f"--threads {args.threads}"
-          + (f" --elle-jar {args.elle_jar}" if args.elle_jar else ""))
+          + (f" --elle-jar {args.elle_jar}" if args.elle_jar else "")
+          + (" --cluster" if args.cluster else ""))
     sys.stdout.flush()
 
     shutil.rmtree(args.out, ignore_errors=True)
     args.write_skew_seen = False
+    args.v168_seen = False
     rng = random.Random(seed)
     try:
         for r in range(args.rounds):
             round_seed = rng.getrandbits(63)
             print(f"round {r + 1}/{args.rounds} seed={round_seed}")
             sys.stdout.flush()
-            check_round(args, round_seed, args.out / f"round-{r}")
-        if args.elle_jar and not args.write_skew_seen:
+            if args.cluster:
+                check_cluster_round(args, round_seed, args.out / f"round-{r}")
+            else:
+                check_round(args, round_seed, args.out / f"round-{r}")
+        if args.cluster and not args.v168_seen:
+            raise CheckFailed(
+                "cluster-vacuum: no round detected #168; the harness is not "
+                "shown to be sensitive to gaps in changes_since")
+        if args.elle_jar and not args.cluster and not args.write_skew_seen:
             raise CheckFailed(
                 "unguarded: Elle reported no write skew in any round; the "
                 "harness is not shown to be sensitive to it")

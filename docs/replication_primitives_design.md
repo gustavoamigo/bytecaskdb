@@ -289,6 +289,8 @@ ByteCaskDB does not care who is consuming or why. It surfaces the ordered stream
 
 The proof framework for replication primitives follows the same model used in [`docs/correctness_validation.md`](correctness_validation.md): StateShape × OpsShape × FailureClass → expected delta, validated against invariants. The validation proves the correctness guarantees expressed in [`CONTRACT.md`](../CONTRACT.md).
 
+The proof framework checks one call at a time. The replication check ([`replication_checking_design.md`](replication_checking_design.md)) runs the protocol end to end every night: a leader under concurrent load, and two followers that are bootstrapped from a manifest and tailed, with lag, duplicate delivery and restarts. With leader vacuum off, bootstrap, prefix consistency, read-your-writes after `durable_sequence`, monotonic follower reads and convergence all hold. With leader vacuum on, prefix consistency and read-your-writes fail, as #168 describes: `changes_since` hands a lagging follower history with entries missing. Planned transfer, promotion and re-targeting are not checked yet.
+
 ### Proof Framework
 
 Replication correctness reduces to: the follower's `EngineState` after ingesting `changes_since(snap, 0)` from the leader is identical to the leader's `EngineState` at snapshot time.

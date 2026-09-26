@@ -1,6 +1,7 @@
 # Replication Checking with Elle
 
-Status: design. Tracks [#178](https://github.com/gustavoamigo/bytecaskdb/issues/178).
+Status: step 1 (tailing, fixed leader) implemented and running nightly;
+step 2 (topology) designed. Tracks [#178](https://github.com/gustavoamigo/bytecaskdb/issues/178).
 Extends the isolation check in [`isolation_checking_design.md`](isolation_checking_design.md).
 
 ## Purpose
@@ -165,23 +166,63 @@ most-advanced follower, or have a follower refuse a source whose
 
 Two steps, so each can land green:
 
-1. **Tailing:** bootstrap, replicate, lag, duplicates, follower restart and
-   follower reads, with a fixed leader.
-2. **Topology:** planned transfer, unplanned promotion, re-targeting and
-   re-bootstrap.
+1. **Tailing**, implemented. Bootstrap, replicate, lag, duplicates, follower
+   restart, follower vacuum and follower reads, with a fixed leader.
+2. **Topology**, not yet implemented. Planned transfer, unplanned promotion,
+   re-targeting and re-bootstrap.
 
-Files:
+Step 1 as built:
 
-- `tests/elle/isolation_history.cpp` gains `--cluster`, the cluster view,
-  node holders, replication threads, follower clients and the orchestrator.
-  Every node's clients use one `Recorder`, so real-time order is comparable
-  across nodes. The history gains `node` and `epoch` fields, and the
-  orchestrator writes the topology events (with promotion sequences and
-  manifest `through_sequence`) to a sidecar JSON file.
-- `scripts/run_isolation_check.py` gains `--cluster`. It relabels
-  post-promotion losses, splits leader epochs for the strict check, and runs
-  the new cross-checks.
-- `isolation-nightly.yml` adds the cluster run to both jobs.
+- `tests/elle/isolation_history.cpp` takes `--followers N`, `--lag` and
+  `--force-vacuum`. Each follower:
+  - is bootstrapped from `create_manifest()` 20–220 ms into the run, while
+    the leader is under load. Leader vacuum is held off from the manifest to
+    the end of the copy. The follower's state at open is compared key by key
+    with the manifest's snapshot.
+  - is tailed by its own thread, which cuts `ingest` slices at batch
+    boundaries. That thread also runs the nemeses: lag pauses of 20–200 ms,
+    duplicate delivery from up to 32 sequences back, follower vacuum, and a
+    restart every 100–500 ms.
+  - has 4 reader threads, with 0.5–2 ms of think time. A quarter of their
+    reads are session reads, after a `durable_sequence` wait of up to
+    200 ms.
+
+  The nemesis timings are shorter than the table above, because a run lasts
+  about two seconds. glibc's rwlock prefers readers, so a restart raises a
+  flag that makes the readers back off first. Otherwise the restart waited
+  behind them indefinitely and the follower stopped tailing.
+
+  At the end, a sync write makes every leader entry durable, and every
+  follower must reach the leader's durable sequence within 20 s. Then
+  every node reads every key. Every operation carries `node`, and a session
+  read carries `wait`. The bootstraps and the nemesis counts go to
+  `<out>.cluster.json`.
+- `scripts/run_isolation_check.py --cluster` runs the leader's operations
+  through the #94 checks (cross-check and Elle `strict-serializable`). It
+  runs the whole history through Elle `serializable`, and through the
+  prefix, session, monotonic and convergence cross-checks. It also checks
+  the bootstrap records.
+- `isolation-nightly.yml` runs 8 cluster rounds in each job.
+
+The manifest-boundary check is done at bootstrap, not on the first tailed
+entry. A failed write consumes sequences, so a gap after `through_sequence`
+is legitimate. What must hold is that the follower opens at exactly
+`through_sequence`, with exactly the snapshot's contents.
+
+## Findings
+
+**#168 reproduces.** `cluster-vacuum` reports prefix and session violations
+in about half its rounds (3 of 6 in the first local run). `cluster`, with
+leader vacuum off, stayed clean in all 6 rounds, including the rounds with
+the degrade nemesis.
+
+A typical violation: a follower read shows one key at sequence S but lacks
+a committed append at or below S on another key. Or a follower whose
+`durable_sequence()` has passed W lacks an append committed at or below W.
+Vacuum dropped the dead entry before the lagging follower's `changes_since`
+reached it. The follower shows the gap until the newer version arrives.
+
+Step 2 is still to come, including the fork case above.
 
 ## Acceptance
 
