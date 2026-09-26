@@ -111,6 +111,20 @@ struct TempDir {
   }
 };
 
+// Per-file stats as a sorted multiset. File ids differ between two opens of
+// the same directory, so model tests compare the values, not the ids.
+using FileStatsTuple =
+    std::tuple<std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+               std::uint64_t, std::uint64_t>;
+auto collect_file_stats(bytecask::DB &db) -> std::vector<FileStatsTuple> {
+  std::vector<FileStatsTuple> vals;
+  for (const auto &[fid, fs] : db.file_stats())
+    vals.emplace_back(fs.live_bytes, fs.total_bytes, fs.min_sequence,
+                      fs.max_sequence, fs.tombstone_bytes, fs.marker_bytes);
+  std::ranges::sort(vals);
+  return vals;
+}
+
 // Flips a byte in the middle of path to invalidate its CRC checksum.
 void corrupt_file_middle(const std::filesystem::path &path) {
   const auto size = std::filesystem::file_size(path);
@@ -1433,19 +1447,6 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
     }
   };
 
-  // Helper: collect per-file stats as a sorted vector for comparison.
-  // File IDs may differ, but the multiset of (live_bytes, total_bytes,
-  // sequence bounds, tombstone_bytes) must match between serial and parallel.
-  auto collect_stats = [](bytecask::DB &db) {
-    std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                           std::uint64_t, std::uint64_t, std::uint64_t>> vals;
-    for (const auto &[fid, fs] : db.file_stats()) {
-      vals.emplace_back(fs.live_bytes, fs.total_bytes,
-                        fs.min_sequence, fs.max_sequence, fs.tombstone_bytes);
-    }
-    std::ranges::sort(vals);
-    return vals;
-  };
 
   // Count data files for the max-parallelism test.
   int data_file_count = 0;
@@ -1457,15 +1458,14 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
 
   // Collect serial file_stats as baseline for parallel comparison.
   // Must use a separate copy since opening mutates the directory.
-  std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                         std::uint64_t, std::uint64_t, std::uint64_t>> serial_stats_vals;
+  std::vector<FileStatsTuple> serial_stats_vals;
   {
     const auto serial_path = td.path / "serial_baseline";
     std::filesystem::copy(db_path, serial_path,
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(serial_path, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial_baseline", collect(db));
-    serial_stats_vals = collect_stats(db);
+    serial_stats_vals = collect_file_stats(db);
   }
 
   SECTION("serial recovery") {
@@ -1474,7 +1474,7 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
   }
 
   SECTION("parallel recovery (2 workers)") {
@@ -1483,7 +1483,7 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 2});
     verify("parallel/2", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
   }
 
   SECTION("parallel recovery (W = file count)") {
@@ -1494,7 +1494,7 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
         p, {.max_file_bytes = 1,
             .recovery_threads = static_cast<unsigned>(data_file_count)});
     verify("parallel/max", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
   }
 
   // The pool serves every value read below, so this proves recovery and
@@ -1508,7 +1508,7 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
                                      .io_backend = bytecask::IoBackend::BufferPool,
                                      .buffer_pool = {.capacity_bytes = 1 << 20}});
     verify("parallel/2/pool", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
   }
 }
 
@@ -1602,26 +1602,15 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
     }
   };
 
-  auto collect_stats = [](bytecask::DB &db) {
-    std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                           std::uint64_t, std::uint64_t, std::uint64_t>> vals;
-    for (const auto &[fid, fs] : db.file_stats()) {
-      vals.emplace_back(fs.live_bytes, fs.total_bytes,
-                        fs.min_sequence, fs.max_sequence, fs.tombstone_bytes);
-    }
-    std::ranges::sort(vals);
-    return vals;
-  };
 
-  std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                         std::uint64_t, std::uint64_t, std::uint64_t>> serial_stats_vals;
+  std::vector<FileStatsTuple> serial_stats_vals;
   {
     const auto serial_path = td.path / "serial_baseline";
     std::filesystem::copy(db_path, serial_path,
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(serial_path, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial_baseline", collect(db));
-    serial_stats_vals = collect_stats(db);
+    serial_stats_vals = collect_file_stats(db);
   }
 
   SECTION("serial") {
@@ -1630,7 +1619,7 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
   }
 
   SECTION("parallel (4 workers)") {
@@ -1639,7 +1628,7 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 4});
     verify("parallel/4", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
   }
 
   // The pool serves every value read below, so this proves recovery and
@@ -1653,7 +1642,7 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
                                      .io_backend = bytecask::IoBackend::BufferPool,
                                      .buffer_pool = {.capacity_bytes = 1 << 20}});
     verify("parallel/4/pool", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
   }
 }
 
@@ -1719,16 +1708,6 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
     }
   };
 
-  auto collect_stats = [](bytecask::DB &db) {
-    std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                           std::uint64_t, std::uint64_t, std::uint64_t>> vals;
-    for (const auto &[fid, fs] : db.file_stats()) {
-      vals.emplace_back(fs.live_bytes, fs.total_bytes,
-                        fs.min_sequence, fs.max_sequence, fs.tombstone_bytes);
-    }
-    std::ranges::sort(vals);
-    return vals;
-  };
 
   int data_file_count = 0;
   for (const auto &e : std::filesystem::directory_iterator{db_path}) {
@@ -1736,15 +1715,14 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
       ++data_file_count;
   }
 
-  std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                         std::uint64_t, std::uint64_t, std::uint64_t>> serial_stats_vals;
+  std::vector<FileStatsTuple> serial_stats_vals;
   {
     const auto serial_path = td.path / "serial_baseline";
     std::filesystem::copy(db_path, serial_path,
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(serial_path, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial_baseline", collect(db));
-    serial_stats_vals = collect_stats(db);
+    serial_stats_vals = collect_file_stats(db);
   }
 
   SECTION("serial") {
@@ -1753,7 +1731,7 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
   }
 
   SECTION("parallel (3 workers)") {
@@ -1762,7 +1740,7 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 3});
     verify("parallel/3", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
   }
 
   SECTION("parallel (W = file count)") {
@@ -1773,7 +1751,7 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
         p, {.max_file_bytes = 1,
             .recovery_threads = static_cast<unsigned>(data_file_count)});
     verify("parallel/max", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
   }
 
   // The pool serves every value read below, so this proves recovery and
@@ -1787,7 +1765,7 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
                                      .io_backend = bytecask::IoBackend::BufferPool,
                                      .buffer_pool = {.capacity_bytes = 1 << 20}});
     verify("parallel/3/pool", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
   }
 }
 
@@ -1886,30 +1864,20 @@ TEST_CASE("Recovery model-based: wide workers with range deletes",
     }
   };
 
-  auto collect_stats = [](bytecask::DB &db) {
-    std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                           std::uint64_t, std::uint64_t, std::uint64_t>> vals;
-    for (const auto &[fid, fs] : db.file_stats())
-      vals.emplace_back(fs.live_bytes, fs.total_bytes,
-                        fs.min_sequence, fs.max_sequence, fs.tombstone_bytes);
-    std::ranges::sort(vals);
-    return vals;
-  };
 
   int data_file_count = 0;
   for (const auto &e : std::filesystem::directory_iterator{db_path})
     if (e.path().extension() == ".data") ++data_file_count;
   REQUIRE(data_file_count > 8);
 
-  std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                         std::uint64_t, std::uint64_t, std::uint64_t>> serial_stats_vals;
+  std::vector<FileStatsTuple> serial_stats_vals;
   {
     const auto p = td.path / "serial_baseline";
     std::filesystem::copy(db_path, p,
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(p, {.recovery_threads = 1});
     verify("serial_baseline", collect(db));
-    serial_stats_vals = collect_stats(db);
+    serial_stats_vals = collect_file_stats(db);
   }
 
   // Every thread count changes both the partitioning and the number of
@@ -1921,7 +1889,7 @@ TEST_CASE("Recovery model-based: wide workers with range deletes",
                             std::filesystem::copy_options::recursive);
       auto db = bytecask::DB::open(p, {.recovery_threads = threads});
       verify(std::format("threads/{}", threads), collect(db));
-      CHECK(collect_stats(db) == serial_stats_vals);
+      CHECK(collect_file_stats(db) == serial_stats_vals);
     }
   }
 }
@@ -3321,7 +3289,9 @@ TEST_CASE("vacuum keeps a tombstone-only file that shadows an older put",
         REQUIRE(db.apply_batch({}, std::move(plan)));
       }
       db.put({}, to_bytes("b"), to_bytes("new"));
-      REQUIRE(db.vacuum({.fragmentation_threshold = 0.6}));
+      // The batch's markers are kept too, so its dead put is about a third
+      // of it; the older file's dead put is about a quarter.
+      REQUIRE(db.vacuum({.fragmentation_threshold = 0.3}));
       CHECK_FALSE(db.contains_key({}, to_bytes("a")));
     }
     auto db = bytecask::DB::open(path, {.max_file_bytes = 1});
@@ -3374,6 +3344,402 @@ TEST_CASE("vacuum does not select a file holding only tombstones",
     std::ranges::sort(got);
     CHECK(got == want);
     CHECK_FALSE(db.contains_key({}, to_bytes("a")));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tombstone elimination (#167)
+//
+// A tombstone matters only while another file holds an older Put of a key it
+// deletes. Recovery records which tombstones are in that position; compaction
+// drops the rest, but only in files it compacts for their dead Puts.
+// ---------------------------------------------------------------------------
+namespace {
+// Seals the active file: the next write starts a new one.
+void seal(bytecask::DB &db) { (void)db.create_manifest(); }
+
+auto tombstones_dropped(const bytecask::DB &db) -> std::int64_t {
+  return db.stats().at("bytecask.vacuum_tombstones_dropped");
+}
+
+auto tombstone_bytes_on_disk(const bytecask::DB &db) -> std::uint64_t {
+  std::uint64_t total = 0;
+  for (const auto &[fid, fs] : db.file_stats()) total += fs.tombstone_bytes;
+  return total;
+}
+} // namespace
+
+// A tombstone written since the open was never examined by recovery, so
+// compaction keeps it even when nothing would need it.
+TEST_CASE("vacuum keeps a tombstone written since the open",
+          "[vacuum][tombstone]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({}, to_bytes("a"), to_bytes("old"));
+    db.put({}, to_bytes("keep"), to_bytes(std::string(200, 'k')));
+    seal(db);  // A: a (dead below), keep (live) — lightly fragmented
+    db.put({}, to_bytes("x"), to_bytes("1"));
+    (void)db.del({}, to_bytes("a"));
+    seal(db);  // B: x (dead below), del a — no live bytes
+    db.put({}, to_bytes("x"), to_bytes("2"));
+    seal(db);
+
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.3}));  // B, not A
+    // Written this session: never examined by recovery, so kept.
+    CHECK(tombstones_dropped(db) == 0);
+    CHECK(tombstone_bytes_on_disk(db) > 0);
+  }
+  auto db = bytecask::DB::open(dir);
+  CHECK_FALSE(db.contains_key({}, to_bytes("a")));
+  CHECK(get_str(db, to_bytes("x")) == "2");
+}
+
+// The case a rule based on the key directory alone gets wrong: the tombstone
+// and a Put of the same key share a file, and a third, older Put sits in
+// another file. Compaction drops the dead Put next to the tombstone; the
+// tombstone must stay for the older one.
+TEST_CASE("vacuum keeps a tombstone when its own file and an older file "
+          "both hold a Put",
+          "[vacuum][tombstone]") {
+  const auto threads = GENERATE(1U, 3U);
+  TempDir td;
+  const auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({}, to_bytes("a"), to_bytes("old"));
+    db.put({}, to_bytes("keep"), to_bytes(std::string(200, 'k')));
+    seal(db);  // A
+    db.put({}, to_bytes("a"), to_bytes("mid"));
+    db.put({}, to_bytes("x"), to_bytes("1"));
+    (void)db.del({}, to_bytes("a"));
+    seal(db);  // T: a=mid (dead), x=1 (dead below), del a
+    db.put({}, to_bytes("x"), to_bytes("2"));
+    seal(db);
+  }
+  {
+    auto db = bytecask::DB::open(dir, {.recovery_threads = threads});
+    CHECK(db.stats().at("bytecask.tombstones_needed") >= 1);
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.3}));  // T, not A
+    CHECK(tombstones_dropped(db) == 0);
+    CHECK_FALSE(db.contains_key({}, to_bytes("a")));
+  }
+  auto db = bytecask::DB::open(dir, {.recovery_threads = threads});
+  CHECK_FALSE(db.contains_key({}, to_bytes("a")));
+  CHECK(get_str(db, to_bytes("x")) == "2");
+}
+
+// Nothing older holds the key, so the tombstone goes with the dead Puts and
+// the compacted file is empty: it is removed instead of published.
+TEST_CASE("vacuum drops a tombstone no older file needs",
+          "[vacuum][tombstone]") {
+  const auto threads = GENERATE(1U, 3U);
+  TempDir td;
+  const auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({}, to_bytes("b"), to_bytes(std::string(200, 'b')));
+    seal(db);  // A: holds no a
+    db.put({}, to_bytes("a"), to_bytes("mid"));
+    db.put({}, to_bytes("x"), to_bytes("1"));
+    (void)db.del({}, to_bytes("a"));
+    seal(db);  // T: a=mid (dead), x=1 (dead below), del a
+    db.put({}, to_bytes("x"), to_bytes("2"));
+    seal(db);
+  }
+  {
+    auto db = bytecask::DB::open(dir, {.recovery_threads = threads});
+    CHECK(db.stats().at("bytecask.tombstones_needed") == 0);
+    const auto files_before = db.file_stats().size();
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.3}));
+    CHECK(tombstones_dropped(db) == 1);
+    CHECK(db.file_stats().size() == files_before - 1);
+    CHECK(tombstone_bytes_on_disk(db) == 0);
+  }
+  auto db = bytecask::DB::open(dir, {.recovery_threads = threads});
+  CHECK_FALSE(db.contains_key({}, to_bytes("a")));
+  CHECK(get_str(db, to_bytes("x")) == "2");
+  CHECK(get_str(db, to_bytes("b")) == std::string(200, 'b'));
+}
+
+// Once the older Put is compacted away, the next open finds the tombstone
+// no longer needed and a later compaction of its file drops it.
+TEST_CASE("vacuum drops a tombstone after the Put it hid is gone",
+          "[vacuum][tombstone]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({}, to_bytes("a"), to_bytes("old"));
+    seal(db);  // A: only a
+    db.put({}, to_bytes("x"), to_bytes("1"));
+    db.put({}, to_bytes("y"), to_bytes("1"));
+    (void)db.del({}, to_bytes("a"));
+    db.put({}, to_bytes("z"), to_bytes(std::string(100, 'z')));
+    seal(db);  // T: x, y (dead below), del a, z (live)
+    db.put({}, to_bytes("x"), to_bytes("2"));
+    seal(db);
+  }
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(db.stats().at("bytecask.tombstones_needed") == 1);
+    // A is all dead and holds no tombstone: removed without a scan. T is
+    // below the threshold with only x dead.
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.5}));
+    CHECK_FALSE(db.vacuum({.fragmentation_threshold = 0.5}));
+    db.put({}, to_bytes("y"), to_bytes("2"));  // now T has more dead bytes
+    seal(db);
+  }
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(db.stats().at("bytecask.tombstones_needed") == 0);
+    // T is the only file with dead bytes.
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.1}));
+    CHECK(tombstones_dropped(db) == 1);
+  }
+  auto db = bytecask::DB::open(dir);
+  CHECK_FALSE(db.contains_key({}, to_bytes("a")));
+  CHECK(get_str(db, to_bytes("x")) == "2");
+  CHECK(get_str(db, to_bytes("y")) == "2");
+}
+
+TEST_CASE("vacuum keeps a range tombstone over a Put in an older file",
+          "[vacuum][tombstone][del_range]") {
+  const auto threads = GENERATE(1U, 3U);
+  TempDir td;
+  const auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({}, to_bytes("r5"), to_bytes("old"));
+    db.put({}, to_bytes("keep"), to_bytes(std::string(200, 'k')));
+    seal(db);  // A
+    db.put({}, to_bytes("x"), to_bytes(std::string(50, 'x')));
+    db.del_range({}, to_bytes("r0"), to_bytes("r9"));
+    seal(db);  // T
+    db.put({}, to_bytes("x"), to_bytes("2"));
+    seal(db);
+  }
+  {
+    auto db = bytecask::DB::open(dir, {.recovery_threads = threads});
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.3}));  // T, not A
+    CHECK(tombstones_dropped(db) == 0);
+  }
+  auto db = bytecask::DB::open(dir, {.recovery_threads = threads});
+  CHECK_FALSE(db.contains_key({}, to_bytes("r5")));
+}
+
+TEST_CASE("vacuum drops a range tombstone no older file needs",
+          "[vacuum][tombstone][del_range]") {
+  const auto threads = GENERATE(1U, 3U);
+  TempDir td;
+  const auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({}, to_bytes("keep"), to_bytes(std::string(200, 'k')));
+    seal(db);  // A: nothing in [r0, r9)
+    db.put({}, to_bytes("r5"), to_bytes("mid"));
+    db.put({}, to_bytes("x"), to_bytes(std::string(50, 'x')));
+    db.del_range({}, to_bytes("r0"), to_bytes("r9"));
+    seal(db);  // T: its own r5 is the only key in range
+    db.put({}, to_bytes("x"), to_bytes("2"));
+    seal(db);
+  }
+  {
+    auto db = bytecask::DB::open(dir, {.recovery_threads = threads});
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.3}));
+    CHECK(tombstones_dropped(db) == 1);
+  }
+  auto db = bytecask::DB::open(dir, {.recovery_threads = threads});
+  CHECK_FALSE(db.contains_key({}, to_bytes("r5")));
+  CHECK(get_str(db, to_bytes("x")) == "2");
+}
+
+// A lenient open that skips an unreadable file never saw its Puts, so it
+// cannot show any tombstone unneeded: that open drops none.
+TEST_CASE("vacuum drops no tombstone after a lenient open skipped a file",
+          "[vacuum][tombstone][corruption]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  std::filesystem::path victim;
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({}, to_bytes("a"), to_bytes("old"));
+    for (const auto &e : std::filesystem::directory_iterator{dir})
+      if (e.path().extension() == ".data") victim = e.path();
+    seal(db);  // A: the only Put of a
+    db.put({}, to_bytes("x"), to_bytes("1"));
+    (void)db.del({}, to_bytes("a"));
+    seal(db);  // T: x (dead below), del a
+    db.put({}, to_bytes("x"), to_bytes("2"));
+    seal(db);
+  }
+  corrupt_hint_beyond_rebuild(dir / (victim.stem().string() + ".hint"));
+
+  auto db = bytecask::DB::open(dir, {.fail_recovery_on_crc_errors = false});
+  // The skipped file measures all dead and goes first; then T.
+  while (db.vacuum({.fragmentation_threshold = 0.3})) {
+  }
+  CHECK(tombstones_dropped(db) == 0);
+  CHECK(tombstone_bytes_on_disk(db) > 0);
+}
+
+// Batch markers are kept by every compaction, so they are not reclaimable.
+// Counted as dead, they made a batch file of live Puts look more fragmented
+// than a file with real dead bytes; vacuum picked it, could not shrink it,
+// and returned false with the other file never reclaimed (#169).
+TEST_CASE("vacuum is not stalled by a file whose only dead bytes are markers",
+          "[vacuum][batch]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("a"), to_bytes("1"));
+  plan.put(to_bytes("b"), to_bytes("1"));
+  (void)db.apply_batch({}, std::move(plan));
+  seal(db);  // A: a batch of two live Puts, about half markers
+  db.put({}, to_bytes("c"), to_bytes(std::string(200, 'c')));
+  db.put({}, to_bytes("d"), to_bytes("1"));
+  seal(db);  // B: c (live), d (dead below)
+  db.put({}, to_bytes("d"), to_bytes("2"));
+  seal(db);
+
+  for (const auto &[fid, fs] : db.file_stats())
+    if (fs.marker_bytes > 0) CHECK(fs.reclaimable_bytes() == 0);
+  REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));  // B
+  CHECK_FALSE(db.vacuum({.fragmentation_threshold = 0.0}));
+  CHECK(get_str(db, to_bytes("a")) == "1");
+  CHECK(get_str(db, to_bytes("d")) == "2");
+}
+
+// Random writes with vacuum between them, over many opens: after every
+// vacuum and every reopen the database must equal the model. Dropping a
+// tombstone that still hid a Put would bring a key back at the next open.
+// Vacuum runs one file at a time at thresholds that leave lightly fragmented
+// files alone, so older Puts outlive the compaction of their tombstones.
+TEST_CASE("Vacuum model-based: dropping tombstones never resurrects a key",
+          "[vacuum][tombstone][model]") {
+  std::mt19937 gen(16716);
+  auto pick = [&](int lo, int hi) {
+    return std::uniform_int_distribution<int>(lo, hi)(gen);
+  };
+  // A wide key space, so a deleted key usually stays deleted until the next
+  // open — where a wrongly dropped tombstone would show.
+  constexpr int kKeys = 400;
+  auto key_at = [](int i) { return std::format("k{:03d}", i); };
+  auto rand_value = [&] {
+    return std::string(static_cast<std::size_t>(pick(1, 300)), 'v') +
+           std::to_string(pick(0, 999));
+  };
+
+  TempDir td;
+  const auto dir = td.path / "db";
+  std::map<std::string, std::string> oracle;
+
+  auto verify = [&](bytecask::DB &db, const std::string &label) {
+    INFO(label);
+    std::map<std::string, std::string> kv;
+    for (auto &entry : db.iter_from({}))
+      kv[to_string(entry.key)] = to_string(entry.value);
+    CHECK(kv == oracle);
+  };
+
+  std::int64_t dropped = 0;
+  for (int session = 0; session < 24; ++session) {
+    const auto threads = static_cast<unsigned>(1 + session % 5);
+    auto db = bytecask::DB::open(
+        dir, {.max_file_bytes = 2048, .recovery_threads = threads});
+    verify(db, std::format("open {}", session));
+    for (int op = 0; op < 150; ++op) {
+      const auto r = pick(0, 99);
+      if (r < 45 || oracle.empty()) {
+        const auto k = key_at(pick(0, kKeys - 1));
+        const auto v = rand_value();
+        db.put({.sync = false}, to_bytes(k), to_bytes(v));
+        oracle[k] = v;
+      } else if (r < 75) {
+        auto it = oracle.begin();
+        std::advance(it, pick(0, static_cast<int>(oracle.size()) - 1));
+        const auto k = it->first;
+        std::ignore = db.del({.sync = false}, to_bytes(k));
+        oracle.erase(k);
+      } else if (r < 80) {
+        const auto lo = pick(0, kKeys - 2);
+        const auto from = key_at(lo);
+        const auto to = key_at(lo + pick(1, 4));
+        db.del_range({.sync = false}, to_bytes(from), to_bytes(to));
+        for (auto it = oracle.lower_bound(from);
+             it != oracle.end() && it->first < to;)
+          it = oracle.erase(it);
+      } else {
+        bytecask::WritePlan plan;
+        std::map<std::string, std::optional<std::string>> staged;
+        for (int b = pick(2, 5); b > 0; --b) {
+          const auto k = key_at(pick(0, kKeys - 1));
+          if (pick(0, 2) == 0) {
+            plan.del(to_bytes(k));
+            staged[k] = std::nullopt;
+          } else {
+            const auto v = rand_value();
+            plan.put(to_bytes(k), to_bytes(v));
+            staged[k] = v;
+          }
+        }
+        REQUIRE(db.apply_batch({.sync = false}, std::move(plan)));
+        for (const auto &[k, v] : staged) {
+          if (v) oracle[k] = *v;
+          else oracle.erase(k);
+        }
+      }
+      if (op % 10 == 9) {
+        constexpr std::array kThresholds{0.3, 0.5, 0.7};
+        const auto threshold =
+            kThresholds[static_cast<std::size_t>(pick(0, 2))];
+        std::ignore = db.vacuum({.fragmentation_threshold = threshold});
+        verify(db, std::format("session {} op {}", session, op));
+      }
+    }
+    dropped += tombstones_dropped(db);
+  }
+  for (const unsigned threads : {1U, 4U}) {
+    auto db = bytecask::DB::open(dir, {.recovery_threads = threads});
+    verify(db, std::format("final, {} threads", threads));
+  }
+  // The test proves nothing unless tombstones were actually dropped.
+  CHECK(dropped > 0);
+}
+
+// Recovery rebuilds tombstone_bytes and marker_bytes from the hint files to
+// the values the write path kept.
+TEST_CASE("FileStats: tombstone and marker bytes survive reopen",
+          "[filestats][tombstone]") {
+  const auto threads = GENERATE(1U, 3U);
+  TempDir td;
+  const auto dir = td.path / "db";
+  std::vector<FileStatsTuple> before;
+  {
+    auto db = bytecask::DB::open(dir);
+    for (int round = 0; round < 4; ++round) {
+      bytecask::WritePlan plan;
+      plan.put(to_bytes(std::format("k{}", round)), to_bytes("v"));
+      plan.put(to_bytes(std::format("j{}", round)), to_bytes("v"));
+      plan.del(to_bytes(std::format("k{}", round - 1)));
+      (void)db.apply_batch({}, std::move(plan));
+      (void)db.del({}, to_bytes(std::format("j{}", round)));
+      db.del_range({}, to_bytes("m0"), to_bytes(std::format("m{}", round + 1)));
+      seal(db);
+    }
+    before = collect_file_stats(db);
+  }
+  auto db = bytecask::DB::open(dir, {.recovery_threads = threads});
+  auto after = collect_file_stats(db);
+  // Each open starts an empty active file.
+  const auto empty = [](const FileStatsTuple &t) { return std::get<1>(t) == 0; };
+  std::erase_if(before, empty);
+  std::erase_if(after, empty);
+  CHECK(after == before);
+  for (const auto &t : after) {
+    CHECK(std::get<4>(t) > 0);  // every file holds tombstones
+    CHECK(std::get<5>(t) > 0);  // and a batch's markers
   }
 }
 
@@ -6125,16 +6491,6 @@ TEST_CASE("Recovery model-based: workload with range deletes",
     }
   };
 
-  auto collect_stats = [](bytecask::DB &db) {
-    std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                           std::uint64_t, std::uint64_t, std::uint64_t>> vals;
-    for (const auto &[fid, fs] : db.file_stats()) {
-      vals.emplace_back(fs.live_bytes, fs.total_bytes,
-                        fs.min_sequence, fs.max_sequence, fs.tombstone_bytes);
-    }
-    std::ranges::sort(vals);
-    return vals;
-  };
 
   int data_file_count = 0;
   for (const auto &e : std::filesystem::directory_iterator{db_path}) {
@@ -6143,15 +6499,14 @@ TEST_CASE("Recovery model-based: workload with range deletes",
   }
   REQUIRE(data_file_count > 1);
 
-  std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                         std::uint64_t, std::uint64_t, std::uint64_t>> serial_stats_vals;
+  std::vector<FileStatsTuple> serial_stats_vals;
   {
     const auto serial_path = td.path / "serial_baseline";
     std::filesystem::copy(db_path, serial_path,
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(serial_path, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial_baseline", collect(db));
-    serial_stats_vals = collect_stats(db);
+    serial_stats_vals = collect_file_stats(db);
   }
 
   SECTION("serial recovery") {
@@ -6160,7 +6515,7 @@ TEST_CASE("Recovery model-based: workload with range deletes",
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 1});
     verify("serial", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
   }
 
   SECTION("parallel recovery (2 workers)") {
@@ -6169,7 +6524,7 @@ TEST_CASE("Recovery model-based: workload with range deletes",
                           std::filesystem::copy_options::recursive);
     auto db = bytecask::DB::open(p, {.max_file_bytes = 1, .recovery_threads = 2});
     verify("parallel/2", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
   }
 
   SECTION("parallel recovery (W = file count)") {
@@ -6180,7 +6535,7 @@ TEST_CASE("Recovery model-based: workload with range deletes",
         p, {.max_file_bytes = 1,
             .recovery_threads = static_cast<unsigned>(data_file_count)});
     verify("parallel/max", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
   }
 
   // The pool serves every value read below, so this proves recovery and
@@ -6194,7 +6549,7 @@ TEST_CASE("Recovery model-based: workload with range deletes",
                                      .io_backend = bytecask::IoBackend::BufferPool,
                                      .buffer_pool = {.capacity_bytes = 1 << 20}});
     verify("parallel/2/pool", collect(db));
-    CHECK(collect_stats(db) == serial_stats_vals);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
   }
 }
 
@@ -6783,21 +7138,19 @@ TEST_CASE("recovery reconstructs min_max sequences", "[file_stats_seq]") {
 
   // Verify each sealed file from pre-close appears in post-open with
   // matching sequence bounds. Skip empty active files (min==0, max==0).
-  std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                         std::uint64_t, std::uint64_t, std::uint64_t>> pre_vals;
+  std::vector<FileStatsTuple> pre_vals;
   for (const auto &[fid, fs] : pre_close_stats) {
     if (fs.min_sequence == 0 && fs.max_sequence == 0) continue;
-    pre_vals.emplace_back(fs.live_bytes, fs.total_bytes,
-                          fs.min_sequence, fs.max_sequence, fs.tombstone_bytes);
+    pre_vals.emplace_back(fs.live_bytes, fs.total_bytes, fs.min_sequence,
+                          fs.max_sequence, fs.tombstone_bytes, fs.marker_bytes);
   }
   std::ranges::sort(pre_vals);
 
-  std::vector<std::tuple<std::uint64_t, std::uint64_t,
-                         std::uint64_t, std::uint64_t, std::uint64_t>> post_vals;
+  std::vector<FileStatsTuple> post_vals;
   for (const auto &[fid, fs] : post_open_stats) {
     if (fs.min_sequence == 0 && fs.max_sequence == 0) continue;
-    post_vals.emplace_back(fs.live_bytes, fs.total_bytes,
-                           fs.min_sequence, fs.max_sequence, fs.tombstone_bytes);
+    post_vals.emplace_back(fs.live_bytes, fs.total_bytes, fs.min_sequence,
+                           fs.max_sequence, fs.tombstone_bytes, fs.marker_bytes);
   }
   std::ranges::sort(post_vals);
 
@@ -8063,6 +8416,8 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.pool_direct_io_fallbacks",
       "bytecask.vacuum_bytes_reclaimed",
       "bytecask.vacuum_files_unlinked",
+      "bytecask.vacuum_tombstones_dropped",
+      "bytecask.tombstones_needed",
       "bytecask.recovery_files",
       "bytecask.recovery_keys",
       "bytecask.recovery_duration_us",
@@ -9320,6 +9675,75 @@ TEST_CASE("pipeline: a writer whose write another thread published sees it "
   CHECK(rf->sequence > rt->sequence);
   CHECK(t_saw_own_write);
   CHECK(db.contains_key({}, to_bytes("t")));
+}
+
+// Found by the Elle isolation check (docs/isolation_checking_design.md) as
+// G-single-item-realtime: a transaction that began after another returned
+// read state from before that write. The gap is the one above, seen from a
+// third thread: a write is "visible to subsequent reads" (CONTRACT.md), and
+// a read that starts after put() returned is subsequent, whichever thread
+// makes it.
+TEST_CASE("pipeline: a write another thread published is visible to every "
+          "thread once put returns, even before state_time_ is stored",
+          "[pipeline][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("seed"), to_bytes("s"));
+
+  FlushGate before_wait;
+  FlushGate between_stores;
+  db.test_before_commit_wait_ = before_wait.hook();
+  db.test_between_publish_stores_ = between_stores.hook();
+
+  // R warms its read cache with the pre-put state, then reads once T's put
+  // has returned.
+  std::mutex mu;
+  std::condition_variable cv;
+  bool t_returned = false;
+  bool r_warm = false;
+  bool r_get_saw = false;
+  bool r_snapshot_saw = false;
+  std::thread tr([&] {
+    (void)db.contains_key({}, to_bytes("seed"));
+    std::unique_lock<std::mutex> lk{mu};
+    r_warm = true;
+    cv.notify_all();
+    cv.wait(lk, [&] { return t_returned; });
+    r_get_saw = get_val(db, to_bytes("t")).has_value();
+    r_snapshot_saw = db.snapshot().contains_key({}, to_bytes("t"));
+  });
+  {
+    std::unique_lock<std::mutex> lk{mu};
+    cv.wait(lk, [&] { return r_warm; });
+  }
+
+  std::optional<bytecask::CommitResult> rt;
+  std::thread tt([&] { rt = db.put({.sync = true}, to_bytes("t"), to_bytes("vt")); });
+  before_wait.wait_in_flush();
+
+  std::optional<bytecask::CommitResult> rf;
+  std::thread tf([&] { rf = db.put({.sync = true}, to_bytes("f"), to_bytes("vf")); });
+  between_stores.wait_in_flush();
+
+  // T returns while F is parked between the state store and the
+  // state_time_ store; only then does R read.
+  before_wait.open();
+  tt.join();
+  {
+    std::lock_guard<std::mutex> lk{mu};
+    t_returned = true;
+  }
+  cv.notify_all();
+  tr.join();
+  between_stores.open();
+  tf.join();
+  db.test_before_commit_wait_ = nullptr;
+  db.test_between_publish_stores_ = nullptr;
+
+  REQUIRE(rt.has_value());
+  REQUIRE(rf.has_value());
+  CHECK(r_get_saw);
+  CHECK(r_snapshot_saw);
 }
 
 TEST_CASE("pipeline: a plan that loses to a write not yet published reports "

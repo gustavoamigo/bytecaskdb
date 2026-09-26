@@ -363,8 +363,14 @@ must be deferred for deletion when no readers reference it.
 ### Data Preservation
 
 Every key-value pair readable before `vacuum_compact` is called must
-be readable after it returns, with the same value. The engine must not
-lose data or introduce phantom entries. Tombstones must be preserved.
+be readable after it returns, with the same value, and after any later
+reopen. The engine must not lose data or introduce phantom entries.
+
+A tombstone may be dropped only when no other file can hold an older Put
+of a key it deletes: otherwise that Put comes back at the next open.
+Recovery decides this once per open and compaction applies it; a
+tombstone written since the open is always kept. A file whose Puts are all
+dead may be removed without a scan only if it holds no tombstone.
 
 ### Size Accounting
 
@@ -372,24 +378,23 @@ A published file's `total_bytes` equals its size on disk. Recovery
 seeds `total_bytes` from the file's length, so anything the compacted
 file contains has to be counted as it is written — including the
 `BulkBegin` / `BulkEnd` markers, which compaction preserves like any
-other entry. A `file_stats()` reading must not change across a restart.
+other entry. `tombstone_bytes` and `marker_bytes` count the tombstones
+and markers the file holds; recovery rebuilds both from the hint files.
+A `file_stats()` reading must not change across a restart.
 
 ### Progress
 
 `vacuum()` returns `true` only when a file was actually reclaimed.
-A file whose every byte is live data, a tombstone or a batch marker
-cannot be made smaller, because compaction must preserve all three;
-the engine discards the staged copy and returns `false` rather than
-publishing an identical file.
+A file is eligible only for its dead Put bytes (`total_bytes` minus
+live, tombstone and marker bytes), so a file that is live data,
+tombstones and markers and nothing else is never selected. If a
+selected file's compaction still cannot make it smaller, the engine
+discards the staged copy and returns `false` rather than publishing an
+identical file.
 
-This is a termination guarantee, not only an efficiency one. Fragmentation
-counts live and tombstone bytes as kept (`1 − (live_bytes +
-tombstone_bytes) / total_bytes`), so a file of tombstones is never
-selected, but batch markers are not tracked and still read as
-reclaimable. Without this rule a file whose only dead bytes are markers
-stays eligible at `fragmentation_threshold = 0` forever, and
-`while (db.vacuum({.fragmentation_threshold = 0.0})) {}` never
-terminates.
+This is a termination guarantee, not only an efficiency one: every
+`true` removes bytes, so
+`while (db.vacuum({.fragmentation_threshold = 0.0})) {}` terminates.
 
 ### Atomicity
 

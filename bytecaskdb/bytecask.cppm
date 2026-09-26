@@ -81,8 +81,8 @@ export using BytesView = std::span<const std::byte>;
 // ---------------------------------------------------------------------------
 export struct VacuumOptions {
   // Minimum fragmentation ratio a sealed file must exceed to be eligible for
-  // vacuum: 1 − (live + tombstone bytes) / total bytes, the share compaction
-  // can reclaim. Range [0.0, 1.0].
+  // vacuum: 1 − (live + tombstone + marker bytes) / total bytes, the share
+  // of dead Puts compaction is sure to reclaim. Range [0.0, 1.0].
   double fragmentation_threshold{0.5};
 };
 
@@ -1168,11 +1168,13 @@ private:
   
 
   // Vacuum helpers
-  // Batch-aware scan: copies live Puts and tombstones from source_file into dest_file.
+  // Batch-aware scan: copies live Puts, markers and the tombstones `needed`
+  // does not allow dropping from source_file into dest_file.
   static auto vacuum_scan_and_copy(
       const std::shared_ptr<const EngineState> &snap,
       const DataFile &source_file, WritableDataFile &dest_file,
-      std::uint32_t source_file_id) -> VacuumScanResult;
+      std::uint32_t source_file_id, const NeededTombstones &needed)
+      -> VacuumScanResult;
   // Remaps key_dir entries, updates file registry, publishes new state. Caller must hold write_mu_.
   void vacuum_commit(std::uint32_t old_file_id, const VacuumScanResult &scan,
                      std::shared_ptr<DataFile> new_sealed_file,
@@ -1188,10 +1190,14 @@ private:
   // State access helpers — raw state_ / state_time_ access is confined here.
   // Per-thread read cache behind load_state_for_read (see ReadCacheSlot).
   // One function-local thread_local slot shared by every DB the thread
-  // touches, so its entry records its owner. commit_wait seeds it with the
-  // state that covered the thread's own write — see there for why the
-  // timestamp alone is not enough.
+  // touches, so its entry records its owner.
   [[nodiscard]] static auto read_cache() -> ReadCacheSlot &;
+  // Moves state_time_ forward to now, never back. commit_wait calls it
+  // before returning a covered write: the state covering it may have been
+  // published by another thread that has not yet stored state_time_, and
+  // until then every thread's read cache would keep serving the state from
+  // before the write.
+  void advance_state_time();
   // Claims this thread's slot and returns the guard; the entry behind it
   // holds this DB's state, refreshed when the staleness rule says so.
   [[nodiscard]] auto load_state_for_read(const ReadOptions &opts) const
@@ -1421,6 +1427,9 @@ private:
   // Serialises vacuum() calls. Separate from write_mu_ so vacuum I/O does
   // not block normal writes.
   std::unique_ptr<std::mutex> vacuum_mu_{std::make_unique<std::mutex>()};
+  // Tombstones compaction must keep. Set by recovery during open, read-only
+  // afterwards.
+  NeededTombstones needed_tombstones_;
   // Solo writer — single-slot execution under write_mu_. Same submit()
   // interface as WriteGroup. Used for large batches or opts.solo benchmarking.
   SoloWriter solo_writer_{[this](auto &b) { execute_slots(b); }};
@@ -2000,6 +2009,7 @@ void TransientEngineState::apply_writes(
   if (multi) {
     file_stats_.update(active_file_id_, [](FileStats &fs) {
       fs.total_bytes += kHeaderSize + kCrcSize;
+      fs.marker_bytes += kHeaderSize + kCrcSize;
     });
     ++next_seq_;
     ++io_idx;
@@ -2090,6 +2100,7 @@ void TransientEngineState::apply_writes(
   if (multi) {
     file_stats_.update(active_file_id_, [](FileStats &fs) {
       fs.total_bytes += kHeaderSize + kCrcSize;
+      fs.marker_bytes += kHeaderSize + kCrcSize;
     });
     ++next_seq_;
     ++io_idx;
@@ -2126,6 +2137,7 @@ void TransientEngineState::apply_ingest(
     case EntryType::BulkEnd:
       file_stats_.update(active_file_id_, [](FileStats &fs) {
         fs.total_bytes += kHeaderSize + kCrcSize;
+        fs.marker_bytes += kHeaderSize + kCrcSize;
       });
       break;
 
@@ -2258,16 +2270,18 @@ void TransientEngineState::apply_vacuum(
     file_stats_.set(dest_file_id,
                     FileStats{actual_live_bytes, scan.total_bytes,
                               scan.min_sequence, scan.max_sequence,
-                              scan.tombstone_bytes});
+                              scan.tombstone_bytes, scan.marker_bytes});
   } else {
     file_stats_.update(dest_file_id, [actual_live_bytes,
                                       total = scan.total_bytes,
                                       tomb = scan.tombstone_bytes,
+                                      mark = scan.marker_bytes,
                                       smin = scan.min_sequence,
                                       smax = scan.max_sequence](FileStats &fs) {
       fs.live_bytes += actual_live_bytes;
       fs.total_bytes += total;
       fs.tombstone_bytes += tomb;
+      fs.marker_bytes += mark;
       if (smin > 0 && (fs.min_sequence == 0 || smin < fs.min_sequence))
         fs.min_sequence = smin;
       if (smax > fs.max_sequence) fs.max_sequence = smax;
@@ -2285,12 +2299,14 @@ void TransientEngineState::apply_resume(
     fs.min_sequence = 0;
     fs.max_sequence = 0;
     fs.tombstone_bytes = 0;
+    fs.marker_bytes = 0;
   });
 
   std::uint64_t max_seq = 0;
   std::uint64_t seq_min = 0;
   std::uint64_t seq_max = 0;
   std::uint64_t tomb = 0;
+  std::uint64_t mark = 0;
   for (const auto &e : entries) {
     const std::span<const std::byte> key_span{e.key};
     if (e.sequence > max_seq) max_seq = e.sequence;
@@ -2299,6 +2315,7 @@ void TransientEngineState::apply_resume(
     // entries holds every committed entry in the file, so the file's
     // tombstones are rebuilt from scratch here, like its bounds.
     tomb += tombstone_size(e.entry_type, e.key.size(), e.range_end.size());
+    mark += marker_size(e.entry_type);
 
     switch (e.entry_type) {
     case EntryType::Put: {
@@ -2374,8 +2391,10 @@ void TransientEngineState::apply_resume(
       fs.max_sequence = seq_max;
     });
   }
-  file_stats_.update(file_id,
-                     [tomb](FileStats &fs) { fs.tombstone_bytes = tomb; });
+  file_stats_.update(file_id, [tomb, mark](FileStats &fs) {
+    fs.tombstone_bytes = tomb;
+    fs.marker_bytes = mark;
+  });
 }
 
 auto TransientEngineState::active_file() -> WritableDataFile & {
@@ -3045,25 +3064,11 @@ void DB::commit_wait(EngineSlot &slot) {
     if (covered) {
       result.durable = published->durable_seq >= target;
       // Another thread may have published this state and not yet stored
-      // state_time_: a read on this thread would compare timestamps, find
-      // nothing new and serve its cached pre-write snapshot. Seed the
-      // cache with the covering state instead. last_write_time is left as
-      // is: once the timestamp lands the next read refreshes as usual.
-      {
-        auto &slot = read_cache();
-        auto *e = slot.claim();
-        if (e == nullptr) {
-          e = new ReadCacheEntry();
-        }
-        if (e->owner != this) {
-          e->owner = this;
-          e->last_write_time = 0;
-        }
-        e->state = std::move(published);
-        e->used_epoch.store(ReadCacheRegistry::instance().epoch(),
-                            std::memory_order_relaxed);
-        slot.release(e);
-      }
+      // state_time_. A read that starts after this return, on any thread,
+      // would then compare timestamps, find nothing new and serve its
+      // cached pre-write state, though the write is acknowledged: visible
+      // to subsequent reads is the contract (CONTRACT.md, Consistency).
+      advance_state_time();
       return;
     }
     {
@@ -3242,16 +3247,16 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
   }
 
   // Find the highest-fragmentation sealed file above threshold. Tombstones
-  // count as kept, not as fragmentation: compaction copies every one of them,
-  // so a file holding nothing but tombstones has nothing to reclaim.
+  // and batch markers count as kept, not as fragmentation: a file is
+  // compacted for its dead Puts, so a file holding nothing else has nothing
+  // to reclaim.
   std::uint32_t target_id{};
   double worst_frag = 0.0;
   for (const auto [fid, fs] : stats_snap) {
     if (fid == active_id) continue;
     if (fs.total_bytes == 0) continue;
-    const auto kept = fs.live_bytes + fs.tombstone_bytes;
-    const auto frag = 1.0 - static_cast<double>(kept) /
-                                static_cast<double>(fs.total_bytes);
+    const auto frag = static_cast<double>(fs.reclaimable_bytes()) /
+                      static_cast<double>(fs.total_bytes);
     if (frag > worst_frag && frag > opts.fragmentation_threshold) {
       worst_frag = frag;
       target_id = fid;
@@ -3263,15 +3268,16 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
   const auto &target = *stats_snap.get(target_id);
 
   // Fast path: nothing in the file needs keeping — skip the scan and drop it.
-  // A tombstone does need keeping even with no live key left: dropping it
-  // would let recovery resurrect a Put it shadows in an older file.
+  // A tombstone may need keeping even with no live key left: dropping it
+  // could let recovery resurrect a Put it shadows in an older file, and only
+  // compaction decides which tombstones can go.
   if (target.live_bytes == 0 && target.tombstone_bytes == 0) {
     vacuum_remove_file(target_id);
     return true;
   }
 
-  // All files with live entries are compacted (sealed→sealed). Returns false
-  // when the scan finds nothing to reclaim.
+  // All other files are compacted (sealed→sealed). Returns false when the
+  // scan finds nothing to reclaim.
   return vacuum_compact_file(target_id);
 }
 
@@ -3459,13 +3465,15 @@ void DB::flush_hints() {
 #pragma region Vacuum internals
 
 // Scans source_file and copies live entries into dest_file.
-// Live Puts (still current in snap->key_dir for source_file_id),
-// all tombstones, and BulkBegin/BulkEnd markers are emitted.
+// Live Puts (still current in snap->key_dir for source_file_id), the
+// tombstones recovery found still needed or never examined, and
+// BulkBegin/BulkEnd markers are emitted.
 // Incomplete batches at EOF are silently discarded by the iterator.
 auto DB::vacuum_scan_and_copy(
     const std::shared_ptr<const EngineState> &snap,
     const DataFile &source_file, WritableDataFile &dest_file,
-    std::uint32_t source_file_id) -> VacuumScanResult {
+    std::uint32_t source_file_id, const NeededTombstones &needed)
+    -> VacuumScanResult {
   VacuumScanResult result;
 
   auto track_seq = [&](std::uint64_t seq) {
@@ -3495,19 +3503,15 @@ auto DB::vacuum_scan_and_copy(
       }
       break;
     }
-    case EntryType::Delete: {
-      std::ignore =
-          dest_file.append_entry(entry.sequence, EntryType::Delete, entry.key, {});
-      const auto sz = entry_size(entry.key.size(), 0);
-      result.total_bytes += sz;
-      result.tombstone_bytes += sz;
-      track_seq(entry.sequence);
-      break;
-    }
+    case EntryType::Delete:
     case EntryType::RangeDel: {
-      std::ignore =
-          dest_file.append_entry(entry.sequence, EntryType::RangeDel,
-                                 entry.key, entry.value);
+      // A tombstone no older Put in another file needs goes with its file.
+      if (needed.droppable(entry.sequence)) {
+        ++result.tombstones_dropped;
+        break;
+      }
+      std::ignore = dest_file.append_entry(entry.sequence, entry.entry_type,
+                                           entry.key, entry.value);
       const auto sz = entry_size(entry.key.size(), entry.value.size());
       result.total_bytes += sz;
       result.tombstone_bytes += sz;
@@ -3523,6 +3527,7 @@ auto DB::vacuum_scan_and_copy(
       // total_bytes equal to the file's size on disk — which is what
       // recovery seeds it from — and keeps every published offset inside it.
       result.total_bytes += kHeaderSize + kCrcSize;
+      result.marker_bytes += kHeaderSize + kCrcSize;
       track_seq(entry.sequence);
       break;
     }
@@ -3570,7 +3575,8 @@ void DB::vacuum_unlink_old_file(
 }
 
 // Rewrites a sealed file into a new sealed file containing only live
-// entries and tombstones. Called under vacuum_mu_, not write_mu_.
+// entries, markers and the tombstones still needed. Called under vacuum_mu_,
+// not write_mu_.
 // The new data file is written to .data.tmp, then renamed atomically.
 // The old file is deferred for cleanup when no readers reference it.
 auto DB::vacuum_compact_file(std::uint32_t file_id) -> bool {
@@ -3589,22 +3595,31 @@ auto DB::vacuum_compact_file(std::uint32_t file_id) -> bool {
     auto tmp_file = createDataFileForWrite(
         dir_, stem, ".data.tmp", rotation_threshold_,
         stagingBackend(io_backend_));
-    scan = vacuum_scan_and_copy(snap, old_file, *tmp_file, file_id);
+    scan = vacuum_scan_and_copy(snap, old_file, *tmp_file, file_id,
+                                needed_tombstones_);
     tmp_file->sync();
     tmp_file->shrink_to_fit();
   }
 
-  // Nothing to reclaim: every byte in this file is live data, a tombstone or
-  // a batch marker, and compaction must preserve all three. Publishing an
-  // identical file would churn I/O, and at fragmentation_threshold 0 the file
-  // would qualify again on the next call and never converge — fragmentation
-  // counts live and tombstone bytes as kept, but batch markers as
-  // reclaimable, so a file whose only dead bytes are markers still qualifies.
+  // Nothing to reclaim: every byte in this file is live data, a needed
+  // tombstone or a batch marker, and compaction must preserve all three.
+  // Publishing an identical file would churn I/O for nothing.
   const auto old_total = snap->file_stats.get(file_id)->total_bytes;
   if (scan.total_bytes >= old_total) {
     std::error_code ec;
     std::filesystem::remove(tmp_data_path, ec);
     return false;
+  }
+  // Nothing left at all: every Put was dead and every tombstone could go.
+  // Remove the file rather than publish an empty one.
+  if (scan.total_bytes == 0) {
+    std::error_code ec;
+    std::filesystem::remove(tmp_data_path, ec);
+    vacuum_remove_file(file_id);
+    counters_.vacuum_tombstones_dropped.fetch_add(
+        static_cast<std::int64_t>(scan.tombstones_dropped),
+        std::memory_order_relaxed);
+    return true;
   }
 
 #ifdef BYTECASK_TESTING
@@ -3649,13 +3664,18 @@ auto DB::vacuum_compact_file(std::uint32_t file_id) -> bool {
   counters_.vacuum_bytes_reclaimed.fetch_add(
       static_cast<std::int64_t>(old_total - scan.total_bytes),
       std::memory_order_relaxed);
+  counters_.vacuum_tombstones_dropped.fetch_add(
+      static_cast<std::int64_t>(scan.tombstones_dropped),
+      std::memory_order_relaxed);
   counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
   vacuum_unlink_old_file(snap, file_id);
   return true;
 }
 
-// Removes a sealed file that has no live keys. No I/O scan needed — just
-// commit the state change and unlink the files. Called under vacuum_mu_.
+// Removes a sealed file that has no live keys and nothing compaction would
+// keep: no tombstone (vacuum() checks) or none still needed (the compaction
+// that found its output empty). No I/O scan needed — just commit the state
+// change and unlink the files. Called under vacuum_mu_.
 void DB::vacuum_remove_file(std::uint32_t file_id) {
   auto snap = load_state_for_write();
   auto old_total = snap->file_stats.get(file_id)->total_bytes;
@@ -3735,6 +3755,10 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.vacuum_bytes_reclaimed.load(std::memory_order_relaxed)},
       {"bytecask.vacuum_files_unlinked",
        counters_.vacuum_files_unlinked.load(std::memory_order_relaxed)},
+      {"bytecask.vacuum_tombstones_dropped",
+       counters_.vacuum_tombstones_dropped.load(std::memory_order_relaxed)},
+      {"bytecask.tombstones_needed",
+       std::ssize(needed_tombstones_.sequences)},
       {"bytecask.recovery_files", counters_.recovery_files},
       {"bytecask.recovery_keys", counters_.recovery_keys},
       {"bytecask.recovery_duration_us", counters_.recovery_duration_us},
@@ -3991,6 +4015,16 @@ auto DB::read_cache() -> ReadCacheSlot & {
   thread_local ReadCacheSlot tl;
 #pragma clang diagnostic pop
   return tl;
+}
+
+void DB::advance_state_time() {
+  const auto now = now_ns();
+  auto cur = state_time_.load(std::memory_order_relaxed);
+  while (cur < now &&
+         !state_time_.compare_exchange_weak(cur, now,
+                                            std::memory_order_release,
+                                            std::memory_order_relaxed)) {
+  }
 }
 
 auto DB::load_state_for_read(const ReadOptions &opts) const
@@ -4322,6 +4356,9 @@ auto DB::recovery_open(const Options &opts) -> EngineState {
   for (;;) {
     std::filesystem::path a;
     std::filesystem::path b;
+    // A rerun after undoing an interrupted vacuum decides afresh; an empty
+    // directory leaves it empty, which keeps every tombstone.
+    needed_tombstones_ = {};
     {
       EngineState s;
       auto files = recovery_prepare_files(s);
@@ -4475,16 +4512,40 @@ struct RecoveryPhaseLog {
 };
 } // namespace
 
+// Collects the tombstones recovery marked as needed into the sorted set
+// vacuum consults. `horizon` is the highest sequence recovery saw: nothing
+// above it was examined. After a lenient open that skipped a file, the
+// horizon is 0 and every tombstone is kept: the skipped file may hold the
+// Put a tombstone hides, and may be readable at the next open.
+static auto recovery_needed_tombstones(
+    std::vector<std::uint64_t> point, const std::vector<RangeTombstone> &ranges,
+    std::uint64_t horizon, bool skipped_files) -> NeededTombstones {
+  if (skipped_files) return {};
+  for (const auto &rt : ranges)
+    if (rt.needed) point.push_back(rt.seq);
+  std::ranges::sort(point);
+  const auto dup = std::ranges::unique(point);
+  point.erase(dup.begin(), dup.end());
+  return {horizon, std::move(point)};
+}
+
 // Builds a RecoveryResult from a subset of hint files.
 // Each worker calls this independently — no shared mutable state.
+//
+// Marks a tombstone needed whenever it suppresses a Put from another file or
+// erases any key directory entry. The erase case is marked whatever file the
+// entry came from: the entry may have displaced an older Put from another
+// file, and the tree keeps no record of that.
 // When strict is false, corrupt or unreadable hint files are skipped
 // with a warning instead of throwing.
 auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
     -> RecoveryResult {
   std::uint64_t max_seq = 0;
   auto t = RecoveryKeyDirTree{}.transient();
-  std::map<Key, std::uint64_t> tombstones;
+  std::map<Key, PointTombstone> tombstones;
   std::vector<RangeTombstone> range_tombstones;
+  std::vector<std::uint64_t> needed;
+  bool skipped = false;
 
   // Use a plain hash map for file_stats accumulation — in-place mutation is
   // O(1) per entry vs. the copy-out/write-back overhead of TransientU32Map::update().
@@ -4518,17 +4579,22 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
           file_fs.max_sequence = he->sequence;
         file_fs.tombstone_bytes +=
             tombstone_size(he->entry_type, he->key.size(), he->end_key.size());
+        file_fs.marker_bytes += marker_size(he->entry_type);
 
         if (he->entry_type == EntryType::Put) {
           const auto k = Key{he->key};
           const auto tomb_it = tombstones.find(k);
-          if (tomb_it != tombstones.end() && tomb_it->second >= he->sequence) {
+          if (tomb_it != tombstones.end() &&
+              tomb_it->second.seq >= he->sequence) {
+            if (tomb_it->second.file_id != file_id)
+              needed.push_back(tomb_it->second.seq);
             continue;
           }
           // Check range tombstones — O(R) per Put, R expected small.
           bool suppressed = false;
-          for (const auto &rt : range_tombstones) {
+          for (auto &rt : range_tombstones) {
             if (rt.seq >= he->sequence && k >= rt.start && k < rt.end) {
+              if (rt.file_id != file_id) rt.needed = true;
               suppressed = true;
               break;
             }
@@ -4542,16 +4608,16 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
                    seq_wins);
         } else if (he->entry_type == EntryType::Delete) {
           const auto k = Key{he->key};
-          auto &tomb_seq = tombstones[k];
-          if (he->sequence > tomb_seq) tomb_seq = he->sequence;
+          auto &slot = tombstones[k];
+          if (he->sequence > slot.seq) slot = {he->sequence, file_id};
           const auto existing = t.get(he->key);
           if (existing && existing->sequence() < he->sequence) {
             t.erase(he->key);
+            needed.push_back(he->sequence);
           }
         } else if (he->entry_type == EntryType::RangeDel) {
           const auto start = Key{he->key};
           const auto end = Key{he->end_key};
-          range_tombstones.push_back({start, end, he->sequence});
           // Erase keys in [start, end) with sequence < this tombstone.
           std::vector<Key> to_erase;
           for (auto it = t.lower_bound(he->key);
@@ -4565,6 +4631,8 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
           for (const auto &ek : to_erase) {
             t.erase(std::span<const std::byte>{ek});
           }
+          range_tombstones.push_back(
+              {start, end, he->sequence, file_id, !to_erase.empty()});
         }
       }
     } catch (const SequenceOverlap &) {
@@ -4572,6 +4640,7 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
       throw;
     } catch (const std::exception &e) {
       if (strict) throw;
+      skipped = true;
       std::fprintf(stderr,
                    "bytecask: skipping data file for hint '%s' — could not "
                    "read it or rebuild it from the data file: %s\n",
@@ -4584,7 +4653,7 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
 
   return {std::move(t).persistent(), std::move(tombstones),
           std::move(range_tombstones), max_seq,
-          std::move(fstats_t).persistent()};
+          std::move(fstats_t).persistent(), std::move(needed), skipped};
 }
 
 // Merges two RecoveryResults. Tree merge uses sequence-based conflict
@@ -4608,33 +4677,39 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
   auto merged = RecoveryKeyDirTree::merge(std::move(a.key_dir), std::move(b.key_dir),
                                   seq_resolver);
 
-  for (const auto &[key, tomb_seq] : b.tombstones) {
+  // Erasing an entry marks the tombstone needed, as in
+  // recovery_build_from_hints: the entry comes from the other side's files.
+  auto &needed = a.needed_tombstones;
+  needed.insert(needed.end(), b.needed_tombstones.begin(),
+                b.needed_tombstones.end());
+  for (const auto &[key, tomb] : b.tombstones) {
     std::span<const std::byte> key_span{key.begin(), key.size()};
     const auto entry = merged.get(key_span);
-    if (entry && entry->sequence() < tomb_seq) {
+    if (entry && entry->sequence() < tomb.seq) {
       merged = merged.erase(key_span);
+      needed.push_back(tomb.seq);
     }
   }
 
-  for (const auto &[key, tomb_seq] : a.tombstones) {
+  for (const auto &[key, tomb] : a.tombstones) {
     std::span<const std::byte> key_span{key.begin(), key.size()};
     const auto entry = merged.get(key_span);
-    if (entry && entry->sequence() < tomb_seq) {
+    if (entry && entry->sequence() < tomb.seq) {
       merged = merged.erase(key_span);
+      needed.push_back(tomb.seq);
     }
   }
 
   auto &merged_tombs = a.tombstones;
-  for (auto &[key, seq] : b.tombstones) {
+  for (auto &[key, tomb] : b.tombstones) {
     auto &existing = merged_tombs[key];
-    if (seq > existing) existing = seq;
+    if (tomb.seq > existing.seq) existing = tomb;
   }
 
   // Cross-apply range tombstones from both sides.
   auto cross_apply_range_tombs =
-      [](RecoveryKeyDirTree &tree,
-         const std::vector<RangeTombstone> &rts) {
-        for (const auto &rt : rts) {
+      [](RecoveryKeyDirTree &tree, std::vector<RangeTombstone> &rts) {
+        for (auto &rt : rts) {
           std::vector<Key> to_erase;
           for (auto it = tree.lower_bound(
                    std::span<const std::byte>{rt.start.begin(), rt.start.size()});
@@ -4648,6 +4723,7 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
           for (const auto &ek : to_erase) {
             tree = tree.erase(std::span<const std::byte>{ek});
           }
+          if (!to_erase.empty()) rt.needed = true;
         }
       };
   cross_apply_range_tombs(merged, b.range_tombstones);
@@ -4661,7 +4737,8 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
 
   return {std::move(merged), std::move(merged_tombs),
           std::move(merged_range_tombs),
-          std::max(a.max_seq, b.max_seq), std::move(a.file_stats)};
+          std::max(a.max_seq, b.max_seq), std::move(a.file_stats),
+          std::move(needed), a.skipped_files || b.skipped_files};
 }
 
 // Parallel recovery: file-level partitioning with sequential accumulator merge.
@@ -4770,6 +4847,7 @@ auto DB::recovery_load_parallel(EngineState s,
 
   // Threads are joined. Propagate any worker exceptions now. A
   // SequenceOverlap propagates in both modes: it is not a file to skip.
+  bool worker_lost = false;
   for (const auto &err : worker_errors) {
     if (!err) continue;
     try {
@@ -4779,11 +4857,15 @@ auto DB::recovery_load_parallel(EngineState s,
     } catch (...) {
       if (strict) throw;
       // lenient: warning already emitted inside recovery_build_from_hints
+      worker_lost = true;
     }
   }
 #endif
 
   auto &final_result = queue[0];
+#ifndef BYTECASK_SINGLE_THREADED
+  if (worker_lost) final_result.skipped_files = true;
+#endif
   plog.mark("build + fan-in merge");
 
   // Phase 4: recompute live_bytes once from the fully-merged tree.
@@ -4806,6 +4888,10 @@ auto DB::recovery_load_parallel(EngineState s,
   plog.mark("live_bytes pass");
 
   // Phase 5: assembly.
+  needed_tombstones_ = recovery_needed_tombstones(
+      std::move(final_result.needed_tombstones),
+      final_result.range_tombstones, final_result.max_seq,
+      final_result.skipped_files);
   s.key_dir = key_dir_from_recovered(std::move(final_result.key_dir));
   s.next_seq = final_result.max_seq + 1;
   s.file_stats = std::move(final_result.file_stats);
@@ -4852,6 +4938,41 @@ static void recovery_parallel_for(unsigned n, Body &body) {
 }
 
 
+// Marks the tombstones that one key's hint entries show are still needed.
+// `matches` holds one entry per file: that file's newest entry for the key.
+// A tombstone is needed when an older Put from another file sits on the key.
+// An older Put a file hides under its own newer entry needs nothing more:
+// that newer entry is a Put that outranks it, or a Delete in the same file
+// that compaction drops together with it.
+template <typename EntryOf, typename FileOf>
+static void recovery_mark_needed(std::span<const std::byte> key,
+                                 std::span<const std::size_t> matches,
+                                 EntryOf entry_of, FileOf file_of,
+                                 std::vector<RangeTombstone> &ranges,
+                                 std::vector<std::uint64_t> &needed) {
+  const auto older_put_elsewhere = [&](std::uint64_t seq, std::uint32_t file) {
+    for (const auto j : matches) {
+      const auto &p = entry_of(j);
+      if (p.entry_type == EntryType::Put && p.sequence < seq &&
+          file_of(j) != file)
+        return true;
+    }
+    return false;
+  };
+  for (const auto i : matches) {
+    const auto &d = entry_of(i);
+    if (d.entry_type == EntryType::Delete &&
+        older_put_elsewhere(d.sequence, file_of(i)))
+      needed.push_back(d.sequence);
+  }
+  for (auto &rt : ranges) {
+    if (rt.needed) continue;
+    if (recovery_key_cmp(key, recovery_span_of(rt.start)) < 0) continue;
+    if (recovery_key_cmp(key, recovery_span_of(rt.end)) >= 0) continue;
+    if (older_put_elsewhere(rt.seq, rt.file_id)) rt.needed = true;
+  }
+}
+
 // Builds a RecoveryResult by merging sorted hint runs straight into a bulk
 // loader, instead of inserting key by key into a transient.
 //
@@ -4869,8 +4990,10 @@ static void recovery_parallel_for(unsigned n, Body &body) {
 auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
     -> RecoveryResult {
   std::uint64_t max_seq = 0;
-  std::map<Key, std::uint64_t> tombstones;
+  std::map<Key, PointTombstone> tombstones;
   std::vector<RangeTombstone> range_tombstones;
+  std::vector<std::uint64_t> needed;
+  bool skipped = false;
   std::unordered_map<std::uint32_t, FileStats> fstats_scratch;
   for (const auto &rf : files)
     fstats_scratch.emplace(rf.file_id, FileStats{0, rf.total_bytes});
@@ -4883,6 +5006,7 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
     if (seq > fs.max_sequence) fs.max_sequence = seq;
     fs.tombstone_bytes +=
         tombstone_size(he.entry_type, he.key.size(), he.end_key.size());
+    fs.marker_bytes += marker_size(he.entry_type);
   };
 
   // One cursor per hint file, parked on its next Put or Delete. The scanner
@@ -4914,7 +5038,7 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
         note(file_id, *he);
         if (he->entry_type == EntryType::RangeDel) {
           range_tombstones.push_back(
-              {Key{he->key}, Key{he->end_key}, he->sequence});
+              {Key{he->key}, Key{he->end_key}, he->sequence, file_id});
           continue;
         }
         if (he->entry_type == EntryType::BulkBegin ||
@@ -4928,6 +5052,7 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
       cursors.push_back(std::move(c));
     } catch (const std::exception &e) {
       if (strict) throw;
+      skipped = true;
       std::fprintf(stderr,
                    "bytecask: skipping data file for hint '%s' — could not "
                    "read it or rebuild it from the data file: %s\n",
@@ -5038,8 +5163,14 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
     for (const auto i : matches) {
       if (cursors[i].cur.entry_type != EntryType::Delete) continue;
       auto &slot = tombstones[Key{key}];
-      if (cursors[i].cur.sequence > slot) slot = cursors[i].cur.sequence;
+      if (cursors[i].cur.sequence > slot.seq)
+        slot = {cursors[i].cur.sequence, cursors[i].file_id};
     }
+    recovery_mark_needed(
+        key, matches,
+        [&](std::size_t i) -> const HintRecord & { return cursors[i].cur; },
+        [&](std::size_t i) { return cursors[i].file_id; }, range_tombstones,
+        needed);
 
     if (winner.entry_type == EntryType::Put) {
       auto suppressed = false;
@@ -5076,7 +5207,7 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
 
   return {std::move(out).finish(), std::move(tombstones),
           std::move(range_tombstones), max_seq,
-          std::move(fstats_t).persistent()};
+          std::move(fstats_t).persistent(), std::move(needed), skipped};
 }
 
 // ---------------------------------------------------------------------------
@@ -5143,26 +5274,32 @@ auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
       worker_errors[i] = std::current_exception();
     }
   });
+  bool skipped_files = false;
   for (const auto &err : worker_errors) {
     if (err) {
       if (strict) std::rethrow_exception(err);
       // lenient: warning already emitted inside recovery_build_sorted
+      skipped_files = true;
     }
   }
   plog.mark("build_sorted");
 
   // Phase 3: union the parts' metadata, and pool their separators into R
   // splitters. Both are O(W × files) or O(W × R) — nothing here touches a key.
-  std::map<Key, std::uint64_t> tombstones;
+  std::map<Key, PointTombstone> tombstones;
   std::vector<RangeTombstone> range_tombstones;
+  std::vector<std::uint64_t> needed;
   std::unordered_map<std::uint32_t, FileStats> fstats;
   std::uint64_t max_seq = 0;
   for (auto &part : parts) {
     max_seq = std::max(max_seq, part.max_seq);
-    for (const auto &[key, seq] : part.tombstones) {
+    for (const auto &[key, tomb] : part.tombstones) {
       auto &existing = tombstones[key];
-      if (seq > existing) existing = seq;
+      if (tomb.seq > existing.seq) existing = tomb;
     }
+    needed.insert(needed.end(), part.needed_tombstones.begin(),
+                  part.needed_tombstones.end());
+    skipped_files = skipped_files || part.skipped_files;
     range_tombstones.insert(
         range_tombstones.end(),
         std::make_move_iterator(part.range_tombstones.begin()),
@@ -5203,6 +5340,8 @@ auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
   struct RangeOut {
     KeyDirLeafRun run;
     std::unordered_map<std::uint32_t, std::uint64_t> live;
+    std::vector<std::uint64_t> needed;
+    std::vector<std::size_t> needed_ranges; // indexes into range_tombstones
   };
   std::vector<RangeOut> outs(ranges);
 
@@ -5289,9 +5428,29 @@ auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
       while (tomb != tombstones.end() &&
              recovery_key_cmp(recovery_span_of(tomb->first), key) < 0)
         ++tomb;
-      auto drop = tomb != tombstones.end() &&
-                  recovery_key_cmp(recovery_span_of(tomb->first), key) == 0 &&
-                  winner.sequence() < tomb->second;
+      const auto on_key =
+          tomb != tombstones.end() &&
+          recovery_key_cmp(recovery_span_of(tomb->first), key) == 0;
+
+      // Each part offers its own newest Put for the key; the tombstones
+      // come from every part. One that is newer than a Put from another
+      // file is needed. Within a part, recovery_build_sorted already marked
+      // what it saw.
+      for (const auto i : matches) {
+        const auto &e = cursors[i].entry;
+        if (on_key && e.sequence() < tomb->second.seq &&
+            e.file_id() != tomb->second.file_id)
+          outs[r].needed.push_back(tomb->second.seq);
+        for (const auto *rt : rts) {
+          if (e.sequence() >= rt->seq || e.file_id() == rt->file_id) continue;
+          if (recovery_key_cmp(key, recovery_span_of(rt->start)) < 0) continue;
+          if (recovery_key_cmp(key, recovery_span_of(rt->end)) >= 0) continue;
+          outs[r].needed_ranges.push_back(
+              static_cast<std::size_t>(rt - range_tombstones.data()));
+        }
+      }
+
+      auto drop = on_key && winner.sequence() < tomb->second.seq;
       if (!drop) {
         for (const auto *rt : rts) {
           if (winner.sequence() >= rt->seq) continue;
@@ -5335,6 +5494,13 @@ auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
     fs.live_bytes = it != live_accum.end() ? it->second : 0ULL;
     fstats_t.set(fid, fs);
   }
+
+  for (auto &o : outs) {
+    needed.insert(needed.end(), o.needed.begin(), o.needed.end());
+    for (const auto idx : o.needed_ranges) range_tombstones[idx].needed = true;
+  }
+  needed_tombstones_ = recovery_needed_tombstones(
+      std::move(needed), range_tombstones, max_seq, skipped_files);
 
   s.key_dir = key_dir_from_recovered(std::move(key_dir));
   s.next_seq = max_seq + 1;
@@ -5429,6 +5595,7 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
       run.stats.tombstone_bytes +=
           tombstone_size(he->entry_type, he->key.size(), he->end_key.size());
       run.max_seq = std::max(run.max_seq, he->sequence);
+      run.stats.marker_bytes += marker_size(he->entry_type);
       switch (he->entry_type) {
       case EntryType::BulkBegin:
       case EntryType::BulkEnd:
@@ -5439,7 +5606,7 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
           throw std::runtime_error{
               "bytecask: range tombstone inside a sorted hint run"};
         run.range_tombstones.push_back(
-            {Key{he->key}, Key{he->end_key}, he->sequence});
+            {Key{he->key}, Key{he->end_key}, he->sequence, rf.file_id});
         continue;
       case EntryType::Put:
       case EntryType::Delete:
@@ -5503,6 +5670,9 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
   struct RangeOut {
     btree_detail::LeafRun<BlindRef> run;
     std::unordered_map<std::uint32_t, std::uint64_t> live;
+    std::vector<std::uint64_t> needed;
+    // This range's own copy, so marking needs no lock; OR-ed after the merge.
+    std::vector<RangeTombstone> ranges;
   };
   std::vector<RangeOut> outs(ranges);
   auto merge_range = [&](unsigned r) {
@@ -5522,6 +5692,8 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
       if (below_hi(start) && (lo.empty() || recovery_key_cmp(end, lo) > 0))
         rts.push_back(&rt);
     }
+    auto &mark_ranges = outs[r].ranges;
+    for (const auto *rt : rts) mark_ranges.push_back(*rt);
 
     // A scanner's entries last only until its next call, so the cursor owns
     // the entries it keeps.
@@ -5644,6 +5816,13 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
         }
       }
 
+      // Every file is merged here, so this is the whole picture for the key.
+      recovery_mark_needed(
+          key, matches,
+          [&](std::size_t i) -> const HintRecord & { return cursors[i].cur; },
+          [&](std::size_t i) { return cursors[i].file_id; }, mark_ranges,
+          outs[r].needed);
+
       auto keep = cursors[winner].cur.entry_type == EntryType::Put;
       for (const auto *rt : rts) {
         if (!keep) break;
@@ -5677,10 +5856,18 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
   std::vector<btree_detail::LeafRun<BlindRef>> leaf_runs;
   leaf_runs.reserve(outs.size());
   std::unordered_map<std::uint32_t, std::uint64_t> live_accum;
+  std::vector<std::uint64_t> needed;
   for (auto &o : outs) {
     for (const auto &[fid, bytes] : o.live) live_accum[fid] += bytes;
     leaf_runs.push_back(std::move(o.run));
+    needed.insert(needed.end(), o.needed.begin(), o.needed.end());
+    for (const auto &rt : o.ranges)
+      if (rt.needed) needed.push_back(rt.seq);
   }
+  const auto skipped_files =
+      std::ranges::any_of(runs, [](const FileRun &run) { return !run.hint; });
+  needed_tombstones_ =
+      recovery_needed_tombstones(std::move(needed), {}, max_seq, skipped_files);
   auto fstats_t = PersistentU32Map<FileStats>{}.transient();
   for (std::size_t f = 0; f < files.size(); ++f) {
     auto fs = runs[f].stats;
