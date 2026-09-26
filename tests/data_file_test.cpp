@@ -856,6 +856,143 @@ TEST_CASE("DataFileIterator sweeps across chunk boundaries", "[data_file][iterat
   std::filesystem::remove_all(dir);
 }
 
+// read_raw is the sweep's only read: it copies up to dst.size() bytes and
+// stops at size() — the logical end on an active file, the file size on a
+// sealed one — returning what it copied, and nothing at or past the end.
+TEST_CASE("DataFile::read_raw stops at size()", "[data_file][iterator]") {
+  const auto io_backend =
+      GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::Mmap,
+               bytecask::IoBackend::BufferPool);
+  const auto sealed = GENERATE(false, true);
+  // Only the buffer pool reads it: with direct I/O a sweep hands each chunk's
+  // page cache back, without it the page cache is the pool's fill path.
+  const auto direct_io = GENERATE(false, true);
+  CAPTURE(static_cast<int>(io_backend), sealed, direct_io);
+
+  const auto dir = std::filesystem::temp_directory_path() / "bc_test_read_raw";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  constexpr std::size_t kCapacity = 8 * 1024 * 1024;
+  auto pool = std::make_shared<bytecask::BufferPool>(bytecask::BufferPoolOptions{
+      .capacity_bytes = 4 * kCapacity, .direct_io = direct_io});
+
+  std::shared_ptr<bytecask::DataFile> file;
+  {
+    auto w = bytecask::createDataFileForWrite(dir, "raw", ".data", kCapacity,
+                                              io_backend, pool, 1);
+    for (std::uint64_t seq = 1; seq <= 3; ++seq)
+      (void)w->append_entry(seq, bytecask::EntryType::Put, to_bytes("key"),
+                            to_bytes("value"));
+    w->sync();
+    if (sealed) {
+      w->shrink_to_fit();
+      w.reset();
+      file = bytecask::openDataFileForRead(dir / "raw.data", io_backend, pool, 1);
+    } else {
+      file = std::move(w);  // zero-filled past size(), never returned
+    }
+  }
+  const auto end = file->size();
+
+  std::vector<std::byte> buf(end + 64, std::byte{0x7f});
+  REQUIRE(file->read_raw(0, buf) == end);
+  // The bytes are the file's: the first header decodes to sequence 1.
+  CHECK(bytecask::read_header(std::span{buf}.first(bytecask::kHeaderSize))
+            .sequence == 1);
+  CHECK(file->read_raw(end - 5, std::span{buf}.first(10)) == 5);
+  CHECK(file->read_raw(end, std::span{buf}.first(10)) == 0);
+  CHECK(file->read_raw(end + 7, std::span{buf}.first(10)) == 0);
+
+  file.reset();
+  std::filesystem::remove_all(dir);
+}
+
+namespace {
+
+// A sealed file whose size() still reports bytes that read_raw no longer
+// returns: what a sweep sees when a file shrinks underneath it.
+class ShrunkDataFile final : public bytecask::DataFile {
+public:
+  ShrunkDataFile(std::shared_ptr<bytecask::DataFile> inner,
+                 bytecask::Offset readable)
+      : DataFile{inner->path()}, inner_{std::move(inner)},
+        readable_{readable} {}
+
+  auto read_raw(bytecask::Offset offset, std::span<std::byte> dst) const
+      -> std::size_t override {
+    if (offset >= readable_) return 0;
+    const auto n = std::min<std::size_t>(dst.size(), readable_ - offset);
+    return inner_->read_raw(offset, dst.first(n));
+  }
+  auto size() const noexcept -> bytecask::Offset override {
+    return inner_->size();
+  }
+  void read_value(bytecask::Offset, std::uint16_t, std::uint32_t, bool,
+                  std::vector<std::byte> &,
+                  std::vector<std::byte> &) const override {
+    throw std::logic_error{"unused"};
+  }
+  auto read_entry(bytecask::Offset, std::uint32_t,
+                  std::vector<std::byte> &) const
+      -> bytecask::DataEntryView override {
+    throw std::logic_error{"unused"};
+  }
+  auto read_entry_unverified(bytecask::Offset, std::uint32_t,
+                             std::vector<std::byte> &) const
+      -> bytecask::DataEntryView override {
+    throw std::logic_error{"unused"};
+  }
+  auto lend_record(bytecask::Offset, std::uint32_t, bool,
+                   std::vector<std::byte> &, bytecask::FrameLease &) const
+      -> bytecask::DataEntryView override {
+    throw std::logic_error{"unused"};
+  }
+
+private:
+  std::shared_ptr<bytecask::DataFile> inner_;
+  bytecask::Offset readable_;
+};
+
+} // namespace
+
+// size() said the entry was there and read_raw could not deliver it. That is
+// an error, not the end of the file: resume() truncates to the last entry a
+// sweep yields, so reading a shortfall as the end would cut acknowledged data.
+TEST_CASE("DataFileIterator throws when the file shrinks under the sweep",
+          "[data_file][iterator]") {
+  const auto path =
+      std::filesystem::temp_directory_path() / "bc_test_shrunk.data";
+  std::filesystem::remove(path);
+  {
+    auto w = bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+    for (std::uint64_t seq = 1; seq <= 3; ++seq)
+      (void)w->append_entry(seq, bytecask::EntryType::Put, to_bytes("key"),
+                            to_bytes("value"));
+    w->sync();
+  }
+  auto real = bytecask::openDataFileForRead(path);
+  const ShrunkDataFile shrunk{real, real->size() - 3};
+
+  auto it = bytecask::DataFileIterator{shrunk};
+  REQUIRE(!(it == std::default_sentinel));
+  CHECK((*it).first.sequence == 1);
+  ++it;
+  CHECK((*it).first.sequence == 2);
+  // The third entry lies below size() but past what read_raw returns: the
+  // short read throws, rather than a CRC failure on bytes never read.
+  try {
+    ++it;
+    FAIL("a sweep past what read_raw returns must throw");
+  } catch (const std::runtime_error &e) {
+    CHECK(std::string_view{e.what()}.find("short read") !=
+          std::string_view::npos);
+  }
+
+  real.reset();
+  std::filesystem::remove(path);
+}
+
+
 
 // ---------------------------------------------------------------------------
 // createDataFileForWrite — a stem is never reused
