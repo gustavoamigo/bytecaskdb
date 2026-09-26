@@ -288,13 +288,38 @@ external_lock(F_WRLCK)          →       begin()  [snapshot = db.snapshot()]
   update_row(old, new)          →       buffer_del(encode_pk(old))
                                         buffer_put(encode_pk(new), encode_row(new))
 external_lock(F_UNLCK)
-  [autocommit]                  →       commit(sync=true)
+  [autocommit]                  →       commit(sync = bytecaskdb_sync == AT_EVERY_COMMIT)
                                           WritePlan plan;
                                           for each buffered write: plan.put/del(...)
                                           db.apply_batch(snapshot, opts, plan)
-  [explicit COMMIT]             →       commit(sync=true)
+  [explicit COMMIT]             →       commit(sync = bytecaskdb_sync == AT_EVERY_COMMIT)
   [ROLLBACK]                    →       rollback()
 ```
+
+### Durability modes
+
+`bytecaskdb_sync` decides only whether a transaction commit waits for
+`fdatasync`. The batch is appended with `pwrite` before `COMMIT` returns in
+every mode, so a mariadbd crash loses nothing; the modes differ in what an OS
+crash can lose.
+
+- `AT_EVERY_COMMIT` (default): `apply_batch` with `sync = true`; concurrent
+  commits share one `fdatasync` through group commit.
+- `AT_INTERVAL`: commits use `sync = false`. A dedicated flusher thread calls
+  `apply_batch({.sync = true}, WritePlan{})` every
+  `bytecaskdb_sync_interval_ms`. The engine returns from that empty synced
+  plan once every earlier write is durable, coalescing with any flush in
+  flight, and does no `fdatasync` when nothing is unsynced. The thread is
+  separate from vacuum so a long vacuum pass cannot delay it; `SET GLOBAL` of
+  either variable wakes it. It also ticks under `AT_EVERY_COMMIT`, where the
+  sync-only write costs no `fdatasync`, so commits made before a switch to
+  `AT_EVERY_COMMIT` do not wait for the next commit to reach disk.
+- `AT_FILE_ROTATION`: commits use `sync = false` and the flusher is idle.
+  Data reaches disk when the active file rotates (the rotation barrier syncs
+  the file it seals) and at shutdown (`~DB` syncs the active file).
+
+DDL (catalog writes, `DROP`, `TRUNCATE`, the ALTER-copy flush) always syncs,
+as InnoDB's DDL does whatever `innodb_flush_log_at_trx_commit` says.
 
 ### Conflict Handling
 

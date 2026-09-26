@@ -50,6 +50,8 @@ std::atomic<bool>        g_verify_checksums{true};
 std::atomic<double>      g_vacuum_fragmentation_threshold{0.5};
 std::atomic<unsigned long> g_vacuum_busy_interval_ms{500};
 std::atomic<unsigned long> g_vacuum_idle_interval_ms{30000};
+std::atomic<unsigned long> g_sync_mode{kSyncAtEveryCommit};
+std::atomic<unsigned long> g_sync_interval_ms{1000};
 }  // namespace bytecaskdb
 
 #ifndef PLUGIN_TESTING
@@ -136,6 +138,46 @@ static MYSQL_SYSVAR_BOOL(verify_checksums, sysvar_verify_checksums,
     "CRC-verify every value read from disk (default ON)",
     nullptr, update_verify_checksums, TRUE);
 
+// Order must match the kSync* constants in ha_bytecaskdb.h.
+static const char *sync_mode_names[] = {"AT_EVERY_COMMIT", "AT_INTERVAL",
+                                        "AT_FILE_ROTATION", NullS};
+static TYPELIB sync_mode_typelib = {
+    array_elements(sync_mode_names) - 1, "sync_mode_typelib",
+    sync_mode_names, nullptr};
+
+namespace bytecaskdb {
+static void wake_sync_flusher();  // defined with the flusher thread below
+}  // namespace bytecaskdb
+
+static unsigned long sysvar_sync = bytecaskdb::kSyncAtEveryCommit;
+static void update_sync(THD *, st_mysql_sys_var *, void *var_ptr,
+                        const void *save) {
+  publish_sysvar<unsigned long>(var_ptr, save, bytecaskdb::g_sync_mode);
+  bytecaskdb::wake_sync_flusher();
+}
+static MYSQL_SYSVAR_ENUM(sync, sysvar_sync,
+    PLUGIN_VAR_RQCMDARG,
+    "When committed transactions reach disk. AT_EVERY_COMMIT (default): "
+    "fdatasync before COMMIT returns. AT_INTERVAL: written at COMMIT, synced "
+    "every bytecaskdb_sync_interval_ms; an OS crash loses at most one "
+    "interval. AT_FILE_ROTATION: synced only when the active data file "
+    "rotates and at shutdown; an OS crash loses up to one data file. A "
+    "mariadbd crash loses nothing in any mode, and DDL is always synced.",
+    nullptr, update_sync, bytecaskdb::kSyncAtEveryCommit, &sync_mode_typelib);
+
+static unsigned long sysvar_sync_interval_ms = 1000;
+static void update_sync_interval_ms(THD *, st_mysql_sys_var *, void *var_ptr,
+                                    const void *save) {
+  publish_sysvar<unsigned long>(var_ptr, save, bytecaskdb::g_sync_interval_ms);
+  bytecaskdb::wake_sync_flusher();
+}
+static MYSQL_SYSVAR_ULONG(sync_interval_ms, sysvar_sync_interval_ms,
+    PLUGIN_VAR_RQCMDARG,
+    "With bytecaskdb_sync = AT_INTERVAL, how often committed transactions are "
+    "synced to disk, in milliseconds (default 1000)",
+    nullptr, update_sync_interval_ms,
+    1000, 1, 60000, 0);
+
 static double sysvar_vacuum_fragmentation_threshold = 0.5;
 static void update_vacuum_fragmentation_threshold(THD *, st_mysql_sys_var *,
                                                   void *var_ptr,
@@ -194,6 +236,9 @@ static void publish_startup_sysvars() {
                                               std::memory_order_relaxed);
   bytecaskdb::g_vacuum_idle_interval_ms.store(sysvar_vacuum_idle_interval_ms,
                                               std::memory_order_relaxed);
+  bytecaskdb::g_sync_mode.store(sysvar_sync, std::memory_order_relaxed);
+  bytecaskdb::g_sync_interval_ms.store(sysvar_sync_interval_ms,
+                                       std::memory_order_relaxed);
 }
 
 static struct st_mysql_sys_var *bytecaskdb_system_variables[] = {
@@ -203,6 +248,8 @@ static struct st_mysql_sys_var *bytecaskdb_system_variables[] = {
     MYSQL_SYSVAR(max_file_bytes),
     MYSQL_SYSVAR(bulk_copy_flush_bytes),
     MYSQL_SYSVAR(verify_checksums),
+    MYSQL_SYSVAR(sync),
+    MYSQL_SYSVAR(sync_interval_ms),
     MYSQL_SYSVAR(vacuum_fragmentation_threshold),
     MYSQL_SYSVAR(vacuum_busy_interval_ms),
     MYSQL_SYSVAR(vacuum_idle_interval_ms),
@@ -231,6 +278,10 @@ handlerton                    *bytecaskdb_hton = nullptr;
 std::size_t catalog_bulk_copy_flush_bytes() {
   std::size_t v = g_bulk_copy_flush_bytes.load(std::memory_order_relaxed);
   return v ? v : (64ULL * 1024 * 1024);
+}
+
+bool plugin_sync_at_commit() {
+  return g_sync_mode.load(std::memory_order_relaxed) == kSyncAtEveryCommit;
 }
 
 bytecask::ReadOptions plugin_read_options() {
@@ -767,6 +818,62 @@ static void vacuum_loop() {
 }
 
 // ---------------------------------------------------------------------------
+// Background sync flusher
+// ---------------------------------------------------------------------------
+//
+// Its own thread, not the vacuum thread: a long vacuum pass must not delay
+// the sync that bounds what an OS crash can lose. It ticks in every mode but
+// AT_FILE_ROTATION. Under AT_EVERY_COMMIT every commit is already synced and
+// a sync-only write costs no fdatasync; the tick is there for commits made
+// before a switch to AT_EVERY_COMMIT, which would otherwise wait for the next
+// commit to reach disk.
+
+static std::thread             s_sync_thread;
+static std::mutex              s_sync_mu;
+static std::condition_variable s_sync_cv;
+static bool                    s_sync_stop = false;
+static bool                    s_sync_woken = false;
+
+// SET GLOBAL of bytecaskdb_sync or bytecaskdb_sync_interval_ms: re-read both
+// now rather than after the pause already in progress.
+static void wake_sync_flusher() {
+  {
+    std::lock_guard<std::mutex> lk{s_sync_mu};
+    s_sync_woken = true;
+  }
+  s_sync_cv.notify_one();
+}
+
+static void sync_loop() {
+  std::unique_lock<std::mutex> lk{s_sync_mu};
+  bool failing = false;  // log a failure once, not once per interval
+  while (!s_sync_stop) {
+    if (g_db &&
+        g_sync_mode.load(std::memory_order_relaxed) != kSyncAtFileRotation) {
+      lk.unlock();
+      try {
+        // An empty synced plan returns once every earlier write is durable.
+        (void)g_db->apply_batch(bytecask::WriteOptions{.sync = true},
+                                bytecask::WritePlan{});
+        failing = false;
+      } catch (const std::exception &e) {
+        if (!failing) {
+          sql_print_error("ByteCaskDB: background sync failed: %s", e.what());
+        }
+        failing = true;
+      }
+      lk.lock();
+    }
+    s_sync_cv.wait_for(
+        lk,
+        std::chrono::milliseconds{
+            g_sync_interval_ms.load(std::memory_order_relaxed)},
+        [] { return s_sync_stop || s_sync_woken; });
+    s_sync_woken = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Backup: manifest file helpers
 // ---------------------------------------------------------------------------
 
@@ -938,6 +1045,10 @@ static int bytecaskdb_init(void *p) {
   s_backup_manifest.reset();
   s_vacuum_thread = std::thread{vacuum_loop};
 
+  s_sync_stop = false;
+  s_sync_woken = false;
+  s_sync_thread = std::thread{sync_loop};
+
   return 0;
 }
 
@@ -949,6 +1060,14 @@ static int bytecaskdb_deinit(void * /*p*/) {
   s_vacuum_cv.notify_one();
   if (s_vacuum_thread.joinable())
     s_vacuum_thread.join();
+
+  {
+    std::lock_guard<std::mutex> lk{s_sync_mu};
+    s_sync_stop = true;
+  }
+  s_sync_cv.notify_one();
+  if (s_sync_thread.joinable())
+    s_sync_thread.join();
 
   g_db = nullptr;
   g_db_owner.reset();

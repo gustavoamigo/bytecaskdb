@@ -6,10 +6,12 @@
     SELECT VARIABLE_NAME, VARIABLE_VALUE FROM information_schema.global_variables
     WHERE VARIABLE_NAME IN ('BYTECASKDB_MAX_FILE_BYTES', 'BYTECASKDB_VERIFY_CHECKSUMS',
       'BYTECASKDB_VACUUM_FRAGMENTATION_THRESHOLD', 'BYTECASKDB_VACUUM_BUSY_INTERVAL_MS',
-      'BYTECASKDB_VACUUM_IDLE_INTERVAL_MS')
+      'BYTECASKDB_VACUUM_IDLE_INTERVAL_MS', 'BYTECASKDB_SYNC', 'BYTECASKDB_SYNC_INTERVAL_MS')
     ORDER BY VARIABLE_NAME
   expected:
     - ['BYTECASKDB_MAX_FILE_BYTES', '67108864']
+    - ['BYTECASKDB_SYNC', 'AT_EVERY_COMMIT']
+    - ['BYTECASKDB_SYNC_INTERVAL_MS', '1000']
     - ['BYTECASKDB_VACUUM_BUSY_INTERVAL_MS', '500']
     - ['BYTECASKDB_VACUUM_FRAGMENTATION_THRESHOLD', '0.500000']
     - ['BYTECASKDB_VACUUM_IDLE_INTERVAL_MS', '30000']
@@ -18,18 +20,24 @@
 - name: Dynamic sysvars round-trip through SET GLOBAL
   setup:
     - SET GLOBAL bytecaskdb_verify_checksums = OFF
+    - SET GLOBAL bytecaskdb_sync = AT_FILE_ROTATION
+    - SET GLOBAL bytecaskdb_sync_interval_ms = 250
     - SET GLOBAL bytecaskdb_vacuum_fragmentation_threshold = 0.25
     - SET GLOBAL bytecaskdb_vacuum_busy_interval_ms = 50
     - SET GLOBAL bytecaskdb_vacuum_idle_interval_ms = 1000
   query: >
     SELECT @@global.bytecaskdb_verify_checksums,
+           @@global.bytecaskdb_sync,
+           @@global.bytecaskdb_sync_interval_ms,
            @@global.bytecaskdb_vacuum_fragmentation_threshold,
            @@global.bytecaskdb_vacuum_busy_interval_ms,
            @@global.bytecaskdb_vacuum_idle_interval_ms
   expected:
-    - ['0', '0.25', '50', '1000']
+    - ['0', 'AT_FILE_ROTATION', '250', '0.25', '50', '1000']
   teardown:
     - SET GLOBAL bytecaskdb_verify_checksums = DEFAULT
+    - SET GLOBAL bytecaskdb_sync = DEFAULT
+    - SET GLOBAL bytecaskdb_sync_interval_ms = DEFAULT
     - SET GLOBAL bytecaskdb_vacuum_fragmentation_threshold = DEFAULT
     - SET GLOBAL bytecaskdb_vacuum_busy_interval_ms = DEFAULT
     - SET GLOBAL bytecaskdb_vacuum_idle_interval_ms = DEFAULT
@@ -39,16 +47,24 @@
     - SET GLOBAL bytecaskdb_vacuum_fragmentation_threshold = 7.5
     - SET GLOBAL bytecaskdb_vacuum_busy_interval_ms = 1
     - SET GLOBAL bytecaskdb_vacuum_idle_interval_ms = 1
+    - SET GLOBAL bytecaskdb_sync_interval_ms = 0
   query: >
     SELECT @@global.bytecaskdb_vacuum_fragmentation_threshold,
            @@global.bytecaskdb_vacuum_busy_interval_ms,
-           @@global.bytecaskdb_vacuum_idle_interval_ms
+           @@global.bytecaskdb_vacuum_idle_interval_ms,
+           @@global.bytecaskdb_sync_interval_ms
   expected:
-    - ['1.0', '10', '100']
+    - ['1.0', '10', '100', '1']
   teardown:
+    - SET GLOBAL bytecaskdb_sync_interval_ms = DEFAULT
     - SET GLOBAL bytecaskdb_vacuum_fragmentation_threshold = DEFAULT
     - SET GLOBAL bytecaskdb_vacuum_busy_interval_ms = DEFAULT
     - SET GLOBAL bytecaskdb_vacuum_idle_interval_ms = DEFAULT
+
+- name: bytecaskdb_sync rejects an unknown mode
+  steps:
+    - sql: SET GLOBAL bytecaskdb_sync = 'ALWAYS'
+      error: 1231
 
 - name: max_file_bytes is read-only
   steps:

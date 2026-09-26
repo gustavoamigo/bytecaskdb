@@ -300,8 +300,9 @@ int MariaDBTxn::commit(THD * /*thd*/, bool all) {
       }
     }
 
-    bool committed = db_->apply_batch(bytecask::WriteOptions{.sync = true},
-                                      std::move(plan)).has_value();
+    bool committed =
+        db_->apply_batch(bytecask::WriteOptions{.sync = plugin_sync_at_commit()},
+                         std::move(plan)).has_value();
     if (!committed) {
       if (deferred) {
         // Snapshot-less plan: the only precondition is ensure_absent, so a

@@ -66,6 +66,15 @@ void             catalog_drop_autoinc(uint32_t table_id);
 // Current value of the bulk_copy_flush_bytes system variable (never 0).
 std::size_t      catalog_bulk_copy_flush_bytes();
 
+// bytecaskdb_sync values, in the order of the sysvar's names.
+inline constexpr unsigned long kSyncAtEveryCommit = 0;
+inline constexpr unsigned long kSyncAtInterval = 1;
+inline constexpr unsigned long kSyncAtFileRotation = 2;
+
+// Whether a transaction COMMIT fdatasyncs before returning
+// (bytecaskdb_sync = AT_EVERY_COMMIT).
+bool             plugin_sync_at_commit();
+
 // ReadOptions for every plugin read, reflecting bytecaskdb_verify_checksums.
 bytecask::ReadOptions plugin_read_options();
 

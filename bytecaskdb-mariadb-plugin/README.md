@@ -26,6 +26,8 @@ All settings are global. Set them in `my.cnf` under `[mariadbd]` or, for the dyn
 | `bytecaskdb_buffer_pool_size` | `0` | bytes | no | Pool size when `io_backend = buffer_pool`. Total footprint, not just frame bytes. Must be at least `2 x bytecaskdb_max_file_bytes`. |
 | `bytecaskdb_buffer_pool_direct_io` | `ON` | — | no | Fill the pool with `O_DIRECT`, so it is the only consumer of memory for sealed-file data. Falls back to buffered fills per file where the filesystem refuses. |
 | `bytecaskdb_max_file_bytes` | 64 MiB | 1 MiB – 4 GiB | no | Active data file rotation threshold. Sealed files are the unit of vacuum: smaller files reclaim space sooner at the cost of more files. |
+| `bytecaskdb_sync` | `AT_EVERY_COMMIT` | `AT_EVERY_COMMIT`, `AT_INTERVAL`, `AT_FILE_ROTATION` | yes | When committed transactions reach disk. See [Durability](#durability). |
+| `bytecaskdb_sync_interval_ms` | 1000 | 1 – 60,000 | yes | With `bytecaskdb_sync = AT_INTERVAL`, how often committed transactions are synced. |
 | `bytecaskdb_verify_checksums` | `ON` | — | yes | CRC-verify every value read from disk. Turn off only for benchmarking; recovery still verifies hint files. |
 | `bytecaskdb_vacuum_fragmentation_threshold` | 0.5 | 0.0 – 1.0 | yes | Fraction of dead bytes a sealed file must reach before background vacuum rewrites it. |
 | `bytecaskdb_vacuum_busy_interval_ms` | 500 | 10 – 3,600,000 | yes | Pause between vacuum passes while files are being reclaimed. |
@@ -33,6 +35,18 @@ All settings are global. Set them in `my.cnf` under `[mariadbd]` or, for the dyn
 | `bytecaskdb_bulk_copy_flush_bytes` | 64 MiB | 4 KiB – 4 GiB | yes | Buffered bytes per batch during `ALTER TABLE ... ALGORITHM=COPY` and `CREATE INDEX`. |
 
 Changes to the vacuum variables take effect on the next vacuum pass, at most one pause of the previous length later.
+
+### Durability
+
+A committed transaction is always written to the data file before `COMMIT` returns, so a mariadbd crash loses nothing in any mode. `bytecaskdb_sync` decides when it also reaches the disk, which is what an OS crash or power loss needs:
+
+| `bytecaskdb_sync` | Synced to disk | Lost on an OS crash | InnoDB | PostgreSQL |
+|---|---|---|---|---|
+| `AT_EVERY_COMMIT` (default) | before `COMMIT` returns (`fdatasync`, shared by concurrent commits) | nothing | `innodb_flush_log_at_trx_commit = 1` | `synchronous_commit = on` |
+| `AT_INTERVAL` | by a background thread every `bytecaskdb_sync_interval_ms` | at most one interval | `= 2` | `= off` |
+| `AT_FILE_ROTATION` | when the active data file fills and rotates, and at shutdown | up to one data file (`bytecaskdb_max_file_bytes`), however old | — | — |
+
+DDL is always synced, in every mode. Changing either variable at runtime takes effect at the next commit; a shorter interval also triggers a sync at once. Set the mode by name: MariaDB numbers enum values from 0, so `SET GLOBAL bytecaskdb_sync = 1` means `AT_INTERVAL`.
 
 ## Examples
 
