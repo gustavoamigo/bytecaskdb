@@ -496,8 +496,13 @@ export template <std::size_t LeafBytes> struct Leaf {
     build_index(n);
   }
 
+  // The meta words fp_lo_matches reads start zeroed: it compares all of
+  // them, including ones past count that no entry has written yet, and
+  // those must be defined values even though the mask then drops them.
   [[nodiscard]] static auto allocate(std::uint64_t tag) -> N * {
-    return N::allocate(LeafBytes, true, tag, {});
+    auto *n = N::allocate(LeafBytes, true, tag, {});
+    std::memset(n->bytes() + kMetaOff, 0, 4 * kMetaWordsRead);
+    return n;
   }
 };
 
