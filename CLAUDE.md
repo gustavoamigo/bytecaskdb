@@ -19,8 +19,7 @@ These instructions apply to every repository work request in this workspace.
 5. After design approval, move to the implementation
 6. Add or update tests that cover the behavior being changed.
 7. Run the relevant tests after making changes.
-8. Do not create a git commit until the user has reviewed the change and explicitly approved committing it.
-9. After approval, create one commit with a concise, high-signal message that describes the change.
+8. Create one commit with a concise, high-signal message that describes the change. No approval is needed to commit.
 
 ## Issue tracking rules
 
@@ -58,9 +57,8 @@ When extending, follow the existing pattern: collect a serial baseline outside t
 
 ## Commit rules
 
-- Show the user what changed and the test result before offering to commit.
-- Wait for explicit approval before running any commit command.
-- **Never push to `main`.** Pushing to other branches, and creating new branches, needs no approval.
+- Commit and push without waiting for approval, then show the user what changed and the test result.
+- **Never push to `main`, under any circumstances.** Committing, creating branches, and pushing to any other branch need no approval.
 - Use commit messages that describe the actual behavior or architecture change, not generic messages like `update files`.
 
 ## Design philosophy
