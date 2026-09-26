@@ -80,8 +80,9 @@ export using BytesView = std::span<const std::byte>;
 // VacuumOptions — controls vacuum file selection.
 // ---------------------------------------------------------------------------
 export struct VacuumOptions {
-  // Minimum fragmentation ratio (1 − live_bytes / total_bytes) a sealed file
-  // must exceed to be eligible for vacuum. Range [0.0, 1.0].
+  // Minimum fragmentation ratio a sealed file must exceed to be eligible for
+  // vacuum: 1 − (live + tombstone bytes) / total bytes, the share compaction
+  // can reclaim. Range [0.0, 1.0].
   double fragmentation_threshold{0.5};
 };
 
@@ -2037,13 +2038,15 @@ void TransientEngineState::apply_writes(
             const auto del_sz = entry_size(key_span.size(), 0);
             file_stats_.update(active_file_id_, [del_sz](FileStats &fs) {
               fs.total_bytes += del_sz;
+              fs.tombstone_bytes += del_sz;
             });
             ++next_seq_;
             ++io_idx;
           } else {
             // RangeDel: iterate key_dir in [from, to), decrement live_bytes
             // on each affected file, erase from key_dir, then account for
-            // the entry itself (total_bytes only — tombstones are not live).
+            // the entry itself (a tombstone: total and tombstone bytes, never
+            // live).
             const std::span<const std::byte> from_span{op.from};
             const std::span<const std::byte> to_span{op.to};
 
@@ -2067,6 +2070,7 @@ void TransientEngineState::apply_writes(
             const auto rd_sz = entry_size(op.from.size(), op.to.size());
             file_stats_.update(active_file_id_, [rd_sz](FileStats &fs) {
               fs.total_bytes += rd_sz;
+              fs.tombstone_bytes += rd_sz;
             });
             ++next_seq_;
             ++io_idx;
@@ -2152,6 +2156,7 @@ void TransientEngineState::apply_ingest(
       const auto del_sz = entry_size(e.key.size(), 0);
       file_stats_.update(active_file_id_, [del_sz](FileStats &fs) {
         fs.total_bytes += del_sz;
+        fs.tombstone_bytes += del_sz;
       });
       break;
     }
@@ -2176,6 +2181,7 @@ void TransientEngineState::apply_ingest(
       const auto rd_sz = entry_size(e.key.size(), e.value.size());
       file_stats_.update(active_file_id_, [rd_sz](FileStats &fs) {
         fs.total_bytes += rd_sz;
+        fs.tombstone_bytes += rd_sz;
       });
       break;
     }
@@ -2244,14 +2250,17 @@ void TransientEngineState::apply_vacuum(
   if (dest_file_id != active_file_id_) {
     file_stats_.set(dest_file_id,
                     FileStats{actual_live_bytes, scan.total_bytes,
-                              scan.min_sequence, scan.max_sequence});
+                              scan.min_sequence, scan.max_sequence,
+                              scan.tombstone_bytes});
   } else {
     file_stats_.update(dest_file_id, [actual_live_bytes,
                                       total = scan.total_bytes,
+                                      tomb = scan.tombstone_bytes,
                                       smin = scan.min_sequence,
                                       smax = scan.max_sequence](FileStats &fs) {
       fs.live_bytes += actual_live_bytes;
       fs.total_bytes += total;
+      fs.tombstone_bytes += tomb;
       if (smin > 0 && (fs.min_sequence == 0 || smin < fs.min_sequence))
         fs.min_sequence = smin;
       if (smax > fs.max_sequence) fs.max_sequence = smax;
@@ -2268,16 +2277,21 @@ void TransientEngineState::apply_resume(
     fs.total_bytes = valid_offset;
     fs.min_sequence = 0;
     fs.max_sequence = 0;
+    fs.tombstone_bytes = 0;
   });
 
   std::uint64_t max_seq = 0;
   std::uint64_t seq_min = 0;
   std::uint64_t seq_max = 0;
+  std::uint64_t tomb = 0;
   for (const auto &e : entries) {
     const std::span<const std::byte> key_span{e.key};
     if (e.sequence > max_seq) max_seq = e.sequence;
     if (seq_min == 0 || e.sequence < seq_min) seq_min = e.sequence;
     if (e.sequence > seq_max) seq_max = e.sequence;
+    // entries holds every committed entry in the file, so the file's
+    // tombstones are rebuilt from scratch here, like its bounds.
+    tomb += tombstone_size(e.entry_type, e.key.size(), e.range_end.size());
 
     switch (e.entry_type) {
     case EntryType::Put: {
@@ -2353,6 +2367,8 @@ void TransientEngineState::apply_resume(
       fs.max_sequence = seq_max;
     });
   }
+  file_stats_.update(file_id,
+                     [tomb](FileStats &fs) { fs.tombstone_bytes = tomb; });
 }
 
 auto TransientEngineState::active_file() -> WritableDataFile & {
@@ -3200,13 +3216,16 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
     active_id = s->active_file_id;
   }
 
-  // Find the highest-fragmentation sealed file above threshold.
+  // Find the highest-fragmentation sealed file above threshold. Tombstones
+  // count as kept, not as fragmentation: compaction copies every one of them,
+  // so a file holding nothing but tombstones has nothing to reclaim.
   std::uint32_t target_id{};
   double worst_frag = 0.0;
   for (const auto [fid, fs] : stats_snap) {
     if (fid == active_id) continue;
     if (fs.total_bytes == 0) continue;
-    const auto frag = 1.0 - static_cast<double>(fs.live_bytes) /
+    const auto kept = fs.live_bytes + fs.tombstone_bytes;
+    const auto frag = 1.0 - static_cast<double>(kept) /
                                 static_cast<double>(fs.total_bytes);
     if (frag > worst_frag && frag > opts.fragmentation_threshold) {
       worst_frag = frag;
@@ -3216,10 +3235,12 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
 
   if (target_id == 0 && worst_frag == 0.0) return false;
 
-  const auto target_live = stats_snap.get(target_id)->live_bytes;
+  const auto &target = *stats_snap.get(target_id);
 
-  // Fast path: file has no live keys — skip scan entirely.
-  if (target_live == 0) {
+  // Fast path: nothing in the file needs keeping — skip the scan and drop it.
+  // A tombstone does need keeping even with no live key left: dropping it
+  // would let recovery resurrect a Put it shadows in an older file.
+  if (target.live_bytes == 0 && target.tombstone_bytes == 0) {
     vacuum_remove_file(target_id);
     return true;
   }
@@ -3452,7 +3473,9 @@ auto DB::vacuum_scan_and_copy(
     case EntryType::Delete: {
       std::ignore =
           dest_file.append_entry(entry.sequence, EntryType::Delete, entry.key, {});
-      result.total_bytes += entry_size(entry.key.size(), 0);
+      const auto sz = entry_size(entry.key.size(), 0);
+      result.total_bytes += sz;
+      result.tombstone_bytes += sz;
       track_seq(entry.sequence);
       break;
     }
@@ -3460,7 +3483,9 @@ auto DB::vacuum_scan_and_copy(
       std::ignore =
           dest_file.append_entry(entry.sequence, EntryType::RangeDel,
                                  entry.key, entry.value);
-      result.total_bytes += entry_size(entry.key.size(), entry.value.size());
+      const auto sz = entry_size(entry.key.size(), entry.value.size());
+      result.total_bytes += sz;
+      result.tombstone_bytes += sz;
       track_seq(entry.sequence);
       break;
     }
@@ -3548,9 +3573,8 @@ auto DB::vacuum_compact_file(std::uint32_t file_id) -> bool {
   // a batch marker, and compaction must preserve all three. Publishing an
   // identical file would churn I/O, and at fragmentation_threshold 0 the file
   // would qualify again on the next call and never converge — fragmentation
-  // is measured against live_bytes, which tombstones and markers can never
-  // count towards (hint files have no marker concept, so recovery could not
-  // reproduce it if they did).
+  // counts live and tombstone bytes as kept, but batch markers as
+  // reclaimable, so a file whose only dead bytes are markers still qualifies.
   const auto old_total = snap->file_stats.get(file_id)->total_bytes;
   if (scan.total_bytes >= old_total) {
     std::error_code ec;
@@ -4470,6 +4494,8 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
           file_fs.min_sequence = he->sequence;
         if (he->sequence > file_fs.max_sequence)
           file_fs.max_sequence = he->sequence;
+        file_fs.tombstone_bytes +=
+            tombstone_size(he->entry_type, he->key.size(), he->end_key.size());
 
         if (he->entry_type == EntryType::Put) {
           const auto k = Key{he->key};
@@ -4827,11 +4853,14 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
   for (const auto &rf : files)
     fstats_scratch.emplace(rf.file_id, FileStats{0, rf.total_bytes});
 
-  auto note = [&](std::uint32_t file_id, std::uint64_t seq) {
+  auto note = [&](std::uint32_t file_id, const HintEntry &he) {
+    const auto seq = he.sequence;
     if (seq > max_seq) max_seq = seq;
     auto &fs = fstats_scratch[file_id];
     if (fs.min_sequence == 0 || seq < fs.min_sequence) fs.min_sequence = seq;
     if (seq > fs.max_sequence) fs.max_sequence = seq;
+    fs.tombstone_bytes +=
+        tombstone_size(he.entry_type, he.key.size(), he.end_key.size());
   };
 
   // One cursor per hint file, parked on its next Put or Delete. The scanner
@@ -4858,7 +4887,7 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
       auto scanner = open_hints.back().make_scanner();
       std::optional<HintEntry> first;
       while (auto he = scanner.next()) {
-        note(file_id, he->sequence);
+        note(file_id, *he);
         if (he->entry_type == EntryType::RangeDel) {
           range_tombstones.push_back(
               {Key{he->key}, Key{he->end_key}, he->sequence});
@@ -4894,7 +4923,7 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
   // towards the file's sequence bounds.
   auto next_data = [&](Cursor &c) -> std::optional<HintEntry> {
     while (auto he = c.scanner.next()) {
-      note(c.file_id, he->sequence);
+      note(c.file_id, *he);
       if (he->entry_type == EntryType::BulkBegin ||
           he->entry_type == EntryType::BulkEnd)
         continue;
@@ -5364,6 +5393,8 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
       if (run.stats.min_sequence == 0 || he->sequence < run.stats.min_sequence)
         run.stats.min_sequence = he->sequence;
       run.stats.max_sequence = std::max(run.stats.max_sequence, he->sequence);
+      run.stats.tombstone_bytes +=
+          tombstone_size(he->entry_type, he->key.size(), he->end_key.size());
       run.max_seq = std::max(run.max_seq, he->sequence);
       switch (he->entry_type) {
       case EntryType::BulkBegin:

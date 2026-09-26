@@ -40,6 +40,9 @@ namespace bytecask {
 // ---------------------------------------------------------------------------
 // FileStats — per-file live/total byte counters for fragmentation tracking.
 // Updated under write_mu_ on every write; rebuilt during recovery.
+// tombstone_bytes counts Delete and RangeDel entries: bytes that are not live
+// but that vacuum must keep, because the tombstone may be all that stands
+// between an older file's Put and its resurrection at recovery.
 // Exported only in BYTECASK_TESTING builds so the public API stays minimal.
 // ---------------------------------------------------------------------------
 #ifdef BYTECASK_TESTING
@@ -48,6 +51,7 @@ export struct FileStats {
   std::uint64_t total_bytes{0};
   std::uint64_t min_sequence{0};
   std::uint64_t max_sequence{0};
+  std::uint64_t tombstone_bytes{0};
 };
 #else
 struct FileStats {
@@ -55,6 +59,7 @@ struct FileStats {
   std::uint64_t total_bytes{0};
   std::uint64_t min_sequence{0};
   std::uint64_t max_sequence{0};
+  std::uint64_t tombstone_bytes{0};
 };
 #endif
 
@@ -182,6 +187,24 @@ export inline constexpr auto entry_size(std::size_t key_size,
                                         std::size_t value_size)
     -> std::uint64_t {
   return kHeaderSize + key_size + value_size + kCrcSize;
+}
+
+// The bytes an entry adds to FileStats::tombstone_bytes: its full size for a
+// Delete or RangeDel (whose value is the range's end key), 0 otherwise.
+export inline constexpr auto tombstone_size(EntryType type,
+                                            std::size_t key_size,
+                                            std::size_t value_size)
+    -> std::uint64_t {
+  switch (type) {
+  case EntryType::Delete:
+  case EntryType::RangeDel:
+    return entry_size(key_size, value_size);
+  case EntryType::Put:
+  case EntryType::BulkBegin:
+  case EntryType::BulkEnd:
+    return 0;
+  }
+  return 0;
 }
 
 // Forward declaration — defined in bytecask.cppm (primary interface).
@@ -796,6 +819,7 @@ export struct VacuumScanResult {
   std::uint64_t total_bytes{0};
   std::uint64_t min_sequence{0};
   std::uint64_t max_sequence{0};
+  std::uint64_t tombstone_bytes{0};
 };
 
 // RecoveredFile and RecoveryResult are private to bytecask.cpp.
