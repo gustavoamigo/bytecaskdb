@@ -7,7 +7,6 @@ These instructions apply to every repository work request in this workspace.
 
 ## General instruction
 
-- Ignore `docs/old_bytecask_design.md`, it's there just so we I can copy and paste ideas from an older project. 
 - When generating commit messages or pull request descriptions, never include 'Co-authored-by' trailers or metadata attributing the work to an AI.
 - Never change git `user.name`, `user.email`, or signing config (`gpg.*`, `user.signingkey`, `commit.gpgsign`), and never pass `--author` or `-c user.*` to git. The session hook sets them; commits must be signed as the repo owner.
 
@@ -33,20 +32,20 @@ GitHub Issues are the repository's task tracker, for work not already captured b
 
 ## Benchmarking rules
 
-- Any change claimed to improve performance **must** include a benchmark run of `engine_bench` before and after the change. Run it with `python3 scripts/run_engine_bench.py`. Results are recorded in `benchmarks/engine_bench_results.csv`.
-- Run `python3 scripts/run_map_bench.py` (records to `benchmarks/map_bench_results.csv`) only when making changes to `radix_tree` or `persistent_ordered_map`.
+- Any change claimed to improve performance **must** include a benchmark run of `engine_bench` before and after the change. Run it with `python3 scripts/run_engine_bench.py`. Results are appended to `benchmarks/engine_bench_results.csv` (local, gitignored).
+- Run `python3 scripts/run_map_bench.py` (records to `benchmarks/map_bench_results.csv`, also gitignored) only when making changes to a key directory tree: `blind_btree`, `btree`, or `radix_tree`.
 - Show the before/after CSV rows to the user as evidence of improvement.
-- If benchmarks cannot be run, state why clearly and leave the project plan updated with the blocker.
+- If benchmarks cannot be run, state why clearly and record the blocker in the PR description or a GitHub issue.
 
 ## Testing rules
 
 - Prefer the narrowest test coverage that proves the change.
 - If the repository does not yet have the necessary test seam, create the smallest practical test harness first.
-- If tests cannot be run, state why clearly and leave the project plan updated with the blocker.
+- If tests cannot be run, state why clearly and record the blocker in the PR description or a GitHub issue.
 
 ### Model-based recovery tests
 
-The `[model]` test cases in `tests/bytecask_test.cpp` (random workload, batch-heavy, delete-heavy) are the primary soundness checks for the DB engine. They run thousands of random operations, close the DB, then reopen under serial and parallel recovery and verify that all key/values and per-file `file_stats` (live_bytes, total_bytes) match a serial baseline.
+The `[model]` test cases in `tests/bytecask_test.cpp` (random, batch-heavy, delete-heavy, range-delete, and many-frame-hint workloads, plus the vacuum tombstone model) are the primary soundness checks for the DB engine. They run thousands of random operations, close the DB, then reopen under serial and parallel recovery and verify that all key/values and per-file `file_stats` (live_bytes, total_bytes) match a serial baseline.
 
 Update or extend the model-based tests when a change could affect what a recovered DB contains or reports. Common examples:
 - Alters recovery logic (parsing, merging, fan-in, file_stats computation).
