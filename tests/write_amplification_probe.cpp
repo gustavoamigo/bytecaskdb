@@ -48,8 +48,8 @@ using namespace bytecask;
     -> std::optional<std::uint64_t> {
   struct stat st {};
   if (::stat(path.c_str(), &st) != 0) return std::nullopt;
-  const auto want_major = ::major(st.st_dev);
-  const auto want_minor = ::minor(st.st_dev);
+  const auto want_major = major(st.st_dev);
+  const auto want_minor = minor(st.st_dev);
 
   std::ifstream f{"/proc/diskstats"};
   std::string line;
