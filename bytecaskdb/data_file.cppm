@@ -74,17 +74,23 @@ export using Offset = std::uint64_t;
 // DataFile — abstract base for all data file implementations.
 //
 // Provides the read interface that the engine uses polymorphically.
-// The file registry stores shared_ptr<DataFile>; readers call scan() and
-// read_value() without knowing or caring whether the file is writable or
-// read-only mmap-backed.
+// The file registry stores shared_ptr<DataFile>; readers call read_value()
+// and sweeps call read_raw() without knowing or caring whether the file is
+// writable or read-only mmap-backed.
 export class DataFile {
 public:
   virtual ~DataFile();
   DataFile(const DataFile &) = delete;
   DataFile &operator=(const DataFile &) = delete;
 
-  [[nodiscard]] virtual auto scan(Offset offset) const
-      -> std::optional<std::pair<DataEntry, Offset>> = 0;
+  // Copies the bytes at offset into dst, stopping at size(), and returns how
+  // many it copied. The read behind DataFileIterator, which sweeps a whole
+  // file in large chunks: it never reads through or admits into the buffer
+  // pool, so a vacuum or hint pass does not flush the working set (buffer
+  // pool design §7).
+  [[nodiscard]] virtual auto read_raw(Offset offset,
+                                      std::span<std::byte> dst) const
+      -> std::size_t = 0;
 
   virtual void read_value(Offset offset, std::uint16_t key_size,
                           std::uint32_t value_size, bool verify,
@@ -303,6 +309,14 @@ auto read_value_from_pool(BufferPool &pool, std::uint32_t file_id,
   }
   pool.note_hit();
   return true;
+}
+
+// How many of the len bytes wanted at offset lie below end.
+constexpr auto bytes_below(Offset offset, std::size_t len, Offset end) noexcept
+    -> std::size_t {
+  return offset >= end
+             ? 0
+             : static_cast<std::size_t>(std::min<Offset>(len, end - offset));
 }
 
 // Reads exactly len bytes at offset; a short read is an error.
@@ -630,66 +644,18 @@ struct WritableFileOps {
     if (file_size == 0 && capacity > 0) ensure_zeroed(1);
   }
 
-  [[nodiscard]] auto scan(Offset offset) const
-      -> std::optional<std::pair<DataEntry, Offset>> {
-    if (offset + kHeaderSize > logical_end()) {
-      return std::nullopt;
-    }
-    auto header = scan_read_header(offset);
-    if (header.sequence == 0) return std::nullopt;
-    const auto next =
-        offset + kHeaderSize + header.key_size + header.value_size + kCrcSize;
-    // The entry CRC covers the key and value, so the sizes cannot be
-    // verified before those bytes are read. An entry ending past everything
-    // ever written to this file is corrupt by inspection: reject it rather
-    // than size a read buffer from it. The sealed files bound scan() against
-    // their size the same way.
-    if (next > logical_end()) return std::nullopt;
-    std::vector<std::byte> buf;
-    auto view = scan_read_entry(offset, header.key_size, header.value_size, buf);
-    return std::make_pair(
-        DataEntry{.sequence = view.sequence, .entry_type = view.entry_type,
-                  .key = {view.key.begin(), view.key.end()},
-                  .value = {view.value.begin(), view.value.end()}},
-        next);
-  }
-
-private:
-  [[nodiscard]] auto scan_read_header(Offset offset) const -> EntryHeader {
-    std::array<std::byte, kHeaderSize> hdr{};
+  // See DataFile::read_raw. Bounded by the logical end, so the zero-filled
+  // tail past it is never returned.
+  [[nodiscard]] auto read_raw(Offset offset, std::span<std::byte> dst) const
+      -> std::size_t {
 #ifdef BYTECASK_TESTING
     // A read of the active file that fails — what resume() must rethrow
     // rather than mistake for the end of the file.
     FAULT_INJECTION(io_data_file_scan);
 #endif
-    if (::pread(fd_, hdr.data(), kHeaderSize, narrow<off_t>(offset)) !=
-        std::ssize(hdr)) {
-      throw std::system_error{errno, std::generic_category(),
-                              "WritableFileOps::scan: pread header failed"};
-    }
-    return bytecask::read_header(std::span{hdr});
-  }
-
-  [[nodiscard]] auto scan_read_entry(Offset offset, std::uint16_t key_size,
-                                     std::uint32_t value_size,
-                                     std::vector<std::byte>& io_buf) const
-      -> DataEntryView {
-    const auto total = kHeaderSize + key_size + value_size + kCrcSize;
-    io_buf.resize(total);
-    if (::pread(fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
-        narrow<ssize_t>(total)) {
-      throw std::system_error{errno, std::generic_category(),
-                              "WritableFileOps::scan: pread entry failed"};
-    }
-    std::span<const std::byte> raw = io_buf;
-    const auto header = parse_header_and_verify(raw);
-    auto body = raw.subspan(kHeaderSize);
-    return DataEntryView{
-        .sequence = header.sequence,
-        .entry_type = header.entry_type,
-        .key = body.subspan(0, key_size),
-        .value = body.subspan(key_size, value_size),
-    };
+    const auto n = bytes_below(offset, dst.size(), logical_end());
+    pread_exact(fd_, offset, n, dst.data());
+    return n;
   }
 
 #ifdef BYTECASK_TESTING
@@ -759,9 +725,9 @@ public:
     ops_.append_entries(entries, offsets_out);
   }
 
-  [[nodiscard]] auto scan(Offset offset) const
-      -> std::optional<std::pair<DataEntry, Offset>> override {
-    return ops_.scan(offset);
+  [[nodiscard]] auto read_raw(Offset offset, std::span<std::byte> dst) const
+      -> std::size_t override {
+    return ops_.read_raw(offset, dst);
   }
 
   void read_value(Offset offset, std::uint16_t key_size,
@@ -1024,9 +990,9 @@ public:
     ops_.append_entries(entries, offsets_out);
   }
 
-  [[nodiscard]] auto scan(Offset offset) const
-      -> std::optional<std::pair<DataEntry, Offset>> override {
-    return ops_.scan(offset);
+  [[nodiscard]] auto read_raw(Offset offset, std::span<std::byte> dst) const
+      -> std::size_t override {
+    return ops_.read_raw(offset, dst);
   }
 
   void read_value(Offset offset, std::uint16_t key_size,
@@ -1229,25 +1195,11 @@ public:
 
   ~ReadOnlyPosixDataFile() override;
 
-  [[nodiscard]] auto scan(Offset offset) const
-      -> std::optional<std::pair<DataEntry, Offset>> override {
-    if (offset + kHeaderSize > file_size_) {
-      return std::nullopt;
-    }
-    const auto header = read_header(offset);
-    if (header.sequence == 0) return std::nullopt;
-    const auto next =
-        offset + kHeaderSize + header.key_size + header.value_size + kCrcSize;
-    if (next > file_size_) {
-      return std::nullopt;
-    }
-    std::vector<std::byte> buf;
-    auto view = read_entry_with_key_size(offset, header.key_size, header.value_size, buf);
-    return std::make_pair(
-        DataEntry{.sequence = view.sequence, .entry_type = view.entry_type,
-                  .key = {view.key.begin(), view.key.end()},
-                  .value = {view.value.begin(), view.value.end()}},
-        next);
+  [[nodiscard]] auto read_raw(Offset offset, std::span<std::byte> dst) const
+      -> std::size_t override {
+    const auto n = bytes_below(offset, dst.size(), file_size_);
+    pread_exact(fd_, offset, n, dst.data());
+    return n;
   }
 
   void read_value(Offset offset, std::uint16_t key_size,
@@ -1418,24 +1370,11 @@ public:
 
   ~ReadOnlyMmapDataFile() override;
 
-  [[nodiscard]] auto scan(Offset offset) const
-      -> std::optional<std::pair<DataEntry, Offset>> override {
-    if (offset + kHeaderSize > mmap_size_) {
-      return std::nullopt;
-    }
-    const auto header = read_header(offset);
-    if (header.sequence == 0) return std::nullopt;
-    const auto next =
-        offset + kHeaderSize + header.key_size + header.value_size + kCrcSize;
-    if (next > mmap_size_) {
-      return std::nullopt;
-    }
-    auto view = read_entry_with_key_size(offset, header.key_size, header.value_size);
-    return std::make_pair(
-        DataEntry{.sequence = view.sequence, .entry_type = view.entry_type,
-                  .key = {view.key.begin(), view.key.end()},
-                  .value = {view.value.begin(), view.value.end()}},
-        next);
+  [[nodiscard]] auto read_raw(Offset offset, std::span<std::byte> dst) const
+      -> std::size_t override {
+    const auto n = bytes_below(offset, dst.size(), mmap_size_);
+    if (n > 0) std::memcpy(dst.data(), mmap_base_ + offset, n);
+    return n;
   }
 
   void read_value(Offset offset, std::uint16_t key_size,
@@ -1536,15 +1475,20 @@ ReadOnlyMmapDataFile::~ReadOnlyMmapDataFile() {
   }
 }
 
-// Releases a file's page-cache residency. Linux only: macOS has no
+// Releases page-cache residency of a file or part of it. Linux only: macOS has no
 // posix_fadvise, and its buffered reads have no per-file drop — the direct
 // descriptor there uses F_NOCACHE instead, so the residency this releases
 // on Linux is simply never built up on macOS.
-inline void drop_page_cache(int fd) noexcept {
+// [offset, offset + len), or the whole file with the defaults.
+inline void drop_page_cache(int fd, Offset offset = 0,
+                            std::size_t len = 0) noexcept {
 #ifndef __APPLE__
-  ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+  ::posix_fadvise(fd, narrow<off_t>(offset), narrow<off_t>(len),
+                  POSIX_FADV_DONTNEED);
 #else
   (void)fd;
+  (void)offset;
+  (void)len;
 #endif
 }
 
@@ -1601,27 +1545,16 @@ public:
 
   ~ReadOnlyBufferPoolDataFile() override;
 
-  [[nodiscard]] auto scan(Offset offset) const
-      -> std::optional<std::pair<DataEntry, Offset>> override {
-    if (offset + kHeaderSize > file_size_) {
-      return sweep_done();
-    }
-    const auto header = read_header(offset, Source::Bypass);
-    if (header.sequence == 0) return sweep_done();
-    const auto next =
-        offset + kHeaderSize + header.key_size + header.value_size + kCrcSize;
-    if (next > file_size_) {
-      return sweep_done();
-    }
-    std::vector<std::byte> buf;
-    auto view = read_entry_with_key_size(offset, header.key_size,
-                                         header.value_size, buf,
-                                         Source::Bypass);
-    return std::make_pair(
-        DataEntry{.sequence = view.sequence, .entry_type = view.entry_type,
-                  .key = {view.key.begin(), view.key.end()},
-                  .value = {view.value.begin(), view.value.end()}},
-        next);
+  // Under direct I/O the page cache a sweep pulls in serves nothing
+  // afterwards — point reads come from frames — so each chunk is given back
+  // as soon as it is copied out. The buffered fallback keeps its cache: there
+  // it IS the fill path.
+  [[nodiscard]] auto read_raw(Offset offset, std::span<std::byte> dst) const
+      -> std::size_t override {
+    const auto n = bytes_below(offset, dst.size(), file_size_);
+    fetch(offset, n, dst.data(), Source::Bypass);
+    if (direct_fd_ != -1) drop_page_cache(fd_, offset, n);
+    return n;
   }
 
   void read_value(Offset offset, std::uint16_t key_size,
@@ -1698,17 +1631,6 @@ private:
         file_size_{file_size}, file_id_{file_id}, pool_{std::move(pool)} {}
 
 
-  // A sweep just finished. Under direct I/O the page cache it pulled in serves
-  // nothing afterwards — point reads come from frames — so give it back. The
-  // buffered fallback keeps its cache: there it IS the fill path.
-  [[nodiscard]] auto sweep_done() const
-      -> std::optional<std::pair<DataEntry, Offset>> {
-    if (direct_fd_ != -1) {
-      drop_page_cache(fd_);
-    }
-    return std::nullopt;
-  }
-
   int fd_;
   int direct_fd_;  // -1: no uncached reads here; fills go through fd_
   std::size_t file_size_;
@@ -1716,7 +1638,7 @@ private:
   // Shared so the pool outlives every file that lends spans into it.
   std::shared_ptr<BufferPool> pool_;
 
-  // Point reads go through the pool; scans deliberately do not. scan() sweeps
+  // Point reads go through the pool; sweeps deliberately do not. read_raw() sweeps
   // a whole file once — vacuum, hint generation, create_manifest — and
   // admitting those frames would flush the working set on every vacuum pass
   // (design §7). Making the source an explicit argument means a new read path
@@ -1730,17 +1652,7 @@ private:
                      offset, len, file_size_, dst);
       return;
     }
-    std::size_t done = 0;
-    while (done < len) {
-      const auto n = ::pread(fd_, dst + done, len - done,
-                             narrow<off_t>(offset + done));
-      if (n <= 0) {
-        throw std::system_error{
-            errno, std::generic_category(),
-            "ReadOnlyBufferPoolDataFile: pread failed"};
-      }
-      done += static_cast<std::size_t>(n);
-    }
+    pread_exact(fd_, offset, len, dst);
   }
 
   [[nodiscard]] auto read_header(Offset offset, Source source) const
@@ -1932,13 +1844,20 @@ export void renameDataFileExclusive(const std::filesystem::path &from,
 }
 
 // Forward-only iterator over raw entries in a DataFile.
-// Wraps DataFile::scan(offset) into a standard C++ input iterator.
-// Exceptions from scan() (CRC errors, I/O failures) propagate to the caller.
+// Reads the file kChunkBytes at a time through DataFile::read_raw and frames
+// entries out of that buffer, so a sweep costs about size() / kChunkBytes
+// reads instead of one or two per entry (#146). An entry larger than a chunk
+// grows the buffer to fit it; max_value_bytes bounds that growth.
+// The yielded entry reuses its key and value storage: a reference to *it is
+// valid until the next increment.
+// Exceptions (CRC errors, I/O failures) propagate to the caller.
 export class DataFileIterator {
 public:
   using iterator_concept = std::input_iterator_tag;
   using value_type = std::pair<DataEntry, Offset>;
   using difference_type = std::ptrdiff_t;
+
+  static constexpr std::size_t kChunkBytes = 1024 * 1024;
 
   DataFileIterator() = default;
 
@@ -1947,7 +1866,7 @@ public:
     advance();
   }
 
-  auto operator*() const -> const value_type& { return *cached_; }
+  auto operator*() const -> const value_type& { return current_; }
 
   auto operator++() -> DataFileIterator& {
     advance();
@@ -1957,7 +1876,7 @@ public:
   void operator++(int) { ++*this; }
 
   auto operator==(std::default_sentinel_t) const noexcept -> bool {
-    return !cached_.has_value();
+    return done_;
   }
 
   [[nodiscard]] auto next_offset() const noexcept -> Offset {
@@ -1965,20 +1884,53 @@ public:
   }
 
 private:
+  // The sweep ends at a short header, a zeroed header (sequence 0: the
+  // preallocated tail of an active file) or an entry running past size().
   void advance() {
-    auto result = file_->scan(next_offset_);
-    if (!result) {
-      cached_.reset();
-      return;
+    done_ = true;
+    const auto offset = next_offset_;
+    const auto end = file_->size();
+    if (offset + kHeaderSize > end) return;
+    const auto hdr = bytecask::read_header(buffered(offset, kHeaderSize));
+    if (hdr.sequence == 0) return;
+    const auto total = record_bytes(hdr);
+    if (offset + total > end) return;
+    const auto view = record_view(buffered(offset, total), hdr, /*verify=*/true);
+    auto& [entry, entry_off] = current_;
+    entry.sequence = view.sequence;
+    entry.entry_type = view.entry_type;
+    entry.key.assign(view.key.begin(), view.key.end());
+    entry.value.assign(view.value.begin(), view.value.end());
+    entry_off = offset;
+    next_offset_ = offset + total;
+    done_ = false;
+  }
+
+  // The len bytes at offset, read into buf_ first unless already there.
+  // The caller has checked they lie below size(), so fewer means the file
+  // shrank under the sweep.
+  auto buffered(Offset offset, std::size_t len) -> std::span<const std::byte> {
+    if (offset < buf_start_ || offset + len > buf_start_ + buf_len_) {
+      const auto want = std::max(len, kChunkBytes);
+      if (buf_.size() < want) buf_.resize(want);
+      buf_start_ = offset;
+      buf_len_ = file_->read_raw(offset, buf_);
+      if (buf_len_ < len)
+        throw std::runtime_error{std::format(
+            "bytecask: short read at offset {} of '{}'", offset,
+            file_->path().string())};
     }
-    auto& [entry, next] = *result;
-    cached_.emplace(std::move(entry), next_offset_);
-    next_offset_ = next;
+    return std::span<const std::byte>{buf_}.subspan(
+        static_cast<std::size_t>(offset - buf_start_), len);
   }
 
   const DataFile* file_{};
   Offset next_offset_{};
-  std::optional<value_type> cached_;
+  value_type current_{};
+  bool done_{true};
+  std::vector<std::byte> buf_;
+  Offset buf_start_{};
+  std::size_t buf_len_{};
 };
 
 export inline auto scan_entries(const DataFile& file, Offset start = 0)

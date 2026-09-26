@@ -112,6 +112,9 @@ struct Options {
   std::uint32_t max_value_bytes{4U * 1024 * 1024};
   IoBackend io_backend{IoBackend::Pread};
   BufferPoolOptions buffer_pool{};
+  // Most sealed files allowed to wait for their hint file before a rotation
+  // waits for the background writer. 0 = unbounded.
+  std::uint32_t max_hint_backlog{4};
 };
 
 struct SizeLimits {

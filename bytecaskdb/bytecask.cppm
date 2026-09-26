@@ -108,6 +108,7 @@ export inline constexpr std::uint32_t kMaxValueSize = KeyDirEntry::kMaxValueSize
 export inline constexpr std::uint32_t kDefaultMaxKeyBytes = 4096;
 export inline constexpr std::uint32_t kDefaultMaxValueBytes =
     4U * 1024 * 1024; // 4 MiB
+export inline constexpr std::uint32_t kDefaultMaxHintBacklog = 4;
 
 // Carried by Snapshot and WritePlan so size checks happen at the API boundary.
 export struct SizeLimits {
@@ -225,6 +226,12 @@ export struct Options {
   IoBackend io_backend{IoBackend::Pread};
   // Only read when io_backend == IoBackend::BufferPool.
   BufferPoolOptions buffer_pool{};
+  // Maximum number of sealed files waiting for their hint file. A rotation
+  // that would exceed it waits for the background worker, stalling writes
+  // (reads are unaffected). This bounds both close, which writes the backlog
+  // out, and the next open after a crash, which rebuilds whatever is missing.
+  // 0 turns the bound off: writes never wait and close/open are unbounded.
+  std::uint32_t max_hint_backlog{kDefaultMaxHintBacklog};
 };
 
 // ---------------------------------------------------------------------------
@@ -1145,6 +1152,12 @@ private:
   void deem_as_degraded(std::string reason);
 
   // Hint file management
+  // Blocks until the hint backlog is below max_hint_backlog_ (0: returns at
+  // once). Called by every path that seals a file, before it seals, so the
+  // backlog never exceeds the limit.
+  void wait_for_hint_backlog();
+  // Queues hint generation for a sealed file on the background worker.
+  void dispatch_hint(std::shared_ptr<DataFile> file);
   // Writes hint file via temp-then-rename. Batch-aware; idempotent if .hint
   // exists. Returns the offset past the last committed entry, or nullopt
   // when the hint already existed and nothing was scanned.
@@ -1373,6 +1386,7 @@ private:
   std::filesystem::path dir_;
   int lock_fd_{-1};  // flock() on dir_/.lock; released by close() in ~DB()
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
+  std::uint32_t max_hint_backlog_{kDefaultMaxHintBacklog};  // 0 = unbounded
   IoBackend io_backend_{IoBackend::Pread};
   // Declared before state_ so it outlives every DataFile holding a pointer to
   // it: members are destroyed in reverse declaration order.
@@ -1445,6 +1459,9 @@ public:
   // commit_wait. Lets a test hold a writer whose entries are already in the
   // head while another thread flushes and publishes them.
   std::function<void()> test_before_commit_wait_;
+  // Called on the background worker at the start of every hint task queued
+  // by dispatch_hint. Lets a test hold the worker to build a backlog.
+  std::function<void()> test_before_hint_;
   // Publishes s through the checked store_state under a write barrier, so
   // tests can drive the runtime invariant checks with a crafted state.
   void test_publish(std::shared_ptr<EngineState> s) {
@@ -2437,6 +2454,7 @@ auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
 // Throws std::system_error if the directory cannot be prepared.
 DB::DB(std::filesystem::path dir, Options opts)
     : dir_{std::move(dir)}, rotation_threshold_{opts.max_file_bytes},
+      max_hint_backlog_{opts.max_hint_backlog},
       io_backend_{opts.io_backend},
       size_limits_{std::min(opts.max_key_bytes, kMaxKeySize),
                    std::min(opts.max_value_bytes, kMaxValueSize)},
@@ -3284,6 +3302,7 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
 // Caller must sync the active file before calling if durability is required.
 void DB::rotate_active_file(TransientEngineState &t,
                             const std::shared_ptr<const EngineState> &) {
+  wait_for_hint_backlog();
   t.active_file().shrink_to_fit();
   auto read_only_old = openDataFileForRead(t.active_file().path(), io_backend_, pool_,
                                          t.active_file_id());
@@ -3298,10 +3317,34 @@ void DB::rotate_active_file(TransientEngineState &t,
   t.apply_rotate_file(read_only_old, std::move(new_file), new_file_id);
   // The sealed file's frames become evictable and the new file's pinned.
   if (pool_) pool_->set_active_file(new_file_id);
-  auto dir = dir_;
-  worker_.dispatch([f = std::move(read_only_old), d = std::move(dir)] {
+  dispatch_hint(std::move(read_only_old));
+}
+
+// The wait runs on the writer's thread with the write path held, so every
+// writer stalls until the worker catches up; readers never touch the worker.
+// It cannot deadlock: a hint task takes no lock a writer holds —
+// flush_hints_for is static and reads the file outside the buffer pool.
+void DB::wait_for_hint_backlog() {
+  if (max_hint_backlog_ == 0 || worker_.pending() < max_hint_backlog_) return;
+  const auto start = std::chrono::steady_clock::now();
+  worker_.wait_pending_below(max_hint_backlog_);
+  const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - start);
+  counters_.hint_backpressure_stalls.fetch_add(1, std::memory_order_relaxed);
+  counters_.hint_backpressure_stall_us.fetch_add(waited.count(),
+                                                 std::memory_order_relaxed);
+}
+
+void DB::dispatch_hint(std::shared_ptr<DataFile> file) {
+#ifdef BYTECASK_TESTING
+  worker_.dispatch([f = std::move(file), d = dir_, hook = test_before_hint_] {
+    if (hook) hook();
     flush_hints_for(f, d);
   });
+#else
+  worker_.dispatch(
+      [f = std::move(file), d = dir_] { flush_hints_for(f, d); });
+#endif
 }
 
 #pragma endregion
@@ -3746,8 +3789,15 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.io_errors.load(std::memory_order_relaxed)},
       {"bytecask.degraded_transitions",
        counters_.degraded_transitions.load(std::memory_order_relaxed)},
+      {"bytecask.hint_backpressure_stalls",
+       counters_.hint_backpressure_stalls.load(std::memory_order_relaxed)},
+      {"bytecask.hint_backpressure_stall_us",
+       counters_.hint_backpressure_stall_us.load(std::memory_order_relaxed)},
       // Gauges — current state, not monotonic.
       {"bytecask.degraded", s->degraded ? 1 : 0},
+      // Sealed files whose hint is queued or being written. What close must
+      // still write, and what an open after a crash would rebuild.
+      {"bytecask.hint_backlog", narrow<std::int64_t>(worker_.pending())},
       {"bytecask.open_files", open_files},
   };
 }
@@ -3781,6 +3831,9 @@ void DB::resume() {
   // the end of the barrier — and the resumed state is derived from the
   // published one with those heads already reclaimed.
   store_head(current);
+
+  // resume() seals the active file like a rotation does.
+  wait_for_hint_backlog();
 
   auto t = current->transient();
   const auto old_file_id = t.active_file_id();
@@ -3866,9 +3919,7 @@ void DB::resume() {
 
   // Dispatch hint generation — idempotent (flush_hints_for skips files
   // whose .hint already exists).
-  worker_.dispatch([f = read_only_old, d = dir_] {
-    flush_hints_for(f, d);
-  });
+  dispatch_hint(read_only_old);
 
   // Create the new active file (may throw → stays degraded).
   const auto stem = make_data_file_stem();

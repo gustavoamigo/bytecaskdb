@@ -422,7 +422,10 @@ NB_MODULE(_bytecaskdb, m) {
       .def_rw("io_backend", &bytecask::Options::io_backend,
               "How data files are read (default IoBackend.Pread).")
       .def_rw("buffer_pool", &bytecask::Options::buffer_pool,
-              "Only read when io_backend is IoBackend.BufferPool.");
+              "Only read when io_backend is IoBackend.BufferPool.")
+      .def_rw("max_hint_backlog", &bytecask::Options::max_hint_backlog,
+              "Most sealed files waiting for a hint file before rotation "
+              "stalls writes (default 4; 0 = unbounded).");
 
   nb::class_<bytecask::WriteOptions>(m, "WriteOptions",
       "Per-write options for put, del_, apply_batch, etc.")

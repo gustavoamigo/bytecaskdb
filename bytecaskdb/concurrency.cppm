@@ -5,6 +5,7 @@
 // group write batching.
 
 module;
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -250,6 +251,10 @@ public:
   }
 
   void drain() {}
+
+  // Tasks run inline, so nothing is ever pending.
+  [[nodiscard]] auto pending() const noexcept -> std::size_t { return 0; }
+  void wait_pending_below(std::size_t) {}
 };
 
 #else
@@ -285,6 +290,21 @@ public:
     cv_idle_.wait(lk, [this] { return queue_.empty() && active_ == 0; });
   }
 
+  // Tasks queued plus the one running, if any.
+  [[nodiscard]] auto pending() const -> std::size_t {
+    std::unique_lock<std::mutex> lk{mu_};
+    return queue_.size() + active_;
+  }
+
+  // Block until fewer than n tasks are queued or running. n == 0 would never
+  // return, so it is treated as 1: wait for the worker to go idle.
+  void wait_pending_below(std::size_t n) {
+    std::unique_lock<std::mutex> lk{mu_};
+    cv_idle_.wait(lk, [this, n] {
+      return queue_.size() + active_ < std::max<std::size_t>(n, 1);
+    });
+  }
+
 private:
   void run() {
     while (true) {
@@ -314,7 +334,7 @@ private:
     }
   }
 
-  std::mutex mu_;
+  mutable std::mutex mu_;
   std::condition_variable cv_task_;
   std::condition_variable cv_idle_;
   std::queue<std::function<void()>> queue_;

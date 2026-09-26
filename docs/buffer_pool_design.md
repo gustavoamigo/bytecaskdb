@@ -97,7 +97,7 @@ Each pool-backed sealed file opens a second descriptor for frame fills through `
 
 ## 7. Everything else
 
-**Scans bypass the pool.** `scan()` sweeps whole files once — vacuum, hint generation, `create_manifest` — and admitting those frames would flush the working set on every vacuum pass. The bypass is an explicit `Source::Bypass` argument on the pool-backed file's read helpers, so a new read path has to choose rather than inherit a default; a test asserts `pool_fills` is unchanged across a vacuum.
+**Scans bypass the pool.** `read_raw()` sweeps whole files once — vacuum, hint generation, `create_manifest` — and admitting those frames would flush the working set on every vacuum pass. The bypass is an explicit `Source::Bypass` argument on the pool-backed file's read helpers, so a new read path has to choose rather than inherit a default; a test asserts `pool_fills` is unchanged across a vacuum.
 
 **Vacuum needs no invalidation.** File ids are strictly monotonic and never reused within a process, so when vacuum unlinks a file nothing will ever look up its frames again. They are orphans, not stale entries, and the hand reclaims them on its next pass since their visited bits stay clear. *If file ids ever become reusable, this reasoning breaks* and a per-frame generation stamp becomes a correctness requirement.
 

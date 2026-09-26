@@ -98,6 +98,7 @@ auto to_module(bytecask::internal::Options o) noexcept -> bytecask::Options {
     o.max_value_bytes,
     to_module(o.io_backend),
     to_module(o.buffer_pool),
+    o.max_hint_backlog,
   };
 }
 
