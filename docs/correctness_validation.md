@@ -1474,9 +1474,10 @@ from its data file. Both need the power-loss follow-up (`dm-flakey`,
 `dm-log-writes`, or a FUSE layer that drops unsynced writes).
 
 What it did catch: #166, `vacuum()` dropping a file with
-`live_bytes == 0` along with its tombstones, so an older `Put` comes back on
-reopen. The harness failed on it about once every ten iterations. With that
-fast path disabled, 300 iterations with vacuum running passed.
+`live_bytes == 0` along with its tombstones, so an older `Put` came back on
+reopen. The harness failed on it about once every ten iterations. Since the
+fix (#171, which counts tombstones in `FileStats` and keeps any file that
+holds one), 400 iterations with vacuum running pass.
 
 Run: `xmake build crash_consistency && xmake run crash_consistency --iterations 200`.
 The seed and a rerun line are printed first. `--seed` replays the same

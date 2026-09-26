@@ -3,8 +3,8 @@
 # writer process at random points and checks the durable prefix on reopen.
 #
 # ci.yml only compiles the harness on every push/PR. The timed run lives here,
-# on a schedule plus manual dispatch, and on pushes that change the harness
-# itself. The run's seed is printed first; rerun with --seed to replay the
+# on a schedule plus manual dispatch, and on every update of a PR that changes
+# the harness itself. The run's seed is printed first; rerun with --seed to replay the
 # same workloads and kill delays (kill timing still varies with the machine).
 
 name: Crash consistency (nightly)
@@ -20,7 +20,8 @@ on:
       seed:
         description: "Seed to replay (empty = random)"
         default: ""
-  push:
+  pull_request:
+    branches: [main]
     paths:
       - "tests/crash/**"
       - ".github/workflows/crash-nightly.yml"
