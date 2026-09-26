@@ -874,12 +874,16 @@ auto planned_transfer(std::vector<std::unique_ptr<Node>> &nodes,
   const auto old = view.get().leader;
   auto &on = *nodes[static_cast<std::size_t>(old)];
   auto &tn = *nodes[static_cast<std::size_t>(target)];
+  // Read under the same hold as the mode switch: a separate durable_of()
+  // can find the gate taken and read 0, and the wait below then promotes a
+  // target that has not caught up, losing the old leader's tail.
+  std::uint64_t old_durable = 0;
   {
     auto g = enter(on);
     if (!g.owns_lock()) return;
     on.holder->db.set_mode(bytecask::Mode::Follower);
+    old_durable = on.holder->db.durable_sequence();
   }
-  const auto old_durable = durable_of(on).value_or(0);
   const auto deadline = Clock::now() + std::chrono::seconds(10);
   while (durable_of(tn).value_or(0) < old_durable) {
     if (Clock::now() >= deadline) {
