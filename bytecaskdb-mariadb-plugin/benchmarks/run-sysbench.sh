@@ -26,6 +26,10 @@
 #              e.g. --engines=bytecaskdb or --engines=bytecaskdb,innodb
 #   --workloads: comma-separated list of sysbench workloads (default: common OLTP mix)
 #                e.g. --workloads=oltp_insert
+#   --reuse-data: skip Phase 1 and run against the instance directories a previous
+#                 run left under --data-root, and keep them at exit. The table
+#                 size must match what was loaded; a mutating workload leaves
+#                 its changes behind for the next run.
 #   --data-root: directory under which the ephemeral mariadbd instances create their
 #                data/tmp/socket files (default: repository root). Point it at a
 #                filesystem that supports native fdatasync/O_DIRECT when the repo
@@ -72,6 +76,7 @@ ENGINES="bytecaskdb,innodb,rocksdb"
 WORKLOADS="oltp_point_select oltp_read_write oltp_insert oltp_write_only"
 CREATE_SECONDARY="on"
 DATA_ROOT=""
+REUSE_DATA="off"
 
 #WORKLOADS="oltp_read_only:points_only oltp_read_only:ranges_only oltp_read_only:simple_range oltp_read_only:sum_range oltp_read_only:order_range oltp_read_only:distinct_range"
 
@@ -92,8 +97,9 @@ for arg in "$@"; do
     --workloads=*)  WORKLOADS="${arg#*=}" ;;
     --data-root=*)  DATA_ROOT="${arg#*=}" ;;
     --no-secondary-index) CREATE_SECONDARY="off" ;;
+    --reuse-data)   REUSE_DATA="on" ;;
     --help|-h)
-      echo "Usage: $0 [--table-size=N] [--threads=1,4,8] [--time=30] [--warmup=60] [--engines=bytecaskdb,innodb,rocksdb] [--workloads=oltp_insert] [--data-root=PATH] [--no-secondary-index]"
+      echo "Usage: $0 [--table-size=N] [--threads=1,4,8] [--time=30] [--warmup=60] [--engines=bytecaskdb,innodb,rocksdb] [--workloads=oltp_insert] [--data-root=PATH] [--no-secondary-index] [--reuse-data]"
       exit 0
       ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
@@ -233,7 +239,7 @@ cleanup() {
   for engine in bytecaskdb innodb rocksdb; do
     dir="$(engine_dir "$engine")"
     stop_mariadbd "$dir/mariadbd.pid"
-    remove_instance "$dir"
+    if [[ "$REUSE_DATA" == "off" ]]; then remove_instance "$dir"; fi
   done
 }
 trap cleanup INT TERM
@@ -382,10 +388,22 @@ if engine_enabled rocksdb && [[ -z "$ROCKSDB_PLUGIN_DIR" ]]; then
 fi
 echo ""
 
-echo "=== Phase 1: preparing data ==="
-for engine in "${ACTIVE_ENGINES[@]}"; do
-  prepare_engine "$engine"
-done
+if [[ "$REUSE_DATA" == "on" ]]; then
+  echo "=== Phase 1: reusing existing data ==="
+  for engine in "${ACTIVE_ENGINES[@]}"; do
+    if [[ ! -d "$(engine_dir "$engine")/data/sbtest" ]]; then
+      echo "ERROR: --reuse-data but no loaded table in $(engine_dir "$engine")" >&2
+      exit 1
+    fi
+    # A server orphaned by an aborted run still holds the data directory.
+    stop_engine "$engine"
+  done
+else
+  echo "=== Phase 1: preparing data ==="
+  for engine in "${ACTIVE_ENGINES[@]}"; do
+    prepare_engine "$engine"
+  done
+fi
 echo ""
 
 echo "=== Phase 2: running workloads ==="

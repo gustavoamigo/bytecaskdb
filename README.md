@@ -497,6 +497,9 @@ python ./scripts/run_engine_bench.py
 # Benchmark the MariaDB plugin with a selected sysbench workload.
 ./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench.sh \
   --engines=bytecaskdb,innodb --workloads=oltp_insert --threads=1,16
+
+# TPROC-C (TPC-C derived) through HammerDB, ByteCaskDB vs InnoDB.
+./bytecaskdb-mariadb-plugin/benchmarks/run-hammerdb.sh --warehouses=20 --vus=8,16
 ```
 
 The key directory is chosen at build time. The default is the blind-leaf B+ tree; `BYTECASK_KEYDIR=btree` builds the engine on the B+ tree that keeps key bytes in its leaves (larger, and it never reads a record to place or enumerate a key), and `BYTECASK_KEYDIR=radix` on the radix tree. All three pass the same engine suite in CI, and the on-disk format is the same, so a database opens under any of them.

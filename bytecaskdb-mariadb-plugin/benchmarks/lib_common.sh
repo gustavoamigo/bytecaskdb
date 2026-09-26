@@ -185,16 +185,28 @@ start_mariadbd() {
     --tmpdir="$(dirname "$data_dir")/tmp" \
     --log-error="$log_file" \
     "${extra_args[@]}" &
+  local server_pid=$!
 
-  # Wait for readiness
+  # Wait for readiness. Opening a large data set takes a while (a 20M-row
+  # ByteCaskDB table on pread needs ~30s), so the limit is generous and
+  # overridable with MARIADB_START_TIMEOUT. Messages go to stderr: callers run
+  # this inside $(...), which would otherwise swallow them.
+  local timeout="${MARIADB_START_TIMEOUT:-600}"
   local tries=0
   while ! mariadb --socket="$socket" -u root -e "SELECT 1" >/dev/null 2>&1; do
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+      echo "ERROR: mariadbd on port $port exited during startup" >&2
+      echo "Log: $log_file" >&2
+      tail -20 "$log_file" >&2
+      exit 1
+    fi
     sleep 1
     tries=$((tries + 1))
-    if [[ $tries -ge 30 ]]; then
-      echo "ERROR: mariadbd on port $port did not start within 30s"
-      echo "Log: $log_file"
-      cat "$log_file" | tail -20
+    if [[ $tries -ge $timeout ]]; then
+      echo "ERROR: mariadbd on port $port did not start within ${timeout}s" >&2
+      echo "Log: $log_file" >&2
+      tail -20 "$log_file" >&2
+      stop_mariadbd "$pid_file"
       exit 1
     fi
   done

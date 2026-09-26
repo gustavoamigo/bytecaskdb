@@ -226,6 +226,36 @@ are listed in.
 ./bytecaskdb-mariadb-plugin/benchmarks/memory-pressure/run-memory-pressure.sh
 ```
 
+## HammerDB TPROC-C
+
+`run-hammerdb.sh` runs HammerDB's TPROC-C workload (TPC-C derived, stored
+procedures) against ByteCaskDB and InnoDB, using the same `bytecaskdb.cnf` and
+`innodb.cnf` as the sysbench runs. It builds the schema once per engine, keeps
+a copy of the data directory, and restores that copy before every
+virtual-user count, so each cell starts from the same database. Results go to
+`hammerdb_results.csv`: NOPM and TPM from HammerDB, plus the same I/O and
+memory columns as the sysbench runs, sampled over the measured window only.
+
+HammerDB is not packaged by most distributions. Unpack a release tarball from
+<https://github.com/TPC-Council/HammerDB/releases> into `~/HammerDB-<version>`,
+or pass `--hammerdb-home`.
+
+TPROC-C contends on a few hot rows: every Payment updates its warehouse row,
+and every New-Order increments a district's next order id. InnoDB makes those
+transactions wait for each other. ByteCaskDB aborts all but one of them at
+`COMMIT` with 1213, and HammerDB drops the aborted transaction and starts the
+next one. NOPM counts only committed new orders. The `aborts` column counts the
+dropped transactions.
+
+```bash
+# 20 warehouses, 16 virtual users, 2 min ramp-up, 5 min measured (defaults)
+./bytecaskdb-mariadb-plugin/benchmarks/run-hammerdb.sh --data-root=/mnt/bench
+
+# Several virtual-user counts. --reuse-data keeps the built schema at exit and
+# reuses it on the next run instead of rebuilding it.
+./bytecaskdb-mariadb-plugin/benchmarks/run-hammerdb.sh --warehouses=50 --vus=8,16,32 --data-root=/mnt/bench --reuse-data
+```
+
 ---
 
 _Tested on AMD Ryzen 7 3700X (8C/16T), Samsung SSD 860 EVO SATA (469 MiB/s read, 450 MiB/s write), 31 GiB RAM. Each result is the mean of a single 10s sysbench run._
