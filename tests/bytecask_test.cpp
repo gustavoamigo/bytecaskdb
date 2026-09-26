@@ -3140,6 +3140,19 @@ TEST_CASE("vacuum keeps a tombstone-only file that shadows an older put",
   }
 }
 
+TEST_CASE("tombstone_size counts Delete and RangeDel only",
+          "[vacuum][tombstone][filestats]") {
+  using bytecask::EntryType;
+  using bytecask::entry_size;
+  using bytecask::tombstone_size;
+  CHECK(tombstone_size(EntryType::Delete, 3, 0) == entry_size(3, 0));
+  // A range tombstone's value is the range's end key.
+  CHECK(tombstone_size(EntryType::RangeDel, 3, 4) == entry_size(3, 4));
+  CHECK(tombstone_size(EntryType::Put, 3, 4) == 0);
+  CHECK(tombstone_size(EntryType::BulkBegin, 0, 0) == 0);
+  CHECK(tombstone_size(EntryType::BulkEnd, 0, 0) == 0);
+}
+
 // Tombstones are kept by every compaction, so they count as kept bytes when
 // vacuum measures fragmentation: a file of nothing but tombstones has nothing
 // to reclaim, is never selected, and a vacuum-to-convergence loop ends.

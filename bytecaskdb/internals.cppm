@@ -195,16 +195,9 @@ export inline constexpr auto tombstone_size(EntryType type,
                                             std::size_t key_size,
                                             std::size_t value_size)
     -> std::uint64_t {
-  switch (type) {
-  case EntryType::Delete:
-  case EntryType::RangeDel:
-    return entry_size(key_size, value_size);
-  case EntryType::Put:
-  case EntryType::BulkBegin:
-  case EntryType::BulkEnd:
-    return 0;
-  }
-  return 0;
+  const bool tombstone =
+      type == EntryType::Delete || type == EntryType::RangeDel;
+  return tombstone ? entry_size(key_size, value_size) : 0;
 }
 
 // Forward declaration — defined in bytecask.cppm (primary interface).
