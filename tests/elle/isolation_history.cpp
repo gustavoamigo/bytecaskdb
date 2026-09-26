@@ -552,14 +552,20 @@ struct Node {
   fs::path dir;
   bytecask::Options opts; // follower options; node 0 first opens as leader
   std::shared_mutex gate;
-  std::atomic<bool> exclusive_wanted{false};
+  // NodeExclusive holders and waiters. A count, not a flag: a holder that
+  // cleared a flag on release while another was still waiting let readers
+  // back in, and glibc's reader-preferring rwlock then starved the waiter
+  // for good, since the readers were waiting on data only it would ingest.
+  std::atomic<int> exclusive_wanted{0};
   std::unique_ptr<DbHolder> holder; // null while not bootstrapped
+  // Where replicate() last gave up on an iteration, for the stuck report.
+  std::atomic<int> repl_stall{0};
 };
 
 // A shared lock on the node's gate if it has a DB and nobody is waiting for
 // it exclusively; an empty lock otherwise.
 auto enter(Node &n) -> std::shared_lock<std::shared_mutex> {
-  if (n.exclusive_wanted.load(std::memory_order_acquire)) return {};
+  if (n.exclusive_wanted.load(std::memory_order_acquire) > 0) return {};
   std::shared_lock<std::shared_mutex> g{n.gate};
   if (!n.holder) return {};
   return g;
@@ -568,12 +574,12 @@ auto enter(Node &n) -> std::shared_lock<std::shared_mutex> {
 class NodeExclusive {
 public:
   explicit NodeExclusive(Node &n) : n_{n} {
-    n_.exclusive_wanted.store(true, std::memory_order_release);
+    n_.exclusive_wanted.fetch_add(1, std::memory_order_acq_rel);
     lk_ = std::unique_lock<std::shared_mutex>{n_.gate};
   }
   ~NodeExclusive() {
     lk_.unlock();
-    n_.exclusive_wanted.store(false, std::memory_order_release);
+    n_.exclusive_wanted.fetch_sub(1, std::memory_order_acq_rel);
   }
   NodeExclusive(const NodeExclusive &) = delete;
   auto operator=(const NodeExclusive &) -> NodeExclusive & = delete;
@@ -766,19 +772,24 @@ auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
     }
     auto g = enter(n);
     if (!g.owns_lock()) {
+      n.repl_stall.store(1, std::memory_order_relaxed);
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
       continue;
     }
     auto v = view.get();
     const auto src = at(v.source, n.id);
     if (src < 0) {
+      n.repl_stall.store(2, std::memory_order_relaxed);
       g.unlock();
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
       continue;
     }
     auto &sn = *nodes[static_cast<std::size_t>(src)];
     auto sg = enter(sn);
-    if (!sg.owns_lock()) continue;
+    if (!sg.owns_lock()) {
+      n.repl_stall.store(3, std::memory_order_relaxed);
+      continue;
+    }
     auto &fdb = n.holder->db;
     auto &leader = sn.holder->db;
     try {
@@ -789,8 +800,11 @@ auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
       }
       auto from = fdb.durable_sequence();
       if (leader.durable_sequence(from + 1, std::chrono::milliseconds(20)) <=
-          from)
+          from) {
+        n.repl_stall.store(4, std::memory_order_relaxed);
         continue;
+      }
+      n.repl_stall.store(5, std::memory_order_relaxed);
       if (rng() % 10 == 0 && from > 0) {
         from -= std::min<std::uint64_t>(from, 1 + rng() % 32);
         stats.duplicates.fetch_add(1, std::memory_order_relaxed);
@@ -1395,10 +1409,16 @@ auto run(const RunOptions &o) -> int {
                                   static_cast<int>(e.entry_type));
             ++count;
           }
+          auto v = view.get();
           cluster.error(std::format(
               "node {}: stuck at durable sequence {} below the leader's {} "
-              "(node {}) after 20s; changes_since yields {} entries:{}",
-              i, at_seq, target, final_leader, count, head));
+              "(node {}) after 20s; changes_since yields {} entries:{}; "
+              "source {} serving {} stall {} wanted {} leader-wanted {}",
+              i, at_seq, target, final_leader, count, head,
+              at(v.source, i),
+              v.serving[static_cast<std::size_t>(i)] ? 1 : 0,
+              node(i).repl_stall.load(), node(i).exclusive_wanted.load(),
+              node(final_leader).exclusive_wanted.load()));
           break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));

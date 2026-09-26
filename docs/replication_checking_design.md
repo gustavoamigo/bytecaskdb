@@ -195,7 +195,13 @@ Step 2 as built:
   node can change role without new threads. Each node sits behind a gate:
   a topology change takes it exclusively, which waits for the ingest or
   read in flight on that node. The replication thread reads the view with
-  the gate held, so a re-target never races an ingest. The degrade nemesis
+  the gate held, so a re-target never races an ingest. Readers back off
+  while anyone waits for the gate exclusively, and that wait is a count,
+  not a flag. With a flag, a drain releasing the gate cleared it while a
+  follower's restart was still waiting. Readers came back in, each held the
+  gate through a session wait on data only that follower would ingest, and
+  glibc's reader-preferring rwlock starved the restart for good: about one
+  run in 60 ended with a follower stuck below the final leader. The degrade nemesis
   is off: a leader that steps down or is promoted is not also degraded.
 - Once every follower is up, an orchestrator applies an event every
   100–400 ms, planned or unplanned with equal odds. A planned transfer
