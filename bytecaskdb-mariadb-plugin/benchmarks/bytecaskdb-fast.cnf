@@ -1,0 +1,39 @@
+# ByteCaskDB tuned for HammerDB TPROC-C throughput (NOPM), used by
+# --profile=fast.
+#
+# Durability: a commit survives a mariadbd crash but not an OS crash or power
+# loss — it is written to the data file at commit and synced about once a
+# second, like InnoDB's innodb_flush_log_at_trx_commit = 2. Unlike
+# bytecaskdb.cnf, the rest is tuned too, with the same memory budget as
+# innodb-fast.cnf: sized for ~70 warehouses on a 31 GiB host running one engine
+# at a time.
+[mariadbd]
+# Durability: the equivalent of innodb-fast.cnf's flush_log_at_trx_commit = 2.
+bytecaskdb_sync                           = AT_INTERVAL
+bytecaskdb_sync_interval_ms               = 1000
+
+# Memory: the same 16 GiB as innodb_buffer_pool_size. It holds the whole
+# dataset (~7 GB at 70 warehouses, growing with inserted orders and with
+# superseded row versions until vacuum reclaims them). No O_DIRECT: pool misses
+# are filled through the page cache, which backs the pool as a second-level
+# cache, as it does for innodb-fast.cnf.
+bytecaskdb_io_backend                     = buffer_pool
+bytecaskdb_buffer_pool_size               = 17179869184
+bytecaskdb_buffer_pool_direct_io          = OFF
+bytecaskdb_max_file_bytes                 = 67108864
+
+# Reads: skip the per-value CRC, as the other engine benchmarks here do.
+bytecaskdb_verify_checksums               = OFF
+
+# Vacuum: rewrite a file only once most of it is dead, so a short run spends
+# its disk bandwidth on commits rather than compaction.
+bytecaskdb_vacuum_fragmentation_threshold = 0.9
+bytecaskdb_vacuum_busy_interval_ms        = 1000
+bytecaskdb_vacuum_idle_interval_ms        = 30000
+
+performance_schema                        = OFF
+skip-log-bin
+sync_binlog                               = 0
+table_open_cache                          = 2000
+thread_cache_size                         = 32
+max_connections                           = 64

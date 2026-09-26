@@ -72,6 +72,36 @@ jemalloc_library() {
   echo "$lib"
 }
 
+# Echoes the option file an engine starts with under a durability profile.
+#   acid — <engine>.cnf: every commit is durable before it returns.
+#   fast — <engine>-fast.cnf, a complete file of its own: a commit survives a
+#          mariadbd crash but not an OS crash.
+# Callers validate the profile first (check_profile).
+engine_defaults_file() {
+  local engine="$1" profile="$2"
+  if [[ "$profile" == fast ]]; then
+    echo "$SCRIPT_DIR/$engine-fast.cnf"
+  else
+    echo "$SCRIPT_DIR/$engine.cnf"
+  fi
+}
+
+# Exits unless the profile is known and every engine has the files it needs.
+check_profile() {
+  local profile="$1"; shift
+  case "$profile" in
+    acid|fast) ;;
+    *) echo "ERROR: unknown --profile=$profile (acid, fast)" >&2; exit 1 ;;
+  esac
+  local engine
+  for engine in "$@"; do
+    if [[ "$profile" == fast && ! -f "$SCRIPT_DIR/$engine-fast.cnf" ]]; then
+      echo "ERROR: --profile=fast but $SCRIPT_DIR/$engine-fast.cnf does not exist" >&2
+      exit 1
+    fi
+  done
+}
+
 # Wipes and re-initialises an instance's data directory. Split out of
 # start_mariadbd so a caller can prepare a dataset once and then start and
 # stop the server repeatedly against it without destroying it.
