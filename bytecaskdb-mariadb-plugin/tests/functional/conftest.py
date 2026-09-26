@@ -60,9 +60,11 @@ def root_user_args():
 
 
 class MariaDBServer:
-    def __init__(self):
+    def __init__(self, dir_name=TEST_DIR_NAME, port=MARIADB_PORT, extra_args=()):
         self.root = _find_bytecask_root()
-        self.test_dir = os.path.join(self.root, TEST_DIR_NAME)
+        self.port = port
+        self.extra_args = list(extra_args)
+        self.test_dir = os.path.join(self.root, dir_name)
         self.data_dir = os.path.join(self.test_dir, "data")
         self.socket_path = os.path.join(self.test_dir, "mysql.sock")
         self.pid_file = os.path.join(self.test_dir, "mariadbd.pid")
@@ -102,13 +104,14 @@ class MariaDBServer:
                 "mariadbd",
                 f"--datadir={self.data_dir}",
                 f"--socket={self.socket_path}",
-                f"--port={MARIADB_PORT}",
+                f"--port={self.port}",
                 f"--pid-file={self.pid_file}",
                 "--skip-grant-tables",
                 f"--tmpdir={self.test_dir}/tmp",
                 f"--plugin-dir={self.plugin_dir}",
                 f"--plugin-load-add=bytecaskdb=ha_bytecaskdb.so",
                 f"--log-error={self.log_file}",
+                *self.extra_args,
                 *as_root,
             ],
             stdout=subprocess.DEVNULL,

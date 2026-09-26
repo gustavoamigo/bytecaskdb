@@ -179,6 +179,23 @@ static MYSQL_SYSVAR_ULONG(vacuum_idle_interval_ms,
     nullptr, update_vacuum_idle_interval_ms,
     30000, 100, 86400UL * 1000, 0);
 
+// A value from the option file or command line is written straight into the
+// backing variable before the plugin initialises; only SET GLOBAL runs the
+// update callbacks. Without this the atomics would keep their compiled-in
+// defaults while SHOW VARIABLES reported the configured value.
+static void publish_startup_sysvars() {
+  bytecaskdb::g_bulk_copy_flush_bytes.store(sysvar_bulk_copy_flush_bytes,
+                                            std::memory_order_relaxed);
+  bytecaskdb::g_verify_checksums.store(sysvar_verify_checksums,
+                                       std::memory_order_relaxed);
+  bytecaskdb::g_vacuum_fragmentation_threshold.store(
+      sysvar_vacuum_fragmentation_threshold, std::memory_order_relaxed);
+  bytecaskdb::g_vacuum_busy_interval_ms.store(sysvar_vacuum_busy_interval_ms,
+                                              std::memory_order_relaxed);
+  bytecaskdb::g_vacuum_idle_interval_ms.store(sysvar_vacuum_idle_interval_ms,
+                                              std::memory_order_relaxed);
+}
+
 static struct st_mysql_sys_var *bytecaskdb_system_variables[] = {
     MYSQL_SYSVAR(io_backend),
     MYSQL_SYSVAR(buffer_pool_size),
@@ -857,6 +874,7 @@ static void bytecaskdb_end_backup() {
 static int bytecaskdb_init(void *p) {
   auto *hton = static_cast<handlerton *>(p);
   bytecaskdb_hton = hton;
+  publish_startup_sysvars();
 
   hton->create                   = bytecaskdb_create_handler;
   hton->commit                   = bytecaskdb_commit;
