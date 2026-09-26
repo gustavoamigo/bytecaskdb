@@ -436,54 +436,11 @@ Benchmarks on a 22-vCPU instance (50k keys, 1 KiB random values):
 
 Throughput scales near-linearly with thread count for read-heavy workloads.
 
-#### Read consistency (`ReadOptions`)
+#### Read consistency
 
-`ReadOptions` controls consistency behaviour for read operations (`get`, `contains_key`). ByteCaskDB provides two read consistency modes, controlled by a single field:
+A read (`get`, `contains_key`, the iterators, `snapshot()`) sees every write that returned before the read began, and every write another read has already seen, on any thread. There is no option to relax this. `ReadOptions` carries only `verify_checksums`.
 
-```cpp
-struct ReadOptions {
-  std::chrono::milliseconds staleness_tolerance{0};
-};
-```
-
-The two modes follow the same naming conventions used by Azure Cosmos DB and distributed systems literature:
-
-| Mode | `staleness_tolerance` | Same-thread `put` → `get` | Cross-thread staleness | Hot-path cost |
-|------|----------------------|--------------------------|------------------------|---------------|
-| **Session** (default) | `0` | Always sees the put. Refreshes whenever a publication is in progress or has completed since the cache was filled, including one just performed by this thread. | None for a write that has returned or that any reader has already seen. A read that overlaps the publication itself may miss it (see below). | Two `MOV`s + integer compares when cached |
-| **Bounded staleness** | `> 0` | **May not see the put.** If a previous write occurred within `staleness_tolerance`, the cached snapshot is returned — even for the thread that just called `put()`. | Up to `staleness_tolerance` after each write. | Single `MOV` + integer compare when cached |
-
-This is analogous to RocksDB's built-in `SuperVersion` thread-local caching, which always provides session consistency with no user-facing knob. ByteCaskDB adds bounded staleness as an opt-in for write-heavy workloads where read throughput matters more than freshness.
-
-The thread-local cache is keyed by the owning `DB` instance (a raw pointer
-comparison), not just by write timestamp. A thread that reads from more than
-one `DB` in the same process switches cache targets transparently — the
-first read against a different instance always refreshes, regardless of
-`staleness_tolerance` (BC-243). This costs one pointer compare on the hot
-path and only matters in practice for processes that open multiple `DB`s
-and read from them on the same thread (e.g. tests, or a service that shards
-across directories).
-
-##### Session consistency (`staleness_tolerance = 0`, default)
-
-The default mode. The thread-local snapshot is refreshed whenever any write has occurred — the reader compares the writer's timestamp against its cached timestamp and refreshes if they differ. This guarantees **read-your-writes** on the same thread: a `put()` followed by a `get()` always observes the put.
-
-Cross-thread writes are visible within nanoseconds (the two-store gap described below). For all practical purposes, this mode behaves like the latest committed state.
-
-##### Bounded staleness (`staleness_tolerance > 0`)
-
-The thread-local snapshot is refreshed only when the last write is older than `staleness_tolerance`. The same-thread read-your-writes guarantee does **not** hold: a `put()` immediately followed by a `get()` may return a stale snapshot.
-
-Example with `staleness_tolerance = 100ms`:
-
-```
-t=0 ms   put("a", "v1")   → state_time_ = T0, tl refreshes, tl.last_write_time = T0
-t=50 ms  put("b", "v2")   → state_time_ = T1 (T1 − T0 = 50ms)
-t=50 ms  get("b")          → wt = T1, T1 − T0 = 50ms ≤ 100ms → condition false
-                              ↳ returns stale snapshot; "b" not found
-```
-
-Use this mode when write throughput is high and readers can tolerate bounded staleness. At high thread counts, avoiding the `atomic<shared_ptr>` internal spinlock on every read yields significant throughput improvements.
+Reads go through a per-thread cache of the engine state, so a read that finds nothing new costs two plain loads and no reference-count traffic on the shared state. The cache entry is keyed by the owning `DB` instance (a raw pointer comparison). A thread that reads from more than one `DB` in the same process switches cache targets transparently: the first read against a different instance always refreshes (BC-243). This costs one pointer compare on the hot path, and only matters in practice for processes that open several `DB`s and read from them on one thread, such as tests or a service that shards across directories.
 
 ##### Mechanism
 
@@ -494,25 +451,20 @@ Every publication passes through one raw store, which brackets the store of the 
            state_.store(S1, seq_cst)                  ← new immutable snapshot
            state_gen_.store(next_state_gen(), release) ← process-wide unique generation
            publishing_.fetch_sub(1, release)
-           state_time_.store(now_ns(), release)       ← (checked publications) for bounded staleness
 
-  Reader, session (tolerance 0):
+  Reader:
            busy = publishing_.load(acquire); gen = state_gen_.load(acquire)   ← two MOVs on x86
            if busy != 0 or gen != tl.gen:
                tl.snapshot = state_.load()            ← refresh (refcount bump)
                tl.gen = busy ? none : gen
            return tl.snapshot
-
-  Reader, bounded staleness (tolerance > 0):
-           wt = state_time_.load(relaxed)
-           if wt - tl.last_write_time > tolerance: refresh, tl.last_write_time = wt
 ```
 
 No clock call on the reader side, no locked instruction, no refcount traffic until a refresh is needed.
 
-##### Why session mode needs more than a timestamp
+##### Why a timestamp was not enough
 
-A timestamp stored after the state cannot tell a reader that a publication it has not yet seen finish is already visible elsewhere. Two failures followed from that, and the Elle isolation check found both:
+The cache used to refresh when a timestamp, `state_time_`, stored after each publication, changed. A timestamp stored after the state cannot tell a reader that a publication it has not yet seen finish is already visible elsewhere. Two failures followed from that, and the Elle isolation check found both:
 
 - **A writer returned inside a publication.** With the commit pipeline, the thread that publishes `S1` is whichever thread holds the flush role. A writer polling `state_` in `commit_wait` could see its write covered and return before the publisher stored `state_time_`. Reads that started after the return, on other threads, then served their cached pre-write state. This was fixed in #180 by advancing `state_time_` in `commit_wait`.
 - **A reader saw a publication another reader then missed.** A reader with nothing cached loads `state_` directly and sees `S1`. A reader on another thread, which starts after the first one has finished, compares timestamps, finds nothing new, and serves its cached `S0`. No writer has returned, so nothing on the write side can close this gap. Elle reported it as `G-single-item-realtime` on the leader in the replication check ([`replication_checking_design.md`](replication_checking_design.md)).
@@ -521,18 +473,11 @@ A timestamp stored after the state cannot tell a reader that a publication it ha
 
 Generations come from a single process-wide counter. A read cache knows its DB only by address, and a new DB can reuse the address of one that was destroyed. A per-DB counter would restart at 0 and could hand the new DB a generation that the cache still holds for the old DB. The cache would then serve the old DB's state. A test sequence that opens a DB at the same stack address in every case reproduced exactly that.
 
-With `staleness_tolerance > 0` the window is irrelevant: the snapshot is held for at least `staleness_tolerance` regardless.
+##### Bounded staleness, removed
 
-**Benchmark results** (22-vCPU, 50k keys, 1 KiB values, 1 background writer, bounded staleness with `tolerance = 100ms` vs session with `tolerance = 0`):
+`ReadOptions::staleness_tolerance` used to let a reader keep its cached state for up to that long after a write, trading freshness for throughput. That included writes made by the same thread. Measured on a 22-vCPU machine against one background writer, it was worth +42% read throughput at 8 threads and +188% at 16 (1.39 M → 1.98 M and 846 k → 2.44 M ops/s), because session readers contend on the spinlock inside `atomic<shared_ptr>` on every refresh.
 
-| Threads | Session ops/s | Bounded Staleness ops/s | Speedup | p99 Session | p99 Bounded Staleness |
-|---------|--------------|------------------------|---------|-------------|----------------------|
-| 2       | 812k         | 791k                   | −3%     | 16.6 µs     | 21.9 µs              |
-| 4       | 1.54 M       | 1.39 M                 | −10%    | 33.0 µs     | 47.2 µs              |
-| 8       | 1.39 M       | 1.98 M                 | +42%    | 193 µs      | 129 µs               |
-| 16      | 846k         | 2.44 M                 | +188%   | 1809 µs     | 536 µs               |
-
-The benefit is pronounced at high thread counts where session-mode readers contend for the internal spinlock inside `atomic<shared_ptr>` on every refresh.
+It was removed. By design it gave up read-your-writes, and the guarantees above are the ones the isolation and replication checks verify. It was also the only reason for a publication timestamp beside the publication counter. A workload that needs the throughput can hold a `Snapshot` for as long as it is willing to read stale data.
 
 `engine_bench` compares ByteCaskDB against LevelDB and RocksDB across Put, Get, Del, Range50, Mixed, MixedBatch, PutMT, and MixedMT benchmarks at both NoSync and Sync durability levels. RocksDB compression is disabled (`kNoCompression`) and values are 1 KiB of random (incompressible) bytes so neither LevelDB nor RocksDB gains an advantage from Snappy/block-cache effects.
 

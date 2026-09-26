@@ -35,7 +35,7 @@ ByteCaskDB follows a **single-writer / multiple-reader (SWMR)** model:
 
 - Exactly one writer may operate at a time (`write_mu_` serialises `put`, `del`, `apply_batch`). Concurrent sync writers are batched via group commit.
 - Multiple readers may operate concurrently, isolated from writes by a persistent snapshot of the key directory loaded via `state_.load()`.
-- `ReadOptions::staleness_tolerance` lets readers trade freshness for throughput: a non-zero tolerance allows reading from a snapshot that is at most that many milliseconds old (bounded staleness). The default (0) provides read-your-writes session consistency.
+- A read sees every write that returned before it began, and every write another read has already seen, on any thread. There is no bounded-staleness option: `ReadOptions::staleness_tolerance` was removed (see *Read consistency* in `bytecask_design.md`).
 - When `sync` is requested, `fdatasync` completes before the new state becomes visible to readers (durability before visibility).
 - MVCC snapshot isolation is provided via `snapshot()` + `apply_batch(WritePlan)`.
 
@@ -159,16 +159,10 @@ struct WriteOptions {
 ## ReadOptions
 
 ```cpp
-// Controls consistency behaviour for get, contains_key, iter_from, keys_from.
+// Options for get, contains_key, iter_from, keys_from. A read sees every
+// write that returned before it began, and every write another read has
+// already seen, on any thread.
 struct ReadOptions {
-    // Maximum age of the cached snapshot before the reader refreshes it.
-    // 0 (default): read-your-writes session consistency — refresh on every write.
-    // > 0: bounded staleness — snapshot may be up to this many milliseconds old.
-    //      Useful for write-heavy workloads where read throughput matters more
-    //      than freshness. The staleness check is a single relaxed load (no lock,
-    //      no clock read on the reader side).
-    std::chrono::milliseconds staleness_tolerance{0};
-
     // When true, CRC32 is verified for every value read from disk.
     // Default true for data integrity; disable for higher throughput when
     // silent corruption detection is not required.
@@ -419,7 +413,7 @@ while (!stop_requested) {
 | D6 | **`KeyIterator` source**: In-memory only — walks the in-memory key directory without opening any data file. |
 | D7 | **`del` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |
 | D8 | **Error handling during iteration**: Throw `std::system_error` on I/O failure (consistent with D1). |
-| D9 | **Concurrency model**: SWMR — exactly one writer at a time; reads are concurrent. Concurrent sync writers are batched via group commit. `ReadOptions::staleness_tolerance` enables bounded-staleness reads. |
+| D9 | **Concurrency model**: SWMR — exactly one writer at a time; reads are concurrent. Concurrent sync writers are batched via group commit. |
 | D10 | **Vacuum**: Online. `vacuum()` is safe to call from a background thread. Only the brief commit step (key-dir remap + file swap) blocks writers via `write_mu_`. A separate `vacuum_mu_` serialises concurrent `vacuum()` calls. |
 | D11 | **File naming**: `data_{YYYYMMDDHHmmss}_{RRRRRRRR}_V{XX}`. Timestamp is UTC second precision — a human-readable creation-time hint, not content age (compaction produces new files with old entries). `RRRRRRRR` is a 4-byte random hex salt for collision avoidance. `V{XX}` is the file format version (`V01` initially). Filename ordering carries no semantic meaning; entry sequence numbers are authoritative. |
 | D12 | **Hint file atomicity**: Write to `*.hint.tmp`, `fdatasync`, then atomically `rename(2)` to `*.hint`. A `.hint.tmp` file found at startup is discarded. |

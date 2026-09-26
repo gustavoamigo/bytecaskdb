@@ -167,26 +167,9 @@ export struct CommitResult {
   bool durable{false};
 };
 
-// Controls consistency behaviour for read operations (get, contains_key).
-// Two modes:
-//   Session (default, staleness_tolerance = 0): read-your-writes guaranteed.
-//     Thread-local snapshot refreshes whenever any write occurs.
-//   Bounded staleness (staleness_tolerance > 0): snapshot may be up to
-//     staleness_tolerance old. Same-thread put→get may return stale data.
-//     Use for write-heavy workloads where read throughput matters more than
-//     freshness.
+// Options for read operations. A read sees every write that returned before
+// it began, and every write another read has already seen, on any thread.
 export struct ReadOptions {
-  // Maximum age of the cached snapshot before the reader refreshes it.
-  // 0 (default): refresh on every write — session consistency.
-  // > 0: refresh only when the last write is older than this value —
-  //      bounded staleness.
-  // The writer timestamps each state publication with steady_clock::now();
-  // the reader compares that timestamp via a cheap relaxed load, never
-  // calling the clock itself. The hot path is a single relaxed load of an
-  // int64_t (plain MOV on x86) — no refcount traffic, no locked
-  // instructions, no clock read on the reader side.
-  std::chrono::milliseconds staleness_tolerance{0};
-
   // When true (default), all data read from underlying storage is verified
   // against its CRC32 checksum. Set to false for higher read throughput at
   // the cost of silent corruption detection.
@@ -799,7 +782,6 @@ inline auto next_state_gen() -> std::uint64_t {
 struct ReadCacheEntry {
   const DB *owner{nullptr};  // compared, never dereferenced
   std::shared_ptr<const EngineState> state;
-  std::int64_t last_write_time{0};
   // state_gen_ when state was loaded with no publication in progress;
   // kNoStateGen otherwise, which never matches.
   std::uint64_t gen{kNoStateGen};
@@ -1203,14 +1185,15 @@ private:
   // Appends live entries from a sealed file into the active file, then removes the sealed file.
   void vacuum_remove_file(std::uint32_t file_id);
 
-  // State access helpers — raw state_ / state_time_ access is confined here.
+  // State access helpers — raw state_ access is confined here.
   // Per-thread read cache behind load_state_for_read (see ReadCacheSlot).
   // One function-local thread_local slot shared by every DB the thread
   // touches, so its entry records its owner.
   [[nodiscard]] static auto read_cache() -> ReadCacheSlot &;
   // Claims this thread's slot and returns the guard; the entry behind it
-  // holds this DB's state, refreshed when the staleness rule says so.
-  [[nodiscard]] auto load_state_for_read(const ReadOptions &opts) const
+  // holds this DB's state, refreshed if a publication is in progress or has
+  // completed since the entry was filled.
+  [[nodiscard]] auto load_state_for_read() const
       -> ReadStateGuard;
   // Publishes reclaim: bumps the scrape epoch and frees the entries of
   // slots idle for kReadCacheIdleEpochs epochs. Rate-limited to one in
@@ -1416,12 +1399,8 @@ private:
   // available in all libc++ versions (e.g. Homebrew LLVM). Use the C++11
   // free-function overloads instead.
   std::shared_ptr<EngineState> state_;
-  // Written (release) by the checked store_state with steady_clock::now().
-  // Bounded-staleness readers compare it against their cached timestamp.
-  std::atomic<std::int64_t> state_time_{0};
-  // Session-mode readers (staleness_tolerance 0) serve their cached state
-  // only while publishing_ is 0 and state_gen_ is the value they cached it
-  // under. Both are maintained by the raw store_state; generations are
+  // Readers serve their cached state only while publishing_ is 0 and
+  // state_gen_ is the value they cached it under. Both are maintained by the raw store_state; generations are
   // unique across DB instances (next_state_gen).
   std::atomic<std::uint32_t> publishing_{0};
   std::atomic<std::uint64_t> state_gen_{0};
@@ -1810,14 +1789,6 @@ auto make_data_file_stem() -> std::string {
   return std::format("data_{:04d}{:02d}{:02d}{:02d}{:02d}{:02d}_{:016x}_V01",
                      tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
                      tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, salt);
-}
-
-// Nanoseconds since steady_clock epoch. Timestamps state publications;
-// readers compare against this with a single relaxed load (plain MOV on x86).
-auto now_ns() -> std::int64_t {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
 }
 
 } // namespace
@@ -2617,7 +2588,7 @@ auto DB::get(const ReadOptions &opts, BytesView key,
   // The guard, not a copy of the state: copying it is a read-modify-write
   // on a control block every reader shares — the line that capped
   // concurrent gets before the read did.
-  const auto s = load_state_for_read(opts);
+  const auto s = load_state_for_read();
 #ifdef BYTECASK_KEYDIR_BLIND
   // The read that confirms the key is the read of the value.
   if (!kd_read_value(s->key_dir, key, s->kd_ctx(opts.verify_checksums), out))
@@ -2679,7 +2650,7 @@ auto DB::del_range(const WriteOptions &opts, BytesView from,
 }
 
 auto DB::contains_key(const ReadOptions& opts, BytesView key) const -> bool {
-  const auto s = load_state_for_read(opts);
+  const auto s = load_state_for_read();
   return kd_contains(s->key_dir, key, s->kd_ctx(opts.verify_checksums));
 }
 
@@ -2688,8 +2659,7 @@ auto DB::contains_key(const ReadOptions& opts, BytesView key) const -> bool {
 #pragma region Snapshot and apply_batch
 
 auto DB::snapshot() const -> Snapshot {
-  ReadOptions opts{};
-  return Snapshot{load_state_for_read(opts).state(), size_limits_};
+  return Snapshot{load_state_for_read().state(), size_limits_};
 }
 
 // The single write path. Routes to either write_group_ (default) or
@@ -3205,7 +3175,7 @@ auto Snapshot::rkeys_from(const ReadOptions& /*opts*/, BytesView from) const
 // Throws std::system_error on I/O failure.
 auto DB::iter_from(const ReadOptions &opts, BytesView from) const
     -> std::ranges::subrange<EntryIterator, std::default_sentinel_t> {
-  auto s = load_state_for_read(opts);
+  auto s = load_state_for_read();
   auto it = kd_value_lower_bound(s->key_dir, from, s->kd_ctx());
   return std::ranges::subrange<EntryIterator, std::default_sentinel_t>{
       EntryIterator{s.state(), std::move(it), opts.verify_checksums},
@@ -3214,9 +3184,9 @@ auto DB::iter_from(const ReadOptions &opts, BytesView from) const
 
 // Returns an input range of keys >= from. Walks the in-memory key directory
 // only; no disk I/O.
-auto DB::keys_from(const ReadOptions &opts, BytesView from) const
+auto DB::keys_from(const ReadOptions & /*opts*/, BytesView from) const
     -> std::ranges::subrange<KeyIterator, std::default_sentinel_t> {
-  auto s = load_state_for_read(opts);
+  auto s = load_state_for_read();
   auto it = from.empty() ? kd_begin(s->key_dir, s->kd_ctx())
                          : kd_lower_bound(s->key_dir, from, s->kd_ctx());
   return std::ranges::subrange<KeyIterator, std::default_sentinel_t>{
@@ -3225,16 +3195,16 @@ auto DB::keys_from(const ReadOptions &opts, BytesView from) const
 
 auto DB::riter_from(const ReadOptions &opts, BytesView from) const
     -> std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t> {
-  auto s = load_state_for_read(opts);
+  auto s = load_state_for_read();
   auto it = kd_value_rlower_bound(s->key_dir, from, s->kd_ctx());
   return std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t>{
       ReverseEntryIterator{s.state(), std::move(it), opts.verify_checksums},
       std::default_sentinel};
 }
 
-auto DB::rkeys_from(const ReadOptions &opts, BytesView from) const
+auto DB::rkeys_from(const ReadOptions & /*opts*/, BytesView from) const
     -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator> {
-  auto s = load_state_for_read(opts);
+  auto s = load_state_for_read();
   auto begin_it = from.empty()
       ? kd_end(s->key_dir, s->kd_ctx())
       : kd_upper_bound(s->key_dir, from, s->kd_ctx());
@@ -4026,12 +3996,10 @@ auto DB::create_manifest() -> FileManifest {
 }
 
 // Returns the engine state from a thread-local cache (read path only).
-// The hot path is three plain loads (state_time_, publishing_, state_gen_;
-// MOVs on x86) plus an owner-pointer compare. Session mode (tolerance 0)
-// refreshes whenever a publication is in progress or has completed since
-// the cache was filled; bounded staleness refreshes when the last write
-// timestamp exceeds the tolerance. An entry holding a different DB
-// instance's state is always refreshed. Returns a
+// The hot path is two plain loads (publishing_, state_gen_; MOVs on x86)
+// plus an owner-pointer compare. The entry is refreshed whenever a
+// publication is in progress or has completed since it was filled, and
+// whenever it holds a different DB instance's state. Returns a
 // reference to the thread-local snapshot. The snapshot stays alive until
 // the same thread calls load_state_for_read again, so callers must not
 // stash the reference across a second load_state_for_read call.
@@ -4045,7 +4013,7 @@ auto DB::read_cache() -> ReadCacheSlot & {
   return tl;
 }
 
-auto DB::load_state_for_read(const ReadOptions &opts) const
+auto DB::load_state_for_read() const
     -> ReadStateGuard {
   auto &slot = read_cache();
   auto *e = slot.claim();
@@ -4060,30 +4028,17 @@ auto DB::load_state_for_read(const ReadOptions &opts) const
       e->state.reset();
     }
     e->owner = this;
-    e->last_write_time = 0;
     e->gen = kNoStateGen;
   }
-  const auto wt = state_time_.load(std::memory_order_relaxed);
-  const auto tolerance =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          opts.staleness_tolerance)
-          .count();
-  if (tolerance <= 0) {
-    // Session mode. A read must see every state published before it began,
-    // and every state another thread has already seen: a timestamp stored
-    // after the state cannot tell a reader that a publication it has not
-    // finished is already visible to others. publishing_ can.
-    const auto busy = publishing_.load(std::memory_order_acquire);
-    const auto gen = state_gen_.load(std::memory_order_acquire);
-    if (busy != 0 || gen != e->gen) {
-      e->state = load_state();
-      e->last_write_time = wt;
-      e->gen = busy != 0 ? kNoStateGen : gen;
-    }
-  } else if (wt - e->last_write_time > tolerance) {
+  // A read must see every state published before it began, and every state
+  // another thread has already seen: a marker stored after the state could
+  // not tell a reader that a publication it has not seen finish is already
+  // visible to others. publishing_ can (see the raw store_state).
+  const auto busy = publishing_.load(std::memory_order_acquire);
+  const auto gen = state_gen_.load(std::memory_order_acquire);
+  if (busy != 0 || gen != e->gen) {
     e->state = load_state();
-    e->last_write_time = wt;
-    e->gen = kNoStateGen;
+    e->gen = busy != 0 ? kNoStateGen : gen;
   }
   e->used_epoch.store(ReadCacheRegistry::instance().epoch(),
                       std::memory_order_relaxed);
@@ -4199,7 +4154,6 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
 #endif
 
   store_state(std::move(new_state));
-  state_time_.store(now_ns(), std::memory_order_release);
 
   // The version this publish superseded is freed once nothing holds it;
   // an idle thread's read cache is the holder nothing else can reach.
@@ -4219,7 +4173,6 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
 void DB::store_initial_state(std::shared_ptr<EngineState> s) {
   store_head(s);
   store_state(std::move(s));
-  state_time_.store(now_ns(), std::memory_order_release);
 }
 
 void DB::validate_state_consistency(const EngineState &s) const {

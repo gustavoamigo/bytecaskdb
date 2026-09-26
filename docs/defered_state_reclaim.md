@@ -37,7 +37,7 @@ Where the last reference is dropped today, in the single-connection
    copy goes out of scope — *not* inside `store_state`, because `current` is
    still alive when the new state is published.
 2. **The reader**, inside `load_state_for_read`, when the thread-local cache
-   is refreshed (`staleness_tolerance == 0` → refresh on every write) and
+   is refreshed (on every publication) and
    that thread's cache held the last reference. This is the dominant site in
    the profile.
 

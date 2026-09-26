@@ -250,10 +250,9 @@ struct WriteOptions {
     bool solo{false};     // bypass group commit — route to solo writer (for benchmarking)
 };
 
+// A read sees every write that returned before it began, and every write any
+// other read has already seen, on any thread.
 struct ReadOptions {
-    // staleness_tolerance == 0 (default): refresh thread-local snapshot on every write.
-    // staleness_tolerance  > 0: refresh only when the last write is older than this window.
-    std::chrono::milliseconds staleness_tolerance{0};
     bool verify_checksums{true}; // CRC-verify each value read from disk (default true)
 };
 
