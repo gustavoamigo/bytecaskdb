@@ -121,7 +121,10 @@ the script checks, per key:
 - the final value holds every `:ok` append, in ascending commit sequence
   (`:info` elements may appear anywhere, or not at all);
 - no element comes from a `:fail` transaction, none is duplicated, and
-  every element was invoked.
+  every element was invoked;
+- a read sees every append whose transaction completed `:ok` before the
+  reading transaction was invoked (real-time visibility). The first CI run
+  showed why this belongs here as well as in Elle: see *Findings*.
 
 This is a direct check with no inference involved. It also guards the
 harness against an encoding bug that Elle would otherwise read as an
@@ -228,6 +231,29 @@ flush stays degraded" in `tests/bytecask_test.cpp`). On a base that
 includes #170, the failing seed completes in every run. Two harnesses
 built differently reaching the same failure is some evidence that each of
 them reaches this part of the engine.
+
+**An acknowledged write was invisible to other threads for a moment.** The
+first CI run with Elle reported `G-single-item-realtime` in a `guarded`
+history, which was otherwise valid. A transaction invoked after another had
+returned `:ok` read the key from before that write.
+
+Reads go through a per-thread cache that refreshes when `state_time_`
+changes, and a publication stores `state_` and then `state_time_`. With the
+commit pipeline, the thread that publishes is whichever holds the flush
+role. A writer polling in `commit_wait` could see its write covered in
+`state_` and return between those two stores. Until the publisher stored
+`state_time_`, every thread's cached state predated the write. The engine
+already covered the writer's own thread by seeding its cache, but not any
+other thread. `CONTRACT.md` promises that a successful write is visible to
+subsequent reads.
+
+`commit_wait` now advances `state_time_` before it returns a covered write,
+which replaces the seeding. The regression test is "pipeline: a write
+another thread published is visible to every thread once put returns, even
+before state_time_ is stored". It failed 3 of 3 runs without the fix. The
+cross-check gained the real-time rule above. With it, the pre-fix binary
+failed in round 3 of a local run, and the fixed one passed 16 rounds on the
+same seed.
 
 ## Acceptance
 

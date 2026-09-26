@@ -53,23 +53,35 @@ def cross_check(history: list[dict]) -> list[str]:
     Returns a list of violations (empty when the history is clean). Relies on
     the generator's final read of every key after all clients finish, so the
     longest read of a key is its final value.
+
+    Also checks real-time visibility: a read must see every append whose
+    transaction completed :ok before the reading transaction was invoked.
     """
     ok_appends: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
     failed: set[int] = set()
     invoked: set[int] = set()
     reads: dict[int, list[list[int]]] = defaultdict(list)
+    # (invoke index, list read) per key, and (completion index, element) per
+    # key for the real-time check.
+    timed_reads: dict[int, list[tuple[int, list[int]]]] = defaultdict(list)
+    acked: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    invoke_index: dict[int, int] = {}
 
     for op in history:
         appends = [m for m in op["value"] if m[0] == "append"]
         if op["type"] == "invoke":
             invoked.update(m[2] for m in appends)
+            invoke_index[op["process"]] = op["index"]
         elif op["type"] == "ok":
             seq = op.get("sequence", 0)
             for pos, m in enumerate(appends):
                 ok_appends[m[1]].append((seq, pos, m[2]))
+                acked[m[1]].append((op["index"], m[2]))
             for m in op["value"]:
                 if m[0] == "r":
                     reads[m[1]].append(m[2])
+                    timed_reads[m[1]].append(
+                        (invoke_index[op["process"]], m[2]))
         elif op["type"] == "fail":
             failed.update(m[2] for m in appends)
 
@@ -101,6 +113,14 @@ def cross_check(history: list[dict]) -> list[str]:
             problems.append(
                 f"key {key}: final read {final} does not follow commit "
                 f"sequence order of {present}")
+        for started, r in timed_reads[key]:
+            seen = set(r)
+            stale = [e for done, e in acked[key] if done < started and e not in seen]
+            if stale:
+                problems.append(
+                    f"key {key}: read {r} started after appends {stale[:8]} "
+                    f"were acknowledged but does not see them")
+                break
     return problems
 
 
