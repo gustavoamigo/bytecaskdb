@@ -18,7 +18,6 @@ bytecaskdb_sync_interval_ms               = 1000
 # are filled through the page cache, which backs the pool as a second-level
 # cache, as it does for innodb-fast.cnf.
 bytecaskdb_io_backend                     = buffer_pool
-# bytecaskdb_io_backend                     = mmap
 bytecaskdb_buffer_pool_size               = 17179869184
 bytecaskdb_buffer_pool_direct_io          = OFF
 bytecaskdb_max_file_bytes                 = 67108864
