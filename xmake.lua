@@ -321,6 +321,21 @@ target("crash_consistency")
         add_release_opts(t)
     end)
 
+-- Isolation history generator for Elle. See docs/isolation_checking_design.md.
+-- BYTECASK_TESTING exposes the fault injector the degrade nemesis arms.
+target("isolation_history")
+    set_kind("binary")
+    set_default(false)
+    add_files("tests/elle/isolation_history.cpp", "bytecaskdb/*.cppm")
+    add_includedirs("bytecaskdb")
+    add_packages("crc32c")
+    add_defines("BYTECASK_TESTING")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
+
 -- Static library target for out-of-tree consumers (e.g. the MariaDB plugin).
 -- Compiles all C++23 module sources and exposes them via libbytecask.a.
 -- Note: C++23 module BMIs are not portable across translation units that

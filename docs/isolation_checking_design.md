@@ -1,6 +1,6 @@
 # Isolation Checking with Elle
 
-Status: design. Tracks [#94](https://github.com/gustavoamigo/bytecaskdb/issues/94).
+Status: implemented, runs nightly. Tracks [#94](https://github.com/gustavoamigo/bytecaskdb/issues/94).
 Follow-ups that extend this harness: [#178](https://github.com/gustavoamigo/bytecaskdb/issues/178)
 (replication), [#176](https://github.com/gustavoamigo/bytecaskdb/issues/176) (SIGKILL).
 
@@ -86,32 +86,44 @@ plan is built:
 | Config | Plan | Expected |
 |---|---|---|
 | `guarded` | `WritePlan(snap)`, `ensure_unchanged` on every key read but not appended | Valid under `strict-serializable` |
-| `unguarded` | `WritePlan(snap)`, no `ensure_unchanged` | Valid under `snapshot-isolation`. Under `strict-serializable`, the only reported anomalies are `G2-item` / `G2-item-realtime` |
-| `blind` | Read with `db.get`, write with a snapshot-less `WritePlan()` | Reports `lost-update` |
+| `unguarded` | `WritePlan(snap)`, no `ensure_unchanged` | Valid under `strong-snapshot-isolation`. Under `strict-serializable`, the only reported anomalies are `G2-item` variants |
+| `blind` | Read with `db.get`, write with a snapshot-less `WritePlan()` | Invalid: committed appends go missing |
 
 `guarded` is the claim under test. `unguarded` and `blind` show that the
-harness can see anomalies. A harness that reports nothing in every
+harness can see anomalies. `blind` has no W-W check, so two appends that
+read the same list overwrite each other. Elle names that in several ways
+(incompatible order, G-single, lost update, depending on which reads
+witness it), so the script requires only that the history is invalid; the
+cross-check below reports the missing appends directly. A harness that reports nothing in every
 configuration is not evidence of anything. `unguarded` also pins the
 boundary: a G1 or G-single there is a bug in the implicit W-W check, not
 expected write skew. Before trusting a run, the harness requires `unguarded`
 to report `G2-item` at least once over the run.
 
-`strict-serializable` rather than plain `serializable`: once `apply_batch`
-returns, a snapshot taken later must see the write (`state_.store()` happens
-before return). Real-time edges check that too. If they prove too strict for
-a legitimate reason, that becomes a documented finding, and the check drops
-to `serializable`.
+`strict-serializable` rather than plain `serializable`, and
+`strong-snapshot-isolation` rather than `snapshot-isolation`: once
+`apply_batch` returns, a snapshot taken later must see the write
+(`state_.store()` happens before return). Real-time edges check that too.
+If they prove too strict for a legitimate reason, that becomes a documented
+finding, and the check drops to the non-real-time model.
 
 ## Commit-sequence cross-check
 
 Elle infers each key's version order from the lists it reads. The engine
 also knows that order: the `CommitResult.sequence` of each `:ok` appending
-transaction. Before calling Elle, the harness checks that, for every key, the
-longest list read is ordered by ascending commit sequence of the transactions
-that appended its elements, with `:info` elements placed wherever they
-appear. This is a direct check with no inference involved. It also guards
-the harness against an encoding bug that Elle would otherwise read as an
-anomaly.
+transaction. After all clients finish, the generator reads every key once
+more, so the longest read of a key is its final value. Before calling Elle,
+the script checks, per key:
+
+- every read is a prefix of the final value;
+- the final value holds every `:ok` append, in ascending commit sequence
+  (`:info` elements may appear anywhere, or not at all);
+- no element comes from a `:fail` transaction, none is duplicated, and
+  every element was invoked.
+
+This is a direct check with no inference involved. It also guards the
+harness against an encoding bug that Elle would otherwise read as an
+anomaly, and it runs without a JVM.
 
 ## Nemeses
 
@@ -120,14 +132,16 @@ Each run draws from these per seed:
 - **Concurrent vacuum.** A thread calls `vacuum()` in a loop, with
   `max_file_bytes` small (16 KiB–1 MiB) so that rotation and compaction run
   under the workload.
-- **Degrade and resume.** A nemesis thread arms a `ScopedFaultInjector` at
-  `io_data_file_sync` and issues its own append with `WriteOptions::solo`.
-  The injector is thread-local, and `solo` keeps that write's I/O on the
-  nemesis thread rather than a group leader's. The engine degrades. Clients
-  record `:info` until the nemesis calls `resume()` after a random delay.
-  Whether the solo path's `fdatasync` runs on the calling thread, given the
-  pipelined commit, has to be confirmed in implementation. If it does not,
-  the nemesis fails `io_data_file_append` instead.
+- **Degrade and resume.** Every 20–200 ms, a nemesis client arms a
+  `ScopedFaultInjector` at `io_data_file_sync` and runs append transactions
+  with `WriteOptions{.sync = true, .solo = true}`. The injector is
+  thread-local. `solo` puts the append on the nemesis thread, but with the
+  pipelined commit the `fdatasync` runs on whichever thread holds the flush
+  role, so the nemesis retries (up to 50 transactions) until its own flush
+  fails and the engine degrades. It then calls `resume()` after 1–20 ms.
+  Its transactions are ordinary history entries. Other clients back off
+  while the engine is degraded, so the history is not flooded with `:info`
+  entries for writes refused at entry.
 - **I/O backend.** `Pread`, `Mmap`, or `BufferPool`, drawn per run.
 
 Replication and SIGKILL are not nemeses here. #178 and #176 add them.
@@ -167,22 +181,58 @@ schedule. Thread interleaving still varies, as kill timing does in the
 crash harness. A failure uploads the history and Elle's output directory,
 which is what a reproduction needs.
 
-**Scale.** 8–32 client threads, 50k transactions per configuration to start.
-The budget is the runtime of `elle-cli`, not of the engine. Raise it once
+**Scale.** 16 client threads by default and 50k transactions per
+configuration. The engine generates a history in about two seconds, so the
+budget is the runtime of `elle-cli`, not of the engine. Raise it once
 nightly timings are known.
 
-**CI.** A new nightly workflow, `isolation-nightly.yml`, runs `release` and
-`asan` jobs, on the same pattern as `crash-nightly.yml`. `elle-cli` has no
-published releases. The job installs Java 21 and Leiningen, builds the
-uberjar at a pinned `elle-cli` commit, and caches the jar keyed on that
-commit. `ci.yml` only compiles `isolation_history`, as it does
-`crash_consistency`.
+**CI.** `isolation-nightly.yml` runs `release` (50k transactions) and
+`asan` (20k) jobs, 4 rounds each, on the same pattern as
+`crash-nightly.yml`. `elle-cli` has no published releases. The job installs
+Java 21 and Leiningen, builds the uberjar at a pinned `elle-cli` commit, and
+caches the jar keyed on that commit. `ci.yml` only compiles
+`isolation_history`, as it does `crash_consistency`.
+
+Run locally:
+
+```
+xmake build isolation_history
+python3 scripts/run_isolation_check.py \
+  --binary build/linux/x86_64/releasedbg/isolation_history \
+  --elle-jar elle-cli.jar --rounds 4
+```
+
+Without `--elle-jar` only the cross-check runs.
+
+## Findings
+
+**A rotation after a failed flush cleared the degrade and hung the engine.**
+The first runs with vacuum and degrade together were on a base without
+#170. They hung in about one run in six. Every client was blocked in
+`wait_published`, waiting for a conflicting write to be published. The
+published state was not degraded, but `flush_error_` was still set.
+
+A batch had passed admission on the healthy state and crossed the rotation
+threshold. It waited in the rotation barrier's `quiesce()` for the
+nemesis's flush, which failed and degraded the engine. The barrier did not
+re-check the published state, so it published a state built on the
+pre-failure head and cleared the degrade. From then on, every `commit_wait`
+rethrew the stale `flush_error_` without flushing, and nothing was
+published again.
+
+The chaos soak had found the same bug independently, and #170 fixed it
+while this harness was being written ("pipeline: rotation behind a failed
+flush stays degraded" in `tests/bytecask_test.cpp`). On a base that
+includes #170, the failing seed completes in every run. Two harnesses
+built differently reaching the same failure is some evidence that each of
+them reaches this part of the engine.
 
 ## Acceptance
 
 - `guarded` is valid under `strict-serializable` on every nightly run.
-- `unguarded` reports only `G2-item` / `G2-item-realtime` (at least once per
-  run), and `blind` reports `lost-update`.
+- `unguarded` is valid under `strong-snapshot-isolation` and reports only
+  `G2-item` variants under `strict-serializable`, at least once per run.
+  `blind` is invalid.
 - The commit-sequence cross-check passes in all three configurations.
 - The seed is printed, and a failure uploads the history.
 - The README's isolation paragraph and `transaction_design.md` cite this
