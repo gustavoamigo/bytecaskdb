@@ -1392,8 +1392,22 @@ MSan test step the slowest of the three and by far the least predictable
 (2m48s and 11m56s on two runs of the same commit, against a steady ~1m50s
 for ASan and TSan; per-job runners vary by ~1.8x and the seeded `[model]`
 workloads account for much of the rest), so it is excluded from the
-`pull_request` matrix and runs on push to `main` and on
+`pull_request` matrix and runs on push to `main`, nightly, and on
 `workflow_dispatch`.
+
+### Sanitizer matrix across key directories
+
+The sanitizer jobs live in `.github/workflows/sanitizers.yml`, which
+`ci.yml` calls. A pull request runs ASan, TSan and UBSan on the default
+blind-leaf key directory. Push to `main` and the nightly schedule run the
+full matrix: `{blind, btree, radix}` (`BYTECASK_KEYDIR`) ×
+`{address, thread, memory, undefined}`, twelve jobs. The two non-default
+trees share their inner nodes and `BuildSession` with the default, so bugs in
+shared code already surface in the PR run; the full matrix catches what is
+specific to one tree. UBSan is built with `-fno-sanitize-recover=undefined`,
+so any report fails the job; its leg on the blind tree also runs
+`btree_tests`, which does not depend on `BYTECASK_KEYDIR`. The three MSan
+jobs share one cache entry for the instrumented libc++.
 
 ### Fuzz testing (libFuzzer)
 
