@@ -9554,6 +9554,169 @@ TEST_CASE("pipeline: a sync-only write joins group commit behind an "
   CHECK(db.stats().at("bytecask.fsyncs") - fsyncs_before == 2);
 }
 
+namespace {
+
+// Five unsynced puts; with max_file_bytes = 4096 the next 8 KiB value
+// crosses the rotation threshold.
+void put_unsynced_tail(bytecask::DB &db) {
+  for (int i = 0; i < 5; ++i) {
+    const auto k = std::format("u{}", i);
+    (void)db.put({.sync = false}, to_bytes(k), to_bytes("v"));
+  }
+}
+
+constexpr std::size_t kRotatingValueBytes = 8192;
+
+}  // namespace
+
+// A sync-only write batched with a write that crosses the rotation
+// threshold: the rotation barrier syncs the sealed file, which covers the
+// sync-only write's target, so it adds no fdatasync of its own.
+TEST_CASE("pipeline: a sync-only write in the same batch as a rotation is "
+          "covered by the rotation's fdatasync", "[pipeline][concurrency][sync]") {
+  TempDir td;
+
+  // What the rotating write costs on its own.
+  std::int64_t rotation_fsyncs = 0;
+  {
+    auto alone = bytecask::DB::open(td.path / "alone", {.max_file_bytes = 4096});
+    put_unsynced_tail(alone);
+    const auto before = alone.stats().at("bytecask.fsyncs");
+    (void)alone.put({.sync = true}, to_bytes("big"), to_bytes(std::string(kRotatingValueBytes, 'x')));
+    REQUIRE(alone.stats().at("bytecask.file_rotations") == 1);
+    rotation_fsyncs = alone.stats().at("bytecask.fsyncs") - before;
+  }
+
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 4096});
+  put_unsynced_tail(db);
+  REQUIRE(db.durable_sequence() < db.engine_state()->next_seq - 1);
+  const auto stats_before = db.stats();
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool leader_ready = false;
+  db.test_write_group().on_leader_start_ = [&] {
+    {
+      std::lock_guard<std::mutex> lk{mu};
+      leader_ready = true;
+    }
+    cv.notify_all();
+    db.test_write_group().wait_for_queue_size(2);
+  };
+
+  std::optional<bytecask::CommitResult> rbig;
+  std::optional<bytecask::CommitResult> rsync;
+  std::thread tbig([&] {
+    rbig = db.put({.sync = true}, to_bytes("big"), to_bytes(std::string(kRotatingValueBytes, 'x')));
+  });
+  std::thread tsync([&] {
+    {
+      std::unique_lock<std::mutex> lk{mu};
+      cv.wait(lk, [&] { return leader_ready; });
+    }
+    rsync = db.apply_batch({.sync = true}, bytecask::WritePlan{});
+  });
+  tbig.join();
+  tsync.join();
+  db.test_write_group().on_leader_start_ = nullptr;
+
+  const auto stats_after = db.stats();
+  REQUIRE(rbig.has_value());
+  REQUIRE(rsync.has_value());
+  CHECK(rbig->durable);
+  CHECK(rsync->durable);
+  CHECK(rsync->sequence == 0);
+  CHECK(stats_after.at("bytecask.file_rotations") -
+            stats_before.at("bytecask.file_rotations") == 1);
+  CHECK(stats_after.at("bytecask.fsyncs") - stats_before.at("bytecask.fsyncs") ==
+        rotation_fsyncs);
+  CHECK(db.durable_sequence() >= rbig->sequence);
+  const auto st = db.engine_state();
+  CHECK(st->durable_seq >= st->sync_requested_seq);
+}
+
+// Several sync-only writers — say a periodic flush and a caller's own —
+// arriving behind an in-flight flush coalesce into the next one.
+TEST_CASE("pipeline: concurrent sync-only writes share one fdatasync",
+          "[pipeline][concurrency][sync]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("seed"), to_bytes("s"));
+  const auto fsyncs_before = db.stats().at("bytecask.fsyncs");
+
+  FlushGate gate;
+  db.test_before_flush_sync_ = gate.hook();
+
+  std::thread ta([&] { (void)db.put({.sync = true}, to_bytes("k1"), to_bytes("v1")); });
+  gate.wait_in_flush();
+
+  bytecask::CommitResult unsynced;
+  std::thread tu([&] {
+    unsynced = db.put({.sync = false}, to_bytes("k2"), to_bytes("v2"));
+  });
+  wait_until([&] { return blocked_count(db) >= 1; });
+
+  constexpr int kSyncOnly = 3;
+  std::vector<std::optional<bytecask::CommitResult>> rs(kSyncOnly);
+  std::vector<std::thread> ts;
+  for (int i = 0; i < kSyncOnly; ++i) {
+    ts.emplace_back([&, i] {
+      rs[static_cast<std::size_t>(i)] =
+          db.apply_batch({.sync = true}, bytecask::WritePlan{});
+    });
+  }
+  wait_until([&] { return blocked_count(db) >= 1 + kSyncOnly; });
+
+  gate.open();
+  ta.join();
+  tu.join();
+  for (auto &t : ts) t.join();
+  db.test_before_flush_sync_ = nullptr;
+
+  for (const auto &r : rs) {
+    REQUIRE(r.has_value());
+    CHECK(r->durable);
+  }
+  CHECK(db.durable_sequence() >= unsynced.sequence);
+  // k1's fdatasync, then one for k2 and all three sync-only writes.
+  CHECK(db.stats().at("bytecask.fsyncs") - fsyncs_before == 2);
+}
+
+// Unsynced writers each calling a sync-only write after their own writes:
+// on return, everything that thread wrote is durable, whichever flush —
+// its own, another thread's, or a rotation — made it so.
+TEST_CASE("pipeline: sync-only writes under concurrent unsynced writers",
+          "[pipeline][concurrency][sync]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 4096});
+  constexpr int kThreads = 8;
+  constexpr int kRounds = 50;
+  std::atomic<int> violations{0};
+  std::vector<std::thread> ts;
+  for (int t = 0; t < kThreads; ++t) {
+    ts.emplace_back([&, t] {
+      for (int r = 0; r < kRounds; ++r) {
+        bytecask::CommitResult mine;
+        for (int i = 0; i < 4; ++i) {
+          const auto k = std::format("t{}-r{}-{}", t, r, i);
+          mine = db.put({.sync = false}, to_bytes(k), to_bytes("value"));
+        }
+        const auto res = db.apply_batch({.sync = true}, bytecask::WritePlan{});
+        if (!res || !res->durable || db.durable_sequence() < mine.sequence) {
+          violations.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    });
+  }
+  for (auto &th : ts) th.join();
+
+  CHECK(violations.load() == 0);
+  CHECK(db.stats().at("bytecask.file_rotations") > 0);  // rotations were exercised
+  const auto st = db.engine_state();
+  CHECK(st->durable_seq >= st->sync_requested_seq);
+  CHECK(st->durable_seq == st->next_seq - 1);
+}
+
 TEST_CASE("pipeline: sync write is invisible until its fdatasync returns; a "
           "writer appended behind it lands in the next flush",
           "[pipeline][concurrency]") {
