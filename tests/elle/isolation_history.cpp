@@ -25,7 +25,15 @@
 // Usage:
 //   isolation_history --config guarded|unguarded|blind --out history.json
 //                     [--seed S] [--threads N] [--txns N] [--dir PATH]
-//                     [--no-vacuum] [--no-degrade]
+//                     [--no-vacuum] [--force-vacuum] [--no-degrade]
+//                     [--followers N] [--follower-readers N] [--lag]
+//
+// With --followers N (#178, docs/replication_checking_design.md) the leader
+// gains N followers, each bootstrapped from a manifest under load and tailed
+// through changes_since -> ingest, with reader threads of their own. Every
+// operation carries a "node" (0 = leader); a session read carries "wait",
+// the durable_sequence it waited for. Bootstraps and nemesis counts go to
+// <out>.cluster.json.
 
 #include <algorithm>
 #include <array>
@@ -43,6 +51,7 @@
 #include <mutex>
 #include <optional>
 #include <random>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -82,6 +91,10 @@ struct RunOptions {
   fs::path out;
   bool no_vacuum{false};
   bool no_degrade{false};
+  int followers{0};        // 0: leader only (#94); N: a cluster (#178)
+  int follower_readers{4}; // reader threads per follower
+  bool lag{false};         // pause replication threads at random
+  bool force_vacuum{false}; // leader vacuum on whatever the seed draws
 };
 
 // Per-run engine and nemesis configuration, derived from the seed.
@@ -241,6 +254,8 @@ auto event_type_name(EventType t) -> std::string_view {
 struct Event {
   std::uint64_t index{0};
   int process{0};
+  int node{0};               // 0 = leader, 1.. = follower
+  std::uint64_t wait_seq{0}; // session read: the durable_sequence waited for
   EventType type{EventType::Invoke};
   std::int64_t time_ns{0};
   std::vector<Mop> value;
@@ -300,9 +315,10 @@ auto write_history(const fs::path &path, std::vector<Event> events) -> void {
   for (std::size_t i = 0; i < events.size(); ++i) {
     const auto &e = events[i];
     line.clear();
-    line += std::format(R"({{"index":{},"process":{},"type":"{}","f":"txn",)"
-                        R"("time":{},"value":[)",
-                        e.index, e.process, event_type_name(e.type), e.time_ns);
+    line += std::format(R"({{"index":{},"process":{},"node":{},"type":"{}",)"
+                        R"("f":"txn","time":{},"value":[)",
+                        e.index, e.process, e.node, event_type_name(e.type),
+                        e.time_ns);
     for (std::size_t j = 0; j < e.value.size(); ++j) {
       const auto &m = e.value[j];
       if (j != 0) line.push_back(',');
@@ -321,6 +337,7 @@ auto write_history(const fs::path &path, std::vector<Event> events) -> void {
     line.push_back(']');
     if (e.type == EventType::Ok && e.sequence != 0)
       line += std::format(R"(,"sequence":{})", e.sequence);
+    if (e.wait_seq != 0) line += std::format(R"(,"wait":{})", e.wait_seq);
     if (e.type == EventType::Info)
       line += std::format(R"(,"error":"{}")", json_escape(e.error));
     line.push_back('}');
@@ -420,12 +437,22 @@ struct Totals {
 // records the completion. inject_sync arms a fault at io_data_file_sync
 // around the call: the solo path appends on this thread, and the fdatasync
 // fails here too when this thread holds the flush role.
-auto run_one(bytecask::DB &db, Mode mode, int process, Recorder &rec,
+// Where a transaction runs, for the history: node 0 is the leader. wait_seq
+// is set on a follower's session read.
+struct Placement {
+  int process{0};
+  int node{0};
+  std::uint64_t wait_seq{0};
+};
+
+auto run_one(bytecask::DB &db, Mode mode, Placement at, Recorder &rec,
              std::vector<Event> &events, std::vector<Mop> mops,
              bytecask::WriteOptions wo, bool inject_sync, Totals &totals)
-    -> void {
+    -> std::uint64_t {
   Event inv;
-  inv.process = process;
+  inv.process = at.process;
+  inv.node = at.node;
+  inv.wait_seq = at.wait_seq;
   inv.value = mops;
   rec.stamp(inv);
 
@@ -442,7 +469,9 @@ auto run_one(bytecask::DB &db, Mode mode, int process, Recorder &rec,
   }
 
   Event done;
-  done.process = process;
+  done.process = at.process;
+  done.node = at.node;
+  done.wait_seq = at.wait_seq;
   done.type = outcome.type;
   // A failed or indeterminate transaction reports what it invoked: its reads
   // carry no result.
@@ -465,6 +494,243 @@ auto run_one(bytecask::DB &db, Mode mode, int process, Recorder &rec,
   }
   events.push_back(std::move(inv));
   events.push_back(std::move(done));
+  return outcome.type == EventType::Ok ? outcome.sequence : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Cluster (#178): followers bootstrapped from the leader's manifest and fed
+// by changes_since -> ingest. See docs/replication_checking_design.md.
+// ---------------------------------------------------------------------------
+
+// DB is neither copyable nor movable; the holder lets a follower be closed and
+// reopened in place.
+struct DbHolder {
+  bytecask::DB db;
+  DbHolder(const fs::path &dir, const bytecask::Options &opts)
+      : db{bytecask::DB::open(dir, opts)} {}
+};
+
+// A follower. Readers and the replication thread hold gate shared while
+// they use db; a restart takes it exclusively. glibc's rwlock prefers
+// readers, so readers back off while restarting is set, or a restart would
+// wait behind them forever.
+struct FollowerNode {
+  int node{0};
+  fs::path dir;
+  bytecask::Options opts;
+  std::shared_mutex gate;
+  std::atomic<bool> restarting{false};
+  std::unique_ptr<DbHolder> holder; // null until bootstrapped
+};
+
+struct Bootstrap {
+  int node{0};
+  std::uint64_t through_sequence{0};
+  std::uint64_t durable_after_open{0};
+  std::int64_t keys_compared{0};
+  std::int64_t mismatches{0};
+};
+
+struct ClusterStats {
+  std::mutex mu;
+  std::vector<Bootstrap> bootstraps; // under mu
+  std::vector<std::string> errors;   // under mu
+  std::atomic<int> ingests{0};
+  std::atomic<int> ingest_errors{0};
+  std::atomic<int> restarts{0};
+  std::atomic<int> duplicates{0};
+  std::atomic<int> lag_pauses{0};
+  std::atomic<int> follower_vacuums{0};
+  std::atomic<int> session_reads{0};
+
+  void error(std::string what) {
+    std::lock_guard<std::mutex> g{mu};
+    errors.push_back(std::move(what));
+  }
+};
+
+// Owned copy of a changes_since entry: the iterator's views are valid only
+// until it advances.
+struct OwnedEntry {
+  std::uint64_t sequence{0};
+  bytecask::EntryType entry_type{bytecask::EntryType::Put};
+  bytecask::Bytes key;
+  bytecask::Bytes value;
+};
+
+auto ingest_owned(bytecask::DB &follower, const std::vector<OwnedEntry> &buf)
+    -> void {
+  std::vector<bytecask::DataEntryView> views;
+  views.reserve(buf.size());
+  for (const auto &e : buf) {
+    views.push_back({e.sequence, e.entry_type, e.key, e.value});
+  }
+  follower.ingest(views);
+}
+
+// Phase 1 of the protocol, under load: manifest, copy, open as a follower.
+// Leader vacuum is held off from the manifest to the end of the copy, as the
+// protocol requires. The follower's state at open must equal the manifest
+// snapshot's, key for key.
+auto bootstrap(bytecask::DB &leader, FollowerNode &f, std::mutex &vacuum_gate,
+               const KeyPool &keys, ClusterStats &stats) -> void {
+  for (;;) {
+    try {
+      std::unique_lock<std::mutex> vl{vacuum_gate};
+      auto m = leader.create_manifest();
+      fs::remove_all(f.dir);
+      fs::create_directories(f.dir);
+      for (const auto &fi : m.files) {
+        fs::copy_file(fi.data_path, f.dir / fi.data_path.filename());
+        fs::copy_file(fi.hint_path, f.dir / fi.hint_path.filename());
+      }
+      vl.unlock();
+      auto h = std::make_unique<DbHolder>(f.dir, f.opts);
+
+      Bootstrap b{.node = f.node,
+                  .through_sequence = m.through_sequence,
+                  .durable_after_open = h->db.durable_sequence(),
+                  .keys_compared = keys.key_count(),
+                  .mismatches = 0};
+      bytecask::Bytes lv;
+      bytecask::Bytes fv;
+      for (std::int64_t k = 0; k < b.keys_compared; ++k) {
+        const auto kb = key_bytes(k);
+        const auto lf = m.snap.get({}, as_view(kb), lv);
+        const auto ff = h->db.get({}, as_view(kb), fv);
+        if (lf != ff || (lf && lv != fv)) ++b.mismatches;
+      }
+      {
+        std::lock_guard<std::mutex> g{stats.mu};
+        stats.bootstraps.push_back(b);
+      }
+      std::unique_lock<std::shared_mutex> g{f.gate};
+      f.holder = std::move(h);
+      return;
+    } catch (const std::exception &) {
+      // create_manifest refuses a degraded leader; the nemesis resumes it.
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+}
+
+// Phase 2: wake on the leader's durable sequence, stream changes_since from
+// the follower's durable_sequence(), ingest in slices cut at batch
+// boundaries. Nemeses: lag pauses, duplicate delivery, follower vacuum and
+// follower restarts.
+auto replicate(bytecask::DB &leader, FollowerNode &f, bool lag,
+               std::uint64_t seed, const std::atomic<bool> &stop,
+               ClusterStats &stats) -> void {
+  std::mt19937_64 rng{seed};
+  // A run lasts a few seconds, so the nemeses fire every few hundred ms.
+  auto next_restart =
+      Clock::now() + std::chrono::milliseconds(100 + rng() % 400);
+  while (!stop.load(std::memory_order_relaxed)) {
+    if (lag && rng() % 10 == 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20 + rng() % 180));
+      stats.lag_pauses.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (Clock::now() >= next_restart) {
+      f.restarting.store(true, std::memory_order_release);
+      std::unique_lock<std::shared_mutex> g{f.gate};
+      f.holder.reset();
+      f.holder = std::make_unique<DbHolder>(f.dir, f.opts);
+      f.restarting.store(false, std::memory_order_release);
+      stats.restarts.fetch_add(1, std::memory_order_relaxed);
+      next_restart =
+          Clock::now() + std::chrono::milliseconds(100 + rng() % 400);
+    }
+    std::shared_lock<std::shared_mutex> g{f.gate};
+    auto &fdb = f.holder->db;
+    try {
+      if (rng() % 50 == 0) {
+        const auto threshold = static_cast<double>(rng() % 60) / 100.0;
+        if (fdb.vacuum({.fragmentation_threshold = threshold}))
+          stats.follower_vacuums.fetch_add(1, std::memory_order_relaxed);
+      }
+      auto from = fdb.durable_sequence();
+      if (leader.durable_sequence(from + 1, std::chrono::milliseconds(20)) <=
+          from)
+        continue;
+      if (rng() % 10 == 0 && from > 0) {
+        from -= std::min<std::uint64_t>(from, 1 + rng() % 32);
+        stats.duplicates.fetch_add(1, std::memory_order_relaxed);
+      }
+      auto snap = leader.snapshot();
+      std::vector<OwnedEntry> buf;
+      auto target = 1 + rng() % 64;
+      auto in_batch = false;
+      for (const auto &e : leader.changes_since(snap, from)) {
+        buf.push_back({e.sequence, e.entry_type,
+                       bytecask::Bytes{e.key.begin(), e.key.end()},
+                       bytecask::Bytes{e.value.begin(), e.value.end()}});
+        if (e.entry_type == bytecask::EntryType::BulkBegin) in_batch = true;
+        if (e.entry_type == bytecask::EntryType::BulkEnd) in_batch = false;
+        // Slices end at batch boundaries: ingest publishes a slice in one
+        // step, and a slice cut inside a batch would publish part of it.
+        if (!in_batch && buf.size() >= target) {
+          ingest_owned(fdb, buf);
+          stats.ingests.fetch_add(1, std::memory_order_relaxed);
+          buf.clear();
+          target = 1 + rng() % 64;
+        }
+      }
+      if (in_batch) {
+        stats.error(std::format(
+            "node {}: changes_since ended inside a batch after {}", f.node,
+            buf.empty() ? 0 : buf.back().sequence));
+      } else if (!buf.empty()) {
+        ingest_owned(fdb, buf);
+        stats.ingests.fetch_add(1, std::memory_order_relaxed);
+      }
+    } catch (const std::exception &) {
+      // Restart from the follower's durable_sequence(), as the protocol
+      // says. A degraded leader or follower recovers through resume().
+      stats.ingest_errors.fetch_add(1, std::memory_order_relaxed);
+      if (fdb.is_degraded()) {
+        try {
+          fdb.resume();
+        } catch (const std::exception &) {
+        }
+      }
+    }
+  }
+}
+
+auto store_max(std::atomic<std::uint64_t> &a, std::uint64_t v) -> void {
+  auto cur = a.load(std::memory_order_relaxed);
+  while (cur < v &&
+         !a.compare_exchange_weak(cur, v, std::memory_order_acq_rel,
+                                  std::memory_order_relaxed)) {
+  }
+}
+
+auto write_cluster_summary(const fs::path &path, ClusterStats &stats)
+    -> void {
+  std::ofstream out{path};
+  if (!out) throw std::runtime_error{"cannot open " + path.string()};
+  std::lock_guard<std::mutex> g{stats.mu};
+  out << "{\"bootstraps\":[";
+  for (std::size_t i = 0; i < stats.bootstraps.size(); ++i) {
+    const auto &b = stats.bootstraps[i];
+    out << std::format(R"({}{{"node":{},"through_sequence":{},)"
+                       R"("durable_after_open":{},"keys_compared":{},)"
+                       R"("mismatches":{}}})",
+                       i == 0 ? "" : ",", b.node, b.through_sequence,
+                       b.durable_after_open, b.keys_compared, b.mismatches);
+  }
+  out << "],\"errors\":[";
+  for (std::size_t i = 0; i < stats.errors.size(); ++i) {
+    out << (i == 0 ? "" : ",") << '"' << json_escape(stats.errors[i]) << '"';
+  }
+  out << std::format(
+      R"(],"ingests":{},"ingest_errors":{},"restarts":{},"duplicates":{},)"
+      R"("lag_pauses":{},"follower_vacuums":{},"session_reads":{}}})",
+      stats.ingests.load(), stats.ingest_errors.load(),
+      stats.restarts.load(), stats.duplicates.load(),
+      stats.lag_pauses.load(), stats.follower_vacuums.load(),
+      stats.session_reads.load());
+  out << "\n";
 }
 
 auto parse_mode(std::string_view s) -> Mode {
@@ -501,6 +767,14 @@ auto parse_args(int argc, char **argv) -> RunOptions {
       o.no_vacuum = true;
     } else if (a == "--no-degrade") {
       o.no_degrade = true;
+    } else if (a == "--followers") {
+      o.followers = std::stoi(std::string{next()});
+    } else if (a == "--follower-readers") {
+      o.follower_readers = std::stoi(std::string{next()});
+    } else if (a == "--lag") {
+      o.lag = true;
+    } else if (a == "--force-vacuum") {
+      o.force_vacuum = true;
     } else {
       throw std::runtime_error{std::format("unknown argument {}", a)};
     }
@@ -509,21 +783,26 @@ auto parse_args(int argc, char **argv) -> RunOptions {
     throw std::runtime_error{"--config and --out are required"};
   if (o.threads < 1 || o.txns < 1)
     throw std::runtime_error{"--threads and --txns must be positive"};
+  if (o.followers < 0 || o.follower_readers < 1)
+    throw std::runtime_error{"--followers must be >= 0, --follower-readers >= 1"};
   return o;
 }
 
 auto run(const RunOptions &o) -> int {
   auto cfg = config_for(o.seed);
   if (o.no_vacuum) cfg.vacuum = false;
+  if (o.force_vacuum) cfg.vacuum = true;
   if (o.no_degrade) cfg.degrade = false;
 
   std::printf("isolation_history: config=%s seed=%llu threads=%d txns=%d "
-              "backend=%s max_file_bytes=%llu sync%%=%d vacuum=%d degrade=%d\n",
+              "backend=%s max_file_bytes=%llu sync%%=%d vacuum=%d degrade=%d "
+              "followers=%d lag=%d\n",
               mode_name(o.mode).data(),
               static_cast<unsigned long long>(o.seed), o.threads, o.txns,
               backend_name(cfg.backend).data(),
               static_cast<unsigned long long>(cfg.max_file_bytes),
-              cfg.sync_percent, cfg.vacuum ? 1 : 0, cfg.degrade ? 1 : 0);
+              cfg.sync_percent, cfg.vacuum ? 1 : 0, cfg.degrade ? 1 : 0,
+              o.followers, o.lag ? 1 : 0);
   std::fflush(stdout);
 
   fs::remove_all(o.dir);
@@ -536,17 +815,31 @@ auto run(const RunOptions &o) -> int {
   std::atomic<int> remaining{o.txns};
   std::atomic<bool> stop{false};
   Totals totals;
-  // One buffer per client, plus one for the degrade nemesis and one for the
-  // final read.
-  std::vector<std::vector<Event>> buffers(static_cast<std::size_t>(o.threads) + 2);
+  // Processes: leader clients, the degrade nemesis, the leader's final read,
+  // then per follower its readers and its final read. One buffer each.
+  const auto leader_processes = o.threads + 2;
+  const auto per_follower = o.follower_readers + 1;
+  auto follower_process = [&](int node, int r) {
+    return leader_processes + (node - 1) * per_follower + r;
+  };
+  std::vector<std::vector<Event>> buffers(
+      static_cast<std::size_t>(leader_processes + o.followers * per_follower));
+  // Highest sequence a leader client has had acknowledged; session reads
+  // wait for it on a follower.
+  std::atomic<std::uint64_t> last_acked{0};
+  // Held by each vacuum call on the leader, and by a bootstrap from its
+  // manifest to the end of the file copy.
+  std::mutex vacuum_gate;
 
   std::jthread vacuum_thread;
   if (cfg.vacuum) {
-    vacuum_thread = std::jthread{[&db, &stop, &totals, seed = o.seed] {
+    vacuum_thread = std::jthread{[&db, &stop, &totals, &vacuum_gate,
+                                  seed = o.seed] {
       std::mt19937_64 vrng{seed + 1};
       while (!stop.load(std::memory_order_relaxed)) {
         const auto threshold = static_cast<double>(vrng() % 60) / 100.0;
         try {
+          std::lock_guard<std::mutex> g{vacuum_gate};
           if (db.vacuum({.fragmentation_threshold = threshold}))
             totals.vacuums.fetch_add(1, std::memory_order_relaxed);
         } catch (const std::exception &) {
@@ -574,8 +867,10 @@ auto run(const RunOptions &o) -> int {
         for (int attempt = 0; attempt < 50 && !db.is_degraded(); ++attempt) {
           auto mops = random_txn(nrng, keys, next_element);
           if (std::ranges::none_of(mops, &Mop::append)) continue;
-          run_one(db, o.mode, process, rec, events, std::move(mops),
-                  {.sync = true, .solo = true}, true, totals);
+          store_max(last_acked,
+                    run_one(db, o.mode, {.process = process}, rec, events,
+                            std::move(mops), {.sync = true, .solo = true},
+                            true, totals));
         }
         if (!db.is_degraded()) continue;
         totals.degrades.fetch_add(1, std::memory_order_relaxed);
@@ -593,6 +888,74 @@ auto run(const RunOptions &o) -> int {
     }};
   }
 
+  // Followers: each is bootstrapped from a manifest while the leader is
+  // under load, then tailed; readers run on it once it exists.
+  ClusterStats cluster;
+  std::vector<std::unique_ptr<FollowerNode>> followers;
+  std::atomic<bool> repl_stop{false};
+  std::atomic<bool> readers_stop{false};
+  std::vector<std::jthread> repl_threads;
+  std::vector<std::jthread> reader_threads;
+  for (int n = 1; n <= o.followers; ++n) {
+    auto f = std::make_unique<FollowerNode>();
+    f->node = n;
+    f->dir = o.dir.string() + std::format("-f{}", n);
+    f->opts = db_options(cfg);
+    f->opts.initial_mode = bytecask::Mode::Follower;
+    followers.push_back(std::move(f));
+  }
+  for (auto &fp : followers) {
+    auto &f = *fp;
+    repl_threads.emplace_back([&, fptr = &f] {
+      std::mt19937_64 brng{o.seed + 200 + static_cast<std::uint64_t>(fptr->node)};
+      std::this_thread::sleep_for(std::chrono::milliseconds(20 + brng() % 200));
+      bootstrap(db, *fptr, vacuum_gate, keys, cluster);
+      replicate(db, *fptr, o.lag, brng(), repl_stop, cluster);
+    });
+    for (int r = 0; r < o.follower_readers; ++r) {
+      reader_threads.emplace_back([&, fptr = &f, r] {
+        const auto process = follower_process(fptr->node, r);
+        std::mt19937_64 rrng{o.seed + 1000 + static_cast<std::uint64_t>(process)};
+        auto &events = buffers[static_cast<std::size_t>(process)];
+        while (!readers_stop.load(std::memory_order_relaxed)) {
+          if (fptr->restarting.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            continue;
+          }
+          std::shared_lock<std::shared_mutex> g{fptr->gate};
+          if (!fptr->holder) {
+            g.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+          }
+          auto &fdb = fptr->holder->db;
+          std::vector<Mop> mops;
+          const auto n = 1 + static_cast<int>(rrng() % 4);
+          for (int i = 0; i < n; ++i)
+            mops.push_back({.append = false, .key = keys.pick(rrng, false),
+                            .element = 0, .read = {}});
+          Placement at{.process = process, .node = fptr->node, .wait_seq = 0};
+          if (rrng() % 4 == 0) {
+            const auto seq = last_acked.load(std::memory_order_acquire);
+            if (seq != 0 &&
+                fdb.durable_sequence(seq, std::chrono::milliseconds(200)) >=
+                    seq) {
+              at.wait_seq = seq;
+              cluster.session_reads.fetch_add(1, std::memory_order_relaxed);
+            }
+          }
+          run_one(fdb, Mode::Guarded, at, rec, events, std::move(mops), {},
+                  false, totals);
+          g.unlock();
+          // Think time: reads are cheap, and unthrottled readers would
+          // dominate the history Elle has to check.
+          std::this_thread::sleep_for(
+              std::chrono::microseconds(500 + rrng() % 1500));
+        }
+      });
+    }
+  }
+
   {
     std::vector<std::jthread> clients;
     for (int p = 0; p < o.threads; ++p) {
@@ -606,9 +969,10 @@ auto run(const RunOptions &o) -> int {
             std::this_thread::sleep_for(std::chrono::microseconds(200));
           const auto sync =
               static_cast<int>(crng() % 100) < cfg.sync_percent;
-          run_one(db, o.mode, p, rec, events,
-                  random_txn(crng, keys, next_element), {.sync = sync}, false,
-                  totals);
+          store_max(last_acked,
+                    run_one(db, o.mode, {.process = p}, rec, events,
+                            random_txn(crng, keys, next_element),
+                            {.sync = sync}, false, totals));
         }
       });
     }
@@ -617,6 +981,51 @@ auto run(const RunOptions &o) -> int {
   if (nemesis_thread.joinable()) nemesis_thread.join();
   if (vacuum_thread.joinable()) vacuum_thread.join();
   if (db.is_degraded()) db.resume();
+
+  // Convergence: a sync write makes every leader entry durable, so
+  // changes_since can deliver all of it; every follower must then reach the
+  // leader's durable sequence.
+  if (!followers.empty()) {
+    db.put({.sync = true}, as_view("fence"), as_view(""));
+    const auto target = db.durable_sequence();
+    for (auto &fp : followers) {
+      const auto deadline = Clock::now() + std::chrono::seconds(20);
+      for (;;) {
+        {
+          std::shared_lock<std::shared_mutex> g{fp->gate};
+          if (fp->holder && fp->holder->db.durable_sequence() >= target) break;
+        }
+        if (Clock::now() >= deadline) {
+          std::shared_lock<std::shared_mutex> g{fp->gate};
+          std::string detail = "not bootstrapped";
+          if (fp->holder) {
+            auto &fdb = fp->holder->db;
+            const auto from = fdb.durable_sequence();
+            auto snap = db.snapshot();
+            std::uint64_t n = 0;
+            std::uint64_t first = 0;
+            for (const auto &e : db.changes_since(snap, from)) {
+              if (n++ == 0) first = e.sequence;
+            }
+            detail = std::format(
+                "follower durable {} degraded {} ({}); leader durable {}; "
+                "changes_since yields {} entries from {}",
+                from, fdb.is_degraded(), fdb.degraded_reason(),
+                db.durable_sequence(), n, first);
+          }
+          cluster.error(std::format("node {}: did not reach durable sequence "
+                                    "{} within 20s: {}",
+                                    fp->node, target, detail));
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+    }
+    readers_stop.store(true, std::memory_order_relaxed);
+    reader_threads.clear();
+    repl_stop.store(true, std::memory_order_relaxed);
+    repl_threads.clear();
+  }
 
   // Final reads over every key, so an append lost after its last concurrent
   // read still shows up in the history.
@@ -628,8 +1037,22 @@ auto run(const RunOptions &o) -> int {
       std::vector<Mop> mops;
       for (auto k = k0; k < std::min(k0 + 32, key_count); ++k)
         mops.push_back({.append = false, .key = k, .element = 0, .read = {}});
-      run_one(db, o.mode, process, rec, events, std::move(mops), {}, false,
-              totals);
+      run_one(db, o.mode, {.process = process}, rec, events, std::move(mops),
+              {}, false, totals);
+    }
+  }
+  for (auto &fp : followers) {
+    if (!fp->holder) continue;
+    const auto process = follower_process(fp->node, o.follower_readers);
+    auto &events = buffers[static_cast<std::size_t>(process)];
+    const auto key_count = keys.key_count();
+    for (std::int64_t k0 = 0; k0 < key_count; k0 += 32) {
+      std::vector<Mop> mops;
+      for (auto k = k0; k < std::min(k0 + 32, key_count); ++k)
+        mops.push_back({.append = false, .key = k, .element = 0, .read = {}});
+      run_one(fp->holder->db, Mode::Guarded,
+              {.process = process, .node = fp->node, .wait_seq = 0}, rec,
+              events, std::move(mops), {}, false, totals);
     }
   }
 
@@ -638,6 +1061,22 @@ auto run(const RunOptions &o) -> int {
     std::ranges::move(b, std::back_inserter(all));
   }
   write_history(o.out, std::move(all));
+  if (!followers.empty()) {
+    auto summary = o.out;
+    summary += ".cluster.json";
+    write_cluster_summary(summary, cluster);
+    std::printf("  cluster: bootstraps=%zu ingests=%d ingest_errors=%d "
+                "restarts=%d duplicates=%d lag_pauses=%d follower_vacuums=%d "
+                "session_reads=%d errors=%zu\n",
+                cluster.bootstraps.size(), cluster.ingests.load(),
+                cluster.ingest_errors.load(), cluster.restarts.load(),
+                cluster.duplicates.load(), cluster.lag_pauses.load(),
+                cluster.follower_vacuums.load(), cluster.session_reads.load(),
+                cluster.errors.size());
+    followers.clear();
+    for (int n = 1; n <= o.followers; ++n)
+      fs::remove_all(o.dir.string() + std::format("-f{}", n));
+  }
 
   const auto secs =
       std::chrono::duration<double>(Clock::now() - start).count();

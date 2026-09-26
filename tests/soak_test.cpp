@@ -147,7 +147,6 @@ struct SoakConfig {
   std::uint32_t max_key_bytes{0};
   std::uint32_t max_value_bytes{0};
   bool verify_checksums{true};
-  std::chrono::milliseconds staleness{0};
   unsigned recovery_threads{1};
 
   [[nodiscard]] auto options() const -> bytecask::Options {
@@ -169,11 +168,10 @@ struct SoakConfig {
     return std::format(
         "seed={} epoch={} duration_ms={} writers={} readers={} slots={} "
         "io_backend={} max_file_bytes={} pool_bytes={} max_key_bytes={} "
-        "max_value_bytes={} verify_checksums={} staleness_ms={} "
-        "recovery_threads={}",
+        "max_value_bytes={} verify_checksums={} recovery_threads={}",
         seed, epoch, duration.count(), writers, readers, slots_per_writer,
         backend, max_file_bytes, pool_bytes, max_key_bytes, max_value_bytes,
-        verify_checksums, staleness.count(), recovery_threads);
+        verify_checksums, recovery_threads);
   }
 };
 
@@ -205,8 +203,6 @@ auto make_config(std::uint64_t seed, unsigned epoch,
   c.max_value_bytes = static_cast<std::uint32_t>(r.pick<std::uint64_t>(
       std::array<std::uint64_t, 3>{256, 64 * 1024, 1024 * 1024}));
   c.verify_checksums = r.chance(0.5);
-  c.staleness = std::chrono::milliseconds{r.pick<std::uint64_t>(
-      std::array<std::uint64_t, 4>{0, 0, 1, 20})};
   c.recovery_threads = static_cast<unsigned>(r.range(1, 8));
   return c;
 }
@@ -531,8 +527,7 @@ private:
     return {.sync = rng_.chance(0.3), .solo = rng_.chance(0.2)};
   }
   [[nodiscard]] auto ropts() const -> bytecask::ReadOptions {
-    return {.staleness_tolerance = 0ms,
-            .verify_checksums = cfg_.verify_checksums};
+    return {.verify_checksums = cfg_.verify_checksums};
   }
 
   auto value_len() -> std::size_t {
@@ -877,8 +872,7 @@ public:
 
 private:
   [[nodiscard]] auto ropts() const -> bytecask::ReadOptions {
-    return {.staleness_tolerance = cfg_.staleness,
-            .verify_checksums = cfg_.verify_checksums};
+    return {.verify_checksums = cfg_.verify_checksums};
   }
 
   auto random_key() -> Bytes {

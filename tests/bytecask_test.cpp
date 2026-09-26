@@ -9881,6 +9881,71 @@ TEST_CASE("pipeline: a write another thread published is visible to every "
   CHECK(r_snapshot_saw);
 }
 
+// Found by the replication check's Elle run as G-single-item-realtime on
+// the leader: reader A saw a write still in flight, and reader B, which
+// began after A finished, did not. No writer has returned here, so nothing
+// on the write side can close the gap; the publication itself must tell B's
+// cache that the state moved before any thread can see the new state.
+TEST_CASE("pipeline: a write one reader has seen is visible to every later "
+          "reader, while its publication is still in progress",
+          "[pipeline][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("seed"), to_bytes("s"));
+
+  FlushGate before_wait;
+  FlushGate between_stores;
+  db.test_before_commit_wait_ = before_wait.hook();
+  db.test_between_publish_stores_ = between_stores.hook();
+
+  // B warms its read cache with the pre-put state, then waits for A.
+  std::mutex mu;
+  std::condition_variable cv;
+  bool a_done = false;
+  bool b_warm = false;
+  bool b_saw = false;
+  std::thread tb([&] {
+    (void)db.contains_key({}, to_bytes("seed"));
+    std::unique_lock<std::mutex> lk{mu};
+    b_warm = true;
+    cv.notify_all();
+    cv.wait(lk, [&] { return a_done; });
+    b_saw = get_val(db, to_bytes("t")).has_value();
+  });
+  {
+    std::unique_lock<std::mutex> lk{mu};
+    cv.wait(lk, [&] { return b_warm; });
+  }
+
+  // T's entry is in the head, T parked before commit_wait. F publishes a
+  // state covering both writes and parks inside that publication.
+  std::thread tt([&] { (void)db.put({.sync = true}, to_bytes("t"), to_bytes("vt")); });
+  before_wait.wait_in_flush();
+  std::thread tf([&] { (void)db.put({.sync = true}, to_bytes("f"), to_bytes("vf")); });
+  between_stores.wait_in_flush();
+
+  // A, a thread with no cached state, reads the new state.
+  bool a_saw = false;
+  std::thread ta([&] { a_saw = get_val(db, to_bytes("t")).has_value(); });
+  ta.join();
+  {
+    std::lock_guard<std::mutex> lk{mu};
+    a_done = true;
+  }
+  cv.notify_all();
+  tb.join();
+
+  between_stores.open();
+  tf.join();
+  before_wait.open();
+  tt.join();
+  db.test_before_commit_wait_ = nullptr;
+  db.test_between_publish_stores_ = nullptr;
+
+  REQUIRE(a_saw);
+  CHECK(b_saw);
+}
+
 TEST_CASE("pipeline: a plan that loses to a write not yet published reports "
           "the conflict once a retry can see that write",
           "[pipeline][concurrency]") {

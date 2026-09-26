@@ -149,7 +149,9 @@ Each run draws from these per seed:
   entries for writes refused at entry.
 - **I/O backend.** `Pread`, `Mmap`, or `BufferPool`, drawn per run.
 
-Replication and SIGKILL are not nemeses here. #178 and #176 add them.
+Replication and SIGKILL are not nemeses here. #178 adds replication, and
+[`replication_checking_design.md`](replication_checking_design.md) designs
+it. #176 adds SIGKILL.
 
 ## Implementation
 
@@ -254,6 +256,13 @@ before state_time_ is stored". It failed 3 of 3 runs without the fix. The
 cross-check gained the real-time rule above. With it, the pre-fix binary
 failed in round 3 of a local run, and the fixed one passed 16 rounds on the
 same seed.
+
+The replication check later found the reader-to-reader version of the same
+gap: one reader saw an in-flight write, and a later reader did not. Session
+reads now use a publication counter and a generation instead of the
+timestamp, which also replaces the `state_time_` advance in `commit_wait`
+(see [`replication_checking_design.md`](replication_checking_design.md),
+*Findings*).
 
 ## Acceptance
 

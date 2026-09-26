@@ -72,7 +72,7 @@ auto to_module(bytecask::internal::WriteOptions o) noexcept -> bytecask::WriteOp
 }
 
 auto to_module(const bytecask::internal::ReadOptions& o) noexcept -> bytecask::ReadOptions {
-  return {o.staleness_tolerance, o.verify_checksums};
+  return {o.verify_checksums};
 }
 
 auto to_module(bytecask::internal::VacuumOptions o) noexcept -> bytecask::VacuumOptions {

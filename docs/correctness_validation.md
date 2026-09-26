@@ -1507,7 +1507,7 @@ The proof matrix covers what can be enumerated. Two things cannot:
 readers, writers and a lifecycle thread against one DB for a time
 budget, in epochs. Each epoch draws its configuration from the run seed:
 thread counts, `io_backend`, `max_file_bytes` (including 1),
-`verify_checksums`, `staleness_tolerance`, key and value limits with
+`verify_checksums`, key and value limits with
 keys and values at those limits, then closes, checks and reopens.
 
 | Thread | Does |
@@ -1630,7 +1630,10 @@ direct cross-check against each write's commit sequence, and
 `isolation-nightly.yml` runs it every night. Its first runs, on a base
 without #170, hung on the rotation-barrier bug that the chaos soak had
 found independently (listed in its findings table above). See
-[`isolation_checking_design.md`](isolation_checking_design.md).
+[`isolation_checking_design.md`](isolation_checking_design.md). Its extension
+to the whole replication protocol (bootstrap, tailing, planned transfer,
+promotion, re-targeting) is designed in
+[`replication_checking_design.md`](replication_checking_design.md).
 
 ---
 

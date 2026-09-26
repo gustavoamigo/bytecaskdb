@@ -95,7 +95,6 @@ struct CommitResult {
 };
 
 struct ReadOptions {
-  std::chrono::milliseconds staleness_tolerance{0};
   bool verify_checksums{true};
 };
 

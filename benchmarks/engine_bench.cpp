@@ -483,21 +483,6 @@ struct PoolHitRatio {
   }
 };
 
-// BcAdapterStale: identical to BcAdapter but get() uses bounded staleness
-// (thread-local snapshot refreshed every staleness_tolerance). Lets BM_GetMT
-// compare the session path vs the bounded-staleness path under concurrency.
-struct BcAdapterStale : BcAdapter {
-  static void get(Db &db, const std::string &k) {
-    bytecask::ReadOptions ro;
-    ro.verify_checksums = false;
-    ro.staleness_tolerance = std::chrono::milliseconds{100};
-    bytecask::Bytes value;
-    auto found = db.engine.get(ro, bc_key(k), value);
-    benchmark::DoNotOptimize(found);
-    benchmark::DoNotOptimize(value.data());
-  }
-};
-
 struct BcUnorderedViewAdapter {
   static auto generate_keys(std::size_t n) { return generate_uuid_keys(n); }
 
@@ -1634,11 +1619,6 @@ BENCH(BM_ReadWhileWriting<BcPread, true>)       ->Name("ByteCaskDB_Pread/ReadAnd
 BENCH(BM_ReadWhileWriting<BcPread, true>)       ->Name("ByteCaskDB_Pread/ReadAndWriteLoad/Sync")       ->Threads(8);
 BENCH(BM_ReadWhileWriting<BcPread, true>)       ->Name("ByteCaskDB_Pread/ReadAndWriteLoad/Sync")       ->Threads(16);
 BENCH(BM_ReadWhileWriting<BcPread, true>)       ->Name("ByteCaskDB_Pread/ReadAndWriteLoad/Sync")       ->Threads(32);
-BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCaskDB/ReadAndWriteLoad/Sync/BoundedStaleness")  ->Threads(2);
-BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCaskDB/ReadAndWriteLoad/Sync/BoundedStaleness")  ->Threads(4);
-BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCaskDB/ReadAndWriteLoad/Sync/BoundedStaleness")  ->Threads(8);
-BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCaskDB/ReadAndWriteLoad/Sync/BoundedStaleness")  ->Threads(16);
-BENCH(BM_ReadWhileWriting<BcAdapterStale, true>)->Name("ByteCaskDB/ReadAndWriteLoad/Sync/BoundedStaleness")  ->Threads(32);
 #ifndef BENCH_NO_ROCKSDB
 BENCH(BM_ReadWhileWriting<Rdb, true>)            ->Name("RocksDB/ReadAndWriteLoad/Sync")            ->Threads(2);
 BENCH(BM_ReadWhileWriting<Rdb, true>)            ->Name("RocksDB/ReadAndWriteLoad/Sync")            ->Threads(4);
