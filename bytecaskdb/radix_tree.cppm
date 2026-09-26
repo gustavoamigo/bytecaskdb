@@ -330,7 +330,7 @@ template <typename V> struct Node {
     // packed_tag_'s node-type bits are somehow corrupted to a stray value
     // outside the 5 declared enumerators. A safe default ("no children")
     // is a wrong-but-safe answer, not silent corruption — see the
-    // Runtime safety guidance in .github/copilot-instructions.md.
+    // Runtime safety guidance in CLAUDE.md.
     return 0;
   }
   [[nodiscard]] auto has_children() const noexcept -> bool {

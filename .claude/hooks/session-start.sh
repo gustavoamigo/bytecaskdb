@@ -76,5 +76,20 @@ xmake f --toolchain=clang \
         --cxflags="-resource-dir=$(clang --print-resource-dir)" \
         -m debug -y >&2
 
+# graft — repo context graph (see CLAUDE.md), also served over MCP from
+# .mcp.json. Installed into /usr/local so `graft` is on the PATH the MCP
+# server is launched with. The graph itself (graft/) is gitignored, so every
+# clone builds its own. Best-effort: a failure here must not block the build
+# toolchain above.
+if ! command -v graft >/dev/null 2>&1; then
+  log "installing graft (about a minute, cached afterwards)"
+  NPM_PREFIX=/usr/local "$project_dir/scripts/install_graft.sh" >&2 \
+    || log "graft install failed; continuing without it"
+fi
+if command -v graft >/dev/null 2>&1; then
+  log "building graft graph"
+  (cd "$project_dir" && graft build >/dev/null 2>&1) || log "graft build failed"
+fi
+
 echo "Toolchain ready. Build and test with:"
 echo "  xmake build bytecask_tests && xmake run bytecask_tests"
