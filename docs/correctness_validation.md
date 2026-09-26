@@ -1417,6 +1417,77 @@ Seed corpus files (`tests/fuzz/seed/`) are committed; evolving corpus
 
 Run: `scripts/run_fuzz.sh fuzz_data_entry 300` (5-minute run).
 
+### Process-crash harness (SIGKILL)
+
+The fault injector answers "what happens if *this* syscall fails". The
+crash harness (`tests/crash/crash_consistency.cpp`) answers "what happens if
+the process stops anywhere", including between two syscalls the injector
+treats as one step and inside the background hint worker.
+
+The binary re-executes itself as a child. The child opens the database and
+runs a random single-writer workload: `put`, `del`, `del_range`, and
+`apply_batch` with `ensure_present`/`ensure_absent` guards, mixed `sync`.
+Most iterations also run a thread calling `vacuum()`. The child streams
+every operation to the parent over a pipe: an Intent frame before the call,
+and a Commit (`sequence`, `durable`) or Abort frame after it returns. It
+also reports `durable_sequence()` every few operations. The backend (`Pread`, `Mmap`,
+`BufferPool`), `max_file_bytes` (16 KiB–1 MiB) and the sync ratio are
+drawn per iteration, so rotation, hint generation and zero-fill-ahead are
+in flight when the kill lands. The parent SIGKILLs the child after a
+log-uniform delay (1 ms to 1.5 s, so many kills land inside `DB::open`).
+It then opens two copies of the directory and checks:
+
+- **Prefix.** The recovered key/value set equals the model after some prefix
+  of the child's operations in commit order. A batch is one operation, so
+  this also checks batch atomicity. A value that was never written, or an
+  older value where a newer one is required, fails it. Values are unique
+  per write (`<child seed>.<ordinal>`), so a failure names the exact write.
+- **Watermark.** That prefix covers every operation at or below the durable
+  watermark: the highest `durable_sequence()` the child reported and every
+  `CommitResult` with `durable == true`. Recovered `durable_sequence()` is
+  at least the watermark.
+- **Default open.** `DB::open` with `fail_recovery_on_crc_errors = true`
+  succeeds on the killed directory.
+- **Serial = parallel.** Serial and 4-thread recovery agree on contents,
+  `file_stats`, `keydir_keys` and `durable_sequence`, the same check the
+  `[model]` tests make.
+- **Live history.** While the child ran, `del` returned `nullopt` exactly
+  when the model had the key absent, and a guarded batch aborted exactly
+  when its guard failed.
+
+The next child opens the killed directory itself, so every iteration
+after the first also starts from a crash: recovery of crash leftovers
+(`.hint.tmp`, `.data.tmp`, a vacuum's compacted copy, the zero-filled
+active tail) is exercised again and again. It also asserts that the child's own open
+agrees with the parent's verified reopen. The directory is wiped every 25
+iterations.
+
+The kernel page cache survives SIGKILL, so this is the process-crash
+contract, not power loss. Two things follow from that. No run so far has
+lost a write whose call returned, `sync` or not; the harness counts
+those losses but does not fail on them, because the contract promises only
+`durable` writes. And the two reverts the harness was first expected to
+catch cannot be caught by it: removing the sync before degrading (B1–B3)
+changes nothing when no write fails, and writing hints in place, without
+the temp-then-rename, leaves a torn hint that fails its CRC and is rebuilt
+from its data file. Both need the power-loss follow-up (`dm-flakey`,
+`dm-log-writes`, or a FUSE layer that drops unsynced writes).
+
+What it did catch: #166, `vacuum()` dropping a file with
+`live_bytes == 0` along with its tombstones, so an older `Put` came back on
+reopen. The harness failed on it about once every ten iterations. Since the
+fix (#171, which counts tombstones in `FileStats` and keeps any file that
+holds one), 400 iterations with vacuum running pass.
+
+Run: `xmake build crash_consistency && xmake run crash_consistency --iterations 200`.
+The seed and a rerun line are printed first. `--seed` replays the same
+workloads and kill delays, but the operation a kill lands on still depends on
+timing. `--no-vacuum` isolates the write path. On failure the directory as
+the child found it, the directory the kill left, and the full operation
+history are kept under `<dir>/failure/`. `crash-nightly.yml` runs 400
+iterations every night in release and under ASan (with a 5 s kill ceiling,
+since the ASan child is several times slower).
+
 ---
 
 ## Output Structure
@@ -1578,7 +1649,9 @@ control:
 - **Hardware-level fault injection** — kernel block-layer error injection
   (`dm-flakey`, `dm-dust`), power-cut testing rigs, or filesystem-
   specific fault tools. The fault injector operates at the application
-  syscall layer only.
+  syscall layer only. The process-crash harness kills the process at
+  arbitrary points, but the page cache survives it, so it does not stand
+  in for power loss either.
 
 ---
 

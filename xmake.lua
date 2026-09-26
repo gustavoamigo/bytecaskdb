@@ -300,6 +300,23 @@ target("memory_profile")
         add_release_opts(t)
     end)
 
+-- Crash-consistency harness (tests/crash/crash_consistency.cpp): SIGKILLs a
+-- writer process at random points and checks the durable prefix on reopen.
+-- BYTECASK_TESTING exposes DB::file_stats() for the serial/parallel check.
+-- Run: xmake build crash_consistency && xmake run crash_consistency --iterations 200
+target("crash_consistency")
+    set_kind("binary")
+    set_default(false)
+    add_files("tests/crash/crash_consistency.cpp", "bytecaskdb/*.cppm")
+    add_includedirs("bytecaskdb")
+    add_packages("crc32c")
+    add_defines("BYTECASK_TESTING")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
+
 -- Static library target for out-of-tree consumers (e.g. the MariaDB plugin).
 -- Compiles all C++23 module sources and exposes them via libbytecask.a.
 -- Note: C++23 module BMIs are not portable across translation units that
