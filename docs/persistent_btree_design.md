@@ -767,7 +767,19 @@ dispatch anywhere.
   "a node larger than `kNodeBytes` holds exactly one entry" rule is
   unnecessary. A rebuild with a shorter prefix or a split among giant keys
   allocates whatever the entries need, with no slack, so the next insert
-  into it splits.
+  into it splits. The slack an oversized node does have is not
+  dependable either: a compacting rebuild (dead bytes, or `own()` on a
+  foreign node) sizes its copy to `max(kNodeBytes, contents)`, so a node
+  grown for one large key shrinks back. `place()` therefore judges room
+  for a compacting rebuild against `kNodeBytes`, not the node's current
+  capacity, and re-checks after `own()`; judging it against the capacity
+  let `insert_entry` write past the end of the rebuilt node (4 KiB keys
+  through `del_range`, found by the chaos soak, #92).
+- **An inner node can be emptied down to its first child**, keeping its
+  prefix. `pack()` takes a prefix from entry 0, so it forces the prefix to
+  zero when there are no entries; reading the missing entry 0 copied
+  garbage into the rebuilt node's prefix, and the next rebuild of it
+  crashed (also found through the soak).
 - **Split point.** Three rules, in order (`BuildSession::split`):
   1. an entry at either end that alone shortens the node prefix by 8 bytes
      or more is split off on its own;

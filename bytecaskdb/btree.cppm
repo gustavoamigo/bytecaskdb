@@ -668,6 +668,11 @@ protected:
   template <typename ItemFn>
   [[nodiscard]] auto pack(bool leaf, std::uint32_t n_items, ItemFn &&item,
                           std::size_t prefix) -> N * {
+    // An inner node emptied down to its first child keeps no entry to take
+    // a prefix from, so a rebuild of it — own() compacting it, or place()
+    // shrinking its prefix — must not read one: item(0) does not exist.
+    if (n_items == 0)
+      prefix = 0;
     std::size_t heap = 0;
     for (std::uint32_t i = 0; i < n_items; ++i)
       heap += N::entry_size(leaf, item(i).key.size() - prefix);
@@ -783,12 +788,19 @@ protected:
     const auto suf = key.subspan(node->prefix_len);
     const bool leaf = node->is_leaf != 0;
     const auto need = N::entry_size(leaf, suf.size()) + N::kSlotBytes;
+    // A compacting rebuild sizes its node to max(node_bytes, contents), not
+    // to the capacity it replaces: a node grown for one oversized key
+    // shrinks back once that key has company or dead bytes. Both checks
+    // below measure against what the rebuild will produce, or insert_entry
+    // writes past the end of the node.
     if (node->free_bytes() >= need) {
-      node = own(node);
-      node->insert_entry(pos, suf, payload);
-      return {node, nullptr, true, true};
+      node = own(node);  // a foreign node with dead bytes is compacted here
+      if (node->free_bytes() >= need) {
+        node->insert_entry(pos, suf, payload);
+        return {node, nullptr, true, true};
+      }
     }
-    if (node->packed_bytes(node->prefix_len) + need <= node->capacity) {
+    if (node->packed_bytes(node->prefix_len) + need <= N::node_bytes(leaf)) {
       node = rebuild(node, node->prefix_len);
       node->insert_entry(pos, suf, payload);
       return {node, nullptr, true, true};

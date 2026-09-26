@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: MIT
+# Nightly chaos soak (#92): readers, writers and lifecycle transitions against
+# one DB at once, 25 minutes per sanitizer. The proof matrix is
+# single-threaded, so this is the only suite that gives ASan and TSan
+# cross-thread overlap between the write path and vacuum / resume /
+# set_mode / create_manifest to see. See docs/correctness_validation.md,
+# "Chaos soak".
+#
+# The seed is the run id, so every night covers different configurations;
+# a failure prints the seed and the epoch's configuration, and
+#   BYTECASK_SOAK_SEED=<seed> BYTECASK_SOAK_EPOCH=<epoch> bytecask_tests "[soak]"
+# replays that epoch directly.
+
+name: Soak (nightly)
+
+on:
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Soak budget per sanitizer, in seconds"
+        default: "1500"
+      seed:
+        description: "Seed (empty: the run id)"
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    container:
+      image: fedora:43
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+      CLANG_TARGET_TRIPLE: x86_64-redhat-linux-gnu
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            clang llvm llvm-devel lld \
+            libcxx libcxx-devel \
+            xmake cmake \
+            python3-pip python3-devel \
+            git ninja-build
+          pip3 install nanobind
+
+      - name: Configure xmake
+        run: |
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          xmake f --toolchain=clang \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            --sanitizer=${{ matrix.sanitizer }} \
+            -m debug -y
+
+      - name: Build
+        run: xmake build bytecask_tests
+
+      - name: Soak under ${{ matrix.sanitizer }} sanitizer
+        env:
+          BYTECASK_SOAK_SECONDS: ${{ inputs.seconds || '1500' }}
+          BYTECASK_SOAK_SEED: ${{ inputs.seed || github.run_id }}
+          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
+          # halt_on_error: the first race ends the run with its report on
+          # top, instead of 25 minutes of follow-on noise.
+          TSAN_OPTIONS: ${{ matrix.sanitizer == 'thread' && 'halt_on_error=1 history_size=4' || '' }}
+        run: |
+          set -o pipefail
+          build/linux/x86_64/debug/bytecask_tests "[soak]" 2>&1 | tee soak.log
+
+      - name: Upload soak log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-${{ matrix.sanitizer }}-log
+          path: soak.log
+          if-no-files-found: ignore

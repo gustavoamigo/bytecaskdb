@@ -1351,8 +1351,15 @@ private:
   auto load_state() const -> std::shared_ptr<EngineState> {
     return std::atomic_load(&state_);
   }
+  // Every publication passes through here — the checked store_state and
+  // the degrade paths that publish a degraded copy directly — so this is
+  // where a transition into degraded is counted, once.
   void store_state(std::shared_ptr<EngineState> s) {
-    std::atomic_store(&state_, std::move(s));
+    const bool degraded = s->degraded;
+    const auto old = std::atomic_exchange(&state_, std::move(s));
+    if (degraded && old && !old->degraded) {
+      counters_.degraded_transitions.fetch_add(1, std::memory_order_relaxed);
+    }
   }
   auto load_head() const -> std::shared_ptr<EngineState> {
     return std::atomic_load(&head_);
@@ -2849,6 +2856,24 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
   // transitions build on the published state.
   auto role = quiesce();
   published = load_state();  // quiesce may have published the previous head
+  // The flush quiesce() waited on — this thread's or another writer's — may
+  // have failed. t is built on a head the engine has already given up on,
+  // so publishing it would clear the degrade without resume() and leave
+  // flush_error_ set under a healthy-looking state. The batch fails with
+  // that flush's error, like every other write appended behind it; resume()
+  // recovers its bytes with theirs.
+  if (published->degraded) {
+    std::exception_ptr ex;
+    {
+      std::lock_guard<std::mutex> lk{durable_mu_};
+      ex = flush_error_;
+    }
+    if (!ex) ex = std::make_exception_ptr(DbDegraded{published->degraded_reason});
+    for (auto *s : batch) {
+      if (!s->err) s->err = ex;
+    }
+    return;
+  }
   try {
     file.sync();
     counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
@@ -4117,9 +4142,6 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
   // an idle thread's read cache is the holder nothing else can reach.
   scrape_read_caches();
 
-  if (became_degraded) {
-    counters_.degraded_transitions.fetch_add(1, std::memory_order_relaxed);
-  }
   // Wakes the sequence waiters: durable_sequence on a durable advance, and
   // wait_published on any publication, which is why a nosync publish that
   // advances no durable sequence notifies too. (A failed flush publishes

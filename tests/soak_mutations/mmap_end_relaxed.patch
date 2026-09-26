@@ -1,0 +1,23 @@
+Weakens WritableMmapDataFile::mmap_end_ from release/acquire to relaxed
+(both sides). Named in #92's acceptance list. Expected: NOT caught, by
+construction — mmap_end_ publishes no non-atomic data, so relaxed is a
+correct ordering for it and no sanitizer can report the change. See
+docs/correctness_validation.md, "Chaos soak".
+--- a/bytecaskdb/data_file.cppm
++++ b/bytecaskdb/data_file.cppm
+@@ -842,13 +842,13 @@
+   std::atomic<std::size_t> mmap_end_{0};
+ 
+   [[nodiscard]] auto mmap_end() const noexcept -> std::size_t {
+-    return mmap_end_.load(std::memory_order_acquire);
++    return mmap_end_.load(std::memory_order_relaxed);
+   }
+ 
+   // The file just shrank to file_size: clamp the readable prefix to it.
+   void set_mmap_end(Offset file_size) noexcept {
+     mmap_end_.store(std::min(mmap_len_, static_cast<std::size_t>(file_size)),
+-                    std::memory_order_release);
++                    std::memory_order_relaxed);
+   }
+ 
+   [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
