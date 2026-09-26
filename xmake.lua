@@ -4,7 +4,16 @@ add_requires("crc32c")
 -- Hint files are zstd-framed (docs/hint_compression_design.md). Built here
 -- rather than taken from the system, whose libzstd is usually shared: linked
 -- statically, the Python wheel and the Node addon need no libzstd at runtime.
-add_requires("zstd", {system = false})
+-- Under MemorySanitizer zstd is instrumented too (see msan_libcxx_prefix
+-- below): its stores into the output buffer are otherwise invisible to MSan,
+-- and every compressed hint frame reads as uninitialized.
+if (get_config("sanitizer") or ""):find("memory", 1, true) then
+    add_requires("zstd", {system = false, configs = {
+        cflags = {"-fsanitize=memory", "-fsanitize-memory-track-origins=2"},
+        ldflags = "-fsanitize=memory"}})
+else
+    add_requires("zstd", {system = false})
+end
 add_requires("jemalloc 5.3.0", {optional = true})
 -- Test dependency — optional so `xmake build` (default targets)
 -- doesn't download/build it unless the consuming target is explicitly built.
@@ -313,7 +322,7 @@ target("crash_consistency")
     set_default(false)
     add_files("tests/crash/crash_consistency.cpp", "bytecaskdb/*.cppm")
     add_includedirs("bytecaskdb")
-    add_packages("crc32c")
+    add_packages("crc32c", "zstd")
     add_defines("BYTECASK_TESTING")
     on_config(function(t)
         add_native_syslinks(t)
