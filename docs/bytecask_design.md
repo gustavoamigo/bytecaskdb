@@ -728,7 +728,7 @@ Deleting C is safe on exactly what step 2 checks: everything in C is also in S. 
 The public `vacuum()` method orchestrates file selection and dispatches to exactly one primitive:
 
 1. **Acquire `vacuum_mu_`** — prevents two `vacuum()` calls from running concurrently.
-2. **Select a target file** — copy `file_stats_` under a brief `write_mu_` acquisition (O(sealed files), then release). Iterate sealed files, compute `fragmentation = 1 − live_bytes / total_bytes` (O(1) per file, no I/O), pick the highest-fragmentation sealed file above `fragmentation_threshold`. If no file qualifies, return immediately.
+2. **Select a target file** — copy `file_stats_` under a brief `write_mu_` acquisition (O(sealed files), then release). Iterate sealed files, compute `fragmentation = 1 − (live_bytes + tombstone_bytes) / total_bytes` (O(1) per file, no I/O), pick the highest-fragmentation sealed file above `fragmentation_threshold`. If no file qualifies, return immediately.
 3. **Branch**:
    - If `file_stats_[target].live_bytes == 0` and `tombstone_bytes == 0` → call `vacuum_remove_file(target)` (fast path, no I/O).
    - Otherwise → call `vacuum_compact_file(target)` (sealed→sealed compaction).
