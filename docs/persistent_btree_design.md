@@ -1,12 +1,16 @@
 # Persistent B+ tree key directory — design
 
-Status: **implemented and the engine's default key directory**. See
+Status: **implemented; the engine's default key directory from 2026-09-18
+until the blind-leaf variant replaced it** (`docs/blind_leaf_btree_design.md`,
+2026-09-24). The inner nodes, path copying, `BuildSession` and reclamation
+below are what the blind tree builds on; the keyed tree described here
+remains selectable with `BYTECASK_KEYDIR=btree`. See
 [Implementation notes](#implementation-notes-first-version) for what was
 built, what differs from the design below, and what was measured.
 Date: 2026-09-17 (design), 2026-09-17 (first version), 2026-09-18 (made default)
 The radix tree is not removed: it offers the same surface, builds from the
 same engine under `BYTECASK_KEYDIR=radix`, and CI runs the full engine suite
-on both. `docs/persistent_radix_tree_design.md` and
+on all three trees. `docs/persistent_radix_tree_design.md` and
 `docs/radix_tree_epoch_reclamation_design.md` (PR #86) therefore still
 describe live code — except for the reclaimer, which is now one
 implementation shared by both trees (`bytecaskdb/version_chain.cppm`).

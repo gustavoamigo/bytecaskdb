@@ -89,7 +89,8 @@ inline void assert_consistent(const DB &db) {
   // 1. live_bytes matches key_dir.
   std::map<std::uint32_t, std::uint64_t> computed_live;
   std::uint64_t max_seq = 0;
-  for (auto it = state->key_dir.begin(); it != std::default_sentinel; ++it) {
+  for (auto it = kd_begin(state->key_dir, state->kd_ctx());
+       it != std::default_sentinel; ++it) {
     auto [key_span, entry] = *it;
     computed_live[entry.file_id()] +=
         entry_size(key_span.size(), entry.value_size());
@@ -341,6 +342,7 @@ inline void assert_matches_recovery(const std::filesystem::path &dir,
     CHECK(it->second.total_bytes == fs.total_bytes);
     CHECK(it->second.min_sequence == fs.min_sequence);
     CHECK(it->second.max_sequence == fs.max_sequence);
+    CHECK(it->second.tombstone_bytes == fs.tombstone_bytes);
   }
 }
 
@@ -544,8 +546,9 @@ inline auto find_vacuum_target(const DB &db) -> std::uint32_t {
   for (const auto [file_id, fs] : state->file_stats) {
     if (file_id == state->active_file_id) continue;
     if (fs.total_bytes == 0) continue;
-    const double frag = 1.0 - static_cast<double>(fs.live_bytes) /
-                                  static_cast<double>(fs.total_bytes);
+    const double frag =
+        1.0 - static_cast<double>(fs.live_bytes + fs.tombstone_bytes) /
+                  static_cast<double>(fs.total_bytes);
     if (frag > worst_frag) {
       worst_frag = frag;
       target_id = file_id;

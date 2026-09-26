@@ -12,10 +12,10 @@ export type EntryType = 'put' | 'delete' | 'bulkBegin' | 'bulkEnd' | 'rangeDel';
 // Selects how data files are read. 'pread' (default) issues pread(2) per
 // read; 'mmap' memory-maps sealed files for zero-copy reads; 'bufferPool'
 // serves sealed files from a bounded, engine-owned cache — see
-// BufferPoolOptions. The WASM backend only supports 'pread': open() throws
-// for 'mmap' or 'bufferPool' there (mmap emulation and MEMFS both make the
-// alternative backends pointless on that platform — see
-// docs/buffer_pool_design.md).
+// BufferPoolOptions. The WASM backend supports 'pread' and 'bufferPool';
+// open() throws for 'mmap' there, since mmap emulation would copy the data
+// file into the WASM heap. On WASM a pool hit also skips the call out to
+// Node's fs that every pread makes.
 export type IoBackend = 'pread' | 'mmap' | 'bufferPool';
 
 export interface BufferPoolOptions {

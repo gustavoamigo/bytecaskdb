@@ -99,14 +99,14 @@ constexpr auto align_up(std::size_t n, std::size_t a) noexcept -> std::size_t {
   return (n + a - 1) / a * a;
 }
 
-template <typename T> auto as_ptr(std::byte *p) noexcept -> T * {
+export template <typename T> auto as_ptr(std::byte *p) noexcept -> T * {
   return static_cast<T *>(static_cast<void *>(p));
 }
-template <typename T> auto as_ptr(const std::byte *p) noexcept -> const T * {
+export template <typename T> auto as_ptr(const std::byte *p) noexcept -> const T * {
   return static_cast<const T *>(static_cast<const void *>(p));
 }
 
-inline auto compare_bytes(Bytes a, Bytes b) noexcept -> int {
+export inline auto compare_bytes(Bytes a, Bytes b) noexcept -> int {
   const auto n = std::min(a.size(), b.size());
   const int c = n == 0 ? 0 : std::memcmp(a.data(), b.data(), n);
   if (c != 0)
@@ -116,7 +116,8 @@ inline auto compare_bytes(Bytes a, Bytes b) noexcept -> int {
   return a.size() < b.size() ? -1 : 1;
 }
 
-inline auto common_prefix_length(Bytes a, Bytes b) noexcept -> std::size_t {
+export inline auto common_prefix_length(Bytes a, Bytes b) noexcept
+    -> std::size_t {
   const auto n = std::min(a.size(), b.size());
   std::size_t i = 0;
   // Eight bytes at a time: the first differing byte is the lowest set bit
@@ -196,7 +197,7 @@ inline auto common_prefix_length(const KeyParts &x,
 // ---------------------------------------------------------------------------
 // Node<V> — the header of every node; the rest of the allocation follows it.
 //
-//   [header][prefix bytes][slots: count × u64 ->]  ...free...  [<- entries]
+//   [header 40][hints 64][prefix bytes][slots: count × u64 ->] ...free... [<- entries]
 //
 //   slot   = head << 32 | off        off: distance from the node end to the
 //                                    entry start (a multiple of kAlign)
@@ -205,7 +206,7 @@ inline auto common_prefix_length(const KeyParts &x,
 // Nodes are immutable once their version is published; only the session
 // whose tag they carry writes to them.
 // ---------------------------------------------------------------------------
-template <typename V> struct Node {
+export template <typename V> struct Node {
   std::uint64_t tag{0};        // creating session: ownership and reclamation
   Node *first_child{nullptr};  // inner only: child left of every separator
   std::uint32_t capacity{0};   // bytes allocated
@@ -219,22 +220,31 @@ template <typename V> struct Node {
 
   std::uint16_t last_pos{kNoLastPos}; // where the last in-place insert went
   std::uint8_t is_leaf{1};
-  // Heads sampled every count/(kHints+1) slots. A search scans the hints
-  // (64 bytes) to find the run of slots that can hold the key, then scans
-  // that run: a few slots instead of the whole array.
-  std::uint32_t hints[kHints]{};
+  // The header ends here: 40 bytes, shared with every node shape built on
+  // it (blind_btree.cppm's leaves). What follows is the slotted page's.
+  //
+  // hints: heads sampled every count/(kHints+1) slots, stored right after the
+  // header. A search scans the hints (64 bytes) to find the run of slots that
+  // can hold the key, then scans that run: a few slots instead of the whole
+  // array.
+  static constexpr std::size_t kHintBytes = kHints * sizeof(std::uint32_t);
 
   static constexpr std::size_t kAlign =
       std::max({alignof(V), alignof(void *), std::size_t{8}});
   static constexpr std::size_t kLenBytes = 2;
   static constexpr std::size_t kSlotBytes = 8;
 
-  [[nodiscard]] static auto header_bytes() noexcept -> std::size_t {
+  [[nodiscard]] static constexpr auto header_bytes() noexcept -> std::size_t {
+    static_assert(align_up(sizeof(Node), 8) == 40,
+                  "the node header is shared with blind leaves; keep it small");
     return align_up(sizeof(Node), 8);
+  }
+  [[nodiscard]] static constexpr auto prefix_offset() noexcept -> std::size_t {
+    return header_bytes() + kHintBytes;
   }
   [[nodiscard]] static auto slots_offset_for(std::size_t prefix) noexcept
       -> std::size_t {
-    return align_up(header_bytes() + prefix, kSlotBytes);
+    return align_up(prefix_offset() + prefix, kSlotBytes);
   }
   [[nodiscard]] static auto payload_size(bool leaf) noexcept -> std::size_t {
     return leaf ? sizeof(V) : sizeof(Node *);
@@ -261,8 +271,9 @@ template <typename V> struct Node {
     n->capacity = static_cast<std::uint32_t>(capacity);
     n->prefix_len = static_cast<std::uint16_t>(pre.size());
     n->is_leaf = leaf ? 1 : 0;
+    std::memset(mem + header_bytes(), 0, kHintBytes);
     if (!pre.empty())
-      std::memcpy(mem + header_bytes(), pre.data(), pre.size());
+      std::memcpy(mem + prefix_offset(), pre.data(), pre.size());
     account_alloc<V>();
     return n;
   }
@@ -288,7 +299,13 @@ template <typename V> struct Node {
     return static_cast<const std::byte *>(static_cast<const void *>(this));
   }
   [[nodiscard]] auto prefix() const noexcept -> Bytes {
-    return {bytes() + header_bytes(), prefix_len};
+    return {bytes() + prefix_offset(), prefix_len};
+  }
+  [[nodiscard]] auto hints() noexcept -> std::uint32_t * {
+    return as_ptr<std::uint32_t>(bytes() + header_bytes());
+  }
+  [[nodiscard]] auto hints() const noexcept -> const std::uint32_t * {
+    return as_ptr<std::uint32_t>(bytes() + header_bytes());
   }
   [[nodiscard]] auto slots() noexcept -> std::uint64_t * {
     return as_ptr<std::uint64_t>(bytes() + slots_offset_for(prefix_len));
@@ -385,8 +402,9 @@ template <typename V> struct Node {
       // Hints below the head are runs of slots entirely below the key; the
       // first hint at or above it bounds the run that can hold it.
       std::uint32_t k = 0;
+      const auto *h = hints();
       for (std::uint32_t i = 0; i < kHints; ++i)
-        k += hints[i] < head ? 1u : 0u;
+        k += h[i] < head ? 1u : 0u;
       const auto dist = count / (kHints + 1);
       lo = k == 0 ? 0 : k * dist + 1;
       hi = k == kHints ? count : (k + 1) * dist + 1;
@@ -436,8 +454,9 @@ template <typename V> struct Node {
       return;
     const auto dist = count / (kHints + 1);
     const auto *s = slots();
+    auto *h = hints();
     for (std::uint32_t i = 0; i < kHints; ++i)
-      hints[i] = slot_head(s[(i + 1) * dist]);
+      h[i] = slot_head(s[(i + 1) * dist]);
   }
 
   void remove_entry(std::uint32_t pos) noexcept {
@@ -466,7 +485,7 @@ template <typename V> struct Node {
 export template <typename V> class BulkLoader;
 export template <typename V> class LeafRun;
 
-template <typename V> struct ChainTraits {
+export template <typename V> struct ChainTraits {
   using Node = btree_detail::Node<V>;
   static auto tag(const Node *n) noexcept -> std::uint64_t { return n->tag; }
   template <typename F> static void for_each_child(Node *n, F &&f) {
@@ -502,7 +521,7 @@ auto find_ptr(const Node<V> *cur, Bytes key) noexcept -> const V * {
 // replaced by a rebuild or split, or never published — all go through
 // discard(). Used by one thread at a time.
 // ---------------------------------------------------------------------------
-template <typename V> class BuildSession {
+export template <typename V> class BuildSession {
 public:
   using N = Node<V>;
   friend class BulkLoader<V>;
@@ -592,13 +611,17 @@ public:
           0);
       return {leaf, nullptr, true, true};
     }
-    return upsert_rec(root, key, val, should_replace);
+    auto leaf_step = [&](N *leaf) {
+      return upsert_leaf(leaf, key, val, should_replace);
+    };
+    return descend_upsert(root, key, leaf_step);
   }
 
   auto erase(N *root, Bytes key) -> Result {
     if (!root)
       return {nullptr, nullptr, false, false};
-    return erase_rec(root, key);
+    auto leaf_step = [&](N *leaf) { return erase_leaf(leaf, key); };
+    return descend_erase(root, key, leaf_step);
   }
 
   // A fresh root over two halves of a split root.
@@ -613,7 +636,10 @@ public:
     return root;
   }
 
-private:
+  // Everything below is shared with trees whose leaves have another layout
+  // (blind_btree.cppm): they route through the same inner nodes and supply
+  // their own leaf step to the descent.
+protected:
   std::uint64_t tag_;
   std::vector<N *> retired_;
   std::vector<std::byte> sep_; // separator handed up by the last split
@@ -704,7 +730,7 @@ private:
         fresh->heap_floor = node->heap_floor;
         fresh->first_child = node->first_child;
         fresh->last_pos = node->last_pos;
-        std::memcpy(fresh->hints, node->hints, sizeof(node->hints));
+        std::memcpy(fresh->hints(), node->hints(), N::kHintBytes);
         discard(node);
         return fresh;
       }
@@ -892,27 +918,16 @@ private:
     return {left, right, true, true};
   }
 
-  template <typename Pred>
-  auto upsert_rec(N *node, Bytes key, const V &val, Pred &should_replace)
-      -> Result {
-    if (node->is_leaf) {
-      const auto p = node->search(key);
-      if (p.exact) {
-        auto *existing = node->template payload<V>(p.idx);
-        if (!should_replace(*existing, val))
-          return {node, nullptr, false, false};
-        auto *n = own(node);
-        auto *slot = n->template payload<V>(p.idx);
-        displaced_ = std::move(*slot);
-        std::destroy_at(slot);
-        std::construct_at(slot, val);
-        return {n, nullptr, true, false};
-      }
-      return place(node, p.idx, key, val);
-    }
+  // Path copy from `node` down to the leaf that holds `key`, where
+  // `leaf_step(leaf)` makes the change. A leaf that split hands its right
+  // half and its separator (in sep_) up; this places them in the parent.
+  template <typename LeafStep>
+  auto descend_upsert(N *node, Bytes key, LeafStep &leaf_step) -> Result {
+    if (node->is_leaf)
+      return leaf_step(node);
     const auto idx = node->child_index(key);
     auto *child = node->child(idx);
-    const auto r = upsert_rec(child, key, val, should_replace);
+    const auto r = descend_upsert(child, key, leaf_step);
     if (!r.changed)
       return {node, nullptr, false, false};
     auto *n = own(node);
@@ -926,21 +941,14 @@ private:
     return placed;
   }
 
-  auto erase_rec(N *node, Bytes key) -> Result {
-    if (node->is_leaf) {
-      const auto p = node->search(key);
-      if (!p.exact)
-        return {node, nullptr, false, false};
-      auto *n = own(node);
-      n->remove_entry(p.idx);
-      if (n->count == 0) {
-        discard(n);
-        return {nullptr, nullptr, true, false};
-      }
-      return {n, nullptr, true, false};
-    }
+  // As descend_upsert, for a removal: a leaf step that empties its leaf
+  // discards it and returns a null node, and the parent drops the child.
+  template <typename LeafStep>
+  auto descend_erase(N *node, Bytes key, LeafStep &leaf_step) -> Result {
+    if (node->is_leaf)
+      return leaf_step(node);
     const auto idx = node->child_index(key);
-    const auto r = erase_rec(node->child(idx), key);
+    const auto r = descend_erase(node->child(idx), key, leaf_step);
     if (!r.changed)
       return {node, nullptr, false, false};
     auto *n = own(node);
@@ -958,6 +966,38 @@ private:
       n->remove_entry(0);
     } else {
       n->remove_entry(idx - 1);
+    }
+    return {n, nullptr, true, false};
+  }
+
+private:
+  template <typename Pred>
+  auto upsert_leaf(N *node, Bytes key, const V &val, Pred &should_replace)
+      -> Result {
+    const auto p = node->search(key);
+    if (p.exact) {
+      auto *existing = node->template payload<V>(p.idx);
+      if (!should_replace(*existing, val))
+        return {node, nullptr, false, false};
+      auto *n = own(node);
+      auto *slot = n->template payload<V>(p.idx);
+      displaced_ = std::move(*slot);
+      std::destroy_at(slot);
+      std::construct_at(slot, val);
+      return {n, nullptr, true, false};
+    }
+    return place(node, p.idx, key, val);
+  }
+
+  auto erase_leaf(N *node, Bytes key) -> Result {
+    const auto p = node->search(key);
+    if (!p.exact)
+      return {node, nullptr, false, false};
+    auto *n = own(node);
+    n->remove_entry(p.idx);
+    if (n->count == 0) {
+      discard(n);
+      return {nullptr, nullptr, true, false};
     }
     return {n, nullptr, true, false};
   }
@@ -1041,6 +1081,13 @@ public:
   BulkLoader() = default;
   BulkLoader(const BulkLoader &) = delete;
   auto operator=(const BulkLoader &) -> BulkLoader & = delete;
+  // A loader dropped before finish() or seal() — abandoned, or unwound by an
+  // append that threw — frees the nodes it sealed: no version holds them.
+  ~BulkLoader() {
+    for (auto &level : levels_)
+      for (auto *n : level.children)
+        free_node_subtree_if<ChainTraits<V>>(n, [](N *) { return true; });
+  }
 
   void append(Bytes key, const V &value) {
     if (key.size() > kBTreeMaxKeyBytes)
@@ -1089,6 +1136,18 @@ public:
   [[nodiscard]] static auto concat(std::vector<LeafRun<V>> runs)
       -> PersistentBTree<V> {
     BulkLoader<V> out;
+    const auto publish_tag = concat_into(out, runs);
+    return std::move(out).assemble(publish_tag);
+  }
+
+  // The level-building and publishing half below is shared with loaders
+  // whose leaves have another layout (blind_btree.cppm).
+protected:
+  // Adds the runs' leaves to `out`'s leaf level in order, with the
+  // separators between runs, and returns the tag to publish under: at or
+  // above every node's.
+  static auto concat_into(BulkLoader &out, std::vector<LeafRun<V>> &runs)
+      -> std::uint64_t {
     auto publish_tag = out.session_.tag();
     std::vector<std::byte> prev_last;
     for (auto &run : runs) {
@@ -1107,10 +1166,9 @@ public:
       prev_last = std::move(run.last_key_);
       out.size_ += run.size_;
     }
-    return std::move(out).assemble(publish_tag);
+    return publish_tag;
   }
 
-private:
   // One built level: the children produced for it, and the separator that
   // sits between each child and the one before it (so seps[i] separates
   // children[i] from children[i + 1], and there are children.size() - 1).
@@ -1147,18 +1205,27 @@ private:
   // chain frees a dead version by tag interval, and a node tagged above the
   // published version would be taken for a later version's garbage.
   [[nodiscard]] auto assemble(std::uint64_t publish_tag) && -> PersistentBTree<V> {
-    if (first_leaf())
+    auto *root = std::move(*this).assemble_root(publish_tag);
+    if (!root)
       return {};
+    return PersistentBTree<V>{root, size_, publish_tag};
+  }
+
+  // The root of the published version, or null for an empty loader.
+  [[nodiscard]] auto assemble_root(std::uint64_t publish_tag) && -> N * {
+    if (first_leaf())
+      return nullptr;
     std::size_t lvl = 0;
     while (levels_[lvl].children.size() > 1) {
       build_parent(lvl);
       ++lvl;
     }
     auto *root = levels_[lvl].children.front();
-    PersistentBTree<V>::chain().publish(publish_tag, 0, session_.retired_list());
+    VersionChain<ChainTraits<V>>::instance().publish(publish_tag, 0,
+                                                     session_.retired_list());
     session_.finish();
     levels_.clear();
-    return PersistentBTree<V>{root, size_, publish_tag};
+    return root;
   }
 
   // Would `key` still fit in the leaf being filled? A shorter shared prefix

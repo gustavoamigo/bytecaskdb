@@ -423,4 +423,4 @@ for (const entry of db.entries('prefix:')) {
 
 All options objects are optional. Omitting them uses the defaults shown above.
 
-**WASM only supports `ioBackend: 'pread'`.** `'mmap'` and `'bufferPool'` are the native backend's — `open` throws for either on this backend: mmap emulation would double-buffer the data file into the WASM heap instead of avoiding a copy, and MEMFS is already memory, so there's no page cache for a bounded pool to protect against.
+**WASM supports `ioBackend: 'pread'` and `'bufferPool'`; `open` throws for `'mmap'`,** since mmap emulation would double-buffer the data file into the WASM heap instead of avoiding a copy. On WASM every `pread` is a call out to Node's `fs`, so a pool hit, which copies from WASM memory, is much faster: at 100k keys, `Get` went from 468 K to 1.25 M ops/s and a 50-key range scan from 16 K to 214 K scans/s. `directIo` has no effect on WASM, where the pool always fills through the page cache. The pool is one allocation that WASM memory keeps for the life of the process, and `capacityBytes` counts against the 4 GiB WASM address space.

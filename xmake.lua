@@ -12,11 +12,11 @@ add_requires("benchmark", {optional = true})
 -- add_requires("leveldb", {optional = true})
 add_requires("rocksdb", {system = true, optional = true})
 
--- Sanitizer option: `xmake f --sanitizer=address`, `--sanitizer=thread`, or `--sanitizer=memory`
+-- Sanitizer option: `xmake f --sanitizer=address`, `--sanitizer=thread`, `--sanitizer=memory`, or `--sanitizer=undefined`
 option("sanitizer")
     set_default("")
     set_showmenu(true)
-    set_description("Enable sanitizer (address, thread, memory, or empty to disable)")
+    set_description("Enable sanitizer (address, thread, memory, undefined, or empty to disable)")
 option_end()
 
 -- MemorySanitizer requires every translation unit — including the C++
@@ -69,6 +69,12 @@ local function apply_sanitizer(t)
         end
         if san == "address" then
             t:add("cxflags", "-fno-omit-frame-pointer", {force = true})
+        end
+        if san == "undefined" then
+            -- UBSan reports and carries on by default; a report must fail
+            -- the run.
+            t:add("cxflags", "-fno-sanitize-recover=undefined", {force = true})
+            t:add("ldflags", "-fno-sanitize-recover=undefined", {force = true})
         end
         if san:find("memory", 1, true) then
             -- Track allocation-site origins for actionable reports; see
@@ -125,12 +131,22 @@ end
 -- LTO and target CPU applied per-target to avoid polluting dependency package builds.
 -- Set BYTECASK_MARCH to override (e.g. "x86-64-v3" for portable wheels).
 -- Defaults to "native" for local development.
--- Key directory tree selection: the engine is built on the persistent B+ tree
--- (docs/persistent_btree_design.md). BYTECASK_KEYDIR=radix builds it on the
--- radix tree instead, which both trees' test suites still exercise. Applies to
--- every target so tests and benchmarks agree.
-if os.getenv("BYTECASK_KEYDIR") ~= "radix" then
+-- Key directory tree selection: the engine is built on the blind-leaf B+
+-- tree (docs/blind_leaf_btree_design.md), which stores no key bytes.
+-- BYTECASK_KEYDIR=btree builds it on the B+ tree that keeps its keys in the
+-- leaves (docs/persistent_btree_design.md), and BYTECASK_KEYDIR=radix on the
+-- radix tree; CI runs the engine suite on all three. Applies to every target
+-- so tests and benchmarks agree.
+local keydir = os.getenv("BYTECASK_KEYDIR")
+if keydir == nil or keydir == "" then
+    keydir = "blind"
+end
+if keydir ~= "radix" then
+    -- The blind tree's inner nodes and BuildSession are the B+ tree's.
     add_defines("BYTECASK_USE_BTREE")
+end
+if keydir ~= "radix" and keydir ~= "btree" then
+    add_defines("BYTECASK_KEYDIR_BLIND")
 end
 
 local march = os.getenv("BYTECASK_MARCH") or "native"
@@ -185,7 +201,7 @@ target("bytecask_tests")
 target("btree_tests")
     set_kind("binary")
     set_default(false)
-    add_files("tests/btree_test.cpp", "bytecaskdb/*.cppm")
+    add_files("tests/btree_test.cpp", "tests/blind_btree_test.cpp", "bytecaskdb/*.cppm")
     add_includedirs("bytecaskdb", "tests")
     add_packages("catch2", "crc32c")
     add_defines("BYTECASK_TESTING")
@@ -643,7 +659,11 @@ local function add_wasm_ldflags(t)
     t:add("ldflags",
         "-fwasm-exceptions",
         "-sNODERAWFS=1", "-sENVIRONMENT=node", "-lnoderawfs.js",
-        "-sMALLOC=mimalloc", "-sALLOW_MEMORY_GROWTH", "-sEXIT_RUNTIME=1",
+        -- dlmalloc, not mimalloc: WASM memory never shrinks, and mimalloc
+        -- does not reuse freed large blocks there, so each data file
+        -- rotation's hint-building buffers grew it by 70-140 MiB for good.
+        "-sMALLOC=dlmalloc", "-sALLOW_MEMORY_GROWTH", "-sMAXIMUM_MEMORY=4GB",
+        "-sEXIT_RUNTIME=1",
         "--pre-js", path.join(wasm_dir, "pre.js"),
         "--js-library", path.join(wasm_dir, "syscall_overrides.js"),
         "-L" .. path.join(wasm_crc32c, "lib"),
@@ -669,6 +689,8 @@ end
 -- Common WASM source files and crc32c dependency.
 local function add_wasm_sources()
     add_files("bytecaskdb/*.cppm")
+    -- Real link() under NODERAWFS; see the file.
+    add_files(path.join(wasm_dir, "node_linkat.c"))
     add_includedirs(path.join(wasm_crc32c, "include"))
     add_linkdirs(path.join(wasm_crc32c, "lib"))
     add_links("crc32c")
@@ -700,7 +722,8 @@ target("wasm_embind")
             -- lossy double at the JS boundary.
             "-sWASM_BIGINT",
             "-sNODERAWFS=1", "-sENVIRONMENT=node", "-lnoderawfs.js",
-            "-sMALLOC=mimalloc", "-sALLOW_MEMORY_GROWTH",
+            -- dlmalloc and the 4 GiB cap: see add_wasm_ldflags.
+            "-sMALLOC=dlmalloc", "-sALLOW_MEMORY_GROWTH", "-sMAXIMUM_MEMORY=4GB",
             "-sMODULARIZE=1", "-sEXPORT_NAME=createByteCask",
             "--pre-js", path.join(wasm_dir, "pre.js"),
             "--js-library", path.join(wasm_dir, "syscall_overrides.js"),
@@ -752,7 +775,7 @@ target("wasm_tests")
     remove_files("tests/bytecask_c_test.cpp")
     add_files("bytecaskdb-node/wasm/catch2_stringmakers.cpp")
     add_includedirs("bytecaskdb", "tests")
-    add_defines("BYTECASK_TESTING")
+    add_defines("BYTECASK_TESTING", "BYTECASK_RADIX_ACCOUNTING")
     on_config(function(t)
         local catch2_prefix = path.join(wasm_dir, "build", "catch2-wasm")
         t:add("includedirs", path.join(catch2_prefix, "include"))

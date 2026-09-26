@@ -13,7 +13,7 @@ Read this before pointing an application written for InnoDB at the engine.
 - **Foreign keys are not enforced.** `FOREIGN KEY` clauses are accepted, stored, and listed in `information_schema`, so DDL round-trips through dump and restore, but no referential check runs on `INSERT`, `UPDATE` or `DELETE`, and there are no cascades.
 - **Transactions are buffered in RAM until commit.** A transaction that modifies millions of rows holds all of them in memory. `ALTER TABLE ... ALGORITHM=COPY` and `CREATE INDEX` are exempt: they flush in batches.
 - **Long-lived snapshots defer vacuum.** `mysqldump --single-transaction` and any long transaction pin the data files they can see; space from overwritten or deleted rows is reclaimed only after they finish.
-- **Every table's key directory lives in memory.** Budget roughly 50 bytes per row per index (primary and secondary) of resident memory, in addition to MariaDB's own.
+- **Every table's key directory lives in memory.** The engine's key directory holds no key bytes, so a row costs about 14–19 bytes per index (primary and secondary) whatever the key's length: 14 measured on structured keys, which index encodings are, 19 on random ones, both at 1M keys. Budget 20 bytes per row per index of resident memory, in addition to MariaDB's own and `bytecaskdb_buffer_pool_size` if the pool is on. The row data itself stays on disk.
 - **Not supported:** `FULLTEXT` and `SPATIAL` indexes, `LOCK TABLES` blocking semantics, `HANDLER`, `INSERT DELAYED`, table-level lock priorities, `CHECKSUM TABLE ... QUICK`.
 
 ## Configuration
@@ -224,6 +224,36 @@ are listed in.
 # (default 2.5 GiB, 10 M rows; needs passwordless sudo). Compares the three
 # ByteCaskDB back-ends (buffer_pool, mmap, pread) with InnoDB.
 ./bytecaskdb-mariadb-plugin/benchmarks/memory-pressure/run-memory-pressure.sh
+```
+
+## HammerDB TPROC-C
+
+`run-hammerdb.sh` runs HammerDB's TPROC-C workload (TPC-C derived, stored
+procedures) against ByteCaskDB and InnoDB, using the same `bytecaskdb.cnf` and
+`innodb.cnf` as the sysbench runs. It builds the schema once per engine, keeps
+a copy of the data directory, and restores that copy before every
+virtual-user count, so each cell starts from the same database. Results go to
+`hammerdb_results.csv`: NOPM and TPM from HammerDB, plus the same I/O and
+memory columns as the sysbench runs, sampled over the measured window only.
+
+HammerDB is not packaged by most distributions. Unpack a release tarball from
+<https://github.com/TPC-Council/HammerDB/releases> into `~/HammerDB-<version>`,
+or pass `--hammerdb-home`.
+
+TPROC-C contends on a few hot rows: every Payment updates its warehouse row,
+and every New-Order increments a district's next order id. InnoDB makes those
+transactions wait for each other. ByteCaskDB aborts all but one of them at
+`COMMIT` with 1213, and HammerDB drops the aborted transaction and starts the
+next one. NOPM counts only committed new orders. The `aborts` column counts the
+dropped transactions.
+
+```bash
+# 20 warehouses, 16 virtual users, 2 min ramp-up, 5 min measured (defaults)
+./bytecaskdb-mariadb-plugin/benchmarks/run-hammerdb.sh --data-root=/mnt/bench
+
+# Several virtual-user counts. --reuse-data keeps the built schema at exit and
+# reuses it on the next run instead of rebuilding it.
+./bytecaskdb-mariadb-plugin/benchmarks/run-hammerdb.sh --warehouses=50 --vus=8,16,32 --data-root=/mnt/bench --reuse-data
 ```
 
 ---

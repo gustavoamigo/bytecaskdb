@@ -383,12 +383,13 @@ the engine discards the staged copy and returns `false` rather than
 publishing an identical file.
 
 This is a termination guarantee, not only an efficiency one. Fragmentation
-is measured against `live_bytes`, and tombstones and markers can never
-count towards it — hint files have no marker concept, so recovery could
-not reproduce a `live_bytes` that included them. Without this rule a
-file holding either one stays eligible at `fragmentation_threshold = 0`
-forever, and `while (db.vacuum({.fragmentation_threshold = 0.0})) {}`
-never terminates.
+counts live and tombstone bytes as kept (`1 − (live_bytes +
+tombstone_bytes) / total_bytes`), so a file of tombstones is never
+selected, but batch markers are not tracked and still read as
+reclaimable. Without this rule a file whose only dead bytes are markers
+stays eligible at `fragmentation_threshold = 0` forever, and
+`while (db.vacuum({.fragmentation_threshold = 0.0})) {}` never
+terminates.
 
 ### Atomicity
 

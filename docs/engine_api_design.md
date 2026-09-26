@@ -25,9 +25,9 @@ Canonical location: `docs/engine_api_design.md`.
 
 ### Key Directory
 
-ByteCaskDB uses `PersistentRadixTree<KeyDirEntry>` as the in-memory key directory. All keys reside in memory at all times. The immutable trie structure provides structural sharing so readers take a cheap snapshot of the root without acquiring any lock.
+ByteCaskDB uses `PersistentBlindBTree` (`bytecaskdb/blind_btree.cppm`, `docs/blind_leaf_btree_design.md`) as the in-memory key directory: a copy-on-write B+ tree whose leaves store a crit bit, a fingerprint and a record location per key, and no key bytes. All keys reside in memory at all times. The immutable structure provides structural sharing so readers take a cheap snapshot of the root without acquiring any lock. Operations that need a key's bytes — placing a key on `put`, confirming a lookup, enumerating keys — read them from the key's record.
 
-`PersistentBTree<V>` is a custom copy-on-write B+ tree implemented in `bytecaskdb/btree.cppm`. It supports get/set/erase, structural sharing between versions, and in-order iteration via `BTreeIterator<V>`. `PersistentRadixTree<V>` (`bytecaskdb/radix_tree.cppm`) offers the same surface and is selected by `BYTECASK_KEYDIR=radix`; the engine names both only through the aliases in `bytecaskdb/internals.cppm`.
+`PersistentBTree<V>` (`bytecaskdb/btree.cppm`) is the B+ tree the blind tree's inner nodes come from; with keyed leaves it is a complete key directory of its own, selected by `BYTECASK_KEYDIR=btree`. `PersistentRadixTree<V>` (`bytecaskdb/radix_tree.cppm`) offers the same surface and is selected by `BYTECASK_KEYDIR=radix`. The engine names the tree only through the aliases and `kd_*` functions in `bytecaskdb/internals.cppm`.
 
 ### Concurrency Model
 
@@ -181,8 +181,9 @@ struct ReadOptions {
 ```cpp
 // Controls which sealed files are eligible for vacuum.
 struct VacuumOptions {
-    // Minimum fragmentation ratio (1 − live_bytes / total_bytes) a sealed
-    // file must exceed to be eligible. Range [0.0, 1.0]. Default 0.5.
+    // Minimum fragmentation ratio a sealed file must exceed to be eligible:
+    // 1 − (live + tombstone bytes) / total bytes, the share compaction can
+    // reclaim. Range [0.0, 1.0]. Default 0.5.
     double fragmentation_threshold{0.5};
 };
 ```

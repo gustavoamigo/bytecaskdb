@@ -259,10 +259,9 @@ static auto string_to_mode(const std::string &s) -> bytecask::Mode {
   throw std::invalid_argument("Invalid mode: " + s + " (expected 'leader' or 'follower')");
 }
 
-// 'mmap' and 'bufferPool' parse here like any other backend, but DB::open
-// rejects both on Emscripten builds (see bytecask.cppm) — there is no page
-// cache to bound (MEMFS is already memory) and mmap emulation would only add
-// a second copy of the data file into the WASM heap.
+// 'mmap' parses here like any other backend, but DB::open rejects it on
+// Emscripten builds (see bytecask.cppm): mmap emulation would only add a
+// second copy of the data file into the WASM heap.
 static auto string_to_io_backend(const std::string &s) -> bytecask::IoBackend {
   if (s == "pread") return bytecask::IoBackend::Pread;
   if (s == "mmap") return bytecask::IoBackend::Mmap;
