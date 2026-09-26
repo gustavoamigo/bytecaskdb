@@ -351,10 +351,14 @@ public:
     // Returns the current engine mode (Leader or Follower).
     [[nodiscard]] auto mode() const noexcept -> Mode;
     // Switches mode under the write mutex. No in-flight write straddles the transition.
+    // A leader stepping down fdatasyncs first: every write it acknowledged,
+    // sync or not, is durable and so shippable by changes_since.
     void set_mode(Mode mode);
 
     // Applies pre-sequenced entries from a leader. Follower mode only.
     // Idempotent: entries with sequence <= durable_sequence() are skipped.
+    // Publishes the slice in one step: cut slices at batch boundaries, or
+    // part of an atomic batch becomes visible.
     // Throws std::logic_error if not in follower mode, DbDegraded if degraded.
     void ingest(std::span<const DataEntryView> entries);
 

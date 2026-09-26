@@ -1632,8 +1632,11 @@ without #170, hung on the rotation-barrier bug that the chaos soak had
 found independently (listed in its findings table above). See
 [`isolation_checking_design.md`](isolation_checking_design.md). Its extension
 to the whole replication protocol (bootstrap, tailing, planned transfer,
-promotion, re-targeting) is designed in
-[`replication_checking_design.md`](replication_checking_design.md).
+promotion, re-targeting, re-bootstrap) runs in the same nightly and is
+described in [`replication_checking_design.md`](replication_checking_design.md).
+Its topology runs found that a planned transfer lost writes acknowledged
+with `sync = false` (`set_mode(Follower)` now syncs), and that promoting a
+follower other than the most advanced one forks the cluster.
 
 ---
 

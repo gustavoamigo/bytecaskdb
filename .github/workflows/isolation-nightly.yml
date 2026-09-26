@@ -22,6 +22,9 @@ on:
       cluster_rounds:
         description: "Cluster rounds per job (two histories each)"
         default: "8"
+      topology_rounds:
+        description: "Topology rounds per job (two histories each)"
+        default: "6"
       seed:
         description: "Seed to replay (empty = random)"
         default: ""
@@ -142,6 +145,22 @@ jobs:
           if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
           python3 scripts/run_isolation_check.py $ARGS
 
+      # The same cluster while leadership moves: planned transfers,
+      # unplanned promotions, re-targeting and re-bootstrap.
+      # topology-behind promotes the least advanced follower and must be
+      # caught forking at least once per run.
+      - name: Run topology check
+        env:
+          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
+          ROUNDS: ${{ github.event.inputs.topology_rounds || '6' }}
+          SEED: ${{ github.event.inputs.seed || '' }}
+        run: |
+          ARGS="--binary build/linux/x86_64/${{ matrix.mode }}/isolation_history"
+          ARGS="$ARGS --elle-jar elle-cli.jar --topology --rounds $ROUNDS"
+          ARGS="$ARGS --txns ${{ matrix.txns }} --out $RUNNER_TEMP/isolation-topology"
+          if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
+          python3 scripts/run_isolation_check.py $ARGS
+
       - name: Upload histories and Elle output
         if: failure()
         uses: actions/upload-artifact@v4
@@ -150,4 +169,5 @@ jobs:
           path: |
             ${{ runner.temp }}/isolation
             ${{ runner.temp }}/isolation-cluster
+            ${{ runner.temp }}/isolation-topology
           if-no-files-found: ignore

@@ -994,6 +994,9 @@ public:
 
   // Switches the engine between Leader and Follower mode.
   // Acquires write_mu_ to ensure no in-flight write straddles the boundary.
+  // Leader -> Follower first fdatasyncs, so durable_sequence() covers every
+  // write acknowledged before the switch, sync or not. A failed fdatasync
+  // degrades the engine and throws; the mode is unchanged.
   void set_mode(Mode mode);
 
   // Returns true if the engine has entered a degraded state. A degraded DB
@@ -1125,6 +1128,8 @@ public:
   // Follower mode (throws std::logic_error otherwise). Entries with
   // sequence <= current durable_seq are silently skipped (idempotency).
   // Always syncs; never splits a BulkBegin..BulkEnd across files.
+  // Publishes the slice in one step, so the caller must end it at a batch
+  // boundary: a slice ending inside a batch publishes part of it (#188).
   void ingest(std::span<const DataEntryView> entries);
 
   // Returns all operational counters and gauges as a flat map.
@@ -3827,6 +3832,27 @@ void DB::set_mode(Mode mode) {
   WriteBarrier barrier{*this};
   auto current = load_state_for_write();
   auto t = current->transient();
+  // A leader stepping down makes every write it acknowledged durable, and
+  // so shippable: changes_since stops at durable_sequence, and a sync=false
+  // write left above it would never reach the next leader, which then
+  // reuses its sequence.
+  const auto last_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
+  if (mode == Mode::Follower && current->mode == Mode::Leader
+      && !current->degraded && t.durable_seq() < last_seq) {
+    try {
+      t.active_file().sync();
+      counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
+    } catch (...) {
+      counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
+      t.apply_degrade(std::format(
+          "set_mode(Follower) fdatasync failed on '{}': writes acknowledged "
+          "without sync are not confirmed durable. Call resume() to recover.",
+          t.active_file().path().string()));
+      store_state(current, std::move(t).persistent());
+      throw;
+    }
+    t.apply_sync(last_seq);
+  }
   t.apply_set_mode(mode);
   store_state(current, std::move(t).persistent());
 }

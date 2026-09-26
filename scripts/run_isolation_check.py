@@ -8,7 +8,7 @@ docs/replication_checking_design.md.
 Usage:
     python3 scripts/run_isolation_check.py --binary PATH [--elle-jar PATH]
         [--seed S] [--rounds N] [--txns N] [--threads N] [--out DIR]
-        [--no-vacuum] [--no-degrade] [--cluster]
+        [--no-vacuum] [--no-degrade] [--cluster] [--topology]
 
 Each round runs the three configurations from one seed:
 
@@ -34,6 +34,19 @@ and restarts, and read from), in two configurations:
                     over the run: a follower resuming below a compacted file
                     receives a batch with entries missing.
 
+With --topology each round runs the same cluster while leadership moves:
+planned transfers to a random node, unplanned promotions, re-targeting of
+every follower to the new leader, and re-bootstrap of the abandoned one. The
+old leader's writes that an unplanned promotion lost are relabelled :info.
+
+    topology         an unplanned promotion takes the most advanced follower.
+                     Must pass everything the cluster configuration does.
+    topology-behind  an unplanned promotion takes the least advanced
+                     follower. A follower ahead of the new leader keeps writes
+                     the leader lost, and at least one round over the run has
+                     to detect that fork. Once the forked node leads in turn, the fork
+                     reaches the leader history, so any finding counts.
+
 Without --elle-jar only the cross-check runs. Exit status is non-zero on any
 failed expectation. Histories and Elle's output stay under --out.
 """
@@ -52,6 +65,7 @@ from pathlib import Path
 
 CONFIGS = ("guarded", "unguarded", "blind")
 CLUSTER_CONFIGS = ("cluster", "cluster-vacuum")
+TOPOLOGY_CONFIGS = ("topology", "topology-behind")
 
 # Anomalies write skew may show up as under strict-serializable. Anything
 # else in the unguarded configuration is a bug in the implicit W-W check or
@@ -182,22 +196,77 @@ def describe(analysis: dict) -> str:
             f"not={analysis.get('not', [])}")
 
 
-def replication_checks(history: list[dict]) -> list[str]:
-    """Checks follower reads against the leader's commit order.
+def relabel_lost_writes(history: list[dict], summary: dict) -> int:
+    """Marks what an unplanned promotion lost as indeterminate.
 
-    prefix       a follower read is a prefix of the leader's history: if it
-                 shows an append committed at sequence S, it shows every
-                 committed append at or below S on the keys it read.
+    Replication is asynchronous: when a follower is promoted without the old
+    leader, the old leader's writes above the promoted node's
+    durable_sequence() in its last term are lost by design, and so is
+    anything its clients read of them. Those :ok operations become :info
+    with their reads cleared, which Elle and the cross-checks accept either
+    way. A session read there that waited above that sequence waited on the
+    lost branch, so its wait is capped at it. A lost write that shows up on
+    another node is still caught: only operations on the old leader are
+    relabelled. Returns how many.
+    """
+    changed = 0
+    for ev in summary.get("events", []):
+        if ev["kind"] != "unplanned":
+            continue
+        old, epoch, durable = ev["from"], ev["epoch"], ev["durable"]
+        tenure = [op for op in history
+                  if op.get("node") == old and op.get("epoch") == epoch - 1
+                  and op["type"] == "ok"]
+        lost_elements: set[int] = set()
+        for op in tenure:
+            if op.get("role") == "leader" and op.get("sequence", 0) > durable:
+                lost_elements.update(
+                    m[2] for m in op["value"] if m[0] == "append")
+        for op in tenure:
+            # A session read there waited on the lost branch: sequences above
+            # durable were reassigned by the new leader. What it waited for
+            # still holds up to durable.
+            if op.get("wait", 0) > durable:
+                op["wait"] = durable
+            wrote_lost = any(m[0] == "append" and m[2] in lost_elements
+                             for m in op["value"])
+            read_lost = any(m[0] == "r" and set(m[2] or []) & lost_elements
+                            for m in op["value"])
+            if wrote_lost or read_lost:
+                op["type"] = "info"
+                op["value"] = [[m[0], m[1], None] if m[0] == "r" else m
+                               for m in op["value"]]
+                op.pop("sequence", None)
+                changed += 1
+    return changed
+
+
+def leader_history(history: list[dict], final_leader: int) -> list[dict]:
+    """The operations a leader served: client transactions, and the final
+    read of the final leader."""
+    return [op for op in history
+            if op.get("role", "leader") == "leader"
+            or (op.get("role") == "final" and op.get("node") == final_leader)]
+
+
+def replication_checks(history: list[dict], final_leader: int) -> list[str]:
+    """Checks every node's reads against the leaders' commit order.
+
+    prefix       a read on a node that is not serving as leader is a prefix
+                 of the leaders' history: if it shows an append committed at
+                 sequence S, it shows every committed append at or below S
+                 on the keys it read.
     session      a read made after durable_sequence(W) returned >= W shows
                  every committed append at or below W.
     monotonic    a read on a node shows no less of a key than any read on the
                  same node that completed before it was invoked.
-    convergence  every node's final value of every key equals the leader's.
+    convergence  every node's final read of every key equals the final
+                 leader's.
     """
     elem_seq: dict[int, int] = {}
     ok_by_key: dict[int, list[tuple[int, int]]] = defaultdict(list)
     for op in history:
-        if op["type"] == "ok" and op.get("node", 0) == 0:
+        if op["type"] == "ok" and op.get("role", "leader") == "leader":
             seq = op.get("sequence", 0)
             for m in op["value"]:
                 if m[0] == "append":
@@ -210,6 +279,7 @@ def replication_checks(history: list[dict]) -> list[str]:
     final: dict[int, dict[int, list[int]]] = defaultdict(dict)
     for op in history:
         node = op.get("node", 0)
+        role = op.get("role", "leader")
         reads = [m for m in op["value"] if m[0] == "r"]
         if op["type"] == "invoke":
             floors[op["process"]] = {m[1]: longest[(node, m[1])] for m in reads}
@@ -224,9 +294,9 @@ def replication_checks(history: list[dict]) -> list[str]:
                     f"node {node} key {key}: read {lst} after a completed read "
                     f"of length {floor[key]}")
             longest[(node, key)] = max(longest[(node, key)], len(lst))
-            if len(lst) >= len(final[node].get(key, [])):
+            if role == "final":
                 final[node][key] = lst
-        if node == 0 or not reads:
+        if role == "leader" or not reads:
             continue
         cut = max((elem_seq[e] for m in reads for e in m[2] if e in elem_seq),
                   default=0)
@@ -244,13 +314,14 @@ def replication_checks(history: list[dict]) -> list[str]:
                     f"node {node} key {m[1]}: read {m[2]} after waiting for "
                     f"sequence {wait} misses committed appends {late[:8]}")
     for node in final:
-        if node == 0:
+        if node == final_leader:
             continue
-        for key in sorted(set(final[0]) | set(final[node])):
-            if final[node].get(key, []) != final[0].get(key, []):
+        for key in sorted(set(final[final_leader]) | set(final[node])):
+            if final[node].get(key, []) != final[final_leader].get(key, []):
                 found["convergence"].append(
                     f"node {node} key {key}: final {final[node].get(key)} but "
-                    f"leader final {final[0].get(key)}")
+                    f"leader (node {final_leader}) final "
+                    f"{final[final_leader].get(key)}")
 
     problems = []
     for kind, items in sorted(found.items()):
@@ -276,9 +347,23 @@ def cluster_summary_problems(summary: dict) -> list[str]:
     return problems
 
 
+def describe_events(summary: dict) -> str:
+    counts: dict[str, int] = defaultdict(int)
+    forks = 0
+    for ev in summary.get("events", []):
+        counts[ev["kind"]] += 1
+        if ev["kind"] == "retarget" and ev["durable"] > ev["other_durable"]:
+            forks += 1
+    parts = [f"{k}={v}" for k, v in sorted(counts.items())]
+    if forks:
+        parts.append(f"retargets-ahead-of-source={forks}")
+    return " ".join(parts) or "none"
+
+
 def check_cluster_round(args: argparse.Namespace, seed: int,
                         round_dir: Path) -> None:
-    for config in CLUSTER_CONFIGS:
+    configs = TOPOLOGY_CONFIGS if args.topology else CLUSTER_CONFIGS
+    for config in configs:
         history_path = round_dir / f"{config}.json"
         cmd = [str(args.binary), "--config", "guarded", "--seed", str(seed),
                "--txns", str(args.txns), "--threads", str(args.threads),
@@ -287,6 +372,10 @@ def check_cluster_round(args: argparse.Namespace, seed: int,
                "--out", str(history_path)]
         cmd.append("--force-vacuum" if config == "cluster-vacuum"
                    else "--no-vacuum")
+        if config.startswith("topology"):
+            cmd.append("--topology")
+        if config == "topology-behind":
+            cmd.append("--promote-least")
         if args.no_degrade:
             cmd.append("--no-degrade")
         subprocess.run(cmd, check=True)
@@ -295,41 +384,53 @@ def check_cluster_round(args: argparse.Namespace, seed: int,
         history = json.loads(history_path.read_text())
         summary = json.loads(
             Path(str(history_path) + ".cluster.json").read_text())
-        leader = [op for op in history if op.get("node", 0) == 0]
-        leader_problems = cross_check(leader)
-        print(f"  {config}: leader cross-check "
-              f"{'clean' if not leader_problems else leader_problems[:3]}")
-        if leader_problems:
-            raise CheckFailed(f"{config}: leader cross-check failed")
+        final_leader = summary.get("final_leader", 0)
+        relabelled = relabel_lost_writes(history, summary)
+        if relabelled:
+            history_path.write_text(json.dumps(history))
+        print(f"  {config}: events {describe_events(summary)}; "
+              f"{relabelled} operations lost to unplanned promotions")
         setup = cluster_summary_problems(summary)
         if setup:
             for p in setup[:10]:
                 print(f"    {p}")
             raise CheckFailed(f"{config}: bootstrap or replication errors")
 
-        problems = replication_checks(history)
+        leader = leader_history(history, final_leader)
+        leader_problems = cross_check(leader)
+        print(f"  {config}: leader cross-check "
+              f"{'clean' if not leader_problems else ''}")
+        for p in leader_problems[:10]:
+            print(f"    {p}")
+        problems = replication_checks(history, final_leader)
         print(f"  {config}: replication checks "
               f"{'clean' if not problems else ''}")
         for p in problems[:12]:
             print(f"    {p}")
         elle_found = False
+        leader_valid = True
         if args.elle_jar:
             leader_path = round_dir / f"{config}-leader.json"
             leader_path.write_text(json.dumps(leader))
             a = run_elle(args.elle_jar, leader_path, "strict-serializable",
                          round_dir / f"elle-{config}-leader")
             print(f"  {config}: leader strict-serializable {describe(a)}")
-            if a.get("valid?") is not True:
-                raise CheckFailed(f"{config}: leader not strict-serializable")
+            leader_valid = a.get("valid?") is True
             a = run_elle(args.elle_jar, history_path, "serializable",
                          round_dir / f"elle-{config}-all")
             print(f"  {config}: all nodes serializable {describe(a)}")
             elle_found = a.get("valid?") is not True
-        if config == "cluster":
-            if problems or elle_found:
-                raise CheckFailed("cluster: replication checks failed")
-        else:
+        if config == "cluster-vacuum":
+            if leader_problems or not leader_valid:
+                raise CheckFailed(f"{config}: leader checks failed")
             args.v168_seen |= bool(problems) or elle_found
+        elif config == "topology-behind":
+            # A forked follower can later lead, so the fork may show in the
+            # leader history too: any finding counts.
+            args.fork_seen |= (bool(leader_problems) or not leader_valid
+                               or bool(problems) or elle_found)
+        elif leader_problems or not leader_valid or problems or elle_found:
+            raise CheckFailed(f"{config}: checks failed")
 
 
 def check_round(args: argparse.Namespace, seed: int, round_dir: Path) -> None:
@@ -405,6 +506,9 @@ def main() -> int:
     parser.add_argument("--no-vacuum", action="store_true")
     parser.add_argument("--no-degrade", action="store_true")
     parser.add_argument("--cluster", action="store_true")
+    parser.add_argument("--topology", action="store_true",
+                        help="cluster with planned transfers, unplanned "
+                             "promotions, re-targeting and re-bootstrap")
     args = parser.parse_args()
 
     seed = args.seed if args.seed is not None else random.SystemRandom().getrandbits(63)
@@ -415,27 +519,34 @@ def main() -> int:
           f"--seed {seed} --rounds {args.rounds} --txns {args.txns} "
           f"--threads {args.threads}"
           + (f" --elle-jar {args.elle_jar}" if args.elle_jar else "")
-          + (" --cluster" if args.cluster else ""))
+          + (" --cluster" if args.cluster else "")
+          + (" --topology" if args.topology else ""))
     sys.stdout.flush()
 
     shutil.rmtree(args.out, ignore_errors=True)
     args.write_skew_seen = False
     args.v168_seen = False
+    args.fork_seen = False
     rng = random.Random(seed)
     try:
         for r in range(args.rounds):
             round_seed = rng.getrandbits(63)
             print(f"round {r + 1}/{args.rounds} seed={round_seed}")
             sys.stdout.flush()
-            if args.cluster:
+            if args.cluster or args.topology:
                 check_cluster_round(args, round_seed, args.out / f"round-{r}")
             else:
                 check_round(args, round_seed, args.out / f"round-{r}")
-        if args.cluster and not args.v168_seen:
+        if args.cluster and not args.topology and not args.v168_seen:
             raise CheckFailed(
                 "cluster-vacuum: no round detected #168; the harness is not "
                 "shown to be sensitive to gaps in changes_since")
-        if args.elle_jar and not args.cluster and not args.write_skew_seen:
+        if args.topology and not args.fork_seen:
+            raise CheckFailed(
+                "topology-behind: no round detected a fork; the harness is "
+                "not shown to be sensitive to a follower ahead of its leader")
+        if (args.elle_jar and not args.cluster and not args.topology
+                and not args.write_skew_seen):
             raise CheckFailed(
                 "unguarded: Elle reported no write skew in any round; the "
                 "harness is not shown to be sensitive to it")

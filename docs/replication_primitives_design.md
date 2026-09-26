@@ -252,13 +252,17 @@ The snapshot determines the upper bound of the stream — `changes_since` yields
 
 ```
 1. Detect leader failure (external coordinator)
-2. Follower stops replication loop
-3. follower.set_mode(Mode::Leader)
-4. Writes resume — next_sequence continues from last ingested sequence
-5. Other followers re-target the new leader
+2. Every follower stops its replication loop from the old leader
+3. Pick the follower with the highest durable_sequence()
+4. follower.set_mode(Mode::Leader)
+5. Writes resume — next_sequence continues from last ingested sequence
+6. Other followers re-target the new leader
+7. The old leader, if it comes back, is re-bootstrapped from a manifest
 ```
 
 No sequence reset, no gap. The promoted follower's sequence space is a strict continuation of the old leader's.
+
+The promoted follower must be the most advanced one. A follower ahead of it holds entries at sequences the new leader will assign to new writes, and `ingest` skips an entry at or below the follower's `durable_sequence()` as a duplicate: that follower would keep the old leader's writes, drop the new leader's, and never report it. Step 2 must finish before step 3, so no follower advances after the choice. The old leader's writes above the promoted follower's `durable_sequence()` are lost; replication is asynchronous.
 
 ### Leadership Transfer (planned)
 
@@ -273,6 +277,8 @@ Graceful leadership transfer uses `set_mode(Mode::Follower)` on the old leader t
 ```
 
 No drain mode is needed. Writes are mutex-serialized — a write is either holding the lock and completes before the mode switch, or it doesn't hold the lock and the next attempt is rejected. There is no intermediate "in-flight" state, so the mode switch is a clean cut.
+
+Step 1 also makes every acknowledged write durable: `set_mode(Mode::Follower)` on a leader calls `fdatasync` before it returns. `changes_since` stops at `durable_sequence()`, so without it a write acknowledged with `sync = false` would never reach the target, and step 3's wait would pass without it.
 
 ---
 
@@ -291,7 +297,7 @@ ByteCaskDB does not care who is consuming or why. It surfaces the ordered stream
 
 The proof framework for replication primitives follows the same model used in [`docs/correctness_validation.md`](correctness_validation.md): StateShape × OpsShape × FailureClass → expected delta, validated against invariants. The validation proves the correctness guarantees expressed in [`CONTRACT.md`](../CONTRACT.md).
 
-The proof framework checks one call at a time. The replication check ([`replication_checking_design.md`](replication_checking_design.md)) runs the protocol end to end every night: a leader under concurrent load, and two followers that are bootstrapped from a manifest and tailed, with lag, duplicate delivery and restarts. With leader vacuum off, bootstrap, prefix consistency, read-your-writes after `durable_sequence`, monotonic follower reads and convergence all hold. With leader vacuum on, prefix consistency and read-your-writes fail, as #168 describes: `changes_since` hands a lagging follower history with entries missing. Planned transfer, promotion and re-targeting are not checked yet.
+The proof framework checks one call at a time. The replication check ([`replication_checking_design.md`](replication_checking_design.md)) runs the protocol end to end every night: a leader under concurrent load, and two followers that are bootstrapped from a manifest and tailed, with lag, duplicate delivery and restarts. With leader vacuum off, bootstrap, prefix consistency, read-your-writes after `durable_sequence`, monotonic follower reads and convergence all hold. With leader vacuum on, prefix consistency and read-your-writes fail, as #168 describes: `changes_since` hands a lagging follower history with entries missing. Planned transfers, unplanned promotions, re-targeting and re-bootstrap run in the same check, with leadership moving every few hundred milliseconds under load; each leader is strict-serializable and every node converges. That run found both rules above: a randomly chosen promotion target forked a follower that was ahead of it, and a planned transfer lost `sync = false` writes before `set_mode(Follower)` synced.
 
 ### Proof Framework
 

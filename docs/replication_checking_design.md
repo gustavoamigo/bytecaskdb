@@ -1,7 +1,7 @@
 # Replication Checking with Elle
 
-Status: step 1 (tailing, fixed leader) implemented and running nightly;
-step 2 (topology) designed. Tracks [#178](https://github.com/gustavoamigo/bytecaskdb/issues/178).
+Status: step 1 (tailing, fixed leader) and step 2 (topology) implemented
+and running nightly. Tracks [#178](https://github.com/gustavoamigo/bytecaskdb/issues/178).
 Extends the isolation check in [`isolation_checking_design.md`](isolation_checking_design.md).
 
 ## Purpose
@@ -79,7 +79,7 @@ view under a shared lock, and topology changes take it exclusively.
 |---|---|---|
 | Bootstrap | pause leader vacuum; `create_manifest()`; copy the manifest files; open a follower on them; resume vacuum; start tailing from its `durable_sequence()` | the first `changes_since` after the manifest continues at `through_sequence + 1`, with no gap and no overlap |
 | Planned transfer | `leader.set_mode(Follower)`; wait until the target's `durable_sequence()` equals the old leader's; `target.set_mode(Leader)`; re-target the other followers; switch the view | every write acknowledged by the old leader is on the new one; writes refused by the old leader stay invisible |
-| Unplanned promotion | stop tailing into the target; `target.set_mode(Leader)`; switch the view; abandon the old leader (clients get `:info` for writes in flight); re-bootstrap it later from the new leader | the promoted node's history is a prefix of the old leader's durable history |
+| Unplanned promotion | cut every follower off the old leader and fence it (`set_mode(Follower)`); let any ingest in flight finish; promote the follower with the highest `durable_sequence()`; re-target the others; switch the view; re-bootstrap the old leader later from the new leader | the promoted node's history is a prefix of the old leader's durable history, and no follower is ahead of it |
 | Follower restart | close a follower and reopen it; resume tailing from its `durable_sequence()` | monotonic reads across the restart |
 | Lag | pause one replication thread for 50–500 ms | nothing, beyond the checks below |
 | Duplicate delivery | restart one `changes_since` from `durable_sequence() - k` | `ingest` skips what it already holds |
@@ -119,48 +119,32 @@ but not older than".
 |---|---|---|---|
 | `cluster` | off | all | every check passes |
 | `cluster-vacuum` | on | all, with lag | **detects #168**: a follower that resumes `changes_since` below a compacted file receives a batch with entries missing |
+| `topology` | off | tailing, planned transfers, unplanned promotions of the most advanced follower, re-bootstrap | every check passes |
+| `topology-behind` | off | as `topology`, but an unplanned promotion takes the least advanced follower | **detects the fork** below in at least one round of the run |
 
 `cluster-vacuum` plays the role `blind` plays in #94: it shows that the
 harness finds the failure it is aimed at. It is an expected failure until
-#168 is fixed, and a regression check after that.
-
-## Likely findings
-
-**Re-targeting after an unplanned promotion can fork silently.** Take a
-follower `n2` that is ahead of the promoted node `n1`, because it tailed the
-old leader further. When `n2` re-targets `n1`, `n1` assigns fresh writes the
-sequences `n2` already holds. `ingest` skips entries at or below
-`durable_sequence()` as duplicates, so `n2` would drop `n1`'s new writes and
-keep the old leader's, with no error. The design says only "other followers
-re-target the new leader". The harness draws the promotion target at random,
-so it will reach this case. The convergence check should catch it. Unless a
-guard already prevents it, it becomes an issue: either promote the
-most-advanced follower, or have a follower refuse a source whose
-`durable_sequence()` is behind its own and re-bootstrap instead.
+#168 is fixed, and a regression check after that. `topology-behind` does
+the same for the promotion rule: without it, the checks must find a fork.
+Once a forked node leads in turn, the fork reaches the leader history too,
+so any finding counts there.
 
 ## Open questions
 
-1. **Mid-batch `ingest` slices.** `ingest` publishes whatever slice it is
-   given in one step, and only its rotation chunking respects batch
-   markers. A caller that cuts a slice between `BulkBegin` and `BulkEnd`
-   publishes half a batch on the follower. The proof tests cut at batch
-   boundaries themselves (`gen_incremental_test`), and no contract says the
-   caller must. Two options:
-   - document it as a caller obligation in `CONTRACT.md`, have the harness
-     cut at batch boundaries, and add a harness mode that cuts anywhere to
-     show the consequence; or
-   - make `ingest` hold back or refuse a trailing incomplete batch, which is
-     a behaviour change and belongs in its own issue.
-
-   Recommendation: the first for this harness, and an issue for the second.
+1. **Mid-batch `ingest` slices.** Settled: `ingest` publishes whatever
+   slice it is given in one step, so a slice cut between `BulkBegin` and
+   `BulkEnd` publishes half a batch. `CONTRACT.md` now states that the
+   caller must cut at batch boundaries, and the harness does.
+   [#188](https://github.com/gustavoamigo/bytecaskdb/issues/188) tracks
+   having `ingest` hold back or refuse a trailing incomplete batch.
 2. **#168's fix shape** decides the flipped expectation for
    `cluster-vacuum`. If `changes_since` refuses to resume below a lower
    bound, the harness must treat that as "re-bootstrap this follower", not
    as a failure. Bootstrap is already an event, so the path exists.
-3. **Promotion target.** Random, which reaches the fork above, or
-   most-advanced, which is what an operator should do? Recommendation:
-   random, since the harness should look for trouble. The fork finding
-   decides what the protocol document says.
+3. **Promotion target.** Settled by the fork finding below: the protocol
+   promotes the most advanced follower, and `topology-behind`, which
+   promotes the least advanced, is the sensitivity check. A random target
+   forked in only about 40% of rounds, too few for a nightly assertion.
 
 ## Implementation
 
@@ -168,7 +152,7 @@ Two steps, so each can land green:
 
 1. **Tailing**, implemented. Bootstrap, replicate, lag, duplicates, follower
    restart, follower vacuum and follower reads, with a fixed leader.
-2. **Topology**, not yet implemented. Planned transfer, unplanned promotion,
+2. **Topology**, implemented. Planned transfer, unplanned promotion,
    re-targeting and re-bootstrap.
 
 Step 1 as built:
@@ -203,6 +187,43 @@ Step 1 as built:
   prefix, session, monotonic and convergence cross-checks. It also checks
   the bootstrap records.
 - `isolation-nightly.yml` runs 8 cluster rounds in each job.
+
+Step 2 as built:
+
+- `isolation_history --topology` starts every node as in step 1, and gives
+  every node, the leader included, a replication thread and readers, so a
+  node can change role without new threads. Each node sits behind a gate:
+  a topology change takes it exclusively, which waits for the ingest or
+  read in flight on that node. The replication thread reads the view with
+  the gate held, so a re-target never races an ingest. Readers back off
+  while anyone waits for the gate exclusively, and that wait is a count,
+  not a flag. With a flag, a drain releasing the gate cleared it while a
+  follower's restart was still waiting. Readers came back in, each held the
+  gate through a session wait on data only that follower would ingest, and
+  glibc's reader-preferring rwlock starved the restart for good: about one
+  run in 60 ended with a follower stuck below the final leader. The degrade nemesis
+  is off: a leader that steps down or is promoted is not also degraded.
+- Once every follower is up, an orchestrator applies an event every
+  100–400 ms, planned or unplanned with equal odds. A planned transfer
+  picks a random target. An unplanned promotion is described in the table above;
+  `--promote-least` inverts its choice of target. A node the
+  promotion abandoned is re-bootstrapped from the new leader before the
+  next event.
+- Every operation carries its `epoch` and `role` (`leader`, `reader`,
+  `final`). The summary records each event with the promoted node's
+  `durable_sequence()` and, for a re-target, the re-targeted node's.
+- At the end, abandoned nodes are re-bootstrapped, a sync write goes to the
+  final leader, every node must catch up to it, and every node reads every
+  key.
+- `run_isolation_check.py --topology` relabels what an unplanned promotion
+  lost: an `:ok` operation on the old leader in its last epoch that wrote or
+  read an element above the promoted node's `durable_sequence()` becomes
+  `:info` with its reads cleared. A session read there that waited above
+  that sequence waited on the lost branch, whose sequences the new leader
+  reassigns, so its wait is capped at it. The leader history is every
+  `leader` operation plus the final leader's final reads; it goes through
+  the #94 checks. The replication checks run over every node, with
+  convergence against the final leader.
 
 The manifest-boundary check is done at bootstrap, not on the first tailed
 entry. A failed write consumes sequences, so a gap after `through_sequence`
@@ -240,7 +261,30 @@ needs more than a timestamp*. The regression test is "pipeline: a write one
 reader has seen is visible to every later reader, while its publication is
 still in progress". It fails on `main` 3 times out of 3.
 
-Step 2 is still to come, including the fork case above.
+**Re-targeting after an unplanned promotion forked silently.** With the
+target drawn at random, a follower `n2` ahead of the promoted `n1`, because
+it had tailed the old leader further, re-targeted `n1`. `n1` assigned its
+new writes sequences `n2` already held, and `ingest` skipped them as
+duplicates: `n2` kept the old leader's writes and dropped `n1`'s, with no
+error. It showed as convergence and prefix violations in 5 of 6 seeds, and
+Elle reported the whole history not serializable (G2-item). The leader
+history stayed strict-serializable. The fix is in the protocol, not the
+engine: cut every follower off the old leader, let the ingest in flight
+finish, and promote the most advanced follower. No follower can then be
+ahead of the new leader. `replication_primitives_design.md` now says so.
+
+**A planned transfer lost acknowledged `sync=false` writes.** In a run
+with only planned transfers, node 1 acknowledged an append at sequence
+8664, and the transfer recorded node 1's `durable_sequence()` as 8663. The
+append was missing from the final read. `set_mode(Follower)` drained the
+commit pipeline but never called `fdatasync`, so a write acknowledged
+without sync stayed above `durable_sequence()`, and `changes_since`, which
+stops there, never shipped it. The new leader then reused its sequence.
+`set_mode(Follower)` on a leader now `fdatasync`s first, so a leader that
+steps down has made every write it acknowledged durable, and the transfer's
+catch-up wait covers them all.
+
+With both fixes, `topology` passed every local round.
 
 ## Acceptance
 
