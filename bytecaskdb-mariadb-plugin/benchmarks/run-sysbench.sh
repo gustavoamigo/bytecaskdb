@@ -30,6 +30,12 @@
 #                 run left under --data-root, and keep them at exit. The table
 #                 size must match what was loaded; a mutating workload leaves
 #                 its changes behind for the next run.
+#   --profile: durability profile (default: acid). acid starts each engine with
+#              <engine>.cnf, where a commit is durable before it returns. fast
+#              uses <engine>-fast.cnf instead: a commit survives a mariadbd crash
+#              but not an OS crash (InnoDB flush_log_at_trx_commit=2,
+#              ByteCaskDB bytecaskdb_sync=AT_INTERVAL, MyRocks
+#              rocksdb_flush_log_at_trx_commit=2). Recorded in every CSV row.
 #   --data-root: directory under which the ephemeral mariadbd instances create their
 #                data/tmp/socket files (default: repository root). Point it at a
 #                filesystem that supports native fdatasync/O_DIRECT when the repo
@@ -77,6 +83,7 @@ WORKLOADS="oltp_point_select oltp_read_write oltp_insert oltp_write_only"
 CREATE_SECONDARY="on"
 DATA_ROOT=""
 REUSE_DATA="off"
+PROFILE="acid"
 
 #WORKLOADS="oltp_read_only:points_only oltp_read_only:ranges_only oltp_read_only:simple_range oltp_read_only:sum_range oltp_read_only:order_range oltp_read_only:distinct_range"
 
@@ -98,8 +105,9 @@ for arg in "$@"; do
     --data-root=*)  DATA_ROOT="${arg#*=}" ;;
     --no-secondary-index) CREATE_SECONDARY="off" ;;
     --reuse-data)   REUSE_DATA="on" ;;
+    --profile=*)    PROFILE="${arg#*=}" ;;
     --help|-h)
-      echo "Usage: $0 [--table-size=N] [--threads=1,4,8] [--time=30] [--warmup=60] [--engines=bytecaskdb,innodb,rocksdb] [--workloads=oltp_insert] [--data-root=PATH] [--no-secondary-index] [--reuse-data]"
+      echo "Usage: $0 [--table-size=N] [--threads=1,4,8] [--time=30] [--warmup=60] [--engines=bytecaskdb,innodb,rocksdb] [--workloads=oltp_insert] [--data-root=PATH] [--no-secondary-index] [--reuse-data] [--profile=acid|fast]"
       exit 0
       ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
@@ -205,6 +213,7 @@ done
 if [[ ${#ACTIVE_ENGINES[@]} -eq 0 ]]; then
   echo "ERROR: no engines to benchmark"; exit 1
 fi
+check_profile "$PROFILE" "${ACTIVE_ENGINES[@]}"
 
 start_engine() {
   local engine="$1"
@@ -220,7 +229,8 @@ start_engine() {
   esac
   start_mariadbd \
     "$dir/data" "$dir/mysql.sock" "$(engine_port "$engine")" \
-    "$dir/mariadbd.pid" "$dir/error.log" "$SCRIPT_DIR/$engine.cnf" \
+    "$dir/mariadbd.pid" "$dir/error.log" \
+    "$(engine_defaults_file "$engine" "$PROFILE")" \
     "${extra[@]}"
 }
 
@@ -356,7 +366,7 @@ run_bench() {
     echo "$output" | tail -20 >&2
   fi
 
-  echo "$engine,$workload,$threads,$tps,$qps,$avg_lat,$p95,$err,$io_cols,$eng_cols,$flush_mib,$rss_cols"
+  echo "$engine,$workload,$threads,$tps,$qps,$avg_lat,$p95,$err,$io_cols,$eng_cols,$flush_mib,$rss_cols,$PROFILE"
 }
 
 # Echoes the collected CSV row for a cell, or nothing.
@@ -382,6 +392,7 @@ echo "    Engines: ${ACTIVE_ENGINES[*]}"
 echo "    Table size: $TABLE_SIZE rows | Warm-up: ${WARMUP}s | Duration: ${DURATION}s per run"
 echo "    Threads: ${THREADS}"
 echo "    Workloads: $WORKLOADS"
+echo "    Durability profile: $PROFILE"
 echo "    Data root: $DATA_ROOT"
 if engine_enabled rocksdb && [[ -z "$ROCKSDB_PLUGIN_DIR" ]]; then
   echo "    RocksDB: SKIPPED (plugin not found)"
@@ -407,7 +418,7 @@ fi
 echo ""
 
 echo "=== Phase 2: running workloads ==="
-echo "engine,workload,threads,tps,qps,avg_lat_ms,p95_ms,err_per_s,read_mib,write_mib,syscr,syscw,eng_write_mib,eng_fsyncs,flush_mib,rss_mib,peak_rss_mib" > "$RESULTS_CSV"
+echo "engine,workload,threads,tps,qps,avg_lat_ms,p95_ms,err_per_s,read_mib,write_mib,syscr,syscw,eng_write_mib,eng_fsyncs,flush_mib,rss_mib,peak_rss_mib,profile" > "$RESULTS_CSV"
 declare -a ALL_RESULTS=()
 
 for workload in $WORKLOADS; do
