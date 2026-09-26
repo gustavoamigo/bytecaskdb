@@ -22,14 +22,11 @@ Usage:
     --rounds N            Interleaved rounds (default 3).
     --configs LIST        Comma-separated from {radix, btree} (default: both).
     --bench-dir DIR        Where the test DB is written (default: ./.tmp).
-                           Point this at a real disk, not tmpfs, to see
-                           genuine I/O rather than an in-memory measurement.
-    --drop-caches          Evict the page cache before each timed recovery
-                           (BC_DROP_CACHES=1). Needs root
-                           (CAP_SYS_ADMIN) — the process writes to
-                           /proc/sys/vm/drop_caches. Meaningless on a VM
-                           whose "cold" reads are still served from host
-                           RAM; check with a plain dd first if unsure.
+                           The benchmark measures a cold start: it evicts
+                           the DB's files from the page cache before each
+                           timed recovery. Point this at a real disk, not
+                           tmpfs, where eviction has nothing to drop. On a
+                           VM, "cold" reads may still come from host RAM.
     --cpus RANGE           taskset CPU range, e.g. "0-3" (default: unpinned).
     --skip-build            Skip building; use existing eb_radix/eb_btree
                              binaries in build/linux/x86_64/release/.
@@ -150,7 +147,6 @@ def run_one(
     threads_filter: str,
     dataset_size: int,
     bench_dir: str,
-    drop_caches: bool,
     cpus: str | None,
     extra_flags: list[str],
     json_out_dir: Path | None,
@@ -176,8 +172,6 @@ def run_one(
     env = os.environ.copy()
     env["BC_DATASET_SIZE"] = str(dataset_size)
     env["BC_BENCH_DIR"] = bench_dir
-    if drop_caches:
-        env["BC_DROP_CACHES"] = "1"
 
     print(f"round {round_num} {config}: " + " ".join(cmd))
     subprocess.run(cmd, cwd=REPO_ROOT, check=True, env=env)
@@ -211,7 +205,6 @@ def main() -> None:
     p.add_argument("--rounds", type=int, default=3)
     p.add_argument("--configs", default=",".join(ALL_CONFIGS))
     p.add_argument("--bench-dir", default=str(REPO_ROOT / ".tmp"))
-    p.add_argument("--drop-caches", action="store_true")
     p.add_argument("--cpus", default=None)
     p.add_argument("--skip-build", action="store_true")
     p.add_argument("--no-rocksdb", action="store_true")
@@ -231,11 +224,6 @@ def main() -> None:
             print(f"error: unknown config {c!r}; choose from {ALL_CONFIGS}",
                   file=sys.stderr)
             sys.exit(1)
-
-    if args.drop_caches and os.geteuid() != 0:
-        print("warning: --drop-caches needs root to write "
-              "/proc/sys/vm/drop_caches; it will silently no-op otherwise.",
-              file=sys.stderr)
 
     os.makedirs(args.bench_dir, exist_ok=True)
     json_out_dir = Path(args.json_out) if args.json_out else None
@@ -258,7 +246,7 @@ def main() -> None:
             for config in configs:
                 data = run_one(
                     config, tfilter, args.dataset_size, args.bench_dir,
-                    args.drop_caches, args.cpus, extra_flags, json_out_dir, r,
+                    args.cpus, extra_flags, json_out_dir, r,
                 )
                 for b in data.get("benchmarks", []):
                     if b.get("run_type") != "iteration":
