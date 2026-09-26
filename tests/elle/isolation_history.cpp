@@ -95,6 +95,7 @@ struct RunOptions {
   int follower_readers{4}; // reader threads per follower
   bool lag{false};         // pause replication threads at random
   bool force_vacuum{false}; // leader vacuum on whatever the seed draws
+  bool topology{false};     // planned transfers, promotions, re-bootstraps
 };
 
 // Per-run engine and nemesis configuration, derived from the seed.
@@ -251,10 +252,28 @@ auto event_type_name(EventType t) -> std::string_view {
   return "?";
 }
 
+// Who ran an operation: a client writing to the leader, a reader of one
+// node, or the final read of every key on one node.
+enum class Role : std::uint8_t { Leader, Reader, Final };
+
+auto role_name(Role r) -> std::string_view {
+  switch (r) {
+  case Role::Leader:
+    return "leader";
+  case Role::Reader:
+    return "reader";
+  case Role::Final:
+    return "final";
+  }
+  return "?";
+}
+
 struct Event {
   std::uint64_t index{0};
   int process{0};
-  int node{0};               // 0 = leader, 1.. = follower
+  int node{0};               // the node the operation ran on
+  int epoch{0};              // cluster epoch when it was invoked
+  Role role{Role::Leader};
   std::uint64_t wait_seq{0}; // session read: the durable_sequence waited for
   EventType type{EventType::Invoke};
   std::int64_t time_ns{0};
@@ -315,10 +334,11 @@ auto write_history(const fs::path &path, std::vector<Event> events) -> void {
   for (std::size_t i = 0; i < events.size(); ++i) {
     const auto &e = events[i];
     line.clear();
-    line += std::format(R"({{"index":{},"process":{},"node":{},"type":"{}",)"
-                        R"("f":"txn","time":{},"value":[)",
-                        e.index, e.process, e.node, event_type_name(e.type),
-                        e.time_ns);
+    line += std::format(R"({{"index":{},"process":{},"node":{},"epoch":{},)"
+                        R"("role":"{}","type":"{}","f":"txn","time":{},)"
+                        R"("value":[)",
+                        e.index, e.process, e.node, e.epoch, role_name(e.role),
+                        event_type_name(e.type), e.time_ns);
     for (std::size_t j = 0; j < e.value.size(); ++j) {
       const auto &m = e.value[j];
       if (j != 0) line.push_back(',');
@@ -437,11 +457,13 @@ struct Totals {
 // records the completion. inject_sync arms a fault at io_data_file_sync
 // around the call: the solo path appends on this thread, and the fdatasync
 // fails here too when this thread holds the flush role.
-// Where a transaction runs, for the history: node 0 is the leader. wait_seq
-// is set on a follower's session read.
+// Where a transaction runs, for the history. wait_seq is set on a session
+// read.
 struct Placement {
   int process{0};
   int node{0};
+  int epoch{0};
+  Role role{Role::Leader};
   std::uint64_t wait_seq{0};
 };
 
@@ -452,6 +474,8 @@ auto run_one(bytecask::DB &db, Mode mode, Placement at, Recorder &rec,
   Event inv;
   inv.process = at.process;
   inv.node = at.node;
+  inv.epoch = at.epoch;
+  inv.role = at.role;
   inv.wait_seq = at.wait_seq;
   inv.value = mops;
   rec.stamp(inv);
@@ -464,6 +488,10 @@ auto run_one(bytecask::DB &db, Mode mode, Placement at, Recorder &rec,
     } else {
       outcome = execute_txn(db, mode, mops, wo);
     }
+  } catch (const bytecask::DbFollowerMode &e) {
+    // Refused at admission, before anything is appended: the node was
+    // demoted under the client. If the write ever shows up, it is G1a.
+    outcome = {.type = EventType::Fail, .sequence = 0, .error = e.what()};
   } catch (const std::exception &e) {
     outcome = {.type = EventType::Info, .sequence = 0, .error = e.what()};
   }
@@ -471,6 +499,8 @@ auto run_one(bytecask::DB &db, Mode mode, Placement at, Recorder &rec,
   Event done;
   done.process = at.process;
   done.node = at.node;
+  done.epoch = at.epoch;
+  done.role = at.role;
   done.wait_seq = at.wait_seq;
   done.type = outcome.type;
   // A failed or indeterminate transaction reports what it invoked: its reads
@@ -498,11 +528,13 @@ auto run_one(bytecask::DB &db, Mode mode, Placement at, Recorder &rec,
 }
 
 // ---------------------------------------------------------------------------
-// Cluster (#178): followers bootstrapped from the leader's manifest and fed
-// by changes_since -> ingest. See docs/replication_checking_design.md.
+// Cluster (#178): nodes bootstrapped from the leader's manifest and fed by
+// changes_since -> ingest, and with --topology, planned transfers, unplanned
+// promotions, re-targeting and re-bootstrap. See
+// docs/replication_checking_design.md.
 // ---------------------------------------------------------------------------
 
-// DB is neither copyable nor movable; the holder lets a follower be closed and
+// DB is neither copyable nor movable; the holder lets a node be closed and
 // reopened in place.
 struct DbHolder {
   bytecask::DB db;
@@ -510,31 +542,107 @@ struct DbHolder {
       : db{bytecask::DB::open(dir, opts)} {}
 };
 
-// A follower. Readers and the replication thread hold gate shared while
-// they use db; a restart takes it exclusively. glibc's rwlock prefers
-// readers, so readers back off while restarting is set, or a restart would
-// wait behind them forever.
-struct FollowerNode {
-  int node{0};
+// One node. Everything that uses db holds gate shared; a restart, promotion
+// or re-bootstrap takes it exclusively through NodeExclusive. glibc's rwlock
+// prefers readers, so users back off while exclusive_wanted is set, or the
+// exclusive holder would wait behind them forever.
+struct Node {
+  int id{0};
   fs::path dir;
-  bytecask::Options opts;
+  bytecask::Options opts; // follower options; node 0 first opens as leader
   std::shared_mutex gate;
-  std::atomic<bool> restarting{false};
-  std::unique_ptr<DbHolder> holder; // null until bootstrapped
+  std::atomic<bool> exclusive_wanted{false};
+  std::unique_ptr<DbHolder> holder; // null while not bootstrapped
 };
+
+// A shared lock on the node's gate if it has a DB and nobody is waiting for
+// it exclusively; an empty lock otherwise.
+auto enter(Node &n) -> std::shared_lock<std::shared_mutex> {
+  if (n.exclusive_wanted.load(std::memory_order_acquire)) return {};
+  std::shared_lock<std::shared_mutex> g{n.gate};
+  if (!n.holder) return {};
+  return g;
+}
+
+class NodeExclusive {
+public:
+  explicit NodeExclusive(Node &n) : n_{n} {
+    n_.exclusive_wanted.store(true, std::memory_order_release);
+    lk_ = std::unique_lock<std::shared_mutex>{n_.gate};
+  }
+  ~NodeExclusive() {
+    lk_.unlock();
+    n_.exclusive_wanted.store(false, std::memory_order_release);
+  }
+  NodeExclusive(const NodeExclusive &) = delete;
+  auto operator=(const NodeExclusive &) -> NodeExclusive & = delete;
+
+private:
+  Node &n_;
+  std::unique_lock<std::shared_mutex> lk_;
+};
+
+// Who leads, who tails whom, and which nodes serve reads. Changed only by
+// the orchestrator (and bootstraps); a node's own entry changes only while
+// the orchestrator holds that node exclusively.
+struct View {
+  int leader{0};
+  int epoch{0};
+  std::vector<int> source;   // node each node tails; -1 for none
+  std::vector<bool> serving; // bootstrapped and not abandoned
+};
+
+class ClusterView {
+public:
+  explicit ClusterView(int nodes) {
+    v_.source.assign(static_cast<std::size_t>(nodes), -1);
+    v_.serving.assign(static_cast<std::size_t>(nodes), false);
+    v_.serving[0] = true;
+  }
+  [[nodiscard]] auto get() const -> View {
+    std::shared_lock<std::shared_mutex> g{mu_};
+    return v_;
+  }
+  template <typename F> void update(F f) {
+    std::unique_lock<std::shared_mutex> g{mu_};
+    f(v_);
+  }
+
+private:
+  mutable std::shared_mutex mu_;
+  View v_;
+};
+
+auto at(std::vector<int> &v, int i) -> int & {
+  return v[static_cast<std::size_t>(i)];
+}
 
 struct Bootstrap {
   int node{0};
+  int source{0};
   std::uint64_t through_sequence{0};
   std::uint64_t durable_after_open{0};
   std::int64_t keys_compared{0};
   std::int64_t mismatches{0};
 };
 
+// A topology event, for the summary. kind is "planned", "unplanned" or
+// "retarget"; durable is the promoted node's durable_sequence() when it
+// stopped tailing (for a retarget, the retargeted node's).
+struct TopologyEvent {
+  std::string kind;
+  int epoch{0};
+  int from{0};
+  int to{0};
+  std::uint64_t durable{0};
+  std::uint64_t other_durable{0}; // planned: the old leader's; retarget: the source's
+};
+
 struct ClusterStats {
   std::mutex mu;
-  std::vector<Bootstrap> bootstraps; // under mu
-  std::vector<std::string> errors;   // under mu
+  std::vector<Bootstrap> bootstraps;  // under mu
+  std::vector<TopologyEvent> events;  // under mu
+  std::vector<std::string> errors;    // under mu
   std::atomic<int> ingests{0};
   std::atomic<int> ingest_errors{0};
   std::atomic<int> restarts{0};
@@ -546,6 +654,10 @@ struct ClusterStats {
   void error(std::string what) {
     std::lock_guard<std::mutex> g{mu};
     errors.push_back(std::move(what));
+  }
+  void event(TopologyEvent e) {
+    std::lock_guard<std::mutex> g{mu};
+    events.push_back(std::move(e));
   }
 };
 
@@ -568,59 +680,64 @@ auto ingest_owned(bytecask::DB &follower, const std::vector<OwnedEntry> &buf)
   follower.ingest(views);
 }
 
-// Phase 1 of the protocol, under load: manifest, copy, open as a follower.
-// Leader vacuum is held off from the manifest to the end of the copy, as the
-// protocol requires. The follower's state at open must equal the manifest
-// snapshot's, key for key.
-auto bootstrap(bytecask::DB &leader, FollowerNode &f, std::mutex &vacuum_gate,
+// Phase 1 of the protocol, under load: manifest from source, copy, open n as
+// a follower. The source's vacuum is held off from the manifest to the end
+// of the copy, as the protocol requires. The opened node must equal the
+// manifest's snapshot, key for key. Retries until the source can produce a
+// manifest (a degraded or demoted source cannot).
+auto bootstrap(Node &source, Node &n, std::mutex &vacuum_gate,
                const KeyPool &keys, ClusterStats &stats) -> void {
   for (;;) {
     try {
-      std::unique_lock<std::mutex> vl{vacuum_gate};
-      auto m = leader.create_manifest();
-      fs::remove_all(f.dir);
-      fs::create_directories(f.dir);
-      for (const auto &fi : m.files) {
-        fs::copy_file(fi.data_path, f.dir / fi.data_path.filename());
-        fs::copy_file(fi.hint_path, f.dir / fi.hint_path.filename());
-      }
-      vl.unlock();
-      auto h = std::make_unique<DbHolder>(f.dir, f.opts);
-
-      Bootstrap b{.node = f.node,
-                  .through_sequence = m.through_sequence,
-                  .durable_after_open = h->db.durable_sequence(),
-                  .keys_compared = keys.key_count(),
-                  .mismatches = 0};
-      bytecask::Bytes lv;
-      bytecask::Bytes fv;
-      for (std::int64_t k = 0; k < b.keys_compared; ++k) {
-        const auto kb = key_bytes(k);
-        const auto lf = m.snap.get({}, as_view(kb), lv);
-        const auto ff = h->db.get({}, as_view(kb), fv);
-        if (lf != ff || (lf && lv != fv)) ++b.mismatches;
+      std::unique_ptr<DbHolder> h;
+      Bootstrap b{.node = n.id, .source = source.id};
+      {
+        auto sg = enter(source);
+        if (!sg.owns_lock()) throw std::runtime_error{"source unavailable"};
+        std::unique_lock<std::mutex> vl{vacuum_gate};
+        auto m = source.holder->db.create_manifest();
+        fs::remove_all(n.dir);
+        fs::create_directories(n.dir);
+        for (const auto &fi : m.files) {
+          fs::copy_file(fi.data_path, n.dir / fi.data_path.filename());
+          fs::copy_file(fi.hint_path, n.dir / fi.hint_path.filename());
+        }
+        vl.unlock();
+        h = std::make_unique<DbHolder>(n.dir, n.opts);
+        b.through_sequence = m.through_sequence;
+        b.durable_after_open = h->db.durable_sequence();
+        b.keys_compared = keys.key_count();
+        bytecask::Bytes lv;
+        bytecask::Bytes fv;
+        for (std::int64_t k = 0; k < b.keys_compared; ++k) {
+          const auto kb = key_bytes(k);
+          const auto lf = m.snap.get({}, as_view(kb), lv);
+          const auto ff = h->db.get({}, as_view(kb), fv);
+          if (lf != ff || (lf && lv != fv)) ++b.mismatches;
+        }
       }
       {
         std::lock_guard<std::mutex> g{stats.mu};
         stats.bootstraps.push_back(b);
       }
-      std::unique_lock<std::shared_mutex> g{f.gate};
-      f.holder = std::move(h);
+      NodeExclusive x{n};
+      n.holder = std::move(h);
       return;
     } catch (const std::exception &) {
-      // create_manifest refuses a degraded leader; the nemesis resumes it.
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
   }
 }
 
-// Phase 2: wake on the leader's durable sequence, stream changes_since from
-// the follower's durable_sequence(), ingest in slices cut at batch
-// boundaries. Nemeses: lag pauses, duplicate delivery, follower vacuum and
-// follower restarts.
-auto replicate(bytecask::DB &leader, FollowerNode &f, bool lag,
-               std::uint64_t seed, const std::atomic<bool> &stop,
-               ClusterStats &stats) -> void {
+// Phase 2 for node n, from whichever node the view says it tails: wake on
+// the source's durable sequence, stream changes_since from n's
+// durable_sequence(), ingest in slices cut at batch boundaries. Nemeses:
+// lag pauses, duplicate delivery, vacuum on n and restarts of n. The view
+// is read with n's gate held, so a promotion (which changes n's source
+// while holding n exclusively) never races an ingest into n.
+auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
+               const ClusterView &view, bool lag, std::uint64_t seed,
+               const std::atomic<bool> &stop, ClusterStats &stats) -> void {
   std::mt19937_64 rng{seed};
   // A run lasts a few seconds, so the nemeses fire every few hundred ms.
   auto next_restart =
@@ -631,17 +748,38 @@ auto replicate(bytecask::DB &leader, FollowerNode &f, bool lag,
       stats.lag_pauses.fetch_add(1, std::memory_order_relaxed);
     }
     if (Clock::now() >= next_restart) {
-      f.restarting.store(true, std::memory_order_release);
-      std::unique_lock<std::shared_mutex> g{f.gate};
-      f.holder.reset();
-      f.holder = std::make_unique<DbHolder>(f.dir, f.opts);
-      f.restarting.store(false, std::memory_order_release);
-      stats.restarts.fetch_add(1, std::memory_order_relaxed);
       next_restart =
           Clock::now() + std::chrono::milliseconds(100 + rng() % 400);
+      // Checked under the exclusive hold: a promotion also holds the node
+      // exclusively, so the node cannot become leader between the check and
+      // the reopen (which opens it as a follower).
+      NodeExclusive x{n};
+      const auto v = view.get();
+      if (v.leader != n.id && v.serving[static_cast<std::size_t>(n.id)]) {
+        if (n.holder) {
+          n.holder.reset();
+          n.holder = std::make_unique<DbHolder>(n.dir, n.opts);
+          stats.restarts.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
     }
-    std::shared_lock<std::shared_mutex> g{f.gate};
-    auto &fdb = f.holder->db;
+    auto g = enter(n);
+    if (!g.owns_lock()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
+    }
+    auto v = view.get();
+    const auto src = at(v.source, n.id);
+    if (src < 0) {
+      g.unlock();
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      continue;
+    }
+    auto &sn = *nodes[static_cast<std::size_t>(src)];
+    auto sg = enter(sn);
+    if (!sg.owns_lock()) continue;
+    auto &fdb = n.holder->db;
+    auto &leader = sn.holder->db;
     try {
       if (rng() % 50 == 0) {
         const auto threshold = static_cast<double>(rng() % 60) / 100.0;
@@ -667,7 +805,8 @@ auto replicate(bytecask::DB &leader, FollowerNode &f, bool lag,
         if (e.entry_type == bytecask::EntryType::BulkBegin) in_batch = true;
         if (e.entry_type == bytecask::EntryType::BulkEnd) in_batch = false;
         // Slices end at batch boundaries: ingest publishes a slice in one
-        // step, and a slice cut inside a batch would publish part of it.
+        // step, and a slice cut inside a batch would publish part of it
+        // (CONTRACT.md, ingest).
         if (!in_batch && buf.size() >= target) {
           ingest_owned(fdb, buf);
           stats.ingests.fetch_add(1, std::memory_order_relaxed);
@@ -677,15 +816,15 @@ auto replicate(bytecask::DB &leader, FollowerNode &f, bool lag,
       }
       if (in_batch) {
         stats.error(std::format(
-            "node {}: changes_since ended inside a batch after {}", f.node,
-            buf.empty() ? 0 : buf.back().sequence));
+            "node {}: changes_since from node {} ended inside a batch after {}",
+            n.id, src, buf.empty() ? 0 : buf.back().sequence));
       } else if (!buf.empty()) {
         ingest_owned(fdb, buf);
         stats.ingests.fetch_add(1, std::memory_order_relaxed);
       }
     } catch (const std::exception &) {
-      // Restart from the follower's durable_sequence(), as the protocol
-      // says. A degraded leader or follower recovers through resume().
+      // Restart from n's durable_sequence(), as the protocol says. A
+      // degraded node recovers through resume().
       stats.ingest_errors.fetch_add(1, std::memory_order_relaxed);
       if (fdb.is_degraded()) {
         try {
@@ -705,28 +844,131 @@ auto store_max(std::atomic<std::uint64_t> &a, std::uint64_t v) -> void {
   }
 }
 
-auto write_cluster_summary(const fs::path &path, ClusterStats &stats)
+auto durable_of(Node &n) -> std::optional<std::uint64_t> {
+  auto g = enter(n);
+  if (!g.owns_lock()) return std::nullopt;
+  return n.holder->db.durable_sequence();
+}
+
+// Planned transfer (replication_primitives_design.md, Leadership Transfer):
+// stop writes on the leader, wait for the target to catch up, promote it,
+// re-target everyone else, the old leader included.
+auto planned_transfer(std::vector<std::unique_ptr<Node>> &nodes,
+                      ClusterView &view, int target, ClusterStats &stats)
     -> void {
+  const auto old = view.get().leader;
+  auto &on = *nodes[static_cast<std::size_t>(old)];
+  auto &tn = *nodes[static_cast<std::size_t>(target)];
+  {
+    auto g = enter(on);
+    if (!g.owns_lock()) return;
+    on.holder->db.set_mode(bytecask::Mode::Follower);
+  }
+  const auto old_durable = durable_of(on).value_or(0);
+  const auto deadline = Clock::now() + std::chrono::seconds(10);
+  while (durable_of(tn).value_or(0) < old_durable) {
+    if (Clock::now() >= deadline) {
+      stats.error(std::format("planned transfer {} -> {}: target stuck at {} "
+                              "below the old leader's {}",
+                              old, target, durable_of(tn).value_or(0),
+                              old_durable));
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  NodeExclusive x{tn};
+  const auto target_durable = tn.holder->db.durable_sequence();
+  view.update([&](View &v) { at(v.source, target) = -1; });
+  tn.holder->db.set_mode(bytecask::Mode::Leader);
+  int epoch = 0;
+  view.update([&](View &v) {
+    v.leader = target;
+    epoch = ++v.epoch;
+    for (std::size_t i = 0; i < v.source.size(); ++i) {
+      if (static_cast<int>(i) != target && v.serving[i])
+        v.source[i] = target;
+    }
+  });
+  stats.event({.kind = "planned", .epoch = epoch, .from = old, .to = target,
+               .durable = target_durable, .other_durable = old_durable});
+}
+
+// Unplanned promotion (Follower Promotion): the target stops tailing and
+// becomes leader where it stands. The old leader is abandoned (writes to
+// it are refused from then on) and re-bootstrapped later. Every other
+// serving node re-targets the new leader; one that is ahead of it is the
+// fork case, recorded with both durable sequences.
+auto unplanned_promotion(std::vector<std::unique_ptr<Node>> &nodes,
+                         ClusterView &view, int target, ClusterStats &stats)
+    -> void {
+  const auto old = view.get().leader;
+  auto &on = *nodes[static_cast<std::size_t>(old)];
+  auto &tn = *nodes[static_cast<std::size_t>(target)];
+  int epoch = 0;
+  std::uint64_t promoted_at = 0;
+  {
+    NodeExclusive x{tn};
+    view.update([&](View &v) { at(v.source, target) = -1; });
+    promoted_at = tn.holder->db.durable_sequence();
+    tn.holder->db.set_mode(bytecask::Mode::Leader);
+    view.update([&](View &v) {
+      v.leader = target;
+      epoch = ++v.epoch;
+      v.serving[static_cast<std::size_t>(old)] = false;
+      at(v.source, old) = -1;
+      for (std::size_t i = 0; i < v.source.size(); ++i) {
+        if (static_cast<int>(i) != target && v.serving[i])
+          v.source[i] = target;
+      }
+    });
+  }
+  stats.event({.kind = "unplanned", .epoch = epoch, .from = old, .to = target,
+               .durable = promoted_at, .other_durable = 0});
+  {
+    auto g = enter(on);
+    if (g.owns_lock()) on.holder->db.set_mode(bytecask::Mode::Follower);
+  }
+  const auto v = view.get();
+  for (std::size_t i = 0; i < nodes.size(); ++i) {
+    const auto id = static_cast<int>(i);
+    if (id == target || !v.serving[i]) continue;
+    stats.event({.kind = "retarget", .epoch = epoch, .from = target, .to = id,
+                 .durable = durable_of(*nodes[i]).value_or(0),
+                 .other_durable = promoted_at});
+  }
+}
+
+auto write_cluster_summary(const fs::path &path, ClusterStats &stats,
+                           int final_leader) -> void {
   std::ofstream out{path};
   if (!out) throw std::runtime_error{"cannot open " + path.string()};
   std::lock_guard<std::mutex> g{stats.mu};
   out << "{\"bootstraps\":[";
   for (std::size_t i = 0; i < stats.bootstraps.size(); ++i) {
     const auto &b = stats.bootstraps[i];
-    out << std::format(R"({}{{"node":{},"through_sequence":{},)"
+    out << std::format(R"({}{{"node":{},"source":{},"through_sequence":{},)"
                        R"("durable_after_open":{},"keys_compared":{},)"
                        R"("mismatches":{}}})",
-                       i == 0 ? "" : ",", b.node, b.through_sequence,
+                       i == 0 ? "" : ",", b.node, b.source, b.through_sequence,
                        b.durable_after_open, b.keys_compared, b.mismatches);
+  }
+  out << "],\"events\":[";
+  for (std::size_t i = 0; i < stats.events.size(); ++i) {
+    const auto &e = stats.events[i];
+    out << std::format(R"({}{{"kind":"{}","epoch":{},"from":{},"to":{},)"
+                       R"("durable":{},"other_durable":{}}})",
+                       i == 0 ? "" : ",", e.kind, e.epoch, e.from, e.to,
+                       e.durable, e.other_durable);
   }
   out << "],\"errors\":[";
   for (std::size_t i = 0; i < stats.errors.size(); ++i) {
     out << (i == 0 ? "" : ",") << '"' << json_escape(stats.errors[i]) << '"';
   }
   out << std::format(
-      R"(],"ingests":{},"ingest_errors":{},"restarts":{},"duplicates":{},)"
-      R"("lag_pauses":{},"follower_vacuums":{},"session_reads":{}}})",
-      stats.ingests.load(), stats.ingest_errors.load(),
+      R"(],"final_leader":{},"ingests":{},"ingest_errors":{},"restarts":{},)"
+      R"("duplicates":{},"lag_pauses":{},"follower_vacuums":{},)"
+      R"("session_reads":{}}})",
+      final_leader, stats.ingests.load(), stats.ingest_errors.load(),
       stats.restarts.load(), stats.duplicates.load(),
       stats.lag_pauses.load(), stats.follower_vacuums.load(),
       stats.session_reads.load());
@@ -775,6 +1017,8 @@ auto parse_args(int argc, char **argv) -> RunOptions {
       o.lag = true;
     } else if (a == "--force-vacuum") {
       o.force_vacuum = true;
+    } else if (a == "--topology") {
+      o.topology = true;
     } else {
       throw std::runtime_error{std::format("unknown argument {}", a)};
     }
@@ -792,21 +1036,40 @@ auto run(const RunOptions &o) -> int {
   auto cfg = config_for(o.seed);
   if (o.no_vacuum) cfg.vacuum = false;
   if (o.force_vacuum) cfg.vacuum = true;
-  if (o.no_degrade) cfg.degrade = false;
+  if (o.no_degrade || o.topology) cfg.degrade = false;
 
   std::printf("isolation_history: config=%s seed=%llu threads=%d txns=%d "
               "backend=%s max_file_bytes=%llu sync%%=%d vacuum=%d degrade=%d "
-              "followers=%d lag=%d\n",
+              "followers=%d lag=%d topology=%d\n",
               mode_name(o.mode).data(),
               static_cast<unsigned long long>(o.seed), o.threads, o.txns,
               backend_name(cfg.backend).data(),
               static_cast<unsigned long long>(cfg.max_file_bytes),
               cfg.sync_percent, cfg.vacuum ? 1 : 0, cfg.degrade ? 1 : 0,
-              o.followers, o.lag ? 1 : 0);
+              o.followers, o.lag ? 1 : 0, o.topology ? 1 : 0);
   std::fflush(stdout);
 
-  fs::remove_all(o.dir);
-  auto db = bytecask::DB::open(o.dir, db_options(cfg));
+  // Node 0 opens as the leader; every other node is bootstrapped from the
+  // leader as a follower.
+  const auto node_count = o.followers + 1;
+  std::vector<std::unique_ptr<Node>> nodes;
+  for (int i = 0; i < node_count; ++i) {
+    auto n = std::make_unique<Node>();
+    n->id = i;
+    n->dir = i == 0 ? o.dir : fs::path{o.dir.string() + std::format("-n{}", i)};
+    n->opts = db_options(cfg);
+    n->opts.initial_mode = bytecask::Mode::Follower;
+    fs::remove_all(n->dir);
+    nodes.push_back(std::move(n));
+  }
+  {
+    auto leader_opts = db_options(cfg);
+    nodes[0]->holder = std::make_unique<DbHolder>(nodes[0]->dir, leader_opts);
+  }
+  ClusterView view{node_count};
+  auto node = [&](int id) -> Node & {
+    return *nodes[static_cast<std::size_t>(id)];
+  };
 
   const auto start = Clock::now();
   Recorder rec{start};
@@ -815,33 +1078,36 @@ auto run(const RunOptions &o) -> int {
   std::atomic<int> remaining{o.txns};
   std::atomic<bool> stop{false};
   Totals totals;
-  // Processes: leader clients, the degrade nemesis, the leader's final read,
-  // then per follower its readers and its final read. One buffer each.
-  const auto leader_processes = o.threads + 2;
-  const auto per_follower = o.follower_readers + 1;
-  auto follower_process = [&](int node, int r) {
-    return leader_processes + (node - 1) * per_follower + r;
+  // Processes: the leader clients, the degrade nemesis, then per node its
+  // readers and its final read. One buffer each.
+  const auto per_node = o.follower_readers + 1;
+  auto node_process = [&](int id, int r) {
+    return o.threads + 1 + id * per_node + r;
   };
   std::vector<std::vector<Event>> buffers(
-      static_cast<std::size_t>(leader_processes + o.followers * per_follower));
+      static_cast<std::size_t>(o.threads + 1 + node_count * per_node));
   // Highest sequence a leader client has had acknowledged; session reads
-  // wait for it on a follower.
+  // wait for it on their node.
   std::atomic<std::uint64_t> last_acked{0};
   // Held by each vacuum call on the leader, and by a bootstrap from its
   // manifest to the end of the file copy.
   std::mutex vacuum_gate;
+  ClusterStats cluster;
 
   std::jthread vacuum_thread;
   if (cfg.vacuum) {
-    vacuum_thread = std::jthread{[&db, &stop, &totals, &vacuum_gate,
-                                  seed = o.seed] {
-      std::mt19937_64 vrng{seed + 1};
+    vacuum_thread = std::jthread{[&] {
+      std::mt19937_64 vrng{o.seed + 1};
       while (!stop.load(std::memory_order_relaxed)) {
         const auto threshold = static_cast<double>(vrng() % 60) / 100.0;
+        auto &ln = node(view.get().leader);
         try {
-          std::lock_guard<std::mutex> g{vacuum_gate};
-          if (db.vacuum({.fragmentation_threshold = threshold}))
-            totals.vacuums.fetch_add(1, std::memory_order_relaxed);
+          auto g = enter(ln);
+          if (g.owns_lock()) {
+            std::lock_guard<std::mutex> vg{vacuum_gate};
+            if (ln.holder->db.vacuum({.fragmentation_threshold = threshold}))
+              totals.vacuums.fetch_add(1, std::memory_order_relaxed);
+          }
         } catch (const std::exception &) {
           // Vacuum refuses to run on a degraded engine; the nemesis resumes it.
         }
@@ -852,13 +1118,14 @@ auto run(const RunOptions &o) -> int {
 
   // The degrade nemesis is its own Elle process: its transactions are real
   // appends, and the one whose fdatasync fails is :info, since resume() may
-  // replay it.
+  // replay it. The leader never moves while it runs (no --topology).
   std::jthread nemesis_thread;
   if (cfg.degrade) {
     const auto process = o.threads;
     nemesis_thread = std::jthread{[&, process] {
       std::mt19937_64 nrng{o.seed + 2};
       auto &events = buffers[static_cast<std::size_t>(process)];
+      auto &db = node(0).holder->db;
       while (!stop.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(
             std::chrono::milliseconds(20 + nrng() % 180));
@@ -888,72 +1155,134 @@ auto run(const RunOptions &o) -> int {
     }};
   }
 
-  // Followers: each is bootstrapped from a manifest while the leader is
-  // under load, then tailed; readers run on it once it exists.
-  ClusterStats cluster;
-  std::vector<std::unique_ptr<FollowerNode>> followers;
+  // Replication: every node has a thread that tails whatever the view says
+  // it tails (nothing while it leads). Followers are first bootstrapped from
+  // the leader while it is under load.
   std::atomic<bool> repl_stop{false};
   std::atomic<bool> readers_stop{false};
   std::vector<std::jthread> repl_threads;
   std::vector<std::jthread> reader_threads;
-  for (int n = 1; n <= o.followers; ++n) {
-    auto f = std::make_unique<FollowerNode>();
-    f->node = n;
-    f->dir = o.dir.string() + std::format("-f{}", n);
-    f->opts = db_options(cfg);
-    f->opts.initial_mode = bytecask::Mode::Follower;
-    followers.push_back(std::move(f));
-  }
-  for (auto &fp : followers) {
-    auto &f = *fp;
-    repl_threads.emplace_back([&, fptr = &f] {
-      std::mt19937_64 brng{o.seed + 200 + static_cast<std::uint64_t>(fptr->node)};
-      std::this_thread::sleep_for(std::chrono::milliseconds(20 + brng() % 200));
-      bootstrap(db, *fptr, vacuum_gate, keys, cluster);
-      replicate(db, *fptr, o.lag, brng(), repl_stop, cluster);
-    });
-    for (int r = 0; r < o.follower_readers; ++r) {
-      reader_threads.emplace_back([&, fptr = &f, r] {
-        const auto process = follower_process(fptr->node, r);
-        std::mt19937_64 rrng{o.seed + 1000 + static_cast<std::uint64_t>(process)};
-        auto &events = buffers[static_cast<std::size_t>(process)];
-        while (!readers_stop.load(std::memory_order_relaxed)) {
-          if (fptr->restarting.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
-            continue;
-          }
-          std::shared_lock<std::shared_mutex> g{fptr->gate};
-          if (!fptr->holder) {
-            g.unlock();
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-          }
-          auto &fdb = fptr->holder->db;
-          std::vector<Mop> mops;
-          const auto n = 1 + static_cast<int>(rrng() % 4);
-          for (int i = 0; i < n; ++i)
-            mops.push_back({.append = false, .key = keys.pick(rrng, false),
-                            .element = 0, .read = {}});
-          Placement at{.process = process, .node = fptr->node, .wait_seq = 0};
-          if (rrng() % 4 == 0) {
-            const auto seq = last_acked.load(std::memory_order_acquire);
-            if (seq != 0 &&
-                fdb.durable_sequence(seq, std::chrono::milliseconds(200)) >=
-                    seq) {
-              at.wait_seq = seq;
-              cluster.session_reads.fetch_add(1, std::memory_order_relaxed);
-            }
-          }
-          run_one(fdb, Mode::Guarded, at, rec, events, std::move(mops), {},
-                  false, totals);
-          g.unlock();
-          // Think time: reads are cheap, and unthrottled readers would
-          // dominate the history Elle has to check.
+  std::jthread orchestrator;
+  // Destroyed before the threads above are joined: if anything below throws,
+  // every loop is told to stop, so the exception surfaces instead of the
+  // unwind waiting on threads that never finish.
+  struct StopAll {
+    std::atomic<bool> &a, &b, &c;
+    ~StopAll() {
+      a.store(true);
+      b.store(true);
+      c.store(true);
+    }
+  } stop_all{stop, repl_stop, readers_stop};
+  if (o.followers > 0) {
+    for (int i = 0; i < node_count; ++i) {
+      repl_threads.emplace_back([&, i] {
+        std::mt19937_64 brng{o.seed + 200 + static_cast<std::uint64_t>(i)};
+        if (i != 0) {
           std::this_thread::sleep_for(
-              std::chrono::microseconds(500 + rrng() % 1500));
+              std::chrono::milliseconds(20 + brng() % 200));
+          const auto leader = view.get().leader;
+          bootstrap(node(leader), node(i), vacuum_gate, keys, cluster);
+          view.update([&](View &v) {
+            v.serving[static_cast<std::size_t>(i)] = true;
+            at(v.source, i) = v.leader;
+          });
         }
+        replicate(nodes, node(i), view, o.lag, brng(), repl_stop, cluster);
+      });
+      for (int r = 0; r < o.follower_readers; ++r) {
+        reader_threads.emplace_back([&, i, r] {
+          const auto process = node_process(i, r);
+          std::mt19937_64 rrng{o.seed + 1000 +
+                               static_cast<std::uint64_t>(process)};
+          auto &events = buffers[static_cast<std::size_t>(process)];
+          auto &n = node(i);
+          while (!readers_stop.load(std::memory_order_relaxed)) {
+            const auto v = view.get();
+            auto g = v.serving[static_cast<std::size_t>(i)]
+                         ? enter(n)
+                         : std::shared_lock<std::shared_mutex>{};
+            if (!g.owns_lock()) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(1));
+              continue;
+            }
+            auto &db = n.holder->db;
+            std::vector<Mop> mops;
+            const auto k = 1 + static_cast<int>(rrng() % 4);
+            for (int j = 0; j < k; ++j)
+              mops.push_back({.append = false, .key = keys.pick(rrng, false),
+                              .element = 0, .read = {}});
+            Placement pl{.process = process, .node = i, .epoch = v.epoch,
+                         .role = Role::Reader, .wait_seq = 0};
+            if (rrng() % 4 == 0) {
+              const auto seq = last_acked.load(std::memory_order_acquire);
+              if (seq != 0 &&
+                  db.durable_sequence(seq, std::chrono::milliseconds(200)) >=
+                      seq) {
+                pl.wait_seq = seq;
+                cluster.session_reads.fetch_add(1, std::memory_order_relaxed);
+              }
+            }
+            run_one(db, Mode::Guarded, pl, rec, events, std::move(mops), {},
+                    false, totals);
+            g.unlock();
+            // Think time: reads are cheap, and unthrottled readers would
+            // dominate the history Elle has to check.
+            std::this_thread::sleep_for(
+                std::chrono::microseconds(500 + rrng() % 1500));
+          }
+        });
+      }
+    }
+  }
+
+  // Topology: once every follower is up, planned transfers and unplanned
+  // promotions to a random serving node, and re-bootstrap of any node an
+  // unplanned promotion abandoned.
+  auto rebootstrap_abandoned = [&] {
+    const auto v = view.get();
+    for (int i = 0; i < node_count; ++i) {
+      if (i == v.leader || v.serving[static_cast<std::size_t>(i)]) continue;
+      {
+        NodeExclusive x{node(i)};
+        node(i).holder.reset();
+      }
+      bootstrap(node(v.leader), node(i), vacuum_gate, keys, cluster);
+      view.update([&](View &w) {
+        w.serving[static_cast<std::size_t>(i)] = true;
+        at(w.source, i) = w.leader;
       });
     }
+  };
+  if (o.topology && o.followers > 0) {
+    orchestrator = std::jthread{[&] {
+      std::mt19937_64 orng{o.seed + 3};
+      const auto all_up = [&] {
+        const auto v = view.get();
+        return std::ranges::all_of(v.serving, [](bool b) { return b; });
+      };
+      while (!all_up() && !stop.load(std::memory_order_relaxed))
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      while (!stop.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(100 + orng() % 300));
+        if (stop.load(std::memory_order_relaxed)) break;
+        if (!all_up()) {
+          rebootstrap_abandoned();
+          continue;
+        }
+        const auto v = view.get();
+        std::vector<int> candidates;
+        for (int i = 0; i < node_count; ++i)
+          if (i != v.leader) candidates.push_back(i);
+        const auto target = candidates[orng() % candidates.size()];
+        if (orng() % 2 == 0) {
+          planned_transfer(nodes, view, target, cluster);
+        } else {
+          unplanned_promotion(nodes, view, target, cluster);
+        }
+      }
+    }};
   }
 
   {
@@ -963,59 +1292,58 @@ auto run(const RunOptions &o) -> int {
         std::mt19937_64 crng{o.seed + 100 + static_cast<std::uint64_t>(p)};
         auto &events = buffers[static_cast<std::size_t>(p)];
         while (remaining.fetch_sub(1, std::memory_order_relaxed) > 0) {
-          // A degraded engine refuses every write until the nemesis resumes
-          // it; back off rather than fill the history with :info.
-          while (db.is_degraded())
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
-          const auto sync =
-              static_cast<int>(crng() % 100) < cfg.sync_percent;
-          store_max(last_acked,
-                    run_one(db, o.mode, {.process = p}, rec, events,
-                            random_txn(crng, keys, next_element),
-                            {.sync = sync}, false, totals));
+          for (;;) {
+            const auto v = view.get();
+            auto &ln = node(v.leader);
+            auto g = enter(ln);
+            // A degraded or demoted leader refuses every write until the
+            // nemesis resumes it or the view moves on; back off rather than
+            // fill the history.
+            if (!g.owns_lock() || ln.holder->db.is_degraded() ||
+                ln.holder->db.mode() != bytecask::Mode::Leader) {
+              if (g.owns_lock()) g.unlock();
+              std::this_thread::sleep_for(std::chrono::microseconds(200));
+              continue;
+            }
+            const auto sync =
+                static_cast<int>(crng() % 100) < cfg.sync_percent;
+            store_max(last_acked,
+                      run_one(ln.holder->db, o.mode,
+                              {.process = p, .node = v.leader,
+                               .epoch = v.epoch, .role = Role::Leader,
+                               .wait_seq = 0},
+                              rec, events, random_txn(crng, keys, next_element),
+                              {.sync = sync}, false, totals));
+            break;
+          }
         }
       });
     }
   }
   stop.store(true, std::memory_order_relaxed);
+  if (orchestrator.joinable()) orchestrator.join();
   if (nemesis_thread.joinable()) nemesis_thread.join();
   if (vacuum_thread.joinable()) vacuum_thread.join();
-  if (db.is_degraded()) db.resume();
+  if (o.topology && o.followers > 0) rebootstrap_abandoned();
+  const auto final_leader = view.get().leader;
+  auto &leader_db = node(final_leader).holder->db;
+  if (leader_db.is_degraded()) leader_db.resume();
 
   // Convergence: a sync write makes every leader entry durable, so
-  // changes_since can deliver all of it; every follower must then reach the
-  // leader's durable sequence.
-  if (!followers.empty()) {
-    db.put({.sync = true}, as_view("fence"), as_view(""));
-    const auto target = db.durable_sequence();
-    for (auto &fp : followers) {
+  // changes_since can deliver all of it; every other node must then reach
+  // the leader's durable sequence.
+  if (o.followers > 0) {
+    leader_db.put({.sync = true}, as_view("fence"), as_view(""));
+    const auto target = leader_db.durable_sequence();
+    for (int i = 0; i < node_count; ++i) {
+      if (i == final_leader) continue;
       const auto deadline = Clock::now() + std::chrono::seconds(20);
-      for (;;) {
-        {
-          std::shared_lock<std::shared_mutex> g{fp->gate};
-          if (fp->holder && fp->holder->db.durable_sequence() >= target) break;
-        }
+      while (durable_of(node(i)).value_or(0) < target) {
         if (Clock::now() >= deadline) {
-          std::shared_lock<std::shared_mutex> g{fp->gate};
-          std::string detail = "not bootstrapped";
-          if (fp->holder) {
-            auto &fdb = fp->holder->db;
-            const auto from = fdb.durable_sequence();
-            auto snap = db.snapshot();
-            std::uint64_t n = 0;
-            std::uint64_t first = 0;
-            for (const auto &e : db.changes_since(snap, from)) {
-              if (n++ == 0) first = e.sequence;
-            }
-            detail = std::format(
-                "follower durable {} degraded {} ({}); leader durable {}; "
-                "changes_since yields {} entries from {}",
-                from, fdb.is_degraded(), fdb.degraded_reason(),
-                db.durable_sequence(), n, first);
-          }
-          cluster.error(std::format("node {}: did not reach durable sequence "
-                                    "{} within 20s: {}",
-                                    fp->node, target, detail));
+          cluster.error(std::format(
+              "node {}: stuck at durable sequence {} below the leader's {} "
+              "(node {}) after 20s",
+              i, durable_of(node(i)).value_or(0), target, final_leader));
           break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -1027,32 +1355,23 @@ auto run(const RunOptions &o) -> int {
     repl_threads.clear();
   }
 
-  // Final reads over every key, so an append lost after its last concurrent
-  // read still shows up in the history.
-  {
-    const auto process = o.threads + 1;
+  // Final reads of every key on every node, so an append lost after its
+  // last concurrent read still shows up, and convergence can be checked.
+  const auto final_epoch = view.get().epoch;
+  for (int i = 0; i < node_count; ++i) {
+    auto &n = node(i);
+    if (!n.holder) continue;
+    const auto process = node_process(i, o.follower_readers);
     auto &events = buffers[static_cast<std::size_t>(process)];
     const auto key_count = keys.key_count();
     for (std::int64_t k0 = 0; k0 < key_count; k0 += 32) {
       std::vector<Mop> mops;
       for (auto k = k0; k < std::min(k0 + 32, key_count); ++k)
         mops.push_back({.append = false, .key = k, .element = 0, .read = {}});
-      run_one(db, o.mode, {.process = process}, rec, events, std::move(mops),
-              {}, false, totals);
-    }
-  }
-  for (auto &fp : followers) {
-    if (!fp->holder) continue;
-    const auto process = follower_process(fp->node, o.follower_readers);
-    auto &events = buffers[static_cast<std::size_t>(process)];
-    const auto key_count = keys.key_count();
-    for (std::int64_t k0 = 0; k0 < key_count; k0 += 32) {
-      std::vector<Mop> mops;
-      for (auto k = k0; k < std::min(k0 + 32, key_count); ++k)
-        mops.push_back({.append = false, .key = k, .element = 0, .read = {}});
-      run_one(fp->holder->db, Mode::Guarded,
-              {.process = process, .node = fp->node, .wait_seq = 0}, rec,
-              events, std::move(mops), {}, false, totals);
+      run_one(n.holder->db, o.followers > 0 ? Mode::Guarded : o.mode,
+              {.process = process, .node = i, .epoch = final_epoch,
+               .role = Role::Final, .wait_seq = 0},
+              rec, events, std::move(mops), {}, false, totals);
     }
   }
 
@@ -1061,22 +1380,24 @@ auto run(const RunOptions &o) -> int {
     std::ranges::move(b, std::back_inserter(all));
   }
   write_history(o.out, std::move(all));
-  if (!followers.empty()) {
+  if (o.followers > 0) {
     auto summary = o.out;
     summary += ".cluster.json";
-    write_cluster_summary(summary, cluster);
-    std::printf("  cluster: bootstraps=%zu ingests=%d ingest_errors=%d "
-                "restarts=%d duplicates=%d lag_pauses=%d follower_vacuums=%d "
-                "session_reads=%d errors=%zu\n",
-                cluster.bootstraps.size(), cluster.ingests.load(),
-                cluster.ingest_errors.load(), cluster.restarts.load(),
-                cluster.duplicates.load(), cluster.lag_pauses.load(),
-                cluster.follower_vacuums.load(), cluster.session_reads.load(),
-                cluster.errors.size());
-    followers.clear();
-    for (int n = 1; n <= o.followers; ++n)
-      fs::remove_all(o.dir.string() + std::format("-f{}", n));
+    write_cluster_summary(summary, cluster, final_leader);
+    std::printf("  cluster: bootstraps=%zu events=%zu ingests=%d "
+                "ingest_errors=%d restarts=%d duplicates=%d lag_pauses=%d "
+                "follower_vacuums=%d session_reads=%d errors=%zu "
+                "final_leader=%d\n",
+                cluster.bootstraps.size(), cluster.events.size(),
+                cluster.ingests.load(), cluster.ingest_errors.load(),
+                cluster.restarts.load(), cluster.duplicates.load(),
+                cluster.lag_pauses.load(), cluster.follower_vacuums.load(),
+                cluster.session_reads.load(), cluster.errors.size(),
+                final_leader);
   }
+  nodes.clear();
+  for (int i = 1; i < node_count; ++i)
+    fs::remove_all(o.dir.string() + std::format("-n{}", i));
 
   const auto secs =
       std::chrono::duration<double>(Clock::now() - start).count();
