@@ -90,6 +90,11 @@ public:
       return he;
     }
 
+    // Where the next entry starts, as a byte offset into the scanned region.
+    // seek() returns there; it must be an offset offset() returned.
+    [[nodiscard]] auto offset() const noexcept -> std::size_t { return pos_; }
+    void seek(std::size_t pos) noexcept { pos_ = pos; }
+
     // Iterator interface — used only when constructed with eager_t.
     auto operator*() const -> const value_type& { return *cached_; }
     auto operator++() -> Scanner& { cached_ = next(); return *this; }

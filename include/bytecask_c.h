@@ -113,7 +113,7 @@ int bytecask_del_range(bytecask_db_t *db,
 int bytecask_get(bytecask_db_t *db, const uint8_t *key, size_t key_len,
                  uint8_t **out_val, size_t *out_val_len);
 
-// Returns 1 if key exists (no I/O), 0 if absent.
+// Returns 1 if key exists, 0 if absent. Reads the key's record to confirm it.
 int bytecask_contains_key(bytecask_db_t *db,
                           const uint8_t *key, size_t key_len);
 
@@ -187,7 +187,7 @@ int bytecask_snapshot_get(const bytecask_snapshot_t *snap,
                           const uint8_t *key, size_t key_len,
                           uint8_t **out_val, size_t *out_val_len);
 
-// Returns 1 if key exists in the snapshot (no I/O), 0 if absent.
+// Returns 1 if key exists in the snapshot, 0 if absent. Reads the key's record to confirm it.
 int bytecask_snapshot_contains_key(const bytecask_snapshot_t *snap,
                                    const uint8_t *key, size_t key_len);
 

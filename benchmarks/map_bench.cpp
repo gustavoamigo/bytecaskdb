@@ -11,8 +11,10 @@
 #include <map>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 import bytecask.btree;
+import bytecask.blind_btree;
 import bytecask.radix_tree;
 import bytecask;
 
@@ -111,6 +113,11 @@ struct RTreeAdapter {
     return std::move(tr).persistent();
   }
 
+  static void transient_set(transient_type &tr, const key_type &k,
+                            std::size_t i) {
+    tr.set(to_bytes(k), bytecask::KeyDirEntry::make(i, 0, 0, 0));
+  }
+
   template <typename Resolve>
   static auto merge(map_type a, map_type b, Resolve &&resolve) -> map_type {
     return map_type::merge(std::move(a), std::move(b),
@@ -194,10 +201,120 @@ struct BTreeAdapter {
     return std::move(tr).persistent();
   }
 
+  static void transient_set(transient_type &tr, const key_type &k,
+                            std::size_t i) {
+    tr.set(to_bytes(k), bytecask::KeyDirEntry::make(i, 0, 0, 0));
+  }
+
   template <typename Resolve>
   static auto merge(map_type a, map_type b, Resolve &&resolve) -> map_type {
     return map_type::merge(std::move(a), std::move(b),
                            std::forward<Resolve>(resolve));
+  }
+};
+
+// The blind-leaf tree (docs/blind_leaf_btree_design.md) with a resolver that
+// does no I/O: keys are interned in a vector before the timed region and a
+// record's offset is its index there. What is timed is the tree plus one
+// in-memory key read per operation that needs a key — the G2 gate.
+struct BenchResolver {
+  std::vector<std::string> store;
+  std::unordered_map<std::string, std::uint32_t> index;
+
+  auto intern(const std::string &k) -> bytecask::BlindRef {
+    auto [it, inserted] =
+        index.try_emplace(k, static_cast<std::uint32_t>(store.size()));
+    if (inserted)
+      store.push_back(k);
+    return {0, it->second};
+  }
+  auto key_at(bytecask::BlindRef r) -> std::span<const std::byte> {
+    return to_bytes(store[r.offset]);
+  }
+};
+
+auto bench_resolver() -> BenchResolver & {
+  static auto *r = new BenchResolver; // never destroyed: outlives every tree
+  return *r;
+}
+
+template <std::size_t LeafBytes> struct BlindAdapter {
+  struct key_type {
+    std::string s;
+    bytecask::BlindRef ref;
+  };
+  using map_type = bytecask::PersistentBlindBTree<LeafBytes>;
+  using transient_type = bytecask::TransientBlindBTree<LeafBytes>;
+
+  static auto make_keys(const std::vector<std::string> &strs)
+      -> std::vector<key_type> {
+    std::vector<key_type> out;
+    out.reserve(strs.size());
+    for (const auto &s : strs)
+      out.push_back({s, bench_resolver().intern(s)});
+    return out;
+  }
+
+  static auto build(const std::vector<key_type> &keys) -> map_type {
+    auto t = map_type{};
+    for (const auto &k : keys)
+      t = t.set(to_bytes(k.s), k.ref, bench_resolver());
+    return t;
+  }
+
+  static auto transient_build(const std::vector<key_type> &keys) -> map_type {
+    auto tr = map_type{}.transient();
+    for (const auto &k : keys)
+      tr.set(to_bytes(k.s), k.ref, bench_resolver());
+    return std::move(tr).persistent();
+  }
+
+  static auto get(const map_type &m, const key_type &k) {
+    return m.get(to_bytes(k.s), bench_resolver());
+  }
+
+  static auto lower_bound(const map_type &m, const key_type &k) {
+    return m.lower_bound(to_bytes(k.s), bench_resolver());
+  }
+
+  // Yields keys, as the other adapters' iterators do: one read per key.
+  static auto iterate_sum(const map_type &m) -> std::uint64_t {
+    std::uint64_t sum = 0;
+    for (auto it = m.begin(); it != m.end(); ++it)
+      sum += (*it).offset + it.key(bench_resolver()).size();
+    return sum;
+  }
+
+  static auto iterate_reverse_sum(const map_type &m) -> std::uint64_t {
+    std::uint64_t sum = 0;
+    for (auto it = m.last(); it != m.end(); --it)
+      sum += (*it).offset + it.key(bench_resolver()).size();
+    return sum;
+  }
+
+  static auto build_transient(const std::vector<key_type> &keys)
+      -> transient_type {
+    auto tr = map_type{}.transient();
+    for (const auto &k : keys)
+      tr.set(to_bytes(k.s), k.ref, bench_resolver());
+    return tr;
+  }
+
+  static auto transient_get(const transient_type &tr, const key_type &k) {
+    return tr.get(to_bytes(k.s), bench_resolver());
+  }
+
+  static auto transient_update(const map_type &base,
+                               const std::vector<key_type> &keys) -> map_type {
+    auto tr = base.transient();
+    for (const auto &k : keys)
+      tr.set(to_bytes(k.s), k.ref, bench_resolver());
+    return std::move(tr).persistent();
+  }
+
+  static void transient_set(transient_type &tr, const key_type &k,
+                            std::size_t) {
+    tr.set(to_bytes(k.s), k.ref, bench_resolver());
   }
 };
 
@@ -289,16 +406,17 @@ template <typename A> void BM_TransientInsertBatch(benchmark::State &state) {
   auto keys = A::make_keys(generate_uniform_keys(n));
   auto base = A::transient_build(keys);
   std::size_t next = n;
-  std::vector<std::string> batch(kBatch);
+  std::vector<std::string> names(kBatch);
   for (auto _ : state) {
     state.PauseTiming();
-    for (auto &k : batch)
+    for (auto &k : names)
       k = "key_" + std::to_string(next++);
+    const auto batch = A::make_keys(names);
     state.ResumeTiming();
     auto tr = base.transient();
     for (std::size_t i = 0; i < kBatch; ++i) {
       benchmark::DoNotOptimize(A::transient_get(tr, batch[i]));
-      tr.set(to_bytes(batch[i]), bytecask::KeyDirEntry::make(i, 0, 0, 0));
+      A::transient_set(tr, batch[i], i);
     }
     benchmark::DoNotOptimize(std::move(tr).persistent());
   }
@@ -312,6 +430,26 @@ template <typename A> void BM_Get(benchmark::State &state) {
   std::size_t idx = 0;
   for (auto _ : state) {
     benchmark::DoNotOptimize(A::get(m, keys[idx % keys.size()]));
+    ++idx;
+  }
+}
+
+// Lookups of keys that are not in the tree, each landing between two that
+// are. For the blind tree this is the lookup that reads nothing: the
+// candidate's fingerprint rejects it.
+template <typename A> void BM_GetAbsent(benchmark::State &state) {
+  const auto n = static_cast<std::size_t>(state.range(0));
+  auto present = generate_uniform_keys(n);
+  std::vector<std::string> absent_strs;
+  absent_strs.reserve(n);
+  for (const auto &k : present)
+    absent_strs.push_back(k + "x");
+  auto keys = A::make_keys(present);
+  auto absent = A::make_keys(absent_strs);
+  auto m = A::build(keys);
+  std::size_t idx = 0;
+  for (auto _ : state) {
+    benchmark::DoNotOptimize(A::get(m, absent[idx % absent.size()]));
     ++idx;
   }
 }
@@ -645,6 +783,7 @@ BENCHMARK(BM_TransientUpdate<BTreeAdapter>)->Name("BTree/TransientUpdate")      
 BENCHMARK(BM_TransientInsertBatch<BTreeAdapter>)->Name("BTree/TransientInsertBatch") SIZES;
 BENCHMARK(BM_MemoryFootprint<BTreeAdapter>)->Name("BTree/Memory")  SIZES;
 BENCHMARK(BM_Get<BTreeAdapter>)           ->Name("BTree/Get")            SIZES;
+BENCHMARK(BM_GetAbsent<BTreeAdapter>)     ->Name("BTree/GetAbsent")      SIZES;
 BENCHMARK(BM_TransientGet<BTreeAdapter>)  ->Name("BTree/TransientGet")   SIZES;
 BENCHMARK(BM_Iterate<BTreeAdapter>)       ->Name("BTree/Iterate")        ITER_SIZES;
 BENCHMARK(BM_LowerBound<BTreeAdapter>)    ->Name("BTree/LowerBound")     SIZES;
@@ -659,6 +798,31 @@ BENCHMARK(BM_MergeOverlappingBinary<BTreeAdapter>)         ->Name("BTree/MergeOv
 BENCHMARK(BM_SplitBuildMerge<BTreeAdapter>)                ->Name("BTree/SplitBuildMerge")              SIZES;
 BENCHMARK(BM_SplitBuildMergeOverlapping<BTreeAdapter>)     ->Name("BTree/SplitBuildMergeOverlapping")   SIZES;
 BENCHMARK(BM_SplitBuildMergePrefixed<BTreeAdapter>)        ->Name("BTree/SplitBuildMergePrefixed")      SIZES;
+
+// Blind-leaf tree. The number is the leaf allocation in bytes (a jemalloc
+// size class): 640 = 48 entries, 1024 = 80 (the engine's), 1280 = 101,
+// 2560 = 208.
+#define BLIND_ROWS(BYTES)                                                                                        \
+  BENCHMARK(BM_Build<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/PersistentSet") SIZES;                         \
+  BENCHMARK(BM_TransientBuild<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/TransientSet") SIZES;                 \
+  BENCHMARK(BM_TransientBuildPrefixed<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/TransientSetPrefixed") SIZES; \
+  BENCHMARK(BM_TransientUpdate<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/TransientUpdate") SIZES;             \
+  BENCHMARK(BM_TransientInsertBatch<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/TransientInsertBatch") SIZES;   \
+  BENCHMARK(BM_MemoryFootprint<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/Memory") SIZES;                      \
+  BENCHMARK(BM_Get<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/Get") SIZES;                                     \
+  BENCHMARK(BM_GetAbsent<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/GetAbsent") SIZES;                         \
+  BENCHMARK(BM_TransientGet<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/TransientGet") SIZES;                   \
+  BENCHMARK(BM_Iterate<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/Iterate") ITER_SIZES;                        \
+  BENCHMARK(BM_LowerBound<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/LowerBound") SIZES;                       \
+  BENCHMARK(BM_LowerBoundBinary<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/LowerBoundBinary") SIZES;           \
+  BENCHMARK(BM_IterateBinary<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/IterateBinary") ITER_SIZES;            \
+  BENCHMARK(BM_ReverseIterate<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/ReverseIterate") ITER_SIZES;          \
+  BENCHMARK(BM_PrefixedMemory<BlindAdapter<BYTES>>)->Name("Blind" #BYTES "/PrefixedMemory") SIZES;
+BLIND_ROWS(640)
+BLIND_ROWS(1024)
+BLIND_ROWS(1280)
+BLIND_ROWS(2560)
+#undef BLIND_ROWS
 
 #undef SIZES
 #undef ITER_SIZES

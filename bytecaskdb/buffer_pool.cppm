@@ -86,24 +86,24 @@ export struct PoolFile {
 // proves nothing.
 export [[nodiscard]] inline auto open_uncached(
     const std::filesystem::path &path, std::size_t file_size) -> int {
-#if defined(O_DIRECT)
-  auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-  if (fd == -1) return -1;
+#if defined(O_DIRECT) && !defined(__EMSCRIPTEN__)
+  // Emscripten defines the flag, but its filesystems read through Node's fs
+  // or linear memory: there is no uncached read to ask for.
+  const auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
 #elif defined(F_NOCACHE)
   // macOS: no O_DIRECT. F_NOCACHE is the analogue the design names — reads
   // bypass the buffer cache, with no alignment requirement, so the aligned
   // fills below are simply valid reads.
   auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd == -1) return -1;
-  if (::fcntl(fd, F_NOCACHE, 1) == -1) {
+  if (fd != -1 && ::fcntl(fd, F_NOCACHE, 1) == -1) {
     ::close(fd);
-    return -1;
+    fd = -1;
   }
 #else
   (void)path;
-  (void)file_size;
-  return -1;  // no uncached read on this platform: every file falls back
+  const auto fd = -1;  // no uncached read on this platform: every file falls back
 #endif
+  if (fd == -1) return -1;
   if (file_size == 0) return fd;  // nothing to probe, nothing to fill
   void *probe = std::aligned_alloc(kPoolFrameBytes, kPoolFrameBytes);
   if (probe == nullptr) {

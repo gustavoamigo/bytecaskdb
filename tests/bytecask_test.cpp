@@ -1494,7 +1494,6 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
     CHECK(collect_stats(db) == serial_stats_vals);
   }
 
-#ifndef __EMSCRIPTEN__
   // The pool serves every value read below, so this proves recovery and
   // pool-backed reads agree with the oracle together — not just that the
   // key directory was rebuilt.
@@ -1508,7 +1507,6 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
     verify("parallel/2/pool", collect(db));
     CHECK(collect_stats(db) == serial_stats_vals);
   }
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1641,7 +1639,6 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
     CHECK(collect_stats(db) == serial_stats_vals);
   }
 
-#ifndef __EMSCRIPTEN__
   // The pool serves every value read below, so this proves recovery and
   // pool-backed reads agree with the oracle together — not just that the
   // key directory was rebuilt.
@@ -1655,7 +1652,6 @@ TEST_CASE("Recovery model-based: batch-heavy workload",
     verify("parallel/4/pool", collect(db));
     CHECK(collect_stats(db) == serial_stats_vals);
   }
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1777,7 +1773,6 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
     CHECK(collect_stats(db) == serial_stats_vals);
   }
 
-#ifndef __EMSCRIPTEN__
   // The pool serves every value read below, so this proves recovery and
   // pool-backed reads agree with the oracle together — not just that the
   // key directory was rebuilt.
@@ -1791,7 +1786,6 @@ TEST_CASE("Recovery model-based: delete-heavy workload",
     verify("parallel/3/pool", collect(db));
     CHECK(collect_stats(db) == serial_stats_vals);
   }
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -2653,6 +2647,9 @@ TEST_CASE("Preallocated tail: sealed files shrink to their logical size",
       GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::Mmap,
                bytecask::IoBackend::BufferPool);
   CAPTURE(static_cast<int>(io_backend));
+#ifdef __EMSCRIPTEN__
+  if (io_backend == bytecask::IoBackend::Mmap) SKIP("DB::open rejects Mmap on WASM");
+#endif
   constexpr std::uint64_t kCapacity = 4096;
   bytecask::Options opts{.max_file_bytes = kCapacity,
                          .io_backend = io_backend};
@@ -4729,6 +4726,12 @@ TEST_CASE("resume() with live snapshot on degraded DB",
   CHECK(db.contains_key({}, to_bytes("k2")));
 }
 
+// The validate_preconditions and apply_resume unit tests build an
+// EngineState by hand, with key directory entries that point at no data file.
+// A blind key directory keeps no keys: it reads them back from the data
+// files, so these states cannot be built for it. Both code paths run in the
+// blind build through the DB-level conflict and resume tests.
+#ifndef BYTECASK_KEYDIR_BLIND
 // ---------------------------------------------------------------------------
 // validate_preconditions unit tests
 // ---------------------------------------------------------------------------
@@ -5227,6 +5230,7 @@ TEST_CASE("apply_resume: multiple entries replayed in order",
   CHECK(s->next_seq == 13);
 }
 
+#endif // !BYTECASK_KEYDIR_BLIND
 #endif
 
 // ---------------------------------------------------------------------------
@@ -5879,7 +5883,6 @@ TEST_CASE("Recovery model-based: workload with range deletes",
     CHECK(collect_stats(db) == serial_stats_vals);
   }
 
-#ifndef __EMSCRIPTEN__
   // The pool serves every value read below, so this proves recovery and
   // pool-backed reads agree with the oracle together — not just that the
   // key directory was rebuilt.
@@ -5893,7 +5896,6 @@ TEST_CASE("Recovery model-based: workload with range deletes",
     verify("parallel/2/pool", collect(db));
     CHECK(collect_stats(db) == serial_stats_vals);
   }
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -7878,13 +7880,6 @@ TEST_CASE("io_backend=BufferPool: a pool smaller than 2x max_file_bytes is rejec
 TEST_CASE("io_backend=BufferPool: put/get round-trip across rotation",
           "[bytecask][buffer_pool]") {
   TempDir td;
-#ifdef __EMSCRIPTEN__
-  CHECK_THROWS_AS(
-      bytecask::DB::open(td.path,
-                         {.io_backend = bytecask::IoBackend::BufferPool,
-                          .buffer_pool = {.capacity_bytes = 4 * 1024 * 1024}}),
-      std::invalid_argument);
-#else
   // Small files so the reads under test land on sealed, pool-backed files
   // rather than on the active file.
   auto db = bytecask::DB::open(
@@ -7915,12 +7910,10 @@ TEST_CASE("io_backend=BufferPool: put/get round-trip across rotation",
   const auto stats = db.stats();
   CHECK(stats.at("bytecask.pool_frames_total") > 0);
   CHECK(stats.at("bytecask.pool_hits") > 0);
-#endif
 }
 
 TEST_CASE("io_backend=BufferPool: values survive recovery",
           "[bytecask][buffer_pool]") {
-#ifndef __EMSCRIPTEN__
   TempDir td;
   constexpr int kCount = 500;
   {
@@ -7945,12 +7938,10 @@ TEST_CASE("io_backend=BufferPool: values survive recovery",
     CHECK(to_string(out) ==
           std::format("v{:05d}", i) + std::string(200, 'x'));
   }
-#endif
 }
 
 TEST_CASE("io_backend=BufferPool: vacuum does not pollute the pool",
           "[bytecask][buffer_pool]") {
-#ifndef __EMSCRIPTEN__
   // A vacuum pass sweeps whole files. If scan() admitted those frames it would
   // evict the working set every pass, so scan reads straight from the fd.
   TempDir td;
@@ -7998,12 +7989,10 @@ TEST_CASE("io_backend=BufferPool: vacuum does not pollute the pool",
     REQUIRE(db.get({}, to_bytes(std::format("k{:05d}", i)), out));
     CHECK(to_string(out) == value_for(i));
   }
-#endif
 }
 
 TEST_CASE("io_backend=BufferPool: verify_checksums=false read paths",
           "[bytecask][buffer_pool]") {
-#ifndef __EMSCRIPTEN__
   // Exercises read_value's unverified branch and read_entry_unverified, which
   // the CRC-verifying default never reaches.
   TempDir td;
@@ -8040,7 +8029,6 @@ TEST_CASE("io_backend=BufferPool: verify_checksums=false read paths",
     ++rseen;
   }
   CHECK(rseen == kCount);
-#endif
 }
 
 namespace {
@@ -8066,7 +8054,6 @@ auto temp_dir_supports_direct_io() -> bool {
 
 TEST_CASE("io_backend=BufferPool: direct I/O fills serve identical bytes",
           "[bytecask][buffer_pool]") {
-#ifndef __EMSCRIPTEN__
   // Same workload through O_DIRECT fills and through buffered fills; both
   // must agree with each other and with what was written. The O_DIRECT path
   // reads block multiples past EOF and copies out of an aligned scratch, so
@@ -8111,7 +8098,6 @@ TEST_CASE("io_backend=BufferPool: direct I/O fills serve identical bytes",
   } else {
     WARN("temp dir refuses O_DIRECT: fallback path exercised, direct path not");
   }
-#endif
 }
 
 TEST_CASE("stats: keydir gauges track the live key count",
@@ -8133,7 +8119,6 @@ TEST_CASE("stats: keydir gauges track the live key count",
 
 TEST_CASE("io_backend=BufferPool: the active file is resident on write",
           "[bytecask][buffer_pool]") {
-#ifndef __EMSCRIPTEN__
   // Read-your-own-writes must never miss: every byte of the active file went
   // into the pool as it was appended. Small values so one frame is extended
   // in place many times; a second batch large enough to straddle frames.
@@ -8161,7 +8146,13 @@ TEST_CASE("io_backend=BufferPool: the active file is resident on write",
   }
   st = db.stats();
   CHECK(st.at("bytecask.pool_misses") == 0);
-  CHECK(st.at("bytecask.pool_hits") == kCount);
+  // One hit per get. A key directory that reads keys back also reads through
+  // the pool on every put (the candidate's key) and reads a record's header
+  // before the rest, so it counts more; it must still never miss.
+  if constexpr (bytecask::kKeyDirReadsKeys)
+    CHECK(st.at("bytecask.pool_hits") >= kCount);
+  else
+    CHECK(st.at("bytecask.pool_hits") == kCount);
   // Nothing was ever filled by a read: the writer put it all there.
   CHECK(st.at("bytecask.pool_fills") == 0);
   // Batches take the other append path; same guarantee.
@@ -8175,12 +8166,10 @@ TEST_CASE("io_backend=BufferPool: the active file is resident on write",
     CHECK(to_string(out) == value_for(i));
   }
   CHECK(db.stats().at("bytecask.pool_misses") == 0);
-#endif
 }
 
 TEST_CASE("io_backend=BufferPool: rotation releases the previous active file",
           "[bytecask][buffer_pool]") {
-#ifndef __EMSCRIPTEN__
   // The pool is barely larger than the 2 x max_file_bytes floor, so it can
   // hold the active file and about one sealed one. Writing through several
   // rotations must evict sealed frames — never pinned ones — and every read
@@ -8207,12 +8196,10 @@ TEST_CASE("io_backend=BufferPool: rotation releases the previous active file",
     REQUIRE(db.get({}, to_bytes(std::format("k{:05d}", i)), out));
     CHECK(to_string(out) == value_for(i));
   }
-#endif
 }
 
 TEST_CASE("io_backend=BufferPool: iteration and vacuum agree with pread",
           "[bytecask][buffer_pool]") {
-#ifndef __EMSCRIPTEN__
   // The pool must be byte-identical to pread through every read path, so the
   // same workload under both back-ends has to produce the same key/value set.
   constexpr int kCount = 800;
@@ -8240,12 +8227,10 @@ TEST_CASE("io_backend=BufferPool: iteration and vacuum agree with pread",
   };
   CHECK(run(bytecask::IoBackend::BufferPool) ==
         run(bytecask::IoBackend::Pread));
-#endif
 }
 
 TEST_CASE("io_backend=BufferPool: lent entry spans hold while readers evict",
-          "[bytecask][buffer_pool]") {
-#ifndef __EMSCRIPTEN__
+          "[bytecask][buffer_pool][concurrency]") {
   // An iterator over the pool is handed spans into frames, not copies. The
   // frame under a span must stay put for as long as the iterator is on that
   // entry, while other readers miss and evict around it: the iterator is
@@ -8295,12 +8280,10 @@ TEST_CASE("io_backend=BufferPool: lent entry spans hold while readers evict",
   // The point of the sizing: eviction really ran underneath the iterator.
   CHECK(db.stats().at("bytecask.pool_evictions") >
         stats_before.at("bytecask.pool_evictions"));
-#endif
 }
 
 TEST_CASE("io_backend=BufferPool: an iterator outlives the DB with its spans",
           "[bytecask][buffer_pool]") {
-#ifndef __EMSCRIPTEN__
   // CONTRACT.md: views already taken stay valid and readable after ~DB. For
   // the pool that means the frames a lent span points into, the pool that
   // owns them and the counters a hit bumps must all outlive the DB, held
@@ -8332,7 +8315,6 @@ TEST_CASE("io_backend=BufferPool: an iterator outlives the DB with its spans",
             std::format("v{:05d}", seen) + std::string(200, 'x'));
   }
   CHECK(seen == 300);
-#endif
 }
 
 // A thread's cached read snapshot pins the key directory version it last
@@ -8343,7 +8325,7 @@ TEST_CASE("io_backend=BufferPool: an iterator outlives the DB with its spans",
 // publish obsoletes any slot unused for ~1 s. The idle thread here does
 // nothing after its one read; the two stats gauges show its version go.
 TEST_CASE("an idle thread's cached version is reclaimed without its help",
-          "[bytecask][reclamation]") {
+          "[bytecask][reclamation][concurrency]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
   for (int i = 0; i < 2000; ++i) {
@@ -8613,7 +8595,7 @@ TEST_CASE("pipeline: sync write is invisible until its fdatasync returns; a "
 
 TEST_CASE("pipeline: fdatasync failure fails every writer appended since the "
           "last flush and resume() recovers them",
-          "[pipeline][f_visibility][degraded][resume]") {
+          "[pipeline][f_visibility][degraded][resume][concurrency]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 1'000'000});
   db.put({.sync = true}, to_bytes("seed"), to_bytes("s"));

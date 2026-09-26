@@ -155,6 +155,48 @@ jobs:
           build/linux/x86_64/release/bytecask_tests
 
   # ---------------------------------------------------------------------------
+  # The blind-leaf tree (docs/blind_leaf_btree_design.md) is the default key
+  # directory, so the main job covers it. The B+ tree that keeps its keys in
+  # the leaves stays selectable with BYTECASK_KEYDIR=btree; this job runs the
+  # same engine suite on it.
+  # ---------------------------------------------------------------------------
+  btree-keydir:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+      BYTECASK_KEYDIR: btree
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            clang llvm llvm-devel lld \
+            libcxx libcxx-devel \
+            xmake \
+            python3-pip python3-devel \
+            git ninja-build
+          # bytecaskdb_python's on_load() asks nanobind for its include dir, and
+          # xmake f loads every target — so this job needs it even though it
+          # only builds bytecask_tests.
+          pip3 install nanobind
+
+      - name: Configure xmake
+        run: |
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          xmake f --toolchain=clang \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            -y
+
+      - name: Build and run the engine suite on the keyed B+ tree key directory
+        run: |
+          xmake build bytecask_tests
+          build/linux/x86_64/release/bytecask_tests
+
+  # ---------------------------------------------------------------------------
   # MariaDB storage engine plugin: unit + proof tests (Catch2/ctest) and the
   # functional suite against a live mariadbd (pytest).
   # ---------------------------------------------------------------------------
@@ -280,7 +322,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sanitizer: ${{ fromJSON(github.event_name == 'pull_request' && '["address", "thread"]' || '["address", "thread", "memory"]') }}
+        sanitizer: ${{ fromJSON(github.event_name == 'pull_request' && '["address", "thread", "undefined"]' || '["address", "thread", "memory", "undefined"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -324,7 +366,17 @@ jobs:
             -m debug -y
 
       - name: Build
-        run: xmake build bytecask_tests
+        run: |
+          xmake build bytecask_tests
+          if [ "${{ matrix.sanitizer }}" = "undefined" ]; then
+            xmake build btree_tests
+          fi
+
+      # The key-directory trees' own tests, where the bit arithmetic is
+      # exercised most directly.
+      - name: Run tree tests under undefined sanitizer
+        if: matrix.sanitizer == 'undefined'
+        run: xmake run btree_tests
 
       - name: Run tests under ${{ matrix.sanitizer }} sanitizer
         # No halt_on_error=0 for ASan/MSan: without -fsanitize-recover=<san>

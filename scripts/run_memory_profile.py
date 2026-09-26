@@ -16,7 +16,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TARGET = "memory_profile"
 BINARY = REPO_ROOT / "build/linux/x86_64/release/memory_profile"
-DEFAULT_SIZES = [50_000, 100_000, 500_000, 1_000_000, 10_000_000]
+DEFAULT_SIZES = [1_000_000]
 DEFAULT_FORMATS = ["prefixed", "binary"]
 HIGH_ENTROPY_FORMATS = ["uuidv4_binary", "uuidv4_text", "uuidv4_prefixed", "sha256_bin", "sha256_hex"]
 VALUE_SIZE = 245  # must match kValueSize in memory_profile.cpp
@@ -127,7 +127,7 @@ def main() -> None:
         "--sizes",
         type=str,
         default=None,
-        help="Comma-separated dataset sizes (default: 50k,100k,500k,1M,10M)",
+        help="Comma-separated dataset sizes (default: 1M)",
     )
     parser.add_argument(
         "--key-formats",
