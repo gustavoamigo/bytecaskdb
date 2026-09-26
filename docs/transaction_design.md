@@ -588,6 +588,16 @@ Extends Snapshot isolation by tracking the **read set** inside `Transaction::get
 
 `apply_batch()` does not change for Serializable — the R-W check is purely in `Transaction`, using `sequence` fields already present in `KeyDirEntry`. No new engine mechanism is required.
 
+### What is checked
+
+The isolation check ([`isolation_checking_design.md`](isolation_checking_design.md)) records concurrent histories of `WritePlan` transactions and runs Elle over them every night, with vacuum and injected `fdatasync` failures running:
+
+- A plan built on a snapshot, with `ensure_unchanged` on every key it read but did not write, is **strict-serializable**. Layer 1 guards already give serializable isolation without the Layer 2 read-set tracking described above.
+- The same plan without read guards is **snapshot-isolated**. Its only serializability anomaly is write skew (G2-item), which is what the section on snapshot isolation above predicts.
+- Plans without a snapshot lose updates, as expected of the AutoCommit path.
+
+The check covers point reads and writes. `ensure_range_unchanged`, `del_range` and phantoms are not part of it yet.
+
 ### ReadUncommitted / ReadCommitted
 
 Not meaningful in ByteCaskDB's SWMR model. Writes are only visible after `state_.store()` completes — there are no uncommitted writes visible to other readers. Not worth implementing.

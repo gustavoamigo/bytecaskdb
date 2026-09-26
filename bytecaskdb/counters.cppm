@@ -95,6 +95,7 @@ export struct Counters {
   // -- Vacuum --
   std::atomic<std::int64_t> vacuum_bytes_reclaimed{0};
   std::atomic<std::int64_t> vacuum_files_unlinked{0};
+  std::atomic<std::int64_t> vacuum_tombstones_dropped{0};
 
   // -- Recovery (set once at open, then read-only) --
   std::int64_t recovery_files{0};

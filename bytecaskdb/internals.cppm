@@ -38,11 +38,13 @@ namespace bytecask {
 // class definition (in bytecask.cppm) can use them as member types.
 
 // ---------------------------------------------------------------------------
-// FileStats — per-file live/total byte counters for fragmentation tracking.
+// FileStats — per-file byte counters for vacuum file selection.
 // Updated under write_mu_ on every write; rebuilt during recovery.
-// tombstone_bytes counts Delete and RangeDel entries: bytes that are not live
-// but that vacuum must keep, because the tombstone may be all that stands
-// between an older file's Put and its resurrection at recovery.
+// tombstone_bytes counts Delete and RangeDel entries, marker_bytes the
+// BulkBegin/BulkEnd markers. Neither is ever live, and neither is what vacuum
+// selects a file for: compaction keeps every marker, and every tombstone that
+// may be all that stands between an older file's Put and its resurrection at
+// recovery (see NeededTombstones).
 // Exported only in BYTECASK_TESTING builds so the public API stays minimal.
 // ---------------------------------------------------------------------------
 #ifdef BYTECASK_TESTING
@@ -52,6 +54,15 @@ export struct FileStats {
   std::uint64_t min_sequence{0};
   std::uint64_t max_sequence{0};
   std::uint64_t tombstone_bytes{0};
+  std::uint64_t marker_bytes{0};
+
+  // Dead Put bytes: what compacting this file is sure to reclaim. Vacuum
+  // selects files by it, so a file that is mostly tombstones or markers is
+  // not picked again and again for a compaction that cannot shrink it.
+  [[nodiscard]] auto reclaimable_bytes() const noexcept -> std::uint64_t {
+    const auto kept = live_bytes + tombstone_bytes + marker_bytes;
+    return total_bytes > kept ? total_bytes - kept : 0;
+  }
 };
 #else
 struct FileStats {
@@ -60,6 +71,15 @@ struct FileStats {
   std::uint64_t min_sequence{0};
   std::uint64_t max_sequence{0};
   std::uint64_t tombstone_bytes{0};
+  std::uint64_t marker_bytes{0};
+
+  // Dead Put bytes: what compacting this file is sure to reclaim. Vacuum
+  // selects files by it, so a file that is mostly tombstones or markers is
+  // not picked again and again for a compaction that cannot shrink it.
+  [[nodiscard]] auto reclaimable_bytes() const noexcept -> std::uint64_t {
+    const auto kept = live_bytes + tombstone_bytes + marker_bytes;
+    return total_bytes > kept ? total_bytes - kept : 0;
+  }
 };
 #endif
 
@@ -202,6 +222,21 @@ export inline constexpr auto tombstone_size(EntryType type,
   case EntryType::Put:
   case EntryType::BulkBegin:
   case EntryType::BulkEnd:
+    return 0;
+  }
+  return 0;
+}
+
+// The bytes an entry adds to FileStats::marker_bytes: a header and a CRC for
+// a BulkBegin or BulkEnd marker, 0 otherwise.
+export inline constexpr auto marker_size(EntryType type) -> std::uint64_t {
+  switch (type) {
+  case EntryType::BulkBegin:
+  case EntryType::BulkEnd:
+    return entry_size(0, 0);
+  case EntryType::Put:
+  case EntryType::Delete:
+  case EntryType::RangeDel:
     return 0;
   }
   return 0;
@@ -820,6 +855,8 @@ export struct VacuumScanResult {
   std::uint64_t min_sequence{0};
   std::uint64_t max_sequence{0};
   std::uint64_t tombstone_bytes{0};
+  std::uint64_t marker_bytes{0};
+  std::uint64_t tombstones_dropped{0};
 };
 
 // RecoveredFile and RecoveryResult are private to bytecask.cpp.
@@ -865,14 +902,59 @@ export struct RangeTombstone {
   Key start;
   Key end; // exclusive — [start, end)
   std::uint64_t seq;
+  std::uint32_t file_id;
+  // Set when recovery sees this tombstone beat a Put held by another file.
+  bool needed{false};
+};
+
+// The newest point tombstone recovery has seen for a key.
+export struct PointTombstone {
+  std::uint64_t seq{0};
+  std::uint32_t file_id{0};
 };
 
 export struct RecoveryResult {
   RecoveryKeyDirTree key_dir;
-  std::map<Key, std::uint64_t> tombstones;
+  std::map<Key, PointTombstone> tombstones;
   std::vector<RangeTombstone> range_tombstones;
   std::uint64_t max_seq{0};
   PersistentU32Map<FileStats> file_stats;
+  // Sequences of point tombstones seen beating a Put in another file.
+  // Unsorted, may repeat; range tombstones carry their own flag.
+  std::vector<std::uint64_t> needed_tombstones;
+  // A lenient open skipped a file it could not read. Its Puts were never
+  // seen, so no tombstone can be shown unneeded.
+  bool skipped_files{false};
+};
+
+// ---------------------------------------------------------------------------
+// NeededTombstones — which tombstones compaction must keep, decided once by
+// recovery.
+//
+// A tombstone matters only while some other file holds an older Put of a key
+// it deletes: dropping it would let that Put back at the next open. Recovery
+// sees every hint entry, so it records the tombstones it saw beat a Put held
+// by a different file. An older Put in the tombstone's own file needs no
+// record — compaction drops that dead Put in the same pass that drops the
+// tombstone.
+//
+// The decision holds for the life of the process. Every later write, ingest
+// or resume carries a higher sequence, so no older Put can appear, and
+// vacuum only ever removes entries. Tombstones above `horizon` were never
+// examined and are always kept; a tombstone that stops being needed after
+// open is dropped only after the next one.
+//
+// Every entry carries its own sequence, so a sequence names one tombstone
+// exactly: the set holds 8 bytes per needed tombstone, and nothing for the
+// tombstones that can go.
+// ---------------------------------------------------------------------------
+export struct NeededTombstones {
+  std::uint64_t horizon{0};
+  std::vector<std::uint64_t> sequences; // sorted, unique
+
+  [[nodiscard]] auto droppable(std::uint64_t seq) const -> bool {
+    return seq <= horizon && !std::ranges::binary_search(sequences, seq);
+  }
 };
 
 } // namespace bytecask

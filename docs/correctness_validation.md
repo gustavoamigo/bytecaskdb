@@ -1617,6 +1617,21 @@ uninstrumented runtime, so TSan reports a read of it on one thread and
 its release on another as a race. The soak classifies exceptions by type
 and reads `what()` only when reporting a failure.
 
+### Isolation checking (Elle)
+
+The layers above check one write at a time or one writer at a time. None of
+them checks the isolation claims (snapshot isolation from `Snapshot`, and
+serializable from a guarded `WritePlan`) against a concurrent history, which
+is where G-single, G2-item and lost update show up.
+`tests/elle/isolation_history.cpp` records `list-append` histories from
+concurrent `WritePlan` transactions, with vacuum and degrade/`resume()`
+running. `scripts/run_isolation_check.py` checks them with Elle and with a
+direct cross-check against each write's commit sequence, and
+`isolation-nightly.yml` runs it every night. Its first runs, on a base
+without #170, hung on the rotation-barrier bug that the chaos soak had
+found independently (listed in its findings table above). See
+[`isolation_checking_design.md`](isolation_checking_design.md).
+
 ---
 
 ## Output Structure
