@@ -1366,6 +1366,42 @@ protected:
   friend class PersistentBTree<V>;
 };
 
+// Entries from one cursor position up to, not including, another: both are
+// an iterator's stack of (node, idx) frames over one version of a tree, the
+// end at or after the start; an empty stack is the end of the tree. Counted
+// from leaf sizes, stopping once the total reaches `limit`: no key is read
+// or compared. Returns min(count, limit).
+export template <typename Frame>
+auto count_entries(std::vector<Frame> from, const std::vector<Frame> &to,
+                   std::size_t limit) -> std::size_t {
+  if (from.empty())
+    return 0;
+  const auto *end_leaf = to.empty() ? nullptr : to.back().node;
+  std::size_t n = 0;
+  for (;;) {
+    const auto leaf = from.back();
+    if (leaf.node == end_leaf)
+      return std::min<std::size_t>(n + (to.back().idx - leaf.idx), limit);
+    n += leaf.node->count - leaf.idx;
+    if (n >= limit)
+      return limit;
+    // On to the first entry of the next leaf.
+    from.pop_back();
+    while (!from.empty() && from.back().idx >= from.back().node->count)
+      from.pop_back();
+    if (from.empty())
+      return n;
+    auto &parent = from.back();
+    ++parent.idx;
+    const auto *c = parent.node->child(parent.idx);
+    while (!c->is_leaf) {
+      from.push_back({c, 0});
+      c = c->child(0);
+    }
+    from.push_back({c, 0});
+  }
+}
+
 } // namespace btree_detail
 
 // ---------------------------------------------------------------------------
@@ -1428,6 +1464,14 @@ public:
   }
   auto operator==(std::default_sentinel_t) const noexcept -> bool {
     return stack_.empty();
+  }
+
+  // Entries from here up to, not including, `end` — an iterator over the
+  // same version at or after this one — counted from leaf sizes, no further
+  // than `limit`. Compares no key.
+  [[nodiscard]] auto count_until(const BasicBTreeIterator &end,
+                                 std::size_t limit) const -> std::size_t {
+    return btree_detail::count_entries(stack_, end.stack_, limit);
   }
 
 private:

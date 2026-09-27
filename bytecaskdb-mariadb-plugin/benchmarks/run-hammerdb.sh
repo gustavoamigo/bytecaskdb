@@ -16,15 +16,29 @@
 #   ./bytecaskdb-mariadb-plugin/benchmarks/run-hammerdb.sh [--warehouses=N] [--vus=LIST]
 #       [--rampup=MIN] [--duration=MIN] [--engines=LIST] [--data-root=PATH]
 #       [--build-vus=N] [--no-restore] [--reuse-data] [--hammerdb-home=PATH]
+#       [--profile=acid|fast]
 #
-#   --warehouses: TPROC-C warehouses (default: 20, ~2 GiB on InnoDB). Keep it
-#                 at or above the largest --vus: a virtual user picks a home
-#                 warehouse, and with fewer warehouses than users they collide
-#                 on the same district rows.
+#   --warehouses: TPROC-C warehouses (default: 20, ~2 GiB on InnoDB). Make it a
+#                 multiple of every --vus value. HammerDB runs with
+#                 maria_allwarehouse = true: each virtual user works a fixed set
+#                 of warehouses, (position + k * users) mod warehouses, and the
+#                 sets are disjoint only when the counts divide. With the
+#                 default (a random home warehouse per user) HammerDB 6.0's
+#                 random numbers are correlated across users — of 8 users on
+#                 70 warehouses, three pairs drew the same home warehouse in
+#                 every trial — so users collide on the same warehouse and
+#                 district rows whatever the warehouse count.
 #   --vus:        comma-separated virtual-user counts (default: 16)
 #   --rampup:     unmeasured minutes before the measured window (default: 2)
 #   --duration:   measured minutes (default: 5)
 #   --engines:    bytecaskdb, innodb, or both (default: bytecaskdb,innodb)
+#   --profile:    durability profile (default: acid). acid starts each engine
+#                 with <engine>.cnf, where a commit is durable before it
+#                 returns. fast starts it with <engine>-fast.cnf: a commit survives a
+#                 mariadbd crash but not an OS crash (InnoDB
+#                 flush_log_at_trx_commit=2, ByteCaskDB bytecaskdb_sync=AT_INTERVAL).
+#                 Use it to compare against published results that relax
+#                 durability; the profile is recorded in every CSV row.
 #   --build-vus:  virtual users loading the schema (default: min(nproc, warehouses))
 #   --no-restore: run every cell against the data the previous cell left
 #                 behind instead of a fresh copy of the built schema
@@ -72,6 +86,7 @@
 #   flush_mib       — device writes while the server shuts down.
 #   rss_mib, peak   — resident memory at the end, and its peak over the
 #                     measured window.
+#   profile         — the --profile the cell ran under.
 # Per-cell HammerDB logs are kept under <data-root>/.hammerdb_logs/.
 
 set -euo pipefail
@@ -89,6 +104,7 @@ RESTORE="on"
 REUSE_DATA="off"
 DATA_ROOT=""
 HAMMERDB_HOME="${HAMMERDB_HOME:-}"
+PROFILE="acid"
 
 BYTECASKDB_PORT=3330
 INNODB_PORT=3331
@@ -110,10 +126,11 @@ for arg in "$@"; do
     --build-vus=*)     BUILD_VUS="${arg#*=}" ;;
     --no-restore)      RESTORE="off" ;;
     --reuse-data)      REUSE_DATA="on" ;;
+    --profile=*)       PROFILE="${arg#*=}" ;;
     --data-root=*)     DATA_ROOT="${arg#*=}" ;;
     --hammerdb-home=*) HAMMERDB_HOME="${arg#*=}" ;;
     --help|-h)
-      echo "Usage: $0 [--warehouses=N] [--vus=8,16] [--rampup=MIN] [--duration=MIN] [--engines=bytecaskdb,innodb] [--build-vus=N] [--no-restore] [--reuse-data] [--data-root=PATH] [--hammerdb-home=PATH]"
+      echo "Usage: $0 [--warehouses=N] [--vus=8,16] [--rampup=MIN] [--duration=MIN] [--engines=bytecaskdb,innodb] [--build-vus=N] [--no-restore] [--reuse-data] [--data-root=PATH] [--hammerdb-home=PATH] [--profile=acid|fast]"
       exit 0
       ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
@@ -133,10 +150,12 @@ done
 
 MAX_VUS=0
 for v in "${VU_LIST[@]}"; do (( v > MAX_VUS )) && MAX_VUS=$v; done
-if (( MAX_VUS > WAREHOUSES )); then
-  echo "WARNING: --vus=$MAX_VUS exceeds --warehouses=$WAREHOUSES; virtual users" \
-       "will share home warehouses and contend on the same district rows." >&2
-fi
+for v in "${VU_LIST[@]}"; do
+  if (( WAREHOUSES % v != 0 )); then
+    echo "WARNING: --warehouses=$WAREHOUSES is not a multiple of --vus=$v; some" \
+         "virtual users will share warehouses and contend on the same rows." >&2
+  fi
+done
 if [[ -z "$BUILD_VUS" ]]; then
   BUILD_VUS="$(nproc)"
   (( BUILD_VUS > WAREHOUSES )) && BUILD_VUS=$WAREHOUSES
@@ -185,6 +204,7 @@ HAMMERDB_HOME="$(find_hammerdb)" || {
 
 # shellcheck source=lib_common.sh
 source "$SCRIPT_DIR/lib_common.sh"
+check_profile "$PROFILE" "${ACTIVE_ENGINES[@]}"
 
 if [[ " ${ACTIVE_ENGINES[*]} " == *" bytecaskdb "* ]]; then
   build_bytecaskdb_plugin
@@ -220,7 +240,8 @@ start_engine() {
   fi
   start_mariadbd \
     "$dir/data" "$dir/mysql.sock" "$(engine_port "$engine")" \
-    "$dir/mariadbd.pid" "$dir/error.log" "$SCRIPT_DIR/$engine.cnf" \
+    "$dir/mariadbd.pid" "$dir/error.log" \
+    "$(engine_defaults_file "$engine" "$PROFILE")" \
     "${extra[@]}"
 }
 
@@ -333,7 +354,7 @@ run_bench() {
 diset tpcc maria_driver timed
 diset tpcc maria_rampup $RAMPUP
 diset tpcc maria_duration $DURATION
-diset tpcc maria_allwarehouse false
+diset tpcc maria_allwarehouse true
 diset tpcc maria_timeprofile false
 diset tpcc maria_raiseerror false
 loadscript
@@ -390,7 +411,7 @@ TCL
     tail -20 "$log" >&2
   fi
 
-  echo "$engine,$WAREHOUSES,$vus,$nopm,$tpm,$aborts,$errors,$io_cols,$eng_cols,$flush_mib,$rss_cols"
+  echo "$engine,$WAREHOUSES,$vus,$nopm,$tpm,$aborts,$errors,$io_cols,$eng_cols,$flush_mib,$rss_cols,$PROFILE"
 }
 
 find_result() {
@@ -413,6 +434,7 @@ echo "    HammerDB: $HAMMERDB_HOME"
 echo "    Engines: ${ACTIVE_ENGINES[*]}"
 echo "    Warehouses: $WAREHOUSES | Ramp-up: ${RAMPUP} min | Duration: ${DURATION} min"
 echo "    Virtual users: ${VUS}"
+echo "    Durability profile: $PROFILE"
 echo "    Restore per cell: $RESTORE"
 echo "    Data root: $DATA_ROOT"
 echo ""
@@ -430,7 +452,7 @@ done
 echo ""
 
 echo "=== Phase 2: running TPROC-C ==="
-echo "engine,warehouses,vus,nopm,tpm,aborts,other_errors,read_mib,write_mib,syscr,syscw,eng_write_mib,eng_fsyncs,flush_mib,rss_mib,peak_rss_mib" > "$RESULTS_CSV"
+echo "engine,warehouses,vus,nopm,tpm,aborts,other_errors,read_mib,write_mib,syscr,syscw,eng_write_mib,eng_fsyncs,flush_mib,rss_mib,peak_rss_mib,profile" > "$RESULTS_CSV"
 declare -a ALL_RESULTS=()
 
 for v in "${VU_LIST[@]}"; do

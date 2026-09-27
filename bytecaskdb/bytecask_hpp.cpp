@@ -448,6 +448,11 @@ auto Snapshot::keys_from(const ReadOptions& opts,
           std::default_sentinel};
 }
 
+auto Snapshot::count_keys(BytesView from, BytesView to,
+                          std::size_t limit) const -> std::size_t {
+  return impl_->snap.count_keys(from, to, limit);
+}
+
 auto Snapshot::riter_from(const ReadOptions& opts,
                           BytesView from) const
     -> std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t> {

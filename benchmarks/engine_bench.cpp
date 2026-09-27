@@ -1009,6 +1009,62 @@ template <typename A, bool Sync> void BM_Del(benchmark::State &state) {
   attach_jitter(state, samples);
 }
 
+// ──────────────────────────── CountRange ─────────────────────────────────────
+//
+// A range estimate as the MariaDB plugin's records_in_range makes it: the
+// keys in [k_i, k_{i+Len}) of the sorted key set, counted no further than the
+// plugin's 1,024 cap. Count uses Snapshot::count_keys; Walk steps keys_from to
+// the end of the range, the walk count_keys replaced. Len 0 is an empty
+// range between two adjacent keys.
+
+template <typename A, int RangeLen, bool Walk>
+void BM_CountRange(benchmark::State &state) {
+  static auto keys = [] {
+    auto k = A::generate_keys(kDatasetSize);
+    std::ranges::sort(k);
+    return k;
+  }();
+  static auto val = make_value();
+  static auto db = A::open_populated("countrange", keys, val);
+  const auto snap = db.engine.snapshot();
+  constexpr std::size_t kCap = 1024;
+  bytecask::ReadOptions ro;
+  ro.verify_checksums = false;
+
+  std::size_t idx = 0;
+  std::vector<double> samples;
+  samples.reserve(kMaxSamples);
+
+  for (auto _ : state) {
+    const auto i = idx % (keys.size() - RangeLen - 1);
+    const auto from = RangeLen == 0 ? keys[i] + '\x01' : keys[i];
+    const auto &to = keys[i + (RangeLen == 0 ? 1 : RangeLen)];
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    std::size_t n = 0;
+    if constexpr (Walk) {
+      for (const auto &k : snap.keys_from(ro, bc_key(from))) {
+        if (n >= kCap || !std::ranges::lexicographical_compare(k, bc_key(to)))
+          break;
+        ++n;
+      }
+    } else {
+      n = snap.count_keys(bc_key(from), bc_key(to), kCap);
+    }
+    benchmark::DoNotOptimize(n);
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    if (samples.size() < kMaxSamples)
+      samples.push_back(static_cast<double>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+              .count()));
+    ++idx;
+  }
+
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
+  state.counters["ops_per_us"] = benchmark::Counter(
+      static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
+  attach_jitter(state, samples);
+}
+
 // ──────────────────────────── Range ──────────────────────────────────────────
 
 template <typename A, int RangeLen> void BM_Range(benchmark::State &state) {
@@ -1515,6 +1571,16 @@ BENCH(BM_Put<Bc, true>)           ->Name("ByteCaskDB/Put/Sync");
 BENCH(BM_Del<Bc, true>)           ->Name("ByteCaskDB/Del/Sync");
 BENCH(BM_Get<Bc>)                 ->Name("ByteCaskDB/Get");
 BENCH(BM_Range<Bc, kRangeLen>)    ->Name("ByteCaskDB/Range50");
+BENCH(BM_CountRange<Bc, 0, false>)    ->Name("ByteCaskDB/CountRange/Count/0");
+BENCH(BM_CountRange<Bc, 0, true>)     ->Name("ByteCaskDB/CountRange/Walk/0");
+BENCH(BM_CountRange<Bc, 1, false>)    ->Name("ByteCaskDB/CountRange/Count/1");
+BENCH(BM_CountRange<Bc, 1, true>)     ->Name("ByteCaskDB/CountRange/Walk/1");
+BENCH(BM_CountRange<Bc, 10, false>)   ->Name("ByteCaskDB/CountRange/Count/10");
+BENCH(BM_CountRange<Bc, 10, true>)    ->Name("ByteCaskDB/CountRange/Walk/10");
+BENCH(BM_CountRange<Bc, 1000, false>) ->Name("ByteCaskDB/CountRange/Count/1000");
+BENCH(BM_CountRange<Bc, 1000, true>)  ->Name("ByteCaskDB/CountRange/Walk/1000");
+BENCH(BM_CountRange<Bc, 1024, false>) ->Name("ByteCaskDB/CountRange/Count/1024");
+BENCH(BM_CountRange<Bc, 1024, true>)  ->Name("ByteCaskDB/CountRange/Walk/1024");
 BENCH(BM_MixedBatch<Bc, true>)      ->Name("ByteCaskDB/MixedBatch/Sync");
 
 // --- mmap read path, the bar for the pool's hit path ---

@@ -21,8 +21,11 @@ That's it. If the tests pass, you're in good shape.
 Sessions in [Claude Code on the web](https://code.claude.com/docs/en/claude-code-on-the-web)
 start from a bare Ubuntu container with none of this installed, so
 `.claude/hooks/session-start.sh` provisions it on session start: it builds xmake
-from source, installs `clang` and `nanobind`, and runs `xmake f` once so the
-dependency packages land in the cached container state. Two constraints in that
+from source, installs `nanobind` and clang 20 (clang, clang-scan-deps and
+clangd, linked as the unversioned names — Ubuntu's default clang is 18, older
+than CI's, and clangd must match the compiler to read its module files), and
+runs `xmake f` once so the dependency packages land in the cached container
+state. Two constraints in that
 environment shape the script — Ubuntu's packaged xmake (2.8.7) is too old to
 load the current xmake-repo, and the egress policy blocks `xmake.io` and GitHub
 archive downloads while allowing git, which is why xmake is cloned and built

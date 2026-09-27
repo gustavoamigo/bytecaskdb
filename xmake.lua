@@ -104,6 +104,14 @@ local function apply_sanitizer(t)
             -- Track allocation-site origins for actionable reports; see
             -- docs/correctness_validation.md for the cost/benefit tradeoff.
             t:add("cxflags", "-fsanitize-memory-track-origins=2", {force = true})
+            -- -O1 over the debug mode's -O0: MSan is meant to run optimized,
+            -- and at -O0 every local spills through instrumented memory, so
+            -- each access pays for its shadow check. It comes
+            -- after the mode's -O0, and Clang takes the last -O. Frame
+            -- pointers and no sibling-call elimination keep the report
+            -- stacks whole.
+            t:add("cxflags", "-O1", "-fno-omit-frame-pointer",
+                "-fno-optimize-sibling-calls", {force = true})
             t:add("cxflags", "-stdlib=libc++", "-nostdinc++",
                 -- std::jthread/std::stop_token are gated behind this flag by
                 -- libc++ (still marked a Library TS-style "experimental"

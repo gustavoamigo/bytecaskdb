@@ -372,6 +372,24 @@ auto kd_lower_bound(const T &t, std::span<const std::byte> key,
                     const KeyDirCtx &) {
   return t.lower_bound(key);
 }
+// Keys in [from, to), counted no further than `limit`. The keys are in
+// memory: the B+ tree counts leaf sizes between the two positions, the radix
+// tree steps through its keys.
+export inline auto kd_count(const KeyDirTree &t, std::span<const std::byte> from,
+                            std::span<const std::byte> to, std::size_t limit,
+                            const KeyDirCtx &) -> std::size_t {
+#ifdef BYTECASK_USE_BTREE
+  return t.lower_bound(from).count_until(t.lower_bound(to), limit);
+#else
+  std::size_t n = 0;
+  for (auto it = t.lower_bound(from);
+       n < limit && it != std::default_sentinel &&
+       std::ranges::lexicographical_compare((*it).first, to);
+       ++it)
+    ++n;
+  return n;
+#endif
+}
 export inline auto kd_begin(const KeyDirTree &t, const KeyDirCtx &) -> KeyDirIter {
   return t.begin();
 }
@@ -707,6 +725,17 @@ auto kd_lower_bound(const T &t, std::span<const std::byte> key,
   FrameLease lease;
   KeyReader reader{ctx, key_read_buffer(), lease};
   return {t.lower_bound(key, reader), ctx};
+}
+// Keys in [from, to), counted no further than `limit`: one read to place
+// each end within its leaf, and the leaves between them counted from their
+// sizes — no read per key.
+export inline auto kd_count(const KeyDirTree &t, std::span<const std::byte> from,
+                            std::span<const std::byte> to, std::size_t limit,
+                            const KeyDirCtx &ctx) -> std::size_t {
+  FrameLease lease;
+  KeyReader reader{ctx, key_read_buffer(), lease};
+  const auto first = t.lower_bound(from, reader);
+  return first.count_until(t.lower_bound(to, reader), limit);
 }
 export inline auto kd_begin(const KeyDirTree &t, const KeyDirCtx &ctx)
     -> KeyDirIter {

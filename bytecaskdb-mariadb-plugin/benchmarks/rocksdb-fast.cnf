@@ -1,0 +1,14 @@
+# rocksdb.cnf with relaxed durability, used by --profile=fast. The WAL is
+# written at commit and synced about once a second. Keep the other settings
+# in step with rocksdb.cnf.
+[mariadbd]
+rocksdb_flush_log_at_trx_commit = 2
+rocksdb_block_cache_size       = 3G
+rocksdb_max_background_jobs    = 4
+
+performance_schema             = OFF
+skip-log-bin
+sync_binlog                    = 0
+table_open_cache               = 200
+thread_cache_size              = 8
+max_connections                = 64

@@ -58,7 +58,21 @@ else
 fi
 
 # Clang is the only supported compiler — the engine is C++23 modules throughout.
-command -v clang >/dev/null 2>&1 || { log "installing clang"; apt_install clang; }
+# Pinned: Ubuntu's unversioned `clang` is 18, older than CI's (Fedora 43), and
+# clangd 18 has no outgoing call hierarchy, which `graft build --lsp` needs.
+# The unversioned names are linked in /usr/local/bin (ahead of /usr/bin on
+# PATH) so xmake, clang-scan-deps and clangd are one version: clangd cannot
+# read module files built by a different clang.
+llvm_version=20
+llvm_bin="/usr/lib/llvm-${llvm_version}/bin"
+if [ ! -x "$llvm_bin/clangd" ] || [ ! -x "$llvm_bin/clang-scan-deps" ]; then
+  log "installing clang ${llvm_version}"
+  apt_install "clang-${llvm_version}" "clangd-${llvm_version}" "clang-tools-${llvm_version}"
+fi
+for tool in clang clang++ clang-scan-deps clangd; do
+  ln -sf "$llvm_bin/$tool" "/usr/local/bin/$tool"
+done
+hash -r
 
 # xmake loads the Python extension target during configure, which imports
 # nanobind; without it, configure fails outright.
