@@ -11,8 +11,9 @@
 #
 # MSan runs only off the PR path: origin tracking
 # (-fsanitize-memory-track-origins=2) makes its test step both the slowest of
-# the four and by far the least predictable — measured at 2m48s and 11m56s on
-# two runs of the same commit, against a steady ~1m50s for ASan and TSan.
+# the four and by far the least predictable. It is built at -O1 (see
+# apply_sanitizer in xmake.lua); at the debug mode's -O0 it took about an
+# hour per key directory.
 # It also requires an MSan-instrumented libc++: the system's libcxx-devel
 # package (used as-is by the others) isn't instrumented, and linking it into
 # an MSan binary produces false positives. See scripts/build_msan_libcxx.sh
@@ -41,6 +42,11 @@ permissions:
 jobs:
   sanitizers:
     runs-on: ubuntu-latest
+    # Clean MSan runs took 56-87 minutes even at -O0, and the six-hour runs
+    # stalled rather than ran slow. Two hours is headroom for a slow runner;
+    # past it, waiting out GitHub's six-hour default only delays the report.
+    # --durations below names the last test that finished.
+    timeout-minutes: ${{ matrix.sanitizer == 'memory' && 120 || 60 }}
     container:
       image: fedora:43
     env:
@@ -125,4 +131,6 @@ jobs:
         env:
           ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
           TSAN_OPTIONS: ${{ matrix.sanitizer == 'thread' && 'halt_on_error=0 history_size=4' || '' }}
-        run: xmake run bytecask_tests
+        # --durations prints each test as it finishes, so a run cut off by
+        # the timeout shows the last test that completed.
+        run: xmake run bytecask_tests --durations yes
