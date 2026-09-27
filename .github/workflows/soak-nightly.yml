@@ -55,6 +55,14 @@ jobs:
             git ninja-build
           pip3 install nanobind
 
+      - name: pread vs truncate stress (no engine code)
+        run: |
+          uname -a
+          df -T /tmp
+          clang++ -std=c++20 -O2 -pthread tests/pread_truncate_stress.cpp -o /tmp/prs
+          mkdir -p /tmp/prs_dir
+          /tmp/prs /tmp/prs_dir 120
+
       - name: Configure xmake
         run: |
           RESOURCE_DIR=$(clang --print-resource-dir)
