@@ -165,8 +165,11 @@ class FailureClass(Enum):
   class also covers sub-entry torn writes at the sector level: a power
   loss mid-flush can land some 512-byte sectors on disk and not others,
   even though `writev` never returned to the caller. On recovery, the
-  entry fails CRC verification and is truncated — the same mechanism that
-  handles B2 at the `writev` boundary.
+  entry fails CRC verification and, in the newest data file, is truncated
+  — the same mechanism that handles B2 at the `writev` boundary (see
+  `bytecask_design.md`, *Recovering a Hint-less File*). Until #138 it was
+  refused instead, and a power cut during a write left the database
+  unopenable.
 - **B3 — full write + error return**: `writev` writes all bytes to disk
   successfully, but an error is returned to the caller (simulated by
   `PostWriteMode::throw_after`). The entry is structurally complete on disk
@@ -814,9 +817,8 @@ It promises only to stop rather than make the damage worse:
   nothing — and does the same on every retry;
 - the data file is byte-for-byte what it was after the damage, including
   the unpublished entry the failed write appended after it;
-- a cold open under the default `fail_recovery_on_crc_errors` refuses as
-  well, wherever the format lets it see the damage (below), and leaves the
-  file untouched.
+- a cold open does not refuse: the damaged file is the newest, and there
+  damage is indistinguishable from a torn tail (below).
 
 The line `resume()` draws is the **published extent** — the active file's
 `total_bytes` in the last published state. `resume()` exists to trim what
@@ -829,27 +831,27 @@ as-is for the same reason: it says nothing about the bytes, and trimming
 on a transient `EIO` would destroy data over a fault the next attempt may
 not see.
 
-The delta is the same shape in every cell: refuse, stay degraded, touch no
-byte.
+The delta is the same shape in every cell: `resume()` refuses, stays
+degraded and touches no byte; a cold open truncates at the damage.
 
 #### What a cold open can and cannot see
 
 | Field | `resume()` | Cold open |
 |-------|-----------|-----------|
-| `crc` | refuses | refuses — the entry fails verification |
-| `entry_type` | refuses | refuses — the entry does not parse |
-| `value_size` | refuses | cannot tell it from the end of the file |
-| `sequence` | refuses | cannot tell it from the end of the file |
+| `crc` | refuses | truncates at the damaged entry |
+| `entry_type` | refuses | truncates at the damaged entry |
+| `value_size` | refuses | truncates at the damaged entry |
+| `sequence` | refuses | truncates at the damaged entry |
 
-An entry that claims to run past the end of the file and a zeroed sequence
-both read as the end of written data, which is also what the zero-filled,
-unwritten tail of a crashed active file looks like. A hint-less file
-records no committed length, so a cold open has nothing to tell the two
-apart with and trims the file to the last entry it could parse. `resume()`
-can tell because the published state knows the extent. The `value_size`
-and `sequence` cells therefore assert the `resume()` refusal only; closing
-the gap at open needs the committed length on disk, which is a format
-change.
+Every cell damages the newest data file, and a cold open knows no more
+about it than its bytes: nothing outside the data files records how much of
+it was synced. A torn tail and damage in synced data look alike there, and
+open truncates at the first bad record for both, keeping what was committed
+before it — the choice PostgreSQL and RocksDB make for their logs (#138).
+`resume()` can refuse because the published state knows the extent. Damage
+in any other hint-less file is refused at open, in every mode; the rule and
+what it leaves unrefused are in `bytecask_design.md`, *Recovering a
+Hint-less File*.
 
 #### What the axis found
 
@@ -1819,7 +1821,9 @@ control:
   partially land at the 512-byte sector level on power loss. CRC-per-
   entry detects this on recovery (the entry fails CRC and is truncated),
   which is the correct behavior — but the fault injector models failures
-  at the `writev` boundary, not the sector boundary.
+  at the `writev` boundary, not the sector boundary. The recovery test
+  `a hint-less file's tail is truncated only in the newest file` builds
+  the shapes a power cut leaves by hand instead.
 - **Hardware-level fault injection** — kernel block-layer error injection
   (`dm-flakey`, `dm-dust`), power-cut testing rigs, or filesystem-
   specific fault tools. The fault injector operates at the application

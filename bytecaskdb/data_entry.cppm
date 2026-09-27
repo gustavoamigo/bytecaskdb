@@ -102,6 +102,16 @@ export auto serialize_entry(std::uint64_t sequence, EntryType entry_type,
   return buf;
 }
 
+// Whether record — one whole entry, header through CRC — carries the CRC of
+// its own bytes.
+export auto crc_matches(std::span<const std::byte> record) -> bool {
+  if (record.size() < kCrcSize) return false;
+  Crc32 crc{};
+  crc.update(record.subspan(0, record.size() - kCrcSize));
+  return crc.finalize() ==
+         read_le<std::uint32_t>(record, record.size() - kCrcSize);
+}
+
 // Validates buffer size and CRC integrity. Returns the parsed header.
 // Throws std::runtime_error on size mismatch or CRC failure.
 export auto parse_header_and_verify(std::span<const std::byte> buf) -> EntryHeader {
@@ -116,11 +126,7 @@ export auto parse_header_and_verify(std::span<const std::byte> buf) -> EntryHead
     throw std::runtime_error{"parse_header_and_verify: buffer size mismatch"};
   }
 
-  Crc32 crc{};
-  crc.update(buf.subspan(0, buf.size() - kCrcSize));
-  const auto computed = crc.finalize();
-  const auto stored = read_le<std::uint32_t>(buf, buf.size() - kCrcSize);
-  if (computed != stored) {
+  if (!crc_matches(buf)) {
     throw std::runtime_error{"parse_header_and_verify: CRC mismatch"};
   }
 

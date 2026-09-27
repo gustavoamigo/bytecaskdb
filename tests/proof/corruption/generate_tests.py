@@ -101,19 +101,24 @@ def gen_test(shape: CorruptionShape, field: CorruptField) -> str:
     p.append(f"      CHECK(data_file_prefix(dir, {delta.guarded_bytes}) == damaged);")
     p.append("    }")
     p.append("  }")
-    if delta.open_refuses:
-        p.append("  // A cold open reads the same damage and refuses the same way,")
-        p.append("  // under the default fail_recovery_on_crc_errors, without")
-        p.append("  // trimming the file to the point it could parse.")
-        p.append("  REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);")
-        p.append(f"  CHECK(data_file_prefix(dir, {delta.guarded_bytes}) == damaged);")
-    else:
-        p.append(f"  // No cold-open assertion: a {field.value} damaged this way")
-        p.append("  // reads as the end of written data, which is also what the")
-        p.append("  // unwritten tail of a crashed active file looks like, and a")
-        p.append("  // hint-less file records no committed length to tell the two")
-        p.append("  // apart. resume() can only because the published state knows")
-        p.append("  // the extent. See docs/correctness_validation.md, class M4.")
+    p.append("  // A cold open cannot refuse the same way: the damaged file is the")
+    p.append("  // newest, where a crash can leave a torn tail, and nothing on disk")
+    p.append("  // tells the two apart. It truncates at the first bad record, as for")
+    p.append("  // a torn tail, and keeps what was committed before it (#138).")
+    p.append("  const auto data = only_data_file(dir);")
+    p.append("  {")
+    p.append("    auto db = bytecask::DB::open(dir);")
+    keys = shape.keys_before
+    all_keys = (["k0", "k1", "b0", "b1"] if shape.batched
+                else [f"k{i}" for i in range(6)]) + ["zz"]
+    for k in all_keys:
+        p.append(
+            f'    CHECK({"" if k in keys else "!"}db.contains_key({{}}, to_bytes("{k}")));'
+        )
+    p.append("  }")
+    p.append(
+        f"  CHECK(std::filesystem::file_size(data) == {delta.open_truncates_to}u);"
+    )
     p.append("}")
     return "\n".join(p)
 
@@ -128,10 +133,10 @@ FILE_HEADER = """\
 // through H model syscalls that fail; these model a read that succeeds and
 // returns something wrong, so the axis is over the bytes rather than the
 // calls. Each test publishes a known set of entries, damages one field of one
-// entry at a computed offset, and verifies the engine fails stop: resume()
-// refuses and stays degraded, a cold open refuses wherever the format can see
-// the damage, and neither truncates a byte. There is no recovery contract for
-// damaged published data — only a promise not to make it worse.
+// entry at a computed offset, and verifies that resume() fails stop: it
+// refuses and stays degraded without truncating a byte. A cold open truncates
+// at the damage, as it would a torn tail (#138). There is no recovery
+// contract for damaged published data.
 
 #include <string_view>
 #include <system_error>
@@ -150,6 +155,7 @@ namespace {
 
 using bytecask::testing::data_file_prefix;
 using bytecask::testing::flip_byte_at;
+using bytecask::testing::only_data_file;
 using bytecask::testing::poke_huge_value_size;
 using bytecask::testing::poke_invalid_entry_type;
 using bytecask::testing::poke_zero_sequence;

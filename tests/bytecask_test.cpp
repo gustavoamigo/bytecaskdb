@@ -1252,42 +1252,216 @@ TEST_CASE("DB recovery: vacuum keeps a data file whose hint was rebuilt",
 }
 
 // ---------------------------------------------------------------------------
-// Damage in a data file is detected and refused, never trimmed around. The
-// scan that indexes a hint-less file at open and the one vacuum copies a
-// sealed file with both stop by throwing: the first entry that fails to parse
-// must not read as the end of the file. If it did, open would truncate the
-// data file to that point and vacuum would publish a copy without the entries
-// after it and unlink the original — each turning one bad entry into the
-// permanent loss of every entry behind it.
+// Recovering a hint-less data file (#138). Open scans every data file without
+// a hint and stops at the first record that does not parse. Only the file
+// written last can hold a record a crash tore, because every other file was
+// fdatasync'd whole before it was sealed. So past the stop:
+// - zeros only: the preallocated tail, trimmed in any file;
+// - anything else, in the file with the highest sequences: a torn tail,
+//   truncated, as PostgreSQL and RocksDB truncate a log at its first bad
+//   record;
+// - anything else, in any other file: damage in synced data. Refused in both
+//   modes, with the file left byte for byte as it was.
+// Each row builds one on-disk shape from a cleanly closed three-file
+// database, whose last file is hint-less and exact-size after the close.
 // ---------------------------------------------------------------------------
-TEST_CASE("DB recovery: a damaged hint-less data file refuses to open and is "
-          "not truncated",
-          "[bytecask][recovery][corruption]") {
-  TempDir td;
-  const auto db_path = td.path / "db";
-  {
-    auto db = bytecask::DB::open(db_path);
-    for (int i = 0; i < 6; ++i)
-      db.put({.sync = true}, to_bytes(std::format("k{}", i)),
-             to_bytes(std::format("v{}", i)));
+namespace {
+
+constexpr std::uint64_t kEntry = 23;  // 15 header + 2 key + 2 value + 4 CRC
+
+// Data files ordered by the sequence of their first record.
+auto data_files_by_sequence(const std::filesystem::path &dir)
+    -> std::vector<std::filesystem::path> {
+  std::vector<std::pair<std::uint64_t, std::filesystem::path>> files;
+  for (const auto &e : std::filesystem::directory_iterator{dir}) {
+    if (e.path().extension() != ".data") continue;
+    std::ifstream f{e.path(), std::ios::binary};
+    std::array<unsigned char, 8> b{};
+    f.read(reinterpret_cast<char *>(b.data()), 8);
+    std::uint64_t seq = 0;
+    for (int i = 7; i >= 0; --i) seq = (seq << 8) | b[static_cast<std::size_t>(i)];
+    files.emplace_back(seq, e.path());
   }
-  // A clean close leaves the file that was active at shutdown without a
-  // hint, so the next open has to scan it.
-  REQUIRE(list_hint_files(db_path).empty());
-  std::filesystem::path data;
-  for (const auto &e : std::filesystem::directory_iterator{db_path})
-    if (e.path().extension() == ".data") data = e.path();
-  const auto size_before = std::filesystem::file_size(data);
-
-  // k2's key: 2-byte keys and values make every entry 23 bytes, and the
-  // key starts after the 15-byte header.
-  flip_byte(data, 2 * 23 + 15);
-
-  REQUIRE_THROWS_AS(bytecask::DB::open(db_path), std::runtime_error);
-  CHECK(std::filesystem::file_size(data) == size_before);
-  CHECK(list_hint_files(db_path).empty());
+  std::ranges::sort(files);
+  std::vector<std::filesystem::path> out;
+  for (auto &[seq, p] : files) out.push_back(std::move(p));
+  return out;
 }
 
+auto read_all(const std::filesystem::path &p) -> std::string {
+  std::ifstream f{p, std::ios::binary};
+  return {std::istreambuf_iterator<char>{f}, {}};
+}
+
+void write_at(const std::filesystem::path &p, std::uint64_t off,
+              std::string_view bytes) {
+  std::fstream f{p, std::ios::in | std::ios::out | std::ios::binary};
+  f.seekp(static_cast<std::streamoff>(off));
+  f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+void zero_at(const std::filesystem::path &p, std::uint64_t off,
+             std::uint64_t n) {
+  write_at(p, off, std::string(n, '\0'));
+}
+
+// What a power cut leaves of a file's preallocated tail.
+void add_zero_tail(const std::filesystem::path &p) {
+  std::filesystem::resize_file(p, std::filesystem::file_size(p) + 4096);
+}
+
+void drop_hint(const std::filesystem::path &data) {
+  auto hint = data;
+  hint.replace_extension(".hint");
+  REQUIRE(std::filesystem::remove(hint));
+}
+
+// The last entry of p torn: its header reached the disk, the rest did not.
+void tear_last_entry(const std::filesystem::path &p) {
+  const auto size = std::filesystem::file_size(p);
+  add_zero_tail(p);
+  zero_at(p, size - kEntry + 15, kEntry - 15);
+}
+
+struct TailRow {
+  const char *label;
+  std::function<void(const std::vector<std::filesystem::path> &)> damage;
+  bool opens;
+  // Opens: the keys, by write order, that the open must have dropped.
+  std::set<int> lost;
+  // Refuses: the file, by sequence order, that must come out unchanged.
+  std::size_t refused_file;
+};
+
+} // namespace
+
+TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
+          "newest file",
+          "[bytecask][recovery][corruption]") {
+  // Files by sequence: f0 holds keys 0-4, f1 keys 5-9, f2 (newest) 10-13.
+  // Entry i of a file begins at kEntry * i.
+  const std::vector<TailRow> rows{
+      {"torn last write", [](auto &f) { tear_last_entry(f[2]); }, true, {13},
+       0},
+      {"file ends mid-entry",
+       [](auto &f) {
+         std::filesystem::resize_file(f[2],
+                                      std::filesystem::file_size(f[2]) - 5);
+       },
+       true, {13}, 0},
+      {"zero tail only", [](auto &f) { add_zero_tail(f[2]); }, true, {}, 0},
+      {"hole, then later entries",
+       [](auto &f) {
+         add_zero_tail(f[2]);
+         zero_at(f[2], kEntry, kEntry);
+       },
+       true, {11, 12, 13}, 0},
+      {"first write torn, header landed",
+       [](auto &f) {
+         std::filesystem::resize_file(f[2], kEntry);
+         tear_last_entry(f[2]);
+       },
+       true, {10, 11, 12, 13}, 0},
+      {"first write torn, header lost",
+       [](auto &f) {
+         std::filesystem::resize_file(f[2], kEntry);
+         add_zero_tail(f[2]);
+         zero_at(f[2], 0, 15);
+       },
+       true, {10, 11, 12, 13}, 0},
+      {"sealed zero tail, newest torn",
+       [](auto &f) {
+         drop_hint(f[0]);
+         add_zero_tail(f[0]);
+         tear_last_entry(f[2]);
+       },
+       true, {13}, 0},
+      {"hint backlog with zero tails",
+       [](auto &f) {
+         drop_hint(f[0]);
+         drop_hint(f[1]);
+         add_zero_tail(f[0]);
+         add_zero_tail(f[1]);
+       },
+       true, {}, 0},
+      {"sealed CRC damage",
+       [](auto &f) {
+         drop_hint(f[0]);
+         flip_byte(f[0], kEntry + 15);
+       },
+       false, {}, 0},
+      {"sealed zeroed entry",
+       [](auto &f) {
+         drop_hint(f[0]);
+         zero_at(f[0], kEntry, kEntry);
+       },
+       false, {}, 0},
+      {"sealed oversized value_size",
+       [](auto &f) {
+         drop_hint(f[0]);
+         write_at(f[0], kEntry + 11, "\xff\xff\xff\x7f");
+       },
+       false, {}, 0},
+      {"sealed damage, newest torn too",
+       [](auto &f) {
+         drop_hint(f[1]);
+         flip_byte(f[1], kEntry + 15);
+         tear_last_entry(f[2]);
+       },
+       false, {}, 1},
+  };
+
+  for (const auto &row : rows) {
+    for (const bool strict : {true, false}) {
+      DYNAMIC_SECTION(row.label << (strict ? " (strict)" : " (lenient)")) {
+        TempDir td;
+        const auto dir = td.path / "db";
+        const bytecask::Options opts{.max_file_bytes = 100,
+                                     .fail_recovery_on_crc_errors = strict};
+        {
+          auto db = bytecask::DB::open(dir, opts);
+          for (int i = 0; i < 14; ++i)
+            db.put({.sync = true}, to_bytes(std::format("k{:x}", i)),
+                   to_bytes(std::format("v{:x}", i)));
+        }
+        const auto files = data_files_by_sequence(dir);
+        REQUIRE(files.size() == 3);
+        REQUIRE(std::filesystem::file_size(files[0]) == 5 * kEntry);
+        REQUIRE(std::filesystem::file_size(files[2]) == 4 * kEntry);
+
+        row.damage(files);
+
+        if (row.opens) {
+          auto db = bytecask::DB::open(dir, opts);
+          for (int i = 0; i < 14; ++i) {
+            INFO("key " << i);
+            CHECK(db.contains_key({}, to_bytes(std::format("k{:x}", i))) ==
+                  !row.lost.contains(i));
+          }
+          // Everything past the last committed record is gone.
+          CHECK(std::filesystem::file_size(files[0]) == 5 * kEntry);
+          CHECK(std::filesystem::file_size(files[2]) ==
+                (4 - row.lost.size()) * kEntry);
+        } else {
+          const auto before = read_all(files[row.refused_file]);
+          REQUIRE_THROWS_AS(bytecask::DB::open(dir, opts), std::runtime_error);
+          CHECK(read_all(files[row.refused_file]) == before);
+          auto hint = files[row.refused_file];
+          hint.replace_extension(".hint");
+          CHECK_FALSE(std::filesystem::exists(hint));
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Damage in a sealed file is detected and refused, never trimmed around. The
+// scan vacuum copies a sealed file with stops by throwing: if the first entry
+// that fails to parse read as the end of the file, vacuum would publish a
+// copy without the entries after it and unlink the original, turning one bad
+// entry into the permanent loss of every entry behind it.
+// ---------------------------------------------------------------------------
 TEST_CASE("DB vacuum: a damaged sealed file is not compacted away",
           "[bytecask][vacuum][corruption]") {
   TempDir td;
