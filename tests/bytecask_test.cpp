@@ -1459,6 +1459,9 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
 TEST_CASE("DB read: a record past the end of its file names the file, the "
           "offset and the header",
           "[bytecask][corruption]") {
+  // Only the blind key directory reads whole records at open, to place keys.
+  if constexpr (!bytecask::kKeyDirReadsKeys)
+    SKIP("the key directory stores its keys and reads no record at open");
   TempDir td;
   const auto dir = td.path / "db";
   const bytecask::Options opts{.max_file_bytes = 100};
