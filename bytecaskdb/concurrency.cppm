@@ -143,6 +143,7 @@ public:
     slot.err = nullptr;
     queue_.push_back(&slot);
     inflight_.fetch_add(1, std::memory_order_relaxed);
+    if (slot.sync) inflight_sync_.fetch_add(1, std::memory_order_relaxed);
 
     if (!leader_active_) {
       leader_active_ = true;
@@ -160,6 +161,12 @@ public:
   // flusher can let an in-progress batch land before it captures the head.
   [[nodiscard]] auto busy() const noexcept -> bool {
     return inflight_.load(std::memory_order_acquire) > 0;
+  }
+
+  // True while a submitted slot that asked for a sync has not been executed
+  // yet: the next flush will fdatasync for it. Lock-free, like busy().
+  [[nodiscard]] auto sync_busy() const noexcept -> bool {
+    return inflight_sync_.load(std::memory_order_acquire) > 0;
   }
 
 private:
@@ -189,9 +196,14 @@ private:
     }
 
     lk.lock();
-    for (auto *s : batch) s->done = true;
+    int synced = 0;
+    for (auto *s : batch) {
+      synced += s->sync ? 1 : 0;
+      s->done = true;
+    }
     inflight_.fetch_sub(static_cast<int>(batch.size()),
                         std::memory_order_release);
+    inflight_sync_.fetch_sub(synced, std::memory_order_release);
     if (queue_.empty()) {
       leader_active_ = false;
     } else {
@@ -207,6 +219,7 @@ private:
   bool leader_active_{false};
   std::condition_variable cv_;
   std::atomic<int> inflight_{0};
+  std::atomic<int> inflight_sync_{0};  // the subset of inflight_ with sync
 };
 
 // ---------------------------------------------------------------------------

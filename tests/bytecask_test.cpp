@@ -9297,6 +9297,7 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.file_rotations",
       "bytecask.fsyncs",
       "bytecask.commit_wait_blocked",
+      "bytecask.flush_settles",
       "bytecask.disk_reads",
       "bytecask.disk_read_bytes",
       "bytecask.pool_hits",
@@ -10479,6 +10480,58 @@ TEST_CASE("pipeline: sync-only writes under concurrent unsynced writers",
   CHECK(st->durable_seq == st->next_seq - 1);
 }
 
+namespace {
+struct SettleCase {
+  bool w1_sync;  // the writer whose flush is observed
+  bool w2_sync;  // a writer still in stage 1 during that flush
+  bool settles;
+};
+}  // namespace
+
+// A flush waits for writers still in stage 1 only when it will fdatasync:
+// then they share it. An unsynced flush has nothing to share, so it
+// publishes at once instead of waiting out kFlushSettleMax.
+TEST_CASE("pipeline: a flush settles for writers in stage 1 only when it "
+          "owes an fdatasync", "[pipeline][concurrency]") {
+  const auto c = GENERATE(SettleCase{false, false, false},  // nothing owed
+                          SettleCase{false, true, true},    // W2 will owe
+                          SettleCase{true, false, true});   // W1 owes
+  CAPTURE(c.w1_sync, c.w2_sync);
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("seed"), to_bytes("s"));
+  const auto settles_before = db.stats().at("bytecask.flush_settles");
+
+  // W1 appends and parks before its flush; W2 is elected leader and parks
+  // in stage 1. W1 is then released to flush with W2 still in the group.
+  FlushGate before_wait;
+  FlushGate leading;
+  db.test_before_commit_wait_ = before_wait.hook();
+  std::optional<bytecask::CommitResult> r1;
+  std::optional<bytecask::CommitResult> r2;
+  std::thread t1([&] { r1 = db.put({.sync = c.w1_sync}, to_bytes("k1"), to_bytes("v1")); });
+  before_wait.wait_in_flush();
+  db.test_write_group().on_leader_start_ = leading.hook();
+  std::thread t2([&] { r2 = db.put({.sync = c.w2_sync}, to_bytes("k2"), to_bytes("v2")); });
+  leading.wait_in_flush();
+
+  before_wait.open();
+  t1.join();  // returns while W2 is still held in stage 1
+  CHECK(db.stats().at("bytecask.flush_settles") - settles_before ==
+        (c.settles ? 1 : 0));
+  CHECK(db.contains_key({}, to_bytes("k1")));
+  CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
+
+  leading.open();
+  t2.join();
+  db.test_before_commit_wait_ = nullptr;
+  db.test_write_group().on_leader_start_ = nullptr;
+  REQUIRE(r1.has_value());
+  REQUIRE(r2.has_value());
+  CHECK(db.contains_key({}, to_bytes("k2")));
+  CHECK(r1->durable == c.w1_sync);
+}
+
 TEST_CASE("pipeline: sync write is invisible until its fdatasync returns; a "
           "writer appended behind it lands in the next flush",
           "[pipeline][concurrency]") {
@@ -10866,6 +10919,110 @@ TEST_CASE("pipeline: many concurrent sync writers, every commit durable and "
       CHECK(to_string(*v) == key);
     }
   }
+}
+
+// A plan with a snapshot is checked and applied by the record location the
+// snapshot gave each written key (D3), where it used to look the key up in
+// both states. The two must agree on every outcome: one seeded workload runs
+// on two databases, one resolving by location and one by key, and every
+// commit, every conflict and the final contents and file stats must match.
+// Vacuum relocates records under the snapshots, so a key whose location
+// changed but whose version did not takes the fallback read.
+TEST_CASE("location tokens: plans checked and applied by location commit and "
+          "conflict exactly as by key", "[model][location]") {
+  const auto seed = GENERATE(1u, 2u, 3u, 4u, 5u);
+  CAPTURE(seed);
+  TempDir td;
+  const bytecask::Options opts{.max_file_bytes = 8 * 1024};
+  auto a = bytecask::DB::open(td.path / "a", opts);
+  auto b = bytecask::DB::open(td.path / "b", opts);
+  b.test_resolve_by_key_ = true;
+
+  std::mt19937_64 rng{seed};
+  const auto key = [&] { return std::format("k{:02d}", rng() % 12); };
+  const auto value = [&] { return std::string(rng() % 200, static_cast<char>('a' + rng() % 26)); };
+  std::vector<std::pair<bytecask::Snapshot, bytecask::Snapshot>> snaps;
+  int commits = 0;
+  int conflicts = 0;
+  // Snapshots are taken more often than plans use them, and age in a queue
+  // of 16, so a plan's snapshot is often several writes old.
+  for (int step = 0; step < 4000; ++step) {
+    const auto dice = rng() % 100;
+    if (dice < 45) {
+      snaps.emplace_back(a.snapshot(), b.snapshot());
+      if (snaps.size() > 16) snaps.erase(snaps.begin());
+    } else if (dice < 47) {
+      const auto ta = rng() % 2 == 0 ? 0.0 : 0.5;
+      REQUIRE(a.vacuum({.fragmentation_threshold = ta}) ==
+              b.vacuum({.fragmentation_threshold = ta}));
+    } else if (dice < 60) {
+      const auto k = key();
+      if (rng() % 3 == 0) {
+        const auto ra = a.del({.sync = false}, to_bytes(k));
+        const auto rb = b.del({.sync = false}, to_bytes(k));
+        REQUIRE(ra.has_value() == rb.has_value());
+      } else {
+        const auto v = value();
+        REQUIRE(a.put({.sync = false}, to_bytes(k), to_bytes(v)).sequence ==
+                b.put({.sync = false}, to_bytes(k), to_bytes(v)).sequence);
+      }
+    } else {
+      std::optional<bytecask::WritePlan> pa;
+      std::optional<bytecask::WritePlan> pb;
+      if (!snaps.empty() && rng() % 5 != 0) {
+        const auto i = static_cast<std::ptrdiff_t>(rng() % snaps.size());
+        auto pair = std::move(snaps[static_cast<std::size_t>(i)]);
+        snaps.erase(snaps.begin() + i);
+        pa.emplace(std::move(pair.first));
+        pb.emplace(std::move(pair.second));
+      } else {
+        pa.emplace();
+        pb.emplace();
+      }
+      const auto ops = 1 + rng() % 4;
+      std::string last;
+      for (std::size_t o = 0; o < ops; ++o) {
+        // Now and then the same key twice in one plan.
+        const auto k = !last.empty() && rng() % 4 == 0 ? last : key();
+        last = k;
+        const auto kind = rng() % 10;
+        if (kind < 6) {
+          const auto v = value();
+          pa->put(to_bytes(k), to_bytes(v));
+          pb->put(to_bytes(k), to_bytes(v));
+        } else if (kind < 9) {
+          pa->del(to_bytes(k));
+          pb->del(to_bytes(k));
+        } else if (pa->has_snapshot()) {
+          pa->ensure_unchanged(to_bytes(k));
+          pb->ensure_unchanged(to_bytes(k));
+        }
+      }
+      const auto ra = a.apply_batch({.sync = false}, std::move(*pa));
+      const auto rb = b.apply_batch({.sync = false}, std::move(*pb));
+      REQUIRE(ra.has_value() == rb.has_value());
+      if (ra) {
+        REQUIRE(ra->sequence == rb->sequence);
+        ++commits;
+      } else {
+        ++conflicts;
+      }
+    }
+  }
+  snaps.clear();
+  CHECK(commits > 300);
+  CHECK(conflicts > 300);
+  REQUIRE(collect_kv(a) == collect_kv(b));
+  const auto stats = [](bytecask::DB &db) {
+    std::vector<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t,
+                           std::uint64_t>> vals;
+    for (const auto &[fid, fs] : db.file_stats())
+      vals.emplace_back(fs.live_bytes, fs.total_bytes, fs.min_sequence,
+                        fs.max_sequence);
+    std::ranges::sort(vals);
+    return vals;
+  };
+  REQUIRE(stats(a) == stats(b));
 }
 
 TEST_CASE("pipeline: a writer whose write another thread published sees it "

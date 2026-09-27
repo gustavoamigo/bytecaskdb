@@ -1521,6 +1521,10 @@ public:
   // Called on the background worker at the start of every hint task queued
   // by dispatch_hint. Lets a test hold the worker to build a backlog.
   std::function<void()> test_before_hint_;
+  // Leaves plans unresolved, so validation and the key directory update go
+  // by key, as before record locations were used as version tokens. The
+  // differential test runs one workload both ways.
+  bool test_resolve_by_key_{false};
   // Publishes s through the checked store_state under a write barrier, so
   // tests can drive the runtime invariant checks with a crafted state.
   void test_publish(std::shared_ptr<EngineState> s) {
@@ -1791,11 +1795,29 @@ private:
     g.precondition = pre;
   }
 
+  // Looks up each point write's key in the snapshot, on the caller's
+  // thread, before the plan joins a batch: under the write lock the check
+  // and the update then find the key by the location found here, without
+  // reading its record (docs/unsynced_commit_design.md, D3).
+  void resolve_snapshot_entries();
+  // The snapshot's entry for write i: resolved earlier, or looked up now.
+  [[nodiscard]] auto snapshot_entry(std::size_t i, BytesView key) const
+      -> std::optional<KeyDirEntry>;
+  // The resolved snapshot entry for write i, if resolution ran and the key
+  // was present: the location an update or erase can go by.
+  [[nodiscard]] auto resolved_entry(std::size_t i) const
+      -> const std::optional<KeyDirEntry> & {
+    static const std::optional<KeyDirEntry> kNone;
+    return i < snap_entries_.size() ? snap_entries_[i] : kNone;
+  }
+
   std::optional<Snapshot> snap_;
   SizeLimits limits_;
   std::vector<WriteOp> writes_;
   std::map<Bytes, KeyGuard> guards_;
   std::vector<RangeGuard> range_guards_;
+  // Parallel to writes_ once resolve_snapshot_entries ran; empty otherwise.
+  std::vector<std::optional<KeyDirEntry>> snap_entries_;
   friend class DB;
   friend class TransientEngineState;
 };
@@ -1955,37 +1977,31 @@ auto TransientEngineState::validate_preconditions(
 
   // 3. Implicit W-W check on all write keys (only when snapshot present).
   if (snap_state) {
-    for (const auto &w : plan.writes_) {
+    // The key changed since the snapshot unless the head maps it to the
+    // snapshot's record, or it is absent from both. The head is asked by
+    // location first, which reads nothing; only a key that moved is read,
+    // to tell a changed key from one vacuum relocated.
+    const auto point_conflict = [&](std::size_t i, const Bytes &key) {
+      const std::span<const std::byte> key_span{key};
+      const auto snap_entry = plan.snapshot_entry(i, key_span);
+      if (snap_entry && kd_holds(key_dir_, key_span, *snap_entry)) return false;
+      const auto cur_entry = kd_get(key_dir_, key_span, kd_ctx());
+      const bool appeared = !snap_entry && cur_entry;
+      const bool deleted = snap_entry && !cur_entry;
+      const bool modified = snap_entry && cur_entry &&
+                            cur_entry->sequence() != snap_entry->sequence();
+      if (!(appeared || deleted || modified)) return false;
+      lost_to = cur_entry ? cur_entry->sequence() : head_latest;
+      return true;
+    };
+    for (std::size_t i = 0; i < plan.writes_.size(); ++i) {
       bool has_conflict = false;
       std::visit(
           [&](const auto &op) -> void {
             using T = std::decay_t<decltype(op)>;
-            if constexpr (std::is_same_v<T, WritePlan::PointPut>) {
-              const std::span<const std::byte> key_span{op.key};
-              const auto snap_entry = kd_get(snap_state->key_dir, key_span, snap_state->kd_ctx());
-              const auto cur_entry = kd_get(key_dir_, key_span, kd_ctx());
-              const bool appeared = !snap_entry && cur_entry;
-              const bool deleted = snap_entry && !cur_entry;
-              const bool modified =
-                  snap_entry && cur_entry &&
-                  cur_entry->sequence() != snap_entry->sequence();
-              if (appeared || deleted || modified) {
-                has_conflict = true;
-                lost_to = cur_entry ? cur_entry->sequence() : head_latest;
-              }
-            } else if constexpr (std::is_same_v<T, WritePlan::PointDel>) {
-              const std::span<const std::byte> key_span{op.key};
-              const auto snap_entry = kd_get(snap_state->key_dir, key_span, snap_state->kd_ctx());
-              const auto cur_entry = kd_get(key_dir_, key_span, kd_ctx());
-              const bool appeared = !snap_entry && cur_entry;
-              const bool deleted = snap_entry && !cur_entry;
-              const bool modified =
-                  snap_entry && cur_entry &&
-                  cur_entry->sequence() != snap_entry->sequence();
-              if (appeared || deleted || modified) {
-                has_conflict = true;
-                lost_to = cur_entry ? cur_entry->sequence() : head_latest;
-              }
+            if constexpr (std::is_same_v<T, WritePlan::PointPut> ||
+                          std::is_same_v<T, WritePlan::PointDel>) {
+              has_conflict = point_conflict(i, op.key);
             } else if constexpr (std::is_same_v<T, WritePlan::RangeDel>) {
               // Range conflict check: verify no keys in [from, to) changed since snapshot
               const std::span<const std::byte> from_span{op.from};
@@ -2017,12 +2033,39 @@ auto TransientEngineState::validate_preconditions(
               }
             }
           },
-          w);
+          plan.writes_[i]);
       if (has_conflict) return false;
     }
   }
 
   return true;
+}
+
+void WritePlan::resolve_snapshot_entries() {
+  if (!snap_) return;
+  const auto &s = *snap_->state_;
+  snap_entries_.clear();
+  snap_entries_.reserve(writes_.size());
+  for (const auto &w : writes_) {
+    std::visit(
+        [&](const auto &op) {
+          using T = std::decay_t<decltype(op)>;
+          if constexpr (std::is_same_v<T, PointPut> ||
+                        std::is_same_v<T, PointDel>) {
+            snap_entries_.push_back(kd_get(s.key_dir, op.key, s.kd_ctx()));
+          } else {
+            snap_entries_.emplace_back();
+          }
+        },
+        w);
+  }
+}
+
+auto WritePlan::snapshot_entry(std::size_t i, BytesView key) const
+    -> std::optional<KeyDirEntry> {
+  if (i < snap_entries_.size()) return snap_entries_[i];
+  const auto &s = *snap_->state_;
+  return kd_get(s.key_dir, key, s.kd_ctx());
 }
 
 auto TransientEngineState::prepare_write(const WritePlan &plan) const
@@ -2087,7 +2130,7 @@ void TransientEngineState::apply_writes(
     ++io_idx;
   }
 
-  for (const auto &w : plan.writes_) {
+  for (std::size_t w_idx = 0; w_idx < plan.writes_.size(); ++w_idx) {
     std::visit(
         [&](const auto &op) {
           using T = std::decay_t<decltype(op)>;
@@ -2095,11 +2138,15 @@ void TransientEngineState::apply_writes(
             const std::span<const std::byte> key_span{op.key};
             const auto val_size = narrow<std::uint32_t>(op.value.size());
             note_pending(offsets[io_idx], next_seq_, key_span, val_size);
-            const auto existing = kd_put(
-                key_dir_, key_span,
-                KeyDirEntry::make(next_seq_, offsets[io_idx], active_file_id_,
-                                  val_size),
-                kd_ctx());
+            const auto entry = KeyDirEntry::make(next_seq_, offsets[io_idx],
+                                                 active_file_id_, val_size);
+            // An update of a key still at the snapshot's record goes by that
+            // location and reads nothing; anything else is placed by key.
+            const auto &at = plan.resolved_entry(w_idx);
+            const auto existing =
+                at && kd_put_at(key_dir_, key_span, *at, entry)
+                    ? std::optional{kd_hit(*at)}
+                    : kd_put(key_dir_, key_span, entry, kd_ctx());
             if (existing) {
               const auto dec =
                   entry_size(key_span.size(), existing->value_size());
@@ -2116,7 +2163,10 @@ void TransientEngineState::apply_writes(
             ++io_idx;
           } else if constexpr (std::is_same_v<T, WritePlan::PointDel>) {
             const std::span<const std::byte> key_span{op.key};
-            const auto existing = kd_erase(key_dir_, key_span, kd_ctx());
+            const auto &at = plan.resolved_entry(w_idx);
+            const auto existing = at && kd_erase_at(key_dir_, key_span, *at)
+                                      ? std::optional{kd_hit(*at)}
+                                      : kd_erase(key_dir_, key_span, kd_ctx());
             if (existing) {
               const auto dec =
                   entry_size(key_span.size(), existing->value_size());
@@ -2165,7 +2215,7 @@ void TransientEngineState::apply_writes(
             ++io_idx;
           }
         },
-        w);
+        plan.writes_[w_idx]);
   }
 
   // Account for BulkEnd marker.
@@ -2760,6 +2810,10 @@ auto DB::apply_batch(WriteOptions opts,
   slot.plan = std::move(plan);
   slot.opts = opts;
   slot.sync = opts.sync;
+#ifdef BYTECASK_TESTING
+  if (!test_resolve_by_key_)
+#endif
+    slot.plan.resolve_snapshot_entries();
 
   const bool use_solo = opts.solo
       || slot.plan.write_bytes() > kGroupWriteMaxBytes;
@@ -3133,13 +3187,26 @@ void DB::flush_once() {
   // running leader would be blocked on it and busy() could never clear.
   // Bounded so a stalled leader cannot hold the disk; the bound only binds
   // under continuous arrivals, where it is ~8% of a flush.
+  //
+  // Only a flush that will fdatasync settles: one the head already owes, or
+  // one a synced writer still in stage 1 will need. An unsynced flush has
+  // no fdatasync to share, and settling would only delay its publication —
+  // under continuous unsynced writers, by the whole bound on every flush
+  // (docs/write_path_investigation.md: +19% oltp_write_only without it).
   {
+    const auto owes_sync = [&] {
+      return write_group_.sync_busy() ||
+             load_head()->sync_requested_seq > load_state()->durable_seq;
+    };
     const auto deadline =
         std::chrono::steady_clock::now() + kFlushSettleMax;
-    while (write_group_.busy()
+    bool settled = false;
+    while (write_group_.busy() && owes_sync()
            && std::chrono::steady_clock::now() < deadline) {
+      settled = true;
       std::this_thread::yield();
     }
+    if (settled) counters_.flush_settles.fetch_add(1, std::memory_order_relaxed);
   }
   flush_pending();
   finish_flush();
@@ -3909,6 +3976,8 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.fsyncs.load(std::memory_order_relaxed)},
       {"bytecask.commit_wait_blocked",
        counters_.commit_wait_blocked.load(std::memory_order_relaxed)},
+      {"bytecask.flush_settles",
+       counters_.flush_settles.load(std::memory_order_relaxed)},
       {"bytecask.disk_reads",
        counters_.disk_reads.load()},
       {"bytecask.disk_read_bytes",

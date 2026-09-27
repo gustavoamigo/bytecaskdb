@@ -367,6 +367,23 @@ export inline auto kd_erase(KeyDirTransient &t, std::span<const std::byte> key,
     (void)t.erase(key);
   return e;
 }
+// Operations on a key whose entry was looked up earlier, `at` (see the blind
+// versions). A keyed tree reads nothing to find a key, so it has nothing to
+// save: these decline and the caller takes the keyed path.
+export inline auto kd_holds(const KeyDirTransient &, std::span<const std::byte>,
+                            const KeyDirEntry &) -> bool {
+  return false;
+}
+export inline auto kd_put_at(KeyDirTransient &, std::span<const std::byte>,
+                             const KeyDirEntry &, const KeyDirEntry &) -> bool {
+  return false;
+}
+export inline auto kd_erase_at(KeyDirTransient &, std::span<const std::byte>,
+                               const KeyDirEntry &) -> bool {
+  return false;
+}
+// What a put or an erase of the entry `at` displaced.
+export inline auto kd_hit(const KeyDirEntry &at) -> KeyDirHit { return at; }
 export template <typename T>
 auto kd_lower_bound(const T &t, std::span<const std::byte> key,
                     const KeyDirCtx &) {
@@ -718,6 +735,31 @@ export inline auto kd_erase(KeyDirTransient &t, std::span<const std::byte> key,
   if (!erased)
     return std::nullopt;
   return reader.displaced(*erased);
+}
+// Operations on a key whose entry was looked up earlier, `at` — in a
+// snapshot, outside the write lock. A record location names one record, and
+// a record holds one key, so an entry that still points at `at` is the key,
+// unchanged since: none of these reads a record. Each declines (false,
+// nothing changed) when the entry no longer points at `at`, and the caller
+// takes the keyed path.
+export inline auto kd_holds(const KeyDirTransient &t,
+                            std::span<const std::byte> key,
+                            const KeyDirEntry &at) -> bool {
+  return t.holds(key, to_blind_ref(at));
+}
+export inline auto kd_put_at(KeyDirTransient &t, std::span<const std::byte> key,
+                             const KeyDirEntry &at, const KeyDirEntry &e)
+    -> bool {
+  return t.replace_at(key, to_blind_ref(at), to_blind_ref(e));
+}
+export inline auto kd_erase_at(KeyDirTransient &t,
+                               std::span<const std::byte> key,
+                               const KeyDirEntry &at) -> bool {
+  return t.erase_at(key, to_blind_ref(at));
+}
+// What a put or an erase of the entry `at` displaced: `at`'s own record.
+export inline auto kd_hit(const KeyDirEntry &at) -> KeyDirHit {
+  return {to_blind_ref(at), at.value_size()};
 }
 export template <typename T>
 auto kd_lower_bound(const T &t, std::span<const std::byte> key,

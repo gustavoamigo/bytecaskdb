@@ -427,6 +427,27 @@ export template <std::size_t LeafBytes> struct Leaf {
     return std::nullopt;
   }
 
+  // Index of the entry whose record is `ref`, among those with the query's
+  // full fingerprint. Reads nothing. `ref` must be a record of the query
+  // key — some version of it: a record holds one key, so an entry that
+  // points at it is the query's, whatever other entries share its
+  // fingerprint.
+  [[nodiscard]] static auto find_at(const N *n, std::uint32_t fpq,
+                                    BlindRef ref) noexcept
+      -> std::optional<std::uint32_t> {
+    const auto hits = fp_lo_matches(n, fpq & 0xFFFu);
+    const auto fp_hi = fpq >> 12;
+    for (std::size_t k = 0; k < kMaskWords; ++k) {
+      for (auto bits = hits.w[k]; bits != 0; bits &= bits - 1) {
+        const auto i = static_cast<std::uint32_t>(
+            64 * k + static_cast<std::size_t>(std::countr_zero(bits)));
+        if ((loc(n)[i] & 0xFFFu) == fp_hi && ref_at(n, i) == ref)
+          return i;
+      }
+    }
+    return std::nullopt;
+  }
+
   // Where `q` is or belongs. For an absent key, `j` is its crit bit against
   // the candidate, and `after` says whether it sorts after the candidate's
   // run (the keys that share bits [0, j) with it) or before it.
@@ -555,19 +576,57 @@ public:
       const auto idx = L::find(leaf, key, fpq, res);
       if (!idx)
         return {leaf, nullptr, false, false};
-      displaced_ = L::ref_at(leaf, *idx);
+      return remove_entry(leaf, *idx);
+    };
+    return this->descend_erase(root, key, step);
+  }
+
+  // Points key's entry at `to` if it points at `from`; otherwise changes
+  // nothing. No read: see Leaf::find_at.
+  auto replace_at(N *root, Bytes key, BlindRef from, BlindRef to) -> Result {
+    displaced_.reset();
+    if (!root)
+      return {nullptr, nullptr, false, false};
+    const auto fpq = fingerprint(key);
+    auto step = [&](N *leaf) -> Result {
+      const auto idx = L::find_at(leaf, fpq, from);
+      if (!idx)
+        return {leaf, nullptr, false, false};
       auto *n = own_leaf(leaf);
-      L::remove_at(n, *idx);
-      if (n->count == 0) {
-        discard(n);
-        return {nullptr, nullptr, true, false};
-      }
+      L::set_ref(n, *idx, to);
+      displaced_ = from;
       return {n, nullptr, true, false};
+    };
+    return this->descend_upsert(root, key, step);
+  }
+
+  // Erases key's entry if it points at `from`; otherwise changes nothing.
+  auto erase_at(N *root, Bytes key, BlindRef from) -> Result {
+    displaced_.reset();
+    if (!root)
+      return {nullptr, nullptr, false, false};
+    const auto fpq = fingerprint(key);
+    auto step = [&](N *leaf) -> Result {
+      const auto idx = L::find_at(leaf, fpq, from);
+      if (!idx)
+        return {leaf, nullptr, false, false};
+      return remove_entry(leaf, *idx);
     };
     return this->descend_erase(root, key, step);
   }
 
 private:
+  auto remove_entry(N *leaf, std::uint32_t idx) -> Result {
+    displaced_ = L::ref_at(leaf, idx);
+    auto *n = own_leaf(leaf);
+    L::remove_at(n, idx);
+    if (n->count == 0) {
+      discard(n);
+      return {nullptr, nullptr, true, false};
+    }
+    return {n, nullptr, true, false};
+  }
+
   // The base's own() rebuilds a node as a slotted page; a blind leaf is
   // cloned by copying its arrays.
   auto own_leaf(N *leaf) -> N * {
@@ -680,6 +739,16 @@ auto find_ref(const N *cur, Bytes key, R &res) -> std::optional<BlindRef> {
   if (!idx)
     return std::nullopt;
   return Leaf<LeafBytes>::ref_at(cur, *idx);
+}
+
+// Whether key's entry points at `ref`. No read.
+template <std::size_t LeafBytes>
+auto holds_ref(const N *cur, Bytes key, BlindRef ref) -> bool {
+  if (!cur)
+    return false;
+  while (!cur->is_leaf)
+    cur = cur->child(cur->child_index(key));
+  return Leaf<LeafBytes>::find_at(cur, fingerprint(key), ref).has_value();
 }
 
 } // namespace blind_detail
@@ -908,6 +977,11 @@ public:
   [[nodiscard]] auto contains(Bytes key, R &res) const -> bool {
     return get(key, res).has_value();
   }
+  // Whether key's entry points at `ref`, a record of key: true only if key
+  // maps to that very record. Reads nothing.
+  [[nodiscard]] auto holds(Bytes key, BlindRef ref) const -> bool {
+    return blind_detail::holds_ref<LeafBytes>(root_, key, ref);
+  }
 
   template <BlindKeyResolver R>
   [[nodiscard]] auto set(Bytes key, BlindRef ref, R &res) const
@@ -1122,6 +1196,34 @@ public:
     (void)upsert(key, ref, res, always);
   }
 
+  // Operations on a key by one of its records, read-free: `from` (`ref`)
+  // must be a record of `key`, current or earlier. A record location names
+  // one record, which holds one key, so an entry pointing at it is key's.
+  // Each does nothing and returns false unless key's entry points at it.
+  [[nodiscard]] auto holds(Bytes key, BlindRef ref) const -> bool {
+    ensure_active();
+    return blind_detail::holds_ref<LeafBytes>(root_, key, ref);
+  }
+  auto replace_at(Bytes key, BlindRef from, BlindRef to) -> bool {
+    ensure_active();
+    blind_detail::check_ref(key, to);
+    const auto r = session_.replace_at(root_, key, from, to);
+    if (!r.changed)
+      return false;
+    changed_ = true;
+    root_ = r.node;
+    (void)session_.take_displaced();
+    return true;
+  }
+  auto erase_at(Bytes key, BlindRef from) -> bool {
+    ensure_active();
+    const auto r = session_.erase_at(root_, key, from);
+    if (!r.changed)
+      return false;
+    apply_erase(r);
+    return true;
+  }
+
   // Inserts if absent, replaces if should_replace(existing, incoming).
   // Returns the displaced reference.
   template <BlindKeyResolver R, typename Pred>
@@ -1146,14 +1248,7 @@ public:
     const auto r = session_.erase(root_, key, res);
     if (!r.changed)
       return std::nullopt;
-    changed_ = true;
-    root_ = r.node;
-    while (root_ && !root_->is_leaf && root_->count == 0) {
-      auto *old = root_;
-      root_ = old->first_child;
-      session_.discard(old);
-    }
-    --size_;
+    apply_erase(r);
     return session_.take_displaced();
   }
 
@@ -1196,6 +1291,18 @@ private:
   void ensure_active() const {
     if (session_.tag() == 0) [[unlikely]]
       throw std::logic_error{"TransientBlindBTree already consumed"};
+  }
+
+  // The root after an erase that removed an entry.
+  void apply_erase(const typename blind_detail::BlindSession<LeafBytes>::Result &r) {
+    changed_ = true;
+    root_ = r.node;
+    while (root_ && !root_->is_leaf && root_->count == 0) {
+      auto *old = root_;
+      root_ = old->first_child;
+      session_.discard(old);
+    }
+    --size_;
   }
 
   void discard() noexcept {

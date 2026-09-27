@@ -83,6 +83,9 @@ export struct Counters {
   // Writers that slept in commit_wait behind an in-flight flush. Zero for
   // a lone writer, which always flushes on its own thread.
   std::atomic<std::int64_t> commit_wait_blocked{0};
+  // Flushes that waited for writers still in stage 1 before capturing the
+  // head, so one fdatasync covers them. Only a flush that owes a sync does.
+  std::atomic<std::int64_t> flush_settles{0};
 
   // -- Read path --
   StripedCounter disk_reads;
