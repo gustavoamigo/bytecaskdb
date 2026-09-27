@@ -1796,6 +1796,12 @@ public:
   // inputs are empty handles, and the nodes of theirs the result does not
   // reuse are freed at once. On key conflicts resolve(a_val, b_val) picks
   // the winner. Size is computed inline as a.size() + b.size() - overlaps.
+  //
+  // resolve must be noexcept. The merge edits its own clones in place, and
+  // until it returns they hang off its stack frames, not off a root: a
+  // throw out of resolve would strand every one of them. A caller whose
+  // resolution can fail records the failure and raises it once the merged
+  // tree is a handle that frees itself.
   template <typename ResolveFunc>
   [[nodiscard]] static auto merge(PersistentRadixTree &&a,
                                   PersistentRadixTree &&b,
@@ -2078,6 +2084,9 @@ auto PersistentRadixTree<V>::merge(PersistentRadixTree &&a,
                                    PersistentRadixTree &&b,
                                    ResolveFunc &&resolve)
     -> PersistentRadixTree {
+  static_assert(std::is_nothrow_invocable_r_v<V, ResolveFunc &, const V &,
+                                              const V &>,
+                "PersistentRadixTree::merge: resolve must be noexcept");
   if (!a.root_)
     return std::move(b);
   if (!b.root_)

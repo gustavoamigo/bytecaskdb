@@ -4810,13 +4810,25 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
   }
   a.file_stats = std::move(merged_stats_t).persistent();
 
-  auto seq_resolver = [](const KeyDirEntry &x, const KeyDirEntry &y) {
-    return kde_newer(x, y) ? x : y;
+  // kde_newer throws on two entries under one sequence (SequenceOverlap, or
+  // corruption), but the radix merge must not be thrown through: its clones
+  // would be stranded. The first failure is held and raised once merge has
+  // returned, when the merged tree frees itself as it unwinds.
+  std::exception_ptr conflict;
+  auto seq_resolver = [&conflict](const KeyDirEntry &x,
+                                  const KeyDirEntry &y) noexcept {
+    try {
+      return kde_newer(x, y) ? x : y;
+    } catch (...) {
+      if (!conflict) conflict = std::current_exception();
+      return x;
+    }
   };
 
   // merge consumes both inputs; a and b are ours, moved in by the caller.
   auto merged = RecoveryKeyDirTree::merge(std::move(a.key_dir), std::move(b.key_dir),
                                   seq_resolver);
+  if (conflict) std::rethrow_exception(conflict);
 
   // Erasing an entry marks the tombstone needed, as in
   // recovery_build_from_hints: the entry comes from the other side's files.
