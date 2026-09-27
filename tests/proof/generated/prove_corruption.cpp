@@ -7,10 +7,10 @@
 // through H model syscalls that fail; these model a read that succeeds and
 // returns something wrong, so the axis is over the bytes rather than the
 // calls. Each test publishes a known set of entries, damages one field of one
-// entry at a computed offset, and verifies the engine fails stop: resume()
-// refuses and stays degraded, a cold open refuses wherever the format can see
-// the damage, and neither truncates a byte. There is no recovery contract for
-// damaged published data — only a promise not to make it worse.
+// entry at a computed offset, and verifies that resume() fails stop: it
+// refuses and stays degraded without truncating a byte. A cold open truncates
+// at the damage, as it would a torn tail (#138). There is no recovery
+// contract for damaged published data.
 
 #include <string_view>
 #include <system_error>
@@ -29,6 +29,7 @@ namespace {
 
 using bytecask::testing::data_file_prefix;
 using bytecask::testing::flip_byte_at;
+using bytecask::testing::only_data_file;
 using bytecask::testing::poke_huge_value_size;
 using bytecask::testing::poke_invalid_entry_type;
 using bytecask::testing::poke_zero_sequence;
@@ -108,11 +109,22 @@ TEST_CASE("prove_corruption__first_entry__crc", "[prove_corruption]") {
       CHECK(data_file_prefix(dir, 161) == damaged);
     }
   }
-  // A cold open reads the same damage and refuses the same way,
-  // under the default fail_recovery_on_crc_errors, without
-  // trimming the file to the point it could parse.
-  REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
-  CHECK(data_file_prefix(dir, 161) == damaged);
+  // A cold open cannot refuse the same way: the damaged file is the
+  // newest, where a crash can leave a torn tail, and nothing on disk
+  // tells the two apart. It truncates at the first bad record, as for
+  // a torn tail, and keeps what was committed before it (#138).
+  const auto data = only_data_file(dir);
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(!db.contains_key({}, to_bytes("k0")));
+    CHECK(!db.contains_key({}, to_bytes("k1")));
+    CHECK(!db.contains_key({}, to_bytes("k2")));
+    CHECK(!db.contains_key({}, to_bytes("k3")));
+    CHECK(!db.contains_key({}, to_bytes("k4")));
+    CHECK(!db.contains_key({}, to_bytes("k5")));
+    CHECK(!db.contains_key({}, to_bytes("zz")));
+  }
+  CHECK(std::filesystem::file_size(data) == 0u);
 }
 
 TEST_CASE("prove_corruption__first_entry__value_size", "[prove_corruption]") {
@@ -155,12 +167,22 @@ TEST_CASE("prove_corruption__first_entry__value_size", "[prove_corruption]") {
       CHECK(data_file_prefix(dir, 161) == damaged);
     }
   }
-  // No cold-open assertion: a value_size damaged this way
-  // reads as the end of written data, which is also what the
-  // unwritten tail of a crashed active file looks like, and a
-  // hint-less file records no committed length to tell the two
-  // apart. resume() can only because the published state knows
-  // the extent. See docs/correctness_validation.md, class M4.
+  // A cold open cannot refuse the same way: the damaged file is the
+  // newest, where a crash can leave a torn tail, and nothing on disk
+  // tells the two apart. It truncates at the first bad record, as for
+  // a torn tail, and keeps what was committed before it (#138).
+  const auto data = only_data_file(dir);
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(!db.contains_key({}, to_bytes("k0")));
+    CHECK(!db.contains_key({}, to_bytes("k1")));
+    CHECK(!db.contains_key({}, to_bytes("k2")));
+    CHECK(!db.contains_key({}, to_bytes("k3")));
+    CHECK(!db.contains_key({}, to_bytes("k4")));
+    CHECK(!db.contains_key({}, to_bytes("k5")));
+    CHECK(!db.contains_key({}, to_bytes("zz")));
+  }
+  CHECK(std::filesystem::file_size(data) == 0u);
 }
 
 TEST_CASE("prove_corruption__first_entry__entry_type", "[prove_corruption]") {
@@ -203,11 +225,22 @@ TEST_CASE("prove_corruption__first_entry__entry_type", "[prove_corruption]") {
       CHECK(data_file_prefix(dir, 161) == damaged);
     }
   }
-  // A cold open reads the same damage and refuses the same way,
-  // under the default fail_recovery_on_crc_errors, without
-  // trimming the file to the point it could parse.
-  REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
-  CHECK(data_file_prefix(dir, 161) == damaged);
+  // A cold open cannot refuse the same way: the damaged file is the
+  // newest, where a crash can leave a torn tail, and nothing on disk
+  // tells the two apart. It truncates at the first bad record, as for
+  // a torn tail, and keeps what was committed before it (#138).
+  const auto data = only_data_file(dir);
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(!db.contains_key({}, to_bytes("k0")));
+    CHECK(!db.contains_key({}, to_bytes("k1")));
+    CHECK(!db.contains_key({}, to_bytes("k2")));
+    CHECK(!db.contains_key({}, to_bytes("k3")));
+    CHECK(!db.contains_key({}, to_bytes("k4")));
+    CHECK(!db.contains_key({}, to_bytes("k5")));
+    CHECK(!db.contains_key({}, to_bytes("zz")));
+  }
+  CHECK(std::filesystem::file_size(data) == 0u);
 }
 
 TEST_CASE("prove_corruption__first_entry__sequence", "[prove_corruption]") {
@@ -250,12 +283,22 @@ TEST_CASE("prove_corruption__first_entry__sequence", "[prove_corruption]") {
       CHECK(data_file_prefix(dir, 161) == damaged);
     }
   }
-  // No cold-open assertion: a sequence damaged this way
-  // reads as the end of written data, which is also what the
-  // unwritten tail of a crashed active file looks like, and a
-  // hint-less file records no committed length to tell the two
-  // apart. resume() can only because the published state knows
-  // the extent. See docs/correctness_validation.md, class M4.
+  // A cold open cannot refuse the same way: the damaged file is the
+  // newest, where a crash can leave a torn tail, and nothing on disk
+  // tells the two apart. It truncates at the first bad record, as for
+  // a torn tail, and keeps what was committed before it (#138).
+  const auto data = only_data_file(dir);
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(!db.contains_key({}, to_bytes("k0")));
+    CHECK(!db.contains_key({}, to_bytes("k1")));
+    CHECK(!db.contains_key({}, to_bytes("k2")));
+    CHECK(!db.contains_key({}, to_bytes("k3")));
+    CHECK(!db.contains_key({}, to_bytes("k4")));
+    CHECK(!db.contains_key({}, to_bytes("k5")));
+    CHECK(!db.contains_key({}, to_bytes("zz")));
+  }
+  CHECK(std::filesystem::file_size(data) == 0u);
 }
 
 TEST_CASE("prove_corruption__mid_file__crc", "[prove_corruption]") {
@@ -298,11 +341,22 @@ TEST_CASE("prove_corruption__mid_file__crc", "[prove_corruption]") {
       CHECK(data_file_prefix(dir, 161) == damaged);
     }
   }
-  // A cold open reads the same damage and refuses the same way,
-  // under the default fail_recovery_on_crc_errors, without
-  // trimming the file to the point it could parse.
-  REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
-  CHECK(data_file_prefix(dir, 161) == damaged);
+  // A cold open cannot refuse the same way: the damaged file is the
+  // newest, where a crash can leave a torn tail, and nothing on disk
+  // tells the two apart. It truncates at the first bad record, as for
+  // a torn tail, and keeps what was committed before it (#138).
+  const auto data = only_data_file(dir);
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("k1")));
+    CHECK(!db.contains_key({}, to_bytes("k2")));
+    CHECK(!db.contains_key({}, to_bytes("k3")));
+    CHECK(!db.contains_key({}, to_bytes("k4")));
+    CHECK(!db.contains_key({}, to_bytes("k5")));
+    CHECK(!db.contains_key({}, to_bytes("zz")));
+  }
+  CHECK(std::filesystem::file_size(data) == 46u);
 }
 
 TEST_CASE("prove_corruption__mid_file__value_size", "[prove_corruption]") {
@@ -345,12 +399,22 @@ TEST_CASE("prove_corruption__mid_file__value_size", "[prove_corruption]") {
       CHECK(data_file_prefix(dir, 161) == damaged);
     }
   }
-  // No cold-open assertion: a value_size damaged this way
-  // reads as the end of written data, which is also what the
-  // unwritten tail of a crashed active file looks like, and a
-  // hint-less file records no committed length to tell the two
-  // apart. resume() can only because the published state knows
-  // the extent. See docs/correctness_validation.md, class M4.
+  // A cold open cannot refuse the same way: the damaged file is the
+  // newest, where a crash can leave a torn tail, and nothing on disk
+  // tells the two apart. It truncates at the first bad record, as for
+  // a torn tail, and keeps what was committed before it (#138).
+  const auto data = only_data_file(dir);
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("k1")));
+    CHECK(!db.contains_key({}, to_bytes("k2")));
+    CHECK(!db.contains_key({}, to_bytes("k3")));
+    CHECK(!db.contains_key({}, to_bytes("k4")));
+    CHECK(!db.contains_key({}, to_bytes("k5")));
+    CHECK(!db.contains_key({}, to_bytes("zz")));
+  }
+  CHECK(std::filesystem::file_size(data) == 46u);
 }
 
 TEST_CASE("prove_corruption__mid_file__entry_type", "[prove_corruption]") {
@@ -393,11 +457,22 @@ TEST_CASE("prove_corruption__mid_file__entry_type", "[prove_corruption]") {
       CHECK(data_file_prefix(dir, 161) == damaged);
     }
   }
-  // A cold open reads the same damage and refuses the same way,
-  // under the default fail_recovery_on_crc_errors, without
-  // trimming the file to the point it could parse.
-  REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
-  CHECK(data_file_prefix(dir, 161) == damaged);
+  // A cold open cannot refuse the same way: the damaged file is the
+  // newest, where a crash can leave a torn tail, and nothing on disk
+  // tells the two apart. It truncates at the first bad record, as for
+  // a torn tail, and keeps what was committed before it (#138).
+  const auto data = only_data_file(dir);
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("k1")));
+    CHECK(!db.contains_key({}, to_bytes("k2")));
+    CHECK(!db.contains_key({}, to_bytes("k3")));
+    CHECK(!db.contains_key({}, to_bytes("k4")));
+    CHECK(!db.contains_key({}, to_bytes("k5")));
+    CHECK(!db.contains_key({}, to_bytes("zz")));
+  }
+  CHECK(std::filesystem::file_size(data) == 46u);
 }
 
 TEST_CASE("prove_corruption__mid_file__sequence", "[prove_corruption]") {
@@ -440,12 +515,22 @@ TEST_CASE("prove_corruption__mid_file__sequence", "[prove_corruption]") {
       CHECK(data_file_prefix(dir, 161) == damaged);
     }
   }
-  // No cold-open assertion: a sequence damaged this way
-  // reads as the end of written data, which is also what the
-  // unwritten tail of a crashed active file looks like, and a
-  // hint-less file records no committed length to tell the two
-  // apart. resume() can only because the published state knows
-  // the extent. See docs/correctness_validation.md, class M4.
+  // A cold open cannot refuse the same way: the damaged file is the
+  // newest, where a crash can leave a torn tail, and nothing on disk
+  // tells the two apart. It truncates at the first bad record, as for
+  // a torn tail, and keeps what was committed before it (#138).
+  const auto data = only_data_file(dir);
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("k1")));
+    CHECK(!db.contains_key({}, to_bytes("k2")));
+    CHECK(!db.contains_key({}, to_bytes("k3")));
+    CHECK(!db.contains_key({}, to_bytes("k4")));
+    CHECK(!db.contains_key({}, to_bytes("k5")));
+    CHECK(!db.contains_key({}, to_bytes("zz")));
+  }
+  CHECK(std::filesystem::file_size(data) == 46u);
 }
 
 TEST_CASE("prove_corruption__last_entry__crc", "[prove_corruption]") {
@@ -488,11 +573,22 @@ TEST_CASE("prove_corruption__last_entry__crc", "[prove_corruption]") {
       CHECK(data_file_prefix(dir, 161) == damaged);
     }
   }
-  // A cold open reads the same damage and refuses the same way,
-  // under the default fail_recovery_on_crc_errors, without
-  // trimming the file to the point it could parse.
-  REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
-  CHECK(data_file_prefix(dir, 161) == damaged);
+  // A cold open cannot refuse the same way: the damaged file is the
+  // newest, where a crash can leave a torn tail, and nothing on disk
+  // tells the two apart. It truncates at the first bad record, as for
+  // a torn tail, and keeps what was committed before it (#138).
+  const auto data = only_data_file(dir);
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("k1")));
+    CHECK(db.contains_key({}, to_bytes("k2")));
+    CHECK(db.contains_key({}, to_bytes("k3")));
+    CHECK(db.contains_key({}, to_bytes("k4")));
+    CHECK(!db.contains_key({}, to_bytes("k5")));
+    CHECK(!db.contains_key({}, to_bytes("zz")));
+  }
+  CHECK(std::filesystem::file_size(data) == 115u);
 }
 
 TEST_CASE("prove_corruption__last_entry__value_size", "[prove_corruption]") {
@@ -535,12 +631,22 @@ TEST_CASE("prove_corruption__last_entry__value_size", "[prove_corruption]") {
       CHECK(data_file_prefix(dir, 161) == damaged);
     }
   }
-  // No cold-open assertion: a value_size damaged this way
-  // reads as the end of written data, which is also what the
-  // unwritten tail of a crashed active file looks like, and a
-  // hint-less file records no committed length to tell the two
-  // apart. resume() can only because the published state knows
-  // the extent. See docs/correctness_validation.md, class M4.
+  // A cold open cannot refuse the same way: the damaged file is the
+  // newest, where a crash can leave a torn tail, and nothing on disk
+  // tells the two apart. It truncates at the first bad record, as for
+  // a torn tail, and keeps what was committed before it (#138).
+  const auto data = only_data_file(dir);
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("k1")));
+    CHECK(db.contains_key({}, to_bytes("k2")));
+    CHECK(db.contains_key({}, to_bytes("k3")));
+    CHECK(db.contains_key({}, to_bytes("k4")));
+    CHECK(!db.contains_key({}, to_bytes("k5")));
+    CHECK(!db.contains_key({}, to_bytes("zz")));
+  }
+  CHECK(std::filesystem::file_size(data) == 115u);
 }
 
 TEST_CASE("prove_corruption__last_entry__entry_type", "[prove_corruption]") {
@@ -583,11 +689,22 @@ TEST_CASE("prove_corruption__last_entry__entry_type", "[prove_corruption]") {
       CHECK(data_file_prefix(dir, 161) == damaged);
     }
   }
-  // A cold open reads the same damage and refuses the same way,
-  // under the default fail_recovery_on_crc_errors, without
-  // trimming the file to the point it could parse.
-  REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
-  CHECK(data_file_prefix(dir, 161) == damaged);
+  // A cold open cannot refuse the same way: the damaged file is the
+  // newest, where a crash can leave a torn tail, and nothing on disk
+  // tells the two apart. It truncates at the first bad record, as for
+  // a torn tail, and keeps what was committed before it (#138).
+  const auto data = only_data_file(dir);
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("k1")));
+    CHECK(db.contains_key({}, to_bytes("k2")));
+    CHECK(db.contains_key({}, to_bytes("k3")));
+    CHECK(db.contains_key({}, to_bytes("k4")));
+    CHECK(!db.contains_key({}, to_bytes("k5")));
+    CHECK(!db.contains_key({}, to_bytes("zz")));
+  }
+  CHECK(std::filesystem::file_size(data) == 115u);
 }
 
 TEST_CASE("prove_corruption__last_entry__sequence", "[prove_corruption]") {
@@ -630,12 +747,22 @@ TEST_CASE("prove_corruption__last_entry__sequence", "[prove_corruption]") {
       CHECK(data_file_prefix(dir, 161) == damaged);
     }
   }
-  // No cold-open assertion: a sequence damaged this way
-  // reads as the end of written data, which is also what the
-  // unwritten tail of a crashed active file looks like, and a
-  // hint-less file records no committed length to tell the two
-  // apart. resume() can only because the published state knows
-  // the extent. See docs/correctness_validation.md, class M4.
+  // A cold open cannot refuse the same way: the damaged file is the
+  // newest, where a crash can leave a torn tail, and nothing on disk
+  // tells the two apart. It truncates at the first bad record, as for
+  // a torn tail, and keeps what was committed before it (#138).
+  const auto data = only_data_file(dir);
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("k1")));
+    CHECK(db.contains_key({}, to_bytes("k2")));
+    CHECK(db.contains_key({}, to_bytes("k3")));
+    CHECK(db.contains_key({}, to_bytes("k4")));
+    CHECK(!db.contains_key({}, to_bytes("k5")));
+    CHECK(!db.contains_key({}, to_bytes("zz")));
+  }
+  CHECK(std::filesystem::file_size(data) == 115u);
 }
 
 TEST_CASE("prove_corruption__inside_batch__crc", "[prove_corruption]") {
@@ -681,11 +808,20 @@ TEST_CASE("prove_corruption__inside_batch__crc", "[prove_corruption]") {
       CHECK(data_file_prefix(dir, 153) == damaged);
     }
   }
-  // A cold open reads the same damage and refuses the same way,
-  // under the default fail_recovery_on_crc_errors, without
-  // trimming the file to the point it could parse.
-  REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
-  CHECK(data_file_prefix(dir, 153) == damaged);
+  // A cold open cannot refuse the same way: the damaged file is the
+  // newest, where a crash can leave a torn tail, and nothing on disk
+  // tells the two apart. It truncates at the first bad record, as for
+  // a torn tail, and keeps what was committed before it (#138).
+  const auto data = only_data_file(dir);
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("k1")));
+    CHECK(!db.contains_key({}, to_bytes("b0")));
+    CHECK(!db.contains_key({}, to_bytes("b1")));
+    CHECK(!db.contains_key({}, to_bytes("zz")));
+  }
+  CHECK(std::filesystem::file_size(data) == 46u);
 }
 
 TEST_CASE("prove_corruption__inside_batch__value_size", "[prove_corruption]") {
@@ -731,12 +867,20 @@ TEST_CASE("prove_corruption__inside_batch__value_size", "[prove_corruption]") {
       CHECK(data_file_prefix(dir, 153) == damaged);
     }
   }
-  // No cold-open assertion: a value_size damaged this way
-  // reads as the end of written data, which is also what the
-  // unwritten tail of a crashed active file looks like, and a
-  // hint-less file records no committed length to tell the two
-  // apart. resume() can only because the published state knows
-  // the extent. See docs/correctness_validation.md, class M4.
+  // A cold open cannot refuse the same way: the damaged file is the
+  // newest, where a crash can leave a torn tail, and nothing on disk
+  // tells the two apart. It truncates at the first bad record, as for
+  // a torn tail, and keeps what was committed before it (#138).
+  const auto data = only_data_file(dir);
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("k1")));
+    CHECK(!db.contains_key({}, to_bytes("b0")));
+    CHECK(!db.contains_key({}, to_bytes("b1")));
+    CHECK(!db.contains_key({}, to_bytes("zz")));
+  }
+  CHECK(std::filesystem::file_size(data) == 46u);
 }
 
 TEST_CASE("prove_corruption__inside_batch__entry_type", "[prove_corruption]") {
@@ -782,11 +926,20 @@ TEST_CASE("prove_corruption__inside_batch__entry_type", "[prove_corruption]") {
       CHECK(data_file_prefix(dir, 153) == damaged);
     }
   }
-  // A cold open reads the same damage and refuses the same way,
-  // under the default fail_recovery_on_crc_errors, without
-  // trimming the file to the point it could parse.
-  REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
-  CHECK(data_file_prefix(dir, 153) == damaged);
+  // A cold open cannot refuse the same way: the damaged file is the
+  // newest, where a crash can leave a torn tail, and nothing on disk
+  // tells the two apart. It truncates at the first bad record, as for
+  // a torn tail, and keeps what was committed before it (#138).
+  const auto data = only_data_file(dir);
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("k1")));
+    CHECK(!db.contains_key({}, to_bytes("b0")));
+    CHECK(!db.contains_key({}, to_bytes("b1")));
+    CHECK(!db.contains_key({}, to_bytes("zz")));
+  }
+  CHECK(std::filesystem::file_size(data) == 46u);
 }
 
 TEST_CASE("prove_corruption__inside_batch__sequence", "[prove_corruption]") {
@@ -832,10 +985,18 @@ TEST_CASE("prove_corruption__inside_batch__sequence", "[prove_corruption]") {
       CHECK(data_file_prefix(dir, 153) == damaged);
     }
   }
-  // No cold-open assertion: a sequence damaged this way
-  // reads as the end of written data, which is also what the
-  // unwritten tail of a crashed active file looks like, and a
-  // hint-less file records no committed length to tell the two
-  // apart. resume() can only because the published state knows
-  // the extent. See docs/correctness_validation.md, class M4.
+  // A cold open cannot refuse the same way: the damaged file is the
+  // newest, where a crash can leave a torn tail, and nothing on disk
+  // tells the two apart. It truncates at the first bad record, as for
+  // a torn tail, and keeps what was committed before it (#138).
+  const auto data = only_data_file(dir);
+  {
+    auto db = bytecask::DB::open(dir);
+    CHECK(db.contains_key({}, to_bytes("k0")));
+    CHECK(db.contains_key({}, to_bytes("k1")));
+    CHECK(!db.contains_key({}, to_bytes("b0")));
+    CHECK(!db.contains_key({}, to_bytes("b1")));
+    CHECK(!db.contains_key({}, to_bytes("zz")));
+  }
+  CHECK(std::filesystem::file_size(data) == 46u);
 }

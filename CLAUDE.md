@@ -73,6 +73,8 @@ These four principles govern every design decision in the codebase, in priority 
 
 4. **Performance** — Optimizations require a real use case. Without one, correctness and simplicity take priority. Benchmark before and after every claimed improvement (`python3 scripts/run_engine_bench.py`). A performance win that introduces a latent UB is not a win.
 
+**The data file is the only record.** Never persist engine state outside the data files. A sidecar, manifest or marker file is extra state that can drift out of sync with the data it describes, and every one needs its own crash and recovery testing. Hints are a rebuildable index of a data file, never a source of truth. If a design needs information the data files don't hold, change the design.
+
 > **The BC-122 lesson:** The old `std::reverse_iterator<RadixTreeIterator>` satisfied none of the first three principles. It was UB (dangling span), it required an apology comment, and it allocated and freed a heap buffer on *every single dereference* — the opposite of predictable latency. Replacing it with `ReverseRadixTreeIterator`, which simply holds the cursor alive as a member (`cur_`) and returns `*cur_` from `operator*`, was simultaneously the correct, simpler, and 26× faster choice. That ordering is not a coincidence.
 
 ## C++ coding guidelines

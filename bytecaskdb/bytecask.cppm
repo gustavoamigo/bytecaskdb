@@ -5,6 +5,7 @@
 
 module;
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -206,7 +207,9 @@ export struct Options {
   // When true (default): any CRC error during recovery causes DB::open to
   // throw std::runtime_error. When false: corrupt entries and hint files are
   // skipped; the DB opens with whatever was successfully recovered, and a
-  // warning is printed to stderr for each skipped item.
+  // warning is printed to stderr for each skipped item. Neither applies to
+  // the tail of a data file without a hint, which recovery_check_tail
+  // truncates or refuses the same way in both modes.
   bool fail_recovery_on_crc_errors{true};
   // Initial engine mode. Leader (default) allows normal writes; Follower
   // blocks put/del/apply_batch and allows ingest().
@@ -1181,12 +1184,25 @@ private:
   void wait_for_hint_backlog();
   // Queues hint generation for a sealed file on the background worker.
   void dispatch_hint(std::shared_ptr<DataFile> file);
+  // Decides, before a hint is renamed into place, whether the file may end
+  // at `end`, the end of its last committed record. Throws to refuse it.
+  using TailCheck = std::function<void(Offset end)>;
   // Writes hint file via temp-then-rename. Batch-aware; idempotent if .hint
   // exists. Returns the offset past the last committed entry, or nullopt
-  // when the hint already existed and nothing was scanned.
+  // when the hint already existed and nothing was scanned. Without a check,
+  // an entry that fails its CRC throws. With one, the scan stops there as it
+  // does at a zeroed header, and the check rules on what lies past it; a
+  // refusal leaves no hint behind.
   static auto flush_hints_for(const std::shared_ptr<DataFile> &file,
-                              const std::filesystem::path &dir)
+                              const std::filesystem::path &dir,
+                              const TailCheck &check = {})
       -> std::optional<Offset>;
+  // recovery_prepare_files' check on a hint-less file, which is where a
+  // crash can leave a torn tail. See docs/bytecask_design.md, *Recovering a
+  // Hint-less File*.
+  static void recovery_check_tail(
+      const DataFile &file, Offset end,
+      const std::vector<std::filesystem::path> &data_paths);
   // Writes hint files for all sealed files in s.
   void flush_hints(const EngineState &s);
   // Both HintFile openers verify the file-level CRC before any parsing, so
@@ -3470,8 +3486,8 @@ auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
 }
 
 auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
-                              const std::filesystem::path &dir)
-    -> std::optional<Offset> {
+                         const std::filesystem::path &dir,
+                         const TailCheck &check) -> std::optional<Offset> {
   const auto stem = file->path().stem().string();
   const auto hint_path = dir / (stem + ".hint");
   const auto tmp_path = dir / (stem + ".hint.tmp");
@@ -3503,7 +3519,8 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
   std::vector<Staged> staged;
   std::vector<std::byte> key_arena;
 
-  auto committed = scan_committed(*file);
+  auto committed =
+      scan_committed(*file, 0, check ? OnDamage::Stop : OnDamage::Throw);
   auto it = committed.begin();
   for (; it != std::default_sentinel; ++it) {
     const auto &[entry, entry_off] = *it;
@@ -3528,6 +3545,16 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
                         narrow<std::uint32_t>(entry.key.size()),
                         entry.entry_type});
       key_arena.insert(key_arena.end(), entry.key.begin(), entry.key.end());
+    }
+  }
+
+  if (check) {
+    try {
+      check(it.committed_offset());
+    } catch (...) {
+      std::error_code ec;
+      std::filesystem::remove(tmp_path, ec);
+      throw;
     }
   }
 
@@ -4604,12 +4631,15 @@ auto DB::recovery_prepare_files(EngineState &s)
 
     const auto hint_path = dir_ / (p.stem().string() + ".hint");
     if (!std::filesystem::exists(hint_path)) {
-      // A file without a hint was the active file at the last shutdown. A
-      // clean close already dropped its preallocated tail; after a crash it
-      // still carries it. Drop it now so its physical size is its logical
-      // size, as for every other sealed file — file_size below is what
-      // seeds total_bytes for vacuum.
-      const auto end = flush_hints_for(data_file, dir_);
+      // A file without a hint was the active file at the last shutdown, or a
+      // sealed file whose hint was not written yet. Whatever lies past its
+      // last committed record goes, once recovery_check_tail has ruled that
+      // it may: the preallocated tail a crash leaves, or a torn write. That
+      // makes its physical size its logical size, as for every other sealed
+      // file — file_size below is what seeds total_bytes for vacuum.
+      const auto end = flush_hints_for(data_file, dir_, [&](Offset e) {
+        recovery_check_tail(*data_file, e, data_paths);
+      });
       if (end && *end < std::filesystem::file_size(p)) {
         data_file.reset();
         std::filesystem::resize_file(p, *end);
@@ -4631,6 +4661,67 @@ auto DB::recovery_prepare_files(EngineState &s)
   return files;
 }
 
+
+namespace {
+
+// The sequence in the file's first header, 0 when there is none. Read
+// without its CRC: in the file a crash tore, the first record may be the
+// torn one.
+auto first_sequence(const DataFile &file) -> std::uint64_t {
+  std::array<std::byte, kHeaderSize> hdr{};
+  if (file.read_raw(0, hdr) < kHeaderSize) return 0;
+  return read_header(hdr).sequence;
+}
+
+// Whether every byte of file from end on is zero.
+auto tail_is_zero(const DataFile &file, Offset end) -> bool {
+  if (end >= file.size()) return true;
+  std::vector<std::byte> buf(static_cast<std::size_t>(
+      std::min<Offset>(Offset{1} << 20, file.size() - end)));
+  for (auto off = end; off < file.size();) {
+    const auto n = file.read_raw(off, buf);
+    if (n == 0) break;
+    if (std::ranges::any_of(std::span{buf}.first(n),
+                            [](std::byte b) { return b != std::byte{0}; }))
+      return false;
+    off += n;
+  }
+  return true;
+}
+
+} // namespace
+
+// Only the file written last can hold a record a crash tore: every other
+// file was fdatasync'd whole before it was sealed. So past a hint-less file's
+// last committed record there may be:
+// - nothing but zeros: the preallocated tail, of the active file or of a
+//   sealed one whose truncate at seal a power loss undid. It goes.
+// - anything else, in the file written last: a torn write, which was never
+//   acknowledged durable. It goes, as PostgreSQL and RocksDB truncate their
+//   log at the first bad record. Damage there is indistinguishable and goes
+//   with it.
+// - anything else, in any other file: damage in data that was synced.
+//   Refused, in every mode, and the file is left as it was.
+// "Written last" is read off sequences, which no two files share: no other
+// file may start at a higher one. A file whose first header is zero has no
+// sequence to compare; nothing before its stop survives, so it may go whole.
+void DB::recovery_check_tail(
+    const DataFile &file, Offset end,
+    const std::vector<std::filesystem::path> &data_paths) {
+  if (tail_is_zero(file, end)) return;
+  const auto seq = first_sequence(file);
+  if (seq == 0) return;
+  for (const auto &other : data_paths) {
+    if (other == file.path()) continue;
+    if (first_sequence(*openDataFileForRead(other)) > seq) {
+      throw std::runtime_error{std::format(
+          "bytecask: corrupt database — data file '{}' does not parse past "
+          "offset {}, and '{}' holds later sequences, so it is not the file a "
+          "crash could have torn; refusing to truncate it",
+          file.path().string(), end, other.string())};
+    }
+  }
+}
 
 // BC_RECOVERY_PHASES=1 prints how long each recovery phase took, so the two
 // key directories can be compared phase by phase rather than in total.

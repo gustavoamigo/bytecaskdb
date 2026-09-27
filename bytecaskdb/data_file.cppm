@@ -1876,6 +1876,12 @@ export void sync_directory(const std::filesystem::path &dir,
 #endif
 }
 
+// What a sweep does at an entry that fails its CRC. Throw is the default:
+// the entry is damage. Stop treats it as the end of the entries, for the one
+// caller that has to find where a crash left the newest file and decides
+// itself whether that is a tail (recovery_prepare_files).
+export enum class OnDamage { Throw, Stop };
+
 // Forward-only iterator over raw entries in a DataFile.
 // Reads the file kChunkBytes at a time through DataFile::read_raw and frames
 // entries out of that buffer, so a sweep costs about size() / kChunkBytes
@@ -1883,7 +1889,8 @@ export void sync_directory(const std::filesystem::path &dir,
 // grows the buffer to fit it; max_value_bytes bounds that growth.
 // The yielded entry reuses its key and value storage: a reference to *it is
 // valid until the next increment.
-// Exceptions (CRC errors, I/O failures) propagate to the caller.
+// Exceptions (CRC errors unless OnDamage::Stop, I/O failures) propagate to
+// the caller.
 export class DataFileIterator {
 public:
   using iterator_concept = std::input_iterator_tag;
@@ -1894,8 +1901,9 @@ public:
 
   DataFileIterator() = default;
 
-  explicit DataFileIterator(const DataFile& file, Offset start = 0)
-      : file_{&file}, next_offset_{start} {
+  explicit DataFileIterator(const DataFile& file, Offset start = 0,
+                            OnDamage on_damage = OnDamage::Throw)
+      : file_{&file}, next_offset_{start}, on_damage_{on_damage} {
     advance();
   }
 
@@ -1919,6 +1927,8 @@ public:
 private:
   // The sweep ends at a short header, a zeroed header (sequence 0: the
   // preallocated tail of an active file) or an entry running past size().
+  // An entry that fails its CRC throws, or under OnDamage::Stop ends the
+  // sweep there too.
   void advance() {
     done_ = true;
     const auto offset = next_offset_;
@@ -1928,7 +1938,10 @@ private:
     if (hdr.sequence == 0) return;
     const auto total = record_bytes(hdr);
     if (offset + total > end) return;
-    const auto view = record_view(buffered(offset, total), hdr, /*verify=*/true);
+    const auto raw = buffered(offset, total);
+    if (on_damage_ == OnDamage::Stop && !crc_matches(raw)) return;
+    const auto view =
+        record_view(raw, hdr, /*verify=*/on_damage_ == OnDamage::Throw);
     auto& [entry, entry_off] = current_;
     entry.sequence = view.sequence;
     entry.entry_type = view.entry_type;
@@ -1959,6 +1972,7 @@ private:
 
   const DataFile* file_{};
   Offset next_offset_{};
+  OnDamage on_damage_{OnDamage::Throw};
   value_type current_{};
   bool done_{true};
   std::vector<std::byte> buf_;

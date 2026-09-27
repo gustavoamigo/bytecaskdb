@@ -6,9 +6,11 @@
 # Damage inside published bytes has no recovery contract: the engine cannot
 # know what state the damage left it in, so it makes no promise about what the
 # file still holds. What it does promise is to stop rather than make the
-# damage worse — resume() refuses, stays degraded and truncates nothing, and a
-# cold open refuses too wherever the format lets it see the damage. The delta
-# is therefore the same shape in every cell.
+# damage worse — resume() refuses, stays degraded and truncates nothing. A cold
+# open cannot do the same: the damaged file is the newest, where a crash can
+# leave a torn tail, and nothing on disk tells the two apart. It truncates at
+# the first bad record, as for a torn tail (#138). The delta is therefore the
+# same shape in every cell.
 
 from __future__ import annotations
 
@@ -22,8 +24,8 @@ class CorruptionDelta:
     # Bytes that must survive every refusal untouched: the published extent,
     # plus the unpublished entry the failed write appended after it.
     guarded_bytes: int
-    # Whether the cold open that follows must refuse as well.
-    open_refuses: bool
+    # Where the cold open that follows truncates the file.
+    open_truncates_to: int
 
 
 def corruption_delta(
@@ -31,5 +33,5 @@ def corruption_delta(
 ) -> CorruptionDelta:
     return CorruptionDelta(
         guarded_bytes=shape.published_extent + ENTRY_BYTES,
-        open_refuses=field.detected_at_open,
+        open_truncates_to=shape.committed_before,
     )

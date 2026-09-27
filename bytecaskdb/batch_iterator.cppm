@@ -137,9 +137,10 @@ private:
   bool step_pending_{false};
 };
 
-export inline auto scan_committed(const DataFile& file, Offset start = 0)
+export inline auto scan_committed(const DataFile& file, Offset start = 0,
+                                  OnDamage on_damage = OnDamage::Throw)
     -> std::ranges::subrange<CommittedEntryIterator, std::default_sentinel_t> {
-  return {CommittedEntryIterator{DataFileIterator{file, start}},
+  return {CommittedEntryIterator{DataFileIterator{file, start, on_damage}},
           std::default_sentinel};
 }
 

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Generator, Tuple
+from typing import Generator, List, Tuple
 
 # 15 header + 2 key + 2 value + 4 crc
 ENTRY_BYTES = 23
@@ -45,18 +45,6 @@ class CorruptField(Enum):
     # A zeroed sequence, which the scan already treats as end of file.
     SEQUENCE = "sequence"
 
-    @property
-    def detected_at_open(self) -> bool:
-        """Whether a cold open can tell this damage from the end of the file.
-
-        A CRC mismatch and an invalid entry type fail to parse, and the open
-        refuses. A zeroed sequence and an entry running past the file's end
-        both read as the end of written data — the same thing the unwritten,
-        zero-filled tail of a crashed active file looks like — and a hint-less
-        file records no committed length to tell them apart. resume() can,
-        because the published state knows how far the file was published.
-        """
-        return self in (CorruptField.CRC, CorruptField.ENTRY_TYPE)
 
 
 class Position(Enum):
@@ -97,6 +85,22 @@ class CorruptionShape:
             # k0, k1, then BulkBegin, then the first batch entry.
             return 2 * ENTRY_BYTES + MARKER_BYTES
         return self.corrupt_entry_index * ENTRY_BYTES
+
+    @property
+    def committed_before(self) -> int:
+        """Where the committed records before the damage end — what a cold
+        open truncates the file to. Inside the batch that is where the batch
+        begins: an incomplete batch is dropped whole."""
+        if self.position == Position.IN_BATCH:
+            return 2 * ENTRY_BYTES
+        return self.corrupt_offset
+
+    @property
+    def keys_before(self) -> List[str]:
+        """The keys a cold open keeps: those committed before the damage."""
+        if self.position == Position.IN_BATCH:
+            return ["k0", "k1"]
+        return [f"k{i}" for i in range(self.corrupt_entry_index)]
 
     @property
     def published_extent(self) -> int:
