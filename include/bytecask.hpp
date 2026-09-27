@@ -382,6 +382,12 @@ public:
                                 BytesView from = {}) const
       -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
 
+  // Live keys in [from, to), counted no further than `limit`: returns
+  // min(count, limit), 0 if from >= to. At most two record reads, whatever
+  // the range holds.
+  [[nodiscard]] auto count_keys(BytesView from, BytesView to,
+                                std::size_t limit) const -> std::size_t;
+
 private:
   explicit Snapshot(std::unique_ptr<Impl> impl) noexcept;
   std::unique_ptr<Impl> impl_;

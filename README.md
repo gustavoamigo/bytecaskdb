@@ -20,7 +20,7 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 ## Features
 
 - **Sequential write path** — all I/O is sequential appends; no random writes. Every `put` and `del` is one append. `apply_batch` with N operations appends a begin marker, N entries, and an end marker in a single `pwritev` — still no WAL, no random writes. Because the key directory stores no key bytes, a `put` or `del` also reads one record (the key's own, or a neighbour's on an insert) to place the key. The whole record is read and CRC-checked, value included, so its cost grows with that record's value size; it is served from the buffer pool or page cache, and if it fails the operation fails before anything is appended.
-- **Ordered range iteration** — scan from any key prefix in key order. Keys are read from their records as the iterator advances, values lazily. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`.
+- **Ordered range iteration** — scan from any key prefix in key order. Keys are read from their records as the iterator advances, values lazily. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`. `Snapshot::count_keys` counts the keys in a range, up to a limit, from the key directory's leaf sizes: at most two record reads, whatever the range holds.
 - **Range deletion** — `del_range(opts, from, to)` deletes all keys in `[from, to)` with a single data file append, whatever the size of the range. Removing the keys from the key directory reads each of them back from its data file (twice, today), so that part grows with the number of keys removed. Available on `DB` and `WritePlan`.
 - **Atomic writes** — every `put`, `del`, and `del_range` is atomic. `apply_batch` makes multiple puts, deletes, and range deletes atomic as a group.
 - **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch(opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `nullopt` on conflict. The snapshot is embedded in the `WritePlan` at construction time. When a snapshot is present, every key in the write set is automatically checked for concurrent modification — no explicit guard needed on keys you write. Use `ensure_unchanged` for keys you read but don't write, and range guards for serializable conflict detection. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. Each precondition check is a key directory lookup plus one record read for the key's sequence — no separate transaction type required. Both levels are checked every night with [Elle](https://github.com/jepsen-io/elle) against concurrent transaction histories, with vacuum and injected `fdatasync` failures running: guarded plans come out strict-serializable, and unguarded ones snapshot-isolated, with write skew as their only anomaly. The check covers point reads and writes; range guards and range deletes are not yet part of it ([`docs/isolation_checking_design.md`](docs/isolation_checking_design.md)).
@@ -415,6 +415,10 @@ public:
     [[nodiscard]] auto rkeys_from(const ReadOptions& opts,
                                   BytesView from = {}) const
         -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
+    // Live keys in [from, to), counted no further than limit: returns
+    // min(count, limit). At most two record reads, whatever the range holds.
+    [[nodiscard]] auto count_keys(BytesView from, BytesView to,
+                                  std::size_t limit) const -> std::size_t;
 };
 
 // Sealed file descriptor returned by create_manifest().

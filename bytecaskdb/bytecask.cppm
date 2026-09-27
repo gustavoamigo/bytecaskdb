@@ -1538,7 +1538,9 @@ public:
                                BytesView from = {}) const
       -> std::ranges::subrange<EntryIterator, std::default_sentinel_t>;
 
-  // Returns an input range of keys >= from. Pure in-memory — no disk I/O.
+  // Returns an input range of keys >= from. Under the blind-leaf key
+  // directory each step reads its key's record (the leaf holds no key
+  // bytes); the keyed directories read nothing.
   [[nodiscard]] auto keys_from(const ReadOptions& opts,
                                BytesView from = {}) const
       -> std::ranges::subrange<KeyIterator, std::default_sentinel_t>;
@@ -1550,10 +1552,17 @@ public:
                                 BytesView from = {}) const
       -> std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t>;
 
-  // Returns a range of keys in descending order. Pure in-memory — no disk I/O.
+  // Returns a range of keys in descending order. Reads as keys_from does.
   [[nodiscard]] auto rkeys_from(const ReadOptions& opts,
                                 BytesView from = {}) const
       -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
+
+  // Live keys in [from, to), counted no further than `limit`: returns
+  // min(count, limit), 0 if from >= to. Reads no key per counted entry: at
+  // most two record reads under the blind-leaf key directory, to place each
+  // end, and none under the keyed ones.
+  [[nodiscard]] auto count_keys(BytesView from, BytesView to,
+                                std::size_t limit) const -> std::size_t;
 
 private:
   explicit Snapshot(std::shared_ptr<const EngineState> state,
@@ -3223,6 +3232,13 @@ auto Snapshot::riter_from(const ReadOptions& opts, BytesView from) const
   return std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t>{
       ReverseEntryIterator{state_, std::move(it), opts.verify_checksums},
       std::default_sentinel};
+}
+
+auto Snapshot::count_keys(BytesView from, BytesView to,
+                          std::size_t limit) const -> std::size_t {
+  if (limit == 0 || !std::ranges::lexicographical_compare(from, to))
+    return 0;
+  return kd_count(state_->key_dir, from, to, limit, state_->kd_ctx());
 }
 
 auto Snapshot::rkeys_from(const ReadOptions& /*opts*/, BytesView from) const
