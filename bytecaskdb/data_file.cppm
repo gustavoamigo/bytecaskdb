@@ -821,14 +821,19 @@ public:
                                  FrameLease &lease) const
       -> DataEntryView override {
     lease.reset();
-    if (offset + kHeaderSize <= mmap_end()) {
+    // The mapping spans the zero-filled capacity: bounded by the logical end
+    // too, so a record that does not fit below it fails as on every other
+    // back-end instead of reading zeros as a record.
+    const auto bound = std::min<Offset>(mmap_end(), ops_.logical_end());
+    if (offset + kHeaderSize <= bound) {
       const auto hdr = bytecask::read_header(
           std::span<const std::byte>{mmap_base_ + offset, kHeaderSize});
       const auto total = record_bytes(hdr);
-      if (offset + total <= mmap_end())
+      if (offset + total <= bound)
         return record_view({mmap_base_ + offset, total}, hdr, verify);
     }
-    // Past the mapped extent (a file that grew since it was mapped).
+    // Past the mapped extent (a file that grew since it was mapped), or past
+    // the logical end, which fetch_record refuses.
     return fetch_record(path(), offset, value_size_hint, ops_.logical_end(), verify,
                         io_buf, [this](Offset at, std::size_t len,
                                        std::byte *dst) {

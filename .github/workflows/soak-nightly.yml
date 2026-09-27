@@ -55,22 +55,21 @@ jobs:
             git ninja-build
           pip3 install nanobind
 
-      - name: pread vs truncate stress (no engine code)
-        continue-on-error: true
+      # The soak trusts the kernel to return what was written. This checks
+      # that, with no engine code, before spending 25 minutes on the soak:
+      # on a kernel that returns wrong bytes the job fails here, naming the
+      # kernel, instead of failing the soak with what looks like an engine
+      # bug. ByteCaskDB does not work around such a kernel (#211).
+      - name: Platform check (kernel returns what was written)
         run: |
           uname -a
           df -T /tmp
-          df -T "$GITHUB_WORKSPACE"
           clang++ -std=c++20 -O2 -pthread tests/platform/pread_truncate_stress.cpp -o /tmp/prs
-          status=0
-          for d in /tmp/prs_dir "$GITHUB_WORKSPACE/prs_dir"; do
-            for v in "" zero-fill-4k no-zero-fill no-sync; do
-              rm -rf "$d" && mkdir -p "$d"
-              if out=$(/tmp/prs "$d" 30 $v 2>&1); then r=ok; else r=FAIL; status=1; fi
-              echo "[$r] dir=$d variant='${v:-default}': $out"
-            done
-          done
-          exit $status
+          mkdir -p /tmp/prs_dir
+          if ! /tmp/prs /tmp/prs_dir 60; then
+            echo "::error::Kernel $(uname -r) returned wrong bytes for a pread of written data (no engine code involved). Platform bug; the soak would prove nothing here."
+            exit 1
+          fi
 
       - name: Configure xmake
         run: |

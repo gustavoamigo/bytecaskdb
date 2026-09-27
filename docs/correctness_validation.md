@@ -1579,6 +1579,20 @@ reproduces a failure's shape; the failures below recurred when their
 seed and epoch were rerun. `soak-nightly.yml` runs it for 25
 minutes per sanitizer (ASan, TSan) with the run id as the seed.
 
+The soak trusts the kernel to return the bytes that were written. The
+job checks that first, with no engine code: it logs `uname -a` and runs
+`tests/platform/pread_truncate_stress.cpp`, one writer appending into a
+zero-filled file with `fdatasync` while readers `pread` the newest
+records and check every byte. On a kernel that returns wrong bytes, the
+job fails at that step and names the kernel; the soak does not run.
+ByteCaskDB does not work around a platform that returns wrong data: the
+read fails, on a CRC mismatch or a record that does not parse. The
+runners' `6.17.0-1022-azure` does this on ext4 (#211): a `pread` of
+written bytes can return the same file's contents from a page earlier.
+Testing builds add to a failed record read where its descriptor points
+and what the same bytes read now, which is what separated that kernel
+from an engine bug.
+
 #### What it found
 
 Its first runs, on `main`, found five engine bugs the proof matrix had
