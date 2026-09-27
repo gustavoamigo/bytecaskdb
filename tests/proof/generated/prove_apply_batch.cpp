@@ -20603,7 +20603,7 @@ TEST_CASE("prove__rotation_threshold__single_put__commit_sync_fails", "[prove]")
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -20874,7 +20874,7 @@ TEST_CASE("prove__rotation_threshold__single_delete__commit_sync_fails", "[prove
     plan.del(to_bytes("k0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -22316,7 +22316,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails", "[prove]") 
     plan.put(to_bytes("p1"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -22362,7 +22362,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails__held_value",
     const bytecask::Bytes obs_value_at_acquire = obs_value;
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -22419,7 +22419,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails__held_iter_sp
         obs_span.begin(), obs_span.end()};
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -22476,7 +22476,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails__held_riter_s
         obs_rspan.begin(), obs_rspan.end()};
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -22531,7 +22531,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails__held_snapsho
     const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -22593,7 +22593,7 @@ TEST_CASE("prove__rotation_threshold__multi_put__commit_sync_fails__second_insta
     REQUIRE(to_string(obs_other) == "other_value");
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -23491,7 +23491,7 @@ TEST_CASE("prove__rotation_threshold__mixed_batch__commit_sync_fails", "[prove]"
     plan.del(to_bytes("k0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -23815,7 +23815,7 @@ TEST_CASE("prove__rotation_threshold__large_batch__commit_sync_fails", "[prove]"
     plan.put(to_bytes("p2"), to_bytes("new2"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{7};
+      bytecask::testing::ScopedFaultInjector fi{8};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -24105,7 +24105,7 @@ TEST_CASE("prove__rotation_threshold__single_put_with_guards__commit_sync_fails"
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -24462,7 +24462,7 @@ TEST_CASE("prove__rotation_threshold__causality_overwrite__commit_sync_fails", "
     plan.put(to_bytes("c0"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -24780,7 +24780,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del__commit_sync_fails", "[p
     plan.del(to_bytes("c0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -25377,7 +25377,7 @@ TEST_CASE("prove__rotation_threshold__causality_del_put__commit_sync_fails", "[p
     plan.put(to_bytes("k0"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -25701,7 +25701,7 @@ TEST_CASE("prove__rotation_threshold__causality_put_del_put__commit_sync_fails",
     plan.put(to_bytes("c0"), to_bytes("new2"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{7};
+      bytecask::testing::ScopedFaultInjector fi{8};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -26021,7 +26021,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_overwrite__commit_sync_fail
     plan.put(to_bytes("c0"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
                             std::move(plan)),
@@ -26339,7 +26339,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del__commit_sync_fails"
     plan.del(to_bytes("c0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
                             std::move(plan)),
@@ -26657,7 +26657,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_del_put__commit_sync_fails"
     plan.put(to_bytes("k0"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
                             std::move(plan)),
@@ -26981,7 +26981,7 @@ TEST_CASE("prove__rotation_threshold__solo_causality_put_del_put__commit_sync_fa
     plan.put(to_bytes("c0"), to_bytes("new2"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{7};
+      bytecask::testing::ScopedFaultInjector fi{8};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
                             std::move(plan)),
@@ -28088,7 +28088,7 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__commit_sync_fails", 
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -28133,7 +28133,7 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__commit_sync_fails__h
     const bytecask::Bytes obs_value_at_acquire = obs_value;
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -28189,7 +28189,7 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__commit_sync_fails__h
         obs_span.begin(), obs_span.end()};
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -28245,7 +28245,7 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__commit_sync_fails__h
         obs_rspan.begin(), obs_rspan.end()};
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -28299,7 +28299,7 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__commit_sync_fails__h
     const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -28360,7 +28360,7 @@ TEST_CASE("prove__rotation_threshold__sequential_overwrite__commit_sync_fails__s
     REQUIRE(to_string(obs_other) == "other_value");
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -29201,7 +29201,7 @@ TEST_CASE("prove__rotation_threshold__solo_sequential_overwrite__commit_sync_fai
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
                             std::move(plan)),
@@ -29472,7 +29472,7 @@ TEST_CASE("prove__rotation_threshold__range_del__commit_sync_fails", "[prove]") 
     plan.del_range(to_bytes("k"), to_bytes("l"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -29788,7 +29788,7 @@ TEST_CASE("prove__rotation_threshold__range_del_then_put__commit_sync_fails", "[
     plan.put(to_bytes("k0"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -30106,7 +30106,7 @@ TEST_CASE("prove__rotation_threshold__put_then_range_del__commit_sync_fails", "[
     plan.del_range(to_bytes("k"), to_bytes("l"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -52624,7 +52624,7 @@ TEST_CASE("prove__rotation_threshold_mmap__single_put__commit_sync_fails", "[pro
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -52909,7 +52909,7 @@ TEST_CASE("prove__rotation_threshold_mmap__single_delete__commit_sync_fails", "[
     plan.del(to_bytes("k0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -54632,7 +54632,7 @@ TEST_CASE("prove__rotation_threshold_mmap__multi_put__commit_sync_fails", "[prov
     plan.put(to_bytes("p1"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -54680,7 +54680,7 @@ TEST_CASE("prove__rotation_threshold_mmap__multi_put__commit_sync_fails__held_va
     const bytecask::Bytes obs_value_at_acquire = obs_value;
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -54739,7 +54739,7 @@ TEST_CASE("prove__rotation_threshold_mmap__multi_put__commit_sync_fails__held_it
         obs_span.begin(), obs_span.end()};
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -54798,7 +54798,7 @@ TEST_CASE("prove__rotation_threshold_mmap__multi_put__commit_sync_fails__held_ri
         obs_rspan.begin(), obs_rspan.end()};
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -54855,7 +54855,7 @@ TEST_CASE("prove__rotation_threshold_mmap__multi_put__commit_sync_fails__held_sn
     const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -54919,7 +54919,7 @@ TEST_CASE("prove__rotation_threshold_mmap__multi_put__commit_sync_fails__second_
     REQUIRE(to_string(obs_other) == "other_value");
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -55853,7 +55853,7 @@ TEST_CASE("prove__rotation_threshold_mmap__mixed_batch__commit_sync_fails", "[pr
     plan.del(to_bytes("k0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -56193,7 +56193,7 @@ TEST_CASE("prove__rotation_threshold_mmap__large_batch__commit_sync_fails", "[pr
     plan.put(to_bytes("p2"), to_bytes("new2"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{7};
+      bytecask::testing::ScopedFaultInjector fi{8};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -56497,7 +56497,7 @@ TEST_CASE("prove__rotation_threshold_mmap__single_put_with_guards__commit_sync_f
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -56872,7 +56872,7 @@ TEST_CASE("prove__rotation_threshold_mmap__causality_overwrite__commit_sync_fail
     plan.put(to_bytes("c0"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -57206,7 +57206,7 @@ TEST_CASE("prove__rotation_threshold_mmap__causality_put_del__commit_sync_fails"
     plan.del(to_bytes("c0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -57829,7 +57829,7 @@ TEST_CASE("prove__rotation_threshold_mmap__causality_del_put__commit_sync_fails"
     plan.put(to_bytes("k0"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -58169,7 +58169,7 @@ TEST_CASE("prove__rotation_threshold_mmap__causality_put_del_put__commit_sync_fa
     plan.put(to_bytes("c0"), to_bytes("new2"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{7};
+      bytecask::testing::ScopedFaultInjector fi{8};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -58505,7 +58505,7 @@ TEST_CASE("prove__rotation_threshold_mmap__solo_causality_overwrite__commit_sync
     plan.put(to_bytes("c0"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
                             std::move(plan)),
@@ -58839,7 +58839,7 @@ TEST_CASE("prove__rotation_threshold_mmap__solo_causality_put_del__commit_sync_f
     plan.del(to_bytes("c0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
                             std::move(plan)),
@@ -59173,7 +59173,7 @@ TEST_CASE("prove__rotation_threshold_mmap__solo_causality_del_put__commit_sync_f
     plan.put(to_bytes("k0"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
                             std::move(plan)),
@@ -59513,7 +59513,7 @@ TEST_CASE("prove__rotation_threshold_mmap__solo_causality_put_del_put__commit_sy
     plan.put(to_bytes("c0"), to_bytes("new2"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{7};
+      bytecask::testing::ScopedFaultInjector fi{8};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
                             std::move(plan)),
@@ -60884,7 +60884,7 @@ TEST_CASE("prove__rotation_threshold_mmap__sequential_overwrite__commit_sync_fai
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -60931,7 +60931,7 @@ TEST_CASE("prove__rotation_threshold_mmap__sequential_overwrite__commit_sync_fai
     const bytecask::Bytes obs_value_at_acquire = obs_value;
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -60989,7 +60989,7 @@ TEST_CASE("prove__rotation_threshold_mmap__sequential_overwrite__commit_sync_fai
         obs_span.begin(), obs_span.end()};
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -61047,7 +61047,7 @@ TEST_CASE("prove__rotation_threshold_mmap__sequential_overwrite__commit_sync_fai
         obs_rspan.begin(), obs_rspan.end()};
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -61103,7 +61103,7 @@ TEST_CASE("prove__rotation_threshold_mmap__sequential_overwrite__commit_sync_fai
     const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -61166,7 +61166,7 @@ TEST_CASE("prove__rotation_threshold_mmap__sequential_overwrite__commit_sync_fai
     REQUIRE(to_string(obs_other) == "other_value");
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -62041,7 +62041,7 @@ TEST_CASE("prove__rotation_threshold_mmap__solo_sequential_overwrite__commit_syn
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
                             std::move(plan)),
@@ -62326,7 +62326,7 @@ TEST_CASE("prove__rotation_threshold_mmap__range_del__commit_sync_fails", "[prov
     plan.del_range(to_bytes("k"), to_bytes("l"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -62658,7 +62658,7 @@ TEST_CASE("prove__rotation_threshold_mmap__range_del_then_put__commit_sync_fails
     plan.put(to_bytes("k0"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -62992,7 +62992,7 @@ TEST_CASE("prove__rotation_threshold_mmap__put_then_range_del__commit_sync_fails
     plan.del_range(to_bytes("k"), to_bytes("l"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -79530,7 +79530,7 @@ TEST_CASE("prove__rotation_threshold_pool__single_put__commit_sync_fails", "[pro
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -79815,7 +79815,7 @@ TEST_CASE("prove__rotation_threshold_pool__single_delete__commit_sync_fails", "[
     plan.del(to_bytes("k0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -81313,7 +81313,7 @@ TEST_CASE("prove__rotation_threshold_pool__multi_put__commit_sync_fails", "[prov
     plan.put(to_bytes("p1"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -81361,7 +81361,7 @@ TEST_CASE("prove__rotation_threshold_pool__multi_put__commit_sync_fails__held_va
     const bytecask::Bytes obs_value_at_acquire = obs_value;
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -81420,7 +81420,7 @@ TEST_CASE("prove__rotation_threshold_pool__multi_put__commit_sync_fails__held_it
         obs_span.begin(), obs_span.end()};
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -81479,7 +81479,7 @@ TEST_CASE("prove__rotation_threshold_pool__multi_put__commit_sync_fails__held_ri
         obs_rspan.begin(), obs_rspan.end()};
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -81536,7 +81536,7 @@ TEST_CASE("prove__rotation_threshold_pool__multi_put__commit_sync_fails__held_sn
     const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -81600,7 +81600,7 @@ TEST_CASE("prove__rotation_threshold_pool__multi_put__commit_sync_fails__second_
     REQUIRE(to_string(obs_other) == "other_value");
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -82534,7 +82534,7 @@ TEST_CASE("prove__rotation_threshold_pool__mixed_batch__commit_sync_fails", "[pr
     plan.del(to_bytes("k0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -82874,7 +82874,7 @@ TEST_CASE("prove__rotation_threshold_pool__large_batch__commit_sync_fails", "[pr
     plan.put(to_bytes("p2"), to_bytes("new2"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{7};
+      bytecask::testing::ScopedFaultInjector fi{8};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -83178,7 +83178,7 @@ TEST_CASE("prove__rotation_threshold_pool__single_put_with_guards__commit_sync_f
     plan.put(to_bytes("p0"), to_bytes("new0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -83553,7 +83553,7 @@ TEST_CASE("prove__rotation_threshold_pool__causality_overwrite__commit_sync_fail
     plan.put(to_bytes("c0"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -83887,7 +83887,7 @@ TEST_CASE("prove__rotation_threshold_pool__causality_put_del__commit_sync_fails"
     plan.del(to_bytes("c0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -84510,7 +84510,7 @@ TEST_CASE("prove__rotation_threshold_pool__causality_del_put__commit_sync_fails"
     plan.put(to_bytes("k0"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -84850,7 +84850,7 @@ TEST_CASE("prove__rotation_threshold_pool__causality_put_del_put__commit_sync_fa
     plan.put(to_bytes("c0"), to_bytes("new2"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{7};
+      bytecask::testing::ScopedFaultInjector fi{8};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -85186,7 +85186,7 @@ TEST_CASE("prove__rotation_threshold_pool__solo_causality_overwrite__commit_sync
     plan.put(to_bytes("c0"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
                             std::move(plan)),
@@ -85520,7 +85520,7 @@ TEST_CASE("prove__rotation_threshold_pool__solo_causality_put_del__commit_sync_f
     plan.del(to_bytes("c0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
                             std::move(plan)),
@@ -85854,7 +85854,7 @@ TEST_CASE("prove__rotation_threshold_pool__solo_causality_del_put__commit_sync_f
     plan.put(to_bytes("k0"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
                             std::move(plan)),
@@ -86194,7 +86194,7 @@ TEST_CASE("prove__rotation_threshold_pool__solo_causality_put_del_put__commit_sy
     plan.put(to_bytes("c0"), to_bytes("new2"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{7};
+      bytecask::testing::ScopedFaultInjector fi{8};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
                             std::move(plan)),
@@ -87345,7 +87345,7 @@ TEST_CASE("prove__rotation_threshold_pool__sequential_overwrite__commit_sync_fai
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -87392,7 +87392,7 @@ TEST_CASE("prove__rotation_threshold_pool__sequential_overwrite__commit_sync_fai
     const bytecask::Bytes obs_value_at_acquire = obs_value;
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -87450,7 +87450,7 @@ TEST_CASE("prove__rotation_threshold_pool__sequential_overwrite__commit_sync_fai
         obs_span.begin(), obs_span.end()};
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -87508,7 +87508,7 @@ TEST_CASE("prove__rotation_threshold_pool__sequential_overwrite__commit_sync_fai
         obs_rspan.begin(), obs_rspan.end()};
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -87564,7 +87564,7 @@ TEST_CASE("prove__rotation_threshold_pool__sequential_overwrite__commit_sync_fai
     const bytecask::Bytes obs_snap_at_acquire = obs_snap_value;
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -87627,7 +87627,7 @@ TEST_CASE("prove__rotation_threshold_pool__sequential_overwrite__commit_sync_fai
     REQUIRE(to_string(obs_other) == "other_value");
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -88502,7 +88502,7 @@ TEST_CASE("prove__rotation_threshold_pool__solo_sequential_overwrite__commit_syn
     plan.put(to_bytes("k0"), to_bytes("new0"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true, .solo = true},
                             std::move(plan)),
@@ -88787,7 +88787,7 @@ TEST_CASE("prove__rotation_threshold_pool__range_del__commit_sync_fails", "[prov
     plan.del_range(to_bytes("k"), to_bytes("l"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{3};
+      bytecask::testing::ScopedFaultInjector fi{4};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -89119,7 +89119,7 @@ TEST_CASE("prove__rotation_threshold_pool__range_del_then_put__commit_sync_fails
     plan.put(to_bytes("k0"), to_bytes("new1"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),
@@ -89453,7 +89453,7 @@ TEST_CASE("prove__rotation_threshold_pool__put_then_range_del__commit_sync_fails
     plan.del_range(to_bytes("k"), to_bytes("l"));
 
     {
-      bytecask::testing::ScopedFaultInjector fi{6};
+      bytecask::testing::ScopedFaultInjector fi{7};
       REQUIRE_THROWS_AS(
           db.apply_batch({.sync = true},
                             std::move(plan)),

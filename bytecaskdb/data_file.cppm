@@ -1843,6 +1843,39 @@ export void renameDataFileExclusive(const std::filesystem::path &from,
   }
 }
 
+// Makes dir's entries durable: the names created, renamed or removed in it so
+// far. fdatasync on a file covers its bytes, not the entry that names it, so a
+// new or renamed file can vanish at a power loss without this (#199). Called
+// before anything depends on the entry — a durable ack into a new file, or the
+// unlink of the file a rename replaces.
+//
+// A filesystem that cannot sync a directory reports EINVAL; that is taken as
+// done, as PostgreSQL does. In the WASM build there is nothing to sync.
+// checkpoint names the call site for fault injection, so a test that fails a
+// site's sync fails only if that site still calls it.
+export void sync_directory(const std::filesystem::path &dir,
+                           [[maybe_unused]] const char *checkpoint) {
+#ifdef BYTECASK_TESTING
+  ::bytecask::testing::io_checkpoint(checkpoint);
+#endif
+#ifndef __EMSCRIPTEN__
+  const auto fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd == -1) {
+    throw std::system_error{
+        errno, std::generic_category(),
+        std::format("sync_directory: cannot open '{}'", dir.string())};
+  }
+  const auto rc = ::fsync(fd);
+  const auto err = errno;
+  ::close(fd);
+  if (rc != 0 && err != EINVAL) {
+    throw std::system_error{
+        err, std::generic_category(),
+        std::format("sync_directory: fsync of '{}' failed", dir.string())};
+  }
+#endif
+}
+
 // Forward-only iterator over raw entries in a DataFile.
 // Reads the file kChunkBytes at a time through DataFile::read_raw and frames
 // entries out of that buffer, so a sweep costs about size() / kChunkBytes

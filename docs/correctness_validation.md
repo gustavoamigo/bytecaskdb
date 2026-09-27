@@ -1825,7 +1825,11 @@ control:
   specific fault tools. The fault injector operates at the application
   syscall layer only. The process-crash harness kills the process at
   arbitrary points, but the page cache survives it, so it does not stand
-  in for power loss either.
+  in for power loss either. The one power-loss hazard the engine controls
+  beyond `fdatasync` — a directory entry that is not durable when something
+  depends on it — is checked by ordering instead: each directory sync has
+  its own `io_dir_sync_*` checkpoint, and the `[dir_sync]` tests fail each
+  one and check that nothing it guards goes ahead (#199).
 - **Time bounds on close and open** — the failure classes are about what a
   failure does to data. A close or open that is correct but too slow for
   the supervisor holding the stopwatch damages nothing, so no class here
