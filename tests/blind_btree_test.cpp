@@ -334,6 +334,120 @@ TEST_CASE("blind tree: random operations match std::map", "[blind]") {
   }
 }
 
+// holds / replace_at / erase_at go by a record of the key that a caller
+// looked up earlier. They read nothing, and act only when the key's entry
+// still points at that very record: its current one, never one the key had
+// before.
+TEST_CASE("blind tree: operations by location read nothing and act only on "
+          "the record named", "[blind]") {
+  std::mt19937_64 rng{11};
+  const auto foreign = foreign_nodes();
+  MemResolver res;
+  std::map<std::string, BlindRef> model;
+  std::map<std::string, BlindRef> previous;  // a key's record before its last write
+  SmallTree t;
+  const auto always = [](const BlindRef &, const BlindRef &) { return true; };
+  std::size_t acted = 0;
+  std::size_t declined = 0;
+  for (int batch = 0; batch < 40; ++batch) {
+    auto tr = t.transient();
+    for (int op = 0; op < 60; ++op) {
+      const auto k = nasty_key(rng, 6);
+      const auto dice = rng() % 10;
+      if (dice < 4) {
+        const auto ref = model.contains(k) ? res.fresh(k) : res.ref(k);
+        if (model.contains(k))
+          previous[k] = model[k];
+        (void)tr.upsert(to_bytes(k), ref, res, always);
+        model[k] = ref;
+        continue;
+      }
+      // The record to go by: the key's current one or its previous one.
+      std::optional<BlindRef> at;
+      if (rng() % 2 == 0 && model.contains(k)) {
+        at = model[k];
+      } else if (previous.contains(k)) {
+        at = previous[k];
+      }
+      if (!at)
+        continue;
+      const bool current = model.contains(k) && model[k] == *at;
+      res.reads = 0;
+      REQUIRE(tr.holds(to_bytes(k), *at) == current);
+      if (dice < 7) {
+        const auto to = res.fresh(k);
+        REQUIRE(tr.replace_at(to_bytes(k), *at, to) == current);
+        if (current) {
+          previous[k] = model[k];
+          model[k] = to;
+        }
+      } else {
+        REQUIRE(tr.erase_at(to_bytes(k), *at) == current);
+        if (current) {
+          previous[k] = model[k];
+          model.erase(k);
+        }
+      }
+      REQUIRE(res.reads == 0);
+      REQUIRE(tr.size() == model.size());
+      ++(current ? acted : declined);
+    }
+    t = std::move(tr).persistent();
+    t.validate(res);
+    for (const auto &[k, v] : model) {
+      REQUIRE(t.get(to_bytes(k), res) == v);
+      REQUIRE(t.holds(to_bytes(k), v));
+    }
+    std::vector<std::string> want;
+    for (const auto &[k, v] : model)
+      want.push_back(k);
+    REQUIRE(keys_of(t, res) == want);
+  }
+  CHECK(acted > 100);
+  CHECK(declined > 100);
+  check_accounting(foreign, {&t});
+}
+
+// Keys whose fingerprints collide share the scan that finds candidates; the
+// record location is what tells their entries apart.
+TEST_CASE("blind tree: operations by location pick the key's entry among "
+          "colliding fingerprints", "[blind]") {
+  std::mt19937_64 rng{7};
+  const auto pairs = colliding_keys(rng, 3);
+  MemResolver res;
+  SmallTree t;
+  {
+    auto tr = t.transient();
+    for (const auto &[a, b] : pairs) {
+      tr.set(to_bytes(a), res.ref(a), res);
+      tr.set(to_bytes(b), res.ref(b), res);
+    }
+    t = std::move(tr).persistent();
+  }
+  for (const auto &[a, b] : pairs) {
+    const auto ra = res.ref(a);
+    const auto rb = res.ref(b);
+    REQUIRE(t.holds(to_bytes(a), ra));
+    REQUIRE(t.holds(to_bytes(b), rb));
+    auto tr = t.transient();
+    // a moves to a new record: its old one names nothing any more, and b is
+    // untouched.
+    const auto ra2 = res.fresh(a);
+    CHECK(tr.replace_at(to_bytes(a), ra, ra2));
+    CHECK_FALSE(tr.holds(to_bytes(a), ra));
+    CHECK_FALSE(tr.replace_at(to_bytes(a), ra, res.fresh(a)));
+    CHECK_FALSE(tr.erase_at(to_bytes(a), ra));
+    CHECK(tr.get(to_bytes(a), res) == ra2);
+    CHECK(tr.get(to_bytes(b), res) == rb);
+    // Erasing b by its record leaves a.
+    CHECK(tr.erase_at(to_bytes(b), rb));
+    CHECK(tr.get(to_bytes(a), res) == ra2);
+    CHECK_FALSE(tr.get(to_bytes(b), res).has_value());
+    auto u = std::move(tr).persistent();
+    u.validate(res);
+  }
+}
+
 TEST_CASE("blind tree: structured keys build a deep tree", "[blind]") {
   MemResolver res;
   std::vector<std::string> keys;
