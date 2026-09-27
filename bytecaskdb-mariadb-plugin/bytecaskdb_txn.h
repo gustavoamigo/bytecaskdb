@@ -234,6 +234,13 @@ public:
   // Returns true if key exists (in buffer or snapshot).
   bool exists(const uint8_t *key, size_t klen);
 
+  // Keys in [lo, hi) this transaction sees — its snapshot plus its own
+  // buffered writes — counted no further than `limit`. The snapshot's count
+  // reads at most two records; each buffered key in the range costs one
+  // existence check, and the checks stop at `limit`.
+  std::size_t count_range(const uint8_t *lo, size_t lo_len,
+                          const uint8_t *hi, size_t hi_len, std::size_t limit);
+
   // Opens a merge iterator over [lo, hi) combining snapshot + buffer.
   std::unique_ptr<MergeIterator> iter_prefix(
       const uint8_t *lo, size_t lo_len,

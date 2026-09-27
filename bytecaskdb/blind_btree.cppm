@@ -723,6 +723,14 @@ public:
   auto operator==(std::default_sentinel_t) const noexcept -> bool {
     return stack_.empty();
   }
+  // Entries from here up to, not including, `end` — an iterator over the
+  // same version at or after this one — counted from leaf sizes, no further
+  // than `limit`. Reads no key: the only reads are the ones that positioned
+  // the two iterators.
+  [[nodiscard]] auto count_until(const BlindBTreeIterator &end,
+                                 std::size_t limit) const -> std::size_t {
+    return btree_detail::count_entries(stack_, end.stack_, limit);
+  }
   // Same position; iterators over different versions never compare equal
   // unless both are at the end.
   auto operator==(const BlindBTreeIterator &o) const noexcept -> bool {

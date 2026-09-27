@@ -146,7 +146,7 @@ All landed on the same branch as §2 and §3, one commit each.
 | Catalog pointer escapes its mutex | `catalog_lookup_meta` replaced by `catalog_copy_meta` (copy under lock); DML paths use the handler's cached index list. |
 | Deferred-INSERT error message | Reported through the server's `print_keydup_error` with the key value, code 1062. PR #29 had changed the code to 1586, which broke every client that checks 1062. |
 | Triggers on deferred INSERT | Tables with triggers take the eager path; deferred mode can only start on a transaction with no snapshot and no buffered writes. The mixed state crashed the server (THD layout mismatch in the fallback message path). |
-| `records_in_range` | Exact count up to 1024 keys, merged with buffered writes; fallback fraction above that. |
+| `records_in_range` | Exact count up to 1024 keys, merged with buffered writes; fallback fraction above that. The snapshot's part is `Snapshot::count_keys`: leaf sizes, at most two record reads. |
 | Plugin guide | Snapshot timing, no server retry on 1213, V2 row format, statement rollback and savepoint semantics corrected. |
 
 Found while fixing §2.3 and fixed in the engine: `riter_from(from)` started
