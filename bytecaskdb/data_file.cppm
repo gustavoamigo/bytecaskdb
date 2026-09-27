@@ -277,6 +277,42 @@ auto fetch_record(const std::filesystem::path &path, Offset offset,
                      verify);
 }
 
+#ifdef BYTECASK_TESTING
+// Testing builds only: a record read through fd that fails says where fd
+// really points and what the same bytes read now, so a soak failure can
+// tell a reused descriptor from bytes that changed under the reader.
+template <typename Read>
+auto diagnose_fd_read(int fd, const std::filesystem::path &path, Offset offset,
+                      const char *kind, Read &&read) -> DataEntryView {
+  try {
+    return read();
+  } catch (const std::runtime_error &e) {
+    std::string target(512, '\0');
+    const auto proc = std::format("/proc/self/fd/{}", fd);
+    const auto n = ::readlink(proc.c_str(), target.data(), target.size());
+    target.resize(n > 0 ? static_cast<std::size_t>(n) : 0);
+    struct stat by_fd {};
+    struct stat by_path {};
+    const auto fd_ok = ::fstat(fd, &by_fd) == 0;
+    const auto path_ok = ::stat(path.c_str(), &by_path) == 0;
+    std::array<std::byte, kHeaderSize> hdr{};
+    const auto got = ::pread(fd, hdr.data(), hdr.size(), narrow<off_t>(offset));
+    std::string reread = "short";
+    if (got == std::ssize(hdr)) {
+      const auto h = bytecask::read_header(std::span<const std::byte>{hdr});
+      reread = std::format("sequence {} key_size {} value_size {}", h.sequence,
+                           h.key_size, h.value_size);
+    }
+    throw std::runtime_error{std::format(
+        "{} [{} fd {} -> '{}', fd inode {} size {}, path inode {} size {}; "
+        "reread now: {}]",
+        e.what(), kind, fd, target, fd_ok ? by_fd.st_ino : 0,
+        fd_ok ? by_fd.st_size : -1, path_ok ? by_path.st_ino : 0,
+        path_ok ? by_path.st_size : -1, reread)};
+  }
+}
+#endif
+
 // The zero-copy read behind lend_record for the two pool-backed files: the
 // record's spans point into the frame the lease pins when the whole record —
 // header through CRC — lies inside one resident frame below file_size.
@@ -1045,11 +1081,18 @@ public:
       }
     }
     lease.reset();
-    return fetch_record(path(), offset, value_size_hint, ops_.logical_end(), verify,
-                        io_buf, [this](Offset at, std::size_t len,
-                                       std::byte *dst) {
-                          fetch(at, len, dst);
-                        });
+    const auto read = [&] {
+      return fetch_record(path(), offset, value_size_hint, ops_.logical_end(),
+                          verify, io_buf,
+                          [this](Offset at, std::size_t len, std::byte *dst) {
+                            fetch(at, len, dst);
+                          });
+    };
+#ifdef BYTECASK_TESTING
+    if constexpr (!Io::kResident)
+      return diagnose_fd_read(ops_.fd_, path(), offset, "writable", read);
+#endif
+    return read();
   }
 
   [[nodiscard]] auto read_entry(Offset offset, std::uint32_t value_size,
@@ -1252,10 +1295,18 @@ public:
                                  FrameLease &lease) const
       -> DataEntryView override {
     lease.reset();
-    return fetch_record(path(), offset, value_size_hint, file_size_, verify, io_buf,
-                        [this](Offset at, std::size_t len, std::byte *dst) {
-                          pread_exact(fd_, at, len, dst);
-                        });
+    const auto read = [&] {
+      return fetch_record(path(), offset, value_size_hint, file_size_, verify,
+                          io_buf,
+                          [this](Offset at, std::size_t len, std::byte *dst) {
+                            pread_exact(fd_, at, len, dst);
+                          });
+    };
+#ifdef BYTECASK_TESTING
+    return diagnose_fd_read(fd_, path(), offset, "sealed", read);
+#else
+    return read();
+#endif
   }
 
   [[nodiscard]] auto read_entry_unverified(
