@@ -29,6 +29,12 @@ archive downloads while allowing git, which is why xmake is cloned and built
 rather than installed. The hook is a no-op everywhere else: local checkouts, the
 Dev Container, and Codespaces already have the toolchain.
 
+The same hook installs [graft](https://github.com/gustavoamigo/Graft) and builds
+its graph (`graft/`, not committed). The other graft hooks in
+`.claude/settings.json` run through the committed shims in `.claude/helpers/`,
+which find the installed graft package; they do nothing useful until graft is
+installed (`scripts/install_graft.sh`).
+
 ## Making a change
 
 1. Open an issue or comment on an existing one before starting significant work, so we can discuss direction.
