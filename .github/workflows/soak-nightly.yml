@@ -56,12 +56,21 @@ jobs:
           pip3 install nanobind
 
       - name: pread vs truncate stress (no engine code)
+        continue-on-error: true
         run: |
           uname -a
           df -T /tmp
+          df -T /dev/shm "$GITHUB_WORKSPACE"
           clang++ -std=c++20 -O2 -pthread tests/pread_truncate_stress.cpp -o /tmp/prs
-          mkdir -p /tmp/prs_dir
-          /tmp/prs /tmp/prs_dir 120
+          status=0
+          for d in /tmp/prs_dir /dev/shm/prs_dir "$GITHUB_WORKSPACE/prs_dir"; do
+            for v in "" no-zero-fill no-sync "no-zero-fill no-sync"; do
+              rm -rf "$d" && mkdir -p "$d"
+              if out=$(/tmp/prs "$d" 30 $v 2>&1); then r=ok; else r=FAIL; status=1; fi
+              echo "[$r] dir=$d variant='${v:-default}': $out"
+            done
+          done
+          exit $status
 
       - name: Configure xmake
         run: |

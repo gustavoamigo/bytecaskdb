@@ -6,7 +6,7 @@
 // returns anything else is caught and reported. Exit 1 on the first bad read.
 //
 //   clang++ -std=c++20 -O2 -pthread tests/pread_truncate_stress.cpp
-//   ./a.out <dir> <seconds>
+//   ./a.out <dir> <seconds> [no-zero-fill] [no-sync]
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -119,12 +119,19 @@ void reader(unsigned seed) {
 }  // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 3) {
-    std::fprintf(stderr, "usage: %s <dir> <seconds>\n", argv[0]);
+  if (argc < 3) {
+    std::fprintf(stderr, "usage: %s <dir> <seconds> [no-zero-fill] [no-sync]\n",
+                 argv[0]);
     return 2;
   }
   const std::string dir = argv[1];
   const auto seconds = std::atoi(argv[2]);
+  bool zero_fill = true;
+  bool sync = true;
+  for (int i = 3; i < argc; ++i) {
+    if (std::string{argv[i]} == "no-zero-fill") zero_fill = false;
+    if (std::string{argv[i]} == "no-sync") sync = false;
+  }
   std::vector<std::thread> readers;
   for (unsigned i = 0; i < 3; ++i) readers.emplace_back(reader, 17 + i);
 
@@ -142,8 +149,11 @@ int main(int argc, char **argv) {
     f->fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
     if (f->fd < 0) { std::perror("open"); return 2; }
     ::posix_fadvise(f->fd, 0, 0, POSIX_FADV_RANDOM);
-    if (::pwrite(f->fd, zeros.data(), kCapacity, 0) !=
-        static_cast<ssize_t>(kCapacity)) { std::perror("zero fill"); return 2; }
+    if (zero_fill && ::pwrite(f->fd, zeros.data(), kCapacity, 0) !=
+                         static_cast<ssize_t>(kCapacity)) {
+      std::perror("zero fill");
+      return 2;
+    }
     {
       std::lock_guard<std::mutex> lk{files_mu};
       files.push_back(f);
@@ -161,7 +171,7 @@ int main(int argc, char **argv) {
       for (std::size_t i = 0; i < size; ++i) rec[i] = byte_at(f->id, end + i);
       if (::pwrite(f->fd, rec.data(), size, static_cast<off_t>(end)) !=
           static_cast<ssize_t>(size)) { std::perror("append"); return 2; }
-      if (rng() % 8 == 0) ::fdatasync(f->fd);
+      if (sync && rng() % 8 == 0) ::fdatasync(f->fd);
       const auto start = end;
       end += size;
       // end before last: a reader that sees a record's start sees its end.
@@ -170,12 +180,12 @@ int main(int argc, char **argv) {
     }
     // Seal: drop the zero-filled tail while readers read the record just
     // written, as shrink_to_fit and resume() do.
-    ::fdatasync(f->fd);
+    if (sync) ::fdatasync(f->fd);
     if (::ftruncate(f->fd, static_cast<off_t>(end)) != 0) {
       std::perror("ftruncate");
       return 2;
     }
-    ::fdatasync(f->fd);
+    if (sync) ::fdatasync(f->fd);
     // Retired files stay open (readers may hold them) but are unlinked.
     ::unlink((dir + "/f" + std::to_string(f->id - kOpenFiles) + ".data").c_str());
   }
