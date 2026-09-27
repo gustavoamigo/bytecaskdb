@@ -21,6 +21,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <random>
@@ -4929,6 +4930,177 @@ TEST_CASE("apply_batch: an empty sync plan whose fdatasync fails degrades "
                     bytecask::DbDegraded);
   // The unsynced write was published before the failure and stays readable.
   CHECK(db.contains_key({}, to_bytes("k")));
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot::count_keys
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr auto kNoLimit = std::numeric_limits<std::size_t>::max();
+
+// Keys of a sorted reference set in [from, to), no further than `limit`.
+// The keys are ASCII, so std::string order is byte order.
+auto reference_count(const std::set<std::string> &keys, const std::string &from,
+                     const std::string &to, std::size_t limit) -> std::size_t {
+  if (!(from < to))
+    return 0;
+  const auto n = std::distance(keys.lower_bound(from), keys.lower_bound(to));
+  return std::min(static_cast<std::size_t>(n), limit);
+}
+
+// Structured keys (shared prefixes, as index encodings have) and random ones
+// of varying length, so leaves split on every kind of crit bit.
+auto count_test_keys(std::size_t n) -> std::set<std::string> {
+  std::mt19937_64 rng{42};
+  std::set<std::string> keys;
+  while (keys.size() < n) {
+    if (rng() % 2 == 0) {
+      keys.insert(std::format("t{:02d}:{:07d}", rng() % 7, rng() % 1000000));
+    } else {
+      std::string k = "r";
+      const auto len = 1 + rng() % 24;
+      for (std::size_t i = 0; i < len; ++i)
+        k.push_back(static_cast<char>('0' + rng() % 75));
+      keys.insert(std::move(k));
+    }
+  }
+  return keys;
+}
+
+// A bound near the key set: an existing key, one just past it, a random
+// string between keys, or one of the two ends.
+auto count_test_bound(const std::vector<std::string> &sorted,
+                      std::mt19937_64 &rng) -> std::string {
+  const auto &k = sorted[rng() % sorted.size()];
+  switch (rng() % 5) {
+  case 0: return k;
+  case 1: return k + '\x01';
+  case 2: return k.substr(0, 1 + rng() % k.size());
+  case 3: return "";
+  default: return "~~~~";
+  }
+}
+
+}  // namespace
+
+TEST_CASE("count_keys matches the keys in the range, at every limit",
+          "[count_keys]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  const auto keys = count_test_keys(40'000);
+  for (const auto &k : keys)
+    db.put({.sync = false}, to_bytes(k), to_bytes("v"));
+  const std::vector<std::string> sorted(keys.begin(), keys.end());
+  const auto snap = db.snapshot();
+
+  REQUIRE(snap.count_keys(to_bytes(""), to_bytes("~~~~"), kNoLimit) ==
+          keys.size());
+
+  std::mt19937_64 rng{7};
+  for (int i = 0; i < 3'000; ++i) {
+    const auto from = count_test_bound(sorted, rng);
+    const auto to = count_test_bound(sorted, rng);
+    for (const std::size_t limit :
+         {std::size_t{0}, std::size_t{1}, std::size_t{7}, std::size_t{100},
+          std::size_t{1024}, kNoLimit}) {
+      const auto got = snap.count_keys(to_bytes(from), to_bytes(to), limit);
+      const auto want = reference_count(keys, from, to, limit);
+      if (got != want)
+        FAIL(std::format("[{}, {}) limit {}: got {}, want {}", from, to,
+                         limit, got, want));
+    }
+  }
+}
+
+TEST_CASE("count_keys on a snapshot ignores later writes", "[count_keys]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  auto keys = count_test_keys(5'000);
+  for (const auto &k : keys)
+    db.put({.sync = false}, to_bytes(k), to_bytes("v"));
+  const auto before = keys;
+  const auto old_snap = db.snapshot();
+
+  // New keys, deletions, and a range deletion across several leaves.
+  for (int i = 0; i < 500; ++i) {
+    const auto k = std::format("t03:{:07d}x", i * 997);
+    db.put({.sync = false}, to_bytes(k), to_bytes("v"));
+    keys.insert(k);
+  }
+  int erased = 0;
+  for (auto it = keys.begin(); it != keys.end() && erased < 300; ++erased) {
+    REQUIRE(db.del({.sync = false}, to_bytes(*it)).has_value());
+    it = keys.erase(it);
+    std::advance(it, std::min<std::ptrdiff_t>(3, std::distance(it, keys.end())));
+  }
+  db.del_range({.sync = false}, to_bytes("t05:"), to_bytes("t06:"));
+  keys.erase(keys.lower_bound("t05:"), keys.lower_bound("t06:"));
+
+  const auto new_snap = db.snapshot();
+  for (const auto &[from, to] :
+       std::vector<std::pair<std::string, std::string>>{
+           {"", "~~~~"}, {"t03:", "t04:"}, {"t05:", "t06:"}, {"r", "s"},
+           {"t00:0500000", "t02:"}}) {
+    CHECK(old_snap.count_keys(to_bytes(from), to_bytes(to), kNoLimit) ==
+          reference_count(before, from, to, kNoLimit));
+    CHECK(new_snap.count_keys(to_bytes(from), to_bytes(to), kNoLimit) ==
+          reference_count(keys, from, to, kNoLimit));
+  }
+}
+
+TEST_CASE("count_keys reads no key per counted entry", "[count_keys]") {
+  // Buffer-pool hits count the key directory's record reads. One key read
+  // can take more than one hit (header, then the rest), so the budget is
+  // measured, not assumed: a contains_key of a present key is one key read.
+  TempDir td;
+  auto db = bytecask::DB::open(
+      td.path / "db", {.io_backend = bytecask::IoBackend::BufferPool,
+                       .buffer_pool = {.capacity_bytes = 256 * 1024 * 1024}});
+  constexpr int kKeys = 20'000;
+  for (int i = 0; i < kKeys; ++i)
+    db.put({.sync = false}, to_bytes(std::format("k{:06d}", i)),
+           to_bytes("value"));
+  const auto snap = db.snapshot();
+  const auto hits = [&] { return db.stats().at("bytecask.pool_hits"); };
+
+  auto h0 = hits();
+  REQUIRE(snap.contains_key({}, to_bytes("k010000")));
+  const auto one_key_read = hits() - h0;
+
+  h0 = hits();
+  REQUIRE(snap.count_keys(to_bytes("k000100"), to_bytes("k019000"), kNoLimit) ==
+          18'900);
+  const auto count_cost = hits() - h0;
+  if constexpr (bytecask::kKeyDirReadsKeys)
+    CHECK(count_cost <= 2 * one_key_read);
+  else
+    CHECK(count_cost == 0);
+
+  // Small ranges cost no more than the keys_from walk they replace: step
+  // from `from` until a key at or past `to`.
+  const auto walk = [&](const std::string &from, const std::string &to) {
+    std::size_t n = 0;
+    for (const auto &k : snap.keys_from({}, to_bytes(from))) {
+      if (!std::ranges::lexicographical_compare(k, to_bytes(to)))
+        break;
+      ++n;
+    }
+    return n;
+  };
+  for (const auto &[from, to] :
+       std::vector<std::pair<std::string, std::string>>{
+           {"k005000x", "k005001"},    // empty
+           {"k005000", "k005001"},     // one key
+           {"k005000", "k005002"}}) {  // two keys
+    h0 = hits();
+    const auto walked = walk(from, to);
+    const auto walk_cost = hits() - h0;
+    h0 = hits();
+    CHECK(snap.count_keys(to_bytes(from), to_bytes(to), kNoLimit) == walked);
+    CHECK(hits() - h0 <= walk_cost);
+  }
 }
 
 // ---------------------------------------------------------------------------

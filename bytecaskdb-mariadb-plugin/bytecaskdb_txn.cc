@@ -145,6 +145,35 @@ bool MariaDBTxn::exists(const uint8_t *key, size_t klen) {
   }
 }
 
+std::size_t MariaDBTxn::count_range(const uint8_t *lo, size_t lo_len,
+                                    const uint8_t *hi, size_t hi_len,
+                                    std::size_t limit) {
+  if (!snap_) {
+    snap_.emplace(db_->snapshot());
+  }
+  auto n = snap_->count_keys(as_view(lo, lo_len), as_view(hi, hi_len), limit);
+  if (n >= limit) {
+    return limit;
+  }
+  // A buffered put of a key the snapshot lacks adds one; a buffered delete
+  // of a key it holds takes one away (that key is among the n counted).
+  const std::vector<uint8_t> lo_vec(lo, lo + lo_len);
+  const std::vector<uint8_t> hi_vec(hi, hi + hi_len);
+  for (auto it = lookup_.lower_bound(lo_vec);
+       it != lookup_.end() && it->first < hi_vec; ++it) {
+    const bool in_snap = snap_->contains_key(
+        plugin_read_options(), as_view(it->first.data(), it->first.size()));
+    if (it->second && !in_snap) {
+      if (++n >= limit) {
+        return limit;
+      }
+    } else if (!it->second && in_snap) {
+      --n;
+    }
+  }
+  return n;
+}
+
 // Helpers to extract a single iterator from a subrange<It, sentinel> by
 // moving its begin(). Both forward and reverse now use default_sentinel_t.
 

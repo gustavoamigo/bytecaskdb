@@ -1479,12 +1479,15 @@ int ha_bytecaskdb::info(uint flag) {
 // ---------------------------------------------------------------------------
 // records_in_range() — row estimate for the optimizer.
 //
-// Key enumeration is an in-memory tree walk, so a selective range is
-// counted exactly (merged with this transaction's buffered writes) up to
-// kRangeCountCap keys. Above the cap the walk stops and the estimate falls
-// back to a fixed fraction of the table, which is all the optimizer needs
-// to rank a wide range against a narrow one. Never returns 0: the server
-// treats 0 as an exact "empty" answer.
+// A selective range is counted exactly, as this transaction sees it (its
+// snapshot plus its own buffered writes), up to kRangeCountCap keys. The
+// snapshot's count comes from the key directory's leaf sizes, not from
+// walking keys: under the blind-leaf key directory walking reads every key's
+// record, which made these estimates most of a TPC-C run's record reads.
+// Above the cap the estimate falls back to a fixed fraction of the table,
+// which is all the optimizer needs to rank a wide range against a narrow
+// one. Never returns 0: the server treats 0 as an exact "empty" answer and
+// may skip reading the range.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -1536,14 +1539,13 @@ ha_rows ha_bytecaskdb::records_in_range(uint index, const key_range *min_key,
                : index_id_upper_bound(table_id_, idx);
   }
 
-  auto it = on_pk
-      ? txn->iter_prefix(lo.data(), lo.size(), hi.data(), hi.size(), table_id_)
-      : txn->iter_index_prefix(lo.data(), lo.size(), hi.data(), hi.size(),
-                               table_id_, idx);
-  if (!it) { return fallback; }
-
   ha_rows n = 0;
-  for (; it->valid() && n < kRangeCountCap; it->next()) { ++n; }
+  try {
+    n = static_cast<ha_rows>(txn->count_range(lo.data(), lo.size(), hi.data(),
+                                              hi.size(), kRangeCountCap));
+  } catch (const std::exception &) {
+    return fallback;  // an estimate: an I/O error must not fail the query
+  }
   if (n >= kRangeCountCap) { return std::max(kRangeCountCap, fallback); }
   return std::max(ha_rows(1), n);
 }
