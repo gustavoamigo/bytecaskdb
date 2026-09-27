@@ -1162,6 +1162,12 @@ private:
   // Seals active file, dispatches hint write to background, opens new active file.
   void rotate_active_file(TransientEngineState &t,
                           const std::shared_ptr<const EngineState> &current);
+  // Creates the active file for file_id under a fresh stem and syncs dir_,
+  // so the file's name is durable before any write into it is acknowledged.
+  // checkpoint names the caller's fault injection point.
+  [[nodiscard]] auto create_active_file(std::uint32_t file_id,
+                                        const char *checkpoint)
+      -> std::shared_ptr<WritableDataFile>;
 
   // Degrade — sets the engine to write-blocked state with a reason.
   // Used by store_state invariant checks; error catch blocks use
@@ -2525,7 +2531,16 @@ DB::DB(std::filesystem::path dir, Options opts)
     pool_ = std::make_shared<BufferPool>(opts.buffer_pool);
   }
   KeyDirEntry::check_file_offset(opts.max_file_bytes);
+  // The directories open creates, each named by an entry in its parent that
+  // has to be durable before the database's files can be.
+  std::vector<std::filesystem::path> created;
+  for (auto p = std::filesystem::absolute(dir_); !std::filesystem::exists(p);
+       p = p.parent_path()) {
+    created.push_back(p);
+  }
   std::filesystem::create_directories(dir_);
+  for (const auto &p : created)
+    sync_directory(p.parent_path(), "io_dir_sync_create_dir");
 
   // Acquire exclusive advisory lock on the database directory.
   const auto lock_path = dir_ / ".lock";
@@ -2563,10 +2578,7 @@ DB::DB(std::filesystem::path dir, Options opts)
     // Count files opened during recovery.
     counters_.files_opened.store(file_count, std::memory_order_relaxed);
     s.active_file_id = s.next_file_id++;
-    const auto stem = make_data_file_stem();
-    auto new_active = createDataFileForWrite(
-        dir_, stem, ".data", rotation_threshold_, io_backend_, pool_,
-        s.active_file_id);
+    auto new_active = create_active_file(s.active_file_id, "io_dir_sync_open");
     if (pool_) pool_->set_active_file(s.active_file_id);
     // +1 for the new active file.
     counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
@@ -3363,18 +3375,26 @@ void DB::rotate_active_file(TransientEngineState &t,
   t.active_file().shrink_to_fit();
   auto read_only_old = openDataFileForRead(t.active_file().path(), io_backend_, pool_,
                                          t.active_file_id());
-  const auto stem = make_data_file_stem();
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_rotate_file_creation);
 #endif
   const auto new_file_id = t.reserve_file_id();
-  auto new_file = createDataFileForWrite(
-      dir_, stem, ".data", rotation_threshold_, io_backend_, pool_,
-      new_file_id);
+  auto new_file = create_active_file(new_file_id, "io_dir_sync_rotate");
   t.apply_rotate_file(read_only_old, std::move(new_file), new_file_id);
   // The sealed file's frames become evictable and the new file's pinned.
   if (pool_) pool_->set_active_file(new_file_id);
   dispatch_hint(std::move(read_only_old));
+}
+
+auto DB::create_active_file(std::uint32_t file_id, const char *checkpoint)
+    -> std::shared_ptr<WritableDataFile> {
+  auto file = createDataFileForWrite(dir_, make_data_file_stem(), ".data",
+                                     rotation_threshold_, io_backend_, pool_,
+                                     file_id);
+  // On failure the created file is left behind empty, which is the state a
+  // crash right after the create leaves too; the next open recovers it.
+  sync_directory(dir_, checkpoint);
+  return file;
 }
 
 // The wait runs on the writer's thread with the write path held, so every
@@ -3535,6 +3555,9 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
   FAULT_INJECTION(io_hint_rename);
 #endif
   std::filesystem::rename(tmp_path, hint_path);
+  // Only restart time depends on this: a lost rename leaves the file
+  // hint-less, and the next open rebuilds the hint from it.
+  sync_directory(dir, "io_dir_sync_hint");
   return it.committed_offset();
 }
 
@@ -3733,6 +3756,10 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
   // between here and the staging create. renameDataFileExclusive refuses the
   // target instead of replacing it.
   renameDataFileExclusive(tmp_data_path, final_data_path);
+  // The source is unlinked once this commits. Were that unlink durable and
+  // the rename not, the next open would find only .data.tmp, delete it as
+  // staging, and lose every live entry the source held.
+  sync_directory(dir_, "io_dir_sync_vacuum");
 #ifdef BYTECASK_TESTING
   // Class G in docs/correctness_validation.md: the rename completed and the
   // process did not get to confirm it. The compacted file is on disk under its
@@ -4027,14 +4054,11 @@ void DB::resume() {
   dispatch_hint(read_only_old);
 
   // Create the new active file (may throw → stays degraded).
-  const auto stem = make_data_file_stem();
 #ifdef BYTECASK_TESTING
   FAULT_INJECTION(io_resume_file_creation);
 #endif
   const auto new_file_id = t.reserve_file_id();
-  auto new_file = createDataFileForWrite(
-      dir_, stem, ".data", rotation_threshold_, io_backend_, pool_,
-      new_file_id);
+  auto new_file = create_active_file(new_file_id, "io_dir_sync_resume");
 
   // Build and publish new state. Replay scanned entries into key_dir so that
   // entries on disk but not yet in EngineState become visible.

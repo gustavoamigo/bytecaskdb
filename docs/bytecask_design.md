@@ -365,7 +365,7 @@ After recovery (`DB::open`, `resume`), `durable_seq` is set to `next_seq - 1` be
 After all appends succeed and mutations are applied, the engine may rotate the active file if it exceeds the size threshold. Rotation syncs the file, seals it, and creates a new active file. Two distinct failures can occur:
 
 - **Sync fails before seal**: the file is not sealed. The engine captures the exception, advances `next_seq` past consumed sequences, and rethrows without publishing key changes. The DB is not degraded — the next write retries rotation or continues appending.
-- **File creation fails after seal**: `rotate_active_file` calls `seal()` before creating the new file. If creation fails, the active file is sealed and cannot accept further appends. The engine degrades the DB and publishes state. `resume()` creates a fresh active file.
+- **File creation fails after seal**: `rotate_active_file` calls `seal()` before creating the new file. If creation fails, the active file is sealed and cannot accept further appends. The engine degrades the DB and publishes state. `resume()` creates a fresh active file. A failed sync of the directory after the create (see *Directory Sync*) takes the same path: the file exists, its name is not known to be durable, and no write is acknowledged into it.
 
 ##### Sync failure: advance sequence, discard key changes
 
@@ -670,6 +670,8 @@ This is a pure metadata operation — no scanning, no copying, no syncing. The f
 #### Crash safety
 
 `vacuum_compact_file` writes the new data file to `.data.tmp` and renames it atomically to `.data` after `fdatasync`. If the engine crashes mid-write, recovery ignores `.data.tmp` files (it only processes `.data` extensions) and cleans them up in `open_and_prepare_files`. The hint file uses the same `.hint.tmp` → `.hint` protocol.
+
+The rename is followed by a sync of the directory before vacuum commits (#199). Without it, a power loss could persist the later unlink of the source and drop the rename: the next open would find only `.data.tmp`, delete it as staging, and lose every live entry the source held. A failed sync throws before the commit; the renamed copy and its source are then both on disk, which is the interrupted-vacuum shape below.
 
 After the rename there is a second window. Vacuum scans the compacted file C to write its hint, commits, and only then unlinks the source S. A kill anywhere in there leaves C and S both on disk, holding the same entries under the same sequences — seconds for a 64 MiB file, and a cgroup OOM kill under a write-heavy load found it. Vacuum is committed on disk only once S is unlinked, so recovery undoes it (`DB::recovery_open`, design in [`vacuum_crash_recovery_design.md`](vacuum_crash_recovery_design.md)):
 
@@ -1136,10 +1138,28 @@ To guarantee hint files are either complete or absent, writing uses a temp-then-
 1. Write the complete hint file to `data_{timestamp}.hint.tmp`.
 2. Call `fdatasync` to flush all bytes to physical storage.
 3. Atomically `rename(2)` to `data_{timestamp}.hint` — POSIX guarantees this rename is atomic on the same filesystem.
+4. Sync the directory (see *Directory Sync*). Only restart time depends on it: a lost rename leaves the data file hint-less, and the next open rebuilds the hint from it.
 
 Any `.hint.tmp` file found at startup is discarded (it represents an incomplete write interrupted by a crash). Recovery will re-scan the corresponding `.data` file instead.
 
 Because hint file writes are deferred (see above), this protocol is exercised at engine close or during an explicit `flush_hints()` call — not inside the rotation critical path.
+
+### Directory Sync
+
+`fdatasync` makes a file's bytes durable, not the directory entry that names it, and POSIX lets a power loss keep a later directory operation while dropping an earlier one. Every create or rename that something later depends on is therefore followed by `sync_directory(dir)` (`fsync` on the directory, #199), before the thing that depends on it:
+
+| Entry | Synced | Before |
+|---|---|---|
+| directories `DB::open` creates | each parent, deepest first | anything is written in them |
+| a new active file (`DB::open`, `rotate_active_file`, `resume()`, all through `create_active_file`) | `dir_` | any write into it is acknowledged |
+| vacuum's compacted file, renamed from `.data.tmp` | `dir_` | the commit, and so the unlink of the source |
+| a hint file, renamed from `.hint.tmp` | `dir_` | nothing; a lost rename only costs a rebuild |
+
+Unlinks are not synced. A lost unlink brings back a file the engine already handles: a vacuum source next to its compacted copy is undone at recovery, and a vacuumed-away file that reappears is the same pair. Vacuum's staging create is not synced on its own; the sync after the rename covers the entry.
+
+A filesystem that cannot sync a directory returns `EINVAL`, which is taken as done, as PostgreSQL does. The WASM build has nothing to sync. The rotation sync runs under the write path, once per `max_file_bytes`, where rotation already waits on the hint backlog; the commit path does not change.
+
+On ext4 and XFS, metadata is journaled in order, so none of these entries is likely to be lost without the sync. The engine does not depend on that. Each site passes its own fault injection checkpoint to `sync_directory` (`io_dir_sync_*`), and the `[dir_sync]` tests fail each one: each shows its site still syncs, and that nothing the sync guards goes ahead when it fails.
 
 ### Module Plan
 
@@ -1683,7 +1703,7 @@ Counters are per-DB instance (`Counters` struct owned by `DB`). Two open databas
 | D9 | **Concurrency model**: SWMR — exactly one writer at a time; reads are concurrent. MVCC and snapshot isolation are not provided. |
 | D10 | **Vacuum**: Two independently testable paths — `vacuum_compact_file` (rewrite sealed file into a new sealed file, dropping dead entries) and `vacuum_remove_file` (delete files with no live entries and no tombstones, no I/O required). `vacuum()` selects a target file above `fragmentation_threshold`, then branches: `vacuum_remove_file` if `live_bytes == 0 && tombstone_bytes == 0`, otherwise `vacuum_compact_file`. Returns `true` if a file was processed, `false` if nothing qualified. No compound paths. All vacuum-related identifiers use a `vacuum_` prefix. One sealed file per `vacuum()` call. Engine continues serving reads and writes. For `vacuum_compact_file`, `write_mu_` is held only for the commit step (I/O writes to a private temp file). For `vacuum_remove_file`, `write_mu_` is held only for the brief metadata update. `vacuum_commit` itself does not acquire `write_mu_` — the caller is responsible for holding it. A tombstone is dropped only when recovery found it no longer hides a Put in another file (`NeededTombstones`); tombstones written since the open are always copied. File selection uses `fragmentation > fragmentation_threshold`, with fragmentation `1 − (live_bytes + tombstone_bytes + marker_bytes) / total_bytes`, computed from incrementally maintained `FileStats` — O(1) per file. Stats are reconstructed during recovery as a side-effect of the hint-file pass. |
 | D11 | **File naming**: `data_{YYYYMMDDHHmmss}_{RRRRRRRR}_V{XX}`. Timestamp is UTC second precision — a human-readable creation-time hint, not content age (compaction produces new files with old entries). `RRRRRRRR` is a 4-byte random hex salt for collision avoidance. `V{XX}` is the file format version (`V01` initially). Filename ordering carries no semantic meaning; entry sequence numbers are authoritative. |
-| D12 | **Hint file atomicity**: Write to `*.hint.tmp`, `fdatasync`, then atomically `rename(2)` to `*.hint`. A `.hint.tmp` file found at startup is discarded. |
+| D12 | **Hint file atomicity**: Write to `*.hint.tmp`, `fdatasync`, then atomically `rename(2)` to `*.hint`, then sync the directory. A `.hint.tmp` file found at startup is discarded. |
 | D13 | **Incomplete batch recovery**: An unmatched `BulkBegin` in the active data file scan causes the partial batch to be discarded with a logged warning. No partial-batch entries enter the key directory. |
 | D14 | **Single-entry batch optimization**: When `apply_batch` is called with exactly one operation, the `BulkBegin`/`BulkEnd` marker writes are skipped. A single data entry is self-describing and CRC-protected, so the markers add no recovery benefit for a write set of size 1. |
 | D15 | **C ABI / shared-library link constraint**: `libbytecask.a` is compiled with `-fPIC` so it can be linked into a shared object (e.g. `ha_bytecaskdb.so`). Without `-fPIC`, clang emits `R_X86_64_TPOFF32`/`R_X86_64_32S` relocations illegal in a DSO. xmake syntax: `add_cxxflags("-fPIC", {force = true})` on the `bytecask` static target. |

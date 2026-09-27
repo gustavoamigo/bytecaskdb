@@ -5389,6 +5389,176 @@ TEST_CASE("resume() recovers from degraded state", "[degraded][resume]") {
   CHECK(db.contains_key({}, to_bytes("k3")));
 }
 
+// ---------------------------------------------------------------------------
+// Directory sync (#199). fdatasync makes a file's bytes durable, not the
+// directory entry that names it, so every create or rename that something
+// later depends on is followed by a sync of its directory. Each site passes
+// its own fault injection checkpoint to sync_directory, so failing a site's
+// sync shows the site still calls it, and that nothing it guards goes ahead.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("directory sync: a failed sync at rotation degrades before the new "
+          "file takes a write",
+          "[dir_sync][degraded][resume]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  {
+    // As in "resume() recovers from degraded state": k2 crosses the 30-byte
+    // threshold, and the rotation after its commit creates the next file.
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 30});
+    db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+    const auto files_before = data_files_in(db_path);
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_dir_sync_rotate"};
+      REQUIRE_THROWS_AS(db.put({.sync = true}, to_bytes("k2"), to_bytes("v2")),
+                        std::system_error);
+    }
+    // The file was created, its name was not confirmed durable, and the
+    // engine refuses writes instead of acknowledging one into it.
+    CHECK(data_files_in(db_path).size() == files_before.size() + 1);
+    REQUIRE(db.is_degraded());
+    CHECK_THROWS_AS(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")),
+                    bytecask::DbDegraded);
+
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_NOTHROW(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")));
+    CHECK(collect_kv(db) == std::map<std::string, std::string>{
+                                {"k1", "v1"}, {"k2", "v2"}, {"k3", "v3"}});
+  }
+  // The file left behind by the failed rotation is recovered like the active
+  // file of a crash.
+  auto db = bytecask::DB::open(db_path, {.max_file_bytes = 30});
+  CHECK(collect_kv(db) == std::map<std::string, std::string>{
+                              {"k1", "v1"}, {"k2", "v2"}, {"k3", "v3"}});
+}
+
+TEST_CASE("directory sync: a failed sync in resume() stays degraded",
+          "[dir_sync][degraded][resume]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 30});
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
+    REQUIRE_THROWS_AS(db.put({.sync = true}, to_bytes("k2"), to_bytes("v2")),
+                      std::system_error);
+  }
+  REQUIRE(db.is_degraded());
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_dir_sync_resume"};
+    REQUIRE_THROWS_AS(db.resume(), std::system_error);
+  }
+  CHECK(db.is_degraded());
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+  REQUIRE_NOTHROW(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")));
+  CHECK(collect_kv(db) == std::map<std::string, std::string>{
+                              {"k1", "v1"}, {"k2", "v2"}, {"k3", "v3"}});
+}
+
+TEST_CASE("directory sync: open fails when the active file's entry cannot be "
+          "synced",
+          "[dir_sync][recovery]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  {
+    auto db = bytecask::DB::open(db_path);
+    db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  }
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_dir_sync_open"};
+    REQUIRE_THROWS_AS(bytecask::DB::open(db_path), std::system_error);
+  }
+  auto db = bytecask::DB::open(db_path);
+  CHECK(collect_kv(db) ==
+        std::map<std::string, std::string>{{"k1", "v1"}});
+}
+
+TEST_CASE("directory sync: open syncs each directory it creates",
+          "[dir_sync]") {
+  TempDir td;
+  const auto db_path = td.path / "a" / "b" / "db";
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_dir_sync_create_dir"};
+    REQUIRE_THROWS_AS(bytecask::DB::open(db_path), std::system_error);
+  }
+  std::filesystem::remove_all(td.path / "a");
+  {
+    // Three directories created, three parents synced before anything else
+    // open does: the third checkpoint is still one of them.
+    bytecask::testing::ScopedFaultInjector fi{2};
+    REQUIRE_THROWS_AS(bytecask::DB::open(db_path), std::system_error);
+    CHECK(fi.inj.call_count == 3);
+    CHECK(fi.inj.last_checkpoint == "io_dir_sync_create_dir");
+  }
+  std::filesystem::remove_all(td.path / "a");
+  { auto db = bytecask::DB::open(db_path); }
+  // An existing directory creates nothing, so there is nothing to sync.
+  bytecask::testing::ScopedFaultInjector fi{"io_dir_sync_create_dir"};
+  REQUIRE_NOTHROW(bytecask::DB::open(db_path));
+}
+
+TEST_CASE("directory sync: a hint rebuilt at open is synced",
+          "[dir_sync][recovery]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  {
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 30});
+    for (int i = 0; i < 6; ++i) {
+      db.put({.sync = true}, to_bytes(std::format("k{}", i)), to_bytes("v"));
+    }
+  }
+  for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+    if (e.path().extension() == ".hint") std::filesystem::remove(e.path());
+  }
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_dir_sync_hint"};
+    REQUIRE_THROWS_AS(bytecask::DB::open(db_path, {.max_file_bytes = 30}),
+                      std::system_error);
+  }
+  auto db = bytecask::DB::open(db_path, {.max_file_bytes = 30});
+  CHECK(collect_kv(db).size() == 6);
+}
+
+TEST_CASE("directory sync: a failed sync in vacuum keeps the source",
+          "[dir_sync][vacuum]") {
+  TempDir td;
+  const auto db_path = td.path / "db";
+  std::map<std::string, std::string> oracle;
+  std::set<std::filesystem::path> before_vacuum;
+  {
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 4096});
+    for (int i = 0; i < 200; ++i) {
+      auto k = std::format("k{:04d}", i);
+      auto v = std::format("v{:04d}", i) + std::string(40, 'x');
+      db.put({.sync = false}, to_bytes(k), to_bytes(v));
+      oracle[k] = v;
+    }
+    // Garbage in the first file, which keeps live keys too: vacuum compacts
+    // it, renaming a compacted copy into place.
+    for (int i = 0; i < 40; i += 2) {
+      auto k = std::format("k{:04d}", i);
+      auto v = std::format("w{:04d}", i) + std::string(40, 'y');
+      db.put({.sync = false}, to_bytes(k), to_bytes(v));
+      oracle[k] = v;
+    }
+    before_vacuum = data_files_in(db_path);
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_dir_sync_vacuum"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}),
+                        std::system_error);
+    }
+    // The rename happened; nothing after it did. Every source is still on
+    // disk and published.
+    CHECK(std::ranges::includes(data_files_in(db_path), before_vacuum));
+    CHECK(collect_kv(db) == oracle);
+  }
+  // The compacted copy next to its source is an interrupted vacuum, which
+  // recovery undoes.
+  auto db = bytecask::DB::open(db_path, {.max_file_bytes = 4096});
+  CHECK(collect_kv(db) == oracle);
+  CHECK(std::ranges::includes(data_files_in(db_path), before_vacuum));
+}
+
 TEST_CASE("resume() replays unpublished entries from active file",
           "[degraded][resume]") {
   TempDir td;

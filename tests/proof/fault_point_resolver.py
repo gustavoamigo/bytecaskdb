@@ -68,8 +68,9 @@ def resolve_fault(
             # checkpoint name. Use count-based to skip rotation + file creation
             # and hit only the commit sync.
             # Sequence: appends(1..n_appends), rotation_sync(+1),
-            #           file_creation(+2), commit_sync(+3 — fails here).
-            return FaultConfig(fail_at=n_appends + 2)
+            #           file_creation(+2), dir_sync_rotate(+3),
+            #           commit_sync(+4 — fails here).
+            return FaultConfig(fail_at=n_appends + 3)
         return FaultConfig(name="io_data_file_sync")
 
     if failure == FailureClass.G:
