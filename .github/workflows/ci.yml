@@ -302,15 +302,16 @@ jobs:
           use_oidc: true
 
   # ---------------------------------------------------------------------------
-  # Sanitizer checks, in sanitizers.yml. A PR gets ASan, TSan and UBSan on the
-  # default key directory; push to main gets every sanitizer on all three key
-  # directories, as does the nightly schedule in sanitizers.yml itself.
+  # Sanitizer checks, in sanitizers.yml. A PR and the push to main that merges
+  # it get ASan, TSan and UBSan on the default key directory. Every sanitizer
+  # on all three key directories runs on the nightly schedule in
+  # sanitizers.yml itself, not on each merge.
   # ---------------------------------------------------------------------------
   sanitizers:
     uses: ./.github/workflows/sanitizers.yml
     with:
-      keydirs: ${{ github.event_name == 'pull_request' && '["blind"]' || '["blind", "btree", "radix"]' }}
-      sanitizers: ${{ github.event_name == 'pull_request' && '["address", "thread", "undefined"]' || '["address", "thread", "memory", "undefined"]' }}
+      keydirs: '["blind"]'
+      sanitizers: '["address", "thread", "undefined"]'
 
   # ---------------------------------------------------------------------------
   # Fuzz targets: compile-only check that the targets still build.

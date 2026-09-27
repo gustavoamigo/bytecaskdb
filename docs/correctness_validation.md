@@ -1400,17 +1400,17 @@ MSan test step the slowest of the three and by far the least predictable
 (2m48s and 11m56s on two runs of the same commit, against a steady ~1m50s
 for ASan and TSan; per-job runners vary by ~1.8x and the seeded `[model]`
 workloads account for much of the rest), so it is excluded from the
-`pull_request` matrix and runs on push to `main`, nightly, and on
-`workflow_dispatch`. The job times out after two hours rather than GitHub's
-six, and the test run prints `--durations`, so a stalled run fails early and
-its log names the last test that finished.
+`pull_request` matrix and runs nightly and on `workflow_dispatch`. The job
+times out after two hours rather than GitHub's six, and the test run prints
+`--durations`, so a stalled run fails early and its log names the last test
+that finished.
 
 ### Sanitizer matrix across key directories
 
 The sanitizer jobs live in `.github/workflows/sanitizers.yml`, which
-`ci.yml` calls. A pull request runs ASan, TSan and UBSan on the default
-blind-leaf key directory. Push to `main` and the nightly schedule run the
-full matrix: `{blind, btree, radix}` (`BYTECASK_KEYDIR`) ×
+`ci.yml` calls. A pull request, and the push to `main` that merges it, run
+ASan, TSan and UBSan on the default blind-leaf key directory. The nightly
+schedule runs the full matrix: `{blind, btree, radix}` (`BYTECASK_KEYDIR`) ×
 `{address, thread, memory, undefined}`, twelve jobs. The two non-default
 trees share their inner nodes and `BuildSession` with the default, so bugs in
 shared code already surface in the PR run; the full matrix catches what is
@@ -1578,6 +1578,20 @@ every thread's operation sequence, not the interleaving, so it
 reproduces a failure's shape; the failures below recurred when their
 seed and epoch were rerun. `soak-nightly.yml` runs it for 25
 minutes per sanitizer (ASan, TSan) with the run id as the seed.
+
+The soak trusts the kernel to return the bytes that were written. The
+job checks that first, with no engine code: it logs `uname -a` and runs
+`tests/platform/pread_truncate_stress.cpp`, one writer appending into a
+zero-filled file with `fdatasync` while readers `pread` the newest
+records and check every byte. On a kernel that returns wrong bytes, the
+job fails at that step and names the kernel; the soak does not run.
+ByteCaskDB does not work around a platform that returns wrong data: the
+read fails, on a CRC mismatch or a record that does not parse. The
+runners' `6.17.0-1022-azure` does this on ext4 (#211): a `pread` of
+written bytes can return the same file's contents from a page earlier.
+Testing builds add to a failed record read where its descriptor points
+and what the same bytes read now, which is what separated that kernel
+from an engine bug.
 
 #### What it found
 

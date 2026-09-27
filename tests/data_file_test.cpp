@@ -1232,6 +1232,93 @@ TEST_CASE("DataFile::lend_record rejects a damaged record when verifying",
   std::filesystem::remove(path);
 }
 
+// A read of a record that does not fit below the file's end names the file,
+// the offset and what the header claims, on every back-end, writable and
+// sealed. In testing builds a pread read also says where its descriptor
+// points and what the bytes read now.
+TEST_CASE("DataFile::lend_record past the end names the file and offset",
+          "[data_file]") {
+  const auto io_backend =
+      GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::Mmap,
+               bytecask::IoBackend::BufferPool);
+  const bool sealed = GENERATE(false, true);
+  CAPTURE(static_cast<int>(io_backend), sealed);
+  // The pool serves the active file from the frames its appends filled, so
+  // damage written through the filesystem never reaches it.
+  if (io_backend == bytecask::IoBackend::BufferPool && !sealed) return;
+  const auto dir = std::filesystem::temp_directory_path();
+  const auto path = dir / "bc_test_lend_past_end.data";
+  std::filesystem::remove(path);
+  auto pool = std::make_shared<bytecask::BufferPool>(
+      bytecask::BufferPoolOptions{.capacity_bytes = 8 << 20});
+  auto writer = bytecask::createDataFileForWrite(
+      dir, "bc_test_lend_past_end", ".data", 1 << 20, io_backend, pool,
+      /*file_id=*/11);
+  (void)writer->append_entry(1, bytecask::EntryType::Put, to_bytes("a"),
+                             to_bytes("first"));
+  const auto second = writer->append_entry(2, bytecask::EntryType::Put,
+                                           to_bytes("b"), to_bytes("second"));
+  writer->sync();
+  const auto end = writer->size();
+  if (sealed) writer->shrink_to_fit();
+  {
+    // The second record's value_size, far past the end.
+    std::fstream f{path, std::ios::in | std::ios::out | std::ios::binary};
+    f.seekp(static_cast<std::streamoff>(second + 11));
+    f.write("\xff\xff\xff\x7f", 4);
+  }
+  std::shared_ptr<bytecask::DataFile> file = writer;
+  if (sealed) {
+    writer.reset();
+    file.reset();
+    file = bytecask::openDataFileForRead(path, io_backend, pool, 12);
+  }
+
+  std::vector<std::byte> io_buf;
+  bytecask::FrameLease lease;
+  const auto error_at = [&](bytecask::Offset offset) {
+    try {
+      (void)file->lend_record(offset, 0, false, io_buf, lease);
+    } catch (const std::runtime_error &e) {
+      return std::string{e.what()};
+    }
+    return std::string{"no error"};
+  };
+
+  const auto record = error_at(second);
+  INFO(record);
+  CHECK(record.find("record extends past the end") != std::string::npos);
+  CHECK(record.find(path.filename().string()) != std::string::npos);
+  CHECK(record.find(std::format("offset {} end {}", second, end)) !=
+        std::string::npos);
+  CHECK(record.find("value_size 2147483647") != std::string::npos);
+#ifdef BYTECASK_TESTING
+  if (io_backend == bytecask::IoBackend::Pread) {
+    CHECK(record.find(sealed ? "[sealed fd " : "[writable fd ") !=
+          std::string::npos);
+    CHECK(record.find("reread now: sequence 2 key_size 1 value_size "
+                      "2147483647") != std::string::npos);
+  }
+#endif
+
+  // The writable mmap file bounds its mapped reads by the mapping, which
+  // spans the zero-filled capacity, not by the logical end: a header just
+  // below the end reads zeros as the rest of a record. Only an offset the
+  // key directory never holds reaches it.
+  if (io_backend == bytecask::IoBackend::Mmap && !sealed) return;
+  const auto header = error_at(end - 5);
+  INFO(header);
+  CHECK(header.find("record header past the end of file") !=
+        std::string::npos);
+  CHECK(header.find(std::format("offset {} end {}", end - 5, end)) !=
+        std::string::npos);
+
+  lease.reset();
+  file.reset();
+  writer.reset();
+  std::filesystem::remove(path);
+}
+
 namespace {
 
 // A record placed so a buffer-pool frame boundary falls inside it: `before`

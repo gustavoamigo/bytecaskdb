@@ -232,24 +232,43 @@ constexpr auto first_read_length(Offset offset, std::uint32_t value_size_hint,
       std::min<std::uint64_t>(len, end > offset ? end - offset : 0));
 }
 
+// The errors for a record that does not fit below end. They carry the file,
+// the offset and what the header claims: a plausible sequence and sizes say
+// the end moved under the reader, garbage says the offset does not start a
+// record.
+[[noreturn]] void throw_header_past_end(const std::filesystem::path &path,
+                                        Offset offset, Offset end) {
+  throw std::runtime_error{std::format(
+      "bytecask: record header past the end of file: '{}' offset {} end {}",
+      path.string(), offset, end)};
+}
+[[noreturn]] void throw_record_past_end(const std::filesystem::path &path,
+                                        Offset offset, const EntryHeader &hdr,
+                                        Offset end) {
+  throw std::runtime_error{std::format(
+      "bytecask: corrupt data file — record extends past the end: '{}' "
+      "offset {} end {}, header sequence {} key_size {} value_size {} ({} "
+      "bytes)",
+      path.string(), offset, end, hdr.sequence, hdr.key_size, hdr.value_size,
+      record_bytes(hdr))};
+}
+
 // A record read through fetch(offset, len, dst), which reads exactly len
 // bytes: one fetch of first_read_length(), then, only when the record is
 // longer than that, one for the rest. The spans point into io_buf.
 template <typename Fetch>
-auto fetch_record(Offset offset, std::uint32_t value_size_hint, Offset end,
-                  bool verify, std::vector<std::byte> &io_buf, Fetch &&fetch)
+auto fetch_record(const std::filesystem::path &path, Offset offset,
+                  std::uint32_t value_size_hint, Offset end, bool verify,
+                  std::vector<std::byte> &io_buf, Fetch &&fetch)
     -> DataEntryView {
   const auto first = first_read_length(offset, value_size_hint, end);
-  if (first < kHeaderSize)
-    throw std::runtime_error{"bytecask: record header past the end of file"};
+  if (first < kHeaderSize) throw_header_past_end(path, offset, end);
   io_buf.resize(first);
   fetch(offset, first, io_buf.data());
   const auto hdr = bytecask::read_header(
       std::span<const std::byte>{io_buf.data(), kHeaderSize});
   const auto total = record_bytes(hdr);
-  if (offset + total > end)
-    throw std::runtime_error{
-        "bytecask: corrupt data file — record extends past the end"};
+  if (offset + total > end) throw_record_past_end(path, offset, hdr, end);
   if (total > first) {
     io_buf.resize(total);
     fetch(offset + first, total - first, io_buf.data() + first);
@@ -257,6 +276,42 @@ auto fetch_record(Offset offset, std::uint32_t value_size_hint, Offset end,
   return record_view(std::span<const std::byte>{io_buf.data(), total}, hdr,
                      verify);
 }
+
+#ifdef BYTECASK_TESTING
+// Testing builds only: a record read through fd that fails says where fd
+// really points and what the same bytes read now, so a soak failure can
+// tell a reused descriptor from bytes that changed under the reader.
+template <typename Read>
+auto diagnose_fd_read(int fd, const std::filesystem::path &path, Offset offset,
+                      const char *kind, Read &&read) -> DataEntryView {
+  try {
+    return read();
+  } catch (const std::runtime_error &e) {
+    std::string target(512, '\0');
+    const auto proc = std::format("/proc/self/fd/{}", fd);
+    const auto n = ::readlink(proc.c_str(), target.data(), target.size());
+    target.resize(n > 0 ? static_cast<std::size_t>(n) : 0);
+    struct stat by_fd {};
+    struct stat by_path {};
+    const auto fd_ok = ::fstat(fd, &by_fd) == 0;
+    const auto path_ok = ::stat(path.c_str(), &by_path) == 0;
+    std::array<std::byte, kHeaderSize> hdr{};
+    const auto got = ::pread(fd, hdr.data(), hdr.size(), narrow<off_t>(offset));
+    std::string reread = "short";
+    if (got == std::ssize(hdr)) {
+      const auto h = bytecask::read_header(std::span<const std::byte>{hdr});
+      reread = std::format("sequence {} key_size {} value_size {}", h.sequence,
+                           h.key_size, h.value_size);
+    }
+    throw std::runtime_error{std::format(
+        "{} [{} fd {} -> '{}', fd inode {} size {}, path inode {} size {}; "
+        "reread now: {}]",
+        e.what(), kind, fd, target, fd_ok ? by_fd.st_ino : 0,
+        fd_ok ? by_fd.st_size : -1, path_ok ? by_path.st_ino : 0,
+        path_ok ? by_path.st_size : -1, reread)};
+  }
+}
+#endif
 
 // The zero-copy read behind lend_record for the two pool-backed files: the
 // record's spans point into the frame the lease pins when the whole record —
@@ -766,15 +821,20 @@ public:
                                  FrameLease &lease) const
       -> DataEntryView override {
     lease.reset();
-    if (offset + kHeaderSize <= mmap_end()) {
+    // The mapping spans the zero-filled capacity: bounded by the logical end
+    // too, so a record that does not fit below it fails as on every other
+    // back-end instead of reading zeros as a record.
+    const auto bound = std::min<Offset>(mmap_end(), ops_.logical_end());
+    if (offset + kHeaderSize <= bound) {
       const auto hdr = bytecask::read_header(
           std::span<const std::byte>{mmap_base_ + offset, kHeaderSize});
       const auto total = record_bytes(hdr);
-      if (offset + total <= mmap_end())
+      if (offset + total <= bound)
         return record_view({mmap_base_ + offset, total}, hdr, verify);
     }
-    // Past the mapped extent (a file that grew since it was mapped).
-    return fetch_record(offset, value_size_hint, ops_.logical_end(), verify,
+    // Past the mapped extent (a file that grew since it was mapped), or past
+    // the logical end, which fetch_record refuses.
+    return fetch_record(path(), offset, value_size_hint, ops_.logical_end(), verify,
                         io_buf, [this](Offset at, std::size_t len,
                                        std::byte *dst) {
                           pread_exact(ops_.fd_, at, len, dst);
@@ -1026,11 +1086,18 @@ public:
       }
     }
     lease.reset();
-    return fetch_record(offset, value_size_hint, ops_.logical_end(), verify,
-                        io_buf, [this](Offset at, std::size_t len,
-                                       std::byte *dst) {
-                          fetch(at, len, dst);
-                        });
+    const auto read = [&] {
+      return fetch_record(path(), offset, value_size_hint, ops_.logical_end(),
+                          verify, io_buf,
+                          [this](Offset at, std::size_t len, std::byte *dst) {
+                            fetch(at, len, dst);
+                          });
+    };
+#ifdef BYTECASK_TESTING
+    if constexpr (!Io::kResident)
+      return diagnose_fd_read(ops_.fd_, path(), offset, "writable", read);
+#endif
+    return read();
   }
 
   [[nodiscard]] auto read_entry(Offset offset, std::uint32_t value_size,
@@ -1233,10 +1300,18 @@ public:
                                  FrameLease &lease) const
       -> DataEntryView override {
     lease.reset();
-    return fetch_record(offset, value_size_hint, file_size_, verify, io_buf,
-                        [this](Offset at, std::size_t len, std::byte *dst) {
-                          pread_exact(fd_, at, len, dst);
-                        });
+    const auto read = [&] {
+      return fetch_record(path(), offset, value_size_hint, file_size_, verify,
+                          io_buf,
+                          [this](Offset at, std::size_t len, std::byte *dst) {
+                            pread_exact(fd_, at, len, dst);
+                          });
+    };
+#ifdef BYTECASK_TESTING
+    return diagnose_fd_read(fd_, path(), offset, "sealed", read);
+#else
+    return read();
+#endif
   }
 
   [[nodiscard]] auto read_entry_unverified(
@@ -1407,12 +1482,11 @@ public:
       -> DataEntryView override {
     lease.reset();
     if (offset + kHeaderSize > mmap_size_)
-      throw std::runtime_error{"bytecask: record header past the end of file"};
+      throw_header_past_end(path(), offset, mmap_size_);
     const auto hdr = read_header(offset);
     const auto total = record_bytes(hdr);
     if (offset + total > mmap_size_)
-      throw std::runtime_error{
-          "bytecask: corrupt data file — record extends past the end"};
+      throw_record_past_end(path(), offset, hdr, mmap_size_);
     return record_view({mmap_base_ + offset, total}, hdr, verify);
   }
 
@@ -1595,7 +1669,7 @@ public:
       return *lent;
     }
     lease.reset();
-    return fetch_record(offset, value_size_hint, file_size_, verify, io_buf,
+    return fetch_record(path(), offset, value_size_hint, file_size_, verify, io_buf,
                         [this](Offset at, std::size_t len, std::byte *dst) {
                           fetch(at, len, dst, Source::Pool);
                         });

@@ -63,6 +63,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <filesystem>
@@ -73,7 +74,9 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <fstream>
 #include <random>
+#include <regex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -382,6 +385,98 @@ auto key_str(BytesView key) -> std::string {
   return s;
 }
 
+// The error carries the header the reader decoded. Rebuilds its bytes
+// (all but the type byte) and looks for them in every data file of the
+// directory, so a read served the wrong bytes says where they came from.
+auto find_seen_header(std::string_view what,
+                      const std::filesystem::path &path, std::uint64_t target)
+    -> std::string {
+  static const std::regex re{
+      "header sequence ([0-9]+) key_size ([0-9]+) value_size ([0-9]+)"};
+  std::match_results<std::string_view::const_iterator> m;
+  if (!std::regex_search(what.begin(), what.end(), m, re)) return {};
+  std::array<unsigned char, 15> seen{};
+  const auto put = [&](std::size_t at, std::uint64_t v, int n) {
+    for (int i = 0; i < n; ++i)
+      seen[at + static_cast<std::size_t>(i)] =
+          static_cast<unsigned char>(v >> (8 * i));
+  };
+  put(0, std::stoull(m[1].str()), 8);
+  put(9, std::stoull(m[2].str()), 2);
+  put(11, std::stoull(m[3].str()), 4);
+  std::string out;
+  std::error_code ec;
+  for (const auto &de :
+       std::filesystem::directory_iterator{path.parent_path(), ec}) {
+    std::ifstream f{de.path(), std::ios::binary};
+    const std::vector<unsigned char> b{std::istreambuf_iterator<char>{f}, {}};
+    for (std::size_t at = 0; at + 15 <= b.size(); ++at) {
+      if (std::memcmp(&b[at], seen.data(), 8) != 0 ||
+          std::memcmp(&b[at + 9], &seen[9], 6) != 0)
+        continue;
+      out += std::format("; seen header found in {} at {} (target {}{:+})",
+                         de.path().filename().string(), at, target,
+                         static_cast<std::int64_t>(at) -
+                             static_cast<std::int64_t>(target));
+    }
+  }
+  return out.empty() ? "; seen header found in no file" : out;
+}
+
+// When a read fails with "record extends past the end: '<file>' offset N
+// ...", walks the named data file with the on-disk layout (15-byte header:
+// sequence u64, type u8, key_size u16, value_size u32; then key, value,
+// CRC) and says which record really covers offset N and where `key`'s own
+// records are. That separates an offset the key directory got wrong from
+// bytes overwritten under a right one. Empty when the message is another.
+auto explain_bad_offset(std::string_view what, BytesView key = {})
+    -> std::string {
+  static const std::regex re{"'([^']+)' offset ([0-9]+) end ([0-9]+)"};
+  std::match_results<std::string_view::const_iterator> m;
+  if (!std::regex_search(what.begin(), what.end(), m, re)) return {};
+  const std::filesystem::path path{m[1].str()};
+  const auto target = std::stoull(m[2].str());
+  std::ifstream f{path, std::ios::binary};
+  if (!f) return std::format(" [explain: cannot open {}]", path.string());
+  const std::vector<unsigned char> b{std::istreambuf_iterator<char>{f}, {}};
+  const auto le = [&](std::size_t at, int n) {
+    std::uint64_t v = 0;
+    for (int i = n - 1; i >= 0; --i)
+      v = (v << 8) | b[at + static_cast<std::size_t>(i)];
+    return v;
+  };
+  std::string out = std::format(" [explain: file size {}", b.size());
+  std::size_t pos = 0;
+  std::size_t records = 0;
+  bool covered = false;
+  while (pos + 15 <= b.size()) {
+    const auto seq = le(pos, 8);
+    if (seq == 0) break;
+    const auto ksz = static_cast<std::size_t>(le(pos + 9, 2));
+    const auto vsz = static_cast<std::size_t>(le(pos + 11, 4));
+    const auto total = 15 + ksz + vsz + 4;
+    if (pos + total > b.size()) break;
+    const std::string k(reinterpret_cast<const char *>(&b[pos + 15]),
+                        std::min<std::size_t>(ksz, 40));
+    if (!covered && target >= pos && target < pos + total) {
+      covered = true;
+      out += std::format("; offset {} is inside the record at {} (seq {} "
+                         "type {} key '{}' {} bytes)",
+                         target, pos, seq, b[pos + 8], k, total);
+    }
+    if (!key.empty() && ksz == key.size() &&
+        std::memcmp(&b[pos + 15], key.data(), ksz) == 0)
+      out += std::format("; key record at {} (seq {} type {})", pos, seq,
+                         b[pos + 8]);
+    pos += total;
+    ++records;
+  }
+  out += std::format("; walk stopped at {} after {} records{}", pos, records,
+                     covered ? "" : ", no record covers the offset");
+  out += find_seen_header(what, path, target);
+  return out + "]";
+}
+
 auto key_less(BytesView a, BytesView b) -> bool {
   return std::ranges::lexicographical_compare(
       a, b, [](std::byte x, std::byte y) {
@@ -591,8 +686,9 @@ private:
     try {
       found = sh_.db.get(ropts(), keys_[s], out);
     } catch (const std::exception &e) {
-      sh_.fail(std::format("writer {} read-back after {}: {}", id_, op,
-                           e.what()));
+      sh_.fail(std::format("writer {} read-back after {} of '{}': {}{}", id_,
+                           op, key_str(keys_[s]), e.what(),
+                           explain_bad_offset(e.what(), keys_[s])));
       return;
     }
     if (m.state == SlotModel::State::Absent) {
@@ -1373,7 +1469,8 @@ TEST_CASE("chaos soak: concurrent readers, writers and lifecycle",
             try {
               body();
             } catch (const std::exception &e) {
-              sh.fail(std::format("thread escaped with: {}", e.what()));
+              sh.fail(std::format("thread escaped with: {}{}", e.what(),
+                                  explain_bad_offset(e.what())));
             }
           };
         };
