@@ -1021,7 +1021,7 @@ TEST_CASE("Memory: merge stress", "[radix_tree][memory]") {
         // both inputs; only merged is left.
         auto merged = Tree::merge(
             std::move(tree_a), std::move(tree_b),
-            [](const int &a, const int &) { return a; });
+            [](const int &a, const int &) noexcept { return a; });
 
         REQUIRE(merged.size() == 1000);
       }

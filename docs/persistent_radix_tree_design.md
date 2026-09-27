@@ -541,8 +541,10 @@ The structural sharing guarantee: any subtree that exists in only one input is a
 **Conflict resolution:**
 
 The `resolve` callback is only invoked on exact key conflicts (same key present in both trees). It receives the two values by `const&` and returns the winner. Common resolvers:
-- Recovery (higher LSN wins): `[](auto& a, auto& b) { return b.lsn > a.lsn ? b : a; }`
-- Prefer b: `[](auto&, auto& b) { return b; }`
+- Recovery (higher LSN wins): `[](auto& a, auto& b) noexcept { return b.lsn > a.lsn ? b : a; }`
+- Prefer b: `[](auto&, auto& b) noexcept { return b; }`
+
+`resolve` must be `noexcept`, and `merge` rejects any other resolver with a `static_assert`. The merge edits its own clones in place, and until it returns they are held by its recursion rather than by a root, so an exception out of `resolve` would leak every one of them. A resolver whose decision can fail records the failure and returns either value. The caller raises the failure once `merge` has returned, when the merged tree is an ordinary handle that frees itself. Recovery does this with `kde_newer`, which throws when two files hold the same sequence.
 
 **Use case — parallel recovery:**
 

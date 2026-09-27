@@ -599,7 +599,7 @@ template <typename A> void BM_MergeDisjoint(benchmark::State &state) {
   std::vector<std::string> ka(all.begin(), all.begin() + std::ssize(all) / 2);
   std::vector<std::string> kb(all.begin() + std::ssize(all) / 2, all.end());
   auto resolve = [](const bytecask::KeyDirEntry &,
-                    const bytecask::KeyDirEntry &b) { return b; };
+                    const bytecask::KeyDirEntry &b) noexcept { return b; };
   typename A::map_type merged;
   for (auto _ : state) {
     state.PauseTiming();
@@ -621,7 +621,7 @@ template <typename A> void BM_MergeOverlapping(benchmark::State &state) {
   std::vector<std::string> ka(all.begin(), all.begin() + quarter * 3);
   std::vector<std::string> kb(all.begin() + quarter, all.end());
   auto resolve = [](const bytecask::KeyDirEntry &,
-                    const bytecask::KeyDirEntry &b) { return b; };
+                    const bytecask::KeyDirEntry &b) noexcept { return b; };
   typename A::map_type merged;
   for (auto _ : state) {
     state.PauseTiming();
@@ -645,7 +645,7 @@ template <typename A> void BM_MergeOverlappingBinary(benchmark::State &state) {
   std::vector<std::string> ka(all.begin(), all.begin() + quarter * 3);
   std::vector<std::string> kb(all.begin() + quarter, all.end());
   auto resolve = [](const bytecask::KeyDirEntry &,
-                    const bytecask::KeyDirEntry &b) { return b; };
+                    const bytecask::KeyDirEntry &b) noexcept { return b; };
   typename A::map_type merged;
   for (auto _ : state) {
     state.PauseTiming();
@@ -669,7 +669,7 @@ template <typename A> void BM_SplitBuildMerge(benchmark::State &state) {
   std::vector<std::string> ka(all.begin(), all.begin() + std::ssize(all) / 2);
   std::vector<std::string> kb(all.begin() + std::ssize(all) / 2, all.end());
   auto resolve = [](const bytecask::KeyDirEntry &,
-                    const bytecask::KeyDirEntry &b) { return b; };
+                    const bytecask::KeyDirEntry &b) noexcept { return b; };
   for (auto _ : state) {
     auto ta = A::transient_build(ka);
     auto tb = A::transient_build(kb);
@@ -689,7 +689,7 @@ template <typename A> void BM_SplitBuildMergeOverlapping(benchmark::State &state
   std::vector<std::string> ka(all.begin(), all.begin() + mid + overlap);
   std::vector<std::string> kb(all.begin() + mid - overlap, all.end());
   auto resolve = [](const bytecask::KeyDirEntry &,
-                    const bytecask::KeyDirEntry &b) { return b; };
+                    const bytecask::KeyDirEntry &b) noexcept { return b; };
   for (auto _ : state) {
     auto ta = A::transient_build(ka);
     auto tb = A::transient_build(kb);
@@ -704,7 +704,7 @@ template <typename A> void BM_SplitBuildMergePrefixed(benchmark::State &state) {
   std::vector<std::string> ka(all.begin(), all.begin() + std::ssize(all) / 2);
   std::vector<std::string> kb(all.begin() + std::ssize(all) / 2, all.end());
   auto resolve = [](const bytecask::KeyDirEntry &,
-                    const bytecask::KeyDirEntry &b) { return b; };
+                    const bytecask::KeyDirEntry &b) noexcept { return b; };
   for (auto _ : state) {
     auto ta = A::transient_build(ka);
     auto tb = A::transient_build(kb);

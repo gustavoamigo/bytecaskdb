@@ -1419,7 +1419,7 @@ TEST_CASE("RadixTree merge disjoint trees", "[radix_tree][merge]") {
   auto b = Tree{}.set(to_bytes("banana"), 3).set(to_bytes("blueberry"), 4);
 
   auto merged =
-      Tree::merge(std::move(a), std::move(b), [](int, int r) { return r; });
+      Tree::merge(std::move(a), std::move(b), [](int, int r) noexcept { return r; });
 
   CHECK(merged.size() == 4U);
   CHECK(*merged.get(to_bytes("apple")) == 1);
@@ -1440,7 +1440,7 @@ TEST_CASE("RadixTree merge conflict resolver picks b", "[radix_tree][merge]") {
   auto b = Tree{}.set(to_bytes("key"), 2).set(to_bytes("only_b"), 20);
 
   auto merged =
-      Tree::merge(std::move(a), std::move(b), [](int, int bv) { return bv; });
+      Tree::merge(std::move(a), std::move(b), [](int, int bv) noexcept { return bv; });
 
   CHECK(merged.size() == 3U);
   CHECK(*merged.get(to_bytes("key")) == 2);   // b wins
@@ -1456,7 +1456,7 @@ TEST_CASE("RadixTree merge conflict resolver picks a", "[radix_tree][merge]") {
   auto b = Tree{}.set(to_bytes("key"), 999);
 
   auto merged =
-      Tree::merge(std::move(a), std::move(b), [](int av, int) { return av; });
+      Tree::merge(std::move(a), std::move(b), [](int av, int) noexcept { return av; });
 
   CHECK(merged.size() == 1U);
   CHECK(*merged.get(to_bytes("key")) == 100);  // a wins
@@ -1467,7 +1467,7 @@ TEST_CASE("RadixTree merge conflict resolver picks a", "[radix_tree][merge]") {
 // ---------------------------------------------------------------------------
 TEST_CASE("RadixTree merge with empty trees", "[radix_tree][merge]") {
   auto t = Tree{}.set(to_bytes("x"), 7);
-  auto resolve = [](int, int r) { return r; };
+  auto resolve = [](int, int r) noexcept { return r; };
 
   auto m1 = Tree::merge(Tree{}, std::move(t), resolve);
   CHECK(m1.size() == 1U);
@@ -1490,7 +1490,7 @@ TEST_CASE("RadixTree merge prefix relationship across trees",
   auto b = Tree{}.set(to_bytes("abcdef"), 2);
 
   auto merged =
-      Tree::merge(std::move(a), std::move(b), [](int, int r) { return r; });
+      Tree::merge(std::move(a), std::move(b), [](int, int r) noexcept { return r; });
 
   CHECK(merged.size() == 2U);
   CHECK(*merged.get(to_bytes("abc")) == 1);
@@ -1506,7 +1506,7 @@ TEST_CASE("RadixTree merge overlapping prefix split", "[radix_tree][merge]") {
   auto b = Tree{}.set(to_bytes("foo"), 99).set(to_bytes("foobaz"), 3);
 
   auto merged =
-      Tree::merge(std::move(a), std::move(b), [](int, int bv) { return bv; });
+      Tree::merge(std::move(a), std::move(b), [](int, int bv) noexcept { return bv; });
 
   CHECK(merged.size() == 3U);
   CHECK(*merged.get(to_bytes("foo")) == 99);    // b wins conflict
@@ -1522,7 +1522,7 @@ TEST_CASE("RadixTree merge result is ordered", "[radix_tree][merge]") {
   auto b = Tree{}.set(to_bytes("banana"), 2).set(to_bytes("date"), 4);
 
   auto merged =
-      Tree::merge(std::move(a), std::move(b), [](int, int r) { return r; });
+      Tree::merge(std::move(a), std::move(b), [](int, int r) noexcept { return r; });
 
   std::vector<std::string> keys;
   for (auto [k, v] : merged)
@@ -1550,7 +1550,7 @@ TEST_CASE("RadixTree merge large overlapping sets", "[radix_tree][merge]") {
   auto b = std::move(tb).persistent();
 
   auto merged =
-      Tree::merge(std::move(a), std::move(b), [](int, int bv) { return bv; });
+      Tree::merge(std::move(a), std::move(b), [](int, int bv) noexcept { return bv; });
 
   // All 500 a-keys present + 250 disjoint b-keys.
   CHECK(merged.size() == 750U);
@@ -1587,7 +1587,7 @@ TEST_CASE("RadixTree merge model-based", "[radix_tree][merge]") {
   };
 
   // Resolver: higher value wins (analogous to higher-sequence wins).
-  auto resolve = [](int av, int bv) { return bv > av ? bv : av; };
+  auto resolve = [](int av, int bv) noexcept { return bv > av ? bv : av; };
 
   // Run multiple rounds with different tree sizes.
   for (int n : {10, 100, 500, 2000}) {
@@ -2232,7 +2232,7 @@ TEST_CASE("RadixTree seek descends a wide node", "[radix_tree]") {
 }
 
 TEST_CASE("RadixTree merge walks a wide node", "[radix_tree][merge]") {
-  auto resolve = [](int, int r) { return r; };
+  auto resolve = [](int, int r) noexcept { return r; };
 
   SECTION("disjoint wide nodes on both sides") {
     // Even first bytes on the left, odd on the right: both roots reach the
@@ -2524,7 +2524,7 @@ TEST_CASE("Accounting: merge frees the input nodes it does not reuse",
     // merge consumes its inputs: whatever of theirs the result does not
     // reuse is freed at publish, and nothing is left parked.
     auto merged =
-        Tree::merge(std::move(a), std::move(b), [](int x, int) { return x; });
+        Tree::merge(std::move(a), std::move(b), [](int x, int) noexcept { return x; });
     CHECK(merged.size() == 400U);
     CHECK(a.empty());
     CHECK(b.empty());
@@ -2678,7 +2678,7 @@ TEST_CASE("Chain: retracting a dead segment of two versions",
 TEST_CASE("Chain: merge refuses an input it cannot consume",
           "[radix_tree][accounting][chain]") {
   const auto before = live_nodes();
-  auto resolve = [](int x, int) { return x; };
+  auto resolve = [](int x, int) noexcept { return x; };
   {
     auto a = build_200();
     auto b = Tree{}.set(to_bytes("other"), 1);
