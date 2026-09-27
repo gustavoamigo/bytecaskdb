@@ -309,8 +309,8 @@ jobs:
   sanitizers:
     uses: ./.github/workflows/sanitizers.yml
     with:
-      keydirs: ${{ github.event_name == 'pull_request' && '["blind"]' || '["blind", "btree", "radix"]' }}
-      sanitizers: ${{ github.event_name == 'pull_request' && '["address", "thread", "undefined"]' || '["address", "thread", "memory", "undefined"]' }}
+      keydirs: '["blind", "btree", "radix"]'
+      sanitizers: '["address", "thread", "memory", "undefined"]'
 
   # ---------------------------------------------------------------------------
   # Fuzz targets: compile-only check that the targets still build.
