@@ -385,6 +385,44 @@ auto key_str(BytesView key) -> std::string {
   return s;
 }
 
+// The error carries the header the reader decoded. Rebuilds its bytes
+// (all but the type byte) and looks for them in every data file of the
+// directory, so a read served the wrong bytes says where they came from.
+auto find_seen_header(std::string_view what,
+                      const std::filesystem::path &path, std::uint64_t target)
+    -> std::string {
+  static const std::regex re{
+      "header sequence ([0-9]+) key_size ([0-9]+) value_size ([0-9]+)"};
+  std::match_results<std::string_view::const_iterator> m;
+  if (!std::regex_search(what.begin(), what.end(), m, re)) return {};
+  std::array<unsigned char, 15> seen{};
+  const auto put = [&](std::size_t at, std::uint64_t v, int n) {
+    for (int i = 0; i < n; ++i)
+      seen[at + static_cast<std::size_t>(i)] =
+          static_cast<unsigned char>(v >> (8 * i));
+  };
+  put(0, std::stoull(m[1].str()), 8);
+  put(9, std::stoull(m[2].str()), 2);
+  put(11, std::stoull(m[3].str()), 4);
+  std::string out;
+  std::error_code ec;
+  for (const auto &de :
+       std::filesystem::directory_iterator{path.parent_path(), ec}) {
+    std::ifstream f{de.path(), std::ios::binary};
+    const std::vector<unsigned char> b{std::istreambuf_iterator<char>{f}, {}};
+    for (std::size_t at = 0; at + 15 <= b.size(); ++at) {
+      if (std::memcmp(&b[at], seen.data(), 8) != 0 ||
+          std::memcmp(&b[at + 9], &seen[9], 6) != 0)
+        continue;
+      out += std::format("; seen header found in {} at {} (target {}{:+})",
+                         de.path().filename().string(), at, target,
+                         static_cast<std::int64_t>(at) -
+                             static_cast<std::int64_t>(target));
+    }
+  }
+  return out.empty() ? "; seen header found in no file" : out;
+}
+
 // When a read fails with "record extends past the end: '<file>' offset N
 // ...", walks the named data file with the on-disk layout (15-byte header:
 // sequence u64, type u8, key_size u16, value_size u32; then key, value,
@@ -433,9 +471,10 @@ auto explain_bad_offset(std::string_view what, BytesView key = {})
     pos += total;
     ++records;
   }
-  out += std::format("; walk stopped at {} after {} records{}]", pos, records,
+  out += std::format("; walk stopped at {} after {} records{}", pos, records,
                      covered ? "" : ", no record covers the offset");
-  return out;
+  out += find_seen_header(what, path, target);
+  return out + "]";
 }
 
 auto key_less(BytesView a, BytesView b) -> bool {
