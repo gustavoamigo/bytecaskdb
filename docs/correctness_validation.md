@@ -1345,6 +1345,12 @@ Run: `scripts/run_sanitizer.sh thread` (or `address` for ASan, `memory` for MSan
 
 The full test suite runs clean under Clang MemorySanitizer with
 `-fsanitize-memory-track-origins=2` (full allocation-site origin tracking).
+The MSan build is compiled at `-O1` with `-fno-omit-frame-pointer
+-fno-optimize-sibling-calls`, over the debug mode's `-O0`: MSan is meant to
+run optimized, and at `-O0` every local goes through instrumented memory. The
+two flags keep report stacks whole. Origin tracking stays at level 2, because
+its cost is small next to `-O0`'s and it is what points a report at the store
+that left the value uninitialized.
 MSan instruments every load at compile time and reports a use of any value
 that hasn't been written, catching bugs ASan and TSan don't: reads of
 uninitialized stack or heap memory that happen to produce a plausible-looking
@@ -1395,7 +1401,9 @@ MSan test step the slowest of the three and by far the least predictable
 for ASan and TSan; per-job runners vary by ~1.8x and the seeded `[model]`
 workloads account for much of the rest), so it is excluded from the
 `pull_request` matrix and runs on push to `main`, nightly, and on
-`workflow_dispatch`.
+`workflow_dispatch`. The job times out after two hours rather than GitHub's
+six, and the test run prints `--durations`, so a stalled run fails early and
+its log names the last test that finished.
 
 ### Sanitizer matrix across key directories
 
