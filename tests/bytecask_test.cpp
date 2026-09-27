@@ -1455,6 +1455,35 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
   }
 }
 
+TEST_CASE("DB read: a record past the end of its file names the file, the "
+          "offset and the header",
+          "[bytecask][corruption]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  const bytecask::Options opts{.max_file_bytes = 100};
+  {
+    auto db = bytecask::DB::open(dir, opts);
+    for (int i = 0; i < 14; ++i)
+      db.put({.sync = true}, to_bytes(std::format("k{:x}", i)),
+             to_bytes(std::format("v{:x}", i)));
+  }
+  const auto files = data_files_by_sequence(dir);
+  // k1's value_size, in the oldest file, which has a hint and is read, not
+  // scanned.
+  write_at(files[0], kEntry + 11, "\xff\xff\xff\x7f");
+  try {
+    auto db = bytecask::DB::open(dir, opts);
+    FAIL("open read a record running past the end of its file");
+  } catch (const std::runtime_error &e) {
+    const std::string what = e.what();
+    INFO(what);
+    CHECK(what.find("record extends past the end") != std::string::npos);
+    CHECK(what.find(files[0].filename().string()) != std::string::npos);
+    CHECK(what.find(std::format("offset {}", kEntry)) != std::string::npos);
+    CHECK(what.find("value_size 2147483647") != std::string::npos);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Damage in a sealed file is detected and refused, never trimmed around. The
 // scan vacuum copies a sealed file with stops by throwing: if the first entry

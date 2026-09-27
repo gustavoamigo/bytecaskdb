@@ -4694,8 +4694,9 @@ auto tail_is_zero(const DataFile &file, Offset end) -> bool {
 // Only the file written last can hold a record a crash tore: every other
 // file was fdatasync'd whole before it was sealed. So past a hint-less file's
 // last committed record there may be:
-// - nothing but zeros: the preallocated tail, of the active file or of a
-//   sealed one whose truncate at seal a power loss undid. It goes.
+// - nothing but zeros: the preallocated tail of the active file. Sealing
+//   truncates it and syncs the truncate, so a sealed file carries one only
+//   if an earlier build left it. It goes either way.
 // - anything else, in the file written last: a torn write, which was never
 //   acknowledged durable. It goes, as PostgreSQL and RocksDB truncate their
 //   log at the first bad record. Damage there is indistinguishable and goes

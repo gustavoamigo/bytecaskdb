@@ -3,8 +3,8 @@
 # key directory (BYTECASK_KEYDIR).
 #
 # ci.yml calls this workflow and picks the matrix: ASan, TSan and UBSan on the
-# default blind tree for a PR, the full keydir x sanitizer matrix on push to
-# main. The schedule below runs the full matrix nightly. Twelve jobs is too
+# default blind tree, for a PR and for the push to main that merges it. The
+# schedule below runs the full keydir x sanitizer matrix nightly. Twelve jobs is too
 # slow for PR feedback, and the two other trees share their inner nodes and
 # BuildSession with the default, so shared-code bugs already surface in the
 # PR run.

@@ -74,6 +74,9 @@ jobs:
           # halt_on_error: the first race ends the run with its report on
           # top, instead of 25 minutes of follow-on noise.
           TSAN_OPTIONS: ${{ matrix.sanitizer == 'thread' && 'halt_on_error=1 history_size=4' || '' }}
+          # A failed epoch's directory stays on disk and goes into the
+          # artifact below, so its data files can be inspected.
+          BYTECASK_SOAK_KEEP: "1"
         run: |
           set -o pipefail
           build/linux/x86_64/debug/bytecask_tests "[soak]" 2>&1 | tee soak.log
@@ -83,5 +86,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: soak-${{ matrix.sanitizer }}-log
-          path: soak.log
+          path: |
+            soak.log
+            /tmp/bc_soak_*
           if-no-files-found: ignore
