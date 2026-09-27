@@ -1,8 +1,8 @@
 # Unsynced commits: one sleep, and less work under the lock
 
-Status: proposal, for review before implementation. Built on
-`docs/write_path_investigation.md`, which has the measurements; its targets
-are numbered T1–T4 below.
+Status: D1 and D3 implemented; D2 and D4 implemented, measured and not
+shipped (see *Results*). Built on `docs/write_path_investigation.md`, which
+has the measurements; its targets are numbered T1–T4 below.
 
 ## Problem
 
@@ -46,6 +46,8 @@ exactly as measured. Nothing about ordering changes: settling only delays
 capturing the head.
 
 ### D2 — Publication that only moves forward; the leader publishes an unsynced batch (T3)
+
+*Not shipped* — measured within noise; see *Results*.
 
 **The rule.** A leader whose batch appended only unsynced writes makes it
 visible and returns. Its callers asked for visibility, not durability, so
@@ -160,6 +162,11 @@ place a key and keep today's code. Point writes only; range deletes and
 range guards keep today's checks.
 
 ### D4 — Publish the state without the global mutex pool (T4; D2's foundation)
+
+*Not shipped.* `std::atomic<std::shared_ptr>` is not available in libc++, so
+the version built mirrored the published `next_seq` and `durable_seq` into
+two atomics that `commit_wait` read instead. It measured neutral (see
+*Results*).
 
 Replace `std::atomic_load`/`std::atomic_store` on `std::shared_ptr` for
 `state_` and `head_` with `std::atomic<std::shared_ptr<EngineState>>`
@@ -295,6 +302,48 @@ Expected, from the investigation: D1 alone about +19% on `oltp_write_only`
 at 16 threads. D2 and D3 are not measured in isolation yet; D3's ceiling is
 the serial work it removes — the snapshot-side validation (~a fifth of the
 section) plus the update and erase reads.
+
+## Results
+
+Measured on the machine of the investigation (Ryzen 7 3700X, SATA SSD),
+each step a commit, with #202 and #197 applied for the harness. sysbench
+`--profile=fast`, 60 s after 30 s of warm-up; HammerDB 70 warehouses, 14
+users. One run each: steps meant to change nothing moved up to ±2.5%.
+
+| Step (transactions/s; NOPM) | write_only 1t | write_only 16t | insert 1t | insert 16t | HammerDB |
+|---|---:|---:|---:|---:|---:|
+| base (`d2f62c9c`) | 6,033 | 21,544 | 22,172 | 57,557 | 198,497 |
+| + D1 | 6,085 | 25,558 | 21,831 | 71,143 | 202,685 |
+| + D4 | 6,050 | 25,450 | 21,887 | 70,465 | 202,911 |
+| + D2a (forward-only publish) | 6,078 | 24,888 | 21,316 | 70,730 | 201,523 |
+| + D2b (leader publishes) | 6,159 | 25,650 | 21,223 | 71,708 | 203,711 |
+| + D3 | 6,197 | 28,358 | 21,929 | 71,338 | 218,757 |
+| **D1 + D3 only (this branch)** | 6,220 | **28,318** | 22,056 | **70,490** | **220,016** |
+| InnoDB, `flush_log_at_trx_commit = 2` | 5,816 | 27,742 | 21,175 | 67,636 | |
+
+D1 and D3 carry the gain: `oltp_write_only` at 16 clients +31%, `oltp_insert`
++22%, both now ahead of InnoDB, HammerDB +11%. D4 and D2a were neutral, as
+intended of a foundation and a refactor; D2b added 1–3%, within noise — with
+the settle gone `commit_wait` is already ~3 µs at the median, so the second
+sleep D2b removes is short. The concurrency D2 adds (two publishers, a
+compare-and-swap publication) is not worth that; D4, measured on its own,
+also slowed synced puts at 8 threads by ~11% until a follow-up fixed it.
+
+`engine_bench`, speed-up over base, mean of two alternating runs, 50,000
+keys:
+
+| | D1 + D3 | with D2 and D4 too |
+|---|---:|---:|
+| `CasMT/NoSync`, 2 / 8 / 32 threads | 1.57× / 1.28× / 1.54× | 1.65× / 1.27× / 1.56× |
+| `PutMT/PeriodicSync`, 2 / 8 / 32 / 64 threads | 1.33× / 1.08× / 0.91× / 1.16× | 1.40× / 1.15× / 0.97× / 1.21× |
+
+At 32 threads `PeriodicSync` is noisy: an earlier pair of runs had D3 at
+1.15× base. Synced puts are level from base to D3 in isolation (2 and 8
+threads, every commit in between). A full-suite run is not a fair
+comparison for them: their `fdatasync` latency depends on the writeback the
+benchmarks before them leave, and it swung 3× between two full runs of the
+same code. Unsynced plain puts at 8 threads — 0.44× RocksDB in the
+investigation — gain only ~8%: they carry no snapshot for D3 to use.
 
 ## Rollout
 
