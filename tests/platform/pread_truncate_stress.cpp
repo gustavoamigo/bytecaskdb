@@ -5,7 +5,7 @@
 // Every record's bytes are a function of (file, offset), so a read that
 // returns anything else is caught and reported. Exit 1 on the first bad read.
 //
-//   clang++ -std=c++20 -O2 -pthread tests/pread_truncate_stress.cpp
+//   clang++ -std=c++20 -O2 -pthread tests/platform/pread_truncate_stress.cpp
 //   ./a.out <dir> <seconds> [no-zero-fill] [zero-fill-4k] [no-sync]
 #include <fcntl.h>
 #include <unistd.h>

@@ -61,7 +61,7 @@ jobs:
           uname -a
           df -T /tmp
           df -T "$GITHUB_WORKSPACE"
-          clang++ -std=c++20 -O2 -pthread tests/pread_truncate_stress.cpp -o /tmp/prs
+          clang++ -std=c++20 -O2 -pthread tests/platform/pread_truncate_stress.cpp -o /tmp/prs
           status=0
           for d in /tmp/prs_dir "$GITHUB_WORKSPACE/prs_dir"; do
             for v in "" zero-fill-4k no-zero-fill no-sync; do
