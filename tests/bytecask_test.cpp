@@ -5395,7 +5395,6 @@ TEST_CASE("resume() recovers from degraded state", "[degraded][resume]") {
 // later depends on is followed by a sync of its directory. Each site passes
 // its own fault injection checkpoint to sync_directory, so failing a site's
 // sync shows the site still calls it, and that nothing it guards goes ahead.
-// None of this loses power; that the sync is needed is POSIX's argument.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("directory sync: a failed sync at rotation degrades before the new "

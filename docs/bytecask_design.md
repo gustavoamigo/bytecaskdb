@@ -1159,7 +1159,7 @@ Unlinks are not synced. A lost unlink brings back a file the engine already hand
 
 A filesystem that cannot sync a directory returns `EINVAL`, which is taken as done, as PostgreSQL does. The WASM build has nothing to sync. The rotation sync runs under the write path, once per `max_file_bytes`, where rotation already waits on the hint backlog; the commit path does not change.
 
-On ext4 and XFS, metadata is journaled in order, so none of these entries is likely to be lost without the sync. The engine does not depend on that. Each site passes its own fault injection checkpoint to `sync_directory` (`io_dir_sync_*`), and the `[dir_sync]` tests fail each one: none of them can show the sync is needed, since no test loses power, but each shows its site still syncs, and that nothing the sync guards goes ahead when it fails.
+On ext4 and XFS, metadata is journaled in order, so none of these entries is likely to be lost without the sync. The engine does not depend on that. Each site passes its own fault injection checkpoint to `sync_directory` (`io_dir_sync_*`), and the `[dir_sync]` tests fail each one: each shows its site still syncs, and that nothing the sync guards goes ahead when it fails.
 
 ### Module Plan
 
