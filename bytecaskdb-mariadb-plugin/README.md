@@ -254,12 +254,31 @@ HammerDB is not packaged by most distributions. Unpack a release tarball from
 <https://github.com/TPC-Council/HammerDB/releases> into `~/HammerDB-<version>`,
 or pass `--hammerdb-home`.
 
+Both benchmark scripts take `--profile=acid` (default) or `--profile=fast`.
+`fast` starts each engine with `<engine>-fast.cnf` instead of `<engine>.cnf`, a
+complete configuration of its own. In all three a commit survives a mariadbd
+crash but not an OS crash: InnoDB `innodb_flush_log_at_trx_commit = 2` with
+the doublewrite buffer off, ByteCaskDB `bytecaskdb_sync = AT_INTERVAL`, MyRocks
+`rocksdb_flush_log_at_trx_commit = 2`. The InnoDB and ByteCaskDB files are
+also tuned for TPROC-C throughput on a 31 GiB host (16 GiB caches, buffered
+I/O, and for InnoDB a 4 GiB redo log); each file's header says what it changes
+and why. Use `fast` to compare against published results that relax
+durability. Each CSV row records its profile.
+
 TPROC-C contends on a few hot rows: every Payment updates its warehouse row,
 and every New-Order increments a district's next order id. InnoDB makes those
 transactions wait for each other. ByteCaskDB aborts all but one of them at
 `COMMIT` with 1213, and HammerDB drops the aborted transaction and starts the
 next one. NOPM counts only committed new orders. The `aborts` column counts the
 dropped transactions.
+
+The script runs HammerDB with `maria_allwarehouse = true`: each virtual user
+works a fixed set of warehouses, and the sets are disjoint when the warehouse
+count is a multiple of the virtual-user count (the script warns otherwise).
+HammerDB's default, a random home warehouse per user, draws correlated values:
+in HammerDB 6.0, 8 users on 70 warehouses formed three pairs sharing a
+warehouse in every trial, so users contended on the same rows regardless of
+the warehouse count.
 
 ```bash
 # 20 warehouses, 16 virtual users, 2 min ramp-up, 5 min measured (defaults)
