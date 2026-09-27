@@ -6,7 +6,7 @@
 // returns anything else is caught and reported. Exit 1 on the first bad read.
 //
 //   clang++ -std=c++20 -O2 -pthread tests/pread_truncate_stress.cpp
-//   ./a.out <dir> <seconds> [no-zero-fill] [no-sync]
+//   ./a.out <dir> <seconds> [no-zero-fill] [zero-fill-4k] [no-sync]
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
@@ -37,7 +38,14 @@ auto byte_at(std::uint32_t file, std::uint64_t offset) -> unsigned char {
   return static_cast<unsigned char>(x | 1);  // never 0, unlike the zero fill
 }
 
+// Closed by the last holder, so a reader never preads a reused descriptor.
 struct File {
+  File() = default;
+  File(const File &) = delete;
+  auto operator=(const File &) -> File & = delete;
+  ~File() {
+    if (fd != -1) ::close(fd);
+  }
   std::uint32_t id{0};
   int fd{-1};
   std::atomic<std::uint64_t> end{0};  // published: bytes below it are written
@@ -45,7 +53,7 @@ struct File {
 };
 
 std::mutex files_mu;
-std::vector<File *> files;  // newest last; readers copy under files_mu
+std::vector<std::shared_ptr<File>> files;  // newest last; copied under files_mu
 std::atomic<bool> stop{false};
 std::atomic<std::uint64_t> reads{0};
 
@@ -84,7 +92,7 @@ void fail(const File &f, std::uint64_t off, std::size_t len,
 void reader(unsigned seed) {
   std::mt19937_64 rng{seed};
   std::vector<unsigned char> buf;
-  std::vector<File *> snap;
+  std::vector<std::shared_ptr<File>> snap;
   while (!stop.load(std::memory_order_relaxed)) {
     {
       std::lock_guard<std::mutex> lk{files_mu};
@@ -93,8 +101,8 @@ void reader(unsigned seed) {
     if (snap.empty()) continue;
     // Mostly the active file's newest record, as the engine's readers do
     // right after a put; sometimes a file sealed just before it.
-    auto *f = snap[snap.size() - 1 -
-                   (rng() % 4 == 0 ? rng() % snap.size() : 0)];
+    const auto &f = snap[snap.size() - 1 -
+                         (rng() % 4 == 0 ? rng() % snap.size() : 0)];
     const auto last = f->last.load(std::memory_order_acquire);
     const auto end = f->end.load(std::memory_order_acquire);
     if (end == 0) continue;
@@ -120,16 +128,18 @@ void reader(unsigned seed) {
 
 int main(int argc, char **argv) {
   if (argc < 3) {
-    std::fprintf(stderr, "usage: %s <dir> <seconds> [no-zero-fill] [no-sync]\n",
+    std::fprintf(stderr, "usage: %s <dir> <seconds> [no-zero-fill] [zero-fill-4k] [no-sync]\n",
                  argv[0]);
     return 2;
   }
   const std::string dir = argv[1];
   const auto seconds = std::atoi(argv[2]);
   bool zero_fill = true;
+  bool zero_fill_4k = false;
   bool sync = true;
   for (int i = 3; i < argc; ++i) {
     if (std::string{argv[i]} == "no-zero-fill") zero_fill = false;
+    if (std::string{argv[i]} == "zero-fill-4k") zero_fill_4k = true;
     if (std::string{argv[i]} == "no-sync") sync = false;
   }
   std::vector<std::thread> readers;
@@ -141,26 +151,27 @@ int main(int argc, char **argv) {
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds{seconds};
   std::uint32_t next_id = 1;
-  std::vector<File *> retired;
   while (std::chrono::steady_clock::now() < deadline) {
-    auto *f = new File{};
+    auto f = std::make_shared<File>();
     f->id = next_id++;
     const auto path = dir + "/f" + std::to_string(f->id) + ".data";
     f->fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
     if (f->fd < 0) { std::perror("open"); return 2; }
     ::posix_fadvise(f->fd, 0, 0, POSIX_FADV_RANDOM);
-    if (zero_fill && ::pwrite(f->fd, zeros.data(), kCapacity, 0) !=
-                         static_cast<ssize_t>(kCapacity)) {
-      std::perror("zero fill");
-      return 2;
+    // One write of the whole capacity, as ensure_zeroed does, or one page
+    // per write.
+    const auto piece = zero_fill_4k ? kPage : kCapacity;
+    for (std::size_t at = 0; zero_fill && at < kCapacity; at += piece) {
+      if (::pwrite(f->fd, zeros.data(), piece, static_cast<off_t>(at)) !=
+          static_cast<ssize_t>(piece)) {
+        std::perror("zero fill");
+        return 2;
+      }
     }
     {
       std::lock_guard<std::mutex> lk{files_mu};
       files.push_back(f);
-      if (files.size() > kOpenFiles) {
-        retired.push_back(files.front());
-        files.erase(files.begin());
-      }
+      if (files.size() > kOpenFiles) files.erase(files.begin());
     }
     // Sealed at 10–100 KiB, as resume() and small max_file_bytes seal.
     const auto seal_at = 10 * 1024 + rng() % (90 * 1024);
@@ -186,7 +197,7 @@ int main(int argc, char **argv) {
       return 2;
     }
     if (sync) ::fdatasync(f->fd);
-    // Retired files stay open (readers may hold them) but are unlinked.
+    // A file past the readers' set is unlinked; the last reader closes it.
     ::unlink((dir + "/f" + std::to_string(f->id - kOpenFiles) + ".data").c_str());
   }
   stop = true;
