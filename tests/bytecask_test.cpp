@@ -9093,6 +9093,7 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.file_rotations",
       "bytecask.fsyncs",
       "bytecask.commit_wait_blocked",
+      "bytecask.flush_settles",
       "bytecask.disk_reads",
       "bytecask.disk_read_bytes",
       "bytecask.pool_hits",
@@ -10273,6 +10274,58 @@ TEST_CASE("pipeline: sync-only writes under concurrent unsynced writers",
   const auto st = db.engine_state();
   CHECK(st->durable_seq >= st->sync_requested_seq);
   CHECK(st->durable_seq == st->next_seq - 1);
+}
+
+namespace {
+struct SettleCase {
+  bool w1_sync;  // the writer whose flush is observed
+  bool w2_sync;  // a writer still in stage 1 during that flush
+  bool settles;
+};
+}  // namespace
+
+// A flush waits for writers still in stage 1 only when it will fdatasync:
+// then they share it. An unsynced flush has nothing to share, so it
+// publishes at once instead of waiting out kFlushSettleMax.
+TEST_CASE("pipeline: a flush settles for writers in stage 1 only when it "
+          "owes an fdatasync", "[pipeline][concurrency]") {
+  const auto c = GENERATE(SettleCase{false, false, false},  // nothing owed
+                          SettleCase{false, true, true},    // W2 will owe
+                          SettleCase{true, false, true});   // W1 owes
+  CAPTURE(c.w1_sync, c.w2_sync);
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("seed"), to_bytes("s"));
+  const auto settles_before = db.stats().at("bytecask.flush_settles");
+
+  // W1 appends and parks before its flush; W2 is elected leader and parks
+  // in stage 1. W1 is then released to flush with W2 still in the group.
+  FlushGate before_wait;
+  FlushGate leading;
+  db.test_before_commit_wait_ = before_wait.hook();
+  std::optional<bytecask::CommitResult> r1;
+  std::optional<bytecask::CommitResult> r2;
+  std::thread t1([&] { r1 = db.put({.sync = c.w1_sync}, to_bytes("k1"), to_bytes("v1")); });
+  before_wait.wait_in_flush();
+  db.test_write_group().on_leader_start_ = leading.hook();
+  std::thread t2([&] { r2 = db.put({.sync = c.w2_sync}, to_bytes("k2"), to_bytes("v2")); });
+  leading.wait_in_flush();
+
+  before_wait.open();
+  t1.join();  // returns while W2 is still held in stage 1
+  CHECK(db.stats().at("bytecask.flush_settles") - settles_before ==
+        (c.settles ? 1 : 0));
+  CHECK(db.contains_key({}, to_bytes("k1")));
+  CHECK_FALSE(db.contains_key({}, to_bytes("k2")));
+
+  leading.open();
+  t2.join();
+  db.test_before_commit_wait_ = nullptr;
+  db.test_write_group().on_leader_start_ = nullptr;
+  REQUIRE(r1.has_value());
+  REQUIRE(r2.has_value());
+  CHECK(db.contains_key({}, to_bytes("k2")));
+  CHECK(r1->durable == c.w1_sync);
 }
 
 TEST_CASE("pipeline: sync write is invisible until its fdatasync returns; a "

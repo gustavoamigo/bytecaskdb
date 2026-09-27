@@ -3124,13 +3124,26 @@ void DB::flush_once() {
   // running leader would be blocked on it and busy() could never clear.
   // Bounded so a stalled leader cannot hold the disk; the bound only binds
   // under continuous arrivals, where it is ~8% of a flush.
+  //
+  // Only a flush that will fdatasync settles: one the head already owes, or
+  // one a synced writer still in stage 1 will need. An unsynced flush has
+  // no fdatasync to share, and settling would only delay its publication —
+  // under continuous unsynced writers, by the whole bound on every flush
+  // (docs/write_path_investigation.md: +19% oltp_write_only without it).
   {
+    const auto owes_sync = [&] {
+      return write_group_.sync_busy() ||
+             load_head()->sync_requested_seq > load_state()->durable_seq;
+    };
     const auto deadline =
         std::chrono::steady_clock::now() + kFlushSettleMax;
-    while (write_group_.busy()
+    bool settled = false;
+    while (write_group_.busy() && owes_sync()
            && std::chrono::steady_clock::now() < deadline) {
+      settled = true;
       std::this_thread::yield();
     }
+    if (settled) counters_.flush_settles.fetch_add(1, std::memory_order_relaxed);
   }
   flush_pending();
   finish_flush();
@@ -3893,6 +3906,8 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.fsyncs.load(std::memory_order_relaxed)},
       {"bytecask.commit_wait_blocked",
        counters_.commit_wait_blocked.load(std::memory_order_relaxed)},
+      {"bytecask.flush_settles",
+       counters_.flush_settles.load(std::memory_order_relaxed)},
       {"bytecask.disk_reads",
        counters_.disk_reads.load()},
       {"bytecask.disk_read_bytes",
