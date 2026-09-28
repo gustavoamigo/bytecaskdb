@@ -45,6 +45,9 @@ module;
 #include <vector>
 
 export module bytecask;
+#ifndef BYTECASK_EXP_REUSE_BUFFERS
+#define BYTECASK_EXP_REUSE_BUFFERS 0
+#endif
 #ifndef BYTECASK_EXP_SKIP_INSERT_WW
 #define BYTECASK_EXP_SKIP_INSERT_WW 0
 #endif
@@ -2895,7 +2898,15 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
 
   // Pre-compute offsets from running_offset (tracks the file position
   // across all slots in the group, without actual I/O).
+#if BYTECASK_EXP_REUSE_BUFFERS
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+  thread_local std::vector<std::uint64_t> offsets;
+#pragma clang diagnostic pop
+  offsets.resize(entries.size());
+#else
   std::vector<std::uint64_t> offsets(entries.size());
+#endif
   for (std::size_t i = 0; i < entries.size(); ++i) {
     offsets[i] = running_offset;
     running_offset += entry_size(entries[i].key.size(),
@@ -2952,7 +2963,15 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
   auto &file = t.active_file();
   auto initial_offset = static_cast<std::uint64_t>(file.size());
   auto running_offset = initial_offset;
+#if BYTECASK_EXP_REUSE_BUFFERS
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+  thread_local std::vector<DataEntryView> all_entries;
+#pragma clang diagnostic pop
+  all_entries.clear();
+#else
   std::vector<DataEntryView> all_entries;
+#endif
   auto any_sync = false;
 
   // Phase 1: pure in-memory — validate, prepare, pre-compute offsets,
@@ -2999,7 +3018,15 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
   const auto batch_max_seq = t.next_seq() - 1;
 
   // Phase 2: one I/O call for all collected entries.
+#if BYTECASK_EXP_REUSE_BUFFERS
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+  thread_local std::vector<std::uint64_t> io_offsets;
+#pragma clang diagnostic pop
+  io_offsets.resize(all_entries.size());
+#else
   std::vector<std::uint64_t> io_offsets(all_entries.size());
+#endif
   try {
     const auto t_app = exp_now_ns();
     file.append_entries(all_entries, io_offsets);

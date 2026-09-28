@@ -183,7 +183,7 @@ end
 
 -- EXPERIMENT toggles (branch exp/commit-probe only), applied to every target
 -- so the MariaDB plugin's libbytecask.a gets them too.
-for _, d in ipairs({"BYTECASK_EXP_TARGETED_WAKE", "BYTECASK_EXP_SKIP_INSERT_WW", "BYTECASK_EXP_COMMITTER", "BYTECASK_EXP_COMMITTER_SPIN_US"}) do
+for _, d in ipairs({"BYTECASK_EXP_TARGETED_WAKE", "BYTECASK_EXP_SKIP_INSERT_WW", "BYTECASK_EXP_COMMITTER", "BYTECASK_EXP_COMMITTER_SPIN_US", "BYTECASK_EXP_REUSE_BUFFERS", "BYTECASK_EXP_NODE_POOL"}) do
     if os.getenv(d) then add_defines(d .. "=" .. os.getenv(d)) end
 end
 

@@ -18,7 +18,9 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <array>
 #include <iterator>
+#include <mutex>
 #include <memory>
 #include <new>
 #include <optional>
@@ -31,6 +33,60 @@ module;
 
 export module bytecask.btree;
 import bytecask.version_chain;
+
+#ifndef BYTECASK_EXP_NODE_POOL
+#define BYTECASK_EXP_NODE_POOL 0
+#endif
+
+// EXPERIMENT: recycles node memory by exact capacity. Any thread frees into a
+// shared list; an allocating thread takes the whole list when its own cache
+// runs dry. Capped so a burst of frees cannot pin memory forever.
+namespace bytecask::node_pool {
+inline constexpr std::size_t kClasses = 4096 / 16 + 1;
+inline constexpr std::size_t kMaxShared = 1u << 20;
+struct Shared {
+  std::mutex mu;
+  std::vector<void *> free;
+};
+inline auto shared(std::size_t cls) -> Shared & {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+#pragma clang diagnostic ignored "-Wglobal-constructors"
+  static std::array<Shared, kClasses> pools;
+#pragma clang diagnostic pop
+  return pools[cls];
+}
+inline auto get(std::size_t capacity) -> void * {
+  const auto cls = capacity / 16;
+  if (cls >= kClasses) return ::operator new(capacity);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+  thread_local std::array<std::vector<void *>, kClasses> local;
+#pragma clang diagnostic pop
+  auto &l = local[cls];
+  if (l.empty()) {
+    auto &s = shared(cls);
+    std::lock_guard<std::mutex> lk{s.mu};
+    l.swap(s.free);
+  }
+  if (l.empty()) return ::operator new(capacity);
+  auto *p = l.back();
+  l.pop_back();
+  return p;
+}
+inline void put(void *p, std::size_t capacity) {
+  const auto cls = capacity / 16;
+  if (cls < kClasses) {
+    auto &s = shared(cls);
+    std::lock_guard<std::mutex> lk{s.mu};
+    if (s.free.size() < kMaxShared) {
+      s.free.push_back(p);
+      return;
+    }
+  }
+  ::operator delete(p);
+}
+} // namespace bytecask::node_pool
 
 namespace bytecask {
 
@@ -265,7 +321,11 @@ export template <typename V> struct Node {
       -> Node * {
     const auto needed = slots_offset_for(pre.size());
     const auto capacity = align_up(std::max(min_capacity, needed), 16);
+#if BYTECASK_EXP_NODE_POOL
+    auto *mem = static_cast<std::byte *>(node_pool::get(capacity));
+#else
     auto *mem = static_cast<std::byte *>(::operator new(capacity));
+#endif
     auto *n = new (mem) Node{};
     n->tag = session_tag;
     n->capacity = static_cast<std::uint32_t>(capacity);
@@ -287,8 +347,14 @@ export template <typename V> struct Node {
           std::destroy_at(n->template payload<V>(i));
       }
     }
+#if BYTECASK_EXP_NODE_POOL
+    const std::size_t cap = n->capacity;
+    n->~Node();
+    node_pool::put(static_cast<void *>(n), cap);
+#else
     n->~Node();
     ::operator delete(static_cast<void *>(n));
+#endif
     account_free<V>();
   }
 
