@@ -1671,6 +1671,7 @@ When the write set contains exactly one operation, `apply_batch` skips the `Bulk
 | `bytecask.bytes_written` | Write | On-disk bytes appended (header + key + value + CRC) |
 | `bytecask.group_writer_batches` | Write | `execute_slots()` calls (one per batch) |
 | `bytecask.group_writer_coalesced` | Write | Total writers coalesced across all batches |
+| `bytecask.group_writer_busy_us` | Write | Wall time `execute_slots()` held `write_mu_`, in microseconds: the serial section every write passes through. Over elapsed time, how busy it is; over `group_writer_coalesced`, its cost per write. When it nears 100%, write throughput is `1 / cost per write` whatever the thread count |
 | `bytecask.file_rotations` | Write | Active file rotations |
 | `bytecask.fsyncs` | Write | `fdatasync` calls |
 | `bytecask.disk_reads` | Read | `pread` calls from `get()` |
