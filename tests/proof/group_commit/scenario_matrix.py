@@ -44,7 +44,7 @@ class GroupFailureClass(Enum):
 class GroupShape:
     label: str
     # Writers in the batch, the leader included. The leader blocks in
-    # on_leader_start_ until this many slots are queued, so the batch shape is
+    # on_batch_start_ until this many slots are queued, so the batch shape is
     # deterministic rather than raced for.
     group_size: int
     # Each writer submits a 2-op plan, so the group's combined append carries a

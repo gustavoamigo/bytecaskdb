@@ -62,12 +62,12 @@ TEST_CASE("prove_group__group_of_2__success", "[prove_group][concurrency]") {
     auto db = bytecask::DB::open(dir);
 
     // Force exactly 2 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -107,7 +107,7 @@ TEST_CASE("prove_group__group_of_2__success", "[prove_group][concurrency]") {
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -146,12 +146,12 @@ TEST_CASE("prove_group__group_of_2__group_append_fails", "[prove_group][concurre
     auto db = bytecask::DB::open(dir);
 
     // Force exactly 2 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -194,7 +194,7 @@ TEST_CASE("prove_group__group_of_2__group_append_fails", "[prove_group][concurre
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -228,12 +228,12 @@ TEST_CASE("prove_group__group_of_2__group_append_partial_write", "[prove_group][
     auto db = bytecask::DB::open(dir);
 
     // Force exactly 2 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -278,7 +278,7 @@ TEST_CASE("prove_group__group_of_2__group_append_partial_write", "[prove_group][
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -312,12 +312,12 @@ TEST_CASE("prove_group__group_of_2__group_commit_sync_fails", "[prove_group][con
     auto db = bytecask::DB::open(dir);
 
     // Force exactly 2 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -365,7 +365,7 @@ TEST_CASE("prove_group__group_of_2__group_commit_sync_fails", "[prove_group][con
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -399,12 +399,12 @@ TEST_CASE("prove_group__group_of_4__success", "[prove_group][concurrency]") {
     auto db = bytecask::DB::open(dir);
 
     // Force exactly 4 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -444,7 +444,7 @@ TEST_CASE("prove_group__group_of_4__success", "[prove_group][concurrency]") {
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -483,12 +483,12 @@ TEST_CASE("prove_group__group_of_4__group_append_fails", "[prove_group][concurre
     auto db = bytecask::DB::open(dir);
 
     // Force exactly 4 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -531,7 +531,7 @@ TEST_CASE("prove_group__group_of_4__group_append_fails", "[prove_group][concurre
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -565,12 +565,12 @@ TEST_CASE("prove_group__group_of_4__group_append_partial_write", "[prove_group][
     auto db = bytecask::DB::open(dir);
 
     // Force exactly 4 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -615,7 +615,7 @@ TEST_CASE("prove_group__group_of_4__group_append_partial_write", "[prove_group][
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -649,12 +649,12 @@ TEST_CASE("prove_group__group_of_4__group_commit_sync_fails", "[prove_group][con
     auto db = bytecask::DB::open(dir);
 
     // Force exactly 4 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -702,7 +702,7 @@ TEST_CASE("prove_group__group_of_4__group_commit_sync_fails", "[prove_group][con
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -736,12 +736,12 @@ TEST_CASE("prove_group__group_of_2_batched__success", "[prove_group][concurrency
     auto db = bytecask::DB::open(dir);
 
     // Force exactly 2 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -782,7 +782,7 @@ TEST_CASE("prove_group__group_of_2_batched__success", "[prove_group][concurrency
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -822,12 +822,12 @@ TEST_CASE("prove_group__group_of_2_batched__group_append_fails", "[prove_group][
     auto db = bytecask::DB::open(dir);
 
     // Force exactly 2 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -871,7 +871,7 @@ TEST_CASE("prove_group__group_of_2_batched__group_append_fails", "[prove_group][
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -906,12 +906,12 @@ TEST_CASE("prove_group__group_of_2_batched__group_append_partial_write", "[prove
     auto db = bytecask::DB::open(dir);
 
     // Force exactly 2 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -957,7 +957,7 @@ TEST_CASE("prove_group__group_of_2_batched__group_append_partial_write", "[prove
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -992,12 +992,12 @@ TEST_CASE("prove_group__group_of_2_batched__group_commit_sync_fails", "[prove_gr
     auto db = bytecask::DB::open(dir);
 
     // Force exactly 2 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -1046,7 +1046,7 @@ TEST_CASE("prove_group__group_of_2_batched__group_commit_sync_fails", "[prove_gr
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -1081,12 +1081,12 @@ TEST_CASE("prove_group__group_of_4_batched__success", "[prove_group][concurrency
     auto db = bytecask::DB::open(dir);
 
     // Force exactly 4 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -1127,7 +1127,7 @@ TEST_CASE("prove_group__group_of_4_batched__success", "[prove_group][concurrency
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -1167,12 +1167,12 @@ TEST_CASE("prove_group__group_of_4_batched__group_append_fails", "[prove_group][
     auto db = bytecask::DB::open(dir);
 
     // Force exactly 4 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -1216,7 +1216,7 @@ TEST_CASE("prove_group__group_of_4_batched__group_append_fails", "[prove_group][
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -1251,12 +1251,12 @@ TEST_CASE("prove_group__group_of_4_batched__group_append_partial_write", "[prove
     auto db = bytecask::DB::open(dir);
 
     // Force exactly 4 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -1302,7 +1302,7 @@ TEST_CASE("prove_group__group_of_4_batched__group_append_partial_write", "[prove
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -1337,12 +1337,12 @@ TEST_CASE("prove_group__group_of_4_batched__group_commit_sync_fails", "[prove_gr
     auto db = bytecask::DB::open(dir);
 
     // Force exactly 4 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -1391,7 +1391,7 @@ TEST_CASE("prove_group__group_of_4_batched__group_commit_sync_fails", "[prove_gr
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -1426,12 +1426,12 @@ TEST_CASE("prove_group__group_of_2_rotation__success", "[prove_group][concurrenc
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
 
     // Force exactly 2 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -1471,7 +1471,7 @@ TEST_CASE("prove_group__group_of_2_rotation__success", "[prove_group][concurrenc
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -1510,12 +1510,12 @@ TEST_CASE("prove_group__group_of_2_rotation__group_rotation_sync_fails", "[prove
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
 
     // Force exactly 2 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -1558,7 +1558,7 @@ TEST_CASE("prove_group__group_of_2_rotation__group_rotation_sync_fails", "[prove
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -1592,12 +1592,12 @@ TEST_CASE("prove_group__group_of_2_rotation__group_rotation_file_creation_fails"
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
 
     // Force exactly 2 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -1640,7 +1640,7 @@ TEST_CASE("prove_group__group_of_2_rotation__group_rotation_file_creation_fails"
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -1674,12 +1674,12 @@ TEST_CASE("prove_group__group_of_4_rotation__success", "[prove_group][concurrenc
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
 
     // Force exactly 4 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -1719,7 +1719,7 @@ TEST_CASE("prove_group__group_of_4_rotation__success", "[prove_group][concurrenc
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -1758,12 +1758,12 @@ TEST_CASE("prove_group__group_of_4_rotation__group_rotation_sync_fails", "[prove
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
 
     // Force exactly 4 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -1806,7 +1806,7 @@ TEST_CASE("prove_group__group_of_4_rotation__group_rotation_sync_fails", "[prove
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
@@ -1840,12 +1840,12 @@ TEST_CASE("prove_group__group_of_4_rotation__group_rotation_file_creation_fails"
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
 
     // Force exactly 4 writers into one batch: the leader blocks in
-    // on_leader_start_ until every follower's slot is queued, so the
+    // on_batch_start_ until every follower's slot is queued, so the
     // group's shape is deterministic rather than raced for.
     std::mutex mu;
     std::condition_variable cv;
     bool leader_ready = false;
-    db.test_write_group().on_leader_start_ = [&] {
+    db.test_write_group().on_batch_start_ = [&] {
       {
         std::lock_guard<std::mutex> lk{mu};
         leader_ready = true;
@@ -1888,7 +1888,7 @@ TEST_CASE("prove_group__group_of_4_rotation__group_rotation_file_creation_fails"
       });
     }
     for (auto &t : writers) t.join();
-    db.test_write_group().on_leader_start_ = nullptr;
+    db.test_write_group().on_batch_start_ = nullptr;
 
     // The group shares one append and one fdatasync, so the engine has
     // no way to tell one writer its write landed and another that it
