@@ -182,19 +182,31 @@ message(STATUS "ByteCaskDB include  : ${BYTECASK_INCLUDE_DIR}")
 message(STATUS "ByteCaskDB library  : ${BYTECASK_LIB}")
 
 # ha_bytecaskdb.cc's extra() handles ALTER TABLE...ALGORITHM=COPY bulk-copy
-# state transitions. Every released MariaDB (10.3 through at least 12.0)
-# names these enumerators HA_EXTRA_END_ALTER_COPY / HA_EXTRA_ABORT_ALTER_COPY;
-# MariaDB's unreleased main branch dropped the "_ALTER_" infix. Detect which
-# spelling the active headers provide instead of hardcoding one, since a
-# plain #ifdef can't see enum members (only macros).
+# state transitions. Released MariaDB names the end enumerator
+# HA_EXTRA_END_ALTER_COPY; MariaDB's unreleased main branch dropped the
+# "_ALTER_" infix. The abort enumerator (HA_EXTRA_ABORT_ALTER_COPY) arrived
+# later than the end one — 10.5 has none — so its spelling is detected
+# separately, and extra() skips it when neither exists (rollback already
+# discards bulk-copy state). A plain #ifdef can't see enum members (only
+# macros), hence the compile checks.
 include(CheckCXXSourceCompiles)
 set(CMAKE_REQUIRED_INCLUDES ${MARIADB_SERVER_INCLUDE_DIRS})
 set(CMAKE_REQUIRED_DEFINITIONS -DMYSQL_SERVER -DDBUG_OFF)
 check_cxx_source_compiles("
 #include <my_global.h>
 #include <my_base.h>
-int main() { return HA_EXTRA_END_ALTER_COPY + HA_EXTRA_ABORT_ALTER_COPY; }
-" BYTECASKDB_HAVE_ALTER_COPY_NAMES)
+int main() { return HA_EXTRA_END_ALTER_COPY; }
+" BYTECASKDB_HAVE_END_ALTER_COPY)
+check_cxx_source_compiles("
+#include <my_global.h>
+#include <my_base.h>
+int main() { return HA_EXTRA_ABORT_ALTER_COPY; }
+" BYTECASKDB_HAVE_ABORT_ALTER_COPY)
+check_cxx_source_compiles("
+#include <my_global.h>
+#include <my_base.h>
+int main() { return HA_EXTRA_ABORT_COPY; }
+" BYTECASKDB_HAVE_ABORT_COPY)
 unset(CMAKE_REQUIRED_INCLUDES)
 unset(CMAKE_REQUIRED_DEFINITIONS)
 
@@ -278,7 +290,9 @@ target_compile_options(ha_bytecaskdb PRIVATE
   # the plugin with the same flag so the macros collapse to no-ops.
   -DDBUG_OFF
   -DDISABLE_DTRACE
-  $<$<BOOL:${BYTECASKDB_HAVE_ALTER_COPY_NAMES}>:-DBYTECASKDB_HAVE_ALTER_COPY_NAMES>
+  $<$<BOOL:${BYTECASKDB_HAVE_END_ALTER_COPY}>:-DBYTECASKDB_HAVE_END_ALTER_COPY>
+  $<$<BOOL:${BYTECASKDB_HAVE_ABORT_ALTER_COPY}>:-DBYTECASKDB_HAVE_ABORT_ALTER_COPY>
+  $<$<BOOL:${BYTECASKDB_HAVE_ABORT_COPY}>:-DBYTECASKDB_HAVE_ABORT_COPY>
   # MariaDB headers trigger some pedantic warnings; suppress known noise.
   -Wno-unused-parameter
   -Wno-missing-field-initializers
