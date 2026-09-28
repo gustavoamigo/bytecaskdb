@@ -351,11 +351,11 @@ The engine validates structural invariants at runtime before publishing state, n
 
 On cold paths (`DB::open()`, `resume()`), `validate_state_consistency` runs the full O(n) structural check: active file in registry, no dangling file references, `next_seq` ahead of all sequences, `file_stats` covers all files, `live_bytes` matches `key_dir`. On violation it throws — the DB does not open or `resume()` fails.
 
-##### Partial write detection (tainted file)
+##### Short and failed writes
 
-If `pwritev` returns a short write (0 < written < total), the append method sets a `tainted_` flag before throwing. A tainted file has bytes on disk that `offset_` does not account for. The next `pwritev` writes at the tracked `offset_` — past the partial data — so subsequent append offsets would be wrong if `offset_` were advanced.
+A regular file writes short (0 < written < total) only when it can take no more — a full disk, a file size limit — and a short write sets no `errno`. Every data-file write goes through `pwritev_all` (`bytecaskdb/data_file.cppm`), which continues a short write from where it stopped: the next call either completes it or fails with the `errno` that names the cause (`ENOSPC`, `EFBIG`). Reporting the short write itself used to report whatever an earlier call had left in `errno` (issue #221). A write that completes in one call leaves its `iovec`s untouched, so the buffer pool is still filled from them. A read that reaches the end of the file is likewise reported as an I/O error that says so, not with a stale `errno`.
 
-For multi-entry batches this is safe: the isolation rotation moves to a new file, abandoning the tainted one. For single-entry writes, the `apply_batch` catch block checks `file.is_tainted()` and degrades the DB if set. `resume()` then truncates the partial entry and restores a clean state.
+A write that fails part-way leaves bytes past the file's logical end that no entry accounts for. The append throws, the engine degrades — reads stay available, writes throw `DbDegraded` — and `resume()` trims the file back to its last complete entry before writes resume.
 
 ##### Durable sequence tracking
 
@@ -572,7 +572,7 @@ The helper `entry_size(key_size, value_size)` returns `kHeaderSize + key_size + 
 
 ##### Write-path updates
 
-All stats updates happen inside `TransientEngineState::apply_writes`:
+All stats updates happen inside `TransientEngineState::apply_writes`. They are gathered while the plan is applied and written once at the end — one update of the active file, then one per other file whose records the plan displaced or erased, summed per file — since every update copies a path of the file-stats tree and a plan otherwise made one per write, and a range delete one per key erased:
 
 - **On Put**: if the key already exists (overwrite), subtract `entry_size(key.size(), old_entry.value_size)` from `file_stats[old_entry.file_id].live_bytes`. Add `entry_size(key.size(), value.size())` to `file_stats[active_file_id].live_bytes` and to `.total_bytes`.
 - **On Del**: if the key exists, subtract `entry_size(key.size(), old_entry.value_size)` from `file_stats[old_entry.file_id].live_bytes`. Add the tombstone size (`kHeaderSize + key.size() + kCrcSize`) to `file_stats[active_file_id].total_bytes` and `.tombstone_bytes`. The tombstone is never added to `live_bytes` — tombstones are never referenced by the key directory.

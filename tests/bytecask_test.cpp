@@ -13,6 +13,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <chrono>
+#include <csignal>
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
 #include <condition_variable>
 #include <cstddef>
 #include <filesystem>
@@ -9240,6 +9244,59 @@ TEST_CASE("stats: group_writer_busy_us counts the serial section, within wall ti
   CHECK(busy > 0);
   CHECK(busy <= wall_us);
 }
+
+#if defined(__linux__)
+// A write the file cannot take in full returns short and sets no errno; the
+// engine used to report whatever errno an earlier call had left behind
+// (#221). A file size limit just past the active file's zero-filled end makes
+// the kernel write part of the next chunk and refuse the rest with EFBIG.
+TEST_CASE("io: a write cut short reports the cause, not a stale errno",
+          "[bytecask][io]") {
+  TempDir td;
+  // Files large enough to be zero-filled in 4 MiB chunks ahead of the write
+  // cursor rather than whole at creation (the test build's default).
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 16 * 1024 * 1024});
+  std::filesystem::path data_file;
+  for (const auto &e : std::filesystem::directory_iterator(td.path / "db"))
+    if (e.path().extension() == ".data") data_file = e.path();
+  REQUIRE(!data_file.empty());
+  const auto zeroed_end = std::filesystem::file_size(data_file);
+
+  struct LimitGuard {
+    rlimit saved{};
+    void (*saved_handler)(int){};
+    explicit LimitGuard(rlim_t limit) {
+      REQUIRE(::getrlimit(RLIMIT_FSIZE, &saved) == 0);
+      saved_handler = std::signal(SIGXFSZ, SIG_IGN);  // default action kills
+      rlimit l = saved;
+      l.rlim_cur = limit;
+      REQUIRE(::setrlimit(RLIMIT_FSIZE, &l) == 0);
+    }
+    ~LimitGuard() {
+      ::setrlimit(RLIMIT_FSIZE, &saved);
+      std::signal(SIGXFSZ, saved_handler);
+    }
+    LimitGuard(const LimitGuard &) = delete;
+    auto operator=(const LimitGuard &) -> LimitGuard & = delete;
+  };
+
+  // A write that ends past the zero-filled end, so the fill must grow the
+  // file past the limit: the first zero-fill write lands 100 bytes of it.
+  db.put({.sync = false}, to_bytes("filler"), to_bytes(std::string(64 * 1024, 'f')));
+  const std::string value(static_cast<std::size_t>(zeroed_end) - 1024, 'v');
+  std::error_code code;
+  {
+    LimitGuard limit{static_cast<rlim_t>(zeroed_end + 100)};
+    try {
+      db.put({.sync = false}, to_bytes("big"), to_bytes(value));
+    } catch (const std::system_error &e) {
+      code = e.code();
+    }
+  }
+  CHECK(std::filesystem::file_size(data_file) == zeroed_end + 100);  // the short write
+  CHECK(code == std::errc::file_too_large);
+}
+#endif
 
 TEST_CASE("stats: disk_reads and disk_read_bytes increment on get",
           "[bytecask][stats]") {
