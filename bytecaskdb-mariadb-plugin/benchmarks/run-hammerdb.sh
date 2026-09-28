@@ -16,7 +16,7 @@
 #   ./bytecaskdb-mariadb-plugin/benchmarks/run-hammerdb.sh [--warehouses=N] [--vus=LIST]
 #       [--rampup=MIN] [--duration=MIN] [--engines=LIST] [--data-root=PATH]
 #       [--build-vus=N] [--no-restore] [--reuse-data] [--hammerdb-home=PATH]
-#       [--profile=acid|fast] [--capture]
+#       [--profile=acid|fast] [--capture] [--capture-dir=PATH]
 #
 #   --warehouses: TPROC-C warehouses (default: 20, ~2 GiB on InnoDB). Make it a
 #                 multiple of every --vus value. HammerDB runs with
@@ -48,7 +48,7 @@
 #   --capture:    profile the server during each cell's measured window —
 #                 per-core CPU, per-thread CPU, on- and off-CPU perf stacks,
 #                 kernel lock contention, engine status — and pack it into
-#                 <data-root>/.hammerdb_logs/capture_<engine>_w<N>_vu<N>.tar.gz
+#                 <capture-dir>/capture_<engine>_w<N>_vu<N>_<run start>.tar.gz
 #                 (see lib_capture.sh). Checks for perf, sysstat and the perf
 #                 permissions it needs before building anything, and after
 #                 the build that the plugin carries debug info for the engine
@@ -56,6 +56,10 @@
 #                 the script prints how when it is not). The profilers
 #                 slow the server: compare captured cells with each other, not
 #                 with uncaptured ones.
+#   --capture-dir: where --capture writes its tarballs (default:
+#                 benchmarks/captures/ in this repository, beside the results
+#                 CSV). Must be on storage that outlives the host — the script
+#                 refuses EC2 instance storage — and have ~1 GiB free per cell.
 #   --data-root:  where instance directories live (default: repository root).
 #                 Point it at a filesystem with native fdatasync/O_DIRECT, e.g.
 #                 --data-root=/mnt/bench. A reflink-capable filesystem (btrfs,
@@ -118,6 +122,7 @@ DATA_ROOT=""
 HAMMERDB_HOME="${HAMMERDB_HOME:-}"
 PROFILE="acid"
 CAPTURE="off"
+CAPTURE_DIR=""
 
 BYTECASKDB_PORT=3330
 INNODB_PORT=3331
@@ -143,8 +148,9 @@ for arg in "$@"; do
     --data-root=*)     DATA_ROOT="${arg#*=}" ;;
     --hammerdb-home=*) HAMMERDB_HOME="${arg#*=}" ;;
     --capture)         CAPTURE="on" ;;
+    --capture-dir=*)   CAPTURE_DIR="${arg#*=}" ;;
     --help|-h)
-      echo "Usage: $0 [--warehouses=N] [--vus=8,16] [--rampup=MIN] [--duration=MIN] [--engines=bytecaskdb,innodb] [--build-vus=N] [--no-restore] [--reuse-data] [--data-root=PATH] [--hammerdb-home=PATH] [--profile=acid|fast] [--capture]"
+      echo "Usage: $0 [--warehouses=N] [--vus=8,16] [--rampup=MIN] [--duration=MIN] [--engines=bytecaskdb,innodb] [--build-vus=N] [--no-restore] [--reuse-data] [--data-root=PATH] [--hammerdb-home=PATH] [--profile=acid|fast] [--capture] [--capture-dir=PATH]"
       exit 0
       ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
@@ -222,7 +228,11 @@ check_profile "$PROFILE" "${ACTIVE_ENGINES[@]}"
 if [[ "$CAPTURE" == on ]]; then
   # shellcheck source=lib_capture.sh
   source "$SCRIPT_DIR/lib_capture.sh"
-  capture_preflight "$DURATION"
+  CAPTURE_DIR="${CAPTURE_DIR:-$SCRIPT_DIR/captures}"
+  capture_preflight "$DURATION" "$CAPTURE_DIR" $(( ${#VU_LIST[@]} * ${#ACTIVE_ENGINES[@]} ))
+  CAPTURE_DIR="$(cd "$CAPTURE_DIR" && pwd)"
+  # In every tarball's name, so a rerun never overwrites an earlier capture.
+  CAPTURE_RUN="$(date +%Y%m%d_%H%M%S)"
 fi
 
 if [[ " ${ACTIVE_ENGINES[*]} " == *" bytecaskdb "* ]]; then
@@ -399,7 +409,7 @@ TCL
   local marks="$dir/window_start"
   local capture_dir="$LOG_DIR/capture_${engine}_w${WAREHOUSES}_vu${vus}"
   rm -f "$marks"
-  rm -rf "$capture_dir" "$capture_dir.tar.gz"
+  rm -rf "$capture_dir"
   (
     sleep $(( RAMPUP * 60 ))
     rss_reset "$dir/mariadbd.pid"
@@ -431,7 +441,8 @@ TCL
   stop_engine "$engine"
   dev_after="$(dev_written_bytes)"
   if [[ "$CAPTURE" == on ]]; then
-    capture_finish "$capture_dir" "$(engine_defaults_file "$engine" "$PROFILE")"
+    capture_finish "$capture_dir" "$CAPTURE_DIR/$(basename "$capture_dir")_$CAPTURE_RUN.tar.gz" \
+      "$(engine_defaults_file "$engine" "$PROFILE")" "$log"
   fi
   flush_mib="$(awk -v b=$((dev_after - dev_before)) \
     'BEGIN { printf "%.1f", (b > 0 ? b : 0) / 1048576 }')"
@@ -474,7 +485,7 @@ echo "    Virtual users: ${VUS}"
 echo "    Durability profile: $PROFILE"
 echo "    Restore per cell: $RESTORE"
 echo "    Data root: $DATA_ROOT"
-echo "    Capture: $CAPTURE"
+echo "    Capture: $CAPTURE${CAPTURE_DIR:+ (tarballs to $CAPTURE_DIR)}"
 echo ""
 
 echo "=== Phase 1: building schema ==="
@@ -504,12 +515,12 @@ for v in "${VU_LIST[@]}"; do
       "$(cut -d, -f4 <<< "$result")" "$(cut -d, -f5 <<< "$result")" \
       "$(cut -d, -f6 <<< "$result")" "$(cut -d, -f9 <<< "$result")" \
       "$(cut -d, -f15 <<< "$result")"
-    capture_file="$LOG_DIR/capture_${engine}_w${WAREHOUSES}_vu${v}.tar.gz"
     if [[ "$CAPTURE" == on ]]; then
+      capture_file="$CAPTURE_DIR/capture_${engine}_w${WAREHOUSES}_vu${v}_$CAPTURE_RUN.tar.gz"
       if [[ -f "$capture_file" ]]; then
         echo "      capture: $capture_file ($(du -h "$capture_file" | cut -f1))"
       else
-        echo "      capture: missing — the server stopped before it finished?" >&2
+        echo "      capture: missing — see the error above, or the server stopped before it finished" >&2
       fi
     fi
   done
@@ -545,5 +556,8 @@ done
 echo ""
 echo "Results saved to: $RESULTS_CSV"
 echo "HammerDB logs:    $LOG_DIR"
+if [[ "$CAPTURE" == on ]]; then
+  echo "Captures:         $CAPTURE_DIR/capture_*_$CAPTURE_RUN.tar.gz"
+fi
 
 cleanup

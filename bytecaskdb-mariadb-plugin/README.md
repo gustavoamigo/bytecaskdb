@@ -291,14 +291,22 @@ the warehouse count.
 
 `--capture` profiles the server for the first two minutes of each cell's
 measured window and packs the result into
-`<data-root>/.hammerdb_logs/capture_<engine>_w<N>_vu<N>.tar.gz`, for analysis
-on another machine: per-core and per-thread CPU (`mpstat`, `pidstat`), on-CPU
-and off-CPU `perf` stacks with a build-id archive of the binaries, contended
-kernel locks (`perf lock contention -b`, where perf and the kernel support
-it), and the engine's status at the start and end. Before building anything
-it checks that `perf`, `sysstat`, `procps` and `binutils` are installed and that
-perf can see kernel frames — through passwordless sudo, or
-`kernel.perf_event_paranoid` ≤ 1 — and stops with what is missing. The
+`benchmarks/captures/capture_<engine>_w<N>_vu<N>_<run start>.tar.gz`, for
+analysis on another machine: per-core and per-thread CPU (`mpstat`,
+`pidstat`), on-CPU and off-CPU `perf` stacks with a build-id archive of the
+binaries, contended kernel locks (`perf lock contention -b`, where perf and
+the kernel support it), the engine's status at the start and end, and the
+cell's HammerDB log. Before building anything it checks that `perf`,
+`sysstat`, `procps` and `binutils` are installed and that perf can see kernel
+frames — through passwordless sudo, or `kernel.perf_event_paranoid` ≤ 1 — and
+stops with what is missing.
+
+The tarballs go beside the results CSV, not under `--data-root`: the data
+root is chosen for speed, and on a cloud host it is often scratch storage that
+does not survive the instance (EC2 instance storage is wiped when the instance
+stops). `--capture-dir=PATH` puts them elsewhere. The script refuses a capture
+directory on EC2 instance storage, or one with less than about 1 GiB free per
+captured cell. Copy the tarballs off the host before discarding it. The
 profilers slow the server, so each CSV row records whether it was captured;
 compare captured cells only with each other. To read a capture's perf data
 elsewhere, unpack its `*.data.tar.bz2` into `~/.debug` first.
