@@ -305,8 +305,10 @@ The tarballs go beside the results CSV, not under `--data-root`: the data
 root is chosen for speed, and on a cloud host it is often scratch storage that
 does not survive the instance (EC2 instance storage is wiped when the instance
 stops). `--capture-dir=PATH` puts them elsewhere. The script refuses a capture
-directory on EC2 instance storage, or one with less than about 1 GiB free per
-captured cell. Copy the tarballs off the host before discarding it. The
+directory on EC2 instance storage, or one with less than about 1 GiB free,
+and warns when it has less than that per captured cell: 1 GiB is an upper
+estimate, and a tarball that does not fit is left unpacked on the data root.
+Copy the tarballs off the host before discarding it. The
 profilers slow the server, so each CSV row records whether it was captured;
 compare captured cells only with each other. To read a capture's perf data
 elsewhere, unpack its `*.data.tar.bz2` into `~/.debug` first.
