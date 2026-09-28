@@ -20,8 +20,10 @@
 # with an uncaptured one; its CSV row says capture=on.
 #
 # DWARF stacks, not frame pointers: the release builds omit frame pointers.
-# They need the binaries' symbol tables, not debug info; capture_check_symbols
-# warns when a binary has none.
+# Unwinding needs only the binaries' symbol tables (capture_check_symbols warns
+# when one has none). Telling inlined functions apart, which at -O3 is most of
+# the commit path, needs debug info: capture_check_debug_info requires it for
+# the plugin.
 
 CAPTURE_SECONDS=120       # capture length, from the start of the window
 CAPTURE_PERF=()           # perf, or sudo -n perf
@@ -129,6 +131,50 @@ capture_check_symbols() {
            "mariadb server debuginfo package." >&2
     fi
   done
+}
+
+# Exits unless the plugin carries debug info for the engine as well as for its
+# own sources. The plugin's sources get it from build_bytecaskdb_plugin; the
+# engine comes from the prebuilt libbytecask.a, which only a -g build of it
+# provides.
+capture_check_debug_info() {
+  local so="$1"
+  local units
+  # Only the compile units' own entries: their source paths say which build
+  # each came from. The engine's are its module units (*.pcm under clang)
+  # and bytecask_hpp.cpp, which every engine build compiles.
+  units="$(readelf --debug-dump=info --dwarf-depth=1 "$so" 2>/dev/null |
+    grep 'DW_AT_name')"
+  if ! grep -q 'ha_bytecaskdb\.cc' <<< "$units"; then
+    echo "ERROR: $so has no debug info for the plugin's own sources, though" \
+         "build_bytecaskdb_plugin builds them with -g. Remove $(dirname "$so")" \
+         "and rerun." >&2
+    exit 1
+  fi
+  if ! grep -q 'bytecaskdb/bytecask_hpp\.cpp' <<< "$units"; then
+    cat >&2 <<MSG
+ERROR: $so has no debug info for the engine: the libbytecask.a it links was
+built without -g. The capture would charge every inlined engine function to
+its caller, and at -O3 that is most of the commit path. Rebuild the engine
+with debug info, then rerun this command. The code under test stays the same:
+with clang 21, -g changed 6 of the engine's ~2,000 functions, all of them in
+recovery, error formatting or std::format.
+
+    cd $BYTECASK_ROOT
+    xmake f -m release --cxflags=-g
+    xmake build -r bytecask
+
+-r forces the rebuild: after the flag change alone, xmake has reported the
+build up to date and compiled nothing. Rerunning this command relinks the
+plugin against the new archive. \`xmake f\` keeps the flag on later
+configures; \`xmake f -c\` drops it, and the debug info with it.
+
+Not \`xmake f -m releasedbg\`: it writes build/linux/<arch>/releasedbg/, which
+the plugin does not link, and keeps frame pointers, so its code is not the
+release build's.
+MSG
+    exit 1
+  fi
 }
 
 capture_status() {

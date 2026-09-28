@@ -50,7 +50,10 @@
 #                 kernel lock contention, engine status — and pack it into
 #                 <data-root>/.hammerdb_logs/capture_<engine>_w<N>_vu<N>.tar.gz
 #                 (see lib_capture.sh). Checks for perf, sysstat and the perf
-#                 permissions it needs before building anything. The profilers
+#                 permissions it needs before building anything, and after
+#                 the build that the plugin carries debug info for the engine
+#                 (libbytecask.a built with xmake f -m release --cxflags=-g;
+#                 the script prints how when it is not). The profilers
 #                 slow the server: compare captured cells with each other, not
 #                 with uncaptured ones.
 #   --data-root:  where instance directories live (default: repository root).
@@ -231,6 +234,9 @@ if [[ "$CAPTURE" == on ]]; then
     symbol_files+=("$PLUGIN_DIR/ha_bytecaskdb.so")
   fi
   capture_check_symbols "${symbol_files[@]}"
+  if [[ " ${ACTIVE_ENGINES[*]} " == *" bytecaskdb "* ]]; then
+    capture_check_debug_info "$PLUGIN_DIR/ha_bytecaskdb.so"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
