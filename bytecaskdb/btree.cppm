@@ -12,13 +12,16 @@
 
 module;
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iterator>
+#include <mutex>
 #include <memory>
 #include <new>
 #include <optional>
@@ -97,6 +100,147 @@ export inline std::atomic<std::uint64_t> split_rule_counts[5]{};
 
 constexpr auto align_up(std::size_t n, std::size_t a) noexcept -> std::size_t {
   return (n + a - 1) / a * a;
+}
+
+// Off where recycled memory would blind a sanitizer: ASan to a use after
+// free, MSan to a read of bytes the new owner never wrote. TSan keeps it —
+// it checks the pool's own synchronisation.
+#if defined(__SANITIZE_ADDRESS__)
+export inline constexpr bool kNodePoolEnabled = false;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(memory_sanitizer)
+export inline constexpr bool kNodePoolEnabled = false;
+#else
+export inline constexpr bool kNodePoolEnabled = true;
+#endif
+#else
+export inline constexpr bool kNodePoolEnabled = true;
+#endif
+
+// NodePool — recycles node memory by exact size.
+//
+// A copy-on-write tree allocates new nodes on the writer thread for every
+// batch, and the nodes they replace are freed wherever the last version
+// pinning them is released — usually a reader. The allocator's per-thread
+// cache on the writer then never gets its memory back, and every few nodes
+// the writer refills from the shared arena: ~16% of the serial section's
+// time on a 48-vCPU host (docs/commit_path_scaling_design.md). Node sizes are
+// few and fixed (1 KiB blind leaves; inner nodes one size unless a long
+// prefix needs more), so the pool keeps freed nodes by size instead:
+//
+//   give   any thread, under the size's mutex, onto its shared list;
+//   take   from the calling thread's own cache, refilled by swapping in
+//          the whole shared list when empty.
+//
+// Bounded: past kMaxPooledBytes per size a freed node goes back to operator
+// delete. A thread's cache goes back to the shared list when the thread
+// exits. Process-wide, shared by every DB. The shared lists are never
+// destroyed, so a thread freeing nodes during exit touches no dead mutex.
+class NodePool {
+public:
+  static auto take(std::size_t bytes) -> void * {
+    if (!kNodePoolEnabled || bytes / kGranule >= kClasses) return ::operator new(bytes);
+    auto &cache = local().cache[bytes / kGranule];
+    if (cache.empty()) {
+      // Checked before locking: while the pool is empty — at open, when
+      // recovery builds a tree on several threads — every allocation would
+      // otherwise take the size's one mutex to find nothing.
+      auto &c = shared(bytes / kGranule);
+      if (c.count.load(std::memory_order_relaxed) > 0) {
+        {
+          // At most kRefill at a time: a bounded lock hold and sort, and
+          // several threads building at once — recovery — share the pool
+          // rather than one of them taking it all.
+          std::lock_guard<std::mutex> lk{c.mu};
+          const auto n = std::min(c.free.size(), kRefill);
+          cache.assign(c.free.end() - static_cast<std::ptrdiff_t>(n), c.free.end());
+          c.free.resize(c.free.size() - n);
+          c.count.store(c.free.size(), std::memory_order_relaxed);
+        }
+        // Hand nodes out lowest address first, as a slab allocator does:
+        // in the order they were freed they would scatter a new tree's
+        // nodes across memory and cost its reads cache and TLB misses
+        // (engine_bench Get: -5% unsorted, level sorted).
+        std::sort(cache.begin(), cache.end(), std::greater<>{});
+      }
+    }
+    if (cache.empty()) return ::operator new(bytes);
+    auto *p = cache.back();
+    cache.pop_back();
+    pooled_bytes().fetch_sub(static_cast<std::int64_t>(bytes), std::memory_order_relaxed);
+    return p;
+  }
+
+  static void give(void *p, std::size_t bytes) noexcept {
+    if (kNodePoolEnabled && bytes / kGranule < kClasses) {
+      auto &c = shared(bytes / kGranule);
+      std::lock_guard<std::mutex> lk{c.mu};
+      if (c.free.size() * bytes < kMaxPooledBytes) {
+        try {
+          c.free.push_back(p);
+          c.count.store(c.free.size(), std::memory_order_relaxed);
+          pooled_bytes().fetch_add(static_cast<std::int64_t>(bytes), std::memory_order_relaxed);
+          return;
+        } catch (...) {  // the list could not grow: free the node instead
+        }
+      }
+    }
+    ::operator delete(p);
+  }
+
+  // Bytes held for reuse: shared lists and thread caches. A gauge.
+  [[nodiscard]] static auto bytes_pooled() noexcept -> std::int64_t {
+    return pooled_bytes().load(std::memory_order_relaxed);
+  }
+
+private:
+  static constexpr std::size_t kGranule = 16;  // node capacities are 16-aligned
+  static constexpr std::size_t kClasses = 4096 / kGranule + 1;
+  static constexpr std::size_t kMaxPooledBytes = std::size_t{64} << 20;
+  static constexpr std::size_t kRefill = 256;
+
+  struct Shared {
+    std::mutex mu;
+    std::vector<void *> free;
+    // free.size(), readable without mu: a hint, written under mu.
+    std::atomic<std::size_t> count{0};
+  };
+  static auto shared(std::size_t cls) -> Shared & {
+    static auto *classes = new std::array<Shared, kClasses>;  // never destroyed
+    return (*classes)[cls];
+  }
+  static auto pooled_bytes() -> std::atomic<std::int64_t> & {
+    static auto *n = new std::atomic<std::int64_t>{0};  // never destroyed
+    return *n;
+  }
+
+  struct Local {
+    std::array<std::vector<void *>, kClasses> cache;
+    Local() = default;
+    Local(const Local &) = delete;
+    auto operator=(const Local &) -> Local & = delete;
+    ~Local() {
+      for (std::size_t cls = 0; cls < kClasses; ++cls) {
+        for (auto *p : cache[cls]) {
+          pooled_bytes().fetch_sub(static_cast<std::int64_t>(cls * kGranule),
+                                   std::memory_order_relaxed);
+          give(p, cls * kGranule);
+        }
+      }
+    }
+  };
+  static auto local() -> Local & {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+    thread_local Local l;
+#pragma clang diagnostic pop
+    return l;
+  }
+};
+
+// Test and stats access to the pool.
+export inline auto node_pool_bytes() noexcept -> std::int64_t {
+  return NodePool::bytes_pooled();
 }
 
 export template <typename T> auto as_ptr(std::byte *p) noexcept -> T * {
@@ -258,14 +402,14 @@ export template <typename V> struct Node {
   }
 
   // Allocates a node of at least `min_capacity` bytes with `prefix` stored
-  // and no entries. Storage comes from the global operator new so the
-  // memory tests see it.
+  // and no entries. Storage comes from NodePool, which recycles freed nodes
+  // and otherwise calls the global operator new.
   [[nodiscard]] static auto allocate(std::size_t min_capacity, bool leaf,
                                      std::uint64_t session_tag, Bytes pre)
       -> Node * {
     const auto needed = slots_offset_for(pre.size());
     const auto capacity = align_up(std::max(min_capacity, needed), 16);
-    auto *mem = static_cast<std::byte *>(::operator new(capacity));
+    auto *mem = static_cast<std::byte *>(NodePool::take(capacity));
     auto *n = new (mem) Node{};
     n->tag = session_tag;
     n->capacity = static_cast<std::uint32_t>(capacity);
@@ -287,8 +431,9 @@ export template <typename V> struct Node {
           std::destroy_at(n->template payload<V>(i));
       }
     }
+    const std::size_t capacity = n->capacity;
     n->~Node();
-    ::operator delete(static_cast<void *>(n));
+    NodePool::give(static_cast<void *>(n), capacity);
     account_free<V>();
   }
 
