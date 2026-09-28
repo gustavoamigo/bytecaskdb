@@ -133,15 +133,25 @@ jobs:
           TSAN_OPTIONS: ${{ matrix.sanitizer == 'thread' && 'halt_on_error=0 history_size=4' || '' }}
         # `timeout-minutes` above bounds the *step*, but GitHub's step
         # cancellation only signals the direct child; a test binary wedged
-        # in an uninterruptible wait (seen on the MSan leg: "hour-long
-        # silences in the log, a stall, not slowness") can leave the runner
-        # waiting on that process long past the intended bound, up to
-        # GitHub's unrelated 360-minute job ceiling (see the nightly run
-        # that hit 14:31 against an 08:31 start with a 120-minute MSan
+        # in an uninterruptible wait (seen on the MSan leg specifically:
+        # "hour-long silences in the log, a stall, not slowness") can leave
+        # the runner waiting on that process long past the intended bound,
+        # up to GitHub's unrelated 360-minute job ceiling (see the nightly
+        # run that hit 14:31 against an 08:31 start with a 120-minute MSan
         # timeout configured). `timeout -k` bounds the binary itself and
         # guarantees a SIGKILL, independent of the runner's own signal
-        # delivery. --durations prints each test as it finishes, so a run
-        # cut off by the timeout still shows the last test that completed.
+        # delivery.
+        #
+        # Scoped to memory only: address/thread/undefined have never shown
+        # this stall, and a run of the full (and growing) suite under TSan
+        # is legitimately slow, not stuck — SIGTERMing it early is a false
+        # failure, not a fix. Give it the same treatment if it ever shows
+        # the same stall pattern, not preemptively. --durations prints each
+        # test as it finishes, so a run cut off by either timeout still
+        # shows the last test that completed.
         run: |
-          bound=${{ matrix.sanitizer == 'memory' && 110 || 50 }}
-          timeout --kill-after=30s "${bound}m" xmake run bytecask_tests --durations yes
+          if [ "${{ matrix.sanitizer }}" = "memory" ]; then
+            timeout --kill-after=30s 110m xmake run bytecask_tests --durations yes
+          else
+            xmake run bytecask_tests --durations yes
+          fi
