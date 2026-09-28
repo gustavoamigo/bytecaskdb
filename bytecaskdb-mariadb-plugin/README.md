@@ -310,8 +310,12 @@ stops with these instructions when it is not:
 
 ```bash
 xmake f -m release --cxflags=-g   # the release build, plus debug info
-xmake build bytecask
+xmake build -r bytecask           # -r: the flag change alone may rebuild nothing
 ```
+
+The next benchmark run relinks the plugin against the new archive. Later
+`xmake f` calls keep the flag; `xmake f -c` drops it, and the debug info with
+it.
 
 ---
 

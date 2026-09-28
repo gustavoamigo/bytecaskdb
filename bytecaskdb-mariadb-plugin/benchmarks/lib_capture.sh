@@ -162,7 +162,12 @@ recovery, error formatting or std::format.
 
     cd $BYTECASK_ROOT
     xmake f -m release --cxflags=-g
-    xmake build bytecask
+    xmake build -r bytecask
+
+-r forces the rebuild: after the flag change alone, xmake has reported the
+build up to date and compiled nothing. Rerunning this command relinks the
+plugin against the new archive. \`xmake f\` keeps the flag on later
+configures; \`xmake f -c\` drops it, and the debug info with it.
 
 Not \`xmake f -m releasedbg\`: it writes build/linux/<arch>/releasedbg/, which
 the plugin does not link, and keeps frame pointers, so its code is not the
