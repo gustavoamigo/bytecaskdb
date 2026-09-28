@@ -289,6 +289,20 @@ the warehouse count.
 ./bytecaskdb-mariadb-plugin/benchmarks/run-hammerdb.sh --warehouses=50 --vus=8,16,32 --data-root=/mnt/bench --reuse-data
 ```
 
+`--capture` profiles the server for the first two minutes of each cell's
+measured window and packs the result into
+`<data-root>/.hammerdb_logs/capture_<engine>_w<N>_vu<N>.tar.gz`, for analysis
+on another machine: per-core and per-thread CPU (`mpstat`, `pidstat`), on-CPU
+and off-CPU `perf` stacks with a build-id archive of the binaries, contended
+kernel locks (`perf lock contention -b`, where perf and the kernel support
+it), and the engine's status at the start and end. Before building anything
+it checks that `perf`, `sysstat`, `procps` and `binutils` are installed and that
+perf can see kernel frames — through passwordless sudo, or
+`kernel.perf_event_paranoid` ≤ 1 — and stops with what is missing. The
+profilers slow the server, so each CSV row records whether it was captured;
+compare captured cells only with each other. To read a capture's perf data
+elsewhere, unpack its `*.data.tar.bz2` into `~/.debug` first.
+
 ---
 
 _Tested on AMD Ryzen 7 3700X (8C/16T), Samsung SSD 860 EVO SATA (469 MiB/s read, 450 MiB/s write), 31 GiB RAM. Each result is the mean of a single 10s sysbench run._

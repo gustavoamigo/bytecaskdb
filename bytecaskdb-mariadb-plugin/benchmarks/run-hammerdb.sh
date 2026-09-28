@@ -16,7 +16,7 @@
 #   ./bytecaskdb-mariadb-plugin/benchmarks/run-hammerdb.sh [--warehouses=N] [--vus=LIST]
 #       [--rampup=MIN] [--duration=MIN] [--engines=LIST] [--data-root=PATH]
 #       [--build-vus=N] [--no-restore] [--reuse-data] [--hammerdb-home=PATH]
-#       [--profile=acid|fast]
+#       [--profile=acid|fast] [--capture]
 #
 #   --warehouses: TPROC-C warehouses (default: 20, ~2 GiB on InnoDB). Make it a
 #                 multiple of every --vus value. HammerDB runs with
@@ -45,6 +45,14 @@
 #   --reuse-data: keep the built schema under --data-root at exit, and on the
 #                 next run skip the build for any engine that already has one.
 #                 --warehouses must match what was built.
+#   --capture:    profile the server during each cell's measured window —
+#                 per-core CPU, per-thread CPU, on- and off-CPU perf stacks,
+#                 kernel lock contention, engine status — and pack it into
+#                 <data-root>/.hammerdb_logs/capture_<engine>_w<N>_vu<N>.tar.gz
+#                 (see lib_capture.sh). Checks for perf, sysstat and the perf
+#                 permissions it needs before building anything. The profilers
+#                 slow the server: compare captured cells with each other, not
+#                 with uncaptured ones.
 #   --data-root:  where instance directories live (default: repository root).
 #                 Point it at a filesystem with native fdatasync/O_DIRECT, e.g.
 #                 --data-root=/mnt/bench. A reflink-capable filesystem (btrfs,
@@ -87,6 +95,7 @@
 #   rss_mib, peak   — resident memory at the end, and its peak over the
 #                     measured window.
 #   profile         — the --profile the cell ran under.
+#   capture         — on when the cell ran under --capture.
 # Per-cell HammerDB logs are kept under <data-root>/.hammerdb_logs/.
 
 set -euo pipefail
@@ -105,6 +114,7 @@ REUSE_DATA="off"
 DATA_ROOT=""
 HAMMERDB_HOME="${HAMMERDB_HOME:-}"
 PROFILE="acid"
+CAPTURE="off"
 
 BYTECASKDB_PORT=3330
 INNODB_PORT=3331
@@ -129,8 +139,9 @@ for arg in "$@"; do
     --profile=*)       PROFILE="${arg#*=}" ;;
     --data-root=*)     DATA_ROOT="${arg#*=}" ;;
     --hammerdb-home=*) HAMMERDB_HOME="${arg#*=}" ;;
+    --capture)         CAPTURE="on" ;;
     --help|-h)
-      echo "Usage: $0 [--warehouses=N] [--vus=8,16] [--rampup=MIN] [--duration=MIN] [--engines=bytecaskdb,innodb] [--build-vus=N] [--no-restore] [--reuse-data] [--data-root=PATH] [--hammerdb-home=PATH] [--profile=acid|fast]"
+      echo "Usage: $0 [--warehouses=N] [--vus=8,16] [--rampup=MIN] [--duration=MIN] [--engines=bytecaskdb,innodb] [--build-vus=N] [--no-restore] [--reuse-data] [--data-root=PATH] [--hammerdb-home=PATH] [--profile=acid|fast] [--capture]"
       exit 0
       ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
@@ -205,9 +216,21 @@ HAMMERDB_HOME="$(find_hammerdb)" || {
 # shellcheck source=lib_common.sh
 source "$SCRIPT_DIR/lib_common.sh"
 check_profile "$PROFILE" "${ACTIVE_ENGINES[@]}"
+if [[ "$CAPTURE" == on ]]; then
+  # shellcheck source=lib_capture.sh
+  source "$SCRIPT_DIR/lib_capture.sh"
+  capture_preflight "$DURATION"
+fi
 
 if [[ " ${ACTIVE_ENGINES[*]} " == *" bytecaskdb "* ]]; then
   build_bytecaskdb_plugin
+fi
+if [[ "$CAPTURE" == on ]]; then
+  symbol_files=("$(command -v mariadbd)")
+  if [[ " ${ACTIVE_ENGINES[*]} " == *" bytecaskdb "* ]]; then
+    symbol_files+=("$PLUGIN_DIR/ha_bytecaskdb.so")
+  fi
+  capture_check_symbols "${symbol_files[@]}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -368,12 +391,17 @@ TCL
   # The timed driver runs ramp-up and the measured window as one vurun, so
   # the "before" samples are taken from the background when ramp-up ends.
   local marks="$dir/window_start"
+  local capture_dir="$LOG_DIR/capture_${engine}_w${WAREHOUSES}_vu${vus}"
   rm -f "$marks"
+  rm -rf "$capture_dir" "$capture_dir.tar.gz"
   (
     sleep $(( RAMPUP * 60 ))
     rss_reset "$dir/mariadbd.pid"
     { io_sample "$dir/mariadbd.pid"; engine_counters "$engine" "$dir/mysql.sock"; } > "$marks.tmp"
     mv "$marks.tmp" "$marks"
+    if [[ "$CAPTURE" == on ]]; then
+      capture_run "$engine" "$dir/mariadbd.pid" "$dir/mysql.sock" "$capture_dir"
+    fi
   ) &
   local sampler=$!
 
@@ -396,6 +424,9 @@ TCL
   dev_before="$(dev_written_bytes)"
   stop_engine "$engine"
   dev_after="$(dev_written_bytes)"
+  if [[ "$CAPTURE" == on ]]; then
+    capture_finish "$capture_dir" "$(engine_defaults_file "$engine" "$PROFILE")"
+  fi
   flush_mib="$(awk -v b=$((dev_after - dev_before)) \
     'BEGIN { printf "%.1f", (b > 0 ? b : 0) / 1048576 }')"
 
@@ -411,7 +442,7 @@ TCL
     tail -20 "$log" >&2
   fi
 
-  echo "$engine,$WAREHOUSES,$vus,$nopm,$tpm,$aborts,$errors,$io_cols,$eng_cols,$flush_mib,$rss_cols,$PROFILE"
+  echo "$engine,$WAREHOUSES,$vus,$nopm,$tpm,$aborts,$errors,$io_cols,$eng_cols,$flush_mib,$rss_cols,$PROFILE,$CAPTURE"
 }
 
 find_result() {
@@ -437,6 +468,7 @@ echo "    Virtual users: ${VUS}"
 echo "    Durability profile: $PROFILE"
 echo "    Restore per cell: $RESTORE"
 echo "    Data root: $DATA_ROOT"
+echo "    Capture: $CAPTURE"
 echo ""
 
 echo "=== Phase 1: building schema ==="
@@ -452,7 +484,7 @@ done
 echo ""
 
 echo "=== Phase 2: running TPROC-C ==="
-echo "engine,warehouses,vus,nopm,tpm,aborts,other_errors,read_mib,write_mib,syscr,syscw,eng_write_mib,eng_fsyncs,flush_mib,rss_mib,peak_rss_mib,profile" > "$RESULTS_CSV"
+echo "engine,warehouses,vus,nopm,tpm,aborts,other_errors,read_mib,write_mib,syscr,syscw,eng_write_mib,eng_fsyncs,flush_mib,rss_mib,peak_rss_mib,profile,capture" > "$RESULTS_CSV"
 declare -a ALL_RESULTS=()
 
 for v in "${VU_LIST[@]}"; do
@@ -466,6 +498,14 @@ for v in "${VU_LIST[@]}"; do
       "$(cut -d, -f4 <<< "$result")" "$(cut -d, -f5 <<< "$result")" \
       "$(cut -d, -f6 <<< "$result")" "$(cut -d, -f9 <<< "$result")" \
       "$(cut -d, -f15 <<< "$result")"
+    capture_file="$LOG_DIR/capture_${engine}_w${WAREHOUSES}_vu${v}.tar.gz"
+    if [[ "$CAPTURE" == on ]]; then
+      if [[ -f "$capture_file" ]]; then
+        echo "      capture: $capture_file ($(du -h "$capture_file" | cut -f1))"
+      else
+        echo "      capture: missing — the server stopped before it finished?" >&2
+      fi
+    fi
   done
   echo ""
 done
