@@ -25,6 +25,12 @@ export module bytecask.concurrency;
 #ifndef BYTECASK_EXP_TARGETED_WAKE
 #define BYTECASK_EXP_TARGETED_WAKE 0
 #endif
+#ifndef BYTECASK_EXP_COMMITTER
+#define BYTECASK_EXP_COMMITTER 0
+#endif
+#ifndef BYTECASK_EXP_COMMITTER_SPIN_US
+#define BYTECASK_EXP_COMMITTER_SPIN_US 50
+#endif
 
 // EXPERIMENT ONLY: timing of the group-commit path.
 export struct ExpTimers {
@@ -122,7 +128,19 @@ export class WriteGroup {
 public:
   explicit WriteGroup(
       std::function<void(std::vector<Slot *> &)> executor)
-      : executor_{std::move(executor)} {}
+      : executor_{std::move(executor)} {
+    if (kCommitter) committer_ = std::thread{[this] { committer_loop(); }};
+  }
+  ~WriteGroup() {
+    if (kCommitter) {
+      {
+        std::lock_guard<std::mutex> lk{queue_mu_};
+        stop_ = true;
+      }
+      committer_cv_.notify_one();
+      committer_.join();
+    }
+  }
 
   WriteGroup(const WriteGroup &) = delete;
   WriteGroup &operator=(const WriteGroup &) = delete;
@@ -169,6 +187,16 @@ public:
     if (slot.sync) inflight_sync_.fetch_add(1, std::memory_order_relaxed);
 
     slot.wake.store(0, std::memory_order_relaxed);
+    if (kCommitter) {
+      queued_.fetch_add(1, std::memory_order_release);
+      const bool wake = committer_sleeping_;
+      lk.unlock();
+      if (wake) committer_cv_.notify_one();
+      while (slot.wake.load(std::memory_order_acquire) == 0)
+        slot.wake.wait(0, std::memory_order_acquire);
+      if (slot.err) std::rethrow_exception(slot.err);
+      return;
+    }
     if (!leader_active_) {
       leader_active_ = true;
       slot.lead = true;
@@ -273,6 +301,63 @@ private:
     }
   }
   static constexpr bool kTargetedWake = BYTECASK_EXP_TARGETED_WAKE;
+  static constexpr bool kCommitter = BYTECASK_EXP_COMMITTER;
+
+  // EXPERIMENT E2: one thread runs every batch, back to back; writers only
+  // queue and sleep until their batch is done. Spins briefly on an empty
+  // queue before sleeping, so a steady stream never waits on its wake-up.
+  void committer_loop() {
+    std::vector<Slot *> batch;
+    for (;;) {
+      std::unique_lock<std::mutex> lk{queue_mu_};
+      if (queue_.empty()) {
+        lk.unlock();
+        const auto until = exp_now_ns() + BYTECASK_EXP_COMMITTER_SPIN_US * 1000;
+        while (queued_.load(std::memory_order_acquire) == 0 && exp_now_ns() < until)
+          __builtin_ia32_pause();
+        lk.lock();
+        while (queue_.empty() && !stop_) {
+          committer_sleeping_ = true;
+          committer_cv_.wait(lk);
+          committer_sleeping_ = false;
+        }
+        if (queue_.empty()) return;  // stop_
+      }
+      batch.clear();
+      batch.swap(queue_);
+      queued_.store(0, std::memory_order_relaxed);
+      lk.unlock();
+      {
+        const auto t0 = exp_now_ns();
+        try {
+          executor_(batch);
+        } catch (...) {
+          auto ex = std::current_exception();
+          for (auto *s : batch)
+            if (!s->err) s->err = ex;
+        }
+        ExpTimers::exec_ns.fetch_add(exp_now_ns() - t0, std::memory_order_relaxed);
+      }
+      lk.lock();
+      int synced = 0;
+      for (auto *s : batch) {
+        synced += s->sync ? 1 : 0;
+        s->done = true;
+      }
+      inflight_.fetch_sub(static_cast<int>(batch.size()), std::memory_order_release);
+      inflight_sync_.fetch_sub(synced, std::memory_order_release);
+      lk.unlock();
+      for (auto *s : batch) {
+        s->wake.store(2, std::memory_order_release);
+        s->wake.notify_one();
+      }
+    }
+  }
+  std::thread committer_;
+  std::condition_variable committer_cv_;
+  bool committer_sleeping_{false};
+  bool stop_{false};
+  std::atomic<int> queued_{0};
 
   std::function<void(std::vector<Slot *> &)> executor_;
   std::mutex queue_mu_;
