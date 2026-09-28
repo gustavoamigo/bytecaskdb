@@ -4953,6 +4953,17 @@ auto reference_count(const std::set<std::string> &keys, const std::string &from,
   return std::min(static_cast<std::size_t>(n), limit);
 }
 
+// Writes every key in one batch. A debug build walks the whole key directory
+// on each publish to check its invariants, so a put per key makes loading
+// quadratic: 40,000 puts took most of an hour under a sanitizer.
+void put_all(bytecask::DB &db, const std::ranges::input_range auto &keys,
+             std::string_view value) {
+  bytecask::WritePlan plan;
+  for (const auto &k : keys)
+    plan.put(to_bytes(k), to_bytes(value));
+  REQUIRE(db.apply_batch({.sync = false}, std::move(plan)));
+}
+
 // Structured keys (shared prefixes, as index encodings have) and random ones
 // of varying length, so leaves split on every kind of crit bit.
 auto count_test_keys(std::size_t n) -> std::set<std::string> {
@@ -4993,8 +5004,7 @@ TEST_CASE("count_keys matches the keys in the range, at every limit",
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
   const auto keys = count_test_keys(40'000);
-  for (const auto &k : keys)
-    db.put({.sync = false}, to_bytes(k), to_bytes("v"));
+  put_all(db, keys, "v");
   const std::vector<std::string> sorted(keys.begin(), keys.end());
   const auto snap = db.snapshot();
 
@@ -5021,8 +5031,7 @@ TEST_CASE("count_keys on a snapshot ignores later writes", "[count_keys]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
   auto keys = count_test_keys(5'000);
-  for (const auto &k : keys)
-    db.put({.sync = false}, to_bytes(k), to_bytes("v"));
+  put_all(db, keys, "v");
   const auto before = keys;
   const auto old_snap = db.snapshot();
 
@@ -5061,10 +5070,11 @@ TEST_CASE("count_keys reads no key per counted entry", "[count_keys]") {
   auto db = bytecask::DB::open(
       td.path / "db", {.io_backend = bytecask::IoBackend::BufferPool,
                        .buffer_pool = {.capacity_bytes = 256 * 1024 * 1024}});
-  constexpr int kKeys = 20'000;
-  for (int i = 0; i < kKeys; ++i)
-    db.put({.sync = false}, to_bytes(std::format("k{:06d}", i)),
-           to_bytes("value"));
+  put_all(db,
+          std::views::iota(0, 20'000) | std::views::transform([](int i) {
+            return std::format("k{:06d}", i);
+          }),
+          "value");
   const auto snap = db.snapshot();
   const auto hits = [&] { return db.stats().at("bytecask.pool_hits"); };
 
