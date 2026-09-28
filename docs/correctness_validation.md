@@ -1400,10 +1400,19 @@ MSan test step the slowest of the three and by far the least predictable
 (2m48s and 11m56s on two runs of the same commit, against a steady ~1m50s
 for ASan and TSan; per-job runners vary by ~1.8x and the seeded `[model]`
 workloads account for much of the rest), so it is excluded from the
-`pull_request` matrix and runs nightly and on `workflow_dispatch`. The job
-times out after two hours rather than GitHub's six, and the test run prints
-`--durations`, so a stalled run fails early and its log names the last test
-that finished.
+`pull_request` matrix and runs nightly and on `workflow_dispatch`. The job's
+`timeout-minutes` is set to two hours rather than GitHub's default six, but
+that bounds the *step*, not the test binary: GitHub's cancellation signals
+the direct child process, and a binary wedged in an uninterruptible wait
+does not necessarily respond to it. The 2026-09-27 nightly hit exactly this
+— all three MSan legs ran for GitHub's unrelated 360-minute job ceiling
+despite the 120-minute `timeout-minutes`, because the step never received
+control back from the hung test binary to be cancelled cleanly. The test
+invocation is now wrapped in `timeout --kill-after=30s <bound>` (a few
+minutes inside the step's own `timeout-minutes`), which sends the process a
+guaranteed SIGKILL directly rather than relying on the runner's own signal
+delivery. The test run also prints `--durations`, so a run cut off this way
+still names the last test that finished in its log.
 
 ### Sanitizer matrix across key directories
 
