@@ -19,6 +19,13 @@
 # The profilers slow the server, so a captured cell's NOPM is not comparable
 # with an uncaptured one; its CSV row says capture=on.
 #
+# Where the files go: a cell records into a working directory under the data
+# root, which is chosen for speed and may be scratch space that does not
+# outlive the host (EC2 instance storage is wiped when the instance stops).
+# Only the finished tarball leaves it, for the capture directory, which
+# defaults to the repository's benchmarks/captures/ — the volume the results
+# CSV is written to — and must not be instance storage.
+#
 # DWARF stacks, not frame pointers: the release builds omit frame pointers.
 # Unwinding needs only the binaries' symbol tables (capture_check_symbols warns
 # when one has none). Telling inlined functions apart, which at -O3 is most of
@@ -26,8 +33,52 @@
 # the plugin.
 
 CAPTURE_SECONDS=120       # capture length, from the start of the window
+CAPTURE_CELL_BYTES=$(( 1024 * 1024 * 1024 ))  # free space asked per cell: an
+                          # estimate — two perf recordings of a few hundred MB
+                          # plus the build-id archive of the binaries
 CAPTURE_PERF=()           # perf, or sudo -n perf
 CAPTURE_LOCKS=off         # perf lock contention -b works here
+
+# The model of the disk behind a path, e.g. "Amazon EC2 NVMe Instance
+# Storage", or nothing when it cannot be told (tmpfs, overlay, no lsblk).
+capture_disk_model() {
+  local src model parent
+  src="$(findmnt -no SOURCE --target "$1" 2>/dev/null | sed 's/\[.*//')" || return 0
+  [[ "$src" == /dev/* ]] || return 0
+  model="$(lsblk -ndo MODEL "$src" 2>/dev/null | sed 's/ *$//')"
+  if [[ -z "$model" ]]; then
+    parent="$(lsblk -ndo PKNAME "$src" 2>/dev/null)"
+    [[ -n "$parent" ]] && model="$(lsblk -ndo MODEL "/dev/$parent" 2>/dev/null | sed 's/ *$//')"
+  fi
+  echo "$model"
+}
+
+# Exits unless the capture directory can be written, is not on EC2 instance
+# storage, and has room for every cell. The captures are the run's only
+# record of what it measured; losing them to a stopped instance or a full disk
+# wastes the whole session.
+capture_check_dir() {
+  local dir="$1" cells="$2"
+  if ! mkdir -p "$dir" 2>/dev/null || [[ ! -w "$dir" ]]; then
+    echo "ERROR: cannot write the capture directory $dir; pass --capture-dir=PATH." >&2
+    exit 1
+  fi
+  local model; model="$(capture_disk_model "$dir")"
+  if [[ "$model" == *"Instance Storage"* ]]; then
+    echo "ERROR: the capture directory $dir is on EC2 instance storage ($model)," \
+         "which is wiped when the instance stops. Pass --capture-dir=PATH with a path on" \
+         "an EBS volume, e.g. under \$HOME." >&2
+    exit 1
+  fi
+  local avail need=$(( cells * CAPTURE_CELL_BYTES ))
+  avail="$(df -P -B1 "$dir" 2>/dev/null | awk 'NR == 2 { print $4 }')"
+  if [[ -n "$avail" ]] && (( avail < need )); then
+    echo "ERROR: the capture directory $dir has $(( avail / 1048576 )) MiB free;" \
+         "$cells captured cells need about $(( need / 1048576 )) MiB. Free space" \
+         "or pass --capture-dir=PATH." >&2
+    exit 1
+  fi
+}
 
 # Runs a command as the user perf runs as, so it can remove or hand back the
 # files perf wrote.
@@ -38,7 +89,7 @@ capture_as_perf_user() {
 # Exits unless every tool the capture needs is installed and perf may profile
 # the kernel side of another process. Run before anything slow happens.
 capture_preflight() {
-  local duration_min="$1"
+  local duration_min="$1" capture_dir="$2" cells="$3"
   if (( duration_min * 60 < CAPTURE_SECONDS + 10 )); then
     echo "ERROR: --capture records ${CAPTURE_SECONDS}s of the measured window;" \
          "--duration=$duration_min is too short (use 3 or more)." >&2
@@ -56,6 +107,8 @@ capture_preflight() {
     printf '  %s\n' "${missing[@]}" >&2
     exit 1
   fi
+  capture_check_dir "$capture_dir" "$cells"
+
   # Ubuntu installs a perf wrapper that fails when the tools for the running
   # kernel are missing, so being on PATH is not enough.
   if ! perf --version >/dev/null 2>&1; then
@@ -219,11 +272,14 @@ capture_run() {
   } < /dev/null > /dev/null 2>&1
 }
 
-# Turns $out into $out.tar.gz once the server has stopped: text reports that
-# read without the binaries, the perf data with its build-id archive for a
-# fuller look elsewhere, and a description of the host and build.
+# Packs the working directory $out into $dest (a .tar.gz path) once the server
+# has stopped: text reports that read without the binaries, the perf data with
+# its build-id archive for a fuller look elsewhere, the cell's HammerDB log,
+# and a description of the host and build. The working directory is removed
+# only once the tarball is complete; otherwise it stays, and the error says
+# where.
 capture_finish() {
-  local out="$1" cnf="$2"
+  local out="$1" dest="$2" cnf="$3" run_log="$4"
   [[ -d "$out" ]] || return 0
   {
     local data
@@ -246,8 +302,15 @@ capture_finish() {
                                    git -C "$BYTECASK_ROOT" status --short
     } > "$out/host.txt" 2>&1 || true
     cp "$cnf" "$out/" || true
+    cp "$run_log" "$out/" || true
   } < /dev/null > /dev/null 2>&1
-  if tar -czf "$out.tar.gz" -C "$(dirname "$out")" "$(basename "$out")" 2>/dev/null; then
+  local err
+  if err="$(tar -czf "$dest.partial" -C "$(dirname "$out")" "$(basename "$out")" 2>&1)" &&
+     mv "$dest.partial" "$dest"; then
     rm -rf "$out"
+  else
+    rm -f "$dest.partial"
+    echo "ERROR: could not write $dest: $err" >&2
+    echo "       The unpacked capture is still in $out — copy it before the host goes away." >&2
   fi
 }
