@@ -88,6 +88,11 @@ Two more words of state:
 
 ### Stage 1 — unchanged `WriteGroup`, executor stops before fdatasync
 
+(Since superseded for stage 1: batches queued behind a running one are now
+run by a committer thread rather than handed to a queued writer — see
+*Write path — group commit* in `docs/bytecask_design.md`. Stage 2 is
+unchanged.)
+
 `WriteGroup` stays as it is after the hand-off-every-batch change: a leader
 takes the queue, runs the executor once, marks its batch done, hands leadership
 to the queue head in the same broadcast. What changes is the executor,

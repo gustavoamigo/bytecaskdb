@@ -7,8 +7,10 @@
 module;
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <iostream>
@@ -46,9 +48,21 @@ public:
 export struct Slot {
   bool sync{false};
   bool done{false};
-  bool lead{false};  // set by WriteGroup when this slot is handed leadership
   std::exception_ptr err;
+  // WriteGroup only: the word a queued slot's owner waits on. See
+  // WriteGroup::release for why it has three values rather than two.
+  std::atomic<std::uint32_t> state{0};
 };
+
+// Spin-wait hint: lets a sibling hyperthread run and saves power while a
+// thread polls a word another core will change.
+inline void cpu_relax() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__)
+  asm volatile("yield" ::: "memory");
+#endif
+}
 
 // ---------------------------------------------------------------------------
 // SoloWriter — single-slot writer with the same submit() interface as
@@ -86,29 +100,59 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// WriteGroup — leader-applies-all write batching (Template Method pattern).
+// WriteGroup — group commit through one serial section (Template Method).
 //
-// The algorithm skeleton lives here: enqueue → elect leader → take the queue
-// as one batch → call executor → mark done → hand leadership to the head of
-// the queue → wake. The domain-specific batch execution logic is injected via
-// a BatchExecutor callback at construction time.
+// Every write passes through the executor one batch at a time. A writer that
+// finds no batch running runs one itself, inline: it takes everything queued,
+// its own slot included, as one batch, then returns to its caller — a lone
+// writer never sleeps and never wakes another thread. Slots queued while a
+// batch runs are taken by the committer thread, which runs batch after batch
+// until the queue is empty and then waits for the next hand-over.
 //
-// submit() is non-template — it takes a Slot&.
+// Why a committer rather than handing the next batch to a queued writer: the
+// next batch cannot start until the thread that runs it is on a CPU. A
+// queued writer is asleep, and waking it put a scheduler round trip —
+// measured at ~300 µs per batch on a busy host — between every two batches.
+// The committer is already running when a queue forms (it spins briefly
+// before sleeping), so under load batches run back to back. Fairness is
+// unchanged: an inline writer still runs exactly one batch before returning,
+// and the committer has no caller of its own to keep waiting.
+//
+// The domain-specific batch execution logic is injected via a BatchExecutor
+// callback at construction time. submit() is non-template — it takes a Slot&.
+// Under BYTECASK_SINGLE_THREADED there is no committer: with one thread, no
+// slot is ever queued behind a running batch.
 // ---------------------------------------------------------------------------
 export class WriteGroup {
 public:
   explicit WriteGroup(
       std::function<void(std::vector<Slot *> &)> executor)
-      : executor_{std::move(executor)} {}
+      : executor_{std::move(executor)} {
+#ifndef BYTECASK_SINGLE_THREADED
+    committer_ = std::thread{[this] { committer_loop(); }};
+#endif
+  }
+
+  // Stops the committer. No submit may be in flight.
+  ~WriteGroup() {
+#ifndef BYTECASK_SINGLE_THREADED
+    {
+      std::lock_guard<std::mutex> lk{queue_mu_};
+      stop_ = true;
+    }
+    committer_cv_.notify_one();
+    committer_.join();
+#endif
+  }
 
   WriteGroup(const WriteGroup &) = delete;
   WriteGroup &operator=(const WriteGroup &) = delete;
 
 #ifdef BYTECASK_TESTING
-  // Test-only hook: called after the leader is elected but before it takes
-  // the queue as its batch. Allows a second thread to enqueue its slot
-  // deterministically into the same batch.
-  std::function<void()> on_leader_start_;
+  // Test-only hook: called on the thread about to run a batch (an inline
+  // writer or the committer) before it takes the queue. Allows a second
+  // thread to enqueue its slot deterministically into the same batch.
+  std::function<void()> on_batch_start_;
 
   // Block until the internal queue has at least n entries.
   void wait_for_queue_size(std::size_t n) {
@@ -122,43 +166,53 @@ public:
   }
 #endif
 
-  // Enqueues slot and blocks until it is done. A submitter that finds no
-  // leader becomes one and runs a single batch — everything queued at that
-  // moment, its own slot included — then returns to its caller. If slots
-  // were queued while the batch ran, leadership passes to the head of the
-  // queue in the same broadcast that releases the batch.
-  //
-  // One batch per leader, not a run of them. The leader's own slot is done
-  // after its batch, so every further batch it ran was time its caller
-  // waited — and under closed-loop clients that batch released every other
-  // writer at once, leaving the queue empty for the round trip each needed
-  // before resubmitting. Measured on MariaDB sysbench oltp_write_only, 8
-  // clients, a leader allowed 8 consecutive batches alternated batches of 1
-  // and 7 with ~220 µs between batches; a hand-off after every batch gave
-  // uniform batches of ~4 and ~70 µs.
+  // Enqueues slot and returns once the executor has run it. Rethrows the
+  // slot's error, if it has one.
   void submit(Slot &slot) {
-    std::unique_lock<std::mutex> lk{queue_mu_};
     slot.done = false;
-    slot.lead = false;
     slot.err = nullptr;
+    slot.state.store(kQueued, std::memory_order_relaxed);
+    std::unique_lock<std::mutex> lk{queue_mu_};
     queue_.push_back(&slot);
     inflight_.fetch_add(1, std::memory_order_relaxed);
     if (slot.sync) inflight_sync_.fetch_add(1, std::memory_order_relaxed);
 
-    if (!leader_active_) {
-      leader_active_ = true;
-      slot.lead = true;
+    if (running_) {
+      lk.unlock();
+      wait_released(slot);
     } else {
-      cv_.wait(lk, [&] { return slot.done || slot.lead; });
+      running_ = true;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+      // Reused so an inline commit allocates nothing here.
+      thread_local std::vector<Slot *> batch;
+#pragma clang diagnostic pop
+      run_batch(lk, batch);
+#ifdef BYTECASK_SINGLE_THREADED
+      while (!queue_.empty()) run_batch(lk, batch);
+      running_ = false;
+      lk.unlock();
+#else
+      // Slots queued while this batch ran go to the committer; running_
+      // stays set so no inline writer overtakes them.
+      const bool more = !queue_.empty();
+      if (more) {
+        hand_over_.store(true, std::memory_order_release);
+      } else {
+        running_ = false;
+      }
+      const bool wake = more && committer_sleeping_;
+      lk.unlock();
+      if (wake) committer_cv_.notify_one();
+#endif
+      release(batch, &slot);
     }
-    if (slot.lead) lead(lk);
-
     if (slot.err) std::rethrow_exception(slot.err);
   }
 
   // True while any submitted slot has not been executed yet: queued, or in
-  // the batch the leader is running. Lock-free so the commit pipeline's
-  // flusher can let an in-progress batch land before it captures the head.
+  // the batch being run. Lock-free so the commit pipeline's flusher can let
+  // an in-progress batch land before it captures the head.
   [[nodiscard]] auto busy() const noexcept -> bool {
     return inflight_.load(std::memory_order_acquire) > 0;
   }
@@ -170,19 +224,28 @@ public:
   }
 
 private:
-  // Runs one batch. Called with lk held and leader_active_ set; drops lk
-  // around the executor call and returns with lk released. One broadcast
-  // wakes the finished batch and the next leader together — a wake per slot
-  // measured 2× slower at 32 writers.
-  void lead(std::unique_lock<std::mutex> &lk) {
+  static constexpr std::uint32_t kQueued = 0;
+  static constexpr std::uint32_t kReleasing = 1;
+  static constexpr std::uint32_t kDone = 2;
+  // A queued unsynced writer polls its slot this long before sleeping: a
+  // batch ahead of it that finishes within the window costs it no scheduler
+  // round trip. A synced writer sleeps at once (see wait_released).
+  static constexpr auto kWriterSpin = std::chrono::microseconds{10};
+  // The committer polls for the next hand-over this long before sleeping, so
+  // under steady load it is running when a queue forms.
+  static constexpr auto kCommitterSpin = std::chrono::microseconds{50};
+
+  // Takes the queue as one batch and runs it. Called and returns with lk
+  // held and running_ set; drops lk around the executor.
+  void run_batch(std::unique_lock<std::mutex> &lk, std::vector<Slot *> &batch) {
 #ifdef BYTECASK_TESTING
-    if (on_leader_start_) {
+    if (on_batch_start_) {
       lk.unlock();
-      on_leader_start_();
+      on_batch_start_();
       lk.lock();
     }
 #endif
-    std::vector<Slot *> batch;
+    batch.clear();
     batch.swap(queue_);
     lk.unlock();
 
@@ -204,22 +267,91 @@ private:
     inflight_.fetch_sub(static_cast<int>(batch.size()),
                         std::memory_order_release);
     inflight_sync_.fetch_sub(synced, std::memory_order_release);
-    if (queue_.empty()) {
-      leader_active_ = false;
-    } else {
-      queue_.front()->lead = true;
-    }
-    lk.unlock();
-    cv_.notify_all();
   }
+
+  // Returns every slot of a finished batch but `self` (the running thread's
+  // own) to its owner. kDone is the last write to a slot: its owner returns
+  // only on kDone, and may destroy the slot the moment it does, so the
+  // notify — which needs the slot alive — happens under kReleasing, while
+  // the owner is still bound to wait.
+  static void release(const std::vector<Slot *> &batch, const Slot *self) {
+    for (auto *s : batch) {
+      if (s == self) continue;
+      s->state.store(kReleasing, std::memory_order_release);
+      s->state.notify_one();
+      s->state.store(kDone, std::memory_order_release);
+    }
+  }
+
+  static void wait_released(Slot &slot) {
+    // A synced writer does not poll: released at once, it would reach the
+    // flush wait before the flush covering it publishes, and sleep there.
+    const auto spin_until = std::chrono::steady_clock::now() +
+        (slot.sync ? std::chrono::microseconds{0} : kWriterSpin);
+    bool spinning = true;
+    for (;;) {
+      const auto s = slot.state.load(std::memory_order_acquire);
+      if (s == kDone) return;
+      if (spinning && std::chrono::steady_clock::now() >= spin_until)
+        spinning = false;
+      if (s == kQueued && !spinning)
+        slot.state.wait(kQueued, std::memory_order_acquire);
+      else
+        cpu_relax();  // spinning, or the releaser is between notify and kDone
+    }
+  }
+
+#ifndef BYTECASK_SINGLE_THREADED
+  void committer_loop() {
+    std::vector<Slot *> batch;
+    std::unique_lock<std::mutex> lk{queue_mu_};
+    for (;;) {
+      if (!hand_over_.load(std::memory_order_relaxed)) {
+        lk.unlock();
+        const auto spin_until = std::chrono::steady_clock::now() + kCommitterSpin;
+        while (!hand_over_.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < spin_until)
+          cpu_relax();
+        lk.lock();
+        while (!hand_over_.load(std::memory_order_relaxed) && !stop_) {
+          committer_sleeping_ = true;
+          committer_cv_.wait(lk);
+          committer_sleeping_ = false;
+        }
+        if (!hand_over_.load(std::memory_order_relaxed)) return;  // stop_
+      }
+      hand_over_.store(false, std::memory_order_relaxed);
+      // running_ is this thread's until the queue is empty.
+      for (;;) {
+        run_batch(lk, batch);
+        const bool more = !queue_.empty();
+        if (!more) running_ = false;
+        lk.unlock();
+        release(batch, nullptr);
+        lk.lock();
+        if (!more) break;
+      }
+    }
+  }
+#endif
 
   std::function<void(std::vector<Slot *> &)> executor_;
   std::mutex queue_mu_;
   std::vector<Slot *> queue_;
-  bool leader_active_{false};
-  std::condition_variable cv_;
+  // A batch is running, or the queue has been handed to the committer.
+  // Guarded by queue_mu_.
+  bool running_{false};
   std::atomic<int> inflight_{0};
   std::atomic<int> inflight_sync_{0};  // the subset of inflight_ with sync
+#ifndef BYTECASK_SINGLE_THREADED
+  // Set, under queue_mu_, when an inline writer leaves slots queued behind
+  // its batch; read without the lock by the spinning committer.
+  std::atomic<bool> hand_over_{false};
+  bool committer_sleeping_{false};  // guarded by queue_mu_
+  bool stop_{false};                // guarded by queue_mu_
+  std::condition_variable committer_cv_;
+  std::thread committer_;
+#endif
 };
 
 // ---------------------------------------------------------------------------
