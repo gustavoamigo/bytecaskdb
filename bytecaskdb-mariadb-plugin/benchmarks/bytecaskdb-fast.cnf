@@ -20,7 +20,7 @@ bytecaskdb_sync_interval_ms               = 1000
 bytecaskdb_io_backend                     = buffer_pool
 bytecaskdb_buffer_pool_size               = 17179869184
 bytecaskdb_buffer_pool_direct_io          = OFF
-bytecaskdb_max_file_bytes                 = 67108864
+bytecaskdb_max_file_bytes                 = 536870912
 
 # Reads: skip the per-value CRC, as the other engine benchmarks here do.
 bytecaskdb_verify_checksums               = OFF

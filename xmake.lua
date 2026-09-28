@@ -181,6 +181,12 @@ if keydir ~= "radix" and keydir ~= "btree" then
     add_defines("BYTECASK_KEYDIR_BLIND")
 end
 
+-- EXPERIMENT toggles (branch exp/commit-probe only), applied to every target
+-- so the MariaDB plugin's libbytecask.a gets them too.
+for _, d in ipairs({"BYTECASK_EXP_TARGETED_WAKE", "BYTECASK_EXP_SKIP_INSERT_WW"}) do
+    if os.getenv(d) then add_defines(d .. "=" .. os.getenv(d)) end
+end
+
 local march = os.getenv("BYTECASK_MARCH") or "native"
 local function add_release_opts(t)
     if is_mode("release") then
@@ -300,6 +306,19 @@ target("engine_bench")
     else
         add_packages("benchmark", "crc32c", "zstd", "rocksdb")
     end
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
+
+target("commit_probe")
+    set_kind("binary")
+    set_default(false)
+    add_files("benchmarks/commit_probe.cpp", "bytecaskdb/*.cppm")
+    add_packages("crc32c", "zstd")
+    set_strip("none")
+    add_cxflags("-g")
     on_config(function(t)
         add_native_syslinks(t)
         apply_sanitizer(t)

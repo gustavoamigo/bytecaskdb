@@ -7,6 +7,8 @@
 module;
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <condition_variable>
 #include <cstddef>
 #include <exception>
@@ -20,6 +22,25 @@ module;
 #include <vector>
 
 export module bytecask.concurrency;
+#ifndef BYTECASK_EXP_TARGETED_WAKE
+#define BYTECASK_EXP_TARGETED_WAKE 0
+#endif
+
+// EXPERIMENT ONLY: timing of the group-commit path.
+export struct ExpTimers {
+  static inline std::atomic<std::int64_t> exec_ns{0};
+  static inline std::atomic<std::int64_t> handoff_ns{0};
+  static inline std::atomic<std::int64_t> handoffs{0};
+  static inline std::atomic<std::int64_t> mu_wait_ns{0};
+  static inline std::atomic<std::int64_t> append_ns{0};
+  static inline std::atomic<std::int64_t> rotate_ns{0};
+  static inline std::atomic<std::int64_t> rotate_n{0};
+};
+export inline auto exp_now_ns() -> std::int64_t {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 namespace bytecask {
 
@@ -48,6 +69,8 @@ export struct Slot {
   bool done{false};
   bool lead{false};  // set by WriteGroup when this slot is handed leadership
   std::exception_ptr err;
+  // EXPERIMENT E1: 0 waiting, 1 leads, 2 done — the word the owner sleeps on.
+  std::atomic<std::uint32_t> wake{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -145,9 +168,19 @@ public:
     inflight_.fetch_add(1, std::memory_order_relaxed);
     if (slot.sync) inflight_sync_.fetch_add(1, std::memory_order_relaxed);
 
+    slot.wake.store(0, std::memory_order_relaxed);
     if (!leader_active_) {
       leader_active_ = true;
       slot.lead = true;
+    } else if (kTargetedWake) {
+      lk.unlock();
+      std::uint32_t w;
+      while ((w = slot.wake.load(std::memory_order_acquire)) == 0)
+        slot.wake.wait(0, std::memory_order_acquire);
+      if (w == 1) {
+        lk.lock();
+        slot.lead = true;
+      }
     } else {
       cv_.wait(lk, [&] { return slot.done || slot.lead; });
     }
@@ -182,11 +215,22 @@ private:
       lk.lock();
     }
 #endif
+    const auto t_start = exp_now_ns();
+    if (handoff_at_ != 0) {
+      ExpTimers::handoff_ns.fetch_add(t_start - handoff_at_, std::memory_order_relaxed);
+      ExpTimers::handoffs.fetch_add(1, std::memory_order_relaxed);
+      handoff_at_ = 0;
+    }
     std::vector<Slot *> batch;
     batch.swap(queue_);
     lk.unlock();
 
+    struct ExecTimer {
+      std::int64_t t0 = exp_now_ns();
+      ~ExecTimer() { ExpTimers::exec_ns.fetch_add(exp_now_ns() - t0, std::memory_order_relaxed); }
+    };
     try {
+      ExecTimer et;
       executor_(batch);
     } catch (...) {
       auto ex = std::current_exception();
@@ -204,19 +248,37 @@ private:
     inflight_.fetch_sub(static_cast<int>(batch.size()),
                         std::memory_order_release);
     inflight_sync_.fetch_sub(synced, std::memory_order_release);
+    Slot *next = nullptr;
     if (queue_.empty()) {
       leader_active_ = false;
     } else {
-      queue_.front()->lead = true;
+      next = queue_.front();
+      if (!kTargetedWake) next->lead = true;
+      handoff_at_ = exp_now_ns();
     }
     lk.unlock();
-    cv_.notify_all();
+    if (!kTargetedWake) {
+      cv_.notify_all();
+      return;
+    }
+    // The next leader first: it is on the critical path, the batch is not.
+    if (next) {
+      next->wake.store(1, std::memory_order_release);
+      next->wake.notify_one();
+    }
+    for (auto *s : batch) {
+      if (s->lead) continue;  // this thread's own slot
+      s->wake.store(2, std::memory_order_release);
+      s->wake.notify_one();
+    }
   }
+  static constexpr bool kTargetedWake = BYTECASK_EXP_TARGETED_WAKE;
 
   std::function<void(std::vector<Slot *> &)> executor_;
   std::mutex queue_mu_;
   std::vector<Slot *> queue_;
   bool leader_active_{false};
+  std::int64_t handoff_at_{0};
   std::condition_variable cv_;
   std::atomic<int> inflight_{0};
   std::atomic<int> inflight_sync_{0};  // the subset of inflight_ with sync

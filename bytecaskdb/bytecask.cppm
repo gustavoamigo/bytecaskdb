@@ -45,6 +45,9 @@ module;
 #include <vector>
 
 export module bytecask;
+#ifndef BYTECASK_EXP_SKIP_INSERT_WW
+#define BYTECASK_EXP_SKIP_INSERT_WW 0
+#endif
 
 export import :internals;
 import bytecask.batch_iterator;
@@ -1984,6 +1987,9 @@ auto TransientEngineState::validate_preconditions(
     const auto point_conflict = [&](std::size_t i, const Bytes &key) {
       const std::span<const std::byte> key_span{key};
       const auto snap_entry = plan.snapshot_entry(i, key_span);
+#if BYTECASK_EXP_SKIP_INSERT_WW
+      if (!snap_entry) return false;  // EXPERIMENT U1: unsafe upper bound
+#endif
       if (snap_entry && kd_holds(key_dir_, key_span, *snap_entry)) return false;
       const auto cur_entry = kd_get(key_dir_, key_span, kd_ctx());
       const bool appeared = !snap_entry && cur_entry;
@@ -2917,7 +2923,9 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
 // batch that crosses the rotation threshold: it quiesces the pipeline and
 // runs sync / rotate / publish inline, once per max_file_bytes.
 void DB::execute_slots(std::vector<Slot *> &batch) {
+  const auto t_mu = exp_now_ns();
   std::lock_guard<std::mutex> wg{*write_mu_};
+  ExpTimers::mu_wait_ns.fetch_add(exp_now_ns() - t_mu, std::memory_order_relaxed);
 
   // Admission is decided on the published state, not the head: a flush
   // fails without write_mu_ and head_ is only reset by the next barrier,
@@ -2993,7 +3001,9 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
   // Phase 2: one I/O call for all collected entries.
   std::vector<std::uint64_t> io_offsets(all_entries.size());
   try {
+    const auto t_app = exp_now_ns();
     file.append_entries(all_entries, io_offsets);
+    ExpTimers::append_ns.fetch_add(exp_now_ns() - t_app, std::memory_order_relaxed);
   } catch (...) {
     auto ex = std::current_exception();
     try { file.sync(); } catch (...) {}
@@ -3030,6 +3040,13 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
   // head, then this batch is synced before the file is sealed. apply_sync
   // gives t the durable_seq the head chain does not carry; degraded
   // transitions build on the published state.
+  struct RotTimer {
+    std::int64_t t0 = exp_now_ns();
+    ~RotTimer() {
+      ExpTimers::rotate_ns.fetch_add(exp_now_ns() - t0, std::memory_order_relaxed);
+      ExpTimers::rotate_n.fetch_add(1, std::memory_order_relaxed);
+    }
+  } rot_timer;
   auto role = quiesce();
   published = load_state();  // quiesce may have published the previous head
   // The flush quiesce() waited on — this thread's or another writer's — may
@@ -3968,6 +3985,13 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.bytes_written.load(std::memory_order_relaxed)},
       {"bytecask.group_writer_batches",
        counters_.group_writer_batches.load(std::memory_order_relaxed)},
+      {"exp.exec_ns", ExpTimers::exec_ns.load()},
+      {"exp.handoff_ns", ExpTimers::handoff_ns.load()},
+      {"exp.handoffs", ExpTimers::handoffs.load()},
+      {"exp.mu_wait_ns", ExpTimers::mu_wait_ns.load()},
+      {"exp.append_ns", ExpTimers::append_ns.load()},
+      {"exp.rotate_ns", ExpTimers::rotate_ns.load()},
+      {"exp.rotate_n", ExpTimers::rotate_n.load()},
       {"bytecask.group_writer_coalesced",
        counters_.group_writer_coalesced.load(std::memory_order_relaxed)},
       {"bytecask.file_rotations",
