@@ -1397,33 +1397,21 @@ Run: `scripts/run_sanitizer.sh memory`. Target scope matches the ASan/TSan
 jobs above: `bytecask_tests` only, not `radix_tree_memory_tests` or
 `unordered_view_tests`. Trigger scope does not — origin tracking makes the
 MSan test step the slowest of the three and by far the least predictable
-(2m48s and 11m56s on two runs of the same commit against an early, much
-smaller version of the suite; the ASan/TSan/UBSan legs have grown alongside
-it and are no longer the couple of minutes an older measurement here once
-claimed — see the 2026-09-28 confirmation run below), so it is excluded from
-the `pull_request` matrix and runs nightly and on `workflow_dispatch`. The
-job's `timeout-minutes` is set to two hours rather than GitHub's default six,
-but that bounds the *step*, not the test binary: GitHub's cancellation
-signals the direct child process, and a binary wedged in an uninterruptible
-wait does not necessarily respond to it. The 2026-09-27 nightly hit exactly
-this — all three MSan legs ran for GitHub's unrelated 360-minute job ceiling
-despite the 120-minute `timeout-minutes`, because the step never received
-control back from the hung test binary to be cancelled cleanly. The MSan
-invocation is now wrapped in `timeout --kill-after=30s 110m`, which sends the
-process a guaranteed SIGKILL directly rather than relying on the runner's own
-signal delivery.
+(2m48s and 11m56s on two runs of the same commit, on an early, much smaller
+suite; per-job runners vary by ~1.8x and the seeded `[model]` workloads
+account for much of the rest), so it is excluded from the `pull_request`
+matrix and runs nightly and on `workflow_dispatch`. The job times out after
+two hours rather than GitHub's six, and the test run prints `--durations`,
+so a stalled run fails early and its log names the last test that finished.
+The six-hour MSan runs before that limit existed also built at `-O0`; at
+`-O1` the MSan legs finish in 20–65 minutes.
 
-This is scoped to the `memory` leg only. A same-day confirmation run
-(2026-09-28, `workflow_dispatch`) found `sanitizers (radix, thread)` still
-running — 866 of the suite's 2,862 cases done, no stall, `--durations`
-showing normal per-test progress — when a first draft of this fix wrapped
-*every* leg in the same 50-minute `timeout`; the wrapper SIGTERM'd a healthy,
-still-progressing run and Catch2 logged that termination as a failure.
-Address, thread and undefined have never shown the MSan-style stall, so they
-keep relying on `timeout-minutes` alone; wrapping them the same way if one
-of them ever does stall, rather than ahead of evidence, is the right call
-per this project's own bias toward the simpler option until a real case
-shows it insufficient.
+Every sanitizer job builds in debug mode, where each published state walks
+the whole key directory to check its invariants (`store_state`). A test that
+loads N keys with N single puts is therefore O(N²) there: loaded that way,
+40,000 keys cost one `count_keys` test 42–49 minutes on the radix key
+directory under ASan and TSan, and pushed those jobs past their 60-minute
+limit. A test that needs a large key set loads it in one `apply_batch`.
 
 ### Sanitizer matrix across key directories
 
