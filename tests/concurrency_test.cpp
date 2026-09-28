@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -199,11 +200,12 @@ TEST_CASE("WriteGroup concurrent submits are batched", "[concurrency]") {
   CHECK(exec_calls.load() <= kThreads);
 }
 
-// A leader runs exactly one batch, then returns to its caller and passes
-// leadership to a slot queued during that batch. Under a leader that kept
-// draining, A would also run the second batch before returning, and that
-// batch's executor — which waits for A to have returned — times out.
-TEST_CASE("WriteGroup leader hands off after its batch", "[concurrency]") {
+// An inline writer runs exactly one batch, then returns to its caller; a slot
+// queued during that batch is run by the committer thread. Under a writer
+// that kept draining, A would also run the second batch before returning,
+// and that batch's executor — which waits for A to have returned — times out.
+TEST_CASE("WriteGroup inline writer returns after one batch; the committer runs the next",
+          "[concurrency]") {
   std::mutex mu;
   std::condition_variable cv;
   bool follower_queued = false;   // written by main thread under mu
@@ -258,6 +260,59 @@ TEST_CASE("WriteGroup leader hands off after its batch", "[concurrency]") {
   REQUIRE(leaders.size() == 2);
   CHECK(leaders[0] == a_id);
   CHECK(leaders[1] != a_id);
+}
+
+TEST_CASE("WriteGroup lone writer runs its batch on its own thread",
+          "[concurrency]") {
+  std::vector<std::thread::id> runners;
+  bytecask::WriteGroup wg{[&](std::vector<bytecask::Slot *> &batch) {
+    runners.push_back(std::this_thread::get_id());
+    CHECK(batch.size() == 1);
+  }};
+  for (int i = 0; i < 100; ++i) {
+    bytecask::Slot slot;
+    wg.submit(slot);
+  }
+  REQUIRE(runners.size() == 100);
+  for (const auto &id : runners) CHECK(id == std::this_thread::get_id());
+}
+
+// A slot lives on its owner's stack and dies the moment submit returns. The
+// thread that runs the batch must be done touching it by then; ASan and TSan
+// check that here, across inline batches and committer batches.
+TEST_CASE("WriteGroup slots may be destroyed as soon as submit returns",
+          "[concurrency]") {
+  std::atomic<long> executed{0};
+  bytecask::WriteGroup wg{[&](std::vector<bytecask::Slot *> &batch) {
+    for (auto *s : batch) s->sync = !s->sync;  // touch every slot
+    executed.fetch_add(static_cast<long>(batch.size()), std::memory_order_relaxed);
+  }};
+  constexpr int kThreads = 8;
+  constexpr int kPerThread = 20000;
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&] {
+      for (int i = 0; i < kPerThread; ++i) {
+        auto slot = std::make_unique<bytecask::Slot>();
+        wg.submit(*slot);
+        slot.reset();  // freed at once; a late touch is a use-after-free
+      }
+    });
+  }
+  for (auto &t : threads) t.join();
+  CHECK(executed.load() == long{kThreads} * kPerThread);
+  CHECK_FALSE(wg.busy());
+}
+
+TEST_CASE("WriteGroup starts and stops its committer cleanly", "[concurrency]") {
+  for (int i = 0; i < 200; ++i) {
+    bytecask::WriteGroup wg{[](std::vector<bytecask::Slot *> &) {}};
+    if (i % 2 == 0) {
+      bytecask::Slot slot;
+      wg.submit(slot);
+    }
+  }
+  SUCCEED();
 }
 
 TEST_CASE("WriteGroup executor exception propagates to the failing slot",
