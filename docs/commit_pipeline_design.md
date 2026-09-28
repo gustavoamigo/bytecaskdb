@@ -597,3 +597,29 @@ is above it because the settle wait shows up in the 128–512 µs buckets
 
 `scripts/run_sanitizer.sh thread` and `address`: 1475 cases, no reports,
 run twice — before and after the settle change to `WriteGroup`.
+
+## The serial section at 48 cores
+
+Stage 1 runs one batch at a time under `write_mu_`. Once it is saturated,
+write throughput is `1 / its cost per commit`, whatever the thread count.
+That is what capped ByteCaskDB on HammerDB TPROC-C on a 48-vCPU host
+(c6id.12xlarge, 96 warehouses): level with InnoDB at 14 users, 22% behind at
+48 (424,518 vs 542,094 NOPM), with the host 62% idle. Timers in the
+group-commit path, with the data on a RAM disk, put stage 1 at 93–97% busy
+at ~60 µs per commit, which caps commits at ~16,600/s: what MariaDB's
+`Com_commit` showed.
+
+On that host the committer's profile split the 60 µs as: key directory work
+(descents, leaf edits, path copies, node allocation) about two thirds;
+validation 14% of it; the append (`pwritev`, the buffer-pool copy, CRC)
+17–23%; the rest allocator and kernel.
+
+`bytecask.group_writer_busy_us` measures stage 1 directly: over elapsed time,
+how busy it is; over `group_writer_coalesced`, its cost per write.
+`benchmarks/commit_probe.cpp` reproduces the TPROC-C commit without MariaDB:
+closed-loop threads, each a snapshot, 10 reads, 10 updates and 12 inserts
+committed with `sync = false`, beside one empty `sync = true` commit a second
+(the plugin's interval sync). It reports commits/s, batch shape, the serial
+busy share and serial µs per commit, and every change to stage 1 is judged by
+the last of those. Run it on tmpfs, with jemalloc preloaded and the two
+builds alternating; on a full machine compare only runs from one session.

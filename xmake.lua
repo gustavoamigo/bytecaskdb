@@ -354,6 +354,20 @@ target("engine_bench")
         add_release_opts(t)
     end)
 
+-- Serial section of the write path under many writers: throughput, batch
+-- shape and group_writer_busy_us for a TPROC-C-shaped commit
+-- (benchmarks/commit_probe.cpp). No RocksDB, no Google Benchmark.
+target("commit_probe")
+    set_kind("binary")
+    set_default(false)
+    add_files("benchmarks/commit_probe.cpp", "bytecaskdb/*.cppm")
+    add_packages("crc32c", "zstd")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
+
 -- Buffer pool sweep over pool_bytes / dataset_bytes. Deliberately independent
 -- of engine_bench: no RocksDB, no Google Benchmark, since this is a parameter
 -- sweep reported as p50/p99, not a microbenchmark.

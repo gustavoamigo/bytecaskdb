@@ -10308,6 +10308,7 @@ TEST_CASE("stats: fresh DB has zero counters and one open file",
   CHECK(s.at("bytecask.bytes_written") == 0);
   CHECK(s.at("bytecask.group_writer_batches") == 0);
   CHECK(s.at("bytecask.group_writer_coalesced") == 0);
+  CHECK(s.at("bytecask.group_writer_busy_us") == 0);
   CHECK(s.at("bytecask.fsyncs") == 0);
   CHECK(s.at("bytecask.disk_reads") == 0);
   CHECK(s.at("bytecask.disk_read_bytes") == 0);
@@ -10333,6 +10334,24 @@ TEST_CASE("stats: write counters increment on put",
   CHECK(s.at("bytecask.group_writer_batches") >= 2);
   CHECK(s.at("bytecask.group_writer_coalesced") >= 2);
   CHECK(s.at("bytecask.fsyncs") >= 2);
+}
+
+TEST_CASE("stats: group_writer_busy_us counts the serial section, within wall time",
+          "[bytecask][stats]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path);
+  const auto before = db.stats().at("bytecask.group_writer_busy_us");
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < 2000; ++i) {
+    const auto k = std::format("k{}", i);
+    db.put({.sync = false}, to_bytes(k), to_bytes("value"));
+  }
+  const auto wall_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - t0)
+                           .count();
+  const auto busy = db.stats().at("bytecask.group_writer_busy_us") - before;
+  CHECK(busy > 0);
+  CHECK(busy <= wall_us);
 }
 
 TEST_CASE("stats: disk_reads and disk_read_bytes increment on get",
@@ -10417,6 +10436,7 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.bytes_written",
       "bytecask.group_writer_batches",
       "bytecask.group_writer_coalesced",
+      "bytecask.group_writer_busy_us",
       "bytecask.file_rotations",
       "bytecask.fsyncs",
       "bytecask.commit_wait_blocked",
