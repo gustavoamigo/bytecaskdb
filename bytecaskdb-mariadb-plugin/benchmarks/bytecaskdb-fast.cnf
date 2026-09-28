@@ -20,7 +20,11 @@ bytecaskdb_sync_interval_ms               = 1000
 bytecaskdb_io_backend                     = buffer_pool
 bytecaskdb_buffer_pool_size               = 17179869184
 bytecaskdb_buffer_pool_direct_io          = OFF
-bytecaskdb_max_file_bytes                 = 67108864
+# 512 MiB data files: a rotation runs two fdatasyncs with every writer
+# waiting, and at the ~57 MB/s TPROC-C appends at 96 warehouses, 64 MiB files
+# rotated about once a second (docs/commit_path_scaling_design.md). The pool
+# must hold at least two files; 16 GiB does.
+bytecaskdb_max_file_bytes                 = 536870912
 
 # Reads: skip the per-value CRC, as the other engine benchmarks here do.
 bytecaskdb_verify_checksums               = OFF

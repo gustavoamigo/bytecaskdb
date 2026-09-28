@@ -380,12 +380,56 @@ void pread_exact(int fd, Offset offset, std::size_t len, std::byte *dst) {
   while (done < len) {
     const auto n =
         ::pread(fd, dst + done, len - done, narrow<off_t>(offset + done));
-    if (n <= 0) {
+    if (n < 0) {
       throw std::system_error{errno, std::generic_category(),
                               "bytecask: pread failed"};
     }
+    if (n == 0) {  // end of file: sets no errno, so name the cause ourselves
+      throw std::system_error{std::make_error_code(std::errc::io_error),
+                              "bytecask: pread reached the end of the file"};
+    }
     done += static_cast<std::size_t>(n);
   }
+}
+
+// Writes all of iov at offset. A regular file writes short only when it can
+// take no more — a full disk, a file size limit — and a short write sets no
+// errno, so reporting it would report whatever an earlier call left there
+// (issue #221). The rest is written by further calls instead: one completes
+// it, or fails with the errno that names the cause. False with errno set on
+// failure, as pwritev. A write that completes in one call — every one that
+// does not run out of space — leaves iov untouched, so a caller may go on
+// using it (the buffer pool is filled from the same iovecs).
+auto pwritev_all(int fd, std::span<const ::iovec> iov, Offset offset) -> bool {
+  std::size_t total = 0;
+  for (const auto &v : iov) total += v.iov_len;
+  const auto first = ::pwritev(fd, iov.data(), narrow<int>(iov.size()),
+                               narrow<off_t>(offset));
+  if (first < 0) return false;
+  auto done = static_cast<std::size_t>(first);
+  if (done == total) return true;
+
+  std::vector<::iovec> rest(iov.begin(), iov.end());
+  auto head = rest.begin();
+  auto skip = done;
+  while (done < total) {
+    while (skip >= head->iov_len) {  // drop what is already written
+      skip -= head->iov_len;
+      ++head;
+    }
+    head->iov_base = static_cast<std::byte *>(head->iov_base) + skip;
+    head->iov_len -= skip;
+    const auto n = ::pwritev(fd, &*head, narrow<int>(rest.end() - head),
+                             narrow<off_t>(offset + done));
+    if (n < 0) return false;
+    if (n == 0) {  // no progress and no errno: do not spin
+      errno = EIO;
+      return false;
+    }
+    done += static_cast<std::size_t>(n);
+    skip = static_cast<std::size_t>(n);
+  }
+  return true;
 }
 
 // pread(2) back-end. Stateless: every publish() call compiles away.
@@ -532,14 +576,14 @@ struct WritableFileOps {
     const auto total = kHeaderSize + key.size() + value.size() + kCrcSize;
     ensure_zeroed(entry_offset + static_cast<Offset>(total));
 
-    const auto written = ::pwritev(fd_, iov.data(), std::ssize(iov),
-                                   narrow<off_t>(entry_offset));
+    const bool written = pwritev_all(fd_, iov, entry_offset);
+    const auto write_errno = errno;
 #ifdef BYTECASK_TESTING
     FAULT_INJECTION_POST_WRITE(io_data_file_append_partial,
                                fd_, entry_offset, total);
 #endif
-    if (written != narrow<ssize_t>(total)) {
-      throw std::system_error{errno, std::generic_category(),
+    if (!written) {
+      throw std::system_error{write_errno, std::generic_category(),
                               "WritableFileOps::append_entry: pwritev failed"};
     }
 
@@ -609,16 +653,17 @@ struct WritableFileOps {
 
       const auto start = logical_end();
       ensure_zeroed(start + static_cast<Offset>(total_bytes));
-      const auto written =
-          ::pwritev(fd_, iov.data(), narrow<int>(chunk_size * kIovecsPerEntry),
-                    narrow<off_t>(start));
+      const bool written = pwritev_all(
+          fd_, std::span<const ::iovec>{iov.data(), chunk_size * kIovecsPerEntry},
+          start);
+      const auto write_errno = errno;
 
 #ifdef BYTECASK_TESTING
       FAULT_INJECTION_POST_WRITE(io_data_file_append_partial,
                                  fd_, start, total_bytes);
 #endif
-      if (written != narrow<ssize_t>(total_bytes)) {
-        throw std::system_error{errno, std::generic_category(),
+      if (!written) {
+        throw std::system_error{write_errno, std::generic_category(),
                                 "WritableFileOps::append_entries: pwritev failed"};
       }
 
@@ -666,8 +711,8 @@ struct WritableFileOps {
 #pragma clang diagnostic pop
     for (auto off = zeroed_end_; off < target;) {
       const auto len = std::min<Offset>(kBuf, target - off);
-      if (::pwrite(fd_, zeros.data(), len, narrow<off_t>(off)) !=
-          narrow<ssize_t>(len)) {
+      const ::iovec v{const_cast<std::byte *>(zeros.data()), len};
+      if (!pwritev_all(fd_, std::span<const ::iovec>{&v, 1}, off)) {
         throw std::system_error{errno, std::generic_category(),
                                 "WritableFileOps::ensure_zeroed: pwrite failed"};
       }
