@@ -626,8 +626,32 @@ public:
   // On failure, lost_to is the highest sequence among the entries the plan
   // lost to — what a retry has to be able to see — or, for a key the plan
   // found deleted or absent, the head's latest sequence.
+  // With defer_puts, point puts are not checked here: apply_puts_checked
+  // checks each in the descent that applies it.
   [[nodiscard]] auto validate_preconditions(const WritePlan &plan,
-                                            std::uint64_t &lost_to) const
+                                            std::uint64_t &lost_to,
+                                            bool defer_puts = false) const
+      -> bool;
+
+  // True for a plan whose write-write checks apply_puts_checked can fold
+  // into its descents: a snapshot plan of point puts only, its keys resolved
+  // against the snapshot, on the blind key directory (the keyed trees read
+  // nothing to check a key, so they have nothing to save).
+  [[nodiscard]] static auto can_apply_puts_checked(const WritePlan &plan)
+      -> bool;
+  // Applies such a plan with each put's write-write check done by the
+  // descent that applies it, instead of by a descent of its own
+  // (docs/commit_path_scaling_design.md, 1.3). An update goes by the
+  // snapshot's location, and applying there is the check: replace_at changes
+  // the entry only if the key is still at that record. An insert is placed by
+  // key, and displacing nothing is the check. A put that cannot be confirmed
+  // that way — a conflict, a record vacuum moved, the plan's own earlier put
+  // of the same key — is not settled here: every change the plan made is
+  // undone, and it returns false having changed nothing, for the caller to
+  // check and apply the plan in two passes as before. Guards must have been
+  // checked first (validate_preconditions with defer_puts).
+  [[nodiscard]] auto apply_puts_checked(const WritePlan &plan,
+                                        std::span<const std::uint64_t> offsets)
       -> bool;
 
   // Prepare IO plan — pure read, no mutations.
@@ -1703,6 +1727,8 @@ public:
   // by key, as before record locations were used as version tokens. The
   // differential test runs one workload both ways.
   bool test_resolve_by_key_{false};
+  // Checks every plan in a pass of its own, as before apply_puts_checked.
+  bool test_two_pass_{false};
   // Publishes s through the checked store_state under a write barrier, so
   // tests can drive the runtime invariant checks with a crafted state.
   void test_publish(std::shared_ptr<EngineState> s) {
@@ -2108,7 +2134,8 @@ auto EngineState::transient() const -> TransientEngineState {
 }
 
 auto TransientEngineState::validate_preconditions(
-    const WritePlan &plan, std::uint64_t &lost_to) const -> bool {
+    const WritePlan &plan, std::uint64_t &lost_to, bool defer_puts) const
+    -> bool {
   const auto *snap_state =
       plan.snap_ ? plan.snap_->state_.get() : nullptr;
   // The head's latest sequence: what a retry must see when the entry the
@@ -2168,6 +2195,9 @@ auto TransientEngineState::validate_preconditions(
       return true;
     };
     for (std::size_t i = 0; i < plan.writes_.size(); ++i) {
+      if (defer_puts &&
+          std::holds_alternative<WritePlan::PointPut>(plan.writes_[i]))
+        continue;
       bool has_conflict = false;
       std::visit(
           [&](const auto &op) -> void {
@@ -2392,6 +2422,100 @@ void TransientEngineState::apply_writes(
   }
 
   file_stats_.patch(active_file_id_, {.min_sequence = batch_start_seq, .max_sequence = next_seq_ - 1});
+}
+
+auto TransientEngineState::can_apply_puts_checked(const WritePlan &plan)
+    -> bool {
+  if constexpr (!kKeyDirReadsKeys) {
+    return false;
+  } else {
+    if (!plan.snap_ || plan.writes_.empty() ||
+        plan.snap_entries_.size() != plan.writes_.size())
+      return false;
+    return std::ranges::all_of(plan.writes_, [](const WritePlan::WriteOp &w) {
+      return std::holds_alternative<WritePlan::PointPut>(w);
+    });
+  }
+}
+
+auto TransientEngineState::apply_puts_checked(
+    const WritePlan &plan, std::span<const std::uint64_t> offsets) -> bool {
+  struct Undo {
+    std::span<const std::byte> key;
+    KeyDirEntry now;                // where the plan put the key
+    std::optional<KeyDirHit> was;   // what it replaced; none for an insert
+  };
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+  // Reused across plans: the serial section allocates nothing here.
+  thread_local std::vector<Undo> undo;
+  thread_local std::vector<std::pair<std::uint32_t, std::uint64_t>> dead;
+#pragma clang diagnostic pop
+  undo.clear();
+  dead.clear();
+
+  const bool multi = plan.write_count() > 1;
+  const auto first_seq = next_seq_;
+  const std::size_t first_io = multi ? 1 : 0;
+  std::size_t io_idx = first_io;
+  if (multi) ++next_seq_;  // BulkBegin
+  std::uint64_t put_bytes = 0;
+
+  const auto abandon = [&]() -> bool {
+    for (auto it = undo.rbegin(); it != undo.rend(); ++it) {
+      const bool undone = it->was ? kd_restore(key_dir_, it->key, it->now, *it->was)
+                                  : kd_remove(key_dir_, it->key, it->now);
+      if (!undone)
+        throw std::logic_error{
+            "apply_puts_checked: undo found a key moved from where the plan put it"};
+    }
+    for (std::size_t i = first_io; i <= io_idx && i < offsets.size(); ++i)
+      pending_.erase(pending_slot(active_file_id_, offsets[i]));
+    next_seq_ = first_seq;
+    return false;
+  };
+
+  for (std::size_t w_idx = 0; w_idx < plan.writes_.size(); ++w_idx) {
+    const auto &op = std::get<WritePlan::PointPut>(plan.writes_[w_idx]);
+    const std::span<const std::byte> key_span{op.key};
+    const auto val_size = narrow<std::uint32_t>(op.value.size());
+    note_pending(offsets[io_idx], next_seq_, key_span, val_size);
+    const auto entry = KeyDirEntry::make(next_seq_, offsets[io_idx],
+                                         active_file_id_, val_size);
+    std::optional<KeyDirHit> existing;
+    if (const auto &at = plan.resolved_entry(w_idx)) {
+      if (!kd_put_at(key_dir_, key_span, *at, entry)) return abandon();
+      existing = kd_hit(*at);
+    } else {
+      existing = kd_put(key_dir_, key_span, entry, kd_ctx());
+      if (existing) {  // the key appeared since the snapshot
+        undo.push_back({key_span, entry, existing});
+        return abandon();
+      }
+    }
+    undo.push_back({key_span, entry, existing});
+    if (existing)
+      dead.emplace_back(existing->file_id(),
+                        entry_size(key_span.size(), existing->value_size()));
+    put_bytes += entry_size(key_span.size(), val_size);
+    ++next_seq_;
+    ++io_idx;
+  }
+  if (multi) ++next_seq_;  // BulkEnd
+
+  // Confirmed. The file stats land as apply_writes would leave them. They
+  // are recorded only now: a recorded patch cannot be taken back, and
+  // abandon() must leave none behind.
+  const auto markers =
+      multi ? 2 * marker_size(EntryType::BulkBegin) : std::uint64_t{0};
+  file_stats_.patch(active_file_id_, {.live_added = put_bytes,
+                                      .total_added = put_bytes + markers,
+                                      .marker_added = markers,
+                                      .min_sequence = first_seq,
+                                      .max_sequence = next_seq_ - 1});
+  for (const auto &[file_id, bytes] : dead)
+    file_stats_.patch(file_id, {.live_removed = bytes});
+  return true;
 }
 
 void TransientEngineState::apply_ingest(
@@ -3086,12 +3210,20 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
     return true;
   }
 
-  if (!t.validate_preconditions(slot.plan, slot.conflict_lost_to)) {
+  const auto conflict = [&] {
     slot.result = std::nullopt;
     slot.conflict_snap_next =
         slot.plan.snap_ ? slot.plan.snap_->state_->next_seq : 0;
     return false;
-  }
+  };
+  // A plan of snapshot puts is checked by the descents that apply it; any
+  // other plan is checked in a pass of its own first.
+  bool checked = TransientEngineState::can_apply_puts_checked(slot.plan);
+#ifdef BYTECASK_TESTING
+  checked = checked && !test_two_pass_;
+#endif
+  if (!t.validate_preconditions(slot.plan, slot.conflict_lost_to, checked))
+    return conflict();
 
   auto entries = t.prepare_write(slot.plan);
   if (entries.empty()) {
@@ -3115,15 +3247,27 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
   }
 
   // Pre-compute offsets from running_offset (tracks the file position
-  // across all slots in the group, without actual I/O).
+  // across all slots in the group, without actual I/O). It advances only
+  // once the plan is applied: a plan that conflicts writes nothing.
   std::vector<std::uint64_t> offsets(entries.size());
+  auto next_offset = running_offset;
   for (std::size_t i = 0; i < entries.size(); ++i) {
-    offsets[i] = running_offset;
-    running_offset += entry_size(entries[i].key.size(),
-                                 entries[i].value.size());
+    offsets[i] = next_offset;
+    next_offset += entry_size(entries[i].key.size(), entries[i].value.size());
   }
 
-  t.apply_writes(slot.plan, offsets);
+  if (!checked || !t.apply_puts_checked(slot.plan, offsets)) {
+    // A put the descents could not confirm leaves the plan unapplied: check
+    // it as before — which settles a real conflict and its lost_to exactly
+    // as it always has — then apply it.
+    if (checked) {
+      counters_.write_check_fallbacks.fetch_add(1, std::memory_order_relaxed);
+      if (!t.validate_preconditions(slot.plan, slot.conflict_lost_to))
+        return conflict();
+    }
+    t.apply_writes(slot.plan, offsets);
+  }
+  running_offset = next_offset;
 
   const auto committed_sequence = entries.back().sequence;
 
@@ -4318,6 +4462,8 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.group_writer_batches.load(std::memory_order_relaxed)},
       {"bytecask.group_writer_coalesced",
        counters_.group_writer_coalesced.load(std::memory_order_relaxed)},
+      {"bytecask.write_check_fallbacks",
+       counters_.write_check_fallbacks.load(std::memory_order_relaxed)},
       {"bytecask.group_writer_busy_us",
        counters_.group_writer_busy_ns.load(std::memory_order_relaxed) / 1000},
       {"bytecask.file_rotations",
