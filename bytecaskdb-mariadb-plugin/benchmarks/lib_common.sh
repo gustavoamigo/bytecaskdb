@@ -3,11 +3,15 @@
 # — the caller must set BYTECASK_ROOT, PLUGIN_DIR and DATA_ROOT before
 # sourcing (DATA_ROOT is read at source time to resolve the backing device).
 
-# Builds the ByteCaskDB plugin in Release mode.
+# Builds the ByteCaskDB plugin in Release mode, with debug info, so perf can
+# attribute samples to inlined functions and source lines (run-hammerdb.sh
+# --capture). GCC generates the same code with -g as without. The flags are
+# passed on every configure, so a cached CMAKE_CXX_FLAGS_RELEASE cannot linger.
 build_bytecaskdb_plugin() {
-  echo "=== Building ByteCaskDB plugin (Release) ==="
+  echo "=== Building ByteCaskDB plugin (Release, with debug info) ==="
   local plugin_src="$BYTECASK_ROOT/bytecaskdb-mariadb-plugin"
-  cmake -S "$plugin_src" -B "$PLUGIN_DIR" -DCMAKE_BUILD_TYPE=Release || {
+  cmake -S "$plugin_src" -B "$PLUGIN_DIR" -DCMAKE_BUILD_TYPE=Release \
+    "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG -g" || {
     echo "ERROR: plugin configure failed"; exit 1;
   }
   cmake --build "$PLUGIN_DIR" --parallel --target ha_bytecaskdb || {

@@ -303,6 +303,16 @@ profilers slow the server, so each CSV row records whether it was captured;
 compare captured cells only with each other. To read a capture's perf data
 elsewhere, unpack its `*.data.tar.bz2` into `~/.debug` first.
 
+`--capture` also needs debug info for the engine, so the profile can tell
+inlined functions apart. The benchmark scripts build the plugin with `-g`,
+but the engine archive it links must be built that way first; the script
+stops with these instructions when it is not:
+
+```bash
+xmake f -m release --cxflags=-g   # the release build, plus debug info
+xmake build bytecask
+```
+
 ---
 
 _Tested on AMD Ryzen 7 3700X (8C/16T), Samsung SSD 860 EVO SATA (469 MiB/s read, 450 MiB/s write), 31 GiB RAM. Each result is the mean of a single 10s sysbench run._
