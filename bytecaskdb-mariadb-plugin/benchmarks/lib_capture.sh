@@ -33,9 +33,10 @@
 # the plugin.
 
 CAPTURE_SECONDS=120       # capture length, from the start of the window
-CAPTURE_CELL_BYTES=$(( 1024 * 1024 * 1024 ))  # free space asked per cell: an
+CAPTURE_CELL_BYTES=$(( 1024 * 1024 * 1024 ))  # free space per cell: an upper
                           # estimate — two perf recordings of a few hundred MB
-                          # plus the build-id archive of the binaries
+                          # plus the build-id archive of the binaries, before
+                          # gzip
 CAPTURE_PERF=()           # perf, or sudo -n perf
 CAPTURE_LOCKS=off         # perf lock contention -b works here
 
@@ -54,7 +55,8 @@ capture_disk_model() {
 }
 
 # Exits unless the capture directory can be written, is not on EC2 instance
-# storage, and has room for every cell. The captures are the run's only
+# storage, and has room for at least one cell; warns when it may not hold
+# every cell. The captures are the run's only
 # record of what it measured; losing them to a stopped instance or a full disk
 # wastes the whole session.
 capture_check_dir() {
@@ -70,13 +72,22 @@ capture_check_dir() {
          "an EBS volume, e.g. under \$HOME." >&2
     exit 1
   fi
+  # Room for one cell is required. The estimate is of the uncompressed perf
+  # data and only the gzipped tarball lands here, so a shortfall for the whole
+  # run is a warning: a tarball that does not fit fails alone, and its
+  # working directory is kept on the data root (capture_finish).
   local avail need=$(( cells * CAPTURE_CELL_BYTES ))
   avail="$(df -P -B1 "$dir" 2>/dev/null | awk 'NR == 2 { print $4 }')"
-  if [[ -n "$avail" ]] && (( avail < need )); then
+  if [[ -n "$avail" ]] && (( avail < CAPTURE_CELL_BYTES )); then
     echo "ERROR: the capture directory $dir has $(( avail / 1048576 )) MiB free;" \
-         "$cells captured cells need about $(( need / 1048576 )) MiB. Free space" \
-         "or pass --capture-dir=PATH." >&2
+         "one captured cell needs about $(( CAPTURE_CELL_BYTES / 1048576 )) MiB. Free" \
+         "space or pass --capture-dir=PATH." >&2
     exit 1
+  fi
+  if [[ -n "$avail" ]] && (( avail < need )); then
+    echo "WARNING: the capture directory $dir has $(( avail / 1048576 )) MiB free;" \
+         "$cells captured cells may need up to $(( need / 1048576 )) MiB. A tarball that" \
+         "does not fit is left unpacked on the data root — copy it before the host goes away." >&2
   fi
 }
 
