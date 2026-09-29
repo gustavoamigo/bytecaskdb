@@ -509,6 +509,7 @@ struct Life {
   std::vector<std::string> throws;
   int views{0};
   int resumed_views{0};
+  std::size_t reads_of_lost_pages{0};
   std::size_t lost_at_resume{0};
   std::size_t committed{0};
 };
@@ -562,8 +563,13 @@ void apply_view(Life &life, const Base &base, bool resumed,
 }
 
 // Fills `life` as it goes, so a failure report shows the history up to the
-// frame that failed.
-void parse_life(std::string_view stream, const Base &base, Life &life) {
+// frame that failed. `cache_lost`: an eviction dropped pages whose writeback
+// had failed, while the process ran. Their published, non-durable writes are
+// gone before the engine can know (it learns at its next fdatasync), so a
+// View may lack writes above the watermark, and a read of such a write may
+// fail. A read may still never return a value that was not written.
+void parse_life(std::string_view stream, const Base &base, bool cache_lost,
+                Life &life) {
   using Outcome = OpRecord::Outcome;
   for (const auto payload : split_frames(stream)) {
     Reader r{payload};
@@ -610,12 +616,17 @@ void parse_life(std::string_view stream, const Base &base, Life &life) {
       const bool resumed = r.u8() != 0;
       const auto durable = r.u64();
       const auto view = decode_state(r);
-      apply_view(life, base, resumed, durable, view);
+      apply_view(life, base, resumed || cache_lost, durable, view);
       break;
     }
-    case FrameType::Violation:
-      life.violations.push_back(r.str());
+    case FrameType::Violation: {
+      auto what = r.str();
+      if (cache_lost && what.find("failed on data it published") != std::string::npos)
+        ++life.reads_of_lost_pages;
+      else
+        life.violations.push_back(std::move(what));
       break;
+    }
     case FrameType::Closed:
       life.closed = true;
       break;
@@ -633,8 +644,8 @@ struct CheckOptions {
   // How the life ended: power (a power cut), sigkill, clean (SIGTERM with
   // the hazards lifted) or exit (the worker exited on its own).
   std::string terminator;
-  // Pages whose writeback failed were evicted during or after the life: like
-  // a power cut, that loses what only the page cache held.
+  // An eviction dropped pages whose writeback had failed, during or after
+  // the life: like a power cut, that loses what only the page cache held.
   bool evicted{false};
 };
 
@@ -657,7 +668,7 @@ auto check(const CheckOptions &o) -> int {
   const auto stream = read_file(o.history);
   Life life;
   try {
-    parse_life(stream, base, life);
+    parse_life(stream, base, o.evicted, life);
     if (!life.violations.empty())
       throw Failure{std::format("the worker saw {} violations; first: {}",
                                 life.violations.size(), life.violations.front())};
@@ -706,7 +717,9 @@ auto check(const CheckOptions &o) -> int {
         throw Failure{std::format(
             "recovered durable_sequence {} below the watermark {}",
             recovered.durable_sequence, life.watermark)};
-      if (o.terminator == "clean" && life.closed &&
+      // A clean close keeps every write, unless an eviction took some before
+      // the engine could know.
+      if (o.terminator == "clean" && life.closed && !o.evicted &&
           r.applied < settled_count(life.ops))
         throw Failure{std::format(
             "after a clean close, recovery lost {} acknowledged writes",

@@ -354,8 +354,7 @@ class Rig:
             proc.wait(60)
             self.ctl("clear")
             if plan["evict_after_kill"]:
-                self.ctl("evict")
-                self.evicted = True
+                self.evicted |= self.ctl("evict") > 0
         else:
             self.ctl("clear")
             proc.send_signal(signal.SIGTERM)
@@ -404,8 +403,8 @@ class Rig:
         elif kind == "off":
             active.pop(ev["id"], None)
         elif kind == "evict":
-            self.ctl("evict")
-            self.evicted = True
+            # Only an eviction that dropped pages loses anything.
+            self.evicted |= self.ctl("evict") > 0
             return
         elif kind == "writeback":
             self.ctl("writeback", seed=int(ev["t"] * 1e6), fail=ev["fail"])

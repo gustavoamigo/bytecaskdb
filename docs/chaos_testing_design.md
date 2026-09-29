@@ -314,6 +314,13 @@ Where the first version differs from the design above, and why.
   writes of the last life that opened on top of it. When a life never opens
   and a power cut or an eviction ends it, the recovered state must be a
   prefix of those writes covering their watermark.
+- **An eviction during a life loses data under a running engine.** Pages
+  whose background writeback failed are clean but not on disk; evicting them
+  drops the published, non-durable writes in them, and the engine cannot
+  know until its next `fdatasync` reports the error. After an eviction that
+  dropped pages, the checker lets Views and a clean close lack writes above
+  the durable watermark, and does not count a failed read of such a write as
+  a violation. A read that returns a value never written still is.
 - **Liveness (I9) is checked at the clean close:** the hazards are lifted,
   and the worker must recover, close and exit within `--close-timeout`
   (60 s), or its stacks are saved and the life fails. Lives that end in a
