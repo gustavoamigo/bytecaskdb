@@ -66,6 +66,9 @@ module;
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 export module bytecask.buffered_btree;
 import bytecask.blind_btree;
@@ -76,7 +79,10 @@ namespace buffered_detail {
 
 using Bytes = std::span<const std::byte>;
 
-inline constexpr std::size_t kPartitions = 16;
+// Partitions by a hash of the whole key: a point lookup scans one, about
+// kBufferSlots / kPartitions fingerprints per buffer, however the keys
+// cluster (a single-table workload writes nearly every key into one index).
+inline constexpr std::size_t kPartitions = 64;
 // Slots per buffer, across its partitions. Tests use a handful, so freezes,
 // installs, merges on the spot and backpressure happen constantly.
 #ifdef BYTECASK_TESTING
@@ -86,7 +92,18 @@ inline constexpr std::size_t kBufferSlots = 512;
 #endif
 // By-location writes (replace_at, erase_at) take no resolver, so they can
 // never merge; they may run a buffer this far past kBufferSlots instead.
-inline constexpr std::size_t kSlotCapacity = kBufferSlots * 4;
+// Slots a partition holds: room for skew and for by-location writes past
+// the target. A write whose partition is full makes room as a full buffer
+// does. Whole SIMD chunks.
+#ifdef BYTECASK_TESTING
+inline constexpr std::size_t kSlotCapacity = 16;
+#else
+inline constexpr std::size_t kSlotCapacity = 128;
+#endif
+static_assert(kSlotCapacity % 16 == 0);
+// A buffer runs past kBufferSlots only for writes by location; past this it
+// takes no more.
+inline constexpr std::size_t kBufferCapacity = kBufferSlots * 4;
 // Key bytes per buffer. Holds at least one key of the largest size.
 inline constexpr std::size_t kArenaBytes = std::size_t{1} << 18;
 static_assert(kArenaBytes >= 4 * 65536);
@@ -107,6 +124,11 @@ inline auto compare(Bytes a, Bytes b) noexcept -> int {
 
 // Eight bytes of the key from `at`, big-endian, zero-padded: order prefixes.
 inline auto word(Bytes k, std::size_t at) noexcept -> std::uint64_t {
+  if (k.size() >= at + 8) {
+    std::uint64_t v;
+    std::memcpy(&v, k.data() + at, 8);
+    return std::byteswap(v);
+  }
   std::uint64_t v = 0;
   for (std::size_t i = at; i < at + 8; ++i)
     v = (v << 8) | (i < k.size() ? std::to_integer<std::uint64_t>(k[i]) : 0);
@@ -121,23 +143,24 @@ struct Prefix {
 };
 inline auto prefix(Bytes k) noexcept -> Prefix { return {word(k, 0), word(k, 8)}; }
 
-// The key's index: its first 6 bytes, padded — for the MariaDB plugin's
-// keys, the table and index id. Non-decreasing in key order, so an index's
-// keys are contiguous and a scan that stays in an index needs only its
-// partition.
-inline auto index_of(std::uint64_t hi) noexcept -> std::uint64_t { return hi >> 16; }
-inline auto partition_of(std::uint64_t hi) noexcept -> std::size_t {
-  return static_cast<std::size_t>((index_of(hi) * 0x9E37'79B9'7F4A'7C15ULL) >> 60);
-}
-inline auto fingerprint(Bytes k) noexcept -> std::uint16_t {
+// A key's partition and fingerprint, from one hash of the key.
+struct Hash {
+  std::size_t part;
+  std::uint16_t fp;
+};
+inline auto hash_of(Bytes k) noexcept -> Hash {
   const std::string_view s{reinterpret_cast<const char *>(k.data()), k.size()};
-  return static_cast<std::uint16_t>(std::hash<std::string_view>{}(s) >> 48);
+  const auto h = static_cast<std::uint64_t>(std::hash<std::string_view>{}(s));
+  return {static_cast<std::size_t>(h >> 58), static_cast<std::uint16_t>(h)};
 }
+static_assert(kPartitions == 64);
 
-// One partition's slots, structure of arrays. Left uninitialised: a slot is
-// written before any count covers it.
+// One partition's slots, structure of arrays. Apart from the fingerprints,
+// left uninitialised: a slot is written before any count covers it.
 struct Part {
-  std::array<std::uint16_t, kSlotCapacity> fp;
+  // Zeroed once, when the buffer is made: the fingerprint scan reads whole
+  // chunks, past the count, and masks what it read there.
+  std::array<std::uint16_t, kSlotCapacity> fp{};
   std::array<std::uint64_t, kSlotCapacity> hi;
   std::array<std::uint64_t, kSlotCapacity> lo;
   std::array<BlindRef, kSlotCapacity> ref;  // kNoRef: an erase
@@ -181,38 +204,50 @@ struct Slot {
   BlindRef ref;
 };
 
+// Bit 2i set where fps[i] == fp, for 16 fingerprints (the byte mask of a
+// 16-bit compare, one bit kept per lane).
+inline auto match16(const std::uint16_t *fps, std::uint16_t fp) noexcept -> std::uint32_t {
+#if defined(__AVX2__)
+  const auto v = _mm256_loadu_si256(static_cast<const __m256i *>(static_cast<const void *>(fps)));
+  const auto eq = _mm256_cmpeq_epi16(v, _mm256_set1_epi16(static_cast<short>(fp)));
+  return static_cast<std::uint32_t>(_mm256_movemask_epi8(eq)) & 0x5555'5555u;
+#else
+  std::uint32_t mask = 0;
+  for (std::uint32_t i = 0; i < 16; ++i)
+    mask |= static_cast<std::uint32_t>(fps[i] == fp) << (2 * i);
+  return mask;
+#endif
+}
+
 // The newest slot for `key` in a view, or none.
-inline auto find_in(const View &v, Bytes key, std::uint64_t hi,
-                    std::uint16_t fp) -> std::optional<Slot> {
+inline auto find_in(const View &v, Bytes key, Hash h) -> std::optional<Slot> {
   if (!v.buf) return std::nullopt;
-  const auto p = partition_of(hi);
+  const auto p = h.part;
+  const auto fp = h.fp;
   const auto &part = v.buf->parts[p];
-  std::size_t n = v.counts[p];
-  // Newest first, 16 fingerprints per step: the mask loop vectorises.
-  while (n > 0) {
-    const auto from = n >= 16 ? n - 16 : 0;
-    std::uint32_t mask = 0;
-    for (std::size_t i = from; i < n; ++i)
-      mask |= static_cast<std::uint32_t>(part.fp[i] == fp) << (i - from);
+  const std::size_t n = v.counts[p];
+  // Newest first, a chunk of 16 fingerprints at a time.
+  for (std::size_t end = n; end > 0;) {
+    const auto from = (end - 1) / 16 * 16;
+    std::uint32_t mask = match16(part.fp.data() + from, fp);
+    if (end - from < 16) mask &= (std::uint32_t{1} << (2 * (end - from))) - 1;
+    end = from;
     while (mask != 0) {
       const auto bit = 31 - std::countl_zero(mask);
       mask &= ~(std::uint32_t{1} << bit);
-      const auto i = from + static_cast<std::size_t>(bit);
-      if (part.hi[i] != hi) continue;
+      const auto i = from + static_cast<std::size_t>(bit / 2);
       const auto k = v.buf->key(p, i);
       if (compare(k, key) == 0) return Slot{k, part.ref[i]};
     }
-    n = from;
   }
   return std::nullopt;
 }
 
 // A key's newest entry in the buffers of a version: A, then F.
 inline auto newest(const View &f, const View &a, Bytes key) -> std::optional<Slot> {
-  const auto hi = word(key, 0);
-  const auto fp = fingerprint(key);
-  if (auto s = find_in(a, key, hi, fp)) return s;
-  return find_in(f, key, hi, fp);
+  const auto h = hash_of(key);
+  if (auto s = find_in(a, key, h)) return s;
+  return find_in(f, key, h);
 }
 
 // The key of a record some visible slot displaced, or none.
@@ -252,27 +287,20 @@ enum class Pick : std::uint8_t { Min, Max };
 
 // Min: the smallest key > (>=) `bound`. Max: the largest key < (<=)
 // `bound`, or the largest of all when `bound` is none. Among the slots of
-// (F, A); the newest slot wins a tie. `scoped` looks only in the bound's
-// index.
+// (F, A); the newest slot wins a tie.
 template <Pick P>
 inline auto buffer_pick(const View &f, const View &a, std::optional<Bytes> bound,
-                        bool inclusive, bool scoped) -> std::optional<Slot> {
+                        bool inclusive) -> std::optional<Slot> {
   const auto bp = bound ? prefix(*bound) : Prefix{};
-  scoped = scoped && bound.has_value();
   std::optional<Slot> best;
   Prefix best_p{};
   for (const View *v : {&f, &a}) {  // oldest first
     if (!v->buf) continue;
-    const auto p_first = scoped ? partition_of(bp.hi) : 0;
-    const auto p_last = scoped ? p_first + 1 : kPartitions;
-    for (auto p = p_first; p < p_last; ++p) {
+    for (std::size_t p = 0; p < kPartitions; ++p) {
       const auto &part = v->buf->parts[p];
       for (std::size_t i = 0; i < v->counts[p]; ++i) {
         const Prefix sp{part.hi[i], part.lo[i]};
-        if (bound) {
-          if (P == Pick::Min ? sp < bp : sp > bp) continue;
-          if (scoped && index_of(sp.hi) != index_of(bp.hi)) continue;
-        }
+        if (bound && (P == Pick::Min ? sp < bp : sp > bp)) continue;
         if (best && (P == Pick::Min ? sp > best_p : sp < best_p)) continue;
         const auto k = v->buf->key(p, i);
         if (bound && sp == bp) {
@@ -294,15 +322,25 @@ inline auto buffer_pick(const View &f, const View &a, std::optional<Bytes> bound
 }
 
 // Whether any slot of (F, A) holds a key in [lo, hi) (hi none: no bound).
+// Full keys only where a prefix ties.
 inline auto any_in(const View &f, const View &a, Bytes lo, std::optional<Bytes> hi)
     -> bool {
+  const auto lp = prefix(lo);
+  const auto hp = hi ? prefix(*hi) : Prefix{~std::uint64_t{0}, ~std::uint64_t{0}};
   for (const View *v : {&f, &a}) {
     if (!v->buf) continue;
-    for (std::size_t p = 0; p < kPartitions; ++p)
+    for (std::size_t p = 0; p < kPartitions; ++p) {
+      const auto &part = v->buf->parts[p];
       for (std::size_t i = 0; i < v->counts[p]; ++i) {
-        const auto k = v->buf->key(p, i);
-        if (compare(k, lo) >= 0 && (!hi || compare(k, *hi) < 0)) return true;
+        const Prefix sp{part.hi[i], part.lo[i]};
+        if (sp < lp || (hi && sp > hp)) continue;
+        if (sp == lp || (hi && sp == hp)) {
+          const auto k = v->buf->key(p, i);
+          if (compare(k, lo) < 0 || (hi && compare(k, *hi) >= 0)) continue;
+        }
+        return true;
       }
+    }
   }
   return false;
 }
@@ -402,13 +440,24 @@ public:
     return f.merged;
   }
 
-  // The merged tree for F, waiting for the merger (backpressure). F must
-  // have been submitted: a version holds it.
+  // The merged tree for F (backpressure). F must have been submitted: a
+  // version holds it. While no merge is running, the caller runs the queued
+  // ones itself, in order, rather than wait for a merger thread the
+  // scheduler has not run yet; merges still run one at a time.
   [[nodiscard]] auto wait(const Frozen &f) -> Tree {
     std::unique_lock<std::mutex> lk{mu_};
     if (!f.merged && !f.error) {
       const auto t0 = std::chrono::steady_clock::now();
-      cv_.wait(lk, [&] { return f.merged.has_value() || f.error; });
+      while (!f.merged && !f.error) {
+        if (!running_ && !jobs_.empty()) {
+          auto job = std::move(jobs_.front());
+          jobs_.pop_front();
+          execute(job, lk);
+          inline_merges_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          cv_.wait(lk);
+        }
+      }
       stalls_.fetch_add(1, std::memory_order_relaxed);
       stall_ns_.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
                               std::chrono::steady_clock::now() - t0)
@@ -461,6 +510,9 @@ public:
   [[nodiscard]] static auto stall_ns() noexcept -> std::int64_t {
     return stall_ns_.load(std::memory_order_relaxed);
   }
+  [[nodiscard]] static auto inline_merges() noexcept -> std::int64_t {
+    return inline_merges_.load(std::memory_order_relaxed);
+  }
 
 private:
   struct Job {
@@ -502,8 +554,8 @@ private:
   void run() {
     std::unique_lock<std::mutex> lk{mu_};
     for (;;) {
-      cv_.wait(lk, [&] { return stop_ || !jobs_.empty(); });
-      if (jobs_.empty()) return;  // stop_
+      cv_.wait(lk, [&] { return stop_ || (!jobs_.empty() && !running_); });
+      if (stop_ && (jobs_.empty() || running_)) return;
       auto job = std::move(jobs_.front());
       jobs_.pop_front();
       execute(job, lk);
@@ -519,6 +571,7 @@ private:
   std::shared_ptr<BufferPool> pool_{std::make_shared<BufferPool>()};
   static inline std::atomic<std::int64_t> stalls_{0};
   static inline std::atomic<std::int64_t> stall_ns_{0};
+  static inline std::atomic<std::int64_t> inline_merges_{0};
   std::thread thread_;  // last: joined before the rest is destroyed
 };
 
@@ -685,8 +738,7 @@ private:
     bwd_ = false;
     bound_ok_ = inclusive;
     if (inclusive) bound_.assign(lo.begin(), lo.end());
-    cand_ = buffered_detail::buffer_pick<Pick::Min>(f_, a_, lo, inclusive, false);
-    cand_ok_ = true;
+    find_candidate<Pick::Min>(lo, inclusive);
     forward(res);
   }
 
@@ -697,28 +749,52 @@ private:
     --tb_;
     bwd_ = true;
     fwd_ = false;
-    cand_ = buffered_detail::buffer_pick<Pick::Max>(f_, a_, hi, false, false);
-    cand_ok_ = true;
+    find_candidate<Pick::Max>(hi, false);
     backward(res);
   }
 
+  // The next buffered entry past `bound`.
+  template <Pick P> void find_candidate(std::optional<Bytes> bound, bool inclusive) {
+    cand_ = buffered_detail::buffer_pick<P>(f_, a_, bound, inclusive);
+    cand_ok_ = true;
+  }
+
+  // The fence of the tree iterator's leaf (upper going forward, lower going
+  // back), cached per leaf.
+  template <bool Upper> auto fence(const TIt &t) -> std::optional<Bytes> {
+    if (t.leaf() != fence_leaf_ || fence_upper_ != Upper) {
+      fence_leaf_ = t.leaf();
+      fence_upper_ = Upper;
+      fence_has_ = Upper ? t.upper_fence(fence_) : t.lower_fence(fence_);
+    }
+    if (!fence_has_) return std::nullopt;
+    return Bytes{fence_.data(), fence_.size()};
+  }
+
   // Steps to the next entry: the smaller of the buffer candidate and the
-  // tree's next, tf_. The position (key_) moves past erases too.
+  // tree's next, tf_. The position (key_) moves past erases too. A tree
+  // entry is known to come first without reading its key when the
+  // candidate is at or past its leaf's upper fence.
   template <BlindKeyResolver R> void forward(R &res) {
     buffered_detail::Overlay<R> ov{res, f_, a_};
     for (;;) {
       if (!cand_ok_) {
         ensure_key(res);
-        cand_ = buffered_detail::buffer_pick<Pick::Min>(
-            f_, a_, Bytes{key_.data(), key_.size()}, false, false);
-        cand_ok_ = true;
+        find_candidate<Pick::Min>(Bytes{key_.data(), key_.size()}, false);
       }
       const bool tree_left = tf_ != std::default_sentinel;
       int c = -1;
+      bool read = false;  // the tree entry's key, into tkey_
       if (cand_ && tree_left) {
-        const auto k = tf_.key(ov);
-        tkey_.assign(k.begin(), k.end());
-        c = buffered_detail::compare(cand_->key, {tkey_.data(), tkey_.size()});
+        const auto up = fence<true>(tf_);
+        if (up && buffered_detail::compare(cand_->key, *up) >= 0) {
+          c = 1;
+        } else {
+          read = true;
+          const auto k = tf_.key(ov);
+          tkey_.assign(k.begin(), k.end());
+          c = buffered_detail::compare(cand_->key, {tkey_.data(), tkey_.size()});
+        }
       }
       if (cand_ && c <= 0) {
         if (c == 0) ++tf_;
@@ -727,7 +803,7 @@ private:
         return;
       }
       if (tree_left) {
-        take_tree(*tf_, cand_.has_value());
+        take_tree(*tf_, read);
         ++tf_;
         return;
       }
@@ -737,22 +813,28 @@ private:
     }
   }
 
-  // Mirror of forward: the larger of the candidate and tb_.
+  // Mirror of forward: the larger of the candidate and tb_, with the lower
+  // fence.
   template <BlindKeyResolver R> void backward(R &res) {
     buffered_detail::Overlay<R> ov{res, f_, a_};
     for (;;) {
       if (!cand_ok_) {
         ensure_key(res);
-        cand_ = buffered_detail::buffer_pick<Pick::Max>(
-            f_, a_, Bytes{key_.data(), key_.size()}, false, false);
-        cand_ok_ = true;
+        find_candidate<Pick::Max>(Bytes{key_.data(), key_.size()}, false);
       }
       const bool tree_left = tb_ != std::default_sentinel;
       int c = 1;
+      bool read = false;
       if (cand_ && tree_left) {
-        const auto k = tb_.key(ov);
-        tkey_.assign(k.begin(), k.end());
-        c = buffered_detail::compare(cand_->key, {tkey_.data(), tkey_.size()});
+        const auto down = fence<false>(tb_);
+        if (down && buffered_detail::compare(cand_->key, *down) < 0) {
+          c = -1;
+        } else {
+          read = true;
+          const auto k = tb_.key(ov);
+          tkey_.assign(k.begin(), k.end());
+          c = buffered_detail::compare(cand_->key, {tkey_.data(), tkey_.size()});
+        }
       }
       if (cand_ && c >= 0) {
         if (c == 0) --tb_;
@@ -761,7 +843,7 @@ private:
         return;
       }
       if (tree_left) {
-        take_tree(*tb_, cand_.has_value());
+        take_tree(*tb_, read);
         --tb_;
         return;
       }
@@ -805,6 +887,10 @@ private:
   std::vector<std::byte> tkey_;
   std::optional<Slot> cand_;
   bool cand_ok_{false};
+  const void *fence_leaf_{nullptr};
+  bool fence_upper_{false};
+  bool fence_has_{false};
+  std::vector<std::byte> fence_;
   // The inclusive bound a seek placed this iterator at, until it moves.
   std::vector<std::byte> bound_;
   bool bound_ok_{false};
@@ -869,6 +955,9 @@ public:
   [[nodiscard]] static auto buffer_stalls() noexcept -> std::int64_t { return Merger::stalls(); }
   [[nodiscard]] static auto buffer_stall_ns() noexcept -> std::int64_t {
     return Merger::stall_ns();
+  }
+  [[nodiscard]] static auto buffer_inline_merges() noexcept -> std::int64_t {
+    return Merger::inline_merges();
   }
 
 #ifdef BYTECASK_TESTING
@@ -946,7 +1035,7 @@ public:
     bool read = false;
     const auto existing = lookup(key, res, read);
     if (existing && !should_replace(*existing, ref)) return std::nullopt;
-    const bool merged = make_room(key.size(), res);
+    const bool merged = make_room(key, res);
     write_slot(key, ref, existing ? *existing : buffered_detail::kNoRef);
     if (existing && (!read || merged)) (void)res.key_at(*existing);
     return existing;
@@ -955,7 +1044,7 @@ public:
     bool read = false;
     const auto existing = lookup(key, res, read);
     if (!existing) return std::nullopt;
-    const bool merged = make_room(key.size(), res);
+    const bool merged = make_room(key, res);
     write_slot(key, buffered_detail::kNoRef, *existing);
     if (!read || merged) (void)res.key_at(*existing);
     return existing;
@@ -1011,16 +1100,19 @@ private:
     return tree_.get(key, ov);
   }
 
-  [[nodiscard]] auto has_room(std::size_t key_len, std::size_t slots) const -> bool {
-    return a_.total < slots && a_.arena + key_len <= buffered_detail::kArenaBytes;
+  // Whether A takes the key with at most `slots` slots in all.
+  [[nodiscard]] auto has_room(Bytes key, std::size_t slots) const -> bool {
+    return a_.total < slots && a_.counts[buffered_detail::hash_of(key).part] <
+                                   buffered_detail::kSlotCapacity &&
+           a_.arena + key.size() <= buffered_detail::kArenaBytes;
   }
 
   // Makes room in A for a key, freezing A when it is full: first the F
   // before it is installed — waiting for the merger if need be — or, if
   // this builder froze it, merged here. Returns whether it merged here
   // (reading records through `res`).
-  template <BlindKeyResolver R> auto make_room(std::size_t key_len, R &res) -> bool {
-    if (has_room(key_len, buffered_detail::kBufferSlots)) return false;
+  template <BlindKeyResolver R> auto make_room(Bytes key, R &res) -> bool {
+    if (has_room(key, buffered_detail::kBufferSlots)) return false;
     bool merged = false;
     if (f_.buf) {
       if (frozen_here_) {
@@ -1050,15 +1142,15 @@ private:
 
   void write_slot(Bytes key, BlindRef ref, BlindRef displaced) {
     auto &b = const_cast<Buffer &>(*a_.buf);  // this builder is its only writer
-    const auto hi = buffered_detail::word(key, 0);
-    const auto p = buffered_detail::partition_of(hi);
+    const auto h = buffered_detail::hash_of(key);
+    const auto p = h.part;
     auto &part = b.parts[p];
     const auto i = a_.counts[p];
     if (i >= buffered_detail::kSlotCapacity || a_.arena + key.size() > buffered_detail::kArenaBytes)
       throw std::logic_error{"buffered key directory: buffer overflow"};
     std::memcpy(b.arena.get() + a_.arena, key.data(), key.size());
-    part.fp[i] = buffered_detail::fingerprint(key);
-    part.hi[i] = hi;
+    part.fp[i] = h.fp;
+    part.hi[i] = buffered_detail::word(key, 0);
     part.lo[i] = buffered_detail::word(key, 8);
     part.ref[i] = ref;
     part.old[i] = displaced;
@@ -1093,7 +1185,7 @@ private:
     // runs A past its target, up to its capacity, and the next keyed write
     // makes room. Past capacity it declines, like a write whose location
     // moved: the caller takes the keyed path.
-    if (!has_room(key.size(), buffered_detail::kSlotCapacity)) return false;
+    if (!has_room(key, buffered_detail::kBufferCapacity)) return false;
     write_slot(key, to, from);
     return true;
   }
