@@ -182,7 +182,135 @@ result of the apply.
   have answered this investigation's first question at once.
 - Issue #221: a short `pwrite` reports a stale `errno`.
 
-### Phase 2: the append out of the serial section (epic)
+### Phase 1b: a buffered key directory
+
+Measured after Phase 1 was planned; ahead of Phase 2 in priority. The
+prototype and every number here are on branch `exp/buffered-keydir`
+(`map_bench`, `BufBlind/*` and `SmallBuf/*`).
+
+**Why.** About two thirds of the serial section is tree work: descents, leaf
+edits, path copies, node allocation (~65% on `commit_probe`, ~70% on the box).
+Phase 1 trims it; this takes it out. The serial section appends each change
+to a small buffer instead, and a merger thread folds full buffers into the
+tree off the critical path. The tree work does not get cheaper — folding a
+buffer sorted costs no less per key than applying it in arrival order — so the
+gain is the pipeline: the ceiling rises from 1 / (serial work) to
+1 / max(serial work − tree work + buffer appends, merger work). Estimated
+~1.7× on top of Phase 1, merger-bound.
+
+**Measured in `map_bench`** (1M-key blind tree unless stated):
+
+| | Cost |
+|---|---|
+| Writer, per key | 23 ns appended, against 269 ns for a tree insert |
+| Point read | +6–9% (a fingerprint scan of one partition, then the tree) |
+| 50-key range scan, busiest index, 512 slots | +13.5% (index partitions + a branch-free AVX2 filter); other indexes ≈ 0 |
+| Merger, one 512-slot buffer | 254 µs at 1M keys, 349 µs at 10M; sorting does not help |
+
+At the box's rate (~16–25K commits/s of ~20 writes) a 512-slot buffer fills in
+~1–1.6 ms; the merger, scaled to the engine's key reads at 65M keys, needs
+~0.7–1 ms. It keeps up with ~1.5× margin and is the next ceiling.
+
+#### The buffer
+
+A fixed-capacity, unordered, structure-of-arrays buffer, split into 16
+partitions by a hash of each key's first 6 bytes — the MariaDB plugin's table
+and index id — since a range scan never leaves its index. Per slot: a 16-bit
+fingerprint (point lookups: an AVX2 scan, as a blind leaf does), a 16-byte
+big-endian key prefix (range filtering), the record location and value size
+(a tombstone for an erase), and the key's bytes in the buffer's arena (exact
+checks: 512 × ~20 bytes; the blind tree's reason to store no key bytes, RAM,
+does not apply to a buffer this size). Newest slot wins. 512 slots across the
+partitions; tests shrink it to a handful so every protocol path runs often.
+
+A range scan filters its partition in two passes: one branch-free AVX2 pass
+classifies every slot against the two bounds by prefix — inside, outside, or
+tied — into bitmaps, and a second compares the full key of tied slots only.
+An 8-byte prefix is not enough: on the plugin's keys every slot of a table ties.
+
+#### State and publication
+
+The key directory becomes a wrapper, `BufferedKeyDir`, behind the `kd_*` layer
+and the `KeyDirTree` / `KeyDirTransient` aliases in `internals.cppm`, selected
+with `BYTECASK_KEYDIR=buffered`. The engine's code does not change beyond one
+hook in `execute_slots`.
+
+- A published version is **(tree version T, frozen buffer F or none, active
+  buffer A with its published slot count per partition)**. F is immutable. A
+  is only ever appended to past its published counts, into preallocated
+  arrays, so a reader of an older version never sees a slot past its counts
+  and nothing it reads moves. Versions hold T, F and A by `shared_ptr` in
+  `EngineState`; snapshots pin them as they pin tree versions today.
+- A transient (the serial section's builder) appends to A. Its undo — the
+  fused check's (Phase 1.3) — truncates A back to the counts at the plan's
+  start. `persistent()` publishes the new counts.
+- Order is total: a key's newest entry is in A, else F, else T. Every slot of
+  A is newer than every slot of F, and F newer than T.
+
+#### Merger protocol
+
+The DB owns a merger thread (`KeyDirMerger`), and `execute_slots` calls one
+hook at the start of each batch, under `write_mu_`:
+
+1. **Install:** if the merger has finished T' = T + F, the head becomes
+   (T', none, A). A pointer swap.
+2. **Freeze:** if A cannot take the batch's writes and F is none, A becomes F,
+   a fresh (recycled) buffer becomes A, and F is handed to the merger.
+3. **Backpressure:** if A is full and F is still being merged, the batch waits
+   for the merger — the one place the serial section waits on it. Counted in
+   `stats()`, as the hint writer's stalls are.
+
+The merger builds T' from a transient of T, applying F's slots in order, and
+never touches A. Neither side ever mutates what the other reads. A batch
+larger than the buffer is applied to the tree directly, as today.
+
+**Barriers** — vacuum, `set_mode`, `resume`, `create_manifest`, close — drain
+first: wait for the merger, fold A synchronously, then run against the tree
+as today. They are rare; vacuum's relocation logic stays untouched.
+
+#### What reads do
+
+| Operation | With the buffers |
+|---|---|
+| `kd_get`, `kd_contains`, `kd_read_value` | A, then F (fingerprint scans of one partition), then T |
+| `kd_put_at` / `kd_erase_at` (the snapshot check) | the key's newest entry must be at the snapshot's location: found in A or F by fingerprint, else `T.holds` — a descent that reads nothing, but a descent. Skipping it when the snapshot is newer than F's start (every change since then is in a buffer) is a follow-up |
+| `kd_put` / `kd_erase` (by key) | what it displaces: the newest entry in A or F, else a tree lookup |
+| Iterators (`kd_lower_bound`, `kd_begin`, value and reverse variants) | the tree iterator merged with the buffers' slots ≥ the start (≤ the start, reverse), filtered once when the iterator is made and sorted; tombstones hide tree entries. Open-ended, so every partition is filtered |
+| `kd_count` | the tree's count, corrected for buffered keys in range: an insert of a key absent from T adds one, an erase of a present key removes one. Up to one tree lookup per buffered key in range — `count_keys`' "at most two record reads" becomes "plus the buffered keys in range" |
+| `size()` | T's size plus a net count kept as slots are appended (+1 for a key the append found absent, −1 for an erase of a present one) |
+
+Recovery builds T from the hint files as today; the buffers start empty.
+
+#### Tests
+
+- **The engine suite** under `BYTECASK_KEYDIR=buffered`, with a buffer of a
+  few slots so freezes, installs, backpressure and barriers happen constantly:
+  every `[model]` recovery test, the differential and location tests, the
+  proof tests. CI adds it as a fourth key directory, as it runs the other three.
+- **A model test for the wrapper** (`tests/buffered_keydir_test.cpp`): seeded
+  puts, erases, snapshots, iterators and counts against a `std::map`, with the
+  merger run at random points — including snapshots taken before a merge and
+  read after it.
+- **TSan** on the merger handoff; the Elle isolation check nightly.
+- **Seeded bugs** the tests must catch: a reader that sees past its published
+  count; an install that drops A's slots; a merge applying F out of order.
+
+#### Measuring
+
+`commit_probe` (serial µs per commit, TPROC-C shape, 16 and 48 threads),
+isolated `engine_bench` (write, read, `Range50`, `Recovery`), local HammerDB
+within the memory budget, then the box: baseline, Phase 1, Phase 1 + buffered
+key directory, in one session.
+
+#### Risks
+
+- The merger's ~1.5× margin at the box's scale. If it falls behind, writers
+  stall on backpressure — bounded, but a latency cost.
+- Range scans pay +13.5% on the busiest index; `count_keys` loses its
+  two-read bound.
+- A second concurrency protocol in the engine, next to the commit pipeline.
+
+### Phase 2: the append out of the serial section (epic, after 1b)
 
 On branch `epic/append-pipeline`, kept alive until measurements and tests say
 whether it comes in.
