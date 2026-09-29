@@ -192,9 +192,10 @@ end
 -- Key directory tree selection: the engine is built on the blind-leaf B+
 -- tree (docs/blind_leaf_btree_design.md), which stores no key bytes.
 -- BYTECASK_KEYDIR=btree builds it on the B+ tree that keeps its keys in the
--- leaves (docs/persistent_btree_design.md); CI runs the engine suite on both.
--- The switch is the seam for testing a new key directory against the same
--- engine suite. Applies to every target so tests and benchmarks agree.
+-- leaves (docs/persistent_btree_design.md), and BYTECASK_KEYDIR=buffered on
+-- the blind tree behind a write buffer; CI runs the engine suite on all
+-- three. The switch is the seam for testing a new key directory against the
+-- same engine suite. Applies to every target so tests and benchmarks agree.
 local keydir = os.getenv("BYTECASK_KEYDIR")
 if keydir == nil or keydir == "" then
     keydir = "blind"
@@ -204,14 +205,19 @@ end
 rule("bytecask.keydir_check")
     on_config(function (t)
         local kd = os.getenv("BYTECASK_KEYDIR")
-        if kd and kd ~= "" and kd ~= "blind" and kd ~= "btree" then
-            raise("BYTECASK_KEYDIR must be blind or btree, not '%s'", kd)
+        if kd and kd ~= "" and kd ~= "blind" and kd ~= "btree" and kd ~= "buffered" then
+            raise("BYTECASK_KEYDIR must be blind, btree or buffered, not '%s'", kd)
         end
     end)
 rule_end()
 add_rules("bytecask.keydir_check")
-if keydir == "blind" then
+if keydir == "blind" or keydir == "buffered" then
+    -- buffered is the blind tree behind a write buffer: the blind family.
     add_defines("BYTECASK_KEYDIR_BLIND")
+end
+if keydir == "buffered" then
+    -- The blind tree behind a write buffer (bytecaskdb/buffered_btree.cppm).
+    add_defines("BYTECASK_KEYDIR_BUFFERED")
 end
 
 local march = os.getenv("BYTECASK_MARCH") or "native"

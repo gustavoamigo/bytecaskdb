@@ -794,6 +794,16 @@ public:
   auto operator==(std::default_sentinel_t) const noexcept -> bool {
     return stack_.empty();
   }
+  // The stepping interface every key directory iterator offers, for trees
+  // that read keys to step (the buffered tree). This one never does.
+  template <BlindKeyResolver R> void settle(R &) noexcept {}
+  template <BlindKeyResolver R> void next(R &) { advance(); }
+  template <BlindKeyResolver R> void prev(R &) { retreat(); }
+  template <BlindKeyResolver R>
+  [[nodiscard]] auto count_until(const BlindBTreeIterator &end, std::size_t limit,
+                                 R &) const -> std::size_t {
+    return count_until(end, limit);
+  }
   // Entries from here up to, not including, `end` — an iterator over the
   // same version at or after this one — counted from leaf sizes, no further
   // than `limit`. Reads no key: the only reads are the ones that positioned
