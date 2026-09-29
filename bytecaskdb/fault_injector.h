@@ -49,7 +49,9 @@ enum class PostWriteMode { none, short_write, throw_after };
 // Name-based injection takes priority if both are set.
 //
 // Post-write mode (short_write/throw_after) fires at FAULT_INJECTION_POST_WRITE
-// checkpoints matching fail_at_name. It does not use count-based triggering.
+// checkpoints matching fail_at_name, and not at a FAULT_INJECTION checkpoint
+// of the same name, so one name can fail a call before or after its syscall
+// lands (io_resume_truncate). It does not use count-based triggering.
 //
 // Thread-local: each thread has its own active injector so concurrent
 // tests do not interfere with each other.
@@ -74,8 +76,11 @@ struct FaultInjector {
     last_checkpoint = name;
     ++call_count;
 
-    // Name-based — targets a specific fault point explicitly
-    if (!fail_at_name.empty() && fail_at_name == name) {
+    // Name-based — targets a specific fault point explicitly. In post-write
+    // mode the name targets the FAULT_INJECTION_POST_WRITE checkpoint, so a
+    // pre-syscall checkpoint of the same name lets the syscall run.
+    if (!fail_at_name.empty() && fail_at_name == name &&
+        post_write_mode == PostWriteMode::none) {
       throw std::system_error{error,
           std::string{"fault injection at: "} + name};
     }

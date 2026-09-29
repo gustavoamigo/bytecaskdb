@@ -12,6 +12,7 @@ from .scenario_matrix import ResumeFailureClass
 # Named fault point for each resume failure class.
 _RESUME_FAULT_NAMES = {
     ResumeFailureClass.R1: "io_resume_truncate",
+    ResumeFailureClass.R1_AFTER_CUT: "io_resume_truncate",
     ResumeFailureClass.R2: "io_resume_sync",
     ResumeFailureClass.R3: "io_resume_file_creation",
 }

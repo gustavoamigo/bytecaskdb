@@ -31,6 +31,7 @@ class DegradeShape:
 class ResumeFailureClass(Enum):
     SUCCESS = "success"
     R1 = "truncate_fails"        # io_resume_truncate
+    R1_AFTER_CUT = "truncate_fails_after_cut"  # io_resume_truncate, post-syscall
     R2 = "sync_fails"            # io_resume_sync
     R3 = "file_creation_fails"   # io_resume_file_creation
     DOUBLE = "double_resume"     # resume succeeds, then resume again (no-op)
@@ -67,7 +68,12 @@ def is_valid_combination(
     # vacuously. degrade_C leaves an orphaned BulkBegin; degrade_B2 leaves a
     # torn entry and degrade_B3 a complete one the caller was never told
     # about. All three reach truncate.
-    if failure == ResumeFailureClass.R1 and degrade.degrade_via not in (
+    # R1_AFTER_CUT fails the same truncate after it has cut the file, so it
+    # needs the same shapes.
+    if failure in (
+        ResumeFailureClass.R1,
+        ResumeFailureClass.R1_AFTER_CUT,
+    ) and degrade.degrade_via not in (
         DegradeVia.C,
         DegradeVia.B2,
         DegradeVia.B3,

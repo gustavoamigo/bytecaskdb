@@ -319,15 +319,13 @@ public:
     }
     const auto file_sz = std::filesystem::file_size(path);
     std::vector<std::byte> buf(file_sz);
-    if (file_sz > 0) {
-      if (::pread(fd, buf.data(), file_sz, 0) != narrow<ssize_t>(file_sz)) {
-        const auto err = errno;
-        ::close(fd);
-        throw std::system_error{
-            err, std::generic_category(),
-            std::format("HintFile: cannot read '{}' into buffer",
-                        path.string())};
-      }
+    try {
+      pread_exact(fd, 0, buf);
+    } catch (const std::system_error &e) {
+      ::close(fd);
+      throw std::system_error{
+          e.code(), std::format("HintFile: cannot read '{}' into buffer: {}",
+                                path.string(), e.what())};
     }
     ::close(fd);
 

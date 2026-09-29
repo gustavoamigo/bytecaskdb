@@ -246,6 +246,34 @@ def gen_fault_phase(fault_name: str) -> str:
     )
 
 
+def gen_fault_after_cut_phase(fault_name: str, delta: ResumeDelta) -> str:
+    """Generate Phase 2 for a truncate that cuts the file and then fails.
+
+    ftruncate can report an error after the file already shrank (#236). The
+    engine stays degraded with the cut file still published, and every key
+    published before the degrade must still read back: a logical end left
+    past the new end of file sends a record read's over-read past EOF.
+    """
+    lines = [
+        "    // Phase 2: the truncate cuts the file, then reports an error →",
+        "    // resume() throws, stays degraded, published keys still read.",
+        "    {",
+        "      bytecask::testing::ScopedFaultInjector fi_resume{",
+        f'          "{fault_name}", bytecask::testing::PostWriteMode::throw_after}};',
+        "      REQUIRE_THROWS_AS(db.resume(), std::system_error);",
+        "    }",
+        "    REQUIRE(db.is_degraded());",
+    ]
+    for key, value in delta.keys_published.items():
+        lines.append("    {")
+        lines.append("      bytecask::Bytes out;")
+        lines.append(f'      INFO("degraded read of published key: {key}");')
+        lines.append(f'      CHECK(db.get({{}}, to_bytes("{key}"), out));')
+        lines.append(f'      CHECK(to_string(out) == "{value}");')
+        lines.append("    }")
+    return "\n".join(lines)
+
+
 def gen_cascade_phases(fault_names) -> str:
     """Generate Phase 2+3: two sequential faults, each keeping engine degraded."""
     parts: List[str] = []
@@ -338,6 +366,10 @@ def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
         parts.append(gen_cascade_phases(fault))
         parts.append("")
         parts.append(gen_clean_resume_and_checks(delta, phase_num=4))
+    elif failure == ResumeFailureClass.R1_AFTER_CUT:
+        parts.append(gen_fault_after_cut_phase(fault, delta))
+        parts.append("")
+        parts.append(gen_clean_resume_and_checks(delta))
     elif fault:
         parts.append(gen_fault_phase(fault))
         parts.append("")

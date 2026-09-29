@@ -866,7 +866,9 @@ not accidents:
   byte under a live span is ever rewritten.
 - *The file can shorten under the mapping.* `resume()` truncates to the
   last committed offset and sealing releases the zero-filled tail.
-  Neither touches the mapping; both lower `mmap_end_` with the file. By
+  Neither touches the mapping; both lower `mmap_end_` with the file,
+  `resume()` before it cuts, so an `ftruncate` that cuts the file and
+  then reports an error leaves no page past the new end readable. By
   P, neither can take away a page a published offset points into, so no
   live span loses its backing. A read at or past the new bound takes
   the `pread` fallback and fails as a clean short read rather than

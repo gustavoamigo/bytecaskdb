@@ -22,6 +22,9 @@ class ResumeDelta:
     keys_absent: List[str]
     # Did the fault-injected resume() throw? (False for SUCCESS.)
     first_threw: bool
+    # Keys published before the degrade, mapped to their value. The degraded
+    # contract keeps them readable while resume() fails.
+    keys_published: Dict[str, str]
 
 
 def resume_delta(degrade: DegradeShape, failure: ResumeFailureClass) -> ResumeDelta:
@@ -76,6 +79,7 @@ def resume_delta(degrade: DegradeShape, failure: ResumeFailureClass) -> ResumeDe
                sequence 1 — a bound a cold open, whose hint file does carry
                markers, computes differently.
     """
+    keys_published = {"k0": "v0"}
     if degrade.degrade_via in (DegradeVia.H, DegradeVia.F, DegradeVia.G):
         keys_present = {"k0": "v0", "p0": "new0"}
         keys_absent: List[str] = []
@@ -88,12 +92,14 @@ def resume_delta(degrade: DegradeShape, failure: ResumeFailureClass) -> ResumeDe
     elif degrade.degrade_via == DegradeVia.F_RANGE:
         keys_present = {}
         keys_absent = ["k0", "k1"]
+        keys_published = {"k0": "v0", "k1": "v1"}
     else:  # DegradeVia.F_BATCH
         keys_present = {"p0": "new0", "p1": "new1", "k0": "v0"}
         keys_absent: List[str] = []
+        keys_published = {"p0": "new0", "p1": "new1"}
 
     first_threw = failure not in (
         ResumeFailureClass.SUCCESS,
         ResumeFailureClass.DOUBLE,
     )
-    return ResumeDelta(keys_present, keys_absent, first_threw)
+    return ResumeDelta(keys_present, keys_absent, first_threw, keys_published)
