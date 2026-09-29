@@ -30,7 +30,10 @@ permissions:
 
 jobs:
   soak:
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest: its 6.17.0-1022-azure kernel returns wrong bytes for
+    # a pread of written data on ext4 (#211, #228). The container shares the host's
+    # kernel, so the runner image is what picks it.
+    runs-on: ubuntu-22.04
     timeout-minutes: 75
     container:
       image: fedora:43

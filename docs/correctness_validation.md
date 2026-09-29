@@ -1597,6 +1597,9 @@ ByteCaskDB does not work around a platform that returns wrong data: the
 read fails, on a CRC mismatch or a record that does not parse. The
 runners' `6.17.0-1022-azure` does this on ext4 (#211): a `pread` of
 written bytes can return the same file's contents from a page earlier.
+The soak runs on the `ubuntu-22.04` runner to stay off that kernel
+(#228); the container shares the host's kernel, so the runner image is
+what picks it.
 Testing builds add to a failed record read where its descriptor points
 and what the same bytes read now, which is what separated that kernel
 from an engine bug.
