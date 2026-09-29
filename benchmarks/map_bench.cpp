@@ -5,7 +5,13 @@
 
 #include "../tests/alloc_tracker.h"
 #include "../tests/key_generators.h"
+#include <algorithm>
 #include <benchmark/benchmark.h>
+#include <bit>
+#include <functional>
+#include <optional>
+#include <random>
+#include <string_view>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -827,6 +833,251 @@ BLIND_ROWS(2560)
 #undef SIZES
 #undef ITER_SIZES
 // clang-format on
+
+
+// ===========================================================================
+// PROTOTYPE — a buffered blind tree, to price an idea before designing it
+// (docs/commit_path_scaling_design.md): the serial section appends each change
+// to a delta table instead of updating the tree, and a merger folds the table
+// into the tree later, in sorted batches. A wrapper: the blind tree is used
+// as is. Three costs decide it, each benchmarked below against the tree
+// alone, on a 1M-key tree:
+//   BufWrite  the writer's cost per change (what leaves the serial section);
+//   BufMerge  the merger's cost per change, sorted batches vs arrival order;
+//   BufGet / BufRange50  what readers pay for consulting the table.
+// Single-threaded: it prices operations; the concurrent protocol (published
+// prefixes, per-key chains for older versions) is not built.
+// ===========================================================================
+
+using BlindA = BlindAdapter<1024>;
+using BlindTree = bytecask::PersistentBlindBTree<1024>;
+constexpr std::size_t kBufBase = 1'000'000;
+
+auto key_hash(std::span<const std::byte> k) -> std::uint64_t {
+  return std::hash<std::string_view>{}(
+      std::string_view{reinterpret_cast<const char *>(k.data()), k.size()});
+}
+
+// Append-only log of (key hash, record) with an open-addressing index on the
+// hash; the index keeps each key's newest entry. A hash match is confirmed by
+// reading the record's key, as the blind tree confirms a fingerprint.
+struct DeltaTable {
+  struct Entry {
+    std::uint64_t h;
+    bytecask::BlindRef ref;
+  };
+  std::vector<Entry> log;
+  std::vector<std::uint32_t> slots;  // log index + 1; 0 is empty
+  std::uint64_t mask;
+
+  explicit DeltaTable(std::size_t capacity)
+      : slots(std::bit_ceil(capacity * 2)), mask(slots.size() - 1) {
+    log.reserve(capacity);
+  }
+  void clear() {
+    log.clear();
+    std::ranges::fill(slots, 0u);
+  }
+  auto slot_of(std::span<const std::byte> key, std::uint64_t h) const -> std::size_t {
+    for (auto i = h & mask;; i = (i + 1) & mask) {
+      const auto s = slots[i];
+      if (s == 0) return i;
+      const auto &e = log[s - 1];
+      if (e.h == h && std::ranges::equal(bench_resolver().key_at(e.ref), key)) return i;
+    }
+  }
+  auto find(std::span<const std::byte> key) const -> std::optional<bytecask::BlindRef> {
+    const auto s = slots[slot_of(key, key_hash(key))];
+    if (s == 0) return std::nullopt;
+    return log[s - 1].ref;
+  }
+  void put(std::span<const std::byte> key, bytecask::BlindRef ref) {
+    const auto h = key_hash(key);
+    const auto i = slot_of(key, h);
+    log.push_back({h, ref});
+    slots[i] = static_cast<std::uint32_t>(log.size());
+  }
+};
+
+// The shared base: a 1M-key blind tree, built once.
+struct BufBase {
+  std::vector<BlindA::key_type> keys;
+  BlindTree tree;
+};
+auto buf_base() -> const BufBase & {
+  static auto *b = [] {
+    auto *p = new BufBase;  // never destroyed
+    p->keys = BlindA::make_keys(generate_uniform_keys(kBufBase));
+    p->tree = BlindA::transient_build(p->keys);
+    return p;
+  }();
+  return *b;
+}
+auto fresh_keys(std::size_t n, std::size_t &next) -> std::vector<BlindA::key_type> {
+  std::vector<std::string> names(n);
+  for (auto &k : names) k = "fresh_" + std::to_string(next++);
+  return BlindA::make_keys(names);
+}
+
+// Writer: one batch of 100 inserts of new keys, as a group commit applies
+// them. mode 0: today — a transient on the tree, get then set per key,
+// publish. mode 1: the table, with the tree lookup today's check needs
+// (absent from the table, then from the tree). mode 2: the table alone —
+// the check answered by the table, if it holds every change since the
+// snapshot.
+void BM_BufWrite(benchmark::State &state) {
+  const auto mode = state.range(0);
+  const auto &b = buf_base();
+  constexpr std::size_t kBatch = 100;
+  constexpr std::size_t kTableCap = 16384;
+  DeltaTable table{kTableCap};
+  std::size_t next = 0;
+  for (auto _ : state) {
+    state.PauseTiming();
+    const auto batch = fresh_keys(kBatch, next);
+    if (table.log.size() + kBatch > kTableCap) table.clear();
+    state.ResumeTiming();
+    if (mode == 0) {
+      auto tr = b.tree.transient();
+      for (const auto &k : batch) {
+        benchmark::DoNotOptimize(BlindA::transient_get(tr, k));
+        tr.set(to_bytes(k.s), k.ref, bench_resolver());
+      }
+      benchmark::DoNotOptimize(std::move(tr).persistent());
+    } else {
+      for (const auto &k : batch) {
+        const auto key = to_bytes(k.s);
+        benchmark::DoNotOptimize(table.find(key));
+        if (mode == 1) benchmark::DoNotOptimize(b.tree.get(key, bench_resolver()));
+        table.put(key, k.ref);
+      }
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(kBatch));
+}
+
+// Merger: fold D changes into the tree in one transient. range(1) = 0 applies
+// them in arrival order, 1 sorts them by key first (the sort is timed: the
+// merger has to do it). range(2) = 0 inserts new keys, 1 updates existing
+// ones. D = 400 is today's batch: ~20 commits of ~20 writes.
+void BM_BufMerge(benchmark::State &state) {
+  const auto d = static_cast<std::size_t>(state.range(0));
+  const bool sorted = state.range(1) != 0;
+  const bool updates = state.range(2) != 0;
+  const auto &b = buf_base();
+  std::size_t next = 0;
+  std::mt19937_64 rng{42};
+  for (auto _ : state) {
+    state.PauseTiming();
+    std::vector<BlindA::key_type> changes;
+    if (updates) {
+      changes.reserve(d);
+      for (std::size_t i = 0; i < d; ++i)
+        changes.push_back(b.keys[rng() % b.keys.size()]);
+    } else {
+      changes = fresh_keys(d, next);
+      std::ranges::shuffle(changes, rng);
+    }
+    state.ResumeTiming();
+    if (sorted)
+      std::ranges::sort(changes, {}, [](const BlindA::key_type &k) -> const std::string & { return k.s; });
+    auto tr = b.tree.transient();
+    for (const auto &k : changes) tr.set(to_bytes(k.s), k.ref, bench_resolver());
+    benchmark::DoNotOptimize(std::move(tr).persistent());
+  }
+  state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(d));
+}
+
+// A table of D changes: half updates of existing keys, half new keys.
+auto filled_table(std::size_t d) -> DeltaTable {
+  const auto &b = buf_base();
+  DeltaTable t{std::max<std::size_t>(d, 16)};
+  std::size_t next = 1'000'000'000;
+  std::mt19937_64 rng{7};
+  const auto fresh = fresh_keys(d / 2, next);
+  for (std::size_t i = 0; i < d; ++i) {
+    const auto &k = i % 2 == 0 ? b.keys[rng() % b.keys.size()] : fresh[i / 2];
+    t.put(to_bytes(k.s), k.ref);
+  }
+  return t;
+}
+
+// Point reads of existing keys with a table of D changes in front of the
+// tree: a probe, then the tree when the table misses (most keys). D = 0 is
+// the tree alone, with no probe.
+void BM_BufGet(benchmark::State &state) {
+  const auto d = static_cast<std::size_t>(state.range(0));
+  const auto &b = buf_base();
+  auto table = filled_table(d);
+  std::mt19937_64 rng{3};
+  for (auto _ : state) {
+    const auto &k = b.keys[rng() % b.keys.size()];
+    const auto key = to_bytes(k.s);
+    if (d > 0) {
+      if (auto hit = table.find(key)) {
+        benchmark::DoNotOptimize(hit);
+        continue;
+      }
+    }
+    benchmark::DoNotOptimize(b.tree.get(key, bench_resolver()));
+  }
+}
+
+// A 50-key range scan with a table of D changes merged in. range(1) = 0 finds
+// the table's entries in range by scanning it (the table as built: unsorted);
+// 1 by binary search in a sorted copy made outside the timed region (what a
+// sorted table would cost readers — keeping it sorted is not priced here).
+void BM_BufRange50(benchmark::State &state) {
+  const auto d = static_cast<std::size_t>(state.range(0));
+  const bool sorted_table = state.range(1) != 0;
+  const auto &b = buf_base();
+  auto table = filled_table(d);
+  std::vector<std::string> sorted_keys;
+  for (const auto &e : table.log) {
+    const auto k = bench_resolver().key_at(e.ref);
+    sorted_keys.emplace_back(reinterpret_cast<const char *>(k.data()), k.size());
+  }
+  std::ranges::sort(sorted_keys);
+  std::mt19937_64 rng{5};
+  std::vector<std::string_view> in_range;
+  for (auto _ : state) {
+    const auto &start = b.keys[rng() % b.keys.size()];
+    auto it = b.tree.lower_bound(to_bytes(start.s), bench_resolver());
+    std::uint64_t sum = 0;
+    std::string last;
+    for (int i = 0; i < 50 && it != std::default_sentinel; ++i, ++it) {
+      const auto k = it.key(bench_resolver());
+      sum += (*it).offset + k.size();
+      if (i == 49) last.assign(reinterpret_cast<const char *>(k.data()), k.size());
+    }
+    if (d > 0) {
+      const std::string_view lo{start.s};
+      in_range.clear();
+      if (sorted_table) {
+        auto first = std::ranges::lower_bound(sorted_keys, lo);
+        for (; first != sorted_keys.end() && *first <= last; ++first) in_range.push_back(*first);
+      } else {
+        for (const auto &e : table.log) {
+          const auto kb = bench_resolver().key_at(e.ref);
+          const std::string_view k{reinterpret_cast<const char *>(kb.data()), kb.size()};
+          if (k >= lo && k <= last) in_range.push_back(k);
+        }
+        std::ranges::sort(in_range);
+      }
+      sum += in_range.size();
+    }
+    benchmark::DoNotOptimize(sum);
+  }
+}
+
+BENCHMARK(BM_BufWrite)->Name("BufBlind/Write")->ArgName("mode")->Arg(0)->Arg(1)->Arg(2)->Unit(benchmark::kNanosecond);
+BENCHMARK(BM_BufMerge)->Name("BufBlind/Merge")->ArgNames({"d", "sorted", "updates"})
+    ->Args({400, 0, 0})->Args({400, 1, 0})->Args({10000, 0, 0})->Args({10000, 1, 0})->Args({100000, 1, 0})
+    ->Args({400, 0, 1})->Args({400, 1, 1})->Args({10000, 0, 1})->Args({10000, 1, 1})->Args({100000, 1, 1})
+    ->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_BufGet)->Name("BufBlind/Get")->ArgName("d")->Arg(0)->Arg(1000)->Arg(10000)->Arg(100000);
+BENCHMARK(BM_BufRange50)->Name("BufBlind/Range50")->ArgNames({"d", "sorted"})
+    ->Args({0, 0})->Args({1000, 0})->Args({10000, 0})->Args({1000, 1})->Args({10000, 1})->Args({100000, 1});
 
 } // namespace
 
