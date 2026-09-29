@@ -543,31 +543,67 @@ public:
   }
 
   // Folds a frozen buffer into base, reading records through the buffers
-  // of `overlay` (it and every newer one). Only each key's newest slot: an
-  // older one may name a record that a later write overrode.
+  // of `overlay` (it and every newer one). Per key, only its newest slot
+  // counts: an older one may name a record that a later write overrode.
+  //
+  // Most keys need no read. A key's oldest slot in the buffer displaced the
+  // entry base holds for it, so an update or an erase is applied by that
+  // location (replace_at / erase_at, which read nothing and succeed only
+  // where base holds the key at that very record). An insert — the key was
+  // absent — and any key whose location base does not hold take the keyed
+  // path, which reads records to place the key.
   template <BlindKeyResolver R>
   static auto merge_with(const Tree &base, const View &frozen, const Layers &overlay, R &res)
       -> Tree {
+    const auto t0 = std::chrono::steady_clock::now();
     auto tr = base.transient();
     buffered_detail::Overlay<R> ov{res, overlay};
-    std::unordered_map<std::string_view, std::uint32_t> newest;
+    struct Span {
+      std::uint32_t oldest;
+      std::uint32_t newest;
+    };
+    std::unordered_map<std::string_view, Span> keys;
+    std::int64_t slots = 0;
+    std::int64_t by_location = 0;
     for (std::size_t p = 0; p < buffered_detail::kPartitions; ++p) {
-      newest.clear();
+      keys.clear();
+      const auto &part = frozen.buf->parts[p];
       for (std::uint32_t i = 0; i < frozen.counts[p]; ++i) {
         const auto k = frozen.buf->key(p, i);
-        newest[std::string_view{reinterpret_cast<const char *>(k.data()), k.size()}] = i;
+        const auto [it, fresh] =
+            keys.try_emplace(std::string_view{reinterpret_cast<const char *>(k.data()), k.size()},
+                             Span{i, i});
+        if (!fresh) it->second.newest = i;
       }
-      for (const auto &[key, i] : newest) {
+      slots += frozen.counts[p];
+      for (const auto &[key, span] : keys) {
         const buffered_detail::Bytes k{reinterpret_cast<const std::byte *>(key.data()),
                                        key.size()};
-        const auto ref = frozen.buf->parts[p].ref[i];
+        const auto ref = part.ref[span.newest];
+        const auto held = part.old[span.oldest];  // what base holds for the key
+        if (!buffered_detail::is_none(held)) {
+          const bool done = buffered_detail::is_none(ref) ? tr.erase_at(k, held)
+                                                          : tr.replace_at(k, held, ref);
+          if (done) {
+            ++by_location;
+            continue;
+          }
+        }
         if (buffered_detail::is_none(ref))
           (void)tr.erase(k, ov);
         else
           tr.set(k, ref, ov);
       }
     }
-    return std::move(tr).persistent();
+    auto merged = std::move(tr).persistent();
+    merges_.fetch_add(1, std::memory_order_relaxed);
+    merge_slots_.fetch_add(slots, std::memory_order_relaxed);
+    merge_by_location_.fetch_add(by_location, std::memory_order_relaxed);
+    merge_ns_.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count(),
+                        std::memory_order_relaxed);
+    return merged;
   }
 
   // Process-wide, across key directories.
@@ -579,6 +615,20 @@ public:
   }
   [[nodiscard]] static auto inline_merges() noexcept -> std::int64_t {
     return inline_merges_.load(std::memory_order_relaxed);
+  }
+  // Merges run, the time they took, the slots they covered, and the keys
+  // applied by location rather than by key.
+  [[nodiscard]] static auto merges() noexcept -> std::int64_t {
+    return merges_.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] static auto merge_ns() noexcept -> std::int64_t {
+    return merge_ns_.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] static auto merge_slots() noexcept -> std::int64_t {
+    return merge_slots_.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] static auto merge_by_location() noexcept -> std::int64_t {
+    return merge_by_location_.load(std::memory_order_relaxed);
   }
 
 private:
@@ -653,6 +703,10 @@ private:
   static inline std::atomic<std::int64_t> stalls_{0};
   static inline std::atomic<std::int64_t> stall_ns_{0};
   static inline std::atomic<std::int64_t> inline_merges_{0};
+  static inline std::atomic<std::int64_t> merges_{0};
+  static inline std::atomic<std::int64_t> merge_ns_{0};
+  static inline std::atomic<std::int64_t> merge_slots_{0};
+  static inline std::atomic<std::int64_t> merge_by_location_{0};
   std::thread thread_;  // last: joined before the rest is destroyed
 };
 
@@ -1044,6 +1098,16 @@ public:
   }
   [[nodiscard]] static auto buffer_inline_merges() noexcept -> std::int64_t {
     return Merger::inline_merges();
+  }
+  [[nodiscard]] static auto buffer_merges() noexcept -> std::int64_t { return Merger::merges(); }
+  [[nodiscard]] static auto buffer_merge_ns() noexcept -> std::int64_t {
+    return Merger::merge_ns();
+  }
+  [[nodiscard]] static auto buffer_merge_slots() noexcept -> std::int64_t {
+    return Merger::merge_slots();
+  }
+  [[nodiscard]] static auto buffer_merge_by_location() noexcept -> std::int64_t {
+    return Merger::merge_by_location();
   }
 
 #ifdef BYTECASK_TESTING
