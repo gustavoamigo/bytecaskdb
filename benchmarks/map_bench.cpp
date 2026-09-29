@@ -1118,9 +1118,9 @@ constexpr std::uint64_t kSign = 0x8000'0000'0000'0000ULL;  // unsigned -> signed
 struct SmallBuffer {
   std::size_t cap;
   std::size_t n = 0;
-  alignas(32) std::array<std::uint16_t, kSmallMax> fp{};
-  alignas(32) std::array<std::int64_t, kSmallMax> hi{};  // prefix bytes 0-7, sign-flipped
-  alignas(32) std::array<std::int64_t, kSmallMax> lo{};  // prefix bytes 8-15, sign-flipped
+  alignas(64) std::array<std::uint16_t, kSmallMax> fp{};
+  alignas(64) std::array<std::int64_t, kSmallMax> hi{};  // prefix bytes 0-7, sign-flipped
+  alignas(64) std::array<std::int64_t, kSmallMax> lo{};  // prefix bytes 8-15, sign-flipped
   std::array<bytecask::BlindRef, kSmallMax> ref{};
   std::array<std::uint32_t, kSmallMax> key_off{};
   std::array<std::uint16_t, kSmallMax> key_len{};
@@ -1149,7 +1149,20 @@ struct SmallBuffer {
   // Newest slot holding k: a fingerprint scan from the newest end.
   [[nodiscard]] auto find(std::span<const std::byte> k) const -> std::optional<bytecask::BlindRef> {
     const auto f = fingerprint(k);
-#if defined(__AVX2__)
+#if defined(__AVX512BW__)
+    const auto want512 = _mm512_set1_epi16(static_cast<short>(f));
+    for (std::size_t base = (n + 31) / 32 * 32; base > 0;) {
+      base -= 32;
+      auto m = static_cast<std::uint32_t>(_mm512_cmpeq_epi16_mask(
+          _mm512_load_si512(reinterpret_cast<const void *>(&fp[base])), want512));
+      while (m != 0) {
+        const auto bit = 31 - std::countl_zero(m);  // newest first
+        const auto i = base + static_cast<std::size_t>(bit);
+        m &= ~(1u << bit);
+        if (i < n && std::ranges::equal(key(i), k)) return ref[i];
+      }
+    }
+#elif defined(__AVX2__)
     const auto want = _mm256_set1_epi16(static_cast<short>(f));
     for (std::size_t base = (n + 15) / 16 * 16; base > 0;) {
       base -= 16;
@@ -1174,12 +1187,13 @@ struct SmallBuffer {
 // (4 bytes), index id (2), then the primary key big-endian — warehouse (4),
 // district (1), order (4), line (1). An 8-byte prefix reaches only the top
 // two bytes of the warehouse id, which are zero: every key of the table ties.
-auto tpcc_key(std::uint32_t w, std::uint8_t d, std::uint32_t o, std::uint8_t l) -> std::string {
+auto tpcc_key(std::uint32_t w, std::uint8_t d, std::uint32_t o, std::uint8_t l,
+              std::uint32_t table = 7) -> std::string {
   std::string k(16, '\0');
   const auto put32 = [&](std::size_t at, std::uint32_t v) {
     for (int i = 0; i < 4; ++i) k[at + static_cast<std::size_t>(i)] = static_cast<char>(v >> (24 - 8 * i));
   };
-  put32(0, 7);
+  put32(0, table);
   k[4] = 0; k[5] = 1;
   put32(6, w);
   k[10] = static_cast<char>(d);
@@ -1197,6 +1211,34 @@ auto tpcc_keys(std::size_t n, std::uint32_t first_order) -> std::vector<std::str
           keys.push_back(tpcc_key(w, d, o, l));
   return keys;
 }
+
+// The index a key belongs to — its first 6 bytes, table and index id —
+// hashed to one of 16 partitions.
+auto index_partition(std::span<const std::byte> k) -> std::size_t {
+  std::uint64_t v = 0;
+  for (std::size_t i = 0; i < 6 && i < k.size(); ++i)
+    v = (v << 8) | std::to_integer<std::uint64_t>(k[i]);
+  return static_cast<std::size_t>((v * 0x9E3779B97F4A7C15ULL) >> 60);
+}
+
+// The same buffer split by index at append time: a range scan, which never
+// leaves its index, filters only its partition; a point lookup scans only
+// its key's. `total` is the capacity across partitions.
+struct PartitionedBuffer {
+  std::vector<SmallBuffer> parts;
+  std::size_t n = 0;
+  explicit PartitionedBuffer(std::size_t total) {
+    parts.reserve(16);
+    for (int i = 0; i < 16; ++i) parts.emplace_back(total);
+  }
+  void put(std::span<const std::byte> k, bytecask::BlindRef r) {
+    parts[index_partition(k)].put(k, r);
+    ++n;
+  }
+  [[nodiscard]] auto find(std::span<const std::byte> k) const {
+    return parts[index_partition(k)].find(k);
+  }
+};
 
 struct SmallBase {
   std::vector<BlindA::key_type> keys;
@@ -1216,13 +1258,38 @@ auto small_base(int keyset) -> const SmallBase & {
     p->tree = BlindA::transient_build(p->keys);
     return p;
   }();
-  return keyset == 0 ? *uniform : *tpcc;
+  return keyset == 0 ? *uniform : *tpcc;  // keyset 2 scans the TPROC-C base too
 }
 // A buffer of `size` recent writes: new keys (for TPROC-C, the next orders)
 // and updates of existing ones, alternating.
-auto filled_small(int keyset, std::size_t size) -> SmallBuffer {
+// keyset 2: the TPROC-C base, and a buffer mixing tables as a batch of
+// New-Order / Payment commits does: ~40% order lines (new keys, in the
+// scanned index), the rest other tables' rows.
+auto mixed_keys(std::size_t size) -> std::vector<BlindA::key_type> {
+  std::mt19937_64 rng{13};
+  std::vector<std::string> names;
+  names.reserve(size);
+  std::uint32_t o = 1'000'000;
+  for (std::size_t i = 0; i < size; ++i) {
+    const auto dice = rng() % 10;
+    const auto w = static_cast<std::uint32_t>(1 + rng() % 96);
+    const auto d = static_cast<std::uint8_t>(1 + rng() % 10);
+    if (dice < 4)
+      names.push_back(tpcc_key(w, d, o++, static_cast<std::uint8_t>(1 + rng() % 10)));
+    else
+      names.push_back(tpcc_key(w, d, static_cast<std::uint32_t>(rng() % 100000), 0,
+                               dice < 6 ? 3u : dice < 7 ? 5u : dice < 8 ? 6u : dice < 9 ? 2u : 1u));
+  }
+  return BlindA::make_keys(names);
+}
+
+template <typename Buffer>
+auto fill_buffer(Buffer &buf, int keyset, std::size_t size) -> void {
+  if (keyset == 2) {
+    for (const auto &k : mixed_keys(size)) buf.put(to_bytes(k.s), k.ref);
+    return;
+  }
   const auto &b = small_base(keyset);
-  SmallBuffer buf{size};
   std::mt19937_64 rng{11};
   std::size_t next = 2'000'000'000;
   const auto fresh = keyset == 0 ? fresh_keys(size, next)
@@ -1231,6 +1298,11 @@ auto filled_small(int keyset, std::size_t size) -> SmallBuffer {
     const auto &k = i % 2 == 0 ? b.keys[rng() % b.keys.size()] : fresh[i];
     buf.put(to_bytes(k.s), k.ref);
   }
+}
+
+auto filled_small(int keyset, std::size_t size) -> SmallBuffer {
+  SmallBuffer buf{size};
+  fill_buffer(buf, keyset, size);
   return buf;
 }
 
@@ -1279,7 +1351,7 @@ void BM_SmallGet(benchmark::State &state) {
 
 // Pass 1 + pass 2 over the buffer for the key range [lo, hi]. variant 1:
 // AVX2 on 16-byte prefixes; 2: the same comparisons, scalar; 3: AVX2 on the
-// 8-byte prefix only. Returns the slots in range, sorted by key.
+// 8-byte prefix only; 4: AVX-512 on 16-byte prefixes (8 slots per compare). Returns the slots in range, sorted by key.
 auto small_range(const SmallBuffer &buf, std::span<const std::byte> lo_k,
                  std::span<const std::byte> hi_k, int variant,
                  std::vector<std::uint32_t> &out, std::size_t &undecided) -> void {
@@ -1309,6 +1381,32 @@ auto small_range(const SmallBuffer &buf, std::span<const std::byte> lo_k,
     if (gt_lo && lt_hi) out.push_back(static_cast<std::uint32_t>(i));
     else if ((eq_lo && (lt_hi || eq_hi)) || (eq_hi && gt_lo)) verify(i);
   };
+#if defined(__AVX512F__)
+  if (variant == 4) {
+    const auto vLh = _mm512_set1_epi64(Lh), vHh = _mm512_set1_epi64(Hh);
+    const auto vLl = _mm512_set1_epi64(Ll), vHl = _mm512_set1_epi64(Hl);
+    std::size_t i = 0;
+    for (; i + 8 <= buf.n; i += 8) {
+      const auto h = _mm512_load_si512(reinterpret_cast<const void *>(&buf.hi[i]));
+      const auto l = _mm512_load_si512(reinterpret_cast<const void *>(&buf.lo[i]));
+      const __mmask8 h_eq_lo = _mm512_cmpeq_epi64_mask(h, vLh);
+      const __mmask8 h_eq_hi = _mm512_cmpeq_epi64_mask(h, vHh);
+      const __mmask8 gt_lo = _mm512_cmpgt_epi64_mask(h, vLh) |
+                             (h_eq_lo & _mm512_cmpgt_epi64_mask(l, vLl));
+      const __mmask8 eq_lo = h_eq_lo & _mm512_cmpeq_epi64_mask(l, vLl);
+      const __mmask8 lt_hi = _mm512_cmpgt_epi64_mask(vHh, h) |
+                             (h_eq_hi & _mm512_cmpgt_epi64_mask(vHl, l));
+      const __mmask8 eq_hi = h_eq_hi & _mm512_cmpeq_epi64_mask(l, vHl);
+      const unsigned inside = gt_lo & lt_hi;
+      const unsigned tie = ((eq_lo & (lt_hi | eq_hi)) | (eq_hi & gt_lo)) & ~inside & 0xffu;
+      for (auto m = inside; m != 0; m &= m - 1)
+        out.push_back(static_cast<std::uint32_t>(i + static_cast<std::size_t>(std::countr_zero(m))));
+      for (auto m = tie; m != 0; m &= m - 1)
+        verify(i + static_cast<std::size_t>(std::countr_zero(m)));
+    }
+    for (; i < buf.n; ++i) classify_scalar(i);
+  } else
+#endif
 #if defined(__AVX2__)
   if (variant != 2) {
     const auto vLh = _mm256_set1_epi64x(Lh), vHh = _mm256_set1_epi64x(Hh);
@@ -1351,8 +1449,21 @@ void BM_SmallRange50(benchmark::State &state) {
   const auto variant = static_cast<int>(state.range(0));
   const auto size = static_cast<std::size_t>(state.range(1));
   const auto keyset = static_cast<int>(state.range(2));
+#if !defined(__AVX512F__)
+  if (variant == 4) {
+    state.SkipWithError("no AVX-512 in this build (needs -march with avx512f)");
+    return;
+  }
+#endif
   const auto &b = small_base(keyset);
-  const auto buf = filled_small(keyset, size);
+  const auto flat = filled_small(keyset, size);
+  PartitionedBuffer parted{size};
+  if (variant == 5) fill_buffer(parted, keyset, size);
+  // variant 5: the partitioned buffer, filtered with AVX2 like variant 1.
+  const auto buffer_for = [&](std::span<const std::byte> k) -> const SmallBuffer & {
+    return variant == 5 ? parted.parts[index_partition(k)] : flat;
+  };
+  const int filter = variant == 5 ? 1 : variant;
   std::mt19937_64 rng{5};
   std::vector<std::uint32_t> in_range;
   in_range.reserve(kSmallMax);
@@ -1365,7 +1476,8 @@ void BM_SmallRange50(benchmark::State &state) {
       const auto &s1 = b.keys[check_rng() % b.keys.size()];
       const auto lo = std::min(s0.s, s1.s), hi = std::max(s0.s, s1.s);
       std::size_t und = 0;
-      small_range(buf, to_bytes(lo), to_bytes(hi), variant, in_range, und);
+      const auto &buf = buffer_for(to_bytes(lo));
+      small_range(buf, to_bytes(lo), to_bytes(hi), filter, in_range, und);
       std::vector<std::uint32_t> brute;
       for (std::size_t i = 0; i < buf.n; ++i) {
         const auto k = buf.key(i);
@@ -1392,7 +1504,8 @@ void BM_SmallRange50(benchmark::State &state) {
     }
     if (variant != 0) {
       std::size_t undecided = 0;
-      small_range(buf, to_bytes(start.s), to_bytes(last), variant, in_range, undecided);
+      small_range(buffer_for(to_bytes(start.s)), to_bytes(start.s), to_bytes(last), filter,
+                  in_range, undecided);
       sum += in_range.size();
       undecided_total += static_cast<std::int64_t>(undecided);
     }
@@ -1407,7 +1520,9 @@ BENCHMARK(BM_SmallGet)->Name("SmallBuf/Get")->ArgNames({"size", "tpcc"})
     ->Args({0, 0})->Args({512, 0})->Args({0, 1})->Args({512, 1})->Args({1024, 1});
 BENCHMARK(BM_SmallRange50)->Name("SmallBuf/Range50")->ArgNames({"variant", "size", "tpcc"})
     ->Args({0, 512, 0})->Args({1, 256, 0})->Args({1, 512, 0})->Args({1, 1024, 0})->Args({2, 512, 0})->Args({3, 512, 0})
-    ->Args({0, 512, 1})->Args({1, 256, 1})->Args({1, 512, 1})->Args({1, 1024, 1})->Args({2, 512, 1})->Args({3, 512, 1});
+    ->Args({0, 512, 1})->Args({1, 256, 1})->Args({1, 512, 1})->Args({1, 1024, 1})->Args({2, 512, 1})->Args({3, 512, 1})
+    ->Args({4, 256, 0})->Args({4, 512, 0})->Args({4, 1024, 0})->Args({4, 256, 1})->Args({4, 512, 1})->Args({4, 1024, 1})
+    ->Args({0, 512, 2})->Args({1, 512, 2})->Args({5, 512, 2})->Args({1, 1024, 2})->Args({5, 1024, 2});
 
 } // namespace
 
