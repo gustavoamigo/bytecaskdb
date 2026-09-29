@@ -271,8 +271,9 @@ The merger holds no reference to the coordinator, so it never joins itself.
 The merger builds T' from a transient of T, applying F's slots in order, and
 never touches A. Neither side mutates what the other reads.
 
-**Nothing drains.** Vacuum relocates keys through `kd_put_at` / `kd_erase_at`,
-which append to the buffer like any write; `set_mode`, `resume` and
+**Nothing drains.** Vacuum relocates keys through `kd_get` and `kd_put`
+(`apply_vacuum`): the lookup sees the buffers before the tree, and the put
+appends to the buffer like any write; `set_mode`, `resume` and
 `create_manifest` never reach into the key directory. Tests get a
 testing-only switch to force a merge or wait for one, so merges can be placed
 at chosen points.
