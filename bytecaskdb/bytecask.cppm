@@ -4445,6 +4445,12 @@ static void add_buffer_stats(std::map<std::string, std::int64_t> &out) {
     out["bytecask.keydir_buffer_stalls"] = T::buffer_stalls();
     out["bytecask.keydir_buffer_stall_us"] = T::buffer_stall_ns() / 1000;
     out["bytecask.keydir_buffer_inline_merges"] = T::buffer_inline_merges();
+    // The merger's work: merges, their time, the slots they covered, and
+    // the keys applied by location (no record read) rather than by key.
+    out["bytecask.keydir_buffer_merges"] = T::buffer_merges();
+    out["bytecask.keydir_buffer_merge_us"] = T::buffer_merge_ns() / 1000;
+    out["bytecask.keydir_buffer_merge_slots"] = T::buffer_merge_slots();
+    out["bytecask.keydir_buffer_merge_by_location"] = T::buffer_merge_by_location();
   }
 }
 

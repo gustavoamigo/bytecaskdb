@@ -223,6 +223,8 @@ TEST_CASE("buffered tree matches a map through merges, undos and vacuums",
   std::vector<Version> versions;
   versions.push_back({Tree{}, files, {}});
   std::size_t most_frozen = 0;  // frozen buffers queued behind the merger
+  const auto by_location_before = Tree::buffer_merge_by_location();
+  const auto merged_slots_before = Tree::buffer_merge_slots();
 
   for (int round = 0; round < 400; ++round) {
     const auto &head = versions.back();
@@ -334,6 +336,11 @@ TEST_CASE("buffered tree matches a map through merges, undos and vacuums",
   for (const auto &v : versions) check_version(v, rec, rng, universe);
   // Several frozen buffers queued at once, merged in order.
   CHECK(most_frozen >= 2);
+  // Updates and erases reached the tree by location, without a read, and
+  // inserts by key: both paths ran.
+  const auto by_location = Tree::buffer_merge_by_location() - by_location_before;
+  CHECK(by_location > 0);
+  CHECK(by_location < Tree::buffer_merge_slots() - merged_slots_before);
 }
 
 TEST_CASE("buffered tree: a count reads no key per counted entry", "[buffered_btree]") {
