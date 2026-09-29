@@ -88,6 +88,11 @@ fail() { echo "ERROR: $*"; exit 1; }
 git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || fail "--repo=$REPO is not a git repository"
 if [[ "$DRY_RUN" == off ]]; then
   [[ -d "$DATA_ROOT" ]] || fail "--data-root=$DATA_ROOT does not exist"
+  # A data root under /mnt must be a mount of its own: after a restart an
+  # instance store is not remounted, and the run would land on the root disk.
+  if [[ "$DATA_ROOT" == /mnt/* ]] && ! mountpoint -q "$DATA_ROOT"; then
+    fail "--data-root=$DATA_ROOT is not a mountpoint; mount the instance store first"
+  fi
   [[ -d "$HDB_HOME" ]] || fail "--hammerdb-home=$HDB_HOME does not exist"
   if [[ "$CAPTURE" == on ]]; then
     [[ $(cat /proc/sys/kernel/perf_event_paranoid) -le 1 ]] ||
@@ -156,9 +161,11 @@ cell() {  # spec engine label
         --reuse-data --data-root="$DATA_ROOT" --hammerdb-home="$HDB_HOME")
   [[ "$CAPTURE" == on ]] && args+=(--capture --capture-dir="$OUT/captures_$label")
   echo "=== $label: $engine on $spec  $(date +%T)"
-  (cd "$wt/bytecaskdb-mariadb-plugin/benchmarks" && ./run-hammerdb.sh "${args[@]}") \
-    >"$OUT/$label.log" 2>&1
-  grep -E "ByteCaskDB:|InnoDB:|FAILED|ERROR" "$OUT/$label.log" | head -5
+  echo "    log: $OUT/$label.log"
+  # The progress lines on screen, everything in the log.
+  (cd "$wt/bytecaskdb-mariadb-plugin/benchmarks" && ./run-hammerdb.sh "${args[@]}") 2>&1 |
+    tee "$OUT/$label.log" |
+    grep --line-buffered -E "^---|built in|NOPM \||FAILED|ERROR|capture:" 
   pgrep -x mariadbd >/dev/null && { echo "a mariadbd was left running; stopping"; pkill -x mariadbd; sleep 5; }
 }
 
@@ -217,7 +224,7 @@ EOF
   echo
   for entry in "${LABELS[@]}"; do
     IFS='|' read -r label spec engine <<<"$entry"
-    line=$(grep -hE "(ByteCaskDB|InnoDB):" "$OUT/$label.log" | head -1)
+    line=$(grep -hE "(ByteCaskDB|InnoDB): +[0-9]+ NOPM" "$OUT/$label.log" | head -1)
     nopm=$(echo "$line" | awk '{print $2}'); tpm=$(echo "$line" | awk '{print $5}')
     sha=-
     [[ "$engine" == bytecaskdb ]] && sha=$(cut -c1-10 "$OUT/sha_$(slug_of "$spec")")
