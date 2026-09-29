@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <benchmark/benchmark.h>
 #include <bit>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <random>
@@ -851,7 +852,11 @@ BLIND_ROWS(2560)
 
 using BlindA = BlindAdapter<1024>;
 using BlindTree = bytecask::PersistentBlindBTree<1024>;
-constexpr std::size_t kBufBase = 1'000'000;
+// BUF_BASE overrides the base tree's size (default 1M).
+const std::size_t kBufBase = [] {
+  const char *v = std::getenv("BUF_BASE");
+  return v != nullptr ? static_cast<std::size_t>(std::stoull(v)) : std::size_t{1'000'000};
+}();
 
 auto key_hash(std::span<const std::byte> k) -> std::uint64_t {
   return std::hash<std::string_view>{}(
