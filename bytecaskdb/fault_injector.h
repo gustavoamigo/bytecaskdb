@@ -18,6 +18,8 @@
 #include <unistd.h>
 #include <vector>
 
+#include "page_cache_model.h"
+
 namespace bytecask::testing {
 
 // ---------------------------------------------------------------------------

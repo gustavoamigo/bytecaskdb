@@ -328,7 +328,7 @@ When this happens, the engine calls `deem_as_degraded(reason)` with a diagnostic
 - **Reads available**: `get`, `contains_key`, `snapshot`, `iter_from`, `keys_from`, `riter_from`, `rkeys_from` continue to work. The in-memory state was correctly rolled back (the transient was never persisted), so reads reflect the last successfully committed state.
 - **Recovery via `resume()`**: the degraded flag is in-memory only. The service calls `resume()` to attempt in-process recovery without a restart. `resume()` runs a universal recovery process:
   1. Acquires the write lock and drops the heads the failed flush left unpublished (`head_ = state_`), so the resumed state is derived from the published one with those heads already reclaimed.
-  2. Scans the active file using `CommittedEntryIterator` to find the last valid committed offset. Orphaned `BulkBegin` batches are excluded — if a `BulkBegin` has no matching `BulkEnd`, `committed_offset` is reset to before the batch start. A corrupt entry ends the scan where a CRC failure throws out of the iterator, so `valid_offset` is recorded as the scan advances rather than after it completes: the entries collected for replay and the offset the file is truncated to must describe the same prefix, or step 3 replays key directory entries addressing bytes step 4 removes. `CommittedEntryIterator` defers parsing the entry after a committed one until the caller advances past it, so the throw leaves the `operator++` that steps past an entry already counted, never the one about to yield it; it never catches, because the scan that compacts a file in vacuum relies on the throw to refuse rather than trim. The scan that indexes a hint-less file at open runs with `OnDamage::Stop` instead, and rules on the tail itself (*Recovering a Hint-less File*). An I/O error is rethrown as-is — it says nothing about the bytes. A parse failure below the **published extent** (the active file's `total_bytes` in the published state) is damage in acknowledged data rather than a failed write's leftovers: `resume()` throws `std::runtime_error` before truncating, leaving the file exactly as found and the engine degraded. There is no recovery contract for damaged published data — the promise is only not to make it worse. The same check is what keeps every published offset inside the file in release builds, where `validate_state_consistency`'s extent walk does not run.
+  2. Writes the active file's bytes back in place and `fdatasync`s them (`rewrite_and_sync`; see *Failed fdatasync and the page cache*), so that everything the scan below reads is on the device. A failure there rethrows and the engine stays degraded. Then scans the active file using `CommittedEntryIterator` to find the last valid committed offset. Orphaned `BulkBegin` batches are excluded — if a `BulkBegin` has no matching `BulkEnd`, `committed_offset` is reset to before the batch start. A corrupt entry ends the scan where a CRC failure throws out of the iterator, so `valid_offset` is recorded as the scan advances rather than after it completes: the entries collected for replay and the offset the file is truncated to must describe the same prefix, or step 3 replays key directory entries addressing bytes step 4 removes. `CommittedEntryIterator` defers parsing the entry after a committed one until the caller advances past it, so the throw leaves the `operator++` that steps past an entry already counted, never the one about to yield it; it never catches, because the scan that compacts a file in vacuum relies on the throw to refuse rather than trim. The scan that indexes a hint-less file at open runs with `OnDamage::Stop` instead, and rules on the tail itself (*Recovering a Hint-less File*). An I/O error is rethrown as-is — it says nothing about the bytes. A parse failure below the **published extent** (the active file's `total_bytes` in the published state) is not a failed write's leftovers: it is damage in acknowledged data, or `sync=false` records whose pages the failed `fdatasync` dropped and the kernel evicted before the rewrite read them back. Either way the key directory addresses records that are gone, and the values they replaced are known only to a full recovery, so `resume()` throws `std::runtime_error` before truncating and the engine stays degraded. A reopen recovers: the file is the newest, and open truncates its tail at the first record that does not parse (*Recovering a Hint-less File*). There is no recovery contract for damaged published data — the promise is only not to make it worse. The same check is what keeps every published offset inside the file in release builds, where `validate_state_consistency`'s extent walk does not run.
   3. Replays valid committed entries into the key directory using sequence-wins resolution. The scan collects **every** entry type, markers included: a `BulkBegin`/`BulkEnd` pair moves no key and no live byte, but it does consume sequences, and the file's `min_sequence`/`max_sequence` have to count them. Hint files carry markers for exactly this reason, so filtering them here made `resume()` report a `min_sequence` above a sequence the file really contains while a cold open of the same bytes reported the true one — and `ChangeIterator` orders its file queue by `min_sequence`. For each Put whose sequence exceeds the current key_dir entry (or the key is absent), update key_dir and file_stats; for each Delete whose sequence exceeds the current entry, erase the key; for each RangeDel, erase every key in `[from, to)` carrying a lower sequence — the same suppression rule hint replay applies in `recovery_build_from_hints`, because resume and a cold open have to agree on what the same bytes mean. The scan carries the range tombstone's exclusive upper bound through in `ResumeEntry::range_end`; it lives in the entry's value, which the rest of the replay does not read. The switch over `EntryType` is exhaustive rather than an if-chain: an entry type that falls through here is silently dropped, and the resumed key directory then holds keys a fresh open would not. This step recovers entries that were written to the data file but never published to EngineState (e.g. sync-failure paths where only next_seq was advanced, or degraded-state transitions that occurred between IO and state publication). Also advances `next_seq` past the highest sequence seen on disk.
   4. Calls `ftruncate` to remove garbage bytes and orphaned batch markers up to `valid_offset`. In mmap mode this leaves the mapping untouched — readers are not quiesced and may hold spans into it (see *DataFile mmap*, and *View and span lifetimes* in [`CONTRACT.md`](../CONTRACT.md) for what a reader is owed across this call).
   5. Calls `fdatasync` to persist the truncation.
@@ -359,7 +359,7 @@ On the common path `flush_pending` advances it: after a successful fdatasync of 
 
 `durable_sequence(min_sequence, timeout)` exposes `durable_seq` to callers (renamed from `current_sequence` — BC-231, since "current" was ambiguous between the highest *allocated* and highest *durable* sequence). It is the single sequence primitive: `min_sequence = 0`, an already-reached target, or a nonpositive `timeout` all return the current watermark immediately without blocking. Otherwise it blocks on `durable_cv_` (notified by `store_state` when `durable_seq` advances) until `durable_seq >= min_sequence` or the timeout expires, then returns the current watermark. The condvar notification is centralized in `store_state` — one place, one check. This single target-based primitive covers polling (`min_sequence = 0`), the replication wake-up (`min_sequence = follower.durable_sequence() + 1`), and RYOW waits (`min_sequence = result.sequence` from a `CommitResult`) — see `docs/commit_result_api_design.md` and `docs/replication_primitives_design.md`.
 
-After recovery (`DB::open`, `resume`), `durable_seq` is set to `next_seq - 1` because all recovered entries were previously synced.
+After recovery (`DB::open`, `resume`), `durable_seq` is set to `next_seq - 1`. That is sound because every recovered entry is on the device: a sealed file was synced whole before its hint was written, and both paths write back and sync any file whose tail may not be before reading it (*Failed fdatasync and the page cache*).
 
 ##### Post-write rotation failure
 
@@ -383,6 +383,72 @@ rethrown by `commit_wait`), the engine degrades, `head_` is reset to the
 degraded published state, and later writers get `DbDegraded` at stage 1.
 `resume()` clears `flush_error_` after it republishes; its active-file scan
 replays those entries as before.
+
+##### Failed fdatasync and the page cache (#231)
+
+After `fdatasync` fails, Linux (since 4.13, `errseq_t`) marks the dirty pages
+it covered clean and keeps them cached. It reports the error once; later
+`fdatasync` calls on the file return 0 without writing them. Reads return the
+cached bytes until the pages are evicted, then the device's. This is the
+documented "fsyncgate" behaviour (PostgreSQL, 2018), distinct from the trust
+assumption in `CONTRACT.md`, which covers a success returned while an error
+went unseen.
+
+The range a failed `fdatasync` drops is everything appended since the last
+successful one: the group being flushed, and every `sync=false` write
+published since, possibly across many flushes. A scan of that range reads the
+cache and finds it intact, so without care `resume()` published those records,
+raised `durable_seq` over them and sealed the file with a hint pointing at
+them; a power cut then left a hole below the watermark, and an eviction left
+`get` failing its CRC on data reported durable. A restart did not help: the
+clean pages were still cached, and `open` indexed the same bytes. `open` had
+the same hole without any `EIO`: after a SIGKILL, `sync=false` writes sit
+dirty in the page cache, and `open` indexed them, wrote their hint and reported
+them durable without `fdatasync`ing the data file.
+
+Engines that handle this treat a failed `fsync` as fatal and rebuild from a
+second, durable copy (PostgreSQL replays WAL, InnoDB redo and doublewrite,
+WiredTiger its journal). The data file is ByteCaskDB's only record, so the
+bytes have to be made durable where they are. `rewrite_and_sync`
+(`data_file.cppm`) reads the file back in 1 MiB chunks, `pwrite`s each chunk to
+the offset it came from — a write dirties a page even when its bytes do not
+change — and then `fdatasync`s. What it read is what it wrote and what the
+sync covered, so what the caller then parses is durable, under the same trust
+assumption every commit relies on. Where pages were evicted before the read,
+the device's bytes are written back and the scan stops there, which is right:
+those writes were never durable.
+
+- **`resume()`** runs it over the active file, `[0, logical_end)`, before its
+  scan. Only the range since the last successful sync needs it, but tracking
+  that offset would be new engine state kept right across rotation and
+  truncate; `resume()` is rare, and the whole file is bounded by
+  `max_file_bytes`.
+- **`open`** runs it over every data file without a hint, before
+  `flush_hints_for` scans it. A new process cannot know what an earlier one
+  synced, or whether it saw an `EIO`. A file with a hint needs none: every
+  seal `fdatasync`s the file on the descriptor that wrote it, which reports an
+  unseen `EIO`, and after a reported one only `resume()` seals the file, after
+  its rewrite. The cost is one read and one write of each hint-less file per
+  open: after a clean close, the file that was active. `engine_bench`'s
+  `ByteCaskDB/OpenHintless` measures that open from a cold page cache: with a
+  60 MB hint-less file on NVMe it went from 496 ms to 516 ms (mean of 5,
+  σ 16–20 ms). The scan that follows reads the pages the rewrite left
+  cached, so the rewrite's read replaces the one the scan would have made.
+
+Rejected: an `O_DIRECT` read of the tail. It shows what the device returns,
+which is evidence, not proof: the device's volatile cache can hold it, and with
+no dirty pages left whether the next `fdatasync` flushes that cache depends on
+the filesystem; some filesystems honour the flag and still serve reads from a
+cache (ZFS before 2.3, NFS).
+
+The fault injector fails the syscall with the bytes still dirty, so the next
+sync is real and the proof matrix's F/G cells cannot see this. Testing builds
+carry a page cache model (`page_cache_model.h`): an injected or real
+`fdatasync` failure marks the range since the last successful sync lost, later
+syncs do not clear it, and only `rewrite_and_sync` followed by a successful
+sync does. `power_cut` zeroes lost and unsynced ranges, `evict_lost` zeroes
+only the lost ones, and `crash_copy` copies a directory as the page cache
+holds it. The `[fsyncgate]` tests drive `resume()` and `open` through it.
 
 ##### Durability before visibility
 
@@ -1066,7 +1132,7 @@ This is a single code path: `flush_hints_for()` is the same function used by rot
 
 ### Recovering a Hint-less File
 
-Open scans every data file that has no hint: the file that was active at shutdown (a clean close leaves it hint-less too), and after a crash any sealed file still waiting for its hint. The scan runs with `OnDamage::Stop`: it ends at the first record that does not parse, whatever the reason — a zeroed header, a record running past the end of the file, or a CRC mismatch. Before the hint is renamed into place, `recovery_check_tail` rules on everything past the end of the last committed record (#138):
+Open scans every data file that has no hint: the file that was active at shutdown (a clean close leaves it hint-less too), and after a crash any sealed file still waiting for its hint. Before scanning, it writes the file back in place and syncs it (*Failed fdatasync and the page cache*), so the scan, the hint and the durable watermark rest only on bytes that are on the device. The scan runs with `OnDamage::Stop`: it ends at the first record that does not parse, whatever the reason — a zeroed header, a record running past the end of the file, or a CRC mismatch. Before the hint is renamed into place, `recovery_check_tail` rules on everything past the end of the last committed record (#138):
 
 | Past the last committed record | File | Outcome |
 |---|---|---|

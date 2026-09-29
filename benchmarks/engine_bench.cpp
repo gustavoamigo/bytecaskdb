@@ -39,6 +39,7 @@
 #include <numeric>
 #include <optional>
 #include <random>
+#include <set>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -1530,6 +1531,52 @@ void BM_RecoveryParallel(benchmark::State &state) {
   state.counters["num_keys"] = static_cast<double>(kDatasetSize);
 }
 
+// Open after a clean close, from a cold page cache. The file that was active
+// has no hint, so open indexes it — and first writes it back in place and
+// syncs it (#231). Each iteration restores the directory to what the close
+// left: the one hint-less file, and none of the files later opens created.
+void BM_OpenHintless(benchmark::State &state) {
+  TmpDir dir{"open_hintless"};
+  {
+    auto db = bytecask::DB::open(dir.path);
+    static constexpr std::size_t kBatch = 100;
+    static const std::vector<std::byte> val(32, std::byte{0x42});
+    for (std::size_t i = 0; i < kDatasetSize; i += kBatch) {
+      bytecask::WritePlan plan;
+      for (std::size_t j = i; j < std::min(i + kBatch, kDatasetSize); ++j) {
+        char buf[64];
+        plan.put(make_key(buf, sizeof(buf), "user::", j), bc_val(val));
+      }
+      (void)db.apply_batch({.sync = false}, std::move(plan));
+    }
+  }
+  std::set<std::filesystem::path> closed;
+  std::filesystem::path hintless;
+  for (const auto &e : std::filesystem::directory_iterator{dir.path}) {
+    closed.insert(e.path());
+    auto hint = e.path();
+    if (e.path().extension() == ".data" &&
+        !std::filesystem::exists(hint.replace_extension(".hint")))
+      hintless = e.path();
+  }
+  const auto restore = [&] {
+    for (const auto &e : std::filesystem::directory_iterator{dir.path})
+      if (!closed.contains(e.path())) std::filesystem::remove(e.path());
+    evict_from_page_cache(dir.path);
+  };
+
+  restore();
+  for (auto _ : state) {
+    { auto db = bytecask::DB::open(dir.path); }
+    state.PauseTiming();
+    restore();
+    state.ResumeTiming();
+  }
+  state.counters["hintless_bytes"] =
+      static_cast<double>(std::filesystem::file_size(hintless));
+  state.counters["num_keys"] = static_cast<double>(kDatasetSize);
+}
+
 // ===========================================================================
 // Registration
 // clang-format off
@@ -1639,6 +1686,9 @@ BENCH(BM_RecoveryParallel)->Name("ByteCaskDB/Recovery")->ArgName("threads")->Arg
 BENCH(BM_RecoveryParallel)->Name("ByteCaskDB/Recovery")->ArgName("threads")->Arg(4) ->Unit(benchmark::kSecond);
 BENCH(BM_RecoveryParallel)->Name("ByteCaskDB/Recovery")->ArgName("threads")->Arg(8) ->Unit(benchmark::kSecond);
 BENCH(BM_RecoveryParallel)->Name("ByteCaskDB/Recovery")->ArgName("threads")->Arg(16)->Unit(benchmark::kSecond);
+#endif
+BENCH(BM_OpenHintless)->Name("ByteCaskDB/OpenHintless")->Unit(benchmark::kMillisecond);
+#ifndef BENCH_NO_MT
 
 // -- Multithreaded Threaded Tests (LevelDb excluded as it's not optimized for this use case) --
 // --- Multithreaded Get (pure read throughput under concurrency) ---

@@ -5778,6 +5778,122 @@ TEST_CASE("resume() recovers from degraded state", "[degraded][resume]") {
 }
 
 // ---------------------------------------------------------------------------
+// fsyncgate (#231). After a failed fdatasync, Linux marks the pages it could
+// not write clean: reads return them, later fdatasyncs skip them, and a
+// power cut or an eviction takes them. An injected failure leaves the pages
+// dirty and the next sync persists them, so these tests run under the page
+// cache model (page_cache_model.h), which tracks what a power cut would take.
+// crash_copy is a process crash — a copy of the directory as the page cache
+// holds it — and power_cut then applies the model to the copy.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("fsyncgate: what resume() publishes after a failed fdatasync "
+          "survives a power cut",
+          "[fsyncgate][degraded][resume]") {
+  TempDir td;
+  bytecask::testing::ScopedPageCacheModel model_scope;
+  auto &model = bytecask::testing::page_cache_model();
+  const auto crashed = td.path / "crashed";
+  std::uint64_t durable = 0;
+  {
+    auto db = bytecask::DB::open(td.path / "db");
+    (void)db.put({.sync = true}, to_bytes("a"), to_bytes("1"));
+    // Unsynced: the failed fdatasync below covers it too.
+    (void)db.put({.sync = false}, to_bytes("b"), to_bytes("2"));
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(db.put({.sync = true}, to_bytes("c"), to_bytes("3")),
+                        std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+    REQUIRE_NOTHROW(db.resume());
+    (void)db.put({.sync = true}, to_bytes("d"), to_bytes("4"));
+    durable = db.durable_sequence();
+    model.crash_copy(td.path / "db", crashed);
+  }
+  REQUIRE(durable >= 4);
+  model.power_cut(crashed);
+
+  // Every write at or below the durable watermark is on the device.
+  auto db = bytecask::DB::open(crashed);
+  CHECK(get_str(db, to_bytes("a")) == "1");
+  CHECK(get_str(db, to_bytes("b")) == "2");
+  CHECK(get_str(db, to_bytes("c")) == "3");
+  CHECK(get_str(db, to_bytes("d")) == "4");
+}
+
+TEST_CASE("fsyncgate: open makes a crashed process's unsynced writes durable "
+          "before it builds on them",
+          "[fsyncgate][recovery]") {
+  TempDir td;
+  bytecask::testing::ScopedPageCacheModel model_scope;
+  auto &model = bytecask::testing::page_cache_model();
+  const auto crashed = td.path / "crashed";
+  const auto cut = td.path / "cut";
+  {
+    auto db = bytecask::DB::open(td.path / "db");
+    (void)db.put({.sync = true}, to_bytes("a"), to_bytes("1"));
+    (void)db.put({.sync = false}, to_bytes("b"), to_bytes("2"));
+    model.crash_copy(td.path / "db", crashed);
+  }
+  std::uint64_t durable = 0;
+  {
+    // Recovers b from the page cache, and reports it durable.
+    auto db = bytecask::DB::open(crashed);
+    REQUIRE(get_str(db, to_bytes("b")) == "2");
+    (void)db.put({.sync = true}, to_bytes("c"), to_bytes("3"));
+    durable = db.durable_sequence();
+    model.crash_copy(crashed, cut);
+  }
+  REQUIRE(durable >= 3);
+  model.power_cut(cut);
+
+  auto db = bytecask::DB::open(cut);
+  CHECK(get_str(db, to_bytes("a")) == "1");
+  CHECK(get_str(db, to_bytes("b")) == "2");
+  CHECK(get_str(db, to_bytes("c")) == "3");
+}
+
+TEST_CASE("fsyncgate: resume() refuses when published unsynced writes were "
+          "evicted after a failed fdatasync, and a reopen recovers",
+          "[fsyncgate][degraded][resume]") {
+  TempDir td;
+  bytecask::testing::ScopedPageCacheModel model_scope;
+  auto &model = bytecask::testing::page_cache_model();
+  const auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir);
+    (void)db.put({.sync = true}, to_bytes("a"), to_bytes("1"));
+    (void)db.put({.sync = false}, to_bytes("a"), to_bytes("2"));
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(db.put({.sync = true}, to_bytes("c"), to_bytes("3")),
+                        std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+    // Readers were served the unsynced value before its pages went.
+    CHECK(get_str(db, to_bytes("a")) == "2");
+    model.evict_lost(dir);
+
+    // The key directory points a at a record no longer there, and only a
+    // full recovery knows the value it replaced.
+    std::string refusal;
+    try {
+      db.resume();
+    } catch (const std::runtime_error &e) {
+      refusal = e.what();
+    }
+    CHECK(refusal.find("refusing to truncate") != std::string::npos);
+    CHECK(db.is_degraded());
+  }
+
+  // What a crash at the failed fdatasync would have left: a's synced value.
+  auto db = bytecask::DB::open(dir);
+  CHECK(get_str(db, to_bytes("a")) == "1");
+  CHECK_FALSE(db.contains_key({}, to_bytes("c")));
+}
+
+// ---------------------------------------------------------------------------
 // Directory sync (#199). fdatasync makes a file's bytes durable, not the
 // directory entry that names it, so every create or rename that something
 // later depends on is followed by a sync of its directory. Each site passes

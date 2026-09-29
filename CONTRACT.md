@@ -71,6 +71,20 @@ embedded engine targeting local storage — the assumption is stated here
 so that it can be revisited if the engine is deployed on storage
 configurations where it does not hold.
 
+**A failed `fdatasync` is not trusted to have written anything.** The
+case the assumption above does not cover is the documented one: after
+`fdatasync` fails, Linux marks the pages it could not write clean and
+keeps them cached, so reads return them and later `fdatasync` calls
+return 0 without writing them. Neither `resume()` nor `DB::open` trusts
+those pages. Before either reads a file whose tail may not be on the
+device — the active file in `resume()`, every file without a hint at
+open — it writes the file's bytes back in place and `fdatasync`s them.
+What it then reads, parses and reports durable is what that sync wrote.
+A failed sync there throws: `resume()` stays degraded, `open` fails.
+The same step makes durable the `sync=false` writes a killed process
+left in the page cache, which open would otherwise index and report
+durable without any `fdatasync` covering them.
+
 ---
 
 ## apply_batch
@@ -180,12 +194,16 @@ If any I/O operation (append, sync) throws during execution:
   file, truncates garbage, replays valid committed entries, and creates a
   fresh active file, restoring normal operation.
 - Garbage is only ever above the **published extent** — the active file's
-  `total_bytes` in the last published state. Damage below it is not a
-  failed write's leftovers but corruption of acknowledged data, and has no
-  recovery contract: `resume()` throws `std::runtime_error` before
-  truncating anything, the file is left exactly as found, and the engine
-  stays degraded on every retry. An I/O error during the scan is rethrown
-  unchanged rather than read as the end of the file.
+  `total_bytes` in the last published state. A scan that stops below it
+  has found acknowledged bytes that are not on the device: corruption, or
+  `sync=false` records whose pages a failed `fdatasync` dropped and the
+  kernel evicted before `resume()` read them back. The key directory
+  points at them, and only a full recovery knows the values they
+  replaced, so `resume()` throws `std::runtime_error` before truncating
+  anything and the engine stays degraded on every retry. Reopening the
+  database recovers as after a crash: the newest file's tail is
+  truncated at the first record that does not parse. An I/O error during
+  the scan is rethrown unchanged rather than read as the end of the file.
 - The DB must remain operational for subsequent calls.
 
 ### Rotation Safety
@@ -206,7 +224,11 @@ The specific guarantees:
 - **Write succeeds, `sync=true`**: the data must be on disk AND
   visible to subsequent reads.
 - **Write succeeds, `sync=false`**: the data must be visible to
-  subsequent reads. It may or may not survive a crash.
+  subsequent reads. It may or may not survive a crash. It can also be
+  lost without one: if a later `fdatasync` of the same file fails before
+  any succeeds, the write is in the range the kernel failed to persist,
+  and if its pages are evicted before `resume()` reads them back, it is
+  gone — `resume()` refuses, and a reopen returns the value it replaced.
 - **Write throws**: the data may or may not be partially on disk. It
   must not be visible to subsequent reads. Recovery must reach a
   consistent state.
@@ -322,9 +344,11 @@ persistent → `store_state` path via `TransientEngineState::apply_sync`.
   `sync_requested_seq` is the highest sequence written by a `sync=true`
   slot. Enforced by `store_state`; a violation degrades the engine.
 
-- **Recovery sets `durable_seq = next_seq - 1`.** All recovered entries
-  were previously synced. After `DB::open()` and `resume()`,
-  `durable_seq` reflects the full recovered state.
+- **Recovery sets `durable_seq = next_seq - 1`.** Every recovered entry
+  is durable: sealed files were synced whole before their hint was
+  written, and `DB::open()` and `resume()` write back and sync any file
+  whose tail may not be before reading it. After `DB::open()` and
+  `resume()`, `durable_seq` reflects the full recovered state.
 
 - **NoSync-only writes do not advance `durable_seq`.** If the prepared
   head owes no fdatasync, `flush_pending` publishes it with the previous

@@ -166,6 +166,12 @@ public:
 
   virtual void truncate(Offset new_size) = 0;
 
+  // Writes the file's bytes below size() back in place and fdatasyncs them:
+  // after a failed fdatasync, the only way to make them durable. See
+  // rewrite_and_sync(int, Offset). Up to size() bytes of I/O; for recovery,
+  // not the write path.
+  virtual void rewrite_and_sync() = 0;
+
   // Releases the zero-filled tail: truncates the file to size() and syncs
   // the new length. Called once, when the file is sealed, so that a sealed
   // file's physical size is its logical size. Unlike truncate() this never
@@ -386,6 +392,69 @@ void pread_exact(int fd, Offset offset, std::size_t len, std::byte *dst) {
     }
     done += static_cast<std::size_t>(n);
   }
+}
+
+// fdatasync, reported to the page cache model in testing builds. end is the
+// file's logical end, the extent the sync is taken to cover.
+inline void sync_fd(int fd, [[maybe_unused]] Offset end, const char *what) {
+  if (portable_fdatasync(fd) != 0) {
+    const auto err = errno;
+#ifdef BYTECASK_TESTING
+    testing::page_cache_model().sync_failed(fd, end);
+#endif
+    throw std::system_error{err, std::generic_category(), what};
+  }
+#ifdef BYTECASK_TESTING
+  testing::page_cache_model().sync_ok(fd, end);
+#endif
+}
+
+// Writes every byte of [0, end) back where it lies, then fdatasyncs, so the
+// range is durable whatever an earlier fdatasync on the file did. After a
+// failed fdatasync Linux marks the pages it could not write clean and keeps
+// them cached ("fsyncgate"): later fdatasyncs return 0 without writing them,
+// while reads keep returning them until they are evicted. A write dirties a
+// page even when its bytes do not change, so the sync that follows covers
+// the whole range. What is read here — the cache, or the disk where pages
+// were evicted — is exactly what becomes durable, so a caller that parses
+// the file after this call sees only durable bytes.
+inline void rewrite_and_sync(int fd, Offset end) {
+#ifdef BYTECASK_TESTING
+  FAULT_INJECTION(io_data_file_rewrite);
+#endif
+  static constexpr std::size_t kChunkBytes = 1024 * 1024;
+  std::vector<std::byte> buf(bytes_below(0, kChunkBytes, end));
+  for (Offset off = 0; off < end;) {
+    const auto n = bytes_below(off, buf.size(), end);
+    pread_exact(fd, off, n, buf.data());
+    if (::pwrite(fd, buf.data(), n, narrow<off_t>(off)) !=
+        narrow<ssize_t>(n)) {
+      throw std::system_error{errno, std::generic_category(),
+                              "rewrite_and_sync: pwrite failed"};
+    }
+    off += n;
+  }
+#ifdef BYTECASK_TESTING
+  testing::page_cache_model().rewritten(fd, 0, end);
+#endif
+  sync_fd(fd, end, "rewrite_and_sync: fdatasync failed");
+}
+
+// The whole file at path, as above: for a file no open descriptor writes.
+export void rewrite_and_sync(const std::filesystem::path &path) {
+  const auto fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+  if (fd == -1) {
+    throw std::system_error{
+        errno, std::generic_category(),
+        std::format("rewrite_and_sync: cannot open '{}'", path.string())};
+  }
+  try {
+    rewrite_and_sync(fd, std::filesystem::file_size(path));
+  } catch (...) {
+    ::close(fd);
+    throw;
+  }
+  ::close(fd);
 }
 
 // pread(2) back-end. Stateless: every publish() call compiles away.
@@ -629,12 +698,30 @@ struct WritableFileOps {
 
   void sync() {
 #ifdef BYTECASK_TESTING
-    FAULT_INJECTION(io_data_file_sync);
-#endif
-    if (portable_fdatasync(fd_) != 0) {
-      throw std::system_error{errno, std::generic_category(),
-                              "WritableFileOps::sync: fdatasync failed"};
+    try {
+      FAULT_INJECTION(io_data_file_sync);
+    } catch (...) {
+      testing::page_cache_model().sync_failed(fd_, logical_end());
+      throw;
     }
+#endif
+    sync_fd(fd_, logical_end(), "WritableFileOps::sync: fdatasync failed");
+  }
+
+  // See WritableDataFile::rewrite_and_sync.
+  void rewrite_and_sync() { bytecask::rewrite_and_sync(fd_, logical_end()); }
+
+  // See WritableDataFile::truncate.
+  void truncate(Offset new_size) {
+    if (::ftruncate(fd_, narrow<off_t>(new_size)) != 0) {
+      throw std::system_error{errno, std::system_category(),
+                              "WritableFileOps::truncate"};
+    }
+#ifdef BYTECASK_TESTING
+    testing::page_cache_model().truncated(fd_, new_size);
+#endif
+    set_logical_end(new_size);
+    zeroed_end_ = new_size;
   }
 
   [[nodiscard]] auto size() const noexcept -> Offset { return logical_end(); }
@@ -683,16 +770,17 @@ struct WritableFileOps {
       throw std::system_error{errno, std::generic_category(),
                               "WritableFileOps::shrink_to_fit: ftruncate failed"};
     }
-    if (portable_fdatasync(fd_) != 0) {
-      throw std::system_error{errno, std::generic_category(),
-                              "WritableFileOps::shrink_to_fit: fdatasync failed"};
-    }
+    sync_fd(fd_, logical_end(),
+            "WritableFileOps::shrink_to_fit: fdatasync failed");
     zeroed_end_ = logical_end();
   }
 
   // Adopts the file's current length as both logical and physical end, and
   // fills the first chunk of a fresh file so its first commits are cheap.
   void adopt(Offset file_size, std::size_t capacity) {
+#ifdef BYTECASK_TESTING
+    testing::page_cache_model().opened_for_write(fd_, file_size);
+#endif
     set_logical_end(file_size);
     zeroed_end_ = file_size;
     capacity_ = capacity;
@@ -885,14 +973,11 @@ public:
   // mmap_end_ moves down — every published offset lies below new_size by
   // construction, and anything at or past it now takes the pread path.
   void truncate(Offset new_size) override {
-    if (::ftruncate(ops_.fd_, narrow<off_t>(new_size)) != 0) {
-      throw std::system_error{errno, std::system_category(),
-                              "WritableMmapDataFile::truncate"};
-    }
-    ops_.set_logical_end(new_size);
-    ops_.zeroed_end_ = new_size;
+    ops_.truncate(new_size);
     set_mmap_end(new_size);
   }
+
+  void rewrite_and_sync() override { ops_.rewrite_and_sync(); }
 
   // Like truncate(), this never touches the mapping — see the class comment.
   void shrink_to_fit() override {
@@ -1152,14 +1237,9 @@ public:
     return ops_.size();
   }
 
-  void truncate(Offset new_size) override {
-    if (::ftruncate(ops_.fd_, narrow<off_t>(new_size)) != 0) {
-      throw std::system_error{errno, std::system_category(),
-                              "WritablePosixFile::truncate"};
-    }
-    ops_.set_logical_end(new_size);
-    ops_.zeroed_end_ = new_size;
-  }
+  void truncate(Offset new_size) override { ops_.truncate(new_size); }
+
+  void rewrite_and_sync() override { ops_.rewrite_and_sync(); }
 
   void shrink_to_fit() override { ops_.shrink_to_fit(); }
 
