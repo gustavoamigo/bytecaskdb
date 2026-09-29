@@ -364,13 +364,15 @@ template <std::size_t LeafBytes> struct FrozenMerge {
   std::exception_ptr error;
 };
 
-// Recycled buffers, shared with the deleters of the buffers it hands out.
-struct BufferPool {
+namespace buffered_detail {
+// Recycled write buffers, shared with the deleters of the buffers it hands
+// out. (Not the engine's BufferPool, the record cache.)
+struct BufferRecycler {
   static constexpr std::size_t kKept = 4;
   std::mutex mu;
   std::vector<std::unique_ptr<buffered_detail::Buffer>> free;
 
-  static auto acquire(const std::shared_ptr<BufferPool> &pool)
+  static auto acquire(const std::shared_ptr<BufferRecycler> &pool)
       -> std::shared_ptr<buffered_detail::Buffer> {
     std::unique_ptr<buffered_detail::Buffer> b;
     {
@@ -389,6 +391,7 @@ struct BufferPool {
             }};
   }
 };
+} // namespace buffered_detail
 
 template <std::size_t LeafBytes, typename RS> class BufferedMerger {
   using Tree = PersistentBlindBTree<LeafBytes>;
@@ -414,7 +417,7 @@ public:
   [[nodiscard]] auto next_id() noexcept -> std::uint64_t {
     return next_id_.fetch_add(1, std::memory_order_relaxed);
   }
-  [[nodiscard]] auto acquire() -> std::shared_ptr<Buffer> { return BufferPool::acquire(pool_); }
+  [[nodiscard]] auto acquire() -> std::shared_ptr<Buffer> { return buffered_detail::BufferRecycler::acquire(pool_); }
 
   // Hands F over: the merger builds base + F, reading records through `src`
   // under the buffers (F, A) of the version that published F.
@@ -568,7 +571,8 @@ private:
   bool running_{false};
   bool stop_{false};
   std::atomic<std::uint64_t> next_id_{1};
-  std::shared_ptr<BufferPool> pool_{std::make_shared<BufferPool>()};
+  std::shared_ptr<buffered_detail::BufferRecycler> pool_{
+      std::make_shared<buffered_detail::BufferRecycler>()};
   static inline std::atomic<std::int64_t> stalls_{0};
   static inline std::atomic<std::int64_t> stall_ns_{0};
   static inline std::atomic<std::int64_t> inline_merges_{0};
