@@ -914,11 +914,11 @@ fault cleared and checks every key back, by value.
 
 | Shape | Damage | What it tests |
 |-------|--------|---------------|
-| `crash_hintless` | none needed | The file that was active at shutdown. A clean close already leaves it hint-less — `flush_hints` skips `active_file_id` — so this *is* the shape a crash produces, and the one `recovery_prepare_files` regenerates from |
+| `crash_hintless` | newest hint removed | The file that was active when the process died: a crash leaves it hint-less, and `recovery_prepare_files` regenerates it. A clean close writes that hint, so the cell removes it |
 | `multi_file_hintless` | every hint removed | Several sealed files, none with a hint; all must be rebuilt |
 | `damaged_hint` | newest hint's CRC broken | `open_hint_or_rebuild` must discard it and rebuild from the data file rather than drop the keys behind it |
-| `hintless_batched` | none needed | `BulkBegin`/`BulkEnd` have to survive regeneration — a hint carries them so recovery can compute `durable_seq` across a batch |
-| `hintless_range_del` | none needed | A range tombstone has to survive it too; recovery reads it back out of the regenerated hint to suppress the range |
+| `hintless_batched` | newest hint removed | `BulkBegin`/`BulkEnd` have to survive regeneration — a hint carries them so recovery can compute `durable_seq` across a batch |
+| `hintless_range_del` | newest hint removed | A range tombstone has to survive it too; recovery reads it back out of the regenerated hint to suppress the range |
 
 Serial and parallel recovery diverging is the specific risk the `[model]`
 tests were built around, so every shape is recovered both ways.
@@ -1866,7 +1866,13 @@ control:
   beyond `fdatasync` — a directory entry that is not durable when something
   depends on it — is checked by ordering instead: each directory sync has
   its own `io_dir_sync_*` checkpoint, and the `[dir_sync]` tests fail each
-  one and check that nothing it guards goes ahead (#199).
+  one and check that nothing it guards goes ahead (#199). A failed
+  `fdatasync` that leaves pages clean but off the device (fsyncgate, #231)
+  is modelled one layer up: `PageCacheModel` tracks each data file page's
+  device image, an injected sync failure keeps the images, and the
+  `[fsyncgate]` tests cut the power or evict the pages by writing them
+  back, then check that `resume()` and `DB::open` published nothing the
+  device does not hold.
 - **Time bounds on close and open** — the failure classes are about what a
   failure does to data. A close or open that is correct but too slow for
   the supervisor holding the stopwatch damages nothing, so no class here

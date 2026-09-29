@@ -27,9 +27,7 @@ from tests.proof.recovery.scenario_matrix import (
 )
 
 _DAMAGE_CALL = {
-    # No call: assert the state instead, so the cell documents that a clean
-    # close already leaves the active file hint-less.
-    Damage.NONE: "REQUIRE(newest_data_is_hintless(dir));",
+    Damage.DROP_NEWEST_HINT: "REQUIRE(drop_newest_hint(dir));",
     Damage.DROP_ALL_HINTS: "REQUIRE(drop_all_hints(dir) > 0);",
     Damage.CORRUPT_NEWEST_HINT: "REQUIRE(corrupt_newest_hint(dir));",
 }
@@ -174,7 +172,7 @@ namespace {
 using bytecask::testing::assert_consistent;
 using bytecask::testing::corrupt_newest_hint;
 using bytecask::testing::drop_all_hints;
-using bytecask::testing::newest_data_is_hintless;
+using bytecask::testing::drop_newest_hint;
 using bytecask::testing::to_bytes;
 using bytecask::testing::to_string;
 
