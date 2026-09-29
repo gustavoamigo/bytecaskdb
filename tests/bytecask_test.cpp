@@ -23,6 +23,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <ranges>
@@ -35,6 +36,7 @@
 #include <tuple>
 #include <vector>
 #include <fcntl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 import bytecask;
@@ -1429,6 +1431,9 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
         REQUIRE(files.size() == 3);
         REQUIRE(std::filesystem::file_size(files[0]) == 5 * kEntry);
         REQUIRE(std::filesystem::file_size(files[2]) == 4 * kEntry);
+        // The damage is a crash's: the file active when it hit has no hint.
+        // A clean close writes one.
+        drop_hint(files[2]);
 
         row.damage(files);
 
@@ -6173,6 +6178,270 @@ TEST_CASE("resume() rethrows an I/O error from its scan and truncates nothing",
   CHECK_FALSE(db.is_degraded());
   CHECK(get_str(db, to_bytes("k1")) == "v1");
   CHECK(get_str(db, to_bytes("k2")) == "v2");
+}
+
+// fsyncgate (#231). Under the page cache model a failed fdatasync leaves the
+// pages it covered clean and off the device, as Linux does, and
+// restore_device() puts back what the device holds: a power cut, or the
+// kernel evicting those pages.
+namespace {
+
+constexpr int kUnsyncedPuts = 40;
+
+auto fsyncgate_key(int i) -> std::string { return std::format("k{}", i); }
+// Long enough that the unsynced puts span several pages.
+auto fsyncgate_value(int i) -> std::string { return std::format("{:0>200}", i); }
+
+// k0 synced, then puts no sync covers.
+void put_unsynced(bytecask::DB &db) {
+  db.put({.sync = true}, to_bytes(fsyncgate_key(0)), to_bytes(fsyncgate_value(0)));
+  for (int i = 1; i <= kUnsyncedPuts; ++i)
+    db.put({.sync = false}, to_bytes(fsyncgate_key(i)),
+           to_bytes(fsyncgate_value(i)));
+}
+
+void check_all_present(const bytecask::DB &db) {
+  for (int i = 0; i <= kUnsyncedPuts; ++i) {
+    INFO("key " << i);
+    CHECK(get_str(db, to_bytes(fsyncgate_key(i))) == fsyncgate_value(i));
+  }
+}
+
+auto has_hint(const std::filesystem::path &data) -> bool {
+  auto hint = data;
+  hint.replace_extension(".hint");
+  return std::filesystem::exists(hint);
+}
+
+constexpr std::array kFsyncgateBackends{bytecask::IoBackend::Pread,
+                                        bytecask::IoBackend::Mmap,
+                                        bytecask::IoBackend::BufferPool};
+
+auto fsyncgate_opts(bytecask::IoBackend backend) -> bytecask::Options {
+  return {.max_file_bytes = 1'000'000,
+          .io_backend = backend,
+          .buffer_pool = {.capacity_bytes = 16 << 20}};
+}
+
+}  // namespace
+
+TEST_CASE("resume() makes durable what it publishes after a failed fdatasync",
+          "[degraded][resume][fsyncgate]") {
+  for (const auto backend : kFsyncgateBackends) {
+    DYNAMIC_SECTION("io_backend " << static_cast<int>(backend)) {
+      bytecask::testing::ScopedPageCacheModel cache;
+      TempDir td;
+      const auto dir = td.path / "db";
+      const auto opts = fsyncgate_opts(backend);
+      {
+        auto db = bytecask::DB::open(dir, opts);
+        put_unsynced(db);
+        {
+          bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+          REQUIRE_THROWS_AS(
+              db.put({.sync = true}, to_bytes("kf"), to_bytes("vf")),
+              std::system_error);
+        }
+        REQUIRE(db.is_degraded());
+        REQUIRE_NOTHROW(db.resume());
+        check_all_present(db);
+        CHECK(get_str(db, to_bytes("kf")) == "vf");
+        // A durable write in a later file: a lost page below it is a hole
+        // under the durable watermark.
+        db.put({.sync = true}, to_bytes("later"), to_bytes("x"));
+      }
+      // The clean close synced everything else; the failed sync's pages
+      // are what a rewrite has to have written.
+      CHECK(cache.model.undurable_pages() == 0);
+      cache.model.restore_device(dir);  // power cut
+
+      auto db = bytecask::DB::open(dir, opts);
+      check_all_present(db);
+      CHECK(get_str(db, to_bytes("kf")) == "vf");
+      CHECK(get_str(db, to_bytes("later")) == "x");
+    }
+  }
+}
+
+TEST_CASE("resume() refuses when a failed fdatasync's pages were evicted, and "
+          "a reopen recovers what the device holds",
+          "[degraded][resume][fsyncgate]") {
+  for (const auto backend : kFsyncgateBackends) {
+    DYNAMIC_SECTION("io_backend " << static_cast<int>(backend)) {
+      bytecask::testing::ScopedPageCacheModel cache;
+      TempDir td;
+      const auto dir = td.path / "db";
+      const auto opts = fsyncgate_opts(backend);
+      {
+        auto db = bytecask::DB::open(dir, opts);
+        put_unsynced(db);
+        {
+          bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+          REQUIRE_THROWS_AS(
+              db.put({.sync = true}, to_bytes("kf"), to_bytes("vf")),
+              std::system_error);
+        }
+        REQUIRE(db.is_degraded());
+        // Evicted: reads return what the device holds. The published
+        // sync=false puts are gone, and the key directory holds no older
+        // state to resume into.
+        cache.model.restore_device(dir);
+        REQUIRE_THROWS_AS(db.resume(), std::runtime_error);
+        CHECK(db.is_degraded());
+      }
+      // A degraded close leaves the active file hint-less, so the reopen
+      // rewrites it, scans it and truncates at the lost bytes.
+      REQUIRE_FALSE(has_hint(active_data_file(dir)));
+      auto db = bytecask::DB::open(dir, opts);
+      CHECK(get_str(db, to_bytes(fsyncgate_key(0))) == fsyncgate_value(0));
+      for (int i = 1; i <= kUnsyncedPuts; ++i) {
+        INFO("key " << i);
+        CHECK_FALSE(db.contains_key({}, to_bytes(fsyncgate_key(i))));
+      }
+      CHECK_FALSE(db.contains_key({}, to_bytes("kf")));
+    }
+  }
+}
+
+TEST_CASE("open makes a hint-less file durable before it indexes it: close "
+          "after a failed fdatasync",
+          "[recovery][fsyncgate]") {
+  bytecask::testing::ScopedPageCacheModel cache;
+  TempDir td;
+  const auto dir = td.path / "db";
+  {
+    // Declared first, so it outlives db and fails the close's fdatasync.
+    std::unique_ptr<bytecask::testing::ScopedFaultInjector> fail_close;
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+    put_unsynced(db);
+    fail_close = std::make_unique<bytecask::testing::ScopedFaultInjector>(
+        "io_data_file_sync");
+  }
+  // The close could not make the file durable, so it wrote no hint for it.
+  REQUIRE_FALSE(has_hint(active_data_file(dir)));
+  {
+    auto db = bytecask::DB::open(dir);
+    check_all_present(db);
+    db.put({.sync = true}, to_bytes("later"), to_bytes("x"));
+  }
+  CHECK(cache.model.undurable_pages() == 0);
+  cache.model.restore_device(dir);  // power cut
+
+  auto db = bytecask::DB::open(dir);
+  check_all_present(db);
+  CHECK(get_str(db, to_bytes("later")) == "x");
+}
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("open makes a hint-less file durable before it indexes it: a "
+          "process killed before its sync",
+          "[recovery][fsyncgate]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  // The child appends with sync=false and dies without closing; the page
+  // cache keeps what it wrote.
+  const auto pid = ::fork();
+  REQUIRE(pid != -1);
+  if (pid == 0) {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+    for (int i = 0; i <= kUnsyncedPuts; ++i)
+      db.put({.sync = false}, to_bytes(fsyncgate_key(i)),
+             to_bytes(fsyncgate_value(i)));
+    ::_exit(0);
+  }
+  int status = 0;
+  REQUIRE(::waitpid(pid, &status, 0) == pid);
+  REQUIRE(WIFEXITED(status));
+  REQUIRE(WEXITSTATUS(status) == 0);
+
+  bytecask::testing::ScopedPageCacheModel cache;
+  const auto killed = active_data_file(dir);
+  REQUIRE_FALSE(has_hint(killed));
+  cache.model.mark_unsynced(killed);
+  {
+    auto db = bytecask::DB::open(dir);
+    check_all_present(db);
+    db.put({.sync = true}, to_bytes("later"), to_bytes("x"));
+  }
+  CHECK(cache.model.undurable_pages() == 0);
+  cache.model.restore_device(dir);  // power cut
+
+  auto db = bytecask::DB::open(dir);
+  check_all_present(db);
+  CHECK(get_str(db, to_bytes("later")) == "x");
+}
+#endif
+
+namespace {
+
+auto read_file(const std::filesystem::path &p) -> std::vector<char> {
+  std::ifstream f{p, std::ios::binary};
+  return {std::istreambuf_iterator<char>{f}, std::istreambuf_iterator<char>{}};
+}
+
+}  // namespace
+
+TEST_CASE("resume() stays degraded when its rewrite's fdatasync fails, and "
+          "leaves the file as it was",
+          "[degraded][resume][fsyncgate]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+  put_unsynced(db);
+  (void)degrade_with_unsynced_batch(db, dir);
+  const auto active = active_data_file(dir);
+  const auto before = read_file(active);
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_rewrite_sync"};
+    REQUIRE_THROWS_AS(db.resume(), std::system_error);
+  }
+  CHECK(db.is_degraded());
+  CHECK(read_file(active) == before);
+
+  REQUIRE_NOTHROW(db.resume());
+  check_all_present(db);
+  CHECK(get_str(db, to_bytes("b1")) == "bv1");
+}
+
+TEST_CASE("open fails when the rewrite of a hint-less file cannot be synced, "
+          "and writes no hint for it",
+          "[recovery][fsyncgate]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+    put_unsynced(db);
+  }
+  // A crash's shape: the active file has no hint.
+  const auto active = active_data_file(dir);
+  auto hint = active;
+  hint.replace_extension(".hint");
+  REQUIRE(std::filesystem::remove(hint));
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_rewrite_sync"};
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::system_error);
+  }
+  CHECK_FALSE(has_hint(active));
+
+  auto db = bytecask::DB::open(dir);
+  check_all_present(db);
+}
+
+TEST_CASE("a clean close writes the active file's hint",
+          "[recovery][fsyncgate]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+    put_unsynced(db);
+  }
+  for (const auto &e : std::filesystem::directory_iterator{dir}) {
+    if (e.path().extension() != ".data") continue;
+    INFO(e.path().string());
+    CHECK(has_hint(e.path()));
+  }
+  auto db = bytecask::DB::open(dir);
+  check_all_present(db);
 }
 
 TEST_CASE("resume() does not trust an entry size that runs past the file",

@@ -71,6 +71,17 @@ embedded engine targeting local storage — the assumption is stated here
 so that it can be revisited if the engine is deployed on storage
 configurations where it does not hold.
 
+**A failed `fdatasync`** is a different case, and is handled. Linux
+marks the pages a failed `fdatasync` covered clean without writing
+them, and a later `fdatasync` returns 0 without writing them either.
+Reads keep returning the bytes until the pages are evicted. So nothing
+is built from bytes whose durability is unknown until they are made
+durable: `resume()` rewrites the active file and syncs it before it
+scans it, and `DB::open` does the same for every hint-less data file
+before indexing it. What a read returns is written back to the same
+offsets and synced, so what is then published and indexed is on the
+device, relying on no more than the trust assumption above.
+
 ---
 
 ## apply_batch
@@ -176,16 +187,21 @@ If any I/O operation (append, sync) throws during execution:
   returned an error — degrades the engine unconditionally. Any `fdatasync`
   failure (commit sync or rotation sync) likewise degrades the engine:
   bytes are in the OS page cache but durability is not confirmed, and the
-  key directory does not reflect those bytes. `resume()` scans the active
-  file, truncates garbage, replays valid committed entries, and creates a
-  fresh active file, restoring normal operation.
+  key directory does not reflect those bytes. `resume()` rewrites and
+  syncs the active file, scans it, truncates garbage, replays valid
+  committed entries, and creates a fresh active file, restoring normal
+  operation.
 - Garbage is only ever above the **published extent** — the active file's
   `total_bytes` in the last published state. Damage below it is not a
   failed write's leftovers but corruption of acknowledged data, and has no
   recovery contract: `resume()` throws `std::runtime_error` before
   truncating anything, the file is left exactly as found, and the engine
-  stays degraded on every retry. An I/O error during the scan is rethrown
-  unchanged rather than read as the end of the file.
+  stays degraded on every retry. The same happens when `sync=false` writes
+  a failed `fdatasync` left off the device were evicted from the page
+  cache before `resume()` read them back: they are gone, and the key
+  directory holds no older version of the keys they overwrote. Reopening
+  the database recovers the state the device holds. An I/O error during
+  the scan is rethrown unchanged rather than read as the end of the file.
 - The DB must remain operational for subsequent calls.
 
 ### Rotation Safety
@@ -199,7 +215,10 @@ a fresh active file.
 
 The in-memory state visible to callers must always be recovery-
 equivalent, with one permitted exception: writes completed with
-`sync=false` may be visible in memory but lost on crash.
+`sync=false` may be visible in memory but lost on crash — or, without a
+crash, after a failed `fdatasync` whose pages the kernel evicts before
+`resume()` reads them back. `resume()` then refuses, and a reopen
+recovers the state without them.
 
 The specific guarantees:
 
@@ -322,9 +341,12 @@ persistent → `store_state` path via `TransientEngineState::apply_sync`.
   `sync_requested_seq` is the highest sequence written by a `sync=true`
   slot. Enforced by `store_state`; a violation degrades the engine.
 
-- **Recovery sets `durable_seq = next_seq - 1`.** All recovered entries
-  were previously synced. After `DB::open()` and `resume()`,
-  `durable_seq` reflects the full recovered state.
+- **Recovery sets `durable_seq = next_seq - 1`.** Every recovered entry
+  is durable: sealed files were synced before they were sealed, and a
+  file whose durability is unknown — a hint-less file at open, the active
+  file at `resume()` — is rewritten and synced before it is read. After
+  `DB::open()` and `resume()`, `durable_seq` reflects the full recovered
+  state.
 
 - **NoSync-only writes do not advance `durable_seq`.** If the prepared
   head owes no fdatasync, `flush_pending` publishes it with the previous

@@ -25,7 +25,7 @@ namespace {
 using bytecask::testing::assert_consistent;
 using bytecask::testing::corrupt_newest_hint;
 using bytecask::testing::drop_all_hints;
-using bytecask::testing::newest_data_is_hintless;
+using bytecask::testing::drop_newest_hint;
 using bytecask::testing::to_bytes;
 using bytecask::testing::to_string;
 
@@ -62,8 +62,8 @@ TEST_CASE("prove_recovery__crash_hintless__success__t1", "[prove_recovery]") {
     db.put({.sync = true}, to_bytes("k5"), to_bytes("v5"));
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   {
     auto db = bytecask::DB::open(dir, {.recovery_threads = 1});
@@ -121,8 +121,8 @@ TEST_CASE("prove_recovery__crash_hintless__success__t4", "[prove_recovery]") {
     db.put({.sync = true}, to_bytes("k5"), to_bytes("v5"));
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   {
     auto db = bytecask::DB::open(dir, {.recovery_threads = 4});
@@ -180,8 +180,8 @@ TEST_CASE("prove_recovery__crash_hintless__hint_write_fails__t1", "[prove_recove
     db.put({.sync = true}, to_bytes("k5"), to_bytes("v5"));
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.
@@ -248,8 +248,8 @@ TEST_CASE("prove_recovery__crash_hintless__hint_write_fails__t4", "[prove_recove
     db.put({.sync = true}, to_bytes("k5"), to_bytes("v5"));
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.
@@ -316,8 +316,8 @@ TEST_CASE("prove_recovery__crash_hintless__hint_sync_fails__t1", "[prove_recover
     db.put({.sync = true}, to_bytes("k5"), to_bytes("v5"));
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.
@@ -384,8 +384,8 @@ TEST_CASE("prove_recovery__crash_hintless__hint_sync_fails__t4", "[prove_recover
     db.put({.sync = true}, to_bytes("k5"), to_bytes("v5"));
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.
@@ -452,8 +452,8 @@ TEST_CASE("prove_recovery__crash_hintless__hint_rename_fails__t1", "[prove_recov
     db.put({.sync = true}, to_bytes("k5"), to_bytes("v5"));
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.
@@ -520,8 +520,8 @@ TEST_CASE("prove_recovery__crash_hintless__hint_rename_fails__t4", "[prove_recov
     db.put({.sync = true}, to_bytes("k5"), to_bytes("v5"));
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.
@@ -1647,8 +1647,8 @@ TEST_CASE("prove_recovery__hintless_batched__success__t1", "[prove_recovery]") {
     }
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   {
     auto db = bytecask::DB::open(dir, {.recovery_threads = 1});
@@ -1713,8 +1713,8 @@ TEST_CASE("prove_recovery__hintless_batched__success__t4", "[prove_recovery]") {
     }
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   {
     auto db = bytecask::DB::open(dir, {.recovery_threads = 4});
@@ -1779,8 +1779,8 @@ TEST_CASE("prove_recovery__hintless_batched__hint_write_fails__t1", "[prove_reco
     }
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.
@@ -1854,8 +1854,8 @@ TEST_CASE("prove_recovery__hintless_batched__hint_write_fails__t4", "[prove_reco
     }
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.
@@ -1929,8 +1929,8 @@ TEST_CASE("prove_recovery__hintless_batched__hint_sync_fails__t1", "[prove_recov
     }
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.
@@ -2004,8 +2004,8 @@ TEST_CASE("prove_recovery__hintless_batched__hint_sync_fails__t4", "[prove_recov
     }
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.
@@ -2079,8 +2079,8 @@ TEST_CASE("prove_recovery__hintless_batched__hint_rename_fails__t1", "[prove_rec
     }
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.
@@ -2154,8 +2154,8 @@ TEST_CASE("prove_recovery__hintless_batched__hint_rename_fails__t4", "[prove_rec
     }
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.
@@ -2225,8 +2225,8 @@ TEST_CASE("prove_recovery__hintless_range_del__success__t1", "[prove_recovery]")
     db.del_range({.sync = true}, to_bytes("k1"), to_bytes("k3"));
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   {
     auto db = bytecask::DB::open(dir, {.recovery_threads = 1});
@@ -2277,8 +2277,8 @@ TEST_CASE("prove_recovery__hintless_range_del__success__t4", "[prove_recovery]")
     db.del_range({.sync = true}, to_bytes("k1"), to_bytes("k3"));
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   {
     auto db = bytecask::DB::open(dir, {.recovery_threads = 4});
@@ -2329,8 +2329,8 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_write_fails__t1", "[prove_re
     db.del_range({.sync = true}, to_bytes("k1"), to_bytes("k3"));
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.
@@ -2390,8 +2390,8 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_write_fails__t4", "[prove_re
     db.del_range({.sync = true}, to_bytes("k1"), to_bytes("k3"));
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.
@@ -2451,8 +2451,8 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_sync_fails__t1", "[prove_rec
     db.del_range({.sync = true}, to_bytes("k1"), to_bytes("k3"));
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.
@@ -2512,8 +2512,8 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_sync_fails__t4", "[prove_rec
     db.del_range({.sync = true}, to_bytes("k1"), to_bytes("k3"));
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.
@@ -2573,8 +2573,8 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_rename_fails__t1", "[prove_r
     db.del_range({.sync = true}, to_bytes("k1"), to_bytes("k3"));
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.
@@ -2634,8 +2634,8 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_rename_fails__t4", "[prove_r
     db.del_range({.sync = true}, to_bytes("k1"), to_bytes("k3"));
   }
 
-  // Damage: none
-  REQUIRE(newest_data_is_hintless(dir));
+  // Damage: drop_newest_hint
+  REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
   // flush_hints_for without a catch, so open fails.

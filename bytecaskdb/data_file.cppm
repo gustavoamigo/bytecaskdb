@@ -532,6 +532,9 @@ struct WritableFileOps {
     const auto total = kHeaderSize + key.size() + value.size() + kCrcSize;
     ensure_zeroed(entry_offset + static_cast<Offset>(total));
 
+#ifdef BYTECASK_TESTING
+    FAULT_CACHE_WRITE(fd_, entry_offset, total);
+#endif
     const auto written = ::pwritev(fd_, iov.data(), std::ssize(iov),
                                    narrow<off_t>(entry_offset));
 #ifdef BYTECASK_TESTING
@@ -609,6 +612,9 @@ struct WritableFileOps {
 
       const auto start = logical_end();
       ensure_zeroed(start + static_cast<Offset>(total_bytes));
+#ifdef BYTECASK_TESTING
+      FAULT_CACHE_WRITE(fd_, start, total_bytes);
+#endif
       const auto written =
           ::pwritev(fd_, iov.data(), narrow<int>(chunk_size * kIovecsPerEntry),
                     narrow<off_t>(start));
@@ -629,15 +635,28 @@ struct WritableFileOps {
 
   void sync() {
 #ifdef BYTECASK_TESTING
-    FAULT_INJECTION(io_data_file_sync);
+    FAULT_INJECTION_SYNC(io_data_file_sync, fd_);
 #endif
     if (portable_fdatasync(fd_) != 0) {
       throw std::system_error{errno, std::generic_category(),
                               "WritableFileOps::sync: fdatasync failed"};
     }
+#ifdef BYTECASK_TESTING
+    FAULT_CACHE_SYNCED(fd_);
+#endif
   }
 
   [[nodiscard]] auto size() const noexcept -> Offset { return logical_end(); }
+
+  // See WritableDataFile::truncate.
+  void truncate(Offset new_size) {
+    if (::ftruncate(fd_, narrow<off_t>(new_size)) != 0) {
+      throw std::system_error{errno, std::system_category(),
+                              "WritableFileOps::truncate: ftruncate failed"};
+    }
+    set_logical_end(new_size);
+    zeroed_end_ = new_size;
+  }
 
   // Keeps the file zero-filled ahead of the write cursor: before an append
   // ends at write_end, zeros are written from zeroed_end_ up to the next
@@ -666,6 +685,9 @@ struct WritableFileOps {
 #pragma clang diagnostic pop
     for (auto off = zeroed_end_; off < target;) {
       const auto len = std::min<Offset>(kBuf, target - off);
+#ifdef BYTECASK_TESTING
+      FAULT_CACHE_WRITE(fd_, off, len);
+#endif
       if (::pwrite(fd_, zeros.data(), len, narrow<off_t>(off)) !=
           narrow<ssize_t>(len)) {
         throw std::system_error{errno, std::generic_category(),
@@ -687,6 +709,9 @@ struct WritableFileOps {
       throw std::system_error{errno, std::generic_category(),
                               "WritableFileOps::shrink_to_fit: fdatasync failed"};
     }
+#ifdef BYTECASK_TESTING
+    FAULT_CACHE_SYNCED(fd_);
+#endif
     zeroed_end_ = logical_end();
   }
 
@@ -885,12 +910,7 @@ public:
   // mmap_end_ moves down — every published offset lies below new_size by
   // construction, and anything at or past it now takes the pread path.
   void truncate(Offset new_size) override {
-    if (::ftruncate(ops_.fd_, narrow<off_t>(new_size)) != 0) {
-      throw std::system_error{errno, std::system_category(),
-                              "WritableMmapDataFile::truncate"};
-    }
-    ops_.set_logical_end(new_size);
-    ops_.zeroed_end_ = new_size;
+    ops_.truncate(new_size);
     set_mmap_end(new_size);
   }
 
@@ -1152,14 +1172,7 @@ public:
     return ops_.size();
   }
 
-  void truncate(Offset new_size) override {
-    if (::ftruncate(ops_.fd_, narrow<off_t>(new_size)) != 0) {
-      throw std::system_error{errno, std::system_category(),
-                              "WritablePosixFile::truncate"};
-    }
-    ops_.set_logical_end(new_size);
-    ops_.zeroed_end_ = new_size;
-  }
+  void truncate(Offset new_size) override { ops_.truncate(new_size); }
 
   void shrink_to_fit() override { ops_.shrink_to_fit(); }
 
@@ -1948,6 +1961,101 @@ export void sync_directory(const std::filesystem::path &dir,
         std::format("sync_directory: fsync of '{}' failed", dir.string())};
   }
 #endif
+}
+
+namespace {
+
+// A buffered, writable descriptor for one of the helpers below: never
+// O_DIRECT, so reads return what the page cache serves.
+class RewriteFd {
+public:
+  explicit RewriteFd(std::filesystem::path path)
+      : fd_{::open(path.c_str(), O_RDWR | O_CLOEXEC)}, path_{std::move(path)} {
+    if (fd_ == -1) {
+      throw std::system_error{
+          errno, std::generic_category(),
+          std::format("bytecask: cannot open '{}' to sync it", path_.string())};
+    }
+  }
+  ~RewriteFd() { ::close(fd_); }
+  RewriteFd(const RewriteFd &) = delete;
+  RewriteFd &operator=(const RewriteFd &) = delete;
+  RewriteFd(RewriteFd &&) = delete;
+  RewriteFd &operator=(RewriteFd &&) = delete;
+
+  [[nodiscard]] auto fd() const noexcept -> int { return fd_; }
+
+  void sync() const {
+#ifdef BYTECASK_TESTING
+    FAULT_INJECTION_SYNC(io_rewrite_sync, fd_);
+#endif
+    if (portable_fdatasync(fd_) != 0) {
+      throw std::system_error{
+          errno, std::generic_category(),
+          std::format("bytecask: fdatasync of '{}' failed", path_.string())};
+    }
+#ifdef BYTECASK_TESTING
+    FAULT_CACHE_SYNCED(fd_);
+#endif
+  }
+
+private:
+  int fd_;
+  std::filesystem::path path_;
+};
+
+} // namespace
+
+// Makes the bytes a read of path returns now durable, whatever became of
+// earlier syncs of it. After a failed fdatasync Linux marks the pages it
+// covered clean without writing them (fsyncgate, #231): reads keep returning
+// the bytes until the pages are evicted, and a later fdatasync, finding
+// nothing dirty, returns 0 without writing them. A process killed before
+// its sync leaves dirty pages the next one reads the same way. So the file
+// is read back and every chunk written to the offset it came from — write()
+// dirties a page even when its bytes do not change — and then synced: what
+// was read is what the device holds, and a scan after this sees only that.
+// Covers [0, end), at most max_file_bytes: nothing records which bytes an
+// earlier process or a failed flush left undurable. Throws std::system_error
+// on any I/O failure, leaving the file's contents as they were.
+export void rewrite_durably(const std::filesystem::path &path, Offset end) {
+  const RewriteFd f{path};
+  const auto size = std::min<std::uintmax_t>(end, std::filesystem::file_size(path));
+  static constexpr std::size_t kChunk = 1024 * 1024;
+  std::vector<std::byte> buf(
+      static_cast<std::size_t>(std::min<std::uintmax_t>(kChunk, size)));
+  for (std::uintmax_t off = 0; off < size;) {
+    const auto n =
+        static_cast<std::size_t>(std::min<std::uintmax_t>(kChunk, size - off));
+    pread_exact(f.fd(), off, n, buf.data());
+#ifdef BYTECASK_TESTING
+    FAULT_CACHE_WRITE(f.fd(), off, n);
+#endif
+    for (std::size_t done = 0; done < n;) {
+      const auto w = ::pwrite(f.fd(), buf.data() + done, n - done,
+                              narrow<off_t>(off + done));
+      if (w <= 0) {
+        throw std::system_error{
+            errno, std::generic_category(),
+            std::format("bytecask: rewrite of '{}' failed", path.string())};
+      }
+      done += static_cast<std::size_t>(w);
+    }
+    off += n;
+  }
+  f.sync();
+}
+
+// Cuts path to size and syncs the new length, which fdatasync is required
+// to persist.
+export void truncate_durably(const std::filesystem::path &path, Offset size) {
+  const RewriteFd f{path};
+  if (::ftruncate(f.fd(), narrow<off_t>(size)) != 0) {
+    throw std::system_error{
+        errno, std::generic_category(),
+        std::format("bytecask: truncate of '{}' failed", path.string())};
+  }
+  f.sync();
 }
 
 // What a sweep does at an entry that fails its CRC. Throw is the default:

@@ -2664,7 +2664,9 @@ DB::DB(std::filesystem::path dir, Options opts)
     fstats_t.set(s.active_file_id, FileStats{});
     s.file_stats = std::move(fstats_t).persistent();
     auto initial = std::make_shared<EngineState>(std::move(s));
-    // All recovered entries were previously synced.
+    // Every recovered entry is durable: sealed files were synced whole
+    // before they were sealed, and recovery_prepare_files rewrote and synced
+    // every hint-less one before reading it.
     initial->durable_seq =
         initial->next_seq > 0 ? initial->next_seq - 1 : 0;
     initial->mode = opts.initial_mode;
@@ -2691,6 +2693,12 @@ DB::~DB() {
       auto t = s->transient();
       t.active_file().sync();
       t.active_file().shrink_to_fit();
+      // With every byte of the active file durable, its hint spares the
+      // next open the rewrite of a hint-less file. Not when degraded: a sync
+      // that failed earlier left pages clean that this one did not write
+      // (#231). An empty file costs the next open nothing.
+      if (!s->degraded && t.active_file().size() > 0)
+        flush_hints_for(*s->files.get(s->active_file_id), dir_);
     } catch (...) {}
   }
   try {
@@ -4083,11 +4091,23 @@ void DB::resume() {
   const auto old_file_id = t.active_file_id();
   auto &file = t.active_file();
 
+  // The degrade may be a failed fdatasync, which on Linux leaves the pages
+  // it covered clean without writing them (#231): every byte appended since
+  // the last successful sync, sync=false writes included, reads back from
+  // the cache and is not on the device, and file.sync() below would find
+  // nothing to write. Rewriting the file and syncing it makes what reads
+  // return durable before the scan reads it (throws → stays degraded). Up to
+  // the logical end, where the scan stops: past it lie only the zero-filled
+  // preallocation and the bytes of an append that failed.
+  rewrite_durably(file.path(), file.size());
+
   // Scan the active file to find the last valid committed offset
   // and collect valid committed entries for key_dir replay. Entries written to
   // disk but never published to EngineState (sync-failure paths, degraded
   // transitions between IO and state publication) would otherwise be invisible
-  // until cold restart.
+  // until cold restart. The scan goes through read_raw, a pread of the page
+  // cache on every back-end — never the buffer pool's frames, which hold what
+  // was appended rather than what the rewrite found and made durable.
   Offset valid_offset = 0;
   std::vector<ResumeEntry> committed;
   try {
@@ -4129,17 +4149,22 @@ void DB::resume() {
   const auto published_extent = active_stats ? active_stats->total_bytes : 0;
   // resume() trims what a failed write left behind: bytes appended but never
   // published. Everything below the published extent was acknowledged, and a
-  // scan that stops short of it has found damage in data readers have
-  // already been served, not a torn tail. There is no consistent state to
-  // resume into from there, so resume() refuses — before truncating, so the
-  // file is left exactly as it was found and the engine stays degraded.
-  // This is detection, not repair: resume() makes no promise about what a
-  // damaged file still holds, only that it will not truncate acknowledged
-  // bytes or report success over them.
+  // scan that stops short of it has found bytes readers were served that the
+  // file no longer holds: damage, or sync=false writes a failed fdatasync
+  // left undurable and the kernel evicted before the rewrite read them. The
+  // key directory holds no older version to fall back to for the keys they
+  // overwrote, so there is no consistent state to resume into, and resume()
+  // refuses — before truncating, so the file is left exactly as it was found
+  // and the engine stays degraded. A reopen recovers the state the device
+  // holds. This is detection, not repair: resume() makes no promise about
+  // what a damaged file still holds, only that it will not truncate
+  // acknowledged bytes or report success over them.
   if (valid_offset < published_extent) {
     throw std::runtime_error{std::format(
-        "resume: active file '{}' is damaged at offset {}, inside data "
-        "already published (up to {}); refusing to truncate it",
+        "resume: active file '{}' ends at offset {}, inside data already "
+        "published (up to {}): damaged, or unsynced writes lost after a "
+        "failed fdatasync; refusing to truncate it. Reopen the database to "
+        "recover what the file holds",
         file.path().string(), valid_offset, published_extent)};
   }
 
@@ -4178,7 +4203,7 @@ void DB::resume() {
   t.apply_rotate_file(std::move(read_only_old), std::move(new_file),
                       new_file_id);
   if (pool_) pool_->set_active_file(new_file_id);
-  // All entries recovered from disk were previously synced.
+  // Every entry replayed was read after rewrite_durably synced it.
   t.apply_sync(t.next_seq() > 0 ? t.next_seq() - 1 : 0);
   t.apply_clear_degraded();
   auto resumed = std::move(t).persistent();
@@ -4711,26 +4736,36 @@ auto DB::recovery_prepare_files(EngineState &s)
 
   for (const auto &p : data_paths) {
     const auto file_id = s.next_file_id++;
+    const auto hint_path = dir_ / (p.stem().string() + ".hint");
+    const auto hintless = !std::filesystem::exists(hint_path);
+    // A file without a hint was the active file when the last process
+    // stopped, or a sealed file whose hint was not written yet. The active
+    // file's last bytes may be in the page cache and not on the device: the
+    // process was killed before its sync, or a sync failed and left its
+    // pages clean without writing them (#231). A hint built from them would
+    // outlive them at a power loss, and point into zeros. So they are made
+    // durable before anything reads them — every hint-less file, since none
+    // of them says which one was active.
+    // No writer says where its entries end, so the whole file.
+    if (hintless) rewrite_durably(p, std::filesystem::file_size(p));
     auto data_file =
         openDataFileForRead(p, io_backend_, pool_, file_id);
 
-    const auto hint_path = dir_ / (p.stem().string() + ".hint");
-    if (!std::filesystem::exists(hint_path)) {
-      // A file without a hint was the active file at the last shutdown, or a
-      // sealed file whose hint was not written yet. Whatever lies past its
-      // last committed record goes, once recovery_check_tail has ruled that
-      // it may: the preallocated tail a crash leaves, or a torn write. That
-      // makes its physical size its logical size, as for every other sealed
-      // file — file_size below is what seeds total_bytes for vacuum.
+    if (hintless) {
+      // Whatever lies past the file's last committed record goes, once
+      // recovery_check_tail has ruled that it may: the preallocated tail a
+      // crash leaves, or a torn write. That makes its physical size its
+      // logical size, as for every other sealed file — file_size below is
+      // what seeds total_bytes for vacuum.
       const auto end = flush_hints_for(data_file, dir_, [&](Offset e) {
         recovery_check_tail(*data_file, e, data_paths);
       });
       if (end && *end < std::filesystem::file_size(p)) {
         data_file.reset();
-        std::filesystem::resize_file(p, *end);
+        truncate_durably(p, *end);
         // Same file_id as the open above, deliberately. Under the buffer
         // pool that open's hint scan may have admitted frames under this id,
-        // but resize_file only drops a tail: every byte below *end is
+        // but the truncate only drops a tail: every byte below *end is
         // unchanged, and no reader addresses anything above it. Frames past
         // the new end are orphans CLOCK reclaims.
         data_file = openDataFileForRead(p, io_backend_, pool_, file_id);
