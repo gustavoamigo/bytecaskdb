@@ -531,6 +531,10 @@ python ./scripts/run_engine_bench.py
 
 # TPROC-C (TPC-C derived) through HammerDB, ByteCaskDB vs InnoDB.
 ./bytecaskdb-mariadb-plugin/benchmarks/run-hammerdb.sh --warehouses=20 --vus=8,16
+
+# The same, across builds: each branch or commit in a worktree of its own,
+# run alternately in one session, with one summary table.
+./bytecaskdb-mariadb-plugin/benchmarks/compare-refs.sh --rounds=2 --innodb main my-branch
 ```
 
 The key directory is chosen at build time. The default is the blind-leaf B+ tree; `BYTECASK_KEYDIR=btree` builds the engine on the B+ tree that keeps key bytes in its leaves (larger, and it never reads a record to place or enumerate a key), and `BYTECASK_KEYDIR=radix` on the radix tree. All three pass the same engine suite in CI, and the on-disk format is the same, so a database opens under any of them.
