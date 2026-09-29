@@ -510,6 +510,7 @@ struct Life {
   int views{0};
   int resumed_views{0};
   std::size_t reads_of_lost_pages{0};
+  std::size_t reopen_required{0};
   std::size_t lost_at_resume{0};
   std::size_t committed{0};
 };
@@ -623,6 +624,11 @@ void parse_life(std::string_view stream, const Base &base, bool cache_lost,
       auto what = r.str();
       if (cache_lost && what.find("failed on data it published") != std::string::npos)
         ++life.reads_of_lost_pages;
+      else if (cache_lost &&
+               what.find("Reopen the database to recover") != std::string::npos)
+        // resume() refuses to trim published data the eviction took, and
+        // sends the caller to a reopen: the next life's open must succeed.
+        ++life.reopen_required;
       else
         life.violations.push_back(std::move(what));
       break;
