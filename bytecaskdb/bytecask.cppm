@@ -3831,6 +3831,22 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
   const auto tmp_data_path = dir_ / (stem + ".data.tmp");
   const auto final_data_path = dir_ / (stem + ".data");
 
+  // Until the rename has placed it, the staging file is removed on every exit
+  // — the early returns below and any failure: scan, copy, sync, shrink, the
+  // rename itself. A vacuum retried under a persistent fault (ENOSPC) would
+  // otherwise leave a full copy behind per attempt until the next open. A
+  // removal that fails under the same fault is left to recovery, which deletes
+  // .data.tmp at open; it must not replace the exception in flight.
+  struct StagingCleanup {
+    std::filesystem::path path;
+    bool armed{true};
+    ~StagingCleanup() {
+      if (!armed) return;
+      std::error_code ec;
+      std::filesystem::remove(path, ec);
+    }
+  } staging{tmp_data_path};
+
   VacuumScanResult scan;
   {
 #ifdef BYTECASK_TESTING
@@ -3849,16 +3865,10 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
   // tombstone or a batch marker, and compaction must preserve all three.
   // Publishing an identical file would churn I/O for nothing.
   const auto old_total = snap->file_stats.get(file_id)->total_bytes;
-  if (scan.total_bytes >= old_total) {
-    std::error_code ec;
-    std::filesystem::remove(tmp_data_path, ec);
-    return false;
-  }
+  if (scan.total_bytes >= old_total) return false;
   // Nothing left at all: every Put was dead and every tombstone could go.
   // Remove the file rather than publish an empty one.
   if (scan.total_bytes == 0) {
-    std::error_code ec;
-    std::filesystem::remove(tmp_data_path, ec);
     vacuum_remove_file(file_id);
     counters_.vacuum_tombstones_dropped.fetch_add(
         static_cast<std::int64_t>(scan.tombstones_dropped),
@@ -3874,6 +3884,9 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
   // between here and the staging create. renameDataFileExclusive refuses the
   // target instead of replacing it.
   renameDataFileExclusive(tmp_data_path, final_data_path);
+  // Placed: .data.tmp no longer exists, and a failure from here on leaves the
+  // compacted file under its final name, which open already resolves.
+  staging.armed = false;
   // The source is unlinked once this commits. Were that unlink durable and
   // the rename not, the next open would find only .data.tmp, delete it as
   // staging, and lose every live entry the source held.

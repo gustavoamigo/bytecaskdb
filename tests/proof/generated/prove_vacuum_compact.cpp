@@ -6,7 +6,8 @@
 // Correctness proof tests for vacuum_compact_file(). Each test creates a
 // DB with a sealed file, optionally injects a fault, calls vacuum(), and
 // verifies the file was correctly compacted or that the DB is clean on failure.
-// VC4 additionally verifies that an orphaned .data.tmp is not replayed on recovery.
+// Every cell checks that no .data.tmp staging copy outlives vacuum(), whether it
+// returned or threw (#235).
 // VC5 verifies that a directory holding a compacted file and its source — a kill
 // after the commit, before the unlink — recovers, with the vacuum undone.
 // VC6 (#104 M3) verifies that a copy renamed but never committed is an orphan
@@ -32,6 +33,7 @@ using bytecask::testing::unreferenced_data_files;
 using bytecask::testing::assert_vacuum_success;
 using bytecask::testing::capture_vacuum_baseline;
 using bytecask::testing::find_vacuum_target;
+using bytecask::testing::staging_data_files;
 using bytecask::testing::to_bytes;
 
 struct TempDir {
@@ -73,6 +75,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__success", "[prove_vacuum_com
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
 }
@@ -99,6 +102,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__tmp_create_fails", "[prove_v
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
 }
@@ -125,6 +129,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__append_fails", "[prove_vacuu
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
 }
@@ -151,6 +156,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__sync_fails", "[prove_vacuum_
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
 }
@@ -171,15 +177,16 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__rename_fails", "[prove_vacuu
     auto vacuumed_file_id = find_vacuum_target(db);
 
     {
-    // VC4: rename succeeded — synced .data.tmp exists on disk but
-    // vacuum_commit never ran. Old file remains in state.
-    // assert_vacuum_recoverable confirms .data.tmp is not replayed.
+    // VC4: fails just before the rename — the copy is synced and
+    // shrunk under .data.tmp and vacuum_commit never ran. Old file
+    // remains in state, and vacuum removes the staging copy (#235).
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_rename"};
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
 }
@@ -211,6 +218,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__unlink_fails", "[prove_vacuu
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
 }
@@ -241,6 +249,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__post_rename", "[prove_vacuum
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
     orphans = unreferenced_data_files(db, dir);
     REQUIRE(orphans.size() == 1);  // the uncommitted copy
   }
@@ -275,6 +284,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__success", "[prove_vacuum_compact]"
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150});
 }
@@ -309,6 +319,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__tmp_create_fails", "[prove_vacuum_
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150});
 }
@@ -343,6 +354,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__append_fails", "[prove_vacuum_comp
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150});
 }
@@ -377,6 +389,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__sync_fails", "[prove_vacuum_compac
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150});
 }
@@ -405,15 +418,16 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__rename_fails", "[prove_vacuum_comp
     auto vacuumed_file_id = find_vacuum_target(db);
 
     {
-    // VC4: rename succeeded — synced .data.tmp exists on disk but
-    // vacuum_commit never ran. Old file remains in state.
-    // assert_vacuum_recoverable confirms .data.tmp is not replayed.
+    // VC4: fails just before the rename — the copy is synced and
+    // shrunk under .data.tmp and vacuum_commit never ran. Old file
+    // remains in state, and vacuum removes the staging copy (#235).
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_rename"};
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150});
 }
@@ -453,6 +467,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__unlink_fails", "[prove_vacuum_comp
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150});
 }
@@ -491,6 +506,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__post_rename", "[prove_vacuum_compa
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
     orphans = unreferenced_data_files(db, dir);
     REQUIRE(orphans.size() == 1);  // the uncommitted copy
   }
@@ -518,6 +534,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__success", "[prove_vacuu
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
 }
@@ -546,6 +563,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__tmp_create_fails", "[pr
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
 }
@@ -574,6 +592,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__append_fails", "[prove_
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
 }
@@ -602,6 +621,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__sync_fails", "[prove_va
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
 }
@@ -624,15 +644,16 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__rename_fails", "[prove_
     auto vacuumed_file_id = find_vacuum_target(db);
 
     {
-    // VC4: rename succeeded — synced .data.tmp exists on disk but
-    // vacuum_commit never ran. Old file remains in state.
-    // assert_vacuum_recoverable confirms .data.tmp is not replayed.
+    // VC4: fails just before the rename — the copy is synced and
+    // shrunk under .data.tmp and vacuum_commit never ran. Old file
+    // remains in state, and vacuum removes the staging copy (#235).
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_rename"};
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
 }
@@ -666,6 +687,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__unlink_fails", "[prove_
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
 }
@@ -698,6 +720,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__post_rename", "[prove_v
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
     orphans = unreferenced_data_files(db, dir);
     REQUIRE(orphans.size() == 1);  // the uncommitted copy
   }
@@ -734,6 +757,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__success", "[prove_vacuum_comp
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
 }
@@ -770,6 +794,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__tmp_create_fails", "[prove_va
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
 }
@@ -806,6 +831,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__append_fails", "[prove_vacuum
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
 }
@@ -842,6 +868,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__sync_fails", "[prove_vacuum_c
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
 }
@@ -872,15 +899,16 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__rename_fails", "[prove_vacuum
     auto vacuumed_file_id = find_vacuum_target(db);
 
     {
-    // VC4: rename succeeded — synced .data.tmp exists on disk but
-    // vacuum_commit never ran. Old file remains in state.
-    // assert_vacuum_recoverable confirms .data.tmp is not replayed.
+    // VC4: fails just before the rename — the copy is synced and
+    // shrunk under .data.tmp and vacuum_commit never ran. Old file
+    // remains in state, and vacuum removes the staging copy (#235).
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_rename"};
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
 }
@@ -922,6 +950,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__unlink_fails", "[prove_vacuum
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
 }
@@ -962,6 +991,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__post_rename", "[prove_vacuum_
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
     orphans = unreferenced_data_files(db, dir);
     REQUIRE(orphans.size() == 1);  // the uncommitted copy
   }
@@ -990,6 +1020,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__success", "[prove_vacuu
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
@@ -1018,6 +1049,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__tmp_create_fails", "[pr
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
@@ -1046,6 +1078,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__append_fails", "[prove_
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
@@ -1074,6 +1107,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__sync_fails", "[prove_va
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
@@ -1096,15 +1130,16 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__rename_fails", "[prove_
     auto vacuumed_file_id = find_vacuum_target(db);
 
     {
-    // VC4: rename succeeded — synced .data.tmp exists on disk but
-    // vacuum_commit never ran. Old file remains in state.
-    // assert_vacuum_recoverable confirms .data.tmp is not replayed.
+    // VC4: fails just before the rename — the copy is synced and
+    // shrunk under .data.tmp and vacuum_commit never ran. Old file
+    // remains in state, and vacuum removes the staging copy (#235).
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_rename"};
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
@@ -1138,6 +1173,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__unlink_fails", "[prove_
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
@@ -1170,6 +1206,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__post_rename", "[prove_v
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
     orphans = unreferenced_data_files(db, dir);
     REQUIRE(orphans.size() == 1);  // the uncommitted copy
   }
@@ -1206,6 +1243,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__success", "[prove_vacuum_comp
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
@@ -1242,6 +1280,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__tmp_create_fails", "[prove_va
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
@@ -1278,6 +1317,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__append_fails", "[prove_vacuum
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
@@ -1314,6 +1354,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__sync_fails", "[prove_vacuum_c
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
@@ -1344,15 +1385,16 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__rename_fails", "[prove_vacuum
     auto vacuumed_file_id = find_vacuum_target(db);
 
     {
-    // VC4: rename succeeded — synced .data.tmp exists on disk but
-    // vacuum_commit never ran. Old file remains in state.
-    // assert_vacuum_recoverable confirms .data.tmp is not replayed.
+    // VC4: fails just before the rename — the copy is synced and
+    // shrunk under .data.tmp and vacuum_commit never ran. Old file
+    // remains in state, and vacuum removes the staging copy (#235).
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_rename"};
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
@@ -1394,6 +1436,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__unlink_fails", "[prove_vacuum
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
@@ -1434,6 +1477,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__post_rename", "[prove_vacuum_
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
     orphans = unreferenced_data_files(db, dir);
     REQUIRE(orphans.size() == 1);  // the uncommitted copy
   }
@@ -1465,6 +1509,7 @@ TEST_CASE("prove_vacuum_compact__batched_file__success", "[prove_vacuum_compact]
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
 }
@@ -1495,6 +1540,7 @@ TEST_CASE("prove_vacuum_compact__batched_file__tmp_create_fails", "[prove_vacuum
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
 }
@@ -1525,6 +1571,7 @@ TEST_CASE("prove_vacuum_compact__batched_file__append_fails", "[prove_vacuum_com
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
 }
@@ -1555,6 +1602,7 @@ TEST_CASE("prove_vacuum_compact__batched_file__sync_fails", "[prove_vacuum_compa
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
 }
@@ -1579,15 +1627,16 @@ TEST_CASE("prove_vacuum_compact__batched_file__rename_fails", "[prove_vacuum_com
     auto vacuumed_file_id = find_vacuum_target(db);
 
     {
-    // VC4: rename succeeded — synced .data.tmp exists on disk but
-    // vacuum_commit never ran. Old file remains in state.
-    // assert_vacuum_recoverable confirms .data.tmp is not replayed.
+    // VC4: fails just before the rename — the copy is synced and
+    // shrunk under .data.tmp and vacuum_commit never ran. Old file
+    // remains in state, and vacuum removes the staging copy (#235).
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_rename"};
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
 }
@@ -1623,6 +1672,7 @@ TEST_CASE("prove_vacuum_compact__batched_file__unlink_fails", "[prove_vacuum_com
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
 }
@@ -1657,6 +1707,7 @@ TEST_CASE("prove_vacuum_compact__batched_file__post_rename", "[prove_vacuum_comp
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
     orphans = unreferenced_data_files(db, dir);
     REQUIRE(orphans.size() == 1);  // the uncommitted copy
   }
@@ -1684,6 +1735,7 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__success", "[prove_vacuum_
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
 }
@@ -1711,6 +1763,7 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__tmp_create_fails", "[prov
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
 }
@@ -1738,6 +1791,7 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__append_fails", "[prove_va
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
 }
@@ -1765,6 +1819,7 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__sync_fails", "[prove_vacu
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
 }
@@ -1786,15 +1841,16 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__rename_fails", "[prove_va
     auto vacuumed_file_id = find_vacuum_target(db);
 
     {
-    // VC4: rename succeeded — synced .data.tmp exists on disk but
-    // vacuum_commit never ran. Old file remains in state.
-    // assert_vacuum_recoverable confirms .data.tmp is not replayed.
+    // VC4: fails just before the rename — the copy is synced and
+    // shrunk under .data.tmp and vacuum_commit never ran. Old file
+    // remains in state, and vacuum removes the staging copy (#235).
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_rename"};
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
 }
@@ -1827,6 +1883,7 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__unlink_fails", "[prove_va
 
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
   }
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
 }
@@ -1858,6 +1915,7 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__post_rename", "[prove_vac
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK_FALSE(db.is_degraded());
+    CHECK(staging_data_files(dir).empty());
     orphans = unreferenced_data_files(db, dir);
     REQUIRE(orphans.size() == 1);  // the uncommitted copy
   }

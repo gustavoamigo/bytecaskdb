@@ -751,11 +751,13 @@ VC2 (`io_data_file_append`), VC3 (`io_data_file_sync`),
 VC4 (`io_vacuum_compact_rename`), VC5 (`io_vacuum_compact_unlink`),
 VC6 (`io_vacuum_compact_post_rename`).
 
-VC4 is the most critical: the tmp file is fully synced and renamed
-(a new `.data` file exists on disk) but `vacuum_commit` has not run —
-the old file is still in the published state. `assert_vacuum_recoverable`
-confirms that recovery does not replay the orphaned new file as a
-secondary source and sees only the data the old file guaranteed.
+VC4 fails at the last step before the rename: the tmp file is fully
+synced and shrunk but `vacuum_commit` has not run — the old file is still
+in the published state. The rename-completed case is VC6.
+
+Every cell also checks that no `.data.tmp` outlives `vacuum()` (#235):
+VC2–VC4 fail after the staging file exists, and vacuum must remove it on
+the way out rather than leave a copy per retry until the next open.
 
 VC5 is the other side of the commit: `vacuum_commit` has run, so in memory
 the outcome is success (`assert_vacuum_success`), but the source was never

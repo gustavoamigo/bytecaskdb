@@ -658,6 +658,16 @@ inline auto unreferenced_data_files(const DB &db,
   return out;
 }
 
+// Vacuum's staging copies left in dir. A vacuum that returns or throws before
+// its rename removes its own (#235); only a killed process leaves one.
+inline auto staging_data_files(const std::filesystem::path &dir)
+    -> std::vector<std::filesystem::path> {
+  std::vector<std::filesystem::path> out;
+  for (const auto &p : sorted_paths(dir, ".tmp"))
+    if (p.stem().extension() == ".data") out.push_back(p);
+  return out;
+}
+
 inline void assert_vacuum_recoverable(const std::filesystem::path &dir,
                                       const VacuumBaseline &before,
                                       const Options &opts = {}) {
