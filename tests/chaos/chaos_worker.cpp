@@ -33,9 +33,10 @@
 //
 // Usage:
 //   chaos_worker run   --dir D --seed S --fd N
-//                      [--as-headroom BYTES] [--nofile-headroom N]
+//                      [--as-headroom BYTES] [--nofile-headroom N] [--no-vacuum]
 //   chaos_worker check --dir CRASHED --work W --history H --state F --seed S
-//                      [--clean] [--report R]
+//                      --terminator power|sigkill|clean|exit [--evicted]
+//                      [--report R]
 
 #include <algorithm>
 #include <array>
@@ -284,6 +285,7 @@ auto start_threads(bytecask::DB *db, Channel &ch, const Config &cfg,
 struct RunLimits {
   std::uint64_t as_headroom{0};
   std::uint64_t nofile_headroom{0};
+  bool no_vacuum{false}; // not a limit: leaves the vacuum thread out
 };
 
 auto current_vm_bytes() -> std::uint64_t {
@@ -332,7 +334,8 @@ auto run(const fs::path &dir, std::uint64_t seed, int fd,
          const RunLimits &limits) -> int {
   std::signal(SIGTERM, on_sigterm);
   Channel ch{fd};
-  const auto cfg = config_for(seed);
+  auto cfg = config_for(seed);
+  if (limits.no_vacuum) cfg.vacuum = false;
   bool opened = false;
   try {
     int rc = 0;
@@ -422,14 +425,41 @@ auto run_open(bytecask::DB &db_ref, Channel &ch, const Config &cfg,
 // check
 // ---------------------------------------------------------------------------
 
+// What the previous check left for the next one. `contents` is what a
+// completed DB::open of the directory would serve. It is durable on the mount
+// only once an open there completes (open makes the bytes it trusts durable),
+// so the check also keeps `floor`, the last state known durable on the mount,
+// and `pending`, the writes of the last life that opened, on top of it. A
+// power cut before the next open completes may lose any of `pending` above
+// its watermark, and nothing else.
 struct Base {
   State contents;
   std::uint64_t durable{0};
+  State floor;
+  std::uint64_t floor_seq{0};
+  std::vector<OpRecord> pending;
+  std::uint64_t pending_watermark{0};
 };
 
 auto read_file(const fs::path &p) -> std::string {
   std::ifstream in{p, std::ios::binary};
   return {std::istreambuf_iterator<char>{in}, {}};
+}
+
+void encode_record(Writer &w, const OpRecord &rec) {
+  encode_op(w, rec.op);
+  w.u8(static_cast<std::uint8_t>(rec.outcome));
+  w.u64(rec.sequence);
+  w.u8(rec.durable ? 1 : 0);
+}
+
+auto decode_record(Reader &r) -> OpRecord {
+  OpRecord rec;
+  rec.op = decode_op(r);
+  rec.outcome = static_cast<OpRecord::Outcome>(r.u8());
+  rec.sequence = r.u64();
+  rec.durable = r.u8() != 0;
+  return rec;
 }
 
 auto load_base(const fs::path &p) -> Base {
@@ -439,6 +469,11 @@ auto load_base(const fs::path &p) -> Base {
   Base b;
   b.durable = r.u64();
   b.contents = decode_state(r);
+  b.floor_seq = r.u64();
+  b.floor = decode_state(r);
+  b.pending_watermark = r.u64();
+  const auto n = r.u32();
+  for (std::uint32_t i = 0; i < n; ++i) b.pending.push_back(decode_record(r));
   return b;
 }
 
@@ -446,6 +481,11 @@ void store_base(const fs::path &p, const Base &b) {
   Writer w;
   w.u64(b.durable);
   encode_state(w, b.contents);
+  w.u64(b.floor_seq);
+  encode_state(w, b.floor);
+  w.u64(b.pending_watermark);
+  w.u32(static_cast<std::uint32_t>(b.pending.size()));
+  for (const auto &rec : b.pending) encode_record(w, rec);
   const auto tmp = fs::path{p}.concat(".tmp");
   {
     std::ofstream out{tmp, std::ios::binary | std::ios::trunc};
@@ -590,7 +630,12 @@ struct CheckOptions {
   fs::path state;
   fs::path report;
   std::uint64_t seed{0};
-  bool clean{false};
+  // How the life ended: power (a power cut), sigkill, clean (SIGTERM with
+  // the hazards lifted) or exit (the worker exited on its own).
+  std::string terminator;
+  // Pages whose writeback failed were evicted during or after the life: like
+  // a power cut, that loses what only the page cache held.
+  bool evicted{false};
 };
 
 void write_report(const CheckOptions &o, const Config &cfg, const Life &life,
@@ -629,13 +674,29 @@ auto check(const CheckOptions &o) -> int {
 
     std::size_t applied = 0;
     std::size_t total = 0;
+    const bool power_cut = o.terminator == "power";
     if (!life.opened) {
-      // Nothing was written: recovery must reproduce the previous state.
-      if (recovered.contents != base.contents)
-        throw Failure{std::format(
-            "the life never opened the database ({}), and the directory "
-            "lost state",
-            life.open_failed.value_or("killed during open"))};
+      // Nothing was written. Unless the page cache lost something (a power
+      // cut or an eviction), recovery reproduces the previous state; if it
+      // did, it may lose what no completed open made durable: a prefix of the
+      // pending writes covering their watermark.
+      const auto why = life.open_failed.value_or("killed during open");
+      if (!power_cut && !o.evicted) {
+        if (recovered.contents != base.contents)
+          throw Failure{std::format("the life never opened the database ({}), "
+                                    "and the directory lost state",
+                                    why)};
+      } else {
+        try {
+          (void)match_prefix(base.floor, base.pending, base.floor_seq,
+                             base.pending_watermark, recovered.contents);
+        } catch (const Failure &f) {
+          throw Failure{std::format("the life never opened the database ({}), "
+                                    "and after the {} {}",
+                                    why, power_cut ? "power cut" : "eviction",
+                                    f.what)};
+        }
+      }
     } else {
       const auto r = match_prefix(base.contents, life.ops, life.opened_durable,
                                   life.watermark, recovered.contents);
@@ -645,12 +706,34 @@ auto check(const CheckOptions &o) -> int {
         throw Failure{std::format(
             "recovered durable_sequence {} below the watermark {}",
             recovered.durable_sequence, life.watermark)};
-      if (o.clean && life.closed && r.applied < settled_count(life.ops))
+      if (o.terminator == "clean" && life.closed &&
+          r.applied < settled_count(life.ops))
         throw Failure{std::format(
             "after a clean close, recovery lost {} acknowledged writes",
             settled_count(life.ops) - r.applied)};
     }
-    store_base(o.state, {recovered.contents, recovered.durable_sequence});
+
+    Base next;
+    next.contents = recovered.contents;
+    next.durable = recovered.durable_sequence;
+    if (power_cut || (o.terminator == "clean" && life.closed)) {
+      // Nothing is left only in the page cache.
+      next.floor = recovered.contents;
+      next.floor_seq = recovered.durable_sequence;
+    } else if (life.opened) {
+      // The open made the state it started from durable; this life's own
+      // writes may still be only in the page cache.
+      next.floor = base.contents;
+      next.floor_seq = life.opened_durable;
+      next.pending = life.ops;
+      next.pending_watermark = life.watermark;
+    } else {
+      next.floor = base.floor;
+      next.floor_seq = base.floor_seq;
+      next.pending = base.pending;
+      next.pending_watermark = base.pending_watermark;
+    }
+    store_base(o.state, next);
     std::printf(
         "{\"ok\": true, \"opened\": %s, \"open_failed\": %s, \"closed\": %s, "
         "\"committed\": %zu, \"views\": %d, \"resumed_views\": %d, "
@@ -686,11 +769,14 @@ auto parse_check(int argc, char **argv) -> CheckOptions {
     else if (a == "--state") o.state = next();
     else if (a == "--report") o.report = next();
     else if (a == "--seed") o.seed = std::stoull(next());
-    else if (a == "--clean") o.clean = true;
+    else if (a == "--terminator") o.terminator = next();
+    else if (a == "--evicted") o.evicted = true;
     else throw std::invalid_argument{std::format("unknown argument {}", a)};
   }
-  if (o.dir.empty() || o.work.empty() || o.history.empty() || o.state.empty())
-    throw std::invalid_argument{"check needs --dir, --work, --history, --state"};
+  if (o.dir.empty() || o.work.empty() || o.history.empty() || o.state.empty() ||
+      o.terminator.empty())
+    throw std::invalid_argument{
+        "check needs --dir, --work, --history, --state, --terminator"};
   return o;
 }
 
@@ -720,13 +806,19 @@ auto main(int argc, char **argv) -> int {
       std::uint64_t seed = 0;
       int fd = -1;
       RunLimits limits;
-      for (int i = 2; i + 1 < argc; i += 2) {
+      for (int i = 2; i < argc; ++i) {
         const std::string_view a = argv[i];
-        if (a == "--dir") dir = argv[i + 1];
-        else if (a == "--seed") seed = std::stoull(argv[i + 1]);
-        else if (a == "--fd") fd = std::stoi(argv[i + 1]);
-        else if (a == "--as-headroom") limits.as_headroom = std::stoull(argv[i + 1]);
-        else if (a == "--nofile-headroom") limits.nofile_headroom = std::stoull(argv[i + 1]);
+        auto next = [&]() -> std::string {
+          if (i + 1 >= argc)
+            throw std::invalid_argument{std::format("{} needs a value", a)};
+          return argv[++i];
+        };
+        if (a == "--dir") dir = next();
+        else if (a == "--seed") seed = std::stoull(next());
+        else if (a == "--fd") fd = std::stoi(next());
+        else if (a == "--as-headroom") limits.as_headroom = std::stoull(next());
+        else if (a == "--nofile-headroom") limits.nofile_headroom = std::stoull(next());
+        else if (a == "--no-vacuum") limits.no_vacuum = true;
         else throw std::invalid_argument{std::format("unknown argument {}", a)};
       }
       if (dir.empty() || fd < 0)

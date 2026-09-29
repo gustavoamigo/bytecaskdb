@@ -142,7 +142,9 @@ EVENTS = {"evict", "writeback", "writeback_fail"}
 # Per-life resource limits on the worker. RLIMIT_AS cannot run under ASan,
 # which reserves terabytes of shadow memory: disable it there.
 RESOURCES = {"rlimit_as", "rlimit_nofile"}
-HAZARDS = set(WINDOWS) | set(TERMINATORS) | EVENTS | RESOURCES
+# Not a hazard: `vacuum` in --disable leaves the worker's vacuum thread out.
+WORKLOAD = {"vacuum"}
+HAZARDS = set(WINDOWS) | set(TERMINATORS) | EVENTS | RESOURCES | WORKLOAD
 
 
 def draw_window(rng: random.Random, disabled: set[str]) -> dict | None:
@@ -273,7 +275,7 @@ class Rig:
         # resource limits included.
         limits = {} if life["quiet_open"] else plan["limits"]
         start_limits = {k: v for k, v in limits.items() if not isinstance(v, list)}
-        run_args = []
+        run_args = ["--no-vacuum"] if "vacuum" in self.args.disable else []
         for name, flag in (("as", "--as-headroom"), ("nofile", "--nofile-headroom")):
             if isinstance(limits.get(name), list):
                 run_args += [flag, str(limits[name][1])]
@@ -302,6 +304,7 @@ class Rig:
         hist = History(rfd)
         active: dict[int, dict] = {}
         pending = list(plan["events"])
+        self.evicted = False
         # After a failed open, the next open must succeed with no hazard in
         # force (I5): its timeline starts once the database is open.
         start = time.monotonic()
@@ -352,6 +355,7 @@ class Rig:
             self.ctl("clear")
             if plan["evict_after_kill"]:
                 self.ctl("evict")
+                self.evicted = True
         else:
             self.ctl("clear")
             proc.send_signal(signal.SIGTERM)
@@ -368,6 +372,7 @@ class Rig:
                               f"{self.args.close_timeout} s with every hazard "
                               f"lifted (I9); stacks in stacks.txt")
         self.ctl("clear")
+        outcome["evicted"] = self.evicted
         hist.join(30)
         life["history"].write_bytes(bytes(hist.raw))
         rc = proc.returncode
@@ -400,6 +405,7 @@ class Rig:
             active.pop(ev["id"], None)
         elif kind == "evict":
             self.ctl("evict")
+            self.evicted = True
             return
         elif kind == "writeback":
             self.ctl("writeback", seed=int(ev["t"] * 1e6), fail=ev["fail"])
@@ -435,8 +441,10 @@ class Rig:
                "--work", str(life["dir"] / "check"),
                "--history", str(life["history"]), "--state", str(life["state"]),
                "--seed", str(life["seed"]), "--report", str(life["dir"] / "report.txt")]
-        if outcome["terminator"] == "clean" and not outcome["exited_early"]:
-            cmd.append("--clean")
+        cmd += ["--terminator",
+                "exit" if outcome["exited_early"] else outcome["terminator"]]
+        if outcome["evicted"]:
+            cmd.append("--evicted")
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if r.returncode == 1:
             raise Failure(r.stderr.strip())
@@ -505,6 +513,15 @@ class Rig:
                     if prev_after.exists():
                         shutil.rmtree(prev_after)
                     shutil.move(str(life_dir / "after"), prev_after)
+                    # The previous life's plan and history, for the record of
+                    # a failure in the next.
+                    prev_life = self.work / "prev_life"
+                    if prev_life.exists():
+                        shutil.rmtree(prev_life)
+                    prev_life.mkdir()
+                    for name in ("plan.json", "history.bin", "report.txt"):
+                        if (life_dir / name).exists():
+                            shutil.copy(life_dir / name, prev_life / name)
                     if a.verbose:
                         print(f"  ep {episode} life {n}: {outcome['terminator']} "
                               f"{json.dumps(result)}")
@@ -541,6 +558,8 @@ class Rig:
         if keep.exists():
             shutil.rmtree(keep)
         shutil.copytree(life["dir"], keep)
+        if (self.work / "prev_life").exists():
+            shutil.copytree(self.work / "prev_life", keep / "prev_life")
         try:
             self.ctl("log", path=str(keep / "chaosfs_faults.log"))
         except (RigError, OSError):

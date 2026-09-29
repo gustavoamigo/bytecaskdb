@@ -1733,13 +1733,14 @@ calls, run out of space, go read-only, write short, stall, and lose power.
   lost nothing, and readers never saw a value that was not written or an
   error that was not I/O.
 
-Its first runs found five engine bugs, none reachable by the matrix or the
+Its first runs found six engine bugs, none reachable by the matrix or the
 SIGKILL harness:
 
 | Bug | Symptom |
 |---|---|
-| `resume()` trusts page-cache bytes after a failed `fdatasync` (#231) | after power loss, a durable hint indexes zeroed records and `DB::open` refuses the database |
-| `DB::open` never syncs the newest hint-less file it indexes (#231) | the same, after a SIGKILL followed by power loss, with no I/O error at all |
+| `resume()` trusts page-cache bytes after a failed `fdatasync` (#231, fixed by #240) | after power loss, a durable hint indexes zeroed records and `DB::open` refuses the database |
+| `DB::open` never syncs the newest hint-less file it indexes (#231, fixed by #240) | the same, after a SIGKILL followed by power loss, with no I/O error at all |
+| vacuum drops a durable record superseded only by a non-durable write (#245) | after a power cut, the key holds neither its old value nor its new one |
 | vacuum leaks its `.data.tmp` staging file when compaction fails (#235) | a copy of a file's live data per failed attempt, most often under `ENOSPC` |
 | a failed `ftruncate` that did cut the file leaves the logical end stale (#236) | while degraded, reads of published records fail with `pread failed: Success` |
 | recovery memory-maps hint files (#237) | a read error on a hint during `DB::open` kills the process with `SIGBUS` |

@@ -50,11 +50,12 @@ jobs:
       CLANG_TARGET_TRIPLE: x86_64-redhat-linux-gnu
       # Hazards that reach a known open bug, left out so the run can find new
       # ones. Remove each when its issue is fixed.
-      #   power, fsync_eio, writeback_fail, evict: #231 (durable hint over
-      #     non-durable data; the database stops opening after power loss)
+      #   vacuum: #245 (vacuum drops a durable record superseded only by a
+      #     non-durable write; a power cut or eviction then loses the key).
+      #     Leaves the worker's vacuum thread out, not a hazard.
       #   meta_eio: #236 (stale logical end after a failed ftruncate)
       #   read_eio: #237 (SIGBUS on a hint read error during open)
-      KNOWN_BUGS: power,fsync_eio,writeback_fail,evict,meta_eio,read_eio
+      KNOWN_BUGS: vacuum,meta_eio,read_eio
     strategy:
       fail-fast: false
       matrix:

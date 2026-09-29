@@ -307,6 +307,13 @@ Where the first version differs from the design above, and why.
   the handle work.
 - **After a failed open**, the next life opens with every hazard lifted and
   must succeed (I5); its timeline starts once the database is open.
+- **What the next life's power cut may lose.** The checker recovers a copy
+  of each life's directory, which includes what only the page cache held.
+  That state becomes durable on the mount only when an open there completes.
+  So the state file keeps the last state known durable on the mount and the
+  writes of the last life that opened on top of it. When a life never opens
+  and a power cut or an eviction ends it, the recovered state must be a
+  prefix of those writes covering their watermark.
 - **Liveness (I9) is checked at the clean close:** the hazards are lifted,
   and the worker must recover, close and exit within `--close-timeout`
   (60 s), or its stacks are saved and the life fails. Lives that end in a
@@ -320,13 +327,14 @@ Where the first version differs from the design above, and why.
 ## Findings
 
 The first runs, each within minutes, found the bugs listed in
-`correctness_validation.md` (*Chaos rig*): #231 in both of its forms, #235,
-#236 and #237. Until they are fixed, a full run fails within tens of lives.
-`--disable power,fsync_eio,writeback_fail,evict` runs past #231, `meta_eio` past
-#236 and `read_eio` past #237. With all of those left out, runs of 15 minutes
-(over 400 lives and 950,000 checked writes) pass. `chaos-nightly.yml` leaves
-them out by default (`KNOWN_BUGS`), so the nightly can find new bugs; each
-entry goes when its issue is fixed.
+`correctness_validation.md` (*Chaos rig*): #231 in both of its forms (fixed
+by #240), #235, #236 and #237. With #231 fixed, power loss found #245.
+
+`chaos-nightly.yml` leaves out what reaches the open ones (`KNOWN_BUGS`), so the
+nightly can find new bugs; each entry goes when its issue is fixed. `vacuum`
+there leaves out the worker's vacuum thread (#245); `meta_eio` and `read_eio`
+are #236 and #237. Against #240, with those left out, 9 minutes (301 lives, 134
+power cuts, 388 failed `fdatasync`s, 165 evictions) pass.
 
 ## Not covered
 
