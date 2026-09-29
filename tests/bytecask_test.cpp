@@ -9417,6 +9417,7 @@ TEST_CASE("stats: all expected keys are present in dump",
 #ifdef BYTECASK_KEYDIR_BUFFERED
       "bytecask.keydir_buffer_stalls",
       "bytecask.keydir_buffer_stall_us",
+      "bytecask.keydir_buffer_inline_merges",
 #endif
   };
   for (const auto &name : expected) {
