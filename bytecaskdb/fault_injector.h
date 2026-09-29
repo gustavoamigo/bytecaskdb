@@ -58,6 +58,10 @@ enum class PostWriteMode { none, short_write, throw_after };
 // ---------------------------------------------------------------------------
 struct FaultInjector {
   std::string fail_at_name;    // fail at this named checkpoint
+  // Name-based only: 0 fails every checkpoint matching fail_at_name; N fails
+  // only the Nth, so a retry of the same I/O succeeds.
+  int         fail_on_nth_match = 0;
+  int         name_matches = 0;
   int         fail_at    = -1; // fail after this many checkpoints (-1 = never)
   int         call_count = 0;  // number of checkpoints passed so far
   std::string last_checkpoint; // name of the last checkpoint that fired
@@ -81,8 +85,11 @@ struct FaultInjector {
     // pre-syscall checkpoint of the same name lets the syscall run.
     if (!fail_at_name.empty() && fail_at_name == name &&
         post_write_mode == PostWriteMode::none) {
-      throw std::system_error{error,
-          std::string{"fault injection at: "} + name};
+      ++name_matches;
+      if (fail_on_nth_match == 0 || name_matches == fail_on_nth_match) {
+        throw std::system_error{error,
+            std::string{"fault injection at: "} + name};
+      }
     }
 
     // Count-based — targets the Nth checkpoint in sequence

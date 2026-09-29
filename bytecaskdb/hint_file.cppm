@@ -19,7 +19,7 @@ module;
 #include <span>
 #include <utility>
 #include <stdexcept>
-#include <sys/mman.h>
+#include <sys/stat.h>
 #include <system_error>
 #include <unistd.h>
 #include <vector>
@@ -83,6 +83,8 @@ constexpr int kZstdLevel = 1;
 constexpr std::size_t kMaxHintEntryBytes =
     kHintHeaderSize + 0xFFFF + sizeof(std::uint16_t) + 0xFFFF;
 constexpr std::size_t kMaxFrameBytes = kHintFrameBytes + kMaxHintEntryBytes;
+// The most such a frame takes on disk: its entries, not compressed at all.
+constexpr std::size_t kMaxPackedFrameBytes = ZSTD_COMPRESSBOUND(kMaxFrameBytes);
 
 #ifdef BYTECASK_TESTING
 std::size_t g_frame_bytes_for_testing = 0;
@@ -116,48 +118,214 @@ auto thread_dctx() -> ZSTD_DCtx & {
   return *ctx;
 }
 
-// Checks the trailer (and, for a framed file, the header) and returns the
-// region the scanner reads: the frames, or a raw file's entries.
-struct VerifiedHint {
-  std::span<const std::byte> body;
-  bool framed;
+// Scratch for the compressed bytes of the frame being decoded: a scanner
+// needs them only until the frame is decompressed into its own buffer, so
+// every scanner a thread drives shares one.
+auto thread_packed_frame() -> std::vector<std::byte> & {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+  // The destructor is wanted: it frees the buffer when the thread exits.
+  thread_local std::vector<std::byte> buf;
+#pragma clang diagnostic pop
+  return buf;
+}
+
+// Reads exactly out.size() bytes at offset. Every read of a hint file goes
+// through here, so a failed read is a std::system_error — as every other read
+// in the engine is — and never a SIGBUS, which is what a memory mapping turns
+// a page it cannot fill into. A file that ends early changed under the reader.
+void read_exact(int fd, std::span<std::byte> out, std::uint64_t offset,
+                const std::filesystem::path &path) {
+#ifdef BYTECASK_TESTING
+  FAULT_INJECTION(io_hint_read);
+#endif
+  try {
+    pread_exact(fd, offset, out);
+  } catch (const std::system_error &e) {
+    throw std::system_error{
+        e.code(),
+        std::format("HintFile: cannot read '{}': {}", path.string(), e.what())};
+  }
+}
+
+// A hint file open for reading, shared by its HintFile and every scanner
+// over it, so no scanner outlives the fd it reads. A unit is what a scanner
+// reads and decodes at once: a zstd frame, or in a raw file a run of whole
+// entries about a frame long.
+struct HintSource {
+  std::filesystem::path path;
+  int fd{-1};
+  bool framed{false};
+  // File offset of each unit, then the offset where the units end.
+  std::vector<std::uint64_t> units;
+
+  HintSource() = default;
+  HintSource(const HintSource &) = delete;
+  HintSource &operator=(const HintSource &) = delete;
+  HintSource(HintSource &&) = delete;
+  HintSource &operator=(HintSource &&) = delete;
+  ~HintSource() {
+    if (fd != -1) ::close(fd);
+  }
 };
-auto verify_hint(std::span<const std::byte> file,
-                 const std::filesystem::path &path) -> VerifiedHint {
-  if (file.size() < kFileCrcSize) {
+
+// The open pass reads a file front to back in chunks of this size. A chunk
+// holds any unit whole: the largest frame, or the largest raw entry.
+constexpr std::size_t kOpenChunkBytes = 256 * 1024;
+static_assert(kOpenChunkBytes >= kMaxPackedFrameBytes);
+static_assert(kOpenChunkBytes >= kMaxHintEntryBytes);
+
+// Sequential reader for the open pass. Every byte before `end` is read once,
+// in order, and fed to the CRC as it arrives.
+class OpenPass {
+public:
+  OpenPass(const HintSource &src, std::uint64_t end)
+      : src_{src}, end_{end}, buf_(kOpenChunkBytes) {}
+
+  // The bytes from `at` on that are in the buffer: at least
+  // min(want, end - at) of them, reading more if needed. `at` only moves
+  // forward, and never past what an earlier call returned.
+  [[nodiscard]] auto window(std::uint64_t at, std::size_t want)
+      -> std::span<const std::byte> {
+    const auto read_to = buf_at_ + len_;
+    const auto need = std::min<std::uint64_t>(want, end_ - at);
+    if (at + need > read_to) {
+      // Keep the tail not yet parsed, and fill the rest of the buffer.
+      const auto keep = static_cast<std::size_t>(read_to - at);
+      const auto from = static_cast<std::size_t>(at - buf_at_);
+      std::copy(buf_.begin() + narrow<std::ptrdiff_t>(from),
+                buf_.begin() + narrow<std::ptrdiff_t>(from + keep),
+                buf_.begin());
+      const auto n = static_cast<std::size_t>(
+          std::min<std::uint64_t>(buf_.size() - keep, end_ - read_to));
+      const auto fresh = std::span{buf_}.subspan(keep, n);
+      read_exact(src_.fd, fresh, read_to, src_.path);
+      crc_.update(fresh);
+      buf_at_ = at;
+      len_ = keep + n;
+    }
+    return std::span<const std::byte>{buf_}.subspan(
+        static_cast<std::size_t>(at - buf_at_),
+        static_cast<std::size_t>(buf_at_ + len_ - at));
+  }
+
+  // The CRC of every byte read. Complete once the pass has reached `end`.
+  [[nodiscard]] auto crc() const noexcept -> std::uint32_t {
+    return crc_.finalize();
+  }
+
+private:
+  const HintSource &src_;
+  std::uint64_t end_;
+  std::vector<std::byte> buf_;
+  std::uint64_t buf_at_{0}; // file offset of buf_[0]
+  std::size_t len_{0};      // bytes of buf_ holding file data
+  Crc32 crc_{};
+};
+
+// Opens a hint file for reading. One pass over the file checks the header,
+// records where each unit starts, and checks the trailer at the end. Nothing
+// the file says is handed out before every byte of it has been read and
+// matched against the trailer: a damaged or unreadable hint throws here,
+// before any entry reaches recovery, which is what lets recovery rebuild it
+// with nothing to undo. The pass holds one chunk; the file is never held
+// whole. Throws std::system_error on I/O failure and std::runtime_error on
+// damage.
+auto open_source(std::filesystem::path path)
+    -> std::shared_ptr<const HintSource> {
+  auto src = std::make_shared<HintSource>();
+  src->path = std::move(path);
+  src->fd = ::open(src->path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (src->fd == -1) {
+    throw std::system_error{
+        errno, std::generic_category(),
+        std::format("HintFile: cannot open '{}' for read", src->path.string())};
+  }
+  // The size of the file this fd reads, not of whatever the path names now.
+  struct stat st{};
+  if (::fstat(src->fd, &st) != 0) {
+    throw std::system_error{
+        errno, std::generic_category(),
+        std::format("HintFile: cannot stat '{}'", src->path.string())};
+  }
+#ifndef __APPLE__
+  // Both the open pass and the scans walk the file front to back.
+  ::posix_fadvise(src->fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+  const auto file_size = narrow<std::uint64_t>(st.st_size);
+  if (file_size < kFileCrcSize) {
     throw std::runtime_error{std::format(
         "HintFile: '{}' is too small to contain a CRC trailer",
-        path.string())};
+        src->path.string())};
   }
-  const auto framed =
-      file.size() >= kFramedMagic.size() &&
-      std::ranges::equal(file.first(kFramedMagic.size()), kFramedMagic);
-  Crc32 crc{};
-  crc.update(file.first(file.size() - kFileCrcSize));
-  const auto computed = framed ? ~crc.finalize() : crc.finalize();
-  const auto stored = read_le<std::uint32_t>(file, file.size() - kFileCrcSize);
+  const auto end = file_size - kFileCrcSize; // what the CRC covers
+  OpenPass pass{*src, end};
+
+  const auto head = pass.window(0, kFramedHeaderSize);
+  src->framed = head.size() >= kFramedMagic.size() &&
+                std::ranges::equal(head.first(kFramedMagic.size()),
+                                   kFramedMagic);
+  std::uint64_t at = 0;
+  if (src->framed) {
+    if (head.size() < kFramedHeaderSize) {
+      throw std::runtime_error{std::format(
+          "HintFile: '{}' is too small for its header", src->path.string())};
+    }
+    const auto version = std::to_integer<std::uint8_t>(head[8]);
+    const auto codec = std::to_integer<std::uint8_t>(head[9]);
+    if (version != kFramedVersion || codec != kCodecZstd) {
+      throw std::runtime_error{std::format(
+          "HintFile: '{}' has unsupported version {} / codec {}",
+          src->path.string(), version, codec)};
+    }
+    at = kFramedHeaderSize;
+  }
+
+  while (at < end) {
+    src->units.push_back(at);
+    if (src->framed) {
+      const auto bytes = pass.window(at, kMaxPackedFrameBytes);
+      const auto packed =
+          ZSTD_findFrameCompressedSize(bytes.data(), bytes.size());
+      if (ZSTD_isError(packed) || packed > kMaxPackedFrameBytes) {
+        throw std::runtime_error{std::format(
+            "HintFile: truncated or corrupt frame in '{}'",
+            src->path.string())};
+      }
+      const auto size = ZSTD_getFrameContentSize(bytes.data(), packed);
+      if (size == ZSTD_CONTENTSIZE_UNKNOWN || size == ZSTD_CONTENTSIZE_ERROR ||
+          size > kMaxFrameBytes) {
+        throw std::runtime_error{std::format(
+            "HintFile: frame of invalid size in '{}'", src->path.string())};
+      }
+      at += packed;
+    } else {
+      // A raw file has no frames; cut it into units at entry boundaries.
+      const auto start = at;
+      do {
+        const auto bytes = pass.window(at, kMaxHintEntryBytes);
+        try {
+          at += deserialize_entry(bytes).second;
+        } catch (const std::runtime_error &e) {
+          // The pass has not reached the trailer, so name the file: this is
+          // the only report its damage gets.
+          throw std::runtime_error{std::format(
+              "HintFile: '{}' is damaged: {}", src->path.string(), e.what())};
+        }
+      } while (at < end && at - start < frame_target());
+    }
+  }
+  src->units.push_back(end);
+
+  std::array<std::byte, kFileCrcSize> trailer{};
+  read_exact(src->fd, trailer, end, src->path);
+  const auto stored = read_le<std::uint32_t>(trailer, 0);
+  const auto computed = src->framed ? ~pass.crc() : pass.crc();
   if (computed != stored) {
     throw std::runtime_error{
-        std::format("HintFile: CRC mismatch in '{}'", path.string())};
+        std::format("HintFile: CRC mismatch in '{}'", src->path.string())};
   }
-  if (!framed) {
-    return {file.first(file.size() - kFileCrcSize), false};
-  }
-  if (file.size() < kFramedHeaderSize + kFileCrcSize) {
-    throw std::runtime_error{
-        std::format("HintFile: '{}' is too small for its header",
-                    path.string())};
-  }
-  const auto version = std::to_integer<std::uint8_t>(file[8]);
-  const auto codec = std::to_integer<std::uint8_t>(file[9]);
-  if (version != kFramedVersion || codec != kCodecZstd) {
-    throw std::runtime_error{std::format(
-        "HintFile: '{}' has unsupported version {} / codec {}", path.string(),
-        version, codec)};
-  }
-  return {file.subspan(kFramedHeaderSize,
-                       file.size() - kFramedHeaderSize - kFileCrcSize),
-          true};
+  return src;
 }
 } // namespace
 
@@ -177,44 +345,41 @@ export void set_hint_frame_bytes_for_testing(std::size_t bytes) noexcept {
 // running CRC-32C is accumulated over every byte written. close() writes the
 // last frame and the trailer, calls fdatasync, and closes the fd.
 //
-// Read mode (OpenForRead, OpenForMerge): verifies the trailer before any
-// parsing and exposes a Scanner. Both layouts — framed, and the raw layout
-// written before compression — are read.
+// Read mode (OpenForRead): verifies the whole file against its trailer before
+// returning, then hands out Scanners that read it a unit at a time with
+// pread. Both layouts — framed, and the raw layout written before
+// compression — are read.
 //
 // Thread safety: NOT thread-safe. External synchronization is required.
 export class HintFile {
 public:
-  // Forward-only scanner over a hint file's entries.
+  // Forward-only scanner over a hint file's entries. It shares the open file
+  // with its HintFile, so either may outlive the other.
   //
   // HintEntry.key and .end_key are valid until the scanner's next call to
-  // next() or seek(): in a framed file they point into the frame the scanner
-  // has decoded, which the next frame overwrites. A reader that keeps an entry
-  // longer copies it (HintRecord).
+  // next() or seek(): they point into the unit the scanner has decoded, which
+  // the next unit overwrites. A reader that keeps an entry longer copies it
+  // (HintRecord).
   class Scanner {
   public:
-    // Where an entry starts: the frame holding it, as an offset into the
-    // file's frame region, and its offset inside the decoded frame. A raw
-    // file is one frame at 0. Positions order like the entries they name.
+    // Where an entry starts: the index of the unit holding it — a frame, or a
+    // run of a raw file's entries — and its offset inside the decoded unit.
+    // Positions order like the entries they name.
     struct Position {
       std::size_t frame{};
       std::size_t offset{};
       auto operator<=>(const Position &) const = default;
     };
 
-    Scanner(std::span<const std::byte> body, bool framed)
-        : body_{body}, framed_{framed} {
-      if (!framed_) {
-        frame_ = body_;
-        next_frame_ = body_.size();
-        loaded_ = true;
-      }
-    }
+    explicit Scanner(std::shared_ptr<const HintSource> src)
+        : src_{std::move(src)} {}
 
     // Returns the next entry, or nullopt at end of data.
-    // Throws std::runtime_error on a truncated entry or a corrupt frame.
+    // Throws std::system_error on a failed read, std::runtime_error on a
+    // truncated entry or a corrupt frame.
     [[nodiscard]] auto next() -> std::optional<HintEntry> {
       while (pos_ >= frame_.size()) {
-        if (next_frame_ >= body_.size()) return std::nullopt;
+        if (next_frame_ >= unit_count()) return std::nullopt;
         load_frame(next_frame_);
       }
       auto [he, consumed] = deserialize_entry(frame_.subspan(pos_));
@@ -225,62 +390,77 @@ public:
     // Where the next entry starts. seek() returns there; it must be a
     // position this scanner's file produced.
     [[nodiscard]] auto position() const noexcept -> Position {
-      if (pos_ >= frame_.size() && next_frame_ < body_.size())
+      if (pos_ >= frame_.size() && next_frame_ < unit_count())
         return {next_frame_, 0};
       return {frame_at_, pos_};
     }
 
     void seek(Position p) {
-      if (framed_ && (!loaded_ || p.frame != frame_at_)) load_frame(p.frame);
+      if (!loaded_ || p.frame != frame_at_) load_frame(p.frame);
       if (p.offset > frame_.size())
         throw std::runtime_error{"HintFile: seek past the end of a frame"};
       pos_ = p.offset;
     }
 
   private:
-    void load_frame(std::size_t at) {
-      if (at >= body_.size()) {
-        // The end of the frames: where an empty file's scan stops.
+    [[nodiscard]] auto unit_count() const noexcept -> std::size_t {
+      return src_->units.size() - 1;
+    }
+
+    // Reads unit i and decodes it into buf_. Its bounds, and a frame's
+    // header, were checked when the file was opened.
+    void load_frame(std::size_t i) {
+      if (i >= unit_count()) {
+        // The end of the units: where an empty file's scan stops.
         frame_ = {};
-        frame_at_ = at;
-        next_frame_ = body_.size();
+        frame_at_ = i;
+        next_frame_ = unit_count();
         pos_ = 0;
         loaded_ = true;
         return;
       }
-      const auto src = body_.subspan(at);
-      const auto packed = ZSTD_findFrameCompressedSize(src.data(), src.size());
-      if (ZSTD_isError(packed))
-        throw std::runtime_error{"HintFile: truncated or corrupt frame"};
-      const auto size = ZSTD_getFrameContentSize(src.data(), packed);
-      if (size == ZSTD_CONTENTSIZE_UNKNOWN || size == ZSTD_CONTENTSIZE_ERROR ||
-          size > kMaxFrameBytes)
-        throw std::runtime_error{"HintFile: frame of invalid size"};
-#ifdef BYTECASK_TESTING
-      // A fresh allocation per frame frees the previous one, so a reader
-      // that kept an entry past the frame reads freed memory and ASan says
-      // so, instead of it silently reading the next frame's bytes.
-      buf_ = std::vector<std::byte>(static_cast<std::size_t>(size));
-#else
-      buf_.resize(static_cast<std::size_t>(size));
-#endif
-      const auto got = ZSTD_decompressDCtx(&thread_dctx(), buf_.data(),
-                                           buf_.size(), src.data(), packed);
-      if (ZSTD_isError(got) || got != size)
-        throw std::runtime_error{"HintFile: frame does not decompress"};
+      const auto at = src_->units[i];
+      const auto len = narrow<std::size_t>(src_->units[i + 1] - at);
+      if (src_->framed) {
+        auto &packed = thread_packed_frame();
+        packed.resize(len);
+        read_exact(src_->fd, packed, at, src_->path);
+        const auto size = ZSTD_getFrameContentSize(packed.data(), len);
+        if (size == ZSTD_CONTENTSIZE_UNKNOWN ||
+            size == ZSTD_CONTENTSIZE_ERROR || size > kMaxFrameBytes)
+          throw std::runtime_error{"HintFile: frame of invalid size"};
+        reset_buffer(static_cast<std::size_t>(size));
+        const auto got = ZSTD_decompressDCtx(&thread_dctx(), buf_.data(),
+                                             buf_.size(), packed.data(), len);
+        if (ZSTD_isError(got) || got != size)
+          throw std::runtime_error{"HintFile: frame does not decompress"};
+      } else {
+        reset_buffer(len);
+        read_exact(src_->fd, buf_, at, src_->path);
+      }
       frame_ = buf_;
-      frame_at_ = at;
-      next_frame_ = at + packed;
+      frame_at_ = i;
+      next_frame_ = i + 1;
       pos_ = 0;
       loaded_ = true;
     }
 
-    std::span<const std::byte> body_; // non-owning; excludes header, trailer
-    bool framed_;
-    std::vector<std::byte> buf_;       // framed: the decoded frame
-    std::span<const std::byte> frame_; // entries being read
+    void reset_buffer(std::size_t size) {
+#ifdef BYTECASK_TESTING
+      // A fresh allocation per unit frees the previous one, so a reader that
+      // kept an entry past its unit reads freed memory and ASan says so,
+      // instead of it silently reading the next unit's bytes.
+      buf_ = std::vector<std::byte>(size);
+#else
+      buf_.resize(size);
+#endif
+    }
+
+    std::shared_ptr<const HintSource> src_;
+    std::vector<std::byte> buf_;       // the decoded unit
+    std::span<const std::byte> frame_; // entries being read, in buf_
     std::size_t frame_at_{0};          // Position::frame of frame_
-    std::size_t next_frame_{0};        // where the following frame starts
+    std::size_t next_frame_{0};        // the unit after frame_
     std::size_t pos_{0};               // next entry, inside frame_
     bool loaded_{false};
   };
@@ -306,100 +486,16 @@ public:
     return hint;
   }
 
-  // Opens an existing hint file for reading. Reads the entire file into an
-  // in-memory buffer in one syscall, then verifies the trailer before
-  // returning. Throws on I/O failure or CRC mismatch.
+  // Opens an existing hint file for reading, and reads and verifies all of it
+  // before returning (open_source). Keeps the fd open for its scanners.
+  // Throws std::system_error on I/O failure, std::runtime_error on damage.
   [[nodiscard]] static auto OpenForRead(std::filesystem::path path)
       -> HintFile {
-    auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd == -1) {
-      throw std::system_error{
-          errno, std::generic_category(),
-          std::format("HintFile: cannot open '{}' for read", path.string())};
-    }
-    const auto file_sz = std::filesystem::file_size(path);
-    std::vector<std::byte> buf(file_sz);
-    try {
-      pread_exact(fd, 0, buf);
-    } catch (const std::system_error &e) {
-      ::close(fd);
-      throw std::system_error{
-          e.code(), std::format("HintFile: cannot read '{}' into buffer: {}",
-                                path.string(), e.what())};
-    }
-    ::close(fd);
-
-    const auto verified = verify_hint(buf, path);
-    const auto body_at = static_cast<std::size_t>(verified.body.data() -
-                                                  buf.data());
-    const auto body_size = verified.body.size();
-    return HintFile{std::move(path), std::move(buf), body_at, body_size,
-                    verified.framed};
-  }
-
-  // Read mode backed by a shared, read-only mapping instead of a heap copy.
-  //
-  // A k-way merge has to hold every file it merges open at once, and slurping
-  // each one makes recovery's working set grow with the database: one worker
-  // at recovery_threads = 1 owns every hint file there is. Mapping keeps the
-  // bytes in the page cache, where they are file-backed and reclaimable, so
-  // the anonymous memory recovery needs stays bounded by the tree it builds
-  // and the one decoded frame each scanner holds.
-  [[nodiscard]] static auto OpenForMerge(std::filesystem::path path)
-      -> HintFile {
-    auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd == -1) {
-      throw std::system_error{
-          errno, std::generic_category(),
-          std::format("HintFile: cannot open '{}' for read", path.string())};
-    }
-    const auto file_sz = std::filesystem::file_size(path);
-    if (file_sz < kFileCrcSize) {
-      ::close(fd);
-      throw std::runtime_error{std::format(
-          "HintFile: '{}' is too small to contain a CRC trailer",
-          path.string())};
-    }
-    // file_size() is 64-bit everywhere; std::size_t is 32-bit on wasm32, so
-    // the mapping length needs checking rather than casting. Checked here
-    // rather than through narrow<> because the fd has to be closed before
-    // throwing.
-    if (!std::in_range<std::size_t>(file_sz)) {
-      ::close(fd);
-      throw std::runtime_error{
-          std::format("HintFile: '{}' is too large to map on this platform",
-                      path.string())};
-    }
-    const auto map_size = static_cast<std::size_t>(file_sz);
-    auto *addr = ::mmap(nullptr, map_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);  // the mapping keeps the file alive
-    if (addr == MAP_FAILED) {
-      throw std::system_error{
-          errno, std::generic_category(),
-          std::format("HintFile: cannot map '{}'", path.string())};
-    }
-    auto map = std::span<const std::byte>{
-        static_cast<const std::byte *>(addr), map_size};
-    // The merge walks each file front to back exactly once.
-    ::madvise(addr, map_size, MADV_SEQUENTIAL);
-
-    VerifiedHint verified;
-    try {
-      verified = verify_hint(map, path);
-    } catch (...) {
-      ::munmap(addr, map_size);
-      throw;
-    }
-    const auto body_at =
-        static_cast<std::size_t>(verified.body.data() - map.data());
-    return HintFile{std::move(path), addr, map_size, body_at,
-                    verified.body.size(), verified.framed};
+    auto src = open_source(path);
+    return HintFile{std::move(path), std::move(src)};
   }
 
   ~HintFile() {
-    if (map_ != nullptr) {
-      ::munmap(map_, map_size_);
-    }
     // If the write fd is still open (close() was not called — e.g. exception
     // path), close without writing CRC. The .hint.tmp file will be cleaned
     // up on next startup.
@@ -413,41 +509,23 @@ public:
 
   HintFile(HintFile &&other) noexcept
       : path_{std::move(other.path_)},
-        buf_{std::move(other.buf_)},
-        map_{other.map_},
-        map_size_{other.map_size_},
-        body_at_{other.body_at_},
-        body_size_{other.body_size_},
-        framed_{other.framed_},
-        write_fd_{other.write_fd_},
+        src_{std::move(other.src_)},
+        write_fd_{std::exchange(other.write_fd_, -1)},
         crc_{other.crc_},
         cctx_{std::move(other.cctx_)},
         pending_{std::move(other.pending_)},
-        packed_{std::move(other.packed_)} {
-    other.write_fd_ = -1;
-    other.map_ = nullptr;
-    other.map_size_ = 0;
-  }
+        packed_{std::move(other.packed_)} {}
 
   HintFile &operator=(HintFile &&other) noexcept {
     if (this != &other) {
       if (write_fd_ != -1) ::close(write_fd_);
-      if (map_ != nullptr) ::munmap(map_, map_size_);
       path_ = std::move(other.path_);
-      buf_ = std::move(other.buf_);
-      map_ = other.map_;
-      map_size_ = other.map_size_;
-      body_at_ = other.body_at_;
-      body_size_ = other.body_size_;
-      framed_ = other.framed_;
-      write_fd_ = other.write_fd_;
+      src_ = std::move(other.src_);
+      write_fd_ = std::exchange(other.write_fd_, -1);
       crc_ = other.crc_;
       cctx_ = std::move(other.cctx_);
       pending_ = std::move(other.pending_);
       packed_ = std::move(other.packed_);
-      other.write_fd_ = -1;
-      other.map_ = nullptr;
-      other.map_size_ = 0;
     }
     return *this;
   }
@@ -500,10 +578,11 @@ public:
     write_fd_ = -1;
   }
 
-  // Returns a Scanner over the file's entries. The Scanner reads this
-  // HintFile's buffer or mapping; this HintFile must outlive it.
+  // Returns a Scanner over the file's entries. Read mode only.
   [[nodiscard]] auto make_scanner() const -> Scanner {
-    return Scanner{view().subspan(body_at_, body_size_), framed_};
+    if (!src_)
+      throw std::logic_error{"HintFile: make_scanner on a write-mode file"};
+    return Scanner{src_};
   }
 
   [[nodiscard]] auto path() const -> const std::filesystem::path & {
@@ -515,17 +594,9 @@ private:
   explicit HintFile(std::filesystem::path path, int fd)
       : path_{std::move(path)}, write_fd_{fd} {}
 
-  // Read-mode constructor: holds the file buffer.
-  HintFile(std::filesystem::path path, std::vector<std::byte> buf,
-           std::size_t body_at, std::size_t body_size, bool framed)
-      : path_{std::move(path)}, buf_{std::move(buf)}, body_at_{body_at},
-        body_size_{body_size}, framed_{framed} {}
-
-  // Merge-mode constructor: holds the mapping, unmapped by the destructor.
-  HintFile(std::filesystem::path path, void *addr, std::size_t size,
-           std::size_t body_at, std::size_t body_size, bool framed)
-      : path_{std::move(path)}, map_{addr}, map_size_{size},
-        body_at_{body_at}, body_size_{body_size}, framed_{framed} {}
+  // Read-mode constructor: holds the verified, open file.
+  HintFile(std::filesystem::path path, std::shared_ptr<const HintSource> src)
+      : path_{std::move(path)}, src_{std::move(src)} {}
 
   void add_entry(std::span<const std::byte> entry) {
     pending_.insert(pending_.end(), entry.begin(), entry.end());
@@ -534,7 +605,8 @@ private:
 
   // Compresses the buffered entries into one frame and writes it. zstd's
   // one-shot call records the decompressed size in the frame header, which
-  // is what lets a reader size its buffer and walk frames without an index.
+  // is what lets a reader size its buffer and find the frames without an
+  // index stored in the file.
   void flush_frame() {
     if (pending_.empty()) return;
     packed_.resize(ZSTD_compressBound(pending_.size()));
@@ -561,19 +633,8 @@ private:
     crc_.update(data);
   }
 
-  [[nodiscard]] auto view() const noexcept -> std::span<const std::byte> {
-    if (map_ != nullptr)
-      return {static_cast<const std::byte *>(map_), map_size_};
-    return {buf_.data(), buf_.size()};
-  }
-
   std::filesystem::path path_;
-  std::vector<std::byte> buf_;   // read mode only
-  void *map_{nullptr};           // merge mode only; owns the mapping
-  std::size_t map_size_{0};
-  std::size_t body_at_{0};       // read modes: where the scanned region starts
-  std::size_t body_size_{0};
-  bool framed_{false};           // read modes: the file is zstd-framed
+  std::shared_ptr<const HintSource> src_; // read mode only
   int write_fd_{-1};             // write mode only; -1 when closed or read mode
   Crc32 crc_{};                  // write mode only; running CRC accumulator
   std::unique_ptr<ZSTD_CCtx, ZstdCCtxFree> cctx_; // write mode only

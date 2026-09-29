@@ -17,6 +17,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "fault_injector.h"
 import bytecask.hint_entry;
 import bytecask.hint_file;
 import bytecask.serialization;
@@ -313,7 +314,6 @@ TEST_CASE("HintFile round-trips across frame boundaries", "[hintfile]") {
       FrameBytes fb{frame};
       write_entries(tmp, es);
       check_scan(bytecask::HintFile::OpenForRead(tmp), es);
-      check_scan(bytecask::HintFile::OpenForMerge(tmp), es);
     }
   }
 }
@@ -345,14 +345,13 @@ TEST_CASE("HintFile entries larger than a frame round-trip", "[hintfile]") {
   };
   write_entries(tmp, es);
   check_scan(bytecask::HintFile::OpenForRead(tmp), es);
-  check_scan(bytecask::HintFile::OpenForMerge(tmp), es);
 }
 
 TEST_CASE("HintFile empty file has no entries", "[hintfile]") {
   const auto tmp = std::filesystem::temp_directory_path() / "bc_hint_empty.hint";
   std::filesystem::remove(tmp);
   write_entries(tmp, {});
-  const auto hf = bytecask::HintFile::OpenForMerge(tmp);
+  const auto hf = bytecask::HintFile::OpenForRead(tmp);
   auto scanner = hf.make_scanner();
   const auto end = scanner.position();
   CHECK_FALSE(scanner.next().has_value());
@@ -371,7 +370,7 @@ TEST_CASE("HintFile seek returns to every position a scan reported",
   FrameBytes fb{100};
   write_entries(tmp, es);
 
-  const auto hf = bytecask::HintFile::OpenForMerge(tmp);
+  const auto hf = bytecask::HintFile::OpenForRead(tmp);
   std::vector<bytecask::HintFile::Scanner::Position> at;
   {
     auto scanner = hf.make_scanner();
@@ -422,10 +421,9 @@ TEST_CASE("HintFile reads the uncompressed layout", "[hintfile]") {
   write_file(tmp, file);
 
   check_scan(bytecask::HintFile::OpenForRead(tmp), es);
-  check_scan(bytecask::HintFile::OpenForMerge(tmp), es);
 
-  SECTION("positions are byte offsets, seekable like a framed file's") {
-    const auto hf = bytecask::HintFile::OpenForMerge(tmp);
+  SECTION("a file shorter than a frame is one unit, positions its offsets") {
+    const auto hf = bytecask::HintFile::OpenForRead(tmp);
     auto scanner = hf.make_scanner();
     (void)scanner.next();
     const auto second = scanner.position();
@@ -436,6 +434,29 @@ TEST_CASE("HintFile reads the uncompressed layout", "[hintfile]") {
     const auto he = scanner.next();
     REQUIRE(he.has_value());
     check_entry(*he, es[1]);
+  }
+
+  SECTION("a longer file is cut into units at entry boundaries") {
+    // Units are cut at the frame size, so tiny frames cut a raw file into
+    // many; every position a scan reports must seek back to its entry.
+    FrameBytes fb{100};
+    const auto hf = bytecask::HintFile::OpenForRead(tmp);
+    check_scan(hf, es);
+    std::vector<bytecask::HintFile::Scanner::Position> at;
+    auto scanner = hf.make_scanner();
+    for (;;) {
+      at.push_back(scanner.position());
+      if (!scanner.next()) break;
+    }
+    REQUIRE(at.size() == es.size() + 1);
+    CHECK(std::ranges::is_sorted(at));
+    CHECK(at.front().frame != at[es.size() / 2].frame);
+    for (std::size_t i = es.size(); i-- > 0;) {
+      scanner.seek(at[i]);
+      const auto he = scanner.next();
+      REQUIRE(he.has_value());
+      check_entry(*he, es[i]);
+    }
   }
 }
 
@@ -463,7 +484,7 @@ TEST_CASE("HintFile damaged frame fails the CRC", "[hintfile]") {
   file[file.size() / 2] ^= std::byte{0x10};
   write_file(tmp, file);
   CHECK_THROWS_AS(bytecask::HintFile::OpenForRead(tmp), std::runtime_error);
-  CHECK_THROWS_AS(bytecask::HintFile::OpenForMerge(tmp), std::runtime_error);
+  CHECK_THROWS_AS(bytecask::HintFile::OpenForRead(tmp), std::runtime_error);
 }
 
 TEST_CASE("HintFile refuses an unknown version", "[hintfile]") {
@@ -479,7 +500,8 @@ TEST_CASE("HintFile refuses an unknown version", "[hintfile]") {
 
 TEST_CASE("HintFile frame claiming a corrupt size is refused", "[hintfile]") {
   // Damage the CRC cannot see — the trailer recomputed over it — must still
-  // not reach the parser as a frame.
+  // not reach the parser as a frame. Opening walks every frame header, so it
+  // is refused there, before any entry is handed out.
   const auto tmp = std::filesystem::temp_directory_path() / "bc_hint_zf.hint";
   std::filesystem::remove(tmp);
   write_entries(tmp, sample_entries(10));
@@ -487,7 +509,49 @@ TEST_CASE("HintFile frame claiming a corrupt size is refused", "[hintfile]") {
   std::ranges::fill(std::span{file}.subspan(16, 8), std::byte{0xAB});
   put_trailer(file, ~crc_of(std::span{file}.first(file.size() - 4)));
   write_file(tmp, file);
-  const auto hf = bytecask::HintFile::OpenForRead(tmp);
-  auto scanner = hf.make_scanner();
-  CHECK_THROWS_AS((void)scanner.next(), std::runtime_error);
+  CHECK_THROWS_AS(bytecask::HintFile::OpenForRead(tmp), std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// I/O errors: a failed read throws std::system_error, wherever it lands
+// ---------------------------------------------------------------------------
+TEST_CASE("HintFile read error throws system_error", "[hintfile]") {
+  const auto tmp = std::filesystem::temp_directory_path() / "bc_hint_eio.hint";
+  std::filesystem::remove(tmp);
+  const auto es = sample_entries(400);
+  FrameBytes fb{256};
+  write_entries(tmp, es);
+
+  SECTION("while the file is opened and verified") {
+    bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+    CHECK_THROWS_AS(bytecask::HintFile::OpenForRead(tmp), std::system_error);
+  }
+
+  SECTION("while a verified file is scanned") {
+    const auto hf = bytecask::HintFile::OpenForRead(tmp);
+    auto scanner = hf.make_scanner();
+    REQUIRE(scanner.next().has_value());
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+      std::size_t read = 1;
+      CHECK_THROWS_AS(
+          [&] {
+            while (scanner.next()) ++read;
+          }(),
+          std::system_error);
+      CHECK(read < es.size()); // it failed on a later unit, not at the end
+    }
+    // The failure was the read's, not the file's: a new scanner reads it all.
+    std::size_t read = 0;
+    auto again = hf.make_scanner();
+    while (again.next()) ++read;
+    CHECK(read == es.size());
+  }
+
+  SECTION("an error on one read does not poison the next open") {
+    bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+    fi.inj.fail_on_nth_match = 1;
+    CHECK_THROWS_AS(bytecask::HintFile::OpenForRead(tmp), std::system_error);
+    check_scan(bytecask::HintFile::OpenForRead(tmp), es);
+  }
 }

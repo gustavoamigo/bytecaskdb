@@ -981,6 +981,8 @@ So `truncate()` calls `ftruncate` and moves one field: `mmap_end_`, the prefix o
 
 **Sealed (read-only) files**: When `seal()` is called, the file is memory-mapped with `mmap(PROT_READ, MAP_PRIVATE)` and `MADV_RANDOM`. Subsequent `read_entry()` and `read_value()` serve directly from the mapped region, eliminating `pread` syscalls on the hot read path. If `mmap` fails (e.g. address space exhaustion), the class silently falls back to `pread`. The mapping is released by `munmap` in the destructor.
 
+A read through a mapping has no way to return an error. When the kernel cannot fill a mapped page — a media error, `EIO` from a network or FUSE filesystem, a file truncated underneath — it delivers `SIGBUS`, which kills the host process unless the host handles it. Every other read in the engine throws `std::system_error`. That is a property of `IoBackend::Mmap`, taken on with it; the `Pread` and `BufferPool` back-ends, and hint files under every back-end, read with `pread`.
+
 On WASM/Emscripten builds, mmap is disabled (`#ifndef __EMSCRIPTEN__`). Emscripten's mmap emulation allocates a heap buffer and copies the file contents into it — functionally identical to `pread` but with doubled memory consumption. WASM builds use the `pread` fallback exclusively; tests that request mmap assert that fallback rather than treating it as a failed fast path. `DB::open` rejects `IoBackend::Mmap` outright on Emscripten builds (throws `std::invalid_argument`), rather than silently ignoring the option — the sealed-file read path and the active-file write path never take the mmap branch on this platform, so an accepted-but-ignored option would be a silent behavior mismatch with native. `IoBackend::BufferPool` is accepted: under `NODERAWFS` each `pread` is a call into Node's `fs`, and a pool hit avoids it. The pool fills without `O_DIRECT` there (`open_uncached` returns -1 on Emscripten), so `direct_io` has no effect. Emscripten stubs out `link()`, which the exclusive rename that installs a vacuumed file depends on; `bytecaskdb-node/wasm/node_linkat.c` replaces the stub with a hard link through Node's `fs`, keeping `EEXIST` so a live file is never replaced. Correctness proof tests generated with `io_backend = IoBackend::Mmap` (in `tests/proof/generated/`) are compiled out under `#ifndef __EMSCRIPTEN__` for the same reason.
 
 ### HintFile I/O model
@@ -988,10 +990,17 @@ On WASM/Emscripten builds, mmap is disabled (`#ifndef __EMSCRIPTEN__`). Emscript
 Write and read modes have different I/O strategies.
 
 - **`OpenForWrite(path)`** — opens the file and writes its 16-byte header. Each `append()` serializes one entry into the open frame; once the frame holds `kHintFrameBytes` (16 KiB) it is compressed with zstd in one call and written to the fd, updating a running CRC-32C accumulator. `close()` writes the last frame and the inverted CRC trailer, calls `fdatasync()`, and closes the fd. If the HintFile is destroyed without calling `close()` (e.g. exception path), the fd is closed without writing the CRC — the `.hint.tmp` file is cleaned up on next startup.
-- **`OpenForRead(path)`** — reads the entire file into an in-memory buffer via a single `pread` and immediately closes the fd.
-- **`OpenForMerge(path)`** — maps the file read-only instead, for the k-way merges that hold every file open at once: the compressed bytes stay in the page cache, file-backed and reclaimable.
+- **`OpenForRead(path)`** — opens the file and reads all of it once, front to back, in 256 KiB chunks with `pread`: each chunk feeds the CRC, and the pass records where each *unit* starts — a zstd frame, or in an uncompressed file a run of whole entries about a frame long. It checks the header, every frame's header and decompressed size, and at the end the trailer. Only then does it return. The fd stays open; scanners read one unit at a time with `pread`, and share the open file with the `HintFile`, so a scanner can outlive it.
 
-Both read modes verify the trailer before any parsing and read either layout: the zstd-framed one, and the uncompressed one written before compression (see [Hint File Format](#hint-file-format-hint)).
+Hint files are never memory-mapped. Recovery used to map them for its merges, and a page the kernel could not fill was a `SIGBUS` that killed the process (#237). With `pread` a failed read is a `std::system_error`, like every other read.
+
+The reader holds, per open file, the fd and one 8-byte offset per unit (one per ~16 KiB of entries before compression), and per scanner one decoded unit. The compressed bytes of the frame being decoded go into a per-thread scratch buffer, shared by the thread's scanners. The open pass holds one chunk while it runs. Nothing holds a whole file.
+
+The pass reads every byte before a scan reads any, so a scan reads a file a second time. That is the pattern the mapping had — the CRC pass, then the scan — and on a cold start the first pass brings the file into the page cache for the second.
+
+The cost is file descriptors: while recovery merges, every hint file it holds is open alongside its data file, where the mapping had closed its fd. A database with more files than half the process's `RLIMIT_NOFILE` needs a higher limit to open.
+
+The reader reads either layout: the zstd-framed one, and the uncompressed one written before compression (see [Hint File Format](#hint-file-format-hint)).
 
 `HintEntry.key` is a `std::span<const std::byte>` with no allocation per entry. In a framed file it points into the frame the scanner has decoded, so it is valid only until the scanner's next `next()` or `seek()`. A reader that keeps an entry longer copies it into a `HintRecord`, which owns its key and reuses its capacity: the merge cursors of `recovery_build_sorted` and `recovery_load_streams` hold their current entry and lookahead that way, and a blind fence owns its key. Testing builds give every decoded frame a fresh allocation, so a reader that breaks the rule reads freed memory, and ASan reports it instead of the reader silently seeing the next frame's bytes.
 
@@ -1045,9 +1054,11 @@ Each entry is a 23-byte header followed by the key:
 
 The file CRC is the only integrity check. zstd detects little on its own — a flipped bit in a frame of real hint entries decoded to wrong bytes without error 83–93% of the time — and its per-frame checksum is not enabled: it would catch the same flips, but not a missing frame, and only partway through decoding.
 
-`OpenForRead` and `OpenForMerge` both verify the trailer CRC eagerly, before parsing any entries, and reject the whole file by throwing `std::runtime_error` on mismatch. Verifying at open is what makes the file's replacement safe: the throw lands before any entry has been applied to the key directory, so the rebuild below has no partial state to undo.
+`OpenForRead` verifies the trailer CRC before it returns, and so before any entry is parsed, rejecting the whole file with `std::runtime_error` on a mismatch or a frame header that does not hold, and with `std::system_error` when a read fails. Verifying at open is what makes the file's replacement safe: the throw lands before any entry has been applied to the key directory, so the rebuild below has no partial state to undo.
 
-A hint file is a derived index, not the records it points at, so a CRC failure in one says the index is damaged and not that the data file behind it is. `open_hint_or_rebuild` therefore removes the damaged hint, regenerates it from its data file through `flush_hints_for` — the same scan a missing hint already takes — and opens the result, in both recovery modes. `fail_recovery_on_crc_errors` governs only what is left after that: a data file whose own entries fail their CRCs cannot be rescanned, and the file is then thrown on (strict) or skipped (lenient). Skipping is not free — a skipped file keeps its `total_bytes` while contributing no `live_bytes`, so the next vacuum sees it as entirely garbage and unlinks it, which is why a rebuildable hint must never reach that path.
+A hint file is a derived index, not the records it points at, so a CRC failure in one says the index is damaged and not that the data file behind it is — and a read that fails on it says nothing about the data file either. `open_hint_or_rebuild` therefore treats any failure to open a hint the same way: it removes the hint, regenerates it from its data file through `flush_hints_for` — the same scan a missing hint already takes — and opens the result, in both recovery modes. `fail_recovery_on_crc_errors` governs only what is left after that: a data file whose own entries fail their CRCs cannot be rescanned, and the file is then thrown on (strict) or skipped (lenient). Skipping is not free — a skipped file keeps its `total_bytes` while contributing no `live_bytes`, so the next vacuum sees it as entirely garbage and unlinks it, which is why a rebuildable hint must never reach that path.
+
+A read can also fail after the open pass succeeded: a scan reads the file again, and the second read can fail where the first did not. By then some of the file's entries have been applied, so neither a rebuild nor a skip is safe, and in both modes `DB::open` throws the `std::system_error`. Nothing has been written by then; the next open recovers. The lenient skip covers only a file that could not be opened, in every recovery path.
 
 ### Size Constants
 
@@ -1058,14 +1069,14 @@ A hint file is a derived index, not the records it points at, so a CRC failure i
 
 ### Scanner API
 
-`HintFile::make_scanner()` returns a `Scanner` object that iterates over entries sequentially, decoding one frame at a time into a buffer it owns; each thread shares one zstd decompression context among all its scanners. `HintEntry.key` is valid until the scanner's next `next()` or `seek()`.
+`HintFile::make_scanner()` returns a `Scanner` object that iterates over entries sequentially, reading and decoding one unit at a time into a buffer it owns; each thread shares one zstd decompression context, and one buffer for compressed bytes, among all its scanners. A failed read throws `std::system_error`. `HintEntry.key` is valid until the scanner's next `next()` or `seek()`.
 
 ```cpp
 auto scanner = hint.make_scanner();
 while (auto he = scanner.next()) { /* use he->key, he->sequence, … */ }
 ```
 
-`position()` names where the next entry starts — its frame and its offset in the decoded frame; an uncompressed file is one frame — and `seek()` returns there. Positions order like the entries they name. The blind recovery path records its fences as positions.
+`position()` names where the next entry starts — the index of its unit and its offset in the decoded unit — and `seek()` returns there. Positions order like the entries they name. The blind recovery path records its fences as positions.
 
 ### Recovery
 
@@ -1206,14 +1217,14 @@ On ext4 and XFS, metadata is journaled in order, so none of these entries is lik
 Construction uses named static factory functions to make intent explicit at the call site:
 
 - **`HintFile::OpenForWrite(path) -> HintFile`** — opens the file immediately with `O_WRONLY | O_CREAT | O_TRUNC`. Each `append()` serializes one entry and writes it directly to the fd, updating a running CRC-32C accumulator.
-- **`HintFile::OpenForRead(path) -> HintFile`** — reads the entire file into an in-memory buffer via a single `pread`, verifies the file-level CRC eagerly, and closes the fd.
+- **`HintFile::OpenForRead(path) -> HintFile`** — reads the whole file once in chunks, verifies the file-level CRC and records where each unit starts, and keeps the fd open for its scanners (see *HintFile I/O model*).
 
 Write API:
 - **`append(sequence, entry_type, file_offset, key, value_size) -> void`**: Serializes one hint entry and writes it to the fd. Only `Put` and `Delete` are valid entry types; passing `BulkBegin` or `BulkEnd` is a programming error.
 - **`close() -> void`**: Writes the 4-byte CRC-32C trailer, calls `fdatasync()`, and closes the fd. If the HintFile is destroyed without calling `close()`, the fd is closed without writing the CRC — the `.hint.tmp` file is cleaned up on next startup.
 
 Read API:
-- **`make_scanner() -> Scanner`**: Returns a forward-only scanner. `HintEntry.key` is a `span<const byte>` into the backing buffer — valid for the lifetime of the `HintFile`.
+- **`make_scanner() -> Scanner`**: Returns a forward-only scanner. `HintEntry.key` is a `span<const byte>` into the scanner's decoded unit — valid until its next `next()` or `seek()`.
 
 `HintEntry` is a plain struct holding `{uint64_t sequence, EntryType entry_type, uint64_t file_offset, std::span<const std::byte> key, uint32_t value_size}`.
 

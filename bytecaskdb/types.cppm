@@ -33,6 +33,8 @@ export enum class Mode { Leader, Follower };
 export enum class IoBackend {
   Pread,      // pread(2) per read. Default — no virtual address space pressure.
   Mmap,       // sealed files memory-mapped; zero-copy reads, unbounded page cache.
+              // A read the kernel cannot complete (EIO) is SIGBUS, not an
+              // exception.
   BufferPool, // sealed files served from a bounded, engine-owned cache.
 };
 

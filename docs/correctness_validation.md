@@ -349,6 +349,21 @@ And one on the read side, for the scan `resume()` runs:
     `resume()` must rethrow it rather than read it as the end of the file
     and truncate; `[degraded][resume]` holds it to that.
 
+And one on the hint read, which recovery used to take through a memory
+mapping — where a failed read is a `SIGBUS`, not an error (#237):
+
+15. `io_hint_read` — before each `pread()` of a hint file, in the pass that
+    opens and verifies it and in every scan. `FaultInjector::fail_on_nth_match`
+    fails only the Nth read, so the rebuild that follows reads cleanly. A
+    failure in the open pass must rebuild the hint and recover every key; one
+    in a scan must fail the open with `std::system_error` and cost nothing on
+    the next. The `[model]` many-frames test fails reads 1–150 in turn and
+    checks each against the serial baseline, file stats included, and
+    `DB::open rebuilds a hint file a read fails on` checks both outcomes
+    directly. Both run at `recovery_threads = 1` on the B+ tree paths: the
+    injector is thread-local, and the radix path builds on worker threads
+    even at one.
+
 ### Orphaned BulkBegin degrade
 
 If a multi-entry batch fails mid-write after `BulkBegin`, the engine
