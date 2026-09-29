@@ -230,12 +230,23 @@ An 8-byte prefix is not enough: on the plugin's keys every slot of a table ties.
 
 #### State and publication
 
-The key directory becomes a wrapper, `BufferedKeyDir`, selected with
-`BYTECASK_KEYDIR=buffered` exactly as `btree` and `radix` are: it provides the
-`KeyDirTree` / `KeyDirTransient` types and its own `kd_*` functions in
-`internals.cppm`, the key directory's interface. **The engine is agnostic to
-the strategy**: buffering, freezing, merging, installing and backpressure all
-happen inside the key directory, and no engine code changes.
+The key directory becomes a wrapper tree, `BufferedBlindBTree`, that
+implements the blind tree's interface — the same member operations as
+`PersistentBlindBTree` / `TransientBlindBTree` (`get`, `upsert`, `erase`,
+`holds`, `replace_at`, `erase_at`, `lower_bound`, the iterators, `count`,
+`size`, `transient` / `persistent`). `BYTECASK_KEYDIR=buffered` selects it by
+pointing the `KeyDirTree` / `KeyDirTransient` / `KeyDirIter` aliases in
+`internals.cppm` at it, exactly as `btree` and `radix` select theirs.
+
+**The `kd_*` functions do not change.** They are the engine's helpers over a
+key directory's interface — extension methods, in C# terms — and know nothing
+of which tree provides it: the blind build's `kd_*` call the buffered tree
+exactly as they call the blind one. Buffering, freezing, merging, installing
+and backpressure all live in the tree type. No engine code and no `kd_*`
+changes. As part of this work, `internals.cppm` documents that contract on the
+`kd_*` functions and states it as a C++20 concept the blind `kd_*` require, so
+a tree that lacks an operation fails to compile rather than being worked
+around in a helper.
 
 - A published version is **(tree version T, frozen buffer F or none, active
   buffer A with its published slot count per partition)**. F is immutable. A
@@ -279,6 +290,9 @@ testing-only switch to force a merge or wait for one, so merges can be placed
 at chosen points.
 
 #### What reads do
+
+What each operation of the tree's interface does (the `kd_*` helper that
+reaches it is named for orientation; the helper itself is unchanged):
 
 | Operation | With the buffers |
 |---|---|
