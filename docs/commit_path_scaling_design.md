@@ -194,12 +194,16 @@ measured end to end, it loses everywhere:
 | Local, sysbench `oltp_read_write`, 16 / 32 threads | 7,584 / 8,358 tps | 7,496 / 8,192 |
 
 It does what it set out to: `commit_probe` at 16 threads, serial µs per
-commit 41.4 → 33.4. But reads pay for it (`engine_bench` `Get` 231 → 266 ns,
-`Range50` 2.6 → 4.4 µs: every lookup checks the buffers, and a range seek
-scans them), and under load the merger falls behind and commits wait for it.
-On the box Phase 1 left 55% of the CPU idle — the case this was designed
-for — and the buffer still lost 12.5%. Reopen only with a design that
-removes the read-side overhead first (#233). The design below is kept as
+commit 41.4 → 33.4. On the dev box it loses because the merger competes with
+the workers for 16 cores. On the 48-vCPU box the capture shows the loss is
+**merger backpressure**, not reads. Commits waited 10 µs each for the single
+frozen buffer's merge (562 stalls/s), even though the merger used only 62%
+of a core. Excluding that wait, the serial section ran at 34.3 µs/commit
+against Phase 1's 39.0, and the workers left 55% of the CPU idle. The first
+step when resuming is to remove the stalls: queue a second frozen buffer, or
+enlarge the buffer. Without stalls, the estimate is ~+13% commits/s over
+Phase 1; the read-side overheads (#233) come after. The data and the steps
+are in #234. The design below is kept as
 the record of what was built.
 
 Measured after Phase 1 was planned; ahead of Phase 2 in priority. The
