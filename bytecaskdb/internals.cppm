@@ -384,6 +384,17 @@ export inline auto kd_erase_at(KeyDirTransient &, std::span<const std::byte>,
 }
 // What a put or an erase of the entry `at` displaced.
 export inline auto kd_hit(const KeyDirEntry &at) -> KeyDirHit { return at; }
+// Undo for a plan applied with its checks folded into the descents (blind
+// key directory only; see TransientEngineState::apply_puts_checked). The
+// keyed trees never take that path.
+export inline auto kd_restore(KeyDirTransient &, std::span<const std::byte>,
+                              const KeyDirEntry &, const KeyDirHit &) -> bool {
+  return false;
+}
+export inline auto kd_remove(KeyDirTransient &, std::span<const std::byte>,
+                             const KeyDirEntry &) -> bool {
+  return false;
+}
 export template <typename T>
 auto kd_lower_bound(const T &t, std::span<const std::byte> key,
                     const KeyDirCtx &) {
@@ -760,6 +771,20 @@ export inline auto kd_erase_at(KeyDirTransient &t,
 // What a put or an erase of the entry `at` displaced: `at`'s own record.
 export inline auto kd_hit(const KeyDirEntry &at) -> KeyDirHit {
   return {to_blind_ref(at), at.value_size()};
+}
+// Undo for a plan applied with its checks folded into the descents (see
+// TransientEngineState::apply_puts_checked), by location, reading nothing:
+// puts back the record `was` where the key now points at `now`, or removes
+// the key where it points at `now`. False if the key does not point at
+// `now` — which the undo never expects.
+export inline auto kd_restore(KeyDirTransient &t, std::span<const std::byte> key,
+                              const KeyDirEntry &now, const KeyDirHit &was)
+    -> bool {
+  return t.replace_at(key, to_blind_ref(now), was.ref);
+}
+export inline auto kd_remove(KeyDirTransient &t, std::span<const std::byte> key,
+                             const KeyDirEntry &now) -> bool {
+  return t.erase_at(key, to_blind_ref(now));
 }
 export template <typename T>
 auto kd_lower_bound(const T &t, std::span<const std::byte> key,
