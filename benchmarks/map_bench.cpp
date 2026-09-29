@@ -1408,7 +1408,43 @@ auto small_range(const SmallBuffer &buf, std::span<const std::byte> lo_k,
   } else
 #endif
 #if defined(__AVX2__)
-  if (variant != 2) {
+  if (variant == 6) {
+    // Lean: one branch-free pass builds the inside and tie bitmaps for every
+    // slot, then the set bits are walked.
+    std::array<std::uint64_t, kSmallMax / 64> in_bits{}, tie_bits{};
+    const auto vLh = _mm256_set1_epi64x(Lh), vHh = _mm256_set1_epi64x(Hh);
+    const auto vLl = _mm256_set1_epi64x(Ll), vHl = _mm256_set1_epi64x(Hl);
+    const auto groups = (buf.n + 3) / 4;  // slots past n are zero: never inside a real range
+    for (std::size_t g = 0; g < groups; ++g) {
+      const auto i = g * 4;
+      const auto h = _mm256_load_si256(reinterpret_cast<const __m256i *>(&buf.hi[i]));
+      const auto l = _mm256_load_si256(reinterpret_cast<const __m256i *>(&buf.lo[i]));
+      const auto h_eq_lo = _mm256_cmpeq_epi64(h, vLh), h_eq_hi = _mm256_cmpeq_epi64(h, vHh);
+      const auto gt_lo = _mm256_or_si256(_mm256_cmpgt_epi64(h, vLh),
+                                         _mm256_and_si256(h_eq_lo, _mm256_cmpgt_epi64(l, vLl)));
+      const auto eq_lo = _mm256_and_si256(h_eq_lo, _mm256_cmpeq_epi64(l, vLl));
+      const auto lt_hi = _mm256_or_si256(_mm256_cmpgt_epi64(vHh, h),
+                                         _mm256_and_si256(h_eq_hi, _mm256_cmpgt_epi64(vHl, l)));
+      const auto eq_hi = _mm256_and_si256(h_eq_hi, _mm256_cmpeq_epi64(l, vHl));
+      const auto inside = static_cast<std::uint64_t>(_mm256_movemask_pd(
+          _mm256_castsi256_pd(_mm256_and_si256(gt_lo, lt_hi))));
+      const auto tie = static_cast<std::uint64_t>(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_or_si256(
+          _mm256_and_si256(eq_lo, _mm256_or_si256(lt_hi, eq_hi)), _mm256_and_si256(eq_hi, gt_lo)))));
+      in_bits[i / 64] |= inside << (i % 64);
+      tie_bits[i / 64] |= (tie & ~inside) << (i % 64);
+    }
+    const auto words = (buf.n + 63) / 64;
+    const auto valid = [&](std::size_t w) {
+      const auto rem = buf.n - w * 64;
+      return rem >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << rem) - 1;
+    };
+    for (std::size_t w = 0; w < words; ++w) {
+      for (auto m = in_bits[w] & valid(w); m != 0; m &= m - 1)
+        out.push_back(static_cast<std::uint32_t>(w * 64 + static_cast<std::size_t>(std::countr_zero(m))));
+      for (auto m = tie_bits[w] & valid(w); m != 0; m &= m - 1)
+        verify(w * 64 + static_cast<std::size_t>(std::countr_zero(m)));
+    }
+  } else if (variant != 2) {
     const auto vLh = _mm256_set1_epi64x(Lh), vHh = _mm256_set1_epi64x(Hh);
     const auto vLl = _mm256_set1_epi64x(two_words ? Ll : 0), vHl = _mm256_set1_epi64x(two_words ? Hl : 0);
     std::size_t i = 0;
@@ -1458,12 +1494,15 @@ void BM_SmallRange50(benchmark::State &state) {
   const auto &b = small_base(keyset);
   const auto flat = filled_small(keyset, size);
   PartitionedBuffer parted{size};
-  if (variant == 5) fill_buffer(parted, keyset, size);
+  const bool partitioned = variant == 5 || variant == 7;
+  if (partitioned) fill_buffer(parted, keyset, size);
   // variant 5: the partitioned buffer, filtered with AVX2 like variant 1.
   const auto buffer_for = [&](std::span<const std::byte> k) -> const SmallBuffer & {
-    return variant == 5 ? parted.parts[index_partition(k)] : flat;
+    return partitioned ? parted.parts[index_partition(k)] : flat;
   };
-  const int filter = variant == 5 ? 1 : variant;
+  // 5: partitioned + AVX2 (variant 1's loop); 6: flat + lean loop;
+  // 7: partitioned + lean loop.
+  const int filter = variant == 5 ? 1 : variant == 7 ? 6 : variant;
   std::mt19937_64 rng{5};
   std::vector<std::uint32_t> in_range;
   in_range.reserve(kSmallMax);
@@ -1522,7 +1561,41 @@ BENCHMARK(BM_SmallRange50)->Name("SmallBuf/Range50")->ArgNames({"variant", "size
     ->Args({0, 512, 0})->Args({1, 256, 0})->Args({1, 512, 0})->Args({1, 1024, 0})->Args({2, 512, 0})->Args({3, 512, 0})
     ->Args({0, 512, 1})->Args({1, 256, 1})->Args({1, 512, 1})->Args({1, 1024, 1})->Args({2, 512, 1})->Args({3, 512, 1})
     ->Args({4, 256, 0})->Args({4, 512, 0})->Args({4, 1024, 0})->Args({4, 256, 1})->Args({4, 512, 1})->Args({4, 1024, 1})
-    ->Args({0, 512, 2})->Args({1, 512, 2})->Args({5, 512, 2})->Args({1, 1024, 2})->Args({5, 1024, 2});
+    ->Args({0, 512, 2})->Args({1, 512, 2})->Args({5, 512, 2})->Args({1, 1024, 2})->Args({5, 1024, 2})
+    ->Args({6, 512, 2})->Args({7, 512, 2})->Args({6, 1024, 2})->Args({7, 1024, 2})
+    ->Args({6, 512, 0})->Args({6, 512, 1});
+
+
+// Merger: fold one full buffer (the TPROC-C mix of keyset 2) into the
+// TPROC-C base tree in one transient, then publish. range(1) = 1 sorts the
+// buffer's slots by key first (timed: the merger has to). The double-buffer
+// scheme needs this to finish before the other buffer fills: at the box's
+// ~16-25K commits/s of ~20 writes, a 512-slot buffer fills in ~1-1.6 ms.
+void BM_SmallMerge(benchmark::State &state) {
+  const auto size = static_cast<std::size_t>(state.range(0));
+  const bool sorted = state.range(1) != 0;
+  const auto &b = small_base(1);
+  const auto keys = mixed_keys(size);
+  const auto buf = [&] {
+    SmallBuffer sb{size};
+    for (const auto &k : keys) sb.put(to_bytes(k.s), k.ref);
+    return sb;
+  }();
+  std::vector<std::uint32_t> order(size);
+  for (auto _ : state) {
+    for (std::uint32_t i = 0; i < size; ++i) order[i] = i;
+    if (sorted)
+      std::ranges::sort(order, [&](std::uint32_t a, std::uint32_t c) {
+        return std::ranges::lexicographical_compare(buf.key(a), buf.key(c));
+      });
+    auto tr = b.tree.transient();
+    for (const auto i : order) tr.set(buf.key(i), buf.ref[i], bench_resolver());
+    benchmark::DoNotOptimize(std::move(tr).persistent());
+  }
+  state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(size));
+}
+BENCHMARK(BM_SmallMerge)->Name("SmallBuf/Merge")->ArgNames({"size", "sorted"})
+    ->Args({256, 0})->Args({256, 1})->Args({512, 0})->Args({512, 1})->Unit(benchmark::kMicrosecond);
 
 } // namespace
 
