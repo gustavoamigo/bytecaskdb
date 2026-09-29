@@ -558,42 +558,51 @@ public:
     const auto t0 = std::chrono::steady_clock::now();
     auto tr = base.transient();
     buffered_detail::Overlay<R> ov{res, overlay};
-    struct Span {
+    // Per key: its oldest and newest slot. Applied in key order across the
+    // whole buffer, so consecutive keys walk the same path and leaf.
+    struct Entry {
+      buffered_detail::Bytes key;
+      std::uint32_t part;
       std::uint32_t oldest;
       std::uint32_t newest;
     };
-    std::unordered_map<std::string_view, Span> keys;
+    std::vector<Entry> entries;
+    entries.reserve(frozen.total);
+    std::unordered_map<std::string_view, std::size_t> index;
     std::int64_t slots = 0;
     std::int64_t by_location = 0;
     for (std::size_t p = 0; p < buffered_detail::kPartitions; ++p) {
-      keys.clear();
-      const auto &part = frozen.buf->parts[p];
+      index.clear();
       for (std::uint32_t i = 0; i < frozen.counts[p]; ++i) {
         const auto k = frozen.buf->key(p, i);
-        const auto [it, fresh] =
-            keys.try_emplace(std::string_view{reinterpret_cast<const char *>(k.data()), k.size()},
-                             Span{i, i});
-        if (!fresh) it->second.newest = i;
+        const auto [it, fresh] = index.try_emplace(
+            std::string_view{reinterpret_cast<const char *>(k.data()), k.size()}, entries.size());
+        if (fresh)
+          entries.push_back({k, static_cast<std::uint32_t>(p), i, i});
+        else
+          entries[it->second].newest = i;
       }
       slots += frozen.counts[p];
-      for (const auto &[key, span] : keys) {
-        const buffered_detail::Bytes k{reinterpret_cast<const std::byte *>(key.data()),
-                                       key.size()};
-        const auto ref = part.ref[span.newest];
-        const auto held = part.old[span.oldest];  // what base holds for the key
-        if (!buffered_detail::is_none(held)) {
-          const bool done = buffered_detail::is_none(ref) ? tr.erase_at(k, held)
-                                                          : tr.replace_at(k, held, ref);
-          if (done) {
-            ++by_location;
-            continue;
-          }
+    }
+    std::ranges::sort(entries, [](const Entry &a, const Entry &b) {
+      return buffered_detail::compare(a.key, b.key) < 0;
+    });
+    for (const auto &e : entries) {
+      const auto &part = frozen.buf->parts[e.part];
+      const auto ref = part.ref[e.newest];
+      const auto held = part.old[e.oldest];  // what base holds for the key
+      if (!buffered_detail::is_none(held)) {
+        const bool done = buffered_detail::is_none(ref) ? tr.erase_at(e.key, held)
+                                                        : tr.replace_at(e.key, held, ref);
+        if (done) {
+          ++by_location;
+          continue;
         }
-        if (buffered_detail::is_none(ref))
-          (void)tr.erase(k, ov);
-        else
-          tr.set(k, ref, ov);
       }
+      if (buffered_detail::is_none(ref))
+        (void)tr.erase(e.key, ov);
+      else
+        tr.set(e.key, ref, ov);
     }
     auto merged = std::move(tr).persistent();
     merges_.fetch_add(1, std::memory_order_relaxed);
