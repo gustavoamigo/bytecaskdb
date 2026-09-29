@@ -8,6 +8,10 @@
 #include <algorithm>
 #include <benchmark/benchmark.h>
 #include <bit>
+#include <cstring>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include <cstdlib>
 #include <functional>
 #include <optional>
@@ -1083,6 +1087,327 @@ BENCHMARK(BM_BufMerge)->Name("BufBlind/Merge")->ArgNames({"d", "sorted", "update
 BENCHMARK(BM_BufGet)->Name("BufBlind/Get")->ArgName("d")->Arg(0)->Arg(1000)->Arg(10000)->Arg(100000);
 BENCHMARK(BM_BufRange50)->Name("BufBlind/Range50")->ArgNames({"d", "sorted"})
     ->Args({0, 0})->Args({1000, 0})->Args({10000, 0})->Args({1000, 1})->Args({10000, 1})->Args({100000, 1});
+
+
+// ===========================================================================
+// PROTOTYPE — a small unordered buffer (fixed capacity, e.g. 512 slots) in
+// front of the blind tree. Structure of arrays: a 16-bit fingerprint per slot
+// for point lookups (a SIMD scan, as a blind leaf does), a 16-byte big-endian
+// key prefix per slot for range filtering, the record location, and the key's
+// bytes in a small arena for exact checks. Unsorted: a put is an append, and
+// a read takes the newest matching slot.
+//
+// A range scan takes two passes over the buffer. Pass 1 compares every
+// slot's prefix with the range's two bounds (AVX2, four 64-bit lanes per
+// instruction): a slot is definitely inside, definitely outside, or
+// undecided because its prefix equals a bound's. Pass 2 compares the full
+// key of the undecided slots only. The survivors are sorted and would be
+// merged into the tree's iterator.
+// ===========================================================================
+
+constexpr std::size_t kSmallMax = 1024;
+
+auto be64(const std::byte *p, std::size_t n) -> std::uint64_t {  // big-endian, zero-padded
+  std::uint64_t v = 0;
+  for (std::size_t i = 0; i < 8; ++i)
+    v = (v << 8) | (i < n ? std::to_integer<std::uint64_t>(p[i]) : 0);
+  return v;
+}
+constexpr std::uint64_t kSign = 0x8000'0000'0000'0000ULL;  // unsigned -> signed order
+
+struct SmallBuffer {
+  std::size_t cap;
+  std::size_t n = 0;
+  alignas(32) std::array<std::uint16_t, kSmallMax> fp{};
+  alignas(32) std::array<std::int64_t, kSmallMax> hi{};  // prefix bytes 0-7, sign-flipped
+  alignas(32) std::array<std::int64_t, kSmallMax> lo{};  // prefix bytes 8-15, sign-flipped
+  std::array<bytecask::BlindRef, kSmallMax> ref{};
+  std::array<std::uint32_t, kSmallMax> key_off{};
+  std::array<std::uint16_t, kSmallMax> key_len{};
+  std::vector<std::byte> arena;
+
+  explicit SmallBuffer(std::size_t c) : cap(c) { arena.reserve(c * 64); }
+  void clear() { n = 0; arena.clear(); }
+  [[nodiscard]] auto full() const { return n == cap; }
+  [[nodiscard]] auto key(std::size_t i) const -> std::span<const std::byte> {
+    return {arena.data() + key_off[i], key_len[i]};
+  }
+  static auto fingerprint(std::span<const std::byte> k) -> std::uint16_t {
+    return static_cast<std::uint16_t>(key_hash(k) >> 48) | 1u;  // never 0
+  }
+  void put(std::span<const std::byte> k, bytecask::BlindRef r) {
+    fp[n] = fingerprint(k);
+    hi[n] = static_cast<std::int64_t>(be64(k.data(), k.size()) ^ kSign);
+    lo[n] = static_cast<std::int64_t>(
+        (k.size() > 8 ? be64(k.data() + 8, k.size() - 8) : 0) ^ kSign);
+    ref[n] = r;
+    key_off[n] = static_cast<std::uint32_t>(arena.size());
+    key_len[n] = static_cast<std::uint16_t>(k.size());
+    arena.insert(arena.end(), k.begin(), k.end());
+    ++n;
+  }
+  // Newest slot holding k: a fingerprint scan from the newest end.
+  [[nodiscard]] auto find(std::span<const std::byte> k) const -> std::optional<bytecask::BlindRef> {
+    const auto f = fingerprint(k);
+#if defined(__AVX2__)
+    const auto want = _mm256_set1_epi16(static_cast<short>(f));
+    for (std::size_t base = (n + 15) / 16 * 16; base > 0;) {
+      base -= 16;
+      auto m = static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi16(
+          _mm256_load_si256(reinterpret_cast<const __m256i *>(&fp[base])), want)));
+      while (m != 0) {
+        const auto bit = 31 - std::countl_zero(m);  // newest first
+        const auto i = base + static_cast<std::size_t>(bit / 2);
+        m &= ~(3u << (bit & ~1));
+        if (i < n && std::ranges::equal(key(i), k)) return ref[i];
+      }
+    }
+#else
+    for (auto i = n; i-- > 0;)
+      if (fp[i] == f && std::ranges::equal(key(i), k)) return ref[i];
+#endif
+    return std::nullopt;
+  }
+};
+
+// Keys shaped like the MariaDB plugin's for a TPROC-C order line: table id
+// (4 bytes), index id (2), then the primary key big-endian — warehouse (4),
+// district (1), order (4), line (1). An 8-byte prefix reaches only the top
+// two bytes of the warehouse id, which are zero: every key of the table ties.
+auto tpcc_key(std::uint32_t w, std::uint8_t d, std::uint32_t o, std::uint8_t l) -> std::string {
+  std::string k(16, '\0');
+  const auto put32 = [&](std::size_t at, std::uint32_t v) {
+    for (int i = 0; i < 4; ++i) k[at + static_cast<std::size_t>(i)] = static_cast<char>(v >> (24 - 8 * i));
+  };
+  put32(0, 7);
+  k[4] = 0; k[5] = 1;
+  put32(6, w);
+  k[10] = static_cast<char>(d);
+  put32(11, o);
+  k[15] = static_cast<char>(l);
+  return k;
+}
+auto tpcc_keys(std::size_t n, std::uint32_t first_order) -> std::vector<std::string> {
+  std::vector<std::string> keys;
+  keys.reserve(n);
+  for (std::uint32_t o = first_order; keys.size() < n; ++o)
+    for (std::uint32_t w = 1; w <= 96 && keys.size() < n; ++w)
+      for (std::uint8_t d = 1; d <= 10 && keys.size() < n; ++d)
+        for (std::uint8_t l = 1; l <= 10 && keys.size() < n; ++l)
+          keys.push_back(tpcc_key(w, d, o, l));
+  return keys;
+}
+
+struct SmallBase {
+  std::vector<BlindA::key_type> keys;
+  BlindTree tree;
+};
+// keyset 0: uniform keys (the shared 1M-key base); 1: TPROC-C-shaped keys.
+auto small_base(int keyset) -> const SmallBase & {
+  static auto *uniform = [] {
+    auto *p = new SmallBase;
+    p->keys = buf_base().keys;
+    p->tree = buf_base().tree;
+    return p;
+  }();
+  static auto *tpcc = [] {
+    auto *p = new SmallBase;
+    p->keys = BlindA::make_keys(tpcc_keys(kBufBase, 1));
+    p->tree = BlindA::transient_build(p->keys);
+    return p;
+  }();
+  return keyset == 0 ? *uniform : *tpcc;
+}
+// A buffer of `size` recent writes: new keys (for TPROC-C, the next orders)
+// and updates of existing ones, alternating.
+auto filled_small(int keyset, std::size_t size) -> SmallBuffer {
+  const auto &b = small_base(keyset);
+  SmallBuffer buf{size};
+  std::mt19937_64 rng{11};
+  std::size_t next = 2'000'000'000;
+  const auto fresh = keyset == 0 ? fresh_keys(size, next)
+                                 : BlindA::make_keys(tpcc_keys(size, 1'000'000));
+  for (std::size_t i = 0; i < size; ++i) {
+    const auto &k = i % 2 == 0 ? b.keys[rng() % b.keys.size()] : fresh[i];
+    buf.put(to_bytes(k.s), k.ref);
+  }
+  return buf;
+}
+
+// Writer: a batch of 100 new keys into the buffer. mode 0: append. mode 1:
+// look the key up first (what a put that dedupes, or a check against the
+// buffer, would pay).
+void BM_SmallWrite(benchmark::State &state) {
+  const auto mode = state.range(0);
+  SmallBuffer buf{512};
+  std::size_t next = 0;
+  constexpr std::size_t kBatch = 100;
+  for (auto _ : state) {
+    state.PauseTiming();
+    const auto batch = fresh_keys(kBatch, next);
+    if (buf.n + kBatch > buf.cap) buf.clear();
+    state.ResumeTiming();
+    for (const auto &k : batch) {
+      const auto key = to_bytes(k.s);
+      if (mode == 1) benchmark::DoNotOptimize(buf.find(key));
+      buf.put(key, k.ref);
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(kBatch));
+}
+
+// Point reads of existing keys with a full buffer (size) in front of the
+// tree; size 0 is the tree alone.
+void BM_SmallGet(benchmark::State &state) {
+  const auto size = static_cast<std::size_t>(state.range(0));
+  const auto keyset = static_cast<int>(state.range(1));
+  const auto &b = small_base(keyset);
+  const auto buf = filled_small(keyset, std::max<std::size_t>(size, 1));
+  std::mt19937_64 rng{3};
+  for (auto _ : state) {
+    const auto &k = b.keys[rng() % b.keys.size()];
+    const auto key = to_bytes(k.s);
+    if (size > 0) {
+      if (auto hit = buf.find(key)) {
+        benchmark::DoNotOptimize(hit);
+        continue;
+      }
+    }
+    benchmark::DoNotOptimize(b.tree.get(key, bench_resolver()));
+  }
+}
+
+// Pass 1 + pass 2 over the buffer for the key range [lo, hi]. variant 1:
+// AVX2 on 16-byte prefixes; 2: the same comparisons, scalar; 3: AVX2 on the
+// 8-byte prefix only. Returns the slots in range, sorted by key.
+auto small_range(const SmallBuffer &buf, std::span<const std::byte> lo_k,
+                 std::span<const std::byte> hi_k, int variant,
+                 std::vector<std::uint32_t> &out, std::size_t &undecided) -> void {
+  out.clear();
+  undecided = 0;
+  const auto Lh = static_cast<std::int64_t>(be64(lo_k.data(), lo_k.size()) ^ kSign);
+  const auto Ll = static_cast<std::int64_t>((lo_k.size() > 8 ? be64(lo_k.data() + 8, lo_k.size() - 8) : 0) ^ kSign);
+  const auto Hh = static_cast<std::int64_t>(be64(hi_k.data(), hi_k.size()) ^ kSign);
+  const auto Hl = static_cast<std::int64_t>((hi_k.size() > 8 ? be64(hi_k.data() + 8, hi_k.size() - 8) : 0) ^ kSign);
+  const bool two_words = variant != 3;
+  const auto verify = [&](std::size_t i) {
+    ++undecided;
+    const auto k = buf.key(i);
+    if (std::ranges::lexicographical_compare(k, lo_k)) return;
+    if (std::ranges::lexicographical_compare(hi_k, k)) return;
+    out.push_back(static_cast<std::uint32_t>(i));
+  };
+  const auto classify_scalar = [&](std::size_t i) {
+    const auto h = buf.hi[i];
+    const auto l = two_words ? buf.lo[i] : 0;
+    const auto lo_l = two_words ? Ll : 0;
+    const auto hi_l = two_words ? Hl : 0;
+    const bool gt_lo = h > Lh || (h == Lh && l > lo_l);
+    const bool eq_lo = h == Lh && l == lo_l;
+    const bool lt_hi = h < Hh || (h == Hh && l < hi_l);
+    const bool eq_hi = h == Hh && l == hi_l;
+    if (gt_lo && lt_hi) out.push_back(static_cast<std::uint32_t>(i));
+    else if ((eq_lo && (lt_hi || eq_hi)) || (eq_hi && gt_lo)) verify(i);
+  };
+#if defined(__AVX2__)
+  if (variant != 2) {
+    const auto vLh = _mm256_set1_epi64x(Lh), vHh = _mm256_set1_epi64x(Hh);
+    const auto vLl = _mm256_set1_epi64x(two_words ? Ll : 0), vHl = _mm256_set1_epi64x(two_words ? Hl : 0);
+    std::size_t i = 0;
+    for (; i + 4 <= buf.n; i += 4) {
+      const auto h = _mm256_load_si256(reinterpret_cast<const __m256i *>(&buf.hi[i]));
+      const auto l = two_words ? _mm256_load_si256(reinterpret_cast<const __m256i *>(&buf.lo[i]))
+                               : _mm256_setzero_si256();
+      const auto h_eq_lo = _mm256_cmpeq_epi64(h, vLh), h_eq_hi = _mm256_cmpeq_epi64(h, vHh);
+      const auto gt_lo = _mm256_or_si256(_mm256_cmpgt_epi64(h, vLh),
+                                         _mm256_and_si256(h_eq_lo, _mm256_cmpgt_epi64(l, vLl)));
+      const auto eq_lo = _mm256_and_si256(h_eq_lo, _mm256_cmpeq_epi64(l, vLl));
+      const auto lt_hi = _mm256_or_si256(_mm256_cmpgt_epi64(vHh, h),
+                                         _mm256_and_si256(h_eq_hi, _mm256_cmpgt_epi64(vHl, l)));
+      const auto eq_hi = _mm256_and_si256(h_eq_hi, _mm256_cmpeq_epi64(l, vHl));
+      const auto inside = static_cast<unsigned>(_mm256_movemask_pd(
+          _mm256_castsi256_pd(_mm256_and_si256(gt_lo, lt_hi))));
+      const auto tie = static_cast<unsigned>(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_or_si256(
+          _mm256_and_si256(eq_lo, _mm256_or_si256(lt_hi, eq_hi)), _mm256_and_si256(eq_hi, gt_lo)))));
+      for (auto m = inside; m != 0; m &= m - 1)
+        out.push_back(static_cast<std::uint32_t>(i + static_cast<std::size_t>(std::countr_zero(m))));
+      for (auto m = tie & ~inside; m != 0; m &= m - 1)
+        verify(i + static_cast<std::size_t>(std::countr_zero(m)));
+    }
+    for (; i < buf.n; ++i) classify_scalar(i);
+  } else
+#endif
+  {
+    for (std::size_t i = 0; i < buf.n; ++i) classify_scalar(i);
+  }
+  std::ranges::sort(out, [&](std::uint32_t a, std::uint32_t b) {
+    return std::ranges::lexicographical_compare(buf.key(a), buf.key(b));
+  });
+}
+
+// A 50-key tree scan plus the buffer's entries in the same range.
+// variant 0: the tree alone. keyset 0: uniform keys; 1: TPROC-C-shaped.
+void BM_SmallRange50(benchmark::State &state) {
+  const auto variant = static_cast<int>(state.range(0));
+  const auto size = static_cast<std::size_t>(state.range(1));
+  const auto keyset = static_cast<int>(state.range(2));
+  const auto &b = small_base(keyset);
+  const auto buf = filled_small(keyset, size);
+  std::mt19937_64 rng{5};
+  std::vector<std::uint32_t> in_range;
+  in_range.reserve(kSmallMax);
+  std::string last;
+  std::int64_t undecided_total = 0;
+  if (variant != 0) {  // the filter must return exactly the brute-force answer
+    std::mt19937_64 check_rng{99};
+    for (int c = 0; c < 200; ++c) {
+      const auto &s0 = b.keys[check_rng() % b.keys.size()];
+      const auto &s1 = b.keys[check_rng() % b.keys.size()];
+      const auto lo = std::min(s0.s, s1.s), hi = std::max(s0.s, s1.s);
+      std::size_t und = 0;
+      small_range(buf, to_bytes(lo), to_bytes(hi), variant, in_range, und);
+      std::vector<std::uint32_t> brute;
+      for (std::size_t i = 0; i < buf.n; ++i) {
+        const auto k = buf.key(i);
+        if (!std::ranges::lexicographical_compare(k, to_bytes(lo)) &&
+            !std::ranges::lexicographical_compare(to_bytes(hi), k))
+          brute.push_back(static_cast<std::uint32_t>(i));
+      }
+      auto got = in_range;
+      std::ranges::sort(got);
+      if (got != brute) {
+        state.SkipWithError("two-pass range filter disagrees with brute force");
+        return;
+      }
+    }
+  }
+  for (auto _ : state) {
+    const auto &start = b.keys[rng() % b.keys.size()];
+    auto it = b.tree.lower_bound(to_bytes(start.s), bench_resolver());
+    std::uint64_t sum = 0;
+    for (int i = 0; i < 50 && it != std::default_sentinel; ++i, ++it) {
+      const auto k = it.key(bench_resolver());
+      sum += (*it).offset + k.size();
+      if (i == 49) last.assign(reinterpret_cast<const char *>(k.data()), k.size());
+    }
+    if (variant != 0) {
+      std::size_t undecided = 0;
+      small_range(buf, to_bytes(start.s), to_bytes(last), variant, in_range, undecided);
+      sum += in_range.size();
+      undecided_total += static_cast<std::int64_t>(undecided);
+    }
+    benchmark::DoNotOptimize(sum);
+  }
+  state.counters["undecided_per_scan"] = benchmark::Counter(
+      static_cast<double>(undecided_total), benchmark::Counter::kAvgIterations);
+}
+
+BENCHMARK(BM_SmallWrite)->Name("SmallBuf/Write")->ArgName("lookup_first")->Arg(0)->Arg(1);
+BENCHMARK(BM_SmallGet)->Name("SmallBuf/Get")->ArgNames({"size", "tpcc"})
+    ->Args({0, 0})->Args({512, 0})->Args({0, 1})->Args({512, 1})->Args({1024, 1});
+BENCHMARK(BM_SmallRange50)->Name("SmallBuf/Range50")->ArgNames({"variant", "size", "tpcc"})
+    ->Args({0, 512, 0})->Args({1, 256, 0})->Args({1, 512, 0})->Args({1, 1024, 0})->Args({2, 512, 0})->Args({3, 512, 0})
+    ->Args({0, 512, 1})->Args({1, 256, 1})->Args({1, 512, 1})->Args({1, 1024, 1})->Args({2, 512, 1})->Args({3, 512, 1});
 
 } // namespace
 
