@@ -324,7 +324,9 @@ The first runs, each within minutes, found the bugs listed in
 #236 and #237. Until they are fixed, a full run fails within tens of lives.
 `--disable power,fsync_eio,writeback_fail,evict` runs past #231, `meta_eio` past
 #236 and `read_eio` past #237. With all of those left out, runs of 15 minutes
-(over 400 lives and 950,000 checked writes) pass.
+(over 400 lives and 950,000 checked writes) pass. `chaos-nightly.yml` leaves
+them out by default (`KNOWN_BUGS`), so the nightly can find new bugs; each
+entry goes when its issue is fixed.
 
 ## Not covered
 

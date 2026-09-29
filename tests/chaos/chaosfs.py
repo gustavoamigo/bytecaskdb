@@ -828,7 +828,16 @@ def make_fuse_ops(model: ChaosModel):
         def access(self, path, amode):
             return 0
 
-    return ChaosFuse(), fuse
+    class HandleFUSE(fuse.FUSE):
+        # mfusepy's libfuse3 truncate drops the file handle, and with nopath
+        # an ftruncate comes without a path: pass the handle through.
+        def truncate_fuse_3(self, path, length, fip):
+            fh = fip.contents.fh if fip else None
+            return self.operations.truncate(
+                None if path is None else path.decode(self.encoding, self.errors),
+                length, fh)
+
+    return ChaosFuse(), HandleFUSE
 
 
 def serve_control(model: ChaosModel, sock_path: str):
@@ -890,12 +899,12 @@ def main() -> int:
 
     model = ChaosModel(args.seed)
     serve_control(model, args.control)
-    ops, fuse = make_fuse_ops(model)
+    ops, fuse_class = make_fuse_ops(model)
     # direct_io: every read and write reaches the model, so the model is the
     # page cache. Zero timeouts: after a crash the kernel must not answer
     # from cached names or sizes. hard_remove: an unlinked open file keeps
     # working through its handle instead of being renamed to .fuse_hidden.
-    fuse.FUSE(ops, args.mountpoint, foreground=True, nothreads=False,
+    fuse_class(ops, args.mountpoint, foreground=True, nothreads=False,
               direct_io=True, hard_remove=True, attr_timeout=0,
               entry_timeout=0, negative_timeout=0, auto_unmount=True,
               fsname="chaosfs")

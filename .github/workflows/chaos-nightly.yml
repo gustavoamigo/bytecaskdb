@@ -25,7 +25,7 @@ on:
         description: "Seed to replay (empty = the run id)"
         default: ""
       disable:
-        description: "Comma-separated hazards to leave out (see run_chaos.py --help)"
+        description: "Hazards to leave out, comma-separated (see run_chaos.py --help); empty = the known bugs below, none = nothing"
         default: ""
   pull_request:
     branches: [main]
@@ -48,6 +48,13 @@ jobs:
       BYTECASK_MARCH: x86-64-v3
       XMAKE_ROOT: "y"
       CLANG_TARGET_TRIPLE: x86_64-redhat-linux-gnu
+      # Hazards that reach a known open bug, left out so the run can find new
+      # ones. Remove each when its issue is fixed.
+      #   power, fsync_eio, writeback_fail, evict: #231 (durable hint over
+      #     non-durable data; the database stops opening after power loss)
+      #   meta_eio: #236 (stale logical end after a failed ftruncate)
+      #   read_eio: #237 (SIGBUS on a hint read error during open)
+      KNOWN_BUGS: power,fsync_eio,writeback_fail,evict,meta_eio,read_eio
     strategy:
       fail-fast: false
       matrix:
@@ -105,6 +112,8 @@ jobs:
         run: |
           ARGS="--worker build/linux/x86_64/${{ matrix.mode }}/chaos_worker"
           ARGS="$ARGS --minutes $MINUTES --seed $SEED --max-life-s ${{ matrix.max_life_s }}"
+          if [ -z "$DISABLE" ]; then DISABLE="$KNOWN_BUGS"; fi
+          if [ "$DISABLE" = "none" ]; then DISABLE=""; fi
           if [ -n "${{ matrix.sanitizer }}" ]; then DISABLE="${DISABLE:+$DISABLE,}rlimit_as"; fi
           ARGS="$ARGS --work $RUNNER_TEMP/chaos"
           if [ -n "$DISABLE" ]; then ARGS="$ARGS --disable $DISABLE"; fi
