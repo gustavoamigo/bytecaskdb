@@ -182,7 +182,25 @@ result of the apply.
   have answered this investigation's first question at once.
 - Issue #221: a short `pwrite` reports a stale `errno`.
 
-### Phase 1b: a buffered key directory
+### Phase 1b: a buffered key directory — parked
+
+**Status: parked.** Implemented on `perf/buffered-keydir` (#234, parked) and
+measured end to end, it loses everywhere:
+
+| | Phase 1 | buffered |
+|---|---|---|
+| Box, c8id.12xlarge, TPROC-C 96 wh / 48 VUs, NVMe, `--capture` | 669,157 NOPM | 585,723 (−12.5%) |
+| Local, TPROC-C 16 wh / 16 VUs, RAM disk (mean of 2) | 251,919 | 240,669 (−4.5%) |
+| Local, sysbench `oltp_read_write`, 16 / 32 threads | 7,584 / 8,358 tps | 7,496 / 8,192 |
+
+It does what it set out to: `commit_probe` at 16 threads, serial µs per
+commit 41.4 → 33.4. But reads pay for it (`engine_bench` `Get` 231 → 266 ns,
+`Range50` 2.6 → 4.4 µs: every lookup checks the buffers, and a range seek
+scans them), and under load the merger falls behind and commits wait for it.
+On the box Phase 1 left 55% of the CPU idle — the case this was designed
+for — and the buffer still lost 12.5%. Reopen only with a design that
+removes the read-side overhead first (#233). The design below is kept as
+the record of what was built.
 
 Measured after Phase 1 was planned; ahead of Phase 2 in priority. The
 prototype and every number here are on branch `exp/buffered-keydir`
@@ -334,7 +352,7 @@ key directory, in one session.
   two-read bound.
 - A second concurrency protocol in the engine, next to the commit pipeline.
 
-### Phase 2: the append out of the serial section (epic, after 1b)
+### Phase 2: the append out of the serial section (epic)
 
 On branch `epic/append-pipeline`, kept alive until measurements and tests say
 whether it comes in.
