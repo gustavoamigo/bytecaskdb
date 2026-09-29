@@ -648,6 +648,16 @@ struct WritableFileOps {
 
   [[nodiscard]] auto size() const noexcept -> Offset { return logical_end(); }
 
+  // See WritableDataFile::truncate.
+  void truncate(Offset new_size) {
+    if (::ftruncate(fd_, narrow<off_t>(new_size)) != 0) {
+      throw std::system_error{errno, std::system_category(),
+                              "WritableFileOps::truncate: ftruncate failed"};
+    }
+    set_logical_end(new_size);
+    zeroed_end_ = new_size;
+  }
+
   // Keeps the file zero-filled ahead of the write cursor: before an append
   // ends at write_end, zeros are written from zeroed_end_ up to the next
   // kZeroFillChunkBytes boundary, never past capacity_ (an oversize entry
@@ -900,12 +910,7 @@ public:
   // mmap_end_ moves down — every published offset lies below new_size by
   // construction, and anything at or past it now takes the pread path.
   void truncate(Offset new_size) override {
-    if (::ftruncate(ops_.fd_, narrow<off_t>(new_size)) != 0) {
-      throw std::system_error{errno, std::system_category(),
-                              "WritableMmapDataFile::truncate"};
-    }
-    ops_.set_logical_end(new_size);
-    ops_.zeroed_end_ = new_size;
+    ops_.truncate(new_size);
     set_mmap_end(new_size);
   }
 
@@ -1167,14 +1172,7 @@ public:
     return ops_.size();
   }
 
-  void truncate(Offset new_size) override {
-    if (::ftruncate(ops_.fd_, narrow<off_t>(new_size)) != 0) {
-      throw std::system_error{errno, std::system_category(),
-                              "WritablePosixFile::truncate"};
-    }
-    ops_.set_logical_end(new_size);
-    ops_.zeroed_end_ = new_size;
-  }
+  void truncate(Offset new_size) override { ops_.truncate(new_size); }
 
   void shrink_to_fit() override { ops_.shrink_to_fit(); }
 
@@ -2017,12 +2015,12 @@ private:
 // is read back and every chunk written to the offset it came from — write()
 // dirties a page even when its bytes do not change — and then synced: what
 // was read is what the device holds, and a scan after this sees only that.
-// Whole file, at most max_file_bytes; nothing records which bytes an earlier
-// process or a failed flush left undurable. Throws std::system_error on any
-// I/O failure, leaving the file's contents as they were.
-export void rewrite_durably(const std::filesystem::path &path) {
+// Covers [0, end), at most max_file_bytes: nothing records which bytes an
+// earlier process or a failed flush left undurable. Throws std::system_error
+// on any I/O failure, leaving the file's contents as they were.
+export void rewrite_durably(const std::filesystem::path &path, Offset end) {
   const RewriteFd f{path};
-  const auto size = std::filesystem::file_size(path);
+  const auto size = std::min<std::uintmax_t>(end, std::filesystem::file_size(path));
   static constexpr std::size_t kChunk = 1024 * 1024;
   std::vector<std::byte> buf(
       static_cast<std::size_t>(std::min<std::uintmax_t>(kChunk, size)));

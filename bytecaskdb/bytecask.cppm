@@ -4096,8 +4096,10 @@ void DB::resume() {
   // the last successful sync, sync=false writes included, reads back from
   // the cache and is not on the device, and file.sync() below would find
   // nothing to write. Rewriting the file and syncing it makes what reads
-  // return durable before the scan reads it (throws → stays degraded).
-  rewrite_durably(file.path());
+  // return durable before the scan reads it (throws → stays degraded). Up to
+  // the logical end, where the scan stops: past it lie only the zero-filled
+  // preallocation and the bytes of an append that failed.
+  rewrite_durably(file.path(), file.size());
 
   // Scan the active file to find the last valid committed offset
   // and collect valid committed entries for key_dir replay. Entries written to
@@ -4744,7 +4746,8 @@ auto DB::recovery_prepare_files(EngineState &s)
     // outlive them at a power loss, and point into zeros. So they are made
     // durable before anything reads them — every hint-less file, since none
     // of them says which one was active.
-    if (hintless) rewrite_durably(p);
+    // No writer says where its entries end, so the whole file.
+    if (hintless) rewrite_durably(p, std::filesystem::file_size(p));
     auto data_file =
         openDataFileForRead(p, io_backend_, pool_, file_id);
 

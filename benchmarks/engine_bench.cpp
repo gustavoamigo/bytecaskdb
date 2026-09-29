@@ -33,12 +33,15 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <array>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <memory>
 #include <numeric>
 #include <optional>
 #include <random>
+#include <set>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -1530,6 +1533,67 @@ void BM_RecoveryParallel(benchmark::State &state) {
   state.counters["num_keys"] = static_cast<double>(kDatasetSize);
 }
 
+namespace {
+// The sequence in a data file's first header: files are written in its order.
+auto first_sequence(const std::filesystem::path &p) -> std::uint64_t {
+  std::array<char, 8> b{};
+  std::ifstream f{p, std::ios::binary};
+  f.read(b.data(), std::ssize(b));
+  std::uint64_t v = 0;
+  for (auto i = b.size(); i-- > 0;)
+    v = (v << 8) | static_cast<unsigned char>(b[i]);
+  return v;
+}
+} // namespace
+
+// Open after a crash, from a cold page cache: the file that was active has no
+// hint, so open writes it back in place and syncs it (#231), then indexes it.
+// A clean close writes that hint, so the setup removes it. Each iteration
+// restores the directory to that state: the one hint-less file, and none of
+// the files later opens created.
+void BM_OpenHintless(benchmark::State &state) {
+  TmpDir dir{"open_hintless"};
+  {
+    auto db = bytecask::DB::open(dir.path);
+    static constexpr std::size_t kBatch = 100;
+    static const std::vector<std::byte> val(32, std::byte{0x42});
+    for (std::size_t i = 0; i < kDatasetSize; i += kBatch) {
+      bytecask::WritePlan plan;
+      for (std::size_t j = i; j < std::min(i + kBatch, kDatasetSize); ++j) {
+        char buf[64];
+        plan.put(make_key(buf, sizeof(buf), "user::", j), bc_val(val));
+      }
+      (void)db.apply_batch({.sync = false}, std::move(plan));
+    }
+  }
+  std::filesystem::path hintless;
+  for (const auto &e : std::filesystem::directory_iterator{dir.path})
+    if (e.path().extension() == ".data" &&
+        (hintless.empty() || first_sequence(e.path()) > first_sequence(hintless)))
+      hintless = e.path();
+  auto hint = hintless;
+  std::filesystem::remove(hint.replace_extension(".hint"));
+  std::set<std::filesystem::path> crashed;
+  for (const auto &e : std::filesystem::directory_iterator{dir.path})
+    crashed.insert(e.path());
+  const auto restore = [&] {
+    for (const auto &e : std::filesystem::directory_iterator{dir.path})
+      if (!crashed.contains(e.path())) std::filesystem::remove(e.path());
+    evict_from_page_cache(dir.path);
+  };
+
+  restore();
+  for (auto _ : state) {
+    { auto db = bytecask::DB::open(dir.path); }
+    state.PauseTiming();
+    restore();
+    state.ResumeTiming();
+  }
+  state.counters["hintless_bytes"] =
+      static_cast<double>(std::filesystem::file_size(hintless));
+  state.counters["num_keys"] = static_cast<double>(kDatasetSize);
+}
+
 // ===========================================================================
 // Registration
 // clang-format off
@@ -1639,6 +1703,9 @@ BENCH(BM_RecoveryParallel)->Name("ByteCaskDB/Recovery")->ArgName("threads")->Arg
 BENCH(BM_RecoveryParallel)->Name("ByteCaskDB/Recovery")->ArgName("threads")->Arg(4) ->Unit(benchmark::kSecond);
 BENCH(BM_RecoveryParallel)->Name("ByteCaskDB/Recovery")->ArgName("threads")->Arg(8) ->Unit(benchmark::kSecond);
 BENCH(BM_RecoveryParallel)->Name("ByteCaskDB/Recovery")->ArgName("threads")->Arg(16)->Unit(benchmark::kSecond);
+#endif
+BENCH(BM_OpenHintless)->Name("ByteCaskDB/OpenHintless")->Unit(benchmark::kMillisecond);
+#ifndef BENCH_NO_MT
 
 // -- Multithreaded Threaded Tests (LevelDb excluded as it's not optimized for this use case) --
 // --- Multithreaded Get (pure read throughput under concurrency) ---

@@ -6250,6 +6250,9 @@ TEST_CASE("resume() makes durable what it publishes after a failed fdatasync",
         // under the durable watermark.
         db.put({.sync = true}, to_bytes("later"), to_bytes("x"));
       }
+      // The clean close synced everything else; the failed sync's pages
+      // are what a rewrite has to have written.
+      CHECK(cache.model.undurable_pages() == 0);
       cache.model.restore_device(dir);  // power cut
 
       auto db = bytecask::DB::open(dir, opts);
@@ -6287,7 +6290,8 @@ TEST_CASE("resume() refuses when a failed fdatasync's pages were evicted, and "
         CHECK(db.is_degraded());
       }
       // A degraded close leaves the active file hint-less, so the reopen
-      // scans it and truncates at the lost bytes.
+      // rewrites it, scans it and truncates at the lost bytes.
+      REQUIRE_FALSE(has_hint(active_data_file(dir)));
       auto db = bytecask::DB::open(dir, opts);
       CHECK(get_str(db, to_bytes(fsyncgate_key(0))) == fsyncgate_value(0));
       for (int i = 1; i <= kUnsyncedPuts; ++i) {
@@ -6320,6 +6324,7 @@ TEST_CASE("open makes a hint-less file durable before it indexes it: close "
     check_all_present(db);
     db.put({.sync = true}, to_bytes("later"), to_bytes("x"));
   }
+  CHECK(cache.model.undurable_pages() == 0);
   cache.model.restore_device(dir);  // power cut
 
   auto db = bytecask::DB::open(dir);
@@ -6358,6 +6363,7 @@ TEST_CASE("open makes a hint-less file durable before it indexes it: a "
     check_all_present(db);
     db.put({.sync = true}, to_bytes("later"), to_bytes("x"));
   }
+  CHECK(cache.model.undurable_pages() == 0);
   cache.model.restore_device(dir);  // power cut
 
   auto db = bytecask::DB::open(dir);
@@ -6365,6 +6371,61 @@ TEST_CASE("open makes a hint-less file durable before it indexes it: a "
   CHECK(get_str(db, to_bytes("later")) == "x");
 }
 #endif
+
+namespace {
+
+auto read_file(const std::filesystem::path &p) -> std::vector<char> {
+  std::ifstream f{p, std::ios::binary};
+  return {std::istreambuf_iterator<char>{f}, std::istreambuf_iterator<char>{}};
+}
+
+}  // namespace
+
+TEST_CASE("resume() stays degraded when its rewrite's fdatasync fails, and "
+          "leaves the file as it was",
+          "[degraded][resume][fsyncgate]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+  put_unsynced(db);
+  (void)degrade_with_unsynced_batch(db, dir);
+  const auto active = active_data_file(dir);
+  const auto before = read_file(active);
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_rewrite_sync"};
+    REQUIRE_THROWS_AS(db.resume(), std::system_error);
+  }
+  CHECK(db.is_degraded());
+  CHECK(read_file(active) == before);
+
+  REQUIRE_NOTHROW(db.resume());
+  check_all_present(db);
+  CHECK(get_str(db, to_bytes("b1")) == "bv1");
+}
+
+TEST_CASE("open fails when the rewrite of a hint-less file cannot be synced, "
+          "and writes no hint for it",
+          "[recovery][fsyncgate]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+    put_unsynced(db);
+  }
+  // A crash's shape: the active file has no hint.
+  const auto active = active_data_file(dir);
+  auto hint = active;
+  hint.replace_extension(".hint");
+  REQUIRE(std::filesystem::remove(hint));
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_rewrite_sync"};
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir), std::system_error);
+  }
+  CHECK_FALSE(has_hint(active));
+
+  auto db = bytecask::DB::open(dir);
+  check_all_present(db);
+}
 
 TEST_CASE("a clean close writes the active file's hint",
           "[recovery][fsyncgate]") {
