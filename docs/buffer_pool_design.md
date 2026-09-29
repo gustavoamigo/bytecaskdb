@@ -85,6 +85,12 @@ This gives read-your-own-writes without a disk read or a page-cache read, warms 
 
 Residency is reliable rather than an invariant: a frame the writer cannot claim (every slot pinned, which the 2× floor makes unreachable in practice) or an append that does not start at a frame boundary of a non-resident frame stays on disk, and a read of it takes the buffered fallback inside `read_at`, which is coherent because the active file is never opened `O_DIRECT`. The test asserts zero misses across 650 read-your-own-writes plus a batch.
 
+**Frames are reserved ahead of the writer.** The append runs inside the engine's serial section, and in a full pool nearly every commit starts a new active-file frame (a TPROC-C commit appends ~3.8 KB into 4 KiB frames): an eviction walk, an erase and an insert under the pool's one mutex, which readers' fills contend for — and `publish` hands the pool one iovec per entry, so a commit took that mutex once per entry. On the 48-vCPU box at 96 warehouses the pool's share of the committer thread was ~6–11% (`sieve_victim`, `append_resident`, the mutex). A reserver thread per pool now admits the active file's next frames empty, up to a window ahead of the writer (512 frames, 2 MiB, at most 1/16 of the pool; none below 8), a chunk of 16 per hold of the mutex. The writer finds a reserved frame the way a reader finds one — probe, pin, version re-check, no mutex — and copies its bytes past the size readers are bounded by. It wakes the reserver when it comes within half a window of the frames reserved, which is once per MiB. A segment that finds no frame ready takes the locked path, as every append did before, so correctness never depends on the reserver keeping up.
+
+The one rule reservation must keep: **a frame is never reserved if any of its bytes were written before without entering the pool.** An empty frame is only right for bytes not yet written; an append that started inside a non-resident frame left its bytes on disk only, and reserving that frame would let the next append extend it while readers found stale memory before it. Every write into a non-resident frame takes the mutex, so it records there how far it reached (`unpooled_end_`), and the reserver, under the mutex, starts past it; a frame already resident is skipped. Frames reserved past the end of a file that rotates hold nothing a reader asks for; they were admitted visited and go on the hand's next pass. `bytecask.pool_frames_reserved` and `bytecask.pool_append_locked` count both paths.
+
+Measured with `commit_probe` (16 threads, tmpfs): with a 4 GiB pool that never fills, serial µs per commit 41.5 → 41.5; with a 256 MiB pool that evicts, 44.35 → 42.85 and commits/s +7.8%. `engine_bench` (1M keys) level on `Put`, `Get`, `GetMT`, `Range50`, `MixedBatch` and `Recovery`; `ReadAndWriteLoad` at 16 threads 455 → 405 ns (mean of three alternating runs).
+
 The new active file's `file_id` is reserved (`TransientEngineState::reserve_file_id`) *before* the file is created, because the writable file keys its frames by it from construction. Vacuum does the same for its compacted file under a short write barrier, which is what keeps the reservation disjoint from the ids rotation mints on the same counter; that costs vacuum a second barrier per compaction. A reserved id that goes unused leaves a gap, which is harmless: ids are monotonic within a process and reassigned at recovery.
 
 ## 6. Sealed files — `O_DIRECT`
@@ -121,7 +127,7 @@ struct BufferPoolOptions {
 };
 ```
 
-`stats()` adds `keydir_keys`, `pool_hits`, `pool_misses`, `pool_fills` (frames admitted by a read miss; the writer's inserts cost no I/O and are not counted), `pool_evictions`, `pool_frames_total`, `pool_frames_resident` and `pool_direct_io_fallbacks`. Hit ratio is the number to size against.
+`stats()` adds `keydir_keys`, `pool_hits`, `pool_misses`, `pool_fills` (frames admitted by a read miss; the writer's inserts cost no I/O and are not counted), `pool_evictions`, `pool_frames_total`, `pool_frames_resident`, `pool_direct_io_fallbacks`, `pool_frames_reserved` and `pool_append_locked` (§5). Hit ratio is the number to size against.
 
 ## 8. Measurements
 

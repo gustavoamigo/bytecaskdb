@@ -4166,6 +4166,12 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        pool ? pool->frames_resident.load(std::memory_order_relaxed) : 0},
       {"bytecask.pool_direct_io_fallbacks",
        pool ? pool->direct_io_fallbacks.load(std::memory_order_relaxed) : 0},
+      // Active-file frames admitted ahead of the writer, and append segments
+      // that found none ready and took the pool's lock.
+      {"bytecask.pool_frames_reserved",
+       pool ? pool->reserved.load(std::memory_order_relaxed) : 0},
+      {"bytecask.pool_append_locked",
+       pool ? pool->append_locked.load(std::memory_order_relaxed) : 0},
       {"bytecask.vacuum_bytes_reclaimed",
        counters_.vacuum_bytes_reclaimed.load(std::memory_order_relaxed)},
       {"bytecask.vacuum_files_unlinked",
