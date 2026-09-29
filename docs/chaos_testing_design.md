@@ -314,6 +314,11 @@ Where the first version differs from the design above, and why.
   writes of the last life that opened on top of it. When a life never opens
   and a power cut or an eviction ends it, the recovered state must be a
   prefix of those writes covering their watermark.
+- **Each life starts from what its open served.** The worker sends the whole
+  database with its `Opened` frame. Without a loss before the open, it must
+  equal the previous check's recovery; after an eviction that dropped pages,
+  a prefix of the pending writes covering their watermark. The life's
+  history is then checked from it.
 - **An eviction during a life loses data under a running engine.** Pages
   whose background writeback failed are clean but not on disk; evicting them
   drops the published, non-durable writes in them, and the engine cannot

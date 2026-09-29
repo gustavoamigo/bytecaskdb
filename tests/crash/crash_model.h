@@ -247,7 +247,8 @@ inline auto execute(bytecask::DB &db, const Op &op)
 // ---------------------------------------------------------------------------
 
 enum class FrameType : std::uint8_t {
-  Opened = 1,     // u64 durable_sequence at open, u64 keydir_keys at open
+  Opened = 1,     // u64 durable_sequence at open, u64 keydir_keys at open;
+                  // the chaos worker adds u8 has_contents and the contents
   Intent = 2,     // encoded Op, written before the call
   Commit = 3,     // u64 sequence, u8 durable
   Abort = 4,      // call returned nullopt

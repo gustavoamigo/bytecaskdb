@@ -362,10 +362,22 @@ auto run_open(bytecask::DB &db_ref, Channel &ch, const Config &cfg,
   auto *db = &db_ref;
   std::mt19937_64 rng{seed};
   {
+    // The whole database as it opened: the checker starts the life from it.
+    // A fault can fail the scan; after a few tries the frame goes without it.
+    std::optional<State> opened;
+    for (int attempt = 0; attempt < 20 && !opened; ++attempt) {
+      try {
+        opened = scan(*db);
+      } catch (const std::exception &) {
+        sleep_ms(10);
+      }
+    }
     Writer w;
     w.u8(static_cast<std::uint8_t>(FrameType::Opened));
     w.u64(db->durable_sequence());
     w.u64(static_cast<std::uint64_t>(db->stats().at("bytecask.keydir_keys")));
+    w.u8(opened ? 1 : 0);
+    if (opened) encode_state(w, *opened);
     ch.send(w);
   }
 
@@ -496,6 +508,8 @@ void store_base(const fs::path &p, const Base &b) {
 
 struct Life {
   bool opened{false};
+  // What the life's open served: the state its history starts from.
+  State start;
   std::uint64_t opened_durable{0};
   std::uint64_t opened_keys{0};
   std::optional<std::string> open_failed;
@@ -524,8 +538,8 @@ auto settled_count(std::span<const OpRecord> ops) -> std::size_t {
 }
 
 // Checks one View and settles the operations before it.
-void apply_view(Life &life, const Base &base, bool resumed,
-                std::uint64_t durable, const State &view) {
+void apply_view(Life &life, bool resumed, std::uint64_t durable,
+                const State &view) {
   using Outcome = OpRecord::Outcome;
   if (durable < life.watermark)
     throw Failure{std::format("durable_sequence went back from {} to {} "
@@ -533,8 +547,8 @@ void apply_view(Life &life, const Base &base, bool resumed,
                               life.watermark, durable)};
   PrefixResult r;
   try {
-    r = match_prefix(base.contents, life.ops, life.opened_durable,
-                     life.watermark, view);
+    r = match_prefix(life.start, life.ops, life.opened_durable, life.watermark,
+                     view);
   } catch (const Failure &f) {
     throw Failure{std::format("View {} ({}): the running database {}",
                               life.views, resumed ? "after resume()" : "after a failed write",
@@ -563,6 +577,31 @@ void apply_view(Life &life, const Base &base, bool resumed,
   if (resumed) ++life.resumed_views;
 }
 
+// The life's open must serve what the previous check recovered. After an
+// eviction that dropped pages, it may serve less: a prefix of the pending
+// writes covering their watermark, as a power cut would leave.
+void check_open(const Life &life, const Base &base, bool cache_lost,
+                bool has_contents) {
+  if (!cache_lost || !has_contents) {
+    if (life.opened_durable != base.durable ||
+        life.opened_keys != base.contents.size() ||
+        (has_contents && life.start != base.contents))
+      throw Failure{std::format(
+          "the worker's open disagrees with the previous recovery: "
+          "durable_sequence {} vs {}, keys {} vs {}{}",
+          life.opened_durable, base.durable, life.opened_keys,
+          base.contents.size(),
+          has_contents && life.start != base.contents ? ", contents differ" : "")};
+    return;
+  }
+  try {
+    (void)match_prefix(base.floor, base.pending, base.floor_seq,
+                       base.pending_watermark, life.start);
+  } catch (const Failure &f) {
+    throw Failure{std::format("after an eviction, the worker's open {}", f.what)};
+  }
+}
+
 // Fills `life` as it goes, so a failure report shows the history up to the
 // frame that failed. `cache_lost`: an eviction dropped pages whose writeback
 // had failed, while the process ran. Their published, non-durable writes are
@@ -575,12 +614,16 @@ void parse_life(std::string_view stream, const Base &base, bool cache_lost,
   for (const auto payload : split_frames(stream)) {
     Reader r{payload};
     switch (static_cast<FrameType>(r.u8())) {
-    case FrameType::Opened:
+    case FrameType::Opened: {
       life.opened = true;
       life.opened_durable = r.u64();
       life.opened_keys = r.u64();
       life.watermark = life.opened_durable;
+      const bool has_contents = r.u8() != 0;
+      life.start = has_contents ? decode_state(r) : base.contents;
+      check_open(life, base, cache_lost, has_contents);
       break;
+    }
     case FrameType::OpenFailed:
       life.open_failed = r.str();
       break;
@@ -617,7 +660,7 @@ void parse_life(std::string_view stream, const Base &base, bool cache_lost,
       const bool resumed = r.u8() != 0;
       const auto durable = r.u64();
       const auto view = decode_state(r);
-      apply_view(life, base, resumed || cache_lost, durable, view);
+      apply_view(life, resumed || cache_lost, durable, view);
       break;
     }
     case FrameType::Violation: {
@@ -678,14 +721,6 @@ auto check(const CheckOptions &o) -> int {
     if (!life.violations.empty())
       throw Failure{std::format("the worker saw {} violations; first: {}",
                                 life.violations.size(), life.violations.front())};
-    if (life.opened && (life.opened_durable != base.durable ||
-                        life.opened_keys != base.contents.size()))
-      throw Failure{std::format(
-          "the worker's open disagrees with the previous recovery: "
-          "durable_sequence {} vs {}, keys {} vs {}",
-          life.opened_durable, base.durable, life.opened_keys,
-          base.contents.size())};
-
     fs::create_directories(o.work);
     const auto recovered = recover_both(o.dir, o.work, db_options(cfg));
 
@@ -715,7 +750,7 @@ auto check(const CheckOptions &o) -> int {
         }
       }
     } else {
-      const auto r = match_prefix(base.contents, life.ops, life.opened_durable,
+      const auto r = match_prefix(life.start, life.ops, life.opened_durable,
                                   life.watermark, recovered.contents);
       applied = r.applied;
       total = r.total;
@@ -742,7 +777,7 @@ auto check(const CheckOptions &o) -> int {
     } else if (life.opened) {
       // The open made the state it started from durable; this life's own
       // writes may still be only in the page cache.
-      next.floor = base.contents;
+      next.floor = life.start;
       next.floor_seq = life.opened_durable;
       next.pending = life.ops;
       next.pending_watermark = life.watermark;
