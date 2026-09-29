@@ -166,8 +166,9 @@ end
 -- Key directory tree selection: the engine is built on the blind-leaf B+
 -- tree (docs/blind_leaf_btree_design.md), which stores no key bytes.
 -- BYTECASK_KEYDIR=btree builds it on the B+ tree that keeps its keys in the
--- leaves (docs/persistent_btree_design.md), and BYTECASK_KEYDIR=radix on the
--- radix tree; CI runs the engine suite on all three. Applies to every target
+-- leaves (docs/persistent_btree_design.md), BYTECASK_KEYDIR=radix on the
+-- radix tree, and BYTECASK_KEYDIR=buffered on the blind tree behind a write
+-- buffer; CI runs the engine suite on all four. Applies to every target
 -- so tests and benchmarks agree.
 local keydir = os.getenv("BYTECASK_KEYDIR")
 if keydir == nil or keydir == "" then
@@ -179,6 +180,10 @@ if keydir ~= "radix" then
 end
 if keydir ~= "radix" and keydir ~= "btree" then
     add_defines("BYTECASK_KEYDIR_BLIND")
+end
+if keydir == "buffered" then
+    -- The blind tree behind a write buffer (bytecaskdb/buffered_btree.cppm).
+    add_defines("BYTECASK_KEYDIR_BUFFERED")
 end
 
 local march = os.getenv("BYTECASK_MARCH") or "native"

@@ -2692,8 +2692,8 @@ void TransientEngineState::note_sync_requested(std::uint64_t seq) {
 
 auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
   auto s = std::make_shared<EngineState>();
-  s->key_dir = std::move(key_dir_).persistent();
   s->files = std::move(files_).persistent();
+  s->key_dir = kd_persistent(std::move(key_dir_), s->files);
   s->file_stats = std::move(file_stats_).persistent();
   s->active_file_id = active_file_id_;
   s->next_file_id = next_file_id_;
@@ -4113,6 +4113,16 @@ auto DB::degraded_reason() const noexcept -> std::string {
   return load_state()->degraded_reason;
 }
 
+// A key directory with a write buffer reports how long writes waited for its
+// merger (process-wide, like the node pool).
+template <typename T>
+static void add_buffer_stats(std::map<std::string, std::int64_t> &out) {
+  if constexpr (requires { T::buffer_stalls(); }) {
+    out["bytecask.keydir_buffer_stalls"] = T::buffer_stalls();
+    out["bytecask.keydir_buffer_stall_us"] = T::buffer_stall_ns() / 1000;
+  }
+}
+
 auto DB::stats() const -> std::map<std::string, std::int64_t> {
   scrape_read_caches();  // see vacuum()
   auto s = load_state();
@@ -4121,7 +4131,7 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
   std::int64_t open_files = 0;
   for (auto it = s->files.begin(); it != std::default_sentinel; ++it)
     ++open_files;
-  return {
+  std::map<std::string, std::int64_t> out{
       // What a pool has to be sized against: the key directory is resident
       // and not a cache. Multiply by the bytes/key your key shape measures
       // (scripts/run_memory_profile.py; about 50 for typical keys).
@@ -4202,6 +4212,8 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
       {"bytecask.hint_backlog", narrow<std::int64_t>(worker_.pending())},
       {"bytecask.open_files", open_files},
   };
+  add_buffer_stats<KeyDirTree>(out);
+  return out;
 }
 
 void DB::set_mode(Mode mode) {

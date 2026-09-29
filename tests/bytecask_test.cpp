@@ -9414,6 +9414,10 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.degraded",
       "bytecask.hint_backlog",
       "bytecask.open_files",
+#ifdef BYTECASK_KEYDIR_BUFFERED
+      "bytecask.keydir_buffer_stalls",
+      "bytecask.keydir_buffer_stall_us",
+#endif
   };
   for (const auto &name : expected) {
     CHECK(s.contains(name));
