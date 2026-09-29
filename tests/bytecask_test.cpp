@@ -13452,6 +13452,10 @@ namespace {
 auto fallbacks(bytecask::DB &db) -> std::int64_t {
   return db.stats().at("bytecask.write_check_fallbacks");
 }
+// Only a key directory that reads keys to place them checks plans in its
+// descents; the keyed trees check every plan in a pass of its own, so they
+// never fall back.
+constexpr std::int64_t kFallback = bytecask::kKeyDirReadsKeys ? 1 : 0;
 }  // namespace
 
 TEST_CASE("checked puts: a plan of snapshot updates and inserts commits "
@@ -13488,7 +13492,7 @@ TEST_CASE("checked puts: an update that lost its race undoes the whole plan",
   plan.put(to_bytes("n"), to_bytes("n1"));   // inserted, then undone
   plan.put(to_bytes("z"), to_bytes("z2"));   // the conflict
   CHECK_FALSE(db.apply_batch({}, std::move(plan)).has_value());
-  CHECK(fallbacks(db) == before + 1);
+  CHECK(fallbacks(db) == before + kFallback);
   CHECK(to_string(*get_val(db, to_bytes("a"))) == "a0");
   CHECK_FALSE(get_val(db, to_bytes("n")).has_value());
   CHECK(to_string(*get_val(db, to_bytes("z"))) == "z1");
@@ -13523,7 +13527,7 @@ TEST_CASE("checked puts: the same key twice in a plan falls back and commits",
   plan.put(to_bytes("new"), to_bytes("n2"));
   plan.put(to_bytes("k"), to_bytes("second"));
   REQUIRE(db.apply_batch({}, std::move(plan)).has_value());
-  CHECK(fallbacks(db) == before + 1);
+  CHECK(fallbacks(db) == before + kFallback);
   CHECK(to_string(*get_val(db, to_bytes("k"))) == "second");
   CHECK(to_string(*get_val(db, to_bytes("new"))) == "n2");
 }
@@ -13614,8 +13618,12 @@ TEST_CASE("checked puts: plans checked by their descents commit and conflict "
   snaps.clear();
   CHECK(commits > 300);
   CHECK(conflicts > 300);
-  CHECK(fallbacks(a) > 0);                 // the undo path ran
-  CHECK(fallbacks(a) < commits + conflicts);  // and so did the fused one
+  if constexpr (bytecask::kKeyDirReadsKeys) {
+    CHECK(fallbacks(a) > 0);                 // the undo path ran
+    CHECK(fallbacks(a) < commits + conflicts);  // and so did the fused one
+  } else {
+    CHECK(fallbacks(a) == 0);
+  }
   CHECK(fallbacks(b) == 0);
   REQUIRE(collect_kv(a) == collect_kv(b));
   REQUIRE(stats(a) == stats(b));
