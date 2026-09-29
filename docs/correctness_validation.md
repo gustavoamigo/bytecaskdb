@@ -317,7 +317,10 @@ Four checkpoints exist in the production code:
 Six additional checkpoints exist in `bytecask.cpp` (compiled under `BYTECASK_TESTING`):
 
 5. `io_resume_truncate` — before `file.truncate()` in `resume()` (only
-   reached when the active file has orphaned bytes to discard)
+   reached when the active file has orphaned bytes to discard). In
+   post-write mode the same name fires after the `ftruncate` in
+   `WritableFileOps::truncate` instead: a truncate that cut the file and
+   then reported an error, as ext4 can.
 6. `io_resume_sync` — before `file.sync()` in `resume()`
 7. `io_resume_file_creation` — before creating the new active `DataFile`
    in `resume()`
@@ -601,9 +604,9 @@ Each test follows the same structure:
 7. `assert_recoverable(dir, before, expected)` — validates persistence
    invariant via fresh recovery (where applicable)
 
-### resume() — 59 tests
+### resume() — 64 tests
 
-59 generated Catch2 tests (`[prove_resume]` tag) cover every valid
+64 generated Catch2 tests (`[prove_resume]` tag) cover every valid
 (DegradeShape, ResumeFailureClass) combination.
 
 Twelve degrade shapes establish a degraded DB before resume is called:
@@ -657,10 +660,15 @@ Twelve degrade shapes establish a degraded DB before resume is called:
   entry is sequence 1 — while a cold open, whose hint file does carry
   markers, said 1. All five cells failed before that filter was removed.
 
-Six resume failure classes:
+Seven resume failure classes:
 
 - **SUCCESS** — clean resume on first attempt.
 - **R1** (`io_resume_truncate`) — truncation fails, stays degraded.
+- **R1_AFTER_CUT** (`io_resume_truncate`, post-write) — the truncate cuts
+  the file and then fails (#236). Stays degraded, and every key published
+  before the degrade must still read back while it is: before the fix the
+  file's logical end stayed past the new end of file, a read's over-read
+  ran past EOF, and the degrade_C cells failed with a short read.
 - **R2** (`io_resume_sync`) — sync fails, stays degraded.
 - **R3** (`io_resume_file_creation`) — new active file creation fails.
 - **DOUBLE** — resume succeeds, then a second resume is called (no-op).
@@ -674,13 +682,14 @@ Two elimination rules apply:
    (`if (file.size() != valid_offset) { ... truncate ... }`). R1 is valid
    for the degrade_C shapes (orphaned `BulkBegin`) and for degrade_B2 and
    degrade_B3, which leave a torn and a complete-but-uncommitted entry
-   respectively — 7 combinations filtered.
+   respectively — 7 combinations filtered. R1_AFTER_CUT needs the same
+   shapes — 7 more.
 2. **R2 and CASCADE require an unsealed file.** The degrade_H shapes
    seal the active file during rotation before the fault fires, so
    `resume()` never enters the truncate/sync/seal block and the sync
    fault point is unreachable — 6 more combinations filtered.
 
-12 shapes × 6 classes = 72 minus 13 filtered = **59 tests**.
+12 shapes × 7 classes = 84 minus 20 filtered = **64 tests**.
 
 Present keys are asserted with `get`, not `contains_key`, both in-process
 and in `assert_keys_recoverable`. A truncation that cut too far leaves

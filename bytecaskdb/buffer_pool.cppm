@@ -410,20 +410,6 @@ private:
     return done >= len;
   }
 
-  static void pread_exact(int fd, std::byte *dst, std::size_t len,
-                          std::uint64_t offset) {
-    std::size_t done = 0;
-    while (done < len) {
-      const auto n = ::pread(fd, dst + done, len - done,
-                             narrow<off_t>(offset + done));
-      if (n <= 0) {
-        throw std::system_error{errno, std::generic_category(),
-                                "BufferPool: pread failed"};
-      }
-      done += static_cast<std::size_t>(n);
-    }
-  }
-
   [[nodiscard]] static constexpr auto align_up(std::size_t v,
                                                std::size_t a) noexcept
       -> std::size_t {
@@ -692,7 +678,7 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
   // An oversize entry would evict the working set to hold one value. It
   // lands in the caller's buffer, which is not aligned, so never O_DIRECT.
   if (len > oversize_limit_) {
-    pread_exact(file.buffered, dst, len, offset);
+    pread_exact(file.buffered, offset, {dst, len});
     return;
   }
 
@@ -710,8 +696,8 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
     const auto from = std::max(offset, run_start);
     const auto to = std::min<std::uint64_t>(offset + len, (b + 1) * kPoolFrameBytes);
     if (run_end <= run_start) {  // entirely past the size we were given
-      pread_exact(file.buffered, dst + (from - offset),
-                  static_cast<std::size_t>(to - from), from);
+      pread_exact(file.buffered, from,
+                  {dst + (from - offset), static_cast<std::size_t>(to - from)});
       return;
     }
     // Declared on the miss path so a hit never touches thread-local storage.
@@ -723,7 +709,7 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
     const auto run_len = static_cast<std::size_t>(run_end - run_start);
     auto *buf = scratch.ensure(align_up(run_len, kPoolFrameBytes));
     if (file.direct < 0 || !pread_direct(file.direct, buf, run_len, run_start)) {
-      pread_exact(file.buffered, buf, run_len, run_start);
+      pread_exact(file.buffered, run_start, {buf, run_len});
     }
     if (to > run_end) {
       throw std::system_error{

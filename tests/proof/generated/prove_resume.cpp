@@ -287,6 +287,63 @@ TEST_CASE("prove_resume__degrade_C__truncate_fails", "[prove_resume]") {
   assert_matches_recovery(dir, fp);
 }
 
+TEST_CASE("prove_resume__degrade_C__truncate_fails_after_cut", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::EngineFingerprint fp;
+  {
+    // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
+    // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
+    // Orphaned BulkBegin+p0+p1 remain in active file — truncation needed.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("p0"), to_bytes("new0"));
+      plan.put(to_bytes("p1"), to_bytes("new1"));
+      bytecask::testing::ScopedFaultInjector fi_degrade{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true}, std::move(plan)),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: the truncate cuts the file, then reports an error →
+    // resume() throws, stays degraded, published keys still read.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{
+          "io_resume_truncate", bytecask::testing::PostWriteMode::throw_after};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("degraded read of published key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+
+    // Phase 3: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
+    assert_consistent(db);
+
+    // resume() and a cold open read the same bytes; they must
+    // reconstruct the same engine.
+    fp = fingerprint(db);
+  }
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
+  assert_matches_recovery(dir, fp);
+}
+
 TEST_CASE("prove_resume__degrade_C__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -1255,6 +1312,65 @@ TEST_CASE("prove_resume__degrade_C_mmap__truncate_fails", "[prove_resume]") {
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove_resume__degrade_C_mmap__truncate_fails_after_cut", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::EngineFingerprint fp;
+  {
+    // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
+    // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
+    // Orphaned BulkBegin+p0+p1 remain in active file — truncation needed.
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("p0"), to_bytes("new0"));
+      plan.put(to_bytes("p1"), to_bytes("new1"));
+      bytecask::testing::ScopedFaultInjector fi_degrade{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true}, std::move(plan)),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: the truncate cuts the file, then reports an error →
+    // resume() throws, stays degraded, published keys still read.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{
+          "io_resume_truncate", bytecask::testing::PostWriteMode::throw_after};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("degraded read of published key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+
+    // Phase 3: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
+    assert_consistent(db);
+
+    // resume() and a cold open read the same bytes; they must
+    // reconstruct the same engine.
+    fp = fingerprint(db);
+  }
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_resume__degrade_C_mmap__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -1720,6 +1836,65 @@ TEST_CASE("prove_resume__degrade_C_pool__truncate_fails", "[prove_resume]") {
 #endif  // __EMSCRIPTEN__
 
 #ifndef __EMSCRIPTEN__
+TEST_CASE("prove_resume__degrade_C_pool__truncate_fails_after_cut", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::EngineFingerprint fp;
+  {
+    // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
+    // (fail_at=3 cascades: BulkEnd + isolation sync + rotation all fail).
+    // Orphaned BulkBegin+p0+p1 remain in active file — truncation needed.
+    auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      bytecask::WritePlan plan;
+      plan.put(to_bytes("p0"), to_bytes("new0"));
+      plan.put(to_bytes("p1"), to_bytes("new1"));
+      bytecask::testing::ScopedFaultInjector fi_degrade{3};
+      REQUIRE_THROWS_AS(
+          db.apply_batch({.sync = true}, std::move(plan)),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: the truncate cuts the file, then reports an error →
+    // resume() throws, stays degraded, published keys still read.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{
+          "io_resume_truncate", bytecask::testing::PostWriteMode::throw_after};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("degraded read of published key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+
+    // Phase 3: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    CHECK_FALSE(db.contains_key({}, to_bytes("p1")));
+    assert_consistent(db);
+
+    // resume() and a cold open read the same bytes; they must
+    // reconstruct the same engine.
+    fp = fingerprint(db);
+  }
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+}
+#endif  // __EMSCRIPTEN__
+
+#ifndef __EMSCRIPTEN__
 TEST_CASE("prove_resume__degrade_C_pool__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -2025,6 +2200,62 @@ TEST_CASE("prove_resume__degrade_B2__truncate_fails", "[prove_resume]") {
   assert_matches_recovery(dir, fp);
 }
 
+TEST_CASE("prove_resume__degrade_B2__truncate_fails_after_cut", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::EngineFingerprint fp;
+  {
+    // Establish degrade_B2: k0 committed; p0's writev returns short,
+    // leaving a torn trailing entry whose CRC cannot hold. This is the
+    // one on-disk state that is genuinely malformed rather than merely
+    // orphaned — resume()'s scan stops on it.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi_degrade{
+          "io_data_file_append_partial", PW::short_write, 5};
+      REQUIRE_THROWS_AS(
+          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: the truncate cuts the file, then reports an error →
+    // resume() throws, stays degraded, published keys still read.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{
+          "io_resume_truncate", bytecask::testing::PostWriteMode::throw_after};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("degraded read of published key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+
+    // Phase 3: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+
+    // resume() and a cold open read the same bytes; they must
+    // reconstruct the same engine.
+    fp = fingerprint(db);
+  }
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
+  assert_matches_recovery(dir, fp);
+}
+
 TEST_CASE("prove_resume__degrade_B2__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
@@ -2297,6 +2528,62 @@ TEST_CASE("prove_resume__degrade_B3__truncate_fails", "[prove_resume]") {
       REQUIRE_THROWS_AS(db.resume(), std::system_error);
     }
     REQUIRE(db.is_degraded());
+
+    // Phase 3: clean resume → clears degraded flag.
+    REQUIRE_NOTHROW(db.resume());
+    REQUIRE_FALSE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("resumed value for key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
+    CHECK_FALSE(db.contains_key({}, to_bytes("p0")));
+    assert_consistent(db);
+
+    // resume() and a cold open read the same bytes; they must
+    // reconstruct the same engine.
+    fp = fingerprint(db);
+  }
+  assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
+  assert_matches_recovery(dir, fp);
+}
+
+TEST_CASE("prove_resume__degrade_B3__truncate_fails_after_cut", "[prove_resume]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::EngineFingerprint fp;
+  {
+    // Establish degrade_B3: k0 committed; p0's writev wrote every byte
+    // and then returned an error. The entry is structurally complete on
+    // disk, but offset_ never advanced, so it sits past the file's
+    // committed offset.
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v0"));
+    {
+      using PW = bytecask::testing::PostWriteMode;
+      bytecask::testing::ScopedFaultInjector fi_degrade{
+          "io_data_file_append_partial", PW::throw_after};
+      REQUIRE_THROWS_AS(
+          db.put({.sync = true}, to_bytes("p0"), to_bytes("new0")),
+          std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+
+    // Phase 2: the truncate cuts the file, then reports an error →
+    // resume() throws, stays degraded, published keys still read.
+    {
+      bytecask::testing::ScopedFaultInjector fi_resume{
+          "io_resume_truncate", bytecask::testing::PostWriteMode::throw_after};
+      REQUIRE_THROWS_AS(db.resume(), std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+    {
+      bytecask::Bytes out;
+      INFO("degraded read of published key: k0");
+      CHECK(db.get({}, to_bytes("k0"), out));
+      CHECK(to_string(out) == "v0");
+    }
 
     // Phase 3: clean resume → clears degraded flag.
     REQUIRE_NOTHROW(db.resume());

@@ -374,18 +374,27 @@ constexpr auto bytes_below(Offset offset, std::size_t len, Offset end) noexcept
              : static_cast<std::size_t>(std::min<Offset>(len, end - offset));
 }
 
-// Reads exactly len bytes at offset; a short read is an error.
-void pread_exact(int fd, Offset offset, std::size_t len, std::byte *dst) {
-  std::size_t done = 0;
-  while (done < len) {
-    const auto n =
-        ::pread(fd, dst + done, len - done, narrow<off_t>(offset + done));
-    if (n <= 0) {
-      throw std::system_error{errno, std::generic_category(),
-                              "bytecask: pread failed"};
-    }
-    done += static_cast<std::size_t>(n);
+// The unverified read of the entry at offset: over-reads by a key budget so
+// the header and body take one pread, and only a longer key pays for a
+// second. Leaves the whole entry, from its header, at the front of io_buf and
+// returns the header. The over-read may run past the end of the file; only
+// the entry's own bytes have to be there.
+auto read_speculative(int fd, Offset offset, std::uint32_t value_size,
+                      std::vector<std::byte> &io_buf) -> EntryHeader {
+  static constexpr std::size_t kKeyBudget = 256;
+  io_buf.resize(kHeaderSize + kKeyBudget + value_size + kCrcSize);
+  const auto got = pread_upto(fd, offset, io_buf);  // short only at EOF
+  if (got < kHeaderSize) throw_short_read(offset, kHeaderSize, got);
+  const auto hdr = bytecask::read_header(
+      std::span<const std::byte>{io_buf.data(), kHeaderSize});
+  const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
+  if (total > io_buf.size()) {
+    io_buf.resize(total);
+    pread_exact(fd, offset + got, std::span{io_buf}.subspan(got));
+  } else if (total > got) {
+    throw_short_read(offset, total, got);
   }
+  return hdr;
 }
 
 // pread(2) back-end. Stateless: every publish() call compiles away.
@@ -398,7 +407,7 @@ export struct PreadIo {
 
   void fetch(int fd, Offset offset, std::size_t len, Offset /*logical_end*/,
              std::byte *dst) const {
-    pread_exact(fd, offset, len, dst);
+    pread_exact(fd, offset, {dst, len});
   }
 
   // Nothing resident to lend or assign from: the file's read methods copy.
@@ -648,14 +657,26 @@ struct WritableFileOps {
 
   [[nodiscard]] auto size() const noexcept -> Offset { return logical_end(); }
 
-  // See WritableDataFile::truncate.
+  // See WritableDataFile::truncate. The logical end comes down before the
+  // file does: ftruncate can fail after cutting (ext4 sets the new size, then
+  // reports the error of freeing the blocks), and a logical end left past
+  // the real end sends readers' over-reads past EOF (#236). Only bytes no
+  // reader needs lie past new_size, so lowering first is safe, and if the
+  // cut then fails the bytes past the lowered end are garbage either way.
+  // A reader that loaded the old end before the store can still over-read
+  // past EOF once the cut lands (#246).
   void truncate(Offset new_size) {
+    assert(new_size <= logical_end());
+    set_logical_end(new_size);
+    zeroed_end_ = new_size;
     if (::ftruncate(fd_, narrow<off_t>(new_size)) != 0) {
       throw std::system_error{errno, std::system_category(),
                               "WritableFileOps::truncate: ftruncate failed"};
     }
-    set_logical_end(new_size);
-    zeroed_end_ = new_size;
+#ifdef BYTECASK_TESTING
+    // An ftruncate that cut the file and then reported an error.
+    FAULT_INJECTION_POST_WRITE(io_resume_truncate, fd_, new_size, 0);
+#endif
   }
 
   // Keeps the file zero-filled ahead of the write cursor: before an append
@@ -734,7 +755,7 @@ struct WritableFileOps {
     FAULT_INJECTION(io_data_file_scan);
 #endif
     const auto n = bytes_below(offset, dst.size(), logical_end());
-    pread_exact(fd_, offset, n, dst.data());
+    pread_exact(fd_, offset, dst.first(n));
     return n;
   }
 
@@ -824,12 +845,7 @@ public:
         out.assign(base, base + value_size);
       } else {
         out.resize(value_size);
-        if (::pread(ops_.fd_, out.data(), value_size,
-                    narrow<off_t>(val_offset)) != narrow<ssize_t>(value_size)) {
-          throw std::system_error{
-              errno, std::generic_category(),
-              "WritableMmapDataFile::read_value: pread failed"};
-        }
+        pread_exact(ops_.fd_, val_offset, out);
       }
     }
   }
@@ -862,7 +878,7 @@ public:
     return fetch_record(path(), offset, value_size_hint, ops_.logical_end(), verify,
                         io_buf, [this](Offset at, std::size_t len,
                                        std::byte *dst) {
-                          pread_exact(ops_.fd_, at, len, dst);
+                          pread_exact(ops_.fd_, at, {dst, len});
                         });
   }
 
@@ -883,12 +899,7 @@ public:
       };
     }
     io_buf.resize(body_size);
-    if (::pread(ops_.fd_, io_buf.data(), body_size,
-                narrow<off_t>(offset + kHeaderSize)) !=
-        narrow<ssize_t>(body_size)) {
-      throw std::system_error{errno, std::generic_category(),
-                              "WritableMmapDataFile::read_entry_unverified: pread failed"};
-    }
+    pread_exact(ops_.fd_, offset + kHeaderSize, io_buf);
     std::span<const std::byte> body{io_buf};
     return DataEntryView{
         .sequence = hdr.sequence,
@@ -909,9 +920,11 @@ public:
   // spans out until the next operator++). The mapping is left alone and only
   // mmap_end_ moves down — every published offset lies below new_size by
   // construction, and anything at or past it now takes the pread path.
+  // Lowered before the file is cut, like the logical end, so an ftruncate
+  // that cuts and then fails cannot leave mapped pages past EOF readable.
   void truncate(Offset new_size) override {
-    ops_.truncate(new_size);
     set_mmap_end(new_size);
+    ops_.truncate(new_size);
   }
 
   // Like truncate(), this never touches the mapping — see the class comment.
@@ -977,11 +990,7 @@ private:
           std::span{mmap_base_ + offset, kHeaderSize});
     }
     std::array<std::byte, kHeaderSize> hdr{};
-    if (::pread(ops_.fd_, hdr.data(), kHeaderSize, narrow<off_t>(offset)) !=
-        std::ssize(hdr)) {
-      throw std::system_error{errno, std::generic_category(),
-                              "WritableMmapDataFile::read_header: pread failed"};
-    }
+    pread_exact(ops_.fd_, offset, hdr);
     return bytecask::read_header(std::span{hdr});
   }
 
@@ -1001,11 +1010,7 @@ private:
       };
     }
     io_buf.resize(total);
-    if (::pread(ops_.fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
-        narrow<ssize_t>(total)) {
-      throw std::system_error{errno, std::generic_category(),
-                              "WritableMmapDataFile::read_entry: pread failed"};
-    }
+    pread_exact(ops_.fd_, offset, io_buf);
     std::span<const std::byte> raw = io_buf;
     const auto header = parse_header_and_verify(raw);
     auto body = raw.subspan(kHeaderSize);
@@ -1142,26 +1147,7 @@ public:
     } else {
       // A syscall per read, so over-read by a key budget and fuse the header
       // and the body into one pread. Only a longer key pays for a second.
-      static constexpr std::size_t kKeyBudget = 256;
-      const auto speculative_total = kHeaderSize + kKeyBudget + value_size + kCrcSize;
-      io_buf.resize(speculative_total);
-      auto bytes_read = ::pread(ops_.fd_, io_buf.data(), speculative_total,
-                               narrow<off_t>(offset));
-      if (bytes_read < narrow<ssize_t>(kHeaderSize)) {
-        throw std::system_error{errno, std::generic_category(),
-                                "WritablePosixFile::read_entry_unverified: pread failed"};
-      }
-      auto hdr = bytecask::read_header(
-          std::span<const std::byte>{io_buf.data(), kHeaderSize});
-      const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
-      if (total > speculative_total) {
-        io_buf.resize(total);
-        if (::pread(ops_.fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
-            narrow<ssize_t>(total)) {
-          throw std::system_error{errno, std::generic_category(),
-                                  "WritablePosixFile::read_entry_unverified: pread failed"};
-        }
-      }
+      const auto hdr = read_speculative(ops_.fd_, offset, value_size, io_buf);
       return view_of(hdr, value_size, io_buf);
     }
   }
@@ -1278,7 +1264,7 @@ public:
   [[nodiscard]] auto read_raw(Offset offset, std::span<std::byte> dst) const
       -> std::size_t override {
     const auto n = bytes_below(offset, dst.size(), file_size_);
-    pread_exact(fd_, offset, n, dst.data());
+    pread_exact(fd_, offset, dst.first(n));
     return n;
   }
 
@@ -1292,12 +1278,7 @@ public:
     } else {
       const auto val_offset = offset + kHeaderSize + key_size;
       out.resize(value_size);
-      if (::pread(fd_, out.data(), value_size,
-                  narrow<off_t>(val_offset)) != narrow<ssize_t>(value_size)) {
-        throw std::system_error{
-            errno, std::generic_category(),
-            "ReadOnlyPosixDataFile::read_value: pread failed"};
-      }
+      pread_exact(fd_, val_offset, out);
     }
   }
 
@@ -1317,7 +1298,7 @@ public:
       return fetch_record(path(), offset, value_size_hint, file_size_, verify,
                           io_buf,
                           [this](Offset at, std::size_t len, std::byte *dst) {
-                            pread_exact(fd_, at, len, dst);
+                            pread_exact(fd_, at, {dst, len});
                           });
     };
 #ifdef BYTECASK_TESTING
@@ -1330,26 +1311,7 @@ public:
   [[nodiscard]] auto read_entry_unverified(
       Offset offset, std::uint32_t value_size,
       std::vector<std::byte> &io_buf) const -> DataEntryView override {
-    static constexpr std::size_t kKeyBudget = 256;
-    const auto speculative_total = kHeaderSize + kKeyBudget + value_size + kCrcSize;
-    io_buf.resize(speculative_total);
-    auto bytes_read = ::pread(fd_, io_buf.data(), speculative_total,
-                             narrow<off_t>(offset));
-    if (bytes_read < narrow<ssize_t>(kHeaderSize)) {
-      throw std::system_error{errno, std::generic_category(),
-                              "ReadOnlyPosixDataFile::read_entry_unverified: pread failed"};
-    }
-    auto hdr = bytecask::read_header(
-        std::span<const std::byte>{io_buf.data(), kHeaderSize});
-    const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
-    if (total > speculative_total) {
-      io_buf.resize(total);
-      if (::pread(fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
-          narrow<ssize_t>(total)) {
-        throw std::system_error{errno, std::generic_category(),
-                                "ReadOnlyPosixDataFile::read_entry_unverified: pread failed"};
-      }
-    }
+    const auto hdr = read_speculative(fd_, offset, value_size, io_buf);
     auto body = std::span<const std::byte>{io_buf.data() + kHeaderSize,
                                            hdr.key_size + value_size};
     return DataEntryView{
@@ -1374,12 +1336,7 @@ private:
 
   [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
     std::array<std::byte, kHeaderSize> hdr{};
-    if (::pread(fd_, hdr.data(), kHeaderSize, narrow<off_t>(offset)) !=
-        std::ssize(hdr)) {
-      throw std::system_error{
-          errno, std::generic_category(),
-          "ReadOnlyPosixDataFile::read_header: pread failed"};
-    }
+    pread_exact(fd_, offset, hdr);
     return bytecask::read_header(std::span{hdr});
   }
 
@@ -1390,12 +1347,7 @@ private:
       -> DataEntryView {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
     io_buf.resize(total);
-    if (::pread(fd_, io_buf.data(), total, narrow<off_t>(offset)) !=
-        narrow<ssize_t>(total)) {
-      throw std::system_error{
-          errno, std::generic_category(),
-          "ReadOnlyPosixDataFile::read_entry: pread failed"};
-    }
+    pread_exact(fd_, offset, io_buf);
     const auto header = parse_header_and_verify(io_buf);
     auto body = std::span<const std::byte>{io_buf}.subspan(kHeaderSize);
     return DataEntryView{
@@ -1739,7 +1691,7 @@ private:
                      offset, len, file_size_, dst);
       return;
     }
-    pread_exact(fd_, offset, len, dst);
+    pread_exact(fd_, offset, {dst, len});
   }
 
   [[nodiscard]] auto read_header(Offset offset, Source source) const
@@ -2027,7 +1979,7 @@ export void rewrite_durably(const std::filesystem::path &path, Offset end) {
   for (std::uintmax_t off = 0; off < size;) {
     const auto n =
         static_cast<std::size_t>(std::min<std::uintmax_t>(kChunk, size - off));
-    pread_exact(f.fd(), off, n, buf.data());
+    pread_exact(f.fd(), off, std::span{buf}.first(n));
 #ifdef BYTECASK_TESTING
     FAULT_CACHE_WRITE(f.fd(), off, n);
 #endif

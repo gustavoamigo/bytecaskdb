@@ -4,14 +4,19 @@
 // ByteCaskDB — filesystem utilities, RNG helpers, and string formatting
 
 module;
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <crc32c/crc32c.h>
+#include <format>
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <sys/types.h>
+#include <system_error>
+#include <unistd.h>
 #include <utility>
 
 export module bytecask.util;
@@ -41,6 +46,48 @@ export [[noreturn]] inline void panic(std::string_view msg) {
   std::fputc('\n', stderr);
   std::fflush(stderr);
   std::abort();
+}
+
+// Reads from offset until dst is full or the file ends, and returns how many
+// bytes it read. Throws std::system_error when pread fails.
+export [[nodiscard]] inline auto pread_upto(int fd, std::uint64_t offset,
+                                            std::span<std::byte> dst)
+    -> std::size_t {
+  std::size_t done = 0;
+  while (done < dst.size()) {
+    const auto n = ::pread(fd, dst.data() + done, dst.size() - done,
+                           narrow<off_t>(offset + done));
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      throw std::system_error{
+          errno, std::generic_category(),
+          std::format("bytecask: pread of {} bytes at offset {} failed",
+                      dst.size(), offset)};
+    }
+    if (n == 0) break;  // end of file
+    done += static_cast<std::size_t>(n);
+  }
+  return done;
+}
+
+// A read of `wanted` bytes at offset that met the end of the file after
+// `got`. A pread that returns 0 sets no errno, so this is reported as EIO
+// saying how much of the read the file held, never as errno 0 ("Success").
+export [[noreturn]] inline void throw_short_read(std::uint64_t offset,
+                                                 std::size_t wanted,
+                                                 std::size_t got) {
+  throw std::system_error{
+      std::make_error_code(std::errc::io_error),
+      std::format("bytecask: short read: the file ends {} bytes into a read "
+                  "of {} at offset {}",
+                  got, wanted, offset)};
+}
+
+// Fills dst from offset; the file ending first is a short read.
+export inline void pread_exact(int fd, std::uint64_t offset,
+                               std::span<std::byte> dst) {
+  const auto got = pread_upto(fd, offset, dst);
+  if (got < dst.size()) throw_short_read(offset, dst.size(), got);
 }
 
 // ---------------------------------------------------------------------------
