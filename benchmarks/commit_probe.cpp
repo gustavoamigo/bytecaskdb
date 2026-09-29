@@ -174,5 +174,14 @@ auto main(int argc, char **argv) -> int {
                 delta("bytecask.keydir_buffer_stalls") / elapsed,
                 delta("bytecask.keydir_buffer_inline_merges") / elapsed,
                 committed > 0 ? delta("bytecask.keydir_buffer_stall_us") / committed : 0.0);
+  if (s1.contains("bytecask.keydir_buffer_merges")) {
+    const auto merges = delta("bytecask.keydir_buffer_merges");
+    const auto slots = delta("bytecask.keydir_buffer_merge_slots");
+    const auto merge_us = delta("bytecask.keydir_buffer_merge_us");
+    std::printf("  merger: busy=%.1f%% us/merge=%.0f ns/slot=%.0f by_location=%.1f%%\n",
+                100.0 * merge_us / (elapsed * 1e6), merges > 0 ? merge_us / merges : 0.0,
+                slots > 0 ? 1000.0 * merge_us / slots : 0.0,
+                slots > 0 ? 100.0 * delta("bytecask.keydir_buffer_merge_by_location") / slots : 0.0);
+  }
   return 0;
 }
