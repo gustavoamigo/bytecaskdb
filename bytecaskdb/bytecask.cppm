@@ -4120,6 +4120,7 @@ static void add_buffer_stats(std::map<std::string, std::int64_t> &out) {
   if constexpr (requires { T::buffer_stalls(); }) {
     out["bytecask.keydir_buffer_stalls"] = T::buffer_stalls();
     out["bytecask.keydir_buffer_stall_us"] = T::buffer_stall_ns() / 1000;
+    out["bytecask.keydir_buffer_inline_merges"] = T::buffer_inline_merges();
   }
 }
 

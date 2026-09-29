@@ -167,5 +167,12 @@ auto main(int argc, char **argv) -> int {
               batches > 0 ? writes / batches : 0.0, batches / elapsed,
               100.0 * busy_us / (elapsed * 1e6),
               writes > 0 ? busy_us / writes : 0.0);
+  // A key directory with a write buffer: how often, and how long, commits
+  // waited for its merger.
+  if (s1.contains("bytecask.keydir_buffer_stalls"))
+    std::printf("  keydir buffer: stalls/s=%.0f inline_merges/s=%.0f stall_us_per_commit=%.2f\n",
+                delta("bytecask.keydir_buffer_stalls") / elapsed,
+                delta("bytecask.keydir_buffer_inline_merges") / elapsed,
+                committed > 0 ? delta("bytecask.keydir_buffer_stall_us") / committed : 0.0);
   return 0;
 }
