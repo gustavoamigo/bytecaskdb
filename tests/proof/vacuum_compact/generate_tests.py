@@ -99,9 +99,9 @@ def gen_vacuum_call(
     opts = "{.fragmentation_threshold = 0.0}"
 
     vc4_comment = (
-        "\n    // VC4: rename succeeded — synced .data.tmp exists on disk but\n"
-        "    // vacuum_commit never ran. Old file remains in state.\n"
-        "    // assert_vacuum_recoverable confirms .data.tmp is not replayed."
+        "\n    // VC4: fails just before the rename — the copy is synced and\n"
+        "    // shrunk under .data.tmp and vacuum_commit never ran. Old file\n"
+        "    // remains in state, and vacuum removes the staging copy (#235)."
         if failure == VacuumCompactFailureClass.VC4
         else "\n    // VC5: committed, source not unlinked — the kill inside vacuum's\n"
         "    // publish window. In-memory outcome is success; on disk the source\n"
@@ -168,6 +168,8 @@ def gen_test(
     parts.append(gen_vacuum_call(fault_name, failure))
     parts.append("")
     parts.append(gen_assertions(delta))
+    # Every cell, thrown or not: no staging copy outlives the vacuum call.
+    parts.append("    CHECK(staging_data_files(dir).empty());")
     if orphan_check:
         parts.append("    orphans = unreferenced_data_files(db, dir);")
         parts.append("    REQUIRE(orphans.size() == 1);  // the uncommitted copy")
@@ -195,7 +197,8 @@ FILE_HEADER = """\
 // Correctness proof tests for vacuum_compact_file(). Each test creates a
 // DB with a sealed file, optionally injects a fault, calls vacuum(), and
 // verifies the file was correctly compacted or that the DB is clean on failure.
-// VC4 additionally verifies that an orphaned .data.tmp is not replayed on recovery.
+// Every cell checks that no .data.tmp staging copy outlives vacuum(), whether it
+// returned or threw (#235).
 // VC5 verifies that a directory holding a compacted file and its source — a kill
 // after the commit, before the unlink — recovers, with the vacuum undone.
 // VC6 (#104 M3) verifies that a copy renamed but never committed is an orphan
@@ -221,6 +224,7 @@ using bytecask::testing::unreferenced_data_files;
 using bytecask::testing::assert_vacuum_success;
 using bytecask::testing::capture_vacuum_baseline;
 using bytecask::testing::find_vacuum_target;
+using bytecask::testing::staging_data_files;
 using bytecask::testing::to_bytes;
 
 struct TempDir {

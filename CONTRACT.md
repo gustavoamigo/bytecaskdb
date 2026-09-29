@@ -448,8 +448,9 @@ If any I/O operation throws during scan, copy, sync, or rename:
 - The caller must receive the exception.
 - The old file must remain in the published state, unchanged and
   readable.
-- Any partial temporary file (`.data.tmp`) must be cleaned up on next
-  recovery or vacuum call.
+- The temporary file (`.data.tmp`) must be removed before the exception
+  propagates. A removal that fails too is left to the next recovery and
+  must not replace the original exception.
 - The DB must remain operational.
 
 If the commit step (`vacuum_commit`) fails after the new file is
