@@ -11,21 +11,26 @@
 // it through the KeyDirTree aliases. Buffering, freezing, merging, installing
 // and backpressure all happen here.
 //
-// Versions. A version is (tree T, frozen buffer F or none, active buffer A
-// with its slot count per partition). F is immutable. A is only appended to
-// past a version's counts, into arrays that never move, so a reader of a
-// version never sees a slot past its counts. A key's newest entry is in A,
-// else F, else T.
+// Versions. A version is (tree T, frozen buffers F1..Fk oldest first, k at
+// most kMaxFrozen, active buffer A with its slot count per partition). A
+// frozen buffer is immutable. A is only appended to past a version's counts,
+// into arrays that never move, so a reader of a version never sees a slot
+// past its counts. A key's newest entry is in A, else Fk, ..., else F1, else
+// T.
 //
 // The builder (TransientBufferedBlindBTree) appends every write to A and
-// never edits the tree. When A is full it freezes: A becomes F and a fresh
-// buffer becomes A. F reaches the merger when the version holding it is
-// published, together with what the merger needs to read records (the
-// source, RS). The merger builds T' = T + F; a builder made later from a
-// version (T, F, A) starts from (T', none, A), which holds the same keys. A
-// builder that must freeze while F is still being merged waits for the
-// merger (backpressure); one that must freeze twice before publishing merges
-// its own F on the spot.
+// never edits the tree. When A is full it freezes: A joins the frozen
+// buffers and a fresh buffer becomes A. A frozen buffer reaches the merger
+// when the version holding it is published, together with what the merger
+// needs to read records (the source, RS). The merger folds them in order,
+// each into the tree the one before it produced: T1 = T + F1, T2 = T1 + F2.
+// A builder made later from (T, F1..Fk, A) starts from (T1, F2..Fk, A) once
+// T1 is done, which holds the same keys, and installs every finished merge
+// from the oldest end. Frozen buffers queue, so a merge that runs long does
+// not stop the writer; a builder waits for the merger only when kMaxFrozen
+// buffers are all unmerged (backpressure), and one whose frozen buffers it
+// froze itself, none of them handed over yet, merges the oldest on the
+// spot.
 //
 // Displaced records. Every slot also records the record it displaced. The
 // tree keeps entries a buffer overrides until the merge, and the record
@@ -204,6 +209,49 @@ struct Slot {
   BlindRef ref;
 };
 
+// Frozen buffers a version holds at most. On the 48-vCPU box one was not
+// enough: a merge that ran past the ~1.2 ms a buffer takes to fill stalled
+// the writer, 10 us a commit, though the merger was a third idle. Each more
+// costs every point lookup one more fingerprint scan while it is unmerged.
+inline constexpr std::size_t kMaxFrozen = 3;
+
+// A version's buffers: the frozen ones, oldest first, and the active one.
+struct Layers {
+  std::array<View, kMaxFrozen> f{};
+  std::size_t nf{0};
+  View a;
+
+  [[nodiscard]] auto net() const noexcept -> std::int64_t {
+    auto n = a.net;
+    for (std::size_t i = 0; i < nf; ++i) n += f[i].net;
+    return n;
+  }
+  [[nodiscard]] auto total() const noexcept -> std::size_t {
+    std::size_t n = a.total;
+    for (std::size_t i = 0; i < nf; ++i) n += f[i].total;
+    return n;
+  }
+  // Oldest first: a later view's slot is newer than an earlier one's. The
+  // first `skip` frozen buffers are left out: a merge a reader uses covers
+  // them.
+  template <typename F> void oldest_first(F &&fn, std::size_t skip = 0) const {
+    for (std::size_t i = skip; i < nf; ++i) fn(f[i]);
+    fn(a);
+  }
+  // Drops the oldest frozen buffer.
+  void pop_oldest() {
+    for (std::size_t i = 1; i < nf; ++i) f[i - 1] = std::move(f[i]);
+    f[--nf] = View{};
+  }
+  // From the i-th frozen buffer on: what a merge of f[i] reads through.
+  [[nodiscard]] auto from(std::size_t i) const -> Layers {
+    Layers l;
+    for (std::size_t j = i; j < nf; ++j) l.f[l.nf++] = f[j];
+    l.a = a;
+    return l;
+  }
+};
+
 // Bit 2i set where fps[i] == fp, for 16 fingerprints (the byte mask of a
 // 16-bit compare, one bit kept per lane).
 inline auto match16(const std::uint16_t *fps, std::uint16_t fp) noexcept -> std::uint32_t {
@@ -243,11 +291,14 @@ inline auto find_in(const View &v, Bytes key, Hash h) -> std::optional<Slot> {
   return std::nullopt;
 }
 
-// A key's newest entry in the buffers of a version: A, then F.
-inline auto newest(const View &f, const View &a, Bytes key) -> std::optional<Slot> {
+// A key's newest entry in the buffers of a version: A, then the frozen ones
+// newest first.
+inline auto newest(const Layers &l, Bytes key, std::size_t skip = 0) -> std::optional<Slot> {
   const auto h = hash_of(key);
-  if (auto s = find_in(a, key, h)) return s;
-  return find_in(f, key, h);
+  if (auto s = find_in(l.a, key, h)) return s;
+  for (std::size_t i = l.nf; i-- > skip;)
+    if (auto s = find_in(l.f[i], key, h)) return s;
+  return std::nullopt;
 }
 
 // The key of a record some visible slot displaced, or none.
@@ -264,16 +315,17 @@ inline auto displaced_key(const View &v, BlindRef r) -> std::optional<Bytes> {
 // displaced it.
 template <BlindKeyResolver R> struct Overlay {
   R &inner;
-  const View &f;
-  const View &a;
+  const Layers &l;
+  std::size_t skip{0};
 
   auto key_at(BlindRef r) -> Bytes {
     if constexpr (requires {
                     { inner.try_key_at(r) } -> std::same_as<std::optional<Bytes>>;
                   }) {
       if (auto k = inner.try_key_at(r)) return *k;
-      if (auto k = displaced_key(a, r)) return *k;
-      if (auto k = displaced_key(f, r)) return *k;
+      if (auto k = displaced_key(l.a, r)) return *k;
+      for (std::size_t i = l.nf; i-- > skip;)
+        if (auto k = displaced_key(l.f[i], r)) return *k;
       throw std::logic_error{
           "buffered key directory: the tree references a missing record that "
           "no buffered write displaced"};
@@ -287,15 +339,16 @@ enum class Pick : std::uint8_t { Min, Max };
 
 // Min: the smallest key > (>=) `bound`. Max: the largest key < (<=)
 // `bound`, or the largest of all when `bound` is none. Among the slots of
-// (F, A); the newest slot wins a tie.
+// the version's buffers; the newest slot wins a tie.
 template <Pick P>
-inline auto buffer_pick(const View &f, const View &a, std::optional<Bytes> bound,
-                        bool inclusive) -> std::optional<Slot> {
+inline auto buffer_pick(const Layers &l, std::optional<Bytes> bound, bool inclusive)
+    -> std::optional<Slot> {
   const auto bp = bound ? prefix(*bound) : Prefix{};
   std::optional<Slot> best;
   Prefix best_p{};
-  for (const View *v : {&f, &a}) {  // oldest first
-    if (!v->buf) continue;
+  l.oldest_first([&](const View &view) {  // oldest first: a later slot wins a tie
+    const View *v = &view;
+    if (!v->buf) return;
     for (std::size_t p = 0; p < kPartitions; ++p) {
       const auto &part = v->buf->parts[p];
       for (std::size_t i = 0; i < v->counts[p]; ++i) {
@@ -317,18 +370,19 @@ inline auto buffer_pick(const View &f, const View &a, std::optional<Bytes> bound
         best_p = sp;
       }
     }
-  }
+  });
   return best;
 }
 
-// Whether any slot of (F, A) holds a key in [lo, hi) (hi none: no bound).
-// Full keys only where a prefix ties.
-inline auto any_in(const View &f, const View &a, Bytes lo, std::optional<Bytes> hi)
-    -> bool {
+// Whether any slot of the version's buffers holds a key in [lo, hi) (hi
+// none: no bound). Full keys only where a prefix ties.
+inline auto any_in(const Layers &l, Bytes lo, std::optional<Bytes> hi) -> bool {
   const auto lp = prefix(lo);
   const auto hp = hi ? prefix(*hi) : Prefix{~std::uint64_t{0}, ~std::uint64_t{0}};
-  for (const View *v : {&f, &a}) {
-    if (!v->buf) continue;
+  bool found = false;
+  l.oldest_first([&](const View &view) {
+    const View *v = &view;
+    if (found || !v->buf) return;
     for (std::size_t p = 0; p < kPartitions; ++p) {
       const auto &part = v->buf->parts[p];
       for (std::size_t i = 0; i < v->counts[p]; ++i) {
@@ -338,11 +392,12 @@ inline auto any_in(const View &f, const View &a, Bytes lo, std::optional<Bytes> 
           const auto k = v->buf->key(p, i);
           if (compare(k, lo) < 0 || (hi && compare(k, *hi) >= 0)) continue;
         }
-        return true;
+        found = true;
+        return;
       }
     }
-  }
-  return false;
+  });
+  return found;
 }
 
 } // namespace buffered_detail
@@ -362,6 +417,9 @@ template <std::size_t LeafBytes> struct FrozenMerge {
   // Under the merger's mutex.
   std::optional<PersistentBlindBTree<LeafBytes>> merged;
   std::exception_ptr error;
+  // The merged tree for readers, lock-free: set once, after `merged`, and
+  // valid while this state lives — as long as a version holds the buffer.
+  std::atomic<const PersistentBlindBTree<LeafBytes> *> done{nullptr};
 };
 
 namespace buffered_detail {
@@ -397,6 +455,7 @@ template <std::size_t LeafBytes, typename RS> class BufferedMerger {
   using Tree = PersistentBlindBTree<LeafBytes>;
   using Buffer = buffered_detail::Buffer;
   using View = buffered_detail::View;
+  using Layers = buffered_detail::Layers;
   using Frozen = FrozenMerge<LeafBytes>;
 
 public:
@@ -419,11 +478,15 @@ public:
   }
   [[nodiscard]] auto acquire() -> std::shared_ptr<Buffer> { return buffered_detail::BufferRecycler::acquire(pool_); }
 
-  // Hands F over: the merger builds base + F, reading records through `src`
-  // under the buffers (F, A) of the version that published F.
-  void submit(Tree base, View frozen, View active, const std::shared_ptr<Frozen> &state,
-              RS src) {
-    Job job{std::move(base), std::move(frozen), std::move(active), state, std::move(src)};
+  // Hands a frozen buffer over. The merger folds it into `base`, or, when
+  // `prev` is set, into the tree prev's merge produced — the frozen buffer
+  // before it, handed over earlier and merged first. `overlay` is the
+  // buffer and every newer one, as the publishing version holds them: the
+  // merge reads records through them and `src`.
+  void submit(std::optional<Tree> base, std::shared_ptr<Frozen> prev, View frozen,
+              Layers overlay, const std::shared_ptr<Frozen> &state, RS src) {
+    Job job{std::move(base), std::move(prev), std::move(frozen), std::move(overlay), state,
+            std::move(src)};
 #ifdef BYTECASK_SINGLE_THREADED
     std::unique_lock<std::mutex> lk{mu_};
     execute(job, lk);
@@ -479,13 +542,14 @@ public:
     cv_.wait(lk, [&] { return jobs_.empty() && !running_; });
   }
 
-  // Folds F into base. Only each key's newest slot: an older one may name a
-  // record that a later write overrode.
+  // Folds a frozen buffer into base, reading records through the buffers
+  // of `overlay` (it and every newer one). Only each key's newest slot: an
+  // older one may name a record that a later write overrode.
   template <BlindKeyResolver R>
-  static auto merge_with(const Tree &base, const View &frozen, const View &active, R &res)
+  static auto merge_with(const Tree &base, const View &frozen, const Layers &overlay, R &res)
       -> Tree {
     auto tr = base.transient();
-    buffered_detail::Overlay<R> ov{res, frozen, active};
+    buffered_detail::Overlay<R> ov{res, overlay};
     std::unordered_map<std::string_view, std::uint32_t> newest;
     for (std::size_t p = 0; p < buffered_detail::kPartitions; ++p) {
       newest.clear();
@@ -519,26 +583,38 @@ public:
 
 private:
   struct Job {
-    Tree base;
+    std::optional<Tree> base;     // none: prev's result
+    std::shared_ptr<Frozen> prev;  // the merge before this one, or null
     View frozen;
-    View active;
+    Layers overlay;
     std::weak_ptr<Frozen> state;
     RS src;
   };
 
-  // Runs one job; called with lk held, returns with it held.
+  // Runs one job; called with lk held, returns with it held. Jobs run in the
+  // order they were handed over, so prev has run.
   void execute(Job &job, std::unique_lock<std::mutex> &lk) {
-    if (job.state.expired()) return;  // every version holding F is gone
+    if (job.state.expired()) return;  // every version holding the buffer is gone
+    std::optional<Tree> base = std::move(job.base);
+    std::exception_ptr error;
+    if (job.prev) {
+      if (job.prev->merged) base = *job.prev->merged;
+      else error = job.prev->error ? job.prev->error
+                                   : std::make_exception_ptr(std::logic_error{
+                                         "buffered key directory: merged out of order"});
+    }
     running_ = true;
     lk.unlock();
     std::optional<Tree> merged;
-    std::exception_ptr error;
-    try {
-      job.src.with_resolver(
-          [&](auto &res) { merged = merge_with(job.base, job.frozen, job.active, res); });
-    } catch (...) {
-      error = std::current_exception();
+    if (!error) {
+      try {
+        job.src.with_resolver(
+            [&](auto &res) { merged = merge_with(*base, job.frozen, job.overlay, res); });
+      } catch (...) {
+        error = std::current_exception();
+      }
     }
+    base.reset();
     auto state = job.state.lock();
     job = Job{};  // release the base, F, A and the source outside the lock
     if (!state) merged.reset();  // nobody wants it: drop it before the next job
@@ -547,6 +623,7 @@ private:
     if (state) {
       state->merged = std::move(merged);
       state->error = error;
+      if (state->merged) state->done.store(&*state->merged, std::memory_order_release);
     }
     lk.unlock();
     state.reset();  // may free the result, off the lock
@@ -598,7 +675,7 @@ export template <std::size_t LeafBytes> class BufferedIterator {
   using Tree = PersistentBlindBTree<LeafBytes>;
   using TIt = BlindBTreeIterator<LeafBytes>;
   using Bytes = buffered_detail::Bytes;
-  using View = buffered_detail::View;
+  using Layers = buffered_detail::Layers;
   using Slot = buffered_detail::Slot;
   using Pick = buffered_detail::Pick;
   enum class Start : std::uint8_t { None, Begin, End, At };
@@ -677,14 +754,14 @@ public:
     if (!lo) return 0;  // at the end
     const auto hi = end.range_bound(res);
     if (hi && buffered_detail::compare(*lo, *hi) >= 0) return 0;
-    if (!buffered_detail::any_in(f_, a_, *lo, hi)) {
+    if (!buffered_detail::any_in(l_, *lo, hi)) {
       // Every entry in range is the tree's.
       if (start_ == Start::None && fwd_ && from_tree_ && end.start_ == Start::None) {
         // tf_ is one past this entry.
         if (end.at_end_) return 1 + tf_.count_until(tree_.end_iter(), limit - 1);
         if (end.fwd_ && end.from_tree_) return tf_.count_until(end.tf_, limit);
       }
-      buffered_detail::Overlay<R> ov{res, f_, a_};
+      buffered_detail::Overlay<R> ov{res, l_};
       const auto from = tree_.lower_bound(*lo, ov);
       const auto to = hi ? tree_.lower_bound(*hi, ov) : tree_.end_iter();
       return from.count_until(to, limit);
@@ -705,9 +782,8 @@ private:
   template <std::size_t, typename> friend class BufferedBlindBTree;
   template <std::size_t, typename> friend class TransientBufferedBlindBTree;
 
-  BufferedIterator(Tree tree, View f, View a, Start start, Bytes at = {})
-      : tree_{std::move(tree)}, f_{std::move(f)}, a_{std::move(a)}, start_{start},
-        start_key_(at.begin(), at.end()) {}
+  BufferedIterator(Tree tree, Layers l, Start start, Bytes at = {})
+      : tree_{std::move(tree)}, l_{std::move(l)}, start_{start}, start_key_(at.begin(), at.end()) {}
 
   // Where the entries from here start: the bound it was placed by or its
   // key; none at the end. Valid until the iterator next changes.
@@ -725,7 +801,7 @@ private:
 
   template <BlindKeyResolver R> void ensure_key(R &res) const {
     if (key_ok_) return;
-    buffered_detail::Overlay<R> ov{res, f_, a_};
+    buffered_detail::Overlay<R> ov{res, l_};
     const auto k = ov.key_at(ref_);
     key_.assign(k.begin(), k.end());
     key_ok_ = true;
@@ -733,7 +809,7 @@ private:
 
   // Positions on the smallest entry > (>=) lo.
   template <BlindKeyResolver R> void seek(Bytes lo, bool inclusive, R &res) {
-    buffered_detail::Overlay<R> ov{res, f_, a_};
+    buffered_detail::Overlay<R> ov{res, l_};
     tf_ = lo.empty() && inclusive ? tree_.begin() : tree_.lower_bound(lo, ov);
     if (!inclusive && tf_ != std::default_sentinel &&
         buffered_detail::compare(tf_.key(ov), lo) == 0)
@@ -748,7 +824,7 @@ private:
 
   // Positions on the largest entry < hi, or the last if none.
   template <BlindKeyResolver R> void seek_back(std::optional<Bytes> hi, R &res) {
-    buffered_detail::Overlay<R> ov{res, f_, a_};
+    buffered_detail::Overlay<R> ov{res, l_};
     tb_ = hi ? tree_.lower_bound(*hi, ov) : tree_.end_iter();
     --tb_;
     bwd_ = true;
@@ -759,7 +835,7 @@ private:
 
   // The next buffered entry past `bound`.
   template <Pick P> void find_candidate(std::optional<Bytes> bound, bool inclusive) {
-    cand_ = buffered_detail::buffer_pick<P>(f_, a_, bound, inclusive);
+    cand_ = buffered_detail::buffer_pick<P>(l_, bound, inclusive);
     cand_ok_ = true;
   }
 
@@ -780,7 +856,7 @@ private:
   // entry is known to come first without reading its key when the
   // candidate is at or past its leaf's upper fence.
   template <BlindKeyResolver R> void forward(R &res) {
-    buffered_detail::Overlay<R> ov{res, f_, a_};
+    buffered_detail::Overlay<R> ov{res, l_};
     for (;;) {
       if (!cand_ok_) {
         ensure_key(res);
@@ -820,7 +896,7 @@ private:
   // Mirror of forward: the larger of the candidate and tb_, with the lower
   // fence.
   template <BlindKeyResolver R> void backward(R &res) {
-    buffered_detail::Overlay<R> ov{res, f_, a_};
+    buffered_detail::Overlay<R> ov{res, l_};
     for (;;) {
       if (!cand_ok_) {
         ensure_key(res);
@@ -875,8 +951,7 @@ private:
   }
 
   Tree tree_;
-  View f_;
-  View a_;
+  Layers l_;
   Start start_{Start::None};
   std::vector<std::byte> start_key_;
   TIt tf_;  // forward: the first tree entry not yet passed
@@ -907,7 +982,8 @@ export template <std::size_t LeafBytes, typename RS> class BufferedBlindBTree {
   using Tree = PersistentBlindBTree<LeafBytes>;
   using Merger = BufferedMerger<LeafBytes, RS>;
   using Frozen = FrozenMerge<LeafBytes>;
-  using View = buffered_detail::View;
+  using Layers = buffered_detail::Layers;
+  using States = std::array<std::shared_ptr<Frozen>, buffered_detail::kMaxFrozen>;
   using Bytes = buffered_detail::Bytes;
   using Iter = BufferedIterator<LeafBytes>;
 
@@ -919,38 +995,44 @@ public:
   BufferedBlindBTree(Tree t) : tree_{std::move(t)} {}  // NOLINT(google-explicit-constructor)
 
   [[nodiscard]] auto size() const noexcept -> std::size_t {
-    return static_cast<std::size_t>(static_cast<std::int64_t>(tree_.size()) + f_.net + a_.net);
+    return static_cast<std::size_t>(static_cast<std::int64_t>(tree_.size()) + l_.net());
   }
   [[nodiscard]] auto empty() const noexcept -> bool { return size() == 0; }
 
+  // Reads go through the newest finished merge, if any, skipping the frozen
+  // buffers it covers: a version keeps its buffers until a later builder
+  // installs the merge, and a read-only stretch would otherwise scan them
+  // all for nothing.
   template <BlindKeyResolver R>
   [[nodiscard]] auto get(Bytes key, R &res) const -> std::optional<BlindRef> {
-    if (auto s = buffered_detail::newest(f_, a_, key)) {
+    const auto [tree, skip] = effective();
+    if (auto s = buffered_detail::newest(l_, key, skip)) {
       if (buffered_detail::is_none(s->ref)) return std::nullopt;
       (void)res.key_at(s->ref);  // the read a lookup's caller takes the entry from
       return s->ref;
     }
-    buffered_detail::Overlay<R> ov{res, f_, a_};
-    return tree_.get(key, ov);
+    buffered_detail::Overlay<R> ov{res, l_, skip};
+    return tree->get(key, ov);
   }
   template <BlindKeyResolver R>
   [[nodiscard]] auto contains(Bytes key, R &res) const -> bool {
     return get(key, res).has_value();
   }
   [[nodiscard]] auto holds(Bytes key, BlindRef ref) const -> bool {
-    if (auto s = buffered_detail::newest(f_, a_, key)) return s->ref == ref;
-    return tree_.holds(key, ref);
+    const auto [tree, skip] = effective();
+    if (auto s = buffered_detail::newest(l_, key, skip)) return s->ref == ref;
+    return tree->holds(key, ref);
   }
 
   // Unsettled: it reads nothing until settled or stepped, so a count
   // between two bounds reads only what the tree needs to place them.
   template <BlindKeyResolver R>
   [[nodiscard]] auto lower_bound(Bytes key, R &) const -> Iter {
-    return {tree_, f_, a_, Iter::Start::At, key};
+    return iter(Iter::Start::At, key);
   }
   // Unsettled: the key directory's iterator settles it.
-  [[nodiscard]] auto begin() const -> Iter { return {tree_, f_, a_, Iter::Start::Begin}; }
-  [[nodiscard]] auto end_iter() const -> Iter { return {tree_, f_, a_, Iter::Start::End}; }
+  [[nodiscard]] auto begin() const -> Iter { return iter(Iter::Start::Begin); }
+  [[nodiscard]] auto end_iter() const -> Iter { return iter(Iter::Start::End); }
   [[nodiscard]] auto end() const noexcept -> std::default_sentinel_t { return {}; }
 
   [[nodiscard]] auto transient() const -> TransientBufferedBlindBTree<LeafBytes, RS>;
@@ -969,22 +1051,36 @@ public:
   void test_wait_merged() const {
     if (merger_) merger_->drain();
   }
-  // Slots this version sees in its buffers.
-  [[nodiscard]] auto test_buffered() const -> std::size_t { return f_.total + a_.total; }
+  // Slots this version sees in its buffers, and how many are frozen.
+  [[nodiscard]] auto test_buffered() const -> std::size_t { return l_.total(); }
+  [[nodiscard]] auto test_frozen() const -> std::size_t { return l_.nf; }
 #endif
 
 private:
   friend class TransientBufferedBlindBTree<LeafBytes, RS>;
-  BufferedBlindBTree(std::shared_ptr<Merger> m, Tree t, View f, std::shared_ptr<Frozen> fs,
-                     View a)
-      : merger_{std::move(m)}, tree_{std::move(t)}, f_{std::move(f)}, fstate_{std::move(fs)},
-        a_{std::move(a)} {}
+  BufferedBlindBTree(std::shared_ptr<Merger> m, Tree t, Layers l, States fs)
+      : merger_{std::move(m)}, tree_{std::move(t)}, l_{std::move(l)}, fs_{std::move(fs)} {}
+
+  // The tree to read and how many frozen buffers it covers: the newest
+  // finished merge's, else this version's own.
+  struct Effective {
+    const Tree *tree;
+    std::size_t skip;
+  };
+  [[nodiscard]] auto effective() const noexcept -> Effective {
+    for (auto i = l_.nf; i-- > 0;)
+      if (const auto *t = fs_[i]->done.load(std::memory_order_acquire)) return {t, i + 1};
+    return {&tree_, 0};
+  }
+  [[nodiscard]] auto iter(typename Iter::Start start, Bytes at = {}) const -> Iter {
+    const auto [tree, skip] = effective();
+    return {*tree, skip == 0 ? l_ : l_.from(skip), start, at};
+  }
 
   std::shared_ptr<Merger> merger_;  // null until a builder is made
   Tree tree_;
-  View f_;
-  std::shared_ptr<Frozen> fstate_;  // F's merge; set whenever F is
-  View a_;
+  Layers l_;
+  States fs_;  // fs_[i]: the merge of l_.f[i]
 };
 
 // ---------------------------------------------------------------------------
@@ -995,6 +1091,8 @@ export template <std::size_t LeafBytes, typename RS> class TransientBufferedBlin
   using Merger = BufferedMerger<LeafBytes, RS>;
   using Frozen = FrozenMerge<LeafBytes>;
   using View = buffered_detail::View;
+  using Layers = buffered_detail::Layers;
+  using States = std::array<std::shared_ptr<Frozen>, buffered_detail::kMaxFrozen>;
   using Buffer = buffered_detail::Buffer;
   using Bytes = buffered_detail::Bytes;
   using Iter = BufferedIterator<LeafBytes>;
@@ -1008,21 +1106,21 @@ public:
   ~TransientBufferedBlindBTree() = default;
 
   [[nodiscard]] auto size() const noexcept -> std::size_t {
-    return static_cast<std::size_t>(static_cast<std::int64_t>(tree_.size()) + f_.net + a_.net);
+    return static_cast<std::size_t>(static_cast<std::int64_t>(tree_.size()) + l_.net());
   }
 
   template <BlindKeyResolver R>
   [[nodiscard]] auto get(Bytes key, R &res) const -> std::optional<BlindRef> {
-    if (auto s = buffered_detail::newest(f_, a_, key)) {
+    if (auto s = buffered_detail::newest(l_, key)) {
       if (buffered_detail::is_none(s->ref)) return std::nullopt;
       (void)res.key_at(s->ref);
       return s->ref;
     }
-    buffered_detail::Overlay<R> ov{res, f_, a_};
+    buffered_detail::Overlay<R> ov{res, l_};
     return tree_.get(key, ov);
   }
   [[nodiscard]] auto holds(Bytes key, BlindRef ref) const -> bool {
-    if (auto s = buffered_detail::newest(f_, a_, key)) return s->ref == ref;
+    if (auto s = buffered_detail::newest(l_, key)) return s->ref == ref;
     return tree_.holds(key, ref);
   }
 
@@ -1067,27 +1165,31 @@ public:
   // between two bounds reads only what the tree needs to place them.
   template <BlindKeyResolver R>
   [[nodiscard]] auto lower_bound(Bytes key, R &) const -> Iter {
-    return {tree_, f_, a_, Iter::Start::At, key};
+    return {tree_, l_, Iter::Start::At, key};
   }
 
-  // Publishes. A buffer this builder froze goes to the merger with `src`,
-  // which reads the records of the version being published.
+  // Publishes. The buffers this builder froze go to the merger, oldest
+  // first, each chained to the one before it, with `src` to read the
+  // records of the version being published.
   [[nodiscard]] auto persistent(RS src) && -> BufferedBlindBTree<LeafBytes, RS> {
-    if (frozen_here_) merger_->submit(tree_, f_, a_, fstate_, std::move(src));
-    return {std::move(merger_), std::move(tree_), std::move(f_), std::move(fstate_),
-            std::move(a_)};
+    for (auto i = l_.nf - here_; i < l_.nf; ++i) {
+      if (i == 0)
+        merger_->submit(tree_, nullptr, l_.f[i], l_.from(i), fs_[i], src);
+      else
+        merger_->submit(std::nullopt, fs_[i - 1], l_.f[i], l_.from(i), fs_[i], src);
+    }
+    return {std::move(merger_), std::move(tree_), std::move(l_), std::move(fs_)};
   }
 
 private:
   friend class BufferedBlindBTree<LeafBytes, RS>;
-  TransientBufferedBlindBTree(std::shared_ptr<Merger> m, Tree t, View f,
-                              std::shared_ptr<Frozen> fs, View a)
-      : merger_{std::move(m)}, tree_{std::move(t)}, f_{std::move(f)}, fstate_{std::move(fs)},
-        a_{std::move(a)} {}
+  TransientBufferedBlindBTree(std::shared_ptr<Merger> m, Tree t, Layers l, States fs)
+      : merger_{std::move(m)}, tree_{std::move(t)}, l_{std::move(l)}, fs_{std::move(fs)} {}
 
-  // A write of this builder still in a buffer, newest last.
+  // A write of this builder still in a buffer, newest last: the buffer (0:
+  // A, else the id of the frozen buffer's merge) and its partition.
   struct Written {
-    bool in_f;
+    std::uint64_t layer;
     std::uint8_t part;
   };
 
@@ -1095,77 +1197,98 @@ private:
   // read it (the tree does, the buffers do not).
   template <BlindKeyResolver R>
   auto lookup(Bytes key, R &res, bool &read) const -> std::optional<BlindRef> {
-    if (auto s = buffered_detail::newest(f_, a_, key)) {
+    if (auto s = buffered_detail::newest(l_, key)) {
       if (buffered_detail::is_none(s->ref)) return std::nullopt;
       return s->ref;
     }
     read = true;
-    buffered_detail::Overlay<R> ov{res, f_, a_};
+    buffered_detail::Overlay<R> ov{res, l_};
     return tree_.get(key, ov);
   }
 
   // Whether A takes the key with at most `slots` slots in all.
   [[nodiscard]] auto has_room(Bytes key, std::size_t slots) const -> bool {
-    return a_.total < slots && a_.counts[buffered_detail::hash_of(key).part] <
-                                   buffered_detail::kSlotCapacity &&
-           a_.arena + key.size() <= buffered_detail::kArenaBytes;
+    return l_.a.total < slots && l_.a.counts[buffered_detail::hash_of(key).part] <
+                                     buffered_detail::kSlotCapacity &&
+           l_.a.arena + key.size() <= buffered_detail::kArenaBytes;
   }
 
-  // Makes room in A for a key, freezing A when it is full: first the F
-  // before it is installed — waiting for the merger if need be — or, if
-  // this builder froze it, merged here. Returns whether it merged here
-  // (reading records through `res`).
+  // Replaces the tree with the oldest frozen buffer's merge and drops the
+  // buffer.
+  void retire_oldest(Tree merged) {
+    const auto id = fs_[0]->id;
+    tree_ = std::move(merged);
+    l_.pop_oldest();
+    for (std::size_t i = 1; i <= l_.nf; ++i) fs_[i - 1] = std::move(fs_[i]);
+    fs_[l_.nf].reset();
+    if (here_ > l_.nf) here_ = l_.nf;
+    std::erase_if(log_, [id](const Written &w) { return w.layer == id; });
+  }
+
+  // Makes room in A for a key, freezing A when it is full. With kMaxFrozen
+  // buffers already frozen, the oldest is retired first: installed from the
+  // merger, waited for if it is still merging (backpressure), or, when this
+  // builder froze it and handed nothing over, merged here. Returns whether it
+  // merged here (reading records through `res`).
   template <BlindKeyResolver R> auto make_room(Bytes key, R &res) -> bool {
     if (has_room(key, buffered_detail::kBufferSlots)) return false;
     bool merged = false;
-    if (f_.buf) {
-      if (frozen_here_) {
+    // Finished merges cost nothing to install.
+    while (l_.nf > here_) {
+      auto done = merger_->ready(*fs_[0]);
+      if (!done) break;
+      retire_oldest(std::move(*done));
+      tree_owned_ = false;
+    }
+    if (l_.nf == buffered_detail::kMaxFrozen) {
+      if (here_ == l_.nf) {
         merger_->drain();  // no merge for a discarded version shares our base
-        tree_ = Merger::merge_with(tree_, f_, a_, res);
+        auto t = Merger::merge_with(tree_, l_.f[0], l_, res);
+        retire_oldest(std::move(t));
         tree_owned_ = true;
         merged = true;
       } else {
-        tree_ = merger_->wait(*fstate_);
+        retire_oldest(merger_->wait(*fs_[0]));
         tree_owned_ = false;
       }
-      f_ = View{};
-      fstate_.reset();
-      frozen_here_ = false;
-      std::erase_if(log_, [](const Written &w) { return w.in_f; });
     }
-    const_cast<Buffer &>(*a_.buf).written.store(buffered_detail::kFrozen,
-                                               std::memory_order_relaxed);
-    f_ = std::move(a_);
-    fstate_ = std::make_shared<Frozen>();
-    fstate_->id = merger_->next_id();
-    frozen_here_ = true;
-    for (auto &w : log_) w.in_f = true;
-    a_ = View{merger_->acquire()};
+    const_cast<Buffer &>(*l_.a.buf).written.store(buffered_detail::kFrozen,
+                                                 std::memory_order_relaxed);
+    auto state = std::make_shared<Frozen>();
+    state->id = merger_->next_id();
+    for (auto &w : log_)
+      if (w.layer == 0) w.layer = state->id;
+    l_.f[l_.nf] = std::move(l_.a);
+    fs_[l_.nf] = std::move(state);
+    ++l_.nf;
+    ++here_;
+    l_.a = View{merger_->acquire()};
     return merged;
   }
 
   void write_slot(Bytes key, BlindRef ref, BlindRef displaced) {
-    auto &b = const_cast<Buffer &>(*a_.buf);  // this builder is its only writer
+    auto &a = l_.a;
+    auto &b = const_cast<Buffer &>(*a.buf);  // this builder is its only writer
     const auto h = buffered_detail::hash_of(key);
     const auto p = h.part;
     auto &part = b.parts[p];
-    const auto i = a_.counts[p];
-    if (i >= buffered_detail::kSlotCapacity || a_.arena + key.size() > buffered_detail::kArenaBytes)
+    const auto i = a.counts[p];
+    if (i >= buffered_detail::kSlotCapacity || a.arena + key.size() > buffered_detail::kArenaBytes)
       throw std::logic_error{"buffered key directory: buffer overflow"};
-    std::memcpy(b.arena.get() + a_.arena, key.data(), key.size());
+    std::memcpy(b.arena.get() + a.arena, key.data(), key.size());
     part.fp[i] = h.fp;
     part.hi[i] = buffered_detail::word(key, 0);
     part.lo[i] = buffered_detail::word(key, 8);
     part.ref[i] = ref;
     part.old[i] = displaced;
-    part.off[i] = a_.arena;
+    part.off[i] = a.arena;
     part.len[i] = static_cast<std::uint16_t>(key.size());
-    a_.arena += static_cast<std::uint32_t>(key.size());
-    a_.counts[p] = static_cast<std::uint16_t>(i + 1);
-    ++a_.total;
-    a_.net += delta(ref, displaced);
-    b.written.store(a_.total, std::memory_order_relaxed);
-    log_.push_back({false, static_cast<std::uint8_t>(p)});
+    a.arena += static_cast<std::uint32_t>(key.size());
+    a.counts[p] = static_cast<std::uint16_t>(i + 1);
+    ++a.total;
+    a.net += delta(ref, displaced);
+    b.written.store(a.total, std::memory_order_relaxed);
+    log_.push_back({0, static_cast<std::uint8_t>(p)});
   }
 
   static auto delta(BlindRef ref, BlindRef displaced) noexcept -> int {
@@ -1176,7 +1299,7 @@ private:
   auto by_location(Bytes key, BlindRef from, BlindRef to) -> bool {
     if (!holds(key, from)) return false;
     if (take_back(key, from, to)) return true;
-    if (!buffered_detail::newest(f_, a_, key) && tree_owned_) {
+    if (!buffered_detail::newest(l_, key) && tree_owned_) {
       // In the tree this builder merged: change it there, where a record
       // an undo drops can never be read again.
       auto t = tree_.transient();
@@ -1199,28 +1322,34 @@ private:
   auto take_back(Bytes key, BlindRef from, BlindRef to) -> bool {
     if (log_.empty()) return false;
     const auto w = log_.back();
-    View &v = w.in_f ? f_ : a_;
+    View *v = w.layer == 0 ? &l_.a : nullptr;
+    for (std::size_t j = l_.nf - here_; v == nullptr && j < l_.nf; ++j)
+      if (fs_[j]->id == w.layer) v = &l_.f[j];
+    if (v == nullptr)
+      throw std::logic_error{"buffered key directory: a logged write's buffer is gone"};
     const auto p = w.part;
-    const auto i = static_cast<std::size_t>(v.counts[p]) - 1;
-    const auto &part = v.buf->parts[p];
+    const auto i = static_cast<std::size_t>(v->counts[p]) - 1;
+    const auto &part = v->buf->parts[p];
     if (!(part.ref[i] == from) || !(part.old[i] == to) ||
-        buffered_detail::compare(v.buf->key(p, i), key) != 0)
+        buffered_detail::compare(v->buf->key(p, i), key) != 0)
       return false;
     log_.pop_back();
-    v.counts[p] = static_cast<std::uint16_t>(i);
-    --v.total;
-    v.arena = part.off[i];  // the newest slot's key is the arena's last
-    v.net -= delta(from, to);
-    if (!w.in_f) const_cast<Buffer &>(*v.buf).written.store(v.total, std::memory_order_relaxed);
+    v->counts[p] = static_cast<std::uint16_t>(i);
+    --v->total;
+    v->arena = part.off[i];  // the newest slot's key is the arena's last
+    v->net -= delta(from, to);
+    if (w.layer == 0)
+      const_cast<Buffer &>(*v->buf).written.store(v->total, std::memory_order_relaxed);
     return true;
   }
 
   std::shared_ptr<Merger> merger_;
   Tree tree_;
-  View f_;
-  std::shared_ptr<Frozen> fstate_;
-  View a_;
-  bool frozen_here_{false};
+  Layers l_;
+  States fs_;
+  // The newest here_ frozen buffers were frozen by this builder and are
+  // not handed over yet; the rest were, by the versions it was made from.
+  std::size_t here_{0};
   // tree_ was derived here, by a merge of this builder: nothing else
   // derives from it, so it can be changed in place.
   bool tree_owned_{false};
@@ -1232,18 +1361,20 @@ auto BufferedBlindBTree<LeafBytes, RS>::transient() const
     -> TransientBufferedBlindBTree<LeafBytes, RS> {
   auto merger = merger_ ? merger_ : std::make_shared<Merger>();
   auto tree = tree_;
-  auto f = f_;
-  auto fs = fstate_;
-  if (fs) {
-    if (auto merged = merger->ready(*fs)) {  // install
-      tree = std::move(*merged);
-      f = View{};
-      fs.reset();
-    }
+  auto l = l_;
+  auto fs = fs_;
+  // Install every finished merge, oldest first.
+  while (l.nf > 0) {
+    auto merged = merger->ready(*fs[0]);
+    if (!merged) break;
+    tree = std::move(*merged);
+    l.pop_oldest();
+    for (std::size_t i = 1; i <= l.nf; ++i) fs[i - 1] = std::move(fs[i]);
+    fs[l.nf].reset();
   }
-  auto a = a_;
+  auto &a = l.a;
   if (!a.buf) {
-    a = View{merger->acquire()};
+    a = buffered_detail::View{merger->acquire()};
   } else if (a.buf->written.load(std::memory_order_relaxed) != a.total) {
     // Another builder wrote past this version's slots (a discarded one, or
     // one made from this version before): append to a copy.
@@ -1264,7 +1395,7 @@ auto BufferedBlindBTree<LeafBytes, RS>::transient() const
     copy->written.store(a.total, std::memory_order_relaxed);
     a.buf = std::move(copy);
   }
-  return {std::move(merger), std::move(tree), std::move(f), std::move(fs), std::move(a)};
+  return {std::move(merger), std::move(tree), std::move(l), std::move(fs)};
 }
 
 } // namespace bytecask
