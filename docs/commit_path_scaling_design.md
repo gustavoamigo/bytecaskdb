@@ -230,10 +230,12 @@ An 8-byte prefix is not enough: on the plugin's keys every slot of a table ties.
 
 #### State and publication
 
-The key directory becomes a wrapper, `BufferedKeyDir`, behind the `kd_*` layer
-and the `KeyDirTree` / `KeyDirTransient` aliases in `internals.cppm`, selected
-with `BYTECASK_KEYDIR=buffered`. The engine's code does not change beyond one
-hook in `execute_slots`.
+The key directory becomes a wrapper, `BufferedKeyDir`, selected with
+`BYTECASK_KEYDIR=buffered` exactly as `btree` and `radix` are: it provides the
+`KeyDirTree` / `KeyDirTransient` types and its own `kd_*` functions in
+`internals.cppm`, the key directory's interface. **The engine is agnostic to
+the strategy**: buffering, freezing, merging, installing and backpressure all
+happen inside the key directory, and no engine code changes.
 
 - A published version is **(tree version T, frozen buffer F or none, active
   buffer A with its published slot count per partition)**. F is immutable. A
@@ -247,26 +249,33 @@ hook in `execute_slots`.
 - Order is total: a key's newest entry is in A, else F, else T. Every slot of
   A is newer than every slot of F, and F newer than T.
 
-#### Merger protocol
+#### Merger protocol — inside the key directory
 
-The DB owns a merger thread (`KeyDirMerger`), and `execute_slots` calls one
-hook at the start of each batch, under `write_mu_`:
+Each database's key directory has one coordinator, shared by all its versions
+(`shared_ptr`), which owns the merger thread: created with the first version
+(the recovered tree), stopped and joined when the last version is released.
+The merger holds no reference to the coordinator, so it never joins itself.
 
-1. **Install:** if the merger has finished T' = T + F, the head becomes
-   (T', none, A). A pointer swap.
-2. **Freeze:** if A cannot take the batch's writes and F is none, A becomes F,
-   a fresh (recycled) buffer becomes A, and F is handed to the merger.
-3. **Backpressure:** if A is full and F is still being merged, the batch waits
-   for the merger — the one place the serial section waits on it. Counted in
-   `stats()`, as the hint writer's stalls are.
+1. **Install, in `transient()`:** a builder made from a version (T, F, A)
+   starts from (T', none, A) if the merger has finished T' = T + F. That is
+   legal at any moment — (T', A) holds exactly what (T, F, A) held — so no
+   caller has to choose when.
+2. **Freeze, in the builder's appends:** when A cannot take a write and F is
+   none, A becomes F, a recycled buffer becomes A, and F is handed to the
+   merger.
+3. **Backpressure, in the same place:** when A is full and F is still being
+   merged, the append waits for the merger. The serial section waits without
+   knowing why, as on any slow operation; the key directory counts the stalls
+   (`keydir_buffer_stalls`, `keydir_buffer_stall_us`), as the hint writer does.
 
 The merger builds T' from a transient of T, applying F's slots in order, and
-never touches A. Neither side ever mutates what the other reads. A batch
-larger than the buffer is applied to the tree directly, as today.
+never touches A. Neither side mutates what the other reads.
 
-**Barriers** — vacuum, `set_mode`, `resume`, `create_manifest`, close — drain
-first: wait for the merger, fold A synchronously, then run against the tree
-as today. They are rare; vacuum's relocation logic stays untouched.
+**Nothing drains.** Vacuum relocates keys through `kd_put_at` / `kd_erase_at`,
+which append to the buffer like any write; `set_mode`, `resume` and
+`create_manifest` never reach into the key directory. Tests get a
+testing-only switch to force a merge or wait for one, so merges can be placed
+at chosen points.
 
 #### What reads do
 
@@ -284,7 +293,7 @@ Recovery builds T from the hint files as today; the buffers start empty.
 #### Tests
 
 - **The engine suite** under `BYTECASK_KEYDIR=buffered`, with a buffer of a
-  few slots so freezes, installs, backpressure and barriers happen constantly:
+  few slots so freezes, installs and backpressure happen constantly:
   every `[model]` recovery test, the differential and location tests, the
   proof tests. CI adds it as a fourth key directory, as it runs the other three.
 - **A model test for the wrapper** (`tests/buffered_keydir_test.cpp`): seeded
