@@ -1,0 +1,119 @@
+# SPDX-License-Identifier: MIT
+# Nightly chaos run: tests/chaos/run_chaos.py mounts chaosfs (an in-memory FUSE
+# filesystem that injects I/O faults and models power loss) and runs the
+# engine through process lives ended by power loss, SIGKILL or a clean close,
+# checking every life's history against what it left on disk. See
+# docs/chaos_testing_design.md.
+#
+# ci.yml builds chaos_worker and runs chaosfs's model tests on every push/PR.
+# The timed run lives here, on a schedule plus manual dispatch, and on every
+# update of a PR that changes the rig itself. The run's seed is printed
+# first; rerun with --seed to replay the same plans (thread timing still
+# varies with the machine).
+
+name: Chaos (nightly)
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Minutes per job"
+        default: "40"
+      seed:
+        description: "Seed to replay (empty = the run id)"
+        default: ""
+      disable:
+        description: "Comma-separated hazards to leave out (see run_chaos.py --help)"
+        default: ""
+  pull_request:
+    branches: [main]
+    paths:
+      - "tests/chaos/**"
+      - "tests/crash/crash_model.h"
+      - ".github/workflows/chaos-nightly.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+      # FUSE inside the container.
+      options: --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+      CLANG_TARGET_TRIPLE: x86_64-redhat-linux-gnu
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release
+            mode: releasedbg
+            sanitizer: ""
+            max_life_s: 4
+          - name: asan
+            mode: debug
+            sanitizer: address
+            # The ASan worker runs several times slower; longer lives let
+            # hazards land past open and the first rotations.
+            max_life_s: 10
+    name: chaos (${{ matrix.name }})
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            clang llvm llvm-devel lld \
+            libcxx libcxx-devel \
+            xmake \
+            python3-pip python3-devel \
+            fuse3 fuse3-libs \
+            elfutils \
+            git ninja-build
+          # xmake f loads every target, and bytecaskdb_python's on_load asks
+          # nanobind for its include dir.
+          pip3 install nanobind mfusepy
+
+      - name: Configure xmake
+        run: |
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          SAN=""
+          if [ -n "${{ matrix.sanitizer }}" ]; then SAN="--sanitizer=${{ matrix.sanitizer }}"; fi
+          xmake f --toolchain=clang \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            $SAN -m ${{ matrix.mode }} -y
+
+      - name: Build
+        run: xmake build chaos_worker
+
+      - name: chaosfs model tests
+        run: python3 -m unittest tests/chaos/test_chaosfs.py
+
+      - name: Run chaos
+        env:
+          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
+          MINUTES: ${{ github.event.inputs.minutes || '40' }}
+          SEED: ${{ github.event.inputs.seed || github.run_id }}
+          DISABLE: ${{ github.event.inputs.disable || '' }}
+        run: |
+          ARGS="--worker build/linux/x86_64/${{ matrix.mode }}/chaos_worker"
+          ARGS="$ARGS --minutes $MINUTES --seed $SEED --max-life-s ${{ matrix.max_life_s }}"
+          if [ -n "${{ matrix.sanitizer }}" ]; then DISABLE="${DISABLE:+$DISABLE,}rlimit_as"; fi
+          ARGS="$ARGS --work $RUNNER_TEMP/chaos"
+          if [ -n "$DISABLE" ]; then ARGS="$ARGS --disable $DISABLE"; fi
+          python3 tests/chaos/run_chaos.py $ARGS
+
+      - name: Upload the failing life
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-failure-${{ matrix.name }}
+          path: ${{ runner.temp }}/chaos/failure
+          if-no-files-found: ignore
