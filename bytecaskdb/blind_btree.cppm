@@ -792,6 +792,30 @@ public:
   auto operator==(std::default_sentinel_t) const noexcept -> bool {
     return stack_.empty();
   }
+  // The leaf the iterator is in, and the separators around it: every entry
+  // of the leaf is >= the lower fence and < the upper fence. False where
+  // there is none (the first or last leaf). For merging this tree with
+  // other sorted entries without reading keys.
+  [[nodiscard]] auto leaf() const noexcept -> const void * {
+    return stack_.empty() ? nullptr : stack_.back().node;
+  }
+  auto upper_fence(std::vector<std::byte> &out) const -> bool {
+    if (stack_.empty()) return false;
+    for (auto i = stack_.size() - 1; i-- > 0;) {
+      const auto &f = stack_[i];
+      if (f.idx < f.node->count) return fence(f.node, f.idx, out);
+    }
+    return false;
+  }
+  auto lower_fence(std::vector<std::byte> &out) const -> bool {
+    if (stack_.empty()) return false;
+    for (auto i = stack_.size() - 1; i-- > 0;) {
+      const auto &f = stack_[i];
+      if (f.idx > 0) return fence(f.node, f.idx - 1, out);
+    }
+    return false;
+  }
+
   // The stepping interface every key directory iterator offers, for trees
   // that read keys to step (the buffered tree). This one never does.
   template <BlindKeyResolver R> void settle(R &) noexcept {}
@@ -867,6 +891,13 @@ private:
       stack_.back().idx = cur->count - 1;
       advance();
     }
+  }
+
+  static auto fence(const N *n, std::uint32_t i, std::vector<std::byte> &out) -> bool {
+    const auto k = n->key(i);
+    out.resize(k.size());
+    k.copy_tail(0, out.data());
+    return true;
   }
 
   void descend_leftmost(const N *n) {

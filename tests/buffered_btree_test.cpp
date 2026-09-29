@@ -188,8 +188,9 @@ TEST_CASE("buffered tree matches a map through merges, undos and vacuums",
   // Keys over a few "indexes" (first 6 bytes), so partitions and the
   // index-scoped scans are exercised, plus some shorter than 6 bytes.
   std::vector<std::string> universe;
+  // 600 keys: several leaves, so scans cross leaf fences.
   for (int idx = 0; idx < 3; ++idx)
-    for (int i = 0; i < 60; ++i)
+    for (int i = 0; i < 200; ++i)
       universe.push_back(std::format("ix{:04d}{:05d}", idx, i * 7));
   for (int i = 0; i < 6; ++i) universe.push_back(std::format("s{}", i));
   std::ranges::sort(universe);
