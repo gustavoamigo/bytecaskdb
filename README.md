@@ -533,7 +533,7 @@ python ./scripts/run_engine_bench.py
 ./bytecaskdb-mariadb-plugin/benchmarks/run-hammerdb.sh --warehouses=20 --vus=8,16
 ```
 
-The key directory is chosen at build time. The default is the blind-leaf B+ tree; `BYTECASK_KEYDIR=btree` builds the engine on the B+ tree that keeps key bytes in its leaves (larger, and it never reads a record to place or enumerate a key), and `BYTECASK_KEYDIR=radix` on the radix tree. All three pass the same engine suite in CI, and the on-disk format is the same, so a database opens under any of them.
+The key directory is chosen at build time. The default is the blind-leaf B+ tree; `BYTECASK_KEYDIR=btree` builds the engine on the B+ tree that keeps key bytes in its leaves (larger, and it never reads a record to place or enumerate a key), `BYTECASK_KEYDIR=radix` on the radix tree, and `BYTECASK_KEYDIR=buffered` on the blind-leaf tree behind a small write buffer that a background thread folds into the tree, which takes the tree update out of each commit (experimental). All four pass the same engine suite in CI, and the on-disk format is the same, so a database opens under any of them.
 
 A ready-to-use development environment is provided via the included [Dev Container](.devcontainer) (Fedora 43, Clang, xmake, LLVM tooling, and `nanobind` pre-installed).
 
