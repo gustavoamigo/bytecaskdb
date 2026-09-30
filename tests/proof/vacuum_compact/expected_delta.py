@@ -14,6 +14,7 @@ from .scenario_matrix import CompactStateShape, VacuumCompactFailureClass
 class VacuumCompactDelta:
     threw: bool
     file_removed: bool
+    degraded: bool = False
 
 
 def vacuum_compact_delta(
@@ -41,9 +42,22 @@ def vacuum_compact_delta(
     on the way out (#235), so a retry under a persistent fault does not leave
     a copy per attempt. Every cell checks no staging copy remains.
 
+    VC7: the fdatasync that makes the superseding sync = false writes durable
+    fails (#261). The engine degrades — a sync after a failed one proves
+    nothing — and vacuum throws before committing, so the old file stays in
+    the published state and on disk, as for VC1–VC4.
+
+    Every cell also cuts the power after the vacuum (#265). The recovered copy
+    must hold the durable baseline alone, or with every overwrite: SUCCESS
+    made the overwrites durable before dropping what they superseded, so they
+    are required there; after VC7 nothing did, so either is allowed. A copy
+    with a key missing — the old value dropped, the new one lost — fails
+    both, which is #245.
     """
     if failure == VacuumCompactFailureClass.SUCCESS:
         return VacuumCompactDelta(threw=False, file_removed=True)
     if failure == VacuumCompactFailureClass.VC5:
         return VacuumCompactDelta(threw=True, file_removed=True)
+    if failure == VacuumCompactFailureClass.VC7:
+        return VacuumCompactDelta(threw=True, file_removed=False, degraded=True)
     return VacuumCompactDelta(threw=True, file_removed=False)

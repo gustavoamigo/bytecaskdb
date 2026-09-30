@@ -355,6 +355,10 @@ def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
     parts.append(f'TEST_CASE("{name}", "[prove_resume]") {{')
     parts.append("  TempDir td;")
     parts.append('  auto dir = td.path / "db";')
+    # Power loss (#265): the cell runs under the page cache model, and the
+    # directory is copied as the device holds it before ~DB syncs it.
+    parts.append("  bytecask::testing::ScopedPageCacheModel cache;")
+    parts.append('  auto cut = td.path / "cut";')
     parts.append("  bytecask::testing::EngineFingerprint fp;")
     parts.append("  {")
     parts.append(gen_degrade_setup(degrade))
@@ -381,9 +385,18 @@ def gen_test(degrade: DegradeShape, failure: ResumeFailureClass) -> str:
     parts.append("    // resume() and a cold open read the same bytes; they must")
     parts.append("    // reconstruct the same engine.")
     parts.append("    fp = fingerprint(db);")
+    parts.append("    cache.model.copy_device(dir, cut);  // power cut")
     parts.append("  }")
+    parts.append("  assert_hints_durable(cache.model);")
     parts.append(gen_recovery_check(degrade, delta))
     parts.append(gen_bounds_check(degrade))
+    # resume() claims durable everything it publishes: it rewrites and syncs
+    # the active file before its scan (#240). The copy the cut left must
+    # therefore agree with the resumed engine too. Without the rewrite, the
+    # pages a failed fdatasync left clean and off the device are lost here.
+    parts.append("  // ... and so must what the device held at the cut: resume()")
+    parts.append("  // made durable what it published.")
+    parts.append(gen_bounds_check(degrade).replace("(dir, fp", "(cut, fp"))
     parts.append("}")
     if degrade.io_backend != "pread":
         parts.append("#endif  // __EMSCRIPTEN__")
@@ -419,6 +432,7 @@ namespace {
 
 using bytecask::testing::assert_consistent;
 using bytecask::testing::assert_keys_recoverable;
+using bytecask::testing::assert_hints_durable;
 using bytecask::testing::assert_matches_recovery;
 using bytecask::testing::fingerprint;
 using bytecask::testing::to_bytes;

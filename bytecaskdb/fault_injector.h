@@ -200,7 +200,14 @@ struct ScopedFaultInjector {
 // unless an image is already kept, and marks it dirty. A successful sync
 // forgets the images of the dirty pages; a failed one only clears their dirty
 // mark, so a sync after it keeps them too. Only a new write makes the page
-// dirty again. Hint files are not modelled: they are written durably.
+// dirty again.
+//
+// Hint files are not modelled. A hint is a rebuildable index, so a lost or
+// torn one costs nothing; what would cost keys is a hint that indexes data
+// the device does not hold. The engine keeps that by ordering — a file is
+// synced before it is sealed, and a hint-less file is rewritten and synced
+// before open reads it — and hint_written checks the ordering at every hint
+// the engine writes.
 //
 // Process-wide, not thread-local: the flush leader and the background hint
 // worker are not always the test's thread.
@@ -254,32 +261,88 @@ public:
   // Returns the file what the device holds: after a power loss, or once the
   // kernel has evicted pages that a failed fdatasync marked clean. Every
   // image goes back, clamped to the file's current size, and is forgotten.
-  // Call it with no engine writing.
+  // Call it with no engine writing, and with no engine open on dir: an mmap
+  // back-end maps the active file MAP_SHARED, and the background hint worker
+  // may be reading a sealed one. copy_device is the cut for a live engine.
   void restore_device(const std::filesystem::path &dir) {
     std::lock_guard<std::mutex> lk{mu_};
     for (const auto &e : std::filesystem::directory_iterator{dir}) {
       if (!e.is_regular_file()) continue;
-      const auto fd = ::open(e.path().c_str(), O_WRONLY | O_CLOEXEC);
-      if (fd == -1) continue;
-      auto it = files_.find(key_of(fd));
-      if (it != files_.end()) {
-        const auto size = static_cast<std::uint64_t>(
-            std::filesystem::file_size(e.path()));
-        for (const auto &[p, bytes] : it->second.image) {
-          const auto at = p * kPage;
-          if (at >= size) continue;
-          const auto n = std::min<std::uint64_t>(kPage, size - at);
-          (void)::pwrite(fd, bytes.data(), n, static_cast<off_t>(at));
-        }
-#ifdef __APPLE__
-        (void)::fsync(fd);  // macOS has no fdatasync
-#else
-        (void)::fdatasync(fd);
-#endif
-        files_.erase(it);
-      }
-      ::close(fd);
+      auto it = find_file(e.path());
+      if (it == files_.end()) continue;
+      overlay(e.path(), it->second);
+      files_.erase(it);
     }
+  }
+
+  // Copies dir to dst as the device would hold it after a power cut now:
+  // every file as it is, then each modelled file's undurable pages overlaid
+  // with the device's bytes, looked up by the source file's inode. The live
+  // engine and its directory are untouched and the model keeps its images,
+  // so a test can cut more than once. A file the hint worker renames while
+  // the copy runs may be missing from it, as after a crash; recovery rebuilds
+  // a missing hint and removes a .tmp. The copy holds no lock, so it opens
+  // while the source is still open.
+  void copy_device(const std::filesystem::path &dir,
+                   const std::filesystem::path &dst) {
+    std::lock_guard<std::mutex> lk{mu_};
+    std::error_code ec;
+    std::filesystem::remove_all(dst, ec);
+    std::filesystem::create_directories(dst);
+    for (const auto &e : std::filesystem::directory_iterator{dir}) {
+      if (!e.is_regular_file(ec)) continue;
+      const auto target = dst / e.path().filename();
+      if (!std::filesystem::copy_file(e.path(), target, ec)) continue;
+      auto it = find_file(e.path());
+      if (it == files_.end()) continue;
+      overlay(target, it->second);
+    }
+  }
+
+  // A hint may only index bytes the device holds. Called with the hint's
+  // path as its trailer is about to be written; its data file has the same
+  // stem. A page of that file whose image differs from its current bytes is
+  // a violation: the hint indexes what the cut would take. A page whose image
+  // equals its current bytes is not — the device holds them either way. That
+  // is a rewrite of durable data in flight: resume() rewrites the file the
+  // degraded state calls active, and a rotation may already have sealed it,
+  // synced it and handed it to the hint worker (a commit sync that fails
+  // after the rotation degrades against the pre-rotation state). Recorded
+  // rather than thrown: the caller may be the background hint worker, where
+  // no test assertion can run.
+  void hint_written(const std::filesystem::path &hint_path) {
+    auto data = hint_path;
+    if (data.extension() == ".tmp") data.replace_extension();
+    data.replace_extension(".data");
+    std::lock_guard<std::mutex> lk{mu_};
+    auto it = find_file(data);
+    if (it == files_.end() || it->second.image.empty()) return;
+    const auto fd = ::open(data.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd == -1) return;
+    struct stat st{};
+    const auto size = ::fstat(fd, &st) == 0 ? static_cast<std::uint64_t>(st.st_size) : 0;
+    std::vector<std::byte> now(kPage);
+    for (const auto &[p, bytes] : it->second.image) {
+      const auto at = p * kPage;
+      if (at >= size) continue;
+      const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(kPage, size - at));
+      const auto got = ::pread(fd, now.data(), n, static_cast<off_t>(at));
+      if (got < 0 || static_cast<std::size_t>(got) != n ||
+          !std::equal(now.begin(), now.begin() + static_cast<std::ptrdiff_t>(n),
+                      bytes.begin())) {
+        hints_over_undurable_.push_back(
+            data.string() + " (page " + std::to_string(p) + ")");
+        break;
+      }
+    }
+    ::close(fd);
+  }
+
+  // Data files whose hint was written while the model held undurable pages
+  // of them: each an index that would outlive its bytes at a power cut.
+  [[nodiscard]] auto hints_over_undurable() -> std::vector<std::string> {
+    std::lock_guard<std::mutex> lk{mu_};
+    return hints_over_undurable_;
   }
 
   // Pages whose bytes the device does not hold, over every file.
@@ -300,8 +363,42 @@ private:
     if (::fstat(fd, &st) != 0) throw std::system_error{errno, std::generic_category()};
     return {st.st_dev, st.st_ino};
   }
+  // The model's state for the file at path, by inode; end() if it has none
+  // or the file cannot be opened. Caller holds mu_.
+  auto find_file(const std::filesystem::path &path)
+      -> std::map<std::pair<dev_t, ino_t>, FileState>::iterator {
+    const auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd == -1) return files_.end();
+    auto it = files_.end();
+    try {
+      it = files_.find(key_of(fd));
+    } catch (...) {
+    }
+    ::close(fd);
+    return it;
+  }
+  // Writes f's images into the file at path, clamped to its size, and syncs.
+  static void overlay(const std::filesystem::path &path, const FileState &f) {
+    const auto fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+    if (fd == -1) return;
+    const auto size =
+        static_cast<std::uint64_t>(std::filesystem::file_size(path));
+    for (const auto &[p, bytes] : f.image) {
+      const auto at = p * kPage;
+      if (at >= size) continue;
+      const auto n = std::min<std::uint64_t>(kPage, size - at);
+      (void)::pwrite(fd, bytes.data(), n, static_cast<off_t>(at));
+    }
+#ifdef __APPLE__
+    (void)::fsync(fd);  // macOS has no fdatasync
+#else
+    (void)::fdatasync(fd);
+#endif
+    ::close(fd);
+  }
   std::mutex mu_;
   std::map<std::pair<dev_t, ino_t>, FileState> files_;
+  std::vector<std::string> hints_over_undurable_;
 };
 
 #pragma clang diagnostic push
@@ -315,6 +412,10 @@ inline void io_cache_write(int fd, std::uint64_t offset, std::size_t len) {
 
 inline void io_cache_synced(int fd) {
   if (active_cache_model) active_cache_model->synced(fd);
+}
+
+inline void io_hint_written(const std::filesystem::path &hint_path) {
+  if (active_cache_model) active_cache_model->hint_written(hint_path);
 }
 
 // A sync's checkpoint. An injected failure there is an fdatasync that
@@ -357,5 +458,8 @@ struct ScopedPageCacheModel {
 
 #define FAULT_CACHE_SYNCED(fd) \
     ::bytecask::testing::io_cache_synced(fd)
+
+#define FAULT_HINT_WRITTEN(hint_path) \
+    ::bytecask::testing::io_hint_written(hint_path)
 
 #endif // BYTECASK_TESTING

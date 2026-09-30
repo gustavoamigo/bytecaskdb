@@ -6,7 +6,10 @@
 // Correctness proof tests for replication primitives. Each test exercises
 // one (StateShape, OpsShape, IngestFailureClass) or
 // (StateShape, ManifestFailureClass) combination from the scenario matrix,
-// validates invariants, and verifies recovery where applicable.
+// validates invariants, and verifies recovery where applicable. The plain
+// successful stream cells also cut the power (#265): the leader once the
+// stream is collected, so every streamed entry must survive it, and the
+// follower once it has ingested, so everything it acknowledged must.
 
 #include <system_error>
 
@@ -22,7 +25,9 @@ import bytecask;
 namespace {
 
 using bytecask::testing::assert_consistent;
+using bytecask::testing::assert_hints_durable;
 using bytecask::testing::assert_replication_match;
+using bytecask::testing::assert_stream_survives_power_loss;
 using bytecask::testing::assert_replication_no_change;
 using bytecask::testing::assert_replication_recovery;
 using bytecask::testing::assert_resumable;
@@ -50,6 +55,9 @@ TEST_CASE("prove_repl__single_key__full_stream__success", "[prove_repl]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   auto follower_dir = td.path / "follower";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto leader_cut = td.path / "leader_cut";
+  auto follower_cut = td.path / "follower_cut";
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir);
@@ -59,6 +67,7 @@ TEST_CASE("prove_repl__single_key__full_stream__success", "[prove_repl]") {
     auto snap = leader.snapshot();
     auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
+    cache.model.copy_device(leader_dir, leader_cut);  // leader loses power
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
@@ -69,8 +78,15 @@ TEST_CASE("prove_repl__single_key__full_stream__success", "[prove_repl]") {
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
+      cache.model.copy_device(follower_dir, follower_cut);  // follower loses power
   }
     assert_replication_recovery(follower_dir, leader_bl);
+    assert_hints_durable(cache.model);
+    // Invariant 8 on the device: the leader keeps every entry it
+    // streamed; ingest syncs, so the follower keeps everything it
+    // acknowledged.
+    assert_stream_survives_power_loss(leader_cut, leader_bl);
+    assert_replication_recovery(follower_cut, leader_bl);
 }
 
 TEST_CASE("prove_repl__single_key__full_stream__append_fails_nothing_written", "[prove_repl]") {
@@ -765,6 +781,9 @@ TEST_CASE("prove_repl__multi_key__full_stream__success", "[prove_repl]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   auto follower_dir = td.path / "follower";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto leader_cut = td.path / "leader_cut";
+  auto follower_cut = td.path / "follower_cut";
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir);
@@ -778,6 +797,7 @@ TEST_CASE("prove_repl__multi_key__full_stream__success", "[prove_repl]") {
     auto snap = leader.snapshot();
     auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
+    cache.model.copy_device(leader_dir, leader_cut);  // leader loses power
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
@@ -788,8 +808,15 @@ TEST_CASE("prove_repl__multi_key__full_stream__success", "[prove_repl]") {
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
+      cache.model.copy_device(follower_dir, follower_cut);  // follower loses power
   }
     assert_replication_recovery(follower_dir, leader_bl);
+    assert_hints_durable(cache.model);
+    // Invariant 8 on the device: the leader keeps every entry it
+    // streamed; ingest syncs, so the follower keeps everything it
+    // acknowledged.
+    assert_stream_survives_power_loss(leader_cut, leader_bl);
+    assert_replication_recovery(follower_cut, leader_bl);
 }
 
 TEST_CASE("prove_repl__multi_key__full_stream__append_fails_nothing_written", "[prove_repl]") {
@@ -1536,6 +1563,9 @@ TEST_CASE("prove_repl__overwrites__full_stream__success", "[prove_repl]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   auto follower_dir = td.path / "follower";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto leader_cut = td.path / "leader_cut";
+  auto follower_cut = td.path / "follower_cut";
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir);
@@ -1546,6 +1576,7 @@ TEST_CASE("prove_repl__overwrites__full_stream__success", "[prove_repl]") {
     auto snap = leader.snapshot();
     auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
+    cache.model.copy_device(leader_dir, leader_cut);  // leader loses power
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
@@ -1556,8 +1587,15 @@ TEST_CASE("prove_repl__overwrites__full_stream__success", "[prove_repl]") {
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
+      cache.model.copy_device(follower_dir, follower_cut);  // follower loses power
   }
     assert_replication_recovery(follower_dir, leader_bl);
+    assert_hints_durable(cache.model);
+    // Invariant 8 on the device: the leader keeps every entry it
+    // streamed; ingest syncs, so the follower keeps everything it
+    // acknowledged.
+    assert_stream_survives_power_loss(leader_cut, leader_bl);
+    assert_replication_recovery(follower_cut, leader_bl);
 }
 
 TEST_CASE("prove_repl__overwrites__full_stream__append_fails_nothing_written", "[prove_repl]") {
@@ -2265,6 +2303,9 @@ TEST_CASE("prove_repl__deletes__full_stream__success", "[prove_repl]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   auto follower_dir = td.path / "follower";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto leader_cut = td.path / "leader_cut";
+  auto follower_cut = td.path / "follower_cut";
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir);
@@ -2275,6 +2316,7 @@ TEST_CASE("prove_repl__deletes__full_stream__success", "[prove_repl]") {
     auto snap = leader.snapshot();
     auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
+    cache.model.copy_device(leader_dir, leader_cut);  // leader loses power
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
@@ -2285,8 +2327,15 @@ TEST_CASE("prove_repl__deletes__full_stream__success", "[prove_repl]") {
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
+      cache.model.copy_device(follower_dir, follower_cut);  // follower loses power
   }
     assert_replication_recovery(follower_dir, leader_bl);
+    assert_hints_durable(cache.model);
+    // Invariant 8 on the device: the leader keeps every entry it
+    // streamed; ingest syncs, so the follower keeps everything it
+    // acknowledged.
+    assert_stream_survives_power_loss(leader_cut, leader_bl);
+    assert_replication_recovery(follower_cut, leader_bl);
 }
 
 TEST_CASE("prove_repl__deletes__full_stream__append_fails_nothing_written", "[prove_repl]") {
@@ -2994,6 +3043,9 @@ TEST_CASE("prove_repl__range_deletes__full_stream__success", "[prove_repl]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   auto follower_dir = td.path / "follower";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto leader_cut = td.path / "leader_cut";
+  auto follower_cut = td.path / "follower_cut";
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir);
@@ -3008,6 +3060,7 @@ TEST_CASE("prove_repl__range_deletes__full_stream__success", "[prove_repl]") {
     auto snap = leader.snapshot();
     auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
+    cache.model.copy_device(leader_dir, leader_cut);  // leader loses power
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
@@ -3018,8 +3071,15 @@ TEST_CASE("prove_repl__range_deletes__full_stream__success", "[prove_repl]") {
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
+      cache.model.copy_device(follower_dir, follower_cut);  // follower loses power
   }
     assert_replication_recovery(follower_dir, leader_bl);
+    assert_hints_durable(cache.model);
+    // Invariant 8 on the device: the leader keeps every entry it
+    // streamed; ingest syncs, so the follower keeps everything it
+    // acknowledged.
+    assert_stream_survives_power_loss(leader_cut, leader_bl);
+    assert_replication_recovery(follower_cut, leader_bl);
 }
 
 TEST_CASE("prove_repl__range_deletes__full_stream__append_fails_nothing_written", "[prove_repl]") {
@@ -3779,6 +3839,9 @@ TEST_CASE("prove_repl__batches__full_stream__success", "[prove_repl]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   auto follower_dir = td.path / "follower";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto leader_cut = td.path / "leader_cut";
+  auto follower_cut = td.path / "follower_cut";
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir);
@@ -3794,6 +3857,7 @@ TEST_CASE("prove_repl__batches__full_stream__success", "[prove_repl]") {
     auto snap = leader.snapshot();
     auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
+    cache.model.copy_device(leader_dir, leader_cut);  // leader loses power
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
@@ -3804,8 +3868,15 @@ TEST_CASE("prove_repl__batches__full_stream__success", "[prove_repl]") {
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
+      cache.model.copy_device(follower_dir, follower_cut);  // follower loses power
   }
     assert_replication_recovery(follower_dir, leader_bl);
+    assert_hints_durable(cache.model);
+    // Invariant 8 on the device: the leader keeps every entry it
+    // streamed; ingest syncs, so the follower keeps everything it
+    // acknowledged.
+    assert_stream_survives_power_loss(leader_cut, leader_bl);
+    assert_replication_recovery(follower_cut, leader_bl);
 }
 
 TEST_CASE("prove_repl__batches__full_stream__append_fails_nothing_written", "[prove_repl]") {
@@ -4769,6 +4840,9 @@ TEST_CASE("prove_repl__multi_file__full_stream__success", "[prove_repl]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   auto follower_dir = td.path / "follower";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto leader_cut = td.path / "leader_cut";
+  auto follower_cut = td.path / "follower_cut";
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
@@ -4782,6 +4856,7 @@ TEST_CASE("prove_repl__multi_file__full_stream__success", "[prove_repl]") {
     auto snap = leader.snapshot();
     auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
+    cache.model.copy_device(leader_dir, leader_cut);  // leader loses power
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
@@ -4792,8 +4867,15 @@ TEST_CASE("prove_repl__multi_file__full_stream__success", "[prove_repl]") {
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
+      cache.model.copy_device(follower_dir, follower_cut);  // follower loses power
   }
     assert_replication_recovery(follower_dir, leader_bl);
+    assert_hints_durable(cache.model);
+    // Invariant 8 on the device: the leader keeps every entry it
+    // streamed; ingest syncs, so the follower keeps everything it
+    // acknowledged.
+    assert_stream_survives_power_loss(leader_cut, leader_bl, {.max_file_bytes = 256});
+    assert_replication_recovery(follower_cut, leader_bl);
 }
 
 TEST_CASE("prove_repl__multi_file__full_stream__append_fails_nothing_written", "[prove_repl]") {
@@ -5904,6 +5986,9 @@ TEST_CASE("prove_repl__mixed_sync_nosync__full_stream__success", "[prove_repl]")
   TempDir td;
   auto leader_dir = td.path / "leader";
   auto follower_dir = td.path / "follower";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto leader_cut = td.path / "leader_cut";
+  auto follower_cut = td.path / "follower_cut";
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir);
@@ -5916,6 +6001,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__full_stream__success", "[prove_repl]")
     auto snap = leader.snapshot();
     auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
+    cache.model.copy_device(leader_dir, leader_cut);  // leader loses power
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
@@ -5926,8 +6012,15 @@ TEST_CASE("prove_repl__mixed_sync_nosync__full_stream__success", "[prove_repl]")
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
+      cache.model.copy_device(follower_dir, follower_cut);  // follower loses power
   }
     assert_replication_recovery(follower_dir, leader_bl);
+    assert_hints_durable(cache.model);
+    // Invariant 8 on the device: the leader keeps every entry it
+    // streamed; ingest syncs, so the follower keeps everything it
+    // acknowledged.
+    assert_stream_survives_power_loss(leader_cut, leader_bl);
+    assert_replication_recovery(follower_cut, leader_bl);
 }
 
 TEST_CASE("prove_repl__mixed_sync_nosync__full_stream__append_fails_nothing_written", "[prove_repl]") {
@@ -6671,6 +6764,9 @@ TEST_CASE("prove_repl__nosync_only__full_stream__success", "[prove_repl]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   auto follower_dir = td.path / "follower";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto leader_cut = td.path / "leader_cut";
+  auto follower_cut = td.path / "follower_cut";
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
@@ -6684,6 +6780,7 @@ TEST_CASE("prove_repl__nosync_only__full_stream__success", "[prove_repl]") {
     auto snap = leader.snapshot();
     auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
+    cache.model.copy_device(leader_dir, leader_cut);  // leader loses power
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
@@ -6694,8 +6791,15 @@ TEST_CASE("prove_repl__nosync_only__full_stream__success", "[prove_repl]") {
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
+      cache.model.copy_device(follower_dir, follower_cut);  // follower loses power
   }
     assert_replication_recovery(follower_dir, leader_bl);
+    assert_hints_durable(cache.model);
+    // Invariant 8 on the device: the leader keeps every entry it
+    // streamed; ingest syncs, so the follower keeps everything it
+    // acknowledged.
+    assert_stream_survives_power_loss(leader_cut, leader_bl, {.max_file_bytes = 256});
+    assert_replication_recovery(follower_cut, leader_bl);
 }
 
 TEST_CASE("prove_repl__nosync_only__full_stream__append_fails_nothing_written", "[prove_repl]") {
@@ -7816,6 +7920,9 @@ TEST_CASE("prove_repl__nosync_then_sync__full_stream__success", "[prove_repl]") 
   TempDir td;
   auto leader_dir = td.path / "leader";
   auto follower_dir = td.path / "follower";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto leader_cut = td.path / "leader_cut";
+  auto follower_cut = td.path / "follower_cut";
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir);
@@ -7828,6 +7935,7 @@ TEST_CASE("prove_repl__nosync_then_sync__full_stream__success", "[prove_repl]") 
     auto snap = leader.snapshot();
     auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
+    cache.model.copy_device(leader_dir, leader_cut);  // leader loses power
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
@@ -7838,8 +7946,15 @@ TEST_CASE("prove_repl__nosync_then_sync__full_stream__success", "[prove_repl]") 
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
+      cache.model.copy_device(follower_dir, follower_cut);  // follower loses power
   }
     assert_replication_recovery(follower_dir, leader_bl);
+    assert_hints_durable(cache.model);
+    // Invariant 8 on the device: the leader keeps every entry it
+    // streamed; ingest syncs, so the follower keeps everything it
+    // acknowledged.
+    assert_stream_survives_power_loss(leader_cut, leader_bl);
+    assert_replication_recovery(follower_cut, leader_bl);
 }
 
 TEST_CASE("prove_repl__nosync_then_sync__full_stream__append_fails_nothing_written", "[prove_repl]") {
@@ -8583,6 +8698,9 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__success", "[prove_repl]") 
   TempDir td;
   auto leader_dir = td.path / "leader";
   auto follower_dir = td.path / "follower";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto leader_cut = td.path / "leader_cut";
+  auto follower_cut = td.path / "follower_cut";
   bytecask::testing::ReplicationBaseline leader_bl;
   {
     auto leader = bytecask::DB::open(leader_dir, {.max_file_bytes = 256});
@@ -8613,6 +8731,7 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__success", "[prove_repl]") 
     auto snap = leader.snapshot();
     auto owned = collect_changes(leader.changes_since(snap, stream_from));
     auto views = owned.views();
+    cache.model.copy_device(leader_dir, leader_cut);  // leader loses power
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
@@ -8624,8 +8743,15 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__success", "[prove_repl]") 
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
+      cache.model.copy_device(follower_dir, follower_cut);  // follower loses power
   }
     assert_replication_recovery(follower_dir, leader_bl);
+    assert_hints_durable(cache.model);
+    // Invariant 8 on the device: the leader keeps every entry it
+    // streamed; ingest syncs, so the follower keeps everything it
+    // acknowledged.
+    assert_stream_survives_power_loss(leader_cut, leader_bl, {.max_file_bytes = 256});
+    assert_replication_recovery(follower_cut, leader_bl);
 }
 
 TEST_CASE("prove_repl__vacuumed_batches__full_stream__append_fails_nothing_written", "[prove_repl]") {

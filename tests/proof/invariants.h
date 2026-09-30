@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -71,13 +72,20 @@ struct ExpectedDelta {
 
 // ---- Core functions ------------------------------------------------------
 
+// Every live key with its value, read through the iterator.
+inline auto key_values(const DB &db) -> std::map<std::string, Bytes> {
+  std::map<std::string, Bytes> kv;
+  for (const auto &entry : db.iter_from({})) {
+    kv[to_string(entry.key)] = Bytes{entry.value.begin(), entry.value.end()};
+  }
+  return kv;
+}
+
 // Captures a baseline snapshot of the DB for later delta comparison.
 inline auto capture_baseline(const DB &db) -> Baseline {
   Baseline bl;
   bl.next_seq = db.engine_state()->next_seq;
-  for (const auto &entry : db.iter_from({})) {
-    bl.key_values[to_string(entry.key)] = Bytes{entry.value.begin(), entry.value.end()};
-  }
+  bl.key_values = key_values(db);
   return bl;
 }
 
@@ -289,10 +297,7 @@ inline auto fingerprint(const DB &db) -> EngineFingerprint {
   EngineFingerprint fp;
   auto state = db.engine_state();
   fp.next_seq = state->next_seq;
-  for (const auto &entry : db.iter_from({})) {
-    fp.key_values[to_string(entry.key)] =
-        Bytes{entry.value.begin(), entry.value.end()};
-  }
+  fp.key_values = key_values(db);
   for (const auto [file_id, fs] : state->file_stats) {
     auto file = state->files.get(file_id);
     if (!file) continue;
@@ -344,6 +349,119 @@ inline void assert_matches_recovery(const std::filesystem::path &dir,
     CHECK(it->second.max_sequence == fs.max_sequence);
     CHECK(it->second.tombstone_bytes == fs.tombstone_bytes);
     CHECK(it->second.marker_bytes == fs.marker_bytes);
+  }
+}
+
+// ---- Power loss ------------------------------------------------------------
+//
+// The generators cut the power after every cell (#265). A cell runs under
+// ScopedPageCacheModel; before ~DB syncs the directory, copy_device copies it
+// as the device holds it, and the copy is recovered. The rule for what may be
+// missing is the crash harness's watermark rule, applied where a sync = false
+// write can actually be lost: the baseline is made durable first, so the
+// recovered copy holds the baseline alone, or the baseline and the whole
+// transition, and must hold the transition once the durable watermark covers
+// it. A partial transition is a failure either way.
+
+// Makes every write so far durable: an empty sync batch flushes what earlier
+// sync = false writes left in the page cache. Called at the end of a cell's
+// setup, so the baseline is what a cut cannot take. Returns the watermark.
+inline auto make_durable(DB &db) -> std::uint64_t {
+  const auto r = db.apply_batch({.sync = true}, WritePlan{});
+  REQUIRE(r.has_value());
+  REQUIRE(r->durable);
+  const auto durable = db.durable_sequence();
+  INFO("every sequence assigned so far must be durable");
+  REQUIRE(durable + 1 == db.engine_state()->next_seq);
+  return durable;
+}
+
+// The highest sequence the cell knows to be durable at the cut:
+// durable_sequence(), which must already cover a CommitResult that reported
+// durable — the two are checked against each other, as the crash harness does
+// with what the child reported.
+inline auto durable_watermark(const DB &db,
+                              const std::optional<CommitResult> &cr = {})
+    -> std::uint64_t {
+  auto watermark = db.durable_sequence();
+  if (cr && cr->durable) {
+    INFO("a CommitResult reported durable must be covered by durable_sequence()");
+    CHECK(watermark >= cr->sequence);
+    watermark = std::max(watermark, cr->sequence);
+  }
+  return watermark;
+}
+
+// The baseline with the whole transition applied, as the reference model
+// describes it.
+inline auto apply_delta(const std::map<std::string, Bytes> &baseline,
+                        const ExpectedDelta &expected)
+    -> std::map<std::string, Bytes> {
+  auto out = baseline;
+  for (const auto &key : expected.keys_removed) out.erase(key);
+  for (const auto &[key, value] : expected.expected_values) {
+    const auto bv = to_bytes(value);
+    out[key] = Bytes{bv.begin(), bv.end()};
+  }
+  return out;
+}
+
+// What a cut copy may recover to.
+struct PowerLossExpectation {
+  std::map<std::string, Bytes> baseline;  // durable before the transition
+  std::map<std::string, Bytes> after;     // baseline + the whole transition
+  std::uint64_t transition_last_seq{0};   // 0: the transition wrote nothing
+  std::uint64_t watermark{0};             // durable_watermark at the cut
+};
+
+// `got` is exactly `expected`, reported key by key.
+inline void check_key_values(const std::map<std::string, Bytes> &got,
+                             const std::map<std::string, Bytes> &expected,
+                             const char *what) {
+  for (const auto &[key, value] : expected) {
+    INFO(what << ": key must be present with its value: " << key);
+    auto it = got.find(key);
+    CHECK(it != got.end());
+    if (it != got.end()) CHECK(it->second == value);
+  }
+  for (const auto &[key, _] : got) {
+    INFO(what << ": unexpected key: " << key);
+    CHECK(expected.contains(key));
+  }
+}
+
+// Recovers the copy a power cut left and checks it against the expectation.
+// The transition is required when the in-process watermark covered it, and
+// when the recovered durable_sequence() does: a recovered engine that claims
+// a sequence durable must hold what it wrote.
+inline void assert_power_loss_outcome(const std::filesystem::path &cut,
+                                      const PowerLossExpectation &x,
+                                      const Options &opts = {}) {
+  auto recovered = DB::open(cut, opts);
+  const auto got = key_values(recovered);
+  const auto durable = recovered.durable_sequence();
+  {
+    INFO("recovered durable_sequence must cover the in-process watermark");
+    CHECK(durable >= x.watermark);
+  }
+  const bool required =
+      x.transition_last_seq > 0 && (x.watermark >= x.transition_last_seq ||
+                                    durable >= x.transition_last_seq);
+  if (required) {
+    check_key_values(got, x.after, "the transition was durable");
+  } else if (got != x.baseline) {
+    check_key_values(got, x.after,
+                     "a transition that survives must survive whole");
+  }
+  assert_consistent(recovered);
+}
+
+// No hint the cell wrote indexed bytes the device did not hold. Checked once
+// the DB is closed, so the background hint worker has written every hint.
+inline void assert_hints_durable(PageCacheModel &model) {
+  for (const auto &data : model.hints_over_undurable()) {
+    INFO("hint written while the device did not hold every page of " << data);
+    CHECK(false);
   }
 }
 
@@ -889,6 +1007,28 @@ inline void assert_replication_recovery(const std::filesystem::path &dir,
     CHECK(leader.key_values.contains(key_str));
   }
 
+  assert_consistent(recovered);
+}
+
+// The leader's copy after a power cut, taken once a follower was handed a
+// changes_since stream: every entry the stream carried must still be there.
+// Invariant 8 proven on the device rather than on the return value — a
+// leader that streamed an entry it then lost would leave the follower ahead
+// of it.
+inline void assert_stream_survives_power_loss(
+    const std::filesystem::path &leader_cut,
+    const ReplicationBaseline &streamed, const Options &opts = {}) {
+  auto recovered = DB::open(leader_cut, opts);
+  {
+    INFO("the leader must recover to at least what it streamed");
+    CHECK(recovered.durable_sequence() >= streamed.durable_seq);
+  }
+  for (const auto &[key, value] : streamed.key_values) {
+    INFO("streamed key must survive the leader's power loss: " << key);
+    Bytes out;
+    REQUIRE(recovered.get({}, to_bytes(key), out));
+    CHECK(out == value);
+  }
   assert_consistent(recovered);
 }
 

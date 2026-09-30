@@ -6,7 +6,10 @@
 // Correctness proof tests for group commit under I/O failure. Each test forces
 // a deterministic batch of N writers through one leader, faults the group's
 // shared I/O on the leader's thread, and verifies that every writer in the
-// group saw the same outcome and that the group landed all or nothing.
+// group saw the same outcome and that the group landed all or nothing. Every
+// cell cuts the power before the DB closes (#265) and checks the directory as
+// the device held it agrees with the engine: a synced group is durable, and a
+// resumed one made durable what it published.
 
 #include <array>
 #include <condition_variable>
@@ -29,6 +32,7 @@ import bytecask;
 namespace {
 
 using bytecask::testing::assert_consistent;
+using bytecask::testing::assert_hints_durable;
 using bytecask::testing::assert_matches_recovery;
 using bytecask::testing::assert_resumable;
 using bytecask::testing::fingerprint;
@@ -57,6 +61,8 @@ struct TempDir {
 TEST_CASE("prove_group__group_of_2__success", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir);
@@ -133,14 +139,21 @@ TEST_CASE("prove_group__group_of_2__success", "[prove_group][concurrency]") {
     }
     assert_consistent(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp);
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_group__group_of_2__group_append_fails", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir);
@@ -215,14 +228,21 @@ TEST_CASE("prove_group__group_of_2__group_append_fails", "[prove_group][concurre
     assert_consistent(db);
     assert_resumable(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp);
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_group__group_of_2__group_append_partial_write", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir);
@@ -299,14 +319,21 @@ TEST_CASE("prove_group__group_of_2__group_append_partial_write", "[prove_group][
     assert_consistent(db);
     assert_resumable(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp);
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_group__group_of_2__group_commit_sync_fails", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir);
@@ -386,14 +413,21 @@ TEST_CASE("prove_group__group_of_2__group_commit_sync_fails", "[prove_group][con
     assert_consistent(db);
     assert_resumable(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp);
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_group__group_of_4__success", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir);
@@ -470,14 +504,21 @@ TEST_CASE("prove_group__group_of_4__success", "[prove_group][concurrency]") {
     }
     assert_consistent(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp);
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_group__group_of_4__group_append_fails", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir);
@@ -552,14 +593,21 @@ TEST_CASE("prove_group__group_of_4__group_append_fails", "[prove_group][concurre
     assert_consistent(db);
     assert_resumable(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp);
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_group__group_of_4__group_append_partial_write", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir);
@@ -636,14 +684,21 @@ TEST_CASE("prove_group__group_of_4__group_append_partial_write", "[prove_group][
     assert_consistent(db);
     assert_resumable(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp);
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_group__group_of_4__group_commit_sync_fails", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir);
@@ -723,14 +778,21 @@ TEST_CASE("prove_group__group_of_4__group_commit_sync_fails", "[prove_group][con
     assert_consistent(db);
     assert_resumable(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp);
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_group__group_of_2_batched__success", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir);
@@ -809,14 +871,21 @@ TEST_CASE("prove_group__group_of_2_batched__success", "[prove_group][concurrency
     }
     assert_consistent(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp);
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_group__group_of_2_batched__group_append_fails", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir);
@@ -893,14 +962,21 @@ TEST_CASE("prove_group__group_of_2_batched__group_append_fails", "[prove_group][
     assert_consistent(db);
     assert_resumable(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp);
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_group__group_of_2_batched__group_append_partial_write", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir);
@@ -979,14 +1055,21 @@ TEST_CASE("prove_group__group_of_2_batched__group_append_partial_write", "[prove
     assert_consistent(db);
     assert_resumable(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp);
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_group__group_of_2_batched__group_commit_sync_fails", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir);
@@ -1068,14 +1151,21 @@ TEST_CASE("prove_group__group_of_2_batched__group_commit_sync_fails", "[prove_gr
     assert_consistent(db);
     assert_resumable(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp);
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_group__group_of_4_batched__success", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir);
@@ -1154,14 +1244,21 @@ TEST_CASE("prove_group__group_of_4_batched__success", "[prove_group][concurrency
     }
     assert_consistent(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp);
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_group__group_of_4_batched__group_append_fails", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir);
@@ -1238,14 +1335,21 @@ TEST_CASE("prove_group__group_of_4_batched__group_append_fails", "[prove_group][
     assert_consistent(db);
     assert_resumable(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp);
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_group__group_of_4_batched__group_append_partial_write", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir);
@@ -1324,14 +1428,21 @@ TEST_CASE("prove_group__group_of_4_batched__group_append_partial_write", "[prove
     assert_consistent(db);
     assert_resumable(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp);
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_group__group_of_4_batched__group_commit_sync_fails", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir);
@@ -1413,14 +1524,21 @@ TEST_CASE("prove_group__group_of_4_batched__group_commit_sync_fails", "[prove_gr
     assert_consistent(db);
     assert_resumable(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp);
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_group__group_of_2_rotation__success", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -1497,14 +1615,21 @@ TEST_CASE("prove_group__group_of_2_rotation__success", "[prove_group][concurrenc
     }
     assert_consistent(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp, {.max_file_bytes = 1});
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1});
 }
 
 TEST_CASE("prove_group__group_of_2_rotation__group_rotation_sync_fails", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -1579,14 +1704,21 @@ TEST_CASE("prove_group__group_of_2_rotation__group_rotation_sync_fails", "[prove
     assert_consistent(db);
     assert_resumable(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp, {.max_file_bytes = 1});
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1});
 }
 
 TEST_CASE("prove_group__group_of_2_rotation__group_rotation_file_creation_fails", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -1661,14 +1793,21 @@ TEST_CASE("prove_group__group_of_2_rotation__group_rotation_file_creation_fails"
     assert_consistent(db);
     assert_resumable(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp, {.max_file_bytes = 1});
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1});
 }
 
 TEST_CASE("prove_group__group_of_4_rotation__success", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -1745,14 +1884,21 @@ TEST_CASE("prove_group__group_of_4_rotation__success", "[prove_group][concurrenc
     }
     assert_consistent(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp, {.max_file_bytes = 1});
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1});
 }
 
 TEST_CASE("prove_group__group_of_4_rotation__group_rotation_sync_fails", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -1827,14 +1973,21 @@ TEST_CASE("prove_group__group_of_4_rotation__group_rotation_sync_fails", "[prove
     assert_consistent(db);
     assert_resumable(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp, {.max_file_bytes = 1});
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1});
 }
 
 TEST_CASE("prove_group__group_of_4_rotation__group_rotation_file_creation_fails", "[prove_group][concurrency]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 1});
@@ -1909,7 +2062,12 @@ TEST_CASE("prove_group__group_of_4_rotation__group_rotation_file_creation_fails"
     assert_consistent(db);
     assert_resumable(db);
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   // Whatever the group left on disk, a cold open must agree with it.
   assert_matches_recovery(dir, fp, {.max_file_bytes = 1});
+  // And so must the directory as the device held it at the cut:
+  // the group was synced, or resume() made durable what it published.
+  assert_matches_recovery(cut, fp, {.max_file_bytes = 1});
 }

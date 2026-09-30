@@ -21,7 +21,10 @@ from tests.proof.vacuum_compact.expected_delta import (
     VacuumCompactDelta,
     vacuum_compact_delta,
 )
-from tests.proof.vacuum_compact.fault_point_resolver import resolve_compact_fault
+from tests.proof.vacuum_compact.fault_point_resolver import (
+    CompactFault,
+    resolve_compact_fault,
+)
 from tests.proof.vacuum_compact.scenario_matrix import (
     CompactStateShape,
     VacuumCompactFailureClass,
@@ -88,11 +91,29 @@ def gen_setup(state: CompactStateShape) -> str:
             lines.append(
                 f'    (void)db.del({{.sync = false}}, to_bytes("{key}"));'
             )
+    lines.append("    // The baseline a power cut cannot take: everything so far is")
+    lines.append("    // durable before the state vacuum will judge the file by is made.")
+    lines.append("    make_durable(db);")
+    lines.append("    durable_before = key_values(db);")
+    if state.overwritten_keys:
+        lines.append(
+            f"    // Overwrite {list(state.overwritten_keys)} without a sync (#245):"
+        )
+        lines.append(
+            "    // the sealed file's entries are dead only by writes a power cut"
+        )
+        lines.append("    // can lose.")
+        # 2-byte values: a 23-byte entry, so the overwrites stay under the
+        # 50-byte limit and no rotation syncs them (a rotation would).
+        for key in state.overwritten_keys:
+            lines.append(
+                f'    db.put({{.sync = false}}, to_bytes("{key}"), to_bytes("n{key[1:]}"));'
+            )
     return "\n".join(lines)
 
 
 def gen_vacuum_call(
-    fault_name: str | None, failure: VacuumCompactFailureClass
+    fault: CompactFault | None, failure: VacuumCompactFailureClass
 ) -> str:
     """Generate the vacuum() call, wrapped in fault injector if needed."""
     # fragmentation_threshold=0.0 ensures any sealed file qualifies for vacuum.
@@ -113,29 +134,37 @@ def gen_vacuum_call(
         "    // disk under its final name and the published state does not\n"
         "    // reference it. The next open must detect it and delete it."
         if failure == VacuumCompactFailureClass.VC6
+        else "\n    // VC7: the fdatasync that makes the superseding sync = false writes\n"
+        "    // durable fails (#261). The engine degrades and vacuum throws before\n"
+        "    // committing; the old file stays."
+        if failure == VacuumCompactFailureClass.VC7
         else ""
     )
 
-    if fault_name is None:
+    if fault is None:
         return f"    REQUIRE(db.vacuum({opts}));"
 
+    nth = (
+        f"\n      fi.inj.fail_on_nth_match = {fault.nth};" if fault.nth else ""
+    )
     return (
         f"    {{{vc4_comment}\n"
-        f'      bytecask::testing::ScopedFaultInjector fi{{"{fault_name}"}};\n'
+        f'      bytecask::testing::ScopedFaultInjector fi{{"{fault.name}"}};{nth}\n'
         f"      REQUIRE_THROWS_AS(db.vacuum({opts}), std::system_error);\n"
         f"    }}"
     )
 
 
 def gen_assertions(delta: VacuumCompactDelta) -> str:
+    degraded = "true" if delta.degraded else "false"
     if delta.file_removed:
         return (
             "    assert_vacuum_success(db, before, vacuumed_file_id);\n"
-            "    CHECK_FALSE(db.is_degraded());"
+            f"    CHECK(db.is_degraded() == {degraded});"
         )
     return (
         "    assert_vacuum_no_change(db, before, vacuumed_file_id);\n"
-        "    CHECK_FALSE(db.is_degraded());"
+        f"    CHECK(db.is_degraded() == {degraded});"
     )
 
 
@@ -144,7 +173,7 @@ def gen_test(
 ) -> str:
     """Generate one complete TEST_CASE."""
     delta = vacuum_compact_delta(state, failure)
-    fault_name = resolve_compact_fault(failure)
+    fault = resolve_compact_fault(state, failure)
     name = f"prove_vacuum_compact__{state.label}__{failure.value}"
 
     parts: List[str] = []
@@ -155,6 +184,12 @@ def gen_test(
     parts.append(f'TEST_CASE("{name}", "[prove_vacuum_compact]") {{')
     parts.append("  TempDir td;")
     parts.append('  auto dir = td.path / "db";')
+    # Power loss (#265): the cell runs under the page cache model, and the
+    # directory is copied as the device holds it before ~DB syncs it.
+    parts.append("  bytecask::testing::ScopedPageCacheModel cache;")
+    parts.append('  auto cut = td.path / "cut";')
+    parts.append("  std::map<std::string, bytecask::Bytes> durable_before;")
+    parts.append("  std::uint64_t watermark = 0;")
     parts.append("  bytecask::testing::VacuumBaseline before;")
     orphan_check = failure == VacuumCompactFailureClass.VC6
     if orphan_check:
@@ -165,7 +200,7 @@ def gen_test(
     parts.append("    before = capture_vacuum_baseline(db);")
     parts.append("    auto vacuumed_file_id = find_vacuum_target(db);")
     parts.append("")
-    parts.append(gen_vacuum_call(fault_name, failure))
+    parts.append(gen_vacuum_call(fault, failure))
     parts.append("")
     parts.append(gen_assertions(delta))
     # Every cell, thrown or not: no staging copy outlives the vacuum call.
@@ -173,11 +208,26 @@ def gen_test(
     if orphan_check:
         parts.append("    orphans = unreferenced_data_files(db, dir);")
         parts.append("    REQUIRE(orphans.size() == 1);  // the uncommitted copy")
+    parts.append("    watermark = durable_watermark(db);")
+    parts.append("    cache.model.copy_device(dir, cut);  // power cut")
     parts.append("  }")
+    parts.append("  assert_hints_durable(cache.model);")
     opts = _build_open_opts(state)
     parts.append(f"  assert_vacuum_recoverable(dir, before, {{{opts}}});")
     if orphan_check:
         parts.append("  CHECK_FALSE(std::filesystem::exists(orphans.front()));")
+    # The cut copy: the durable baseline, alone or with every overwrite, and
+    # with them once the watermark covers them. A key gone is #245.
+    last_seq = (
+        "before.keys.next_seq - 1" if state.has_unsynced_superseder else "0"
+    )
+    parts.append("  assert_power_loss_outcome(")
+    parts.append("      cut,")
+    parts.append("      {.baseline = durable_before,")
+    parts.append("       .after = before.keys.key_values,")
+    parts.append(f"       .transition_last_seq = {last_seq},")
+    parts.append(f"       .watermark = watermark}},")
+    parts.append(f"      {{{opts}}});")
     parts.append("}")
     if state.io_backend != "pread":
         parts.append("#endif  // __EMSCRIPTEN__")
@@ -203,7 +253,14 @@ FILE_HEADER = """\
 // after the commit, before the unlink — recovers, with the vacuum undone.
 // VC6 (#104 M3) verifies that a copy renamed but never committed is an orphan
 // the next open detects and deletes.
+// VC7 (#261) fails the fdatasync vacuum issues before dropping entries that
+// only sync = false writes supersede. Every cell cuts the power after the
+// vacuum (#265) and recovers the directory as the device held it: the durable
+// baseline must be there, with every overwrite or with none.
 
+#include <cstdint>
+#include <map>
+#include <string>
 #include <system_error>
 
 #ifdef BYTECASK_TESTING
@@ -218,7 +275,12 @@ import bytecask;
 namespace {
 
 using bytecask::testing::assert_consistent;
+using bytecask::testing::assert_hints_durable;
+using bytecask::testing::assert_power_loss_outcome;
 using bytecask::testing::assert_vacuum_no_change;
+using bytecask::testing::durable_watermark;
+using bytecask::testing::key_values;
+using bytecask::testing::make_durable;
 using bytecask::testing::assert_vacuum_recoverable;
 using bytecask::testing::unreferenced_data_files;
 using bytecask::testing::assert_vacuum_success;

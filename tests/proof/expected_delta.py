@@ -85,7 +85,8 @@ def expected_delta(
     key_labels:    the key name assigned to each op in the plan
     existing_keys: which of those keys exist in the pre-transition state
     """
-    if failure == FailureClass.SUCCESS:
+    if failure in (FailureClass.SUCCESS, FailureClass.NOSYNC):
+        # NOSYNC differs from SUCCESS only in what a power cut may take.
         return _full_delta(plan, key_labels, existing_keys)
 
     if failure == FailureClass.A:

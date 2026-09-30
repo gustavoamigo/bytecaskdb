@@ -24,10 +24,28 @@ class CompactStateShape:
     # file being compacted carries a range tombstone. The keys it covers are
     # named in deleted_keys.
     range_del: Optional[Tuple[str, str]] = None
+    # Keys overwritten with sync = false once the baseline is durable (#245).
+    # Their entries in the sealed file are dead only by writes a power cut can
+    # lose, so vacuum must make those writes durable before it drops them.
+    overwritten_keys: Tuple[str, ...] = ()
 
     @property
     def live_keys(self) -> List[str]:
-        return [k for k in self.sealed_keys if k not in self.deleted_keys]
+        return [
+            k
+            for k in self.sealed_keys
+            if k not in self.deleted_keys and k not in self.overwritten_keys
+        ]
+
+    @property
+    def has_unsynced_superseder(self) -> bool:
+        return bool(self.overwritten_keys)
+
+    # No live entry and no tombstone: vacuum drops the file whole, with no
+    # staging copy (vacuum_remove_file).
+    @property
+    def whole_file(self) -> bool:
+        return not self.live_keys
 
 
 class VacuumCompactFailureClass(Enum):
@@ -41,6 +59,11 @@ class VacuumCompactFailureClass(Enum):
     # process did not get to confirm it. Nothing is committed, so the copy on
     # disk is an orphan the published state does not reference.
     VC6 = "post_rename"       # io_vacuum_compact_post_rename (renamed; not committed)
+    # The fdatasync vacuum_commit issues before it drops entries superseded
+    # only by sync = false writes (#261): io_data_file_sync, the second one on
+    # the compaction path (the first is the staging copy's), the first on the
+    # whole-file path. Vacuum degrades and throws without committing.
+    VC7 = "durability_sync_fails"
 
 
 # Compact path is now always used for files with live_bytes > 0.
@@ -112,9 +135,49 @@ COMPACT_STATE_SHAPES = [
         max_file_bytes=73,
         range_del=("k1", "k2"),
     ),
+    # #245: the sealed file's dead entries are superseded only by sync = false
+    # writes. Two 25-byte puts fill max_file_bytes = 50 and seal file_0; the
+    # 23-byte overwrites (2-byte values) land in the next file and stay under
+    # the limit, so nothing but vacuum syncs them — a rotation would, and did
+    # when the values were 4 bytes. Deleting instead would hide the bug: a
+    # lost delete and a dropped Put leave the state the history ends in.
+    CompactStateShape(
+        "unsynced_overwrite",
+        sealed_keys=["k0", "k1"],
+        deleted_keys=[],
+        max_file_bytes=50,
+        overwritten_keys=("k1",),
+    ),
+    # Every key overwritten: no live entry and no tombstone, so vacuum drops
+    # the file whole, without a staging copy — the other path through
+    # vacuum_commit, and the one #245 was found on.
+    CompactStateShape(
+        "unsynced_overwrite_whole_file",
+        sealed_keys=["k0", "k1"],
+        deleted_keys=[],
+        max_file_bytes=50,
+        overwritten_keys=("k0", "k1"),
+    ),
 ]
 
 VACUUM_COMPACT_FAILURE_CLASSES = list(VacuumCompactFailureClass)
+
+
+def is_valid_combination(
+    state: CompactStateShape, failure: VacuumCompactFailureClass
+) -> bool:
+    # vacuum_commit syncs only when the state it judged the file by holds
+    # writes no fdatasync has covered.
+    if failure == VacuumCompactFailureClass.VC7:
+        return state.has_unsynced_superseder
+    # The whole-file path writes no staging copy, so it never makes the calls
+    # VC1-VC4 and VC6 fault. It commits and unlinks, so VC5 applies.
+    if state.whole_file:
+        return failure in (
+            VacuumCompactFailureClass.SUCCESS,
+            VacuumCompactFailureClass.VC5,
+        )
+    return True
 
 
 def generate_matrix() -> Generator[
@@ -122,4 +185,5 @@ def generate_matrix() -> Generator[
 ]:
     for state in COMPACT_STATE_SHAPES:
         for failure in VACUUM_COMPACT_FAILURE_CLASSES:
-            yield (state, failure)
+            if is_valid_combination(state, failure):
+                yield (state, failure)

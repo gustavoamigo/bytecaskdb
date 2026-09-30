@@ -19,6 +19,11 @@ class OpType(Enum):
 
 class FailureClass(Enum):
     SUCCESS = "success"
+    # The transition commits with sync = false and no fault. In process it is
+    # SUCCESS; under the power cut every cell ends with (#265) it is the one
+    # class whose transition the cut may take, whole or not at all, so it is
+    # what makes the "baseline alone" arm of that check non-vacuous.
+    NOSYNC = "success_nosync"
     A = "before_any_io"
     B1 = "append_fails_nothing_written"
     B2 = "append_fails_partial_write"
@@ -296,7 +301,9 @@ def is_valid_observer(
     """
     if observer == Observer.NONE:
         return True
-    if failure == FailureClass.A:
+    # A returns before any I/O and cannot invalidate anything; NOSYNC does
+    # exactly what SUCCESS does to a view, and exists for the power cut.
+    if failure in (FailureClass.A, FailureClass.NOSYNC):
         return False
     if not (failure in DEGRADING_CLASSES or state.io_backend == "mmap"):
         return False
