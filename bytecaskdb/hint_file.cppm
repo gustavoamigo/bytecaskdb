@@ -148,25 +148,43 @@ void read_exact(int fd, std::span<std::byte> out, std::uint64_t offset,
   }
 }
 
-// A hint file open for reading, shared by its HintFile and every scanner
-// over it, so no scanner outlives the fd it reads. A unit is what a scanner
-// reads and decodes at once: a zstd frame, or in a raw file a run of whole
-// entries about a frame long.
+// A descriptor closed when it goes out of scope.
+class ScopedFd {
+public:
+  explicit ScopedFd(int fd) noexcept : fd_{fd} {}
+  ~ScopedFd() { ::close(fd_); }
+  ScopedFd(const ScopedFd &) = delete;
+  ScopedFd &operator=(const ScopedFd &) = delete;
+  ScopedFd(ScopedFd &&) = delete;
+  ScopedFd &operator=(ScopedFd &&) = delete;
+  [[nodiscard]] auto get() const noexcept -> int { return fd_; }
+
+private:
+  int fd_;
+};
+
+// Opens a hint file for reading. Throws std::system_error when it cannot.
+auto open_read_only(const std::filesystem::path &path) -> ScopedFd {
+  const auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd == -1) {
+    throw std::system_error{
+        errno, std::generic_category(),
+        std::format("HintFile: cannot open '{}' for read", path.string())};
+  }
+  return ScopedFd{fd};
+}
+
+// What a reader knows about a hint file: the path to open it at, and where
+// its units are. A unit is what a scanner reads and decodes at once: a zstd
+// frame, or in a raw file a run of whole entries about a frame long. The file
+// is not held open: the pass that opens it and every unit read after it open
+// the file for the duration of the read, so a recovery merging thousands of
+// files costs each thread one descriptor, not one per file (#251).
 struct HintSource {
   std::filesystem::path path;
-  int fd{-1};
   bool framed{false};
   // File offset of each unit, then the offset where the units end.
   std::vector<std::uint64_t> units;
-
-  HintSource() = default;
-  HintSource(const HintSource &) = delete;
-  HintSource &operator=(const HintSource &) = delete;
-  HintSource(HintSource &&) = delete;
-  HintSource &operator=(HintSource &&) = delete;
-  ~HintSource() {
-    if (fd != -1) ::close(fd);
-  }
 };
 
 // The open pass reads a file front to back in chunks of this size. A chunk
@@ -179,8 +197,8 @@ static_assert(kOpenChunkBytes >= kMaxHintEntryBytes);
 // in order, and fed to the CRC as it arrives.
 class OpenPass {
 public:
-  OpenPass(const HintSource &src, std::uint64_t end)
-      : src_{src}, end_{end}, buf_(kOpenChunkBytes) {}
+  OpenPass(int fd, const std::filesystem::path &path, std::uint64_t end)
+      : fd_{fd}, path_{path}, end_{end}, buf_(kOpenChunkBytes) {}
 
   // The bytes from `at` on that are in the buffer: at least
   // min(want, end - at) of them, reading more if needed. `at` only moves
@@ -199,7 +217,7 @@ public:
       const auto n = static_cast<std::size_t>(
           std::min<std::uint64_t>(buf_.size() - keep, end_ - read_to));
       const auto fresh = std::span{buf_}.subspan(keep, n);
-      read_exact(src_.fd, fresh, read_to, src_.path);
+      read_exact(fd_, fresh, read_to, path_);
       crc_.update(fresh);
       buf_at_ = at;
       len_ = keep + n;
@@ -215,7 +233,8 @@ public:
   }
 
 private:
-  const HintSource &src_;
+  int fd_;
+  const std::filesystem::path &path_;
   std::uint64_t end_;
   std::vector<std::byte> buf_;
   std::uint64_t buf_at_{0}; // file offset of buf_[0]
@@ -229,28 +248,23 @@ private:
 // matched against the trailer: a damaged or unreadable hint throws here,
 // before any entry reaches recovery, which is what lets recovery rebuild it
 // with nothing to undo. The pass holds one chunk; the file is never held
-// whole. Throws std::system_error on I/O failure and std::runtime_error on
-// damage.
+// whole, and its descriptor is closed when the pass is done. Throws
+// std::system_error on I/O failure and std::runtime_error on damage.
 auto open_source(std::filesystem::path path)
     -> std::shared_ptr<const HintSource> {
   auto src = std::make_shared<HintSource>();
   src->path = std::move(path);
-  src->fd = ::open(src->path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (src->fd == -1) {
-    throw std::system_error{
-        errno, std::generic_category(),
-        std::format("HintFile: cannot open '{}' for read", src->path.string())};
-  }
+  const auto fd = open_read_only(src->path);
   // The size of the file this fd reads, not of whatever the path names now.
   struct stat st{};
-  if (::fstat(src->fd, &st) != 0) {
+  if (::fstat(fd.get(), &st) != 0) {
     throw std::system_error{
         errno, std::generic_category(),
         std::format("HintFile: cannot stat '{}'", src->path.string())};
   }
 #ifndef __APPLE__
-  // Both the open pass and the scans walk the file front to back.
-  ::posix_fadvise(src->fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+  // The pass walks the file front to back.
+  ::posix_fadvise(fd.get(), 0, 0, POSIX_FADV_SEQUENTIAL);
 #endif
   const auto file_size = narrow<std::uint64_t>(st.st_size);
   if (file_size < kFileCrcSize) {
@@ -259,7 +273,7 @@ auto open_source(std::filesystem::path path)
         src->path.string())};
   }
   const auto end = file_size - kFileCrcSize; // what the CRC covers
-  OpenPass pass{*src, end};
+  OpenPass pass{fd.get(), src->path, end};
 
   const auto head = pass.window(0, kFramedHeaderSize);
   src->framed = head.size() >= kFramedMagic.size() &&
@@ -318,7 +332,7 @@ auto open_source(std::filesystem::path path)
   src->units.push_back(end);
 
   std::array<std::byte, kFileCrcSize> trailer{};
-  read_exact(src->fd, trailer, end, src->path);
+  read_exact(fd.get(), trailer, end, src->path);
   const auto stored = read_le<std::uint32_t>(trailer, 0);
   const auto computed = src->framed ? ~pass.crc() : pass.crc();
   if (computed != stored) {
@@ -347,14 +361,14 @@ export void set_hint_frame_bytes_for_testing(std::size_t bytes) noexcept {
 //
 // Read mode (OpenForRead): verifies the whole file against its trailer before
 // returning, then hands out Scanners that read it a unit at a time with
-// pread. Both layouts — framed, and the raw layout written before
-// compression — are read.
+// pread. Neither holds the file open between reads. Both layouts — framed,
+// and the raw layout written before compression — are read.
 //
 // Thread safety: NOT thread-safe. External synchronization is required.
 export class HintFile {
 public:
-  // Forward-only scanner over a hint file's entries. It shares the open file
-  // with its HintFile, so either may outlive the other.
+  // Forward-only scanner over a hint file's entries. It shares its HintFile's
+  // map of the file, so either may outlive the other.
   //
   // HintEntry.key and .end_key are valid until the scanner's next call to
   // next() or seek(): they point into the unit the scanner has decoded, which
@@ -424,7 +438,7 @@ public:
       if (src_->framed) {
         auto &packed = thread_packed_frame();
         packed.resize(len);
-        read_exact(src_->fd, packed, at, src_->path);
+        read_unit(packed, at);
         const auto size = ZSTD_getFrameContentSize(packed.data(), len);
         if (size == ZSTD_CONTENTSIZE_UNKNOWN ||
             size == ZSTD_CONTENTSIZE_ERROR || size > kMaxFrameBytes)
@@ -436,13 +450,19 @@ public:
           throw std::runtime_error{"HintFile: frame does not decompress"};
       } else {
         reset_buffer(len);
-        read_exact(src_->fd, buf_, at, src_->path);
+        read_unit(buf_, at);
       }
       frame_ = buf_;
       frame_at_ = i;
       next_frame_ = i + 1;
       pos_ = 0;
       loaded_ = true;
+    }
+
+    // One read of the file, which is opened for it and closed after it.
+    void read_unit(std::span<std::byte> out, std::uint64_t at) const {
+      const auto fd = open_read_only(src_->path);
+      read_exact(fd.get(), out, at, src_->path);
     }
 
     void reset_buffer(std::size_t size) {
@@ -487,7 +507,8 @@ public:
   }
 
   // Opens an existing hint file for reading, and reads and verifies all of it
-  // before returning (open_source). Keeps the fd open for its scanners.
+  // before returning (open_source). Holds no descriptor afterwards: scanners
+  // open the file for each unit they read.
   // Throws std::system_error on I/O failure, std::runtime_error on damage.
   [[nodiscard]] static auto OpenForRead(std::filesystem::path path)
       -> HintFile {

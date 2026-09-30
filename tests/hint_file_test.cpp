@@ -558,6 +558,39 @@ TEST_CASE("HintFile read error throws system_error", "[hintfile]") {
 }
 
 // ---------------------------------------------------------------------------
+// Descriptors: a reader holds the file open only while it reads a unit (#251)
+// ---------------------------------------------------------------------------
+#ifdef __linux__
+TEST_CASE("HintFile keeps no descriptor open between reads", "[hintfile]") {
+  const auto tmp = std::filesystem::temp_directory_path() / "bc_hint_fd.hint";
+  std::filesystem::remove(tmp);
+  const auto es = sample_entries(400);
+  FrameBytes fb{256};
+  write_entries(tmp, es);
+
+  // Descriptors this process holds, not counting the one that lists them.
+  const auto open_fds = [] {
+    std::size_t n = 0;
+    for ([[maybe_unused]] const auto &e :
+         std::filesystem::directory_iterator{"/proc/self/fd"})
+      ++n;
+    return n - 1;
+  };
+  const auto before = open_fds();
+  const auto hf = bytecask::HintFile::OpenForRead(tmp);
+  CHECK(open_fds() == before);
+  auto scanner = hf.make_scanner();
+  REQUIRE(scanner.next().has_value());
+  // Mid-scan: the unit is in memory and the file is closed.
+  CHECK(open_fds() == before);
+  std::size_t read = 1;
+  while (scanner.next()) ++read;
+  CHECK(read == es.size());
+  CHECK(open_fds() == before);
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // Opening: a file that cannot be a hint is refused before any entry is read
 // ---------------------------------------------------------------------------
 TEST_CASE("HintFile open refuses a file that cannot be a hint", "[hintfile]") {
