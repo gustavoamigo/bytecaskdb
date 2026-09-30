@@ -2343,10 +2343,6 @@ TEST_CASE("Recovery model-based: hints split into many frames",
 // ---------------------------------------------------------------------------
 TEST_CASE("DB::open rebuilds a hint file a read fails on",
           "[bytecask][recovery]") {
-#ifndef BYTECASK_USE_BTREE
-  SKIP("radix recovery reads hints on worker threads, out of reach of the "
-       "thread-local fault injector");
-#endif
   TempDir td;
   const auto dir = td.path / "db";
   constexpr int kKeys = 40;
@@ -2519,10 +2515,6 @@ TEST_CASE("DB::open needs one descriptor per data file, not two",
 TEST_CASE("DB::open leaves a hint alone on an error that says nothing about "
           "its bytes",
           "[bytecask][recovery]") {
-#ifndef BYTECASK_USE_BTREE
-  SKIP("radix recovery reads hints on worker threads, out of reach of the "
-       "thread-local fault injector");
-#endif
   TempDir td;
   const auto dir = td.path / "db";
   constexpr int kKeys = 40;
