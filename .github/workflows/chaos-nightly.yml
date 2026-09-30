@@ -53,8 +53,7 @@ jobs:
       #   vacuum: #245 (vacuum drops a durable record superseded only by a
       #     non-durable write; a power cut or eviction then loses the key).
       #     Leaves the worker's vacuum thread out, not a hazard.
-      #   read_eio: #237 (SIGBUS on a hint read error during open)
-      KNOWN_BUGS: vacuum,read_eio
+      KNOWN_BUGS: vacuum
     strategy:
       fail-fast: false
       matrix:

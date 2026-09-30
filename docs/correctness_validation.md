@@ -1743,7 +1743,7 @@ SIGKILL harness:
 | vacuum drops a durable record superseded only by a non-durable write (#245) | after a power cut, the key holds neither its old value nor its new one |
 | vacuum leaks its `.data.tmp` staging file when compaction fails (#235, fixed by #247) | a copy of a file's live data per failed attempt, most often under `ENOSPC` |
 | a failed `ftruncate` that did cut the file leaves the logical end stale (#236, fixed by #248) | while degraded, reads of published records fail with `pread failed: Success` |
-| recovery memory-maps hint files (#237) | a read error on a hint during `DB::open` kills the process with `SIGBUS` |
+| recovery memory-maps hint files (#237, fixed by #255) | a read error on a hint during `DB::open` kills the process with `SIGBUS` |
 
 `chaos-nightly.yml` runs it for 40 minutes a night, in release and under
 ASan. `--disable` leaves hazards out, to bisect a failure or to run past a
