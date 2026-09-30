@@ -94,10 +94,9 @@ if [[ "$DRY_RUN" == off ]]; then
     fail "--data-root=$DATA_ROOT is not a mountpoint; mount the instance store first"
   fi
   [[ -d "$HDB_HOME" ]] || fail "--hammerdb-home=$HDB_HOME does not exist"
-  if [[ "$CAPTURE" == on ]]; then
-    [[ $(cat /proc/sys/kernel/perf_event_paranoid) -le 1 ]] ||
-      fail "--capture needs: sudo sysctl kernel.perf_event_paranoid=-1"
-  fi
+  # perf permissions for --capture are checked by run-hammerdb.sh itself
+  # (lib_capture.sh): passwordless sudo is enough, or a low
+  # kernel.perf_event_paranoid. A missing one fails the first cell at once.
   if pgrep -x mariadbd >/dev/null; then
     fail "a mariadbd is already running; stop it first (pgrep -a mariadbd)"
   fi
