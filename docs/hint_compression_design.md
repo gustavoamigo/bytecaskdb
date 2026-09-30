@@ -5,6 +5,16 @@
 > first measured with a standalone harness over real hint files (§Harness
 > measurements); §Measured in the engine has the before/after of the change
 > itself.
+>
+> **Update (#237):** hint files are no longer memory-mapped or read whole.
+> A failed read on a mapping is a `SIGBUS` that kills the process, so
+> `OpenForRead` now reads the file once in chunks with `pread` — feeding the
+> CRC and recording where each frame starts — and scanners read one frame at
+> a time with `pread`; an uncompressed hint is cut at entry boundaries into
+> units about a frame long, so it is not read whole either. `OpenForMerge`
+> is gone. §Reading and §Seeking below
+> describe the mapped reader as it was built; `docs/bytecask_design.md`
+> (*HintFile I/O model*) has the current one.
 
 ## Problem
 
@@ -52,7 +62,7 @@ cold start at its expense is acceptable.
 - File names stay `…_V01.hint`. Backups (the MariaDB plugin selects files by
   the `.hint` extension), `FileManifest::hint_path`, and replication file
   transfer are unaffected.
-- Recovery's anonymous memory stays bounded, as `OpenForMerge` intends.
+- Recovery's anonymous memory stays bounded: no file is held whole.
 - No option. Hint files are always written compressed.
 
 ## Design

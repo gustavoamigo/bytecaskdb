@@ -204,12 +204,14 @@ export struct Options {
 #else
   unsigned recovery_threads{4};
 #endif
-  // When true (default): any CRC error during recovery causes DB::open to
-  // throw std::runtime_error. When false: corrupt entries and hint files are
-  // skipped; the DB opens with whatever was successfully recovered, and a
-  // warning is printed to stderr for each skipped item. Neither applies to
-  // the tail of a data file without a hint, which recovery_check_tail
-  // truncates or refuses the same way in both modes.
+  // A hint file that fails its CRC, or that a read fails on, is rebuilt from
+  // its data file in both modes. This governs a file that still cannot be
+  // indexed — its data file cannot be rescanned. When true (default): DB::open
+  // throws. When false: the file is skipped; the DB opens with whatever was
+  // recovered from the rest, and a warning is printed to stderr for each
+  // skipped file. Neither applies to the tail of a data file without a hint,
+  // which recovery_check_tail truncates or refuses the same way in both
+  // modes.
   bool fail_recovery_on_crc_errors{true};
   // Initial engine mode. Leader (default) allows normal writes; Follower
   // blocks put/del/apply_batch and allows ingest().
@@ -1205,17 +1207,17 @@ private:
       const std::vector<std::filesystem::path> &data_paths);
   // Writes hint files for all sealed files in s.
   void flush_hints(const EngineState &s);
-  // Both HintFile openers verify the file-level CRC before any parsing, so
-  // either one is the point a damaged hint is detected.
-  using HintOpener = auto (*)(std::filesystem::path) -> HintFile;
   // Opens a hint file, rebuilding it from its data file if it will not open.
-  // A hint is a derived index, not the records it points at: a CRC failure in
-  // one says the index is damaged, not that the data file behind it is.
-  // Throws when the rebuild cannot produce a readable hint, leaving the
-  // caller to apply fail_recovery_on_crc_errors to a file it cannot index.
+  // HintFile::OpenForRead reads and verifies every byte before returning, so
+  // this is where a damaged hint — one that fails its CRC, or one a read
+  // fails on — is found, before any of its entries is applied. A hint is a
+  // derived index, not the records it points at: neither failure says the
+  // data file behind it is damaged. Throws when the rebuild cannot produce a
+  // readable hint, leaving the caller to apply fail_recovery_on_crc_errors to
+  // a file it cannot index.
   static auto open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
-                                   const std::filesystem::path &hint_path,
-                                   HintOpener open) -> HintFile;
+                                   const std::filesystem::path &hint_path)
+      -> HintFile;
 
   
 
@@ -3554,10 +3556,10 @@ static auto recovery_key_cmp(std::span<const std::byte> a,
 }
 
 auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
-                              const std::filesystem::path &hint_path,
-                              HintOpener open) -> HintFile {
+                              const std::filesystem::path &hint_path)
+    -> HintFile {
   try {
-    return open(hint_path);
+    return HintFile::OpenForRead(hint_path);
   } catch (const std::exception &e) {
     // flush_hints_for leaves an existing hint alone, so the damaged one has
     // to go first. Nothing is lost by removing it: it is unreadable either
@@ -3565,7 +3567,7 @@ auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
     // which the next open regenerates through the same scan.
     std::filesystem::remove(hint_path);
     (void)flush_hints_for(data_file, hint_path.parent_path());
-    auto hint = open(hint_path);
+    auto hint = HintFile::OpenForRead(hint_path);
     // The tail-drop recovery_prepare_files does for a hint-less file is not
     // repeated here: a file that had a hint at all was sealed, and sealing
     // already gave its preallocated tail back.
@@ -4929,81 +4931,12 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
   };
 
   for (auto &[file_id, data_file, hint_path, tb] : files) {
+    // Only a file that cannot be opened is skipped. An error once its entries
+    // are being applied fails the open: some of them are already in t. The
+    // scanner keeps the file open.
+    std::optional<HintFile::Scanner> scanner;
     try {
-      auto hint =
-          open_hint_or_rebuild(data_file, hint_path, &HintFile::OpenForRead);
-      auto scanner = hint.make_scanner();
-      while (auto he = scanner.next()) {
-        // Track per-file sequence bounds for ALL entries, including those
-        // suppressed by tombstones. Bounds represent the range of sequences
-        // physically present in the file, not just live ones.
-        if (he->sequence > max_seq) max_seq = he->sequence;
-        auto &file_fs = fstats_scratch[file_id];
-        if (file_fs.min_sequence == 0 || he->sequence < file_fs.min_sequence)
-          file_fs.min_sequence = he->sequence;
-        if (he->sequence > file_fs.max_sequence)
-          file_fs.max_sequence = he->sequence;
-        file_fs.tombstone_bytes +=
-            tombstone_size(he->entry_type, he->key.size(), he->end_key.size());
-        file_fs.marker_bytes += marker_size(he->entry_type);
-
-        if (he->entry_type == EntryType::Put) {
-          const auto k = Key{he->key};
-          const auto tomb_it = tombstones.find(k);
-          if (tomb_it != tombstones.end() &&
-              tomb_it->second.seq >= he->sequence) {
-            if (tomb_it->second.file_id != file_id)
-              needed.push_back(tomb_it->second.seq);
-            continue;
-          }
-          // Check range tombstones — O(R) per Put, R expected small.
-          bool suppressed = false;
-          for (auto &rt : range_tombstones) {
-            if (rt.seq >= he->sequence && k >= rt.start && k < rt.end) {
-              if (rt.file_id != file_id) rt.needed = true;
-              suppressed = true;
-              break;
-            }
-          }
-          if (suppressed) {
-            continue;
-          }
-          t.upsert(he->key,
-                   KeyDirEntry::make(he->sequence, he->file_offset, file_id,
-                                     he->value_size),
-                   seq_wins);
-        } else if (he->entry_type == EntryType::Delete) {
-          const auto k = Key{he->key};
-          auto &slot = tombstones[k];
-          if (he->sequence > slot.seq) slot = {he->sequence, file_id};
-          const auto existing = t.get(he->key);
-          if (existing && existing->sequence() < he->sequence) {
-            t.erase(he->key);
-            needed.push_back(he->sequence);
-          }
-        } else if (he->entry_type == EntryType::RangeDel) {
-          const auto start = Key{he->key};
-          const auto end = Key{he->end_key};
-          // Erase keys in [start, end) with sequence < this tombstone.
-          std::vector<Key> to_erase;
-          for (auto it = t.lower_bound(he->key);
-               it != std::default_sentinel; ++it) {
-            auto [key_span, entry] = *it;
-            if (Key{key_span} >= end) break;
-            if (entry.sequence() < he->sequence) {
-              to_erase.emplace_back(key_span);
-            }
-          }
-          for (const auto &ek : to_erase) {
-            t.erase(std::span<const std::byte>{ek});
-          }
-          range_tombstones.push_back(
-              {start, end, he->sequence, file_id, !to_erase.empty()});
-        }
-      }
-    } catch (const SequenceOverlap &) {
-      // Not a damaged file to skip: recovery_open resolves or rejects it.
-      throw;
+      scanner.emplace(open_hint_or_rebuild(data_file, hint_path).make_scanner());
     } catch (const std::exception &e) {
       if (strict) throw;
       skipped = true;
@@ -5011,6 +4944,75 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
                    "bytecask: skipping data file for hint '%s' — could not "
                    "read it or rebuild it from the data file: %s\n",
                    hint_path.string().c_str(), e.what());
+      continue;
+    }
+    while (auto he = scanner->next()) {
+      // Track per-file sequence bounds for ALL entries, including those
+      // suppressed by tombstones. Bounds represent the range of sequences
+      // physically present in the file, not just live ones.
+      if (he->sequence > max_seq) max_seq = he->sequence;
+      auto &file_fs = fstats_scratch[file_id];
+      if (file_fs.min_sequence == 0 || he->sequence < file_fs.min_sequence)
+        file_fs.min_sequence = he->sequence;
+      if (he->sequence > file_fs.max_sequence)
+        file_fs.max_sequence = he->sequence;
+      file_fs.tombstone_bytes +=
+          tombstone_size(he->entry_type, he->key.size(), he->end_key.size());
+      file_fs.marker_bytes += marker_size(he->entry_type);
+
+      if (he->entry_type == EntryType::Put) {
+        const auto k = Key{he->key};
+        const auto tomb_it = tombstones.find(k);
+        if (tomb_it != tombstones.end() &&
+            tomb_it->second.seq >= he->sequence) {
+          if (tomb_it->second.file_id != file_id)
+            needed.push_back(tomb_it->second.seq);
+          continue;
+        }
+        // Check range tombstones — O(R) per Put, R expected small.
+        bool suppressed = false;
+        for (auto &rt : range_tombstones) {
+          if (rt.seq >= he->sequence && k >= rt.start && k < rt.end) {
+            if (rt.file_id != file_id) rt.needed = true;
+            suppressed = true;
+            break;
+          }
+        }
+        if (suppressed) {
+          continue;
+        }
+        t.upsert(he->key,
+                 KeyDirEntry::make(he->sequence, he->file_offset, file_id,
+                                   he->value_size),
+                 seq_wins);
+      } else if (he->entry_type == EntryType::Delete) {
+        const auto k = Key{he->key};
+        auto &slot = tombstones[k];
+        if (he->sequence > slot.seq) slot = {he->sequence, file_id};
+        const auto existing = t.get(he->key);
+        if (existing && existing->sequence() < he->sequence) {
+          t.erase(he->key);
+          needed.push_back(he->sequence);
+        }
+      } else if (he->entry_type == EntryType::RangeDel) {
+        const auto start = Key{he->key};
+        const auto end = Key{he->end_key};
+        // Erase keys in [start, end) with sequence < this tombstone.
+        std::vector<Key> to_erase;
+        for (auto it = t.lower_bound(he->key);
+             it != std::default_sentinel; ++it) {
+          auto [key_span, entry] = *it;
+          if (Key{key_span} >= end) break;
+          if (entry.sequence() < he->sequence) {
+            to_erase.emplace_back(key_span);
+          }
+        }
+        for (const auto &ek : to_erase) {
+          t.erase(std::span<const std::byte>{ek});
+        }
+        range_tombstones.push_back(
+            {start, end, he->sequence, file_id, !to_erase.empty()});
+      }
     }
   }
 
@@ -5387,10 +5389,9 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
     fs.marker_bytes += marker_size(he.entry_type);
   };
 
-  // One cursor per hint file, parked on its next Put or Delete. The scanner
-  // reads the hint file's own buffer or mapping, so the files must outlive
-  // the merge. A scanner's entries last only until its next call, so the
-  // cursor owns the entries it keeps.
+  // One cursor per hint file, parked on its next Put or Delete. A scanner's
+  // entries last only until its next call, so the cursor owns the entries it
+  // keeps.
   struct Cursor {
     HintFile::Scanner scanner;
     std::uint32_t file_id;
@@ -5399,35 +5400,19 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
     bool has_cur{false};
     bool has_lookahead{false};
   };
-  std::vector<HintFile> open_hints;
   std::vector<Cursor> cursors;
-  open_hints.reserve(files.size());
   cursors.reserve(files.size());
 
   // Phase A: the head of each file — markers and range tombstones — is read
   // up front, so every range tombstone this worker owns is known before any
   // Put is admitted.
   for (auto &[file_id, data_file, hint_path, tb] : files) {
+    // Only a file that cannot be opened is skipped. An error once its entries
+    // are being read fails the open: some of them are already noted. The
+    // scanner keeps the file open.
+    std::optional<HintFile::Scanner> scanner;
     try {
-      open_hints.push_back(
-          open_hint_or_rebuild(data_file, hint_path, &HintFile::OpenForMerge));
-      Cursor c{open_hints.back().make_scanner(), file_id, {}, {}, false, false};
-      while (auto he = c.scanner.next()) {
-        note(file_id, *he);
-        if (he->entry_type == EntryType::RangeDel) {
-          range_tombstones.push_back(
-              {Key{he->key}, Key{he->end_key}, he->sequence, file_id});
-          continue;
-        }
-        if (he->entry_type == EntryType::BulkBegin ||
-            he->entry_type == EntryType::BulkEnd) {
-          continue;
-        }
-        c.lookahead.assign(*he);
-        c.has_lookahead = true;
-        break;
-      }
-      cursors.push_back(std::move(c));
+      scanner.emplace(open_hint_or_rebuild(data_file, hint_path).make_scanner());
     } catch (const std::exception &e) {
       if (strict) throw;
       skipped = true;
@@ -5435,7 +5420,25 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
                    "bytecask: skipping data file for hint '%s' — could not "
                    "read it or rebuild it from the data file: %s\n",
                    hint_path.string().c_str(), e.what());
+      continue;
     }
+    Cursor c{std::move(*scanner), file_id, {}, {}, false, false};
+    while (auto he = c.scanner.next()) {
+      note(file_id, *he);
+      if (he->entry_type == EntryType::RangeDel) {
+        range_tombstones.push_back(
+            {Key{he->key}, Key{he->end_key}, he->sequence, file_id});
+        continue;
+      }
+      if (he->entry_type == EntryType::BulkBegin ||
+          he->entry_type == EntryType::BulkEnd) {
+        continue;
+      }
+      c.lookahead.assign(*he);
+      c.has_lookahead = true;
+      break;
+    }
+    cursors.push_back(std::move(c));
   }
 
   // Phase B: merge the runs. For each key the highest sequence across every
@@ -5948,8 +5951,7 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
     const auto &rf = files[f];
     run.stats = FileStats{0, rf.total_bytes};
     try {
-      run.hint.emplace(open_hint_or_rebuild(rf.data_file, rf.hint_path,
-                                            &HintFile::OpenForMerge));
+      run.hint.emplace(open_hint_or_rebuild(rf.data_file, rf.hint_path));
     } catch (const std::exception &e) {
       if (strict) throw;
       std::fprintf(stderr,

@@ -2291,6 +2291,133 @@ TEST_CASE("Recovery model-based: hints split into many frames",
       CHECK(collect_stats(db) == serial_stats_vals);
     }
   }
+
+  // A read that fails on a hint file must not cost keys, wherever it lands.
+  // In the pass that opens and verifies a hint, before any of its entries is
+  // applied, recovery rebuilds the hint from its data file. In the scan of a
+  // hint that verified, some entries are already applied, so the open fails
+  // with std::system_error, and the next open recovers. Either way what is
+  // recovered is the serial baseline. The fault injector is thread-local, so
+  // recovery runs on the thread that opens — which the radix path, building
+  // on worker threads even at one, never does.
+#ifdef BYTECASK_USE_BTREE
+  for (const int nth : {1, 2, 3, 5, 40, 150}) {
+    DYNAMIC_SECTION("hint read " << nth << " fails, recovery_threads = 1") {
+      const auto p = td.path / std::format("eio{}", nth);
+      std::filesystem::copy(db_path, p,
+                            std::filesystem::copy_options::recursive);
+      bool opened = false;
+      {
+        bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+        fi.inj.fail_on_nth_match = nth;
+        try {
+          auto db = bytecask::DB::open(p, {.recovery_threads = 1});
+          opened = true;
+          verify(std::format("eio/{}", nth), collect(db));
+          CHECK(collect_stats(db) == serial_stats_vals);
+        } catch (const std::system_error &) {
+        }
+        REQUIRE(fi.inj.name_matches >= nth);
+      }
+      // The first read of the first hint is in its open pass.
+      if (nth == 1) CHECK(opened);
+      auto db = bytecask::DB::open(p, {.recovery_threads = 1});
+      verify(std::format("eio/{}/reopen", nth), collect(db));
+      // An open that succeeded added an active file; one that failed did not.
+      if (!opened) CHECK(collect_stats(db) == serial_stats_vals);
+    }
+  }
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// A hint file a read fails on is rebuilt from its data file (#237).
+//
+// Recovery used to map hint files, and a page the kernel could not fill
+// (EIO, a file truncated underneath) was a SIGBUS that killed the process.
+// Hints are read with pread now: a failed read is a std::system_error, and one
+// in the pass that opens a hint is treated like a CRC failure — the hint is an
+// index, so it is rebuilt from its data file.
+// ---------------------------------------------------------------------------
+TEST_CASE("DB::open rebuilds a hint file a read fails on",
+          "[bytecask][recovery]") {
+#ifndef BYTECASK_USE_BTREE
+  SKIP("radix recovery reads hints on worker threads, out of reach of the "
+       "thread-local fault injector");
+#endif
+  TempDir td;
+  const auto dir = td.path / "db";
+  constexpr int kKeys = 40;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 256});
+    for (int i = 0; i < kKeys; ++i)
+      db.put({}, to_bytes(std::format("k{:03d}", i)),
+             to_bytes(std::format("v{:03d}", i)));
+  }
+  std::size_t hint_count = 0;
+  for (const auto &e : std::filesystem::directory_iterator{dir})
+    if (e.path().extension() == ".hint") ++hint_count;
+  REQUIRE(hint_count > 2);
+
+  auto check_keys = [&](const bytecask::DB &db) {
+    for (int i = 0; i < kKeys; ++i) {
+      const auto v = get_val(db, to_bytes(std::format("k{:03d}", i)));
+      INFO("k" << i);
+      REQUIRE(v.has_value());
+      CHECK(to_string(*v) == std::format("v{:03d}", i));
+    }
+  };
+
+  SECTION("an error in the pass that opens a hint rebuilds it") {
+    {
+      // The first read of the first hint fails. Strict recovery neither skips
+      // a file nor gets past one it cannot index, so an open that succeeds,
+      // with the reads that followed, rebuilt that hint.
+      bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+      fi.inj.fail_on_nth_match = 1;
+      auto db = bytecask::DB::open(dir, {.max_file_bytes = 256,
+                                         .recovery_threads = 1});
+      REQUIRE(fi.inj.name_matches > 1);
+      check_keys(db);
+    }
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 256});
+    check_keys(db);
+  }
+
+  SECTION("an error while a verified hint is scanned fails the open") {
+    // One data file, so one hint, read first: its open pass, then its scan.
+    const auto one = td.path / "one";
+    {
+      auto db = bytecask::DB::open(one);
+      for (int i = 0; i < kKeys; ++i)
+        db.put({}, to_bytes(std::format("k{:03d}", i)),
+               to_bytes(std::format("v{:03d}", i)));
+    }
+    std::vector<std::filesystem::path> hints;
+    for (const auto &e : std::filesystem::directory_iterator{one})
+      if (e.path().extension() == ".hint") hints.push_back(e.path());
+    REQUIRE(hints.size() == 1);
+    // The read after those that open the hint is the first of its scan.
+    int open_reads = 0;
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+      fi.inj.fail_on_nth_match = std::numeric_limits<int>::max();
+      (void)bytecask::HintFile::OpenForRead(hints[0]);
+      open_reads = fi.inj.name_matches;
+    }
+    REQUIRE(open_reads > 0);
+    const auto hint_size = std::filesystem::file_size(hints[0]);
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+      fi.inj.fail_on_nth_match = open_reads + 1;
+      CHECK_THROWS_AS(bytecask::DB::open(one, {.recovery_threads = 1}),
+                      std::system_error);
+    }
+    // Nothing was rebuilt or skipped, and the next open recovers every key.
+    CHECK(std::filesystem::file_size(hints[0]) == hint_size);
+    auto db = bytecask::DB::open(one);
+    check_keys(db);
+  }
 }
 
 // ---------------------------------------------------------------------------
