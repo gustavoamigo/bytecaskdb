@@ -1872,7 +1872,10 @@ auto run(const RunOptions &o) -> int {
           rebootstrap_abandoned();
           continue;
         }
-        if (orng() % 2 == 0) {
+        // promote_least exists to fork a follower ahead of the new leader,
+        // and only an unplanned promotion can; a short run must not spend
+        // its few events on planned transfers.
+        if (!o.promote_least && orng() % 2 == 0) {
           const auto v = view.get();
           std::vector<int> candidates;
           for (int i = 0; i < node_count; ++i)
