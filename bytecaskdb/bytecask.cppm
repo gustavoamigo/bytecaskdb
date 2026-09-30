@@ -1236,11 +1236,13 @@ private:
   // Opens a hint file, rebuilding it from its data file if it will not open.
   // HintFile::OpenForRead reads and verifies every byte before returning, so
   // this is where a damaged hint — one that fails its CRC, or one a read
-  // fails on — is found, before any of its entries is applied. A hint is a
-  // derived index, not the records it points at: neither failure says the
-  // data file behind it is damaged. Throws when the rebuild cannot produce a
-  // readable hint, leaving the caller to apply fail_recovery_on_crc_errors to
-  // a file it cannot index.
+  // fails on with EIO — is found, before any of its entries is applied. A
+  // hint is a derived index, not the records it points at: neither failure
+  // says the data file behind it is damaged. Any other error (EMFILE,
+  // ENOMEM, ...) is rethrown with the hint untouched: it says nothing about
+  // the hint, and a rebuild would fail the same way. Throws when the rebuild
+  // cannot produce a readable hint, leaving the caller to apply
+  // fail_recovery_on_crc_errors to a file it cannot index.
   static auto open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
                                    const std::filesystem::path &hint_path)
       -> HintFile;
@@ -3629,12 +3631,22 @@ static auto recovery_key_cmp(std::span<const std::byte> a,
   return a.size() < b.size() ? -1 : 1;
 }
 
+// Whether an error opening a hint says the hint itself is bad: damage found
+// in its bytes, or a read the device failed (EIO, or a file that ends early).
+// Anything else — out of descriptors or memory — says nothing about the hint.
+static auto hint_is_damaged(const std::exception &e) noexcept -> bool {
+  if (const auto *se = dynamic_cast<const std::system_error *>(&e))
+    return se->code() == std::errc::io_error;
+  return dynamic_cast<const std::runtime_error *>(&e) != nullptr;
+}
+
 auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
                               const std::filesystem::path &hint_path)
     -> HintFile {
   try {
     return HintFile::OpenForRead(hint_path);
   } catch (const std::exception &e) {
+    if (!hint_is_damaged(e)) throw;
     // flush_hints_for leaves an existing hint alone, so the damaged one has
     // to go first. Nothing is lost by removing it: it is unreadable either
     // way, and a rebuild that does not finish here leaves the file hint-less,
@@ -5024,8 +5036,7 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
 
   for (auto &[file_id, data_file, hint_path, tb] : files) {
     // Only a file that cannot be opened is skipped. An error once its entries
-    // are being applied fails the open: some of them are already in t. The
-    // scanner keeps the file open.
+    // are being applied fails the open: some of them are already in t.
     std::optional<HintFile::Scanner> scanner;
     try {
       scanner.emplace(open_hint_or_rebuild(data_file, hint_path).make_scanner());
@@ -5500,8 +5511,7 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
   // Put is admitted.
   for (auto &[file_id, data_file, hint_path, tb] : files) {
     // Only a file that cannot be opened is skipped. An error once its entries
-    // are being read fails the open: some of them are already noted. The
-    // scanner keeps the file open.
+    // are being read fails the open: some of them are already noted.
     std::optional<HintFile::Scanner> scanner;
     try {
       scanner.emplace(open_hint_or_rebuild(data_file, hint_path).make_scanner());

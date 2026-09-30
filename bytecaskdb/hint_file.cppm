@@ -148,24 +148,69 @@ void read_exact(int fd, std::span<std::byte> out, std::uint64_t offset,
   }
 }
 
-// A hint file open for reading, shared by its HintFile and every scanner
-// over it, so no scanner outlives the fd it reads. A unit is what a scanner
-// reads and decodes at once: a zstd frame, or in a raw file a run of whole
-// entries about a frame long.
+// A read-only descriptor on a hint file, closed when it goes out of scope.
+// Readers open one per read rather than keeping one per file: a recovery
+// merge holds every hint file at once, and a descriptor each would double
+// what an open needs beside the data files (#251).
+class HintFd {
+public:
+  explicit HintFd(const std::filesystem::path &path)
+      : fd_{::open(path.c_str(), O_RDONLY | O_CLOEXEC)} {
+    if (fd_ == -1) {
+      throw std::system_error{
+          errno, std::generic_category(),
+          std::format("HintFile: cannot open '{}' for read", path.string())};
+    }
+  }
+  ~HintFd() {
+    if (fd_ != -1) ::close(fd_);
+  }
+  HintFd(const HintFd &) = delete;
+  HintFd &operator=(const HintFd &) = delete;
+  HintFd(HintFd &&other) noexcept : fd_{std::exchange(other.fd_, -1)} {}
+  HintFd &operator=(HintFd &&) = delete;
+
+  [[nodiscard]] auto get() const noexcept -> int { return fd_; }
+
+  [[nodiscard]] auto stat(const std::filesystem::path &path) const
+      -> struct stat {
+    struct stat st{};
+    if (::fstat(fd_, &st) != 0) {
+      throw std::system_error{
+          errno, std::generic_category(),
+          std::format("HintFile: cannot stat '{}'", path.string())};
+    }
+    return st;
+  }
+
+private:
+  int fd_;
+};
+
+// A verified hint file, shared by its HintFile and every scanner over it. It
+// holds no descriptor: each read opens the file by path and checks it is the
+// file that was verified. A unit is what a scanner reads and decodes at once:
+// a zstd frame, or in a raw file a run of whole entries about a frame long.
 struct HintSource {
   std::filesystem::path path;
-  int fd{-1};
+  // The file the open pass verified.
+  dev_t dev{};
+  ino_t ino{};
   bool framed{false};
   // File offset of each unit, then the offset where the units end.
   std::vector<std::uint64_t> units;
 
-  HintSource() = default;
-  HintSource(const HintSource &) = delete;
-  HintSource &operator=(const HintSource &) = delete;
-  HintSource(HintSource &&) = delete;
-  HintSource &operator=(HintSource &&) = delete;
-  ~HintSource() {
-    if (fd != -1) ::close(fd);
+  // Opens the verified file for one read. A file replaced since is not the
+  // one its trailer vouched for, so reading it would hand out unchecked
+  // bytes.
+  [[nodiscard]] auto reopen() const -> HintFd {
+    HintFd fd{path};
+    const auto st = fd.stat(path);
+    if (st.st_dev != dev || st.st_ino != ino) {
+      throw std::runtime_error{std::format(
+          "HintFile: '{}' was replaced after it was verified", path.string())};
+    }
+    return fd;
   }
 };
 
@@ -179,8 +224,9 @@ static_assert(kOpenChunkBytes >= kMaxHintEntryBytes);
 // in order, and fed to the CRC as it arrives.
 class OpenPass {
 public:
-  OpenPass(const HintSource &src, std::uint64_t end)
-      : src_{src}, end_{end}, buf_(kOpenChunkBytes) {}
+  OpenPass(const HintFd &fd, const std::filesystem::path &path,
+           std::uint64_t end)
+      : fd_{fd}, path_{path}, end_{end}, buf_(kOpenChunkBytes) {}
 
   // The bytes from `at` on that are in the buffer: at least
   // min(want, end - at) of them, reading more if needed. `at` only moves
@@ -199,7 +245,7 @@ public:
       const auto n = static_cast<std::size_t>(
           std::min<std::uint64_t>(buf_.size() - keep, end_ - read_to));
       const auto fresh = std::span{buf_}.subspan(keep, n);
-      read_exact(src_.fd, fresh, read_to, src_.path);
+      read_exact(fd_.get(), fresh, read_to, path_);
       crc_.update(fresh);
       buf_at_ = at;
       len_ = keep + n;
@@ -215,7 +261,8 @@ public:
   }
 
 private:
-  const HintSource &src_;
+  const HintFd &fd_;
+  const std::filesystem::path &path_;
   std::uint64_t end_;
   std::vector<std::byte> buf_;
   std::uint64_t buf_at_{0}; // file offset of buf_[0]
@@ -235,22 +282,15 @@ auto open_source(std::filesystem::path path)
     -> std::shared_ptr<const HintSource> {
   auto src = std::make_shared<HintSource>();
   src->path = std::move(path);
-  src->fd = ::open(src->path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (src->fd == -1) {
-    throw std::system_error{
-        errno, std::generic_category(),
-        std::format("HintFile: cannot open '{}' for read", src->path.string())};
-  }
+  // Held only for this pass: scanners reopen the file per read.
+  const HintFd fd{src->path};
   // The size of the file this fd reads, not of whatever the path names now.
-  struct stat st{};
-  if (::fstat(src->fd, &st) != 0) {
-    throw std::system_error{
-        errno, std::generic_category(),
-        std::format("HintFile: cannot stat '{}'", src->path.string())};
-  }
+  const auto st = fd.stat(src->path);
+  src->dev = st.st_dev;
+  src->ino = st.st_ino;
 #ifndef __APPLE__
-  // Both the open pass and the scans walk the file front to back.
-  ::posix_fadvise(src->fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+  // The pass walks the file front to back.
+  ::posix_fadvise(fd.get(), 0, 0, POSIX_FADV_SEQUENTIAL);
 #endif
   const auto file_size = narrow<std::uint64_t>(st.st_size);
   if (file_size < kFileCrcSize) {
@@ -259,7 +299,7 @@ auto open_source(std::filesystem::path path)
         src->path.string())};
   }
   const auto end = file_size - kFileCrcSize; // what the CRC covers
-  OpenPass pass{*src, end};
+  OpenPass pass{fd, src->path, end};
 
   const auto head = pass.window(0, kFramedHeaderSize);
   src->framed = head.size() >= kFramedMagic.size() &&
@@ -318,7 +358,7 @@ auto open_source(std::filesystem::path path)
   src->units.push_back(end);
 
   std::array<std::byte, kFileCrcSize> trailer{};
-  read_exact(src->fd, trailer, end, src->path);
+  read_exact(fd.get(), trailer, end, src->path);
   const auto stored = read_le<std::uint32_t>(trailer, 0);
   const auto computed = src->framed ? ~pass.crc() : pass.crc();
   if (computed != stored) {
@@ -347,14 +387,15 @@ export void set_hint_frame_bytes_for_testing(std::size_t bytes) noexcept {
 //
 // Read mode (OpenForRead): verifies the whole file against its trailer before
 // returning, then hands out Scanners that read it a unit at a time with
-// pread. Both layouts — framed, and the raw layout written before
+// pread, opening it for each unit. Both layouts — framed, and the raw layout written before
 // compression — are read.
 //
 // Thread safety: NOT thread-safe. External synchronization is required.
 export class HintFile {
 public:
-  // Forward-only scanner over a hint file's entries. It shares the open file
-  // with its HintFile, so either may outlive the other.
+  // Forward-only scanner over a hint file's entries. It shares the verified
+  // file with its HintFile, so either may outlive the other, and holds a
+  // descriptor only while it reads a unit.
   //
   // HintEntry.key and .end_key are valid until the scanner's next call to
   // next() or seek(): they point into the unit the scanner has decoded, which
@@ -408,7 +449,8 @@ public:
     }
 
     // Reads unit i and decodes it into buf_. Its bounds, and a frame's
-    // header, were checked when the file was opened.
+    // header, were checked when the file was opened. Throws
+    // std::runtime_error if the file was replaced since.
     void load_frame(std::size_t i) {
       if (i >= unit_count()) {
         // The end of the units: where an empty file's scan stops.
@@ -421,10 +463,11 @@ public:
       }
       const auto at = src_->units[i];
       const auto len = narrow<std::size_t>(src_->units[i + 1] - at);
+      const auto fd = src_->reopen();
       if (src_->framed) {
         auto &packed = thread_packed_frame();
         packed.resize(len);
-        read_exact(src_->fd, packed, at, src_->path);
+        read_exact(fd.get(), packed, at, src_->path);
         const auto size = ZSTD_getFrameContentSize(packed.data(), len);
         if (size == ZSTD_CONTENTSIZE_UNKNOWN ||
             size == ZSTD_CONTENTSIZE_ERROR || size > kMaxFrameBytes)
@@ -436,7 +479,7 @@ public:
           throw std::runtime_error{"HintFile: frame does not decompress"};
       } else {
         reset_buffer(len);
-        read_exact(src_->fd, buf_, at, src_->path);
+        read_exact(fd.get(), buf_, at, src_->path);
       }
       frame_ = buf_;
       frame_at_ = i;
@@ -487,7 +530,7 @@ public:
   }
 
   // Opens an existing hint file for reading, and reads and verifies all of it
-  // before returning (open_source). Keeps the fd open for its scanners.
+  // before returning (open_source). Holds no descriptor once it returns.
   // Throws std::system_error on I/O failure, std::runtime_error on damage.
   [[nodiscard]] static auto OpenForRead(std::filesystem::path path)
       -> HintFile {
@@ -594,7 +637,7 @@ private:
   explicit HintFile(std::filesystem::path path, int fd)
       : path_{std::move(path)}, write_fd_{fd} {}
 
-  // Read-mode constructor: holds the verified, open file.
+  // Read-mode constructor: holds the verified file.
   HintFile(std::filesystem::path path, std::shared_ptr<const HintSource> src)
       : path_{std::move(path)}, src_{std::move(src)} {}
 

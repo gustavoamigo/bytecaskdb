@@ -36,6 +36,7 @@
 #include <tuple>
 #include <vector>
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -2417,6 +2418,90 @@ TEST_CASE("DB::open rebuilds a hint file a read fails on",
     CHECK(std::filesystem::file_size(hints[0]) == hint_size);
     auto db = bytecask::DB::open(one);
     check_keys(db);
+  }
+
+  SECTION("an error that is not the hint's leaves it alone") {
+    // Out of descriptors says nothing about the hint: it is not deleted,
+    // and the open fails rather than rebuilding it.
+    std::map<std::filesystem::path, std::uintmax_t> sizes;
+    for (const auto &e : std::filesystem::directory_iterator{dir})
+      if (e.path().extension() == ".hint")
+        sizes[e.path()] = std::filesystem::file_size(e.path());
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+      fi.inj.fail_on_nth_match = 1;
+      fi.inj.error = std::make_error_code(std::errc::too_many_files_open);
+      try {
+        (void)bytecask::DB::open(dir, {.max_file_bytes = 256,
+                                       .recovery_threads = 1});
+        FAIL("open succeeded");
+      } catch (const std::system_error &e) {
+        CHECK(e.code() == std::errc::too_many_files_open);
+      }
+    }
+    for (const auto &[path, size] : sizes) {
+      INFO(path);
+      REQUIRE(std::filesystem::exists(path));
+      CHECK(std::filesystem::file_size(path) == size);
+    }
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 256});
+    check_keys(db);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Recovery holds a descriptor per data file, not per data file and hint
+// (#251). The merge keeps every hint of a range open at once, and each used
+// to hold an fd, so a DB of more than RLIMIT_NOFILE / 2 files would not open.
+// ---------------------------------------------------------------------------
+// glibc defines RLIMIT_NOFILE as itself, which -Weverything flags.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdisabled-macro-expansion"
+constexpr auto kNoFileLimit = RLIMIT_NOFILE;
+#pragma clang diagnostic pop
+
+TEST_CASE("DB::open needs about one descriptor per data file",
+          "[bytecask][recovery]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  constexpr int kKeys = 800;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 256});
+    for (int i = 0; i < kKeys; ++i)
+      db.put({}, to_bytes(std::format("k{:03d}", i)),
+             to_bytes(std::format("v{:03d}", i)));
+  }
+  long files = 0;
+  for (const auto &e : std::filesystem::directory_iterator{dir})
+    if (e.path().extension() == ".hint") ++files;
+  REQUIRE(files >= 64);
+
+  // Room for a descriptor per data file, one per recovery thread, and a few
+  // for the engine; far short of a second one per file for its hint.
+  constexpr unsigned kThreads = 4;
+  const auto open_now = std::ranges::distance(
+      std::filesystem::directory_iterator{"/proc/self/fd"});
+  const auto limit = static_cast<rlim_t>(open_now + files + kThreads + 16);
+  REQUIRE(limit < static_cast<rlim_t>(open_now + 2 * files));
+
+  rlimit saved{};
+  REQUIRE(::getrlimit(kNoFileLimit, &saved) == 0);
+  REQUIRE(saved.rlim_cur >= limit);
+  struct Restore {
+    rlimit rl;
+    ~Restore() { (void)::setrlimit(kNoFileLimit, &rl); }
+  } restore{saved};
+  rlimit lowered = saved;
+  lowered.rlim_cur = limit;
+  REQUIRE(::setrlimit(kNoFileLimit, &lowered) == 0);
+
+  auto db = bytecask::DB::open(dir, {.max_file_bytes = 256,
+                                     .recovery_threads = kThreads});
+  for (int i = 0; i < kKeys; ++i) {
+    const auto v = get_val(db, to_bytes(std::format("k{:03d}", i)));
+    INFO("k" << i);
+    REQUIRE(v.has_value());
+    CHECK(to_string(*v) == std::format("v{:03d}", i));
   }
 }
 

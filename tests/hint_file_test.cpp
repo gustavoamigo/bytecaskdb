@@ -664,6 +664,45 @@ TEST_CASE("HintFile scan fails on a file changed after it was opened",
     CHECK_THROWS_WITH(scanner.next(),
                       Catch::Matchers::ContainsSubstring("invalid size"));
   }
+
+  SECTION("replaced: another file renamed over it is refused") {
+    // A valid hint, but not the one that was verified.
+    const auto other = tmp.string() + ".new";
+    write_entries(other, sample_entries(3));
+    std::filesystem::rename(other, tmp);
+    auto scanner = hf.make_scanner();
+    CHECK_THROWS_WITH(scanner.next(),
+                      Catch::Matchers::ContainsSubstring("was replaced"));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A verified hint holds no descriptor: recovery keeps every hint of a merge
+// open at once, and a descriptor each would double what an open needs (#251).
+// ---------------------------------------------------------------------------
+TEST_CASE("HintFile holds no descriptor between reads", "[hintfile]") {
+  const auto tmp = std::filesystem::temp_directory_path() / "bc_hint_nofd.hint";
+  std::filesystem::remove(tmp);
+  const auto es = sample_entries(400);
+  FrameBytes fb{256};
+  write_entries(tmp, es);
+  auto open_fds = [] {
+    return std::ranges::distance(
+        std::filesystem::directory_iterator{"/proc/self/fd"});
+  };
+  const auto before = open_fds();
+
+  const auto hf = bytecask::HintFile::OpenForRead(tmp);
+  CHECK(open_fds() == before);
+  auto scanner = hf.make_scanner();
+  auto second = hf.make_scanner();
+  REQUIRE(scanner.next().has_value());
+  REQUIRE(second.next().has_value());
+  CHECK(open_fds() == before);
+  std::size_t read = 1;
+  while (scanner.next()) ++read;
+  CHECK(read == es.size());
+  CHECK(open_fds() == before);
 }
 
 TEST_CASE("HintFile read mode survives move assignment", "[hintfile]") {
