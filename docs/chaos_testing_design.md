@@ -349,14 +349,16 @@ Where the first version differs from the design above, and why.
 The first runs, each within minutes, found the bugs listed in
 `correctness_validation.md` (*Chaos rig*): #231 in both of its forms (fixed
 by #240), #235 (fixed by #247), #236 (fixed by #248) and #237 (fixed by
-#255). With #231 fixed, power loss found #245.
+#255). With #231 fixed, power loss found #245 (fixed by #261). The rig also
+motivated `DB::close()` (#257, #260): a clean shutdown whose last
+`fdatasync` failed had no way to say so.
 
-`chaos-nightly.yml` leaves out what reaches the open ones (`KNOWN_BUGS`), so the
-nightly can find new bugs; each entry goes when its issue is fixed. It is now
-`vacuum` alone, which leaves out the worker's vacuum thread (#245). Against
-#255 with vacuum left out, 9 minutes (266 lives, 112 power cuts, 183 read
-errors) pass, and so does vacuum under I/O faults without power loss or
-eviction.
+All of them are fixed, and `chaos-nightly.yml` runs every hazard.
+`KNOWN_BUGS` in the workflow is where a hazard goes when the rig finds a bug
+that is not fixed yet, so the nightly can keep finding new ones; each entry
+names its issue and goes when the issue is fixed. Against #261, 8 minutes with
+every hazard (302 lives, 145 power cuts, 145 evictions, 299 failed
+`fdatasync`s, 261 read errors) pass.
 
 ## Not covered
 

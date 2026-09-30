@@ -1740,14 +1740,15 @@ SIGKILL harness:
 |---|---|
 | `resume()` trusts page-cache bytes after a failed `fdatasync` (#231, fixed by #240) | after power loss, a durable hint indexes zeroed records and `DB::open` refuses the database |
 | `DB::open` never syncs the newest hint-less file it indexes (#231, fixed by #240) | the same, after a SIGKILL followed by power loss, with no I/O error at all |
-| vacuum drops a durable record superseded only by a non-durable write (#245) | after a power cut, the key holds neither its old value nor its new one |
+| vacuum drops a durable record superseded only by a non-durable write (#245, fixed by #261) | after a power cut, the key holds neither its old value nor its new one |
 | vacuum leaks its `.data.tmp` staging file when compaction fails (#235, fixed by #247) | a copy of a file's live data per failed attempt, most often under `ENOSPC` |
 | a failed `ftruncate` that did cut the file leaves the logical end stale (#236, fixed by #248) | while degraded, reads of published records fail with `pread failed: Success` |
 | recovery memory-maps hint files (#237, fixed by #255) | a read error on a hint during `DB::open` kills the process with `SIGBUS` |
 
 `chaos-nightly.yml` runs it for 40 minutes a night, in release and under
-ASan. `--disable` leaves hazards out, to bisect a failure or to run past a
-known bug; a failure keeps the directory before and after the life, the
+ASan, with every hazard; a bug found and not yet fixed gets its hazards
+listed in the workflow's `KNOWN_BUGS` until it is. `--disable` leaves hazards
+out, to bisect a failure or to run past a known bug; a failure keeps the directory before and after the life, the
 history, the timeline and chaosfs's fault log.
 
 ### Isolation checking (Elle)

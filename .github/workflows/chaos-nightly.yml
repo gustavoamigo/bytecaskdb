@@ -48,12 +48,11 @@ jobs:
       BYTECASK_MARCH: x86-64-v3
       XMAKE_ROOT: "y"
       CLANG_TARGET_TRIPLE: x86_64-redhat-linux-gnu
-      # Hazards that reach a known open bug, left out so the run can find new
-      # ones. Remove each when its issue is fixed.
-      #   vacuum: #245 (vacuum drops a durable record superseded only by a
-      #     non-durable write; a power cut or eviction then loses the key).
-      #     Leaves the worker's vacuum thread out, not a hazard.
-      KNOWN_BUGS: vacuum
+      # Hazards that reach a known open bug, comma-separated, left out so the
+      # run can find new ones: add one with its issue number in a comment when
+      # a bug is found, remove it when the issue is fixed. Empty: every hazard
+      # runs. (`vacuum` leaves out the worker's vacuum thread.)
+      KNOWN_BUGS: ""
     strategy:
       fail-fast: false
       matrix:
