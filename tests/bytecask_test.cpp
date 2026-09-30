@@ -6507,6 +6507,86 @@ TEST_CASE("close() makes unsynced writes durable and writes the active "
   CHECK(reopened.durable_sequence() > last);
 }
 
+// #245: vacuum judges a record dead by the key directory, which holds
+// sync=false writes no fdatasync has covered yet. Dropping the record is
+// durable once vacuum commits, so it must not go before what superseded it.
+// The power is cut with the DB still open — its close would sync — and the
+// device's view of the directory is copied out before ~DB runs.
+TEST_CASE("vacuum does not drop a durable record that only an unsynced write "
+          "supersedes",
+          "[vacuum][fsyncgate]") {
+  // Compaction keeps k0; with both keys overwritten, the file goes whole.
+  for (const bool whole_file : {false, true}) {
+    DYNAMIC_SECTION((whole_file ? "file removed" : "file compacted")) {
+      bytecask::testing::ScopedPageCacheModel cache;
+      TempDir td;
+      const auto dir = td.path / "db";
+      const auto after_cut = td.path / "after_cut";
+      // Two 25-byte entries fill the first file and seal it. The 23-byte
+      // overwrites stay below the limit, so no rotation syncs them.
+      const bytecask::Options opts{.max_file_bytes = 50};
+      {
+        auto db = bytecask::DB::open(dir, opts);
+        db.put({.sync = true}, to_bytes("k0"), to_bytes("v_k0"));
+        db.put({.sync = true}, to_bytes("k1"), to_bytes("v_k1"));
+        if (whole_file)
+          db.put({.sync = false}, to_bytes("k0"), to_bytes("n0"));
+        const auto last = db.put({.sync = false}, to_bytes("k1"), to_bytes("n1"));
+        REQUIRE(db.durable_sequence() < last.sequence);
+        REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+        cache.model.restore_device(dir);  // power cut
+        std::filesystem::copy(dir, after_cut,
+                              std::filesystem::copy_options::recursive);
+      }
+      auto db = bytecask::DB::open(after_cut, opts);
+      const auto k0 = get_str(db, to_bytes("k0"));
+      const auto k1 = get_str(db, to_bytes("k1"));
+      CHECK((k0 == "v_k0" || (whole_file && k0 == "n0")));
+      CHECK((k1 == "v_k1" || k1 == "n1"));
+    }
+  }
+}
+
+TEST_CASE("vacuum whose fdatasync fails degrades, keeps the source file, and "
+          "the durable values survive a power cut",
+          "[vacuum][fsyncgate]") {
+  bytecask::testing::ScopedPageCacheModel cache;
+  TempDir td;
+  const auto dir = td.path / "db";
+  const auto after_cut = td.path / "after_cut";
+  const bytecask::Options opts{.max_file_bytes = 50};  // as above
+  {
+    auto db = bytecask::DB::open(dir, opts);
+    db.put({.sync = true}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = true}, to_bytes("k1"), to_bytes("v_k1"));
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("n0"));
+    const auto last = db.put({.sync = false}, to_bytes("k1"), to_bytes("n1"));
+    REQUIRE(db.durable_sequence() < last.sequence);
+    auto data_files = [&] {
+      std::set<std::filesystem::path> out;
+      for (const auto &e : std::filesystem::directory_iterator{dir})
+        if (e.path().extension() == ".data") out.insert(e.path());
+      return out;
+    };
+    const auto files_before = data_files();
+    {
+      // The whole-file path writes no staging copy: the first data file
+      // sync is the one that makes the overwrites durable.
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}),
+                        std::system_error);
+    }
+    CHECK(db.is_degraded());
+    CHECK(data_files() == files_before);
+    cache.model.restore_device(dir);  // power cut
+    std::filesystem::copy(dir, after_cut,
+                          std::filesystem::copy_options::recursive);
+  }
+  auto db = bytecask::DB::open(after_cut, opts);
+  CHECK(get_str(db, to_bytes("k0")) == "v_k0");
+  CHECK(get_str(db, to_bytes("k1")) == "v_k1");
+}
+
 TEST_CASE("after close() every operation throws DbClosed; snapshots taken "
           "before stay readable",
           "[close]") {

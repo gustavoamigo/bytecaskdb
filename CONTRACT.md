@@ -400,6 +400,11 @@ Recovery decides this once per open and compaction applies it; a
 tombstone written since the open is always kept. A file whose Puts are all
 dead may be removed without a scan only if it holds no tombstone.
 
+A Put may be dropped as dead only once the write that superseded it is
+durable. Before the old file can be unlinked, vacuum makes every write it
+judged liveness by durable, even `sync = false` ones: a power cut may lose
+a write the caller did not sync, never the durable value it replaced.
+
 ### Retention
 
 Vacuum drops no entry with a sequence above `VacuumOptions::retain_after`:
@@ -452,6 +457,11 @@ If any I/O operation throws during scan, copy, sync, or rename:
   propagates. A removal that fails too is left to the next recovery and
   must not replace the original exception.
 - The DB must remain operational.
+
+If the `fdatasync` that makes those superseding writes durable fails, the
+engine degrades and vacuum throws before committing; the old file stays in
+the published state and on disk. On an engine that is already degraded,
+vacuum throws `DbDegraded`.
 
 If the commit step (`vacuum_commit`) fails after the new file is
 written and renamed:

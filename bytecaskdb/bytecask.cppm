@@ -1255,10 +1255,18 @@ private:
       const DataFile &source_file, WritableDataFile &dest_file,
       std::uint32_t source_file_id, const NeededTombstones &needed,
       std::uint64_t retain_after) -> VacuumScanResult;
-  // Remaps key_dir entries, updates file registry, publishes new state. Caller must hold write_mu_.
+  // Remaps key_dir entries, updates file registry, publishes new state.
+  // First makes every write through decided_at durable: the state vacuum
+  // judged the file's records dead by. Caller must hold write_mu_.
   void vacuum_commit(std::uint32_t old_file_id, const VacuumScanResult &scan,
                      std::shared_ptr<DataFile> new_sealed_file,
-                     std::uint32_t dest_file_id);
+                     std::uint32_t dest_file_id, std::uint64_t decided_at);
+  // fdatasyncs the active file and advances t's durable_seq to its last
+  // sequence. On failure degrades, publishes the degraded state over
+  // current, and rethrows. Caller holds the write barrier.
+  void sync_active_file(TransientEngineState &t,
+                        const std::shared_ptr<const EngineState> &current,
+                        std::string_view caller);
   // Unlinks the old data and hint files. Open fds survive (POSIX).
   void vacuum_unlink_old_file(const std::shared_ptr<const EngineState> &snap,
                               std::uint32_t file_id);
@@ -3868,9 +3876,19 @@ auto DB::vacuum_scan_and_copy(
 void DB::vacuum_commit(std::uint32_t old_file_id,
                              const VacuumScanResult &scan,
                              std::shared_ptr<DataFile> new_sealed_file,
-                             std::uint32_t dest_file_id) {
+                             std::uint32_t dest_file_id,
+                             std::uint64_t decided_at) {
   auto current = load_state_for_write();
   auto t = current->transient();
+  // A record left out as superseded is gone for good once the source is
+  // unlinked, but what superseded it may be a sync=false write a crash can
+  // still lose, taking the key's last durable value with it (#245). So
+  // everything the scan saw becomes durable before the source can go.
+  if (t.durable_seq() < decided_at) {
+    // A sync after a failed one proves nothing (#231).
+    if (current->degraded) throw DbDegraded{current->degraded_reason};
+    sync_active_file(t, current, "vacuum");
+  }
   t.apply_vacuum(old_file_id, scan, std::move(new_sealed_file), dest_file_id);
 
   store_state(current, std::move(t).persistent());
@@ -3994,7 +4012,8 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
 
   {
     WriteBarrier barrier{*this};
-    vacuum_commit(file_id, scan, new_file, dest_file_id);
+    vacuum_commit(file_id, scan, new_file, dest_file_id,
+                  snap->next_seq > 0 ? snap->next_seq - 1 : 0);
   }
   // Bytes reclaimed = the shrinkage, not old_total - live_bytes: the compacted
   // file also carries the tombstones and markers that had to be preserved.
@@ -4020,7 +4039,8 @@ void DB::vacuum_remove_file(std::uint32_t file_id) {
     WriteBarrier barrier{*this};
     VacuumScanResult empty{};
     // No new sealed file, so no id is consumed.
-    vacuum_commit(file_id, empty, nullptr, 0);
+    vacuum_commit(file_id, empty, nullptr, 0,
+                  snap->next_seq > 0 ? snap->next_seq - 1 : 0);
   }
   counters_.vacuum_bytes_reclaimed.fetch_add(
       static_cast<std::int64_t>(old_total), std::memory_order_relaxed);
@@ -4135,22 +4155,28 @@ void DB::set_mode(Mode mode) {
   const auto last_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
   if (mode == Mode::Follower && current->mode == Mode::Leader
       && !current->degraded && t.durable_seq() < last_seq) {
-    try {
-      t.active_file().sync();
-      counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
-    } catch (...) {
-      counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-      t.apply_degrade(std::format(
-          "set_mode(Follower) fdatasync failed on '{}': writes acknowledged "
-          "without sync are not confirmed durable. Call resume() to recover.",
-          t.active_file().path().string()));
-      store_state(current, std::move(t).persistent());
-      throw;
-    }
-    t.apply_sync(last_seq);
+    sync_active_file(t, current, "set_mode(Follower)");
   }
   t.apply_set_mode(mode);
   store_state(current, std::move(t).persistent());
+}
+
+void DB::sync_active_file(TransientEngineState &t,
+                          const std::shared_ptr<const EngineState> &current,
+                          std::string_view caller) {
+  try {
+    t.active_file().sync();
+    counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
+  } catch (...) {
+    counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
+    t.apply_degrade(std::format(
+        "{} fdatasync failed on '{}': writes acknowledged without sync are "
+        "not confirmed durable. Call resume() to recover.",
+        caller, t.active_file().path().string()));
+    store_state(current, std::move(t).persistent());
+    throw;
+  }
+  t.apply_sync(t.next_seq() > 0 ? t.next_seq() - 1 : 0);
 }
 
 void DB::deem_as_degraded(std::string reason) {

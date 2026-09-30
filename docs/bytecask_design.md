@@ -652,6 +652,7 @@ Used when the file's live data is too large to fit into the active file. Produce
    If nothing at all is left to copy — every Put dead, every tombstone droppable — the staged file is discarded and the source is removed with `vacuum_remove_file` instead of publishing an empty file.
 3. **Seal and durability** — `fdatasync` the tmp file, close it. Rename `.data.tmp` → `.data` atomically. Open a new `DataFile` at the final path and seal it. Write a hint file by scanning the compacted file (no batches in the output), using the temp-then-rename protocol (`.hint.tmp` → `.hint`).
 4. **Atomic commit** (under `write_mu_`):
+   0. If `durable_seq` is below the last sequence of the step 1 snapshot, `fdatasync` the active file and advance `durable_seq` first. See **What supersedes must be durable** below.
    a. Build a `TransientRadixTree` from the current `key_dir_`.
    b. For each live Put entry copied to the new file, look up the key in the current key directory. If the sequence number still matches (no concurrent write superseded it), update `KeyDirEntry` to the new `file_id` and `file_offset`. If the sequence number differs, skip — the concurrent writer's version takes precedence.
    c. Call `persistent()` to obtain the new immutable key directory.
@@ -669,6 +670,7 @@ A file with no live entries but with tombstones goes through `vacuum_compact_fil
 
 1. **Snapshot the key directory** — call `state_.load()` to obtain the current `EngineState`.
 2. **Commit the removal** under `write_mu_`:
+   0. Make every write in the snapshot durable, as in `vacuum_compact_file` step 4.
    a. Remove the file from the registry.
    b. Remove the file's entry from `file_stats_`.
    c. Publish the updated `EngineState`.
@@ -701,6 +703,12 @@ After the rename there is a second window. Vacuum scans the compacted file C to 
 Deleting C is safe on exactly what step 2 checks: everything in C is also in S. Deleting S instead would also assume that S's other entries are dead, which nothing checks; a copy of a prefix of a file passes step 2, and deleting the larger file there would lose every write after the copy. The cost is that the next vacuum redoes the compaction. After reopening, files are sequence-disjoint again (D18), so `changes_since` yields each entry once.
 
 `vacuum_remove_file` has no crash safety concerns — it performs no I/O, only removes file references from engine state.
+
+##### What supersedes must be durable
+
+The snapshot a file is judged by is the published state, and it includes `sync = false` writes that no `fdatasync` has covered yet. A Put superseded only by such a write looks dead, and dropping it is durable once the source is unlinked. A power cut then loses the new write, which `sync = false` allows, and the old value with it, which it does not: the key is gone, a state no prefix of the history produces (#245, found by the chaos rig).
+
+So both primitives, in `vacuum_commit` and before the source can be unlinked, make every write up to the snapshot's last sequence durable: an `fdatasync` of the active file under the write barrier, advancing `durable_seq` as a commit would. It is skipped when `durable_seq` already covers the snapshot, which is the case whenever the writes are synced. A failed sync degrades the engine, like any failed `fdatasync` on the write path, and vacuum throws before committing, leaving the source in place. A degraded engine cannot trust a later sync (#231), so vacuum refuses there too. The alternative, dropping a record only when its superseder is at or below `durable_seq`, adds no sync but leaves the rest for a later vacuum that has to find them again.
 
 #### Vacuum caller (`vacuum()`)
 
@@ -766,7 +774,7 @@ For 1 KiB values a needed tombstone (`~19 + key_size` bytes) is negligible relat
 
 #### Concurrency guarantee
 
-Vacuum never holds `write_mu_` during file I/O. The only time `write_mu_` is held is the atomic commit step (6), which is a pure in-memory operation (transient tree update + pointer swaps). Write-path latency is unaffected by the size of the file being vacuumed.
+Vacuum never holds `write_mu_` during file I/O on the file it compacts. `write_mu_` is held for the atomic commit step, which is in-memory (transient tree update + pointer swaps) except for one `fdatasync` of the active file when `sync = false` writes are not yet durable (see **What supersedes must be durable**). Writers wait for that sync as they would for a group commit's. Write-path latency is unaffected by the size of the file being vacuumed.
 
 ## Data File Format (.data)
 
