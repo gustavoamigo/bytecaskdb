@@ -6332,6 +6332,191 @@ TEST_CASE("open makes a hint-less file durable before it indexes it: close "
   CHECK(get_str(db, to_bytes("later")) == "x");
 }
 
+// DB::close() (#257): the shutdown ~DB() does, with its outcome reported.
+TEST_CASE("close() throws when its fdatasync fails, closes all the same, and "
+          "a reopen recovers what was durable",
+          "[close][fsyncgate]") {
+  bytecask::testing::ScopedPageCacheModel cache;
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+  put_unsynced(db);
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    CHECK_THROWS_AS(db.close(), std::system_error);
+  }
+  CHECK_THROWS_AS(db.put({}, to_bytes("after"), to_bytes("x")),
+                  bytecask::DbClosed);
+  // A retry cannot make the lost pages durable, and does not pretend to.
+  CHECK_NOTHROW(db.close());
+  REQUIRE_FALSE(has_hint(active_data_file(dir)));
+
+  cache.model.restore_device(dir);  // power cut
+  // The lock is released: the handle is still alive, and the open succeeds.
+  auto reopened = bytecask::DB::open(dir);
+  CHECK(get_str(reopened, to_bytes(fsyncgate_key(0))) == fsyncgate_value(0));
+  for (int i = 1; i <= kUnsyncedPuts; ++i) {
+    INFO("key " << i);
+    CHECK_FALSE(reopened.contains_key({}, to_bytes(fsyncgate_key(i))));
+  }
+}
+
+TEST_CASE("close() makes unsynced writes durable and writes the active "
+          "file's hint",
+          "[close][fsyncgate]") {
+  bytecask::testing::ScopedPageCacheModel cache;
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+  put_unsynced(db);
+  const auto last = db.durable_sequence();
+  db.close();
+  CHECK(has_hint(active_data_file(dir)));
+  CHECK(cache.model.undurable_pages() == 0);
+  cache.model.restore_device(dir);  // power cut
+
+  auto reopened = bytecask::DB::open(dir);
+  check_all_present(reopened);
+  CHECK(reopened.durable_sequence() > last);
+}
+
+TEST_CASE("after close() every operation throws DbClosed; snapshots taken "
+          "before stay readable",
+          "[close]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = bytecask::DB::open(dir);
+  db.put({}, to_bytes("k"), to_bytes("v"));
+  auto snap = db.snapshot();
+  auto it = db.iter_from({}, to_bytes("k")).begin();
+  db.close();
+  db.close();  // idempotent
+
+  bytecask::Bytes out;
+  CHECK_THROWS_AS((void)db.get({}, to_bytes("k"), out), bytecask::DbClosed);
+  CHECK_THROWS_AS((void)db.contains_key({}, to_bytes("k")), bytecask::DbClosed);
+  CHECK_THROWS_AS(db.put({}, to_bytes("k"), to_bytes("v")), bytecask::DbClosed);
+  CHECK_THROWS_AS((void)db.del({}, to_bytes("k")), bytecask::DbClosed);
+  CHECK_THROWS_AS(db.del_range({}, to_bytes("a"), to_bytes("z")),
+                  bytecask::DbClosed);
+  CHECK_THROWS_AS((void)db.apply_batch({}, bytecask::WritePlan{}),
+                  bytecask::DbClosed);
+  CHECK_THROWS_AS((void)db.snapshot(), bytecask::DbClosed);
+  CHECK_THROWS_AS((void)db.iter_from({}), bytecask::DbClosed);
+  CHECK_THROWS_AS((void)db.keys_from({}), bytecask::DbClosed);
+  CHECK_THROWS_AS((void)db.riter_from({}), bytecask::DbClosed);
+  CHECK_THROWS_AS((void)db.rkeys_from({}), bytecask::DbClosed);
+  CHECK_THROWS_AS((void)db.vacuum(), bytecask::DbClosed);
+  CHECK_THROWS_AS((void)db.durable_sequence(), bytecask::DbClosed);
+  CHECK_THROWS_AS((void)db.create_manifest(), bytecask::DbClosed);
+  CHECK_THROWS_AS((void)db.changes_since(snap, 0), bytecask::DbClosed);
+  CHECK_THROWS_AS(db.set_mode(bytecask::Mode::Follower), bytecask::DbClosed);
+  CHECK_THROWS_AS(db.resume(), bytecask::DbClosed);
+  CHECK_THROWS_AS((void)db.stats(), bytecask::DbClosed);
+  CHECK_THROWS_AS(db.ingest({}), bytecask::DbClosed);
+  CHECK(db.mode() == bytecask::Mode::Leader);
+  CHECK_FALSE(db.is_degraded());
+
+  CHECK(snap.get({}, to_bytes("k"), out));
+  CHECK(to_string(out) == "v");
+  REQUIRE(it != std::default_sentinel);
+  CHECK(to_string((*it).value) == "v");
+
+  auto reopened = bytecask::DB::open(dir);
+  CHECK(get_str(reopened, to_bytes("k")) == "v");
+}
+
+TEST_CASE("close() on a degraded engine reports acknowledged writes that are "
+          "not durable",
+          "[close][degraded][fsyncgate]") {
+  bytecask::testing::ScopedPageCacheModel cache;
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+  put_unsynced(db);
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    REQUIRE_THROWS_AS(db.put({.sync = true}, to_bytes("kf"), to_bytes("vf")),
+                      std::system_error);
+  }
+  REQUIRE(db.is_degraded());
+  CHECK_THROWS_AS(db.close(), bytecask::DbDegraded);
+  CHECK(db.is_degraded());
+  CHECK_THROWS_AS((void)db.stats(), bytecask::DbClosed);
+  CHECK_NOTHROW(db.close());
+}
+
+TEST_CASE("close() on a degraded engine whose acknowledged writes are all "
+          "durable returns normally",
+          "[close][degraded]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  // The failed batch was never acknowledged, so nothing acknowledged is lost.
+  (void)degrade_with_unsynced_batch(db, dir);
+  CHECK_NOTHROW(db.close());
+
+  auto reopened = bytecask::DB::open(dir);
+  // The failed batch may be there or not: it was never acknowledged.
+  CHECK(get_str(reopened, to_bytes("k1")) == "v1");
+}
+
+TEST_CASE("writers and readers racing close() either complete or throw "
+          "DbClosed, and every acknowledged write survives",
+          "[close][concurrency]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  constexpr int kWriters = 4;
+  constexpr int kReaders = 2;
+  std::array<std::vector<std::string>, kWriters> acked;
+  std::atomic<int> started{0};
+  std::atomic<bool> unexpected{false};
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 64 * 1024});
+    std::vector<std::thread> threads;
+    for (int w = 0; w < kWriters; ++w) {
+      threads.emplace_back([&, w] {
+        try {
+          for (int i = 0;; ++i) {
+            const auto key = std::format("w{}:{}", w, i);
+            (void)db.put({.sync = (i % 3 == 0)}, to_bytes(key),
+                         to_bytes(key));
+            acked[static_cast<std::size_t>(w)].push_back(key);
+            if (i == 20) started.fetch_add(1);
+          }
+        } catch (const bytecask::DbClosed &) {
+        } catch (...) {
+          unexpected = true;
+        }
+      });
+    }
+    for (int r = 0; r < kReaders; ++r) {
+      threads.emplace_back([&] {
+        try {
+          bytecask::Bytes out;
+          for (;;) (void)db.get({}, to_bytes("w0:0"), out);
+        } catch (const bytecask::DbClosed &) {
+        } catch (...) {
+          unexpected = true;
+        }
+      });
+    }
+    while (started.load() < kWriters) std::this_thread::yield();
+    db.close();
+    for (auto &t : threads) t.join();
+  }
+  CHECK_FALSE(unexpected);
+  auto db = bytecask::DB::open(dir);
+  for (const auto &keys : acked) {
+    CHECK(keys.size() > 20);
+    for (const auto &key : keys) {
+      INFO(key);
+      CHECK(get_str(db, to_bytes(key)) == key);
+    }
+  }
+}
+
 #ifndef __EMSCRIPTEN__
 TEST_CASE("open makes a hint-less file durable before it indexes it: a "
           "process killed before its sync",

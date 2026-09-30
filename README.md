@@ -25,7 +25,7 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 - **Atomic writes** — every `put`, `del`, and `del_range` is atomic. `apply_batch` makes multiple puts, deletes, and range deletes atomic as a group.
 - **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch(opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `nullopt` on conflict. The snapshot is embedded in the `WritePlan` at construction time. When a snapshot is present, every key in the write set is automatically checked for concurrent modification — no explicit guard needed on keys you write. Use `ensure_unchanged` for keys you read but don't write, and range guards for serializable conflict detection. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. Each precondition check is a key directory lookup plus one record read for the key's sequence — no separate transaction type required. Both levels are checked every night with [Elle](https://github.com/jepsen-io/elle) against concurrent transaction histories, with vacuum and injected `fdatasync` failures running, and with the process SIGKILLed and reopened under concurrent group-commit writers: guarded plans come out strict-serializable, and unguarded ones snapshot-isolated, with write skew as their only anomaly. The check covers point reads and writes; range guards and range deletes are not yet part of it ([`docs/isolation_checking_design.md`](docs/isolation_checking_design.md)).
 - **Fast recovery** — parallelised index reconstruction from zstd-compressed hint files; from a cold start, with nothing in the page cache, 10 M keys recover in 0.33 s on a SATA SSD.
-- **Bounded close and restart** — hint files are written in the background, and the number waiting is capped (`max_hint_backlog`, default 4). When the writer falls behind, writes wait for it rather than letting the backlog grow, so a clean close has at most that many hint files to write, plus the active file's, and an open after a crash at most one more to rebuild. The cap can be turned off for bulk loads.
+- **Bounded close and restart** — hint files are written in the background, and the number waiting is capped (`max_hint_backlog`, default 4). When the writer falls behind, writes wait for it rather than letting the backlog grow, so a clean close has at most that many hint files to write, plus the active file's, and an open after a crash at most one more to rebuild. The cap can be turned off for bulk loads. `close()` reports how the shutdown went: it returns only if every acknowledged write, `sync = false` ones included, is durable, and throws if the final `fdatasync` or a hint write failed.
 - **Vacuum** — vacuum process to reclaim unused space from overwritten or deleted keys; query performance does not degrade as the database grows. Delete tombstones are reclaimed too: when vacuum compacts a file, it drops each tombstone that no longer hides an older value in another file. Which ones qualify is decided when the database is opened, so a tombstone written since the last open stays until the next one. Vacuum removes history `changes_since` would stream, so under replication it takes `retain_after` from the replication service: the lowest position a follower still needs, above which nothing is dropped. The default restricts nothing.
 - **Lock-free multi-reader, single-writer** — reads are lock-free and scale to millions of operations per second. Writes are serialised under a single mutex for their in-memory phase, with group commit: concurrent sync writers share a single `fdatasync` call, amortising the dominant cost. The commit is pipelined: while one flush is in flight, the next batch is validated, applied and appended, so the disk never waits on in-memory work. On the success path, `state_.store()` happens after `fdatasync`, guaranteeing durability before visibility.
 - **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and append-only data files as the primary durable store. A new or renamed file's directory entry is synced before anything depends on it — before the first write into a new data file is acknowledged, and before vacuum removes the file it compacted — so a power loss cannot keep a file's contents and lose its name. Hint files are an index, not the record: one that fails its CRC is rebuilt from its data file at recovery rather than dropped, so a damaged index costs the time to rebuild it and not the keys behind it. A process killed in the middle of a vacuum leaves the file being compacted and its compacted copy side by side; the next open deletes the copy once it has checked that every entry in it is also in the original, and refuses to open on any other pair of files that share sequence numbers. On unrecoverable write-path failures (e.g. isolation rotation fails), the engine enters a degraded state: reads remain available, all writes throw `DbDegraded`, and the service calls `resume()` to recover without a restart. A failed `fdatasync` is not retried on trust: Linux leaves the pages it failed to write clean in the page cache, and a second `fdatasync` returns success without writing them. So `resume()`, and `open` for a file the last process may not have synced, read the file back, write it to the same offsets and sync it before building anything from it. `sync=false` writes caught in a failed sync can then be lost without a crash, if the kernel evicted their pages first; `resume()` refuses in that case, and a reopen recovers what the disk holds. Corruption of data already acknowledged is refused rather than repaired: `resume()` throws instead of cutting the file back to the last entry it can parse, and `open` refuses damage in any data file but the newest. The newest file is the one a crash can leave with a torn tail, and nothing but its own bytes says how much of it was synced, so `open` truncates it at the first record that does not parse — as PostgreSQL and RocksDB truncate their logs — and damage in that file goes with the tail.
@@ -199,6 +199,10 @@ for (auto& [key, value] : db.riter_from({}, to_bytes("user:~"))) { ... }
 
 // Reverse keys-only — descending order.
 for (auto& key : db.rkeys_from({}, to_bytes("user:~"))) { ... }
+
+// Close — makes every write durable, and throws if it could not.
+// The destructor closes too, but has to swallow the error.
+db.close();
 ```
 
 > `to_bytes` is a small helper that converts a `std::string_view` to `BytesView`:
@@ -397,6 +401,17 @@ public:
     // gauges (degraded, open_files, hint_backlog, keydir_versions_live,
     // keydir_nodes_parked). Designed for pull-based scraping.
     [[nodiscard]] auto stats() const -> std::map<std::string, std::int64_t>;
+
+    // Makes every write durable, sync = false ones included, writes the hint
+    // files and releases the directory lock. Waits for in-flight writes and a
+    // running vacuum. Returns only if every acknowledged write is durable and
+    // the shutdown completed; otherwise throws std::system_error (a failed
+    // fdatasync or hint write) or DbDegraded (a degraded engine holding
+    // acknowledged writes that are not durable). Closed either way: every
+    // later call throws DbClosed, except mode(), is_degraded() and
+    // degraded_reason(). A second close() returns at once. ~DB calls close()
+    // if it was not called, and swallows its errors.
+    void close();
 };
 
 // Frozen, move-only, read-only view of DB state at a point in time.
@@ -480,10 +495,13 @@ class DbDegraded : public std::runtime_error { /* ... */ };
 // Thrown by put/del/del_range/apply_batch when the engine is in follower mode.
 class DbFollowerMode : public std::runtime_error { /* ... */ };
 
+// Thrown by every DB operation after close().
+class DbClosed : public std::logic_error { /* ... */ };
+
 } // namespace bytecask
 ```
 
-Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; an internal invariant violation that cannot be continued through safely — currently only a reused data file name, which would silently drop writes at recovery — prints to stderr and aborts the process rather than throwing, since the write path would otherwise catch it and retry into the same corrupt state; write operations on a degraded engine throw `DbDegraded` (a `std::runtime_error` subclass, catchable separately); normal writes in follower mode throw `DbFollowerMode`. Key-not-found is signalled by `get` returning `false`; `apply_batch` (and `del`) return `nullopt` on precondition or W-W conflict — conflicts are expected outcomes, not exceptional errors. Every committed write returns a `CommitResult{sequence, durable}` — a wait-friendly token for read-your-own-writes across replication (see `durable_sequence` above).
+Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; an internal invariant violation that cannot be continued through safely — currently only a reused data file name, which would silently drop writes at recovery — prints to stderr and aborts the process rather than throwing, since the write path would otherwise catch it and retry into the same corrupt state; write operations on a degraded engine throw `DbDegraded` (a `std::runtime_error` subclass, catchable separately); normal writes in follower mode throw `DbFollowerMode`; any call on a closed `DB` throws `DbClosed` (a `std::logic_error`). Key-not-found is signalled by `get` returning `false`; `apply_batch` (and `del`) return `nullopt` on precondition or W-W conflict — conflicts are expected outcomes, not exceptional errors. Every committed write returns a `CommitResult{sequence, durable}` — a wait-friendly token for read-your-own-writes across replication (see `durable_sequence` above).
 
 
 ## Architecture

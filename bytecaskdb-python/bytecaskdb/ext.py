@@ -570,6 +570,21 @@ class DB:
         """Attempt recovery from a degraded state."""
         self._db.resume()
 
+    def close(self) -> None:
+        """Make every write durable and release the database.
+
+        Raises OSError, or DbDegraded, if an acknowledged write is not
+        durable or the shutdown failed; the DB is closed either way.
+        Idempotent.
+        """
+        self._db.close()
+
+    def __enter__(self) -> "DB":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
     # ── Properties ────────────────────────────────────────────────────────────
 
     @property

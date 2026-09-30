@@ -345,6 +345,8 @@ NB_MODULE(_bytecaskdb, m) {
   nb::exception<bytecask::DbDegraded>(m, "DbDegraded", PyExc_RuntimeError);
   nb::exception<bytecask::DbFollowerMode>(m, "DbFollowerMode",
                                           PyExc_RuntimeError);
+  // A ValueError, as Python's own operations on a closed file raise.
+  nb::exception<bytecask::DbClosed>(m, "DbClosed", PyExc_ValueError);
 
   nb::register_exception_translator(
       [](const std::exception_ptr &p, void *) {
@@ -353,6 +355,8 @@ NB_MODULE(_bytecaskdb, m) {
         } catch (const bytecask::DbDegraded &) {
           throw;
         } catch (const bytecask::DbFollowerMode &) {
+          throw;
+        } catch (const bytecask::DbClosed &) {
           throw;
         } catch (const std::system_error &e) {
           PyErr_SetString(PyExc_OSError, e.what());
@@ -851,6 +855,21 @@ NB_MODULE(_bytecaskdb, m) {
              self.db.resume();
            },
            "Attempt recovery from a degraded state.")
+      .def("close",
+           [](PyDB &self) {
+             BC_GIL_RELEASE;
+             self.db.close();
+           },
+           "Make every write durable, write the hint files and release the "
+           "directory lock. Raises OSError, or DbDegraded, if an "
+           "acknowledged write is not durable or the shutdown failed; the DB "
+           "is closed either way. Idempotent.")
+      .def("__enter__", [](nb::object self) -> nb::object { return self; })
+      .def("__exit__",
+           [](PyDB &self, nb::args) {
+             BC_GIL_RELEASE;
+             self.db.close();
+           })
       .def_prop_ro(
           "mode",
           [](PyDB &self) { return self.db.mode(); },

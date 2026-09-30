@@ -1069,6 +1069,17 @@ static int bytecaskdb_deinit(void * /*p*/) {
   if (s_sync_thread.joinable())
     s_sync_thread.join();
 
+  // Close explicitly so a shutdown that lost acknowledged writes, or could
+  // not write its hints, is logged; ~DB() would swallow it.
+  int rc = 0;
+  if (g_db_owner) {
+    try {
+      g_db_owner->db.close();
+    } catch (const std::exception &e) {
+      sql_print_error("ByteCaskDB: close failed: %s", e.what());
+      rc = 1;
+    }
+  }
   g_db = nullptr;
   g_db_owner.reset();
   // Clear caches.
@@ -1089,7 +1100,7 @@ static int bytecaskdb_deinit(void * /*p*/) {
     std::lock_guard<std::mutex> lk{s_row_count_mu};
     s_row_counts.clear();
   }
-  return 0;
+  return rc;
 }
 
 } // namespace bytecaskdb

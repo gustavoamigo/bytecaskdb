@@ -141,6 +141,9 @@ export interface ByteCaskDB extends Disposable {
   changesSince(snap: Snapshot, fromSeq: bigint): CloseableIterator<DataEntry>;
   ingest(entries: DataEntry[]): void;
   stats(): Record<string, number>;
+  // Makes every write durable, writes the hint files and releases the
+  // directory lock and the handle. Throws if an acknowledged write is not
+  // durable or the shutdown failed; the DB is closed either way. Idempotent.
   close(): void;
 }
 

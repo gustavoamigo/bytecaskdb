@@ -34,13 +34,17 @@ export function applyDisposeWiring(module: Record<string, any>): void {
   // close() method leaves that handle live, so Embind later deletes the same
   // pointer again. Give Embind classes a close() that delegates to their own
   // idempotent delete() lifecycle API. N-API classes already expose close().
+  // The DB first runs its own close (closeDb), which returns what the
+  // shutdown reported: the handle is deleted either way, then that is thrown.
   for (const name of DISPOSABLE_CLASSES) {
     const cls = module[name];
     if (typeof cls?.prototype?.delete === "function") {
       cls.prototype.close = function () {
-        if (!this.isDeleted()) {
-          this.delete();
-        }
+        if (this.isDeleted()) return;
+        const error: string =
+          typeof this.closeDb === "function" ? this.closeDb() : "";
+        this.delete();
+        if (error) throw new Error(error);
       };
     }
   }
