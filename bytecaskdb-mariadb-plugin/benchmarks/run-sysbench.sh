@@ -30,6 +30,16 @@
 #                 run left under --data-root, and keep them at exit. The table
 #                 size must match what was loaded; a mutating workload leaves
 #                 its changes behind for the next run.
+#   --capture: profile the server during each cell's measured run, as
+#              run-hammerdb.sh --capture does (see lib_capture.sh): per-core and
+#              per-thread CPU, on- and off-CPU perf stacks, engine status at the
+#              start and end. One tarball per cell,
+#              <capture-dir>/capture_<engine>_<workload>_t<threads>_<run start>.tar.gz.
+#              The capture takes 120 s from the start of the measured run, so it
+#              needs --time=130 or more. The profilers slow the server: compare
+#              captured cells with each other, not with uncaptured ones.
+#   --capture-dir: where --capture writes its tarballs (default:
+#              benchmarks/captures/ in this repository).
 #   --profile: durability profile (default: acid). acid starts each engine with
 #              <engine>.cnf, where a commit is durable before it returns. fast
 #              uses <engine>-fast.cnf instead: a commit survives a mariadbd crash
@@ -84,6 +94,8 @@ CREATE_SECONDARY="on"
 DATA_ROOT=""
 REUSE_DATA="off"
 PROFILE="acid"
+CAPTURE="off"
+CAPTURE_DIR=""
 
 #WORKLOADS="oltp_read_only:points_only oltp_read_only:ranges_only oltp_read_only:simple_range oltp_read_only:sum_range oltp_read_only:order_range oltp_read_only:distinct_range"
 
@@ -106,8 +118,10 @@ for arg in "$@"; do
     --no-secondary-index) CREATE_SECONDARY="off" ;;
     --reuse-data)   REUSE_DATA="on" ;;
     --profile=*)    PROFILE="${arg#*=}" ;;
+    --capture)      CAPTURE="on" ;;
+    --capture-dir=*) CAPTURE_DIR="${arg#*=}" ;;
     --help|-h)
-      echo "Usage: $0 [--table-size=N] [--threads=1,4,8] [--time=30] [--warmup=60] [--engines=bytecaskdb,innodb,rocksdb] [--workloads=oltp_insert] [--data-root=PATH] [--no-secondary-index] [--reuse-data] [--profile=acid|fast]"
+      echo "Usage: $0 [--table-size=N] [--threads=1,4,8] [--time=30] [--warmup=60] [--engines=bytecaskdb,innodb,rocksdb] [--workloads=oltp_insert] [--data-root=PATH] [--no-secondary-index] [--reuse-data] [--profile=acid|fast] [--capture] [--capture-dir=PATH]"
       exit 0
       ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
@@ -147,11 +161,37 @@ command -v mariadbd >/dev/null 2>&1 || { echo "ERROR: mariadbd not found"; exit 
 # shellcheck source=lib_common.sh
 source "$SCRIPT_DIR/lib_common.sh"
 
+# Checked before anything slow: tools, perf permissions, the capture directory.
+if [[ "$CAPTURE" == on ]]; then
+  # shellcheck source=lib_capture.sh
+  source "$SCRIPT_DIR/lib_capture.sh"
+  if (( DURATION < CAPTURE_SECONDS + 10 )); then
+    echo "ERROR: --capture records ${CAPTURE_SECONDS}s of the measured run;" \
+         "--time=$DURATION is too short (use $(( CAPTURE_SECONDS + 10 )) or more)." >&2
+    exit 1
+  fi
+  CAPTURE_DIR="${CAPTURE_DIR:-$SCRIPT_DIR/captures}"
+  read -ra _wl <<< "${WORKLOADS//,/ }"
+  capture_preflight $(( (DURATION + 59) / 60 )) "$CAPTURE_DIR" \
+    $(( ${#_wl[@]} * ${#THREAD_LIST[@]} * ${#ENGINE_LIST[@]} ))
+  CAPTURE_DIR="$(cd "$CAPTURE_DIR" && pwd)"
+  # In every tarball's name, so a rerun never overwrites an earlier capture.
+  CAPTURE_RUN="$(date +%Y%m%d_%H%M%S)"
+fi
+
 # ---------------------------------------------------------------------------
 # Build plugin in Release mode
 # ---------------------------------------------------------------------------
 if engine_enabled bytecaskdb; then
   build_bytecaskdb_plugin
+fi
+if [[ "$CAPTURE" == on ]]; then
+  symbol_files=("$(command -v mariadbd)")
+  engine_enabled bytecaskdb && symbol_files+=("$PLUGIN_DIR/ha_bytecaskdb.so")
+  capture_check_symbols "${symbol_files[@]}"
+  if engine_enabled bytecaskdb; then
+    capture_check_debug_info "$PLUGIN_DIR/ha_bytecaskdb.so"
+  fi
 fi
 
 ROCKSDB_PLUGIN_DIR=""
@@ -330,9 +370,18 @@ run_bench() {
   rss_reset "$dir/mariadbd.pid"
   io_before="$(io_sample "$dir/mariadbd.pid")"
   eng_before="$(engine_counters "$engine" "$dir/mysql.sock")"
+  # The capture runs beside the measured run, from its start.
+  local capture_dir="" capturer=""
+  if [[ "$CAPTURE" == on ]]; then
+    capture_dir="$(dirname "$dir")/$(capture_name "$engine" "$workload" "$threads")"
+    rm -rf "$capture_dir"
+    capture_run "$engine" "$dir/mariadbd.pid" "$dir/mysql.sock" "$capture_dir" &
+    capturer=$!
+  fi
   # shellcheck disable=SC2086
   output="$(sysbench "$base_workload" $args $variant_args --time="$DURATION" \
     --mysql-ignore-errors=1180,1213 run 2>&1)" || true
+  [[ -n "$capturer" ]] && { wait "$capturer" 2>/dev/null || true; }
   # Engine counters must be read while the server is still up.
   eng_after="$(engine_counters "$engine" "$dir/mysql.sock")"
   io_after="$(io_sample "$dir/mariadbd.pid")"
@@ -348,6 +397,12 @@ run_bench() {
   dev_after="$(dev_written_bytes)"
   flush_mib="$(awk -v b=$((dev_after - dev_before)) \
     'BEGIN { printf "%.1f", (b > 0 ? b : 0) / 1048576 }')"
+  if [[ -n "$capture_dir" ]]; then
+    echo "$output" > "$capture_dir.sysbench.log"
+    capture_finish "$capture_dir" "$CAPTURE_DIR/$(basename "$capture_dir")_$CAPTURE_RUN.tar.gz" \
+      "$(engine_defaults_file "$engine" "$PROFILE")" "$capture_dir.sysbench.log"
+    rm -f "$capture_dir.sysbench.log"
+  fi
 
   # Extract metrics (sysbench 1.0 outputs only one percentile: 95th by default).
   # The "transactions:" / "queries:" / "ignored errors:" lines are all
@@ -366,7 +421,12 @@ run_bench() {
     echo "$output" | tail -20 >&2
   fi
 
-  echo "$engine,$workload,$threads,$tps,$qps,$avg_lat,$p95,$err,$io_cols,$eng_cols,$flush_mib,$rss_cols,$PROFILE"
+  echo "$engine,$workload,$threads,$tps,$qps,$avg_lat,$p95,$err,$io_cols,$eng_cols,$flush_mib,$rss_cols,$PROFILE,$CAPTURE"
+}
+
+# A cell's capture name: engine, workload (a variant's ':' made '-') and threads.
+capture_name() {
+  echo "capture_$1_${2//:/-}_t$3"
 }
 
 # Echoes the collected CSV row for a cell, or nothing.
@@ -394,6 +454,7 @@ echo "    Threads: ${THREADS}"
 echo "    Workloads: $WORKLOADS"
 echo "    Durability profile: $PROFILE"
 echo "    Data root: $DATA_ROOT"
+echo "    Capture: $CAPTURE${CAPTURE_DIR:+ (tarballs to $CAPTURE_DIR)}"
 if engine_enabled rocksdb && [[ -z "$ROCKSDB_PLUGIN_DIR" ]]; then
   echo "    RocksDB: SKIPPED (plugin not found)"
 fi
@@ -418,7 +479,7 @@ fi
 echo ""
 
 echo "=== Phase 2: running workloads ==="
-echo "engine,workload,threads,tps,qps,avg_lat_ms,p95_ms,err_per_s,read_mib,write_mib,syscr,syscw,eng_write_mib,eng_fsyncs,flush_mib,rss_mib,peak_rss_mib,profile" > "$RESULTS_CSV"
+echo "engine,workload,threads,tps,qps,avg_lat_ms,p95_ms,err_per_s,read_mib,write_mib,syscr,syscw,eng_write_mib,eng_fsyncs,flush_mib,rss_mib,peak_rss_mib,profile,capture" > "$RESULTS_CSV"
 declare -a ALL_RESULTS=()
 
 for workload in $WORKLOADS; do
@@ -434,6 +495,14 @@ for workload in $WORKLOADS; do
         "$(cut -d, -f9 <<< "$result")" \
         "$(cut -d, -f10 <<< "$result")" \
         "$(cut -d, -f16 <<< "$result")"
+      if [[ "$CAPTURE" == on ]]; then
+        capture_file="$CAPTURE_DIR/$(capture_name "$engine" "$workload" "$t")_$CAPTURE_RUN.tar.gz"
+        if [[ -f "$capture_file" ]]; then
+          echo "      capture: $capture_file ($(du -h "$capture_file" | cut -f1))"
+        else
+          echo "      capture: missing — see the error above, or the server stopped before it finished" >&2
+        fi
+      fi
     done
     echo ""
   done
@@ -554,5 +623,8 @@ done
 
 echo ""
 echo "Results saved to: $RESULTS_CSV"
+if [[ "$CAPTURE" == on ]]; then
+  echo "Captures:         $CAPTURE_DIR/capture_*_$CAPTURE_RUN.tar.gz"
+fi
 
 cleanup
