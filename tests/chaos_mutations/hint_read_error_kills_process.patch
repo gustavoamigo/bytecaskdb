@@ -1,0 +1,18 @@
+A hint file that fails to read during DB::open kills the process instead of
+being rebuilt from its data file: the behaviour recovery had while it
+memory-mapped hint files, where the kernel's SIGBUS did it. #255 (#237)
+replaced the mapping with pread; this restores the symptom (by abort()), not
+the mapping.
+Expected: caught.
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index aab1a99e..fad1dd1e 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3643,6 +3643,7 @@ auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
+   try {
+     return HintFile::OpenForRead(hint_path);
+   } catch (const std::exception &e) {
++    std::abort();
+     // flush_hints_for leaves an existing hint alone, so the damaged one has
+     // to go first. Nothing is lost by removing it: it is unreadable either
+     // way, and a rebuild that does not finish here leaves the file hint-less,

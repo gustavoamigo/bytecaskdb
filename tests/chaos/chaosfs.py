@@ -63,6 +63,7 @@ DEFAULT_FAULTS = {
     "write_eio": 0.0,      # write fails after landing a random prefix (maybe none)
     "write_short": 0.0,    # write lands a prefix and returns its length
     "fsync_eio": 0.0,      # fdatasync fails with Linux semantics
+    "evict_failed": 0.0,   # ...and the pages it lost leave the cache at once
     "meta_eio": 0.0,       # create/mkdir/rename/unlink/truncate/fsyncdir fail;
                            # the change may or may not have happened
     "erofs": False,        # every mutation fails with EROFS
@@ -145,6 +146,7 @@ class ChaosModel:
         self.next_fh = 1
         self.log: deque = deque(maxlen=20000)
         self.counts: dict[str, int] = {}
+        self.pages_evicted = 0  # every page an eviction reverted, ever
         self.root = self._new_inode(True, 0o755)
         self.root.nlink = 1
 
@@ -446,6 +448,10 @@ class ChaosModel:
                 if h:
                     h.seen_err = n.err_seq
                 self._note("fsync", f"eio(lost_pages={len(n.failed)})", path or "")
+                if self._chance("evict_failed"):
+                    # Memory pressure right after the failure: the lost pages
+                    # go before anyone reads them again.
+                    self._note("fsync", f"evicted(pages={self._evict(n)})", path or "")
                 _fail(errno.EIO)
             if h and h.seen_err < n.err_seq:
                 h.seen_err = n.err_seq
@@ -555,21 +561,25 @@ class ChaosModel:
         with self.cond:
             self.frozen = True
 
+    def _evict(self, n: Inode) -> int:
+        reverted = 0
+        for p in n.failed:
+            start = p * PAGE
+            end = min(start + PAGE, len(n.data))
+            if start >= end:
+                continue
+            disk = bytes(n.durable[start:end])
+            n.data[start:end] = disk + bytes(end - start - len(disk))
+            reverted += 1
+        n.failed.clear()
+        self.pages_evicted += reverted
+        return reverted
+
     def evict(self) -> int:
         """Pages whose writeback failed leave the cache: reads now return
         what the disk holds."""
         with self.cond:
-            reverted = 0
-            for n in self.inodes.values():
-                for p in n.failed:
-                    start = p * PAGE
-                    end = min(start + PAGE, len(n.data))
-                    if start >= end:
-                        continue
-                    disk = bytes(n.durable[start:end])
-                    n.data[start:end] = disk + bytes(end - start - len(disk))
-                    reverted += 1
-                n.failed.clear()
+            reverted = sum(self._evict(n) for n in self.inodes.values())
             self._note("evict", f"reverted(pages={reverted})")
             return reverted
 
@@ -703,7 +713,8 @@ class ChaosModel:
                     "inodes": len(self.inodes), "frozen": self.frozen,
                     "epoch": self.epoch,
                     "dirty_pages": sum(len(n.dirty) for n in self.inodes.values()),
-                    "failed_pages": sum(len(n.failed) for n in self.inodes.values())}
+                    "failed_pages": sum(len(n.failed) for n in self.inodes.values()),
+                    "pages_evicted": self.pages_evicted}
 
     def dump_log(self, path: str):
         with self.cond:

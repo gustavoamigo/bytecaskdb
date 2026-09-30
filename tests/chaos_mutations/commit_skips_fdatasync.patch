@@ -1,0 +1,15 @@
+The commit flush skips its fdatasync and still publishes durable_seq, so a
+sync write returns durable = true with its bytes only in the page cache.
+Expected: caught.
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index aab1a99e..8272b9d7 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3221,7 +3221,6 @@ void DB::flush_pending() {
+     if (test_before_flush_sync_) test_before_flush_sync_();
+ #endif
+     try {
+-      static_cast<WritableDataFile &>(head->active_file()).sync();
+       counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
+     } catch (...) {
+       flush_failed(std::current_exception(), published,

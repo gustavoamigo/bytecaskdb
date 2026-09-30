@@ -242,27 +242,61 @@ images.
 ## Proving the rig
 
 Like the soak, the rig earns its cost only if it catches what nothing else
-does. A mutation set in `tests/chaos_mutations/`, run by a script like
-`soak_mutation_check.sh`, must each be caught within a fixed budget:
+does. `tests/chaos_mutations/` holds mutations of the engine, each with an
+`Expected: caught | NOT caught` header, and `scripts/chaos_mutation_check.sh
+[minutes] [patch...]` applies each, rebuilds `chaos_worker`, runs the rig on
+two seeds with a budget per seed, and fails if a mutation expected to be
+caught survives (#268). A patch can carry `Budget: N` minutes and `Disable:
+a,b`, the hazards to leave out so the run concentrates on the ones that reach
+it; with read faults, evictions and the descriptor limit all left out, the
+worker's readers also count a read's I/O error as a violation
+(`--strict-reads`), since nothing in the run can fail a read.
 
-| Mutation | Expected catch |
-|---|---|
-| No `fdatasync` before sealing at rotation | power loss loses a durable write (I1) |
-| No directory sync after creating a data file (#199) | power loss drops the file's name (I1) |
-| No sync before degrading (B1–B3) | power loss after a failed write and `resume()` (I6) |
-| Hint written in place, not temp-then-rename | expected to survive: the torn hint fails its CRC and is rebuilt — recorded to confirm the rig reaches it |
-| `resume()` skips the scan and reuses the active file | I2 or I6 |
+Most mutations revert a fix the rig prompted, so the set also guards those
+fixes:
 
-A mutation expected to be caught that survives is a rig bug.
+| Mutation | Reverts | Result |
+|---|---|---|
+| `commit_skips_fdatasync`: the commit flush skips its `fdatasync` and still reports durable | — | caught in ~20 s, every run |
+| `no_dir_sync_new_data_file`: a new data file's name is not synced | #199 | caught in 30–90 s, every run |
+| `resume_trusts_page_cache`: `resume()` publishes the tail without rewriting it | #240 (#231) | caught in 1–2 min, every run |
+| `open_trusts_page_cache`: `open` indexes a hint-less file without making it durable | #240 (#231) | caught in 0.5–3 min, every run |
+| `close_swallows_error`: `close()` drops its final `fdatasync`'s error | #260 (#257) | caught in 0.5–3 min, every run (every life a clean close) |
+| `hint_read_error_kills_process`: a hint read error kills the process | #255 (#237) | caught in 2–5 min, every run |
+| `vacuum_drops_before_durable`: vacuum drops records superseded by non-durable writes | #261 (#245) | caught in 2 of 5 runs of 10 min: rare |
+| `hint_written_in_place`: hints written in place, not renamed | — | caught twice in ~45 min: rare |
+| `no_sync_before_degrade`: a failed append degrades without syncing | — | not caught: #240's rewrite in `resume()` covers it |
+| `truncate_lowers_end_after`: the logical end drops after `ftruncate`, not before | #248 (#236) | not caught: the stale end lasts one `resume()` retry; #248's `prove_resume` cell guards it |
 
-The first question the rig answered is not a mutation. After an `fdatasync`
-fails, `resume()` "replays any valid committed entries (including F/G
-bytes if they survived in the page cache to `sync()`)". Under the Linux
-semantics above those bytes are readable but no longer headed for the disk,
-and the `sync()` after them succeeds without writing them. The rig
-reproduced it (#231): after the power loss, the hint `resume()` wrote indexes
-zeroed records and the database no longer opens. The mutation set is still to
-be built.
+"Rare" (`Expected: caught (rare)`) marks a mutation the rig catches but not
+within a fixed budget: the script runs and reports it, and a survival is not a
+failure.
+
+What building the set taught:
+
+- **Two of the design's mutations were redundant in today's engine.** "No
+  `fdatasync` before sealing at rotation" is covered by `shrink_to_fit()`'s
+  own `fdatasync` before anything is published, and "no sync before degrading"
+  by #240's rewrite-then-sync in `resume()`. The first was replaced by the
+  commit flush skipping its `fdatasync`; the second is kept as not caught.
+- **A partial revert can be masked.** Removing only `open`'s rewrite left the
+  durable trim, whose `fdatasync` covers the file; only the full revert of
+  #240's `open` half is caught.
+- **The rename of a hint is load-bearing.** The design expected a hint
+  written in place to survive, torn hints being rebuilt. It is caught: the
+  rebuild of a hint that fails its CRC skips a hint-less file's tail
+  handling, and only the rename guarantees a hint exists only once complete.
+- **Rare paths need focus, and one needed the rig to change.** A `close()`
+  that swallows its error shows only after a failed writeback, an eviction
+  and a clean close, about one life in 300; its run ends every life in a
+  clean close. The truncate revert (#248) needs an eviction between a failed
+  `fdatasync` and the next `resume()`, which the timeline almost never
+  produced; chaosfs now evicts a failed `fdatasync`'s lost pages at once with
+  some probability (`evict_failed`), as memory pressure can. Even so that
+  mutation is not provable here, and #248's unit test guards it.
+- **A fixed budget does not suit every mutation.** Vacuum's and the in-place
+  hint's need a coincidence the random timeline reaches a few times an hour;
+  they are kept, marked rare, and run without failing the check.
 
 ## CI
 
@@ -314,6 +348,11 @@ Where the first version differs from the design above, and why.
   writes of the last life that opened on top of it. When a life never opens
   and a power cut or an eviction ends it, the recovered state must be a
   prefix of those writes covering their watermark.
+- **Evictions come from chaosfs too.** Within an `fsync_eio` window,
+  chaosfs sometimes evicts the pages a failed `fdatasync` lost at once
+  (`evict_failed`), so the next read or `resume()` already sees the disk. The
+  orchestrator learns whether a life lost pages to eviction from chaosfs's
+  own count, not from its timeline.
 - **Each life starts from what its open served.** The worker sends the whole
   database with its `Opened` frame. Without a loss before the open, it must
   equal the previous check's recovery; after an eviction that dropped pages,
