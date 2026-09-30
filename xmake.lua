@@ -349,6 +349,22 @@ target("crash_consistency")
         add_release_opts(t)
     end)
 
+-- Chaos worker (tests/chaos/chaos_worker.cpp): runs the crash workload on a
+-- chaosfs mount under I/O faults and power loss, and checks each process
+-- life. Driven by tests/chaos/run_chaos.py; see docs/chaos_testing_design.md.
+target("chaos_worker")
+    set_kind("binary")
+    set_default(false)
+    add_files("tests/chaos/chaos_worker.cpp", "bytecaskdb/*.cppm")
+    add_includedirs("bytecaskdb")
+    add_packages("crc32c", "zstd")
+    add_defines("BYTECASK_TESTING")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
+
 -- Isolation history generator for Elle. See docs/isolation_checking_design.md.
 -- BYTECASK_TESTING exposes the fault injector the degrade nemesis arms.
 target("isolation_history")

@@ -62,92 +62,14 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-import bytecask;
+#include "crash_model.h"
 
 extern char **environ; // NOLINT(readability-redundant-declaration)
 
 namespace {
 
-namespace fs = std::filesystem;
+using namespace crash_model;
 using Clock = std::chrono::steady_clock;
-
-// ---------------------------------------------------------------------------
-// Workload model
-// ---------------------------------------------------------------------------
-
-constexpr int kKeySpace = 512;
-constexpr std::size_t kMaxValueBytes = 600;
-
-enum class OpKind : std::uint8_t { Put = 1, Del = 2, DelRange = 3, Batch = 4 };
-enum class ItemKind : std::uint8_t { Put = 1, Del = 2 };
-enum class GuardKind : std::uint8_t { Present = 1, Absent = 2 };
-
-struct BatchItem {
-  ItemKind kind{ItemKind::Put};
-  std::string key;
-  std::string value;
-};
-
-struct Guard {
-  GuardKind kind{GuardKind::Present};
-  std::string key;
-};
-
-struct Op {
-  OpKind kind{OpKind::Put};
-  bool sync{false};
-  std::string key;   // Put, Del; range start for DelRange
-  std::string value; // Put; range end (exclusive) for DelRange
-  std::vector<BatchItem> items;
-  std::vector<Guard> guards;
-};
-
-using State = std::map<std::string, std::string>;
-
-auto key_name(int i) -> std::string { return std::format("k{:04}", i); }
-
-// Applies op to state the way the engine does. Returns false when the op is a
-// no-op the engine reports as nullopt (del of an absent key, failed guard).
-auto apply(State &s, const Op &op, std::vector<std::string> *touched) -> bool {
-  auto touch = [&](const std::string &k) {
-    if (touched) touched->push_back(k);
-  };
-  switch (op.kind) {
-  case OpKind::Put:
-    s[op.key] = op.value;
-    touch(op.key);
-    return true;
-  case OpKind::Del:
-    if (s.erase(op.key) == 0) return false;
-    touch(op.key);
-    return true;
-  case OpKind::DelRange: {
-    auto first = s.lower_bound(op.key);
-    auto last = s.lower_bound(op.value);
-    for (auto it = first; it != last; ++it) touch(it->first);
-    s.erase(first, last);
-    return true;
-  }
-  case OpKind::Batch:
-    for (const auto &g : op.guards) {
-      const bool present = s.contains(g.key);
-      if (present != (g.kind == GuardKind::Present)) return false;
-    }
-    for (const auto &item : op.items) {
-      switch (item.kind) {
-      case ItemKind::Put:
-        s[item.key] = item.value;
-        break;
-      case ItemKind::Del:
-        s.erase(item.key);
-        break;
-      }
-      touch(item.key);
-    }
-    return true;
-  }
-  return false;
-}
 
 // ---------------------------------------------------------------------------
 // Per-iteration configuration, derived from the iteration seed so parent and
@@ -203,240 +125,9 @@ auto db_options(const Config &c) -> bytecask::Options {
   return o;
 }
 
-auto as_view(std::string_view s) -> bytecask::BytesView {
-  return std::as_bytes(std::span{s.data(), s.size()});
-}
-
-auto as_string(std::span<const std::byte> b) -> std::string {
-  std::string s(b.size(), '\0');
-  if (!b.empty()) std::memcpy(s.data(), b.data(), b.size());
-  return s;
-}
-
-// ---------------------------------------------------------------------------
-// Wire format: [u32 payload length][payload]. The payload starts with a
-// FrameType byte. A frame cut short by the kill is discarded.
-// ---------------------------------------------------------------------------
-
-enum class FrameType : std::uint8_t {
-  Opened = 1,    // u64 durable_sequence at open, u64 keydir_keys at open
-  Intent = 2,    // encoded Op, written before the call
-  Commit = 3,    // u64 sequence, u8 durable
-  Abort = 4,     // call returned nullopt
-  Watermark = 5, // u64 durable_sequence()
-};
-
-class Writer {
-public:
-  void u8(std::uint8_t v) { buf_.push_back(static_cast<char>(v)); }
-  void u32(std::uint32_t v) {
-    for (int i = 0; i < 4; ++i) u8(static_cast<std::uint8_t>(v >> (8 * i)));
-  }
-  void u64(std::uint64_t v) {
-    for (int i = 0; i < 8; ++i) u8(static_cast<std::uint8_t>(v >> (8 * i)));
-  }
-  void str(std::string_view s) {
-    u32(static_cast<std::uint32_t>(s.size()));
-    buf_.append(s);
-  }
-  [[nodiscard]] auto data() const -> const std::string & { return buf_; }
-
-private:
-  std::string buf_;
-};
-
-class Reader {
-public:
-  explicit Reader(std::string_view s) : s_{s} {}
-  auto u8() -> std::uint8_t {
-    need(1);
-    return static_cast<std::uint8_t>(s_[pos_++]);
-  }
-  auto u32() -> std::uint32_t {
-    std::uint32_t v = 0;
-    for (int i = 0; i < 4; ++i) v |= std::uint32_t{u8()} << (8 * i);
-    return v;
-  }
-  auto u64() -> std::uint64_t {
-    std::uint64_t v = 0;
-    for (int i = 0; i < 8; ++i) v |= std::uint64_t{u8()} << (8 * i);
-    return v;
-  }
-  auto str() -> std::string {
-    const auto n = u32();
-    need(n);
-    std::string out{s_.substr(pos_, n)};
-    pos_ += n;
-    return out;
-  }
-
-private:
-  void need(std::size_t n) const {
-    if (pos_ + n > s_.size()) throw std::runtime_error{"truncated frame"};
-  }
-  std::string_view s_;
-  std::size_t pos_{0};
-};
-
-void encode_op(Writer &w, const Op &op) {
-  w.u8(static_cast<std::uint8_t>(op.kind));
-  w.u8(op.sync ? 1 : 0);
-  w.str(op.key);
-  w.str(op.value);
-  w.u32(static_cast<std::uint32_t>(op.items.size()));
-  for (const auto &item : op.items) {
-    w.u8(static_cast<std::uint8_t>(item.kind));
-    w.str(item.key);
-    w.str(item.value);
-  }
-  w.u32(static_cast<std::uint32_t>(op.guards.size()));
-  for (const auto &g : op.guards) {
-    w.u8(static_cast<std::uint8_t>(g.kind));
-    w.str(g.key);
-  }
-}
-
-auto decode_op(Reader &r) -> Op {
-  Op op;
-  op.kind = static_cast<OpKind>(r.u8());
-  op.sync = r.u8() != 0;
-  op.key = r.str();
-  op.value = r.str();
-  const auto n_items = r.u32();
-  for (std::uint32_t i = 0; i < n_items; ++i) {
-    BatchItem item;
-    item.kind = static_cast<ItemKind>(r.u8());
-    item.key = r.str();
-    item.value = r.str();
-    op.items.push_back(std::move(item));
-  }
-  const auto n_guards = r.u32();
-  for (std::uint32_t i = 0; i < n_guards; ++i) {
-    Guard g;
-    g.kind = static_cast<GuardKind>(r.u8());
-    g.key = r.str();
-    op.guards.push_back(std::move(g));
-  }
-  return op;
-}
-
-void write_all(int fd, std::string_view bytes) {
-  while (!bytes.empty()) {
-    const auto n = ::write(fd, bytes.data(), bytes.size());
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      // The parent is gone; nothing left to report to.
-      std::_Exit(3);
-    }
-    bytes.remove_prefix(static_cast<std::size_t>(n));
-  }
-}
-
-void send_frame(int fd, const Writer &payload) {
-  Writer frame;
-  frame.u32(static_cast<std::uint32_t>(payload.data().size()));
-  write_all(fd, frame.data());
-  write_all(fd, payload.data());
-}
-
 // ---------------------------------------------------------------------------
 // Child
 // ---------------------------------------------------------------------------
-
-auto random_op(std::mt19937_64 &rng, const Config &cfg, std::uint64_t seed,
-               std::uint64_t &value_id) -> Op {
-  auto pick = [&](int n) { return static_cast<int>(rng() % static_cast<std::uint64_t>(n)); };
-  auto value = [&] {
-    // Unique per write, so a recovered value names exactly one operation:
-    // the child's seed and the write's ordinal within that child.
-    auto v = std::format("{:016x}.{}:", seed, value_id++);
-    v.resize(v.size() + static_cast<std::size_t>(pick(kMaxValueBytes)), 'x');
-    return v;
-  };
-  Op op;
-  op.sync = pick(100) < cfg.sync_percent;
-  const auto r = pick(100);
-  if (r < 55) {
-    op.kind = OpKind::Put;
-    op.key = key_name(pick(kKeySpace));
-    op.value = value();
-  } else if (r < 75) {
-    op.kind = OpKind::Del;
-    op.key = key_name(pick(kKeySpace));
-  } else if (r < 80) {
-    op.kind = OpKind::DelRange;
-    const auto from = pick(kKeySpace);
-    op.key = key_name(from);
-    op.value = key_name(from + 1 + pick(16));
-  } else {
-    op.kind = OpKind::Batch;
-    // Distinct keys: the model does not need to decide in-batch ordering.
-    std::vector<int> keys;
-    const auto n = 2 + pick(8);
-    while (std::ssize(keys) < n) {
-      const auto k = pick(kKeySpace);
-      if (std::ranges::find(keys, k) == keys.end()) keys.push_back(k);
-    }
-    for (const auto k : keys) {
-      BatchItem item;
-      item.key = key_name(k);
-      if (pick(4) == 0) {
-        item.kind = ItemKind::Del;
-      } else {
-        item.kind = ItemKind::Put;
-        item.value = value();
-      }
-      op.items.push_back(std::move(item));
-    }
-    if (pick(3) == 0) {
-      Guard g;
-      g.kind = pick(2) == 0 ? GuardKind::Present : GuardKind::Absent;
-      g.key = key_name(pick(kKeySpace));
-      op.guards.push_back(std::move(g));
-    }
-  }
-  return op;
-}
-
-// Runs op against the engine. nullopt when the engine reported a no-op.
-auto execute(bytecask::DB &db, const Op &op)
-    -> std::optional<bytecask::CommitResult> {
-  const bytecask::WriteOptions wo{.sync = op.sync};
-  switch (op.kind) {
-  case OpKind::Put:
-    return db.put(wo, as_view(op.key), as_view(op.value));
-  case OpKind::Del:
-    return db.del(wo, as_view(op.key));
-  case OpKind::DelRange:
-    return db.del_range(wo, as_view(op.key), as_view(op.value));
-  case OpKind::Batch: {
-    bytecask::WritePlan plan;
-    for (const auto &g : op.guards) {
-      switch (g.kind) {
-      case GuardKind::Present:
-        plan.ensure_present(as_view(g.key));
-        break;
-      case GuardKind::Absent:
-        plan.ensure_absent(as_view(g.key));
-        break;
-      }
-    }
-    for (const auto &item : op.items) {
-      switch (item.kind) {
-      case ItemKind::Put:
-        plan.put(as_view(item.key), as_view(item.value));
-        break;
-      case ItemKind::Del:
-        plan.del(as_view(item.key));
-        break;
-      }
-    }
-    return db.apply_batch(wo, std::move(plan));
-  }
-  }
-  return std::nullopt;
-}
-
 auto run_child(const fs::path &dir, std::uint64_t seed, bool no_vacuum, int fd)
     -> int {
   auto cfg = config_for(seed);
@@ -469,7 +160,7 @@ auto run_child(const fs::path &dir, std::uint64_t seed, bool no_vacuum, int fd)
   // the parent kills it.
   constexpr int kMaxOps = 200'000;
   for (int i = 0; i < kMaxOps; ++i) {
-    const auto op = random_op(rng, cfg, seed, value_id);
+    const auto op = random_op(rng, cfg.sync_percent, seed, value_id);
     {
       Writer w;
       w.u8(static_cast<std::uint8_t>(FrameType::Intent));
@@ -502,13 +193,6 @@ auto run_child(const fs::path &dir, std::uint64_t seed, bool no_vacuum, int fd)
 // Parent
 // ---------------------------------------------------------------------------
 
-struct OpRecord {
-  Op op;
-  enum class Outcome { InFlight, Committed, Aborted } outcome{Outcome::InFlight};
-  std::uint64_t sequence{0};
-  bool durable{false};
-};
-
 struct History {
   bool opened{false};
   std::uint64_t opened_durable{0};
@@ -519,13 +203,8 @@ struct History {
 
 auto parse_history(std::string_view stream) -> History {
   History h;
-  std::size_t pos = 0;
-  while (stream.size() - pos >= 4) {
-    Reader len_reader{stream.substr(pos, 4)};
-    const auto len = len_reader.u32();
-    if (stream.size() - pos - 4 < len) break; // cut short by the kill
-    Reader r{stream.substr(pos + 4, len)};
-    pos += 4 + len;
+  for (const auto payload : split_frames(stream)) {
+    Reader r{payload};
     switch (static_cast<FrameType>(r.u8())) {
     case FrameType::Opened:
       h.opened = true;
@@ -549,235 +228,19 @@ auto parse_history(std::string_view stream) -> History {
     case FrameType::Watermark:
       h.watermark = std::max(h.watermark, r.u64());
       break;
+    case FrameType::Throw:
+    case FrameType::Rejected:
+    case FrameType::View:
+    case FrameType::OpenFailed:
+    case FrameType::Violation:
+    case FrameType::Closed:
+      // Sent only by the chaos worker.
+      throw Failure{"unexpected frame from the crash child"};
     }
   }
   return h;
 }
 
-struct Failure {
-  std::string what;
-};
-
-struct Recovered {
-  State contents;
-  std::vector<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t,
-                         std::uint64_t>>
-      file_stats;
-  std::int64_t keydir_keys{0};
-  std::uint64_t durable_sequence{0};
-};
-
-auto open_and_collect(const fs::path &dir, const Config &cfg, unsigned threads,
-                      bool fail_on_crc) -> Recovered {
-  auto opts = db_options(cfg);
-  opts.recovery_threads = threads;
-  opts.fail_recovery_on_crc_errors = fail_on_crc;
-  auto db = bytecask::DB::open(dir, opts);
-  Recovered r;
-  for (auto &entry : db.iter_from({})) {
-    r.contents.emplace(as_string(entry.key), as_string(entry.value));
-  }
-  for (const auto &[id, fs] : db.file_stats()) {
-    r.file_stats.emplace_back(fs.live_bytes, fs.total_bytes, fs.min_sequence,
-                              fs.max_sequence);
-  }
-  std::ranges::sort(r.file_stats);
-  r.keydir_keys = db.stats().at("bytecask.keydir_keys");
-  r.durable_sequence = db.durable_sequence();
-  return r;
-}
-
-struct PrefixResult {
-  std::size_t applied{0};   // operations in the matching prefix
-  std::size_t committed{0}; // operations whose call returned
-};
-
-// A value's identity: "<child seed>.<ordinal>", without the padding.
-auto brief(const std::string &v) -> std::string { return v.substr(0, v.find(':')); }
-
-auto touches(const Op &op, const std::string &k) -> bool {
-  switch (op.kind) {
-  case OpKind::Put:
-  case OpKind::Del:
-    return op.key == k;
-  case OpKind::DelRange:
-    return op.key <= k && k < op.value;
-  case OpKind::Batch:
-    return std::ranges::any_of(op.items, [&](const auto &i) { return i.key == k; }) ||
-           std::ranges::any_of(op.guards, [&](const auto &g) { return g.key == k; });
-  }
-  return false;
-}
-
-// One line per operation. With only_key set, batch items for other keys are
-// left out.
-auto describe(const OpRecord &rec, const std::string *only_key) -> std::string {
-  const auto *outcome = rec.outcome == OpRecord::Outcome::Committed ? "committed"
-                        : rec.outcome == OpRecord::Outcome::Aborted ? "aborted"
-                                                                    : "in-flight";
-  auto line = std::format("seq {:>8} {:<9} sync={:d} durable={:d} ", rec.sequence,
-                          outcome, rec.op.sync, rec.durable);
-  switch (rec.op.kind) {
-  case OpKind::Put:
-    line += std::format("put {} {}", rec.op.key, brief(rec.op.value));
-    break;
-  case OpKind::Del:
-    line += std::format("del {}", rec.op.key);
-    break;
-  case OpKind::DelRange:
-    line += std::format("del_range [{}, {})", rec.op.key, rec.op.value);
-    break;
-  case OpKind::Batch:
-    line += "batch";
-    for (const auto &g : rec.op.guards)
-      if (!only_key || g.key == *only_key)
-        line += std::format(" ensure_{}({})",
-                            g.kind == GuardKind::Present ? "present" : "absent",
-                            g.key);
-    for (const auto &i : rec.op.items)
-      if (!only_key || i.key == *only_key)
-        line += i.kind == ItemKind::Put
-                    ? std::format(" put {} {}", i.key, brief(i.value))
-                    : std::format(" del {}", i.key);
-    break;
-  }
-  return line;
-}
-
-// Finds the prefix of `ops` (in commit order, aborted ops skipped) whose
-// application to `base` yields `recovered`, starting at the shortest prefix
-// that covers the watermark. Throws Failure when none does.
-auto match_prefix(const State &base, const History &h,
-                  const State &recovered) -> PrefixResult {
-  std::vector<const OpRecord *> applied_ops;
-  std::uint64_t last_seq = h.opened_durable;
-  State running = base;
-  for (const auto &rec : h.ops) {
-    switch (rec.outcome) {
-    case OpRecord::Outcome::Committed: {
-      if (rec.sequence <= last_seq)
-        throw Failure{std::format("sequence {} not above previous {}",
-                                  rec.sequence, last_seq)};
-      last_seq = rec.sequence;
-      // The engine said it wrote something; the model must agree it was not
-      // a no-op. This is checked on the live history, before any crash.
-      if (!apply(running, rec.op, nullptr) && rec.op.kind != OpKind::DelRange)
-        throw Failure{std::format(
-            "seq {}: engine committed an op the model says is a no-op",
-            rec.sequence)};
-      applied_ops.push_back(&rec);
-      break;
-    }
-    case OpRecord::Outcome::Aborted: {
-      auto copy = running;
-      if (apply(copy, rec.op, nullptr))
-        throw Failure{"engine returned nullopt for an op the model says "
-                      "should commit"};
-      break;
-    }
-    case OpRecord::Outcome::InFlight:
-      // Only the last op can be in flight: the child has a single writer.
-      applied_ops.push_back(&rec);
-      break;
-    }
-  }
-
-  std::size_t min_prefix = 0;
-  std::size_t committed = 0;
-  for (std::size_t i = 0; i < applied_ops.size(); ++i) {
-    const auto *rec = applied_ops[i];
-    if (rec->outcome != OpRecord::Outcome::Committed) continue;
-    ++committed;
-    if (rec->sequence <= h.watermark) min_prefix = i + 1;
-  }
-
-  State model = base;
-  for (std::size_t i = 0; i < min_prefix; ++i)
-    (void)apply(model, applied_ops[i]->op, nullptr);
-
-  auto differs = [&](const std::string &k) {
-    const auto m = model.find(k);
-    const auto r = recovered.find(k);
-    if (m == model.end() || r == recovered.end())
-      return (m == model.end()) != (r == recovered.end());
-    return m->second != r->second;
-  };
-  std::map<std::string, bool> mismatched;
-  std::size_t mismatches = 0;
-  auto recheck = [&](const std::string &k) {
-    const auto now = differs(k);
-    auto &was = mismatched[k];
-    if (was != now) {
-      mismatches = now ? mismatches + 1 : mismatches - 1;
-      was = now;
-    }
-  };
-  for (const auto &[k, v] : model) recheck(k);
-  for (const auto &[k, v] : recovered) recheck(k);
-
-  // Operations that change nothing (a del_range over no keys, a batch of
-  // deletes on absent keys) make several prefixes match. The longest one is
-  // reported, so `applied` does not undercount what survived.
-  std::optional<std::size_t> longest;
-  std::size_t best = mismatches;
-  std::size_t best_at = min_prefix;
-  for (std::size_t k = min_prefix;; ++k) {
-    if (mismatches == 0) longest = k;
-    if (mismatches < best) {
-      best = mismatches;
-      best_at = k;
-    }
-    if (k == applied_ops.size()) break;
-    std::vector<std::string> touched;
-    (void)apply(model, applied_ops[k]->op, &touched);
-    for (const auto &key : touched) recheck(key);
-  }
-  if (longest) return {.applied = *longest, .committed = committed};
-
-  // Describe the closest prefix to make the report actionable.
-  State closest = base;
-  for (std::size_t i = 0; i < best_at; ++i)
-    (void)apply(closest, applied_ops[i]->op, nullptr);
-  std::string sample;
-  int shown = 0;
-  auto show = [&](const std::string &k) {
-    if (shown++ >= 5) return;
-    const auto m = closest.find(k);
-    const auto r = recovered.find(k);
-    const auto b = base.find(k);
-    sample += std::format("\n    {}: model={} recovered={} (at open: {})", k,
-                          m == closest.end() ? "<absent>" : brief(m->second),
-                          r == recovered.end() ? "<absent>" : brief(r->second),
-                          b == base.end() ? "<absent>" : brief(b->second));
-    for (const auto &rec : h.ops)
-      if (touches(rec.op, k)) sample += "\n      " + describe(rec, &k);
-  };
-  std::map<std::string, bool> keys;
-  for (const auto &[k, v] : closest) keys[k];
-  for (const auto &[k, v] : recovered) keys[k];
-  for (const auto &[k, unused] : keys) {
-    const auto m = closest.find(k);
-    const auto r = recovered.find(k);
-    if ((m == closest.end()) != (r == recovered.end()) ||
-        (m != closest.end() && m->second != r->second))
-      show(k);
-  }
-  throw Failure{std::format(
-      "recovered state matches no prefix of the history at or above the "
-      "durable watermark {} (ops {}, watermark prefix {}, closest prefix {} "
-      "with {} mismatched keys):{}",
-      h.watermark, applied_ops.size(), min_prefix, best_at, best, sample)};
-}
-
-auto copy_dir(const fs::path &from, const fs::path &to) -> void {
-  fs::remove_all(to);
-  // A kill before DB::open created the directory leaves nothing to copy.
-  if (!fs::exists(from)) {
-    fs::create_directories(to);
-    return;
-  }
-  fs::copy(from, to, fs::copy_options::recursive);
-}
 
 struct RunOptions {
   int iterations{200};
@@ -892,32 +355,8 @@ auto verify(const fs::path &crashed, const fs::path &work, const Config &cfg,
     ++totals.killed_before_open;
   }
 
-  // Default options first: a directory left by a process crash must open
-  // with fail_recovery_on_crc_errors = true. Serial recovery is the baseline.
-  const auto serial_dir = work / "serial";
-  copy_dir(crashed, serial_dir);
-  Recovered serial;
-  try {
-    serial = open_and_collect(serial_dir, cfg, 1, true);
-  } catch (const std::exception &e) {
-    throw Failure{std::format("DB::open with default options refused the "
-                              "crashed directory: {}",
-                              e.what())};
-  }
-
-  const auto parallel_dir = work / "parallel";
-  copy_dir(crashed, parallel_dir);
-  const auto parallel = open_and_collect(parallel_dir, cfg, 4, false);
-
-  if (serial.contents != parallel.contents)
-    throw Failure{"serial and parallel recovery disagree on contents"};
-  if (serial.file_stats != parallel.file_stats)
-    throw Failure{"serial and parallel recovery disagree on file_stats"};
-  if (serial.keydir_keys != parallel.keydir_keys ||
-      serial.keydir_keys != std::ssize(serial.contents))
-    throw Failure{"keydir_keys disagrees with the recovered contents"};
-  if (serial.durable_sequence != parallel.durable_sequence)
-    throw Failure{"serial and parallel recovery disagree on durable_sequence"};
+  // A directory left by a process crash must open with default options.
+  const auto serial = recover_both(crashed, work, db_options(cfg));
 
   if (!h.opened) {
     // Killed during open: nothing was written, so recovery must reproduce the
@@ -927,7 +366,8 @@ auto verify(const fs::path &crashed, const fs::path &work, const Config &cfg,
     return serial;
   }
 
-  const auto prefix = match_prefix(base, h, serial.contents);
+  const auto prefix =
+      match_prefix(base, h.ops, h.opened_durable, h.watermark, serial.contents);
   if (serial.durable_sequence < h.watermark)
     throw Failure{std::format("recovered durable_sequence {} below watermark {}",
                               serial.durable_sequence, h.watermark)};
