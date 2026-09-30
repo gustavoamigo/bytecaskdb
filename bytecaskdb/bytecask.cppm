@@ -1233,17 +1233,27 @@ private:
       const std::vector<std::filesystem::path> &data_paths);
   // Writes hint files for all sealed files in s.
   void flush_hints(const EngineState &s);
-  // Opens a hint file, rebuilding it from its data file if it will not open.
+  // Opens a hint file, rebuilding it from its data file if its bytes are bad.
   // HintFile::OpenForRead reads and verifies every byte before returning, so
   // this is where a damaged hint — one that fails its CRC, or one a read
   // fails on — is found, before any of its entries is applied. A hint is a
   // derived index, not the records it points at: neither failure says the
-  // data file behind it is damaged. Throws when the rebuild cannot produce a
-  // readable hint, leaving the caller to apply fail_recovery_on_crc_errors to
-  // a file it cannot index.
+  // data file behind it is damaged. An error that says nothing about the
+  // hint's bytes (EMFILE, ENOMEM) is thrown as it is: a rebuild would remove
+  // a good hint and then fail to write it back. Throws when the rebuild
+  // cannot produce a readable hint.
   static auto open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
                                    const std::filesystem::path &hint_path)
       -> HintFile;
+  // open_hint_or_rebuild for recovery: applies fail_recovery_on_crc_errors
+  // (strict) to a file that cannot be indexed. Lenient recovery skips such a
+  // file — nullopt, after a warning on stderr — but only a file whose bytes
+  // are the problem: an error of the process or the environment is thrown in
+  // both modes, since a skip would cost the file's keys, and vacuum then the
+  // file.
+  static auto open_hint_or_skip(const std::shared_ptr<DataFile> &data_file,
+                                const std::filesystem::path &hint_path,
+                                bool strict) -> std::optional<HintFile>;
 
   
 
@@ -3637,12 +3647,25 @@ static auto recovery_key_cmp(std::span<const std::byte> a,
   return a.size() < b.size() ? -1 : 1;
 }
 
+// True when the error says a file's bytes are bad or cannot be delivered — a
+// CRC or parse failure, EIO, a short read — which a rebuild answers for a
+// hint and a skip for a data file. False for an error of the process or the
+// environment (EMFILE, ENOMEM, EACCES), which says nothing about the file:
+// acting on the file would turn a transient failure into a lost index, or a
+// lost file.
+static auto is_file_damage(const std::exception &e) noexcept -> bool {
+  if (const auto *se = dynamic_cast<const std::system_error *>(&e))
+    return se->code() == std::errc::io_error;
+  return dynamic_cast<const std::runtime_error *>(&e) != nullptr;
+}
+
 auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
                               const std::filesystem::path &hint_path)
     -> HintFile {
   try {
     return HintFile::OpenForRead(hint_path);
   } catch (const std::exception &e) {
+    if (!is_file_damage(e)) throw;
     // flush_hints_for leaves an existing hint alone, so the damaged one has
     // to go first. Nothing is lost by removing it: it is unreadable either
     // way, and a rebuild that does not finish here leaves the file hint-less,
@@ -3657,6 +3680,21 @@ auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
                  "bytecask: rebuilt hint file '%s' from its data file: %s\n",
                  hint_path.string().c_str(), e.what());
     return hint;
+  }
+}
+
+auto DB::open_hint_or_skip(const std::shared_ptr<DataFile> &data_file,
+                           const std::filesystem::path &hint_path, bool strict)
+    -> std::optional<HintFile> {
+  try {
+    return open_hint_or_rebuild(data_file, hint_path);
+  } catch (const std::exception &e) {
+    if (strict || !is_file_damage(e)) throw;
+    std::fprintf(stderr,
+                 "bytecask: skipping data file for hint '%s' — could not "
+                 "read it or rebuild it from the data file: %s\n",
+                 hint_path.string().c_str(), e.what());
+    return std::nullopt;
   }
 }
 
@@ -5050,21 +5088,14 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
 
   for (auto &[file_id, data_file, hint_path, tb] : files) {
     // Only a file that cannot be opened is skipped. An error once its entries
-    // are being applied fails the open: some of them are already in t. The
-    // scanner keeps the file open.
-    std::optional<HintFile::Scanner> scanner;
-    try {
-      scanner.emplace(open_hint_or_rebuild(data_file, hint_path).make_scanner());
-    } catch (const std::exception &e) {
-      if (strict) throw;
+    // are being applied fails the open: some of them are already in t.
+    const auto hint = open_hint_or_skip(data_file, hint_path, strict);
+    if (!hint) {
       skipped = true;
-      std::fprintf(stderr,
-                   "bytecask: skipping data file for hint '%s' — could not "
-                   "read it or rebuild it from the data file: %s\n",
-                   hint_path.string().c_str(), e.what());
       continue;
     }
-    while (auto he = scanner->next()) {
+    auto scanner = hint->make_scanner();
+    while (auto he = scanner.next()) {
       // Track per-file sequence bounds for ALL entries, including those
       // suppressed by tombstones. Bounds represent the range of sequences
       // physically present in the file, not just live ones.
@@ -5343,27 +5374,16 @@ auto DB::recovery_load_parallel(EngineState s,
     queue.push_back(std::move(acc));
   }
 
-  // Threads are joined. Propagate any worker exceptions now. A
-  // SequenceOverlap propagates in both modes: it is not a file to skip.
-  bool worker_lost = false;
+  // Threads are joined. Propagate any worker exception now, in both modes:
+  // the lenient skip happens inside the worker (open_hint_or_skip), so what
+  // escapes it is an error no mode answers — a resource error, a read that
+  // failed once entries were applied, a SequenceOverlap.
   for (const auto &err : worker_errors) {
-    if (!err) continue;
-    try {
-      std::rethrow_exception(err);
-    } catch (const SequenceOverlap &) {
-      throw;
-    } catch (...) {
-      if (strict) throw;
-      // lenient: warning already emitted inside recovery_build_from_hints
-      worker_lost = true;
-    }
+    if (err) std::rethrow_exception(err);
   }
 #endif
 
   auto &final_result = queue[0];
-#ifndef BYTECASK_SINGLE_THREADED
-  if (worker_lost) final_result.skipped_files = true;
-#endif
   plog.mark("build + fan-in merge");
 
   // Phase 4: recompute live_bytes once from the fully-merged tree.
@@ -5526,21 +5546,13 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
   // Put is admitted.
   for (auto &[file_id, data_file, hint_path, tb] : files) {
     // Only a file that cannot be opened is skipped. An error once its entries
-    // are being read fails the open: some of them are already noted. The
-    // scanner keeps the file open.
-    std::optional<HintFile::Scanner> scanner;
-    try {
-      scanner.emplace(open_hint_or_rebuild(data_file, hint_path).make_scanner());
-    } catch (const std::exception &e) {
-      if (strict) throw;
+    // are being read fails the open: some of them are already noted.
+    const auto hint = open_hint_or_skip(data_file, hint_path, strict);
+    if (!hint) {
       skipped = true;
-      std::fprintf(stderr,
-                   "bytecask: skipping data file for hint '%s' — could not "
-                   "read it or rebuild it from the data file: %s\n",
-                   hint_path.string().c_str(), e.what());
       continue;
     }
-    Cursor c{std::move(*scanner), file_id, {}, {}, false, false};
+    Cursor c{hint->make_scanner(), file_id, {}, {}, false, false};
     while (auto he = c.scanner.next()) {
       note(file_id, *he);
       if (he->entry_type == EntryType::RangeDel) {
@@ -5773,14 +5785,12 @@ auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
       worker_errors[i] = std::current_exception();
     }
   });
-  bool skipped_files = false;
+  // In both modes: the lenient skip happens inside the worker
+  // (open_hint_or_skip), so what escapes it is an error no mode answers.
   for (const auto &err : worker_errors) {
-    if (err) {
-      if (strict) std::rethrow_exception(err);
-      // lenient: warning already emitted inside recovery_build_sorted
-      skipped_files = true;
-    }
+    if (err) std::rethrow_exception(err);
   }
+  bool skipped_files = false;
   plog.mark("build_sorted");
 
   // Phase 3: union the parts' metadata, and pool their separators into R
@@ -6068,16 +6078,8 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
     auto &run = runs[f];
     const auto &rf = files[f];
     run.stats = FileStats{0, rf.total_bytes};
-    try {
-      run.hint.emplace(open_hint_or_rebuild(rf.data_file, rf.hint_path));
-    } catch (const std::exception &e) {
-      if (strict) throw;
-      std::fprintf(stderr,
-                   "bytecask: skipping data file for hint '%s' — could not "
-                   "read it or rebuild it from the data file: %s\n",
-                   rf.hint_path.string().c_str(), e.what());
-      return;
-    }
+    run.hint = open_hint_or_skip(rf.data_file, rf.hint_path, strict);
+    if (!run.hint) return;
     auto scanner = run.hint->make_scanner();
     bool in_data = false;
     Position next_fence{};

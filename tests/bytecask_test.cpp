@@ -36,6 +36,8 @@
 #include <tuple>
 #include <vector>
 #include <fcntl.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -2417,6 +2419,160 @@ TEST_CASE("DB::open rebuilds a hint file a read fails on",
     CHECK(std::filesystem::file_size(hints[0]) == hint_size);
     auto db = bytecask::DB::open(one);
     check_keys(db);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Recovery holds at most one hint file open per thread (#251).
+//
+// Every data file stays open for the life of the DB, so an open needs one
+// descriptor per data file. The hints must not double that: a scanner opens
+// its file for the time it takes to read one unit, so however many files a
+// merge holds cursors on, its hints cost the thread one descriptor.
+// ---------------------------------------------------------------------------
+#ifdef __linux__
+namespace {
+// Descriptors this process holds, not counting the one that lists them.
+auto open_fd_count() -> std::size_t {
+  std::size_t n = 0;
+  for ([[maybe_unused]] const auto &e :
+       std::filesystem::directory_iterator{"/proc/self/fd"})
+    ++n;
+  return n - 1;
+}
+
+// Lowers the soft RLIMIT_NOFILE for its scope.
+struct ScopedFdLimit {
+  rlimit saved{};
+  explicit ScopedFdLimit(std::size_t soft) {
+    REQUIRE(::getrlimit(RLIMIT_NOFILE, &saved) == 0);
+    auto rl = saved;
+    rl.rlim_cur = static_cast<rlim_t>(soft);
+    REQUIRE(::setrlimit(RLIMIT_NOFILE, &rl) == 0);
+  }
+  ~ScopedFdLimit() { (void)::setrlimit(RLIMIT_NOFILE, &saved); }
+  ScopedFdLimit(const ScopedFdLimit &) = delete;
+  ScopedFdLimit &operator=(const ScopedFdLimit &) = delete;
+};
+} // namespace
+#endif
+
+TEST_CASE("DB::open needs one descriptor per data file, not two",
+          "[bytecask][recovery]") {
+#ifndef __linux__
+  SKIP("counts descriptors through /proc/self/fd");
+#else
+  TempDir td;
+  const auto dir = td.path / "db";
+  constexpr int kKeys = 800;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 256});
+    for (int i = 0; i < kKeys; ++i)
+      db.put({.sync = false}, to_bytes(std::format("k{:03d}", i)),
+             to_bytes(std::format("v{:03d}", i)));
+    db.close();
+  }
+  auto check_keys = [&](const bytecask::DB &db) {
+    for (int i = 0; i < kKeys; ++i) {
+      const auto v = get_val(db, to_bytes(std::format("k{:03d}", i)));
+      INFO("k" << i);
+      REQUIRE(v.has_value());
+      CHECK(to_string(*v) == std::format("v{:03d}", i));
+    }
+  };
+
+  for (const unsigned threads : {1u, 4u}) {
+    DYNAMIC_SECTION("recovery_threads = " << threads) {
+      std::size_t data_files = 0;
+      for (const auto &e : std::filesystem::directory_iterator{dir})
+        if (e.path().extension() == ".data") ++data_files;
+      // Room for what the open DB holds — every data file, the active file
+      // it adds, the lock — one hint per recovery thread, and the transient
+      // descriptors of an open: its directory listing, the hint it writes
+      // for the file the last open left active, the directory it syncs. Not
+      // for a hint per data file.
+      constexpr std::size_t kSlack = 8;
+      REQUIRE(data_files > threads + kSlack + 16);
+      ScopedFdLimit limit{open_fd_count() + data_files + 2 + threads + kSlack};
+      auto db = bytecask::DB::open(dir, {.recovery_threads = threads});
+      check_keys(db);
+      // Recovery done, no hint file is held open.
+      for (const auto &e : std::filesystem::directory_iterator{"/proc/self/fd"}) {
+        std::error_code ec;
+        const auto target = std::filesystem::read_symlink(e.path(), ec);
+        if (!ec) CHECK(target.extension() != ".hint");
+      }
+    }
+  }
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// A hint is rebuilt only on an error that says its bytes are bad (#251).
+//
+// A CRC or parse failure, or EIO, says the hint is unusable, and the rebuild
+// replaces it. EMFILE, ENOMEM or EACCES say nothing about the hint: a rebuild
+// on those would delete a good hint and then fail to write it back, and a
+// lenient open would then skip the file behind it. Both modes let the error
+// out, and the hint stays as it was.
+// ---------------------------------------------------------------------------
+TEST_CASE("DB::open leaves a hint alone on an error that says nothing about "
+          "its bytes",
+          "[bytecask][recovery]") {
+#ifndef BYTECASK_USE_BTREE
+  SKIP("radix recovery reads hints on worker threads, out of reach of the "
+       "thread-local fault injector");
+#endif
+  TempDir td;
+  const auto dir = td.path / "db";
+  constexpr int kKeys = 40;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 256});
+    for (int i = 0; i < kKeys; ++i)
+      db.put({}, to_bytes(std::format("k{:03d}", i)),
+             to_bytes(std::format("v{:03d}", i)));
+  }
+  auto inode_of = [](const std::filesystem::path &p) {
+    struct stat st{};
+    REQUIRE(::stat(p.c_str(), &st) == 0);
+    return st.st_ino;
+  };
+  const auto hints = list_hint_files(dir);
+  REQUIRE(hints.size() > 2);
+  std::vector<ino_t> inodes;
+  for (const auto &h : hints) inodes.push_back(inode_of(h));
+
+  for (const bool strict : {true, false}) {
+    DYNAMIC_SECTION((strict ? "strict" : "lenient")) {
+      {
+        // The first read of the first hint: in the pass that opens it, where
+        // a read that said the hint was damaged would have it rebuilt.
+        bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
+        fi.inj.fail_on_nth_match = 1;
+        fi.inj.error = std::make_error_code(std::errc::too_many_files_open);
+        try {
+          auto db = bytecask::DB::open(
+              dir, {.recovery_threads = 1,
+                    .fail_recovery_on_crc_errors = strict});
+          FAIL("open succeeded");
+        } catch (const std::system_error &e) {
+          CHECK(e.code() == std::errc::too_many_files_open);
+        }
+      }
+      // Every hint is the file it was: none removed, none rewritten. (The
+      // open may have added one, for the file the last open left active.)
+      for (std::size_t i = 0; i < hints.size(); ++i) {
+        INFO(hints[i]);
+        CHECK(inode_of(hints[i]) == inodes[i]);
+      }
+      auto db = bytecask::DB::open(dir);
+      for (int i = 0; i < kKeys; ++i) {
+        const auto v = get_val(db, to_bytes(std::format("k{:03d}", i)));
+        INFO("k" << i);
+        REQUIRE(v.has_value());
+        CHECK(to_string(*v) == std::format("v{:03d}", i));
+      }
+    }
   }
 }
 

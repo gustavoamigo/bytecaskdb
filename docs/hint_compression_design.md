@@ -12,7 +12,9 @@
 > CRC and recording where each frame starts — and scanners read one frame at
 > a time with `pread`; an uncompressed hint is cut at entry boundaries into
 > units about a frame long, so it is not read whole either. `OpenForMerge`
-> is gone. §Reading and §Seeking below
+> is gone. Scanners hold no descriptor between reads: each one opens the
+> file, reads the unit and closes it (#251), so a merge over every hint
+> needs no descriptor per hint. §Reading and §Seeking below
 > describe the mapped reader as it was built; `docs/bytecask_design.md`
 > (*HintFile I/O model*) has the current one.
 
