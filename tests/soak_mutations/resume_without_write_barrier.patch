@@ -1,12 +1,14 @@
 Drops the WriteBarrier that quiesces writers and the flush role in
 resume(). Named in #92's acceptance list. Expected: caught.
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index aab1a99e..c95bfa78 100644
 --- a/bytecaskdb/bytecask.cppm
 +++ b/bytecaskdb/bytecask.cppm
-@@ -3733,7 +3733,6 @@
- void DB::resume() {
-   if (!is_degraded()) return;
+@@ -4194,7 +4194,6 @@ void DB::resume() {
+     return;
+   }
  
 -  WriteBarrier barrier{*this};
    auto current = load_state_for_write();
+   if (current->closed) throw DbClosed{};
    if (!current->degraded) return;  // re-check under lock
- 

@@ -1949,6 +1949,11 @@ focuses the run with `Disable:`.
 within a fixed budget: the script runs and reports it, and a survival is not a
 failure.
 
+The set is kept current as the engine moves: a fix for a bug the rig found
+adds a patch reverting it, a change that moves a patch's lines regenerates it
+(`ci.yml` checks every patch still applies), and a change to the rig runs the
+check and reports its summary.
+
 Building the set changed the rig: chaosfs now sometimes evicts a failed
 `fdatasync`'s lost pages at once (`evict_failed`), and the worker counts a
 read's I/O error as a violation when nothing in the run can fail a read

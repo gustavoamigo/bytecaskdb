@@ -55,6 +55,13 @@ This list is not exhaustive — use judgment. If a change touches anything that 
 
 When extending, follow the existing pattern: collect a serial baseline outside the SECTIONs, copy the sealed DB to an isolated directory per SECTION, reopen with the target thread count, and CHECK both key/values and `collect_stats(db) == serial_stats_vals`.
 
+### Mutation sets
+
+`tests/soak_mutations/` and `tests/chaos_mutations/` hold deliberate engine breaks that prove the soak and the chaos rig still catch what they should (`scripts/soak_mutation_check.sh`, `scripts/chaos_mutation_check.sh`). Keep them current:
+- A fix for a bug the soak or the chaos rig found adds a patch that reverts the fix, with `Expected: caught.` and one line on what the rig then sees.
+- A change that moves the lines a patch touches regenerates the patch (make the same break, save the diff) or deletes it if its target is gone; `ci.yml` checks that every patch still applies.
+- A change to `tests/chaos/` runs `scripts/chaos_mutation_check.sh` and puts its summary in the PR description. A mutation whose result changes gets its `Expected:` header updated with the reason.
+
 ## Commit rules
 
 - Commit and push without waiting for approval, then show the user what changed and the test result.

@@ -1,19 +1,21 @@
 Moves the commit flush's state publication ahead of its fdatasync,
 breaking durability-before-visibility. Named in #92's acceptance list.
 Expected: caught.
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index aab1a99e..f37ce0a8 100644
 --- a/bytecaskdb/bytecask.cppm
 +++ b/bytecaskdb/bytecask.cppm
-@@ -2896,6 +2896,9 @@
-   if (head->next_seq <= published->next_seq) return;  // nothing pending
+@@ -3216,6 +3216,9 @@ void DB::flush_pending() {
+   // already, by flushes that did not sync them.
+   if (head->next_seq <= published->next_seq && !need_sync) return;
  
-   const bool need_sync = head->sync_requested_seq > published->durable_seq;
 +  auto pub = std::make_shared<EngineState>(*head);
 +  pub->durable_seq = need_sync ? head->next_seq - 1 : published->durable_seq;
 +  store_state(published, std::move(pub));
    if (need_sync) {
  #ifdef BYTECASK_TESTING
      if (test_before_flush_sync_) test_before_flush_sync_();
-@@ -2909,14 +2912,6 @@
+@@ -3229,14 +3232,6 @@ void DB::flush_pending() {
        return;
      }
    }

@@ -77,6 +77,21 @@ jobs:
         # in chaos-nightly.yml.
         run: python3 -m unittest tests/chaos/test_chaosfs.py -v
 
+      - name: Mutation patches still apply
+        # The soak's and the chaos rig's mutations are diffs against engine
+        # code. A change that moves the lines they touch must regenerate them
+        # (make the same break, save the diff), or delete one whose target is
+        # gone; otherwise the mutation checks break the next time they run.
+        run: |
+          status=0
+          for p in tests/soak_mutations/*.patch tests/chaos_mutations/*.patch; do
+            if ! git apply --check "$p"; then
+              echo "::error file=$p::no longer applies; regenerate it against the current code"
+              status=1
+            fi
+          done
+          exit "$status"
+
       - name: Run proof independence tests (Hypothesis)
         run: |
           xmake build bytecaskdb_python
