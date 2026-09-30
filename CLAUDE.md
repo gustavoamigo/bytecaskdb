@@ -60,7 +60,11 @@ When extending, follow the existing pattern: collect a serial baseline outside t
 `tests/soak_mutations/` and `tests/chaos_mutations/` hold deliberate engine breaks that prove the soak and the chaos rig still catch what they should (`scripts/soak_mutation_check.sh`, `scripts/chaos_mutation_check.sh`). Keep them current:
 - A fix for a bug the soak or the chaos rig found adds a patch that reverts the fix, with `Expected: caught.` and one line on what the rig then sees.
 - A change that moves the lines a patch touches regenerates the patch (make the same break, save the diff) or deletes it if its target is gone; `ci.yml` checks that every patch still applies.
-- A change to `tests/chaos/` runs `scripts/chaos_mutation_check.sh` and puts its summary in the PR description. A mutation whose result changes gets its `Expected:` header updated with the reason.
+- Run the mutation check when a change could alter what it proves, and put its summary in the PR description:
+  - a change to the rig (`tests/chaos/`, `tests/crash/crash_model.h`) or to the mutations themselves runs the whole set: `scripts/chaos_mutation_check.sh`;
+  - a change to engine code a mutation patches runs that mutation: `scripts/chaos_mutation_check.sh 5 tests/chaos_mutations/<name>.patch` (a soak mutation: `scripts/soak_mutation_check.sh <address|thread> 120 tests/soak_mutations/<name>.patch`).
+  Other changes need no run: the set only goes stale when the rig or the code it mutates changes, which is why it is not scheduled.
+- A mutation whose result changes gets its `Expected:` header updated with the reason. One that other code now covers is kept as `Expected: NOT caught` with that reason, not deleted.
 
 ## Commit rules
 

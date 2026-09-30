@@ -1951,8 +1951,9 @@ failure.
 
 The set is kept current as the engine moves: a fix for a bug the rig found
 adds a patch reverting it, a change that moves a patch's lines regenerates it
-(`ci.yml` checks every patch still applies), and a change to the rig runs the
-check and reports its summary.
+(`ci.yml` checks every patch still applies), and a change to the rig, or to
+engine code a mutation patches, runs the check and reports its summary. It
+is not scheduled: it only goes stale when one of those changes.
 
 Building the set changed the rig: chaosfs now sometimes evicts a failed
 `fdatasync`'s lost pages at once (`evict_failed`), and the worker counts a
