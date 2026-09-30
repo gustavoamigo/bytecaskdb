@@ -271,7 +271,11 @@ public:
           const auto n = std::min<std::uint64_t>(kPage, size - at);
           (void)::pwrite(fd, bytes.data(), n, static_cast<off_t>(at));
         }
+#ifdef __APPLE__
+        (void)::fsync(fd);  // macOS has no fdatasync
+#else
         (void)::fdatasync(fd);
+#endif
         files_.erase(it);
       }
       ::close(fd);
