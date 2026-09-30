@@ -177,6 +177,15 @@ public:
   DbFollowerMode& operator=(const DbFollowerMode&) = default;
   ~DbFollowerMode() override = default;
 };
+
+// Thrown by every DB operation after DB::close().
+class DbClosed : public std::logic_error {
+public:
+  DbClosed() : std::logic_error("DB is closed") {}
+  DbClosed(const DbClosed&) = default;
+  DbClosed& operator=(const DbClosed&) = default;
+  ~DbClosed() override = default;
+};
 #pragma clang diagnostic pop
 
 // ---------------------------------------------------------------------------
@@ -454,7 +463,14 @@ public:
   DB& operator=(const DB&) = delete;
   DB(DB&&) = delete;
   DB& operator=(DB&&) = delete;
+  // Calls close() if it was not called, and swallows its errors.
   ~DB();
+
+  // Makes every write durable, writes the hint files and releases the
+  // directory lock. Returns only if every acknowledged write is durable;
+  // throws std::system_error or DbDegraded otherwise. The DB is closed
+  // either way; afterwards operations throw DbClosed. Idempotent.
+  void close();
 
   [[nodiscard]] auto get(const ReadOptions& opts,
                          BytesView key,
@@ -545,6 +561,7 @@ using DataEntryView        = internal::DataEntryView;
 using EntryView            = internal::EntryView;
 using DbDegraded           = internal::DbDegraded;
 using DbFollowerMode       = internal::DbFollowerMode;
+using DbClosed             = internal::DbClosed;
 using DB                   = internal::DB;
 using Snapshot             = internal::Snapshot;
 using WritePlan            = internal::WritePlan;

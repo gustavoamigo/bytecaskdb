@@ -44,6 +44,19 @@ test('close releases resources properly', async ({ tmpDir, wasmBackend }) => {
   expect(() => db.close()).not.toThrow()
 })
 
+test('close makes unsynced writes durable, releases the lock, and is idempotent', async ({ tmpDir, wasmBackend }) => {
+  const dbPath = join(tmpDir, 'close-durable.db')
+  const db = wasmBackend.open(dbPath)
+  db.put('k', 'v', { sync: false })
+  db.close()
+  expect(() => db.close()).not.toThrow()
+  expect(() => db.get('k', {})).toThrow()
+
+  const reopened = wasmBackend.open(dbPath)
+  expect(decodeBytes(reopened.get('k', {})!)).toBe('v')
+  reopened.close()
+})
+
 test('Symbol.dispose works with using statements', async ({ tmpDir, wasmBackend }) => {
   const dbPath = join(tmpDir, 'dispose-test.db')
 

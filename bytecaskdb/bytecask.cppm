@@ -759,6 +759,18 @@ public:
   ~DbFollowerMode() override;
 };
 
+// ---------------------------------------------------------------------------
+// DbClosed — thrown by every DB operation after close(). Using a closed
+// handle is a caller bug, not an I/O condition, hence std::logic_error.
+// ---------------------------------------------------------------------------
+export class DbClosed : public std::logic_error {
+public:
+  DbClosed() : std::logic_error("DB is closed") {}
+  DbClosed(const DbClosed &) = default;
+  auto operator=(const DbClosed &) -> DbClosed & = default;
+  ~DbClosed() override;
+};
+
 // Default group-write byte-size threshold: plans above this size are routed
 // to the solo writer (a large batch would monopolize the group).
 export inline constexpr std::uint64_t kGroupWriteMaxBytes = 256ULL * 1024;
@@ -972,7 +984,21 @@ public:
   DB(DB &&) = delete;
   DB &operator=(DB &&) = delete;
 
+  // Calls close() if it was not called, and swallows its errors.
   ~DB();
+
+  // Makes every write durable, trims the active file, writes the hint files
+  // and releases the directory lock. Waits for in-flight writes and a running
+  // vacuum to finish first. Returns normally only if every write the DB
+  // acknowledged is durable and the shutdown completed; otherwise throws —
+  // std::system_error for a failed fdatasync, trim or hint write, DbDegraded
+  // for a degraded engine holding acknowledged writes that are not durable.
+  // The DB is closed either way, and a retry cannot help: a failed
+  // fdatasync leaves its pages clean (#231). Afterwards every operation
+  // throws DbClosed, except mode(), is_degraded() and degraded_reason(),
+  // and a second close() returns at once. Snapshots and iterators taken
+  // before stay readable.
+  void close();
 
   // Writes the value for key into out, reusing its existing capacity to
   // amortize allocation across calls. Returns true if the key was found,
@@ -1120,8 +1146,8 @@ public:
   // nonpositive timeout returns immediately. Identical semantics in Leader
   // and Follower mode (on a follower it reflects the last synced ingest).
   // Blocks until the published state covers sequence — a fresh snapshot
-  // can see the write a plan lost to — or the engine degrades. See
-  // apply_batch.
+  // can see the write a plan lost to — or the engine degrades or closes.
+  // See apply_batch.
   void wait_published(std::uint64_t sequence) const;
 
   [[nodiscard]] auto durable_sequence(
@@ -1440,7 +1466,7 @@ private:
 
   // Member variables
   std::filesystem::path dir_;
-  int lock_fd_{-1};  // flock() on dir_/.lock; released by close() in ~DB()
+  int lock_fd_{-1};  // flock() on dir_/.lock; released by DB::close()
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
   std::uint32_t max_hint_backlog_{kDefaultMaxHintBacklog};  // 0 = unbounded
   IoBackend io_backend_{IoBackend::Pread};
@@ -1849,6 +1875,7 @@ export struct EngineSlot : Slot {
 
 DbDegraded::~DbDegraded() = default;
 DbFollowerMode::~DbFollowerMode() = default;
+DbClosed::~DbClosed() = default;
 
 #pragma region Internal helpers
 
@@ -2685,31 +2712,70 @@ DB::DB(std::filesystem::path dir, Options opts)
 
 #pragma region Lifecycle
 
-// Seals the active file, drains background hint tasks, writes hint files for
-// all sealed files, then purges stale files.
-// At destruction no readers are active.
 DB::~DB() {
-  auto s = load_state();
-  if (!s->files.empty()) {
-    try {
-      auto t = s->transient();
-      t.active_file().sync();
-      t.active_file().shrink_to_fit();
-      // With every byte of the active file durable, its hint spares the
-      // next open the rewrite of a hint-less file. Not when degraded: a sync
-      // that failed earlier left pages clean that this one did not write
-      // (#231). An empty file costs the next open nothing.
-      if (!s->degraded && t.active_file().size() > 0)
-        flush_hints_for(*s->files.get(s->active_file_id), dir_);
-    } catch (...) {}
-  }
   try {
-    flush_hints();
+    close();
   } catch (...) {}
+}
+
+// Takes vacuum_mu_ before write_mu_, the order vacuum() takes them in. The
+// barrier publishes every write already appended, and admits no new one
+// before the closed state, so the state it reads holds every write the DB
+// will ever acknowledge.
+void DB::close() {
+  std::lock_guard<std::mutex> vg{*vacuum_mu_};
+  std::exception_ptr error;
+  {
+    WriteBarrier barrier{*this};
+    auto current = load_state_for_write();
+    if (current->closed) return;
+    auto t = current->transient();
+    const auto last_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
+    if (current->degraded) {
+      // No sync here can be trusted: one that failed earlier left pages
+      // clean that a later one does not write (#231). What was durable when
+      // the engine degraded is what is durable. The trim is best effort; a
+      // degraded active file may already be sealed.
+      if (t.durable_seq() < last_seq) {
+        error = std::make_exception_ptr(DbDegraded{std::format(
+            "close: writes after sequence {} were acknowledged but are not "
+            "durable; the engine was degraded: {}",
+            t.durable_seq(), current->degraded_reason)});
+      }
+      try {
+        t.active_file().shrink_to_fit();
+      } catch (...) {}
+    } else {
+      try {
+        t.active_file().sync();
+        counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
+        t.apply_sync(last_seq);
+        t.active_file().shrink_to_fit();
+        // With every byte of the active file durable, its hint spares the
+        // next open the rewrite of a hint-less file. An empty file costs the
+        // next open nothing.
+        if (t.active_file().size() > 0)
+          flush_hints_for(t.active_file_ptr(), dir_);
+      } catch (...) {
+        counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
+        error = std::current_exception();
+      }
+    }
+    // Sealed files were synced whole before they were sealed, so their hints
+    // are written whether or not the engine is degraded.
+    try {
+      flush_hints();
+    } catch (...) {
+      counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
+      if (!error) error = std::current_exception();
+    }
+    store_state(current, std::move(t).persistent()->closed_copy());
+  }
   if (lock_fd_ != -1) {
     ::close(lock_fd_);
     lock_fd_ = -1;
   }
+  if (error) std::rethrow_exception(error);
 }
 
 #pragma endregion
@@ -2801,14 +2867,21 @@ auto DB::snapshot() const -> Snapshot {
   return Snapshot{load_state_for_read().state(), size_limits_};
 }
 
+// Why a state refuses writes: is_write_allowed() is false.
+static auto write_rejection(const EngineState &s) -> std::exception_ptr {
+  if (s.closed) return std::make_exception_ptr(DbClosed{});
+  if (s.degraded) return std::make_exception_ptr(DbDegraded{s.degraded_reason});
+  return std::make_exception_ptr(
+      DbFollowerMode{"write rejected: engine is in follower mode"});
+}
+
 // The single write path. Routes to either write_group_ (default) or
 // solo_writer_ depending on plan characteristics. put/del/apply_batch are
 // thin wrappers that construct a WritePlan and delegate here.
 auto DB::apply_batch(WriteOptions opts,
                      WritePlan plan) -> std::optional<CommitResult> {
   if (auto s = load_state(); !s->is_write_allowed()) {
-    if (s->degraded) throw DbDegraded{s->degraded_reason};
-    throw DbFollowerMode{"write rejected: engine is in follower mode"};
+    std::rethrow_exception(write_rejection(*s));
   }
   // With sync, even an empty plan goes through the pipeline: it returns once
   // every earlier write is durable (see execute_slots).
@@ -2937,10 +3010,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
   // bytes handled by resume() like the failed flush's.
   auto published = load_state();
   if (!published->is_write_allowed()) {
-    auto ex = published->degraded
-        ? std::make_exception_ptr(DbDegraded{published->degraded_reason})
-        : std::make_exception_ptr(
-              DbFollowerMode{"write rejected: engine is in follower mode"});
+    const auto ex = write_rejection(*published);
     for (auto *s : batch) s->err = ex;
     return;
   }
@@ -3415,7 +3485,11 @@ auto DB::rkeys_from(const ReadOptions & /*opts*/, BytesView from) const
 // write_mu_.
 auto DB::vacuum(VacuumOptions opts) -> bool {
   std::lock_guard<std::mutex> vg{*vacuum_mu_};
-  if (auto s = load_state(); s->degraded) throw DbDegraded{s->degraded_reason};
+  if (auto s = load_state(); s->closed) {
+    throw DbClosed{};
+  } else if (s->degraded) {
+    throw DbDegraded{s->degraded_reason};
+  }
   // Publishes scrape idle read caches; with no writes there are none, and
   // what the last writes retired stays pinned by whichever thread went idle
   // last. vacuum and stats are the entry points that keep running without
@@ -3972,6 +4046,7 @@ auto DB::degraded_reason() const noexcept -> std::string {
 auto DB::stats() const -> std::map<std::string, std::int64_t> {
   scrape_read_caches();  // see vacuum()
   auto s = load_state();
+  if (s->closed) throw DbClosed{};
   const auto *pool = pool_ ? &pool_->counters() : nullptr;
   const auto reclaim = KeyDirTree::reclamation_gauges();
   std::int64_t open_files = 0;
@@ -4051,6 +4126,7 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
 void DB::set_mode(Mode mode) {
   WriteBarrier barrier{*this};
   auto current = load_state_for_write();
+  if (current->closed) throw DbClosed{};
   auto t = current->transient();
   // A leader stepping down makes every write it acknowledged durable, and
   // so shippable: changes_since stops at durable_sequence, and a sync=false
@@ -4086,10 +4162,15 @@ void DB::deem_as_degraded(std::string reason) {
 }
 
 void DB::resume() {
-  if (!is_degraded()) return;
+  if (auto s = load_state(); s->closed) {
+    throw DbClosed{};
+  } else if (!s->degraded) {
+    return;
+  }
 
   WriteBarrier barrier{*this};
   auto current = load_state_for_write();
+  if (current->closed) throw DbClosed{};
   if (!current->degraded) return;  // re-check under lock
 
   // The failed flush left one or two heads derived from the published
@@ -4234,24 +4315,28 @@ void DB::wait_published(std::uint64_t sequence) const {
   std::unique_lock<std::mutex> lk{durable_mu_};
   durable_cv_.wait(lk, [&] {
     const auto s = load_state();
-    return s->next_seq > sequence || s->degraded;
+    return s->next_seq > sequence || s->degraded || s->closed;
   });
 }
 
 auto DB::durable_sequence(std::uint64_t min_sequence,
                          std::chrono::milliseconds timeout) const
     -> std::uint64_t {
-  auto baseline = load_state()->durable_seq;
-  if (min_sequence == 0 || baseline >= min_sequence
+  const auto s = load_state();
+  if (s->closed) throw DbClosed{};
+  if (min_sequence == 0 || s->durable_seq >= min_sequence
       || timeout <= std::chrono::milliseconds{0}) {
-    return baseline;
+    return s->durable_seq;
   }
 
   std::unique_lock<std::mutex> lk{durable_mu_};
   durable_cv_.wait_for(lk, timeout, [&] {
-    return load_state()->durable_seq >= min_sequence;
+    const auto cur = load_state();
+    return cur->durable_seq >= min_sequence || cur->closed;
   });
-  return load_state()->durable_seq;
+  const auto last = load_state();
+  if (last->closed) throw DbClosed{};
+  return last->durable_seq;
 }
 
 auto DB::create_manifest() -> FileManifest {
@@ -4261,6 +4346,7 @@ auto DB::create_manifest() -> FileManifest {
     WriteBarrier barrier{*this};
 
     auto current = load_state_for_write();
+    if (current->closed) throw DbClosed{};
     if (current->degraded) throw DbDegraded{current->degraded_reason};
 
     auto t = current->transient();
@@ -4353,6 +4439,10 @@ auto DB::load_state_for_read() const
   }
   e->used_epoch.store(ReadCacheRegistry::instance().epoch(),
                       std::memory_order_relaxed);
+  if (e->state->closed) {
+    slot.release(e);
+    throw DbClosed{};
+  }
   return ReadStateGuard{slot, e};
 }
 
@@ -4414,6 +4504,7 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
       new_state->next_seq > old_state->next_seq;
   const auto became_degraded =
       new_state->degraded && !old_state->degraded;
+  const auto became_closed = new_state->closed && !old_state->closed;
 
 #ifndef NDEBUG
   if constexpr (kKeyDirReadsKeys) {
@@ -4475,7 +4566,8 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
   // advances no durable sequence notifies too. (A failed flush publishes
   // through the raw store under durable_mu_ and finish_flush notifies for
   // it; deem_as_degraded notifies for itself.)
-  if (durable_advanced || published_advanced || became_degraded) {
+  if (durable_advanced || published_advanced || became_degraded ||
+      became_closed) {
     { std::lock_guard<std::mutex> lk{durable_mu_}; }
     durable_cv_.notify_all();
   }
@@ -6414,7 +6506,7 @@ auto ChangeIterator::operator==(std::default_sentinel_t) const noexcept -> bool 
 // DB::changes_since implementation
 auto DB::changes_since(const Snapshot& snap, std::uint64_t from_sequence) const
     -> std::ranges::subrange<ChangeIterator, std::default_sentinel_t> {
-
+  if (load_state()->closed) throw DbClosed{};
   auto state = snap.state();
   auto begin = ChangeIterator{state, from_sequence, state->durable_seq};
   return {std::move(begin), std::default_sentinel};
@@ -6426,6 +6518,7 @@ auto DB::changes_since(const Snapshot& snap, std::uint64_t from_sequence) const
 
 void DB::ingest(std::span<const DataEntryView> entries) {
   if (auto s = load_state(); !s->is_ingestion_allowed()) {
+    if (s->closed) throw DbClosed{};
     if (s->degraded) throw DbDegraded{s->degraded_reason};
     throw std::logic_error{"ingest rejected: engine is not in follower mode"};
   }
@@ -6442,6 +6535,7 @@ void DB::ingest(std::span<const DataEntryView> entries) {
 
   auto current = load_state_for_write();
   if (!current->is_ingestion_allowed()) {
+    if (current->closed) throw DbClosed{};
     if (current->degraded) throw DbDegraded{current->degraded_reason};
     throw std::logic_error{"ingest rejected: engine is not in follower mode"};
   }

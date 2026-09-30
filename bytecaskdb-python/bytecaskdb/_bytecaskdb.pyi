@@ -15,6 +15,9 @@ class DbDegraded(RuntimeError):
     Reads remain available. Call ``DB.resume()`` to attempt recovery.
     """
 
+class DbClosed(ValueError):
+    """Raised by every ``DB`` operation after ``DB.close()``."""
+
 class DbFollowerMode(RuntimeError):
     """Raised by normal write operations when the engine is in follower mode.
 
@@ -472,6 +475,19 @@ class DB:
     def resume(self) -> None:
         """Attempt recovery from a degraded state."""
         ...
+
+    def close(self) -> None:
+        """Make every write durable, write the hint files and release the
+        directory lock.
+
+        Raises ``OSError``, or ``DbDegraded``, if an acknowledged write is
+        not durable or the shutdown failed; the DB is closed either way.
+        Afterwards every operation raises ``DbClosed``. Idempotent.
+        """
+        ...
+
+    def __enter__(self) -> DB: ...
+    def __exit__(self, *args: object) -> None: ...
 
     @property
     def is_degraded(self) -> bool:

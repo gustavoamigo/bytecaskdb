@@ -67,9 +67,13 @@ typedef struct {
 // Returns NULL on failure; call bytecask_errmsg() for details.
 bytecask_db_t *bytecask_open(const char *dir, unsigned recovery_threads);
 
-// Closes the database and frees the handle.  Must not be called after a
-// concurrent put/get/del/iter is still in flight.
-void bytecask_close(bytecask_db_t *db);
+// Closes the database and frees the handle. Must not be called while a
+// concurrent put/get/del/iter is still in flight. Returns 0 if every
+// acknowledged write is durable and the shutdown completed; -1 otherwise,
+// with bytecask_errmsg() saying what failed (a failed fdatasync, trim or
+// hint write, or a degraded engine holding writes that are not durable).
+// The handle is freed either way. A NULL handle returns 0.
+int bytecask_close(bytecask_db_t *db);
 
 // ---------------------------------------------------------------------------
 // Write operations

@@ -133,7 +133,7 @@ auto from_module(std::optional<bytecask::CommitResult> r) noexcept
 }
 
 // Translate module-attached exception types to the header-defined internal types.
-// The module's bytecask::DbDegraded and bytecask::DbFollowerMode carry the
+// The module's bytecask::DbDegraded, DbFollowerMode and DbClosed carry the
 // C++23 module attachment suffix in their mangled names, so they cannot be
 // caught by the header-defined internal types at call sites that only see the header.
 template <typename F>
@@ -144,6 +144,8 @@ auto translate_exceptions(F&& f) -> decltype(std::forward<F>(f)()) {
     throw bytecask::internal::DbDegraded(e.what());
   } catch (const bytecask::DbFollowerMode& e) {
     throw bytecask::internal::DbFollowerMode(e.what());
+  } catch (const bytecask::DbClosed&) {
+    throw bytecask::internal::DbClosed{};
   }
 }
 
@@ -544,6 +546,10 @@ struct DB::Impl {
 DB::DB(std::unique_ptr<Impl> impl) noexcept : impl_{std::move(impl)} {}
 DB::~DB() = default;
 
+void DB::close() {
+  translate_exceptions([&] { impl_->db.close(); });
+}
+
 auto DB::open(std::filesystem::path dir, Options opts) -> DB {
   return DB{std::make_unique<Impl>(std::move(dir), std::move(opts))};
 }
@@ -579,7 +585,9 @@ auto DB::del_range(const WriteOptions& opts,
 
 auto DB::contains_key(const ReadOptions& opts,
                       BytesView key) const -> bool {
-  return impl_->db.contains_key(to_module(opts), key);
+  return translate_exceptions([&] {
+    return impl_->db.contains_key(to_module(opts), key);
+  });
 }
 
 auto DB::mode() const noexcept -> Mode {
@@ -587,7 +595,7 @@ auto DB::mode() const noexcept -> Mode {
 }
 
 void DB::set_mode(Mode mode) {
-  impl_->db.set_mode(to_module(mode));
+  translate_exceptions([&] { impl_->db.set_mode(to_module(mode)); });
 }
 
 auto DB::is_degraded() const noexcept -> bool {
@@ -599,11 +607,13 @@ auto DB::degraded_reason() const noexcept -> std::string {
 }
 
 void DB::resume() {
-  impl_->db.resume();
+  translate_exceptions([&] { impl_->db.resume(); });
 }
 
 auto DB::snapshot() const -> Snapshot {
-  return Snapshot{std::make_unique<Snapshot::Impl>(impl_->db.snapshot())};
+  return translate_exceptions([&] {
+    return Snapshot{std::make_unique<Snapshot::Impl>(impl_->db.snapshot())};
+  });
 }
 
 auto DB::apply_batch(WriteOptions opts, WritePlan plan) -> std::optional<CommitResult> {
@@ -615,7 +625,8 @@ auto DB::apply_batch(WriteOptions opts, WritePlan plan) -> std::optional<CommitR
 auto DB::iter_from(const ReadOptions& opts,
                    BytesView from) const
     -> std::ranges::subrange<EntryIterator, std::default_sentinel_t> {
-  auto r = impl_->db.iter_from(to_module(opts), from);
+  auto r = translate_exceptions(
+      [&] { return impl_->db.iter_from(to_module(opts), from); });
   return {EntryIterator{std::make_unique<EntryIterator::Impl>(r.begin())},
           std::default_sentinel};
 }
@@ -623,7 +634,8 @@ auto DB::iter_from(const ReadOptions& opts,
 auto DB::keys_from(const ReadOptions& opts,
                    BytesView from) const
     -> std::ranges::subrange<KeyIterator, std::default_sentinel_t> {
-  auto r = impl_->db.keys_from(to_module(opts), from);
+  auto r = translate_exceptions(
+      [&] { return impl_->db.keys_from(to_module(opts), from); });
   return {KeyIterator{std::make_unique<KeyIterator::Impl>(r.begin())},
           std::default_sentinel};
 }
@@ -631,7 +643,8 @@ auto DB::keys_from(const ReadOptions& opts,
 auto DB::riter_from(const ReadOptions& opts,
                     BytesView from) const
     -> std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t> {
-  auto r = impl_->db.riter_from(to_module(opts), from);
+  auto r = translate_exceptions(
+      [&] { return impl_->db.riter_from(to_module(opts), from); });
   return {
     ReverseEntryIterator{std::make_unique<ReverseEntryIterator::Impl>(r.begin())},
     std::default_sentinel
@@ -641,7 +654,8 @@ auto DB::riter_from(const ReadOptions& opts,
 auto DB::rkeys_from(const ReadOptions& opts,
                     BytesView from) const
     -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator> {
-  auto r = impl_->db.rkeys_from(to_module(opts), from);
+  auto r = translate_exceptions(
+      [&] { return impl_->db.rkeys_from(to_module(opts), from); });
   return {
     ReverseKeyIterator{std::make_unique<ReverseKeyIterator::Impl>(r.begin())},
     ReverseKeyIterator{std::make_unique<ReverseKeyIterator::Impl>(r.end())}
@@ -649,17 +663,18 @@ auto DB::rkeys_from(const ReadOptions& opts,
 }
 
 auto DB::vacuum(VacuumOptions opts) -> bool {
-  return impl_->db.vacuum(to_module(opts));
+  return translate_exceptions([&] { return impl_->db.vacuum(to_module(opts)); });
 }
 
 auto DB::durable_sequence(std::uint64_t min_sequence,
                          std::chrono::milliseconds timeout) const
     -> std::uint64_t {
-  return impl_->db.durable_sequence(min_sequence, timeout);
+  return translate_exceptions(
+      [&] { return impl_->db.durable_sequence(min_sequence, timeout); });
 }
 
 auto DB::create_manifest() -> FileManifest {
-  auto m = impl_->db.create_manifest();
+  auto m = translate_exceptions([&] { return impl_->db.create_manifest(); });
   std::vector<FileInfo> files;
   files.reserve(m.files.size());
   for (const auto& fi : m.files) {
@@ -674,7 +689,8 @@ auto DB::create_manifest() -> FileManifest {
 
 auto DB::changes_since(const Snapshot& snap, std::uint64_t from_sequence) const
     -> std::ranges::subrange<ChangeIterator, std::default_sentinel_t> {
-  auto r = impl_->db.changes_since(snap.impl_->snap, from_sequence);
+  auto r = translate_exceptions(
+      [&] { return impl_->db.changes_since(snap.impl_->snap, from_sequence); });
   return {
     ChangeIterator{std::make_unique<ChangeIterator::Impl>(std::move(r).begin())},
     std::default_sentinel
@@ -693,7 +709,7 @@ void DB::ingest(std::span<const DataEntryView> entries) {
 }
 
 auto DB::stats() const -> std::map<std::string, std::int64_t> {
-  return impl_->db.stats();
+  return translate_exceptions([&] { return impl_->db.stats(); });
 }
 
 } // namespace bytecask::internal

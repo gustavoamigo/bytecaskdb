@@ -771,6 +771,23 @@ tests, not through standalone `changes_since` proof tests.
 
 ---
 
+## `close`
+
+Shuts the engine down and reports whether the shutdown kept every
+acknowledged write. `~DB` calls it when the caller did not, and swallows
+its errors. Proved by the `[close]` tests.
+
+| Property | Contract |
+|----------|----------|
+| **Durability** | Returns normally only if every write the DB acknowledged — `sync = false` ones included — is durable, and the sync, trim and hint writes all succeeded. |
+| **Failure reporting** | Healthy engine: a failed `fdatasync`, trim or hint write throws `std::system_error`. Degraded engine: throws `DbDegraded` when writes were acknowledged above `durable_seq`; it does not sync, since a sync after a failed one proves nothing (#231). A degraded engine whose acknowledged writes are all durable closes normally. |
+| **Closed either way** | Whatever it throws, the engine is closed and the directory lock released. A failed close leaves on disk what a crash would, and the next `open` recovers it the same way. |
+| **Concurrency** | Waits for a running vacuum and for every in-flight write to be published. A write racing `close` either commits before it — and is covered by its durability verdict — or throws `DbClosed`. A read racing it returns a result or throws `DbClosed`. |
+| **Afterwards** | Every operation throws `DbClosed` (a `std::logic_error`), except `mode()`, `is_degraded()` and `degraded_reason()`, which keep answering. `Snapshot`s, iterators and spans taken before stay valid and readable. |
+| **Idempotency** | A second `close` returns at once and reports nothing: a retry cannot make lost pages durable. |
+
+---
+
 ## View and span lifetimes
 
 Every read API either copies bytes out or lends a view of them. A lent
@@ -979,7 +996,7 @@ the iterator's `io_buf_` otherwise. Both are covered below.
 | `set_mode()` | Valid | In-memory transition only |
 | Originating `Snapshot` destroyed | Valid | B |
 | Concurrent write | Valid | B + D — appends and zero-fill never rewrite a published byte |
-| `DB` destruction | Valid | B + D + P — the destructor's `shrink_to_fit` releases only the zero tail |
+| `DB::close()` / destruction | Valid | B + D + P — close's `shrink_to_fit` releases only the zero tail |
 | — | | |
 | Next `operator++()` | Invalid | Same as above |
 | Iterator destroyed | Invalid | Same as above |
@@ -1049,20 +1066,20 @@ move-only, so a span can never be separated from the buffer it
 addresses by copying the iterator. Moving is safe — the buffer travels
 with the spans.
 
-### `DB` destruction
+### `DB` close and destruction
 
-No operation may be in flight when `~DB` runs. That is a caller
-precondition, not something the engine enforces.
+`close()` may race other operations; see *`close`*. No operation may be
+in flight when `~DB` runs: that is a caller precondition, not something
+the engine enforces, since it ends the object's lifetime.
 
 Views already taken stay valid. An iterator, a `Snapshot`, and the
 spans they hand out hold their own references to the engine state and
 to every data file it names, so they remain valid and remain readable
-after the `DB` is gone.
+after the `DB` is closed or gone.
 
-An operation *racing* the destructor is undefined: a read may throw,
-and a write may be truncated away by the destructor's final release of
-the zero-filled tail and lost. Undefined here does not extend to data
-already written. Data files are append-only and the destructor's only
+An operation *racing* the destructor is undefined: it uses an object
+whose lifetime is ending. Undefined here does not extend to data
+already written. Data files are append-only and the close's only
 destructive act is truncating the active file to its logical end, so
 the worst on-disk outcome is a shorter valid prefix of the committed
 history — every surviving entry keeps its CRC, and a cut that lands

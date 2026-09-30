@@ -429,6 +429,18 @@ static auto jsdb_degraded_reason(JsDB &self) -> std::string {
 
 static void jsdb_resume(JsDB &self) { self.db.resume(); }
 
+// Returns what close() reported, or "" if the shutdown was clean. A message,
+// not a throw: under -fwasm-exceptions JS sees a C++ exception without its
+// what(). The JS close() throws it once the handle is deleted (dispose.ts).
+static auto jsdb_close(JsDB &self) -> std::string {
+  try {
+    self.db.close();
+  } catch (const std::exception &e) {
+    return e.what();
+  }
+  return {};
+}
+
 static auto jsdb_mode(JsDB &self) -> std::string {
   return mode_to_string(self.db.mode());
 }
@@ -672,6 +684,7 @@ EMSCRIPTEN_BINDINGS(bytecask) {
       .function("isDegraded", &jsdb_is_degraded)
       .function("degradedReason", &jsdb_degraded_reason)
       .function("resume", &jsdb_resume)
+      .function("closeDb", &jsdb_close)
       .function("mode", &jsdb_mode)
       .function("setMode", &jsdb_set_mode)
       .function("durableSequence", &jsdb_durable_sequence)
