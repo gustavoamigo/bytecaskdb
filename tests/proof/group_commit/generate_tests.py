@@ -76,6 +76,10 @@ def gen_test(shape: GroupShape, failure: GroupFailureClass) -> str:
     p.append(f'TEST_CASE("{name}", "[prove_group][concurrency]") {{')
     p.append("  TempDir td;")
     p.append('  auto dir = td.path / "db";')
+    # Power loss (#265): the group runs under the page cache model, and the
+    # directory is copied as the device holds it before ~DB syncs it.
+    p.append("  bytecask::testing::ScopedPageCacheModel cache;")
+    p.append('  auto cut = td.path / "cut";')
     p.append("  bytecask::testing::EngineFingerprint fp;")
     p.append("  {")
     p.append(f"    auto db = {open_call};")
@@ -190,12 +194,17 @@ def gen_test(shape: GroupShape, failure: GroupFailureClass) -> str:
         p.append("    fp = fingerprint(db);")
     else:
         p.append("    fp = fingerprint(db);")
+    p.append("    cache.model.copy_device(dir, cut);  // power cut")
     p.append("  }")
+    p.append("  assert_hints_durable(cache.model);")
     p.append("  // Whatever the group left on disk, a cold open must agree with it.")
-    if opts:
-        p.append(f"  assert_matches_recovery(dir, fp, {opts});")
-    else:
-        p.append("  assert_matches_recovery(dir, fp);")
+    opts_arg = f", {opts}" if opts else ""
+    p.append(f"  assert_matches_recovery(dir, fp{opts_arg});")
+    # A synced group reported durable; a degraded one was resumed, which made
+    # durable what it published. Either way the cut may have taken nothing.
+    p.append("  // And so must the directory as the device held it at the cut:")
+    p.append("  // the group was synced, or resume() made durable what it published.")
+    p.append(f"  assert_matches_recovery(cut, fp{opts_arg});")
     p.append("}")
     return "\n".join(p)
 
@@ -209,7 +218,10 @@ FILE_HEADER = """\
 // Correctness proof tests for group commit under I/O failure. Each test forces
 // a deterministic batch of N writers through one leader, faults the group's
 // shared I/O on the leader's thread, and verifies that every writer in the
-// group saw the same outcome and that the group landed all or nothing.
+// group saw the same outcome and that the group landed all or nothing. Every
+// cell cuts the power before the DB closes (#265) and checks the directory as
+// the device held it agrees with the engine: a synced group is durable, and a
+// resumed one made durable what it published.
 
 #include <array>
 #include <condition_variable>
@@ -232,6 +244,7 @@ import bytecask;
 namespace {
 
 using bytecask::testing::assert_consistent;
+using bytecask::testing::assert_hints_durable;
 using bytecask::testing::assert_matches_recovery;
 using bytecask::testing::assert_resumable;
 using bytecask::testing::fingerprint;

@@ -24,6 +24,7 @@ namespace {
 
 using bytecask::testing::assert_consistent;
 using bytecask::testing::assert_keys_recoverable;
+using bytecask::testing::assert_hints_durable;
 using bytecask::testing::assert_matches_recovery;
 using bytecask::testing::fingerprint;
 using bytecask::testing::to_bytes;
@@ -52,6 +53,8 @@ struct TempDir {
 TEST_CASE("prove_resume__degrade_H__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
@@ -85,14 +88,21 @@ TEST_CASE("prove_resume__degrade_H__success", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_H__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
@@ -133,14 +143,21 @@ TEST_CASE("prove_resume__degrade_H__file_creation_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_H__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
@@ -191,14 +208,21 @@ TEST_CASE("prove_resume__degrade_H__double_resume", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_C__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -233,14 +257,21 @@ TEST_CASE("prove_resume__degrade_C__success", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_C__truncate_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -282,14 +313,21 @@ TEST_CASE("prove_resume__degrade_C__truncate_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_C__truncate_fails_after_cut", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -339,14 +377,21 @@ TEST_CASE("prove_resume__degrade_C__truncate_fails_after_cut", "[prove_resume]")
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_C__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -388,14 +433,21 @@ TEST_CASE("prove_resume__degrade_C__sync_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_C__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -437,14 +489,21 @@ TEST_CASE("prove_resume__degrade_C__file_creation_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_C__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -492,14 +551,21 @@ TEST_CASE("prove_resume__degrade_C__double_resume", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_C__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -548,14 +614,21 @@ TEST_CASE("prove_resume__degrade_C__cascade_r2_r3", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F: k0 committed (sync=false); p0 appended but
@@ -590,14 +663,21 @@ TEST_CASE("prove_resume__degrade_F__success", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F: k0 committed (sync=false); p0 appended but
@@ -639,14 +719,21 @@ TEST_CASE("prove_resume__degrade_F__sync_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F: k0 committed (sync=false); p0 appended but
@@ -688,14 +775,21 @@ TEST_CASE("prove_resume__degrade_F__file_creation_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F: k0 committed (sync=false); p0 appended but
@@ -747,14 +841,21 @@ TEST_CASE("prove_resume__degrade_F__double_resume", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F: k0 committed (sync=false); p0 appended but
@@ -803,14 +904,21 @@ TEST_CASE("prove_resume__degrade_F__cascade_r2_r3", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_G__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_G: k0 committed (sync=false); p0 appended with
@@ -845,14 +953,21 @@ TEST_CASE("prove_resume__degrade_G__success", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_G__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_G: k0 committed (sync=false); p0 appended with
@@ -894,14 +1009,21 @@ TEST_CASE("prove_resume__degrade_G__sync_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_G__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_G: k0 committed (sync=false); p0 appended with
@@ -943,14 +1065,21 @@ TEST_CASE("prove_resume__degrade_G__file_creation_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_G__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_G: k0 committed (sync=false); p0 appended with
@@ -1002,14 +1131,21 @@ TEST_CASE("prove_resume__degrade_G__double_resume", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_G__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_G: k0 committed (sync=false); p0 appended with
@@ -1058,15 +1194,22 @@ TEST_CASE("prove_resume__degrade_G__cascade_r2_r3", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 #ifndef __EMSCRIPTEN__
 TEST_CASE("prove_resume__degrade_H_mmap__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
@@ -1100,9 +1243,14 @@ TEST_CASE("prove_resume__degrade_H_mmap__success", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::Mmap});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1110,6 +1258,8 @@ TEST_CASE("prove_resume__degrade_H_mmap__success", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_H_mmap__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
@@ -1150,9 +1300,14 @@ TEST_CASE("prove_resume__degrade_H_mmap__file_creation_fails", "[prove_resume]")
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::Mmap});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1160,6 +1315,8 @@ TEST_CASE("prove_resume__degrade_H_mmap__file_creation_fails", "[prove_resume]")
 TEST_CASE("prove_resume__degrade_H_mmap__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
@@ -1210,9 +1367,14 @@ TEST_CASE("prove_resume__degrade_H_mmap__double_resume", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::Mmap});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1220,6 +1382,8 @@ TEST_CASE("prove_resume__degrade_H_mmap__double_resume", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_mmap__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -1254,9 +1418,14 @@ TEST_CASE("prove_resume__degrade_C_mmap__success", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1264,6 +1433,8 @@ TEST_CASE("prove_resume__degrade_C_mmap__success", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_mmap__truncate_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -1305,9 +1476,14 @@ TEST_CASE("prove_resume__degrade_C_mmap__truncate_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1315,6 +1491,8 @@ TEST_CASE("prove_resume__degrade_C_mmap__truncate_fails", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_mmap__truncate_fails_after_cut", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -1364,9 +1542,14 @@ TEST_CASE("prove_resume__degrade_C_mmap__truncate_fails_after_cut", "[prove_resu
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1374,6 +1557,8 @@ TEST_CASE("prove_resume__degrade_C_mmap__truncate_fails_after_cut", "[prove_resu
 TEST_CASE("prove_resume__degrade_C_mmap__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -1415,9 +1600,14 @@ TEST_CASE("prove_resume__degrade_C_mmap__sync_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1425,6 +1615,8 @@ TEST_CASE("prove_resume__degrade_C_mmap__sync_fails", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_mmap__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -1466,9 +1658,14 @@ TEST_CASE("prove_resume__degrade_C_mmap__file_creation_fails", "[prove_resume]")
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1476,6 +1673,8 @@ TEST_CASE("prove_resume__degrade_C_mmap__file_creation_fails", "[prove_resume]")
 TEST_CASE("prove_resume__degrade_C_mmap__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -1523,9 +1722,14 @@ TEST_CASE("prove_resume__degrade_C_mmap__double_resume", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1533,6 +1737,8 @@ TEST_CASE("prove_resume__degrade_C_mmap__double_resume", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_mmap__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -1581,9 +1787,14 @@ TEST_CASE("prove_resume__degrade_C_mmap__cascade_r2_r3", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::Mmap});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::Mmap});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1591,6 +1802,8 @@ TEST_CASE("prove_resume__degrade_C_mmap__cascade_r2_r3", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_H_pool__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
@@ -1624,9 +1837,14 @@ TEST_CASE("prove_resume__degrade_H_pool__success", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1634,6 +1852,8 @@ TEST_CASE("prove_resume__degrade_H_pool__success", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_H_pool__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
@@ -1674,9 +1894,14 @@ TEST_CASE("prove_resume__degrade_H_pool__file_creation_fails", "[prove_resume]")
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1684,6 +1909,8 @@ TEST_CASE("prove_resume__degrade_H_pool__file_creation_fails", "[prove_resume]")
 TEST_CASE("prove_resume__degrade_H_pool__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_H: write k0, then fault on rotation after p0.
@@ -1734,9 +1961,14 @@ TEST_CASE("prove_resume__degrade_H_pool__double_resume", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}, {"p0", "new0"}}, {}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1744,6 +1976,8 @@ TEST_CASE("prove_resume__degrade_H_pool__double_resume", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_pool__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -1778,9 +2012,14 @@ TEST_CASE("prove_resume__degrade_C_pool__success", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1788,6 +2027,8 @@ TEST_CASE("prove_resume__degrade_C_pool__success", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_pool__truncate_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -1829,9 +2070,14 @@ TEST_CASE("prove_resume__degrade_C_pool__truncate_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1839,6 +2085,8 @@ TEST_CASE("prove_resume__degrade_C_pool__truncate_fails", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_pool__truncate_fails_after_cut", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -1888,9 +2136,14 @@ TEST_CASE("prove_resume__degrade_C_pool__truncate_fails_after_cut", "[prove_resu
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1898,6 +2151,8 @@ TEST_CASE("prove_resume__degrade_C_pool__truncate_fails_after_cut", "[prove_resu
 TEST_CASE("prove_resume__degrade_C_pool__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -1939,9 +2194,14 @@ TEST_CASE("prove_resume__degrade_C_pool__sync_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1949,6 +2209,8 @@ TEST_CASE("prove_resume__degrade_C_pool__sync_fails", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_pool__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -1990,9 +2252,14 @@ TEST_CASE("prove_resume__degrade_C_pool__file_creation_fails", "[prove_resume]")
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -2000,6 +2267,8 @@ TEST_CASE("prove_resume__degrade_C_pool__file_creation_fails", "[prove_resume]")
 TEST_CASE("prove_resume__degrade_C_pool__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -2047,9 +2316,14 @@ TEST_CASE("prove_resume__degrade_C_pool__double_resume", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -2057,6 +2331,8 @@ TEST_CASE("prove_resume__degrade_C_pool__double_resume", "[prove_resume]") {
 TEST_CASE("prove_resume__degrade_C_pool__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_C: k0 committed; 2-op batch fails at BulkEnd
@@ -2105,15 +2381,22 @@ TEST_CASE("prove_resume__degrade_C_pool__cascade_r2_r3", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0", "p1"}, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
   assert_matches_recovery(dir, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp, {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
 TEST_CASE("prove_resume__degrade_B2__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B2: k0 committed; p0's writev returns short,
@@ -2147,14 +2430,21 @@ TEST_CASE("prove_resume__degrade_B2__success", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B2__truncate_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B2: k0 committed; p0's writev returns short,
@@ -2195,14 +2485,21 @@ TEST_CASE("prove_resume__degrade_B2__truncate_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B2__truncate_fails_after_cut", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B2: k0 committed; p0's writev returns short,
@@ -2251,14 +2548,21 @@ TEST_CASE("prove_resume__degrade_B2__truncate_fails_after_cut", "[prove_resume]"
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B2__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B2: k0 committed; p0's writev returns short,
@@ -2299,14 +2603,21 @@ TEST_CASE("prove_resume__degrade_B2__sync_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B2__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B2: k0 committed; p0's writev returns short,
@@ -2347,14 +2658,21 @@ TEST_CASE("prove_resume__degrade_B2__file_creation_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B2__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B2: k0 committed; p0's writev returns short,
@@ -2400,14 +2718,21 @@ TEST_CASE("prove_resume__degrade_B2__double_resume", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B2__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B2: k0 committed; p0's writev returns short,
@@ -2455,14 +2780,21 @@ TEST_CASE("prove_resume__degrade_B2__cascade_r2_r3", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B3__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B3: k0 committed; p0's writev wrote every byte
@@ -2496,14 +2828,21 @@ TEST_CASE("prove_resume__degrade_B3__success", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B3__truncate_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B3: k0 committed; p0's writev wrote every byte
@@ -2544,14 +2883,21 @@ TEST_CASE("prove_resume__degrade_B3__truncate_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B3__truncate_fails_after_cut", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B3: k0 committed; p0's writev wrote every byte
@@ -2600,14 +2946,21 @@ TEST_CASE("prove_resume__degrade_B3__truncate_fails_after_cut", "[prove_resume]"
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B3__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B3: k0 committed; p0's writev wrote every byte
@@ -2648,14 +3001,21 @@ TEST_CASE("prove_resume__degrade_B3__sync_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B3__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B3: k0 committed; p0's writev wrote every byte
@@ -2696,14 +3056,21 @@ TEST_CASE("prove_resume__degrade_B3__file_creation_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B3__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B3: k0 committed; p0's writev wrote every byte
@@ -2749,14 +3116,21 @@ TEST_CASE("prove_resume__degrade_B3__double_resume", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_B3__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_B3: k0 committed; p0's writev wrote every byte
@@ -2804,14 +3178,21 @@ TEST_CASE("prove_resume__degrade_B3__cascade_r2_r3", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"k0", "v0"}}, {"p0"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_range__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_range: k0 and k1 committed (sync=false); a
@@ -2840,14 +3221,21 @@ TEST_CASE("prove_resume__degrade_F_range__success", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {}, {"k0", "k1"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_range__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_range: k0 and k1 committed (sync=false); a
@@ -2883,14 +3271,21 @@ TEST_CASE("prove_resume__degrade_F_range__sync_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {}, {"k0", "k1"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_range__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_range: k0 and k1 committed (sync=false); a
@@ -2926,14 +3321,21 @@ TEST_CASE("prove_resume__degrade_F_range__file_creation_fails", "[prove_resume]"
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {}, {"k0", "k1"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_range__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_range: k0 and k1 committed (sync=false); a
@@ -2969,14 +3371,21 @@ TEST_CASE("prove_resume__degrade_F_range__double_resume", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {}, {"k0", "k1"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_range__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_range: k0 and k1 committed (sync=false); a
@@ -3019,14 +3428,21 @@ TEST_CASE("prove_resume__degrade_F_range__cascade_r2_r3", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {}, {"k0", "k1"});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_batch__success", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_batch: a 2-op batch commits (sync=false), so
@@ -3074,14 +3490,21 @@ TEST_CASE("prove_resume__degrade_F_batch__success", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"p0", "new0"}, {"p1", "new1"}, {"k0", "v0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_batch__sync_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_batch: a 2-op batch commits (sync=false), so
@@ -3136,14 +3559,21 @@ TEST_CASE("prove_resume__degrade_F_batch__sync_fails", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"p0", "new0"}, {"p1", "new1"}, {"k0", "v0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_batch__file_creation_fails", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_batch: a 2-op batch commits (sync=false), so
@@ -3198,14 +3628,21 @@ TEST_CASE("prove_resume__degrade_F_batch__file_creation_fails", "[prove_resume]"
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"p0", "new0"}, {"p1", "new1"}, {"k0", "v0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_batch__double_resume", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_batch: a 2-op batch commits (sync=false), so
@@ -3276,14 +3713,21 @@ TEST_CASE("prove_resume__degrade_F_batch__double_resume", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"p0", "new0"}, {"p1", "new1"}, {"k0", "v0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }
 
 TEST_CASE("prove_resume__degrade_F_batch__cascade_r2_r3", "[prove_resume]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
   bytecask::testing::EngineFingerprint fp;
   {
     // Establish degrade_F_batch: a 2-op batch commits (sync=false), so
@@ -3345,7 +3789,12 @@ TEST_CASE("prove_resume__degrade_F_batch__cascade_r2_r3", "[prove_resume]") {
     // resume() and a cold open read the same bytes; they must
     // reconstruct the same engine.
     fp = fingerprint(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_keys_recoverable(dir, {{"p0", "new0"}, {"p1", "new1"}, {"k0", "v0"}}, {});
   assert_matches_recovery(dir, fp);
+  // ... and so must what the device held at the cut: resume()
+  // made durable what it published.
+  assert_matches_recovery(cut, fp);
 }

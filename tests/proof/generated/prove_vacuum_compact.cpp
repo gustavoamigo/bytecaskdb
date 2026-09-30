@@ -12,7 +12,14 @@
 // after the commit, before the unlink — recovers, with the vacuum undone.
 // VC6 (#104 M3) verifies that a copy renamed but never committed is an orphan
 // the next open detects and deletes.
+// VC7 (#261) fails the fdatasync vacuum issues before dropping entries that
+// only sync = false writes supersede. Every cell cuts the power after the
+// vacuum (#265) and recovers the directory as the device held it: the durable
+// baseline must be there, with every overwrite or with none.
 
+#include <cstdint>
+#include <map>
+#include <string>
 #include <system_error>
 
 #ifdef BYTECASK_TESTING
@@ -27,7 +34,12 @@ import bytecask;
 namespace {
 
 using bytecask::testing::assert_consistent;
+using bytecask::testing::assert_hints_durable;
+using bytecask::testing::assert_power_loss_outcome;
 using bytecask::testing::assert_vacuum_no_change;
+using bytecask::testing::durable_watermark;
+using bytecask::testing::key_values;
+using bytecask::testing::make_durable;
 using bytecask::testing::assert_vacuum_recoverable;
 using bytecask::testing::unreferenced_data_files;
 using bytecask::testing::assert_vacuum_success;
@@ -59,6 +71,10 @@ struct TempDir {
 TEST_CASE("prove_vacuum_compact__low_fragmentation__success", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -67,6 +83,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__success", "[prove_vacuum_com
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -74,15 +94,29 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__success", "[prove_vacuum_com
     REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
     assert_vacuum_success(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
 }
 
 TEST_CASE("prove_vacuum_compact__low_fragmentation__tmp_create_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -91,6 +125,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__tmp_create_fails", "[prove_v
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -101,15 +139,29 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__tmp_create_fails", "[prove_v
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
 }
 
 TEST_CASE("prove_vacuum_compact__low_fragmentation__append_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -118,6 +170,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__append_fails", "[prove_vacuu
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -128,15 +184,29 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__append_fails", "[prove_vacuu
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
 }
 
 TEST_CASE("prove_vacuum_compact__low_fragmentation__sync_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -145,6 +215,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__sync_fails", "[prove_vacuum_
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -155,15 +229,29 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__sync_fails", "[prove_vacuum_
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
 }
 
 TEST_CASE("prove_vacuum_compact__low_fragmentation__rename_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -172,6 +260,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__rename_fails", "[prove_vacuu
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -185,15 +277,29 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__rename_fails", "[prove_vacuu
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
 }
 
 TEST_CASE("prove_vacuum_compact__low_fragmentation__unlink_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -202,6 +308,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__unlink_fails", "[prove_vacuu
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -217,15 +327,29 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__unlink_fails", "[prove_vacuu
     }
 
     assert_vacuum_success(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
 }
 
 TEST_CASE("prove_vacuum_compact__low_fragmentation__post_rename", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   std::vector<std::filesystem::path> orphans;
   {
@@ -235,6 +359,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__post_rename", "[prove_vacuum
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -248,18 +376,32 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__post_rename", "[prove_vacuum
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
     orphans = unreferenced_data_files(db, dir);
     REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
   CHECK_FALSE(std::filesystem::exists(orphans.front()));
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
 }
 
 TEST_CASE("prove_vacuum_compact__mostly_dead__success", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -276,6 +418,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__success", "[prove_vacuum_compact]"
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -283,15 +429,29 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__success", "[prove_vacuum_compact]"
     REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
     assert_vacuum_success(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150});
 }
 
 TEST_CASE("prove_vacuum_compact__mostly_dead__tmp_create_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -308,6 +468,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__tmp_create_fails", "[prove_vacuum_
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -318,15 +482,29 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__tmp_create_fails", "[prove_vacuum_
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150});
 }
 
 TEST_CASE("prove_vacuum_compact__mostly_dead__append_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -343,6 +521,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__append_fails", "[prove_vacuum_comp
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -353,15 +535,29 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__append_fails", "[prove_vacuum_comp
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150});
 }
 
 TEST_CASE("prove_vacuum_compact__mostly_dead__sync_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -378,6 +574,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__sync_fails", "[prove_vacuum_compac
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -388,15 +588,29 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__sync_fails", "[prove_vacuum_compac
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150});
 }
 
 TEST_CASE("prove_vacuum_compact__mostly_dead__rename_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -413,6 +627,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__rename_fails", "[prove_vacuum_comp
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -426,15 +644,29 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__rename_fails", "[prove_vacuum_comp
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150});
 }
 
 TEST_CASE("prove_vacuum_compact__mostly_dead__unlink_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -451,6 +683,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__unlink_fails", "[prove_vacuum_comp
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -466,15 +702,29 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__unlink_fails", "[prove_vacuum_comp
     }
 
     assert_vacuum_success(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150});
 }
 
 TEST_CASE("prove_vacuum_compact__mostly_dead__post_rename", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   std::vector<std::filesystem::path> orphans;
   {
@@ -492,6 +742,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__post_rename", "[prove_vacuum_compa
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -505,19 +759,33 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__post_rename", "[prove_vacuum_compa
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
     orphans = unreferenced_data_files(db, dir);
     REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150});
   CHECK_FALSE(std::filesystem::exists(orphans.front()));
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150});
 }
 
 #ifndef __EMSCRIPTEN__
 TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__success", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -526,6 +794,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__success", "[prove_vacuu
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -533,10 +805,20 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__success", "[prove_vacuu
     REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
     assert_vacuum_success(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -544,6 +826,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__success", "[prove_vacuu
 TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__tmp_create_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -552,6 +838,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__tmp_create_fails", "[pr
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -562,10 +852,20 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__tmp_create_fails", "[pr
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -573,6 +873,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__tmp_create_fails", "[pr
 TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__append_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -581,6 +885,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__append_fails", "[prove_
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -591,10 +899,20 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__append_fails", "[prove_
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -602,6 +920,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__append_fails", "[prove_
 TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__sync_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -610,6 +932,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__sync_fails", "[prove_va
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -620,10 +946,20 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__sync_fails", "[prove_va
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -631,6 +967,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__sync_fails", "[prove_va
 TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__rename_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -639,6 +979,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__rename_fails", "[prove_
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -652,10 +996,20 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__rename_fails", "[prove_
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -663,6 +1017,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__rename_fails", "[prove_
 TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__unlink_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -671,6 +1029,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__unlink_fails", "[prove_
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -686,10 +1048,20 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__unlink_fails", "[prove_
     }
 
     assert_vacuum_success(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -697,6 +1069,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__unlink_fails", "[prove_
 TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__post_rename", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   std::vector<std::filesystem::path> orphans;
   {
@@ -706,6 +1082,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__post_rename", "[prove_v
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -719,13 +1099,23 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__post_rename", "[prove_v
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
     orphans = unreferenced_data_files(db, dir);
     REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
   CHECK_FALSE(std::filesystem::exists(orphans.front()));
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -733,6 +1123,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__post_rename", "[prove_v
 TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__success", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -749,6 +1143,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__success", "[prove_vacuum_comp
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -756,10 +1154,20 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__success", "[prove_vacuum_comp
     REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
     assert_vacuum_success(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -767,6 +1175,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__success", "[prove_vacuum_comp
 TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__tmp_create_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -783,6 +1195,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__tmp_create_fails", "[prove_va
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -793,10 +1209,20 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__tmp_create_fails", "[prove_va
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -804,6 +1230,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__tmp_create_fails", "[prove_va
 TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__append_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -820,6 +1250,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__append_fails", "[prove_vacuum
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -830,10 +1264,20 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__append_fails", "[prove_vacuum
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -841,6 +1285,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__append_fails", "[prove_vacuum
 TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__sync_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -857,6 +1305,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__sync_fails", "[prove_vacuum_c
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -867,10 +1319,20 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__sync_fails", "[prove_vacuum_c
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -878,6 +1340,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__sync_fails", "[prove_vacuum_c
 TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__rename_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -894,6 +1360,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__rename_fails", "[prove_vacuum
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -907,10 +1377,20 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__rename_fails", "[prove_vacuum
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -918,6 +1398,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__rename_fails", "[prove_vacuum
 TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__unlink_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -934,6 +1418,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__unlink_fails", "[prove_vacuum
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -949,10 +1437,20 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__unlink_fails", "[prove_vacuum
     }
 
     assert_vacuum_success(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -960,6 +1458,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__unlink_fails", "[prove_vacuum
 TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__post_rename", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   std::vector<std::filesystem::path> orphans;
   {
@@ -977,6 +1479,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__post_rename", "[prove_vacuum_
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -990,13 +1496,23 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__post_rename", "[prove_vacuum_
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
     orphans = unreferenced_data_files(db, dir);
     REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
   CHECK_FALSE(std::filesystem::exists(orphans.front()));
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1004,6 +1520,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__post_rename", "[prove_vacuum_
 TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__success", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1012,6 +1532,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__success", "[prove_vacuu
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1019,10 +1543,20 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__success", "[prove_vacuu
     REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
     assert_vacuum_success(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1030,6 +1564,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__success", "[prove_vacuu
 TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__tmp_create_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1038,6 +1576,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__tmp_create_fails", "[pr
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1048,10 +1590,20 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__tmp_create_fails", "[pr
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1059,6 +1611,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__tmp_create_fails", "[pr
 TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__append_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1067,6 +1623,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__append_fails", "[prove_
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1077,10 +1637,20 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__append_fails", "[prove_
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1088,6 +1658,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__append_fails", "[prove_
 TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__sync_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1096,6 +1670,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__sync_fails", "[prove_va
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1106,10 +1684,20 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__sync_fails", "[prove_va
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1117,6 +1705,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__sync_fails", "[prove_va
 TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__rename_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1125,6 +1717,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__rename_fails", "[prove_
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1138,10 +1734,20 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__rename_fails", "[prove_
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1149,6 +1755,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__rename_fails", "[prove_
 TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__unlink_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1157,6 +1767,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__unlink_fails", "[prove_
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1172,10 +1786,20 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__unlink_fails", "[prove_
     }
 
     assert_vacuum_success(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1183,6 +1807,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__unlink_fails", "[prove_
 TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__post_rename", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   std::vector<std::filesystem::path> orphans;
   {
@@ -1192,6 +1820,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__post_rename", "[prove_v
     db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1205,13 +1837,23 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__post_rename", "[prove_v
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
     orphans = unreferenced_data_files(db, dir);
     REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
   CHECK_FALSE(std::filesystem::exists(orphans.front()));
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1219,6 +1861,10 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__post_rename", "[prove_v
 TEST_CASE("prove_vacuum_compact__mostly_dead_pool__success", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -1235,6 +1881,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__success", "[prove_vacuum_comp
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1242,10 +1892,20 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__success", "[prove_vacuum_comp
     REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
     assert_vacuum_success(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1253,6 +1913,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__success", "[prove_vacuum_comp
 TEST_CASE("prove_vacuum_compact__mostly_dead_pool__tmp_create_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -1269,6 +1933,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__tmp_create_fails", "[prove_va
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1279,10 +1947,20 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__tmp_create_fails", "[prove_va
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1290,6 +1968,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__tmp_create_fails", "[prove_va
 TEST_CASE("prove_vacuum_compact__mostly_dead_pool__append_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -1306,6 +1988,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__append_fails", "[prove_vacuum
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1316,10 +2002,20 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__append_fails", "[prove_vacuum
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1327,6 +2023,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__append_fails", "[prove_vacuum
 TEST_CASE("prove_vacuum_compact__mostly_dead_pool__sync_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -1343,6 +2043,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__sync_fails", "[prove_vacuum_c
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1353,10 +2057,20 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__sync_fails", "[prove_vacuum_c
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1364,6 +2078,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__sync_fails", "[prove_vacuum_c
 TEST_CASE("prove_vacuum_compact__mostly_dead_pool__rename_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -1380,6 +2098,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__rename_fails", "[prove_vacuum
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1393,10 +2115,20 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__rename_fails", "[prove_vacuum
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1404,6 +2136,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__rename_fails", "[prove_vacuum
 TEST_CASE("prove_vacuum_compact__mostly_dead_pool__unlink_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
@@ -1420,6 +2156,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__unlink_fails", "[prove_vacuum
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1435,10 +2175,20 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__unlink_fails", "[prove_vacuum
     }
 
     assert_vacuum_success(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
@@ -1446,6 +2196,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__unlink_fails", "[prove_vacuum
 TEST_CASE("prove_vacuum_compact__mostly_dead_pool__post_rename", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   std::vector<std::filesystem::path> orphans;
   {
@@ -1463,6 +2217,10 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__post_rename", "[prove_vacuum_
     (void)db.del({.sync = false}, to_bytes("k3"));
     (void)db.del({.sync = false}, to_bytes("k4"));
     (void)db.del({.sync = false}, to_bytes("k5"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1476,19 +2234,33 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__post_rename", "[prove_vacuum_
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
     orphans = unreferenced_data_files(db, dir);
     REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
   CHECK_FALSE(std::filesystem::exists(orphans.front()));
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
 }
 #endif  // __EMSCRIPTEN__
 
 TEST_CASE("prove_vacuum_compact__batched_file__success", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1501,6 +2273,10 @@ TEST_CASE("prove_vacuum_compact__batched_file__success", "[prove_vacuum_compact]
     }
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1508,15 +2284,29 @@ TEST_CASE("prove_vacuum_compact__batched_file__success", "[prove_vacuum_compact]
     REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
     assert_vacuum_success(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 88});
 }
 
 TEST_CASE("prove_vacuum_compact__batched_file__tmp_create_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1529,6 +2319,10 @@ TEST_CASE("prove_vacuum_compact__batched_file__tmp_create_fails", "[prove_vacuum
     }
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1539,15 +2333,29 @@ TEST_CASE("prove_vacuum_compact__batched_file__tmp_create_fails", "[prove_vacuum
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 88});
 }
 
 TEST_CASE("prove_vacuum_compact__batched_file__append_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1560,6 +2368,10 @@ TEST_CASE("prove_vacuum_compact__batched_file__append_fails", "[prove_vacuum_com
     }
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1570,15 +2382,29 @@ TEST_CASE("prove_vacuum_compact__batched_file__append_fails", "[prove_vacuum_com
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 88});
 }
 
 TEST_CASE("prove_vacuum_compact__batched_file__sync_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1591,6 +2417,10 @@ TEST_CASE("prove_vacuum_compact__batched_file__sync_fails", "[prove_vacuum_compa
     }
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1601,15 +2431,29 @@ TEST_CASE("prove_vacuum_compact__batched_file__sync_fails", "[prove_vacuum_compa
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 88});
 }
 
 TEST_CASE("prove_vacuum_compact__batched_file__rename_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1622,6 +2466,10 @@ TEST_CASE("prove_vacuum_compact__batched_file__rename_fails", "[prove_vacuum_com
     }
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1635,15 +2483,29 @@ TEST_CASE("prove_vacuum_compact__batched_file__rename_fails", "[prove_vacuum_com
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 88});
 }
 
 TEST_CASE("prove_vacuum_compact__batched_file__unlink_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1656,6 +2518,10 @@ TEST_CASE("prove_vacuum_compact__batched_file__unlink_fails", "[prove_vacuum_com
     }
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1671,15 +2537,29 @@ TEST_CASE("prove_vacuum_compact__batched_file__unlink_fails", "[prove_vacuum_com
     }
 
     assert_vacuum_success(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 88});
 }
 
 TEST_CASE("prove_vacuum_compact__batched_file__post_rename", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   std::vector<std::filesystem::path> orphans;
   {
@@ -1693,6 +2573,10 @@ TEST_CASE("prove_vacuum_compact__batched_file__post_rename", "[prove_vacuum_comp
     }
     // Delete ['k1'] to create dead entries in file_0.
     (void)db.del({.sync = false}, to_bytes("k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1706,18 +2590,32 @@ TEST_CASE("prove_vacuum_compact__batched_file__post_rename", "[prove_vacuum_comp
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
     orphans = unreferenced_data_files(db, dir);
     REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
   CHECK_FALSE(std::filesystem::exists(orphans.front()));
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 88});
 }
 
 TEST_CASE("prove_vacuum_compact__range_tombstone_file__success", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1727,6 +2625,10 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__success", "[prove_vacuum_
     // Range tombstone inside the file being compacted: it deletes ['k1'],
     // and compaction has to carry it across even though it is not key data.
     db.del_range({.sync = false}, to_bytes("k1"), to_bytes("k2"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1734,15 +2636,29 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__success", "[prove_vacuum_
     REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
 
     assert_vacuum_success(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 73});
 }
 
 TEST_CASE("prove_vacuum_compact__range_tombstone_file__tmp_create_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1752,6 +2668,10 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__tmp_create_fails", "[prov
     // Range tombstone inside the file being compacted: it deletes ['k1'],
     // and compaction has to carry it across even though it is not key data.
     db.del_range({.sync = false}, to_bytes("k1"), to_bytes("k2"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1762,15 +2682,29 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__tmp_create_fails", "[prov
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 73});
 }
 
 TEST_CASE("prove_vacuum_compact__range_tombstone_file__append_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1780,6 +2714,10 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__append_fails", "[prove_va
     // Range tombstone inside the file being compacted: it deletes ['k1'],
     // and compaction has to carry it across even though it is not key data.
     db.del_range({.sync = false}, to_bytes("k1"), to_bytes("k2"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1790,15 +2728,29 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__append_fails", "[prove_va
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 73});
 }
 
 TEST_CASE("prove_vacuum_compact__range_tombstone_file__sync_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1808,6 +2760,10 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__sync_fails", "[prove_vacu
     // Range tombstone inside the file being compacted: it deletes ['k1'],
     // and compaction has to carry it across even though it is not key data.
     db.del_range({.sync = false}, to_bytes("k1"), to_bytes("k2"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1818,15 +2774,29 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__sync_fails", "[prove_vacu
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 73});
 }
 
 TEST_CASE("prove_vacuum_compact__range_tombstone_file__rename_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1836,6 +2806,10 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__rename_fails", "[prove_va
     // Range tombstone inside the file being compacted: it deletes ['k1'],
     // and compaction has to carry it across even though it is not key data.
     db.del_range({.sync = false}, to_bytes("k1"), to_bytes("k2"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1849,15 +2823,29 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__rename_fails", "[prove_va
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 73});
 }
 
 TEST_CASE("prove_vacuum_compact__range_tombstone_file__unlink_fails", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
@@ -1867,6 +2855,10 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__unlink_fails", "[prove_va
     // Range tombstone inside the file being compacted: it deletes ['k1'],
     // and compaction has to carry it across even though it is not key data.
     db.del_range({.sync = false}, to_bytes("k1"), to_bytes("k2"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1882,15 +2874,29 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__unlink_fails", "[prove_va
     }
 
     assert_vacuum_success(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 73});
 }
 
 TEST_CASE("prove_vacuum_compact__range_tombstone_file__post_rename", "[prove_vacuum_compact]") {
   TempDir td;
   auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
   std::vector<std::filesystem::path> orphans;
   {
@@ -1901,6 +2907,10 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__post_rename", "[prove_vac
     // Range tombstone inside the file being compacted: it deletes ['k1'],
     // and compaction has to carry it across even though it is not key data.
     db.del_range({.sync = false}, to_bytes("k1"), to_bytes("k2"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
 
     before = capture_vacuum_baseline(db);
     auto vacuumed_file_id = find_vacuum_target(db);
@@ -1914,11 +2924,563 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__post_rename", "[prove_vac
     }
 
     assert_vacuum_no_change(db, before, vacuumed_file_id);
-    CHECK_FALSE(db.is_degraded());
+    CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
     orphans = unreferenced_data_files(db, dir);
     REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
   }
+  assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
   CHECK_FALSE(std::filesystem::exists(orphans.front()));
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = 0,
+       .watermark = watermark},
+      {.max_file_bytes = 73});
+}
+
+TEST_CASE("prove_vacuum_compact__unsynced_overwrite__success", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
+    // Overwrite ['k1'] without a sync (#245):
+    // the sealed file's entries are dead only by writes a power cut
+    // can lose.
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("n1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+
+    assert_vacuum_success(db, before, vacuumed_file_id);
+    CHECK(db.is_degraded() == false);
+    CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = before.keys.next_seq - 1,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
+}
+
+TEST_CASE("prove_vacuum_compact__unsynced_overwrite__tmp_create_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
+    // Overwrite ['k1'] without a sync (#245):
+    // the sealed file's entries are dead only by writes a power cut
+    // can lose.
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("n1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_tmp_create"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK(db.is_degraded() == false);
+    CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = before.keys.next_seq - 1,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
+}
+
+TEST_CASE("prove_vacuum_compact__unsynced_overwrite__append_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
+    // Overwrite ['k1'] without a sync (#245):
+    // the sealed file's entries are dead only by writes a power cut
+    // can lose.
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("n1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK(db.is_degraded() == false);
+    CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = before.keys.next_seq - 1,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
+}
+
+TEST_CASE("prove_vacuum_compact__unsynced_overwrite__sync_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
+    // Overwrite ['k1'] without a sync (#245):
+    // the sealed file's entries are dead only by writes a power cut
+    // can lose.
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("n1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK(db.is_degraded() == false);
+    CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = before.keys.next_seq - 1,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
+}
+
+TEST_CASE("prove_vacuum_compact__unsynced_overwrite__rename_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
+    // Overwrite ['k1'] without a sync (#245):
+    // the sealed file's entries are dead only by writes a power cut
+    // can lose.
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("n1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+    // VC4: fails just before the rename — the copy is synced and
+    // shrunk under .data.tmp and vacuum_commit never ran. Old file
+    // remains in state, and vacuum removes the staging copy (#235).
+      bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_rename"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK(db.is_degraded() == false);
+    CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = before.keys.next_seq - 1,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
+}
+
+TEST_CASE("prove_vacuum_compact__unsynced_overwrite__unlink_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
+    // Overwrite ['k1'] without a sync (#245):
+    // the sealed file's entries are dead only by writes a power cut
+    // can lose.
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("n1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+    // VC5: committed, source not unlinked — the kill inside vacuum's
+    // publish window. In-memory outcome is success; on disk the source
+    // and its compacted copy both exist with the same entries under
+    // the same sequences. Recovery deletes the copy, undoing the
+    // vacuum; assert_vacuum_recoverable proves the directory opens.
+      bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_unlink"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_success(db, before, vacuumed_file_id);
+    CHECK(db.is_degraded() == false);
+    CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = before.keys.next_seq - 1,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
+}
+
+TEST_CASE("prove_vacuum_compact__unsynced_overwrite__post_rename", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
+  bytecask::testing::VacuumBaseline before;
+  std::vector<std::filesystem::path> orphans;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
+    // Overwrite ['k1'] without a sync (#245):
+    // the sealed file's entries are dead only by writes a power cut
+    // can lose.
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("n1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+    // VC6: renamed, not committed (#104 M3) — the compacted copy is on
+    // disk under its final name and the published state does not
+    // reference it. The next open must detect it and delete it.
+      bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_post_rename"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK(db.is_degraded() == false);
+    CHECK(staging_data_files(dir).empty());
+    orphans = unreferenced_data_files(db, dir);
+    REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
+  CHECK_FALSE(std::filesystem::exists(orphans.front()));
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = before.keys.next_seq - 1,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
+}
+
+TEST_CASE("prove_vacuum_compact__unsynced_overwrite__durability_sync_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
+    // Overwrite ['k1'] without a sync (#245):
+    // the sealed file's entries are dead only by writes a power cut
+    // can lose.
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("n1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+    // VC7: the fdatasync that makes the superseding sync = false writes
+    // durable fails (#261). The engine degrades and vacuum throws before
+    // committing; the old file stays.
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      fi.inj.fail_on_nth_match = 2;
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK(db.is_degraded() == true);
+    CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = before.keys.next_seq - 1,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
+}
+
+TEST_CASE("prove_vacuum_compact__unsynced_overwrite_whole_file__success", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
+    // Overwrite ['k0', 'k1'] without a sync (#245):
+    // the sealed file's entries are dead only by writes a power cut
+    // can lose.
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("n0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("n1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+
+    assert_vacuum_success(db, before, vacuumed_file_id);
+    CHECK(db.is_degraded() == false);
+    CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = before.keys.next_seq - 1,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
+}
+
+TEST_CASE("prove_vacuum_compact__unsynced_overwrite_whole_file__unlink_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
+    // Overwrite ['k0', 'k1'] without a sync (#245):
+    // the sealed file's entries are dead only by writes a power cut
+    // can lose.
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("n0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("n1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+    // VC5: committed, source not unlinked — the kill inside vacuum's
+    // publish window. In-memory outcome is success; on disk the source
+    // and its compacted copy both exist with the same entries under
+    // the same sequences. Recovery deletes the copy, undoing the
+    // vacuum; assert_vacuum_recoverable proves the directory opens.
+      bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_unlink"};
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_success(db, before, vacuumed_file_id);
+    CHECK(db.is_degraded() == false);
+    CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = before.keys.next_seq - 1,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
+}
+
+TEST_CASE("prove_vacuum_compact__unsynced_overwrite_whole_file__durability_sync_fails", "[prove_vacuum_compact]") {
+  TempDir td;
+  auto dir = td.path / "db";
+  bytecask::testing::ScopedPageCacheModel cache;
+  auto cut = td.path / "cut";
+  std::map<std::string, bytecask::Bytes> durable_before;
+  std::uint64_t watermark = 0;
+  bytecask::testing::VacuumBaseline before;
+  {
+    // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("v_k0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("v_k1"));
+    // The baseline a power cut cannot take: everything so far is
+    // durable before the state vacuum will judge the file by is made.
+    make_durable(db);
+    durable_before = key_values(db);
+    // Overwrite ['k0', 'k1'] without a sync (#245):
+    // the sealed file's entries are dead only by writes a power cut
+    // can lose.
+    db.put({.sync = false}, to_bytes("k0"), to_bytes("n0"));
+    db.put({.sync = false}, to_bytes("k1"), to_bytes("n1"));
+
+    before = capture_vacuum_baseline(db);
+    auto vacuumed_file_id = find_vacuum_target(db);
+
+    {
+    // VC7: the fdatasync that makes the superseding sync = false writes
+    // durable fails (#261). The engine degrades and vacuum throws before
+    // committing; the old file stays.
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      fi.inj.fail_on_nth_match = 1;
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
+    }
+
+    assert_vacuum_no_change(db, before, vacuumed_file_id);
+    CHECK(db.is_degraded() == true);
+    CHECK(staging_data_files(dir).empty());
+    watermark = durable_watermark(db);
+    cache.model.copy_device(dir, cut);  // power cut
+  }
+  assert_hints_durable(cache.model);
+  assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
+  assert_power_loss_outcome(
+      cut,
+      {.baseline = durable_before,
+       .after = before.keys.key_values,
+       .transition_last_seq = before.keys.next_seq - 1,
+       .watermark = watermark},
+      {.max_file_bytes = 50});
 }

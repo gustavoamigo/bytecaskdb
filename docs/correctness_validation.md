@@ -141,6 +141,7 @@ operation failed, not what the key bytes were.
 ```python
 class FailureClass(Enum):
     SUCCESS = "success"               # no failure — transition fully persisted
+    NOSYNC  = "success_nosync"        # no failure, sync = false — persisted in process; a power cut may take it whole
     A  = "before_any_io"              # conflict check fails — no I/O attempted
     B1 = "append_fails_nothing_written"   # writev returns -1
     B2 = "append_fails_partial_write"     # writev returns short, file tainted
@@ -221,6 +222,7 @@ healthy but fails on the next append. Degrading is the correct response;
 | Class | Transition persisted | key_dir changes | LSN advances | Throws | Degraded |
 |-------|---------------------|-----------------|--------------|--------|----------|
 | SUCCESS | Yes — fully | Yes — full delta | Yes | No | No |
+| NOSYNC | Yes — page cache only | Yes — full delta | Yes | No | No |
 | A | No — not attempted | No | No | No (returns false) | No |
 | B1 | No — indeterminate | No | Yes | Yes | Yes |
 | B2 | No — partial write | No | Yes | Yes | Yes |
@@ -384,12 +386,103 @@ to callers. Degrading forces `resume()` before further writes are accepted;
 
 ## Proof Test Generator
 
-### apply_batch — 1873 tests
+### Power-loss axis
 
-1873 generated Catch2 tests (`[prove]` tag) cover every valid
+Every cell in the apply_batch, vacuum_compact, group_commit and resume
+generators, and the plain successful stream cells of the replication
+generator, cut the power before the DB closes (#265). #245 — vacuum
+dropping a durable record that only a `sync = false` write superseded — got
+past every other layer here: the fault injector needs a syscall to fail, and
+#245 needs none; the recovery checks reopen a directory whose page cache is
+intact; the crash harness SIGKILLs, and the page cache survives that too.
+Only the chaos rig cuts power, and it found the bug by chance. The one place
+a `sync = false` write can actually be lost in-process is the page cache
+model, so the generators now cut there.
+
+Each cell runs under `ScopedPageCacheModel`. Before the DB's destructor
+would sync and hint everything, `PageCacheModel::copy_device(dir, cut)`
+copies the directory the way the crash harness copies a killed one, then
+overlays every page the model still holds an image of — a page written but
+not synced, or one a failed `fdatasync` left clean and off the device —
+with the device's bytes, looked up by the source file's inode. The live
+engine is untouched: it goes on to its close, and the existing recovery
+checks run on the original directory as before. A restore in place would
+break both — the close would hint data the restore just zeroed, and under
+`mmap` the active file is mapped `MAP_SHARED` — which is why the earlier
+`restore_device` is now for closed directories only.
+
+What the copy may recover to is decided by the crash harness's watermark
+rule, applied where writes can actually be lost. A cell's setup writes with
+`sync = false`, so it ends with an empty `apply_batch({.sync = true},
+WritePlan{})` (`make_durable`), which flushes everything written so far. The
+baseline is then durable, and the recovered copy must hold the baseline
+alone, or the baseline and the whole transition; a partial transition fails
+either way (`assert_power_loss_outcome`). The transition is required when the
+durable watermark covers it — `durable_sequence()` at the cut, which must
+itself cover any `CommitResult` that reported `durable` — and when the
+recovered engine's `durable_sequence()` covers it: an engine that claims a
+sequence durable must hold what it wrote. Recovered `durable_sequence()`
+must reach the in-process watermark. The new NOSYNC class (a `sync = false`
+transition with no fault) is what makes the "baseline alone" arm
+non-vacuous, and the `rotation_threshold` shapes cut it after the rotation
+that syncs it.
+
+Cells that degrade end with `resume()`, which claims durable everything it
+publishes: it rewrites and syncs the active file before it trusts a byte of
+it (#240). The cut copy must therefore agree with the resumed engine
+exactly, and it is checked with the same `assert_matches_recovery` the
+closed directory is. Removing the rewrite fails every F and G cell in
+`[prove]` and `[prove_resume]`, and the F and G group cells: `resume()`
+publishes pages a failed sync left clean but off the device, the cut loses
+them, and a key at or below the watermark is gone. That is a power-loss-only
+bug of a different class than #245, and the axis catches it without a cell
+written for it.
+
+Hint files are not modelled, and do not need to be: a hint is a rebuildable
+index, so a lost or torn one costs recovery time and a damaged one is
+rebuilt from its data file (`[prove_recovery]`). What would cost keys is a
+hint that indexes data the device does not hold. The engine keeps that by
+ordering — rotation seals through `shrink_to_fit` (`ftruncate` +
+`fdatasync`) before the hint is dispatched, vacuum syncs its copy before the
+rename, and open rewrites and syncs a hint-less file before hinting it — and
+the model now checks the ordering: `hint_written`, called as every hint's
+trailer is written, records a violation if a page of that hint's data file
+has an image that differs from its current bytes, and every cell asserts
+there were none (`assert_hints_durable`). The check runs on the background
+hint worker too, where no test assertion could. A page whose image equals
+its current bytes is not a violation: the device holds them either way.
+That case is real and CI found it on its disk-backed runners, where hint
+`fdatasync`s are slow enough to expose it: a commit sync that fails right
+after a rotation degrades the engine against the pre-rotation state, so
+`resume()` rewrites a file the rotation has already sealed, synced and
+handed to the hint worker, and the hint's trailer can land while the
+rewrite has the pages dirty with the same bytes.
+
+Directory operations are not modelled: a `rename`, `unlink` or `create`
+survives the cut whether or not an `io_dir_sync_*` covered it, so a missing
+directory sync on a SUCCESS path is still out of reach of the axis. The
+`[dir_sync]` tests fail each existing sync and check the ordering (#199);
+modelling the operations is #266.
+
+Cost: a copy and a reopen per cell, plus one `fdatasync` for the durable
+baseline. On the dev machine with `/tmp` on tmpfs, release build:
+
+| Suite | Cells before → after | Wall before → after |
+|---|---:|---:|
+| `[prove]` | 1873 → 2082 | 3.1 s → 6.7 s |
+| `[prove_vacuum_compact]` | 56 → 67 | 0.27 s → 0.51 s |
+| `[prove_group]` | 22 → 22 | 0.03 s → 0.07 s |
+| `[prove_repl]` | 178 → 178 | 0.68 s → 0.68 s |
+| `[prove_resume]` | 64 → 64 | 0.11 s → 0.19 s |
+
+The `fdatasync` per cell is what will show on CI's disk-backed runners.
+
+### apply_batch — 2082 tests
+
+2082 generated Catch2 tests (`[prove]` tag) cover every valid
 (StateShape, PlanShape, FailureClass, Observer) combination for
 `apply_batch`. The scenario matrix is 11 state shapes × 20 plan shapes ×
-9 failure classes; 4 elimination rules reduce this to 1313 observer-free
+10 failure classes; 4 elimination rules reduce this to 1522 observer-free
 cells, and the observer axis adds 560 more.
 
 #### State shapes
@@ -605,9 +698,12 @@ Four rules filter invalid (state, plan, failure) combinations:
 3. **Conflicting plan only valid for class A** — a plan that fails preconditions never reaches the I/O path.
 4. **Classes G and H require `rotation_threshold` state** — rotation only occurs when the active file crosses the size threshold.
 
+NOSYNC carries no observer: it does to a lent view exactly what SUCCESS
+does, and exists for the power cut.
+
 Each test follows the same structure:
-1. Set up initial DB state from `StateShape`
-2. Capture baseline
+1. Set up initial DB state from `StateShape`, under `ScopedPageCacheModel`
+2. `make_durable(db)`, then capture baseline
 3. Construct `WritePlan` from `PlanShape`
 4. Inject fault per `FaultConfig`
 5. Execute `apply_batch`
@@ -616,13 +712,21 @@ Each test follows the same structure:
    and degraded state.
    For degraded cases, `assert_resumable(db)` is called immediately after
    to verify that `resume()` restores consistent state in-process.
-7. `assert_recoverable(dir, before, expected)` — validates persistence
+7. `copy_device(dir, cut)` — the power cut, before the DB closes
+8. `assert_recoverable(dir, before, expected)` — validates persistence
    invariant via fresh recovery (where applicable)
+9. `assert_power_loss_outcome(cut, ...)` — the cut copy holds the durable
+   baseline, alone or with the whole transition; for degraded cells,
+   `assert_matches_recovery(cut, fp)` instead (see *Power-loss axis*)
 
 ### resume() — 64 tests
 
 64 generated Catch2 tests (`[prove_resume]` tag) cover every valid
-(DegradeShape, ResumeFailureClass) combination.
+(DegradeShape, ResumeFailureClass) combination. Every cell also cuts the
+power after the final `resume()` and checks the cut copy against the resumed
+engine's fingerprint (*Power-loss axis*): `resume()` claims durable what it
+publishes, and the F and G shapes are where that claim rests on the rewrite
+from #240.
 
 Twelve degrade shapes establish a degraded DB before resume is called:
 
@@ -733,10 +837,11 @@ fault points.
 
 This directly proves: *resume always eventually recovers once the underlying fault clears.*
 
-### vacuum_compact — 56 tests
+### vacuum_compact — 67 tests
 
-56 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover eight state
-shapes × seven failure classes (SUCCESS, VC1–VC6).
+67 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover ten state
+shapes × eight failure classes (SUCCESS, VC1–VC7), less the combinations
+a shape cannot reach (below).
 
 State shapes create a DB with exactly one sealed file having fragmentation > 0:
 
@@ -755,6 +860,17 @@ State shapes create a DB with exactly one sealed file having fragmentation > 0:
   batch and the delete that fragments it lands in the next file.
 - **range_tombstone_file** — the sealed file holds a range tombstone
   (25 + 25 for the puts, 23 for the `RangeDel`, so `max_file_bytes = 73`).
+- **unsynced_overwrite** — #245's shape: the sealed file's dead entry is
+  superseded only by a `sync = false` write. Two 25-byte puts fill
+  `max_file_bytes = 50` and seal file_0; `k1` is then overwritten with a
+  2-byte value, a 23-byte entry that stays under the limit, so no rotation
+  syncs it and only vacuum can. The other shapes make their dead entries
+  with deletes, which hide this class of bug: a lost delete and a dropped
+  Put leave the state the history ends in anyway.
+- **unsynced_overwrite_whole_file** — both keys overwritten the same way.
+  No live entry and no tombstone, so vacuum drops the file whole through
+  `vacuum_remove_file`, with no staging copy: the other path through
+  `vacuum_commit`, and the one #245 was found on.
 
 The last two exist for an invariant no key-and-value assertion can see:
 batch markers and range tombstones are not key data, so a compaction
@@ -773,7 +889,26 @@ sealed file.
 Failure classes: SUCCESS, VC1 (`io_vacuum_compact_tmp_create`),
 VC2 (`io_data_file_append`), VC3 (`io_data_file_sync`),
 VC4 (`io_vacuum_compact_rename`), VC5 (`io_vacuum_compact_unlink`),
-VC6 (`io_vacuum_compact_post_rename`).
+VC6 (`io_vacuum_compact_post_rename`), VC7 (`io_data_file_sync` again,
+at the `fdatasync` `vacuum_commit` issues before dropping records that only
+`sync = false` writes supersede, #261 — the second checkpoint of that name
+on the compaction path, after the staging copy's, and the first on the
+whole-file path, which writes no copy).
+
+VC7 applies only to the two `unsynced_overwrite` shapes: with the deletes
+made durable by `make_durable`, `vacuum_commit` has nothing to sync in the
+others. The whole-file shape reaches only SUCCESS, VC5 and VC7: it makes
+none of the calls VC1–VC4 and VC6 fault. Under VC7 the engine degrades and
+vacuum throws before committing, so the old file stays
+(`assert_vacuum_no_change`, `is_degraded() == true`).
+
+Every cell then cuts the power (*Power-loss axis*). The durable baseline is
+the sealed file and every delete; the overwrites are the transition. After
+SUCCESS they are required in the recovered copy — vacuum made them durable
+before it dropped what they superseded — and after VC7 either outcome is
+allowed. Reverting #261's sync fails both SUCCESS cells with a key gone
+from the copy: the old value dropped, the new one lost, a state no prefix
+of the history produces.
 
 VC4 fails at the last step before the rename: the tmp file is fully
 synced and shrunk but `vacuum_commit` has not run — the old file is still
@@ -963,6 +1098,10 @@ So it is recorded rather than engineered around.
 
 ### group_commit — 22 tests
 
+Every cell cuts the power before the DB closes and checks the cut copy
+against the engine's fingerprint (*Power-loss axis*): a synced group is
+durable, and a degraded one was resumed.
+
 22 generated Catch2 tests (`[prove_group]` + `[concurrency]` tags) cover
 six group shapes × the failure classes valid for each. Every other matrix
 in this framework drives one thread; these are the cells where group
@@ -1032,6 +1171,14 @@ found no engine bug; what they add is that the mechanism is now covered
 at all, and the record of who performs which call.
 
 ### prove_replication — 211 tests
+
+The eleven `full_stream` SUCCESS cells cut the power twice (*Power-loss
+axis*): the leader once the stream is collected, so every streamed entry
+must survive its loss — invariant 8 proven on the device rather than on
+the return value, since `ingest` syncs and a follower cut mostly re-proves
+the write path — and the follower once it has ingested, so everything it
+acknowledged must (`assert_stream_survives_power_loss`,
+`assert_replication_recovery` on the copy).
 
 211 generated Catch2 tests (`[prove_repl]` + `[prove_manifest]` tags) cover
 the replication pipeline: 178 ingest tests covering (StateShape × OpsShape ×
@@ -1181,9 +1328,9 @@ write on new leader → backward sync → verify convergence).
 
 | File | Role |
 |------|------|
-| `scenario_matrix.py` | CompactStateShape (low_fragmentation, mostly_dead, batched_file, range_tombstone_file), VacuumCompactFailureClass |
-| `fault_point_resolver.py` | Maps failure class → fault checkpoint name |
-| `expected_delta.py` | Reference model: threw/file_removed outcome |
+| `scenario_matrix.py` | CompactStateShape (low_fragmentation, mostly_dead, batched_file, range_tombstone_file, unsynced_overwrite, unsynced_overwrite_whole_file), VacuumCompactFailureClass (SUCCESS, VC1–VC7), validity filter |
+| `fault_point_resolver.py` | Maps (state, failure class) → fault checkpoint name and which occurrence of it |
+| `expected_delta.py` | Reference model: threw/file_removed/degraded outcome |
 | `generate_tests.py` | Generates `prove_vacuum_compact.cpp` |
 
 **replication module** (`tests/proof/replication/`):
@@ -1199,7 +1346,7 @@ write on new leader → backward sync → verify convergence).
 
 | File | Role |
 |------|------|
-| [`invariants.h`](../tests/proof/invariants.h) | `capture_baseline`, `assert_consistent`, `assert_delta`, `assert_recoverable`, `assert_resumable`, `assert_keys_recoverable`, `VacuumBaseline`, `capture_vacuum_baseline`, `find_vacuum_target`, `count_structural_entries`, `assert_structural_entries_preserved`, `assert_vacuum_success`, `assert_vacuum_no_change`, `assert_vacuum_recoverable`, `OwnedEntries`, `collect_changes`, `ReplicationBaseline`, `capture_replication_baseline`, `assert_replication_match`, `assert_replication_no_change`, `assert_replication_recovery`, `assert_durable_boundary` |
+| [`invariants.h`](../tests/proof/invariants.h) | `capture_baseline`, `assert_consistent`, `assert_delta`, `assert_recoverable`, `assert_resumable`, `assert_keys_recoverable`, `VacuumBaseline`, `capture_vacuum_baseline`, `find_vacuum_target`, `count_structural_entries`, `assert_structural_entries_preserved`, `assert_vacuum_success`, `assert_vacuum_no_change`, `assert_vacuum_recoverable`, `OwnedEntries`, `collect_changes`, `ReplicationBaseline`, `capture_replication_baseline`, `assert_replication_match`, `assert_replication_no_change`, `assert_replication_recovery`, `assert_durable_boundary`, `make_durable`, `durable_watermark`, `apply_delta`, `assert_power_loss_outcome`, `assert_hints_durable`, `assert_stream_survives_power_loss` |
 
 ### Fault injection modes
 
@@ -1207,6 +1354,10 @@ The four `ScopedFaultInjector` modes map failure classes to the four
 I/O checkpoints:
 
 - **Name-based** — targets a single checkpoint. Used for B1, F, G, H.
+  `fail_on_nth_match` picks a later occurrence of the name when one
+  operation passes the same checkpoint twice: VC7 fails the second
+  `io_data_file_sync` of a compaction, the active file's, not the first,
+  the staging copy's.
 - **Count-based** — fails from checkpoint N onward, cascading. Used for C.
 - **Post-write mode** — fires at `io_data_file_append_partial` with
   `short_write` or `throw_after`. Used for B2, B3.
@@ -1295,14 +1446,30 @@ I/O checkpoints:
   disk and verifies replication survived recovery.
 - `assert_durable_boundary(range, durable_seq)` — verifies no entry in
   a `changes_since` stream has `sequence > durable_seq`.
+- `make_durable(db)` — an empty sync batch, so everything a cell's setup
+  wrote with `sync = false` is durable before the baseline is captured;
+  requires `durable_sequence()` to reach every sequence assigned.
+- `durable_watermark(db, cr)` — `durable_sequence()` at the cut, checked to
+  cover a `CommitResult` that reported durable.
+- `apply_delta(baseline, expected)` — the baseline with the whole transition
+  applied, as the reference model describes it.
+- `assert_power_loss_outcome(cut, expectation)` — recovers the copy a
+  power cut left and checks it holds the durable baseline alone or with the
+  whole transition, the transition when the watermark or the recovered
+  `durable_sequence()` covers it, and `assert_consistent`.
+- `assert_hints_durable(model)` — no hint written in the cell indexed a page
+  the device did not hold (`PageCacheModel::hint_written`).
+- `assert_stream_survives_power_loss(leader_cut, streamed)` — the leader's
+  cut copy holds every entry `changes_since` streamed, and its
+  `durable_sequence()` reaches the stream's.
 
 12 test cases (`[invariants]` tag) in `tests/invariants_test.cpp`
 smoke-test the helpers themselves.
 
 ### Test coverage
 
-All nine failure classes for `apply_batch` (SUCCESS, A, B1, B2, B3, C,
-F, G, H) are covered by the 1873 `[prove]` tests. Each class is exercised
+All ten failure classes for `apply_batch` (SUCCESS, NOSYNC, A, B1, B2, B3,
+C, F, G, H) are covered by the 2082 `[prove]` tests. Each class is exercised
 across all valid (StateShape, PlanShape) combinations, with and without
 back-end, and — for every class that can disturb a lent view — against
 each of the five observers.
@@ -1315,8 +1482,9 @@ degrade_F, degrade_G, degrade_F_range and degrade_F_batch shapes (no
 orphaned bytes to truncate — fault point unreachable), and R2/CASCADE for
 degrade_H (file already sealed).
 
-All seven vacuum_compact classes (SUCCESS, VC1–VC6) across all eight state
-shapes are covered by the 56 `[prove_vacuum_compact]` tests.
+All eight vacuum_compact classes (SUCCESS, VC1–VC7) across all ten state
+shapes, less the combinations a shape cannot reach, are covered by the 67
+`[prove_vacuum_compact]` tests.
 
 All seven ingest failure classes across 11 state shapes and 5 ops shapes
 are covered by the 178 `[prove_repl]` tests. All three manifest failure
@@ -1528,7 +1696,12 @@ those losses but does not fail on them, because the contract promises only
 catch cannot be caught by it: removing the sync before degrading (B1–B3)
 changes nothing when no write fails, and writing hints in place, without
 the temp-then-rename, leaves a torn hint that fails its CRC and is rebuilt
-from its data file. Both need power loss, which the chaos rig below models.
+from its data file. Both need power loss. The chaos rig below models it
+out of process, on a FUSE filesystem; the generators' *Power-loss axis* cuts
+it in process, over `PageCacheModel`, applying this harness's watermark rule
+to a directory whose unsynced pages are really gone. What that model leaves
+out — `fdatasync` as a barrier, the hint worker's timing, directory
+operations (#266) — is the chaos rig's.
 
 What it did catch: #166, `vacuum()` dropping a file with
 `live_bytes == 0` along with its tombstones, so an older `Put` came back on
@@ -1950,7 +2123,13 @@ control:
   device image, an injected sync failure keeps the images, and the
   `[fsyncgate]` tests cut the power or evict the pages by writing them
   back, then check that `resume()` and `DB::open` published nothing the
-  device does not hold.
+  device does not hold. The proof generators cut the power under the same
+  model after every cell (*Power-loss axis*, #265), so a decision made
+  durable on state that is not — #245's class — is caught at the cell.
+  The model covers data file pages and checks the ordering hints depend
+  on; it does not model directory operations (a `rename` or `unlink`
+  survives the cut whether or not a directory sync covered it, #266), and
+  it takes `fdatasync` as a barrier and the hint worker's timing as given.
 - **Time bounds on close and open** — the failure classes are about what a
   failure does to data. A close or open that is correct but too slow for
   the supervisor holding the stopwatch damages nothing, so no class here

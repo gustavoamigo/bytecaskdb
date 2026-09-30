@@ -307,6 +307,7 @@ def gen_full_stream_test(
     failure: IngestFailureClass,
     delta: IngestDelta,
     config: FaultConfig,
+    power_loss: bool = False,
 ) -> str:
     """Generate a full_stream ingest test."""
     parts: List[str] = []
@@ -317,6 +318,9 @@ def gen_full_stream_test(
     parts.append("    auto snap = leader.snapshot();")
     parts.append("    auto owned = collect_changes(leader.changes_since(snap, stream_from));")
     parts.append("    auto views = owned.views();")
+    if power_loss:
+        # The stream is in the follower's hands; the leader now loses power.
+        parts.append("    cache.model.copy_device(leader_dir, leader_cut);  // leader loses power")
     parts.append("")
 
     # Follower setup.
@@ -349,6 +353,8 @@ def gen_full_stream_test(
     # Assertions.
     if delta.keys_match:
         parts.append(gen_assertions_success(state))
+        if power_loss:
+            parts.append("      cache.model.copy_device(follower_dir, follower_cut);  // follower loses power")
     else:
         parts.append(gen_assertions_failure(delta))
 
@@ -693,17 +699,29 @@ def gen_ingest_test(
     config = resolve_ingest_fault(failure, ops)
     name = f"prove_repl__{state.label}__{ops.value}__{failure.value}"
 
+    # Power loss (#265), on the plain successful stream: the leader is cut
+    # once the stream is collected, the follower once it has ingested it.
+    power_loss = (
+        ops == OpsShape.FULL_STREAM and failure == IngestFailureClass.SUCCESS
+    )
+
     parts: List[str] = []
     parts.append(f'TEST_CASE("{name}", "[prove_repl]") {{')
     parts.append("  TempDir td;")
     parts.append('  auto leader_dir = td.path / "leader";')
     parts.append('  auto follower_dir = td.path / "follower";')
+    if power_loss:
+        parts.append("  bytecask::testing::ScopedPageCacheModel cache;")
+        parts.append('  auto leader_cut = td.path / "leader_cut";')
+        parts.append('  auto follower_cut = td.path / "follower_cut";')
     # leader_bl declared outside scope so recovery check can use it.
     parts.append("  bytecask::testing::ReplicationBaseline leader_bl;")
     parts.append("  {")
 
     if ops == OpsShape.FULL_STREAM:
-        parts.append(gen_full_stream_test(state, failure, delta, config))
+        parts.append(
+            gen_full_stream_test(state, failure, delta, config, power_loss)
+        )
     elif ops == OpsShape.INCREMENTAL:
         parts.append(gen_incremental_test(state, failure, delta, config))
     elif ops == OpsShape.RESTART_MIDSTREAM:
@@ -719,6 +737,21 @@ def gen_ingest_test(
 
     # Recovery check (outside inner scope so DBs are closed).
     parts.append(gen_recovery_check(delta, failure))
+
+    if power_loss:
+        leader_opts = (
+            f", {{.max_file_bytes = {state.max_file_bytes}}}"
+            if state.max_file_bytes is not None
+            else ""
+        )
+        parts.append("    assert_hints_durable(cache.model);")
+        parts.append("    // Invariant 8 on the device: the leader keeps every entry it")
+        parts.append("    // streamed; ingest syncs, so the follower keeps everything it")
+        parts.append("    // acknowledged.")
+        parts.append(
+            f"    assert_stream_survives_power_loss(leader_cut, leader_bl{leader_opts});"
+        )
+        parts.append("    assert_replication_recovery(follower_cut, leader_bl);")
 
     parts.append("}")
     return "\n".join(parts)
@@ -802,7 +835,10 @@ FILE_HEADER = """\
 // Correctness proof tests for replication primitives. Each test exercises
 // one (StateShape, OpsShape, IngestFailureClass) or
 // (StateShape, ManifestFailureClass) combination from the scenario matrix,
-// validates invariants, and verifies recovery where applicable.
+// validates invariants, and verifies recovery where applicable. The plain
+// successful stream cells also cut the power (#265): the leader once the
+// stream is collected, so every streamed entry must survive it, and the
+// follower once it has ingested, so everything it acknowledged must.
 
 #include <system_error>
 
@@ -818,7 +854,9 @@ import bytecask;
 namespace {
 
 using bytecask::testing::assert_consistent;
+using bytecask::testing::assert_hints_durable;
 using bytecask::testing::assert_replication_match;
+using bytecask::testing::assert_stream_survives_power_loss;
 using bytecask::testing::assert_replication_no_change;
 using bytecask::testing::assert_replication_recovery;
 using bytecask::testing::assert_resumable;

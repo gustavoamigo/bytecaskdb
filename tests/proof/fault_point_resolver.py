@@ -42,6 +42,9 @@ def resolve_fault(
     if failure in (FailureClass.SUCCESS, FailureClass.A):
         return FaultConfig()
 
+    if failure == FailureClass.NOSYNC:
+        return FaultConfig(use_sync_false=True)
+
     if failure == FailureClass.B1:
         return FaultConfig(name="io_data_file_append")
 

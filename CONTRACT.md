@@ -605,6 +605,16 @@ Specifically:
   deduplication — cross-file conflict resolution happens during
   recovery.
 
+### Ordering
+
+A hint indexes only bytes the device holds. Its data file is `fdatasync`ed
+before the hint is written — at rotation, before the sealed file is handed
+to the hint worker; at vacuum, before the compacted copy is renamed; at
+open, by rewriting and syncing a hint-less file before scanning it — so a
+power loss can lose a hint, never leave one pointing into bytes that are
+gone. `PageCacheModel::hint_written` checks this at every hint the tests
+write.
+
 ### Atomicity
 
 Hint files must be written atomically via a temp-then-rename protocol.

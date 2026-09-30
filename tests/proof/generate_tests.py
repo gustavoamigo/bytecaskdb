@@ -281,14 +281,14 @@ def gen_execute(
         )
     if plan.is_conflicting:
         return (
-            f"      REQUIRE_FALSE(\n"
-            f"          db.apply_batch({{.sync = {sync_val}{solo_part}}},\n"
-            f"                            std::move(plan)));"
+            f"      cr = db.apply_batch({{.sync = {sync_val}{solo_part}}},\n"
+            f"                          std::move(plan));\n"
+            f"      REQUIRE_FALSE(cr);"
         )
     return (
-        f"      REQUIRE(\n"
-        f"          db.apply_batch({{.sync = {sync_val}{solo_part}}},\n"
-        f"                            std::move(plan)));"
+        f"      cr = db.apply_batch({{.sync = {sync_val}{solo_part}}},\n"
+        f"                          std::move(plan));\n"
+        f"      REQUIRE(cr);"
     )
 
 
@@ -347,10 +347,18 @@ def gen_test(
     parts.append(f'TEST_CASE("{name}", "[prove]") {{')
     parts.append("  TempDir td;")
     parts.append('  auto dir = td.path / "db";')
+    # Power loss (#265): the cell runs under the page cache model, and the
+    # directory is copied as the device holds it before ~DB syncs it.
+    parts.append("  bytecask::testing::ScopedPageCacheModel cache;")
+    parts.append('  auto cut = td.path / "cut";')
     parts.append(f"  auto expected = {gen_delta_literal(delta)};")
     parts.append("  Baseline before;")
+    if not delta.threw:
+        parts.append("  std::optional<bytecask::CommitResult> cr;")
     if delta.degraded:
         parts.append("  bytecask::testing::EngineFingerprint fp;")
+    else:
+        parts.append("  std::uint64_t watermark = 0;")
     parts.append("  {")
 
     # Setup
@@ -363,6 +371,8 @@ def gen_test(
         parts.append(pre)
         parts.append("")
 
+    # The baseline is durable, so a power cut can take only the transition.
+    parts.append("    make_durable(db);")
     parts.append("    before = capture_baseline(db);")
     parts.append("")
 
@@ -407,7 +417,11 @@ def gen_test(
         verify_after_resume = gen_observer_verify(observer, "after resume()")
         if verify_after_resume:
             parts.append(verify_after_resume)
+    else:
+        parts.append("    watermark = durable_watermark(db, cr);")
+    parts.append("    cache.model.copy_device(dir, cut);  // power cut")
     parts.append("  }")
+    parts.append("  assert_hints_durable(cache.model);")
 
     # Recovery
     if should_check_recovery(delta, failure):
@@ -431,16 +445,28 @@ def gen_test(
             parts.append(
                 "  // Recovery skipped: degraded state with unpersisted transition."
             )
+    opts = _build_open_opts(state)
+    opts_arg = f", {{{opts}}}" if opts else ""
     if delta.degraded:
-        opts = _build_open_opts(state)
         parts.append(
             "  // resume() and a cold open read the same bytes and must"
         )
         parts.append("  // reconstruct the same engine.")
-        if opts:
-            parts.append(f"  assert_matches_recovery(dir, fp, {{{opts}}});")
-        else:
-            parts.append("  assert_matches_recovery(dir, fp);")
+        parts.append(f"  assert_matches_recovery(dir, fp{opts_arg});")
+        # resume() claims durable everything it published, so the copy the
+        # cut left must agree with it as well as the closed directory.
+        parts.append("  // ... and so must what the device held at the cut:")
+        parts.append("  // resume() made durable what it published.")
+        parts.append(f"  assert_matches_recovery(cut, fp{opts_arg});")
+    else:
+        # The cut copy holds the durable baseline, alone or with the whole
+        # transition; the transition is required once the watermark covers it.
+        parts.append("  assert_power_loss_outcome(")
+        parts.append("      cut,")
+        parts.append("      {.baseline = before.key_values,")
+        parts.append("       .after = apply_delta(before.key_values, expected),")
+        parts.append("       .transition_last_seq = cr ? cr->sequence : std::uint64_t{0},")
+        parts.append(f"       .watermark = watermark}}{opts_arg});")
 
     parts.append("}")
     if state.io_backend != "pread":
@@ -461,8 +487,14 @@ FILE_HEADER = """\
 // Correctness proof tests for apply_batch. Each test exercises one
 // (StateShape, PlanShape, FailureClass) combination from the scenario
 // matrix, validates the transition delta against the reference model,
-// and verifies recovery where applicable.
+// and verifies recovery where applicable. Every cell also cuts the power
+// before the DB closes (#265): the directory as the device holds it under
+// PageCacheModel is recovered, and must hold the durable baseline alone or
+// with the whole transition, and the transition once the durable watermark
+// covers it.
 
+#include <cstdint>
+#include <optional>
 #include <system_error>
 
 #ifdef BYTECASK_TESTING
@@ -476,9 +508,14 @@ import bytecask;
 
 namespace {
 
+using bytecask::testing::apply_delta;
 using bytecask::testing::assert_consistent;
 using bytecask::testing::assert_delta;
+using bytecask::testing::assert_hints_durable;
+using bytecask::testing::assert_power_loss_outcome;
 using bytecask::testing::assert_recoverable;
+using bytecask::testing::durable_watermark;
+using bytecask::testing::make_durable;
 using bytecask::testing::assert_matches_recovery;
 using bytecask::testing::assert_resumable;
 using bytecask::testing::fingerprint;

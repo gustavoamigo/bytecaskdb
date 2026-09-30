@@ -5,9 +5,18 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 
-from .scenario_matrix import VacuumCompactFailureClass
+from .scenario_matrix import CompactStateShape, VacuumCompactFailureClass
+
+
+@dataclass(frozen=True)
+class CompactFault:
+    name: str
+    # Which checkpoint of that name fails: 0 the first, N the Nth
+    # (FaultInjector::fail_on_nth_match).
+    nth: int = 0
 
 _COMPACT_FAULT_NAMES = {
     VacuumCompactFailureClass.VC1: "io_vacuum_compact_tmp_create",
@@ -19,6 +28,13 @@ _COMPACT_FAULT_NAMES = {
 }
 
 
-def resolve_compact_fault(failure: VacuumCompactFailureClass) -> Optional[str]:
-    """Returns the fault point name, or None for SUCCESS."""
-    return _COMPACT_FAULT_NAMES.get(failure)
+def resolve_compact_fault(
+    state: CompactStateShape, failure: VacuumCompactFailureClass
+) -> Optional[CompactFault]:
+    """Returns the fault to arm, or None for SUCCESS."""
+    if failure == VacuumCompactFailureClass.VC7:
+        # The compaction path syncs its staging copy first; the whole-file path
+        # writes none, so its first data file sync is the one.
+        return CompactFault("io_data_file_sync", nth=1 if state.whole_file else 2)
+    name = _COMPACT_FAULT_NAMES.get(failure)
+    return CompactFault(name) if name else None

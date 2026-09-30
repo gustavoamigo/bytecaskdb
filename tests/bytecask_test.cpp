@@ -6510,8 +6510,8 @@ TEST_CASE("close() makes unsynced writes durable and writes the active "
 // #245: vacuum judges a record dead by the key directory, which holds
 // sync=false writes no fdatasync has covered yet. Dropping the record is
 // durable once vacuum commits, so it must not go before what superseded it.
-// The power is cut with the DB still open — its close would sync — and the
-// device's view of the directory is copied out before ~DB runs.
+// The power is cut with the DB still open — its close would sync — so the
+// directory is copied as the device holds it (copy_device) before ~DB runs.
 TEST_CASE("vacuum does not drop a durable record that only an unsynced write "
           "supersedes",
           "[vacuum][fsyncgate]") {
@@ -6534,9 +6534,7 @@ TEST_CASE("vacuum does not drop a durable record that only an unsynced write "
         const auto last = db.put({.sync = false}, to_bytes("k1"), to_bytes("n1"));
         REQUIRE(db.durable_sequence() < last.sequence);
         REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
-        cache.model.restore_device(dir);  // power cut
-        std::filesystem::copy(dir, after_cut,
-                              std::filesystem::copy_options::recursive);
+        cache.model.copy_device(dir, after_cut);  // power cut
       }
       auto db = bytecask::DB::open(after_cut, opts);
       const auto k0 = get_str(db, to_bytes("k0"));
@@ -6578,9 +6576,7 @@ TEST_CASE("vacuum whose fdatasync fails degrades, keeps the source file, and "
     }
     CHECK(db.is_degraded());
     CHECK(data_files() == files_before);
-    cache.model.restore_device(dir);  // power cut
-    std::filesystem::copy(dir, after_cut,
-                          std::filesystem::copy_options::recursive);
+    cache.model.copy_device(dir, after_cut);  // power cut
   }
   auto db = bytecask::DB::open(after_cut, opts);
   CHECK(get_str(db, to_bytes("k0")) == "v_k0");

@@ -555,6 +555,8 @@ public:
     w.put(static_cast<std::uint32_t>(~crc_.finalize()));
 #ifdef BYTECASK_TESTING
     FAULT_INJECTION(io_hint_write);
+    // The data file this indexes must be durable first (PageCacheModel).
+    FAULT_HINT_WRITTEN(path_);
 #endif
     if (::write(write_fd_, trailer.data(), trailer.size()) !=
         std::ssize(trailer)) {
