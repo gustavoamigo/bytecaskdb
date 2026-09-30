@@ -1375,6 +1375,56 @@ TEST_CASE("DataFile: a read past the end of file reports a short read",
   std::filesystem::remove(path);
 }
 
+// A pread that fails is an I/O error, and stays one in testing builds, where
+// the read's diagnostic is added to the message: callers tell an I/O error
+// from corruption by the exception's type.
+TEST_CASE("DataFile::lend_record: a failed pread throws std::system_error",
+          "[data_file]") {
+  const bool sealed = GENERATE(false, true);
+  CAPTURE(sealed);
+  const auto dir = std::filesystem::temp_directory_path();
+  const auto path = dir / "bc_test_lend_io_error.data";
+  std::filesystem::remove(path);
+  auto writer = bytecask::createDataFileForWrite(
+      dir, "bc_test_lend_io_error", ".data", 1 << 20,
+      bytecask::IoBackend::Pread, nullptr, /*file_id=*/13);
+  (void)writer->append_entry(1, bytecask::EntryType::Put, to_bytes("a"),
+                             to_bytes("value"));
+  writer->sync();
+  if (sealed) writer->shrink_to_fit();
+  std::shared_ptr<bytecask::DataFile> file = writer;
+  if (sealed) {
+    writer.reset();
+    file.reset();
+    file = bytecask::openDataFileForRead(path, bytecask::IoBackend::Pread,
+                                         nullptr, 14);
+  }
+  // Cut the file under the open descriptor: the record's bytes are gone, and
+  // pread returns end of file where the file object expects the record.
+  std::filesystem::resize_file(path, 4);
+
+  std::vector<std::byte> io_buf;
+  bytecask::FrameLease lease;
+  try {
+    (void)file->lend_record(0, 0, false, io_buf, lease);
+    FAIL("the read of a cut record returned");
+  } catch (const std::system_error &e) {
+    const std::string what = e.what();
+    INFO(what);
+    CHECK(what.find("short read") != std::string::npos);
+#ifdef BYTECASK_TESTING
+    CHECK(what.find(sealed ? "[sealed fd " : "[writable fd ") !=
+          std::string::npos);
+    CHECK(what.find("reread now: short") != std::string::npos);
+#endif
+  }
+
+  lease.reset();
+  file.reset();
+  writer.reset();
+  std::filesystem::remove(path);
+}
+
 namespace {
 
 // A record placed so a buffer-pool frame boundary falls inside it: `before`

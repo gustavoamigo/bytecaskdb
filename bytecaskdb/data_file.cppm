@@ -303,12 +303,17 @@ auto diagnose_fd_read(int fd, const std::filesystem::path &path, Offset offset,
       reread = std::format("sequence {} key_size {} value_size {}", h.sequence,
                            h.key_size, h.value_size);
     }
-    throw std::runtime_error{std::format(
+    auto what = std::format(
         "{} [{} fd {} -> '{}', fd inode {} size {}, path inode {} size {}; "
         "reread now: {}]",
         e.what(), kind, fd, target, fd_ok ? by_fd.st_ino : 0,
         fd_ok ? by_fd.st_size : -1, path_ok ? by_path.st_ino : 0,
-        path_ok ? by_path.st_size : -1, reread)};
+        path_ok ? by_path.st_size : -1, reread);
+    // Keep the type: callers tell an I/O error from corruption by it, as
+    // they would in a build without this diagnostic.
+    if (const auto *se = dynamic_cast<const std::system_error *>(&e))
+      throw std::system_error{se->code(), what};
+    throw std::runtime_error{what};
   }
 }
 #endif

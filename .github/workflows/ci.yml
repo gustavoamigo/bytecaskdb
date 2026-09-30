@@ -57,9 +57,10 @@ jobs:
           xmake build radix_tree_memory_tests
           xmake build unordered_view_tests
           # Built here so a break shows up on the PR; they run in
-          # crash-nightly.yml and isolation-nightly.yml.
+          # crash-nightly.yml, isolation-nightly.yml and chaos-nightly.yml.
           xmake build crash_consistency
           xmake build isolation_history
+          xmake build chaos_worker
 
       - name: Run tests and generate JUnit reports
         run: |
@@ -70,6 +71,11 @@ jobs:
           build/linux/x86_64/release/radix_tree_memory_tests --reporter junit --out test-results/radix_tree_memory_tests.xml || status=1
           build/linux/x86_64/release/unordered_view_tests --reporter junit --out test-results/unordered_view_tests.xml || status=1
           exit "$status"
+
+      - name: Run chaosfs model tests
+        # The chaos rig's filesystem model, without FUSE; the rig itself runs
+        # in chaos-nightly.yml.
+        run: python3 -m unittest tests/chaos/test_chaosfs.py -v
 
       - name: Run proof independence tests (Hypothesis)
         run: |

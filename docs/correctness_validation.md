@@ -1528,8 +1528,7 @@ those losses but does not fail on them, because the contract promises only
 catch cannot be caught by it: removing the sync before degrading (B1–B3)
 changes nothing when no write fails, and writing hints in place, without
 the temp-then-rename, leaves a torn hint that fails its CRC and is rebuilt
-from its data file. Both need the power-loss follow-up (`dm-flakey`,
-`dm-log-writes`, or a FUSE layer that drops unsynced writes).
+from its data file. Both need power loss, which the chaos rig below models.
 
 What it did catch: #166, `vacuum()` dropping a file with
 `live_bytes == 0` along with its tombstones, so an older `Put` came back on
@@ -1701,6 +1700,56 @@ message buffer its copies share, under a reference count in the
 uninstrumented runtime, so TSan reports a read of it on one thread and
 its release on another as a race. The soak classifies exceptions by type
 and reads `what()` only when reporting a failure.
+
+### Chaos rig (power loss, I/O faults, resource limits)
+
+Every layer above ends a run with a SIGKILL, which keeps the page cache, or
+fails one syscall from inside the engine. The chaos rig
+(`tests/chaos/`, [`chaos_testing_design.md`](chaos_testing_design.md))
+runs the engine as a black box on a filesystem that can do anything POSIX
+and Linux allow: return `EIO` from reads, writes, `fdatasync` and metadata
+calls, run out of space, go read-only, write short, stall, and lose power.
+
+- `chaosfs.py` is an in-memory FUSE filesystem with a volatile and a durable
+  image per file and per directory. `fdatasync` copies dirty pages to the
+  durable image; a directory `fsync` makes its entry changes durable. A failed
+  `fdatasync` follows Linux: the pages are marked clean without reaching the
+  disk, the error is reported once, and reads keep returning the lost bytes
+  until an eviction. Power loss keeps each dirty page whole, not at all, or
+  torn at 512-byte sectors, and a prefix (or, in a quarter of crashes, a
+  subset) of each directory's unsynced changes.
+- `chaos_worker run` is the crash harness's single-writer workload plus
+  vacuum and reader threads, on the mount. A write that throws is recorded
+  as unknown; the worker then recovers (`resume()` while degraded) and sends
+  the whole database as a View before writing again, so every unknown
+  outcome is settled.
+- `run_chaos.py` runs chains of process lives on one directory, each with
+  its own fault windows, resource limits (`RLIMIT_AS`, `RLIMIT_NOFILE`) and
+  end: power loss, SIGKILL, or a clean close with the hazards lifted.
+- `chaos_worker check` holds each life to the invariants: every View and the
+  recovered directory are a prefix of the history covering the durable
+  watermark, a View with no degrade before it lost nothing, recovery with
+  default options opens, serial and parallel recovery agree, a `close()`
+  that returned lost nothing, and readers never saw a value that was not
+  written or an error that was not I/O.
+
+Its first runs found six engine bugs, none reachable by the matrix or the
+SIGKILL harness:
+
+| Bug | Symptom |
+|---|---|
+| `resume()` trusts page-cache bytes after a failed `fdatasync` (#231, fixed by #240) | after power loss, a durable hint indexes zeroed records and `DB::open` refuses the database |
+| `DB::open` never syncs the newest hint-less file it indexes (#231, fixed by #240) | the same, after a SIGKILL followed by power loss, with no I/O error at all |
+| vacuum drops a durable record superseded only by a non-durable write (#245, fixed by #261) | after a power cut, the key holds neither its old value nor its new one |
+| vacuum leaks its `.data.tmp` staging file when compaction fails (#235, fixed by #247) | a copy of a file's live data per failed attempt, most often under `ENOSPC` |
+| a failed `ftruncate` that did cut the file leaves the logical end stale (#236, fixed by #248) | while degraded, reads of published records fail with `pread failed: Success` |
+| recovery memory-maps hint files (#237, fixed by #255) | a read error on a hint during `DB::open` kills the process with `SIGBUS` |
+
+`chaos-nightly.yml` runs it for 40 minutes a night, in release and under
+ASan, with every hazard; a bug found and not yet fixed gets its hazards
+listed in the workflow's `KNOWN_BUGS` until it is. `--disable` leaves hazards
+out, to bisect a failure or to run past a known bug; a failure keeps the directory before and after the life, the
+history, the timeline and chaosfs's fault log.
 
 ### Isolation checking (Elle)
 
@@ -1888,7 +1937,10 @@ control:
   specific fault tools. The fault injector operates at the application
   syscall layer only. The process-crash harness kills the process at
   arbitrary points, but the page cache survives it, so it does not stand
-  in for power loss either. The one power-loss hazard the engine controls
+  in for power loss either. The chaos rig models power loss and
+  filesystem errors in a FUSE layer, as a filesystem that keeps the POSIX
+  contract may produce them; it does not model a device that loses what an
+  `fdatasync` confirmed. The one power-loss hazard the engine controls
   beyond `fdatasync` — a directory entry that is not durable when something
   depends on it — is checked by ordering instead: each directory sync has
   its own `io_dir_sync_*` checkpoint, and the `[dir_sync]` tests fail each
