@@ -5374,27 +5374,16 @@ auto DB::recovery_load_parallel(EngineState s,
     queue.push_back(std::move(acc));
   }
 
-  // Threads are joined. Propagate any worker exceptions now. A
-  // SequenceOverlap propagates in both modes: it is not a file to skip.
-  bool worker_lost = false;
+  // Threads are joined. Propagate any worker exception now, in both modes:
+  // the lenient skip happens inside the worker (open_hint_or_skip), so what
+  // escapes it is an error no mode answers — a resource error, a read that
+  // failed once entries were applied, a SequenceOverlap.
   for (const auto &err : worker_errors) {
-    if (!err) continue;
-    try {
-      std::rethrow_exception(err);
-    } catch (const SequenceOverlap &) {
-      throw;
-    } catch (...) {
-      if (strict) throw;
-      // lenient: warning already emitted inside recovery_build_from_hints
-      worker_lost = true;
-    }
+    if (err) std::rethrow_exception(err);
   }
 #endif
 
   auto &final_result = queue[0];
-#ifndef BYTECASK_SINGLE_THREADED
-  if (worker_lost) final_result.skipped_files = true;
-#endif
   plog.mark("build + fan-in merge");
 
   // Phase 4: recompute live_bytes once from the fully-merged tree.
@@ -5796,14 +5785,12 @@ auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
       worker_errors[i] = std::current_exception();
     }
   });
-  bool skipped_files = false;
+  // In both modes: the lenient skip happens inside the worker
+  // (open_hint_or_skip), so what escapes it is an error no mode answers.
   for (const auto &err : worker_errors) {
-    if (err) {
-      if (strict) std::rethrow_exception(err);
-      // lenient: warning already emitted inside recovery_build_sorted
-      skipped_files = true;
-    }
+    if (err) std::rethrow_exception(err);
   }
+  bool skipped_files = false;
   plog.mark("build_sorted");
 
   // Phase 3: union the parts' metadata, and pool their separators into R
