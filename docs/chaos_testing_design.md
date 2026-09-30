@@ -1,8 +1,9 @@
 # Chaos Testing — Design
 
 > Status: first version implemented (`tests/chaos/`, `chaos-nightly.yml`).
-> Tracks issue #230; the cgroup memory hazard and the Elle workload on
-> chaosfs (#232) are still to come.
+> Tracks issue #230; the Elle workload runs on chaosfs too (#232,
+> `isolation_checking_design.md`, *Chaos*). The cgroup memory hazard (#269)
+> is still to come.
 
 ## Why
 
@@ -401,8 +402,8 @@ every hazard (302 lives, 145 power cuts, 145 evictions, 299 failed
 
 ## Not covered
 
-- Concurrent group commit under faults. A later step runs the Elle
-  workload (`tests/elle/isolation_history.cpp`) on chaosfs, which adds
-  multi-writer histories without a new oracle.
+- Concurrent group commit under faults is covered by the Elle workload on
+  chaosfs (`run_chaos.py --workload elle`, #232), checked per episode, not
+  per life.
 - Replication under faults and partitions (#178 covers the checker).
 - Filesystem behaviour outside the trust boundary above.

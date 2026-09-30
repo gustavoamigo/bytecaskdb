@@ -207,6 +207,62 @@ cross-check clean. Every kill had about 15 transactions in flight and caught
 two or more sync writers; one landed inside a compaction and the next open
 removed the half-done copy.
 
+## Chaos
+
+The kill mode's SIGKILL keeps the page cache, so it never loses an
+acknowledged write, and it never fails an I/O. The chaos mode (#232) runs the
+same writers under the chaos rig's hazards
+([`chaos_testing_design.md`](chaos_testing_design.md)): power loss, failed
+`fdatasync` with Linux semantics, eviction, failed writeback, full disks,
+read-only remounts, metadata errors, latency and stalls. It is
+`run_chaos.py --workload elle --config guarded|unguarded` with
+`isolation_history` as the worker.
+
+**Who drives.** The chaos orchestrator owns the mount, the fault timeline and
+how each process life ends: a power cut (freeze, SIGKILL, crash, fence), a
+SIGKILL, or a clean stop with the hazards lifted. A life is an epoch. The
+child, `isolation_history --chaos-child`, is the kill child plus what a
+service would do under faults:
+
+- `O` once `DB::open` succeeds, or `F <error>` and exit 4 if it fails, so the
+  orchestrator can require the next open, with every hazard lifted, to work.
+- A recovery thread that calls `resume()` when the engine degrades, with
+  backoff. If `resume()` refuses and asks for a reopen (#240), the child
+  writes `R` and exits 6, which ends the life; the orchestrator accepts that
+  only after an eviction dropped pages.
+- On SIGTERM the writers finish, then `close()`. If it returns, a
+  `durable_sequence` line at the last committed sequence follows, so every
+  acknowledged write counts as durable; `X ok` or `X fail <error>` records the
+  result.
+- The `Mmap` backend is mapped to `Pread`, which chaosfs's `direct_io` mount
+  cannot map.
+
+At the end of an episode (N lives on one directory) `isolation_history
+--absorb` turns the saved lives into one history with the kill mode's
+`absorb_epoch`, then reads every key from a copy of the directory the last
+life left. The history must pass the cross-check, and Elle: guarded
+strict-serializable, unguarded snapshot-isolated.
+
+**What a power cut may take.** The kill encoding holds per life. One rule is
+added for lives whose page cache lost data (a power cut, or an eviction that
+dropped pages): a read that returned an element not durable on the mount is
+`:info`, with its result cleared as the kill mode's downgrades are. Such a
+read saw a write the contract lets a crash take, and without the rule a
+later read that no longer sees it would count as a lost write. An element
+stays "not durable on the mount" from the life that wrote it until a later
+life's `DB::open` completes (open makes what it trusts durable, #240) or a
+`close()` returns. Reads of durable data are checked in full.
+
+**Sensitivity.** With `commit_skips_fdatasync` from `tests/chaos_mutations/`
+applied (the commit flush skips its `fdatasync` and still reports durable),
+the first guarded episode fails the cross-check: committed appends are
+missing from the final read, and reads miss acknowledged appends.
+
+**Result.** Guarded, 3 minutes: 92 lives, about 489,000 acknowledged
+transactions, 48 lives ended with two or more sync writers in flight, 46 lost
+page-cache data; every episode clean and strict-serializable. Unguarded,
+3 minutes: 60 lives, every episode snapshot-isolated.
+
 ## Implementation
 
 **The generator is C++, not Python.** #94 proposed the Python binding. Three

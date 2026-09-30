@@ -28,6 +28,9 @@ on:
       kill_rounds:
         description: "Kill rounds per job (two histories each)"
         default: "4"
+      chaos_minutes:
+        description: "Minutes per configuration of the chaos check"
+        default: "10"
       seed:
         description: "Seed to replay (empty = random)"
         default: ""
@@ -36,6 +39,8 @@ on:
     paths:
       - "tests/elle/**"
       - "scripts/run_isolation_check.py"
+      - "tests/chaos/run_chaos.py"
+      - "tests/chaos/chaosfs.py"
       - ".github/workflows/isolation-nightly.yml"
 
 permissions:
@@ -51,6 +56,8 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: fedora:43
+      # FUSE inside the container, for the chaos check's chaosfs.
+      options: --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined
     env:
       BYTECASK_MARCH: x86-64-v3
       XMAKE_ROOT: "y"
@@ -82,12 +89,13 @@ jobs:
             python3-pip python3-devel \
             git ninja-build \
             java-21-openjdk-headless \
-            graphviz
+            graphviz \
+            fuse3 fuse3-libs
           # xmake f loads every target, and bytecaskdb_python's on_load asks
           # nanobind for its include dir. graphviz: elle-cli renders every
           # cycle it finds with dot, including the write skew the unguarded
           # configuration is expected to show, and crashes without it.
-          pip3 install nanobind
+          pip3 install nanobind mfusepy
 
       - name: Cache elle-cli
         id: elle-cache
@@ -147,6 +155,24 @@ jobs:
           if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
           python3 scripts/run_isolation_check.py $ARGS
 
+      # Guarded and unguarded under the chaos rig (#232): chaosfs cuts the
+      # power, fails fdatasync with Linux semantics, evicts, fills the disk,
+      # stalls, and each writer process ends in a power cut, SIGKILL or clean
+      # close. Each episode's history must pass the cross-check and Elle.
+      - name: Run chaos check
+        env:
+          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
+          MINUTES: ${{ github.event.inputs.chaos_minutes || '10' }}
+          SEED: ${{ github.event.inputs.seed || github.run_id }}
+        run: |
+          for config in guarded unguarded; do
+            python3 tests/chaos/run_chaos.py --workload elle --config $config \
+              --worker build/linux/x86_64/${{ matrix.mode }}/isolation_history \
+              --elle-jar elle-cli.jar --minutes $MINUTES --seed $SEED --lives 6 \
+              --max-life-s ${{ matrix.sanitizer == 'address' && '10' || '4' }} \
+              --work $RUNNER_TEMP/isolation-chaos-$config
+          done
+
       # Leader plus two followers through bootstrap and tailing
       # (docs/replication_checking_design.md). cluster-vacuum vacuums with
       # retain_after and must pass; cluster-vacuum-unretained must detect
@@ -189,4 +215,6 @@ jobs:
             ${{ runner.temp }}/isolation-cluster
             ${{ runner.temp }}/isolation-topology
             ${{ runner.temp }}/isolation-kill
+            ${{ runner.temp }}/isolation-chaos-guarded/failure
+            ${{ runner.temp }}/isolation-chaos-unguarded/failure
           if-no-files-found: ignore

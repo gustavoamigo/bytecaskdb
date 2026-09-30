@@ -28,6 +28,10 @@
 //                     [--no-vacuum] [--force-vacuum] [--no-degrade]
 //                     [--followers N] [--follower-readers N] [--lag]
 //                     [--kill-epochs N]
+//   isolation_history --chaos-child --config C --seed S --threads N --dir D
+//                     --fd N --process-base P --element-base E --key-base K
+//   isolation_history --absorb MANIFEST --config C --seed S --threads N
+//                     --dir D --out history.json
 //
 // With --followers N (#178, docs/replication_checking_design.md) the leader
 // gains N followers, each bootstrapped from a manifest under load and tailed
@@ -61,6 +65,7 @@
 #include <random>
 #include <shared_mutex>
 #include <span>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -119,6 +124,8 @@ struct RunOptions {
   int kill_epochs{0};
   // Set on the child only, by the parent.
   bool kill_child{false};
+  bool chaos_child{false}; // #232: driven by run_chaos.py --workload elle
+  fs::path absorb;         // #232: a chaos episode's manifest
   int child_fd{-1};
   int process_base{0};
   std::int64_t element_base{0};
@@ -1347,10 +1354,13 @@ struct KillStats {
 // reported, except that an acknowledged write not known durable at the kill
 // becomes :info (a crash may lose it), and every operation still in flight
 // gets an :info completion at the kill.
+// not_durable, when given, receives every element appended by an operation
+// that ends up :info: a power cut may still take it (#232).
 auto absorb_epoch(std::string_view stream, int epoch, std::int64_t killed_at,
                   std::int64_t start_ns, std::vector<Event> &events,
                   std::uint64_t &next_index, std::int64_t &max_element,
-                  std::int64_t &max_key, KillStats &stats) -> void {
+                  std::int64_t &max_key, KillStats &stats,
+                  std::vector<std::int64_t> *not_durable = nullptr) -> void {
   struct Pending {
     std::vector<Mop> mops;
     bool sync{false};
@@ -1402,6 +1412,9 @@ auto absorb_epoch(std::string_view stream, int epoch, std::int64_t killed_at,
       durable = std::max(durable, d);
       continue;
     }
+    // The chaos child's open, open-failure, reopen-required and close lines
+    // (#232) carry nothing the history needs.
+    if (tag == 'O' || tag == 'F' || tag == 'R' || tag == 'X') continue;
     Event e;
     std::int64_t t = 0;
     in >> e.process >> t;
@@ -1433,6 +1446,11 @@ auto absorb_epoch(std::string_view stream, int epoch, std::int64_t killed_at,
     }
   }
 
+  auto note_not_durable = [&](const std::vector<Mop> &mops) {
+    if (!not_durable) return;
+    for (const auto &m : mops)
+      if (m.append) not_durable->push_back(m.element);
+  };
   for (auto &[event, invoked, dur] : completions) {
     if (event.type == EventType::Ok && event.sequence != 0 && !dur &&
         event.sequence > durable) {
@@ -1442,6 +1460,7 @@ auto absorb_epoch(std::string_view stream, int epoch, std::int64_t killed_at,
       event.error = "acknowledged, not durable at the kill";
       ++stats.downgraded;
     }
+    if (event.type == EventType::Info) note_not_durable(invoked);
     if (event.type == EventType::Ok) ++stats.ok;
     if (event.type == EventType::Fail) ++stats.fail;
     events.push_back(std::move(event));
@@ -1454,6 +1473,7 @@ auto absorb_epoch(std::string_view stream, int epoch, std::int64_t killed_at,
     e.epoch = epoch;
     e.type = EventType::Info;
     e.time_ns = killed_at - start_ns;
+    note_not_durable(p.mops);
     e.value = std::move(p.mops);
     e.error = "in flight at the kill";
     events.push_back(std::move(e));
@@ -1547,6 +1567,301 @@ auto run_kill(const RunOptions &o) -> int {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Chaos child and absorb (#232): the kill child's workload on a chaosfs mount,
+// driven by tests/chaos/run_chaos.py --workload elle, which cuts the power,
+// fails I/O and ends each process life; --absorb then turns the lives it
+// saved into one history. See docs/isolation_checking_design.md, "Chaos".
+//
+// Beyond the kill child's lines the chaos child writes
+//   O              the database opened
+//   F <error>      DB::open threw; the child exits 4
+//   R              resume() asks for a reopen (#240); the child exits 6
+//   X ok | X fail <error>   the result of close() at a clean stop (SIGTERM)
+// ---------------------------------------------------------------------------
+
+std::atomic<bool> g_chaos_stop{false};
+
+extern "C" void on_chaos_stop(int /*sig*/) { g_chaos_stop.store(true); }
+
+auto one_line(std::string_view s) -> std::string {
+  std::string out{s};
+  std::ranges::replace(out, '\n', ' ');
+  return out;
+}
+
+auto chaos_child_body(bytecask::DB &db, const RunOptions &o, const Config &cfg,
+                      LineWriter &out) -> int {
+  out.write("O\n");
+  KeyPool keys{o.key_base};
+  std::atomic<std::int64_t> next_element{o.element_base};
+  std::atomic<std::uint64_t> max_ok{0};
+  std::atomic<bool> stop{false};
+
+  std::jthread vacuum_thread;
+  if (cfg.vacuum) {
+    vacuum_thread = std::jthread{[&] {
+      std::mt19937_64 vrng{o.seed + 1};
+      while (!stop.load(std::memory_order_relaxed)) {
+        const auto threshold = static_cast<double>(vrng() % 60) / 100.0;
+        try {
+          std::ignore = db.vacuum({.fragmentation_threshold = threshold});
+        } catch (const std::exception &) {
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(vrng() % 5000));
+      }
+    }};
+  }
+  std::jthread durable_thread{[&] {
+    std::uint64_t last = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      const auto d = db.durable_sequence(last + 1, std::chrono::milliseconds(5));
+      if (d > last) {
+        last = d;
+        out.write(std::format("D {}\n", d));
+      }
+    }
+  }};
+  // Faults degrade the engine; the child recovers it as a service would. A
+  // resume() that refuses and asks for a reopen ends the life: the next one
+  // reopens the directory.
+  std::jthread recovery_thread{[&] {
+    std::mt19937_64 rrng{o.seed + 3};
+    while (!stop.load(std::memory_order_relaxed)) {
+      if (db.is_degraded()) {
+        try {
+          db.resume();
+        } catch (const std::exception &e) {
+          if (std::string_view{e.what()}.find("Reopen the database") !=
+              std::string_view::npos) {
+            out.write("R\n");
+            std::_Exit(6);
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(10 + rrng() % 100));
+          continue;
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  }};
+
+  std::vector<std::jthread> writers;
+  for (int t = 0; t < o.threads; ++t) {
+    writers.emplace_back([&, t] {
+      std::mt19937_64 rng{o.seed + 100 + static_cast<std::uint64_t>(t)};
+      const auto process = o.process_base + t;
+      while (!stop.load(std::memory_order_relaxed)) {
+        if (db.is_degraded()) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+          continue;
+        }
+        auto mops = random_txn(rng, keys, next_element);
+        const auto sync = static_cast<int>(rng() % 100) < cfg.sync_percent;
+        std::string line = std::format("I {} {} {}", process, monotonic_ns(),
+                                       sync ? 1 : 0);
+        append_mops(line, mops, false);
+        out.write(line + "\n");
+        TxnOutcome r;
+        try {
+          r = execute_txn(db, o.mode, mops, {.sync = sync});
+        } catch (const std::exception &e) {
+          r = {.type = EventType::Info, .sequence = 0, .error = e.what(),
+               .durable = false};
+        }
+        if (r.type == EventType::Ok) {
+          auto seen = max_ok.load();
+          while (r.sequence > seen && !max_ok.compare_exchange_weak(seen, r.sequence)) {
+          }
+        }
+        line = std::format("C {} {} {} {} {}", process, monotonic_ns(),
+                           event_type_name(r.type), r.sequence,
+                           r.durable ? 1 : 0);
+        append_mops(line, mops, r.type == EventType::Ok);
+        out.write(line + "\n");
+      }
+    });
+  }
+
+  while (!g_chaos_stop.load()) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  // A clean stop: the orchestrator lifted every hazard before SIGTERM. The
+  // writers finish their transactions, then close() says whether everything
+  // acknowledged is durable; if so, every sequence up to the last is.
+  stop.store(true);
+  writers.clear();
+  recovery_thread = {};
+  durable_thread = {};
+  vacuum_thread = {};
+  try {
+    db.close();
+    out.write(std::format("D {}\n", max_ok.load()));
+    out.write("X ok\n");
+  } catch (const std::exception &e) {
+    out.write(std::format("X fail {}\n", one_line(e.what())));
+  }
+  return 0;
+}
+
+auto run_chaos_child(const RunOptions &o) -> int {
+  std::signal(SIGTERM, on_chaos_stop);
+  auto cfg = kill_config(o.seed);
+  if (o.no_vacuum) cfg.vacuum = false;
+  // chaosfs serves every read itself (FUSE direct_io), and the kernel refuses
+  // a shared mapping of such a file: the Mmap backend cannot open there.
+  if (cfg.backend == bytecask::IoBackend::Mmap)
+    cfg.backend = bytecask::IoBackend::Pread;
+  LineWriter out{o.child_fd};
+  auto opened = false;
+  try {
+    // DB is neither copyable nor movable: it lives in this scope.
+    auto db = bytecask::DB::open(o.dir, db_options(cfg));
+    opened = true;
+    return chaos_child_body(db, o, cfg, out);
+  } catch (const std::exception &e) {
+    if (opened) throw;
+    out.write(std::format("F {}\n", one_line(e.what())));
+    return 4;
+  }
+}
+
+// One life of a chaos episode, as the manifest lists it.
+struct ChaosEpoch {
+  int epoch{0};
+  std::int64_t ended_at{0}; // CLOCK_MONOTONIC ns when the life was ended
+  bool cache_lost{false};   // a power cut, or an eviction that dropped pages
+  bool opened{false};       // the life's DB::open completed
+  bool closed_ok{false};    // close() returned at a clean stop
+  fs::path stream;
+};
+
+// The manifest: "start <ns>", then one line per life:
+//   epoch <n> <ended_at_ns> <cache_lost> <opened> <closed_ok> <stream path>
+auto read_manifest(const fs::path &path, std::int64_t &start_ns)
+    -> std::vector<ChaosEpoch> {
+  std::ifstream in{path};
+  std::vector<ChaosEpoch> epochs;
+  std::string tag;
+  while (in >> tag) {
+    if (tag == "start") {
+      in >> start_ns;
+    } else if (tag == "epoch") {
+      ChaosEpoch e;
+      int lost = 0;
+      int opened = 0;
+      int closed = 0;
+      in >> e.epoch >> e.ended_at >> lost >> opened >> closed >> std::ws;
+      std::string p;
+      std::getline(in, p);
+      e.cache_lost = lost != 0;
+      e.opened = opened != 0;
+      e.closed_ok = closed != 0;
+      e.stream = p;
+      epochs.push_back(std::move(e));
+    } else {
+      throw std::runtime_error{std::format("manifest: unknown line {}", tag)};
+    }
+  }
+  return epochs;
+}
+
+auto read_whole(const fs::path &p) -> std::string {
+  std::ifstream in{p, std::ios::binary};
+  return {std::istreambuf_iterator<char>{in}, {}};
+}
+
+// Builds one history from a chaos episode's lives, then reads every key once
+// from --dir (a copy of the directory the last life left).
+//
+// The kill mode's rules hold per life: operations in flight at the end, and
+// acknowledged writes not durable then, are :info. One rule is added for
+// lives whose page cache lost data. Such a loss takes writes that were
+// visible but never durable, so a read that returned one of them is :info:
+// its result is not one the database had to keep. A write stays "not durable
+// on the mount" until a later life's open completes (open makes what it
+// trusts durable, #240), or a close() returns.
+auto run_absorb(const RunOptions &o) -> int {
+  std::int64_t start_ns = 0;
+  const auto epochs = read_manifest(o.absorb, start_ns);
+  std::vector<Event> events;
+  std::uint64_t next_index = 0;
+  std::int64_t max_element = -1;
+  std::int64_t max_key = -1;
+  KillStats stats;
+  std::map<std::int64_t, std::vector<std::size_t>> readers_of;
+  std::set<std::int64_t> unsynced;
+  std::int64_t lost_reads = 0;
+  int cache_losses = 0;
+
+  for (const auto &ep : epochs) {
+    const auto first = events.size();
+    std::vector<std::int64_t> not_durable;
+    absorb_epoch(read_whole(ep.stream), ep.epoch, ep.ended_at, start_ns, events,
+                 next_index, max_element, max_key, stats, &not_durable);
+    for (auto i = first; i < events.size(); ++i) {
+      if (events[i].type != EventType::Ok) continue;
+      for (const auto &m : events[i].value)
+        if (m.read)
+          for (const auto e : *m.read) readers_of[e].push_back(i);
+    }
+    if (ep.opened) unsynced.clear();
+    unsynced.insert(not_durable.begin(), not_durable.end());
+    if (ep.cache_lost) {
+      ++cache_losses;
+      for (const auto e : unsynced) {
+        const auto it = readers_of.find(e);
+        if (it == readers_of.end()) continue;
+        for (const auto i : it->second) {
+          if (events[i].type != EventType::Ok) continue;
+          events[i].type = EventType::Info;
+          events[i].sequence = 0;
+          events[i].error = "read a write the page cache lost";
+          // An :info read's result is unknown, as for the kill mode's
+          // downgrades: Elle would otherwise still order by what it saw.
+          for (auto &m : events[i].value)
+            if (!m.append) m.read.reset();
+          ++lost_reads;
+        }
+      }
+      unsynced.clear();
+    }
+    if (ep.closed_ok) unsynced.clear();
+  }
+
+  {
+    auto db = bytecask::DB::open(o.dir, db_options(kill_config(o.seed)));
+    Event inv;
+    inv.process = static_cast<int>(epochs.size()) * o.threads;
+    inv.epoch = static_cast<int>(epochs.size());
+    inv.index = next_index++;
+    inv.time_ns = monotonic_ns() - start_ns;
+    for (std::int64_t k = 0; k <= max_key; ++k)
+      inv.value.push_back({.append = false, .key = k, .element = 0, .read = {}});
+    auto done = inv;
+    auto snap = db.snapshot();
+    bytecask::Bytes buf;
+    for (auto &m : done.value) {
+      const auto kb = key_bytes(m.key);
+      m.read = snap.get({}, as_view(kb), buf) ? decode_list(buf) : List{};
+    }
+    done.type = EventType::Ok;
+    done.index = next_index++;
+    done.time_ns = monotonic_ns() - start_ns;
+    inv.type = EventType::Invoke;
+    events.push_back(std::move(inv));
+    events.push_back(std::move(done));
+  }
+
+  write_history(o.out, std::move(events));
+  auto summary = o.out;
+  summary += ".chaos.json";
+  std::ofstream{summary} << std::format(
+      R"({{"epochs":{},"in_flight":{},"downgraded":{},"group_kills":{},)"
+      R"("ok":{},"fail":{},"cache_losses":{},"lost_reads":{},"keys":{}}})"
+      "\n",
+      stats.epochs, stats.in_flight, stats.downgraded, stats.group_kills,
+      stats.ok, stats.fail, cache_losses, lost_reads, max_key + 1);
+  return 0;
+}
+
 auto parse_mode(std::string_view s) -> Mode {
   if (s == "guarded") return Mode::Guarded;
   if (s == "unguarded") return Mode::Unguarded;
@@ -1599,6 +1914,10 @@ auto parse_args(int argc, char **argv) -> RunOptions {
       o.kill_epochs = std::stoi(std::string{next()});
     } else if (a == "--kill-child") {
       o.kill_child = true;
+    } else if (a == "--chaos-child") {
+      o.chaos_child = true;
+    } else if (a == "--absorb") {
+      o.absorb = next();
     } else if (a == "--fd") {
       o.child_fd = std::stoi(std::string{next()});
     } else if (a == "--process-base") {
@@ -1611,7 +1930,7 @@ auto parse_args(int argc, char **argv) -> RunOptions {
       throw std::runtime_error{std::format("unknown argument {}", a)};
     }
   }
-  if (!have_config || (o.out.empty() && !o.kill_child))
+  if (!have_config || (o.out.empty() && !o.kill_child && !o.chaos_child))
     throw std::runtime_error{"--config and --out are required"};
   if (o.kill_epochs < 0)
     throw std::runtime_error{"--kill-epochs must be >= 0"};
@@ -2037,6 +2356,8 @@ auto main(int argc, char **argv) -> int {
   try {
     const auto o = parse_args(argc, argv);
     if (o.kill_child) return run_kill_child(o);
+    if (o.chaos_child) return run_chaos_child(o);
+    if (!o.absorb.empty()) return run_absorb(o);
     if (o.kill_epochs > 0) return run_kill(o);
     return run(o);
   } catch (const std::exception &e) {
