@@ -258,7 +258,7 @@ enum class FrameType : std::uint8_t {
   View = 8,       // u8 resumed, u64 durable_sequence, u32 n, n x (key, value)
   OpenFailed = 9, // str what(): DB::open threw
   Violation = 10, // str: the worker saw an invariant break while running
-  Closed = 11,    // the DB was destroyed cleanly
+  Closed = 11,    // u8 close() returned, str what() it threw otherwise
 };
 
 class Writer {

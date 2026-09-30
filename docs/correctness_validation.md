@@ -1729,9 +1729,9 @@ calls, run out of space, go read-only, write short, stall, and lose power.
 - `chaos_worker check` holds each life to the invariants: every View and the
   recovered directory are a prefix of the history covering the durable
   watermark, a View with no degrade before it lost nothing, recovery with
-  default options opens, serial and parallel recovery agree, a clean close
-  lost nothing, and readers never saw a value that was not written or an
-  error that was not I/O.
+  default options opens, serial and parallel recovery agree, a `close()`
+  that returned lost nothing, and readers never saw a value that was not
+  written or an error that was not I/O.
 
 Its first runs found six engine bugs, none reachable by the matrix or the
 SIGKILL harness:

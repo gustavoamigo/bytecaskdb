@@ -338,18 +338,10 @@ auto run(const fs::path &dir, std::uint64_t seed, int fd,
   if (limits.no_vacuum) cfg.vacuum = false;
   bool opened = false;
   try {
-    int rc = 0;
-    {
-      // DB is neither copyable nor movable: it lives in this scope, and
-      // Closed is sent once its destructor has run.
-      auto db = bytecask::DB::open(dir, db_options(cfg));
-      opened = true;
-      rc = run_open(db, ch, cfg, seed, limits);
-    }
-    Writer w;
-    w.u8(static_cast<std::uint8_t>(FrameType::Closed));
-    ch.send(w);
-    return rc;
+    // DB is neither copyable nor movable: it lives in this scope.
+    auto db = bytecask::DB::open(dir, db_options(cfg));
+    opened = true;
+    return run_open(db, ch, cfg, seed, limits);
   } catch (const std::exception &e) {
     if (opened) throw;
     ch.text(FrameType::OpenFailed, e.what());
@@ -425,11 +417,25 @@ auto run_open(bytecask::DB &db_ref, Channel &ch, const Config &cfg,
   }
   while (!g_stop.load()) sleep_ms(20);
 
-  // Clean close: the orchestrator lifted every hazard before SIGTERM.
+  // Clean close: the orchestrator lifted every hazard before SIGTERM. The
+  // reader and vacuum threads stop first: after close() they would see
+  // DbClosed. close() returning means every acknowledged write is durable;
+  // a throw is the engine reporting that some are not.
   lift_limits();
   if (db->is_degraded()) (void)recover(*db, ch, rng, true);
   threads.clear();
   ch.u64(FrameType::Watermark, db->durable_sequence());
+  Writer w;
+  w.u8(static_cast<std::uint8_t>(FrameType::Closed));
+  try {
+    db->close();
+    w.u8(1);
+    w.str("");
+  } catch (const std::exception &e) {
+    w.u8(0);
+    w.str(e.what());
+  }
+  ch.send(w);
   return 0;
 }
 
@@ -514,6 +520,8 @@ struct Life {
   std::uint64_t opened_keys{0};
   std::optional<std::string> open_failed;
   bool closed{false};
+  bool close_ok{false};
+  std::string close_error;
   std::uint64_t watermark{0};
   // Operations still unsettled by a View, in order. A View folds the prefix
   // it matched into `settled`.
@@ -678,6 +686,8 @@ void parse_life(std::string_view stream, const Base &base, bool cache_lost,
     }
     case FrameType::Closed:
       life.closed = true;
+      life.close_ok = r.u8() != 0;
+      life.close_error = r.str();
       break;
     }
   }
@@ -706,6 +716,8 @@ void write_report(const CheckOptions &o, const Config &cfg, const Life &life,
   out << "seed " << o.seed << " " << describe_config(cfg) << "\n";
   out << "watermark " << life.watermark << " opened_durable "
       << life.opened_durable << " views " << life.views << "\n";
+  if (life.closed)
+    out << "close(): " << (life.close_ok ? "returned" : life.close_error) << "\n";
   for (const auto &t : life.throws) out << "threw: " << t << "\n";
   for (const auto &v : life.violations) out << "violation: " << v << "\n";
   for (const auto &rec : life.all) out << describe(rec, nullptr) << "\n";
@@ -758,19 +770,19 @@ auto check(const CheckOptions &o) -> int {
         throw Failure{std::format(
             "recovered durable_sequence {} below the watermark {}",
             recovered.durable_sequence, life.watermark)};
-      // A clean close keeps every write, unless an eviction took some before
-      // the engine could know.
-      if (o.terminator == "clean" && life.closed && !o.evicted &&
-          r.applied < settled_count(life.ops))
+      // close() returning promises every acknowledged write durable, an
+      // eviction before it included: the engine's last fdatasync reports a
+      // writeback that failed. A close() that threw has reported the loss.
+      if (life.closed && life.close_ok && r.applied < settled_count(life.ops))
         throw Failure{std::format(
-            "after a clean close, recovery lost {} acknowledged writes",
+            "close() returned, and recovery lost {} acknowledged writes",
             settled_count(life.ops) - r.applied)};
     }
 
     Base next;
     next.contents = recovered.contents;
     next.durable = recovered.durable_sequence;
-    if (power_cut || (o.terminator == "clean" && life.closed)) {
+    if (power_cut || (life.closed && life.close_ok)) {
       // Nothing is left only in the page cache.
       next.floor = recovered.contents;
       next.floor_seq = recovered.durable_sequence;
@@ -790,11 +802,14 @@ auto check(const CheckOptions &o) -> int {
     store_base(o.state, next);
     std::printf(
         "{\"ok\": true, \"opened\": %s, \"open_failed\": %s, \"closed\": %s, "
+        "\"close_failed\": %s, "
         "\"committed\": %zu, \"views\": %d, \"resumed_views\": %d, "
         "\"throws\": %zu, \"bad_alloc\": %zu, \"lost_at_resume\": %zu, "
         "\"tail_applied\": %zu, \"tail_total\": %zu, \"keys\": %zu}\n",
         life.opened ? "true" : "false", life.open_failed ? "true" : "false",
-        life.closed ? "true" : "false", life.committed, life.views,
+        life.closed ? "true" : "false",
+        life.closed && !life.close_ok ? "true" : "false", life.committed,
+        life.views,
         life.resumed_views, life.throws.size(),
         static_cast<std::size_t>(std::ranges::count_if(
             life.throws,

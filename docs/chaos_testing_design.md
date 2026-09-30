@@ -323,11 +323,17 @@ Where the first version differs from the design above, and why.
   whose background writeback failed are clean but not on disk; evicting them
   drops the published, non-durable writes in them, and the engine cannot
   know until its next `fdatasync` reports the error. After an eviction that
-  dropped pages, the checker lets Views and a clean close lack writes above
-  the durable watermark, and does not count a failed read of such a write as
+  dropped pages, the checker lets Views lack writes above the durable
+  watermark, and does not count a failed read of such a write as
   a violation. A read that returns a value never written still is. If
   `resume()` then refuses to trim published data and asks for a reopen
   (#240), that is the documented recovery: the next life's open must succeed.
+- **The clean close calls `DB::close()` (#257).** Returning means every
+  acknowledged write is durable, and the checker holds recovery to all of
+  them, an eviction before the close included: the engine's last
+  `fdatasync` must report a writeback that failed. A `close()` that throws
+  has reported the loss; then only the durable watermark binds, and that
+  life's writes stay pending for the next power cut.
 - **Liveness (I9) is checked at the clean close:** the hazards are lifted,
   and the worker must recover, close and exit within `--close-timeout`
   (60 s), or its stacks are saved and the life fails. Lives that end in a

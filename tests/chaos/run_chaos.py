@@ -549,6 +549,8 @@ class Rig:
             t[f"rlimit_{name}"] = t.get(f"rlimit_{name}", 0) + 1
         if result["open_failed"]:
             t["open_failed"] = t.get("open_failed", 0) + 1
+        if result["close_failed"]:
+            t["close_failed"] = t.get("close_failed", 0) + 1
         if outcome["out_of_memory"]:
             t["out_of_memory"] = t.get("out_of_memory", 0) + 1
 
