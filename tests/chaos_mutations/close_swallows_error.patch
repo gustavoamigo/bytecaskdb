@@ -4,7 +4,8 @@ close() was added to end. Reverts #260's report (#257).
 Rare in a full run (a failed writeback and an eviction before a clean
 close, about one life in 300), so every life ends in a clean close:
 Disable: power,sigkill
-Expected: caught.
+Guarded-by: "close() throws when its fdatasync fails, closes all the same, and a reopen recovers what was durable"
+
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
 index aab1a99e..ac0af9a2 100644
 --- a/bytecaskdb/bytecask.cppm

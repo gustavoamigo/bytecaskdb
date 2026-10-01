@@ -1927,12 +1927,14 @@ history, the timeline and chaosfs's fault log.
 #### Mutations
 
 `tests/chaos_mutations/` holds mutations of the engine, most of them reverts
-of the fixes the rig prompted, and `scripts/chaos_mutation_check.sh` proves
-the rig catches them (#268): it applies each, rebuilds `chaos_worker`, and runs
-the rig on two seeds, 5 minutes each unless the patch sets a `Budget:` or
-focuses the run with `Disable:`.
+of the fixes the rig prompted (#268). Each now names the deterministic test
+that guards its site, and `scripts/chaos_mutation_check.sh` gates on those
+tests (*Durability sites*, #280). `--chaos MINUTES` also runs the rig on each
+mutation, on two seeds, unless the patch sets a `Budget:` or focuses the run
+with `Disable:`; its result is reported and gates nothing. What the rig caught
+when the set was built:
 
-| Mutation | Reverts | Result |
+| Mutation | Reverts | Rig result |
 |---|---|---|
 | `commit_skips_fdatasync`: the commit flush skips its `fdatasync` and still reports durable | — | caught in ~20 s, every run |
 | `no_dir_sync_new_data_file`: a new data file's name is not synced | #199 | caught in 30–90 s, every run |
@@ -1945,17 +1947,17 @@ focuses the run with `Disable:`.
 | `no_sync_before_degrade`: a failed append degrades without syncing | — | not caught: #240's rewrite in `resume()` covers it |
 | `truncate_lowers_end_after`: the logical end drops after `ftruncate`, not before | #248 (#236) | not caught: the stale end lasts one `resume()` retry; #248's `prove_resume` cell guards it |
 
-"Rare" (`Expected: caught (rare)`) marks a mutation the rig catches but not
-within a fixed budget: the script runs and reports it, and a survival is not a
-failure.
+The two rare catches are why the rig is not the gate: `vacuum_drops_before_durable`
+and `hint_written_in_place` are now caught every run, by a power cut right
+after a vacuum and by a hint write that fails before its trailer.
 
 The set is kept current as the engine moves. Patches apply by three-way
 merge (`scripts/mutation_patch.sh`, for both mutation sets): a change
 elsewhere in a file merges, and only a conflict, when the targeted code or a
 line directly next to it changed, means the patch must be regenerated.
-`ci.yml` fails on a conflicting patch. A fix for a bug the rig found adds a
-patch reverting it, and a change to the rig, or to engine code a mutation
-patches, runs the check and reports its summary. It is not scheduled: it only
+`ci.yml` fails on a conflicting patch. A fix for a durability bug adds a
+patch reverting it, guarded by the fix's test, and a change to the guards,
+or to engine code a mutation patches, runs the check and reports its summary. It is not scheduled: it only
 goes stale when one of those changes.
 
 Building the set changed the rig: chaosfs now sometimes evicts a failed
@@ -1994,6 +1996,100 @@ Elle ([`isolation_checking_design.md`](isolation_checking_design.md),
 *Chaos*).
 
 ---
+
+## Durability sites
+
+Every place where a mistake loses or corrupts acknowledged data, or leaves the database unopenable, and what proves it is right (#280). A site is **guarded** when a deterministic test fails if the site is broken, and a mutation in `tests/chaos_mutations/` (or `tests/soak_mutations/`) proves it: `scripts/chaos_mutation_check.sh` applies the mutation, rebuilds `bytecask_tests`, and requires the tests its `Guarded-by:` headers name to fail. A site is **not needed** when nothing has to catch its removal, for the reason given. A site with a guard but no mutation yet, or with neither, is still to do.
+
+The chaos rig ([*Chaos rig*](#chaos-rig-power-loss-io-faults-resource-limits)) runs over the same mutations with `--chaos`: a second, black-box confirmation that gates nothing.
+
+The sites came from a sweep of every `fdatasync`, directory sync, rename, truncate and unlink in the engine, every degrade on an I/O error, and every durability fix in the git history. The sweep found #281: `create_manifest` threw on a failed sync without degrading. Proving the guards found one that could not fail: #248's `prove_resume` cells fail `io_resume_truncate` to model an `ftruncate` that cut the file and then reported an error, but the fault fired after the logical end was lowered whichever order the code used, so the revert of #248 passed them. The fault now stands in for `ftruncate`'s result. Proving them also found that the commit `fdatasync`, the engine's first promise, had no test of its own: other tests failed without it only because their first sync write was lost.
+
+### Commit path
+
+| Site | Guarded by | Mutation | Origin |
+|---|---|---|---|
+| `flush_pending`: the commit `fdatasync` before `durable_seq` moves | `a sync write survives a power cut as soon as it returns` | `commit_skips_fdatasync` | — |
+| `flush_pending`: the state is published only after the `fdatasync` | `pipeline: sync write is invisible until its fdatasync returns; …` | `publish_before_fdatasync` (soak) | #92 |
+| `flush_failed`: a failed commit sync degrades and publishes nothing | `class F: key not visible after commit sync failure` | to do | BC-155, BC-163 |
+| `execute_slots`: a failed append degrades | `prove_group__*__group_append_fails` | to do | BC-163 |
+| `execute_slots`: a failed append syncs before it degrades | not needed: `resume()` rewrites and syncs the file before trusting it (#240) | `no_sync_before_degrade` | — |
+| `execute_slots`: a rotation behind a failed flush stays degraded | `pipeline: rotation behind a failed flush stays degraded` | to do | #170 |
+| `execute_slots` / `flush_pending`: a sync-only write makes earlier unsynced writes durable | `apply_batch: an empty sync plan makes earlier unsynced writes …` | to do | #192 |
+
+### Rotation and new files
+
+| Site | Guarded by | Mutation | Origin |
+|---|---|---|---|
+| `execute_slots`: the rotation `fdatasync` before sealing; a failure degrades | `class G: key not visible after rotation sync failure` | to do | BC-155 |
+| `rotate_active_file`: `shrink_to_fit` cuts the preallocated tail and syncs the size | to do: test, or a recorded reason | to do | — |
+| `create_active_file`: the directory sync before the first write into a new file (open, rotation, `resume()`) | `directory sync: a failed sync at rotation degrades …`, `… in resume() stays degraded`, `… open fails when the active file's entry cannot be synced` | `no_dir_sync_new_data_file` | #199 |
+| rotation: a failed file creation degrades | `prove_*__rotation_file_creation_fails` cells | to do | — |
+| `createDataFileForWrite` / `renameDataFileExclusive`: a reused file name panics instead of replacing a live file | `createDataFileForWrite panics when the data file already exists`, `renameDataFileExclusive panics rather than replacing a live file` | to do | #35 |
+
+### Hint files
+
+| Site | Guarded by | Mutation | Origin |
+|---|---|---|---|
+| `flush_hints_for`: written to `.hint.tmp` and renamed into place | `DB recovery: a crash while open writes a hint leaves no hint behind it, …` | `hint_written_in_place` | — |
+| `HintFile::close`: the hint's `fdatasync` before the rename | to do: the page cache model does not model hint files | to do | — |
+| `flush_hints_for`: the directory sync after the rename | not needed: a lost rename leaves the file hint-less, and the next open rebuilds it (`directory sync: a hint rebuilt at open is synced` checks the call) | — | #199 |
+| `flush_hints_for`: batch markers kept in the hint, so `next_seq` covers them | `prove_repl__*__restart_midstream__*` cells | to do | — |
+| `open_hint_or_rebuild`: a hint that fails its CRC is rebuilt, not skipped | `DB recovery: a corrupt hint is rebuilt from its data file` | to do | #123 |
+| `open_hint_or_rebuild`: a hint read error rebuilds the hint | `DB::open rebuilds a hint file a read fails on` | `hint_read_error_kills_process` | #255 (#237) |
+| `open_hint_or_rebuild` / `open_hint_or_skip`: an error that says nothing about the bytes leaves the hint alone and is not a skipped file | `DB::open leaves a hint alone on an error that says nothing about …` | to do | #270 |
+
+### Vacuum
+
+| Site | Guarded by | Mutation | Origin |
+|---|---|---|---|
+| `vacuum_commit`: what superseded a dropped record is synced first | `vacuum does not drop a durable record that only an unsynced write supersedes` | `vacuum_drops_before_durable` | #261 (#245) |
+| `vacuum_commit`: that sync failing degrades and keeps the source | `vacuum whose fdatasync fails degrades, keeps the source file, …` | to do | #261 |
+| `vacuum_compact_file`: the staging file's `fdatasync` | not needed: `shrink_to_fit()` syncs it right after | — | — |
+| `vacuum_compact_file`: the directory sync after the rename, before the source is unlinked | `directory sync: a failed sync in vacuum keeps the source` | to do | #199 |
+| `vacuum_compact_file`: the staging file is removed on every failure | `prove_vacuum_compact` VC2–VC4 cells | to do | #247 (#235) |
+| `vacuum`: a file of tombstones only is kept while they hide older puts | `vacuum keeps a tombstone-only file that shadows an older put` | to do | #171 |
+| `vacuum_scan_and_copy`: a scan error stops the compaction | `DB vacuum: a damaged sealed file is not compacted away` | to do | #136 |
+| `vacuum_scan_and_copy`: batch markers are copied | `vacuum preserves BulkBegin/BulkEnd markers` | to do | BC-197 |
+
+### `resume()`
+
+| Site | Guarded by | Mutation | Origin |
+|---|---|---|---|
+| `rewrite_durably` before the scan | `resume() makes durable what it publishes after a failed fdatasync` | `resume_trusts_page_cache` | #240 (#231) |
+| refuses below the published extent | `resume() refuses when a failed fdatasync's pages were evicted, …`, `prove_corruption` cells | to do | #136, #240 |
+| an I/O error in the scan truncates nothing | `resume() rethrows an I/O error from its scan and truncates nothing` | to do | #136 |
+| `WritableFileOps::truncate`: the logical end is lowered before `ftruncate` | `*__truncate_fails_after_cut` (the five `prove_resume` cells) | `truncate_lowers_end_after` | #248 (#236) |
+| `apply_resume`: range tombstones are replayed | `prove_resume__degrade_F_range__*` cells | to do | #135 |
+| the sync after the truncate | to do: test, or a recorded reason | to do | — |
+
+### Open and recovery
+
+| Site | Guarded by | Mutation | Origin |
+|---|---|---|---|
+| `DB::DB`: each directory open creates is synced in its parent | `directory sync: open syncs each directory it creates` | to do | #199 |
+| `recovery_prepare_files`: a hint-less file is rewritten and synced before it is read | `open makes a hint-less file durable before it indexes it: a process killed before its sync` | `open_trusts_page_cache` | #240 (#231) |
+| `recovery_check_tail`: a tail is cut only in the newest file | `DB recovery: a hint-less file's tail is truncated only in the newest file` | to do | #206 (#138) |
+| `truncate_durably`: the cut tail's new size is synced | to do: test, or a recorded reason | to do | — |
+| `recovery_undo_interrupted_vacuum`: only a compacted copy of the other file is removed | `recovery undoes a vacuum killed before the source was unlinked` | to do | #137 |
+| recovery workers rethrow instead of terminating | `DB parallel recovery: an unrebuildable hint throws instead of …` | to do | BC-157, #270 |
+| `recovery_prepare_files`: stale `.tmp` files are removed | not needed: a `.tmp` is never a source of truth | — | — |
+| `ReadOnlyMmapDataFile::scan` of a truncated file | to do: no test | to do | ed3ad5df |
+
+### `close()` and replication
+
+| Site | Guarded by | Mutation | Origin |
+|---|---|---|---|
+| `close()`: the final `fdatasync` and its error | `close() throws when its fdatasync fails, closes all the same, …` | `close_swallows_error` | #260 (#257) |
+| `close()`: a degraded engine reports writes that are not durable | `close() on a degraded engine reports acknowledged writes …` | to do | #260 |
+| `close()`: the active file's hint | not needed: without it the next open rewrites the hint-less file, which costs time only (`a clean close writes the active file's hint` checks it) | — | #240 |
+| `set_mode(Follower)`: unsynced acknowledged writes are synced | `set_mode(Follower) makes unsynced acknowledged writes durable` | to do | #190 |
+| `set_mode(Follower)`: that sync failing degrades | `set_mode(Follower): a failed fdatasync degrades and keeps the mode` | to do | #190 |
+| `create_manifest`: a failed sync degrades | `create_manifest whose fdatasync fails degrades, …` | `manifest_sync_keeps_healthy` | #282 (#281) |
+| `create_manifest`: a failed rotation degrades | `prove_manifest__*__rotation_fails` cells | to do | — |
+| `ingest`: each sync before publishing; a failure degrades | to do: find the guarding cells | to do | — |
+
+The radix key directory's leak on a failed recovery merge (#203) is not a durability site; LeakSanitizer catches it in CI.
 
 ## Output Structure
 

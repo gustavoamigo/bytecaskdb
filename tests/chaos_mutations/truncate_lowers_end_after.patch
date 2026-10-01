@@ -2,32 +2,37 @@ The active file's truncate lowers its logical end only after ftruncate
 succeeds. An ftruncate that cuts the file and then fails leaves the end past
 EOF, and reads of published records near the tail fail while the engine is
 degraded. Reverts #248's ordering (#236).
-The rig cannot prove this one, so it is kept as the record of why. resume()
+The chaos rig cannot catch this one. resume()
 cuts below the logical end only when unpublished records have vanished (a
 failed fdatasync, then an eviction). An ftruncate that cuts and then fails
 there leaves the end stale, but the next resume() - 10 to 110 ms later - scans
 to the real end of file, finds nothing left to cut and succeeds, so the stale
 end lasts one retry. In that window its only symptom is a reader's I/O error,
-which evictions also cause honestly. #248's prove_resume cell, which fails
-io_resume_truncate after the cut lands and reads every published key while
-degraded, is the guard for it.
-Expected: NOT caught.
+which evictions also cause honestly. #248's prove_resume cells, which fail
+io_resume_truncate after the cut lands and read every published key while
+degraded, are the guard for it. Until #280 they could not fail: the fault
+fired after the end was lowered in either order, and now stands in for
+ftruncate's own result.
+Guarded-by: "*__truncate_fails_after_cut"
 diff --git a/bytecaskdb/data_file.cppm b/bytecaskdb/data_file.cppm
-index 62ac80bd..09ae2098 100644
+index 60dfeeaa..1f708a7c 100644
 --- a/bytecaskdb/data_file.cppm
 +++ b/bytecaskdb/data_file.cppm
-@@ -672,12 +672,12 @@ struct WritableFileOps {
+@@ -672,8 +672,6 @@ struct WritableFileOps {
    // past EOF once the cut lands (#246).
    void truncate(Offset new_size) {
      assert(new_size <= logical_end());
 -    set_logical_end(new_size);
 -    zeroed_end_ = new_size;
-     if (::ftruncate(fd_, narrow<off_t>(new_size)) != 0) {
-       throw std::system_error{errno, std::system_category(),
+     const auto rc = ::ftruncate(fd_, narrow<off_t>(new_size));
+     const auto err = errno;
+ #ifdef BYTECASK_TESTING
+@@ -686,6 +684,8 @@ struct WritableFileOps {
+       throw std::system_error{err, std::system_category(),
                                "WritableFileOps::truncate: ftruncate failed"};
      }
 +    set_logical_end(new_size);
 +    zeroed_end_ = new_size;
- #ifdef BYTECASK_TESTING
-     // An ftruncate that cut the file and then reported an error.
-     FAULT_INJECTION_POST_WRITE(io_resume_truncate, fd_, new_size, 0);
+   }
+ 
+   // Keeps the file zero-filled ahead of the write cursor: before an append

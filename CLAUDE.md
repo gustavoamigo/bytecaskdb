@@ -57,14 +57,15 @@ When extending, follow the existing pattern: collect a serial baseline outside t
 
 ### Mutation sets
 
-`tests/soak_mutations/` and `tests/chaos_mutations/` hold deliberate engine breaks that prove the soak and the chaos rig still catch what they should (`scripts/soak_mutation_check.sh`, `scripts/chaos_mutation_check.sh`). Keep them current:
-- A fix for a bug the soak or the chaos rig found adds a patch that reverts the fix, with `Expected: caught.` and one line on what the rig then sees.
+`tests/chaos_mutations/` holds deliberate breaks of the engine's durability sites, each naming the deterministic test that catches it; `tests/soak_mutations/` holds breaks the concurrent soak catches (`scripts/chaos_mutation_check.sh`, `scripts/soak_mutation_check.sh`). The sites, their guards and their mutations are listed in `docs/correctness_validation.md`, *Durability sites*. Keep them current:
+- A new durability site (an `fdatasync`, directory sync, rename, truncate or unlink of a data or hint file, a sync-before-publish ordering, or a degrade on an I/O error) gets a row in that table: its guarding test and mutation, or why none is needed.
+- A fix for a durability bug adds a test that fails without the fix and a patch reverting the fix, with a `Guarded-by: "<test name>"` header naming that test (a Catch2 test spec; `*` is a wildcard). A break nothing has to catch carries `Not needed: <reason>` instead, and is kept as the record of why.
 - Patches apply by three-way merge (`scripts/mutation_patch.sh`, used by both check scripts and `ci.yml`), so a change elsewhere in the file, or to lines a little way off, merges. A patch needs regenerating only when the merge conflicts: when the targeted code changed, or a line directly next to it did. Regenerate it by making the same break and saving `git diff` (the `index` line is what lets it merge later), or delete it if its target is gone; `ci.yml` fails on a conflicting patch.
 - Run the mutation check when a change could alter what it proves, and put its summary in the PR description:
-  - a change to the rig (`tests/chaos/`, `tests/crash/crash_model.h`) or to the mutations themselves runs the whole set: `scripts/chaos_mutation_check.sh`;
-  - a change to engine code a mutation patches runs that mutation: `scripts/chaos_mutation_check.sh 5 tests/chaos_mutations/<name>.patch` (a soak mutation: `scripts/soak_mutation_check.sh <address|thread> 120 tests/soak_mutations/<name>.patch`).
-  Other changes need no run: the set only goes stale when the rig or the code it mutates changes, which is why it is not scheduled.
-- A mutation whose result changes gets its `Expected:` header updated with the reason. One that other code now covers is kept as `Expected: NOT caught` with that reason, not deleted.
+  - a change to a guarding test, or to the mutations themselves, runs the whole set: `scripts/chaos_mutation_check.sh`;
+  - a change to engine code a mutation patches runs that mutation: `scripts/chaos_mutation_check.sh tests/chaos_mutations/<name>.patch` (a soak mutation: `scripts/soak_mutation_check.sh <address|thread> 120 tests/soak_mutations/<name>.patch`);
+  - a change to the chaos rig (`tests/chaos/`, `tests/crash/crash_model.h`) adds `--chaos 5` to see what the rig still catches; that part gates nothing.
+  Other changes need no run: the set only goes stale when the guards or the code it mutates change, which is why it is not scheduled.
 
 ## Commit rules
 

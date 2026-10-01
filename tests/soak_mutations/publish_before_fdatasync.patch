@@ -1,6 +1,8 @@
 Moves the commit flush's state publication ahead of its fdatasync,
 breaking durability-before-visibility. Named in #92's acceptance list.
 Expected: caught.
+Guarded-by: "pipeline: sync write is invisible until its fdatasync returns; a writer appended behind it lands in the next flush"
+
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
 index aab1a99e..f37ce0a8 100644
 --- a/bytecaskdb/bytecask.cppm

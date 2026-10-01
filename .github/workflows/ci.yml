@@ -150,6 +150,14 @@ jobs:
               status=1
             fi
           done
+          # A durability mutation names the deterministic test that catches
+          # it, or why nothing has to (scripts/chaos_mutation_check.sh).
+          for p in tests/chaos_mutations/*.patch; do
+            if ! grep -q -E '^(Guarded-by: ".+"|Not needed: .+)$' "$p"; then
+              echo "::error file=$p::needs a Guarded-by: or Not needed: header"
+              status=1
+            fi
+          done
           exit "$status"
 
   radix-keydir:

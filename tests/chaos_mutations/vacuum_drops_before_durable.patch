@@ -6,9 +6,10 @@ a power cut before they are synced, so every life ends in a power cut and
 nothing slows the workload down:
 Budget: 10
 Disable: sigkill,clean,read_eio,meta_eio,short,enospc,erofs,latency,stall,rlimit_as,rlimit_nofile
-Caught in 2 of 5 runs of 10 minutes, focused or not: the coincidence is
-rare, so it is not held to the budget.
-Expected: caught (rare).
+The rig caught it in 2 of 5 runs of 10 minutes, focused or not; the guard
+cuts the power right after the vacuum.
+Guarded-by: "vacuum does not drop a durable record that only an unsynced write supersedes"
+
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
 index aab1a99e..a060b39e 100644
 --- a/bytecaskdb/bytecask.cppm

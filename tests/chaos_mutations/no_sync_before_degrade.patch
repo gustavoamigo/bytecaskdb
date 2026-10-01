@@ -1,7 +1,8 @@
 A failed append degrades without first syncing what the page cache holds
 (classes B1-B3). resume() now rewrites and syncs the tail before it trusts
 it (#240), so nothing it publishes depends on that sync.
-Expected: NOT caught.
+Not needed: resume() rewrites and syncs the active file before it trusts it (#240).
+
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
 index aab1a99e..3bc3f195 100644
 --- a/bytecaskdb/bytecask.cppm

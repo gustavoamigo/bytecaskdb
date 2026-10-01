@@ -5,11 +5,11 @@ a hint that later fails its CRC is rebuilt by a scan that skips the tail
 handling, since a file with a hint was sealed. Torn in place by a power cut,
 the hint sends the next open to that scan over an untrimmed tail, and
 DB::open refuses the database. (The design first expected this to survive.)
-It takes a power cut inside the few milliseconds of an open's hint write.
-Unfocused runs caught it twice in about 45 minutes; focusing on power cuts
-without the latency and stalls that slow opens down caught it less, so it
-runs unfocused and is not held to a budget.
-Expected: caught (rare).
+The chaos rig needs a power cut inside the few milliseconds of an open's hint
+write, and caught it twice in about 45 minutes. The guard fails the hint
+write itself, after its frames and before its trailer.
+Guarded-by: "DB recovery: a crash while open writes a hint leaves no hint behind it, and the next open recovers"
+
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
 index aab1a99e..840bff15 100644
 --- a/bytecaskdb/bytecask.cppm

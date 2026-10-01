@@ -1,7 +1,10 @@
 A new data file's directory entry is not synced before the first write into
 it is acknowledged, so a power cut can drop the file's name and the durable
 writes in it (#199).
-Expected: caught.
+Guarded-by: "directory sync: a failed sync at rotation degrades before the new file takes a write"
+Guarded-by: "directory sync: a failed sync in resume() stays degraded"
+Guarded-by: "directory sync: open fails when the active file's entry cannot be synced"
+
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
 index aab1a99e..beed67de 100644
 --- a/bytecaskdb/bytecask.cppm

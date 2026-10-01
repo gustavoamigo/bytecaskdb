@@ -243,11 +243,12 @@ images.
 ## Proving the rig
 
 Like the soak, the rig earns its cost only if it catches what nothing else
-does. `tests/chaos_mutations/` holds mutations of the engine, each with an
-`Expected: caught | NOT caught` header, and `scripts/chaos_mutation_check.sh
-[minutes] [patch...]` applies each, rebuilds `chaos_worker`, runs the rig on
-two seeds with a budget per seed, and fails if a mutation expected to be
-caught survives (#268). A patch can carry `Budget: N` minutes and `Disable:
+does. `tests/chaos_mutations/` holds mutations of the engine (#268). The
+check that gates them is deterministic now: each mutation names the test that
+guards its site (`Guarded-by:`), and `scripts/chaos_mutation_check.sh` fails if
+that test passes with the mutation applied (#280, [`correctness_validation.md`](correctness_validation.md), *Durability sites*).
+`--chaos MINUTES` runs the rig on each mutation as well, on two seeds with a
+budget per seed, and reports what it catches without gating. A patch can carry `Budget: N` minutes and `Disable:
 a,b`, the hazards to leave out so the run concentrates on the ones that reach
 it; with read faults, evictions and the descriptor limit all left out, the
 worker's readers also count a read's I/O error as a violation
@@ -256,7 +257,7 @@ worker's readers also count a read's I/O error as a violation
 Most mutations revert a fix the rig prompted, so the set also guards those
 fixes:
 
-| Mutation | Reverts | Result |
+| Mutation | Reverts | Rig result |
 |---|---|---|
 | `commit_skips_fdatasync`: the commit flush skips its `fdatasync` and still reports durable | — | caught in ~20 s, every run |
 | `no_dir_sync_new_data_file`: a new data file's name is not synced | #199 | caught in 30–90 s, every run |
@@ -269,9 +270,9 @@ fixes:
 | `no_sync_before_degrade`: a failed append degrades without syncing | — | not caught: #240's rewrite in `resume()` covers it |
 | `truncate_lowers_end_after`: the logical end drops after `ftruncate`, not before | #248 (#236) | not caught: the stale end lasts one `resume()` retry; #248's `prove_resume` cell guards it |
 
-"Rare" (`Expected: caught (rare)`) marks a mutation the rig catches but not
-within a fixed budget: the script runs and reports it, and a survival is not a
-failure.
+The rare catches are what moved the gate to deterministic tests: a
+mutation the rig catches once in several runs proves nothing on the run that
+misses it.
 
 What building the set taught:
 

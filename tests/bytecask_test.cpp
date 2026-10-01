@@ -1463,6 +1463,45 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
   }
 }
 
+// A hint is written to .hint.tmp and renamed into place, so ".hint exists"
+// means "the hint is complete". Open writes a hint-less file's hint before it
+// trims the file's torn tail, and a hint that later fails its CRC is rebuilt
+// by a scan that does no tail handling, since a file with a hint was sealed.
+// A hint torn in place by a crash during that open would send the next one
+// to that scan over the torn tail, and it would refuse the database.
+TEST_CASE("DB recovery: a crash while open writes a hint leaves no hint behind "
+          "it, and the next open recovers",
+          "[bytecask][recovery][corruption]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  const bytecask::Options opts{.max_file_bytes = 100};
+  {
+    auto db = bytecask::DB::open(dir, opts);
+    for (int i = 0; i < 14; ++i)
+      db.put({.sync = true}, to_bytes(std::format("k{:x}", i)),
+             to_bytes(std::format("v{:x}", i)));
+  }
+  const auto files = data_files_by_sequence(dir);
+  REQUIRE(files.size() == 3);
+  drop_hint(files[2]);
+  tear_last_entry(files[2]);
+
+  {
+    // The crash: the hint's frames are written, its trailer is not.
+    bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
+    REQUIRE_THROWS(bytecask::DB::open(dir, opts));
+  }
+  auto hint = files[2];
+  hint.replace_extension(".hint");
+  CHECK_FALSE(std::filesystem::exists(hint));
+
+  auto db = bytecask::DB::open(dir, opts);
+  for (int i = 0; i < 13; ++i) {
+    INFO("key " << i);
+    CHECK(db.contains_key({}, to_bytes(std::format("k{:x}", i))));
+  }
+}
+
 TEST_CASE("DB read: a record past the end of its file names the file, the "
           "offset and the header",
           "[bytecask][corruption]") {
@@ -6653,6 +6692,35 @@ TEST_CASE("close() makes unsynced writes durable and writes the active "
   auto reopened = bytecask::DB::open(dir);
   check_all_present(reopened);
   CHECK(reopened.durable_sequence() > last);
+}
+
+// The commit promise itself: a sync write that returned is on the device,
+// with nothing after it — no close, no later write — to sync it.
+TEST_CASE("a sync write survives a power cut as soon as it returns",
+          "[fsyncgate][durable_seq]") {
+  for (const auto backend : kFsyncgateBackends) {
+    for (const bool solo : {false, true}) {
+      DYNAMIC_SECTION("io_backend " << static_cast<int>(backend)
+                                    << (solo ? ", solo" : ", group commit")) {
+        bytecask::testing::ScopedPageCacheModel cache;
+        TempDir td;
+        const auto dir = td.path / "db";
+        const auto after_cut = td.path / "after_cut";
+        const auto opts = fsyncgate_opts(backend);
+        {
+          auto db = bytecask::DB::open(dir, opts);
+          const auto r = db.put({.sync = true, .solo = solo},
+                                to_bytes(fsyncgate_key(0)),
+                                to_bytes(fsyncgate_value(0)));
+          CHECK(r.durable);
+          CHECK(db.durable_sequence() >= r.sequence);
+          cache.model.copy_device(dir, after_cut);  // power cut
+        }
+        auto db = bytecask::DB::open(after_cut, opts);
+        CHECK(get_str(db, to_bytes(fsyncgate_key(0))) == fsyncgate_value(0));
+      }
+    }
+  }
 }
 
 // #281: create_manifest's sync is the active file's like any other. Were the
