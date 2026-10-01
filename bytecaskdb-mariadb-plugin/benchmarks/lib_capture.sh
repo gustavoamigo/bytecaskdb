@@ -15,6 +15,9 @@
 #                          mutexes are in the off-CPU profile, not here.
 #   engine status          SHOW ENGINE ... STATUS and SHOW GLOBAL STATUS at the
 #                          start and end of the capture
+#   error.log              the server's error log, through its shutdown after
+#                          the run: whatever it said while loading, starting
+#                          and stopping
 #
 # The profilers slow the server, so a captured cell's NOPM is not comparable
 # with an uncaptured one; its CSV row says capture=on.
@@ -289,8 +292,9 @@ capture_run() {
 # and a description of the host and build. The working directory is removed
 # only once the tarball is complete; otherwise it stays, and the error says
 # where.
-capture_finish() {
-  local out="$1" dest="$2" cnf="$3" run_log="$4"
+capture_finish() {  # capture dir, tarball, file to include...
+  local out="$1" dest="$2"
+  shift 2
   [[ -d "$out" ]] || return 0
   {
     local data
@@ -312,8 +316,8 @@ capture_finish() {
       echo "## git";               git -C "$BYTECASK_ROOT" rev-parse HEAD
                                    git -C "$BYTECASK_ROOT" status --short
     } > "$out/host.txt" 2>&1 || true
-    cp "$cnf" "$out/" || true
-    cp "$run_log" "$out/" || true
+    local f
+    for f in "$@"; do cp "$f" "$out/" || true; done
   } < /dev/null > /dev/null 2>&1
   local err
   if err="$(tar -czf "$dest.partial" -C "$(dirname "$out")" "$(basename "$out")" 2>&1)" &&
