@@ -1985,6 +1985,14 @@ Its topology runs found that a planned transfer lost writes acknowledged
 with `sync = false` (`set_mode(Follower)` now syncs), and that promoting a
 follower other than the most advanced one forks the cluster.
 
+The same writers also run under the chaos rig's hazards (#232):
+`run_chaos.py --workload elle` drives `isolation_history` on chaosfs with
+power loss, failed `fdatasync`, evictions and full disks, so group commit is
+checked under faults, not only under SIGKILL. A read of a write the page
+cache then lost is `:info`; everything durable is held to the cross-check and
+Elle ([`isolation_checking_design.md`](isolation_checking_design.md),
+*Chaos*).
+
 ---
 
 ## Output Structure
