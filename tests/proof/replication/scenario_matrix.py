@@ -86,7 +86,7 @@ ROTATION_ONLY_FAILURES = {IngestFailureClass.I_G, IngestFailureClass.I_H}
 class ManifestFailureClass(Enum):
     SUCCESS = "success"
     M_R = "rotation_fails"
-    M_H = "hint_gen_fails"
+    M_S = "sync_fails"
 
 
 MANIFEST_FAILURE_CLASSES = list(ManifestFailureClass)

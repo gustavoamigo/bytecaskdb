@@ -4415,11 +4415,10 @@ auto DB::create_manifest() -> FileManifest {
 
     auto t = current->transient();
 
-    // Sync active file to make all entries durable.
-    auto &file = t.active_file();
-    file.sync();
+    // Make every entry durable before sealing. A failure degrades: the pages
+    // it left clean are written by no later fdatasync (#231, #281).
+    sync_active_file(t, current, "create_manifest");
     const auto max_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
-    t.apply_sync(max_seq);
 
     // Seal active file, dispatch hint generation, open new active.
     try {

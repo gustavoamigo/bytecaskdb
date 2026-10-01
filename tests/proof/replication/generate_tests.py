@@ -797,25 +797,20 @@ def gen_manifest_test(state: StateShape, failure: ManifestFailureClass) -> str:
                 "    REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);"
             )
 
-        # Post-failure assertions.
-        if delta.degraded:
-            parts.append("")
-            parts.append("    // Engine must be degraded — sealed active file is unusable.")
-            parts.append("    CHECK(leader.is_degraded());")
-            parts.append("    assert_consistent(leader);")
-            parts.append("")
-            parts.append("    // resume() must recover.")
-            parts.append("    assert_resumable(leader);")
-            parts.append("")
-            parts.append("    // After resume, writes must succeed.")
-            parts.append('    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));')
-        else:
-            parts.append("")
-            parts.append("    // Engine must NOT be degraded — failure was before seal.")
-            parts.append("    CHECK_FALSE(leader.is_degraded());")
-            parts.append("")
-            parts.append("    // Writes must still succeed.")
-            parts.append('    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));')
+        # Post-failure assertions. Every manifest failure degrades: a failed
+        # sync cannot be retried on trust (#281), and a failed rotation leaves
+        # the active file sealed.
+        assert delta.degraded, f"{failure} must degrade"
+        parts.append("")
+        parts.append("    // Engine must be degraded.")
+        parts.append("    CHECK(leader.is_degraded());")
+        parts.append("    assert_consistent(leader);")
+        parts.append("")
+        parts.append("    // resume() must recover.")
+        parts.append("    assert_resumable(leader);")
+        parts.append("")
+        parts.append("    // After resume, writes must succeed.")
+        parts.append('    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));')
 
     parts.append("  }")
     parts.append("}")
