@@ -7,9 +7,21 @@
 # attribute samples to inlined functions and source lines (run-hammerdb.sh
 # --capture). GCC generates the same code with -g as without. The flags are
 # passed on every configure, so a cached CMAKE_CXX_FLAGS_RELEASE cannot linger.
+#
+# Both the engine library and the plugin are built from scratch every time
+# (see lib_build.sh), unless BENCH_LIB_FRESH=1 says the caller has just built
+# the library on this host, as compare-refs.sh does once per tree.
 build_bytecaskdb_plugin() {
+  if [[ "${BENCH_LIB_FRESH:-}" != 1 ]]; then
+    # shellcheck source=lib_build.sh
+    source "$BYTECASK_ROOT/bytecaskdb-mariadb-plugin/benchmarks/lib_build.sh"
+    build_bytecask_lib "$BYTECASK_ROOT" "$(bench_keydir "$BYTECASK_ROOT")" || {
+      echo "ERROR: libbytecask.a build failed"; exit 1;
+    }
+  fi
   echo "=== Building ByteCaskDB plugin (Release, with debug info) ==="
   local plugin_src="$BYTECASK_ROOT/bytecaskdb-mariadb-plugin"
+  rm -rf "$PLUGIN_DIR"
   cmake -S "$plugin_src" -B "$PLUGIN_DIR" -DCMAKE_BUILD_TYPE=Release \
     "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG -g" || {
     echo "ERROR: plugin configure failed"; exit 1;
