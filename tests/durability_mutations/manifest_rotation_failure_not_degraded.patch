@@ -1,0 +1,17 @@
+create_manifest publishes a healthy state when its rotation seals the
+active file and cannot create the next one. Reverts 362cc590.
+Guarded-by: "prove_manifest__*"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..83904d55 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -4424,7 +4424,7 @@ auto DB::create_manifest() -> FileManifest {
+     try {
+       rotate_active_file(t, current);
+     } catch (...) {
+-      t.apply_degrade(
++      (void)(
+           "create_manifest rotation failed: active file is sealed "
+           "but new file could not be created. Call resume() to recover.");
+       store_state(current, std::move(t).persistent());

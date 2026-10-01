@@ -1,0 +1,18 @@
+Vacuum unlinks the source without syncing the directory after the rename:
+a power cut can keep the unlink and lose the rename, and the next open
+deletes the compacted copy as staging. Reverts #200's vacuum site (#199).
+Guarded-by: "directory sync: a failed sync in vacuum keeps the source"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..0f9df741 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -4022,7 +4022,7 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
+   // The source is unlinked once this commits. Were that unlink durable and
+   // the rename not, the next open would find only .data.tmp, delete it as
+   // staging, and lose every live entry the source held.
+-  sync_directory(dir_, "io_dir_sync_vacuum");
++  (void)dir_;
+ #ifdef BYTECASK_TESTING
+   // Class G in docs/correctness_validation.md: the rename completed and the
+   // process did not get to confirm it. The compacted file is on disk under its

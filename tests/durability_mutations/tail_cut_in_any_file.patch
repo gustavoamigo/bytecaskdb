@@ -1,0 +1,18 @@
+open truncates a hint-less file at its first bad record whichever file it
+is, cutting synced data in a sealed file as if it were a torn tail.
+Reverts #206 (#138).
+Guarded-by: "DB recovery: a hint-less file's tail is truncated only in the newest file"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..d10b2d7e 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -4999,7 +4999,7 @@ auto tail_is_zero(const DataFile &file, Offset end) -> bool {
+ void DB::recovery_check_tail(
+     const DataFile &file, Offset end,
+     const std::vector<std::filesystem::path> &data_paths) {
+-  if (tail_is_zero(file, end)) return;
++  return;
+   const auto seq = first_sequence(file);
+   if (seq == 0) return;
+   for (const auto &other : data_paths) {

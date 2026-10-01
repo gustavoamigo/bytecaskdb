@@ -1,6 +1,8 @@
 The commit flush skips its fdatasync and still publishes durable_seq, so a
 sync write returns durable = true with its bytes only in the page cache.
 Expected: caught.
+Guarded-by: "a sync write survives a power cut as soon as it returns"
+
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
 index aab1a99e..8272b9d7 100644
 --- a/bytecaskdb/bytecask.cppm

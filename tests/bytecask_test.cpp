@@ -1463,6 +1463,78 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
   }
 }
 
+// A hint is written to .hint.tmp and renamed into place, so ".hint exists"
+// means "the hint is complete". Open writes a hint-less file's hint before it
+// trims the file's torn tail, and a hint that later fails its CRC is rebuilt
+// by a scan that does no tail handling, since a file with a hint was sealed.
+// A hint torn in place by a crash during that open would send the next one
+// to that scan over the torn tail, and it would refuse the database.
+TEST_CASE("DB recovery: a crash while open writes a hint leaves no hint behind "
+          "it, and the next open recovers",
+          "[bytecask][recovery][corruption]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  const bytecask::Options opts{.max_file_bytes = 100};
+  {
+    auto db = bytecask::DB::open(dir, opts);
+    for (int i = 0; i < 14; ++i)
+      db.put({.sync = true}, to_bytes(std::format("k{:x}", i)),
+             to_bytes(std::format("v{:x}", i)));
+  }
+  const auto files = data_files_by_sequence(dir);
+  REQUIRE(files.size() == 3);
+  drop_hint(files[2]);
+  tear_last_entry(files[2]);
+
+  {
+    // The crash: the hint's frames are written, its trailer is not.
+    bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
+    REQUIRE_THROWS(bytecask::DB::open(dir, opts));
+  }
+  auto hint = files[2];
+  hint.replace_extension(".hint");
+  CHECK_FALSE(std::filesystem::exists(hint));
+
+  auto db = bytecask::DB::open(dir, opts);
+  for (int i = 0; i < 13; ++i) {
+    INFO("key " << i);
+    CHECK(db.contains_key({}, to_bytes(std::format("k{:x}", i))));
+  }
+}
+
+// Open cuts a torn tail with truncate_durably, whose fdatasync persists the
+// new length. The first io_rewrite_sync is the hint-less file's rewrite, the
+// second the cut's; failing the second fails the open only while it is made.
+TEST_CASE("DB recovery: open fails when the cut of a torn tail cannot be "
+          "synced, and the next open recovers",
+          "[bytecask][recovery][corruption]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  const bytecask::Options opts{.max_file_bytes = 100};
+  {
+    auto db = bytecask::DB::open(dir, opts);
+    for (int i = 0; i < 14; ++i)
+      db.put({.sync = true}, to_bytes(std::format("k{:x}", i)),
+             to_bytes(std::format("v{:x}", i)));
+  }
+  const auto files = data_files_by_sequence(dir);
+  REQUIRE(files.size() == 3);
+  drop_hint(files[2]);
+  tear_last_entry(files[2]);
+
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_rewrite_sync"};
+    fi.inj.fail_on_nth_match = 2;
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, opts), std::system_error);
+  }
+
+  auto db = bytecask::DB::open(dir, opts);
+  for (int i = 0; i < 13; ++i) {
+    INFO("key " << i);
+    CHECK(db.contains_key({}, to_bytes(std::format("k{:x}", i))));
+  }
+}
+
 TEST_CASE("DB read: a record past the end of its file names the file, the "
           "offset and the header",
           "[bytecask][corruption]") {
@@ -6387,6 +6459,34 @@ auto degrade_with_unsynced_batch(bytecask::DB &db,
 
 }  // namespace
 
+// The truncate's new length is metadata only an fdatasync persists. The
+// test fails the first data file sync resume() makes after its rewrite —
+// the one after the truncate — so it fails only while that sync is made.
+TEST_CASE("resume() stays degraded when the sync after its truncate fails",
+          "[degraded][resume]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+  const auto offsets = degrade_with_unsynced_batch(db, dir);
+  REQUIRE(offsets.size() == 6);  // k1, k2, BulkBegin, b1, b2, BulkEnd
+  // A damaged entry in the unpublished batch: resume() cuts the file there.
+  flip_byte(active_data_file(dir), offsets[3] + 15);
+
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    CHECK_THROWS_AS(db.resume(), std::system_error);
+  }
+  CHECK(db.is_degraded());
+
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+  CHECK(get_str(db, to_bytes("k1")) == "v1");
+  CHECK(get_str(db, to_bytes("k2")) == "v2");
+  CHECK_FALSE(db.contains_key({}, to_bytes("b1")));
+}
+
 TEST_CASE("resume() discards pending batch on CRC error in active file",
           "[degraded][resume]") {
   TempDir td;
@@ -6653,6 +6753,35 @@ TEST_CASE("close() makes unsynced writes durable and writes the active "
   auto reopened = bytecask::DB::open(dir);
   check_all_present(reopened);
   CHECK(reopened.durable_sequence() > last);
+}
+
+// The commit promise itself: a sync write that returned is on the device,
+// with nothing after it — no close, no later write — to sync it.
+TEST_CASE("a sync write survives a power cut as soon as it returns",
+          "[fsyncgate][durable_seq]") {
+  for (const auto backend : kFsyncgateBackends) {
+    for (const bool solo : {false, true}) {
+      DYNAMIC_SECTION("io_backend " << static_cast<int>(backend)
+                                    << (solo ? ", solo" : ", group commit")) {
+        bytecask::testing::ScopedPageCacheModel cache;
+        TempDir td;
+        const auto dir = td.path / "db";
+        const auto after_cut = td.path / "after_cut";
+        const auto opts = fsyncgate_opts(backend);
+        {
+          auto db = bytecask::DB::open(dir, opts);
+          const auto r = db.put({.sync = true, .solo = solo},
+                                to_bytes(fsyncgate_key(0)),
+                                to_bytes(fsyncgate_value(0)));
+          CHECK(r.durable);
+          CHECK(db.durable_sequence() >= r.sequence);
+          cache.model.copy_device(dir, after_cut);  // power cut
+        }
+        auto db = bytecask::DB::open(after_cut, opts);
+        CHECK(get_str(db, to_bytes(fsyncgate_key(0))) == fsyncgate_value(0));
+      }
+    }
+  }
 }
 
 // #281: create_manifest's sync is the active file's like any other. Were the
@@ -8675,18 +8804,27 @@ TEST_CASE("vacuum preserves BulkBegin/BulkEnd markers", "[vacuum][batch]") {
   bytecask::WritePlan plan;
   plan.put(to_bytes("a"), to_bytes("new_a"));
   plan.put(to_bytes("b"), to_bytes("new_b"));
+  plan.put(to_bytes("c"), to_bytes("new_c"));
   (void)db.apply_batch({}, std::move(plan));
+  // A later write makes one of the batch's entries dead, so the batch's file
+  // is compacted: a file holding only live entries never is, and would keep
+  // its markers whatever compaction does with them.
+  db.put({}, to_bytes("c"), to_bytes("newer_c"));
 
-  // Vacuum — the batch file has live entries, so markers should be preserved.
+  // Vacuum — the batch file keeps live entries, so its markers must be kept.
   for (int i = 0; i < 10 && db.vacuum({.fragmentation_threshold = 0.0}); ++i) {}
 
   // Verify data is correct.
   auto va = get_val(db, to_bytes("a"));
   auto vb = get_val(db, to_bytes("b"));
+  auto vc = get_val(db, to_bytes("c"));
   REQUIRE(va.has_value());
   REQUIRE(vb.has_value());
+  REQUIRE(vc.has_value());
   CHECK(to_string(*va) == "new_a");
   CHECK(to_string(*vb) == "new_b");
+  CHECK(to_string(*vc) == "newer_c");
+  CHECK(db.stats().at("bytecask.vacuum_bytes_reclaimed") > 0);
 
   // Scan vacuumed files for BulkBegin/BulkEnd markers.
   bool found_begin = false;
@@ -8796,6 +8934,28 @@ TEST_CASE("batch write covers marker sequences", "[file_stats_seq]") {
   const auto &[fid, fs] = *stats.begin();
   CHECK(fs.min_sequence == 1);
   CHECK(fs.max_sequence == 5);
+}
+
+// A batch's end marker carries the highest sequence of the batch. A restart
+// rebuilds next_seq from the hint files, so they must keep the markers, or
+// the next write reuses the marker's sequence.
+TEST_CASE("a write after a restart does not reuse a batch marker's sequence",
+          "[file_stats_seq][recovery]") {
+  TempDir td;
+  std::uint64_t batch_end = 0;
+  {
+    auto db = bytecask::DB::open(td.path);
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k1"), to_bytes("v1"));
+    plan.put(to_bytes("k2"), to_bytes("v2"));
+    const auto r = db.apply_batch({.sync = true}, std::move(plan));
+    REQUIRE(r.has_value());
+    batch_end = r->sequence;  // the BulkEnd's
+  }
+  auto db = bytecask::DB::open(td.path);
+  CHECK(db.durable_sequence() == batch_end);
+  CHECK(db.put({.sync = true}, to_bytes("k3"), to_bytes("v3")).sequence >
+        batch_end);
 }
 
 TEST_CASE("rotation preserves sealed file bounds and resets new",

@@ -34,6 +34,15 @@ static inline int portable_fdatasync(int fd) { return fcntl(fd, F_FULLFSYNC); }
 static inline int portable_fdatasync(int fd) { return fdatasync(fd); }
 #endif
 
+// The hint's fdatasync, with its fault point in the same call: a test that
+// fails io_hint_sync fails only while the hint is still synced.
+static inline int sync_hint(int fd) {
+#ifdef BYTECASK_TESTING
+  FAULT_INJECTION(io_hint_sync);
+#endif
+  return portable_fdatasync(fd);
+}
+
 export module bytecask.hint_file;
 
 import bytecask.hint_entry;
@@ -587,10 +596,7 @@ public:
       throw std::system_error{err, std::generic_category(),
                               "HintFile::close: write CRC trailer failed"};
     }
-#ifdef BYTECASK_TESTING
-    FAULT_INJECTION(io_hint_sync);
-#endif
-    if (portable_fdatasync(write_fd_) != 0) {
+    if (sync_hint(write_fd_) != 0) {
       const auto err = errno;
       ::close(write_fd_);
       write_fd_ = -1;

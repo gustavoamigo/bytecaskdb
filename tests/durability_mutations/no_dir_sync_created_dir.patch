@@ -1,0 +1,17 @@
+open creates the database directory without syncing its parent, so a power
+cut can lose the directory and every file in it. Reverts #200's site (#199).
+Guarded-by: "directory sync: open syncs each directory it creates"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..faa7f101 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -2662,7 +2662,7 @@ DB::DB(std::filesystem::path dir, Options opts)
+   }
+   std::filesystem::create_directories(dir_);
+   for (const auto &p : created)
+-    sync_directory(p.parent_path(), "io_dir_sync_create_dir");
++    (void)p;
+ 
+   // Acquire exclusive advisory lock on the database directory.
+   const auto lock_path = dir_ / ".lock";

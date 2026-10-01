@@ -1,0 +1,17 @@
+Any error opening a hint removes it and rebuilds it, including EMFILE or
+ENOMEM, which say nothing about its bytes: a good hint is deleted and the
+rebuild fails the same way. Reverts #270 (#262).
+Guarded-by: "DB::open leaves a hint alone on an error that says nothing about*"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..c21fe845 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3665,7 +3665,6 @@ auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
+   try {
+     return HintFile::OpenForRead(hint_path);
+   } catch (const std::exception &e) {
+-    if (!is_file_damage(e)) throw;
+     // flush_hints_for leaves an existing hint alone, so the damaged one has
+     // to go first. Nothing is lost by removing it: it is unreadable either
+     // way, and a rebuild that does not finish here leaves the file hint-less,

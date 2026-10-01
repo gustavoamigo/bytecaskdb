@@ -1,0 +1,27 @@
+A new data file is opened without O_EXCL, so a reused name reopens a live
+file instead of panicking, and its appends land where recovery does not look.
+Reverts #35.
+Guarded-by: "createDataFileForWrite panics when the data file already exists"
+
+diff --git a/bytecaskdb/data_file.cppm b/bytecaskdb/data_file.cppm
+index 60dfeeaa..9c4bbd96 100644
+--- a/bytecaskdb/data_file.cppm
++++ b/bytecaskdb/data_file.cppm
+@@ -947,7 +947,7 @@ private:
+                        bool exclusive)
+       : WritableDataFile{std::move(path)} {
+     ops_.fd_ = ::open(path_.c_str(),
+-                      O_RDWR | O_CREAT | O_CLOEXEC | (exclusive ? O_EXCL : 0),
++                      O_RDWR | O_CREAT | O_CLOEXEC,
+                       0644);
+     if (ops_.fd_ == -1) {
+       if (exclusive && errno == EEXIST) panic_on_reused_path(path_);
+@@ -1176,7 +1176,7 @@ private:
+                     bool exclusive, Io io)
+       : WritableDataFile{std::move(path)}, ops_{std::move(io)} {
+     ops_.fd_ = ::open(path_.c_str(),
+-                      O_RDWR | O_CREAT | O_CLOEXEC | (exclusive ? O_EXCL : 0),
++                      O_RDWR | O_CREAT | O_CLOEXEC,
+                       0644);
+     if (ops_.fd_ == -1) {
+       if (exclusive && errno == EEXIST) panic_on_reused_path(path_);

@@ -1,0 +1,17 @@
+close() on a degraded engine returns quietly although writes it
+acknowledged are not durable. Reverts part of #260 (#257).
+Guarded-by: "close() on a degraded engine reports acknowledged writes*"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..d7147df5 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -2754,7 +2754,7 @@ void DB::close() {
+       // clean that a later one does not write (#231). What was durable when
+       // the engine degraded is what is durable. The trim is best effort; a
+       // degraded active file may already be sealed.
+-      if (t.durable_seq() < last_seq) {
++      if (false) {
+         error = std::make_exception_ptr(DbDegraded{std::format(
+             "close: writes after sequence {} were acknowledged but are not "
+             "durable; the engine was degraded: {}",

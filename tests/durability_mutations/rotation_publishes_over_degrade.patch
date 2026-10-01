@@ -1,0 +1,17 @@
+A rotating batch behind a failed flush publishes its state over the degrade,
+clearing it without resume() while flush_error_ stays set. Reverts #170.
+Guarded-by: "pipeline: rotation behind a failed flush stays degraded"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..c0945966 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3136,7 +3136,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
+   // flush_error_ set under a healthy-looking state. The batch fails with
+   // that flush's error, like every other write appended behind it; resume()
+   // recovers its bytes with theirs.
+-  if (published->degraded) {
++  if (false) {
+     std::exception_ptr ex;
+     {
+       std::lock_guard<std::mutex> lk{durable_mu_};

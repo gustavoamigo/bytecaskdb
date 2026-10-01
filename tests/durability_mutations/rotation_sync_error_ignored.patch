@@ -1,0 +1,18 @@
+A failed rotation fdatasync is ignored: the file is sealed and the batch
+reported durable as if the sync had succeeded. Reverts BC-155.
+Guarded-by: "class G: key not visible after rotation sync failure"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..7f2f833c 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3153,6 +3153,9 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
+     counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
+     t.apply_sync(batch_max_seq);
+   } catch (...) {
++    t.apply_sync(batch_max_seq);
++  }
++  if (false) {
+     auto ex = std::current_exception();
+     auto err_s = published->degraded_copy(std::format(
+         "rotation fdatasync failed on '{}': bytes in page cache but "

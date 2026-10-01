@@ -1,0 +1,20 @@
+A leader stepping down ignores a failed fdatasync and switches mode with
+its unsynced writes unconfirmed. Reverts #190's failure path.
+Guarded-by: "set_mode(Follower): a failed fdatasync degrades and keeps the mode"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..94693ae5 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -4193,7 +4193,10 @@ void DB::set_mode(Mode mode) {
+   const auto last_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
+   if (mode == Mode::Follower && current->mode == Mode::Leader
+       && !current->degraded && t.durable_seq() < last_seq) {
+-    sync_active_file(t, current, "set_mode(Follower)");
++    try {
++      t.active_file().sync();
++    } catch (...) {
++    }
+   }
+   t.apply_set_mode(mode);
+   store_state(current, std::move(t).persistent());

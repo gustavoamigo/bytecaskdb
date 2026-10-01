@@ -1,0 +1,17 @@
+open cuts a torn tail without syncing the new length, so a power cut can
+bring the torn record back into a file that now has a hint, where a later
+hint rebuild refuses it.
+Guarded-by: "DB recovery: open fails when the cut of a torn tail cannot be synced*"
+
+diff --git a/bytecaskdb/data_file.cppm b/bytecaskdb/data_file.cppm
+index 60dfeeaa..f8ebe1b2 100644
+--- a/bytecaskdb/data_file.cppm
++++ b/bytecaskdb/data_file.cppm
+@@ -2016,7 +2016,6 @@ export void truncate_durably(const std::filesystem::path &path, Offset size) {
+         errno, std::generic_category(),
+         std::format("bytecask: truncate of '{}' failed", path.string())};
+   }
+-  f.sync();
+ }
+ 
+ // What a sweep does at an entry that fails its CRC. Throw is the default:

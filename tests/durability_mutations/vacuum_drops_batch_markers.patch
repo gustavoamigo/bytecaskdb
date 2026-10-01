@@ -1,0 +1,16 @@
+Compaction drops BulkBegin/BulkEnd markers, so a compacted batch is no
+longer atomic at recovery. Reverts BC-197.
+Guarded-by: "vacuum preserves BulkBegin/BulkEnd markers"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..6c39bda1 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3885,6 +3885,7 @@ auto DB::vacuum_scan_and_copy(
+     }
+     case EntryType::BulkBegin:
+     case EntryType::BulkEnd:
++      break;
+       std::ignore =
+           dest_file.append_entry(entry.sequence, entry.entry_type, {}, {});
+       // A marker occupies a header and a CRC in the compacted file, exactly

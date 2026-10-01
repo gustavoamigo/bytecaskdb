@@ -1,0 +1,21 @@
+An exception in a recovery worker escapes its thread and calls
+std::terminate instead of failing the open. Reverts BC-157.
+Guarded-by: "DB parallel recovery: an unrebuildable hint throws instead of*"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..13834aa6 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -5432,11 +5432,7 @@ static void recovery_parallel_for(unsigned n, Body &body) {
+     threads.reserve(n);
+     for (unsigned i = 0; i < n; ++i) {
+       threads.emplace_back([&body, &errors, i] {
+-        try {
+-          body(i);
+-        } catch (...) {
+-          errors[i] = std::current_exception();
+-        }
++        body(i);
+       });
+     }
+   }

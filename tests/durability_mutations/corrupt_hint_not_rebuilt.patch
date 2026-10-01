@@ -1,0 +1,17 @@
+A hint that fails its CRC or a read is not rebuilt from its data file: open
+refuses (strict) or skips the file and its keys (lenient). Reverts #123.
+Guarded-by: "DB recovery: a corrupt hint is rebuilt from its data file"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..e2662df1 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3665,7 +3665,7 @@ auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
+   try {
+     return HintFile::OpenForRead(hint_path);
+   } catch (const std::exception &e) {
+-    if (!is_file_damage(e)) throw;
++    throw;
+     // flush_hints_for leaves an existing hint alone, so the damaged one has
+     // to go first. Nothing is lost by removing it: it is unreadable either
+     // way, and a rebuild that does not finish here leaves the file hint-less,
