@@ -3019,6 +3019,17 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
 // runs sync / rotate / publish inline, once per max_file_bytes.
 void DB::execute_slots(std::vector<Slot *> &batch) {
   std::lock_guard<std::mutex> wg{*write_mu_};
+  // Declared after the lock, so it measures only the time the lock is held.
+  struct BusyTimer {
+    std::atomic<std::int64_t> &total;
+    std::chrono::steady_clock::time_point start{std::chrono::steady_clock::now()};
+    ~BusyTimer() {
+      total.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - start)
+                          .count(),
+                      std::memory_order_relaxed);
+    }
+  } busy{counters_.group_writer_busy_ns};
 
   // Admission is decided on the published state, not the head: a flush
   // fails without write_mu_ and head_ is only reset by the next barrier,
@@ -4126,6 +4137,8 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.group_writer_batches.load(std::memory_order_relaxed)},
       {"bytecask.group_writer_coalesced",
        counters_.group_writer_coalesced.load(std::memory_order_relaxed)},
+      {"bytecask.group_writer_busy_us",
+       counters_.group_writer_busy_ns.load(std::memory_order_relaxed) / 1000},
       {"bytecask.file_rotations",
        counters_.file_rotations.load(std::memory_order_relaxed)},
       {"bytecask.fsyncs",
