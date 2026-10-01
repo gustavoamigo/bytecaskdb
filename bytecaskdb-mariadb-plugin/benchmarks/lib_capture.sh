@@ -15,6 +15,9 @@
 #                          mutexes are in the off-CPU profile, not here.
 #   engine status          SHOW ENGINE ... STATUS and SHOW GLOBAL STATUS at the
 #                          start and end of the capture
+#   variables.txt          SHOW GLOBAL VARIABLES: the settings the server ran
+#                          with — its .cnf (also packed), MariaDB's defaults
+#                          and the command line — and its exact version
 #   error.log              the server's error log, through its shutdown after
 #                          the run: whatever it said while loading, starting
 #                          and stopping
@@ -263,6 +266,8 @@ capture_run() {
   mkdir -p "$out"
   {
     capture_status "$engine" "$socket" > "$out/status_start.txt" || true
+    mariadb --socket="$socket" -u root -e "SHOW GLOBAL VARIABLES" \
+      > "$out/variables.txt" 2>&1 || true
     local samplers=()
     mpstat -P ALL 1 "$CAPTURE_SECONDS" > "$out/mpstat.txt" 2>&1 & samplers+=($!)
     vmstat -w 1 "$CAPTURE_SECONDS" > "$out/vmstat.txt" 2>&1 & samplers+=($!)
