@@ -1122,7 +1122,7 @@ Before this, a torn record that failed its CRC refused the open in both modes, s
 
 ### Parallel Recovery
 
-`Bytecask::open(dir, max_file_bytes, recovery_threads)` accepts an optional `recovery_threads` parameter (default 4). A single unified code path handles all thread counts — there is no separate serial implementation. When `recovery_threads == 1`, the same algorithm runs on the calling thread without spawning workers:
+`Bytecask::open(dir, max_file_bytes, recovery_threads)` accepts an optional `recovery_threads` parameter (default 4). A single unified code path handles all thread counts — there is no separate serial implementation. When there is a single worker (`recovery_threads == 1`, or one data file), the same algorithm runs on the calling thread without spawning a thread, in every key directory — so an open with one recovery thread keeps the caller's thread-local state, which the fault-injection tests rely on:
 
 1. **Phase 1 (serial, shared)**: same as above — open files, generate missing hints. Factored into `open_and_prepare_files()`, shared by both paths.
 2. **Phase 2 (parallel build)**: round-robin assign files to W workers. Each builds a `RecoveryResult{key_dir, tombstones, max_seq, file_stats}` independently.

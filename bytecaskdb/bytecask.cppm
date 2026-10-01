@@ -5302,84 +5302,76 @@ auto DB::recovery_load_parallel(EngineState s,
   // each into an accumulator as it arrives. Each ~N/W-key tree is merged
   // once; disjoint subtrees are shared O(1) by the persistent tree, so
   // total merge work is proportional to overlap, not N × log₂(W).
-#ifdef BYTECASK_SINGLE_THREADED
-  // Single-threaded: run recovery serially on the calling thread.
+  //
+  // A single worker runs on the calling thread: a thread would buy nothing,
+  // and the open keeps the caller's thread-local state, the fault injector
+  // among it.
   std::vector<RecoveryResult> queue;
-  {
-    RecoveryResult acc{};
-    bool acc_initialized = false;
-    for (unsigned i = 0; i < W; ++i) {
-      auto result = recovery_build_from_hints(worker_files[i], strict);
-      if (!acc_initialized) {
-        acc = std::move(result);
-        acc_initialized = true;
-      } else {
-        acc = recovery_merge_results(std::move(acc), std::move(result));
-      }
-    }
-    queue.push_back(std::move(acc));
+  if (W == 1) {
+    queue.push_back(recovery_build_from_hints(worker_files[0], strict));
   }
-#else
-  std::mutex queue_mu;
-  std::condition_variable queue_cv;
-  std::vector<RecoveryResult> queue;
-  std::vector<std::exception_ptr> worker_errors(W, nullptr);
-  unsigned finished_count = 0;
+#ifndef BYTECASK_SINGLE_THREADED
+  else {
+    std::mutex queue_mu;
+    std::condition_variable queue_cv;
+    std::vector<std::exception_ptr> worker_errors(W, nullptr);
+    unsigned finished_count = 0;
 
-  {
-    std::vector<std::jthread> threads;
-    threads.reserve(W);
-    for (unsigned i = 0; i < W; ++i) {
-      threads.emplace_back([&, i] {
-        try {
-          auto result = recovery_build_from_hints(worker_files[i], strict);
-          std::unique_lock<std::mutex> lk{queue_mu};
-          queue.push_back(std::move(result));
-          ++finished_count;
-          queue_cv.notify_one();
-        } catch (...) {
-          std::unique_lock<std::mutex> lk{queue_mu};
-          worker_errors[i] = std::current_exception();
-          ++finished_count;  // still advances so main thread doesn't deadlock
-          queue_cv.notify_one();
-        }
-      });
-    }
+    {
+      std::vector<std::jthread> threads;
+      threads.reserve(W);
+      for (unsigned i = 0; i < W; ++i) {
+        threads.emplace_back([&, i] {
+          try {
+            auto result = recovery_build_from_hints(worker_files[i], strict);
+            std::unique_lock<std::mutex> lk{queue_mu};
+            queue.push_back(std::move(result));
+            ++finished_count;
+            queue_cv.notify_one();
+          } catch (...) {
+            std::unique_lock<std::mutex> lk{queue_mu};
+            worker_errors[i] = std::current_exception();
+            ++finished_count;  // still advances so main thread doesn't deadlock
+            queue_cv.notify_one();
+          }
+        });
+      }
 
-    // Main thread: consume results as they arrive.
-    RecoveryResult acc{};
-    bool acc_initialized = false;
-    unsigned merged_count = 0;
+      // Main thread: consume results as they arrive.
+      RecoveryResult acc{};
+      bool acc_initialized = false;
+      unsigned merged_count = 0;
 
-    while (merged_count < W) {
-      std::unique_lock<std::mutex> lk{queue_mu};
-      queue_cv.wait(lk, [&] { return finished_count > merged_count; });
-      std::vector<RecoveryResult> local;
-      local.swap(queue);
-      merged_count = finished_count;  // advance past all finished, including errored
-      lk.unlock();
+      while (merged_count < W) {
+        std::unique_lock<std::mutex> lk{queue_mu};
+        queue_cv.wait(lk, [&] { return finished_count > merged_count; });
+        std::vector<RecoveryResult> local;
+        local.swap(queue);
+        merged_count = finished_count;  // advance past all finished, including errored
+        lk.unlock();
 
-      for (auto &incoming : local) {
-        if (!acc_initialized) {
-          acc = std::move(incoming);
-          acc_initialized = true;
-        } else {
-          acc = recovery_merge_results(std::move(acc), std::move(incoming));
+        for (auto &incoming : local) {
+          if (!acc_initialized) {
+            acc = std::move(incoming);
+            acc_initialized = true;
+          } else {
+            acc = recovery_merge_results(std::move(acc), std::move(incoming));
+          }
         }
       }
+
+      // Store final result for phases 4-5 (threads join at scope exit).
+      queue.clear();
+      queue.push_back(std::move(acc));
     }
 
-    // Store final result for phases 4-5 (threads join at scope exit).
-    queue.clear();
-    queue.push_back(std::move(acc));
-  }
-
-  // Threads are joined. Propagate any worker exception now, in both modes:
-  // the lenient skip happens inside the worker (open_hint_or_skip), so what
-  // escapes it is an error no mode answers — a resource error, a read that
-  // failed once entries were applied, a SequenceOverlap.
-  for (const auto &err : worker_errors) {
-    if (err) std::rethrow_exception(err);
+    // Threads are joined. Propagate any worker exception now, in both modes:
+    // the lenient skip happens inside the worker (open_hint_or_skip), so what
+    // escapes it is an error no mode answers — a resource error, a read that
+    // failed once entries were applied, a SequenceOverlap.
+    for (const auto &err : worker_errors) {
+      if (err) std::rethrow_exception(err);
+    }
   }
 #endif
 
