@@ -541,8 +541,11 @@ the caller's responsibility.
 
 ### I/O failure safety
 
-If the pre-rotation sync fails, the exception propagates and no manifest
-is produced. The active file is not sealed; the leader continues normally.
+If the pre-rotation sync fails, the engine degrades, the exception
+propagates and no manifest is produced. The active file is not sealed.
+As after any failed `fdatasync`, a later sync cannot be trusted to write
+what the failed one did not (#231), so writes throw `DbDegraded` until
+`resume()` rewrites and syncs the file (#281).
 
 If `rotate_active_file` fails (active file sealed but new file creation
 fails), the engine degrades — same pattern as `execute_slots` and

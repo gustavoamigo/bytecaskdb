@@ -6655,6 +6655,66 @@ TEST_CASE("close() makes unsynced writes durable and writes the active "
   CHECK(reopened.durable_sequence() > last);
 }
 
+// #281: create_manifest's sync is the active file's like any other. Were the
+// engine left healthy after it failed, the next sync write's fdatasync would
+// find the failed pages clean, return 0, and move durable_sequence past
+// writes the device does not hold.
+TEST_CASE("create_manifest whose fdatasync fails degrades, and a power cut "
+          "keeps everything below durable_sequence",
+          "[manifest][fsyncgate]") {
+  bytecask::testing::ScopedPageCacheModel cache;
+  TempDir td;
+  const auto dir = td.path / "db";
+  const auto after_cut = td.path / "after_cut";
+  std::uint64_t durable = 0;
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+    put_unsynced(db);
+    const auto synced = db.durable_sequence();
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      CHECK_THROWS_AS(db.create_manifest(), std::system_error);
+    }
+    CHECK(db.is_degraded());
+    CHECK(db.durable_sequence() == synced);
+    // Healthy, this sync would succeed without writing the failed pages.
+    CHECK_THROWS_AS(db.put({.sync = true}, to_bytes("later"), to_bytes("x")),
+                    bytecask::DbDegraded);
+    durable = db.durable_sequence();
+    cache.model.copy_device(dir, after_cut);  // power cut
+  }
+  // k{i} was written at sequence i + 1.
+  auto db = bytecask::DB::open(after_cut);
+  for (int i = 0; i <= kUnsyncedPuts; ++i) {
+    if (static_cast<std::uint64_t>(i) + 1 > durable) break;
+    INFO("key " << i << ", durable_sequence " << durable);
+    CHECK(get_str(db, to_bytes(fsyncgate_key(i))) == fsyncgate_value(i));
+  }
+}
+
+TEST_CASE("create_manifest after resume() from its failed fdatasync makes "
+          "every write durable",
+          "[manifest][fsyncgate]") {
+  bytecask::testing::ScopedPageCacheModel cache;
+  TempDir td;
+  const auto dir = td.path / "db";
+  const auto after_cut = td.path / "after_cut";
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1'000'000});
+    put_unsynced(db);
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      CHECK_THROWS_AS(db.create_manifest(), std::system_error);
+    }
+    REQUIRE_NOTHROW(db.resume());
+    const auto manifest = db.create_manifest();
+    CHECK(manifest.through_sequence == static_cast<std::uint64_t>(kUnsyncedPuts + 1));
+    cache.model.copy_device(dir, after_cut);  // power cut
+  }
+  auto db = bytecask::DB::open(after_cut);
+  check_all_present(db);
+}
+
 // #245: vacuum judges a record dead by the key directory, which holds
 // sync=false writes no fdatasync has covered yet. Dropping the record is
 // durable once vacuum commits, so it must not go before what superseded it.

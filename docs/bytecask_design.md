@@ -381,7 +381,7 @@ After recovery (`DB::open`, `resume`), `durable_seq` is set to `next_seq - 1`: e
 
 After all appends succeed and mutations are applied, the engine may rotate the active file if it exceeds the size threshold. Rotation syncs the file, seals it, and creates a new active file. Two distinct failures can occur:
 
-- **Sync fails before seal**: the file is not sealed. The engine captures the exception, advances `next_seq` past consumed sequences, and rethrows without publishing key changes. The DB is not degraded — the next write retries rotation or continues appending.
+- **Sync fails before seal**: the file is not sealed, and the engine degrades without publishing key changes. A later `fdatasync` would return 0 without writing the pages the failed one left clean (*A failed `fdatasync` (fsyncgate)*), so nothing is retried on trust; `resume()` rewrites and syncs the file.
 - **File creation fails after seal**: `rotate_active_file` calls `seal()` before creating the new file. If creation fails, the active file is sealed and cannot accept further appends. The engine degrades the DB and publishes state. `resume()` creates a fresh active file. A failed sync of the directory after the create (see *Directory Sync*) takes the same path: the file exists, its name is not known to be durable, and no write is acknowledged into it.
 
 ##### Sync failure: advance sequence, discard key changes
@@ -1819,6 +1819,8 @@ enum class Mode { Leader, Follower };
 `set_mode(Mode)` acquires the write mutex to ensure no in-flight write straddles the transition. `mode()` is a lock-free atomic read (acquire semantics), same pattern as `is_degraded()`.
 
 A leader stepping down (`set_mode(Mode::Follower)` from `Leader`) calls `fdatasync` on the active file before it publishes the new mode, and raises `durable_seq` to the last assigned sequence. `changes_since` ships only up to `durable_seq`, so without the sync a write acknowledged with `sync = false` stays unshippable: a planned transfer would complete without it, and the new leader would reuse its sequence (found by the topology replication check, #178). The sync is skipped when nothing is above `durable_seq`. A failed `fdatasync` degrades the engine, publishes nothing else, and rethrows; the mode stays `Leader`, and `resume()` recovers as after any failed commit sync.
+
+Every sync of the active file degrades the engine when it fails, whatever called it: the commit flush, a rotation, `set_mode`, vacuum, `create_manifest` and `ingest`. A caller that only threw would leave a healthy engine whose next `fdatasync` returns 0 without writing the failed pages, and `durable_seq` would rise over writes the device does not hold. `create_manifest` did exactly that until #281.
 
 ### Leader-side: `durable_sequence`, `create_manifest`, `changes_since`
 

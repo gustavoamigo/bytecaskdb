@@ -1237,8 +1237,8 @@ reflects a partial delta — the entries from that chunk are committed.
 | Class | Manifest produced | Leader state |
 |-------|-------------------|-------------|
 | SUCCESS | Yes | Continues accepting writes |
-| M_R (`rotation_fails`) | No — exception thrown | Unchanged |
-| M_H (`hint_generation_fails`) | No — exception or timeout | Active file was rotated (sealed) |
+| M_R (`rotation_fails`) | No — exception thrown | Degraded: the active file was sealed and no new one was created; `resume()` recovers |
+| M_S (`sync_fails`) | No — exception thrown | Degraded: the pre-rotation `fdatasync` failed, and no later one can be trusted to write what it did not (#281); `resume()` recovers |
 
 #### Elimination rules
 

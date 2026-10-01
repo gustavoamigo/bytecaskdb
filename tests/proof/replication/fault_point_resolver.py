@@ -77,10 +77,9 @@ def resolve_manifest_fault(failure: ManifestFailureClass) -> FaultConfig:
     if failure == ManifestFailureClass.M_R:
         return FaultConfig(name="io_rotate_file_creation")
 
-    if failure == ManifestFailureClass.M_H:
-        # Hint file sync goes through io_data_file_sync on the hint DataFile.
-        # The manifest waits for hint generation; faulting the sync path
-        # causes create_manifest to throw during worker_.drain().
+    if failure == ManifestFailureClass.M_S:
+        # The first data file sync create_manifest reaches is the active
+        # file's, before it is sealed.
         return FaultConfig(name="io_data_file_sync")
 
     raise ValueError(f"Unhandled manifest failure class: {failure}")

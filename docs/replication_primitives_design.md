@@ -420,14 +420,14 @@ Class C (orphaned `BulkBegin`) is reachable through the replication pipeline —
 class ManifestFailureClass(Enum):
     SUCCESS = "success"                # rotation + hints complete
     M_R = "rotation_fails"            # active file rotation throws
-    M_H = "hint_generation_fails"     # hint file write fails
+    M_S = "sync_fails"                # pre-rotation fdatasync fails
 ```
 
 | Class | Manifest produced | Leader state | Expected delta |
 |-------|-------------------|-------------|---------------|
 | SUCCESS | Yes | Continues accepting writes | manifest.through_sequence == leader.durable_sequence() at rotation time; all sealed files listed |
-| M_R | No — exception thrown | Unchanged, continues accepting writes | No state change — rotation is atomic |
-| M_H | No — exception or timeout | Active file was rotated (sealed) | Leader has a new active file but no manifest returned |
+| M_R | No — exception thrown | Degraded | The active file was sealed and no new one created; `resume()` recovers |
+| M_S | No — exception thrown | Degraded | The failed `fdatasync` left pages no later one writes (#281); `resume()` rewrites and syncs the file |
 
 ### Invariants
 

@@ -10472,7 +10472,7 @@ TEST_CASE("prove_manifest__single_key__rotation_fails", "[prove_manifest]") {
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must be degraded — sealed active file is unusable.
+    // Engine must be degraded.
     CHECK(leader.is_degraded());
     assert_consistent(leader);
 
@@ -10484,7 +10484,7 @@ TEST_CASE("prove_manifest__single_key__rotation_fails", "[prove_manifest]") {
   }
 }
 
-TEST_CASE("prove_manifest__single_key__hint_gen_fails", "[prove_manifest]") {
+TEST_CASE("prove_manifest__single_key__sync_fails", "[prove_manifest]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   {
@@ -10497,11 +10497,15 @@ TEST_CASE("prove_manifest__single_key__hint_gen_fails", "[prove_manifest]") {
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must NOT be degraded — failure was before seal.
-    CHECK_FALSE(leader.is_degraded());
+    // Engine must be degraded.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
 
-    // Writes must still succeed.
-    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -10546,7 +10550,7 @@ TEST_CASE("prove_manifest__multi_key__rotation_fails", "[prove_manifest]") {
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must be degraded — sealed active file is unusable.
+    // Engine must be degraded.
     CHECK(leader.is_degraded());
     assert_consistent(leader);
 
@@ -10558,7 +10562,7 @@ TEST_CASE("prove_manifest__multi_key__rotation_fails", "[prove_manifest]") {
   }
 }
 
-TEST_CASE("prove_manifest__multi_key__hint_gen_fails", "[prove_manifest]") {
+TEST_CASE("prove_manifest__multi_key__sync_fails", "[prove_manifest]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   {
@@ -10575,11 +10579,15 @@ TEST_CASE("prove_manifest__multi_key__hint_gen_fails", "[prove_manifest]") {
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must NOT be degraded — failure was before seal.
-    CHECK_FALSE(leader.is_degraded());
+    // Engine must be degraded.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
 
-    // Writes must still succeed.
-    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -10618,7 +10626,7 @@ TEST_CASE("prove_manifest__overwrites__rotation_fails", "[prove_manifest]") {
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must be degraded — sealed active file is unusable.
+    // Engine must be degraded.
     CHECK(leader.is_degraded());
     assert_consistent(leader);
 
@@ -10630,7 +10638,7 @@ TEST_CASE("prove_manifest__overwrites__rotation_fails", "[prove_manifest]") {
   }
 }
 
-TEST_CASE("prove_manifest__overwrites__hint_gen_fails", "[prove_manifest]") {
+TEST_CASE("prove_manifest__overwrites__sync_fails", "[prove_manifest]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   {
@@ -10644,11 +10652,15 @@ TEST_CASE("prove_manifest__overwrites__hint_gen_fails", "[prove_manifest]") {
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must NOT be degraded — failure was before seal.
-    CHECK_FALSE(leader.is_degraded());
+    // Engine must be degraded.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
 
-    // Writes must still succeed.
-    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -10687,7 +10699,7 @@ TEST_CASE("prove_manifest__deletes__rotation_fails", "[prove_manifest]") {
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must be degraded — sealed active file is unusable.
+    // Engine must be degraded.
     CHECK(leader.is_degraded());
     assert_consistent(leader);
 
@@ -10699,7 +10711,7 @@ TEST_CASE("prove_manifest__deletes__rotation_fails", "[prove_manifest]") {
   }
 }
 
-TEST_CASE("prove_manifest__deletes__hint_gen_fails", "[prove_manifest]") {
+TEST_CASE("prove_manifest__deletes__sync_fails", "[prove_manifest]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   {
@@ -10713,11 +10725,15 @@ TEST_CASE("prove_manifest__deletes__hint_gen_fails", "[prove_manifest]") {
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must NOT be degraded — failure was before seal.
-    CHECK_FALSE(leader.is_degraded());
+    // Engine must be degraded.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
 
-    // Writes must still succeed.
-    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -10764,7 +10780,7 @@ TEST_CASE("prove_manifest__range_deletes__rotation_fails", "[prove_manifest]") {
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must be degraded — sealed active file is unusable.
+    // Engine must be degraded.
     CHECK(leader.is_degraded());
     assert_consistent(leader);
 
@@ -10776,7 +10792,7 @@ TEST_CASE("prove_manifest__range_deletes__rotation_fails", "[prove_manifest]") {
   }
 }
 
-TEST_CASE("prove_manifest__range_deletes__hint_gen_fails", "[prove_manifest]") {
+TEST_CASE("prove_manifest__range_deletes__sync_fails", "[prove_manifest]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   {
@@ -10794,11 +10810,15 @@ TEST_CASE("prove_manifest__range_deletes__hint_gen_fails", "[prove_manifest]") {
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must NOT be degraded — failure was before seal.
-    CHECK_FALSE(leader.is_degraded());
+    // Engine must be degraded.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
 
-    // Writes must still succeed.
-    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -10847,7 +10867,7 @@ TEST_CASE("prove_manifest__batches__rotation_fails", "[prove_manifest]") {
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must be degraded — sealed active file is unusable.
+    // Engine must be degraded.
     CHECK(leader.is_degraded());
     assert_consistent(leader);
 
@@ -10859,7 +10879,7 @@ TEST_CASE("prove_manifest__batches__rotation_fails", "[prove_manifest]") {
   }
 }
 
-TEST_CASE("prove_manifest__batches__hint_gen_fails", "[prove_manifest]") {
+TEST_CASE("prove_manifest__batches__sync_fails", "[prove_manifest]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   {
@@ -10878,11 +10898,15 @@ TEST_CASE("prove_manifest__batches__hint_gen_fails", "[prove_manifest]") {
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must NOT be degraded — failure was before seal.
-    CHECK_FALSE(leader.is_degraded());
+    // Engine must be degraded.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
 
-    // Writes must still succeed.
-    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -10927,7 +10951,7 @@ TEST_CASE("prove_manifest__multi_file__rotation_fails", "[prove_manifest]") {
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must be degraded — sealed active file is unusable.
+    // Engine must be degraded.
     CHECK(leader.is_degraded());
     assert_consistent(leader);
 
@@ -10939,7 +10963,7 @@ TEST_CASE("prove_manifest__multi_file__rotation_fails", "[prove_manifest]") {
   }
 }
 
-TEST_CASE("prove_manifest__multi_file__hint_gen_fails", "[prove_manifest]") {
+TEST_CASE("prove_manifest__multi_file__sync_fails", "[prove_manifest]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   {
@@ -10956,11 +10980,15 @@ TEST_CASE("prove_manifest__multi_file__hint_gen_fails", "[prove_manifest]") {
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must NOT be degraded — failure was before seal.
-    CHECK_FALSE(leader.is_degraded());
+    // Engine must be degraded.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
 
-    // Writes must still succeed.
-    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -11003,7 +11031,7 @@ TEST_CASE("prove_manifest__mixed_sync_nosync__rotation_fails", "[prove_manifest]
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must be degraded — sealed active file is unusable.
+    // Engine must be degraded.
     CHECK(leader.is_degraded());
     assert_consistent(leader);
 
@@ -11015,7 +11043,7 @@ TEST_CASE("prove_manifest__mixed_sync_nosync__rotation_fails", "[prove_manifest]
   }
 }
 
-TEST_CASE("prove_manifest__mixed_sync_nosync__hint_gen_fails", "[prove_manifest]") {
+TEST_CASE("prove_manifest__mixed_sync_nosync__sync_fails", "[prove_manifest]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   {
@@ -11031,11 +11059,15 @@ TEST_CASE("prove_manifest__mixed_sync_nosync__hint_gen_fails", "[prove_manifest]
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must NOT be degraded — failure was before seal.
-    CHECK_FALSE(leader.is_degraded());
+    // Engine must be degraded.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
 
-    // Writes must still succeed.
-    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -11080,7 +11112,7 @@ TEST_CASE("prove_manifest__nosync_only__rotation_fails", "[prove_manifest]") {
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must be degraded — sealed active file is unusable.
+    // Engine must be degraded.
     CHECK(leader.is_degraded());
     assert_consistent(leader);
 
@@ -11092,7 +11124,7 @@ TEST_CASE("prove_manifest__nosync_only__rotation_fails", "[prove_manifest]") {
   }
 }
 
-TEST_CASE("prove_manifest__nosync_only__hint_gen_fails", "[prove_manifest]") {
+TEST_CASE("prove_manifest__nosync_only__sync_fails", "[prove_manifest]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   {
@@ -11109,11 +11141,15 @@ TEST_CASE("prove_manifest__nosync_only__hint_gen_fails", "[prove_manifest]") {
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must NOT be degraded — failure was before seal.
-    CHECK_FALSE(leader.is_degraded());
+    // Engine must be degraded.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
 
-    // Writes must still succeed.
-    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -11156,7 +11192,7 @@ TEST_CASE("prove_manifest__nosync_then_sync__rotation_fails", "[prove_manifest]"
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must be degraded — sealed active file is unusable.
+    // Engine must be degraded.
     CHECK(leader.is_degraded());
     assert_consistent(leader);
 
@@ -11168,7 +11204,7 @@ TEST_CASE("prove_manifest__nosync_then_sync__rotation_fails", "[prove_manifest]"
   }
 }
 
-TEST_CASE("prove_manifest__nosync_then_sync__hint_gen_fails", "[prove_manifest]") {
+TEST_CASE("prove_manifest__nosync_then_sync__sync_fails", "[prove_manifest]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   {
@@ -11184,11 +11220,15 @@ TEST_CASE("prove_manifest__nosync_then_sync__hint_gen_fails", "[prove_manifest]"
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must NOT be degraded — failure was before seal.
-    CHECK_FALSE(leader.is_degraded());
+    // Engine must be degraded.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
 
-    // Writes must still succeed.
-    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }
 
@@ -11267,7 +11307,7 @@ TEST_CASE("prove_manifest__vacuumed_batches__rotation_fails", "[prove_manifest]"
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must be degraded — sealed active file is unusable.
+    // Engine must be degraded.
     CHECK(leader.is_degraded());
     assert_consistent(leader);
 
@@ -11279,7 +11319,7 @@ TEST_CASE("prove_manifest__vacuumed_batches__rotation_fails", "[prove_manifest]"
   }
 }
 
-TEST_CASE("prove_manifest__vacuumed_batches__hint_gen_fails", "[prove_manifest]") {
+TEST_CASE("prove_manifest__vacuumed_batches__sync_fails", "[prove_manifest]") {
   TempDir td;
   auto leader_dir = td.path / "leader";
   {
@@ -11313,10 +11353,14 @@ TEST_CASE("prove_manifest__vacuumed_batches__hint_gen_fails", "[prove_manifest]"
         REQUIRE_THROWS_AS(leader.create_manifest(), std::system_error);
     }
 
-    // Engine must NOT be degraded — failure was before seal.
-    CHECK_FALSE(leader.is_degraded());
+    // Engine must be degraded.
+    CHECK(leader.is_degraded());
+    assert_consistent(leader);
 
-    // Writes must still succeed.
-    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_fail"), to_bytes("ok")));
+    // resume() must recover.
+    assert_resumable(leader);
+
+    // After resume, writes must succeed.
+    REQUIRE_NOTHROW(leader.put({}, to_bytes("post_resume"), to_bytes("ok")));
   }
 }

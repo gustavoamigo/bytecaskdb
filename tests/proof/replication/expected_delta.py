@@ -77,5 +77,7 @@ def manifest_expected(failure: ManifestFailureClass) -> ManifestDelta:
     # M_R: rotation file creation fails after seal — engine must degrade.
     if failure == ManifestFailureClass.M_R:
         return ManifestDelta(manifest_produced=False, threw=True, degraded=True)
-    # M_H: pre-rotation sync fails — active file not sealed, no degradation.
-    return ManifestDelta(manifest_produced=False, threw=True, degraded=False)
+    # M_S: the pre-rotation sync fails. The file is not sealed, but the pages
+    # the failed sync left clean are written by no later fdatasync (#231), so
+    # the engine degrades as after any failed sync (#281).
+    return ManifestDelta(manifest_produced=False, threw=True, degraded=True)
