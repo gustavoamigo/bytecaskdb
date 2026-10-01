@@ -13,9 +13,16 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <fcntl.h>
+#include <filesystem>
+#include <map>
+#include <mutex>
+#include <set>
 #include <string>
+#include <sys/stat.h>
 #include <system_error>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace bytecask::testing {
@@ -42,13 +49,19 @@ enum class PostWriteMode { none, short_write, throw_after };
 // Name-based injection takes priority if both are set.
 //
 // Post-write mode (short_write/throw_after) fires at FAULT_INJECTION_POST_WRITE
-// checkpoints matching fail_at_name. It does not use count-based triggering.
+// checkpoints matching fail_at_name, and not at a FAULT_INJECTION checkpoint
+// of the same name, so one name can fail a call before or after its syscall
+// lands (io_resume_truncate). It does not use count-based triggering.
 //
 // Thread-local: each thread has its own active injector so concurrent
 // tests do not interfere with each other.
 // ---------------------------------------------------------------------------
 struct FaultInjector {
   std::string fail_at_name;    // fail at this named checkpoint
+  // Name-based only: 0 fails every checkpoint matching fail_at_name; N fails
+  // only the Nth, so a retry of the same I/O succeeds.
+  int         fail_on_nth_match = 0;
+  int         name_matches = 0;
   int         fail_at    = -1; // fail after this many checkpoints (-1 = never)
   int         call_count = 0;  // number of checkpoints passed so far
   std::string last_checkpoint; // name of the last checkpoint that fired
@@ -67,10 +80,16 @@ struct FaultInjector {
     last_checkpoint = name;
     ++call_count;
 
-    // Name-based — targets a specific fault point explicitly
-    if (!fail_at_name.empty() && fail_at_name == name) {
-      throw std::system_error{error,
-          std::string{"fault injection at: "} + name};
+    // Name-based — targets a specific fault point explicitly. In post-write
+    // mode the name targets the FAULT_INJECTION_POST_WRITE checkpoint, so a
+    // pre-syscall checkpoint of the same name lets the syscall run.
+    if (!fail_at_name.empty() && fail_at_name == name &&
+        post_write_mode == PostWriteMode::none) {
+      ++name_matches;
+      if (fail_on_nth_match == 0 || name_matches == fail_on_nth_match) {
+        throw std::system_error{error,
+            std::string{"fault injection at: "} + name};
+      }
     }
 
     // Count-based — targets the Nth checkpoint in sequence
@@ -168,6 +187,158 @@ struct ScopedFaultInjector {
   ScopedFaultInjector& operator=(ScopedFaultInjector&&) = delete;
 };
 
+// ---------------------------------------------------------------------------
+// PageCacheModel
+//
+// Models which bytes of a data file the device holds, so a test can cut the
+// power after a failed fdatasync with Linux semantics (fsyncgate): the failed
+// flush marks the pages it covered clean without writing them, and a later
+// fdatasync, finding nothing dirty, returns 0 without writing them either.
+//
+// Per 4 KiB page it keeps the device's bytes while the page cache holds
+// others. A write to a page records the page as it reads before the write,
+// unless an image is already kept, and marks it dirty. A successful sync
+// forgets the images of the dirty pages; a failed one only clears their dirty
+// mark, so a sync after it keeps them too. Only a new write makes the page
+// dirty again. Hint files are not modelled: they are written durably.
+//
+// Process-wide, not thread-local: the flush leader and the background hint
+// worker are not always the test's thread.
+// ---------------------------------------------------------------------------
+class PageCacheModel {
+public:
+  static constexpr std::uint64_t kPage = 4096;
+
+  void write(int fd, std::uint64_t offset, std::size_t len) {
+    if (len == 0) return;
+    std::lock_guard<std::mutex> lk{mu_};
+    auto &f = files_[key_of(fd)];
+    for (auto p = offset / kPage; p <= (offset + len - 1) / kPage; ++p) {
+      if (!f.image.contains(p)) {
+        std::vector<std::byte> page(kPage, std::byte{0});
+        (void)::pread(fd, page.data(), kPage, static_cast<off_t>(p * kPage));
+        f.image.emplace(p, std::move(page));
+      }
+      f.dirty.insert(p);
+    }
+  }
+
+  void synced(int fd) {
+    std::lock_guard<std::mutex> lk{mu_};
+    auto it = files_.find(key_of(fd));
+    if (it == files_.end()) return;
+    for (const auto p : it->second.dirty) it->second.image.erase(p);
+    it->second.dirty.clear();
+  }
+
+  void sync_failed(int fd) {
+    std::lock_guard<std::mutex> lk{mu_};
+    auto it = files_.find(key_of(fd));
+    if (it != files_.end()) it->second.dirty.clear();
+  }
+
+  // Treats every byte of path as written but never synced, over a device
+  // that holds zeros: a process that appended with sync=false and was
+  // killed, its pages still in the cache.
+  void mark_unsynced(const std::filesystem::path &path) {
+    const auto size = std::filesystem::file_size(path);
+    const auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd == -1) throw std::system_error{errno, std::generic_category()};
+    std::lock_guard<std::mutex> lk{mu_};
+    auto &f = files_[key_of(fd)];
+    ::close(fd);
+    for (std::uint64_t p = 0; p * kPage < size; ++p)
+      f.image[p] = std::vector<std::byte>(kPage, std::byte{0});
+  }
+
+  // Returns the file what the device holds: after a power loss, or once the
+  // kernel has evicted pages that a failed fdatasync marked clean. Every
+  // image goes back, clamped to the file's current size, and is forgotten.
+  // Call it with no engine writing.
+  void restore_device(const std::filesystem::path &dir) {
+    std::lock_guard<std::mutex> lk{mu_};
+    for (const auto &e : std::filesystem::directory_iterator{dir}) {
+      if (!e.is_regular_file()) continue;
+      const auto fd = ::open(e.path().c_str(), O_WRONLY | O_CLOEXEC);
+      if (fd == -1) continue;
+      auto it = files_.find(key_of(fd));
+      if (it != files_.end()) {
+        const auto size = static_cast<std::uint64_t>(
+            std::filesystem::file_size(e.path()));
+        for (const auto &[p, bytes] : it->second.image) {
+          const auto at = p * kPage;
+          if (at >= size) continue;
+          const auto n = std::min<std::uint64_t>(kPage, size - at);
+          (void)::pwrite(fd, bytes.data(), n, static_cast<off_t>(at));
+        }
+#ifdef __APPLE__
+        (void)::fsync(fd);  // macOS has no fdatasync
+#else
+        (void)::fdatasync(fd);
+#endif
+        files_.erase(it);
+      }
+      ::close(fd);
+    }
+  }
+
+  // Pages whose bytes the device does not hold, over every file.
+  [[nodiscard]] auto undurable_pages() -> std::size_t {
+    std::lock_guard<std::mutex> lk{mu_};
+    std::size_t n = 0;
+    for (const auto &[k, f] : files_) n += f.image.size();
+    return n;
+  }
+
+private:
+  struct FileState {
+    std::map<std::uint64_t, std::vector<std::byte>> image;
+    std::set<std::uint64_t> dirty;
+  };
+  static auto key_of(int fd) -> std::pair<dev_t, ino_t> {
+    struct stat st{};
+    if (::fstat(fd, &st) != 0) throw std::system_error{errno, std::generic_category()};
+    return {st.st_dev, st.st_ino};
+  }
+  std::mutex mu_;
+  std::map<std::pair<dev_t, ino_t>, FileState> files_;
+};
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunique-object-duplication"
+inline PageCacheModel* active_cache_model = nullptr;
+#pragma clang diagnostic pop
+
+inline void io_cache_write(int fd, std::uint64_t offset, std::size_t len) {
+  if (active_cache_model) active_cache_model->write(fd, offset, len);
+}
+
+inline void io_cache_synced(int fd) {
+  if (active_cache_model) active_cache_model->synced(fd);
+}
+
+// A sync's checkpoint. An injected failure there is an fdatasync that
+// failed, and the model drops fd's dirty marks as the kernel does.
+inline void io_sync_checkpoint(const char* name, int fd) {
+  try {
+    io_checkpoint(name);
+  } catch (...) {
+    if (active_cache_model) active_cache_model->sync_failed(fd);
+    throw;
+  }
+}
+
+// RAII guard: the model sees data file writes and syncs while it lives.
+struct ScopedPageCacheModel {
+  PageCacheModel model;
+  ScopedPageCacheModel() { active_cache_model = &model; }
+  ~ScopedPageCacheModel() { active_cache_model = nullptr; }
+  ScopedPageCacheModel(const ScopedPageCacheModel&) = delete;
+  ScopedPageCacheModel& operator=(const ScopedPageCacheModel&) = delete;
+  ScopedPageCacheModel(ScopedPageCacheModel&&) = delete;
+  ScopedPageCacheModel& operator=(ScopedPageCacheModel&&) = delete;
+};
+
 } // namespace bytecask::testing
 
 // The macro — only defined when BYTECASK_TESTING is set.
@@ -177,5 +348,14 @@ struct ScopedFaultInjector {
 
 #define FAULT_INJECTION_POST_WRITE(name, fd, offset, total) \
     ::bytecask::testing::io_post_write_checkpoint(#name, fd, offset, total)
+
+#define FAULT_INJECTION_SYNC(name, fd) \
+    ::bytecask::testing::io_sync_checkpoint(#name, fd)
+
+#define FAULT_CACHE_WRITE(fd, offset, len) \
+    ::bytecask::testing::io_cache_write(fd, offset, len)
+
+#define FAULT_CACHE_SYNCED(fd) \
+    ::bytecask::testing::io_cache_synced(fd)
 
 #endif // BYTECASK_TESTING

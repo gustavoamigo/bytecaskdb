@@ -102,8 +102,9 @@ Each worker calls `recovery_build_from_hints(span<RecoveredFile>)` which:
 
 1. Initialises `file_stats[file_id].total_bytes = rf.total_bytes` for each
    assigned file (live_bytes is left at 0 — deferred to Phase 4).
-2. Opens each hint file via `HintFile::OpenForRead` and iterates entries
-   with `scanner.next()`.
+2. Opens each hint file via `open_hint_or_rebuild` (`HintFile::OpenForRead`,
+   rebuilding a hint that fails its CRC or a read) and iterates entries with
+   `scanner.next()`.
 3. For each `Put` entry: checks tombstone map; if no superseding tombstone,
    calls `t.upsert(key, entry, lsn_wins)` where `lsn_wins` keeps the entry
    with the higher sequence number.

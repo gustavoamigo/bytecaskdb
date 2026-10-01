@@ -363,16 +363,16 @@ inline auto sorted_paths(const std::filesystem::path &dir,
   return out;
 }
 
-// True when the newest data file has no hint beside it. A clean close leaves
-// exactly this: flush_hints skips the active file, so the file that was active
-// at shutdown is hint-less whether the process stopped cleanly or crashed.
-// recovery_prepare_files regenerates it at the next open.
-inline auto newest_data_is_hintless(const std::filesystem::path &dir) -> bool {
+// Removes the newest data file's hint, leaving the state a crash does: the
+// file active when the process died has none, and recovery_prepare_files
+// regenerates it at the next open. A clean close writes it.
+inline auto drop_newest_hint(const std::filesystem::path &dir) -> bool {
   const auto data = sorted_paths(dir, ".data");
   if (data.empty()) return false;
   auto hint = data.back();
   hint.replace_extension(".hint");
-  return !std::filesystem::exists(hint);
+  std::error_code ec;
+  return std::filesystem::remove(hint, ec);
 }
 
 // Removes every hint file that exists, so recovery regenerates all of them.
@@ -655,6 +655,16 @@ inline auto unreferenced_data_files(const DB &db,
     if (std::ranges::find(referenced, p.filename().string()) ==
         referenced.end())
       out.push_back(p);
+  return out;
+}
+
+// Vacuum's staging copies left in dir. A vacuum that returns or throws before
+// its rename removes its own (#235); only a killed process leaves one.
+inline auto staging_data_files(const std::filesystem::path &dir)
+    -> std::vector<std::filesystem::path> {
+  std::vector<std::filesystem::path> out;
+  for (const auto &p : sorted_paths(dir, ".tmp"))
+    if (p.stem().extension() == ".data") out.push_back(p);
   return out;
 }
 

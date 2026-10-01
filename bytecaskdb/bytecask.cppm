@@ -204,12 +204,14 @@ export struct Options {
 #else
   unsigned recovery_threads{4};
 #endif
-  // When true (default): any CRC error during recovery causes DB::open to
-  // throw std::runtime_error. When false: corrupt entries and hint files are
-  // skipped; the DB opens with whatever was successfully recovered, and a
-  // warning is printed to stderr for each skipped item. Neither applies to
-  // the tail of a data file without a hint, which recovery_check_tail
-  // truncates or refuses the same way in both modes.
+  // A hint file that fails its CRC, or that a read fails on, is rebuilt from
+  // its data file in both modes. This governs a file that still cannot be
+  // indexed — its data file cannot be rescanned. When true (default): DB::open
+  // throws. When false: the file is skipped; the DB opens with whatever was
+  // recovered from the rest, and a warning is printed to stderr for each
+  // skipped file. Neither applies to the tail of a data file without a hint,
+  // which recovery_check_tail truncates or refuses the same way in both
+  // modes.
   bool fail_recovery_on_crc_errors{true};
   // Initial engine mode. Leader (default) allows normal writes; Follower
   // blocks put/del/apply_batch and allows ingest().
@@ -757,6 +759,18 @@ public:
   ~DbFollowerMode() override;
 };
 
+// ---------------------------------------------------------------------------
+// DbClosed — thrown by every DB operation after close(). Using a closed
+// handle is a caller bug, not an I/O condition, hence std::logic_error.
+// ---------------------------------------------------------------------------
+export class DbClosed : public std::logic_error {
+public:
+  DbClosed() : std::logic_error("DB is closed") {}
+  DbClosed(const DbClosed &) = default;
+  auto operator=(const DbClosed &) -> DbClosed & = default;
+  ~DbClosed() override;
+};
+
 // Default group-write byte-size threshold: plans above this size are routed
 // to the solo writer (a large batch would monopolize the group).
 export inline constexpr std::uint64_t kGroupWriteMaxBytes = 256ULL * 1024;
@@ -970,7 +984,21 @@ public:
   DB(DB &&) = delete;
   DB &operator=(DB &&) = delete;
 
+  // Calls close() if it was not called, and swallows its errors.
   ~DB();
+
+  // Makes every write durable, trims the active file, writes the hint files
+  // and releases the directory lock. Waits for in-flight writes and a running
+  // vacuum to finish first. Returns normally only if every write the DB
+  // acknowledged is durable and the shutdown completed; otherwise throws —
+  // std::system_error for a failed fdatasync, trim or hint write, DbDegraded
+  // for a degraded engine holding acknowledged writes that are not durable.
+  // The DB is closed either way, and a retry cannot help: a failed
+  // fdatasync leaves its pages clean (#231). Afterwards every operation
+  // throws DbClosed, except mode(), is_degraded() and degraded_reason(),
+  // and a second close() returns at once. Snapshots and iterators taken
+  // before stay readable.
+  void close();
 
   // Writes the value for key into out, reusing its existing capacity to
   // amortize allocation across calls. Returns true if the key was found,
@@ -1118,8 +1146,8 @@ public:
   // nonpositive timeout returns immediately. Identical semantics in Leader
   // and Follower mode (on a follower it reflects the last synced ingest).
   // Blocks until the published state covers sequence — a fresh snapshot
-  // can see the write a plan lost to — or the engine degrades. See
-  // apply_batch.
+  // can see the write a plan lost to — or the engine degrades or closes.
+  // See apply_batch.
   void wait_published(std::uint64_t sequence) const;
 
   [[nodiscard]] auto durable_sequence(
@@ -1205,17 +1233,17 @@ private:
       const std::vector<std::filesystem::path> &data_paths);
   // Writes hint files for all sealed files in s.
   void flush_hints(const EngineState &s);
-  // Both HintFile openers verify the file-level CRC before any parsing, so
-  // either one is the point a damaged hint is detected.
-  using HintOpener = auto (*)(std::filesystem::path) -> HintFile;
   // Opens a hint file, rebuilding it from its data file if it will not open.
-  // A hint is a derived index, not the records it points at: a CRC failure in
-  // one says the index is damaged, not that the data file behind it is.
-  // Throws when the rebuild cannot produce a readable hint, leaving the
-  // caller to apply fail_recovery_on_crc_errors to a file it cannot index.
+  // HintFile::OpenForRead reads and verifies every byte before returning, so
+  // this is where a damaged hint — one that fails its CRC, or one a read
+  // fails on — is found, before any of its entries is applied. A hint is a
+  // derived index, not the records it points at: neither failure says the
+  // data file behind it is damaged. Throws when the rebuild cannot produce a
+  // readable hint, leaving the caller to apply fail_recovery_on_crc_errors to
+  // a file it cannot index.
   static auto open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
-                                   const std::filesystem::path &hint_path,
-                                   HintOpener open) -> HintFile;
+                                   const std::filesystem::path &hint_path)
+      -> HintFile;
 
   
 
@@ -1227,10 +1255,18 @@ private:
       const DataFile &source_file, WritableDataFile &dest_file,
       std::uint32_t source_file_id, const NeededTombstones &needed,
       std::uint64_t retain_after) -> VacuumScanResult;
-  // Remaps key_dir entries, updates file registry, publishes new state. Caller must hold write_mu_.
+  // Remaps key_dir entries, updates file registry, publishes new state.
+  // First makes every write through decided_at durable: the state vacuum
+  // judged the file's records dead by. Caller must hold write_mu_.
   void vacuum_commit(std::uint32_t old_file_id, const VacuumScanResult &scan,
                      std::shared_ptr<DataFile> new_sealed_file,
-                     std::uint32_t dest_file_id);
+                     std::uint32_t dest_file_id, std::uint64_t decided_at);
+  // fdatasyncs the active file and advances t's durable_seq to its last
+  // sequence. On failure degrades, publishes the degraded state over
+  // current, and rethrows. Caller holds the write barrier.
+  void sync_active_file(TransientEngineState &t,
+                        const std::shared_ptr<const EngineState> &current,
+                        std::string_view caller);
   // Unlinks the old data and hint files. Open fds survive (POSIX).
   void vacuum_unlink_old_file(const std::shared_ptr<const EngineState> &snap,
                               std::uint32_t file_id);
@@ -1438,7 +1474,7 @@ private:
 
   // Member variables
   std::filesystem::path dir_;
-  int lock_fd_{-1};  // flock() on dir_/.lock; released by close() in ~DB()
+  int lock_fd_{-1};  // flock() on dir_/.lock; released by DB::close()
   std::uint64_t rotation_threshold_{kDefaultRotationThreshold};
   std::uint32_t max_hint_backlog_{kDefaultMaxHintBacklog};  // 0 = unbounded
   IoBackend io_backend_{IoBackend::Pread};
@@ -1847,6 +1883,7 @@ export struct EngineSlot : Slot {
 
 DbDegraded::~DbDegraded() = default;
 DbFollowerMode::~DbFollowerMode() = default;
+DbClosed::~DbClosed() = default;
 
 #pragma region Internal helpers
 
@@ -2664,7 +2701,9 @@ DB::DB(std::filesystem::path dir, Options opts)
     fstats_t.set(s.active_file_id, FileStats{});
     s.file_stats = std::move(fstats_t).persistent();
     auto initial = std::make_shared<EngineState>(std::move(s));
-    // All recovered entries were previously synced.
+    // Every recovered entry is durable: sealed files were synced whole
+    // before they were sealed, and recovery_prepare_files rewrote and synced
+    // every hint-less one before reading it.
     initial->durable_seq =
         initial->next_seq > 0 ? initial->next_seq - 1 : 0;
     initial->mode = opts.initial_mode;
@@ -2681,25 +2720,70 @@ DB::DB(std::filesystem::path dir, Options opts)
 
 #pragma region Lifecycle
 
-// Seals the active file, drains background hint tasks, writes hint files for
-// all sealed files, then purges stale files.
-// At destruction no readers are active.
 DB::~DB() {
-  auto s = load_state();
-  if (!s->files.empty()) {
-    try {
-      auto t = s->transient();
-      t.active_file().sync();
-      t.active_file().shrink_to_fit();
-    } catch (...) {}
-  }
   try {
-    flush_hints();
+    close();
   } catch (...) {}
+}
+
+// Takes vacuum_mu_ before write_mu_, the order vacuum() takes them in. The
+// barrier publishes every write already appended, and admits no new one
+// before the closed state, so the state it reads holds every write the DB
+// will ever acknowledge.
+void DB::close() {
+  std::lock_guard<std::mutex> vg{*vacuum_mu_};
+  std::exception_ptr error;
+  {
+    WriteBarrier barrier{*this};
+    auto current = load_state_for_write();
+    if (current->closed) return;
+    auto t = current->transient();
+    const auto last_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
+    if (current->degraded) {
+      // No sync here can be trusted: one that failed earlier left pages
+      // clean that a later one does not write (#231). What was durable when
+      // the engine degraded is what is durable. The trim is best effort; a
+      // degraded active file may already be sealed.
+      if (t.durable_seq() < last_seq) {
+        error = std::make_exception_ptr(DbDegraded{std::format(
+            "close: writes after sequence {} were acknowledged but are not "
+            "durable; the engine was degraded: {}",
+            t.durable_seq(), current->degraded_reason)});
+      }
+      try {
+        t.active_file().shrink_to_fit();
+      } catch (...) {}
+    } else {
+      try {
+        t.active_file().sync();
+        counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
+        t.apply_sync(last_seq);
+        t.active_file().shrink_to_fit();
+        // With every byte of the active file durable, its hint spares the
+        // next open the rewrite of a hint-less file. An empty file costs the
+        // next open nothing.
+        if (t.active_file().size() > 0)
+          flush_hints_for(t.active_file_ptr(), dir_);
+      } catch (...) {
+        counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
+        error = std::current_exception();
+      }
+    }
+    // Sealed files were synced whole before they were sealed, so their hints
+    // are written whether or not the engine is degraded.
+    try {
+      flush_hints();
+    } catch (...) {
+      counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
+      if (!error) error = std::current_exception();
+    }
+    store_state(current, std::move(t).persistent()->closed_copy());
+  }
   if (lock_fd_ != -1) {
     ::close(lock_fd_);
     lock_fd_ = -1;
   }
+  if (error) std::rethrow_exception(error);
 }
 
 #pragma endregion
@@ -2791,14 +2875,21 @@ auto DB::snapshot() const -> Snapshot {
   return Snapshot{load_state_for_read().state(), size_limits_};
 }
 
+// Why a state refuses writes: is_write_allowed() is false.
+static auto write_rejection(const EngineState &s) -> std::exception_ptr {
+  if (s.closed) return std::make_exception_ptr(DbClosed{});
+  if (s.degraded) return std::make_exception_ptr(DbDegraded{s.degraded_reason});
+  return std::make_exception_ptr(
+      DbFollowerMode{"write rejected: engine is in follower mode"});
+}
+
 // The single write path. Routes to either write_group_ (default) or
 // solo_writer_ depending on plan characteristics. put/del/apply_batch are
 // thin wrappers that construct a WritePlan and delegate here.
 auto DB::apply_batch(WriteOptions opts,
                      WritePlan plan) -> std::optional<CommitResult> {
   if (auto s = load_state(); !s->is_write_allowed()) {
-    if (s->degraded) throw DbDegraded{s->degraded_reason};
-    throw DbFollowerMode{"write rejected: engine is in follower mode"};
+    std::rethrow_exception(write_rejection(*s));
   }
   // With sync, even an empty plan goes through the pipeline: it returns once
   // every earlier write is durable (see execute_slots).
@@ -2927,10 +3018,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
   // bytes handled by resume() like the failed flush's.
   auto published = load_state();
   if (!published->is_write_allowed()) {
-    auto ex = published->degraded
-        ? std::make_exception_ptr(DbDegraded{published->degraded_reason})
-        : std::make_exception_ptr(
-              DbFollowerMode{"write rejected: engine is in follower mode"});
+    const auto ex = write_rejection(*published);
     for (auto *s : batch) s->err = ex;
     return;
   }
@@ -3405,7 +3493,11 @@ auto DB::rkeys_from(const ReadOptions & /*opts*/, BytesView from) const
 // write_mu_.
 auto DB::vacuum(VacuumOptions opts) -> bool {
   std::lock_guard<std::mutex> vg{*vacuum_mu_};
-  if (auto s = load_state(); s->degraded) throw DbDegraded{s->degraded_reason};
+  if (auto s = load_state(); s->closed) {
+    throw DbClosed{};
+  } else if (s->degraded) {
+    throw DbDegraded{s->degraded_reason};
+  }
   // Publishes scrape idle read caches; with no writes there are none, and
   // what the last writes retired stays pinned by whichever thread went idle
   // last. vacuum and stats are the entry points that keep running without
@@ -3546,10 +3638,10 @@ static auto recovery_key_cmp(std::span<const std::byte> a,
 }
 
 auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
-                              const std::filesystem::path &hint_path,
-                              HintOpener open) -> HintFile {
+                              const std::filesystem::path &hint_path)
+    -> HintFile {
   try {
-    return open(hint_path);
+    return HintFile::OpenForRead(hint_path);
   } catch (const std::exception &e) {
     // flush_hints_for leaves an existing hint alone, so the damaged one has
     // to go first. Nothing is lost by removing it: it is unreadable either
@@ -3557,7 +3649,7 @@ auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
     // which the next open regenerates through the same scan.
     std::filesystem::remove(hint_path);
     (void)flush_hints_for(data_file, hint_path.parent_path());
-    auto hint = open(hint_path);
+    auto hint = HintFile::OpenForRead(hint_path);
     // The tail-drop recovery_prepare_files does for a hint-less file is not
     // repeated here: a file that had a hint at all was sealed, and sealing
     // already gave its preallocated tail back.
@@ -3784,9 +3876,19 @@ auto DB::vacuum_scan_and_copy(
 void DB::vacuum_commit(std::uint32_t old_file_id,
                              const VacuumScanResult &scan,
                              std::shared_ptr<DataFile> new_sealed_file,
-                             std::uint32_t dest_file_id) {
+                             std::uint32_t dest_file_id,
+                             std::uint64_t decided_at) {
   auto current = load_state_for_write();
   auto t = current->transient();
+  // A record left out as superseded is gone for good once the source is
+  // unlinked, but what superseded it may be a sync=false write a crash can
+  // still lose, taking the key's last durable value with it (#245). So
+  // everything the scan saw becomes durable before the source can go.
+  if (t.durable_seq() < decided_at) {
+    // A sync after a failed one proves nothing (#231).
+    if (current->degraded) throw DbDegraded{current->degraded_reason};
+    sync_active_file(t, current, "vacuum");
+  }
   t.apply_vacuum(old_file_id, scan, std::move(new_sealed_file), dest_file_id);
 
   store_state(current, std::move(t).persistent());
@@ -3823,6 +3925,22 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
   const auto tmp_data_path = dir_ / (stem + ".data.tmp");
   const auto final_data_path = dir_ / (stem + ".data");
 
+  // Until the rename has placed it, the staging file is removed on every exit
+  // — the early returns below and any failure: scan, copy, sync, shrink, the
+  // rename itself. A vacuum retried under a persistent fault (ENOSPC) would
+  // otherwise leave a full copy behind per attempt until the next open. A
+  // removal that fails under the same fault is left to recovery, which deletes
+  // .data.tmp at open; it must not replace the exception in flight.
+  struct StagingCleanup {
+    std::filesystem::path path;
+    bool armed{true};
+    ~StagingCleanup() {
+      if (!armed) return;
+      std::error_code ec;
+      std::filesystem::remove(path, ec);
+    }
+  } staging{tmp_data_path};
+
   VacuumScanResult scan;
   {
 #ifdef BYTECASK_TESTING
@@ -3841,16 +3959,10 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
   // tombstone or a batch marker, and compaction must preserve all three.
   // Publishing an identical file would churn I/O for nothing.
   const auto old_total = snap->file_stats.get(file_id)->total_bytes;
-  if (scan.total_bytes >= old_total) {
-    std::error_code ec;
-    std::filesystem::remove(tmp_data_path, ec);
-    return false;
-  }
+  if (scan.total_bytes >= old_total) return false;
   // Nothing left at all: every Put was dead and every tombstone could go.
   // Remove the file rather than publish an empty one.
   if (scan.total_bytes == 0) {
-    std::error_code ec;
-    std::filesystem::remove(tmp_data_path, ec);
     vacuum_remove_file(file_id);
     counters_.vacuum_tombstones_dropped.fetch_add(
         static_cast<std::int64_t>(scan.tombstones_dropped),
@@ -3866,6 +3978,9 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
   // between here and the staging create. renameDataFileExclusive refuses the
   // target instead of replacing it.
   renameDataFileExclusive(tmp_data_path, final_data_path);
+  // Placed: .data.tmp no longer exists, and a failure from here on leaves the
+  // compacted file under its final name, which open already resolves.
+  staging.armed = false;
   // The source is unlinked once this commits. Were that unlink durable and
   // the rename not, the next open would find only .data.tmp, delete it as
   // staging, and lose every live entry the source held.
@@ -3897,7 +4012,8 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
 
   {
     WriteBarrier barrier{*this};
-    vacuum_commit(file_id, scan, new_file, dest_file_id);
+    vacuum_commit(file_id, scan, new_file, dest_file_id,
+                  snap->next_seq > 0 ? snap->next_seq - 1 : 0);
   }
   // Bytes reclaimed = the shrinkage, not old_total - live_bytes: the compacted
   // file also carries the tombstones and markers that had to be preserved.
@@ -3923,7 +4039,8 @@ void DB::vacuum_remove_file(std::uint32_t file_id) {
     WriteBarrier barrier{*this};
     VacuumScanResult empty{};
     // No new sealed file, so no id is consumed.
-    vacuum_commit(file_id, empty, nullptr, 0);
+    vacuum_commit(file_id, empty, nullptr, 0,
+                  snap->next_seq > 0 ? snap->next_seq - 1 : 0);
   }
   counters_.vacuum_bytes_reclaimed.fetch_add(
       static_cast<std::int64_t>(old_total), std::memory_order_relaxed);
@@ -3949,6 +4066,7 @@ auto DB::degraded_reason() const noexcept -> std::string {
 auto DB::stats() const -> std::map<std::string, std::int64_t> {
   scrape_read_caches();  // see vacuum()
   auto s = load_state();
+  if (s->closed) throw DbClosed{};
   const auto *pool = pool_ ? &pool_->counters() : nullptr;
   const auto reclaim = KeyDirTree::reclamation_gauges();
   std::int64_t open_files = 0;
@@ -4028,6 +4146,7 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
 void DB::set_mode(Mode mode) {
   WriteBarrier barrier{*this};
   auto current = load_state_for_write();
+  if (current->closed) throw DbClosed{};
   auto t = current->transient();
   // A leader stepping down makes every write it acknowledged durable, and
   // so shippable: changes_since stops at durable_sequence, and a sync=false
@@ -4036,22 +4155,28 @@ void DB::set_mode(Mode mode) {
   const auto last_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
   if (mode == Mode::Follower && current->mode == Mode::Leader
       && !current->degraded && t.durable_seq() < last_seq) {
-    try {
-      t.active_file().sync();
-      counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
-    } catch (...) {
-      counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
-      t.apply_degrade(std::format(
-          "set_mode(Follower) fdatasync failed on '{}': writes acknowledged "
-          "without sync are not confirmed durable. Call resume() to recover.",
-          t.active_file().path().string()));
-      store_state(current, std::move(t).persistent());
-      throw;
-    }
-    t.apply_sync(last_seq);
+    sync_active_file(t, current, "set_mode(Follower)");
   }
   t.apply_set_mode(mode);
   store_state(current, std::move(t).persistent());
+}
+
+void DB::sync_active_file(TransientEngineState &t,
+                          const std::shared_ptr<const EngineState> &current,
+                          std::string_view caller) {
+  try {
+    t.active_file().sync();
+    counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
+  } catch (...) {
+    counters_.io_errors.fetch_add(1, std::memory_order_relaxed);
+    t.apply_degrade(std::format(
+        "{} fdatasync failed on '{}': writes acknowledged without sync are "
+        "not confirmed durable. Call resume() to recover.",
+        caller, t.active_file().path().string()));
+    store_state(current, std::move(t).persistent());
+    throw;
+  }
+  t.apply_sync(t.next_seq() > 0 ? t.next_seq() - 1 : 0);
 }
 
 void DB::deem_as_degraded(std::string reason) {
@@ -4063,10 +4188,15 @@ void DB::deem_as_degraded(std::string reason) {
 }
 
 void DB::resume() {
-  if (!is_degraded()) return;
+  if (auto s = load_state(); s->closed) {
+    throw DbClosed{};
+  } else if (!s->degraded) {
+    return;
+  }
 
   WriteBarrier barrier{*this};
   auto current = load_state_for_write();
+  if (current->closed) throw DbClosed{};
   if (!current->degraded) return;  // re-check under lock
 
   // The failed flush left one or two heads derived from the published
@@ -4083,11 +4213,23 @@ void DB::resume() {
   const auto old_file_id = t.active_file_id();
   auto &file = t.active_file();
 
+  // The degrade may be a failed fdatasync, which on Linux leaves the pages
+  // it covered clean without writing them (#231): every byte appended since
+  // the last successful sync, sync=false writes included, reads back from
+  // the cache and is not on the device, and file.sync() below would find
+  // nothing to write. Rewriting the file and syncing it makes what reads
+  // return durable before the scan reads it (throws → stays degraded). Up to
+  // the logical end, where the scan stops: past it lie only the zero-filled
+  // preallocation and the bytes of an append that failed.
+  rewrite_durably(file.path(), file.size());
+
   // Scan the active file to find the last valid committed offset
   // and collect valid committed entries for key_dir replay. Entries written to
   // disk but never published to EngineState (sync-failure paths, degraded
   // transitions between IO and state publication) would otherwise be invisible
-  // until cold restart.
+  // until cold restart. The scan goes through read_raw, a pread of the page
+  // cache on every back-end — never the buffer pool's frames, which hold what
+  // was appended rather than what the rewrite found and made durable.
   Offset valid_offset = 0;
   std::vector<ResumeEntry> committed;
   try {
@@ -4129,17 +4271,22 @@ void DB::resume() {
   const auto published_extent = active_stats ? active_stats->total_bytes : 0;
   // resume() trims what a failed write left behind: bytes appended but never
   // published. Everything below the published extent was acknowledged, and a
-  // scan that stops short of it has found damage in data readers have
-  // already been served, not a torn tail. There is no consistent state to
-  // resume into from there, so resume() refuses — before truncating, so the
-  // file is left exactly as it was found and the engine stays degraded.
-  // This is detection, not repair: resume() makes no promise about what a
-  // damaged file still holds, only that it will not truncate acknowledged
-  // bytes or report success over them.
+  // scan that stops short of it has found bytes readers were served that the
+  // file no longer holds: damage, or sync=false writes a failed fdatasync
+  // left undurable and the kernel evicted before the rewrite read them. The
+  // key directory holds no older version to fall back to for the keys they
+  // overwrote, so there is no consistent state to resume into, and resume()
+  // refuses — before truncating, so the file is left exactly as it was found
+  // and the engine stays degraded. A reopen recovers the state the device
+  // holds. This is detection, not repair: resume() makes no promise about
+  // what a damaged file still holds, only that it will not truncate
+  // acknowledged bytes or report success over them.
   if (valid_offset < published_extent) {
     throw std::runtime_error{std::format(
-        "resume: active file '{}' is damaged at offset {}, inside data "
-        "already published (up to {}); refusing to truncate it",
+        "resume: active file '{}' ends at offset {}, inside data already "
+        "published (up to {}): damaged, or unsynced writes lost after a "
+        "failed fdatasync; refusing to truncate it. Reopen the database to "
+        "recover what the file holds",
         file.path().string(), valid_offset, published_extent)};
   }
 
@@ -4178,7 +4325,7 @@ void DB::resume() {
   t.apply_rotate_file(std::move(read_only_old), std::move(new_file),
                       new_file_id);
   if (pool_) pool_->set_active_file(new_file_id);
-  // All entries recovered from disk were previously synced.
+  // Every entry replayed was read after rewrite_durably synced it.
   t.apply_sync(t.next_seq() > 0 ? t.next_seq() - 1 : 0);
   t.apply_clear_degraded();
   auto resumed = std::move(t).persistent();
@@ -4194,24 +4341,28 @@ void DB::wait_published(std::uint64_t sequence) const {
   std::unique_lock<std::mutex> lk{durable_mu_};
   durable_cv_.wait(lk, [&] {
     const auto s = load_state();
-    return s->next_seq > sequence || s->degraded;
+    return s->next_seq > sequence || s->degraded || s->closed;
   });
 }
 
 auto DB::durable_sequence(std::uint64_t min_sequence,
                          std::chrono::milliseconds timeout) const
     -> std::uint64_t {
-  auto baseline = load_state()->durable_seq;
-  if (min_sequence == 0 || baseline >= min_sequence
+  const auto s = load_state();
+  if (s->closed) throw DbClosed{};
+  if (min_sequence == 0 || s->durable_seq >= min_sequence
       || timeout <= std::chrono::milliseconds{0}) {
-    return baseline;
+    return s->durable_seq;
   }
 
   std::unique_lock<std::mutex> lk{durable_mu_};
   durable_cv_.wait_for(lk, timeout, [&] {
-    return load_state()->durable_seq >= min_sequence;
+    const auto cur = load_state();
+    return cur->durable_seq >= min_sequence || cur->closed;
   });
-  return load_state()->durable_seq;
+  const auto last = load_state();
+  if (last->closed) throw DbClosed{};
+  return last->durable_seq;
 }
 
 auto DB::create_manifest() -> FileManifest {
@@ -4221,6 +4372,7 @@ auto DB::create_manifest() -> FileManifest {
     WriteBarrier barrier{*this};
 
     auto current = load_state_for_write();
+    if (current->closed) throw DbClosed{};
     if (current->degraded) throw DbDegraded{current->degraded_reason};
 
     auto t = current->transient();
@@ -4313,6 +4465,10 @@ auto DB::load_state_for_read() const
   }
   e->used_epoch.store(ReadCacheRegistry::instance().epoch(),
                       std::memory_order_relaxed);
+  if (e->state->closed) {
+    slot.release(e);
+    throw DbClosed{};
+  }
   return ReadStateGuard{slot, e};
 }
 
@@ -4374,6 +4530,7 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
       new_state->next_seq > old_state->next_seq;
   const auto became_degraded =
       new_state->degraded && !old_state->degraded;
+  const auto became_closed = new_state->closed && !old_state->closed;
 
 #ifndef NDEBUG
   if constexpr (kKeyDirReadsKeys) {
@@ -4435,7 +4592,8 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
   // advances no durable sequence notifies too. (A failed flush publishes
   // through the raw store under durable_mu_ and finish_flush notifies for
   // it; deem_as_degraded notifies for itself.)
-  if (durable_advanced || published_advanced || became_degraded) {
+  if (durable_advanced || published_advanced || became_degraded ||
+      became_closed) {
     { std::lock_guard<std::mutex> lk{durable_mu_}; }
     durable_cv_.notify_all();
   }
@@ -4711,26 +4869,36 @@ auto DB::recovery_prepare_files(EngineState &s)
 
   for (const auto &p : data_paths) {
     const auto file_id = s.next_file_id++;
+    const auto hint_path = dir_ / (p.stem().string() + ".hint");
+    const auto hintless = !std::filesystem::exists(hint_path);
+    // A file without a hint was the active file when the last process
+    // stopped, or a sealed file whose hint was not written yet. The active
+    // file's last bytes may be in the page cache and not on the device: the
+    // process was killed before its sync, or a sync failed and left its
+    // pages clean without writing them (#231). A hint built from them would
+    // outlive them at a power loss, and point into zeros. So they are made
+    // durable before anything reads them — every hint-less file, since none
+    // of them says which one was active.
+    // No writer says where its entries end, so the whole file.
+    if (hintless) rewrite_durably(p, std::filesystem::file_size(p));
     auto data_file =
         openDataFileForRead(p, io_backend_, pool_, file_id);
 
-    const auto hint_path = dir_ / (p.stem().string() + ".hint");
-    if (!std::filesystem::exists(hint_path)) {
-      // A file without a hint was the active file at the last shutdown, or a
-      // sealed file whose hint was not written yet. Whatever lies past its
-      // last committed record goes, once recovery_check_tail has ruled that
-      // it may: the preallocated tail a crash leaves, or a torn write. That
-      // makes its physical size its logical size, as for every other sealed
-      // file — file_size below is what seeds total_bytes for vacuum.
+    if (hintless) {
+      // Whatever lies past the file's last committed record goes, once
+      // recovery_check_tail has ruled that it may: the preallocated tail a
+      // crash leaves, or a torn write. That makes its physical size its
+      // logical size, as for every other sealed file — file_size below is
+      // what seeds total_bytes for vacuum.
       const auto end = flush_hints_for(data_file, dir_, [&](Offset e) {
         recovery_check_tail(*data_file, e, data_paths);
       });
       if (end && *end < std::filesystem::file_size(p)) {
         data_file.reset();
-        std::filesystem::resize_file(p, *end);
+        truncate_durably(p, *end);
         // Same file_id as the open above, deliberately. Under the buffer
         // pool that open's hint scan may have admitted frames under this id,
-        // but resize_file only drops a tail: every byte below *end is
+        // but the truncate only drops a tail: every byte below *end is
         // unchanged, and no reader addresses anything above it. Frames past
         // the new end are orphans CLOCK reclaims.
         data_file = openDataFileForRead(p, io_backend_, pool_, file_id);
@@ -4881,81 +5049,12 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
   };
 
   for (auto &[file_id, data_file, hint_path, tb] : files) {
+    // Only a file that cannot be opened is skipped. An error once its entries
+    // are being applied fails the open: some of them are already in t. The
+    // scanner keeps the file open.
+    std::optional<HintFile::Scanner> scanner;
     try {
-      auto hint =
-          open_hint_or_rebuild(data_file, hint_path, &HintFile::OpenForRead);
-      auto scanner = hint.make_scanner();
-      while (auto he = scanner.next()) {
-        // Track per-file sequence bounds for ALL entries, including those
-        // suppressed by tombstones. Bounds represent the range of sequences
-        // physically present in the file, not just live ones.
-        if (he->sequence > max_seq) max_seq = he->sequence;
-        auto &file_fs = fstats_scratch[file_id];
-        if (file_fs.min_sequence == 0 || he->sequence < file_fs.min_sequence)
-          file_fs.min_sequence = he->sequence;
-        if (he->sequence > file_fs.max_sequence)
-          file_fs.max_sequence = he->sequence;
-        file_fs.tombstone_bytes +=
-            tombstone_size(he->entry_type, he->key.size(), he->end_key.size());
-        file_fs.marker_bytes += marker_size(he->entry_type);
-
-        if (he->entry_type == EntryType::Put) {
-          const auto k = Key{he->key};
-          const auto tomb_it = tombstones.find(k);
-          if (tomb_it != tombstones.end() &&
-              tomb_it->second.seq >= he->sequence) {
-            if (tomb_it->second.file_id != file_id)
-              needed.push_back(tomb_it->second.seq);
-            continue;
-          }
-          // Check range tombstones — O(R) per Put, R expected small.
-          bool suppressed = false;
-          for (auto &rt : range_tombstones) {
-            if (rt.seq >= he->sequence && k >= rt.start && k < rt.end) {
-              if (rt.file_id != file_id) rt.needed = true;
-              suppressed = true;
-              break;
-            }
-          }
-          if (suppressed) {
-            continue;
-          }
-          t.upsert(he->key,
-                   KeyDirEntry::make(he->sequence, he->file_offset, file_id,
-                                     he->value_size),
-                   seq_wins);
-        } else if (he->entry_type == EntryType::Delete) {
-          const auto k = Key{he->key};
-          auto &slot = tombstones[k];
-          if (he->sequence > slot.seq) slot = {he->sequence, file_id};
-          const auto existing = t.get(he->key);
-          if (existing && existing->sequence() < he->sequence) {
-            t.erase(he->key);
-            needed.push_back(he->sequence);
-          }
-        } else if (he->entry_type == EntryType::RangeDel) {
-          const auto start = Key{he->key};
-          const auto end = Key{he->end_key};
-          // Erase keys in [start, end) with sequence < this tombstone.
-          std::vector<Key> to_erase;
-          for (auto it = t.lower_bound(he->key);
-               it != std::default_sentinel; ++it) {
-            auto [key_span, entry] = *it;
-            if (Key{key_span} >= end) break;
-            if (entry.sequence() < he->sequence) {
-              to_erase.emplace_back(key_span);
-            }
-          }
-          for (const auto &ek : to_erase) {
-            t.erase(std::span<const std::byte>{ek});
-          }
-          range_tombstones.push_back(
-              {start, end, he->sequence, file_id, !to_erase.empty()});
-        }
-      }
-    } catch (const SequenceOverlap &) {
-      // Not a damaged file to skip: recovery_open resolves or rejects it.
-      throw;
+      scanner.emplace(open_hint_or_rebuild(data_file, hint_path).make_scanner());
     } catch (const std::exception &e) {
       if (strict) throw;
       skipped = true;
@@ -4963,6 +5062,75 @@ auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
                    "bytecask: skipping data file for hint '%s' — could not "
                    "read it or rebuild it from the data file: %s\n",
                    hint_path.string().c_str(), e.what());
+      continue;
+    }
+    while (auto he = scanner->next()) {
+      // Track per-file sequence bounds for ALL entries, including those
+      // suppressed by tombstones. Bounds represent the range of sequences
+      // physically present in the file, not just live ones.
+      if (he->sequence > max_seq) max_seq = he->sequence;
+      auto &file_fs = fstats_scratch[file_id];
+      if (file_fs.min_sequence == 0 || he->sequence < file_fs.min_sequence)
+        file_fs.min_sequence = he->sequence;
+      if (he->sequence > file_fs.max_sequence)
+        file_fs.max_sequence = he->sequence;
+      file_fs.tombstone_bytes +=
+          tombstone_size(he->entry_type, he->key.size(), he->end_key.size());
+      file_fs.marker_bytes += marker_size(he->entry_type);
+
+      if (he->entry_type == EntryType::Put) {
+        const auto k = Key{he->key};
+        const auto tomb_it = tombstones.find(k);
+        if (tomb_it != tombstones.end() &&
+            tomb_it->second.seq >= he->sequence) {
+          if (tomb_it->second.file_id != file_id)
+            needed.push_back(tomb_it->second.seq);
+          continue;
+        }
+        // Check range tombstones — O(R) per Put, R expected small.
+        bool suppressed = false;
+        for (auto &rt : range_tombstones) {
+          if (rt.seq >= he->sequence && k >= rt.start && k < rt.end) {
+            if (rt.file_id != file_id) rt.needed = true;
+            suppressed = true;
+            break;
+          }
+        }
+        if (suppressed) {
+          continue;
+        }
+        t.upsert(he->key,
+                 KeyDirEntry::make(he->sequence, he->file_offset, file_id,
+                                   he->value_size),
+                 seq_wins);
+      } else if (he->entry_type == EntryType::Delete) {
+        const auto k = Key{he->key};
+        auto &slot = tombstones[k];
+        if (he->sequence > slot.seq) slot = {he->sequence, file_id};
+        const auto existing = t.get(he->key);
+        if (existing && existing->sequence() < he->sequence) {
+          t.erase(he->key);
+          needed.push_back(he->sequence);
+        }
+      } else if (he->entry_type == EntryType::RangeDel) {
+        const auto start = Key{he->key};
+        const auto end = Key{he->end_key};
+        // Erase keys in [start, end) with sequence < this tombstone.
+        std::vector<Key> to_erase;
+        for (auto it = t.lower_bound(he->key);
+             it != std::default_sentinel; ++it) {
+          auto [key_span, entry] = *it;
+          if (Key{key_span} >= end) break;
+          if (entry.sequence() < he->sequence) {
+            to_erase.emplace_back(key_span);
+          }
+        }
+        for (const auto &ek : to_erase) {
+          t.erase(std::span<const std::byte>{ek});
+        }
+        range_tombstones.push_back(
+            {start, end, he->sequence, file_id, !to_erase.empty()});
+      }
     }
   }
 
@@ -5339,10 +5507,9 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
     fs.marker_bytes += marker_size(he.entry_type);
   };
 
-  // One cursor per hint file, parked on its next Put or Delete. The scanner
-  // reads the hint file's own buffer or mapping, so the files must outlive
-  // the merge. A scanner's entries last only until its next call, so the
-  // cursor owns the entries it keeps.
+  // One cursor per hint file, parked on its next Put or Delete. A scanner's
+  // entries last only until its next call, so the cursor owns the entries it
+  // keeps.
   struct Cursor {
     HintFile::Scanner scanner;
     std::uint32_t file_id;
@@ -5351,35 +5518,19 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
     bool has_cur{false};
     bool has_lookahead{false};
   };
-  std::vector<HintFile> open_hints;
   std::vector<Cursor> cursors;
-  open_hints.reserve(files.size());
   cursors.reserve(files.size());
 
   // Phase A: the head of each file — markers and range tombstones — is read
   // up front, so every range tombstone this worker owns is known before any
   // Put is admitted.
   for (auto &[file_id, data_file, hint_path, tb] : files) {
+    // Only a file that cannot be opened is skipped. An error once its entries
+    // are being read fails the open: some of them are already noted. The
+    // scanner keeps the file open.
+    std::optional<HintFile::Scanner> scanner;
     try {
-      open_hints.push_back(
-          open_hint_or_rebuild(data_file, hint_path, &HintFile::OpenForMerge));
-      Cursor c{open_hints.back().make_scanner(), file_id, {}, {}, false, false};
-      while (auto he = c.scanner.next()) {
-        note(file_id, *he);
-        if (he->entry_type == EntryType::RangeDel) {
-          range_tombstones.push_back(
-              {Key{he->key}, Key{he->end_key}, he->sequence, file_id});
-          continue;
-        }
-        if (he->entry_type == EntryType::BulkBegin ||
-            he->entry_type == EntryType::BulkEnd) {
-          continue;
-        }
-        c.lookahead.assign(*he);
-        c.has_lookahead = true;
-        break;
-      }
-      cursors.push_back(std::move(c));
+      scanner.emplace(open_hint_or_rebuild(data_file, hint_path).make_scanner());
     } catch (const std::exception &e) {
       if (strict) throw;
       skipped = true;
@@ -5387,7 +5538,25 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
                    "bytecask: skipping data file for hint '%s' — could not "
                    "read it or rebuild it from the data file: %s\n",
                    hint_path.string().c_str(), e.what());
+      continue;
     }
+    Cursor c{std::move(*scanner), file_id, {}, {}, false, false};
+    while (auto he = c.scanner.next()) {
+      note(file_id, *he);
+      if (he->entry_type == EntryType::RangeDel) {
+        range_tombstones.push_back(
+            {Key{he->key}, Key{he->end_key}, he->sequence, file_id});
+        continue;
+      }
+      if (he->entry_type == EntryType::BulkBegin ||
+          he->entry_type == EntryType::BulkEnd) {
+        continue;
+      }
+      c.lookahead.assign(*he);
+      c.has_lookahead = true;
+      break;
+    }
+    cursors.push_back(std::move(c));
   }
 
   // Phase B: merge the runs. For each key the highest sequence across every
@@ -5900,8 +6069,7 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
     const auto &rf = files[f];
     run.stats = FileStats{0, rf.total_bytes};
     try {
-      run.hint.emplace(open_hint_or_rebuild(rf.data_file, rf.hint_path,
-                                            &HintFile::OpenForMerge));
+      run.hint.emplace(open_hint_or_rebuild(rf.data_file, rf.hint_path));
     } catch (const std::exception &e) {
       if (strict) throw;
       std::fprintf(stderr,
@@ -6364,7 +6532,7 @@ auto ChangeIterator::operator==(std::default_sentinel_t) const noexcept -> bool 
 // DB::changes_since implementation
 auto DB::changes_since(const Snapshot& snap, std::uint64_t from_sequence) const
     -> std::ranges::subrange<ChangeIterator, std::default_sentinel_t> {
-
+  if (load_state()->closed) throw DbClosed{};
   auto state = snap.state();
   auto begin = ChangeIterator{state, from_sequence, state->durable_seq};
   return {std::move(begin), std::default_sentinel};
@@ -6376,6 +6544,7 @@ auto DB::changes_since(const Snapshot& snap, std::uint64_t from_sequence) const
 
 void DB::ingest(std::span<const DataEntryView> entries) {
   if (auto s = load_state(); !s->is_ingestion_allowed()) {
+    if (s->closed) throw DbClosed{};
     if (s->degraded) throw DbDegraded{s->degraded_reason};
     throw std::logic_error{"ingest rejected: engine is not in follower mode"};
   }
@@ -6392,6 +6561,7 @@ void DB::ingest(std::span<const DataEntryView> entries) {
 
   auto current = load_state_for_write();
   if (!current->is_ingestion_allowed()) {
+    if (current->closed) throw DbClosed{};
     if (current->degraded) throw DbDegraded{current->degraded_reason};
     throw std::logic_error{"ingest rejected: engine is not in follower mode"};
   }

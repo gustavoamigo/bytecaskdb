@@ -684,11 +684,12 @@ auto NapiDB::Stats(const Napi::CallbackInfo& info) -> Napi::Value {
 }
 
 auto NapiDB::Close(const Napi::CallbackInfo&) -> void {
-  // Deterministically destroys the wrapped bytecask::DB (releasing its file
-  // lock and flushing) rather than waiting for GC — matches the Embind
-  // layer's explicit `delete` in jsdb_close. Idempotent: db is null if
-  // close() has already run.
-  db.reset();
+  // Closes and destroys the wrapped bytecask::DB now rather than when GC
+  // runs. The handle is released before close() can throw: the DB is closed
+  // either way, and a failed shutdown reaches JS as an Error. Idempotent:
+  // db is null once close() has run.
+  const auto closing = std::move(db);
+  if (closing) closing->close();
 }
 
 // ===========================================================================

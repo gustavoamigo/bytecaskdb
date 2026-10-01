@@ -37,9 +37,9 @@ def vacuum_compact_delta(
     Recovery must detect it and delete it: the cell records the orphan's
     path before closing and checks it is gone after the next open.
 
-    VC4 note: after a successful rename the tmp file is valid on disk but
-    unreferenced. The .data.tmp extension is not scanned by recovery, so it
-    is a harmless disk orphan — assert_vacuum_recoverable confirms this.
+    VC1–VC4 fail before the rename: vacuum removes its .data.tmp staging copy
+    on the way out (#235), so a retry under a persistent fault does not leave
+    a copy per attempt. Every cell checks no staging copy remains.
 
     """
     if failure == VacuumCompactFailureClass.SUCCESS:

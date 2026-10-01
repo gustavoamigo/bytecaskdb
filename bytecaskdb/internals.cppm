@@ -854,13 +854,16 @@ export struct EngineState {
   Mode mode{Mode::Leader};
   bool degraded{false};
   std::string degraded_reason;
+  // Set by DB::close(). A closed state is the last one a DB publishes and
+  // holds no files or key directory (see closed_copy).
+  bool closed{false};
 
   [[nodiscard]] auto is_write_allowed() const noexcept -> bool {
-    return mode == Mode::Leader && !degraded;
+    return mode == Mode::Leader && !degraded && !closed;
   }
 
   [[nodiscard]] auto is_ingestion_allowed() const noexcept -> bool {
-    return mode == Mode::Follower && !degraded;
+    return mode == Mode::Follower && !degraded && !closed;
   }
 
   // Where this state's key directory reads the keys it does not store.
@@ -889,6 +892,23 @@ export struct EngineState {
     auto s = std::make_shared<EngineState>(*this);
     s->degraded = true;
     s->degraded_reason = std::move(reason);
+    return s;
+  }
+
+  // The state DB::close() publishes: this state's sequences, mode and
+  // degraded reason, without its files or key directory, so the DB stops
+  // holding them. Snapshots and iterators keep the versions they hold.
+  [[nodiscard]] auto closed_copy() const -> std::shared_ptr<EngineState> {
+    auto s = std::make_shared<EngineState>();
+    s->active_file_id = active_file_id;
+    s->next_file_id = next_file_id;
+    s->next_seq = next_seq;
+    s->durable_seq = durable_seq;
+    s->sync_requested_seq = sync_requested_seq;
+    s->mode = mode;
+    s->degraded = degraded;
+    s->degraded_reason = degraded_reason;
+    s->closed = true;
     return s;
   }
 };

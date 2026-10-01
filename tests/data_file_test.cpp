@@ -1319,6 +1319,112 @@ TEST_CASE("DataFile::lend_record past the end names the file and offset",
   std::filesystem::remove(path);
 }
 
+// A file that ends before a read the engine believed it held (#236): pread
+// returns 0 and sets no errno, so the error must say where the file ended
+// instead of "pread failed: Success".
+TEST_CASE("DataFile: a read past the end of file reports a short read",
+          "[data_file]") {
+  const bool sealed = GENERATE(false, true);
+  CAPTURE(sealed);
+  const auto path =
+      std::filesystem::temp_directory_path() / "bc_test_short_read.data";
+  std::filesystem::remove(path);
+  auto writer =
+      bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+  (void)writer->append_entry(1, bytecask::EntryType::Put, to_bytes("a"),
+                             to_bytes("first"));
+  const auto second = writer->append_entry(2, bytecask::EntryType::Put,
+                                           to_bytes("b"), to_bytes("second"));
+  writer->sync();
+  std::shared_ptr<bytecask::DataFile> file = writer;
+  if (sealed) file = bytecask::openDataFileForRead(path);
+  // Cut the file behind the handle's back, two bytes into the second
+  // record's value.
+  const auto cut = second + bytecask::kHeaderSize + 1 + 2;
+  REQUIRE(::truncate(path.c_str(), static_cast<off_t>(cut)) == 0);
+
+  const auto error_of = [&](auto &&read) {
+    try {
+      read();
+    } catch (const std::system_error &e) {
+      CHECK(e.code() == std::errc::io_error);
+      return std::string{e.what()};
+    }
+    return std::string{"no error"};
+  };
+  std::vector<std::byte> io_buf;
+  std::vector<std::byte> out;
+  const auto value = error_of([&] {
+    file->read_value(second, 1, 6, /*verify=*/false, io_buf, out);
+  });
+  INFO(value);
+  CHECK(value.find(std::format(
+            "short read: the file ends 2 bytes into a read of 6 at offset {}",
+            second + bytecask::kHeaderSize + 1)) != std::string::npos);
+  // The over-read past the record may meet the end of the file; the
+  // record's own bytes may not.
+  const auto entry = error_of(
+      [&] { (void)file->read_entry_unverified(second, 6, io_buf); });
+  INFO(entry);
+  CHECK(entry.find(std::format("short read: the file ends 18 bytes into a "
+                               "read of 26 at offset {}",
+                               second)) != std::string::npos);
+
+  file.reset();
+  writer.reset();
+  std::filesystem::remove(path);
+}
+
+// A pread that fails is an I/O error, and stays one in testing builds, where
+// the read's diagnostic is added to the message: callers tell an I/O error
+// from corruption by the exception's type.
+TEST_CASE("DataFile::lend_record: a failed pread throws std::system_error",
+          "[data_file]") {
+  const bool sealed = GENERATE(false, true);
+  CAPTURE(sealed);
+  const auto dir = std::filesystem::temp_directory_path();
+  const auto path = dir / "bc_test_lend_io_error.data";
+  std::filesystem::remove(path);
+  auto writer = bytecask::createDataFileForWrite(
+      dir, "bc_test_lend_io_error", ".data", 1 << 20,
+      bytecask::IoBackend::Pread, nullptr, /*file_id=*/13);
+  (void)writer->append_entry(1, bytecask::EntryType::Put, to_bytes("a"),
+                             to_bytes("value"));
+  writer->sync();
+  if (sealed) writer->shrink_to_fit();
+  std::shared_ptr<bytecask::DataFile> file = writer;
+  if (sealed) {
+    writer.reset();
+    file.reset();
+    file = bytecask::openDataFileForRead(path, bytecask::IoBackend::Pread,
+                                         nullptr, 14);
+  }
+  // Cut the file under the open descriptor: the record's bytes are gone, and
+  // pread returns end of file where the file object expects the record.
+  std::filesystem::resize_file(path, 4);
+
+  std::vector<std::byte> io_buf;
+  bytecask::FrameLease lease;
+  try {
+    (void)file->lend_record(0, 0, false, io_buf, lease);
+    FAIL("the read of a cut record returned");
+  } catch (const std::system_error &e) {
+    const std::string what = e.what();
+    INFO(what);
+    CHECK(what.find("short read") != std::string::npos);
+#ifdef BYTECASK_TESTING
+    CHECK(what.find(sealed ? "[sealed fd " : "[writable fd ") !=
+          std::string::npos);
+    CHECK(what.find("reread now: short") != std::string::npos);
+#endif
+  }
+
+  lease.reset();
+  file.reset();
+  writer.reset();
+  std::filesystem::remove(path);
+}
+
 namespace {
 
 // A record placed so a buffer-pool frame boundary falls inside it: `before`

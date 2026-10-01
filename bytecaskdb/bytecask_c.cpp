@@ -130,8 +130,18 @@ bytecask_db_t *bytecask_open(const char *dir, unsigned recovery_threads) {
   }
 }
 
-void bytecask_close(bytecask_db_t *db) {
+int bytecask_close(bytecask_db_t *db) {
+  clear_errmsg();
+  if (!db) return 0;
+  auto rc = 0;
+  try {
+    db->db.close();
+  } catch (const std::exception &e) {
+    set_errmsg(e.what());
+    rc = -1;
+  }
   delete db;
+  return rc;
 }
 
 // ---------------------------------------------------------------------------

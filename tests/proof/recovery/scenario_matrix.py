@@ -37,11 +37,10 @@ class RecoveryFailureClass(Enum):
 
 
 class Damage(Enum):
-    # No damage needed. A clean close leaves the file that was active at
-    # shutdown hint-less all by itself — flush_hints skips active_file_id — so
-    # this is already the shape a crash produces, and the one
-    # recovery_prepare_files regenerates from.
-    NONE = "none"
+    # The shape a crash produces: the file active when the process died has
+    # no hint, and recovery_prepare_files regenerates it. A clean close
+    # writes that hint, so the test removes it.
+    DROP_NEWEST_HINT = "drop_newest_hint"
     DROP_ALL_HINTS = "drop_all_hints"             # every sealed file's hint gone
     CORRUPT_NEWEST_HINT = "corrupt_newest_hint"   # newest hint's CRC no longer holds
 
@@ -60,7 +59,7 @@ RECOVERY_STATE_SHAPES = [
     # The shape a crash leaves behind: the file that was active at shutdown
     # never got a hint, and recovery_prepare_files regenerates it (and drops
     # its preallocated tail).
-    RecoveryStateShape("crash_hintless", Damage.NONE),
+    RecoveryStateShape("crash_hintless", Damage.DROP_NEWEST_HINT),
     # Several sealed files, none with a hint — every one has to be rebuilt.
     RecoveryStateShape(
         "multi_file_hintless", Damage.DROP_ALL_HINTS, max_file_bytes=120
@@ -72,10 +71,10 @@ RECOVERY_STATE_SHAPES = [
     ),
     # Batch markers have to survive regeneration: hint files carry BulkBegin
     # and BulkEnd so recovery can compute durable_seq over a batch.
-    RecoveryStateShape("hintless_batched", Damage.NONE, has_batches=True),
+    RecoveryStateShape("hintless_batched", Damage.DROP_NEWEST_HINT, has_batches=True),
     # A range tombstone has to survive it too — recovery's suppression loop
     # reads it back out of the regenerated hint.
-    RecoveryStateShape("hintless_range_del", Damage.NONE, has_range_del=True),
+    RecoveryStateShape("hintless_range_del", Damage.DROP_NEWEST_HINT, has_range_del=True),
 ]
 
 RECOVERY_FAILURE_CLASSES = list(RecoveryFailureClass)

@@ -317,7 +317,10 @@ Four checkpoints exist in the production code:
 Six additional checkpoints exist in `bytecask.cpp` (compiled under `BYTECASK_TESTING`):
 
 5. `io_resume_truncate` — before `file.truncate()` in `resume()` (only
-   reached when the active file has orphaned bytes to discard)
+   reached when the active file has orphaned bytes to discard). In
+   post-write mode the same name fires after the `ftruncate` in
+   `WritableFileOps::truncate` instead: a truncate that cut the file and
+   then reported an error, as ext4 can.
 6. `io_resume_sync` — before `file.sync()` in `resume()`
 7. `io_resume_file_creation` — before creating the new active `DataFile`
    in `resume()`
@@ -345,6 +348,21 @@ And one on the read side, for the scan `resume()` runs:
     `read_raw()`, which every sweep of it goes through. An I/O error there says nothing about the bytes, so
     `resume()` must rethrow it rather than read it as the end of the file
     and truncate; `[degraded][resume]` holds it to that.
+
+And one on the hint read, which recovery used to take through a memory
+mapping — where a failed read is a `SIGBUS`, not an error (#237):
+
+15. `io_hint_read` — before each `pread()` of a hint file, in the pass that
+    opens and verifies it and in every scan. `FaultInjector::fail_on_nth_match`
+    fails only the Nth read, so the rebuild that follows reads cleanly. A
+    failure in the open pass must rebuild the hint and recover every key; one
+    in a scan must fail the open with `std::system_error` and cost nothing on
+    the next. The `[model]` many-frames test fails reads 1–150 in turn and
+    checks each against the serial baseline, file stats included, and
+    `DB::open rebuilds a hint file a read fails on` checks both outcomes
+    directly. Both run at `recovery_threads = 1` on the B+ tree paths: the
+    injector is thread-local, and the radix path builds on worker threads
+    even at one.
 
 ### Orphaned BulkBegin degrade
 
@@ -601,9 +619,9 @@ Each test follows the same structure:
 7. `assert_recoverable(dir, before, expected)` — validates persistence
    invariant via fresh recovery (where applicable)
 
-### resume() — 59 tests
+### resume() — 64 tests
 
-59 generated Catch2 tests (`[prove_resume]` tag) cover every valid
+64 generated Catch2 tests (`[prove_resume]` tag) cover every valid
 (DegradeShape, ResumeFailureClass) combination.
 
 Twelve degrade shapes establish a degraded DB before resume is called:
@@ -657,10 +675,15 @@ Twelve degrade shapes establish a degraded DB before resume is called:
   entry is sequence 1 — while a cold open, whose hint file does carry
   markers, said 1. All five cells failed before that filter was removed.
 
-Six resume failure classes:
+Seven resume failure classes:
 
 - **SUCCESS** — clean resume on first attempt.
 - **R1** (`io_resume_truncate`) — truncation fails, stays degraded.
+- **R1_AFTER_CUT** (`io_resume_truncate`, post-write) — the truncate cuts
+  the file and then fails (#236). Stays degraded, and every key published
+  before the degrade must still read back while it is: before the fix the
+  file's logical end stayed past the new end of file, a read's over-read
+  ran past EOF, and the degrade_C cells failed with a short read.
 - **R2** (`io_resume_sync`) — sync fails, stays degraded.
 - **R3** (`io_resume_file_creation`) — new active file creation fails.
 - **DOUBLE** — resume succeeds, then a second resume is called (no-op).
@@ -674,13 +697,14 @@ Two elimination rules apply:
    (`if (file.size() != valid_offset) { ... truncate ... }`). R1 is valid
    for the degrade_C shapes (orphaned `BulkBegin`) and for degrade_B2 and
    degrade_B3, which leave a torn and a complete-but-uncommitted entry
-   respectively — 7 combinations filtered.
+   respectively — 7 combinations filtered. R1_AFTER_CUT needs the same
+   shapes — 7 more.
 2. **R2 and CASCADE require an unsealed file.** The degrade_H shapes
    seal the active file during rotation before the fault fires, so
    `resume()` never enters the truncate/sync/seal block and the sync
    fault point is unreachable — 6 more combinations filtered.
 
-12 shapes × 6 classes = 72 minus 13 filtered = **59 tests**.
+12 shapes × 7 classes = 84 minus 20 filtered = **64 tests**.
 
 Present keys are asserted with `get`, not `contains_key`, both in-process
 and in `assert_keys_recoverable`. A truncation that cut too far leaves
@@ -751,11 +775,13 @@ VC2 (`io_data_file_append`), VC3 (`io_data_file_sync`),
 VC4 (`io_vacuum_compact_rename`), VC5 (`io_vacuum_compact_unlink`),
 VC6 (`io_vacuum_compact_post_rename`).
 
-VC4 is the most critical: the tmp file is fully synced and renamed
-(a new `.data` file exists on disk) but `vacuum_commit` has not run —
-the old file is still in the published state. `assert_vacuum_recoverable`
-confirms that recovery does not replay the orphaned new file as a
-secondary source and sees only the data the old file guaranteed.
+VC4 fails at the last step before the rename: the tmp file is fully
+synced and shrunk but `vacuum_commit` has not run — the old file is still
+in the published state. The rename-completed case is VC6.
+
+Every cell also checks that no `.data.tmp` outlives `vacuum()` (#235):
+VC2–VC4 fail after the staging file exists, and vacuum must remove it on
+the way out rather than leave a copy per retry until the next open.
 
 VC5 is the other side of the commit: `vacuum_commit` has run, so in memory
 the outcome is success (`assert_vacuum_success`), but the source was never
@@ -914,11 +940,11 @@ fault cleared and checks every key back, by value.
 
 | Shape | Damage | What it tests |
 |-------|--------|---------------|
-| `crash_hintless` | none needed | The file that was active at shutdown. A clean close already leaves it hint-less — `flush_hints` skips `active_file_id` — so this *is* the shape a crash produces, and the one `recovery_prepare_files` regenerates from |
+| `crash_hintless` | newest hint removed | The file that was active when the process died: a crash leaves it hint-less, and `recovery_prepare_files` regenerates it. A clean close writes that hint, so the cell removes it |
 | `multi_file_hintless` | every hint removed | Several sealed files, none with a hint; all must be rebuilt |
 | `damaged_hint` | newest hint's CRC broken | `open_hint_or_rebuild` must discard it and rebuild from the data file rather than drop the keys behind it |
-| `hintless_batched` | none needed | `BulkBegin`/`BulkEnd` have to survive regeneration — a hint carries them so recovery can compute `durable_seq` across a batch |
-| `hintless_range_del` | none needed | A range tombstone has to survive it too; recovery reads it back out of the regenerated hint to suppress the range |
+| `hintless_batched` | newest hint removed | `BulkBegin`/`BulkEnd` have to survive regeneration — a hint carries them so recovery can compute `durable_seq` across a batch |
+| `hintless_range_del` | newest hint removed | A range tombstone has to survive it too; recovery reads it back out of the regenerated hint to suppress the range |
 
 Serial and parallel recovery diverging is the specific risk the `[model]`
 tests were built around, so every shape is recovered both ways.
@@ -1502,8 +1528,7 @@ those losses but does not fail on them, because the contract promises only
 catch cannot be caught by it: removing the sync before degrading (B1–B3)
 changes nothing when no write fails, and writing hints in place, without
 the temp-then-rename, leaves a torn hint that fails its CRC and is rebuilt
-from its data file. Both need the power-loss follow-up (`dm-flakey`,
-`dm-log-writes`, or a FUSE layer that drops unsynced writes).
+from its data file. Both need power loss, which the chaos rig below models.
 
 What it did catch: #166, `vacuum()` dropping a file with
 `live_bytes == 0` along with its tombstones, so an older `Put` came back on
@@ -1675,6 +1700,56 @@ message buffer its copies share, under a reference count in the
 uninstrumented runtime, so TSan reports a read of it on one thread and
 its release on another as a race. The soak classifies exceptions by type
 and reads `what()` only when reporting a failure.
+
+### Chaos rig (power loss, I/O faults, resource limits)
+
+Every layer above ends a run with a SIGKILL, which keeps the page cache, or
+fails one syscall from inside the engine. The chaos rig
+(`tests/chaos/`, [`chaos_testing_design.md`](chaos_testing_design.md))
+runs the engine as a black box on a filesystem that can do anything POSIX
+and Linux allow: return `EIO` from reads, writes, `fdatasync` and metadata
+calls, run out of space, go read-only, write short, stall, and lose power.
+
+- `chaosfs.py` is an in-memory FUSE filesystem with a volatile and a durable
+  image per file and per directory. `fdatasync` copies dirty pages to the
+  durable image; a directory `fsync` makes its entry changes durable. A failed
+  `fdatasync` follows Linux: the pages are marked clean without reaching the
+  disk, the error is reported once, and reads keep returning the lost bytes
+  until an eviction. Power loss keeps each dirty page whole, not at all, or
+  torn at 512-byte sectors, and a prefix (or, in a quarter of crashes, a
+  subset) of each directory's unsynced changes.
+- `chaos_worker run` is the crash harness's single-writer workload plus
+  vacuum and reader threads, on the mount. A write that throws is recorded
+  as unknown; the worker then recovers (`resume()` while degraded) and sends
+  the whole database as a View before writing again, so every unknown
+  outcome is settled.
+- `run_chaos.py` runs chains of process lives on one directory, each with
+  its own fault windows, resource limits (`RLIMIT_AS`, `RLIMIT_NOFILE`) and
+  end: power loss, SIGKILL, or a clean close with the hazards lifted.
+- `chaos_worker check` holds each life to the invariants: every View and the
+  recovered directory are a prefix of the history covering the durable
+  watermark, a View with no degrade before it lost nothing, recovery with
+  default options opens, serial and parallel recovery agree, a `close()`
+  that returned lost nothing, and readers never saw a value that was not
+  written or an error that was not I/O.
+
+Its first runs found six engine bugs, none reachable by the matrix or the
+SIGKILL harness:
+
+| Bug | Symptom |
+|---|---|
+| `resume()` trusts page-cache bytes after a failed `fdatasync` (#231, fixed by #240) | after power loss, a durable hint indexes zeroed records and `DB::open` refuses the database |
+| `DB::open` never syncs the newest hint-less file it indexes (#231, fixed by #240) | the same, after a SIGKILL followed by power loss, with no I/O error at all |
+| vacuum drops a durable record superseded only by a non-durable write (#245, fixed by #261) | after a power cut, the key holds neither its old value nor its new one |
+| vacuum leaks its `.data.tmp` staging file when compaction fails (#235, fixed by #247) | a copy of a file's live data per failed attempt, most often under `ENOSPC` |
+| a failed `ftruncate` that did cut the file leaves the logical end stale (#236, fixed by #248) | while degraded, reads of published records fail with `pread failed: Success` |
+| recovery memory-maps hint files (#237, fixed by #255) | a read error on a hint during `DB::open` kills the process with `SIGBUS` |
+
+`chaos-nightly.yml` runs it for 40 minutes a night, in release and under
+ASan, with every hazard; a bug found and not yet fixed gets its hazards
+listed in the workflow's `KNOWN_BUGS` until it is. `--disable` leaves hazards
+out, to bisect a failure or to run past a known bug; a failure keeps the directory before and after the life, the
+history, the timeline and chaosfs's fault log.
 
 ### Isolation checking (Elle)
 
@@ -1862,11 +1937,20 @@ control:
   specific fault tools. The fault injector operates at the application
   syscall layer only. The process-crash harness kills the process at
   arbitrary points, but the page cache survives it, so it does not stand
-  in for power loss either. The one power-loss hazard the engine controls
+  in for power loss either. The chaos rig models power loss and
+  filesystem errors in a FUSE layer, as a filesystem that keeps the POSIX
+  contract may produce them; it does not model a device that loses what an
+  `fdatasync` confirmed. The one power-loss hazard the engine controls
   beyond `fdatasync` — a directory entry that is not durable when something
   depends on it — is checked by ordering instead: each directory sync has
   its own `io_dir_sync_*` checkpoint, and the `[dir_sync]` tests fail each
-  one and check that nothing it guards goes ahead (#199).
+  one and check that nothing it guards goes ahead (#199). A failed
+  `fdatasync` that leaves pages clean but off the device (fsyncgate, #231)
+  is modelled one layer up: `PageCacheModel` tracks each data file page's
+  device image, an injected sync failure keeps the images, and the
+  `[fsyncgate]` tests cut the power or evict the pages by writing them
+  back, then check that `resume()` and `DB::open` published nothing the
+  device does not hold.
 - **Time bounds on close and open** — the failure classes are about what a
   failure does to data. A close or open that is correct but too slow for
   the supervisor holding the stopwatch damages nothing, so no class here

@@ -216,13 +216,14 @@ The entries are stored in zstd frames, between a header and a trailer:
 
 Each frame is a standard zstd frame (level 1) holding a whole number of
 entries, cut once the entries reach 16 KiB (`kHintFrameBytes`), and recording
-its decompressed size in its frame header. Frames are not indexed: a reader
-walks them one after another. Decompressed back to back, the frames are the
+its decompressed size in its frame header. Frames are not indexed in the
+file: a reader finds them by walking them one after another. Decompressed back to back, the frames are the
 entries below, in the order above; compression changes how a hint file is
 stored, not what it says.
 
-The trailer is verified eagerly by `OpenForRead` and `OpenForMerge` before any
-parsing begins. A file whose version or codec the reader does not know is
+The trailer is verified by `OpenForRead` before any entry is handed out: it
+reads the whole file once, feeding the CRC as it goes, and checks the trailer
+before it returns. A file whose version or codec the reader does not know is
 refused like a damaged one, and rebuilt from its data file.
 
 **Uncompressed layout.** Hint files written before compression hold the

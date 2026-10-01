@@ -187,6 +187,7 @@ snap.close();
 - Scan methods (`entries`, `keys`, `entriesReverse`, `keysReverse`) return lazy JS iterators. Use `for...of` and `break` for bounded scans.
 - Iterator objects hold C++ state. Close them when done, or consume to exhaustion, or use `using` declarations. All iterator and resource types support `Symbol.dispose` (Node.js 22+).
 - Call `.close()` on DB, Snapshot, WritePlan, and iterators when done to free C++ memory. There is no garbage collection integration.
+- `db.close()` makes every write durable, `sync: false` ones included, and throws if it could not — a failed final `fdatasync` or hint write. The handle is released either way; a second `close()` does nothing.
 - C++ exceptions (I/O errors, CRC mismatches) are thrown as JS `Error` objects.
 - All write methods default to `sync: true`. Pass `{ sync: false }` for async writes.
 

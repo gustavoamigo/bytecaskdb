@@ -44,6 +44,23 @@ auto bytes_of(std::string_view sv) -> const uint8_t * {
 
 } // namespace
 
+TEST_CASE("bytecask_close reports a clean shutdown, and accepts NULL",
+          "[c_api][close]") {
+  TempDir td;
+  auto *db = bytecask_open(td.path.string().c_str(), 0);
+  REQUIRE(db != nullptr);
+  REQUIRE(bytecask_put(db, bytes_of("k"), 1, bytes_of("v"), 1, nullptr,
+                       nullptr) == 0);
+  CHECK(bytecask_close(db) == 0);
+  CHECK(bytecask_close(nullptr) == 0);
+
+  // The lock was released and the write is durable.
+  db = bytecask_open(td.path.string().c_str(), 0);
+  REQUIRE(db != nullptr);
+  CHECK(bytecask_contains_key(db, bytes_of("k"), 1) == 1);
+  CHECK(bytecask_close(db) == 0);
+}
+
 TEST_CASE("bytecask_put with null opts/out succeeds", "[c_api]") {
   TempDir td;
   auto *db = bytecask_open(td.path.string().c_str(), 0);

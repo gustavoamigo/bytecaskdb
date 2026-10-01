@@ -71,6 +71,17 @@ embedded engine targeting local storage — the assumption is stated here
 so that it can be revisited if the engine is deployed on storage
 configurations where it does not hold.
 
+**A failed `fdatasync`** is a different case, and is handled. Linux
+marks the pages a failed `fdatasync` covered clean without writing
+them, and a later `fdatasync` returns 0 without writing them either.
+Reads keep returning the bytes until the pages are evicted. So nothing
+is built from bytes whose durability is unknown until they are made
+durable: `resume()` rewrites the active file and syncs it before it
+scans it, and `DB::open` does the same for every hint-less data file
+before indexing it. What a read returns is written back to the same
+offsets and synced, so what is then published and indexed is on the
+device, relying on no more than the trust assumption above.
+
 ---
 
 ## apply_batch
@@ -176,16 +187,21 @@ If any I/O operation (append, sync) throws during execution:
   returned an error — degrades the engine unconditionally. Any `fdatasync`
   failure (commit sync or rotation sync) likewise degrades the engine:
   bytes are in the OS page cache but durability is not confirmed, and the
-  key directory does not reflect those bytes. `resume()` scans the active
-  file, truncates garbage, replays valid committed entries, and creates a
-  fresh active file, restoring normal operation.
+  key directory does not reflect those bytes. `resume()` rewrites and
+  syncs the active file, scans it, truncates garbage, replays valid
+  committed entries, and creates a fresh active file, restoring normal
+  operation.
 - Garbage is only ever above the **published extent** — the active file's
   `total_bytes` in the last published state. Damage below it is not a
   failed write's leftovers but corruption of acknowledged data, and has no
   recovery contract: `resume()` throws `std::runtime_error` before
   truncating anything, the file is left exactly as found, and the engine
-  stays degraded on every retry. An I/O error during the scan is rethrown
-  unchanged rather than read as the end of the file.
+  stays degraded on every retry. The same happens when `sync=false` writes
+  a failed `fdatasync` left off the device were evicted from the page
+  cache before `resume()` read them back: they are gone, and the key
+  directory holds no older version of the keys they overwrote. Reopening
+  the database recovers the state the device holds. An I/O error during
+  the scan is rethrown unchanged rather than read as the end of the file.
 - The DB must remain operational for subsequent calls.
 
 ### Rotation Safety
@@ -199,7 +215,10 @@ a fresh active file.
 
 The in-memory state visible to callers must always be recovery-
 equivalent, with one permitted exception: writes completed with
-`sync=false` may be visible in memory but lost on crash.
+`sync=false` may be visible in memory but lost on crash — or, without a
+crash, after a failed `fdatasync` whose pages the kernel evicts before
+`resume()` reads them back. `resume()` then refuses, and a reopen
+recovers the state without them.
 
 The specific guarantees:
 
@@ -322,9 +341,12 @@ persistent → `store_state` path via `TransientEngineState::apply_sync`.
   `sync_requested_seq` is the highest sequence written by a `sync=true`
   slot. Enforced by `store_state`; a violation degrades the engine.
 
-- **Recovery sets `durable_seq = next_seq - 1`.** All recovered entries
-  were previously synced. After `DB::open()` and `resume()`,
-  `durable_seq` reflects the full recovered state.
+- **Recovery sets `durable_seq = next_seq - 1`.** Every recovered entry
+  is durable: sealed files were synced before they were sealed, and a
+  file whose durability is unknown — a hint-less file at open, the active
+  file at `resume()` — is rewritten and synced before it is read. After
+  `DB::open()` and `resume()`, `durable_seq` reflects the full recovered
+  state.
 
 - **NoSync-only writes do not advance `durable_seq`.** If the prepared
   head owes no fdatasync, `flush_pending` publishes it with the previous
@@ -378,6 +400,11 @@ Recovery decides this once per open and compaction applies it; a
 tombstone written since the open is always kept. A file whose Puts are all
 dead may be removed without a scan only if it holds no tombstone.
 
+A Put may be dropped as dead only once the write that superseded it is
+durable. Before the old file can be unlinked, vacuum makes every write it
+judged liveness by durable, even `sync = false` ones: a power cut may lose
+a write the caller did not sync, never the durable value it replaced.
+
 ### Retention
 
 Vacuum drops no entry with a sequence above `VacuumOptions::retain_after`:
@@ -426,9 +453,15 @@ If any I/O operation throws during scan, copy, sync, or rename:
 - The caller must receive the exception.
 - The old file must remain in the published state, unchanged and
   readable.
-- Any partial temporary file (`.data.tmp`) must be cleaned up on next
-  recovery or vacuum call.
+- The temporary file (`.data.tmp`) must be removed before the exception
+  propagates. A removal that fails too is left to the next recovery and
+  must not replace the original exception.
 - The DB must remain operational.
+
+If the `fdatasync` that makes those superseding writes durable fails, the
+engine degrades and vacuum throws before committing; the old file stays in
+the published state and on disk. On an engine that is already degraded,
+vacuum throws `DbDegraded`.
 
 If the commit step (`vacuum_commit`) fails after the new file is
 written and renamed:
@@ -748,6 +781,23 @@ tests, not through standalone `changes_since` proof tests.
 
 ---
 
+## `close`
+
+Shuts the engine down and reports whether the shutdown kept every
+acknowledged write. `~DB` calls it when the caller did not, and swallows
+its errors. Proved by the `[close]` tests.
+
+| Property | Contract |
+|----------|----------|
+| **Durability** | Returns normally only if every write the DB acknowledged — `sync = false` ones included — is durable, and the sync, trim and hint writes all succeeded. |
+| **Failure reporting** | Healthy engine: a failed `fdatasync`, trim or hint write throws `std::system_error`. Degraded engine: throws `DbDegraded` when writes were acknowledged above `durable_seq`; it does not sync, since a sync after a failed one proves nothing (#231). A degraded engine whose acknowledged writes are all durable closes normally. |
+| **Closed either way** | Whatever it throws, the engine is closed and the directory lock released. A failed close leaves on disk what a crash would, and the next `open` recovers it the same way. |
+| **Concurrency** | Waits for a running vacuum and for every in-flight write to be published. A write racing `close` either commits before it — and is covered by its durability verdict — or throws `DbClosed`. A read racing it returns a result or throws `DbClosed`. |
+| **Afterwards** | Every operation throws `DbClosed` (a `std::logic_error`), except `mode()`, `is_degraded()` and `degraded_reason()`, which keep answering. `Snapshot`s, iterators and spans taken before stay valid and readable. |
+| **Idempotency** | A second `close` returns at once and reports nothing: a retry cannot make lost pages durable. |
+
+---
+
 ## View and span lifetimes
 
 Every read API either copies bytes out or lends a view of them. A lent
@@ -843,7 +893,9 @@ not accidents:
   byte under a live span is ever rewritten.
 - *The file can shorten under the mapping.* `resume()` truncates to the
   last committed offset and sealing releases the zero-filled tail.
-  Neither touches the mapping; both lower `mmap_end_` with the file. By
+  Neither touches the mapping; both lower `mmap_end_` with the file,
+  `resume()` before it cuts, so an `ftruncate` that cuts the file and
+  then reports an error leaves no page past the new end readable. By
   P, neither can take away a page a published offset points into, so no
   live span loses its backing. A read at or past the new bound takes
   the `pread` fallback and fails as a clean short read rather than
@@ -954,7 +1006,7 @@ the iterator's `io_buf_` otherwise. Both are covered below.
 | `set_mode()` | Valid | In-memory transition only |
 | Originating `Snapshot` destroyed | Valid | B |
 | Concurrent write | Valid | B + D — appends and zero-fill never rewrite a published byte |
-| `DB` destruction | Valid | B + D + P — the destructor's `shrink_to_fit` releases only the zero tail |
+| `DB::close()` / destruction | Valid | B + D + P — close's `shrink_to_fit` releases only the zero tail |
 | — | | |
 | Next `operator++()` | Invalid | Same as above |
 | Iterator destroyed | Invalid | Same as above |
@@ -1024,20 +1076,20 @@ move-only, so a span can never be separated from the buffer it
 addresses by copying the iterator. Moving is safe — the buffer travels
 with the spans.
 
-### `DB` destruction
+### `DB` close and destruction
 
-No operation may be in flight when `~DB` runs. That is a caller
-precondition, not something the engine enforces.
+`close()` may race other operations; see *`close`*. No operation may be
+in flight when `~DB` runs: that is a caller precondition, not something
+the engine enforces, since it ends the object's lifetime.
 
 Views already taken stay valid. An iterator, a `Snapshot`, and the
 spans they hand out hold their own references to the engine state and
 to every data file it names, so they remain valid and remain readable
-after the `DB` is gone.
+after the `DB` is closed or gone.
 
-An operation *racing* the destructor is undefined: a read may throw,
-and a write may be truncated away by the destructor's final release of
-the zero-filled tail and lost. Undefined here does not extend to data
-already written. Data files are append-only and the destructor's only
+An operation *racing* the destructor is undefined: it uses an object
+whose lifetime is ending. Undefined here does not extend to data
+already written. Data files are append-only and the close's only
 destructive act is truncating the active file to its logical end, so
 the worst on-disk outcome is a shorter valid prefix of the committed
 history — every surviving entry keeps its CRC, and a cut that lands
