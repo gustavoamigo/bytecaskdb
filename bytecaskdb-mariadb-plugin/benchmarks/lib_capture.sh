@@ -339,13 +339,14 @@ capture_public_host() {
 }
 
 # Prints a command to paste on your own machine that copies a run's files
-# into ./<local dir>/. Remote paths may hold globs; they are quoted, so the
-# remote side expands them. BENCH_SSH_KEY names the key (default below).
+# into ./<local dir>/. Remote paths may be directories or hold globs; they are
+# quoted, so the remote side expands the globs. BENCH_SSH_KEY names the key
+# (default below).
 capture_fetch_hint() {  # local dir, remote path...
   local dest="$1" host key="${BENCH_SSH_KEY:-~/.ssh/ec2_recovered_key}" p
   shift
   host="$(id -un)@$(capture_public_host)"
-  printf 'Fetch with:       mkdir -p %s && scp -i %s' "$dest" "$key"
+  printf 'Fetch with:       mkdir -p %s && scp -r -i %s' "$dest" "$key"
   for p in "$@"; do printf " '%s:%s'" "$host" "$p"; done
   printf ' %s/\n' "$dest"
 }
