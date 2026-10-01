@@ -240,3 +240,6 @@ EOF
   done
 } | tee "$OUT/summary.txt"
 echo "=== done $(date)  ($OUT)"
+# shellcheck source=lib_capture.sh
+source "$REPO/bytecaskdb-mariadb-plugin/benchmarks/lib_capture.sh"
+capture_fetch_hint "$(basename "$(dirname "$OUT")")_$(basename "$OUT")" "$OUT/*"
