@@ -400,7 +400,8 @@ run_bench() {
   if [[ -n "$capture_dir" ]]; then
     echo "$output" > "$capture_dir.sysbench.log"
     capture_finish "$capture_dir" "$CAPTURE_DIR/$(basename "$capture_dir")_$CAPTURE_RUN.tar.gz" \
-      "$(engine_defaults_file "$engine" "$PROFILE")" "$capture_dir.sysbench.log"
+      "$(engine_defaults_file "$engine" "$PROFILE")" "$capture_dir.sysbench.log" \
+      "$dir/error.log"
     rm -f "$capture_dir.sysbench.log"
   fi
 
