@@ -325,3 +325,27 @@ capture_finish() {
     echo "       The unpacked capture is still in $out — copy it before the host goes away." >&2
   fi
 }
+
+# This host's name as another machine reaches it: the EC2 public DNS name,
+# which changes each time the instance starts, read from the instance metadata
+# service (IMDSv2); off EC2, or with no public name, the host name.
+capture_public_host() {
+  local token name
+  token="$(curl -sf -m 1 -X PUT http://169.254.169.254/latest/api/token \
+             -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null)" &&
+    name="$(curl -sf -m 1 -H "X-aws-ec2-metadata-token: $token" \
+              http://169.254.169.254/latest/meta-data/public-hostname 2>/dev/null)"
+  echo "${name:-$(uname -n)}"
+}
+
+# Prints a command to paste on your own machine that copies a run's files
+# into ./<local dir>/. Remote paths may hold globs; they are quoted, so the
+# remote side expands them. BENCH_SSH_KEY names the key (default below).
+capture_fetch_hint() {  # local dir, remote path...
+  local dest="$1" host key="${BENCH_SSH_KEY:-~/.ssh/ec2_recovered_key}" p
+  shift
+  host="$(id -un)@$(capture_public_host)"
+  printf 'Fetch with:       mkdir -p %s && scp -i %s' "$dest" "$key"
+  for p in "$@"; do printf " '%s:%s'" "$host" "$p"; done
+  printf ' %s/\n' "$dest"
+}

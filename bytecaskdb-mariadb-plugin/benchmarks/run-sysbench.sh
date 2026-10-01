@@ -625,6 +625,8 @@ echo ""
 echo "Results saved to: $RESULTS_CSV"
 if [[ "$CAPTURE" == on ]]; then
   echo "Captures:         $CAPTURE_DIR/capture_*_$CAPTURE_RUN.tar.gz"
+  capture_fetch_hint "sysbench_${PROFILE}_t${THREADS//,/-}_$CAPTURE_RUN" \
+    "$RESULTS_CSV" "$CAPTURE_DIR/capture_*_$CAPTURE_RUN.tar.gz"
 fi
 
 cleanup
