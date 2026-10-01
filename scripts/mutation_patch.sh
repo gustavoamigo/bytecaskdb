@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 #
 # Applies, reverts or checks one mutation patch (tests/soak_mutations/,
-# tests/chaos_mutations/) by three-way merge, so a patch keeps applying when
+# tests/chaos_mutations/, tests/durability_mutations/) by three-way merge, so a patch keeps applying when
 # lines near its target change. Used by soak_mutation_check.sh,
 # chaos_mutation_check.sh and ci.yml.
 #

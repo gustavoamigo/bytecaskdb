@@ -3,6 +3,8 @@ and syncing it first. After a failed fdatasync the kernel has marked those
 pages clean without writing them, so resume() publishes and declares durable
 bytes that are not on disk. Reverts #240's resume() half (#231).
 Expected: caught.
+Guarded-by: "resume() makes durable what it publishes after a failed fdatasync"
+
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
 index aab1a99e..c960aad7 100644
 --- a/bytecaskdb/bytecask.cppm

@@ -1,0 +1,17 @@
+A rotation whose new file cannot be created publishes a healthy state over a
+sealed active file, and the next write appends to a file that is sealed.
+Guarded-by: "*rotation_file_creation_fails"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..35486e3b 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3171,7 +3171,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
+     counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
+   } catch (...) {
+     auto ex = std::current_exception();
+-    t.apply_degrade(std::format(
++    (void)(std::format(
+         "post-write rotation failed for '{}': active file is sealed "
+         "but new file could not be created. Call resume() to recover.",
+         file.path().string()));

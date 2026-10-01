@@ -1,0 +1,18 @@
+Vacuum's compacted copy is renamed over whatever holds its name, so a stem a
+concurrent rotation minted is replaced instead of panicking. Reverts #35's
+renameDataFileExclusive.
+Guarded-by: "renameDataFileExclusive panics rather than replacing a live file"
+
+diff --git a/bytecaskdb/data_file.cppm b/bytecaskdb/data_file.cppm
+index 60dfeeaa..9bd03947 100644
+--- a/bytecaskdb/data_file.cppm
++++ b/bytecaskdb/data_file.cppm
+@@ -1860,7 +1860,7 @@ export void renameDataFileExclusive(const std::filesystem::path &from,
+                                     const std::filesystem::path &to) {
+ #if defined(__linux__) && defined(RENAME_NOREPLACE)
+   if (::renameat2(AT_FDCWD, from.c_str(), AT_FDCWD, to.c_str(),
+-                  RENAME_NOREPLACE) == 0) {
++                  0) == 0) {
+     return;
+   }
+   if (errno == EEXIST) panic_on_reused_path(to);

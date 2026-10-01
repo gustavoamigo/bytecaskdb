@@ -1,0 +1,19 @@
+A hint is renamed into place without its fdatasync. The rename's directory
+sync can then persist the name over contents a power cut loses: a hint that
+fails its CRC, rebuilt by a scan that skips a hint-less file's tail handling,
+and open refuses a torn tail it would otherwise have cut.
+Guarded-by: "*hint_sync_fails*"
+
+diff --git a/bytecaskdb/hint_file.cppm b/bytecaskdb/hint_file.cppm
+index 0e2bec4d..e0a93393 100644
+--- a/bytecaskdb/hint_file.cppm
++++ b/bytecaskdb/hint_file.cppm
+@@ -596,7 +596,7 @@ public:
+       throw std::system_error{err, std::generic_category(),
+                               "HintFile::close: write CRC trailer failed"};
+     }
+-    if (sync_hint(write_fd_) != 0) {
++    if (false) {
+       const auto err = errno;
+       ::close(write_fd_);
+       write_fd_ = -1;

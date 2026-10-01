@@ -1,0 +1,17 @@
+A sweep trusts an entry's size before its CRC can vouch for it: one corrupt
+byte names an entry running past the file, and the sweep reads (and
+allocates) up to 4 GiB for it. Reverts the bound #36 and ed3ad5df added.
+Guarded-by: "resume() does not trust an entry size that runs past the file"
+
+diff --git a/bytecaskdb/data_file.cppm b/bytecaskdb/data_file.cppm
+index 60dfeeaa..ee4bf03e 100644
+--- a/bytecaskdb/data_file.cppm
++++ b/bytecaskdb/data_file.cppm
+@@ -2080,7 +2080,6 @@ private:
+     const auto hdr = bytecask::read_header(buffered(offset, kHeaderSize));
+     if (hdr.sequence == 0) return;
+     const auto total = record_bytes(hdr);
+-    if (offset + total > end) return;
+     const auto raw = buffered(offset, total);
+     if (on_damage_ == OnDamage::Stop && !crc_matches(raw)) return;
+     const auto view =

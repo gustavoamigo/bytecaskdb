@@ -4,6 +4,8 @@ memory-mapped hint files, where the kernel's SIGBUS did it. #255 (#237)
 replaced the mapping with pread; this restores the symptom (by abort()), not
 the mapping.
 Expected: caught.
+Guarded-by: "DB::open rebuilds a hint file a read fails on"
+
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
 index baca3a34..c364a8e0 100644
 --- a/bytecaskdb/bytecask.cppm

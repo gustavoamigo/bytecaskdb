@@ -129,7 +129,8 @@ jobs:
   # from rotting: same engine suite, other tree.
   # ---------------------------------------------------------------------------
   mutation-patches:
-    # The soak's and the chaos rig's mutations are diffs against engine code.
+    # The soak's, the chaos rig's and the durability sites' mutations are
+    # diffs against engine code.
     # Each must still apply by three-way merge (scripts/mutation_patch.sh): a
     # change to lines near its target merges, a change to the targeted code
     # conflicts, and then the patch must be regenerated (make the same break,
@@ -144,7 +145,8 @@ jobs:
       - name: Mutation patches still apply
         run: |
           status=0
-          for p in tests/soak_mutations/*.patch tests/chaos_mutations/*.patch; do
+          for p in tests/soak_mutations/*.patch tests/chaos_mutations/*.patch \
+                   tests/durability_mutations/*.patch; do
             if ! scripts/mutation_patch.sh check "$p"; then
               echo "::error file=$p::conflicts with the current code; regenerate it"
               status=1

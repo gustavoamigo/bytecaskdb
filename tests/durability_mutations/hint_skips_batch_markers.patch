@@ -1,0 +1,16 @@
+Hint files leave out batch markers, so a restart computes next_seq below
+the markers' sequences and reuses them. Reverts 362cc590.
+Guarded-by: "a write after a restart does not reuse a batch marker's sequence"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..7cc58cb2 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3741,7 +3741,6 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
+         entry.entry_type == EntryType::BulkEnd) {
+       // Structural markers carry no key; recovery ignores them. They stay in
+       // scan order ahead of the sorted run.
+-      hint.append(entry.sequence, entry.entry_type, entry_off, {}, 0);
+       continue;
+     }
+     if (entry.entry_type == EntryType::RangeDel) {

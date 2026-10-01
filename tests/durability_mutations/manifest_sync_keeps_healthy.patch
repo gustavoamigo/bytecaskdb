@@ -1,0 +1,21 @@
+create_manifest syncs the active file with a bare fdatasync, and a failure
+throws without degrading. The pages the failed sync left clean are written by
+no later fdatasync (#231), so the next sync write moves durable_sequence over
+writes a power cut then loses. Reverts #282 (#281).
+Guarded-by: "create_manifest whose fdatasync fails degrades, and a power cut keeps everything below durable_sequence"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..c423b3d2 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -4417,8 +4417,9 @@ auto DB::create_manifest() -> FileManifest {
+ 
+     // Make every entry durable before sealing. A failure degrades: the pages
+     // it left clean are written by no later fdatasync (#231, #281).
+-    sync_active_file(t, current, "create_manifest");
++    t.active_file().sync();
+     const auto max_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
++    t.apply_sync(max_seq);
+ 
+     // Seal active file, dispatch hint generation, open new active.
+     try {

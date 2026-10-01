@@ -1,0 +1,17 @@
+resume() seals the active file without syncing the truncate that cut its
+unpublished tail, so a power cut can bring the tail back into a sealed file,
+where a later hint rebuild refuses it.
+Guarded-by: "resume() stays degraded when the sync after its truncate fails"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..277c57af 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -4340,7 +4340,6 @@ void DB::resume() {
+ #ifdef BYTECASK_TESTING
+   FAULT_INJECTION(io_resume_sync);
+ #endif
+-  file.sync();
+ 
+   // Open the old active as read-only for hint generation.
+   auto read_only_old = openDataFileForRead(file.path(), io_backend_, pool_,

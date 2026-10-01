@@ -4,6 +4,8 @@ process killed with unsynced writes leaves them in the page cache; the next
 open writes a durable hint over them, and a power cut then takes the bytes
 the hint points at. Reverts #240's open half (#231).
 Expected: caught.
+Guarded-by: "open makes a hint-less file durable before it indexes it: a process killed before its sync"
+
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
 index aab1a99e..7e0b29c8 100644
 --- a/bytecaskdb/bytecask.cppm

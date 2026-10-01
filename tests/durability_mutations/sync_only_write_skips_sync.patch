@@ -1,0 +1,17 @@
+A sync write that appends nothing (an empty or guard-only plan) returns
+durable without asking for the flush that makes earlier sync=false writes
+durable. Reverts #192.
+Guarded-by: "apply_batch: an empty sync plan makes earlier unsynced writes*"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..d8b0ba49 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3078,7 +3078,6 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
+       if (slot.result) slot.result->durable = slot.sync_through == 0;
+     }
+     if (sync_only_pending) {
+-      t.note_sync_requested(head_last_seq);
+       store_head(std::move(t).persistent());
+     }
+     return;

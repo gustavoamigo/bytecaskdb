@@ -1,0 +1,18 @@
+Compaction stops at the first damaged entry instead of failing, publishes a
+copy of what came before it, and unlinks the original. Reverts #136.
+Guarded-by: "DB vacuum: a damaged sealed file is not compacted away"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..03f08915 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3898,7 +3898,8 @@ auto DB::vacuum_scan_and_copy(
+     }
+   };
+ 
+-  for (const auto &[entry, entry_off] : scan_committed(source_file)) {
++  for (const auto &[entry, entry_off] :
++       scan_committed(source_file, 0, OnDamage::Stop)) {
+     emit_entry(entry, entry_off);
+   }
+ 

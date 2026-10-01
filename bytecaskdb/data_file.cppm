@@ -674,14 +674,18 @@ struct WritableFileOps {
     assert(new_size <= logical_end());
     set_logical_end(new_size);
     zeroed_end_ = new_size;
-    if (::ftruncate(fd_, narrow<off_t>(new_size)) != 0) {
-      throw std::system_error{errno, std::system_category(),
-                              "WritableFileOps::truncate: ftruncate failed"};
-    }
+    const auto rc = ::ftruncate(fd_, narrow<off_t>(new_size));
+    const auto err = errno;
 #ifdef BYTECASK_TESTING
-    // An ftruncate that cut the file and then reported an error.
+    // An ftruncate that cut the file and then reported an error. It stands
+    // in for ftruncate's result, so it fires where a real error would: an
+    // end lowered only after the check would still be stale here.
     FAULT_INJECTION_POST_WRITE(io_resume_truncate, fd_, new_size, 0);
 #endif
+    if (rc != 0) {
+      throw std::system_error{err, std::system_category(),
+                              "WritableFileOps::truncate: ftruncate failed"};
+    }
   }
 
   // Keeps the file zero-filled ahead of the write cursor: before an append

@@ -1,0 +1,18 @@
+A failed commit fdatasync is ignored: the flush publishes the head and
+advances durable_seq as if it had succeeded. Reverts BC-155 / BC-163.
+Guarded-by: "class F: key not visible after commit sync failure"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index e0317da8..8e3feaba 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3234,9 +3234,6 @@ void DB::flush_pending() {
+       static_cast<WritableDataFile &>(head->active_file()).sync();
+       counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
+     } catch (...) {
+-      flush_failed(std::current_exception(), published,
+-                   head->active_file().path());
+-      return;
+     }
+   }
+ 
