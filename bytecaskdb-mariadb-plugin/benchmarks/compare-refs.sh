@@ -117,6 +117,9 @@ resolve() {  # ref -> commit sha
     git -C "$REPO" rev-parse --verify -q "$1^{commit}" 2>/dev/null
 }
 
+# shellcheck source=lib_build.sh
+source "$REPO/bytecaskdb-mariadb-plugin/benchmarks/lib_build.sh"
+
 prepare() {  # spec -> builds its worktree; prints nothing on success
   local spec="$1" ref kd slug wt sha
   ref=$(ref_of "$spec"); kd=$(keydir_of "$spec"); slug=$(slug_of "$spec")
@@ -128,19 +131,9 @@ prepare() {  # spec -> builds its worktree; prints nothing on success
     git -C "$REPO" worktree add -q --detach "$wt" "$sha" || return 1
   fi
   echo "=== build $spec -> $(git -C "$wt" log --oneline -1) (keydir=$kd)"
-  local cxflags=()
-  [[ "$CAPTURE" == on ]] && cxflags=(--cxflags=-g)  # perf needs the symbols
-  (cd "$wt" && BYTECASK_KEYDIR="$kd" xmake f -y -m release "${cxflags[@]}" >/dev/null &&
-     BYTECASK_KEYDIR="$kd" xmake build -y bytecask) >"$OUT/build_$slug.log" 2>&1 ||
+  # From scratch, for this host's CPU (lib_build.sh); the cells reuse it.
+  build_bytecask_lib "$wt" "$kd" >"$OUT/build_$slug.log" 2>&1 ||
     { echo "build failed: see $OUT/build_$slug.log"; return 1; }
-  # xmake remembers the key directory: check the archive is the one asked for.
-  local lib="$wt/build/linux/$(uname -m)/release/libbytecask.a"
-  local is_buffered=no
-  strings "$lib" | grep -q 'buffered key directory' && is_buffered=yes
-  if [[ "$kd" == buffered && "$is_buffered" == no ]] ||
-     [[ "$kd" != buffered && "$is_buffered" == yes ]]; then
-    echo "libbytecask.a in $wt is not the $kd key directory"; return 1
-  fi
   echo "$sha" >"$OUT/sha_$slug"
 }
 
@@ -162,7 +155,7 @@ cell() {  # spec engine label
   echo "=== $label: $engine on $spec  $(date +%T)"
   echo "    log: $OUT/$label.log"
   # The progress lines on screen, everything in the log.
-  (cd "$wt/bytecaskdb-mariadb-plugin/benchmarks" && ./run-hammerdb.sh "${args[@]}") 2>&1 |
+  (cd "$wt/bytecaskdb-mariadb-plugin/benchmarks" && BENCH_LIB_FRESH=1 ./run-hammerdb.sh "${args[@]}") 2>&1 |
     tee "$OUT/$label.log" |
     grep --line-buffered -E "^---|built in|NOPM \||FAILED|ERROR|capture:" 
   pgrep -x mariadbd >/dev/null && { echo "a mariadbd was left running; stopping"; pkill -x mariadbd; sleep 5; }
