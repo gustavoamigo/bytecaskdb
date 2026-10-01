@@ -34,6 +34,7 @@
 // Usage:
 //   chaos_worker run   --dir D --seed S --fd N
 //                      [--as-headroom BYTES] [--nofile-headroom N] [--no-vacuum]
+//                      [--strict-reads]
 //   chaos_worker check --dir CRASHED --work W --history H --state F --seed S
 //                      --terminator power|sigkill|clean|exit [--evicted]
 //                      [--report R]
@@ -206,8 +207,12 @@ auto recover(bytecask::DB &db, Channel &ch, std::mt19937_64 &rng, bool on_stop)
   }
 }
 
+// strict_reads: the run injects nothing that can make a read fail (no read
+// faults, evictions or descriptor limit), so an I/O error on a read is the
+// engine's, not the filesystem's.
 void reader_loop(const bytecask::DB &db, Channel &ch, std::uint64_t seed,
-                 const std::atomic<std::uint64_t> &issued, int id) {
+                 const std::atomic<std::uint64_t> &issued, int id,
+                 bool strict_reads) {
   std::mt19937_64 rng{seed + 100 + static_cast<std::uint64_t>(id)};
   const auto own = std::format("{:016x}.", seed);
   bytecask::Bytes out;
@@ -232,8 +237,14 @@ void reader_loop(const bytecask::DB &db, Channel &ch, std::uint64_t seed,
         }
       }
     } catch (const bytecask::DbDegraded &) {
-    } catch (const std::system_error &) {
-      // An I/O error on a read is an honest failure.
+    } catch (const std::system_error &e) {
+      // An I/O error on a read is an honest failure, unless nothing in the
+      // run can make a read fail.
+      if (strict_reads)
+        ch.text(FrameType::Violation,
+                std::format("get({}) failed with an I/O error while no hazard "
+                            "can fail a read: {}",
+                            key, e.what()));
     } catch (const std::exception &e) {
       // A CRC mismatch or a record that does not parse: the filesystem never
       // returns bytes that were not written, so the engine served a location
@@ -250,8 +261,8 @@ void reader_loop(const bytecask::DB &db, Channel &ch, std::uint64_t seed,
 // creating them can fail; that is the harness running out of memory, not the
 // engine failing, so it exits as out of memory.
 auto start_threads(bytecask::DB *db, Channel &ch, const Config &cfg,
-                   std::uint64_t seed, const std::atomic<std::uint64_t> &issued)
-    -> std::vector<std::jthread> {
+                   std::uint64_t seed, const std::atomic<std::uint64_t> &issued,
+                   bool strict_reads) -> std::vector<std::jthread> {
   std::vector<std::jthread> threads;
   try {
     if (cfg.vacuum) {
@@ -270,8 +281,8 @@ auto start_threads(bytecask::DB *db, Channel &ch, const Config &cfg,
       });
     }
     for (int i = 0; i < cfg.readers; ++i)
-      threads.emplace_back([db, &ch, seed, &issued, i] {
-        reader_loop(*db, ch, seed, issued, i);
+      threads.emplace_back([db, &ch, seed, &issued, i, strict_reads] {
+        reader_loop(*db, ch, seed, issued, i, strict_reads);
       });
   } catch (const std::system_error &) {
     std::_Exit(5);
@@ -285,7 +296,9 @@ auto start_threads(bytecask::DB *db, Channel &ch, const Config &cfg,
 struct RunLimits {
   std::uint64_t as_headroom{0};
   std::uint64_t nofile_headroom{0};
-  bool no_vacuum{false}; // not a limit: leaves the vacuum thread out
+  // Not limits: options of the run.
+  bool no_vacuum{false};    // leaves the vacuum thread out
+  bool strict_reads{false}; // see reader_loop
 };
 
 auto current_vm_bytes() -> std::uint64_t {
@@ -374,7 +387,7 @@ auto run_open(bytecask::DB &db_ref, Channel &ch, const Config &cfg,
   }
 
   std::atomic<std::uint64_t> issued{0};
-  auto threads = start_threads(db, ch, cfg, seed, issued);
+  auto threads = start_threads(db, ch, cfg, seed, issued, limits.strict_reads);
   apply_run_limits(limits);
 
   std::uint64_t value_id = 0;
@@ -888,6 +901,7 @@ auto main(int argc, char **argv) -> int {
         else if (a == "--as-headroom") limits.as_headroom = std::stoull(next());
         else if (a == "--nofile-headroom") limits.nofile_headroom = std::stoull(next());
         else if (a == "--no-vacuum") limits.no_vacuum = true;
+        else if (a == "--strict-reads") limits.strict_reads = true;
         else throw std::invalid_argument{std::format("unknown argument {}", a)};
       }
       if (dir.empty() || fd < 0)

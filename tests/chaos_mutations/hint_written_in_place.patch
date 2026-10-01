@@ -1,0 +1,25 @@
+Hint files are written in place instead of to a temporary file renamed into
+place. The rename is what makes "a hint exists" mean "the hint is complete":
+recovery writes a hint-less file's hint before it trims the file's tail, and
+a hint that later fails its CRC is rebuilt by a scan that skips the tail
+handling, since a file with a hint was sealed. Torn in place by a power cut,
+the hint sends the next open to that scan over an untrimmed tail, and
+DB::open refuses the database. (The design first expected this to survive.)
+It takes a power cut inside the few milliseconds of an open's hint write.
+Unfocused runs caught it twice in about 45 minutes; focusing on power cuts
+without the latency and stalls that slow opens down caught it less, so it
+runs unfocused and is not held to a budget.
+Expected: caught (rare).
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index aab1a99e..840bff15 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3665,7 +3665,7 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
+                          const TailCheck &check) -> std::optional<Offset> {
+   const auto stem = file->path().stem().string();
+   const auto hint_path = dir / (stem + ".hint");
+-  const auto tmp_path = dir / (stem + ".hint.tmp");
++  const auto tmp_path = hint_path;
+ 
+   if (std::filesystem::exists(hint_path)) {
+     return std::nullopt;

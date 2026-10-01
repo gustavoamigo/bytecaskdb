@@ -1,0 +1,27 @@
+DB::open indexes a hint-less data file without making it durable first:
+no rewrite, and the tail trimmed with a plain resize_file, as before #240. A
+process killed with unsynced writes leaves them in the page cache; the next
+open writes a durable hint over them, and a power cut then takes the bytes
+the hint points at. Reverts #240's open half (#231).
+Expected: caught.
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index aab1a99e..7e0b29c8 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -4880,7 +4880,6 @@ auto DB::recovery_prepare_files(EngineState &s)
+     // durable before anything reads them — every hint-less file, since none
+     // of them says which one was active.
+     // No writer says where its entries end, so the whole file.
+-    if (hintless) rewrite_durably(p, std::filesystem::file_size(p));
+     auto data_file =
+         openDataFileForRead(p, io_backend_, pool_, file_id);
+ 
+@@ -4895,7 +4894,7 @@ auto DB::recovery_prepare_files(EngineState &s)
+       });
+       if (end && *end < std::filesystem::file_size(p)) {
+         data_file.reset();
+-        truncate_durably(p, *end);
++        std::filesystem::resize_file(p, *end);
+         // Same file_id as the open above, deliberately. Under the buffer
+         // pool that open's hint scan may have admitted frames under this id,
+         // but the truncate only drops a tail: every byte below *end is

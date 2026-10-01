@@ -153,7 +153,10 @@ def draw_window(rng: random.Random, disabled: set[str]) -> dict | None:
         return None
     kind = rng.choices(kinds, weights=[WINDOWS[k] for k in kinds])[0]
     if kind == "fsync_eio":
-        return {"fsync_eio": rng.choice([0.05, 0.3, 1.0])}
+        # Sometimes the pages a failed fdatasync lost are evicted at once, so
+        # the next read or resume() already sees what the disk holds.
+        p, evict = rng.choice([0.05, 0.3, 1.0]), rng.choice([0.0, 0.5])
+        return {"fsync_eio": p, "evict_failed": 0.0 if "evict" in disabled else evict}
     if kind == "write_eio":
         return {"write_eio": rng.choice([0.01, 0.1])}
     if kind == "read_eio":
@@ -276,6 +279,9 @@ class Rig:
         limits = {} if life["quiet_open"] else plan["limits"]
         start_limits = {k: v for k, v in limits.items() if not isinstance(v, list)}
         run_args = ["--no-vacuum"] if "vacuum" in self.args.disable else []
+        # With nothing that can fail a read, a read's I/O error is the engine's.
+        if {"read_eio", "evict", "rlimit_nofile"} <= self.args.disable:
+            run_args.append("--strict-reads")
         for name, flag in (("as", "--as-headroom"), ("nofile", "--nofile-headroom")):
             if isinstance(limits.get(name), list):
                 run_args += [flag, str(limits[name][1])]
@@ -304,7 +310,9 @@ class Rig:
         hist = History(rfd)
         active: dict[int, dict] = {}
         pending = list(plan["events"])
-        self.evicted = False
+        # Whether an eviction dropped pages during or after the life, from
+        # chaosfs's own count: it evicts on its own too (evict_failed).
+        evicted_before = self.ctl("stats")["pages_evicted"]
         # After a failed open, the next open must succeed with no hazard in
         # force (I5): its timeline starts once the database is open.
         start = time.monotonic()
@@ -354,7 +362,7 @@ class Rig:
             proc.wait(60)
             self.ctl("clear")
             if plan["evict_after_kill"]:
-                self.evicted |= self.ctl("evict") > 0
+                self.ctl("evict")
         else:
             self.ctl("clear")
             proc.send_signal(signal.SIGTERM)
@@ -371,7 +379,7 @@ class Rig:
                               f"{self.args.close_timeout} s with every hazard "
                               f"lifted (I9); stacks in stacks.txt")
         self.ctl("clear")
-        outcome["evicted"] = self.evicted
+        outcome["evicted"] = self.ctl("stats")["pages_evicted"] > evicted_before
         hist.join(30)
         life["history"].write_bytes(bytes(hist.raw))
         rc = proc.returncode
@@ -403,8 +411,7 @@ class Rig:
         elif kind == "off":
             active.pop(ev["id"], None)
         elif kind == "evict":
-            # Only an eviction that dropped pages loses anything.
-            self.evicted |= self.ctl("evict") > 0
+            self.ctl("evict")
             return
         elif kind == "writeback":
             self.ctl("writeback", seed=int(ev["t"] * 1e6), fail=ev["fail"])

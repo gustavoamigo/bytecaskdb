@@ -1,0 +1,27 @@
+Vacuum drops records superseded by writes that are not durable yet. A power
+cut then loses the superseding write and the record it replaced, and the key
+holds neither value. Reverts #261 (#245).
+It takes vacuum dropping a record, sync=false writes that superseded it and
+a power cut before they are synced, so every life ends in a power cut and
+nothing slows the workload down:
+Budget: 10
+Disable: sigkill,clean,read_eio,meta_eio,short,enospc,erofs,latency,stall,rlimit_as,rlimit_nofile
+Caught in 2 of 5 runs of 10 minutes, focused or not: the coincidence is
+rare, so it is not held to the budget.
+Expected: caught (rare).
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index aab1a99e..a060b39e 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3884,11 +3884,6 @@ void DB::vacuum_commit(std::uint32_t old_file_id,
+   // unlinked, but what superseded it may be a sync=false write a crash can
+   // still lose, taking the key's last durable value with it (#245). So
+   // everything the scan saw becomes durable before the source can go.
+-  if (t.durable_seq() < decided_at) {
+-    // A sync after a failed one proves nothing (#231).
+-    if (current->degraded) throw DbDegraded{current->degraded_reason};
+-    sync_active_file(t, current, "vacuum");
+-  }
+   t.apply_vacuum(old_file_id, scan, std::move(new_sealed_file), dest_file_id);
+ 
+   store_state(current, std::move(t).persistent());

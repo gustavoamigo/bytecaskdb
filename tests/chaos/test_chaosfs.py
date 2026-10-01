@@ -162,6 +162,20 @@ class FsyncErrorTest(unittest.TestCase):
                 lost_any = True
         self.assertTrue(lost_any, "eviction never exposed a lost page")
 
+    def test_evict_failed_drops_the_lost_pages_at_once(self):
+        m = ChaosModel(4)
+        fh = new_file(m, "/a", b"A" * PAGE)
+        m.fsync("/a", 1, fh)
+        m.fsyncdir("/", None)
+        m.write("/a", b"B" * PAGE, PAGE, fh)
+        m.set_faults({"fsync_eio": 1.0, "evict_failed": 1.0}, 1)
+        with self.assertRaises(OSError):
+            m.fsync("/a", 1, fh)
+        m.set_faults({}, None)
+        # No eviction event: the failure itself dropped the page.
+        self.assertEqual(content(m, "/a")[PAGE:], bytes(PAGE))
+        self.assertGreater(m.stats()["pages_evicted"], 0)
+
     def test_error_reported_to_a_handle_opened_before_it(self):
         m = ChaosModel(2)
         fh1 = new_file(m, "/a", b"x" * 10)

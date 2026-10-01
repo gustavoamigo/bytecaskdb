@@ -1924,6 +1924,46 @@ listed in the workflow's `KNOWN_BUGS` until it is. `--disable` leaves hazards
 out, to bisect a failure or to run past a known bug; a failure keeps the directory before and after the life, the
 history, the timeline and chaosfs's fault log.
 
+#### Mutations
+
+`tests/chaos_mutations/` holds mutations of the engine, most of them reverts
+of the fixes the rig prompted, and `scripts/chaos_mutation_check.sh` proves
+the rig catches them (#268): it applies each, rebuilds `chaos_worker`, and runs
+the rig on two seeds, 5 minutes each unless the patch sets a `Budget:` or
+focuses the run with `Disable:`.
+
+| Mutation | Reverts | Result |
+|---|---|---|
+| `commit_skips_fdatasync`: the commit flush skips its `fdatasync` and still reports durable | — | caught in ~20 s, every run |
+| `no_dir_sync_new_data_file`: a new data file's name is not synced | #199 | caught in 30–90 s, every run |
+| `resume_trusts_page_cache`: `resume()` publishes the tail without rewriting it | #240 (#231) | caught in 1–2 min, every run |
+| `open_trusts_page_cache`: `open` indexes a hint-less file without making it durable | #240 (#231) | caught in 0.5–3 min, every run |
+| `close_swallows_error`: `close()` drops its final `fdatasync`'s error | #260 (#257) | caught in 0.5–3 min, every run (every life a clean close) |
+| `hint_read_error_kills_process`: a hint read error kills the process | #255 (#237) | caught in 2–5 min, every run |
+| `vacuum_drops_before_durable`: vacuum drops records superseded by non-durable writes | #261 (#245) | caught in 2 of 5 runs of 10 min: rare |
+| `hint_written_in_place`: hints written in place, not renamed | — | caught twice in ~45 min: rare |
+| `no_sync_before_degrade`: a failed append degrades without syncing | — | not caught: #240's rewrite in `resume()` covers it |
+| `truncate_lowers_end_after`: the logical end drops after `ftruncate`, not before | #248 (#236) | not caught: the stale end lasts one `resume()` retry; #248's `prove_resume` cell guards it |
+
+"Rare" (`Expected: caught (rare)`) marks a mutation the rig catches but not
+within a fixed budget: the script runs and reports it, and a survival is not a
+failure.
+
+The set is kept current as the engine moves. Patches apply by three-way
+merge (`scripts/mutation_patch.sh`, for both mutation sets): a change
+elsewhere in a file merges, and only a conflict, when the targeted code or a
+line directly next to it changed, means the patch must be regenerated.
+`ci.yml` fails on a conflicting patch. A fix for a bug the rig found adds a
+patch reverting it, and a change to the rig, or to engine code a mutation
+patches, runs the check and reports its summary. It is not scheduled: it only
+goes stale when one of those changes.
+
+Building the set changed the rig: chaosfs now sometimes evicts a failed
+`fdatasync`'s lost pages at once (`evict_failed`), and the worker counts a
+read's I/O error as a violation when nothing in the run can fail a read
+(`--strict-reads`). See [`chaos_testing_design.md`](chaos_testing_design.md),
+*Proving the rig*.
+
 ### Isolation checking (Elle)
 
 The layers above check one write at a time or one writer at a time. None of

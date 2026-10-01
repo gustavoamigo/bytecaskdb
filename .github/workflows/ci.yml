@@ -128,6 +128,30 @@ jobs:
   # nothing else here would compile it. This job keeps BYTECASK_KEYDIR=radix
   # from rotting: same engine suite, other tree.
   # ---------------------------------------------------------------------------
+  mutation-patches:
+    # The soak's and the chaos rig's mutations are diffs against engine code.
+    # Each must still apply by three-way merge (scripts/mutation_patch.sh): a
+    # change to lines near its target merges, a change to the targeted code
+    # conflicts, and then the patch must be regenerated (make the same break,
+    # save `git diff`) or deleted if its target is gone. The merge needs the
+    # blobs the patches were made against, so this job checks out all history.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mutation patches still apply
+        run: |
+          status=0
+          for p in tests/soak_mutations/*.patch tests/chaos_mutations/*.patch; do
+            if ! scripts/mutation_patch.sh check "$p"; then
+              echo "::error file=$p::conflicts with the current code; regenerate it"
+              status=1
+            fi
+          done
+          exit "$status"
+
   radix-keydir:
     runs-on: ubuntu-latest
     container:

@@ -1,0 +1,19 @@
+DB::close() drops the error of its final fdatasync, trim or hint write and
+returns as if every acknowledged write were durable: the silent shutdown
+close() was added to end. Reverts #260's report (#257).
+Rare in a full run (a failed writeback and an eviction before a clean
+close, about one life in 300), so every life ends in a clean close:
+Disable: power,sigkill
+Expected: caught.
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index aab1a99e..ac0af9a2 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -2783,7 +2783,6 @@ void DB::close() {
+     ::close(lock_fd_);
+     lock_fd_ = -1;
+   }
+-  if (error) std::rethrow_exception(error);
+ }
+ 
+ #pragma endregion

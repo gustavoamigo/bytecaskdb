@@ -29,7 +29,7 @@ bin=build/linux/x86_64/debug/bytecask_tests
 applied=""
 revert() {
   if [ -n "$applied" ]; then
-    git apply -R "$applied"
+    scripts/mutation_patch.sh revert "$applied"
     applied=""
   fi
 }
@@ -52,7 +52,13 @@ for p in "${patches[@]}"; do
     summary+=$(printf '%-32s %-9s (needs --sanitizer=%s)' "$name" skipped "$only")$'\n'
     continue
   fi
-  git apply "$p"
+  # A three-way merge: the patch keeps applying when lines near its target
+  # change; a conflict means the targeted code changed (mutation_patch.sh).
+  if ! scripts/mutation_patch.sh apply "$p"; then
+    summary+=$(printf '%-32s %-9s (regenerate the patch)' "$name" conflict)$'\n'
+    status=1
+    continue
+  fi
   applied=$p
   xmake build bytecask_tests >/dev/null
   log=$(mktemp)
