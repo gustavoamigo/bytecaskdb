@@ -25,6 +25,7 @@ module;
 #include <vector>
 
 #include <cerrno>
+#include <ctime>
 #include <fcntl.h>
 #include <filesystem>
 #include <sys/types.h>
@@ -67,6 +68,141 @@ export struct BufferPoolOptions {
 // O_DIRECT and serves frame-aligned fills only; it is -1 where the filesystem
 // refused it, and fills then go through `buffered`. `buffered` serves
 // everything else: oversize reads and the fallback.
+// ---------------------------------------------------------------------------
+// PoolTrace — what the engine asks of the data files, for offline cache
+// modelling (exp/pool-write-model; the read-only version was issue #148).
+//
+// Measurement tool, not a feature: on only when BYTECASK_POOL_TRACE names a
+// file. One record per logical read of a record (whether the pool held it or
+// not), per append to the active file, per record superseded (its bytes
+// became dead), and per file vacuum creates or deletes. The stream is what
+// the engine did, not what the pool did, so it replays through any policy at
+// any pool size. Off, the cost is one null check per event.
+//
+// Records go to a per-thread buffer written out in chunks with O_APPEND;
+// the timestamp restores the global order.
+// ---------------------------------------------------------------------------
+export struct PoolTraceRecord {
+  std::uint64_t ts_ns;   // CLOCK_MONOTONIC
+  std::uint64_t offset;
+  std::uint32_t file_id;
+  std::uint32_t len;     // bytes; a new file's size for kNewFile
+  std::uint8_t kind;     // PoolTrace::Kind
+  std::uint8_t ctx;      // PoolTrace::Ctx of the reading thread
+  std::uint16_t pad;
+  std::uint32_t tid;
+};
+static_assert(sizeof(PoolTraceRecord) == 32);
+
+export class PoolTrace {
+public:
+  enum Kind : std::uint8_t {
+    kRead = 0,     // a record read from a data file
+    kAppend = 1,   // bytes written to the active file
+    kKill = 2,     // a record superseded: its bytes are dead from now on
+    kNewFile = 3,  // vacuum's compacted file, live in full, never in the pool
+    kUnlink = 4,   // a file deleted by vacuum
+    kLive = 5,     // a record written that is live until a kKill names it
+  };
+  enum Ctx : std::uint8_t { kOther = 0, kGet = 1, kWrite = 2 };
+
+  // nullptr unless tracing is on. Leaked on purpose: thread-exit flushes can
+  // run after static destruction has started.
+  [[nodiscard]] static auto get() noexcept -> PoolTrace * {
+    static PoolTrace *const trace = open_from_env();
+    return trace;
+  }
+
+  // What the calling thread is doing, stamped on its reads. Set for a scope
+  // by Scope; reads outside one (iterators) are kOther.
+  [[nodiscard]] static auto ctx() noexcept -> std::uint8_t & {
+    thread_local std::uint8_t c = kOther;
+    return c;
+  }
+  class Scope {
+  public:
+    explicit Scope(Ctx c) noexcept : prev_{ctx()} { ctx() = c; }
+    Scope(const Scope &) = delete;
+    auto operator=(const Scope &) -> Scope & = delete;
+    ~Scope() { ctx() = prev_; }
+
+  private:
+    std::uint8_t prev_;
+  };
+
+  static void note(Kind kind, std::uint32_t file_id, std::uint64_t offset,
+                   std::uint64_t len) noexcept {
+    if (auto *t = get()) t->record(kind, file_id, offset, len);
+  }
+
+  void record(Kind kind, std::uint32_t file_id, std::uint64_t offset,
+              std::uint64_t len) noexcept {
+    timespec ts{};
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+    thread_local Buffer buf{this};
+#pragma clang diagnostic pop
+    const auto now = static_cast<std::uint64_t>(ts.tv_sec) * 1'000'000'000ULL +
+                     static_cast<std::uint64_t>(ts.tv_nsec);
+    if (buf.recs.empty()) buf.first_ts = now;
+    buf.recs.push_back(PoolTraceRecord{
+        .ts_ns = now,
+        .offset = offset,
+        .file_id = file_id,
+        .len = static_cast<std::uint32_t>(std::min<std::uint64_t>(len, UINT32_MAX)),
+        .kind = kind,
+        .ctx = ctx(),
+        .pad = 0,
+        .tid = static_cast<std::uint32_t>(::gettid())});
+    if (buf.recs.size() >= kChunkRecords || now - buf.first_ts > kMaxAgeNs) {
+      buf.flush();
+    }
+  }
+
+private:
+  static constexpr std::size_t kChunkRecords = 16 * 1024;
+  static constexpr std::uint64_t kMaxAgeNs = 1'000'000'000;
+
+  struct Buffer {
+    explicit Buffer(PoolTrace *t) : trace{t} { recs.reserve(kChunkRecords); }
+    Buffer(const Buffer &) = delete;
+    auto operator=(const Buffer &) -> Buffer & = delete;
+    ~Buffer() { flush(); }
+    void flush() noexcept {
+      if (recs.empty()) return;
+      trace->write_chunk(std::as_bytes(std::span{recs}));
+      recs.clear();
+    }
+    PoolTrace *trace;
+    std::vector<PoolTraceRecord> recs;
+    std::uint64_t first_ts{0};
+  };
+
+  explicit PoolTrace(int fd) noexcept : fd_{fd} {}
+
+  static auto open_from_env() noexcept -> PoolTrace * {
+    const char *path = std::getenv("BYTECASK_POOL_TRACE");
+    if (path == nullptr || *path == '\0') return nullptr;
+    const int fd =
+        ::open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0644);
+    if (fd == -1) return nullptr;
+    return new PoolTrace{fd};
+  }
+
+  void write_chunk(std::span<const std::byte> bytes) noexcept {
+    std::lock_guard<std::mutex> lk{mu_};
+    while (!bytes.empty()) {
+      const auto n = ::write(fd_, bytes.data(), bytes.size());
+      if (n <= 0) return;  // a lost chunk shortens the trace; nothing else
+      bytes = bytes.subspan(static_cast<std::size_t>(n));
+    }
+  }
+
+  int fd_;
+  std::mutex mu_;
+};
+
 export struct PoolFile {
   int buffered{-1};
   int direct{-1};

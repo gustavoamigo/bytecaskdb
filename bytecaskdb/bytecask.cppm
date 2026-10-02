@@ -2198,10 +2198,12 @@ void TransientEngineState::apply_writes(
               const auto dec =
                   entry_size(key_span.size(), existing->value_size());
               const auto ef = existing->file_id();
+              PoolTrace::note(PoolTrace::kKill, ef, existing->file_offset(), dec);
               file_stats_.update(
                   ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
             }
             const auto sz = entry_size(key_span.size(), val_size);
+            PoolTrace::note(PoolTrace::kLive, active_file_id_, offsets[io_idx], sz);
             file_stats_.update(active_file_id_, [sz](FileStats &fs) {
               fs.live_bytes += sz;
               fs.total_bytes += sz;
@@ -2218,6 +2220,7 @@ void TransientEngineState::apply_writes(
               const auto dec =
                   entry_size(key_span.size(), existing->value_size());
               const auto ef = existing->file_id();
+              PoolTrace::note(PoolTrace::kKill, ef, existing->file_offset(), dec);
               file_stats_.update(
                   ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
             }
@@ -2245,6 +2248,7 @@ void TransientEngineState::apply_writes(
               const auto dec =
                   entry_size(key_span.size(), entry.value_size());
               const auto ef = entry.file_id();
+              PoolTrace::note(PoolTrace::kKill, ef, entry.file_offset(), dec);
               file_stats_.update(
                   ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
               to_erase.emplace_back(key_span);
@@ -2321,10 +2325,12 @@ void TransientEngineState::apply_ingest(
         const auto dec =
             entry_size(e.key.size(), existing->value_size());
         const auto ef = existing->file_id();
+        PoolTrace::note(PoolTrace::kKill, ef, existing->file_offset(), dec);
         file_stats_.update(
             ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
       }
       const auto sz = entry_size(e.key.size(), val_size);
+      PoolTrace::note(PoolTrace::kLive, active_file_id_, offset, sz);
       file_stats_.update(active_file_id_, [sz](FileStats &fs) {
         fs.live_bytes += sz;
         fs.total_bytes += sz;
@@ -2338,6 +2344,7 @@ void TransientEngineState::apply_ingest(
         const auto dec =
             entry_size(e.key.size(), existing->value_size());
         const auto ef = existing->file_id();
+        PoolTrace::note(PoolTrace::kKill, ef, existing->file_offset(), dec);
         file_stats_.update(
             ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
       }
@@ -2359,6 +2366,7 @@ void TransientEngineState::apply_ingest(
         const auto dec =
             entry_size(key_span.size(), entry.value_size());
         const auto ef = entry.file_id();
+        PoolTrace::note(PoolTrace::kKill, ef, entry.file_offset(), dec);
         file_stats_.update(
             ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
         to_erase.emplace_back(key_span);
@@ -2427,6 +2435,8 @@ void TransientEngineState::apply_vacuum(
                    KeyDirEntry::make(m.sequence, m.new_offset, dest_file_id,
                                      m.value_size),
                    kd_ctx());
+      PoolTrace::note(PoolTrace::kLive, dest_file_id, m.new_offset,
+                      entry_size(m.key.size(), m.value_size));
     } else {
       actual_live_bytes -= entry_size(m.key.size(), m.value_size);
     }
@@ -2808,6 +2818,7 @@ void DB::close() {
 // mismatch.
 auto DB::get(const ReadOptions &opts, BytesView key,
                    Bytes &out) const -> bool {
+  PoolTrace::Scope trace_scope{PoolTrace::kGet};
   // The guard, not a copy of the state: copying it is a read-modify-write
   // on a control block every reader shares — the line that capped
   // concurrent gets before the read did.
@@ -2873,6 +2884,7 @@ auto DB::del_range(const WriteOptions &opts, BytesView from,
 }
 
 auto DB::contains_key(const ReadOptions& opts, BytesView key) const -> bool {
+  PoolTrace::Scope trace_scope{PoolTrace::kGet};
   const auto s = load_state_for_read();
   return kd_contains(s->key_dir, key, s->kd_ctx(opts.verify_checksums));
 }
@@ -2898,6 +2910,7 @@ static auto write_rejection(const EngineState &s) -> std::exception_ptr {
 // thin wrappers that construct a WritePlan and delegate here.
 auto DB::apply_batch(WriteOptions opts,
                      WritePlan plan) -> std::optional<CommitResult> {
+  PoolTrace::Scope trace_scope{PoolTrace::kWrite};
   if (auto s = load_state(); !s->is_write_allowed()) {
     std::rethrow_exception(write_rejection(*s));
   }
@@ -3373,6 +3386,7 @@ void DB::commit_wait(EngineSlot &slot) {
 
 auto Snapshot::contains_key(const ReadOptions& opts,
                             BytesView key) const -> bool {
+  PoolTrace::Scope trace_scope{PoolTrace::kGet};
   return kd_contains(state_->key_dir, key,
                      state_->kd_ctx(opts.verify_checksums));
 }
@@ -3381,6 +3395,7 @@ auto Snapshot::contains_key(const ReadOptions& opts,
 // Thread-local I/O buffer reused across calls to amortize allocation.
 auto Snapshot::get(const ReadOptions& opts, BytesView key,
                    Bytes &out) const -> bool {
+  PoolTrace::Scope trace_scope{PoolTrace::kGet};
 #ifdef BYTECASK_KEYDIR_BLIND
   return kd_read_value(state_->key_dir, key,
                        state_->kd_ctx(opts.verify_checksums), out);
@@ -3946,6 +3961,7 @@ void DB::vacuum_unlink_old_file(
       dir_ / (old_data_file->path().stem().string() + ".hint");
   std::filesystem::remove(old_data_file->path());
   std::filesystem::remove(old_hint_path);
+  PoolTrace::note(PoolTrace::kUnlink, file_id, 0, 0);
   counters_.vacuum_files_unlinked.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -4046,6 +4062,7 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
 
   auto new_file = openDataFileForRead(final_data_path, io_backend_, pool_,
                                       dest_file_id);
+  PoolTrace::note(PoolTrace::kNewFile, dest_file_id, 0, new_file->size());
   flush_hints_for(new_file, dir_);
 
   {

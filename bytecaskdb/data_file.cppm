@@ -371,6 +371,28 @@ auto read_value_from_pool(BufferPool &pool, std::uint32_t file_id,
   return true;
 }
 
+// exp/pool-write-model trace hooks: the bytes one logical read needs, recorded
+// whether the pool holds them or not. No-ops unless BYTECASK_POOL_TRACE is set.
+inline void trace_read(std::uint32_t file_id, Offset offset,
+                       std::size_t len) noexcept {
+  PoolTrace::note(PoolTrace::kRead, file_id, offset, len);
+}
+inline void trace_value_read(std::uint32_t file_id, Offset offset,
+                             std::uint16_t key_size, std::uint32_t value_size,
+                             bool verify) noexcept {
+  if (verify) {
+    trace_read(file_id, offset, kHeaderSize + key_size + value_size + kCrcSize);
+  } else {
+    trace_read(file_id, offset + kHeaderSize + key_size, value_size);
+  }
+}
+inline auto traced(std::uint32_t file_id, Offset offset, DataEntryView v) noexcept
+    -> DataEntryView {
+  trace_read(file_id, offset,
+             kHeaderSize + v.key.size() + v.value.size() + kCrcSize);
+  return v;
+}
+
 // How many of the len bytes wanted at offset lie below end.
 constexpr auto bytes_below(Offset offset, std::size_t len, Offset end) noexcept
     -> std::size_t {
@@ -442,8 +464,15 @@ public:
   // The bytes are already in memory, so an over-read saves nothing.
   static constexpr bool kResident = true;
 
+  [[nodiscard]] auto file_id() const noexcept -> std::uint32_t { return file_id_; }
+
   // One append_resident per iovec, so nothing is re-read or re-gathered.
   void publish(Offset start, std::span<const ::iovec> iov) const {
+    if (PoolTrace::get() != nullptr) {
+      std::size_t total = 0;
+      for (const auto &v : iov) total += v.iov_len;
+      PoolTrace::note(PoolTrace::kAppend, file_id_, start, total);
+    }
     auto at = static_cast<std::uint64_t>(start);
     for (const auto &v : iov) {
       pool_->append_resident(
@@ -1094,6 +1123,7 @@ public:
                   std::vector<std::byte> &io_buf,
                   std::vector<std::byte> &out) const override {
     if constexpr (Io::kResident) {
+      trace_value_read(ops_.io_.file_id(), offset, key_size, value_size, verify);
       if (ops_.io_.read_value(offset, key_size, value_size, verify,
                               ops_.logical_end(), out)) {
         return;
@@ -1116,8 +1146,14 @@ public:
     if constexpr (Io::kResident) {
       if (auto lent =
               ops_.io_.lend(offset, verify, ops_.logical_end(), lease)) {
-        return *lent;
+        return traced(ops_.io_.file_id(), offset, *lent);
       }
+      lease.reset();
+      return traced(ops_.io_.file_id(), offset,
+                    fetch_record(path(), offset, value_size_hint,
+                                 ops_.logical_end(), verify, io_buf,
+                                 [this](Offset at, std::size_t len,
+                                        std::byte *dst) { fetch(at, len, dst); }));
     }
     lease.reset();
     const auto read = [&] {
@@ -1138,6 +1174,11 @@ public:
                                 std::vector<std::byte> &io_buf) const
       -> DataEntryView override {
     auto hdr = read_header(offset);
+    if constexpr (Io::kResident) {
+      return traced(ops_.io_.file_id(), offset,
+                    read_entry_with_key_size(offset, hdr.key_size, value_size,
+                                             io_buf));
+    }
     return read_entry_with_key_size(offset, hdr.key_size, value_size, io_buf);
   }
 
@@ -1152,7 +1193,7 @@ public:
       const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
       io_buf.resize(total);
       fetch(offset, total, io_buf.data());
-      return view_of(hdr, value_size, io_buf);
+      return traced(ops_.io_.file_id(), offset, view_of(hdr, value_size, io_buf));
     } else {
       // A syscall per read, so over-read by a key budget and fuse the header
       // and the body into one pread. Only a longer key pays for a second.
@@ -1609,6 +1650,7 @@ public:
                   std::uint32_t value_size, bool verify,
                   std::vector<std::byte> &io_buf,
                   std::vector<std::byte> &out) const override {
+    trace_value_read(file_id_, offset, key_size, value_size, verify);
     if (read_value_from_pool(*pool_, file_id_, file_size_, offset, key_size,
                              value_size, verify, out)) {
       return;
@@ -1628,8 +1670,9 @@ public:
                                 std::vector<std::byte> &io_buf) const
       -> DataEntryView override {
     auto hdr = read_header(offset, Source::Pool);
-    return read_entry_with_key_size(offset, hdr.key_size, value_size, io_buf,
-                                    Source::Pool);
+    return traced(file_id_, offset,
+                  read_entry_with_key_size(offset, hdr.key_size, value_size,
+                                           io_buf, Source::Pool));
   }
 
   // One frame lookup for a record inside one resident frame; otherwise the
@@ -1640,13 +1683,15 @@ public:
       -> DataEntryView override {
     if (auto lent = lend_from_pool(*pool_, file_id_, file_size_, offset,
                                    verify, lease)) {
-      return *lent;
+      return traced(file_id_, offset, *lent);
     }
     lease.reset();
-    return fetch_record(path(), offset, value_size_hint, file_size_, verify, io_buf,
-                        [this](Offset at, std::size_t len, std::byte *dst) {
-                          fetch(at, len, dst, Source::Pool);
-                        });
+    return traced(file_id_, offset,
+                  fetch_record(path(), offset, value_size_hint, file_size_,
+                               verify, io_buf,
+                               [this](Offset at, std::size_t len, std::byte *dst) {
+                                 fetch(at, len, dst, Source::Pool);
+                               }));
   }
 
   [[nodiscard]] auto read_entry_unverified(
@@ -1656,6 +1701,7 @@ public:
     const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
     io_buf.resize(total);
     fetch(offset, total, io_buf.data(), Source::Pool);
+    trace_read(file_id_, offset, total);
     auto body = std::span<const std::byte>{io_buf.data() + kHeaderSize,
                                            hdr.key_size + value_size};
     return DataEntryView{
