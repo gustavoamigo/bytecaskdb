@@ -54,9 +54,11 @@ from __future__ import annotations
 
 import contextlib
 import enum
+import fcntl
 import os
 import secrets
 import struct
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -584,7 +586,7 @@ class DB(_Reads):
                 return None
             if not plan.writes:
                 if sync:
-                    os.fdatasync(self._fds[self._active_id])
+                    _datasync(self._fds[self._active_id])
                 return CommitResult(0, True)
 
             # More than one write is framed, so the batch lands whole. Every
@@ -604,7 +606,7 @@ class DB(_Reads):
             fd = self._fds[self._active_id]
             _pwrite_all(fd, b"".join(encoded), self._active_size)
             if sync:
-                os.fdatasync(fd)
+                _datasync(fd)
             self._active_size = end
             self._next_sequence += len(entries)
 
@@ -656,7 +658,7 @@ class DB(_Reads):
             self._closed = True
             try:
                 if self._failure is None:
-                    os.fdatasync(self._fds[self._active_id])
+                    _datasync(self._fds[self._active_id])
             finally:
                 for fd in self._fds.values():
                     os.close(fd)
@@ -681,7 +683,7 @@ class DB(_Reads):
 
     def _rotate(self) -> None:
         """Seals the active file, synced whole, and starts the next one."""
-        os.fdatasync(self._fds[self._active_id])
+        _datasync(self._fds[self._active_id])
         self._start_active_file()
 
     def _recover(self) -> None:
@@ -735,6 +737,21 @@ def _check_sizes(writes: list[Entry]) -> None:
             raise ValueError(f"value size {len(write.value)} exceeds limit {limit}")
 
 
+if sys.platform == "darwin":
+    # macOS has no fdatasync, and its fsync does not flush the drive's cache.
+    def _datasync(fd: int) -> None:
+        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+
+    _fullsync = _datasync
+else:
+    def _datasync(fd: int) -> None:
+        os.fdatasync(fd)
+
+    def _fullsync(fd: int) -> None:
+        """Syncs data and metadata: a truncate changes the file's size."""
+        os.fsync(fd)
+
+
 def _pwrite_all(fd: int, data: bytes, offset: int) -> None:
     view = memoryview(data)
     while view:
@@ -756,7 +773,7 @@ def _rewrite_durably(path: Path, end: int) -> None:
     try:
         _pwrite_all(fd, os.pread(fd, end, 0), 0)
         os.ftruncate(fd, end)
-        os.fsync(fd)
+        _fullsync(fd)
     finally:
         os.close(fd)
 

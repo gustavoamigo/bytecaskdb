@@ -113,13 +113,13 @@ def test_damage_in_an_older_file_is_refused(tmp_path):
 def test_a_failed_sync_stops_writes(tmp_path, monkeypatch):
     db = ref.DB.open(tmp_path)
     db[b"a"] = b"1"
-    real = os.fdatasync
+    real = ref._datasync
 
     def fail_once(fd):
-        monkeypatch.setattr(os, "fdatasync", real)
+        monkeypatch.setattr(ref, "_datasync", real)
         raise OSError(errno.EIO, "injected")
 
-    monkeypatch.setattr(os, "fdatasync", fail_once)
+    monkeypatch.setattr(ref, "_datasync", fail_once)
     with pytest.raises(OSError):
         db[b"b"] = b"2"
     # A sync that succeeds now may not write what the failed one left behind.
@@ -167,15 +167,15 @@ def test_open_makes_the_newest_file_durable(tmp_path, monkeypatch):
     newest, = [p for p in data_files(tmp_path)
                if (c := ref.scan_committed(p.read_bytes())[0]) and c[0][1].sequence == 2]
     synced = []
-    real = os.fsync
+    real = ref._fullsync
 
     def record(fd):
-        synced.append(Path(os.readlink(f"/proc/self/fd/{fd}")))
+        synced.append(os.fstat(fd).st_ino)
         real(fd)
 
-    monkeypatch.setattr(os, "fsync", record)
+    monkeypatch.setattr(ref, "_fullsync", record)
     ref.DB.open(tmp_path, max_file_bytes=1).close()
-    assert newest.resolve() in synced
+    assert newest.stat().st_ino in synced
 
 
 def test_transactions(tmp_path):
