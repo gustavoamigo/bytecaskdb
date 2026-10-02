@@ -396,8 +396,8 @@ class DB:
         backend=_bc,
     ) -> "DB":
         """*backend* is the module providing the engine interface: the native
-        extension (default), or one with the same interface, such as the
-        Python reference implementation (bytecaskdb-python/reference)."""
+        extension by default. Tests pass the Python reference implementation
+        (bytecaskdb-python/reference) to run this wrapper on it."""
         opts = backend.Options()
         if max_file_bytes is not None:
             opts.max_file_bytes = max_file_bytes

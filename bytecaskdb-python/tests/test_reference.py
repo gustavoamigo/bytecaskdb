@@ -170,6 +170,23 @@ def test_a_torn_first_write_of_a_file_is_cut(tmp_path, torn_to):
     assert second.stat().st_size == 0
 
 
+def test_an_older_file_with_a_zeroed_first_header_is_refused(tmp_path):
+    """Its first sequence reads as 0, like a file too short for a header, but
+    it holds acknowledged entries: it is damage, not a torn first write."""
+    with ref.DB.open(tmp_path) as db:
+        for i in range(5):
+            db.put(f"k{i}".encode(), b"v", NO_SYNC)
+    with ref.DB.open(tmp_path) as db:
+        db.put(b"z", b"1")
+    older = file_starting_at(tmp_path, 1)
+    raw = bytearray(older.read_bytes())
+    raw[:8] = bytes(8)
+    older.write_bytes(bytes(raw))
+    with pytest.raises(RuntimeError, match="corrupt data file"):
+        ref.DB.open(tmp_path)
+    assert older.stat().st_size == len(raw)
+
+
 def test_damage_in_an_older_file_is_refused(tmp_path):
     opts = ref.Options(max_file_bytes=1)  # a file per write
     with ref.DB.open(tmp_path, opts) as db:

@@ -97,7 +97,7 @@ Its interface is the engine's, as the native binding (`bytecaskdb._bytecaskdb`) 
 - `Snapshot`, which a `WritePlan` consumes;
 - `CommitResult`, and option objects.
 
-The Pythonic interface (`db[k]`, `with db.transaction()`) stays in `bytecaskdb/ext.py`. `ext.py` runs on either backend: `bytecaskdb.DB.open(path, backend=bytecask_ref)`. Its classes build options and plans through the backend module it was opened with, and the default is the native extension.
+The Pythonic interface (`db[k]`, `with db.transaction()`) stays in `bytecaskdb/ext.py`. A test can run `ext.py` on the reference through `bytecaskdb.DB.open(path, backend=bytecask_ref)`. `ext.py` builds options and plans through the backend module it was opened with, and the default is the native extension. This is a test seam: `reference/` is not part of the `bytecaskdb` package and must be on `sys.path`.
 
 The docstring shows, with `dump(path)`, what a put followed by a two-write batch leaves on disk. `dump` prints the committed entries of any database, the engine's included. The reference contains only what decides what a read returns:
 
@@ -110,7 +110,7 @@ The docstring shows, with `dump(path)`, what a put followed by a two-write batch
 - **Key directory.** A `PersistentTree[bytes, Location]`. `PersistentTree` is an unbalanced binary search tree built by path copying and knows nothing of the engine. It is a `collections.abc.Mapping` whose `set`, `remove` and `discard` return a new tree, with ordered `ascending`/`descending` scans. A snapshot is a tree. A `Location` is a record's file, offset and sequence. A value is read from its record, and the record's CRC, key and sequence are checked.
 - **Recovery.** Every data file is replayed in order of its first sequence, through the same `apply_entry` the write path uses. A batch counts once its BULK_END is read. A file whose committed entries stop before its end falls into one of three cases:
   - zeros follow: they are cut;
-  - data follows, in the newest file or in a file too short to hold one header: it is cut, as in the engine's `recovery_check_tail`, since nothing in such a file survives;
+  - data follows, in the newest file or in a file shorter than one header: it is cut. The short file cannot hold an acknowledged entry, since the smallest is 19 bytes. The engine's `recovery_check_tail` keys this case on the first sequence reading 0, which also lets an older file whose first header was zeroed be cut whole (#303);
   - data follows, anywhere else: open refuses.
   - Before replaying, the newest file's committed bytes are written back and synced, and so is any cut. This is the engine's `rewrite_durably`/`truncate_durably`. Without it, a failed sync could leave those bytes only in the page cache, and a cut that was never synced could bring a torn tail back into a file that is no longer the newest.
 - **I/O errors.** A write or sync that fails with an I/O error stops all writes: they raise `DbDegraded`, while reads go on. `close()` raises `DbDegraded` too. Reopening is the only way back, and it rewrites the file as above. The engine also offers `resume()`; the reference does not.

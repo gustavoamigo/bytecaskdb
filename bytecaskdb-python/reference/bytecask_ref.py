@@ -291,36 +291,41 @@ class Snapshot:
         self._db = db
         self._keydir: KeyDir | None = keydir
 
-    def _take(self) -> KeyDir:
+    def _view(self) -> KeyDir:
         if self._keydir is None:
             raise RuntimeError("Snapshot already consumed by WritePlan")
         return self._keydir
 
+    def _consume(self) -> KeyDir:
+        keydir = self._view()
+        self._keydir = None
+        return keydir
+
     def get(self, key: bytes, opts: ReadOptions | None = None) -> bytes | None:
-        location = self._take().get(key)
+        location = self._view().get(key)
         return None if location is None else self._db._read_value(key, location, opts)
 
     def contains_key(self, key: bytes, opts: ReadOptions | None = None) -> bool:
-        return key in self._take()
+        return key in self._view()
 
     def iter_from(self, from_key: bytes = b"",
                   opts: ReadOptions | None = None) -> Iterator[tuple[bytes, bytes]]:
         """(key, value) pairs from from_key, ascending. Values are read as the scan reaches them."""
-        for key, location in self._take().ascending(from_key):
+        for key, location in self._view().ascending(from_key):
             yield key, self._db._read_value(key, location, opts)
 
     def keys_from(self, from_key: bytes = b"", opts: ReadOptions | None = None) -> Iterator[bytes]:
-        for key, _ in self._take().ascending(from_key):
+        for key, _ in self._view().ascending(from_key):
             yield key
 
     def riter_from(self, from_key: bytes = b"",
                    opts: ReadOptions | None = None) -> Iterator[tuple[bytes, bytes]]:
         """(key, value) pairs at or below from_key, descending; from the last key if it is b""."""
-        for key, location in self._take().descending(from_key or None):
+        for key, location in self._view().descending(from_key or None):
             yield key, self._db._read_value(key, location, opts)
 
     def rkeys_from(self, from_key: bytes = b"", opts: ReadOptions | None = None) -> Iterator[bytes]:
-        for key, _ in self._take().descending(from_key or None):
+        for key, _ in self._view().descending(from_key or None):
             yield key
 
     def __enter__(self) -> Snapshot:
@@ -343,9 +348,7 @@ class WritePlan:
     """
 
     def __init__(self, snapshot: Snapshot | None = None) -> None:
-        self._snapshot = snapshot._take() if snapshot is not None else None
-        if snapshot is not None:
-            snapshot._keydir = None  # consumed
+        self._snapshot = snapshot._consume() if snapshot is not None else None
         self._writes: list[Entry] = []  # sequences assigned at commit
         self._guards: dict[bytes, _Guard] = {}
         self._range_guards: list[tuple[bytes, bytes]] = []
@@ -395,19 +398,14 @@ class WritePlan:
             raise RuntimeError("WritePlan already applied")
 
     def _holds(self, head: KeyDir) -> bool:
-        for key, guard in self._guards.items():
-            match guard:
-                case _Guard.PRESENT:
-                    ok = key in head
-                case _Guard.ABSENT:
-                    ok = key not in head
-                case _Guard.UNCHANGED:
-                    ok = True  # checked below, with the keys the plan writes
-            if not ok:
-                return False
+        guards = self._guards.items()
+        if any(key not in head for key, g in guards if g is _Guard.PRESENT):
+            return False
+        if any(key in head for key, g in guards if g is _Guard.ABSENT):
+            return False
         if self._snapshot is None:
-            return True
-        unchanged_keys = [k for k, g in self._guards.items() if g is _Guard.UNCHANGED]
+            return True  # nothing to compare with: no other guard is possible
+        unchanged_keys = [key for key, g in guards if g is _Guard.UNCHANGED]
         unchanged_ranges = list(self._range_guards)
         for write in self._writes:
             if write.type is EntryType.RANGE_DELETE:
@@ -658,18 +656,18 @@ class DB:
         newest = max((f.first_sequence for f in files), default=0)
         for f in sorted(files, key=lambda f: f.first_sequence):
             # Every file but the newest was synced whole before the next one
-            # was started; the newest may hold bytes the last process never
-            # got to disk, or a write a crash tore.
-            if f.end == f.size:
-                pass  # clean
-            elif not f.has_data_past_end:
-                pass  # zeros after the end: unwritten space, cut below
-            elif f.first_sequence not in (newest, 0):
-                # Data after the end of an older file is damage to
-                # acknowledged data. A file with no first sequence to compare
-                # holds nothing that survives, so it may go whole.
+            # was started. After its committed entries, a file may hold:
+            #   - nothing, or zeros (unwritten space): cut;
+            #   - a write a crash tore, in the newest file, or in a file too
+            #     short to hold one header, which holds no acknowledged entry
+            #     (the smallest is 19 bytes): cut;
+            #   - anything else: damage to acknowledged data, refused.
+            is_newest = f.first_sequence == newest
+            too_short_for_a_header = f.size < _HEADER.size
+            if f.has_data_past_end and not (is_newest or too_short_for_a_header):
                 raise RuntimeError(f"corrupt data file {f.path.name} past offset {f.end}")
-            if f.first_sequence == newest or f.end < f.size:
+            # The newest may also hold bytes the last process never got to disk.
+            if is_newest or f.end < f.size:
                 _rewrite_durably(f.path, f.end)
             self._fds[f.file_id] = os.open(f.path, os.O_RDWR)
             for p in f.committed:

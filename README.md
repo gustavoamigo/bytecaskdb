@@ -533,7 +533,7 @@ ByteCaskDB is designed around four core tenets, in priority order:
 
 **Recovery**: on `open`, the engine generates a hint file for any data file that lacks one — after a crash, the file that was active and any sealed file still waiting for its hint — then replays all hint files in parallel to rebuild the key directory. A hint-less file is first read back and synced, so the hint never indexes bytes that were only in the page cache. Hint files are compact per-file indexes, sorted by key and compressed with zstd, written atomically (`write → fdatasync → rename`) by a background worker after each file rotation and synchronously at engine close. No raw data-file scan is performed — recovery reads only hint files.
 
-To see the whole model in one file, read [`bytecaskdb-python/reference/bytecask_ref.py`](bytecaskdb-python/reference/bytecask_ref.py). It is a plain-Python reference implementation of the engine's interface and file format, without hint files, vacuum or any optimisation. The Pythonic `bytecaskdb.DB` runs on it too: `bytecaskdb.DB.open(path, backend=bytecask_ref)`. It is checked against the engine in CI.
+To see the whole model in one file, read [`bytecaskdb-python/reference/bytecask_ref.py`](bytecaskdb-python/reference/bytecask_ref.py). It is a plain-Python reference implementation of the engine's interface and file format, without hint files, vacuum or any optimisation. It is checked against the engine in CI.
 
 Start with [`docs/bytecask_intro.md`](docs/bytecask_intro.md) for a first-pass happy-path overview, then use [`docs/bytecask_design.md`](docs/bytecask_design.md) as the full design reference.
 
