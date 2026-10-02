@@ -89,16 +89,22 @@ Under GIL Python, all nanobind locking primitives (`nb::ft_mutex`, `nb::lock_sel
 
 ### Python Reference Implementation
 
-`bytecaskdb-python/reference/bytecask_ref.py` is the engine's model in one file of plain Python, written to be read. It imports two general-purpose modules: `persistent_tree.py`, an immutable sorted map, and `checksum.py`, CRC-32C. It has the binding's API (`DB`, `Snapshot`, `WritePlan`, the four iterators, `put`/`del_`/`del_range`/`apply_batch` with every guard). It contains only what decides what a read returns:
+`bytecaskdb-python/reference/bytecask_ref.py` is the engine's model in one file of plain Python, written to be read. It imports two general-purpose modules: `persistent_tree.py`, an immutable sorted map, and `checksum.py`, CRC-32C. Its API is the Pythonic one `bytecaskdb.DB` offers (`bytecaskdb/ext.py`):
+- `db[k]`, `k in db`, `del db[k]`, `get`;
+- `put`/`delete`/`delete_range` with `sync=` as a keyword;
+- `items`/`keys`/`ritems`/`rkeys`/`prefix`/`rprefix`;
+- `snapshot()`, and `batch()` and `transaction()` as context managers.
 
-- **Write path.** One lock. A plan's preconditions are checked against the published key directory. Its entries are appended in one write, with BulkBegin/BulkEnd around more than one write and one sequence per entry, markers included. Then the file is synced if asked, the new key directory is built, and only after that is it published.
+A transaction reads its own writes, accepts every guard, and raises `ConflictError` on conflict. Code written against `bytecaskdb.DB` runs on the reference unchanged. Internally, a batch and a transaction are both a plan: writes plus the guards they commit under. It contains only what decides what a read returns:
+
+- **Write path.** One lock. A plan's preconditions are checked against the published key directory. Its entries are appended in one write, with BULK_BEGIN/BULK_END around more than one write and one sequence per entry, markers included. Then the file is synced if asked, the new key directory is built, and only after that is it published.
 - **Key directory.** A `PersistentTree[bytes, Location]`. `PersistentTree` is an unbalanced binary search tree built by path copying and knows nothing of the engine. It is a `collections.abc.Mapping` whose `set`, `remove` and `discard` return a new tree, with ordered `ascending`/`descending` scans. A snapshot is a tree. A `Location` is a record's file, offset and sequence. A value is read from its record, and the record's CRC, key and sequence are checked.
-- **Recovery.** Every data file is replayed in order of its first sequence, through the same `apply_entry` the write path uses. A batch counts once its BulkEnd is read. A file that does not parse to its end is truncated if it is the newest file, or if what follows is zeros. Anywhere else, open refuses.
+- **Recovery.** Every data file is replayed in order of its first sequence, through the same `apply_entry` the write path uses. A batch counts once its BULK_END is read. A file that does not parse to its end is truncated if it is the newest file, or if what follows is zeros. Anywhere else, open refuses.
 - **Guards.** These match `validate_preconditions`. A key is unchanged if its sequence, or its absence, is the same in the snapshot and the head. A key created and then deleted after the snapshot is absent from both, so it does not conflict.
 
 It writes the V01 format, so the engine opens a database it wrote (generating the hints) and it opens one the engine wrote (ignoring the hints). Hints, vacuum, group commit, preallocation, the buffer pool, replication, degraded mode and the directory lock are left out. A database the engine left mid-vacuum, with a compacted copy beside the original, is for the engine to open first.
 
-`bytecaskdb-python/tests/test_persistent_tree.py` checks the tree and the CRC on their own. `bytecaskdb-python/tests/test_reference.py` runs the reference against the native binding. A seeded workload of puts, deletes, range deletes and guarded plans runs on both engines, with snapshots held across writes, rotation, reopens and native vacuum. Every commit or conflict, every sequence and every `get` and scan must agree. File-format tests cover both directions. It runs in `ci.yml`.
+`bytecaskdb-python/tests/test_persistent_tree.py` checks the tree and the CRC on their own. `bytecaskdb-python/tests/test_reference.py` runs the reference and `bytecaskdb.DB` through the same calls. A seeded workload runs on both: puts, deletes, range deletes, batches, and guarded transactions held open across other writes. Snapshots are held across writes, rotation, reopens and native vacuum. Every commit or conflict must agree, and so must every sequence, every `get` and scan, and every read a transaction makes of its own writes. File-format tests cover both directions. It runs in `ci.yml`.
 
 ## Design Principles
 

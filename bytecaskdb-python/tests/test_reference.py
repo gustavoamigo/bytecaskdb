@@ -2,8 +2,8 @@
 # Copyright (c) 2026 Gustavo Amigo
 #
 # The Python reference implementation (reference/bytecask_ref.py): its own
-# behaviour, a differential run against the native engine, and the file format
-# in both directions.
+# behaviour, a differential run against the native engine through the same
+# API (bytecaskdb.DB), and the file format in both directions.
 
 import random
 import sys
@@ -13,12 +13,17 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "reference"))
 import bytecask_ref as ref  # noqa: E402
-
-NO_SYNC = ref.WriteOptions(sync=False)
+from bytecask_ref import EntryType as T  # noqa: E402
 
 
 def data_files(path):
     return sorted(Path(path).glob("*.data"))
+
+
+def entry_types(path):
+    (committed, _), = [ref.scan_committed(p.read_bytes()) for p in data_files(path)
+                       if p.stat().st_size]
+    return [e.type for _, e in committed]
 
 
 # ---------------------------------------------------------------------------
@@ -26,145 +31,164 @@ def data_files(path):
 # ---------------------------------------------------------------------------
 
 
+def test_dict_like_access(tmp_path):
+    with ref.DB.open(tmp_path) as db:
+        db[b"a"] = b"1"
+        assert db[b"a"] == b"1" and b"a" in db and db.get(b"zz", b"none") == b"none"
+        del db[b"a"]
+        del db[b"a"]  # absent: nothing happens
+        assert b"a" not in db
+        with pytest.raises(KeyError):
+            db[b"a"]
+
+
 def test_sequences_and_framing(tmp_path):
     with ref.DB.open(tmp_path) as db:
         assert db.put(b"a", b"1").sequence == 1
-        plan = ref.WritePlan()
-        plan.put(b"b", b"2")
-        plan.put(b"c", b"3")
-        assert db.apply_batch(plan).sequence == 5  # BulkBegin 2, puts 3-4, BulkEnd 5
-        assert db.del_(b"zz") is None
-        assert db.del_(b"a").sequence == 6
-        assert db.del_range(b"x", b"a") == ref.CommitResult(0, True)
-    (entries, _), = [ref.scan_committed(p.read_bytes()) for p in data_files(tmp_path)]
-    assert [e.type for _, e in entries] == [
-        ref.EntryType.Put, ref.EntryType.BulkBegin, ref.EntryType.Put,
-        ref.EntryType.Put, ref.EntryType.BulkEnd, ref.EntryType.Delete]
+        with db.batch() as b:
+            b[b"b"] = b"2"
+            b[b"c"] = b"3"
+        assert b.result.sequence == 5  # BULK_BEGIN 2, puts 3-4, BULK_END 5
+        assert db.delete(b"zz") is None
+        assert db.delete(b"a").sequence == 6
+        assert db.delete_range(b"x", b"a") == ref.CommitResult(0, True)
+    assert entry_types(tmp_path) == [T.PUT, T.BULK_BEGIN, T.PUT, T.PUT, T.BULK_END, T.DELETE]
+
+
+def test_scans(tmp_path):
+    with ref.DB.open(tmp_path) as db:
+        for k in [b"a", b"b1", b"b2", b"b\xff", b"c"]:
+            db.put(k, k.upper(), sync=False)
+        assert list(db.keys(b"b")) == [b"b1", b"b2", b"b\xff", b"c"]
+        assert list(db.rkeys(b"b2")) == [b"b2", b"b1", b"a"]
+        assert list(db.rkeys()) == [b"c", b"b\xff", b"b2", b"b1", b"a"]
+        assert list(db.prefix(b"b")) == [(b"b1", b"B1"), (b"b2", b"B2"), (b"b\xff", b"B\xff")]
+        assert [k for k, _ in db.rprefix(b"b")] == [b"b\xff", b"b2", b"b1"]
 
 
 def test_reopen_replays_every_write(tmp_path):
-    opts = ref.Options(max_file_bytes=200)
-    with ref.DB.open(tmp_path, opts) as db:
+    with ref.DB.open(tmp_path, max_file_bytes=200) as db:
         for i in range(50):
-            db.put(f"k{i:02}".encode(), f"v{i}".encode(), NO_SYNC)
-        db.del_range(b"k10", b"k20")
-        db.del_(b"k30")
+            db.put(f"k{i:02}".encode(), f"v{i}".encode(), sync=False)
+        db.delete_range(b"k10", b"k20")
+        del db[b"k30"]
     assert len(data_files(tmp_path)) > 5
-    with ref.DB.open(tmp_path, opts) as db:
+    with ref.DB.open(tmp_path, max_file_bytes=200) as db:
         expected = [f"k{i:02}".encode() for i in range(50) if not 10 <= i < 20 and i != 30]
-        assert list(db.keys_from()) == expected
-        assert db.get(b"k05") == b"v5"
+        assert list(db.keys()) == expected
+        assert db[b"k05"] == b"v5"
         assert db.put(b"n", b"v").sequence == 53
 
 
 def test_torn_batch_in_newest_file_is_cut(tmp_path):
     with ref.DB.open(tmp_path) as db:
-        db.put(b"a", b"1")
-        plan = ref.WritePlan()
-        plan.put(b"b", b"2")
-        plan.put(b"c", b"3")
-        db.apply_batch(plan)
-    path = data_files(tmp_path)[0]
-    whole = path.stat().st_size
+        db[b"a"] = b"1"
+        with db.batch() as b:
+            b[b"b"] = b"2"
+            b[b"c"] = b"3"
+    path, = [p for p in data_files(tmp_path) if p.stat().st_size]
     with open(path, "r+b") as f:
-        f.truncate(whole - 5)  # BulkEnd torn
+        f.truncate(path.stat().st_size - 5)  # BULK_END torn
     with ref.DB.open(tmp_path) as db:
-        assert list(db.keys_from()) == [b"a"]
-    assert path.stat().st_size == len(ref.encode_entry(ref.Entry(1, ref.EntryType.Put, b"a", b"1")))
+        assert list(db.keys()) == [b"a"]
+    assert path.stat().st_size == len(ref.Entry(1, T.PUT, b"a", b"1").encode())
 
 
 def test_damage_in_an_older_file_is_refused(tmp_path):
-    opts = ref.Options(max_file_bytes=1)  # a file per write
-    with ref.DB.open(tmp_path, opts) as db:
-        db.put(b"a", b"1")
-        db.put(b"b", b"2")
+    with ref.DB.open(tmp_path, max_file_bytes=1) as db:  # a file per write
+        db[b"a"] = b"1"
+        db[b"b"] = b"2"
     # Names order files only by the second, so find the first by its sequence.
     oldest, = [p for p in data_files(tmp_path)
-               if (s := ref.scan_committed(p.read_bytes())[0]) and s[0][1].sequence == 1]
+               if (c := ref.scan_committed(p.read_bytes())[0]) and c[0][1].sequence == 1]
     raw = bytearray(oldest.read_bytes())
     raw[-1] ^= 0xFF
     oldest.write_bytes(bytes(raw))
     with pytest.raises(RuntimeError, match="corrupt data file"):
-        ref.DB.open(tmp_path, opts)
+        ref.DB.open(tmp_path, max_file_bytes=1)
 
 
-def test_guards(tmp_path):
+def test_transactions(tmp_path):
     with ref.DB.open(tmp_path) as db:
-        db.put(b"price", b"10")
-        db.put(b"r1", b"x")
-        snap = db.snapshot()
-        db.put(b"price", b"20")
+        db[b"price"] = b"10"
+        db[b"r1"] = b"x"
 
-        plan = ref.WritePlan(snap)
-        plan.ensure_unchanged(b"price")
-        plan.put(b"order", b"1")
-        assert db.apply_batch(plan) is None
+        with db.transaction() as txn:
+            txn[b"order"] = txn[b"price"]
+            assert txn[b"order"] == b"10"  # reads its own writes
+            txn.delete_range(b"a", b"p")
+            assert b"order" not in txn and txn.get(b"price") == b"10"
+        assert b"order" not in db
 
-        plan = ref.WritePlan(snap)  # writes a key changed since the snapshot
-        plan.put(b"price", b"30")
-        assert db.apply_batch(plan) is None
+        with pytest.raises(ref.ConflictError):
+            with db.transaction() as txn:
+                txn.ensure_unchanged(b"price")
+                db[b"price"] = b"20"
+                txn[b"order"] = b"1"
+        assert b"order" not in db
 
-        plan = ref.WritePlan(snap)
-        plan.ensure_range_unchanged(b"r", b"s")
-        plan.put(b"order", b"1")
-        assert db.apply_batch(plan) is not None
-        db.del_(b"r1")
-        plan = ref.WritePlan(snap)
-        plan.ensure_range_unchanged(b"r", b"s")
-        assert db.apply_batch(plan) is None
+        with pytest.raises(ref.ConflictError):
+            with db.transaction() as txn:  # writes a key changed since it began
+                db[b"price"] = b"30"
+                txn[b"price"] = b"40"
 
-        assert snap.get(b"price") == b"10" and db.get(b"price") == b"20"
+        with pytest.raises(ref.ConflictError):
+            with db.transaction() as txn:
+                txn.ensure_range_unchanged(b"r", b"s")
+                del db[b"r1"]
+
         with pytest.raises(ValueError):
-            ref.WritePlan().ensure_unchanged(b"k")
+            with db.transaction() as txn:
+                txn.ensure_present(b"k")
+                txn.ensure_absent(b"k")
+
+        with pytest.raises(RuntimeError, match="in the block"):
+            with db.transaction() as txn:
+                txn[b"never"] = b"1"
+                raise RuntimeError("in the block")
+        assert b"never" not in db
 
 
 # ---------------------------------------------------------------------------
-# Against the native engine
+# Against the native engine, through the same API
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def bc():
-    return pytest.importorskip("bytecaskdb._bytecaskdb")
-
-
-def native_options(bc, max_file_bytes):
-    opts = bc.Options()
-    opts.max_file_bytes = max_file_bytes
-    return opts
-
-
-def native_write_options(bc, sync):
-    opts = bc.WriteOptions()
-    opts.sync = sync
-    return opts
-
-
-def commit(result):
-    return None if result is None else result.sequence
+    return pytest.importorskip("bytecaskdb")
 
 
 def assert_same_reads(r, n, rng, keys, where):
     for k in rng.sample(keys, 5):
         assert r.get(k) == n.get(k), (where, k)
-        assert r.contains_key(k) == n.contains_key(k), (where, k)
-    start = rng.choice(keys + [b""])
-    assert list(r.iter_from(start)) == list(n.iter_from(start)), (where, start)
-    assert list(r.keys_from(start)) == list(n.keys_from(start)), (where, start)
-    assert list(r.riter_from(start)) == list(n.riter_from(start)), (where, start)
-    assert list(r.rkeys_from(start)) == list(n.rkeys_from(start)), (where, start)
+        assert (k in r) == (k in n), (where, k)
+    start = rng.choice([*keys, b""])
+    pfx = start[:1]
+    for scan in ("items", "keys", "ritems", "rkeys"):
+        assert list(getattr(r, scan)(start)) == list(getattr(n, scan)(start)), (where, scan, start)
+    assert list(r.prefix(pfx)) == list(n.prefix(pfx)), (where, pfx)
+    assert list(r.rprefix(pfx)) == list(n.rprefix(pfx)), (where, pfx)
 
 
 @pytest.mark.parametrize("seed", range(6))
 def test_differential_against_native(tmp_path, bc, seed):
     """One seeded workload on both engines: every commit, conflict, sequence
-    and read must agree, through rotation, reopen, held snapshots and native
-    vacuum (which the reference does not have and must not need)."""
+    and read must agree, through rotation, reopen, transactions held open
+    across other writes, and native vacuum (which the reference does not have
+    and must not need)."""
     rng = random.Random(seed)
-    keys = sorted({bytes(rng.choice(b"abc") for _ in range(rng.randint(1, 4))) for _ in range(60)})
+    keys = sorted({bytes(rng.choice(b"abc") for _ in range(rng.randint(1, 4)))
+                   for _ in range(60)})
     max_file_bytes = 512
-    r = ref.DB.open(tmp_path / "ref", ref.Options(max_file_bytes=max_file_bytes))
-    n = bc.DB.open(str(tmp_path / "native"), native_options(bc, max_file_bytes))
-    snaps = []  # (reference, native), consumed by plans like native ones are
+
+    def open_both():
+        return (ref.DB.open(tmp_path / "ref", max_file_bytes=max_file_bytes),
+                bc.DB.open(str(tmp_path / "native"), max_file_bytes=max_file_bytes))
+
+    r, n = open_both()
+    open_txns = []  # (reference, native) transactions begun and not yet committed
+    snaps = []
 
     def value():
         return bytes(rng.randrange(256) for _ in range(rng.randint(0, 40)))
@@ -173,95 +197,124 @@ def test_differential_against_native(tmp_path, bc, seed):
         a, b = rng.choice(keys), rng.choice(keys)
         return min(a, b), max(a, b)
 
+    def stage(rb, nb, guards):
+        for _ in range(rng.randint(0, 4)):
+            dice = rng.random()
+            if dice < 0.6:
+                k, v = rng.choice(keys), value()
+                rb[k] = v
+                nb[k] = v
+            elif dice < 0.9:
+                k = rng.choice(keys)
+                del rb[k]
+                del nb[k]
+            else:
+                a, b = key_range()
+                rb.delete_range(a, b)
+                nb.delete_range(a, b)
+        if not guards:
+            return
+        for k in rng.sample(keys, rng.randint(0, 2)):
+            guard = rng.choice(["present", "absent", "unchanged", "unchanged"])
+            getattr(rb, f"ensure_{guard}")(k)
+            getattr(nb, f"ensure_{guard}")(k)
+        if rng.random() < 0.3:
+            a, b = key_range()
+            rb.ensure_range_unchanged(a, b)
+            nb.ensure_range_unchanged(a, b)
+
+    def finish(r_ctx, n_ctx):
+        """Exits both contexts: the commit sequence, or "conflict"."""
+        outcomes = []
+        for ctx, txn in (r_ctx, n_ctx):
+            try:
+                ctx.__exit__(None, None, None)
+                outcomes.append(txn.result.sequence)
+            except (ref.ConflictError, bc.ConflictError):
+                outcomes.append("conflict")
+        return outcomes
+
     for step in range(1500):
         dice = rng.random()
         sync = rng.random() < 0.1
-        ro, no = ref.WriteOptions(sync=sync), native_write_options(bc, sync)
         where = f"seed {seed} step {step}"
         if dice < 0.30:
             k, v = rng.choice(keys), value()
-            assert commit(r.put(k, v, ro)) == commit(n.put(k, v, no)), where
+            assert r.put(k, v, sync=sync).sequence == n.put(k, v, sync=sync).sequence, where
         elif dice < 0.40:
             k = rng.choice(keys)
-            assert commit(r.del_(k, ro)) == commit(n.del_(k, no)), where
+            rr, nr = r.delete(k, sync=sync), n.delete(k, sync=sync)
+            assert (rr and rr.sequence) == (nr and nr.sequence), where
         elif dice < 0.45:
             a, b = key_range()
-            assert commit(r.del_range(a, b, ro)) == commit(n.del_range(a, b, no)), where
-        elif dice < 0.65:
-            pair = snaps.pop(rng.randrange(len(snaps))) if snaps and rng.random() < 0.6 else None
-            rp = ref.WritePlan(pair[0]) if pair else ref.WritePlan()
-            np_ = bc.WritePlan(pair[1]) if pair else bc.WritePlan()
-            for _ in range(rng.randint(0, 4)):
-                kind = rng.random()
-                if kind < 0.6:
-                    k, v = rng.choice(keys), value()
-                    rp.put(k, v), np_.put(k, v)
-                elif kind < 0.9:
-                    k = rng.choice(keys)
-                    rp.del_(k), np_.del_(k)
-                else:
-                    a, b = key_range()
-                    rp.del_range(a, b), np_.del_range(a, b)
-            guarded = rng.sample(keys, rng.randint(0, 2))
-            for k in guarded:
-                kinds = ["present", "absent"] + (["unchanged"] * 2 if pair else [])
-                kind = rng.choice(kinds)
-                getattr(rp, f"ensure_{kind}")(k), getattr(np_, f"ensure_{kind}")(k)
-            if pair and rng.random() < 0.3:
-                a, b = key_range()
-                rp.ensure_range_unchanged(a, b), np_.ensure_range_unchanged(a, b)
-            assert commit(r.apply_batch(rp, ro)) == commit(n.apply_batch(np_, no)), where
-        elif dice < 0.75:
+            assert (r.delete_range(a, b, sync=sync).sequence
+                    == n.delete_range(a, b, sync=sync).sequence), where
+        elif dice < 0.55:
+            r_ctx, n_ctx = r.batch(sync=sync), n.batch(sync=sync)
+            stage(r_ctx.__enter__(), n_ctx.__enter__(), guards=False)
+            outcome = finish((r_ctx, r_ctx._batch), (n_ctx, n_ctx._batch))
+            assert outcome[0] == outcome[1], where
+        elif dice < 0.62:
+            r_ctx, n_ctx = r.transaction(sync=sync), n.transaction(sync=sync)
+            open_txns.append((r_ctx, r_ctx.__enter__(), n_ctx, n_ctx.__enter__()))
+        elif dice < 0.72 and open_txns:
+            r_ctx, r_txn, n_ctx, n_txn = open_txns.pop(rng.randrange(len(open_txns)))
+            stage(r_txn, n_txn, guards=True)
+            for k in rng.sample(keys, 3):  # reads see the transaction's own writes
+                assert r_txn.get(k) == n_txn.get(k), (where, k)
+                assert (k in r_txn) == (k in n_txn), (where, k)
+            outcome = finish((r_ctx, r_txn), (n_ctx, n_txn))
+            assert outcome[0] == outcome[1], where
+        elif dice < 0.78:
             snaps.append((r.snapshot(), n.snapshot()))
             if len(snaps) > 8:
                 snaps.pop(0)
-        elif dice < 0.93:
+        elif dice < 0.94:
             assert_same_reads(r, n, rng, keys, where)
             if snaps:
                 rs, ns = rng.choice(snaps)
                 assert_same_reads(rs, ns, rng, keys, where + " (snapshot)")
-        elif dice < 0.96:
+        elif dice < 0.97:
             n.vacuum()
         else:
+            open_txns.clear()
             snaps.clear()
-            r.close(), n.close()
-            r = ref.DB.open(tmp_path / "ref", ref.Options(max_file_bytes=max_file_bytes))
-            n = bc.DB.open(str(tmp_path / "native"), native_options(bc, max_file_bytes))
-    assert list(r.iter_from()) == list(n.iter_from())
-    r.close(), n.close()
+            r.close()
+            n.close()
+            r, n = open_both()
+    assert list(r.items()) == list(n.items())
+    r.close()
+    n.close()
 
 
 def fill(put, rng):
-    for i in range(300):
-        put(f"k{rng.randrange(100):03}".encode(), bytes(rng.randrange(256) for _ in range(rng.randint(0, 30))))
+    for _ in range(300):
+        put(f"k{rng.randrange(100):03}".encode(),
+            bytes(rng.randrange(256) for _ in range(rng.randint(0, 30))))
 
 
 def test_native_opens_reference_files(tmp_path, bc):
     rng = random.Random(1)
-    with ref.DB.open(tmp_path, ref.Options(max_file_bytes=1024)) as r:
-        fill(lambda k, v: r.put(k, v, NO_SYNC), rng)
-        plan = ref.WritePlan()
-        plan.del_range(b"k010", b"k020")
-        plan.del_(b"k050")
-        r.apply_batch(plan)
-        expected = list(r.iter_from())
-    n = bc.DB.open(str(tmp_path), native_options(bc, 1024))
-    assert list(n.iter_from()) == expected
-    n.close()
+    with ref.DB.open(tmp_path, max_file_bytes=1024) as r:
+        fill(lambda k, v: r.put(k, v, sync=False), rng)
+        with r.batch() as b:
+            b.delete_range(b"k010", b"k020")
+            del b[b"k050"]
+        expected = list(r.items())
+    with bc.DB.open(str(tmp_path), max_file_bytes=1024) as n:
+        assert list(n.items()) == expected
 
 
 def test_reference_opens_native_files(tmp_path, bc):
     rng = random.Random(2)
-    n = bc.DB.open(str(tmp_path), native_options(bc, 1024))
-    fill(lambda k, v: n.put(k, v, native_write_options(bc, False)), rng)
-    plan = bc.WritePlan()
-    plan.del_range(b"k010", b"k020")
-    plan.del_(b"k050")
-    n.apply_batch(plan)
-    fill(lambda k, v: n.put(k, v, native_write_options(bc, False)), rng)
-    while n.vacuum():
-        pass
-    expected = list(n.iter_from())
-    n.close()
-    with ref.DB.open(tmp_path, ref.Options(max_file_bytes=1024)) as r:
-        assert list(r.iter_from()) == expected
+    with bc.DB.open(str(tmp_path), max_file_bytes=1024) as n:
+        fill(lambda k, v: n.put(k, v, sync=False), rng)
+        with n.batch() as b:
+            b.delete_range(b"k010", b"k020")
+            del b[b"k050"]
+        fill(lambda k, v: n.put(k, v, sync=False), rng)
+        while n.vacuum():
+            pass
+        expected = list(n.items())
+    with ref.DB.open(tmp_path, max_file_bytes=1024) as r:
+        assert list(r.items()) == expected

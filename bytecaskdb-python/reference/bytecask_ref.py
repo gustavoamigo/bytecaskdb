@@ -7,7 +7,7 @@ The whole engine is two ideas:
 
 1. **The data file is the only record.** Every write is an append of
    CRC-checked entries to the active data file. A batch is framed by a
-   BulkBegin and a BulkEnd entry, so it is on disk whole or not at all.
+   BULK_BEGIN and a BULK_END entry, so it is on disk whole or not at all.
    Opening a database replays the data files in sequence order.
 2. **The key directory is an immutable tree in memory.** It maps each key to
    the location of its newest record (file, offset, sequence). A write builds
@@ -18,15 +18,24 @@ Writers take one lock; readers never do. A write is appended (and synced, if
 asked) before its tree is published, so nothing becomes visible before it is
 on disk.
 
+The API is the one ``bytecaskdb.DB`` offers (bytecaskdb/ext.py)::
+
+    with DB.open("my_db") as db:
+        db[b"user:1"] = b"alice"
+        with db.transaction() as txn:          # raises ConflictError on conflict
+            txn[b"user:2"] = txn[b"user:1"]
+        for key, value in db.prefix(b"user:"):
+            ...
+
 Files are the engine's V01 format (docs/file_format.md): the C++ engine opens
 a database written here, and this opens one the engine wrote.
 
 Left out, because none of it changes what a read returns: hint files, vacuum,
 group commit, the buffer pool, preallocation, replication, degraded mode and
-the directory lock. The tree (persistent_tree.py, CRC-32C in checksum.py) is a
-plain unbalanced BST that stores keys; the engine's is a B+ tree whose leaves
-hold no key bytes. Sorted inserts make it a list, so it is for reading and
-testing, not for loads.
+the directory lock. The tree (persistent_tree.py) is a plain unbalanced BST
+that stores keys; the engine's is a B+ tree whose leaves hold no key bytes.
+Sorted inserts make it a list, so this is for reading and testing, not for
+loads.
 """
 
 from __future__ import annotations
@@ -37,28 +46,31 @@ import secrets
 import struct
 import threading
 import time
-from dataclasses import dataclass
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, NamedTuple
+from typing import NamedTuple
 
 from checksum import crc32c
 from persistent_tree import PersistentTree
 
-# ---------------------------------------------------------------------------
-# Data file entries
+MAX_KEY_BYTES = 4096
+MAX_VALUE_BYTES = 4 * 1024 * 1024
+
+
+# ── Data file entries ────────────────────────────────────────────────────────
 #
 #   sequence u64 | type u8 | key_size u16 | value_size u32 | key | value | crc32c u32
 #
 # all little-endian; the CRC covers everything before it.
-# ---------------------------------------------------------------------------
 
 
 class EntryType(enum.IntEnum):
-    Put = 1
-    Delete = 2
-    BulkBegin = 3
-    BulkEnd = 4
-    RangeDel = 5  # key = range start, value = range end (exclusive)
+    PUT = 1
+    DELETE = 2
+    BULK_BEGIN = 3
+    BULK_END = 4
+    RANGE_DELETE = 5  # key = range start, value = range end (exclusive)
 
 
 _HEADER = struct.Struct("<QBHI")
@@ -68,69 +80,70 @@ _CRC = struct.Struct("<I")
 class Entry(NamedTuple):
     sequence: int
     type: EntryType
-    key: bytes
-    value: bytes
+    key: bytes = b""
+    value: bytes = b""
 
+    def encode(self) -> bytes:
+        body = _HEADER.pack(self.sequence, self.type, len(self.key), len(self.value))
+        body += self.key + self.value
+        return body + _CRC.pack(crc32c(body))
 
-def encode_entry(e: Entry) -> bytes:
-    body = _HEADER.pack(e.sequence, e.type, len(e.key), len(e.value)) + e.key + e.value
-    return body + _CRC.pack(crc32c(body))
-
-
-def decode_entry(buf: bytes, off: int, verify: bool = True) -> tuple[Entry, int] | None:
-    """The entry at off and the offset past it, or None if none parses there."""
-    if off + _HEADER.size > len(buf):
-        return None
-    seq, typ, key_size, value_size = _HEADER.unpack_from(buf, off)
-    if typ not in EntryType._value2member_map_:
-        return None  # 0 is never a valid type: zeros are unwritten space
-    key_at = off + _HEADER.size
-    value_at = key_at + key_size
-    end = value_at + value_size + _CRC.size
-    if end > len(buf):
-        return None
-    if verify:
-        (crc,) = _CRC.unpack_from(buf, end - _CRC.size)
-        if crc != crc32c(buf[off : end - _CRC.size]):
+    @classmethod
+    def decode(cls, buf: bytes, offset: int, verify: bool = True) -> tuple[Entry, int] | None:
+        """The entry at offset and the offset past it, or None if none parses there."""
+        if offset + _HEADER.size > len(buf):
             return None
-    return Entry(seq, EntryType(typ), bytes(buf[key_at:value_at]), bytes(buf[value_at : end - _CRC.size])), end
+        sequence, raw_type, key_size, value_size = _HEADER.unpack_from(buf, offset)
+        try:
+            entry_type = EntryType(raw_type)
+        except ValueError:  # 0 is never a type: zeros are unwritten space
+            return None
+        key_at = offset + _HEADER.size
+        value_at = key_at + key_size
+        crc_at = value_at + value_size
+        end = crc_at + _CRC.size
+        if end > len(buf):
+            return None
+        if verify and _CRC.unpack_from(buf, crc_at)[0] != crc32c(buf[offset:crc_at]):
+            return None
+        entry = cls(sequence, entry_type, bytes(buf[key_at:value_at]), bytes(buf[value_at:crc_at]))
+        return entry, end
 
 
 def scan_committed(buf: bytes) -> tuple[list[tuple[int, Entry]], int]:
     """The committed entries of a data file, with their offsets, and the
     offset where committed data ends.
 
-    A batch counts only once its BulkEnd is read: a crash that tore it leaves
-    a BulkBegin without one, and none of the batch survives.
+    A batch counts only once its BULK_END is read: a crash that tore it leaves
+    a BULK_BEGIN without one, and none of the batch survives.
     """
     committed: list[tuple[int, Entry]] = []
     batch: list[tuple[int, Entry]] | None = None
-    end = off = 0
-    while (parsed := decode_entry(buf, off)) is not None:
-        entry, nxt = parsed
-        if entry.type == EntryType.BulkBegin:
-            if batch is not None:
-                break
-            batch = [(off, entry)]
-        elif entry.type == EntryType.BulkEnd:
-            if batch is None:
-                break
-            committed += batch + [(off, entry)]
-            batch = None
-            end = nxt
-        elif batch is not None:
-            batch.append((off, entry))
-        else:
-            committed.append((off, entry))
-            end = nxt
-        off = nxt
+    end = offset = 0
+    while (parsed := Entry.decode(buf, offset)) is not None:
+        entry, next_offset = parsed
+        match entry.type:
+            case EntryType.BULK_BEGIN if batch is None:
+                batch = [(offset, entry)]
+            case EntryType.BULK_END if batch is not None:
+                committed += [*batch, (offset, entry)]
+                batch = None
+                end = next_offset
+            case EntryType.BULK_BEGIN | EntryType.BULK_END:
+                break  # a marker out of place: damage
+            case _ if batch is not None:
+                batch.append((offset, entry))
+            case _:
+                committed.append((offset, entry))
+                end = next_offset
+        offset = next_offset
     return committed, end
 
 
-# ---------------------------------------------------------------------------
-# The key directory: an immutable sorted map from key to the location of the
-# key's newest record. Every write publishes a new one; a snapshot keeps one.
-# ---------------------------------------------------------------------------
+# ── The key directory ────────────────────────────────────────────────────────
+#
+# An immutable sorted map from each key to the location of its newest record.
+# Every write publishes a new version; a snapshot keeps one.
 
 
 class Location(NamedTuple):
@@ -142,46 +155,101 @@ class Location(NamedTuple):
 KeyDir = PersistentTree[bytes, Location]
 
 
-def apply_entry(keydir: KeyDir, file_id: int, offset: int, e: Entry) -> KeyDir:
-    """The key directory after entry e, written at (file_id, offset).
+def apply_entry(keydir: KeyDir, file_id: int, offset: int, entry: Entry) -> KeyDir:
+    """The key directory after entry, written at (file_id, offset).
 
     Both the write path and recovery go through here: opening a database is
     replaying its writes.
     """
-    if e.type == EntryType.Put:
-        return keydir.set(e.key, Location(file_id, offset, e.sequence))
-    if e.type == EntryType.Delete:
-        return keydir.discard(e.key)
-    if e.type == EntryType.RangeDel:
-        for key, _ in list(keydir.ascending(e.key, e.value)):
-            keydir = keydir.remove(key)
-    return keydir  # BulkBegin / BulkEnd: structure only
+    match entry.type:
+        case EntryType.PUT:
+            return keydir.set(entry.key, Location(file_id, offset, entry.sequence))
+        case EntryType.DELETE:
+            return keydir.discard(entry.key)
+        case EntryType.RANGE_DELETE:
+            for key, _ in list(keydir.ascending(entry.key, entry.value)):
+                keydir = keydir.remove(key)
+            return keydir
+        case EntryType.BULK_BEGIN | EntryType.BULK_END:
+            return keydir
 
 
-# ---------------------------------------------------------------------------
-# Public API — mirrors bytecaskdb._bytecaskdb (bytecaskdb-python)
-# ---------------------------------------------------------------------------
+def _sequence(location: Location | None) -> int:
+    return 0 if location is None else location.sequence
+
+
+def _range_changed(now: KeyDir, then: KeyDir, start: bytes, stop: bytes) -> bool:
+    """Whether any key in [start, stop) was written, or erased, between two versions.
+
+    A key created and erased in between is absent from both, and does not count.
+    """
+    if any(loc.sequence != _sequence(then.get(k)) for k, loc in now.ascending(start, stop)):
+        return True
+    return any(k not in now for k, _ in then.ascending(start, stop))
+
+
+# ── Plans: writes and the preconditions they commit under ────────────────────
+
+
+class _Guard(enum.Enum):
+    PRESENT = enum.auto()
+    ABSENT = enum.auto()
+    UNCHANGED = enum.auto()  # since the plan's snapshot
+
+
+@dataclass
+class _Plan:
+    """Writes to apply atomically, if every guard holds.
+
+    With a snapshot, every key the plan writes must also be unchanged since it.
+    """
+
+    snapshot: KeyDir | None = None
+    writes: list[Entry] = field(default_factory=list)  # sequences assigned at commit
+    guards: dict[bytes, _Guard] = field(default_factory=dict)
+    range_guards: list[tuple[bytes, bytes]] = field(default_factory=list)
+
+    def guard(self, key: bytes, guard: _Guard) -> None:
+        if self.guards.setdefault(key, guard) is not guard:
+            raise ValueError("contradictory guards on the same key")
+
+    def holds(self, head: KeyDir) -> bool:
+        snap = self.snapshot if self.snapshot is not None else KeyDir()
+        for key, guard in self.guards.items():
+            location = head.get(key)
+            match guard:
+                case _Guard.PRESENT if location is None:
+                    return False
+                case _Guard.ABSENT if location is not None:
+                    return False
+                case _Guard.UNCHANGED if _sequence(location) != _sequence(snap.get(key)):
+                    return False
+        if any(_range_changed(head, snap, start, stop) for start, stop in self.range_guards):
+            return False
+        if self.snapshot is None:
+            return True
+        for write in self.writes:
+            if write.type is EntryType.RANGE_DELETE:
+                if _range_changed(head, snap, write.key, write.value):
+                    return False
+            elif _sequence(head.get(write.key)) != _sequence(snap.get(write.key)):
+                return False
+        return True
+
+
+# ── Public API: the one bytecaskdb.DB offers ─────────────────────────────────
+
+
+class ByteCaskError(Exception):
+    """Base for this module's errors."""
+
+
+class ConflictError(ByteCaskError):
+    """A transaction lost to a concurrent write; nothing was written."""
 
 
 class DbClosed(ValueError):
     """Raised by every operation after close()."""
-
-
-@dataclass
-class Options:
-    max_file_bytes: int = 64 * 1024 * 1024
-    max_key_bytes: int = 4096
-    max_value_bytes: int = 4 * 1024 * 1024
-
-
-@dataclass
-class WriteOptions:
-    sync: bool = True
-
-
-@dataclass
-class ReadOptions:
-    verify_checksums: bool = True
 
 
 @dataclass(frozen=True)
@@ -190,261 +258,343 @@ class CommitResult:
     durable: bool  # fdatasync confirmed it before return
 
 
-class Snapshot:
-    """A read-only view of the database at one instant: a key directory.
+class _Reads:
+    """Dict-like reads and ordered scans over one version of the key directory."""
 
-    Unlike the native binding's, it is not consumed by WritePlan; an immutable
-    tree can be shared freely.
-    """
+    def _version(self) -> tuple[DB, KeyDir]:
+        raise NotImplementedError
 
-    def __init__(self, db: DB, keydir: KeyDir):
+    def __getitem__(self, key: bytes) -> bytes:
+        value = self.get(key)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+    def __contains__(self, key: bytes) -> bool:
+        return key in self._version()[1]
+
+    def get(self, key: bytes, default: bytes | None = None, *,
+            verify_checksums: bool = False) -> bytes | None:
+        db, keydir = self._version()
+        location = keydir.get(key)
+        if location is None:
+            return default
+        return db._read_value(key, location, verify_checksums)
+
+    def items(self, start: bytes = b"", *,
+              verify_checksums: bool = False) -> Iterator[tuple[bytes, bytes]]:
+        """(key, value) pairs from start, ascending. Values are read as the scan reaches them."""
+        db, keydir = self._version()
+        for key, location in keydir.ascending(start):
+            yield key, db._read_value(key, location, verify_checksums)
+
+    def keys(self, start: bytes = b"") -> Iterator[bytes]:
+        for key, _ in self._version()[1].ascending(start):
+            yield key
+
+    def ritems(self, start: bytes = b"", *,
+               verify_checksums: bool = False) -> Iterator[tuple[bytes, bytes]]:
+        """(key, value) pairs at or below start, descending; from the last key if start is b""."""
+        db, keydir = self._version()
+        for key, location in keydir.descending(start or None):
+            yield key, db._read_value(key, location, verify_checksums)
+
+    def rkeys(self, start: bytes = b"") -> Iterator[bytes]:
+        for key, _ in self._version()[1].descending(start or None):
+            yield key
+
+    def prefix(self, pfx: bytes, *,
+               verify_checksums: bool = False) -> Iterator[tuple[bytes, bytes]]:
+        for key, value in self.items(pfx, verify_checksums=verify_checksums):
+            if not key.startswith(pfx):
+                return
+            yield key, value
+
+    def rprefix(self, pfx: bytes, *,
+                verify_checksums: bool = False) -> Iterator[tuple[bytes, bytes]]:
+        upper = _prefix_upper(pfx)
+        for key, value in self.ritems(upper, verify_checksums=verify_checksums):
+            if upper and key >= upper:
+                continue
+            if not key.startswith(pfx):
+                return
+            yield key, value
+
+
+def _prefix_upper(prefix: bytes) -> bytes:
+    """The least key above every key starting with prefix; b"" if there is none."""
+    stripped = prefix.rstrip(b"\xff")
+    return stripped[:-1] + bytes([stripped[-1] + 1]) if stripped else b""
+
+
+class Snapshot(_Reads):
+    """A read-only view of the database at one instant: one key directory."""
+
+    def __init__(self, db: DB, keydir: KeyDir) -> None:
         self._db = db
         self._keydir = keydir
 
-    def get(self, key: bytes, opts: ReadOptions | None = None) -> bytes | None:
-        loc = self._keydir.get(key)
-        return None if loc is None else self._db._read_value(key, loc, opts)
-
-    def contains_key(self, key: bytes, opts: ReadOptions | None = None) -> bool:
-        return key in self._keydir
-
-    def iter_from(self, from_key: bytes = b"", opts: ReadOptions | None = None) -> Iterator[tuple[bytes, bytes]]:
-        for key, loc in self._keydir.ascending(from_key):
-            yield key, self._db._read_value(key, loc, opts)
-
-    def keys_from(self, from_key: bytes = b"", opts: ReadOptions | None = None) -> Iterator[bytes]:
-        for key, _ in self._keydir.ascending(from_key):
-            yield key
-
-    def riter_from(self, from_key: bytes = b"", opts: ReadOptions | None = None) -> Iterator[tuple[bytes, bytes]]:
-        for key, loc in self._keydir.descending(from_key or None):
-            yield key, self._db._read_value(key, loc, opts)
-
-    def rkeys_from(self, from_key: bytes = b"", opts: ReadOptions | None = None) -> Iterator[bytes]:
-        for key, _ in self._keydir.descending(from_key or None):
-            yield key
+    def _version(self) -> tuple[DB, KeyDir]:
+        return self._db, self._keydir
 
     def __enter__(self) -> Snapshot:
         return self
 
-    def __exit__(self, *args: object) -> None:
+    def __exit__(self, *exc: object) -> None:
         pass
 
 
-class WritePlan:
-    """Writes applied atomically by DB.apply_batch, under preconditions.
+class Batch:
+    """Writes committed atomically when the ``with db.batch()`` block exits."""
 
-    With a snapshot, every key the plan writes must be unchanged since that
-    snapshot, or the plan conflicts.
+    def __init__(self) -> None:
+        self._plan = _Plan()
+        self.result: CommitResult | None = None
+
+    def __setitem__(self, key: bytes, value: bytes) -> None:
+        self.put(key, value)
+
+    def __delitem__(self, key: bytes) -> None:
+        self.delete(key)
+
+    def put(self, key: bytes, value: bytes) -> None:
+        self._plan.writes.append(Entry(0, EntryType.PUT, bytes(key), bytes(value)))
+
+    def delete(self, key: bytes) -> None:
+        self._plan.writes.append(Entry(0, EntryType.DELETE, bytes(key)))
+
+    def delete_range(self, from_key: bytes, to_key: bytes) -> None:
+        self._plan.writes.append(
+            Entry(0, EntryType.RANGE_DELETE, bytes(from_key), bytes(to_key)))
+
+
+class Transaction(Batch, Snapshot):
+    """A batch read from, and checked against, the snapshot taken when it began.
+
+    Point reads see the transaction's own writes; scans read the snapshot only.
+    It commits when the ``with db.transaction()`` block exits, and raises
+    ConflictError instead if a key it writes, or guards, changed meanwhile.
     """
 
-    def __init__(self, snapshot: Snapshot | None = None):
-        self._snap = snapshot
-        self._writes: list[tuple[EntryType, bytes, bytes]] = []
-        self._guards: dict[bytes, str] = {}
-        self._range_guards: list[tuple[bytes, bytes]] = []
+    def __init__(self, db: DB, keydir: KeyDir) -> None:
+        Batch.__init__(self)
+        Snapshot.__init__(self, db, keydir)
+        self._plan.snapshot = keydir
+        self._pending: dict[bytes, bytes | None] = {}  # None: deleted here
+        self._deleted_ranges: list[tuple[bytes, bytes]] = []
+
+    def _own_write(self, key: bytes) -> tuple[bool, bytes | None]:
+        """Whether this transaction wrote key, and the value it left (None: deleted)."""
+        if key in self._pending:
+            return True, self._pending[key]
+        if any(lo <= key < hi for lo, hi in self._deleted_ranges):
+            return True, None
+        return False, None
+
+    def get(self, key: bytes, default: bytes | None = None, *,
+            verify_checksums: bool = False) -> bytes | None:
+        written, value = self._own_write(key)
+        if written:
+            return default if value is None else value
+        return super().get(key, default, verify_checksums=verify_checksums)
+
+    def __contains__(self, key: bytes) -> bool:
+        written, value = self._own_write(key)
+        return value is not None if written else super().__contains__(key)
+
+    def put(self, key: bytes, value: bytes) -> None:
+        super().put(key, value)
+        self._pending[bytes(key)] = bytes(value)
+
+    def delete(self, key: bytes) -> None:
+        super().delete(key)
+        self._pending[bytes(key)] = None
+
+    def delete_range(self, from_key: bytes, to_key: bytes) -> None:
+        super().delete_range(from_key, to_key)
+        self._deleted_ranges.append((from_key, to_key))
+        for key in self._pending:
+            if from_key <= key < to_key:
+                self._pending[key] = None
+
+    def ensure_present(self, key: bytes) -> None:
+        self._plan.guard(bytes(key), _Guard.PRESENT)
+
+    def ensure_absent(self, key: bytes) -> None:
+        self._plan.guard(bytes(key), _Guard.ABSENT)
+
+    def ensure_unchanged(self, key: bytes) -> None:
+        self._plan.guard(bytes(key), _Guard.UNCHANGED)
+
+    def ensure_range_unchanged(self, from_key: bytes, to_key: bytes) -> None:
+        self._plan.range_guards.append((bytes(from_key), bytes(to_key)))
 
     @property
     def has_snapshot(self) -> bool:
-        return self._snap is not None
-
-    def put(self, key: bytes, value: bytes) -> None:
-        self._writes.append((EntryType.Put, bytes(key), bytes(value)))
-
-    def del_(self, key: bytes) -> None:
-        self._writes.append((EntryType.Delete, bytes(key), b""))
-
-    def del_range(self, from_key: bytes, to_key: bytes) -> None:
-        self._writes.append((EntryType.RangeDel, bytes(from_key), bytes(to_key)))
-
-    def ensure_present(self, key: bytes) -> None:
-        self._guard(key, "present")
-
-    def ensure_absent(self, key: bytes) -> None:
-        self._guard(key, "absent")
-
-    def ensure_unchanged(self, key: bytes) -> None:
-        if self._snap is None:
-            raise ValueError("WritePlan::ensure_unchanged requires a snapshot")
-        self._guard(key, "unchanged")
-
-    def ensure_range_unchanged(self, from_key: bytes, to_key: bytes) -> None:
-        if self._snap is None:
-            raise ValueError("WritePlan::ensure_range_unchanged requires a snapshot")
-        self._range_guards.append((bytes(from_key), bytes(to_key)))
-
-    def _guard(self, key: bytes, kind: str) -> None:
-        if self._guards.setdefault(bytes(key), kind) != kind:
-            raise ValueError("WritePlan: contradictory guards on same key")
-
-
-def _seq(loc: Location | None) -> int:
-    return 0 if loc is None else loc.sequence
-
-
-def _range_changed(now: KeyDir, then: KeyDir, start: bytes, end: bytes) -> bool:
-    """Whether any key in [start, end) was written, or erased, between two trees.
-
-    A key created and erased in between is absent from both, and does not count.
-    """
-    if any(loc.sequence != _seq(then.get(k)) for k, loc in now.ascending(start, end)):
         return True
-    return any(k not in now for k, _ in then.ascending(start, end))
 
 
-def _preconditions_hold(plan: WritePlan, head: KeyDir) -> bool:
-    snap = plan._snap._keydir if plan._snap is not None else KeyDir()
-    for key, kind in plan._guards.items():
-        loc = head.get(key)
-        if kind == "present" and loc is None:
-            return False
-        if kind == "absent" and loc is not None:
-            return False
-        if kind == "unchanged" and _seq(loc) != _seq(snap.get(key)):
-            return False
-    for start, end in plan._range_guards:
-        if _range_changed(head, snap, start, end):
-            return False
-    if plan._snap is None:
-        return True
-    # Every key the plan writes must be as the snapshot saw it.
-    for typ, key, value in plan._writes:
-        if typ == EntryType.RangeDel:
-            if _range_changed(head, snap, key, value):
-                return False
-        elif _seq(head.get(key)) != _seq(snap.get(key)):
-            return False
-    return True
+class _Commit:
+    """The context manager behind db.batch() and db.transaction()."""
+
+    def __init__(self, db: DB, batch: Batch, sync: bool) -> None:
+        self._db = db
+        self._batch = batch
+        self._sync = sync
+
+    def __enter__(self) -> Batch:
+        return self._batch
+
+    def __exit__(self, exc_type: type[BaseException] | None, *exc: object) -> None:
+        if exc_type is not None:
+            return  # the block raised: nothing is written
+        self._batch.result = self._db._commit(self._batch._plan, self._sync)
+        if self._batch.result is None:
+            raise ConflictError("Transaction aborted: concurrent modification detected")
 
 
-class DB:
-    def __init__(self, path: Path, opts: Options):
-        """Use DB.open."""
+class DB(_Reads):
+    """A database directory. Open it with DB.open."""
+
+    def __init__(self, path: Path, max_file_bytes: int) -> None:
         self._dir = path
-        self._opts = opts
+        self._max_file_bytes = max_file_bytes
         self._lock = threading.Lock()  # writers only
-        self._fds: dict[int, int] = {}  # file_id -> descriptor, for reads
-        self._keydir: KeyDir = KeyDir()  # the published key directory
-        self._next_seq = 1
+        self._fds: dict[int, int] = {}  # file_id -> descriptor
+        self._keydir = KeyDir()  # the published version; replaced, never changed
+        self._next_sequence = 1
         self._active_id = 0
         self._active_size = 0
         self._closed = False
 
-    @staticmethod
-    def open(path: str | os.PathLike[str], opts: Options | None = None) -> DB:
+    @classmethod
+    def open(cls, path: str | os.PathLike[str], *,
+             max_file_bytes: int = 64 * 1024 * 1024) -> DB:
         """Opens or creates the database at path: replays every data file in
         sequence order, then starts a new active file."""
-        db = DB(Path(path), opts or Options())
+        db = cls(Path(path), max_file_bytes)
         db._dir.mkdir(parents=True, exist_ok=True)
         db._recover()
         db._start_active_file()
         return db
 
-    # --- Reads: lock-free, from whatever key directory is published ---------
+    def __enter__(self) -> DB:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    # ── Reads: lock-free, from whichever version is published ───────────────
+
+    def _version(self) -> tuple[DB, KeyDir]:
+        self._check_open()
+        return self, self._keydir
 
     def snapshot(self) -> Snapshot:
+        return Snapshot(*self._version())
+
+    def _read_value(self, key: bytes, location: Location, verify: bool) -> bytes:
+        """Reads the record at location: one read returns the value."""
         self._check_open()
-        return Snapshot(self, self._keydir)
-
-    def get(self, key: bytes, opts: ReadOptions | None = None) -> bytes | None:
-        return self.snapshot().get(key, opts)
-
-    def contains_key(self, key: bytes, opts: ReadOptions | None = None) -> bool:
-        return self.snapshot().contains_key(key, opts)
-
-    def iter_from(self, from_key: bytes = b"", opts: ReadOptions | None = None) -> Iterator[tuple[bytes, bytes]]:
-        return self.snapshot().iter_from(from_key, opts)
-
-    def keys_from(self, from_key: bytes = b"", opts: ReadOptions | None = None) -> Iterator[bytes]:
-        return self.snapshot().keys_from(from_key, opts)
-
-    def riter_from(self, from_key: bytes = b"", opts: ReadOptions | None = None) -> Iterator[tuple[bytes, bytes]]:
-        return self.snapshot().riter_from(from_key, opts)
-
-    def rkeys_from(self, from_key: bytes = b"", opts: ReadOptions | None = None) -> Iterator[bytes]:
-        return self.snapshot().rkeys_from(from_key, opts)
-
-    def _read_value(self, key: bytes, loc: Location, opts: ReadOptions | None) -> bytes:
-        """Reads the record at loc: one read returns the value."""
-        self._check_open()
-        fd = self._fds[loc.file_id]
-        header = os.pread(fd, _HEADER.size, loc.offset)
+        fd = self._fds[location.file_id]
+        header = os.pread(fd, _HEADER.size, location.offset)
         _, _, key_size, value_size = _HEADER.unpack(header)
         size = _HEADER.size + key_size + value_size + _CRC.size
-        verify = opts is None or opts.verify_checksums
-        parsed = decode_entry(os.pread(fd, size, loc.offset), 0, verify)
-        if parsed is None or parsed[0].key != key or parsed[0].sequence != loc.sequence:
-            raise RuntimeError(f"corrupt record at file {loc.file_id} offset {loc.offset}")
+        parsed = Entry.decode(os.pread(fd, size, location.offset), 0, verify)
+        if parsed is None or parsed[0].key != key or parsed[0].sequence != location.sequence:
+            raise RuntimeError(f"corrupt record in file {location.file_id} at {location.offset}")
         return parsed[0].value
 
-    # --- Writes: one at a time, under the lock -------------------------------
+    # ── Writes: one at a time, under the lock ────────────────────────────────
 
-    def put(self, key: bytes, value: bytes, opts: WriteOptions | None = None) -> CommitResult:
-        plan = WritePlan()
-        plan.put(key, value)
-        result = self.apply_batch(plan, opts)
-        assert result is not None
+    def __setitem__(self, key: bytes, value: bytes) -> None:
+        self.put(key, value)
+
+    def __delitem__(self, key: bytes) -> None:
+        """Deletes key; nothing happens if it is absent."""
+        self.delete(key)
+
+    def put(self, key: bytes, value: bytes, *, sync: bool = True) -> CommitResult:
+        plan = _Plan(writes=[Entry(0, EntryType.PUT, bytes(key), bytes(value))])
+        result = self._commit(plan, sync)
+        assert result is not None  # an unguarded plan cannot conflict
         return result
 
-    def del_(self, key: bytes, opts: WriteOptions | None = None) -> CommitResult | None:
+    def delete(self, key: bytes, *, sync: bool = True) -> CommitResult | None:
         """None if the key was absent: nothing is written."""
-        plan = WritePlan()
-        plan.ensure_present(key)
-        plan.del_(key)
-        return self.apply_batch(plan, opts)
+        plan = _Plan(writes=[Entry(0, EntryType.DELETE, bytes(key))])
+        plan.guard(bytes(key), _Guard.PRESENT)
+        return self._commit(plan, sync)
 
-    def del_range(self, from_key: bytes, to_key: bytes, opts: WriteOptions | None = None) -> CommitResult:
+    def delete_range(self, from_key: bytes, to_key: bytes, *,
+                     sync: bool = True) -> CommitResult:
         """Deletes [from_key, to_key) with one entry, however many keys it holds."""
-        self._check_sizes([(EntryType.RangeDel, from_key, to_key)])
+        write = Entry(0, EntryType.RANGE_DELETE, bytes(from_key), bytes(to_key))
+        _check_sizes([write])
         if from_key >= to_key:
             return CommitResult(0, True)
-        plan = WritePlan()
-        plan.del_range(from_key, to_key)
-        result = self.apply_batch(plan, opts)
+        result = self._commit(_Plan(writes=[write]), sync)
         assert result is not None
         return result
 
-    def apply_batch(self, plan: WritePlan, opts: WriteOptions | None = None) -> CommitResult | None:
-        """Applies every write in plan atomically, or none: None if a
-        precondition failed."""
-        sync = (opts or WriteOptions()).sync
-        self._check_sizes(plan._writes)
+    def batch(self, *, sync: bool = True) -> _Commit:
+        """An atomic batch of writes, committed when the block exits::
+
+            with db.batch() as b:
+                b[b"k1"] = b"v1"
+                del b[b"k2"]
+        """
+        return _Commit(self, Batch(), sync)
+
+    def transaction(self, *, sync: bool = True) -> _Commit:
+        """A snapshot-backed transaction, committed when the block exits::
+
+            with db.transaction() as txn:
+                txn[b"stock"] = str(int(txn[b"stock"]) - 1).encode()
+        """
+        return _Commit(self, Transaction(*self._version()), sync)
+
+    def _commit(self, plan: _Plan, sync: bool) -> CommitResult | None:
+        """Applies every write in plan atomically, or none: None if a guard failed."""
+        _check_sizes(plan.writes)
         with self._lock:
             self._check_open()
-            if not _preconditions_hold(plan, self._keydir):
+            if not plan.holds(self._keydir):
                 return None
-            if not plan._writes:
+            if not plan.writes:
                 if sync:
                     os.fdatasync(self._fds[self._active_id])
                 return CommitResult(0, True)
 
-            # A batch of more than one write is framed, so it lands whole.
-            framed = list(plan._writes)
-            if len(framed) > 1:
-                framed = [(EntryType.BulkBegin, b"", b""), *framed, (EntryType.BulkEnd, b"", b"")]
-            entries = [Entry(self._next_seq + i, t, k, v) for i, (t, k, v) in enumerate(framed)]
+            # More than one write is framed, so the batch lands whole. Every
+            # entry takes a sequence, the markers too.
+            writes = plan.writes
+            if len(writes) > 1:
+                writes = [Entry(0, EntryType.BULK_BEGIN), *writes, Entry(0, EntryType.BULK_END)]
+            entries = [w._replace(sequence=self._next_sequence + i) for i, w in enumerate(writes)]
 
-            # 1. Append, in one write.
-            encoded = [encode_entry(e) for e in entries]
+            # 1. Append, in one write; sync if asked.
+            encoded = [entry.encode() for entry in entries]
             offsets = []
-            at = self._active_size
+            end = self._active_size
             for buf in encoded:
-                offsets.append(at)
-                at += len(buf)
+                offsets.append(end)
+                end += len(buf)
             fd = self._fds[self._active_id]
             _pwrite_all(fd, b"".join(encoded), self._active_size)
             if sync:
                 os.fdatasync(fd)
-            self._active_size = at
-            self._next_seq += len(entries)
+            self._active_size = end
+            self._next_sequence += len(entries)
 
-            # 2. Build the new key directory, then publish it: durable before visible.
+            # 2. Build the next version of the key directory, then publish it:
+            #    durable before visible.
             keydir = self._keydir
-            for e, off in zip(entries, offsets):
-                keydir = apply_entry(keydir, self._active_id, off, e)
+            for entry, offset in zip(entries, offsets):
+                keydir = apply_entry(keydir, self._active_id, offset, entry)
             self._keydir = keydir
 
-            if self._active_size >= self._opts.max_file_bytes:
+            if self._active_size >= self._max_file_bytes:
                 self._rotate()
             return CommitResult(entries[-1].sequence, sync)
 
@@ -459,25 +609,11 @@ class DB:
                 os.close(fd)
             self._fds.clear()
 
-    def __enter__(self) -> DB:
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        self.close()
-
     def _check_open(self) -> None:
         if self._closed:
             raise DbClosed("database is closed")
 
-    def _check_sizes(self, writes: list[tuple[EntryType, bytes, bytes]]) -> None:
-        for typ, key, value in writes:
-            if len(key) > self._opts.max_key_bytes:
-                raise ValueError(f"key size {len(key)} exceeds limit {self._opts.max_key_bytes}")
-            limit = self._opts.max_key_bytes if typ == EntryType.RangeDel else self._opts.max_value_bytes
-            if len(value) > limit:
-                raise ValueError(f"value size {len(value)} exceeds limit {limit}")
-
-    # --- Files ---------------------------------------------------------------
+    # ── Files ────────────────────────────────────────────────────────────────
 
     def _start_active_file(self) -> None:
         stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
@@ -499,34 +635,55 @@ class DB:
         Files never share a sequence, so replaying them in order of their
         first sequence replays every write in the order it was made.
         """
-        scanned = []
-        for file_id, path in enumerate(sorted(self._dir.glob("*.data")), start=1):
-            buf = path.read_bytes()
-            committed, end = scan_committed(buf)
-            first = _HEADER.unpack_from(buf)[0] if len(buf) >= _HEADER.size else 0
-            scanned.append((first, file_id, path, committed, end, buf))
-
-        newest = max((first for first, *_ in scanned), default=0)
-        for first, file_id, path, committed, end, buf in sorted(scanned, key=lambda s: s[0]):
-            if end < len(buf) and any(buf[end:]):
+        paths = sorted(self._dir.glob("*.data"))
+        files = [_ScannedFile.read(file_id, path) for file_id, path in enumerate(paths, start=1)]
+        newest = max((f.first_sequence for f in files), default=0)
+        for f in sorted(files, key=lambda f: f.first_sequence):
+            if f.end < f.size:
                 # Only the file written last can hold a write a crash tore;
                 # damage anywhere else is damage to acknowledged data.
-                if first != newest:
-                    raise RuntimeError(f"corrupt data file {path.name} past offset {end}")
-            if end < len(buf):
-                os.truncate(path, end)
-            self._fds[file_id] = os.open(path, os.O_RDWR)
-            for off, entry in committed:
-                self._keydir = apply_entry(self._keydir, file_id, off, entry)
-                self._next_seq = max(self._next_seq, entry.sequence + 1)
+                if f.has_data_past_end and f.first_sequence != newest:
+                    raise RuntimeError(f"corrupt data file {f.path.name} past offset {f.end}")
+                os.truncate(f.path, f.end)
+            self._fds[f.file_id] = os.open(f.path, os.O_RDWR)
+            for offset, entry in f.committed:
+                self._keydir = apply_entry(self._keydir, f.file_id, offset, entry)
+                self._next_sequence = max(self._next_sequence, entry.sequence + 1)
+
+
+@dataclass
+class _ScannedFile:
+    file_id: int
+    path: Path
+    first_sequence: int  # read without its CRC; 0 if the file has no header
+    committed: list[tuple[int, Entry]]
+    end: int  # where committed data ends
+    size: int
+    has_data_past_end: bool  # anything but zeros after end
+
+    @classmethod
+    def read(cls, file_id: int, path: Path) -> _ScannedFile:
+        buf = path.read_bytes()
+        committed, end = scan_committed(buf)
+        first = _HEADER.unpack_from(buf)[0] if len(buf) >= _HEADER.size else 0
+        return cls(file_id, path, first, committed, end, len(buf), any(buf[end:]))
+
+
+def _check_sizes(writes: list[Entry]) -> None:
+    for write in writes:
+        if len(write.key) > MAX_KEY_BYTES:
+            raise ValueError(f"key size {len(write.key)} exceeds limit {MAX_KEY_BYTES}")
+        limit = MAX_KEY_BYTES if write.type is EntryType.RANGE_DELETE else MAX_VALUE_BYTES
+        if len(write.value) > limit:
+            raise ValueError(f"value size {len(write.value)} exceeds limit {limit}")
 
 
 def _pwrite_all(fd: int, data: bytes, offset: int) -> None:
     view = memoryview(data)
     while view:
-        n = os.pwrite(fd, view, offset)
-        view = view[n:]
-        offset += n
+        written = os.pwrite(fd, view, offset)
+        view = view[written:]
+        offset += written
 
 
 def _sync_dir(path: Path) -> None:

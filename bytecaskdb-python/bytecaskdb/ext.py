@@ -336,7 +336,7 @@ class _Transaction:
             getattr(plan, method)(*args)
         for method, args in self._ops:
             getattr(plan, method)(*args)
-        result = self._db.apply_batch(plan, self._write_opts)
+        self.result = result = self._db.apply_batch(plan, self._write_opts)
         # Release all references — snapshot is consumed, buffers are stale.
         self._raw_snap = None  # type: ignore[assignment]
         self._snap = None  # type: ignore[assignment]
