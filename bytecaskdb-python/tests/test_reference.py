@@ -5,6 +5,8 @@
 # behaviour, a differential run against the native engine through the same
 # API (bytecaskdb.DB), and the file format in both directions.
 
+import errno
+import os
 import random
 import sys
 from pathlib import Path
@@ -106,6 +108,74 @@ def test_damage_in_an_older_file_is_refused(tmp_path):
     oldest.write_bytes(bytes(raw))
     with pytest.raises(RuntimeError, match="corrupt data file"):
         ref.DB.open(tmp_path, max_file_bytes=1)
+
+
+def test_a_failed_sync_stops_writes(tmp_path, monkeypatch):
+    db = ref.DB.open(tmp_path)
+    db[b"a"] = b"1"
+    real = os.fdatasync
+
+    def fail_once(fd):
+        monkeypatch.setattr(os, "fdatasync", real)
+        raise OSError(errno.EIO, "injected")
+
+    monkeypatch.setattr(os, "fdatasync", fail_once)
+    with pytest.raises(OSError):
+        db[b"b"] = b"2"
+    # A sync that succeeds now may not write what the failed one left behind.
+    with pytest.raises(ref.DbDegraded):
+        db.put(b"c", b"3", sync=False)
+    assert db.is_degraded and "injected" in db.degraded_reason
+    assert db[b"a"] == b"1"  # reads go on
+    with pytest.raises(ref.DbDegraded):
+        db.close()
+    with ref.DB.open(tmp_path) as db:  # the failed write may be there or not, never in part
+        assert db[b"a"] == b"1" and db.get(b"b") in (None, b"2") and b"c" not in db
+        db[b"c"] = b"3"
+
+
+def test_a_torn_write_is_cut_at_reopen(tmp_path, monkeypatch):
+    db = ref.DB.open(tmp_path, max_file_bytes=300)
+    db[b"a"] = b"1"
+
+    def write_half(fd, data, offset):
+        os.pwrite(fd, data[: len(data) // 2], offset)
+        raise OSError(errno.ENOSPC, "injected")
+
+    with monkeypatch.context() as m:
+        m.setattr(ref, "_pwrite_all", write_half)
+        with pytest.raises(OSError):
+            with db.batch() as b:
+                b[b"b"] = b"2" * 50
+                b[b"c"] = b"3" * 50
+    with pytest.raises(ref.DbDegraded):
+        db.close()
+    # Reopened, the torn bytes are gone: later writes rotate the file away,
+    # and a tail left in it would make the next open refuse it as damage.
+    with ref.DB.open(tmp_path, max_file_bytes=300) as db:
+        assert list(db.keys()) == [b"a"]
+        for i in range(20):
+            db[f"k{i}".encode()] = b"x" * 40
+    with ref.DB.open(tmp_path, max_file_bytes=300) as db:
+        assert len(list(db.keys())) == 21
+
+
+def test_open_makes_the_newest_file_durable(tmp_path, monkeypatch):
+    with ref.DB.open(tmp_path, max_file_bytes=1) as db:  # a file per write
+        db[b"a"] = b"1"
+        db[b"b"] = b"2"
+    newest, = [p for p in data_files(tmp_path)
+               if (c := ref.scan_committed(p.read_bytes())[0]) and c[0][1].sequence == 2]
+    synced = []
+    real = os.fsync
+
+    def record(fd):
+        synced.append(Path(os.readlink(f"/proc/self/fd/{fd}")))
+        real(fd)
+
+    monkeypatch.setattr(os, "fsync", record)
+    ref.DB.open(tmp_path, max_file_bytes=1).close()
+    assert newest.resolve() in synced
 
 
 def test_transactions(tmp_path):

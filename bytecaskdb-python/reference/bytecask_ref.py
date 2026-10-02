@@ -31,15 +31,28 @@ Files are the engine's V01 format (docs/file_format.md): the C++ engine opens
 a database written here, and this opens one the engine wrote.
 
 Left out, because none of it changes what a read returns: hint files, vacuum,
-group commit, the buffer pool, preallocation, replication, degraded mode and
-the directory lock. The tree (persistent_tree.py) is a plain unbalanced BST
-that stores keys; the engine's is a B+ tree whose leaves hold no key bytes.
-Sorted inserts make it a list, so this is for reading and testing, not for
-loads.
+group commit, the buffer pool, preallocation, replication and resume(). After
+an I/O error on a write, writes stop until the database is reopened.
+
+What the engine guarantees and this does not:
+
+- Exclusive access. There is no directory lock: two processes can open one
+  database and corrupt it.
+- Snapshots that outlive close(). Here reads after close() raise DbClosed.
+- Flat latency. There is no group commit, so every sync write pays for its
+  own fdatasync. The tree (persistent_tree.py) is unbalanced, and sorted
+  inserts make it a list. Range deletes and range guards take time linear in
+  the keys they cover, and opening reads every file whole.
+- Fault testing. The engine's crash, chaos and fault-injection rigs have
+  never run against this; its crash behaviour has unit tests only.
+
+The engine's key directory is a B+ tree whose leaves hold no key bytes; this
+tree stores the keys. It is for reading and testing, not for loads.
 """
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import os
 import secrets
@@ -250,6 +263,11 @@ class ConflictError(ByteCaskError):
 
 class DbClosed(ValueError):
     """Raised by every operation after close()."""
+
+
+class DbDegraded(RuntimeError):
+    """Raised by writes after a write failed with an I/O error. Reads go on;
+    reopen the database to write again."""
 
 
 @dataclass(frozen=True)
@@ -466,6 +484,7 @@ class DB(_Reads):
         self._active_id = 0
         self._active_size = 0
         self._closed = False
+        self._failure: str | None = None  # why writes stopped, after an I/O error
 
     @classmethod
     def open(cls, path: str | os.PathLike[str], *,
@@ -557,8 +576,10 @@ class DB(_Reads):
     def _commit(self, plan: _Plan, sync: bool) -> CommitResult | None:
         """Applies every write in plan atomically, or none: None if a guard failed."""
         _check_sizes(plan.writes)
-        with self._lock:
+        with self._lock, self._stop_writes_on_io_error():
             self._check_open()
+            if self._failure is not None:
+                raise DbDegraded(f"writes stopped after an I/O error: {self._failure}")
             if not plan.holds(self._keydir):
                 return None
             if not plan.writes:
@@ -598,16 +619,50 @@ class DB(_Reads):
                 self._rotate()
             return CommitResult(entries[-1].sequence, sync)
 
+    @contextlib.contextmanager
+    def _stop_writes_on_io_error(self) -> Iterator[None]:
+        """After a failed write or sync, no write is accepted again.
+
+        A failed fdatasync may leave the pages it could not write clean in the
+        page cache, so a later fdatasync reports success without writing them:
+        nothing written before the failure can be trusted to reach the disk,
+        however often it is synced. A failed write may also leave bytes past
+        the end of the active file. Reopening scans the file and rewrites it
+        (see _recover), so the next process starts from what is really there.
+        """
+        try:
+            yield
+        except OSError as e:
+            self._failure = str(e)
+            raise
+
+    @property
+    def is_degraded(self) -> bool:
+        return self._failure is not None
+
+    @property
+    def degraded_reason(self) -> str:
+        return self._failure or ""
+
     def close(self) -> None:
-        """Makes every write durable and closes the files. Idempotent."""
+        """Makes every write durable and closes the files. Idempotent.
+
+        Raises DbDegraded, after closing, if writes stopped on an I/O error:
+        writes acknowledged without sync may then not be durable.
+        """
         with self._lock:
             if self._closed:
                 return
             self._closed = True
-            os.fdatasync(self._fds[self._active_id])
-            for fd in self._fds.values():
-                os.close(fd)
-            self._fds.clear()
+            try:
+                if self._failure is None:
+                    os.fdatasync(self._fds[self._active_id])
+            finally:
+                for fd in self._fds.values():
+                    os.close(fd)
+                self._fds.clear()
+            if self._failure is not None:
+                raise DbDegraded(f"closed after an I/O error: {self._failure}")
 
     def _check_open(self) -> None:
         if self._closed:
@@ -639,12 +694,14 @@ class DB(_Reads):
         files = [_ScannedFile.read(file_id, path) for file_id, path in enumerate(paths, start=1)]
         newest = max((f.first_sequence for f in files), default=0)
         for f in sorted(files, key=lambda f: f.first_sequence):
-            if f.end < f.size:
-                # Only the file written last can hold a write a crash tore;
-                # damage anywhere else is damage to acknowledged data.
-                if f.has_data_past_end and f.first_sequence != newest:
-                    raise RuntimeError(f"corrupt data file {f.path.name} past offset {f.end}")
-                os.truncate(f.path, f.end)
+            # Only the file written last can hold a write a crash tore;
+            # damage anywhere else is damage to acknowledged data.
+            if f.has_data_past_end and f.first_sequence != newest:
+                raise RuntimeError(f"corrupt data file {f.path.name} past offset {f.end}")
+            # Every other file was synced whole before the next was started.
+            # The newest may hold bytes the last process never got to disk.
+            if f.first_sequence == newest or f.end < f.size:
+                _rewrite_durably(f.path, f.end)
             self._fds[f.file_id] = os.open(f.path, os.O_RDWR)
             for offset, entry in f.committed:
                 self._keydir = apply_entry(self._keydir, f.file_id, offset, entry)
@@ -684,6 +741,24 @@ def _pwrite_all(fd: int, data: bytes, offset: int) -> None:
         written = os.pwrite(fd, view, offset)
         view = view[written:]
         offset += written
+
+
+def _rewrite_durably(path: Path, end: int) -> None:
+    """Makes the first end bytes of path durable, and cuts what follows.
+
+    What was read may be only in the page cache: the last process was killed
+    before it synced, or a sync failed and left the pages clean without
+    writing them, where no later sync would. Writing the bytes back dirties
+    them again, so the sync writes them. The cut is synced too, or a power
+    loss could bring back the torn tail in a file that is no longer the newest.
+    """
+    fd = os.open(path, os.O_RDWR)
+    try:
+        _pwrite_all(fd, os.pread(fd, end, 0), 0)
+        os.ftruncate(fd, end)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _sync_dir(path: Path) -> None:
