@@ -15,6 +15,12 @@
 #                          mutexes are in the off-CPU profile, not here.
 #   engine status          SHOW ENGINE ... STATUS and SHOW GLOBAL STATUS at the
 #                          start and end of the capture
+#   variables.txt          SHOW GLOBAL VARIABLES: the settings the server ran
+#                          with — its .cnf (also packed), MariaDB's defaults
+#                          and the command line — and its exact version
+#   error.log              the server's error log, through its shutdown after
+#                          the run: whatever it said while loading, starting
+#                          and stopping
 #
 # The profilers slow the server, so a captured cell's NOPM is not comparable
 # with an uncaptured one; its CSV row says capture=on.
@@ -260,6 +266,8 @@ capture_run() {
   mkdir -p "$out"
   {
     capture_status "$engine" "$socket" > "$out/status_start.txt" || true
+    mariadb --socket="$socket" -u root -e "SHOW GLOBAL VARIABLES" \
+      > "$out/variables.txt" 2>&1 || true
     local samplers=()
     mpstat -P ALL 1 "$CAPTURE_SECONDS" > "$out/mpstat.txt" 2>&1 & samplers+=($!)
     vmstat -w 1 "$CAPTURE_SECONDS" > "$out/vmstat.txt" 2>&1 & samplers+=($!)
@@ -289,8 +297,9 @@ capture_run() {
 # and a description of the host and build. The working directory is removed
 # only once the tarball is complete; otherwise it stays, and the error says
 # where.
-capture_finish() {
-  local out="$1" dest="$2" cnf="$3" run_log="$4"
+capture_finish() {  # capture dir, tarball, file to include...
+  local out="$1" dest="$2"
+  shift 2
   [[ -d "$out" ]] || return 0
   {
     local data
@@ -312,8 +321,8 @@ capture_finish() {
       echo "## git";               git -C "$BYTECASK_ROOT" rev-parse HEAD
                                    git -C "$BYTECASK_ROOT" status --short
     } > "$out/host.txt" 2>&1 || true
-    cp "$cnf" "$out/" || true
-    cp "$run_log" "$out/" || true
+    local f
+    for f in "$@"; do cp "$f" "$out/" || true; done
   } < /dev/null > /dev/null 2>&1
   local err
   if err="$(tar -czf "$dest.partial" -C "$(dirname "$out")" "$(basename "$out")" 2>&1)" &&
@@ -324,4 +333,29 @@ capture_finish() {
     echo "ERROR: could not write $dest: $err" >&2
     echo "       The unpacked capture is still in $out — copy it before the host goes away." >&2
   fi
+}
+
+# This host's name as another machine reaches it: the EC2 public DNS name,
+# which changes each time the instance starts, read from the instance metadata
+# service (IMDSv2); off EC2, or with no public name, the host name.
+capture_public_host() {
+  local token name
+  token="$(curl -sf -m 1 -X PUT http://169.254.169.254/latest/api/token \
+             -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null)" &&
+    name="$(curl -sf -m 1 -H "X-aws-ec2-metadata-token: $token" \
+              http://169.254.169.254/latest/meta-data/public-hostname 2>/dev/null)"
+  echo "${name:-$(uname -n)}"
+}
+
+# Prints a command to paste on your own machine that copies a run's files
+# into ./<local dir>/. Remote paths may be directories or hold globs; they are
+# quoted, so the remote side expands the globs. BENCH_SSH_KEY names the key
+# (default below).
+capture_fetch_hint() {  # local dir, remote path...
+  local dest="$1" host key="${BENCH_SSH_KEY:-~/.ssh/ec2_recovered_key}" p
+  shift
+  host="$(id -un)@$(capture_public_host)"
+  printf 'Fetch with:       mkdir -p %s && scp -r -i %s' "$dest" "$key"
+  for p in "$@"; do printf " '%s:%s'" "$host" "$p"; done
+  printf ' %s/\n' "$dest"
 }
