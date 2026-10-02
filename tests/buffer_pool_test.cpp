@@ -6,6 +6,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -878,4 +879,117 @@ TEST_CASE("BufferPool: readers racing release_file always read the file's "
   for (auto &r : readers) r.join();
   CHECK(bad.load() == 0);
   CHECK(pool.counters().frames_released.load() > 0);
+
+// ---------------------------------------------------------------------------
+// Reservation: the active file's frames admitted ahead of the writer, which
+// then extends them without the pool's lock.
+// ---------------------------------------------------------------------------
+namespace {
+// Appends file's bytes [from, to) to the pool as the active file does, in
+// entry-sized pieces.
+void append_range(bytecask::BufferPool &pool, std::uint32_t file_id, const ScratchFile &file,
+                  std::size_t from, std::size_t to, std::size_t piece) {
+  for (auto at = from; at < to;) {
+    const auto n = std::min(piece, to - at);
+    const auto bytes = file.expected(at, n);
+    pool.append_resident(file_id, at, bytes);
+    at += n;
+  }
+}
+} // namespace
+
+TEST_CASE("BufferPool: the writer extends reserved frames without the lock",
+          "[buffer_pool][reserve]") {
+  ScratchFile file{1024 * 1024};
+  bytecask::BufferPool pool{bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}};
+  REQUIRE(pool.reserve_frames() > 0);
+  pool.set_active_file(7);
+  append_range(pool, 7, file, 0, 1000, 100);
+  REQUIRE(pool.test_wait_reserved());
+  const auto locked = pool.counters().append_locked.load();
+  const auto window = pool.reserve_frames() * bytecask::kPoolFrameBytes;
+  // Everything within the window lands in reserved frames.
+  append_range(pool, 7, file, 1000, window / 2, 300);
+  CHECK(pool.counters().append_locked.load() == locked);
+  CHECK(pool.counters().reserved.load() > 0);
+  // And reads back as written, whatever of it is resident.
+  std::vector<std::byte> got(window / 2);
+  pool.read_at(7, file.fd(), 0, got.size(), window / 2, got.data());
+  CHECK(got == file.expected(0, got.size()));
+}
+
+TEST_CASE("BufferPool: a frame a write reached without pooling is never reserved",
+          "[buffer_pool][reserve]") {
+  // An append that starts inside a frame that is not resident leaves its
+  // bytes on disk only. Reserving that frame empty would let the next
+  // append extend it, and readers would then find garbage before it.
+  ScratchFile file{256 * 1024};
+  bytecask::BufferPool pool{bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}};
+  REQUIRE(pool.reserve_frames() > 0);
+  pool.test_pause_reserver(true);
+  pool.set_active_file(7);
+  append_range(pool, 7, file, 100, 200, 100);  // mid-frame, frame 0 not resident
+  pool.test_pause_reserver(false);
+  REQUIRE(pool.test_wait_reserved());
+  append_range(pool, 7, file, 200, 3 * bytecask::kPoolFrameBytes, 250);
+  // [0, 100) was never appended through the pool: the file on disk has it.
+  std::vector<std::byte> got(3 * bytecask::kPoolFrameBytes);
+  pool.read_at(7, file.fd(), 0, got.size(), got.size(), got.data());
+  CHECK(got == file.expected(0, got.size()));
+}
+
+TEST_CASE("BufferPool: reads stay correct while the writer extends reserved "
+          "frames and readers evict",
+          "[buffer_pool][reserve][concurrency]") {
+  // A small pool, so reservation, reader fills and eviction all contend for
+  // frames; the writer rotates to a second file half way.
+  ScratchFile sealed{512 * 1024};
+  ScratchFile active_a{512 * 1024};
+  ScratchFile active_b{512 * 1024};
+  const std::size_t capacity = 256 * (bytecask::kPoolFrameBytes + 64);
+  bytecask::BufferPool pool{bytecask::BufferPoolOptions{.capacity_bytes = capacity}};
+  REQUIRE(pool.reserve_frames() > 0);
+
+  std::atomic<std::size_t> published_a{0};
+  std::atomic<std::size_t> published_b{0};
+  std::atomic<bool> done{false};
+  std::atomic<int> mismatches{0};
+
+  std::vector<std::thread> readers;
+  for (int t = 0; t < 4; ++t) {
+    readers.emplace_back([&, t] {
+      std::mt19937_64 rng{static_cast<unsigned long long>(t) + 11};
+      std::vector<std::byte> got;
+      while (!done.load()) {
+        const auto pick = rng() % 3;
+        const auto &f = pick == 0 ? sealed : pick == 1 ? active_a : active_b;
+        const std::uint32_t id = pick == 0 ? 1 : pick == 1 ? 7 : 8;
+        const auto size = pick == 0 ? sealed.size() : pick == 1 ? published_a.load() : published_b.load();
+        if (size < 2) continue;
+        const auto len = static_cast<std::size_t>(1 + rng() % std::min<std::size_t>(size - 1, 3000));
+        const auto offset = static_cast<std::size_t>(rng() % (size - len));
+        got.assign(len, std::byte{0});
+        pool.read_at(id, f.fd(), offset, len, size, got.data());
+        if (got != f.expected(offset, len)) mismatches.fetch_add(1);
+      }
+    });
+  }
+
+  const auto write_file = [&](std::uint32_t id, const ScratchFile &f, std::atomic<std::size_t> &published) {
+    pool.set_active_file(id);
+    std::mt19937_64 rng{id};
+    for (std::size_t at = 0; at < f.size();) {
+      const auto n = std::min<std::size_t>(1 + rng() % 400, f.size() - at);
+      pool.append_resident(id, at, f.expected(at, n));
+      at += n;
+      published.store(at);  // readers are bounded by what was published
+    }
+  };
+  write_file(7, active_a, published_a);
+  write_file(8, active_b, published_b);
+  done = true;
+  for (auto &r : readers) r.join();
+  CHECK(mismatches.load() == 0);
+  CHECK(pool.counters().reserved.load() > 0);
+  CHECK(pool.counters().evictions.load() > 0);
 }

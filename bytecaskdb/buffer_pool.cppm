@@ -12,16 +12,19 @@ module;
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <format>
+#include <condition_variable>
 #include <mutex>
 #include <new>
 #include <span>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include <cerrno>
@@ -131,6 +134,10 @@ export struct PoolCounters {
   // fills: they cost no I/O.
   std::atomic<std::int64_t> fills{0};
   std::atomic<std::int64_t> evictions{0};
+  // Active-file frames the reserver admitted ahead of the writer, and append
+  // segments that found no frame ready and took the pool's lock instead.
+  std::atomic<std::int64_t> reserved{0};
+  std::atomic<std::int64_t> append_locked{0};
   std::int64_t frames_total{0};
   // Gauge: frames currently holding a file's bytes. Resident / total is the
   // fill level an operator sizes against.
@@ -223,6 +230,18 @@ private:
 // Values are copied into the caller's buffer, never returned as a span into
 // a frame: frames are reused memory, and a span into one would dangle the
 // moment it was evicted.
+//
+// Reservation. The writer appends under the engine's serial section, and in
+// a full pool nearly every commit starts a new active-file frame: an
+// eviction, an erase and an insert under mu_, which readers' fills contend
+// for. A reserver thread admits the active file's next frames ahead of the
+// writer instead, empty, and the writer extends them without mu_ — found as
+// a reader finds a frame, and written past the size readers are bounded by.
+// A frame is reserved only if none of its bytes were written before: every
+// write into a frame that is not resident takes mu_ and records how far it
+// reached (unpooled_end_), and the reserver, under mu_, starts past that and
+// past everything the writer has published (written_). An append that finds
+// no frame ready takes the locked path, as every append did before.
 // ---------------------------------------------------------------------------
 export class BufferPool {
 public:
@@ -262,6 +281,22 @@ public:
     older_ = std::vector<std::uint32_t>(frame_count_, kNoFrame);
     table_ = std::vector<Slot>(table);
     counters_.frames_total = narrow<std::int64_t>(frame_count_);
+    // Ahead of the writer by at most 2 MiB, and never a large share of a
+    // small pool: reserved frames displace cached ones.
+    reserve_frames_ = std::min<std::size_t>(kReserveFrames, frame_count_ / 16);
+    if (reserve_frames_ < kMinReserveFrames) reserve_frames_ = 0;
+#ifdef BYTECASK_SINGLE_THREADED
+    reserve_frames_ = 0;  // no thread to reserve with
+#endif
+  }
+
+  ~BufferPool() {
+    {
+      std::lock_guard<std::mutex> lk{rmu_};
+      stop_ = true;
+    }
+    rcv_.notify_all();
+    if (reserver_.joinable()) reserver_.join();
   }
 
   BufferPool(const BufferPool &) = delete;
@@ -309,9 +344,8 @@ public:
   // previous active file's frames become ordinary — no sweep, one comparison
   // in the victim check. kNoActiveFile pins nothing.
   static constexpr std::uint32_t kNoActiveFile = ~std::uint32_t{0};
-  void set_active_file(std::uint32_t file_id) noexcept {
-    active_file_id_.store(file_id, std::memory_order_relaxed);
-  }
+  // Also points the reserver at the new file, starting it on first use.
+  void set_active_file(std::uint32_t file_id);
 
   // The writer just appended bytes at [offset, offset + bytes.size()) of the
   // active file. Puts them in the pool so the active file stays resident and
@@ -325,6 +359,35 @@ public:
                        std::span<const std::byte> bytes);
 
   [[nodiscard]] auto direct_io() const noexcept -> bool { return direct_io_; }
+
+  // Frames the reserver keeps ahead of the writer; 0 when the pool is too
+  // small to reserve.
+  [[nodiscard]] auto reserve_frames() const noexcept -> std::size_t { return reserve_frames_; }
+
+#ifdef BYTECASK_TESTING
+  // Holds the reserver between passes, so a test can make writes it must
+  // see before it reserves.
+  void test_pause_reserver(bool paused) {
+    {
+      std::lock_guard<std::mutex> lk{rmu_};
+      paused_ = paused;
+      kick_ = kick_ || !paused;
+    }
+    rcv_.notify_one();
+  }
+  // Waits, up to a few seconds, until a full window past the writer is
+  // reserved or the reserver gave up for want of frames. True if it is.
+  auto test_wait_reserved() -> bool {
+    for (int i = 0; i < 5000; ++i) {
+      const auto w = written_.load(std::memory_order_acquire);
+      const auto r = reserved_.load(std::memory_order_acquire);
+      if (mark_file(r) == mark_file(w) && mark_frame(r) >= mark_frame(w) + reserve_frames_)
+        return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    return false;
+  }
+#endif
 
   // A pool-backed file reports that its filesystem refused O_DIRECT and it
   // will fill through the page cache. Surfaced so a CI run on such a mount
@@ -480,6 +543,103 @@ private:
   }
 
   static constexpr std::uint32_t kNoFrame = ~std::uint32_t{0};
+
+  // Reservation: how far ahead of the writer, in frames, and the least worth
+  // a thread; frames admitted per hold of mu_, so readers' fills wait at most
+  // that long.
+  static constexpr std::size_t kReserveFrames = 512;  // 2 MiB
+  static constexpr std::size_t kMinReserveFrames = 8;
+  static constexpr std::size_t kReserveChunk = 16;
+
+  // (file id, frame index) in one word, for the reservation's progress marks.
+  [[nodiscard]] static constexpr auto mark(std::uint32_t file_id,
+                                           std::uint64_t frame_index) noexcept
+      -> std::uint64_t {
+    return (static_cast<std::uint64_t>(file_id) << 32) | (frame_index & 0xFFFFFFFFULL);
+  }
+  [[nodiscard]] static constexpr auto mark_file(std::uint64_t m) noexcept -> std::uint32_t {
+    return static_cast<std::uint32_t>(m >> 32);
+  }
+  [[nodiscard]] static constexpr auto mark_frame(std::uint64_t m) noexcept -> std::uint64_t {
+    return m & 0xFFFFFFFFULL;
+  }
+
+  // Writes len bytes at in_frame of key's frame if it is resident, without
+  // mu_. Only the active file's appends call it: the frame cannot be
+  // evicted (the hand skips the active file), and the bytes lie past the
+  // size readers are bounded by. False if the frame is not resident.
+  [[nodiscard]] auto extend_unlocked(std::uint64_t key, std::size_t in_frame,
+                                     const std::byte *src, std::size_t len) noexcept
+      -> bool {
+    const auto f = find_pinned(key);
+    if (f == kNoFrame) return false;
+    std::memcpy(frame_bytes(f) + in_frame, src, len);
+    unpin(f);
+    return true;
+  }
+
+  // After an append of the active file: records the writer's position and
+  // wakes the reserver once it is within half a window of the frames
+  // reserved.
+  void after_append(std::uint32_t file_id, std::uint64_t end) {
+    const auto cursor = end / kPoolFrameBytes;
+    written_.store(mark(file_id, cursor), std::memory_order_release);
+    const auto r = reserved_.load(std::memory_order_acquire);
+    if (mark_file(r) == file_id && mark_frame(r) >= cursor + reserve_frames_ / 2) return;
+    if (kick_pending_.exchange(true, std::memory_order_acq_rel)) return;
+    {
+      std::lock_guard<std::mutex> lk{rmu_};
+      kick_ = true;
+    }
+    rcv_.notify_one();
+  }
+
+  void reserve_loop() {
+    std::unique_lock<std::mutex> lk{rmu_};
+    for (;;) {
+      rcv_.wait(lk, [&] { return stop_ || (kick_ && !paused_); });
+      if (stop_) return;
+      kick_ = false;
+      lk.unlock();
+      // Cleared before the pass, so an append during it can wake the next.
+      kick_pending_.store(false, std::memory_order_release);
+      reserve_ahead();
+      lk.lock();
+    }
+  }
+
+  // Admits the active file's frames from the writer's position up to a
+  // window ahead of it, a chunk per hold of mu_. Skips frames already
+  // resident and any a write reached without pooling its bytes. Stops early
+  // when no frame can be claimed; the writer then takes the locked path.
+  void reserve_ahead() {
+    const auto file_id = active_file_id_.load(std::memory_order_acquire);
+    const auto w = written_.load(std::memory_order_acquire);
+    if (file_id == kNoActiveFile || mark_file(w) != file_id) return;
+    const auto target = mark_frame(w) + reserve_frames_;
+    const auto r = reserved_.load(std::memory_order_acquire);
+    auto next = std::max(mark_frame(w), mark_file(r) == file_id ? mark_frame(r) : 0);
+    while (next < target) {
+      std::lock_guard<std::mutex> lk{mu_};
+      if (active_file_id_.load(std::memory_order_relaxed) != file_id) return;
+      const auto floor = unpooled_file_ == file_id
+                             ? align_up(static_cast<std::size_t>(unpooled_end_), kPoolFrameBytes) /
+                                   kPoolFrameBytes
+                             : 0;
+      for (std::size_t n = 0; n < kReserveChunk && next < target; ++n, ++next) {
+        if (next < floor) continue;
+        const auto key = make_key(file_id, next);
+        if (find(key) != kNoSlot) continue;
+        if (!admit(key, &kNothing, 0, true)) {
+          reserved_.store(mark(file_id, next), std::memory_order_release);
+          return;
+        }
+        counters_.reserved.fetch_add(1, std::memory_order_relaxed);
+      }
+      reserved_.store(mark(file_id, next), std::memory_order_release);
+    }
+  }
+  static constexpr std::byte kNothing{};
 
   // Probes for key and returns its frame with a pin held, or kNoFrame with
   // nothing held: a miss, or a race with eviction lost kMaxRetries times, and
@@ -692,6 +852,24 @@ private:
   std::size_t used_frames_{0};
   std::vector<std::uint32_t> free_frames_;  // guarded by mu_
   std::atomic<std::uint32_t> active_file_id_{kNoActiveFile};
+  // Guarded by mu_: the furthest a write of this file reached into a frame
+  // that was not resident, leaving those bytes on disk only. No frame at or
+  // below it is reserved.
+  std::uint32_t unpooled_file_{kNoActiveFile};
+  std::uint64_t unpooled_end_{0};
+  // Reservation. reserve_frames_ is fixed at construction (0: none).
+  // written_ and reserved_ are (file, frame) marks: the writer's position
+  // and the first frame not yet reserved.
+  std::size_t reserve_frames_{0};
+  std::atomic<std::uint64_t> written_{mark(kNoActiveFile, 0)};
+  std::atomic<std::uint64_t> reserved_{mark(kNoActiveFile, 0)};
+  std::atomic<bool> kick_pending_{false};
+  std::mutex rmu_;
+  std::condition_variable rcv_;
+  bool kick_{false};  // guarded by rmu_
+  bool stop_{false};  // guarded by rmu_
+  bool paused_{false};  // guarded by rmu_; tests only
+  std::thread reserver_;  // last: joined before the rest is destroyed
 };
 
 void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
@@ -853,7 +1031,8 @@ void BufferPool::append_resident(std::uint32_t file_id, std::uint64_t offset,
                                  std::span<const std::byte> bytes) {
   if (bytes.empty()) return;
   const auto end = offset + bytes.size();
-  std::lock_guard<std::mutex> lk{mu_};
+  const bool active = file_id == active_file_id_.load(std::memory_order_relaxed);
+  std::unique_lock<std::mutex> lk{mu_, std::defer_lock};
   for (auto f = offset / kPoolFrameBytes; f <= (end - 1) / kPoolFrameBytes; ++f) {
     const auto frame_start = f * kPoolFrameBytes;
     const auto seg_from = std::max(offset, frame_start);
@@ -862,6 +1041,13 @@ void BufferPool::append_resident(std::uint32_t file_id, std::uint64_t offset,
     const auto seg_len = static_cast<std::size_t>(seg_to - seg_from);
     const auto in_frame = static_cast<std::size_t>(seg_from - frame_start);
     const auto key = make_key(file_id, f);
+
+    // A frame reserved ahead, or one an earlier append admitted: extend it
+    // without the lock. Only the active file's frames are safe from
+    // eviction while this runs.
+    if (active && !lk.owns_lock() && extend_unlocked(key, in_frame, src, seg_len)) continue;
+    if (!lk.owns_lock()) lk.lock();
+    counters_.append_locked.fetch_add(1, std::memory_order_relaxed);
 
     if (const auto s = find(key); s != kNoSlot) {
       // Extends the frame past the size every reader is bounded by: the
@@ -875,8 +1061,32 @@ void BufferPool::append_resident(std::uint32_t file_id, std::uint64_t offset,
     // read miss will admit the whole frame later.
     // Visited: bytes just written are the likeliest to be read next, and the
     // hand skips the active file anyway until it rotates.
-    if (in_frame == 0) (void)admit(key, src, seg_len, true);
+    if (in_frame == 0 && admit(key, src, seg_len, true)) continue;
+    // These bytes are on disk only: the reserver must never admit this
+    // frame empty, or readers would find garbage below the file size.
+    if (active) {
+      if (unpooled_file_ != file_id) unpooled_end_ = 0;
+      unpooled_file_ = file_id;
+      unpooled_end_ = std::max(unpooled_end_, seg_to);
+    }
   }
+  if (lk.owns_lock()) lk.unlock();
+  if (active && reserve_frames_ > 0) after_append(file_id, end);
+}
+
+void BufferPool::set_active_file(std::uint32_t file_id) {
+  active_file_id_.store(file_id, std::memory_order_release);
+  if (reserve_frames_ == 0 || file_id == kNoActiveFile) return;
+#ifndef BYTECASK_SINGLE_THREADED
+  written_.store(mark(file_id, 0), std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lk{rmu_};
+    if (!reserver_.joinable()) reserver_ = std::thread{[this] { reserve_loop(); }};
+    kick_ = true;
+  }
+  kick_pending_.store(true, std::memory_order_release);
+  rcv_.notify_one();
+#endif
 }
 
 } // namespace bytecask

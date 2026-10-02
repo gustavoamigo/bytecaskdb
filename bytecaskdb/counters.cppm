@@ -78,6 +78,15 @@ export struct Counters {
   std::atomic<std::int64_t> bytes_written{0};
   std::atomic<std::int64_t> group_writer_batches{0};
   std::atomic<std::int64_t> group_writer_coalesced{0};
+  // Wall time spent executing batches with write_mu_ held — the serial
+  // section every write passes through. Divided by elapsed time it is how
+  // busy that section is; divided by group_writer_coalesced, its cost per
+  // write. Nanoseconds; stats() reports microseconds.
+  std::atomic<std::int64_t> group_writer_busy_ns{0};
+  // Plans of snapshot puts that the fused check could not confirm — a
+  // conflict, a record vacuum moved, the same key twice — and so were
+  // undone and checked in a pass of their own.
+  std::atomic<std::int64_t> write_check_fallbacks{0};
   std::atomic<std::int64_t> file_rotations{0};
   std::atomic<std::int64_t> fsyncs{0};
   // Writers that slept in commit_wait behind an in-flight flush. Zero for

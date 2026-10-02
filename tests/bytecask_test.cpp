@@ -13,6 +13,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <chrono>
+#include <csignal>
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
 #include <condition_variable>
 #include <cstddef>
 #include <filesystem>
@@ -5796,7 +5800,7 @@ TEST_CASE("apply_batch group commit: second slot conflicts on existing key",
   std::condition_variable cv;
   bool leader_ready = false;
 
-  db.test_write_group().on_leader_start_ = [&] {
+  db.test_write_group().on_batch_start_ = [&] {
     {
       std::unique_lock<std::mutex> lk{mu};
       leader_ready = true;
@@ -5826,7 +5830,7 @@ TEST_CASE("apply_batch group commit: second slot conflicts on existing key",
   tA.join();
   tB.join();
 
-  db.test_write_group().on_leader_start_ = nullptr;
+  db.test_write_group().on_batch_start_ = nullptr;
 
   CHECK(resultA.has_value());
   CHECK_FALSE(resultB.has_value());
@@ -5855,7 +5859,7 @@ TEST_CASE("apply_batch group commit: second slot conflicts on new key",
   std::condition_variable cv;
   bool leader_ready = false;
 
-  db.test_write_group().on_leader_start_ = [&] {
+  db.test_write_group().on_batch_start_ = [&] {
     {
       std::unique_lock<std::mutex> lk{mu};
       leader_ready = true;
@@ -5882,7 +5886,7 @@ TEST_CASE("apply_batch group commit: second slot conflicts on new key",
   tA.join();
   tB.join();
 
-  db.test_write_group().on_leader_start_ = nullptr;
+  db.test_write_group().on_batch_start_ = nullptr;
 
   CHECK(resultA.has_value());
   CHECK_FALSE(resultB.has_value());
@@ -8743,7 +8747,7 @@ TEST_CASE("CommitResult nosync writer coalesced with sync writer is durable",
   std::condition_variable cv;
   bool leader_ready = false;
 
-  db.test_write_group().on_leader_start_ = [&] {
+  db.test_write_group().on_batch_start_ = [&] {
     {
       std::unique_lock<std::mutex> lk{mu};
       leader_ready = true;
@@ -8780,7 +8784,7 @@ TEST_CASE("CommitResult nosync writer coalesced with sync writer is durable",
   tA.join();
   tB.join();
 
-  db.test_write_group().on_leader_start_ = nullptr;
+  db.test_write_group().on_batch_start_ = nullptr;
 
   REQUIRE(nosync_result.has_value());
   REQUIRE(sync_result.has_value());
@@ -10220,6 +10224,7 @@ TEST_CASE("stats: fresh DB has zero counters and one open file",
   CHECK(s.at("bytecask.bytes_written") == 0);
   CHECK(s.at("bytecask.group_writer_batches") == 0);
   CHECK(s.at("bytecask.group_writer_coalesced") == 0);
+  CHECK(s.at("bytecask.group_writer_busy_us") == 0);
   CHECK(s.at("bytecask.fsyncs") == 0);
   CHECK(s.at("bytecask.disk_reads") == 0);
   CHECK(s.at("bytecask.disk_read_bytes") == 0);
@@ -10246,6 +10251,77 @@ TEST_CASE("stats: write counters increment on put",
   CHECK(s.at("bytecask.group_writer_coalesced") >= 2);
   CHECK(s.at("bytecask.fsyncs") >= 2);
 }
+
+TEST_CASE("stats: group_writer_busy_us counts the serial section, within wall time",
+          "[bytecask][stats]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path);
+  const auto before = db.stats().at("bytecask.group_writer_busy_us");
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < 2000; ++i) {
+    const auto k = std::format("k{}", i);
+    db.put({.sync = false}, to_bytes(k), to_bytes("value"));
+  }
+  const auto wall_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - t0)
+                           .count();
+  const auto busy = db.stats().at("bytecask.group_writer_busy_us") - before;
+  CHECK(busy > 0);
+  CHECK(busy <= wall_us);
+}
+
+#if defined(__linux__)
+// A write the file cannot take in full returns short and sets no errno; the
+// engine used to report whatever errno an earlier call had left behind
+// (#221). A file size limit just past the active file's zero-filled end makes
+// the kernel write part of the next chunk and refuse the rest with EFBIG.
+TEST_CASE("io: a write cut short reports the cause, not a stale errno",
+          "[bytecask][io]") {
+  TempDir td;
+  // Files large enough to be zero-filled in 4 MiB chunks ahead of the write
+  // cursor rather than whole at creation (the test build's default).
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 16 * 1024 * 1024});
+  std::filesystem::path data_file;
+  for (const auto &e : std::filesystem::directory_iterator(td.path / "db"))
+    if (e.path().extension() == ".data") data_file = e.path();
+  REQUIRE(!data_file.empty());
+  const auto zeroed_end = std::filesystem::file_size(data_file);
+
+  struct LimitGuard {
+    rlimit saved{};
+    void (*saved_handler)(int){};
+    explicit LimitGuard(rlim_t limit) {
+      REQUIRE(::getrlimit(RLIMIT_FSIZE, &saved) == 0);
+      saved_handler = std::signal(SIGXFSZ, SIG_IGN);  // default action kills
+      rlimit l = saved;
+      l.rlim_cur = limit;
+      REQUIRE(::setrlimit(RLIMIT_FSIZE, &l) == 0);
+    }
+    ~LimitGuard() {
+      ::setrlimit(RLIMIT_FSIZE, &saved);
+      std::signal(SIGXFSZ, saved_handler);
+    }
+    LimitGuard(const LimitGuard &) = delete;
+    auto operator=(const LimitGuard &) -> LimitGuard & = delete;
+  };
+
+  // A write that ends past the zero-filled end, so the fill must grow the
+  // file past the limit: the first zero-fill write lands 100 bytes of it.
+  db.put({.sync = false}, to_bytes("filler"), to_bytes(std::string(64 * 1024, 'f')));
+  const std::string value(static_cast<std::size_t>(zeroed_end) - 1024, 'v');
+  std::error_code code;
+  {
+    LimitGuard limit{static_cast<rlim_t>(zeroed_end + 100)};
+    try {
+      db.put({.sync = false}, to_bytes("big"), to_bytes(value));
+    } catch (const std::system_error &e) {
+      code = e.code();
+    }
+  }
+  CHECK(std::filesystem::file_size(data_file) == zeroed_end + 100);  // the short write
+  CHECK(code == std::errc::file_too_large);
+}
+#endif
 
 TEST_CASE("stats: disk_reads and disk_read_bytes increment on get",
           "[bytecask][stats]") {
@@ -10326,9 +10402,12 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.keydir_keys",
       "bytecask.keydir_versions_live",
       "bytecask.keydir_nodes_parked",
+      "bytecask.keydir_pool_bytes",
       "bytecask.bytes_written",
       "bytecask.group_writer_batches",
       "bytecask.group_writer_coalesced",
+      "bytecask.group_writer_busy_us",
+      "bytecask.write_check_fallbacks",
       "bytecask.file_rotations",
       "bytecask.fsyncs",
       "bytecask.commit_wait_blocked",
@@ -10343,6 +10422,8 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.pool_frames_resident",
       "bytecask.pool_frames_released",
       "bytecask.pool_direct_io_fallbacks",
+      "bytecask.pool_frames_reserved",
+      "bytecask.pool_append_locked",
       "bytecask.vacuum_bytes_reclaimed",
       "bytecask.vacuum_files_unlinked",
       "bytecask.vacuum_tombstones_dropped",
@@ -10359,6 +10440,15 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.degraded",
       "bytecask.hint_backlog",
       "bytecask.open_files",
+#ifdef BYTECASK_KEYDIR_BUFFERED
+      "bytecask.keydir_buffer_stalls",
+      "bytecask.keydir_buffer_stall_us",
+      "bytecask.keydir_buffer_inline_merges",
+      "bytecask.keydir_buffer_merges",
+      "bytecask.keydir_buffer_merge_us",
+      "bytecask.keydir_buffer_merge_slots",
+      "bytecask.keydir_buffer_merge_by_location",
+#endif
   };
   for (const auto &name : expected) {
     CHECK(s.contains(name));
@@ -11447,7 +11537,7 @@ TEST_CASE("pipeline: a sync-only write in the same batch as a rotation is "
   std::mutex mu;
   std::condition_variable cv;
   bool leader_ready = false;
-  db.test_write_group().on_leader_start_ = [&] {
+  db.test_write_group().on_batch_start_ = [&] {
     {
       std::lock_guard<std::mutex> lk{mu};
       leader_ready = true;
@@ -11470,7 +11560,7 @@ TEST_CASE("pipeline: a sync-only write in the same batch as a rotation is "
   });
   tbig.join();
   tsync.join();
-  db.test_write_group().on_leader_start_ = nullptr;
+  db.test_write_group().on_batch_start_ = nullptr;
 
   const auto stats_after = db.stats();
   REQUIRE(rbig.has_value());
@@ -11600,7 +11690,7 @@ TEST_CASE("pipeline: a flush settles for writers in stage 1 only when it "
   std::optional<bytecask::CommitResult> r2;
   std::thread t1([&] { r1 = db.put({.sync = c.w1_sync}, to_bytes("k1"), to_bytes("v1")); });
   before_wait.wait_in_flush();
-  db.test_write_group().on_leader_start_ = leading.hook();
+  db.test_write_group().on_batch_start_ = leading.hook();
   std::thread t2([&] { r2 = db.put({.sync = c.w2_sync}, to_bytes("k2"), to_bytes("v2")); });
   leading.wait_in_flush();
 
@@ -11614,7 +11704,7 @@ TEST_CASE("pipeline: a flush settles for writers in stage 1 only when it "
   leading.open();
   t2.join();
   db.test_before_commit_wait_ = nullptr;
-  db.test_write_group().on_leader_start_ = nullptr;
+  db.test_write_group().on_batch_start_ = nullptr;
   REQUIRE(r1.has_value());
   REQUIRE(r2.has_value());
   CHECK(db.contains_key({}, to_bytes("k2")));
@@ -12114,6 +12204,208 @@ TEST_CASE("location tokens: plans checked and applied by location commit and "
   REQUIRE(stats(a) == stats(b));
 }
 
+// ---------------------------------------------------------------------------
+// Checked puts: a plan of snapshot puts is checked by the descents that apply
+// it (TransientEngineState::apply_puts_checked). A put they cannot confirm
+// undoes the plan, which is then checked and applied in two passes.
+// ---------------------------------------------------------------------------
+
+namespace {
+auto fallbacks(bytecask::DB &db) -> std::int64_t {
+  return db.stats().at("bytecask.write_check_fallbacks");
+}
+// Only a key directory that reads keys to place them checks plans in its
+// descents; the keyed trees check every plan in a pass of its own, so they
+// never fall back.
+constexpr std::int64_t kFallback = bytecask::kKeyDirReadsKeys ? 1 : 0;
+}  // namespace
+
+TEST_CASE("checked puts: a plan of snapshot updates and inserts commits "
+          "without a fallback", "[bytecask][checked_puts]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("u1"), to_bytes("old1"));
+  db.put({}, to_bytes("u2"), to_bytes("old2"));
+  const auto before = fallbacks(db);
+  bytecask::WritePlan plan{db.snapshot()};
+  plan.put(to_bytes("u1"), to_bytes("new1"));   // updates
+  plan.put(to_bytes("u2"), to_bytes("new2"));
+  plan.put(to_bytes("i1"), to_bytes("ins1"));   // inserts
+  plan.put(to_bytes("i2"), to_bytes("ins2"));
+  REQUIRE(db.apply_batch({}, std::move(plan)).has_value());
+  CHECK(fallbacks(db) == before);
+  CHECK(to_string(*get_val(db, to_bytes("u1"))) == "new1");
+  CHECK(to_string(*get_val(db, to_bytes("u2"))) == "new2");
+  CHECK(to_string(*get_val(db, to_bytes("i1"))) == "ins1");
+  CHECK(to_string(*get_val(db, to_bytes("i2"))) == "ins2");
+}
+
+TEST_CASE("checked puts: an update that lost its race undoes the whole plan",
+          "[bytecask][checked_puts]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("a0"));
+  db.put({}, to_bytes("z"), to_bytes("z0"));
+  auto snap = db.snapshot();
+  const auto won = db.put({}, to_bytes("z"), to_bytes("z1"));  // after the snapshot
+  const auto before = fallbacks(db);
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.put(to_bytes("a"), to_bytes("a1"));   // applied, then undone
+  plan.put(to_bytes("n"), to_bytes("n1"));   // inserted, then undone
+  plan.put(to_bytes("z"), to_bytes("z2"));   // the conflict
+  CHECK_FALSE(db.apply_batch({}, std::move(plan)).has_value());
+  CHECK(fallbacks(db) == before + kFallback);
+  CHECK(to_string(*get_val(db, to_bytes("a"))) == "a0");
+  CHECK_FALSE(get_val(db, to_bytes("n")).has_value());
+  CHECK(to_string(*get_val(db, to_bytes("z"))) == "z1");
+  // Nothing of the plan was written: the next write takes the next sequence.
+  CHECK(db.put({}, to_bytes("q"), to_bytes("q")).sequence == won.sequence + 1);
+}
+
+TEST_CASE("checked puts: an insert whose key appeared since the snapshot "
+          "conflicts", "[bytecask][checked_puts]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("a0"));
+  auto snap = db.snapshot();
+  db.put({}, to_bytes("n"), to_bytes("theirs"));  // appears after the snapshot
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.put(to_bytes("a"), to_bytes("a1"));
+  plan.put(to_bytes("n"), to_bytes("mine"));
+  CHECK_FALSE(db.apply_batch({}, std::move(plan)).has_value());
+  CHECK(to_string(*get_val(db, to_bytes("a"))) == "a0");
+  CHECK(to_string(*get_val(db, to_bytes("n"))) == "theirs");
+}
+
+TEST_CASE("checked puts: the same key twice in a plan falls back and commits",
+          "[bytecask][checked_puts]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("k0"));
+  const auto before = fallbacks(db);
+  bytecask::WritePlan plan{db.snapshot()};
+  plan.put(to_bytes("k"), to_bytes("first"));
+  plan.put(to_bytes("new"), to_bytes("n1"));
+  plan.put(to_bytes("new"), to_bytes("n2"));
+  plan.put(to_bytes("k"), to_bytes("second"));
+  REQUIRE(db.apply_batch({}, std::move(plan)).has_value());
+  CHECK(fallbacks(db) == before + kFallback);
+  CHECK(to_string(*get_val(db, to_bytes("k"))) == "second");
+  CHECK(to_string(*get_val(db, to_bytes("new"))) == "n2");
+}
+
+// The fused check must agree with the two-pass check on every outcome. One
+// seeded workload of put-only snapshot plans — updates, inserts of new keys,
+// the same key twice, plain writes landing between snapshot and commit, and
+// vacuum moving records under the snapshots — runs on two databases, one
+// checking puts in their descents and one in a pass of their own. Every
+// commit and conflict, the final contents and the file stats must match,
+// and both paths must actually have run.
+TEST_CASE("checked puts: plans checked by their descents commit and conflict "
+          "exactly as when checked in a pass of their own",
+          "[model][checked_puts]") {
+  const auto seed = GENERATE(1u, 2u, 3u, 4u, 5u);
+  CAPTURE(seed);
+  TempDir td;
+  const bytecask::Options opts{.max_file_bytes = 8 * 1024};
+  const auto stats = [](bytecask::DB &db) {
+    std::vector<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t,
+                           std::uint64_t, std::uint64_t>> vals;
+    for (const auto &[fid, fs] : db.file_stats())
+      vals.emplace_back(fs.live_bytes, fs.total_bytes, fs.min_sequence,
+                        fs.max_sequence, fs.marker_bytes);
+    std::ranges::sort(vals);
+    return vals;
+  };
+  decltype(collect_kv(std::declval<bytecask::DB &>())) kv_before;
+  decltype(stats(std::declval<bytecask::DB &>())) stats_before;
+  {
+  auto a = bytecask::DB::open(td.path / "a", opts);
+  auto b = bytecask::DB::open(td.path / "b", opts);
+  b.test_two_pass_ = true;
+
+  std::mt19937_64 rng{seed};
+  int next_new = 0;
+  const auto key = [&] {
+    // Mostly a small hot set, so plans collide; now and then a fresh key.
+    return rng() % 5 == 0 ? std::format("n{:05d}", next_new++)
+                          : std::format("k{:02d}", rng() % 16);
+  };
+  const auto value = [&] {
+    return std::string(1 + rng() % 150, static_cast<char>('a' + rng() % 26));
+  };
+  std::vector<std::pair<bytecask::Snapshot, bytecask::Snapshot>> snaps;
+  int commits = 0;
+  int conflicts = 0;
+  for (int step = 0; step < 5000; ++step) {
+    const auto dice = rng() % 100;
+    if (dice < 40) {
+      snaps.emplace_back(a.snapshot(), b.snapshot());
+      if (snaps.size() > 12) snaps.erase(snaps.begin());
+    } else if (dice < 42) {
+      const auto ta = rng() % 2 == 0 ? 0.0 : 0.5;
+      REQUIRE(a.vacuum({.fragmentation_threshold = ta}) ==
+              b.vacuum({.fragmentation_threshold = ta}));
+    } else if (dice < 55) {
+      const auto k = key();
+      const auto v = value();
+      REQUIRE(a.put({.sync = false}, to_bytes(k), to_bytes(v)).sequence ==
+              b.put({.sync = false}, to_bytes(k), to_bytes(v)).sequence);
+    } else if (!snaps.empty()) {
+      const auto i = static_cast<std::ptrdiff_t>(rng() % snaps.size());
+      auto pair = std::move(snaps[static_cast<std::size_t>(i)]);
+      snaps.erase(snaps.begin() + i);
+      bytecask::WritePlan pa{std::move(pair.first)};
+      bytecask::WritePlan pb{std::move(pair.second)};
+      const auto ops = 1 + rng() % 6;
+      std::string last;
+      for (std::size_t o = 0; o < ops; ++o) {
+        const auto k = !last.empty() && rng() % 6 == 0 ? last : key();
+        last = k;
+        const auto v = value();
+        pa.put(to_bytes(k), to_bytes(v));
+        pb.put(to_bytes(k), to_bytes(v));
+      }
+      const auto ra = a.apply_batch({.sync = false}, std::move(pa));
+      const auto rb = b.apply_batch({.sync = false}, std::move(pb));
+      REQUIRE(ra.has_value() == rb.has_value());
+      if (ra) {
+        REQUIRE(ra->sequence == rb->sequence);
+        ++commits;
+      } else {
+        ++conflicts;
+      }
+    }
+  }
+  snaps.clear();
+  CHECK(commits > 300);
+  CHECK(conflicts > 300);
+  if constexpr (bytecask::kKeyDirReadsKeys) {
+    CHECK(fallbacks(a) > 0);                 // the undo path ran
+    CHECK(fallbacks(a) < commits + conflicts);  // and so did the fused one
+  } else {
+    CHECK(fallbacks(a) == 0);
+  }
+  CHECK(fallbacks(b) == 0);
+  REQUIRE(collect_kv(a) == collect_kv(b));
+  REQUIRE(stats(a) == stats(b));
+  kv_before = collect_kv(a);
+  stats_before = stats(a);
+  }
+  // Recovery rebuilds the file stats from the data files: they must be the
+  // ones the fused path kept in memory — apart from the empty active file
+  // the reopen creates — and the ones recovery rebuilds for the two-pass
+  // database.
+  auto reopened_a = bytecask::DB::open(td.path / "a", opts);
+  auto reopened_b = bytecask::DB::open(td.path / "b", opts);
+  CHECK(collect_kv(reopened_a) == kv_before);
+  CHECK(collect_kv(reopened_b) == kv_before);
+  CHECK(stats(reopened_a) == stats(reopened_b));
+  auto recovered = stats(reopened_a);
+  std::erase_if(recovered, [](const auto &v) { return std::get<1>(v) == 0; });
+  CHECK(recovered == stats_before);
+}
+
 TEST_CASE("pipeline: a writer whose write another thread published sees it "
           "on its next read, even before state_time_ is stored",
           "[pipeline][concurrency]") {
@@ -12379,7 +12671,7 @@ TEST_CASE("pipeline: a batch admitted before a flush failure is rejected as "
   std::condition_variable cv;
   bool leader_parked = false;
   bool go = false;
-  db.test_write_group().on_leader_start_ = [&] {
+  db.test_write_group().on_batch_start_ = [&] {
     std::unique_lock<std::mutex> lk{mu};
     leader_parked = true;
     cv.notify_all();
@@ -12420,7 +12712,7 @@ TEST_CASE("pipeline: a batch admitted before a flush failure is rejected as "
   }
   cv.notify_all();
   ta.join();
-  db.test_write_group().on_leader_start_ = nullptr;
+  db.test_write_group().on_batch_start_ = nullptr;
   REQUIRE(ea);
   CHECK_THROWS_AS(std::rethrow_exception(ea), bytecask::DbDegraded);
 
