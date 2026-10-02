@@ -1,6 +1,10 @@
 [mariadbd]
 bytecaskdb_io_backend = buffer_pool
-bytecaskdb_buffer_pool_size = 1075840000
+# Memory: the same 3 GiB as innodb.cnf's innodb_buffer_pool_size, so the acid
+# profile compares the engines, not their cache sizes. At 1 GiB, sysbench's
+# 5M-row table missed the pool 266K times a second on the 48-vCPU box, and
+# the run measured O_DIRECT reads (36% iowait against InnoDB's 0.3%).
+bytecaskdb_buffer_pool_size = 3221225472
 bytecaskdb_max_file_bytes = 67108864
 bytecaskdb_verify_checksums = OFF
 bytecaskdb_vacuum_fragmentation_threshold = 0.9
