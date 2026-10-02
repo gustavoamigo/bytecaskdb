@@ -197,7 +197,7 @@ auto placement_name(Placement p) -> std::string_view {
 enum class PlanShape : std::uint8_t { Guard, DelRange, Both };
 
 // Submits `first` and then `second` into one group commit: the thread
-// submitting `first` becomes leader and waits in the leader hook until the
+// submitting `first` becomes leader and waits in the batch hook until the
 // second slot is queued, so `second` is validated against a head holding
 // `first`'s writes before either is published.
 auto same_group(bytecask::DB &db, bytecask::WritePlan first,
@@ -207,7 +207,7 @@ auto same_group(bytecask::DB &db, bytecask::WritePlan first,
   std::mutex mu;
   std::condition_variable cv;
   bool leader_ready = false;
-  db.test_write_group().on_leader_start_ = [&] {
+  db.test_write_group().on_batch_start_ = [&] {
     {
       std::unique_lock<std::mutex> lk{mu};
       leader_ready = true;
@@ -227,7 +227,7 @@ auto same_group(bytecask::DB &db, bytecask::WritePlan first,
   }};
   ta.join();
   tb.join();
-  db.test_write_group().on_leader_start_ = nullptr;
+  db.test_write_group().on_batch_start_ = nullptr;
   return {ra, rb};
 }
 
