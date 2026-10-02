@@ -135,6 +135,8 @@ export struct PoolCounters {
   // Gauge: frames currently holding a file's bytes. Resident / total is the
   // fill level an operator sizes against.
   std::atomic<std::int64_t> frames_resident{0};
+  // Frames given back when vacuum deleted the file they held (release_file).
+  std::atomic<std::int64_t> frames_released{0};
   // Files whose filesystem refused O_DIRECT and fill through the page cache
   // instead. Catches a CI mount that would otherwise measure the wrong thing.
   std::atomic<std::int64_t> direct_io_fallbacks{0};
@@ -292,6 +294,15 @@ public:
                           std::size_t file_size, FrameLease &lease)
       -> std::span<const std::byte>;
   void note_hit() noexcept { counters_.hits.add(1); }
+
+  // Frees the frames of a file vacuum has deleted, so they hold live data
+  // again at once instead of when the hand reaches them — a whole pass later
+  // for a frame read just before the delete. Each frame is claimed and
+  // removed exactly as eviction removes a victim; one a reader holds is left
+  // to the hand. A reader still on the deleted file (a snapshot keeps its
+  // descriptor open) fills what it needs again. file_size bounds the frames
+  // to look up.
+  void release_file(std::uint32_t file_id, std::size_t file_size);
 
   // The active file's frames are never evicted: the hand skips them, and the
   // engine moves this at rotation (under the write lock), at which point the
@@ -630,13 +641,17 @@ private:
              bool visited) -> bool {
     if (find(key) != kNoSlot) return false;
     std::uint32_t frame = 0;
-    if (used_frames_ < frame_count_) {
+    if (!free_frames_.empty()) {
+      // Released by release_file: still dead, named by no slot.
+      frame = free_frames_.back();
+      free_frames_.pop_back();
+      note_resident();
+    } else if (used_frames_ < frame_count_) {
       frame = narrow<std::uint32_t>(used_frames_++);
       // Named by no slot yet, so nothing can pin it; dead keeps the
       // invariant that a frame is written only while dead.
       pins_[frame].store(kDead, std::memory_order_relaxed);
-      counters_.frames_resident.store(narrow<std::int64_t>(used_frames_),
-                                           std::memory_order_relaxed);
+      note_resident();
     } else {
       const auto victim = sieve_victim();
       if (victim == kNoSlot) return false;
@@ -646,6 +661,12 @@ private:
     }
     insert(key, frame, src, len, visited);
     return true;
+  }
+
+  void note_resident() noexcept {
+    counters_.frames_resident.store(
+        narrow<std::int64_t>(used_frames_ - free_frames_.size()),
+        std::memory_order_relaxed);
   }
 
   PoolCounters counters_;
@@ -666,7 +687,10 @@ private:
   std::uint32_t newest_{kNoFrame};  // guarded by mu_
   std::uint32_t oldest_{kNoFrame};  // guarded by mu_
   std::uint32_t hand_{kNoFrame};    // guarded by mu_; kNoFrame: start at oldest_
-  std::size_t used_frames_{0};  // guarded by mu_; every used frame is indexed
+  // Guarded by mu_: frames ever handed out. Each is indexed and on the SIEVE
+  // list, or dead and in free_frames_.
+  std::size_t used_frames_{0};
+  std::vector<std::uint32_t> free_frames_;  // guarded by mu_
   std::atomic<std::uint32_t> active_file_id_{kNoActiveFile};
 };
 
@@ -740,8 +764,9 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
   // pool has free frames. Blocks are how a cold pool warms; in a full one
   // each block's neighbours would evict frames that earned their place — at
   // a pool a tenth of a Zipf dataset, block fills cut throughput 5x. The
-  // resident count is read without the lock: it only grows until the pool is
-  // full, and a stale value picks a fill size, never a correctness outcome.
+  // resident count is read without the lock: it grows until the pool is
+  // full, and drops only when release_file frees a deleted file's frames; a
+  // stale value picks a fill size, never a correctness outcome.
   // A pool too small for a block to pass the oversize guard fills frames
   // only, or one miss would evict the frames it had just admitted. Frames of
   // the block already resident are read again and not re-admitted; fill_run
@@ -800,6 +825,28 @@ void FrameLease::reset() noexcept {
     pool_->unpin(frame_);
     pool_ = nullptr;
   }
+}
+
+void BufferPool::release_file(std::uint32_t file_id, std::size_t file_size) {
+  const auto frames = (file_size + kPoolFrameBytes - 1) / kPoolFrameBytes;
+  std::lock_guard<std::mutex> lk{mu_};
+  for (std::uint64_t n = 0; n < frames; ++n) {
+    const auto i = find(make_key(file_id, n));
+    if (i == kNoSlot) continue;
+    const auto f = table_[i].frame.load(std::memory_order_relaxed) & ~kRefBit;
+    // Claimed as sieve_victim claims a victim; a pinned frame is left to it.
+    std::uint32_t unpinned = 0;
+    if (!pins_[f].compare_exchange_strong(unpinned, kDead,
+                                          std::memory_order_acq_rel)) {
+      continue;
+    }
+    if (hand_ == f) hand_ = newer_[f];
+    unlink(f);
+    erase(i);
+    free_frames_.push_back(f);
+    counters_.frames_released.fetch_add(1, std::memory_order_relaxed);
+  }
+  note_resident();
 }
 
 void BufferPool::append_resident(std::uint32_t file_id, std::uint64_t offset,

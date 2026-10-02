@@ -10341,6 +10341,7 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.pool_evictions",
       "bytecask.pool_frames_total",
       "bytecask.pool_frames_resident",
+      "bytecask.pool_frames_released",
       "bytecask.pool_direct_io_fallbacks",
       "bytecask.vacuum_bytes_reclaimed",
       "bytecask.vacuum_files_unlinked",
@@ -10751,6 +10752,59 @@ TEST_CASE("io_backend=BufferPool: vacuum does not pollute the pool",
   for (int i = 1; i < kCount; i += 2) {
     REQUIRE(db.get({}, to_bytes(std::format("k{:05d}", i)), out));
     CHECK(to_string(out) == value_for(i));
+  }
+}
+
+TEST_CASE("io_backend=BufferPool: vacuum releases the frames of the files it "
+          "deletes",
+          "[bytecask][buffer_pool]") {
+  // A deleted file's frames can never be read again. Left in the pool they
+  // would each hold a frame until the SIEVE hand came round; vacuum gives
+  // them back as it deletes the file.
+  TempDir td;
+  auto db = bytecask::DB::open(
+      td.path, {.max_file_bytes = 32 * 1024,
+                .io_backend = bytecask::IoBackend::BufferPool,
+                .buffer_pool = {.capacity_bytes = 1024 * 1024}});
+  constexpr int kCount = 600;
+  const auto value_for = [](int i) {
+    return std::format("v{:05d}", i) + std::string(200, 'x');
+  };
+  for (int i = 0; i < kCount; ++i) {
+    db.put({.sync = false}, to_bytes(std::format("k{:05d}", i)),
+           to_bytes(value_for(i)));
+  }
+  for (int i = 0; i < kCount; i += 2) {
+    (void)db.del({.sync = false}, to_bytes(std::format("k{:05d}", i)));
+  }
+  const auto before = db.stats();
+  REQUIRE(before.at("bytecask.pool_frames_resident") > 0);
+  REQUIRE(before.at("bytecask.pool_frames_released") == 0);
+
+  bool vacuumed = false;
+  while (db.vacuum({.fragmentation_threshold = 0.0})) {
+    vacuumed = true;
+  }
+  REQUIRE(vacuumed);
+
+  const auto after = db.stats();
+  REQUIRE(after.at("bytecask.vacuum_files_unlinked") > 0);
+  const auto released = after.at("bytecask.pool_frames_released");
+  CHECK(released > 0);
+  // Vacuum admits nothing, so residency falls by exactly what it released.
+  REQUIRE(after.at("bytecask.pool_fills") == before.at("bytecask.pool_fills"));
+  CHECK(after.at("bytecask.pool_frames_resident") ==
+        before.at("bytecask.pool_frames_resident") - released);
+
+  bytecask::Bytes out;
+  for (int i = 0; i < kCount; ++i) {
+    const auto key = std::format("k{:05d}", i);
+    if (i % 2 == 0) {
+      CHECK_FALSE(db.get({}, to_bytes(key), out));
+    } else {
+      REQUIRE(db.get({}, to_bytes(key), out));
+      CHECK(to_string(out) == value_for(i));
+    }
   }
 }
 
