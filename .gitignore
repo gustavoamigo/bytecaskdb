@@ -74,8 +74,7 @@ bytecaskdb-mariadb-plugin/benchmarks/sysbench_longrun_results.csv
 .notes
 
 # Claude Code local state — except the SessionStart hook and its registration,
-# which provision the toolchain for Claude Code on the web (see CONTRIBUTING.md),
-# and the graft hook/statusline shims that settings.json invokes.
+# which provision the toolchain for Claude Code on the web (see CONTRIBUTING.md).
 # Re-inclusion has to walk down one directory at a time: git will not re-include
 # a path whose parent directory is itself excluded.
 .claude/*
@@ -83,14 +82,6 @@ bytecaskdb-mariadb-plugin/benchmarks/sysbench_longrun_results.csv
 !.claude/hooks/
 .claude/hooks/*
 !.claude/hooks/session-start.sh
-!.claude/helpers/
-.claude/helpers/*
-!.claude/helpers/graft-hooks.cjs
-!.claude/helpers/graft-statusline.cjs
 
 # Local tools (e.g. nektos/act)
 bin/
-
-
-# graft's local graph cache — regenerable, not committed (run `graft build`).
-/graft/

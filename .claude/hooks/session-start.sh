@@ -58,8 +58,7 @@ else
 fi
 
 # Clang is the only supported compiler — the engine is C++23 modules throughout.
-# Pinned: Ubuntu's unversioned `clang` is 18, older than CI's (Fedora 43), and
-# clangd 18 has no outgoing call hierarchy, which `graft build --lsp` needs.
+# Pinned: Ubuntu's unversioned `clang` is 18, older than CI's (Fedora 43).
 # The unversioned names are linked in /usr/local/bin (ahead of /usr/bin on
 # PATH) so xmake, clang-scan-deps and clangd are one version: clangd cannot
 # read module files built by a different clang.
@@ -89,21 +88,6 @@ cd "$project_dir"
 xmake f --toolchain=clang \
         --cxflags="-resource-dir=$(clang --print-resource-dir)" \
         -m debug -y >&2
-
-# graft — repo context graph (see CLAUDE.md), also served over MCP from
-# .mcp.json. Installed into /usr/local so `graft` is on the PATH the MCP
-# server is launched with. The graph itself (graft/) is gitignored, so every
-# clone builds its own. Best-effort: a failure here must not block the build
-# toolchain above.
-if ! command -v graft >/dev/null 2>&1; then
-  log "installing graft (about a minute, cached afterwards)"
-  NPM_PREFIX=/usr/local "$project_dir/scripts/install_graft.sh" >&2 \
-    || log "graft install failed; continuing without it"
-fi
-if command -v graft >/dev/null 2>&1; then
-  log "building graft graph"
-  (cd "$project_dir" && graft build >/dev/null 2>&1) || log "graft build failed"
-fi
 
 echo "Toolchain ready. Build and test with:"
 echo "  xmake build bytecask_tests && xmake run bytecask_tests"

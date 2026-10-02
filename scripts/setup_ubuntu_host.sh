@@ -169,23 +169,5 @@ log "Seeding local Claude settings from defaults"
 mkdir -p .claude
 cp -n .claude.defaults/settings.json .claude/settings.json 2>/dev/null || true
 
-log "Installing graft (repo context graph) under \$HOME/.npm-global"
-NPM_PREFIX="${HOME}/.npm-global"
-mkdir -p "$NPM_PREFIX"
-export PATH="${NPM_PREFIX}/bin:${PATH}"
-# Installed from our fork (gustavoamigo/Graft), which knows the .cppm
-# extension (C++20 module interface units) our core engine is written in.
-if ! command -v graft >/dev/null 2>&1; then
-  NPM_PREFIX="${NPM_PREFIX}" ./scripts/install_graft.sh
-fi
-graft init --agents copilot --agents claude -y
-
-if ! grep -qF 'NPM_PREFIX' "$HOME/.bashrc" 2>/dev/null; then
-  {
-    echo 'export NPM_PREFIX="${HOME}/.npm-global"'
-    echo 'export PATH=$NPM_PREFIX/bin:$PATH'
-  } >> "$HOME/.bashrc"
-fi
-
 log "Done. Open a new shell (or run 'source ~/.bashrc'), then:"
 echo "  xmake build bytecask_tests && xmake run bytecask_tests"
