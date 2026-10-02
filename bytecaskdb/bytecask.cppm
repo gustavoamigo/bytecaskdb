@@ -2435,6 +2435,8 @@ void TransientEngineState::apply_vacuum(
                    KeyDirEntry::make(m.sequence, m.new_offset, dest_file_id,
                                      m.value_size),
                    kd_ctx());
+      PoolTrace::note(PoolTrace::kMoveFrom, cur->file_id(), cur->file_offset(),
+                      entry_size(m.key.size(), m.value_size));
       PoolTrace::note(PoolTrace::kLive, dest_file_id, m.new_offset,
                       entry_size(m.key.size(), m.value_size));
     } else {

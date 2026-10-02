@@ -103,6 +103,8 @@ public:
     kNewFile = 3,  // vacuum's compacted file, live in full, never in the pool
     kUnlink = 4,   // a file deleted by vacuum
     kLive = 5,     // a record written that is live until a kKill names it
+    kMoveFrom = 6, // vacuum moved this record; the kLive that follows on the
+                   // same thread names where to
   };
   enum Ctx : std::uint8_t { kOther = 0, kGet = 1, kWrite = 2 };
 

@@ -43,6 +43,8 @@ Policies (`sim run ... <policy>`, tokens joined with `+`):
 | `ra_young=N` | read ahead only in the newest N files |
 | `ra_live` | read the block, admit only frames at least half live |
 | `vacwarm` | records vacuum moves enter the pool as it writes them |
+| `orphans` | a deleted file's frames stay until the hand reaches them, as in the pool; without it they are freed at once |
+| `rewarm` | a record vacuum moves enters the pool at its new place when its old frame was in it, with its visited bit |
 | `opt` | Belady with bypass: the best any policy could do |
 
 Recorded locally (Ryzen 7 3700X, SATA SSD): 1M rows (242 MiB live: rows and
@@ -72,7 +74,9 @@ is `special` (1 % of keys take 75 % of accesses), which is what
 ## Results
 
 Read misses (share of record reads that needed a fill) and bytes read from
-disk, `pool` policy:
+disk, `pool` policy. With vacuum running, these rows free a deleted file's
+frames at once, which the pool does not do; the next section has the pool's
+own behaviour, which misses more:
 
 | distribution, vacuum | 250 MiB | 375 MiB | 500 MiB | 750 MiB |
 |---|---|---|---|---|
@@ -115,12 +119,36 @@ room — 0.14 % against 0.37 % (`special`, 0.5, 250 MiB), 4.3 % against 12.5 %
 1. **Yes, vacuum harder.** It is the lever: at a pool the size of the live
    data, threshold 0.5 instead of 0.9 cuts misses tenfold on the box's
    distribution (3.67 % to 0.37 %) for ~6.5 MiB/s of vacuum I/O against
-   ~260 MiB/s of misses saved, and 0.25 takes them to 0.05 %. What the pool
+   ~260 MiB/s of misses saved, and 0.25 to 0.20 %. Freeing a deleted file's
+   frames at once takes a further 17–97 % off, depending on the pool size. What the pool
    has to hold is the frames that still contain a live record, and that is
    the file bytes vacuum has not reclaimed; the threshold bounds them.
 2. **No policy change is worth making.** Liveness-aware eviction, plain SIEVE
    for the writer's frames, and every read-ahead rule tried are within ~10 %
    of the pool as it is, or worse.
+
+## Vacuum's deleted files, and rewarming what it moved
+
+When vacuum deletes a file, the pool keeps its frames: nothing can look them
+up again (file ids are not reused), and the hand reclaims each one when it
+reaches it — a whole pass later if the frame was read just before. With few
+misses the hand moves slowly, so they linger. Recorded again with each moved
+record's old location (`special`):
+
+| vacuum, pool | as today (`orphans`) | `orphans+rewarm` | freed at once (`pool`) | freed + `rewarm` |
+|---|---|---|---|---|
+| 0.5, 250 MiB | 0.372 % | 0.362 % | 0.308 % | 0.313 % |
+| 0.5, 375 MiB | 0.051 % | 0.034 % | 0.010 % | 0.010 % |
+| 0.5, 500 MiB | 0.031 % | 0.013 % | 0.001 % | 0.000 % |
+| 0.25, 250 MiB | 0.201 % | 0.188 % | 0.151 % | 0.154 % |
+| 0.25, 375 MiB | 0.045 % | 0.026 % | 0.004 % | 0.004 % |
+| 0.25, 500 MiB | 0.032 % | 0.012 % | 0.001 % | 0.000 % |
+
+Freeing a deleted file's frames when vacuum deletes it takes 17–25 % of the
+misses off at a pool the size of the live data and 80–97 % at 1.5–2×.
+Rewarming moved records helps only while orphans are left in place; once they
+are freed it adds nothing. With the pool's own behaviour, vacuum at 0.5 and
+0.25 misses 0.37 % and 0.20 % at 250 MiB, against 3.67 % at 0.9.
 
 What neither touches: range scans read ~30× more frames than the rows need,
 because writes destroy key order. Only where records are written could change
@@ -131,8 +159,7 @@ that (for example a vacuum that rewrites live records in key order).
 - One machine, one workload, 1M rows, 120 s runs. The 0.9 runs never reach a
   steady state — the files are still growing at the end — so a longer run
   would widen the gap.
-- The model drops a deleted file's frames at once; the pool leaves them for
-  the hand. Vacuum's sweep reads are not modelled as pool traffic (they
+- Vacuum's sweep reads are not modelled as pool traffic (they
   bypass it) but are counted above.
 - A trace records what the engine asked for; how long a miss takes, and so
   throughput, is not modelled.

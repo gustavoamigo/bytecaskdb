@@ -50,7 +50,7 @@ struct Rec {
   std::uint32_t tid;
 };
 static_assert(sizeof(Rec) == 32);
-enum Kind : std::uint8_t { kRead = 0, kAppend = 1, kKill = 2, kNewFile = 3, kUnlink = 4, kLive = 5 };
+enum Kind : std::uint8_t { kRead = 0, kAppend = 1, kKill = 2, kNewFile = 3, kUnlink = 4, kLive = 5, kMoveFrom = 6 };
 enum Ctx : std::uint8_t { kOther = 0, kGet = 1, kWrite = 2 };
 
 auto key_of(std::uint32_t fid, std::uint64_t frame) -> std::uint64_t {
@@ -170,6 +170,8 @@ struct Policy {
   bool dead_first = false;    // evict frames with no live bytes before anything else
   double sparse_no_second_chance = -1; // frames below this live fraction ignore their visited bit
   bool vacuum_warm = false;   // vacuum's moved records enter the pool, as the writer's appends do
+  bool orphans = false;       // a deleted file's frames stay until the hand reaches them (the pool today)
+  bool rewarm = false;        // a moved record's new frame enters the pool if its old frame was there
 };
 
 auto parse_policy(const std::string &s) -> Policy {
@@ -188,6 +190,8 @@ auto parse_policy(const std::string &s) -> Policy {
     else if (t == "ra_live") p.fill = Policy::kLiveFilteredBlock;
     else if (t == "wnv") p.writer_visited = false;
     else if (t == "vacwarm") p.vacuum_warm = true;
+    else if (t == "orphans") p.orphans = true;
+    else if (t == "rewarm") p.rewarm = true;
     else if (t == "deadfirst") p.dead_first = true;
     else if (t.rfind("sparse", 0) == 0) p.sparse_no_second_chance = std::stod(t.substr(7));
     else if (t == "opt") {}
@@ -231,8 +235,31 @@ public:
           });
           break;
         }
+        case kMoveFrom:
+          moves_[r.tid] = r;
+          break;
         case kLive:
           files.add_live(r.fid, r.off, r.len);
+          if (p_.rewarm && vacuum_files_.count(r.fid)) {
+            auto mv = moves_.find(r.tid);
+            if (mv != moves_.end()) {
+              const auto &from = mv->second;
+              bool resident = false, visited = false;
+              Files::each_frame(from.off, from.len, [&](std::uint64_t fr, std::uint64_t) {
+                auto it = map_.find(key_of(from.fid, fr));
+                if (it != map_.end()) { resident = true; visited |= node_[it->second].visited; }
+              });
+              if (resident) {
+                Files::each_frame(r.off, r.len, [&](std::uint64_t fr, std::uint64_t) {
+                  const auto k = key_of(r.fid, fr);
+                  auto it = map_.find(k);
+                  if (it != map_.end()) { node_[it->second].visited |= visited; return; }
+                  admit(k, r.fid, visited, files, /*prefetch=*/false);
+                });
+              }
+              moves_.erase(mv);
+            }
+          }
           if (p_.vacuum_warm && vacuum_files_.count(r.fid)) {
             Files::each_frame(r.off, r.len, [&](std::uint64_t fr, std::uint64_t) {
               const auto k = key_of(r.fid, fr);
@@ -258,7 +285,8 @@ public:
           if (it != files.f.end()) {
             if (counting_) c.vacuum_unlinked_bytes += it->second.size;
             const auto nfr = it->second.live.size();
-            for (std::uint64_t fr = 0; fr < nfr; ++fr) drop(key_of(r.fid, fr));
+            if (!p_.orphans)
+              for (std::uint64_t fr = 0; fr < nfr; ++fr) drop(key_of(r.fid, fr));
           }
           files.unlink(r.fid);
           break;
@@ -289,6 +317,7 @@ private:
   std::vector<std::uint64_t> dead_;
   std::unordered_set<std::uint64_t> seen_;
   std::unordered_set<std::uint32_t> vacuum_files_;
+  std::unordered_map<std::uint32_t, Rec> moves_;  // per thread: the last kMoveFrom
   bool counting_ = false;
 
   auto size() const -> std::size_t { return map_.size(); }
@@ -543,7 +572,7 @@ int main(int argc, char **argv) {
     const auto t = map_trace(argv[2]);
     const auto run_ts = phase_ts(argv[3], "run");
     const auto end_ts = phase_ts(argv[3], "end");
-    std::uint64_t kinds[6] = {}, ctx_reads[3] = {}, read_bytes = 0, app_bytes = 0, kill_bytes = 0;
+    std::uint64_t kinds[7] = {}, ctx_reads[3] = {}, read_bytes = 0, app_bytes = 0, kill_bytes = 0;
     Files files;
     std::uint64_t live_at_run = 0, file_at_run = 0, live_frames_at_run = 0;
     bool marked = false;
@@ -576,7 +605,7 @@ int main(int argc, char **argv) {
       else if (r.kind == kNewFile) files.extend(r.fid, r.len);
       else if (r.kind == kUnlink) files.unlink(r.fid);
       if (r.ts < run_ts) continue;
-      ++kinds[r.kind % 6];
+      ++kinds[r.kind % 7];
       if (r.kind == kRead) { ++ctx_reads[r.ctx % 3]; read_bytes += r.len; }
       if (r.kind == kRead) {
         auto &q = seqs[r.tid];
