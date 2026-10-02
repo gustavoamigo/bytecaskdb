@@ -750,3 +750,132 @@ TEST_CASE("BufferPool: SIEVE keeps a re-read frame and evicts the oldest "
   read_frame(1);  // the victim: oldest frame never read again
   CHECK(pool.counters().misses.load() == misses + 1);
 }
+
+TEST_CASE("BufferPool: release_file frees a deleted file's frames for reuse "
+          "without eviction",
+          "[buffer_pool]") {
+  // Below 8 blocks the pool fills frames only, so every read admits exactly
+  // the frame it touches.
+  const std::size_t capacity = 512 * 1024;
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = capacity}};
+  const auto n = pool.frame_count();
+  const auto half = n / 2;
+  ScratchFile deleted{(n + 2) * bytecask::kPoolFrameBytes};
+  ScratchFile kept{(n + 2) * bytecask::kPoolFrameBytes};
+  ScratchFile next{(n + 2) * bytecask::kPoolFrameBytes};
+  std::vector<std::byte> one(1);
+  const auto read_frame = [&](std::uint32_t id, const ScratchFile &file,
+                              std::size_t f) {
+    pool.read_at(id, file.fd(), f * bytecask::kPoolFrameBytes, one.size(),
+                 file.size(), one.data());
+    CHECK(one == file.expected(f * bytecask::kPoolFrameBytes, one.size()));
+  };
+
+  for (std::size_t f = 0; f < half; ++f) read_frame(1, deleted, f);
+  for (std::size_t f = 0; f < n - half; ++f) read_frame(2, kept, f);
+  REQUIRE(pool.counters().frames_resident.load() ==
+          static_cast<std::int64_t>(n));
+
+  pool.release_file(1, deleted.size());
+  CHECK(pool.counters().frames_released.load() ==
+        static_cast<std::int64_t>(half));
+  CHECK(pool.counters().frames_resident.load() ==
+        static_cast<std::int64_t>(n - half));
+
+  // The freed frames take new data before anything is evicted.
+  for (std::size_t f = 0; f < half; ++f) read_frame(3, next, f);
+  CHECK(pool.counters().evictions.load() == 0);
+  CHECK(pool.counters().frames_resident.load() ==
+        static_cast<std::int64_t>(n));
+
+  // The other file's frames were not touched.
+  const auto misses = pool.counters().misses.load();
+  for (std::size_t f = 0; f < n - half; ++f) read_frame(2, kept, f);
+  CHECK(pool.counters().misses.load() == misses);
+
+  // A reader still on the released file fills it again, correctly.
+  read_frame(1, deleted, 0);
+  CHECK(pool.counters().misses.load() == misses + 1);
+}
+
+TEST_CASE("BufferPool: release_file leaves a leased frame to the hand",
+          "[buffer_pool]") {
+  // A frame a reader holds cannot be claimed, by eviction or by a release:
+  // the lent bytes stay valid, and the frame stays indexed until the hand
+  // gets to it after the lease is dropped.
+  const std::size_t capacity = 512 * 1024;
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = capacity}};
+  ScratchFile file{16 * bytecask::kPoolFrameBytes};
+  std::vector<std::byte> one(1);
+  for (std::size_t f = 0; f < 8; ++f) {
+    pool.read_at(1, file.fd(), f * bytecask::kPoolFrameBytes, one.size(),
+                 file.size(), one.data());
+  }
+  const std::size_t leased_offset = 3 * bytecask::kPoolFrameBytes + 10;
+  bytecask::FrameLease lease;
+  const auto span = pool.view(1, leased_offset, file.size(), lease);
+  REQUIRE(static_cast<bool>(lease));
+  const std::vector<std::byte> lent(span.begin(), span.end());
+
+  pool.release_file(1, file.size());
+  CHECK(pool.counters().frames_released.load() == 7);
+  CHECK(pool.counters().frames_resident.load() == 1);
+  // Refill every freed frame from another file: had the leased frame been
+  // freed too, this would overwrite the bytes the span points at.
+  ScratchFile other{16 * bytecask::kPoolFrameBytes};
+  for (std::size_t f = 0; f < 8; ++f) {
+    pool.read_at(2, other.fd(), f * bytecask::kPoolFrameBytes, one.size(),
+                 other.size(), one.data());
+  }
+  CHECK(std::vector<std::byte>(span.begin(), span.end()) == lent);
+  CHECK(lent == file.expected(leased_offset, lent.size()));
+
+  lease.reset();
+  bytecask::FrameLease again;
+  CHECK_FALSE(pool.view(1, leased_offset, file.size(), again).empty());
+}
+
+TEST_CASE("BufferPool: readers racing release_file always read the file's "
+          "bytes",
+          "[buffer_pool]") {
+  // A release removes frames under readers exactly as eviction does: a
+  // reader that loses the race misses and fills again, and never sees a
+  // frame mid-reuse. The pool is small, so released frames are refilled at
+  // once by the readers themselves.
+  ScratchFile file{2 * 1024 * 1024};
+  const std::size_t capacity = 64 * (bytecask::kPoolFrameBytes + 64);
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = capacity}};
+  std::atomic<bool> stop{false};
+  std::atomic<int> bad{0};
+  std::vector<std::thread> readers;
+  for (int t = 0; t < 4; ++t) {
+    readers.emplace_back([&, t] {
+      std::mt19937_64 rng{static_cast<std::uint64_t>(t) * 7919};
+      std::vector<std::byte> got;
+      bytecask::FrameLease lease;
+      while (!stop.load(std::memory_order_relaxed)) {
+        const auto len = static_cast<std::size_t>(1 + rng() % 3000);
+        const auto offset =
+            static_cast<std::size_t>(rng() % (file.size() - len));
+        got.assign(len, std::byte{0});
+        pool.read_at(1, file.fd(), offset, len, file.size(), got.data());
+        if (got != file.expected(offset, len)) bad.fetch_add(1);
+        const auto span = pool.view(1, offset, file.size(), lease);
+        if (!span.empty() &&
+            std::vector<std::byte>(span.begin(), span.end()) !=
+                file.expected(offset, span.size())) {
+          bad.fetch_add(1);
+        }
+        lease.reset();
+      }
+    });
+  }
+  for (int i = 0; i < 2000; ++i) pool.release_file(1, file.size());
+  stop.store(true);
+  for (auto &r : readers) r.join();
+  CHECK(bad.load() == 0);
+  CHECK(pool.counters().frames_released.load() > 0);
+}

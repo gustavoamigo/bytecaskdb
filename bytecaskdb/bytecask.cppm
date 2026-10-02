@@ -3946,6 +3946,12 @@ void DB::vacuum_unlink_old_file(
       dir_ / (old_data_file->path().stem().string() + ".hint");
   std::filesystem::remove(old_data_file->path());
   std::filesystem::remove(old_hint_path);
+  // Its frames would otherwise hold a frame each until the SIEVE hand came
+  // round, which in a pool that rarely misses is a long time.
+  if (pool_) {
+    pool_->release_file(file_id,
+                        static_cast<std::size_t>(old_data_file->size()));
+  }
   counters_.vacuum_files_unlinked.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -4147,6 +4153,8 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
       {"bytecask.pool_frames_total", pool ? pool->frames_total : 0},
       {"bytecask.pool_frames_resident",
        pool ? pool->frames_resident.load(std::memory_order_relaxed) : 0},
+      {"bytecask.pool_frames_released",
+       pool ? pool->frames_released.load(std::memory_order_relaxed) : 0},
       {"bytecask.pool_direct_io_fallbacks",
        pool ? pool->direct_io_fallbacks.load(std::memory_order_relaxed) : 0},
       {"bytecask.vacuum_bytes_reclaimed",
