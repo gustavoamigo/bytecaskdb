@@ -73,8 +73,9 @@ bytecaskdb-mariadb-plugin/benchmarks/sysbench_longrun_results.csv
 
 .notes
 
-# Claude Code local state — except the SessionStart hook and its registration,
-# which provision the toolchain for Claude Code on the web (see CONTRIBUTING.md).
+# Claude Code local state — except the hooks and their registration: the
+# SessionStart hook provisions the toolchain for Claude Code on the web, and
+# serena.sh runs Serena's hooks (see CONTRIBUTING.md).
 # Re-inclusion has to walk down one directory at a time: git will not re-include
 # a path whose parent directory is itself excluded.
 .claude/*
@@ -82,6 +83,7 @@ bytecaskdb-mariadb-plugin/benchmarks/sysbench_longrun_results.csv
 !.claude/hooks/
 .claude/hooks/*
 !.claude/hooks/session-start.sh
+!.claude/hooks/serena.sh
 
 # Local tools (e.g. nektos/act)
 bin/

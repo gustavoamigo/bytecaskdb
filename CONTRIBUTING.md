@@ -30,7 +30,54 @@ environment shape the script — Ubuntu's packaged xmake (2.8.7) is too old to
 load the current xmake-repo, and the egress policy blocks `xmake.io` and GitHub
 archive downloads while allowing git, which is why xmake is cloned and built
 rather than installed. The hook is a no-op everywhere else: local checkouts, the
-Dev Container, and Codespaces already have the toolchain.
+Dev Container, and Codespaces already have the toolchain. On the web the hook
+also installs [Serena](https://oraios.github.io/serena/), best-effort.
+
+## Serena (optional)
+
+[Serena](https://oraios.github.io/serena/) gives coding agents symbol-level
+navigation and editing through clangd. The repository is set up for it, and
+everything is a silent no-op when it is not installed: the `serena` entry in
+`.mcp.json` then serves an empty MCP server, and the hooks and build step do
+nothing.
+
+```bash
+uv tool install -p 3.13 serena-agent
+```
+
+Then trust the checkout in `~/.serena/serena_config.yml` (Serena creates the
+file on first run). Without this Serena ignores the project's clangd settings
+and downloads its own clangd, which cannot read the module files clang builds:
+
+```yaml
+trusted_project_path_patterns:
+  - /path/to/bytecaskdb/**   # also covers worktrees created under it
+```
+
+How the pieces fit:
+
+- `.serena/project.yml` configures clangd only, using the clangd on `PATH`.
+  It has no `project_name`, so Serena names each project after its folder and
+  every git worktree is a project of its own, with its own cache under
+  `.serena/` (gitignored).
+- clangd reads `compile_commands.json`, which is gitignored and per checkout.
+  Serena generates it on activation when it is missing; building
+  `bytecask_tests` regenerates it when the build files or its sources change,
+  then refreshes Serena's index in the background (log in
+  `.serena/logs/index.log`). Both are skipped when Serena is not installed or
+  `CI` is set.
+- The index is incremental: Serena caches symbols per file by content, so a
+  refresh asks clangd only about changed files. A changed
+  `compile_commands.json` drops the whole cache. `scripts/serena_index.sh`
+  refreshes it by hand.
+- The Claude Code hooks (`.claude/hooks/serena.sh`) run Serena's `activate`,
+  `remind`, `auto-approve` and `cleanup`
+  [hooks](https://oraios.github.io/serena/02-usage/030_clients.html).
+  `remind` denies runs of `grep` and code-file reads that ignore Serena's
+  tools.
+
+A worktree nested inside the main checkout (as Claude Code creates under
+`.claude/worktrees/`) needs `xmake -P .`, or xmake builds the parent checkout.
 
 ## Making a change
 

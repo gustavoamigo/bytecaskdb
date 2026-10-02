@@ -229,6 +229,33 @@ target("bytecask_tests")
         apply_coverage(t)
         add_release_opts(t)
     end)
+    -- Keeps the Serena symbol index current (scripts/serena_index.sh): only
+    -- where Serena is installed, never on CI. compile_commands.json is
+    -- regenerated inside the build, when the project files or this target's
+    -- sources change, because a nested `xmake project` would block on the
+    -- project lock. The index itself runs detached, so the build returns.
+    after_build(function(t)
+        import("lib.detect.find_program")
+        local home = os.getenv("HOME") or ""
+        if os.getenv("CI") or not find_program("serena",
+                {paths = {path.join(home, ".local", "bin")}, norun = true}) then
+            return
+        end
+        import("core.base.task")
+        import("core.project.config")
+        import("core.project.depend")
+        import("core.project.project")
+        local root = os.projectdir()
+        depend.on_changed(function()
+            task.run("project", {kind = "compile_commands", target = t:name(),
+                                 outputdir = root})
+            os.vrunv("python3", {"scripts/fix_compile_commands.py"}, {curdir = root})
+        end, {dependfile = path.join(config.builddir(), ".gens", "serena", t:name() .. ".d"),
+              files = table.join(project.allfiles(), config.filepath()),
+              values = t:sourcefiles(),
+              changed = not os.isfile(path.join(root, "compile_commands.json"))})
+        os.vrunv(path.join(root, "scripts", "serena_index.sh"), {"--background"})
+    end)
 
 target("btree_tests")
     set_kind("binary")

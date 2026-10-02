@@ -231,3 +231,4 @@ The README targets an experienced systems/database engineering audience. They kn
 ## Tips
 
 * Build and run the test suite with `xmake build bytecask_tests && xmake run bytecask_tests`. xmake can take a while; wait for it to finish before doing anything else.
+* When the Serena MCP tools are available, prefer them for C++ navigation and edits: `find_symbol`, `find_referencing_symbols` and `get_symbols_overview` resolve through clangd, across module boundaries. If a lookup comes back empty, `compile_commands.json` may be stale: build `bytecask_tests` or run `scripts/serena_index.sh`. Setup is in CONTRIBUTING.md, "Serena".

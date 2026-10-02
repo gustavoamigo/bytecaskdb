@@ -89,5 +89,19 @@ xmake f --toolchain=clang \
         --cxflags="-resource-dir=$(clang --print-resource-dir)" \
         -m debug -y >&2
 
+# Serena — symbol-level code navigation over MCP (.mcp.json). Best-effort:
+# without it the session still starts, and the MCP entry serves an empty
+# server. Installed with the system Python (noble's 3.12 satisfies Serena's
+# >=3.11), since uv's managed Pythons download from GitHub releases, which
+# 403 here.
+if ! command -v serena >/dev/null 2>&1; then
+  log "installing serena (cached afterwards)"
+  {
+    command -v uv >/dev/null 2>&1 \
+      || pip install --quiet --break-system-packages uv
+    UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --python-preference only-system serena-agent
+  } >&2 || log "serena install failed; continuing without it"
+fi
+
 echo "Toolchain ready. Build and test with:"
 echo "  xmake build bytecask_tests && xmake run bytecask_tests"

@@ -1,0 +1,5 @@
+# Everything Serena writes here (symbol cache, logs, its rewritten
+# compile_commands.json, project.local.yml, memories) is per checkout.
+/*
+!/.gitignore
+!/project.yml
