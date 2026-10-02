@@ -879,6 +879,7 @@ TEST_CASE("BufferPool: readers racing release_file always read the file's "
   for (auto &r : readers) r.join();
   CHECK(bad.load() == 0);
   CHECK(pool.counters().frames_released.load() > 0);
+}
 
 // ---------------------------------------------------------------------------
 // Reservation: the active file's frames admitted ahead of the writer, which
