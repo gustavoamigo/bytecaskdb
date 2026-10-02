@@ -77,10 +77,11 @@ jobs:
         # in chaos-nightly.yml.
         run: python3 -m unittest tests/chaos/test_chaosfs.py -v
 
-      - name: Run proof independence tests (Hypothesis)
+      - name: Run proof independence tests (Hypothesis) and the Python reference
         run: |
           xmake build bytecaskdb_python
-          PYTHONPATH=bytecaskdb-python python3 -m pytest tests/proof/test_independence.py -v
+          PYTHONPATH=bytecaskdb-python python3 -m pytest tests/proof/test_independence.py \
+            bytecaskdb-python/tests/test_reference.py -v
 
       - name: Enrich JUnit reports with source metadata
         if: ${{ always() && !cancelled() }}

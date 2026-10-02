@@ -87,6 +87,19 @@ The locking strategy respects the engine's existing thread model:
 
 Under GIL Python, all nanobind locking primitives (`nb::ft_mutex`, `nb::lock_self()`) are no-ops — zero overhead.
 
+### Python Reference Implementation
+
+`bytecaskdb-python/reference/bytecask_ref.py` is the engine's model in one file of plain Python, written to be read. It has the binding's API (`DB`, `Snapshot`, `WritePlan`, the four iterators, `put`/`del_`/`del_range`/`apply_batch` with every guard). It contains only what decides what a read returns:
+
+- **Write path.** One lock. A plan's preconditions are checked against the published key directory. Its entries are appended in one write, with BulkBegin/BulkEnd around more than one write and one sequence per entry, markers included. Then the file is synced if asked, the new key directory is built, and only after that is it published.
+- **Key directory.** An unbalanced persistent BST built by path copying. A snapshot is a root. Each node maps a key to its record's file, offset and sequence. A value is read from its record, and the record's CRC, key and sequence are checked.
+- **Recovery.** Every data file is replayed in order of its first sequence, through the same `apply_entry` the write path uses. A batch counts once its BulkEnd is read. A file that does not parse to its end is truncated if it is the newest file, or if what follows is zeros. Anywhere else, open refuses.
+- **Guards.** These match `validate_preconditions`. A key is unchanged if its sequence, or its absence, is the same in the snapshot and the head. A key created and then deleted after the snapshot is absent from both, so it does not conflict.
+
+It writes the V01 format, so the engine opens a database it wrote (generating the hints) and it opens one the engine wrote (ignoring the hints). Hints, vacuum, group commit, preallocation, the buffer pool, replication, degraded mode and the directory lock are left out. A database the engine left mid-vacuum, with a compacted copy beside the original, is for the engine to open first.
+
+`bytecaskdb-python/tests/test_reference.py` runs it against the native binding. A seeded workload of puts, deletes, range deletes and guarded plans runs on both engines, with snapshots held across writes, rotation, reopens and native vacuum. Every commit or conflict, every sequence and every `get` and scan must agree. File-format tests cover both directions. It runs in `ci.yml`.
+
 ## Design Principles
 
 The design follows these core tenets in order of priority:

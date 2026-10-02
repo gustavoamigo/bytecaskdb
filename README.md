@@ -533,6 +533,8 @@ ByteCaskDB is designed around four core tenets, in priority order:
 
 **Recovery**: on `open`, the engine generates a hint file for any data file that lacks one — after a crash, the file that was active and any sealed file still waiting for its hint — then replays all hint files in parallel to rebuild the key directory. A hint-less file is first read back and synced, so the hint never indexes bytes that were only in the page cache. Hint files are compact per-file indexes, sorted by key and compressed with zstd, written atomically (`write → fdatasync → rename`) by a background worker after each file rotation and synchronously at engine close. No raw data-file scan is performed — recovery reads only hint files.
 
+To see the whole model in one file, read [`bytecaskdb-python/reference/bytecask_ref.py`](bytecaskdb-python/reference/bytecask_ref.py). It is a plain-Python reference implementation with the same API and the same file format, but without hint files, vacuum or any optimisation. It is checked against the engine in CI.
+
 Start with [`docs/bytecask_intro.md`](docs/bytecask_intro.md) for a first-pass happy-path overview, then use [`docs/bytecask_design.md`](docs/bytecask_design.md) as the full design reference.
 
 ## Building
@@ -588,6 +590,7 @@ If you want to take it in a different direction and fork it into your own thing,
 | [`docs/replication_primitives_design.md`](docs/replication_primitives_design.md) | Replication primitives: minimal API surface for building leader-follower replication on top of ByteCaskDB |
 | [`docs/buffer_pool_design.md`](docs/buffer_pool_design.md) | Buffer pool: bounded, `O_DIRECT`-filled value cache for memory-constrained deployments, with measurements |
 | [`docs/xa_support_design.md`](docs/xa_support_design.md) | XA / two-phase commit: generic 2PC primitives (`BulkPrepare`, `Bulk2PCCommit`, `Bulk2PCRollback`) for external coordinators |
+| [`bytecaskdb-python/reference/bytecask_ref.py`](bytecaskdb-python/reference/bytecask_ref.py) | The model in one file: a plain-Python reference implementation of the API and file format, checked against the engine |
 | [`bytecaskdb-node/`](bytecaskdb-node/) | Node.js package: WASM (Embind) and native (N-API) backends behind one TypeScript API |
 | [`CONTRACT.md`](CONTRACT.md) | Per-function behavioral contracts: atomicity, durability, I/O failure safety, sequence invariants |
 
