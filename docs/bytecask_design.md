@@ -296,6 +296,8 @@ On the write path, `prepare_write` emits one `DataEntryView` per range delete. `
 
 Range deletes are supported on `DB::del_range` and `WritePlan::del_range`. Inside a batch, they are framed by `BulkBegin`/`BulkEnd` like other operations. Existing guards (`ensure_unchanged`, `ensure_range_unchanged`, implicit W-W check) detect concurrent range deletes without changes — erased keys produce sequence mismatches.
 
+A range guard and the implicit W-W check of a planned `del_range` are one check, `TransientEngineState::range_changed(snap, from, to)`: `[from, to)` has changed when a key in the head carries a sequence the snapshot does not hold for it (changed or inserted), or a key in the snapshot is absent from the head (deleted, by `del` or a range tombstone). Two passes are needed because a deletion leaves no entry to carry a sequence. A key vacuum relocated keeps its sequence and is not a change; a key inserted and deleted again since the snapshot is not one either. The check runs against the pipeline head, so it sees writes of earlier slots in the same group that are not yet published. `tests/range_conflict_test.cpp` checks it against a `std::map` model of the range, with the intervening writes published, in the same group commit, followed by vacuum, or replayed by `resume()`.
+
 ##### TransientEngineState
 
 `TransientEngineState` is the mutable working copy for all write-path state transitions. It follows the same `transient()` / `persistent()` pattern as the key directory tree.
