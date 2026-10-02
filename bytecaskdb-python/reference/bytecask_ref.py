@@ -23,9 +23,10 @@ a database written here, and this opens one the engine wrote.
 
 Left out, because none of it changes what a read returns: hint files, vacuum,
 group commit, the buffer pool, preallocation, replication, degraded mode and
-the directory lock. The tree here is a plain unbalanced BST that stores keys;
-the engine's is a B+ tree whose leaves hold no key bytes. Sorted inserts make
-it a list, so it is for reading and testing, not for loads.
+the directory lock. The tree (persistent_tree.py, CRC-32C in checksum.py) is a
+plain unbalanced BST that stores keys; the engine's is a B+ tree whose leaves
+hold no key bytes. Sorted inserts make it a list, so it is for reading and
+testing, not for loads.
 """
 
 from __future__ import annotations
@@ -40,30 +41,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, NamedTuple
 
-# ---------------------------------------------------------------------------
-# CRC-32C (Castagnoli), table-driven. The standard library has only CRC-32.
-# ---------------------------------------------------------------------------
-
-
-def _crc32c_table() -> list[int]:
-    table = []
-    for i in range(256):
-        c = i
-        for _ in range(8):
-            c = (c >> 1) ^ 0x82F63B78 if c & 1 else c >> 1
-        table.append(c)
-    return table
-
-
-_CRC_TABLE = _crc32c_table()
-
-
-def crc32c(data: bytes) -> int:
-    c = 0xFFFFFFFF
-    for b in data:
-        c = _CRC_TABLE[(c ^ b) & 0xFF] ^ (c >> 8)
-    return c ^ 0xFFFFFFFF
-
+from checksum import crc32c
+from persistent_tree import PersistentTree
 
 # ---------------------------------------------------------------------------
 # Data file entries
@@ -149,11 +128,8 @@ def scan_committed(buf: bytes) -> tuple[list[tuple[int, Entry]], int]:
 
 
 # ---------------------------------------------------------------------------
-# The key directory: a persistent (immutable) binary search tree
-#
-# A node is never changed after it is built. Inserting or erasing copies the
-# nodes on the path from the root to the change and shares everything else,
-# so every older root still describes the tree as it was.
+# The key directory: an immutable sorted map from key to the location of the
+# key's newest record. Every write publishes a new one; a snapshot keeps one.
 # ---------------------------------------------------------------------------
 
 
@@ -163,133 +139,23 @@ class Location(NamedTuple):
     sequence: int
 
 
-class Node:
-    __slots__ = ("key", "loc", "left", "right")
-
-    def __init__(self, key: bytes, loc: Location, left: Node | None, right: Node | None):
-        self.key = key
-        self.loc = loc
-        self.left = left
-        self.right = right
+KeyDir = PersistentTree[bytes, Location]
 
 
-Path_ = list[tuple[Node, bool]]  # (node, went_left) from the root down
-
-
-def _rebuild(path: Path_, child: Node | None) -> Node | None:
-    """Copies the path bottom-up, hanging child where the path ended."""
-    for node, went_left in reversed(path):
-        if went_left:
-            child = Node(node.key, node.loc, child, node.right)
-        else:
-            child = Node(node.key, node.loc, node.left, child)
-    return child
-
-
-def tree_get(root: Node | None, key: bytes) -> Location | None:
-    node = root
-    while node is not None:
-        if key == node.key:
-            return node.loc
-        node = node.left if key < node.key else node.right
-    return None
-
-
-def tree_put(root: Node | None, key: bytes, loc: Location) -> Node | None:
-    path: Path_ = []
-    node = root
-    while node is not None and key != node.key:
-        went_left = key < node.key
-        path.append((node, went_left))
-        node = node.left if went_left else node.right
-    if node is None:
-        return _rebuild(path, Node(key, loc, None, None))
-    return _rebuild(path, Node(key, loc, node.left, node.right))
-
-
-def tree_erase(root: Node | None, key: bytes) -> Node | None:
-    path: Path_ = []
-    node = root
-    while node is not None and key != node.key:
-        went_left = key < node.key
-        path.append((node, went_left))
-        node = node.left if went_left else node.right
-    if node is None:
-        return root  # absent: the same tree
-    if node.left is None:
-        return _rebuild(path, node.right)
-    if node.right is None:
-        return _rebuild(path, node.left)
-    # Two children: the successor (leftmost of the right subtree) takes its place.
-    succ_path: Path_ = []
-    succ = node.right
-    while succ.left is not None:
-        succ_path.append((succ, True))
-        succ = succ.left
-    right = _rebuild(succ_path, succ.right)
-    return _rebuild(path, Node(succ.key, succ.loc, node.left, right))
-
-
-def tree_ascend(root: Node | None, start: bytes = b"") -> Iterator[tuple[bytes, Location]]:
-    """Keys >= start, ascending."""
-    stack: list[Node] = []
-    node = root
-    while node is not None:  # the path to start; nodes below start are skipped
-        if node.key >= start:
-            stack.append(node)
-            node = node.left
-        else:
-            node = node.right
-    while stack:
-        node = stack.pop()
-        yield node.key, node.loc
-        node = node.right
-        while node is not None:
-            stack.append(node)
-            node = node.left
-
-
-def tree_descend(root: Node | None, start: bytes | None = None) -> Iterator[tuple[bytes, Location]]:
-    """Keys <= start, descending; every key when start is None."""
-    stack: list[Node] = []
-    node = root
-    while node is not None:
-        if start is None or node.key <= start:
-            stack.append(node)
-            node = node.right
-        else:
-            node = node.left
-    while stack:
-        node = stack.pop()
-        yield node.key, node.loc
-        node = node.left
-        while node is not None:
-            stack.append(node)
-            node = node.right
-
-
-def tree_range(root: Node | None, start: bytes, end: bytes) -> Iterator[tuple[bytes, Location]]:
-    """Keys in [start, end)."""
-    for key, loc in tree_ascend(root, start):
-        if key >= end:
-            return
-        yield key, loc
-
-
-def apply_entry(root: Node | None, file_id: int, offset: int, e: Entry) -> Node | None:
+def apply_entry(keydir: KeyDir, file_id: int, offset: int, e: Entry) -> KeyDir:
     """The key directory after entry e, written at (file_id, offset).
 
     Both the write path and recovery go through here: opening a database is
     replaying its writes.
     """
     if e.type == EntryType.Put:
-        return tree_put(root, e.key, Location(file_id, offset, e.sequence))
+        return keydir.set(e.key, Location(file_id, offset, e.sequence))
     if e.type == EntryType.Delete:
-        return tree_erase(root, e.key)
+        return keydir.discard(e.key)
     if e.type == EntryType.RangeDel:
-        for key in [k for k, _ in tree_range(root, e.key, e.value)]:
-            root = tree_erase(root, key)
-    return root  # BulkBegin / BulkEnd: structure only
+        for key, _ in list(keydir.ascending(e.key, e.value)):
+            keydir = keydir.remove(key)
+    return keydir  # BulkBegin / BulkEnd: structure only
 
 
 # ---------------------------------------------------------------------------
@@ -325,37 +191,37 @@ class CommitResult:
 
 
 class Snapshot:
-    """A read-only view of the database at one instant: a key directory root.
+    """A read-only view of the database at one instant: a key directory.
 
     Unlike the native binding's, it is not consumed by WritePlan; an immutable
     tree can be shared freely.
     """
 
-    def __init__(self, db: DB, root: Node | None):
+    def __init__(self, db: DB, keydir: KeyDir):
         self._db = db
-        self._root = root
+        self._keydir = keydir
 
     def get(self, key: bytes, opts: ReadOptions | None = None) -> bytes | None:
-        loc = tree_get(self._root, key)
+        loc = self._keydir.get(key)
         return None if loc is None else self._db._read_value(key, loc, opts)
 
     def contains_key(self, key: bytes, opts: ReadOptions | None = None) -> bool:
-        return tree_get(self._root, key) is not None
+        return key in self._keydir
 
     def iter_from(self, from_key: bytes = b"", opts: ReadOptions | None = None) -> Iterator[tuple[bytes, bytes]]:
-        for key, loc in tree_ascend(self._root, from_key):
+        for key, loc in self._keydir.ascending(from_key):
             yield key, self._db._read_value(key, loc, opts)
 
     def keys_from(self, from_key: bytes = b"", opts: ReadOptions | None = None) -> Iterator[bytes]:
-        for key, _ in tree_ascend(self._root, from_key):
+        for key, _ in self._keydir.ascending(from_key):
             yield key
 
     def riter_from(self, from_key: bytes = b"", opts: ReadOptions | None = None) -> Iterator[tuple[bytes, bytes]]:
-        for key, loc in tree_descend(self._root, from_key or None):
+        for key, loc in self._keydir.descending(from_key or None):
             yield key, self._db._read_value(key, loc, opts)
 
     def rkeys_from(self, from_key: bytes = b"", opts: ReadOptions | None = None) -> Iterator[bytes]:
-        for key, _ in tree_descend(self._root, from_key or None):
+        for key, _ in self._keydir.descending(from_key or None):
             yield key
 
     def __enter__(self) -> Snapshot:
@@ -416,37 +282,37 @@ def _seq(loc: Location | None) -> int:
     return 0 if loc is None else loc.sequence
 
 
-def _range_changed(now: Node | None, then: Node | None, start: bytes, end: bytes) -> bool:
+def _range_changed(now: KeyDir, then: KeyDir, start: bytes, end: bytes) -> bool:
     """Whether any key in [start, end) was written, or erased, between two trees.
 
     A key created and erased in between is absent from both, and does not count.
     """
-    if any(loc.sequence != _seq(tree_get(then, k)) for k, loc in tree_range(now, start, end)):
+    if any(loc.sequence != _seq(then.get(k)) for k, loc in now.ascending(start, end)):
         return True
-    return any(tree_get(now, k) is None for k, _ in tree_range(then, start, end))
+    return any(k not in now for k, _ in then.ascending(start, end))
 
 
-def _preconditions_hold(plan: WritePlan, root: Node | None) -> bool:
-    snap = plan._snap._root if plan._snap is not None else None
+def _preconditions_hold(plan: WritePlan, head: KeyDir) -> bool:
+    snap = plan._snap._keydir if plan._snap is not None else KeyDir()
     for key, kind in plan._guards.items():
-        loc = tree_get(root, key)
+        loc = head.get(key)
         if kind == "present" and loc is None:
             return False
         if kind == "absent" and loc is not None:
             return False
-        if kind == "unchanged" and _seq(loc) != _seq(tree_get(snap, key)):
+        if kind == "unchanged" and _seq(loc) != _seq(snap.get(key)):
             return False
     for start, end in plan._range_guards:
-        if _range_changed(root, snap, start, end):
+        if _range_changed(head, snap, start, end):
             return False
     if plan._snap is None:
         return True
     # Every key the plan writes must be as the snapshot saw it.
     for typ, key, value in plan._writes:
         if typ == EntryType.RangeDel:
-            if _range_changed(root, snap, key, value):
+            if _range_changed(head, snap, key, value):
                 return False
-        elif _seq(tree_get(root, key)) != _seq(tree_get(snap, key)):
+        elif _seq(head.get(key)) != _seq(snap.get(key)):
             return False
     return True
 
@@ -458,7 +324,7 @@ class DB:
         self._opts = opts
         self._lock = threading.Lock()  # writers only
         self._fds: dict[int, int] = {}  # file_id -> descriptor, for reads
-        self._root: Node | None = None  # the published key directory
+        self._keydir: KeyDir = KeyDir()  # the published key directory
         self._next_seq = 1
         self._active_id = 0
         self._active_size = 0
@@ -474,11 +340,11 @@ class DB:
         db._start_active_file()
         return db
 
-    # --- Reads: lock-free, from whatever root is published -----------------
+    # --- Reads: lock-free, from whatever key directory is published ---------
 
     def snapshot(self) -> Snapshot:
         self._check_open()
-        return Snapshot(self, self._root)
+        return Snapshot(self, self._keydir)
 
     def get(self, key: bytes, opts: ReadOptions | None = None) -> bytes | None:
         return self.snapshot().get(key, opts)
@@ -545,7 +411,7 @@ class DB:
         self._check_sizes(plan._writes)
         with self._lock:
             self._check_open()
-            if not _preconditions_hold(plan, self._root):
+            if not _preconditions_hold(plan, self._keydir):
                 return None
             if not plan._writes:
                 if sync:
@@ -573,10 +439,10 @@ class DB:
             self._next_seq += len(entries)
 
             # 2. Build the new key directory, then publish it: durable before visible.
-            root = self._root
+            keydir = self._keydir
             for e, off in zip(entries, offsets):
-                root = apply_entry(root, self._active_id, off, e)
-            self._root = root
+                keydir = apply_entry(keydir, self._active_id, off, e)
+            self._keydir = keydir
 
             if self._active_size >= self._opts.max_file_bytes:
                 self._rotate()
@@ -651,7 +517,7 @@ class DB:
                 os.truncate(path, end)
             self._fds[file_id] = os.open(path, os.O_RDWR)
             for off, entry in committed:
-                self._root = apply_entry(self._root, file_id, off, entry)
+                self._keydir = apply_entry(self._keydir, file_id, off, entry)
                 self._next_seq = max(self._next_seq, entry.sequence + 1)
 
 

@@ -26,33 +26,6 @@ def data_files(path):
 # ---------------------------------------------------------------------------
 
 
-def test_crc32c_check_value():
-    assert ref.crc32c(b"123456789") == 0xE3069283
-
-
-def test_tree_is_persistent():
-    loc = lambda s: ref.Location(1, 0, s)  # noqa: E731
-    roots = [None]
-    keys = [b"m", b"c", b"x", b"a", b"e", b"z", b"d"]
-    for i, k in enumerate(keys, start=1):
-        roots.append(ref.tree_put(roots[-1], k, loc(i)))
-    roots.append(ref.tree_erase(roots[-1], b"c"))  # two children
-    roots.append(ref.tree_erase(roots[-1], b"m"))  # the root
-    roots.append(ref.tree_put(roots[-1], b"x", loc(99)))
-
-    def keys_of(root):
-        return [k for k, _ in ref.tree_ascend(root)]
-
-    # Every older root still holds exactly what it held when it was made.
-    for n in range(len(keys) + 1):
-        assert keys_of(roots[n]) == sorted(keys[:n])
-    assert keys_of(roots[-1]) == [b"a", b"d", b"e", b"x", b"z"]
-    assert ref.tree_get(roots[-1], b"x").sequence == 99
-    assert ref.tree_get(roots[-2], b"x").sequence == 3
-    assert [k for k, _ in ref.tree_descend(roots[-1], b"w")] == [b"e", b"d", b"a"]
-    assert [k for k, _ in ref.tree_ascend(roots[-1], b"b")] == [b"d", b"e", b"x", b"z"]
-
-
 def test_sequences_and_framing(tmp_path):
     with ref.DB.open(tmp_path) as db:
         assert db.put(b"a", b"1").sequence == 1
