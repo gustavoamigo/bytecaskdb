@@ -144,7 +144,7 @@ for each range guard R in plan:
     for each key K in range:
         snap_entry = snap.state_->key_dir.find(K)
         snap_seq   = snap_entry ? snap_entry->sequence : 0
-        if K.sequence > snap_seq → conflict (key inserted or modified since snapshot)
+        if K.sequence != snap_seq → conflict (key inserted or modified since snapshot)
     scan snap key_dir from lower_bound(R.from) to R.to
     for each key K in snap range:
         if !current key_dir contains K → conflict (key deleted since snapshot)
@@ -159,6 +159,8 @@ for each write key K in plan:
     if snap_entry and current_entry and
        current_entry.sequence != snap_entry.sequence:
         → conflict (key was modified after snapshot was taken)
+for each del_range [from, to) in plan:
+    same two scans as a range guard over [from, to)
 
 on first conflict:
     unlock write_mu_

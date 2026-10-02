@@ -682,6 +682,14 @@ public:
   [[nodiscard]] auto persistent() && -> std::shared_ptr<EngineState>;
 
 private:
+  // Returns true if [from, to) differs between snap and the head: a key
+  // changed, inserted or deleted since snap. Sets lost_to as
+  // validate_preconditions documents. Shared by range guards and the
+  // implicit W-W check of a planned del_range.
+  [[nodiscard]] auto range_changed(const EngineState &snap,
+                                   std::span<const std::byte> from,
+                                   std::span<const std::byte> to,
+                                   std::uint64_t &lost_to) const -> bool;
   // Where key_dir_ reads the keys it does not store: this transient's files
   // and the records it has not written yet.
   [[nodiscard]] auto kd_ctx() const -> KeyDirCtx {
@@ -1998,29 +2006,8 @@ auto TransientEngineState::validate_preconditions(
   }
 
   // 2. Range guards (only present when snap_ is set — enforced at build time).
-  for (const auto &rg : plan.range_guards_) {
-    const std::span<const std::byte> from_span{rg.from};
-    const std::span<const std::byte> to_span{rg.to};
-
-    // Check current state for keys modified since snapshot.
-    for (auto it = kd_lower_bound(key_dir_, from_span, kd_ctx());
-         it != std::default_sentinel; ++it) {
-      auto [key_span, entry] = *it;
-      if (Key{key_span} >= Key{to_span}) break;
-      const auto snap_entry = kd_get(snap_state->key_dir, key_span, snap_state->kd_ctx());
-      const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence() : 0;
-      if (entry.sequence() != snap_seq) return lost(entry);
-    }
-
-    // Check snapshot for keys deleted since snapshot.
-    for (auto it = kd_lower_bound(snap_state->key_dir, from_span,
-                                         snap_state->kd_ctx());
-         it != std::default_sentinel; ++it) {
-      auto [key_span, entry] = *it;
-      if (Key{key_span} >= Key{to_span}) break;
-      if (!kd_get(key_dir_, key_span, kd_ctx())) return lost(std::nullopt);
-    }
-  }
+  for (const auto &rg : plan.range_guards_)
+    if (range_changed(*snap_state, rg.from, rg.to, lost_to)) return false;
 
   // 3. Implicit W-W check on all write keys (only when snapshot present).
   if (snap_state) {
@@ -2050,34 +2037,7 @@ auto TransientEngineState::validate_preconditions(
                           std::is_same_v<T, WritePlan::PointDel>) {
               has_conflict = point_conflict(i, op.key);
             } else if constexpr (std::is_same_v<T, WritePlan::RangeDel>) {
-              // Range conflict check: verify no keys in [from, to) changed since snapshot
-              const std::span<const std::byte> from_span{op.from};
-              const std::span<const std::byte> to_span{op.to};
-
-              // Check current state for keys modified since snapshot.
-              for (auto it = kd_lower_bound(key_dir_, from_span, kd_ctx());
-                   it != std::default_sentinel && !has_conflict; ++it) {
-                auto [key_span, entry] = *it;
-                if (Key{key_span} >= Key{to_span}) break;
-                const auto snap_entry = kd_get(snap_state->key_dir, key_span, snap_state->kd_ctx());
-                const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence() : 0;
-                if (entry.sequence() != snap_seq) {
-                  has_conflict = true;
-                  lost_to = entry.sequence();
-                }
-              }
-
-              // Check snapshot for keys deleted since snapshot.
-              for (auto it = kd_lower_bound(snap_state->key_dir, from_span,
-                                         snap_state->kd_ctx());
-                   it != std::default_sentinel && !has_conflict; ++it) {
-                auto [key_span, entry] = *it;
-                if (Key{key_span} >= Key{to_span}) break;
-                if (!kd_get(key_dir_, key_span, kd_ctx())) {
-                  has_conflict = true;
-                  lost_to = head_latest;
-                }
-              }
+              has_conflict = range_changed(*snap_state, op.from, op.to, lost_to);
             }
           },
           plan.writes_[i]);
@@ -2086,6 +2046,39 @@ auto TransientEngineState::validate_preconditions(
   }
 
   return true;
+}
+
+auto TransientEngineState::range_changed(const EngineState &snap,
+                                         std::span<const std::byte> from,
+                                         std::span<const std::byte> to,
+                                         std::uint64_t &lost_to) const -> bool {
+  // Keys changed or inserted since the snapshot: present in the head with a
+  // sequence the snapshot does not hold for them. A key vacuum relocated
+  // keeps its sequence, so it is not a change.
+  for (auto it = kd_lower_bound(key_dir_, from, kd_ctx());
+       it != std::default_sentinel; ++it) {
+    auto [key_span, entry] = *it;
+    if (Key{key_span} >= Key{to}) break;
+    const auto snap_entry = kd_get(snap.key_dir, key_span, snap.kd_ctx());
+    const std::uint64_t snap_seq = snap_entry ? snap_entry->sequence() : 0;
+    if (entry.sequence() != snap_seq) {
+      lost_to = entry.sequence();
+      return true;
+    }
+  }
+  // Keys deleted since the snapshot, by del or by a range tombstone: present
+  // in the snapshot, absent from the head. They leave no entry to carry a
+  // sequence, so a retry has to see the head's latest.
+  for (auto it = kd_lower_bound(snap.key_dir, from, snap.kd_ctx());
+       it != std::default_sentinel; ++it) {
+    auto [key_span, entry] = *it;
+    if (Key{key_span} >= Key{to}) break;
+    if (!kd_get(key_dir_, key_span, kd_ctx())) {
+      lost_to = next_seq_ - 1;
+      return true;
+    }
+  }
+  return false;
 }
 
 void WritePlan::resolve_snapshot_entries() {

@@ -75,8 +75,12 @@ appends, when a fresh key takes its slot. This is the same scheme Jepsen's
 
 **Not modelled in this pass.** `del`, `del_range`, and
 `ensure_range_unchanged` have no counterpart in `list-append`, and Elle
-checks items, not predicates. Phantoms and range guards remain covered only
-by the pairwise tests. That gap is stated here rather than worked around.
+checks items, not predicates. The conflict check behind range guards and
+planned range deletes is tested against a model of the key range
+(`tests/range_conflict_test.cpp`), including against a write in the same
+group commit, but one write at a time: no concurrent history runs a range
+guard against a write it has to lose to while that write is in flight (#302).
+That gap is stated here rather than worked around.
 
 ## Configurations
 
