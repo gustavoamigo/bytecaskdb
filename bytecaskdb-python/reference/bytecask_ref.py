@@ -654,6 +654,11 @@ class DB:
         paths = sorted(self._dir.glob("*.data"))
         files = [_ScannedFile.read(file_id, path) for file_id, path in enumerate(paths, start=1)]
         newest = max((f.first_sequence for f in files), default=0)
+        # A crash tears only the file being written, so two files with data
+        # after their committed entries are damage.
+        torn = [f.path.name for f in files if f.has_data_past_end]
+        if len(torn) > 1:
+            raise RuntimeError(f"corrupt data files {', '.join(torn)}: more than one holds data past its end")
         for f in sorted(files, key=lambda f: f.first_sequence):
             # Every file but the newest was synced whole before the next one
             # was started. After its committed entries, a file may hold:

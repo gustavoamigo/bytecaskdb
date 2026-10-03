@@ -111,6 +111,7 @@ The docstring shows, with `dump(path)`, what a put followed by a two-write batch
 - **Recovery.** Every data file is replayed in order of its first sequence, through the same `apply_entry` the write path uses. A batch counts once its BULK_END is read. A file whose committed entries stop before its end falls into one of three cases:
   - zeros follow: they are cut;
   - data follows, in the newest file or in a file whose first sequence reads 0: it is cut, as in the engine's `recovery_check_tail`;
+  - data follows in more than one file: open refuses, since a crash tears only the file being written;
   - data follows, anywhere else: open refuses.
   - Before replaying, the newest file's committed bytes are written back and synced, and so is any cut. This is the engine's `rewrite_durably`/`truncate_durably`. Without it, a failed sync could leave those bytes only in the page cache, and a cut that was never synced could bring a torn tail back into a file that is no longer the newest.
 - **I/O errors.** A write or sync that fails with an I/O error stops all writes: they raise `DbDegraded`, while reads go on. `close()` raises `DbDegraded` too. Reopening is the only way back, and it rewrites the file as above. The engine also offers `resume()`; the reference does not.
@@ -1153,6 +1154,7 @@ Open scans every data file that has no hint: after a crash, the file that was ac
 | zeros only | any | trimmed, and the new length synced: the preallocated tail of the active file. Sealing truncates it and `fdatasync`s the truncate, so a sealed file does not normally carry one; one that does (sealed by an earlier build, say) is trimmed the same way |
 | anything else | no other file starts at a higher sequence | truncated: a torn tail |
 | anything else | another file starts at a higher sequence | refused in every mode; the file is left as found and no hint is written |
+| anything else | another hint-less file also holds something other than zeros past its last committed record | refused in every mode, before either file is cut: a crash tears one file |
 
 The rule rests on one invariant: only the file written last can hold a record a crash tore, because rotation, vacuum's copy and `resume()` all `fdatasync` a file before sealing it. "Written last" is read off sequences, which no two files share, so each file's first header orders them. A file whose first header is zero has no sequence to compare, and goes whole: it may be the newest file, never synced, whose first page a power cut lost while a later page reached the disk, and that open must succeed. Nothing outside the data files records how much of a file was synced, so in the newest file damage in synced data is indistinguishable from a torn tail and is truncated with it — the choice PostgreSQL makes for its WAL and RocksDB for its default recovery mode. `resume()` does not have that ambiguity: it knows the published extent and refuses below it.
 
@@ -1162,7 +1164,7 @@ What that leaves unrefused, besides damage in the newest file:
 - damage to the first header of a sealed file that leaves a sequence higher than any other file's;
 - damage that zeroes the sequence in the first header of a sealed hint-less file, which reads as a newest file whose first page was lost.
 
-None of these is a state a crash produces. Each needs storage to lose bytes it reported synced, and the engine relies on storage to keep that promise: it does not defend against its breaking. The refusal is a check on damage that happens to be visible, not a guarantee that a damaged database will not open.
+None of these is a state a crash produces: each needs storage to lose bytes it reported synced. The engine relies on storage to keep that promise, and refuses a database that shows it broken rather than open what is left of it. These are the shapes it cannot refuse, because each leaves exactly what a crash would. The last one is refused when the newest file is torn as well, since a crash tears one file; with a clean newest file it is not visible (#303).
 
 Before this, a torn record that failed its CRC refused the open in both modes, so an ordinary power cut during a write could leave the database unopenable, while a zeroed header or an oversized `value_size` in any hint-less file was trimmed silently.
 

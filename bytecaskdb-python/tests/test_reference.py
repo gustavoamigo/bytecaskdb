@@ -187,6 +187,27 @@ def test_a_file_whose_first_page_was_lost_is_cut(tmp_path):
     assert second.stat().st_size == 0
 
 
+def test_two_files_with_data_past_their_end_are_refused(tmp_path):
+    """A crash tears only the file being written. An older file with no first
+    sequence beside a torn newest one is damage, and neither is cut."""
+    with ref.DB.open(tmp_path) as db:
+        for i in range(5):
+            db.put(f"k{i}".encode(), b"v", NO_SYNC)
+    with ref.DB.open(tmp_path) as db:
+        db.put(b"y", b"1")
+        db.put(b"z", b"2")
+    older, newest = file_starting_at(tmp_path, 1), file_starting_at(tmp_path, 6)
+    raw = bytearray(older.read_bytes())
+    raw[:8] = bytes(8)
+    older.write_bytes(bytes(raw))
+    with open(newest, "r+b") as f:
+        f.truncate(newest.stat().st_size - 5)
+    sizes = older.stat().st_size, newest.stat().st_size
+    with pytest.raises(RuntimeError, match="corrupt data files"):
+        ref.DB.open(tmp_path)
+    assert (older.stat().st_size, newest.stat().st_size) == sizes
+
+
 def test_damage_in_an_older_file_is_refused(tmp_path):
     opts = ref.Options(max_file_bytes=1)  # a file per write
     with ref.DB.open(tmp_path, opts) as db:

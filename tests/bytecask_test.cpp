@@ -1411,6 +1411,29 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
          write_at(f[0], kEntry + 11, "\xff\xff\xff\x7f");
        },
        false, {}, 0},
+      // A crash tears one file. Two that need a cut are damage, and neither
+      // is cut: once for each file, since the row checks one.
+      {"zeroed first header, newest torn too: the older file",
+       [](auto &f) {
+         drop_hint(f[0]);
+         zero_at(f[0], 0, 8);
+         tear_last_entry(f[2]);
+       },
+       false, {}, 0},
+      {"zeroed first header, newest torn too: the newest file",
+       [](auto &f) {
+         drop_hint(f[0]);
+         zero_at(f[0], 0, 8);
+         tear_last_entry(f[2]);
+       },
+       false, {}, 2},
+      {"two files with a zeroed first header",
+       [](auto &f) {
+         drop_hint(f[1]);
+         zero_at(f[1], 0, 8);
+         zero_at(f[2], 0, 8);
+       },
+       false, {}, 1},
       {"sealed damage, newest torn too",
        [](auto &f) {
          drop_hint(f[1]);
