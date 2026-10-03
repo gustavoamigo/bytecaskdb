@@ -160,8 +160,9 @@ class FailureClass(Enum):
   no bytes reached the page cache — FUSE and network filesystems may not
   follow the Linux regular-file convention. The engine treats any `writev`
   failure as indeterminate: `tainted_` is always set, and the engine degrades.
-- **B2 — partial write**: `writev` returns 0 < N < total. N bytes are on
-  disk, kernel fd position advanced by N. `offset_` is not advanced (the
+- **B2 — partial write**: `writev` returns 0 < N < total, and sets no
+  `errno`; the append reports it as `EIO` with the byte counts (#221). N
+  bytes are on disk, kernel fd position advanced by N. `offset_` is not advanced (the
   throw in `append()` skips `offset_ +=`). The file is `tainted`. This
   class also covers sub-entry torn writes at the sector level: a power
   loss mid-flush can land some 512-byte sectors on disk and not others,

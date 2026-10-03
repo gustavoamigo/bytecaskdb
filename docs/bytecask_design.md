@@ -405,11 +405,9 @@ The engine validates structural invariants at runtime before publishing state, n
 
 On cold paths (`DB::open()`, `resume()`), `validate_state_consistency` runs the full O(n) structural check: active file in registry, no dangling file references, `next_seq` ahead of all sequences, `file_stats` covers all files, `live_bytes` matches `key_dir`. On violation it throws — the DB does not open or `resume()` fails.
 
-##### Partial write detection (tainted file)
+##### Short writes
 
-If `pwritev` returns a short write (0 < written < total), the append method sets a `tainted_` flag before throwing. A tainted file has bytes on disk that `offset_` does not account for. The next `pwritev` writes at the tracked `offset_` — past the partial data — so subsequent append offsets would be wrong if `offset_` were advanced.
-
-For multi-entry batches this is safe: the isolation rotation moves to a new file, abandoning the tainted one. For single-entry writes, the `apply_batch` catch block checks `file.is_tainted()` and degrades the DB if set. `resume()` then truncates the partial entry and restores a clean state.
+A `pwritev` on a regular file returns short when the file runs out of room part way (a full disk, `RLIMIT_FSIZE`), and sets no `errno`. Every data and hint file write checks its result with `check_write` (`bytecask.util`): -1 is reported with its `errno`, and a short count as `EIO` naming the bytes the file took, never as whatever an earlier call left in `errno` (#221). The write is not continued: the bytes that landed are past the logical end, the engine degrades as for any append failure, and `resume()` cuts what lies past the last committed record.
 
 ##### Durable sequence tracking
 

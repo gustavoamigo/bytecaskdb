@@ -5,13 +5,13 @@ and open refuses a torn tail it would otherwise have cut.
 Guarded-by: "*hint_sync_fails*"
 
 diff --git a/bytecaskdb/hint_file.cppm b/bytecaskdb/hint_file.cppm
-index 0e2bec4d..e0a93393 100644
+index e82f430..d57f70f 100644
 --- a/bytecaskdb/hint_file.cppm
 +++ b/bytecaskdb/hint_file.cppm
-@@ -596,7 +596,7 @@ public:
-       throw std::system_error{err, std::generic_category(),
-                               "HintFile::close: write CRC trailer failed"};
-     }
+@@ -590,7 +590,7 @@ public:
+     FAULT_HINT_WRITTEN(path_);
+ #endif
+     write_or_abandon(trailer, "HintFile::close: CRC trailer");
 -    if (sync_hint(write_fd_) != 0) {
 +    if (false) {
        const auto err = errno;

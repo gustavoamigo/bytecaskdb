@@ -17,6 +17,7 @@ module;
 #include <new>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <stdexcept>
 #include <sys/stat.h>
@@ -588,14 +589,7 @@ public:
     // The data file this indexes must be durable first (PageCacheModel).
     FAULT_HINT_WRITTEN(path_);
 #endif
-    if (::write(write_fd_, trailer.data(), trailer.size()) !=
-        std::ssize(trailer)) {
-      const auto err = errno;
-      ::close(write_fd_);
-      write_fd_ = -1;
-      throw std::system_error{err, std::generic_category(),
-                              "HintFile::close: write CRC trailer failed"};
-    }
+    write_or_abandon(trailer, "HintFile::close: CRC trailer");
     if (sync_hint(write_fd_) != 0) {
       const auto err = errno;
       ::close(write_fd_);
@@ -651,15 +645,23 @@ private:
   }
 
   void write_bytes(std::span<const std::byte> data) {
-    if (::write(write_fd_, data.data(), data.size()) !=
-        std::ssize(data)) {
-      const auto err = errno;
+    write_or_abandon(data, "HintFile::append");
+    crc_.update(data);
+  }
+
+  // A write that fails closes the descriptor: the .hint.tmp is abandoned,
+  // and startup removes it. check_write reads errno before close() can
+  // change it.
+  void write_or_abandon(std::span<const std::byte> data,
+                        std::string_view what) {
+    try {
+      check_write(::write(write_fd_, data.data(), data.size()), data.size(),
+                  what);
+    } catch (...) {
       ::close(write_fd_);
       write_fd_ = -1;
-      throw std::system_error{err, std::generic_category(),
-                              "HintFile::append: write failed"};
+      throw;
     }
-    crc_.update(data);
   }
 
   std::filesystem::path path_;

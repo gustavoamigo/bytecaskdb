@@ -566,10 +566,7 @@ struct WritableFileOps {
     FAULT_INJECTION_POST_WRITE(io_data_file_append_partial,
                                fd_, entry_offset, total);
 #endif
-    if (written != narrow<ssize_t>(total)) {
-      throw std::system_error{errno, std::generic_category(),
-                              "WritableFileOps::append_entry: pwritev failed"};
-    }
+    check_write(written, total, "WritableFileOps::append_entry");
 
     io_.publish(entry_offset, iov);
     advance(static_cast<Offset>(total));
@@ -648,10 +645,7 @@ struct WritableFileOps {
       FAULT_INJECTION_POST_WRITE(io_data_file_append_partial,
                                  fd_, start, total_bytes);
 #endif
-      if (written != narrow<ssize_t>(total_bytes)) {
-        throw std::system_error{errno, std::generic_category(),
-                                "WritableFileOps::append_entries: pwritev failed"};
-      }
+      check_write(written, total_bytes, "WritableFileOps::append_entries");
 
       io_.publish(start, std::span<const ::iovec>{iov});
       advance(static_cast<Offset>(total_bytes));
@@ -729,11 +723,8 @@ struct WritableFileOps {
 #ifdef BYTECASK_TESTING
       FAULT_CACHE_WRITE(fd_, off, len);
 #endif
-      if (::pwrite(fd_, zeros.data(), len, narrow<off_t>(off)) !=
-          narrow<ssize_t>(len)) {
-        throw std::system_error{errno, std::generic_category(),
-                                "WritableFileOps::ensure_zeroed: pwrite failed"};
-      }
+      check_write(::pwrite(fd_, zeros.data(), len, narrow<off_t>(off)), len,
+                  "WritableFileOps::ensure_zeroed");
       off += len;
     }
     zeroed_end_ = target;
@@ -2001,6 +1992,7 @@ export void rewrite_durably(const std::filesystem::path &path, Offset end) {
   const RewriteFd f{path};
   const auto size = std::min<std::uintmax_t>(end, std::filesystem::file_size(path));
   static constexpr std::size_t kChunk = 1024 * 1024;
+  const auto what = std::format("bytecask: rewrite of '{}'", path.string());
   std::vector<std::byte> buf(
       static_cast<std::size_t>(std::min<std::uintmax_t>(kChunk, size)));
   for (std::uintmax_t off = 0; off < size;) {
@@ -2010,16 +2002,7 @@ export void rewrite_durably(const std::filesystem::path &path, Offset end) {
 #ifdef BYTECASK_TESTING
     FAULT_CACHE_WRITE(f.fd(), off, n);
 #endif
-    for (std::size_t done = 0; done < n;) {
-      const auto w = ::pwrite(f.fd(), buf.data() + done, n - done,
-                              narrow<off_t>(off + done));
-      if (w <= 0) {
-        throw std::system_error{
-            errno, std::generic_category(),
-            std::format("bytecask: rewrite of '{}' failed", path.string())};
-      }
-      done += static_cast<std::size_t>(w);
-    }
+    check_write(::pwrite(f.fd(), buf.data(), n, narrow<off_t>(off)), n, what);
     off += n;
   }
   f.sync();
