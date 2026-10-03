@@ -1250,6 +1250,24 @@ private:
 export using WritablePosixDataFile = WritablePosixFile<PreadIo>;
 export using WritableBufferPoolDataFile = WritablePosixFile<PoolIo>;
 
+// The size of the sealed file behind fd, which every read of it is bounded
+// by. A failed fstat closes fd and throws: taken as an empty file it would
+// seal a file none of whose records can be read, and whose hint, written from
+// it, indexes nothing.
+[[nodiscard]] inline auto sealed_file_size(int fd,
+                                           const std::filesystem::path &path)
+    -> std::size_t {
+  struct stat st {};
+  if (::fstat(fd, &st) != 0) {
+    const auto err = errno;
+    ::close(fd);
+    throw std::system_error{
+        err, std::generic_category(),
+        std::format("sealed_file_size: cannot stat '{}'", path.string())};
+  }
+  return static_cast<std::size_t>(st.st_size);
+}
+
 // ---------------------------------------------------------------------------
 // ReadOnlyPosixDataFile — pread-based read-only data file.
 //
@@ -1266,11 +1284,7 @@ public:
           std::format("ReadOnlyPosixDataFile: cannot open '{}'",
                       path.string())};
     }
-    struct stat st {};
-    std::size_t file_size = 0;
-    if (::fstat(fd, &st) == 0) {
-      file_size = static_cast<std::size_t>(st.st_size);
-    }
+    const auto file_size = sealed_file_size(fd, path);
     return std::shared_ptr<ReadOnlyPosixDataFile>(
         new ReadOnlyPosixDataFile{std::move(path), fd, file_size});
   }
@@ -1575,11 +1589,7 @@ public:
           std::format("ReadOnlyBufferPoolDataFile: cannot open '{}'",
                       path.string())};
     }
-    struct stat st {};
-    std::size_t file_size = 0;
-    if (::fstat(fd, &st) == 0) {
-      file_size = static_cast<std::size_t>(st.st_size);
-    }
+    const auto file_size = sealed_file_size(fd, path);
 
     int direct_fd = -1;
     if (pool->direct_io()) {

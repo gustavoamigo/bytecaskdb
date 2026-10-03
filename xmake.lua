@@ -194,6 +194,24 @@ local function add_release_opts(t)
     end
 end
 
+-- The I/O calls bytecask_tests interposes with -Wl,--wrap, and the variants
+-- of them it must not reference (other spellings of the same calls, and
+-- calls the engine does not make today). See the target below.
+local syscall_fault_wraps = {
+    "open", "pread", "pwrite", "pwritev", "write", "fdatasync", "fsync",
+    "ftruncate", "fstat", "stat", "renameat2", "link", "unlink", "mmap",
+}
+local syscall_fault_unwrapped = {
+    "open64", "openat", "openat64", "creat", "pread64", "pwrite64",
+    "pwritev64", "pwritev2", "preadv", "preadv2", "read", "writev",
+    "ftruncate64", "fstat64", "stat64", "lstat", "fstatat", "statx",
+    "rename", "renameat", "unlinkat", "symlink",
+    "mmap64", "fallocate", "posix_fallocate", "sync_file_range",
+    "copy_file_range", "sendfile",
+    -- _FORTIFY_SOURCE spellings
+    "__open_2", "__open64_2", "__pread_chk", "__pread64_chk", "__read_chk",
+}
+
 target("bytecask_tests")
     set_kind("binary")
     set_default(false)
@@ -223,6 +241,18 @@ target("bytecask_tests")
         add_packages("catch2")
     end
     add_defines("BYTECASK_TESTING", "BYTECASK_RADIX_ACCOUNTING")
+    -- Counted fault sweep (tests/syscall_faults.cpp): each I/O call the
+    -- binary's objects make goes through an interposer that can count it and
+    -- fail the N-th.
+    for _, call in ipairs(syscall_fault_wraps) do
+        add_ldflags("-Wl,--wrap=" .. call, {force = true})
+    end
+    -- No interposer exists for these, so a reference to one fails the link
+    -- with "undefined reference to __wrap_<call>": a call the sweep would
+    -- not count. Write its interposer and move it to the list above.
+    for _, call in ipairs(syscall_fault_unwrapped) do
+        add_ldflags("-Wl,--wrap=" .. call, {force = true})
+    end
     on_config(function(t)
         add_native_syslinks(t)
         apply_sanitizer(t)

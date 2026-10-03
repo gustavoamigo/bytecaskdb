@@ -308,6 +308,9 @@ model.
 - `FAULT_INJECTION(name)` and `FAULT_INJECTION_POST_WRITE(name, fd, offset, total)`
   macros, compiled under `BYTECASK_TESTING`
 - Thread-local `active_injector` pointer
+- `SuspendSyscallFaults`, held by the `PageCacheModel`'s hooks so the I/O
+  they do from inside the engine is not counted by the sweep below
+  (*Counted fault sweep*)
 
 Four checkpoints exist in the production code:
 1. `io_data_file_append` — before `writev()` in `DataFile::append()`
@@ -1516,6 +1519,144 @@ smoke testing not covered by the proof matrix:
   takes a snapshot while degraded, calls `resume()`, verifies the snapshot
   remains readable (pinned files not deleted) and post-resume writes succeed.
 
+### Counted fault sweep
+
+The proof matrix fails checkpoints by name. A cell exists because someone
+chose a checkpoint for a failure class, so a call no class names is never
+failed, and a call added later is untested under failure until a cell is
+written for it. The sweep closes that gap the way SQLite's I/O error tests
+do: it fails the N-th I/O call of an operation, for N = 1, 2, …, until the
+operation completes without reaching the fault (#317).
+
+```
+for each operation:
+  for each pass (before, after, short, cascade):
+    for N = 1, 2, …:
+      build the starting state
+      run the operation with the N-th counted call failing
+      assert the generic invariants
+      if the fault was never reached: next pass
+```
+
+It runs in `bytecask_tests` as `[fault_sweep]`
+([`tests/fault_sweep_test.cpp`](../tests/fault_sweep_test.cpp)), on every
+PR: about 1,400 failed calls in 11 s on an unsanitized debug build. A
+failure names the call: `vacuum, fault before, N = 7:
+ftruncate(…/x.data.tmp)`. `BYTECASK_SWEEP_TRACE=1` prints every call a
+sweep failed.
+
+**Counting below the engine.** The engine has no single I/O layer to count
+in, and counting `FAULT_INJECTION` checkpoints would leave a call without
+one unreached. So `bytecask_tests` is linked with `-Wl,--wrap=<call>` for
+`open`, `pread`, `pwrite`, `pwritev`, `write`, `fdatasync`, `fsync`,
+`ftruncate`, `fstat`, `stat`, `renameat2`, `link`, `unlink` and `mmap`, and
+the interposers in [`tests/syscall_faults.cpp`](../tests/syscall_faults.cpp)
+count and fail them. A call is counted only while a sweep is armed, and
+only on a file under the DB directory, matched by its path or by what its
+descriptor names (`/proc/self/fd`). An interposer calls through to the
+real symbol, which under a sanitizer is the sanitizer's interceptor.
+
+`xmake.lua` also passes `--wrap` for the other spellings of those calls
+(`pread64`, `openat`, `rename`, the `_FORTIFY_SOURCE` variants, …) without
+defining an interposer for them, so a reference to one fails the link. A
+new kind of call cannot join the engine uncounted, and a toolchain that
+spells a call differently is noticed. The first test in the file checks the
+other direction: that a put's append and sync are in fact counted.
+
+**Passes.** Each pass counts only the calls it can fail, so N indexes a
+different sequence in each.
+
+| Pass | The N-th call | Counts |
+|---|---|---|
+| before | is not made, and reports `EIO` | every wrapped call |
+| after | is made, then reports `EIO`: the bytes, the cut or the rename landed | `pwrite`, `pwritev`, `write`, `fdatasync`, `fsync`, `ftruncate`, `renameat2`, `link`, `unlink` |
+| short | transfers half of what was asked | `pread`, `pwrite`, `pwritev`, `write` |
+| cascade | and every counted call after it fail as in *before* | every wrapped call |
+
+An `fdatasync` failed *before* leaves its pages clean and unwritten in the
+`PageCacheModel`, as the kernel does; one failed *after* wrote them.
+
+**Operations.** The number is the calls of the *before* pass.
+
+| Operation | Starting state | Calls |
+|---|---|---:|
+| `put`, overwriting | one file: six keys, a delete, a batch | 3 |
+| `del` | the same | 4 |
+| `del_range` | the same | 8 |
+| `apply_batch`: puts, a delete, a range delete | the same | 13 |
+| a put that fills the active file | the same, `max_file_bytes = 512` | 23 |
+| `vacuum` | a sealed file with a dead entry | 25 |
+| `create_manifest` | one file | 19 |
+| `ingest` of a put and a batch | a follower holding the first slice | 15 |
+| `resume()` | degraded by a failed commit sync: the entry whole, unsynced | 42 |
+| `resume()` | degraded by a short append: the entry torn | 40 |
+| `close()` | an unsynced batch behind it | 13 |
+| `DB::open`, serial and parallel | three sealed files and their hints, after a clean close | 68, 80 |
+| `DB::open`, serial and parallel | the same, as a killed process leaves it: the newest file hint-less | 77, 89 |
+
+**Invariants.** They need no expected delta per failure class, which is
+what makes an operation cheap to add. After a failure at any N:
+
+- the operation threw, or returned having done its work;
+- the state is the baseline or the baseline plus the whole transition,
+  and the transition if the operation returned (`assert_consistent`);
+- a degraded engine resumes once the fault is lifted (`assert_resumable`),
+  and `resume()` keeps or completes the transition;
+- for `ingest`, whose slice is two atomic units, `resume()` or a power cut
+  may also leave the first unit without the second, and delivering the
+  slice again completes it (`CONTRACT.md`, `ingest`);
+- a write after the fault lands;
+- a close and reopen recovers that state, serial and parallel, with the
+  same file stats;
+- the copy a power cut leaves, taken right after the fault and again at
+  the end, obeys the watermark rule (`assert_power_loss_outcome`), and no
+  hint indexed bytes the device did not hold (`assert_hints_durable`).
+
+`close()` and `DB::open` have their own loops, since there is no open
+engine on one side of them. A `close()` that returns has made the unsynced
+batch durable; it is closed either way; and a reopen in the same process
+recovers the batch. A failed open loses nothing: the next open, and the
+device after the failed one, recover every key.
+
+**The hint worker.** The counter is process-wide, because the flush leader
+and the hint worker are not always the test's thread. The sweep waits for
+the worker to go idle before it arms and again before it disarms, so an
+operation's calls are the same set on every run. Under parallel recovery,
+and wherever the worker runs beside the caller, their order can move, and
+N with it; each N still fails one call and the invariants do not depend on
+which.
+
+**What it found.** `ReadOnlyPosixDataFile::openForRead` and
+`ReadOnlyBufferPoolDataFile::openForRead` took a failed `fstat` as an empty
+file. A rotation, a vacuum or a `create_manifest` then sealed a file none of
+whose records could be read, and the hint written from it indexed nothing,
+so the next open lost its keys. No checkpoint named the call. Both now
+throw (`sealed_file_size`), and the `sealed_fstat_failure_reads_empty`
+mutation reverts it.
+
+**Limits.**
+
+- *Calls inside shared libraries are not counted.* `--wrap` rewrites the
+  references in this binary's objects, not libstdc++'s, so everything the
+  engine does through `std::filesystem` is neither counted nor failed: the
+  hint's rename, vacuum's removal of the file it compacted, the removal of
+  stale `.tmp` files, `file_size`, `exists`, `create_directories`. The named
+  checkpoints (`io_hint_rename`, `io_vacuum_compact_unlink`) and the chaos
+  rig remain their cover (#319).
+- *`mmap` reads cannot be failed this way.* A failed mapped read is a
+  `SIGBUS`, not a return value. The `mmap` call itself is counted.
+- *One I/O back-end.* The sweep runs on the default, `Pread`; the buffer
+  pool's fills and the mmap back-end's files are not swept (#320).
+- *The oracle is weaker than the matrix's.* "Baseline or the whole
+  transition" does not say which of the two a given fault must produce. The
+  proof cells keep that job, and the named checkpoints stay for them.
+- *One fault, one small operation, one thread.* Volume, concurrency, real
+  power loss, resource limits and faults across process lives stay with the
+  chaos rig.
+- `close`, `flock`, `posix_fadvise`, `madvise` and `munmap` are not
+  wrapped: the engine acts on none of their results but `flock`'s, which
+  the lock tests cover.
+
 ### ThreadSanitizer (TSan)
 
 The full test suite (428 test cases, 1.5 M+ assertions) runs clean under
@@ -2027,6 +2168,7 @@ A site whose break nothing has to catch says why instead.
 | `execute_slots`: a failed rotation `fdatasync` degrades | `class G: key not visible after rotation sync failure` | `rotation_sync_error_ignored` | BC-155 |
 | `rotate_active_file`: `shrink_to_fit` cuts the preallocated tail and syncs the length | not needed: a sealed file's zero tail costs space, not data; open drops a zero tail past the last record (`recovery_check_tail`), and the rotation `fdatasync` before it has already made the data durable | — | — |
 | `create_active_file`: the directory sync before the first write into a new file (open, rotation, `resume()`) | `directory sync: a failed sync at rotation degrades …`, `… in resume() stays degraded`, `… open fails when the active file's entry cannot be synced` | `no_dir_sync_new_data_file` (chaos) | #199 |
+| `sealed_file_size`: a sealed file whose `fstat` fails is not opened as an empty one | `fault sweep: write across a rotation` | `sealed_fstat_failure_reads_empty` | #317 |
 | rotation: a new file that cannot be created degrades | `*rotation_file_creation_fails` | `rotation_create_failure_not_degraded` | — |
 | `createDataFileForWrite`: a reused file name panics instead of reopening a live file | `createDataFileForWrite panics when the data file already exists` | `data_file_create_not_exclusive` | #35 |
 | `renameDataFileExclusive`: vacuum's copy never replaces a file holding its name | `renameDataFileExclusive panics rather than replacing a live file` | `data_file_rename_replaces` | #35 |
@@ -2104,6 +2246,8 @@ A site whose break nothing has to catch says why instead.
 - **`vacuum preserves BulkBegin/BulkEnd markers` never compacted the batch.** Its batch file held only live entries, which vacuum does not touch. A later write now kills one of them.
 - **Three syncs had no test that could see them.** The hint's `fdatasync`, `resume()`'s sync after its truncate, and open's sync of a cut tail: the page cache model covers data file pages, not hint files or file lengths. Each is guarded the way the directory syncs are, by failing its fault point, which a mutation that removes the sync removes too. The hint's fault point moved into the call (`sync_hint`) for that.
 - **The `hint_written_in_place` mutation had no test of its own;** the rig caught it twice in about 45 minutes. A test now fails the hint write between its frames and its trailer.
+
+- **A failed `fstat` sealed a file as empty.** No checkpoint named the call; the counted fault sweep reached it (*Counted fault sweep*, #317).
 
 The radix key directory's leak on a failed recovery merge (#203) is not a durability site; LeakSanitizer catches it in CI.
 
