@@ -664,6 +664,13 @@ public:
   // State transition: set engine mode (Leader/Follower).
   void apply_set_mode(Mode mode) { mode_ = mode; }
 
+  // State transition: a key directory drain freezes what the write buffer
+  // holds, for the merger to fold in once this state is published. False if
+  // there was nothing to freeze, or the key directory has no buffer.
+  [[nodiscard]] auto apply_freeze_key_dir_buffer() -> bool {
+    return kd_freeze_buffer(key_dir_);
+  }
+
   // State transition: mark engine as degraded with a reason.
   void apply_degrade(std::string reason) {
     degraded_ = true;
@@ -1361,6 +1368,24 @@ private:
                     const std::filesystem::path &active_path);
   // Publish initial state during construction (no previous state to compare).
   void store_initial_state(std::shared_ptr<EngineState> s);
+  // The key directory's drain hook (kd_set_drain_hook), run on its
+  // background thread once writes pause: freezes what the write buffer
+  // holds, waits for the merge without the write lock, then publishes it
+  // installed. Returns true when a commit was in flight and it published
+  // nothing: the tree retries at the next pause. Never throws.
+  auto drain_key_directory() noexcept -> bool;
+  // One publish of the drain: installs finished merges and, with `freeze`,
+  // freezes the write buffer. Returns whether it froze, or nullopt when a
+  // flush is in flight or the head holds writes waiting for one — writes
+  // have not paused, and the drain must not flush under the write lock as a
+  // barrier would. Publishes nothing on a degraded engine.
+  auto publish_key_dir_drain(bool freeze) -> std::optional<bool>;
+  // The head holds what `published` does not: entries, or a sync asked for.
+  [[nodiscard]] static auto head_owes_flush(const EngineState &head,
+                                            const EngineState &published) -> bool {
+    return head.next_seq > published.next_seq ||
+           head.sync_requested_seq > published.durable_seq;
+  }
   // Validates structural consistency of published state. Throws on violation.
   // Called on cold paths only (open, resume).
   void validate_state_consistency(const EngineState &s) const;
@@ -2692,8 +2717,8 @@ void TransientEngineState::note_sync_requested(std::uint64_t seq) {
 
 auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
   auto s = std::make_shared<EngineState>();
-  s->key_dir = std::move(key_dir_).persistent();
   s->files = std::move(files_).persistent();
+  s->key_dir = kd_persistent(std::move(key_dir_), s->files);
   s->file_stats = std::move(file_stats_).persistent();
   s->active_file_id = active_file_id_;
   s->next_file_id = next_file_id_;
@@ -2805,6 +2830,8 @@ DB::DB(std::filesystem::path dir, Options opts)
         initial->next_seq > 0 ? initial->next_seq - 1 : 0;
     initial->mode = opts.initial_mode;
     validate_state_consistency(*initial);
+    // Cleared first thing in ~DB, so the hook never outlives this DB.
+    kd_set_drain_hook(initial->key_dir, [this] { return drain_key_directory(); });
     store_initial_state(std::move(initial));
   } catch (...) {
     ::close(lock_fd_);
@@ -2822,6 +2849,9 @@ DB::DB(std::filesystem::path dir, Options opts)
 // At destruction no readers are active.
 DB::~DB() {
   auto s = load_state();
+  // Every version shares the key directory's drain hook; after this no
+  // drain runs or starts.
+  kd_clear_drain_hook(s->key_dir);
   if (!s->files.empty()) {
     try {
       auto t = s->transient();
@@ -3293,7 +3323,7 @@ void DB::flush_pending() {
   // Nothing appended and no sync asked for. A sync-only write appends
   // nothing but asks for one: the entries it covers may all be published
   // already, by flushes that did not sync them.
-  if (head->next_seq <= published->next_seq && !need_sync) return;
+  if (!head_owes_flush(*head, *published)) return;
 
   if (need_sync) {
 #ifdef BYTECASK_TESTING
@@ -4113,6 +4143,28 @@ auto DB::degraded_reason() const noexcept -> std::string {
   return load_state()->degraded_reason;
 }
 
+// A key directory with a write buffer reports how long writes waited for its
+// merger (process-wide, like the node pool).
+template <typename T>
+static void add_buffer_stats(const T &key_dir, std::map<std::string, std::int64_t> &out) {
+  if constexpr (requires { T::buffer_stalls(); }) {
+    // Gauge: slots the published version holds in its buffers, 0 once a
+    // drain has merged and installed them.
+    out["bytecask.keydir_buffer_slots"] = narrow<std::int64_t>(key_dir.buffered_slots());
+    // Buffers frozen by a drain, once writes paused, rather than when full.
+    out["bytecask.keydir_buffer_drains"] = T::buffer_drains();
+    out["bytecask.keydir_buffer_stalls"] = T::buffer_stalls();
+    out["bytecask.keydir_buffer_stall_us"] = T::buffer_stall_ns() / 1000;
+    out["bytecask.keydir_buffer_inline_merges"] = T::buffer_inline_merges();
+    // The merger's work: merges, their time, the slots they covered, and
+    // the keys applied by location (no record read) rather than by key.
+    out["bytecask.keydir_buffer_merges"] = T::buffer_merges();
+    out["bytecask.keydir_buffer_merge_us"] = T::buffer_merge_ns() / 1000;
+    out["bytecask.keydir_buffer_merge_slots"] = T::buffer_merge_slots();
+    out["bytecask.keydir_buffer_merge_by_location"] = T::buffer_merge_by_location();
+  }
+}
+
 auto DB::stats() const -> std::map<std::string, std::int64_t> {
   scrape_read_caches();  // see vacuum()
   auto s = load_state();
@@ -4121,7 +4173,7 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
   std::int64_t open_files = 0;
   for (auto it = s->files.begin(); it != std::default_sentinel; ++it)
     ++open_files;
-  return {
+  std::map<std::string, std::int64_t> out{
       // What a pool has to be sized against: the key directory is resident
       // and not a cache. Multiply by the bytes/key your key shape measures
       // (scripts/run_memory_profile.py; about 50 for typical keys).
@@ -4196,6 +4248,46 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
       {"bytecask.hint_backlog", narrow<std::int64_t>(worker_.pending())},
       {"bytecask.open_files", open_files},
   };
+  add_buffer_stats(s->key_dir, out);
+  return out;
+}
+
+auto DB::drain_key_directory() noexcept -> bool {
+  try {
+    const auto froze = publish_key_dir_drain(true);
+    if (!froze) return true;
+    if (!*froze) return false;
+    // Without the write lock: a commit arriving now proceeds, and installs
+    // the merge itself if it has finished.
+    kd_wait_merged(load_state()->key_dir);
+    return !publish_key_dir_drain(false).has_value();
+  } catch (...) {
+    // Only an allocation can fail here; the next write's publish arms the
+    // drain again.
+    return false;
+  }
+}
+
+auto DB::publish_key_dir_drain(bool freeze) -> std::optional<bool> {
+  std::lock_guard<std::mutex> wg{*write_mu_};
+  // The flush role without waiting for it, unlike quiesce(): a commit in
+  // flight means writes have not paused.
+  if (flush_in_flight_.exchange(true, std::memory_order_acq_rel))
+    return std::nullopt;
+  auto current = load_state();
+  if (head_owes_flush(*load_head(), *current)) {
+    finish_flush();  // the head stays: its committer flushes it
+    return std::nullopt;
+  }
+  // Releases the role and resets the head to what is published here.
+  // After the lock guard, so it runs first, as in WriteBarrier.
+  const FlushRole role{*this};
+  if (current->degraded) return false;
+  // transient() installs the merges that have finished.
+  auto t = current->transient();
+  const bool froze = freeze && t.apply_freeze_key_dir_buffer();
+  store_state(current, std::move(t).persistent());
+  return froze;
 }
 
 void DB::set_mode(Mode mode) {
@@ -4555,19 +4647,21 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
     // each debug commit O(n) in disk reads (and fill the buffer pool from
     // files no reader asked for). What the locations alone show is checked:
     // every entry starts inside its file's committed extent (invariant P).
-    for (auto it = kd_value_lower_bound(new_state->key_dir, {},
-                                        new_state->kd_ctx(/*verify=*/false));
-         it != std::default_sentinel; ++it) {
-      const auto loc = *it;
-      if (const auto *fs = new_state->file_stats.get(loc.file_id());
-          fs != nullptr && loc.file_offset() >= fs->total_bytes) {
-        deem_as_degraded(std::format(
-            "invariant violation: key in file_id {} starts at {} but the "
-            "file's committed extent is {}",
-            loc.file_id(), loc.file_offset(), fs->total_bytes));
-        return;
-      }
-    }
+    bool violated = false;
+    kd_for_each_location(
+        new_state->key_dir, new_state->kd_ctx(/*verify=*/false), [&](const auto &loc) {
+          if (const auto *fs = new_state->file_stats.get(loc.file_id());
+              fs != nullptr && loc.file_offset() >= fs->total_bytes) {
+            deem_as_degraded(std::format(
+                "invariant violation: key in file_id {} starts at {} but the "
+                "file's committed extent is {}",
+                loc.file_id(), loc.file_offset(), fs->total_bytes));
+            violated = true;
+            return false;
+          }
+          return true;
+        });
+    if (violated) return;
   } else {
     // Debug-only O(n) checks, sharing one walk: next_seq > max(all key_dir
     // sequences), and every entry inside its file's committed extent

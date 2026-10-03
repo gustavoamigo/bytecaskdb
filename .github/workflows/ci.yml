@@ -201,6 +201,48 @@ jobs:
           build/linux/x86_64/release/bytecask_tests
 
   # ---------------------------------------------------------------------------
+  # BYTECASK_KEYDIR=buffered puts a small write buffer, folded in by a merger
+  # thread, in front of the blind tree (bytecaskdb/buffered_btree.cppm). The
+  # test build shrinks the buffer to a few slots, so the engine suite runs
+  # through freezes, merges and backpressure constantly.
+  # ---------------------------------------------------------------------------
+  buffered-keydir:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+      BYTECASK_KEYDIR: buffered
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            clang llvm llvm-devel lld \
+            libcxx libcxx-devel \
+            xmake \
+            python3-pip python3-devel \
+            git ninja-build
+          # bytecaskdb_python's on_load() asks nanobind for its include dir, and
+          # xmake f loads every target — so this job needs it even though it
+          # only builds bytecask_tests.
+          pip3 install nanobind
+
+      - name: Configure xmake
+        run: |
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          xmake f --toolchain=clang \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            -y
+
+      - name: Build and run the engine suite on the buffered key directory
+        run: |
+          xmake build bytecask_tests
+          build/linux/x86_64/release/bytecask_tests
+
+  # ---------------------------------------------------------------------------
   # MariaDB storage engine plugin: unit + proof tests (Catch2/ctest) and the
   # functional suite against a live mariadbd (pytest).
   # ---------------------------------------------------------------------------
@@ -303,14 +345,15 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Sanitizer checks, in sanitizers.yml. A PR and the push to main that merges
-  # it get ASan, TSan and UBSan on the default key directory. Every sanitizer
-  # on all three key directories runs on the nightly schedule in
-  # sanitizers.yml itself, not on each merge.
+  # it get ASan, TSan and UBSan on the default key directory and on the
+  # buffered one, whose merger thread is a concurrency protocol of its own.
+  # Every sanitizer on all four key directories runs on the nightly schedule
+  # in sanitizers.yml itself, not on each merge.
   # ---------------------------------------------------------------------------
   sanitizers:
     uses: ./.github/workflows/sanitizers.yml
     with:
-      keydirs: '["blind"]'
+      keydirs: '["blind", "buffered"]'
       sanitizers: '["address", "thread", "undefined"]'
 
   # ---------------------------------------------------------------------------

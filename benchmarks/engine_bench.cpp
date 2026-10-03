@@ -1096,6 +1096,99 @@ template <typename A, int RangeLen> void BM_Range(benchmark::State &state) {
   pool_ratio.attach(state);
 }
 
+// ──────────────────────────── BurstThenRead ──────────────────────────────────
+//
+// Reads between write bursts, the pattern a buffered key directory's drain is
+// for: every 50 ms an untimed burst of 1,000 unsynced puts over the existing
+// keys, then timed reads (a Get, or a RangeLen scan) until the next. Reads
+// right after a burst see what of it is still buffered.
+
+template <typename A, int RangeLen> void BM_BurstThenRead(benchmark::State &state) {
+  static auto keys = A::generate_keys(kDatasetSize);
+  static auto val = make_value();
+  static auto db = A::open_populated(RangeLen == 0 ? "burst_get" : "burst_range", keys, val);
+  constexpr auto kBurstEvery = std::chrono::milliseconds{50};
+  constexpr std::size_t kBurst = 1000;
+
+  std::size_t idx = 0;
+  std::size_t burst_idx = 0;
+  std::vector<double> samples;
+  samples.reserve(kMaxSamples);
+  auto last_burst = std::chrono::steady_clock::now() - kBurstEvery;
+
+  for (auto _ : state) {
+    if (std::chrono::steady_clock::now() - last_burst >= kBurstEvery) {
+      state.PauseTiming();
+      for (std::size_t i = 0; i < kBurst; ++i)
+        A::put(db, keys[(burst_idx++ * 7919) % keys.size()], val, false);
+      last_burst = std::chrono::steady_clock::now();
+      state.ResumeTiming();
+    }
+    const auto &k = keys[idx % keys.size()];
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    if constexpr (RangeLen == 0)
+      A::get(db, k);
+    else
+      A::range(db, k, RangeLen);
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    if (samples.size() < kMaxSamples)
+      samples.push_back(static_cast<double>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+              .count()));
+    ++idx;
+  }
+
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()));
+  state.counters["ops_per_us"] = benchmark::Counter(
+      static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
+  attach_jitter(state, samples);
+}
+
+// ──────────────────────────── LightWriteStream ───────────────────────────────
+//
+// A steady light stream of unsynced puts, one every gap_us microseconds, with
+// the put latency timed. On a buffered key directory it reports how often a
+// drain froze the buffer and how many merges ran, per write: a gap longer
+// than the drain's idle window drains after every write.
+
+template <typename A> void BM_LightWriteStream(benchmark::State &state) {
+  static auto keys = A::generate_keys(kDatasetSize);
+  static auto val = make_value();
+  static auto db = A::open_populated("light_stream", keys, val);
+  const auto gap = std::chrono::microseconds{state.range(0)};
+  const auto stat = [&](const char *name) -> double {
+    if constexpr (requires { db.engine.stats(); }) {
+      const auto s = db.engine.stats();
+      const auto it = s.find(name);
+      return it == s.end() ? 0.0 : static_cast<double>(it->second);
+    } else {
+      return 0.0;
+    }
+  };
+  const auto drains0 = stat("bytecask.keydir_buffer_drains");
+  const auto merges0 = stat("bytecask.keydir_buffer_merges");
+
+  static std::size_t idx = 0;
+  std::vector<double> samples;
+  samples.reserve(kMaxSamples);
+
+  for (auto _ : state) {
+    const auto &k = keys[(idx++ * 7919) % keys.size()];
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    A::put(db, k, val, false);
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    state.SetIterationTime(static_cast<double>(ns) / 1e9);
+    if (samples.size() < kMaxSamples) samples.push_back(static_cast<double>(ns));
+    std::this_thread::sleep_for(gap);
+  }
+
+  const auto writes = static_cast<double>(state.iterations());
+  state.counters["ops_per_us"] = benchmark::Counter(writes, benchmark::Counter::kIsRate);
+  state.counters["drains_per_write"] = (stat("bytecask.keydir_buffer_drains") - drains0) / writes;
+  state.counters["merges_per_write"] = (stat("bytecask.keydir_buffer_merges") - merges0) / writes;
+  attach_jitter(state, samples);
+}
 
 // ──────────────────────────── Mixed ──────────────────────────────────────────
 // 80% get / 10% put / 10% del
@@ -1582,6 +1675,10 @@ BENCH(BM_CountRange<Bc, 1000, true>)  ->Name("ByteCaskDB/CountRange/Walk/1000");
 BENCH(BM_CountRange<Bc, 1024, false>) ->Name("ByteCaskDB/CountRange/Count/1024");
 BENCH(BM_CountRange<Bc, 1024, true>)  ->Name("ByteCaskDB/CountRange/Walk/1024");
 BENCH(BM_MixedBatch<Bc, true>)      ->Name("ByteCaskDB/MixedBatch/Sync");
+BENCH(BM_BurstThenRead<Bc, 0>)         ->Name("ByteCaskDB/BurstThenRead/Get");
+BENCH(BM_BurstThenRead<Bc, kRangeLen>) ->Name("ByteCaskDB/BurstThenRead/Range50");
+BENCHMARK(BM_LightWriteStream<Bc>)->Name("ByteCaskDB/LightWriteStream")->ArgName("gap_us")
+    ->Arg(500)->Arg(5000)->Arg(20000)->Iterations(300)->UseManualTime();
 
 // --- mmap read path, the bar for the pool's hit path ---
 // WASM has no mmap; there the bar is pread, which crosses into JS per read.

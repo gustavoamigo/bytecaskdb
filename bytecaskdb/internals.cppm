@@ -5,9 +5,11 @@
 
 module;
 #include <algorithm>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -23,6 +25,9 @@ module;
 export module bytecask:internals;
 
 import bytecask.blind_btree;
+#ifdef BYTECASK_KEYDIR_BUFFERED
+import bytecask.buffered_btree;
+#endif
 import bytecask.btree;
 import bytecask.buffer_pool;
 import bytecask.data_entry;
@@ -289,11 +294,18 @@ export struct KeyDirCtx {
 // put or erase returns what it displaced (a KeyDirHit: file, offset and value
 // size), iterators yield (key, KeyDirEntry) or a KeyDirHit.
 //
-// The B+ tree (docs/persistent_btree_design.md) is the default;
-// BYTECASK_KEYDIR=radix builds the engine on the radix tree and
-// BYTECASK_KEYDIR=blind on the blind-leaf tree
-// (docs/blind_leaf_btree_design.md), which stores no key bytes and reads them
-// back through the KeyDirCtx.
+// The blind-leaf tree (docs/blind_leaf_btree_design.md), which stores no key
+// bytes and reads them back through the KeyDirCtx, is the default.
+// BYTECASK_KEYDIR=btree builds the engine on the B+ tree that keeps keys in
+// its leaves (docs/persistent_btree_design.md), BYTECASK_KEYDIR=radix on the
+// radix tree, and BYTECASK_KEYDIR=buffered on the blind tree behind a write
+// buffer (buffered_btree.cppm).
+//
+// The kd_* functions are the engine's helpers over a key directory's
+// interface — extension methods, in C# terms. They know nothing of which tree
+// provides that interface and hold none of its strategy; a tree that needs
+// something they do not offer adds it to its own interface. The blind-family
+// helpers require the BlindKeyDir concept below.
 //
 // Recovery builds a RecoveryKeyDirTree: the B+ tree in the blind build too,
 // converted once by key_dir_from_recovered() until recovery can build a
@@ -442,8 +454,21 @@ export inline auto kd_value_rlower_bound(const KeyDirTree &t,
     -> KeyDirReverseValueIter {
   return from.empty() ? t.value_rbegin() : t.value_rlower_bound(from);
 }
+// Visits every location the key directory holds, reading no record; f
+// returns false to stop. For checks over locations (store_state).
+export template <typename F>
+inline void kd_for_each_location(const KeyDirTree &t, const KeyDirCtx &ctx, F &&f) {
+  for (auto it = kd_value_lower_bound(t, {}, ctx); it != std::default_sentinel; ++it)
+    if (!f(*it)) return;
+}
 export inline auto key_dir_from_recovered(RecoveryKeyDirTree t) -> KeyDirTree {
   return t;
+}
+// Publishes a builder; these trees need nothing from the version's files.
+export inline auto kd_persistent(KeyDirTransient &&t,
+                                 const PersistentU32Map<std::shared_ptr<DataFile>> &)
+    -> KeyDirTree {
+  return std::move(t).persistent();
 }
 
 #else // BYTECASK_KEYDIR_BLIND
@@ -455,9 +480,6 @@ export inline auto key_dir_from_recovered(RecoveryKeyDirTree t) -> KeyDirTree {
 // never refill the slack, so they keep ~26% more than a full load.
 export inline constexpr double kBlindRecoveryFillMin = 0.6;
 export inline constexpr double kBlindRecoveryFillMax = 1.0;
-export using KeyDirTree = PersistentBlindBTree<kBlindLeafBytes>;
-export using KeyDirTransient = TransientBlindBTree<kBlindLeafBytes>;
-
 // What a blind key directory holds for a key: where its record is. Its sizes
 // and sequence are in the record's header.
 export struct KeyDirLoc {
@@ -512,6 +534,15 @@ export struct KeyReader {
   std::span<const std::byte> value; // empty for a record not yet written
 
   auto key_at(BlindRef r) -> std::span<const std::byte> {
+    if (auto k = try_key_at(r))
+      return *k;
+    throw std::logic_error{
+        "key directory references a data file missing from the registry"};
+  }
+  // As key_at, or none if the record's file is not in the registry — a file
+  // vacuum dropped. A key directory that keeps such references until it
+  // merges (the buffered tree) finds their keys elsewhere.
+  auto try_key_at(BlindRef r) -> std::optional<std::span<const std::byte>> {
     last = r;
     if (ctx.pending) {
       if (auto it = ctx.pending->find(pending_slot(r.file_id, r.offset));
@@ -524,8 +555,7 @@ export struct KeyReader {
     }
     const auto *f = ctx.file(r.file_id);
     if (!f)
-      throw std::logic_error{
-          "key directory references a data file missing from the registry"};
+      return std::nullopt;
     const auto v = f->lend_record(r.offset, 0, ctx.verify, buf, lease);
     if (v.entry_type != EntryType::Put)
       throw std::runtime_error{
@@ -547,6 +577,58 @@ export struct KeyReader {
   }
 };
 
+// What a published key directory hands a buffered tree's merger: a handle on
+// the version's file registry, which pins its files for the merge.
+export struct KeyDirMergeSource {
+  PersistentU32Map<std::shared_ptr<DataFile>> files;
+
+  template <typename F> void with_resolver(F &&f) const {
+    const KeyDirCtx ctx{&files, nullptr, nullptr, true};
+    std::vector<std::byte> buf;
+    FrameLease lease;
+    KeyReader reader{ctx, buf, lease};
+    f(reader);
+  }
+};
+
+#ifdef BYTECASK_KEYDIR_BUFFERED
+export using KeyDirTree = BufferedBlindBTree<kBlindLeafBytes, KeyDirMergeSource>;
+export using KeyDirTransient =
+    TransientBufferedBlindBTree<kBlindLeafBytes, KeyDirMergeSource>;
+#else
+export using KeyDirTree = PersistentBlindBTree<kBlindLeafBytes>;
+export using KeyDirTransient = TransientBlindBTree<kBlindLeafBytes>;
+#endif
+
+// The interface the blind-family kd_* helpers use. Iterators move through
+// settle / next / prev with a resolver, since a tree may have to read keys
+// to step; the blind tree's ignore it.
+template <typename T, typename Tr>
+concept BlindKeyDir = requires(const T &t, Tr &tr, KeyReader &r,
+                               std::span<const std::byte> key, BlindRef ref,
+                               std::size_t n) {
+  { t.size() } -> std::convertible_to<std::size_t>;
+  { t.get(key, r) } -> std::same_as<std::optional<BlindRef>>;
+  { t.lower_bound(key, r) };
+  { t.begin() };
+  { t.end_iter() };
+  { t.transient() } -> std::same_as<Tr>;
+  { t.lower_bound(key, r).count_until(t.end_iter(), n, r) } -> std::convertible_to<std::size_t>;
+  { tr.get(key, r) } -> std::same_as<std::optional<BlindRef>>;
+  { tr.holds(key, ref) } -> std::same_as<bool>;
+  { tr.replace_at(key, ref, ref) } -> std::same_as<bool>;
+  { tr.erase_at(key, ref) } -> std::same_as<bool>;
+  { tr.erase(key, r) } -> std::same_as<std::optional<BlindRef>>;
+  { tr.lower_bound(key, r) } -> std::same_as<decltype(t.begin())>;
+  requires requires(decltype(t.begin()) it) {
+    it.settle(r);
+    it.next(r);
+    it.prev(r);
+    { *it } -> std::same_as<BlindRef>;
+  };
+};
+static_assert(BlindKeyDir<KeyDirTree, KeyDirTransient>);
+
 // Scratch buffer for the reads of one call, reused per thread.
 inline auto key_read_buffer() -> std::vector<std::byte> & {
 #pragma clang diagnostic push
@@ -565,7 +647,7 @@ inline auto key_read_buffer() -> std::vector<std::byte> & {
 // span lives until the next dereference or advance.
 // ---------------------------------------------------------------------------
 export template <bool Keyed> class BlindKeyDirIter {
-  using Inner = BlindBTreeIterator<kBlindLeafBytes>;
+  using Inner = decltype(std::declval<const KeyDirTree &>().begin());
 
 public:
   using iterator_category = std::bidirectional_iterator_tag;
@@ -583,6 +665,10 @@ public:
     }
     ctx_ = ctx;
     ctx_.files = nullptr;
+    const auto c = context();
+    KeyReader reader{c, buf_, lease_};
+    cur_.settle(reader);
+    lease_.reset();
   }
 
   auto operator*() const -> value_type {
@@ -623,7 +709,10 @@ public:
 
   auto operator++() -> BlindKeyDirIter & {
     lease_.reset();
-    ++cur_;
+    const auto c = context();
+    KeyReader reader{c, buf_, lease_};
+    cur_.next(reader);
+    lease_.reset();
     return *this;
   }
   auto operator++(int) -> BlindKeyDirIter {
@@ -633,7 +722,10 @@ public:
   }
   auto operator--() -> BlindKeyDirIter & {
     lease_.reset();
-    --cur_;
+    const auto c = context();
+    KeyReader reader{c, buf_, lease_};
+    cur_.prev(reader);
+    lease_.reset();
     return *this;
   }
   auto operator--(int) -> BlindKeyDirIter {
@@ -802,7 +894,7 @@ export inline auto kd_count(const KeyDirTree &t, std::span<const std::byte> from
   FrameLease lease;
   KeyReader reader{ctx, key_read_buffer(), lease};
   const auto first = t.lower_bound(from, reader);
-  return first.count_until(t.lower_bound(to, reader), limit);
+  return first.count_until(t.lower_bound(to, reader), limit, reader);
 }
 export inline auto kd_begin(const KeyDirTree &t, const KeyDirCtx &ctx)
     -> KeyDirIter {
@@ -846,6 +938,30 @@ export inline auto kd_value_rlower_bound(const KeyDirTree &t,
     ++fwd;
   return KeyDirReverseValueIter{std::move(fwd)};
 }
+// Visits every location the key directory holds, in no particular order,
+// reading no record; f returns false to stop. For checks over locations
+// (store_state). The blind tree's value iterator reads nothing; a buffered
+// tree's would, to order its buffered keys, so it walks its parts instead.
+export template <typename F>
+inline void kd_for_each_location(const KeyDirTree &t, const KeyDirCtx &ctx, F &&f) {
+#ifdef BYTECASK_KEYDIR_BUFFERED
+  (void)ctx;
+  t.for_each_ref([&](BlindRef r) { return f(KeyDirLoc{r}); });
+#else
+  for (auto it = kd_value_lower_bound(t, {}, ctx); it != std::default_sentinel; ++it)
+    if (!f(*it)) return;
+#endif
+}
+// Publishes a builder, handing it the registry of the version it becomes.
+export template <typename T>
+  requires std::same_as<T, KeyDirTransient>
+auto kd_persistent(T &&t, const PersistentU32Map<std::shared_ptr<DataFile>> &files)
+    -> KeyDirTree {
+  if constexpr (requires { std::move(t).persistent(KeyDirMergeSource{files}); })
+    return std::move(t).persistent(KeyDirMergeSource{files});
+  else
+    return std::move(t).persistent();
+}
 export inline auto key_dir_from_recovered(RecoveryKeyDirTree t) -> KeyDirTree {
   BlindBulkLoader<kBlindLeafBytes> out{kBlindRecoveryFillMin,
                                        kBlindRecoveryFillMax};
@@ -857,6 +973,41 @@ export inline auto key_dir_from_recovered(RecoveryKeyDirTree t) -> KeyDirTree {
 }
 
 #endif // BYTECASK_KEYDIR_BLIND
+
+// Draining a key directory that defers work to a background thread (the
+// buffered tree: buffered_btree.cppm, "Draining"). The tree calls the hook
+// on its own thread once writes pause; the engine's hook freezes what is
+// buffered (kd_freeze_buffer, in a builder under the write lock), waits for
+// the merge without the lock (kd_wait_merged) and publishes the result,
+// returning true to be called again at the next pause when it could not.
+// No-ops for a key directory that defers nothing.
+export template <typename T>
+  requires std::same_as<T, KeyDirTree>
+void kd_set_drain_hook(T &t, std::function<bool()> hook) {
+  if constexpr (requires { t.set_drain_hook(std::move(hook)); })
+    t.set_drain_hook(std::move(hook));
+}
+// Once it returns the hook is never called again.
+export template <typename T>
+  requires std::same_as<T, KeyDirTree>
+void kd_clear_drain_hook(const T &t) {
+  if constexpr (requires { t.clear_drain_hook(); })
+    t.clear_drain_hook();
+}
+export template <typename T>
+  requires std::same_as<T, KeyDirTransient>
+auto kd_freeze_buffer(T &t) -> bool {
+  if constexpr (requires { t.freeze_buffer(); })
+    return t.freeze_buffer();
+  else
+    return false;
+}
+export template <typename T>
+  requires std::same_as<T, KeyDirTree>
+void kd_wait_merged(const T &t) {
+  if constexpr (requires { t.wait_merged(); })
+    t.wait_merged();
+}
 
 // ---------------------------------------------------------------------------
 // EngineState — immutable snapshot of all mutable engine state.

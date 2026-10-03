@@ -166,8 +166,9 @@ end
 -- Key directory tree selection: the engine is built on the blind-leaf B+
 -- tree (docs/blind_leaf_btree_design.md), which stores no key bytes.
 -- BYTECASK_KEYDIR=btree builds it on the B+ tree that keeps its keys in the
--- leaves (docs/persistent_btree_design.md), and BYTECASK_KEYDIR=radix on the
--- radix tree; CI runs the engine suite on all three. Applies to every target
+-- leaves (docs/persistent_btree_design.md), BYTECASK_KEYDIR=radix on the
+-- radix tree, and BYTECASK_KEYDIR=buffered on the blind tree behind a write
+-- buffer; CI runs the engine suite on all four. Applies to every target
 -- so tests and benchmarks agree.
 local keydir = os.getenv("BYTECASK_KEYDIR")
 if keydir == nil or keydir == "" then
@@ -179,6 +180,16 @@ if keydir ~= "radix" then
 end
 if keydir ~= "radix" and keydir ~= "btree" then
     add_defines("BYTECASK_KEYDIR_BLIND")
+end
+if keydir == "buffered" then
+    -- The blind tree behind a write buffer (bytecaskdb/buffered_btree.cppm).
+    add_defines("BYTECASK_KEYDIR_BUFFERED")
+    -- How long writes pause before the buffer is drained, in ms. For
+    -- measurement only: the default is the tree's kIdleWindow.
+    local idle_ms = os.getenv("BYTECASK_BUFFER_IDLE_MS")
+    if idle_ms ~= nil and idle_ms ~= "" then
+        add_defines("BYTECASK_BUFFER_IDLE_MS=" .. idle_ms)
+    end
 end
 
 local march = os.getenv("BYTECASK_MARCH") or "native"
@@ -716,6 +727,18 @@ local wasm_dir = path.join(os.projectdir(), "bytecaskdb-node", "wasm")
 local wasm_crc32c = path.join(wasm_dir, "build", "crc32c-wasm")
 local wasm_zstd = path.join(wasm_dir, "build", "zstd-wasm")
 
+-- The buffered key directory needs its merger thread, and WASM builds have
+-- no threads (BYTECASK_SINGLE_THREADED). Every WASM target runs it
+-- (set_wasm_policies) in before_prepare: on_config runs for every target on
+-- any build, which would fail native buffered builds, and before_build runs
+-- after the module scan has already compiled.
+local function refuse_buffered_keydir()
+    if keydir == "buffered" then
+        os.raise("BYTECASK_KEYDIR=buffered is not available for WASM targets; "
+            .. "they use the blind tree")
+    end
+end
+
 -- Common WASM target setup. Each WASM target calls this in on_config.
 local function add_wasm_ldflags(t)
     t:add("ldflags",
@@ -740,6 +763,7 @@ local function set_wasm_policies()
     set_policy("build.c++.modules", true)
     set_policy("build.c++.modules.clang.fallbackscanner", true)
     set_policy("build.c++.modules.std", false)
+    before_prepare(refuse_buffered_keydir)
 end
 
 -- Run WASM targets via node, forwarding extra arguments.
@@ -753,6 +777,8 @@ end
 -- by bytecaskdb-node/wasm/build.sh.
 local function add_wasm_sources()
     add_files("bytecaskdb/*.cppm")
+    -- Needs threads; see refuse_buffered_keydir.
+    remove_files("bytecaskdb/buffered_btree.cppm")
     -- Real link() under NODERAWFS; see the file.
     add_files(path.join(wasm_dir, "node_linkat.c"))
     add_includedirs(path.join(wasm_crc32c, "include"))
@@ -839,7 +865,7 @@ target("wasm_tests")
     set_wasm_policies()
     add_wasm_sources()
     add_files("tests/*.cpp", "tests/proof/generated/*.cpp")
-    remove_files("tests/bytecask_c_test.cpp")
+    remove_files("tests/bytecask_c_test.cpp", "tests/buffered_btree_test.cpp")
     add_files("bytecaskdb-node/wasm/catch2_stringmakers.cpp")
     add_includedirs("bytecaskdb", "tests")
     add_defines("BYTECASK_TESTING", "BYTECASK_RADIX_ACCOUNTING")
