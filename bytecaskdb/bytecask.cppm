@@ -810,6 +810,11 @@ export struct FileManifest;
 // contends: the exchange is on its own line, and "recently used" is a scrape
 // epoch the reader copies from a counter the scrape bumps ~10 times a
 // second, not a clock.
+//
+// Closing a DB takes the same way every entry that belongs to it, in every
+// slot, and waits out the slots it finds claimed: a claimed slot may be a
+// read of the closing DB that puts its entry back. Nothing the DB opened
+// outlives it through a cache — with the buffer pool, that is every frame.
 // ---------------------------------------------------------------------------
 export class DB;
 
@@ -826,7 +831,9 @@ inline auto next_state_gen() -> std::uint64_t {
 }
 
 struct ReadCacheEntry {
-  const DB *owner{nullptr};  // compared, never dereferenced
+  // Compared, never dereferenced. Written by its reader, read by a close
+  // taking the DB's entries, hence atomic.
+  std::atomic<const DB *> owner{nullptr};
   std::shared_ptr<const EngineState> state;
   // state_gen_ when state was loaded with no publication in progress;
   // kNoStateGen otherwise, which never matches.
@@ -893,31 +900,58 @@ public:
   }
 
   // Advances the epoch and takes the entry from every slot that has not
-  // been used for `idle_epochs` epochs. A slot read as kInUse is skipped —
-  // its reader is in the middle of a read — and a claim that lands between
-  // the load and the swap makes the swap fail, so an entry is only ever
-  // freed once no reader can be holding it.
+  // been used for `idle_epochs` epochs.
   void scrape(std::uint64_t idle_epochs) {
-    std::vector<ReadCacheEntry *> taken;
-    {
-      std::lock_guard<std::mutex> lk{mu_};
-      const auto now = epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
-      for (auto *slot : slots_) {
-        auto *e = slot->ptr_.load(std::memory_order_acquire);
-        if (!ReadCacheSlot::is_entry(e)) continue;
-        if (now - e->used_epoch.load(std::memory_order_relaxed) <= idle_epochs)
-          continue;
-        if (slot->ptr_.compare_exchange_strong(e, ReadCacheSlot::obsolete(),
-                                               std::memory_order_acq_rel)) {
-          taken.push_back(e);
-        }
-      }
+    const auto now = epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
+    (void)take([&](const ReadCacheEntry &e) {
+      return now - e.used_epoch.load(std::memory_order_relaxed) > idle_epochs;
+    });
+  }
+
+  // Takes every entry of `db` from every slot. A claimed slot is retried
+  // until it is released, since the read holding it may be one of `db`
+  // that puts an entry back; claims last one read, so this ends.
+  void release(const DB *db) {
+    while (take([db](const ReadCacheEntry &e) {
+      return e.owner.load(std::memory_order_relaxed) == db;
+    })) {
+      std::this_thread::yield();
     }
-    for (auto *e : taken) delete e;
   }
 
 private:
   ReadCacheRegistry() = default;
+
+  // Takes the entry `select` picks from every slot and frees it with mu_
+  // released: freeing a state runs the destructors of what it held (files,
+  // the buffer pool), which must not run under the lock every exiting
+  // thread takes. `select` reads only the entry's atomics; the claim holder owns
+  // the rest. A slot read as kInUse is skipped — its reader is in the
+  // middle of a read — and a claim that lands between the load and the
+  // swap makes the swap fail, so an entry is only ever freed once no reader
+  // can be holding it. Returns whether a slot was skipped as kInUse.
+  template <typename Select>
+  [[nodiscard]] auto take(const Select &select) -> bool {
+    std::vector<ReadCacheEntry *> taken;
+    auto claimed = false;
+    {
+      std::lock_guard<std::mutex> lk{mu_};
+      for (auto *slot : slots_) {
+        auto *e = slot->ptr_.load(std::memory_order_acquire);
+        if (e == ReadCacheSlot::in_use()) claimed = true;
+        if (!ReadCacheSlot::is_entry(e) || !select(*e)) continue;
+        if (slot->ptr_.compare_exchange_strong(e, ReadCacheSlot::obsolete(),
+                                               std::memory_order_acq_rel)) {
+          taken.push_back(e);
+        } else {
+          claimed = true;
+        }
+      }
+    }
+    for (auto *e : taken) delete e;
+    return claimed;
+  }
+
   std::mutex mu_;
   std::vector<ReadCacheSlot *> slots_;
   std::atomic<std::uint64_t> epoch_{1};
@@ -2727,6 +2761,13 @@ DB::~DB() {
   try {
     close();
   } catch (...) {}
+  // close() took this DB's read-cache entries, but a read on another thread
+  // racing an explicit close() is not ordered after it and can cache one
+  // again. Every call on this DB has returned by now, so this pass is the
+  // last word.
+  try {
+    ReadCacheRegistry::instance().release(this);
+  } catch (...) {}
 }
 
 // Takes vacuum_mu_ before write_mu_, the order vacuum() takes them in. The
@@ -2782,6 +2823,8 @@ void DB::close() {
     }
     store_state(current, std::move(t).persistent()->closed_copy());
   }
+  // The closed state holds no files; the states threads cached do.
+  ReadCacheRegistry::instance().release(this);
   if (lock_fd_ != -1) {
     ::close(lock_fd_);
     lock_fd_ = -1;
@@ -4482,13 +4525,13 @@ auto DB::load_state_for_read() const
   // thread that reads from two DBs could see one DB's generation while
   // querying the other. An entry of another DB is dropped, not reused —
   // this DB must never take ownership of another DB's state.
-  if (e == nullptr || e->owner != this) {
+  if (e == nullptr || e->owner.load(std::memory_order_relaxed) != this) {
     if (e == nullptr) {
       e = new ReadCacheEntry();
     } else {
       e->state.reset();
     }
-    e->owner = this;
+    e->owner.store(this, std::memory_order_relaxed);
     e->gen = kNoStateGen;
   }
   // A read must see every state published before it began, and every state
