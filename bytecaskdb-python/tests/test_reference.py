@@ -170,9 +170,27 @@ def test_a_torn_first_write_of_a_file_is_cut(tmp_path, torn_to):
     assert second.stat().st_size == 0
 
 
-def test_an_older_file_with_a_zeroed_first_header_is_refused(tmp_path):
-    """Its first sequence reads as 0, like a file too short for a header, but
-    it holds acknowledged entries: it is damage, not a torn first write."""
+def test_a_file_whose_first_page_was_lost_is_cut(tmp_path):
+    """A power cut can lose the first page of a file that was never synced
+    and keep a later one. The file has no first sequence, and goes whole."""
+    with ref.DB.open(tmp_path) as db:
+        db.put(b"a", b"1")
+    with ref.DB.open(tmp_path) as db:
+        for i in range(5):
+            db.put(f"k{i}".encode(), b"v", NO_SYNC)
+    second = file_starting_at(tmp_path, 2)
+    raw = bytearray(second.read_bytes())
+    raw[:8] = bytes(8)
+    second.write_bytes(bytes(raw))
+    with ref.DB.open(tmp_path) as db:
+        assert list(db.keys_from()) == [b"a"]
+    assert second.stat().st_size == 0
+
+
+def test_an_older_file_with_a_zeroed_first_header_is_cut(tmp_path):
+    """A known limitation, shared with the engine (#303). The file holds
+    acknowledged entries, but with no first sequence it cannot be told from
+    the newest file after a power cut, which must open."""
     with ref.DB.open(tmp_path) as db:
         for i in range(5):
             db.put(f"k{i}".encode(), b"v", NO_SYNC)
@@ -182,9 +200,9 @@ def test_an_older_file_with_a_zeroed_first_header_is_refused(tmp_path):
     raw = bytearray(older.read_bytes())
     raw[:8] = bytes(8)
     older.write_bytes(bytes(raw))
-    with pytest.raises(RuntimeError, match="corrupt data file"):
-        ref.DB.open(tmp_path)
-    assert older.stat().st_size == len(raw)
+    with ref.DB.open(tmp_path) as db:
+        assert list(db.keys_from()) == [b"z"]
+    assert older.stat().st_size == 0
 
 
 def test_damage_in_an_older_file_is_refused(tmp_path):

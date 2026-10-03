@@ -1374,6 +1374,19 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
          zero_at(f[2], 0, 15);
        },
        true, {10, 11, 12, 13}, 0},
+      // What a power cut leaves of a file that was never synced when its
+      // first page is lost and a later one reaches the disk.
+      {"first header lost, later entries landed",
+       [](auto &f) { zero_at(f[2], 0, 15); }, true, {10, 11, 12, 13}, 0},
+      // A known limitation (#303): a file with no first sequence cannot be
+      // told from the one above, so damage that zeroes an older file's first
+      // header is not refused, and the file goes whole.
+      {"sealed zeroed first header",
+       [](auto &f) {
+         drop_hint(f[0]);
+         zero_at(f[0], 0, 8);
+       },
+       true, {0, 1, 2, 3, 4}, 0},
       {"sealed zero tail, newest torn",
        [](auto &f) {
          drop_hint(f[0]);
@@ -1447,9 +1460,14 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
                   !row.lost.contains(i));
           }
           // Everything past the last committed record is gone.
-          CHECK(std::filesystem::file_size(files[0]) == 5 * kEntry);
+          const auto lost_in = [&](int first, int last) {
+            return static_cast<std::uintmax_t>(std::ranges::count_if(
+                row.lost, [&](int k) { return first <= k && k <= last; }));
+          };
+          CHECK(std::filesystem::file_size(files[0]) ==
+                (5 - lost_in(0, 4)) * kEntry);
           CHECK(std::filesystem::file_size(files[2]) ==
-                (4 - row.lost.size()) * kEntry);
+                (4 - lost_in(10, 13)) * kEntry);
         } else {
           const auto before = read_all(files[row.refused_file]);
           REQUIRE_THROWS_AS(bytecask::DB::open(dir, opts), std::runtime_error);
