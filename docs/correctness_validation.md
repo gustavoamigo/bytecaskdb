@@ -1587,7 +1587,7 @@ An `fdatasync` failed *before* leaves its pages clean and unwritten in the
 | a put that fills the active file | the same, `max_file_bytes = 512` | 23 |
 | `vacuum` | a sealed file with a dead entry | 25 |
 | `create_manifest` | one file | 19 |
-| `ingest` of one batch | a follower holding the first slice | 13 |
+| `ingest` of a put and a batch | a follower holding the first slice | 15 |
 | `resume()` | degraded by a failed commit sync: the entry whole, unsynced | 42 |
 | `resume()` | degraded by a short append: the entry torn | 40 |
 | `close()` | an unsynced batch behind it | 13 |
@@ -1602,6 +1602,9 @@ what makes an operation cheap to add. After a failure at any N:
   and the transition if the operation returned (`assert_consistent`);
 - a degraded engine resumes once the fault is lifted (`assert_resumable`),
   and `resume()` keeps or completes the transition;
+- for `ingest`, whose slice is two atomic units, `resume()` or a power cut
+  may also leave the first unit without the second, and delivering the
+  slice again completes it (`CONTRACT.md`, `ingest`);
 - a write after the fault lands;
 - a close and reopen recovers that state, serial and parallel, with the
   same file stats;

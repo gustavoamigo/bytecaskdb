@@ -10,6 +10,7 @@
 // what a power cut leaves obeys the watermark rule.
 // See docs/correctness_validation.md, "Counted fault sweep".
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +21,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <vector>
 
 #include "fault_injector.h"
 #include "syscall_faults.h"
@@ -182,7 +184,20 @@ struct Operation {
   std::function<KeyValues(KeyValues)> transition;
   // False for a follower, which takes no writes but ingest.
   bool takes_writes{true};
+  // States short of the whole transition that resume() or a power cut may
+  // leave after a failure: an operation that puts several atomic units in
+  // the file can fail with the first of them complete. Empty for an
+  // operation that writes one unit.
+  std::function<std::vector<KeyValues>(const KeyValues &)> partial{};
+  // Runs the operation again after the fault, as a caller that got the error
+  // would. Whatever the failure left, the whole transition must follow.
+  std::function<void(DB &)> retry{};
 };
+
+auto one_of(const KeyValues &got, const std::vector<KeyValues> &states)
+    -> bool {
+  return std::ranges::find(states, got) != states.end();
+}
 
 // One run of `op` with its n-th call failing. Returns false once the
 // operation completes without reaching the fault.
@@ -197,6 +212,7 @@ auto sweep_step(const Operation &op, const Pass &pass, int n) -> bool {
   KeyValues baseline;
   KeyValues after;
   KeyValues final_state;
+  std::vector<KeyValues> partial_states;
   std::uint64_t final_next_seq = 0;
   bytecask::testing::PowerLossExpectation at_cut;
   {
@@ -205,6 +221,7 @@ auto sweep_step(const Operation &op, const Pass &pass, int n) -> bool {
     wait_hints_idle(*db);
     baseline = key_values(*db);
     after = op.transition(baseline);
+    if (op.partial) partial_states = op.partial(baseline);
 
     bool threw = false;
     bool did_work = false;
@@ -252,11 +269,18 @@ auto sweep_step(const Operation &op, const Pass &pass, int n) -> bool {
     if (db->is_degraded()) {
       assert_resumable(*db);
       const auto resumed = key_values(*db);
-      if (live == baseline && resumed == baseline) {
+      if (live == baseline &&
+          (resumed == baseline || one_of(resumed, partial_states))) {
         // The transition never reached the file whole.
       } else {
         check_key_values(resumed, after, "resume() keeps or completes the transition");
       }
+    }
+
+    if (op.retry) {
+      op.retry(*db);
+      check_key_values(key_values(*db), after, "the operation, run again");
+      assert_consistent(*db);
     }
 
     // The engine goes on: a write after the fault lands and recovers.
@@ -274,7 +298,15 @@ auto sweep_step(const Operation &op, const Pass &pass, int n) -> bool {
   assert_reopens(dir, final_state, final_next_seq, op.opts);
   {
     INFO("the cut taken after the fault, before resume()");
-    assert_power_loss_outcome(cut, at_cut, op.opts);
+    const auto durable =
+        at_cut.transition_last_seq > 0 &&
+        at_cut.watermark >= at_cut.transition_last_seq;
+    if (!durable && !partial_states.empty() &&
+        one_of(key_values(DB::open(cut, op.opts)), partial_states)) {
+      // The device holds the transition's first units, whole.
+    } else {
+      assert_power_loss_outcome(cut, at_cut, op.opts);
+    }
   }
   {
     // Everything published by then was synced, or resume() made it durable.
@@ -487,9 +519,10 @@ TEST_CASE("fault sweep: create_manifest", "[fault_sweep]") {
 
 TEST_CASE("fault sweep: ingest", "[fault_sweep]") {
   // The leader's stream in two slices: the follower's baseline, then the
-  // slice ingested under fault. That one is a single batch: a slice is
-  // published in one step, but on disk only each batch in it is atomic, so a
-  // failed ingest of several may leave the first of them.
+  // slice ingested under fault, a put and a batch. A slice is published in
+  // one step, and a failed ingest publishes none of it; but on disk only each
+  // unit is atomic, so resume() may replay the put without the batch.
+  // Delivering the slice again then completes it (CONTRACT.md, ingest).
   OwnedEntries first;
   OwnedEntries second;
   {
@@ -501,6 +534,7 @@ TEST_CASE("fault sweep: ingest", "[fault_sweep]") {
       const auto snap = leader.snapshot();
       first = bytecask::testing::collect_changes(leader.changes_since(snap, 0));
     }
+    leader.put({.sync = true}, to_bytes("k1"), to_bytes("over"));
     REQUIRE(leader.apply_batch({.sync = true}, mixed_plan()));
     const auto snap = leader.snapshot();
     second = bytecask::testing::collect_changes(leader.changes_since(snap, upto));
@@ -524,7 +558,14 @@ TEST_CASE("fault sweep: ingest", "[fault_sweep]") {
                }
                return kv;
              },
-         .takes_writes = false});
+         .takes_writes = false,
+         .partial =
+             [](const KeyValues &baseline) {
+               auto put_only = baseline;
+               put_only["k1"] = bytes("over");
+               return std::vector<KeyValues>{put_only};
+             },
+         .retry = [&](DB &db) { db.ingest(second.views()); }});
 }
 
 // resume() itself under fault, from each state a failed write leaves: the

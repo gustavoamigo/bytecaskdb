@@ -759,7 +759,7 @@ Applies pre-sequenced entries from a leader to a follower's storage.
 | **Degraded on I/O failure** | Same pattern as `apply_batch`: on `writev`/`fdatasync` failure, advance sequence to prevent reuse, go degraded, rethrow. |
 | **Atomicity** | If ingest throws, no partial state is published to readers. |
 | **Causality** | Entries are applied in the sequence order provided by `changes_since`. If entry A has a lower sequence than entry B, A is applied before B. The follower's state reflects the same causal ordering as the leader's write history. |
-| **I/O failure safety** | If any I/O operation throws, the published key directory reflects zero entries from this call. The engine degrades; `resume()` restores normal operation. After resume, re-delivery from `follower.durable_sequence()` proceeds normally. |
+| **I/O failure safety** | If any I/O operation throws, the published key directory reflects zero entries from this call. The engine degrades; `resume()` restores normal operation. `resume()` replays every complete unit it finds in the active file — a standalone entry, or a batch through its `BulkEnd` — so after it the follower may hold the first units of the failed slice, never part of a batch. Re-delivery from `follower.durable_sequence()` then skips those and applies the rest. |
 | **Slices end at batch boundaries (caller obligation)** | `ingest` publishes what it is given. A slice that ends between a `BulkBegin` and its `BulkEnd` makes part of an atomic batch visible on the follower until the next slice arrives. The caller must cut slices after a `BulkEnd` or a standalone entry. Not enforced by the engine today ([#188](https://github.com/gustavoamigo/bytecaskdb/issues/188)). |
 
 ## `set_mode` / `mode`
