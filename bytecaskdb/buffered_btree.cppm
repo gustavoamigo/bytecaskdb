@@ -88,6 +88,7 @@ module;
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -867,43 +868,41 @@ export template <std::size_t LeafBytes, typename RS> class BufferedBlindBTree;
 export template <std::size_t LeafBytes, typename RS> class TransientBufferedBlindBTree;
 
 // ---------------------------------------------------------------------------
-// BufferedIterator — the tree's entries merged with the buffers', in key
-// order, the newest entry winning and erases hiding what they erase.
-// Moving may read keys, so the iterator takes a resolver: settle(res) once
-// after it is made, next(res) and prev(res) to move. The engine's key
-// directory iterator does this for every tree.
+// BufferedMergeCursor — the tree's entries merged with the buffers', in key
+// order, the newest entry winning and erases hiding what they erase. Moving
+// may read keys, so it takes a resolver: settle(res) once after it is made,
+// next(res) and prev(res) to move.
 //
 // The next buffer candidate is cached: the smallest buffer key past the
 // position stays the smallest until it is passed. A tree entry's key is
 // read only to compare it with a candidate, so with none ahead, stepping
 // through the tree reads nothing more than the tree iterator does.
+//
+// One tree iterator, t_, is both the cursor and the pin on the version's
+// tree: going forward it is the first tree entry not yet passed, going back
+// the last. Turning around seeks again, so one serves both directions, and
+// every seek repositions it in place.
 // ---------------------------------------------------------------------------
-export template <std::size_t LeafBytes> class BufferedIterator {
-  using Tree = PersistentBlindBTree<LeafBytes>;
+template <std::size_t LeafBytes> class BufferedMergeCursor {
   using TIt = BlindBTreeIterator<LeafBytes>;
   using Bytes = buffered_detail::Bytes;
   using Layers = buffered_detail::Layers;
   using Slot = buffered_detail::Slot;
   using Pick = buffered_detail::Pick;
-  enum class Start : std::uint8_t { None, Begin, End, At };
 
 public:
-  using iterator_category = std::bidirectional_iterator_tag;
-  using value_type = BlindRef;
-  using difference_type = std::ptrdiff_t;
+  enum class Start : std::uint8_t { None, Begin, End, At };
 
-  BufferedIterator() = default;
+  // `t` is any iterator over the tree to merge; only its version is used.
+  BufferedMergeCursor(TIt t, Layers l, Start start, Bytes at)
+      : t_{std::move(t)}, l_{std::move(l)}, start_{start}, start_key_(at.begin(), at.end()) {}
 
-  [[nodiscard]] auto operator*() const -> BlindRef { return ref_; }
+  [[nodiscard]] auto ref() const noexcept -> BlindRef { return ref_; }
+  [[nodiscard]] auto at_end() const noexcept -> bool { return at_end_; }
+  // Valid until the cursor next moves.
   template <BlindKeyResolver R> [[nodiscard]] auto key(R &res) const -> Bytes {
     ensure_key(res);
     return {key_.data(), key_.size()};
-  }
-  auto operator==(std::default_sentinel_t) const noexcept -> bool { return at_end_; }
-  // Same entry: a record location names one record.
-  auto operator==(const BufferedIterator &o) const noexcept -> bool {
-    if (at_end_ || o.at_end_) return at_end_ == o.at_end_;
-    return ref_ == o.ref_;
   }
 
   template <BlindKeyResolver R> void settle(R &res) {
@@ -924,11 +923,6 @@ public:
     bound_ok_ = false;
     if (at_end_) return;
     if (fwd_) {
-      // No buffers: forward() reduces to stepping the tree.
-      if (plain_) {
-        step_tree();
-        return;
-      }
       forward(res);
       return;
     }
@@ -956,10 +950,10 @@ public:
 
   // Entries from here up to `end`, counted no further than limit. When no
   // buffered key falls in the range, from the tree's leaf sizes and the
-  // bounds the iterators were placed by: two reads at most, and none when
+  // bounds the cursors were placed by: two reads at most, and none when
   // the tree positions are at hand. Otherwise by stepping.
   template <BlindKeyResolver R>
-  [[nodiscard]] auto count_until(const BufferedIterator &end, std::size_t limit,
+  [[nodiscard]] auto count_until(const BufferedMergeCursor &end, std::size_t limit,
                                  R &res) const -> std::size_t {
     if (limit == 0) return 0;
     const auto lo = range_bound(res);
@@ -969,13 +963,17 @@ public:
     if (!buffered_detail::any_in(l_, *lo, hi)) {
       // Every entry in range is the tree's.
       if (start_ == Start::None && fwd_ && from_tree_ && end.start_ == Start::None) {
-        // tf_ is one past this entry.
-        if (end.at_end_) return 1 + tf_.count_until(tree_.end_iter(), limit - 1);
-        if (end.fwd_ && end.from_tree_) return tf_.count_until(end.tf_, limit);
+        // t_ is one past this entry; an iterator with no position counts
+        // to the end.
+        if (end.at_end_) return 1 + t_.count_until(TIt{}, limit - 1);
+        if (end.fwd_ && end.from_tree_) return t_.count_until(end.t_, limit);
       }
       buffered_detail::Overlay<R> ov{res, l_};
-      const auto from = tree_.lower_bound(*lo, ov);
-      const auto to = hi ? tree_.lower_bound(*hi, ov) : tree_.end_iter();
+      auto from = t_;
+      from.seek(*lo, ov);
+      if (!hi) return from.count_until(TIt{}, limit);
+      auto to = t_;
+      to.seek(*hi, ov);
       return from.count_until(to, limit);
     }
     auto it = *this;
@@ -983,7 +981,7 @@ public:
     auto stop = end;
     stop.settle(res);
     std::size_t n = 0;
-    while (n < limit && !(it == stop) && !(it == std::default_sentinel)) {
+    while (n < limit && !it.same_entry(stop) && !it.at_end_) {
       ++n;
       it.next(res);
     }
@@ -991,26 +989,14 @@ public:
   }
 
 private:
-  template <std::size_t, typename> friend class BufferedBlindBTree;
-  template <std::size_t, typename> friend class TransientBufferedBlindBTree;
-
-  BufferedIterator(Tree tree, Layers l, Start start, Bytes at = {})
-      : tree_{std::move(tree)}, l_{std::move(l)}, start_{start}, start_key_(at.begin(), at.end()),
-        plain_{l_.total() == 0} {}
-
-  // forward() with no buffer candidate: the tree's next entry, or the end.
-  void step_tree() {
-    if (tf_ == std::default_sentinel) {
-      at_end_ = true;
-      fwd_ = false;
-      return;
-    }
-    take_tree(*tf_, false);
-    ++tf_;
+  // Same entry: a record location names one record.
+  [[nodiscard]] auto same_entry(const BufferedMergeCursor &o) const noexcept -> bool {
+    if (at_end_ || o.at_end_) return at_end_ == o.at_end_;
+    return ref_ == o.ref_;
   }
 
   // Where the entries from here start: the bound it was placed by or its
-  // key; none at the end. Valid until the iterator next changes.
+  // key; none at the end. Valid until the cursor next changes.
   template <BlindKeyResolver R> auto range_bound(R &res) const -> std::optional<Bytes> {
     switch (start_) {
     case Start::Begin: return Bytes{};
@@ -1034,10 +1020,13 @@ private:
   // Positions on the smallest entry > (>=) lo.
   template <BlindKeyResolver R> void seek(Bytes lo, bool inclusive, R &res) {
     buffered_detail::Overlay<R> ov{res, l_};
-    tf_ = lo.empty() && inclusive ? tree_.begin() : tree_.lower_bound(lo, ov);
-    if (!inclusive && tf_ != std::default_sentinel &&
-        buffered_detail::compare(tf_.key(ov), lo) == 0)
-      ++tf_;
+    if (lo.empty() && inclusive)
+      t_.seek_first();
+    else
+      t_.seek(lo, ov);
+    if (!inclusive && t_ != std::default_sentinel &&
+        buffered_detail::compare(t_.key(ov), lo) == 0)
+      ++t_;
     fwd_ = true;
     bwd_ = false;
     bound_ok_ = inclusive;
@@ -1049,8 +1038,11 @@ private:
   // Positions on the largest entry < hi, or the last if none.
   template <BlindKeyResolver R> void seek_back(std::optional<Bytes> hi, R &res) {
     buffered_detail::Overlay<R> ov{res, l_};
-    tb_ = hi ? tree_.lower_bound(*hi, ov) : tree_.end_iter();
-    --tb_;
+    if (hi)
+      t_.seek(*hi, ov);
+    else
+      t_.seek_end();
+    --t_;
     bwd_ = true;
     fwd_ = false;
     find_candidate<Pick::Max>(hi, false);
@@ -1063,22 +1055,22 @@ private:
     cand_ok_ = true;
   }
 
-  // The fence of the tree iterator's leaf (upper going forward, lower going
+  // The fence of the tree cursor's leaf (upper going forward, lower going
   // back), cached per leaf.
-  template <bool Upper> auto fence(const TIt &t) -> std::optional<Bytes> {
-    if (t.leaf() != fence_leaf_ || fence_upper_ != Upper) {
-      fence_leaf_ = t.leaf();
+  template <bool Upper> auto fence() -> std::optional<Bytes> {
+    if (t_.leaf() != fence_leaf_ || fence_upper_ != Upper) {
+      fence_leaf_ = t_.leaf();
       fence_upper_ = Upper;
-      fence_has_ = Upper ? t.upper_fence(fence_) : t.lower_fence(fence_);
+      fence_has_ = Upper ? t_.upper_fence(fence_) : t_.lower_fence(fence_);
     }
     if (!fence_has_) return std::nullopt;
     return Bytes{fence_.data(), fence_.size()};
   }
 
   // Steps to the next entry: the smaller of the buffer candidate and the
-  // tree's next, tf_. The position (key_) moves past erases too. A tree
-  // entry is known to come first without reading its key when the
-  // candidate is at or past its leaf's upper fence.
+  // tree's next. The position (key_) moves past erases too. A tree entry is
+  // known to come first without reading its key when the candidate is at or
+  // past its leaf's upper fence.
   template <BlindKeyResolver R> void forward(R &res) {
     buffered_detail::Overlay<R> ov{res, l_};
     for (;;) {
@@ -1086,29 +1078,29 @@ private:
         ensure_key(res);
         find_candidate<Pick::Min>(Bytes{key_.data(), key_.size()}, false);
       }
-      const bool tree_left = tf_ != std::default_sentinel;
+      const bool tree_left = t_ != std::default_sentinel;
       int c = -1;
       bool read = false;  // the tree entry's key, into tkey_
       if (cand_ && tree_left) {
-        const auto up = fence<true>(tf_);
+        const auto up = fence<true>();
         if (up && buffered_detail::compare(cand_->key, *up) >= 0) {
           c = 1;
         } else {
           read = true;
-          const auto k = tf_.key(ov);
+          const auto k = t_.key(ov);
           tkey_.assign(k.begin(), k.end());
           c = buffered_detail::compare(cand_->key, {tkey_.data(), tkey_.size()});
         }
       }
       if (cand_ && c <= 0) {
-        if (c == 0) ++tf_;
+        if (c == 0) ++t_;
         take_candidate();
         if (buffered_detail::is_none(ref_)) continue;
         return;
       }
       if (tree_left) {
-        take_tree(*tf_, read);
-        ++tf_;
+        take_tree(*t_, read);
+        ++t_;
         return;
       }
       at_end_ = true;
@@ -1117,8 +1109,8 @@ private:
     }
   }
 
-  // Mirror of forward: the larger of the candidate and tb_, with the lower
-  // fence.
+  // Mirror of forward: the larger of the candidate and the tree's previous,
+  // with the lower fence.
   template <BlindKeyResolver R> void backward(R &res) {
     buffered_detail::Overlay<R> ov{res, l_};
     for (;;) {
@@ -1126,29 +1118,29 @@ private:
         ensure_key(res);
         find_candidate<Pick::Max>(Bytes{key_.data(), key_.size()}, false);
       }
-      const bool tree_left = tb_ != std::default_sentinel;
+      const bool tree_left = t_ != std::default_sentinel;
       int c = 1;
       bool read = false;
       if (cand_ && tree_left) {
-        const auto down = fence<false>(tb_);
+        const auto down = fence<false>();
         if (down && buffered_detail::compare(cand_->key, *down) < 0) {
           c = -1;
         } else {
           read = true;
-          const auto k = tb_.key(ov);
+          const auto k = t_.key(ov);
           tkey_.assign(k.begin(), k.end());
           c = buffered_detail::compare(cand_->key, {tkey_.data(), tkey_.size()});
         }
       }
       if (cand_ && c >= 0) {
-        if (c == 0) --tb_;
+        if (c == 0) --t_;
         take_candidate();
         if (buffered_detail::is_none(ref_)) continue;
         return;
       }
       if (tree_left) {
-        take_tree(*tb_, read);
-        --tb_;
+        take_tree(*t_, read);
+        --t_;
         return;
       }
       at_end_ = true;
@@ -1174,12 +1166,10 @@ private:
     at_end_ = false;
   }
 
-  Tree tree_;
+  TIt t_;  // the tree cursor, and the pin on its version
   Layers l_;
   Start start_{Start::None};
   std::vector<std::byte> start_key_;
-  TIt tf_;  // forward: the first tree entry not yet passed
-  TIt tb_;  // backward: the last tree entry not yet passed
   bool fwd_{false};
   bool bwd_{false};
   bool at_end_{true};
@@ -1194,11 +1184,132 @@ private:
   bool fence_upper_{false};
   bool fence_has_{false};
   std::vector<std::byte> fence_;
-  // The inclusive bound a seek placed this iterator at, until it moves.
+  // The inclusive bound a seek placed this cursor at, until it moves.
   std::vector<std::byte> bound_;
   bool bound_ok_{false};
-  // Made over a version with nothing buffered: steps the tree alone.
-  bool plain_{false};
+};
+
+// ---------------------------------------------------------------------------
+// BufferedIterator — the key directory's iterator over a version: the tree
+// iterator itself when the version holds nothing buffered, a
+// BufferedMergeCursor otherwise. Either way it holds one pin on the tree;
+// the cursor's merge state is allocated only for a version with buffered
+// slots, so copying, moving and destroying an iterator over a drained
+// version costs what the blind tree's does. Moving takes a resolver
+// (settle / next / prev), as the engine's key directory iterator does for
+// every tree; the plain one ignores it.
+// ---------------------------------------------------------------------------
+export template <std::size_t LeafBytes> class BufferedIterator {
+  using TIt = BlindBTreeIterator<LeafBytes>;
+  using Cursor = BufferedMergeCursor<LeafBytes>;
+  using Bytes = buffered_detail::Bytes;
+  using State = std::variant<TIt, std::unique_ptr<Cursor>>;
+
+public:
+  using iterator_category = std::bidirectional_iterator_tag;
+  using value_type = BlindRef;
+  using difference_type = std::ptrdiff_t;
+
+  BufferedIterator() = default;
+  BufferedIterator(const BufferedIterator &o) : s_{copy_of(o.s_)} {}
+  auto operator=(const BufferedIterator &o) -> BufferedIterator & {
+    if (this != &o) s_ = copy_of(o.s_);
+    return *this;
+  }
+  // A moved-from iterator is at the end, holding nothing.
+  BufferedIterator(BufferedIterator &&o) noexcept : s_{std::exchange(o.s_, State{})} {}
+  auto operator=(BufferedIterator &&o) noexcept -> BufferedIterator & {
+    if (this != &o) s_ = std::exchange(o.s_, State{});
+    return *this;
+  }
+  ~BufferedIterator() = default;
+
+  [[nodiscard]] auto operator*() const -> BlindRef {
+    if (const auto *t = plain()) return **t;
+    return cursor().ref();
+  }
+  // Valid until the iterator moves or `res` is used again.
+  template <BlindKeyResolver R> [[nodiscard]] auto key(R &res) const -> Bytes {
+    if (const auto *t = plain()) return t->key(res);
+    return cursor().key(res);
+  }
+  auto operator==(std::default_sentinel_t) const noexcept -> bool {
+    if (const auto *t = plain()) return *t == std::default_sentinel;
+    return cursor().at_end();
+  }
+  // Same entry: a record location names one record.
+  auto operator==(const BufferedIterator &o) const noexcept -> bool {
+    const bool end = *this == std::default_sentinel;
+    const bool o_end = o == std::default_sentinel;
+    if (end || o_end) return end == o_end;
+    return **this == *o;
+  }
+
+  template <BlindKeyResolver R> void settle(R &res) {
+    if (auto *c = merging()) c->settle(res);
+  }
+  template <BlindKeyResolver R> void next(R &res) {
+    if (auto *t = plain_mut()) {
+      ++*t;
+      return;
+    }
+    merging()->next(res);
+  }
+  // From the end, the last entry; from the first entry, the end.
+  template <BlindKeyResolver R> void prev(R &res) {
+    if (auto *t = plain_mut()) {
+      --*t;
+      return;
+    }
+    merging()->prev(res);
+  }
+
+  // Entries from here up to `end`, an iterator over the same version,
+  // counted no further than limit. Two iterators over one version are of
+  // one kind: whether a version holds buffered slots never changes.
+  template <BlindKeyResolver R>
+  [[nodiscard]] auto count_until(const BufferedIterator &end, std::size_t limit,
+                                 R &res) const -> std::size_t {
+    const auto *t = plain();
+    const auto *end_t = end.plain();
+    if (t && end_t) return t->count_until(*end_t, limit);
+    if (!t && !end_t) return cursor().count_until(end.cursor(), limit, res);
+    throw std::logic_error{"buffered key directory: a count between iterators over "
+                           "different versions"};
+  }
+
+private:
+  template <std::size_t, typename> friend class BufferedBlindBTree;
+  template <std::size_t, typename> friend class TransientBufferedBlindBTree;
+
+  // Over a version with nothing buffered: the tree's own iterator.
+  explicit BufferedIterator(TIt t) : s_{std::move(t)} {}
+  explicit BufferedIterator(std::unique_ptr<Cursor> c) : s_{std::move(c)} {}
+
+  using Start = typename Cursor::Start;
+  // Over a version with buffered slots: merges tree `tree` with buffers `l`,
+  // placed when settled.
+  static auto merge(const PersistentBlindBTree<LeafBytes> &tree, buffered_detail::Layers l,
+                    Start start, Bytes at = {}) -> BufferedIterator {
+    return BufferedIterator{std::make_unique<Cursor>(tree.end_iter(), std::move(l), start, at)};
+  }
+
+  static auto copy_of(const State &s) -> State {
+    if (const auto *c = std::get_if<std::unique_ptr<Cursor>>(&s))
+      return std::make_unique<Cursor>(**c);
+    return std::get<TIt>(s);
+  }
+  [[nodiscard]] auto plain() const noexcept -> const TIt * { return std::get_if<TIt>(&s_); }
+  [[nodiscard]] auto plain_mut() noexcept -> TIt * { return std::get_if<TIt>(&s_); }
+  [[nodiscard]] auto merging() noexcept -> Cursor * {
+    auto *c = std::get_if<std::unique_ptr<Cursor>>(&s_);
+    return c ? c->get() : nullptr;
+  }
+  [[nodiscard]] auto cursor() const -> const Cursor & {
+    return *std::get<std::unique_ptr<Cursor>>(s_);
+  }
+
+  State s_;
 };
 
 // ---------------------------------------------------------------------------
@@ -1253,15 +1364,23 @@ public:
     return tree->holds(key, ref);
   }
 
-  // Unsettled: it reads nothing until settled or stepped, so a count
-  // between two bounds reads only what the tree needs to place them.
+  // With buffered slots, unsettled: it reads nothing until settled or
+  // stepped, so a count between two bounds reads only what the tree needs
+  // to place them. Without, the tree's own iterator, placed at once.
   template <BlindKeyResolver R>
-  [[nodiscard]] auto lower_bound(Bytes key, R &) const -> Iter {
-    return iter(Iter::Start::At, key);
+  [[nodiscard]] auto lower_bound(Bytes key, R &res) const -> Iter {
+    if (unbuffered()) return Iter{tree_.lower_bound(key, res)};
+    return merging(Iter::Start::At, key);
   }
-  // Unsettled: the key directory's iterator settles it.
-  [[nodiscard]] auto begin() const -> Iter { return iter(Iter::Start::Begin); }
-  [[nodiscard]] auto end_iter() const -> Iter { return iter(Iter::Start::End); }
+  // Unsettled when merging: the key directory's iterator settles it.
+  [[nodiscard]] auto begin() const -> Iter {
+    if (unbuffered()) return Iter{tree_.begin()};
+    return merging(Iter::Start::Begin);
+  }
+  [[nodiscard]] auto end_iter() const -> Iter {
+    if (unbuffered()) return Iter{tree_.end_iter()};
+    return merging(Iter::Start::End);
+  }
   [[nodiscard]] auto end() const noexcept -> std::default_sentinel_t { return {}; }
 
   // Every location this version holds, in no order and reading no record:
@@ -1355,12 +1474,15 @@ private:
       if (const auto *t = fs_[i]->done.load(std::memory_order_acquire)) return {t, i + 1};
     return {&tree_, 0};
   }
-  // Nothing buffered: an iterator without buffers, which steps the tree
-  // alone, and whose seeks and counts scan no slot.
-  [[nodiscard]] auto iter(typename Iter::Start start, Bytes at = {}) const -> Iter {
+  // Holds no buffered slot, frozen or not: its iterators are the tree's
+  // own. Fixed for a version, so every iterator over it is of one kind. A
+  // version whose merges have finished but are not installed yet merges
+  // (through the finished trees, skipping the buffers they cover); the
+  // next publish installs them.
+  [[nodiscard]] auto unbuffered() const noexcept -> bool { return l_.total() == 0; }
+  [[nodiscard]] auto merging(typename Iter::Start start, Bytes at = {}) const -> Iter {
     const auto [tree, skip] = effective();
-    if (l_.total_from(skip) == 0) return {*tree, Layers{}, start, at};
-    return {*tree, skip == 0 ? l_ : l_.from(skip), start, at};
+    return Iter::merge(*tree, skip == 0 ? l_ : l_.from(skip), start, at);
   }
 
   std::shared_ptr<Merger> merger_;  // null until a builder is made
@@ -1447,11 +1569,11 @@ public:
     return by_location(key, from, buffered_detail::kNoRef);
   }
 
-  // Unsettled: it reads nothing until settled or stepped, so a count
-  // between two bounds reads only what the tree needs to place them.
+  // As the published version's.
   template <BlindKeyResolver R>
-  [[nodiscard]] auto lower_bound(Bytes key, R &) const -> Iter {
-    return {tree_, l_, Iter::Start::At, key};
+  [[nodiscard]] auto lower_bound(Bytes key, R &res) const -> Iter {
+    if (l_.total() == 0) return Iter{tree_.lower_bound(key, res)};
+    return Iter::merge(tree_, l_, Iter::Start::At, key);
   }
 
   // Publishes. The buffers this builder froze go to the merger, oldest
