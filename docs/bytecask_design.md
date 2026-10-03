@@ -87,6 +87,47 @@ The locking strategy respects the engine's existing thread model:
 
 Under GIL Python, all nanobind locking primitives (`nb::ft_mutex`, `nb::lock_self()`) are no-ops — zero overhead.
 
+### Python Reference Implementation
+
+`bytecaskdb-python/reference/bytecask_ref.py` is the engine's model in one file of plain Python, written to be read. It imports two general-purpose modules: `persistent_tree.py`, an immutable sorted map, and `checksum.py`, CRC-32C.
+
+Its interface is the engine's, as the native binding (`bytecaskdb._bytecaskdb`) exposes it and `CONTRACT.md` specifies it:
+- `apply_batch(WritePlan)`, with every guard;
+- `put`/`del_`/`del_range`, `get`/`contains_key`, and the four iterators;
+- `Snapshot`, which a `WritePlan` consumes;
+- `CommitResult`, and option objects.
+
+The Pythonic interface (`db[k]`, `with db.transaction()`) stays in `bytecaskdb/ext.py`. A test can run `ext.py` on the reference through `bytecaskdb.DB.open(path, backend=bytecask_ref)`. `ext.py` builds options and plans through the backend module it was opened with, and the default is the native extension. This is a test seam: `reference/` is not part of the `bytecaskdb` package and must be on `sys.path`.
+
+The docstring shows, with `dump(path)`, what a put followed by a two-write batch leaves on disk. `dump` prints the committed entries of any database, the engine's included. The reference contains only what decides what a read returns:
+
+- **Write path.** One lock. `apply_batch` runs five steps: check, frame, append, sync, publish.
+  - **Check:** the plan's guards are checked against the head, the published key directory.
+  - **Frame:** BULK_BEGIN/BULK_END wrap more than one write, and every entry takes a sequence, markers included.
+  - **Append:** in one write, which returns each entry with its offset.
+  - **Sync:** if asked.
+  - **Publish:** the next key directory is built from those placed entries and published.
+- **Key directory.** A `PersistentTree[bytes, Location]`. `PersistentTree` is an unbalanced binary search tree built by path copying and knows nothing of the engine. It is a `collections.abc.Mapping` whose `set`, `remove` and `discard` return a new tree, with ordered `ascending`/`descending` scans. A snapshot is a tree. A `Location` is a record's file, offset and sequence. A value is read from its record, and the record's CRC, key and sequence are checked.
+- **Recovery.** Every data file is replayed in order of its first sequence, through the same `apply_entry` the write path uses. A batch counts once its BULK_END is read. A file whose committed entries stop before its end falls into one of three cases:
+  - zeros follow: they are cut;
+  - data follows, in the newest file or in a file shorter than one header: it is cut. The short file cannot hold an acknowledged entry, since the smallest is 19 bytes. The engine's `recovery_check_tail` keys this case on the first sequence reading 0, which also lets an older file whose first header was zeroed be cut whole (#303);
+  - data follows, anywhere else: open refuses.
+  - Before replaying, the newest file's committed bytes are written back and synced, and so is any cut. This is the engine's `rewrite_durably`/`truncate_durably`. Without it, a failed sync could leave those bytes only in the page cache, and a cut that was never synced could bring a torn tail back into a file that is no longer the newest.
+- **I/O errors.** A write or sync that fails with an I/O error stops all writes: they raise `DbDegraded`, while reads go on. `close()` raises `DbDegraded` too. Reopening is the only way back, and it rewrites the file as above. The engine also offers `resume()`; the reference does not.
+- **Guards.** These match `validate_preconditions`. With a snapshot, the plan collects the keys and ranges that must be unchanged: explicit guards plus the keys it writes, and range guards plus its range deletes. It then checks each one the same way. A key is unchanged if its sequence, or its absence, is the same in the snapshot and the head. A key created and then deleted after the snapshot is absent from both, so it does not conflict.
+
+It writes the V01 format, so the engine opens a database it wrote (generating the hints) and it opens one the engine wrote (ignoring the hints). Hints, vacuum, group commit, preallocation, the buffer pool, replication and `resume()` are left out. A database the engine left mid-vacuum, with a compacted copy beside the original, is for the engine to open first.
+
+It does not give the engine's other guarantees:
+- **Exclusive access.** There is no directory lock.
+- **Snapshots that outlive `close()`.**
+- **Flat latency.** There is no group commit, the tree is unbalanced, range deletes and range guards are linear in the keys they cover, and opening reads every file whole.
+- **Fault testing.** The crash, chaos and fault-injection rigs have never run against it; its crash and I/O-error handling have unit tests only.
+
+`bytecaskdb-python/tests/test_persistent_tree.py` checks the tree and the CRC on their own. `bytecaskdb-python/tests/test_reference.py` runs the reference and the native binding through the same calls at the engine's interface. A seeded workload runs on both: puts, deletes, range deletes, and guarded plans whose snapshots were taken several writes earlier. Snapshots are held across writes, rotation, reopens and native vacuum. Every commit or conflict must agree, and so must every sequence and every `get` and scan.
+
+A second test runs one `ext.py` script on both backends and compares the results. Because `ext.py` is shared, the differential test cannot see a bug in it; `ext.py`'s own tests (`test_safety.py`) cover it. File-format tests cover both directions. It all runs in `ci.yml`.
+
 ## Design Principles
 
 The design follows these core tenets in order of priority:

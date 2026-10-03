@@ -38,17 +38,17 @@ class DegradedError(ByteCaskError):
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
-def _write_opts(sync: bool, solo: bool) -> _bc.WriteOptions:
-    o = _bc.WriteOptions()
+def _write_opts(backend, sync: bool, solo: bool) -> _bc.WriteOptions:
+    o = backend.WriteOptions()
     o.sync = sync
     o.solo = solo
     return o
 
 
-def _read_opts(verify_checksums: bool) -> _bc.ReadOptions | None:
+def _read_opts(backend, verify_checksums: bool) -> _bc.ReadOptions | None:
     if not verify_checksums:
         return None
-    o = _bc.ReadOptions()
+    o = backend.ReadOptions()
     o.verify_checksums = True
     return o
 
@@ -144,9 +144,9 @@ class _Batch:
     exits successfully, ``result`` holds the committed ``CommitResult``.
     """
 
-    def __init__(self, db: _bc.DB, write_opts: _bc.WriteOptions) -> None:
+    def __init__(self, db: _bc.DB, write_opts: _bc.WriteOptions, backend) -> None:
         self._db = db
-        self._plan = _bc.WritePlan()
+        self._plan = backend.WritePlan()
         self._write_opts = write_opts
         self.result: _bc.CommitResult | None = None
 
@@ -171,13 +171,14 @@ class _Batch:
 
 
 class _BatchContext:
-    def __init__(self, db: _bc.DB, write_opts: _bc.WriteOptions) -> None:
+    def __init__(self, db: _bc.DB, write_opts: _bc.WriteOptions, backend) -> None:
         self._db = db
         self._write_opts = write_opts
+        self._backend = backend
         self._batch: _Batch | None = None
 
     def __enter__(self) -> _Batch:
-        self._batch = _Batch(self._db, self._write_opts)
+        self._batch = _Batch(self._db, self._write_opts, self._backend)
         return self._batch
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -212,8 +213,9 @@ class _Transaction:
     """
 
     def __init__(self, db: _bc.DB, raw_snap: _bc.Snapshot,
-                 write_opts: _bc.WriteOptions) -> None:
+                 write_opts: _bc.WriteOptions, backend) -> None:
         self._db = db
+        self._backend = backend
         self._raw_snap = raw_snap
         self._snap = Snapshot(raw_snap)
         self._ops: list[tuple[str, tuple]] = []
@@ -331,12 +333,12 @@ class _Transaction:
         return True
 
     def _commit(self) -> _bc.CommitResult | None:
-        plan = _bc.WritePlan(self._raw_snap)  # moves snapshot — reads are done
+        plan = self._backend.WritePlan(self._raw_snap)  # moves snapshot — reads are done
         for method, args in self._guards:
             getattr(plan, method)(*args)
         for method, args in self._ops:
             getattr(plan, method)(*args)
-        result = self._db.apply_batch(plan, self._write_opts)
+        self.result = result = self._db.apply_batch(plan, self._write_opts)
         # Release all references — snapshot is consumed, buffers are stale.
         self._raw_snap = None  # type: ignore[assignment]
         self._snap = None  # type: ignore[assignment]
@@ -348,13 +350,15 @@ class _Transaction:
 
 
 class _TransactionContext:
-    def __init__(self, db: _bc.DB, write_opts: _bc.WriteOptions) -> None:
+    def __init__(self, db: _bc.DB, write_opts: _bc.WriteOptions, backend) -> None:
         self._db = db
         self._write_opts = write_opts
+        self._backend = backend
         self._txn: _Transaction | None = None
 
     def __enter__(self) -> _Transaction:
-        self._txn = _Transaction(self._db, self._db.snapshot(), self._write_opts)
+        self._txn = _Transaction(self._db, self._db.snapshot(), self._write_opts,
+                                 self._backend)
         return self._txn
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -375,8 +379,9 @@ class DB:
     Open with DB.open(path) or DB.open(path, max_file_bytes=..., ...).
     """
 
-    def __init__(self, inner: _bc.DB) -> None:
+    def __init__(self, inner: _bc.DB, backend=_bc) -> None:
         self._db = inner
+        self._backend = backend
 
     # ── Open ──────────────────────────────────────────────────────────────────
 
@@ -388,15 +393,19 @@ class DB:
         max_file_bytes: int | None = None,
         recovery_threads: int | None = None,
         fail_recovery_on_crc_errors: bool | None = None,
+        backend=_bc,
     ) -> "DB":
-        opts = _bc.Options()
+        """*backend* is the module providing the engine interface: the native
+        extension by default. Tests pass the Python reference implementation
+        (bytecaskdb-python/reference) to run this wrapper on it."""
+        opts = backend.Options()
         if max_file_bytes is not None:
             opts.max_file_bytes = max_file_bytes
         if recovery_threads is not None:
             opts.recovery_threads = recovery_threads
         if fail_recovery_on_crc_errors is not None:
             opts.fail_recovery_on_crc_errors = fail_recovery_on_crc_errors
-        return cls(_bc.DB.open(path, opts))
+        return cls(backend.DB.open(path, opts), backend)
 
     # ── Dict-like interface ───────────────────────────────────────────────────
 
@@ -427,7 +436,7 @@ class DB:
         verify_checksums: bool = False,
     ) -> bytes | None:
         """Return value for *key*, or *default* if not found."""
-        v = self._db.get(key, _read_opts(verify_checksums))
+        v = self._db.get(key, _read_opts(self._backend, verify_checksums))
         return v if v is not None else default
 
     # ── Writes ────────────────────────────────────────────────────────────────
@@ -441,7 +450,7 @@ class DB:
         solo: bool = False,
     ) -> _bc.CommitResult:
         """Write key → value. Returns the assigned CommitResult."""
-        return self._db.put(key, value, _write_opts(sync, solo))
+        return self._db.put(key, value, _write_opts(self._backend, sync, solo))
 
     def delete(
         self,
@@ -451,7 +460,7 @@ class DB:
         solo: bool = False,
     ) -> _bc.CommitResult | None:
         """Delete *key*. Returns the CommitResult, or None if absent."""
-        return self._db.del_(key, _write_opts(sync, solo))
+        return self._db.del_(key, _write_opts(self._backend, sync, solo))
 
     def delete_range(
         self,
@@ -463,31 +472,31 @@ class DB:
     ) -> _bc.CommitResult:
         """Delete all keys in [from_key, to_key) with a single disk append.
         Returns the assigned CommitResult."""
-        return self._db.del_range(from_key, to_key, _write_opts(sync, solo))
+        return self._db.del_range(from_key, to_key, _write_opts(self._backend, sync, solo))
 
     # ── Iteration ─────────────────────────────────────────────────────────────
 
     def items(self, start: bytes = b"", *, verify_checksums: bool = False):
         """Iterate (key, value) pairs in ascending order from *start*."""
-        return self._db.iter_from(start, _read_opts(verify_checksums))
+        return self._db.iter_from(start, _read_opts(self._backend, verify_checksums))
 
     def keys(self, start: bytes = b"", *, verify_checksums: bool = False):
         """Iterate keys in ascending order from *start*. No disk I/O."""
-        return self._db.keys_from(start, _read_opts(verify_checksums))
+        return self._db.keys_from(start, _read_opts(self._backend, verify_checksums))
 
     def ritems(self, start: bytes = b"", *, verify_checksums: bool = False):
         """Iterate (key, value) pairs in descending order from *start*.
         When *start* is b'' (default), begins at the last key."""
-        return self._db.riter_from(start, _read_opts(verify_checksums))
+        return self._db.riter_from(start, _read_opts(self._backend, verify_checksums))
 
     def rkeys(self, start: bytes = b"", *, verify_checksums: bool = False):
         """Iterate keys in descending order from *start*. No disk I/O."""
-        return self._db.rkeys_from(start, _read_opts(verify_checksums))
+        return self._db.rkeys_from(start, _read_opts(self._backend, verify_checksums))
 
     def prefix(self, pfx: bytes, *, verify_checksums: bool = False):
         """Iterate (key, value) pairs whose key starts with *pfx*,
         ascending."""
-        ropts = _read_opts(verify_checksums)
+        ropts = _read_opts(self._backend, verify_checksums)
         for key, value in self._db.iter_from(pfx, ropts):
             if not key.startswith(pfx):
                 break
@@ -497,7 +506,7 @@ class DB:
         """Iterate (key, value) pairs whose key starts with *pfx*,
         descending."""
         upper = _prefix_upper(pfx)
-        ropts = _read_opts(verify_checksums)
+        ropts = _read_opts(self._backend, verify_checksums)
         for key, value in self._db.riter_from(upper if upper else b"", ropts):
             if upper and key >= upper:
                 continue
@@ -519,7 +528,7 @@ class DB:
                 del b[b"key2"]
                 b.delete_range(b"log:001", b"log:010")
         """
-        return _BatchContext(self._db, _write_opts(sync, solo))
+        return _BatchContext(self._db, _write_opts(self._backend, sync, solo), self._backend)
 
     def transaction(
         self, *, sync: bool = True, solo: bool = False
@@ -536,7 +545,8 @@ class DB:
                 stock = int(txn[b"stock"])
                 txn[b"stock"] = str(stock - 1).encode()
         """
-        return _TransactionContext(self._db, _write_opts(sync, solo))
+        return _TransactionContext(self._db, _write_opts(self._backend, sync, solo),
+                                   self._backend)
 
     # ── Snapshot ──────────────────────────────────────────────────────────────
 
@@ -559,7 +569,7 @@ class DB:
             while db.vacuum():
                 pass
         """
-        opts = _bc.VacuumOptions()
+        opts = self._backend.VacuumOptions()
         if fragmentation_threshold is not None:
             opts.fragmentation_threshold = fragmentation_threshold
         if retain_after is not None:
