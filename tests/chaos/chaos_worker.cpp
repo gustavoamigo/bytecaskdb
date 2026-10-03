@@ -273,8 +273,10 @@ auto start_threads(bytecask::DB *db, Channel &ch, const Config &cfg,
             const auto threshold = static_cast<double>(vrng() % 60) / 100.0;
             (void)db->vacuum({.fragmentation_threshold = threshold});
           } catch (const std::exception &) {
-            // A vacuum that fails on I/O leaves the files as they were, or
-            // degrades the engine; the writer recovers it.
+            // A vacuum that fails on I/O before its commit removes its copy
+            // and leaves the files as they were (#304), or degrades the
+            // engine; the writer recovers it. Retried here every few ms, a
+            // copy left per attempt piles up for the next open.
           }
           std::this_thread::sleep_for(std::chrono::microseconds(vrng() % 5000));
         }

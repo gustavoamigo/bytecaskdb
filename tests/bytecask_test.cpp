@@ -3770,6 +3770,69 @@ TEST_CASE("recovery refuses two different writes under one sequence",
   }
 }
 
+// A vacuum that fails after its rename and before its commit removes its
+// copy, as one that fails before the rename removes its staging file (#235).
+// Left behind, a vacuum retried under a persistent fault placed one copy per
+// attempt, and the next open ran a full recovery pass per copy (#304).
+TEST_CASE("vacuum that fails between its rename and its commit removes its "
+          "copy",
+          "[vacuum][recovery]") {
+  const auto checkpoint = GENERATE(
+      as<std::string>{}, "io_dir_sync_vacuum", "io_vacuum_compact_post_rename",
+      "io_hint_write", "io_dir_sync_hint");
+  INFO("failing at " << checkpoint);
+  TempDir td;
+  const auto db_path = td.path / "db";
+  const bytecask::Options opts{.max_file_bytes = 4096};
+  std::map<std::string, std::string> oracle;
+  {
+    auto db = bytecask::DB::open(db_path, opts);
+    for (int i = 0; i < 200; ++i) {
+      auto k = std::format("k{:04d}", i);
+      auto v = std::format("v{:04d}", i) + std::string(40, 'x');
+      db.put({.sync = false}, to_bytes(k), to_bytes(v));
+      oracle[k] = v;
+    }
+    for (int i = 0; i < 40; i += 2) {
+      auto k = std::format("k{:04d}", i);
+      auto v = std::format("w{:04d}", i) + std::string(40, 'y');
+      db.put({.sync = false}, to_bytes(k), to_bytes(v));
+      oracle[k] = v;
+    }
+  }
+  // Reopened, so every sealed file has its hint and no background hint write
+  // can meet the fault.
+  auto db = bytecask::DB::open(db_path, opts);
+  const auto all_files = [&] {
+    std::set<std::filesystem::path> out;
+    for (const auto &e : std::filesystem::directory_iterator{db_path}) {
+      out.insert(e.path().filename());
+    }
+    return out;
+  };
+  const auto before = all_files();
+  {
+    bytecask::testing::ScopedFaultInjector fi{checkpoint};
+    for (int attempt = 0; attempt < 3; ++attempt) {
+      REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}),
+                        std::system_error);
+    }
+  }
+  CHECK(all_files() == before);
+  CHECK_FALSE(db.is_degraded());
+  CHECK(collect_kv(db) == oracle);
+
+  // With the fault gone the vacuum runs, and the reopen finds no copy to
+  // remove: every file is still there, beside the new active file.
+  REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+  const auto vacuumed = data_files_in(db_path);
+  db.close();
+  auto reopened = bytecask::DB::open(db_path, opts);
+  CHECK(std::ranges::includes(data_files_in(db_path), vacuumed));
+  CHECK(collect_kv(reopened) == oracle);
+  CHECK(disjoint(sequence_ranges(reopened)));
+}
+
 // ---------------------------------------------------------------------------
 // vacuum_compact_file: tombstones are preserved
 // ---------------------------------------------------------------------------
@@ -6287,13 +6350,11 @@ TEST_CASE("directory sync: a failed sync in vacuum keeps the source",
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}),
                         std::system_error);
     }
-    // The rename happened; nothing after it did. Every source is still on
-    // disk and published.
-    CHECK(std::ranges::includes(data_files_in(db_path), before_vacuum));
+    // The rename happened and the commit did not. Every source is still on
+    // disk and published, and vacuum removed its copy (#304).
+    CHECK(data_files_in(db_path) == before_vacuum);
     CHECK(collect_kv(db) == oracle);
   }
-  // The compacted copy next to its source is an interrupted vacuum, which
-  // recovery undoes.
   auto db = bytecask::DB::open(db_path, {.max_file_bytes = 4096});
   CHECK(collect_kv(db) == oracle);
   CHECK(std::ranges::includes(data_files_in(db_path), before_vacuum));

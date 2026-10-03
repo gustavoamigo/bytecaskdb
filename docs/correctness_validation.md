@@ -239,7 +239,7 @@ region they leave out, syscalls that **succeed with the wrong result**:
 |-------|----------------------|------------------|-----------|
 | M1 | `mmap` returns the address `munmap` just released | a span handed out before `truncate()` still reads the same bytes | observer axis, `assert_view_stable` (byte comparison, not address) |
 | M2 | `open(O_CREAT)` on a stem already on disk or already hinted | aborts rather than adopting the sealed file | `createDataFileForWrite panics when the data file already exists` / `… when the stem was already hinted` in `data_file_test.cpp` |
-| M3 | `rename` completes, the process does not confirm it | the next open detects the uncommitted copy and deletes it | VC6 in `[prove_vacuum_compact]` |
+| M3 | `rename` completes, the process does not confirm it | vacuum removes its uncommitted copy on the way out (#304); a kill leaves it, and the next open detects it and deletes it | VC6 in `[prove_vacuum_compact]`; the kill by VC5 and `recovery undoes a vacuum killed before the source was unlinked` |
 | M4 | `pread` returns damaged bytes of published data | fail-stop: `resume()` refuses and truncates nothing; `open` refuses where the format can see it | `[prove_corruption]`, `[corruption]` |
 
 Note on classes B1/B2/B3 — LSN advanced, engine degraded: Any `writev`
@@ -341,8 +341,8 @@ Three more instrument the hint write, mirroring the data file's:
 And one for the window a completed rename opens:
 
 13. `io_vacuum_compact_post_rename` — after `renameDataFileExclusive()` and
-    before `vacuum_commit()` in `vacuum_compact_file()`. See *Orphaned
-    `.data` files* for what it reproduces and why no cell asserts it yet.
+    the directory sync, before `vacuum_commit()` in `vacuum_compact_file()`.
+    See *Orphaned `.data` files* for what it reproduces.
 
 And one on the read side, for the scan `resume()` runs:
 
@@ -916,7 +916,9 @@ in the published state. The rename-completed case is VC6.
 
 Every cell also checks that no `.data.tmp` outlives `vacuum()` (#235):
 VC2–VC4 fail after the staging file exists, and vacuum must remove it on
-the way out rather than leave a copy per retry until the next open.
+the way out rather than leave a copy per retry until the next open. Every
+cell but VC5 checks the same of the renamed copy (#304): no `.data` or
+`.hint` file is on disk that the published state does not reference.
 
 VC5 is the other side of the commit: `vacuum_commit` has run, so in memory
 the outcome is success (`assert_vacuum_success`), but the source was never
@@ -932,13 +934,15 @@ cgroup OOM kill under a write-heavy sysbench run left a database that would
 not open.
 
 VC6 is the other end of that window, and #104's class M3: the rename
-completed and the process did not get to confirm it. Nothing is committed,
-so in memory the outcome is a failed vacuum (`assert_vacuum_no_change`), and
-on disk the compacted copy sits under its final name, referenced by nothing
-in the published state. The cell records that orphan's path before closing
-and checks the next open deleted it, on top of what
-`assert_vacuum_recoverable` proves for every class. Making recovery's undo
-throw instead fails all eight VC6 cells, and all eight VC5 cells with them.
+completed and the commit did not. Nothing is committed, so in memory the
+outcome is a failed vacuum (`assert_vacuum_no_change`), and vacuum removes
+the compacted copy it placed under its final name on the way out (#304).
+Before #304 the copy stayed, referenced by nothing, until the next open
+deleted it; a vacuum retried under a persistent fault placed one per
+attempt, and the chaos rig found an open that ran a recovery pass for each
+of 58. A kill in the window still leaves the copy, and recovery deletes it
+as it deletes VC5's: making recovery's undo throw fails all eight VC5
+cells.
 
 ### corruption — 16 tests
 
@@ -1428,9 +1432,9 @@ I/O checkpoints:
   matches its actual on-disk size, `assert_consistent`.
 - `assert_vacuum_recoverable(dir, before)` — opens a fresh DB and verifies
   all pre-vacuum keys survive recovery with correct values.
-- `unreferenced_data_files(db, dir)` — the `.data` files on disk that the
-  published state does not reference; VC6 uses it to name the orphan a
-  post-rename kill leaves, and to check the next open deleted it.
+- `unreferenced_files(db, dir)` — the `.data` and `.hint` files on disk
+  that the published state does not reference; every cell but VC5 checks it
+  is empty after `vacuum()`, so no failed vacuum leaves its copy (#304).
 - `OwnedEntries` / `collect_changes(range)` — collects transient
   `ChangeIterator` entries into owned storage. The views returned by the
   iterator are invalidated on advance; `OwnedEntries` preserves them.
@@ -2047,6 +2051,7 @@ A site whose break nothing has to catch says why instead.
 | `vacuum_compact_file`: the staging file's `fdatasync` | not needed: `shrink_to_fit()` syncs it again right after | — | — |
 | `vacuum_compact_file`: the directory sync after the rename, before the source is unlinked | `directory sync: a failed sync in vacuum keeps the source` | `vacuum_unlinks_before_dir_sync` | #199 |
 | `vacuum_compact_file`: the staging file is removed on every failure | `prove_vacuum_compact__*` | `vacuum_leaks_staging_file` | #247 (#235) |
+| `vacuum_compact_file`: the renamed copy and its hint are removed on every failure before the commit | `vacuum that fails between its rename and its commit removes its copy`, `prove_vacuum_compact__*` | `vacuum_leaks_renamed_copy` (chaos) | #304 |
 | `vacuum`: a file of tombstones only is not dropped whole | `vacuum keeps a tombstone-only file that shadows an older put` | `vacuum_drops_tombstone_only_file` | #171 (#166) |
 | `vacuum_scan_and_copy`: a damaged entry fails the compaction | `DB vacuum: a damaged sealed file is not compacted away` | `vacuum_compacts_damaged_file` | #136 |
 | `vacuum_scan_and_copy`: batch markers are copied | `vacuum preserves BulkBegin/BulkEnd markers` | `vacuum_drops_batch_markers` | BC-197 |

@@ -132,7 +132,7 @@ def gen_vacuum_call(
         if failure == VacuumCompactFailureClass.VC5
         else "\n    // VC6: renamed, not committed (#104 M3) — the compacted copy is on\n"
         "    // disk under its final name and the published state does not\n"
-        "    // reference it. The next open must detect it and delete it."
+        "    // reference it. Vacuum removes it on the way out (#304)."
         if failure == VacuumCompactFailureClass.VC6
         else "\n    // VC7: the fdatasync that makes the superseding sync = false writes\n"
         "    // durable fails (#261). The engine degrades and vacuum throws before\n"
@@ -191,9 +191,6 @@ def gen_test(
     parts.append("  std::map<std::string, bytecask::Bytes> durable_before;")
     parts.append("  std::uint64_t watermark = 0;")
     parts.append("  bytecask::testing::VacuumBaseline before;")
-    orphan_check = failure == VacuumCompactFailureClass.VC6
-    if orphan_check:
-        parts.append("  std::vector<std::filesystem::path> orphans;")
     parts.append("  {")
     parts.append(gen_setup(state))
     parts.append("")
@@ -205,17 +202,16 @@ def gen_test(
     parts.append(gen_assertions(delta))
     # Every cell, thrown or not: no staging copy outlives the vacuum call.
     parts.append("    CHECK(staging_data_files(dir).empty());")
-    if orphan_check:
-        parts.append("    orphans = unreferenced_data_files(db, dir);")
-        parts.append("    REQUIRE(orphans.size() == 1);  // the uncommitted copy")
+    # Every cell but VC5, whose source stays on disk after the commit: no
+    # copy outlives an uncommitted vacuum either (#304).
+    if failure != VacuumCompactFailureClass.VC5:
+        parts.append("    CHECK(unreferenced_files(db, dir).empty());")
     parts.append("    watermark = durable_watermark(db);")
     parts.append("    cache.model.copy_device(dir, cut);  // power cut")
     parts.append("  }")
     parts.append("  assert_hints_durable(cache.model);")
     opts = _build_open_opts(state)
     parts.append(f"  assert_vacuum_recoverable(dir, before, {{{opts}}});")
-    if orphan_check:
-        parts.append("  CHECK_FALSE(std::filesystem::exists(orphans.front()));")
     # The cut copy: the durable baseline, alone or with every overwrite, and
     # with them once the watermark covers them. A key gone is #245.
     last_seq = (
@@ -251,8 +247,9 @@ FILE_HEADER = """\
 // returned or threw (#235).
 // VC5 verifies that a directory holding a compacted file and its source — a kill
 // after the commit, before the unlink — recovers, with the vacuum undone.
-// VC6 (#104 M3) verifies that a copy renamed but never committed is an orphan
-// the next open detects and deletes.
+// VC6 (#104 M3) verifies that a copy renamed but never committed is removed by
+// the vacuum that placed it (#304): every cell but VC5 checks that no data or
+// hint file outlives vacuum() unless the published state references it.
 // VC7 (#261) fails the fdatasync vacuum issues before dropping entries that
 // only sync = false writes supersede. Every cell cuts the power after the
 // vacuum (#265) and recovers the directory as the device held it: the durable
@@ -282,7 +279,7 @@ using bytecask::testing::durable_watermark;
 using bytecask::testing::key_values;
 using bytecask::testing::make_durable;
 using bytecask::testing::assert_vacuum_recoverable;
-using bytecask::testing::unreferenced_data_files;
+using bytecask::testing::unreferenced_files;
 using bytecask::testing::assert_vacuum_success;
 using bytecask::testing::capture_vacuum_baseline;
 using bytecask::testing::find_vacuum_target;

@@ -3,15 +3,15 @@ full copy per retry under a persistent fault. Reverts #247 (#235).
 Guarded-by: "prove_vacuum_compact__*"
 
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..49978712 100644
+index 729c047..b336e1b 100644
 --- a/bytecaskdb/bytecask.cppm
 +++ b/bytecaskdb/bytecask.cppm
-@@ -3971,7 +3971,7 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
-   // .data.tmp at open; it must not replace the exception in flight.
-   struct StagingCleanup {
-     std::filesystem::path path;
+@@ -3974,7 +3974,7 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
+   // source at open; it must not replace the exception in flight.
+   struct CopyCleanup {
+     std::vector<std::filesystem::path> paths;
 -    bool armed{true};
 +    bool armed{false};
-     ~StagingCleanup() {
+     ~CopyCleanup() {
        if (!armed) return;
        std::error_code ec;

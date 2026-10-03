@@ -21,6 +21,11 @@ run hit this window. The database could not be opened afterwards.
 The window is not short: step 2 is a full scan of C, which takes seconds for
 a 64 MiB file.
 
+Only a kill leaves the pair. A vacuum that throws before step 3 removes C
+and its hint itself, as it removes `.data.tmp` before step 1's rename
+(#235, #304); after step 3 C is the published file, and a failed unlink in
+step 4 leaves S, the same pair as a kill.
+
 ## The decision
 
 When recovery finds two files with the same sequence numbers, what should it
@@ -110,7 +115,11 @@ Either way, `DB::recovery_open` then:
 
 Each pass removes one file or throws, so this ends. A healthy open runs one
 pass, and the only added cost is the ranges check, which is over files, not
-keys. The data files are read only when files overlap, which should not
+keys. An open with N pairs runs N + 1 passes. That stays cheap because N
+stays small: only a kill, a failed unlink or a lost one leaves a pair, and
+the next directory sync makes a lost unlink durable. Before #304 a vacuum
+that failed between its rename and its commit left C too, one per retry, and
+an open after a run of them under the chaos rig took 59 passes. The data files are read only when files overlap, which should not
 happen outside this crash.
 
 This needs no change to the on-disk format and no new file type. It also
@@ -146,6 +155,12 @@ We drop the relaxed `kde_newer` and the matching tie-break in
   file that existed before the vacuum is still there, serial and parallel
   recovery agree, `changes_since` returns each sequence once (#129), and
   the next vacuum compacts S again.
+- A vacuum that fails between the rename and the commit, three times, at
+  each fault point there (the directory sync, after it, the hint write, the
+  hint's directory sync): the directory holds the files it held before, and
+  the vacuum then runs and reopens (#304). VC6 checks the same in every
+  proof shape, and every cell but VC5 checks that no data or hint file
+  outlives `vacuum()` unless the published state references it.
 - A file and a copy of a prefix of it: recovery keeps the full file.
 - Two files with the same key under the same sequence and different values
   of the same size: `DB::open` throws and nothing is deleted, at one worker

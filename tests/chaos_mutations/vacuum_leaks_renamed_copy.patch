@@ -1,0 +1,25 @@
+A vacuum that fails between its rename and its commit leaves its compacted
+copy under its final name, one per retry under a persistent fault. Reverts
+#304. The rig sees an open that runs a recovery pass per leftover copy and
+does not finish within the open timeout once the copies pile up.
+The nightly caught it once (run 37095498277, 58 copies, episode 11).
+Rerunning that seed for 40 minutes did not, twice under release and once
+under releasedbg: the copies pile up only when a fault keeps vacuum failing
+after its rename, and the open must then outlast a wall-clock timeout.
+Expected: caught (rare).
+Guarded-by: "vacuum that fails between its rename and its commit removes its copy"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index 729c047..dfb94da 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -4025,8 +4025,7 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
+   // rotation minted. Frames the hint scan admits under the buffer pool are
+   // left to eviction if the copy goes: their file id was reserved for it and
+   // is never reused.
+-  cleanup.paths = {dir_ / (stem + ".hint.tmp"), dir_ / (stem + ".hint"),
+-                   final_data_path};
++  cleanup.armed = false;
+   // The source is unlinked once this commits. Were that unlink durable and
+   // the rename not, the next open would find only .data.tmp, delete it as
+   // staging, and lose every live entry the source held.
