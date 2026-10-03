@@ -756,7 +756,7 @@ struct WritableFileOps {
 #pragma clang diagnostic pop
     for (auto off = zeroed_end_; off < target;) {
       const auto len = std::min<Offset>(kBuf, target - off);
-      const ::iovec v{const_cast<std::byte *>(zeros.data()), len};
+      const ::iovec v{const_cast<std::byte *>(zeros.data()), narrow<std::size_t>(len)};
       if (!pwritev_all(fd_, std::span<const ::iovec>{&v, 1}, off)) {
         throw std::system_error{errno, std::generic_category(),
                                 "WritableFileOps::ensure_zeroed: pwrite failed"};
