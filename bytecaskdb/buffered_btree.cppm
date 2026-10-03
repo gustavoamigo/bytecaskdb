@@ -1110,6 +1110,28 @@ public:
   [[nodiscard]] auto end_iter() const -> Iter { return iter(Iter::Start::End); }
   [[nodiscard]] auto end() const noexcept -> std::default_sentinel_t { return {}; }
 
+  // Every location this version holds, in no order and reading no record:
+  // the tree's entries, ones a buffer overrides included, and every
+  // buffered write. f returns false to stop. For checks that need
+  // locations, not keys: the iterator orders buffered keys among the
+  // tree's, and that reads them.
+  template <typename F> void for_each_ref(F &&f) const {
+    for (auto it = tree_.begin(); !(it == std::default_sentinel); ++it)
+      if (!f(*it)) return;
+    const auto visit = [&](const buffered_detail::View &v) {
+      if (!v.buf) return true;
+      for (std::size_t p = 0; p < buffered_detail::kPartitions; ++p)
+        for (std::size_t i = 0; i < v.counts[p]; ++i) {
+          const auto r = v.buf->parts[p].ref[i];
+          if (!buffered_detail::is_none(r) && !f(r)) return false;
+        }
+      return true;
+    };
+    for (std::size_t i = 0; i < l_.nf; ++i)
+      if (!visit(l_.f[i])) return;
+    (void)visit(l_.a);
+  }
+
   [[nodiscard]] auto transient() const -> TransientBufferedBlindBTree<LeafBytes, RS>;
 
   [[nodiscard]] static auto reclamation_gauges() { return Tree::reclamation_gauges(); }
