@@ -1,0 +1,25 @@
+A sealed file whose fstat fails is opened as an empty one: none of its
+records can be read, and the hint written from it indexes nothing, so the
+next open loses its keys. No named checkpoint fails this call; the counted
+fault sweep does (#317).
+Guarded-by: "fault sweep: write across a rotation"
+
+diff --git a/bytecaskdb/data_file.cppm b/bytecaskdb/data_file.cppm
+index da974ae..70f0eef 100644
+--- a/bytecaskdb/data_file.cppm
++++ b/bytecaskdb/data_file.cppm
+@@ -1258,13 +1258,7 @@ export using WritableBufferPoolDataFile = WritablePosixFile<PoolIo>;
+                                            const std::filesystem::path &path)
+     -> std::size_t {
+   struct stat st {};
+-  if (::fstat(fd, &st) != 0) {
+-    const auto err = errno;
+-    ::close(fd);
+-    throw std::system_error{
+-        err, std::generic_category(),
+-        std::format("sealed_file_size: cannot stat '{}'", path.string())};
+-  }
++  if (::fstat(fd, &st) != 0) return 0;
+   return static_cast<std::size_t>(st.st_size);
+ }
+ 

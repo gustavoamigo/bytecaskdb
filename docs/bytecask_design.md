@@ -964,6 +964,8 @@ The choice is made once, when the factory maps the runtime `IoBackend` onto a ty
 
 Two factory functions select the implementation. `createDataFileForWrite(dir, stem, suffix, capacity, io_backend)` creates a file that must not already exist and is what the engine uses; it adds `O_EXCL` and panics on a reused stem (see *Log-Structured Naming Convention*). `openDataFileForWrite(path, capacity, io_backend)` opens or creates, adopting the file's current length — for tests and tooling that reopen a file they wrote. Both open with `O_RDWR | O_CREAT | O_CLOEXEC` — no `O_APPEND`, since pre-allocated files require positioned writes. `renameDataFileExclusive(from, to)` completes the set: it moves a staged file onto its final name without replacing an existing target, and is how vacuum publishes a compacted file. Both write factories, like `openDataFileForRead`, *require* a pool for `IoBackend::BufferPool` and throw `std::logic_error` without one — falling back to `pread` would make the configured bound quietly meaningless. Vacuum's staging copy is the one file that legitimately wants no pool, because its `file_id` is reserved only once the copy is complete and a pool-backed file keys its frames by one from construction; it says so by passing `stagingBackend(io_backend)`, which maps `BufferPool` to `Pread` and leaves the others alone. The staged file enters the pool when it is reopened for read under its final name.
 
+A read-only file's size is taken once, by `fstat`, when it is opened, and bounds every read of it. If that `fstat` fails the open throws (`sealed_file_size`): a size of zero would seal a file whose records cannot be read and whose hint indexes nothing.
+
 - **`append_entry(sequence, entry_type, key, value) -> Offset`**: Serializes a new entry with the given sequence number and `EntryType`, writes it via `pwritev()` at the tracked `offset_`, and returns the byte offset where the entry starts. `BulkBegin`/`BulkEnd` entries pass empty key and value spans. Does **not** guarantee durability on its own. The 15-byte header and 4-byte CRC are serialized into a fixed member buffer (`hdr_crc_buf_`); the key and value spans are passed directly as iovecs — no heap allocation and no copy of key/value data occurs on the write path.
 - **`sync()`**: Calls `::fdatasync()` to flush all pending writes to physical storage. Must be called explicitly to guarantee crash-safety. Decoupled from `append_entry()` to enable Group Commit: callers can batch multiple `append_entry()` calls before a single `sync()`.
 - **`shrink_to_fit()`**: `ftruncate` to `size()` plus `fdatasync`. Called once, when the file is sealed, to give the zero-filled tail back. Unlike `truncate()` it never touches a mapping, so it is safe while readers hold snapshots of the file — every published offset lies below `size()`.
@@ -1668,6 +1670,10 @@ void fault_inject_reset() noexcept;
 ```
 
 Fault state is per-thread (`thread_local FaultHooks`), so tests on different threads don't interfere. Both functions throw `std::system_error(EINVAL)` when the countdown reaches zero, identical in type to a real IO failure.
+
+### Faults by count, below the engine
+
+The checkpoints above fail the calls someone named. `bytecask_tests` also fails calls nobody named: it is linked with `-Wl,--wrap` for each I/O call the engine makes, and the `[fault_sweep]` tests fail the 1st, 2nd, …, n-th call of each operation in turn and check generic invariants after each. A new I/O call is covered the day it is added; one whose spelling has no interposer fails the link. See `docs/correctness_validation.md`, *Counted fault sweep*.
 
 ### Intended use
 

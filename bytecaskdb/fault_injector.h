@@ -188,6 +188,27 @@ struct ScopedFaultInjector {
 };
 
 // ---------------------------------------------------------------------------
+// SuspendSyscallFaults
+//
+// The counted fault sweep (tests/syscall_faults.h) counts and fails the
+// engine's I/O calls from below, in the test binary's --wrap interposers.
+// Test instrumentation that does I/O of its own from inside the engine — the
+// PageCacheModel's hooks — holds one of these, so its calls are neither
+// counted nor failed. Thread-local: only the calling thread is exempt.
+// ---------------------------------------------------------------------------
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunique-object-duplication"
+inline thread_local int syscall_faults_suspended = 0;
+#pragma clang diagnostic pop
+
+struct SuspendSyscallFaults {
+  SuspendSyscallFaults() { ++syscall_faults_suspended; }
+  ~SuspendSyscallFaults() { --syscall_faults_suspended; }
+  SuspendSyscallFaults(const SuspendSyscallFaults&) = delete;
+  SuspendSyscallFaults& operator=(const SuspendSyscallFaults&) = delete;
+};
+
+// ---------------------------------------------------------------------------
 // PageCacheModel
 //
 // Models which bytes of a data file the device holds, so a test can cut the
@@ -218,6 +239,7 @@ public:
 
   void write(int fd, std::uint64_t offset, std::size_t len) {
     if (len == 0) return;
+    const SuspendSyscallFaults uncounted;
     std::lock_guard<std::mutex> lk{mu_};
     auto &f = files_[key_of(fd)];
     for (auto p = offset / kPage; p <= (offset + len - 1) / kPage; ++p) {
@@ -231,6 +253,7 @@ public:
   }
 
   void synced(int fd) {
+    const SuspendSyscallFaults uncounted;
     std::lock_guard<std::mutex> lk{mu_};
     auto it = files_.find(key_of(fd));
     if (it == files_.end()) return;
@@ -239,6 +262,7 @@ public:
   }
 
   void sync_failed(int fd) {
+    const SuspendSyscallFaults uncounted;
     std::lock_guard<std::mutex> lk{mu_};
     auto it = files_.find(key_of(fd));
     if (it != files_.end()) it->second.dirty.clear();
@@ -248,6 +272,7 @@ public:
   // that holds zeros: a process that appended with sync=false and was
   // killed, its pages still in the cache.
   void mark_unsynced(const std::filesystem::path &path) {
+    const SuspendSyscallFaults uncounted;
     const auto size = std::filesystem::file_size(path);
     const auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd == -1) throw std::system_error{errno, std::generic_category()};
@@ -265,6 +290,7 @@ public:
   // back-end maps the active file MAP_SHARED, and the background hint worker
   // may be reading a sealed one. copy_device is the cut for a live engine.
   void restore_device(const std::filesystem::path &dir) {
+    const SuspendSyscallFaults uncounted;
     std::lock_guard<std::mutex> lk{mu_};
     for (const auto &e : std::filesystem::directory_iterator{dir}) {
       if (!e.is_regular_file()) continue;
@@ -285,6 +311,7 @@ public:
   // while the source is still open.
   void copy_device(const std::filesystem::path &dir,
                    const std::filesystem::path &dst) {
+    const SuspendSyscallFaults uncounted;
     std::lock_guard<std::mutex> lk{mu_};
     std::error_code ec;
     std::filesystem::remove_all(dst, ec);
@@ -311,6 +338,7 @@ public:
   // rather than thrown: the caller may be the background hint worker, where
   // no test assertion can run.
   void hint_written(const std::filesystem::path &hint_path) {
+    const SuspendSyscallFaults uncounted;
     auto data = hint_path;
     if (data.extension() == ".tmp") data.replace_extension();
     data.replace_extension(".data");
