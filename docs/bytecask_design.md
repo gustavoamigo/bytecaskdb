@@ -1159,8 +1159,10 @@ The rule rests on one invariant: only the file written last can hold a record a 
 What that leaves unrefused, besides damage in the newest file:
 - damage in a sealed hint-less file that zeroes it from a record boundary to its end, which reads as a leftover preallocated tail;
 - damage in a just-sealed file when a crash follows the rotation before the new file's first write, since the empty new file has no sequence and the sealed one reads as newest;
-- damage to the first header of a sealed file that leaves a sequence higher than any other file's.
-- damage that zeroes the sequence in the first header of a sealed hint-less file, a zeroed first sector for instance: the file is cut whole, acknowledged entries included (#303). With the header gone, nothing in the file tells it from the newest file above. Refusing it would refuse an ordinary power loss under `sync = false`; telling the two apart would take a later record's sequence, found by searching for a valid CRC at an unknown offset, and such a match can be garbage, so it cannot decide between cutting a file and refusing the database. The window is at most `max_hint_backlog + 1` files at a crash.
+- damage to the first header of a sealed file that leaves a sequence higher than any other file's;
+- damage that zeroes the sequence in the first header of a sealed hint-less file, which reads as a newest file whose first page was lost.
+
+None of these is a state a crash produces. Each needs storage to lose bytes it reported synced, and the engine relies on storage to keep that promise: it does not defend against its breaking. The refusal is a check on damage that happens to be visible, not a guarantee that a damaged database will not open.
 
 Before this, a torn record that failed its CRC refused the open in both modes, so an ordinary power cut during a write could leave the database unopenable, while a zeroed header or an oversized `value_size` in any hint-less file was trimmed silently.
 

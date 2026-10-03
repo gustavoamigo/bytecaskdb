@@ -660,9 +660,7 @@ class DB:
             #   - nothing, or zeros (unwritten space): cut;
             #   - a write a crash tore, in the newest file: cut. A file with
             #     no first sequence may be the newest, its first page lost at
-            #     a power cut and a later one kept, so it is cut too. Damage
-            #     that zeroes an older file's first header looks the same and
-            #     goes with it: a known limitation, shared with the engine;
+            #     a power cut and a later one kept, so it is cut too;
             #   - anything else: damage to acknowledged data, refused.
             is_newest = f.first_sequence == newest
             has_no_sequence = f.first_sequence == 0

@@ -5040,8 +5040,7 @@ auto tail_is_zero(const DataFile &file, Offset end) -> bool {
 // "Written last" is read off sequences, which no two files share: no other
 // file may start at a higher one. A file whose first header is zero has no
 // sequence to compare. It may be the newest, its first page lost at a power
-// cut and a later one kept, so it goes whole — and so does an older file
-// whose first header damage zeroed (#303, a known limitation).
+// cut and a later one kept, so it goes whole.
 void DB::recovery_check_tail(
     const DataFile &file, Offset end,
     const std::vector<std::filesystem::path> &data_paths) {
