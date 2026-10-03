@@ -218,6 +218,12 @@ end
 if keydir == "buffered" then
     -- The blind tree behind a write buffer (bytecaskdb/buffered_btree.cppm).
     add_defines("BYTECASK_KEYDIR_BUFFERED")
+    -- How long writes pause before the buffer is drained, in ms. For
+    -- measurement only: the default is the tree's kIdleWindow.
+    local idle_ms = os.getenv("BYTECASK_BUFFER_IDLE_MS")
+    if idle_ms ~= nil and idle_ms ~= "" then
+        add_defines("BYTECASK_BUFFER_IDLE_MS=" .. idle_ms)
+    end
 end
 
 local march = os.getenv("BYTECASK_MARCH") or "native"

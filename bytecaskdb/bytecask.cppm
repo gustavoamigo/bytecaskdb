@@ -699,6 +699,13 @@ public:
   // State transition: set engine mode (Leader/Follower).
   void apply_set_mode(Mode mode) { mode_ = mode; }
 
+  // State transition: a key directory drain freezes what the write buffer
+  // holds, for the merger to fold in once this state is published. False if
+  // there was nothing to freeze, or the key directory has no buffer.
+  [[nodiscard]] auto apply_freeze_key_dir_buffer() -> bool {
+    return kd_freeze_buffer(key_dir_);
+  }
+
   // State transition: mark engine as degraded with a reason.
   void apply_degrade(std::string reason) {
     degraded_ = true;
@@ -1519,6 +1526,24 @@ private:
                     const std::filesystem::path &active_path);
   // Publish initial state during construction (no previous state to compare).
   void store_initial_state(std::shared_ptr<EngineState> s);
+  // The key directory's drain hook (kd_set_drain_hook), run on its
+  // background thread once writes pause: freezes what the write buffer
+  // holds, waits for the merge without the write lock, then publishes it
+  // installed. Returns true when a commit was in flight and it published
+  // nothing: the tree retries at the next pause. Never throws.
+  auto drain_key_directory() noexcept -> bool;
+  // One publish of the drain: installs finished merges and, with `freeze`,
+  // freezes the write buffer. Returns whether it froze, or nullopt when a
+  // flush is in flight or the head holds writes waiting for one — writes
+  // have not paused, and the drain must not flush under the write lock as a
+  // barrier would. Publishes nothing on a degraded engine.
+  auto publish_key_dir_drain(bool freeze) -> std::optional<bool>;
+  // The head holds what `published` does not: entries, or a sync asked for.
+  [[nodiscard]] static auto head_owes_flush(const EngineState &head,
+                                            const EngineState &published) -> bool {
+    return head.next_seq > published.next_seq ||
+           head.sync_requested_seq > published.durable_seq;
+  }
   // Validates structural consistency of published state. Throws on violation.
   // Called on cold paths only (open, resume).
   void validate_state_consistency(const EngineState &s) const;
@@ -2848,6 +2873,8 @@ DB::DB(std::filesystem::path dir, Options opts)
         initial->next_seq > 0 ? initial->next_seq - 1 : 0;
     initial->mode = opts.initial_mode;
     validate_state_consistency(*initial);
+    // Cleared first thing in ~DB, so the hook never outlives this DB.
+    kd_set_drain_hook(initial->key_dir, [this] { return drain_key_directory(); });
     store_initial_state(std::move(initial));
   } catch (...) {
     ::close(lock_fd_);
@@ -2878,6 +2905,10 @@ DB::~DB() {
 // before the closed state, so the state it reads holds every write the DB
 // will ever acknowledge.
 void DB::close() {
+  // Every version shares the key directory's drain hook; after this no drain
+  // runs or starts, so a closed or dying DB is never called back. Before the
+  // locks: clearing waits for a running drain, which takes them.
+  kd_clear_drain_hook(load_state()->key_dir);
   std::lock_guard<std::mutex> vg{*vacuum_mu_};
   std::exception_ptr error;
   {
@@ -3475,7 +3506,7 @@ void DB::flush_pending() {
   // Nothing appended and no sync asked for. A sync-only write appends
   // nothing but asks for one: the entries it covers may all be published
   // already, by flushes that did not sync them.
-  if (head->next_seq <= published->next_seq && !need_sync) return;
+  if (!head_owes_flush(*head, *published)) return;
 
   if (need_sync) {
 #ifdef BYTECASK_TESTING
@@ -4440,8 +4471,13 @@ auto DB::degraded_reason() const noexcept -> std::string {
 // A key directory with a write buffer reports how long writes waited for its
 // merger (process-wide, like the node pool).
 template <typename T>
-static void add_buffer_stats(std::map<std::string, std::int64_t> &out) {
+static void add_buffer_stats(const T &key_dir, std::map<std::string, std::int64_t> &out) {
   if constexpr (requires { T::buffer_stalls(); }) {
+    // Gauge: slots the published version holds in its buffers, 0 once a
+    // drain has merged and installed them.
+    out["bytecask.keydir_buffer_slots"] = narrow<std::int64_t>(key_dir.buffered_slots());
+    // Buffers frozen by a drain, once writes paused, rather than when full.
+    out["bytecask.keydir_buffer_drains"] = T::buffer_drains();
     out["bytecask.keydir_buffer_stalls"] = T::buffer_stalls();
     out["bytecask.keydir_buffer_stall_us"] = T::buffer_stall_ns() / 1000;
     out["bytecask.keydir_buffer_inline_merges"] = T::buffer_inline_merges();
@@ -4546,8 +4582,46 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
       {"bytecask.hint_backlog", narrow<std::int64_t>(worker_.pending())},
       {"bytecask.open_files", open_files},
   };
-  add_buffer_stats<KeyDirTree>(out);
+  add_buffer_stats(s->key_dir, out);
   return out;
+}
+
+auto DB::drain_key_directory() noexcept -> bool {
+  try {
+    const auto froze = publish_key_dir_drain(true);
+    if (!froze) return true;
+    if (!*froze) return false;
+    // Without the write lock: a commit arriving now proceeds, and installs
+    // the merge itself if it has finished.
+    kd_wait_merged(load_state()->key_dir);
+    return !publish_key_dir_drain(false).has_value();
+  } catch (...) {
+    // Only an allocation can fail here; the next write's publish arms the
+    // drain again.
+    return false;
+  }
+}
+
+auto DB::publish_key_dir_drain(bool freeze) -> std::optional<bool> {
+  std::lock_guard<std::mutex> wg{*write_mu_};
+  // The flush role without waiting for it, unlike quiesce(): a commit in
+  // flight means writes have not paused.
+  if (flush_in_flight_.exchange(true, std::memory_order_acq_rel))
+    return std::nullopt;
+  auto current = load_state();
+  if (head_owes_flush(*load_head(), *current)) {
+    finish_flush();  // the head stays: its committer flushes it
+    return std::nullopt;
+  }
+  // Releases the role and resets the head to what is published here.
+  // After the lock guard, so it runs first, as in WriteBarrier.
+  const FlushRole role{*this};
+  if (current->degraded) return false;
+  // transient() installs the merges that have finished.
+  auto t = current->transient();
+  const bool froze = freeze && t.apply_freeze_key_dir_buffer();
+  store_state(current, std::move(t).persistent());
+  return froze;
 }
 
 void DB::set_mode(Mode mode) {
