@@ -464,6 +464,13 @@ export inline auto kd_value_rlower_bound(const KeyDirTree &t,
     -> KeyDirReverseValueIter {
   return from.empty() ? t.value_rbegin() : t.value_rlower_bound(from);
 }
+// Visits every location the key directory holds, reading no record; f
+// returns false to stop. For checks over locations (store_state).
+export template <typename F>
+inline void kd_for_each_location(const KeyDirTree &t, const KeyDirCtx &ctx, F &&f) {
+  for (auto it = kd_value_lower_bound(t, {}, ctx); it != std::default_sentinel; ++it)
+    if (!f(*it)) return;
+}
 export inline auto key_dir_from_recovered(RecoveryKeyDirTree t) -> KeyDirTree {
   return t;
 }
@@ -929,6 +936,20 @@ export inline auto kd_value_rlower_bound(const KeyDirTree &t,
       btree_detail::compare_bytes(fwd.key(), from) == 0)
     ++fwd;
   return KeyDirReverseValueIter{std::move(fwd)};
+}
+// Visits every location the key directory holds, in no particular order,
+// reading no record; f returns false to stop. For checks over locations
+// (store_state). The blind tree's value iterator reads nothing; a buffered
+// tree's would, to order its buffered keys, so it walks its parts instead.
+export template <typename F>
+inline void kd_for_each_location(const KeyDirTree &t, const KeyDirCtx &ctx, F &&f) {
+#ifdef BYTECASK_KEYDIR_BUFFERED
+  (void)ctx;
+  t.for_each_ref([&](BlindRef r) { return f(KeyDirLoc{r}); });
+#else
+  for (auto it = kd_value_lower_bound(t, {}, ctx); it != std::default_sentinel; ++it)
+    if (!f(*it)) return;
+#endif
 }
 // Publishes a builder, handing it the registry of the version it becomes.
 export template <typename T>

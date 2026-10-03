@@ -4985,25 +4985,28 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
     // each debug commit O(n) in disk reads (and fill the buffer pool from
     // files no reader asked for). What the locations alone show is checked:
     // every entry starts inside its file's committed extent (invariant P).
-    for (auto it = kd_value_lower_bound(new_state->key_dir, {},
-                                        new_state->kd_ctx(/*verify=*/false));
-         it != std::default_sentinel; ++it) {
-      const auto loc = *it;
-      const auto fs = new_state->file_stats.get(loc.file_id());
-      if (!fs) {
-        deem_as_degraded(std::format(
-            "invariant violation: key in file_id {}, which has no file_stats",
-            loc.file_id()));
-        return;
-      }
-      if (loc.file_offset() >= fs->total_bytes) {
-        deem_as_degraded(std::format(
-            "invariant violation: key in file_id {} starts at {} but the "
-            "file's committed extent is {}",
-            loc.file_id(), loc.file_offset(), fs->total_bytes));
-        return;
-      }
-    }
+    bool violated = false;
+    kd_for_each_location(
+        new_state->key_dir, new_state->kd_ctx(/*verify=*/false), [&](const auto &loc) {
+          const auto fs = new_state->file_stats.get(loc.file_id());
+          if (!fs) {
+            deem_as_degraded(std::format(
+                "invariant violation: key in file_id {}, which has no file_stats",
+                loc.file_id()));
+            violated = true;
+            return false;
+          }
+          if (loc.file_offset() >= fs->total_bytes) {
+            deem_as_degraded(std::format(
+                "invariant violation: key in file_id {} starts at {} but the "
+                "file's committed extent is {}",
+                loc.file_id(), loc.file_offset(), fs->total_bytes));
+            violated = true;
+            return false;
+          }
+          return true;
+        });
+    if (violated) return;
   } else {
     // Debug-only O(n) checks, sharing one walk: next_seq > max(all key_dir
     // sequences), and every entry inside its file's committed extent
