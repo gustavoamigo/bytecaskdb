@@ -11198,6 +11198,96 @@ TEST_CASE("an idle thread's cached version is reclaimed without its help",
   idle.join();
 }
 
+// A read cache knows its DB only by address and is reclaimed by idleness, so
+// a closed DB's last state used to stay in every slot that read it — on the
+// closing thread and on any other — until that thread read another DB or a
+// scrape found it idle. With the buffer pool that state holds the pool and
+// all its frames. Closing a DB drops its entries from every thread's slot.
+TEST_CASE("closing a DB releases the state every thread's read cache holds",
+          "[bytecask][reclamation][concurrency][buffer_pool]") {
+  TempDir td;
+  std::weak_ptr<const bytecask::EngineState> state;
+  std::weak_ptr<bytecask::DataFile> active;
+
+  // A second thread reads once, then stays alive past the close.
+  std::mutex mu;
+  std::condition_variable cv;
+  int step = 0;
+  std::thread reader;
+  const auto advance = [&](int to) {
+    { std::lock_guard<std::mutex> lk{mu}; step = to; }
+    cv.notify_all();
+  };
+  const auto await = [&](int at) {
+    std::unique_lock<std::mutex> lk{mu};
+    cv.wait(lk, [&] { return step >= at; });
+  };
+  {
+    auto db = bytecask::DB::open(
+        td.path / "db",
+        {.io_backend = bytecask::IoBackend::BufferPool,
+         .buffer_pool = {.capacity_bytes = 256ULL << 20}});
+    db.put({}, to_bytes("k"), to_bytes("v"));
+    bytecask::Bytes out;
+    REQUIRE(db.get({}, to_bytes("k"), out));
+    reader = std::thread{[&] {
+      bytecask::Bytes v;
+      CHECK(db.get({}, to_bytes("k"), v));
+      advance(1);
+      await(2);
+    }};
+    await(1);
+    {
+      const auto s = db.engine_state();
+      state = s;
+      active = *s->files.get(s->active_file_id);
+    }
+
+    SECTION("by close()") {
+      db.close();
+      CHECK(state.expired());
+      CHECK(active.expired());
+    }
+    SECTION("by the destructor") {}
+  }
+  CHECK(state.expired());
+  CHECK(active.expired());
+  advance(2);
+  reader.join();
+}
+
+// Close takes entries from slots other threads are claiming and releasing
+// as it runs; readers here read until they see DbClosed. Nothing of the DB
+// may be left cached once it is gone.
+TEST_CASE("closing a DB under concurrent reads leaves nothing cached",
+          "[bytecask][reclamation][concurrency][buffer_pool]") {
+  TempDir td;
+  std::weak_ptr<const bytecask::EngineState> state;
+  std::vector<std::thread> readers;
+  std::atomic<int> started{0};
+  {
+    auto db = bytecask::DB::open(
+        td.path / "db",
+        {.io_backend = bytecask::IoBackend::BufferPool,
+         .buffer_pool = {.capacity_bytes = 256ULL << 20}});
+    db.put({}, to_bytes("k"), to_bytes("v"));
+    state = db.engine_state();
+    for (int i = 0; i < 4; ++i) {
+      readers.emplace_back([&] {
+        bytecask::Bytes v;
+        started.fetch_add(1);
+        try {
+          while (true) (void)db.get({}, to_bytes("k"), v);
+        } catch (const bytecask::DbClosed &) {}
+      });
+    }
+    while (started.load() < 4) std::this_thread::yield();
+    db.close();
+    for (auto &t : readers) t.join();
+  }
+  CHECK(state.expired());
+}
+
 TEST_CASE("io_backend=Pread: full pread mode",
           "[bytecask][pread_mode]") {
   TempDir td;
