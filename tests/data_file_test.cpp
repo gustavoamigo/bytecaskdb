@@ -37,6 +37,7 @@
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
 #endif
+#include "fsize_limit.h"
 #include "mapping_probe.h"
 
 import bytecask.data_file;
@@ -1416,6 +1417,67 @@ TEST_CASE("DataFile: a record below a cut reads whole under a stale end",
 
   lease.reset();
   writer.reset();
+  std::filesystem::remove(path);
+}
+
+// A write that runs out of room part way returns short and sets no errno;
+// the error must say so, not report what an earlier call left in errno
+// (#221). RLIMIT_FSIZE produces the short write for real.
+TEST_CASE("DataFile: a write cut short by a full file reports a short write",
+          "[data_file]") {
+#ifdef __EMSCRIPTEN__
+  SKIP("needs RLIMIT_FSIZE");
+#endif
+  const auto path =
+      std::filesystem::temp_directory_path() / "bc_test_short_write.data";
+  std::filesystem::remove(path);
+  const std::string value(100, 'v');
+
+  SECTION("append_entry") {
+    auto writer =
+        bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+    (void)writer->append_entry(1, bytecask::EntryType::Put, to_bytes("a"),
+                               to_bytes("first"));
+    const auto error = bytecask_test::write_error_under_fsize_limit(
+        writer->size() + 10, [&] {
+          (void)writer->append_entry(2, bytecask::EntryType::Put,
+                                     to_bytes("b"), to_bytes(value));
+        });
+    INFO(error.what);
+    CHECK(error.is_short_write());
+  }
+  SECTION("append_entries") {
+    auto writer =
+        bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+    (void)writer->append_entry(1, bytecask::EntryType::Put, to_bytes("a"),
+                               to_bytes("first"));
+    const std::array entries{
+        bytecask::DataEntryView{2, bytecask::EntryType::Put, to_bytes("b"),
+                                to_bytes(value)},
+        bytecask::DataEntryView{3, bytecask::EntryType::Put, to_bytes("c"),
+                                to_bytes(value)},
+    };
+    std::array<bytecask::Offset, 2> offsets{};
+    const auto error = bytecask_test::write_error_under_fsize_limit(
+        writer->size() + 10, [&] { writer->append_entries(entries, offsets); });
+    INFO(error.what);
+    CHECK(error.is_short_write());
+  }
+  SECTION("ensure_zeroed") {
+    // Creation zero-fills the first 4 MiB chunk; a record that runs past it
+    // makes the fill extend the file, and a limit inside the second chunk
+    // cuts that pwrite short.
+    auto writer = bytecask::openDataFileForWrite(path, 16 << 20,
+                                                 bytecask::IoBackend::Pread);
+    const std::string large(5 << 20, 'v');
+    const auto error = bytecask_test::write_error_under_fsize_limit(
+        (4 << 20) + (512 << 10), [&] {
+          (void)writer->append_entry(1, bytecask::EntryType::Put,
+                                     to_bytes("a"), to_bytes(large));
+        });
+    INFO(error.what);
+    CHECK(error.is_short_write());
+  }
   std::filesystem::remove(path);
 }
 

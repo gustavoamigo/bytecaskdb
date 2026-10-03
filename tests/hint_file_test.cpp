@@ -17,8 +17,10 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 #include "fault_injector.h"
+#include "fsize_limit.h"
 import bytecask.hint_entry;
 import bytecask.hint_file;
 import bytecask.serialization;
@@ -267,6 +269,27 @@ TEST_CASE("HintFile CRC mismatch throws", "[hintfile]") {
 
   // CRC is verified eagerly in OpenForRead — throws before any parsing.
   CHECK_THROWS_AS(bytecask::HintFile::OpenForRead(tmp), std::runtime_error);
+}
+
+// A hint write cut short by a full file says so, not what an earlier call
+// left in errno (#221). The 16-byte header fits under the limit; the frame
+// close() flushes does not.
+TEST_CASE("HintFile: a write cut short by a full file reports a short write",
+          "[hintfile]") {
+#ifdef __EMSCRIPTEN__
+  SKIP("needs RLIMIT_FSIZE");
+#endif
+  const auto tmp =
+      std::filesystem::temp_directory_path() / "bc_hint_short_write.hint";
+  std::filesystem::remove(tmp);
+  const auto error = bytecask_test::write_error_under_fsize_limit(20, [&] {
+    auto hf = bytecask::HintFile::OpenForWrite(tmp);
+    hf.append(7, bytecask::EntryType::Put, 1024, to_bytes("key"), 50);
+    hf.close();
+  });
+  INFO(error.what);
+  CHECK(error.is_short_write());
+  std::filesystem::remove(tmp);
 }
 
 // ---------------------------------------------------------------------------

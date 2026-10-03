@@ -83,6 +83,25 @@ export [[noreturn]] inline void throw_short_read(std::uint64_t offset,
                   got, wanted, offset)};
 }
 
+// Checks a write(2)-family result against the bytes asked for. -1 throws
+// with errno. A short count — the file ran out of room part way: a full
+// disk, RLIMIT_FSIZE — sets no errno, so it is reported as EIO with the byte
+// counts, never as whatever an earlier call left in errno (#221). The write
+// is not continued: a write that fails part way degrades the engine either
+// way, and the counts point at the cause.
+export inline void check_write(ssize_t written, std::size_t wanted,
+                               std::string_view what) {
+  if (written == narrow<ssize_t>(wanted)) return;
+  if (written < 0) {
+    throw std::system_error{errno, std::generic_category(),
+                            std::format("{}: write failed", what)};
+  }
+  throw std::system_error{
+      std::make_error_code(std::errc::io_error),
+      std::format("{}: short write: the file took {} of {} bytes", what,
+                  written, wanted)};
+}
+
 // Fills dst from offset; the file ending first is a short read.
 export inline void pread_exact(int fd, std::uint64_t offset,
                                std::span<std::byte> dst) {
