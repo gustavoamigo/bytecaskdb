@@ -592,70 +592,115 @@ struct WritableFileOps {
     return entry_offset;
   }
 
+  // Serializes each chunk of entries into one buffer — header, key, value
+  // and CRC back to back — and writes it with one iovec, not four per entry:
+  // the kernel faults in and walks every iovec it is handed, which on the
+  // commit path was ~10% of the serial section (a TPROC-C batch is a few
+  // hundred small entries), and the pool is published a frame at a time
+  // rather than once per piece. A value above kInlineValueBytes is not
+  // copied: it gets an iovec of its own, pointing at the caller's bytes.
   void append_entries(std::span<const DataEntryView> entries,
                       std::span<Offset> offsets_out) {
     assert(entries.size() == offsets_out.size());
     if (entries.empty()) return;
 
-    static constexpr std::size_t kIovecsPerEntry = 4;
+    static constexpr std::size_t kInlineValueBytes = 4096;
 #ifdef BYTECASK_TESTING
     static constexpr std::size_t kMaxEntriesPerWritev = 2;
 #else
-    static constexpr std::size_t kMaxEntriesPerWritev =
-        IOV_MAX / kIovecsPerEntry;
+    // At most three iovecs per entry (a buffer run, an out-of-line value,
+    // the run after it).
+    static constexpr std::size_t kMaxEntriesPerWritev = IOV_MAX / 3;
 #endif
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
-    thread_local std::vector<std::array<std::byte, kHeaderSize + kCrcSize>>
-        hdr_crcs;
+    // Reused by the one thread that appends, so the commit path allocates
+    // only while they grow.
+    thread_local std::vector<std::byte> buf;
+    // The chunk's pieces in order: a range of buf, or an out-of-line value.
+    // Kept as offsets while buf may still grow; iovecs are made once it is
+    // done.
+    struct Piece {
+      const std::byte *ext;  // out-of-line value, or nullptr: buf[at, at+len)
+      std::size_t at;
+      std::size_t len;
+    };
+    thread_local std::vector<Piece> pieces;
     thread_local std::vector<::iovec> iov;
 #pragma clang diagnostic pop
+
+    const auto to_iovecs = [&] {
+      iov.clear();
+      for (const auto &p : pieces) {
+        auto *base = p.ext ? const_cast<std::byte *>(p.ext) : buf.data() + p.at;
+        iov.push_back({base, p.len});
+      }
+    };
+    // Appends buf[from, buf.size()) to the pieces, merged with a buffer run
+    // before it.
+    const auto run_to_end = [&](std::size_t from) {
+      if (buf.size() == from) return;
+      if (!pieces.empty() && pieces.back().ext == nullptr &&
+          pieces.back().at + pieces.back().len == from) {
+        pieces.back().len += buf.size() - from;
+      } else {
+        pieces.push_back({nullptr, from, buf.size() - from});
+      }
+    };
+    const auto put = [&](const std::byte *p, std::size_t n) {
+      buf.insert(buf.end(), p, p + n);
+    };
 
     for (std::size_t base = 0; base < entries.size();
          base += kMaxEntriesPerWritev) {
       const auto chunk_end =
           std::min(base + kMaxEntriesPerWritev, entries.size());
-      const auto chunk_size = chunk_end - base;
-
-      hdr_crcs.resize(chunk_size);
-      iov.resize(chunk_size * kIovecsPerEntry);
+      buf.clear();
+      pieces.clear();
 
       std::size_t total_bytes = 0;
-    #ifdef BYTECASK_TESTING
+#ifdef BYTECASK_TESTING
       std::size_t serialized = 0;
-    #endif
-      for (std::size_t i = 0; i < chunk_size; ++i) {
-        const auto &e = entries[base + i];
+#endif
+      for (std::size_t i = base; i < chunk_end; ++i) {
+        const auto &e = entries[i];
 
 #ifdef BYTECASK_TESTING
+        to_iovecs();
         testing_fault_injection_append(iov, serialized, total_bytes);
 #endif
 
-        offsets_out[base + i] = logical_end() + static_cast<Offset>(total_bytes);
+        offsets_out[i] = logical_end() + static_cast<Offset>(total_bytes);
 
-        write_header_and_crc(hdr_crcs[i], e.sequence, e.entry_type,
-                             e.key, e.value);
+        std::array<std::byte, kHeaderSize + kCrcSize> hdr_crc;
+        write_header_and_crc(hdr_crc, e.sequence, e.entry_type, e.key, e.value);
 
-        const auto iov_base = i * kIovecsPerEntry;
-        iov[iov_base] = {hdr_crcs[i].data(), kHeaderSize};
-        iov[iov_base + 1] = {const_cast<std::byte *>(e.key.data()),
-                              e.key.size()};
-        iov[iov_base + 2] = {const_cast<std::byte *>(e.value.data()),
-                              e.value.size()};
-        iov[iov_base + 3] = {hdr_crcs[i].data() + kHeaderSize, kCrcSize};
+        const auto from = buf.size();
+        put(hdr_crc.data(), kHeaderSize);
+        put(e.key.data(), e.key.size());
+        if (e.value.size() <= kInlineValueBytes) {
+          put(e.value.data(), e.value.size());
+          put(hdr_crc.data() + kHeaderSize, kCrcSize);
+          run_to_end(from);
+        } else {
+          run_to_end(from);
+          pieces.push_back({e.value.data(), 0, e.value.size()});
+          const auto crc_at = buf.size();
+          put(hdr_crc.data() + kHeaderSize, kCrcSize);
+          run_to_end(crc_at);
+        }
 
         total_bytes += kHeaderSize + e.key.size() + e.value.size() + kCrcSize;
 #ifdef BYTECASK_TESTING
         ++serialized;
 #endif
       }
+      to_iovecs();
 
       const auto start = logical_end();
       ensure_zeroed(start + static_cast<Offset>(total_bytes));
-      const bool written = pwritev_all(
-          fd_, std::span<const ::iovec>{iov.data(), chunk_size * kIovecsPerEntry},
-          start);
+      const bool written = pwritev_all(fd_, std::span<const ::iovec>{iov}, start);
       const auto write_errno = errno;
 
 #ifdef BYTECASK_TESTING
@@ -711,7 +756,7 @@ struct WritableFileOps {
 #pragma clang diagnostic pop
     for (auto off = zeroed_end_; off < target;) {
       const auto len = std::min<Offset>(kBuf, target - off);
-      const ::iovec v{const_cast<std::byte *>(zeros.data()), len};
+      const ::iovec v{const_cast<std::byte *>(zeros.data()), narrow<std::size_t>(len)};
       if (!pwritev_all(fd_, std::span<const ::iovec>{&v, 1}, off)) {
         throw std::system_error{errno, std::generic_category(),
                                 "WritableFileOps::ensure_zeroed: pwrite failed"};
@@ -759,17 +804,18 @@ struct WritableFileOps {
   }
 
 #ifdef BYTECASK_TESTING
+  // Before each entry of a chunk: an injected append failure writes the
+  // entries serialized so far (iov_buf covers exactly them) and advances
+  // over them if that write completes, as a crash mid-batch would leave it.
   void testing_fault_injection_append(std::span<const ::iovec> iov_buf,
                                       std::size_t serialized,
                                       std::size_t byte_count) {
-    static constexpr std::size_t kIovecsPerEntry = 4;
     try {
       FAULT_INJECTION(io_data_file_append);
     } catch (...) {
       if (serialized > 0) {
         const auto written =
-            ::pwritev(fd_, iov_buf.data(),
-                      narrow<int>(serialized * kIovecsPerEntry),
+            ::pwritev(fd_, iov_buf.data(), narrow<int>(iov_buf.size()),
                       narrow<off_t>(logical_end()));
         if (written == narrow<ssize_t>(byte_count)) {
           advance(static_cast<Offset>(byte_count));
