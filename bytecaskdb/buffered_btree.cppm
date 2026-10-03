@@ -267,6 +267,18 @@ inline auto match16(const std::uint16_t *fps, std::uint16_t fp) noexcept -> std:
 #endif
 }
 
+// match16's mask for the first n < 16 fingerprints only. The active buffer
+// is appended to while readers scan it: fingerprints past a version's count
+// may be being written, so a reader must not load them, not even to mask
+// the result away (a data race, undefined behaviour).
+inline auto match_first(const std::uint16_t *fps, std::size_t n, std::uint16_t fp) noexcept
+    -> std::uint32_t {
+  std::uint32_t mask = 0;
+  for (std::size_t i = 0; i < n; ++i)
+    mask |= static_cast<std::uint32_t>(fps[i] == fp) << (2 * i);
+  return mask;
+}
+
 // The newest slot for `key` in a view, or none.
 inline auto find_in(const View &v, Bytes key, Hash h) -> std::optional<Slot> {
   if (!v.buf) return std::nullopt;
@@ -277,8 +289,8 @@ inline auto find_in(const View &v, Bytes key, Hash h) -> std::optional<Slot> {
   // Newest first, a chunk of 16 fingerprints at a time.
   for (std::size_t end = n; end > 0;) {
     const auto from = (end - 1) / 16 * 16;
-    std::uint32_t mask = match16(part.fp.data() + from, fp);
-    if (end - from < 16) mask &= (std::uint32_t{1} << (2 * (end - from))) - 1;
+    std::uint32_t mask = end - from == 16 ? match16(part.fp.data() + from, fp)
+                                          : match_first(part.fp.data() + from, end - from, fp);
     end = from;
     while (mask != 0) {
       const auto bit = 31 - std::countl_zero(mask);
@@ -1097,6 +1109,28 @@ public:
   [[nodiscard]] auto begin() const -> Iter { return iter(Iter::Start::Begin); }
   [[nodiscard]] auto end_iter() const -> Iter { return iter(Iter::Start::End); }
   [[nodiscard]] auto end() const noexcept -> std::default_sentinel_t { return {}; }
+
+  // Every location this version holds, in no order and reading no record:
+  // the tree's entries, ones a buffer overrides included, and every
+  // buffered write. f returns false to stop. For checks that need
+  // locations, not keys: the iterator orders buffered keys among the
+  // tree's, and that reads them.
+  template <typename F> void for_each_ref(F &&f) const {
+    for (auto it = tree_.begin(); !(it == std::default_sentinel); ++it)
+      if (!f(*it)) return;
+    const auto visit = [&](const buffered_detail::View &v) {
+      if (!v.buf) return true;
+      for (std::size_t p = 0; p < buffered_detail::kPartitions; ++p)
+        for (std::size_t i = 0; i < v.counts[p]; ++i) {
+          const auto r = v.buf->parts[p].ref[i];
+          if (!buffered_detail::is_none(r) && !f(r)) return false;
+        }
+      return true;
+    };
+    for (std::size_t i = 0; i < l_.nf; ++i)
+      if (!visit(l_.f[i])) return;
+    (void)visit(l_.a);
+  }
 
   [[nodiscard]] auto transient() const -> TransientBufferedBlindBTree<LeafBytes, RS>;
 
