@@ -10448,6 +10448,7 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.keydir_buffer_merge_us",
       "bytecask.keydir_buffer_merge_slots",
       "bytecask.keydir_buffer_merge_by_location",
+      "bytecask.keydir_buffer_slots",
 #endif
   };
   for (const auto &name : expected) {

@@ -55,6 +55,7 @@ module;
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -214,6 +215,19 @@ struct Slot {
 // the writer, 10 us a commit, though the merger was a third idle. Each more
 // costs every point lookup one more fingerprint scan while it is unmerged.
 inline constexpr std::size_t kMaxFrozen = 3;
+
+// Experiment (exp/buffered-drain): drain the buffers at every publish —
+// install finished merges, and freeze A whenever the merger is idle — rather
+// than only when A is full. On with BYTECASK_BUFFER_DRAIN=1; force_drain
+// freezes A at publish whatever the merger is doing (DB::drain_key_directory).
+inline auto drain_enabled() -> bool {
+  static const bool on = [] {
+    const char *e = std::getenv("BYTECASK_BUFFER_DRAIN");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+inline std::atomic<bool> force_drain{false};
 
 // A version's buffers: the frozen ones, oldest first, and the active one.
 struct Layers {
@@ -532,6 +546,12 @@ public:
     }
     if (f.error) std::rethrow_exception(f.error);
     return *f.merged;
+  }
+
+  // No merge queued or running.
+  [[nodiscard]] auto idle() -> bool {
+    std::lock_guard<std::mutex> lk{mu_};
+    return jobs_.empty() && !running_;
   }
 
   // Waits until no merge is queued or running. A builder about to derive a
@@ -1119,11 +1139,18 @@ public:
     return Merger::merge_by_location();
   }
 
-#ifdef BYTECASK_TESTING
+  // Slots the published version sees in its buffers (a gauge).
+  [[nodiscard]] auto buffered_slots() const noexcept -> std::size_t { return l_.total(); }
   // Waits for every merge handed over so far.
-  void test_wait_merged() const {
+  void wait_merged() const {
     if (merger_) merger_->drain();
   }
+  static void set_force_drain(bool on) noexcept {
+    buffered_detail::force_drain.store(on, std::memory_order_relaxed);
+  }
+
+#ifdef BYTECASK_TESTING
+  void test_wait_merged() const { wait_merged(); }
   // Slots this version sees in its buffers, and how many are frozen.
   [[nodiscard]] auto test_buffered() const -> std::size_t { return l_.total(); }
   [[nodiscard]] auto test_frozen() const -> std::size_t { return l_.nf; }
@@ -1245,6 +1272,13 @@ public:
   // first, each chained to the one before it, with `src` to read the
   // records of the version being published.
   [[nodiscard]] auto persistent(RS src) && -> BufferedBlindBTree<LeafBytes, RS> {
+    const bool force = buffered_detail::force_drain.load(std::memory_order_relaxed);
+    if (force || buffered_detail::drain_enabled()) {
+      install_finished();
+      if (l_.a.total > 0 && l_.nf < buffered_detail::kMaxFrozen &&
+          (force || merger_->idle()))
+        freeze_active();
+    }
     for (auto i = l_.nf - here_; i < l_.nf; ++i) {
       if (i == 0)
         merger_->submit(tree_, nullptr, l_.f[i], l_.from(i), fs_[i], src);
@@ -1306,13 +1340,7 @@ private:
   template <BlindKeyResolver R> auto make_room(Bytes key, R &res) -> bool {
     if (has_room(key, buffered_detail::kBufferSlots)) return false;
     bool merged = false;
-    // Finished merges cost nothing to install.
-    while (l_.nf > here_) {
-      auto done = merger_->ready(*fs_[0]);
-      if (!done) break;
-      retire_oldest(std::move(*done));
-      tree_owned_ = false;
-    }
+    install_finished();
     if (l_.nf == buffered_detail::kMaxFrozen) {
       if (here_ == l_.nf) {
         merger_->drain();  // no merge for a discarded version shares our base
@@ -1325,6 +1353,23 @@ private:
         tree_owned_ = false;
       }
     }
+    freeze_active();
+    return merged;
+  }
+
+  // Finished merges cost nothing to install.
+  void install_finished() {
+    while (l_.nf > here_) {
+      auto done = merger_->ready(*fs_[0]);
+      if (!done) break;
+      retire_oldest(std::move(*done));
+      tree_owned_ = false;
+    }
+  }
+
+  // A joins the frozen buffers and a fresh buffer becomes A. Needs a free
+  // frozen place.
+  void freeze_active() {
     const_cast<Buffer &>(*l_.a.buf).written.store(buffered_detail::kFrozen,
                                                  std::memory_order_relaxed);
     auto state = std::make_shared<Frozen>();
@@ -1336,7 +1381,6 @@ private:
     ++l_.nf;
     ++here_;
     l_.a = View{merger_->acquire()};
-    return merged;
   }
 
   void write_slot(Bytes key, BlindRef ref, BlindRef displaced) {

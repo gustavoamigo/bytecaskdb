@@ -371,6 +371,11 @@ struct BcAdapterBase {
         for (const auto &k : *populate_keys) {
           (void)engine.get(ro, bc_key(k), value);
         }
+        // Experiment: BC_DRAIN_KEYDIR=1 empties a buffered key directory's
+        // write buffer before the timed loop.
+        if (const char *e = std::getenv("BC_DRAIN_KEYDIR"); e != nullptr && e[0] == '1') {
+          engine.drain_key_directory();
+        }
       }
     }
   };

@@ -1214,6 +1214,11 @@ public:
   // EngineState. Designed for pull-based scraping (Prometheus, logging).
   [[nodiscard]] auto stats() const -> std::map<std::string, std::int64_t>;
 
+  // Experiment (exp/buffered-drain): with a buffered key directory, merges
+  // every buffered write into the tree and publishes the result, so reads
+  // see no buffer. A no-op for the other key directories.
+  void drain_key_directory();
+
 
     // Drains background hint tasks then writes all sealed hint files.
     // temporary in public for memoery profile - TODO: Move it back to private:
@@ -4377,7 +4382,32 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
       {"bytecask.open_files", open_files},
   };
   add_buffer_stats<KeyDirTree>(out);
+  if constexpr (requires { s->key_dir.buffered_slots(); }) {
+    out["bytecask.keydir_buffer_slots"] = narrow<std::int64_t>(s->key_dir.buffered_slots());
+  }
   return out;
+}
+
+void DB::drain_key_directory() {
+  using KD = std::remove_cvref_t<decltype(load_state()->key_dir)>;
+  if constexpr (requires(const KD &k) {
+                  k.wait_merged();
+                  KD::set_force_drain(true);
+                }) {
+    // Each publish installs what has merged and freezes what is left; up
+    // to kMaxFrozen merges may be queued, so a few rounds empty it.
+    KD::set_force_drain(true);
+    for (int round = 0; round < 6 && load_state()->key_dir.buffered_slots() > 0; ++round) {
+      {
+        WriteBarrier barrier{*this};
+        auto current = load_state_for_write();
+        auto t = current->transient();
+        store_state(current, std::move(t).persistent());
+      }
+      load_state()->key_dir.wait_merged();
+    }
+    KD::set_force_drain(false);
+  }
 }
 
 void DB::set_mode(Mode mode) {
