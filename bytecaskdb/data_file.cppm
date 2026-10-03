@@ -190,7 +190,7 @@ WritableDataFile::~WritableDataFile() = default;
 // neither pays for nor can reach another back-end's state.
 //
 // The two roles are used by different holders: WritableFileOps calls publish()
-// from the append path, WritablePosixFile calls fetch() and reads kResident
+// from the append path, WritablePosixFile calls fetch_upto() and reads kResident
 // from the read path. WritableMmapDataFile serves its own reads from the
 // mapping and uses only the append half.
 // ---------------------------------------------------------------------------
@@ -253,9 +253,13 @@ constexpr auto first_read_length(Offset offset, std::uint32_t value_size_hint,
       record_bytes(hdr))};
 }
 
-// A record read through fetch(offset, len, dst), which reads exactly len
-// bytes: one fetch of first_read_length(), then, only when the record is
-// longer than that, one for the rest. The spans point into io_buf.
+// A record read through fetch(offset, len, dst), which reads up to len
+// bytes and returns how many, short only where the file ends: one fetch of
+// first_read_length(), then, only when the record is longer than that, one
+// for the rest. The first fetch over-reads past the record up to end, and
+// may meet the end of the file below it — resume() cuts the active file
+// under readers that loaded its end before the cut (#246) — so only the
+// record's own bytes have to be there. The spans point into io_buf.
 template <typename Fetch>
 auto fetch_record(const std::filesystem::path &path, Offset offset,
                   std::uint32_t value_size_hint, Offset end, bool verify,
@@ -264,14 +268,18 @@ auto fetch_record(const std::filesystem::path &path, Offset offset,
   const auto first = first_read_length(offset, value_size_hint, end);
   if (first < kHeaderSize) throw_header_past_end(path, offset, end);
   io_buf.resize(first);
-  fetch(offset, first, io_buf.data());
+  const std::size_t got = fetch(offset, first, io_buf.data());
+  if (got < kHeaderSize) throw_short_read(offset, kHeaderSize, got);
   const auto hdr = bytecask::read_header(
       std::span<const std::byte>{io_buf.data(), kHeaderSize});
   const auto total = record_bytes(hdr);
   if (offset + total > end) throw_record_past_end(path, offset, hdr, end);
-  if (total > first) {
+  if (total > got) {
+    if (got < first) throw_short_read(offset, total, got);
     io_buf.resize(total);
-    fetch(offset + first, total - first, io_buf.data() + first);
+    const std::size_t rest =
+        fetch(offset + first, total - first, io_buf.data() + first);
+    if (rest < total - first) throw_short_read(offset, total, first + rest);
   }
   return record_view(std::span<const std::byte>{io_buf.data(), total}, hdr,
                      verify);
@@ -410,9 +418,10 @@ export struct PreadIo {
 
   void publish(Offset, std::span<const ::iovec>) const noexcept {}
 
-  void fetch(int fd, Offset offset, std::size_t len, Offset /*logical_end*/,
-             std::byte *dst) const {
-    pread_exact(fd, offset, {dst, len});
+  [[nodiscard]] auto fetch_upto(int fd, Offset offset, std::size_t len,
+                                Offset /*logical_end*/, std::byte *dst) const
+      -> std::size_t {
+    return pread_upto(fd, offset, {dst, len});
   }
 
   // Nothing resident to lend or assign from: the file's read methods copy.
@@ -455,10 +464,12 @@ public:
 
   // logical_end is the file size the pool bounds admission by; unlike a sealed
   // file's, it moves with every append.
-  void fetch(int fd, Offset offset, std::size_t len, Offset logical_end,
-             std::byte *dst) const {
-    pool_->read_at(file_id_, PoolFile{.buffered = fd, .direct = -1}, offset,
-                   len, static_cast<std::size_t>(logical_end), dst);
+  [[nodiscard]] auto fetch_upto(int fd, Offset offset, std::size_t len,
+                                Offset logical_end, std::byte *dst) const
+      -> std::size_t {
+    return pool_->read_upto(file_id_, PoolFile{.buffered = fd, .direct = -1},
+                            offset, len, static_cast<std::size_t>(logical_end),
+                            dst);
   }
 
   // Zero-copy entry and point read out of the frames the writer filled,
@@ -887,7 +898,7 @@ public:
     return fetch_record(path(), offset, value_size_hint, ops_.logical_end(), verify,
                         io_buf, [this](Offset at, std::size_t len,
                                        std::byte *dst) {
-                          pread_exact(ops_.fd_, at, {dst, len});
+                          return pread_upto(ops_.fd_, at, {dst, len});
                         });
   }
 
@@ -1124,7 +1135,7 @@ public:
       return fetch_record(path(), offset, value_size_hint, ops_.logical_end(),
                           verify, io_buf,
                           [this](Offset at, std::size_t len, std::byte *dst) {
-                            fetch(at, len, dst);
+                            return fetch_upto(at, len, dst);
                           });
     };
 #ifdef BYTECASK_TESTING
@@ -1194,8 +1205,13 @@ private:
 
   // Point reads of the active file, answered by the back-end's policy. Its
   // logical end moves with every append, so it is passed per call.
+  [[nodiscard]] auto fetch_upto(Offset offset, std::size_t len,
+                                std::byte *dst) const -> std::size_t {
+    return ops_.io_.fetch_upto(ops_.fd_, offset, len, ops_.logical_end(), dst);
+  }
   void fetch(Offset offset, std::size_t len, std::byte *dst) const {
-    ops_.io_.fetch(ops_.fd_, offset, len, ops_.logical_end(), dst);
+    const auto got = fetch_upto(offset, len, dst);
+    if (got < len) throw_short_read(offset, len, got);
   }
 
   [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
@@ -1308,6 +1324,7 @@ public:
                           io_buf,
                           [this](Offset at, std::size_t len, std::byte *dst) {
                             pread_exact(fd_, at, {dst, len});
+                            return len;
                           });
     };
 #ifdef BYTECASK_TESTING
@@ -1646,6 +1663,7 @@ public:
     return fetch_record(path(), offset, value_size_hint, file_size_, verify, io_buf,
                         [this](Offset at, std::size_t len, std::byte *dst) {
                           fetch(at, len, dst, Source::Pool);
+                          return len;
                         });
   }
 

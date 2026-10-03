@@ -1375,6 +1375,50 @@ TEST_CASE("DataFile: a read past the end of file reports a short read",
   std::filesystem::remove(path);
 }
 
+// resume() lowers the active file's logical end and then cuts the file; a
+// reader that loaded the end before that over-reads up to it, past the new
+// end of file (#246). A record the file still holds is read whole; only a
+// record the cut reached is a short read. Cutting the file behind the
+// handle's back leaves its stale end in place, as the race does.
+TEST_CASE("DataFile: a record below a cut reads whole under a stale end",
+          "[data_file]") {
+  const auto io_backend =
+      GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::Mmap);
+  CAPTURE(io_backend);
+  const auto path =
+      std::filesystem::temp_directory_path() / "bc_test_stale_end.data";
+  std::filesystem::remove(path);
+  auto writer = bytecask::openDataFileForWrite(path, 1 << 20, io_backend);
+  const auto first = writer->append_entry(1, bytecask::EntryType::Put,
+                                          to_bytes("a"), to_bytes("first"));
+  const auto second = writer->append_entry(2, bytecask::EntryType::Put,
+                                           to_bytes("b"), to_bytes("second"));
+  writer->sync();
+  REQUIRE(::truncate(path.c_str(), static_cast<off_t>(second + 3)) == 0);
+
+  std::vector<std::byte> io_buf;
+  bytecask::FrameLease lease;
+  for (const std::uint32_t hint : {0U, 5U}) {
+    CAPTURE(hint);
+    const auto entry = writer->lend_record(first, hint, true, io_buf, lease);
+    CHECK(entry.sequence == 1);
+    CHECK(std::ranges::equal(entry.value, to_bytes("first")));
+  }
+  if (io_backend == bytecask::IoBackend::Pread) {
+    try {
+      (void)writer->lend_record(second, 0, true, io_buf, lease);
+      FAIL("a record the cut reached was read");
+    } catch (const std::system_error &e) {
+      CHECK(e.code() == std::errc::io_error);
+      CHECK(std::string{e.what()}.find("short read") != std::string::npos);
+    }
+  }
+
+  lease.reset();
+  writer.reset();
+  std::filesystem::remove(path);
+}
+
 // A pread that fails is an I/O error, and stays one in testing builds, where
 // the read's diagnostic is added to the message: callers tell an I/O error
 // from corruption by the exception's type.

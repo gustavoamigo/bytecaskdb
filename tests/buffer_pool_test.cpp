@@ -15,6 +15,7 @@
 #include <fstream>
 #include <random>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -595,6 +596,45 @@ TEST_CASE("BufferPool: a block is clipped to the file and its short tail",
   }
   CHECK(pool.counters().fills.load() == static_cast<std::int64_t>(kTailFrames));
   CHECK(pool.counters().misses.load() == 3);
+}
+
+// The file ends below the size the reader was given: the active file's
+// logical end, loaded just before resume() cut the file (#246). A read the
+// file still holds succeeds though its block fill meets the end of file;
+// only frames read whole are admitted; a read past the real end comes back
+// short from read_upto, and read_at refuses it.
+TEST_CASE("BufferPool: a file that ends below the size it was given",
+          "[buffer_pool]") {
+  constexpr std::size_t kWholeFrames = 2;
+  ScratchFile file{bytecask::kPoolFillBlockBytes +
+                   kWholeFrames * bytecask::kPoolFrameBytes + 100};
+  const auto stale_size = file.size() + 3 * bytecask::kPoolFrameBytes;
+  bytecask::BufferPool pool{
+      bytecask::BufferPoolOptions{.capacity_bytes = kRoomyCapacity}};
+
+  std::vector<std::byte> got(50);
+  const std::size_t inside = bytecask::kPoolFillBlockBytes + 10;
+  CHECK(pool.read_upto(1, file.fd(), inside, got.size(), stale_size,
+                       got.data()) == got.size());
+  CHECK(got == file.expected(inside, got.size()));
+  CHECK(pool.counters().fills.load() ==
+        static_cast<std::int64_t>(kWholeFrames));
+  pool.read_at(1, file.fd(), inside, got.size(), stale_size, got.data());
+  CHECK(got == file.expected(inside, got.size()));
+
+  const auto across = file.size() - 20;
+  std::fill(got.begin(), got.end(), std::byte{0});
+  CHECK(pool.read_upto(1, file.fd(), across, got.size(), stale_size,
+                       got.data()) == 20);
+  CHECK(std::vector(got.begin(), got.begin() + 20) ==
+        file.expected(across, 20));
+  CHECK_THROWS_AS(
+      pool.read_at(1, file.fd(), across, got.size(), stale_size, got.data()),
+      std::system_error);
+  CHECK(pool.read_upto(1, file.fd(), file.size() + 10, got.size(), stale_size,
+                       got.data()) == 0);
+  CHECK(pool.counters().fills.load() ==
+        static_cast<std::int64_t>(kWholeFrames));
 }
 
 TEST_CASE("BufferPool: a partial miss reads only the blocks it touches",
