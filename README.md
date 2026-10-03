@@ -572,7 +572,7 @@ python ./scripts/run_engine_bench.py
 ./bytecaskdb-mariadb-plugin/benchmarks/compare-refs.sh --rounds=2 --innodb main my-branch
 ```
 
-The key directory is chosen at build time. The default is the blind-leaf B+ tree; `BYTECASK_KEYDIR=btree` builds the engine on the B+ tree that keeps key bytes in its leaves (larger, and it never reads a record to place or enumerate a key), and `BYTECASK_KEYDIR=buffered` on the blind-leaf tree behind a small write buffer that a background thread folds into the tree, which takes the tree update out of each commit (experimental). All three pass the same engine suite in CI, and the on-disk format is the same, so a database opens under any of them.
+The key directory is chosen at build time. The default is the blind-leaf B+ tree; `BYTECASK_KEYDIR=btree` builds the engine on the B+ tree that keeps key bytes in its leaves (larger, and it never reads a record to place or enumerate a key), and `BYTECASK_KEYDIR=buffered` on the blind-leaf tree behind a small write buffer that a background thread folds into the tree, which takes the tree update out of each commit (experimental, and native only: the WASM build has no threads and uses the blind-leaf tree). All three pass the same engine suite in CI, and the on-disk format is the same, so a database opens under any of them.
 
 A ready-to-use development environment is provided via the included [Dev Container](.devcontainer) (Fedora 43, Clang, xmake, LLVM tooling, and `nanobind` pre-installed).
 

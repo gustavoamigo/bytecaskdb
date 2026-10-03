@@ -25,7 +25,9 @@ module;
 export module bytecask:internals;
 
 import bytecask.blind_btree;
+#ifdef BYTECASK_KEYDIR_BUFFERED
 import bytecask.buffered_btree;
+#endif
 import bytecask.btree;
 import bytecask.buffer_pool;
 import bytecask.data_entry;

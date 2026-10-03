@@ -94,6 +94,13 @@ module;
 #include <immintrin.h>
 #endif
 
+// The merger is a thread: without one, every merge would run on the commit
+// that froze the buffer, and nothing would drain the buffer once writes
+// pause. Builds without threads (WASM) use the blind tree.
+#ifdef BYTECASK_SINGLE_THREADED
+#error "the buffered key directory needs threads; WASM builds use the blind tree"
+#endif
+
 export module bytecask.buffered_btree;
 import bytecask.blind_btree;
 
@@ -529,17 +536,12 @@ public:
               Layers overlay, const std::shared_ptr<Frozen> &state, RS src) {
     Job job{std::move(base), std::move(prev), std::move(frozen), std::move(overlay), state,
             std::move(src)};
-#ifdef BYTECASK_SINGLE_THREADED
-    std::unique_lock<std::mutex> lk{mu_};
-    execute(job, lk);
-#else
     {
       std::lock_guard<std::mutex> lk{mu_};
       jobs_.push_back(std::move(job));
       if (!thread_.joinable()) thread_ = std::thread{[this] { run(); }};
     }
     cv_.notify_all();
-#endif
   }
 
   // The merged tree for F, if the merger has finished it.
@@ -613,7 +615,6 @@ public:
   void note_publish(bool buffered) {
     publishes_.fetch_add(1, std::memory_order_relaxed);
     if (armed_.load(std::memory_order_relaxed) == buffered) return;
-#ifndef BYTECASK_SINGLE_THREADED
     {
       std::lock_guard<std::mutex> lk{mu_};
       armed_.store(buffered, std::memory_order_relaxed);
@@ -621,7 +622,6 @@ public:
       if (!thread_.joinable()) thread_ = std::thread{[this] { run(); }};
     }
     cv_.notify_all();
-#endif
   }
 
   // Folds a frozen buffer into base, reading records through the buffers
