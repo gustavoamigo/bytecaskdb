@@ -4005,21 +4005,25 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
   const auto tmp_data_path = dir_ / (stem + ".data.tmp");
   const auto final_data_path = dir_ / (stem + ".data");
 
-  // Until the rename has placed it, the staging file is removed on every exit
-  // — the early returns below and any failure: scan, copy, sync, shrink, the
-  // rename itself. A vacuum retried under a persistent fault (ENOSPC) would
-  // otherwise leave a full copy behind per attempt until the next open. A
-  // removal that fails under the same fault is left to recovery, which deletes
-  // .data.tmp at open; it must not replace the exception in flight.
-  struct StagingCleanup {
-    std::filesystem::path path;
+  // Until the commit publishes it, vacuum's copy is removed on every exit —
+  // the early returns below and any failure: scan, copy, sync, shrink, the
+  // rename, and after the rename the directory sync, the open, the hint and
+  // the commit itself. A vacuum retried under a persistent fault (ENOSPC,
+  // EMFILE) would otherwise leave a full copy behind per attempt, and the next
+  // open runs a recovery pass per copy (#235, #304). Before the commit the
+  // published state still holds the source, so nothing reads the copy. A
+  // removal that fails under the same fault, or that a power cut loses, is
+  // left to recovery, which deletes a .data.tmp and a placed copy beside its
+  // source at open; it must not replace the exception in flight.
+  struct CopyCleanup {
+    std::vector<std::filesystem::path> paths;
     bool armed{true};
-    ~StagingCleanup() {
+    ~CopyCleanup() {
       if (!armed) return;
       std::error_code ec;
-      std::filesystem::remove(path, ec);
+      for (const auto &p : paths) std::filesystem::remove(p, ec);
     }
-  } staging{tmp_data_path};
+  } cleanup{{tmp_data_path}};
 
   VacuumScanResult scan;
   {
@@ -4058,17 +4062,23 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
   // between here and the staging create. renameDataFileExclusive refuses the
   // target instead of replacing it.
   renameDataFileExclusive(tmp_data_path, final_data_path);
-  // Placed: .data.tmp no longer exists, and a failure from here on leaves the
-  // compacted file under its final name, which open already resolves.
-  staging.armed = false;
+  // Placed: from here the copy is the final file and the hint flush_hints_for
+  // writes for it, staged or renamed, hint first as recovery removes them.
+  // Only once the rename succeeded: until then the final name may be a file
+  // rotation minted. Frames the hint scan admits under the buffer pool are
+  // left to eviction if the copy goes: their file id was reserved for it and
+  // is never reused.
+  cleanup.paths = {dir_ / (stem + ".hint.tmp"), dir_ / (stem + ".hint"),
+                   final_data_path};
   // The source is unlinked once this commits. Were that unlink durable and
   // the rename not, the next open would find only .data.tmp, delete it as
   // staging, and lose every live entry the source held.
   sync_directory(dir_, "io_dir_sync_vacuum");
 #ifdef BYTECASK_TESTING
-  // Class G in docs/correctness_validation.md: the rename completed and the
-  // process did not get to confirm it. The compacted file is on disk under its
-  // final name while the old one is still the published state's.
+  // *Orphaned .data files* in docs/correctness_validation.md: the rename
+  // completed and the commit did not. The compacted file is on disk under its
+  // final name while the old one is still the published state's; cleanup
+  // removes it.
   FAULT_INJECTION(io_vacuum_compact_post_rename);
 #endif
 
@@ -4095,6 +4105,9 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
     vacuum_commit(file_id, scan, new_file, dest_file_id,
                   snap->next_seq > 0 ? snap->next_seq - 1 : 0);
   }
+  // Published: the copy is the file now. A failure from here on, the source's
+  // unlink, leaves the source beside it, which open resolves.
+  cleanup.armed = false;
   // Bytes reclaimed = the shrinkage, not old_total - live_bytes: the compacted
   // file also carries the tombstones and markers that had to be preserved.
   counters_.vacuum_bytes_reclaimed.fetch_add(

@@ -10,8 +10,9 @@
 // returned or threw (#235).
 // VC5 verifies that a directory holding a compacted file and its source — a kill
 // after the commit, before the unlink — recovers, with the vacuum undone.
-// VC6 (#104 M3) verifies that a copy renamed but never committed is an orphan
-// the next open detects and deletes.
+// VC6 (#104 M3) verifies that a copy renamed but never committed is removed by
+// the vacuum that placed it (#304): every cell but VC5 checks that no data or
+// hint file outlives vacuum() unless the published state references it.
 // VC7 (#261) fails the fdatasync vacuum issues before dropping entries that
 // only sync = false writes supersede. Every cell cuts the power after the
 // vacuum (#265) and recovers the directory as the device held it: the durable
@@ -41,7 +42,7 @@ using bytecask::testing::durable_watermark;
 using bytecask::testing::key_values;
 using bytecask::testing::make_durable;
 using bytecask::testing::assert_vacuum_recoverable;
-using bytecask::testing::unreferenced_data_files;
+using bytecask::testing::unreferenced_files;
 using bytecask::testing::assert_vacuum_success;
 using bytecask::testing::capture_vacuum_baseline;
 using bytecask::testing::find_vacuum_target;
@@ -96,6 +97,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__success", "[prove_vacuum_com
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -141,6 +143,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__tmp_create_fails", "[prove_v
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -186,6 +189,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__append_fails", "[prove_vacuu
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -231,6 +235,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__sync_fails", "[prove_vacuum_
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -279,6 +284,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__rename_fails", "[prove_vacuu
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -351,7 +357,6 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__post_rename", "[prove_vacuum
   std::map<std::string, bytecask::Bytes> durable_before;
   std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
-  std::vector<std::filesystem::path> orphans;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
@@ -370,7 +375,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__post_rename", "[prove_vacuum
     {
     // VC6: renamed, not committed (#104 M3) — the compacted copy is on
     // disk under its final name and the published state does not
-    // reference it. The next open must detect it and delete it.
+    // reference it. Vacuum removes it on the way out (#304).
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_post_rename"};
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
@@ -378,14 +383,12 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation__post_rename", "[prove_vacuum
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
-    orphans = unreferenced_data_files(db, dir);
-    REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
   assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
-  CHECK_FALSE(std::filesystem::exists(orphans.front()));
   assert_power_loss_outcome(
       cut,
       {.baseline = durable_before,
@@ -431,6 +434,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__success", "[prove_vacuum_compact]"
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -484,6 +488,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__tmp_create_fails", "[prove_vacuum_
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -537,6 +542,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__append_fails", "[prove_vacuum_comp
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -590,6 +596,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__sync_fails", "[prove_vacuum_compac
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -646,6 +653,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__rename_fails", "[prove_vacuum_comp
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -726,7 +734,6 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__post_rename", "[prove_vacuum_compa
   std::map<std::string, bytecask::Bytes> durable_before;
   std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
-  std::vector<std::filesystem::path> orphans;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
@@ -753,7 +760,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__post_rename", "[prove_vacuum_compa
     {
     // VC6: renamed, not committed (#104 M3) — the compacted copy is on
     // disk under its final name and the published state does not
-    // reference it. The next open must detect it and delete it.
+    // reference it. Vacuum removes it on the way out (#304).
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_post_rename"};
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
@@ -761,14 +768,12 @@ TEST_CASE("prove_vacuum_compact__mostly_dead__post_rename", "[prove_vacuum_compa
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
-    orphans = unreferenced_data_files(db, dir);
-    REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
   assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150});
-  CHECK_FALSE(std::filesystem::exists(orphans.front()));
   assert_power_loss_outcome(
       cut,
       {.baseline = durable_before,
@@ -807,6 +812,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__success", "[prove_vacuu
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -854,6 +860,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__tmp_create_fails", "[pr
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -901,6 +908,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__append_fails", "[prove_
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -948,6 +956,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__sync_fails", "[prove_va
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -998,6 +1007,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__rename_fails", "[prove_
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -1074,7 +1084,6 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__post_rename", "[prove_v
   std::map<std::string, bytecask::Bytes> durable_before;
   std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
-  std::vector<std::filesystem::path> orphans;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
@@ -1093,7 +1102,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__post_rename", "[prove_v
     {
     // VC6: renamed, not committed (#104 M3) — the compacted copy is on
     // disk under its final name and the published state does not
-    // reference it. The next open must detect it and delete it.
+    // reference it. Vacuum removes it on the way out (#304).
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_post_rename"};
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
@@ -1101,14 +1110,12 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_mmap__post_rename", "[prove_v
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
-    orphans = unreferenced_data_files(db, dir);
-    REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
   assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::Mmap});
-  CHECK_FALSE(std::filesystem::exists(orphans.front()));
   assert_power_loss_outcome(
       cut,
       {.baseline = durable_before,
@@ -1156,6 +1163,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__success", "[prove_vacuum_comp
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -1211,6 +1219,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__tmp_create_fails", "[prove_va
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -1266,6 +1275,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__append_fails", "[prove_vacuum
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -1321,6 +1331,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__sync_fails", "[prove_vacuum_c
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -1379,6 +1390,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__rename_fails", "[prove_vacuum
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -1463,7 +1475,6 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__post_rename", "[prove_vacuum_
   std::map<std::string, bytecask::Bytes> durable_before;
   std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
-  std::vector<std::filesystem::path> orphans;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
@@ -1490,7 +1501,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__post_rename", "[prove_vacuum_
     {
     // VC6: renamed, not committed (#104 M3) — the compacted copy is on
     // disk under its final name and the published state does not
-    // reference it. The next open must detect it and delete it.
+    // reference it. Vacuum removes it on the way out (#304).
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_post_rename"};
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
@@ -1498,14 +1509,12 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_mmap__post_rename", "[prove_vacuum_
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
-    orphans = unreferenced_data_files(db, dir);
-    REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
   assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::Mmap});
-  CHECK_FALSE(std::filesystem::exists(orphans.front()));
   assert_power_loss_outcome(
       cut,
       {.baseline = durable_before,
@@ -1545,6 +1554,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__success", "[prove_vacuu
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -1592,6 +1602,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__tmp_create_fails", "[pr
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -1639,6 +1650,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__append_fails", "[prove_
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -1686,6 +1698,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__sync_fails", "[prove_va
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -1736,6 +1749,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__rename_fails", "[prove_
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -1812,7 +1826,6 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__post_rename", "[prove_v
   std::map<std::string, bytecask::Bytes> durable_before;
   std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
-  std::vector<std::filesystem::path> orphans;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -1831,7 +1844,7 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__post_rename", "[prove_v
     {
     // VC6: renamed, not committed (#104 M3) — the compacted copy is on
     // disk under its final name and the published state does not
-    // reference it. The next open must detect it and delete it.
+    // reference it. Vacuum removes it on the way out (#304).
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_post_rename"};
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
@@ -1839,14 +1852,12 @@ TEST_CASE("prove_vacuum_compact__low_fragmentation_pool__post_rename", "[prove_v
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
-    orphans = unreferenced_data_files(db, dir);
-    REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
   assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
-  CHECK_FALSE(std::filesystem::exists(orphans.front()));
   assert_power_loss_outcome(
       cut,
       {.baseline = durable_before,
@@ -1894,6 +1905,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__success", "[prove_vacuum_comp
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -1949,6 +1961,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__tmp_create_fails", "[prove_va
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -2004,6 +2017,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__append_fails", "[prove_vacuum
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -2059,6 +2073,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__sync_fails", "[prove_vacuum_c
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -2117,6 +2132,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__rename_fails", "[prove_vacuum
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -2201,7 +2217,6 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__post_rename", "[prove_vacuum_
   std::map<std::string, bytecask::Bytes> durable_before;
   std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
-  std::vector<std::filesystem::path> orphans;
   {
     // Setup: write ['k0', 'k1', 'k2', 'k3', 'k4', 'k5'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
@@ -2228,7 +2243,7 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__post_rename", "[prove_vacuum_
     {
     // VC6: renamed, not committed (#104 M3) — the compacted copy is on
     // disk under its final name and the published state does not
-    // reference it. The next open must detect it and delete it.
+    // reference it. Vacuum removes it on the way out (#304).
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_post_rename"};
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
@@ -2236,14 +2251,12 @@ TEST_CASE("prove_vacuum_compact__mostly_dead_pool__post_rename", "[prove_vacuum_
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
-    orphans = unreferenced_data_files(db, dir);
-    REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
   assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 150, .io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1048576}});
-  CHECK_FALSE(std::filesystem::exists(orphans.front()));
   assert_power_loss_outcome(
       cut,
       {.baseline = durable_before,
@@ -2286,6 +2299,7 @@ TEST_CASE("prove_vacuum_compact__batched_file__success", "[prove_vacuum_compact]
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -2335,6 +2349,7 @@ TEST_CASE("prove_vacuum_compact__batched_file__tmp_create_fails", "[prove_vacuum
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -2384,6 +2399,7 @@ TEST_CASE("prove_vacuum_compact__batched_file__append_fails", "[prove_vacuum_com
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -2433,6 +2449,7 @@ TEST_CASE("prove_vacuum_compact__batched_file__sync_fails", "[prove_vacuum_compa
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -2485,6 +2502,7 @@ TEST_CASE("prove_vacuum_compact__batched_file__rename_fails", "[prove_vacuum_com
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -2561,7 +2579,6 @@ TEST_CASE("prove_vacuum_compact__batched_file__post_rename", "[prove_vacuum_comp
   std::map<std::string, bytecask::Bytes> durable_before;
   std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
-  std::vector<std::filesystem::path> orphans;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 88});
@@ -2584,7 +2601,7 @@ TEST_CASE("prove_vacuum_compact__batched_file__post_rename", "[prove_vacuum_comp
     {
     // VC6: renamed, not committed (#104 M3) — the compacted copy is on
     // disk under its final name and the published state does not
-    // reference it. The next open must detect it and delete it.
+    // reference it. Vacuum removes it on the way out (#304).
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_post_rename"};
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
@@ -2592,14 +2609,12 @@ TEST_CASE("prove_vacuum_compact__batched_file__post_rename", "[prove_vacuum_comp
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
-    orphans = unreferenced_data_files(db, dir);
-    REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
   assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 88});
-  CHECK_FALSE(std::filesystem::exists(orphans.front()));
   assert_power_loss_outcome(
       cut,
       {.baseline = durable_before,
@@ -2638,6 +2653,7 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__success", "[prove_vacuum_
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -2684,6 +2700,7 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__tmp_create_fails", "[prov
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -2730,6 +2747,7 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__append_fails", "[prove_va
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -2776,6 +2794,7 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__sync_fails", "[prove_vacu
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -2825,6 +2844,7 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__rename_fails", "[prove_va
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -2898,7 +2918,6 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__post_rename", "[prove_vac
   std::map<std::string, bytecask::Bytes> durable_before;
   std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
-  std::vector<std::filesystem::path> orphans;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 73});
@@ -2918,7 +2937,7 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__post_rename", "[prove_vac
     {
     // VC6: renamed, not committed (#104 M3) — the compacted copy is on
     // disk under its final name and the published state does not
-    // reference it. The next open must detect it and delete it.
+    // reference it. Vacuum removes it on the way out (#304).
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_post_rename"};
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
@@ -2926,14 +2945,12 @@ TEST_CASE("prove_vacuum_compact__range_tombstone_file__post_rename", "[prove_vac
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
-    orphans = unreferenced_data_files(db, dir);
-    REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
   assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 73});
-  CHECK_FALSE(std::filesystem::exists(orphans.front()));
   assert_power_loss_outcome(
       cut,
       {.baseline = durable_before,
@@ -2973,6 +2990,7 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__success", "[prove_vacuum_co
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -3020,6 +3038,7 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__tmp_create_fails", "[prove_
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -3067,6 +3086,7 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__append_fails", "[prove_vacu
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -3114,6 +3134,7 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__sync_fails", "[prove_vacuum
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -3164,6 +3185,7 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__rename_fails", "[prove_vacu
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -3238,7 +3260,6 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__post_rename", "[prove_vacuu
   std::map<std::string, bytecask::Bytes> durable_before;
   std::uint64_t watermark = 0;
   bytecask::testing::VacuumBaseline before;
-  std::vector<std::filesystem::path> orphans;
   {
     // Setup: write ['k0', 'k1'] to file_0, trigger rotation to seal it.
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 50});
@@ -3259,7 +3280,7 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__post_rename", "[prove_vacuu
     {
     // VC6: renamed, not committed (#104 M3) — the compacted copy is on
     // disk under its final name and the published state does not
-    // reference it. The next open must detect it and delete it.
+    // reference it. Vacuum removes it on the way out (#304).
       bytecask::testing::ScopedFaultInjector fi{"io_vacuum_compact_post_rename"};
       REQUIRE_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}), std::system_error);
     }
@@ -3267,14 +3288,12 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__post_rename", "[prove_vacuu
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
-    orphans = unreferenced_data_files(db, dir);
-    REQUIRE(orphans.size() == 1);  // the uncommitted copy
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
   assert_hints_durable(cache.model);
   assert_vacuum_recoverable(dir, before, {.max_file_bytes = 50});
-  CHECK_FALSE(std::filesystem::exists(orphans.front()));
   assert_power_loss_outcome(
       cut,
       {.baseline = durable_before,
@@ -3321,6 +3340,7 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite__durability_sync_fails", "[p
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == true);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -3366,6 +3386,7 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite_whole_file__success", "[prov
     assert_vacuum_success(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == false);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }
@@ -3471,6 +3492,7 @@ TEST_CASE("prove_vacuum_compact__unsynced_overwrite_whole_file__durability_sync_
     assert_vacuum_no_change(db, before, vacuumed_file_id);
     CHECK(db.is_degraded() == true);
     CHECK(staging_data_files(dir).empty());
+    CHECK(unreferenced_files(db, dir).empty());
     watermark = durable_watermark(db);
     cache.model.copy_device(dir, cut);  // power cut
   }

@@ -33,10 +33,12 @@ def vacuum_compact_delta(
     proves the directory opens with every key and sequence-disjoint files.
 
     VC6: vacuum throws after the rename and before the commit — #104's M3.
-    In memory nothing changed, as for VC1–VC4. On disk the compacted copy
-    sits under its final name, unreferenced, beside the source it copies.
-    Recovery must detect it and delete it: the cell records the orphan's
-    path before closing and checks it is gone after the next open.
+    In memory nothing changed, as for VC1–VC4, and on disk too: vacuum
+    removes the copy it placed under its final name, and the hint it may
+    have written, on the way out (#304). Left there, a vacuum retried under
+    a persistent fault placed one copy per attempt, each costing the next
+    open a recovery pass. A kill in the window still leaves the copy, which
+    recovery deletes; VC5 and the recovery tests cover that pair.
 
     VC1–VC4 fail before the rename: vacuum removes its .data.tmp staging copy
     on the way out (#235), so a retry under a persistent fault does not leave
