@@ -130,6 +130,11 @@ What matters is not all values that `EngineState` can have, but the
 difference between `S1` and `S2`, which is finite and determined
 entirely by `P` and `F`.
 
+This is model-based testing with a transition-based model, and the finite
+set is covered by enumeration rather than sampling: bounded exhaustive
+testing. [*Prior Art*](#prior-art) places each layer of this document
+against the work it follows.
+
 ---
 
 ## Failure Classes
@@ -397,7 +402,9 @@ past every other layer here: the fault injector needs a syscall to fail, and
 intact; the crash harness SIGKILLs, and the page cache survives that too.
 Only the chaos rig cuts power, and it found the bug by chance. The one place
 a `sync = false` write can actually be lost in-process is the page cache
-model, so the generators now cut there.
+model, so the generators now cut there. The shape is CrashMonkey and ACE's
+([*Prior Art*](#prior-art)): a bounded, enumerated set of workloads, each
+crashed once at a known point and checked against an oracle.
 
 Each cell runs under `ScopedPageCacheModel`. Before the DB's destructor
 would sync and hint everything, `PageCacheModel::copy_device(dir, cut)`
@@ -1366,6 +1373,11 @@ I/O checkpoints:
 - **Post-write mode** — fires at `io_data_file_append_partial` with
   `short_write` or `throw_after`. Used for B2, B3.
 
+SQLite's harness fails the 1st, 2nd, …, n-th I/O call of an operation in
+turn. The injector names its sites instead, so that each failure has a
+class and each class an expected delta; what that gives up is in
+[*Prior Art*](#prior-art).
+
 ### Invariant helpers
 
 `tests/proof/invariants.h` provides:
@@ -1834,7 +1846,8 @@ separator; the leaf case of the first is specific to
 #### Mutations
 
 A soak earns its nightly cost only if it catches what the matrix
-cannot. `tests/soak_mutations/` holds one-line mutations of the
+cannot. This is mutation testing ([*Prior Art*](#prior-art)) with
+hand-written mutants. `tests/soak_mutations/` holds one-line mutations of the
 engine's synchronization, and `scripts/soak_mutation_check.sh <san>
 [seconds]` applies each, runs the soak under that sanitizer, and fails
 if a mutation expected to be caught survives.
@@ -1886,6 +1899,7 @@ fails one syscall from inside the engine. The chaos rig
 runs the engine as a black box on a filesystem that can do anything POSIX
 and Linux allow: return `EIO` from reads, writes, `fdatasync` and metadata
 calls, run out of space, go read-only, write short, stall, and lose power.
+Its nearest relatives are LazyFS and ALICE ([*Prior Art*](#prior-art)).
 
 - `chaosfs.py` is an in-memory FUSE filesystem with a volatile and a durable
   image per file and per directory. `fdatasync` copies dirty pages to the
@@ -2233,7 +2247,10 @@ For every (S1, P, F) in the scenario matrix:
 **What it does not claim**: exhaustive coverage of all state values.
 It claims exhaustive coverage of all structural failure classes for
 all plan shapes in the matrix. That coverage targets the failure
-modes that matter in practice.
+modes that matter in practice. The argument that a bounded matrix is
+enough is the small scope hypothesis ([*Prior Art*](#prior-art)): it is a
+hypothesis, and the soak, the crash harness and the chaos rig exist for
+what the bound leaves out.
 
 ### What this does not cover
 
@@ -2337,6 +2354,126 @@ Each experiment either clears the baseline or it does not.
 
 ---
 
+## Prior Art
+
+None of the techniques here is new. This section names what each layer
+follows, and where it departs.
+
+**Model-based testing.** In Utting, Pretschner and Legeard's taxonomy [1],
+the proof generator is model-based testing with a *transition-based* model
+— their term for state machines and transition systems. The model
+(`expected_delta.py`) is written for testing and kept apart from the
+engine; the tests are generated offline, and the model is covered
+structurally, by enumerating its transitions.
+
+**Category-partition.** The matrix's axes — state shapes, plan shapes,
+failure classes — and its elimination rules are Ostrand and Balcer's
+categories, choices and constraints [2], with the generator producing the
+test frames. Using one fixed set of symbolic values per cell rests on what
+Bernot, Gaudel and Marre call a uniformity hypothesis [3]: every member of
+a class behaves as its representative does. *Property-Based Validation of
+the Independence Assumption* tests that hypothesis with random values, in
+the manner of QuickCheck [4].
+
+**Bounded exhaustive testing.** Korat [5] generates every input up to a
+size bound that satisfies a validity predicate, and runs the code on each.
+The generators do the same over transitions: every combination within the
+bound, minus those the elimination rules mark impossible. The case that a
+small bound is enough is Jackson's small scope hypothesis [6]: most bugs
+have small counterexamples. Plan shapes here are a handful of operations,
+and `kMaxEntriesPerWritev` is lowered to 2 under test so that the bound
+still reaches the chunking loop. The hypothesis says nothing about interleaving
+or volume; *Chaos soak* covers those by sampling.
+
+**Combinatorial testing.** Covering arrays [7] cut a product of parameters
+down to the rows that cover every *t*-way interaction, on the evidence
+that few failures need more than a handful of parameters to interact. The
+matrix does not use them. After elimination the product is a few thousand
+tests, small enough to run in full, and every cell has its own expected
+delta to check. Covering arrays are the fallback if a new axis makes the
+product too large.
+
+**Fault injection by count.** SQLite [8] instruments its allocator and its
+VFS to fail the N-th call, and reruns each operation with N = 1, 2, …
+until it completes without reaching the fault. The fault injector here
+names its sites instead: a failure class is a named checkpoint and mode,
+and the model gives each class an expected delta, which a count cannot
+carry. The cost is that a counted loop reaches a new I/O call without
+anyone registering it, and a named one does not: a new site needs a
+checkpoint, and a row in *Durability sites*. SQLite's crash tests, which
+run on a VFS that drops or damages unsynced writes at a simulated crash,
+are the ancestor of `PageCacheModel`.
+
+**Crash-consistency testing.** CrashMonkey and ACE [9] test file systems
+by bounded black-box crash testing: ACE enumerates every workload of a
+few file-system operations, and CrashMonkey records each one's block I/O,
+builds the state a crash after a persistence point leaves, and checks it
+against an oracle. The *Power-loss axis* has that shape one layer up: the
+workloads are the generators' cells, the cut comes once per cell, and the
+oracle is the durable baseline and watermark. CrashMonkey itself is not
+used. It tests the file system below the engine: on a correct file system
+it yields the one state that file system produces, where the engine's
+bugs are in what any conforming file system may do with unsynced state.
+
+ALICE [10] is the closer relative, since it tests applications. It traces
+an application's system calls, constructs the crash states an abstract
+persistence model permits, and runs the application's own checker on
+each. The *Chaos rig* produces the same kind of state — what POSIX
+allows, not what one file system does — on a FUSE filesystem, as LazyFS
+[11] does for Jepsen's tests, but picks its crash points at random where
+ALICE enumerates them. No layer here enumerates every crash point inside
+an operation: the axis cuts once, at the end of a cell, and the rig
+samples.
+
+**Mutation testing.** The mutation sets (*Durability sites*, and the
+*Mutations* tables of the soak and the chaos rig) are mutation testing
+[12]: a test suite is judged by the deliberate faults it detects. The
+mutants are written by hand, one per durability site or synchronization
+rule, not generated by operators, so each is a bug worth catching: one
+that survives is a missing test, or is kept as `Expected: NOT caught` with
+the reason.
+
+**Isolation checking.** Elle [13] infers a transaction dependency graph
+from an observed history and reports the cycles; *Isolation checking*
+uses it as published.
+
+1. M. Utting, A. Pretschner, B. Legeard. *A taxonomy of model-based
+   testing approaches.* Software Testing, Verification and Reliability
+   22(5), 2012.
+2. T. J. Ostrand, M. J. Balcer. *The category-partition method for
+   specifying and generating functional tests.* Communications of the
+   ACM 31(6), 1988.
+3. G. Bernot, M.-C. Gaudel, B. Marre. *Software testing based on formal
+   specifications: a theory and a tool.* Software Engineering Journal
+   6(6), 1991.
+4. K. Claessen, J. Hughes. *QuickCheck: a lightweight tool for random
+   testing of Haskell programs.* ICFP 2000.
+5. C. Boyapati, S. Khurshid, D. Marinov. *Korat: automated testing based
+   on Java predicates.* ISSTA 2002.
+6. D. Jackson. *Software Abstractions: Logic, Language, and Analysis.*
+   MIT Press, 2006.
+7. D. R. Kuhn, D. R. Wallace, A. M. Gallo. *Software fault interactions
+   and implications for software testing.* IEEE Transactions on Software
+   Engineering 30(6), 2004.
+8. [*How SQLite Is Tested*](https://www.sqlite.org/testing.html):
+   out-of-memory, I/O error and crash testing.
+9. J. Mohan, A. Martinez, S. Ponnapalli, P. Raju, V. Chidambaram.
+   *Finding crash-consistency bugs with bounded black-box crash testing.*
+   OSDI 2018.
+10. T. S. Pillai, V. Chidambaram, R. Alagappan, S. Al-Kiswany,
+    A. C. Arpaci-Dusseau, R. H. Arpaci-Dusseau. *All file systems are not
+    created equal: on the complexity of crafting crash-consistent
+    applications.* OSDI 2014.
+11. [LazyFS](https://github.com/dsrhaslab/lazyfs): a FUSE filesystem that
+    loses unsynced writes on demand.
+12. R. A. DeMillo, R. J. Lipton, F. G. Sayward. *Hints on test data
+    selection: help for the practicing programmer.* IEEE Computer 11(4),
+    1978.
+13. K. Kingsbury, P. Alvaro. *Elle: inferring isolation anomalies from
+    experimental observations.* PVLDB 14(3), 2020.
+
+---
+
 ## Property-Based Validation of the Independence Assumption
 
 ### The assumption
@@ -2349,6 +2486,10 @@ etc.) across all 800 matrix cells. If some code path accidentally
 depends on value content — a length-dependent branch, a key that
 collides with an internal sentinel, or a value size that crosses a
 buffer boundary — the current matrix would not catch it.
+
+The testing literature calls this a uniformity hypothesis
+([*Prior Art*](#prior-art)): one representative stands for its whole
+class.
 
 ### Approach
 
