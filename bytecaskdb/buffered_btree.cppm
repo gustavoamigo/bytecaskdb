@@ -253,9 +253,11 @@ struct Layers {
     for (std::size_t i = 0; i < nf; ++i) n += f[i].net;
     return n;
   }
-  [[nodiscard]] auto total() const noexcept -> std::size_t {
+  [[nodiscard]] auto total() const noexcept -> std::size_t { return total_from(0); }
+  // Slots from the i-th frozen buffer on, the active one included.
+  [[nodiscard]] auto total_from(std::size_t i) const noexcept -> std::size_t {
     std::size_t n = a.total;
-    for (std::size_t i = 0; i < nf; ++i) n += f[i].total;
+    for (; i < nf; ++i) n += f[i].total;
     return n;
   }
   // Oldest first: a later view's slot is newer than an earlier one's. The
@@ -922,6 +924,11 @@ public:
     bound_ok_ = false;
     if (at_end_) return;
     if (fwd_) {
+      // No buffers: forward() reduces to stepping the tree.
+      if (plain_) {
+        step_tree();
+        return;
+      }
       forward(res);
       return;
     }
@@ -988,7 +995,19 @@ private:
   template <std::size_t, typename> friend class TransientBufferedBlindBTree;
 
   BufferedIterator(Tree tree, Layers l, Start start, Bytes at = {})
-      : tree_{std::move(tree)}, l_{std::move(l)}, start_{start}, start_key_(at.begin(), at.end()) {}
+      : tree_{std::move(tree)}, l_{std::move(l)}, start_{start}, start_key_(at.begin(), at.end()),
+        plain_{l_.total() == 0} {}
+
+  // forward() with no buffer candidate: the tree's next entry, or the end.
+  void step_tree() {
+    if (tf_ == std::default_sentinel) {
+      at_end_ = true;
+      fwd_ = false;
+      return;
+    }
+    take_tree(*tf_, false);
+    ++tf_;
+  }
 
   // Where the entries from here start: the bound it was placed by or its
   // key; none at the end. Valid until the iterator next changes.
@@ -1178,6 +1197,8 @@ private:
   // The inclusive bound a seek placed this iterator at, until it moves.
   std::vector<std::byte> bound_;
   bool bound_ok_{false};
+  // Made over a version with nothing buffered: steps the tree alone.
+  bool plain_{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -1211,6 +1232,9 @@ public:
   template <BlindKeyResolver R>
   [[nodiscard]] auto get(Bytes key, R &res) const -> std::optional<BlindRef> {
     const auto [tree, skip] = effective();
+    // Nothing buffered: the tree holds every entry, and every record it
+    // names is in this version's files.
+    if (l_.total_from(skip) == 0) return tree->get(key, res);
     if (auto s = buffered_detail::newest(l_, key, skip)) {
       if (buffered_detail::is_none(s->ref)) return std::nullopt;
       (void)res.key_at(s->ref);  // the read a lookup's caller takes the entry from
@@ -1331,8 +1355,11 @@ private:
       if (const auto *t = fs_[i]->done.load(std::memory_order_acquire)) return {t, i + 1};
     return {&tree_, 0};
   }
+  // Nothing buffered: an iterator without buffers, which steps the tree
+  // alone, and whose seeks and counts scan no slot.
   [[nodiscard]] auto iter(typename Iter::Start start, Bytes at = {}) const -> Iter {
     const auto [tree, skip] = effective();
+    if (l_.total_from(skip) == 0) return {*tree, Layers{}, start, at};
     return {*tree, skip == 0 ? l_ : l_.from(skip), start, at};
   }
 
