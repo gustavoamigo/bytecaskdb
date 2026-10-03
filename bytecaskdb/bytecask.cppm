@@ -5052,21 +5052,38 @@ auto tail_is_zero(const DataFile &file, Offset end) -> bool {
 //   Refused, in every mode, and the file is left as it was.
 // "Written last" is read off sequences, which no two files share: no other
 // file may start at a higher one. A file whose first header is zero has no
-// sequence to compare; nothing before its stop survives, so it may go whole.
+// sequence to compare. It may be the newest, its first page lost at a power
+// cut and a later one kept, so it goes whole.
+// Either way it is the one file a crash tore, so no other file may need such
+// a cut. The files open handled before this one have their hints by now;
+// the rest are scanned here, before anything is cut.
 void DB::recovery_check_tail(
     const DataFile &file, Offset end,
     const std::vector<std::filesystem::path> &data_paths) {
   if (tail_is_zero(file, end)) return;
   const auto seq = first_sequence(file);
-  if (seq == 0) return;
   for (const auto &other : data_paths) {
     if (other == file.path()) continue;
-    if (first_sequence(*openDataFileForRead(other)) > seq) {
+    const auto other_file = openDataFileForRead(other);
+    if (seq != 0 && first_sequence(*other_file) > seq) {
       throw std::runtime_error{std::format(
           "bytecask: corrupt database — data file '{}' does not parse past "
           "offset {}, and '{}' holds later sequences, so it is not the file a "
           "crash could have torn; refusing to truncate it",
           file.path().string(), end, other.string())};
+    }
+    auto hint = other;
+    hint.replace_extension(".hint");
+    if (std::filesystem::exists(hint)) continue;
+    auto committed = scan_committed(*other_file, 0, OnDamage::Stop);
+    auto it = committed.begin();
+    while (it != std::default_sentinel) ++it;
+    if (!tail_is_zero(*other_file, it.committed_offset())) {
+      throw std::runtime_error{std::format(
+          "bytecask: corrupt database — data files '{}' and '{}' both hold "
+          "data past their last committed record, and a crash can tear only "
+          "the file being written; refusing to truncate either",
+          file.path().string(), other.string())};
     }
   }
 }

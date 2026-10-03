@@ -2074,6 +2074,7 @@ A site whose break nothing has to catch says why instead.
 | `DB::DB`: each directory open creates is synced in its parent | `directory sync: open syncs each directory it creates` | `no_dir_sync_created_dir` | #199 |
 | `recovery_prepare_files`: a hint-less file is rewritten and synced before it is read | `open makes a hint-less file durable before it indexes it: a process killed before its sync` | `open_trusts_page_cache` (chaos) | #240 (#231) |
 | `recovery_check_tail`: a tail is cut only in the newest file | `DB recovery: a hint-less file's tail is truncated only in the newest file` | `tail_cut_in_any_file` | #206 (#138) |
+| `recovery_check_tail`: a tail is cut in one file per open | `DB recovery: a hint-less file's tail is truncated only in the newest file` | `two_torn_files_both_cut` | #303 |
 | `truncate_durably`: the cut's new length is synced | `DB recovery: open fails when the cut of a torn tail cannot be synced, …` | `open_truncate_not_synced` | — |
 | `DataFileIterator`: an entry whose size runs past the file ends the sweep | `resume() does not trust an entry size that runs past the file` | `scan_trusts_entry_size` | #36, ed3ad5df |
 | `recovery_undo_interrupted_vacuum`: only a compacted copy of the other file is removed | `recovery refuses two different writes under one sequence` | `interrupted_vacuum_any_pair` | #137 |

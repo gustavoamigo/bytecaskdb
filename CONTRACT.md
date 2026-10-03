@@ -794,6 +794,23 @@ tests, not through standalone `changes_since` proof tests.
 
 ---
 
+## `open`
+
+Recovers the database a crash or power loss left, on storage that keeps
+its promises, and refuses any other. Proved by the `[recovery]` tests.
+
+| Property | Contract |
+|----------|----------|
+| **Storage assumption** | Bytes an `fdatasync` reported durable stay as written, and so does a synced directory entry. `open` recovers what a crash or power loss leaves on storage that honours this. It does not recover from storage that does not. |
+| **Durability** | Every write acknowledged as durable is in the opened database. `sync = false` writes made after the last sync may be missing; those that survive form a prefix of the write order, and a batch is in whole or not at all. |
+| **Only the active file is cut** | Every other file was synced whole before the next was started, so a crash can tear only the file being written. `open` cuts that file at its last committed record — whole, if its first page was lost — and syncs the cut. A tail of zeros, preallocated space, is trimmed in any file. |
+| **Damage is refused** | A state no crash can leave on such storage is damage. Where `open` can see it, it throws and cuts nothing: data past the last committed record in a file that is not the newest, such data in more than one file, two files sharing sequences other than an interrupted vacuum's pair. `open` does not open a best-effort subset of a damaged database: to the caller that is data loss with no error. |
+| **Damage that cannot be seen** | Damage that leaves exactly what a crash would is outside this contract: `open` cannot refuse what it cannot tell from a torn write. `docs/bytecask_design.md`, *Recovering a Hint-less File*, lists the known shapes. |
+| **Hint files** | A hint is a rebuildable index. One that fails its CRC, or that a read fails on, is rebuilt from its data file and costs no keys. |
+| **`fail_recovery_on_crc_errors = false`** | The operator's explicit opt-out from refusal, for one case: a data file whose hint is bad and that cannot be rescanned is skipped with a warning on stderr, and the database opens without its keys. It does not relax the rules on cutting above. |
+
+---
+
 ## `close`
 
 Shuts the engine down and reports whether the shutdown kept every

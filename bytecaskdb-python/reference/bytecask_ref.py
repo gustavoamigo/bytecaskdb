@@ -654,17 +654,22 @@ class DB:
         paths = sorted(self._dir.glob("*.data"))
         files = [_ScannedFile.read(file_id, path) for file_id, path in enumerate(paths, start=1)]
         newest = max((f.first_sequence for f in files), default=0)
+        # A crash tears only the file being written, so two files with data
+        # after their committed entries are damage.
+        torn = [f.path.name for f in files if f.has_data_past_end]
+        if len(torn) > 1:
+            raise RuntimeError(f"corrupt data files {', '.join(torn)}: more than one holds data past its end")
         for f in sorted(files, key=lambda f: f.first_sequence):
             # Every file but the newest was synced whole before the next one
             # was started. After its committed entries, a file may hold:
             #   - nothing, or zeros (unwritten space): cut;
-            #   - a write a crash tore, in the newest file, or in a file too
-            #     short to hold one header, which holds no acknowledged entry
-            #     (the smallest is 19 bytes): cut;
+            #   - a write a crash tore, in the newest file: cut. A file with
+            #     no first sequence may be the newest, its first page lost at
+            #     a power cut and a later one kept, so it is cut too;
             #   - anything else: damage to acknowledged data, refused.
             is_newest = f.first_sequence == newest
-            too_short_for_a_header = f.size < _HEADER.size
-            if f.has_data_past_end and not (is_newest or too_short_for_a_header):
+            has_no_sequence = f.first_sequence == 0
+            if f.has_data_past_end and not (is_newest or has_no_sequence):
                 raise RuntimeError(f"corrupt data file {f.path.name} past offset {f.end}")
             # The newest may also hold bytes the last process never got to disk.
             if is_newest or f.end < f.size:
