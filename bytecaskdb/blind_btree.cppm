@@ -859,20 +859,33 @@ private:
                      Seek where)
       : tree_{std::move(tree)}, root_{root} {
     stack_.reserve(8);
-    if (!root_ || where == Seek::End)
-      return;
     if (where == Seek::First)
-      descend_leftmost(root_);
-    else
+      seek_first();
+    else if (where == Seek::Last && root_)
       descend_rightmost(root_);
   }
 
-  // The first entry >= target: one read unless the leaf is empty.
   template <BlindKeyResolver R>
   BlindBTreeIterator(PersistentBlindBTree<LeafBytes> tree, const N *root,
                      Bytes target, R &res)
       : tree_{std::move(tree)}, root_{root} {
     stack_.reserve(8);
+    seek(target, res);
+  }
+
+public:
+  // Repositions in place, in the same version: the first entry, past the
+  // last, or the first entry >= target (one read unless the leaf is
+  // empty). For an iterator that seeks often (the buffered tree's merge),
+  // so a seek pins nothing and allocates nothing.
+  void seek_first() {
+    stack_.clear();
+    if (root_)
+      descend_leftmost(root_);
+  }
+  void seek_end() noexcept { stack_.clear(); }
+  template <BlindKeyResolver R> void seek(Bytes target, R &res) {
+    stack_.clear();
     const N *cur = root_;
     while (cur && !cur->is_leaf) {
       const auto idx = cur->child_index(target);
@@ -893,6 +906,7 @@ private:
     }
   }
 
+private:
   static auto fence(const N *n, std::uint32_t i, std::vector<std::byte> &out) -> bool {
     const auto k = n->key(i);
     out.resize(k.size());
