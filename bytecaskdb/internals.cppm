@@ -5,9 +5,11 @@
 
 module;
 #include <algorithm>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -969,6 +971,41 @@ export inline auto key_dir_from_recovered(RecoveryKeyDirTree t) -> KeyDirTree {
 }
 
 #endif // BYTECASK_KEYDIR_BLIND
+
+// Draining a key directory that defers work to a background thread (the
+// buffered tree: buffered_btree.cppm, "Draining"). The tree calls the hook
+// on its own thread once writes pause; the engine's hook freezes what is
+// buffered (kd_freeze_buffer, in a builder under the write lock), waits for
+// the merge without the lock (kd_wait_merged) and publishes the result,
+// returning true to be called again at the next pause when it could not.
+// No-ops for a key directory that defers nothing.
+export template <typename T>
+  requires std::same_as<T, KeyDirTree>
+void kd_set_drain_hook(T &t, std::function<bool()> hook) {
+  if constexpr (requires { t.set_drain_hook(std::move(hook)); })
+    t.set_drain_hook(std::move(hook));
+}
+// Once it returns the hook is never called again.
+export template <typename T>
+  requires std::same_as<T, KeyDirTree>
+void kd_clear_drain_hook(const T &t) {
+  if constexpr (requires { t.clear_drain_hook(); })
+    t.clear_drain_hook();
+}
+export template <typename T>
+  requires std::same_as<T, KeyDirTransient>
+auto kd_freeze_buffer(T &t) -> bool {
+  if constexpr (requires { t.freeze_buffer(); })
+    return t.freeze_buffer();
+  else
+    return false;
+}
+export template <typename T>
+  requires std::same_as<T, KeyDirTree>
+void kd_wait_merged(const T &t) {
+  if constexpr (requires { t.wait_merged(); })
+    t.wait_merged();
+}
 
 // ---------------------------------------------------------------------------
 // EngineState — immutable snapshot of all mutable engine state.

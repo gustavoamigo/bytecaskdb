@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -29,6 +30,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -223,6 +225,7 @@ TEST_CASE("buffered tree matches a map through merges, undos and vacuums",
   std::vector<Version> versions;
   versions.push_back({Tree{}, files, {}});
   std::size_t most_frozen = 0;  // frozen buffers queued behind the merger
+  std::size_t drained_versions = 0;  // versions holding nothing buffered
   const auto by_location_before = Tree::buffer_merge_by_location();
   const auto merged_slots_before = Tree::buffer_merge_slots();
 
@@ -327,7 +330,22 @@ TEST_CASE("buffered tree matches a map through merges, undos and vacuums",
                         std::move(model)});
 
     most_frozen = std::max(most_frozen, versions.back().tree.test_frozen());
-    if (rng() % 8 == 0) versions.back().tree.test_wait_merged();
+    if (rng() % 8 == 0) versions.back().tree.wait_merged();
+    if (rng() % 8 == 0) {
+      // A drain, as the engine runs it once writes pause: freeze, merge,
+      // publish the merge installed. Nothing is left buffered unless a
+      // frozen buffer was still unmerged and the freeze declined.
+      auto d = versions.back().tree.transient();
+      const bool froze = d.freeze_buffer();
+      auto frozen = std::move(d).persistent(Source{rec, cur_files});
+      frozen.wait_merged();
+      auto done = frozen.transient();
+      Version drained{std::move(done).persistent(Source{rec, cur_files}), cur_files,
+                      versions.back().model};
+      if (froze) REQUIRE(drained.tree.buffered_slots() == 0);
+      if (drained.tree.buffered_slots() == 0) ++drained_versions;
+      versions.push_back(std::move(drained));
+    }
     // Check the head and a random older version (read after later merges).
     check_version(versions.back(), rec, rng, universe);
     check_version(versions[rng() % versions.size()], rec, rng, universe);
@@ -336,6 +354,8 @@ TEST_CASE("buffered tree matches a map through merges, undos and vacuums",
   for (const auto &v : versions) check_version(v, rec, rng, universe);
   // Several frozen buffers queued at once, merged in order.
   CHECK(most_frozen >= 2);
+  // Versions with nothing buffered were read too (the plain tree's path).
+  CHECK(drained_versions > 0);
   // Updates and erases reached the tree by location, without a read, and
   // inserts by key: both paths ran.
   const auto by_location = Tree::buffer_merge_by_location() - by_location_before;
@@ -358,13 +378,83 @@ TEST_CASE("buffered tree: a count reads no key per counted entry", "[buffered_bt
     auto b = t.transient();
     b.upsert(to_bytes(k), {1, i}, res, [](const BlindRef &, const BlindRef &) { return true; });
     t = std::move(b).persistent(Source{rec, files});
-    t.test_wait_merged();
+    t.wait_merged();
   }
-  REQUIRE(t.test_buffered() > 0);
+  REQUIRE(t.buffered_slots() > 0);
   res.reads = 0;
   const auto first = t.lower_bound(to_bytes("k000100"), res);
   const auto last = t.lower_bound(to_bytes("k001500"), res);
   REQUIRE(first.count_until(last, 1'000'000, res) == 1400);
   // The tree places each bound: a read or two each, never one per key.
   CHECK(res.reads <= 4);
+}
+
+TEST_CASE("buffered tree: the drain hook runs once publishes pause, not before",
+          "[buffered_btree][drain]") {
+  auto rec = std::make_shared<Records>();
+  auto files = std::make_shared<const Files>(Files{1});
+  Resolver res{rec, files, {}, 0};
+  // The published version, as the engine keeps it: replaced under a lock
+  // by writes and by the hook.
+  std::mutex mu;
+  Tree published;
+  int calls = 0;
+  published.set_drain_hook([&] {
+    std::unique_lock<std::mutex> lk{mu};
+    ++calls;
+    auto b = published.transient();
+    const bool froze = b.freeze_buffer();
+    published = std::move(b).persistent(Source{rec, files});
+    if (!froze) return false;
+    const auto frozen = published;
+    lk.unlock();
+    frozen.wait_merged();  // without the lock
+    lk.lock();
+    published = published.transient().persistent(Source{rec, files});
+    return false;
+  });
+  // Cleared before `published` goes, however the test leaves.
+  struct Unhook {
+    Tree &t;
+    ~Unhook() { t.clear_drain_hook(); }
+  } unhook{published};
+  const auto write = [&](std::uint32_t i) {
+    const auto k = std::format("k{:06d}", i);
+    {
+      std::lock_guard<std::mutex> lk{rec->mu};
+      rec->keys[pack({1, i})] = k;
+    }
+    std::lock_guard<std::mutex> lk{mu};
+    auto b = published.transient();
+    b.upsert(to_bytes(k), {1, i}, res, [](const BlindRef &, const BlindRef &) { return true; });
+    published = std::move(b).persistent(Source{rec, files});
+  };
+  const auto slots = [&] {
+    std::lock_guard<std::mutex> lk{mu};
+    return published.buffered_slots();
+  };
+  const auto wait_drained = [&] {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{20};
+    while (slots() != 0 && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    return slots() == 0;
+  };
+
+  // Nothing written, nothing to drain: the hook is never called.
+  std::this_thread::sleep_for(std::chrono::milliseconds{50});
+  CHECK(calls == 0);
+  for (std::uint32_t i = 0; i < 100; ++i) write(i);
+  REQUIRE(wait_drained());
+  const auto after_first = calls;
+  CHECK(after_first >= 1);
+  // Drained: the hook is not called again until something is written.
+  std::this_thread::sleep_for(std::chrono::milliseconds{50});
+  CHECK(calls == after_first);
+  write(1000);
+  REQUIRE(wait_drained());
+  {
+    std::lock_guard<std::mutex> lk{mu};
+    CHECK(published.size() == 101);
+    CHECK(published.get(to_bytes("k001000"), res) == BlindRef{1, 1000});
+  }
 }

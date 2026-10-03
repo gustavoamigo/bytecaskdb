@@ -32,6 +32,24 @@
 // froze itself, none of them handed over yet, merges the oldest on the
 // spot.
 //
+// Draining. A buffer freezes when it is full, so once writes stop the last
+// slots would stay buffered, and every read near them would order them among
+// the tree's keys. Instead every publish installs the merges that have
+// finished, and the merger thread watches for writes to pause: once a
+// version holding buffered slots is published and no builder publishes for
+// kIdleWindow, it calls the drain hook the engine set. The engine then
+// freezes A (freeze_buffer, only when no frozen buffer is left unmerged,
+// so draining never brings a writer closer to backpressure), waits for the
+// merge without its write lock (wait_merged), and publishes the merge
+// installed: a version with nothing buffered, which reads as the plain tree.
+// The freeze and the install each take the write lock for O(1) work. A
+// commit arriving meanwhile proceeds as usual and installs the merge itself
+// if it has finished. A hook that finds a commit in flight publishes nothing
+// and returns true; the merger tries again at the next pause. Commits pay no
+// signal: a publish bumps a counter, and takes the merger's lock only when
+// the version it publishes goes from nothing buffered to something buffered
+// or back. Nothing buffered, nothing to watch: the merger sleeps.
+//
 // Displaced records. Every slot also records the record it displaced. The
 // tree keeps entries a buffer overrides until the merge, and the record
 // behind one may be gone — vacuum relocates a file's keys (appending slots)
@@ -214,6 +232,15 @@ struct Slot {
 // the writer, 10 us a commit, though the merger was a third idle. Each more
 // costs every point lookup one more fingerprint scan while it is unmerged.
 inline constexpr std::size_t kMaxFrozen = 3;
+
+// How long writes must pause before the merger drains the buffers. Short
+// enough that reads after a burst soon cost what the plain tree's do, long
+// enough that a steady stream of commits does not freeze a buffer per
+// commit. A build-time define overrides it, for measurement only.
+#ifndef BYTECASK_BUFFER_IDLE_MS
+#define BYTECASK_BUFFER_IDLE_MS 2
+#endif
+inline constexpr std::chrono::milliseconds kIdleWindow{BYTECASK_BUFFER_IDLE_MS};
 
 // A version's buffers: the frozen ones, oldest first, and the active one.
 struct Layers {
@@ -548,10 +575,50 @@ public:
 
   // Waits until no merge is queued or running. A builder about to derive a
   // tree itself calls it, so no merge for a discarded version still holds a
-  // tree derived from the same base.
+  // tree derived from the same base; so does the drain, for the merge of the
+  // buffer it froze. While no merge is running the caller runs the queued
+  // ones itself, as wait() does: the merger thread may be the caller (the
+  // drain hook), or blocked in the hook on the write lock the caller holds.
   void drain() {
     std::unique_lock<std::mutex> lk{mu_};
-    cv_.wait(lk, [&] { return jobs_.empty() && !running_; });
+    while (!jobs_.empty() || running_) {
+      if (running_) {
+        cv_.wait(lk);
+        continue;
+      }
+      auto job = std::move(jobs_.front());
+      jobs_.pop_front();
+      execute(job, lk);
+    }
+  }
+
+  // The drain hook (see "Draining" above), called on the merger thread.
+  // Replacing or clearing it waits for a call in progress, so once
+  // clear_drain_hook returns the hook is never called again: its owner may
+  // go. Never call either from the hook.
+  void set_drain_hook(std::function<bool()> hook) {
+    std::unique_lock<std::mutex> lk{mu_};
+    cv_.wait(lk, [&] { return !hook_running_; });
+    hook_ = std::move(hook);
+  }
+  void clear_drain_hook() { set_drain_hook(nullptr); }
+
+  // A builder published a version; `buffered`: it holds buffered slots.
+  // Called for every publish, so it only counts, unless the version goes
+  // from nothing buffered to something buffered (the merger starts watching
+  // for writes to pause) or back.
+  void note_publish(bool buffered) {
+    publishes_.fetch_add(1, std::memory_order_relaxed);
+    if (armed_.load(std::memory_order_relaxed) == buffered) return;
+#ifndef BYTECASK_SINGLE_THREADED
+    {
+      std::lock_guard<std::mutex> lk{mu_};
+      armed_.store(buffered, std::memory_order_relaxed);
+      if (!buffered || !hook_) return;
+      if (!thread_.joinable()) thread_ = std::thread{[this] { run(); }};
+    }
+    cv_.notify_all();
+#endif
   }
 
   // Folds a frozen buffer into base, reading records through the buffers
@@ -651,6 +718,11 @@ public:
   [[nodiscard]] static auto merge_by_location() noexcept -> std::int64_t {
     return merge_by_location_.load(std::memory_order_relaxed);
   }
+  // Buffers frozen by a drain rather than by filling up.
+  [[nodiscard]] static auto drains() noexcept -> std::int64_t {
+    return drains_.load(std::memory_order_relaxed);
+  }
+  static void count_drain() noexcept { drains_.fetch_add(1, std::memory_order_relaxed); }
 
 private:
   struct Job {
@@ -676,6 +748,9 @@ private:
     }
     running_ = true;
     lk.unlock();
+#ifdef BYTECASK_TESTING
+    if (auto *f = test_before_merge_.load(std::memory_order_acquire)) f();
+#endif
     std::optional<Tree> merged;
     if (!error) {
       try {
@@ -702,15 +777,53 @@ private:
     cv_.notify_all();
   }
 
+  [[nodiscard]] auto runnable() const -> bool { return !jobs_.empty() && !running_; }
+  // A version with buffered slots was published and there is a hook to
+  // drain it. Under mu_.
+  [[nodiscard]] auto watching() const -> bool {
+    return armed_.load(std::memory_order_relaxed) && hook_ != nullptr;
+  }
+
+  // Merges in order, and drains once writes pause. Sleeps while there is
+  // neither a merge to run nor a buffered version to watch.
   void run() {
     std::unique_lock<std::mutex> lk{mu_};
     for (;;) {
-      cv_.wait(lk, [&] { return stop_ || (!jobs_.empty() && !running_); });
-      if (stop_ && (jobs_.empty() || running_)) return;
-      auto job = std::move(jobs_.front());
-      jobs_.pop_front();
-      execute(job, lk);
+      cv_.wait(lk, [&] { return stop_ || runnable() || watching(); });
+      if (stop_ && !runnable()) return;
+      if (runnable()) {
+        auto job = std::move(jobs_.front());
+        jobs_.pop_front();
+        execute(job, lk);
+        continue;
+      }
+      if (!writes_paused(lk)) continue;
+      // Cleared before the call: every publish the hook makes sets it again
+      // from what it published, and a builder that publishes after the
+      // hook's last one finds it clear and arms it again.
+      armed_.store(false, std::memory_order_relaxed);
+      hook_running_ = true;
+      lk.unlock();
+      bool again = false;
+      try {
+        again = hook_();
+      } catch (...) {
+        // The hook's owner handles its own failures.
+      }
+      lk.lock();
+      hook_running_ = false;
+      if (again) armed_.store(true, std::memory_order_relaxed);
+      cv_.notify_all();
     }
+  }
+
+  // Waits out the idle window. True when no builder published during it and
+  // there is still something to drain and no merge to run.
+  auto writes_paused(std::unique_lock<std::mutex> &lk) -> bool {
+    const auto seen = publishes_.load(std::memory_order_relaxed);
+    if (cv_.wait_for(lk, buffered_detail::kIdleWindow, [&] { return stop_ || runnable(); }))
+      return false;
+    return publishes_.load(std::memory_order_relaxed) == seen && !running_ && watching();
   }
 
   std::mutex mu_;
@@ -718,6 +831,14 @@ private:
   std::deque<Job> jobs_;
   bool running_{false};
   bool stop_{false};
+  // Under mu_; called with hook_running_ set. Returns true when it drained
+  // nothing because writes resumed: retried at the next pause.
+  std::function<bool()> hook_;
+  bool hook_running_{false};
+  // Whether the last version a builder published holds buffered slots.
+  // Changed under mu_; read without it by note_publish.
+  std::atomic<bool> armed_{false};
+  std::atomic<std::uint64_t> publishes_{0};
   std::atomic<std::uint64_t> next_id_{1};
   std::shared_ptr<buffered_detail::BufferRecycler> pool_{
       std::make_shared<buffered_detail::BufferRecycler>()};
@@ -728,6 +849,15 @@ private:
   static inline std::atomic<std::int64_t> merge_ns_{0};
   static inline std::atomic<std::int64_t> merge_slots_{0};
   static inline std::atomic<std::int64_t> merge_by_location_{0};
+  static inline std::atomic<std::int64_t> drains_{0};
+#ifdef BYTECASK_TESTING
+public:
+  // Called on the thread about to run a merge, without the lock: a test
+  // holds merges back with it.
+  static inline std::atomic<void (*)()> test_before_merge_{nullptr};
+
+private:
+#endif
   std::thread thread_;  // last: joined before the rest is destroyed
 };
 
@@ -1153,14 +1283,36 @@ public:
     return Merger::merge_by_location();
   }
 
-#ifdef BYTECASK_TESTING
-  // Waits for every merge handed over so far.
-  void test_wait_merged() const {
+  [[nodiscard]] static auto buffer_drains() noexcept -> std::int64_t { return Merger::drains(); }
+
+  // Slots this version holds in its buffers, frozen ones included until a
+  // version installs their merge (a gauge: 0 once drained).
+  [[nodiscard]] auto buffered_slots() const noexcept -> std::size_t { return l_.total(); }
+  // Waits for every merge handed over so far, running queued ones on this
+  // thread while none is running.
+  void wait_merged() const {
     if (merger_) merger_->drain();
   }
-  // Slots this version sees in its buffers, and how many are frozen.
-  [[nodiscard]] auto test_buffered() const -> std::size_t { return l_.total(); }
+  // Sets the hook the merger thread calls once writes pause (see "Draining"
+  // at the top), for this version and every version derived from it. Set it
+  // before the version is published.
+  void set_drain_hook(std::function<bool()> hook) {
+    if (!merger_) merger_ = std::make_shared<Merger>();
+    merger_->set_drain_hook(std::move(hook));
+  }
+  // Clears it, waiting for a call in progress: once this returns the hook is
+  // never called again. Not from the hook.
+  void clear_drain_hook() const {
+    if (merger_) merger_->clear_drain_hook();
+  }
+
+#ifdef BYTECASK_TESTING
+  // How many of this version's buffers are frozen.
   [[nodiscard]] auto test_frozen() const -> std::size_t { return l_.nf; }
+  // f runs before every merge, on the thread running it (null: none).
+  static void test_set_before_merge(void (*f)()) noexcept {
+    Merger::test_before_merge_.store(f, std::memory_order_release);
+  }
 #endif
 
 private:
@@ -1278,14 +1430,30 @@ public:
   // Publishes. The buffers this builder froze go to the merger, oldest
   // first, each chained to the one before it, with `src` to read the
   // records of the version being published.
+  // Every finished merge is installed first: it costs nothing, and a version
+  // whose buffers are all merged then reads as the plain tree.
   [[nodiscard]] auto persistent(RS src) && -> BufferedBlindBTree<LeafBytes, RS> {
+    install_finished();
     for (auto i = l_.nf - here_; i < l_.nf; ++i) {
       if (i == 0)
         merger_->submit(tree_, nullptr, l_.f[i], l_.from(i), fs_[i], src);
       else
         merger_->submit(std::nullopt, fs_[i - 1], l_.f[i], l_.from(i), fs_[i], src);
     }
+    merger_->note_publish(l_.total() > 0);
     return {std::move(merger_), std::move(tree_), std::move(l_), std::move(fs_)};
+  }
+
+  // The drain's freeze: A joins the frozen buffers, to be merged once this
+  // builder is published. Only when no frozen buffer is left unmerged, so
+  // a drain never adds to a queue a writer could have to wait on. Returns
+  // whether it froze.
+  auto freeze_buffer() -> bool {
+    install_finished();
+    if (l_.nf != 0 || l_.a.total == 0) return false;
+    freeze_active();
+    Merger::count_drain();
+    return true;
   }
 
 private:
@@ -1340,13 +1508,7 @@ private:
   template <BlindKeyResolver R> auto make_room(Bytes key, R &res) -> bool {
     if (has_room(key, buffered_detail::kBufferSlots)) return false;
     bool merged = false;
-    // Finished merges cost nothing to install.
-    while (l_.nf > here_) {
-      auto done = merger_->ready(*fs_[0]);
-      if (!done) break;
-      retire_oldest(std::move(*done));
-      tree_owned_ = false;
-    }
+    install_finished();
     if (l_.nf == buffered_detail::kMaxFrozen) {
       if (here_ == l_.nf) {
         merger_->drain();  // no merge for a discarded version shares our base
@@ -1359,6 +1521,23 @@ private:
         tree_owned_ = false;
       }
     }
+    freeze_active();
+    return merged;
+  }
+
+  // Installs the merges that have finished, oldest first: free.
+  void install_finished() {
+    while (l_.nf > here_) {
+      auto done = merger_->ready(*fs_[0]);
+      if (!done) break;
+      retire_oldest(std::move(*done));
+      tree_owned_ = false;
+    }
+  }
+
+  // A joins the frozen buffers and a fresh buffer becomes A. Needs a free
+  // frozen place.
+  void freeze_active() {
     const_cast<Buffer &>(*l_.a.buf).written.store(buffered_detail::kFrozen,
                                                  std::memory_order_relaxed);
     auto state = std::make_shared<Frozen>();
@@ -1370,7 +1549,6 @@ private:
     ++l_.nf;
     ++here_;
     l_.a = View{merger_->acquire()};
-    return merged;
   }
 
   void write_slot(Bytes key, BlindRef ref, BlindRef displaced) {

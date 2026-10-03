@@ -24,6 +24,7 @@
 #include <format>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -9420,6 +9421,8 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.keydir_buffer_merge_us",
       "bytecask.keydir_buffer_merge_slots",
       "bytecask.keydir_buffer_merge_by_location",
+      "bytecask.keydir_buffer_slots",
+      "bytecask.keydir_buffer_drains",
 #endif
   };
   for (const auto &name : expected) {
@@ -11668,3 +11671,299 @@ TEST_CASE("pipeline: publishing a state that owes an fdatasync degrades the "
   const auto s = db.engine_state();
   CHECK(s->durable_seq >= s->sync_requested_seq);
 }
+
+// ---------------------------------------------------------------------------
+// Draining the key directory's write buffer once writes pause
+// (buffered_btree.cppm, "Draining"). The model test runs on every key
+// directory; the others look at the buffer and need the buffered one.
+// ---------------------------------------------------------------------------
+namespace {
+
+// The DB's contents, by a full scan.
+auto scan_all(const bytecask::DB &db) -> std::map<std::string, std::string> {
+  std::map<std::string, std::string> kv;
+  for (auto &entry : db.iter_from({}))
+    kv[to_string(entry.key)] = to_string(entry.value);
+  return kv;
+}
+
+// Every read path agrees with the model: point reads, a forward and a
+// reverse scan, and counts.
+void check_reads(const bytecask::DB &db, const std::map<std::string, std::string> &model) {
+  for (const auto &[k, v] : model) {
+    INFO("key=" << k);
+    CHECK(get_str(db, to_bytes(k)) == v);
+  }
+  CHECK(scan_all(db) == model);
+  std::vector<std::string> back;
+  for (const auto &k : db.rkeys_from({})) back.push_back(to_string(k));
+  std::vector<std::string> want;
+  for (const auto &[k, v] : model) want.push_back(k);
+  std::ranges::reverse(want);
+  CHECK(back == want);
+  const auto snap = db.snapshot();
+  CHECK(snap.count_keys(to_bytes(""), to_bytes("\xff"), 1'000'000) == model.size());
+  if (model.size() > 2) {
+    const auto lo = std::next(model.begin())->first;
+    const auto hi = std::prev(model.end())->first;
+    CHECK(snap.count_keys(to_bytes(lo), to_bytes(hi), 1'000'000) == model.size() - 2);
+  }
+}
+
+} // namespace
+
+TEST_CASE("Recovery model-based: writes and vacuums with key directory drains "
+          "between them",
+          "[bytecask][recovery][parallel][model][drain]") {
+  // Bursts of writes, each followed by a pause long enough for a buffered
+  // key directory to drain (and a vacuum, now and then). After every pause
+  // the open DB reads as the model; at the end, serial and parallel
+  // recovery agree with the model and with each other.
+  std::mt19937 gen(24680);
+  const auto rand_key = [&] { return std::format("k{:03d}", gen() % 120); };
+  const auto rand_value = [&] { return std::format("v{}", gen() % 100000); };
+
+  TempDir td;
+  const auto db_path = td.path / "db";
+  std::map<std::string, std::string> model;
+  {
+    auto db = bytecask::DB::open(db_path, {.max_file_bytes = 512});
+    for (int burst = 0; burst < 40; ++burst) {
+      const auto n = 1 + gen() % 30;
+      for (std::uint32_t i = 0; i < n; ++i) {
+        const auto op = gen() % 10;
+        if (op < 6) {
+          const auto k = rand_key();
+          const auto v = rand_value();
+          db.put({.sync = false}, to_bytes(k), to_bytes(v));
+          model[k] = v;
+        } else if (op < 8) {
+          const auto k = rand_key();
+          (void)db.del({.sync = false}, to_bytes(k));
+          model.erase(k);
+        } else if (op < 9) {
+          bytecask::WritePlan plan;
+          for (int b = 0; b < 4; ++b) {
+            const auto k = rand_key();
+            if (gen() % 4 == 0) {
+              plan.del(to_bytes(k));
+              model.erase(k);
+            } else {
+              const auto v = rand_value();
+              plan.put(to_bytes(k), to_bytes(v));
+              model[k] = v;
+            }
+          }
+          (void)db.apply_batch({.sync = false}, std::move(plan));
+        } else {
+          auto from = rand_key();
+          auto to = rand_key();
+          if (to < from) std::swap(from, to);
+          db.del_range({.sync = false}, to_bytes(from), to_bytes(to));
+          model.erase(model.lower_bound(from), model.lower_bound(to));
+        }
+      }
+      if (burst % 5 == 4) (void)db.vacuum({.fragmentation_threshold = 0.2});
+      std::this_thread::sleep_for(std::chrono::milliseconds{gen() % 4 == 0 ? 0 : 25});
+      check_reads(db, model);
+    }
+  }
+
+  std::vector<FileStatsTuple> serial_stats_vals;
+  {
+    const auto p = td.path / "serial_baseline";
+    std::filesystem::copy(db_path, p, std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 512, .recovery_threads = 1});
+    check_reads(db, model);
+    serial_stats_vals = collect_file_stats(db);
+  }
+  SECTION("serial recovery") {
+    const auto p = td.path / "s1";
+    std::filesystem::copy(db_path, p, std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 512, .recovery_threads = 1});
+    CHECK(scan_all(db) == model);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
+  }
+  SECTION("parallel recovery (4 workers)") {
+    const auto p = td.path / "p4";
+    std::filesystem::copy(db_path, p, std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(p, {.max_file_bytes = 512, .recovery_threads = 4});
+    CHECK(scan_all(db) == model);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
+  }
+}
+
+#ifdef BYTECASK_KEYDIR_BUFFERED
+namespace {
+
+auto buffered_slots(const bytecask::DB &db) -> std::int64_t {
+  return db.stats().at("bytecask.keydir_buffer_slots");
+}
+
+// Waits until the published key directory holds nothing buffered.
+auto wait_drained(const bytecask::DB &db) -> bool {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{20};
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (buffered_slots(db) == 0) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  return false;
+}
+
+// Holds every merge back, on whatever thread runs it, until opened.
+struct MergeGate {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool closed{false};
+  int held{0};  // merges that reached the gate while it was closed
+
+  static auto instance() -> MergeGate & {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+    static MergeGate gate;
+#pragma clang diagnostic pop
+    return gate;
+  }
+  static void pass() {
+    auto &g = instance();
+    std::unique_lock<std::mutex> lk{g.mu};
+    if (!g.closed) return;
+    ++g.held;
+    g.cv.notify_all();
+    g.cv.wait(lk, [&] { return !g.closed; });
+  }
+  void close() {
+    std::lock_guard<std::mutex> lk{mu};
+    closed = true;
+    held = 0;
+    bytecask::KeyDirTree::test_set_before_merge(&MergeGate::pass);
+  }
+  void open() {
+    {
+      std::lock_guard<std::mutex> lk{mu};
+      closed = false;
+    }
+    cv.notify_all();
+  }
+  // Waits until a merge is held at the gate.
+  auto wait_held() -> bool {
+    std::unique_lock<std::mutex> lk{mu};
+    return cv.wait_for(lk, std::chrono::seconds{20}, [&] { return held > 0; });
+  }
+};
+
+// Opens the gate and unhooks it when the test leaves, however it leaves.
+struct GateGuard {
+  MergeGate &gate{MergeGate::instance()};
+  GateGuard() = default;
+  GateGuard(const GateGuard &) = delete;
+  auto operator=(const GateGuard &) -> GateGuard & = delete;
+  ~GateGuard() {
+    gate.open();
+    bytecask::KeyDirTree::test_set_before_merge(nullptr);
+  }
+};
+
+} // namespace
+
+TEST_CASE("buffered key directory: drained once writes pause",
+          "[bytecask][buffered][drain]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  const auto drains_before = db.stats().at("bytecask.keydir_buffer_drains");
+  std::map<std::string, std::string> model;
+  for (int round = 0; round < 3; ++round) {
+    for (int i = 0; i < 40; ++i) {
+      const auto k = std::format("k{:03d}", (i * 7 + round * 13) % 100);
+      const auto v = std::format("v{}-{}", round, i);
+      db.put({.sync = i % 8 == 0}, to_bytes(k), to_bytes(v));
+      model[k] = v;
+    }
+    for (int i = 0; i < 5; ++i) {
+      const auto k = std::format("k{:03d}", (i * 11 + round) % 100);
+      (void)db.del({.sync = false}, to_bytes(k));
+      model.erase(k);
+    }
+    // The last writes are buffered; a pause drains them, within the idle
+    // window plus a merge.
+    REQUIRE(wait_drained(db));
+    check_reads(db, model);
+  }
+  CHECK(db.stats().at("bytecask.keydir_buffer_drains") > drains_before);
+}
+
+TEST_CASE("buffered key directory: a commit during a drain does not wait for "
+          "its merge",
+          "[bytecask][buffered][drain][concurrency]") {
+  GateGuard guard;
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  std::map<std::string, std::string> model;
+  const auto put = [&](const std::string &k, const std::string &v, bool sync) {
+    db.put({.sync = sync}, to_bytes(k), to_bytes(v));
+    model[k] = v;
+  };
+  // Fewer writes than a buffer holds: the only merge is the drain's.
+  put("a", "1", false);
+  put("b", "1", false);
+  put("c", "1", true);
+  REQUIRE(wait_drained(db));
+  guard.gate.close();
+  put("a", "2", false);
+  put("d", "2", false);
+  // The pause freezes them and the drain's merge is held at the gate.
+  REQUIRE(guard.gate.wait_held());
+
+  // Commits and reads go on while it is held: they neither wait for the
+  // merge nor lose sight of the frozen buffer.
+  put("b", "3", true);
+  put("e", "3", false);
+  (void)db.del({.sync = false}, to_bytes("c"));
+  model.erase("c");
+  check_reads(db, model);
+  CHECK(buffered_slots(db) > 0);
+
+  guard.gate.open();
+  REQUIRE(wait_drained(db));
+  check_reads(db, model);
+}
+
+TEST_CASE("buffered key directory: vacuum while a drain's merge is running",
+          "[bytecask][buffered][drain][vacuum]") {
+  GateGuard guard;
+  TempDir td;
+  const auto opts = bytecask::Options{.max_file_bytes = 256};
+  std::map<std::string, std::string> model;
+  {
+    auto db = bytecask::DB::open(td.path / "db", opts);
+    // Two rounds of the same keys: the first round's files are mostly dead.
+    for (int round = 0; round < 2; ++round)
+      for (int i = 0; i < 24; ++i) {
+        const auto k = std::format("k{:02d}", i);
+        const auto v = std::format("value-{}-{:02d}", round, i);
+        db.put({.sync = false}, to_bytes(k), to_bytes(v));
+        model[k] = v;
+      }
+    REQUIRE(wait_drained(db));
+
+    guard.gate.close();
+    db.put({.sync = false}, to_bytes("k00"), to_bytes("late"));
+    model["k00"] = "late";
+    REQUIRE(guard.gate.wait_held());
+
+    // Vacuum relocates live keys and drops a file while the frozen buffer
+    // is unmerged; it must not wait for that merge either.
+    auto vac = std::async(std::launch::async, [&] {
+      return db.vacuum({.fragmentation_threshold = 0.1});
+    });
+    const bool finished = vac.wait_for(std::chrono::seconds{20}) == std::future_status::ready;
+    guard.gate.open();
+    REQUIRE(finished);
+    CHECK(vac.get());
+    REQUIRE(wait_drained(db));
+    check_reads(db, model);
+  }
+  auto db = bytecask::DB::open(td.path / "db", opts);
+  check_reads(db, model);
+}
+#endif // BYTECASK_KEYDIR_BUFFERED
