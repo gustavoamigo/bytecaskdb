@@ -283,6 +283,14 @@ public:
   void read_at(std::uint32_t file_id, PoolFile file, std::uint64_t offset,
                std::size_t len, std::size_t file_size, std::byte *dst);
 
+  // read_at, except that the file ending first is not an error: returns how
+  // many bytes from offset were read, short only where the file ends. Only
+  // frames read whole are admitted. Throws std::system_error if a read fails.
+  [[nodiscard]] auto read_upto(std::uint32_t file_id, PoolFile file,
+                               std::uint64_t offset, std::size_t len,
+                               std::size_t file_size, std::byte *dst)
+      -> std::size_t;
+
   // Lends the resident bytes from offset to the end of its frame, or to
   // file_size if that comes first, without copying: the returned span points
   // into the frame and lease holds the pin that keeps it valid. Empty if the
@@ -697,14 +705,28 @@ private:
 void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
                          std::uint64_t offset, std::size_t len,
                          std::size_t file_size, std::byte *dst) {
-  if (len == 0) return;
+  if (read_upto(file_id, file, offset, len, file_size, dst) < len) {
+    throw std::system_error{
+        EIO, std::generic_category(),
+        std::format("BufferPool::read_at: file {} is shorter than the "
+                    "requested range [{}, {})",
+                    file_id, offset, offset + len)};
+  }
+}
+
+auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
+                           std::uint64_t offset, std::size_t len,
+                           std::size_t file_size, std::byte *dst)
+    -> std::size_t {
+  if (len == 0) return 0;
 
   // An oversize entry would evict the working set to hold one value. It
   // lands in the caller's buffer, which is not aligned, so never O_DIRECT.
-  if (len > oversize_limit_) {
-    pread_exact(file.buffered, offset, {dst, len});
-    return;
-  }
+  if (len > oversize_limit_) return pread_upto(file.buffered, offset, {dst, len});
+
+  // Where the bytes delivered from offset stop: the first end of file a fill
+  // meets, or the end of what file_size covers.
+  auto avail = offset + len;
 
   const auto first = offset / kPoolFrameBytes;
   const auto last = (offset + len - 1) / kPoolFrameBytes;
@@ -720,8 +742,10 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
     const auto from = std::max(offset, run_start);
     const auto to = std::min<std::uint64_t>(offset + len, (b + 1) * kPoolFrameBytes);
     if (run_end <= run_start) {  // entirely past the size we were given
-      pread_exact(file.buffered, from,
-                  {dst + (from - offset), static_cast<std::size_t>(to - from)});
+      const auto got = pread_upto(
+          file.buffered, from,
+          {dst + (from - offset), static_cast<std::size_t>(to - from)});
+      avail = std::min(avail, from + got);
       return;
     }
     // Declared on the miss path so a hit never touches thread-local storage.
@@ -732,24 +756,25 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
 #pragma clang diagnostic pop
     const auto run_len = static_cast<std::size_t>(run_end - run_start);
     auto *buf = scratch.ensure(align_up(run_len, kPoolFrameBytes));
+    auto got = run_len;
     if (file.direct < 0 || !pread_direct(file.direct, buf, run_len, run_start)) {
-      pread_exact(file.buffered, run_start, {buf, run_len});
+      got = pread_upto(file.buffered, run_start, {buf, run_len});
     }
-    if (to > run_end) {
-      throw std::system_error{
-          EIO, std::generic_category(),
-          std::format("BufferPool::read_at: file {} is shorter than the "
-                      "requested range [{}, {})",
-                      file_id, offset, offset + len)};
+    // The file can end below file_size: the active file's logical end is
+    // loaded before resume() cuts the file under it (#246).
+    const auto have = run_start + got;
+    if (to > have) avail = std::min(avail, have);
+    if (std::min(to, have) > from) {
+      std::memcpy(dst + (from - offset), buf + (from - run_start),
+                  static_cast<std::size_t>(std::min(to, have) - from));
     }
-    std::memcpy(dst + (from - offset), buf + (from - run_start),
-                static_cast<std::size_t>(to - from));
 
     std::lock_guard<std::mutex> lk{mu_};
     for (auto f = a; f <= b; ++f) {
       const auto frame_start = f * kPoolFrameBytes;
       // Only whole frames are admitted; a short tail frame stays uncached.
-      if (frame_start + kPoolFrameBytes > file_size) break;
+      if (frame_start + kPoolFrameBytes > std::min<std::uint64_t>(file_size, have))
+        break;
       // Unvisited: the miss that brought it in is its first read, and what
       // earns it a place is a second one. Admitted visited, a frame read once
       // would survive a whole pass of the hand and SIEVE would be CLOCK.
@@ -803,6 +828,7 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
   }
   if (in_run) fill_missing(run_start, last);
   (any_miss ? counters_.misses : counters_.hits).add(1);
+  return avail > offset ? static_cast<std::size_t>(avail - offset) : 0;
 }
 
 auto BufferPool::view(std::uint32_t file_id, std::uint64_t offset,
