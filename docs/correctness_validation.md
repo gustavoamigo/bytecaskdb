@@ -2627,7 +2627,7 @@ The proof matrix makes a structural independence assumption: the
 correctness of a transition depends only on operation types and their
 ordering, not on the specific key bytes, value bytes, or value sizes.
 Every test uses one fixed set of symbolic values (`"new0"`, `"v0"`,
-etc.) across all 800 matrix cells. If some code path accidentally
+etc.) across all 2,082 matrix cells. If some code path accidentally
 depends on value content — a length-dependent branch, a key that
 collides with an internal sentinel, or a value size that crosses a
 buffer boundary — the current matrix would not catch it.
@@ -2638,17 +2638,12 @@ class.
 
 ### Approach
 
-The delta model produces 18 structurally distinct deltas across 800
-matrix cells. These collapse further:
-
-- 2 "empty deltas" (nothing written) — failure cases. No value
-  independence to validate.
-- 4 "remove-only deltas" — no new values written. Value independence
-  is trivially true, but **key-byte independence** is testable.
-- 12 "value-writing deltas" — these come in 6 SUCCESS/H pairs
-  (identical except `degraded`/`threw` flags).
-
-The real cardinality for property-based testing is:
+Only a transition that lands has values to be independent of: the
+SUCCESS, NOSYNC and H cells, 535 of the 2,082. Their deltas differ only
+in the `degraded`/`threw` flags and in what a power cut may take, and
+the solo, guarded and observer variants of a plan leave its delta
+unchanged, so the 19 plan shapes that write (the conflicting plan writes
+nothing) collapse to 13 structurally distinct deltas:
 
 | # | Delta shape | seq_advance | Representative plan |
 |---|-------------|-------------|---------------------|
@@ -2658,65 +2653,75 @@ The real cardinality for property-based testing is:
 | 4 | 1 added + 1 removed, 1 value | 4 | `mixed_batch` |
 | 5 | 2 added, 2 values | 4 | `multi_put` |
 | 6 | 3 added, 3 values | 5 | `large_batch` |
-
-Plus 2 remove-only deltas for key-byte independence:
-
 | 7 | 0 added, 1 removed | 1 | `single_delete` |
 | 8 | 0 added, 1 removed | 4 | `causality_put_del` |
+| 9 | 1 changed, 1 value | 1 | `sequential_overwrite` |
+| 10 | 1 changed, 1 value | 4 | `causality_del_put` |
+| 11 | every key in the range removed | 1 | `range_del` |
+| 12 | range removed, 1 key put back | 4 | `range_del_then_put` |
+| 13 | range removed, the put with it | 4 | `put_then_range_del` |
 
-**8 property tests** total.
+**13 property tests** total.
 
 ### What each property test does
 
 For each distinct delta:
-1. Generate random key bytes and value bytes (varying lengths,
-   binary content, edge sizes near buffer boundaries).
-2. Run the corresponding plan against the real engine.
-3. Assert the structural delta matches `expected_delta`'s prediction
-   — same key membership, same seq_advance, same causal ordering.
+1. Generate a starting state, the plan's keys and values, and how the
+   DB is opened.
+2. Run the plan against the real engine.
+3. Assert the whole DB equals a dict the same operations were applied
+   to — in the live DB, and after serial and 4-thread recovery — and
+   that the sequence advanced by the plan's entry count.
 
-This directly tests: "for a given plan shape and failure class, the
-engine produces the same structural delta regardless of what concrete
-bytes the keys and values contain."
+The comparison is of the whole DB, by `iter_from`, `riter_from`,
+`keys_from` and a `get` of every key, not of the plan's keys alone: a
+key misplaced because of its bytes shows up as damage to a neighbour.
+
+What is generated is chosen for the code that could depend on it:
+
+- **Keys that share a prefix.** The blind-leaf key directory holds no
+  key bytes, only a crit bit and a fingerprint per key, and reads a
+  neighbour's record to place a key. Uniformly random keys diverge in
+  their first byte and exercise none of that. The keys of one example
+  share a prefix (empty, short, or within a few bytes of
+  `max_key_bytes`) and differ in a suffix of up to six bytes over
+  `{00, 01, 80, FF}`, so they are prefixes of one another and differ in
+  a single bit. The empty key is included.
+- **A populated starting state.** Empty, up to a dozen keys, or 170 to
+  290 sharing the prefix — several leaves' worth — so the plan's keys
+  land among neighbours and across leaf splits.
+- **Range bounds drawn from the same family**, so which keys a range
+  delete covers is decided at those single-bit and prefix boundaries.
+- **Value sizes**: empty, 1 byte, typical (64 B), around a page
+  (4095–4097 B), 8–16 KiB, and `max_value_bytes` and one byte under.
+- **How the DB is opened**: `Pread`, `Mmap` and `BufferPool`, with the
+  default file size or 64 KiB files, where the setup rotates and the
+  plan lands on a DB of several sealed files.
 
 ### Scope
 
-- Cover SUCCESS for all 8 deltas. Optionally cover class H for
-  deltas 1–6 (the engine takes a different code path: write commits
-  but rotation fails). That would add 6 more for 14 total.
-- Use Hypothesis (Python) driving the C++ engine through the Python
-  bindings, or a C++ property framework (rapidcheck) if bindings
-  don't cover the needed surface.
-- Value size ranges should include: empty, 1 byte, typical (64 B),
-  near page boundary (4095/4096/4097 B), and near max_value_bytes.
-- Key size ranges should include: 1 byte, typical, and near
-  max_key_bytes.
+SUCCESS only. Class H (the write commits, the rotation after it fails)
+and NOSYNC take other paths through the engine and are not covered:
+the Python bindings do not expose `ScopedFaultInjector`, and nothing in
+them cuts the power. A C++ property framework (rapidcheck) could cover
+both.
+
+The generated keys are adversarial for prefixes and crit bits, not for
+fingerprints: no example is constructed to make two keys' fingerprints
+collide.
 
 ### What this does NOT replace
 
 The deterministic proof matrix remains the primary validation. It
 exhausts the behavioral space (all failure classes × all plan shapes ×
-all state shapes). The property tests complement it by exhausting the
+all state shapes). The property tests complement it by sampling the
 value space for each behavioral equivalence class — validating the
 assumption that lets the deterministic matrix use symbolic values.
 
 ### Implementation
 
-8 Hypothesis property tests in
-`tests/proof/test_independence.py` cover SUCCESS for all
-8 delta shapes. Each test generates random key bytes (1 B to 4096 B)
-and value bytes (0 B to 16 KiB) including null bytes and
-page-boundary-adjacent sizes, executes the corresponding plan, and
-asserts:
-
-1. Key membership matches the delta prediction.
-2. Values read back identically.
-3. Sequence advance matches `n + (2 if n > 1 else 0)`.
-4. Engine is not degraded.
-5. Recovery (close + reopen) preserves all keys and values.
-
-Class H coverage (fault injection during rotation) is deferred — the
-Python bindings do not expose `ScopedFaultInjector`. A future
-rapidcheck-based C++ implementation could cover the H path.
+13 Hypothesis property tests in `tests/proof/test_independence.py`, 50
+examples each, run on every pull request (`ci.yml`) and against each
+built wheel (`build-wheels.yml`).
 
 Run: `PYTHONPATH=bytecaskdb-python pytest tests/proof/test_independence.py`
