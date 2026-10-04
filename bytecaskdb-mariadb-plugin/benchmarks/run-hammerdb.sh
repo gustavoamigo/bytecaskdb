@@ -442,7 +442,7 @@ TCL
   dev_after="$(dev_written_bytes)"
   if [[ "$CAPTURE" == on ]]; then
     capture_finish "$capture_dir" "$CAPTURE_DIR/$(basename "$capture_dir")_$CAPTURE_RUN.tar.gz" \
-      "$(engine_defaults_file "$engine" "$PROFILE")" "$log"
+      "$(engine_defaults_file "$engine" "$PROFILE")" "$log" "$dir/error.log"
   fi
   flush_mib="$(awk -v b=$((dev_after - dev_before)) \
     'BEGIN { printf "%.1f", (b > 0 ? b : 0) / 1048576 }')"
@@ -558,6 +558,8 @@ echo "Results saved to: $RESULTS_CSV"
 echo "HammerDB logs:    $LOG_DIR"
 if [[ "$CAPTURE" == on ]]; then
   echo "Captures:         $CAPTURE_DIR/capture_*_$CAPTURE_RUN.tar.gz"
+  capture_fetch_hint "hammerdb_${PROFILE}_w${WAREHOUSES}_$CAPTURE_RUN" \
+    "$RESULTS_CSV" "$CAPTURE_DIR/capture_*_$CAPTURE_RUN.tar.gz"
 fi
 
 cleanup
