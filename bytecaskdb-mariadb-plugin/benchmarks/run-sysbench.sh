@@ -11,7 +11,9 @@
 #   - sysbench installed
 #   - jemalloc (libjemalloc.so.2) — preloaded into every mariadbd so RSS reports
 #     the engine, not memory glibc's arenas keep after a drop/re-prepare;
-#     MARIADB_MALLOC=none runs on the system allocator instead
+#     MARIADB_MALLOC=none runs on the system allocator instead. It runs with a
+#     larger thread cache (lib_common.sh, jemalloc_conf; needs jemalloc 5.3+);
+#     MARIADB_MALLOC_CONF= (empty) runs jemalloc's defaults
 #
 # Usage:
 #   ./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench.sh [--table-size=N] [--threads=LIST] [--time=S] [--warmup=S] [--engines=LIST] [--workloads=LIST] [--data-root=PATH]
