@@ -888,14 +888,17 @@ TEST_CASE("BufferPool: readers racing release_file always read the file's "
   const std::size_t capacity = 64 * (bytecask::kPoolFrameBytes + 64);
   bytecask::BufferPool pool{
       bytecask::BufferPoolOptions{.capacity_bytes = capacity}};
+  constexpr int kReaders = 4;
   std::atomic<bool> stop{false};
   std::atomic<int> bad{0};
+  std::atomic<int> warm{0};
   std::vector<std::thread> readers;
-  for (int t = 0; t < 4; ++t) {
+  for (int t = 0; t < kReaders; ++t) {
     readers.emplace_back([&, t] {
       std::mt19937_64 rng{static_cast<std::uint64_t>(t) * 7919};
       std::vector<std::byte> got;
       bytecask::FrameLease lease;
+      bool first = true;
       while (!stop.load(std::memory_order_relaxed)) {
         const auto len = static_cast<std::size_t>(1 + rng() % 3000);
         const auto offset =
@@ -910,8 +913,18 @@ TEST_CASE("BufferPool: readers racing release_file always read the file's "
           bad.fetch_add(1);
         }
         lease.reset();
+        if (first) {
+          first = false;
+          warm.fetch_add(1, std::memory_order_release);
+        }
       }
     });
+  }
+  // The releases start once every reader has filled a frame. Started at
+  // once, they can all run before the first fill, slow under a sanitizer,
+  // and release nothing: the race the test is for never happens.
+  while (warm.load(std::memory_order_acquire) < kReaders) {
+    std::this_thread::yield();
   }
   for (int i = 0; i < 2000; ++i) pool.release_file(1, file.size());
   stop.store(true);
