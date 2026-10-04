@@ -76,6 +76,38 @@ jemalloc_library() {
   echo "$lib"
 }
 
+# jemalloc options for every mariadbd it is preloaded into. A larger thread
+# cache for small size classes, trimmed less often: a commit copies tree nodes
+# on its own thread and readers free them on theirs, and with jemalloc's
+# default cache the committing thread refills from the shared arena every few
+# nodes. On commit_probe (16 threads, jemalloc 5.3) this took 55.2 -> 51.7 us
+# per commit, at ~12 MB of RSS per thread (#308). Every engine gets the same
+# options. MARIADB_MALLOC_CONF overrides them; set it empty for jemalloc's
+# defaults. The max is jemalloc's own ceiling: 5.3 caps larger values at 2048
+# without a warning.
+JEMALLOC_TUNED_CONF="tcache_nslots_small_min:2000,tcache_nslots_small_max:2048,lg_tcache_nslots_mul:6,tcache_gc_incr_bytes:8388608"
+jemalloc_conf() {
+  echo "${MARIADB_MALLOC_CONF-$JEMALLOC_TUNED_CONF}"
+}
+
+# Warns, once per library and conf, when jemalloc rejects any of the options:
+# it prints "Invalid conf pair" and runs on its defaults for them (versions
+# before 5.3 lack the tcache_nslots_* options), so a run would otherwise
+# measure untuned jemalloc without saying so.
+JEMALLOC_CONF_CHECKED=""
+check_jemalloc_conf() {
+  local lib="$1" conf="$2"
+  [[ -z "$conf" || "$JEMALLOC_CONF_CHECKED" == "$lib|$conf" ]] && return 0
+  JEMALLOC_CONF_CHECKED="$lib|$conf"
+  local out
+  out="$(env "LD_PRELOAD=$lib" "MALLOC_CONF=$conf" /bin/true 2>&1)"
+  if [[ "$out" == *"Invalid conf"* ]]; then
+    echo "WARNING: $lib rejected part of MALLOC_CONF and uses its defaults for it" \
+         "(the tuned thread cache needs jemalloc 5.3+):" >&2
+    echo "$out" >&2
+  fi
+}
+
 # Echoes the option file an engine starts with under a durability profile.
 #   acid — <engine>.cnf: every commit is durable before it returns.
 #   fast — <engine>-fast.cnf, a complete file of its own: a commit survives a
@@ -153,9 +185,9 @@ scope_available() {
 
 # Starts an ephemeral mariadbd instance and waits for it to accept connections.
 # The data directory is used as found: call init_datadir first for a fresh one.
-# Runs it under jemalloc when the library is found (see jemalloc_library);
-# set MARIADB_MALLOC=/path/to/lib.so to pick another, or MARIADB_MALLOC=none
-# for the system allocator.
+# Runs it under jemalloc when the library is found (see jemalloc_library),
+# with jemalloc_conf's options; set MARIADB_MALLOC=/path/to/lib.so to pick
+# another library, or MARIADB_MALLOC=none for the system allocator.
 start_mariadbd() {
   local data_dir="$1"
   local socket="$2"
@@ -201,7 +233,11 @@ start_mariadbd() {
   if [[ "$malloc_lib" == "none" ]]; then
     :
   elif [[ -n "$malloc_lib" ]]; then
+    local malloc_conf
+    malloc_conf="$(jemalloc_conf)"
+    check_jemalloc_conf "$malloc_lib" "$malloc_conf"
     preload=(env "LD_PRELOAD=$malloc_lib${LD_PRELOAD:+:$LD_PRELOAD}")
+    [[ -n "$malloc_conf" ]] && preload+=("MALLOC_CONF=$malloc_conf")
   else
     echo "WARNING: libjemalloc.so.2 not found; mariadbd on port $port runs on the" \
          "system allocator and its RSS will include memory glibc has not returned" >&2
