@@ -1543,6 +1543,7 @@ operation completes without reaching the fault (#317).
 
 ```
 for each operation:
+ for each I/O back-end (pread, buffer pool, mmap):
   for each pass (before, after, short, cascade):
     for N = 1, 2, …:
       build the starting state
@@ -1553,7 +1554,8 @@ for each operation:
 
 It runs in `bytecask_tests` as `[fault_sweep]`
 ([`tests/fault_sweep_test.cpp`](../tests/fault_sweep_test.cpp)), on every
-PR: about 1,400 failed calls in 11 s on an unsanitized debug build. A
+PR: about 3,900 failed calls, 1,400 of them on the default back-end, in
+22 s on an unsanitized release build. A
 failure names the call: `vacuum, fault before, N = 7:
 ftruncate(…/x.data.tmp)`. `BYTECASK_SWEEP_TRACE=1` prints every call a
 sweep failed.
@@ -1589,23 +1591,38 @@ different sequence in each.
 An `fdatasync` failed *before* leaves its pages clean and unwritten in the
 `PageCacheModel`, as the kernel does; one failed *after* wrote them.
 
-**Operations.** The number is the calls of the *before* pass.
+**Back-ends.** Each operation runs once on each `IoBackend`, since they
+make different calls on the same operation. The buffer pool opens a sealed
+file a second time `O_DIRECT`, proves that descriptor with one aligned
+`pread` and fills through the buffered one if either fails, and fills
+frames with its own `pread`, retried buffered when the direct one fails. The mmap back-end
+maps the active file and each sealed one. The pool must hold
+2 × `max_file_bytes`, so on it an operation on the default file size runs
+with `max_file_bytes = 64 KiB` and a 1 MiB pool; none comes near either.
+
+**Operations.** The numbers are the calls of the *before* pass on each
+back-end: pread, buffer pool, mmap. The two others make fewer on a write
+because a record of the active file is read from memory, the pool's frames
+or the mapping, not with `pread`; they make more or fewer on an open by
+their own opens, probes, fills and maps.
 
 | Operation | Starting state | Calls |
 |---|---|---:|
-| `put`, overwriting | one file: six keys, a delete, a batch | 3 |
-| `del` | the same | 4 |
-| `del_range` | the same | 8 |
-| `apply_batch`: puts, a delete, a range delete | the same | 13 |
-| a put that fills the active file | the same, `max_file_bytes = 512` | 23 |
-| `vacuum` | a sealed file with a dead entry | 25 |
-| `create_manifest` | one file | 19 |
-| `ingest` of a put and a batch | a follower holding the first slice | 15 |
-| `resume()` | degraded by a failed commit sync: the entry whole, unsynced | 42 |
-| `resume()` | degraded by a short append: the entry torn | 40 |
-| `close()` | an unsynced batch behind it | 13 |
-| `DB::open`, serial and parallel | three sealed files and their hints, after a clean close | 68, 80 |
-| `DB::open`, serial and parallel | the same, as a killed process leaves it: the newest file hint-less | 77, 89 |
+| `put`, overwriting | one file: six keys, a delete, a batch | 3, 2, 2 |
+| `del` | the same | 4, 2, 2 |
+| `del_range` | the same | 8, 2, 2 |
+| `apply_batch`: puts, a delete, a range delete | the same | 13, 4, 4 |
+| a put that fills the active file | the same, `max_file_bytes = 512` | 21, 22, 22 |
+| `vacuum` | a sealed file with a dead entry | 23, 22, 21 |
+| `create_manifest` | one file | 17, 19, 19 |
+| `ingest` of a put and a batch | a follower holding the first slice | 15, 5, 5 |
+| `resume()` | degraded by a failed commit sync: the entry whole, unsynced | 40, 23, 23 |
+| `resume()` | degraded by a short append: the entry torn | 38, 23, 23 |
+| `close()` | an unsynced batch behind it | 11, 11, 11 |
+| `DB::open`, serial | three sealed files and their hints, after a clean close | 66, 90, 57 |
+| `DB::open`, parallel | the same | 78, 102, 69 |
+| `DB::open`, serial | the same, as a killed process leaves it: the newest file hint-less | 75, 101, 66 |
+| `DB::open`, parallel | the same | 87, 113, 78 |
 
 **Invariants.** They need no expected delta per failure class, which is
 what makes an operation cheap to add. After a failure at any N:
@@ -1671,9 +1688,12 @@ mutation reverts it.
   `--sanitizer` includes `memory` (#327). The sweep still runs there; the
   ASan, TSan and UBSan legs and `ci.yml`'s build keep the guard.
 - *`mmap` reads cannot be failed this way.* A failed mapped read is a
-  `SIGBUS`, not a return value. The `mmap` call itself is counted.
-- *One I/O back-end.* The sweep runs on the default, `Pread`; the buffer
-  pool's fills and the mmap back-end's files are not swept (#320).
+  `SIGBUS`, not a return value. The `mmap` call itself is counted, and on
+  the mmap back-end failed.
+- *The buffer pool's buffered retry is failed only by the cascade.* When
+  the N-th call is a direct fill, the buffered `pread` that retries it is
+  the (N+1)-th, which no single-fault run reaches with the N-th
+  succeeding. The cascade fails both, and the read throws.
 - *The oracle is weaker than the matrix's.* "Baseline or the whole
   transition" does not say which of the two a given fault must produce. The
   proof cells keep that job, and the named checkpoints stay for them.

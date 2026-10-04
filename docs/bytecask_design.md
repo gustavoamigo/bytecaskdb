@@ -1673,7 +1673,7 @@ Fault state is per-thread (`thread_local FaultHooks`), so tests on different thr
 
 ### Faults by count, below the engine
 
-The checkpoints above fail the calls someone named. `bytecask_tests` also fails calls nobody named: it is linked with `-Wl,--wrap` for each I/O call the engine makes, and the `[fault_sweep]` tests fail the 1st, 2nd, …, n-th call of each operation in turn and check generic invariants after each. A new I/O call is covered the day it is added; one whose spelling has no interposer fails the link, except in builds that link part of the C++ standard library statically (the manylinux wheels, MemorySanitizer), where that guard is off. The sweep is Linux-only (Apple's linker has no `--wrap`). See `docs/correctness_validation.md`, *Counted fault sweep*.
+The checkpoints above fail the calls someone named. `bytecask_tests` also fails calls nobody named: it is linked with `-Wl,--wrap` for each I/O call the engine makes, and the `[fault_sweep]` tests fail the 1st, 2nd, …, n-th call of each operation in turn, on each I/O back-end, and check generic invariants after each. A new I/O call is covered the day it is added; one whose spelling has no interposer fails the link, except in builds that link part of the C++ standard library statically (the manylinux wheels, MemorySanitizer), where that guard is off. The sweep is Linux-only (Apple's linker has no `--wrap`). See `docs/correctness_validation.md`, *Counted fault sweep*.
 
 ### Intended use
 
