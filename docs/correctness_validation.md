@@ -1655,6 +1655,15 @@ mutation reverts it.
   stale `.tmp` files, `file_size`, `exists`, `create_directories`. The named
   checkpoints (`io_hint_rename`, `io_vacuum_compact_unlink`) and the chaos
   rig remain their cover (#319).
+- *Linux only.* Apple's linker has no `--wrap`, so on macOS `bytecask_tests`
+  is built without `tests/syscall_faults.cpp` and `tests/fault_sweep_test.cpp`.
+- *The link guard is off where libstdc++ is partly static.* manylinux's
+  gcc-toolset links part of `std::filesystem` from `libstdc++_nonshared.a`
+  into the binary, so its `openat`, `rename`, `unlinkat`, `symlink` and
+  `sendfile` would fail the guard although the engine makes none of them.
+  The wheel build configures `--fault_sweep_link_guard=n`; `ci.yml` keeps
+  the guard. There the archived `std::filesystem` calls that are wrapped
+  (`stat`, `unlink`, …) are counted too.
 - *`mmap` reads cannot be failed this way.* A failed mapped read is a
   `SIGBUS`, not a return value. The `mmap` call itself is counted.
 - *One I/O back-end.* The sweep runs on the default, `Pread`; the buffer
