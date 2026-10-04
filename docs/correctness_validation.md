@@ -1379,7 +1379,8 @@ I/O checkpoints:
 
 SQLite's harness fails the 1st, 2nd, …, n-th I/O call of an operation in
 turn. The injector names its sites instead, so that each failure has a
-class and each class an expected delta; what that gives up is in
+class and each class an expected delta. The counted fault sweep below
+fails calls by count as well, to reach the ones no site names; see
 [*Prior Art*](#prior-art).
 
 ### Invariant helpers
@@ -2552,9 +2553,14 @@ VFS to fail the N-th call, and reruns each operation with N = 1, 2, …
 until it completes without reaching the fault. The fault injector here
 names its sites instead: a failure class is a named checkpoint and mode,
 and the model gives each class an expected delta, which a count cannot
-carry. The cost is that a counted loop reaches a new I/O call without
-anyone registering it, and a named one does not: a new site needs a
-checkpoint, and a row in *Durability sites*. SQLite's crash tests, which
+carry. A counted loop, though, reaches a new I/O call without anyone
+registering it, and a named one does not. So both run: the
+[*Counted fault sweep*](#counted-fault-sweep) fails each I/O call of an
+operation in turn, counted below the engine with `--wrap`, and holds the
+result to invariants that need no expected delta; the named checkpoints
+keep the per-class deltas. Unlike SQLite, which counts through its own
+VFS, the sweep cannot count what the engine does inside libstdc++
+(#319). SQLite's crash tests, which
 run on a VFS that drops or damages unsynced writes at a simulated crash,
 are the ancestor of `PageCacheModel`.
 
