@@ -57,6 +57,18 @@ option("coverage")
     set_description("Enable LLVM source-based code coverage (true or empty to disable)")
 option_end()
 
+-- Counted fault sweep link guard: `xmake f --fault_sweep_link_guard=n` stops
+-- bytecask_tests poisoning the I/O calls the sweep has no interposer for (see
+-- syscall_fault_unwrapped). Only for a toolchain that links part of libstdc++
+-- statically, as manylinux's gcc-toolset does with libstdc++_nonshared.a:
+-- std::filesystem's references to openat, rename, … then land in this binary
+-- and fail the guard although the engine does not make them. ci.yml keeps it.
+option("fault_sweep_link_guard")
+    set_default(true)
+    set_showmenu(true)
+    set_description("Fail the bytecask_tests link on an I/O call the counted fault sweep cannot count")
+option_end()
+
 -- Common flags shared by all targets
 local common_flags = {
     "-Weverything", "-Wno-c++98-compat", "-Wno-c++98-compat-pedantic",
@@ -243,15 +255,21 @@ target("bytecask_tests")
     add_defines("BYTECASK_TESTING", "BYTECASK_RADIX_ACCOUNTING")
     -- Counted fault sweep (tests/syscall_faults.cpp): each I/O call the
     -- binary's objects make goes through an interposer that can count it and
-    -- fail the N-th.
-    for _, call in ipairs(syscall_fault_wraps) do
-        add_ldflags("-Wl,--wrap=" .. call, {force = true})
-    end
-    -- No interposer exists for these, so a reference to one fails the link
-    -- with "undefined reference to __wrap_<call>": a call the sweep would
-    -- not count. Write its interposer and move it to the list above.
-    for _, call in ipairs(syscall_fault_unwrapped) do
-        add_ldflags("-Wl,--wrap=" .. call, {force = true})
+    -- fail the N-th. Linux only: Apple's linker has no --wrap.
+    if is_plat("linux") then
+        for _, call in ipairs(syscall_fault_wraps) do
+            add_ldflags("-Wl,--wrap=" .. call, {force = true})
+        end
+        -- No interposer exists for these, so a reference to one fails the
+        -- link with "undefined reference to __wrap_<call>": a call the sweep
+        -- would not count. Write its interposer and move it to the list above.
+        if has_config("fault_sweep_link_guard") then
+            for _, call in ipairs(syscall_fault_unwrapped) do
+                add_ldflags("-Wl,--wrap=" .. call, {force = true})
+            end
+        end
+    else
+        remove_files("tests/syscall_faults.cpp", "tests/fault_sweep_test.cpp")
     end
     on_config(function(t)
         add_native_syslinks(t)
