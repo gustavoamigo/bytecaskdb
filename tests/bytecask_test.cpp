@@ -10441,6 +10441,10 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.fsyncs",
       "bytecask.commit_wait_blocked",
       "bytecask.flush_settles",
+      "bytecask.commit_delay_waits",
+      "bytecask.commit_delay_us",
+      "bytecask.commit_delay_fsync_us",
+      "bytecask.commit_delay_round_trip_us",
       "bytecask.disk_reads",
       "bytecask.disk_read_bytes",
       "bytecask.pool_hits",
@@ -12654,4 +12658,75 @@ TEST_CASE("pipeline: publishing a state that owes an fdatasync degrades the "
   CHECK(db.put({.sync = true}, to_bytes("k2"), to_bytes("v2")).durable);
   const auto s = db.engine_state();
   CHECK(s->durable_seq >= s->sync_requested_seq);
+}
+
+// ---------------------------------------------------------------------------
+// Commit delay: who waits before an fdatasync (CommitDelay)
+// ---------------------------------------------------------------------------
+
+using namespace std::chrono_literals;
+
+TEST_CASE("commit delay: a lone synced writer never waits",
+          "[pipeline][commit_delay]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  for (int i = 0; i < 200; ++i)
+    db.put({.sync = true}, to_bytes(std::format("k{}", i)), to_bytes("v"));
+  const auto s = db.stats();
+  CHECK(s.at("bytecask.commit_delay_waits") == 0);
+  CHECK(s.at("bytecask.fsyncs") >= 200);
+}
+
+TEST_CASE("commit delay: unsynced writers never wait",
+          "[pipeline][commit_delay][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  std::vector<std::thread> writers;
+  for (int t = 0; t < 4; ++t)
+    writers.emplace_back([&, t] {
+      for (int i = 0; i < 500; ++i)
+        db.put({.sync = false}, to_bytes(std::format("t{}-{}", t, i)), to_bytes("v"));
+    });
+  for (auto &w : writers) w.join();
+  CHECK(db.stats().at("bytecask.commit_delay_waits") == 0);
+}
+
+TEST_CASE("commit delay: a synced commit waits once the last flush covered two",
+          "[pipeline][commit_delay]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("seed"), to_bytes("s"));
+  // As if the last fdatasync covered 3 commits; nobody comes back, so the
+  // next synced flush waits out min(F, 2R) = 20 ms.
+  auto &d = db.test_commit_delay();
+  for (int i = 0; i < 3; ++i) d.on_arrival();
+  d.on_sync_start();
+  d.on_sync_end(1s);
+  d.on_round_trip(10ms);
+  const auto before = db.stats().at("bytecask.commit_delay_waits");
+  db.put({.sync = true}, to_bytes("k"), to_bytes("v"));
+  CHECK(db.stats().at("bytecask.commit_delay_waits") == before + 1);
+  CHECK(db.contains_key({}, to_bytes("k")));
+}
+
+// Barriers flush to make state durable, not to batch: they take the flush
+// role through quiesce(), which never waits, however the policy is primed.
+TEST_CASE("commit delay: barriers never wait",
+          "[pipeline][commit_delay]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = false}, to_bytes("k"), to_bytes("v"));  // a flush is owed
+  auto &d = db.test_commit_delay();
+  for (int i = 0; i < 3; ++i) d.on_arrival();
+  d.on_sync_start();
+  d.on_sync_end(30s);
+  d.on_round_trip(15s);  // a wait would last up to 30 s
+  const auto t0 = std::chrono::steady_clock::now();
+  {
+    const auto manifest = db.create_manifest();  // rotation: two fdatasyncs
+    CHECK(std::chrono::steady_clock::now() - t0 < 10s);
+  }
+  CHECK(db.stats().at("bytecask.commit_delay_waits") == 0);
+  db.close();
+  CHECK(std::chrono::steady_clock::now() - t0 < 10s);
 }

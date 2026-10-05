@@ -628,3 +628,69 @@ committed with `sync = false`, beside one empty `sync = true` commit a second
 busy share and serial µs per commit, and every change to stage 1 is judged by
 the last of those. Run it on tmpfs, with jemalloc preloaded and the two
 builds alternating; on a full machine compare only runs from one session.
+
+## Commit delay
+
+With every commit synced and the disk busy with `fdatasync` back to back,
+throughput is commits per `fdatasync` × `fdatasync`s per second; the second
+factor is the disk's. A flush covers the commits that finished stage 1
+before it captured the head. The settle waits only for slots already inside
+the write group, not for the clients the previous flush just released, which
+are a round trip away from sending their next commit.
+
+The leader hand-off gave `main` a delay by accident: its stage 1 drained
+slowly enough that the settle often caught arrivals. The committer thread
+drains it faster and removed the accident. On acid `oltp_insert` at 16
+threads (SATA SSD), a `perf sched` timeline showed the next `fdatasync`
+starting 258 µs after the previous one ended on the leader build and 45 µs
+after on the committer build, with 10.0 against 9.1 commits per `fdatasync`
+and 1,621 against 1,332 tps. A fixed 250 µs wait before each synced
+`fdatasync` took the committer build from 8.2 to 15.4 commits per
+`fdatasync` and from 1,310 to 2,320 tps, which confirmed the mechanism. A
+fixed wait is not the answer: it charges every synced commit, a lone
+writer's too, and the right length depends on the disk and the workload.
+
+**The rule** (`CommitDelay`, in `flush_once` before the settle). A flush that
+owes an `fdatasync` waits until as many synced commits have finished stage 1
+since the last `fdatasync` returned as that `fdatasync` covered, or until
+min(F, 2·R), whichever comes first:
+
+- F, the running average of `fdatasync` time (weight 1/16). Waiting longer
+  than one can never pay: a commit that misses this flush waits about F.
+- R, the running average of a client's round trip: from a synced commit
+  returning to the same thread's next synced commit on the same DB. Samples
+  of F or longer are dropped: a client that slow is not worth waiting for,
+  and one idle connection would otherwise hold the average up (48–62 ms
+  unfiltered against 55–85 µs filtered, in the same runs).
+
+Nothing is configured. A lone writer never waits (the last `fdatasync`
+covered one commit), nor does anything before F and R are measured, an
+unsynced flush, a barrier (`quiesce()` takes the role without `flush_once`),
+or a single-threaded build. The wait spins with `yield`, like the settle. It
+changes when an `fdatasync` starts and nothing else: a commit still returns
+only once an `fdatasync` covering it has completed, so durability, ordering
+and publication are unchanged, and the added wait is at most one F per
+flush. `stats()` reports `commit_delay_waits`, `commit_delay_us` and the
+current F and R.
+
+**Measured** with the rule as an experiment build of the committer thread,
+against `main`, every commit synced (sysbench acid, HammerDB acid; Ryzen 7
+3700X, SATA SSD on No_COW btrfs, medians of the rounds run):
+
+| Workload | 1 thread | 4 | 16 | 64 |
+| --- | ---: | ---: | ---: | ---: |
+| `oltp_insert` (2 rounds) | 0% | +94% | +22% | +31% |
+| `oltp_write_only` (1 round) | −5% | +76% | +60% | +39% |
+| `oltp_read_write` (3 rounds) | 0% | +65% | +38% | +9% |
+| HammerDB TPROC-C, 16 users (1 round) | | | +101% | |
+
+Commits per `fdatasync` roughly doubled (HammerDB 6.2 → 13.8) and p95
+latency fell with it. In the fast profile (interval sync) and on tmpfs the
+rule did not engage and throughput matched the committer build. On
+`oltp_read_write` at 64 threads it waits to its bound every round (4–5 ms):
+fewer clients than the last `fdatasync` covered come back in time.
+
+The rule ships as measured. Three changes that could improve it each need
+their own experiment against it: a round trip that does not assume one
+thread per client (#333), stopping once arrivals stop (#334), and waiting
+without spinning (#335).

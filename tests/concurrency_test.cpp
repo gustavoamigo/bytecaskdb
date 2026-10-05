@@ -411,3 +411,87 @@ TEST_CASE("WriteGroup aborted slots receive WriteGroupAborted", "[concurrency]")
   CHECK(aborted_count.load() >= 1);
   CHECK(succeeded_count.load() + aborted_count.load() == kThreads);
 }
+
+// ---------------------------------------------------------------------------
+// CommitDelay
+// ---------------------------------------------------------------------------
+
+namespace {
+// Primes a CommitDelay as if `covered` synced commits arrived, one
+// fdatasync of `fsync` covered them, and a client came back `round_trip`
+// after it returned.
+void prime(bytecask::CommitDelay &d, int covered,
+           std::chrono::nanoseconds fsync, std::chrono::nanoseconds round_trip) {
+  for (int i = 0; i < covered; ++i) d.on_arrival();
+  d.on_sync_start();
+  d.on_sync_end(fsync);
+  d.on_round_trip(round_trip);
+}
+}  // namespace
+
+TEST_CASE("CommitDelay: a lone writer never waits",
+          "[concurrency][commit_delay]") {
+  bytecask::CommitDelay d;
+  prime(d, 1, 10s, 5s);  // a wait would last up to 10 s
+  d.wait();
+  CHECK(d.waits() == 0);
+}
+
+TEST_CASE("CommitDelay: nothing waits before F and R are measured",
+          "[concurrency][commit_delay]") {
+  bytecask::CommitDelay d;
+  for (int i = 0; i < 4; ++i) d.on_arrival();
+  d.on_sync_start();  // covered 4, but no fdatasync has returned yet
+  d.wait();
+  CHECK(d.waits() == 0);
+  d.on_sync_end(10s);  // F known, R not yet
+  d.wait();
+  CHECK(d.waits() == 0);
+}
+
+TEST_CASE("CommitDelay: a round trip of one fdatasync or longer is ignored",
+          "[concurrency][commit_delay]") {
+  bytecask::CommitDelay d;
+  prime(d, 2, 10ms, 50ms);
+  CHECK(d.round_trip_estimate() == 0ns);
+  d.on_round_trip(2ms);
+  CHECK(d.round_trip_estimate() == 2ms);
+}
+
+TEST_CASE("CommitDelay: estimates take the first sample whole, then 1/16 of each",
+          "[concurrency][commit_delay]") {
+  bytecask::CommitDelay d;
+  d.on_sync_end(16ms);
+  CHECK(d.fsync_estimate() == 16ms);
+  d.on_sync_end(32ms);
+  CHECK(d.fsync_estimate() == 17ms);
+}
+
+TEST_CASE("CommitDelay: the wait ends once the released commits are back",
+          "[concurrency][commit_delay]") {
+  bytecask::CommitDelay d;
+  prime(d, 3, 10s, 5s);  // bound min(10 s, 2 * 5 s)
+  std::thread clients{[&] {
+    std::this_thread::sleep_for(20ms);
+    for (int i = 0; i < 3; ++i) d.on_arrival();
+  }};
+  const auto t0 = std::chrono::steady_clock::now();
+  d.wait();
+  const auto took = std::chrono::steady_clock::now() - t0;
+  clients.join();
+  CHECK(d.waits() == 1);
+  CHECK(took < 5s);  // ended on the arrivals, far short of the bound
+}
+
+TEST_CASE("CommitDelay: with nobody coming back the wait ends at min(F, 2R)",
+          "[concurrency][commit_delay]") {
+  bytecask::CommitDelay d;
+  prime(d, 3, 1s, 10ms);  // bound min(1 s, 20 ms)
+  const auto t0 = std::chrono::steady_clock::now();
+  d.wait();
+  const auto took = std::chrono::steady_clock::now() - t0;
+  CHECK(d.waits() == 1);
+  CHECK(took >= 20ms);
+  CHECK(took < 1s);
+  CHECK(d.waited() >= 20ms);
+}

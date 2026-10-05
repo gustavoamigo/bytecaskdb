@@ -1569,6 +1569,9 @@ private:
   // Longest the flush role waits for in-progress stage-1 work before it
   // captures the head. See flush_pending.
   static constexpr auto kFlushSettleMax = std::chrono::microseconds{200};
+  // How long a flush that owes an fdatasync waits for the commits the last
+  // one released, before it captures the head. See CommitDelay.
+  CommitDelay commit_delay_;
   // The fdatasync error that degraded the engine, rethrown by commit_wait
   // to every writer whose entries were appended since the last successful
   // flush. Guarded by durable_mu_. Cleared by resume().
@@ -1594,6 +1597,7 @@ private:
 #ifdef BYTECASK_TESTING
 public:
   auto& test_write_group() { return write_group_; }
+  auto& test_commit_delay() { return commit_delay_; }
   // Called by flush_pending on the flushing thread just before the
   // fdatasync. Lets a test hold a flush in flight while other writers
   // append behind it.
@@ -2929,6 +2933,15 @@ static auto write_rejection(const EngineState &s) -> std::exception_ptr {
       DbFollowerMode{"write rejected: engine is in follower mode"});
 }
 
+// The calling thread's last synced commit: the DB it went to and when it
+// returned. The commit delay's round trip is measured from it, per DB, so a
+// thread that writes to two databases does not mix their timings.
+struct LastSyncedReturn {
+  const DB *db{nullptr};
+  std::chrono::steady_clock::time_point at{};
+};
+static thread_local LastSyncedReturn last_synced_return{};
+
 // The single write path. Routes to either write_group_ (default) or
 // solo_writer_ depending on plan characteristics. put/del/apply_batch are
 // thin wrappers that construct a WritePlan and delegate here.
@@ -2942,6 +2955,10 @@ auto DB::apply_batch(WriteOptions opts,
   if (plan.empty() && !opts.sync) {
     return CommitResult{.sequence = 0, .durable = true};
   }
+
+  if (opts.sync && last_synced_return.db == this)
+    commit_delay_.on_round_trip(std::chrono::steady_clock::now() -
+                                last_synced_return.at);
 
   EngineSlot slot;
   slot.plan = std::move(plan);
@@ -2960,6 +2977,7 @@ auto DB::apply_batch(WriteOptions opts,
   } else {
     write_group_.submit(slot);
   }
+  if (opts.sync) commit_delay_.on_arrival();
 
   // Stage 1 is done: the slot's entries are in the prepared head and the
   // page cache. Stage 2 — fdatasync (if sync) and publication — happens
@@ -2970,6 +2988,7 @@ auto DB::apply_batch(WriteOptions opts,
   if (slot.result && (slot.result->sequence != 0 || slot.sync_through != 0)) {
     commit_wait(slot);
   }
+  if (opts.sync) last_synced_return = {this, std::chrono::steady_clock::now()};
 
   // A conflict against a write the head holds but no snapshot can see yet.
   // Plans are validated against the head, which is right — two in-flight
@@ -3277,6 +3296,8 @@ void DB::flush_pending() {
 #ifdef BYTECASK_TESTING
     if (test_before_flush_sync_) test_before_flush_sync_();
 #endif
+    commit_delay_.on_sync_start();
+    const auto sync_start = std::chrono::steady_clock::now();
     try {
       static_cast<WritableDataFile &>(head->active_file()).sync();
       counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);
@@ -3285,6 +3306,7 @@ void DB::flush_pending() {
                    head->active_file().path());
       return;
     }
+    commit_delay_.on_sync_end(std::chrono::steady_clock::now() - sync_start);
   }
 
   // Publish the head as it stood before the fdatasync. Entries appended
@@ -3343,6 +3365,7 @@ void DB::flush_once() {
       return write_group_.sync_busy() ||
              load_head()->sync_requested_seq > load_state()->durable_seq;
     };
+    if (owes_sync()) commit_delay_.wait();
     const auto deadline =
         std::chrono::steady_clock::now() + kFlushSettleMax;
     bool settled = false;
@@ -4202,6 +4225,13 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.commit_wait_blocked.load(std::memory_order_relaxed)},
       {"bytecask.flush_settles",
        counters_.flush_settles.load(std::memory_order_relaxed)},
+      {"bytecask.commit_delay_waits", commit_delay_.waits()},
+      {"bytecask.commit_delay_us",
+       std::chrono::duration_cast<std::chrono::microseconds>(commit_delay_.waited()).count()},
+      {"bytecask.commit_delay_fsync_us",
+       std::chrono::duration_cast<std::chrono::microseconds>(commit_delay_.fsync_estimate()).count()},
+      {"bytecask.commit_delay_round_trip_us",
+       std::chrono::duration_cast<std::chrono::microseconds>(commit_delay_.round_trip_estimate()).count()},
       {"bytecask.disk_reads",
        counters_.disk_reads.load()},
       {"bytecask.disk_read_bytes",
