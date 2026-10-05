@@ -5886,7 +5886,7 @@ TEST_CASE("apply_batch group commit: second slot conflicts on existing key",
   std::condition_variable cv;
   bool leader_ready = false;
 
-  db.test_write_group().on_leader_start_ = [&] {
+  db.test_write_group().on_batch_start_ = [&] {
     {
       std::unique_lock<std::mutex> lk{mu};
       leader_ready = true;
@@ -5916,7 +5916,7 @@ TEST_CASE("apply_batch group commit: second slot conflicts on existing key",
   tA.join();
   tB.join();
 
-  db.test_write_group().on_leader_start_ = nullptr;
+  db.test_write_group().on_batch_start_ = nullptr;
 
   CHECK(resultA.has_value());
   CHECK_FALSE(resultB.has_value());
@@ -5945,7 +5945,7 @@ TEST_CASE("apply_batch group commit: second slot conflicts on new key",
   std::condition_variable cv;
   bool leader_ready = false;
 
-  db.test_write_group().on_leader_start_ = [&] {
+  db.test_write_group().on_batch_start_ = [&] {
     {
       std::unique_lock<std::mutex> lk{mu};
       leader_ready = true;
@@ -5972,7 +5972,7 @@ TEST_CASE("apply_batch group commit: second slot conflicts on new key",
   tA.join();
   tB.join();
 
-  db.test_write_group().on_leader_start_ = nullptr;
+  db.test_write_group().on_batch_start_ = nullptr;
 
   CHECK(resultA.has_value());
   CHECK_FALSE(resultB.has_value());
@@ -8831,7 +8831,7 @@ TEST_CASE("CommitResult nosync writer coalesced with sync writer is durable",
   std::condition_variable cv;
   bool leader_ready = false;
 
-  db.test_write_group().on_leader_start_ = [&] {
+  db.test_write_group().on_batch_start_ = [&] {
     {
       std::unique_lock<std::mutex> lk{mu};
       leader_ready = true;
@@ -8868,7 +8868,7 @@ TEST_CASE("CommitResult nosync writer coalesced with sync writer is durable",
   tA.join();
   tB.join();
 
-  db.test_write_group().on_leader_start_ = nullptr;
+  db.test_write_group().on_batch_start_ = nullptr;
 
   REQUIRE(nosync_result.has_value());
   REQUIRE(sync_result.has_value());
@@ -10308,6 +10308,7 @@ TEST_CASE("stats: fresh DB has zero counters and one open file",
   CHECK(s.at("bytecask.bytes_written") == 0);
   CHECK(s.at("bytecask.group_writer_batches") == 0);
   CHECK(s.at("bytecask.group_writer_coalesced") == 0);
+  CHECK(s.at("bytecask.group_writer_busy_us") == 0);
   CHECK(s.at("bytecask.fsyncs") == 0);
   CHECK(s.at("bytecask.disk_reads") == 0);
   CHECK(s.at("bytecask.disk_read_bytes") == 0);
@@ -10333,6 +10334,24 @@ TEST_CASE("stats: write counters increment on put",
   CHECK(s.at("bytecask.group_writer_batches") >= 2);
   CHECK(s.at("bytecask.group_writer_coalesced") >= 2);
   CHECK(s.at("bytecask.fsyncs") >= 2);
+}
+
+TEST_CASE("stats: group_writer_busy_us counts the serial section, within wall time",
+          "[bytecask][stats]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path);
+  const auto before = db.stats().at("bytecask.group_writer_busy_us");
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < 2000; ++i) {
+    const auto k = std::format("k{}", i);
+    db.put({.sync = false}, to_bytes(k), to_bytes("value"));
+  }
+  const auto wall_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - t0)
+                           .count();
+  const auto busy = db.stats().at("bytecask.group_writer_busy_us") - before;
+  CHECK(busy > 0);
+  CHECK(busy <= wall_us);
 }
 
 TEST_CASE("stats: disk_reads and disk_read_bytes increment on get",
@@ -10417,6 +10436,7 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.bytes_written",
       "bytecask.group_writer_batches",
       "bytecask.group_writer_coalesced",
+      "bytecask.group_writer_busy_us",
       "bytecask.file_rotations",
       "bytecask.fsyncs",
       "bytecask.commit_wait_blocked",
@@ -11625,7 +11645,7 @@ TEST_CASE("pipeline: a sync-only write in the same batch as a rotation is "
   std::mutex mu;
   std::condition_variable cv;
   bool leader_ready = false;
-  db.test_write_group().on_leader_start_ = [&] {
+  db.test_write_group().on_batch_start_ = [&] {
     {
       std::lock_guard<std::mutex> lk{mu};
       leader_ready = true;
@@ -11648,7 +11668,7 @@ TEST_CASE("pipeline: a sync-only write in the same batch as a rotation is "
   });
   tbig.join();
   tsync.join();
-  db.test_write_group().on_leader_start_ = nullptr;
+  db.test_write_group().on_batch_start_ = nullptr;
 
   const auto stats_after = db.stats();
   REQUIRE(rbig.has_value());
@@ -11778,7 +11798,7 @@ TEST_CASE("pipeline: a flush settles for writers in stage 1 only when it "
   std::optional<bytecask::CommitResult> r2;
   std::thread t1([&] { r1 = db.put({.sync = c.w1_sync}, to_bytes("k1"), to_bytes("v1")); });
   before_wait.wait_in_flush();
-  db.test_write_group().on_leader_start_ = leading.hook();
+  db.test_write_group().on_batch_start_ = leading.hook();
   std::thread t2([&] { r2 = db.put({.sync = c.w2_sync}, to_bytes("k2"), to_bytes("v2")); });
   leading.wait_in_flush();
 
@@ -11792,7 +11812,7 @@ TEST_CASE("pipeline: a flush settles for writers in stage 1 only when it "
   leading.open();
   t2.join();
   db.test_before_commit_wait_ = nullptr;
-  db.test_write_group().on_leader_start_ = nullptr;
+  db.test_write_group().on_batch_start_ = nullptr;
   REQUIRE(r1.has_value());
   REQUIRE(r2.has_value());
   CHECK(db.contains_key({}, to_bytes("k2")));
@@ -12557,7 +12577,7 @@ TEST_CASE("pipeline: a batch admitted before a flush failure is rejected as "
   std::condition_variable cv;
   bool leader_parked = false;
   bool go = false;
-  db.test_write_group().on_leader_start_ = [&] {
+  db.test_write_group().on_batch_start_ = [&] {
     std::unique_lock<std::mutex> lk{mu};
     leader_parked = true;
     cv.notify_all();
@@ -12598,7 +12618,7 @@ TEST_CASE("pipeline: a batch admitted before a flush failure is rejected as "
   }
   cv.notify_all();
   ta.join();
-  db.test_write_group().on_leader_start_ = nullptr;
+  db.test_write_group().on_batch_start_ = nullptr;
   REQUIRE(ea);
   CHECK_THROWS_AS(std::rethrow_exception(ea), bytecask::DbDegraded);
 

@@ -1,0 +1,21 @@
+Reads the slot's sync flag in wait_released, after the slot is queued,
+instead of the copy submit takes before queuing it. The batch's executor
+writes the slot's fields (execute_slots sets slot.sync for every slot it
+runs), so the waiting owner's read races with that write: the race the
+TSan soak and every thread-sanitizer CI leg reported on #224 before the
+fix. Expected: caught.
+Guarded-by: "WriteGroup slots may be destroyed as soon as submit returns"
+Sanitizer: thread
+diff --git a/bytecaskdb/concurrency.cppm b/bytecaskdb/concurrency.cppm
+index 667751c..bf1fcee 100644
+--- a/bytecaskdb/concurrency.cppm
++++ b/bytecaskdb/concurrency.cppm
+@@ -292,7 +292,7 @@ private:
+     // A synced writer does not poll: released at once, it would reach the
+     // flush wait before the flush covering it publishes, and sleep there.
+     const auto spin_until = std::chrono::steady_clock::now() +
+-        (synced ? std::chrono::microseconds{0} : kWriterSpin);
++        (slot.sync ? std::chrono::microseconds{0} : kWriterSpin);
+     bool spinning = true;
+     for (;;) {
+       const auto s = slot.state.load(std::memory_order_acquire);
