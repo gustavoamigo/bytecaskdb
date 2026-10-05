@@ -2034,6 +2034,7 @@ if a mutation expected to be caught survives.
 | `publish_before_fdatasync` — the commit flush publishes before its `fdatasync` | caught |
 | `resume_without_write_barrier` — `resume()` without its `WriteBarrier` | caught |
 | `read_cache_release_relaxed` — `ReadCacheSlot::release` store weakened to relaxed | caught, under TSan (a data race); ASan cannot see it |
+| `sync_flag_read_after_queue` — a queued writer reads its slot's `sync` flag while the batch's executor writes the slot | caught, under TSan (a data race); also by `WriteGroup slots may be destroyed as soon as submit returns` |
 | `mmap_end_relaxed` — `mmap_end_` weakened from release/acquire to relaxed | survives, by construction |
 
 Both caught mutations surface first as the engine refusing to derive a
