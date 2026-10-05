@@ -3,7 +3,8 @@
 `catch_amalgamated.hpp`/`catch_amalgamated.cpp` are Catch2 v3.15.2's official
 amalgamated distribution (Boost Software License 1.0, see the file headers),
 pinned to match the version xmake's `catch2 3.x` package currently resolves
-to. `catch2/catch_test_macros.hpp`, `catch2/generators/catch_generators.hpp` and
+to. `catch2/catch_test_macros.hpp`, `catch2/generators/catch_generators.hpp`,
+`catch2/generators/catch_generators_range.hpp` and
 `catch2/matchers/catch_matchers_string.hpp`
 are small shims so test files can keep using the normal modular Catch2
 include paths against this single-TU build.
