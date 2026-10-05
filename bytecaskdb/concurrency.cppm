@@ -18,6 +18,7 @@ module;
 #include <queue>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -357,6 +358,115 @@ private:
   std::condition_variable committer_cv_;
   std::thread committer_;
 #endif
+};
+
+// ---------------------------------------------------------------------------
+// CommitDelay — how long a flush that owes an fdatasync waits for the
+// commits it would otherwise miss.
+//
+// With the disk busy with fdatasync back to back, throughput is commits per
+// fdatasync. The clients one fdatasync releases send their next commit a
+// round trip later; a flush that starts at once leaves them for the flush
+// after, a whole fdatasync later. So before capturing the head, the flusher
+// waits until as many synced commits have finished stage 1 since the last
+// fdatasync returned as that fdatasync covered, or until min(F, 2 * R),
+// whichever comes first:
+//   F  the time per fdatasync, a running average. Waiting longer than one
+//      can never pay: a commit that misses this flush waits about F.
+//   R  a client's round trip, from a synced commit returning to the same
+//      thread's next synced commit, a running average. Samples of F or
+//      longer are dropped: a client that slow is not worth waiting for, and
+//      one idle connection would otherwise hold the average up.
+// Nothing is configured. A lone writer (the last fdatasync covered one
+// commit) never waits, nor does anything before F and R are measured. The
+// wait spins with yield, as the flush settle does.
+//
+// Thread-safety: every member is an atomic, read and written relaxed. The
+// values steer timing only; a lost or stale update costs at most one
+// mistimed wait. on_arrival and on_round_trip are called by writers;
+// on_sync_start, on_sync_end and wait by the thread holding the flush role.
+// ---------------------------------------------------------------------------
+export class CommitDelay {
+public:
+  using Clock = std::chrono::steady_clock;
+  // The atomics below hold Clock::rep counts and are named _ns.
+  static_assert(std::is_same_v<Clock::duration, std::chrono::nanoseconds>);
+
+  // A synced commit finished stage 1: the next fdatasync can cover it.
+  void on_arrival() noexcept { arrivals_.fetch_add(1, std::memory_order_relaxed); }
+
+  // A thread starts a synced commit `rt` after its previous one returned.
+  void on_round_trip(Clock::duration rt) noexcept {
+    if (rt < Clock::duration{f_ns_.load(std::memory_order_relaxed)})
+      average(r_ns_, rt);
+  }
+
+  // The flush role is about to fdatasync: it covers every arrival so far.
+  void on_sync_start() noexcept {
+    const auto now = arrivals_.load(std::memory_order_relaxed);
+    const auto before = at_start_.exchange(now, std::memory_order_relaxed);
+    covered_.store(now - before, std::memory_order_relaxed);
+  }
+
+  // The fdatasync returned after `took`; the commits it covered are being
+  // released.
+  void on_sync_end(Clock::duration took) noexcept {
+    average(f_ns_, took);
+    at_end_.store(arrivals_.load(std::memory_order_relaxed),
+                  std::memory_order_relaxed);
+  }
+
+  // Called by the flush role before it captures the head, only when the
+  // flush owes an fdatasync. Compiled out without threads: nothing could
+  // arrive while it waited.
+  void wait() noexcept {
+#ifndef BYTECASK_SINGLE_THREADED
+    const auto covered = covered_.load(std::memory_order_relaxed);
+    if (covered < 2) return;
+    const auto bound = std::min(f_ns_.load(std::memory_order_relaxed),
+                                2 * r_ns_.load(std::memory_order_relaxed));
+    if (bound <= 0) return;
+    const auto t0 = Clock::now();
+    const auto deadline = t0 + Clock::duration{bound};
+    const auto released = at_end_.load(std::memory_order_relaxed);
+    while (arrivals_.load(std::memory_order_relaxed) - released < covered &&
+           Clock::now() < deadline)
+      std::this_thread::yield();
+    waits_.fetch_add(1, std::memory_order_relaxed);
+    waited_ns_.fetch_add((Clock::now() - t0).count(), std::memory_order_relaxed);
+#endif
+  }
+
+  [[nodiscard]] auto waits() const noexcept -> std::int64_t {
+    return waits_.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] auto waited() const noexcept -> Clock::duration {
+    return Clock::duration{waited_ns_.load(std::memory_order_relaxed)};
+  }
+  [[nodiscard]] auto fsync_estimate() const noexcept -> Clock::duration {
+    return Clock::duration{f_ns_.load(std::memory_order_relaxed)};
+  }
+  [[nodiscard]] auto round_trip_estimate() const noexcept -> Clock::duration {
+    return Clock::duration{r_ns_.load(std::memory_order_relaxed)};
+  }
+
+private:
+  // Running average, weight 1/16 per sample; the first sample is taken
+  // whole. Concurrent updates may lose one; see the class comment.
+  static void average(std::atomic<Clock::rep> &avg, Clock::duration sample) noexcept {
+    const auto old = avg.load(std::memory_order_relaxed);
+    const auto x = sample.count();
+    avg.store(old == 0 ? x : old - old / 16 + x / 16, std::memory_order_relaxed);
+  }
+
+  std::atomic<std::uint64_t> arrivals_{0};
+  std::atomic<std::uint64_t> at_start_{0};  // arrivals when the last fdatasync started
+  std::atomic<std::uint64_t> at_end_{0};    // arrivals when the last fdatasync returned
+  std::atomic<std::uint64_t> covered_{0};   // commits the last fdatasync covered
+  std::atomic<Clock::rep> f_ns_{0};
+  std::atomic<Clock::rep> r_ns_{0};
+  std::atomic<std::int64_t> waits_{0};
+  std::atomic<Clock::rep> waited_ns_{0};
 };
 
 // ---------------------------------------------------------------------------
