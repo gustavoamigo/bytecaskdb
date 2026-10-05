@@ -169,17 +169,20 @@ public:
   // Enqueues slot and returns once the executor has run it. Rethrows the
   // slot's error, if it has one.
   void submit(Slot &slot) {
+    // Read before the slot is queued: once it is, the batch's executor may
+    // write the slot's fields while this thread waits.
+    const bool synced = slot.sync;
     slot.done = false;
     slot.err = nullptr;
     slot.state.store(kQueued, std::memory_order_relaxed);
     std::unique_lock<std::mutex> lk{queue_mu_};
     queue_.push_back(&slot);
     inflight_.fetch_add(1, std::memory_order_relaxed);
-    if (slot.sync) inflight_sync_.fetch_add(1, std::memory_order_relaxed);
+    if (synced) inflight_sync_.fetch_add(1, std::memory_order_relaxed);
 
     if (running_) {
       lk.unlock();
-      wait_released(slot);
+      wait_released(slot, synced);
     } else {
       running_ = true;
 #pragma clang diagnostic push
@@ -283,11 +286,13 @@ private:
     }
   }
 
-  static void wait_released(Slot &slot) {
+  // `synced` is the slot's sync flag as submit read it: the slot itself is
+  // the executor's to write until kDone.
+  static void wait_released(Slot &slot, bool synced) {
     // A synced writer does not poll: released at once, it would reach the
     // flush wait before the flush covering it publishes, and sleep there.
     const auto spin_until = std::chrono::steady_clock::now() +
-        (slot.sync ? std::chrono::microseconds{0} : kWriterSpin);
+        (synced ? std::chrono::microseconds{0} : kWriterSpin);
     bool spinning = true;
     for (;;) {
       const auto s = slot.state.load(std::memory_order_acquire);
