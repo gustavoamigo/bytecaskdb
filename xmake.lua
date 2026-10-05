@@ -62,7 +62,9 @@ option_end()
 -- syscall_fault_unwrapped). Only for a toolchain that links part of libstdc++
 -- statically, as manylinux's gcc-toolset does with libstdc++_nonshared.a:
 -- std::filesystem's references to openat, rename, … then land in this binary
--- and fail the guard although the engine does not make them. ci.yml keeps it.
+-- and fail the guard although the engine does not make them. The
+-- MemorySanitizer build is one such case, since its instrumented libc++ is
+-- static, and drops the guard on its own (see bytecask_tests). ci.yml keeps it.
 option("fault_sweep_link_guard")
     set_default(true)
     set_showmenu(true)
@@ -263,7 +265,12 @@ target("bytecask_tests")
         -- No interposer exists for these, so a reference to one fails the
         -- link with "undefined reference to __wrap_<call>": a call the sweep
         -- would not count. Write its interposer and move it to the list above.
-        if has_config("fault_sweep_link_guard") then
+        -- Not under MemorySanitizer: its libc++ is linked statically (see
+        -- scripts/build_msan_libcxx.sh), and std::filesystem's and
+        -- random_device's references to read, lstat, openat, … would fail
+        -- the guard although the engine makes none of them.
+        local msan = (get_config("sanitizer") or ""):find("memory", 1, true)
+        if has_config("fault_sweep_link_guard") and not msan then
             for _, call in ipairs(syscall_fault_unwrapped) do
                 add_ldflags("-Wl,--wrap=" .. call, {force = true})
             end

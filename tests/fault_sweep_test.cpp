@@ -7,7 +7,8 @@
 // to name them. After each failure only generic invariants are checked: the
 // state is the baseline or the baseline plus the whole transition, a degraded
 // engine resumes, a reopen recovers the same state serial and parallel, and
-// what a power cut leaves obeys the watermark rule.
+// what a power cut leaves obeys the watermark rule. Each operation is swept
+// once per I/O back-end.
 // See docs/correctness_validation.md, "Counted fault sweep".
 
 #include <algorithm>
@@ -26,6 +27,8 @@
 #include "fault_injector.h"
 #include "syscall_faults.h"
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
+#include <catch2/generators/catch_generators_range.hpp>
 
 import bytecask;
 
@@ -83,6 +86,40 @@ auto bytes(std::string_view sv) -> Bytes {
 auto open_db(const std::filesystem::path &dir, const Options &opts)
     -> std::unique_ptr<DB> {
   return std::unique_ptr<DB>{new DB(DB::open(dir, opts))};
+}
+
+// The I/O back-ends make different calls on the same operation: the buffer
+// pool opens a sealed file O_DIRECT, falls back, and fills frames with its
+// own pread; the mmap back-end maps the active file and each sealed one.
+struct Backend {
+  const char *name;
+  bytecask::IoBackend io;
+};
+
+constexpr Backend kBackends[] = {
+    {"pread", bytecask::IoBackend::Pread},
+    {"buffer pool", bytecask::IoBackend::BufferPool},
+    {"mmap", bytecask::IoBackend::Mmap},
+};
+
+// The pool must hold 2 x max_file_bytes. An operation on the default file
+// size gets a small one, so the pool, and each run, stays cheap; none of
+// them comes near it.
+constexpr std::uint64_t kPoolFileBytes = 64 * 1024;
+constexpr std::size_t kPoolBytes = 1024 * 1024;
+
+auto on_backend(Options opts, const Backend &backend) -> Options {
+  opts.io_backend = backend.io;
+  if (backend.io == bytecask::IoBackend::BufferPool) {
+    opts.max_file_bytes = std::min(opts.max_file_bytes, kPoolFileBytes);
+    opts.buffer_pool.capacity_bytes = kPoolBytes;
+  }
+  return opts;
+}
+
+auto with_backend(std::string_view name, const Backend &backend)
+    -> std::string {
+  return std::format("{} ({})", name, backend.name);
 }
 
 // The pass a sweep makes over an operation's calls.
@@ -318,7 +355,10 @@ auto sweep_step(const Operation &op, const Pass &pass, int n) -> bool {
   return rep.fired;
 }
 
-void sweep(const Operation &op) {
+void sweep(Operation op) {
+  const auto backend = GENERATE(from_range(kBackends));
+  op.name = with_backend(op.name, backend);
+  op.opts = on_backend(op.opts, backend);
   for (const auto &pass : kPasses) {
     int n = 1;
     while (sweep_step(op, pass, n)) {
@@ -607,7 +647,9 @@ TEST_CASE("fault sweep: resume after a torn append", "[fault_sweep]") {
 // acknowledged write is durable; it is closed either way; and a reopen in the
 // same process, where the page cache still holds the batch, recovers it.
 TEST_CASE("fault sweep: close", "[fault_sweep]") {
-  const Options opts{.max_file_bytes = 512};
+  const auto backend = GENERATE(from_range(kBackends));
+  const auto name = with_backend("close", backend);
+  const auto opts = on_backend({.max_file_bytes = 512}, backend);
   for (const auto &pass : kPasses) {
     for (int n = 1;; ++n) {
       REQUIRE(n <= kMaxCalls);
@@ -636,15 +678,15 @@ TEST_CASE("fault sweep: close", "[fault_sweep]") {
           }
           rep = faults.report();
         }
-        trace("close", pass, n, rep, threw);
-        INFO("close, fault " << pass.name << ", N = " << n << ": "
+        trace(name, pass, n, rep, threw);
+        INFO(name << ", fault " << pass.name << ", N = " << n << ": "
                              << (rep.fired ? rep.what : "not reached"));
         if (!rep.fired) REQUIRE_FALSE(threw);
         CHECK_THROWS_AS(db->put({}, to_bytes("late"), to_bytes("x")),
                         bytecask::DbClosed);
         cache.model.copy_device(dir, cut);  // power cut
       }
-      INFO("close, fault " << pass.name << ", N = " << n << ": "
+      INFO(name << ", fault " << pass.name << ", N = " << n << ": "
                            << (rep.fired ? rep.what : "not reached"));
       assert_hints_durable(cache.model);
       {
@@ -734,6 +776,7 @@ auto fill_files(DB &db) -> KeyValues {
 }  // namespace
 
 TEST_CASE("fault sweep: open after a clean close", "[fault_sweep]") {
+  const auto backend = GENERATE(from_range(kBackends));
   const Options opts{.max_file_bytes = 512};
   TempDir td;
   const auto shape = td.path / "shape";
@@ -742,16 +785,20 @@ TEST_CASE("fault sweep: open after a clean close", "[fault_sweep]") {
     auto db = DB::open(shape, opts);
     expected = fill_files(db);
   }
-  auto serial = opts;
+  auto parallel = on_backend(opts, backend);
+  auto serial = parallel;
   serial.recovery_threads = 1;
-  sweep_open(shape, expected, serial, "open (clean, serial)");
-  sweep_open(shape, expected, opts, "open (clean, parallel)");
+  sweep_open(shape, expected, serial,
+             with_backend("open (clean, serial)", backend));
+  sweep_open(shape, expected, parallel,
+             with_backend("open (clean, parallel)", backend));
 }
 
 // The directory a killed process leaves: the file that was active has no
 // hint and a preallocated tail, so open rewrites it, syncs it, cuts the tail
 // and generates the hint.
 TEST_CASE("fault sweep: open after a crash", "[fault_sweep]") {
+  const auto backend = GENERATE(from_range(kBackends));
   const Options opts{.max_file_bytes = 512};
   TempDir td;
   const auto shape = td.path / "shape";
@@ -761,8 +808,11 @@ TEST_CASE("fault sweep: open after a crash", "[fault_sweep]") {
     expected = fill_files(db);
     std::filesystem::copy(td.path / "live", shape);
   }
-  auto serial = opts;
+  auto parallel = on_backend(opts, backend);
+  auto serial = parallel;
   serial.recovery_threads = 1;
-  sweep_open(shape, expected, serial, "open (crashed, serial)");
-  sweep_open(shape, expected, opts, "open (crashed, parallel)");
+  sweep_open(shape, expected, serial,
+             with_backend("open (crashed, serial)", backend));
+  sweep_open(shape, expected, parallel,
+             with_backend("open (crashed, parallel)", backend));
 }
