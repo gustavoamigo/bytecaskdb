@@ -1664,7 +1664,12 @@ mutation reverts it.
   `sendfile` would fail the guard although the engine makes none of them.
   The wheel build configures `--fault_sweep_link_guard=n`; `ci.yml` keeps
   the guard. There the archived `std::filesystem` calls that are wrapped
-  (`stat`, `unlink`, …) are counted too.
+  (`stat`, `unlink`, …) are counted too. The MemorySanitizer build is the
+  same case: its instrumented libc++ is static (`build_msan_libcxx.sh`), so
+  `std::filesystem` and `random_device` bring `read`, `lstat`, `openat`,
+  `rename`, … into the binary, and `xmake.lua` drops the guard whenever
+  `--sanitizer` includes `memory` (#327). The sweep still runs there; the
+  ASan, TSan and UBSan legs and `ci.yml`'s build keep the guard.
 - *`mmap` reads cannot be failed this way.* A failed mapped read is a
   `SIGBUS`, not a return value. The `mmap` call itself is counted.
 - *One I/O back-end.* The sweep runs on the default, `Pread`; the buffer
