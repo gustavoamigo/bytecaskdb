@@ -64,13 +64,12 @@ namespace bytecask {
 //
 // A frame decompresses to exactly the bytes the entries serialize to
 // (hint_entry.cppm); compression changes how a hint is stored, not what it
-// says. Files written before compression — the entries back to back, then a
-// plain CRC-32C — are still read. The first u64 of such a file is the
-// sequence of its first entry, which never reaches 2^63, and the magic's last
-// byte sets that bit, so the two cannot be confused. The trailer is inverted
-// so that a reader that knows only the old layout fails the CRC on a new
-// file and rebuilds it from its data file, instead of parsing frames as
-// entries. See docs/hint_compression_design.md.
+// says. A file without the magic — such as one written before compression,
+// the entries back to back with a plain CRC-32C — is refused, and recovery
+// rebuilds it from its data file like any damaged hint. The trailer is
+// inverted so that a binary that knows only that older layout fails the CRC
+// on a framed file and rebuilds it too, instead of parsing frames as entries.
+// See docs/hint_compression_design.md.
 
 // Entries are buffered until a frame holds at least this many bytes. Small
 // enough that a merge holding one decoded frame per cursor stays bounded,
@@ -185,23 +184,21 @@ auto open_read_only(const std::filesystem::path &path) -> ScopedFd {
 }
 
 // What a reader knows about a hint file: the path to open it at, and where
-// its units are. A unit is what a scanner reads and decodes at once: a zstd
-// frame, or in a raw file a run of whole entries about a frame long. The file
+// its units are. A unit is what a scanner reads and decodes at once: one zstd
+// frame. The file
 // is not held open: the pass that opens it and every unit read after it open
 // the file for the duration of the read, so a recovery merging thousands of
 // files costs each thread one descriptor, not one per file (#251).
 struct HintSource {
   std::filesystem::path path;
-  bool framed{false};
   // File offset of each unit, then the offset where the units end.
   std::vector<std::uint64_t> units;
 };
 
 // The open pass reads a file front to back in chunks of this size. A chunk
-// holds any unit whole: the largest frame, or the largest raw entry.
+// holds any unit whole: the largest frame.
 constexpr std::size_t kOpenChunkBytes = 256 * 1024;
 static_assert(kOpenChunkBytes >= kMaxPackedFrameBytes);
-static_assert(kOpenChunkBytes >= kMaxHintEntryBytes);
 
 // Sequential reader for the open pass. Every byte before `end` is read once,
 // in order, and fed to the CRC as it arrives.
@@ -286,65 +283,47 @@ auto open_source(std::filesystem::path path)
   OpenPass pass{fd.get(), src->path, end};
 
   const auto head = pass.window(0, kFramedHeaderSize);
-  src->framed = head.size() >= kFramedMagic.size() &&
-                std::ranges::equal(head.first(kFramedMagic.size()),
-                                   kFramedMagic);
-  std::uint64_t at = 0;
-  if (src->framed) {
-    if (head.size() < kFramedHeaderSize) {
-      throw std::runtime_error{std::format(
-          "HintFile: '{}' is too small for its header", src->path.string())};
-    }
-    const auto version = std::to_integer<std::uint8_t>(head[8]);
-    const auto codec = std::to_integer<std::uint8_t>(head[9]);
-    if (version != kFramedVersion || codec != kCodecZstd) {
-      throw std::runtime_error{std::format(
-          "HintFile: '{}' has unsupported version {} / codec {}",
-          src->path.string(), version, codec)};
-    }
-    at = kFramedHeaderSize;
+  if (head.size() < kFramedMagic.size() ||
+      !std::ranges::equal(head.first(kFramedMagic.size()), kFramedMagic)) {
+    throw std::runtime_error{std::format(
+        "HintFile: '{}' is not a framed hint file", src->path.string())};
+  }
+  if (head.size() < kFramedHeaderSize) {
+    throw std::runtime_error{std::format(
+        "HintFile: '{}' is too small for its header", src->path.string())};
+  }
+  const auto version = std::to_integer<std::uint8_t>(head[8]);
+  const auto codec = std::to_integer<std::uint8_t>(head[9]);
+  if (version != kFramedVersion || codec != kCodecZstd) {
+    throw std::runtime_error{std::format(
+        "HintFile: '{}' has unsupported version {} / codec {}",
+        src->path.string(), version, codec)};
   }
 
+  std::uint64_t at = kFramedHeaderSize;
   while (at < end) {
     src->units.push_back(at);
-    if (src->framed) {
-      const auto bytes = pass.window(at, kMaxPackedFrameBytes);
-      const auto packed =
-          ZSTD_findFrameCompressedSize(bytes.data(), bytes.size());
-      if (ZSTD_isError(packed) || packed > kMaxPackedFrameBytes) {
-        throw std::runtime_error{std::format(
-            "HintFile: truncated or corrupt frame in '{}'",
-            src->path.string())};
-      }
-      const auto size = ZSTD_getFrameContentSize(bytes.data(), packed);
-      if (size == ZSTD_CONTENTSIZE_UNKNOWN || size == ZSTD_CONTENTSIZE_ERROR ||
-          size > kMaxFrameBytes) {
-        throw std::runtime_error{std::format(
-            "HintFile: frame of invalid size in '{}'", src->path.string())};
-      }
-      at += packed;
-    } else {
-      // A raw file has no frames; cut it into units at entry boundaries.
-      const auto start = at;
-      do {
-        const auto bytes = pass.window(at, kMaxHintEntryBytes);
-        try {
-          at += deserialize_entry(bytes).second;
-        } catch (const std::runtime_error &e) {
-          // The pass has not reached the trailer, so name the file: this is
-          // the only report its damage gets.
-          throw std::runtime_error{std::format(
-              "HintFile: '{}' is damaged: {}", src->path.string(), e.what())};
-        }
-      } while (at < end && at - start < frame_target());
+    const auto bytes = pass.window(at, kMaxPackedFrameBytes);
+    const auto packed =
+        ZSTD_findFrameCompressedSize(bytes.data(), bytes.size());
+    if (ZSTD_isError(packed) || packed > kMaxPackedFrameBytes) {
+      throw std::runtime_error{std::format(
+          "HintFile: truncated or corrupt frame in '{}'", src->path.string())};
     }
+    const auto size = ZSTD_getFrameContentSize(bytes.data(), packed);
+    if (size == ZSTD_CONTENTSIZE_UNKNOWN || size == ZSTD_CONTENTSIZE_ERROR ||
+        size > kMaxFrameBytes) {
+      throw std::runtime_error{std::format(
+          "HintFile: frame of invalid size in '{}'", src->path.string())};
+    }
+    at += packed;
   }
   src->units.push_back(end);
 
   std::array<std::byte, kFileCrcSize> trailer{};
   read_exact(fd.get(), trailer, end, src->path);
   const auto stored = read_le<std::uint32_t>(trailer, 0);
-  const auto computed = src->framed ? ~pass.crc() : pass.crc();
+  const auto computed = ~pass.crc();
   if (computed != stored) {
     throw std::runtime_error{
         std::format("HintFile: CRC mismatch in '{}'", src->path.string())};
@@ -371,8 +350,7 @@ export void set_hint_frame_bytes_for_testing(std::size_t bytes) noexcept {
 //
 // Read mode (OpenForRead): verifies the whole file against its trailer before
 // returning, then hands out Scanners that read it a unit at a time with
-// pread. Neither holds the file open between reads. Both layouts — framed,
-// and the raw layout written before compression — are read.
+// pread. Neither holds the file open between reads.
 //
 // Thread safety: NOT thread-safe. External synchronization is required.
 export class HintFile {
@@ -386,8 +364,8 @@ public:
   // (HintRecord).
   class Scanner {
   public:
-    // Where an entry starts: the index of the unit holding it — a frame, or a
-    // run of a raw file's entries — and its offset inside the decoded unit.
+    // Where an entry starts: the index of the frame holding it and its offset
+    // inside the decoded frame.
     // Positions order like the entries they name.
     struct Position {
       std::size_t frame{};
@@ -445,23 +423,18 @@ public:
       }
       const auto at = src_->units[i];
       const auto len = narrow<std::size_t>(src_->units[i + 1] - at);
-      if (src_->framed) {
-        auto &packed = thread_packed_frame();
-        packed.resize(len);
-        read_unit(packed, at);
-        const auto size = ZSTD_getFrameContentSize(packed.data(), len);
-        if (size == ZSTD_CONTENTSIZE_UNKNOWN ||
-            size == ZSTD_CONTENTSIZE_ERROR || size > kMaxFrameBytes)
-          throw std::runtime_error{"HintFile: frame of invalid size"};
-        reset_buffer(static_cast<std::size_t>(size));
-        const auto got = ZSTD_decompressDCtx(&thread_dctx(), buf_.data(),
-                                             buf_.size(), packed.data(), len);
-        if (ZSTD_isError(got) || got != size)
-          throw std::runtime_error{"HintFile: frame does not decompress"};
-      } else {
-        reset_buffer(len);
-        read_unit(buf_, at);
-      }
+      auto &packed = thread_packed_frame();
+      packed.resize(len);
+      read_unit(packed, at);
+      const auto size = ZSTD_getFrameContentSize(packed.data(), len);
+      if (size == ZSTD_CONTENTSIZE_UNKNOWN ||
+          size == ZSTD_CONTENTSIZE_ERROR || size > kMaxFrameBytes)
+        throw std::runtime_error{"HintFile: frame of invalid size"};
+      reset_buffer(static_cast<std::size_t>(size));
+      const auto got = ZSTD_decompressDCtx(&thread_dctx(), buf_.data(),
+                                           buf_.size(), packed.data(), len);
+      if (ZSTD_isError(got) || got != size)
+        throw std::runtime_error{"HintFile: frame does not decompress"};
       frame_ = buf_;
       frame_at_ = i;
       next_frame_ = i + 1;

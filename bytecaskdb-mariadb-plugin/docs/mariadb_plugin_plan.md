@@ -463,8 +463,8 @@ H.3 — Replication hooks:
   The existing `BulkBegin`/`BulkCommit` path works for both standalone
   and 2PC — `BulkPrepare` only activates under MariaDB 2PC.
 
-  See `docs/xa_support_design.md` for the full generic 2PC design
-  (batch markers, on-disk format, recovery semantics) and
+  The generic 2PC design (batch markers, on-disk format, recovery
+  semantics) is tracked in #340; see
   `docs/mariadb_engine_design.md` Phase 6 for MariaDB-specific
   handler integration.
 

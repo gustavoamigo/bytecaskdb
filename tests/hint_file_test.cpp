@@ -423,13 +423,14 @@ TEST_CASE("HintFile seek returns to every position a scan reported",
 // ---------------------------------------------------------------------------
 // Compatibility: the layout written before compression
 // ---------------------------------------------------------------------------
-TEST_CASE("HintFile reads the uncompressed layout", "[hintfile]") {
+TEST_CASE("HintFile refuses the uncompressed layout", "[hintfile]") {
+  // The entries back to back with a plain CRC-32C, as hints were written
+  // before compression. The file is intact; it is refused for lacking the
+  // magic, as a damaged hint is, so recovery rebuilds it from its data file.
   const auto tmp = std::filesystem::temp_directory_path() / "bc_hint_raw.hint";
   std::filesystem::remove(tmp);
-  const auto es = sample_entries(300);
-
   std::vector<std::byte> file;
-  for (const auto &e : es) {
+  for (const auto &e : sample_entries(50)) {
     const auto bytes =
         e.type == bytecask::EntryType::RangeDel
             ? bytecask::serialize_range_del_entry(e.seq, e.offset,
@@ -444,44 +445,7 @@ TEST_CASE("HintFile reads the uncompressed layout", "[hintfile]") {
   put_trailer(file, crc);
   write_file(tmp, file);
 
-  check_scan(bytecask::HintFile::OpenForRead(tmp), es);
-
-  SECTION("a file shorter than a frame is one unit, positions its offsets") {
-    const auto hf = bytecask::HintFile::OpenForRead(tmp);
-    auto scanner = hf.make_scanner();
-    (void)scanner.next();
-    const auto second = scanner.position();
-    CHECK(second.frame == 0);
-    CHECK(second.offset == bytecask::kHintHeaderSize); // BulkBegin, no key
-    (void)scanner.next();
-    scanner.seek(second);
-    const auto he = scanner.next();
-    REQUIRE(he.has_value());
-    check_entry(*he, es[1]);
-  }
-
-  SECTION("a longer file is cut into units at entry boundaries") {
-    // Units are cut at the frame size, so tiny frames cut a raw file into
-    // many; every position a scan reports must seek back to its entry.
-    FrameBytes fb{100};
-    const auto hf = bytecask::HintFile::OpenForRead(tmp);
-    check_scan(hf, es);
-    std::vector<bytecask::HintFile::Scanner::Position> at;
-    auto scanner = hf.make_scanner();
-    for (;;) {
-      at.push_back(scanner.position());
-      if (!scanner.next()) break;
-    }
-    REQUIRE(at.size() == es.size() + 1);
-    CHECK(std::ranges::is_sorted(at));
-    CHECK(at.front().frame != at[es.size() / 2].frame);
-    for (std::size_t i = es.size(); i-- > 0;) {
-      scanner.seek(at[i]);
-      const auto he = scanner.next();
-      REQUIRE(he.has_value());
-      check_entry(*he, es[i]);
-    }
-  }
+  CHECK_THROWS_AS(bytecask::HintFile::OpenForRead(tmp), std::runtime_error);
 }
 
 TEST_CASE("HintFile trailer fails a check that expects the old layout",

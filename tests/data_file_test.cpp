@@ -111,7 +111,7 @@ TEST_CASE("DataFile::append: B3 full write + error return — file throws",
       std::filesystem::temp_directory_path() / "bc_test_b3_tainted.data";
   std::filesystem::remove(path);
 
-  auto file = bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+  auto file = bytecask::WritablePosixDataFile::create(path, 0);
   const auto key = to_bytes("hello");
   const auto val = to_bytes("world");
 
@@ -136,7 +136,7 @@ TEST_CASE("DataFile::append: B2 partial write — file throws",
       std::filesystem::temp_directory_path() / "bc_test_b2_tainted.data";
   std::filesystem::remove(path);
 
-  auto file = bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+  auto file = bytecask::WritablePosixDataFile::create(path, 0);
   const auto key = to_bytes("hello");
   const auto val = to_bytes("world");
 
@@ -159,7 +159,7 @@ TEST_CASE("DataFile::append_entries batches multiple entries into one writev",
       std::filesystem::temp_directory_path() / "bc_test_append_entries.data";
   std::filesystem::remove(path);
 
-  auto file = bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+  auto file = bytecask::WritablePosixDataFile::create(path, 0);
   const auto k0 = to_bytes("key0");
   const auto v0 = to_bytes("val0");
   const auto k1 = to_bytes("key1");
@@ -220,7 +220,7 @@ TEST_CASE("WritableDataFile constructor: fresh file with no buffer",
       std::filesystem::temp_directory_path() / "bc_test_ctor_no_buf.data";
   std::filesystem::remove(path);
 
-  auto file = bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+  auto file = bytecask::WritablePosixDataFile::create(path, 0);
   CHECK(file->size() == 0);
   CHECK(std::filesystem::exists(path));
 
@@ -246,13 +246,13 @@ TEST_CASE("WritableDataFile constructor: reopens existing file",
 
   // Write one entry and close.
   {
-    auto file = bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+    auto file = bytecask::WritablePosixDataFile::create(path, 0);
     (void)file->append_entry(1, bytecask::EntryType::Put, key, val);
     file->sync();
   }
 
   // Native builds request mmap; Emscripten always uses pread.
-  auto file = bytecask::openDataFileForWrite(path, 4096, bytecask::IoBackend::Mmap);
+  auto file = bytecask::WritableMmapDataFile::create(path, 4096);
   CHECK(file->size() == entry_size);
 
   std::vector<std::byte> io_buf;
@@ -274,7 +274,7 @@ TEST_CASE("WritableDataFile constructor: reopens existing file",
 TEST_CASE("WritableDataFile constructor: throws on invalid path",
           "[data_file]") {
   REQUIRE_THROWS_AS(
-      bytecask::openDataFileForWrite("/nonexistent/dir/file.data", 0, bytecask::IoBackend::Pread),
+      bytecask::WritablePosixDataFile::create("/nonexistent/dir/file.data", 0),
       std::system_error);
 }
 
@@ -288,7 +288,7 @@ TEST_CASE("WritableDataFile::read_entry_unverified with mmap request",
       std::filesystem::temp_directory_path() / "bc_test_unverified_buf.data";
   std::filesystem::remove(path);
 
-  auto file = bytecask::openDataFileForWrite(path, 4096, bytecask::IoBackend::Mmap);
+  auto file = bytecask::WritableMmapDataFile::create(path, 4096);
   const auto key = to_bytes("bufkey");
   const auto val = to_bytes("bufval");
   (void)file->append_entry(42, bytecask::EntryType::Put, key, val);
@@ -398,7 +398,7 @@ TEST_CASE("WritableDataFile::read_entry_unverified pread fallback",
   std::filesystem::remove(path);
 
   // capacity=0 means no buffer — forces pread path.
-  auto file = bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+  auto file = bytecask::WritablePosixDataFile::create(path, 0);
   const auto key = to_bytes("pkey");
   const auto val = to_bytes("pval");
   (void)file->append_entry(7, bytecask::EntryType::Put, key, val);
@@ -428,7 +428,7 @@ TEST_CASE("WritablePosixDataFile::read_entry_unverified long key triggers retry"
   const auto key = to_bytes(long_key_str);
   const auto val = to_bytes("lv");
 
-  auto file = bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+  auto file = bytecask::WritablePosixDataFile::create(path, 0);
   (void)file->append_entry(42, bytecask::EntryType::Put, key, val);
 
   std::vector<std::byte> io_buf;
@@ -458,7 +458,7 @@ TEST_CASE("ReadOnlyPosixDataFile::read_entry_unverified short key",
   const auto key = to_bytes("shortkey");
   const auto val = to_bytes("shortval");
   {
-    auto w = bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+    auto w = bytecask::WritablePosixDataFile::create(path, 0);
     (void)w->append_entry(10, bytecask::EntryType::Put, key, val);
     w->sync();
   }
@@ -487,7 +487,7 @@ TEST_CASE("ReadOnlyPosixDataFile::read_entry_unverified long key triggers retry"
   const auto key = to_bytes(long_key_str);
   const auto val = to_bytes("lv");
   {
-    auto w = bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+    auto w = bytecask::WritablePosixDataFile::create(path, 0);
     (void)w->append_entry(99, bytecask::EntryType::Put, key, val);
     w->sync();
   }
@@ -519,7 +519,7 @@ TEST_CASE("ReadOnlyMmapDataFile::read_entry_unverified",
   const auto key = to_bytes("mmapkey");
   const auto val = to_bytes("mmapval");
   {
-    auto w = bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+    auto w = bytecask::WritablePosixDataFile::create(path, 0);
     (void)w->append_entry(55, bytecask::EntryType::Put, key, val);
     w->sync();
   }
@@ -553,7 +553,7 @@ TEST_CASE("WritableMmapDataFile: read_header pread fallback beyond mmap",
   const auto val = to_bytes("v");
 
   // capacity=16 — far too small for any entry, so all reads fall through to pread.
-  auto file = bytecask::openDataFileForWrite(path, 16, bytecask::IoBackend::Mmap);
+  auto file = bytecask::WritableMmapDataFile::create(path, 16);
   (void)file->append_entry(10, bytecask::EntryType::Put, key, val);
 
   // read_entry uses read_header internally — if header is beyond mmap, it uses pread.
@@ -581,7 +581,7 @@ TEST_CASE("WritableMmapDataFile: read_value pread fallback beyond mmap",
   const auto val = to_bytes("read_value_test_payload");
 
   // capacity=16 — entry written beyond mmap region.
-  auto file = bytecask::openDataFileForWrite(path, 16, bytecask::IoBackend::Mmap);
+  auto file = bytecask::WritableMmapDataFile::create(path, 16);
   (void)file->append_entry(20, bytecask::EntryType::Put, key, val);
 
   // read_value with verify=false exercises the pread fallback in read_value.
@@ -605,7 +605,7 @@ TEST_CASE("WritableMmapDataFile: read_entry_with_key_size pread fallback",
   const auto val = to_bytes("eval");
 
   // capacity=16 — forces pread path for read_entry (verified).
-  auto file = bytecask::openDataFileForWrite(path, 16, bytecask::IoBackend::Mmap);
+  auto file = bytecask::WritableMmapDataFile::create(path, 16);
   (void)file->append_entry(30, bytecask::EntryType::Put, key, val);
 
   std::vector<std::byte> io_buf;
@@ -637,8 +637,7 @@ TEST_CASE("WritableMmapDataFile::truncate leaves the mapping in place",
   std::filesystem::remove(path);
 
   constexpr std::size_t kCapacity = 1024 * 1024;
-  auto file = bytecask::openDataFileForWrite(path, kCapacity,
-                                             bytecask::IoBackend::Mmap);
+  auto file = bytecask::WritableMmapDataFile::create(path, kCapacity);
   const auto key = to_bytes("tk");
   const auto val = to_bytes("truncate_must_not_move_this");
   const auto kept = file->append_entry(1, bytecask::EntryType::Put, key, val);
@@ -702,7 +701,7 @@ TEST_CASE("Sweep over ReadOnlyMmapDataFile ends at truncated header",
   const auto key = to_bytes("scankey");
   const auto val = to_bytes("scanval");
   {
-    auto w = bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+    auto w = bytecask::WritablePosixDataFile::create(path, 0);
     (void)w->append_entry(1, bytecask::EntryType::Put, key, val);
     w->sync();
   }
@@ -728,7 +727,7 @@ TEST_CASE("Sweep over ReadOnlyMmapDataFile ends at truncated entry body",
   const auto full_size =
       bytecask::kHeaderSize + key.size() + val.size() + bytecask::kCrcSize;
   {
-    auto w = bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+    auto w = bytecask::WritablePosixDataFile::create(path, 0);
     (void)w->append_entry(2, bytecask::EntryType::Put, key, val);
     w->sync();
   }
@@ -809,7 +808,8 @@ TEST_CASE("DataFileIterator sweeps across chunk boundaries", "[data_file][iterat
 
   auto check_prefix = [&](const bytecask::DataFile &f, std::size_t n) {
     std::size_t i = 0;
-    for (const auto &[entry, off] : bytecask::scan_entries(f)) {
+    for (const auto &[entry, off] :
+         std::ranges::subrange{bytecask::DataFileIterator{f}, std::default_sentinel}) {
       REQUIRE(i < n);
       const auto &e = expected[i];
       CHECK(entry.sequence == e.seq);
@@ -847,7 +847,8 @@ TEST_CASE("DataFileIterator sweeps across chunk boundaries", "[data_file][iterat
       file = bytecask::openDataFileForRead(path, io_backend, pool, 1);
       CHECK_THROWS_AS(
           [&] {
-            for (const auto &e : bytecask::scan_entries(*file)) (void)e;
+            for (const auto &e :
+                 std::ranges::subrange{bytecask::DataFileIterator{*file}, std::default_sentinel}) (void)e;
           }(),
           std::runtime_error);
     }
@@ -965,7 +966,7 @@ TEST_CASE("DataFileIterator throws when the file shrinks under the sweep",
       std::filesystem::temp_directory_path() / "bc_test_shrunk.data";
   std::filesystem::remove(path);
   {
-    auto w = bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+    auto w = bytecask::WritablePosixDataFile::create(path, 0);
     for (std::uint64_t seq = 1; seq <= 3; ++seq)
       (void)w->append_entry(seq, bytecask::EntryType::Put, to_bytes("key"),
                             to_bytes("value"));
@@ -1017,8 +1018,7 @@ TEST_CASE("createDataFileForWrite panics when the data file already exists",
 
   // A sealed file from an earlier rotation, with content past the threshold.
   {
-    auto sealed = bytecask::openDataFileForWrite(
-        dir / (stem + ".data"), 0, bytecask::IoBackend::Pread);
+    auto sealed = bytecask::WritablePosixDataFile::create(dir / (stem + ".data"), 0);
     (void)sealed->append_entry(1, bytecask::EntryType::Put, to_bytes("k"),
                                to_bytes("v"));
     sealed->sync();
@@ -1331,7 +1331,7 @@ TEST_CASE("DataFile: a read past the end of file reports a short read",
       std::filesystem::temp_directory_path() / "bc_test_short_read.data";
   std::filesystem::remove(path);
   auto writer =
-      bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+      bytecask::WritablePosixDataFile::create(path, 0);
   (void)writer->append_entry(1, bytecask::EntryType::Put, to_bytes("a"),
                              to_bytes("first"));
   const auto second = writer->append_entry(2, bytecask::EntryType::Put,
@@ -1389,7 +1389,9 @@ TEST_CASE("DataFile: a record below a cut reads whole under a stale end",
   const auto path =
       std::filesystem::temp_directory_path() / "bc_test_stale_end.data";
   std::filesystem::remove(path);
-  auto writer = bytecask::openDataFileForWrite(path, 1 << 20, io_backend);
+  auto writer = io_backend == bytecask::IoBackend::Mmap
+                    ? bytecask::WritableMmapDataFile::create(path, 1 << 20)
+                    : bytecask::WritablePosixDataFile::create(path, 1 << 20);
   const auto first = writer->append_entry(1, bytecask::EntryType::Put,
                                           to_bytes("a"), to_bytes("first"));
   const auto second = writer->append_entry(2, bytecask::EntryType::Put,
@@ -1435,7 +1437,7 @@ TEST_CASE("DataFile: a write cut short by a full file reports a short write",
 
   SECTION("append_entry") {
     auto writer =
-        bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+        bytecask::WritablePosixDataFile::create(path, 0);
     (void)writer->append_entry(1, bytecask::EntryType::Put, to_bytes("a"),
                                to_bytes("first"));
     const auto error = bytecask_test::write_error_under_fsize_limit(
@@ -1448,7 +1450,7 @@ TEST_CASE("DataFile: a write cut short by a full file reports a short write",
   }
   SECTION("append_entries") {
     auto writer =
-        bytecask::openDataFileForWrite(path, 0, bytecask::IoBackend::Pread);
+        bytecask::WritablePosixDataFile::create(path, 0);
     (void)writer->append_entry(1, bytecask::EntryType::Put, to_bytes("a"),
                                to_bytes("first"));
     const std::array entries{
@@ -1467,8 +1469,7 @@ TEST_CASE("DataFile: a write cut short by a full file reports a short write",
     // Creation zero-fills the first 4 MiB chunk; a record that runs past it
     // makes the fill extend the file, and a limit inside the second chunk
     // cuts that pwrite short.
-    auto writer = bytecask::openDataFileForWrite(path, 16 << 20,
-                                                 bytecask::IoBackend::Pread);
+    auto writer = bytecask::WritablePosixDataFile::create(path, 16 << 20);
     const std::string large(5 << 20, 'v');
     const auto error = bytecask_test::write_error_under_fsize_limit(
         (4 << 20) + (512 << 10), [&] {

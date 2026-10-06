@@ -17,6 +17,12 @@
 > needs no descriptor per hint. §Reading and §Seeking below
 > describe the mapped reader as it was built; `docs/bytecask_design.md`
 > (*HintFile I/O model*) has the current one.
+>
+> **Update:** the uncompressed layout is no longer read. A hint without the
+> magic is refused like a damaged one and rebuilt from its data file in the
+> framed layout, so a database from before compression recovers the same keys
+> and its first open rewrites its hints. §Format detection and the
+> compatibility notes below describe the reader as it was built.
 
 ## Problem
 
