@@ -7,6 +7,7 @@ RUN dnf install -y \
     gcc \
     gcc-c++ \
     libstdc++-devel \
+    libstdc++-static \
     gdb \
     make \
     ninja-build \

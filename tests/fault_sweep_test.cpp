@@ -17,9 +17,11 @@
 #include <cstdlib>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <vector>
@@ -457,6 +459,42 @@ TEST_CASE("fault sweep: the interposers count the engine's calls",
     CHECK_NOTHROW(db->resume());
     CHECK(elsewhere.report().calls == 0);
   }
+}
+
+// The C++ standard library is linked statically so that std::filesystem's
+// calls reach the interposers too (xmake.lua). Linked against the shared
+// libstdc++, none of these would be counted.
+TEST_CASE("fault sweep: the interposers count std::filesystem's calls",
+          "[fault_sweep]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  std::filesystem::create_directories(dir);
+  const auto from = dir / "a.tmp";
+  const auto to = dir / "a";
+  { std::ofstream{from} << "x"; }
+
+  auto fails = [&](SyscallFault mode, auto &&call, std::string_view name) {
+    ScopedSyscallFaults faults{dir, mode, 1};
+    CHECK_THROWS_AS(call(), std::filesystem::filesystem_error);
+    const auto rep = faults.report();
+    INFO(rep.what);
+    CHECK(rep.what.starts_with(name));
+  };
+  fails(SyscallFault::before, [&] { (void)std::filesystem::file_size(from); },
+        "stat(");
+  fails(SyscallFault::before, [&] { (void)std::filesystem::exists(from); },
+        "stat(");
+  fails(SyscallFault::before,
+        [&] { (void)std::filesystem::directory_iterator{dir}; }, "openat(");
+  fails(SyscallFault::before,
+        [&] { (void)std::filesystem::create_directory(dir / "sub"); }, "mkdir(");
+  // Made, then reported failed: the rename landed.
+  fails(SyscallFault::after, [&] { std::filesystem::rename(from, to); },
+        "rename(");
+  CHECK(std::filesystem::exists(to));
+  fails(SyscallFault::before, [&] { (void)std::filesystem::remove(to); },
+        "remove(");
+  CHECK(std::filesystem::exists(to));
 }
 
 TEST_CASE("fault sweep: put", "[fault_sweep]") {

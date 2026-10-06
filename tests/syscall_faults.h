@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Gustavo Amigo
 //
 // Fault injection by count, below the engine: bytecask_tests is linked with
-// -Wl,--wrap=<call> for each I/O call the engine makes (xmake.lua), and the
+// -Wl,--wrap=<call> for each I/O call it references, the statically linked
+// C++ standard library's included (xmake.lua), and the
 // interposers in syscall_faults.cpp count the calls made on files under one
 // directory and fail the N-th. No checkpoint names the call, so a call added
 // to the engine tomorrow is counted the day it is added.
@@ -23,12 +24,13 @@ enum class SyscallFault {
   // The call is not made and reports EIO. Counts every wrapped call.
   before,
   // The call is made and then reports EIO: the fault lands after the bytes,
-  // the cut or the rename did. Counts the calls that change something:
-  // pwrite, pwritev, write, fdatasync, fsync, ftruncate, renameat2, link,
-  // unlink.
+  // the cut or the rename did. Counts the calls that change something: the
+  // writes, the syncs, and the calls that change a size, a directory entry
+  // or a file's metadata (Kind::write and Kind::change, syscall_faults.cpp).
   after,
   // The call transfers half of what was asked and returns that count.
-  // Counts pread, pwrite, pwritev and write.
+  // Counts pread, read, pwrite, pwritev, write, writev, sendfile and
+  // copy_file_range.
   short_io,
 };
 
