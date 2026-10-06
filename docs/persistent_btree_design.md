@@ -560,7 +560,12 @@ them back to the next allocation instead.
   or a read of unwritten bytes; on under TSan, which checks the pool's own
   synchronisation.
 
-`bytecask.keydir_pool_bytes` reports the bytes on the shared lists. The
+`bytecask.keydir_pool_bytes` reports the bytes on the shared lists, not
+the thread caches, so it can rise while a thread builds: the build takes
+from its cache first, and the nodes it frees on the way go to the shared
+lists. What a build drew from the pool is the shared lists and the
+builder's cache together, which is what the `[node_pool]` tests measure,
+each starting from an empty pool. The
 measurements, under glibc and jemalloc, are in
 `docs/commit_pipeline_design.md`, *Node allocation*.
 
