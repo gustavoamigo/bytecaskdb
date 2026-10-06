@@ -218,6 +218,7 @@ void profile_blind(const key_generators::KeyShape &shape, std::size_t n) {
   using Tree = bytecask::PersistentBlindBTree<LeafBytes>;
   ShapeResolver res{&shape, n, {}};
   std::string key_buf;
+  bytecask::btree_detail::node_pool_trim();
   const auto before = measure_heap_allocated();
   print_memory("before build");
   {
@@ -232,6 +233,12 @@ void profile_blind(const key_generators::KeyShape &shape, std::size_t n) {
       }
       t = std::move(tr).persistent();
     }
+    // Nodes the build freed wait in the node pool, at most 64 MiB per node
+    // size: reported, then freed, so heap/key is the tree's alone.
+    std::printf("  node pool: %.1f MiB\n",
+                static_cast<double>(bytecask::btree_detail::node_pool_bytes()) /
+                    (1024.0 * 1024.0));
+    bytecask::btree_detail::node_pool_trim();
     const auto after = measure_heap_allocated();
     print_memory("after insert");
     const auto st = t.stats();

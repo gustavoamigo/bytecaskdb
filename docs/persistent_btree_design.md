@@ -533,6 +533,37 @@ Three conclusions:
 Not counted: the retired nodes waiting on a live snapshot, which the
 interval rule bounds by what the snapshot reaches, as today.
 
+### Node pool
+
+Nodes come in two capacities (`kPooledNodeBytes`): 1 KiB for the blind
+tree's leaves and 4 KiB for every other node of either tree; a node grown
+for a long prefix is the exception. `NodePool` recycles those two by exact
+size. A batch allocates the nodes it path-copies on the thread that runs it,
+almost always the committer, and the nodes they replace are freed wherever
+the last version pinning them is released, usually a reader. A
+general-purpose allocator returns those frees where the allocating thread
+does not draw from them, so it keeps fetching fresh memory; the pool gives
+them back to the next allocation instead.
+
+- **give**, from any thread: onto the size's shared list, under its mutex,
+  up to 64 MiB per size; past that, `operator delete`.
+- **take**: from the calling thread's cache. An empty cache takes up to 256
+  nodes from the shared list and sorts them lowest address first, as a slab
+  allocator hands memory out: in free order, recycled nodes scatter a new
+  tree across memory (`engine_bench` `Get` −5%). The 256-node bound keeps a
+  refill's lock hold and sort short and lets recovery threads share the
+  pool (taking the whole list cost recovery 11% at 8 threads).
+- A thread's cache, at most 256 nodes per size (1.25 MiB), returns to the
+  shared lists when the thread exits. The lists are process-wide and never
+  destroyed, so a free during process exit touches no dead mutex.
+- Off under ASan and MSan, where recycled memory would hide a use after free
+  or a read of unwritten bytes; on under TSan, which checks the pool's own
+  synchronisation.
+
+`bytecask.keydir_pool_bytes` reports the bytes on the shared lists. The
+measurements, under glibc and jemalloc, are in
+`docs/commit_pipeline_design.md`, *Node allocation*.
+
 ## Performance expectations
 
 Stated before measuring so the benchmark can disagree.

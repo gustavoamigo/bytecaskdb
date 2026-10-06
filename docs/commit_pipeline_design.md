@@ -627,6 +627,49 @@ busy share and serial µs per commit, and every change to stage 1 is judged by
 the last of those. Run it on tmpfs, with jemalloc preloaded and the two
 builds alternating; on a full machine compare only runs from one session.
 
+### Node allocation
+
+The committer thread allocates almost every key-directory node: each batch
+path-copies the nodes it changes, and the nodes they replace are freed on
+whichever thread drops the last version pinning them, usually a reader. A
+general-purpose allocator does not hand those frees back to the allocating
+thread, so the committer keeps fetching fresh memory. Under jemalloc's
+defaults this is mostly slab allocation: a 4 KiB inner node fills a one-page
+slab on its own, and at 16 writers the allocator was 6.5% of the committer's
+CPU, 2.4 points of it getting slabs. `NodePool`
+(`docs/persistent_btree_design.md`, *Node pool*) recycles the two node sizes
+instead.
+
+`commit_probe`, tmpfs, `main` at 90e34d7, two rounds alternating, rounds
+within 0.4%, against `main` on glibc's `malloc`:
+
+| Allocator | Build | 16 writers | 48 writers | serial µs/commit (16 / 48) |
+|---|---|---:|---:|---|
+| glibc | without the pool | 16,144 | 19,750 | 55.1 / 48.5 |
+| glibc | pool | +4.1% | +5.4% | 53.2 / 45.8 |
+| jemalloc, defaults | without the pool | +3.4% | +4.9% | 54.2 / 46.0 |
+| jemalloc, defaults | pool | +6.0% | +9.9% | 51.2 / 43.9 |
+| jemalloc, `slab_sizes:1024-4096:32` | without the pool | +5.5% | +9.6% | 51.8 / 44.0 |
+
+RSS within 30 MB in every row. Under jemalloc, 32-page slabs for the node
+size classes recover what the pool does, and the two together add 0.2–0.3%
+more: the allocator's share of the serial section is gone either way. glibc
+has no such setting, and a packaged mariadbd (MariaDB 10.11 on Fedora 43)
+links neither jemalloc nor tcmalloc, so the pool is what a default
+deployment gets. With it, glibc stays 1–4% behind jemalloc: the rest of
+jemalloc's lead is not node allocation.
+
+Other jemalloc settings, without the pool, against its defaults at 16 / 48
+writers: `tcache_nslots_small_max:800` +0.1% / +0.3%,
+`tcache_gc_incr_bytes:1048576` 0.0% / −0.2%, `lg_tcache_flush_small_div:3`
+−0.2% / +0.3%, `narenas:1` +0.3% / −0.3%, `bin_shards` 16 for the node
+classes −0.3% / +0.2%, `percpu_arena` −1.7% / −1.0%. A thread cache ten
+times the default (`tcache_nslots_small_min:2000`,
+`tcache_gc_incr_bytes:8388608`, the MariaDB benchmarks' setting until the
+pool) cost 7–10% on `commit_probe` and 5–9% on sysbench fast-profile
+writes: the serial section stayed as fast, the threads around it slowed,
+and RSS rose 12 MB per thread. The benchmarks now run jemalloc's defaults.
+
 ## Commit delay
 
 With every commit synced and the disk busy with `fdatasync` back to back,

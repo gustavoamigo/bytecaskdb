@@ -543,6 +543,10 @@ template <typename A> void BM_MemoryFootprint(benchmark::State &state) {
   std::size_t net = 0;
   for (auto _ : state) {
     state.PauseTiming();
+    // The B+ trees' node pool would hand the build nodes freed by earlier
+    // benchmarks, and keep the nodes the build frees: empty it on both sides
+    // so net counts the tree's live nodes alone.
+    bytecask::btree_detail::node_pool_trim();
     alloc_tracker::reset();
     state.ResumeTiming();
 
@@ -550,6 +554,7 @@ template <typename A> void BM_MemoryFootprint(benchmark::State &state) {
     benchmark::DoNotOptimize(&m);
 
     state.PauseTiming();
+    bytecask::btree_detail::node_pool_trim();
     net = alloc_tracker::net_bytes();
     state.ResumeTiming();
   }
@@ -568,6 +573,10 @@ template <typename A> void BM_PrefixedMemory(benchmark::State &state) {
   std::size_t net = 0;
   for (auto _ : state) {
     state.PauseTiming();
+    // The B+ trees' node pool would hand the build nodes freed by earlier
+    // benchmarks, and keep the nodes the build frees: empty it on both sides
+    // so net counts the tree's live nodes alone.
+    bytecask::btree_detail::node_pool_trim();
     alloc_tracker::reset();
     state.ResumeTiming();
 
@@ -575,6 +584,7 @@ template <typename A> void BM_PrefixedMemory(benchmark::State &state) {
     benchmark::DoNotOptimize(&m);
 
     state.PauseTiming();
+    bytecask::btree_detail::node_pool_trim();
     net = alloc_tracker::net_bytes();
     state.ResumeTiming();
   }
