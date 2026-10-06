@@ -20,7 +20,6 @@
 //   hash_prefixed, binary, zipfian, clustered, many_partitions, mixed
 
 #include "../tests/key_generators.h"
-#include "unordered_view.h"
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
@@ -64,11 +63,6 @@ auto key_format() -> std::string {
 auto index_only() -> std::string {
   const char *env = std::getenv("BC_INDEX_ONLY");
   return (env && *env) ? std::string{env} : std::string{};
-}
-
-auto use_unordered_view() -> bool {
-  const char *env = std::getenv("BC_USE_UNORDERED_VIEW");
-  return env && *env && std::string{env} != "0";
 }
 
 auto make_value() -> std::array<std::byte, kValueSize> {
@@ -331,7 +325,6 @@ void profile_blind_growth(const key_generators::KeyShape &shape, std::size_t n,
 int main() {
   auto n = dataset_size();
   auto format = key_format();
-  auto use_uv = use_unordered_view();
   auto *shape = key_generators::key_shape_by_name(format);
   if (!shape) {
     std::fprintf(stderr, "Unknown BC_KEY_FORMAT: %s\nAvailable formats:", format.c_str());
@@ -379,9 +372,8 @@ int main() {
     return 0;
   }
 
-  std::printf("=== Memory Profile (%zu keys, %zu-byte %s keys, %zu-byte values%s) ===\n",
-              n, avg_key_size, format.c_str(), kValueSize,
-              use_uv ? ", UnorderedView" : "");
+  std::printf("=== Memory Profile (%zu keys, %zu-byte %s keys, %zu-byte values) ===\n",
+              n, avg_key_size, format.c_str(), kValueSize);
 
   const char *base = std::getenv("BC_BENCH_DIR");
   auto parent = base && *base ? std::filesystem::path{base}
@@ -394,59 +386,18 @@ int main() {
   {
     auto db = bytecask::DB::open(dir);
 
-    if (use_uv) {
-      // Route through UnorderedView — linear hashing maps arbitrary keys
-      // into sequential bucket keys for efficient radix tree compression.
-      unordered_view::Options uv_opts;
-      const char *cap_env = std::getenv("BC_UV_BUCKET_CAPACITY");
-      if (cap_env && *cap_env)
-        uv_opts.bucket_capacity = static_cast<std::uint32_t>(std::stoul(cap_env));
-      const char *sz_env = std::getenv("BC_UV_CAPACITY");
-      if (sz_env && *sz_env)
-        uv_opts.capacity = std::stoull(sz_env);
-      unordered_view::UnorderedView view{db, "uv", uv_opts};
-      for (std::size_t i = 0; i < n; ++i) {
-        shape->make_key(i, n, key_buf);
-        view.put(bc_key(key_buf), val_view);
-      }
-      // Final sync.
-      shape->make_key(0, n, key_buf);
-      db.put({.sync = true}, bc_key(key_buf), val_view);
+    bytecask::WriteOptions wo;
+    wo.sync = false;
 
-      // Print allocation / I/O counters.
-      auto &s = view.stats();
-      std::printf("\n  UnorderedView stats:\n");
-      std::printf("    splits:              %12lu  (empty: %lu)\n", s.splits, s.split_empty);
-      std::printf("    split_entries_moved:  %12lu\n", s.split_entries_moved);
-      std::printf("    split_tombstones_gc: %12lu\n", s.split_tombstones_gc);
-      std::printf("    split_db_reads:      %12lu\n", s.split_db_reads);
-      std::printf("    split_db_writes:     %12lu\n", s.split_db_writes);
-      std::printf("    put_append:          %12lu  (no-read fast path)\n", s.put_append);
-      std::printf("    put_bloom_skip:      %12lu  (bloom no-collision → overwrite)\n", s.put_bloom_skip);
-      std::printf("    put_bloom_rmw:       %12lu  (bloom maybe-collision → RMW)\n", s.put_bloom_rmw);
-      std::printf("    bloom_collisions_set:%12lu\n", s.bloom_collisions_set);
-      std::printf("    put_chain_update:    %12lu  (read-modify-write)\n", s.put_chain_update);
-      std::printf("    chain_decodes:       %12lu\n", s.chain_decodes);
-      std::printf("    chain_encodes:       %12lu\n", s.chain_encodes);
-      std::printf("    splits/put ratio:    %12.4f\n",
-                  n > 0 ? static_cast<double>(s.splits) / static_cast<double>(n) : 0.0);
-      std::printf("    entries_moved/put:   %12.4f\n",
-                  n > 0 ? static_cast<double>(s.split_entries_moved) / static_cast<double>(n) : 0.0);
-      std::printf("\n");
-    } else {
-      bytecask::WriteOptions wo;
-      wo.sync = false;
-
-      for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
-        auto end = std::min(i + kPopulateBatchSize, n);
-        bytecask::WritePlan plan;
-        for (std::size_t j = i; j < end; ++j) {
-          shape->make_key(j, n, key_buf);
-          plan.put(bc_key(key_buf), val_view);
-        }
-        wo.sync = (end == n);
-        (void)db.apply_batch(wo, std::move(plan));
+    for (std::size_t i = 0; i < n; i += kPopulateBatchSize) {
+      auto end = std::min(i + kPopulateBatchSize, n);
+      bytecask::WritePlan plan;
+      for (std::size_t j = i; j < end; ++j) {
+        shape->make_key(j, n, key_buf);
+        plan.put(bc_key(key_buf), val_view);
       }
+      wo.sync = (end == n);
+      (void)db.apply_batch(wo, std::move(plan));
     }
 
     print_memory("after insert");

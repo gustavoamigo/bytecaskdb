@@ -3,7 +3,7 @@
 //
 // ByteCaskDB — engine benchmarks: throughput and latency vs RocksDB
 
-// Benchmarks comparing ByteCaskDB against LevelDB and RocksDB across:
+// Benchmarks comparing ByteCaskDB against RocksDB across:
 //  - Put throughput (ops/µs)
 //  - Get throughput (ops/µs)
 //  - Del throughput (ops/µs)
@@ -15,14 +15,12 @@
 //   - nosync: WriteOptions::sync = false  (OS page-cache durability)
 //   - sync:   WriteOptions::sync = true   (fdatasync per write)
 //
-// Keys: each adapter provides generate_keys(); ByteCaskDB/RocksDB/LevelDB use
-//   UUIDv7-like prefix-heavy keys, UnorderedView uses 16-byte binary UUIDv4.
-// Values: 1 KiB of random (incompressible) bytes; LevelDB compression disabled.
-//   Using compressible fill (e.g. 0xAB * 1024) gives LevelDB an unfair
-//   advantage: Snappy collapses 1 KiB to ~15 bytes, fitting the entire dataset
-//   in the block cache.  Random bytes eliminate that effect.
+// Keys: each adapter provides generate_keys(); the default adapters use
+//   UUIDv7-like prefix-heavy keys, the *_UUIDv4 variants random 16-byte binary UUIDv4.
+// Values: random (incompressible) bytes, so a compressing engine cannot
+//   shrink the dataset into its block cache.
 //
-// ByteCaskDB is opened in a fresh tmpdir per benchmark; LevelDB likewise.
+// Each engine is opened in a fresh tmpdir per benchmark.
 // After each benchmark the directory is removed.
 
 #include <algorithm>
@@ -55,12 +53,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-// LevelDB
-#ifndef BENCH_NO_LEVELDB
-#include <leveldb/db.h>
-#include <leveldb/write_batch.h>
-#endif
-
 // RocksDB
 #ifndef BENCH_NO_ROCKSDB
 #include <rocksdb/db.h>
@@ -75,8 +67,6 @@ import bytecask;
 import bytecask.hint_entry;
 import bytecask.hint_file;
 import bytecask.types;
-
-#include "unordered_view.h"
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -177,23 +167,11 @@ auto bc_val(const std::vector<std::byte> &v) -> bytecask::BytesView {
   return std::span<const std::byte>{v.data(), v.size()};
 }
 
-#ifndef BENCH_NO_LEVELDB
-auto ldb_slice(const std::string &s) -> leveldb::Slice {
-  return {s.data(), s.size()};
-}
-#endif
-
 // Wraps the reinterpret_cast needed to view a byte vector as a C char array.
-// Both LevelDB and RocksDB accept their respective Slice via const char*.
+// RocksDB's Slice takes a const char*.
 auto bytes_to_chars(const std::vector<std::byte> &v) -> const char * {
   return reinterpret_cast<const char *>(v.data());
 }
-
-#ifndef BENCH_NO_LEVELDB
-auto ldb_val_slice(const std::vector<std::byte> &v) -> leveldb::Slice {
-  return {bytes_to_chars(v), v.size()};
-}
-#endif
 
 #ifndef BENCH_NO_ROCKSDB
 auto rdb_slice(const std::string &s) -> rocksdb::Slice {
@@ -307,7 +285,6 @@ inline void cas_backoff(std::uint64_t failed_attempts) {
   std::uniform_int_distribution<std::uint64_t> dist{0, max_us};
   std::this_thread::sleep_for(std::chrono::microseconds{dist(rng)});
 }
-
 
 // Total buffer pool footprint for the BufferPool adapter — the default, so
 // every fixture allocates one and it is sized to the dataset rather than
@@ -486,54 +463,6 @@ struct PoolHitRatio {
   }
 };
 
-struct BcUnorderedViewAdapter {
-  static auto generate_keys(std::size_t n) { return generate_uuid_keys(n); }
-
-  struct Db {
-    TmpDir dir;
-    bytecask::DB engine;
-    std::unique_ptr<unordered_view::UnorderedView> view;
-
-    Db(std::string_view tag, const std::vector<std::string> *populate_keys,
-       const std::vector<std::byte> *populate_val)
-        : dir{tag}, engine{bytecask::DB::open(dir.path)},
-          view{std::make_unique<unordered_view::UnorderedView>(engine, "uv",
-               unordered_view::Options{.capacity = kDatasetSize})} {
-      if (populate_keys && populate_val) {
-        auto val_view = bytecask::BytesView{populate_val->data(),
-                                            populate_val->size()};
-        for (const auto &k : *populate_keys) {
-          view->put(bc_key(k), val_view);
-        }
-        // Final sync.
-        engine.put({.sync = true}, bc_key((*populate_keys)[0]), val_view);
-      }
-    }
-  };
-
-  static auto open_empty(std::string_view tag) -> Db {
-    return Db{tag, nullptr, nullptr};
-  }
-
-  static auto open_populated(std::string_view tag,
-                             const std::vector<std::string> &keys,
-                             const std::vector<std::byte> &val) -> Db {
-    return Db{tag, &keys, &val};
-  }
-
-  static void put(Db &db, const std::string &k,
-                  const std::vector<std::byte> &v, bool /*sync*/) {
-    db.view->put(bc_key(k), bc_val(v));
-  }
-
-  static void get(Db &db, const std::string &k) {
-    bytecask::Bytes value;
-    auto found = db.view->get(bc_key(k), value);
-    benchmark::DoNotOptimize(found);
-    benchmark::DoNotOptimize(value.data());
-  }
-};
-
 struct BcCasAdapter {
   struct Db {
     TmpDir dir;
@@ -590,108 +519,6 @@ struct BcCasAdapter {
     }
   }
 };
-
-#ifndef BENCH_NO_LEVELDB
-template <bool UseCache = true> struct LdbAdapter {
-  static auto generate_keys(std::size_t n) { return generate_prefixed_keys(n); }
-
-  struct Db {
-    TmpDir dir;
-    leveldb::DB *raw{nullptr};
-
-    Db(std::string_view tag, const std::vector<std::string> *populate_keys,
-       const std::vector<std::byte> *populate_val)
-        : dir{tag} {
-      leveldb::Options opts;
-      opts.create_if_missing = true;
-      auto s = leveldb::DB::Open(opts, dir.path.string(), &raw);
-      if (!s.ok())
-        throw std::runtime_error{"LevelDB open failed: " + s.ToString()};
-
-      if (populate_keys) {
-        leveldb::WriteOptions wo;
-        wo.sync = false;
-        for (const auto &k : *populate_keys) {
-          s = raw->Put(wo, ldb_slice(k), ldb_val_slice(*populate_val));
-          if (!s.ok())
-            throw std::runtime_error{"LevelDB put failed: " + s.ToString()};
-        }
-      }
-    }
-
-    ~Db() { delete raw; }
-    Db(const Db &) = delete;
-    Db &operator=(const Db &) = delete;
-  };
-
-  static auto open_empty(std::string_view tag) -> Db {
-    return Db{tag, nullptr, nullptr};
-  }
-
-  static auto open_populated(std::string_view tag,
-                             const std::vector<std::string> &keys,
-                             const std::vector<std::byte> &val) -> Db {
-    return Db{tag, &keys, &val};
-  }
-
-  static void put(Db &db, const std::string &k, const std::vector<std::byte> &v,
-                  bool sync) {
-    leveldb::WriteOptions wo;
-    wo.sync = sync;
-    auto s = db.raw->Put(wo, ldb_slice(k), ldb_val_slice(v));
-    benchmark::DoNotOptimize(s);
-  }
-
-  static void get(Db &db, const std::string &k) {
-    leveldb::ReadOptions ro;
-    ro.verify_checksums = false;
-    if constexpr (!UseCache)
-      ro.fill_cache = false;
-    std::string value;
-    auto s = db.raw->Get(ro, ldb_slice(k), &value);
-    benchmark::DoNotOptimize(value);
-  }
-
-  static void del(Db &db, const std::string &k, bool sync) {
-    leveldb::WriteOptions wo;
-    wo.sync = sync;
-    auto s = db.raw->Delete(wo, ldb_slice(k));
-    benchmark::DoNotOptimize(s);
-  }
-
-  static void range(Db &db, const std::string &k, int limit) {
-    leveldb::ReadOptions ro;
-    ro.verify_checksums = false;
-    if constexpr (!UseCache)
-      ro.fill_cache = false;
-    std::unique_ptr<leveldb::Iterator> it{db.raw->NewIterator(ro)};
-    it->Seek(ldb_slice(k));
-    int count = 0;
-    for (; it->Valid() && count < limit; it->Next(), ++count) {
-      benchmark::DoNotOptimize(it->value());
-    }
-  }
-
-  // Batch: 90% put + 10% del in a single atomic WriteBatch call.
-  static void apply_batch(Db &db, const std::vector<std::string> &keys,
-                          const std::vector<std::byte> &val, std::size_t start,
-                          int count, bool sync) {
-    leveldb::WriteBatch wb;
-    for (int i = 0; i < count; ++i) {
-      const auto &k = keys[(start + i) % keys.size()];
-      if (i % 10 == 9) {
-        wb.Delete(ldb_slice(k));
-      } else {
-        wb.Put(ldb_slice(k), ldb_val_slice(val));
-      }
-    }
-    leveldb::WriteOptions wo;
-    wo.sync = sync;
-    auto s = db.raw->Write(wo, &wb);
-    benchmark::DoNotOptimize(s);
-  }
-};
-#endif // BENCH_NO_LEVELDB
 
 #ifndef BENCH_NO_ROCKSDB
 template <bool UseCache = true> struct RdbAdapter {
@@ -1099,7 +926,6 @@ template <typename A, int RangeLen> void BM_Range(benchmark::State &state) {
   pool_ratio.attach(state);
 }
 
-
 // ──────────────────────────── Mixed ──────────────────────────────────────────
 // 80% get / 10% put / 10% del
 
@@ -1393,8 +1219,6 @@ void BM_ReadWhileWriting(benchmark::State &state) {
   }
 }
 
-
-
 // ──────────── CAS (Compare-And-Swap) multithreaded ──────────────────────────
 // N threads concurrently read-modify-write 100 stock counters using optimistic
 // concurrency control. Each iteration is one successful CAS; retries on
@@ -1439,8 +1263,6 @@ void BM_CasMT(benchmark::State &state) {
       attempts / iters, benchmark::Counter::kAvgThreads);
   attach_jitter(state, samples);
 }
-
-
 
 // ──────────── Parallel Recovery ──────────────────────────────────────────────
 // Measures a cold start with varying thread counts: every file of the
@@ -1606,22 +1428,17 @@ void BM_OpenHintless(benchmark::State &state) {
 using Bc  = BcAdapter;        // buffer pool, warmed (default read path)
 using BcMmap = BcMmapAdapter;    // mmap (explicit comparison)
 using BcPread = BcPreadAdapter;  // pread (explicit comparison)
-using BcUV = BcUnorderedViewAdapter;
 
-// BcAdapter with UUIDv4 keys for apples-to-apples comparison with UnorderedView.
+// BcAdapter on random UUIDv4 keys, against RdbUuid.
 struct BcUuidAdapter : BcAdapter {
   static auto generate_keys(std::size_t n) { return generate_uuid_keys(n); }
 };
 using BcUuid = BcUuidAdapter;
-#ifndef BENCH_NO_LEVELDB
-using Ldb = LdbAdapter<true>;
-using LdbNC = LdbAdapter<false>;
-#endif
 #ifndef BENCH_NO_ROCKSDB
 using Rdb = RdbAdapter<true>;
 using RdbNC = RdbAdapter<false>;
 
-// RdbAdapter with UUIDv4 keys for apples-to-apples comparison with UnorderedView.
+// RdbAdapter on random UUIDv4 keys, against BcUuid.
 struct RdbUuidAdapter : RdbAdapter<true> {
   static auto generate_keys(std::size_t n) { return generate_uuid_keys(n); }
 };
@@ -1657,32 +1474,13 @@ BENCH(BM_Get<BcPread>)             ->Name("ByteCaskDB_Pread/Get");
 BENCH(BM_Range<BcPread, kRangeLen>)->Name("ByteCaskDB_Pread/Range50");
 #endif
 
-// --- UnorderedView (legacy, disabled; slated for removal) ---
-// BENCH(BM_Put<BcUV, false>)          ->Name("ByteCaskDB_UnorderedView/Put/NoSync")->Iterations(kDatasetSize);
-// BENCH(BM_Get<BcUV>)                 ->Name("ByteCaskDB_UnorderedView/Get");
-
-// --- RocksDB with UUIDv4 keys (apples-to-apples with UnorderedView) ---
+// --- RocksDB with UUIDv4 keys ---
 #ifndef BENCH_NO_ROCKSDB
 BENCH(BM_Get<RdbUuid>)              ->Name("RocksDB_UUIDv4/Get");
 #endif
 
-// --- ByteCaskDB with UUIDv4 keys (apples-to-apples with UnorderedView) ---
+// --- ByteCaskDB with UUIDv4 keys ---
 BENCH(BM_Get<BcUuid>)               ->Name("ByteCaskDB_UUIDv4/Get");
-
-
-
-
-
-// --- LevelDB ---
-#ifndef BENCH_NO_LEVELDB
-// BENCH(BM_Put<Ldb, false>)          ->Name("LevelDB/Put/NoSync");
-// BENCH(BM_Put<Ldb, true>)           ->Name("LevelDB/Put/Sync");
-// BENCH(BM_Del<Ldb, true>)           ->Name("LevelDB/Del/Sync");
-// BENCH(BM_Get<Ldb>)                 ->Name("LevelDB/Get");
-// BENCH(BM_Range<Ldb, kRangeLen>)    ->Name("LevelDB/Range50");
-// BENCH(BM_MixedBatch<Ldb, true>)    ->Name("LevelDB/MixedBatch/Sync");
-#endif
-
 
 // --- RocksDB ---
 #ifndef BENCH_NO_ROCKSDB
@@ -1693,8 +1491,6 @@ BENCH(BM_Get<Rdb>)                 ->Name("RocksDB/Get");
 BENCH(BM_Range<Rdb, kRangeLen>)    ->Name("RocksDB/Range50");
 BENCH(BM_MixedBatch<Rdb, true>)    ->Name("RocksDB/MixedBatch/Sync");
 #endif
-
-
 
 // --- Recovery from 1 thread to 16 ---
 BENCH(BM_RecoveryParallel)->Name("ByteCaskDB/Recovery")->ArgName("threads")->Arg(1) ->Unit(benchmark::kSecond);
@@ -1733,12 +1529,6 @@ BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(8
 BENCH(BM_GetMT<Rdb>)               ->Name("RocksDB/GetMT")           ->Threads(16);
 BENCH(BM_GetMT<Rdb>)                ->Name("RocksDB/GetMT")           ->Threads(32);
 #endif
-// --- UnorderedView GetMT (legacy, disabled; slated for removal) ---
-// BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(2);
-// BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(4);
-// BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(8);
-// BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(16);
-// BENCH(BM_GetMT<BcUV>)              ->Name("ByteCaskDB_UnorderedView/GetMT")      ->Threads(32);
 
 // --- ReadAndWriteLoad (read throughput with 1 background writer) ---
 BENCH(BM_ReadWhileWriting<Bc, true>)            ->Name("ByteCaskDB/ReadAndWriteLoad/Sync")            ->Threads(2);
@@ -1832,7 +1622,6 @@ BENCH(BM_CasMT<RdbCas, true>)  ->Name("RocksDB/CasMT/Sync")      ->Threads(16);
 BENCH(BM_CasMT<RdbCas, true>)  ->Name("RocksDB/CasMT/Sync")      ->Threads(32);
 #endif
 #endif // BENCH_NO_MT
-
 
 // clang-format on
 

@@ -55,7 +55,6 @@ jobs:
           xmake build bytecask_tests
           xmake build btree_tests
           xmake build radix_tree_memory_tests
-          xmake build unordered_view_tests
           # Built here so a break shows up on the PR; they run in
           # crash-nightly.yml, isolation-nightly.yml and chaos-nightly.yml.
           xmake build crash_consistency
@@ -69,7 +68,6 @@ jobs:
           build/linux/x86_64/release/bytecask_tests --reporter junit --out test-results/bytecask_tests.xml || status=1
           build/linux/x86_64/release/btree_tests --reporter junit --out test-results/btree_tests.xml || status=1
           build/linux/x86_64/release/radix_tree_memory_tests --reporter junit --out test-results/radix_tree_memory_tests.xml || status=1
-          build/linux/x86_64/release/unordered_view_tests --reporter junit --out test-results/unordered_view_tests.xml || status=1
           exit "$status"
 
       - name: Run chaosfs model tests
@@ -90,8 +88,7 @@ jobs:
           /usr/bin/python scripts/enrich_junit_sources.py \
             --pair build/linux/x86_64/release/bytecask_tests:test-results/bytecask_tests.xml \
             --pair build/linux/x86_64/release/btree_tests:test-results/btree_tests.xml \
-            --pair build/linux/x86_64/release/radix_tree_memory_tests:test-results/radix_tree_memory_tests.xml \
-            --pair build/linux/x86_64/release/unordered_view_tests:test-results/unordered_view_tests.xml
+            --pair build/linux/x86_64/release/radix_tree_memory_tests:test-results/radix_tree_memory_tests.xml
 
       - name: Publish test results in GitHub Checks
         if: ${{ always() && !cancelled() }}
@@ -116,7 +113,6 @@ jobs:
             ./test-results/bytecask_tests.xml
             ./test-results/btree_tests.xml
             ./test-results/radix_tree_memory_tests.xml
-            ./test-results/unordered_view_tests.xml
           report_type: test_results
           flags: cpp
           name: bytecask-cpp-tests

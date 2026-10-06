@@ -376,7 +376,8 @@ TEST_CASE("WriteGroup executor throw propagates to all waiting slots",
   CHECK(threw.load() == kSubmitters);
 }
 
-TEST_CASE("WriteGroup aborted slots receive WriteGroupAborted", "[concurrency]") {
+TEST_CASE("WriteGroup slots the executor fails throw; the rest return",
+          "[concurrency]") {
   std::atomic<int> aborted_count{0};
   std::atomic<int> succeeded_count{0};
   constexpr int kThreads = 4;
@@ -385,7 +386,7 @@ TEST_CASE("WriteGroup aborted slots receive WriteGroupAborted", "[concurrency]")
   bytecask::WriteGroup wg{[](std::vector<bytecask::Slot *> &batch) {
     std::this_thread::sleep_for(std::chrono::milliseconds{5});
     for (std::size_t i = 1; i < batch.size(); ++i) {
-      batch[i]->err = std::make_exception_ptr(bytecask::WriteGroupAborted{});
+      batch[i]->err = std::make_exception_ptr(std::runtime_error("aborted"));
     }
   }};
 
@@ -399,7 +400,7 @@ TEST_CASE("WriteGroup aborted slots receive WriteGroupAborted", "[concurrency]")
       try {
         wg.submit(slot);
         ++succeeded_count;
-      } catch (const bytecask::WriteGroupAborted &) {
+      } catch (const std::runtime_error &) {
         ++aborted_count;
       }
     });

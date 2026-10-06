@@ -16,7 +16,6 @@ module;
 #include <iostream>
 #include <mutex>
 #include <queue>
-#include <stdexcept>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -25,20 +24,6 @@ module;
 export module bytecask.concurrency;
 
 namespace bytecask {
-
-// ---------------------------------------------------------------------------
-// WriteGroupAborted — thrown to callers whose slot was not executed
-// because a prior slot in the same batch failed.
-// ---------------------------------------------------------------------------
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wweak-vtables"
-export class WriteGroupAborted : public std::runtime_error {
-public:
-  WriteGroupAborted()
-      : std::runtime_error(
-            "bytecask: write group aborted — operation was not attempted") {}
-};
-#pragma clang diagnostic pop
 
 // ---------------------------------------------------------------------------
 // Slot — base type for writer submit interfaces.
