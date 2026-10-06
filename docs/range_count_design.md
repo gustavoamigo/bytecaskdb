@@ -1,6 +1,6 @@
 # Counting keys in a range without reading records
 
-Status: approved. This change implements exact counting up to a limit;
+Status: implemented (`Snapshot::count_keys`). It implements exact counting up to a limit;
 estimating the rest of a range beyond the limit is a follow-up (see the end).
 
 ## Problem

@@ -16,7 +16,7 @@ For a first-pass overview focused on the main write loop, see `docs/bytecask_int
 
 `scripts/sys-info.sh` reports host hardware characteristics for the current execution context. The memory section is intentionally minimal and privilege-free: it reports the machine's installed RAM capacity from `/proc/meminfo` instead of attempting detailed DIMM inventory. The disk section resolves the filesystem mounted at an optional target path argument (default `./.tmp`) via `findmnt --target`, strips any bracketed subvolume suffix from the reported source, and then maps partitions/LVM-style block devices back to their parent physical disk with `lsblk -no PKNAME`. This keeps the output focused on the disk that backs the benchmark data directory instead of listing every block device on the host. The target path is also where the `fio` sequential read/write probes run, and it is echoed as `Measured path` in the output. `benchmark_showcase.py` passes its `--tmpdir` here: the reported hardware must be the disk the benchmarks actually wrote to, not the one holding the repository.
 
-The main CI workflow (`.github/workflows/ci.yml`) includes a dedicated `coverage` job. It runs `scripts/run_coverage.sh` in a Fedora + Clang environment, executes the C++ test binaries (`bytecask_tests`, `radix_tree_memory_tests`, `unordered_view_tests`, and `bytecask_tests` twice more, built with `BYTECASK_KEYDIR=btree` and `BYTECASK_KEYDIR=radix`, so the keyed and radix trees' engine paths — their recovery among them — count alongside the default blind tree's) with LLVM profile instrumentation, merges profiles with `llvm-profdata`, generates HTML coverage (`coverage/html`), exports `lcov.info`, uploads both artifacts to GitHub Actions, and publishes `lcov.info` to Codecov for repository coverage tracking and badge rendering.
+The main CI workflow (`.github/workflows/ci.yml`) includes a dedicated `coverage` job. It runs `scripts/run_coverage.sh` in a Fedora + Clang environment, executes the C++ test binaries (`bytecask_tests`, `radix_tree_memory_tests`, and `bytecask_tests` twice more, built with `BYTECASK_KEYDIR=btree` and `BYTECASK_KEYDIR=radix`, so the keyed and radix trees' engine paths — their recovery among them — count alongside the default blind tree's) with LLVM profile instrumentation, merges profiles with `llvm-profdata`, generates HTML coverage (`coverage/html`), exports `lcov.info`, uploads both artifacts to GitHub Actions, and publishes `lcov.info` to Codecov for repository coverage tracking and badge rendering.
 
 Codecov policy is configured in `.codecov.yml`: project coverage status uses the `cpp` flag with an 85% target (1% threshold), patch coverage status uses the same flag with an 80% target (1% threshold), and CI pass is required before Codecov reports success.
 
@@ -977,7 +977,7 @@ A read-only file's size is taken once, by `fstat`, when it is opened, and bounds
 - **`read_entry(offset, key_size, value_size, io_buf)`**: Single-pread read primitive. Resizes `io_buf` (reusing existing capacity) and preads the full entry into it. Callers then pass `io_buf` to `deserialize_entry()` depending on what they need.
 - **`read_raw(offset, dst) -> size_t`**: The sweep primitive. Copies the bytes at `offset` into `dst`, stopping at `size()` — `file_size` for a sealed file, the write cursor `offset_` for an active one — and returns how many it copied. It never goes through the buffer pool (see *Buffer pool*: a sweep must not flush the working set); under direct I/O the pool-backed file drops each chunk's page cache as soon as it is copied out.
 - **`DataFileIterator` / `scan_entries(file)`**: How every whole-file sweep reads entries — hint generation, vacuum, `create_manifest`, `resume()`, `changes_since`. It reads `DataFileIterator::kChunkBytes` (1 MiB) at a time through `read_raw` and frames entries out of that buffer, verifying each CRC; an entry that crosses the end of the buffer refills from that entry, and one larger than the buffer grows it to fit (bounded by `max_value_bytes`). The yielded entry reuses its key and value storage. A 64 MiB file costs about 64 reads rather than two `pread`s and three allocations per entry, which is what made hint generation syscall-bound — 13 s a file on virtiofs (#146); on local disk a 300k-entry file went from ~360 ms to ~40 ms. The sweep ends at a short header, a zero header (`sequence == 0`) or an entry whose computed end lies past `size()`. Because the CRC covers the key and the value, `key_size` and `value_size` cannot be validated before the bytes they describe are read, and a `value_size` is 32 bits wide: a single corrupt byte can name a 4 GiB entry. Bounding the entry's end against the readable extent, rather than sizing a read buffer from a number not yet verified, is what keeps that from turning into a 4 GiB allocation. An entry that ends past anything ever written is corrupt by inspection; treating it as the end of the file is what lets `resume()` truncate to the last good offset.
-- **`read_value(offset, key_size, value_size, io_buf, out)`**: High-level read primitive. Calls `read_entry` then `extract_value_into` to pread, CRC-verify, and extract only the value into `out`. Both `io_buf` (scratch) and `out` reuse existing capacity across calls. Used by `Bytecask::get()` and `EntryIterator`.
+- **`read_value(offset, key_size, value_size, io_buf, out)`**: High-level read primitive. Reads the entry into `io_buf`, CRC-verifies it when `verify` is set, and copies only the value into `out`. Both `io_buf` (scratch) and `out` reuse existing capacity across calls. Used by `Bytecask::get()` and `EntryIterator`.
 - Key and value are accepted as `std::span<const std::byte>` for binary safety.
 
 ### I/O Back-end Rationale
@@ -994,7 +994,7 @@ A read-only file's size is taken once, by `fstat`, when it is opened, and bounds
 We use fine-grained C++20 modules:
 - `bytecask.util`: CRC-32C accumulator (`Crc32`, backed by google/crc32c) and checked `narrow<To>(From)` conversion.
 - `bytecask.serialization`: Core serialization primitives (`ByteWriter`, `ByteReader`, `read_le`, `write_le`) and re-exports `bytecask.util`.
-- `bytecask.data_entry`: Logical entry definition, `write_header_and_crc()` (fills a fixed 19-byte buffer with LE header + CRC for zero-copy I/O), `serialize_entry()` (complete in-memory entry for tests/recovery), `parse_header_and_verify()` / `deserialize_entry()` / `extract_value_into()` — CRC verification is factored into `parse_header_and_verify()` and shared by both extraction functions.
+- `bytecask.data_entry`: Logical entry definition, `write_header_and_crc()` (fills a fixed 19-byte buffer with LE header + CRC for zero-copy I/O), `serialize_entry()` (complete in-memory entry for tests/recovery), `parse_header_and_verify()` / `deserialize_entry()` — CRC verification is factored into `parse_header_and_verify()`, which the data file's read paths share.
 - `bytecask.data_file`: Disk I/O — `DataFile` (abstract base), `WritableDataFile` (pure interface), `WritablePosixFile<Io>` with the `PreadIo` / `PoolIo` policies (aliased `WritablePosixDataFile` / `WritableBufferPoolDataFile`), `WritableMmapDataFile`, `ReadOnlyMmapDataFile`, `ReadOnlyPosixDataFile`, `ReadOnlyBufferPoolDataFile`, `Offset`.
 - `bytecask.hint_entry`: `HintEntry`, `serialize_entry()`, `deserialize_entry()` — symmetric read/write for hint entries.
 - `bytecask.hint_file`: Hint file writer and reader (`HintFile`).
@@ -1295,83 +1295,6 @@ Read API:
 
 Results are always in ascending key order (key directory iteration order).
 
-`ReadOptions` is currently an empty struct reserved for future knobs (e.g. `verify_checksums`).
-
-
-### [Draft] PMR - Memory Allocation (BC-024)
-
-This is a solid design to add to your backlog. In the world of systems programming, this pattern is often called **"Caller-Controlled Allocation"** or the **"Arena Injection"** pattern.
-
-By decoupling the *logic* of fetching data from the *policy* of how that data's memory is managed, you’ve given Bytecask a massive performance advantage over engines that hardcode `std::allocator` (the standard heap).
-
----
-
-## Backlog Item: Polymorphic Memory Injection (PMR)
-**Title:** Implement Configurable Memory Allocation via PMR and Function Overloading
-
-### 1. The Design Intent
-The goal is to allow `Bytecask` to remain "low-friction" for standard users (who just want the heap) while being "zero-friction" for high-performance callers (like the Vacuum process or a MySQL Bridge) who need to reuse memory to avoid GC-like pauses or heap fragmentation.
-
-### 2. Implementation Specs
-
-* **Instance Default:** The `Bytecask` instance holds a `memory_resource*` (defaulting to the system heap). This acts as the "Standard Life-cycle" manager.
-* **Signature Overloading:** * **Convenience API:** `get(key)` → Internalizes the default pool. Perfect for UI or one-off app requests.
-    * **Expert API:** `get(key, pool)` → Allows the caller to "inject" a temporary Arena. This is the **High-Performance** path.
-* **Container Binding:** All returned values must be `std::pmr::vector<std::byte>` (or your `PmrBytes` alias) to ensure the container honors the injected resource during its `resize()` and `destructor` phases.
-
-
-
----
-
-### 3. Usage Scenarios for the Backlog
-
-| Scenario | Logic | Memory Outcome |
-| :--- | :--- | :--- |
-| **Standard App Get** | `db.get("user:1")` | Allocated on Heap. Deleted when variable goes out of scope. |
-| **Heavy Scan Loop** | `db.get(key, &local_arena)` | Allocated in a pre-allocated "scratchpad." No system calls. |
-| **Long-Running Task** | `db.get(key, &shared_pool)` | Memory is recycled into "buckets" for the next operation. |
-
-### 4. Technical Trade-offs to Note
-* **Virtual Dispatch:** Every allocation now goes through a virtual function call (`do_allocate`). In a database engine, the cost of I/O (reading the disk) so heavily outweighs a virtual call that this is essentially "free" performance.
-* **Pointer Stability:** The `memory_resource` pointer must remain valid for the entire lifetime of the returned `PmrBytes`. Since your design uses a class member or a caller-provided arena, this is safe as long as the caller doesn't destroy their arena before processing the result.
-
-
-```cpp
-export class Bytecask {
-private:
-    // This is configured in the constructor
-    std::pmr::memory_resource* default_pool_; 
-
-public:
-    // Constructor: User can pass a specific pool (like a long-lived unsynchronized_pool_resource)
-    explicit Bytecask(std::pmr::memory_resource* pool = std::pmr::get_default_resource())
-        : default_pool_(pool) {}
-
-    /**
-     * @brief Signature 1: Uses the constructor-configured pool.
-     * This is what your loop "for (auto val : db.get(key))" will use.
-     */
-    [[nodiscard]] auto get(BytesView key) const -> std::optional<PmrBytes> {
-        return get(key, default_pool_);
-    }
-
-    /**
-     * @brief Signature 2: Allows overriding the pool for a specific call.
-     * Use this for your Vacuum Pump or high-performance scans.
-     */
-    [[nodiscard]] auto get(BytesView key, std::pmr::memory_resource* pool) const 
-        -> std::optional<PmrBytes> 
-    {
-        auto meta = index_.get(key);
-        if (!meta) return std::nullopt;
-
-        PmrBytes buffer(pool); 
-        buffer.resize(meta->size);
-        file_io.read_at(meta->offset, buffer.data(), meta->size);
-        return buffer;
-    }
-};
-```
 
 ### Type Aliases
 
@@ -1589,18 +1512,6 @@ for (auto& key : db.rkeys_from(as_bytes("user:~"))) { ... }
 
 > `as_bytes` is a small helper that converts a string literal or `std::string_view` to `BytesView`. Its exact form is TBD.
 
-## GroupWriter (Removed)
-
-`GroupWriter` was a leader/follower group-commit helper that coalesced concurrent `fdatasync` calls. It was implemented (BC-049), benchmarked, and removed (BC-051) because benchmarks showed it provided no measurable throughput benefit: on fast storage `fdatasync` is already cheap enough that grouping saves nothing; on slow storage LevelDB's internal WAL batching achieves similar amortisation without an extra abstraction.
-
-One improvement originally introduced for `GroupWriter` was **retained** because it is independently valuable:
-
-- **`rotate_active_file()` always fdatasyncs before sealing** — ensures prior `sync=false` writes are durable before the file becomes immutable.
-
-The full design and implementation are preserved in git history (see BC-049 in the project plan).
-
----
-
 ## Background Worker
 
 `BackgroundWorker` is a non-exported internal class in `bytecask.engine`. It maintains a single persistent background thread that processes tasks in FIFO order.
@@ -1701,41 +1612,6 @@ The seam is intentionally minimal:
 
 ---
 
-## Current implementation state
-
-- Language: C++23
-- Build system: xmake
-- Dependencies: crc32c (google/crc32c, hardware-accelerated CRC-32C)
-- Primary target: `bytecask` (includes `src/*.cpp` + `src/engine/*.cppm`)
-- Test target: `bytecask_tests` (includes `tests/*.cpp` + `src/engine/*.cppm`)
-- Status: Full `Bytecask` SWMR engine with `open`, `get`, `put`, `del`, `contains_key`, `apply_batch`, `iter_from`, `keys_from`, `riter_from`, `rkeys_from`. Key directory backed by `PersistentRadixTree<KeyDirEntry>`. Per-file fragmentation tracking via `FileStats` (`live_bytes`, `total_bytes`) maintained on every write and reconstructed during recovery. `open()` always creates a fresh active data file; unified recovery path from hint files (single-threaded or parallel). 1.2M+ assertions, 103 test cases.
-
-## Current repository structure
-
-- `src/main.cpp`: temporary executable entry point
-- `src/engine/util.cppm`: C++23 module (`bytecask.util`) — `Crc32` accumulator (google/crc32c), `narrow<To>(From)` checked conversion
-- `src/engine/serialization.cppm`: C++23 module (`bytecask.serialization`) — `ByteWriter`, `ByteReader`, `read_le`, `write_le`
-- `src/engine/data_entry.cppm`: C++23 module (`bytecask.data_entry`) — `EntryType`, `EntryHeader`, `DataEntry`, serialization helpers
-- `src/engine/data_file.cppm`: C++23 module (`bytecask.data_file`) — `DataFile`, `WritableDataFile`, `WritablePosixFile<Io>` (`WritablePosixDataFile`, `WritableBufferPoolDataFile`), `WritableMmapDataFile`, `ReadOnlyMmapDataFile`, `ReadOnlyPosixDataFile`, `ReadOnlyBufferPoolDataFile`, `Offset`
-- `src/engine/hint_entry.cppm`: C++23 module (`bytecask.hint_entry`) — `HintEntry`, `serialize_entry`, `deserialize_entry`
-- `src/engine/hint_file.cppm`: C++23 module (`bytecask.hint_file`) — `HintFile`, `OpenForWrite`/`OpenForRead`
-- `src/engine/radix_tree.cppm`: C++23 module (`bytecask.radix_tree`) — `PersistentRadixTree<V>`, `RadixTreeIterator<V>`
-- `src/engine/concurrency.cppm`: C++23 module (`bytecask.concurrency`) — `SyncGroup`, `BackgroundWorker`
-- `src/engine/internals.cppm`: internal partition `bytecask.engine:internals` — `EngineState`, `FileStats`, `KeyDirEntry`, `FileRegistry`, `Key`, `StaleFile`, `VacuumMapping`, `VacuumScanResult`, `RecoveredFile`, `RecoveryResult`, `entry_size`
-- `src/engine/bytecask.cppm`: primary interface unit `bytecask.engine` — public types (`Bytes`, `BytesView`, `VacuumOptions`, `WritePlan`, `WriteOptions`, `ReadOptions`, `Options`, `KeyIterator`, `EntryIterator`) and `Bytecask` class declaration
-- `src/engine/bytecask.cpp`: implementation unit `bytecask.engine` — all `Bytecask` method bodies, recovery, vacuum, hint, rotation logic
-- `tests/data_entry_test.cpp`: behavior tests for data entry serialization and file append
-- `tests/hint_file_test.cpp`: behavior tests for hint file append, round-trip, and CRC panic
-- `tests/bytecask_test.cpp`: behavior tests for the full `Bytecask` engine API
-- `xmake.lua`: build and test target definitions
-- `docs/bytecask_design.md`: living design reference
-
-## Near-term design direction
-
-- Keep the implementation simple enough to validate correctness before optimizing.
-- Evolve the current executable into a real storage engine with separable components that can be tested independently.
-- Treat design changes as documentation changes: code and this file should move together.
-
 ## Layer 1: `snapshot()` and `apply_batch(WritePlan)`
 
 Two primitives added to `DB` in BC-103 providing snapshot isolation without any mandatory transaction wrapper.
@@ -1748,7 +1624,7 @@ The `shared_ptr` keeps all data files referenced at snapshot time alive — thei
 
 `Snapshot` exposes the same read API as `DB`: `get`, `contains_key`, `iter_from`, `keys_from`, `riter_from`, `rkeys_from`.
 
-### `DB::apply_batch(opts, plan) -> bool`
+### `DB::apply_batch(opts, plan) -> std::optional<CommitResult>`
 
 Applies `plan` atomically only if all guards pass and no key in the write set was modified since the plan's snapshot was taken (when the plan carries a snapshot). Both the conflict check and the apply run under `write_mu_`, serialised with all other writers.
 
@@ -1758,7 +1634,7 @@ Conflict is detected by comparing `KeyDirEntry::sequence` between the snapshot s
 2. Key present in snapshot but absent now (key deleted after snapshot).
 3. Key present in both but with a different `sequence` (key modified after snapshot).
 
-On the first conflict detected, `apply_batch` returns `false` before any I/O is performed. If no conflict is found, the writes are applied atomically.
+On the first conflict detected, `apply_batch` returns `nullopt` before any I/O is performed. If no conflict is found, the writes are applied atomically.
 
 #### Implicit W-W check on write keys
 
@@ -1775,13 +1651,6 @@ When a `WritePlan` carries a snapshot, `apply_batch` automatically checks every 
 ### Single-entry batch optimization
 
 When the write set contains exactly one operation, `apply_batch` skips the `BulkBegin`/`BulkEnd` marker writes entirely. A single data entry is CRC-protected and self-describing — the markers add no recovery benefit. See D14.
-
-## Immediate engineering constraints
-
-- Tests must remain runnable from the repository with a single clear command.
-- Architectural decisions should prefer small, composable units over logic embedded in `main.cpp`.
-- Design notes in `docs/old_bytecask_design.md` are historical reference material, not the current source of truth.
-- The living design and project tracker live under `docs/`.
 
 ## Operational Counters
 
