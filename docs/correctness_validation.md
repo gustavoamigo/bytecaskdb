@@ -1815,25 +1815,55 @@ jobs share one cache entry for the instrumented libc++.
 
 ### Fuzz testing (libFuzzer)
 
-Two buffer-level fuzz harnesses exercise the parser code that handles
-adversarial input on recovery — the one code path where untrusted bytes
-from bad hardware or corruption reach the engine.
+Three harnesses feed arbitrary bytes to the code that parses what recovery
+and the sweeps read from disk, where damage from bad hardware or a crash
+reaches the engine. Each accepts `std::runtime_error` as the rejection of
+bad input; any other exception, an abort or a sanitizer report is a finding.
 
-**`fuzz_data_entry`** — feeds arbitrary bytes to
-`data_entry::deserialize_entry(span)`. Exercises header parsing, size
-validation, and CRC checking. 3.7 M executions/minute on seed corpus.
+The two data-file harnesses read a control byte ahead of the input. Its bit 0
+recomputes the CRC of each entry before parsing. Without it a mutated entry
+almost never carries a valid CRC-32C, and the run explores the CRC
+rejection and little behind it; with it clear, that rejection stays covered.
 
-**`fuzz_hint_entry`** — feeds arbitrary bytes to
-`hint_entry::deserialize_entry(span, key_buf)` in a sequential loop
-simulating `Scanner::next`. Exercises prefix compression key
-reconstruction and length validation across multiple entries. 1.9 M
-executions/minute on seed corpus.
+**`fuzz_data_entry`** — `deserialize_entry(span)` on one entry: header,
+size validation, CRC.
 
-Both harnesses run with `-fsanitize=fuzzer,address` (libFuzzer + ASan).
-Seed corpus files (`tests/fuzz/seed/`) are committed; evolving corpus
-(`tests/fuzz/corpus/`) is gitignored.
+**`fuzz_hint_entry`** — the hint `deserialize_entry(span)` in a loop, as
+`Scanner::next` walks a frame: length validation across consecutive
+entries. Hint entries carry no CRC of their own (the file trailer covers
+them), so it has no control byte.
 
-Run: `scripts/run_fuzz.sh fuzz_data_entry 300` (5-minute run).
+**`fuzz_data_file_scan`** — the input as a whole data file, swept by
+`DataFileIterator` (bit 1 of the control byte picks `OnDamage::Stop` over
+`Throw`) and by `CommittedEntryIterator` on top of it. This is the sweep
+behind hint generation at open, `resume()`, vacuum's copy and
+`changes_since`. Besides surviving, it checks that:
+
+- each entry yielded lies inside the file, directly after the one before,
+  and equals `deserialize_entry` of its own bytes;
+- under `Stop` the sweep never throws;
+- `CommittedEntryIterator` yields the raw entries minus a batch still open
+  at the end, never part of a batch, and its `committed_offset()` is the
+  end of the last entry it yielded; when the sweep throws, what it yielded
+  before is a prefix of that.
+
+The file is held in memory (a `DataFile` whose point reads abort, since the
+sweep never makes them), so a run is not bound by syscalls. Bits 2–3 of the
+control byte set the sweep's chunk size from 16 B to 4 KiB, through a
+`DataFileIterator` constructor argument that is the 1 MiB `kChunkBytes`
+everywhere else. With the engine's chunk every input fits in one read, and
+the refill at a chunk boundary and the growth for an entry larger than a
+chunk would go unexercised.
+
+All three build with `-fsanitize=fuzzer,address` and run nightly
+(`fuzz-nightly.yml`), 30 minutes per target; PR CI does not build them, so
+a harness broken by an engine change fails the next night. Seeds
+(`tests/fuzz/seed/`, written by `gen_fuzz_corpus`) are committed. The
+evolving corpus (`tests/fuzz/corpus/`) is gitignored locally and, in CI,
+cached from one night to the next and minimised with `-merge=1`, so each
+run continues from what the last one found.
+
+Run: `scripts/run_fuzz.sh fuzz_data_file_scan 300` (5-minute run).
 
 ### Process-crash harness (SIGKILL)
 

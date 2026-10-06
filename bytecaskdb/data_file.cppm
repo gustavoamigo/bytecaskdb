@@ -2018,6 +2018,8 @@ export enum class OnDamage { Throw, Stop };
 // entries out of that buffer, so a sweep costs about size() / kChunkBytes
 // reads instead of one or two per entry (#146). An entry larger than a chunk
 // grows the buffer to fit it; max_value_bytes bounds that growth.
+// chunk_bytes is kChunkBytes outside the fuzz harness, which passes a few
+// bytes so that its small inputs cross chunk boundaries.
 // The yielded entry reuses its key and value storage: a reference to *it is
 // valid until the next increment.
 // Exceptions (CRC errors unless OnDamage::Stop, I/O failures) propagate to
@@ -2033,8 +2035,10 @@ public:
   DataFileIterator() = default;
 
   explicit DataFileIterator(const DataFile& file, Offset start = 0,
-                            OnDamage on_damage = OnDamage::Throw)
-      : file_{&file}, next_offset_{start}, on_damage_{on_damage} {
+                            OnDamage on_damage = OnDamage::Throw,
+                            std::size_t chunk_bytes = kChunkBytes)
+      : file_{&file}, next_offset_{start}, on_damage_{on_damage},
+        chunk_bytes_{chunk_bytes} {
     advance();
   }
 
@@ -2088,7 +2092,7 @@ private:
   // shrank under the sweep.
   auto buffered(Offset offset, std::size_t len) -> std::span<const std::byte> {
     if (offset < buf_start_ || offset + len > buf_start_ + buf_len_) {
-      const auto want = std::max(len, kChunkBytes);
+      const auto want = std::max(len, chunk_bytes_);
       if (buf_.size() < want) buf_.resize(want);
       buf_start_ = offset;
       buf_len_ = file_->read_raw(offset, buf_);
@@ -2104,6 +2108,7 @@ private:
   const DataFile* file_{};
   Offset next_offset_{};
   OnDamage on_damage_{OnDamage::Throw};
+  std::size_t chunk_bytes_{kChunkBytes};
   value_type current_{};
   bool done_{true};
   std::vector<std::byte> buf_;
