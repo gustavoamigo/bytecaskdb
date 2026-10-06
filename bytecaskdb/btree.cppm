@@ -12,7 +12,6 @@
 
 module;
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <bit>
 #include <cassert>
@@ -37,16 +36,11 @@ import bytecask.version_chain;
 
 namespace bytecask {
 
-export inline constexpr std::size_t kBTreeLeafBytes = 4096;
-export inline constexpr std::size_t kBTreeInnerBytes = 4096;
-// Node capacities NodePool recycles: the blind tree's leaves, and every other
-// node of either tree. A node made larger to hold a long prefix is not pooled.
-export inline constexpr std::array<std::size_t, 2> kPooledNodeBytes{1024, 4096};
-export constexpr auto is_pooled_node_size(std::size_t bytes) noexcept -> bool {
-  return std::ranges::find(kPooledNodeBytes, bytes) != kPooledNodeBytes.end();
-}
-static_assert(is_pooled_node_size(kBTreeLeafBytes) &&
-              is_pooled_node_size(kBTreeInnerBytes));
+// Every node of either tree, leaf or inner, and the one size NodePool
+// recycles. A node made larger to hold a long key is the exception. Chosen
+// over 4 KiB inner nodes for the write path: see "Node size" in
+// docs/persistent_btree_design.md.
+export inline constexpr std::size_t kBTreeNodeBytes = 1024;
 // Entry lengths are 16-bit; the data file's key_size field has the same
 // ceiling, so no legal key or separator exceeds it.
 export inline constexpr std::size_t kBTreeMaxKeyBytes = 65535;
@@ -125,32 +119,31 @@ export inline constexpr bool kNodePoolEnabled = true;
 export inline constexpr bool kNodePoolEnabled = true;
 #endif
 
-// NodePool: recycles node memory by size, whichever thread frees it.
+// NodePool: recycles node memory, whichever thread frees it.
 //
 // A batch allocates the nodes it path-copies on the thread that runs it, the
 // committer almost always, and the nodes they replace are freed wherever the
 // last version pinning them is released, usually a reader. A general-purpose
 // allocator returns those frees to memory the allocating thread does not draw
-// from, so the committer keeps fetching fresh memory: ~2.5 us of a ~50 us
-// serial section per commit under glibc
+// from, so the committer keeps fetching fresh memory
 // (docs/commit_pipeline_design.md, "Node allocation"). The pool keeps freed
-// nodes of the kPooledNodeBytes sizes instead:
+// kBTreeNodeBytes nodes instead:
 //
-//   give  from any thread, under the size's mutex, onto a shared list, up to
+//   give  from any thread, under the mutex, onto a shared list, up to
 //         kMaxPooledBytes; past that, to operator delete.
 //   take  from the calling thread's cache; an empty cache takes up to kRefill
 //         nodes from the shared list.
 //
-// A thread's cache, at most kRefill nodes per size, goes back to the shared
-// lists when the thread exits. Process-wide, shared by every DB. The shared
-// lists are never destroyed, so a thread freeing nodes during process exit
-// touches no dead mutex.
+// A thread's cache, at most kRefill nodes, goes back to the shared list when
+// the thread exits. Process-wide, shared by every DB. The shared list is
+// never destroyed, so a thread freeing nodes during process exit touches no
+// dead mutex.
 class NodePool {
 public:
   [[nodiscard]] static auto take(std::size_t bytes) -> void * {
-    if (const auto cls = size_class(bytes)) {
-      auto &cache = local().cache[*cls];
-      if (cache.empty()) refill(cache, shared(*cls));
+    if (pooled(bytes)) {
+      auto &cache = local().cache;
+      if (cache.empty()) refill(cache);
       if (!cache.empty()) {
         auto *p = cache.back();
         cache.pop_back();
@@ -161,10 +154,10 @@ public:
   }
 
   static void give(void *p, std::size_t bytes) noexcept {
-    if (const auto cls = size_class(bytes)) {
-      auto &s = shared(*cls);
+    if (pooled(bytes)) {
+      auto &s = shared();
       std::lock_guard<std::mutex> lk{s.mu};
-      if (s.free.size() * bytes < kMaxPooledBytes) {
+      if (s.free.size() < kMaxPooledNodes) {
         try {
           s.free.push_back(p);
           return;
@@ -175,42 +168,33 @@ public:
     ::operator delete(p);
   }
 
-  // Frees the shared lists and the calling thread's cache to operator delete,
+  // Frees the shared list and the calling thread's cache to operator delete,
   // so a heap measurement taken next counts only live nodes. Benchmarks.
   static void trim() noexcept {
-    for (std::size_t cls = 0; cls < kPooledNodeBytes.size(); ++cls) {
-      auto &cache = local().cache[cls];
-      for (auto *p : cache) ::operator delete(p);
-      cache.clear();
-      auto &s = shared(cls);
-      std::lock_guard<std::mutex> lk{s.mu};
-      for (auto *p : s.free) ::operator delete(p);
-      s.free.clear();
-    }
+    auto &cache = local().cache;
+    for (auto *p : cache) ::operator delete(p);
+    cache.clear();
+    auto &s = shared();
+    std::lock_guard<std::mutex> lk{s.mu};
+    for (auto *p : s.free) ::operator delete(p);
+    s.free.clear();
   }
 
-  // Bytes on the shared lists, not counting thread caches. A gauge.
+  // Bytes on the shared list, not counting thread caches. A gauge.
   [[nodiscard]] static auto shared_bytes() -> std::int64_t {
-    std::size_t total = 0;
-    for (std::size_t cls = 0; cls < kPooledNodeBytes.size(); ++cls) {
-      auto &s = shared(cls);
-      std::lock_guard<std::mutex> lk{s.mu};
-      total += s.free.size() * kPooledNodeBytes[cls];
-    }
-    return static_cast<std::int64_t>(total);
+    auto &s = shared();
+    std::lock_guard<std::mutex> lk{s.mu};
+    return static_cast<std::int64_t>(s.free.size() * kBTreeNodeBytes);
   }
 
   // Bytes in the calling thread's cache. Tests: a build takes from this cache
-  // before the shared lists, so only the two together say what it drew.
+  // before the shared list, so only the two together say what it drew.
   [[nodiscard]] static auto local_bytes() -> std::int64_t {
-    std::size_t total = 0;
-    for (std::size_t cls = 0; cls < kPooledNodeBytes.size(); ++cls)
-      total += local().cache[cls].size() * kPooledNodeBytes[cls];
-    return static_cast<std::int64_t>(total);
+    return static_cast<std::int64_t>(local().cache.size() * kBTreeNodeBytes);
   }
 
 private:
-  static constexpr std::size_t kMaxPooledBytes = std::size_t{64} << 20;
+  static constexpr std::size_t kMaxPooledNodes = (std::size_t{64} << 20) / kBTreeNodeBytes;
   // Bounds a refill's lock hold and sort, and lets threads building trees at
   // once (recovery) share the pool: taking the whole list made one recovery
   // thread sort every pooled node while the others waited (Recovery, 8
@@ -222,24 +206,19 @@ private:
     std::vector<void *> free;
   };
   struct Local {
-    std::array<std::vector<void *>, kPooledNodeBytes.size()> cache;
+    std::vector<void *> cache;
     ~Local() {
-      for (std::size_t cls = 0; cls < cache.size(); ++cls) {
-        for (auto *p : cache[cls]) give(p, kPooledNodeBytes[cls]);
-      }
+      for (auto *p : cache) give(p, kBTreeNodeBytes);
     }
   };
 
-  static constexpr auto size_class(std::size_t bytes) noexcept
-      -> std::optional<std::size_t> {
-    if (!kNodePoolEnabled) return std::nullopt;
-    const auto it = std::ranges::find(kPooledNodeBytes, bytes);
-    if (it == kPooledNodeBytes.end()) return std::nullopt;
-    return static_cast<std::size_t>(it - kPooledNodeBytes.begin());
+  static constexpr auto pooled(std::size_t bytes) noexcept -> bool {
+    return kNodePoolEnabled && bytes == kBTreeNodeBytes;
   }
 
-  static void refill(std::vector<void *> &cache, Shared &s) {
+  static void refill(std::vector<void *> &cache) {
     {
+      auto &s = shared();
       std::lock_guard<std::mutex> lk{s.mu};
       const auto n = static_cast<std::ptrdiff_t>(std::min(s.free.size(), kRefill));
       cache.assign(s.free.end() - n, s.free.end());
@@ -251,20 +230,20 @@ private:
     std::sort(cache.begin(), cache.end(), std::greater<>{});
   }
 
-  static auto shared(std::size_t cls) -> Shared & {
-    static auto *lists = new std::array<Shared, kPooledNodeBytes.size()>;  // never destroyed
-    return (*lists)[cls];
+  static auto shared() -> Shared & {
+    static auto *list = new Shared;  // never destroyed
+    return *list;
   }
   static auto local() -> Local & {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
-    thread_local Local l;  // returns its nodes to the shared lists at thread exit
+    thread_local Local l;  // returns its nodes to the shared list at thread exit
 #pragma clang diagnostic pop
     return l;
   }
 };
 
-// Stats and test access: bytes on the pool's shared lists.
+// Stats and test access: bytes on the pool's shared list.
 export inline auto node_pool_bytes() -> std::int64_t {
   return NodePool::shared_bytes();
 }
@@ -428,9 +407,6 @@ export template <typename V> struct Node {
   [[nodiscard]] static auto entry_size(bool leaf, std::size_t len) noexcept
       -> std::size_t {
     return align_up(payload_size(leaf) + kLenBytes + len, kAlign);
-  }
-  [[nodiscard]] static auto node_bytes(bool leaf) noexcept -> std::size_t {
-    return leaf ? kBTreeLeafBytes : kBTreeInnerBytes;
   }
 
   // Allocates a node of at least `min_capacity` bytes with `prefix` stored
@@ -867,7 +843,7 @@ protected:
         prefix_bytes = prefix_buf;
       }
     }
-    auto *n = N::allocate(std::max(N::node_bytes(leaf), top + heap), leaf,
+    auto *n = N::allocate(std::max(kBTreeNodeBytes, top + heap), leaf,
                           tag_, prefix_bytes);
     auto *s = n->slots();
     for (std::uint32_t i = 0; i < n_items; ++i) {
@@ -965,7 +941,7 @@ protected:
     const auto suf = key.subspan(node->prefix_len);
     const bool leaf = node->is_leaf != 0;
     const auto need = N::entry_size(leaf, suf.size()) + N::kSlotBytes;
-    // A compacting rebuild sizes its node to max(node_bytes, contents), not
+    // A compacting rebuild sizes its node to max(kBTreeNodeBytes, contents), not
     // to the capacity it replaces: a node grown for one oversized key
     // shrinks back once that key has company or dead bytes. Both checks
     // below measure against what the rebuild will produce, or insert_entry
@@ -977,7 +953,7 @@ protected:
         return {node, nullptr, true, true};
       }
     }
-    if (node->packed_bytes(node->prefix_len) + need <= N::node_bytes(leaf)) {
+    if (node->packed_bytes(node->prefix_len) + need <= kBTreeNodeBytes) {
       node = rebuild(node, node->prefix_len);
       node->insert_entry(pos, suf, payload);
       return {node, nullptr, true, true};
@@ -1431,7 +1407,7 @@ protected:
     heap += N::entry_size(true, key.size() - p);
     const auto total = N::slots_offset_for(p) +
                        (leaf_lens_.size() + 1) * N::kSlotBytes + heap;
-    if (total > N::node_bytes(true))
+    if (total > kBTreeNodeBytes)
       return false;
     leaf_prefix_ = p;
     leaf_heap_ = heap - N::entry_size(true, key.size() - p);
@@ -1520,7 +1496,7 @@ protected:
         h += N::entry_size(false, sep.size() - p);
         const auto total =
             N::slots_offset_for(p) + (keys.size() + 1) * N::kSlotBytes + h;
-        if (!keys.empty() && total > N::node_bytes(false))
+        if (!keys.empty() && total > kBTreeNodeBytes)
           break;
         prefix = p;
         heap = h;

@@ -165,9 +165,11 @@ The leaf size is a template parameter, in bytes, and the capacity follows
 from it: `(bytes − 104 − 4) / 16` entries. Sizes are jemalloc size classes so
 no allocation is rounded up: 640 bytes hold 33 entries, 1,280 hold 73 and
 2,560 hold 153. Blind search is linear in the leaf (§Search), so the leaf is
-smaller than the 4 KiB B+ tree leaf. The engine now uses 1,024-byte leaves,
-80 entries with the 12-byte entries and 40-byte header of R2 and R4
-(§Leaf size, revisited).
+smaller than the B+ tree's original 4 KiB leaf. The engine now uses
+1,024-byte leaves, 80 entries with the 12-byte entries and 40-byte header of
+R2 and R4 (§Leaf size, revisited). Inner nodes are 1 KiB too, for the write
+path's copy volume (`docs/persistent_btree_design.md`, §Node size,
+revisited).
 
 ### Invariants
 

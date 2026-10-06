@@ -637,8 +637,10 @@ thread, so the committer keeps fetching fresh memory. Under jemalloc's
 defaults this is mostly slab allocation: a 4 KiB inner node fills a one-page
 slab on its own, and at 16 writers the allocator was 6.5% of the committer's
 CPU, 2.4 points of it getting slabs. `NodePool`
-(`docs/persistent_btree_design.md`, *Node pool*) recycles the two node sizes
-instead.
+(`docs/persistent_btree_design.md`, *Node pool*) recycles freed nodes
+instead. The measurements below were taken with 4 KiB inner nodes; every
+node has been 1 KiB since (`docs/persistent_btree_design.md`, *Node size,
+revisited*).
 
 `commit_probe`, tmpfs, `main` at 90e34d7, two rounds alternating, rounds
 within 0.4%, against `main` on glibc's `malloc`:

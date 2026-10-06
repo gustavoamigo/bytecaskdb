@@ -55,7 +55,7 @@ export inline constexpr std::uint32_t kBlindMaxFileId = (1u << 20) - 1;
 // Chosen over 1,280 (101 entries) by measurement; see "Leaf size, revisited"
 // in docs/blind_leaf_btree_design.md.
 export inline constexpr std::size_t kBlindLeafBytes = 1024;
-static_assert(is_pooled_node_size(kBlindLeafBytes),
+static_assert(kBlindLeafBytes == kBTreeNodeBytes,
               "NodePool would not recycle the blind tree's leaves");
 
 // Reads the key of the record at a location. The returned span is valid until
