@@ -547,21 +547,14 @@ It was removed. By design it gave up read-your-writes, and the guarantees above 
 
 ### File Registry
 
-The engine maintains a registry that maps a monotonic `uint32_t` file ID to an open `DataFile`. The type is:
+The engine maps each monotonic `uint32_t` file ID to its open `DataFile` (`EngineState::files`), and keeps per-file `FileStats` the same way (`EngineState::file_stats`). Both are copy-on-write maps from `bytecaskdb/u32_map.cppm`: a copy is an O(1) snapshot, and a write goes through `transient()` / `persistent() &&` like the key directory, so a reader holding an old `EngineState` keeps the registry it started with, and every `DataFile` in it open, without locking.
 
-```cpp
-using FileRegistry =
-    std::shared_ptr<std::map<std::uint32_t, std::shared_ptr<DataFile>>>;
-```
+The module has two implementations of one interface (the `PersistentU32MapOf` / `TransientU32MapOf` concepts), because the two maps are used in opposite ways:
 
-Two levels of `shared_ptr` serve distinct purposes:
+- **`files` is a `PersistentU32Table`**, a direct-addressing table: one slot per ID between the lowest and highest ID held, so a lookup is an index. It is read on every record access — a range scan on the blind key directory looks a file up both to read each key and to read its value — and written only at rotation, vacuum and open. A transient shares its base table until its first write, which copies it, so the per-batch transient the write path takes costs nothing. IDs are minted in sequence and capped at `KeyDirEntry::kMaxFileId` (2^20 − 1); erasing the lowest or highest ID trims the table, so it spans the IDs held. A file that is never vacuumed keeps every slot above it, one per rotation since.
+- **`file_stats` is a `PersistentU32Map`**, over the keyed `PersistentBTree`: it is updated by every commit and read only by vacuum and `stats()`, so a write must not copy the map.
 
-- **Inner `shared_ptr<DataFile>`**: ensures a `DataFile` (and its fd) remains alive as long as any part of the system holds a reference to it, even after it has been rotated out of the current registry.
-- **Outer `shared_ptr<map<...>>`**: enables O(1) copy-on-write snapshotting. `EntryIterator` captures a copy of the outer pointer at construction, giving it an independent lifetime from the `Bytecask` instance.
-
-**Rotation** is a functional update: `rotate_active_file()` clones the inner map into a new allocation, inserts the new `DataFile`, and replaces `files_` with the new outer `shared_ptr`. Any iterator holding the previous snapshot continues reading from the old set of open files without any locking.
-
-**Why not `immer::map`**: `immer::map<K, std::shared_ptr<V>>` triggers a GCC 15 / libstdc++15 regression — the `friend` declaration inside `std::shared_ptr`'s internals is rejected when the type is instantiated from a C++20 module context.
+Neither is built on the key directory's tree. The blind-leaf tree stores no key bytes and reads each key back from its record, and a file ID is in no record. Measured with `engine_bench` at 50k keys against the radix tree `files` was on before: `Range50` 4.44 → 3.83 µs, `Get` 323 → 303 ns, writes unchanged. A one-entry lookup costs about 0.75 ns in the table, 6.8 ns in the radix tree and 8.9 ns in the keyed B+ tree, and the gap widens with the number of files.
 
 ### Data File Lifecycle
 
