@@ -228,13 +228,14 @@ refused like a damaged one, and rebuilt from its data file.
 
 **Uncompressed layout.** Hint files written before compression hold the
 entries back to back from offset 0, followed by a plain CRC-32C trailer over
-them. They are still read. The first 8 bytes of such a file are the sequence
-of its first entry, which never reaches 2^63; the magic's last byte, `0x81`,
-sets that bit, so the two layouts cannot be confused. The compressed layout's
-trailer is inverted so that a reader that knows only the uncompressed layout
-fails its CRC and rebuilds the hint from the data file, instead of parsing
-frames as entries. Hint files are never rewritten in place, so a database
-holds a mix of both until vacuum turns its older files over.
+them. They are no longer read: a file that does not start with the magic is
+refused like a damaged one, and recovery rebuilds it from its data file in the
+compressed layout. The first 8 bytes of such a file are the sequence of its
+first entry, which never reaches 2^63; the magic's last byte, `0x81`, sets
+that bit, so an old file can never pass for a new one. The compressed
+layout's trailer is inverted so that a binary that knows only the
+uncompressed layout fails its CRC and rebuilds the hint too, instead of
+parsing frames as entries.
 
 ### Entry Layout
 
@@ -270,7 +271,7 @@ Total entry size: `23 + key_len` bytes.
 
 | Offset from file start | Size | Type   | Description |
 |------------------------|------|--------|-------------|
-| `file_size - 4`        | 4    | u32 LE | Bitwise NOT of the CRC-32C (Castagnoli) over all bytes that precede this field; the plain CRC-32C in the uncompressed layout |
+| `file_size - 4`        | 4    | u32 LE | Bitwise NOT of the CRC-32C (Castagnoli) over all bytes that precede this field |
 
 Reading a hint file with a mismatched trailer CRC is a hard error. The engine
 discards the hint file and regenerates it from the raw data file during recovery.

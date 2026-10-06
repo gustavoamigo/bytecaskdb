@@ -173,7 +173,7 @@ Building a thin `MariaDBTxn` directly on `snapshot()` + `apply_batch()` is simpl
 
 #### 2PC Design — `BulkPrepare` / `Bulk2PCCommit`
 
-See `docs/xa_support_design.md` for the full generic 2PC design including batch marker types, on-disk format, conflict detection, and recovery semantics. This section covers the MariaDB-specific integration.
+The engine-side 2PC primitives are not implemented yet; their design (batch marker types, on-disk format, conflict detection, recovery semantics) is tracked in [#340](https://github.com/gustavoamigo/bytecaskdb/issues/340). This section covers the MariaDB-specific integration.
 
 MariaDB's binlog group commit calls `prepare_ordered()` → binlog write + group fsync → `commit_ordered()` for each transaction in the group, serialized under `LOCK_commit_ordered`. The storage engine is called once per transaction, not once per group. The group commit benefit is the shared binlog `fdatasync`.
 

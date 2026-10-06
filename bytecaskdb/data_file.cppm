@@ -1799,29 +1799,6 @@ export [[nodiscard]] inline auto openDataFileForRead(
   return ReadOnlyPosixDataFile::openForRead(std::move(path));
 }
 
-// Factory for writable data files: returns the WritableDataFile for the
-// selected back-end.
-// Opens path for write, creating it if absent and adopting its current length
-// if present. The engine never uses this to create a new file — see
-// createDataFileForWrite — but tests and tooling reopen a file they wrote.
-export [[nodiscard]] inline auto openDataFileForWrite(
-    std::filesystem::path path, std::size_t capacity, IoBackend backend,
-    std::shared_ptr<BufferPool> pool = nullptr, std::uint32_t file_id = 0)
-    -> std::shared_ptr<WritableDataFile> {
-  if (backend == IoBackend::BufferPool) {
-    return WritableBufferPoolDataFile::create(
-        std::move(path), capacity, /*exclusive=*/false,
-        PoolIo{require_pool(std::move(pool), "openDataFileForWrite"), file_id});
-  }
-#ifndef __EMSCRIPTEN__
-  if (backend == IoBackend::Mmap && capacity > 0) {
-    return WritableMmapDataFile::create(std::move(path), capacity);
-  }
-#endif
-  return WritablePosixDataFile::create(std::move(path), capacity,
-                                       /*exclusive=*/false);
-}
-
 // Creates the one writable data file for stem in dir: "<stem>.data", or
 // "<stem>.data.tmp" for vacuum's staging copy. This is how the engine creates
 // every data file it writes to.
@@ -2133,10 +2110,5 @@ private:
   Offset buf_start_{};
   std::size_t buf_len_{};
 };
-
-export inline auto scan_entries(const DataFile& file, Offset start = 0)
-    -> std::ranges::subrange<DataFileIterator, std::default_sentinel_t> {
-  return {DataFileIterator{file, start}, std::default_sentinel};
-}
 
 } // namespace bytecask
