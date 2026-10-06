@@ -1,6 +1,6 @@
 # Commit pipeline — overlapping the next batch with the in-flight fdatasync
 
-Status: **implemented on branch `commit-pipeline`**, validation gate passed; see [Results](#results).
+Status: **implemented**, validation gate passed; see [Results](#results).
 Date: 2026-09-14
 Tracking: [gustavoamigo/bytecaskdb#70](https://github.com/gustavoamigo/bytecaskdb/issues/70)
 Depends on: hand-off-after-every-batch `WriteGroup` (branch `write-group-handoff-every-batch`).
@@ -341,9 +341,7 @@ a 190 ms stall. Measure it separately.
 - **Reclaim moves.** The old published state is dropped by the flusher's
   `store_state` on a client thread that is about to return anyway, or by
   reader caches as today. Not on the flush critical path, since the flusher
-  publishes and then releases the role before the drop. Interacts with
-  `docs/defered_state_reclaim.md` (#40) only in that the flusher would be the
-  natural producer for its queue.
+  publishes and then releases the role before the drop.
 - **Latency under one flusher per flush.** A writer's worst case is two
   flushes (remaining part of N, all of N+1), the same as InnoDB and no worse
   than today's leader-runs-batch-of-7 case.

@@ -164,7 +164,7 @@ def run_regular(dataset_size: int) -> dict:
     # with --benchmark_filter) but no section_* renderer reads them — running
     # them here only adds wall-clock time to every showcase run.
     filt = _exclude_filter([
-        "Recovery", "CasMT", "BoundedStaleness", "UUIDv4", "UnorderedView",
+        "Recovery", "CasMT", "BoundedStaleness", "UUIDv4",
         "PeriodicSync", "_Pread", "_Mmap",
     ])
     if filt is None:

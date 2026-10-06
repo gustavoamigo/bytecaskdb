@@ -1781,8 +1781,7 @@ means bugs inside `crc32c` itself, if any, wouldn't be caught by this MSan
 run.
 
 Run: `scripts/run_sanitizer.sh memory`. Target scope matches the ASan/TSan
-jobs above: `bytecask_tests` only, not `radix_tree_memory_tests` or
-`unordered_view_tests`. Trigger scope does not — origin tracking makes the
+jobs above: `bytecask_tests` only, not `radix_tree_memory_tests`. Trigger scope does not — origin tracking makes the
 MSan test step the slowest of the three and by far the least predictable
 (2m48s and 11m56s on two runs of the same commit, on an early, much smaller
 suite; per-job runners vary by ~1.8x and the seeded `[model]` workloads

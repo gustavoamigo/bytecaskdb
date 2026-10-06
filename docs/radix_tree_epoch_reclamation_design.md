@@ -1,6 +1,6 @@
 # Radix tree epoch reclamation — no reference counts on the write path
 
-Status: implemented on `radix-epoch-reclamation`; see Implementation notes,
+Status: implemented (`bytecaskdb/version_chain.cppm`); see Implementation notes,
 in particular *Versions form a chain* for what changed after review.
 Intended as the implementation guide for a separate session; every code
 reference is to `main` at `4538844`.

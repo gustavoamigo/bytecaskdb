@@ -4649,9 +4649,6 @@ TEST_CASE("vacuum no-op when nothing exceeds threshold", "[vacuum]") {
 }
 
 // ---------------------------------------------------------------------------
-// vacuum_absorb_file: basic absorption into active file
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
 // vacuum: compact path chosen for large file
 // ---------------------------------------------------------------------------
 TEST_CASE("vacuum chooses compact for large file", "[vacuum]") {

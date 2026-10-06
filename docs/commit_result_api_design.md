@@ -1,6 +1,6 @@
 # CommitResult API — Sequence-Returning Write Operations
 
-**Status: approved.** Scope covers the engine, public C++ API, Python,
+**Status: implemented.** Scope covers the engine, public C++ API, Python,
 C, and synchronous Node/WASM bindings in one breaking pre-1.0 change.
 Backward compatibility is not retained for any surface: `current_sequence`/
 `currentSequence` are removed outright, not aliased or deprecated.

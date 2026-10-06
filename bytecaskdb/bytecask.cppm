@@ -607,9 +607,10 @@ public:
   // process and are reassigned from scratch at recovery.
   [[nodiscard]] auto reserve_file_id() -> std::uint32_t;
 
-  // dest_file_id must have been reserved by reserve_file_id(); it is ignored
-  // when new_sealed_file is null, since the live entries then move into the
-  // active file.
+  // Remaps the scan's live entries from old_file_id to new_sealed_file, which
+  // must carry an id reserved by reserve_file_id(). A null new_sealed_file
+  // removes old_file_id outright: its scan must hold no live entries, and
+  // dest_file_id is ignored.
   void apply_vacuum(std::uint32_t old_file_id, const VacuumScanResult &scan,
                     std::shared_ptr<DataFile> new_sealed_file,
                     std::uint32_t dest_file_id);
@@ -1161,10 +1162,10 @@ public:
                                 BytesView from = {}) const
       -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
 
-  // Selects the highest-fragmentation sealed file above the threshold
-  // and either absorbs it into the active file (if it fits) or compacts
-  // it into a new sealed file.
-  // Returns true if a file was vacuumed, false if no file qualified.
+  // Selects the highest-fragmentation sealed file above the threshold and
+  // compacts its live entries into a new sealed file, or removes the file
+  // when nothing in it is live. Returns true if a file was reclaimed, false
+  // if no file qualified or none could be made smaller.
   //
   // Thread-safe: vacuum_mu_ serialises concurrent vacuum() calls independently
   // from write_mu_, so normal put/del/apply_batch calls are not blocked while
@@ -1187,11 +1188,6 @@ public:
   // sequence at return. min_sequence = 0, an already-reached target, or a
   // nonpositive timeout returns immediately. Identical semantics in Leader
   // and Follower mode (on a follower it reflects the last synced ingest).
-  // Blocks until the published state covers sequence — a fresh snapshot
-  // can see the write a plan lost to — or the engine degrades or closes.
-  // See apply_batch.
-  void wait_published(std::uint64_t sequence) const;
-
   [[nodiscard]] auto durable_sequence(
       std::uint64_t min_sequence = 0,
       std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const
@@ -1224,12 +1220,16 @@ public:
   // EngineState. Designed for pull-based scraping (Prometheus, logging).
   [[nodiscard]] auto stats() const -> std::map<std::string, std::int64_t>;
 
-
-    // Drains background hint tasks then writes all sealed hint files.
-    // temporary in public for memoery profile - TODO: Move it back to private:
-  void flush_hints();
 private:
   explicit DB(std::filesystem::path dir, Options opts);
+
+  // Blocks until the published state covers sequence — a fresh snapshot
+  // can see the write a plan lost to — or the engine degrades or closes.
+  // See apply_batch.
+  void wait_published(std::uint64_t sequence) const;
+
+  // Drains background hint tasks then writes all sealed hint files.
+  void flush_hints();
 
   // File rotation
   // Seals active file, dispatches hint write to background, opens new active file.
@@ -2438,16 +2438,20 @@ auto TransientEngineState::reserve_file_id() -> std::uint32_t {
 
 void TransientEngineState::apply_vacuum(
     std::uint32_t old_file_id, const VacuumScanResult &scan,
-    std::shared_ptr<DataFile> new_sealed_file, std::uint32_t reserved_file_id) {
-  const auto dest_file_id =
-      new_sealed_file ? reserved_file_id : active_file_id_;
+    std::shared_ptr<DataFile> new_sealed_file, std::uint32_t dest_file_id) {
+  if (!new_sealed_file) {
+    // Removal: nothing in the file is live, so there is nothing to remap.
+    if (!scan.mappings.empty())
+      throw std::logic_error{"apply_vacuum: live entries without a destination"};
+    files_.erase(old_file_id);
+    file_stats_.erase(old_file_id);
+    return;
+  }
 
   // The destination is registered before the remap: a key directory that
   // reads keys back may resolve an already remapped record while placing the
   // next one.
-  if (new_sealed_file) {
-    files_.set(dest_file_id, std::move(new_sealed_file));
-  }
+  files_.set(dest_file_id, std::move(new_sealed_file));
 
   auto actual_live_bytes = scan.live_bytes;
   for (const auto &m : scan.mappings) {
@@ -2464,29 +2468,11 @@ void TransientEngineState::apply_vacuum(
   }
 
   files_.erase(old_file_id);
-
   file_stats_.erase(old_file_id);
-  if (dest_file_id != active_file_id_) {
-    file_stats_.set(dest_file_id,
-                    FileStats{actual_live_bytes, scan.total_bytes,
-                              scan.min_sequence, scan.max_sequence,
-                              scan.tombstone_bytes, scan.marker_bytes});
-  } else {
-    file_stats_.update(dest_file_id, [actual_live_bytes,
-                                      total = scan.total_bytes,
-                                      tomb = scan.tombstone_bytes,
-                                      mark = scan.marker_bytes,
-                                      smin = scan.min_sequence,
-                                      smax = scan.max_sequence](FileStats &fs) {
-      fs.live_bytes += actual_live_bytes;
-      fs.total_bytes += total;
-      fs.tombstone_bytes += tomb;
-      fs.marker_bytes += mark;
-      if (smin > 0 && (fs.min_sequence == 0 || smin < fs.min_sequence))
-        fs.min_sequence = smin;
-      if (smax > fs.max_sequence) fs.max_sequence = smax;
-    });
-  }
+  file_stats_.set(dest_file_id,
+                  FileStats{actual_live_bytes, scan.total_bytes,
+                            scan.min_sequence, scan.max_sequence,
+                            scan.tombstone_bytes, scan.marker_bytes});
 }
 
 void TransientEngineState::apply_resume(
@@ -3975,12 +3961,10 @@ auto DB::vacuum_scan_and_copy(
   return result;
 }
 
-// Remaps key_dir entries from old_file_id to the destination file,
-// updates the files map and file_stats, and publishes the new
-// EngineState. Caller must hold write_mu_.
-// If new_sealed_file is non-null (compact), a fresh file-id is
-// allocated and the new file is registered. Otherwise (absorb),
-// the active file's stats are incremented.
+// Remaps key_dir entries from old_file_id to new_sealed_file, updates the
+// files map and file_stats, and publishes the new EngineState. A null
+// new_sealed_file removes old_file_id (see apply_vacuum). Caller must hold
+// write_mu_.
 void DB::vacuum_commit(std::uint32_t old_file_id,
                              const VacuumScanResult &scan,
                              std::shared_ptr<DataFile> new_sealed_file,

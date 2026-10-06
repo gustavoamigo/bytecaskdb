@@ -147,16 +147,4 @@ export auto deserialize_entry(std::span<const std::byte> buf) -> DataEntry {
   };
 }
 
-// Extracts only the value portion into out (reuses capacity).
-// When verify is true (default), computes and checks the CRC32 checksum.
-export void extract_value_into(std::span<const std::byte> buf,
-                               std::vector<std::byte> &out,
-                               bool verify = true) {
-  const auto h = verify ? parse_header_and_verify(buf) : read_header(buf);
-  ByteReader r{buf.subspan(kHeaderSize)};
-  r.get_bytes(h.key_size); // skip key
-  auto val_span = r.get_bytes(h.value_size);
-  out.assign(val_span.begin(), val_span.end());
-}
-
 } // namespace bytecask
