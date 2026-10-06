@@ -710,7 +710,7 @@ private:
   friend class DB;
   friend struct EngineState;
   TransientEngineState(KeyDirTransient key_dir,
-                       TransientU32Map<std::shared_ptr<DataFile>> files,
+                       TransientU32Table<std::shared_ptr<DataFile>> files,
                        TransientU32Map<FileStats> file_stats,
                        std::uint32_t active_file_id,
                        std::uint32_t next_file_id,
@@ -722,7 +722,7 @@ private:
                        std::string degraded_reason);
 
   KeyDirTransient key_dir_;
-  TransientU32Map<std::shared_ptr<DataFile>> files_;
+  TransientU32Table<std::shared_ptr<DataFile>> files_;
   // Records this transient placed in the active file before they are
   // written, for a key directory that reads keys back (kKeyDirReadsKeys).
   PendingRecords pending_;
@@ -1986,7 +1986,7 @@ auto make_data_file_stem() -> std::string {
 
 TransientEngineState::TransientEngineState(
     KeyDirTransient key_dir,
-    TransientU32Map<std::shared_ptr<DataFile>> files,
+    TransientU32Table<std::shared_ptr<DataFile>> files,
     TransientU32Map<FileStats> file_stats,
     std::uint32_t active_file_id, std::uint32_t next_file_id,
     std::uint64_t next_seq, std::uint64_t durable_seq,

@@ -547,11 +547,14 @@ It was removed. By design it gave up read-your-writes, and the guarantees above 
 
 ### File Registry
 
-The engine maps each monotonic `uint32_t` file ID to its open `DataFile`, and keeps per-file `FileStats` the same way. Both are `PersistentU32Map<V>` (`bytecaskdb/u32_map.cppm`) fields of `EngineState`: `files` with `V = std::shared_ptr<DataFile>` and `file_stats` with `V = FileStats`.
+The engine maps each monotonic `uint32_t` file ID to its open `DataFile` (`EngineState::files`), and keeps per-file `FileStats` the same way (`EngineState::file_stats`). Both are copy-on-write maps from `bytecaskdb/u32_map.cppm`: a copy is an O(1) snapshot, and a write goes through `transient()` / `persistent() &&` like the key directory, so a reader holding an old `EngineState` keeps the registry it started with, and every `DataFile` in it open, without locking.
 
-`PersistentU32Map` is a thin wrapper over the keyed `PersistentBTree<V>`, with each file ID encoded as 4 big-endian bytes so iteration runs in ascending ID order. A copy is an O(1) snapshot, and a write goes through `transient()` / `persistent() &&` like the key directory, so a reader holding an old `EngineState` keeps the registry it started with and every `DataFile` in it open, without locking. The `shared_ptr<DataFile>` keeps a file's descriptor alive for as long as any version still names it, after rotation or vacuum has removed it from the current registry.
+The module has two implementations of one interface (the `PersistentU32MapOf` / `TransientU32MapOf` concepts), because the two maps are used in opposite ways:
 
-It is not built on the key directory's tree. The blind-leaf tree stores no key bytes and reads each key back from its record, and a file ID is in no record; the keyed B+ tree is compiled in every configuration anyway, since the blind tree shares its inner nodes. So the registry is the same in every `BYTECASK_KEYDIR` build. A range scan looks a file up once per entry, and against the radix tree this map was previously built on that costs about 8 ns an entry: `ByteCaskDB/Range50` went from 4.72 to 5.12 µs at 50k keys, with `Get` unchanged.
+- **`files` is a `PersistentU32Table`**, a direct-addressing table: one slot per ID between the lowest and highest ID held, so a lookup is an index. It is read on every record access — a range scan on the blind key directory looks a file up both to read each key and to read its value — and written only at rotation, vacuum and open. A transient shares its base table until its first write, which copies it, so the per-batch transient the write path takes costs nothing. IDs are minted in sequence and capped at `KeyDirEntry::kMaxFileId` (2^20 − 1); erasing the lowest or highest ID trims the table, so it spans the IDs held. A file that is never vacuumed keeps every slot above it, one per rotation since.
+- **`file_stats` is a `PersistentU32Map`**, over the keyed `PersistentBTree`: it is updated by every commit and read only by vacuum and `stats()`, so a write must not copy the map.
+
+Neither is built on the key directory's tree. The blind-leaf tree stores no key bytes and reads each key back from its record, and a file ID is in no record. Measured with `engine_bench` at 50k keys against the radix tree `files` was on before: `Range50` 4.44 → 3.83 µs, `Get` 323 → 303 ns, writes unchanged. A one-entry lookup costs about 0.75 ns in the table, 6.8 ns in the radix tree and 8.9 ns in the keyed B+ tree, and the gap widens with the number of files.
 
 ### Data File Lifecycle
 

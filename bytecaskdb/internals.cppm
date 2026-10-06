@@ -272,8 +272,8 @@ export inline constexpr auto pending_slot(std::uint32_t file_id,
 // points into is.
 // ---------------------------------------------------------------------------
 export struct KeyDirCtx {
-  const PersistentU32Map<std::shared_ptr<DataFile>> *files{nullptr};
-  const TransientU32Map<std::shared_ptr<DataFile>> *writer_files{nullptr};
+  const PersistentU32Table<std::shared_ptr<DataFile>> *files{nullptr};
+  const TransientU32Table<std::shared_ptr<DataFile>> *writer_files{nullptr};
   const PendingRecords *pending{nullptr};
   bool verify{true};
 
@@ -639,7 +639,7 @@ public:
 
 private:
   Inner cur_;
-  PersistentU32Map<std::shared_ptr<DataFile>> files_;
+  PersistentU32Table<std::shared_ptr<DataFile>> files_;
   bool owned_{false};
   KeyDirCtx ctx_;
   mutable std::vector<std::byte> buf_;
@@ -841,7 +841,7 @@ export inline auto key_dir_from_recovered(RecoveryKeyDirTree t) -> KeyDirTree {
 // ---------------------------------------------------------------------------
 export struct EngineState {
   KeyDirTree key_dir;
-  PersistentU32Map<std::shared_ptr<DataFile>> files;
+  PersistentU32Table<std::shared_ptr<DataFile>> files;
   PersistentU32Map<FileStats> file_stats;
   std::uint32_t active_file_id{};
   std::uint32_t next_file_id{};

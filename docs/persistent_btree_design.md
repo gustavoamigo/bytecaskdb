@@ -1213,10 +1213,14 @@ needs a key-directory column before it can hold both.
    `BulkLoader::append` copies the key again into its arena; handing the
    loader the iterator's buffer directly would avoid one of those copies.
 3. Re-run recovery on a 16-thread host.
-4. `u32_map` on the B+ tree. Done: `files` and `file_stats` are on the
-   keyed B+ tree in every build. `engine_bench` at 50k keys: `Get` level,
-   `Range50` about 8% slower (4.72 to 5.12 µs), which is the per-entry file
-   lookup; sysbench against `main` not run.
+4. `u32_map` on the B+ tree. Done for `file_stats` only. `files` is read
+   on every record access, and the B+ tree's general search costs more per
+   lookup than the radix tree's (8.9 against 6.8 ns at one entry, 45 against
+   23 ns at 1024): on the keyed tree `Range50` lost 8%. `files` is a
+   direct-addressing table instead (`PersistentU32Table`), which made
+   `Range50` 14% faster than on the radix tree. Smaller nodes did not help
+   the B+ tree: a one-entry lookup costs ~9 ns at 4096, 1024, 512 and 256
+   bytes, and 256 is slower at 64 entries and up.
 5. Sibling merge on delete, gated by the churn memory tests (D6).
 
 ## References
