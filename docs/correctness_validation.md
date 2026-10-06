@@ -371,9 +371,8 @@ mapping — where a failed read is a `SIGBUS`, not an error (#237):
     the next. The `[model]` many-frames test fails reads 1–150 in turn and
     checks each against the serial baseline, file stats included, and
     `DB::open rebuilds a hint file a read fails on` checks both outcomes
-    directly. Both run at `recovery_threads = 1` on the B+ tree paths: the
-    injector is thread-local, and the radix path builds on worker threads
-    even at one.
+    directly. Both run at `recovery_threads = 1`: the injector is
+    thread-local, and at one thread recovery runs on the thread that opens.
 
 ### Orphaned BulkBegin degrade
 
@@ -629,7 +628,8 @@ primary's cached generation, in which that key does not exist.
 Reverting BC-122 — giving `ReverseRadixTreeIterator::operator*` back the
 `std::reverse_iterator` shape, where it dereferences a temporary copy and
 returns a span into it — left **every cell in the matrix passing** when it
-was measured. Four `radix_tree_test.cpp` cases catch it instead.
+was measured. Four `radix_tree_test.cpp` cases caught it instead (the radix
+tree has since been removed, and the class with it).
 
 That is structural, not a coverage gap to close by adding cells. The
 reverted class is reached only through `key_dir.rbegin()`, and no public
@@ -675,7 +675,7 @@ sequence resolution rather than key lookup — nothing in the key
 directory distinguishes the two orderings, only the sequences do, and a
 failure class is precisely what perturbs the order the entries reach
 disk in. They also drive the range-tombstone suppression loop in
-`recovery_build_from_hints`, which is O(R) per Put during hint replay and
+recovery's hint replay, which is O(R) per Put and
 was previously exercised on clean paths only. They carry no observers:
 what a range tombstone does is settled in the key directory and at
 recovery, and a lent view can see neither.
@@ -1628,7 +1628,7 @@ simplification (the condition could not decide anything), or an exemption.
 | `recovery_prepare_files`: `.tmp && (.hint \|\| .data)` | Test: staged files removed, other `.tmp` files kept. |
 | `recovery_prepare_files`: `end && *end < size` | Simplified: a hint-less file always gets an end. |
 | `RecoveryPhaseLog`: `e && *e == '1'` | Test: `BC_RECOVERY_PHASES` set to `1` and `0`. |
-| `recovery_merge_results` (radix): `a.skipped \|\| b.skipped` | Moved to the caller: which part was `a` depended on which worker finished first. |
+| `recovery_merge_results` (radix): `a.skipped \|\| b.skipped` | Moved to the caller: which part was `a` depended on which worker finished first. Since removed with the radix tree. |
 | `recovery_build_sorted`, `recovery_load_streams`: markers and a `RangeDel` in the sorted run | Test: a crafted hint with markers, a `Delete` and a range tombstone inside the run. |
 | `recovery_build_sorted`: `have_prev && key <= prev` | Removed: keys leave a heap of ascending cursors ascending. |
 | `recovery_load_ranged`: `on_key && older && other file` | Simplified: each file offers one entry per key, so an older Put is from another file. |
@@ -1871,7 +1871,6 @@ Concurrency code paths exercised:
 | Write serialization | `unique_ptr<mutex>` |
 | Group commit | mutex + condition_variable |
 | Background worker | mutex + condition_variable |
-| Radix tree refcount | `atomic<uint32_t>` intrusive refcount |
 | Edit tag counter | `atomic<uint64_t>` relaxed fetch_add |
 
 Run: `scripts/run_sanitizer.sh thread` (or `address` for ASan, `memory` for MSan).
@@ -1929,7 +1928,7 @@ means bugs inside `crc32c` itself, if any, wouldn't be caught by this MSan
 run.
 
 Run: `scripts/run_sanitizer.sh memory`. Target scope matches the ASan/TSan
-jobs above: `bytecask_tests` only, not `radix_tree_memory_tests`. Trigger scope does not — origin tracking makes the
+jobs above: `bytecask_tests` only. Trigger scope does not — origin tracking makes the
 MSan test step the slowest of the three and by far the least predictable
 (2m48s and 11m56s on two runs of the same commit, on an early, much smaller
 suite; per-job runners vary by ~1.8x and the seeded `[model]` workloads
@@ -1952,10 +1951,9 @@ limit. A test that needs a large key set loads it in one `apply_batch`.
 The sanitizer jobs live in `.github/workflows/sanitizers.yml`, which
 `ci.yml` calls. A pull request, and the push to `main` that merges it, run
 ASan, TSan and UBSan on the default blind-leaf key directory. The nightly
-schedule runs the full matrix: `{blind, btree, radix}` (`BYTECASK_KEYDIR`) ×
-`{address, thread, memory, undefined}`, twelve jobs. The two non-default
-trees share their inner nodes and `BuildSession` with the default, so bugs in
-shared code already surface in the PR run; the full matrix catches what is
+schedule runs the full matrix: `{blind, btree}` (`BYTECASK_KEYDIR`) ×
+`{address, thread, memory, undefined}`, eight jobs. The keyed tree shares
+its inner nodes and `BuildSession` with the default, so bugs in shared code already surface in the PR run; the full matrix catches what is
 specific to one tree. UBSan is built with `-fno-sanitize-recover=undefined`,
 so any report fails the job; its leg on the blind tree also runs
 `btree_tests`, which does not depend on `BYTECASK_KEYDIR`. The three MSan
@@ -2477,7 +2475,7 @@ A site whose break nothing has to catch says why instead.
 
 - **A failed `fstat` sealed a file as empty.** No checkpoint named the call; the counted fault sweep reached it (*Counted fault sweep*, #317).
 
-The radix key directory's leak on a failed recovery merge (#203) is not a durability site; LeakSanitizer catches it in CI.
+The radix key directory's leak on a failed recovery merge (#203), before the radix tree was removed, was not a durability site; LeakSanitizer caught it in CI.
 
 ## Output Structure
 
@@ -2704,7 +2702,6 @@ baseline moves forward or stays still, never backward. This makes
 the following safe to attempt without losing correctness:
 
 - `io_uring` or alternative I/O backends
-- Persistent radix tree (relax keys-in-memory requirement)
 - Alternative index structures
 - Alternative thread models
 - External contributors

@@ -1669,7 +1669,7 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
   std::mt19937 gen(98765);
 
   auto rand_key = [&]() -> std::string {
-    // Short keys with prefix overlap to stress the radix tree.
+    // Short keys with prefix overlap to stress shared key prefixes.
     static constexpr std::string_view alphabet = "abcdef";
     const auto len = std::uniform_int_distribution<int>(1, 6)(gen);
     std::string k;
@@ -2408,9 +2408,7 @@ TEST_CASE("Recovery model-based: hints split into many frames",
   // hint that verified, some entries are already applied, so the open fails
   // with std::system_error, and the next open recovers. Either way what is
   // recovered is the serial baseline. The fault injector is thread-local, so
-  // recovery runs on the thread that opens — which the radix path, building
-  // on worker threads even at one, never does.
-#ifdef BYTECASK_USE_BTREE
+  // recovery runs on the thread that opens.
   for (const int nth : {1, 2, 3, 5, 40, 150}) {
     DYNAMIC_SECTION("hint read " << nth << " fails, recovery_threads = 1") {
       const auto p = td.path / std::format("eio{}", nth);
@@ -2437,7 +2435,6 @@ TEST_CASE("Recovery model-based: hints split into many frames",
       if (!opened) CHECK(collect_stats(db) == serial_stats_vals);
     }
   }
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -3016,7 +3013,7 @@ TEST_CASE("DB group commit recovery preserves all keys",
 // ---------------------------------------------------------------------------
 // Test: concurrent reads during writes — raw pointer traversal safety
 // ---------------------------------------------------------------------------
-// Readers traverse the radix tree using raw pointers while a writer mutates
+// Readers traverse the key directory using raw pointers while a writer mutates
 // it via transient (put path). This validates that the persistent/immutable
 // tree structure keeps old nodes alive for the duration of a read, even as
 // the writer clones and replaces nodes.

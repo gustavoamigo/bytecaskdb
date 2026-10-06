@@ -2,7 +2,7 @@
 
 > **Status: built, measured, and the engine's default key directory**
 > (2026-09-24). It describes a key directory beside the keyed B+ tree
-> (`BYTECASK_KEYDIR=btree`) and the radix tree (`BYTECASK_KEYDIR=radix`),
+> (`BYTECASK_KEYDIR=btree`) and the radix tree (since retired),
 > for deployments where the number of keys, not the value data, is what
 > runs out of RAM. The tree (`bytecaskdb/blind_btree.cppm`) is tested, the
 > default build puts the engine on it, and recovery merges the hint files
@@ -76,7 +76,7 @@ Goals:
 Non-goals:
 
 - Replacing the B+ tree as the default. This is a mode for key-count-bound
-  deployments, chosen at build time like `BYTECASK_KEYDIR=radix` today
+  deployments, chosen at build time as the radix tree then was
   (§Selection).
 - Keeping `keys_from` free of I/O. It cannot be: the tree has no key bytes to
   return.
@@ -559,9 +559,8 @@ engine instantiations, so the hot path stays inlined.
 ## Selection
 
 Build-time. The blind tree is the default; `BYTECASK_KEYDIR=btree` selects
-the keyed B+ tree and `BYTECASK_KEYDIR=radix` the radix tree, and CI runs
-the engine suite on all three. The on-disk format is the same for all of
-them: the blind build recovers from the same hint files, so a database
+the keyed B+ tree, and CI runs the engine suite on both. The on-disk format
+is the same for both: the blind build recovers from the same hint files, so a database
 opens under any tree. A runtime `Options::key_directory` is a follow-up
 that belongs to the pluggable-interface work, not to this tree.
 

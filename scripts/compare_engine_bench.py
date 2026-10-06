@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-"""Compare radix tree vs B+ tree across the full engine_bench suite —
+"""Compare the blind-leaf tree vs the keyed B+ tree across the full engine_bench suite —
 Get, Range50, Put (Sync/NoSync), Del, MixedBatch, and the multi-threaded
 Get/Put variants — interleaved round by round so both trees share machine
-state. Sibling to compare_recovery.py, which covers Recovery only.
+state. Builds engine_bench once per BYTECASK_KEYDIR value.
 
 Usage:
     python3 scripts/compare_engine_bench.py [options] [-- <extra flags>]
@@ -16,7 +16,7 @@ Usage:
     --list                  Print the available benchmark keys and exit.
     --bench-dir DIR         Where the test DB is written (default: ./.tmp).
     --cpus RANGE            taskset CPU range, e.g. "0-3" (default: unpinned).
-    --skip-build             Skip building; use existing eb_radix/eb_btree
+    --skip-build             Skip building; use existing eb_blind/eb_btree
                               binaries in build/linux/x86_64/release/.
     --no-rocksdb             Build with BYTECASK_NO_ROCKSDB=1.
     --json-out DIR            Save each run's raw benchmark JSON into DIR.
@@ -39,13 +39,8 @@ registrations in engine_bench.cpp first if those numbers matter — this
 script only runs what is already registered, matching benchmark names
 verified against --benchmark_list_tests rather than guessed.
 
-The ratio column is B+ tree / radix tree (matching the convention already
-used when this comparison was reported in chat) — below 1.0 means the B+
-tree is faster, above 1.0 means the radix tree is faster. This is the
-INVERSE of the ratio convention in compare_recovery.py (radix / B+, where
-above 1.0 means the B+ tree is faster) — that script matched an existing
-report already phrased "radix / B+ tree"; this one matches this one.
-Read the column header, not your memory of the other script.
+The ratio column is B+ tree / blind tree, by time: below 1.0 means the
+keyed B+ tree is faster, above 1.0 means the blind tree is faster.
 """
 
 import argparse
@@ -79,7 +74,7 @@ BENCHMARKS: dict[str, tuple[str, str, bool]] = {
                             r"ByteCaskDB/PutMT/PeriodicSync/real_time/threads:[0-9]+$", True),
 }
 
-CONFIGS = ["radix", "btree"]
+CONFIGS = ["blind", "btree"]
 _TIME_UNIT_TO_NS = {"ns": 1.0, "us": 1e3, "ms": 1e6, "s": 1e9}
 
 
@@ -121,13 +116,13 @@ def build_binaries(no_rocksdb: bool) -> None:
         env_base["BYTECASK_NO_ROCKSDB"] = "1"
     config_flags = clang_config_flags()
 
-    # Both arms name the tree explicitly: the blind tree is the default build,
-    # so leaving BYTECASK_KEYDIR unset would build neither.
+    # Both arms name the tree explicitly, so the comparison does not depend
+    # on which tree is the default build.
     env = env_base.copy()
-    env["BYTECASK_KEYDIR"] = "radix"
+    env["BYTECASK_KEYDIR"] = "blind"
     run(["xmake", "f", "-m", "release", "--sanitizer="] + config_flags, env=env)
     run(["xmake", "build", BENCH_TARGET], env=env)
-    shutil.copy(BUILD_DIR / "engine_bench", BUILD_DIR / "eb_radix")
+    shutil.copy(BUILD_DIR / "engine_bench", BUILD_DIR / "eb_blind")
 
     env = env_base.copy()
     env["BYTECASK_KEYDIR"] = "btree"
@@ -135,7 +130,7 @@ def build_binaries(no_rocksdb: bool) -> None:
     run(["xmake", "build", BENCH_TARGET], env=env)
     shutil.copy(BUILD_DIR / "engine_bench", BUILD_DIR / "eb_btree")
 
-    for name in ("eb_radix", "eb_btree"):
+    for name in ("eb_blind", "eb_btree"):
         if not (BUILD_DIR / name).exists():
             print(f"error: {name} was not built", file=sys.stderr)
             sys.exit(1)
@@ -156,7 +151,7 @@ def run_one(
     json_out_dir: Path | None,
     round_num: int,
 ) -> dict:
-    binary = BUILD_DIR / ("eb_radix" if config == "radix" else "eb_btree")
+    binary = BUILD_DIR / ("eb_blind" if config == "blind" else "eb_btree")
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         out_path = tmp.name
 
@@ -239,7 +234,7 @@ def fmt_ops(ops: float) -> str:
 def main() -> None:
     run_id = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     p = argparse.ArgumentParser(
-        description="Compare radix vs B+ tree across the engine_bench suite.",
+        description="Compare blind vs keyed B+ tree across the engine_bench suite.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--dataset-size", type=int, default=1_000_000)
@@ -278,7 +273,7 @@ def main() -> None:
     if not args.skip_build:
         build_binaries(args.no_rocksdb)
     else:
-        print("[skip-build] using existing eb_radix / eb_btree binaries")
+        print("[skip-build] using existing eb_blind / eb_btree binaries")
 
     # results[key][config][threads] -> list of real_time_ns.
     # ops_results mirrors it with items_per_second — Google Benchmark's own
@@ -349,7 +344,7 @@ def print_tables(
 ) -> None:
     print()
     print(f"engine_bench, {dataset_size:,} keys, {rounds} interleaved rounds")
-    print("(ratio = B+ tree / radix tree, by time; below 1.0 = B+ tree faster.")
+    print("(ratio = B+ tree / blind tree, by time; below 1.0 = B+ tree faster.")
     print(" ops/sec is Google Benchmark's own items_per_second, in the")
     print(" README's own unit — thread-aware for the MT benchmarks, so it is")
     print(" not simply 1/time.)")
@@ -363,24 +358,24 @@ def print_tables(
 
     if single:
         print()
-        print("| Benchmark | radix | radix ops/sec | B+ tree | B+ tree ops/sec | ratio |")
+        print("| Benchmark | blind | blind ops/sec | B+ tree | B+ tree ops/sec | ratio |")
         print("|---|---:|---:|---:|---:|---:|")
         for k in single:
             label = BENCHMARKS[k][0]
-            r_vals = results[k]["radix"].get(0, [])
+            r_vals = results[k]["blind"].get(0, [])
             b_vals = results[k]["btree"].get(0, [])
             if not r_vals or not b_vals:
                 print(f"| {label} | - | - | - | - | - |")
                 continue
             r_med = statistics.median(r_vals)
             b_med = statistics.median(b_vals)
-            print(f"| {label} | {fmt_time(r_med)} | {ops_cell(k, 'radix', 0)} | "
+            print(f"| {label} | {fmt_time(r_med)} | {ops_cell(k, 'blind', 0)} | "
                   f"{fmt_time(b_med)} | {ops_cell(k, 'btree', 0)} | "
                   f"{b_med / r_med:.2f} |")
 
     for k in multi:
         label = BENCHMARKS[k][0]
-        r_threads = sorted(results[k]["radix"].keys())
+        r_threads = sorted(results[k]["blind"].keys())
         b_threads = sorted(results[k]["btree"].keys())
         all_threads = sorted(set(r_threads) | set(b_threads))
         if not all_threads:
@@ -388,17 +383,17 @@ def print_tables(
         print()
         print(f"### {label}")
         print()
-        print("| Threads | radix | radix ops/sec | B+ tree | B+ tree ops/sec | ratio |")
+        print("| Threads | blind | blind ops/sec | B+ tree | B+ tree ops/sec | ratio |")
         print("|---:|---:|---:|---:|---:|---:|")
         for t in all_threads:
-            r_vals = results[k]["radix"].get(t, [])
+            r_vals = results[k]["blind"].get(t, [])
             b_vals = results[k]["btree"].get(t, [])
             if not r_vals or not b_vals:
                 print(f"| {t} | - | - | - | - | - |")
                 continue
             r_med = statistics.median(r_vals)
             b_med = statistics.median(b_vals)
-            print(f"| {t} | {fmt_time(r_med)} | {ops_cell(k, 'radix', t)} | "
+            print(f"| {t} | {fmt_time(r_med)} | {ops_cell(k, 'blind', t)} | "
                   f"{fmt_time(b_med)} | {ops_cell(k, 'btree', t)} | "
                   f"{b_med / r_med:.2f} |")
 

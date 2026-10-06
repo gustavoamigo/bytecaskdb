@@ -1,6 +1,6 @@
 # Parallel Recovery Design
 
-> This describes `recovery_load_parallel`, the file-partitioned path with a fan-in merge. It is what the radix key directory (`BYTECASK_KEYDIR=radix`) recovers through. The keyed B+ tree (`BYTECASK_KEYDIR=btree`) recovers through `recovery_load_ranged` instead: it partitions by key range, bulk-loads each range from the sorted hint files, and has no fan-in at all. The blind-leaf tree, the default, recovers through `recovery_load_streams`, a k-way merge of the sorted hint files straight into leaves. See `docs/bytecask_design.md`, `docs/persistent_btree_design.md` and `docs/blind_leaf_btree_design.md`.
+> **Status: retired with the radix tree.** This describes `recovery_load_parallel`, the file-partitioned path with a fan-in merge that the radix key directory recovered through. Both have been removed. Recovery today: the blind-leaf tree, the default, recovers through `recovery_load_streams`, a k-way merge of the sorted hint files straight into leaves; the keyed B+ tree (`BYTECASK_KEYDIR=btree`) recovers through `recovery_load_ranged`, which partitions by key range, bulk-loads each range from the sorted hint files, and has no fan-in. See `docs/bytecask_design.md`, `docs/persistent_btree_design.md` and `docs/blind_leaf_btree_design.md`. This document is kept for the reasoning behind the fan-in, and why the B+ trees replaced it.
 
 ## 1. Motivation
 

@@ -26,13 +26,12 @@ These are non-negotiable constraints the plan is built around.
    `bytecaskdb_init()`, closed in `bytecaskdb_deinit()`. All schemas,
    tables, indexes, and the catalog live inside this one DB, namespaced
    exclusively by key prefix.
-2. **MariaDB-only Layer 2.** The public `Transaction` described in
-   `docs/transaction_design.md` is **not** implemented yet and is **not**
-   exposed. The plugin ships its own `MariaDBTxn` internal to
+2. **MariaDB-only transaction type.** The engine has no public
+   `Transaction`; `docs/transaction_design.md` describes the snapshot and
+   `WritePlan` primitives it offers instead. The plugin ships its own `MariaDBTxn` internal to
    `bytecaskdb-mariadb-plugin/`, built directly on the already-public
    `DB::snapshot()` + `DB::apply_batch(WritePlan)` (Layer 1) via the
-   C API (`bytecask_c.h`). The public Transaction in the main project
-   is deferred indefinitely — nothing in the plugin should depend on it.
+   C API (`bytecask_c.h`).
 3. **`del_range` is planned but not yet in the engine.** The plan
    assumes `DB::del_range(from, to)` (and the matching
    `WritePlan::del_range`) will land per `.notes/del_range.md`. The

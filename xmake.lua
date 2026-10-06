@@ -182,18 +182,27 @@ end
 -- Key directory tree selection: the engine is built on the blind-leaf B+
 -- tree (docs/blind_leaf_btree_design.md), which stores no key bytes.
 -- BYTECASK_KEYDIR=btree builds it on the B+ tree that keeps its keys in the
--- leaves (docs/persistent_btree_design.md), and BYTECASK_KEYDIR=radix on the
--- radix tree; CI runs the engine suite on all three. Applies to every target
--- so tests and benchmarks agree.
+-- leaves (docs/persistent_btree_design.md); CI runs the engine suite on both.
+-- The switch is the seam for testing a new key directory against the same
+-- engine suite. Applies to every target so tests and benchmarks agree.
 local keydir = os.getenv("BYTECASK_KEYDIR")
 if keydir == nil or keydir == "" then
     keydir = "blind"
 end
-if keydir ~= "radix" then
-    -- The blind tree's inner nodes and BuildSession are the B+ tree's.
-    add_defines("BYTECASK_USE_BTREE")
-end
-if keydir ~= "radix" and keydir ~= "btree" then
+-- Any other value is refused when a target is configured: this scope cannot
+-- raise.
+rule("bytecask.keydir_check")
+    on_config(function (t)
+        local kd = os.getenv("BYTECASK_KEYDIR")
+        if kd and kd ~= "" and kd ~= "blind" and kd ~= "btree" then
+            raise("BYTECASK_KEYDIR must be blind or btree, not '%s'", kd)
+        end
+    end)
+rule_end()
+add_rules("bytecask.keydir_check")
+-- The blind tree's inner nodes and BuildSession are the B+ tree's.
+add_defines("BYTECASK_USE_BTREE")
+if keydir == "blind" then
     add_defines("BYTECASK_KEYDIR_BLIND")
 end
 
@@ -248,7 +257,6 @@ target("bytecask_tests")
     set_default(false)
     -- For VS Code / clangd support, run: scripts/gen_compile_commands.sh
     add_files("tests/*.cpp", "tests/proof/generated/*.cpp", "bytecaskdb/*.cppm")
-    remove_files("tests/radix_tree_memory_test.cpp")
     remove_files("tests/bytecask_c_test.cpp")
     add_includedirs("bytecaskdb", "tests")
     add_packages("crc32c", "zstd")
@@ -271,7 +279,7 @@ target("bytecask_tests")
     else
         add_packages("catch2")
     end
-    add_defines("BYTECASK_TESTING", "BYTECASK_RADIX_ACCOUNTING")
+    add_defines("BYTECASK_TESTING")
     -- Counted fault sweep (tests/syscall_faults.cpp): each I/O call the
     -- binary's objects make goes through an interposer that can count it and
     -- fail the N-th. Linux only: Apple's linker has no --wrap.
@@ -315,20 +323,6 @@ target("btree_tests")
     add_defines("BYTECASK_TESTING")
     on_config(function(t)
         add_native_syslinks(t)
-        apply_sanitizer(t)
-        apply_coverage(t)
-        add_release_opts(t)
-    end)
-
-target("radix_tree_memory_tests")
-    set_kind("binary")
-    set_default(false)
-    add_files("tests/radix_tree_memory_test.cpp", "bytecaskdb/*.cppm")
-    add_includedirs("bytecaskdb", "tests")
-    add_cxflags("-Wno-global-constructors")
-    add_packages("catch2", "crc32c", "zstd")
-    add_defines("BYTECASK_TESTING", "BYTECASK_RADIX_ACCOUNTING")
-    on_config(function(t)
         apply_sanitizer(t)
         apply_coverage(t)
         add_release_opts(t)
@@ -930,7 +924,7 @@ target("wasm_tests")
     remove_files("tests/bytecask_c_test.cpp")
     add_files("bytecaskdb-node/wasm/catch2_stringmakers.cpp")
     add_includedirs("bytecaskdb", "tests")
-    add_defines("BYTECASK_TESTING", "BYTECASK_RADIX_ACCOUNTING")
+    add_defines("BYTECASK_TESTING")
     on_config(function(t)
         local catch2_prefix = path.join(wasm_dir, "build", "catch2-wasm")
         t:add("includedirs", path.join(catch2_prefix, "include"))
