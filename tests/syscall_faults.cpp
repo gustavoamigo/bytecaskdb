@@ -77,6 +77,14 @@ enum class Kind {
 
 enum class Verdict { pass, fail };
 
+// What decide() ruled for one call: whether to fail it, in which mode, and
+// with which errno (0: the call's own default).
+struct Ruling {
+  Verdict verdict{Verdict::pass};
+  SyscallFault mode{SyscallFault::none};
+  int err{0};
+};
+
 struct State {
   std::mutex mu;
   // The directory as the test named it and as the kernel names it; a path
@@ -86,6 +94,7 @@ struct State {
   SyscallFault mode{SyscallFault::none};
   int nth{0};
   bool cascade{false};
+  int err{0};
   int calls{0};
   bool fired{false};
   std::string what;
@@ -131,32 +140,32 @@ auto counts(Kind kind, SyscallFault mode) -> bool {
 // Counts the call if it is the sweep's to count, and says whether this one
 // is to fail. `path` is empty for a call that takes a descriptor.
 auto decide(const char *call, Kind kind, const char *path, int fd)
-    -> std::pair<Verdict, SyscallFault> {
+    -> Ruling {
   if (!armed.load(std::memory_order_acquire) ||
       bytecask::testing::syscall_faults_suspended > 0) {
-    return {Verdict::pass, SyscallFault::none};
+    return {};
   }
   auto &s = state();
   const std::lock_guard<std::mutex> lk{s.mu};
   if (!armed.load(std::memory_order_relaxed) || !counts(kind, s.mode)) {
-    return {Verdict::pass, SyscallFault::none};
+    return {};
   }
   const auto target = path != nullptr ? std::string{path} : fd_path(fd);
   const auto ours = path != nullptr
                         ? under(target, s.dir) || under(target, s.real_dir)
                         : under(target, s.real_dir);
-  if (!ours) return {Verdict::pass, SyscallFault::none};
+  if (!ours) return {};
 
   ++s.calls;
-  if (s.mode == SyscallFault::none) return {Verdict::pass, SyscallFault::none};
+  if (s.mode == SyscallFault::none) return {};
   if (s.calls != s.nth && !(s.cascade && s.calls > s.nth)) {
-    return {Verdict::pass, SyscallFault::none};
+    return {};
   }
   if (!s.fired) {
     s.fired = true;
     s.what = std::string{call} + "(" + target + ")";
   }
-  return {Verdict::fail, s.mode};
+  return {Verdict::fail, s.mode, s.err};
 }
 
 auto halve(std::size_t n) -> std::size_t { return n > 1 ? n / 2 : n; }
@@ -175,11 +184,10 @@ void model_sync(int fd, bool reached_device) {
 }
 
 template <typename R, typename Real>
-auto fail_or_run(std::pair<Verdict, SyscallFault> d, R failure, int err,
-                 Real real) -> R {
-  if (d.first == Verdict::pass) return real();
-  if (d.second == SyscallFault::after) (void)real();
-  errno = err;
+auto fail_or_run(Ruling d, R failure, int err, Real real) -> R {
+  if (d.verdict == Verdict::pass) return real();
+  if (d.mode == SyscallFault::after) (void)real();
+  errno = d.err != 0 ? d.err : err;
   return failure;
 }
 
@@ -189,7 +197,7 @@ namespace bytecask::testing {
 
 ScopedSyscallFaults::ScopedSyscallFaults(const std::filesystem::path &dir,
                                          SyscallFault mode, int nth,
-                                         bool cascade) {
+                                         bool cascade, int err) {
   std::error_code ec;
   auto real = std::filesystem::weakly_canonical(dir, ec);
   if (ec) real = dir;
@@ -200,6 +208,7 @@ ScopedSyscallFaults::ScopedSyscallFaults(const std::filesystem::path &dir,
   s.mode = mode;
   s.nth = nth;
   s.cascade = cascade;
+  s.err = err;
   s.calls = 0;
   s.fired = false;
   s.what.clear();
@@ -233,7 +242,7 @@ int __wrap_open(const char *path, int flags, ...) {
 
 ssize_t __wrap_pread(int fd, void *buf, size_t n, off_t off) {
   const auto d = decide("pread", Kind::read, nullptr, fd);
-  if (d.first == Verdict::fail && d.second == SyscallFault::short_io) {
+  if (d.verdict == Verdict::fail && d.mode == SyscallFault::short_io) {
     return __real_pread(fd, buf, halve(n), off);
   }
   return fail_or_run(d, ssize_t{-1}, EIO,
@@ -242,7 +251,7 @@ ssize_t __wrap_pread(int fd, void *buf, size_t n, off_t off) {
 
 ssize_t __wrap_pwrite(int fd, const void *buf, size_t n, off_t off) {
   const auto d = decide("pwrite", Kind::write, nullptr, fd);
-  if (d.first == Verdict::fail && d.second == SyscallFault::short_io) {
+  if (d.verdict == Verdict::fail && d.mode == SyscallFault::short_io) {
     return __real_pwrite(fd, buf, halve(n), off);
   }
   return fail_or_run(d, ssize_t{-1}, EIO,
@@ -251,7 +260,7 @@ ssize_t __wrap_pwrite(int fd, const void *buf, size_t n, off_t off) {
 
 ssize_t __wrap_pwritev(int fd, const struct iovec *iov, int cnt, off_t off) {
   const auto d = decide("pwritev", Kind::write, nullptr, fd);
-  if (d.first == Verdict::fail && d.second == SyscallFault::short_io) {
+  if (d.verdict == Verdict::fail && d.mode == SyscallFault::short_io) {
     // The first half of the bytes, cut wherever that falls in the vector.
     std::size_t total = 0;
     for (int i = 0; i < cnt; ++i) total += iov[i].iov_len;
@@ -270,7 +279,7 @@ ssize_t __wrap_pwritev(int fd, const struct iovec *iov, int cnt, off_t off) {
 
 ssize_t __wrap_write(int fd, const void *buf, size_t n) {
   const auto d = decide("write", Kind::write, nullptr, fd);
-  if (d.first == Verdict::fail && d.second == SyscallFault::short_io) {
+  if (d.verdict == Verdict::fail && d.mode == SyscallFault::short_io) {
     return __real_write(fd, buf, halve(n));
   }
   return fail_or_run(d, ssize_t{-1}, EIO,
@@ -279,13 +288,13 @@ ssize_t __wrap_write(int fd, const void *buf, size_t n) {
 
 int __wrap_fdatasync(int fd) {
   const auto d = decide("fdatasync", Kind::change, nullptr, fd);
-  if (d.first == Verdict::fail) model_sync(fd, d.second == SyscallFault::after);
+  if (d.verdict == Verdict::fail) model_sync(fd, d.mode == SyscallFault::after);
   return fail_or_run(d, -1, EIO, [&] { return __real_fdatasync(fd); });
 }
 
 int __wrap_fsync(int fd) {
   const auto d = decide("fsync", Kind::change, nullptr, fd);
-  if (d.first == Verdict::fail) model_sync(fd, d.second == SyscallFault::after);
+  if (d.verdict == Verdict::fail) model_sync(fd, d.mode == SyscallFault::after);
   return fail_or_run(d, -1, EIO, [&] { return __real_fsync(fd); });
 }
 

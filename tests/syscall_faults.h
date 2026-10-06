@@ -41,12 +41,14 @@ struct SyscallFaultReport {
 // Arms the interposers, process-wide: the flush leader and the hint worker
 // are not always the test's thread. Counts calls on files under `dir`, by
 // path or by what the descriptor names, and fails the nth (1-based). With
-// `cascade`, every counted call from the nth onward fails. Disarms and
-// reports on destruction or on report().
+// `cascade`, every counted call from the nth onward fails. A failed call
+// reports `err` (0: the call's usual EIO, or ENOMEM for mmap), so a test can
+// reach a caller's handling of one errno. Disarms and reports on destruction
+// or on report().
 class ScopedSyscallFaults {
 public:
   ScopedSyscallFaults(const std::filesystem::path &dir, SyscallFault mode,
-                      int nth, bool cascade = false);
+                      int nth, bool cascade = false, int err = 0);
   ~ScopedSyscallFaults();
   ScopedSyscallFaults(const ScopedSyscallFaults &) = delete;
   auto operator=(const ScopedSyscallFaults &) -> ScopedSyscallFaults & = delete;

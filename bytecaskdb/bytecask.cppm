@@ -667,18 +667,6 @@ public:
 
   [[nodiscard]] auto durable_seq() const noexcept -> std::uint64_t;
 
-  [[nodiscard]] auto mode() const noexcept -> Mode { return mode_; }
-  [[nodiscard]] auto is_degraded() const noexcept -> bool { return degraded_; }
-  [[nodiscard]] auto degraded_reason() const noexcept -> const std::string & {
-    return degraded_reason_;
-  }
-
-  // Returns a mutable reference to file_stats_. Used by resume() to update
-  // total_bytes for a truncated active file before publishing state.
-  [[nodiscard]] auto file_stats() noexcept -> TransientU32Map<FileStats> & {
-    return file_stats_;
-  }
-
   // Commit: consume the transient and produce a new immutable EngineState.
   [[nodiscard]] auto persistent() && -> std::shared_ptr<EngineState>;
 
@@ -1512,7 +1500,8 @@ private:
 #endif
     state_gen_.store(next_state_gen(), std::memory_order_release);
     publishing_.fetch_sub(1, std::memory_order_release);
-    if (degraded && old && !old->degraded) {
+    // state_ is never null: it starts as an empty state (see open).
+    if (degraded && !old->degraded) {
       counters_.degraded_transitions.fetch_add(1, std::memory_order_relaxed);
     }
   }
@@ -1613,6 +1602,13 @@ public:
   // Called on the background worker at the start of every hint task queued
   // by dispatch_hint. Lets a test hold the worker to build a backlog.
   std::function<void()> test_before_hint_;
+  // Called by vacuum once its copy is in place, before it takes the write
+  // barrier to commit. Lets a test write to the keys the copy holds.
+  std::function<void()> test_before_vacuum_commit_;
+  // Called under durable_mu_ each time a thread blocked in wait_published or
+  // durable_sequence checks its condition, the first time before it blocks.
+  // Lets a test act once a waiter is parked. Must not take durable_mu_.
+  std::function<void()> test_in_sequence_wait_;
   // Leaves plans unresolved, so validation and the key directory update go
   // by key, as before record locations were used as version tokens. The
   // differential test runs one workload both ways.
@@ -2221,10 +2217,11 @@ void TransientEngineState::apply_writes(
             // An update of a key still at the snapshot's record goes by that
             // location and reads nothing; anything else is placed by key.
             const auto &at = plan.resolved_entry(w_idx);
+            const bool by_location =
+                at && kd_put_at(key_dir_, key_span, *at, entry);
             const auto existing =
-                at && kd_put_at(key_dir_, key_span, *at, entry)
-                    ? std::optional{kd_hit(*at)}
-                    : kd_put(key_dir_, key_span, entry, kd_ctx());
+                by_location ? std::optional{kd_hit(*at)}
+                            : kd_put(key_dir_, key_span, entry, kd_ctx());
             if (existing) {
               const auto dec =
                   entry_size(key_span.size(), existing->value_size());
@@ -2242,9 +2239,10 @@ void TransientEngineState::apply_writes(
           } else if constexpr (std::is_same_v<T, WritePlan::PointDel>) {
             const std::span<const std::byte> key_span{op.key};
             const auto &at = plan.resolved_entry(w_idx);
-            const auto existing = at && kd_erase_at(key_dir_, key_span, *at)
-                                      ? std::optional{kd_hit(*at)}
-                                      : kd_erase(key_dir_, key_span, kd_ctx());
+            const bool by_location = at && kd_erase_at(key_dir_, key_span, *at);
+            const auto existing =
+                by_location ? std::optional{kd_hit(*at)}
+                            : kd_erase(key_dir_, key_span, kd_ctx());
             if (existing) {
               const auto dec =
                   entry_size(key_span.size(), existing->value_size());
@@ -2306,13 +2304,13 @@ void TransientEngineState::apply_writes(
     ++io_idx;
   }
 
-  // Track per-file sequence bounds.
+  // Track per-file sequence bounds. A file's sequences ascend, so its
+  // minimum is its first batch's.
   const auto batch_end_seq = next_seq_ - 1;
   file_stats_.update(
       active_file_id_,
       [batch_start_seq, batch_end_seq](FileStats &fs) {
-        if (fs.min_sequence == 0 || batch_start_seq < fs.min_sequence)
-          fs.min_sequence = batch_start_seq;
+        if (fs.min_sequence == 0) fs.min_sequence = batch_start_seq;
         if (batch_end_seq > fs.max_sequence)
           fs.max_sequence = batch_end_seq;
       });
@@ -2410,13 +2408,13 @@ void TransientEngineState::apply_ingest(
   // Advance next_seq past the highest ingested sequence.
   if (max_seq >= next_seq_) next_seq_ = max_seq + 1;
 
-  // Track per-file sequence bounds.
+  // Track per-file sequence bounds. A file's sequences ascend, so its
+  // minimum is its first batch's.
   const auto batch_end_seq = max_seq;
   file_stats_.update(
       active_file_id_,
       [batch_start_seq, batch_end_seq](FileStats &fs) {
-        if (fs.min_sequence == 0 || batch_start_seq < fs.min_sequence)
-          fs.min_sequence = batch_start_seq;
+        if (fs.min_sequence == 0) fs.min_sequence = batch_start_seq;
         if (batch_end_seq > fs.max_sequence)
           fs.max_sequence = batch_end_seq;
       });
@@ -2496,7 +2494,7 @@ void TransientEngineState::apply_resume(
   for (const auto &e : entries) {
     const std::span<const std::byte> key_span{e.key};
     if (e.sequence > max_seq) max_seq = e.sequence;
-    if (seq_min == 0 || e.sequence < seq_min) seq_min = e.sequence;
+    if (seq_min == 0) seq_min = e.sequence;  // entries are in file order
     if (e.sequence > seq_max) seq_max = e.sequence;
     // entries holds every committed entry in the file, so the file's
     // tombstones are rebuilt from scratch here, like its bounds.
@@ -3889,9 +3887,9 @@ auto DB::vacuum_scan_and_copy(
     std::uint64_t retain_after) -> VacuumScanResult {
   VacuumScanResult result;
 
+  // The source is scanned in file order, where sequences ascend.
   auto track_seq = [&](std::uint64_t seq) {
-    if (result.min_sequence == 0 || seq < result.min_sequence)
-      result.min_sequence = seq;
+    if (result.min_sequence == 0) result.min_sequence = seq;
     if (seq > result.max_sequence) result.max_sequence = seq;
   };
 
@@ -3899,9 +3897,10 @@ auto DB::vacuum_scan_and_copy(
     switch (entry.entry_type) {
     case EntryType::Put: {
       const auto existing = kd_get(snap->key_dir, entry.key, snap->kd_ctx());
+      // A location names one record, so an entry still at this one is this
+      // record, sequence and all.
       if (existing && existing->file_id() == source_file_id &&
-          existing->file_offset() == entry_off &&
-          existing->sequence() == entry.sequence) {
+          existing->file_offset() == entry_off) {
         const auto new_off =
             dest_file.append_entry(entry.sequence, EntryType::Put, entry.key,
                              entry.value);
@@ -4098,6 +4097,7 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
   // final name while the old one is still the published state's; cleanup
   // removes it.
   FAULT_INJECTION(io_vacuum_compact_post_rename);
+  if (test_before_vacuum_commit_) test_before_vacuum_commit_();
 #endif
 
   // Reserve the destination id before opening the file, so the file carries
@@ -4276,10 +4276,11 @@ void DB::set_mode(Mode mode) {
   // A leader stepping down makes every write it acknowledged durable, and
   // so shippable: changes_since stops at durable_sequence, and a sync=false
   // write left above it would never reach the next leader, which then
-  // reuses its sequence.
+  // reuses its sequence. Only a leader can hold such a write: ingest syncs
+  // before it publishes.
   const auto last_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
-  if (mode == Mode::Follower && current->mode == Mode::Leader
-      && !current->degraded && t.durable_seq() < last_seq) {
+  if (mode == Mode::Follower && !current->degraded &&
+      t.durable_seq() < last_seq) {
     sync_active_file(t, current, "set_mode(Follower)");
   }
   t.apply_set_mode(mode);
@@ -4465,7 +4466,14 @@ void DB::resume() {
 void DB::wait_published(std::uint64_t sequence) const {
   std::unique_lock<std::mutex> lk{durable_mu_};
   durable_cv_.wait(lk, [&] {
+#ifdef BYTECASK_TESTING
+    if (test_in_sequence_wait_) test_in_sequence_wait_();
+#endif
     const auto s = load_state();
+    // mcdc-exempt(C3): close() takes the write barrier, which waits for the
+    // flush this waiter's sequence is in, so by the time a state is closed
+    // that flush has either published the sequence (C1) or degraded (C2).
+    // The test stays so a waiter can never outlive the engine.
     return s->next_seq > sequence || s->degraded || s->closed;
   });
 }
@@ -4482,6 +4490,9 @@ auto DB::durable_sequence(std::uint64_t min_sequence,
 
   std::unique_lock<std::mutex> lk{durable_mu_};
   durable_cv_.wait_for(lk, timeout, [&] {
+#ifdef BYTECASK_TESTING
+    if (test_in_sequence_wait_) test_in_sequence_wait_();
+#endif
     const auto cur = load_state();
     return cur->durable_seq >= min_sequence || cur->closed;
   });
@@ -4654,7 +4665,8 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
       new_state->next_seq > old_state->next_seq;
   const auto became_degraded =
       new_state->degraded && !old_state->degraded;
-  const auto became_closed = new_state->closed && !old_state->closed;
+  // close() publishes once; nothing publishes after it.
+  const auto became_closed = new_state->closed;
 
 #ifndef NDEBUG
   if constexpr (kKeyDirReadsKeys) {
@@ -4667,8 +4679,14 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
                                         new_state->kd_ctx(/*verify=*/false));
          it != std::default_sentinel; ++it) {
       const auto loc = *it;
-      if (const auto *fs = new_state->file_stats.get(loc.file_id());
-          fs != nullptr && loc.file_offset() >= fs->total_bytes) {
+      const auto *fs = new_state->file_stats.get(loc.file_id());
+      if (fs == nullptr) {
+        deem_as_degraded(std::format(
+            "invariant violation: key in file_id {}, which has no file_stats",
+            loc.file_id()));
+        return;
+      }
+      if (loc.file_offset() >= fs->total_bytes) {
         deem_as_degraded(std::format(
             "invariant violation: key in file_id {} starts at {} but the "
             "file's committed extent is {}",
@@ -4687,8 +4705,14 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
       if (entry.sequence() > max_seq) max_seq = entry.sequence();
       const auto entry_end = entry.file_offset() +
                              entry_size(key_span.size(), entry.value_size());
-      if (const auto *fs = new_state->file_stats.get(entry.file_id());
-          fs != nullptr && entry_end > fs->total_bytes) {
+      const auto *fs = new_state->file_stats.get(entry.file_id());
+      if (fs == nullptr) {
+        deem_as_degraded(std::format(
+            "invariant violation: key in file_id {}, which has no file_stats",
+            entry.file_id()));
+        return;
+      }
+      if (entry_end > fs->total_bytes) {
         deem_as_degraded(std::format(
             "invariant violation: key in file_id {} ends at {} but the file's "
             "committed extent is {}",
@@ -4696,7 +4720,8 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
         return;
       }
     }
-    if (max_seq > 0 && new_state->next_seq <= max_seq) {
+    // next_seq starts at 1, so an empty key directory passes.
+    if (new_state->next_seq <= max_seq) {
       deem_as_degraded(std::format(
           "invariant violation: next_seq {} <= max key_dir sequence {}",
           new_state->next_seq, max_seq));
@@ -4771,14 +4796,15 @@ void DB::validate_state_consistency(const EngineState &s) const {
     // put and only mmap_end_ moves, so an entry above the new extent would
     // leave a reader's span addressing a page beyond EOF. See "View and span
     // lifetimes" in CONTRACT.md.
+    // Check 4 put every registered file in file_stats.
     const auto size = entry_size(key_span.size(), entry.value_size());
     const auto entry_end = entry.file_offset() + size;
-    if (const auto *fs = s.file_stats.get(entry.file_id());
-        fs != nullptr && entry_end > fs->total_bytes) {
+    if (entry_end > s.file_stats.get(entry.file_id())->total_bytes) {
       throw std::runtime_error{std::format(
           "state consistency: key in file_id {} ends at {} but the file's "
           "committed extent is {}",
-          entry.file_id(), entry_end, fs->total_bytes)};
+          entry.file_id(), entry_end,
+          s.file_stats.get(entry.file_id())->total_bytes)};
     }
     computed_live[entry.file_id()] += size;
     if (entry.sequence() > max_seq) max_seq = entry.sequence();
@@ -4809,7 +4835,8 @@ void DB::validate_state_consistency(const EngineState &s) const {
           "(one is zero, the other is not)",
           file_id, fs.min_sequence, fs.max_sequence)};
     }
-    if (fs.min_sequence > 0 && fs.min_sequence > fs.max_sequence) {
+    // Both are zero or neither is (above), so this needs no zero test.
+    if (fs.min_sequence > fs.max_sequence) {
       throw std::runtime_error{std::format(
           "state consistency: file_id {} min_sequence {} > max_sequence {}",
           file_id, fs.min_sequence, fs.max_sequence)};
@@ -4864,13 +4891,16 @@ auto find_sequence_overlap(const EngineState &s)
       ranges.push_back({fs.min_sequence, fs.max_sequence, fid});
     }
   }
+  // Sorted by min, a range overlaps an earlier one only if it overlaps the
+  // one just before it: until an overlap is found the ranges are disjoint,
+  // so the previous range is also the one reaching furthest.
   std::ranges::sort(ranges, {}, &Range::min);
-  const Range *widest = nullptr;
+  const Range *prev = nullptr;
   for (const auto &r : ranges) {
-    if (widest != nullptr && r.min <= widest->max) {
-      return std::pair{widest->file_id, r.file_id};
+    if (prev != nullptr && r.min <= prev->max) {
+      return std::pair{prev->file_id, r.file_id};
     }
-    if (widest == nullptr || r.max > widest->max) widest = &r;
+    prev = &r;
   }
   return std::nullopt;
 }
@@ -5017,7 +5047,9 @@ auto DB::recovery_prepare_files(EngineState &s)
       const auto end = flush_hints_for(data_file, dir_, [&](Offset e) {
         recovery_check_tail(*data_file, e, data_paths);
       });
-      if (end && *end < std::filesystem::file_size(p)) {
+      // The file had no hint, so flush_hints_for wrote one and returns the
+      // end of what it indexed.
+      if (end.value() < std::filesystem::file_size(p)) {
         data_file.reset();
         truncate_durably(p, *end);
         // Same file_id as the open above, deliberately. Under the buffer
@@ -5370,7 +5402,9 @@ auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
   return {std::move(merged), std::move(merged_tombs),
           std::move(merged_range_tombs),
           std::max(a.max_seq, b.max_seq), std::move(a.file_stats),
-          std::move(needed), a.skipped_files || b.skipped_files};
+          // The caller collects skipped_files from every part as it
+          // arrives (recovery_load_parallel), in whatever order they finish.
+          std::move(needed), /*skipped_files=*/false};
 }
 
 // Parallel recovery: file-level partitioning with sequential accumulator merge.
@@ -5443,6 +5477,7 @@ auto DB::recovery_load_parallel(EngineState s,
       // Main thread: consume results as they arrive.
       RecoveryResult acc{};
       bool acc_initialized = false;
+      bool skipped = false;
       unsigned merged_count = 0;
 
       while (merged_count < W) {
@@ -5454,6 +5489,7 @@ auto DB::recovery_load_parallel(EngineState s,
         lk.unlock();
 
         for (auto &incoming : local) {
+          if (incoming.skipped_files) skipped = true;
           if (!acc_initialized) {
             acc = std::move(incoming);
             acc_initialized = true;
@@ -5464,6 +5500,7 @@ auto DB::recovery_load_parallel(EngineState s,
       }
 
       // Store final result for phases 4-5 (threads join at scope exit).
+      acc.skipped_files = skipped;
       queue.clear();
       queue.push_back(std::move(acc));
     }
@@ -5672,8 +5709,6 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
   KeyDirBulkLoader out;
   std::vector<std::size_t> matches;
   matches.reserve(cursors.size());
-  std::vector<std::byte> prev_key;
-  bool have_prev = false;
 
   // The next Put or Delete in this file, counting every entry it steps over
   // towards the file's sequence bounds.
@@ -5787,13 +5822,9 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
         suppressed = true;
         break;
       }
+      // Keys leave the heap ascending: each cursor's are (load checks it)
+      // and equal keys are merged above. The bulk loader checks it again.
       if (!suppressed) {
-        if (have_prev && recovery_key_cmp(key, prev_key) <= 0) {
-          throw std::runtime_error{
-              "bytecask: merged hint keys are not ascending"};
-        }
-        prev_key.assign(key.begin(), key.end());
-        have_prev = true;
         out.append(key, KeyDirEntry::make(winner.sequence, winner.file_offset,
                                           winner_file, winner.value_size));
       }
@@ -6042,8 +6073,10 @@ auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
       // what it saw.
       for (const auto i : matches) {
         const auto &e = cursors[i].entry;
-        if (on_key && e.sequence() < tomb->second.seq &&
-            e.file_id() != tomb->second.file_id)
+        // recovery_build_sorted reduces each file to its newest entry for a
+        // key, so a file offers a Put or a tombstone for it, never both: a
+        // Put older than the tombstone is from another file.
+        if (on_key && e.sequence() < tomb->second.seq)
           outs[r].needed.push_back(tomb->second.seq);
         for (const auto *rt : rts) {
           if (e.sequence() >= rt->seq || e.file_id() == rt->file_id) continue;
@@ -6533,7 +6566,8 @@ private:
     has_entry_ = false;
 
     // Advance past the previously cached entry (deferred from last call).
-    if (needs_advance_ && entry_iter_) {
+    // Set only once an entry was read from entry_iter_.
+    if (needs_advance_) {
       ++(*entry_iter_);
       needs_advance_ = false;
     }

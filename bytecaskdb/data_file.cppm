@@ -99,17 +99,6 @@ public:
 
   [[nodiscard]] virtual auto size() const noexcept -> Offset = 0;
 
-  // Reads full entry (header + key + value + CRC), verifies CRC.
-  // key_size derived from on-disk header. Spans point into io_buf or mmap.
-  [[nodiscard]] virtual auto read_entry(Offset offset, std::uint32_t value_size,
-                                        std::vector<std::byte> &io_buf) const
-      -> DataEntryView = 0;
-
-  // Reads full entry without CRC verification. Spans point into mmap or io_buf.
-  [[nodiscard]] virtual auto read_entry_unverified(
-      Offset offset, std::uint32_t value_size,
-      std::vector<std::byte> &io_buf) const -> DataEntryView = 0;
-
   // The record at offset, its key and value sizes taken from its own header:
   // one frame lookup and no copy on a pool-backed file, the mapping on an
   // mmap one, and on a pread one a single speculative read that a record
@@ -387,33 +376,9 @@ constexpr auto bytes_below(Offset offset, std::size_t len, Offset end) noexcept
              : static_cast<std::size_t>(std::min<Offset>(len, end - offset));
 }
 
-// The unverified read of the entry at offset: over-reads by a key budget so
-// the header and body take one pread, and only a longer key pays for a
-// second. Leaves the whole entry, from its header, at the front of io_buf and
-// returns the header. The over-read may run past the end of the file; only
-// the entry's own bytes have to be there.
-auto read_speculative(int fd, Offset offset, std::uint32_t value_size,
-                      std::vector<std::byte> &io_buf) -> EntryHeader {
-  static constexpr std::size_t kKeyBudget = 256;
-  io_buf.resize(kHeaderSize + kKeyBudget + value_size + kCrcSize);
-  const auto got = pread_upto(fd, offset, io_buf);  // short only at EOF
-  if (got < kHeaderSize) throw_short_read(offset, kHeaderSize, got);
-  const auto hdr = bytecask::read_header(
-      std::span<const std::byte>{io_buf.data(), kHeaderSize});
-  const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
-  if (total > io_buf.size()) {
-    io_buf.resize(total);
-    pread_exact(fd, offset + got, std::span{io_buf}.subspan(got));
-  } else if (total > got) {
-    throw_short_read(offset, total, got);
-  }
-  return hdr;
-}
-
 // pread(2) back-end. Stateless: every publish() call compiles away.
 export struct PreadIo {
-  // Each point read costs a syscall, so read_entry_unverified over-reads
-  // speculatively to fuse the header and the body into one of them.
+  // Nothing is held in memory: the file's read methods pread it.
   static constexpr bool kResident = false;
 
   void publish(Offset, std::span<const ::iovec>) const noexcept {}
@@ -422,19 +387,6 @@ export struct PreadIo {
                                 Offset /*logical_end*/, std::byte *dst) const
       -> std::size_t {
     return pread_upto(fd, offset, {dst, len});
-  }
-
-  // Nothing resident to lend or assign from: the file's read methods copy.
-  [[nodiscard]] static auto lend(Offset, std::uint32_t, bool, Offset,
-                                 FrameLease &) noexcept
-      -> std::optional<DataEntryView> {
-    return std::nullopt;
-  }
-  [[nodiscard]] static auto read_value(Offset, std::uint16_t, std::uint32_t,
-                                       bool, Offset,
-                                       std::vector<std::byte> &) noexcept
-      -> bool {
-    return false;
   }
 };
 
@@ -448,7 +400,7 @@ public:
   PoolIo(std::shared_ptr<BufferPool> pool, std::uint32_t file_id) noexcept
       : pool_{std::move(pool)}, file_id_{file_id} {}
 
-  // The bytes are already in memory, so an over-read saves nothing.
+  // The bytes are in memory: reads try lend() and read_value() first.
   static constexpr bool kResident = true;
 
   // One append_resident per iovec, so nothing is re-read or re-gathered.
@@ -861,13 +813,6 @@ public:
     }
   }
 
-  [[nodiscard]] auto read_entry(Offset offset, std::uint32_t value_size,
-                                std::vector<std::byte> &io_buf) const
-      -> DataEntryView override {
-    auto hdr = read_header(offset);
-    return read_entry_with_key_size(offset, hdr.key_size, value_size, io_buf);
-  }
-
   [[nodiscard]] auto lend_record(Offset offset, std::uint32_t value_size_hint,
                                  bool verify, std::vector<std::byte> &io_buf,
                                  FrameLease &lease) const
@@ -891,33 +836,6 @@ public:
                                        std::byte *dst) {
                           return pread_upto(ops_.fd_, at, {dst, len});
                         });
-  }
-
-  [[nodiscard]] auto read_entry_unverified(
-      Offset offset, std::uint32_t value_size,
-      std::vector<std::byte> &io_buf) const
-      -> DataEntryView override {
-    auto hdr = read_header(offset);
-    const auto body_size = hdr.key_size + value_size;
-    if (offset + kHeaderSize + body_size <= mmap_end()) {
-      auto body = std::span<const std::byte>{
-          mmap_base_ + offset + kHeaderSize, body_size};
-      return DataEntryView{
-          .sequence = hdr.sequence,
-          .entry_type = hdr.entry_type,
-          .key = body.subspan(0, hdr.key_size),
-          .value = body.subspan(hdr.key_size, value_size),
-      };
-    }
-    io_buf.resize(body_size);
-    pread_exact(ops_.fd_, offset + kHeaderSize, io_buf);
-    std::span<const std::byte> body{io_buf};
-    return DataEntryView{
-        .sequence = hdr.sequence,
-        .entry_type = hdr.entry_type,
-        .key = body.subspan(0, hdr.key_size),
-        .value = body.subspan(hdr.key_size, value_size),
-    };
   }
 
   void sync() override { ops_.sync(); }
@@ -952,7 +870,8 @@ private:
                       O_RDWR | O_CREAT | O_CLOEXEC | (exclusive ? O_EXCL : 0),
                       0644);
     if (ops_.fd_ == -1) {
-      if (exclusive && errno == EEXIST) panic_on_reused_path(path_);
+      // Only O_EXCL reports EEXIST, so this is an exclusive create.
+      if (errno == EEXIST) panic_on_reused_path(path_);
       throw std::system_error{
           errno, std::generic_category(),
           std::format("WritableMmapDataFile: cannot open '{}'", path_.string())};
@@ -993,16 +912,6 @@ private:
   void set_mmap_end(Offset file_size) noexcept {
     mmap_end_.store(std::min(mmap_len_, static_cast<std::size_t>(file_size)),
                     std::memory_order_release);
-  }
-
-  [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
-    if (offset + kHeaderSize <= mmap_end()) {
-      return bytecask::read_header(
-          std::span{mmap_base_ + offset, kHeaderSize});
-    }
-    std::array<std::byte, kHeaderSize> hdr{};
-    pread_exact(ops_.fd_, offset, hdr);
-    return bytecask::read_header(std::span{hdr});
   }
 
   [[nodiscard]] auto read_entry_with_key_size(
@@ -1136,33 +1045,6 @@ public:
     return read();
   }
 
-  [[nodiscard]] auto read_entry(Offset offset, std::uint32_t value_size,
-                                std::vector<std::byte> &io_buf) const
-      -> DataEntryView override {
-    auto hdr = read_header(offset);
-    return read_entry_with_key_size(offset, hdr.key_size, value_size, io_buf);
-  }
-
-  [[nodiscard]] auto read_entry_unverified(
-      Offset offset, std::uint32_t value_size,
-      std::vector<std::byte> &io_buf) const
-      -> DataEntryView override {
-    if constexpr (Io::kResident) {
-      // Nothing to save by over-reading: read the header, then exactly the
-      // entry it describes.
-      const auto hdr = read_header(offset);
-      const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
-      io_buf.resize(total);
-      fetch(offset, total, io_buf.data());
-      return view_of(hdr, value_size, io_buf);
-    } else {
-      // A syscall per read, so over-read by a key budget and fuse the header
-      // and the body into one pread. Only a longer key pays for a second.
-      const auto hdr = read_speculative(ops_.fd_, offset, value_size, io_buf);
-      return view_of(hdr, value_size, io_buf);
-    }
-  }
-
   void sync() override { ops_.sync(); }
 
   [[nodiscard]] auto size() const noexcept -> Offset override {
@@ -1181,7 +1063,8 @@ private:
                       O_RDWR | O_CREAT | O_CLOEXEC | (exclusive ? O_EXCL : 0),
                       0644);
     if (ops_.fd_ == -1) {
-      if (exclusive && errno == EEXIST) panic_on_reused_path(path_);
+      // Only O_EXCL reports EEXIST, so this is an exclusive create.
+      if (errno == EEXIST) panic_on_reused_path(path_);
       throw std::system_error{
           errno, std::generic_category(),
           std::format("WritablePosixFile: cannot open '{}'", path_.string())};
@@ -1203,27 +1086,6 @@ private:
   void fetch(Offset offset, std::size_t len, std::byte *dst) const {
     const auto got = fetch_upto(offset, len, dst);
     if (got < len) throw_short_read(offset, len, got);
-  }
-
-  [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
-    std::array<std::byte, kHeaderSize> hdr{};
-    fetch(offset, kHeaderSize, hdr.data());
-    return bytecask::read_header(std::span{hdr});
-  }
-
-  // io_buf holds the whole entry starting at its header; the view borrows it.
-  [[nodiscard]] static auto view_of(const EntryHeader &hdr,
-                                    std::uint32_t value_size,
-                                    const std::vector<std::byte> &io_buf)
-      -> DataEntryView {
-    auto body = std::span<const std::byte>{io_buf.data() + kHeaderSize,
-                                           hdr.key_size + value_size};
-    return DataEntryView{
-        .sequence = hdr.sequence,
-        .entry_type = hdr.entry_type,
-        .key = body.subspan(0, hdr.key_size),
-        .value = body.subspan(hdr.key_size, value_size),
-    };
   }
 
   [[nodiscard]] auto read_entry_with_key_size(Offset offset,
@@ -1312,13 +1174,6 @@ public:
     }
   }
 
-  [[nodiscard]] auto read_entry(Offset offset, std::uint32_t value_size,
-                                std::vector<std::byte> &io_buf) const
-      -> DataEntryView override {
-    auto hdr = read_header(offset);
-    return read_entry_with_key_size(offset, hdr.key_size, value_size, io_buf);
-  }
-
   [[nodiscard]] auto lend_record(Offset offset, std::uint32_t value_size_hint,
                                  bool verify, std::vector<std::byte> &io_buf,
                                  FrameLease &lease) const
@@ -1339,20 +1194,6 @@ public:
 #endif
   }
 
-  [[nodiscard]] auto read_entry_unverified(
-      Offset offset, std::uint32_t value_size,
-      std::vector<std::byte> &io_buf) const -> DataEntryView override {
-    const auto hdr = read_speculative(fd_, offset, value_size, io_buf);
-    auto body = std::span<const std::byte>{io_buf.data() + kHeaderSize,
-                                           hdr.key_size + value_size};
-    return DataEntryView{
-        .sequence = hdr.sequence,
-        .entry_type = hdr.entry_type,
-        .key = body.subspan(0, hdr.key_size),
-        .value = body.subspan(hdr.key_size, value_size),
-    };
-  }
-
   [[nodiscard]] auto size() const noexcept -> Offset override {
     return static_cast<Offset>(file_size_);
   }
@@ -1364,12 +1205,6 @@ private:
 
   int fd_;
   std::size_t file_size_;
-
-  [[nodiscard]] auto read_header(Offset offset) const -> EntryHeader {
-    std::array<std::byte, kHeaderSize> hdr{};
-    pread_exact(fd_, offset, hdr);
-    return bytecask::read_header(std::span{hdr});
-  }
 
   [[nodiscard]] auto read_entry_with_key_size(Offset offset,
                                               std::uint16_t key_size,
@@ -1463,13 +1298,6 @@ public:
     }
   }
 
-  [[nodiscard]] auto read_entry(Offset offset, std::uint32_t value_size,
-                                [[maybe_unused]] std::vector<std::byte> &io_buf) const
-      -> DataEntryView override {
-    auto hdr = read_header(offset);
-    return read_entry_with_key_size(offset, hdr.key_size, value_size);
-  }
-
   [[nodiscard]] auto lend_record(Offset offset,
                                  std::uint32_t /*value_size_hint*/,
                                  bool verify,
@@ -1484,21 +1312,6 @@ public:
     if (offset + total > mmap_size_)
       throw_record_past_end(path(), offset, hdr, mmap_size_);
     return record_view({mmap_base_ + offset, total}, hdr, verify);
-  }
-
-  [[nodiscard]] auto read_entry_unverified(
-      Offset offset, std::uint32_t value_size,
-      [[maybe_unused]] std::vector<std::byte> &io_buf) const
-      -> DataEntryView override {
-    auto hdr = bytecask::read_header(std::span{mmap_base_ + offset, kHeaderSize});
-    auto body = std::span{mmap_base_ + offset + kHeaderSize,
-                          hdr.key_size + value_size};
-    return DataEntryView{
-        .sequence = hdr.sequence,
-        .entry_type = hdr.entry_type,
-        .key = body.subspan(0, hdr.key_size),
-        .value = body.subspan(hdr.key_size, value_size),
-    };
   }
 
   [[nodiscard]] auto size() const noexcept -> Offset override {
@@ -1571,11 +1384,6 @@ inline void drop_page_cache(int fd, Offset offset = 0,
 // file registered with it. Frames are keyed by the engine's file_id, which the
 // caller reserves before opening the file — see TransientEngineState::
 // reserve_file_id, which exists so vacuum can supply one here.
-//
-// Spans returned by read_entry / read_entry_unverified point into the caller's
-// io_buf, exactly as ReadOnlyPosixDataFile does — never into a frame. A frame
-// is reused memory, so a span into one would dangle the moment it was evicted,
-// and an EntryIterator holds its span across the user's whole loop body.
 export class ReadOnlyBufferPoolDataFile : public DataFile {
 public:
   [[nodiscard]] static auto openForRead(std::filesystem::path path,
@@ -1642,14 +1450,6 @@ public:
     }
   }
 
-  [[nodiscard]] auto read_entry(Offset offset, std::uint32_t value_size,
-                                std::vector<std::byte> &io_buf) const
-      -> DataEntryView override {
-    auto hdr = read_header(offset, Source::Pool);
-    return read_entry_with_key_size(offset, hdr.key_size, value_size, io_buf,
-                                    Source::Pool);
-  }
-
   // One frame lookup for a record inside one resident frame; otherwise the
   // record is copied through the pool, which fills what is missing.
   [[nodiscard]] auto lend_record(Offset offset, std::uint32_t value_size_hint,
@@ -1666,23 +1466,6 @@ public:
                           fetch(at, len, dst, Source::Pool);
                           return len;
                         });
-  }
-
-  [[nodiscard]] auto read_entry_unverified(
-      Offset offset, std::uint32_t value_size,
-      std::vector<std::byte> &io_buf) const -> DataEntryView override {
-    const auto hdr = read_header(offset, Source::Pool);
-    const auto total = kHeaderSize + hdr.key_size + value_size + kCrcSize;
-    io_buf.resize(total);
-    fetch(offset, total, io_buf.data(), Source::Pool);
-    auto body = std::span<const std::byte>{io_buf.data() + kHeaderSize,
-                                           hdr.key_size + value_size};
-    return DataEntryView{
-        .sequence = hdr.sequence,
-        .entry_type = hdr.entry_type,
-        .key = body.subspan(0, hdr.key_size),
-        .value = body.subspan(hdr.key_size, value_size),
-    };
   }
 
   [[nodiscard]] auto size() const noexcept -> Offset override {
@@ -1720,13 +1503,6 @@ private:
       return;
     }
     pread_exact(fd_, offset, {dst, len});
-  }
-
-  [[nodiscard]] auto read_header(Offset offset, Source source) const
-      -> EntryHeader {
-    std::array<std::byte, kHeaderSize> hdr{};
-    fetch(offset, kHeaderSize, hdr.data(), source);
-    return bytecask::read_header(std::span{hdr});
   }
 
   [[nodiscard]] auto read_entry_with_key_size(
@@ -2089,9 +1865,11 @@ private:
 
   // The len bytes at offset, read into buf_ first unless already there.
   // The caller has checked they lie below size(), so fewer means the file
-  // shrank under the sweep.
+  // shrank under the sweep. The sweep only moves forward, so offset is never
+  // below buf_start_ and only the end of the buffer needs checking.
   auto buffered(Offset offset, std::size_t len) -> std::span<const std::byte> {
-    if (offset < buf_start_ || offset + len > buf_start_ + buf_len_) {
+    assert(offset >= buf_start_);
+    if (offset + len > buf_start_ + buf_len_) {
       const auto want = std::max(len, chunk_bytes_);
       if (buf_.size() < want) buf_.resize(want);
       buf_start_ = offset;

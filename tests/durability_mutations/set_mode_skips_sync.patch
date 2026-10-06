@@ -4,13 +4,13 @@ sequences. Reverts #190.
 Guarded-by: "set_mode(Follower) makes unsynced acknowledged writes durable"
 
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..b0c183b0 100644
+index 666865f..2a48842 100644
 --- a/bytecaskdb/bytecask.cppm
 +++ b/bytecaskdb/bytecask.cppm
-@@ -4193,7 +4193,7 @@ void DB::set_mode(Mode mode) {
+@@ -4281,7 +4281,7 @@ void DB::set_mode(Mode mode) {
    const auto last_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
-   if (mode == Mode::Follower && current->mode == Mode::Leader
-       && !current->degraded && t.durable_seq() < last_seq) {
+   if (mode == Mode::Follower && !current->degraded &&
+       t.durable_seq() < last_seq) {
 -    sync_active_file(t, current, "set_mode(Follower)");
 +    (void)current;
    }

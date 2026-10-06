@@ -82,16 +82,6 @@ public:
                   std::vector<std::byte> &) const override {
     std::abort();
   }
-  [[nodiscard]] auto read_entry(Offset, std::uint32_t,
-                                std::vector<std::byte> &) const
-      -> DataEntryView override {
-    std::abort();
-  }
-  [[nodiscard]] auto read_entry_unverified(Offset, std::uint32_t,
-                                           std::vector<std::byte> &) const
-      -> DataEntryView override {
-    std::abort();
-  }
   [[nodiscard]] auto lend_record(Offset, std::uint32_t, bool,
                                  std::vector<std::byte> &,
                                  bytecask::FrameLease &) const

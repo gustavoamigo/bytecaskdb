@@ -1532,6 +1532,117 @@ smoke testing not covered by the proof matrix:
   takes a snapshot while degraded, calls `resume()`, verifies the snapshot
   remains readable (pinned files not deleted) and post-resume writes succeed.
 
+### MC/DC coverage
+
+Branch coverage says each decision went both ways. MC/DC (modified
+condition/decision coverage) says each condition in it was shown to change
+the outcome on its own, with the others held fixed. It finds conditions no
+test isolates, which are either a missing test or a condition that cannot
+decide anything. Clang records it with `-fcoverage-mcdc`, for every decision
+of two or more conditions; a single condition is branch coverage's.
+
+**The gate.** `scripts/run_coverage.sh` builds the coverage binaries with
+`-fcoverage-mcdc`, and `scripts/mcdc_report.py` fails the `coverage` CI job
+unless every condition in `data_file.cppm`, `hint_file.cppm` and
+`bytecask.cppm` — the write path, recovery and vacuum — is covered or
+exempt. Elsewhere MC/DC is reported, not gated; the key directory modules
+are #357.
+
+**Merged per build.** The engine suite runs on all three key directories, and
+each build compiles paths the others do not. `llvm-profdata` cannot merge
+them: a function whose MC/DC bitmap differs between builds (`store_state`'s
+debug walk differs per key directory) keeps one build's counters and drops
+the rest. So each build is exported on its own and `mcdc_report.py` merges
+the exports: a condition is covered if some build, or some template
+instantiation, shows it independent.
+
+**Exemptions.** A condition that cannot go the other way is marked at its
+site, on the decision's first line or in the comment block directly above it:
+
+```cpp
+// mcdc-exempt(C3): close() takes the write barrier, which waits for the
+// flush this waiter's sequence is in, ...
+return s->next_seq > sequence || s->degraded || s->closed;
+```
+
+`mcdc-exempt:` exempts every condition of the decision; `mcdc-exempt(C3):`
+only the third, counted as `llvm-cov show -show-mcdc` numbers them, so the
+other two still need their tests. Every report lists the exemptions with
+their reasons. A marker on a condition that is covered, or on no decision,
+fails the gate, so a marker cannot outlive the miss it excused.
+`MCDC_MAX_EXEMPT` in `run_coverage.sh` caps how many there are; raising it is
+a line a reviewer sees, so the gate cannot be held by exempting what a test
+should cover.
+
+SQLite's alternative, `ALWAYS(x)` / `NEVER(x)` macros that a coverage build
+compiles to constants, was not taken: the coverage build would stop checking
+the conditions it exempts, so the build that runs the tests would differ from
+the one that ships, and every module unit would need the macro header. A
+comment changes no build. Its cost, a filter to maintain, is
+`mcdc_report.py`.
+
+**What Clang does not count.**
+
+- A decision that is the condition of a `?:` whose result has class type
+  records no test vectors, however often it runs: `at && kd_put_at(...) ?
+  std::optional{...} : kd_put(...)` ran 293k times and reported 0%. Name
+  the decision as a `bool` first. The report marks such a decision
+  `[no vectors]` (#358).
+- A decision that nests a boolean operator inside an operand
+  (`a != b && !(c && d)`) is not instrumented at all, with the warning
+  "unsupported MC/DC boolean expression". None is in the engine today.
+- A process that dies by `abort()` writes no profile, so the code a death
+  test reaches counts as unexecuted (`panic_on_reused_path`).
+
+**Triage record (#353).** Every decision in the gated files that no test
+isolated when MC/DC was first measured, and its answer: a test, a
+simplification (the condition could not decide anything), or an exemption.
+
+| Site | Answer |
+|---|---|
+| `WritableMmapDataFile` / `WritablePosixFile` ctor: `exclusive && errno == EEXIST` | Simplified: only `O_EXCL` reports `EEXIST`. |
+| `ReadOnlyMmapDataFile::openForRead`: `fstat != 0 \|\| size == 0` | Tests: `fstat` failed by injection; an empty file. |
+| `createDataFileForWrite`: `Mmap && capacity > 0` | Test: a zero-capacity mmap file is written with `pread`. |
+| `renameDataFileExclusive`: `errno != EINVAL && errno != ENOSYS` | Tests: `renameat2` failed with `EINVAL`, `ENOSYS` (fallback) and `EIO` (throws). `ScopedSyscallFaults` takes the errno to report. |
+| `sync_directory`: `rc != 0 && err != EINVAL` | Tests: `fsync` failed with `EINVAL` (done) and `EIO` (throws). |
+| `DataFileIterator::buffered`: `offset < buf_start_ \|\| …` | Simplified: the sweep only moves forward (asserted). |
+| `HintFile` open: `head < magic \|\| !equal(magic)` | Test: a file too short for the magic. |
+| `HintFile` open: `version != 1 \|\| codec != zstd` | Test: an unknown codec. |
+| `HintFile` open: `ZSTD_isError(packed) \|\| packed > cap` | Simplified: the window holds at most the cap. |
+| `HintFile` open and scan: `size == UNKNOWN \|\| size == ERROR \|\| size > cap` | Simplified to `valid_frame_size(size)`: both sentinels exceed the cap (`static_assert`). |
+| `HintFile` scan: `ZSTD_isError(got) \|\| got != size` | Exempt (C2): zstd checks the size a frame declares. |
+| `store_state`: `degraded && old && !old->degraded` | Simplified: `state_` is never null. |
+| `apply_writes`: `at && kd_put_at(...)`, `at && kd_erase_at(...)` | Covered all along; Clang recorded no vectors (see above). Named the `bool`. |
+| `apply_writes`, `apply_ingest`, `apply_resume`, vacuum scan: `min == 0 \|\| seq < min` | Simplified: sequences ascend within a file, so the first is the minimum. |
+| `apply_vacuum`: `cur && cur->sequence() == m.sequence` | Test: a key overwritten and one deleted while vacuum copies (`test_before_vacuum_commit_`). |
+| vacuum scan: `existing && file && offset && sequence` | Simplified: a location names one record, so the sequence compare (a record read on the blind tree) goes. |
+| `set_mode`: `Follower && current Leader && !degraded && durable < last` | `current Leader` removed: a follower has nothing unsynced (`ingest` syncs). Test: a degraded leader steps down without a sync. |
+| `wait_published`: `published \|\| degraded \|\| closed` | Test: a conflict waiter released by a degrade (`test_in_sequence_wait_`). Exempt (C3): `close()` drains the flush first. |
+| `durable_sequence`: `min == 0 \|\| reached \|\| timeout <= 0`, and its wait `reached \|\| closed` | Tests: a zero timeout; a waiter woken by `close()`. |
+| `store_state`: `closed && !old->closed` | Simplified: nothing publishes after `close()`. |
+| `store_state` debug walk: `fs != nullptr && past extent` (both walks) | A key whose file has no stats is now a violation too. Tests via `test_publish`. |
+| `store_state` debug walk: `max_seq > 0 && next_seq <= max_seq` | Simplified: `next_seq` starts at 1. |
+| `validate_state_consistency`: `fs != nullptr && past extent`, `min > 0 && min > max` | Simplified: the checks before them rule out the first operand. |
+| `is_compaction_of`: same sequence, type, key and value | Test: two writes under one sequence differing in key, and in type. |
+| `find_sequence_overlap`: `widest == nullptr \|\| r.max > widest->max` | Simplified: sorted and disjoint so far, the previous range reaches furthest. |
+| `recovery_prepare_files`: `.tmp && (.hint \|\| .data)` | Test: staged files removed, other `.tmp` files kept. |
+| `recovery_prepare_files`: `end && *end < size` | Simplified: a hint-less file always gets an end. |
+| `RecoveryPhaseLog`: `e && *e == '1'` | Test: `BC_RECOVERY_PHASES` set to `1` and `0`. |
+| `recovery_merge_results` (radix): `a.skipped \|\| b.skipped` | Moved to the caller: which part was `a` depended on which worker finished first. |
+| `recovery_build_sorted`, `recovery_load_streams`: markers and a `RangeDel` in the sorted run | Test: a crafted hint with markers, a `Delete` and a range tombstone inside the run. |
+| `recovery_build_sorted`: `have_prev && key <= prev` | Removed: keys leave a heap of ascending cursors ascending. |
+| `recovery_load_ranged`: `on_key && older && other file` | Simplified: each file offers one entry per key, so an older Put is from another file. |
+| `ChangeIterator`: `seq > from && seq <= durable` | Test: an unsynced write is not shipped. |
+| `ChangeIterator`: `needs_advance_ && entry_iter_` | Simplified: set only after a read from `entry_iter_`. |
+| `ChangeIterator`: `!impl_ \|\| !has_more()` | Test: a default iterator is at its end. |
+
+Functions in the same files that no build called were tested (the iterators'
+post-increment, `ChangeIterator`'s move assignment) or deleted:
+`DataFile::read_entry` and `read_entry_unverified`, which nothing but tests
+called since reads went through `lend_record`, with their helpers, and four
+unused `TransientEngineState` accessors and `HintFile::path`. What remains
+is `panic_on_reused_path`, reached only by the death tests above.
+
 ### Counted fault sweep
 
 The proof matrix fails checkpoints by name. A cell exists because someone
