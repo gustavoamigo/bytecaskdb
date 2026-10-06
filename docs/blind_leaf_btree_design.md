@@ -113,7 +113,7 @@ A binary tree has one key per node, so a path from the root to a key is about lo
    leaf:  [bat] [bay]            [cab] [cat] [cup]   entries, in key order
 ```
 
-Path copying applies exactly as in the BST, with two differences of degree. The path is short: a tree of a million keys with 80-entry leaves is three or four nodes deep, so a write copies three or four nodes, whatever N. And copying a leaf copies all of its entries, about a kilobyte, not one key — which is why the transient matters: a batch of a hundred writes that land in the same leaf copies it once.
+Path copying applies exactly as in the BST, with two differences of degree. The path is short: a tree of a million keys with 80-entry leaves and 1 KiB inner nodes is four nodes deep, and a hundred million keys six, so a write copies four to six nodes, whatever N. And copying a leaf copies all of its entries, about a kilobyte, not one key — which is why the transient matters: a batch of a hundred writes that land in the same leaf copies it once.
 
 **Version 1** — `root_v1 → R1`:
 
@@ -139,7 +139,7 @@ graph TB
     class L1 sharedNode
 ```
 
-Two properties of the B+ tree matter for what follows. The inner nodes are few: with 80 entries per leaf, about 1 in 60 nodes is an inner node, so whatever an inner node stores costs little per key. And the leaf is where the key bytes live. In the keyed B+ tree (`docs/persistent_btree_design.md`) each leaf entry holds its key's bytes beside the record location, which is what makes that tree cost 33–133 B/key. The rest of this Background is about what a leaf can hold *instead* of key bytes and still be searched. The inner nodes, the path copying, the transient and the reclamation of versions are the keyed B+ tree's and are reused unchanged.
+Two properties of the B+ tree matter for what follows. The inner nodes are few: with 80 entries per leaf and about 27 separators per inner node, roughly 1 in 30 nodes is an inner node, so whatever an inner node stores costs little per key. And the leaf is where the key bytes live. In the keyed B+ tree (`docs/persistent_btree_design.md`) each leaf entry holds its key's bytes beside the record location, which is what makes that tree cost 33–133 B/key. The rest of this Background is about what a leaf can hold *instead* of key bytes and still be searched. The inner nodes, the path copying, the transient and the reclamation of versions are the keyed B+ tree's and are reused unchanged.
 
 ### Tries: Branching on Key Bytes
 
@@ -368,7 +368,7 @@ The byte-level common prefix used for separators is `crit(a, b) >> 4`.
 
 The header is the B+ tree's `Node` header (tag, first child, capacity, count, prefix length, heap floor, dead bytes, `last_pos`, `is_leaf`; 40 bytes, held there by a `static_assert`), so a blind leaf is a `Node` whose bytes after the header are an index and two arrays instead of slots and a heap. That is what lets the version chain, `BuildSession` and the inner nodes handle it unchanged: children stay `Node *`, `is_leaf` tells a leaf apart, and reclamation never looks inside a leaf. `prefix_len`, `heap_floor` and `dead_bytes` are unused in a blind leaf; `last_pos` records where the last insert went, which the split rule reads (§4.4). The arrays are structure-of-arrays so that each search reads only `meta`.
 
-The leaf size is a template parameter, in bytes, and the capacity follows from it: `(bytes − 56 − 4) / 12` entries, with `loc` aligned to 8. Sizes are jemalloc size classes so no allocation is rounded up. The engine uses **1,024-byte leaves, 80 entries**: `meta` is 320 bytes at offset 56, `loc` 640 bytes at offset 376. The size was picked by measurement over 512–1,280 bytes (Appendix A, *Leaf size, revisited*); capacity must stay below 256 because the `top` index names entries with a byte.
+The leaf size is a template parameter, in bytes, and the capacity follows from it: `(bytes − 56 − 4) / 12` entries, with `loc` aligned to 8. Sizes are jemalloc size classes so no allocation is rounded up. The engine uses **1,024-byte leaves, 80 entries**: `meta` is 320 bytes at offset 56, `loc` 640 bytes at offset 376. The size was picked by measurement over 512–1,280 bytes (Appendix A, *Leaf size, revisited*); capacity must stay below 256 because the `top` index names entries with a byte. Inner nodes are 1 KiB too (`kBTreeNodeBytes`; a `static_assert` ties `kBlindLeafBytes` to it), chosen for the write path's copy volume rather than for reads: a commit of random keys copies one parent per leaf it changes, and at 4 KiB those copies were four times the leaves' (`docs/persistent_btree_design.md`, *Node size, revisited*).
 
 **The fingerprint** (`fp_lo`, `fp_hi`, 24 bits) is a hash of the full key, taken when the key is inserted and never recomputed: a multiply-xor over 8-byte words, inlined, since every lookup and write computes one. Words are loaded in native byte order, since fingerprints live only in memory and are rebuilt with the tree at recovery; a key of eight bytes or more hashes its tail as its last eight bytes, overlapping the word before, so that no byte loop is needed. It is not used for ordering. The low twelve bits sit in `meta`, the one contiguous array the lookup compares in vector registers (§3.1), and the high twelve in `loc` confirm a match before its key is read. The false-match rate is 1 in 16.7 million per entry.
 
@@ -688,7 +688,7 @@ Build-time. The blind tree is the default; `BYTECASK_KEYDIR=btree` selects the k
 
 ## 7. Memory
 
-A leaf entry is 12 bytes. Per key, add the leaf's fixed 56 bytes of header and index spread over its entries, the fill, and about 0.5 B of inner nodes: at 80 entries, 12 / fill + 56 / (80 × fill) + 0.5, which is 13.2 B/key at full leaves and 18.9 at the 0.69 fill random inserts settle at.
+A leaf entry is 12 bytes. Per key, add the leaf's fixed 56 bytes of header and index spread over its entries, the fill, and under 1 B of inner nodes (1 KiB each, one per 27 leaves or so): at 80 entries, 12 / fill + 56 / (80 × fill) + about 0.7, which is about 13.4 B/key at full leaves and 19.1 at the 0.69 fill random inserts settle at.
 
 Measured with `memory_profile` (`BC_INDEX_ONLY=…`), 1M keys inserted in batches of 100 as the engine does, jemalloc heap per key, 1,024-byte leaves:
 
@@ -717,6 +717,8 @@ Against the keyed B+ tree's 33–133 B/key, the directory is 2–7× smaller, an
 | Keyed B+ tree | 1.00 (4.18 M/s) | 1.00 (2.83 M/s) | 1.00 (37.5 M/s) | 1,019 | 2,252 | 1.29 |
 | Blind, crit-bit walk for lookups | 0.907 | 1.10 | 0.92 | 1,115 | 2,482 | 2.38 |
 | **Blind, fingerprint scan** | **1.01** | **1.28** | **0.99** | 1,011 | 2,261 | 1.06 |
+
+These were measured with 4 KiB inner nodes. Inner nodes have since been made 1 KiB for the write path's copy volume (`docs/persistent_btree_design.md`, *Node size, revisited*): against 4 KiB, `Get` +8.5% at 1M keys and level at 10M, `UUIDv4/Get` −10% at 1M and −15% at 10M from the one or two extra levels, `commit_probe`'s serial section −11% to −12% per commit, key directory memory level.
 
 `Get` is at parity, `GetMT` within noise of it, and on random keys the blind tree leads by 28%: the keyed tree's larger random-key footprint misses cache where the blind tree's does not. Per call the blind path's remaining costs are outside the tree — the record read and the key confirmation `memcmp`, which the keyed tree does not do — against the keyed tree's fourth node search, which the blind tree does not do. They cancel. Across dataset sizes, as a fraction of the keyed tree's ops/sec:
 
