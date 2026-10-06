@@ -141,3 +141,33 @@ TEST_CASE("u32 table: snapshots and iterators outlive later writes",
   ++it;
   CHECK(it == std::default_sentinel);
 }
+
+TEST_CASE("u32 table: untouched transients and iterator equality",
+          "[u32_map]") {
+  auto t = bytecask::PersistentU32Table<int>{}.transient();
+  t.set(4, 40);
+  t.set(6, 60);
+  const auto m = std::move(t).persistent();
+
+  // A transient that only reads, or updates and erases absent keys, writes
+  // nothing and hands back the version it came from.
+  auto r = m.transient();
+  CHECK(*r.get(4) == 40);
+  r.update(5, [](int &v) { ++v; });
+  CHECK_FALSE(r.erase(5));
+  const auto same = std::move(r).persistent();
+  CHECK(same.get(4) == m.get(4));
+
+  auto a = m.begin();
+  auto b = m.begin();
+  CHECK(a == b);
+  ++b;
+  CHECK_FALSE(a == b);
+  ++a;
+  CHECK(a == b);
+  ++a;
+  ++b;
+  CHECK(a == b); // both at the end
+  CHECK(a == bytecask::U32TableIterator<int>{});
+  CHECK_FALSE(m.begin() == bytecask::U32TableIterator<int>{});
+}
