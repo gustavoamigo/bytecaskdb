@@ -200,6 +200,15 @@ public:
     return static_cast<std::int64_t>(total);
   }
 
+  // Bytes in the calling thread's cache. Tests: a build takes from this cache
+  // before the shared lists, so only the two together say what it drew.
+  [[nodiscard]] static auto local_bytes() -> std::int64_t {
+    std::size_t total = 0;
+    for (std::size_t cls = 0; cls < kPooledNodeBytes.size(); ++cls)
+      total += local().cache[cls].size() * kPooledNodeBytes[cls];
+    return static_cast<std::int64_t>(total);
+  }
+
 private:
   static constexpr std::size_t kMaxPooledBytes = std::size_t{64} << 20;
   // Bounds a refill's lock hold and sort, and lets threads building trees at
@@ -258,6 +267,10 @@ private:
 // Stats and test access: bytes on the pool's shared lists.
 export inline auto node_pool_bytes() -> std::int64_t {
   return NodePool::shared_bytes();
+}
+// Test access: bytes in the calling thread's cache.
+export inline auto node_pool_local_bytes() -> std::int64_t {
+  return NodePool::local_bytes();
 }
 // Benchmark access: empties the pool, see NodePool::trim.
 export inline void node_pool_trim() noexcept { NodePool::trim(); }

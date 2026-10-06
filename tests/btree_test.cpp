@@ -877,6 +877,15 @@ auto pool_keys() -> std::vector<std::string> {
   return keys;
 }
 
+// Pooled bytes this thread can draw on: the shared lists and its own cache. A
+// build takes from the cache first, and the nodes it frees as it goes land on
+// the shared lists, so the shared lists alone can grow over a build that was
+// served from a cache left full by an earlier test.
+auto pool_bytes_here() -> std::int64_t {
+  return bytecask::btree_detail::node_pool_bytes() +
+         bytecask::btree_detail::node_pool_local_bytes();
+}
+
 } // namespace
 
 TEST_CASE("NodePool: a tree's freed nodes are reused by the next build",
@@ -885,13 +894,14 @@ TEST_CASE("NodePool: a tree's freed nodes are reused by the next build",
     SKIP("the node pool is compiled out under this sanitizer");
   }
   using bytecask::btree_detail::node_pool_bytes;
+  bytecask::btree_detail::node_pool_trim();  // nothing left by earlier tests
   const auto keys = pool_keys();
   { auto t = build(keys); }  // leaves at least one tree's nodes pooled
-  const auto pooled = node_pool_bytes();
-  REQUIRE(pooled > 0);
+  const auto pooled = pool_bytes_here();
+  REQUIRE(node_pool_bytes() > 0);
   {
     auto t = build(keys);
-    CHECK(node_pool_bytes() < pooled);  // the build drew on the pool
+    CHECK(pool_bytes_here() < pooled);  // the build drew on the pool
     CHECK(keys_of(t) == keys);          // and recycled memory holds a sound tree
     check_accounting({&t});
   }
@@ -904,14 +914,15 @@ TEST_CASE("NodePool: nodes freed on another thread are reused here",
     SKIP("the node pool is compiled out under this sanitizer");
   }
   using bytecask::btree_detail::node_pool_bytes;
+  bytecask::btree_detail::node_pool_trim();  // nothing left by earlier tests
   const auto keys = pool_keys();
   auto t = build(keys);
   const auto before_free = node_pool_bytes();
   std::thread{[tree = std::move(t)]() mutable { Tree gone = std::move(tree); }}.join();
-  const auto pooled = node_pool_bytes();
-  CHECK(pooled > before_free);  // the other thread's frees landed in the pool
+  CHECK(node_pool_bytes() > before_free);  // the other thread's frees landed in the pool
+  const auto pooled = pool_bytes_here();
   auto again = build(keys);
-  CHECK(node_pool_bytes() < pooled);
+  CHECK(pool_bytes_here() < pooled);
   CHECK(keys_of(again) == keys);
 }
 
@@ -921,14 +932,17 @@ TEST_CASE("NodePool: an exiting thread's cache stays available",
     SKIP("the node pool is compiled out under this sanitizer");
   }
   using bytecask::btree_detail::node_pool_bytes;
+  using bytecask::btree_detail::node_pool_local_bytes;
+  bytecask::btree_detail::node_pool_trim();  // nothing left by earlier tests
   const auto keys = pool_keys();
   std::thread{[&] {
     { auto t = build(keys); }
     { auto t = build(keys); }  // this thread's cache now holds nodes
   }}.join();
-  const auto pooled = node_pool_bytes();
-  REQUIRE(pooled > 0);
+  REQUIRE(node_pool_local_bytes() == 0);  // all this thread can draw on came from the other
+  REQUIRE(node_pool_bytes() > 0);
+  const auto pooled = pool_bytes_here();
   auto t = build(keys);
-  CHECK(node_pool_bytes() < pooled);  // the exited thread's nodes were reused
+  CHECK(pool_bytes_here() < pooled);  // the exited thread's nodes were reused
   CHECK(keys_of(t) == keys);
 }
