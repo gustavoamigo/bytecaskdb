@@ -132,7 +132,7 @@ ceiling 65,535 from the u16 wire field). The layout has to admit a key of
 |---|---|---|---|
 | D1 | Variant | B+ tree: values only in leaves, inner nodes hold suffix-truncated separators, **no sibling links** | Sibling links break structural sharing (updating a leaf would touch its neighbour). Iteration keeps a stack of `(node, index)` like today. |
 | D2 | Node shape | One slotted node: 32-byte header, node prefix, `u64` slot array growing up, entry heap growing down. A leaf entry is `V + key suffix`; an inner entry is `Node* + separator suffix`. `is_leaf` picks the payload size, nothing else differs. | One layout means one search, one insert, one erase, one pack, one clone. |
-| D3 | Node size | `kLeafBytes = kInnerBytes = 4096`, compile-time, two constants read from the per-node `capacity` field. A node is larger only when a single key needs it, and such a node holds exactly one entry. | 3 levels at 1M keys and 4 at 100M for 36-byte keys; every level removed is a DRAM round trip removed from every read. Smaller inner nodes (1 or 2 KiB) and 2 KiB leaves are the alternatives to benchmark (§Performance, §Plan step 4). |
+| D3 | Node size | `kBTreeNodeBytes = 1024` for every node, leaf or inner, compile-time, read from the per-node `capacity` field. A node is larger only when a single key needs it, and such a node holds exactly one entry. | First 4 KiB, for read depth. Measured later on the blind tree (§Node size, revisited): a commit of random keys copies one parent per leaf it changes, so the inner size set the write path's copy volume; 1 KiB took 11–12% off the serial section and gained 3–5% on HammerDB, for one to two more levels and 10–15% on random-key point reads. |
 | D4 | Node prefix | Every key in a node shares `prefix_len` bytes, stored once. Recomputed on split and rebuild from the first and last key. | What keeps structured keys dense (§Memory) and makes heads discriminating. |
 | D5 | In-node search | 4-byte key heads in the high half of each `u64` slot; lower bound = count of slots below `head << 32`, a branch-free loop clang vectorises; ties resolved by full compare. | Avoids touching the heap for most keys and avoids branch mispredicts. No intrinsics unless `-Rpass=loop-vectorize` shows the loop is scalar. |
 | D6 | Deletion | Lazy: no rebalancing. An emptied node is unlinked and freed; the root collapses when it has one child. | A B+ tree stays correct at any fill. Sibling merge is a follow-up gated by the churn memory tests. |
@@ -194,9 +194,10 @@ Invariants, checked by a debug `validate()` and by the tests:
   only by the session whose tag it carries.
 
 Sizes for `V = KeyDirEntry` (16 B) on a 64-bit host: an entry is
-`align8(16 + suffix)`, a slot 8 B. A 4 KiB leaf holds about 60 keys of
-36 bytes, about 100 of 8 bytes. An inner entry is `align8(8 + separator)`;
-separators are short (§Split), so inner fanout is 100 to 150.
+`align8(16 + suffix)`, a slot 8 B. A 1 KiB leaf holds about 15 keys of
+36 bytes, about 45 of 8 bytes (at 4 KiB, before §Node size, revisited:
+about 60 and 100). An inner entry is `align8(8 + separator)`; separators
+are short (§Split), so inner fanout is about 27 to 38 (100 to 150 at 4 KiB).
 
 ### Search within a node
 
@@ -535,39 +536,78 @@ interval rule bounds by what the snapshot reaches, as today.
 
 ### Node pool
 
-Nodes come in two capacities (`kPooledNodeBytes`): 1 KiB for the blind
-tree's leaves and 4 KiB for every other node of either tree; a node grown
-for a long prefix is the exception. `NodePool` recycles those two by exact
-size. A batch allocates the nodes it path-copies on the thread that runs it,
+Every node is `kBTreeNodeBytes` (1 KiB); a node grown for a long key is
+the exception. `NodePool` recycles nodes of that size. A batch allocates the nodes it path-copies on the thread that runs it,
 almost always the committer, and the nodes they replace are freed wherever
 the last version pinning them is released, usually a reader. A
 general-purpose allocator returns those frees where the allocating thread
 does not draw from them, so it keeps fetching fresh memory; the pool gives
 them back to the next allocation instead.
 
-- **give**, from any thread: onto the size's shared list, under its mutex,
-  up to 64 MiB per size; past that, `operator delete`.
+- **give**, from any thread: onto the shared list, under its mutex, up to
+  64 MiB; past that, `operator delete`.
 - **take**: from the calling thread's cache. An empty cache takes up to 256
   nodes from the shared list and sorts them lowest address first, as a slab
   allocator hands memory out: in free order, recycled nodes scatter a new
   tree across memory (`engine_bench` `Get` −5%). The 256-node bound keeps a
   refill's lock hold and sort short and lets recovery threads share the
   pool (taking the whole list cost recovery 11% at 8 threads).
-- A thread's cache, at most 256 nodes per size (1.25 MiB), returns to the
-  shared lists when the thread exits. The lists are process-wide and never
+- A thread's cache, at most 256 nodes (256 KiB), returns to the shared
+  list when the thread exits. The list is process-wide and never
   destroyed, so a free during process exit touches no dead mutex.
 - Off under ASan and MSan, where recycled memory would hide a use after free
   or a read of unwritten bytes; on under TSan, which checks the pool's own
   synchronisation.
 
-`bytecask.keydir_pool_bytes` reports the bytes on the shared lists, not
+`bytecask.keydir_pool_bytes` reports the bytes on the shared list, not
 the thread caches, so it can rise while a thread builds: the build takes
 from its cache first, and the nodes it frees on the way go to the shared
-lists. What a build drew from the pool is the shared lists and the
+list. What a build drew from the pool is the shared list and the
 builder's cache together, which is what the `[node_pool]` tests measure,
 each starting from an empty pool. The
 measurements, under glibc and jemalloc, are in
 `docs/commit_pipeline_design.md`, *Node allocation*.
+
+### Node size, revisited
+
+The blind tree (`docs/blind_leaf_btree_design.md`) took its leaf size from
+measurement, 1 KiB, and kept 4 KiB inner nodes from D3. Counting node
+allocations per commit on `commit_probe` (TPROC-C shape, 16 writers) showed
+what that cost: a commit of 10 random updates copies 10 leaves and about 12
+inner nodes. Random keys rarely share a parent, so each changed leaf copies
+its own, and the estimate below (one path per commit, inner nodes copied
+once per batch) does not hold for it. At 4 KiB the inner copies came to
+about 45 KB per commit, four times the leaves'.
+
+Every node 1 KiB, against 4 KiB inner nodes, both on `main` at 1fa2cea:
+
+| | 4 KiB inner | 1 KiB | |
+|---|---:|---:|---:|
+| Blind tree height, 1M / 10M / 100M random keys | 3 / 4 / 4 | 4 / 5 / 6 | +1 / +1 / +2 |
+| Same, structured (`prefixed`) keys | 4 / 4 / 5 | 5 / 6 / 7 | +1 / +2 / +2 |
+| Inner fanout, 1M random keys | ~137 | ~27 | |
+| Key directory B/key (`memory_profile`) | 13.6–19.2 | 13.7–19.2 | level |
+| `commit_probe` serial µs/commit, 16 / 48 writers | 53.3 / 46.0 | 47.5 / 40.7 | −11% / −12% |
+| `commit_probe` commits/s, 16 / 48 writers | 16,375 / 20,663 | 16,870 / 23,214 | +3.0% / +12.3% |
+| HammerDB TPROC-C NOPM, 64 warehouses, 16 / 32 users | 207,028 / 224,548 | 217,572 / 231,663 | +5.1% / +3.2% |
+| `engine_bench` `Get`, 1M / 10M keys | | | +8.5% / level |
+| `engine_bench` `UUIDv4/Get` (random keys), 1M / 10M | | | −10.4% / −14.5% |
+| `engine_bench` `Range50`, 1M | | | −4.0% |
+| `engine_bench` `GetMT`, 1M, 4–32 threads | | | +2% to +19%, noisy |
+
+`commit_probe` on tmpfs with jemalloc, one round. HammerDB fast profile on
+`/mnt/bench`, one run per cell, alternating. `engine_bench` on tmpfs, two
+rounds alternating; at 10M keys `Get` 228.5 / 231.3 ns against 226.2 /
+227.9, `UUIDv4/Get` 402.9 / 404.2 ns against 482.9 / 460.7.
+
+A smaller node is cheaper to copy and to search, and the tree gets taller:
+random-key point reads, where every level is a cache miss, pay 10% at 1M
+keys and 15% at 10M. Structured keys stay level or gain. ByteCaskDB's lead
+on random keys over engines that sort or hash on disk is far larger than
+that, while the serial section bounds every commit, so the write path won.
+One node size also leaves the pool a single list. The keyed tree
+(`BYTECASK_KEYDIR=btree`, and `file_stats`) follows with 1 KiB leaves, about
+15 keys of 36 bytes each; it was not measured separately.
 
 ## Performance expectations
 
@@ -750,10 +790,10 @@ Each step is a reviewed commit with the suite green.
 
 ## Open questions
 
-1. **Node sizes.** 4 KiB leaves and 4 KiB inner nodes are proposed for
-   read depth; 4K/1K and 2K/1K are in the step 4 matrix, judged on `Get`
-   at 10M keys and batched random writes together. Accept the default
-   with the comparison in step 4?
+1. **Node sizes.** 4 KiB leaves and 4 KiB inner nodes were proposed for
+   read depth. Resolved: 1 KiB everywhere, by measurement on the blind
+   tree, judged on `Get` at 10M keys and batched random writes together
+   (§Node size, revisited).
 2. **Lazy deletion.** No sibling merge in the first version. Accept, with
    the churn memory tests as the trigger for adding it?
 3. **Order with #86.** Merge #86 first and build on its chain (proposed),

@@ -334,10 +334,10 @@ TEST_CASE("BTree giant keys", "[btree]") {
 }
 
 // Found by the chaos soak (#92) through del_range over 4 KiB keys. A leaf
-// grown past kBTreeLeafBytes for one large key, with an erased entry's dead
+// grown past kBTreeNodeBytes for one large key, with an erased entry's dead
 // bytes in it, was judged to have room for a new entry by its own capacity,
 // then compacted by rebuild() into a node sized back down to
-// kBTreeLeafBytes — without the room — and insert_entry wrote past its end.
+// kBTreeNodeBytes — without the room — and insert_entry wrote past its end.
 TEST_CASE("BTree insert into a compacted oversized leaf", "[btree]") {
   const std::string big = "k19" + std::string(3961, 'z');  // 3964 bytes
   SECTION("within one session") {
@@ -438,9 +438,10 @@ TEST_CASE("BTree ascending inserts fill nodes", "[btree]") {
   (void)t.validate();
   std::size_t nodes = 0;
   t.visit_nodes([&](const void *) { ++nodes; });
-  // 8-byte keys, 16 B of overhead each after the shared prefix: a full leaf
-  // holds well over 150; half-full leaves would need twice the nodes.
-  CHECK(nodes < 100000 / 150);
+  // 8-byte keys after the shared prefix: a full 1 KiB leaf holds about 45,
+  // so full leaves take about 2,200 nodes; half-full ones would need twice
+  // that.
+  CHECK(nodes < 100000 / 35);
   CHECK(keys_of(t) == keys);
   check_accounting({&t});
 }
