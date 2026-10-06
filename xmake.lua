@@ -200,8 +200,6 @@ rule("bytecask.keydir_check")
     end)
 rule_end()
 add_rules("bytecask.keydir_check")
--- The blind tree's inner nodes and BuildSession are the B+ tree's.
-add_defines("BYTECASK_USE_BTREE")
 if keydir == "blind" then
     add_defines("BYTECASK_KEYDIR_BLIND")
 end

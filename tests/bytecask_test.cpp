@@ -3568,7 +3568,6 @@ TEST_CASE("open removes staged .data and .hint files and nothing else",
   CHECK(get_val(db, to_bytes("k")).has_value());
 }
 
-#ifdef BYTECASK_USE_BTREE
 // ---------------------------------------------------------------------------
 // A hint file that verifies but breaks the sorted layout flush_hints_for
 // writes — a head of markers and range tombstones, then Puts and Deletes in
@@ -3671,7 +3670,6 @@ TEST_CASE("recovery checks the layout of a hint file's sorted run",
         Catch::Matchers::ContainsSubstring("range tombstone inside"));
   }
 }
-#endif
 
 TEST_CASE("BC_RECOVERY_PHASES=1 times the recovery phases", "[recovery]") {
   // The switch only prints; the open must recover the same either way.
