@@ -2,7 +2,7 @@
 
 This document describes the design of the blind-leaf B+ tree used as the in-memory key directory in ByteCaskDB. It is intended for contributors who need to understand, modify, or reason about correctness of this component, and for readers who want to know how a tree can order and find keys it does not store.
 
-The **Background** section builds up the necessary concepts from scratch — what the key directory has to do, persistent data structures and path copying, how that applies to a B+ tree, tries and Patricia tries, crit bits, blind search and fingerprints — for readers coming without that context. From §1 onward the document covers the C++ design as built: the overview, design principles, leaf layout, search, algorithms, API, engine integration, memory, performance and tests. **Appendix A** keeps the design history: the gates the design had to pass, every measurement taken on the way, and the revisions those measurements forced. **Appendix B** lists the prior art.
+The **Background** section builds up the necessary concepts from scratch — what the key directory has to do, persistent data structures and path copying, how that applies to a B+ tree, tries and PATRICIA, crit bits, blind search and fingerprints — for readers coming without that context. From §1 onward the document covers the C++ design as built: the overview, the leaf layout and key resolution, the two searches, the algorithms, the API, the engine integration, memory, performance and tests. **Appendix A** keeps the design history: the gates the design had to pass, every measurement taken on the way, and the revisions those measurements forced. **Appendix B** lists the prior art.
 
 > **Status: built, measured, and the engine's default key directory**
 > (2026-09-24). The tree is `bytecaskdb/blind_btree.cppm`, module
@@ -100,7 +100,7 @@ Persistence adds O(log N) allocations per write — the length of the copied pat
 
 Two consequences follow, and both are visible in the engine:
 
-- **Old nodes are garbage only when no version reaches them.** `ptr_1`, `ptr_2` and `ptr_4` are still part of Version 1. They can be freed when the last holder of `root_v1` lets go, and not before. A `db.snapshot()` that lives for an hour therefore keeps alive exactly the nodes of the version it pinned, and nothing retired since. §4.6 says how the engine decides that without reference counts.
+- **Old nodes are garbage only when no version reaches them.** `ptr_1`, `ptr_2` and `ptr_4` are still part of Version 1. They can be freed when the last holder of `root_v1` lets go, and not before. A `db.snapshot()` that lives for an hour therefore keeps alive exactly the nodes of the version it pinned, and nothing retired since. §2.6 says how the engine decides that without reference counts.
 - **A batch of writes is one version.** Copying the path once per key and publishing once per key would be wasteful. The writer instead works in a **transient**: a private builder that path-copies a node the first time the batch touches it and then mutates its own copy in place, since nothing outside the batch can see it. When the batch is durable, the transient freezes into one new version and publishes it with one pointer store. The builder-then-freeze pattern is Clojure's [transients](https://clojure.org/reference/transients).
 
 ### From a BST to a B+ tree
@@ -168,44 +168,13 @@ Nodes marked ✓ carry a value. Unmarked nodes are routing-only intermediates.
 
 Path copying applies exactly as in the BST. The path to any key has at most k nodes — one per character — so inserting or updating a key of length k copies at most k nodes. The rest of the trie is shared. Unlike the BST, path length is O(k) — bounded by the key length, not the number of keys N.
 
-What a trie buys is that a search never compares whole keys: it looks at one byte of the query per level and follows the edge for that byte. That observation — *a search can be driven by the query's own bytes, one at a time* — is the one this design is built on. ByteCaskDB's first key directory was a persistent trie of this kind, with its chains of single-child nodes compressed (a radix tree, since retired in favour of the B+ trees); the blind-leaf tree takes the idea one step further.
+What a trie buys is that a search never compares whole keys: it looks at one byte of the query per level and follows the edge for that byte. That observation — *a search can be driven by the query's own bytes, one at a time* — is the one this design is built on. The blind leaf is built on it, one step further on.
 
-### Patricia Tries: Compressing the Trie
+### From the trie to PATRICIA: keeping only the bit positions
 
-A standard Trie can contain long chains of single-child nodes — one per character of a shared prefix — that carry no branching information. A key `"application"` with no sibling sharing its prefix creates a linear chain 11 nodes deep. These nodes are pure structural overhead.
+A trie as drawn above stores a byte on every edge, and a key with no sibling sharing its prefix makes a chain of single-child nodes, one per byte: `"application"` on its own is a chain 11 deep. Radix trees collapse those chains into edges labelled with whole byte strings; that is the usual compression, and it still stores every key byte somewhere in the tree. Morrison's **[PATRICIA](https://dl.acm.org/doi/abs/10.1145/321479.321481)** (1968) goes in a different direction, and it is the one that matters here. To *route* a search, a branching node needs to know only **which bit position** it branches on: the search tests that one bit of the query and goes left on 0 or right on 1. The bytes between one branch and the next are not needed to find the way down, only to confirm, at the bottom, that the key reached is the key sought. So PATRICIA stores one bit index per branching node and no label bytes at all, and compares the full key once, at the end.
 
-A **[Patricia Trie](https://dl.acm.org/doi/abs/10.1145/321479.321481)** (Morrison, 1968; also called a *Radix Tree*) eliminates this by collapsing chains of single-child nodes into a single edge whose label carries the entire compressed byte sequence. Branching still happens at the first character where two keys diverge; it just doesn't allocate a separate node for every character in between.
-
-**Standard Trie** — the `a → p` prefix creates a 2-node chain before the first branch:
-
-```
-root
- └─'a'─ node
-          └─'p'─ node
-                   ├─'p'─ [app ✓]
-                   │        └─'l'─ node
-                   │                ├─'e'─ [apple ✓]
-                   │                └─'y'─ [apply ✓]
-                   └─'t'─ [apt ✓]
-```
-
-**Patricia Trie** — the single-child chain `a → p` is collapsed into the edge label `"ap"`:
-
-```
-root
- └─"ap"─ node
-            ├─"p"─ [app ✓]
-            │        └─"l"─ node
-            │                ├─"e"─ [apple ✓]
-            │                └─"y"─ [apply ✓]
-            └─"t"─ [apt ✓]
-```
-
-Node count drops from 7 to 5. A properly compressed Patricia Trie has at most 2N − 1 nodes for N keys — no unbounded single-child chains exist.
-
-Now push the compression to its limit. The edge labels above still carry key bytes. But to *route* a search, a node needs only to know **which bit position** it branches on: a search tests that one bit of the query and goes left on 0 or right on 1. The bytes in between are not needed to find the way down, only to confirm, at the bottom, that the key reached is the key sought. Morrison's original PATRICIA stores exactly that — one bit index per branching node, and no label bytes — and this is where the design starts: a search structure that holds, per key, nothing but a bit position, and reads the key itself once, at the end.
-
-In a trie of *N* keys there are *N − 1* branching nodes, so there are *N − 1* bit positions to store. The next section shows where they come from.
+Two things follow. A set of *N* keys has *N − 1* branching nodes, so *N − 1* bit positions describe the whole trie. And the walk down it never reads a stored key: it reads the query's own bits. That is a search structure which holds, per key, nothing but a bit position, and reads the key itself once, when it arrives. It is the blind leaf. The next section shows where the N − 1 positions come from, without building a single node.
 
 ### Crit bits: what a sorted array remembers about its keys
 
@@ -243,7 +212,7 @@ Now throw the keys away and keep only the four crit bits:
      4     (1,4)
 ```
 
-This is enough to decide, for *any* query key, where it belongs in the array — without ever looking at the keys. The reason is that the crit bits of a sorted array *are* the Patricia trie of the previous section, read off from left to right. The boundary with the smallest crit bit splits the array in two: every key left of it has a 0 at that bit, every key right of it a 1. Within each half, the boundary with the smallest crit bit splits again, and so on down to single entries:
+This is enough to decide, for *any* query key, where it belongs in the array — without ever looking at the keys. The reason is that the crit bits of a sorted array *are* a PATRICIA trie, read off from left to right. The boundary with the smallest crit bit splits the array in two: every key left of it has a 0 at that bit, every key right of it a 1. Within each half, the boundary with the smallest crit bit splits again, and so on down to single entries:
 
 ```
                       (0,8)                 ← smallest crit bit: 'b' vs 'c'
@@ -259,7 +228,7 @@ Each internal node of this trie is one boundary of the array, and each subtree i
 
 > Keys of different lengths, where one is a prefix of another (`"ab"`, `"abc"`),
 > need one more bit per byte so that the end of a key is itself a bit
-> position. §4.1 gives that encoding. The examples here use equal-length
+> position. §2.1 gives that encoding. The examples here use equal-length
 > keys so that it can be left out.
 
 ### Blind search: finding a key you cannot see
@@ -286,7 +255,7 @@ The walk lands on `cat` again. Reading that key says `cow ≠ cat`, and it says 
 
 This is the whole trick. **A sorted array of crit bits places any key with one read of one neighbouring key.** A present key costs its own record's read, which a `get` was going to do anyway; an absent key costs one neighbour's.
 
-Inserting `cow` at position 4 needs only the crit bit against its new predecessor, which is `j`, and the key after it keeps its own: `crit(cow, cup) = (1,4)`, the same as `crit(cat, cup)` was, because `cup` differed from the run at a bit below `j`. Erasing an entry needs no read either: the first difference between two keys is the smallest first difference between any adjacent pair between them, so when entry 3 goes, entry 4's crit bit becomes `min((2,4), (1,4)) = (1,4)`. §6 has the rules.
+Inserting `cow` at position 4 needs only the crit bit against its new predecessor, which is `j`, and the key after it keeps its own: `crit(cow, cup) = (1,4)`, the same as `crit(cat, cup)` was, because `cup` differed from the run at a bit below `j`. Erasing an entry needs no read either: the first difference between two keys is the smallest first difference between any adjacent pair between them, so when entry 3 goes, entry 4's crit bit becomes `min((2,4), (1,4)) = (1,4)`. §4 has the rules.
 
 ### Fingerprints: skipping the read on a lookup
 
@@ -312,13 +281,13 @@ Let N = total number of keys, k = length of the key being operated on, L = entri
 |---|---|---|---|---|
 | Mutable BST | O(log N) | O(log N) | O(log N) | O(1) |
 | **Persistent BST** | O(log N) | O(log N) | O(log N) | **O(log N)** |
-| Mutable Trie / Radix Tree | O(k) | O(k) | O(k) | O(k) |
-| **Persistent Radix Tree** | O(k) | O(k) | O(k) | **O(k)** |
+| Mutable Trie | O(k) | O(k) | O(k) | O(k) |
+| **Persistent Trie** | O(k) | O(k) | O(k) | **O(k)** |
 | Mutable B+ tree | O(log N) | O(log N) | O(log N) | O(1) |
 | **Persistent B+ tree** | O(log N) | O(log N) | O(log N) | **O(log_L N)** nodes, one a leaf |
 | **Persistent blind-leaf B+ tree** | O(log N) + O(L) | O(log N) + O(L) | O(log N) + O(L) | **O(log_L N)** nodes, one a leaf |
 
-**Making a structure persistent does not change the asymptotic time complexity of any operation.** Making the leaves blind adds a scan of the leaf, O(L), bounded by a constant the build chooses; §5 has what it costs in practice.
+**Making a structure persistent does not change the asymptotic time complexity of any operation.** Making the leaves blind adds a scan of the leaf, O(L), bounded by a constant the build chooses; §3 has what it costs in practice.
 
 ### Cost summary
 
@@ -335,46 +304,31 @@ What each operation reads from the data files, beyond what it reads on any tree.
 | leaf entry | 32 B + key suffix | **12 B**, whatever the key length |
 | snapshot | O(1), a root pointer | O(1), a root pointer |
 
-The O(L) leaf scan is over a 320-byte array with a 16-byte index on top, so in practice it is a few dozen entries; §5 has the numbers and §10 what they cost.
+The O(L) leaf scan is over a 320-byte array with a 16-byte index on top, so in practice it is a few dozen entries; §3 has the numbers and §8 what they cost.
+
+That is the whole idea. The rest of the document is the C++ design as built: §1 what the module is and what it shares with the keyed tree, §2 the key encoding, the leaf and how keys are resolved, §3 the two searches, §4 the algorithms, §5 the API, §6 how the engine uses it, §7 and §8 what it costs in memory and time, §9 the tests and §10 what is still open. Appendix A is how it got there.
 
 ---
 
 ## 1. Overview
 
-This component implements a persistent B+ tree whose leaves hold no key bytes, as the key directory for ByteCaskDB. It exposes the same two interfaces as the other key directories: an immutable `PersistentBlindBTree<LeafBytes>`, where every mutating operation returns a new version sharing unchanged nodes by pointer, and a `TransientBlindBTree<LeafBytes>` builder that mutates nodes its own session created in place and freezes into a persistent snapshot. A `BlindBulkLoader<LeafBytes>` builds a tree from keys in ascending order without a single read, and recovery feeds it a k-way merge of the sorted hint files. Every operation that needs a key's bytes takes a **resolver** — an object that returns the key of the record at a location — so the tree module does no file I/O, and tests drive it with an in-memory resolver.
+`bytecask.blind_btree` (`bytecaskdb/blind_btree.cppm`) is a persistent B+ tree whose leaves hold no key bytes, built as the key directory for ByteCaskDB. It has the same two handle types as the keyed tree: an immutable `PersistentBlindBTree<LeafBytes>`, where every mutating operation returns a new version sharing unchanged nodes by pointer, and a `TransientBlindBTree<LeafBytes>` builder that mutates nodes its own session created in place and freezes into one version. A `BlindBulkLoader<LeafBytes>` builds a tree from keys in ascending order without a single read, and recovery feeds it a k-way merge of the sorted hint files.
 
-The value type is fixed: a `BlindRef`, the `(file_id, offset)` of a key's record. Sizes and sequence numbers live in the record's header and are read with the key when an operation confirms it.
+Three facts shape everything below:
 
-What the tree shares with the keyed B+ tree (`bytecaskdb/btree.cppm`): the 40-byte node header, the inner nodes and their search, `BuildSession` (ownership, discard, path copying, inner-node splits, `make_root`), the level building of `BulkLoader`, `ChainTraits` and the `VersionChain`. What it adds: the leaf layout, both searches, the leaf steps of insert, overwrite, erase and split, its iterator, its handle types and a loader that fills blind leaves.
+- **The value type is a `BlindRef`**, the `(file_id, offset)` of a key's record. Sizes and sequence numbers live in the record's header and are read with the key when an operation confirms it.
+- **Keys are never stored.** Every operation that needs a key's bytes takes a **resolver**, an object that returns the key of the record at a location, so the tree module does no file I/O and the tests drive it with an in-memory resolver (§1).
+- **The leaf is the only new part.** The 40-byte node header, the inner nodes and their search, `BuildSession` (ownership, path copying, inner-node splits), the level building of `BulkLoader`, `ChainTraits` and the `VersionChain` are the keyed B+ tree's (`bytecaskdb/btree.cppm`), used unchanged. This module adds the leaf layout, both searches, the leaf steps of insert, overwrite, erase and split, its iterator, its handle types and a loader that fills blind leaves.
 
-The engine's build uses 1,024-byte leaves holding 80 entries each; the leaf size is a template parameter (§4.2).
+The engine's build uses 1,024-byte leaves holding 80 entries each; the leaf size is a template parameter (§1).
 
-## 2. Design Principles
-
-This component inherits the ByteCaskDB design tenets in order of priority:
-
-1. **Correctness**: Data integrity is paramount. All design decisions prioritize correctness over performance.
-2. **Simplicity**: The architecture is kept simple to facilitate understanding and maintainability.
-3. **Predictable latency over peak throughput**: Write-path operations must have bounded, predictable latency. A steady 1 ms per write is preferable to an average of 0.1 ms with occasional 500 ms spikes.
-4. **Performance**: Optimizations require a real use case. Without one, correctness and simplicity take priority.
-
-**Key context**: this tree exists so that the key directory's size depends on the number of keys and nothing else. It adds a record read to the write path; that read is one per operation, from a cache, and its cost is constant (principle #3). The in-leaf search is CPU work on the hot read path, and Appendix A records how much of the design effort went into keeping it level with the keyed tree's.
-
-## 3. Core Characteristics
-
-*   **Key Type:** `std::span<const std::byte>`, up to 65,535 bytes, never stored. Keys are compared as bit strings under the encoding in §4.1, which preserves byte-lexicographic order.
-*   **Value Type:** `BlindRef { uint32_t file_id; uint32_t offset; }` — where the key's record is. Within one process, a `(file_id, offset)` pair names at most one record, ever (§4.2, invariants).
-*   **Leaf entry:** 12 bytes — a 20-bit crit bit, a 24-bit fingerprint and the location — whatever the key's length.
-*   **Immutability:** All mutating operations return a new version of the tree. Untouched nodes are shared between versions as plain pointers.
-*   **Memory management:** The keyed B+ tree's. Nodes carry no reference count; the `VersionChain` frees a node when no live version can reach it. Leaves are allocated at one size, a jemalloc size class, and recycled through the node pool.
-*   **Key resolution:** Every operation that needs a key's bytes takes a resolver and reads at most one key per leaf step. The tree never stores the resolver.
-*   **Edit tags (COW):** Transient mode uses the session tag to mutate uniquely-owned nodes in place, falling back to path copying when a node belongs to a published version.
+The design follows the four tenets of the README, correctness, simplicity, predictable latency and then performance, and one consequence of them governs this tree: it adds a record read to the write path, and that read is one per operation, bounded, and served from a cache, so write latency stays flat (§4.4). The in-leaf search is CPU work on the hot read path, and Appendix A records how much of the design effort went into keeping it level with the keyed tree's.
 
 ---
 
-## 4. Architectural Design
+## 2. Architectural Design
 
-### 4.1. Key encoding and crit bits
+### 2.1. Key encoding and crit bits
 
 Keys are byte strings of any length up to 65,535, and one can be a prefix of another (`"ab"`, `"ab\0"`, `"abc"`). Zero-padding a short key would make `"ab"` and `"ab\0"` identical, so crit bits are defined over an encoding that keeps byte-lexicographic order and gives every key a distinct bit string:
 
@@ -399,37 +353,37 @@ A shorter key has `0` where a longer key with the same prefix has its continuati
 
 The byte-level common prefix used for separators is `crit(a, b) >> 4`.
 
-### 4.2. Leaf layout
+### 2.2. Leaf layout
 
 ```
   ┌─────────────┬──────────┬──────────────────────┬───────────────────────────┐
   │ header 40 B │ top 16 B │ meta: u32 × capacity │ loc: u64 × capacity       │
   └─────────────┴──────────┴──────────────────────┴───────────────────────────┘
 
-  top   = top[15], u8 each      the first four levels of the leaf's trie (§4.3); one pad byte
+  top   = top[15], u8 each      the first four levels of the leaf's trie (§2.3); one pad byte
   meta  = crit:20 | fp_lo:12    crit of this key against the previous key in the leaf;
                                 unused for index 0
   loc   = file_id:20 | offset:32 | fp_hi:12
 ```
 
-The header is the B+ tree's `Node` header (tag, first child, capacity, count, prefix length, heap floor, dead bytes, `last_pos`, `is_leaf`; 40 bytes, held there by a `static_assert`), so a blind leaf is a `Node` whose bytes after the header are an index and two arrays instead of slots and a heap. That is what lets the version chain, `BuildSession` and the inner nodes handle it unchanged: children stay `Node *`, `is_leaf` tells a leaf apart, and reclamation never looks inside a leaf. `prefix_len`, `heap_floor` and `dead_bytes` are unused in a blind leaf; `last_pos` records where the last insert went, which the split rule reads (§6.4). The arrays are structure-of-arrays so that each search reads only `meta`.
+The header is the B+ tree's `Node` header (tag, first child, capacity, count, prefix length, heap floor, dead bytes, `last_pos`, `is_leaf`; 40 bytes, held there by a `static_assert`), so a blind leaf is a `Node` whose bytes after the header are an index and two arrays instead of slots and a heap. That is what lets the version chain, `BuildSession` and the inner nodes handle it unchanged: children stay `Node *`, `is_leaf` tells a leaf apart, and reclamation never looks inside a leaf. `prefix_len`, `heap_floor` and `dead_bytes` are unused in a blind leaf; `last_pos` records where the last insert went, which the split rule reads (§4.4). The arrays are structure-of-arrays so that each search reads only `meta`.
 
 The leaf size is a template parameter, in bytes, and the capacity follows from it: `(bytes − 56 − 4) / 12` entries, with `loc` aligned to 8. Sizes are jemalloc size classes so no allocation is rounded up. The engine uses **1,024-byte leaves, 80 entries**: `meta` is 320 bytes at offset 56, `loc` 640 bytes at offset 376. The size was picked by measurement over 512–1,280 bytes (Appendix A, *Leaf size, revisited*); capacity must stay below 256 because the `top` index names entries with a byte.
 
-**The fingerprint** (`fp_lo`, `fp_hi`, 24 bits) is a hash of the full key, taken when the key is inserted and never recomputed: a multiply-xor over 8-byte words, inlined, since every lookup and write computes one. Words are loaded in native byte order, since fingerprints live only in memory and are rebuilt with the tree at recovery; a key of eight bytes or more hashes its tail as its last eight bytes, overlapping the word before, so that no byte loop is needed. It is not used for ordering. The low twelve bits sit in `meta`, the one contiguous array the lookup compares in vector registers (§5.1), and the high twelve in `loc` confirm a match before its key is read. The false-match rate is 1 in 16.7 million per entry.
+**The fingerprint** (`fp_lo`, `fp_hi`, 24 bits) is a hash of the full key, taken when the key is inserted and never recomputed: a multiply-xor over 8-byte words, inlined, since every lookup and write computes one. Words are loaded in native byte order, since fingerprints live only in memory and are rebuilt with the tree at recovery; a key of eight bytes or more hashes its tail as its last eight bytes, overlapping the word before, so that no byte loop is needed. It is not used for ordering. The low twelve bits sit in `meta`, the one contiguous array the lookup compares in vector registers (§3.1), and the high twelve in `loc` confirm a match before its key is read. The false-match rate is 1 in 16.7 million per entry.
 
-**What the leaf does not hold:** the key bytes, the value size and the 48-bit sequence number. All three are in the record's header, which every confirming read returns (§4.5).
+**What the leaf does not hold:** the key bytes, the value size and the 48-bit sequence number. All three are in the record's header, which every confirming read returns (§2.5).
 
 **Invariants:**
 
 - Entries are in key order. `meta[i].crit == crit(key[i-1], key[i])` for `i ≥ 1`; `meta[0].crit` is 0.
 - `fp(key[i])` describes the record at `loc[i]`, and that record is a `Put` whose key is `key[i]`.
-- `top` is the index §4.3 defines for the leaf's current entries. It is rebuilt after every change to the entries, and debug `validate()` recomputes and compares it.
-- Every `loc` in a published version names bytes already written to the data file. Every `loc` in the writer's transient names bytes written *or* bytes in the batch the writer is building (§4.5).
-- Within one process, a `(file_id, offset)` pair names at most one record, ever. File ids come from `next_file_id_++` and are never reused; files are append-only; `resume()` trims only bytes no version references and then seals the file. This is what makes location equality mean record equality, which the no-read operations in §5.4 rely on.
+- `top` is the index §2.3 defines for the leaf's current entries. It is rebuilt after every change to the entries, and debug `validate()` recomputes and compares it.
+- Every `loc` in a published version names bytes already written to the data file. Every `loc` in the writer's transient names bytes written *or* bytes in the batch the writer is building (§2.5).
+- Within one process, a `(file_id, offset)` pair names at most one record, ever. File ids come from `next_file_id_++` and are never reused; files are append-only; `resume()` trims only bytes no version references and then seals the file. This is what makes location equality mean record equality, which the no-read operations in §3.4 rely on.
 - The `meta` words past `count` are zero or stale entries, never uninitialised: the fingerprint scan compares all of them before masking, so a fresh leaf zeroes them at allocation.
 
-### 4.3. The top index
+### 2.3. The top index
 
 The sorted keys and their crit bits imply a Patricia trie (Background). Its root is the boundary with the smallest crit bit; each child is the boundary with the smallest crit bit within its half; every subtree is a contiguous range of entries. `top[15]` holds that trie's first four levels in heap order — the children of slot `k` are `2k + 1` and `2k + 2` — as the index of the boundary at the root of each range, or 0 for a range of fewer than two entries.
 
@@ -443,11 +397,11 @@ For the Background's five keys, `top[0] = 2` (the (0,8) boundary), `top[1] = 1`,
 
 A placement walk takes four bit tests down the index and scans only the range it lands in — about a sixteenth of a leaf of random keys — instead of the whole leaf. Building the index is four passes over the leaf's crit bits (`compute_index`), done after every insert, erase or split; a lookup never reads it. Appendix A, *R6*, records why four levels and not five: the walk is bound by its chain of dependent loads, and a fifth level lengthened it by more than the scan it saved.
 
-### 4.4. What is shared with the keyed B+ tree
+### 2.4. What is shared with the keyed B+ tree
 
 `BlindSession<LeafBytes>` derives from `btree_detail::BuildSession<BlindRef>`. The base owns the descent, the path copy of inner nodes, inner-node splits, `make_root`, node ownership (`owns`, `discard`) and the garbage sites; it takes the leaf step as a callback. The blind session supplies only the leaf steps: `upsert_leaf`, `remove_entry`, `split_leaf`, and `own_leaf`, which clones a leaf by copying its arrays and index rather than rebuilding a slotted page. The inner-node search (`child_index`), the separator rule (`separator(prev, key)`), `BulkLoader`'s level building and `concat_into`, `ChainTraits<BlindRef>` and the `VersionChain` are used as they are. `map_bench` showed the keyed B+ tree unchanged by the refactor that exposed those pieces.
 
-### 4.5. Key resolution
+### 2.5. Key resolution
 
 Every operation that needs a key's bytes asks a resolver:
 
@@ -462,21 +416,21 @@ concept BlindKeyResolver = requires(R &r, BlindRef ref) {
 
 The tree takes the resolver as an argument to each operation that needs one and never stores it. The tree module stays free of file I/O, and the tests drive it with an in-memory resolver that counts its calls.
 
-The engine's resolver is `KeyReader` (`bytecaskdb/internals.cppm`). It reads the whole record at the location through `DataFile::lend_record` — one buffer-pool lookup, no copy unless the record straddles a frame — and CRC-checks it on the write path. The CRC covers header, key and value together, so there is no verified read of the key alone: confirming a key reads its value too (§8.4). It keeps the sequence, value size and value of the last record read, so a `get` that confirmed a key has its value, and a `put` or `erase` has the value size of the record it displaced, without a second read. It resolves through the version's file registry (`KeyDirCtx`), so a snapshot resolves against the files it pins.
+The engine's resolver is `KeyReader` (`bytecaskdb/internals.cppm`). It reads the whole record at the location through `DataFile::lend_record` — one buffer-pool lookup, no copy unless the record straddles a frame — and CRC-checks it on the write path. The CRC covers header, key and value together, so there is no verified read of the key alone: confirming a key reads its value too (§6.4). It keeps the sequence, value size and value of the last record read, so a `get` that confirmed a key has its value, and a `put` or `erase` has the value size of the record it displaced, without a second read. It resolves through the version's file registry (`KeyDirCtx`), so a snapshot resolves against the files it pins.
 
 One case needs more. Phase 1 of a commit (validate and apply) runs **before** the batch's `pwritev` (`docs/commit_pipeline_design.md`), so the writer's transient can hold locations whose bytes are not yet on disk: a batch that puts `k1` then `k2` may land `k2`'s blind walk on `k1`'s new record. `KeyDirCtx` therefore carries the batch's **pending records**, a map from `(file_id, offset)` to the key, sequence and value size of each record the batch has applied but not written, and `KeyReader` answers from it first. Readers never see these locations, because the version is published after `fdatasync`.
 
-### 4.6. Versions, transients and reclamation
+### 2.6. Versions, transients and reclamation
 
 Unchanged from the keyed B+ tree. A `TransientBlindBTree` is a `BuildSession` with a tag; a node whose tag is the session's is mutated in place, any other node is copied and the original retired through `discard`. `persistent() &&` publishes the version into the `VersionChain`, which parks each retired node on the oldest live version that can still reach it and frees it when that version dies. A transient destroyed without `persistent()` frees what it created and gives back what it retired. The `[accounting]` tests run on the blind tree and assert that the nodes which exist are exactly those reachable from a live version plus those the chain still owes a free to. Readers share nodes with no synchronisation, because nothing writes to a node after the session that created it has published.
 
 ---
 
-## 5. Search
+## 3. Search
 
-A leaf answers two questions. A point lookup (`get`, `contains`, `erase`) asks whether `q` is in the leaf and at which index; it scans the fingerprints (§5.1). An insert or `lower_bound` asks where `q` belongs among keys it cannot see; it walks the crit bits to a candidate and reads that key (§5.2, §5.3). Both are preceded by the inner-node descent, which is exact: the search reaches the one leaf that can hold `q`.
+A leaf answers two questions. A point lookup (`get`, `contains`, `erase`) asks whether `q` is in the leaf and at which index; it scans the fingerprints (§3.1). An insert or `lower_bound` asks where `q` belongs among keys it cannot see; it walks the crit bits to a candidate and reads that key (§3.2, §3.3). Both are preceded by the inner-node descent, which is exact: the search reaches the one leaf that can hold `q`.
 
-### 5.1. Point lookups: the fingerprint scan
+### 3.1. Point lookups: the fingerprint scan
 
 `meta` holds the low twelve fingerprint bits of every entry in one contiguous array. A lookup compares all `kCap` of them with the query's in vector registers — ten AVX2 compares for an 80-entry leaf, a fixed count with no loop or branch on data — and masks the result to `count`. Each match is then checked against the twelve bits in `loc` and, if those agree too, its key is read through the resolver; the first key equal to `q` is the answer, in index order.
 
@@ -497,7 +451,7 @@ The scan reads all 320 bytes of `meta`, five cache lines, where a trie walk touc
 
 The scan replaced a crit-bit walk for lookups: the walk cost about 295 instructions per lookup and carried the data-dependent branches, the scan about 60 and none. Appendix A, *Point lookups by fingerprint scan*, has the measurements.
 
-### 5.2. Placing a key: the blind walk
+### 3.2. Placing a key: the blind walk
 
 `candidate(leaf, q)` walks the implied trie (Background) in two stages. First, four bit tests down the `top` index narrow the search to one subtree, a range `[lo, hi)` of the leaf. Then a left-to-right pass over that range finds the candidate. `c` is the candidate. `s` is the crit bit of the last left turn still in force: the boundaries after it with a crit bit at or above `s` are that node's right subtree, which the search did not enter.
 
@@ -521,10 +475,10 @@ A boundary with a smaller crit bit is an ancestor of the boundaries between it a
 
 Two details are not optional:
 
-- **The reset on a right turn.** A first draft kept `s` across a right turn. That skips boundaries of the subtree the search has just entered and returns a wrong candidate. A brute-force check of this pass, of the resolution in §5.3, and of the insert and erase rules, against sorted arrays of random keys (prefix keys and `\0` bytes included, 23,000 key sets), found it; undoing the reset fails five of the seven tree test cases.
+- **The reset on a right turn.** A first draft kept `s` across a right turn. That skips boundaries of the subtree the search has just entered and returns a wrong candidate. A brute-force check of this pass, of the resolution in §3.3, and of the insert and erase rules, against sorted arrays of random keys (prefix keys and `\0` bytes included, 23,000 key sets), found it; undoing the reset fails five of the seven tree test cases.
 - **The select.** "No branch on data" has to be enforced, not assumed. Clang compiles the ternary `right ? kNoCrit : p` to a conditional jump on `right`, which is a coin flip for every entry scanned. The implementation writes it as `p | (0u - right)` (`kNoCrit` is all ones), which stays a select; the jump cost 2.3 mispredicts per `Get` while lookups used this walk (Appendix A, *G3 on hardware counters*).
 
-### 5.3. Resolving the candidate
+### 3.3. Resolving the candidate
 
 `position(leaf, q, resolver)` returns the entry for `q` or its insertion position:
 
@@ -535,21 +489,21 @@ Two details are not optional:
 
 Step 4 is the Patricia argument: `j` cannot be a crit bit on `c`'s path, because the search would have tested it and followed `q`'s bit, not `c`'s. So no boundary inside the run has crit `j`, and the boundaries at `a` and `b` have crit bits below `j` (a boundary with crit `j` next to the run would be on `c`'s path too). The Background's `cow` example is exactly this: candidate `cat`, `j = (1,5)`, run `{cab, cat}`, `bit(cow, j) = 1`, position 4.
 
-The result carries `idx`, whether it was `exact`, whether `q` sorts `after` the run, and `j`; the insert step needs all four (§6.1). An insert or `lower_bound` costs one read unless the leaf is empty.
+The result carries `idx`, whether it was `exact`, whether `q` sorts `after` the run, and `j`; the insert step needs all four (§4.1). An insert or `lower_bound` costs one read unless the leaf is empty.
 
-### 5.4. Lookups by location: no read
+### 3.4. Lookups by location: no read
 
-Two engine paths know a key *and* the record they expect it to point at, and need to know whether the directory agrees. Vacuum asks whether a record is still live (the key still resolves to `(source_file, offset)`) and, when it copies a record, remaps the key from its old location to the new one. By the location invariant (§4.2), a record holds one key, so an entry that points at the expected record *is* the key's entry, whatever other entries share its fingerprint. `find_at(leaf, fp, ref)` scans the fingerprints like `find` and compares locations instead of reading keys; `holds(key, ref)`, `replace_at(key, from, to)` and `erase_at(key, from)` are built on it. None of them reads a record, so vacuum's liveness check and remap cost the key directory no I/O, as on the keyed tree.
+Two engine paths know a key *and* the record they expect it to point at, and need to know whether the directory agrees. Vacuum asks whether a record is still live (the key still resolves to `(source_file, offset)`) and, when it copies a record, remaps the key from its old location to the new one. By the location invariant (§2.2), a record holds one key, so an entry that points at the expected record *is* the key's entry, whatever other entries share its fingerprint. `find_at(leaf, fp, ref)` scans the fingerprints like `find` and compares locations instead of reading keys; `holds(key, ref)`, `replace_at(key, from, to)` and `erase_at(key, from)` are built on it. None of them reads a record, so vacuum's liveness check and remap cost the key directory no I/O, as on the keyed tree.
 
 ---
 
-## 6. Algorithms
+## 4. Algorithms
 
 Everything is written once in `BlindSession`, as in the keyed B+ tree. Only the leaf-level steps are described here; the path copying, `own`, splits of inner nodes and garbage sites are the base's. Every write first computes the query's fingerprint.
 
-### 6.1. Insert
+### 4.1. Insert
 
-With the position from §5.3 and `j = crit(q, key[c])`. The entries are fixed-size, so an insert shifts both arrays above the position by one, then:
+With the position from §3.3 and `j = crit(q, key[c])`. The entries are fixed-size, so an insert shifts both arrays above the position by one, then:
 
 - `q` after the run, at `b`: `crit(q) = j`, and the key now after `q` keeps its crit bit (`crit(q, key[b])` is the old `crit(key[b-1], key[b])`, which is below `j`).
 - `q` before the run, at `a`: `crit(q)` is the old `crit(key[a-1], key[a])` (0 when `a == 0`), and `key[a]` gets `j`.
@@ -565,13 +519,13 @@ No other entry changes, and no key other than `key[c]` is read. `last_pos` recor
                                                                                new    kept
 ```
 
-### 6.2. Overwrite
+### 4.2. Overwrite
 
 `position` resolves `q` to itself: replace `loc`, keeping the crit bit and fingerprint, which describe the key and the key has not changed. The transient's `upsert` takes a predicate over the existing and the new `BlindRef`, so a caller can refuse the replacement (a recovery resolver that keeps the newer sequence, say) and nothing changes; the displaced location is returned so that the engine can account the old record's bytes.
 
-### 6.3. Erase
+### 4.3. Erase
 
-`find` (§5.1) gives the index `i`; remove it. If `i > 0` and `i + 1 < count`, the next key's crit bit becomes `min(crit[i], crit[i+1])`: the first difference between two keys is the smallest first difference between any adjacent pair between them. No read beyond the one that confirmed the key. A leaf whose last entry goes is discarded, and the base removes it from its parent.
+`find` (§3.1) gives the index `i`; remove it. If `i > 0` and `i + 1 < count`, the next key's crit bit becomes `min(crit[i], crit[i+1])`: the first difference between two keys is the smallest first difference between any adjacent pair between them. No read beyond the one that confirmed the key. A leaf whose last entry goes is discarded, and the base removes it from its parent.
 
 ```
   Erase "cat" (index 3):
@@ -581,7 +535,7 @@ No other entry changes, and no key other than `key[c]` is read. `last_pos` recor
   crit    —     (2,5)  (0,8)  (2,4)  (1,4)         —     (2,5)  (0,8)  min((2,4),(1,4)) = (1,4)
 ```
 
-### 6.4. Split
+### 4.4. Split
 
 A full leaf plus the new entry is laid out in a scratch copy and cut at `m`. The crit bit at the cut, `crit(left.last, right.first)`, is already in the arrays, and it gives the separator's length: `cpl = crit >> 4`, separator `= right.first[0 .. cpl + 1)`. Building it needs the bytes of `right.first`, **one read per split**. When the key being inserted is `right.first`, its bytes are in hand and the read is skipped. The right leaf's first entry gets crit bit 0, both leaves get a fresh index, and `last_pos` follows the new key into whichever leaf holds it.
 
@@ -594,24 +548,24 @@ A full leaf plus the new entry is laid out in a scratch copy and cut at `m`. The
 
 A split happens once per leaf filled: with 80-entry leaves, a few dozen inserts apart in random order.
 
-### 6.5. Range erase (`del_range`)
+### 4.5. Range erase (`del_range`)
 
 As built, the engine walks the range with a keyed iterator, which reads each key (to find the range's end and the record's size for `live_bytes`), then erases each key by name, which reads it again: two reads per key in the range. The data file still takes one append, whatever the range holds. The designed form — two seeks, one read each, and every entry between them erased without a read, with `live_bytes` estimated from the file's average record — is deferred as R3 (#162; Appendix A).
 
-### 6.6. Iteration
+### 4.6. Iteration
 
-`BlindBTreeIterator` is a bidirectional cursor over one version: a stack of `(node, index)` frames, advancing within a leaf and across leaves in memory, like the keyed tree's. It yields a `BlindRef`; `key(resolver)` reads the key of the current entry. A seek (`lower_bound`) costs one read (§5.3); `count_until(end)` counts entries between two cursors from the leaf counts, reading nothing, which is what `Snapshot::count_keys` uses.
+`BlindBTreeIterator` is a bidirectional cursor over one version: a stack of `(node, index)` frames, advancing within a leaf and across leaves in memory, like the keyed tree's. It yields a `BlindRef`; `key(resolver)` reads the key of the current entry. A seek (`lower_bound`) costs one read (§3.3); `count_until(end)` counts entries between two cursors from the leaf counts, reading nothing, which is what `Snapshot::count_keys` uses.
 
 What the engine's iterators cost differs by what they yield:
 
 - **Value iterators** (`iter_from`, `riter_from`) read the record at `loc`, which is the read they do on any tree, and take the key from the same bytes. No extra I/O.
 - **Key iterators** (`keys_from`, `rkeys_from`) read the header and key of each entry: **one read per key**, where the keyed trees read none. The iterator owns the buffer the key is read into, so the span it yields lives until the next advance, as the lifetime rules require.
 
-### 6.7. Bulk load
+### 4.7. Bulk load
 
-`BlindBulkLoader` takes keys in ascending order, so it has every key's bytes in hand: crit bits between neighbours, fingerprints and separators are computed from the stream without a single read. It throws if a key does not sort after the previous one. Leaves are filled to a target that can be a fixed fraction of capacity or spread over a range of fractions, successive leaves taking their target from a golden-ratio sequence so that they do not all reach capacity, and split, at the same time (§9). `finish() &&` assembles the inner levels and returns a tree; `seal() &&` returns the sealed leaves without the levels above them, so that loaders which ran in parallel over disjoint ascending slices can be joined by `concat`, as the keyed tree's are.
+`BlindBulkLoader` takes keys in ascending order, so it has every key's bytes in hand: crit bits between neighbours, fingerprints and separators are computed from the stream without a single read. It throws if a key does not sort after the previous one. Leaves are filled to a target that can be a fixed fraction of capacity or spread over a range of fractions, successive leaves taking their target from a golden-ratio sequence so that they do not all reach capacity, and split, at the same time (§7). `finish() &&` assembles the inner levels and returns a tree; `seal() &&` returns the sealed leaves without the levels above them, so that loaders which ran in parallel over disjoint ascending slices can be joined by `concat`, as the keyed tree's are.
 
-### 6.8. Recovery from sorted hint streams
+### 4.8. Recovery from sorted hint streams
 
 Recovery cannot merge per-worker trees the way the retired radix tree's fan-in did, because merging two blind trees means comparing keys neither holds. It merges the **hint files** instead (`DB::recovery_load_streams`), which are already sorted by key and then by sequence descending (`docs/file_format.md`):
 
@@ -620,17 +574,17 @@ Recovery cannot merge per-worker trees the way the retired radix tree's fan-in d
 3. **Per range, in parallel.** A k-way merge over every hint file's slice of the range, each slice found by seeking to that file's last fence below the range and scanning forward to the first key in it. For each key the highest sequence wins (`kde_newer`'s rules, so `SequenceOverlap` is still thrown); a winning `Delete`, or a range tombstone with a higher sequence covering the key, drops it. Survivors feed a `BlindBulkLoader` and their sizes feed the file's live bytes. Every file is merged in every range, so no tombstone map crosses threads.
 4. **Concatenate** the ranges' sealed leaf runs through `BulkLoader::concat_into`.
 
-No intermediate tree is built. The loader fills leaves between 60% and 100% full, spread (§9). The format document allows unsorted hint files; phase 1 sorts one in memory, bounded by `max_file_bytes`, as hint generation does. The `[model]` recovery tests check serial and parallel recovery for equal keys, values and `file_stats`.
+No intermediate tree is built. The loader fills leaves between 60% and 100% full, spread (§7). The format document allows unsorted hint files; phase 1 sorts one in memory, bounded by `max_file_bytes`, as hint generation does. The `[model]` recovery tests check serial and parallel recovery for equal keys, values and `file_stats`.
 
 ---
 
-## 7. API Specification
+## 5. API Specification
 
-### 7.1. Resolver concept
+### 5.1. Resolver concept
 
-Every operation that may read a key takes an `R &res` satisfying `BlindKeyResolver` (§4.5). The tree calls `res.key_at(ref)` at most once per leaf step and never keeps the span past the call.
+Every operation that may read a key takes an `R &res` satisfying `BlindKeyResolver` (§2.5). The tree calls `res.key_at(ref)` at most once per leaf step and never keeps the span past the call.
 
-### 7.2. Persistent API (`PersistentBlindBTree<LeafBytes>`)
+### 5.2. Persistent API (`PersistentBlindBTree<LeafBytes>`)
 
 All operations leave the original tree unchanged and return a new instance.
 
@@ -642,12 +596,12 @@ All operations leave the original tree unchanged and return a new instance.
 *   `PersistentBlindBTree set(key, BlindRef ref, R &res) const` — insert or overwrite.
 *   `PersistentBlindBTree erase(key, R &res) const`
 *   `TransientBlindBTree<LeafBytes> transient() const` — spawns a mutable builder.
-*   `begin()`, `end()` (`std::default_sentinel`), `last()`, `end_iter()`, `lower_bound(key, R &res)` — iterators (§7.4).
+*   `begin()`, `end()` (`std::default_sentinel`), `last()`, `end_iter()`, `lower_bound(key, R &res)` — iterators (§5.4).
 *   `stats()`, `validate(R &res)`, `visit_nodes(f)` — node counts and depth, the debug invariant check, and a walk over node pointers for the memory tests.
 
 A version can be derived from only while it has no live successor; a second derivation throws `std::logic_error`, as on the other trees.
 
-### 7.3. Transient API (`TransientBlindBTree<LeafBytes>`)
+### 5.3. Transient API (`TransientBlindBTree<LeafBytes>`)
 
 Operations mutate the tree in place under the session's tag. A consumed or moved-from transient throws `std::logic_error` on use.
 
@@ -660,7 +614,7 @@ Operations mutate the tree in place under the session's tag. A consumed or moved
 *   `lower_bound(key, R &res) const`
 *   `PersistentBlindBTree<LeafBytes> persistent() &&` — consumes the builder.
 
-### 7.4. Iterator API (`BlindBTreeIterator<LeafBytes>`)
+### 5.4. Iterator API (`BlindBTreeIterator<LeafBytes>`)
 
 *   Satisfies `std::bidirectional_iterator` over `BlindRef`: `operator*` returns the current entry's location by value, `operator++` and `operator--` move within and across leaves in memory.
 *   `key(R &res)` reads the current entry's key; the span is the resolver's and lives until its next call.
@@ -669,7 +623,7 @@ Operations mutate the tree in place under the session's tag. A consumed or moved
 
 The engine wraps it as `BlindKeyDirIter<Keyed>`: a keyed iterator yields `(key, KeyDirEntry)` and reads the record on every dereference; a value iterator yields a location and reads nothing. An iterator over a published state keeps its own handle on that state's file registry, so it can outlive the call that made it.
 
-### 7.5. Bulk loader (`BlindBulkLoader<LeafBytes>`)
+### 5.5. Bulk loader (`BlindBulkLoader<LeafBytes>`)
 
 *   `BlindBulkLoader()`, `BlindBulkLoader(double fill)`, `BlindBulkLoader(double fill_min, double fill_max)` — leaves filled to capacity, to a fraction of it, or to fractions spread over the range.
 *   `void append(key, BlindRef ref)` — keys must ascend; throws `std::invalid_argument` otherwise.
@@ -678,23 +632,23 @@ The engine wraps it as `BlindKeyDirIter<Keyed>`: a keyed iterator yields `(key, 
 
 ---
 
-## 8. Engine integration
+## 6. Engine integration
 
-### 8.1. The key directory facade
+### 6.1. The key directory facade
 
-The engine talks to its key directory through a set of `kd_*` functions in `bytecaskdb/internals.cppm` — `kd_get`, `kd_contains`, `kd_put`, `kd_erase`, `kd_holds`, `kd_put_at`, `kd_erase_at`, `kd_lower_bound`, `kd_count`, `kd_read_value` and the iterator constructors — that speak the engine's terms: a lookup returns a `KeyDirEntry`, a put or erase returns what it displaced (a `KeyDirHit`: location and value size), iterators yield `(key, KeyDirEntry)` or a location. Each takes a `KeyDirCtx`: the version's file registry (a published state's, or the writer's transient one), the writer's pending records (§4.5) and whether to verify CRCs. `bytecaskdb/bytecask.cppm` calls nothing else, so the same engine builds on both trees; the keyed B+ tree ignores the context.
+The engine talks to its key directory through a set of `kd_*` functions in `bytecaskdb/internals.cppm` — `kd_get`, `kd_contains`, `kd_put`, `kd_erase`, `kd_holds`, `kd_put_at`, `kd_erase_at`, `kd_lower_bound`, `kd_count`, `kd_read_value` and the iterator constructors — that speak the engine's terms: a lookup returns a `KeyDirEntry`, a put or erase returns what it displaced (a `KeyDirHit`: location and value size), iterators yield `(key, KeyDirEntry)` or a location. Each takes a `KeyDirCtx`: the version's file registry (a published state's, or the writer's transient one), the writer's pending records (§2.5) and whether to verify CRCs. `bytecaskdb/bytecask.cppm` calls nothing else, so the same engine builds on both trees; the keyed B+ tree ignores the context.
 
 On the blind tree the facade constructs a `KeyReader` per call, over a per-thread scratch buffer and a frame lease. A put is one `upsert`; the predicate always accepts, and the hit it displaced takes its value size from the record the reader just confirmed (`KeyReader::displaced` checks it was that record). `DB::get` takes the value from the same read that confirmed the key.
 
-### 8.2. Sequences
+### 6.2. Sequences
 
 The leaf holds no sequence. Every engine use of a key's sequence — the W-W check and `ensure_unchanged`, range guards, `lost_to` on a conflict, vacuum's remap, `apply_resume` — gets it from the record's header, which the read that confirms the key returns, so `kd_get` yields a full `KeyDirEntry` and those paths run unchanged from the keyed tree. The cost is that a guard on an unchanged key reads a record where the keyed tree read nothing. A design that compares *locations* instead, so that the common path of every guard is free of I/O, is written up but not built (R8; Appendix A, *Sequence without a sequence field*).
 
-Vacuum's liveness check and remap take the no-read path of §5.4 (`kd_holds`, `kd_put_at`, `kd_erase_at`): they know the record they expect, and location equality is record equality.
+Vacuum's liveness check and remap take the no-read path of §3.4 (`kd_holds`, `kd_put_at`, `kd_erase_at`): they know the record they expect, and location equality is record equality.
 
-### 8.3. I/O per operation
+### 6.3. I/O per operation
 
-Reads of the key directory's own doing, beyond what the operation reads on any tree. Each read is of the whole record, value included (§4.5), and lands on a record the writer or a reader touched recently, often in the active file, which is resident in the page cache and in the buffer pool.
+Reads of the key directory's own doing, beyond what the operation reads on any tree. Each read is of the whole record, value included (§2.5), and lands on a record the writer or a reader touched recently, often in the active file, which is resident in the page cache and in the buffer pool.
 
 | Operation | Keyed B+ tree | Blind leaves |
 |---|---|---|
@@ -711,28 +665,28 @@ Reads of the key directory's own doing, beyond what the operation reads on any t
 | vacuum liveness and remap | 0 | 0 |
 | recovery | 0 | 0 |
 
-### 8.4. Latency
+### 6.4. Latency
 
 A write that reads a key does so while the leader holds the write mutex, in phase 1. On a warm page cache or buffer pool that is under a microsecond; on a cold SATA SSD it is about 100 µs, and a batch of 64 cold reads is several milliseconds of serial I/O before the `fdatasync`. The cost per write is constant, one read, so latency stays predictable; its variance is the cache hit ratio's.
 
-The read is of the whole record, not its header and key, because the CRC covers the value too. An overwrite or delete of a key with a large value therefore reads and checks that value under the mutex, and an insert does the same to its neighbour's: up to `max_value_bytes` (4 MiB by default) per write. `engine_bench`'s puts use small values, so its numbers do not show this. Reading only the header and key would mean confirming a key without verifying it; that trade-off is open (§12, #163).
+The read is of the whole record, not its header and key, because the CRC covers the value too. An overwrite or delete of a key with a large value therefore reads and checks that value under the mutex, and an insert does the same to its neighbour's: up to `max_value_bytes` (4 MiB by default) per write. `engine_bench`'s puts use small values, so its numbers do not show this. Reading only the header and key would mean confirming a key without verifying it; that trade-off is open (§10, #163).
 
 The fix, if a workload shows the need: resolve candidates *before* joining the commit group, against the latest published version, and at apply time check that the leaf the candidate came from is still the leaf the transient routes to (same node pointer, or same tag). Only a key whose leaf changed in between is re-read under the mutex. The reads then run in parallel across writers and phase 1 stays in memory. That is the second half of R8.
 
-### 8.5. Failure modes
+### 6.5. Failure modes
 
 - **A write can fail on a neighbour's record.** An insert reads the candidate's key, which belongs to another key. An I/O error or CRC failure there fails the write: `std::system_error` or `std::runtime_error`, as a failed read does on any tree, and nothing is appended because phase 1 fails before phase 2. The engine does not enter the degraded state, since nothing was written. `CONTRACT.md` records this case; a fault-injection test covers it.
 - **A record the directory points at that is not a `Put`** is corruption: `KeyReader` throws `std::runtime_error` rather than treating its bytes as a key.
 - **Key resolution during recovery cannot fail this way:** recovery reads hint files, not data entries.
 - **A fingerprint collision is not a correctness risk.** A match is always confirmed by the key bytes; the fingerprint only skips reads on a mismatch.
 
-### 8.6. Selection
+### 6.6. Selection
 
 Build-time. The blind tree is the default; `BYTECASK_KEYDIR=btree` selects the keyed B+ tree, and CI runs the engine suite on both. The on-disk format is the same for both: the blind build recovers from the same hint files, so a database opens under either tree. A runtime `Options::key_directory` is a follow-up that belongs to the pluggable-interface work, not to this tree.
 
 ---
 
-## 9. Memory
+## 7. Memory
 
 A leaf entry is 12 bytes. Per key, add the leaf's fixed 56 bytes of header and index spread over its entries, the fill, and about 0.5 B of inner nodes: at 80 entries, 12 / fill + 56 / (80 × fill) + 0.5, which is 13.2 B/key at full leaves and 18.9 at the 0.69 fill random inserts settle at.
 
@@ -746,7 +700,7 @@ Measured with `memory_profile` (`BC_INDEX_ONLY=…`), 1M keys inserted in batche
 
 The size no longer depends on key length: every random shape measures the same, and a structured shape differs from it only by its fill. The per-shape picture, at 1,280-byte leaves before the header shrank, is in Appendix A, *R2*; the two numbers above moved by −1.1 and −0.9 B/key when it did (*R4*) and by +0.2 and +0.3 when the leaf size was chosen for read speed (*Leaf size, revisited*).
 
-**Fill.** Ordered inserts fill leaves to about 1.0, random inserts to 0.69, and the split rule in §6.4 is what keeps ascending streams from leaving half-full leaves behind. `many_partitions`, whose second pass adds one key after every existing key, is the worst structured shape at 0.67: every full leaf must end up holding twice its capacity.
+**Fill.** Ordered inserts fill leaves to about 1.0, random inserts to 0.69, and the split rule in §4.4 is what keeps ascending streams from leaving half-full leaves behind. `many_partitions`, whose second pass adds one key after every existing key, is the worst structured shape at 0.67: every full leaf must end up holding twice its capacity.
 
 **Recovery slack.** A tree bulk-loaded with full leaves splits every one of them within the first few percent of random writes, nearly doubling the directory (12.9 → 24.6 B/key) before it settles at the insert-built figure. Recovery therefore loads leaves between 60% and 100% full, spread over successive leaves, which removes the cliff: the peak stays at the steady state. Keys written in order never refill the slack, so a recovered tree of ordered keys keeps about 26% more than a full load would (16.3 against 12.9 B/key). Predictable latency ranks above the smaller footprint; Appendix A, *R5*, has the table.
 
@@ -754,7 +708,7 @@ Against the keyed B+ tree's 33–133 B/key, the directory is 2–7× smaller, an
 
 ---
 
-## 10. Performance
+## 8. Performance
 
 `engine_bench`, 1M keys, buffer pool, release build, AMD Ryzen 7 3700X, not pinned, medians of five interleaved runs, all binaries built the same way on the same day. Ops/sec as a fraction of the keyed B+ tree's, and hardware counters per `Get` call:
 
@@ -793,9 +747,9 @@ G1 was the reason to build this. How the design got from its first measurements 
 
 ---
 
-## 11. Tests
+## 9. Tests
 
-- **Tree, with an in-memory resolver** (`tests/blind_btree_test.cpp`, tag `[blind]`): the encoding's crit bits agree with byte order; a brute-force check of the leaf search over 23,000 single-leaf key sets (prefix keys, embedded and trailing `\0`, long shared prefixes, single-bit differences at every bit of a byte) finds every key and every insertion point; a model test against `std::map` over random insert, overwrite, erase, `lower_bound`, forward and reverse iteration, with snapshots; structured keys build a deep tree; bulk load matches inserting, spreads fill over a range, seals slices that concatenate into one tree, and frees what an abandoned loader sealed; a refused replacement changes nothing; 65,535-byte keys; and a resolver that counts calls asserts the I/O table in §8.3.
+- **Tree, with an in-memory resolver** (`tests/blind_btree_test.cpp`, tag `[blind]`): the encoding's crit bits agree with byte order; a brute-force check of the leaf search over 23,000 single-leaf key sets (prefix keys, embedded and trailing `\0`, long shared prefixes, single-bit differences at every bit of a byte) finds every key and every insertion point; a model test against `std::map` over random insert, overwrite, erase, `lower_bound`, forward and reverse iteration, with snapshots; structured keys build a deep tree; bulk load matches inserting, spreads fill over a range, seals slices that concatenate into one tree, and frees what an abandoned loader sealed; a refused replacement changes nothing; 65,535-byte keys; and a resolver that counts calls asserts the I/O table in §6.3.
 - **Fingerprint collisions**: leaves built from pairs of distinct keys with the same 24-bit fingerprint (found by brute force). Every key resolves to its own record, an absent key that shares a pair's fingerprint reads both and finds neither, erasing one of a pair leaves the other findable, and the operations by location pick the key's entry among colliding ones without a read.
 - **Crit-bit and index invariants**: debug `validate()` checks `crit(key[i-1], key[i])` and `top` against the stored values on every leaf of every test. Undoing the right-turn reset in the walk fails five of the seven original test cases; swapping the two children in the index walk fails six.
 - **Persistence**: the keyed B+ tree's snapshot, transient and `[accounting]` tests run on the blind tree; structural sharing is unchanged.
@@ -806,25 +760,25 @@ G1 was the reason to build this. How the design got from its first measurements 
 
 ---
 
-## 12. Open questions
+## 10. Open questions
 
-- **The write path reads whole records.** A key is confirmed by reading and CRC-checking its record, value included (§8.4). A header-and-key read would bound the cost, but it confirms the key without verifying it; a record whose key bytes are damaged would then compare unequal and the write would add a second entry for the key instead of failing. Tracked in #163.
+- **The write path reads whole records.** A key is confirmed by reading and CRC-checking its record, value included (§6.4). A header-and-key read would bound the cost, but it confirms the key without verifying it; a record whose key bytes are damaged would then compare unequal and the write would add a second entry for the key instead of failing. Tracked in #163.
 - **`contains_key`.** One read per present key is a regression for callers that use it as a cheap existence test. A 24-bit fingerprint cannot answer "present" on its own; a caller that tolerates 1-in-16.7M false positives could have a separate `probably_contains`, but that is a new API, not a change to this one.
-- **Range deletes** read each key twice (§6.5). The designed form is R3, #162.
-- **Guards read a record** (§8.2). Location-based guards and resolving candidates before the commit group are R8; neither affects the benchmarks above, both matter for guard-heavy and cold-cache workloads.
+- **Range deletes** read each key twice (§4.5). The designed form is R3, #162.
+- **Guards read a record** (§6.2). Location-based guards and resolving candidates before the commit group are R8; neither affects the benchmarks above, both matter for guard-heavy and cold-cache workloads.
 - **Leaf boundaries at short separators in recovery** (#159). The bulk loader could end each leaf at the smallest crit bit within its fill allowance: shorter separators and a shorter scan, without the fill cost that ruled the same rule out for inserts. This is G1's last byte.
-- **Hint-stream recovery for the other trees.** §6.8 never builds per-worker trees and may beat the keyed trees' recovery too. Not measured.
+- **Hint-stream recovery for the other trees.** §4.8 never builds per-worker trees and may beat the keyed trees' recovery too. Not measured.
 - **The facade's shape.** Whether a variant-at-open selection fits the engine's module structure, and what it costs in build time, is part of the pluggable-interface work.
 
 ---
 
 ## Appendix A: Design history and measurements
 
-The sections above describe the tree as built. This appendix is the record of how it got there, kept because the measurements are the argument for most of the choices in §4–§6: the gates the design had to pass, the first version's results against them, the revision those results forced (R1–R8), the profiling that closed the point-read gap, and the plan as it was worked through. Section names are as they were when the work was done, so that commit messages and issues that cite them still resolve. "B+ tree" in this appendix means the keyed B+ tree; "today" means before the blind tree.
+The sections above describe the tree as built. This appendix is the record of how it got there, kept because the measurements are the argument for most of the choices in §2–§4: the gates the design had to pass, the first version's results against them, the revision those results forced (R1–R8), the profiling that closed the point-read gap, and the plan as it was worked through. Section names are as they were when the work was done, so that commit messages and issues that cite them still resolve. "B+ tree" in this appendix means the keyed B+ tree; "today" means before the blind tree.
 
 ### Sequence without a sequence field (R8, designed, not built)
 
-The engine reads a key's sequence from its record (§8.2). This is the design that would make the common path of every guard free of I/O by comparing locations instead; it is written up here as it was proposed.
+The engine reads a key's sequence from its record (§6.2). This is the design that would make the common path of every guard free of I/O by comparing locations instead; it is written up here as it was proposed.
 
 | Use of `sequence()` today | Replacement |
 |---|---|
@@ -861,7 +815,7 @@ well, gain about 2×; long random keys gain 4–5×. The size no longer depends
 on key length. HOT's reported 11–14 B/key is lower because its leaf value is
 8 bytes; dropping `entry_bytes` would get this design to 12 B/key, at the
 cost of a read per key in `del_range` and a second read in `get` for values
-longer than a first guess. §12 keeps that variant open.
+longer than a first guess. §10 keeps that variant open.
 
 
 ### Gates
@@ -1300,13 +1254,13 @@ instead fails the `[model]` and recovery tests.
 0.143–0.149 s against the B+ tree's 0.203–0.225 s (0.255–0.260 s through
 the B+ tree and conversion); 4 threads 0.053–0.056 s against 0.068–0.075 s
 (0.119–0.125 s). G5 passes: the blind tree now recovers faster than the B+
-tree. §12 asks whether the same path would speed up the B+
+tree. §10 asks whether the same path would speed up the B+
 tree; it is not measured yet.
 
 #### R8. Later
 
 Location-based guards (§Sequence without a sequence field) and resolving
-candidates before joining the commit group (§8.4). Neither affects G1–G4
+candidates before joining the commit group (§6.4). Neither affects G1–G4
 on the benchmarks above; both matter for guard-heavy and cold-cache
 workloads.
 
@@ -1379,7 +1333,7 @@ built `releasedbg`.
 Cache misses are level, and AMD IBS shows the leaf's dependent loads
 hitting L1. What callgrind missed is three extra branch misses per call.
 Most of them came from one branch clang put in the scan, on the `right` bit
-(§5.2). Writing that update as a mask fixes it.
+(§3.2). Writing that update as a mask fixes it.
 
 `engine_bench`, 1M keys, buffer pool, release build, performance governor,
 not pinned. Ops/sec as a fraction of the B+ tree's, medians of five
@@ -1620,7 +1574,7 @@ insert-built figure, which is what G1 measures, plus 0.2 B/key for the
 | G5 | Recovery within 1.5× | Met: 0.66–0.88× the B+ tree's time (§R7) |
 
 With G1 within 1 B/key of its target and G3 met, the tree became the
-default key directory (§8.6). G1's last byte is #159's, the bulk
+default key directory (§6.6). G1's last byte is #159's, the bulk
 loader ending leaves at short separators.
 
 ### Plan
@@ -1662,10 +1616,10 @@ Listed as a matter of good faith — this design builds on established ideas fro
 
 | Concept | Source | Link |
 |---|---|---|
-| Patricia trie — the crit-bit search every blind leaf implies (Background, §5.2) | D. R. Morrison, *PATRICIA — Practical Algorithm To Retrieve Information Coded in Alphanumeric*, J. ACM 15(4), 1968 | https://dl.acm.org/doi/abs/10.1145/321479.321481 |
+| Patricia trie — the crit-bit search every blind leaf implies (Background, §3.2) | D. R. Morrison, *PATRICIA — Practical Algorithm To Retrieve Information Coded in Alphanumeric*, J. ACM 15(4), 1968 | https://dl.acm.org/doi/abs/10.1145/321479.321481 |
 | Blind tries in every node of a B-tree — the search this design does in its leaves only | P. Ferragina, R. Grossi, *The String B-tree: A New Data Structure for String Search in External Memory and Its Applications*, J. ACM 46(2), 1999 | https://doi.org/10.1145/301970.301973 |
 | Fixed-size partial keys in a main-memory index — the fingerprint's ancestor | P. Bohannon, P. McIlroy, R. Rastogi, *Main-memory index structures with fixed-size partial keys*, SIGMOD 2001 | https://doi.org/10.1145/375663.375681 |
-| HOT — a height-balanced tree of blind nodes with SIMD partial-key search; the 11–14 B/key this design is measured against (§9) and the search it was weighed against (Appendix A, *What is left*) | R. Binna, E. Zangerle, M. Pichl, G. Specht, V. Leis, *HOT: A Height Optimized Trie Index for Main-Memory Database Systems*, SIGMOD 2018 | https://doi.org/10.1145/3183713.3196896 |
+| HOT — a height-balanced tree of blind nodes with SIMD partial-key search; the 11–14 B/key this design is measured against (§7) and the search it was weighed against (Appendix A, *What is left*) | R. Binna, E. Zangerle, M. Pichl, G. Specht, V. Leis, *HOT: A Height Optimized Trie Index for Main-Memory Database Systems*, SIGMOD 2018 | https://doi.org/10.1145/3183713.3196896 |
 | Memory-efficient key-value store indexes with partial keys | H. Lim, B. Fan, D. G. Andersen, M. Kaminsky, *SILT: A Memory-Efficient, High-Performance Key-Value Store*, SOSP 2011 | https://doi.org/10.1145/2043556.2043558 |
 | Persistent data structures (path copying) — the versioning the tree inherits | Driscoll, Sarnak, Sleator & Tarjan, *JCSS* 38(1), 1989 | https://doi.org/10.1016/0022-0000(89)90034-2 |
 | Persistent data structures (accessible introduction) | Okasaki, *Purely Functional Data Structures*, Cambridge University Press, 1998 | [book](https://www.cambridge.org/9780521663502) · [OCaml source](https://github.com/mmottl/pure-fun) |
