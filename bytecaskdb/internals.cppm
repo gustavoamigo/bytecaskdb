@@ -289,15 +289,16 @@ export struct KeyDirCtx {
 // put or erase returns what it displaced (a KeyDirHit: file, offset and value
 // size), iterators yield (key, KeyDirEntry) or a KeyDirHit.
 //
-// The B+ tree (docs/persistent_btree_design.md) is the default;
-// BYTECASK_KEYDIR=radix builds the engine on the radix tree and
-// BYTECASK_KEYDIR=blind on the blind-leaf tree
-// (docs/blind_leaf_btree_design.md), which stores no key bytes and reads them
-// back through the KeyDirCtx.
+// The blind-leaf tree (docs/blind_leaf_btree_design.md), which stores no key
+// bytes and reads them back through the KeyDirCtx, is the default;
+// BYTECASK_KEYDIR=btree builds the engine on the keyed B+ tree
+// (docs/persistent_btree_design.md) and BYTECASK_KEYDIR=radix on the radix
+// tree.
 //
-// Recovery builds a RecoveryKeyDirTree: the B+ tree in the blind build too,
-// converted once by key_dir_from_recovered() until recovery can build a
-// blind tree from the hint files directly.
+// Recovery at open builds the blind tree straight from the sorted hint
+// streams (DB::recovery_load_streams). The other recovery paths build a
+// RecoveryKeyDirTree, the keyed B+ tree in the blind build too, and
+// key_dir_from_recovered() converts it once.
 // ---------------------------------------------------------------------------
 #if defined(BYTECASK_KEYDIR_BLIND)
 export inline constexpr bool kKeyDirReadsKeys = true;
