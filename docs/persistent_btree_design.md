@@ -1213,8 +1213,10 @@ needs a key-directory column before it can hold both.
    `BulkLoader::append` copies the key again into its arena; handing the
    loader the iterator's buffer directly would avoid one of those copies.
 3. Re-run recovery on a 16-thread host.
-4. `u32_map` on the B+ tree, sysbench against `main`. `u32_map` still builds
-   on the radix tree; it backs `file_stats`, not the key directory.
+4. `u32_map` on the B+ tree. Done: `files` and `file_stats` are on the
+   keyed B+ tree in every build. `engine_bench` at 50k keys: `Get` level,
+   `Range50` about 8% slower (4.72 to 5.12 µs), which is the per-entry file
+   lookup; sysbench against `main` not run.
 5. Sibling merge on delete, gated by the churn memory tests (D6).
 
 ## References

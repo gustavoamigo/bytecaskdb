@@ -547,21 +547,11 @@ It was removed. By design it gave up read-your-writes, and the guarantees above 
 
 ### File Registry
 
-The engine maintains a registry that maps a monotonic `uint32_t` file ID to an open `DataFile`. The type is:
+The engine maps each monotonic `uint32_t` file ID to its open `DataFile`, and keeps per-file `FileStats` the same way. Both are `PersistentU32Map<V>` (`bytecaskdb/u32_map.cppm`) fields of `EngineState`: `files` with `V = std::shared_ptr<DataFile>` and `file_stats` with `V = FileStats`.
 
-```cpp
-using FileRegistry =
-    std::shared_ptr<std::map<std::uint32_t, std::shared_ptr<DataFile>>>;
-```
+`PersistentU32Map` is a thin wrapper over the keyed `PersistentBTree<V>`, with each file ID encoded as 4 big-endian bytes so iteration runs in ascending ID order. A copy is an O(1) snapshot, and a write goes through `transient()` / `persistent() &&` like the key directory, so a reader holding an old `EngineState` keeps the registry it started with and every `DataFile` in it open, without locking. The `shared_ptr<DataFile>` keeps a file's descriptor alive for as long as any version still names it, after rotation or vacuum has removed it from the current registry.
 
-Two levels of `shared_ptr` serve distinct purposes:
-
-- **Inner `shared_ptr<DataFile>`**: ensures a `DataFile` (and its fd) remains alive as long as any part of the system holds a reference to it, even after it has been rotated out of the current registry.
-- **Outer `shared_ptr<map<...>>`**: enables O(1) copy-on-write snapshotting. `EntryIterator` captures a copy of the outer pointer at construction, giving it an independent lifetime from the `Bytecask` instance.
-
-**Rotation** is a functional update: `rotate_active_file()` clones the inner map into a new allocation, inserts the new `DataFile`, and replaces `files_` with the new outer `shared_ptr`. Any iterator holding the previous snapshot continues reading from the old set of open files without any locking.
-
-**Why not `immer::map`**: `immer::map<K, std::shared_ptr<V>>` triggers a GCC 15 / libstdc++15 regression — the `friend` declaration inside `std::shared_ptr`'s internals is rejected when the type is instantiated from a C++20 module context.
+It is not built on the key directory's tree. The blind-leaf tree stores no key bytes and reads each key back from its record, and a file ID is in no record; the keyed B+ tree is compiled in every configuration anyway, since the blind tree shares its inner nodes. So the registry is the same in every `BYTECASK_KEYDIR` build. A range scan looks a file up once per entry, and against the radix tree this map was previously built on that costs about 8 ns an entry: `ByteCaskDB/Range50` went from 4.72 to 5.12 µs at 50k keys, with `Get` unchanged.
 
 ### Data File Lifecycle
 

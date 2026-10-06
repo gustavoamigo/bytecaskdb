@@ -2,7 +2,12 @@
 // Copyright (c) 2026 Gustavo Amigo
 //
 // ByteCaskDB — PersistentU32Map<V> / TransientU32Map<V>
-// COW map with uint32_t keys backed by PersistentRadixTree.
+// COW map with uint32_t keys backed by the keyed PersistentBTree.
+//
+// Not the key directory's tree: the blind-leaf tree keeps no key bytes and
+// reads them back from data files, and a file id is in no data file. The
+// keyed B+ tree is built in every configuration anyway, since the blind tree
+// shares its inner nodes.
 
 module;
 #include <array>
@@ -14,12 +19,12 @@ module;
 
 export module bytecask.u32_map;
 
-import bytecask.radix_tree;
+import bytecask.btree;
 
 namespace bytecask {
 
 // Encode a uint32_t as 4 big-endian bytes.
-// Preserves numeric ordering through the radix tree's byte-by-byte traversal.
+// Byte order is numeric order, so the tree iterates in ascending key order.
 auto encode_key(std::uint32_t k) noexcept -> std::array<std::byte, 4> {
   return {
       static_cast<std::byte>((k >> 24) & 0xFF),
@@ -39,7 +44,7 @@ auto decode_key(std::span<const std::byte> b) noexcept -> std::uint32_t {
 export template <typename V> class TransientU32Map;
 
 // ---------------------------------------------------------------------------
-// U32MapIterator<V> — decodes uint32_t key from RadixTreeIterator's byte span.
+// U32MapIterator<V> — decodes uint32_t key from BTreeIterator's byte span.
 // operator* returns pair<uint32_t, const V&>; the V& references the backing
 // tree node directly, valid while the originating U32Map is alive.
 // ---------------------------------------------------------------------------
@@ -49,7 +54,7 @@ public:
   using difference_type = std::ptrdiff_t;
 
   U32MapIterator() = default;
-  explicit U32MapIterator(RadixTreeIterator<V> inner)
+  explicit U32MapIterator(BTreeIterator<V> inner)
       : inner_{std::move(inner)} {}
 
   auto operator*() const -> std::pair<std::uint32_t, const V &> {
@@ -71,7 +76,7 @@ public:
   }
 
 private:
-  RadixTreeIterator<V> inner_;
+  BTreeIterator<V> inner_;
 };
 
 // ---------------------------------------------------------------------------
@@ -112,10 +117,10 @@ public:
 private:
   friend class TransientU32Map<V>;
 
-  explicit PersistentU32Map(PersistentRadixTree<V> tree)
+  explicit PersistentU32Map(PersistentBTree<V> tree)
       : tree_{std::move(tree)} {}
 
-  PersistentRadixTree<V> tree_;
+  PersistentBTree<V> tree_;
 };
 
 // ---------------------------------------------------------------------------
@@ -170,10 +175,10 @@ public:
 private:
   friend class PersistentU32Map<V>;
 
-  explicit TransientU32Map(TransientRadixTree<V> tree)
+  explicit TransientU32Map(TransientBTree<V> tree)
       : tree_{std::move(tree)} {}
 
-  TransientRadixTree<V> tree_;
+  TransientBTree<V> tree_;
 };
 
 } // namespace bytecask
