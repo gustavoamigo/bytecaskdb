@@ -36,6 +36,8 @@ All settings are global. Set them in `my.cnf` under `[mariadbd]` or, for the dyn
 
 Changes to the vacuum variables take effect on the next vacuum pass, at most one pause of the previous length later.
 
+Under jemalloc, give the 1–4 KiB size classes larger slabs: `MALLOC_CONF=slab_sizes:1024-4096:32` in mariadbd's environment. The key directory's nodes fall in those classes, and by default a 4 KiB class holds one object per slab, so nearly every node a commit copies costs a fresh slab. With the setting, sysbench write throughput was level to 5% higher and TPROC-C 1% higher, with RSS within 70 MB.
+
 ### Durability
 
 A committed transaction is always written to the data file before `COMMIT` returns, so a mariadbd crash loses nothing in any mode. `bytecaskdb_sync` decides when it also reaches the disk, which is what an OS crash or power loss needs:

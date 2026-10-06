@@ -629,6 +629,48 @@ busy share and serial µs per commit, and every change to stage 1 is judged by
 the last of those. Run it on tmpfs, with jemalloc preloaded and the two
 builds alternating; on a full machine compare only runs from one session.
 
+### Node allocation
+
+The committer thread allocates almost every key-directory node: each batch
+path-copies the nodes it changes. The nodes it replaces are freed wherever
+the last version pinning them is released, usually on a reader. Leaves are
+1 KiB and inner nodes 4 KiB, both jemalloc small size classes, and with
+jemalloc's defaults a 4 KiB class gets a one-page slab: one node per slab.
+So nearly every node the committer copies takes a fresh slab from its arena,
+and slab allocation is extent work (`pac_alloc_real`, `extent_recycle`,
+`edata_heap`). On `commit_probe` at 16 writers, with jemalloc 5.3's
+defaults, the allocator was 6.5% of the committer thread's CPU, about 2.4
+points of it getting slabs.
+
+`slab_sizes:1024-4096:32` gives the 1-4 KiB classes 32-page slabs.
+`commit_probe` (tmpfs, two rounds alternating, rounds within 0.3%), against
+jemalloc's defaults:
+
+| | 16 writers | 48 writers | serial µs/commit (16 / 48) |
+|---|---|---|---|
+| defaults | 16,717 | 20,712 | 54.3 / 46.2 |
+| `slab_sizes:1024-4096:32` | +2.1% | +4.3% | 51.8 / 44.1 |
+| node pool in the engine (#225), defaults | +2.3% | +4.4% | 51.5 / 44.1 |
+| node pool and the larger slabs | +2.3% | +4.6% | 51.3 / 44.0 |
+
+The setting is level with a pool, and the two together gain nothing more:
+the allocator's share of the serial section is gone, without engine code.
+None of the other knobs moved it: thread-cache size
+(`tcache_nslots_small_max`), cache GC rate (`tcache_gc_incr_bytes`), flush
+fraction (`lg_tcache_flush_small_div`), `narenas:1`, `bin_shards` for the
+node classes and `percpu_arena` all came within 1.7% of the defaults or
+behind them. A thread cache ten times jemalloc's (`tcache_nslots_small_min`
+2000, `tcache_gc_incr_bytes` 8 MiB) cost 7-10%: the serial section stayed
+as fast, the threads around it slowed, and RSS rose 12 MB per thread.
+
+On MariaDB, fast profile, `/mnt/bench`, against jemalloc's defaults: sysbench
+`oltp_insert` level at 16 threads and +2.6% at 64, `oltp_write_only` +2.4%
+and +4.9% (three rounds each); HammerDB TPROC-C, 32 warehouses, 16 users,
++1.1% (two rounds each); RSS within 70 MB. The MariaDB benchmarks preload
+jemalloc with this setting (`lib_common.sh`, `jemalloc_conf`). It is a
+property of the allocator, not of the engine: a mariadbd run without it
+pays the slab cost.
+
 ## Commit delay
 
 With every commit synced and the disk busy with `fdatasync` back to back,

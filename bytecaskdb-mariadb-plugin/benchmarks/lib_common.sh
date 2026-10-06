@@ -88,24 +88,21 @@ jemalloc_library() {
   echo "$lib"
 }
 
-# jemalloc options for every mariadbd it is preloaded into. A larger thread
-# cache for small size classes, trimmed less often: a commit copies tree nodes
-# on its own thread and readers free them on theirs, and with jemalloc's
-# default cache the committing thread refills from the shared arena every few
-# nodes. On commit_probe (16 threads, jemalloc 5.3) this took 55.2 -> 51.7 us
-# per commit, at ~12 MB of RSS per thread (#308). Every engine gets the same
-# options. MARIADB_MALLOC_CONF overrides them; set it empty for jemalloc's
-# defaults. The max is jemalloc's own ceiling: 5.3 caps larger values at 2048
-# without a warning.
-JEMALLOC_TUNED_CONF="tcache_nslots_small_min:2000,tcache_nslots_small_max:2048,lg_tcache_nslots_mul:6,tcache_gc_incr_bytes:8388608"
+# jemalloc options for every mariadbd it is preloaded into; every engine gets
+# the same. 32-page slabs for the 1-4 KiB size classes, which hold the key
+# directory's nodes: by default a 4 KiB class gets one node per slab, so the
+# committer thread takes a fresh slab for nearly every node it copies
+# (docs/commit_pipeline_design.md, "Node allocation"). MARIADB_MALLOC_CONF
+# overrides it; set it empty for jemalloc's defaults.
+JEMALLOC_DEFAULT_CONF="slab_sizes:1024-4096:32"
 jemalloc_conf() {
-  echo "${MARIADB_MALLOC_CONF-$JEMALLOC_TUNED_CONF}"
+  echo "${MARIADB_MALLOC_CONF-$JEMALLOC_DEFAULT_CONF}"
 }
 
 # Warns, once per library and conf, when jemalloc rejects any of the options:
-# it prints "Invalid conf pair" and runs on its defaults for them (versions
-# before 5.3 lack the tcache_nslots_* options), so a run would otherwise
-# measure untuned jemalloc without saying so.
+# it prints "Invalid conf pair" and runs on its defaults for them, so a run
+# would otherwise measure something other than what was asked without saying
+# so.
 JEMALLOC_CONF_CHECKED=""
 check_jemalloc_conf() {
   local lib="$1" conf="$2"
@@ -114,8 +111,7 @@ check_jemalloc_conf() {
   local out
   out="$(env "LD_PRELOAD=$lib" "MALLOC_CONF=$conf" /bin/true 2>&1)"
   if [[ "$out" == *"Invalid conf"* ]]; then
-    echo "WARNING: $lib rejected part of MALLOC_CONF and uses its defaults for it" \
-         "(the tuned thread cache needs jemalloc 5.3+):" >&2
+    echo "WARNING: $lib rejected part of MALLOC_CONF and uses its defaults for it:" >&2
     echo "$out" >&2
   fi
 }
