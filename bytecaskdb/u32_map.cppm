@@ -395,6 +395,13 @@ concept PersistentU32MapOf = requires(const M m, std::uint32_t k) {
   { m.begin() == m.end() } -> std::same_as<bool>;
 };
 
+// A callable for update() in the concept below. A named type, not a lambda:
+// Homebrew clang 23 crashed compiling this module interface while the
+// concept held a lambda (#343).
+template <typename V> struct U32MapNoOpUpdate {
+  void operator()(V &) const noexcept {}
+};
+
 export template <typename T, typename V>
 concept TransientU32MapOf =
     std::movable<T> &&
@@ -404,13 +411,8 @@ concept TransientU32MapOf =
       { ct.empty() } noexcept -> std::same_as<bool>;
       t.set(k, std::move(v));
       { t.erase(k) } -> std::same_as<bool>;
-      t.update(k, [](V &) {});
+      t.update(k, U32MapNoOpUpdate<V>{});
       std::move(t).persistent();
     };
-
-static_assert(PersistentU32MapOf<PersistentU32Map<int>, int>);
-static_assert(PersistentU32MapOf<PersistentU32Table<int>, int>);
-static_assert(TransientU32MapOf<TransientU32Map<int>, int>);
-static_assert(TransientU32MapOf<TransientU32Table<int>, int>);
 
 } // namespace bytecask

@@ -15,6 +15,12 @@
 #include <vector>
 import bytecask.u32_map;
 
+// Both implementations provide the interface the engine relies on.
+static_assert(bytecask::PersistentU32MapOf<bytecask::PersistentU32Map<int>, int>);
+static_assert(bytecask::PersistentU32MapOf<bytecask::PersistentU32Table<int>, int>);
+static_assert(bytecask::TransientU32MapOf<bytecask::TransientU32Map<int>, int>);
+static_assert(bytecask::TransientU32MapOf<bytecask::TransientU32Table<int>, int>);
+
 namespace {
 
 template <typename P>
