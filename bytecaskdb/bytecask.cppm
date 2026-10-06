@@ -4193,6 +4193,9 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
       {"bytecask.keydir_versions_live", narrow<std::int64_t>(reclaim.versions)},
       {"bytecask.keydir_nodes_parked",
        narrow<std::int64_t>(reclaim.parked_nodes)},
+      // Gauge, process-wide: freed key directory nodes held for reuse on the
+      // node pool's shared lists (thread caches not counted).
+      {"bytecask.keydir_pool_bytes", btree_detail::node_pool_bytes()},
       {"bytecask.bytes_written",
        counters_.bytes_written.load(std::memory_order_relaxed)},
       {"bytecask.group_writer_batches",
