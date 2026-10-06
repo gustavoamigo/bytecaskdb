@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Main CI pipeline: build, test, sanitizers, fuzz testing, and the MariaDB
+# Main CI pipeline: build, test, sanitizers, and the MariaDB
 # plugin suites (Linux only).
 # macOS coverage is handled by build-wheels.yml.
 
@@ -342,48 +342,6 @@ jobs:
     with:
       keydirs: '["blind"]'
       sanitizers: '["address", "thread", "undefined"]'
-
-  # ---------------------------------------------------------------------------
-  # Fuzz targets: compile-only check that the targets still build.
-  # The actual timed fuzzing run happens nightly in fuzz-nightly.yml — running
-  # a real fuzz budget on every PR pays a full build cost for a duration too
-  # short to reliably find anything.
-  # ---------------------------------------------------------------------------
-  fuzz:
-    runs-on: ubuntu-latest
-    container:
-      image: fedora:43
-    env:
-      BYTECASK_MARCH: x86-64-v3
-      XMAKE_ROOT: "y"
-      CLANG_TARGET_TRIPLE: x86_64-redhat-linux-gnu
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [fuzz_data_entry, fuzz_hint_entry]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          dnf install -y \
-            clang llvm llvm-devel lld \
-            libcxx libcxx-devel \
-            xmake \
-            python3-pip python3-devel \
-            git ninja-build
-          pip3 install nanobind pytest hypothesis
-
-      - name: Configure xmake
-        run: |
-          RESOURCE_DIR=$(clang --print-resource-dir)
-          xmake f --toolchain=clang \
-            --cxflags="-resource-dir=${RESOURCE_DIR}" \
-            --sanitizer=fuzzer,address \
-            -m debug -y
-
-      - name: Build fuzz target
-        run: xmake build ${{ matrix.target }}
 
   # ---------------------------------------------------------------------------
   # Node.js bindings (bytecaskdb-node): native (N-API) and WASM (Embind)
