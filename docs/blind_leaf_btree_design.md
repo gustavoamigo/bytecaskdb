@@ -2,14 +2,14 @@
 
 This document describes the design of the blind-leaf B+ tree used as the in-memory key directory in ByteCaskDB. It is intended for contributors who need to understand, modify, or reason about correctness of this component, and for readers who want to know how a tree can order and find keys it does not store.
 
-The **Background** section builds up the necessary concepts from scratch — what the key directory has to do, B+ trees, crit bits, Patricia tries, blind search and fingerprints — for readers coming without that context. From §1 onward the document covers the C++ design as built: the overview, design principles, leaf layout, search, algorithms, API, engine integration, memory, performance and tests. **Appendix A** keeps the design history: the gates the design had to pass, every measurement taken on the way, and the revisions those measurements forced. **Appendix B** lists the prior art.
+The **Background** section builds up the necessary concepts from scratch — what the key directory has to do, persistent data structures and path copying, how that applies to a B+ tree, tries and Patricia tries, crit bits, blind search and fingerprints — for readers coming without that context. From §1 onward the document covers the C++ design as built: the overview, design principles, leaf layout, search, algorithms, API, engine integration, memory, performance and tests. **Appendix A** keeps the design history: the gates the design had to pass, every measurement taken on the way, and the revisions those measurements forced. **Appendix B** lists the prior art.
 
 > **Status: built, measured, and the engine's default key directory**
 > (2026-09-24). The tree is `bytecaskdb/blind_btree.cppm`, module
 > `bytecask.blind_btree`. The keyed B+ tree (`BYTECASK_KEYDIR=btree`,
-> `docs/persistent_btree_design.md`) and the radix tree
-> (`BYTECASK_KEYDIR=radix`, `docs/persistent_radix_tree_design.md`) remain
-> selectable, and CI runs the engine suite on all three.
+> `docs/persistent_btree_design.md`) remains selectable, and CI runs the
+> engine suite on both. The persistent radix tree that preceded both as the
+> key directory has been retired.
 
 ---
 
@@ -23,16 +23,89 @@ It has to do four things:
 
 1. **Point lookup.** Given a key, return its record location, or say the key is absent.
 2. **Order.** Iterate keys in byte order, from any starting key, forwards and backwards. `iter_from`, `keys_from`, `del_range` and range guards all need it.
-3. **Snapshots.** A reader takes a consistent view of the whole directory in O(1), and keeps it while the writer goes on. This is what makes reads lock-free.
+3. **Snapshots.** A reader takes a consistent view of the whole directory in O(1), and keeps it while the writer goes on. This is what makes reads lock-free, and it is what the first half of this Background is about.
 4. **One writer.** Inserts, overwrites and erases, with the latency of each one bounded.
 
 The cost that matters is memory per key. A key directory that holds every key in full spends most of its bytes on key bytes: the keyed B+ tree measures 33–42 B/key on structured keys and 71–133 B/key on random ones, and 32 of those bytes are structural before the key itself. At 128 GB that is between one and four billion keys, depending on the key shape. For a deployment where the *number* of keys, not the value data, is what runs out of RAM, the key bytes are the problem.
 
-The keys are already on disk twice: in each key's data record, and in the hint file that indexes the data file. The key directory needs them only to order entries and to confirm a match. The question this design answers is whether a tree can do both without holding them.
+The keys are already on disk twice: in each key's data record, and in the hint file that indexes the data file. The key directory needs them only to order entries and to confirm a match. The second half of this Background is about how a tree can do both without holding them.
 
-### B+ trees in one page
+### What is a Persistent Data Structure?
 
-A **B+ tree** is a sorted array cut into pages. The **leaves** hold the entries, in key order, and each leaf holds many of them — tens to hundreds. The **inner nodes** hold **separators**: for each pair of adjacent children, one key that sorts between the last key of the left child and the first key of the right. A search descends from the root, comparing the query against separators to pick a child, until it reaches a leaf, then searches within the leaf.
+A **persistent data structure** preserves all previous versions of itself when modified. Instead of mutating state in place, every operation returns a new version. Old versions are never altered and remain fully accessible.
+
+> **Note on terminology**: "Persistent" here comes from functional programming — it refers to *immutability and version preservation*, not to storage on disk. A persistent data structure lives entirely in memory. In ByteCaskDB the data files are what is durable; the key directory is persistent in this other sense.
+
+This is the property behind requirement 3 above. If the key directory is never modified in place, a reader that holds a pointer to the version it started with can keep using it, unlocked, for as long as it likes, while the writer publishes new versions beside it. A `Snapshot` is exactly that: a pointer to one version. A `get` on the live database takes the pointer to the newest version and reads through it; nothing the writer does afterwards can change what that pointer leads to.
+
+The simplest way to implement persistence is to deep-copy the entire structure on every write. That is O(N) per operation — correct, but impractical at any real scale.
+
+The efficient alternative is **structural sharing**: since nodes are never mutated after creation, unchanged nodes can be *referenced by both the old and the new version simultaneously*. No copying is needed for any part of the structure that wasn't on the modified path.
+
+For trees, a single insertion or deletion only touches nodes along the *path from the root to the affected leaf*. Everything off that path is shared freely between the two versions — this technique is called **[path copying](https://doi.org/10.1016/0022-0000(89)90034-2)**. Okasaki's [*Purely Functional Data Structures*](https://www.cambridge.org/9780521663502) (1998) develops this and related techniques in depth.
+
+### Persistent BST: Path Copying
+
+Consider a binary search tree holding integer keys. Nodes are identified by a pointer ID (e.g. `ptr_1`) and carry a key (e.g. `8`).
+
+**Version 1** — `root_v1` holds a reference to `ptr_1`:
+
+```mermaid
+graph TB
+    ptr_1["ptr_1 : 8"] --> ptr_2["ptr_2 : 4"]
+    ptr_1 --> ptr_5["ptr_5 : 12"]
+    ptr_2 --> ptr_3["ptr_3 : 2"]
+    ptr_2 --> ptr_4["ptr_4 : 6"]
+    ptr_5 --> ptr_6["ptr_6 : 10"]
+    ptr_5 --> ptr_9["ptr_9 : 14"]
+    ptr_6 --> ptr_7["ptr_7 : 9"]
+    ptr_6 --> ptr_8["ptr_8 : 11"]
+    ptr_9 --> ptr_10["ptr_10 : 13"]
+
+    classDef sharedNode fill:#ADD8E6,stroke:#2166ac
+    class ptr_1,ptr_2,ptr_3,ptr_4,ptr_5,ptr_6,ptr_7,ptr_8,ptr_9,ptr_10 sharedNode
+```
+
+The search path for inserting 5 is **ptr_1(8) → ptr_2(4) → ptr_4(6)**, where 5 is placed as the left child of `ptr_4` (since 5 < 6). Every node on this path must be copied because their child pointers change. Everything off the path is untouched.
+
+The result is three copies (`ptr_11`, `ptr_12`, `ptr_13`) plus a new leaf (`ptr_14 : 5`). `root_v2` points to `ptr_11`. The remaining 7 nodes on the right subtree and the untouched left leaf are shared unchanged.
+
+**Version 2** — `root_v2 → ptr_11` (after inserting key 5):
+
+```mermaid
+graph TB
+    ptr_11["ptr_11 : 8"] --> ptr_12["ptr_12 : 4"]
+    ptr_11 --> ptr_5["ptr_5 : 12"]
+    ptr_12 --> ptr_3["ptr_3 : 2"]
+    ptr_12 --> ptr_13["ptr_13 : 6"]
+    ptr_13 --> ptr_14["ptr_14 : 5"]
+    ptr_5 --> ptr_6["ptr_6 : 10"]
+    ptr_5 --> ptr_9["ptr_9 : 14"]
+    ptr_6 --> ptr_7["ptr_7 : 9"]
+    ptr_6 --> ptr_8["ptr_8 : 11"]
+    ptr_9 --> ptr_10["ptr_10 : 13"]
+
+    classDef newNode fill:#90EE90,stroke:#2d7a2d
+    classDef sharedNode fill:#ADD8E6,stroke:#2166ac
+    class ptr_11,ptr_12,ptr_13,ptr_14 newNode
+    class ptr_3,ptr_5,ptr_6,ptr_7,ptr_8,ptr_9,ptr_10 sharedNode
+```
+
+- **Green nodes** — newly allocated copies (`ptr_11`, `ptr_12`, `ptr_13`) plus the new leaf (`ptr_14 : 5`). Only 4 nodes out of 11 are new.
+- **Blue nodes** — the exact same node objects from Version 1, shared by pointer. No copying occurred.
+
+A caller holding `root_v1` sees the original tree, unchanged. A caller holding `root_v2` sees a tree that contains key 5. Both are valid simultaneously and neither is aware of the other.
+
+Persistence adds O(log N) allocations per write — the length of the copied path — but **does not change the time complexity of any operation**.
+
+Two consequences follow, and both are visible in the engine:
+
+- **Old nodes are garbage only when no version reaches them.** `ptr_1`, `ptr_2` and `ptr_4` are still part of Version 1. They can be freed when the last holder of `root_v1` lets go, and not before. A `db.snapshot()` that lives for an hour therefore keeps alive exactly the nodes of the version it pinned, and nothing retired since. §4.6 says how the engine decides that without reference counts.
+- **A batch of writes is one version.** Copying the path once per key and publishing once per key would be wasteful. The writer instead works in a **transient**: a private builder that path-copies a node the first time the batch touches it and then mutates its own copy in place, since nothing outside the batch can see it. When the batch is durable, the transient freezes into one new version and publishes it with one pointer store. The builder-then-freeze pattern is Clojure's [transients](https://clojure.org/reference/transients).
+
+### From a BST to a B+ tree
+
+A binary tree has one key per node, so a path from the root to a key is about log₂ N nodes long — 20 pointer hops for a million keys, each a probable cache miss, and 20 node copies per write. A **B+ tree** is the same idea with wide nodes. The **leaves** hold the entries, in key order, and each holds many of them — tens to hundreds. The **inner nodes** hold **separators**: for each pair of adjacent children, one key that sorts between the last key of the left child and the first key of the right. A search descends from the root, comparing the query against separators to pick a child, until it reaches a leaf, then searches within the leaf.
 
 ```
                  inner:   [ "cab" ]                 separators route the search
@@ -40,9 +113,99 @@ A **B+ tree** is a sorted array cut into pages. The **leaves** hold the entries,
    leaf:  [bat] [bay]            [cab] [cat] [cup]   entries, in key order
 ```
 
-Two properties matter here. First, the inner nodes are few: with 80 entries per leaf, about 1 in 60 nodes is an inner node, so whatever an inner node stores costs little per key. Second, the leaf is where the key bytes live, and a leaf's entries are a sorted array, which is the shape the rest of this section works on.
+Path copying applies exactly as in the BST, with two differences of degree. The path is short: a tree of a million keys with 80-entry leaves is three or four nodes deep, so a write copies three or four nodes, whatever N. And copying a leaf copies all of its entries, about a kilobyte, not one key — which is why the transient matters: a batch of a hundred writes that land in the same leaf copies it once.
 
-ByteCaskDB's B+ tree is **persistent** in the functional-programming sense: nothing is modified in place. A write copies the nodes on the path from the root to the changed leaf and shares everything else with the previous version, so a snapshot is a root pointer and an old version stays valid as long as someone holds it. The persistent radix tree document's Background section builds this up with diagrams ([`docs/persistent_radix_tree_design.md`](persistent_radix_tree_design.md), *Persistent BST: Path Copying*); the keyed B+ tree document covers how versions are reclaimed ([`docs/persistent_btree_design.md`](persistent_btree_design.md), *Versions, transients and reclamation*). The blind tree reuses both mechanisms unchanged, so this document does not repeat them.
+**Version 1** — `root_v1 → R1`:
+
+```mermaid
+graph TB
+    R1["R1 : sep ⟨cab⟩"] --> L1["L1 : bat · bay"]
+    R1 --> L2["L2 : cab · cat · cup"]
+
+    classDef sharedNode fill:#ADD8E6,stroke:#2166ac
+    class R1,L1,L2 sharedNode
+```
+
+**Version 2** — `root_v2 → R2`, after inserting `cow`. The search path is `R1 → L2`, so both are copied; `L1` is shared:
+
+```mermaid
+graph TB
+    R2["R2 : sep ⟨cab⟩"] --> L1["L1 : bat · bay"]
+    R2 --> L3["L3 : cab · cat · cow · cup"]
+
+    classDef newNode fill:#90EE90,stroke:#2d7a2d
+    classDef sharedNode fill:#ADD8E6,stroke:#2166ac
+    class R2,L3 newNode
+    class L1 sharedNode
+```
+
+Two properties of the B+ tree matter for what follows. The inner nodes are few: with 80 entries per leaf, about 1 in 60 nodes is an inner node, so whatever an inner node stores costs little per key. And the leaf is where the key bytes live. In the keyed B+ tree (`docs/persistent_btree_design.md`) each leaf entry holds its key's bytes beside the record location, which is what makes that tree cost 33–133 B/key. The rest of this Background is about what a leaf can hold *instead* of key bytes and still be searched. The inner nodes, the path copying, the transient and the reclamation of versions are the keyed B+ tree's and are reused unchanged.
+
+### Tries: Branching on Key Bytes
+
+A BST or a B+ tree branches based on a *comparison* between whole keys. The path length depends on the number of keys in the tree.
+
+A **Trie** (from the word *re**trie**val*) takes a fundamentally different approach: it branches on *individual characters (or bytes)* of the key, one per level. The depth of any key equals its length, regardless of how many keys are in the tree.
+
+- Each **edge** is labelled with a single character.
+- A key's value is stored at the node reached after consuming all its characters.
+- All keys sharing a common prefix share the same path down to the point of divergence — prefix sharing is structural, not incidental.
+
+Keys: `app`, `apple`, `apply`, `apt`
+
+```
+root
+ └─'a'─ node
+          └─'p'─ node
+                   ├─'p'─ [app ✓]
+                   │        └─'l'─ node
+                   │                ├─'e'─ [apple ✓]
+                   │                └─'y'─ [apply ✓]
+                   └─'t'─ [apt ✓]
+```
+
+Nodes marked ✓ carry a value. Unmarked nodes are routing-only intermediates.
+
+Path copying applies exactly as in the BST. The path to any key has at most k nodes — one per character — so inserting or updating a key of length k copies at most k nodes. The rest of the trie is shared. Unlike the BST, path length is O(k) — bounded by the key length, not the number of keys N.
+
+What a trie buys is that a search never compares whole keys: it looks at one byte of the query per level and follows the edge for that byte. That observation — *a search can be driven by the query's own bytes, one at a time* — is the one this design is built on. ByteCaskDB's first key directory was a persistent trie of this kind, with its chains of single-child nodes compressed (a radix tree, since retired in favour of the B+ trees); the blind-leaf tree takes the idea one step further.
+
+### Patricia Tries: Compressing the Trie
+
+A standard Trie can contain long chains of single-child nodes — one per character of a shared prefix — that carry no branching information. A key `"application"` with no sibling sharing its prefix creates a linear chain 11 nodes deep. These nodes are pure structural overhead.
+
+A **[Patricia Trie](https://dl.acm.org/doi/abs/10.1145/321479.321481)** (Morrison, 1968; also called a *Radix Tree*) eliminates this by collapsing chains of single-child nodes into a single edge whose label carries the entire compressed byte sequence. Branching still happens at the first character where two keys diverge; it just doesn't allocate a separate node for every character in between.
+
+**Standard Trie** — the `a → p` prefix creates a 2-node chain before the first branch:
+
+```
+root
+ └─'a'─ node
+          └─'p'─ node
+                   ├─'p'─ [app ✓]
+                   │        └─'l'─ node
+                   │                ├─'e'─ [apple ✓]
+                   │                └─'y'─ [apply ✓]
+                   └─'t'─ [apt ✓]
+```
+
+**Patricia Trie** — the single-child chain `a → p` is collapsed into the edge label `"ap"`:
+
+```
+root
+ └─"ap"─ node
+            ├─"p"─ [app ✓]
+            │        └─"l"─ node
+            │                ├─"e"─ [apple ✓]
+            │                └─"y"─ [apply ✓]
+            └─"t"─ [apt ✓]
+```
+
+Node count drops from 7 to 5. A properly compressed Patricia Trie has at most 2N − 1 nodes for N keys — no unbounded single-child chains exist.
+
+Now push the compression to its limit. The edge labels above still carry key bytes. But to *route* a search, a node needs only to know **which bit position** it branches on: a search tests that one bit of the query and goes left on 0 or right on 1. The bytes in between are not needed to find the way down, only to confirm, at the bottom, that the key reached is the key sought. Morrison's original PATRICIA stores exactly that — one bit index per branching node, and no label bytes — and this is where the design starts: a search structure that holds, per key, nothing but a bit position, and reads the key itself once, at the end.
+
+In a trie of *N* keys there are *N − 1* branching nodes, so there are *N − 1* bit positions to store. The next section shows where they come from.
 
 ### Crit bits: what a sorted array remembers about its keys
 
@@ -80,7 +243,7 @@ Now throw the keys away and keep only the four crit bits:
      4     (1,4)
 ```
 
-This is enough to decide, for *any* query key, where it belongs in the array — without ever looking at the keys. The reason is that the crit bits of a sorted array are exactly a **Patricia trie** (Morrison, 1968) read off from left to right. The boundary with the smallest crit bit splits the array in two: every key left of it has a 0 at that bit, every key right of it a 1. Within each half, the boundary with the smallest crit bit splits again, and so on down to single entries:
+This is enough to decide, for *any* query key, where it belongs in the array — without ever looking at the keys. The reason is that the crit bits of a sorted array *are* the Patricia trie of the previous section, read off from left to right. The boundary with the smallest crit bit splits the array in two: every key left of it has a 0 at that bit, every key right of it a 1. Within each half, the boundary with the smallest crit bit splits again, and so on down to single entries:
 
 ```
                       (0,8)                 ← smallest crit bit: 'b' vs 'c'
@@ -92,7 +255,7 @@ This is enough to decide, for *any* query key, where it belongs in the array —
                        cab     cat
 ```
 
-Each internal node of this trie is one boundary of the array, and each subtree is one contiguous range of it. Nothing had to be built: the trie is implied by the sorted order and the crit bits, and a search can walk it by scanning the array.
+Each internal node of this trie is one boundary of the array, and each subtree is one contiguous range of it. Nothing had to be built and no node is allocated: the trie is implied by the sorted order and the crit bits, and a search can walk it by scanning the array. The N − 1 bit positions a PATRICIA trie needs are the N − 1 boundaries of the sorted array.
 
 > Keys of different lengths, where one is a prefix of another (`"ab"`, `"abc"`),
 > need one more bit per byte so that the end of a key is itself a bit
@@ -135,26 +298,44 @@ The two searches answer different questions and coexist in the same leaf. The fi
 
 ### Blind leaves in a B+ tree
 
-A **blind leaf** is a B+ tree leaf that stores, per entry, the crit bit against the previous entry, the fingerprint and the record's location — and no key bytes. The inner nodes stay as they are: separators with their key bytes, so routing to the right leaf is exact and needs no I/O, at a cost of under 1 B/key because inner nodes are so few. The literature has gone further — the String B-tree (Ferragina and Grossi, 1999) puts a blind trie in every node, HOT (Binna et al., 2018) is a height-balanced tree of blind nodes — but blinding only the leaves keeps every inner-node algorithm, the path copying and the reclamation of the keyed B+ tree unchanged. Only the leaf layout and the steps that touch it are new.
+A **blind leaf** is a B+ tree leaf that stores, per entry, the crit bit against the previous entry, the fingerprint and the record's location — and no key bytes. The inner nodes stay as they are: separators with their key bytes, so routing to the right leaf is exact and needs no I/O, at a cost of under 1 B/key because inner nodes are so few. The literature has gone further — the String B-tree (Ferragina and Grossi, 1999) puts a blind trie in every node, HOT (Binna et al., 2018) is a height-balanced tree of blind nodes — but blinding only the leaves keeps every inner-node algorithm, the path copying, the transient and the reclamation of the persistent B+ tree unchanged. Only the leaf layout and the steps that touch it are new.
+
+Persistence is untouched by the change: a blind leaf is copied and shared by pointer exactly as a keyed leaf is, a version is still a root pointer, and a reader on an old version still sees its leaves as they were. What the record reads add is a dependency the keyed tree did not have: a version's leaves point into data files, so a version must keep those files open for as long as it lives. The engine's snapshot already did that for values; the blind tree makes it true for keys too.
 
 What it costs, against the keyed B+ tree, is reads: a `put` or a `del` reads one record to place or confirm the key, and `keys_from` reads one record per key it yields, where the keyed tree read none. What it saves is every key byte in the directory.
 
+### Big-O summary
+
+Let N = total number of keys, k = length of the key being operated on, L = entries per leaf (80 in the engine's build).
+
+| Structure | `get` | `set` | `erase` | New allocs / write |
+|---|---|---|---|---|
+| Mutable BST | O(log N) | O(log N) | O(log N) | O(1) |
+| **Persistent BST** | O(log N) | O(log N) | O(log N) | **O(log N)** |
+| Mutable Trie / Radix Tree | O(k) | O(k) | O(k) | O(k) |
+| **Persistent Radix Tree** | O(k) | O(k) | O(k) | **O(k)** |
+| Mutable B+ tree | O(log N) | O(log N) | O(log N) | O(1) |
+| **Persistent B+ tree** | O(log N) | O(log N) | O(log N) | **O(log_L N)** nodes, one a leaf |
+| **Persistent blind-leaf B+ tree** | O(log N) + O(L) | O(log N) + O(L) | O(log N) + O(L) | **O(log_L N)** nodes, one a leaf |
+
+**Making a structure persistent does not change the asymptotic time complexity of any operation.** Making the leaves blind adds a scan of the leaf, O(L), bounded by a constant the build chooses; §5 has what it costs in practice.
+
 ### Cost summary
 
-Let N = number of keys, L = entries per leaf (80 in the engine's build), and a *read* = one data record read from the buffer pool or page cache.
+What each operation reads from the data files, beyond what it reads on any tree. A *read* is one data record from the buffer pool or page cache.
 
 | Operation | Keyed B+ tree | Blind-leaf B+ tree |
 |---|---|---|
-| `get`, present | O(log N), 1 read (the value) | O(log N) + fingerprint scan, 1 read (key and value together) |
-| `get`, absent | O(log N), 0 reads | O(log N) + fingerprint scan, 0 reads (bar a collision) |
-| insert / overwrite / erase | O(log N), 0 reads | O(log N) + O(L) walk, **1 read** (+1 per leaf split) |
-| `lower_bound` | O(log N), 0 reads | O(log N) + O(L) walk, **1 read** |
+| `get`, present | 1 read (the value) | 1 read (key and value together) |
+| `get`, absent | 0 reads | 0 reads (bar a fingerprint collision) |
+| insert / overwrite / erase | 0 reads | **1 read** (+1 per leaf split) |
+| `lower_bound` | 0 reads | **1 read** |
 | iteration, keys only | 0 reads per key | **1 read per key** |
 | iteration, keys and values | 1 read per key | 1 read per key |
 | leaf entry | 32 B + key suffix | **12 B**, whatever the key length |
-| snapshot | O(1) | O(1) |
+| snapshot | O(1), a root pointer | O(1), a root pointer |
 
-The O(L) walk is over a 320-byte array with a 16-byte index on top, so in practice it is a few dozen entries; §5 has the numbers and §10 what they cost.
+The O(L) leaf scan is over a 320-byte array with a 16-byte index on top, so in practice it is a few dozen entries; §5 has the numbers and §10 what they cost.
 
 ---
 
@@ -432,7 +613,7 @@ What the engine's iterators cost differs by what they yield:
 
 ### 6.8. Recovery from sorted hint streams
 
-Recovery cannot merge per-worker trees the way the radix tree's fan-in does, because merging two blind trees means comparing keys neither holds. It merges the **hint files** instead (`DB::recovery_load_streams`), which are already sorted by key and then by sequence descending (`docs/file_format.md`):
+Recovery cannot merge per-worker trees the way the retired radix tree's fan-in did, because merging two blind trees means comparing keys neither holds. It merges the **hint files** instead (`DB::recovery_load_streams`), which are already sorted by key and then by sequence descending (`docs/file_format.md`):
 
 1. **Per file, in parallel.** Verify the CRC. Collect the range tombstones at the head of the file and the file's sequence bounds. Record a fence every 4 KiB: the key and byte offset of the first entry that starts in each step, placed only on the first entry of a key so that a seek never skips an older duplicate. A hint file has no sync marker, so this pass is also the only safe way to find entry boundaries.
 2. **Splitters.** Pool the fence keys and cut them into `R` ranges.
@@ -501,7 +682,7 @@ The engine wraps it as `BlindKeyDirIter<Keyed>`: a keyed iterator yields `(key, 
 
 ### 8.1. The key directory facade
 
-The engine talks to its key directory through a set of `kd_*` functions in `bytecaskdb/internals.cppm` — `kd_get`, `kd_contains`, `kd_put`, `kd_erase`, `kd_holds`, `kd_put_at`, `kd_erase_at`, `kd_lower_bound`, `kd_count`, `kd_read_value` and the iterator constructors — that speak the engine's terms: a lookup returns a `KeyDirEntry`, a put or erase returns what it displaced (a `KeyDirHit`: location and value size), iterators yield `(key, KeyDirEntry)` or a location. Each takes a `KeyDirCtx`: the version's file registry (a published state's, or the writer's transient one), the writer's pending records (§4.5) and whether to verify CRCs. `bytecaskdb/bytecask.cppm` calls nothing else, so the same engine builds on all three trees; the keyed B+ tree and the radix tree ignore the context.
+The engine talks to its key directory through a set of `kd_*` functions in `bytecaskdb/internals.cppm` — `kd_get`, `kd_contains`, `kd_put`, `kd_erase`, `kd_holds`, `kd_put_at`, `kd_erase_at`, `kd_lower_bound`, `kd_count`, `kd_read_value` and the iterator constructors — that speak the engine's terms: a lookup returns a `KeyDirEntry`, a put or erase returns what it displaced (a `KeyDirHit`: location and value size), iterators yield `(key, KeyDirEntry)` or a location. Each takes a `KeyDirCtx`: the version's file registry (a published state's, or the writer's transient one), the writer's pending records (§4.5) and whether to verify CRCs. `bytecaskdb/bytecask.cppm` calls nothing else, so the same engine builds on both trees; the keyed B+ tree ignores the context.
 
 On the blind tree the facade constructs a `KeyReader` per call, over a per-thread scratch buffer and a frame lease. A put is one `upsert`; the predicate always accepts, and the hit it displaced takes its value size from the record the reader just confirmed (`KeyReader::displaced` checks it was that record). `DB::get` takes the value from the same read that confirmed the key.
 
@@ -547,7 +728,7 @@ The fix, if a workload shows the need: resolve candidates *before* joining the c
 
 ### 8.6. Selection
 
-Build-time. The blind tree is the default; `BYTECASK_KEYDIR=btree` selects the keyed B+ tree and `BYTECASK_KEYDIR=radix` the radix tree, and CI runs the engine suite on all three. The on-disk format is the same for all of them: the blind build recovers from the same hint files, so a database opens under any tree. A runtime `Options::key_directory` is a follow-up that belongs to the pluggable-interface work, not to this tree.
+Build-time. The blind tree is the default; `BYTECASK_KEYDIR=btree` selects the keyed B+ tree, and CI runs the engine suite on both. The on-disk format is the same for both: the blind build recovers from the same hint files, so a database opens under either tree. A runtime `Options::key_directory` is a follow-up that belongs to the pluggable-interface work, not to this tree.
 
 ---
 
@@ -618,7 +799,7 @@ G1 was the reason to build this. How the design got from its first measurements 
 - **Fingerprint collisions**: leaves built from pairs of distinct keys with the same 24-bit fingerprint (found by brute force). Every key resolves to its own record, an absent key that shares a pair's fingerprint reads both and finds neither, erasing one of a pair leaves the other findable, and the operations by location pick the key's entry among colliding ones without a read.
 - **Crit-bit and index invariants**: debug `validate()` checks `crit(key[i-1], key[i])` and `top` against the stored values on every leaf of every test. Undoing the right-turn reset in the walk fails five of the seven original test cases; swapping the two children in the index walk fails six.
 - **Persistence**: the keyed B+ tree's snapshot, transient and `[accounting]` tests run on the blind tree; structural sharing is unchanged.
-- **Engine**: the full suite on the blind build, the `[model]` recovery tests included, with serial and parallel recovery checked for equal keys, values and `file_stats`. The suite also runs under `BYTECASK_KEYDIR=btree` and `=radix` in CI.
+- **Engine**: the full suite on the blind build, the `[model]` recovery tests included, with serial and parallel recovery checked for equal keys, values and `file_stats`. The suite also runs under `BYTECASK_KEYDIR=btree` in CI.
 - **Pending-batch resolution**: a batch whose later op's candidate is an earlier op's record in the same batch.
 - **Neighbour failure**: fault injection on the read of a candidate's key; the write fails, nothing is appended, the engine is not degraded.
 - **Vector kernels**: the SSE2 kernel is built with `BYTECASK_MARCH=x86-64-v2` and passes the tree tests. The NEON kernel is cross-compiled only; its first run on hardware is `btree_tests '[blind]'` on the blind build, then `engine_bench` `Get` against the keyed tree on that host.
@@ -1487,5 +1668,6 @@ Listed as a matter of good faith — this design builds on established ideas fro
 | HOT — a height-balanced tree of blind nodes with SIMD partial-key search; the 11–14 B/key this design is measured against (§9) and the search it was weighed against (Appendix A, *What is left*) | R. Binna, E. Zangerle, M. Pichl, G. Specht, V. Leis, *HOT: A Height Optimized Trie Index for Main-Memory Database Systems*, SIGMOD 2018 | https://doi.org/10.1145/3183713.3196896 |
 | Memory-efficient key-value store indexes with partial keys | H. Lim, B. Fan, D. G. Andersen, M. Kaminsky, *SILT: A Memory-Efficient, High-Performance Key-Value Store*, SOSP 2011 | https://doi.org/10.1145/2043556.2043558 |
 | Persistent data structures (path copying) — the versioning the tree inherits | Driscoll, Sarnak, Sleator & Tarjan, *JCSS* 38(1), 1989 | https://doi.org/10.1016/0022-0000(89)90034-2 |
+| Persistent data structures (accessible introduction) | Okasaki, *Purely Functional Data Structures*, Cambridge University Press, 1998 | [book](https://www.cambridge.org/9780521663502) · [OCaml source](https://github.com/mmottl/pure-fun) |
+| Transient/persistent duality — the writer's builder that freezes into a version | Rich Hickey, Clojure (transients added in Clojure 1.1, ~2009) | https://clojure.org/reference/transients |
 | The keyed B+ tree whose inner nodes, `BuildSession`, `VersionChain` and bulk loader this tree builds on | `docs/persistent_btree_design.md` | [persistent_btree_design.md](persistent_btree_design.md) |
-| The radix tree: the Background on persistence and path copying, and the alternate key directory | `docs/persistent_radix_tree_design.md` | [persistent_radix_tree_design.md](persistent_radix_tree_design.md) |
