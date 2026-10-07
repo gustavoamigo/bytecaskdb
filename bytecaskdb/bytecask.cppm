@@ -143,6 +143,23 @@ export inline std::uint64_t test_max_batch_bytes = kMaxBatchBytes;
 #endif
 }
 
+// Size a commit group may take the active file to: one past the largest
+// packed offset, so every entry the group writes starts inside it.
+#ifdef BYTECASK_TESTING
+// Lowered by a test, never raised, so a group splits without writing 4 GiB.
+// Not synchronised: set it while no write is running.
+export inline std::uint64_t test_max_group_file_bytes =
+    std::uint64_t{KeyDirEntry::kMaxFileOffset} + 1;
+#endif
+
+[[nodiscard]] inline auto max_group_file_bytes() noexcept -> std::uint64_t {
+#ifdef BYTECASK_TESTING
+  return test_max_group_file_bytes;
+#else
+  return std::uint64_t{KeyDirEntry::kMaxFileOffset} + 1;
+#endif
+}
+
 // Sensible defaults — keys live in RAM (the key directory), values go to disk.
 export inline constexpr std::uint32_t kDefaultMaxKeyBytes = 4096;
 export inline constexpr std::uint32_t kDefaultMaxValueBytes =
@@ -3220,8 +3237,8 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
   std::size_t taken = 0;
   for (; taken < batch.size(); ++taken) {
     auto &slot = static_cast<EngineSlot &>(*batch[taken]);
-    if (taken > 0 && running_offset + slot.plan.write_bytes() >
-                         KeyDirEntry::kMaxFileOffset + 1) {
+    if (taken > 0 &&
+        running_offset + slot.plan.write_bytes() > max_group_file_bytes()) {
       break;
     }
     slot.sync = slot.opts.sync;

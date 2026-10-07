@@ -11064,6 +11064,57 @@ TEST_CASE("Limits: durable_sequence waits with a timeout the clock cannot "
   }
 }
 
+TEST_CASE("Limits: a commit group ends before a slot that would carry the "
+          "file past the group limit", "[bytecask][limits]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  const std::string value(179, 'v');
+  REQUIRE(bytecask::entry_size(2, value.size()) == 200);
+  // Each slot alone fills a file past max_file_bytes, and the group limit,
+  // lowered from 2^32 to keep the test small, admits one slot per group.
+  auto db = bytecask::DB::open(dir, {.max_file_bytes = 150});
+  struct RestoreLimit {
+    ~RestoreLimit() {
+      bytecask::test_max_group_file_bytes =
+          std::uint64_t{bytecask::KeyDirEntry::kMaxFileOffset} + 1;
+    }
+  } restore;
+  bytecask::test_max_group_file_bytes = 150;
+
+  // Both writers' slots reach the executor as one batch: the leader waits in
+  // on_batch_start_ until the second is queued.
+  std::mutex mu;
+  std::condition_variable cv;
+  bool leader_ready = false;
+  db.test_write_group().on_batch_start_ = [&] {
+    {
+      std::lock_guard<std::mutex> lk{mu};
+      leader_ready = true;
+    }
+    cv.notify_all();
+    db.test_write_group().wait_for_queue_size(2);
+  };
+  std::thread leader{[&] { db.put({}, to_bytes("g0"), to_bytes(value)); }};
+  std::thread follower{[&] {
+    std::unique_lock<std::mutex> lk{mu};
+    cv.wait(lk, [&] { return leader_ready; });
+    lk.unlock();
+    db.put({}, to_bytes("g1"), to_bytes(value));
+  }};
+  leader.join();
+  follower.join();
+  db.test_write_group().on_batch_start_ = nullptr;
+
+  CHECK(get_str(db, to_bytes("g0")) == value);
+  CHECK(get_str(db, to_bytes("g1")) == value);
+  // Two groups, each rotating the file it filled: two sealed files and the
+  // active one. One group would have put both slots in one file.
+  int data_files = 0;
+  for (const auto &e : std::filesystem::directory_iterator{dir})
+    if (e.path().extension() == ".data") ++data_files;
+  CHECK(data_files == 3);
+}
+
 TEST_CASE("Limits: batches at the production writev chunk boundary round-trip",
           "[bytecask][limits]") {
   TempDir td;
