@@ -413,8 +413,9 @@ TEST_CASE("state consistency rejects an entry outside its file's extent",
   auto bad = good;
   {
     auto t = bad.file_stats.transient();
-    t.update(bad.active_file_id,
-             [](bytecask::FileStats &fs) { fs.total_bytes = 1; });
+    auto fs = *t.get(bad.active_file_id);
+    fs.total_bytes = 1;
+    t.set(bad.active_file_id, fs);
     bad.file_stats = std::move(t).persistent();
   }
   bool threw = false;
@@ -13550,8 +13551,9 @@ TEST_CASE("pipeline: publishing a key outside its file's stats degrades the "
     reason = "has no file_stats";
   }
   SECTION("a key past the file's committed extent") {
-    stats.update(bad->active_file_id,
-                 [](bytecask::FileStats &fs) { fs.total_bytes = 0; });
+    auto fs = *stats.get(bad->active_file_id);
+    fs.total_bytes = 0;
+    stats.set(bad->active_file_id, fs);
     reason = "committed extent";
   }
   bad->file_stats = std::move(stats).persistent();

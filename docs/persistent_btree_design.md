@@ -110,7 +110,7 @@ it name-for-name so the switch is a type alias:
 | `TransientEngineState::apply_*` | transient `get`, `set`, `erase`, `upsert`, `lower_bound` (range delete and range guards collect keys first, then erase: `bytecask.cppm:1727-1743`) |
 | `iter_from`, `keys_from`, `riter_from`, `rkeys_from` | `begin`, `lower_bound`, `upper_bound`, `rbegin().base()`, `value_begin`, `value_lower_bound`, `value_rbegin`, `value_rlower_bound`; iterators yield `(span<const byte> key, const V&)` with the span valid until the next advance; `operator--` on the forward iterator |
 | Recovery | `merge(a, b, resolve)`, persistent `erase` for tombstones, `size` |
-| `PersistentU32Map<V>` | `get_ptr`, `set`, `erase`, `begin`, with `V = FileStats` and `V = std::shared_ptr<DataFile>` |
+| `PersistentU32Map<V>` (since removed: *Next steps*, item 4) | `get_ptr`, `set`, `erase`, `begin`, with `V = FileStats` and `V = std::shared_ptr<DataFile>` |
 | Everything | `transient()`, `persistent() &&`, copy of a handle is an O(1) snapshot |
 
 Two constraints follow from the value types. `KeyDirEntry` is 16 bytes and
@@ -609,7 +609,7 @@ keys and 15% at 10M. Structured keys stay level or gain. ByteCaskDB's lead
 on random keys over engines that sort or hash on disk is far larger than
 that, while the serial section bounds every commit, so the write path won.
 One node size also leaves the pool a single list. The keyed tree
-(`BYTECASK_KEYDIR=btree`, and `file_stats`) follows with 1 KiB leaves, about
+(`BYTECASK_KEYDIR=btree`) follows with 1 KiB leaves, about
 15 keys of 36 bytes each; it was not measured separately.
 
 ## Performance expectations
@@ -1292,7 +1292,10 @@ needs a key-directory column before it can hold both.
    `BulkLoader::append` copies the key again into its arena; handing the
    loader the iterator's buffer directly would avoid one of those copies.
 3. Re-run recovery on a 16-thread host.
-4. `u32_map` on the B+ tree. Done for `file_stats` only. `files` is read
+4. `u32_map` on the B+ tree. Done for `file_stats` only, and since undone:
+   `file_stats` is a patch map over the paged table (#367), because a commit
+   updating the keyed tree once per file it touched cost 5 µs of a 45 µs
+   serial section, and the keyed `PersistentU32Map` was removed. `files` is read
    on every record access, and the B+ tree's general search costs more per
    lookup than the radix tree's (8.9 against 6.8 ns at one entry, 45 against
    23 ns at 1024): on the keyed tree `Range50` lost 8%. `files` is a

@@ -749,7 +749,7 @@ private:
   friend struct EngineState;
   TransientEngineState(KeyDirTransient key_dir,
                        TransientU32Table<std::shared_ptr<DataFile>> files,
-                       TransientU32Map<FileStats> file_stats,
+                       FileStatsTransient file_stats,
                        std::uint32_t active_file_id,
                        std::uint32_t next_file_id,
                        std::uint64_t next_seq,
@@ -764,7 +764,7 @@ private:
   // Records this transient placed in the active file before they are
   // written, for a key directory that reads keys back (kKeyDirReadsKeys).
   PendingRecords pending_;
-  TransientU32Map<FileStats> file_stats_;
+  FileStatsTransient file_stats_;
   std::uint32_t active_file_id_;
   std::uint32_t next_file_id_;
   std::uint64_t next_seq_;
@@ -1145,7 +1145,7 @@ public:
   [[nodiscard]] auto file_stats() const -> std::map<std::uint32_t, FileStats> {
     auto s = load_state();
     std::map<std::uint32_t, FileStats> result;
-    for (const auto [id, fs] : s->file_stats) result.emplace(id, fs);
+    for (const auto [id, fs] : s->file_stats.all()) result.emplace(id, fs);
     return result;
   }
 
@@ -2063,7 +2063,7 @@ auto make_data_file_stem() -> std::string {
 TransientEngineState::TransientEngineState(
     KeyDirTransient key_dir,
     TransientU32Table<std::shared_ptr<DataFile>> files,
-    TransientU32Map<FileStats> file_stats,
+    FileStatsTransient file_stats,
     std::uint32_t active_file_id, std::uint32_t next_file_id,
     std::uint64_t next_seq, std::uint64_t durable_seq,
     std::uint64_t sync_requested_seq,
@@ -2273,13 +2273,12 @@ void TransientEngineState::apply_writes(
   const auto wc = plan.write_count();
   const bool multi = wc > 1;
   const auto batch_start_seq = next_seq_;
+  constexpr auto kMarker = marker_size(EntryType::BulkBegin);
 
   // Account for BulkBegin marker.
   if (multi) {
-    file_stats_.update(active_file_id_, [](FileStats &fs) {
-      fs.total_bytes += kHeaderSize + kCrcSize;
-      fs.marker_bytes += kHeaderSize + kCrcSize;
-    });
+    file_stats_.patch(active_file_id_,
+                      {.total_added = kMarker, .marker_added = kMarker});
     ++next_seq_;
     ++io_idx;
   }
@@ -2305,15 +2304,10 @@ void TransientEngineState::apply_writes(
             if (existing) {
               const auto dec =
                   entry_size(key_span.size(), existing->value_size());
-              const auto ef = existing->file_id();
-              file_stats_.update(
-                  ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
+              file_stats_.patch(existing->file_id(), {.live_removed = dec});
             }
             const auto sz = entry_size(key_span.size(), val_size);
-            file_stats_.update(active_file_id_, [sz](FileStats &fs) {
-              fs.live_bytes += sz;
-              fs.total_bytes += sz;
-            });
+            file_stats_.patch(active_file_id_, {.live_added = sz, .total_added = sz});
             ++next_seq_;
             ++io_idx;
           } else if constexpr (std::is_same_v<T, WritePlan::PointDel>) {
@@ -2326,15 +2320,10 @@ void TransientEngineState::apply_writes(
             if (existing) {
               const auto dec =
                   entry_size(key_span.size(), existing->value_size());
-              const auto ef = existing->file_id();
-              file_stats_.update(
-                  ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
+              file_stats_.patch(existing->file_id(), {.live_removed = dec});
             }
             const auto del_sz = entry_size(key_span.size(), 0);
-            file_stats_.update(active_file_id_, [del_sz](FileStats &fs) {
-              fs.total_bytes += del_sz;
-              fs.tombstone_bytes += del_sz;
-            });
+            file_stats_.patch(active_file_id_, {.total_added = del_sz, .tombstone_added = del_sz});
             ++next_seq_;
             ++io_idx;
           } else {
@@ -2353,9 +2342,7 @@ void TransientEngineState::apply_writes(
               if (Key{key_span} >= Key{to_span}) break;
               const auto dec =
                   entry_size(key_span.size(), entry.value_size());
-              const auto ef = entry.file_id();
-              file_stats_.update(
-                  ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
+              file_stats_.patch(entry.file_id(), {.live_removed = dec});
               to_erase.emplace_back(key_span);
             }
             for (const auto &k : to_erase) {
@@ -2363,10 +2350,7 @@ void TransientEngineState::apply_writes(
             }
 
             const auto rd_sz = entry_size(op.from.size(), op.to.size());
-            file_stats_.update(active_file_id_, [rd_sz](FileStats &fs) {
-              fs.total_bytes += rd_sz;
-              fs.tombstone_bytes += rd_sz;
-            });
+            file_stats_.patch(active_file_id_, {.total_added = rd_sz, .tombstone_added = rd_sz});
             ++next_seq_;
             ++io_idx;
           }
@@ -2376,24 +2360,13 @@ void TransientEngineState::apply_writes(
 
   // Account for BulkEnd marker.
   if (multi) {
-    file_stats_.update(active_file_id_, [](FileStats &fs) {
-      fs.total_bytes += kHeaderSize + kCrcSize;
-      fs.marker_bytes += kHeaderSize + kCrcSize;
-    });
+    file_stats_.patch(active_file_id_,
+                      {.total_added = kMarker, .marker_added = kMarker});
     ++next_seq_;
     ++io_idx;
   }
 
-  // Track per-file sequence bounds. A file's sequences ascend, so its
-  // minimum is its first batch's.
-  const auto batch_end_seq = next_seq_ - 1;
-  file_stats_.update(
-      active_file_id_,
-      [batch_start_seq, batch_end_seq](FileStats &fs) {
-        if (fs.min_sequence == 0) fs.min_sequence = batch_start_seq;
-        if (batch_end_seq > fs.max_sequence)
-          fs.max_sequence = batch_end_seq;
-      });
+  file_stats_.patch(active_file_id_, {.min_sequence = batch_start_seq, .max_sequence = next_seq_ - 1});
 }
 
 void TransientEngineState::apply_ingest(
@@ -2412,12 +2385,11 @@ void TransientEngineState::apply_ingest(
 
     switch (e.entry_type) {
     case EntryType::BulkBegin:
-    case EntryType::BulkEnd:
-      file_stats_.update(active_file_id_, [](FileStats &fs) {
-        fs.total_bytes += kHeaderSize + kCrcSize;
-        fs.marker_bytes += kHeaderSize + kCrcSize;
-      });
+    case EntryType::BulkEnd: {
+      const auto m = marker_size(e.entry_type);
+      file_stats_.patch(active_file_id_, {.total_added = m, .marker_added = m});
       break;
+    }
 
     case EntryType::Put: {
       const auto val_size = narrow<std::uint32_t>(e.value.size());
@@ -2429,15 +2401,10 @@ void TransientEngineState::apply_ingest(
       if (existing) {
         const auto dec =
             entry_size(e.key.size(), existing->value_size());
-        const auto ef = existing->file_id();
-        file_stats_.update(
-            ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
+        file_stats_.patch(existing->file_id(), {.live_removed = dec});
       }
       const auto sz = entry_size(e.key.size(), val_size);
-      file_stats_.update(active_file_id_, [sz](FileStats &fs) {
-        fs.live_bytes += sz;
-        fs.total_bytes += sz;
-      });
+      file_stats_.patch(active_file_id_, {.live_added = sz, .total_added = sz});
       break;
     }
 
@@ -2446,15 +2413,10 @@ void TransientEngineState::apply_ingest(
       if (existing) {
         const auto dec =
             entry_size(e.key.size(), existing->value_size());
-        const auto ef = existing->file_id();
-        file_stats_.update(
-            ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
+        file_stats_.patch(existing->file_id(), {.live_removed = dec});
       }
       const auto del_sz = entry_size(e.key.size(), 0);
-      file_stats_.update(active_file_id_, [del_sz](FileStats &fs) {
-        fs.total_bytes += del_sz;
-        fs.tombstone_bytes += del_sz;
-      });
+      file_stats_.patch(active_file_id_, {.total_added = del_sz, .tombstone_added = del_sz});
       break;
     }
 
@@ -2467,19 +2429,14 @@ void TransientEngineState::apply_ingest(
         if (Key{key_span} >= Key{e.value}) break;
         const auto dec =
             entry_size(key_span.size(), entry.value_size());
-        const auto ef = entry.file_id();
-        file_stats_.update(
-            ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
+        file_stats_.patch(entry.file_id(), {.live_removed = dec});
         to_erase.emplace_back(key_span);
       }
       for (const auto &k : to_erase) {
         (void)kd_erase(key_dir_, std::span<const std::byte>{k}, kd_ctx());
       }
       const auto rd_sz = entry_size(e.key.size(), e.value.size());
-      file_stats_.update(active_file_id_, [rd_sz](FileStats &fs) {
-        fs.total_bytes += rd_sz;
-        fs.tombstone_bytes += rd_sz;
-      });
+      file_stats_.patch(active_file_id_, {.total_added = rd_sz, .tombstone_added = rd_sz});
       break;
     }
     }
@@ -2488,16 +2445,7 @@ void TransientEngineState::apply_ingest(
   // Advance next_seq past the highest ingested sequence.
   if (max_seq >= next_seq_) next_seq_ = max_seq + 1;
 
-  // Track per-file sequence bounds. A file's sequences ascend, so its
-  // minimum is its first batch's.
-  const auto batch_end_seq = max_seq;
-  file_stats_.update(
-      active_file_id_,
-      [batch_start_seq, batch_end_seq](FileStats &fs) {
-        if (fs.min_sequence == 0) fs.min_sequence = batch_start_seq;
-        if (batch_end_seq > fs.max_sequence)
-          fs.max_sequence = batch_end_seq;
-      });
+  file_stats_.patch(active_file_id_, {.min_sequence = batch_start_seq, .max_sequence = max_seq});
 }
 
 void TransientEngineState::apply_rotate_file(
@@ -2562,16 +2510,6 @@ void TransientEngineState::apply_vacuum(
 void TransientEngineState::apply_resume(
     std::uint32_t file_id, const std::vector<ResumeEntry> &entries,
     std::uint64_t valid_offset) {
-  // Reset file stats for the truncated file — apply_resume owns the
-  // full stats lifecycle so callers don't need mutable file_stats access.
-  file_stats_.update(file_id, [valid_offset](FileStats &fs) {
-    fs.total_bytes = valid_offset;
-    fs.min_sequence = 0;
-    fs.max_sequence = 0;
-    fs.tombstone_bytes = 0;
-    fs.marker_bytes = 0;
-  });
-
   std::uint64_t max_seq = 0;
   std::uint64_t seq_min = 0;
   std::uint64_t seq_max = 0;
@@ -2593,13 +2531,10 @@ void TransientEngineState::apply_resume(
       if (!existing || existing->sequence() < e.sequence) {
         if (existing) {
           const auto dec = entry_size(key_span.size(), existing->value_size());
-          const auto ef = existing->file_id();
-          file_stats_.update(ef,
-                             [dec](FileStats &fs) { fs.live_bytes -= dec; });
+          file_stats_.patch(existing->file_id(), {.live_removed = dec});
         }
         const auto inc = entry_size(key_span.size(), e.value_size);
-        file_stats_.update(file_id,
-                           [inc](FileStats &fs) { fs.live_bytes += inc; });
+        file_stats_.patch(file_id, {.live_added = inc});
         (void)kd_put(key_dir_, key_span,
                      KeyDirEntry::make(e.sequence, e.file_offset, file_id,
                                        e.value_size),
@@ -2611,8 +2546,7 @@ void TransientEngineState::apply_resume(
       const auto existing = kd_get(key_dir_, key_span, kd_ctx());
       if (existing && existing->sequence() < e.sequence) {
         const auto dec = entry_size(key_span.size(), existing->value_size());
-        const auto ef = existing->file_id();
-        file_stats_.update(ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
+        file_stats_.patch(existing->file_id(), {.live_removed = dec});
         (void)kd_erase(key_dir_, key_span, kd_ctx());
       }
       break;
@@ -2631,8 +2565,7 @@ void TransientEngineState::apply_resume(
         if (Key{k} >= end) break;
         if (entry.sequence() >= e.sequence) continue;
         const auto dec = entry_size(k.size(), entry.value_size());
-        const auto ef = entry.file_id();
-        file_stats_.update(ef, [dec](FileStats &fs) { fs.live_bytes -= dec; });
+        file_stats_.patch(entry.file_id(), {.live_removed = dec});
         to_erase.emplace_back(k);
       }
       for (const auto &k : to_erase)
@@ -2655,16 +2588,17 @@ void TransientEngineState::apply_resume(
     next_seq_ = max_seq + 1;
   }
 
-  if (seq_max > 0) {
-    file_stats_.update(file_id, [seq_min, seq_max](FileStats &fs) {
-      fs.min_sequence = seq_min;
-      fs.max_sequence = seq_max;
-    });
+  // apply_resume owns the truncated file's stats, so callers need no
+  // mutable file_stats access. Its live bytes moved entry by entry above;
+  // its extent, bounds and tombstones are rebuilt from the entries.
+  if (auto fs = file_stats_.get(file_id)) {
+    fs->total_bytes = valid_offset;
+    fs->min_sequence = seq_min;
+    fs->max_sequence = seq_max;
+    fs->tombstone_bytes = tomb;
+    fs->marker_bytes = mark;
+    file_stats_.set(file_id, *fs);
   }
-  file_stats_.update(file_id, [tomb, mark](FileStats &fs) {
-    fs.tombstone_bytes = tomb;
-    fs.marker_bytes = mark;
-  });
 }
 
 auto TransientEngineState::active_file() -> WritableDataFile & {
@@ -3717,7 +3651,7 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
   worker_.drain();
 
   // Snapshot file_stats and active-file info.
-  PersistentU32Map<FileStats> stats_snap;
+  FileStatsMap stats_snap;
   std::uint32_t active_id{};
   {
     auto s = load_state_for_write();
@@ -3730,7 +3664,7 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
   // for its dead Puts, so a file holding nothing else has nothing to
   // reclaim. Nor has a file whose every entry is above retain_after.
   std::vector<std::pair<double, std::uint32_t>> candidates;
-  for (const auto [fid, fs] : stats_snap) {
+  for (const auto [fid, fs] : stats_snap.all()) {
     if (fid == active_id) continue;
     if (fs.total_bytes == 0) continue;
     if (fs.min_sequence > opts.retain_after) continue;
@@ -3742,7 +3676,7 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
   std::ranges::sort(candidates, std::greater<>{});
 
   for (const auto &[frag, fid] : candidates) {
-    const auto &target = *stats_snap.get(fid);
+    const auto target = *stats_snap.get(fid);
     // Fast path: nothing in the file needs keeping — skip the scan and drop
     // it. A tombstone may need keeping even with no live key left: dropping
     // it could let recovery resurrect a Put it shadows in an older file, and
@@ -4843,8 +4777,8 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
                                         new_state->kd_ctx(/*verify=*/false));
          it != std::default_sentinel; ++it) {
       const auto loc = *it;
-      const auto *fs = new_state->file_stats.get(loc.file_id());
-      if (fs == nullptr) {
+      const auto fs = new_state->file_stats.get(loc.file_id());
+      if (!fs) {
         deem_as_degraded(std::format(
             "invariant violation: key in file_id {}, which has no file_stats",
             loc.file_id()));
@@ -4869,8 +4803,8 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
       if (entry.sequence() > max_seq) max_seq = entry.sequence();
       const auto entry_end = entry.file_offset() +
                              entry_size(key_span.size(), entry.value_size());
-      const auto *fs = new_state->file_stats.get(entry.file_id());
-      if (fs == nullptr) {
+      const auto fs = new_state->file_stats.get(entry.file_id());
+      if (!fs) {
         deem_as_degraded(std::format(
             "invariant violation: key in file_id {}, which has no file_stats",
             entry.file_id()));
@@ -4980,7 +4914,7 @@ void DB::validate_state_consistency(const EngineState &s) const {
         s.next_seq, max_seq)};
   }
 
-  for (const auto [file_id, fs] : s.file_stats) {
+  for (const auto [file_id, fs] : s.file_stats.all()) {
     auto it = computed_live.find(file_id);
     auto expected_live = (it != computed_live.end()) ? it->second : 0ULL;
     if (fs.live_bytes != expected_live) {
@@ -4992,7 +4926,7 @@ void DB::validate_state_consistency(const EngineState &s) const {
 #endif
 
   // 6. min_sequence / max_sequence coherence.
-  for (const auto [file_id, fs] : s.file_stats) {
+  for (const auto [file_id, fs] : s.file_stats.all()) {
     if ((fs.min_sequence == 0) != (fs.max_sequence == 0)) {
       throw std::runtime_error{std::format(
           "state consistency: file_id {} has min_sequence={} max_sequence={} "
@@ -5050,7 +4984,7 @@ auto find_sequence_overlap(const EngineState &s)
     std::uint32_t file_id;
   };
   std::vector<Range> ranges;
-  for (const auto [fid, fs] : s.file_stats) {
+  for (const auto [fid, fs] : s.file_stats.all()) {
     if (fs.min_sequence > 0) {
       ranges.push_back({fs.min_sequence, fs.max_sequence, fid});
     }
@@ -5644,7 +5578,7 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
     }
   }
 
-  auto fstats_t = PersistentU32Map<FileStats>{}.transient();
+  auto fstats_t = PersistentU32Table<FileStats>{}.transient();
   for (const auto &[id, fs] : fstats_scratch) fstats_t.set(id, fs);
 
   return {std::move(out).finish(), std::move(tombstones),
@@ -5924,7 +5858,7 @@ auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
   auto key_dir = KeyDirBulkLoader::concat(std::move(runs));
   plog.mark("concat");
 
-  auto fstats_t = PersistentU32Map<FileStats>{}.transient();
+  auto fstats_t = PersistentU32Table<FileStats>{}.transient();
   for (auto &[fid, fs] : fstats) {
     const auto it = live_accum.find(fid);
     fs.live_bytes = it != live_accum.end() ? it->second : 0ULL;
@@ -5940,7 +5874,7 @@ auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
 
   s.key_dir = key_dir_from_recovered(std::move(key_dir));
   s.next_seq = max_seq + 1;
-  s.file_stats = std::move(fstats_t).persistent();
+  s.file_stats = FileStatsMap{std::move(fstats_t).persistent()};
   return s;
 }
 
@@ -6294,7 +6228,7 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
       std::ranges::any_of(runs, [](const FileRun &run) { return !run.hint; });
   needed_tombstones_ =
       recovery_needed_tombstones(std::move(needed), {}, max_seq, skipped_files);
-  auto fstats_t = PersistentU32Map<FileStats>{}.transient();
+  auto fstats_t = PersistentU32Table<FileStats>{}.transient();
   for (std::size_t f = 0; f < files.size(); ++f) {
     auto fs = runs[f].stats;
     const auto it = live_accum.find(files[f].file_id);
@@ -6304,7 +6238,7 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
   s.key_dir = BlindBulkLoader<kBlindLeafBytes>::concat(std::move(leaf_runs));
   plog.mark("concat");
   s.next_seq = max_seq + 1;
-  s.file_stats = std::move(fstats_t).persistent();
+  s.file_stats = FileStatsMap{std::move(fstats_t).persistent()};
   return s;
 }
 #endif  // BYTECASK_KEYDIR_BLIND
@@ -6331,7 +6265,7 @@ public:
       durable_sequence_(durable_sequence) {
 
     // Build sorted file list — O(num_files), typically tiny.
-    for (const auto [file_id, stats] : state_->file_stats) {
+    for (const auto [file_id, stats] : state_->file_stats.all()) {
       if (stats.max_sequence > from_sequence && stats.min_sequence <= durable_sequence) {
         file_queue_.emplace_back(stats.min_sequence, file_id);
       }
