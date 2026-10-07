@@ -255,7 +255,6 @@ target("bytecask_tests")
     set_default(false)
     -- For VS Code / clangd support, run: scripts/gen_compile_commands.sh
     add_files("tests/*.cpp", "tests/proof/generated/*.cpp", "bytecaskdb/*.cppm")
-    remove_files("tests/bytecask_c_test.cpp")
     add_includedirs("bytecaskdb", "tests")
     add_packages("crc32c", "zstd")
     if (get_config("sanitizer") or ""):find("memory", 1, true) then
@@ -450,16 +449,16 @@ target("isolation_history")
 -- Compiles all C++23 module sources and exposes them via libbytecask.a.
 -- Note: C++23 module BMIs are not portable across translation units that
 -- import them without the matching toolchain; the MariaDB plugin instead
--- uses the stable header-based C API in include/bytecask_c.h.
+-- uses the PIMPL header include/bytecask.hpp.
 --
--- bytecaskdb/bytecask_c.cpp is compiled here because it imports
+-- bytecaskdb/bytecask_hpp.cpp is compiled here because it imports
 -- the C++23 bytecask module and must be built with the same toolchain that
 -- produced the BMIs.
 target("bytecask")
     set_kind("static")
     set_default(false)
     add_cxxflags("-fPIC", {force = true})  -- required when linking into a shared object (e.g. MariaDB plugin)
-    add_files("bytecaskdb/*.cppm", "bytecaskdb/bytecask_c.cpp", "bytecaskdb/bytecask_hpp.cpp")
+    add_files("bytecaskdb/*.cppm", "bytecaskdb/bytecask_hpp.cpp")
     add_packages("crc32c", "zstd")
     on_config(function(t)
         add_native_syslinks(t)
@@ -474,7 +473,7 @@ target("bytecask_testing")
     set_kind("static")
     set_default(false)
     add_cxxflags("-fPIC", {force = true})
-    add_files("bytecaskdb/*.cppm", "bytecaskdb/bytecask_c.cpp", "bytecaskdb/bytecask_hpp.cpp")
+    add_files("bytecaskdb/*.cppm", "bytecaskdb/bytecask_hpp.cpp")
     add_packages("crc32c", "zstd")
     add_defines("BYTECASK_TESTING")
     on_config(function(t)
@@ -482,42 +481,8 @@ target("bytecask_testing")
         apply_sanitizer(t)
     end)
 
--- C API behavioral tests (Catch2, driven from C++) — exercises status codes,
--- nullable write-options/result out-params, and CommitResult/durable_sequence
--- semantics through the stable C ABI (include/bytecask_c.h). Links against
--- the prebuilt "bytecask" static library rather than recompiling the module.
-target("bytecask_c_tests")
-    set_kind("binary")
-    set_default(false)
-    add_deps("bytecask")
-    add_files("tests/bytecask_c_test.cpp")
-    add_includedirs("include")
-    add_packages("catch2", "crc32c", "zstd")
-    on_config(function(t)
-        add_native_syslinks(t)
-        apply_sanitizer(t)
-        add_release_opts(t)
-    end)
-
--- Plain C11 compilation smoke test for include/bytecask_c.h — compiled with
--- the C frontend (not C++) so header syntax/struct-layout mistakes that only
--- a C compiler would reject are caught. Links against libbytecask.a, which
--- requires the C++ standard library at link time even though this TU is C.
-target("bytecask_c_smoke")
-    set_kind("binary")
-    set_default(false)
-    set_languages("c11")
-    add_deps("bytecask")
-    add_files("tests/bytecask_c_smoke.c")
-    add_includedirs("include")
-    add_packages("crc32c", "zstd")
-    add_syslinks("stdc++")
-    on_config(function(t)
-        add_native_syslinks(t)
-    end)
-
 -- Python bindings via nanobind.
--- Wraps the C++23 module interface directly (not the C API).
+-- Wraps the C++23 module interface directly.
 -- Prerequisites: pip install nanobind
 -- Build: xmake build bytecaskdb_python
 -- Usage: PYTHONPATH=bytecaskdb-python python3 your_script.py
@@ -919,7 +884,6 @@ target("wasm_tests")
     set_wasm_policies()
     add_wasm_sources()
     add_files("tests/*.cpp", "tests/proof/generated/*.cpp")
-    remove_files("tests/bytecask_c_test.cpp")
     add_files("bytecaskdb-node/wasm/catch2_stringmakers.cpp")
     add_includedirs("bytecaskdb", "tests")
     add_defines("BYTECASK_TESTING")
