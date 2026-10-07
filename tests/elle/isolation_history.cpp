@@ -753,7 +753,9 @@ auto bootstrap(Node &source, Node &n, std::mutex &vacuum_gate,
         fs::create_directories(n.dir);
         for (const auto &fi : m.files) {
           fs::copy_file(fi.data_path, n.dir / fi.data_path.filename());
-          fs::copy_file(fi.hint_path, n.dir / fi.hint_path.filename());
+          // A hint the leader failed to write is rebuilt by the open.
+          if (fs::exists(fi.hint_path))
+            fs::copy_file(fi.hint_path, n.dir / fi.hint_path.filename());
         }
         vl.unlock();
         h = std::make_unique<DbHolder>(n.dir, n.opts);

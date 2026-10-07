@@ -8,12 +8,11 @@ remains selectable with `BYTECASK_KEYDIR=btree`. See
 [Implementation notes](#implementation-notes-first-version) for what was
 built, what differs from the design below, and what was measured.
 Date: 2026-09-17 (design), 2026-09-17 (first version), 2026-09-18 (made default)
-The radix tree is not removed: it offers the same surface, builds from the
-same engine under `BYTECASK_KEYDIR=radix`, and CI runs the full engine suite
-on all three trees. `docs/persistent_radix_tree_design.md` and
-`docs/radix_tree_epoch_reclamation_design.md` (PR #86) therefore still
-describe live code — except for the reclaimer, which is now one
-implementation shared by both trees (`bytecaskdb/version_chain.cppm`).
+The radix tree stayed selectable with `BYTECASK_KEYDIR=radix` for a while
+and has since been removed; `docs/persistent_radix_tree_design.md` is kept
+as its record. Its reclaimer lives on as `bytecaskdb/version_chain.cppm`
+(`docs/radix_tree_epoch_reclamation_design.md`). References to the radix
+tree below describe it as it was.
 Baseline for every code reference: `main` at `5297632`, and
 `radix-epoch-reclamation` at `9023a58` for the reclaimer.
 

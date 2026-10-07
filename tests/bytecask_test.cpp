@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <concepts>
 #ifdef BYTECASK_TESTING
 #include "fault_injector.h"
@@ -12,6 +13,7 @@
 #include "mapping_probe.h"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -33,6 +35,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <latch>
 #include <tuple>
 #include <vector>
 #include <fcntl.h>
@@ -1666,7 +1669,7 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
   std::mt19937 gen(98765);
 
   auto rand_key = [&]() -> std::string {
-    // Short keys with prefix overlap to stress the radix tree.
+    // Short keys with prefix overlap to stress shared key prefixes.
     static constexpr std::string_view alphabet = "abcdef";
     const auto len = std::uniform_int_distribution<int>(1, 6)(gen);
     std::string k;
@@ -2405,9 +2408,7 @@ TEST_CASE("Recovery model-based: hints split into many frames",
   // hint that verified, some entries are already applied, so the open fails
   // with std::system_error, and the next open recovers. Either way what is
   // recovered is the serial baseline. The fault injector is thread-local, so
-  // recovery runs on the thread that opens — which the radix path, building
-  // on worker threads even at one, never does.
-#ifdef BYTECASK_USE_BTREE
+  // recovery runs on the thread that opens.
   for (const int nth : {1, 2, 3, 5, 40, 150}) {
     DYNAMIC_SECTION("hint read " << nth << " fails, recovery_threads = 1") {
       const auto p = td.path / std::format("eio{}", nth);
@@ -2434,7 +2435,6 @@ TEST_CASE("Recovery model-based: hints split into many frames",
       if (!opened) CHECK(collect_stats(db) == serial_stats_vals);
     }
   }
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -3013,7 +3013,7 @@ TEST_CASE("DB group commit recovery preserves all keys",
 // ---------------------------------------------------------------------------
 // Test: concurrent reads during writes — raw pointer traversal safety
 // ---------------------------------------------------------------------------
-// Readers traverse the radix tree using raw pointers while a writer mutates
+// Readers traverse the key directory using raw pointers while a writer mutates
 // it via transient (put path). This validates that the persistent/immutable
 // tree structure keeps old nodes alive for the duration of a read, even as
 // the writer clones and replaces nodes.
@@ -3552,6 +3552,139 @@ TEST_CASE("FileStats: parallel recovery matches serial",
 // ---------------------------------------------------------------------------
 // vacuum_compact_file: basic compaction
 // ---------------------------------------------------------------------------
+TEST_CASE("open removes staged .data and .hint files and nothing else",
+          "[recovery]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  bytecask::DB::open(dir).put({}, to_bytes("k"), to_bytes("v"));
+  for (const auto *name : {"x.data.tmp", "x.hint.tmp", "x.tmp", "x.other.tmp"})
+    std::ofstream{dir / name} << "staged";
+
+  auto db = bytecask::DB::open(dir);
+  CHECK_FALSE(std::filesystem::exists(dir / "x.data.tmp"));
+  CHECK_FALSE(std::filesystem::exists(dir / "x.hint.tmp"));
+  CHECK(std::filesystem::exists(dir / "x.tmp"));
+  CHECK(std::filesystem::exists(dir / "x.other.tmp"));
+  CHECK(get_val(db, to_bytes("k")).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// A hint file that verifies but breaks the sorted layout flush_hints_for
+// writes — a head of markers and range tombstones, then Puts and Deletes in
+// key order — is refused by the B+ tree recoveries, which bulk-load from it.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct OwnedHint {
+  std::uint64_t seq;
+  bytecask::EntryType type;
+  std::uint64_t offset;
+  std::string key;
+  std::uint32_t value_size;
+  std::string end_key;
+};
+
+auto only_hint(const std::filesystem::path &dir) -> std::filesystem::path {
+  std::vector<std::filesystem::path> hints;
+  for (const auto &e : std::filesystem::directory_iterator{dir})
+    if (e.path().extension() == ".hint") hints.push_back(e.path());
+  REQUIRE(hints.size() == 1);
+  return hints.front();
+}
+
+auto read_hint(const std::filesystem::path &p) -> std::vector<OwnedHint> {
+  const auto hf = bytecask::HintFile::OpenForRead(p);
+  auto scanner = hf.make_scanner();
+  std::vector<OwnedHint> out;
+  while (const auto he = scanner.next()) {
+    out.push_back({he->sequence, he->entry_type, he->file_offset,
+                   to_string(he->key), he->value_size,
+                   to_string(he->end_key)});
+  }
+  return out;
+}
+
+void write_hint(const std::filesystem::path &p,
+                const std::vector<OwnedHint> &entries) {
+  const auto tmp = std::filesystem::path{p.string() + ".crafted"};
+  auto hf = bytecask::HintFile::OpenForWrite(tmp);
+  for (const auto &e : entries) {
+    if (e.type == bytecask::EntryType::RangeDel) {
+      hf.append_range_del(e.seq, e.offset, to_bytes(e.key), to_bytes(e.end_key));
+    } else {
+      hf.append(e.seq, e.type, e.offset, to_bytes(e.key), e.value_size);
+    }
+  }
+  hf.close();
+  std::filesystem::rename(tmp, p);
+}
+
+}  // namespace
+
+TEST_CASE("recovery checks the layout of a hint file's sorted run",
+          "[recovery][hintfile]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir);
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("a"), to_bytes("1"));
+    plan.put(to_bytes("b"), to_bytes("2"));
+    (void)db.apply_batch({}, std::move(plan));
+    (void)db.del({}, to_bytes("b"));
+    db.del_range({}, to_bytes("c"), to_bytes("d"));
+  }
+  const auto hint = only_hint(dir);
+  const auto written = read_hint(hint);
+  // The head (both batch markers, then the range tombstone) and the run: a,
+  // then b's Delete before its older Put.
+  using bytecask::EntryType;
+  REQUIRE(written.size() == 6);
+  const auto &[begin, end, range, a, b_del, b_put] =
+      std::tie(written[0], written[1], written[2], written[3], written[4],
+               written[5]);
+  REQUIRE(begin.type == EntryType::BulkBegin);
+  REQUIRE(end.type == EntryType::BulkEnd);
+  REQUIRE(range.type == EntryType::RangeDel);
+  REQUIRE(a.key == "a");
+  REQUIRE(b_del.type == EntryType::Delete);
+  REQUIRE(b_put.type == EntryType::Put);
+
+  SECTION("batch markers inside the run are passed over") {
+    write_hint(hint, {range, a, begin, b_del, end, b_put});
+    auto db = bytecask::DB::open(dir);
+    CHECK(get_val(db, to_bytes("a")).has_value());
+    CHECK_FALSE(get_val(db, to_bytes("b")).has_value());
+  }
+  SECTION("keys descending are refused") {
+    write_hint(hint, {begin, end, range, b_del, b_put, a});
+    // Each recovery words it its own way.
+    CHECK_THROWS_WITH(bytecask::DB::open(dir),
+                      Catch::Matchers::ContainsSubstring("not sorted") ||
+                          Catch::Matchers::ContainsSubstring("not ascending"));
+  }
+  SECTION("a range tombstone after the head is refused") {
+    write_hint(hint, {begin, end, a, range, b_del, b_put});
+    CHECK_THROWS_WITH(
+        bytecask::DB::open(dir),
+        Catch::Matchers::ContainsSubstring("range tombstone inside"));
+  }
+}
+
+TEST_CASE("BC_RECOVERY_PHASES=1 times the recovery phases", "[recovery]") {
+  // The switch only prints; the open must recover the same either way.
+  TempDir td;
+  const auto dir = td.path / "db";
+  bytecask::DB::open(dir).put({}, to_bytes("k"), to_bytes("v"));
+  for (const auto *value : {"1", "0"}) {
+    INFO("BC_RECOVERY_PHASES=" << value);
+    ::setenv("BC_RECOVERY_PHASES", value, 1);
+    auto db = bytecask::DB::open(dir);
+    ::unsetenv("BC_RECOVERY_PHASES");
+    CHECK(get_val(db, to_bytes("k")).has_value());
+  }
+}
+
 TEST_CASE("vacuum compact removes dead entries", "[vacuum]") {
   TempDir td;
   // Threshold=1 forces rotation after each write → every put lands in its
@@ -3632,6 +3765,37 @@ auto disjoint(const std::vector<std::pair<std::uint64_t, std::uint64_t>> &r)
 }
 
 } // namespace
+
+TEST_CASE("vacuum remaps only the keys no write changed during its copy",
+          "[vacuum]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("a0"));
+  db.put({}, to_bytes("b"), to_bytes("b0"));
+  db.put({}, to_bytes("c"), to_bytes("c0"));
+  db.put({}, to_bytes("c"), to_bytes("c1"));  // the dead bytes to reclaim
+  (void)db.create_manifest();                 // seals the file
+
+  // The copy holds a, b and c; by the commit a is rewritten and b deleted,
+  // so only c may be remapped into it.
+  db.test_before_vacuum_commit_ = [&] {
+    db.put({}, to_bytes("a"), to_bytes("a1"));
+    (void)db.del({}, to_bytes("b"));
+  };
+  REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+  db.test_before_vacuum_commit_ = nullptr;
+
+  const auto expected = std::map<std::string, std::string>{{"a", "a1"},
+                                                           {"c", "c1"}};
+  CHECK(collect_kv(db) == expected);
+  std::uint64_t live = 0;
+  for (const auto &[fid, fs] : db.file_stats()) live += fs.live_bytes;
+  CHECK(live == esize("a", "a1") + esize("c", "c1"));
+
+  db.close();
+  auto reopened = bytecask::DB::open(td.path / "db");
+  CHECK(collect_kv(reopened) == expected);
+}
 
 TEST_CASE("recovery undoes a vacuum killed before the source was unlinked",
           "[vacuum][recovery]") {
@@ -3766,20 +3930,37 @@ TEST_CASE("recovery keeps the full file over a copy of its prefix",
   CHECK(disjoint(sequence_ranges(db)));
 }
 
-// The same key under the same sequence with a different value of the same
-// size is two writes, not a copy. Recovery refuses it and deletes nothing.
+// Two entries under one sequence that differ in value, key or type are two
+// writes, not a copy. Recovery refuses them and deletes nothing.
 TEST_CASE("recovery refuses two different writes under one sequence",
           "[vacuum][recovery]") {
+  using Write = std::function<void(bytecask::DB &)>;
+  const auto put = [](std::string k, std::string v) -> Write {
+    return [k, v](bytecask::DB &db) { db.put({}, to_bytes(k), to_bytes(v)); };
+  };
+  const auto del = [](std::string k) -> Write {
+    return [k](bytecask::DB &db) { (void)db.del({}, to_bytes(k)); };
+  };
+  // Sequence 1 is the same write in both; sequence 2 differs.
+  const auto [what, second_a, second_b] =
+      GENERATE_COPY(table<std::string, Write, Write>({
+          {"value", put("key", "aaaa"), put("key", "bbbb")},
+          {"key", put("key", "aaaa"), put("kez", "aaaa")},
+          {"type", put("key", "aaaa"), del("key")},
+      }));
+  INFO("the second writes differ in " << what);
   TempDir td;
   const auto a = td.path / "a";
   const auto b = td.path / "b";
   {
     auto db = bytecask::DB::open(a);
-    db.put({}, to_bytes("key"), to_bytes("aaaa"));
+    db.put({}, to_bytes("key"), to_bytes("0000"));
+    second_a(db);
   }
   {
     auto db = bytecask::DB::open(b);
-    db.put({}, to_bytes("key"), to_bytes("bbbb"));
+    db.put({}, to_bytes("key"), to_bytes("0000"));
+    second_b(db);
   }
   for (const auto &e : std::filesystem::directory_iterator{b}) {
     const auto ext = e.path().extension();
@@ -8603,6 +8784,85 @@ TEST_CASE("durable_sequence long-poll times out on idle DB", "[durable_seq]") {
   CHECK(elapsed >= std::chrono::milliseconds{40});
 }
 
+TEST_CASE("durable_sequence with no timeout returns an unreached target at once",
+          "[durable_seq]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  const auto start = std::chrono::steady_clock::now();
+  CHECK(db.durable_sequence(1, std::chrono::milliseconds{0}) == 0);
+  CHECK(std::chrono::steady_clock::now() - start <
+        std::chrono::milliseconds{2000});
+}
+
+TEST_CASE("durable_sequence wakes a waiter when the DB closes",
+          "[durable_seq][concurrency]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  std::latch parked{1};
+  std::atomic<bool> signalled{false};
+  db.test_in_sequence_wait_ = [&] {
+    if (!signalled.exchange(true)) parked.count_down();
+  };
+  std::exception_ptr err;
+  std::thread waiter{[&] {
+    try {
+      (void)db.durable_sequence(1, std::chrono::seconds{30});
+    } catch (...) {
+      err = std::current_exception();
+    }
+  }};
+  parked.wait();  // the waiter has checked its condition under the mutex
+  db.close();
+  waiter.join();
+  REQUIRE(err);
+  CHECK_THROWS_AS(std::rethrow_exception(err), bytecask::DbClosed);
+}
+
+TEST_CASE("a conflict waiting on a write whose flush fails returns when the "
+          "engine degrades",
+          "[pipeline][degraded][concurrency]") {
+  // B's plan loses to A's write, which is in the head but not published; B
+  // waits for A's publication (wait_published). A's fdatasync then fails,
+  // so A's write is never published and only the degrade can release B.
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("k"), to_bytes("v0"));
+  auto snap = db.snapshot();
+
+  std::latch in_flush{1};
+  std::latch release{1};
+  db.test_before_flush_sync_ = [&] {
+    in_flush.count_down();
+    release.wait();
+  };
+  std::exception_ptr ea;
+  std::thread a{[&] {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    try {
+      db.put({.sync = true}, to_bytes("k"), to_bytes("v1"));
+    } catch (...) {
+      ea = std::current_exception();
+    }
+  }};
+  in_flush.wait();
+  std::atomic<bool> released{false};
+  db.test_in_sequence_wait_ = [&] {
+    if (!released.exchange(true)) release.count_down();
+  };
+
+  bytecask::WritePlan plan{std::move(snap)};
+  plan.put(to_bytes("k"), to_bytes("v2"));
+  const auto r = db.apply_batch({.sync = false}, std::move(plan));
+  a.join();
+  db.test_before_flush_sync_ = nullptr;
+  db.test_in_sequence_wait_ = nullptr;
+
+  CHECK_FALSE(r.has_value());
+  CHECK(released.load());  // B did wait
+  REQUIRE(ea);
+  CHECK(db.is_degraded());
+}
+
 // ---------------------------------------------------------------------------
 // durable_sequence: correct after recovery
 // ---------------------------------------------------------------------------
@@ -9348,6 +9608,61 @@ TEST_CASE("changes_since iterator yields entries in sequence order", "[replicati
   REQUIRE(collected_values[1] == "value5");
 }
 
+TEST_CASE("iterators advance by post-increment as by pre-increment",
+          "[iterator]") {
+  // The forms the standard iterator concepts require; nothing in the engine
+  // calls them.
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  for (const auto *k : {"a", "b", "c"}) db.put({}, to_bytes(k), to_bytes(k));
+
+  auto keys = db.keys_from({});
+  auto k = keys.begin();
+  const auto was = k++;
+  CHECK(to_string(*was) == "a");
+  CHECK(to_string(*k) == "b");
+  const auto then = k--;
+  CHECK(to_string(*then) == "b");
+  CHECK(to_string(*k) == "a");
+
+  auto entries = db.iter_from({});
+  auto e = entries.begin();
+  e++;
+  CHECK(to_string((*e).key) == "b");
+
+  auto reversed = db.riter_from({});
+  auto r = reversed.begin();
+  r++;
+  CHECK(to_string((*r).key) == "b");
+
+  auto snap = db.snapshot();
+  auto changes = db.changes_since(snap, 0);
+  auto c = changes.begin();
+  c++;
+  CHECK(to_string((*c).key) == "b");
+  bytecask::ChangeIterator moved;
+  moved = std::move(c);
+  CHECK(to_string((*moved).key) == "b");
+}
+
+TEST_CASE("changes_since stops at the snapshot's durable sequence",
+          "[replication]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  const auto synced = db.put({.sync = true}, to_bytes("a"), to_bytes("1"));
+  const auto unsynced = db.put({.sync = false}, to_bytes("b"), to_bytes("2"));
+  REQUIRE_FALSE(unsynced.durable);
+  auto snap = db.snapshot();
+  std::vector<std::uint64_t> seqs;
+  for (const auto &e : db.changes_since(snap, 0)) seqs.push_back(e.sequence);
+  CHECK(seqs == std::vector<std::uint64_t>{synced.sequence});
+}
+
+TEST_CASE("a default ChangeIterator is at its end", "[replication]") {
+  const bytecask::ChangeIterator it;
+  CHECK(it == std::default_sentinel);
+}
+
 TEST_CASE("changes_since empty iterator when no new entries", "[replication]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
@@ -9469,6 +9784,27 @@ TEST_CASE("set_mode(Follower): a failed fdatasync degrades and keeps the mode",
   REQUIRE_NOTHROW(db.resume());
   db.set_mode(bytecask::Mode::Follower);
   CHECK(db.mode() == bytecask::Mode::Follower);
+}
+
+TEST_CASE("set_mode(Follower) on a degraded leader steps down without a sync",
+          "[replication]") {
+  // A sync after a failed one proves nothing (#231), so the unsynced write
+  // stays above durable_sequence instead of being reported durable.
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  const auto r = db.put({.sync = false}, to_bytes("b"), to_bytes("2"));
+  {
+    bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+    CHECK_THROWS_AS(db.set_mode(bytecask::Mode::Follower), std::system_error);
+  }
+  REQUIRE(db.is_degraded());
+  const auto durable = db.durable_sequence();
+  REQUIRE(durable < r.sequence);
+
+  db.set_mode(bytecask::Mode::Follower);
+  CHECK(db.mode() == bytecask::Mode::Follower);
+  CHECK(db.is_degraded());
+  CHECK(db.durable_sequence() == durable);
 }
 
 TEST_CASE("basic ingest: entries from changes_since are ingested correctly",
@@ -10626,7 +10962,7 @@ TEST_CASE("hint backlog: max_hint_backlog = 0 never waits",
 }
 
 // ---------------------------------------------------------------------------
-// ReadOptions: verify_checksums=false exercises read_entry_unverified paths
+// ReadOptions: verify_checksums=false exercises the unverified read paths
 // ---------------------------------------------------------------------------
 
 TEST_CASE("iter_from and riter_from with verify_checksums=false",
@@ -12668,6 +13004,32 @@ TEST_CASE("pipeline: publishing a state that owes an fdatasync degrades the "
   const auto s = db.engine_state();
   CHECK(s->durable_seq >= s->sync_requested_seq);
 }
+
+#ifndef NDEBUG
+TEST_CASE("pipeline: publishing a key outside its file's stats degrades the "
+          "engine",
+          "[pipeline][invariants][degraded]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  auto bad = std::make_shared<bytecask::EngineState>(*db.engine_state());
+  auto stats = bad->file_stats.transient();
+  std::string reason;
+  SECTION("a file with no stats") {
+    stats.erase(bad->active_file_id);
+    reason = "has no file_stats";
+  }
+  SECTION("a key past the file's committed extent") {
+    stats.update(bad->active_file_id,
+                 [](bytecask::FileStats &fs) { fs.total_bytes = 0; });
+    reason = "committed extent";
+  }
+  bad->file_stats = std::move(stats).persistent();
+  db.test_publish(bad);
+  CHECK(db.is_degraded());
+  CHECK(db.degraded_reason().find(reason) != std::string::npos);
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Commit delay: who waits before an fdatasync (CommitDelay)

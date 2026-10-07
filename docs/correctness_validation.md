@@ -371,9 +371,8 @@ mapping — where a failed read is a `SIGBUS`, not an error (#237):
     the next. The `[model]` many-frames test fails reads 1–150 in turn and
     checks each against the serial baseline, file stats included, and
     `DB::open rebuilds a hint file a read fails on` checks both outcomes
-    directly. Both run at `recovery_threads = 1` on the B+ tree paths: the
-    injector is thread-local, and the radix path builds on worker threads
-    even at one.
+    directly. Both run at `recovery_threads = 1`: the injector is
+    thread-local, and at one thread recovery runs on the thread that opens.
 
 ### Orphaned BulkBegin degrade
 
@@ -629,7 +628,8 @@ primary's cached generation, in which that key does not exist.
 Reverting BC-122 — giving `ReverseRadixTreeIterator::operator*` back the
 `std::reverse_iterator` shape, where it dereferences a temporary copy and
 returns a span into it — left **every cell in the matrix passing** when it
-was measured. Four `radix_tree_test.cpp` cases catch it instead.
+was measured. Four `radix_tree_test.cpp` cases caught it instead (the radix
+tree has since been removed, and the class with it).
 
 That is structural, not a coverage gap to close by adding cells. The
 reverted class is reached only through `key_dir.rbegin()`, and no public
@@ -675,7 +675,7 @@ sequence resolution rather than key lookup — nothing in the key
 directory distinguishes the two orderings, only the sequences do, and a
 failure class is precisely what perturbs the order the entries reach
 disk in. They also drive the range-tombstone suppression loop in
-`recovery_build_from_hints`, which is O(R) per Put during hint replay and
+recovery's hint replay, which is O(R) per Put and
 was previously exercised on clean paths only. They carry no observers:
 what a range tombstone does is settled in the key directory and at
 recovery, and a lent view can see neither.
@@ -1532,6 +1532,117 @@ smoke testing not covered by the proof matrix:
   takes a snapshot while degraded, calls `resume()`, verifies the snapshot
   remains readable (pinned files not deleted) and post-resume writes succeed.
 
+### MC/DC coverage
+
+Branch coverage says each decision went both ways. MC/DC (modified
+condition/decision coverage) says each condition in it was shown to change
+the outcome on its own, with the others held fixed. It finds conditions no
+test isolates, which are either a missing test or a condition that cannot
+decide anything. Clang records it with `-fcoverage-mcdc`, for every decision
+of two or more conditions; a single condition is branch coverage's.
+
+**The gate.** `scripts/run_coverage.sh` builds the coverage binaries with
+`-fcoverage-mcdc`, and `scripts/mcdc_report.py` fails the `coverage` CI job
+unless every condition in `data_file.cppm`, `hint_file.cppm` and
+`bytecask.cppm` — the write path, recovery and vacuum — is covered or
+exempt. Elsewhere MC/DC is reported, not gated; the key directory modules
+are #357.
+
+**Merged per build.** The engine suite runs on all three key directories, and
+each build compiles paths the others do not. `llvm-profdata` cannot merge
+them: a function whose MC/DC bitmap differs between builds (`store_state`'s
+debug walk differs per key directory) keeps one build's counters and drops
+the rest. So each build is exported on its own and `mcdc_report.py` merges
+the exports: a condition is covered if some build, or some template
+instantiation, shows it independent.
+
+**Exemptions.** A condition that cannot go the other way is marked at its
+site, on the decision's first line or in the comment block directly above it:
+
+```cpp
+// mcdc-exempt(C3): close() takes the write barrier, which waits for the
+// flush this waiter's sequence is in, ...
+return s->next_seq > sequence || s->degraded || s->closed;
+```
+
+`mcdc-exempt:` exempts every condition of the decision; `mcdc-exempt(C3):`
+only the third, counted as `llvm-cov show -show-mcdc` numbers them, so the
+other two still need their tests. Every report lists the exemptions with
+their reasons. A marker on a condition that is covered, or on no decision,
+fails the gate, so a marker cannot outlive the miss it excused.
+`MCDC_MAX_EXEMPT` in `run_coverage.sh` caps how many there are; raising it is
+a line a reviewer sees, so the gate cannot be held by exempting what a test
+should cover.
+
+SQLite's alternative, `ALWAYS(x)` / `NEVER(x)` macros that a coverage build
+compiles to constants, was not taken: the coverage build would stop checking
+the conditions it exempts, so the build that runs the tests would differ from
+the one that ships, and every module unit would need the macro header. A
+comment changes no build. Its cost, a filter to maintain, is
+`mcdc_report.py`.
+
+**What Clang does not count.**
+
+- A decision that is the condition of a `?:` whose result has class type
+  records no test vectors, however often it runs: `at && kd_put_at(...) ?
+  std::optional{...} : kd_put(...)` ran 293k times and reported 0%. Name
+  the decision as a `bool` first. The report marks such a decision
+  `[no vectors]` (#358).
+- A decision that nests a boolean operator inside an operand
+  (`a != b && !(c && d)`) is not instrumented at all, with the warning
+  "unsupported MC/DC boolean expression". None is in the engine today.
+- A process that dies by `abort()` writes no profile, so the code a death
+  test reaches counts as unexecuted (`panic_on_reused_path`).
+
+**Triage record (#353).** Every decision in the gated files that no test
+isolated when MC/DC was first measured, and its answer: a test, a
+simplification (the condition could not decide anything), or an exemption.
+
+| Site | Answer |
+|---|---|
+| `WritableMmapDataFile` / `WritablePosixFile` ctor: `exclusive && errno == EEXIST` | Simplified: only `O_EXCL` reports `EEXIST`. |
+| `ReadOnlyMmapDataFile::openForRead`: `fstat != 0 \|\| size == 0` | Tests: `fstat` failed by injection; an empty file. |
+| `createDataFileForWrite`: `Mmap && capacity > 0` | Test: a zero-capacity mmap file is written with `pread`. |
+| `renameDataFileExclusive`: `errno != EINVAL && errno != ENOSYS` | Tests: `renameat2` failed with `EINVAL`, `ENOSYS` (fallback) and `EIO` (throws). `ScopedSyscallFaults` takes the errno to report. |
+| `sync_directory`: `rc != 0 && err != EINVAL` | Tests: `fsync` failed with `EINVAL` (done) and `EIO` (throws). |
+| `DataFileIterator::buffered`: `offset < buf_start_ \|\| …` | Simplified: the sweep only moves forward (asserted). |
+| `HintFile` open: `head < magic \|\| !equal(magic)` | Test: a file too short for the magic. |
+| `HintFile` open: `version != 1 \|\| codec != zstd` | Test: an unknown codec. |
+| `HintFile` open: `ZSTD_isError(packed) \|\| packed > cap` | Simplified: the window holds at most the cap. |
+| `HintFile` open and scan: `size == UNKNOWN \|\| size == ERROR \|\| size > cap` | Simplified to `valid_frame_size(size)`: both sentinels exceed the cap (`static_assert`). |
+| `HintFile` scan: `ZSTD_isError(got) \|\| got != size` | Exempt (C2): zstd checks the size a frame declares. |
+| `store_state`: `degraded && old && !old->degraded` | Simplified: `state_` is never null. |
+| `apply_writes`: `at && kd_put_at(...)`, `at && kd_erase_at(...)` | Covered all along; Clang recorded no vectors (see above). Named the `bool`. |
+| `apply_writes`, `apply_ingest`, `apply_resume`, vacuum scan: `min == 0 \|\| seq < min` | Simplified: sequences ascend within a file, so the first is the minimum. |
+| `apply_vacuum`: `cur && cur->sequence() == m.sequence` | Test: a key overwritten and one deleted while vacuum copies (`test_before_vacuum_commit_`). |
+| vacuum scan: `existing && file && offset && sequence` | Simplified: a location names one record, so the sequence compare (a record read on the blind tree) goes. |
+| `set_mode`: `Follower && current Leader && !degraded && durable < last` | `current Leader` removed: a follower has nothing unsynced (`ingest` syncs). Test: a degraded leader steps down without a sync. |
+| `wait_published`: `published \|\| degraded \|\| closed` | Test: a conflict waiter released by a degrade (`test_in_sequence_wait_`). Exempt (C3): `close()` drains the flush first. |
+| `durable_sequence`: `min == 0 \|\| reached \|\| timeout <= 0`, and its wait `reached \|\| closed` | Tests: a zero timeout; a waiter woken by `close()`. |
+| `store_state`: `closed && !old->closed` | Simplified: nothing publishes after `close()`. |
+| `store_state` debug walk: `fs != nullptr && past extent` (both walks) | A key whose file has no stats is now a violation too. Tests via `test_publish`. |
+| `store_state` debug walk: `max_seq > 0 && next_seq <= max_seq` | Simplified: `next_seq` starts at 1. |
+| `validate_state_consistency`: `fs != nullptr && past extent`, `min > 0 && min > max` | Simplified: the checks before them rule out the first operand. |
+| `is_compaction_of`: same sequence, type, key and value | Test: two writes under one sequence differing in key, and in type. |
+| `find_sequence_overlap`: `widest == nullptr \|\| r.max > widest->max` | Simplified: sorted and disjoint so far, the previous range reaches furthest. |
+| `recovery_prepare_files`: `.tmp && (.hint \|\| .data)` | Test: staged files removed, other `.tmp` files kept. |
+| `recovery_prepare_files`: `end && *end < size` | Simplified: a hint-less file always gets an end. |
+| `RecoveryPhaseLog`: `e && *e == '1'` | Test: `BC_RECOVERY_PHASES` set to `1` and `0`. |
+| `recovery_merge_results` (radix): `a.skipped \|\| b.skipped` | Moved to the caller: which part was `a` depended on which worker finished first. Since removed with the radix tree. |
+| `recovery_build_sorted`, `recovery_load_streams`: markers and a `RangeDel` in the sorted run | Test: a crafted hint with markers, a `Delete` and a range tombstone inside the run. |
+| `recovery_build_sorted`: `have_prev && key <= prev` | Removed: keys leave a heap of ascending cursors ascending. |
+| `recovery_load_ranged`: `on_key && older && other file` | Simplified: each file offers one entry per key, so an older Put is from another file. |
+| `ChangeIterator`: `seq > from && seq <= durable` | Test: an unsynced write is not shipped. |
+| `ChangeIterator`: `needs_advance_ && entry_iter_` | Simplified: set only after a read from `entry_iter_`. |
+| `ChangeIterator`: `!impl_ \|\| !has_more()` | Test: a default iterator is at its end. |
+
+Functions in the same files that no build called were tested (the iterators'
+post-increment, `ChangeIterator`'s move assignment) or deleted:
+`DataFile::read_entry` and `read_entry_unverified`, which nothing but tests
+called since reads went through `lend_record`, with their helpers, and four
+unused `TransientEngineState` accessors and `HintFile::path`. What remains
+is `panic_on_reused_path`, reached only by the death tests above.
+
 ### Counted fault sweep
 
 The proof matrix fails checkpoints by name. A cell exists because someone
@@ -1554,8 +1665,8 @@ for each operation:
 
 It runs in `bytecask_tests` as `[fault_sweep]`
 ([`tests/fault_sweep_test.cpp`](../tests/fault_sweep_test.cpp)), on every
-PR: about 3,900 failed calls, 1,400 of them on the default back-end, in
-22 s on an unsanitized release build. A
+PR: about 5,300 failed calls, 1,850 of them on the default back-end, in
+30 s on an unsanitized release build. A
 failure names the call: `vacuum, fault before, N = 7:
 ftruncate(…/x.data.tmp)`. `BYTECASK_SWEEP_TRACE=1` prints every call a
 sweep failed.
@@ -1563,20 +1674,47 @@ sweep failed.
 **Counting below the engine.** The engine has no single I/O layer to count
 in, and counting `FAULT_INJECTION` checkpoints would leave a call without
 one unreached. So `bytecask_tests` is linked with `-Wl,--wrap=<call>` for
-`open`, `pread`, `pwrite`, `pwritev`, `write`, `fdatasync`, `fsync`,
-`ftruncate`, `fstat`, `stat`, `renameat2`, `link`, `unlink` and `mmap`, and
-the interposers in [`tests/syscall_faults.cpp`](../tests/syscall_faults.cpp)
-count and fail them. A call is counted only while a sweep is armed, and
-only on a file under the DB directory, matched by its path or by what its
-descriptor names (`/proc/self/fd`). An interposer calls through to the
-real symbol, which under a sanitizer is the sanitizer's interceptor.
+each I/O call it references, and the interposers in
+[`tests/syscall_faults.cpp`](../tests/syscall_faults.cpp) count and fail
+them. A call is counted only while a sweep is armed, and only on a file
+under the DB directory, matched by its path, by what its descriptor names
+(`/proc/self/fd`), or for an `*at` call by both. An interposer calls
+through to the real symbol, which under a sanitizer is the sanitizer's
+interceptor.
+
+`--wrap` rewrites the references in the objects that are part of the link,
+and nothing in a shared library. So `bytecask_tests` links the C++
+standard library statically (`-static-libstdc++`), and `std::filesystem`'s
+calls into libc are rewritten like the engine's: the hint's rename,
+vacuum's removal of the file it compacted, the removal of stale `.tmp`
+files at open, `file_size`, `exists`, the directory scan at open. Using one
+filesystem operation pulls in libstdc++'s whole object for them, so the
+binary references more than the engine calls: `openat`, `read`, `writev`,
+`sendfile`, `copy_file_range`, `truncate`, `lstat`, `rename`, `unlinkat`,
+`remove`, `mkdir`, `symlink`, `utimensat`, `fchmod`, `fchmodat`,
+`realpath`, `opendir`, `readdir`, `fopen` and `freopen` have interposers
+beside the engine's own `open`, `pread`, `pwrite`, `pwritev`, `write`,
+`fdatasync`, `fsync`, `ftruncate`, `fstat`, `stat`, `renameat2`, `link`,
+`unlink` and `mmap`. Some come only from the MemorySanitizer build's libc++
+(`opendir`, `copy_file_range`). `remove`,
+`realpath` and `fopen` call `unlink`, `lstat` and `open` inside libc,
+through aliases `--wrap` cannot see, so they are wrapped themselves.
 
 `xmake.lua` also passes `--wrap` for the other spellings of those calls
-(`pread64`, `openat`, `rename`, the `_FORTIFY_SOURCE` variants, …) without
-defining an interposer for them, so a reference to one fails the link. A
-new kind of call cannot join the engine uncounted, and a toolchain that
-spells a call differently is noticed. The first test in the file checks the
-other direction: that a put's append and sync are in fact counted.
+(`pread64`, `openat64`, `renameat`, `mkdirat`, glibc's old `__xstat`, the
+`_FORTIFY_SOURCE` variants, …) and for calls nothing references yet
+(`fallocate`, `splice`, …), without defining an interposer for
+them, so a reference to one fails the link. With the standard library in
+the link the guard is complete: an I/O call cannot join the binary
+uncounted, from the engine or from a `std::filesystem` operation it starts
+using, and a toolchain that spells a call differently is noticed. An I/O
+call here opens, reads, writes, syncs, sizes, maps, lists or changes a file
+or a directory entry; the rest (`close`, `lseek`, `flock`,
+`posix_fadvise`, `readlink` of `/proc/self/fd`, `statvfs`, stdio past the
+open, …) are listed in `xmake.lua` as left out. The first two tests in the
+file check the other direction: that a put's append and sync are in fact
+counted, and that `std::filesystem`'s `stat`, `openat`, `mkdir`, `rename`
+and `remove` are.
 
 **Passes.** Each pass counts only the calls it can fail, so N indexes a
 different sequence in each.
@@ -1584,8 +1722,8 @@ different sequence in each.
 | Pass | The N-th call | Counts |
 |---|---|---|
 | before | is not made, and reports `EIO` | every wrapped call |
-| after | is made, then reports `EIO`: the bytes, the cut or the rename landed | `pwrite`, `pwritev`, `write`, `fdatasync`, `fsync`, `ftruncate`, `renameat2`, `link`, `unlink` |
-| short | transfers half of what was asked | `pread`, `pwrite`, `pwritev`, `write` |
+| after | is made, then reports `EIO`: the bytes, the cut or the rename landed | the writes, the syncs, and the calls that change a file's size or a directory entry: `ftruncate`, `truncate`, `renameat2`, `rename`, `link`, `unlink`, `unlinkat`, `remove`, `mkdir`, … |
+| short | transfers half of what was asked | `pread`, `read`, `pwrite`, `pwritev`, `write`, `writev`, `sendfile`, `copy_file_range` |
 | cascade | and every counted call after it fail as in *before* | every wrapped call |
 
 An `fdatasync` failed *before* leaves its pages clean and unwritten in the
@@ -1612,17 +1750,23 @@ their own opens, probes, fills and maps.
 | `del` | the same | 4, 2, 2 |
 | `del_range` | the same | 8, 2, 2 |
 | `apply_batch`: puts, a delete, a range delete | the same | 13, 4, 4 |
-| a put that fills the active file | the same, `max_file_bytes = 512` | 21, 22, 22 |
-| `vacuum` | a sealed file with a dead entry | 23, 22, 21 |
-| `create_manifest` | one file | 17, 19, 19 |
+| a put that fills the active file | the same, `max_file_bytes = 512` | 25, 26, 26 |
+| `vacuum` | a sealed file with a dead entry | 29, 28, 27 |
+| `create_manifest` | one file | 21, 23, 23 |
 | `ingest` of a put and a batch | a follower holding the first slice | 15, 5, 5 |
-| `resume()` | degraded by a failed commit sync: the entry whole, unsynced | 40, 23, 23 |
-| `resume()` | degraded by a short append: the entry torn | 38, 23, 23 |
-| `close()` | an unsynced batch behind it | 11, 11, 11 |
-| `DB::open`, serial | three sealed files and their hints, after a clean close | 66, 90, 57 |
-| `DB::open`, parallel | the same | 78, 102, 69 |
-| `DB::open`, serial | the same, as a killed process leaves it: the newest file hint-less | 75, 101, 66 |
-| `DB::open`, parallel | the same | 87, 113, 78 |
+| `resume()` | degraded by a failed commit sync: the entry whole, unsynced | 46, 29, 29 |
+| `resume()` | degraded by a short append: the entry torn | 44, 29, 29 |
+| `close()` | an unsynced batch behind it | 13, 13, 13 |
+| `DB::open`, serial | three sealed files and their hints, after a clean close | 107, 131, 98 |
+| `DB::open`, parallel | the same | 119, 143, 110 |
+| `DB::open`, serial | the same, as a killed process leaves it: the newest file hint-less | 116, 142, 107 |
+| `DB::open`, parallel | the same | 128, 154, 119 |
+
+The `std::filesystem` calls account for the rise over the counts before
+the static link (#319): the hint's `exists` check and rename on every
+operation that writes a hint, vacuum's two removes, `resume()`'s size
+checks, and at open the directory scans, one `readdir` per entry, which
+are most of the 41 more calls an open makes.
 
 **Invariants.** They need no expected delta per failure class, which is
 what makes an operation cheap to add. After a failure at any N:
@@ -1635,6 +1779,11 @@ what makes an operation cheap to add. After a failure at any N:
 - for `ingest`, whose slice is two atomic units, `resume()` or a power cut
   may also leave the first unit without the second, and delivering the
   slice again completes it (`CONTRACT.md`, `ingest`);
+- for `create_manifest`, every data file a returned manifest lists
+  exists, and the listed files, with whichever hints exist, open to the
+  manifest's state; a hint the worker failed to write may be missing
+  (#349). This is checked once the fault is disarmed, since the check's own
+  `stat` calls would otherwise be counted;
 - a write after the fault lands;
 - a close and reopen recovers that state, serial and parallel, with the
   same file stats;
@@ -1664,29 +1813,33 @@ so the next open lost its keys. No checkpoint named the call. Both now
 throw (`sealed_file_size`), and the `sealed_fstat_failure_reads_empty`
 mutation reverts it.
 
+Counting `std::filesystem`'s calls (#319) found no failure the invariants
+reject. It did show that `create_manifest` returns a manifest naming a
+hint whose write failed, against `CONTRACT.md`'s *File list accuracy*. The
+same was already true of a failed `write` or `fdatasync` of the hint, and
+no invariant checks the manifest's file list (#349). The
+`rewrite_size_failure_reads_empty` mutation shows that a newly counted
+site is reached: read as an empty file, a failed `file_size` in
+`rewrite_durably` lets `resume()` build a hint over pages the device does
+not hold, and the sweep rejects it.
+
 **Limits.**
 
-- *Calls inside shared libraries are not counted.* `--wrap` rewrites the
-  references in this binary's objects, not libstdc++'s, so everything the
-  engine does through `std::filesystem` is neither counted nor failed: the
-  hint's rename, vacuum's removal of the file it compacted, the removal of
-  stale `.tmp` files, `file_size`, `exists`, `create_directories`. The named
-  checkpoints (`io_hint_rename`, `io_vacuum_compact_unlink`) and the chaos
-  rig remain their cover (#319).
+- *Calls glibc makes inside itself are not counted.* `--wrap` sees the
+  public function, not what it calls through an internal alias, so a
+  stream's reads and writes after `fopen` are not counted. The engine uses
+  no stdio.
 - *Linux only.* Apple's linker has no `--wrap`, so on macOS `bytecask_tests`
   is built without `tests/syscall_faults.cpp` and `tests/fault_sweep_test.cpp`.
-- *The link guard is off where libstdc++ is partly static.* manylinux's
-  gcc-toolset links part of `std::filesystem` from `libstdc++_nonshared.a`
-  into the binary, so its `openat`, `rename`, `unlinkat`, `symlink` and
-  `sendfile` would fail the guard although the engine makes none of them.
-  The wheel build configures `--fault_sweep_link_guard=n`; `ci.yml` keeps
-  the guard. There the archived `std::filesystem` calls that are wrapped
-  (`stat`, `unlink`, …) are counted too. The MemorySanitizer build is the
-  same case: its instrumented libc++ is static (`build_msan_libcxx.sh`), so
-  `std::filesystem` and `random_device` bring `read`, `lstat`, `openat`,
-  `rename`, … into the binary, and `xmake.lua` drops the guard whenever
-  `--sanitizer` includes `memory` (#327). The sweep still runs there; the
-  ASan, TSan and UBSan legs and `ci.yml`'s build keep the guard.
+- *The link guard is off on glibc older than 2.33.* There `<sys/stat.h>`
+  turns `stat`, `fstat` and `lstat` into `__xstat`, `__fxstat` and
+  `__lxstat`, which have no interposer: a newer glibc keeps them only as
+  compatibility symbols, so an interposer calling through to them would not
+  link where CI builds. The manylinux_2_28 wheel build, on glibc 2.28,
+  configures `--fault_sweep_link_guard=n`, and there those calls go
+  uncounted. Every other build keeps the guard, MemorySanitizer's included:
+  its libc++ was static before the rest of the binary's standard library
+  was, and it no longer needs the exception it had (#327).
 - *`mmap` reads cannot be failed this way.* A failed mapped read is a
   `SIGBUS`, not a return value. The `mmap` call itself is counted, and on
   the mmap back-end failed.
@@ -1723,7 +1876,6 @@ Concurrency code paths exercised:
 | Write serialization | `unique_ptr<mutex>` |
 | Group commit | mutex + condition_variable |
 | Background worker | mutex + condition_variable |
-| Radix tree refcount | `atomic<uint32_t>` intrusive refcount |
 | Edit tag counter | `atomic<uint64_t>` relaxed fetch_add |
 
 Run: `scripts/run_sanitizer.sh thread` (or `address` for ASan, `memory` for MSan).
@@ -1781,7 +1933,7 @@ means bugs inside `crc32c` itself, if any, wouldn't be caught by this MSan
 run.
 
 Run: `scripts/run_sanitizer.sh memory`. Target scope matches the ASan/TSan
-jobs above: `bytecask_tests` only, not `radix_tree_memory_tests`. Trigger scope does not — origin tracking makes the
+jobs above: `bytecask_tests` only. Trigger scope does not — origin tracking makes the
 MSan test step the slowest of the three and by far the least predictable
 (2m48s and 11m56s on two runs of the same commit, on an early, much smaller
 suite; per-job runners vary by ~1.8x and the seeded `[model]` workloads
@@ -1804,10 +1956,9 @@ limit. A test that needs a large key set loads it in one `apply_batch`.
 The sanitizer jobs live in `.github/workflows/sanitizers.yml`, which
 `ci.yml` calls. A pull request, and the push to `main` that merges it, run
 ASan, TSan and UBSan on the default blind-leaf key directory. The nightly
-schedule runs the full matrix: `{blind, btree, radix}` (`BYTECASK_KEYDIR`) ×
-`{address, thread, memory, undefined}`, twelve jobs. The two non-default
-trees share their inner nodes and `BuildSession` with the default, so bugs in
-shared code already surface in the PR run; the full matrix catches what is
+schedule runs the full matrix: `{blind, btree}` (`BYTECASK_KEYDIR`) ×
+`{address, thread, memory, undefined}`, eight jobs. The keyed tree shares
+its inner nodes and `BuildSession` with the default, so bugs in shared code already surface in the PR run; the full matrix catches what is
 specific to one tree. UBSan is built with `-fno-sanitize-recover=undefined`,
 so any report fails the job; its leg on the blind tree also runs
 `btree_tests`, which does not depend on `BYTECASK_KEYDIR`. The three MSan
@@ -1815,25 +1966,55 @@ jobs share one cache entry for the instrumented libc++.
 
 ### Fuzz testing (libFuzzer)
 
-Two buffer-level fuzz harnesses exercise the parser code that handles
-adversarial input on recovery — the one code path where untrusted bytes
-from bad hardware or corruption reach the engine.
+Three harnesses feed arbitrary bytes to the code that parses what recovery
+and the sweeps read from disk, where damage from bad hardware or a crash
+reaches the engine. Each accepts `std::runtime_error` as the rejection of
+bad input; any other exception, an abort or a sanitizer report is a finding.
 
-**`fuzz_data_entry`** — feeds arbitrary bytes to
-`data_entry::deserialize_entry(span)`. Exercises header parsing, size
-validation, and CRC checking. 3.7 M executions/minute on seed corpus.
+The two data-file harnesses read a control byte ahead of the input. Its bit 0
+recomputes the CRC of each entry before parsing. Without it a mutated entry
+almost never carries a valid CRC-32C, and the run explores the CRC
+rejection and little behind it; with it clear, that rejection stays covered.
 
-**`fuzz_hint_entry`** — feeds arbitrary bytes to
-`hint_entry::deserialize_entry(span, key_buf)` in a sequential loop
-simulating `Scanner::next`. Exercises prefix compression key
-reconstruction and length validation across multiple entries. 1.9 M
-executions/minute on seed corpus.
+**`fuzz_data_entry`** — `deserialize_entry(span)` on one entry: header,
+size validation, CRC.
 
-Both harnesses run with `-fsanitize=fuzzer,address` (libFuzzer + ASan).
-Seed corpus files (`tests/fuzz/seed/`) are committed; evolving corpus
-(`tests/fuzz/corpus/`) is gitignored.
+**`fuzz_hint_entry`** — the hint `deserialize_entry(span)` in a loop, as
+`Scanner::next` walks a frame: length validation across consecutive
+entries. Hint entries carry no CRC of their own (the file trailer covers
+them), so it has no control byte.
 
-Run: `scripts/run_fuzz.sh fuzz_data_entry 300` (5-minute run).
+**`fuzz_data_file_scan`** — the input as a whole data file, swept by
+`DataFileIterator` (bit 1 of the control byte picks `OnDamage::Stop` over
+`Throw`) and by `CommittedEntryIterator` on top of it. This is the sweep
+behind hint generation at open, `resume()`, vacuum's copy and
+`changes_since`. Besides surviving, it checks that:
+
+- each entry yielded lies inside the file, directly after the one before,
+  and equals `deserialize_entry` of its own bytes;
+- under `Stop` the sweep never throws;
+- `CommittedEntryIterator` yields the raw entries minus a batch still open
+  at the end, never part of a batch, and its `committed_offset()` is the
+  end of the last entry it yielded; when the sweep throws, what it yielded
+  before is a prefix of that.
+
+The file is held in memory (a `DataFile` whose point reads abort, since the
+sweep never makes them), so a run is not bound by syscalls. Bits 2–3 of the
+control byte set the sweep's chunk size from 16 B to 4 KiB, through a
+`DataFileIterator` constructor argument that is the 1 MiB `kChunkBytes`
+everywhere else. With the engine's chunk every input fits in one read, and
+the refill at a chunk boundary and the growth for an entry larger than a
+chunk would go unexercised.
+
+All three build with `-fsanitize=fuzzer,address` and run nightly
+(`fuzz-nightly.yml`), 30 minutes per target; PR CI does not build them, so
+a harness broken by an engine change fails the next night. Seeds
+(`tests/fuzz/seed/`, written by `gen_fuzz_corpus`) are committed. The
+evolving corpus (`tests/fuzz/corpus/`) is gitignored locally and, in CI,
+cached from one night to the next and minimised with `-merge=1`, so each
+run continues from what the last one found.
+
+Run: `scripts/run_fuzz.sh fuzz_data_file_scan 300` (5-minute run).
 
 ### Process-crash harness (SIGKILL)
 
@@ -2218,6 +2399,7 @@ A site whose break nothing has to catch says why instead.
 | `rotate_active_file`: `shrink_to_fit` cuts the preallocated tail and syncs the length | not needed: a sealed file's zero tail costs space, not data; open drops a zero tail past the last record (`recovery_check_tail`), and the rotation `fdatasync` before it has already made the data durable | — | — |
 | `create_active_file`: the directory sync before the first write into a new file (open, rotation, `resume()`) | `directory sync: a failed sync at rotation degrades …`, `… in resume() stays degraded`, `… open fails when the active file's entry cannot be synced` | `no_dir_sync_new_data_file` (chaos) | #199 |
 | `sealed_file_size`: a sealed file whose `fstat` fails is not opened as an empty one | `fault sweep: write across a rotation` | `sealed_fstat_failure_reads_empty` | #317 |
+| `rewrite_durably`: a file whose `file_size` fails is not rewritten as an empty one | `fault sweep: resume after a failed sync` | `rewrite_size_failure_reads_empty` | #319 |
 | rotation: a new file that cannot be created degrades | `*rotation_file_creation_fails` | `rotation_create_failure_not_degraded` | — |
 | `createDataFileForWrite`: a reused file name panics instead of reopening a live file | `createDataFileForWrite panics when the data file already exists` | `data_file_create_not_exclusive` | #35 |
 | `renameDataFileExclusive`: vacuum's copy never replaces a file holding its name | `renameDataFileExclusive panics rather than replacing a live file` | `data_file_rename_replaces` | #35 |
@@ -2298,7 +2480,7 @@ A site whose break nothing has to catch says why instead.
 
 - **A failed `fstat` sealed a file as empty.** No checkpoint named the call; the counted fault sweep reached it (*Counted fault sweep*, #317).
 
-The radix key directory's leak on a failed recovery merge (#203) is not a durability site; LeakSanitizer catches it in CI.
+The radix key directory's leak on a failed recovery merge (#203), before the radix tree was removed, was not a durability site; LeakSanitizer caught it in CI.
 
 ## Output Structure
 
@@ -2525,7 +2707,6 @@ baseline moves forward or stays still, never backward. This makes
 the following safe to attempt without losing correctness:
 
 - `io_uring` or alternative I/O backends
-- Persistent radix tree (relax keys-in-memory requirement)
 - Alternative index structures
 - Alternative thread models
 - External contributors
@@ -2583,9 +2764,10 @@ registering it, and a named one does not. So both run: the
 [*Counted fault sweep*](#counted-fault-sweep) fails each I/O call of an
 operation in turn, counted below the engine with `--wrap`, and holds the
 result to invariants that need no expected delta; the named checkpoints
-keep the per-class deltas. Unlike SQLite, which counts through its own
-VFS, the sweep cannot count what the engine does inside libstdc++
-(#319). SQLite's crash tests, which
+keep the per-class deltas. SQLite counts through its own VFS; the sweep
+counts at the libc boundary, and links the C++ standard library
+statically so that what the engine does through `std::filesystem` crosses
+it in the binary (#319). SQLite's crash tests, which
 run on a VFS that drops or damages unsynced writes at a simulated crash,
 are the ancestor of `PageCacheModel`.
 

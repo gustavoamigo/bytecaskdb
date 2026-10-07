@@ -98,9 +98,9 @@ jobs:
           export XMAKE_ROOT=y
           export RESOURCE_DIR=$(clang --print-resource-dir)
           source ~/.xmake/profile
-          # gcc-toolset links part of std::filesystem statically
-          # (libstdc++_nonshared.a), so its openat, rename, … would fail the
-          # fault sweep's link guard; ci.yml enforces the guard (xmake.lua).
+          # glibc 2.28 spells stat, fstat and lstat as __xstat, __fxstat and
+          # __lxstat, which the fault sweep has no interposer for, so they
+          # would fail its link guard; ci.yml enforces the guard (xmake.lua).
           xmake f --toolchain=llvm \
             --sdk=/usr/lib64/llvm20 \
             --cxflags="-resource-dir=${RESOURCE_DIR}" \

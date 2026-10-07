@@ -58,12 +58,11 @@ option_end()
 
 -- Counted fault sweep link guard: `xmake f --fault_sweep_link_guard=n` stops
 -- bytecask_tests poisoning the I/O calls the sweep has no interposer for (see
--- syscall_fault_unwrapped). Only for a toolchain that links part of libstdc++
--- statically, as manylinux's gcc-toolset does with libstdc++_nonshared.a:
--- std::filesystem's references to openat, rename, … then land in this binary
--- and fail the guard although the engine does not make them. The
--- MemorySanitizer build is one such case, since its instrumented libc++ is
--- static, and drops the guard on its own (see bytecask_tests). ci.yml keeps it.
+-- syscall_fault_unwrapped). Only for a glibc older than 2.33, as in the
+-- manylinux_2_28 wheel build: its headers turn stat, fstat and lstat into
+-- __xstat, __fxstat and __lxstat, which have no interposer, since a newer
+-- glibc cannot link a new reference to them. There those calls go uncounted.
+-- ci.yml, the sanitizer legs and the nightlies keep the guard.
 option("fault_sweep_link_guard")
     set_default(true)
     set_showmenu(true)
@@ -147,7 +146,11 @@ local function apply_coverage(t)
     if cov and cov ~= "" then
         local triple = os.getenv("CLANG_TARGET_TRIPLE")
         local target_flag = triple and ("--target=" .. triple) or nil
-        t:add("cxflags", "-fprofile-instr-generate", "-fcoverage-mapping", {force = true})
+        -- -fcoverage-mcdc records, for each decision of two or more
+        -- conditions, whether each condition was shown to flip the outcome
+        -- on its own (MC/DC). Compile-only; scripts/mcdc_report.py reads it.
+        t:add("cxflags", "-fprofile-instr-generate", "-fcoverage-mapping",
+            "-fcoverage-mcdc", {force = true})
         t:add("ldflags", "-fprofile-instr-generate", {force = true})
         if target_flag then
             t:add("cxflags", target_flag, {force = true})
@@ -179,18 +182,25 @@ end
 -- Key directory tree selection: the engine is built on the blind-leaf B+
 -- tree (docs/blind_leaf_btree_design.md), which stores no key bytes.
 -- BYTECASK_KEYDIR=btree builds it on the B+ tree that keeps its keys in the
--- leaves (docs/persistent_btree_design.md), and BYTECASK_KEYDIR=radix on the
--- radix tree; CI runs the engine suite on all three. Applies to every target
--- so tests and benchmarks agree.
+-- leaves (docs/persistent_btree_design.md); CI runs the engine suite on both.
+-- The switch is the seam for testing a new key directory against the same
+-- engine suite. Applies to every target so tests and benchmarks agree.
 local keydir = os.getenv("BYTECASK_KEYDIR")
 if keydir == nil or keydir == "" then
     keydir = "blind"
 end
-if keydir ~= "radix" then
-    -- The blind tree's inner nodes and BuildSession are the B+ tree's.
-    add_defines("BYTECASK_USE_BTREE")
-end
-if keydir ~= "radix" and keydir ~= "btree" then
+-- Any other value is refused when a target is configured: this scope cannot
+-- raise.
+rule("bytecask.keydir_check")
+    on_config(function (t)
+        local kd = os.getenv("BYTECASK_KEYDIR")
+        if kd and kd ~= "" and kd ~= "blind" and kd ~= "btree" then
+            raise("BYTECASK_KEYDIR must be blind or btree, not '%s'", kd)
+        end
+    end)
+rule_end()
+add_rules("bytecask.keydir_check")
+if keydir == "blind" then
     add_defines("BYTECASK_KEYDIR_BLIND")
 end
 
@@ -209,20 +219,35 @@ end
 
 -- The I/O calls bytecask_tests interposes with -Wl,--wrap, and the variants
 -- of them it must not reference (other spellings of the same calls, and
--- calls the engine does not make today). See the target below.
+-- calls neither the engine nor the C++ standard library makes today). An
+-- I/O call opens, reads, writes, syncs, sizes, maps, lists or changes a file
+-- or a directory entry. Left out on purpose, so referenced freely: close,
+-- lseek, dirfd, fdopen, fdopendir, closedir (descriptor bookkeeping),
+-- posix_fadvise, madvise, mincore, munmap (advice and mapping teardown),
+-- flock, readlink (only ever of /proc/self/fd), getcwd, chdir, statvfs, and
+-- stdio past fopen/freopen, whose reads and writes run inside libc. See the
+-- target below.
 local syscall_fault_wraps = {
-    "open", "pread", "pwrite", "pwritev", "write", "fdatasync", "fsync",
-    "ftruncate", "fstat", "stat", "renameat2", "link", "unlink", "mmap",
+    "open", "openat", "pread", "read", "pwrite", "pwritev", "write", "writev",
+    "sendfile", "copy_file_range", "fdatasync", "fsync", "ftruncate",
+    "truncate", "fstat", "stat", "lstat", "renameat2", "rename", "link",
+    "unlink", "unlinkat", "remove", "mkdir", "symlink", "utimensat", "fchmod",
+    "fchmodat", "realpath", "opendir", "readdir", "fopen", "freopen", "mmap",
 }
 local syscall_fault_unwrapped = {
-    "open64", "openat", "openat64", "creat", "pread64", "pwrite64",
-    "pwritev64", "pwritev2", "preadv", "preadv2", "read", "writev",
-    "ftruncate64", "fstat64", "stat64", "lstat", "fstatat", "statx",
-    "rename", "renameat", "unlinkat", "symlink",
-    "mmap64", "fallocate", "posix_fallocate", "sync_file_range",
-    "copy_file_range", "sendfile",
+    "open64", "openat64", "creat", "creat64", "fopen64", "freopen64",
+    "pread64", "pwrite64", "pwritev64", "pwritev2", "preadv", "preadv2",
+    "readv", "readdir64", "readdir_r", "getdents64", "sendfile64", "splice",
+    "ftruncate64", "truncate64", "fstat64", "stat64", "lstat64", "fstatat",
+    "fstatat64", "statx", "renameat", "linkat", "symlinkat", "mkdirat",
+    "rmdir", "chmod", "utimes", "futimens", "mmap64", "fallocate",
+    "posix_fallocate", "sync_file_range", "syncfs",
+    -- glibc before 2.33 spells stat, fstat and lstat these ways
+    "__xstat", "__fxstat", "__lxstat", "__fxstatat", "__xstat64",
+    "__fxstat64", "__lxstat64", "__fxstatat64",
     -- _FORTIFY_SOURCE spellings
-    "__open_2", "__open64_2", "__pread_chk", "__pread64_chk", "__read_chk",
+    "__open_2", "__open64_2", "__openat_2", "__openat64_2", "__pread_chk",
+    "__pread64_chk", "__read_chk", "__realpath_chk",
 }
 
 target("bytecask_tests")
@@ -230,7 +255,6 @@ target("bytecask_tests")
     set_default(false)
     -- For VS Code / clangd support, run: scripts/gen_compile_commands.sh
     add_files("tests/*.cpp", "tests/proof/generated/*.cpp", "bytecaskdb/*.cppm")
-    remove_files("tests/radix_tree_memory_test.cpp")
     remove_files("tests/bytecask_c_test.cpp")
     add_includedirs("bytecaskdb", "tests")
     add_packages("crc32c", "zstd")
@@ -253,23 +277,27 @@ target("bytecask_tests")
     else
         add_packages("catch2")
     end
-    add_defines("BYTECASK_TESTING", "BYTECASK_RADIX_ACCOUNTING")
+    add_defines("BYTECASK_TESTING")
     -- Counted fault sweep (tests/syscall_faults.cpp): each I/O call the
     -- binary's objects make goes through an interposer that can count it and
     -- fail the N-th. Linux only: Apple's linker has no --wrap.
     if is_plat("linux") then
+        -- --wrap rewrites only the objects in the link, so the C++ standard
+        -- library is linked statically: std::filesystem's rename, remove,
+        -- stat, … are then counted like the engine's own calls. The
+        -- MemorySanitizer build's libc++ is static already (see
+        -- scripts/build_msan_libcxx.sh).
+        if not (get_config("sanitizer") or ""):find("memory", 1, true) then
+            add_ldflags("-static-libstdc++", {force = true})
+        end
         for _, call in ipairs(syscall_fault_wraps) do
             add_ldflags("-Wl,--wrap=" .. call, {force = true})
         end
         -- No interposer exists for these, so a reference to one fails the
         -- link with "undefined reference to __wrap_<call>": a call the sweep
-        -- would not count. Write its interposer and move it to the list above.
-        -- Not under MemorySanitizer: its libc++ is linked statically (see
-        -- scripts/build_msan_libcxx.sh), and std::filesystem's and
-        -- random_device's references to read, lstat, openat, … would fail
-        -- the guard although the engine makes none of them.
-        local msan = (get_config("sanitizer") or ""):find("memory", 1, true)
-        if has_config("fault_sweep_link_guard") and not msan then
+        -- would not count, from the engine or from the standard library.
+        -- Write its interposer and move it to the list above.
+        if has_config("fault_sweep_link_guard") then
             for _, call in ipairs(syscall_fault_unwrapped) do
                 add_ldflags("-Wl,--wrap=" .. call, {force = true})
             end
@@ -293,20 +321,6 @@ target("btree_tests")
     add_defines("BYTECASK_TESTING")
     on_config(function(t)
         add_native_syslinks(t)
-        apply_sanitizer(t)
-        apply_coverage(t)
-        add_release_opts(t)
-    end)
-
-target("radix_tree_memory_tests")
-    set_kind("binary")
-    set_default(false)
-    add_files("tests/radix_tree_memory_test.cpp", "bytecaskdb/*.cppm")
-    add_includedirs("bytecaskdb", "tests")
-    add_cxflags("-Wno-global-constructors")
-    add_packages("catch2", "crc32c", "zstd")
-    add_defines("BYTECASK_TESTING", "BYTECASK_RADIX_ACCOUNTING")
-    on_config(function(t)
         apply_sanitizer(t)
         apply_coverage(t)
         add_release_opts(t)
@@ -667,7 +681,7 @@ target("bytecaskdb_node")
 
 -- Fuzz targets — buffer-level parser harnesses using libFuzzer + ASan.
 -- Build: CLANG_TARGET_TRIPLE=$(clang --print-target-triple) xmake f --sanitizer=fuzzer,address -m debug -y
---        xmake build fuzz_data_entry   (or fuzz_hint_entry)
+--        xmake build fuzz_data_entry   (or fuzz_hint_entry, fuzz_data_file_scan)
 -- Run:   ./build/.../fuzz_data_entry tests/fuzz/corpus/data_entry/ -max_total_time=60
 
 target("fuzz_data_entry")
@@ -694,9 +708,21 @@ target("fuzz_hint_entry")
         apply_sanitizer(t)
     end)
 
+target("fuzz_data_file_scan")
+    set_kind("binary")
+    set_default(false)
+    add_files("tests/fuzz/fuzz_data_file_scan.cpp", "bytecaskdb/*.cppm")
+    add_includedirs("bytecaskdb")
+    add_packages("crc32c", "zstd")
+    add_defines("BYTECASK_TESTING")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+    end)
+
 -- Seed corpus generator for fuzz targets.
 -- Build: xmake build gen_fuzz_corpus
--- Run:   ./build/.../gen_fuzz_corpus   (writes to tests/fuzz/corpus/)
+-- Run:   ./build/.../gen_fuzz_corpus   (writes to tests/fuzz/seed/)
 target("gen_fuzz_corpus")
     set_kind("binary")
     set_default(false)
@@ -896,7 +922,7 @@ target("wasm_tests")
     remove_files("tests/bytecask_c_test.cpp")
     add_files("bytecaskdb-node/wasm/catch2_stringmakers.cpp")
     add_includedirs("bytecaskdb", "tests")
-    add_defines("BYTECASK_TESTING", "BYTECASK_RADIX_ACCOUNTING")
+    add_defines("BYTECASK_TESTING")
     on_config(function(t)
         local catch2_prefix = path.join(wasm_dir, "build", "catch2-wasm")
         t:add("includedirs", path.join(catch2_prefix, "include"))

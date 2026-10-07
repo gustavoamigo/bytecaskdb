@@ -1887,15 +1887,6 @@ public:
   [[nodiscard]] auto erase(Bytes key) const -> PersistentBTree;
   [[nodiscard]] auto transient() const -> TransientBTree<V>;
 
-  // A new tree with every key of `a` and `b`; on a key in both,
-  // resolve(a_val, b_val) picks the value. The result shares no node with
-  // its inputs and starts a lineage of its own. Consuming, matching the
-  // radix tree's contract: the inputs are taken by value and released here,
-  // so one engine call site serves either key directory.
-  template <typename ResolveFunc>
-  [[nodiscard]] static auto merge(PersistentBTree a, PersistentBTree b,
-                                  ResolveFunc &&resolve) -> PersistentBTree;
-
   [[nodiscard]] auto begin() const -> BTreeIterator<V> {
     return {*this, root_, BTreeIterator<V>::Seek::First};
   }
@@ -2353,49 +2344,6 @@ auto PersistentBTree<V>::erase(Bytes key) const -> PersistentBTree {
   if (!t.erase(key))
     return *this;
   return std::move(t).persistent();
-}
-
-template <typename V>
-template <typename ResolveFunc>
-auto PersistentBTree<V>::merge(PersistentBTree a, PersistentBTree b,
-                               ResolveFunc &&resolve) -> PersistentBTree {
-  // Ordered merge into a bulk loader: each key is written once, with no
-  // descent and no split. Rebuilding with set() in a loop costs a full
-  // descent per key and was the whole cost of recovery's fan-in.
-  btree_detail::BulkLoader<V> out;
-  auto ia = a.begin();
-  auto ib = b.begin();
-  while (ia != std::default_sentinel && ib != std::default_sentinel) {
-    auto [ka, va] = *ia;
-    auto [kb, vb] = *ib;
-    const auto c = btree_detail::compare_bytes(ka, kb);
-    if (c < 0) {
-      out.append(ka, va);
-      ++ia;
-    } else if (c > 0) {
-      out.append(kb, vb);
-      ++ib;
-    } else {
-      out.append(ka, resolve(va, vb));
-      ++ia;
-      ++ib;
-    }
-  }
-  for (; ia != std::default_sentinel; ++ia) {
-    auto [k, v] = *ia;
-    out.append(k, v);
-  }
-  for (; ib != std::default_sentinel; ++ib) {
-    auto [k, v] = *ib;
-    out.append(k, v);
-  }
-  auto merged = std::move(out).finish();
-  // The iterators pin the inputs, so they are released only now.
-  ia = {};
-  ib = {};
-  a = {};
-  b = {};
-  return merged;
 }
 
 } // namespace bytecask

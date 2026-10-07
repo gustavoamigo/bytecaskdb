@@ -526,32 +526,6 @@ TEST_CASE("BTree chain contract and retraction", "[btree]") {
   }
 }
 
-TEST_CASE("BTree merge", "[btree]") {
-  std::vector<std::string> ka;
-  std::vector<std::string> kb;
-  for (int i = 0; i < 3000; ++i) {
-    if (i % 3 != 0)
-      ka.push_back("key_" + std::to_string(i));
-    if (i % 2 == 0)
-      kb.push_back("key_" + std::to_string(i));
-  }
-  auto a = build(ka);
-  auto b = build(kb);
-  auto merged = Tree::merge(a, b, [](int x, int y) { return x + y; });
-  (void)merged.validate();
-  std::map<std::string, int> oracle;
-  for (std::size_t i = 0; i < ka.size(); ++i)
-    oracle[ka[i]] += static_cast<int>(i);
-  for (std::size_t i = 0; i < kb.size(); ++i)
-    oracle[kb[i]] += static_cast<int>(i);
-  REQUIRE(merged.size() == oracle.size());
-  for (const auto &[k, v] : oracle)
-    CHECK(merged.get(to_bytes(k)) == v);
-  CHECK(a.size() == ka.size());
-  CHECK(b.size() == kb.size());
-  check_accounting({&a, &b, &merged});
-}
-
 TEST_CASE("BTree upsert with predicate", "[btree]") {
   auto t = build({"a", "b", "c"});
   auto tr = t.transient();
@@ -638,60 +612,51 @@ TEST_CASE("BTree sequential stream below other keys fills leaves", "[btree]") {
   check_accounting({&t});
 }
 
-TEST_CASE("BTree bulk-loaded merge fills leaves and stays valid", "[btree]") {
-  // The merge path goes through the bulk loader, so this also covers it.
-  std::vector<std::string> ka;
-  std::vector<std::string> kb;
-  for (int i = 0; i < 60000; ++i) {
-    if (i % 3 != 0) ka.push_back("key_" + std::to_string(i));
-    if (i % 2 == 0) kb.push_back("key_" + std::to_string(i));
-  }
-  auto a = build(ka);
-  auto b = build(kb);
-  auto merged = Tree::merge(a, b, [](int x, int y) { return x + y; });
-  (void)merged.validate();
-
-  std::map<std::string, int> oracle;
-  for (std::size_t i = 0; i < ka.size(); ++i) oracle[ka[i]] += static_cast<int>(i);
-  for (std::size_t i = 0; i < kb.size(); ++i) oracle[kb[i]] += static_cast<int>(i);
-  REQUIRE(merged.size() == oracle.size());
-  auto oit = oracle.begin();
-  for (auto it = merged.begin(); it != merged.end(); ++it, ++oit) {
+TEST_CASE("BTree bulk loader fills leaves and stays valid", "[btree]") {
+  // Recovery's range merge builds each slice through the bulk loader.
+  using Loader = bytecask::btree_detail::BulkLoader<int>;
+  std::vector<std::string> keys;
+  for (int i = 0; i < 60000; ++i) keys.push_back("key_" + std::to_string(i));
+  std::ranges::sort(keys);
+  Loader l;
+  for (std::size_t i = 0; i < keys.size(); ++i)
+    l.append(to_bytes(keys[i]), static_cast<int>(i));
+  auto t = std::move(l).finish();
+  (void)t.validate();
+  REQUIRE(t.size() == keys.size());
+  std::size_t i = 0;
+  for (auto it = t.begin(); it != t.end(); ++it, ++i) {
     auto [k, v] = *it;
-    REQUIRE(oit != oracle.end());
-    CHECK(to_string(k) == oit->first);
-    CHECK(v == oit->second);
+    CHECK(to_string(k) == keys[i]);
+    CHECK(v == static_cast<int>(i));
   }
   // Bulk loading fills leaves, unlike the insert path which leaves them
   // around 60-70% full on this key shape.
-  const auto st = merged.stats();
+  const auto st = t.stats();
   const auto fill = static_cast<double>(st.used_bytes) /
                     static_cast<double>(st.capacity_bytes);
   INFO("fill " << fill << " leaves " << st.leaves);
   CHECK(fill > 0.85);
-  CHECK(a.size() == ka.size());
-  CHECK(b.size() == kb.size());
-  check_accounting({&a, &b, &merged});
+  check_accounting({&t});
 }
 
-TEST_CASE("BTree merge of empty and giant-key inputs", "[btree]") {
-  auto empty = Tree{};
-  auto t = build({"a", "b", "c"});
-  auto r = [](int x, int) { return x; };
-  auto m1 = Tree::merge(empty, t, r);
-  CHECK(m1.size() == 3U);
-  auto m2 = Tree::merge(t, empty, r);
-  CHECK(m2.size() == 3U);
-  auto m3 = Tree::merge(empty, empty, r);
-  CHECK(m3.empty());
+TEST_CASE("BTree bulk loader with no keys and with giant keys", "[btree]") {
+  using Loader = bytecask::btree_detail::BulkLoader<int>;
+  auto empty = Loader{}.finish();
+  CHECK(empty.empty());
 
   const std::string giant(60000, 'g');
-  auto big = build({giant, giant + "x", "zzz"});
-  auto m4 = Tree::merge(big, t, r);
-  (void)m4.validate();
-  CHECK(m4.size() == 6U);
-  CHECK(m4.contains(to_bytes(giant)));
-  check_accounting({&t, &m1, &m2, &m3, &big, &m4});
+  Loader l;
+  l.append(to_bytes("a"), 1);
+  l.append(to_bytes(giant), 2);
+  l.append(to_bytes(giant + "x"), 3);
+  l.append(to_bytes("zzz"), 4);
+  auto t = std::move(l).finish();
+  (void)t.validate();
+  CHECK(t.size() == 4U);
+  CHECK(t.get(to_bytes(giant)) == 2);
+  CHECK(t.get(to_bytes(giant + "x")) == 3);
+  check_accounting({&empty, &t});
 }
 
 TEST_CASE("BTree sample_separators cuts the key space evenly", "[btree]") {

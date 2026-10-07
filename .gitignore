@@ -49,6 +49,7 @@ lcov.info
 
 # Fuzz corpus (evolving; seed/ is committed, corpus/ is runtime-only)
 tests/fuzz/corpus/
+tests/fuzz/findings/
 
 # MSan-instrumented libc++ build output (scripts/build_msan_libcxx.sh)
 .msan-libcxx/

@@ -528,9 +528,13 @@ capture.
 
 ### File list accuracy
 
-Every file in `FileManifest::files` exists on disk with both `.data` and
-`.hint` paths at the time of return. `worker_.drain()` ensures hint
-generation has completed before building the file list.
+Every `data_path` in `FileManifest::files` exists on disk at the time of
+return. `worker_.drain()` waits for hint generation to finish before the
+list is built, but a `hint_path` may name a file that does not exist: the
+worker only logs a failed hint write. A missing hint costs no data. A hint
+is a rebuildable index, and the open of a directory holding the copied
+files writes the hint of any data file that has none (#349). A caller
+copies a hint when it exists and skips it when it does not.
 
 ### Caller responsibility
 
@@ -708,7 +712,9 @@ that need it run in test builds only:
 
 The same containment check runs in `store_state`'s debug walk, so it
 covers every publication — rotation and vacuum included — not only the
-two cold paths.
+two cold paths. There a key whose file has no `file_stats` entry is a
+violation too: the cold path rules it out by checking that `file_stats`
+covers every file first, and the walk has no such check before it.
 
 P is the invariant the mmap read path depends on — see *Offset
 containment* under **View and span lifetimes**. It is checked after

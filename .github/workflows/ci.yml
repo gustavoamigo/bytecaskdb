@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Main CI pipeline: build, test, sanitizers, fuzz testing, and the MariaDB
+# Main CI pipeline: build, test, sanitizers, and the MariaDB
 # plugin suites (Linux only).
 # macOS coverage is handled by build-wheels.yml.
 
@@ -37,7 +37,7 @@ jobs:
         run: |
           dnf install -y \
             clang llvm llvm-devel lld \
-            libcxx libcxx-devel \
+            libcxx libcxx-devel libstdc++-static \
             xmake \
             python3-pip python3-devel \
             git ninja-build
@@ -54,7 +54,6 @@ jobs:
         run: |
           xmake build bytecask_tests
           xmake build btree_tests
-          xmake build radix_tree_memory_tests
           # Built here so a break shows up on the PR; they run in
           # crash-nightly.yml, isolation-nightly.yml and chaos-nightly.yml.
           xmake build crash_consistency
@@ -67,7 +66,6 @@ jobs:
           status=0
           build/linux/x86_64/release/bytecask_tests --reporter junit --out test-results/bytecask_tests.xml || status=1
           build/linux/x86_64/release/btree_tests --reporter junit --out test-results/btree_tests.xml || status=1
-          build/linux/x86_64/release/radix_tree_memory_tests --reporter junit --out test-results/radix_tree_memory_tests.xml || status=1
           exit "$status"
 
       - name: Run chaosfs model tests
@@ -87,8 +85,7 @@ jobs:
         run: |
           /usr/bin/python scripts/enrich_junit_sources.py \
             --pair build/linux/x86_64/release/bytecask_tests:test-results/bytecask_tests.xml \
-            --pair build/linux/x86_64/release/btree_tests:test-results/btree_tests.xml \
-            --pair build/linux/x86_64/release/radix_tree_memory_tests:test-results/radix_tree_memory_tests.xml
+            --pair build/linux/x86_64/release/btree_tests:test-results/btree_tests.xml
 
       - name: Publish test results in GitHub Checks
         if: ${{ always() && !cancelled() }}
@@ -112,7 +109,6 @@ jobs:
           files: |
             ./test-results/bytecask_tests.xml
             ./test-results/btree_tests.xml
-            ./test-results/radix_tree_memory_tests.xml
           report_type: test_results
           flags: cpp
           name: bytecask-cpp-tests
@@ -121,11 +117,6 @@ jobs:
           fail_ci_if_error: false
           use_oidc: true
 
-  # ---------------------------------------------------------------------------
-  # The radix tree is no longer the key directory the engine builds on, so
-  # nothing else here would compile it. This job keeps BYTECASK_KEYDIR=radix
-  # from rotting: same engine suite, other tree.
-  # ---------------------------------------------------------------------------
   mutation-patches:
     # The soak's, the chaos rig's and the durability sites' mutations are
     # diffs against engine code.
@@ -152,42 +143,6 @@ jobs:
           done
           exit "$status"
 
-  radix-keydir:
-    runs-on: ubuntu-latest
-    container:
-      image: fedora:43
-    env:
-      BYTECASK_MARCH: x86-64-v3
-      XMAKE_ROOT: "y"
-      BYTECASK_KEYDIR: radix
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          dnf install -y \
-            clang llvm llvm-devel lld \
-            libcxx libcxx-devel \
-            xmake \
-            python3-pip python3-devel \
-            git ninja-build
-          # bytecaskdb_python's on_load() asks nanobind for its include dir, and
-          # xmake f loads every target — so this job needs it even though it
-          # only builds bytecask_tests.
-          pip3 install nanobind
-
-      - name: Configure xmake
-        run: |
-          RESOURCE_DIR=$(clang --print-resource-dir)
-          xmake f --toolchain=clang \
-            --cxflags="-resource-dir=${RESOURCE_DIR}" \
-            -y
-
-      - name: Build and run the engine suite on the radix key directory
-        run: |
-          xmake build bytecask_tests
-          build/linux/x86_64/release/bytecask_tests
-
   # ---------------------------------------------------------------------------
   # The blind-leaf tree (docs/blind_leaf_btree_design.md) is the default key
   # directory, so the main job covers it. The B+ tree that keeps its keys in
@@ -209,7 +164,7 @@ jobs:
         run: |
           dnf install -y \
             clang llvm llvm-devel lld \
-            libcxx libcxx-devel \
+            libcxx libcxx-devel libstdc++-static \
             xmake \
             python3-pip python3-devel \
             git ninja-build
@@ -252,7 +207,7 @@ jobs:
         run: |
           dnf install -y \
             clang llvm llvm-devel lld \
-            libcxx libcxx-devel \
+            libcxx libcxx-devel libstdc++-static \
             gcc gcc-c++ cmake \
             xmake \
             python3-pip python3-devel \
@@ -344,48 +299,6 @@ jobs:
       sanitizers: '["address", "thread", "undefined"]'
 
   # ---------------------------------------------------------------------------
-  # Fuzz targets: compile-only check that the targets still build.
-  # The actual timed fuzzing run happens nightly in fuzz-nightly.yml — running
-  # a real fuzz budget on every PR pays a full build cost for a duration too
-  # short to reliably find anything.
-  # ---------------------------------------------------------------------------
-  fuzz:
-    runs-on: ubuntu-latest
-    container:
-      image: fedora:43
-    env:
-      BYTECASK_MARCH: x86-64-v3
-      XMAKE_ROOT: "y"
-      CLANG_TARGET_TRIPLE: x86_64-redhat-linux-gnu
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [fuzz_data_entry, fuzz_hint_entry]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          dnf install -y \
-            clang llvm llvm-devel lld \
-            libcxx libcxx-devel \
-            xmake \
-            python3-pip python3-devel \
-            git ninja-build
-          pip3 install nanobind pytest hypothesis
-
-      - name: Configure xmake
-        run: |
-          RESOURCE_DIR=$(clang --print-resource-dir)
-          xmake f --toolchain=clang \
-            --cxflags="-resource-dir=${RESOURCE_DIR}" \
-            --sanitizer=fuzzer,address \
-            -m debug -y
-
-      - name: Build fuzz target
-        run: xmake build ${{ matrix.target }}
-
-  # ---------------------------------------------------------------------------
   # Node.js bindings (bytecaskdb-node): native (N-API) and WASM (Embind)
   # backends, both exercised by the shared Vitest suite.
   # ---------------------------------------------------------------------------
@@ -410,7 +323,7 @@ jobs:
         run: |
           dnf install -y \
             clang llvm llvm-devel lld \
-            libcxx libcxx-devel \
+            libcxx libcxx-devel libstdc++-static \
             xmake cmake \
             python3-pip python3-devel \
             git ninja-build
@@ -514,22 +427,27 @@ jobs:
         run: |
           dnf install -y \
             clang llvm llvm-devel lld \
-            libcxx libcxx-devel \
+            libcxx libcxx-devel libstdc++-static \
             xmake \
             python3-pip python3-devel \
             git ninja-build
           pip3 install nanobind pytest hypothesis
 
+      # Fails when MC/DC on the durability and recovery code drops below
+      # 100% after exemptions (scripts/mcdc_report.py); the report is still
+      # written, so the uploads below run either way.
       - name: Run coverage pipeline
         run: bash scripts/run_coverage.sh
 
       - name: Upload coverage HTML artifact
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: coverage-html
           path: coverage/html/
 
       - name: Upload lcov artifact
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: coverage-lcov

@@ -17,9 +17,11 @@
 #include <cstdlib>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <vector>
@@ -229,6 +231,10 @@ struct Operation {
   // Runs the operation again after the fault, as a caller that got the error
   // would. Whatever the failure left, the whole transition must follow.
   std::function<void(DB &)> retry{};
+  // Checks what a run that returned produced, given the whole transition,
+  // once the fault is disarmed: a check run under it would have its own
+  // calls counted and failed.
+  std::function<void(const KeyValues &)> returned{};
 };
 
 auto one_of(const KeyValues &got, const std::vector<KeyValues> &states)
@@ -275,6 +281,7 @@ auto sweep_step(const Operation &op, const Pass &pass, int n) -> bool {
     trace(op.name, pass, n, rep, threw);
     INFO(op.name << ", fault " << pass.name << ", N = " << n << ": "
                  << (rep.fired ? rep.what : "not reached"));
+    if (!threw && op.returned) op.returned(after);
     if (!rep.fired) {
       REQUIRE_FALSE(threw);
       REQUIRE(did_work);
@@ -459,6 +466,54 @@ TEST_CASE("fault sweep: the interposers count the engine's calls",
   }
 }
 
+// The C++ standard library is linked statically so that std::filesystem's
+// calls reach the interposers too (xmake.lua). Linked against the shared
+// libstdc++, none of these would be counted.
+TEST_CASE("fault sweep: the interposers count std::filesystem's calls",
+          "[fault_sweep]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  std::filesystem::create_directories(dir);
+  const auto from = dir / "a.tmp";
+  const auto to = dir / "a";
+  { std::ofstream{from} << "x"; }
+
+  auto fails = [&](SyscallFault mode, auto &&call, std::string_view name) {
+    ScopedSyscallFaults faults{dir, mode, 1};
+    CHECK_THROWS_AS(call(), std::filesystem::filesystem_error);
+    const auto rep = faults.report();
+    INFO(rep.what);
+    CHECK(rep.what.starts_with(name));
+  };
+  // Before glibc 2.33, stat is an inline wrapper around __xstat, which
+  // --wrap=stat does not see (xmake.lua, fault_sweep_link_guard): there the
+  // call goes uncounted and nothing fails.
+  auto stat_fails = [&](auto &&call) {
+    {
+      ScopedSyscallFaults probe{dir, SyscallFault::none, 0};
+      (void)call();
+      if (probe.report().calls == 0) {
+        WARN("stat is not interposed on this libc");
+        return;
+      }
+    }
+    fails(SyscallFault::before, call, "stat(");
+  };
+  stat_fails([&] { return std::filesystem::file_size(from); });
+  stat_fails([&] { return std::filesystem::exists(from); });
+  fails(SyscallFault::before,
+        [&] { (void)std::filesystem::directory_iterator{dir}; }, "openat(");
+  fails(SyscallFault::before,
+        [&] { (void)std::filesystem::create_directory(dir / "sub"); }, "mkdir(");
+  // Made, then reported failed: the rename landed.
+  fails(SyscallFault::after, [&] { std::filesystem::rename(from, to); },
+        "rename(");
+  CHECK(std::filesystem::exists(to));
+  fails(SyscallFault::before, [&] { (void)std::filesystem::remove(to); },
+        "remove(");
+  CHECK(std::filesystem::exists(to));
+}
+
 TEST_CASE("fault sweep: put", "[fault_sweep]") {
   sweep({.name = "put",
          .setup = seed,
@@ -551,9 +606,38 @@ TEST_CASE("fault sweep: vacuum", "[fault_sweep]") {
 }
 
 TEST_CASE("fault sweep: create_manifest", "[fault_sweep]") {
+  auto listed = std::make_shared<std::vector<bytecask::FileInfo>>();
   sweep({.name = "create_manifest",
          .setup = seed,
-         .run = [](DB &db) { return !db.create_manifest().files.empty(); },
+         .run =
+             [listed](DB &db) {
+               auto m = db.create_manifest();
+               *listed = std::move(m.files);
+               return !listed->empty();
+             },
+         // Every listed data file exists. A hint may not, when the worker
+         // failed to write it (#349): copying what is there must still open
+         // to the manifest's state, the missing hint rebuilt by the open.
+         .returned =
+             [listed](const KeyValues &expected) {
+               REQUIRE_FALSE(listed->empty());
+               const auto dest =
+                   listed->front().data_path.parent_path().parent_path() /
+                   "from_manifest";
+               std::filesystem::create_directories(dest);
+               for (const auto &f : *listed) {
+                 INFO("manifest file " << f.file_id);
+                 REQUIRE(std::filesystem::exists(f.data_path));
+                 std::filesystem::copy_file(f.data_path,
+                                            dest / f.data_path.filename());
+                 if (std::filesystem::exists(f.hint_path))
+                   std::filesystem::copy_file(f.hint_path,
+                                              dest / f.hint_path.filename());
+               }
+               auto copy = DB::open(dest, {});
+               check_key_values(key_values(copy), expected,
+                                "a DB opened from the manifest's files");
+             },
          .transition = [](KeyValues kv) { return kv; }});
 }
 

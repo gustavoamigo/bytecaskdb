@@ -155,7 +155,9 @@ auto manifest = db.create_manifest();
 // Copy all files listed in manifest.files
 for (auto& file : manifest.files) {
     copy_file(file.data_path, backup_dir / file.data_path.filename());
-    copy_file(file.hint_path, backup_dir / file.hint_path.filename());
+    // A missing hint is rebuilt when the backup is opened.
+    if (exists(file.hint_path))
+        copy_file(file.hint_path, backup_dir / file.hint_path.filename());
 }
 
 // Record the consistency point

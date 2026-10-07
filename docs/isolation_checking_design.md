@@ -63,7 +63,7 @@ implicit W-W check through the model itself, not beside it.
 
 Inside a transaction, reads and appends on the same key see the
 transaction's own earlier appends. The harness keeps a per-transaction
-buffer for this, as `Transaction` (Layer 2) would.
+buffer for this; the engine has no transaction type that would.
 
 A transaction with no appends does not call `apply_batch`. It completes
 `:ok` with the reads it made.

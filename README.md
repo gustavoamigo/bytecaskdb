@@ -10,6 +10,7 @@ Test Analytics dashboard: https://app.codecov.io/gh/gustavoamigo/bytecaskdb/test
 
 CI uploads JUnit test results with per-test source file/line metadata so Test Analytics can show source context instead of a flat list.
 CI also publishes JUnit results directly in GitHub Checks for PR-native test summaries.
+The coverage job fails unless every condition in the write path, recovery and vacuum has MC/DC coverage — each shown by a test to decide its outcome on its own — or is marked unreachable, with the reason, at its site ([`docs/correctness_validation.md`](docs/correctness_validation.md#mcdc-coverage)).
 
 **ByteCaskDB** is a fast, predictable embedded key-value store written in C++. Reads and writes have flat, predictable latency from thousands of keys to hundreds of millions.
 
@@ -362,7 +363,9 @@ public:
         -> std::uint64_t;
 
     // Rotates the active file, waits for all hint files, and returns a
-    // manifest of sealed files with a snapshot. Forces file rotation.
+    // manifest of sealed files with a snapshot. Forces file rotation. A
+    // listed hint may be missing, if its write failed; opening the copied
+    // files rebuilds it.
     // Vacuum must not run between create_manifest() and file transfer
     // completion (caller responsibility).
     [[nodiscard]] auto create_manifest() -> FileManifest;
@@ -561,7 +564,7 @@ python ./scripts/run_engine_bench.py
 ./bytecaskdb-mariadb-plugin/benchmarks/compare-refs.sh --rounds=2 --innodb main my-branch
 ```
 
-The key directory is chosen at build time. The default is the blind-leaf B+ tree; `BYTECASK_KEYDIR=btree` builds the engine on the B+ tree that keeps key bytes in its leaves (larger, and it never reads a record to place or enumerate a key), and `BYTECASK_KEYDIR=radix` on the radix tree. All three pass the same engine suite in CI, and the on-disk format is the same, so a database opens under any of them.
+The key directory is chosen at build time. The default is the blind-leaf B+ tree; `BYTECASK_KEYDIR=btree` builds the engine on the B+ tree that keeps key bytes in its leaves (larger, and it never reads a record to place or enumerate a key). Both pass the same engine suite in CI, and the on-disk format is the same, so a database opens under either.
 
 A ready-to-use development environment is provided via the included [Dev Container](.devcontainer) (Fedora 43, Clang, xmake, LLVM tooling, and `nanobind` pre-installed).
 
@@ -580,11 +583,11 @@ If you want to take it in a different direction and fork it into your own thing,
 | [`docs/bytecask_design.md`](docs/bytecask_design.md) | Living design reference: architecture, concurrency model, file format, vacuum, recovery |
 | [`docs/file_format.md`](docs/file_format.md) | On-disk file format reference: data file entries, hint file entries, CRC, byte order, naming |
 | [`docs/engine_api_design.md`](docs/engine_api_design.md) | Public API specification with usage examples |
-| [`docs/parallel_recovery_design.md`](docs/parallel_recovery_design.md) | Parallel recovery algorithm and fan-in merge strategy |
+| [`docs/parallel_recovery_design.md`](docs/parallel_recovery_design.md) | File-partitioned recovery with a fan-in merge, as the radix tree used it; retired |
 | [`docs/hint_compression_design.md`](docs/hint_compression_design.md) | zstd-framed hint files: why cold-start recovery is bound by the SSD, the frame layout, compatibility, and measurements |
 | [`docs/blind_leaf_btree_design.md`](docs/blind_leaf_btree_design.md) | Blind-leaf B+ tree — the key directory: a from-scratch introduction to persistent data structures, path copying, tries, crit bits, blind search and fingerprints, then the design as built, with the measurements |
 | [`docs/persistent_btree_design.md`](docs/persistent_btree_design.md) | Persistent B+ tree design — the inner nodes of the key directory, and the keyed tree selectable with `BYTECASK_KEYDIR=btree` |
-| [`docs/persistent_radix_tree_design.md`](docs/persistent_radix_tree_design.md) | Persistent radix tree data structure design — the alternate key directory (`BYTECASK_KEYDIR=radix`) |
+| [`docs/persistent_radix_tree_design.md`](docs/persistent_radix_tree_design.md) | Persistent radix tree design — the key directory before the B+ tree; retired |
 | [`docs/correctness_validation.md`](docs/correctness_validation.md) | Write-path correctness validation: failure classes, proof test matrix, fault injection framework |
 | [`docs/failure_mode_comparison.md`](docs/failure_mode_comparison.md) | Write-path failure mode comparison: ByteCaskDB vs RocksDB, LevelDB, SQLite WAL, LMDB, WiredTiger |
 | [`docs/replication_primitives_design.md`](docs/replication_primitives_design.md) | Replication primitives: minimal API surface for building leader-follower replication on top of ByteCaskDB |

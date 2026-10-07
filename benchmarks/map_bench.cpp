@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// ByteCaskDB — benchmarks for the adaptive radix tree and ordered map structures
+// ByteCaskDB — benchmarks for the key directory trees and ordered map structures
 
 #include "../tests/alloc_tracker.h"
 #include "../tests/key_generators.h"
@@ -15,7 +15,6 @@
 #include <vector>
 import bytecask.btree;
 import bytecask.blind_btree;
-import bytecask.radix_tree;
 import bytecask;
 
 namespace {
@@ -32,100 +31,6 @@ auto to_bytes(const std::string &s) -> std::span<const std::byte> {
 // Container adapters — normalize each container's API for generic benchmarks.
 // ===========================================================================
 
-struct RTreeAdapter {
-  using key_type = std::string;
-  using map_type = bytecask::PersistentRadixTree<bytecask::KeyDirEntry>;
-  using transient_type = bytecask::TransientRadixTree<bytecask::KeyDirEntry>;
-
-  static auto make_keys(const std::vector<std::string> &strs)
-      -> std::vector<key_type> {
-    return strs;
-  }
-
-  static auto build(const std::vector<key_type> &keys) -> map_type {
-    auto t = map_type{};
-    for (std::size_t i = 0; i < keys.size(); ++i)
-      t = t.set(to_bytes(keys[i]),
-                bytecask::KeyDirEntry::make(i, 0, 0, 0));
-    return t;
-  }
-
-  static auto transient_build(const std::vector<key_type> &keys) -> map_type {
-    auto tr = map_type{}.transient();
-    for (std::size_t i = 0; i < keys.size(); ++i)
-      tr.set(to_bytes(keys[i]),
-             bytecask::KeyDirEntry::make(i, 0, 0, 0));
-    return std::move(tr).persistent();
-  }
-
-  static auto get(const map_type &m, const key_type &k) {
-    return m.get(to_bytes(k));
-  }
-
-  static auto lower_bound(const map_type &m, const key_type &k) {
-    return m.lower_bound(to_bytes(k));
-  }
-
-  static auto iterate_sum(const map_type &m) -> std::uint64_t {
-    std::uint64_t sum = 0;
-    for (auto it = m.begin(); it != m.end(); ++it) {
-      auto [k, v] = *it;
-      sum += v.sequence();
-    }
-    return sum;
-  }
-
-  static auto iterate_reverse_sum(const map_type &m) -> std::uint64_t {
-    std::uint64_t sum = 0;
-    for (auto it = m.rbegin(); it != m.rend(); ++it) {
-      auto [k, v] = *it;
-      sum += v.sequence();
-    }
-    return sum;
-  }
-
-  static auto upper_bound(const map_type &m, const key_type &k) {
-    return m.upper_bound(to_bytes(k));
-  }
-
-  static auto build_transient(const std::vector<key_type> &keys)
-      -> transient_type {
-    auto tr = map_type{}.transient();
-    for (std::size_t i = 0; i < keys.size(); ++i)
-      tr.set(to_bytes(keys[i]),
-             bytecask::KeyDirEntry::make(i, 0, 0, 0));
-    return tr;
-  }
-
-  static auto transient_get(const transient_type &tr, const key_type &k) {
-    return tr.get(to_bytes(k));
-  }
-
-  // Snapshot an existing persistent tree, update all keys, return a new
-  // persistent tree. Exercises the persistent -> transient -> mutate path
-  // and the refcount==1 fast path in ensure_mutable.
-  static auto transient_update(const map_type &base,
-                               const std::vector<key_type> &keys) -> map_type {
-    auto tr = base.transient();
-    for (std::size_t i = 0; i < keys.size(); ++i)
-      tr.set(to_bytes(keys[i]),
-             bytecask::KeyDirEntry::make(i + 1, 0, 0, 0));
-    return std::move(tr).persistent();
-  }
-
-  static void transient_set(transient_type &tr, const key_type &k,
-                            std::size_t i) {
-    tr.set(to_bytes(k), bytecask::KeyDirEntry::make(i, 0, 0, 0));
-  }
-
-  template <typename Resolve>
-  static auto merge(map_type a, map_type b, Resolve &&resolve) -> map_type {
-    return map_type::merge(std::move(a), std::move(b),
-                           std::forward<Resolve>(resolve));
-  }
-};
-
-// Same surface over the persistent B+ tree (docs/persistent_btree_design.md).
 struct BTreeAdapter {
   using key_type = std::string;
   using map_type = bytecask::PersistentBTree<bytecask::KeyDirEntry>;
@@ -204,12 +109,6 @@ struct BTreeAdapter {
   static void transient_set(transient_type &tr, const key_type &k,
                             std::size_t i) {
     tr.set(to_bytes(k), bytecask::KeyDirEntry::make(i, 0, 0, 0));
-  }
-
-  template <typename Resolve>
-  static auto merge(map_type a, map_type b, Resolve &&resolve) -> map_type {
-    return map_type::merge(std::move(a), std::move(b),
-                           std::forward<Resolve>(resolve));
   }
 };
 
@@ -565,7 +464,7 @@ template <typename A> void BM_MemoryFootprint(benchmark::State &state) {
 
 // ---------------------------------------------------------------------------
 // Memory footprint with prefix-heavy keys (user::uuid, order::uuid, …).
-// Shows radix tree prefix compression benefit vs flat key storage.
+// Shows how each tree stores prefix-heavy keys against flat key storage.
 // ---------------------------------------------------------------------------
 template <typename A> void BM_PrefixedMemory(benchmark::State &state) {
   auto keys = A::make_keys(
@@ -594,135 +493,6 @@ template <typename A> void BM_PrefixedMemory(benchmark::State &state) {
 }
 
 // ===========================================================================
-// Merge benchmarks — disjoint vs overlapping, and split-build-merge vs linear
-// ===========================================================================
-
-// Merge-only: two disjoint N/2-key trees (zero overlap).
-// Measures the cost of structural merge when all subtrees are adopted by
-// pointer (best case — no conflict resolution). merge consumes its inputs,
-// so the merge-only benchmarks rebuild them each iteration, and free the
-// previous result, with the timer paused; what is timed is the merge and
-// the freeing of the input nodes it does not reuse.
-template <typename A> void BM_MergeDisjoint(benchmark::State &state) {
-  auto n = static_cast<std::size_t>(state.range(0));
-  auto all = generate_uniform_keys(n);
-  std::vector<std::string> ka(all.begin(), all.begin() + std::ssize(all) / 2);
-  std::vector<std::string> kb(all.begin() + std::ssize(all) / 2, all.end());
-  auto resolve = [](const bytecask::KeyDirEntry &,
-                    const bytecask::KeyDirEntry &b) noexcept { return b; };
-  typename A::map_type merged;
-  for (auto _ : state) {
-    state.PauseTiming();
-    merged = {}; // free the previous result off the clock
-    auto ta = A::transient_build(ka);
-    auto tb = A::transient_build(kb);
-    state.ResumeTiming();
-    merged = A::merge(std::move(ta), std::move(tb), resolve);
-    benchmark::DoNotOptimize(merged);
-  }
-}
-
-// Merge-only: two N/2-key trees with ~50% key overlap (worst realistic case).
-// Half the keys exist in both trees and require conflict resolution.
-template <typename A> void BM_MergeOverlapping(benchmark::State &state) {
-  auto n = static_cast<std::size_t>(state.range(0));
-  auto all = generate_uniform_keys(n);
-  auto quarter = std::ssize(all) / 4;
-  std::vector<std::string> ka(all.begin(), all.begin() + quarter * 3);
-  std::vector<std::string> kb(all.begin() + quarter, all.end());
-  auto resolve = [](const bytecask::KeyDirEntry &,
-                    const bytecask::KeyDirEntry &b) noexcept { return b; };
-  typename A::map_type merged;
-  for (auto _ : state) {
-    state.PauseTiming();
-    merged = {}; // free the previous result off the clock
-    auto ta = A::transient_build(ka);
-    auto tb = A::transient_build(kb);
-    state.ResumeTiming();
-    merged = A::merge(std::move(ta), std::move(tb), resolve);
-    benchmark::DoNotOptimize(merged);
-  }
-}
-
-// Merge-only on binary keys — same ~50% overlap as BM_MergeOverlapping, but
-// on the one shape that produces a full 256-child node (see the binary-key
-// note above). merge_impl walks the right-hand node's children in order, so
-// this is the merge-path counterpart to BM_LowerBoundBinary.
-template <typename A> void BM_MergeOverlappingBinary(benchmark::State &state) {
-  auto n = static_cast<std::size_t>(state.range(0));
-  auto all = generate_binary_keys(n);
-  auto quarter = std::ssize(all) / 4;
-  std::vector<std::string> ka(all.begin(), all.begin() + quarter * 3);
-  std::vector<std::string> kb(all.begin() + quarter, all.end());
-  auto resolve = [](const bytecask::KeyDirEntry &,
-                    const bytecask::KeyDirEntry &b) noexcept { return b; };
-  typename A::map_type merged;
-  for (auto _ : state) {
-    state.PauseTiming();
-    merged = {}; // free the previous result off the clock
-    auto ta = A::transient_build(ka);
-    auto tb = A::transient_build(kb);
-    state.ResumeTiming();
-    merged = A::merge(std::move(ta), std::move(tb), resolve);
-    benchmark::DoNotOptimize(merged);
-  }
-}
-
-// Full parallel-recovery simulation (measured sequentially):
-//   build(N/2) + build(N/2) + merge
-// Compare against TransientSet(N) to decide if split+merge is worthwhile.
-// In true parallel execution, build times overlap → real time ≈ build(N/2) +
-// merge.
-template <typename A> void BM_SplitBuildMerge(benchmark::State &state) {
-  auto n = static_cast<std::size_t>(state.range(0));
-  auto all = generate_uniform_keys(n);
-  std::vector<std::string> ka(all.begin(), all.begin() + std::ssize(all) / 2);
-  std::vector<std::string> kb(all.begin() + std::ssize(all) / 2, all.end());
-  auto resolve = [](const bytecask::KeyDirEntry &,
-                    const bytecask::KeyDirEntry &b) noexcept { return b; };
-  for (auto _ : state) {
-    auto ta = A::transient_build(ka);
-    auto tb = A::transient_build(kb);
-    benchmark::DoNotOptimize(A::merge(std::move(ta), std::move(tb), resolve));
-  }
-}
-
-// Split-build-merge with ~20% key overlap — simulates later rounds in the
-// fan-in merge tree where partial overlap is expected (e.g. hot keys updated
-// across multiple data files).
-template <typename A> void BM_SplitBuildMergeOverlapping(benchmark::State &state) {
-  auto n = static_cast<std::size_t>(state.range(0));
-  auto all = generate_uniform_keys(n);
-  // 10% overlap on each side → 20% of keys shared between the two halves.
-  auto overlap = std::ssize(all) / 10;
-  auto mid = std::ssize(all) / 2;
-  std::vector<std::string> ka(all.begin(), all.begin() + mid + overlap);
-  std::vector<std::string> kb(all.begin() + mid - overlap, all.end());
-  auto resolve = [](const bytecask::KeyDirEntry &,
-                    const bytecask::KeyDirEntry &b) noexcept { return b; };
-  for (auto _ : state) {
-    auto ta = A::transient_build(ka);
-    auto tb = A::transient_build(kb);
-    benchmark::DoNotOptimize(A::merge(std::move(ta), std::move(tb), resolve));
-  }
-}
-
-// Same as above but with prefix-heavy keys — realistic recovery workload.
-template <typename A> void BM_SplitBuildMergePrefixed(benchmark::State &state) {
-  auto n = static_cast<std::size_t>(state.range(0));
-  auto all = generate_prefixed_keys(n);
-  std::vector<std::string> ka(all.begin(), all.begin() + std::ssize(all) / 2);
-  std::vector<std::string> kb(all.begin() + std::ssize(all) / 2, all.end());
-  auto resolve = [](const bytecask::KeyDirEntry &,
-                    const bytecask::KeyDirEntry &b) noexcept { return b; };
-  for (auto _ : state) {
-    auto ta = A::transient_build(ka);
-    auto tb = A::transient_build(kb);
-    benchmark::DoNotOptimize(A::merge(std::move(ta), std::move(tb), resolve));
-  }
-}
-
-// ===========================================================================
 // Registration
 // ===========================================================================
 
@@ -734,58 +504,19 @@ constexpr int kLarge = 100000;
 #define SIZES ->Arg(kSmall)->Arg(kMedium)->Arg(kLarge)
 #define ITER_SIZES ->Arg(kSmall)->Arg(kMedium)
 
-// Bulk insert
-BENCHMARK(BM_Build<RTreeAdapter>)         ->Name("RadixTree/PersistentSet")        SIZES;
-BENCHMARK(BM_TransientBuild<RTreeAdapter>)->Name("RadixTree/TransientSet")         SIZES;
-BENCHMARK(BM_TransientBuildPrefixed<RTreeAdapter>)->Name("RadixTree/TransientSetPrefixed") SIZES;
-BENCHMARK(BM_TransientUpdate<RTreeAdapter>)->Name("RadixTree/TransientUpdate")      SIZES;
-BENCHMARK(BM_TransientInsertBatch<RTreeAdapter>)->Name("RadixTree/TransientInsertBatch") SIZES;
-BENCHMARK(BM_Build<StdMapAdapter>)        ->Name("StdMap/Set")                     SIZES;
+// std::map, as a reference
+BENCHMARK(BM_Build<StdMapAdapter>)            ->Name("StdMap/Set")              SIZES;
+BENCHMARK(BM_MemoryFootprint<StdMapAdapter>)  ->Name("StdMap/Memory")           SIZES;
+BENCHMARK(BM_Get<StdMapAdapter>)              ->Name("StdMap/Get")              SIZES;
+BENCHMARK(BM_Iterate<StdMapAdapter>)          ->Name("StdMap/Iterate")          ITER_SIZES;
+BENCHMARK(BM_LowerBound<StdMapAdapter>)       ->Name("StdMap/LowerBound")       SIZES;
+BENCHMARK(BM_UpperBound<StdMapAdapter>)       ->Name("StdMap/UpperBound")       SIZES;
+BENCHMARK(BM_LowerBoundBinary<StdMapAdapter>) ->Name("StdMap/LowerBoundBinary") SIZES;
+BENCHMARK(BM_IterateBinary<StdMapAdapter>)    ->Name("StdMap/IterateBinary")    ITER_SIZES;
+BENCHMARK(BM_ReverseIterate<StdMapAdapter>)   ->Name("StdMap/ReverseIterate")   ITER_SIZES;
+BENCHMARK(BM_PrefixedMemory<StdMapAdapter>)   ->Name("StdMap/PrefixedMemory")   SIZES;
 
-// Memory footprint
-BENCHMARK(BM_MemoryFootprint<RTreeAdapter>)->Name("RadixTree/Memory")  SIZES;
-BENCHMARK(BM_MemoryFootprint<StdMapAdapter>)->Name("StdMap/Memory")    SIZES;
-
-// Point lookups
-BENCHMARK(BM_Get<RTreeAdapter>)           ->Name("RadixTree/Get")            SIZES;
-BENCHMARK(BM_TransientGet<RTreeAdapter>)  ->Name("RadixTree/TransientGet")   SIZES;
-BENCHMARK(BM_Get<StdMapAdapter>)          ->Name("StdMap/Get")               SIZES;
-
-// Full iteration
-BENCHMARK(BM_Iterate<RTreeAdapter>)       ->Name("RadixTree/Iterate")        ITER_SIZES;
-BENCHMARK(BM_Iterate<StdMapAdapter>)      ->Name("StdMap/Iterate")           ITER_SIZES;
-
-// lower_bound
-BENCHMARK(BM_LowerBound<RTreeAdapter>)    ->Name("RadixTree/LowerBound")     SIZES;
-BENCHMARK(BM_LowerBound<StdMapAdapter>)   ->Name("StdMap/LowerBound")        SIZES;
-
-// upper_bound
-BENCHMARK(BM_UpperBound<RTreeAdapter>)    ->Name("RadixTree/UpperBound")     SIZES;
-BENCHMARK(BM_UpperBound<StdMapAdapter>)   ->Name("StdMap/UpperBound")        SIZES;
-
-// Binary keys — the only shape that builds a full 256-child node
-BENCHMARK(BM_LowerBoundBinary<RTreeAdapter>) ->Name("RadixTree/LowerBoundBinary") SIZES;
-BENCHMARK(BM_LowerBoundBinary<StdMapAdapter>)->Name("StdMap/LowerBoundBinary")    SIZES;
-BENCHMARK(BM_IterateBinary<RTreeAdapter>)    ->Name("RadixTree/IterateBinary")    ITER_SIZES;
-BENCHMARK(BM_IterateBinary<StdMapAdapter>)   ->Name("StdMap/IterateBinary")       ITER_SIZES;
-
-// Reverse iteration
-BENCHMARK(BM_ReverseIterate<RTreeAdapter>)->Name("RadixTree/ReverseIterate") ITER_SIZES;
-BENCHMARK(BM_ReverseIterate<StdMapAdapter>)->Name("StdMap/ReverseIterate")   ITER_SIZES;
-
-// Memory footprint with prefix-heavy keys (user::uuid, order::uuid, …)
-BENCHMARK(BM_PrefixedMemory<RTreeAdapter>)   ->Name("RadixTree/PrefixedMemory")  SIZES;
-BENCHMARK(BM_PrefixedMemory<StdMapAdapter>)  ->Name("StdMap/PrefixedMemory")     SIZES;
-
-// Merge
-BENCHMARK(BM_MergeDisjoint<RTreeAdapter>)                  ->Name("RadixTree/MergeDisjoint")           SIZES;
-BENCHMARK(BM_MergeOverlapping<RTreeAdapter>)               ->Name("RadixTree/MergeOverlapping")        SIZES;
-BENCHMARK(BM_MergeOverlappingBinary<RTreeAdapter>)         ->Name("RadixTree/MergeOverlappingBinary")  SIZES;
-BENCHMARK(BM_SplitBuildMerge<RTreeAdapter>)                ->Name("RadixTree/SplitBuildMerge")              SIZES;
-BENCHMARK(BM_SplitBuildMergeOverlapping<RTreeAdapter>)     ->Name("RadixTree/SplitBuildMergeOverlapping")   SIZES;
-BENCHMARK(BM_SplitBuildMergePrefixed<RTreeAdapter>)        ->Name("RadixTree/SplitBuildMergePrefixed")      SIZES;
-
-// B+ tree, same rows
+// Keyed B+ tree
 BENCHMARK(BM_Build<BTreeAdapter>)         ->Name("BTree/PersistentSet")        SIZES;
 BENCHMARK(BM_TransientBuild<BTreeAdapter>)->Name("BTree/TransientSet")         SIZES;
 BENCHMARK(BM_TransientBuildPrefixed<BTreeAdapter>)->Name("BTree/TransientSetPrefixed") SIZES;
@@ -802,12 +533,6 @@ BENCHMARK(BM_LowerBoundBinary<BTreeAdapter>) ->Name("BTree/LowerBoundBinary") SI
 BENCHMARK(BM_IterateBinary<BTreeAdapter>)    ->Name("BTree/IterateBinary")    ITER_SIZES;
 BENCHMARK(BM_ReverseIterate<BTreeAdapter>)->Name("BTree/ReverseIterate") ITER_SIZES;
 BENCHMARK(BM_PrefixedMemory<BTreeAdapter>)   ->Name("BTree/PrefixedMemory")  SIZES;
-BENCHMARK(BM_MergeDisjoint<BTreeAdapter>)                  ->Name("BTree/MergeDisjoint")           SIZES;
-BENCHMARK(BM_MergeOverlapping<BTreeAdapter>)               ->Name("BTree/MergeOverlapping")        SIZES;
-BENCHMARK(BM_MergeOverlappingBinary<BTreeAdapter>)         ->Name("BTree/MergeOverlappingBinary")  SIZES;
-BENCHMARK(BM_SplitBuildMerge<BTreeAdapter>)                ->Name("BTree/SplitBuildMerge")              SIZES;
-BENCHMARK(BM_SplitBuildMergeOverlapping<BTreeAdapter>)     ->Name("BTree/SplitBuildMergeOverlapping")   SIZES;
-BENCHMARK(BM_SplitBuildMergePrefixed<BTreeAdapter>)        ->Name("BTree/SplitBuildMergePrefixed")      SIZES;
 
 // Blind-leaf tree. The number is the leaf allocation in bytes (a jemalloc
 // size class): 640 = 48 entries, 1024 = 80 (the engine's), 1280 = 101,

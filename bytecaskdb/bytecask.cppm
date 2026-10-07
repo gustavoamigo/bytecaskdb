@@ -57,7 +57,6 @@ import bytecask.data_entry;
 import bytecask.data_file;
 import bytecask.hint_entry;
 import bytecask.hint_file;
-import bytecask.radix_tree;
 export import bytecask.types;
 import bytecask.u32_map;
 import bytecask.util;
@@ -120,7 +119,7 @@ export inline constexpr std::uint64_t kDefaultRotationThreshold =
 export inline constexpr std::uint32_t kMaxKeySize = 65535;
 export inline constexpr std::uint32_t kMaxValueSize = KeyDirEntry::kMaxValueSize;
 
-// Sensible defaults — keys live in RAM (radix tree), values go to disk.
+// Sensible defaults — keys live in RAM (the key directory), values go to disk.
 export inline constexpr std::uint32_t kDefaultMaxKeyBytes = 4096;
 export inline constexpr std::uint32_t kDefaultMaxValueBytes =
     4U * 1024 * 1024; // 4 MiB
@@ -667,18 +666,6 @@ public:
 
   [[nodiscard]] auto durable_seq() const noexcept -> std::uint64_t;
 
-  [[nodiscard]] auto mode() const noexcept -> Mode { return mode_; }
-  [[nodiscard]] auto is_degraded() const noexcept -> bool { return degraded_; }
-  [[nodiscard]] auto degraded_reason() const noexcept -> const std::string & {
-    return degraded_reason_;
-  }
-
-  // Returns a mutable reference to file_stats_. Used by resume() to update
-  // total_bytes for a truncated active file before publishing state.
-  [[nodiscard]] auto file_stats() noexcept -> TransientU32Map<FileStats> & {
-    return file_stats_;
-  }
-
   // Commit: consume the transient and produce a new immutable EngineState.
   [[nodiscard]] auto persistent() && -> std::shared_ptr<EngineState>;
 
@@ -1194,7 +1181,9 @@ public:
       -> std::uint64_t;
 
   // Rotates the active file, waits for all hint files, and returns a
-  // manifest of sealed files with a snapshot. Forces file rotation.
+  // manifest of sealed files with a snapshot. Forces file rotation. A
+  // listed hint may be missing, if its write failed; opening the copied
+  // files rebuilds it.
   // Vacuum must not run between create_manifest() and file transfer
   // completion (caller responsibility).
   [[nodiscard]] auto create_manifest() -> FileManifest;
@@ -1451,17 +1440,6 @@ private:
   // Phase 1: opens all data files, seals them, generates missing hint files.
   auto recovery_prepare_files(EngineState &s)
       -> std::vector<RecoveredFile>;
-  // Builds a RecoveryResult from a set of hint files; no shared mutable state.
-  static auto recovery_build_from_hints(std::span<RecoveredFile> files,
-                                        bool strict) -> RecoveryResult;
-  // Merges two RecoveryResults with sequence-based conflict resolution.
-  static auto recovery_merge_results(RecoveryResult a, RecoveryResult b)
-      -> RecoveryResult;
-  // Reconstructs key_dir from hint files. Uses file-level fan-in parallelism
-  // when recovery_threads > 1; single-threaded otherwise.
-  auto recovery_load_parallel(EngineState s, std::vector<RecoveredFile> files,
-                              unsigned recovery_threads, bool strict)
-      -> EngineState;
 #ifdef BYTECASK_KEYDIR_BLIND
   // Reconstructs a blind key directory straight from the sorted hint files:
   // fences in each file, range splitters from the fences, a k-way merge per
@@ -1470,11 +1448,9 @@ private:
                              unsigned recovery_threads, bool strict)
       -> EngineState;
 #endif
-#ifdef BYTECASK_USE_BTREE
   // Reconstructs key_dir from hint files by range merge. Coupled to the B+
   // tree: it needs the tree to sample its own separators and to bulk-build
-  // and concatenate range-disjoint slices. See the definition for why the
-  // radix tree wants a different strategy.
+  // and concatenate range-disjoint slices.
   auto recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
                             unsigned recovery_threads, bool strict)
       -> EngineState;
@@ -1482,7 +1458,6 @@ private:
   // Requires the sorted hint files flush_hints_for writes.
   static auto recovery_build_sorted(std::span<RecoveredFile> files,
                                     bool strict) -> RecoveryResult;
-#endif
 
   // Portable atomic load/store for shared_ptr. The C++20 specialization
   // std::atomic<std::shared_ptr<T>> is not yet available in all libc++
@@ -1512,7 +1487,8 @@ private:
 #endif
     state_gen_.store(next_state_gen(), std::memory_order_release);
     publishing_.fetch_sub(1, std::memory_order_release);
-    if (degraded && old && !old->degraded) {
+    // state_ is never null: it starts as an empty state (see open).
+    if (degraded && !old->degraded) {
       counters_.degraded_transitions.fetch_add(1, std::memory_order_relaxed);
     }
   }
@@ -1613,6 +1589,13 @@ public:
   // Called on the background worker at the start of every hint task queued
   // by dispatch_hint. Lets a test hold the worker to build a backlog.
   std::function<void()> test_before_hint_;
+  // Called by vacuum once its copy is in place, before it takes the write
+  // barrier to commit. Lets a test write to the keys the copy holds.
+  std::function<void()> test_before_vacuum_commit_;
+  // Called under durable_mu_ each time a thread blocked in wait_published or
+  // durable_sequence checks its condition, the first time before it blocks.
+  // Lets a test act once a waiter is parked. Must not take durable_mu_.
+  std::function<void()> test_in_sequence_wait_;
   // Leaves plans unresolved, so validation and the key directory update go
   // by key, as before record locations were used as version tokens. The
   // differential test runs one workload both ways.
@@ -2221,10 +2204,11 @@ void TransientEngineState::apply_writes(
             // An update of a key still at the snapshot's record goes by that
             // location and reads nothing; anything else is placed by key.
             const auto &at = plan.resolved_entry(w_idx);
+            const bool by_location =
+                at && kd_put_at(key_dir_, key_span, *at, entry);
             const auto existing =
-                at && kd_put_at(key_dir_, key_span, *at, entry)
-                    ? std::optional{kd_hit(*at)}
-                    : kd_put(key_dir_, key_span, entry, kd_ctx());
+                by_location ? std::optional{kd_hit(*at)}
+                            : kd_put(key_dir_, key_span, entry, kd_ctx());
             if (existing) {
               const auto dec =
                   entry_size(key_span.size(), existing->value_size());
@@ -2242,9 +2226,10 @@ void TransientEngineState::apply_writes(
           } else if constexpr (std::is_same_v<T, WritePlan::PointDel>) {
             const std::span<const std::byte> key_span{op.key};
             const auto &at = plan.resolved_entry(w_idx);
-            const auto existing = at && kd_erase_at(key_dir_, key_span, *at)
-                                      ? std::optional{kd_hit(*at)}
-                                      : kd_erase(key_dir_, key_span, kd_ctx());
+            const bool by_location = at && kd_erase_at(key_dir_, key_span, *at);
+            const auto existing =
+                by_location ? std::optional{kd_hit(*at)}
+                            : kd_erase(key_dir_, key_span, kd_ctx());
             if (existing) {
               const auto dec =
                   entry_size(key_span.size(), existing->value_size());
@@ -2306,13 +2291,13 @@ void TransientEngineState::apply_writes(
     ++io_idx;
   }
 
-  // Track per-file sequence bounds.
+  // Track per-file sequence bounds. A file's sequences ascend, so its
+  // minimum is its first batch's.
   const auto batch_end_seq = next_seq_ - 1;
   file_stats_.update(
       active_file_id_,
       [batch_start_seq, batch_end_seq](FileStats &fs) {
-        if (fs.min_sequence == 0 || batch_start_seq < fs.min_sequence)
-          fs.min_sequence = batch_start_seq;
+        if (fs.min_sequence == 0) fs.min_sequence = batch_start_seq;
         if (batch_end_seq > fs.max_sequence)
           fs.max_sequence = batch_end_seq;
       });
@@ -2410,13 +2395,13 @@ void TransientEngineState::apply_ingest(
   // Advance next_seq past the highest ingested sequence.
   if (max_seq >= next_seq_) next_seq_ = max_seq + 1;
 
-  // Track per-file sequence bounds.
+  // Track per-file sequence bounds. A file's sequences ascend, so its
+  // minimum is its first batch's.
   const auto batch_end_seq = max_seq;
   file_stats_.update(
       active_file_id_,
       [batch_start_seq, batch_end_seq](FileStats &fs) {
-        if (fs.min_sequence == 0 || batch_start_seq < fs.min_sequence)
-          fs.min_sequence = batch_start_seq;
+        if (fs.min_sequence == 0) fs.min_sequence = batch_start_seq;
         if (batch_end_seq > fs.max_sequence)
           fs.max_sequence = batch_end_seq;
       });
@@ -2496,7 +2481,7 @@ void TransientEngineState::apply_resume(
   for (const auto &e : entries) {
     const std::span<const std::byte> key_span{e.key};
     if (e.sequence > max_seq) max_seq = e.sequence;
-    if (seq_min == 0 || e.sequence < seq_min) seq_min = e.sequence;
+    if (seq_min == 0) seq_min = e.sequence;  // entries are in file order
     if (e.sequence > seq_max) seq_max = e.sequence;
     // entries holds every committed entry in the file, so the file's
     // tombstones are rebuilt from scratch here, like its bounds.
@@ -3889,9 +3874,9 @@ auto DB::vacuum_scan_and_copy(
     std::uint64_t retain_after) -> VacuumScanResult {
   VacuumScanResult result;
 
+  // The source is scanned in file order, where sequences ascend.
   auto track_seq = [&](std::uint64_t seq) {
-    if (result.min_sequence == 0 || seq < result.min_sequence)
-      result.min_sequence = seq;
+    if (result.min_sequence == 0) result.min_sequence = seq;
     if (seq > result.max_sequence) result.max_sequence = seq;
   };
 
@@ -3899,9 +3884,10 @@ auto DB::vacuum_scan_and_copy(
     switch (entry.entry_type) {
     case EntryType::Put: {
       const auto existing = kd_get(snap->key_dir, entry.key, snap->kd_ctx());
+      // A location names one record, so an entry still at this one is this
+      // record, sequence and all.
       if (existing && existing->file_id() == source_file_id &&
-          existing->file_offset() == entry_off &&
-          existing->sequence() == entry.sequence) {
+          existing->file_offset() == entry_off) {
         const auto new_off =
             dest_file.append_entry(entry.sequence, EntryType::Put, entry.key,
                              entry.value);
@@ -4098,6 +4084,7 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
   // final name while the old one is still the published state's; cleanup
   // removes it.
   FAULT_INJECTION(io_vacuum_compact_post_rename);
+  if (test_before_vacuum_commit_) test_before_vacuum_commit_();
 #endif
 
   // Reserve the destination id before opening the file, so the file carries
@@ -4276,10 +4263,11 @@ void DB::set_mode(Mode mode) {
   // A leader stepping down makes every write it acknowledged durable, and
   // so shippable: changes_since stops at durable_sequence, and a sync=false
   // write left above it would never reach the next leader, which then
-  // reuses its sequence.
+  // reuses its sequence. Only a leader can hold such a write: ingest syncs
+  // before it publishes.
   const auto last_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
-  if (mode == Mode::Follower && current->mode == Mode::Leader
-      && !current->degraded && t.durable_seq() < last_seq) {
+  if (mode == Mode::Follower && !current->degraded &&
+      t.durable_seq() < last_seq) {
     sync_active_file(t, current, "set_mode(Follower)");
   }
   t.apply_set_mode(mode);
@@ -4465,7 +4453,14 @@ void DB::resume() {
 void DB::wait_published(std::uint64_t sequence) const {
   std::unique_lock<std::mutex> lk{durable_mu_};
   durable_cv_.wait(lk, [&] {
+#ifdef BYTECASK_TESTING
+    if (test_in_sequence_wait_) test_in_sequence_wait_();
+#endif
     const auto s = load_state();
+    // mcdc-exempt(C3): close() takes the write barrier, which waits for the
+    // flush this waiter's sequence is in, so by the time a state is closed
+    // that flush has either published the sequence (C1) or degraded (C2).
+    // The test stays so a waiter can never outlive the engine.
     return s->next_seq > sequence || s->degraded || s->closed;
   });
 }
@@ -4482,6 +4477,9 @@ auto DB::durable_sequence(std::uint64_t min_sequence,
 
   std::unique_lock<std::mutex> lk{durable_mu_};
   durable_cv_.wait_for(lk, timeout, [&] {
+#ifdef BYTECASK_TESTING
+    if (test_in_sequence_wait_) test_in_sequence_wait_();
+#endif
     const auto cur = load_state();
     return cur->durable_seq >= min_sequence || cur->closed;
   });
@@ -4654,7 +4652,8 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
       new_state->next_seq > old_state->next_seq;
   const auto became_degraded =
       new_state->degraded && !old_state->degraded;
-  const auto became_closed = new_state->closed && !old_state->closed;
+  // close() publishes once; nothing publishes after it.
+  const auto became_closed = new_state->closed;
 
 #ifndef NDEBUG
   if constexpr (kKeyDirReadsKeys) {
@@ -4667,8 +4666,14 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
                                         new_state->kd_ctx(/*verify=*/false));
          it != std::default_sentinel; ++it) {
       const auto loc = *it;
-      if (const auto *fs = new_state->file_stats.get(loc.file_id());
-          fs != nullptr && loc.file_offset() >= fs->total_bytes) {
+      const auto *fs = new_state->file_stats.get(loc.file_id());
+      if (fs == nullptr) {
+        deem_as_degraded(std::format(
+            "invariant violation: key in file_id {}, which has no file_stats",
+            loc.file_id()));
+        return;
+      }
+      if (loc.file_offset() >= fs->total_bytes) {
         deem_as_degraded(std::format(
             "invariant violation: key in file_id {} starts at {} but the "
             "file's committed extent is {}",
@@ -4687,8 +4692,14 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
       if (entry.sequence() > max_seq) max_seq = entry.sequence();
       const auto entry_end = entry.file_offset() +
                              entry_size(key_span.size(), entry.value_size());
-      if (const auto *fs = new_state->file_stats.get(entry.file_id());
-          fs != nullptr && entry_end > fs->total_bytes) {
+      const auto *fs = new_state->file_stats.get(entry.file_id());
+      if (fs == nullptr) {
+        deem_as_degraded(std::format(
+            "invariant violation: key in file_id {}, which has no file_stats",
+            entry.file_id()));
+        return;
+      }
+      if (entry_end > fs->total_bytes) {
         deem_as_degraded(std::format(
             "invariant violation: key in file_id {} ends at {} but the file's "
             "committed extent is {}",
@@ -4696,7 +4707,8 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
         return;
       }
     }
-    if (max_seq > 0 && new_state->next_seq <= max_seq) {
+    // next_seq starts at 1, so an empty key directory passes.
+    if (new_state->next_seq <= max_seq) {
       deem_as_degraded(std::format(
           "invariant violation: next_seq {} <= max key_dir sequence {}",
           new_state->next_seq, max_seq));
@@ -4771,14 +4783,15 @@ void DB::validate_state_consistency(const EngineState &s) const {
     // put and only mmap_end_ moves, so an entry above the new extent would
     // leave a reader's span addressing a page beyond EOF. See "View and span
     // lifetimes" in CONTRACT.md.
+    // Check 4 put every registered file in file_stats.
     const auto size = entry_size(key_span.size(), entry.value_size());
     const auto entry_end = entry.file_offset() + size;
-    if (const auto *fs = s.file_stats.get(entry.file_id());
-        fs != nullptr && entry_end > fs->total_bytes) {
+    if (entry_end > s.file_stats.get(entry.file_id())->total_bytes) {
       throw std::runtime_error{std::format(
           "state consistency: key in file_id {} ends at {} but the file's "
           "committed extent is {}",
-          entry.file_id(), entry_end, fs->total_bytes)};
+          entry.file_id(), entry_end,
+          s.file_stats.get(entry.file_id())->total_bytes)};
     }
     computed_live[entry.file_id()] += size;
     if (entry.sequence() > max_seq) max_seq = entry.sequence();
@@ -4809,7 +4822,8 @@ void DB::validate_state_consistency(const EngineState &s) const {
           "(one is zero, the other is not)",
           file_id, fs.min_sequence, fs.max_sequence)};
     }
-    if (fs.min_sequence > 0 && fs.min_sequence > fs.max_sequence) {
+    // Both are zero or neither is (above), so this needs no zero test.
+    if (fs.min_sequence > fs.max_sequence) {
       throw std::runtime_error{std::format(
           "state consistency: file_id {} min_sequence {} > max_sequence {}",
           file_id, fs.min_sequence, fs.max_sequence)};
@@ -4864,13 +4878,16 @@ auto find_sequence_overlap(const EngineState &s)
       ranges.push_back({fs.min_sequence, fs.max_sequence, fid});
     }
   }
+  // Sorted by min, a range overlaps an earlier one only if it overlaps the
+  // one just before it: until an overlap is found the ranges are disjoint,
+  // so the previous range is also the one reaching furthest.
   std::ranges::sort(ranges, {}, &Range::min);
-  const Range *widest = nullptr;
+  const Range *prev = nullptr;
   for (const auto &r : ranges) {
-    if (widest != nullptr && r.min <= widest->max) {
-      return std::pair{widest->file_id, r.file_id};
+    if (prev != nullptr && r.min <= prev->max) {
+      return std::pair{prev->file_id, r.file_id};
     }
-    if (widest == nullptr || r.max > widest->max) widest = &r;
+    prev = &r;
   }
   return std::nullopt;
 }
@@ -4907,14 +4924,10 @@ auto DB::recovery_open(const Options &opts) -> EngineState {
         s = recovery_load_streams(std::move(s), std::move(files),
                                   opts.recovery_threads,
                                   opts.fail_recovery_on_crc_errors);
-#elif defined(BYTECASK_USE_BTREE)
+#else
         s = recovery_load_ranged(std::move(s), std::move(files),
                                  opts.recovery_threads,
                                  opts.fail_recovery_on_crc_errors);
-#else
-        s = recovery_load_parallel(std::move(s), std::move(files),
-                                   opts.recovery_threads,
-                                   opts.fail_recovery_on_crc_errors);
 #endif
         const auto overlap = find_sequence_overlap(s);
         if (!overlap) return s;
@@ -5017,7 +5030,9 @@ auto DB::recovery_prepare_files(EngineState &s)
       const auto end = flush_hints_for(data_file, dir_, [&](Offset e) {
         recovery_check_tail(*data_file, e, data_paths);
       });
-      if (end && *end < std::filesystem::file_size(p)) {
+      // The file had no hint, so flush_hints_for wrote one and returns the
+      // end of what it indexed.
+      if (end.value() < std::filesystem::file_size(p)) {
         data_file.reset();
         truncate_durably(p, *end);
         // Same file_id as the open above, deliberately. Under the buffer
@@ -5156,362 +5171,6 @@ static auto recovery_needed_tombstones(
   return {horizon, std::move(point)};
 }
 
-// Builds a RecoveryResult from a subset of hint files.
-// Each worker calls this independently — no shared mutable state.
-//
-// Marks a tombstone needed whenever it suppresses a Put from another file or
-// erases any key directory entry. The erase case is marked whatever file the
-// entry came from: the entry may have displaced an older Put from another
-// file, and the tree keeps no record of that.
-// When strict is false, corrupt or unreadable hint files are skipped
-// with a warning instead of throwing.
-auto DB::recovery_build_from_hints(std::span<RecoveredFile> files, bool strict)
-    -> RecoveryResult {
-  std::uint64_t max_seq = 0;
-  auto t = RecoveryKeyDirTree{}.transient();
-  std::map<Key, PointTombstone> tombstones;
-  std::vector<RangeTombstone> range_tombstones;
-  std::vector<std::uint64_t> needed;
-  bool skipped = false;
-
-  // Use a plain hash map for file_stats accumulation — in-place mutation is
-  // O(1) per entry vs. the copy-out/write-back overhead of TransientU32Map::update().
-  // Converted to PersistentU32Map once at the end.
-  std::unordered_map<std::uint32_t, FileStats> fstats_scratch;
-  for (const auto &rf : files) {
-    fstats_scratch.emplace(rf.file_id, FileStats{0, rf.total_bytes});
-  }
-
-  // live_bytes are NOT tracked per-entry here — Phase 4 in
-  // recovery_load_parallel recomputes them in a single pass after the
-  // final merge, avoiding redundant O(N) map lookups per worker.
-  auto seq_wins = [](const KeyDirEntry &existing, const KeyDirEntry &incoming) {
-    return kde_newer(incoming, existing);
-  };
-
-  for (auto &[file_id, data_file, hint_path, tb] : files) {
-    // Only a file that cannot be opened is skipped. An error once its entries
-    // are being applied fails the open: some of them are already in t.
-    const auto hint = open_hint_or_skip(data_file, hint_path, strict);
-    if (!hint) {
-      skipped = true;
-      continue;
-    }
-    auto scanner = hint->make_scanner();
-    while (auto he = scanner.next()) {
-      // Track per-file sequence bounds for ALL entries, including those
-      // suppressed by tombstones. Bounds represent the range of sequences
-      // physically present in the file, not just live ones.
-      if (he->sequence > max_seq) max_seq = he->sequence;
-      auto &file_fs = fstats_scratch[file_id];
-      if (file_fs.min_sequence == 0 || he->sequence < file_fs.min_sequence)
-        file_fs.min_sequence = he->sequence;
-      if (he->sequence > file_fs.max_sequence)
-        file_fs.max_sequence = he->sequence;
-      file_fs.tombstone_bytes +=
-          tombstone_size(he->entry_type, he->key.size(), he->end_key.size());
-      file_fs.marker_bytes += marker_size(he->entry_type);
-
-      if (he->entry_type == EntryType::Put) {
-        const auto k = Key{he->key};
-        const auto tomb_it = tombstones.find(k);
-        if (tomb_it != tombstones.end() &&
-            tomb_it->second.seq >= he->sequence) {
-          if (tomb_it->second.file_id != file_id)
-            needed.push_back(tomb_it->second.seq);
-          continue;
-        }
-        // Check range tombstones — O(R) per Put, R expected small.
-        bool suppressed = false;
-        for (auto &rt : range_tombstones) {
-          if (rt.seq >= he->sequence && k >= rt.start && k < rt.end) {
-            if (rt.file_id != file_id) rt.needed = true;
-            suppressed = true;
-            break;
-          }
-        }
-        if (suppressed) {
-          continue;
-        }
-        t.upsert(he->key,
-                 KeyDirEntry::make(he->sequence, he->file_offset, file_id,
-                                   he->value_size),
-                 seq_wins);
-      } else if (he->entry_type == EntryType::Delete) {
-        const auto k = Key{he->key};
-        auto &slot = tombstones[k];
-        if (he->sequence > slot.seq) slot = {he->sequence, file_id};
-        const auto existing = t.get(he->key);
-        if (existing && existing->sequence() < he->sequence) {
-          t.erase(he->key);
-          needed.push_back(he->sequence);
-        }
-      } else if (he->entry_type == EntryType::RangeDel) {
-        const auto start = Key{he->key};
-        const auto end = Key{he->end_key};
-        // Erase keys in [start, end) with sequence < this tombstone.
-        std::vector<Key> to_erase;
-        for (auto it = t.lower_bound(he->key);
-             it != std::default_sentinel; ++it) {
-          auto [key_span, entry] = *it;
-          if (Key{key_span} >= end) break;
-          if (entry.sequence() < he->sequence) {
-            to_erase.emplace_back(key_span);
-          }
-        }
-        for (const auto &ek : to_erase) {
-          t.erase(std::span<const std::byte>{ek});
-        }
-        range_tombstones.push_back(
-            {start, end, he->sequence, file_id, !to_erase.empty()});
-      }
-    }
-  }
-
-  auto fstats_t = PersistentU32Map<FileStats>{}.transient();
-  for (const auto &[id, fs] : fstats_scratch) fstats_t.set(id, fs);
-
-  return {std::move(t).persistent(), std::move(tombstones),
-          std::move(range_tombstones), max_seq,
-          std::move(fstats_t).persistent(), std::move(needed), skipped};
-}
-
-// Merges two RecoveryResults. Tree merge uses sequence-based conflict
-// resolution, then tombstones from both sides are cross-applied to
-// suppress stale PUTs. Tombstone maps and file_stats are unioned.
-// live_bytes are NOT recomputed here — deferred to a single pass
-// after the final merge to avoid O(N × log₂ W) redundant traversals.
-auto DB::recovery_merge_results(RecoveryResult a, RecoveryResult b)
--> RecoveryResult {
-  auto merged_stats_t = a.file_stats.transient();
-  for (const auto [fid, fs] : b.file_stats) {
-    merged_stats_t.set(fid, fs);
-  }
-  a.file_stats = std::move(merged_stats_t).persistent();
-
-  // kde_newer throws on two entries under one sequence (SequenceOverlap, or
-  // corruption), but the radix merge must not be thrown through: its clones
-  // would be stranded. The first failure is held and raised once merge has
-  // returned, when the merged tree frees itself as it unwinds.
-  std::exception_ptr conflict;
-  auto seq_resolver = [&conflict](const KeyDirEntry &x,
-                                  const KeyDirEntry &y) noexcept {
-    try {
-      return kde_newer(x, y) ? x : y;
-    } catch (...) {
-      if (!conflict) conflict = std::current_exception();
-      return x;
-    }
-  };
-
-  // merge consumes both inputs; a and b are ours, moved in by the caller.
-  auto merged = RecoveryKeyDirTree::merge(std::move(a.key_dir), std::move(b.key_dir),
-                                  seq_resolver);
-  if (conflict) std::rethrow_exception(conflict);
-
-  // Erasing an entry marks the tombstone needed, as in
-  // recovery_build_from_hints: the entry comes from the other side's files.
-  auto &needed = a.needed_tombstones;
-  needed.insert(needed.end(), b.needed_tombstones.begin(),
-                b.needed_tombstones.end());
-  for (const auto &[key, tomb] : b.tombstones) {
-    std::span<const std::byte> key_span{key.begin(), key.size()};
-    const auto entry = merged.get(key_span);
-    if (entry && entry->sequence() < tomb.seq) {
-      merged = merged.erase(key_span);
-      needed.push_back(tomb.seq);
-    }
-  }
-
-  for (const auto &[key, tomb] : a.tombstones) {
-    std::span<const std::byte> key_span{key.begin(), key.size()};
-    const auto entry = merged.get(key_span);
-    if (entry && entry->sequence() < tomb.seq) {
-      merged = merged.erase(key_span);
-      needed.push_back(tomb.seq);
-    }
-  }
-
-  auto &merged_tombs = a.tombstones;
-  for (auto &[key, tomb] : b.tombstones) {
-    auto &existing = merged_tombs[key];
-    if (tomb.seq > existing.seq) existing = tomb;
-  }
-
-  // Cross-apply range tombstones from both sides.
-  auto cross_apply_range_tombs =
-      [](RecoveryKeyDirTree &tree, std::vector<RangeTombstone> &rts) {
-        for (auto &rt : rts) {
-          std::vector<Key> to_erase;
-          for (auto it = tree.lower_bound(
-                   std::span<const std::byte>{rt.start.begin(), rt.start.size()});
-               it != std::default_sentinel; ++it) {
-            auto [key_span, entry] = *it;
-            if (Key{key_span} >= rt.end) break;
-            if (entry.sequence() < rt.seq) {
-              to_erase.emplace_back(key_span);
-            }
-          }
-          for (const auto &ek : to_erase) {
-            tree = tree.erase(std::span<const std::byte>{ek});
-          }
-          if (!to_erase.empty()) rt.needed = true;
-        }
-      };
-  cross_apply_range_tombs(merged, b.range_tombstones);
-  cross_apply_range_tombs(merged, a.range_tombstones);
-
-  // Union range tombstone vectors.
-  auto &merged_range_tombs = a.range_tombstones;
-  merged_range_tombs.insert(merged_range_tombs.end(),
-                            std::make_move_iterator(b.range_tombstones.begin()),
-                            std::make_move_iterator(b.range_tombstones.end()));
-
-  return {std::move(merged), std::move(merged_tombs),
-          std::move(merged_range_tombs),
-          std::max(a.max_seq, b.max_seq), std::move(a.file_stats),
-          std::move(needed), a.skipped_files || b.skipped_files};
-}
-
-// Parallel recovery: file-level partitioning with sequential accumulator merge.
-// Round-robin assigns files to W workers, each builds a RecoveryResult,
-// then results are merged one-at-a-time into an accumulator as workers finish.
-auto DB::recovery_load_parallel(EngineState s,
-                                std::vector<RecoveredFile> files,
-                                unsigned recovery_threads, bool strict)
-    -> EngineState {
-  RecoveryPhaseLog plog;
-
-  if (files.empty()) {
-    return s;
-  }
-
-#ifdef BYTECASK_SINGLE_THREADED
-  auto W = 1u;
-  (void)recovery_threads;
-#else
-  auto W = std::min(static_cast<unsigned>(files.size()), recovery_threads);
-  if (W == 0) W = 1;
-#endif
-
-  // Phase 1: round-robin file assignment.
-  std::vector<std::vector<RecoveredFile>> worker_files(W);
-  for (unsigned i = 0; i < files.size(); ++i) {
-    worker_files[i % W].push_back(std::move(files[i]));
-  }
-
-  // Phase 2: parallel build + Phase 3: sequential accumulator merge.
-  // Workers push finished results into a queue; the main thread merges
-  // each into an accumulator as it arrives. Each ~N/W-key tree is merged
-  // once; disjoint subtrees are shared O(1) by the persistent tree, so
-  // total merge work is proportional to overlap, not N × log₂(W).
-  //
-  // A single worker runs on the calling thread: a thread would buy nothing,
-  // and the open keeps the caller's thread-local state, the fault injector
-  // among it.
-  std::vector<RecoveryResult> queue;
-  if (W == 1) {
-    queue.push_back(recovery_build_from_hints(worker_files[0], strict));
-  }
-#ifndef BYTECASK_SINGLE_THREADED
-  else {
-    std::mutex queue_mu;
-    std::condition_variable queue_cv;
-    std::vector<std::exception_ptr> worker_errors(W, nullptr);
-    unsigned finished_count = 0;
-
-    {
-      std::vector<std::jthread> threads;
-      threads.reserve(W);
-      for (unsigned i = 0; i < W; ++i) {
-        threads.emplace_back([&, i] {
-          try {
-            auto result = recovery_build_from_hints(worker_files[i], strict);
-            std::unique_lock<std::mutex> lk{queue_mu};
-            queue.push_back(std::move(result));
-            ++finished_count;
-            queue_cv.notify_one();
-          } catch (...) {
-            std::unique_lock<std::mutex> lk{queue_mu};
-            worker_errors[i] = std::current_exception();
-            ++finished_count;  // still advances so main thread doesn't deadlock
-            queue_cv.notify_one();
-          }
-        });
-      }
-
-      // Main thread: consume results as they arrive.
-      RecoveryResult acc{};
-      bool acc_initialized = false;
-      unsigned merged_count = 0;
-
-      while (merged_count < W) {
-        std::unique_lock<std::mutex> lk{queue_mu};
-        queue_cv.wait(lk, [&] { return finished_count > merged_count; });
-        std::vector<RecoveryResult> local;
-        local.swap(queue);
-        merged_count = finished_count;  // advance past all finished, including errored
-        lk.unlock();
-
-        for (auto &incoming : local) {
-          if (!acc_initialized) {
-            acc = std::move(incoming);
-            acc_initialized = true;
-          } else {
-            acc = recovery_merge_results(std::move(acc), std::move(incoming));
-          }
-        }
-      }
-
-      // Store final result for phases 4-5 (threads join at scope exit).
-      queue.clear();
-      queue.push_back(std::move(acc));
-    }
-
-    // Threads are joined. Propagate any worker exception now, in both modes:
-    // the lenient skip happens inside the worker (open_hint_or_skip), so what
-    // escapes it is an error no mode answers — a resource error, a read that
-    // failed once entries were applied, a SequenceOverlap.
-    for (const auto &err : worker_errors) {
-      if (err) std::rethrow_exception(err);
-    }
-  }
-#endif
-
-  auto &final_result = queue[0];
-  plog.mark("build + fan-in merge");
-
-  // Phase 4: recompute live_bytes once from the fully-merged tree.
-  // Accumulate into a hash map (O(1) in-place), then apply to PersistentU32Map
-  // in a single pass over the (small) file set — avoids O(N) radix tree
-  // mutations for N key_dir entries.
-  std::unordered_map<std::uint32_t, std::uint64_t> live_accum;
-  for (auto it = final_result.key_dir.begin(); it != std::default_sentinel;
-       ++it) {
-    const auto &[key_span, kde] = *it;
-    live_accum[kde.file_id()] += entry_size(key_span.size(), kde.value_size());
-  }
-  auto fstats_t = final_result.file_stats.transient();
-  for (const auto [fid, _] : final_result.file_stats) {
-    const auto acc_it = live_accum.find(fid);
-    const auto live = (acc_it != live_accum.end()) ? acc_it->second : 0ULL;
-    fstats_t.update(fid, [live](FileStats &fs) { fs.live_bytes = live; });
-  }
-  final_result.file_stats = std::move(fstats_t).persistent();
-  plog.mark("live_bytes pass");
-
-  // Phase 5: assembly.
-  needed_tombstones_ = recovery_needed_tombstones(
-      std::move(final_result.needed_tombstones),
-      final_result.range_tombstones, final_result.max_seq,
-      final_result.skipped_files);
-  s.key_dir = key_dir_from_recovered(std::move(final_result.key_dir));
-  s.next_seq = final_result.max_seq + 1;
-  s.file_stats = std::move(final_result.file_stats);
-  return s;
-}
-
-#ifdef BYTECASK_USE_BTREE
 static auto recovery_span_of(const Key &k) noexcept
     -> std::span<const std::byte> {
   return {k.begin(), k.size()};
@@ -5589,12 +5248,12 @@ static void recovery_mark_needed(std::span<const std::byte> key,
 // Builds a RecoveryResult by merging sorted hint runs straight into a bulk
 // loader, instead of inserting key by key into a transient.
 //
-// recovery_build_from_hints costs a descent, a slot shift and a split every
+// Inserting key by key costs a descent, a slot shift and a split every
 // fanout inserts, per key; per-phase timing put it at 90 of the B+ tree's
-// 128 ms at 1M keys and 4 threads, which is the whole of its deficit against
-// the radix tree. A bulk loader writes each key exactly once with no descent
-// and no split, but it needs its keys in ascending order — which is what a
-// sorted hint file gives.
+// 128 ms at 1M keys and 4 threads, which was the whole of its deficit against
+// the radix tree it replaced. A bulk loader writes each key exactly once with
+// no descent and no split, but it needs its keys in ascending order — which
+// is what a sorted hint file gives.
 //
 // Requires the sorted hint files flush_hints_for writes. A sorted hint file is
 // (batch markers and range tombstones, in scan order) followed by one run of
@@ -5672,8 +5331,6 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
   KeyDirBulkLoader out;
   std::vector<std::size_t> matches;
   matches.reserve(cursors.size());
-  std::vector<std::byte> prev_key;
-  bool have_prev = false;
 
   // The next Put or Delete in this file, counting every entry it steps over
   // towards the file's sequence bounds.
@@ -5728,7 +5385,7 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
   // A heap, not a scan over the cursors: there is one cursor per hint file
   // this worker owns, and at one recovery thread that is every file in the
   // database. A linear scan costs O(files) per key, which at 10M keys and
-  // ~180 files made recovery 3x slower than the radix tree; the heap makes
+  // ~180 files made recovery 3x slower than the heap; the heap makes
   // it O(log files).
   const auto ahead = [&](std::size_t a, std::size_t b) {
     return recovery_key_cmp(cursors[a].cur.key, cursors[b].cur.key) > 0;
@@ -5787,13 +5444,9 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
         suppressed = true;
         break;
       }
+      // Keys leave the heap ascending: each cursor's are (load checks it)
+      // and equal keys are merged above. The bulk loader checks it again.
       if (!suppressed) {
-        if (have_prev && recovery_key_cmp(key, prev_key) <= 0) {
-          throw std::runtime_error{
-              "bytecask: merged hint keys are not ascending"};
-        }
-        prev_key.assign(key.begin(), key.end());
-        have_prev = true;
         out.append(key, KeyDirEntry::make(winner.sequence, winner.file_offset,
                                           winner_file, winner.value_size));
       }
@@ -5819,10 +5472,10 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
 // ---------------------------------------------------------------------------
 // Range-partitioned recovery — the B+ tree path.
 //
-// recovery_load_parallel folds the W per-worker trees together pairwise, so
-// every surviving key is rewritten once per level of the fan-in: log2(W)
-// passes over the key set, the last of them serial. That fold is what stops
-// recovery scaling past a few threads.
+// Folding W per-worker trees together pairwise would rewrite every surviving
+// key once per level of the fan-in: log2(W) passes over the key set, the
+// last of them serial. That fold is what stopped recovery scaling past a few
+// threads when the radix tree used it.
 //
 // Here the fold is replaced by a partition. The workers' trees are cut at the
 // same splitters, each range is merged by one thread straight into a bulk
@@ -5835,12 +5488,6 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
 // them and the pooled sample is cut into R even parts. Only the *output* has
 // to be disjoint — each worker still reads whatever keys its own files held —
 // so nothing is shuffled and the phase costs two barriers.
-//
-// This is not a strategy the radix tree would want. A trie is canonical: two
-// radix trees agree on the shape of any subtree whose key set they agree on,
-// so their merge adopts whole subtrees by pointer and does work proportional
-// to the overlap rather than to N. Rebuilding the key set into range slices
-// would throw that away, which is why the radix path keeps the pairwise fold.
 // ---------------------------------------------------------------------------
 auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
                               unsigned recovery_threads, bool strict)
@@ -6042,8 +5689,10 @@ auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
       // what it saw.
       for (const auto i : matches) {
         const auto &e = cursors[i].entry;
-        if (on_key && e.sequence() < tomb->second.seq &&
-            e.file_id() != tomb->second.file_id)
+        // recovery_build_sorted reduces each file to its newest entry for a
+        // key, so a file offers a Put or a tombstone for it, never both: a
+        // Put older than the tombstone is from another file.
+        if (on_key && e.sequence() < tomb->second.seq)
           outs[r].needed.push_back(tomb->second.seq);
         for (const auto *rt : rts) {
           if (e.sequence() >= rt->seq || e.file_id() == rt->file_id) continue;
@@ -6111,7 +5760,6 @@ auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
   s.file_stats = std::move(fstats_t).persistent();
   return s;
 }
-#endif  // BYTECASK_USE_BTREE
 
 #ifdef BYTECASK_KEYDIR_BLIND
 // ---------------------------------------------------------------------------
@@ -6533,7 +6181,8 @@ private:
     has_entry_ = false;
 
     // Advance past the previously cached entry (deferred from last call).
-    if (needs_advance_ && entry_iter_) {
+    // Set only once an entry was read from entry_iter_.
+    if (needs_advance_) {
       ++(*entry_iter_);
       needs_advance_ = false;
     }

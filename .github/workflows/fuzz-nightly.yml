@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
-# Nightly fuzz run (libFuzzer + ASan), 5 minutes per target.
+# Nightly fuzz run (libFuzzer + ASan), 30 minutes per target.
 #
-# ci.yml's `fuzz` job only compiles these targets on every push/PR — a
-# meaningful fuzzing budget doesn't fit a per-PR job, so the timed run lives
-# here instead, on a schedule plus manual dispatch.
+# The only place the fuzz targets are built: a harness that stops compiling
+# fails here, the next night. Each target's corpus is cached between runs, so
+# a night starts from what the last one found rather than from the seeds, and
+# is minimised (-merge=1) before it is saved.
 
 name: Fuzz (nightly)
 
@@ -27,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [fuzz_data_entry, fuzz_hint_entry]
+        target: [fuzz_data_entry, fuzz_hint_entry, fuzz_data_file_scan]
     steps:
       - uses: actions/checkout@v4
 
@@ -57,20 +58,59 @@ jobs:
       - name: Build fuzz target
         run: xmake build ${{ matrix.target }}
 
-      - name: Run ${{ matrix.target }} (5 min)
+      - name: Restore corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: tests/fuzz/corpus/
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Run ${{ matrix.target }} (30 min)
         run: |
           TARGET=${{ matrix.target }}
           NAME="${TARGET#fuzz_}"
           CORPUS="tests/fuzz/corpus/$NAME/"
           SEED="tests/fuzz/seed/$NAME/"
-          mkdir -p "$CORPUS"
+          mkdir -p "$CORPUS" tests/fuzz/findings
           BIN="build/linux/x86_64/debug/$TARGET"
-          "$BIN" "$CORPUS" "$SEED" -max_total_time=300 -max_len=65536
+          "$BIN" "$CORPUS" "$SEED" -max_total_time=1800 -max_len=65536 \
+            -artifact_prefix=tests/fuzz/findings/
+
+      # Keeps only inputs that add coverage, so the cache does not grow
+      # night after night. Runs after a finding too: the corpus up to it is
+      # still worth keeping.
+      - name: Minimise corpus
+        if: always()
+        run: |
+          TARGET=${{ matrix.target }}
+          NAME="${TARGET#fuzz_}"
+          CORPUS="tests/fuzz/corpus/$NAME"
+          BIN="build/linux/x86_64/debug/$TARGET"
+          [ -d "$CORPUS" ] && [ -x "$BIN" ] || exit 0
+          mkdir -p "$CORPUS.min"
+          "$BIN" -merge=1 "$CORPUS.min" "$CORPUS"
+          rm -rf "$CORPUS"
+          mv "$CORPUS.min" "$CORPUS"
+
+      - name: Save corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: tests/fuzz/corpus/
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+
+      - name: Upload corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: tests/fuzz/corpus/
+          if-no-files-found: ignore
 
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-crash-${{ matrix.target }}
-          path: tests/fuzz/corpus/*/crash-*
+          path: tests/fuzz/findings/
           if-no-files-found: ignore
