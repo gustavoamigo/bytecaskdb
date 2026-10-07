@@ -884,6 +884,9 @@ target("wasm_tests")
     set_wasm_policies()
     add_wasm_sources()
     add_files("tests/*.cpp", "tests/proof/generated/*.cpp")
+    -- The counted fault sweep interposes libc with the linker's --wrap,
+    -- which wasm-ld has no equivalent for (see bytecask_tests).
+    remove_files("tests/syscall_faults.cpp", "tests/fault_sweep_test.cpp")
     add_files("bytecaskdb-node/wasm/catch2_stringmakers.cpp")
     add_includedirs("bytecaskdb", "tests")
     add_defines("BYTECASK_TESTING")
