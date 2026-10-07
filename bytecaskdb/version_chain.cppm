@@ -3,9 +3,9 @@
 //
 // ByteCaskDB — version-chain reclamation for persistent trees.
 //
-// Lifted from the radix tree (PR #86) with the tree shape abstracted behind
-// a Traits type, so any path-copying tree can use it. See
-// docs/radix_tree_epoch_reclamation_design.md for the reasoning and
+// Built first for the radix tree (PR #86), since retired, with the tree shape
+// abstracted behind a Traits type so any path-copying tree can use it. See
+// docs/radix_tree_epoch_reclamation_design.md for the design and
 // docs/persistent_btree_design.md for the B+ tree that uses it.
 
 module;
@@ -70,9 +70,9 @@ void free_node_subtree_if(typename Traits::Node *root, Pred is_garbage) {
 // VersionChain<Traits> — owns node lifetime for every persistent tree built
 // over one Traits type.
 //
-// Both trees instantiate this: the B+ tree over btree_detail::ChainTraits and
-// the radix tree over RadixChainTraits. It began as the radix tree's own
-// class and was lifted out and made generic over Traits, which needs only a
+// The B+ trees (keyed and blind) instantiate this over
+// btree_detail::ChainTraits. It began as the radix tree's own class and was
+// lifted out and made generic over Traits, which needs only a
 // node's version tag, its children, how to destroy it, and the accounting
 // hook the memory tests read.
 //
@@ -82,7 +82,7 @@ void free_node_subtree_if(typename Traits::Node *root, Pred is_garbage) {
 // or unlinks — and hands that list over when it publishes. Nothing carries a
 // reference count; freeing is a batch of plain deletes off the write path.
 //
-// Two contracts make the free rule exact. publish() enforces both.
+// One contract makes the free rule exact, and publish() enforces it.
 //
 //   Chain. A version may be derived only from a version that has no
 //   successor. The versions derived from one another form a lineage, and
@@ -93,12 +93,6 @@ void free_node_subtree_if(typename Traits::Node *root, Pred is_garbage) {
 //   none of R's version or its descendants. A node created by S and retired
 //   by R is therefore reachable from exactly the versions of its lineage
 //   with tags in [S, R).
-//
-//   Consumption. merge takes the sole handle of two versions that have
-//   neither predecessor nor successor — what a builder or a previous merge
-//   yields — and its result starts a new lineage. The inputs stop being
-//   versions at publish, and the nodes of theirs the result does not reuse
-//   are freed at once: nothing else reached them.
 //
 // When is a retired node freed? It is parked on the live version that
 // blocks it — the smallest live tag of its lineage in [S, R) — and freed the
@@ -170,31 +164,6 @@ public:
       }
       add_version(tag, lineage);
       park_retired(tag, lineage, retired, to_free);
-    }
-    destroy_all(to_free);
-  }
-
-  // Registers the version built by session `tag` merging versions `a` and
-  // `b` (0 = the empty tree), consuming both: each must be held by exactly
-  // one handle and be the only version of its lineage, or std::logic_error
-  // is thrown with nothing changed. On success the inputs are no longer
-  // versions — the caller drops its handles without unpinning — and the
-  // result starts a lineage of its own.
-  void publish_merge(std::uint64_t tag, std::uint64_t a, std::uint64_t b,
-                     std::vector<Node *> &retired) {
-    std::vector<Node *> to_free;
-    {
-      std::lock_guard<std::mutex> lk{mu_};
-      for (auto input : {a, b}) {
-        if (input != 0)
-          check_consumable(input);
-      }
-      for (auto input : {a, b}) {
-        if (input != 0)
-          records_.erase(seat_for(input));
-      }
-      add_version(tag, tag);
-      park_retired(tag, tag, retired, to_free);
     }
     destroy_all(to_free);
   }
@@ -334,23 +303,6 @@ private:
       pending_.push_back(Parcel{std::move(retired), tag, lineage});
     retired.clear();
     drain_pending(out);
-  }
-
-  // Under mu_: the consumption contract for one merge input.
-  void check_consumable(std::uint64_t tag) {
-    const auto *rec = find(tag);
-    if (rec->live != 1)
-      throw std::logic_error{
-          "VersionChain::merge: an input is held by another handle"};
-    if (rec->successor != 0)
-      throw std::logic_error{"VersionChain::merge: an input has a successor"};
-    for (const auto &r : records_) {
-      if (r.lineage == rec->lineage && r.tag != tag)
-        throw std::logic_error{
-            "VersionChain::merge: an input has a live predecessor"};
-    }
-    // Nothing can be parked on the only version of a lineage.
-    assert(rec->parked.nodes.empty() && rec->more.empty());
   }
 
   // Under mu_: the version at `it` has no successor and no handle left.

@@ -1,5 +1,7 @@
 # Persistent Radix Tree (Byte-Array Keys)
 
+> **Status: retired.** The persistent radix tree was ByteCaskDB's key directory until the B+ tree replaced it as the default (`docs/persistent_btree_design.md`), and stayed selectable with `BYTECASK_KEYDIR=radix` until the blind-leaf B+ tree (`docs/blind_leaf_btree_design.md`) became the default. It has since been removed from the codebase. This document is kept as the record of how it worked and what it measured; its version-chain reclamation lives on in `bytecaskdb/version_chain.cppm` (`docs/radix_tree_epoch_reclamation_design.md`). Code references below are to files that no longer exist; the last commit that has them is [`70612bc`](https://github.com/gustavoamigo/bytecaskdb/tree/70612bcef60dd41136f7c01f8c593034b3833cc6) (`bytecaskdb/radix_tree.cppm`).
+
 This document describes the design of the persistent radix tree used as the in-memory key directory in ByteCaskDB. It is intended for contributors who need to understand, modify, or reason about correctness of this component.
 
 The **Background** section builds up the necessary concepts from scratch — persistent data structures, structural sharing, Tries, and Patricia Tries — for readers coming without that context. From §1 onward the document covers the C++ design: the overview, design principles, node layout, API, algorithms, acceptance criteria, memory usage, and benchmark results.

@@ -54,7 +54,6 @@ jobs:
         run: |
           xmake build bytecask_tests
           xmake build btree_tests
-          xmake build radix_tree_memory_tests
           # Built here so a break shows up on the PR; they run in
           # crash-nightly.yml, isolation-nightly.yml and chaos-nightly.yml.
           xmake build crash_consistency
@@ -67,7 +66,6 @@ jobs:
           status=0
           build/linux/x86_64/release/bytecask_tests --reporter junit --out test-results/bytecask_tests.xml || status=1
           build/linux/x86_64/release/btree_tests --reporter junit --out test-results/btree_tests.xml || status=1
-          build/linux/x86_64/release/radix_tree_memory_tests --reporter junit --out test-results/radix_tree_memory_tests.xml || status=1
           exit "$status"
 
       - name: Run chaosfs model tests
@@ -87,8 +85,7 @@ jobs:
         run: |
           /usr/bin/python scripts/enrich_junit_sources.py \
             --pair build/linux/x86_64/release/bytecask_tests:test-results/bytecask_tests.xml \
-            --pair build/linux/x86_64/release/btree_tests:test-results/btree_tests.xml \
-            --pair build/linux/x86_64/release/radix_tree_memory_tests:test-results/radix_tree_memory_tests.xml
+            --pair build/linux/x86_64/release/btree_tests:test-results/btree_tests.xml
 
       - name: Publish test results in GitHub Checks
         if: ${{ always() && !cancelled() }}
@@ -112,7 +109,6 @@ jobs:
           files: |
             ./test-results/bytecask_tests.xml
             ./test-results/btree_tests.xml
-            ./test-results/radix_tree_memory_tests.xml
           report_type: test_results
           flags: cpp
           name: bytecask-cpp-tests
@@ -121,11 +117,6 @@ jobs:
           fail_ci_if_error: false
           use_oidc: true
 
-  # ---------------------------------------------------------------------------
-  # The radix tree is no longer the key directory the engine builds on, so
-  # nothing else here would compile it. This job keeps BYTECASK_KEYDIR=radix
-  # from rotting: same engine suite, other tree.
-  # ---------------------------------------------------------------------------
   mutation-patches:
     # The soak's, the chaos rig's and the durability sites' mutations are
     # diffs against engine code.
@@ -151,42 +142,6 @@ jobs:
             fi
           done
           exit "$status"
-
-  radix-keydir:
-    runs-on: ubuntu-latest
-    container:
-      image: fedora:43
-    env:
-      BYTECASK_MARCH: x86-64-v3
-      XMAKE_ROOT: "y"
-      BYTECASK_KEYDIR: radix
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          dnf install -y \
-            clang llvm llvm-devel lld \
-            libcxx libcxx-devel libstdc++-static \
-            xmake \
-            python3-pip python3-devel \
-            git ninja-build
-          # bytecaskdb_python's on_load() asks nanobind for its include dir, and
-          # xmake f loads every target — so this job needs it even though it
-          # only builds bytecask_tests.
-          pip3 install nanobind
-
-      - name: Configure xmake
-        run: |
-          RESOURCE_DIR=$(clang --print-resource-dir)
-          xmake f --toolchain=clang \
-            --cxflags="-resource-dir=${RESOURCE_DIR}" \
-            -y
-
-      - name: Build and run the engine suite on the radix key directory
-        run: |
-          xmake build bytecask_tests
-          build/linux/x86_64/release/bytecask_tests
 
   # ---------------------------------------------------------------------------
   # The blind-leaf tree (docs/blind_leaf_btree_design.md) is the default key

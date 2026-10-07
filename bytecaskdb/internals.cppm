@@ -27,7 +27,6 @@ import bytecask.btree;
 import bytecask.buffer_pool;
 import bytecask.data_entry;
 import bytecask.data_file;
-import bytecask.radix_tree;
 import bytecask.types;
 import bytecask.u32_map;
 import bytecask.util;
@@ -90,7 +89,7 @@ struct FileStats {
 // ---------------------------------------------------------------------------
 // KeyDirEntry — one slot in the in-memory key directory.
 //
-// Bit-packed into two 64-bit words to reduce per-node radix tree overhead.
+// Bit-packed into two 64-bit words to keep the key directory small.
 // Access is through accessor methods so the internal layout can be changed
 // without touching call sites.
 //
@@ -267,8 +266,8 @@ export inline constexpr auto pending_slot(std::uint32_t file_id,
 // ---------------------------------------------------------------------------
 // KeyDirCtx — where a key directory that does not store keys reads them: the
 // file registry of the version it belongs to (a published state's, or the
-// writer's transient one plus the records it has not written yet). The B+
-// tree and the radix tree ignore it. Non-owning; valid while the state it
+// writer's transient one plus the records it has not written yet). The keyed
+// B+ tree ignores it. Non-owning; valid while the state it
 // points into is.
 // ---------------------------------------------------------------------------
 export struct KeyDirCtx {
@@ -289,15 +288,13 @@ export struct KeyDirCtx {
 // put or erase returns what it displaced (a KeyDirHit: file, offset and value
 // size), iterators yield (key, KeyDirEntry) or a KeyDirHit.
 //
-// The B+ tree (docs/persistent_btree_design.md) is the default;
-// BYTECASK_KEYDIR=radix builds the engine on the radix tree and
-// BYTECASK_KEYDIR=blind on the blind-leaf tree
-// (docs/blind_leaf_btree_design.md), which stores no key bytes and reads them
-// back through the KeyDirCtx.
+// The blind-leaf tree (docs/blind_leaf_btree_design.md) is the default: it
+// stores no key bytes and reads them back through the KeyDirCtx.
+// BYTECASK_KEYDIR=btree builds the engine on the B+ tree that keeps its keys
+// (docs/persistent_btree_design.md).
 //
-// Recovery builds a RecoveryKeyDirTree: the B+ tree in the blind build too,
-// converted once by key_dir_from_recovered() until recovery can build a
-// blind tree from the hint files directly.
+// The keyed build recovers into a RecoveryKeyDirTree, a keyed B+ tree; the
+// blind build recovers straight from the hint files (recovery_load_streams).
 // ---------------------------------------------------------------------------
 #if defined(BYTECASK_KEYDIR_BLIND)
 export inline constexpr bool kKeyDirReadsKeys = true;
@@ -305,33 +302,20 @@ export inline constexpr bool kKeyDirReadsKeys = true;
 export inline constexpr bool kKeyDirReadsKeys = false;
 #endif
 
-#ifdef BYTECASK_USE_BTREE
 export using RecoveryKeyDirTree = PersistentBTree<KeyDirEntry>;
 export using RecoveryKeyDirIter = BTreeIterator<KeyDirEntry>;
 // Bulk build of a key directory from ascending keys, and the concatenation
 // of the slices several threads built — what recovery_load_ranged uses.
 export using KeyDirBulkLoader = btree_detail::BulkLoader<KeyDirEntry>;
 export using KeyDirLeafRun = btree_detail::LeafRun<KeyDirEntry>;
-#else
-export using RecoveryKeyDirTree = PersistentRadixTree<KeyDirEntry>;
-export using RecoveryKeyDirIter = RadixTreeIterator<KeyDirEntry>;
-#endif
 
 #if !defined(BYTECASK_KEYDIR_BLIND)
 
-#ifdef BYTECASK_USE_BTREE
 export using KeyDirTree = PersistentBTree<KeyDirEntry>;
 export using KeyDirTransient = TransientBTree<KeyDirEntry>;
 export using KeyDirIter = BTreeIterator<KeyDirEntry>;
 export using KeyDirValueIter = BTreeValueIterator<KeyDirEntry>;
 export using KeyDirReverseValueIter = ReverseBTreeValueIterator<KeyDirEntry>;
-#else
-export using KeyDirTree = PersistentRadixTree<KeyDirEntry>;
-export using KeyDirTransient = TransientRadixTree<KeyDirEntry>;
-export using KeyDirIter = RadixTreeIterator<KeyDirEntry>;
-export using KeyDirValueIter = ValueIterator<KeyDirEntry>;
-export using KeyDirReverseValueIter = ReverseValueIterator<KeyDirEntry>;
-#endif
 export using KeyDirHit = KeyDirEntry;
 
 // The value size a value iterator's entry expects, as a read hint.
@@ -390,22 +374,11 @@ auto kd_lower_bound(const T &t, std::span<const std::byte> key,
   return t.lower_bound(key);
 }
 // Keys in [from, to), counted no further than `limit`. The keys are in
-// memory: the B+ tree counts leaf sizes between the two positions, the radix
-// tree steps through its keys.
+// memory: the B+ tree counts leaf sizes between the two positions.
 export inline auto kd_count(const KeyDirTree &t, std::span<const std::byte> from,
                             std::span<const std::byte> to, std::size_t limit,
                             const KeyDirCtx &) -> std::size_t {
-#ifdef BYTECASK_USE_BTREE
   return t.lower_bound(from).count_until(t.lower_bound(to), limit);
-#else
-  std::size_t n = 0;
-  for (auto it = t.lower_bound(from);
-       n < limit && it != std::default_sentinel &&
-       std::ranges::lexicographical_compare((*it).first, to);
-       ++it)
-    ++n;
-  return n;
-#endif
 }
 export inline auto kd_begin(const KeyDirTree &t, const KeyDirCtx &) -> KeyDirIter {
   return t.begin();

@@ -253,7 +253,7 @@ int ha_bytecaskdb::open(const char *name, int /*mode*/,
 
 // Seeds the per-table synthetic rowid counter from disk on first open,
 // by reverse-scanning the row namespace for this table_id. Cheap: a
-// single radix-tree traversal returns the largest existing key in O(1).
+// single reverse seek in the key directory returns the largest existing key.
 void ha_bytecaskdb::seed_rowid_counter_if_needed() const {
   if (catalog_peek_rowid(table_id_) != 0) { return; }
 

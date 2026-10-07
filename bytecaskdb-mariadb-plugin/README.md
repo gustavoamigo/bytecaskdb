@@ -204,7 +204,7 @@ Sysbench: 1 table, `--report-interval=0`, `--time=10`.
 
 ### Observations
 
-- **Point selects**: ByteCaskDB leads at both dataset sizes and scales well with threads (3.2M tps at 16 threads, 1M rows). The in-memory radix tree lookup avoids block cache misses that affect InnoDB and RocksDB at larger sizes.
+- **Point selects**: ByteCaskDB leads at both dataset sizes and scales well with threads (3.2M tps at 16 threads, 1M rows). The in-memory key directory lookup avoids block cache misses that affect InnoDB and RocksDB at larger sizes.
 - **Write-only (16 threads)**: ByteCaskDB's group commit delivers 2x the throughput of InnoDB and RocksDB at 16 threads. Single-writer serialization with batched `fdatasync` amortizes the dominant cost.
 - **Read-only (range scans)**: InnoDB leads slightly due to contiguous sorted storage. ByteCaskDB fetches each value individually from disk (known trade-off).
 - **Insert (single-row)**: All three engines are close — limited by `fdatasync` round-trip latency per row.

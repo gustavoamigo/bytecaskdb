@@ -33,7 +33,6 @@ xmake f "${XMAKE_P[@]}" --toolchain=clang --coverage=true -m debug -o build -y
 
 echo "==> Building..."
 xmake build "${XMAKE_P[@]}" bytecask_tests
-xmake build "${XMAKE_P[@]}" radix_tree_memory_tests
 
 # The engine suite again on the keyed B+ tree: the default build runs the
 # engine on the blind-leaf tree, and the keyed tree's engine paths (its
@@ -45,40 +44,21 @@ BYTECASK_KEYDIR=btree xmake f "${XMAKE_P[@]}" --toolchain=clang \
     --coverage=true -m debug -o build/cov-btree -y
 BYTECASK_KEYDIR=btree xmake build "${XMAKE_P[@]}" bytecask_tests
 
-# And on the radix tree, whose recovery (recovery_load_parallel and
-# recovery_build_from_hints) is compiled only in this build.
-echo "==> Building the engine on the radix tree..."
-BYTECASK_KEYDIR=radix xmake f "${XMAKE_P[@]}" --toolchain=clang \
-    --coverage=true -m debug -o build/cov-radix -y
-BYTECASK_KEYDIR=radix xmake build "${XMAKE_P[@]}" bytecask_tests
-
 BYTECASK_TEST_BIN="$PROJECT_DIR/build/linux/x86_64/debug/bytecask_tests"
-RADIX_TREE_TEST_BIN="$PROJECT_DIR/build/linux/x86_64/debug/radix_tree_memory_tests"
 KEYED_ENGINE_TEST_BIN="$PROJECT_DIR/build/cov-btree/linux/x86_64/debug/bytecask_tests"
-RADIX_ENGINE_TEST_BIN="$PROJECT_DIR/build/cov-radix/linux/x86_64/debug/bytecask_tests"
 
 if [ ! -x "$BYTECASK_TEST_BIN" ]; then
     echo "ERROR: could not find bytecask_tests binary at $BYTECASK_TEST_BIN"
-    exit 1
-fi
-if [ ! -x "$RADIX_TREE_TEST_BIN" ]; then
-    echo "ERROR: could not find radix_tree_memory_tests binary at $RADIX_TREE_TEST_BIN"
     exit 1
 fi
 if [ ! -x "$KEYED_ENGINE_TEST_BIN" ]; then
     echo "ERROR: could not find the keyed-tree bytecask_tests binary at $KEYED_ENGINE_TEST_BIN"
     exit 1
 fi
-if [ ! -x "$RADIX_ENGINE_TEST_BIN" ]; then
-    echo "ERROR: could not find the radix-tree bytecask_tests binary at $RADIX_ENGINE_TEST_BIN"
-    exit 1
-fi
 
 echo "==> Running tests..."
 LLVM_PROFILE_FILE="$COV_DIR/bytecask_tests.profraw" "$BYTECASK_TEST_BIN"
 LLVM_PROFILE_FILE="$COV_DIR/bytecask_tests_btree.profraw" "$KEYED_ENGINE_TEST_BIN"
-LLVM_PROFILE_FILE="$COV_DIR/bytecask_tests_radix.profraw" "$RADIX_ENGINE_TEST_BIN"
-LLVM_PROFILE_FILE="$COV_DIR/radix_tree_memory_tests.profraw" "$RADIX_TREE_TEST_BIN"
 
 echo "==> Merging profile data..."
 llvm-profdata merge -sparse "$COV_DIR"/*.profraw -o "$COV_DIR/coverage.profdata"
@@ -97,13 +77,10 @@ export_build() {  # name binary profraw
 }
 export_build blind "$BYTECASK_TEST_BIN" "$COV_DIR/bytecask_tests.profraw"
 export_build btree "$KEYED_ENGINE_TEST_BIN" "$COV_DIR/bytecask_tests_btree.profraw"
-export_build radix "$RADIX_ENGINE_TEST_BIN" "$COV_DIR/bytecask_tests_radix.profraw"
 
 echo "==> Generating summary..."
 llvm-cov report "$BYTECASK_TEST_BIN" \
     -object="$KEYED_ENGINE_TEST_BIN" \
-    -object="$RADIX_ENGINE_TEST_BIN" \
-    -object="$RADIX_TREE_TEST_BIN" \
     -instr-profile="$COV_DIR/coverage.profdata" \
     -ignore-filename-regex='tests/|catch2|crc32c|/usr/' \
     -show-mcdc-summary
@@ -112,8 +89,6 @@ echo ""
 echo "==> Generating HTML report..."
 llvm-cov show "$BYTECASK_TEST_BIN" \
     -object="$KEYED_ENGINE_TEST_BIN" \
-    -object="$RADIX_ENGINE_TEST_BIN" \
-    -object="$RADIX_TREE_TEST_BIN" \
     -instr-profile="$COV_DIR/coverage.profdata" \
     -ignore-filename-regex='tests/|catch2|crc32c|/usr/' \
     -show-mcdc \
@@ -124,8 +99,6 @@ echo ""
 echo "==> Generating lcov report (for VS Code Coverage Gutters)..."
 llvm-cov export "$BYTECASK_TEST_BIN" \
     -object="$KEYED_ENGINE_TEST_BIN" \
-    -object="$RADIX_ENGINE_TEST_BIN" \
-    -object="$RADIX_TREE_TEST_BIN" \
     -instr-profile="$COV_DIR/coverage.profdata" \
     -ignore-filename-regex='tests/|catch2|crc32c|/usr/' \
     -format=lcov > "$PROJECT_DIR/lcov.info"

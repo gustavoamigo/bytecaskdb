@@ -133,15 +133,15 @@ The `bytecaskdb-mariadb-plugin/` directory is a self-contained CMake project. It
 - Isolation: Snapshot isolation (Layer 1's default). Serializable deferred to later.
 - Per-THD transaction state stored via `thd_get_ha_data()` / `thd_set_ha_data()`.
 
-**Design detail — Why a separate L2, not the public `Transaction` from `transaction_design.md`**:
+**Design detail — why the plugin has its own transaction type**:
 
-The public `Transaction` class (designed but not yet implemented) targets the ByteCaskDB C++ API consumer. The MariaDB integration has different requirements:
+The engine has no public `Transaction` type: it offers snapshots, `WritePlan` guards and conditional `apply_batch` (`docs/transaction_design.md`), and a higher-level type was considered and not built. The MariaDB integration needs its own anyway:
 - MariaDB drives the lifecycle (`external_lock`, `commit`, `rollback`) — the plugin doesn't control when operations begin/end.
 - MariaDB's `handler` API operates on `uchar*` record buffers, not `BytesView` — the adapter must encode/decode.
 - The plugin needs to track MariaDB-specific state (THD pointer, table metadata, whether statement or session-level transaction).
 - The write buffer stores encoded KV pairs, not the original `(BytesView, BytesView)`.
 
-Building a thin `MariaDBTxn` directly on `snapshot()` + `apply_batch()` is simpler and more correct than trying to reuse a general-purpose `Transaction` class that would need MariaDB-specific hooks.
+Building a thin `MariaDBTxn` directly on `snapshot()` + `apply_batch()` keeps that MariaDB-specific state in the plugin.
 
 ### Phase 4 — Secondary Indexes
 
@@ -398,7 +398,7 @@ The `[table_id][index_id]` prefix ensures secondary indexes occupy a separate ke
 ## Reference
 
 - `.notes/mariadb_engine_guide.md` — detailed MariaDB handler API reference.
-- `docs/transaction_design.md` — Layer 1/2/3 transaction architecture.
+- `docs/transaction_design.md` — snapshots, `WritePlan` guards and conditional `apply_batch`.
 - `docs/bytecask_design.md` — ByteCaskDB core design and concurrency model.
 - MariaDB `storage/example/` — minimal engine skeleton.
 - MariaDB `storage/rocksdb/` (MyRocks) — production KV engine reference.

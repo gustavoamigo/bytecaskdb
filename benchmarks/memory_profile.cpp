@@ -9,7 +9,7 @@
 //   BC_DATASET_SIZE=1000000 node build/memory_profile.js  (WASM)
 //   BC_INDEX_ONLY=btree BC_KEY_FORMAT=uuidv7 ./memory_profile   (tree only)
 //
-// BC_INDEX_ONLY=btree|radix|blind builds only the in-memory key directory
+// BC_INDEX_ONLY=btree|blind builds only the in-memory key directory
 // from the key shape, without a DB, so the per-key cost of the index itself
 // can be read off directly. blind is the blind-leaf tree at the engine's
 // leaf size (kBlindLeafBytes); blind640, blind1280 and blind2560 pick others.
@@ -41,7 +41,6 @@
 import bytecask;
 import bytecask.btree;
 import bytecask.blind_btree;
-import bytecask.radix_tree;
 
 namespace {
 
@@ -354,8 +353,6 @@ int main() {
                 index.c_str(), n, avg_key_size, format.c_str());
     if (index == "btree") {
       profile_index_only<bytecask::PersistentBTree<bytecask::KeyDirEntry>>(*shape, n);
-    } else if (index == "radix") {
-      profile_index_only<bytecask::PersistentRadixTree<bytecask::KeyDirEntry>>(*shape, n);
     } else if (index == "blind") {
       profile_blind<bytecask::kBlindLeafBytes>(*shape, n);
     } else if (index == "blind_growth") {
@@ -373,7 +370,7 @@ int main() {
     } else if (index == "blind2560") {
       profile_blind<2560>(*shape, n);
     } else {
-      std::fprintf(stderr, "Unknown BC_INDEX_ONLY: %s (btree|radix|blind|blind640|blind1280|blind2560)\n", index.c_str());
+      std::fprintf(stderr, "Unknown BC_INDEX_ONLY: %s (btree|blind|blind640|blind1280|blind2560)\n", index.c_str());
       return 1;
     }
     return 0;
