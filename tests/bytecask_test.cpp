@@ -1905,6 +1905,14 @@ TEST_CASE("Recovery model-based: ceiling-size keys and large values",
         // equal depends on the standard library's distribution.
         while (to == from) to = rand_key();
         if (to < from) std::swap(from, to);
+        // Both bounds come from the same pool, so they can be equal: an
+        // empty range is refused before anything is written.
+        if (from == to) {
+          CHECK_THROWS_AS(
+              db.del_range({.sync = false}, to_bytes(from), to_bytes(to)),
+              std::invalid_argument);
+          continue;
+        }
         db.del_range({.sync = false}, to_bytes(from), to_bytes(to));
         std::erase_if(oracle, [&](const auto &kv) {
           return kv.first >= from && kv.first < to;
