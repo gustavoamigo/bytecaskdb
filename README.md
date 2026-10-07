@@ -10,6 +10,7 @@ Test Analytics dashboard: https://app.codecov.io/gh/gustavoamigo/bytecaskdb/test
 
 CI uploads JUnit test results with per-test source file/line metadata so Test Analytics can show source context instead of a flat list.
 CI also publishes JUnit results directly in GitHub Checks for PR-native test summaries.
+The coverage job fails unless every condition in the write path, recovery and vacuum has MC/DC coverage — each shown by a test to decide its outcome on its own — or is marked unreachable, with the reason, at its site ([`docs/correctness_validation.md`](docs/correctness_validation.md#mcdc-coverage)).
 
 **ByteCaskDB** is a fast, predictable embedded key-value store written in C++. Reads and writes have flat, predictable latency from thousands of keys to hundreds of millions.
 

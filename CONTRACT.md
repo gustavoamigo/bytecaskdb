@@ -708,7 +708,9 @@ that need it run in test builds only:
 
 The same containment check runs in `store_state`'s debug walk, so it
 covers every publication — rotation and vacuum included — not only the
-two cold paths.
+two cold paths. There a key whose file has no `file_stats` entry is a
+violation too: the cold path rules it out by checking that `file_stats`
+covers every file first, and the walk has no such check before it.
 
 P is the invariant the mmap read path depends on — see *Offset
 containment* under **View and span lifetimes**. It is checked after

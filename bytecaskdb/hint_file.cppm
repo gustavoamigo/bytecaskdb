@@ -95,6 +95,16 @@ constexpr std::size_t kMaxFrameBytes = kHintFrameBytes + kMaxHintEntryBytes;
 // The most such a frame takes on disk: its entries, not compressed at all.
 constexpr std::size_t kMaxPackedFrameBytes = ZSTD_COMPRESSBOUND(kMaxFrameBytes);
 
+// ZSTD_CONTENTSIZE_UNKNOWN and ZSTD_CONTENTSIZE_ERROR are the two largest
+// 64-bit values, so the cap alone refuses a frame that does not declare its
+// size or whose header does not parse.
+static_assert(ZSTD_CONTENTSIZE_UNKNOWN > kMaxFrameBytes &&
+              ZSTD_CONTENTSIZE_ERROR > kMaxFrameBytes);
+[[nodiscard]] constexpr auto valid_frame_size(unsigned long long size)
+    -> bool {
+  return size <= kMaxFrameBytes;
+}
+
 #ifdef BYTECASK_TESTING
 std::size_t g_frame_bytes_for_testing = 0;
 #endif
@@ -306,13 +316,14 @@ auto open_source(std::filesystem::path path)
     const auto bytes = pass.window(at, kMaxPackedFrameBytes);
     const auto packed =
         ZSTD_findFrameCompressedSize(bytes.data(), bytes.size());
-    if (ZSTD_isError(packed) || packed > kMaxPackedFrameBytes) {
+    // The window holds at most kMaxPackedFrameBytes, so a frame larger than
+    // that does not fit in it and is reported as an error.
+    if (ZSTD_isError(packed)) {
       throw std::runtime_error{std::format(
           "HintFile: truncated or corrupt frame in '{}'", src->path.string())};
     }
     const auto size = ZSTD_getFrameContentSize(bytes.data(), packed);
-    if (size == ZSTD_CONTENTSIZE_UNKNOWN || size == ZSTD_CONTENTSIZE_ERROR ||
-        size > kMaxFrameBytes) {
+    if (!valid_frame_size(size)) {
       throw std::runtime_error{std::format(
           "HintFile: frame of invalid size in '{}'", src->path.string())};
     }
@@ -427,12 +438,14 @@ public:
       packed.resize(len);
       read_unit(packed, at);
       const auto size = ZSTD_getFrameContentSize(packed.data(), len);
-      if (size == ZSTD_CONTENTSIZE_UNKNOWN ||
-          size == ZSTD_CONTENTSIZE_ERROR || size > kMaxFrameBytes)
+      if (!valid_frame_size(size))
         throw std::runtime_error{"HintFile: frame of invalid size"};
       reset_buffer(static_cast<std::size_t>(size));
       const auto got = ZSTD_decompressDCtx(&thread_dctx(), buf_.data(),
                                            buf_.size(), packed.data(), len);
+      // mcdc-exempt: zstd checks what a frame decompresses to against the
+      // content size its header declares, and buf_ holds exactly that many
+      // bytes, so got != size cannot hold unless ZSTD_isError(got) does.
       if (ZSTD_isError(got) || got != size)
         throw std::runtime_error{"HintFile: frame does not decompress"};
       frame_ = buf_;
@@ -579,10 +592,6 @@ public:
     if (!src_)
       throw std::logic_error{"HintFile: make_scanner on a write-mode file"};
     return Scanner{src_};
-  }
-
-  [[nodiscard]] auto path() const -> const std::filesystem::path & {
-    return path_;
   }
 
 private:

@@ -486,6 +486,19 @@ TEST_CASE("HintFile refuses an unknown version", "[hintfile]") {
   CHECK_THROWS_AS(bytecask::HintFile::OpenForRead(tmp), std::runtime_error);
 }
 
+TEST_CASE("HintFile refuses an unknown codec", "[hintfile]") {
+  // The version is the current one; only the codec byte is not zstd.
+  const auto tmp = std::filesystem::temp_directory_path() / "bc_hint_codec.hint";
+  std::filesystem::remove(tmp);
+  write_entries(tmp, sample_entries(10));
+  auto file = read_file(tmp);
+  file[9] = std::byte{2};
+  put_trailer(file, ~crc_of(std::span{file}.first(file.size() - 4)));
+  write_file(tmp, file);
+  CHECK_THROWS_WITH(bytecask::HintFile::OpenForRead(tmp),
+                    Catch::Matchers::ContainsSubstring("unsupported version"));
+}
+
 TEST_CASE("HintFile frame claiming a corrupt size is refused", "[hintfile]") {
   // Damage the CRC cannot see — the trailer recomputed over it — must still
   // not reach the parser as a frame. Opening walks every frame header, so it
@@ -591,6 +604,16 @@ TEST_CASE("HintFile open refuses a file that cannot be a hint", "[hintfile]") {
   SECTION("a file shorter than its trailer") {
     write_file(tmp, std::vector<std::byte>(3));
     CHECK_THROWS_AS(bytecask::HintFile::OpenForRead(tmp), std::runtime_error);
+  }
+
+  SECTION("a file too short to hold the magic") {
+    write_entries(tmp, sample_entries(10));
+    auto file = read_file(tmp);
+    file.resize(9); // five bytes of the magic, then a trailer
+    put_trailer(file, ~crc_of(std::span{file}.first(5)));
+    write_file(tmp, file);
+    CHECK_THROWS_WITH(bytecask::HintFile::OpenForRead(tmp),
+                      Catch::Matchers::ContainsSubstring("not a framed"));
   }
 
   SECTION("a framed file cut inside its header") {

@@ -147,7 +147,11 @@ local function apply_coverage(t)
     if cov and cov ~= "" then
         local triple = os.getenv("CLANG_TARGET_TRIPLE")
         local target_flag = triple and ("--target=" .. triple) or nil
-        t:add("cxflags", "-fprofile-instr-generate", "-fcoverage-mapping", {force = true})
+        -- -fcoverage-mcdc records, for each decision of two or more
+        -- conditions, whether each condition was shown to flip the outcome
+        -- on its own (MC/DC). Compile-only; scripts/mcdc_report.py reads it.
+        t:add("cxflags", "-fprofile-instr-generate", "-fcoverage-mapping",
+            "-fcoverage-mcdc", {force = true})
         t:add("ldflags", "-fprofile-instr-generate", {force = true})
         if target_flag then
             t:add("cxflags", target_flag, {force = true})

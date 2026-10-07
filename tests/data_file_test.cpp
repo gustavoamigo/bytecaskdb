@@ -39,6 +39,9 @@
 #endif
 #include "fsize_limit.h"
 #include "mapping_probe.h"
+#ifdef __linux__
+#include "syscall_faults.h"
+#endif
 
 import bytecask.data_file;
 import bytecask.data_entry;
@@ -256,7 +259,9 @@ TEST_CASE("WritableDataFile constructor: reopens existing file",
   CHECK(file->size() == entry_size);
 
   std::vector<std::byte> io_buf;
-  auto view = file->read_entry_unverified(0, static_cast<std::uint32_t>(val.size()), io_buf);
+  bytecask::FrameLease lease;
+  auto view = file->lend_record(0, static_cast<std::uint32_t>(val.size()),
+                               /*verify=*/false, io_buf, lease);
   CHECK(view.sequence == 1);
   CHECK(view.entry_type == bytecask::EntryType::Put);
   CHECK(std::equal(view.key.begin(), view.key.end(), key.begin()));
@@ -279,10 +284,10 @@ TEST_CASE("WritableDataFile constructor: throws on invalid path",
 }
 
 // ---------------------------------------------------------------------------
-// read_entry_unverified — WritableDataFile
+// lend_record (unverified) — WritableDataFile
 // ---------------------------------------------------------------------------
 
-TEST_CASE("WritableDataFile::read_entry_unverified with mmap request",
+TEST_CASE("WritableDataFile::lend_record with mmap request",
           "[data_file]") {
   const auto path =
       std::filesystem::temp_directory_path() / "bc_test_unverified_buf.data";
@@ -294,8 +299,9 @@ TEST_CASE("WritableDataFile::read_entry_unverified with mmap request",
   (void)file->append_entry(42, bytecask::EntryType::Put, key, val);
 
   std::vector<std::byte> io_buf;
-  auto view = file->read_entry_unverified(
-      0, static_cast<std::uint32_t>(val.size()), io_buf);
+  bytecask::FrameLease lease;
+  auto view = file->lend_record(0, static_cast<std::uint32_t>(val.size()),
+                               /*verify=*/false, io_buf, lease);
 
   CHECK(view.sequence == 42);
   CHECK(view.entry_type == bytecask::EntryType::Put);
@@ -391,7 +397,7 @@ TEST_CASE("WritableDataFile: fresh file has no unwritten extents",
 }
 #endif
 
-TEST_CASE("WritableDataFile::read_entry_unverified pread fallback",
+TEST_CASE("WritableDataFile::lend_record pread fallback",
           "[data_file]") {
   const auto path =
       std::filesystem::temp_directory_path() / "bc_test_unverified_pread.data";
@@ -404,8 +410,9 @@ TEST_CASE("WritableDataFile::read_entry_unverified pread fallback",
   (void)file->append_entry(7, bytecask::EntryType::Put, key, val);
 
   std::vector<std::byte> io_buf;
-  auto view = file->read_entry_unverified(
-      0, static_cast<std::uint32_t>(val.size()), io_buf);
+  bytecask::FrameLease lease;
+  auto view = file->lend_record(0, static_cast<std::uint32_t>(val.size()),
+                               /*verify=*/false, io_buf, lease);
 
   CHECK(view.sequence == 7);
   CHECK(view.entry_type == bytecask::EntryType::Put);
@@ -417,7 +424,7 @@ TEST_CASE("WritableDataFile::read_entry_unverified pread fallback",
   std::filesystem::remove(path);
 }
 
-TEST_CASE("WritablePosixDataFile::read_entry_unverified long key triggers retry",
+TEST_CASE("WritablePosixDataFile::lend_record long key triggers retry",
           "[data_file]") {
   const auto path =
       std::filesystem::temp_directory_path() / "bc_test_posix_wr_longkey.data";
@@ -432,8 +439,9 @@ TEST_CASE("WritablePosixDataFile::read_entry_unverified long key triggers retry"
   (void)file->append_entry(42, bytecask::EntryType::Put, key, val);
 
   std::vector<std::byte> io_buf;
-  auto view = file->read_entry_unverified(
-      0, static_cast<std::uint32_t>(val.size()), io_buf);
+  bytecask::FrameLease lease;
+  auto view = file->lend_record(0, static_cast<std::uint32_t>(val.size()),
+                               /*verify=*/false, io_buf, lease);
 
   CHECK(view.sequence == 42);
   CHECK(view.entry_type == bytecask::EntryType::Put);
@@ -446,10 +454,10 @@ TEST_CASE("WritablePosixDataFile::read_entry_unverified long key triggers retry"
 }
 
 // ---------------------------------------------------------------------------
-// read_entry_unverified — ReadOnlyPosixDataFile
+// lend_record (unverified) — ReadOnlyPosixDataFile
 // ---------------------------------------------------------------------------
 
-TEST_CASE("ReadOnlyPosixDataFile::read_entry_unverified short key",
+TEST_CASE("ReadOnlyPosixDataFile::lend_record short key",
           "[data_file]") {
   const auto path =
       std::filesystem::temp_directory_path() / "bc_test_posix_unverified.data";
@@ -465,8 +473,9 @@ TEST_CASE("ReadOnlyPosixDataFile::read_entry_unverified short key",
 
   auto file = bytecask::ReadOnlyPosixDataFile::openForRead(path);
   std::vector<std::byte> io_buf;
-  auto view = file->read_entry_unverified(
-      0, static_cast<std::uint32_t>(val.size()), io_buf);
+  bytecask::FrameLease lease;
+  auto view = file->lend_record(0, static_cast<std::uint32_t>(val.size()),
+                               /*verify=*/false, io_buf, lease);
 
   CHECK(view.sequence == 10);
   CHECK(view.entry_type == bytecask::EntryType::Put);
@@ -476,7 +485,7 @@ TEST_CASE("ReadOnlyPosixDataFile::read_entry_unverified short key",
   std::filesystem::remove(path);
 }
 
-TEST_CASE("ReadOnlyPosixDataFile::read_entry_unverified long key triggers retry",
+TEST_CASE("ReadOnlyPosixDataFile::lend_record long key triggers retry",
           "[data_file]") {
   const auto path =
       std::filesystem::temp_directory_path() / "bc_test_posix_longkey.data";
@@ -494,8 +503,9 @@ TEST_CASE("ReadOnlyPosixDataFile::read_entry_unverified long key triggers retry"
 
   auto file = bytecask::ReadOnlyPosixDataFile::openForRead(path);
   std::vector<std::byte> io_buf;
-  auto view = file->read_entry_unverified(
-      0, static_cast<std::uint32_t>(val.size()), io_buf);
+  bytecask::FrameLease lease;
+  auto view = file->lend_record(0, static_cast<std::uint32_t>(val.size()),
+                               /*verify=*/false, io_buf, lease);
 
   CHECK(view.sequence == 99);
   CHECK(view.entry_type == bytecask::EntryType::Put);
@@ -507,10 +517,10 @@ TEST_CASE("ReadOnlyPosixDataFile::read_entry_unverified long key triggers retry"
 }
 
 // ---------------------------------------------------------------------------
-// read_entry_unverified — ReadOnlyMmapDataFile
+// lend_record (unverified) — ReadOnlyMmapDataFile
 // ---------------------------------------------------------------------------
 
-TEST_CASE("ReadOnlyMmapDataFile::read_entry_unverified",
+TEST_CASE("ReadOnlyMmapDataFile::lend_record",
           "[data_file]") {
   const auto path =
       std::filesystem::temp_directory_path() / "bc_test_mmap_unverified.data";
@@ -526,8 +536,9 @@ TEST_CASE("ReadOnlyMmapDataFile::read_entry_unverified",
 
   auto file = bytecask::ReadOnlyMmapDataFile::openForRead(path);
   std::vector<std::byte> io_buf;
-  auto view = file->read_entry_unverified(
-      0, static_cast<std::uint32_t>(val.size()), io_buf);
+  bytecask::FrameLease lease;
+  auto view = file->lend_record(0, static_cast<std::uint32_t>(val.size()),
+                               /*verify=*/false, io_buf, lease);
 
   CHECK(view.sequence == 55);
   CHECK(view.entry_type == bytecask::EntryType::Put);
@@ -543,7 +554,7 @@ TEST_CASE("ReadOnlyMmapDataFile::read_entry_unverified",
 // WritableMmapDataFile — pread fallback (entry beyond mmap region)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("WritableMmapDataFile: read_header pread fallback beyond mmap",
+TEST_CASE("WritableMmapDataFile: lend_record pread fallback beyond mmap",
           "[data_file]") {
   const auto path =
       std::filesystem::temp_directory_path() / "bc_test_mmap_hdr_fallback.data";
@@ -556,10 +567,11 @@ TEST_CASE("WritableMmapDataFile: read_header pread fallback beyond mmap",
   auto file = bytecask::WritableMmapDataFile::create(path, 16);
   (void)file->append_entry(10, bytecask::EntryType::Put, key, val);
 
-  // read_entry uses read_header internally — if header is beyond mmap, it uses pread.
+  // A header beyond the mapping is read with pread.
   std::vector<std::byte> io_buf;
-  auto view = file->read_entry_unverified(
-      0, static_cast<std::uint32_t>(val.size()), io_buf);
+  bytecask::FrameLease lease;
+  auto view = file->lend_record(0, static_cast<std::uint32_t>(val.size()),
+                               /*verify=*/false, io_buf, lease);
 
   CHECK(view.sequence == 10);
   CHECK(view.entry_type == bytecask::EntryType::Put);
@@ -595,7 +607,7 @@ TEST_CASE("WritableMmapDataFile: read_value pread fallback beyond mmap",
   std::filesystem::remove(path);
 }
 
-TEST_CASE("WritableMmapDataFile: read_entry_with_key_size pread fallback",
+TEST_CASE("WritableMmapDataFile: verified read_value pread fallback",
           "[data_file]") {
   const auto path =
       std::filesystem::temp_directory_path() / "bc_test_mmap_entry_fallback.data";
@@ -604,17 +616,16 @@ TEST_CASE("WritableMmapDataFile: read_entry_with_key_size pread fallback",
   const auto key = to_bytes("ekey");
   const auto val = to_bytes("eval");
 
-  // capacity=16 — forces pread path for read_entry (verified).
+  // capacity=16 — forces the pread path of the CRC-checked read.
   auto file = bytecask::WritableMmapDataFile::create(path, 16);
   (void)file->append_entry(30, bytecask::EntryType::Put, key, val);
 
   std::vector<std::byte> io_buf;
-  auto view = file->read_entry(0, static_cast<std::uint32_t>(val.size()), io_buf);
+  std::vector<std::byte> out;
+  file->read_value(0, static_cast<std::uint16_t>(key.size()),
+                   static_cast<std::uint32_t>(val.size()), true, io_buf, out);
 
-  CHECK(view.sequence == 30);
-  CHECK(view.entry_type == bytecask::EntryType::Put);
-  CHECK(std::equal(view.key.begin(), view.key.end(), key.begin()));
-  CHECK(std::equal(view.value.begin(), view.value.end(), val.begin()));
+  CHECK(std::equal(out.begin(), out.end(), val.begin(), val.end()));
   CHECK(!io_buf.empty());
 
   std::filesystem::remove(path);
@@ -649,8 +660,9 @@ TEST_CASE("WritableMmapDataFile::truncate leaves the mapping in place",
                                           garbage_key, garbage_val);
 
   std::vector<std::byte> io_buf;
-  auto view = file->read_entry_unverified(
-      kept, static_cast<std::uint32_t>(val.size()), io_buf);
+  bytecask::FrameLease lease;
+  auto view = file->lend_record(kept, static_cast<std::uint32_t>(val.size()),
+                                /*verify=*/false, io_buf, lease);
   REQUIRE(io_buf.empty());  // the span points into the mapping, not io_buf
   const auto *addr = view.value.data();
 
@@ -665,17 +677,19 @@ TEST_CASE("WritableMmapDataFile::truncate leaves the mapping in place",
   CHECK(std::equal(view.value.begin(), view.value.end(), val.begin()));
 
   // A fresh read of the same offset resolves to the same address.
-  auto again = file->read_entry_unverified(
-      kept, static_cast<std::uint32_t>(val.size()), io_buf);
+  auto again = file->lend_record(kept, static_cast<std::uint32_t>(val.size()),
+                                 /*verify=*/false, io_buf, lease);
   CHECK(again.value.data() == addr);
   CHECK(io_buf.empty());
 
-  // Past the new end the file is gone: reads take the pread path and fail as
-  // a short read rather than faulting on a mapped page beyond EOF.
+  // Past the new end the file is gone: reads fail as an error — the record
+  // read refuses it as past the end, the value read as a short pread —
+  // rather than faulting on a mapped page beyond EOF.
   CHECK_THROWS_AS(
-      file->read_entry_unverified(
-          dropped, static_cast<std::uint32_t>(garbage_val.size()), io_buf),
-      std::system_error);
+      file->lend_record(dropped,
+                        static_cast<std::uint32_t>(garbage_val.size()),
+                        /*verify=*/false, io_buf, lease),
+      std::runtime_error);
   std::vector<std::byte> out;
   CHECK_THROWS_AS(
       file->read_value(dropped, static_cast<std::uint16_t>(garbage_key.size()),
@@ -751,6 +765,20 @@ TEST_CASE("Sweep over ReadOnlyMmapDataFile ends at truncated entry body",
 // active file, a truncated last entry, and a CRC failure in the middle —
 // on every back-end, active and sealed.
 // ---------------------------------------------------------------------------
+TEST_CASE("DataFileIterator advances by post-increment", "[data_file][iterator]") {
+  const auto path = std::filesystem::temp_directory_path() / "bc_test_iter_post.data";
+  std::filesystem::remove(path);
+  auto file = bytecask::WritablePosixDataFile::create(path, 0);
+  (void)file->append_entry(1, bytecask::EntryType::Put, to_bytes("a"), to_bytes("1"));
+  (void)file->append_entry(2, bytecask::EntryType::Put, to_bytes("b"), to_bytes("2"));
+  bytecask::DataFileIterator it{*file};
+  it++;
+  REQUIRE_FALSE(it == std::default_sentinel);
+  CHECK((*it).first.sequence == 2);
+  file.reset();
+  std::filesystem::remove(path);
+}
+
 TEST_CASE("DataFileIterator sweeps across chunk boundaries", "[data_file][iterator]") {
   const auto io_backend =
       GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::Mmap,
@@ -934,16 +962,6 @@ public:
                   std::vector<std::byte> &) const override {
     throw std::logic_error{"unused"};
   }
-  auto read_entry(bytecask::Offset, std::uint32_t,
-                  std::vector<std::byte> &) const
-      -> bytecask::DataEntryView override {
-    throw std::logic_error{"unused"};
-  }
-  auto read_entry_unverified(bytecask::Offset, std::uint32_t,
-                             std::vector<std::byte> &) const
-      -> bytecask::DataEntryView override {
-    throw std::logic_error{"unused"};
-  }
   auto lend_record(bytecask::Offset, std::uint32_t, bool,
                    std::vector<std::byte> &, bytecask::FrameLease &) const
       -> bytecask::DataEntryView override {
@@ -1121,6 +1139,130 @@ TEST_CASE("renameDataFileExclusive panics rather than replacing a live file",
 
   std::filesystem::remove_all(dir);
 }
+
+TEST_CASE("createDataFileForWrite writes an empty mmap file with pread",
+          "[data_file]") {
+  // Without a capacity there is nothing to map ahead of the write cursor.
+  const auto dir = std::filesystem::temp_directory_path() / "bc_test_mmap_cap0";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const auto file = bytecask::createDataFileForWrite(
+      dir, "data_20260912164544_00000002_V01", ".data", 0,
+      bytecask::IoBackend::Mmap);
+  CHECK(dynamic_cast<bytecask::WritablePosixDataFile *>(file.get()) != nullptr);
+  std::filesystem::remove_all(dir);
+}
+
+#ifdef __linux__
+// ---------------------------------------------------------------------------
+// The errno each fallback turns on, injected below the call
+// ---------------------------------------------------------------------------
+
+TEST_CASE("renameDataFileExclusive falls back to link when the filesystem "
+          "lacks RENAME_NOREPLACE",
+          "[data_file]") {
+  const auto err = GENERATE(EINVAL, ENOSYS);
+  const auto dir = std::filesystem::temp_directory_path() / "bc_test_place_fb";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const auto from = dir / "staged.data.tmp";
+  const auto to = dir / "staged.data";
+  { std::ofstream f{from}; f << "compacted"; }
+
+  {
+    bytecask::testing::ScopedSyscallFaults faults{
+        dir, bytecask::testing::SyscallFault::before, 1, false, err};
+    bytecask::renameDataFileExclusive(from, to);
+    const auto report = faults.report();
+    REQUIRE(report.fired);
+    CHECK(report.what.starts_with("renameat2("));
+  }
+
+  CHECK(std::filesystem::file_size(to) == 9);
+  CHECK_FALSE(std::filesystem::exists(from));
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("renameDataFileExclusive throws on any other rename error",
+          "[data_file]") {
+  const auto dir = std::filesystem::temp_directory_path() / "bc_test_place_eio";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const auto from = dir / "staged.data.tmp";
+  const auto to = dir / "staged.data";
+  { std::ofstream f{from}; f << "compacted"; }
+
+  {
+    bytecask::testing::ScopedSyscallFaults faults{
+        dir, bytecask::testing::SyscallFault::before, 1};
+    CHECK_THROWS_AS(bytecask::renameDataFileExclusive(from, to),
+                    std::system_error);
+  }
+
+  CHECK(std::filesystem::exists(from));  // no fallback: nothing moved
+  CHECK_FALSE(std::filesystem::exists(to));
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("sync_directory takes EINVAL as done and throws on other errors",
+          "[data_file]") {
+  const auto dir = std::filesystem::temp_directory_path() / "bc_test_dirsync";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  // The directory's open is the first counted call, its fsync the second.
+  SECTION("a filesystem that cannot sync a directory") {
+    bytecask::testing::ScopedSyscallFaults faults{
+        dir, bytecask::testing::SyscallFault::before, 2, false, EINVAL};
+    CHECK_NOTHROW(bytecask::sync_directory(dir, "test_dirsync"));
+    const auto report = faults.report();
+    REQUIRE(report.fired);
+    CHECK(report.what.starts_with("fsync("));
+  }
+  SECTION("an I/O error") {
+    bytecask::testing::ScopedSyscallFaults faults{
+        dir, bytecask::testing::SyscallFault::before, 2};
+    CHECK_THROWS_AS(bytecask::sync_directory(dir, "test_dirsync"),
+                    std::system_error);
+  }
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("ReadOnlyMmapDataFile::openForRead refuses an empty file",
+          "[data_file]") {
+  // There is nothing to map.
+  const auto dir = std::filesystem::temp_directory_path() / "bc_test_mmap_empty";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const auto path = dir / "empty.data";
+  { std::ofstream f{path}; }
+  CHECK_THROWS_AS(bytecask::ReadOnlyMmapDataFile::openForRead(path),
+                  std::system_error);
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("ReadOnlyMmapDataFile::openForRead throws when fstat fails",
+          "[data_file]") {
+  const auto dir = std::filesystem::temp_directory_path() / "bc_test_mmap_fstat";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const auto path = dir / "sealed.data";
+  {
+    auto w = bytecask::WritablePosixDataFile::create(path, 0);
+    (void)w->append_entry(1, bytecask::EntryType::Put, to_bytes("k"),
+                          to_bytes("v"));
+    w->sync();
+  }
+  {
+    // The open is the first counted call, the fstat the second.
+    bytecask::testing::ScopedSyscallFaults faults{
+        dir, bytecask::testing::SyscallFault::before, 2};
+    CHECK_THROWS_AS(bytecask::ReadOnlyMmapDataFile::openForRead(path),
+                    std::system_error);
+    CHECK(faults.report().what.starts_with("fstat("));
+  }
+  std::filesystem::remove_all(dir);
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // lend_record — every back-end, writable and sealed
@@ -1365,7 +1507,10 @@ TEST_CASE("DataFile: a read past the end of file reports a short read",
   // The over-read past the record may meet the end of the file; the
   // record's own bytes may not.
   const auto entry = error_of(
-      [&] { (void)file->read_entry_unverified(second, 6, io_buf); });
+      [&] {
+        bytecask::FrameLease lease;
+        (void)file->lend_record(second, 6, /*verify=*/false, io_buf, lease);
+      });
   INFO(entry);
   CHECK(entry.find(std::format("short read: the file ends 18 bytes into a "
                                "read of 26 at offset {}",

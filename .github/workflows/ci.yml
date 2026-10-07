@@ -478,16 +478,21 @@ jobs:
             git ninja-build
           pip3 install nanobind pytest hypothesis
 
+      # Fails when MC/DC on the durability and recovery code drops below
+      # 100% after exemptions (scripts/mcdc_report.py); the report is still
+      # written, so the uploads below run either way.
       - name: Run coverage pipeline
         run: bash scripts/run_coverage.sh
 
       - name: Upload coverage HTML artifact
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: coverage-html
           path: coverage/html/
 
       - name: Upload lcov artifact
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: coverage-lcov
