@@ -207,12 +207,12 @@ public:
 
     void put(BytesView key, BytesView value);
     void del(BytesView key);
-    void del_range(BytesView from, BytesView to);  // range delete: [from, to)
+    void del_range(BytesView from, BytesView to);  // range delete: [from, to); from >= to throws
 
     void ensure_present(BytesView key);                         // guard: key must exist
     void ensure_absent(BytesView key);                          // guard: key must be absent
     void ensure_unchanged(BytesView key);                       // guard: key unchanged since snapshot
-    void ensure_range_unchanged(BytesView from, BytesView to);  // guard: no key change in [from, to)
+    void ensure_range_unchanged(BytesView from, BytesView to);  // guard: no key change in [from, to); from >= to throws
 
     [[nodiscard]] auto has_snapshot() const noexcept -> bool;
     [[nodiscard]] auto empty() const noexcept -> bool;

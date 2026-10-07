@@ -56,7 +56,8 @@ count without reading records.
 
 ```cpp
 // Live keys in [from, to), counted no further than `limit`: returns
-// min(count, limit). 0 if from >= to.
+// min(count, limit). Throws std::invalid_argument if from >= to; the plugin's
+// count_range answers lo >= hi with 0 before calling it.
 [[nodiscard]] auto count_keys(BytesView from, BytesView to,
                               std::size_t limit) const -> std::size_t;
 ```

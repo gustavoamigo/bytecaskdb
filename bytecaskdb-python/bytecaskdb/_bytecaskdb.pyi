@@ -84,7 +84,7 @@ class Options:
     """Active file rotation threshold in bytes (default 64 MiB)."""
 
     recovery_threads: int
-    """Number of threads for parallel hint-file replay at open (default 4)."""
+    """Number of threads for parallel hint-file replay at open (default 4; 0 is refused at open)."""
 
     fail_recovery_on_crc_errors: bool
     """If True (default), any CRC error during recovery raises.
@@ -326,7 +326,10 @@ class WritePlan:
         ...
 
     def del_range(self, from_key: bytes, to_key: bytes) -> None:
-        """Stage a range deletion: all keys in ``[from_key, to_key)``."""
+        """Stage a range deletion: all keys in ``[from_key, to_key)``.
+
+        Raises ``ValueError`` if ``from_key >= to_key``.
+        """
         ...
 
     def ensure_present(self, key: bytes) -> None:
@@ -347,7 +350,8 @@ class WritePlan:
     def ensure_range_unchanged(self, from_key: bytes, to_key: bytes) -> None:
         """Guard: no key in ``[from_key, to_key)`` changed since the snapshot.
 
-        Raises ``ValueError`` if the plan has no snapshot.
+        Raises ``ValueError`` if the plan has no snapshot or if
+        ``from_key >= to_key``.
         """
         ...
 
@@ -411,8 +415,8 @@ class DB:
     ) -> CommitResult:
         """Delete all keys in ``[from_key, to_key)`` with a single disk append.
 
-        Returns the assigned ``CommitResult`` (``sequence == 0`` if
-        ``from_key >= to_key``, since nothing was written). Cannot conflict.
+        Returns the assigned ``CommitResult``. Cannot conflict. Raises
+        ``ValueError``, before anything is written, if ``from_key >= to_key``.
         """
         ...
 

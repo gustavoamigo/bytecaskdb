@@ -180,6 +180,17 @@ inline void check_key_size(std::size_t size, std::uint32_t limit) {
   }
 }
 
+// A range [from, to) must hold at least one possible key. An empty or
+// inverted one is refused rather than treated as nothing to do: from >= to is
+// almost always swapped bounds, and a write that silently does nothing hides
+// the bug.
+inline void check_range(BytesView from, BytesView to) {
+  if (!std::ranges::lexicographical_compare(from, to)) {
+    throw std::invalid_argument{
+        "range [from, to) is empty: from must sort before to"};
+  }
+}
+
 inline void check_value_size(std::size_t size, std::uint32_t limit) {
   if (size > limit) {
     throw std::invalid_argument{
@@ -235,11 +246,13 @@ export struct ReadOptions {
 // Options passed to DB::open().
 export struct Options {
   // Active-file rotation threshold in bytes (default 64 MiB). When the active
-  // file reaches this size it is sealed and a new one is opened. Hard
-  // ceiling: kMaxFileBytes (3 GiB); open rejects more.
+  // file reaches this size it is sealed and a new one is opened, so 0 seals
+  // a file after every write. Hard ceiling: kMaxFileBytes (3 GiB); open
+  // rejects more.
   std::uint64_t max_file_bytes{kDefaultRotationThreshold};
   // Number of threads used to rebuild the key directory at open time.
-  // 1 selects the serial path; >1 uses file-level fan-in parallelism.
+  // 1 selects the serial path; >1 uses file-level fan-in parallelism. 0 is
+  // refused at open with std::invalid_argument.
 #ifdef BYTECASK_SINGLE_THREADED
   unsigned recovery_threads{1};
 #else
@@ -1106,8 +1119,8 @@ public:
                         BytesView key) -> std::optional<CommitResult>;
 
   // Deletes all keys in [from, to). One append to the data file, one
-  // optional fdatasync. Cannot conflict. Returns {sequence = 0, durable =
-  // true} without writing if from >= to.
+  // optional fdatasync. Cannot conflict. Throws std::invalid_argument, before
+  // anything is written, if from >= to.
   auto del_range(const WriteOptions &opts, BytesView from,
                 BytesView to) -> CommitResult;
 
@@ -1742,7 +1755,7 @@ public:
       -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
 
   // Live keys in [from, to), counted no further than `limit`: returns
-  // min(count, limit), 0 if from >= to. Reads no key per counted entry: at
+  // min(count, limit). Throws std::invalid_argument if from >= to. Reads no key per counted entry: at
   // most two record reads under the blind-leaf key directory, to place each
   // end, and none under the keyed ones.
   [[nodiscard]] auto count_keys(BytesView from, BytesView to,
@@ -1858,9 +1871,11 @@ public:
 
   // --- Range writes ---
 
+  // Deletes [from, to). from >= to throws std::invalid_argument.
   void del_range(BytesView from, BytesView to) {
     check_key_size(from.size(), limits_.max_key_bytes);
     check_key_size(to.size(), limits_.max_key_bytes);
+    check_range(from, to);
     writes_.emplace_back(
         RangeDel{Bytes{from.begin(), from.end()},
                  Bytes{to.begin(), to.end()}});
@@ -1892,11 +1907,13 @@ public:
 
   // Conflict if any key in [from, to) was inserted, modified,
   // or deleted since the snapshot. The range is half-open:
-  // from is inclusive, to is exclusive.
+  // from is inclusive, to is exclusive; from >= to throws
+  // std::invalid_argument.
   // Requires a snapshot — throws std::logic_error if constructed without one.
   void ensure_range_unchanged(BytesView from, BytesView to) {
     check_key_size(from.size(), limits_.max_key_bytes);
     check_key_size(to.size(), limits_.max_key_bytes);
+    check_range(from, to);
     if (!snap_) {
       throw std::logic_error{
           "WritePlan::ensure_range_unchanged requires a snapshot"};
@@ -2747,6 +2764,10 @@ DB::DB(std::filesystem::path dir, Options opts)
         "max_file_bytes = {} exceeds the hard ceiling of {}",
         opts.max_file_bytes, kMaxFileBytes)};
   }
+  if (opts.recovery_threads == 0) {
+    throw std::invalid_argument{
+        "recovery_threads = 0: recovery needs at least one thread"};
+  }
 #ifdef __EMSCRIPTEN__
   if (opts.io_backend == IoBackend::Mmap) {
     throw std::invalid_argument{
@@ -2765,7 +2786,7 @@ DB::DB(std::filesystem::path dir, Options opts)
           "IoBackend::BufferPool: buffer_pool.capacity_bytes = {} must be at "
           "least 2 x max_file_bytes = {}. Raise the pool, or lower "
           "max_file_bytes — the two are coupled.",
-          opts.buffer_pool.capacity_bytes, opts.max_file_bytes)};
+          opts.buffer_pool.capacity_bytes, 2 * opts.max_file_bytes)};
     }
     pool_ = std::make_shared<BufferPool>(opts.buffer_pool);
   }
@@ -2989,9 +3010,6 @@ auto DB::del(const WriteOptions &opts,
 
 auto DB::del_range(const WriteOptions &opts, BytesView from,
                   BytesView to) -> CommitResult {
-  check_key_size(from.size(), size_limits_.max_key_bytes);
-  check_key_size(to.size(), size_limits_.max_key_bytes);
-  if (Key{from} >= Key{to}) return CommitResult{.sequence = 0, .durable = true};
   WritePlan plan{size_limits_};
   plan.del_range(from, to);
   return *apply_batch(opts, std::move(plan));
@@ -3627,8 +3645,8 @@ auto Snapshot::riter_from(const ReadOptions& opts, BytesView from) const
 
 auto Snapshot::count_keys(BytesView from, BytesView to,
                           std::size_t limit) const -> std::size_t {
-  if (limit == 0 || !std::ranges::lexicographical_compare(from, to))
-    return 0;
+  check_range(from, to);
+  if (limit == 0) return 0;
   return kd_count(state_->key_dir, from, to, limit, state_->kd_ctx());
 }
 
@@ -5684,8 +5702,9 @@ auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
   const auto W = 1u;
   (void)recovery_threads;
 #else
-  auto W = std::min(static_cast<unsigned>(files.size()), recovery_threads);
-  if (W == 0) W = 1;
+  // Both are at least 1: open rejects recovery_threads = 0, and an empty
+  // file list returned above.
+  const auto W = std::min(static_cast<unsigned>(files.size()), recovery_threads);
 #endif
 
   const auto parallel_for = [](unsigned n, auto &&body) {
@@ -5979,8 +5998,9 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
   const auto W = 1u;
   (void)recovery_threads;
 #else
-  auto W = std::min(static_cast<unsigned>(files.size()), recovery_threads);
-  if (W == 0) W = 1;
+  // Both are at least 1: open rejects recovery_threads = 0, and an empty
+  // file list returned above.
+  const auto W = std::min(static_cast<unsigned>(files.size()), recovery_threads);
 #endif
   constexpr std::size_t kFenceStep = 4096;
 

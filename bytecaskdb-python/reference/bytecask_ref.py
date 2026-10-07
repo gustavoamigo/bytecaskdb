@@ -267,6 +267,13 @@ MAX_FILE_BYTES = 3 << 30
 MAX_BATCH_BYTES = 1 << 30
 
 
+def _check_range(from_key: bytes, to_key: bytes) -> None:
+    """A range [from, to) must hold a possible key. from >= to is refused, not
+    treated as nothing to do: it is almost always swapped bounds."""
+    if from_key >= to_key:
+        raise ValueError("range [from, to) is empty: from must sort before to")
+
+
 @dataclass
 class Options:
     max_file_bytes: int = 64 * 1024 * 1024
@@ -382,6 +389,7 @@ class WritePlan:
         self._add(Entry(0, EntryType.DELETE, bytes(key)))
 
     def del_range(self, from_key: bytes, to_key: bytes) -> None:
+        _check_range(from_key, to_key)
         self._add(Entry(0, EntryType.RANGE_DELETE, bytes(from_key), bytes(to_key)))
 
     def ensure_present(self, key: bytes) -> None:
@@ -396,6 +404,7 @@ class WritePlan:
         self._guard(key, _Guard.UNCHANGED)
 
     def ensure_range_unchanged(self, from_key: bytes, to_key: bytes) -> None:
+        _check_range(from_key, to_key)
         if self._snapshot is None:
             raise ValueError("WritePlan::ensure_range_unchanged requires a snapshot")
         self._check_not_applied()
@@ -524,8 +533,6 @@ class DB:
                   opts: WriteOptions | None = None) -> CommitResult:
         """Deletes [from_key, to_key) with one entry, however many keys it holds."""
         self._check_sizes([Entry(0, EntryType.RANGE_DELETE, from_key, to_key)])
-        if from_key >= to_key:
-            return CommitResult(0, True)
         plan = WritePlan()
         plan.del_range(from_key, to_key)
         result = self.apply_batch(plan, opts)

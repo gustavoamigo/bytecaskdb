@@ -104,7 +104,8 @@ Delete all keys in `[from, to)` with a single disk append. Cannot conflict.
 - **from** `string`
 - **to** `string`
 - **opts** `WriteOptions?`
-- **returns** `CommitResult` — `{ sequence: 0n, durable: true }` without writing if `from >= to`
+- **returns** `CommitResult`
+- **throws** if `from >= to`, before anything is written
 - **throws** on I/O failure or `DbDegraded`
 
 ---

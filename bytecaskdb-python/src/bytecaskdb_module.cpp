@@ -413,7 +413,7 @@ NB_MODULE(_bytecaskdb, m) {
       .def_rw("max_file_bytes", &bytecask::Options::max_file_bytes,
               "Active file rotation threshold in bytes (default 64 MiB).")
       .def_rw("recovery_threads", &bytecask::Options::recovery_threads,
-              "Number of threads for parallel hint-file replay (default 4).")
+              "Number of threads for parallel hint-file replay (default 4; 0 is refused at open).")
       .def_rw("fail_recovery_on_crc_errors",
               &bytecask::Options::fail_recovery_on_crc_errors,
               "If True (default), CRC errors during recovery raise.")
@@ -667,7 +667,8 @@ NB_MODULE(_bytecaskdb, m) {
       .def("del_", &PyWritePlan::del, "Stage a key deletion.",
            "key"_a, nb::lock_self())
       .def("del_range", &PyWritePlan::del_range,
-           "Stage a range deletion: all keys in [from_key, to_key).",
+           "Stage a range deletion: all keys in [from_key, to_key). Raises "
+           "ValueError if from_key >= to_key.",
            "from_key"_a, "to_key"_a, nb::lock_self())
       .def("ensure_present", &PyWritePlan::ensure_present,
            "Guard: key must exist at commit time.",
@@ -754,7 +755,8 @@ NB_MODULE(_bytecaskdb, m) {
             return self.db.del_range(wopts, f, t);
           },
           "Delete all keys in [from_key, to_key) with a single disk append. "
-          "Returns the assigned CommitResult.",
+          "Returns the assigned CommitResult. Raises ValueError, before "
+          "anything is written, if from_key >= to_key.",
           "from_key"_a, "to_key"_a, "opts"_a = nb::none())
       .def(
           "contains_key",

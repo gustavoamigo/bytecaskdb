@@ -104,10 +104,12 @@ export interface Snapshot extends Disposable {
 export interface WritePlan extends Disposable {
   put(key: string, value: string): void;
   del(key: string): void;
+  /** Deletes [from, to). Throws if from >= to. */
   delRange(from: string, to: string): void;
   ensurePresent(key: string): void;
   ensureAbsent(key: string): void;
   ensureUnchanged(key: string): void;
+  /** Throws if from >= to. */
   ensureRangeUnchanged(from: string, to: string): void;
   hasSnapshot(): boolean;
   close(): void;
@@ -117,6 +119,7 @@ export interface ByteCaskDB extends Disposable {
   get(key: string, opts?: ReadOptions): Uint8Array | null;
   put(key: string, value: string, opts?: WriteOptions): CommitResult;
   del(key: string, opts?: WriteOptions): CommitResult | null;
+  /** Deletes [from, to). Throws, before anything is written, if from >= to. */
   delRange(from: string, to: string, opts?: WriteOptions): CommitResult;
   containsKey(key: string, opts?: ReadOptions): boolean;
   snapshot(): Snapshot;

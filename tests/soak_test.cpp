@@ -764,16 +764,17 @@ private:
 
   void do_del_range() {
     const auto a = slot();
-    const auto b = static_cast<std::uint32_t>(
-        rng_.range(a, std::min<std::uint64_t>(cfg_.slots_per_writer, a + 16)));
+    // A range holds at least one slot: from >= to is refused.
+    const auto b = static_cast<std::uint32_t>(rng_.range(
+        a + 1, std::min<std::uint64_t>(cfg_.slots_per_writer, a + 16)));
     const auto [from, to] = range_keys(a, b);
     const auto opts = wopts();
     try {
       const auto r = sh_.db.del_range(opts, std::as_bytes(std::span{from}),
                                       std::as_bytes(std::span{to}));
-      if (a < b) check_commit(r, opts.sync, "del_range");
+      check_commit(r, opts.sync, "del_range");
       for (auto s = a; s < b; ++s) p_.slots[s].state = SlotModel::State::Absent;
-      if (a < b) read_back(a, "del_range");
+      read_back(a, "del_range");
     } catch (...) {
       if (!classify("del_range"))
         for (auto s = a; s < b; ++s)
@@ -824,7 +825,7 @@ private:
     if (with_snap && rng_.chance(0.2)) {
       const auto a = slot();
       const auto b = static_cast<std::uint32_t>(rng_.range(
-          a, std::min<std::uint64_t>(cfg_.slots_per_writer, a + 8)));
+          a + 1, std::min<std::uint64_t>(cfg_.slots_per_writer, a + 8)));
       const auto [from, to] = range_keys(a, b);
       plan->ensure_range_unchanged(std::as_bytes(std::span{from}),
                                    std::as_bytes(std::span{to}));
@@ -856,7 +857,7 @@ private:
       } else {
         const auto a = slot();
         const auto b = static_cast<std::uint32_t>(rng_.range(
-            a, std::min<std::uint64_t>(cfg_.slots_per_writer, a + 8)));
+            a + 1, std::min<std::uint64_t>(cfg_.slots_per_writer, a + 8)));
         const auto [from, to] = range_keys(a, b);
         plan->del_range(std::as_bytes(std::span{from}),
                         std::as_bytes(std::span{to}));

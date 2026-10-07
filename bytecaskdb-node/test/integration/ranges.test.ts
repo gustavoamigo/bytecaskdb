@@ -118,8 +118,9 @@ test('empty range handling works correctly', async ({ db }) => {
   // Setup some test data
   db.put('test:key', 'test:value')
 
-  // Test deleting empty range (from >= to)
-  db.delRange('empty:b', 'empty:a') // b >= a, no-op
+  // An empty or swapped range (from >= to) is refused, not ignored
+  expect(() => db.delRange('empty:b', 'empty:a')).toThrow()
+  expect(() => db.delRange('empty:a', 'empty:a')).toThrow()
 
   // Should not affect existing data
   expect(decodeBytes(db.get('test:key')!)).toBe('test:value')
