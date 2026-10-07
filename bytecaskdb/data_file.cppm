@@ -56,6 +56,10 @@ namespace bytecask {
 // Byte offset into a data file, as returned by append() and consumed by read().
 export using Offset = std::uint64_t;
 
+// Offsets reach pread and pwrite as off_t. A 32-bit off_t would make every
+// narrow<off_t> refuse an offset from 2 GiB up.
+static_assert(sizeof(off_t) == 8, "data files need a 64-bit off_t");
+
 // Reached only when an exclusive create loses to an existing file, which means
 // the caller handed back a name the database already used. Opening it for write
 // would silently adopt the sealed file's length and append past its end; those
@@ -341,7 +345,7 @@ auto diagnose_fd_read(int fd, const std::filesystem::path &path, Offset offset,
 // nullopt otherwise, with nothing pinned; the caller copies instead. That
 // covers a straddling record, a non-resident frame and a lost race alike.
 auto lend_from_pool(BufferPool &pool, std::uint32_t file_id,
-                    std::size_t file_size, Offset offset, bool verify,
+                    Offset file_size, Offset offset, bool verify,
                     FrameLease &lease) -> std::optional<DataEntryView> {
   const auto bytes = pool.view(file_id, offset, file_size, lease);
   if (bytes.size() < kHeaderSize) {
@@ -366,7 +370,7 @@ auto lend_from_pool(BufferPool &pool, std::uint32_t file_id,
 // the whole entry, checked in place. Returns false, with nothing pinned,
 // when they do not; the caller then reads through the pool the long way.
 auto read_value_from_pool(BufferPool &pool, std::uint32_t file_id,
-                          std::size_t file_size, Offset offset,
+                          Offset file_size, Offset offset,
                           std::uint16_t key_size, std::uint32_t value_size,
                           bool verify, std::vector<std::byte> &out) -> bool {
   FrameLease lease;
@@ -440,8 +444,7 @@ public:
                                 Offset logical_end, std::byte *dst) const
       -> std::size_t {
     return pool_->read_upto(file_id_, PoolFile{.buffered = fd, .direct = -1},
-                            offset, len, static_cast<std::size_t>(logical_end),
-                            dst);
+                            offset, len, logical_end, dst);
   }
 
   // Zero-copy entry and point read out of the frames the writer filled,
@@ -450,16 +453,14 @@ public:
   [[nodiscard]] auto lend(Offset offset, bool verify, Offset logical_end,
                           FrameLease &lease) const
       -> std::optional<DataEntryView> {
-    return lend_from_pool(*pool_, file_id_,
-                          static_cast<std::size_t>(logical_end), offset,
-                          verify, lease);
+    return lend_from_pool(*pool_, file_id_, logical_end, offset, verify,
+                          lease);
   }
   [[nodiscard]] auto read_value(Offset offset, std::uint16_t key_size,
                                 std::uint32_t value_size, bool verify,
                                 Offset logical_end,
                                 std::vector<std::byte> &out) const -> bool {
-    return read_value_from_pool(*pool_, file_id_,
-                                static_cast<std::size_t>(logical_end), offset,
+    return read_value_from_pool(*pool_, file_id_, logical_end, offset,
                                 key_size, value_size, verify, out);
   }
 
@@ -777,6 +778,13 @@ struct WritableFileOps {
 #endif
 };
 
+#ifndef __EMSCRIPTEN__
+// Neither mmap-backed file exists in the WASM build. Emscripten's mmap copies
+// the file into linear memory when it is mapped, so a mapping never sees a
+// later write, and a reader would take stale bytes for the record. The engine
+// refuses IoBackend::Mmap there; without these classes nothing else can
+// construct one by mistake either.
+
 // ---------------------------------------------------------------------------
 // WritableMmapDataFile — mmap-backed writable data file.
 //
@@ -983,6 +991,7 @@ WritableMmapDataFile::~WritableMmapDataFile() {
     ::close(ops_.fd_);
   }
 }
+#endif  // __EMSCRIPTEN__
 
 // ---------------------------------------------------------------------------
 // WritablePosixFile — pwritev-based writable data file.
@@ -1148,9 +1157,12 @@ export using WritableBufferPoolDataFile = WritablePosixFile<PoolIo>;
 // by. A failed fstat closes fd and throws: taken as an empty file it would
 // seal a file none of whose records can be read, and whose hint, written from
 // it, indexes nothing.
+// A file's size is an Offset, not a size_t: a data file can be 4 GiB, which
+// a 32-bit size_t (the WASM build) would wrap to 0 and every reader would see
+// as empty.
 [[nodiscard]] inline auto sealed_file_size(int fd,
                                            const std::filesystem::path &path)
-    -> std::size_t {
+    -> Offset {
   struct stat st {};
   if (::fstat(fd, &st) != 0) {
     const auto err = errno;
@@ -1159,7 +1171,7 @@ export using WritableBufferPoolDataFile = WritablePosixFile<PoolIo>;
         err, std::generic_category(),
         std::format("sealed_file_size: cannot stat '{}'", path.string())};
   }
-  return static_cast<std::size_t>(st.st_size);
+  return narrow<Offset>(st.st_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -1227,16 +1239,15 @@ public:
   }
 
   [[nodiscard]] auto size() const noexcept -> Offset override {
-    return static_cast<Offset>(file_size_);
+    return file_size_;
   }
 
 private:
-  ReadOnlyPosixDataFile(std::filesystem::path path, int fd,
-                        std::size_t file_size)
+  ReadOnlyPosixDataFile(std::filesystem::path path, int fd, Offset file_size)
       : DataFile{std::move(path)}, fd_{fd}, file_size_{file_size} {}
 
   int fd_;
-  std::size_t file_size_;
+  Offset file_size_;
 
   [[nodiscard]] auto read_entry_with_key_size(Offset offset,
                                               std::uint16_t key_size,
@@ -1263,6 +1274,7 @@ ReadOnlyPosixDataFile::~ReadOnlyPosixDataFile() {
   }
 }
 
+#ifndef __EMSCRIPTEN__  // see WritableMmapDataFile
 // ---------------------------------------------------------------------------
 // ReadOnlyMmapDataFile — mmap-backed read-only data file.
 //
@@ -1389,6 +1401,7 @@ ReadOnlyMmapDataFile::~ReadOnlyMmapDataFile() {
     ::close(fd_);
   }
 }
+#endif  // __EMSCRIPTEN__
 
 // Releases page-cache residency of a file or part of it. Linux only: macOS has no
 // posix_fadvise, and its buffered reads have no per-file drop — the direct
@@ -1501,12 +1514,12 @@ public:
   }
 
   [[nodiscard]] auto size() const noexcept -> Offset override {
-    return static_cast<Offset>(file_size_);
+    return file_size_;
   }
 
 private:
   ReadOnlyBufferPoolDataFile(std::filesystem::path path, int fd,
-                             int direct_fd, std::size_t file_size,
+                             int direct_fd, Offset file_size,
                              std::uint32_t file_id,
                              std::shared_ptr<BufferPool> pool)
       : DataFile{std::move(path)}, fd_{fd}, direct_fd_{direct_fd},
@@ -1515,7 +1528,7 @@ private:
 
   int fd_;
   int direct_fd_;  // -1: no uncached reads here; fills go through fd_
-  std::size_t file_size_;
+  Offset file_size_;
   std::uint32_t file_id_;
   // Shared so the pool outlives every file that lends spans into it.
   std::shared_ptr<BufferPool> pool_;

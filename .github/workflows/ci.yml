@@ -336,6 +336,7 @@ jobs:
       XMAKE_ROOT: "y"
       EMSDK: /opt/emsdk
       EM_CONFIG: /opt/emsdk/.emscripten
+      EMSDK_VERSION: "6.0.11"
     steps:
       - uses: actions/checkout@v4
 
@@ -358,27 +359,29 @@ jobs:
         with:
           node-version: 22
 
-      # Cache the SDK itself (a full install is ~1 GB and several minutes) —
-      # bump the key's suffix to force a refresh onto a newer emsdk "latest".
+      # Cache the SDK itself (a full install is ~1 GB and several minutes).
+      # The version is pinned and is the cache key, so a new Emscripten
+      # arrives as a commit that changes EMSDK_VERSION, never through a cache
+      # eviction (#259, #292).
       - name: Cache Emscripten SDK
         id: emsdk-cache
         uses: actions/cache@v4
         with:
           path: /opt/emsdk
-          key: emsdk-latest-v1
+          key: emsdk-${{ env.EMSDK_VERSION }}
 
       - name: Install Emscripten SDK
         if: steps.emsdk-cache.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 https://github.com/emscripten-core/emsdk.git /opt/emsdk
-          cd /opt/emsdk && ./emsdk install latest && ./emsdk activate latest
+          cd /opt/emsdk && ./emsdk install "$EMSDK_VERSION" && ./emsdk activate "$EMSDK_VERSION"
 
       # wasm_embind (and every other WASM xmake target) links a prebuilt
       # crc32c-wasm and zstd-wasm the xmake targets don't build themselves —
       # only wasm/build.sh does (cross-compiling crc32c, zstd, Google
-      # Benchmark, and Catch2 for WASM, via emcmake/emmake). Cache it keyed on build.sh's own
-      # contents so a future change to the cross-compile recipe invalidates
-      # the cache.
+      # Benchmark, and Catch2 for WASM, via emcmake/emmake). Cache it keyed on
+      # the emsdk version and build.sh's own contents, so a new compiler or a
+      # change to the cross-compile recipe invalidates the cache.
       #
       # emsdk_env.sh prepends emsdk's own clang to PATH — normally unsafe
       # here, since it's also named "clang" and would shadow the system
@@ -392,7 +395,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: bytecaskdb-node/wasm/build
-          key: wasm-deps-${{ hashFiles('bytecaskdb-node/wasm/build.sh') }}
+          key: wasm-deps-${{ env.EMSDK_VERSION }}-${{ hashFiles('bytecaskdb-node/wasm/build.sh') }}
 
       - name: Build WASM dependencies
         if: steps.wasm-deps-cache.outputs.cache-hit != 'true'
@@ -431,6 +434,16 @@ jobs:
         env:
           BC_TEST_BACKEND: native
         run: npm test
+
+      # The engine's own Catch2 suite, compiled for WASM: a 32-bit size_t,
+      # one thread, NODERAWFS. `xmake run` leaves out the [concurrency] and
+      # [lock] cases one thread cannot run; everything else runs, so a 32-bit
+      # break shows here (#373, #292).
+      - name: Build engine test suite (WASM)
+        run: xmake build wasm_tests
+
+      - name: Run engine test suite (WASM)
+        run: xmake run wasm_tests
 
   # ---------------------------------------------------------------------------
   # Coverage (LLVM/Clang)

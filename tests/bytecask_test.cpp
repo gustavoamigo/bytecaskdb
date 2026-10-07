@@ -1901,6 +1901,9 @@ TEST_CASE("Recovery model-based: ceiling-size keys and large values",
       } else {
         auto from = rand_key();
         auto to = rand_key();
+        // Distinct bounds: an empty range is refused. Which draws come out
+        // equal depends on the standard library's distribution.
+        while (to == from) to = rand_key();
         if (to < from) std::swap(from, to);
         db.del_range({.sync = false}, to_bytes(from), to_bytes(to));
         std::erase_if(oracle, [&](const auto &kv) {
@@ -7007,7 +7010,9 @@ auto has_hint(const std::filesystem::path &data) -> bool {
 }
 
 constexpr std::array kFsyncgateBackends{bytecask::IoBackend::Pread,
-                                        bytecask::IoBackend::Mmap,
+#ifndef __EMSCRIPTEN__
+                                        bytecask::IoBackend::Mmap,  // refused on WASM
+#endif
                                         bytecask::IoBackend::BufferPool};
 
 auto fsyncgate_opts(bytecask::IoBackend backend) -> bytecask::Options {
@@ -11282,7 +11287,7 @@ TEST_CASE("Limits: resume without a file id leaves the engine degraded and "
 }
 
 TEST_CASE("Limits: durable_sequence waits with a timeout the clock cannot "
-          "represent", "[bytecask][limits]") {
+          "represent", "[bytecask][limits][concurrency]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
   for (const auto timeout : {std::chrono::milliseconds::max(),
@@ -11301,7 +11306,7 @@ TEST_CASE("Limits: durable_sequence waits with a timeout the clock cannot "
 }
 
 TEST_CASE("Limits: a commit group ends before a slot that would carry the "
-          "file past the group limit", "[bytecask][limits]") {
+          "file past the group limit", "[bytecask][limits][concurrency]") {
   TempDir td;
   const auto dir = td.path / "db";
   const std::string value(179, 'v');
@@ -13830,6 +13835,9 @@ TEST_CASE("commit delay: unsynced writers never wait",
 
 TEST_CASE("commit delay: a synced commit waits once the last flush covered two",
           "[pipeline][commit_delay]") {
+#ifdef BYTECASK_SINGLE_THREADED
+  SKIP("one thread: no other writer can arrive, so a flush never waits");
+#endif
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
   db.put({.sync = true}, to_bytes("seed"), to_bytes("s"));

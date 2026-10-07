@@ -879,7 +879,7 @@ TEST_CASE("BufferPool: release_file leaves a leased frame to the hand",
 
 TEST_CASE("BufferPool: readers racing release_file always read the file's "
           "bytes",
-          "[buffer_pool]") {
+          "[buffer_pool][concurrency]") {
   // A release removes frames under readers exactly as eviction does: a
   // reader that loses the race misses and fills again, and never sees a
   // frame mid-reuse. The pool is small, so released frames are refilled at

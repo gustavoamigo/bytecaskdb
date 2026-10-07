@@ -4179,8 +4179,7 @@ void DB::vacuum_unlink_old_file(
   // Its frames would otherwise hold a frame each until the SIEVE hand came
   // round, which in a pool that rarely misses is a long time.
   if (pool_) {
-    pool_->release_file(file_id,
-                        static_cast<std::size_t>(old_data_file->size()));
+    pool_->release_file(file_id, old_data_file->size());
   }
   counters_.vacuum_files_unlinked.fetch_add(1, std::memory_order_relaxed);
 }
