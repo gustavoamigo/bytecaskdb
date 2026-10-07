@@ -392,8 +392,9 @@ public:
       -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
 
   // Live keys in [from, to), counted no further than `limit`: returns
-  // min(count, limit), 0 if from >= to. At most two record reads, whatever
-  // the range holds.
+  // min(count, limit). At most two record reads, whatever the range holds.
+  // Every range [from, to) here must have from < to: from >= to throws
+  // std::invalid_argument.
   [[nodiscard]] auto count_keys(BytesView from, BytesView to,
                                 std::size_t limit) const -> std::size_t;
 
@@ -433,13 +434,13 @@ public:
 
   void put(BytesView key, BytesView value);
   void del(BytesView key);
-  void del_range(BytesView from, BytesView to);
+  void del_range(BytesView from, BytesView to);  // from >= to throws
 
   void ensure_present(BytesView key);
   void ensure_absent(BytesView key);
   // Requires snapshot; throws std::logic_error if called without one.
   void ensure_unchanged(BytesView key);
-  void ensure_range_unchanged(BytesView from, BytesView to);
+  void ensure_range_unchanged(BytesView from, BytesView to);  // from >= to throws
 
   [[nodiscard]] auto has_snapshot() const noexcept -> bool;
 
@@ -479,6 +480,7 @@ public:
            BytesView key, BytesView value) -> CommitResult;
   [[nodiscard]] auto del(const WriteOptions& opts,
                         BytesView key) -> std::optional<CommitResult>;
+  // Throws std::invalid_argument, before anything is written, if from >= to.
   auto del_range(const WriteOptions& opts,
                 BytesView from, BytesView to) -> CommitResult;
   [[nodiscard]] auto contains_key(const ReadOptions& opts,

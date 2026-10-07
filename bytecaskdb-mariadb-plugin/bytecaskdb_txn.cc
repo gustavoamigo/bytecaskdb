@@ -148,6 +148,11 @@ bool MariaDBTxn::exists(const uint8_t *key, size_t klen) {
 std::size_t MariaDBTxn::count_range(const uint8_t *lo, size_t lo_len,
                                     const uint8_t *hi, size_t hi_len,
                                     std::size_t limit) {
+  // Contradictory predicates (a > 5 AND a < 3) give lo >= hi: a range that
+  // holds no rows. count_keys refuses one, so it is answered here.
+  if (!std::lexicographical_compare(lo, lo + lo_len, hi, hi + hi_len)) {
+    return 0;
+  }
   if (!snap_) {
     snap_.emplace(db_->snapshot());
   }

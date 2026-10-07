@@ -95,7 +95,7 @@ public:
   [[nodiscard]] auto del(const WriteOptions &opts, BytesView key)
       -> std::optional<CommitResult>;
 
-  // Cannot conflict. If from >= to, returns {sequence = 0} without writing.
+  // Cannot conflict. Throws std::invalid_argument, without writing, if from >= to.
   auto del_range(const WriteOptions &opts, BytesView from, BytesView to)
       -> CommitResult;
 

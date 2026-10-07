@@ -180,6 +180,17 @@ inline void check_key_size(std::size_t size, std::uint32_t limit) {
   }
 }
 
+// A range [from, to) must hold at least one possible key. An empty or
+// inverted one is refused rather than treated as nothing to do: from >= to is
+// almost always swapped bounds, and a write that silently does nothing hides
+// the bug.
+inline void check_range(BytesView from, BytesView to) {
+  if (!std::ranges::lexicographical_compare(from, to)) {
+    throw std::invalid_argument{
+        "range [from, to) is empty: from must sort before to"};
+  }
+}
+
 inline void check_value_size(std::size_t size, std::uint32_t limit) {
   if (size > limit) {
     throw std::invalid_argument{
@@ -1108,8 +1119,8 @@ public:
                         BytesView key) -> std::optional<CommitResult>;
 
   // Deletes all keys in [from, to). One append to the data file, one
-  // optional fdatasync. Cannot conflict. Returns {sequence = 0, durable =
-  // true} without writing if from >= to.
+  // optional fdatasync. Cannot conflict. Throws std::invalid_argument, before
+  // anything is written, if from >= to.
   auto del_range(const WriteOptions &opts, BytesView from,
                 BytesView to) -> CommitResult;
 
@@ -1744,7 +1755,7 @@ public:
       -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
 
   // Live keys in [from, to), counted no further than `limit`: returns
-  // min(count, limit), 0 if from >= to. Reads no key per counted entry: at
+  // min(count, limit). Throws std::invalid_argument if from >= to. Reads no key per counted entry: at
   // most two record reads under the blind-leaf key directory, to place each
   // end, and none under the keyed ones.
   [[nodiscard]] auto count_keys(BytesView from, BytesView to,
@@ -1860,9 +1871,11 @@ public:
 
   // --- Range writes ---
 
+  // Deletes [from, to). from >= to throws std::invalid_argument.
   void del_range(BytesView from, BytesView to) {
     check_key_size(from.size(), limits_.max_key_bytes);
     check_key_size(to.size(), limits_.max_key_bytes);
+    check_range(from, to);
     writes_.emplace_back(
         RangeDel{Bytes{from.begin(), from.end()},
                  Bytes{to.begin(), to.end()}});
@@ -1894,11 +1907,13 @@ public:
 
   // Conflict if any key in [from, to) was inserted, modified,
   // or deleted since the snapshot. The range is half-open:
-  // from is inclusive, to is exclusive.
+  // from is inclusive, to is exclusive; from >= to throws
+  // std::invalid_argument.
   // Requires a snapshot — throws std::logic_error if constructed without one.
   void ensure_range_unchanged(BytesView from, BytesView to) {
     check_key_size(from.size(), limits_.max_key_bytes);
     check_key_size(to.size(), limits_.max_key_bytes);
+    check_range(from, to);
     if (!snap_) {
       throw std::logic_error{
           "WritePlan::ensure_range_unchanged requires a snapshot"};
@@ -2995,9 +3010,6 @@ auto DB::del(const WriteOptions &opts,
 
 auto DB::del_range(const WriteOptions &opts, BytesView from,
                   BytesView to) -> CommitResult {
-  check_key_size(from.size(), size_limits_.max_key_bytes);
-  check_key_size(to.size(), size_limits_.max_key_bytes);
-  if (Key{from} >= Key{to}) return CommitResult{.sequence = 0, .durable = true};
   WritePlan plan{size_limits_};
   plan.del_range(from, to);
   return *apply_batch(opts, std::move(plan));
@@ -3633,8 +3645,8 @@ auto Snapshot::riter_from(const ReadOptions& opts, BytesView from) const
 
 auto Snapshot::count_keys(BytesView from, BytesView to,
                           std::size_t limit) const -> std::size_t {
-  if (limit == 0 || !std::ranges::lexicographical_compare(from, to))
-    return 0;
+  check_range(from, to);
+  if (limit == 0) return 0;
   return kd_count(state_->key_dir, from, to, limit, state_->kd_ctx());
 }
 

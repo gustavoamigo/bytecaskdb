@@ -50,7 +50,8 @@ def test_sequences_framing_and_dump(tmp_path, capsys):
         assert db.apply_batch(batch((b"b", b"2"), (b"c", b"3"))).sequence == 5
         assert db.del_(b"zz") is None
         assert db.del_(b"a").sequence == 6
-        assert db.del_range(b"x", b"a") == ref.CommitResult(0, True)
+        with pytest.raises(ValueError):
+            db.del_range(b"x", b"a")
     ref.dump(tmp_path)
     lines = [line for line in capsys.readouterr().out.splitlines() if not line.endswith(".data")]
     # The trace in the module docstring, plus the delete.
@@ -346,7 +347,7 @@ def test_differential_against_native(tmp_path, bc, seed):
         return bytes(rng.randrange(256) for _ in range(rng.randint(0, 40)))
 
     def key_range():
-        a, b = rng.choice(keys), rng.choice(keys)
+        a, b = rng.sample(keys, 2)  # distinct: from >= to is refused
         return min(a, b), max(a, b)
 
     for step in range(1500):

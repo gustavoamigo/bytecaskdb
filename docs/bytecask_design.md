@@ -343,6 +343,8 @@ Properties of stage 2:
 
 `del_range(opts, from, to)` deletes all keys in `[from, to)` with a single data file append. The on-disk entry reuses the standard layout: `entry_type = RangeDel (0x05)`, `key = start_key`, `value = end_key`. No new header fields.
 
+A range must have `from < to`. `check_range` refuses `from >= to` with `std::invalid_argument` in `WritePlan::del_range` (which `DB::del_range` goes through), `ensure_range_unchanged` and `Snapshot::count_keys`, before anything is written or read. It used to be a silent no-op — `{sequence = 0}` from `DB::del_range`, an entry that deleted nothing from a plan — and an empty or swapped range is almost always a caller's swapped bounds, which the silence hid. The MariaDB plugin's `count_range` answers `lo >= hi`, which contradictory predicates produce, with 0 before calling `count_keys`. The rule is on the API only: `ingest` and recovery still apply a `RangeDel` with `from >= to` written before it, as a range that deletes nothing.
+
 On the write path, `prepare_write` emits one `DataEntryView` per range delete. `apply_writes` iterates the key directory from `lower_bound(from)` to the first key `>= to`, decrements `live_bytes` on each affected file, and erases the keys. The RangeDel entry itself contributes only to `total_bytes` (same as point Delete — tombstones are not live).
 
 Range deletes are supported on `DB::del_range` and `WritePlan::del_range`. Inside a batch, they are framed by `BulkBegin`/`BulkEnd` like other operations. Existing guards (`ensure_unchanged`, `ensure_range_unchanged`, implicit W-W check) detect concurrent range deletes without changes — erased keys produce sequence mismatches.

@@ -1,3 +1,4 @@
+import pytest
 import bytecaskdb._bytecaskdb as bc
 
 
@@ -29,10 +30,15 @@ def test_db_del_range_all(db):
         assert db.get(f"k{i}".encode()) is None
 
 
-def test_db_del_range_noop(db):
+def test_db_del_range_refuses_empty_range(db):
     db.put(b"a", b"1")
-    # from >= to is a no-op
-    db.del_range(b"z", b"a")
+    # from >= to is refused, not ignored: swapped bounds are a bug.
+    for lo, hi in ((b"z", b"a"), (b"a", b"a")):
+        with pytest.raises(ValueError):
+            db.del_range(lo, hi)
+        plan = bc.WritePlan()
+        with pytest.raises(ValueError):
+            plan.del_range(lo, hi)
     assert db.get(b"a") == b"1"
 
 

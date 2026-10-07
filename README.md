@@ -22,7 +22,7 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 
 - **Sequential write path** — all I/O is sequential appends; no random writes. Every `put` and `del` is one append. `apply_batch` with N operations appends a begin marker, N entries, and an end marker in a single `pwritev` — still no WAL, no random writes. Because the key directory stores no key bytes, a `put` or `del` also reads one record (the key's own, or a neighbour's on an insert) to place the key. The whole record is read and CRC-checked, value included, so its cost grows with that record's value size; it is served from the buffer pool or page cache, and if it fails the operation fails before anything is appended.
 - **Ordered range iteration** — scan from any key prefix in key order. Keys are read from their records as the iterator advances, values lazily. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`. `Snapshot::count_keys` counts the keys in a range, up to a limit, from the key directory's leaf sizes: at most two record reads, whatever the range holds.
-- **Range deletion** — `del_range(opts, from, to)` deletes all keys in `[from, to)` with a single data file append, whatever the size of the range. Removing the keys from the key directory reads each of them back from its data file (twice, today), so that part grows with the number of keys removed. Available on `DB` and `WritePlan`.
+- **Range deletion** — `del_range(opts, from, to)` deletes all keys in `[from, to)` with a single data file append, whatever the size of the range. A range with `from >= to` is refused with `std::invalid_argument`, here and in range guards and counts, rather than silently doing nothing. Removing the keys from the key directory reads each of them back from its data file (twice, today), so that part grows with the number of keys removed. Available on `DB` and `WritePlan`.
 - **Atomic writes** — every `put`, `del`, and `del_range` is atomic. `apply_batch` makes multiple puts, deletes, and range deletes atomic as a group.
 - **Hard limits, checked up front** — keys up to 65,535 bytes, values up to 256 MiB, one write up to 1 GiB, data files up to 3 GiB. Anything over a limit is refused before a byte reaches disk, and an option over its ceiling is refused at `open`. One process can create about a million data files (64 TiB written at the default 64 MiB file size, far fewer with tiny files); past that a write that needs a new file is refused, the engine stays writable below it, and a reopen renumbers.
 - **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch(opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `nullopt` on conflict. The snapshot is embedded in the `WritePlan` at construction time. When a snapshot is present, every key in the write set is automatically checked for concurrent modification — no explicit guard needed on keys you write. Use `ensure_unchanged` for keys you read but don't write, and range guards for serializable conflict detection. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. Each precondition check is a key directory lookup plus one record read for the key's sequence — no separate transaction type required. Both levels are checked every night with [Elle](https://github.com/jepsen-io/elle) against concurrent transaction histories, with vacuum and injected `fdatasync` failures running, and with the process SIGKILLed and reopened under concurrent group-commit writers: guarded plans come out strict-serializable, and unguarded ones snapshot-isolated, with write skew as their only anomaly. The check covers point reads and writes; range guards and range deletes are not yet part of it ([`docs/isolation_checking_design.md`](docs/isolation_checking_design.md)).
@@ -314,7 +314,7 @@ public:
     [[nodiscard]] auto del(const WriteOptions& opts, BytesView key) -> std::optional<CommitResult>;
 
     // Deletes all keys in [from, to) with a single data file append. Cannot conflict.
-    // Returns {sequence = 0, durable = true} without writing if from >= to.
+    // Throws std::invalid_argument, before anything is written, if from >= to.
     // Throws std::system_error on I/O failure or DbDegraded.
     auto del_range(const WriteOptions& opts, BytesView from, BytesView to) -> CommitResult;
 
@@ -447,6 +447,7 @@ public:
         -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
     // Live keys in [from, to), counted no further than limit: returns
     // min(count, limit). At most two record reads, whatever the range holds.
+    // Throws std::invalid_argument if from >= to.
     [[nodiscard]] auto count_keys(BytesView from, BytesView to,
                                   std::size_t limit) const -> std::size_t;
 };
@@ -481,7 +482,7 @@ public:
 
     void put(BytesView key, BytesView value);
     void del(BytesView key);
-    void del_range(BytesView from, BytesView to);  // range delete: [from, to)
+    void del_range(BytesView from, BytesView to);  // range delete: [from, to); from >= to throws
 
     void ensure_present(BytesView key);                         // guard: key must exist
     void ensure_absent(BytesView key);                          // guard: key must be absent

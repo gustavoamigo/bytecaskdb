@@ -8196,24 +8196,55 @@ TEST_CASE("del_range deletes keys in range and leaves others",
   CHECK(db.get({}, to_bytes("e"), out));
 }
 
-TEST_CASE("del_range is a no-op when from >= to",
-          "[bytecask][del_range]") {
+TEST_CASE("Ranges: from >= to is refused, before anything is written",
+          "[bytecask][del_range][limits][edges]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
-
   db.put({}, to_bytes("a"), to_bytes("1"));
   db.put({}, to_bytes("b"), to_bytes("2"));
+  const auto bytes = [&] { return db.stats().at("bytecask.bytes_written"); };
+  const auto before = bytes();
+  const auto seq_before = db.durable_sequence();
 
-  bytecask::Bytes out;
+  // Equal bounds hold no key; swapped ones are a caller's bug. Both throw,
+  // the empty key included, and the range check comes before anything else.
+  for (const auto &[from, to] : {std::pair{"a", "a"}, std::pair{"z", "a"},
+                                 std::pair{"", ""}, std::pair{"a", ""}}) {
+    INFO("[" << from << ", " << to << ")");
+    CHECK_THROWS_AS(db.del_range({}, to_bytes(from), to_bytes(to)),
+                    std::invalid_argument);
+    bytecask::WritePlan plan;
+    CHECK_THROWS_AS(plan.del_range(to_bytes(from), to_bytes(to)),
+                    std::invalid_argument);
+    bytecask::WritePlan guarded{db.snapshot()};
+    CHECK_THROWS_AS(
+        guarded.ensure_range_unchanged(to_bytes(from), to_bytes(to)),
+        std::invalid_argument);
+    CHECK_THROWS_AS(db.snapshot().count_keys(to_bytes(from), to_bytes(to), 10),
+                    std::invalid_argument);
+    CHECK_THROWS_AS(db.snapshot().count_keys(to_bytes(from), to_bytes(to), 0),
+                    std::invalid_argument);
+  }
 
-  // from == to: no-op
-  db.del_range({}, to_bytes("a"), to_bytes("a"));
-  CHECK(db.get({}, to_bytes("a"), out));
+  // A refused range leaves its plan as it was: the rest still commits.
+  bytecask::WritePlan plan;
+  plan.put(to_bytes("c"), to_bytes("3"));
+  CHECK_THROWS_AS(plan.del_range(to_bytes("z"), to_bytes("a")),
+                  std::invalid_argument);
+  const auto r = db.apply_batch({}, std::move(plan));
+  REQUIRE(r.has_value());
+  CHECK(bytes() == before + static_cast<std::int64_t>(
+                                bytecask::entry_size(1, 1)));
+  CHECK(r->sequence == seq_before + 1);
+  CHECK(collect_kv(db) == std::map<std::string, std::string>{
+                              {"a", "1"}, {"b", "2"}, {"c", "3"}});
 
-  // from > to: no-op
-  db.del_range({}, to_bytes("z"), to_bytes("a"));
-  CHECK(db.get({}, to_bytes("a"), out));
-  CHECK(db.get({}, to_bytes("b"), out));
+  // The smallest valid range: [k, k + "\0") holds exactly k.
+  const std::string k0{"a\0", 2};
+  CHECK(db.snapshot().count_keys(to_bytes("a"), to_bytes(k0), 10) == 1);
+  db.del_range({}, to_bytes("a"), to_bytes(k0));
+  CHECK_FALSE(db.contains_key({}, to_bytes("a")));
+  CHECK(db.contains_key({}, to_bytes("b")));
 }
 
 TEST_CASE("del_range with no matching keys still writes entry",
@@ -9181,19 +9212,6 @@ TEST_CASE("CommitResult guard-only plan returns durable zero sequence",
   REQUIRE(result.has_value());
   CHECK(result->sequence == 0);
   CHECK(result->durable);
-}
-
-// ---------------------------------------------------------------------------
-// CommitResult: del_range with an empty range writes nothing
-// ---------------------------------------------------------------------------
-TEST_CASE("CommitResult del_range empty range returns durable zero sequence",
-          "[commit_result]") {
-  TempDir td;
-  auto db = bytecask::DB::open(td.path / "db");
-
-  auto result = db.del_range({}, to_bytes("z"), to_bytes("a"));  // from >= to
-  CHECK(result.sequence == 0);
-  CHECK(result.durable);
 }
 
 // ---------------------------------------------------------------------------
@@ -10888,15 +10906,13 @@ TEST_CASE("Edges: an empty key and an empty value behave like any other",
   CHECK(collect_kv(follower) == expected);
 }
 
-TEST_CASE("Edges: count_keys with limit 0, an empty range and an inverted one",
+TEST_CASE("Edges: count_keys with limit 0, and a range holding the empty key",
           "[bytecask][limits][edges]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
   for (const auto *k : {"", "a", "b"}) db.put({}, to_bytes(k), to_bytes("v"));
   const auto snap = db.snapshot();
   CHECK(snap.count_keys(to_bytes(""), to_bytes("z"), 0) == 0);
-  CHECK(snap.count_keys(to_bytes("a"), to_bytes("a"), 10) == 0);
-  CHECK(snap.count_keys(to_bytes("b"), to_bytes("a"), 10) == 0);
   // The empty key counts like any other.
   CHECK(snap.count_keys(to_bytes(""), to_bytes("a"), 10) == 1);
   CHECK(snap.count_keys(to_bytes(""), to_bytes("z"), 10) == 3);

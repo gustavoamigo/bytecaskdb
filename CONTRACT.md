@@ -108,6 +108,17 @@ methods) before any data is copied. `DB::put`, `DB::del`, and
 than `kMaxBatchBytes` (1 GiB) is refused by `apply_batch` before it joins a
 group. Violations throw `std::invalid_argument`.
 
+### Ranges
+
+Every range `[from, to)` — `del_range` on `DB` and `WritePlan`,
+`ensure_range_unchanged`, `Snapshot::count_keys` — must have `from < to`.
+`from >= to` throws `std::invalid_argument` before anything is written or
+read; on a `WritePlan` the plan is left as it was. An empty or swapped range
+is refused rather than treated as nothing to do, since it is almost always
+swapped bounds and a write that silently does nothing hides the bug.
+Ingest and recovery still accept a range-delete entry with `from >= to`
+written before this rule: it deletes nothing.
+
 ### Hard limits
 
 Each limit is enforced before any I/O: reaching it never degrades the
@@ -384,7 +395,7 @@ Every committed write (`put`, `del`, `del_range`, `apply_batch`) returns a
 and `apply_batch`, which can report `nullopt` on an absent key or a
 conflict). `sequence` is the highest sequence assigned to the write (the
 `BulkEnd` marker's sequence for a multi-op batch); `0` means nothing was
-written (empty plan, guard-only plan, or empty-range `del_range`) —
+written (empty plan or guard-only plan) —
 `durable` is always `true` in that case. Such a write with `sync=true` still
 returns only once every earlier write is durable: if an earlier `sync=false`
 write left the active file unsynced, it waits for an `fdatasync` covering

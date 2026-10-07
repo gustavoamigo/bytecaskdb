@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <string>
 #include <string_view>
 
 #include "../include/bytecask_c.h"
@@ -136,17 +137,38 @@ TEST_CASE("bytecask_del of existing key returns 1 and fills out",
   bytecask_close(db);
 }
 
-TEST_CASE("bytecask_del_range with from >= to returns durable zero sequence",
+TEST_CASE("bytecask_del_range and plan building refuse bad arguments with -1",
           "[c_api][commit_result]") {
   TempDir td;
   auto *db = bytecask_open(td.path.string().c_str(), 0);
   REQUIRE(db != nullptr);
 
+  // from >= to is refused, and nothing is written.
   bytecask_commit_result_t result{.sequence = 7, .durable = 0};
-  int rc = bytecask_del_range(db, bytes_of("z"), 1, bytes_of("a"), 1, nullptr, &result);
-  CHECK(rc == 0);
-  CHECK(result.sequence == 0);
-  CHECK(result.durable != 0);
+  CHECK(bytecask_del_range(db, bytes_of("z"), 1, bytes_of("a"), 1, nullptr,
+                           &result) == -1);
+  CHECK(std::string_view{bytecask_errmsg()}.find("empty") !=
+        std::string_view::npos);
+  CHECK(result.sequence == 0);  // out is cleared on every call
+
+  // Adding to a plan reports a refused argument instead of throwing through
+  // the C boundary, and leaves the plan as it was.
+  auto *plan = bytecask_write_plan_new();
+  REQUIRE(plan != nullptr);
+  CHECK(bytecask_write_plan_put(plan, bytes_of("k"), 1, bytes_of("v"), 1) == 0);
+  CHECK(bytecask_write_plan_del_range(plan, bytes_of("b"), 1, bytes_of("b"),
+                                      1) == -1);
+  const std::string big_key(5000, 'k');  // over the 4 KiB default limit
+  CHECK(bytecask_write_plan_put(plan, bytes_of(big_key),
+                                big_key.size(), bytes_of("v"), 1) == -1);
+  CHECK(bytecask_write_plan_del(plan, bytes_of(big_key),
+                                big_key.size()) == -1);
+  CHECK(bytecask_write_plan_ensure_present(plan, bytes_of(big_key),
+                                           big_key.size()) == -1);
+  CHECK(bytecask_write_plan_ensure_absent(plan, bytes_of(big_key),
+                                          big_key.size()) == -1);
+  CHECK(bytecask_apply_batch(db, plan, nullptr, &result) == 1);
+  CHECK(result.sequence == 1);
 
   bytecask_close(db);
 }

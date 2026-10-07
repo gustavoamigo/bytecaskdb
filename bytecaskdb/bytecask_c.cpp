@@ -494,38 +494,73 @@ bytecask_write_plan_t *bytecask_write_plan_new_with_snapshot(
   return plan;
 }
 
-void bytecask_write_plan_put(bytecask_write_plan_t *plan,
+int bytecask_write_plan_put(bytecask_write_plan_t *plan,
                              const uint8_t *key, std::size_t key_len,
                              const uint8_t *val, std::size_t val_len) {
-  if (!plan) { return; }
-  plan->plan.put(to_view(key, key_len), to_view(val, val_len));
+  clear_errmsg();
+  if (!plan) { set_errmsg("null plan handle"); return -1; }
+  try {
+    plan->plan.put(to_view(key, key_len), to_view(val, val_len));
+    return 0;
+  } catch (const std::exception &e) {
+    set_errmsg(e.what());
+    return -1;
+  }
 }
 
-void bytecask_write_plan_del(bytecask_write_plan_t *plan,
+int bytecask_write_plan_del(bytecask_write_plan_t *plan,
                              const uint8_t *key, std::size_t key_len) {
-  if (!plan) { return; }
-  plan->plan.del(to_view(key, key_len));
+  clear_errmsg();
+  if (!plan) { set_errmsg("null plan handle"); return -1; }
+  try {
+    plan->plan.del(to_view(key, key_len));
+    return 0;
+  } catch (const std::exception &e) {
+    set_errmsg(e.what());
+    return -1;
+  }
 }
 
-void bytecask_write_plan_del_range(bytecask_write_plan_t *plan,
+int bytecask_write_plan_del_range(bytecask_write_plan_t *plan,
                                    const uint8_t *from, std::size_t from_len,
                                    const uint8_t *to, std::size_t to_len) {
-  if (!plan) { return; }
-  plan->plan.del_range(to_view(from, from_len), to_view(to, to_len));
+  clear_errmsg();
+  if (!plan) { set_errmsg("null plan handle"); return -1; }
+  try {
+    plan->plan.del_range(to_view(from, from_len), to_view(to, to_len));
+    return 0;
+  } catch (const std::exception &e) {
+    set_errmsg(e.what());
+    return -1;
+  }
 }
 
-void bytecask_write_plan_ensure_present(bytecask_write_plan_t *plan,
+int bytecask_write_plan_ensure_present(bytecask_write_plan_t *plan,
                                         const uint8_t *key,
                                         std::size_t key_len) {
-  if (!plan) { return; }
-  plan->plan.ensure_present(to_view(key, key_len));
+  clear_errmsg();
+  if (!plan) { set_errmsg("null plan handle"); return -1; }
+  try {
+    plan->plan.ensure_present(to_view(key, key_len));
+    return 0;
+  } catch (const std::exception &e) {
+    set_errmsg(e.what());
+    return -1;
+  }
 }
 
-void bytecask_write_plan_ensure_absent(bytecask_write_plan_t *plan,
+int bytecask_write_plan_ensure_absent(bytecask_write_plan_t *plan,
                                        const uint8_t *key,
                                        std::size_t key_len) {
-  if (!plan) { return; }
-  plan->plan.ensure_absent(to_view(key, key_len));
+  clear_errmsg();
+  if (!plan) { set_errmsg("null plan handle"); return -1; }
+  try {
+    plan->plan.ensure_absent(to_view(key, key_len));
+    return 0;
+  } catch (const std::exception &e) {
+    set_errmsg(e.what());
+    return -1;
+  }
 }
 
 int bytecask_write_plan_ensure_unchanged(bytecask_write_plan_t *plan,

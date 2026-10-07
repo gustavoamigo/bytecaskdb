@@ -49,7 +49,7 @@ typedef struct {
 } bytecask_write_options_t;
 
 // Outcome of a committed write. sequence == 0 means nothing was written
-// (empty plan, guard-only plan, or empty-range del_range) — durable is then
+// (empty plan or guard-only plan) — durable is then
 // always nonzero. durable is nonzero iff fdatasync confirmed the write
 // before return.
 typedef struct {
@@ -98,9 +98,9 @@ int bytecask_del(bytecask_db_t *db, const uint8_t *key, size_t key_len,
                  const bytecask_write_options_t *opts,
                  bytecask_commit_result_t *out);
 
-// Deletes all keys in [from, to). No-op if from >= to. Cannot conflict.
-// Returns 0 on success, -1 on error; out is filled on 0 (sequence == 0 if
-// from >= to, since nothing was written).
+// Deletes all keys in [from, to). Cannot conflict. Returns 0 on success, -1
+// on error, including from >= to, which is refused before anything is
+// written; out is filled on 0.
 int bytecask_del_range(bytecask_db_t *db,
                        const uint8_t *from, size_t from_len,
                        const uint8_t *to, size_t to_len,
@@ -209,6 +209,9 @@ void bytecask_snapshot_free(bytecask_snapshot_t *snap);
 //
 // A WritePlan accumulates put/del operations and optional precondition guards.
 // bytecask_apply_batch() applies the plan atomically iff all guards hold.
+// Every function that adds to a plan returns 0, or -1 with errmsg set when
+// the argument is refused (a key over the size limit, from >= to); the plan
+// is then unchanged.
 // ---------------------------------------------------------------------------
 
 // Creates an empty write plan without a snapshot.
@@ -222,25 +225,26 @@ bytecask_write_plan_t *bytecask_write_plan_new_with_snapshot(
     bytecask_snapshot_t *snap);
 
 // Adds a put operation to the plan.
-void bytecask_write_plan_put(bytecask_write_plan_t *plan,
+int bytecask_write_plan_put(bytecask_write_plan_t *plan,
                              const uint8_t *key, size_t key_len,
                              const uint8_t *val, size_t val_len);
 
 // Adds a delete operation to the plan.
-void bytecask_write_plan_del(bytecask_write_plan_t *plan,
+int bytecask_write_plan_del(bytecask_write_plan_t *plan,
                              const uint8_t *key, size_t key_len);
 
 // Adds a range delete operation to the plan: deletes all keys in [from, to).
-void bytecask_write_plan_del_range(bytecask_write_plan_t *plan,
+// from >= to is refused: returns -1 and sets errmsg.
+int bytecask_write_plan_del_range(bytecask_write_plan_t *plan,
                                    const uint8_t *from, size_t from_len,
                                    const uint8_t *to, size_t to_len);
 
 // Guard: key must exist at apply time.
-void bytecask_write_plan_ensure_present(bytecask_write_plan_t *plan,
+int bytecask_write_plan_ensure_present(bytecask_write_plan_t *plan,
                                         const uint8_t *key, size_t key_len);
 
 // Guard: key must be absent at apply time.
-void bytecask_write_plan_ensure_absent(bytecask_write_plan_t *plan,
+int bytecask_write_plan_ensure_absent(bytecask_write_plan_t *plan,
                                        const uint8_t *key, size_t key_len);
 
 // Guard: key must not have been modified since the plan's snapshot.
