@@ -1644,6 +1644,13 @@ private:
   // How long a flush that owes an fdatasync waits for the commits the last
   // one released, before it captures the head. See CommitDelay.
   CommitDelay commit_delay_;
+  // Names this DB to per-thread state that must not match another DB: unlike
+  // its address, never reused in the process. Starts at 1; 0 is no DB.
+  const std::uint64_t instance_id_{next_instance_id()};
+  static auto next_instance_id() noexcept -> std::uint64_t {
+    static std::atomic<std::uint64_t> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+  }
   // The fdatasync error that degraded the engine, rethrown by commit_wait
   // to every writer whose entries were appended since the last successful
   // flush. Guarded by durable_mu_. Cleared by resume().
@@ -2057,6 +2064,7 @@ auto file_ids_exhausted() -> std::runtime_error {
 auto make_data_file_stem() -> std::string {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
+  // TLS: process — an entropy source; no DB data.
   static thread_local std::random_device rd;
 #pragma clang diagnostic pop
   const auto salt = (static_cast<std::uint64_t>(rd()) << 32) | rd();
@@ -2978,6 +2986,7 @@ auto DB::get(const ReadOptions &opts, BytesView key,
   // Thread-exit destructor is intentional; suppress the Clang diagnostic.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
+  // TLS: scratch — this call's record; keeps the largest value's size (#384).
   thread_local Bytes io_buf;
 #pragma clang diagnostic pop
   (*s->files.get(kv->file_id()))
@@ -3040,9 +3049,13 @@ static auto write_rejection(const EngineState &s) -> std::exception_ptr {
 // returned. The commit delay's round trip is measured from it, per DB, so a
 // thread that writes to two databases does not mix their timings.
 struct LastSyncedReturn {
-  const DB *db{nullptr};
+  std::uint64_t db{0};  // DB::instance_id_
   std::chrono::steady_clock::time_point at{};
 };
+// TLS: per-DB — names its DB by instance_id_, not by address, so a DB opened
+// where a destroyed one lived does not take its timing. Holds no resources.
+// Tested by "commit delay: a DB at a destroyed DB's address does not inherit
+// its round trip".
 static thread_local LastSyncedReturn last_synced_return{};
 
 // The single write path. Routes to either write_group_ (default) or
@@ -3064,7 +3077,7 @@ auto DB::apply_batch(WriteOptions opts,
     return CommitResult{.sequence = 0, .durable = true};
   }
 
-  if (opts.sync && last_synced_return.db == this)
+  if (opts.sync && last_synced_return.db == instance_id_)
     commit_delay_.on_round_trip(std::chrono::steady_clock::now() -
                                 last_synced_return.at);
 
@@ -3096,7 +3109,8 @@ auto DB::apply_batch(WriteOptions opts,
   if (slot.result && (slot.result->sequence != 0 || slot.sync_through != 0)) {
     commit_wait(slot);
   }
-  if (opts.sync) last_synced_return = {this, std::chrono::steady_clock::now()};
+  if (opts.sync)
+    last_synced_return = {instance_id_, std::chrono::steady_clock::now()};
 
   // A conflict against a write the head holds but no snapshot can see yet.
   // Plans are validated against the head, which is right — two in-flight
@@ -3609,6 +3623,7 @@ auto Snapshot::get(const ReadOptions& opts, BytesView key,
   }
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
+  // TLS: scratch — this call's record; keeps the largest value's size (#384).
   thread_local Bytes io_buf;
 #pragma clang diagnostic pop
   (*state_->files.get(kv->file_id()))
@@ -4748,6 +4763,10 @@ auto DB::read_cache() -> ReadCacheSlot & {
   // leaves the registry.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
+  // TLS: per-DB — entries name their DB, and close() and ~DB take them from
+  // every thread's slot, so no later DB at the same address finds one. Tested
+  // by "closing a DB releases the state every thread's read cache holds" and
+  // "BC-243: thread-local read cache does not leak across DB instances".
   thread_local ReadCacheSlot tl;
 #pragma clang diagnostic pop
   return tl;

@@ -56,6 +56,7 @@ private:
   // share stripes, which is contention between a few threads rather than all.
   static auto stripe_index() noexcept -> std::size_t {
     static std::atomic<std::size_t> next{0};
+    // TLS: process — a stripe index, the same in every Counter.
     thread_local const std::size_t id =
         next.fetch_add(1, std::memory_order_relaxed) & (kStripes - 1);
     return id;

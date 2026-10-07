@@ -132,6 +132,16 @@ jobs:
           fail_ci_if_error: false
           use_oidc: true
 
+  thread-local-tags:
+    # Every thread_local in engine and binding code says whether it is
+    # scratch, process-wide or per-DB (docs/bytecask_design.md, Per-thread
+    # state): one that holds a DB's state leaks across instances.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every thread_local is tagged
+        run: python3 scripts/check_thread_local.py
+
   mutation-patches:
     # The soak's, the chaos rig's and the durability sites' mutations are
     # diffs against engine code.

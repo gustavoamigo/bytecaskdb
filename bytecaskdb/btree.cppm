@@ -237,6 +237,7 @@ private:
   static auto local() -> Local & {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
+    // TLS: process — free nodes shared by every DB's trees, never a live node.
     thread_local Local l;  // returns its nodes to the shared list at thread exit
 #pragma clang diagnostic pop
     return l;

@@ -107,6 +107,7 @@ struct FaultInjector {
 // Use ScopedFaultInjector to ensure cleanup even if the test throws.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunique-object-duplication"
+// TLS: process — test instrumentation for whatever this thread drives.
 inline thread_local FaultInjector* active_injector = nullptr;
 #pragma clang diagnostic pop
 
@@ -198,6 +199,7 @@ struct ScopedFaultInjector {
 // ---------------------------------------------------------------------------
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunique-object-duplication"
+// TLS: process — test instrumentation for whatever this thread drives.
 inline thread_local int syscall_faults_suspended = 0;
 #pragma clang diagnostic pop
 
