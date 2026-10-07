@@ -1261,10 +1261,11 @@ private:
       sh_.fail(std::format("create_manifest: through_sequence {} above "
                            "durable_sequence() {}",
                            m.through_sequence, sh_.db.durable_sequence()));
-    // Vacuum runs only on this thread, so every listed file still exists.
+    // Vacuum runs only on this thread, so every listed data file still
+    // exists. A hint may not: one the worker failed to write is rebuilt by
+    // the next open (CONTRACT.md, create_manifest).
     for (const auto &f : m.files) {
-      if (!std::filesystem::exists(f.data_path)
-          || !std::filesystem::exists(f.hint_path))
+      if (!std::filesystem::exists(f.data_path))
         sh_.fail(std::format("create_manifest: file {} missing on disk",
                              f.file_id));
     }

@@ -1779,6 +1779,11 @@ what makes an operation cheap to add. After a failure at any N:
 - for `ingest`, whose slice is two atomic units, `resume()` or a power cut
   may also leave the first unit without the second, and delivering the
   slice again completes it (`CONTRACT.md`, `ingest`);
+- for `create_manifest`, every data file a returned manifest lists
+  exists, and the listed files, with whichever hints exist, open to the
+  manifest's state; a hint the worker failed to write may be missing
+  (#349). This is checked once the fault is disarmed, since the check's own
+  `stat` calls would otherwise be counted;
 - a write after the fault lands;
 - a close and reopen recovers that state, serial and parallel, with the
   same file stats;
