@@ -115,9 +115,50 @@ export inline constexpr std::uint64_t kDefaultRotationThreshold =
 #endif
 
 // Hard limits imposed by the on-disk entry header format and in-memory packing.
-// key_size is u16 (2 bytes), value_size is u24 in packed KeyDirEntry (16 MiB).
+// key_size is u16 on disk; value_size is 28 bits in a packed KeyDirEntry.
 export inline constexpr std::uint32_t kMaxKeySize = 65535;
 export inline constexpr std::uint32_t kMaxValueSize = KeyDirEntry::kMaxValueSize;
+
+// Most bytes one write (a plan, or an atomic batch in an ingest slice) may
+// append, markers included. A write never spans two files, and a file is only
+// rotated once it has crossed max_file_bytes, so an entry starts below
+// kMaxFileBytes + kMaxBatchBytes. The two are chosen to keep that below the
+// 32-bit offset a KeyDirEntry holds.
+export inline constexpr std::uint64_t kMaxBatchBytes = std::uint64_t{1} << 30;
+export inline constexpr std::uint64_t kMaxFileBytes = std::uint64_t{3} << 30;
+static_assert(kMaxFileBytes + kMaxBatchBytes - 1 <= KeyDirEntry::kMaxFileOffset);
+
+#ifdef BYTECASK_TESTING
+// The limit apply_batch and ingest enforce in test builds. A test lowers it,
+// never raises it, to reach the boundary without a gigabyte plan, and
+// restores it. Not synchronised: set it while no write is running.
+export inline std::uint64_t test_max_batch_bytes = kMaxBatchBytes;
+#endif
+
+[[nodiscard]] inline auto max_batch_bytes() noexcept -> std::uint64_t {
+#ifdef BYTECASK_TESTING
+  return test_max_batch_bytes;
+#else
+  return kMaxBatchBytes;
+#endif
+}
+
+// Size a commit group may take the active file to: one past the largest
+// packed offset, so every entry the group writes starts inside it.
+#ifdef BYTECASK_TESTING
+// Lowered by a test, never raised, so a group splits without writing 4 GiB.
+// Not synchronised: set it while no write is running.
+export inline std::uint64_t test_max_group_file_bytes =
+    std::uint64_t{KeyDirEntry::kMaxFileOffset} + 1;
+#endif
+
+[[nodiscard]] inline auto max_group_file_bytes() noexcept -> std::uint64_t {
+#ifdef BYTECASK_TESTING
+  return test_max_group_file_bytes;
+#else
+  return std::uint64_t{KeyDirEntry::kMaxFileOffset} + 1;
+#endif
+}
 
 // Sensible defaults — keys live in RAM (the key directory), values go to disk.
 export inline constexpr std::uint32_t kDefaultMaxKeyBytes = 4096;
@@ -194,7 +235,8 @@ export struct ReadOptions {
 // Options passed to DB::open().
 export struct Options {
   // Active-file rotation threshold in bytes (default 64 MiB). When the active
-  // file reaches this size it is sealed and a new one is opened.
+  // file reaches this size it is sealed and a new one is opened. Hard
+  // ceiling: kMaxFileBytes (3 GiB); open rejects more.
   std::uint64_t max_file_bytes{kDefaultRotationThreshold};
   // Number of threads used to rebuild the key directory at open time.
   // 1 selects the serial path; >1 uses file-level fan-in parallelism.
@@ -216,10 +258,12 @@ export struct Options {
   // blocks put/del/apply_batch and allows ingest().
   Mode initial_mode{Mode::Leader};
   // Maximum key size in bytes. Keys exceeding this limit are rejected with
-  // std::invalid_argument. Hard ceiling: 65,535 (u16 wire format).
+  // std::invalid_argument. Hard ceiling: 65,535 (u16 wire format); open
+  // rejects more.
   std::uint32_t max_key_bytes{kDefaultMaxKeyBytes};
   // Maximum value size in bytes. Values exceeding this limit are rejected with
-  // std::invalid_argument. Hard ceiling: 16,777,215 (24-bit packed KeyDirEntry).
+  // std::invalid_argument. Hard ceiling: 268,435,455 (2^28 - 1, 28-bit packed
+  // KeyDirEntry); open rejects more.
   std::uint32_t max_value_bytes{kDefaultMaxValueBytes};
   // Selects how data files are read. Pread (default) issues pread(2) per read
   // and avoids virtual address space pressure under memory contention; Mmap
@@ -659,6 +703,13 @@ public:
   [[nodiscard]] auto active_file_ptr() const -> std::shared_ptr<DataFile>;
   [[nodiscard]] auto active_file_id() const noexcept -> std::uint32_t;
   [[nodiscard]] auto is_rotation_needed(std::uint64_t threshold) const -> bool;
+  // How many more ids reserve_file_id can give.
+  [[nodiscard]] auto file_ids_left() const noexcept -> std::uint32_t;
+#ifdef BYTECASK_TESTING
+  // Starts the id counter near its ceiling, so a test reaches it without
+  // creating a million files.
+  void test_set_next_file_id(std::uint32_t id) { next_file_id_ = id; }
+#endif
 
   // Returns the current next_seq value — used to capture the post-write sequence
   // before consuming the transient on sync failure (F/G).
@@ -1104,6 +1155,17 @@ public:
     return load_state();
   }
 
+  // Starts the file id counter at id, so a test reaches its ceiling without
+  // creating a million files. Ids only move forward: id must not be below
+  // the current counter.
+  void test_set_next_file_id(std::uint32_t id) {
+    WriteBarrier barrier{*this};
+    auto current = load_state_for_write();
+    auto t = current->transient();
+    t.test_set_next_file_id(id);
+    store_state(current, std::move(t).persistent());
+  }
+
   // Exposed for testing: validates structural consistency of an EngineState.
   void test_validate_state_consistency(const EngineState &s) const {
     validate_state_consistency(s);
@@ -1421,14 +1483,35 @@ private:
   // Prepares and applies one slot against the transient. Pure in-memory:
   // no I/O. Appends prepared entries to all_entries; running_offset is
   // advanced by the total byte size produced. Returns false on validation
-  // failure (sets slot.result).
+  // failure (sets slot.result) or when the slot cannot be written (sets
+  // slot.err): its sequences would pass the packed limit, or it would cross
+  // the rotation threshold and no file id is left (can_rotate false).
   auto execute_slot(TransientEngineState &t, EngineSlot &slot,
                     std::vector<DataEntryView> &all_entries,
-                    std::uint64_t &running_offset) -> bool;
-  // Executor callback shared by solo_writer_ and write_group_. Three phases:
-  // (1) per-slot validate/prepare/apply in-memory, (2) one append_entries,
-  // (3) sync/rotate/publish.
+                    std::uint64_t &running_offset, bool can_rotate) -> bool;
+  // Executor callback shared by solo_writer_ and write_group_. Runs the
+  // batch as consecutive groups, each through execute_group.
   void execute_slots(std::vector<Slot *> &batch);
+  // Runs a prefix of batch as one group, in three phases: (1) per-slot
+  // validate/prepare/apply in-memory, (2) one append_entries, (3)
+  // sync/rotate/publish. The prefix ends before a slot that would take the
+  // active file past 2^32 bytes, the packed offset limit. Returns the prefix
+  // length. Caller holds write_mu_.
+  auto execute_group(std::span<Slot *> batch) -> std::size_t;
+
+  // The prefix of an ingest slice written to the active file before the
+  // next rotation: it ends after the first entry, outside a batch, that
+  // takes the file (now file_size bytes) to the threshold. needs_rotation
+  // is false when the prefix is the whole slice; end_size is the file size
+  // after it.
+  struct IngestChunk {
+    std::size_t end;
+    bool needs_rotation;
+    std::uint64_t end_size;
+  };
+  [[nodiscard]] auto ingest_chunk(std::span<const DataEntryView> entries,
+                                  std::uint64_t file_size) const
+      -> IngestChunk;
 
   // Recovery
   // Runs recovery, undoing an interrupted vacuum it finds on the way.
@@ -1928,6 +2011,16 @@ DbClosed::~DbClosed() = default;
 
 namespace {
 
+// Ids are given out from the directory's contents at each open and never
+// reused within a process, so the ceiling is reached by files created since
+// open, and a reopen renumbers.
+auto file_ids_exhausted() -> std::runtime_error {
+  return std::runtime_error{std::format(
+      "file id space exhausted: this process has used all {} file ids. "
+      "Reopen the database to renumber its files.",
+      KeyDirEntry::kMaxFileId + 1)};
+}
+
 // Generates a unique data file stem.
 // Format: "data_{YYYYMMDDHHmmss}_{RRRRRRRRRRRRRRRR}_V01"
 //   - Timestamp: UTC second precision, human-readable creation time (debug hint
@@ -2416,8 +2509,14 @@ void TransientEngineState::apply_rotate_file(
   file_stats_.set(active_file_id_, FileStats{});
 }
 
+auto TransientEngineState::file_ids_left() const noexcept -> std::uint32_t {
+  return next_file_id_ > KeyDirEntry::kMaxFileId
+             ? 0
+             : KeyDirEntry::kMaxFileId - next_file_id_ + 1;
+}
+
 auto TransientEngineState::reserve_file_id() -> std::uint32_t {
-  KeyDirEntry::check_file_id(next_file_id_);
+  if (file_ids_left() == 0) throw file_ids_exhausted();
   return next_file_id_++;
 }
 
@@ -2629,9 +2728,25 @@ DB::DB(std::filesystem::path dir, Options opts)
     : dir_{std::move(dir)}, rotation_threshold_{opts.max_file_bytes},
       max_hint_backlog_{opts.max_hint_backlog},
       io_backend_{opts.io_backend},
-      size_limits_{std::min(opts.max_key_bytes, kMaxKeySize),
-                   std::min(opts.max_value_bytes, kMaxValueSize)},
+      size_limits_{opts.max_key_bytes, opts.max_value_bytes},
       state_{std::make_shared<EngineState>()} {
+  // A setting above a hard ceiling is refused, not lowered: the engine never
+  // runs with a limit other than the one asked for.
+  if (opts.max_key_bytes > kMaxKeySize) {
+    throw std::invalid_argument{std::format(
+        "max_key_bytes = {} exceeds the hard ceiling of {}",
+        opts.max_key_bytes, kMaxKeySize)};
+  }
+  if (opts.max_value_bytes > kMaxValueSize) {
+    throw std::invalid_argument{std::format(
+        "max_value_bytes = {} exceeds the hard ceiling of {}",
+        opts.max_value_bytes, kMaxValueSize)};
+  }
+  if (opts.max_file_bytes > kMaxFileBytes) {
+    throw std::invalid_argument{std::format(
+        "max_file_bytes = {} exceeds the hard ceiling of {}",
+        opts.max_file_bytes, kMaxFileBytes)};
+  }
 #ifdef __EMSCRIPTEN__
   if (opts.io_backend == IoBackend::Mmap) {
     throw std::invalid_argument{
@@ -2654,7 +2769,6 @@ DB::DB(std::filesystem::path dir, Options opts)
     }
     pool_ = std::make_shared<BufferPool>(opts.buffer_pool);
   }
-  KeyDirEntry::check_file_offset(opts.max_file_bytes);
   // The directories open creates, each named by an entry in its parent that
   // has to be durable before the database's files can be.
   std::vector<std::filesystem::path> created;
@@ -2921,6 +3035,11 @@ auto DB::apply_batch(WriteOptions opts,
   if (auto s = load_state(); !s->is_write_allowed()) {
     std::rethrow_exception(write_rejection(*s));
   }
+  if (plan.write_bytes() > max_batch_bytes()) {
+    throw std::invalid_argument{std::format(
+        "write plan of {} bytes exceeds the limit of {} bytes per write",
+        plan.write_bytes(), max_batch_bytes())};
+  }
   // With sync, even an empty plan goes through the pipeline: it returns once
   // every earlier write is durable (see execute_slots).
   if (plan.empty() && !opts.sync) {
@@ -2995,7 +3114,7 @@ auto DB::apply_batch(WriteOptions opts,
 // execute_slots fills it in once the batch's durability is known.
 auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
                       std::vector<DataEntryView> &all_entries,
-                      std::uint64_t &running_offset) -> bool {
+                      std::uint64_t &running_offset, bool can_rotate) -> bool {
   if (slot.plan.empty()) {
     slot.result = CommitResult{};
     return true;
@@ -3012,6 +3131,21 @@ auto DB::execute_slot(TransientEngineState &t, EngineSlot &slot,
   if (entries.empty()) {
     slot.result = CommitResult{};
     return true;
+  }
+
+  // Both refusals come before apply_writes touches the transient, so the
+  // slot fails alone and the rest of the group commits.
+  if (entries.back().sequence > KeyDirEntry::kMaxSequence) {
+    slot.err = std::make_exception_ptr(std::runtime_error{std::format(
+        "sequence space exhausted: the write needs sequences up to {}, "
+        "above the limit of {}",
+        entries.back().sequence, KeyDirEntry::kMaxSequence)});
+    return false;
+  }
+  if (!can_rotate &&
+      running_offset + slot.plan.write_bytes() >= rotation_threshold_) {
+    slot.err = std::make_exception_ptr(file_ids_exhausted());
+    return false;
   }
 
   // Pre-compute offsets from running_offset (tracks the file position
@@ -3057,6 +3191,20 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     }
   } busy{counters_.group_writer_busy_ns};
 
+  counters_.group_writer_batches.fetch_add(1, std::memory_order_relaxed);
+  counters_.group_writer_coalesced.fetch_add(
+      static_cast<std::int64_t>(batch.size()), std::memory_order_relaxed);
+
+  // Every group starts below max_file_bytes (a group that reaches it
+  // rotates), and its first slot holds at most kMaxBatchBytes, so that slot
+  // ends inside the 32-bit packed offset. A later slot that would end past
+  // it starts the next group, after the rotation. At the default
+  // max_file_bytes a group would need gigabytes of writes to split.
+  std::span<Slot *> rest{batch};
+  while (!rest.empty()) rest = rest.subspan(execute_group(rest));
+}
+
+auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
   // Admission is decided on the published state, not the head: a flush
   // fails without write_mu_ and head_ is only reset by the next barrier,
   // so the head can be non-degraded while the engine is. (Mode is the same
@@ -3067,13 +3215,9 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
   if (!published->is_write_allowed()) {
     const auto ex = write_rejection(*published);
     for (auto *s : batch) s->err = ex;
-    return;
+    return batch.size();
   }
   auto current = load_head();
-
-  counters_.group_writer_batches.fetch_add(1, std::memory_order_relaxed);
-  counters_.group_writer_coalesced.fetch_add(
-      static_cast<std::int64_t>(batch.size()), std::memory_order_relaxed);
 
   auto t = current->transient();
   auto &file = t.active_file();
@@ -3081,15 +3225,27 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
   auto running_offset = initial_offset;
   std::vector<DataEntryView> all_entries;
   auto any_sync = false;
+  // Without an id for the next file the active file cannot be rotated, so a
+  // write that would take it to the threshold is refused before any I/O.
+  const auto can_rotate = t.file_ids_left() > 0;
 
   // Phase 1: pure in-memory — validate, prepare, pre-compute offsets,
-  // apply_writes for each slot sequentially.
-  for (auto *s : batch) {
-    auto &slot = static_cast<EngineSlot &>(*s);
+  // apply_writes for each slot sequentially, up to the slot that reaches
+  // the rotation threshold.
+  // The group ends before a slot that would take the file past the 32-bit
+  // packed offset; the first slot always fits (see execute_slots).
+  std::size_t taken = 0;
+  for (; taken < batch.size(); ++taken) {
+    auto &slot = static_cast<EngineSlot &>(*batch[taken]);
+    if (taken > 0 &&
+        running_offset + slot.plan.write_bytes() > max_group_file_bytes()) {
+      break;
+    }
     slot.sync = slot.opts.sync;
-    execute_slot(t, slot, all_entries, running_offset);
+    execute_slot(t, slot, all_entries, running_offset, can_rotate);
     any_sync |= slot.opts.sync;
   }
+  batch = batch.first(taken);
 
   // A sync slot that appended nothing (an empty, guard-only or no-op plan)
   // still makes the promise every sync=true write makes: on return, every
@@ -3118,7 +3274,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
       t.note_sync_requested(head_last_seq);
       store_head(std::move(t).persistent());
     }
-    return;
+    return batch.size();
   }
 
   // Highest sequence in this batch — the fdatasync that covers it advances
@@ -3143,7 +3299,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     for (auto *s : batch) {
       if (!s->err) s->err = ex;
     }
-    return;
+    return batch.size();
   }
 
   counters_.bytes_written.fetch_add(
@@ -3156,7 +3312,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     store_head(std::move(t).persistent());
     // durable is filled in by commit_wait once the flush covering this
     // batch has landed.
-    return;
+    return batch.size();
   }
 
   // Rotation barrier: everything before this batch is flushed and
@@ -3183,7 +3339,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     for (auto *s : batch) {
       if (!s->err) s->err = ex;
     }
-    return;
+    return batch.size();
   }
   try {
     file.sync();
@@ -3200,7 +3356,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     for (auto *s : batch) {
       if (!s->err) s->err = ex;
     }
-    return;
+    return batch.size();
   }
   try {
     rotate_active_file(t, published);
@@ -3217,7 +3373,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     for (auto *s : batch) {
       if (!s->err) s->err = ex;
     }
-    return;
+    return batch.size();
   }
 
   if (any_sync) {
@@ -3236,7 +3392,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
       for (auto *s : batch) {
         if (!s->err) s->err = ex;
       }
-      return;
+      return batch.size();
     }
   }
 
@@ -3247,6 +3403,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
     auto &slot = static_cast<EngineSlot &>(*s);
     if (slot.result) slot.result->durable = final_durable_seq >= slot.result->sequence;
   }
+  return batch.size();
 }
 
 #pragma endregion
@@ -4003,6 +4160,9 @@ void DB::vacuum_unlink_old_file(
 auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
     -> bool {
   auto snap = load_state_for_write();
+  // Checked again where the id is reserved; here so a vacuum that cannot
+  // finish does not copy the file first.
+  if (snap->next_file_id > KeyDirEntry::kMaxFileId) throw file_ids_exhausted();
   const auto &old_file = **snap->files.get(file_id);
 
   const auto stem = make_data_file_stem();
@@ -4326,6 +4486,9 @@ void DB::resume() {
   wait_for_hint_backlog();
 
   auto t = current->transient();
+  // resume() seals the active file and needs an id for the next one; without
+  // it nothing is touched and the engine stays degraded until a reopen.
+  if (t.file_ids_left() == 0) throw file_ids_exhausted();
   const auto old_file_id = t.active_file_id();
   auto &file = t.active_file();
 
@@ -4478,14 +4641,25 @@ auto DB::durable_sequence(std::uint64_t min_sequence,
     return s->durable_seq;
   }
 
-  std::unique_lock<std::mutex> lk{durable_mu_};
-  durable_cv_.wait_for(lk, timeout, [&] {
+  const auto reached = [&] {
 #ifdef BYTECASK_TESTING
     if (test_in_sequence_wait_) test_in_sequence_wait_();
 #endif
     const auto cur = load_state();
     return cur->durable_seq >= min_sequence || cur->closed;
-  });
+  };
+  std::unique_lock<std::mutex> lk{durable_mu_};
+  // wait_for adds the timeout to now() in nanoseconds, which overflows for a
+  // timeout such as milliseconds::max(). One past what the clock can
+  // represent waits with no deadline.
+  const auto now = std::chrono::steady_clock::now();
+  const auto room = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::time_point::max() - now);
+  if (timeout >= room) {
+    durable_cv_.wait(lk, reached);
+  } else {
+    durable_cv_.wait_until(lk, now + timeout, reached);
+  }
   const auto last = load_state();
   if (last->closed) throw DbClosed{};
   return last->durable_seq;
@@ -5003,6 +5177,12 @@ auto DB::recovery_prepare_files(EngineState &s)
     }
   }
   std::ranges::sort(data_paths);
+  // Each data file takes an id, and the new active file one more.
+  if (data_paths.size() > KeyDirEntry::kMaxFileId) {
+    throw std::runtime_error{std::format(
+        "DB::open: '{}' holds {} data files; at most {} can be opened",
+        dir_.string(), data_paths.size(), KeyDirEntry::kMaxFileId)};
+  }
 
   std::vector<RecoveredFile> files;
   auto files_t = s.files.transient();
@@ -6291,6 +6471,23 @@ auto DB::changes_since(const Snapshot& snap, std::uint64_t from_sequence) const
 
 #pragma region Ingest (follower replication)
 
+auto DB::ingest_chunk(std::span<const DataEntryView> entries,
+                      std::uint64_t file_size) const -> IngestChunk {
+  auto in_batch = false;
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    file_size += entry_size(entries[i].key.size(), entries[i].value.size());
+    if (entries[i].entry_type == EntryType::BulkBegin) in_batch = true;
+    else if (entries[i].entry_type == EntryType::BulkEnd) in_batch = false;
+
+    if (!in_batch && file_size >= rotation_threshold_ &&
+        i + 1 < entries.size()) {
+      return {.end = i + 1, .needs_rotation = true, .end_size = file_size};
+    }
+  }
+  return {.end = entries.size(), .needs_rotation = false,
+          .end_size = file_size};
+}
+
 void DB::ingest(std::span<const DataEntryView> entries) {
   if (auto s = load_state(); !s->is_ingestion_allowed()) {
     if (s->closed) throw DbClosed{};
@@ -6299,11 +6496,33 @@ void DB::ingest(std::span<const DataEntryView> entries) {
   }
   if (entries.empty()) return;
 
+  // An atomic batch is written to one file like a plan, so it is held to the
+  // same byte limit; with it every entry's offset fits the packed field.
+  std::uint64_t batch_bytes = 0;
+  auto in_batch = false;
   for (const auto &e : entries) {
     check_key_size(e.key.size(), size_limits_.max_key_bytes);
     if (e.entry_type == EntryType::Put) {
       check_value_size(e.value.size(), size_limits_.max_value_bytes);
     }
+    if (e.sequence > KeyDirEntry::kMaxSequence) {
+      throw std::invalid_argument{std::format(
+          "ingest: sequence {} exceeds the limit of {}", e.sequence,
+          KeyDirEntry::kMaxSequence)};
+    }
+    if (e.entry_type == EntryType::BulkBegin) {
+      in_batch = true;
+      batch_bytes = 0;
+    }
+    if (in_batch) {
+      batch_bytes += entry_size(e.key.size(), e.value.size());
+      if (batch_bytes > max_batch_bytes()) {
+        throw std::invalid_argument{std::format(
+            "ingest: atomic batch exceeds the limit of {} bytes",
+            max_batch_bytes())};
+      }
+    }
+    if (e.entry_type == EntryType::BulkEnd) in_batch = false;
   }
 
   WriteBarrier barrier{*this};
@@ -6325,29 +6544,34 @@ void DB::ingest(std::span<const DataEntryView> entries) {
   }
   if (remaining.empty()) return;
 
+  // Every file the slice will need is counted before anything is written:
+  // a rotation that finds no id would fail after its file was sealed.
+  {
+    std::uint32_t rotations = 0;
+    auto size = static_cast<std::uint64_t>(t.active_file().size());
+    for (auto rest = remaining; !rest.empty();) {
+      const auto chunk = ingest_chunk(rest, size);
+      if (chunk.needs_rotation) {
+        ++rotations;
+        size = 0;
+      } else {
+        size = chunk.end_size;
+      }
+      rest = rest.subspan(chunk.end);
+    }
+    if (size >= rotation_threshold_) ++rotations;
+    if (rotations > t.file_ids_left()) throw file_ids_exhausted();
+  }
+
   // Chunk-and-rotate loop: write entries in chunks, rotating between chunks
   // at safe boundaries (never inside BulkBegin..BulkEnd).
   while (!remaining.empty()) {
     auto &file = t.active_file();
 
-    // Find chunk end: largest prefix that keeps batches intact.
-    std::size_t chunk_end = remaining.size();
-    bool needs_rotation = false;
-    bool in_batch = false;
-    auto running_bytes = static_cast<std::uint64_t>(file.size());
-    for (std::size_t i = 0; i < remaining.size(); ++i) {
-      running_bytes += entry_size(remaining[i].key.size(),
-                                  remaining[i].value.size());
-      if (remaining[i].entry_type == EntryType::BulkBegin) in_batch = true;
-      else if (remaining[i].entry_type == EntryType::BulkEnd) in_batch = false;
-
-      if (!in_batch && running_bytes >= rotation_threshold_ &&
-          i + 1 < remaining.size()) {
-        chunk_end = i + 1;
-        needs_rotation = true;
-        break;
-      }
-    }
+    const auto next =
+        ingest_chunk(remaining, static_cast<std::uint64_t>(file.size()));
+    const auto chunk_end = next.end;
+    const auto needs_rotation = next.needs_rotation;
 
     auto chunk = remaining.subspan(0, chunk_end);
 

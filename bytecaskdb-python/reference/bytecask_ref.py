@@ -257,11 +257,28 @@ class DbDegraded(RuntimeError):
     reopen the database to write again."""
 
 
+# Hard ceilings. Options above them are refused at open. A value is limited
+# by the engine's packed in-memory entry, not the u32 on disk; one write (its
+# entries and batch markers) and the file size are capped so that every entry
+# starts below 2^32 bytes into its file.
+MAX_KEY_BYTES = 65535
+MAX_VALUE_BYTES = (1 << 28) - 1
+MAX_FILE_BYTES = 3 << 30
+MAX_BATCH_BYTES = 1 << 30
+
+
 @dataclass
 class Options:
     max_file_bytes: int = 64 * 1024 * 1024
     max_key_bytes: int = 4096
     max_value_bytes: int = 4 * 1024 * 1024
+
+    def _check(self) -> None:
+        for name, ceiling in (("max_file_bytes", MAX_FILE_BYTES),
+                              ("max_key_bytes", MAX_KEY_BYTES),
+                              ("max_value_bytes", MAX_VALUE_BYTES)):
+            if getattr(self, name) > ceiling:
+                raise ValueError(f"{name} = {getattr(self, name)} exceeds the hard ceiling of {ceiling}")
 
 
 @dataclass
@@ -435,7 +452,9 @@ class DB:
     def open(cls, path: str | os.PathLike[str], opts: Options | None = None) -> DB:
         """Opens or creates the database at path: replays every data file in
         sequence order, then starts a new active file."""
-        db = cls(Path(path), opts or Options())
+        opts = opts or Options()
+        opts._check()
+        db = cls(Path(path), opts)
         db._dir.mkdir(parents=True, exist_ok=True)
         db._recover()
         db._start_active_file()
@@ -579,6 +598,11 @@ class DB:
                      else self._opts.max_value_bytes)
             if len(write.value) > limit:
                 raise ValueError(f"value size {len(write.value)} exceeds limit {limit}")
+        framed = sum(_HEADER.size + len(w.key) + len(w.value) + _CRC.size for w in writes)
+        if len(writes) > 1:
+            framed += 2 * (_HEADER.size + _CRC.size)
+        if framed > MAX_BATCH_BYTES:
+            raise ValueError(f"write plan of {framed} bytes exceeds the limit of {MAX_BATCH_BYTES} bytes per write")
 
     @contextlib.contextmanager
     def _stop_writes_on_io_error(self) -> Iterator[None]:

@@ -418,9 +418,9 @@ NB_MODULE(_bytecaskdb, m) {
               &bytecask::Options::fail_recovery_on_crc_errors,
               "If True (default), CRC errors during recovery raise.")
       .def_rw("max_key_bytes", &bytecask::Options::max_key_bytes,
-              "Max key size in bytes (default 4096; hard ceiling 65535).")
+              "Max key size in bytes (default 4096; hard ceiling 65535, open rejects more).")
       .def_rw("max_value_bytes", &bytecask::Options::max_value_bytes,
-              "Max value size in bytes (default 4 MiB; hard ceiling ~4 GiB).")
+              "Max value size in bytes (default 4 MiB; hard ceiling 2^28 - 1, open rejects more).")
       .def_rw("initial_mode", &bytecask::Options::initial_mode,
               "Initial engine mode (default Mode.Leader).")
       .def_rw("io_backend", &bytecask::Options::io_backend,

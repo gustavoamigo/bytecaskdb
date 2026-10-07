@@ -24,6 +24,7 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 - **Ordered range iteration** — scan from any key prefix in key order. Keys are read from their records as the iterator advances, values lazily. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`. `Snapshot::count_keys` counts the keys in a range, up to a limit, from the key directory's leaf sizes: at most two record reads, whatever the range holds.
 - **Range deletion** — `del_range(opts, from, to)` deletes all keys in `[from, to)` with a single data file append, whatever the size of the range. Removing the keys from the key directory reads each of them back from its data file (twice, today), so that part grows with the number of keys removed. Available on `DB` and `WritePlan`.
 - **Atomic writes** — every `put`, `del`, and `del_range` is atomic. `apply_batch` makes multiple puts, deletes, and range deletes atomic as a group.
+- **Hard limits, checked up front** — keys up to 65,535 bytes, values up to 256 MiB, one write up to 1 GiB, data files up to 3 GiB. Anything over a limit is refused before a byte reaches disk, and an option over its ceiling is refused at `open`. One process can create about a million data files (64 TiB written at the default 64 MiB file size, far fewer with tiny files); past that a write that needs a new file is refused, the engine stays writable below it, and a reopen renumbers.
 - **MVCC transactions** — `snapshot` captures a consistent point-in-time read-only view; `apply_batch(opts, plan)` applies a `WritePlan` atomically only when every precondition holds (**key present / absent / unchanged**, **range unchanged**), returning `nullopt` on conflict. The snapshot is embedded in the `WritePlan` at construction time. When a snapshot is present, every key in the write set is automatically checked for concurrent modification — no explicit guard needed on keys you write. Use `ensure_unchanged` for keys you read but don't write, and range guards for serializable conflict detection. Together they cover the full isolation spectrum: read from a `Snapshot` for **snapshot isolation**, add guards for **serializable** conflict detection, or use bare `put`/`del` for **read-uncommitted** fast paths. Each precondition check is a key directory lookup plus one record read for the key's sequence — no separate transaction type required. Both levels are checked every night with [Elle](https://github.com/jepsen-io/elle) against concurrent transaction histories, with vacuum and injected `fdatasync` failures running, and with the process SIGKILLed and reopened under concurrent group-commit writers: guarded plans come out strict-serializable, and unguarded ones snapshot-isolated, with write skew as their only anomaly. The check covers point reads and writes; range guards and range deletes are not yet part of it ([`docs/isolation_checking_design.md`](docs/isolation_checking_design.md)).
 - **Fast recovery** — parallelised index reconstruction from zstd-compressed hint files; from a cold start, with nothing in the page cache, 10 M keys recover in 0.33 s on a SATA SSD. Recovery keeps at most one hint file open per thread, so opening a database needs one descriptor per data file and a handful more, not two per data file.
 - **Bounded close and restart** — hint files are written in the background, and the number waiting is capped (`max_hint_backlog`, default 4). When the writer falls behind, writes wait for it rather than letting the backlog grow, so a clean close has at most that many hint files to write, plus the active file's, and an open after a crash at most one more to rebuild. The cap can be turned off for bulk loads. `close()` reports how the shutdown went: it returns only if every acknowledged write, `sync = false` ones included, is durable, and throws if the final `fdatasync` or a hint write failed.
@@ -219,7 +220,7 @@ db.close();
 namespace bytecask {
 
 struct Options {
-    uint64_t max_file_bytes{64 * 1024 * 1024};  // active file rotation threshold (default 64 MiB, hard ceiling: 4 GiB)
+    uint64_t max_file_bytes{64 * 1024 * 1024};  // active file rotation threshold (default 64 MiB, hard ceiling: 3 GiB)
     unsigned recovery_threads{4};                // parallelism for hint-file replay at open
     // A hint file is a rebuildable index: one that fails its CRC, or that a
     // read fails on, is regenerated from its data file in both modes and
@@ -232,8 +233,9 @@ struct Options {
     // without a hint is refused, in both modes.
     bool fail_recovery_on_crc_errors{true};
     Mode initial_mode{Mode::Leader};             // leader allows normal writes; follower allows ingest
+    // A setting above its hard ceiling makes open throw std::invalid_argument.
     uint32_t max_key_bytes{4096};                // max key size (hard ceiling: 65,535 — u16 wire format)
-    uint32_t max_value_bytes{4 * 1024 * 1024};   // max value size (hard ceiling: 256 MiB — packed KeyDirEntry)
+    uint32_t max_value_bytes{4 * 1024 * 1024};   // max value size (hard ceiling: 2^28 - 1, 256 MiB less one byte)
     IoBackend io_backend{IoBackend::Pread};      // how sealed files are read
     BufferPoolOptions buffer_pool{};             // only read when io_backend == BufferPool
     // Most sealed files allowed to wait for their hint file. A rotation that
@@ -324,6 +326,8 @@ public:
     // guard-only plan that passes writes nothing and returns {sequence = 0,
     // durable = true}. With sync it first makes every earlier write durable, so
     // apply_batch({.sync = true}, WritePlan{}) flushes earlier sync=false writes.
+    // A plan over 1 GiB on disk, batch markers included, throws
+    // std::invalid_argument before anything is written.
     // Throws std::system_error on I/O failure or DbDegraded if the engine is degraded.
     [[nodiscard]] auto apply_batch(WriteOptions opts,
                                    WritePlan plan) -> std::optional<CommitResult>;
@@ -354,7 +358,7 @@ public:
     // durable by fdatasync. min_sequence = 0, an already-reached target, or a
     // nonpositive timeout return immediately without blocking. Otherwise blocks
     // until durable_seq >= min_sequence or timeout expires, then returns the
-    // watermark. Covers polling (default args), replication wake-up
+    // watermark; milliseconds::max() waits with no deadline. Covers polling (default args), replication wake-up
     // (follower.durable_sequence() + 1), and read-your-own-writes waits
     // (a CommitResult's sequence).
     [[nodiscard]] auto durable_sequence(
@@ -381,7 +385,9 @@ public:
     // Idempotent: entries with sequence <= durable_sequence() are skipped.
     // Publishes the slice in one step: cut slices at batch boundaries, or
     // part of an atomic batch becomes visible.
-    // Throws std::logic_error if not in follower mode, DbDegraded if degraded.
+    // Throws std::logic_error if not in follower mode, DbDegraded if degraded,
+    // std::invalid_argument for a sequence above 2^48 - 1 or an atomic batch
+    // over 1 GiB, before anything is written.
     void ingest(std::span<const DataEntryView> entries);
 
     // True if the engine has entered a degraded state from a write-path failure.
@@ -506,7 +512,7 @@ class DbClosed : public std::logic_error { /* ... */ };
 } // namespace bytecask
 ```
 
-Error handling follows the throw-on-failure convention used by the C++ standard library: I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; an internal invariant violation that cannot be continued through safely — currently only a reused data file name, which would silently drop writes at recovery — prints to stderr and aborts the process rather than throwing, since the write path would otherwise catch it and retry into the same corrupt state; write operations on a degraded engine throw `DbDegraded` (a `std::runtime_error` subclass, catchable separately); normal writes in follower mode throw `DbFollowerMode`; any call on a closed `DB` throws `DbClosed` (a `std::logic_error`). Key-not-found is signalled by `get` returning `false`; `apply_batch` (and `del`) return `nullopt` on precondition or W-W conflict — conflicts are expected outcomes, not exceptional errors. Every committed write returns a `CommitResult{sequence, durable}` — a wait-friendly token for read-your-own-writes across replication (see `durable_sequence` above).
+Error handling follows the throw-on-failure convention used by the C++ standard library: a key, value or plan over its limit, or an option over its hard ceiling at `open`, throws `std::invalid_argument` before anything is written; I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; an internal invariant violation that cannot be continued through safely — currently only a reused data file name, which would silently drop writes at recovery — prints to stderr and aborts the process rather than throwing, since the write path would otherwise catch it and retry into the same corrupt state; write operations on a degraded engine throw `DbDegraded` (a `std::runtime_error` subclass, catchable separately); normal writes in follower mode throw `DbFollowerMode`; any call on a closed `DB` throws `DbClosed` (a `std::logic_error`). Key-not-found is signalled by `get` returning `false`; `apply_batch` (and `del`) return `nullopt` on precondition or W-W conflict — conflicts are expected outcomes, not exceptional errors. Every committed write returns a `CommitResult{sequence, durable}` — a wait-friendly token for read-your-own-writes across replication (see `durable_sequence` above).
 
 
 ## Architecture

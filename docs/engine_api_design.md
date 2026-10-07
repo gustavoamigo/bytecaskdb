@@ -229,7 +229,7 @@ private:
 };
 ```
 
-**Rationale:** `WritePlan` unifies unconditional writes and conditional (guarded) writes into a single type consumed by `apply_batch`. When constructed without a snapshot, it behaves as a simple unconditional batch. When constructed with a snapshot, guards and implicit W-W checks are available. `WritePlan` is move-only and single-use; `DB::apply_batch` consumes it by move. No size limit is imposed by the engine.
+**Rationale:** `WritePlan` unifies unconditional writes and conditional (guarded) writes into a single type consumed by `apply_batch`. When constructed without a snapshot, it behaves as a simple unconditional batch. When constructed with a snapshot, guards and implicit W-W checks are available. `WritePlan` is move-only and single-use; `DB::apply_batch` consumes it by move. A plan may come to at most `kMaxBatchBytes` (1 GiB) on disk.
 
 ---
 
@@ -414,7 +414,7 @@ while (!stop_requested) {
 | D1 | **Error handling**: Throw (`std::system_error` for I/O, `std::runtime_error` for corruption). These are panic-level events the caller cannot meaningfully recover from inline. `get` uses an output parameter + `bool` return instead of `std::optional` so the caller can reuse an existing buffer across repeated calls. No `std::expected` at this boundary. |
 | D2 | **Config**: `Options` (open-time), `WriteOptions` (per-write durability), `ReadOptions` (per-read freshness and CRC), `VacuumOptions` (fragmentation thresholds). Modelled after LevelDB / RocksDB patterns. |
 | D3 | **WritePlan ownership**: `WritePlan` is move-only (copy constructor and copy assignment deleted). Single-use by design; `apply_batch` consumes it. |
-| D4 | **WritePlan size limit**: None — the caller is responsible. |
+| D4 | **WritePlan size limit**: `kMaxBatchBytes` (1 GiB) on disk, markers included — `apply_batch` throws `std::invalid_argument` above it. |
 | D5 | **Iterator strategy**: Lazy — `operator*` reads one value from disk on demand via a single `pread`. Early-termination scans pay no I/O cost for unvisited entries. |
 | D6 | **`KeyIterator` source**: In-memory only — walks the in-memory key directory without opening any data file. |
 | D7 | **`del` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |
