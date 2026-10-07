@@ -485,10 +485,22 @@ TEST_CASE("fault sweep: the interposers count std::filesystem's calls",
     INFO(rep.what);
     CHECK(rep.what.starts_with(name));
   };
-  fails(SyscallFault::before, [&] { (void)std::filesystem::file_size(from); },
-        "stat(");
-  fails(SyscallFault::before, [&] { (void)std::filesystem::exists(from); },
-        "stat(");
+  // Before glibc 2.33, stat is an inline wrapper around __xstat, which
+  // --wrap=stat does not see (xmake.lua, fault_sweep_link_guard): there the
+  // call goes uncounted and nothing fails.
+  auto stat_fails = [&](auto &&call) {
+    {
+      ScopedSyscallFaults probe{dir, SyscallFault::none, 0};
+      (void)call();
+      if (probe.report().calls == 0) {
+        WARN("stat is not interposed on this libc");
+        return;
+      }
+    }
+    fails(SyscallFault::before, call, "stat(");
+  };
+  stat_fails([&] { return std::filesystem::file_size(from); });
+  stat_fails([&] { return std::filesystem::exists(from); });
   fails(SyscallFault::before,
         [&] { (void)std::filesystem::directory_iterator{dir}; }, "openat(");
   fails(SyscallFault::before,
