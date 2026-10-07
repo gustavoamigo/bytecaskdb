@@ -31,9 +31,9 @@ export interface BufferPoolOptions {
 export interface OpenOptions {
   maxFileBytes?: number;
   failOnCrcErrors?: boolean;
-  /** Max key size in bytes (default 4096; hard ceiling 65535). */
+  /** Max key size in bytes (default 4096; hard ceiling 65535, open rejects more). */
   maxKeyBytes?: number;
-  /** Max value size in bytes (default 4 MiB; hard ceiling ~4 GiB). */
+  /** Max value size in bytes (default 4 MiB; hard ceiling 2^28 - 1, open rejects more). */
   maxValueBytes?: number;
   /** Initial engine mode (default 'leader'). */
   initialMode?: Mode;

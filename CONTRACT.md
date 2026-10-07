@@ -100,11 +100,28 @@ without external locking.
 
 All keys and values in the `WritePlan` must satisfy the size limits
 configured in `Options` (default: 4 KiB keys, 4 MiB values; hard
-ceiling: 65,535 bytes keys, ~4 GiB values). Size validation happens
-at the `WritePlan` API boundary (`put`, `del`, `del_range`, guard
+ceiling: 65,535 bytes keys, 268,435,455 bytes values). Size validation
+happens at the `WritePlan` API boundary (`put`, `del`, `del_range`, guard
 methods) before any data is copied. `DB::put`, `DB::del`, and
 `DB::del_range` also validate before creating their internal
-`WritePlan`. Violations throw `std::invalid_argument`.
+`WritePlan`. A plan whose entries, batch markers included, come to more
+than `kMaxBatchBytes` (1 GiB) is refused by `apply_batch` before it joins a
+group. Violations throw `std::invalid_argument`.
+
+### Hard limits
+
+Each limit is enforced before any I/O: reaching it never degrades the
+engine and never leaves bytes in a data file. Proved by the `[limits]`
+tests.
+
+| Limit | Value | Reached by | What happens |
+|---|---|---|---|
+| Key size | 65,535 bytes (u16 on disk) | a key or range bound above `max_key_bytes` | `std::invalid_argument`. `open` refuses a `max_key_bytes` above the ceiling with `std::invalid_argument`. |
+| Value size | 268,435,455 bytes (28-bit packed) | a value above `max_value_bytes` | `std::invalid_argument`. `open` refuses a `max_value_bytes` above the ceiling with `std::invalid_argument`. |
+| Bytes per write | `kMaxBatchBytes`, 1 GiB | a `WritePlan`, or an atomic batch in an `ingest` slice | `std::invalid_argument`. |
+| File size | `kMaxFileBytes`, 3 GiB | `Options::max_file_bytes` | `open` refuses more with `std::invalid_argument`. A file is rotated once it reaches `max_file_bytes`, and a write never spans two files, so every entry starts below `max_file_bytes + kMaxBatchBytes`, inside the 32-bit packed offset. A commit group ends before a write that would carry the file past 2^32 bytes; the next group starts after the rotation. |
+| File ids | 1,048,575 (20-bit packed) per process | each rotation, vacuum compaction and `resume()` takes one; ids are given out from the directory at each `open` and never reused within a process | A write that would take the active file to `max_file_bytes` with no id left throws `std::runtime_error` and appends nothing; smaller writes, and the rest of its group, still commit. `vacuum`, `resume()` and an `ingest` slice that needs a new file refuse the same way before touching a file, and the engine's state is unchanged (`resume()` leaves it degraded). A reopen renumbers the files. `open` refuses a directory holding more than 1,048,575 data files. |
+| Sequence | 2^48 − 1 | `ingest` of a higher sequence; a leader write after it | `ingest` throws `std::invalid_argument` for any entry above the limit, whatever its type. A write that would need a sequence above it throws `std::runtime_error` and appends nothing; at a million writes a second, a leader reaches it after about 8.9 years. |
 
 ### Atomicity
 
@@ -357,7 +374,9 @@ persistent → `store_state` path via `TransientEngineState::apply_sync`.
 `min_sequence = 0`, an already-reached target, or a nonpositive `timeout`
 return the current watermark immediately without blocking. Otherwise it
 blocks on `durable_cv_` until `durable_seq >= min_sequence` or the timeout
-expires, then returns the watermark. The condvar notification is
+expires, then returns the watermark. A timeout longer than the steady
+clock can represent from now, such as `milliseconds::max()`, waits with no
+deadline. The condvar notification is
 centralized in `store_state` — one place, one check.
 
 Every committed write (`put`, `del`, `del_range`, `apply_batch`) returns a
@@ -759,6 +778,7 @@ Applies pre-sequenced entries from a leader to a follower's storage.
 | **Mode requirement** | Throws `std::logic_error` if `mode() != Mode::Follower`. |
 | **Degraded check** | Throws `DbDegraded` if the engine is degraded. |
 | **Idempotency** | Entries with `sequence <= durable_seq` are silently skipped. Safe for restart-on-failure semantics. |
+| **Limits** | Checked before any I/O, and nothing is written on a refusal: a key or value over the configured size limit, a sequence above 2^48 − 1, or an atomic batch over `kMaxBatchBytes` throws `std::invalid_argument`; a slice that needs more new files than there are file ids left throws `std::runtime_error`. See *Hard limits*. |
 | **Batch-safe rotation** | `BulkBegin`/`BulkEnd` pairs always land in the same data file. File rotation only occurs at boundaries where no batch is open. |
 | **Durability** | Every chunk is `fdatasync`'d before rotation. The final chunk is `fdatasync`'d before `store_state` publishes. |
 | **Sequence advancement** | After ingest, `next_seq = max(next_seq, max(ingested sequences) + 1)`. Monotonically non-decreasing. |
@@ -812,6 +832,7 @@ its promises, and refuses any other. Proved by the `[recovery]` tests.
 | **Only the active file is cut** | Every other file was synced whole before the next was started, so a crash can tear only the file being written. `open` cuts that file at its last committed record — whole, if its first page was lost — and syncs the cut. A tail of zeros, preallocated space, is trimmed in any file. |
 | **Damage is refused** | A state no crash can leave on such storage is damage. Where `open` can see it, it throws and cuts nothing: data past the last committed record in a file that is not the newest, such data in more than one file, two files sharing sequences other than an interrupted vacuum's pair. `open` does not open a best-effort subset of a damaged database: to the caller that is data loss with no error. |
 | **Damage that cannot be seen** | Damage that leaves exactly what a crash would is outside this contract: `open` cannot refuse what it cannot tell from a torn write. `docs/bytecask_design.md`, *Recovering a Hint-less File*, lists the known shapes. |
+| **Options** | `max_key_bytes`, `max_value_bytes` or `max_file_bytes` above its hard ceiling (see *Hard limits*) throws `std::invalid_argument` before the directory is created or locked. |
 | **Hint files** | A hint is a rebuildable index. One that fails its CRC, or that a read fails on, is rebuilt from its data file and costs no keys. |
 | **`fail_recovery_on_crc_errors = false`** | The operator's explicit opt-out from refusal, for one case: a data file whose hint is bad and that cannot be rescanned is skipped with a warning on stderr, and the database opens without its keys. It does not relax the rules on cutting above. |
 

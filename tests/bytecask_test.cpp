@@ -1826,6 +1826,144 @@ TEST_CASE("Recovery model-based: random workload matches oracle",
 }
 
 // ---------------------------------------------------------------------------
+// Model-based recovery: keys at the 65,535-byte ceiling, values above 1 MiB.
+//
+// Keys share all but one byte, at the start, the middle or the end, so the
+// key directory tells them apart at every depth. Values above 1 MiB are
+// larger than DataFileIterator's read chunk and the test build's
+// max_file_bytes, so each large write gets a file of its own. Range deletes
+// take large keys as bounds.
+// ---------------------------------------------------------------------------
+TEST_CASE("Recovery model-based: ceiling-size keys and large values",
+          "[bytecask][recovery][parallel][model][limits]") {
+  std::mt19937 gen(28801);
+  const auto pick = [&](int lo, int hi) {
+    return std::uniform_int_distribution<int>(lo, hi)(gen);
+  };
+
+  std::vector<std::string> keys;
+  for (int i = 0; i < 12; ++i) {
+    std::string k(bytecask::kMaxKeySize, 'k');
+    static constexpr std::array<std::size_t, 4> kAt{
+        0, bytecask::kMaxKeySize / 2, bytecask::kMaxKeySize - 2,
+        bytecask::kMaxKeySize - 1};
+    k[kAt[static_cast<std::size_t>(i % 4)]] = static_cast<char>('A' + i);
+    keys.push_back(std::move(k));
+  }
+  for (int i = 0; i < 4; ++i) keys.push_back(std::format("small{}", i));
+
+  const auto rand_key = [&] {
+    return keys[static_cast<std::size_t>(pick(0, static_cast<int>(keys.size()) - 1))];
+  };
+  const auto rand_value = [&] {
+    const auto len = pick(0, 9) < 3 ? pick((1 << 20) + 1, 3 << 19)
+                                    : pick(0, 64);
+    std::string v(static_cast<std::size_t>(len), 'x');
+    const auto seed = static_cast<char>(pick('A', 'z'));
+    for (std::size_t i = 0; i < v.size(); ++i)
+      v[i] = static_cast<char>(seed + static_cast<char>(i % 7));
+    return v;
+  };
+
+  TempDir td;
+  const auto db_path = td.path / "db";
+  std::map<std::string, std::string> oracle;
+  {
+    auto db = bytecask::DB::open(
+        db_path, {.max_key_bytes = bytecask::kMaxKeySize,
+                  .max_value_bytes = 2U << 20});
+    for (int i = 0; i < 80; ++i) {
+      const auto op = pick(0, 19);
+      if (op < 10) {
+        auto k = rand_key();
+        auto v = rand_value();
+        db.put({.sync = false}, to_bytes(k), to_bytes(v));
+        oracle[k] = std::move(v);
+      } else if (op < 14) {
+        const auto k = rand_key();
+        std::ignore = db.del({.sync = false}, to_bytes(k));
+        oracle.erase(k);
+      } else if (op < 17) {
+        bytecask::WritePlan plan{
+            bytecask::SizeLimits{bytecask::kMaxKeySize, 2U << 20}};
+        for (int b = pick(2, 3); b > 0; --b) {
+          auto k = rand_key();
+          if (pick(0, 3) == 0) {
+            plan.del(to_bytes(k));
+            oracle.erase(k);
+          } else {
+            auto v = rand_value();
+            plan.put(to_bytes(k), to_bytes(v));
+            oracle[k] = std::move(v);
+          }
+        }
+        (void)db.apply_batch({.sync = false}, std::move(plan));
+      } else {
+        auto from = rand_key();
+        auto to = rand_key();
+        if (to < from) std::swap(from, to);
+        db.del_range({.sync = false}, to_bytes(from), to_bytes(to));
+        std::erase_if(oracle, [&](const auto &kv) {
+          return kv.first >= from && kv.first < to;
+        });
+      }
+    }
+  }
+
+  const auto open = [&](const std::filesystem::path &p, unsigned threads) {
+    return bytecask::DB::open(p, {.recovery_threads = threads,
+                                  .max_key_bytes = bytecask::kMaxKeySize,
+                                  .max_value_bytes = 2U << 20});
+  };
+  const auto verify = [&](const std::string &label, bytecask::DB &db) {
+    INFO(label);
+    std::map<std::string, std::string> kv;
+    for (auto &entry : db.iter_from({}))
+      kv[to_string(entry.key)] = to_string(entry.value);
+    CHECK(kv.size() == oracle.size());
+    CHECK(kv == oracle);
+  };
+
+  int data_file_count = 0;
+  for (const auto &e : std::filesystem::directory_iterator{db_path})
+    if (e.path().extension() == ".data") ++data_file_count;
+  REQUIRE(data_file_count > 1);
+
+  std::vector<FileStatsTuple> serial_stats_vals;
+  {
+    const auto p = td.path / "serial_baseline";
+    std::filesystem::copy(db_path, p, std::filesystem::copy_options::recursive);
+    auto db = open(p, 1);
+    verify("serial_baseline", db);
+    serial_stats_vals = collect_file_stats(db);
+  }
+
+  SECTION("serial recovery") {
+    const auto p = td.path / "s1";
+    std::filesystem::copy(db_path, p, std::filesystem::copy_options::recursive);
+    auto db = open(p, 1);
+    verify("serial", db);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
+  }
+
+  SECTION("parallel recovery (2 workers)") {
+    const auto p = td.path / "p2";
+    std::filesystem::copy(db_path, p, std::filesystem::copy_options::recursive);
+    auto db = open(p, 2);
+    verify("parallel/2", db);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
+  }
+
+  SECTION("parallel recovery (W = file count)") {
+    const auto p = td.path / "pmax";
+    std::filesystem::copy(db_path, p, std::filesystem::copy_options::recursive);
+    auto db = open(p, static_cast<unsigned>(data_file_count));
+    verify("parallel/max", db);
+    CHECK(collect_file_stats(db) == serial_stats_vals);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Model-based recovery: large batch-heavy workload.
 //
 // Exercises the batch code path (BulkBegin/BulkEnd) extensively — most
@@ -10628,16 +10766,357 @@ TEST_CASE("Size limits: guard methods validate key size",
       std::invalid_argument);
 }
 
-TEST_CASE("Size limits: hard ceiling clamps user value",
+TEST_CASE("Limits: open rejects options above the hard ceilings",
           "[bytecask][limits]") {
   TempDir td;
-  // User passes a value larger than the wire format ceiling.
-  // DB::open clamps it to kMaxKeySize.
-  auto db = bytecask::DB::open(td.path, {.max_key_bytes = 100000});
-  // A 65535-byte key should be accepted (at wire format ceiling).
-  std::string key_at_hard_limit(65535, 'k');
-  CHECK_NOTHROW(
-      db.put({.sync = false}, to_bytes(key_at_hard_limit), to_bytes("v")));
+  // At each ceiling: accepted.
+  CHECK_NOTHROW(bytecask::DB::open(
+      td.path / "at", {.max_file_bytes = bytecask::kMaxFileBytes,
+                       .max_key_bytes = bytecask::kMaxKeySize,
+                       .max_value_bytes = bytecask::kMaxValueSize}));
+  // One past: refused, not lowered to the ceiling.
+  CHECK_THROWS_AS(
+      bytecask::DB::open(td.path / "k",
+                         {.max_key_bytes = bytecask::kMaxKeySize + 1}),
+      std::invalid_argument);
+  CHECK_THROWS_AS(
+      bytecask::DB::open(td.path / "v",
+                         {.max_value_bytes = bytecask::kMaxValueSize + 1}),
+      std::invalid_argument);
+  CHECK_THROWS_AS(
+      bytecask::DB::open(td.path / "f",
+                         {.max_file_bytes = bytecask::kMaxFileBytes + 1}),
+      std::invalid_argument);
+  // A refusal takes no lock: the directory opens with valid options.
+  CHECK_NOTHROW(bytecask::DB::open(td.path / "k"));
+}
+
+TEST_CASE("Limits: a KeyDirEntry packs each field at its ceiling and refuses "
+          "one past", "[bytecask][limits]") {
+  using E = bytecask::KeyDirEntry;
+  const auto e = E::make(E::kMaxSequence, E::kMaxFileOffset, E::kMaxFileId,
+                         E::kMaxValueSize);
+  CHECK(e.sequence() == E::kMaxSequence);
+  CHECK(e.file_offset() == E::kMaxFileOffset);
+  CHECK(e.file_id() == E::kMaxFileId);
+  CHECK(e.value_size() == E::kMaxValueSize);
+
+  CHECK_THROWS_AS(E::make(E::kMaxSequence + 1, 0, 0, 0), std::runtime_error);
+  CHECK_THROWS_AS(E::make(1, E::kMaxFileOffset + 1, 0, 0), std::runtime_error);
+  CHECK_THROWS_AS(E::make(1, 0, E::kMaxFileId + 1, 0), std::runtime_error);
+  CHECK_THROWS_AS(E::make(1, 0, 0, E::kMaxValueSize + 1), std::runtime_error);
+
+  // The engine's limits keep every entry inside the packed fields.
+  STATIC_CHECK(bytecask::kMaxValueSize == E::kMaxValueSize);
+  STATIC_CHECK(bytecask::kMaxFileBytes + bytecask::kMaxBatchBytes - 1 <=
+               E::kMaxFileOffset);
+}
+
+namespace {
+// Lowers the per-write byte limit for one test and restores it.
+struct ScopedBatchLimit {
+  explicit ScopedBatchLimit(std::uint64_t bytes) {
+    bytecask::test_max_batch_bytes = bytes;
+  }
+  ~ScopedBatchLimit() {
+    bytecask::test_max_batch_bytes = bytecask::kMaxBatchBytes;
+  }
+  ScopedBatchLimit(const ScopedBatchLimit &) = delete;
+  auto operator=(const ScopedBatchLimit &) -> ScopedBatchLimit & = delete;
+};
+
+struct ScopedWritevLimits {
+  explicit ScopedWritevLimits(bytecask::WritevLimits limits)
+      : saved_{bytecask::test_writev_limits} {
+    bytecask::test_writev_limits = limits;
+  }
+  ~ScopedWritevLimits() { bytecask::test_writev_limits = saved_; }
+  ScopedWritevLimits(const ScopedWritevLimits &) = delete;
+  auto operator=(const ScopedWritevLimits &) -> ScopedWritevLimits & = delete;
+
+private:
+  bytecask::WritevLimits saved_;
+};
+
+auto data_file_bytes(const std::filesystem::path &dir) -> std::uintmax_t {
+  std::uintmax_t total = 0;
+  for (const auto &e : std::filesystem::directory_iterator{dir})
+    if (e.path().extension() == ".data") total += e.file_size();
+  return total;
+}
+}  // namespace
+
+TEST_CASE("Limits: a plan larger than the per-write byte limit is refused "
+          "before any I/O", "[bytecask][limits]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  const std::string value(100, 'v');
+
+  // Two puts and their batch markers.
+  const auto two_puts = 2 * bytecask::entry_size(2, value.size()) +
+                        2 * (bytecask::kHeaderSize + bytecask::kCrcSize);
+  const auto make_plan = [&] {
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("k1"), to_bytes(value));
+    plan.put(to_bytes("k2"), to_bytes(value));
+    return plan;
+  };
+
+  {
+    const ScopedBatchLimit limit{two_puts};
+    CHECK(db.apply_batch({}, make_plan()).has_value());
+  }
+  (void)db.del({}, to_bytes("k1"));
+  (void)db.del({}, to_bytes("k2"));
+  const auto seq_before = db.durable_sequence();
+  const auto bytes_before = db.stats().at("bytecask.bytes_written");
+  {
+    const ScopedBatchLimit limit{two_puts - 1};
+    CHECK_THROWS_AS(db.apply_batch({}, make_plan()), std::invalid_argument);
+  }
+  CHECK(db.durable_sequence() == seq_before);
+  CHECK(db.stats().at("bytecask.bytes_written") == bytes_before);
+  CHECK_FALSE(db.is_degraded());
+  CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
+}
+
+TEST_CASE("Limits: ingest refuses an atomic batch past the per-write byte "
+          "limit", "[bytecask][limits]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db",
+                               {.initial_mode = bytecask::Mode::Follower});
+  // One 4 MiB buffer behind every entry: the slice is over 1 GiB on the wire
+  // without holding it in memory.
+  const std::vector<std::byte> value(4U * 1024 * 1024);
+  const auto per_put = bytecask::entry_size(1, value.size());
+  const auto puts = bytecask::kMaxBatchBytes / per_put + 1;
+  std::vector<bytecask::DataEntryView> slice;
+  std::uint64_t seq = 1;
+  slice.push_back({seq++, bytecask::EntryType::BulkBegin, {}, {}});
+  const auto key = to_bytes("k");
+  for (std::uint64_t i = 0; i < puts; ++i)
+    slice.push_back({seq++, bytecask::EntryType::Put, key, value});
+  slice.push_back({seq++, bytecask::EntryType::BulkEnd, {}, {}});
+
+  const auto bytes_before = data_file_bytes(td.path / "db");
+  CHECK_THROWS_AS(db.ingest(slice), std::invalid_argument);
+  CHECK(data_file_bytes(td.path / "db") == bytes_before);
+  CHECK(db.durable_sequence() == 0);
+  CHECK_FALSE(db.is_degraded());
+}
+
+TEST_CASE("Limits: ingest takes the last packable sequence and refuses the "
+          "next", "[bytecask][limits]") {
+  using E = bytecask::KeyDirEntry;
+  TempDir td;
+  const auto dir = td.path / "db";
+  {
+    auto db =
+        bytecask::DB::open(dir, {.initial_mode = bytecask::Mode::Follower});
+    const auto k = to_bytes("k");
+    const auto v = to_bytes("v");
+
+    // Every entry type is checked, not only the ones the key directory
+    // packs: a tombstone or marker past the limit would reach the file.
+    for (const auto type : {bytecask::EntryType::Put,
+                            bytecask::EntryType::Delete,
+                            bytecask::EntryType::BulkBegin}) {
+      const std::array past{bytecask::DataEntryView{
+          E::kMaxSequence + 1, type, k,
+          type == bytecask::EntryType::Put ? v : bytecask::BytesView{}}};
+      CHECK_THROWS_AS(db.ingest(past), std::invalid_argument);
+    }
+    CHECK(db.durable_sequence() == 0);
+
+    const std::array at{bytecask::DataEntryView{
+        E::kMaxSequence, bytecask::EntryType::Put, k, v}};
+    db.ingest(at);
+    CHECK(db.durable_sequence() == E::kMaxSequence);
+
+    // The sequence space is used up: a leader write needs the next one and
+    // is refused before it appends, leaving the engine healthy.
+    db.set_mode(bytecask::Mode::Leader);
+    const auto bytes_before = db.stats().at("bytecask.bytes_written");
+    CHECK_THROWS_AS(db.put({}, to_bytes("k2"), v), std::runtime_error);
+    CHECK(db.stats().at("bytecask.bytes_written") == bytes_before);
+    CHECK_FALSE(db.is_degraded());
+    CHECK(get_str(db, k) == "v");
+  }
+  auto db = bytecask::DB::open(dir);
+  CHECK(get_str(db, to_bytes("k")) == "v");
+  CHECK(db.durable_sequence() == E::kMaxSequence);
+}
+
+TEST_CASE("Limits: the last file id is used, then a write that needs another "
+          "is refused until a reopen", "[bytecask][limits]") {
+  using E = bytecask::KeyDirEntry;
+  TempDir td;
+  const auto dir = td.path / "db";
+  const bytecask::Options opts{.max_file_bytes = 256};
+  const std::string small(10, 's');
+  const std::string big(300, 'b');
+  {
+    auto db = bytecask::DB::open(dir, opts);
+    db.put({}, to_bytes("seed"), to_bytes(small));
+    db.test_set_next_file_id(E::kMaxFileId);
+
+    // Crosses the threshold: the rotation takes the last id.
+    db.put({}, to_bytes("last"), to_bytes(big));
+    CHECK(db.engine_state()->active_file_id == E::kMaxFileId);
+
+    // Below the threshold no new file is needed.
+    db.put({}, to_bytes("fits"), to_bytes(small));
+
+    // Would reach it: refused before any I/O, the engine still writable.
+    const auto bytes_before = db.stats().at("bytecask.bytes_written");
+    CHECK_THROWS_WITH(db.put({}, to_bytes("over"), to_bytes(big)),
+                      Catch::Matchers::ContainsSubstring("exhausted"));
+    CHECK(db.stats().at("bytecask.bytes_written") == bytes_before);
+    CHECK_FALSE(db.is_degraded());
+    CHECK_FALSE(db.contains_key({}, to_bytes("over")));
+    db.put({}, to_bytes("fits2"), to_bytes(small));
+
+    // vacuum needs an id for its copy and refuses before making one.
+    db.put({}, to_bytes("seed"), to_bytes(small));
+    CHECK_THROWS_AS(db.vacuum({.fragmentation_threshold = 0.0}),
+                    std::runtime_error);
+    for (const auto &e : std::filesystem::directory_iterator{dir})
+      CHECK(e.path().extension() != ".tmp");
+    CHECK_FALSE(db.is_degraded());
+  }
+  // Open numbers the files from the directory, so the space is back.
+  auto db = bytecask::DB::open(dir, opts);
+  db.put({}, to_bytes("over"), to_bytes(big));
+  for (const auto *k : {"seed", "fits", "fits2"})
+    CHECK(get_str(db, to_bytes(k)) == small);
+  CHECK(get_str(db, to_bytes("last")) == big);
+  CHECK(get_str(db, to_bytes("over")) == big);
+}
+
+TEST_CASE("Limits: ingest refuses a slice that needs a file id it does not "
+          "have, before any I/O", "[bytecask][limits]") {
+  using E = bytecask::KeyDirEntry;
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db",
+                               {.max_file_bytes = 256,
+                                .initial_mode = bytecask::Mode::Follower});
+  db.test_set_next_file_id(E::kMaxFileId + 1);
+  const std::string big(300, 'b');
+  const auto k = to_bytes("k");
+  const std::array slice{
+      bytecask::DataEntryView{1, bytecask::EntryType::Put, k, to_bytes("v")},
+      bytecask::DataEntryView{2, bytecask::EntryType::Put, k, to_bytes(big)}};
+
+  const auto bytes_before = data_file_bytes(td.path / "db");
+  CHECK_THROWS_WITH(db.ingest(slice),
+                    Catch::Matchers::ContainsSubstring("exhausted"));
+  CHECK(data_file_bytes(td.path / "db") == bytes_before);
+  CHECK(db.durable_sequence() == 0);
+  CHECK_FALSE(db.is_degraded());
+  // A slice that stays below the threshold still goes in.
+  db.ingest(std::span{slice}.first(1));
+  CHECK(db.durable_sequence() == 1);
+}
+
+TEST_CASE("Limits: resume without a file id leaves the engine degraded and "
+          "untouched", "[bytecask][limits]") {
+  using E = bytecask::KeyDirEntry;
+  TempDir td;
+  const auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({}, to_bytes("a"), to_bytes("1"));
+    {
+      bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
+      CHECK_THROWS_AS(db.put({}, to_bytes("b"), to_bytes("2")),
+                      std::system_error);
+    }
+    REQUIRE(db.is_degraded());
+    db.test_set_next_file_id(E::kMaxFileId + 1);
+    const auto bytes_before = data_file_bytes(dir);
+    CHECK_THROWS_WITH(db.resume(),
+                      Catch::Matchers::ContainsSubstring("exhausted"));
+    CHECK(db.is_degraded());
+    CHECK(data_file_bytes(dir) == bytes_before);
+    CHECK(get_str(db, to_bytes("a")) == "1");
+  }
+  auto db = bytecask::DB::open(dir);
+  CHECK(get_str(db, to_bytes("a")) == "1");
+  db.put({}, to_bytes("c"), to_bytes("3"));
+}
+
+TEST_CASE("Limits: durable_sequence waits with a timeout the clock cannot "
+          "represent", "[bytecask][limits]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  for (const auto timeout : {std::chrono::milliseconds::max(),
+                             std::chrono::milliseconds::max() -
+                                 std::chrono::milliseconds{1}}) {
+    const auto target = db.durable_sequence() + 1;
+    std::thread writer{[&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds{20});
+      db.put({.sync = true}, to_bytes("k"), to_bytes("v"));
+    }};
+    // A deadline that wrapped into the past would return at once, below
+    // the target.
+    CHECK(db.durable_sequence(target, timeout) >= target);
+    writer.join();
+  }
+}
+
+TEST_CASE("Limits: batches at the production writev chunk boundary round-trip",
+          "[bytecask][limits]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  const auto value = [](std::size_t n, std::size_t i) {
+    return std::format("v{}-{}", n, i);
+  };
+  // Puts per plan; each plan adds a begin and an end marker. 254 puts fill
+  // one call exactly, 255 and 256 spill the end marker or one put into a
+  // second, and 600 needs three.
+  const std::array<std::size_t, 5> plans{
+      bytecask::kMaxEntriesPerWritev - 2, bytecask::kMaxEntriesPerWritev - 1,
+      bytecask::kMaxEntriesPerWritev, bytecask::kMaxEntriesPerWritev + 1, 600};
+  {
+    const ScopedWritevLimits limits{{bytecask::kMaxEntriesPerWritev,
+                                     bytecask::kMaxBytesPerWritev}};
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 1U << 20});
+    for (const auto n : plans) {
+      bytecask::WritePlan plan;
+      for (std::size_t i = 0; i < n; ++i)
+        plan.put(to_bytes(std::format("p{}-{:04}", n, i)),
+                 to_bytes(value(n, i)));
+      REQUIRE(db.apply_batch({}, std::move(plan)).has_value());
+    }
+  }
+  auto db = bytecask::DB::open(dir, {.max_file_bytes = 1U << 20});
+  for (const auto n : plans)
+    for (std::size_t i = 0; i < n; ++i)
+      CHECK(get_str(db, to_bytes(std::format("p{}-{:04}", n, i))) ==
+            value(n, i));
+}
+
+TEST_CASE("Limits: a batch split by the writev byte limit round-trips",
+          "[bytecask][limits]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  const std::string value(50, 'v');
+  {
+    // Every entry above 64 bytes goes out in a call of its own; markers pair.
+    const ScopedWritevLimits limits{{bytecask::kMaxEntriesPerWritev, 64}};
+    auto db = bytecask::DB::open(dir);
+    bytecask::WritePlan plan;
+    for (int i = 0; i < 20; ++i)
+      plan.put(to_bytes(std::format("k{:02}", i)), to_bytes(value));
+    plan.del(to_bytes("k03"));
+    REQUIRE(db.apply_batch({}, std::move(plan)).has_value());
+    CHECK(get_str(db, to_bytes("k19")) == value);
+  }
+  auto db = bytecask::DB::open(dir);
+  for (int i = 0; i < 20; ++i) {
+    const auto k = std::format("k{:02}", i);
+    CHECK(get_str(db, to_bytes(k)) == (i == 3 ? "<missing>" : value));
+  }
 }
 
 // ---------------------------------------------------------------------------

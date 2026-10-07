@@ -179,27 +179,33 @@ In the engine it changes what reads the data files:
 
 ### Size Limits
 
-The on-disk entry header imposes hard ceilings: keys are limited to 65,535 bytes (u16 `key_size` field) and values to 4,294,967,295 bytes (u32 `value_size` field). These cannot be raised without a format change.
+The on-disk entry header limits keys to 65,535 bytes (u16 `key_size` field). Its `value_size` field is 32 bits wide, but values are limited further by the in-memory packing below. Neither can be raised without a format or packing change.
 
 The in-memory `KeyDirEntry` is bit-packed into two 64-bit words (16 bytes) to keep the key directory small. Field limits enforced by the packing:
 
 | Field | Bits | Max value |
 |---|---|---|
-| sequence | 48 | 281 trillion (~8.9 years at 1M ops/sec) |
+| sequence | 48 | 2^48 − 1, 281 trillion (~8.9 years at 1M ops/sec) |
 | file_id | 20 | 1,048,575 (split across word0 and word1) |
-| file_offset | 32 | 4 GiB per file |
-| value_size | 28 | 256 MiB per value |
+| file_offset | 32 | 2^32 − 1, where an entry may start |
+| value_size | 28 | 268,435,455 (2^28 − 1) per value |
 
-These limits are validated at construction time (`KeyDirEntry::make`). The on-disk format is unaffected — packing is in-memory only. All field access goes through accessor methods so the internal layout can be changed without touching call sites.
+`KeyDirEntry::make` checks each field and throws past it. The engine does not rely on that check: every limit is enforced before the write it would break reaches a data file, so reaching one never degrades the engine. `CONTRACT.md`, *Hard limits*, states the behaviour; the `[limits]` tests prove it, exactly at each limit and one past.
+
+- **Sequence.** `ingest` rejects an entry above 2^48 − 1, of any type — a tombstone or marker would otherwise reach the file unchecked, since only Puts are packed. `execute_slot` refuses a plan whose last sequence would pass the limit, before `apply_writes`, so it fails alone and the rest of its group commits.
+- **File offset.** `Options::max_file_bytes` is capped at `kMaxFileBytes` (3 GiB) and one write — a plan, or an atomic batch in an `ingest` slice — at `kMaxBatchBytes` (1 GiB). A file is rotated once it reaches `max_file_bytes` and a write never spans two files, so the first write of a group starts below 3 GiB and ends below 4 GiB. Writers that queue together could still carry the file further, so `execute_group` ends a group before a slot that would take the file past 2^32 bytes; `execute_slots` runs the rest as the next group, after the rotation. A group splits only that close to the offset limit — at the default 64 MiB it would take gigabytes queued at once — so a group is still one append with one outcome. `ingest` needs no split: it already rotates between batches. A `static_assert` ties the two constants to the packed field.
+- **File id.** Ids are given out in name order at each `open` and taken by every rotation, vacuum compaction and `resume()`, never reused within a process. `execute_group` checks for a free id before phase 1; without one, a slot that would take the active file to the threshold is refused (`execute_slot`, with `can_rotate` false) and the file stays under it, so no rotation is attempted after sealing. `ingest` counts the rotations a slice needs with the same chunking rule it writes with (`ingest_chunk`) and refuses the slice if there are fewer ids. `vacuum_compact_file` and `resume()` check before touching a file. The error tells the operator to reopen, which renumbers; `open` refuses a directory with more data files than there are ids.
+- **Bytes per `pwritev`.** `append_entries` splits a write into calls of at most `kMaxEntriesPerWritev` entries (`IOV_MAX / 4`) and `kMaxBytesPerWritev` bytes (1 GiB), with at least one entry per call. Linux transfers at most 0x7ffff000 bytes per call and returns short above it, which `check_write` reports as a failed write: without the byte cap, a legal plan of nine 256 MiB values degraded the engine. Test builds lower the entry count to 2 so ordinary tests cross chunk boundaries; `test_writev_limits` lets a test set the production values or a small byte cap.
 
 Configurable limits are enforced at the API boundary — before any data is copied into a `WritePlan` or written to disk:
 
 | Limit | Default | Hard ceiling | Rationale |
 |-------|---------|-------------|-----------|
 | `Options::max_key_bytes` | 4,096 (4 KiB) | 65,535 | Keys live in memory (key directory). Large keys bloat RAM and slow traversal. |
-| `Options::max_value_bytes` | 4,194,304 (4 MiB) | 4,294,967,295 | Values go to disk. Oversized values cause pathological file rotation. |
+| `Options::max_value_bytes` | 4,194,304 (4 MiB) | 268,435,455 | Values go to disk. Oversized values cause pathological file rotation. |
+| `Options::max_file_bytes` | 64 MiB | 3 GiB (`kMaxFileBytes`) | Leaves room for one `kMaxBatchBytes` write under the 32-bit offset. |
 
-Violations throw `std::invalid_argument`. `WritePlan` carries the limits from `Snapshot` (which inherits them from `DB`) or uses the defaults when constructed without a snapshot. `DB::put`, `DB::del`, `DB::del_range`, and `DB::ingest` all validate before proceeding.
+An option above its ceiling makes `open` throw `std::invalid_argument` before the directory is created or locked; it is not lowered to the ceiling, so the engine never runs with a limit other than the one configured. Violations of the size limits throw `std::invalid_argument`. `WritePlan` carries the limits from `Snapshot` (which inherits them from `DB`) or uses the defaults when constructed without a snapshot. `DB::put`, `DB::del`, `DB::del_range`, and `DB::ingest` all validate before proceeding.
 
 ### Concurrency Model
 
@@ -1686,7 +1692,7 @@ Counters are per-DB instance (`Counters` struct owned by `DB`). Two open databas
 | D1 | **Error handling**: Throw (`std::system_error` for I/O, `std::runtime_error` for corruption). These are panic-level events the caller cannot meaningfully recover from inline. `std::optional` covers the key-not-found case for `get`. No `std::expected` at this boundary — there are no anticipated recoverable error conditions in normal operation. |
 | D2 | **Config**: Deferred — removed from the initial API scope. |
 | D3 | **WritePlan ownership**: `WritePlan` is move-only (copy constructor and copy assignment deleted). Single-use by design. |
-| D4 | **WritePlan size limit**: None — the caller is responsible. |
+| D4 | **WritePlan size limit**: `kMaxBatchBytes` (1 GiB) on disk, markers included — `apply_batch` throws `std::invalid_argument` above it (see *Size Limits*). |
 | D5 | **Iterator strategy**: Lazy — each `operator++` reads one value from disk on demand. Early-termination scans pay no I/O cost for unvisited entries. |
 | D6 | **`KeyIterator` source**: In-memory only — walks the B-Tree key directory without opening any data file. |
 | D7 | **`del` on missing key**: Returns `bool` — `true` if the key existed and was removed, `false` if it was absent. Consistent with `std::set::erase` returning a count. |

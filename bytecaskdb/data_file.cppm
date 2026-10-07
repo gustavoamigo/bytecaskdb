@@ -133,6 +133,26 @@ DataFile::~DataFile() = default;
 // never past their capacity. See WritableFileOps::ensure_zeroed.
 export inline constexpr std::size_t kZeroFillChunkBytes = 4 * 1024 * 1024;
 
+// append_entries splits a write into pwritev calls of at most this many
+// entries (four iovecs each) and this many bytes. Linux transfers at most
+// 0x7ffff000 bytes per call and returns short above it, which append_entries
+// would report as a failed write; 1 GiB keeps every call under that, and
+// under INT_MAX where the platform limit is that.
+export inline constexpr std::size_t kMaxEntriesPerWritev = IOV_MAX / 4;
+export inline constexpr std::size_t kMaxBytesPerWritev = std::size_t{1} << 30;
+
+#ifdef BYTECASK_TESTING
+// The limits append_entries uses in test builds. Entries default to 2, so
+// ordinary tests cross chunk boundaries; a test sets the production values,
+// or a byte limit small enough to split a batch, and restores them. Not
+// synchronised: set it while no write is running.
+export struct WritevLimits {
+  std::size_t entries;
+  std::size_t bytes;
+};
+export inline WritevLimits test_writev_limits{2, kMaxBytesPerWritev};
+#endif
+
 // ---------------------------------------------------------------------------
 // WritableDataFile — pure interface for the write API.
 //
@@ -532,10 +552,11 @@ struct WritableFileOps {
 
     static constexpr std::size_t kIovecsPerEntry = 4;
 #ifdef BYTECASK_TESTING
-    static constexpr std::size_t kMaxEntriesPerWritev = 2;
+    const auto max_entries = test_writev_limits.entries;
+    const auto max_bytes = test_writev_limits.bytes;
 #else
-    static constexpr std::size_t kMaxEntriesPerWritev =
-        IOV_MAX / kIovecsPerEntry;
+    constexpr auto max_entries = kMaxEntriesPerWritev;
+    constexpr auto max_bytes = kMaxBytesPerWritev;
 #endif
 
 #pragma clang diagnostic push
@@ -545,10 +566,17 @@ struct WritableFileOps {
     thread_local std::vector<::iovec> iov;
 #pragma clang diagnostic pop
 
-    for (std::size_t base = 0; base < entries.size();
-         base += kMaxEntriesPerWritev) {
-      const auto chunk_end =
-          std::min(base + kMaxEntriesPerWritev, entries.size());
+    for (std::size_t base = 0; base < entries.size();) {
+      // At least one entry, so an entry larger than max_bytes still goes
+      // out; the largest one an engine can write is well under it.
+      auto chunk_end = base;
+      for (std::size_t chunk_bytes = 0;
+           chunk_end < entries.size() && chunk_end - base < max_entries;
+           ++chunk_end) {
+        const auto &e = entries[chunk_end];
+        chunk_bytes += kHeaderSize + e.key.size() + e.value.size() + kCrcSize;
+        if (chunk_end > base && chunk_bytes > max_bytes) break;
+      }
       const auto chunk_size = chunk_end - base;
 
       hdr_crcs.resize(chunk_size);
@@ -601,6 +629,7 @@ struct WritableFileOps {
 
       io_.publish(start, std::span<const ::iovec>{iov});
       advance(static_cast<Offset>(total_bytes));
+      base = chunk_end;
     }
   }
 
