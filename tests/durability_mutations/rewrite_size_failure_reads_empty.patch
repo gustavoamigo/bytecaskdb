@@ -1,0 +1,23 @@
+rewrite_durably reads a failed stat of the file as an empty file, so it
+rewrites nothing and syncs pages a failed fdatasync left clean and unwritten.
+resume() and the open after a crash then build a hint over bytes the device
+does not hold. The stat is std::filesystem::file_size's, which the counted
+fault sweep reaches only because bytecask_tests links the C++ library
+statically (#319).
+Guarded-by: "fault sweep: resume after a failed sync"
+
+diff --git a/bytecaskdb/data_file.cppm b/bytecaskdb/data_file.cppm
+index 548a4fd..a6b422d 100644
+--- a/bytecaskdb/data_file.cppm
++++ b/bytecaskdb/data_file.cppm
+@@ -1977,7 +1977,9 @@ private:
+ // on any I/O failure, leaving the file's contents as they were.
+ export void rewrite_durably(const std::filesystem::path &path, Offset end) {
+   const RewriteFd f{path};
+-  const auto size = std::min<std::uintmax_t>(end, std::filesystem::file_size(path));
++  std::error_code size_ec;
++  const auto on_disk = std::filesystem::file_size(path, size_ec);
++  const auto size = size_ec ? 0 : std::min<std::uintmax_t>(end, on_disk);
+   static constexpr std::size_t kChunk = 1024 * 1024;
+   const auto what = std::format("bytecask: rewrite of '{}'", path.string());
+   std::vector<std::byte> buf(

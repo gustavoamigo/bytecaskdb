@@ -1665,8 +1665,8 @@ for each operation:
 
 It runs in `bytecask_tests` as `[fault_sweep]`
 ([`tests/fault_sweep_test.cpp`](../tests/fault_sweep_test.cpp)), on every
-PR: about 3,900 failed calls, 1,400 of them on the default back-end, in
-22 s on an unsanitized release build. A
+PR: about 5,300 failed calls, 1,850 of them on the default back-end, in
+30 s on an unsanitized release build. A
 failure names the call: `vacuum, fault before, N = 7:
 ftruncate(…/x.data.tmp)`. `BYTECASK_SWEEP_TRACE=1` prints every call a
 sweep failed.
@@ -1674,20 +1674,47 @@ sweep failed.
 **Counting below the engine.** The engine has no single I/O layer to count
 in, and counting `FAULT_INJECTION` checkpoints would leave a call without
 one unreached. So `bytecask_tests` is linked with `-Wl,--wrap=<call>` for
-`open`, `pread`, `pwrite`, `pwritev`, `write`, `fdatasync`, `fsync`,
-`ftruncate`, `fstat`, `stat`, `renameat2`, `link`, `unlink` and `mmap`, and
-the interposers in [`tests/syscall_faults.cpp`](../tests/syscall_faults.cpp)
-count and fail them. A call is counted only while a sweep is armed, and
-only on a file under the DB directory, matched by its path or by what its
-descriptor names (`/proc/self/fd`). An interposer calls through to the
-real symbol, which under a sanitizer is the sanitizer's interceptor.
+each I/O call it references, and the interposers in
+[`tests/syscall_faults.cpp`](../tests/syscall_faults.cpp) count and fail
+them. A call is counted only while a sweep is armed, and only on a file
+under the DB directory, matched by its path, by what its descriptor names
+(`/proc/self/fd`), or for an `*at` call by both. An interposer calls
+through to the real symbol, which under a sanitizer is the sanitizer's
+interceptor.
+
+`--wrap` rewrites the references in the objects that are part of the link,
+and nothing in a shared library. So `bytecask_tests` links the C++
+standard library statically (`-static-libstdc++`), and `std::filesystem`'s
+calls into libc are rewritten like the engine's: the hint's rename,
+vacuum's removal of the file it compacted, the removal of stale `.tmp`
+files at open, `file_size`, `exists`, the directory scan at open. Using one
+filesystem operation pulls in libstdc++'s whole object for them, so the
+binary references more than the engine calls: `openat`, `read`, `writev`,
+`sendfile`, `copy_file_range`, `truncate`, `lstat`, `rename`, `unlinkat`,
+`remove`, `mkdir`, `symlink`, `utimensat`, `fchmod`, `fchmodat`,
+`realpath`, `opendir`, `readdir`, `fopen` and `freopen` have interposers
+beside the engine's own `open`, `pread`, `pwrite`, `pwritev`, `write`,
+`fdatasync`, `fsync`, `ftruncate`, `fstat`, `stat`, `renameat2`, `link`,
+`unlink` and `mmap`. Some come only from the MemorySanitizer build's libc++
+(`opendir`, `copy_file_range`). `remove`,
+`realpath` and `fopen` call `unlink`, `lstat` and `open` inside libc,
+through aliases `--wrap` cannot see, so they are wrapped themselves.
 
 `xmake.lua` also passes `--wrap` for the other spellings of those calls
-(`pread64`, `openat`, `rename`, the `_FORTIFY_SOURCE` variants, …) without
-defining an interposer for them, so a reference to one fails the link. A
-new kind of call cannot join the engine uncounted, and a toolchain that
-spells a call differently is noticed. The first test in the file checks the
-other direction: that a put's append and sync are in fact counted.
+(`pread64`, `openat64`, `renameat`, `mkdirat`, glibc's old `__xstat`, the
+`_FORTIFY_SOURCE` variants, …) and for calls nothing references yet
+(`fallocate`, `splice`, …), without defining an interposer for
+them, so a reference to one fails the link. With the standard library in
+the link the guard is complete: an I/O call cannot join the binary
+uncounted, from the engine or from a `std::filesystem` operation it starts
+using, and a toolchain that spells a call differently is noticed. An I/O
+call here opens, reads, writes, syncs, sizes, maps, lists or changes a file
+or a directory entry; the rest (`close`, `lseek`, `flock`,
+`posix_fadvise`, `readlink` of `/proc/self/fd`, `statvfs`, stdio past the
+open, …) are listed in `xmake.lua` as left out. The first two tests in the
+file check the other direction: that a put's append and sync are in fact
+counted, and that `std::filesystem`'s `stat`, `openat`, `mkdir`, `rename`
+and `remove` are.
 
 **Passes.** Each pass counts only the calls it can fail, so N indexes a
 different sequence in each.
@@ -1695,8 +1722,8 @@ different sequence in each.
 | Pass | The N-th call | Counts |
 |---|---|---|
 | before | is not made, and reports `EIO` | every wrapped call |
-| after | is made, then reports `EIO`: the bytes, the cut or the rename landed | `pwrite`, `pwritev`, `write`, `fdatasync`, `fsync`, `ftruncate`, `renameat2`, `link`, `unlink` |
-| short | transfers half of what was asked | `pread`, `pwrite`, `pwritev`, `write` |
+| after | is made, then reports `EIO`: the bytes, the cut or the rename landed | the writes, the syncs, and the calls that change a file's size or a directory entry: `ftruncate`, `truncate`, `renameat2`, `rename`, `link`, `unlink`, `unlinkat`, `remove`, `mkdir`, … |
+| short | transfers half of what was asked | `pread`, `read`, `pwrite`, `pwritev`, `write`, `writev`, `sendfile`, `copy_file_range` |
 | cascade | and every counted call after it fail as in *before* | every wrapped call |
 
 An `fdatasync` failed *before* leaves its pages clean and unwritten in the
@@ -1723,17 +1750,23 @@ their own opens, probes, fills and maps.
 | `del` | the same | 4, 2, 2 |
 | `del_range` | the same | 8, 2, 2 |
 | `apply_batch`: puts, a delete, a range delete | the same | 13, 4, 4 |
-| a put that fills the active file | the same, `max_file_bytes = 512` | 21, 22, 22 |
-| `vacuum` | a sealed file with a dead entry | 23, 22, 21 |
-| `create_manifest` | one file | 17, 19, 19 |
+| a put that fills the active file | the same, `max_file_bytes = 512` | 25, 26, 26 |
+| `vacuum` | a sealed file with a dead entry | 29, 28, 27 |
+| `create_manifest` | one file | 21, 23, 23 |
 | `ingest` of a put and a batch | a follower holding the first slice | 15, 5, 5 |
-| `resume()` | degraded by a failed commit sync: the entry whole, unsynced | 40, 23, 23 |
-| `resume()` | degraded by a short append: the entry torn | 38, 23, 23 |
-| `close()` | an unsynced batch behind it | 11, 11, 11 |
-| `DB::open`, serial | three sealed files and their hints, after a clean close | 66, 90, 57 |
-| `DB::open`, parallel | the same | 78, 102, 69 |
-| `DB::open`, serial | the same, as a killed process leaves it: the newest file hint-less | 75, 101, 66 |
-| `DB::open`, parallel | the same | 87, 113, 78 |
+| `resume()` | degraded by a failed commit sync: the entry whole, unsynced | 46, 29, 29 |
+| `resume()` | degraded by a short append: the entry torn | 44, 29, 29 |
+| `close()` | an unsynced batch behind it | 13, 13, 13 |
+| `DB::open`, serial | three sealed files and their hints, after a clean close | 107, 131, 98 |
+| `DB::open`, parallel | the same | 119, 143, 110 |
+| `DB::open`, serial | the same, as a killed process leaves it: the newest file hint-less | 116, 142, 107 |
+| `DB::open`, parallel | the same | 128, 154, 119 |
+
+The `std::filesystem` calls account for the rise over the counts before
+the static link (#319): the hint's `exists` check and rename on every
+operation that writes a hint, vacuum's two removes, `resume()`'s size
+checks, and at open the directory scans, one `readdir` per entry, which
+are most of the 41 more calls an open makes.
 
 **Invariants.** They need no expected delta per failure class, which is
 what makes an operation cheap to add. After a failure at any N:
@@ -1775,29 +1808,33 @@ so the next open lost its keys. No checkpoint named the call. Both now
 throw (`sealed_file_size`), and the `sealed_fstat_failure_reads_empty`
 mutation reverts it.
 
+Counting `std::filesystem`'s calls (#319) found no failure the invariants
+reject. It did show that `create_manifest` returns a manifest naming a
+hint whose write failed, against `CONTRACT.md`'s *File list accuracy*. The
+same was already true of a failed `write` or `fdatasync` of the hint, and
+no invariant checks the manifest's file list (#349). The
+`rewrite_size_failure_reads_empty` mutation shows that a newly counted
+site is reached: read as an empty file, a failed `file_size` in
+`rewrite_durably` lets `resume()` build a hint over pages the device does
+not hold, and the sweep rejects it.
+
 **Limits.**
 
-- *Calls inside shared libraries are not counted.* `--wrap` rewrites the
-  references in this binary's objects, not libstdc++'s, so everything the
-  engine does through `std::filesystem` is neither counted nor failed: the
-  hint's rename, vacuum's removal of the file it compacted, the removal of
-  stale `.tmp` files, `file_size`, `exists`, `create_directories`. The named
-  checkpoints (`io_hint_rename`, `io_vacuum_compact_unlink`) and the chaos
-  rig remain their cover (#319).
+- *Calls glibc makes inside itself are not counted.* `--wrap` sees the
+  public function, not what it calls through an internal alias, so a
+  stream's reads and writes after `fopen` are not counted. The engine uses
+  no stdio.
 - *Linux only.* Apple's linker has no `--wrap`, so on macOS `bytecask_tests`
   is built without `tests/syscall_faults.cpp` and `tests/fault_sweep_test.cpp`.
-- *The link guard is off where libstdc++ is partly static.* manylinux's
-  gcc-toolset links part of `std::filesystem` from `libstdc++_nonshared.a`
-  into the binary, so its `openat`, `rename`, `unlinkat`, `symlink` and
-  `sendfile` would fail the guard although the engine makes none of them.
-  The wheel build configures `--fault_sweep_link_guard=n`; `ci.yml` keeps
-  the guard. There the archived `std::filesystem` calls that are wrapped
-  (`stat`, `unlink`, …) are counted too. The MemorySanitizer build is the
-  same case: its instrumented libc++ is static (`build_msan_libcxx.sh`), so
-  `std::filesystem` and `random_device` bring `read`, `lstat`, `openat`,
-  `rename`, … into the binary, and `xmake.lua` drops the guard whenever
-  `--sanitizer` includes `memory` (#327). The sweep still runs there; the
-  ASan, TSan and UBSan legs and `ci.yml`'s build keep the guard.
+- *The link guard is off on glibc older than 2.33.* There `<sys/stat.h>`
+  turns `stat`, `fstat` and `lstat` into `__xstat`, `__fxstat` and
+  `__lxstat`, which have no interposer: a newer glibc keeps them only as
+  compatibility symbols, so an interposer calling through to them would not
+  link where CI builds. The manylinux_2_28 wheel build, on glibc 2.28,
+  configures `--fault_sweep_link_guard=n`, and there those calls go
+  uncounted. Every other build keeps the guard, MemorySanitizer's included:
+  its libc++ was static before the rest of the binary's standard library
+  was, and it no longer needs the exception it had (#327).
 - *`mmap` reads cannot be failed this way.* A failed mapped read is a
   `SIGBUS`, not a return value. The `mmap` call itself is counted, and on
   the mmap back-end failed.
@@ -2359,6 +2396,7 @@ A site whose break nothing has to catch says why instead.
 | `rotate_active_file`: `shrink_to_fit` cuts the preallocated tail and syncs the length | not needed: a sealed file's zero tail costs space, not data; open drops a zero tail past the last record (`recovery_check_tail`), and the rotation `fdatasync` before it has already made the data durable | — | — |
 | `create_active_file`: the directory sync before the first write into a new file (open, rotation, `resume()`) | `directory sync: a failed sync at rotation degrades …`, `… in resume() stays degraded`, `… open fails when the active file's entry cannot be synced` | `no_dir_sync_new_data_file` (chaos) | #199 |
 | `sealed_file_size`: a sealed file whose `fstat` fails is not opened as an empty one | `fault sweep: write across a rotation` | `sealed_fstat_failure_reads_empty` | #317 |
+| `rewrite_durably`: a file whose `file_size` fails is not rewritten as an empty one | `fault sweep: resume after a failed sync` | `rewrite_size_failure_reads_empty` | #319 |
 | rotation: a new file that cannot be created degrades | `*rotation_file_creation_fails` | `rotation_create_failure_not_degraded` | — |
 | `createDataFileForWrite`: a reused file name panics instead of reopening a live file | `createDataFileForWrite panics when the data file already exists` | `data_file_create_not_exclusive` | #35 |
 | `renameDataFileExclusive`: vacuum's copy never replaces a file holding its name | `renameDataFileExclusive panics rather than replacing a live file` | `data_file_rename_replaces` | #35 |
@@ -2724,9 +2762,10 @@ registering it, and a named one does not. So both run: the
 [*Counted fault sweep*](#counted-fault-sweep) fails each I/O call of an
 operation in turn, counted below the engine with `--wrap`, and holds the
 result to invariants that need no expected delta; the named checkpoints
-keep the per-class deltas. Unlike SQLite, which counts through its own
-VFS, the sweep cannot count what the engine does inside libstdc++
-(#319). SQLite's crash tests, which
+keep the per-class deltas. SQLite counts through its own VFS; the sweep
+counts at the libc boundary, and links the C++ standard library
+statically so that what the engine does through `std::filesystem` crosses
+it in the binary (#319). SQLite's crash tests, which
 run on a VFS that drops or damages unsynced writes at a simulated crash,
 are the ancestor of `PageCacheModel`.
 

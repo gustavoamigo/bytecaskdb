@@ -52,7 +52,7 @@ jobs:
         run: |
           dnf install -y \
             clang llvm llvm-devel lld \
-            libcxx libcxx-devel \
+            libcxx libcxx-devel libstdc++-static \
             xmake cmake \
             python3-pip python3-devel \
             git ninja-build
