@@ -513,6 +513,7 @@ export struct KeyReader {
 inline auto key_read_buffer() -> std::vector<std::byte> & {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
+  // TLS: scratch — this call's records; keeps the largest record's size (#384).
   thread_local std::vector<std::byte> buf;
 #pragma clang diagnostic pop
   return buf;

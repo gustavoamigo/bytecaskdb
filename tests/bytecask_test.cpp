@@ -13610,6 +13610,33 @@ TEST_CASE("commit delay: a synced commit waits once the last flush covered two",
   CHECK(db.contains_key({}, to_bytes("k")));
 }
 
+// The round trip is per thread and per DB. A DB opened in the storage of a
+// destroyed one has its address, and once named its DB by address, a
+// thread's first synced commit there was timed from its last commit on the
+// dead DB.
+TEST_CASE("commit delay: a DB at a destroyed DB's address does not inherit "
+          "its round trip",
+          "[pipeline][commit_delay][tls]") {
+  TempDir td;
+  alignas(bytecask::DB) std::array<std::byte, sizeof(bytecask::DB)> storage{};
+  auto *a = ::new (storage.data()) bytecask::DB{bytecask::DB::open(td.path / "a")};
+  a->put({.sync = true}, to_bytes("k"), to_bytes("v"));
+  std::destroy_at(a);
+
+  auto *b = ::new (storage.data()) bytecask::DB{bytecask::DB::open(td.path / "b")};
+  REQUIRE(static_cast<void *>(b) == static_cast<void *>(a));
+  // Any round trip shorter than the fsync estimate is taken as a sample.
+  b->test_commit_delay().on_sync_end(1h);
+  b->put({.sync = true}, to_bytes("k"), to_bytes("v"));
+  CHECK(b->test_commit_delay().round_trip_estimate() ==
+        std::chrono::steady_clock::duration::zero());
+  // The next commit on b is this thread's second there: it is timed.
+  b->put({.sync = true}, to_bytes("k2"), to_bytes("v"));
+  CHECK(b->test_commit_delay().round_trip_estimate() >
+        std::chrono::steady_clock::duration::zero());
+  std::destroy_at(b);
+}
+
 // Barriers flush to make state durable, not to batch: they take the flush
 // role through quiesce(), which never waits, however the policy is primed.
 TEST_CASE("commit delay: barriers never wait",

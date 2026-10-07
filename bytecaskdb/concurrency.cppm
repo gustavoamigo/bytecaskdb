@@ -174,6 +174,8 @@ public:
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
       // Reused so an inline commit allocates nothing here.
+      // TLS: scratch — the slots of the batch this thread runs; cleared once
+      // they are released.
       thread_local std::vector<Slot *> batch;
 #pragma clang diagnostic pop
       run_batch(lk, batch);
@@ -195,6 +197,7 @@ public:
       if (wake) committer_cv_.notify_one();
 #endif
       release(batch, &slot);
+      batch.clear();  // its slots belong to callers that may now return
     }
     if (slot.err) std::rethrow_exception(slot.err);
   }

@@ -561,8 +561,10 @@ struct WritableFileOps {
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
+    // TLS: scratch — this write's headers, at most max_entries.
     thread_local std::vector<std::array<std::byte, kHeaderSize + kCrcSize>>
         hdr_crcs;
+    // TLS: scratch — addresses into this write's entries, rebuilt per call.
     thread_local std::vector<::iovec> iov;
 #pragma clang diagnostic pop
 
@@ -697,6 +699,7 @@ struct WritableFileOps {
     static constexpr std::size_t kBuf = 1024 * 1024;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
+    // TLS: process — constant zeros.
     thread_local const std::vector<std::byte> zeros(kBuf, std::byte{0});
 #pragma clang diagnostic pop
     for (auto off = zeroed_end_; off < target;) {

@@ -752,6 +752,8 @@ auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
     // Thread-exit destructor is intentional; suppress the Clang diagnostic.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
+    // TLS: scratch — this fill's bytes; keeps the largest fill run's size
+    // (#384).
     thread_local AlignedScratch scratch;
 #pragma clang diagnostic pop
     const auto run_len = static_cast<std::size_t>(run_end - run_start);

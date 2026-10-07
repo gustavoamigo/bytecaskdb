@@ -184,6 +184,10 @@ private:
 - If you see a `// WARNING:` comment excusing a lifetime hazard, treat it as a required design fix, not permanent documentation. Removing the hazard is always the goal.
 - When in doubt, return an owned value (`std::vector<std::byte>`, `std::string`). The borrow optimisation is only worth it when profiling identifies it as a real bottleneck.
 
+### Thread-local state
+
+A `thread_local` outlives every DB its thread touches, so one holding a DB's state or recognising a DB by address leaks across instances (BC-243, #306). Tag every `thread_local` in engine and binding code with a `TLS: scratch|process|per-DB` comment on it or in the comment block above; `scripts/check_thread_local.py` fails CI otherwise. Prefer `scratch` or `process`. A `per-DB` one must not match a later DB opened at a dead one's address — name the DB by `DB::instance_id_`, or have `close()` and `~DB` release it — and its tag names the test proving that. See `docs/bytecask_design.md`, *Per-thread state*.
+
 ### Clang warnings to avoid (-Weverything is enabled)
 - **CTAD on standard lock types** (`-Wctad-maybe-unsupported`): Always write the explicit template argument for `std::lock_guard` and `std::unique_lock`: `std::lock_guard<std::mutex>`, `std::unique_lock<std::mutex>`. Never rely on CTAD for these types.
 - **`[[nodiscard]]` ignored** (`-Wunused-result`): Never silently discard the return value of a `[[nodiscard]]` function. In tests where the value is intentionally unused, cast to `void`: `(void)db.del(...)`. In production code, handle or assign the result.

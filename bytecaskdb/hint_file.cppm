@@ -130,6 +130,7 @@ auto thread_dctx() -> ZSTD_DCtx & {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
   // The destructor is wanted: it frees the context when the thread exits.
+  // TLS: process — a decompression context; no DB data.
   thread_local const std::unique_ptr<ZSTD_DCtx, ZstdDCtxFree> ctx{
       ZSTD_createDCtx()};
 #pragma clang diagnostic pop
@@ -144,6 +145,7 @@ auto thread_packed_frame() -> std::vector<std::byte> & {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
   // The destructor is wanted: it frees the buffer when the thread exits.
+  // TLS: scratch — one compressed frame; keeps the largest frame's size (#384).
   thread_local std::vector<std::byte> buf;
 #pragma clang diagnostic pop
   return buf;
