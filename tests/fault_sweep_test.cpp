@@ -229,6 +229,10 @@ struct Operation {
   // Runs the operation again after the fault, as a caller that got the error
   // would. Whatever the failure left, the whole transition must follow.
   std::function<void(DB &)> retry{};
+  // Checks what a run that returned produced, given the whole transition,
+  // once the fault is disarmed: a check run under it would have its own
+  // calls counted and failed.
+  std::function<void(const KeyValues &)> returned{};
 };
 
 auto one_of(const KeyValues &got, const std::vector<KeyValues> &states)
@@ -275,6 +279,7 @@ auto sweep_step(const Operation &op, const Pass &pass, int n) -> bool {
     trace(op.name, pass, n, rep, threw);
     INFO(op.name << ", fault " << pass.name << ", N = " << n << ": "
                  << (rep.fired ? rep.what : "not reached"));
+    if (!threw && op.returned) op.returned(after);
     if (!rep.fired) {
       REQUIRE_FALSE(threw);
       REQUIRE(did_work);
@@ -551,9 +556,38 @@ TEST_CASE("fault sweep: vacuum", "[fault_sweep]") {
 }
 
 TEST_CASE("fault sweep: create_manifest", "[fault_sweep]") {
+  auto listed = std::make_shared<std::vector<bytecask::FileInfo>>();
   sweep({.name = "create_manifest",
          .setup = seed,
-         .run = [](DB &db) { return !db.create_manifest().files.empty(); },
+         .run =
+             [listed](DB &db) {
+               auto m = db.create_manifest();
+               *listed = std::move(m.files);
+               return !listed->empty();
+             },
+         // Every listed data file exists. A hint may not, when the worker
+         // failed to write it (#349): copying what is there must still open
+         // to the manifest's state, the missing hint rebuilt by the open.
+         .returned =
+             [listed](const KeyValues &expected) {
+               REQUIRE_FALSE(listed->empty());
+               const auto dest =
+                   listed->front().data_path.parent_path().parent_path() /
+                   "from_manifest";
+               std::filesystem::create_directories(dest);
+               for (const auto &f : *listed) {
+                 INFO("manifest file " << f.file_id);
+                 REQUIRE(std::filesystem::exists(f.data_path));
+                 std::filesystem::copy_file(f.data_path,
+                                            dest / f.data_path.filename());
+                 if (std::filesystem::exists(f.hint_path))
+                   std::filesystem::copy_file(f.hint_path,
+                                              dest / f.hint_path.filename());
+               }
+               auto copy = DB::open(dest, {});
+               check_key_values(key_values(copy), expected,
+                                "a DB opened from the manifest's files");
+             },
          .transition = [](KeyValues kv) { return kv; }});
 }
 

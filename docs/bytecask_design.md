@@ -1456,7 +1456,9 @@ public:
     // ── Manifest ──────────────────────────────────────────────────────────
 
     // Rotates the active file, waits for all hint files, and returns a
-    // manifest of sealed files with a snapshot. Forces file rotation.
+    // manifest of sealed files with a snapshot. Forces file rotation. A
+    // listed hint may be missing, if its write failed; opening the copied
+    // files rebuilds it.
     // Vacuum must not run between create_manifest() and file transfer
     // completion (caller responsibility).
     [[nodiscard]] auto create_manifest() -> FileManifest;
@@ -1750,7 +1752,7 @@ Every sync of the active file degrades the engine when it fails, whatever called
 ### Leader-side: `durable_sequence`, `create_manifest`, `changes_since`
 
 - `durable_sequence(min_sequence, timeout)` — the single sequence primitive (renamed from `current_sequence` — BC-231). Blocks until the durable sequence reaches at least `min_sequence` or the timeout expires, then returns the durable sequence; `min_sequence = 0`/an already-reached target/a nonpositive timeout return immediately without blocking (useful for polling replicas or waking a replication loop only when the leader is genuinely ahead).
-- `create_manifest()` — rotates the active file, waits for all hint files, and returns a `FileManifest` of sealed files with a snapshot. Used for initial bootstrap.
+- `create_manifest()` — rotates the active file, waits for all hint files, and returns a `FileManifest` of sealed files with a snapshot. Used for initial bootstrap. Every listed data file exists; a hint may not, since the background worker only logs a failed hint write. That is safe because a hint is a rebuildable index: the receiver's open writes the hint of any data file that lacks one, at the cost of one scan of that file. The manifest builds `hint_path` from the file's name rather than checking it, and callers copy a hint only when it exists (#349).
 - `changes_since(seq, snap)` — returns a lazy `ChangeIterator` that walks sealed files in sequence order, yielding `DataEntryView` entries with `sequence > seq`. Constant memory — scans one entry at a time.
 
 ### Follower-side: `ingest`

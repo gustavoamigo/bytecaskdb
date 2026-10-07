@@ -1194,7 +1194,9 @@ public:
       -> std::uint64_t;
 
   // Rotates the active file, waits for all hint files, and returns a
-  // manifest of sealed files with a snapshot. Forces file rotation.
+  // manifest of sealed files with a snapshot. Forces file rotation. A
+  // listed hint may be missing, if its write failed; opening the copied
+  // files rebuilds it.
   // Vacuum must not run between create_manifest() and file transfer
   // completion (caller responsibility).
   [[nodiscard]] auto create_manifest() -> FileManifest;

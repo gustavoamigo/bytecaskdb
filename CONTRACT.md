@@ -528,9 +528,13 @@ capture.
 
 ### File list accuracy
 
-Every file in `FileManifest::files` exists on disk with both `.data` and
-`.hint` paths at the time of return. `worker_.drain()` ensures hint
-generation has completed before building the file list.
+Every `data_path` in `FileManifest::files` exists on disk at the time of
+return. `worker_.drain()` waits for hint generation to finish before the
+list is built, but a `hint_path` may name a file that does not exist: the
+worker only logs a failed hint write. A missing hint costs no data. A hint
+is a rebuildable index, and the open of a directory holding the copied
+files writes the hint of any data file that has none (#349). A caller
+copies a hint when it exists and skips it when it does not.
 
 ### Caller responsibility
 
