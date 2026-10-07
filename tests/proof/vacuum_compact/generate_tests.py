@@ -138,11 +138,52 @@ def gen_vacuum_call(
         "    // durable fails (#261). The engine degrades and vacuum throws before\n"
         "    // committing; the old file stays."
         if failure == VacuumCompactFailureClass.VC7
+        else "\n    // VC8: the staging copy's shrink_to_fit fails (#258). Old file\n"
+        "    // remains in state, and vacuum removes the staging copy."
+        if failure == VacuumCompactFailureClass.VC8
+        else "\n    // VC9: renameat2 lacks RENAME_NOREPLACE, link() places the copy and\n"
+        "    // the unlink() of the staged name fails (#258).\n"
+        "    // renameDataFileExclusive takes the placed name back, and vacuum\n"
+        "    // removes the staged one: nothing is left."
+        if failure == VacuumCompactFailureClass.VC9
+        else "\n    // VC10: as VC9, under a fault that fails every unlink and remove:\n"
+        "    // the take-back and the cleanup fail too, and both names stay for\n"
+        "    // the next open to remove."
+        if failure == VacuumCompactFailureClass.VC10
         else ""
     )
 
     if fault is None:
         return f"    REQUIRE(db.vacuum({opts}));"
+
+    if fault.syscall_rules:
+        rules = []
+        for r in fault.syscall_rules:
+            fields = [
+                f'.call = "{r.call}"',
+                ".mode = bytecask::testing::SyscallFault::before",
+                f".nth = {r.nth}",
+            ]
+            if r.cascade:
+                fields.append(".cascade = true")
+            if r.err:
+                fields.append(f".err = {r.err}")
+            rules.append("         {" + ", ".join(fields) + "}")
+        lines = [
+            f"    {{{vc4_comment}",
+            "      bytecask::testing::ScopedSyscallFaults faults{",
+            "        dir,",
+            "        {" + ",\n".join(rules).lstrip() + "}};",
+            f"      REQUIRE_THROWS_AS(db.vacuum({opts}), std::system_error);",
+            "      const auto report = faults.report();",
+            "      // The fallback was reached, and its unlink() is what failed.",
+            f"      REQUIRE(report.failed.size() >= {len(fault.expected_failed)});",
+        ]
+        for i, (prefix, suffix) in enumerate(fault.expected_failed):
+            lines.append(f'      CHECK(report.failed[{i}].starts_with("{prefix}"));')
+            lines.append(f'      CHECK(report.failed[{i}].ends_with("{suffix}"));')
+        lines.append("    }")
+        return "\n".join(lines)
 
     nth = (
         f"\n      fi.inj.fail_on_nth_match = {fault.nth};" if fault.nth else ""
@@ -176,10 +217,20 @@ def gen_test(
     fault = resolve_compact_fault(state, failure)
     name = f"prove_vacuum_compact__{state.label}__{failure.value}"
 
-    parts: List[str] = []
-    if state.io_backend != "pread":
+    # The guard the cell is compiled under, if any.
+    guard = None
+    if fault is not None and fault.syscall_rules:
+        # The interposers behind ScopedSyscallFaults are linked on Linux only.
+        guard = "BYTECASK_SYSCALL_FAULTS"
+    elif state.io_backend != "pread":
         # WASM/Emscripten builds reject every non-pread back-end (see
         # DB::open); these buffered/mmap variants only make sense natively.
+        guard = "__EMSCRIPTEN__"
+
+    parts: List[str] = []
+    if guard == "BYTECASK_SYSCALL_FAULTS":
+        parts.append("#ifdef BYTECASK_SYSCALL_FAULTS")
+    elif guard:
         parts.append("#ifndef __EMSCRIPTEN__")
     parts.append(f'TEST_CASE("{name}", "[prove_vacuum_compact]") {{')
     parts.append("  TempDir td;")
@@ -200,18 +251,26 @@ def gen_test(
     parts.append(gen_vacuum_call(fault, failure))
     parts.append("")
     parts.append(gen_assertions(delta))
-    # Every cell, thrown or not: no staging copy outlives the vacuum call.
-    parts.append("    CHECK(staging_data_files(dir).empty());")
-    # Every cell but VC5, whose source stays on disk after the commit: no
-    # copy outlives an uncommitted vacuum either (#304).
-    if failure != VacuumCompactFailureClass.VC5:
-        parts.append("    CHECK(unreferenced_files(db, dir).empty());")
+    if delta.copy_left:
+        # A fault that fails every removal: the copies are the next open's.
+        parts.append("    CHECK_FALSE(staging_data_files(dir).empty());")
+        parts.append("    CHECK_FALSE(unreferenced_files(db, dir).empty());")
+    else:
+        # Every other cell, thrown or not: no staging copy outlives the
+        # vacuum call.
+        parts.append("    CHECK(staging_data_files(dir).empty());")
+        # And but for VC5, whose source stays on disk after the commit, no
+        # copy outlives an uncommitted vacuum either (#304).
+        if failure != VacuumCompactFailureClass.VC5:
+            parts.append("    CHECK(unreferenced_files(db, dir).empty());")
     parts.append("    watermark = durable_watermark(db);")
     parts.append("    cache.model.copy_device(dir, cut);  // power cut")
     parts.append("  }")
     parts.append("  assert_hints_durable(cache.model);")
     opts = _build_open_opts(state)
     parts.append(f"  assert_vacuum_recoverable(dir, before, {{{opts}}});")
+    if delta.copy_left:
+        parts.append("  CHECK(staging_data_files(dir).empty());  // the open removed it")
     # The cut copy: the durable baseline, alone or with every overwrite, and
     # with them once the watermark covers them. A key gone is #245.
     last_seq = (
@@ -225,8 +284,8 @@ def gen_test(
     parts.append(f"       .watermark = watermark}},")
     parts.append(f"      {{{opts}}});")
     parts.append("}")
-    if state.io_backend != "pread":
-        parts.append("#endif  // __EMSCRIPTEN__")
+    if guard:
+        parts.append(f"#endif  // {guard}")
     return "\n".join(parts)
 
 
@@ -254,7 +313,10 @@ FILE_HEADER = """\
 // only sync = false writes supersede. Every cell cuts the power after the
 // vacuum (#265) and recovers the directory as the device held it: the durable
 // baseline must be there, with every overwrite or with none.
+// VC8-VC10 (#258) fail the staging copy's shrink, and the unlink() in
+// renameDataFileExclusive's link() fallback, once and for good.
 
+#include <cerrno>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -264,6 +326,13 @@ FILE_HEADER = """\
 #include "fault_injector.h"
 #endif
 #include <catch2/catch_test_macros.hpp>
+
+// The interposers behind ScopedSyscallFaults are linked on Linux only
+// (xmake.lua), so the cells that use them are compiled there only.
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+#define BYTECASK_SYSCALL_FAULTS
+#include "syscall_faults.h"
+#endif
 
 import bytecask;
 

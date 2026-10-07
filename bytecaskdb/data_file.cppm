@@ -1627,7 +1627,9 @@ export [[nodiscard]] inline auto createDataFileForWrite(
 // The refusal has to be part of the placement itself.
 //
 // Panics on a name already in use, for the same reason createDataFileForWrite
-// does; any other failure is an ordinary I/O error and throws.
+// does; any other failure is an ordinary I/O error and throws. A throw means
+// nothing was placed, on the fallback path as on renameat2's, as far as a
+// removal under the same fault allows (#258).
 export void renameDataFileExclusive(const std::filesystem::path &from,
                                     const std::filesystem::path &to) {
 #if defined(__linux__) && defined(RENAME_NOREPLACE)
@@ -1656,8 +1658,16 @@ export void renameDataFileExclusive(const std::filesystem::path &from,
                     from.string(), to.string())};
   }
   if (::unlink(from.c_str()) != 0) {
+    const auto err = errno;
+    // The link placed the file and the call is about to report it was not.
+    // Take the target back so the caller's view holds: vacuum's cleanup
+    // removes the staged name and would leave the placed one, a full copy
+    // per retry. `to` is ours to remove, as link() just created it. Under a
+    // fault that fails this too, both names stay for recovery, which deletes
+    // a .data.tmp and a placed copy beside its source at open.
+    (void)::unlink(to.c_str());
     throw std::system_error{
-        errno, std::generic_category(),
+        err, std::generic_category(),
         std::format("renameDataFileExclusive: cannot unlink '{}'",
                     from.string())};
   }

@@ -64,6 +64,19 @@ class VacuumCompactFailureClass(Enum):
     # the compaction path (the first is the staging copy's), the first on the
     # whole-file path. Vacuum degrades and throws without committing.
     VC7 = "durability_sync_fails"
+    # The staging copy's shrink_to_fit, between its sync and the rename
+    # (#258): io_vacuum_compact_shrink.
+    VC8 = "shrink_fails"
+    # renameDataFileExclusive's fallback, for a filesystem without
+    # RENAME_NOREPLACE (#258): renameat2 fails with EINVAL, link() places the
+    # copy, and the unlink() of the staged name fails. The function takes the
+    # placed name back before it throws, so nothing is left. Injected below
+    # the engine (ScopedSyscallFaults), so Linux only.
+    VC9 = "fallback_unlink_fails"
+    # The same under a fault that fails every unlink and remove in the
+    # directory: the take-back and vacuum's cleanup fail too, both names stay,
+    # and the next open removes them.
+    VC10 = "fallback_unlink_persistent"
 
 
 # Compact path is now always used for files with live_bytes > 0.
@@ -171,7 +184,7 @@ def is_valid_combination(
     if failure == VacuumCompactFailureClass.VC7:
         return state.has_unsynced_superseder
     # The whole-file path writes no staging copy, so it never makes the calls
-    # VC1-VC4 and VC6 fault. It commits and unlinks, so VC5 applies.
+    # VC1-VC4, VC6 and VC8-VC10 fault. It commits and unlinks, so VC5 applies.
     if state.whole_file:
         return failure in (
             VacuumCompactFailureClass.SUCCESS,

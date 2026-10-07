@@ -1204,6 +1204,83 @@ TEST_CASE("renameDataFileExclusive throws on any other rename error",
   std::filesystem::remove_all(dir);
 }
 
+// The fallback's link() placed the file and its unlink() of the staged name
+// failed: the call throws, so it takes the placed name back (#258). Vacuum's
+// cleanup removes only the staged name, and a placed copy left behind would
+// stay until the next open, one per retry.
+TEST_CASE("renameDataFileExclusive takes the placement back when the staged "
+          "name cannot be unlinked",
+          "[data_file]") {
+  using bytecask::testing::SyscallFault;
+  const auto dir = std::filesystem::temp_directory_path() / "bc_test_place_ul";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const auto from = dir / "staged.data.tmp";
+  const auto to = dir / "staged.data";
+  { std::ofstream f{from}; f << "compacted"; }
+
+  {
+    bytecask::testing::ScopedSyscallFaults faults{
+        dir,
+        {{.call = "renameat2",
+          .mode = SyscallFault::before,
+          .nth = 1,
+          .cascade = true,
+          .err = EINVAL},
+         {.call = "unlink", .mode = SyscallFault::before, .nth = 1}}};
+    CHECK_THROWS_AS(bytecask::renameDataFileExclusive(from, to),
+                    std::system_error);
+    const auto report = faults.report();
+    REQUIRE(report.failed.size() == 2);
+    CHECK(report.failed[1] == "unlink(" + from.string() + ")");
+  }
+
+  CHECK(std::filesystem::file_size(from) == 9);  // as before the call
+  CHECK_FALSE(std::filesystem::exists(to));
+  std::filesystem::remove_all(dir);
+}
+
+// The same, under a fault that fails the take-back too: both names stay, for
+// recovery to remove, and the error reported is the first unlink's (EROFS),
+// not the take-back's (EIO).
+TEST_CASE("renameDataFileExclusive leaves both names when the take-back "
+          "fails too",
+          "[data_file]") {
+  using bytecask::testing::SyscallFault;
+  const auto dir = std::filesystem::temp_directory_path() / "bc_test_place_ul2";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const auto from = dir / "staged.data.tmp";
+  const auto to = dir / "staged.data";
+  { std::ofstream f{from}; f << "compacted"; }
+
+  {
+    bytecask::testing::ScopedSyscallFaults faults{
+        dir,
+        {{.call = "renameat2",
+          .mode = SyscallFault::before,
+          .nth = 1,
+          .cascade = true,
+          .err = EINVAL},
+         {.call = "unlink", .mode = SyscallFault::before, .nth = 1,
+          .err = EROFS},
+         {.call = "unlink", .mode = SyscallFault::before, .nth = 2}}};
+    try {
+      bytecask::renameDataFileExclusive(from, to);
+      FAIL("renameDataFileExclusive returned");
+    } catch (const std::system_error &e) {
+      CHECK(e.code().value() == EROFS);
+    }
+    const auto report = faults.report();
+    REQUIRE(report.failed.size() == 3);
+    CHECK(report.failed[2] == "unlink(" + to.string() + ")");
+  }
+
+  CHECK(std::filesystem::file_size(from) == 9);
+  CHECK(std::filesystem::file_size(to) == 9);
+  std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("sync_directory takes EINVAL as done and throws on other errors",
           "[data_file]") {
   const auto dir = std::filesystem::temp_directory_path() / "bc_test_dirsync";

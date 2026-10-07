@@ -139,20 +139,24 @@ struct Ruling {
   int err{0};
 };
 
+struct Rule {
+  bytecask::testing::SyscallFaultRule spec;
+  int calls{0};
+};
+
 struct State {
   std::mutex mu;
   // The directory as the test named it and as the kernel names it; a path
   // argument is matched against both, a descriptor's link against the second.
   std::string dir;
   std::string real_dir;
-  SyscallFault mode{SyscallFault::none};
-  int nth{0};
-  bool cascade{false};
-  int err{0};
-  int calls{0};
+  std::vector<Rule> rules;
   bool fired{false};
   std::string what;
+  std::vector<std::string> failed;
 };
+
+constexpr std::size_t kMaxFailedReported = 16;
 
 // Read on every wrapped call, from any thread, before main and after exit.
 constinit std::atomic<bool> armed{false};
@@ -203,7 +207,12 @@ auto decide(const char *call, Kind kind, const char *path, int fd)
   }
   auto &s = state();
   const std::lock_guard<std::mutex> lk{s.mu};
-  if (!armed.load(std::memory_order_relaxed) || !counts(kind, s.mode)) {
+  const auto applies = [&](const Rule &r) {
+    return (r.spec.call.empty() || r.spec.call == call) &&
+           counts(kind, r.spec.mode);
+  };
+  if (!armed.load(std::memory_order_relaxed) ||
+      std::ranges::none_of(s.rules, applies)) {
     return {};
   }
   // A path the caller wrote is matched against the directory as the test
@@ -216,16 +225,27 @@ auto decide(const char *call, Kind kind, const char *path, int fd)
                     (as_written && under(target, s.dir));
   if (!ours) return {};
 
-  ++s.calls;
-  if (s.mode == SyscallFault::none) return {};
-  if (s.calls != s.nth && !(s.cascade && s.calls > s.nth)) {
-    return {};
+  // Every rule the call applies to counts it; the first to fail it wins.
+  Ruling ruling;
+  for (auto &r : s.rules) {
+    if (!applies(r)) continue;
+    ++r.calls;
+    if (ruling.verdict == Verdict::fail || r.spec.mode == SyscallFault::none) {
+      continue;
+    }
+    if (r.calls != r.spec.nth && !(r.spec.cascade && r.calls > r.spec.nth)) {
+      continue;
+    }
+    ruling = {Verdict::fail, r.spec.mode, r.spec.err};
   }
+  if (ruling.verdict == Verdict::pass) return ruling;
+  auto failed = std::string{call} + "(" + target + ")";
   if (!s.fired) {
     s.fired = true;
-    s.what = std::string{call} + "(" + target + ")";
+    s.what = failed;
   }
-  return {Verdict::fail, s.mode, s.err};
+  if (s.failed.size() < kMaxFailedReported) s.failed.push_back(std::move(failed));
+  return ruling;
 }
 
 auto halve(std::size_t n) -> std::size_t { return n > 1 ? n / 2 : n; }
@@ -271,7 +291,14 @@ namespace bytecask::testing {
 
 ScopedSyscallFaults::ScopedSyscallFaults(const std::filesystem::path &dir,
                                          SyscallFault mode, int nth,
-                                         bool cascade, int err) {
+                                         bool cascade, int err)
+    : ScopedSyscallFaults{dir, {{.mode = mode,
+                                 .nth = nth,
+                                 .cascade = cascade,
+                                 .err = err}}} {}
+
+ScopedSyscallFaults::ScopedSyscallFaults(const std::filesystem::path &dir,
+                                         std::vector<SyscallFaultRule> rules) {
   std::error_code ec;
   auto real = std::filesystem::weakly_canonical(dir, ec);
   if (ec) real = dir;
@@ -279,13 +306,11 @@ ScopedSyscallFaults::ScopedSyscallFaults(const std::filesystem::path &dir,
   const std::lock_guard<std::mutex> lk{s.mu};
   s.dir = dir.string();
   s.real_dir = real.string();
-  s.mode = mode;
-  s.nth = nth;
-  s.cascade = cascade;
-  s.err = err;
-  s.calls = 0;
+  s.rules.clear();
+  for (auto &spec : rules) s.rules.push_back({.spec = std::move(spec)});
   s.fired = false;
   s.what.clear();
+  s.failed.clear();
   armed.store(true, std::memory_order_release);
 }
 
@@ -295,7 +320,10 @@ auto ScopedSyscallFaults::report() -> SyscallFaultReport {
   auto &s = state();
   const std::lock_guard<std::mutex> lk{s.mu};
   armed.store(false, std::memory_order_release);
-  return {.calls = s.calls, .fired = s.fired, .what = s.what};
+  return {.calls = s.rules.empty() ? 0 : s.rules.front().calls,
+          .fired = s.fired,
+          .what = s.what,
+          .failed = s.failed};
 }
 
 }  // namespace bytecask::testing
