@@ -344,8 +344,14 @@ void run_rounds(Placement placement, std::uint64_t seed, int rounds,
 
 TEST_CASE("range conflicts match a model of the key range",
           "[model][range_conflict][del_range][guards]") {
+#ifdef __EMSCRIPTEN__
+  // Same-group placement submits from a second thread, which WASM lacks.
+  const auto placement =
+      GENERATE(Placement::Published, Placement::Vacuum, Placement::Resume);
+#else
   const auto placement = GENERATE(Placement::Published, Placement::SameGroup,
                                   Placement::Vacuum, Placement::Resume);
+#endif
   Counts counts;
   const int rounds = placement == Placement::Published ? 400 : 150;
   for (std::uint64_t seed = 1; seed <= 4; ++seed)

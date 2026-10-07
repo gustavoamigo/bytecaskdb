@@ -875,7 +875,7 @@ TEST_CASE("NodePool: a tree's freed nodes are reused by the next build",
 }
 
 TEST_CASE("NodePool: nodes freed on another thread are reused here",
-          "[btree][node_pool]") {
+          "[btree][node_pool][concurrency]") {
   if constexpr (!bytecask::btree_detail::kNodePoolEnabled) {
     SKIP("the node pool is compiled out under this sanitizer");
   }
@@ -893,7 +893,7 @@ TEST_CASE("NodePool: nodes freed on another thread are reused here",
 }
 
 TEST_CASE("NodePool: an exiting thread's cache stays available",
-          "[btree][node_pool]") {
+          "[btree][node_pool][concurrency]") {
   if constexpr (!bytecask::btree_detail::kNodePoolEnabled) {
     SKIP("the node pool is compiled out under this sanitizer");
   }

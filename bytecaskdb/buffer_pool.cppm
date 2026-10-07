@@ -85,7 +85,7 @@ export struct PoolFile {
 // some filesystems accept the flag at open and fail at read, so the open alone
 // proves nothing.
 export [[nodiscard]] inline auto open_uncached(
-    const std::filesystem::path &path, std::size_t file_size) -> int {
+    const std::filesystem::path &path, std::uint64_t file_size) -> int {
 #if defined(O_DIRECT) && !defined(__EMSCRIPTEN__)
   // Emscripten defines the flag, but its filesystems read through Node's fs
   // or linear memory: there is no uncached read to ask for.
@@ -281,14 +281,14 @@ public:
   //
   // Throws std::system_error if the underlying read fails or comes up short.
   void read_at(std::uint32_t file_id, PoolFile file, std::uint64_t offset,
-               std::size_t len, std::size_t file_size, std::byte *dst);
+               std::size_t len, std::uint64_t file_size, std::byte *dst);
 
   // read_at, except that the file ending first is not an error: returns how
   // many bytes from offset were read, short only where the file ends. Only
   // frames read whole are admitted. Throws std::system_error if a read fails.
   [[nodiscard]] auto read_upto(std::uint32_t file_id, PoolFile file,
                                std::uint64_t offset, std::size_t len,
-                               std::size_t file_size, std::byte *dst)
+                               std::uint64_t file_size, std::byte *dst)
       -> std::size_t;
 
   // Lends the resident bytes from offset to the end of its frame, or to
@@ -299,7 +299,7 @@ public:
   // note_hit() once it has used the span, since a span too short for its
   // entry sends it to read_at, which counts that read itself.
   [[nodiscard]] auto view(std::uint32_t file_id, std::uint64_t offset,
-                          std::size_t file_size, FrameLease &lease)
+                          std::uint64_t file_size, FrameLease &lease)
       -> std::span<const std::byte>;
   void note_hit() noexcept { counters_.hits.add(1); }
 
@@ -310,7 +310,7 @@ public:
   // to the hand. A reader still on the deleted file (a snapshot keeps its
   // descriptor open) fills what it needs again. file_size bounds the frames
   // to look up.
-  void release_file(std::uint32_t file_id, std::size_t file_size);
+  void release_file(std::uint32_t file_id, std::uint64_t file_size);
 
   // The active file's frames are never evicted: the hand skips them, and the
   // engine moves this at rotation (under the write lock), at which point the
@@ -704,7 +704,7 @@ private:
 
 void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
                          std::uint64_t offset, std::size_t len,
-                         std::size_t file_size, std::byte *dst) {
+                         std::uint64_t file_size, std::byte *dst) {
   if (read_upto(file_id, file, offset, len, file_size, dst) < len) {
     throw std::system_error{
         EIO, std::generic_category(),
@@ -716,7 +716,7 @@ void BufferPool::read_at(std::uint32_t file_id, PoolFile file,
 
 auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
                            std::uint64_t offset, std::size_t len,
-                           std::size_t file_size, std::byte *dst)
+                           std::uint64_t file_size, std::byte *dst)
     -> std::size_t {
   if (len == 0) return 0;
 
@@ -834,7 +834,7 @@ auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
 }
 
 auto BufferPool::view(std::uint32_t file_id, std::uint64_t offset,
-                      std::size_t file_size, FrameLease &lease)
+                      std::uint64_t file_size, FrameLease &lease)
     -> std::span<const std::byte> {
   lease.reset();
   if (offset >= file_size) return {};
@@ -855,7 +855,7 @@ void FrameLease::reset() noexcept {
   }
 }
 
-void BufferPool::release_file(std::uint32_t file_id, std::size_t file_size) {
+void BufferPool::release_file(std::uint32_t file_id, std::uint64_t file_size) {
   const auto frames = (file_size + kPoolFrameBytes - 1) / kPoolFrameBytes;
   std::lock_guard<std::mutex> lk{mu_};
   for (std::uint64_t n = 0; n < frames; ++n) {

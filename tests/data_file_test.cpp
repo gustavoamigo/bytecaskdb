@@ -236,6 +236,7 @@ TEST_CASE("WritableDataFile constructor: fresh file with no buffer",
   std::filesystem::remove(path);
 }
 
+#ifndef __EMSCRIPTEN__  // no mmap-backed data file in the WASM build
 TEST_CASE("WritableDataFile constructor: reopens existing file",
           "[data_file]") {
   const auto path =
@@ -254,7 +255,6 @@ TEST_CASE("WritableDataFile constructor: reopens existing file",
     file->sync();
   }
 
-  // Native builds request mmap; Emscripten always uses pread.
   auto file = bytecask::WritableMmapDataFile::create(path, 4096);
   CHECK(file->size() == entry_size);
 
@@ -266,15 +266,13 @@ TEST_CASE("WritableDataFile constructor: reopens existing file",
   CHECK(view.entry_type == bytecask::EntryType::Put);
   CHECK(std::equal(view.key.begin(), view.key.end(), key.begin()));
   CHECK(std::equal(view.value.begin(), view.value.end(), val.begin()));
-  // mmap lends a file-backed view; Emscripten's pread fallback owns it in io_buf.
-#ifdef __EMSCRIPTEN__
-  CHECK(!io_buf.empty());
-#else
+  // mmap lends a file-backed view: nothing is copied into io_buf.
   CHECK(io_buf.empty());
-#endif
 
   std::filesystem::remove(path);
 }
+
+#endif
 
 TEST_CASE("WritableDataFile constructor: throws on invalid path",
           "[data_file]") {
@@ -287,6 +285,7 @@ TEST_CASE("WritableDataFile constructor: throws on invalid path",
 // lend_record (unverified) — WritableDataFile
 // ---------------------------------------------------------------------------
 
+#ifndef __EMSCRIPTEN__  // no mmap-backed data file in the WASM build
 TEST_CASE("WritableDataFile::lend_record with mmap request",
           "[data_file]") {
   const auto path =
@@ -307,14 +306,11 @@ TEST_CASE("WritableDataFile::lend_record with mmap request",
   CHECK(view.entry_type == bytecask::EntryType::Put);
   CHECK(std::equal(view.key.begin(), view.key.end(), key.begin()));
   CHECK(std::equal(view.value.begin(), view.value.end(), val.begin()));
-#ifdef __EMSCRIPTEN__
-  CHECK(!io_buf.empty());
-#else
   CHECK(io_buf.empty());
-#endif
 
   std::filesystem::remove(path);
 }
+#endif
 
 #ifdef __linux__
 // Counts the file's extents and how many are still unwritten (allocated by
@@ -516,6 +512,7 @@ TEST_CASE("ReadOnlyPosixDataFile::lend_record long key triggers retry",
   std::filesystem::remove(path);
 }
 
+#ifndef __EMSCRIPTEN__  // no mmap-backed data file in the WASM build
 // ---------------------------------------------------------------------------
 // lend_record (unverified) — ReadOnlyMmapDataFile
 // ---------------------------------------------------------------------------
@@ -631,6 +628,8 @@ TEST_CASE("WritableMmapDataFile: verified read_value pread fallback",
   std::filesystem::remove(path);
 }
 
+#endif
+
 // ---------------------------------------------------------------------------
 // WritableMmapDataFile::truncate — mapping stability
 //
@@ -702,6 +701,7 @@ TEST_CASE("WritableMmapDataFile::truncate leaves the mapping in place",
 }
 #endif
 
+#ifndef __EMSCRIPTEN__  // no mmap-backed data file in the WASM build
 // ---------------------------------------------------------------------------
 // ReadOnlyMmapDataFile::scan — truncated file handling
 // ---------------------------------------------------------------------------
@@ -755,6 +755,8 @@ TEST_CASE("Sweep over ReadOnlyMmapDataFile ends at truncated entry body",
 
   std::filesystem::remove(path);
 }
+
+#endif
 
 // ---------------------------------------------------------------------------
 // DataFileIterator — chunked sweep (#146)
@@ -1616,15 +1618,23 @@ TEST_CASE("DataFile: a read past the end of file reports a short read",
 // handle's back leaves its stale end in place, as the race does.
 TEST_CASE("DataFile: a record below a cut reads whole under a stale end",
           "[data_file]") {
+#ifdef __EMSCRIPTEN__
+  const auto io_backend = bytecask::IoBackend::Pread;  // no mmap file here
+#else
   const auto io_backend =
       GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::Mmap);
+#endif
   CAPTURE(io_backend);
   const auto path =
       std::filesystem::temp_directory_path() / "bc_test_stale_end.data";
   std::filesystem::remove(path);
+#ifdef __EMSCRIPTEN__
+  auto writer = bytecask::WritablePosixDataFile::create(path, 1 << 20);
+#else
   auto writer = io_backend == bytecask::IoBackend::Mmap
                     ? bytecask::WritableMmapDataFile::create(path, 1 << 20)
                     : bytecask::WritablePosixDataFile::create(path, 1 << 20);
+#endif
   const auto first = writer->append_entry(1, bytecask::EntryType::Put,
                                           to_bytes("a"), to_bytes("first"));
   const auto second = writer->append_entry(2, bytecask::EntryType::Put,
@@ -1910,5 +1920,57 @@ TEST_CASE("DataFile: a damaged record across pool frames fails verification",
     lease.reset();
   }
   file.reset();
+  std::filesystem::remove(path);
+}
+
+// A data file can reach 4 GiB (a commit group may carry it to 2^32 bytes), and
+// one written by a 64-bit build can be opened by a 32-bit one (the WASM
+// build). Its size must survive a 32-bit size_t: wrapped, a file of 2^32 bytes
+// reads as empty, and open would truncate it or vacuum remove it (#373). The
+// file here is sparse, so the test writes a few bytes, not 4 GiB.
+TEST_CASE("DataFile: a sealed file past 4 GiB keeps its size and its records",
+          "[data_file][limits]") {
+  const auto path =
+      std::filesystem::temp_directory_path() / "bc_test_past_4gib.data";
+  std::filesystem::remove(path);
+  bytecask::Offset first = 0;
+  {
+    auto writer = bytecask::WritablePosixDataFile::create(path, 0);
+    first = writer->append_entry(1, bytecask::EntryType::Put, to_bytes("k"),
+                                 to_bytes("value"));
+    writer->sync();
+  }
+  constexpr auto kSize = (bytecask::Offset{1} << 32) + 4096;
+  std::filesystem::resize_file(path, kSize);
+
+  const auto check = [&](const bytecask::DataFile &file) {
+    CHECK(file.size() == kSize);
+    std::vector<std::byte> io_buf;
+    bytecask::FrameLease lease;
+    const auto view = file.lend_record(first, 0, true, io_buf, lease);
+    CHECK(view.sequence == 1);
+    CHECK(std::ranges::equal(view.value, to_bytes("value")));
+    lease.reset();
+    // Bytes past 2^32 are inside the file: the hole reads as zeros.
+    std::array<std::byte, 16> tail{};
+    tail.fill(std::byte{0x5A});
+    CHECK(file.read_raw(kSize - tail.size(), tail) == tail.size());
+    CHECK(std::ranges::all_of(tail, [](auto b) { return b == std::byte{0}; }));
+  };
+
+  SECTION("pread") {
+    check(*bytecask::openDataFileForRead(path, bytecask::IoBackend::Pread));
+  }
+  SECTION("buffer pool") {
+    auto pool = std::make_shared<bytecask::BufferPool>(
+        bytecask::BufferPoolOptions{.capacity_bytes = 1 << 20});
+    const auto file = bytecask::openDataFileForRead(
+        path, bytecask::IoBackend::BufferPool, pool, /*file_id=*/7);
+    check(*file);
+    // The frame holding the record was admitted, and release_file finds it:
+    // a wrapped size counts no frames and frees nothing.
+    pool->release_file(7, file->size());
+    CHECK(pool->counters().frames_released.load() >= 1);
+  }
   std::filesystem::remove(path);
 }
