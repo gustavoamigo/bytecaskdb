@@ -24,6 +24,12 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same branch, main or a pull request's, cancels the run it
+# supersedes: only the latest commit's result is wanted.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # ---------------------------------------------------------------------------
   # Build and run all test targets

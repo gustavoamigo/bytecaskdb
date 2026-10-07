@@ -44,10 +44,12 @@ permissions:
   pages: write
   id-token: write
 
-# Only one Pages deployment at a time.
+# A newer push to the same branch, main or a pull request's, cancels the run it
+# supersedes: only the latest commit's wheels are wanted. The Pages deployment
+# has its own group on the publish job below.
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -216,6 +218,10 @@ jobs:
   # ---------------------------------------------------------------------------
   publish:
     needs: [linux, macos-arm64]
+    # One Pages deployment at a time.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     # Only deploy from pushes to main; PR runs build wheels for verification only.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

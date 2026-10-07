@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Gustavo Amigo
 //
 // ByteCaskDB — unit tests for bytecask.u32_map: both implementations against
-// a std::map model, and the direct-addressing table's trimming and snapshots.
+// a std::map model, and the paged table's paging, trimming and snapshots.
 
 #include <catch2/catch_template_test_macros.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -54,7 +54,11 @@ TEMPLATE_TEST_CASE("u32 map matches a std::map model", "[u32_map]",
     const auto before_model = model;
     auto t = map.transient();
     for (int op = 0; op < 20; ++op) {
-      const auto key = lo + static_cast<std::uint32_t>(rng() % 40);
+      // Mostly a dense window; sometimes a sparse key pages away from it.
+      const auto key =
+          rng() % 4 != 0
+              ? lo + static_cast<std::uint32_t>(rng() % 40)
+              : static_cast<std::uint32_t>((rng() % 16) << 12 | rng() % 3);
       switch (rng() % 4) {
       case 0:
       case 1:
@@ -170,4 +174,92 @@ TEST_CASE("u32 table: untouched transients and iterator equality",
   CHECK(a == b); // both at the end
   CHECK(a == bytecask::U32TableIterator<int>{});
   CHECK_FALSE(m.begin() == bytecask::U32TableIterator<int>{});
+}
+
+TEST_CASE("u32 table: pages across a sparse id range", "[u32_map]") {
+  using Table = bytecask::PersistentU32Table<std::shared_ptr<int>>;
+  using Contents = std::vector<std::uint32_t>;
+  const auto keys = [](const Table &m) {
+    Contents out;
+    for (auto it = m.begin(); it != std::default_sentinel; ++it)
+      out.push_back((*it).first);
+    return out;
+  };
+
+  // Keys on both sides of page boundaries, and pages apart.
+  auto t = Table{}.transient();
+  for (const auto k : {5U, 255U, 256U, 300U, 70'000U, 70'001U, 1'048'575U})
+    t.set(k, std::make_shared<int>(static_cast<int>(k)));
+  const auto v1 = std::move(t).persistent();
+  CHECK(keys(v1) ==
+        Contents{5, 255, 256, 300, 70'000, 70'001, 1'048'575});
+  CHECK(v1.pages() == 4);
+  for (const auto k : {0U, 4U, 6U, 257U, 511U, 512U, 69'999U, 70'002U,
+                       1'048'574U, 1'048'576U, 0xFFFF'FFFFU})
+    CHECK(v1.get(k) == nullptr);
+  CHECK(**v1.get(70'001) == 70'001);
+
+  // A write copies only the page it touches: the others stay shared.
+  auto t2 = v1.transient();
+  t2.set(301, std::make_shared<int>(301));
+  const auto v2 = std::move(t2).persistent();
+  CHECK(v2.get(256) != v1.get(256));       // copied page
+  CHECK(*v2.get(256) == *v1.get(256));     // same value in it
+  CHECK(v2.get(5) == v1.get(5));           // shared pages
+  CHECK(v2.get(70'000) == v1.get(70'000));
+  CHECK(v1.get(301) == nullptr);
+
+  // Emptying a middle page drops it; emptying an end page trims the table.
+  auto t3 = v2.transient();
+  CHECK(t3.erase(70'000));
+  CHECK(t3.contains(70'001));
+  CHECK(t3.erase(70'001));
+  CHECK(t3.erase(5));
+  CHECK(t3.erase(255));
+  const auto v3 = std::move(t3).persistent();
+  CHECK(keys(v3) == Contents{256, 300, 301, 1'048'575});
+  CHECK(v3.pages() == 2);
+  CHECK(v3.get(70'000) == nullptr);
+  CHECK(v3.get(5) == nullptr);
+
+  // A dropped page can come back, below and above what is left.
+  auto t4 = v3.transient();
+  t4.set(70'002, std::make_shared<int>(2));
+  t4.set(3, std::make_shared<int>(3));
+  t4.update(70'002, [](std::shared_ptr<int> &v) { v = std::make_shared<int>(*v + 1); });
+  const auto v4 = std::move(t4).persistent();
+  CHECK(keys(v4) == Contents{3, 256, 300, 301, 70'002, 1'048'575});
+  CHECK(**v4.get(70'002) == 3);
+  CHECK(v4.pages() == 4);
+
+  // Every earlier version is intact.
+  CHECK(keys(v1) ==
+        Contents{5, 255, 256, 300, 70'000, 70'001, 1'048'575});
+  CHECK(keys(v2) ==
+        Contents{5, 255, 256, 300, 301, 70'000, 70'001, 1'048'575});
+  CHECK(keys(v3) == Contents{256, 300, 301, 1'048'575});
+  CHECK(**v1.get(70'000) == 70'000);
+  CHECK(v1.pages() == 4);
+  CHECK(v3.pages() == 2);
+
+  // Emptied entirely, the table holds nothing.
+  auto t5 = v4.transient();
+  for (const auto k : keys(v4)) CHECK(t5.erase(k));
+  const auto v5 = std::move(t5).persistent();
+  CHECK(v5.empty());
+  CHECK(v5.pages() == 0);
+  CHECK(v5.begin() == v5.end());
+}
+
+TEST_CASE("u32 table: the top of the key range", "[u32_map]") {
+  auto t = bytecask::PersistentU32Table<int>{}.transient();
+  t.set(0xFFFF'FFFFU, 1);
+  t.set(0xFFFF'FF00U, 2);
+  t.set(0xFFFF'FE00U, 3);
+  const auto m = std::move(t).persistent();
+  CHECK(contents(m) == std::vector<std::pair<std::uint32_t, int>>{
+                           {0xFFFF'FE00U, 3}, {0xFFFF'FF00U, 2},
+                           {0xFFFF'FFFFU, 1}});
+  CHECK(m.get(0xFFFF'FFFEU) == nullptr);
+  CHECK(m.pages() == 2);
 }

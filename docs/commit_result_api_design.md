@@ -1,5 +1,7 @@
 # CommitResult API — Sequence-Returning Write Operations
 
+> **Note:** the C API this document mentions (`include/bytecask_c.h`, `bytecaskdb/bytecask_c.cpp`) is not used by the plugin, which links `libbytecask.a` through `include/bytecask.hpp`, and has been removed.
+
 **Status: implemented.** Scope covers the engine, public C++ API, Python,
 C, and synchronous Node/WASM bindings in one breaking pre-1.0 change.
 Backward compatibility is not retained for any surface: `current_sequence`/
