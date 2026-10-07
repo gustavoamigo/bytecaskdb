@@ -1296,8 +1296,8 @@ needs a key-directory column before it can hold both.
    on every record access, and the B+ tree's general search costs more per
    lookup than the radix tree's (8.9 against 6.8 ns at one entry, 45 against
    23 ns at 1024): on the keyed tree `Range50` lost 8%. `files` is a
-   direct-addressing table instead (`PersistentU32Table`), which made
-   `Range50` 14% faster than on the radix tree. Smaller nodes did not help
+   direct-addressing table instead (`PersistentU32Table`, paged since
+   #380), which made `Range50` 14% faster than on the radix tree. Smaller nodes did not help
    the B+ tree: a one-entry lookup costs ~9 ns at 4096, 1024, 512 and 256
    bytes, and 256 is slower at 64 entries and up.
 5. Sibling merge on delete, gated by the churn memory tests (D6).
