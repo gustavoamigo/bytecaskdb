@@ -6,11 +6,14 @@
 name: CI
 
 on:
+  # A change that touches only documentation runs nothing here, as a pull
+  # request or as a push to main: no job reads Markdown. A change that also
+  # touches anything else runs everything.
   push:
     branches: [main]
-  # A pull request that changes only documentation runs nothing here: no job
-  # reads Markdown. Pushes to main still run everything, so every commit on
-  # main keeps its coverage upload.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
   pull_request:
     branches: [main]
     paths-ignore:
