@@ -71,7 +71,7 @@ if(NOT EXISTS "${BYTECASK_LIB}")
     "Build it first: cd ${BYTECASK_ROOT} && xmake build bytecask")
 endif()
 
-# Include directory for the stable C API header.
+# Include directory for include/bytecask.hpp.
 set(BYTECASK_INCLUDE_DIR "${BYTECASK_ROOT}/include")
 
 # Location of the testing archive (with BYTECASK_TESTING defined).

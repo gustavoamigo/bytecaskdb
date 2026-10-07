@@ -26,8 +26,8 @@ Everything needed to build or embed ByteCaskDB as a library is MIT:
 |------|------------|
 | `bytecaskdb/*.cppm` | C++23 module sources — the engine |
 | `bytecaskdb/bytecask.cpp` | Engine entry point |
-| `include/bytecask_c.h` | Public C API declaration |
-| `bytecaskdb/bytecask_c.cpp` | C ABI bridge (no MariaDB headers; MIT-clean) |
+| `include/bytecask.hpp` | Public C++ header for out-of-tree consumers (no module imports) |
+| `bytecaskdb/bytecask_hpp.cpp` | Its implementation, bridging to the modules (no MariaDB headers; MIT-clean) |
 
 These files contain **no MariaDB headers** and impose no GPL obligations on
 callers. A third party can embed them, link them, or ship them under their
@@ -49,7 +49,7 @@ plugin API.
 | `bytecaskdb-mariadb-plugin/row_encoding.{h,cc}` | MariaDB row → bytecask value encoding |
 | `bytecaskdb-mariadb-plugin/CMakeLists.txt` | CMake build for the plugin |
 
-`bytecaskdb/bytecask_c.cpp` is compiled by xmake into `libbytecask.a` (it
+`bytecaskdb/bytecask_hpp.cpp` is compiled by xmake into `libbytecask.a` (it
 imports the C++23 `bytecask` module and must be built with the same toolchain
 that produced the BMIs). The file is MIT-licensed — it contains no MariaDB
 headers.
@@ -64,10 +64,10 @@ bytecask/
 ├── bytecaskdb/           # MIT — C++23 engine modules
 │   ├── *.cppm            # C++23 module sources (import bytecask;)
 │   └── bytecask.cpp      # Engine definition (module implementation unit)
-│   └── bytecask_c.cpp     # C ABI bridge (compiled by xmake into libbytecask.a)
+│   └── bytecask_hpp.cpp   # bytecask.hpp's implementation (compiled by xmake into libbytecask.a)
 │
 ├── include/              # MIT — public headers for out-of-tree consumers
-│   └── bytecask_c.h      # Stable C API (no C++ types, no MariaDB types)
+│   └── bytecask.hpp      # PIMPL C++ header (no module imports, no MariaDB types)
 │
 ├── bytecaskdb-mariadb-plugin/  # GPL-2.0 — MariaDB storage engine plugin
 │   ├── CMakeLists.txt    # Standalone CMake build
@@ -76,14 +76,14 @@ bytecask/
 │   ├── key_encoding.h/cc
 │   └── row_encoding.h/cc
 │
-├── tests/                # MIT — engine tests (no C API, no MariaDB)
+├── tests/                # MIT — engine tests (no MariaDB)
 ├── benchmarks/           # MIT — engine benchmarks
 ├── docs/                 # Documentation
 ├── scripts/              # Build and benchmark helper scripts
 └── xmake.lua             # xmake build — covers bytecaskdb/, tests/, benchmarks/ only
 ```
 
-`xmake.lua` builds `bytecaskdb/bytecask_c.cpp` into `libbytecask.a`. The
+`xmake.lua` builds `bytecaskdb/bytecask_hpp.cpp` into `libbytecask.a`. The
 plugin is built independently with CMake, which consumes `libbytecask.a`
 produced by xmake.
 
@@ -105,8 +105,8 @@ Builds the C++23 engine. Targets:
 | `bytecask` | static lib | `libbytecask.a` — consumed by MariaDB CMake |
 
 The `bytecask` static target compiles `bytecaskdb/` sources plus
-`bytecaskdb/bytecask_c.cpp` (the C ABI bridge). Tests link
-against their own engine objects without the C bridge.
+`bytecaskdb/bytecask_hpp.cpp` (the header's bridge to the modules). Tests
+link against their own engine objects without it.
 
 Build:
 ```sh
@@ -117,7 +117,7 @@ xmake build bytecask          # produces libbytecask.a
 ### CMake — MariaDB Plugin
 
 Builds the GPL storage engine plugin. Consumes `libbytecask.a` and
-`include/bytecask_c.h`.
+`include/bytecask.hpp`.
 
 ```sh
 xmake build bytecask          # prerequisite: build the static lib first
@@ -132,15 +132,15 @@ INSTALL PLUGIN bytecaskdb SONAME 'ha_bytecaskdb.so';
 
 ---
 
-## The C API Bridge (`bytecaskdb/bytecask_c.cpp`)
+## The Header Bridge (`bytecaskdb/bytecask_hpp.cpp`)
 
-`bytecask_c.cpp` sits at the boundary between the two license zones:
+`bytecask_hpp.cpp` sits at the boundary between the two license zones:
 
-- It `#include`s only `include/bytecask_c.h` and `import`s only `bytecask`
+- It `#include`s only `include/bytecask.hpp` and `import`s only `bytecask`
 - It contains **zero** MariaDB headers → it is MIT-clean
 - It is compiled by xmake into `libbytecask.a` (it imports the C++23 module)
 
 This means the GPL obligation comes only from MariaDB headers present in other
-`bytecaskdb-mariadb-plugin/` files — not from `bytecask_c.cpp` itself. The file is MIT, but it
+`bytecaskdb-mariadb-plugin/` files — not from `bytecask_hpp.cpp` itself. The file is MIT, but it
 ends up inside the GPL-licensed shared object because `libbytecask.a` is linked
 into the plugin.

@@ -1,5 +1,7 @@
 # MariaDB Plugin — Build-Out Plan
 
+> **Note:** the C API this document mentions (`include/bytecask_c.h`, `bytecaskdb/bytecask_c.cpp`) is not used by the plugin, which links `libbytecask.a` through `include/bytecask.hpp`, and has been removed.
+
 > **Superseded.** This document is an early planning artifact. The current code guide is
 > [`plugin_guide.md`](plugin_guide.md) — read that instead.
 

@@ -53,19 +53,9 @@ cached state instead of resolving catalog maps per row. Row-count deltas are
 still tracked in the per-THD transaction object so rollback and failed commit
 can restore the counters exactly.
 
-### C API / Shared Library Boundary
-
-ByteCaskDB uses C++23 modules internally, which are not portable across compilation unit boundaries when linking external code. To cross this boundary (e.g. the MariaDB plugin), a stable `extern "C"` API is provided:
-
-- **`include/bytecask_c.h`**: flat C header with opaque `bytecask_db_t*` / `bytecask_iter_t*` / `bytecask_snapshot_t*` / `bytecask_write_plan_t*` handles. No C++ types, no module imports. Covers: open/close, put/del/get, forward iteration, snapshots, conditional atomic writes (`apply_batch` via `WritePlan`), and vacuum.
-- **`bytecaskdb/bytecask_c.cpp`**: implementation that imports `bytecask` (the C++23 module) and forwards calls through the C API. Compiled into `libbytecask.a`.
-- **`xmake.lua` `bytecask` target**: static library combining all engine module objects plus `bytecask_c.cpp`.
-
-Any out-of-tree consumer (not just the MariaDB plugin) should use this C API boundary rather than importing the C++23 modules directly.
-
 ### C++ Public Header (`include/bytecask.hpp`)
 
-For C++ consumers that want the full typed API without importing C++23 modules, a PIMPL header is provided:
+C++23 modules are not portable across compilation unit boundaries when linking external code. For consumers that link `libbytecask.a` without importing the modules (the MariaDB plugin, and anything else out of tree), a PIMPL header is provided:
 
 - **`include/bytecask.hpp`**: standard `#pragma once` header. Defines all public types (`WriteOptions`, `ReadOptions`, `Mode`, `Options`, `Snapshot`, `WritePlan`, `DB`, all iterator types, `DbDegraded`, `DbFollowerMode`) in namespace `bytecask::internal`, with `using` aliases in `namespace bytecask` at the bottom. Depends only on the C++ standard library — no module imports.
 - **`bytecaskdb/bytecask_hpp.cpp`**: the only translation unit that `import bytecask;`. Contains all `Impl` struct definitions and out-of-line method bodies. `to_module()`/`from_module()` helpers in an anonymous namespace convert between `bytecask::internal::` (header-defined, plain mangling) and `bytecask::` (module-imported, module-attached mangling) types. `translate_exceptions()` re-throws `bytecask::DbDegraded` and `bytecask::DbFollowerMode` (module-attached) as the header-defined equivalents so callers that include only the header can catch them correctly.
@@ -1548,7 +1538,7 @@ The closed state keeps the sequences, mode and degraded reason, and drops the fi
 
 A failed close leaves on disk what a crash would, and the next open handles it the same way: the active file is hint-less, so it is rewritten durably and scanned (*Recovering a Hint-less File*).
 
-The bindings report it too. C: `bytecask_close` returns `-1` with `bytecask_errmsg()` set, and frees the handle either way. Python: `DB.close()`, and `DB` is a context manager; `DbClosed` is a `ValueError`, as Python raises for a closed file. Node: `close()` throws once the handle is released; under WASM the bound `closeDb` returns the message, because `-fwasm-exceptions` hides `what()` from JS. MariaDB: `bytecaskdb_deinit` logs a failed close with `sql_print_error` and returns `1`.
+The bindings report it too. Python: `DB.close()`, and `DB` is a context manager; `DbClosed` is a `ValueError`, as Python raises for a closed file. Node: `close()` throws once the handle is released; under WASM the bound `closeDb` returns the message, because `-fwasm-exceptions` hides `what()` from JS. MariaDB: `bytecaskdb_deinit` logs a failed close with `sql_print_error` and returns `1`.
 
 ---
 
@@ -1710,7 +1700,7 @@ Counters are per-DB instance (`Counters` struct owned by `DB`). Two open databas
 | D12 | **Hint file atomicity**: Write to `*.hint.tmp`, `fdatasync`, then atomically `rename(2)` to `*.hint`, then sync the directory. A `.hint.tmp` file found at startup is discarded. |
 | D13 | **Incomplete batch recovery**: An unmatched `BulkBegin` in the active data file scan causes the partial batch to be discarded with a logged warning. No partial-batch entries enter the key directory. |
 | D14 | **Single-entry batch optimization**: When `apply_batch` is called with exactly one operation, the `BulkBegin`/`BulkEnd` marker writes are skipped. A single data entry is self-describing and CRC-protected, so the markers add no recovery benefit for a write set of size 1. |
-| D15 | **C ABI / shared-library link constraint**: `libbytecask.a` is compiled with `-fPIC` so it can be linked into a shared object (e.g. `ha_bytecaskdb.so`). Without `-fPIC`, clang emits `R_X86_64_TPOFF32`/`R_X86_64_32S` relocations illegal in a DSO. xmake syntax: `add_cxxflags("-fPIC", {force = true})` on the `bytecask` static target. |
+| D15 | **Shared-library link constraint**: `libbytecask.a` is compiled with `-fPIC` so it can be linked into a shared object (e.g. `ha_bytecaskdb.so`). Without `-fPIC`, clang emits `R_X86_64_TPOFF32`/`R_X86_64_32S` relocations illegal in a DSO. xmake syntax: `add_cxxflags("-fPIC", {force = true})` on the `bytecask` static target. |
 | D16 | **MariaDB plugin header ordering**: Server-internal headers require `server/my_global.h` before `handler.h`. The client-side stub does not define `MY_GLOBAL_INCLUDED`/`uchar`/`unlikely()`. Fedora layout: base `/usr/include/mysql`, server `/usr/include/mysql/server`, private `/usr/include/mysql/server/private`. CMake include order must be `server/private` → `server` → base. `-DMYSQL_SERVER` is required. `handlerton::state` does not exist in this MariaDB ABI; use `PLUGIN_LICENSE_GPL` (no MIT constant). |
 | D17 | **Directory locking**: One process per directory, enforced by `flock()` on `dir/.lock`. Advisory only — does not protect against uncooperative processes that bypass `DB::open()`. |
 | D18 | **Sequence-disjoint files**: All data files must have non-overlapping sequence ranges — no two files contain entries with the same sequence number. Active file rotation naturally preserves this (sealed files have contiguous sequence ranges). Vacuum compact must ensure compacted files maintain disjoint ranges; the one exception, a compacted file whose source outlived a kill, is removed at the next open (see *Vacuum → Crash safety*), and recovery refuses any other overlap. This invariant enables efficient replication (linear scan instead of min-heap merge), supports future file merging operations, and allows skipping entire files based on sequence bounds. |
