@@ -353,6 +353,11 @@ And one for the window a completed rename opens:
     the directory sync, before `vacuum_commit()` in `vacuum_compact_file()`.
     See *Orphaned `.data` files* for what it reproduces.
 
+And one between the staging copy's sync and the rename (#258):
+
+- `io_vacuum_compact_shrink` — before the staging copy's `shrink_to_fit()`
+  in `vacuum_compact_file()`.
+
 And one on the read side, for the scan `resume()` runs:
 
 14. `io_data_file_scan` — before the `pread()` in the active file's
@@ -848,10 +853,10 @@ fault points.
 
 This directly proves: *resume always eventually recovers once the underlying fault clears.*
 
-### vacuum_compact — 67 tests
+### vacuum_compact — 94 tests
 
-67 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover ten state
-shapes × eight failure classes (SUCCESS, VC1–VC7), less the combinations
+94 generated Catch2 tests (`[prove_vacuum_compact]` tag) cover ten state
+shapes × eleven failure classes (SUCCESS, VC1–VC10), less the combinations
 a shape cannot reach (below).
 
 State shapes create a DB with exactly one sealed file having fragmentation > 0:
@@ -904,12 +909,13 @@ VC6 (`io_vacuum_compact_post_rename`), VC7 (`io_data_file_sync` again,
 at the `fdatasync` `vacuum_commit` issues before dropping records that only
 `sync = false` writes supersede, #261 — the second checkpoint of that name
 on the compaction path, after the staging copy's, and the first on the
-whole-file path, which writes no copy).
+whole-file path, which writes no copy), VC8 (`io_vacuum_compact_shrink`),
+and VC9 and VC10, which fail calls below the engine (#258, below).
 
 VC7 applies only to the two `unsynced_overwrite` shapes: with the deletes
 made durable by `make_durable`, `vacuum_commit` has nothing to sync in the
 others. The whole-file shape reaches only SUCCESS, VC5 and VC7: it makes
-none of the calls VC1–VC4 and VC6 fault. Under VC7 the engine degrades and
+none of the calls VC1–VC4, VC6 and VC8–VC10 fault. Under VC7 the engine degrades and
 vacuum throws before committing, so the old file stays
 (`assert_vacuum_no_change`, `is_degraded() == true`).
 
@@ -954,6 +960,29 @@ attempt, and the chaos rig found an open that ran a recovery pass for each
 of 58. A kill in the window still leaves the copy, and recovery deletes it
 as it deletes VC5's: making recovery's undo throw fails all eight VC5
 cells.
+
+VC8 fails the staging copy's `shrink_to_fit()`, between its sync and the
+rename. The outcome is VC4's: the old file stays and the staging copy goes.
+
+VC9 and VC10 reach the fallback in `renameDataFileExclusive`, for a
+filesystem without `RENAME_NOREPLACE`: `link()` places the copy, then
+`unlink()` removes the staged name. No checkpoint can select that path, so
+these cells use `ScopedSyscallFaults` with one rule per call (*Counted fault
+sweep*): `renameat2` reports `EINVAL`, and `unlink` fails. Each cell checks
+that those two calls, on the `.data.tmp`, are the first to fail, so a cell
+that never reached the fallback does not pass. They are compiled on Linux
+only, where the interposers are linked.
+
+VC9 fails the staged name's `unlink()` once. The placement took effect, but
+the function is about to report that it did not, so it takes the placed
+name back before it throws, and vacuum's cleanup removes the staged one.
+Nothing is left (`unreferenced_files` is empty), as in VC4. Without the
+take-back, the placed copy stayed until the next open, one copy per retry
+(mutation `rename_fallback_keeps_placed_copy`). VC10 fails every `unlink`
+and `remove` in the directory, so the take-back and the cleanup fail too.
+Both names stay (the cell asserts they do), and
+`assert_vacuum_recoverable` proves the next open removes them and recovers
+every key.
 
 ### corruption — 16 tests
 
@@ -1503,8 +1532,8 @@ degrade_F, degrade_G, degrade_F_range and degrade_F_batch shapes (no
 orphaned bytes to truncate — fault point unreachable), and R2/CASCADE for
 degrade_H (file already sealed).
 
-All eight vacuum_compact classes (SUCCESS, VC1–VC7) across all ten state
-shapes, less the combinations a shape cannot reach, are covered by the 67
+All eleven vacuum_compact classes (SUCCESS, VC1–VC10) across all ten state
+shapes, less the combinations a shape cannot reach, are covered by the 94
 `[prove_vacuum_compact]` tests.
 
 All seven ingest failure classes across 11 state shapes and 5 ops shapes
@@ -1728,6 +1757,14 @@ different sequence in each.
 
 An `fdatasync` failed *before* leaves its pages clean and unwritten in the
 `PageCacheModel`, as the kernel does; one failed *after* wrote them.
+
+Outside the sweep, a test can arm several `SyscallFaultRule`s at once. Each
+names a call (`"renameat2"`, `"unlink"`) or none, and counts and fails its
+own sequence with its own errno; the first rule that fails a call wins.
+That reaches a path an errno selects and fails a call inside it:
+`renameDataFileExclusive`'s fallback, in `[data_file]` and in the
+`prove_vacuum_compact` VC9 and VC10 cells. The report lists every call
+failed, in order.
 
 **Back-ends.** Each operation runs once on each `IoBackend`, since they
 make different calls on the same operation. The buffer pool opens a sealed
@@ -2426,6 +2463,7 @@ A site whose break nothing has to catch says why instead.
 | `vacuum_compact_file`: the directory sync after the rename, before the source is unlinked | `directory sync: a failed sync in vacuum keeps the source` | `vacuum_unlinks_before_dir_sync` | #199 |
 | `vacuum_compact_file`: the staging file is removed on every failure | `prove_vacuum_compact__*` | `vacuum_leaks_staging_file` | #247 (#235) |
 | `vacuum_compact_file`: the renamed copy and its hint are removed on every failure before the commit | `vacuum that fails between its rename and its commit removes its copy`, `prove_vacuum_compact__*` | `vacuum_leaks_renamed_copy` (chaos) | #304 |
+| `renameDataFileExclusive`: the fallback takes its `link()` back when the staged name's `unlink()` fails | `renameDataFileExclusive takes the placement back …`, `*__fallback_unlink_fails` (`prove_vacuum_compact`) | `rename_fallback_keeps_placed_copy` | #258 |
 | `vacuum`: a file of tombstones only is not dropped whole | `vacuum keeps a tombstone-only file that shadows an older put` | `vacuum_drops_tombstone_only_file` | #171 (#166) |
 | `vacuum_scan_and_copy`: a damaged entry fails the compaction | `DB vacuum: a damaged sealed file is not compacted away` | `vacuum_compacts_damaged_file` | #136 |
 | `vacuum_scan_and_copy`: batch markers are copied | `vacuum preserves BulkBegin/BulkEnd markers` | `vacuum_drops_batch_markers` | BC-197 |

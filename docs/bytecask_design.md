@@ -928,7 +928,12 @@ concurrent rotation can mint the same stem in the window between the check and
 the rename — its own `O_EXCL` succeeds, because vacuum holds only
 `<stem>.data.tmp` and has not written a `.hint` yet — and the rename then
 replaces a live active file. A crash between `link` and `unlink` leaves a
-`.data.tmp` behind, which `recovery_prepare_files` removes at open.
+`.data.tmp` behind, which `recovery_prepare_files` removes at open. If the
+`unlink` fails, the function removes the name its `link` placed before it
+throws. A throw then means nothing was placed, as when `renameat2` fails,
+and vacuum's cleanup, which removes only the staged name, leaves no copy
+behind. If that removal fails too, both names stay, and the next open
+deletes the `.data.tmp` and the placed copy beside its source (#258).
 
 All three checks `panic()` — they abort the process rather than throw. An
 exception would be caught by the write path's `catch (...)`, turned into a

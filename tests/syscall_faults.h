@@ -13,6 +13,7 @@
 
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace bytecask::testing {
 
@@ -34,10 +35,22 @@ enum class SyscallFault {
   short_io,
 };
 
+// One schedule of failures. `call` limits it to the calls of that name, as
+// the interposers spell them ("renameat2", "unlink"); empty counts every call
+// the mode counts. See ScopedSyscallFaults for the rest.
+struct SyscallFaultRule {
+  std::string call;
+  SyscallFault mode{SyscallFault::none};
+  int nth{0};
+  bool cascade{false};
+  int err{0};
+};
+
 struct SyscallFaultReport {
-  int calls{0};       // counted while armed
-  bool fired{false};  // the N-th call was reached
+  int calls{0};       // counted by the first rule while armed
+  bool fired{false};  // some rule reached its N-th call
   std::string what;   // the call that failed first, e.g. "fdatasync(/db/x.data)"
+  std::vector<std::string> failed;  // every call failed, in order (first 16)
 };
 
 // Arms the interposers, process-wide: the flush leader and the hint worker
@@ -47,10 +60,16 @@ struct SyscallFaultReport {
 // reports `err` (0: the call's usual EIO, or ENOMEM for mmap), so a test can
 // reach a caller's handling of one errno. Disarms and reports on destruction
 // or on report().
+//
+// With several rules, each counts its own calls and the first that rules a
+// call failed fails it: a fallback is reached by failing one call with the
+// errno that selects it, and a later call in it by a second rule.
 class ScopedSyscallFaults {
 public:
   ScopedSyscallFaults(const std::filesystem::path &dir, SyscallFault mode,
                       int nth, bool cascade = false, int err = 0);
+  ScopedSyscallFaults(const std::filesystem::path &dir,
+                      std::vector<SyscallFaultRule> rules);
   ~ScopedSyscallFaults();
   ScopedSyscallFaults(const ScopedSyscallFaults &) = delete;
   auto operator=(const ScopedSyscallFaults &) -> ScopedSyscallFaults & = delete;

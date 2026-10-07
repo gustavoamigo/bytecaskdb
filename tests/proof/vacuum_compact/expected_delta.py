@@ -15,6 +15,9 @@ class VacuumCompactDelta:
     threw: bool
     file_removed: bool
     degraded: bool = False
+    # The staging copy and the placed copy are still on disk after vacuum()
+    # threw, for the next open to remove.
+    copy_left: bool = False
 
 
 def vacuum_compact_delta(
@@ -49,6 +52,20 @@ def vacuum_compact_delta(
     nothing — and vacuum throws before committing, so the old file stays in
     the published state and on disk, as for VC1–VC4.
 
+    VC8: the staging copy's shrink_to_fit fails (#258). As for VC1-VC4: vacuum
+    throws, the old file stays and the staging copy is removed.
+
+    VC9: renameDataFileExclusive's link() + unlink() fallback placed the copy
+    and the unlink() of the staged name failed (#258). The function takes the
+    placed name back before it throws, so vacuum's cleanup, which removes
+    only the staged name, leaves nothing: the outcome is VC4's. Without the
+    take-back the placed copy stayed until the next open, one per retry.
+
+    VC10: the same under a fault that fails every unlink and remove: the
+    take-back and the cleanup fail too, and both names stay (copy_left). The
+    next open deletes the staged name and the placed copy beside its source,
+    and assert_vacuum_recoverable proves it opens with every key.
+
     Every cell also cuts the power after the vacuum (#265). The recovered copy
     must hold the durable baseline alone, or with every overwrite: SUCCESS
     made the overwrites durable before dropping what they superseded, so they
@@ -62,4 +79,6 @@ def vacuum_compact_delta(
         return VacuumCompactDelta(threw=True, file_removed=True)
     if failure == VacuumCompactFailureClass.VC7:
         return VacuumCompactDelta(threw=True, file_removed=False, degraded=True)
+    if failure == VacuumCompactFailureClass.VC10:
+        return VacuumCompactDelta(threw=True, file_removed=False, copy_left=True)
     return VacuumCompactDelta(threw=True, file_removed=False)

@@ -1,0 +1,18 @@
+renameDataFileExclusive's fallback throws with the copy still under its
+final name when the staged name's unlink() fails: vacuum's cleanup removes
+only the staged name, and each retry leaves a full copy until the next open.
+Reverts #258's take-back.
+Guarded-by: "renameDataFileExclusive takes the placement back when the staged name cannot be unlinked,*__fallback_unlink_fails"
+
+diff --git a/bytecaskdb/data_file.cppm b/bytecaskdb/data_file.cppm
+index 8991613..93a9801 100644
+--- a/bytecaskdb/data_file.cppm
++++ b/bytecaskdb/data_file.cppm
+@@ -1665,7 +1665,6 @@ export void renameDataFileExclusive(const std::filesystem::path &from,
+     // per retry. `to` is ours to remove, as link() just created it. Under a
+     // fault that fails this too, both names stay for recovery, which deletes
+     // a .data.tmp and a placed copy beside its source at open.
+-    (void)::unlink(to.c_str());
+     throw std::system_error{
+         err, std::generic_category(),
+         std::format("renameDataFileExclusive: cannot unlink '{}'",

@@ -4040,6 +4040,9 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
     scan = vacuum_scan_and_copy(snap, old_file, *tmp_file, file_id,
                                 needed_tombstones_, retain_after);
     tmp_file->sync();
+#ifdef BYTECASK_TESTING
+    FAULT_INJECTION(io_vacuum_compact_shrink);
+#endif
     tmp_file->shrink_to_fit();
   }
 
