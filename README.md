@@ -220,8 +220,8 @@ db.close();
 namespace bytecask {
 
 struct Options {
-    uint64_t max_file_bytes{64 * 1024 * 1024};  // active file rotation threshold (default 64 MiB, hard ceiling: 3 GiB)
-    unsigned recovery_threads{4};                // parallelism for hint-file replay at open
+    uint64_t max_file_bytes{64 * 1024 * 1024};  // active file rotation threshold (default 64 MiB, hard ceiling: 3 GiB; 0 seals a file after every write)
+    unsigned recovery_threads{4};                // parallelism for hint-file replay at open (0 is refused)
     // A hint file is a rebuildable index: one that fails its CRC, or that a
     // read fails on, is regenerated from its data file in both modes and
     // costs no keys. This

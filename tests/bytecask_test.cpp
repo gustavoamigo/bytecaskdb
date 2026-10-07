@@ -10791,6 +10791,218 @@ TEST_CASE("Limits: open rejects options above the hard ceilings",
   CHECK_NOTHROW(bytecask::DB::open(td.path / "k"));
 }
 
+// ---------------------------------------------------------------------------
+// Zero and empty boundaries (#371), and options at their edges (#372).
+// ---------------------------------------------------------------------------
+
+namespace {
+auto count_data_files(const std::filesystem::path &dir) -> int {
+  int n = 0;
+  for (const auto &e : std::filesystem::directory_iterator{dir})
+    if (e.path().extension() == ".data") ++n;
+  return n;
+}
+}  // namespace
+
+TEST_CASE("Edges: an empty key and an empty value behave like any other",
+          "[bytecask][limits][edges]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  const auto empty = to_bytes("");
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({}, empty, to_bytes("ev"));
+    db.put({}, to_bytes("a"), empty);
+    db.put({}, to_bytes("b"), to_bytes("bv"));
+
+    CHECK(get_str(db, empty) == "ev");
+    CHECK(db.contains_key({}, empty));
+    bytecask::Bytes out{std::byte{1}};
+    CHECK(db.get({}, to_bytes("a"), out));
+    CHECK(out.empty());
+
+    // An empty `from` means the start (forward) or the end (reverse), and
+    // the empty key, the smallest of all, is still yielded.
+    std::vector<std::string> fwd;
+    for (const auto &k : db.keys_from({})) fwd.push_back(to_string(k));
+    CHECK(fwd == std::vector<std::string>{"", "a", "b"});
+    CHECK(to_string((*db.iter_from({}).begin()).key).empty());
+    std::vector<std::string> rev;
+    for (const auto &k : db.rkeys_from({})) rev.push_back(to_string(k));
+    CHECK(rev == std::vector<std::string>{"b", "a", ""});
+
+    // Guards on the empty key.
+    {
+      bytecask::WritePlan p{db.snapshot()};
+      p.ensure_present(empty);
+      p.put(to_bytes("g1"), to_bytes("x"));
+      CHECK(db.apply_batch({}, std::move(p)).has_value());
+    }
+    {
+      bytecask::WritePlan p{db.snapshot()};
+      p.ensure_absent(empty);
+      p.put(to_bytes("g2"), to_bytes("x"));
+      CHECK_FALSE(db.apply_batch({}, std::move(p)).has_value());
+    }
+    {
+      bytecask::WritePlan p{db.snapshot()};
+      p.ensure_unchanged(empty);
+      db.put({}, empty, to_bytes("ev2"));
+      p.put(to_bytes("g3"), to_bytes("x"));
+      CHECK_FALSE(db.apply_batch({}, std::move(p)).has_value());
+    }
+
+    // del and a range starting at the empty key remove it.
+    CHECK(db.del({}, empty).has_value());
+    CHECK_FALSE(db.contains_key({}, empty));
+    db.put({}, empty, to_bytes("ev3"));
+    db.del_range({}, empty, to_bytes("a"));
+    CHECK_FALSE(db.contains_key({}, empty));
+    CHECK(db.contains_key({}, to_bytes("a")));
+    db.put({}, empty, to_bytes("ev4"));
+  }
+
+  const std::map<std::string, std::string> expected{
+      {"", "ev4"}, {"a", ""}, {"b", "bv"}, {"g1", "x"}};
+  for (const unsigned threads : {1U, 4U}) {
+    INFO("recovery_threads=" << threads);
+    const auto copy = td.path / std::format("r{}", threads);
+    std::filesystem::copy(dir, copy, std::filesystem::copy_options::recursive);
+    auto db = bytecask::DB::open(copy, {.recovery_threads = threads});
+    CHECK(collect_kv(db) == expected);
+  }
+
+  // Through changes_since and ingest to a follower.
+  auto leader = bytecask::DB::open(dir);
+  auto follower = bytecask::DB::open(
+      td.path / "f", {.initial_mode = bytecask::Mode::Follower});
+  auto snap = leader.snapshot();
+  std::vector<bytecask::DataEntry> owned;
+  for (const auto &e : leader.changes_since(snap, 0))
+    owned.push_back({e.sequence, e.entry_type, {e.key.begin(), e.key.end()},
+                     {e.value.begin(), e.value.end()}});
+  std::vector<bytecask::DataEntryView> views;
+  for (const auto &e : owned)
+    views.push_back({e.sequence, e.entry_type, e.key, e.value});
+  follower.ingest(views);
+  CHECK(collect_kv(follower) == expected);
+}
+
+TEST_CASE("Edges: count_keys with limit 0, an empty range and an inverted one",
+          "[bytecask][limits][edges]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  for (const auto *k : {"", "a", "b"}) db.put({}, to_bytes(k), to_bytes("v"));
+  const auto snap = db.snapshot();
+  CHECK(snap.count_keys(to_bytes(""), to_bytes("z"), 0) == 0);
+  CHECK(snap.count_keys(to_bytes("a"), to_bytes("a"), 10) == 0);
+  CHECK(snap.count_keys(to_bytes("b"), to_bytes("a"), 10) == 0);
+  // The empty key counts like any other.
+  CHECK(snap.count_keys(to_bytes(""), to_bytes("a"), 10) == 1);
+  CHECK(snap.count_keys(to_bytes(""), to_bytes("z"), 10) == 3);
+}
+
+TEST_CASE("Options: recovery_threads = 0 is refused at open",
+          "[bytecask][limits][edges]") {
+  TempDir td;
+  {
+    auto db = bytecask::DB::open(td.path / "db");
+    db.put({}, to_bytes("k"), to_bytes("v"));
+  }
+  CHECK_THROWS_AS(bytecask::DB::open(td.path / "db", {.recovery_threads = 0}),
+                  std::invalid_argument);
+  auto db = bytecask::DB::open(td.path / "db", {.recovery_threads = 1});
+  CHECK(get_str(db, to_bytes("k")) == "v");
+}
+
+TEST_CASE("Options: a buffer pool of exactly 2 x max_file_bytes is accepted, "
+          "one byte less is not", "[bytecask][limits][edges]") {
+  TempDir td;
+  constexpr std::uint64_t kFile = 1U << 16;
+  const auto open = [&](const char *name, std::size_t capacity) {
+    return bytecask::DB::open(
+        td.path / name, {.max_file_bytes = kFile,
+                         .io_backend = bytecask::IoBackend::BufferPool,
+                         .buffer_pool = {.capacity_bytes = capacity}});
+  };
+  CHECK_NOTHROW(open("at", 2 * kFile));
+  CHECK_THROWS_WITH(open("under", 2 * kFile - 1),
+                    Catch::Matchers::ContainsSubstring(
+                        std::format("2 x max_file_bytes = {}", 2 * kFile)));
+}
+
+TEST_CASE("Options: a value larger than max_file_bytes gets a file of its own",
+          "[bytecask][limits][edges]") {
+  TempDir td;
+  // Larger than the test build's default max_file_bytes (64 KiB), and in the
+  // pool case larger than the whole pool.
+  const std::string big(300 * 1024, 'x');
+  for (const auto backend :
+       {bytecask::IoBackend::Pread, bytecask::IoBackend::BufferPool}) {
+    const bytecask::Options opts{
+        .max_value_bytes = 1U << 20, .io_backend = backend,
+        .buffer_pool = {.capacity_bytes = 2 * bytecask::kDefaultRotationThreshold}};
+    const auto dir =
+        td.path / (backend == bytecask::IoBackend::Pread ? "pread" : "pool");
+    {
+      auto db = bytecask::DB::open(dir, opts);
+      db.put({}, to_bytes("k1"), to_bytes(big));
+      db.put({}, to_bytes("s"), to_bytes("small"));
+      db.put({}, to_bytes("k2"), to_bytes(big));
+      CHECK(get_str(db, to_bytes("k1")) == big);
+    }
+    // Each large write filled a file past the threshold and sealed it.
+    CHECK(count_data_files(dir) >= 3);
+    auto db = bytecask::DB::open(dir, opts);
+    CHECK(get_str(db, to_bytes("k1")) == big);
+    CHECK(get_str(db, to_bytes("k2")) == big);
+    CHECK(get_str(db, to_bytes("s")) == "small");
+  }
+}
+
+TEST_CASE("Options: max_hint_backlog = 0 under a value-heavy load",
+          "[bytecask][limits][edges]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  const auto value = [](int i) {
+    return std::string(20 * 1024, static_cast<char>('a' + i % 26));
+  };
+  // Every second write rotates, and with the bound off writes never wait
+  // for the hint writer.
+  {
+    auto db = bytecask::DB::open(
+        dir, {.max_file_bytes = 32 * 1024, .max_hint_backlog = 0});
+    for (int i = 0; i < 200; ++i)
+      db.put({.sync = false}, to_bytes(std::format("k{:03}", i)),
+             to_bytes(value(i)));
+    CHECK(db.stats().at("bytecask.hint_backpressure_stalls") == 0);
+  }
+  auto db = bytecask::DB::open(dir);
+  for (int i = 0; i < 200; ++i)
+    CHECK(get_str(db, to_bytes(std::format("k{:03}", i))) == value(i));
+}
+
+TEST_CASE("Options: max_file_bytes = 0 seals a file after every write",
+          "[bytecask][limits][edges]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir, {.max_file_bytes = 0});
+    for (int i = 0; i < 5; ++i)
+      db.put({}, to_bytes(std::format("k{}", i)), to_bytes("v"));
+    bytecask::WritePlan plan;
+    plan.put(to_bytes("x"), to_bytes("1"));
+    plan.put(to_bytes("y"), to_bytes("2"));
+    REQUIRE(db.apply_batch({}, std::move(plan)).has_value());
+  }
+  // Six writes, each in a file of its own, and the active file.
+  CHECK(count_data_files(dir) == 7);
+  auto db = bytecask::DB::open(dir, {.max_file_bytes = 0});
+  CHECK(collect_kv(db) == std::map<std::string, std::string>{
+                              {"k0", "v"}, {"k1", "v"}, {"k2", "v"},
+                              {"k3", "v"}, {"k4", "v"}, {"x", "1"}, {"y", "2"}});
+}
+
 TEST_CASE("Limits: a KeyDirEntry packs each field at its ceiling and refuses "
           "one past", "[bytecask][limits]") {
   using E = bytecask::KeyDirEntry;

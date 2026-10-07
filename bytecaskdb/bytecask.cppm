@@ -235,11 +235,13 @@ export struct ReadOptions {
 // Options passed to DB::open().
 export struct Options {
   // Active-file rotation threshold in bytes (default 64 MiB). When the active
-  // file reaches this size it is sealed and a new one is opened. Hard
-  // ceiling: kMaxFileBytes (3 GiB); open rejects more.
+  // file reaches this size it is sealed and a new one is opened, so 0 seals
+  // a file after every write. Hard ceiling: kMaxFileBytes (3 GiB); open
+  // rejects more.
   std::uint64_t max_file_bytes{kDefaultRotationThreshold};
   // Number of threads used to rebuild the key directory at open time.
-  // 1 selects the serial path; >1 uses file-level fan-in parallelism.
+  // 1 selects the serial path; >1 uses file-level fan-in parallelism. 0 is
+  // refused at open with std::invalid_argument.
 #ifdef BYTECASK_SINGLE_THREADED
   unsigned recovery_threads{1};
 #else
@@ -2747,6 +2749,10 @@ DB::DB(std::filesystem::path dir, Options opts)
         "max_file_bytes = {} exceeds the hard ceiling of {}",
         opts.max_file_bytes, kMaxFileBytes)};
   }
+  if (opts.recovery_threads == 0) {
+    throw std::invalid_argument{
+        "recovery_threads = 0: recovery needs at least one thread"};
+  }
 #ifdef __EMSCRIPTEN__
   if (opts.io_backend == IoBackend::Mmap) {
     throw std::invalid_argument{
@@ -2765,7 +2771,7 @@ DB::DB(std::filesystem::path dir, Options opts)
           "IoBackend::BufferPool: buffer_pool.capacity_bytes = {} must be at "
           "least 2 x max_file_bytes = {}. Raise the pool, or lower "
           "max_file_bytes — the two are coupled.",
-          opts.buffer_pool.capacity_bytes, opts.max_file_bytes)};
+          opts.buffer_pool.capacity_bytes, 2 * opts.max_file_bytes)};
     }
     pool_ = std::make_shared<BufferPool>(opts.buffer_pool);
   }
@@ -5684,8 +5690,9 @@ auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
   const auto W = 1u;
   (void)recovery_threads;
 #else
-  auto W = std::min(static_cast<unsigned>(files.size()), recovery_threads);
-  if (W == 0) W = 1;
+  // Both are at least 1: open rejects recovery_threads = 0, and an empty
+  // file list returned above.
+  const auto W = std::min(static_cast<unsigned>(files.size()), recovery_threads);
 #endif
 
   const auto parallel_for = [](unsigned n, auto &&body) {
@@ -5979,8 +5986,9 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
   const auto W = 1u;
   (void)recovery_threads;
 #else
-  auto W = std::min(static_cast<unsigned>(files.size()), recovery_threads);
-  if (W == 0) W = 1;
+  // Both are at least 1: open rejects recovery_threads = 0, and an empty
+  // file list returned above.
+  const auto W = std::min(static_cast<unsigned>(files.size()), recovery_threads);
 #endif
   constexpr std::size_t kFenceStep = 4096;
 

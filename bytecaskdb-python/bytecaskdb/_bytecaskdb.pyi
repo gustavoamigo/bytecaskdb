@@ -84,7 +84,7 @@ class Options:
     """Active file rotation threshold in bytes (default 64 MiB)."""
 
     recovery_threads: int
-    """Number of threads for parallel hint-file replay at open (default 4)."""
+    """Number of threads for parallel hint-file replay at open (default 4; 0 is refused at open)."""
 
     fail_recovery_on_crc_errors: bool
     """If True (default), any CRC error during recovery raises.

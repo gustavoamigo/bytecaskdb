@@ -413,7 +413,7 @@ NB_MODULE(_bytecaskdb, m) {
       .def_rw("max_file_bytes", &bytecask::Options::max_file_bytes,
               "Active file rotation threshold in bytes (default 64 MiB).")
       .def_rw("recovery_threads", &bytecask::Options::recovery_threads,
-              "Number of threads for parallel hint-file replay (default 4).")
+              "Number of threads for parallel hint-file replay (default 4; 0 is refused at open).")
       .def_rw("fail_recovery_on_crc_errors",
               &bytecask::Options::fail_recovery_on_crc_errors,
               "If True (default), CRC errors during recovery raise.")

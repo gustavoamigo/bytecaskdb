@@ -205,9 +205,9 @@ Configurable limits are enforced at the API boundary — before any data is copi
 |-------|---------|-------------|-----------|
 | `Options::max_key_bytes` | 4,096 (4 KiB) | 65,535 | Keys live in memory (key directory). Large keys bloat RAM and slow traversal. |
 | `Options::max_value_bytes` | 4,194,304 (4 MiB) | 268,435,455 | Values go to disk. Oversized values cause pathological file rotation. |
-| `Options::max_file_bytes` | 64 MiB | 3 GiB (`kMaxFileBytes`) | Leaves room for one `kMaxBatchBytes` write under the 32-bit offset. |
+| `Options::max_file_bytes` | 64 MiB | 3 GiB (`kMaxFileBytes`) | Leaves room for one `kMaxBatchBytes` write under the 32-bit offset. 0 is valid and seals a file after every write. |
 
-An option above its ceiling makes `open` throw `std::invalid_argument` before the directory is created or locked; it is not lowered to the ceiling, so the engine never runs with a limit other than the one configured. Violations of the size limits throw `std::invalid_argument`. `WritePlan` carries the limits from `Snapshot` (which inherits them from `DB`) or uses the defaults when constructed without a snapshot. `DB::put`, `DB::del`, `DB::del_range`, and `DB::ingest` all validate before proceeding.
+An option above its ceiling, or `recovery_threads = 0`, makes `open` throw `std::invalid_argument` before the directory is created or locked; it is not lowered to the ceiling, so the engine never runs with a limit other than the one configured. Violations of the size limits throw `std::invalid_argument`. `WritePlan` carries the limits from `Snapshot` (which inherits them from `DB`) or uses the defaults when constructed without a snapshot. `DB::put`, `DB::del`, `DB::del_range`, and `DB::ingest` all validate before proceeding.
 
 ### Concurrency Model
 
