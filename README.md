@@ -585,7 +585,7 @@ If you want to take it in a different direction and fork it into your own thing,
 | [`docs/engine_api_design.md`](docs/engine_api_design.md) | Public API specification with usage examples |
 | [`docs/parallel_recovery_design.md`](docs/parallel_recovery_design.md) | File-partitioned recovery with a fan-in merge, as the radix tree used it; retired |
 | [`docs/hint_compression_design.md`](docs/hint_compression_design.md) | zstd-framed hint files: why cold-start recovery is bound by the SSD, the frame layout, compatibility, and measurements |
-| [`docs/blind_leaf_btree_design.md`](docs/blind_leaf_btree_design.md) | Blind-leaf B+ tree design — the key directory: leaves without key bytes, fingerprint lookups, measurements |
+| [`docs/blind_leaf_btree_design.md`](docs/blind_leaf_btree_design.md) | Blind-leaf B+ tree — the key directory: a from-scratch introduction to persistent data structures, path copying, tries, crit bits, blind search and fingerprints, then the design as built, with the measurements |
 | [`docs/persistent_btree_design.md`](docs/persistent_btree_design.md) | Persistent B+ tree design — the inner nodes of the key directory, and the keyed tree selectable with `BYTECASK_KEYDIR=btree` |
 | [`docs/persistent_radix_tree_design.md`](docs/persistent_radix_tree_design.md) | Persistent radix tree design — the key directory before the B+ tree; retired |
 | [`docs/correctness_validation.md`](docs/correctness_validation.md) | Write-path correctness validation: failure classes, proof test matrix, fault injection framework |
