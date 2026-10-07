@@ -19,6 +19,7 @@
 #include <format>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -478,12 +479,17 @@ TEST_CASE("fault sweep: the interposers count std::filesystem's calls",
   const auto to = dir / "a";
   { std::ofstream{from} << "x"; }
 
-  auto fails = [&](SyscallFault mode, auto &&call, std::string_view name) {
+  // names: the calls the standard library may make for it, any of which the
+  // interposers must fail.
+  auto fails = [&](SyscallFault mode, auto &&call,
+                   std::initializer_list<std::string_view> names) {
     ScopedSyscallFaults faults{dir, mode, 1};
     CHECK_THROWS_AS(call(), std::filesystem::filesystem_error);
     const auto rep = faults.report();
     INFO(rep.what);
-    CHECK(rep.what.starts_with(name));
+    CHECK(std::ranges::any_of(names, [&](std::string_view name) {
+      return rep.what.starts_with(name);
+    }));
   };
   // Before glibc 2.33, stat is an inline wrapper around __xstat, which
   // --wrap=stat does not see (xmake.lua, fault_sweep_link_guard): there the
@@ -497,20 +503,24 @@ TEST_CASE("fault sweep: the interposers count std::filesystem's calls",
         return;
       }
     }
-    fails(SyscallFault::before, call, "stat(");
+    fails(SyscallFault::before, call, {"stat("});
   };
   stat_fails([&] { return std::filesystem::file_size(from); });
   stat_fails([&] { return std::filesystem::exists(from); });
+  // libstdc++ opens the directory with openat, libc++ (the MemorySanitizer
+  // build) with opendir.
   fails(SyscallFault::before,
-        [&] { (void)std::filesystem::directory_iterator{dir}; }, "openat(");
+        [&] { (void)std::filesystem::directory_iterator{dir}; },
+        {"openat(", "opendir("});
   fails(SyscallFault::before,
-        [&] { (void)std::filesystem::create_directory(dir / "sub"); }, "mkdir(");
+        [&] { (void)std::filesystem::create_directory(dir / "sub"); },
+        {"mkdir("});
   // Made, then reported failed: the rename landed.
   fails(SyscallFault::after, [&] { std::filesystem::rename(from, to); },
-        "rename(");
+        {"rename("});
   CHECK(std::filesystem::exists(to));
   fails(SyscallFault::before, [&] { (void)std::filesystem::remove(to); },
-        "remove(");
+        {"remove("});
   CHECK(std::filesystem::exists(to));
 }
 
