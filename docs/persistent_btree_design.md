@@ -411,8 +411,12 @@ different algorithm and belongs to `main`, not here.
 
 A `PersistentBTree<V>` handle is `(root, size, version)`; copying it pins
 the version in the `VersionChain`, destroying it unpins. `transient()` on
-a handle starts a `BuildSession` with the next tag of the lineage and a
-copy of the base handle, so the base cannot die under the session.
+a handle starts a `BuildSession` and keeps a copy of the base handle, so
+the base cannot die under the session. The session's tag comes from
+`new_version_tag()`, a process-wide counter, not from the lineage: a node
+may be mutated in place only by the session that created it, so tags must
+be unique across every tree in the process, and a lineage's versions are
+not consecutive.
 `persistent() &&` publishes: the chain checks that the base has no
 successor, records the new version, parks the session's retired nodes on
 the live versions that still reach them, and frees the rest. A transient
