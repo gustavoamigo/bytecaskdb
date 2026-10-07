@@ -239,7 +239,7 @@ The engine state is published through `std::atomic<std::shared_ptr<EngineState>>
   ┌──────────────────────────────────────────────────┐
   │  key_dir         PersistentBTree<KeyDirEntry>     │  key → (file_id, offset, seq)
   │  files           shared_ptr<FileMap>              │  file_id → open DataFile fd
-  │  file_stats      map<uint32_t, FileStats>         │  per-file live/total bytes
+  │  file_stats      FileStatsMap (patch map)         │  per-file live/total bytes
   │  active_file_id  uint32_t                         │
   │  next_file_id    uint32_t                         │  writer-only; monotonic file counter
   │  next_seq         uint64_t                         │  writer-only; monotonic sequence counter
@@ -249,7 +249,7 @@ The engine state is published through `std::atomic<std::shared_ptr<EngineState>>
 
 `EngineState` bundles all engine state into a single immutable value. Writers never mutate an `EngineState` in place; they create a `TransientEngineState` working copy, apply mutations, and publish the result via `persistent()`. The old state stays alive as long as any reader holds a `shared_ptr` reference.
 
-`file_stats` lives inside `EngineState` so that the transient/persistent discipline covers all mutable state uniformly. The map is shallow-copied into `TransientEngineState` on each write — acceptable because the number of open files is small (typically < 100).
+`file_stats` lives inside `EngineState` so that the transient/persistent discipline covers all mutable state uniformly. It is a patch map (see *File Registry*): a commit records its changes as patches and writes no map, so taking a transient of it on each write group is O(1).
 
 ##### Write path — group commit
 
@@ -553,14 +553,36 @@ The check is textual. It cannot tell whether a tag is true; it makes sure the qu
 
 ### File Registry
 
-The engine maps each monotonic `uint32_t` file ID to its open `DataFile` (`EngineState::files`), and keeps per-file `FileStats` the same way (`EngineState::file_stats`). Both are copy-on-write maps from `bytecaskdb/u32_map.cppm`: a copy is an O(1) snapshot, and a write goes through `transient()` / `persistent() &&` like the key directory, so a reader holding an old `EngineState` keeps the registry it started with, and every `DataFile` in it open, without locking.
+The engine maps each monotonic `uint32_t` file ID to its open `DataFile` (`EngineState::files`), and keeps per-file `FileStats` the same way (`EngineState::file_stats`). Both are copy-on-write maps: a copy is an O(1) snapshot, and a write goes through `transient()` / `persistent() &&` like the key directory, so a reader holding an old `EngineState` keeps the registry it started with, and every `DataFile` in it open, without locking.
 
-The module has two implementations of one interface (the `PersistentU32MapOf` / `TransientU32MapOf` concepts), because the two maps are used in opposite ways:
+The two maps are used in opposite ways:
 
 - **`files` is a `PersistentU32Table`**, a paged direct-addressing table: a directory of 256-slot pages, so an ID is a page index (`id >> 8`) and a slot index (`id & 255`), and a lookup is two array indexes. It is read on every record access — a range scan on the blind key directory looks a file up both to read each key and to read its value — and written only at rotation, vacuum and open. A transient shares its base directory until its first write, which copies the directory (one pointer per page) and then each page it writes, once; pages it does not write stay shared with the version it came from, so a write costs one page and the directory, not the table, and a snapshot that holds an old version pins only the pages that have changed since. The per-batch transient the write path takes, which only reads, costs nothing. IDs are minted in sequence and capped at `KeyDirEntry::kMaxFileId` (2^20 − 1). A page whose slots are all empty is dropped and the directory is trimmed to its first and last page, so memory follows the pages that hold live files: a sealed file that vacuum never picks costs its own page and one 16-byte directory pointer per 256 IDs minted since, not a slot per ID. At the ID cap the directory is 4096 pointers (64 KiB).
-- **`file_stats` is a `PersistentU32Map`**, over the keyed `PersistentBTree`: it is updated by every commit and read only by vacuum and `stats()`, so a write must not copy the map.
+- **`file_stats` is a `PersistentPatchMap`** (`bytecaskdb/patch_map.cppm`) over the same paged table: it is written by every commit and read only off the write path, so a write must not touch the map at all. See *Patch map* below.
 
 Neither is built on the key directory's tree. The blind-leaf tree stores no key bytes and reads each key back from its record, and a file ID is in no record. Measured with `engine_bench` at 50k keys against the radix tree `files` was on before: `Range50` 4.44 → 3.83 µs, `Get` 323 → 303 ns, writes unchanged. A one-entry lookup costs about 0.75 ns in the table, 6.8 ns in the radix tree and 8.9 ns in the keyed B+ tree, and the gap widens with the number of files. Paging the table (#380) measured level at 1M keys on a 16-thread host, builds interleaved: `Get` 217 → 217 ns, `Range50` 2394 → 2408 ns, `GetMT` at 16 threads 358 → 340 ns, and writes and recovery within run-to-run noise.
+
+#### Patch map
+
+A commit changes the stats of the active file (its counters and sequence bounds) and subtracts from `live_bytes` of every file whose key it overwrites or deletes. A TPROC-C-shaped commit (10 updates of random keys, 12 inserts) made about 45 such updates; each walked the keyed B+ tree twice and copied its leaf on the first write in a commit. With the data spread over many files, nearly every update hit a different file. On `commit_probe` that was 5 µs of a 45 µs serial section, and 0.2–0.4 µs of a 2.5–2.8 µs single unsynced put (#367). Totalling the changes per file within a commit group recovered only a third of it: the files a group touches are mostly distinct.
+
+`PersistentPatchMap<V, Policy, MaxDepth, Base>` moves that cost off the commit. A version is a base map plus a chain of at most `MaxDepth` immutable runs, newest first. A transient records each write — set a value, erase it, or apply a `Policy::Delta` — as a patch, folded per key into one sorted run; `persistent()` pushes the run onto the chain. When the chain would exceed `MaxDepth`, the freeze squashes instead: it writes every run into a transient of the base, oldest first, and returns a version with an empty chain. A read walks the chain newest first until a set or an erase decides the value, or the base does, and applies the deltas it passed, oldest first: up to `MaxDepth` binary searches more than a base lookup. `get()` and `all()` return owned values, since a value with deltas applied exists nowhere to point at.
+
+- **The policy contract.** `combine(older, d)` must make applying the result equal to applying `older`, then `d`, and must be associative. A transient relies on it to keep one patch per key, and `all()` to merge the chain; a read and a squash only apply patches in order. The compiler cannot check it, so `tests/patch_map_test.cpp` does: `check_patch_policy` applies random delta sequences one by one and folded, left to right and split at a random point, and every policy gets a case — `FileStatsPolicy` and the test's own. A `combine` that took the newer batch's `min_sequence` fails it on the first trial; the engine suite catches that one too, in the group-commit proofs, but only as a stats mismatch after recovery. The container itself is tested against a `std::map` model.
+- **A delta to an absent key is a no-op**, as `update()` on a map is. Subtractions recorded for a file vacuum then erases are dropped, and file IDs are never reused, so none lands on another file.
+- **Old versions are untouched.** A squash builds a new base from a transient; versions that hold the old base and chain keep them. The chain never exceeds `MaxDepth`, so freeing a version never recurses deeply.
+- **The base is the paged table.** A squash copies each page it writes, once, and writes a slot per patch. On the keyed B+ tree a squash cost about 190 ns per file it touched, which with many files was a 100 µs stall in the serial section every 32 groups; on the paged table, replaying the runs in order rather than merging them first, it is about 10 µs at `MaxDepth` = 8.
+
+`kFileStatsMaxDepth` is 8. On `commit_probe` (tmpfs, 16 threads, alternating runs, main at `a751097`) 8 and 32 measured level, and 8 squashes a quarter as much at a time:
+
+| Shape | main serial µs/commit | patch map | commits/s | squash mean |
+|---|---|---|---|---|
+| TPROC-C, `file_mb=1` (~950 files) | 45.5 | 41.2 (−9.5%) | +3.7% | ~10 µs |
+| TPROC-C, defaults | 43.8 | 42.8 (−2.4%) | +1.1% | ~5 µs |
+| Single unsynced put, defaults | 2.54 | 2.36 (−7%) | +5% | ~1 µs |
+| Single unsynced put, `file_mb=1` | 2.81 | 2.42 (−14%) | +11% | ~1 µs |
+
+With the `file_stats` updates stubbed out the TPROC-C serial section was about 40 µs, so the patch map leaves about 1 µs per commit of the 5.5 µs it addressed. Rare squashes still take 50–200 µs (19 of 11,410 on the many-files run).
 
 ### Data File Lifecycle
 
@@ -622,13 +644,13 @@ struct FileStats {
 };
 ```
 
-`file_stats` is a `std::map<uint32_t, FileStats>` inside `EngineState`. It is copied into `TransientEngineState` on each write and updated as part of the state transition. This keeps all mutable state under the transient/persistent discipline.
+`file_stats` is a `FileStatsMap` inside `EngineState`: a patch map (see *File Registry → Patch map*) whose deltas are `FileStatsDelta` and whose policy, `FileStatsPolicy`, adds counters, subtracts `live_bytes` and widens the sequence bounds. A transient of it is taken on each write and updated as part of the state transition. This keeps all mutable state under the transient/persistent discipline.
 
 The helper `entry_size(key_size, value_size)` returns `kHeaderSize + key_size + value_size + kCrcSize` and is used everywhere stats are updated.
 
 ##### Write-path updates
 
-All stats updates happen inside `TransientEngineState::apply_writes`:
+All stats updates happen inside `TransientEngineState::apply_writes` (and `apply_ingest`, the same rules for a follower), each recorded as a patch:
 
 - **On Put**: if the key already exists (overwrite), subtract `entry_size(key.size(), old_entry.value_size)` from `file_stats[old_entry.file_id].live_bytes`. Add `entry_size(key.size(), value.size())` to `file_stats[active_file_id].live_bytes` and to `.total_bytes`.
 - **On Del**: if the key exists, subtract `entry_size(key.size(), old_entry.value_size)` from `file_stats[old_entry.file_id].live_bytes`. Add the tombstone size (`kHeaderSize + key.size() + kCrcSize`) to `file_stats[active_file_id].total_bytes` and `.tombstone_bytes`. The tombstone is never added to `live_bytes` — tombstones are never referenced by the key directory.

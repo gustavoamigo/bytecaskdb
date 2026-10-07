@@ -27,6 +27,7 @@ import bytecask.btree;
 import bytecask.buffer_pool;
 import bytecask.data_entry;
 import bytecask.data_file;
+import bytecask.patch_map;
 import bytecask.types;
 import bytecask.u32_map;
 import bytecask.util;
@@ -82,9 +83,60 @@ struct FileStats {
 };
 #endif
 
+// A change to one file's stats, as the write path makes it: additions to
+// the counters, a subtraction from live_bytes, and the sequences of a batch.
+// FileStatsMap records these and applies them when read.
+struct FileStatsDelta {
+  std::uint64_t live_added{0};
+  std::uint64_t live_removed{0};
+  std::uint64_t total_added{0};
+  std::uint64_t tombstone_added{0};
+  std::uint64_t marker_added{0};
+  std::uint64_t min_sequence{0}; // first batch's first sequence; 0 = none
+  std::uint64_t max_sequence{0};
+};
+
+struct FileStatsPolicy {
+  using Delta = FileStatsDelta;
+  static void apply(FileStats &fs, const Delta &d) {
+    // Additions first: the stats are consistent before the writes a delta
+    // totals and after them, so live_bytes cannot wrap in between.
+    fs.live_bytes += d.live_added;
+    fs.live_bytes -= d.live_removed;
+    fs.total_bytes += d.total_added;
+    fs.tombstone_bytes += d.tombstone_added;
+    fs.marker_bytes += d.marker_added;
+    // A file's sequences ascend, so its minimum is its first batch's.
+    if (fs.min_sequence == 0) fs.min_sequence = d.min_sequence;
+    fs.max_sequence = std::max(fs.max_sequence, d.max_sequence);
+  }
+  static void combine(Delta &older, const Delta &d) {
+    older.live_added += d.live_added;
+    older.live_removed += d.live_removed;
+    older.total_added += d.total_added;
+    older.tombstone_added += d.tombstone_added;
+    older.marker_added += d.marker_added;
+    if (older.min_sequence == 0) older.min_sequence = d.min_sequence;
+    older.max_sequence = std::max(older.max_sequence, d.max_sequence);
+  }
+};
+
+// Per-file stats, written on every commit and read only off the write path
+// (vacuum's choice of file, ChangeIterator, resume, the consistency checks).
+// A commit group's changes are one patch run, so a commit writes no map;
+// every kFileStatsMaxDepth groups a freeze squashes the runs into the paged
+// table (#367). 8 measured level with 32 on commit_probe's serial section,
+// with squashes a quarter the size (~10 µs on ~950 files, ~5 µs at defaults).
+inline constexpr std::size_t kFileStatsMaxDepth = 8;
+using FileStatsMap =
+    PersistentPatchMap<FileStats, FileStatsPolicy, kFileStatsMaxDepth>;
+using FileStatsTransient =
+    TransientPatchMap<FileStats, FileStatsPolicy, kFileStatsMaxDepth,
+                      PersistentU32Table<FileStats>>;
+
 // File registry: a COW map from file_id to shared DataFile.
-// PersistentU32Map provides O(1) snapshot sharing; rotation and vacuum
-// fork a transient, mutate it, and freeze — no O(N) map clone.
+// PersistentU32Table provides O(1) snapshot sharing; rotation and vacuum
+// fork a transient, mutate it, and freeze, copying only the pages they touch.
 
 // ---------------------------------------------------------------------------
 // KeyDirEntry — one slot in the in-memory key directory.
@@ -816,7 +868,7 @@ export inline auto key_dir_from_recovered(RecoveryKeyDirTree t) -> KeyDirTree {
 export struct EngineState {
   KeyDirTree key_dir;
   PersistentU32Table<std::shared_ptr<DataFile>> files;
-  PersistentU32Map<FileStats> file_stats;
+  FileStatsMap file_stats;
   std::uint32_t active_file_id{};
   std::uint32_t next_file_id{};
   std::uint64_t next_seq{1};
@@ -983,7 +1035,7 @@ export struct RecoveryResult {
   std::map<Key, PointTombstone> tombstones;
   std::vector<RangeTombstone> range_tombstones;
   std::uint64_t max_seq{0};
-  PersistentU32Map<FileStats> file_stats;
+  PersistentU32Table<FileStats> file_stats;
   // Sequences of point tombstones seen beating a Put in another file.
   // Unsorted, may repeat; range tombstones carry their own flag.
   std::vector<std::uint64_t> needed_tombstones;

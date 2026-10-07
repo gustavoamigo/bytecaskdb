@@ -111,7 +111,7 @@ inline void assert_consistent(const DB &db) {
     if (entry.sequence() > max_seq) max_seq = entry.sequence();
   }
 
-  for (const auto [file_id, fs] : state->file_stats) {
+  for (const auto [file_id, fs] : state->file_stats.all()) {
     auto it = computed_live.find(file_id);
     auto expected_live = (it != computed_live.end()) ? it->second : 0ULL;
     INFO("file_id=" << file_id << " live_bytes");
@@ -298,7 +298,7 @@ inline auto fingerprint(const DB &db) -> EngineFingerprint {
   auto state = db.engine_state();
   fp.next_seq = state->next_seq;
   fp.key_values = key_values(db);
-  for (const auto [file_id, fs] : state->file_stats) {
+  for (const auto [file_id, fs] : state->file_stats.all()) {
     auto file = state->files.get(file_id);
     if (!file) continue;
     fp.file_stats[(*file)->path().stem().string()] = fs;
@@ -636,7 +636,7 @@ inline auto capture_vacuum_baseline(const DB &db) -> VacuumBaseline {
   VacuumBaseline bl;
   bl.keys = capture_baseline(db);
   auto state = db.engine_state();
-  for (const auto [file_id, fs] : state->file_stats) {
+  for (const auto [file_id, fs] : state->file_stats.all()) {
     bl.file_stats.emplace(file_id, fs);
   }
   bl.structural = count_structural_entries(db);
@@ -662,7 +662,7 @@ inline auto find_vacuum_target(const DB &db) -> std::uint32_t {
   auto state = db.engine_state();
   std::uint32_t target_id{};
   double worst_frag = 0.0;
-  for (const auto [file_id, fs] : state->file_stats) {
+  for (const auto [file_id, fs] : state->file_stats.all()) {
     if (file_id == state->active_file_id) continue;
     if (fs.total_bytes == 0) continue;
     const double frag = static_cast<double>(fs.reclaimable_bytes()) /

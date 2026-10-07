@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// ByteCaskDB — unit tests for bytecask.u32_map: both implementations against
-// a std::map model, and the paged table's paging, trimming and snapshots.
+// ByteCaskDB — unit tests for bytecask.u32_map: the paged table against a
+// std::map model, and its paging, trimming and snapshots.
 
 #include <catch2/catch_template_test_macros.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -15,10 +15,8 @@
 #include <vector>
 import bytecask.u32_map;
 
-// Both implementations provide the interface the engine relies on.
-static_assert(bytecask::PersistentU32MapOf<bytecask::PersistentU32Map<int>, int>);
+// The table provides the interface the engine relies on.
 static_assert(bytecask::PersistentU32MapOf<bytecask::PersistentU32Table<int>, int>);
-static_assert(bytecask::TransientU32MapOf<bytecask::TransientU32Map<int>, int>);
 static_assert(bytecask::TransientU32MapOf<bytecask::TransientU32Table<int>, int>);
 
 namespace {
@@ -41,7 +39,6 @@ auto contents(const std::map<std::uint32_t, int> &m)
 } // namespace
 
 TEMPLATE_TEST_CASE("u32 map matches a std::map model", "[u32_map]",
-                   bytecask::PersistentU32Map<int>,
                    bytecask::PersistentU32Table<int>) {
   std::mt19937 rng{7};
   std::map<std::uint32_t, int> model;

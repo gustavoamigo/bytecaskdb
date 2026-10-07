@@ -314,9 +314,9 @@ TEST_CASE("validate_state_consistency throws on live_bytes mismatch",
   // Corrupt live_bytes in file_stats.
   auto bad = *state;
   auto fstats_t = bad.file_stats.transient();
-  fstats_t.update(bad.active_file_id, [](bytecask::FileStats &fs) {
-    fs.live_bytes = 999999;
-  });
+  auto fs = *fstats_t.get(bad.active_file_id);
+  fs.live_bytes = 999999;
+  fstats_t.set(bad.active_file_id, fs);
   bad.file_stats = std::move(fstats_t).persistent();
   REQUIRE_THROWS_AS(db.test_validate_state_consistency(bad),
                     std::runtime_error);
