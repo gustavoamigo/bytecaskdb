@@ -5779,6 +5779,14 @@ TEST_CASE("count_keys matches the keys in the range, at every limit",
   for (int i = 0; i < 3'000; ++i) {
     const auto from = count_test_bound(sorted, rng);
     const auto to = count_test_bound(sorted, rng);
+    // An empty or swapped range is refused, at every limit.
+    if (!(from < to)) {
+      CHECK_THROWS_AS(snap.count_keys(to_bytes(from), to_bytes(to), 0),
+                      std::invalid_argument);
+      CHECK_THROWS_AS(snap.count_keys(to_bytes(from), to_bytes(to), kNoLimit),
+                      std::invalid_argument);
+      continue;
+    }
     for (const std::size_t limit :
          {std::size_t{0}, std::size_t{1}, std::size_t{7}, std::size_t{100},
           std::size_t{1024}, kNoLimit}) {
