@@ -1252,15 +1252,26 @@ TEST_CASE("ReadOnlyMmapDataFile::openForRead throws when fstat fails",
                           to_bytes("v"));
     w->sync();
   }
+  // The open is the first counted call, the fstat the second. Before glibc
+  // 2.33, fstat is an inline wrapper around __fxstat, which --wrap=fstat
+  // does not see: the second counted call is then the mmap.
+  bool threw = false;
+  std::string failed;
   {
-    // The open is the first counted call, the fstat the second.
     bytecask::testing::ScopedSyscallFaults faults{
         dir, bytecask::testing::SyscallFault::before, 2};
-    CHECK_THROWS_AS(bytecask::ReadOnlyMmapDataFile::openForRead(path),
-                    std::system_error);
-    CHECK(faults.report().what.starts_with("fstat("));
+    try {
+      (void)bytecask::ReadOnlyMmapDataFile::openForRead(path);
+    } catch (const std::system_error &) {
+      threw = true;
+    }
+    failed = faults.report().what;
   }
   std::filesystem::remove_all(dir);
+  if (!failed.starts_with("fstat(")) {
+    SKIP("fstat is not interposed on this libc; failed " << failed);
+  }
+  CHECK(threw);
 }
 #endif
 
