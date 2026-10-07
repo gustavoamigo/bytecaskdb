@@ -6,16 +6,17 @@
 //
 // - PersistentU32Map<V> / TransientU32Map<V>: the keyed PersistentBTree.
 //   For maps written often and read off the hot path (file_stats).
-// - PersistentU32Table<V> / TransientU32Table<V>: a direct-addressing table,
-//   one slot per key between the lowest and highest key held. A lookup is an
-//   index; a write copies the table. For maps read on every record access and
-//   written rarely, with dense keys (files: ids are minted in sequence and
-//   capped at KeyDirEntry::kMaxFileId).
+// - PersistentU32Table<V> / TransientU32Table<V>: a paged direct-addressing
+//   table. A lookup is two indexes; a write copies the directory and the
+//   pages it touches, and memory follows the pages holding keys. For maps
+//   read on every record access and written rarely, with clustered keys
+//   (files: ids are minted in sequence and capped at KeyDirEntry::kMaxFileId).
 //
 // Neither is the key directory's tree: the blind-leaf tree keeps no key bytes
 // and reads them back from data files, and a file id is in no data file.
 
 module;
+#include <algorithm>
 #include <array>
 #include <concepts>
 #include <cstddef>
@@ -192,55 +193,82 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// PersistentU32Table<V> / TransientU32Table<V> — direct addressing.
+// PersistentU32Table<V> / TransientU32Table<V> — paged direct addressing.
 //
-// A version is an immutable block: slots[k - base] holds key k. Persistent
-// copies share the block; a transient reads its base block until its first
-// write, which copies it, so a transient that only reads costs nothing.
-// Erasing the lowest or highest key trims the block, so it spans the keys
-// held, not every key ever set.
+// Key k lives in page k >> kU32TablePageBits, at slot k % kU32TablePageSize.
+// A version is an immutable directory of pages, so a lookup is two indexes.
+// Persistent copies share the directory. A transient reads its base directory
+// until its first write, which copies the directory (one pointer per page);
+// it copies a page the first time it writes to it, and every page it does not
+// write stays shared with the version it came from. A transient that only
+// reads costs nothing.
+//
+// A page whose slots are all empty is dropped, and the directory is trimmed
+// to its first and last page, so memory follows the pages holding keys, plus
+// one directory pointer for each page between them.
 // ---------------------------------------------------------------------------
-template <typename V> struct U32TableBlock {
+inline constexpr unsigned kU32TablePageBits = 8;
+inline constexpr std::size_t kU32TablePageSize = std::size_t{1}
+                                                 << kU32TablePageBits;
+
+template <typename V> struct U32TablePage {
+  std::size_t used{0}; // slots holding a value; a page at 0 is dropped
+  std::array<std::optional<V>, kU32TablePageSize> slots{};
+};
+
+template <typename V> struct U32TableDir {
+  // pages[i] is page number base + i, null where the page was dropped.
+  // Neither end is null: an emptied directory has no pages.
   std::uint32_t base{0};
-  std::vector<std::optional<V>> slots;
+  std::vector<std::shared_ptr<const U32TablePage<V>>> pages;
+
+  [[nodiscard]] auto page(std::uint32_t p) const noexcept
+      -> const U32TablePage<V> * {
+    if (p < base) return nullptr;
+    const auto i = std::size_t{p - base};
+    return i < pages.size() ? pages[i].get() : nullptr;
+  }
 
   [[nodiscard]] auto find(std::uint32_t key) const noexcept -> const V * {
-    if (key < base) return nullptr;
-    const auto i = std::size_t{key - base};
-    if (i >= slots.size() || !slots[i]) return nullptr;
-    return &*slots[i];
+    const auto *pg = page(key >> kU32TablePageBits);
+    if (!pg) return nullptr;
+    const auto &slot = pg->slots[key & (kU32TablePageSize - 1)];
+    return slot ? &*slot : nullptr;
   }
 };
 
 export template <typename V> class TransientU32Table;
 
-// Yields pair<uint32_t, const V&> in ascending key order. Holds the block it
-// walks, so it stays valid after the map it came from is gone.
+// Yields pair<uint32_t, const V&> in ascending key order. Holds the directory
+// it walks, and so its pages, so it stays valid after the map it came from is
+// gone.
 export template <typename V> class U32TableIterator {
 public:
   using value_type = std::pair<std::uint32_t, const V &>;
   using difference_type = std::ptrdiff_t;
 
   U32TableIterator() = default;
-  explicit U32TableIterator(std::shared_ptr<const U32TableBlock<V>> block)
-      : block_{std::move(block)} {
+  explicit U32TableIterator(std::shared_ptr<const U32TableDir<V>> dir)
+      : dir_{std::move(dir)} {
     skip_empty();
   }
 
   auto operator*() const -> std::pair<std::uint32_t, const V &> {
-    return {block_->base + static_cast<std::uint32_t>(i_), *block_->slots[i_]};
+    const auto page_no = dir_->base + static_cast<std::uint32_t>(page_);
+    return {(page_no << kU32TablePageBits) | static_cast<std::uint32_t>(slot_),
+            *dir_->pages[page_]->slots[slot_]};
   }
 
   auto operator++() -> U32TableIterator & {
-    ++i_;
+    ++slot_;
     skip_empty();
     return *this;
   }
 
   auto operator==(const U32TableIterator &other) const noexcept -> bool {
     return at_end() ? other.at_end()
-                    : !other.at_end() && block_ == other.block_ &&
-                          i_ == other.i_;
+                    : !other.at_end() && dir_ == other.dir_ &&
+                          page_ == other.page_ && slot_ == other.slot_;
   }
 
   auto operator==(std::default_sentinel_t) const noexcept -> bool {
@@ -249,14 +277,20 @@ public:
 
 private:
   [[nodiscard]] auto at_end() const noexcept -> bool {
-    return !block_ || i_ >= block_->slots.size();
+    return !dir_ || page_ >= dir_->pages.size();
   }
   void skip_empty() noexcept {
-    while (!at_end() && !block_->slots[i_]) ++i_;
+    for (; !at_end(); ++page_, slot_ = 0) {
+      const auto *pg = dir_->pages[page_].get();
+      if (!pg) continue;
+      while (slot_ < kU32TablePageSize && !pg->slots[slot_]) ++slot_;
+      if (slot_ < kU32TablePageSize) return;
+    }
   }
 
-  std::shared_ptr<const U32TableBlock<V>> block_;
-  std::size_t i_{0};
+  std::shared_ptr<const U32TableDir<V>> dir_;
+  std::size_t page_{0};
+  std::size_t slot_{0};
 };
 
 export template <typename V> class PersistentU32Table {
@@ -265,7 +299,7 @@ public:
 
   // Valid for the lifetime of this map instance.
   [[nodiscard]] auto get(std::uint32_t key) const noexcept -> const V * {
-    return block_ ? block_->find(key) : nullptr;
+    return dir_ ? dir_->find(key) : nullptr;
   }
 
   [[nodiscard]] auto contains(std::uint32_t key) const noexcept -> bool {
@@ -273,16 +307,23 @@ public:
   }
 
   [[nodiscard]] auto empty() const noexcept -> bool {
-    return !block_ || block_->slots.empty();
+    return !dir_ || dir_->pages.empty();
   }
 
-  // O(1): shares this version's block until the transient's first write.
+  // Pages this version holds: its memory, in units of a page.
+  [[nodiscard]] auto pages() const noexcept -> std::size_t {
+    if (!dir_) return 0;
+    return static_cast<std::size_t>(std::ranges::count_if(
+        dir_->pages, [](const auto &pg) { return pg != nullptr; }));
+  }
+
+  // O(1): shares this version's directory until the transient's first write.
   [[nodiscard]] auto transient() const -> TransientU32Table<V> {
-    return TransientU32Table<V>{block_};
+    return TransientU32Table<V>{dir_};
   }
 
   [[nodiscard]] auto begin() const -> U32TableIterator<V> {
-    return U32TableIterator<V>{block_};
+    return U32TableIterator<V>{dir_};
   }
 
   [[nodiscard]] auto end() const noexcept -> std::default_sentinel_t {
@@ -292,10 +333,10 @@ public:
 private:
   friend class TransientU32Table<V>;
 
-  explicit PersistentU32Table(std::shared_ptr<const U32TableBlock<V>> block)
-      : block_{std::move(block)} {}
+  explicit PersistentU32Table(std::shared_ptr<const U32TableDir<V>> dir)
+      : dir_{std::move(dir)} {}
 
-  std::shared_ptr<const U32TableBlock<V>> block_;
+  std::shared_ptr<const U32TableDir<V>> dir_;
 };
 
 export template <typename V> class TransientU32Table {
@@ -307,8 +348,8 @@ public:
 
   // Safe for immediate use; do not retain across set()/erase() calls.
   [[nodiscard]] auto get(std::uint32_t key) const noexcept -> const V * {
-    const auto *b = view();
-    return b ? b->find(key) : nullptr;
+    const auto *d = view();
+    return d ? d->find(key) : nullptr;
   }
 
   [[nodiscard]] auto contains(std::uint32_t key) const noexcept -> bool {
@@ -316,46 +357,36 @@ public:
   }
 
   [[nodiscard]] auto empty() const noexcept -> bool {
-    const auto *b = view();
-    return !b || b->slots.empty();
+    const auto *d = view();
+    return !d || d->pages.empty();
   }
 
   void set(std::uint32_t key, V value) {
-    auto &b = writable();
-    if (b.slots.empty()) {
-      b.base = key;
-    } else if (key < b.base) {
-      b.slots.insert(b.slots.begin(), std::size_t{b.base - key},
-                     std::nullopt);
-      b.base = key;
-    }
-    const auto i = std::size_t{key - b.base};
-    if (i >= b.slots.size()) b.slots.resize(i + 1);
-    b.slots[i] = std::move(value);
+    auto &pg = writable_page(key >> kU32TablePageBits);
+    auto &slot = pg.slots[key & (kU32TablePageSize - 1)];
+    if (!slot) ++pg.used;
+    slot = std::move(value);
   }
 
   auto erase(std::uint32_t key) -> bool {
     if (!contains(key)) return false;
-    auto &b = writable();
-    b.slots[std::size_t{key - b.base}].reset();
-    while (!b.slots.empty() && !b.slots.back()) b.slots.pop_back();
-    std::size_t lead = 0;
-    while (lead < b.slots.size() && !b.slots[lead]) ++lead;
-    b.slots.erase(b.slots.begin(),
-                  b.slots.begin() + static_cast<std::ptrdiff_t>(lead));
-    b.base = b.slots.empty() ? 0 : b.base + static_cast<std::uint32_t>(lead);
+    const auto p = key >> kU32TablePageBits;
+    auto &pg = writable_page(p);
+    pg.slots[key & (kU32TablePageSize - 1)].reset();
+    if (--pg.used == 0) drop_page(p);
     return true;
   }
 
   // Read-modify-write: calls func(V&) on the existing value. No-op if absent.
   template <typename Func> void update(std::uint32_t key, Func &&func) {
     if (!contains(key)) return;
-    auto &b = writable();
-    std::forward<Func>(func)(*b.slots[std::size_t{key - b.base}]);
+    auto &pg = writable_page(key >> kU32TablePageBits);
+    std::forward<Func>(func)(*pg.slots[key & (kU32TablePageSize - 1)]);
   }
 
   // Freeze and consume; produces an immutable snapshot.
   [[nodiscard]] auto persistent() && -> PersistentU32Table<V> {
+    owned_.clear();
     if (own_) return PersistentU32Table<V>{std::move(own_)};
     return PersistentU32Table<V>{std::move(base_)};
   }
@@ -363,23 +394,58 @@ public:
 private:
   friend class PersistentU32Table<V>;
 
-  explicit TransientU32Table(std::shared_ptr<const U32TableBlock<V>> base)
+  explicit TransientU32Table(std::shared_ptr<const U32TableDir<V>> base)
       : base_{std::move(base)} {}
 
-  [[nodiscard]] auto view() const noexcept -> const U32TableBlock<V> * {
+  [[nodiscard]] auto view() const noexcept -> const U32TableDir<V> * {
     return own_ ? own_.get() : base_.get();
   }
 
-  // The block this transient writes to: a copy of the base, made once.
-  auto writable() -> U32TableBlock<V> & {
+  // The page this transient writes to: a copy of the shared page, or a new
+  // one, made once and listed in owned_. Pages not in owned_ are shared with
+  // other versions and never written.
+  auto writable_page(std::uint32_t p) -> U32TablePage<V> & {
+    for (const auto &[no, pg] : owned_)
+      if (no == p) return *pg;
+    const auto *d = view();
+    const auto *shared = d ? d->page(p) : nullptr;
+    auto pg = shared ? std::make_shared<U32TablePage<V>>(*shared)
+                     : std::make_shared<U32TablePage<V>>();
+    owned_.reserve(owned_.size() + 1);
     if (!own_)
-      own_ = base_ ? std::make_unique<U32TableBlock<V>>(*base_)
-                   : std::make_unique<U32TableBlock<V>>();
-    return *own_;
+      own_ = base_ ? std::make_unique<U32TableDir<V>>(*base_)
+                   : std::make_unique<U32TableDir<V>>();
+    auto &dir = *own_;
+    if (dir.pages.empty()) {
+      dir.base = p;
+    } else if (p < dir.base) {
+      dir.pages.insert(dir.pages.begin(), std::size_t{dir.base - p}, nullptr);
+      dir.base = p;
+    }
+    const auto i = std::size_t{p - dir.base};
+    if (i >= dir.pages.size()) dir.pages.resize(i + 1);
+    dir.pages[i] = pg;
+    owned_.emplace_back(p, pg);
+    return *pg;
   }
 
-  std::shared_ptr<const U32TableBlock<V>> base_;
-  std::unique_ptr<U32TableBlock<V>> own_;
+  // Drops an emptied page this transient owns and trims the directory.
+  void drop_page(std::uint32_t p) {
+    std::erase_if(owned_, [p](const auto &e) { return e.first == p; });
+    auto &dir = *own_;
+    dir.pages[std::size_t{p - dir.base}].reset();
+    while (!dir.pages.empty() && !dir.pages.back()) dir.pages.pop_back();
+    std::size_t lead = 0;
+    while (lead < dir.pages.size() && !dir.pages[lead]) ++lead;
+    dir.pages.erase(dir.pages.begin(),
+                    dir.pages.begin() + static_cast<std::ptrdiff_t>(lead));
+    dir.base = dir.pages.empty() ? 0 : dir.base + static_cast<std::uint32_t>(lead);
+  }
+
+  std::shared_ptr<const U32TableDir<V>> base_;
+  std::unique_ptr<U32TableDir<V>> own_;
+  std::vector<std::pair<std::uint32_t, std::shared_ptr<U32TablePage<V>>>>
+      owned_;
 };
 
 // ---------------------------------------------------------------------------
