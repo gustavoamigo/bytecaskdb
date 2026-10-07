@@ -8,8 +8,14 @@ name: CI
 on:
   push:
     branches: [main]
+  # A pull request that changes only documentation runs nothing here: no job
+  # reads Markdown. Pushes to main still run everything, so every commit on
+  # main keeps its coverage upload.
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
   workflow_dispatch:
 
 permissions:

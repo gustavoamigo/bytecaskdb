@@ -25,8 +25,14 @@ name: Build Python wheels
 on:
   push:
     branches: [main]
+  # A pull request that changes only documentation runs nothing here: no job
+  # reads Markdown. Pushes to main still run everything, so every commit on
+  # main publishes its wheels.
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
   workflow_dispatch:
 
 # Required for GitHub Pages deployment.
