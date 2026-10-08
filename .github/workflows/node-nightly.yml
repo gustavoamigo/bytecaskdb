@@ -64,12 +64,17 @@ jobs:
         working-directory: bytecaskdb-node
         run: npm ci
 
+      # releasedbg, not debug: debug walks the whole key directory on every
+      # published state (store_state), so the suite's 10,000 single puts are
+      # O(N^2) there and ran past two minutes. The engine's own sanitizer jobs
+      # cover those checks; this job is after the binding's memory errors.
+      # releasedbg keeps symbols and frame pointers for the reports.
       - name: Configure xmake
         run: |
           RESOURCE_DIR=$(clang --print-resource-dir)
           xmake f --toolchain=clang \
             --cxflags="-resource-dir=${RESOURCE_DIR}" \
-            --sanitizer=address -m debug -y
+            --sanitizer=address -m releasedbg -y
 
       - name: Build native addon
         run: xmake build bytecaskdb_node
@@ -88,7 +93,7 @@ jobs:
                ! -name '*preinit*' | head -n 1)
           test -n "$RT" || { echo "no ASan runtime found"; exit 1; }
           echo "ASan runtime: $RT"
-          LD_PRELOAD="$RT" npx vitest run --testTimeout=120000
+          LD_PRELOAD="$RT" npx vitest run --testTimeout=60000
 
   wasm-checked:
     runs-on: ubuntu-latest

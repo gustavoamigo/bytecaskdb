@@ -341,8 +341,9 @@ the existing seam rather than building a new one.
 failure:
 
 - **Native under AddressSanitizer.** The addon is built with
-  `--sanitizer=address -m debug`, and the ASan runtime is preloaded into an
-  uninstrumented `node`. Leak detection is off, since it would report V8's own
+  `--sanitizer=address -m releasedbg`, and the ASan runtime is preloaded into
+  an uninstrumented `node`. Not `-m debug`: there every published state walks
+  the whole key directory, and the suite's 10,000 single puts take minutes. Leak detection is off, since it would report V8's own
   allocations live at exit. Wrapper finalizers run when V8 collects, in an
   order no test controls; `test/integration/finalizers.test.ts` leaves every
   wrapper type unclosed and forces collections (`vitest.config.ts` passes

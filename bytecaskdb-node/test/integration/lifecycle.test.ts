@@ -3,7 +3,11 @@ import { test, expect, decodeBytes } from '../fixtures/index.js'
 import { join } from 'node:path'
 import { createWasmBackend } from '../../src/wasm-backend.js'
 
-test('createWasmBackend initializes successfully', async () => {
+// The native backend's runs (including the ASan nightly) need not build the
+// WASM module.
+const isNative = process.env.BC_TEST_BACKEND === 'native'
+
+test.skipIf(isNative)('createWasmBackend initializes successfully', async () => {
   const backend = await createWasmBackend()
 
   expect(backend).toBeDefined()
