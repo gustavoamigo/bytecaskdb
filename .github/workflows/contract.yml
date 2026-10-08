@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: MIT
+# CONTRACT.md states guarantees in public terms: every name in it is
+# declared in include/bytecask.hpp, or is on a baseline that only shrinks
+# (#399). A private name describes mechanism, which changes under refactors
+# that change no guarantee.
+#
+# Its own workflow, because ci.yml ignores Markdown: a change to the
+# contract alone must still run this, and a change to the header, the
+# script or the baseline can break it too.
+
+name: Contract
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - CONTRACT.md
+      - include/bytecask.hpp
+      - scripts/check_contract_vocabulary.py
+      - scripts/contract_vocabulary_baseline.txt
+  pull_request:
+    branches: [main]
+    paths:
+      - CONTRACT.md
+      - include/bytecask.hpp
+      - scripts/check_contract_vocabulary.py
+      - scripts/contract_vocabulary_baseline.txt
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract-vocabulary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: CONTRACT.md names only public API
+        run: python3 scripts/check_contract_vocabulary.py
