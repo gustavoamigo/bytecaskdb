@@ -199,7 +199,7 @@ Both backends throw an `Error` whose `code` says what kind of failure it was, so
 |---|---|
 | `BC_DEGRADED` | A write on a degraded engine. Reads still work; `resume()` recovers. |
 | `BC_FOLLOWER_MODE` | A normal write in follower mode. |
-| `BC_CLOSED` | A call on a closed DB, snapshot or plan, or on a snapshot or plan already consumed. A closed iterator is done instead. |
+| `BC_CLOSED` | A call on a closed DB, snapshot, plan or file manifest, or on a snapshot or plan already consumed. A closed iterator is done instead. |
 | `BC_INVALID_ARGUMENT` | Input refused before anything is written: a key, value or plan over its limit, an empty range, an option over its ceiling. |
 | `BC_IO` | An I/O failure. `errno` holds the system error: Linux's numbering on the native backend, Emscripten's on WASM. |
 | `BC_LOGIC` | A call the engine's state does not allow, such as `ingest` on a leader or a guard on a plan without a snapshot. |

@@ -93,3 +93,27 @@ test('resume() on an engine that is not degraded does nothing', async ({ testing
   expect(new TextDecoder().decode(db.get('a')!)).toBe('1')
   db.close()
 })
+
+test('a close whose final sync fails reports BC_IO and still closes', async ({ testing, dir }) => {
+  const db = testing.backend.open(join(dir, 'db'))
+  db.put('unsynced', '1', { sync: false })
+
+  // close() makes every write durable; its fdatasync fails.
+  testing.failAt('io_data_file_sync')
+  let error: ByteCaskError
+  try {
+    error = caught(() => db.close())
+  } finally {
+    testing.clearFault()
+  }
+  expect(error.code).toBe('BC_IO')
+  expect(error.errno).toBeGreaterThan(0)
+
+  // The handle is released either way.
+  expect(caught(() => db.get('unsynced')).code).toBe('BC_CLOSED')
+  db.close()
+
+  // And so is the directory lock: the database opens again.
+  const reopened = testing.backend.open(join(dir, 'db'))
+  reopened.close()
+})

@@ -12,8 +12,8 @@ export type EntryType = 'put' | 'delete' | 'bulkBegin' | 'bulkEnd' | 'rangeDel';
 // The `code` on every error either backend throws.
 //   BC_DEGRADED          a write on a degraded engine; resume() clears it
 //   BC_FOLLOWER_MODE     a normal write in follower mode
-//   BC_CLOSED            a call on a closed DB, or on a closed or consumed
-//                        snapshot or plan
+//   BC_CLOSED            a call on a closed DB or file manifest, or on a
+//                        closed or consumed snapshot or plan
 //   BC_INVALID_ARGUMENT  input refused before anything is written: a key,
 //                        value or plan over its limit, an empty range, an
 //                        option over its ceiling

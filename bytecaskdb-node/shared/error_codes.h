@@ -20,8 +20,8 @@
 namespace bytecask_node {
 
 // Thrown by a binding for a handle that can no longer be used: a closed DB,
-// snapshot or plan, or a snapshot or plan already consumed. Reported as
-// BC_CLOSED, like the engine's own DbClosed.
+// snapshot, plan or file manifest, or a snapshot or plan already consumed.
+// Reported as BC_CLOSED, like the engine's own DbClosed.
 // Header-only, so it has no out-of-line virtual to anchor its vtable; each
 // binding is one translation unit, which emits it once.
 #pragma clang diagnostic push

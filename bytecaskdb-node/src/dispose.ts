@@ -38,8 +38,8 @@ export function applyDisposeWiring(module: Record<string, any>): void {
   // or not that throws.
   //
   // A deleted Embind handle makes every bound method throw Embind's own
-  // BindingError. Check first, so a closed handle reports BC_CLOSED as the
-  // native addon's do, and a closed iterator is done, as it is there.
+  // BindingError. Check first, so a closed handle reports BC_CLOSED as it
+  // does on the native addon, and a closed iterator is done, as it is there.
   // Embind also converts the arguments before the C++ guard runs, so an
   // argument of the wrong type is its BindingError (or a TypeError, for a
   // value that is not a BigInt), with no code: give it BC_INVALID_ARGUMENT,
