@@ -217,7 +217,7 @@ EOF
   echo
   for entry in "${LABELS[@]}"; do
     IFS='|' read -r label spec engine <<<"$entry"
-    line=$(grep -hE "(ByteCaskDB|InnoDB):" "$OUT/$label.log" | head -1)
+    line=$(grep -hE "(ByteCaskDB|InnoDB): +[0-9]+ NOPM" "$OUT/$label.log" | head -1)
     nopm=$(echo "$line" | awk '{print $2}'); tpm=$(echo "$line" | awk '{print $5}')
     sha=-
     [[ "$engine" == bytecaskdb ]] && sha=$(cut -c1-10 "$OUT/sha_$(slug_of "$spec")")
