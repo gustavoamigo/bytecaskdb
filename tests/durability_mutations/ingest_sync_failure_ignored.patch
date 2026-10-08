@@ -2,18 +2,18 @@ ingest ignores a failed final fdatasync and publishes the slice as durable.
 Guarded-by: "prove_repl__*"
 
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..dfec0da8 100644
+index 9f42cec..68ef8cc 100644
 --- a/bytecaskdb/bytecask.cppm
 +++ b/bytecaskdb/bytecask.cppm
-@@ -6670,10 +6670,7 @@ void DB::ingest(std::span<const DataEntryView> entries) {
-     t.active_file().sync();
-     t.apply_sync(t.next_seq() - 1);
-   } catch (...) {
--    auto err_s = current->degraded_copy(
--        "ingest fdatasync failed: call resume() to recover.");
--    store_state(std::move(err_s));
--    throw;
-+    t.apply_sync(t.next_seq() - 1);
-   }
+@@ -6791,10 +6791,7 @@ void DB::ingest(std::span<const DataEntryView> entries) {
+       t.active_file().sync();
+       t.apply_sync(t.next_seq() - 1);
+     } catch (...) {
+-      auto err_s = current->degraded_copy(
+-          "ingest fdatasync failed: call resume() to recover.");
+-      store_state(std::move(err_s));
+-      throw;
++      t.apply_sync(t.next_seq() - 1);
+     }
  
-   assert(t.active_file().size() <= rotation_threshold_);
+     assert(t.active_file().size() <= rotation_threshold_);

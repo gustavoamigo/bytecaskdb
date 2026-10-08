@@ -1,0 +1,31 @@
+Freeing a dropped subtree allocates its work list on the heap, in
+noexcept destructors: under memory pressure the process ends there.
+Reverts #364.
+Guarded-by: "alloc sweep: a transient tree is freed when nothing can be allocated"
+
+diff --git a/bytecaskdb/version_chain.cppm b/bytecaskdb/version_chain.cppm
+index d439b52..3abdd0d 100644
+--- a/bytecaskdb/version_chain.cppm
++++ b/bytecaskdb/version_chain.cppm
+@@ -56,10 +56,17 @@ void free_node_subtree_if(typename Traits::Node *root,
+                           const Pred &is_garbage) noexcept {
+   if (!root || !is_garbage(root))
+     return;
+-  Traits::for_each_child(root, [&](typename Traits::Node *child) {
+-    free_node_subtree_if<Traits>(child, is_garbage);
+-  });
+-  Traits::destroy(root);
++  std::vector<typename Traits::Node *> stack;
++  stack.push_back(root);
++  while (!stack.empty()) {
++    auto *n = stack.back();
++    stack.pop_back();
++    Traits::for_each_child(n, [&](typename Traits::Node *child) {
++      if (is_garbage(child))
++        stack.push_back(child);
++    });
++    Traits::destroy(n);
++  }
+ }
+ 
+ // ---------------------------------------------------------------------------

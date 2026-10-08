@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <map>
 #include <optional>
@@ -89,9 +90,10 @@ inline auto capture_baseline(const DB &db) -> Baseline {
   return bl;
 }
 
-// Validates structural consistency of the published EngineState.
-// Uses Catch2 CHECK macros — call from a TEST_CASE context.
-inline void assert_consistent(const DB &db) {
+// Every way the published EngineState is structurally inconsistent; empty
+// when it is consistent. Free of Catch2, so a forked child can run it.
+inline auto consistency_errors(const DB &db) -> std::vector<std::string> {
+  std::vector<std::string> errors;
   auto state = db.engine_state();
 
   // 1. live_bytes matches key_dir.
@@ -104,8 +106,9 @@ inline void assert_consistent(const DB &db) {
         entry_size(key_span.size(), entry.value_size());
 
     // 2. No dangling file references.
-    INFO("key references file_id=" << entry.file_id());
-    CHECK(state->files.contains(entry.file_id()));
+    if (!state->files.contains(entry.file_id()))
+      errors.push_back(std::format("a key references file_id={}, which is not open",
+                                   entry.file_id()));
 
     // 5. Track max sequence for next_seq check.
     if (entry.sequence() > max_seq) max_seq = entry.sequence();
@@ -114,23 +117,33 @@ inline void assert_consistent(const DB &db) {
   for (const auto [file_id, fs] : state->file_stats.all()) {
     auto it = computed_live.find(file_id);
     auto expected_live = (it != computed_live.end()) ? it->second : 0ULL;
-    INFO("file_id=" << file_id << " live_bytes");
-    CHECK(fs.live_bytes == expected_live);
+    if (fs.live_bytes != expected_live)
+      errors.push_back(std::format("file_id={} live_bytes {} != {} from the key directory",
+                                   file_id, fs.live_bytes, expected_live));
   }
 
   // 3. Active file exists.
-  CHECK(state->files.contains(state->active_file_id));
+  if (!state->files.contains(state->active_file_id))
+    errors.push_back(std::format("active file_id={} is not open",
+                                 state->active_file_id));
 
   // 4. file_stats covers all files.
   for (const auto [file_id, _] : state->files) {
-    INFO("file_id=" << file_id << " missing from file_stats");
-    CHECK(state->file_stats.contains(file_id));
+    if (!state->file_stats.contains(file_id))
+      errors.push_back(std::format("file_id={} missing from file_stats", file_id));
   }
 
   // 5. next_seq ahead of all sequences.
-  if (max_seq > 0) {
-    CHECK(state->next_seq > max_seq);
-  }
+  if (max_seq > 0 && state->next_seq <= max_seq)
+    errors.push_back(std::format("next_seq {} not above the highest sequence {}",
+                                 state->next_seq, max_seq));
+  return errors;
+}
+
+// Validates structural consistency of the published EngineState.
+// Uses Catch2 CHECK macros — call from a TEST_CASE context.
+inline void assert_consistent(const DB &db) {
+  for (const auto &e : consistency_errors(db)) FAIL_CHECK(e);
 }
 
 // Validates the transition delta against the reference model's expected delta.

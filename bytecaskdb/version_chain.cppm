@@ -47,23 +47,19 @@ export inline auto new_version_tag() noexcept -> std::uint64_t {
 // along a path — once it is false for a node it is false for everything
 // below it — which holds for both predicates used here, because a node's
 // children are never newer than the node itself: a session links new
-// children only into nodes it owns. Iterative — no recursion on tree depth.
+// children only into nodes it owns. Recursive: the depth is the tree's
+// height, logarithmic in its size. It runs in noexcept destructors, often
+// because memory ran out, so freeing must not need memory: a work list on
+// the heap would, and the allocation failing there ends the process.
 export template <typename Traits, typename Pred>
-void free_node_subtree_if(typename Traits::Node *root, Pred is_garbage) {
-  using Node = typename Traits::Node;
+void free_node_subtree_if(typename Traits::Node *root,
+                          const Pred &is_garbage) noexcept {
   if (!root || !is_garbage(root))
     return;
-  std::vector<Node *> stack;
-  stack.push_back(root);
-  while (!stack.empty()) {
-    auto *n = stack.back();
-    stack.pop_back();
-    Traits::for_each_child(n, [&](Node *child) {
-      if (is_garbage(child))
-        stack.push_back(child);
-    });
-    Traits::destroy(n);
-  }
+  Traits::for_each_child(root, [&](typename Traits::Node *child) {
+    free_node_subtree_if<Traits>(child, is_garbage);
+  });
+  Traits::destroy(root);
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +148,11 @@ public:
     std::vector<Node *> to_free;
     {
       std::lock_guard<std::mutex> lk{mu_};
+      // Room for the new record and the session's parcel first: once the
+      // base is linked to its successor it cannot be derived from again, so
+      // nothing between the link and the record may fail.
+      records_.reserve(records_.size() + 1);
+      pending_.reserve(pending_.size() + 1);
       auto lineage = tag;
       if (base != 0) {
         auto *b = find(base);
@@ -163,7 +164,14 @@ public:
         lineage = b->lineage;
       }
       add_version(tag, lineage);
-      park_retired(tag, lineage, retired, to_free);
+      try {
+        park_retired(tag, lineage, retired, to_free);
+      } catch (const std::bad_alloc &) {
+        // The version is registered and the chain consistent; a parcel that
+        // could not be placed is never freed. A leak is the safe failure
+        // here, under memory pressure, where a throw would leave the version
+        // half published.
+      }
     }
     destroy_all(to_free);
   }

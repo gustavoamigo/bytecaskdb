@@ -3,12 +3,12 @@ active file and cannot create the next one. Reverts 362cc590.
 Guarded-by: "prove_manifest__*"
 
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..83904d55 100644
+index 9f42cec..07de31e 100644
 --- a/bytecaskdb/bytecask.cppm
 +++ b/bytecaskdb/bytecask.cppm
-@@ -4424,7 +4424,7 @@ auto DB::create_manifest() -> FileManifest {
+@@ -4801,7 +4801,7 @@ auto DB::create_manifest() -> FileManifest {
      try {
-       rotate_active_file(t, current);
+       rotation = prepare_rotation(t);
      } catch (...) {
 -      t.apply_degrade(
 +      (void)(
