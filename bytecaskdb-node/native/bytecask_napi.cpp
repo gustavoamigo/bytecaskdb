@@ -56,14 +56,19 @@ auto make_js_error(Napi::Env env, const std::exception &e) -> Napi::Error {
   return error;
 }
 
-// Runs a bound method. A Napi::Error is already a JS error (a call into JS
-// threw) and passes through; any other exception becomes make_js_error's.
-// node-addon-api would convert it too, but to a bare Error with no code.
+// Runs a bound method. Any C++ exception becomes make_js_error's Error;
+// node-addon-api would convert it too, but to a bare Error with no code. A
+// Napi::Error is already a JS error and passes through: a coded one from a
+// nested call (Open's constructor), or node-addon-api's own when a JS
+// argument has the wrong type (a number where a string goes), which gets
+// BC_INVALID_ARGUMENT.
 template <typename Fn>
 auto guard_call(Napi::Env env, Fn &&fn) -> decltype(fn()) {
   try {
     return fn();
-  } catch (const Napi::Error &) {
+  } catch (Napi::Error &e) {
+    if (!e.Value().Has("code"))
+      e.Value().Set("code", Napi::String::New(env, "BC_INVALID_ARGUMENT"));
     throw;
   } catch (const std::exception &e) {
     throw make_js_error(env, e);

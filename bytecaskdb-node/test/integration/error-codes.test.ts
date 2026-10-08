@@ -36,6 +36,13 @@ test('a closed DB, snapshot or consumed snapshot reports BC_CLOSED', async ({ tm
   const plan = wasmBackend.WritePlan.withSnapshot(consumed)
   expectCode(() => consumed.get('a'), 'BC_CLOSED')
   plan.close()
+  expectCode(() => plan.put('b', '2'), 'BC_CLOSED')
+
+  const applied = new wasmBackend.WritePlan()
+  applied.put('b', '2')
+  db.applyBatch(applied)
+  expectCode(() => applied.put('c', '3'), 'BC_CLOSED')
+  applied.close()
 
   db.close()
   expectCode(() => db.get('a'), 'BC_CLOSED')
@@ -59,6 +66,9 @@ test('a write on a follower reports BC_FOLLOWER_MODE', async ({ tmpDir, wasmBack
 
 test('input refused before anything is written reports BC_INVALID_ARGUMENT', async ({ db, wasmBackend }) => {
   expectCode(() => db.delRange('b', 'a'), 'BC_INVALID_ARGUMENT')
+  // A JS argument of the wrong type, refused by the binding itself.
+  expectCode(() => db.put(1 as unknown as string, 'v'), 'BC_INVALID_ARGUMENT')
+  expectCode(() => wasmBackend.open(42 as unknown as string), 'BC_INVALID_ARGUMENT')
   expectCode(() => db.put('k'.repeat(5000), 'v'), 'BC_INVALID_ARGUMENT')
   expectCode(() => wasmBackend.open(join('/nonexistent-never', 'x'), { maxKeyBytes: 70000 }),
     'BC_INVALID_ARGUMENT')
