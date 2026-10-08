@@ -949,7 +949,9 @@ NB_MODULE(_bytecaskdb, m) {
             BC_GIL_RELEASE;
             self.db.ingest(views);
           },
-          "Ingest pre-sequenced entries from a leader (follower mode only).",
+          "Ingest pre-sequenced entries from a leader (follower mode only). "
+          "Raises ValueError, before anything is written, if the list ends "
+          "inside an atomic batch.",
           "entries"_a)
       .def(
           "stats",

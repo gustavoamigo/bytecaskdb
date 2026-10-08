@@ -6655,6 +6655,14 @@ void DB::ingest(std::span<const DataEntryView> entries) {
     }
     if (e.entry_type == EntryType::BulkEnd) in_batch = false;
   }
+  // A slice published as given would expose half a batch, and a rotation
+  // after it would seal the BulkBegin into a file with no BulkEnd: recovery
+  // then drops entries this follower acknowledged and synced (#188).
+  if (in_batch) {
+    throw std::invalid_argument{
+        "ingest: the slice ends inside an atomic batch; cut slices after a "
+        "BulkEnd or a standalone entry"};
+  }
 
   WriteBarrier barrier{*this};
 
