@@ -317,6 +317,9 @@ variant_flags() {
     # One part of an oltp_read_write transaction alone, still between BEGIN
     # and COMMIT, e.g. oltp_read_write:rw_index_updates. Comparing each part's
     # latency across engines says which part a gap in the full mix comes from.
+    # The full mix less one group: which removal closes a gap between engines.
+    rw_no_ranges)   echo "--simple-ranges=0 --sum-ranges=0 --order-ranges=0 --distinct-ranges=0" ;;
+    rw_no_writes)   echo "--index-updates=0 --non-index-updates=0 --delete-inserts=0" ;;
     rw_*)           rw_part_flags "${1##*:rw_}" ;;
     *)              echo "" ;;
   esac
