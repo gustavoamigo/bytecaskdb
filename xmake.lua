@@ -468,6 +468,13 @@ target("bytecask")
     set_kind("static")
     set_default(false)
     add_cxxflags("-fPIC", {force = true})  -- required when linking into a shared object (e.g. MariaDB plugin)
+    -- TLS descriptors: a thread_local in a dlopen'ed object otherwise costs a
+    -- call to __tls_get_addr per access (2.8% of mariadbd's CPU on sysbench
+    -- oltp_read_write). An ELF option, so Linux only (Darwin's Clang rejects
+    -- it); AArch64 uses descriptors already.
+    if is_plat("linux") and is_arch("x86_64") then
+        add_cxxflags("-mtls-dialect=gnu2", {force = true})
+    end
     add_files("bytecaskdb/*.cppm", "bytecaskdb/bytecask_hpp.cpp")
     add_packages("crc32c", "zstd")
     on_config(function(t)
