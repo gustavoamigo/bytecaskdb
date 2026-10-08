@@ -7,9 +7,16 @@
 #   mpstat, vmstat         host CPU use per core, run queue, context switches
 #   pidstat -t             CPU and context switches per server thread
 #   perf record (on-CPU)   where the server's threads run, with DWARF stacks
-#   perf record (off-CPU)  where they go to sleep: every 50th sched_switch,
+#   perf record (off-CPU)  where they go to sleep: every 50th context switch,
 #                          with DWARF stacks — waits on user-space mutexes
-#                          (futex) show up here, under their callers
+#                          (futex) show up here, under their callers — and
+#                          every switch in and out, so offcpu_wait.txt
+#                          (offcpu_wait.py) weighs each sampled sleep by how
+#                          long the thread stayed off the CPU. The software
+#                          event, not the sched:sched_switch tracepoint: perf
+#                          records that tracepoint on every switch whatever
+#                          the period, and a stack copy per switch slows the
+#                          server enough to create the waits it measures.
 #   perf lock contention   contended kernel locks (BPF; skipped when perf or
 #                          the kernel lacks it). Kernel locks only: user-space
 #                          mutexes are in the off-CPU profile, not here.
@@ -38,6 +45,7 @@
 # the commit path, needs debug info: capture_check_debug_info requires it for
 # the plugin.
 
+CAPTURE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CAPTURE_SECONDS=120       # capture length, from the start of the window
 CAPTURE_CELL_BYTES=$(( 1024 * 1024 * 1024 ))  # free space per cell: an upper
                           # estimate — two perf recordings of a few hundred MB
@@ -159,11 +167,11 @@ capture_preflight() {
     capture_as_perf_user rm -rf "$probe"
     exit 1
   fi
-  if ! "${CAPTURE_PERF[@]}" record -e sched:sched_switch -c 50 --call-graph dwarf,8192 \
+  if ! "${CAPTURE_PERF[@]}" record -e context-switches -c 50 --switch-events --call-graph dwarf,8192 \
        -o "$probe/offcpu.data" -- sleep 0.2 >"$probe/log" 2>&1; then
-    echo "ERROR: perf cannot record sched:sched_switch (tracefs not readable?):" >&2
+    echo "ERROR: perf cannot record context switches with switch events:" >&2
     tail -5 "$probe/log" >&2
-    echo "  Running as root (passwordless sudo) or mounting tracefs readable fixes it." >&2
+    echo "  Running as root (passwordless sudo) or a lower kernel.perf_event_paranoid fixes it." >&2
     capture_as_perf_user rm -rf "$probe"
     exit 1
   fi
@@ -278,7 +286,7 @@ capture_run() {
     "${CAPTURE_PERF[@]}" record -F 99 --call-graph dwarf,8192 -p "$pid" \
       -o "$out/oncpu.data" -- sleep 10 > "$out/oncpu.log" 2>&1 || true
     sleep 5
-    "${CAPTURE_PERF[@]}" record -e sched:sched_switch -c 50 --call-graph dwarf,8192 -p "$pid" \
+    "${CAPTURE_PERF[@]}" record -e context-switches -c 50 --switch-events --call-graph dwarf,8192 -p "$pid" \
       -o "$out/offcpu.data" -- sleep 5 > "$out/offcpu.log" 2>&1 || true
     if [[ "$CAPTURE_LOCKS" == on ]]; then
       sleep 5
@@ -302,13 +310,22 @@ capture_finish() {  # capture dir, tarball, file to include...
   shift 2
   [[ -d "$out" ]] || return 0
   {
+    if [[ -f "$out/oncpu.data" ]]; then
+      "${CAPTURE_PERF[@]}" report -i "$out/oncpu.data" --stdio --no-children \
+        --percent-limit 0.5 > "$out/oncpu_report.txt" 2>&1 || true
+      "${CAPTURE_PERF[@]}" report -i "$out/oncpu.data" --stdio --no-children \
+        -g none -s dso,sym --percent-limit 0.2 > "$out/oncpu_flat.txt" 2>&1 || true
+    fi
+    # A sched_switch report ranks every sample under __schedule; the time
+    # each thread waits, and where, takes the switch events beside it.
+    if [[ -f "$out/offcpu.data" ]]; then
+      "${CAPTURE_PERF[@]}" script -i "$out/offcpu.data" --show-switch-events \
+        -F tid,time,event,ip,sym,dso 2>/dev/null |
+        python3 "$CAPTURE_LIB_DIR/offcpu_wait.py" > "$out/offcpu_wait.txt" 2>&1 || true
+    fi
     local data
     for data in oncpu offcpu; do
       [[ -f "$out/$data.data" ]] || continue
-      "${CAPTURE_PERF[@]}" report -i "$out/$data.data" --stdio --no-children \
-        --percent-limit 0.5 > "$out/${data}_report.txt" 2>&1 || true
-      "${CAPTURE_PERF[@]}" report -i "$out/$data.data" --stdio --no-children \
-        -g none -s dso,sym --percent-limit 0.2 > "$out/${data}_flat.txt" 2>&1 || true
       "${CAPTURE_PERF[@]}" archive "$out/$data.data" > "$out/${data}_archive.log" 2>&1 || true
     done
     capture_as_perf_user chown -R "$(id -u):$(id -g)" "$out" || true

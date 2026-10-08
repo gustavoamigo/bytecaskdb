@@ -30,7 +30,8 @@
 # Usage:
 #   ./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench-longrun.sh \
 #       [--table-size=N] [--duration=4h] [--report-interval=30s] \
-#       [--threads=N] [--workload=NAME] [--engines=LIST] [--out=PATH] [--data-root=PATH]
+#       [--threads=N] [--workload=NAME] [--engines=LIST] [--out=PATH] [--data-root=PATH] \
+#       [--profile=acid|fast] [--capture] [--capture-at=10m] [--capture-dir=PATH]
 #
 #   --duration / --report-interval accept a plain integer (seconds) or a
 #   number with a trailing s/m/h/d suffix, e.g. --duration=6h --report-interval=30s.
@@ -41,6 +42,17 @@
 #   create their data/tmp/socket files (default: repository root). Point it at
 #   a filesystem that supports native fdatasync/O_DIRECT when the repo lives on
 #   a bind mount or overlay that doesn't, e.g. --data-root=/mnt/nvme.
+#   --profile is the durability profile (default: acid), as in run-sysbench.sh:
+#   acid starts each engine with <engine>.cnf, fast with <engine>-fast.cnf,
+#   where a commit survives a mariadbd crash but not an OS crash. Recorded in
+#   every CSV row.
+#   --capture profiles each engine's server for 120 s, as run-sysbench.sh
+#   --capture does (see lib_capture.sh), starting --capture-at into the run
+#   (default 60s, past the start-up transient; later to profile a run that has
+#   degraded). The tarball goes to --capture-dir (default benchmarks/captures/)
+#   as capture_<engine>_<workload>_t<threads>_<run start>.tar.gz. The capture
+#   slows the server, so the samples it overlaps are not comparable with the
+#   rest.
 # ./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench-longrun.sh \
 #      --duration=10m --report-interval=30s] \
 #       --threads=8 --workload=oltp_read_write --engines=bytecaskdb --out=sysbench_longrun_results.csv --data-root=/mnt/data
@@ -57,6 +69,10 @@ THREADS=8
 WORKLOAD="oltp_read_write"
 ENGINES="bytecaskdb,innodb"
 CREATE_SECONDARY="on"
+PROFILE="acid"
+CAPTURE="off"
+CAPTURE_AT_RAW="60s"
+CAPTURE_DIR=""
 
 BYTECASKDB_PORT=3330
 INNODB_PORT=3331
@@ -77,9 +93,13 @@ for arg in "$@"; do
     --engines=*)          ENGINES="${arg#*=}" ;;
     --out=*)              OUT_CSV="${arg#*=}" ;;
     --data-root=*)        DATA_ROOT="${arg#*=}" ;;
+    --profile=*)          PROFILE="${arg#*=}" ;;
+    --capture)            CAPTURE="on" ;;
+    --capture-at=*)       CAPTURE_AT_RAW="${arg#*=}" ;;
+    --capture-dir=*)      CAPTURE_DIR="${arg#*=}" ;;
     --no-secondary-index) CREATE_SECONDARY="off" ;;
     --help|-h)
-      echo "Usage: $0 [--table-size=5000000] [--duration=4h] [--report-interval=30s] [--threads=8] [--workload=oltp_read_write] [--engines=bytecaskdb,innodb] [--out=PATH] [--data-root=PATH] [--no-secondary-index]"
+      echo "Usage: $0 [--table-size=5000000] [--duration=4h] [--report-interval=30s] [--threads=8] [--workload=oltp_read_write] [--engines=bytecaskdb,innodb] [--out=PATH] [--data-root=PATH] [--no-secondary-index] [--profile=acid|fast] [--capture] [--capture-at=60s] [--capture-dir=PATH]"
       exit 0
       ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
@@ -100,6 +120,7 @@ to_seconds() {
 
 DURATION="$(to_seconds "$DURATION_RAW")"
 REPORT_INTERVAL="$(to_seconds "$REPORT_INTERVAL_RAW")"
+CAPTURE_AT="$(to_seconds "$CAPTURE_AT_RAW")"
 
 IFS=',' read -ra ENGINE_LIST <<< "$ENGINES"
 engine_enabled() { for e in "${ENGINE_LIST[@]}"; do [[ "$e" == "$1" ]] && return 0; done; return 1; }
@@ -130,8 +151,35 @@ command -v mariadbd >/dev/null 2>&1 || { echo "ERROR: mariadbd not found"; exit 
 # shellcheck source=lib_common.sh
 source "$SCRIPT_DIR/lib_common.sh"
 
+# Before the plugin build, so a bad --profile fails in a second, not minutes.
+check_profile "$PROFILE" "${ENGINE_LIST[@]}"
+
+# Checked before anything slow: tools, perf permissions, the capture directory.
+if [[ "$CAPTURE" == on ]]; then
+  # shellcheck source=lib_capture.sh
+  source "$SCRIPT_DIR/lib_capture.sh"
+  if (( DURATION < CAPTURE_AT + CAPTURE_SECONDS + 10 )); then
+    echo "ERROR: --capture records ${CAPTURE_SECONDS}s from --capture-at=${CAPTURE_AT}s;" \
+         "--duration=${DURATION}s is too short (use $(( CAPTURE_AT + CAPTURE_SECONDS + 10 ))s or more)." >&2
+    exit 1
+  fi
+  CAPTURE_DIR="${CAPTURE_DIR:-$SCRIPT_DIR/captures}"
+  capture_preflight $(( (DURATION + 59) / 60 )) "$CAPTURE_DIR" "${#ENGINE_LIST[@]}"
+  CAPTURE_DIR="$(cd "$CAPTURE_DIR" && pwd)"
+  # In every tarball's name, so a rerun never overwrites an earlier capture.
+  CAPTURE_RUN="$(date +%Y%m%d_%H%M%S)"
+fi
+
 if engine_enabled bytecaskdb; then
   build_bytecaskdb_plugin
+fi
+if [[ "$CAPTURE" == on ]]; then
+  symbol_files=("$(command -v mariadbd)")
+  engine_enabled bytecaskdb && symbol_files+=("$PLUGIN_DIR/ha_bytecaskdb.so")
+  capture_check_symbols "${symbol_files[@]}"
+  if engine_enabled bytecaskdb; then
+    capture_check_debug_info "$PLUGIN_DIR/ha_bytecaskdb.so"
+  fi
 fi
 
 ROCKSDB_PLUGIN_DIR=""
@@ -146,6 +194,7 @@ fi
 # Cleanup trap — a long run is exactly where Ctrl-C is most likely.
 # ---------------------------------------------------------------------------
 SYSBENCH_PID=""
+CAPTURER_PID=""
 CLEANED_UP=0
 cleanup() {
   [[ "$CLEANED_UP" -eq 1 ]] && return
@@ -157,6 +206,7 @@ cleanup() {
   # actually stop a running sysbench (a very likely scenario for a
   # multi-hour run started under nohup/tmux). Kill it directly first.
   [[ -n "$SYSBENCH_PID" ]] && kill "$SYSBENCH_PID" 2>/dev/null
+  [[ -n "$CAPTURER_PID" ]] && kill "$CAPTURER_PID" 2>/dev/null
   stop_mariadbd "${BYTECASKDB_DIR}/mariadbd.pid"
   remove_instance "${BYTECASKDB_DIR}"
   stop_mariadbd "${INNODB_DIR}/mariadbd.pid"
@@ -231,7 +281,7 @@ run_longbench() {
         e_mib="$(eng_delta "$eng_prev" "$eng_now" | cut -d, -f1)"
         io_prev="$io_now"
         eng_prev="$eng_now"
-        echo "$ts,$engine,$WORKLOAD,$THREADS,$row,$w_mib,$e_mib" >> "$RESULTS_CSV"
+        echo "$ts,$engine,$WORKLOAD,$THREADS,$row,$w_mib,$e_mib,$PROFILE" >> "$RESULTS_CSV"
         # elapsed_s is the row's first field — echo a compact live progress line.
         local elapsed="${row%%,*}"
         echo "  [$engine] ${elapsed}s / ${DURATION}s : $line | wrote ${w_mib} MiB"
@@ -241,8 +291,29 @@ run_longbench() {
     done
   ) 2>&1 &
   SYSBENCH_PID=$!
+  # The capture runs beside the run, from --capture-at into it.
+  local capture_dir="" capturer=""
+  if [[ "$CAPTURE" == on ]]; then
+    capture_dir="$(dirname "$dir")/capture_${engine}_${WORKLOAD}_t${THREADS}"
+    rm -rf "$capture_dir"
+    ( sleep "$CAPTURE_AT"
+      capture_run "$engine" "$pid_file" "$socket" "$capture_dir" ) &
+    capturer=$!
+    CAPTURER_PID=$capturer
+  fi
   wait "$SYSBENCH_PID"
   SYSBENCH_PID=""
+  if [[ -n "$capturer" ]]; then
+    wait "$capturer" 2>/dev/null || true
+    CAPTURER_PID=""
+    local tarball="$CAPTURE_DIR/$(basename "$capture_dir")_$CAPTURE_RUN.tar.gz"
+    capture_finish "$capture_dir" "$tarball" \
+      "$(engine_defaults_file "$engine" "$PROFILE")" "$dir/error.log"
+    if [[ -f "$tarball" ]]; then
+      echo "  [$engine] capture: $tarball ($(du -h "$tarball" | cut -f1))"
+      echo "  [$engine] $(capture_fetch_hint "$(basename "$tarball" .tar.gz)" "$tarball")"
+    fi
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -252,9 +323,11 @@ echo ""
 echo "=== Long-running sysbench comparison ==="
 echo "    Engines: ${ENGINES}"
 echo "    Workload: $WORKLOAD | Threads: $THREADS"
+echo "    Durability profile: $PROFILE"
 echo "    Table size: $TABLE_SIZE rows | Duration: ${DURATION}s per engine | Report every ${REPORT_INTERVAL}s"
 echo "    Results: $RESULTS_CSV"
 echo "    Data root: $DATA_ROOT"
+echo "    Capture: $CAPTURE${CAPTURE_DIR:+ (at ${CAPTURE_AT}s, tarballs to $CAPTURE_DIR)}"
 echo ""
 
 # Append across runs so a long-run history accumulates; the timestamp column
@@ -262,7 +335,7 @@ echo ""
 # appending rows with a different column count under someone else's header
 # silently misaligns every field, and the file looks fine until something
 # tries to read it.
-CSV_HEADER="timestamp,engine,workload,threads,elapsed_s,report_threads,tps,qps,lat95_ms,err_per_s,write_mib,eng_write_mib"
+CSV_HEADER="timestamp,engine,workload,threads,elapsed_s,report_threads,tps,qps,lat95_ms,err_per_s,write_mib,eng_write_mib,profile"
 if [[ ! -s "$RESULTS_CSV" ]]; then
   echo "$CSV_HEADER" > "$RESULTS_CSV"
 else
@@ -284,7 +357,7 @@ if engine_enabled bytecaskdb; then
   start_mariadbd \
     "${BYTECASKDB_DIR}/data" "$BYTECASKDB_DIR/mysql.sock" "$BYTECASKDB_PORT" \
     "$BYTECASKDB_DIR/mariadbd.pid" "$BYTECASKDB_DIR/error.log" \
-    "$SCRIPT_DIR/bytecaskdb.cnf" \
+    "$(engine_defaults_file bytecaskdb "$PROFILE")" \
     --plugin-dir="$PLUGIN_DIR" --plugin-load-add=bytecaskdb=ha_bytecaskdb.so
   run_longbench bytecaskdb "$BYTECASKDB_PORT" "$BYTECASKDB_DIR/mysql.sock" bytecaskdb
   stop_mariadbd "${BYTECASKDB_DIR}/mariadbd.pid"
@@ -298,7 +371,7 @@ if engine_enabled innodb; then
   start_mariadbd \
     "${INNODB_DIR}/data" "$INNODB_DIR/mysql.sock" "$INNODB_PORT" \
     "$INNODB_DIR/mariadbd.pid" "$INNODB_DIR/error.log" \
-    "$SCRIPT_DIR/innodb.cnf"
+    "$(engine_defaults_file innodb "$PROFILE")"
   run_longbench innodb "$INNODB_PORT" "$INNODB_DIR/mysql.sock" innodb
   stop_mariadbd "${INNODB_DIR}/mariadbd.pid"
   remove_instance "${INNODB_DIR}"
@@ -311,7 +384,7 @@ if engine_enabled rocksdb && [[ -n "$ROCKSDB_PLUGIN_DIR" ]]; then
   start_mariadbd \
     "${ROCKSDB_DIR}/data" "$ROCKSDB_DIR/mysql.sock" "$ROCKSDB_PORT" \
     "$ROCKSDB_DIR/mariadbd.pid" "$ROCKSDB_DIR/error.log" \
-    "$SCRIPT_DIR/rocksdb.cnf" \
+    "$(engine_defaults_file rocksdb "$PROFILE")" \
     --plugin-load-add=rocksdb=ha_rocksdb.so --plugin-dir="$ROCKSDB_PLUGIN_DIR"
   run_longbench rocksdb "$ROCKSDB_PORT" "$ROCKSDB_DIR/mysql.sock" rocksdb
   stop_mariadbd "${ROCKSDB_DIR}/mariadbd.pid"
