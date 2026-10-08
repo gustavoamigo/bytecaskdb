@@ -474,12 +474,14 @@ export using KeyDirTransient = TransientBlindBTree<kBlindLeafBytes>;
 
 // What a blind key directory holds for a key: where its record is. Its sizes
 // and sequence are in the record's header.
+// Members are marked inline: in a module interface, a member defined in
+// its class is not inline by default, and these sit on every scan step.
 export struct KeyDirLoc {
   BlindRef ref;
-  [[nodiscard]] auto file_id() const noexcept -> std::uint32_t {
+  [[nodiscard]] inline auto file_id() const noexcept -> std::uint32_t {
     return ref.file_id;
   }
-  [[nodiscard]] auto file_offset() const noexcept -> std::uint64_t {
+  [[nodiscard]] inline auto file_offset() const noexcept -> std::uint64_t {
     return ref.offset;
   }
 };
@@ -600,7 +602,7 @@ public:
     ctx_.files = nullptr;
   }
 
-  auto operator*() const -> value_type {
+  inline auto operator*() const -> value_type {
     const auto ref = *cur_;
     if constexpr (Keyed) {
       const auto ctx = context();
@@ -636,7 +638,7 @@ public:
   auto operator=(BlindKeyDirIter &&) noexcept -> BlindKeyDirIter & = default;
   ~BlindKeyDirIter() = default;
 
-  auto operator++() -> BlindKeyDirIter & {
+  inline auto operator++() -> BlindKeyDirIter & {
     lease_.reset();
     ++cur_;
     return *this;
@@ -646,7 +648,7 @@ public:
     ++*this;
     return tmp;
   }
-  auto operator--() -> BlindKeyDirIter & {
+  inline auto operator--() -> BlindKeyDirIter & {
     lease_.reset();
     --cur_;
     return *this;
