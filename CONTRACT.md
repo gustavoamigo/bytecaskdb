@@ -49,8 +49,11 @@ degrades the engine does so *without* publishing the failed transition:
   of class F before the pipeline, and now for every batch since the last
   flush.
 - Class H (rotation failure): the write succeeded and was published, but
-  the rotation to a new file failed. The published state is consistent
-  with what recovery would find — the committed entries are on disk.
+  the rotation to a new file failed. The caller still receives the
+  exception, and the write is visible at once: this is the one failure a
+  caller can observe as both thrown and applied without `resume()`. The
+  published state is consistent with what recovery would find — the
+  committed entries are on disk.
 
 Therefore: the published state at degradation time corresponds only to
 fully-durable committed transitions, and reads against it are safe.
@@ -206,8 +209,9 @@ conflict-detection mechanism.
 If any I/O operation (append, sync) throws during execution:
 
 - The caller must receive the exception.
-- The published key directory must reflect zero operations from this call.
-  `next_seq` must be advanced past all sequences consumed by appends that reached
+- The published key directory must reflect zero operations from this call
+  until `resume()` or a reopen; what either brings back is under
+  *Consistency*. `next_seq` must be advanced past all sequences consumed by appends that reached
   the file, to prevent reuse of those sequence numbers on the next write.
 - The disk may contain none, some, or all of the bytes from this write.
   The engine must not assume what was written. Any append failure —
@@ -277,9 +281,16 @@ The specific guarantees:
   visible to subsequent reads.
 - **Write succeeds, `sync=false`**: the data must be visible to
   subsequent reads. It may or may not survive a crash.
-- **Write throws**: the data may or may not be partially on disk. It
-  must not be visible to subsequent reads. Recovery must reach a
-  consistent state.
+- **Write throws**: the data may or may not be partially on disk, and
+  nothing from the write is visible before `resume()` or a reopen. After
+  either, the write is indeterminate, as a timed-out write is: every
+  complete unit that reached the file — a standalone entry, or a batch
+  through its `BulkEnd` — is replayed and becomes visible as if the write
+  had returned, and anything incomplete is cut. A caller that needs to
+  know re-reads after `resume()`. One case publishes at once: a rotation
+  that fails after the write was synced (class H under *Definitions*)
+  makes the write visible and still throws, because the write itself
+  succeeded. Recovery must reach a consistent state either way.
 
 If the engine cannot maintain recovery-equivalence — because a commit-
 phase failure (rotation, state publication) leaves in-memory state in
