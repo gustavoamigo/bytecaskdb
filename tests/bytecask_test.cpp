@@ -11122,6 +11122,65 @@ TEST_CASE("Limits: a plan larger than the per-write byte limit is refused "
   CHECK_FALSE(db.contains_key({}, to_bytes("k1")));
 }
 
+TEST_CASE("ingest refuses a slice that ends inside an atomic batch",
+          "[replication]") {
+  TempDir td;
+
+  auto leader = bytecask::DB::open(td.path / "leader");
+  bytecask::WritePlan plan;
+  for (char c = 'a'; c <= 'f'; ++c)
+    plan.put(to_bytes(std::string(1, c)), to_bytes("v"));
+  (void)leader.apply_batch({}, std::move(plan));
+
+  struct OwnedEntry {
+    std::uint64_t sequence;
+    bytecask::EntryType entry_type;
+    bytecask::Bytes key;
+    bytecask::Bytes value;
+  };
+  std::vector<OwnedEntry> owned;
+  {
+    auto snap = leader.snapshot();
+    for (const auto &e : leader.changes_since(snap, 0)) {
+      owned.push_back({e.sequence, e.entry_type,
+                       bytecask::Bytes{e.key.begin(), e.key.end()},
+                       bytecask::Bytes{e.value.begin(), e.value.end()}});
+    }
+  }
+  std::vector<bytecask::DataEntryView> views;
+  for (const auto &o : owned)
+    views.push_back({o.sequence, o.entry_type, o.key, o.value});
+  REQUIRE(views.size() == 8);  // BulkBegin, 6 puts, BulkEnd
+  const auto head = std::span{views}.first(4);
+
+  bytecask::Bytes out;
+  {
+    // The head alone fills the file past the threshold: published, it would
+    // be sealed with its BulkBegin and no BulkEnd, and dropped at recovery.
+    auto follower = bytecask::DB::open(
+        td.path / "follower",
+        {.max_file_bytes = 128, .initial_mode = bytecask::Mode::Follower});
+    const auto bytes_before = data_file_bytes(td.path / "follower");
+    CHECK_THROWS_AS(follower.ingest(head), std::invalid_argument);
+    CHECK(data_file_bytes(td.path / "follower") == bytes_before);
+    CHECK(follower.durable_sequence() == 0);
+    CHECK_FALSE(follower.is_degraded());
+    for (char c = 'a'; c <= 'f'; ++c)
+      CHECK_FALSE(follower.contains_key({}, to_bytes(std::string(1, c))));
+
+    follower.ingest(views);
+    CHECK(follower.durable_sequence() == views.back().sequence);
+  }
+
+  auto reopened = bytecask::DB::open(td.path / "follower",
+                                     {.initial_mode = bytecask::Mode::Follower});
+  CHECK(reopened.durable_sequence() == views.back().sequence);
+  for (char c = 'a'; c <= 'f'; ++c) {
+    REQUIRE(reopened.get({}, to_bytes(std::string(1, c)), out));
+    CHECK(to_string(out) == "v");
+  }
+}
+
 TEST_CASE("Limits: ingest refuses an atomic batch past the per-write byte "
           "limit", "[bytecask][limits]") {
   TempDir td;

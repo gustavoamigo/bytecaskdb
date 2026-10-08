@@ -532,7 +532,10 @@ class DB:
         ...
 
     def ingest(self, entries: list[DataEntry]) -> None:
-        """Ingest pre-sequenced entries from a leader (follower mode only)."""
+        """Ingest pre-sequenced entries from a leader (follower mode only).
+
+        Raises ValueError, before anything is written, if the list ends
+        inside an atomic batch: cut after a BulkEnd or a standalone entry."""
         ...
 
     def stats(self) -> dict[str, int]:

@@ -2627,6 +2627,7 @@ A site whose break nothing has to catch says why instead.
 | `create_manifest`: a failed rotation degrades | `prove_manifest__*` | `manifest_rotation_failure_not_degraded` | 362cc590 |
 | `ingest`: the final `fdatasync` before publishing | `prove_repl__*` | `ingest_skips_final_sync` | — |
 | `ingest`: that sync failing degrades | `prove_repl__*` | `ingest_sync_failure_ignored` | — |
+| `ingest`: a slice that ends inside a batch is refused, so no rotation seals a `BulkBegin` without its `BulkEnd` | `ingest refuses a slice that ends inside an atomic batch` | `ingest_open_batch_accepted` | #188 |
 
 ### What building the table found
 

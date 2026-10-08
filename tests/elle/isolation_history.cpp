@@ -897,9 +897,8 @@ auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
                        bytecask::Bytes{e.value.begin(), e.value.end()}});
         if (e.entry_type == bytecask::EntryType::BulkBegin) in_batch = true;
         if (e.entry_type == bytecask::EntryType::BulkEnd) in_batch = false;
-        // Slices end at batch boundaries: ingest publishes a slice in one
-        // step, and a slice cut inside a batch would publish part of it
-        // (CONTRACT.md, ingest).
+        // Slices end at batch boundaries: ingest refuses a slice cut inside
+        // a batch (CONTRACT.md, ingest).
         if (!in_batch && buf.size() >= target) {
           ingest_owned(fdb, buf);
           stats.ingests.fetch_add(1, std::memory_order_relaxed);

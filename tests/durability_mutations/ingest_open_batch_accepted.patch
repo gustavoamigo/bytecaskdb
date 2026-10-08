@@ -1,0 +1,18 @@
+ingest accepts a slice that ends inside an atomic batch: part of the batch
+is published, and a rotation after the slice seals its BulkBegin into a file
+with no BulkEnd, so a reopen drops entries the follower synced (#188).
+Guarded-by: "ingest refuses a slice that ends inside an atomic batch"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index 3838253..8b00e8f 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -6658,7 +6658,7 @@ void DB::ingest(std::span<const DataEntryView> entries) {
+   // A slice published as given would expose half a batch, and a rotation
+   // after it would seal the BulkBegin into a file with no BulkEnd: recovery
+   // then drops entries this follower acknowledged and synced (#188).
+-  if (in_batch) {
++  if (false && in_batch) {
+     throw std::invalid_argument{
+         "ingest: the slice ends inside an atomic batch; cut slices after a "
+         "BulkEnd or a standalone entry"};

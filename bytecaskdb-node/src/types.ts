@@ -168,6 +168,8 @@ export interface ByteCaskDB extends Disposable {
   durableSequence(minSequence?: bigint, timeoutMs?: number): bigint;
   createManifest(): FileManifest;
   changesSince(snap: Snapshot, fromSeq: bigint): CloseableIterator<DataEntry>;
+  // Follower mode only. Throws, before anything is written, if the slice
+  // ends inside an atomic batch: cut after a bulkEnd or a standalone entry.
   ingest(entries: DataEntry[]): void;
   stats(): Record<string, number>;
   // Makes every write durable, writes the hint files and releases the
