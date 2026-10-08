@@ -247,9 +247,11 @@ without the memory. What it guarantees is how it fails:
   nothing: if the degraded state cannot be published, `is_degraded()`,
   `degraded_reason()` and every write still report it.
 - A writer never waits forever on a flush that threw, and the process is
-  never ended by the engine for lack of memory — with one known exception,
-  dropping the last handle of a key directory version, which allocates in
-  a `noexcept` destructor (#390).
+  never ended by the engine for lack of memory. Dropping the last handle
+  of a snapshot, an iterator or any other key directory version never
+  throws: what cannot be freed for want of memory is freed later, or
+  leaked, never freed while a version reaches it (#390).
+- `degraded_reason()` returns a copy and may throw `std::bad_alloc`.
 
 The counted allocation-failure sweep fails every allocation of each swept
 operation, once and from then on, and checks these

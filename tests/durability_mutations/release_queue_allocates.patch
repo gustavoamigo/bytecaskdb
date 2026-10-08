@@ -1,0 +1,22 @@
+Releasing a key directory version queues the nodes it frees with no
+fallback: when the queue cannot grow, std::bad_alloc leaves the noexcept
+destructor and the process ends. Reverts #390.
+Guarded-by: "alloc sweep: a version is released when nothing can be allocated"
+
+diff --git a/bytecaskdb/version_chain.cppm b/bytecaskdb/version_chain.cppm
+index 4d93a82..a0f4271 100644
+--- a/bytecaskdb/version_chain.cppm
++++ b/bytecaskdb/version_chain.cppm
+@@ -473,11 +473,7 @@ private:
+   // freeing them under the lock is correct; it only holds the lock longer.
+   static void free_later(const std::vector<Node *> &nodes,
+                          std::vector<Node *> &out) noexcept {
+-    try {
+-      out.insert(out.end(), nodes.begin(), nodes.end());
+-    } catch (const std::bad_alloc &) {
+-      destroy_all(nodes);
+-    }
++    out.insert(out.end(), nodes.begin(), nodes.end());
+   }
+ 
+   // Under mu_: when the last version of every tree of this value type is

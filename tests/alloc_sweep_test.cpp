@@ -497,6 +497,10 @@ TEST_CASE("alloc sweep: put", "[alloc_sweep]") { alloc_sweep(put_operation()); }
 
 TEST_CASE("alloc sweep: del", "[alloc_sweep]") { alloc_sweep(del_operation()); }
 
+TEST_CASE("alloc sweep: put under a snapshot", "[alloc_sweep]") {
+  alloc_sweep(snapshot_put_operation());
+}
+
 TEST_CASE("alloc sweep: del_range", "[alloc_sweep]") {
   alloc_sweep(del_range_operation());
 }
@@ -617,23 +621,91 @@ TEST_CASE("alloc sweep: a failed publication leaves the base derivable",
     auto tr = u1.transient();
     tr.set(to_bytes("zzz"), res.ref("zzz"), res);
     bool fired = false;
-    // Released once the fault is disarmed: releasing a version still
-    // allocates (#390), and this test is about publishing one.
-    std::optional<Tree> u2;
     {
       ScopedAllocFaults faults{n, false};
       try {
-        u2.emplace(std::move(tr).persistent());
+        // Released under the fault too: the version dies with its parcel
+        // parked on u1 and t.
+        (void)std::move(tr).persistent();
       } catch (const std::bad_alloc &) {
       }
       fired = faults.report().fired;
     }
-    u2.reset();
     INFO("allocation " << n << " of the publication failed");
     auto again = u1.transient();
     again.set(to_bytes("other"), res.ref("other"), res);
     CHECK_NOTHROW((void)std::move(again).persistent());
     if (!fired) break;
+  }
+}
+
+// Dropping the last handle of a version frees what only it reached and hands
+// on what it was holding for older ones, in noexcept destructors, often
+// because memory just ran out. Each way a version can die is run in a forked
+// child with every allocation failing: the release must not end the process,
+// and the versions left must still be whole once memory is back (#390).
+//
+// t is a live base; u1 changes one leaf of it and u2 a leaf far away, so
+// u2's retired nodes park on both u1 and t.
+TEST_CASE("alloc sweep: a version is released when nothing can be allocated",
+          "[alloc_sweep]") {
+  KeyStore res;
+  auto derive = [&res](const Tree &base, const std::string &k) {
+    auto tr = base.transient();
+    tr.set(to_bytes(k), res.ref(k), res);
+    return std::move(tr).persistent();
+  };
+  std::optional<Tree> t{deep_tree(res)};
+  std::optional<Tree> u1{derive(*t, "aaa")};
+  std::optional<Tree> u2{derive(*u1, "zzz")};
+  const auto keys = t->size();
+
+  auto released_under_fault = [](std::optional<Tree> &v) {
+    ScopedAllocFaults every_allocation_fails{1, true};
+    v.reset();
+  };
+  // validate() reads every node and throws on the first broken invariant,
+  // so a node freed while still reached shows here (or under ASan).
+  auto still_whole = [&] {
+    if (t) {
+      (void)t->validate(res);
+      REQUIRE(t->size() == keys);
+    }
+    if (u1) {
+      (void)u1->validate(res);
+      REQUIRE(u1->contains(to_bytes("aaa"), res));
+    }
+    if (u2) {
+      (void)u2->validate(res);
+      REQUIRE(u2->contains(to_bytes("zzz"), res));
+    }
+  };
+
+  SECTION("the head, over a live predecessor") {
+    // Retraction: what u2 created is walked and freed, what it retired is
+    // live again in u1 and t.
+    CHECK(exits_cleanly_in_child([&] {
+      released_under_fault(u2);
+      still_whole();
+    }));
+  }
+  SECTION("a version inside the chain") {
+    // u1 dies with a successor: the nodes u2 retired from it are freed, and
+    // what u1 held for t moves on.
+    CHECK(exits_cleanly_in_child([&] {
+      released_under_fault(u1);
+      still_whole();
+    }));
+  }
+  SECTION("the base, then the rest of the lineage") {
+    CHECK(exits_cleanly_in_child([&] {
+      released_under_fault(t);
+      still_whole();
+      released_under_fault(u1);
+      still_whole();
+      // The last version of the lineage: everything it retired is freed.
+      released_under_fault(u2);
+    }));
   }
 }
 

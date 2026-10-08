@@ -4,15 +4,14 @@ underivable, and every later write throws. Reverts #364.
 Guarded-by: "alloc sweep: a failed publication leaves the base derivable"
 
 diff --git a/bytecaskdb/version_chain.cppm b/bytecaskdb/version_chain.cppm
-index d439b52..ac15824 100644
+index 4d93a82..79b0ddc 100644
 --- a/bytecaskdb/version_chain.cppm
 +++ b/bytecaskdb/version_chain.cppm
-@@ -151,8 +151,6 @@ public:
-       // Room for the new record and the session's parcel first: once the
-       // base is linked to its successor it cannot be derived from again, so
-       // nothing between the link and the record may fail.
+@@ -161,7 +161,6 @@ public:
+       // successor it cannot be derived from again, so nothing between the
+       // link and the record may fail. Parking the session's parcel after it
+       // does not throw (park).
 -      records_.reserve(records_.size() + 1);
--      pending_.reserve(pending_.size() + 1);
        auto lineage = tag;
        if (base != 0) {
          auto *b = find(base);

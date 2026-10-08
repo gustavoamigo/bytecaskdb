@@ -16,6 +16,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -177,6 +178,30 @@ inline auto put_operation() -> Operation {
               [](DB &db) {
                 return db.put({.sync = true}, to_bytes("k1"), to_bytes("over"))
                     .durable;
+              },
+          .transition = [](KeyValues kv) {
+            kv["k1"] = bytes("over");
+            return kv;
+          }};
+}
+
+// A put while a snapshot taken before it is held, and released while the
+// fault is still armed: the put's retired nodes park on the snapshot's key
+// directory version, and its release hands them on or frees them (#390).
+inline auto snapshot_put_operation() -> Operation {
+  return {.name = "put under a snapshot",
+          .setup = seed,
+          .run =
+              [](DB &db) {
+                std::optional<Snapshot> snap;
+                {
+                  const SuspendSyscallFaults inputs;
+                  snap.emplace(db.snapshot());
+                }
+                const auto r =
+                    db.put({.sync = true}, to_bytes("k1"), to_bytes("over"));
+                snap.reset();
+                return r.durable;
               },
           .transition = [](KeyValues kv) {
             kv["k1"] = bytes("over");

@@ -1143,8 +1143,11 @@ public:
   // in-process recovery.
   [[nodiscard]] auto is_degraded() const noexcept -> bool;
 
-  // Returns the reason the engine entered degraded state.
-  [[nodiscard]] auto degraded_reason() const noexcept -> std::string;
+  // Returns the reason the engine entered degraded state, or an empty string.
+  // A copy, not a reference: the published state holding the reason can be
+  // replaced, and freed, by another thread at any time. Copying may throw
+  // std::bad_alloc, so this is not noexcept (#390).
+  [[nodiscard]] auto degraded_reason() const -> std::string;
 
   // Attempts to recover from a degraded state. If not degraded, returns
   // immediately. On success, clears the degraded flag and the engine accepts
@@ -4430,7 +4433,7 @@ auto DB::is_degraded() const noexcept -> bool {
   return refused(*load_state());
 }
 
-auto DB::degraded_reason() const noexcept -> std::string {
+auto DB::degraded_reason() const -> std::string {
   const auto s = load_state();
   if (s->degraded) return s->degraded_reason;
   if (write_fault_.load(std::memory_order_acquire)) return kWriteFaultReason;
