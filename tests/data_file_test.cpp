@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -211,6 +212,90 @@ TEST_CASE("DataFile::append_entries batches multiple entries into one writev",
   CHECK(file->size() == sz0 + sz1 + sz2);
 
   std::filesystem::remove(path);
+}
+
+// append_entries writes a chunk from one buffer, with values above 4 KiB as
+// iovecs of their own; append_entry writes each entry as four iovecs. The
+// file must come out byte for byte the same, and on the pool back-end every
+// entry must read back from the frames the appends filled — across frame
+// boundaries, chunk boundaries (two entries per chunk in test builds) and
+// out-of-line values.
+TEST_CASE("DataFile::append_entries writes the bytes append_entry would",
+          "[data_file]") {
+  const auto io_backend =
+      GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::Mmap,
+               bytecask::IoBackend::BufferPool);
+  CAPTURE(static_cast<int>(io_backend));
+  const auto dir = std::filesystem::temp_directory_path();
+  auto pool = std::make_shared<bytecask::BufferPool>(
+      bytecask::BufferPoolOptions{.capacity_bytes = 32 << 20});
+  pool->set_active_file(21);  // appends to file 21 take the reserved-frame path
+  std::filesystem::remove(dir / "bc_test_batched.data");
+  std::filesystem::remove(dir / "bc_test_single.data");
+  auto batched = bytecask::createDataFileForWrite(dir, "bc_test_batched", ".data", 4 << 20,
+                                                  io_backend, pool, /*file_id=*/21);
+  auto single = bytecask::createDataFileForWrite(dir, "bc_test_single", ".data", 4 << 20,
+                                                 io_backend, pool, /*file_id=*/22);
+
+  std::mt19937_64 rng{42};
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
+  std::vector<bytecask::DataEntryView> all;
+  std::vector<bytecask::Offset> offsets;
+  constexpr std::size_t kEntries = 300;
+  for (std::size_t i = 0; i < kEntries; ++i) {
+    keys.push_back(std::format("key{:05d}", i));
+    // Mostly small; now and then just below, at and above the inline limit.
+    const std::size_t sizes[] = {0, 1, 17, 120, 4095, 4096, 4097, 9000};
+    const auto len = rng() % 4 == 0 ? sizes[rng() % 8] : rng() % 300;
+    values.emplace_back(len, static_cast<char>('a' + i % 26));
+  }
+  for (std::size_t i = 0; i < kEntries; ++i) {
+    const auto type = rng() % 10 == 0 ? bytecask::EntryType::Delete : bytecask::EntryType::Put;
+    const auto value = type == bytecask::EntryType::Delete ? std::span<const std::byte>{}
+                                                          : to_bytes(values[i]);
+    all.push_back({i + 1, type, to_bytes(keys[i]), value});
+  }
+  // Batched in random-sized groups; one at a time for the reference.
+  for (std::size_t at = 0; at < kEntries;) {
+    const auto n = std::min<std::size_t>(1 + rng() % 40, kEntries - at);
+    std::vector<bytecask::Offset> out(n);
+    batched->append_entries(std::span{all}.subspan(at, n), out);
+    offsets.insert(offsets.end(), out.begin(), out.end());
+    at += n;
+  }
+  for (const auto &e : all) {
+    (void)single->append_entry(e.sequence, e.entry_type, e.key, e.value);
+  }
+  batched->sync();
+  single->sync();
+  REQUIRE(batched->size() == single->size());
+
+  const auto read_file = [](const std::filesystem::path &path, std::size_t n) {
+    std::string bytes(n, '\0');
+    std::ifstream f{path, std::ios::binary};
+    f.read(bytes.data(), static_cast<std::streamsize>(n));
+    return bytes;
+  };
+  CHECK(read_file(dir / "bc_test_batched.data", batched->size()) ==
+        read_file(dir / "bc_test_single.data", single->size()));
+
+  // Every entry reads back where append_entries said it is — from the pool's
+  // frames on that back-end.
+  for (std::size_t i = 0; i < kEntries; ++i) {
+    const auto r = scan_at(*batched, offsets[i]);
+    REQUIRE(r.has_value());
+    CHECK(r->first.sequence == all[i].sequence);
+    CHECK(r->first.entry_type == all[i].entry_type);
+    CHECK(to_string(r->first.key) == keys[i]);
+    CHECK(r->first.value.size() == all[i].value.size());
+    CHECK(std::equal(r->first.value.begin(), r->first.value.end(), all[i].value.begin()));
+  }
+
+  batched.reset();
+  single.reset();
+  std::filesystem::remove(dir / "bc_test_batched.data");
+  std::filesystem::remove(dir / "bc_test_single.data");
 }
 
 // ---------------------------------------------------------------------------
