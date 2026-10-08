@@ -44,6 +44,14 @@ test('a closed DB, snapshot or consumed snapshot reports BC_CLOSED', async ({ tm
   expectCode(() => applied.put('c', '3'), 'BC_CLOSED')
   applied.close()
 
+  const manifest = db.createManifest()
+  const manifestSnap = manifest.getSnapshot()
+  manifest.close()
+  manifestSnap.close()
+  expectCode(() => manifest.getThroughSequence(), 'BC_CLOSED')
+  expectCode(() => manifest.getFiles(), 'BC_CLOSED')
+  expectCode(() => manifest.getSnapshot(), 'BC_CLOSED')
+
   db.close()
   expectCode(() => db.get('a'), 'BC_CLOSED')
   expectCode(() => db.put('b', '2'), 'BC_CLOSED')

@@ -483,6 +483,7 @@ class NapiFileManifest : public Napi::ObjectWrap<NapiFileManifest> {
   Napi::Reference<Napi::Array> files_ref_;
   std::uint64_t through_sequence_{0};
 
+  auto Check() const -> void;
   auto GetSnapshot(const Napi::CallbackInfo& info) -> Napi::Value;
   auto GetFiles(const Napi::CallbackInfo& info) -> Napi::Value;
   auto GetThroughSequence(const Napi::CallbackInfo& info) -> Napi::Value;
@@ -1109,16 +1110,25 @@ auto NapiFileManifest::NewInstance(Napi::Env env, bytecask::FileManifest manifes
   return constructor.New({external});
 }
 
+// Close() resets the references, so an empty snapshot_ref_ is a closed
+// manifest: every getter refuses it, as the WASM backend does.
+auto NapiFileManifest::Check() const -> void {
+  if (snapshot_ref_.IsEmpty()) throw HandleClosed("FileManifest is closed");
+}
+
 auto NapiFileManifest::GetSnapshot(const Napi::CallbackInfo&) -> Napi::Value {
+  Check();
   return snapshot_ref_.Value();
 }
 
 auto NapiFileManifest::GetFiles(const Napi::CallbackInfo&) -> Napi::Value {
+  Check();
   return files_ref_.Value();
 }
 
 auto NapiFileManifest::GetThroughSequence(const Napi::CallbackInfo& info)
     -> Napi::Value {
+  Check();
   return Napi::BigInt::New(info.Env(), through_sequence_);
 }
 
