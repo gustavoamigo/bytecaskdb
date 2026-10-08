@@ -8,6 +8,10 @@ export default defineConfig({
     // forks pool: safest for WASM + native addons; each file in own process
     pool: 'forks',
 
+    // global.gc, so test/integration/finalizers.test.ts can force wrapper
+    // finalizers to run rather than leave them to whenever V8 collects.
+    execArgv: ['--expose-gc'],
+
     // Global setup: validate WASM binary is loadable before any tests run
     globalSetup: ['./test/global-setup.ts'],
 
