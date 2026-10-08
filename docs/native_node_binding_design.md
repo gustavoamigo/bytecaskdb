@@ -139,6 +139,12 @@ uses (`sync`, `verifyChecksums`, `maxFileBytes`, `failOnCrcErrors`,
 strings to `bytecask::Mode`. A missing or `undefined`/`null` object yields
 engine defaults.
 
+The Embind layer declares each such trailing parameter `std::optional<val>`
+(`OptionalVal` in `wasm/bytecask_embind.cpp`), with `register_optional<val>()`.
+Embind accepts a call with fewer arguments only when the missing ones are
+`std::optional`: a build with `ASSERTIONS` refuses it with a `BindingError`,
+and a release build passes `undefined` only because it skips that check.
+
 ### Error translation
 
 C++ exceptions become JS `Error`s via `Napi::Error::ThrowAsJavaScriptException`
@@ -329,6 +335,25 @@ backend-agnostic:
 
 Follows the repo testing rule: narrowest coverage that proves the change, reusing
 the existing seam rather than building a new one.
+
+`ci.yml`'s `node-tests` job runs the suite on release builds of both backends.
+`node-nightly.yml` runs it again on two builds that turn a memory error into a
+failure:
+
+- **Native under AddressSanitizer.** The addon is built with
+  `--sanitizer=address -m debug`, and the ASan runtime is preloaded into an
+  uninstrumented `node`. Leak detection is off, since it would report V8's own
+  allocations live at exit. Wrapper finalizers run when V8 collects, in an
+  order no test controls; `test/integration/finalizers.test.ts` leaves every
+  wrapper type unclosed and forces collections (`vitest.config.ts` passes
+  `--expose-gc`), with the DB closed first and with the DB dropped too, so a
+  finalizer that reaches a freed DB is a reported use-after-free.
+- **Checked WASM.** `xmake f --wasm_checked=y` links every WASM target with
+  `-sSAFE_HEAP=1 -sASSERTIONS=2`: each load and store is checked, and Embind
+  checks every call's argument count.
+
+A planted use-after-free in the addon, and a planted null read in the Embind
+layer, each fail the corresponding run.
 
 ---
 

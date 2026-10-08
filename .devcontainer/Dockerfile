@@ -47,9 +47,10 @@ ENV CC=gcc
 ENV CXX=g++
 ENV BYTECASK_PYTHON=python3
 
-# Install Emscripten SDK for WebAssembly builds
+# Install Emscripten SDK for WebAssembly builds. The version matches
+# EMSDK_VERSION in .github/workflows/ci.yml; change both together.
 RUN cd /opt && git clone --depth 1 https://github.com/emscripten-core/emsdk.git \
-    && cd emsdk && ./emsdk install latest && ./emsdk activate latest \
+    && cd emsdk && ./emsdk install 6.0.11 && ./emsdk activate 6.0.11 \
     && ln -s $(ls -d /opt/emsdk/node/*/bin | head -1)/node /usr/local/bin/node
 
 ENV EMSDK=/opt/emsdk

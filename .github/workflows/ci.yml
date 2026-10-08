@@ -362,7 +362,8 @@ jobs:
       # Cache the SDK itself (a full install is ~1 GB and several minutes).
       # The version is pinned and is the cache key, so a new Emscripten
       # arrives as a commit that changes EMSDK_VERSION, never through a cache
-      # eviction (#259, #292).
+      # eviction (#259, #292). node-nightly.yml, .devcontainer/Dockerfile and
+      # scripts/setup_ubuntu_host.sh name the same version; change them too.
       - name: Cache Emscripten SDK
         id: emsdk-cache
         uses: actions/cache@v4

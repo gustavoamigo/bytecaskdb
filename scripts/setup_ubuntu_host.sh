@@ -150,7 +150,8 @@ if [ "$SKIP_EMSDK" -eq 0 ]; then
   if [ ! -d "$HOME/emsdk" ]; then
     git clone --depth 1 https://github.com/emscripten-core/emsdk.git "$HOME/emsdk"
   fi
-  (cd "$HOME/emsdk" && ./emsdk install latest && ./emsdk activate latest)
+  # The version CI builds with (EMSDK_VERSION in .github/workflows/ci.yml).
+  (cd "$HOME/emsdk" && ./emsdk install 6.0.11 && ./emsdk activate 6.0.11)
   if ! grep -qF 'emsdk_env.sh' "$HOME/.bashrc" 2>/dev/null; then
     echo 'source "$HOME/emsdk/emsdk_env.sh" > /dev/null' >> "$HOME/.bashrc"
   fi

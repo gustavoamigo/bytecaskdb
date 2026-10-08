@@ -64,17 +64,31 @@ static auto span_to_js(std::span<const std::byte> s) -> val {
 // Options extraction helpers
 // ---------------------------------------------------------------------------
 
+// A trailing parameter JS callers may leave out. Embind accepts fewer
+// arguments only when the missing ones are std::optional: a build with
+// ASSERTIONS (node-nightly.yml's checked build) refuses the call otherwise,
+// and a release build passes undefined only because it skips the check.
+using OptionalVal = std::optional<val>;
+
+static auto value_or_undefined(const OptionalVal &v) -> val {
+  return v.value_or(val::undefined());
+}
+
 static auto has_prop(const val &opts, const char *name) -> bool {
   return !opts.isUndefined() && !opts.isNull() && opts.hasOwnProperty(name);
 }
 
-static auto extract_write_options(const val &opts) -> bytecask::WriteOptions {
+static auto extract_write_options(const OptionalVal &opts_arg)
+    -> bytecask::WriteOptions {
+  const auto opts = value_or_undefined(opts_arg);
   bytecask::WriteOptions wo;
   if (has_prop(opts, "sync")) wo.sync = opts["sync"].as<bool>();
   return wo;
 }
 
-static auto extract_read_options(const val &opts) -> bytecask::ReadOptions {
+static auto extract_read_options(const OptionalVal &opts_arg)
+    -> bytecask::ReadOptions {
+  const auto opts = value_or_undefined(opts_arg);
   bytecask::ReadOptions ro;
   if (has_prop(opts, "verifyChecksums"))
     ro.verify_checksums = opts["verifyChecksums"].as<bool>();
@@ -327,7 +341,8 @@ struct JsFileManifest {
 // JsDB bound methods
 // ---------------------------------------------------------------------------
 
-static auto jsdb_open(const std::string &path, val opts) -> JsDB * {
+static auto jsdb_open(const std::string &path, OptionalVal opts_arg) -> JsDB * {
+  const auto opts = value_or_undefined(opts_arg);
   bytecask::Options o{.recovery_threads = 1};
   if (has_prop(opts, "maxFileBytes"))
     o.max_file_bytes = opts["maxFileBytes"].as<uint64_t>();
@@ -346,7 +361,7 @@ static auto jsdb_open(const std::string &path, val opts) -> JsDB * {
   return new JsDB{std::filesystem::path{path}, std::move(o)};
 }
 
-static auto jsdb_get(JsDB &self, const std::string &key, val opts) -> val {
+static auto jsdb_get(JsDB &self, const std::string &key, OptionalVal opts) -> val {
   auto ro = extract_read_options(opts);
   Bytes out;
   if (self.db.get(ro, to_view(key), out)) {
@@ -356,12 +371,12 @@ static auto jsdb_get(JsDB &self, const std::string &key, val opts) -> val {
 }
 
 static auto jsdb_put(JsDB &self, const std::string &key,
-                     const std::string &value, val opts) -> val {
+                     const std::string &value, OptionalVal opts) -> val {
   auto wo = extract_write_options(opts);
   return commit_result_to_js(self.db.put(wo, to_view(key), to_view(value)));
 }
 
-static auto jsdb_del(JsDB &self, const std::string &key, val opts) -> val {
+static auto jsdb_del(JsDB &self, const std::string &key, OptionalVal opts) -> val {
   auto wo = extract_write_options(opts);
   auto result = self.db.del(wo, to_view(key));
   if (!result) return val::null();
@@ -369,12 +384,12 @@ static auto jsdb_del(JsDB &self, const std::string &key, val opts) -> val {
 }
 
 static auto jsdb_del_range(JsDB &self, const std::string &from,
-                           const std::string &to, val opts) -> val {
+                           const std::string &to, OptionalVal opts) -> val {
   auto wo = extract_write_options(opts);
   return commit_result_to_js(self.db.del_range(wo, to_view(from), to_view(to)));
 }
 
-static auto jsdb_contains_key(JsDB &self, const std::string &key, val opts)
+static auto jsdb_contains_key(JsDB &self, const std::string &key, OptionalVal opts)
     -> bool {
   auto ro = extract_read_options(opts);
   return self.db.contains_key(ro, to_view(key));
@@ -384,7 +399,7 @@ static auto jsdb_snapshot(JsDB &self) -> JsSnapshot * {
   return new JsSnapshot{self.db.snapshot()};
 }
 
-static auto jsdb_apply_batch(JsDB &self, JsWritePlan &plan, val opts) -> val {
+static auto jsdb_apply_batch(JsDB &self, JsWritePlan &plan, OptionalVal opts) -> val {
   plan.check();
   auto wo = extract_write_options(opts);
   auto result = self.db.apply_batch(wo, std::move(*plan.plan));
@@ -393,25 +408,25 @@ static auto jsdb_apply_batch(JsDB &self, JsWritePlan &plan, val opts) -> val {
   return commit_result_to_js(*result);
 }
 
-static auto jsdb_entries(JsDB &self, const std::string &from, val opts)
+static auto jsdb_entries(JsDB &self, const std::string &from, OptionalVal opts)
     -> JsEntryIterator * {
   auto ro = extract_read_options(opts);
   return new JsEntryIterator{self.db.iter_from(ro, to_view(from))};
 }
 
-static auto jsdb_keys(JsDB &self, const std::string &from, val opts)
+static auto jsdb_keys(JsDB &self, const std::string &from, OptionalVal opts)
     -> JsKeyIterator * {
   auto ro = extract_read_options(opts);
   return new JsKeyIterator{self.db.keys_from(ro, to_view(from))};
 }
 
-static auto jsdb_entries_reverse(JsDB &self, const std::string &from, val opts)
+static auto jsdb_entries_reverse(JsDB &self, const std::string &from, OptionalVal opts)
     -> JsReverseEntryIterator * {
   auto ro = extract_read_options(opts);
   return new JsReverseEntryIterator{self.db.riter_from(ro, to_view(from))};
 }
 
-static auto jsdb_keys_reverse(JsDB &self, const std::string &from, val opts)
+static auto jsdb_keys_reverse(JsDB &self, const std::string &from, OptionalVal opts)
     -> JsReverseKeyIterator * {
   auto ro = extract_read_options(opts);
   return new JsReverseKeyIterator{self.db.rkeys_from(ro, to_view(from))};
@@ -454,8 +469,10 @@ static void jsdb_set_mode(JsDB &self, const std::string &mode) {
 // built-in default-argument support, so undefined/null is treated as 0.
 // Returns a bigint (uint64_t crosses the JS boundary as BigInt under
 // -sWASM_BIGINT, never a lossy double).
-static auto jsdb_durable_sequence(JsDB &self, val min_sequence_val,
-                                  val timeout_ms_val) -> std::uint64_t {
+static auto jsdb_durable_sequence(JsDB &self, OptionalVal min_sequence_arg,
+                                  OptionalVal timeout_ms_arg) -> std::uint64_t {
+  const auto min_sequence_val = value_or_undefined(min_sequence_arg);
+  const auto timeout_ms_val = value_or_undefined(timeout_ms_arg);
   std::uint64_t min_sequence = 0;
   if (!min_sequence_val.isUndefined() && !min_sequence_val.isNull()) {
     min_sequence = min_sequence_val.as<std::uint64_t>();
@@ -534,7 +551,7 @@ static void jsdb_ingest(JsDB &self, val entries) {
 // JsSnapshot bound methods
 // ---------------------------------------------------------------------------
 
-static auto jssnap_get(JsSnapshot &self, const std::string &key, val opts)
+static auto jssnap_get(JsSnapshot &self, const std::string &key, OptionalVal opts)
     -> val {
   self.check();
   auto ro = extract_read_options(opts);
@@ -546,20 +563,20 @@ static auto jssnap_get(JsSnapshot &self, const std::string &key, val opts)
 }
 
 static auto jssnap_contains_key(JsSnapshot &self, const std::string &key,
-                                val opts) -> bool {
+                                OptionalVal opts) -> bool {
   self.check();
   auto ro = extract_read_options(opts);
   return self.snap->contains_key(ro, to_view(key));
 }
 
-static auto jssnap_entries(JsSnapshot &self, const std::string &from, val opts)
+static auto jssnap_entries(JsSnapshot &self, const std::string &from, OptionalVal opts)
     -> JsEntryIterator * {
   self.check();
   auto ro = extract_read_options(opts);
   return new JsEntryIterator{self.snap->iter_from(ro, to_view(from))};
 }
 
-static auto jssnap_keys(JsSnapshot &self, const std::string &from, val opts)
+static auto jssnap_keys(JsSnapshot &self, const std::string &from, OptionalVal opts)
     -> JsKeyIterator * {
   self.check();
   auto ro = extract_read_options(opts);
@@ -567,14 +584,14 @@ static auto jssnap_keys(JsSnapshot &self, const std::string &from, val opts)
 }
 
 static auto jssnap_entries_reverse(JsSnapshot &self, const std::string &from,
-                                   val opts) -> JsReverseEntryIterator * {
+                                   OptionalVal opts) -> JsReverseEntryIterator * {
   self.check();
   auto ro = extract_read_options(opts);
   return new JsReverseEntryIterator{self.snap->riter_from(ro, to_view(from))};
 }
 
 static auto jssnap_keys_reverse(JsSnapshot &self, const std::string &from,
-                                val opts) -> JsReverseKeyIterator * {
+                                OptionalVal opts) -> JsReverseKeyIterator * {
   self.check();
   auto ro = extract_read_options(opts);
   return new JsReverseKeyIterator{self.snap->rkeys_from(ro, to_view(from))};
@@ -588,7 +605,8 @@ static auto jswp_with_snapshot(JsSnapshot &snap) -> JsWritePlan * {
   return new JsWritePlan{snap};
 }
 
-static auto jswp_with_limits(val opts) -> JsWritePlan * {
+static auto jswp_with_limits(OptionalVal opts_arg) -> JsWritePlan * {
+  const auto opts = value_or_undefined(opts_arg);
   bytecask::SizeLimits limits;
   if (has_prop(opts, "maxKeyBytes"))
     limits.max_key_bytes = opts["maxKeyBytes"].as<uint32_t>();
@@ -667,6 +685,7 @@ static auto jsdb_stats(JsDB &self) -> val {
 // ---------------------------------------------------------------------------
 
 EMSCRIPTEN_BINDINGS(bytecask) {
+  register_optional<val>();
   class_<JsDB>("ByteCaskDB")
       .class_function("open", &jsdb_open, allow_raw_pointers())
       .function("get", &jsdb_get)

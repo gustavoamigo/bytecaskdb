@@ -49,6 +49,16 @@ option_end()
 -- this prefix; MSAN_LIBCXX_PREFIX overrides it (e.g. for a cached CI path).
 local msan_libcxx_prefix = os.getenv("MSAN_LIBCXX_PREFIX") or path.join(os.projectdir(), ".msan-libcxx")
 
+-- Checked WASM build: `xmake f --wasm_checked=y` links every WASM target with
+-- Emscripten's SAFE_HEAP (each load and store checked for alignment and
+-- bounds) and ASSERTIONS=2 (runtime checks, stack overflow detection). Several
+-- times slower; node-nightly.yml runs the Node suite against it.
+option("wasm_checked")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Link WASM targets with SAFE_HEAP and ASSERTIONS=2")
+option_end()
+
 -- Coverage option: `xmake f --coverage=true`
 option("coverage")
     set_default("")
@@ -761,8 +771,16 @@ local wasm_dir = path.join(os.projectdir(), "bytecaskdb-node", "wasm")
 local wasm_crc32c = path.join(wasm_dir, "build", "crc32c-wasm")
 local wasm_zstd = path.join(wasm_dir, "build", "zstd-wasm")
 
+-- Checked-build link flags (see the wasm_checked option).
+local function add_wasm_checks(t)
+    if has_config("wasm_checked") then
+        t:add("ldflags", "-sSAFE_HEAP=1", "-sASSERTIONS=2", {force = true})
+    end
+end
+
 -- Common WASM target setup. Each WASM target calls this in on_config.
 local function add_wasm_ldflags(t)
+    add_wasm_checks(t)
     t:add("ldflags",
         "-fwasm-exceptions",
         "-sNODERAWFS=1", "-sENVIRONMENT=node", "-lnoderawfs.js",
@@ -841,6 +859,7 @@ target("wasm_embind")
             "--js-library", path.join(wasm_dir, "syscall_overrides.js"),
             "-L" .. path.join(wasm_crc32c, "lib"),
             {force = true})
+        add_wasm_checks(t)
     end)
     set_basename("bytecask")
     set_extension(".mjs")
