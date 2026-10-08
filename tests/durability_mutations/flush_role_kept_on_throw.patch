@@ -1,0 +1,21 @@
+A flush_pending that throws keeps the flush role, so every later writer
+waits in commit_wait forever. Reverts #364. The guarded test hangs.
+Guarded-by: "refuse writes: a flush that throws releases the flush role"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index 9f42cec..1f034e4 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3564,11 +3564,7 @@ void DB::flush_once() {
+     }
+     if (settled) counters_.flush_settles.fetch_add(1, std::memory_order_relaxed);
+   }
+-  try {
+-    flush_pending();
+-  } catch (...) {
+-    flush_threw();
+-  }
++  flush_pending();
+   finish_flush();
+ }
+ 

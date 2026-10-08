@@ -1,0 +1,17 @@
+The rotation's handler for a failed file create also catches a failure
+while the files are installed in the transient, and publishes it half
+rotated. Reverts #364.
+Guarded-by: "refuse writes: a rotation that fails in memory publishes nothing"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index 9f42cec..186e0d5 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3417,6 +3417,7 @@ void DB::commit_appended(TransientEngineState &t,
+   PreparedRotation rotation;
+   try {
+     rotation = prepare_rotation(t);
++    finish_rotation(t, std::move(rotation));
+   } catch (...) {
+     auto ex = std::current_exception();
+     t.apply_degrade(std::format(

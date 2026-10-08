@@ -232,6 +232,29 @@ If any I/O operation (append, sync) throws during execution:
   the scan is rethrown unchanged rather than read as the end of the file.
 - The DB must remain operational for subsequent calls.
 
+### Allocation Failure Safety
+
+An operation that cannot allocate fails; the engine does not try to go on
+without the memory. What it guarantees is how it fails:
+
+- Before anything is appended: the operation throws (`std::bad_alloc`)
+  and nothing changed. The engine stays writable.
+- After its entries reached the file and before a state covering them was
+  published — or on any other throw on that stretch that no I/O handler
+  degrades for: the operation throws and the engine refuses writes as
+  degraded, with the published state unchanged. `resume()` replays what
+  reached the file, as after a failed `fdatasync`. Refusing allocates
+  nothing: if the degraded state cannot be published, `is_degraded()`,
+  `degraded_reason()` and every write still report it.
+- A writer never waits forever on a flush that threw, and the process is
+  never ended by the engine for lack of memory — with one known exception,
+  dropping the last handle of a key directory version, which allocates in
+  a `noexcept` destructor (#390).
+
+The counted allocation-failure sweep fails every allocation of each swept
+operation, once and from then on, and checks these
+(`docs/correctness_validation.md`).
+
 ### Rotation Safety
 
 If a multi-entry batch fails mid-write, an orphaned `BulkBegin` marker
@@ -581,7 +604,7 @@ As after any failed `fdatasync`, a later sync cannot be trusted to write
 what the failed one did not (#231), so writes throw `DbDegraded` until
 `resume()` rewrites and syncs the file (#281).
 
-If `rotate_active_file` fails (active file sealed but new file creation
+If `prepare_rotation` fails (active file sealed but new file creation
 fails), the engine degrades — same pattern as `execute_slots` and
 `ingest`. The sealed active file cannot accept further appends;
 degrading forces `resume()` before the next write. `resume()` creates a

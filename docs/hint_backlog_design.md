@@ -78,7 +78,7 @@ struct Options {
 
 - `BackgroundWorker` gains `pending()`, the number of queued tasks plus the
   running one, and `wait_pending_below(n)`.
-- Both places that seal a file, `rotate_active_file` and `resume`, call
+- Both places that seal a file, `prepare_rotation` and `resume`, call
   `wait_for_hint_backlog()` before they seal, then queue the task through
   `dispatch_hint()`. With backpressure on, the wait blocks until fewer than
   `max_hint_backlog` tasks are pending. It runs on the writer with the write

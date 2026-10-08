@@ -1295,10 +1295,20 @@ private:
   // Drains background hint tasks then writes all sealed hint files.
   void flush_hints();
 
-  // File rotation
-  // Seals active file, dispatches hint write to background, opens new active file.
-  void rotate_active_file(TransientEngineState &t,
-                          const std::shared_ptr<const EngineState> &current);
+  // File rotation, in two steps. prepare_rotation does the I/O: seals the
+  // active file and creates the next, leaving t as it was but for the id it
+  // reserves; its failure is the one the callers degrade for, by publishing
+  // t. finish_rotation installs both files in t and hands the sealed one to
+  // the hint worker. It does no I/O, and a failure in it leaves t half
+  // changed, so it must never be published: the callers refuse writes.
+  struct PreparedRotation {
+    std::shared_ptr<DataFile> sealed;
+    std::shared_ptr<WritableDataFile> next;
+    std::uint32_t next_id{0};
+  };
+  [[nodiscard]] auto prepare_rotation(TransientEngineState &t)
+      -> PreparedRotation;
+  void finish_rotation(TransientEngineState &t, PreparedRotation r);
   // Creates the active file for file_id under a fresh stem and syncs dir_,
   // so the file's name is durable before any write into it is acknowledged.
   // checkpoint names the caller's fault injection point.
@@ -1475,8 +1485,28 @@ private:
   // and records the error for every writer appended since the last flush.
   void flush_pending();
   // commit_wait's flush: settle, flush_pending, then release the role and
-  // wake every waiter.
+  // wake every waiter. Releases the role however flush_pending ends: one
+  // that throws refuses writes and records the error for the waiters.
   void flush_once();
+  // execute_group's steps after the append; see the definition.
+  void commit_appended(TransientEngineState &t,
+                       std::shared_ptr<const EngineState> published,
+                       std::span<Slot *> batch, bool any_sync,
+                       std::uint64_t batch_max_seq,
+                       std::uint64_t appended_bytes);
+  // flush_pending threw, with its exception in flight: records it for the
+  // waiters and refuses writes. The caller still holds the flush role.
+  void flush_threw() noexcept;
+  // Why a write is refused, or nullptr if it may go ahead.
+  [[nodiscard]] auto write_refusal(const EngineState &s) const
+      -> std::exception_ptr;
+  // Whether the engine refuses writes as degraded: the published state says
+  // so, or write_fault_ is set.
+  [[nodiscard]] auto refused(const EngineState &s) const noexcept -> bool;
+  // Refuses writes from now on, then publishes the degraded state if memory
+  // allows, and wakes every waiter. Allocates nothing to refuse. For a
+  // failure after an append that no I/O handler degraded for.
+  void refuse_writes() noexcept;
   // Releases the flush role and wakes commit_wait / quiesce / durable_sequence
   // waiters. The empty durable_mu_ critical section orders the release
   // before the notify for waiters that checked the predicate and are about
@@ -1651,10 +1681,20 @@ private:
     static std::atomic<std::uint64_t> next{1};
     return next.fetch_add(1, std::memory_order_relaxed);
   }
-  // The fdatasync error that degraded the engine, rethrown by commit_wait
-  // to every writer whose entries were appended since the last successful
-  // flush. Guarded by durable_mu_. Cleared by resume().
+  // The error that failed a flush — a failed fdatasync, or anything that
+  // threw before it published — rethrown by commit_wait to every writer
+  // whose entries were appended since the last successful flush. Guarded by
+  // durable_mu_. Cleared by resume().
   std::exception_ptr flush_error_;
+  // Set when a write reached the data file and could not be published, by a
+  // failure no I/O handler degrades for: an allocation, or anything else
+  // unexpected, after the append. The file then holds bytes the published
+  // state does not cover, so writes are refused until resume() reconciles
+  // them, as for a degraded state. A flag rather than a degraded state
+  // because publishing one allocates, and the failure is often that
+  // nothing could be. refuse_writes() publishes the degraded state too when
+  // it can; the flag is what holds. Cleared by resume().
+  std::atomic<bool> write_fault_{false};
   // Serialises writers (put, del, apply_batch). Readers never acquire this.
   std::unique_ptr<std::mutex> write_mu_{std::make_unique<std::mutex>()};
   // Serialises vacuum() calls. Separate from write_mu_ so vacuum I/O does
@@ -1699,6 +1739,17 @@ public:
   // durable_sequence checks its condition, the first time before it blocks.
   // Lets a test act once a waiter is parked. Must not take durable_mu_.
   std::function<void()> test_in_sequence_wait_;
+  // Called by execute_group once a batch is appended and by flush_pending
+  // before it publishes. A test throws from them to fail the step that
+  // follows an append, as a failed allocation there would.
+  std::function<void()> test_after_append_;
+  std::function<void()> test_before_publish_;
+  // Called by refuse_writes before it publishes the degraded state. A test
+  // throws from it to leave the flag as the only refusal.
+  std::function<void()> test_before_refusal_publish_;
+  // Called by finish_rotation before it installs the new files in the
+  // transient. A test throws from it to fail the rotation's in-memory step.
+  std::function<void()> test_in_finish_rotation_;
   // Leaves plans unresolved, so validation and the key directory update go
   // by key, as before record locations were used as version tokens. The
   // differential test runs one workload both ways.
@@ -2835,7 +2886,7 @@ void DB::close() {
     if (current->closed) return;
     auto t = current->transient();
     const auto last_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
-    if (current->degraded) {
+    if (refused(*current)) {
       // No sync here can be trusted: one that failed earlier left pages
       // clean that a later one does not write (#231). What was durable when
       // the engine degraded is what is durable. The trim is best effort; a
@@ -2971,12 +3022,24 @@ auto DB::snapshot() const -> Snapshot {
   return Snapshot{load_state_for_read().state(), size_limits_};
 }
 
+// Why writes are refused while DB::write_fault_ is set.
+constexpr const char *kWriteFaultReason =
+    "a write reached the data file but could not be published: call "
+    "resume() to recover.";
+
 // Why a state refuses writes: is_write_allowed() is false.
 static auto write_rejection(const EngineState &s) -> std::exception_ptr {
   if (s.closed) return std::make_exception_ptr(DbClosed{});
   if (s.degraded) return std::make_exception_ptr(DbDegraded{s.degraded_reason});
   return std::make_exception_ptr(
       DbFollowerMode{"write rejected: engine is in follower mode"});
+}
+
+auto DB::write_refusal(const EngineState &s) const -> std::exception_ptr {
+  if (!s.is_write_allowed()) return write_rejection(s);
+  if (write_fault_.load(std::memory_order_acquire))
+    return std::make_exception_ptr(DbDegraded{kWriteFaultReason});
+  return nullptr;
 }
 
 // The calling thread's last synced commit: the DB it went to and when it
@@ -2997,8 +3060,8 @@ static thread_local LastSyncedReturn last_synced_return{};
 // thin wrappers that construct a WritePlan and delegate here.
 auto DB::apply_batch(WriteOptions opts,
                      WritePlan plan) -> std::optional<CommitResult> {
-  if (auto s = load_state(); !s->is_write_allowed()) {
-    std::rethrow_exception(write_rejection(*s));
+  if (auto refusal = write_refusal(*load_state())) {
+    std::rethrow_exception(refusal);
   }
   if (plan.write_bytes() > max_batch_bytes()) {
     throw std::invalid_argument{std::format(
@@ -3178,8 +3241,7 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
   // such a failure still ends in commit_wait with the flush error, its
   // bytes handled by resume() like the failed flush's.
   auto published = load_state();
-  if (!published->is_write_allowed()) {
-    const auto ex = write_rejection(*published);
+  if (const auto ex = write_refusal(*published)) {
     for (auto *s : batch) s->err = ex;
     return batch.size();
   }
@@ -3268,9 +3330,37 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
     return batch.size();
   }
 
-  counters_.bytes_written.fetch_add(
-      static_cast<std::int64_t>(running_offset - initial_offset),
-      std::memory_order_relaxed);
+  try {
+#ifdef BYTECASK_TESTING
+    if (test_after_append_) test_after_append_();
+#endif
+    commit_appended(t, std::move(published), batch, any_sync, batch_max_seq,
+                    running_offset - initial_offset);
+  } catch (...) {
+    // The batch is in the file and nothing published it: what the engine
+    // holds no longer matches the file, so writes after it would build on
+    // a wrong state. Refused until resume(), which replays the batch.
+    const auto ex = std::current_exception();
+    for (auto *s : batch) {
+      if (!s->err) s->err = ex;
+    }
+    refuse_writes();
+  }
+  return batch.size();
+}
+
+// Everything after a group's entries reach the file: publishing the head,
+// or the rotation barrier and the publication after it. Throws only for a
+// failure no handler here degrades for, which execute_group turns into a
+// refusal: the entries are in the file either way.
+void DB::commit_appended(TransientEngineState &t,
+                         std::shared_ptr<const EngineState> published,
+                         std::span<Slot *> batch, bool any_sync,
+                         std::uint64_t batch_max_seq,
+                         std::uint64_t appended_bytes) {
+  auto &file = t.active_file();
+  counters_.bytes_written.fetch_add(static_cast<std::int64_t>(appended_bytes),
+                                    std::memory_order_relaxed);
   if (any_sync) t.note_sync_requested(batch_max_seq);
 
   if (!t.is_rotation_needed(rotation_threshold_)) {
@@ -3278,7 +3368,7 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
     store_head(std::move(t).persistent());
     // durable is filled in by commit_wait once the flush covering this
     // batch has landed.
-    return batch.size();
+    return;
   }
 
   // Rotation barrier: everything before this batch is flushed and
@@ -3295,17 +3385,17 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
   // flush_error_ set under a healthy-looking state. The batch fails with
   // that flush's error, like every other write appended behind it; resume()
   // recovers its bytes with theirs.
-  if (published->degraded) {
+  if (refused(*published)) {
     std::exception_ptr ex;
     {
       std::lock_guard<std::mutex> lk{durable_mu_};
       ex = flush_error_;
     }
-    if (!ex) ex = std::make_exception_ptr(DbDegraded{published->degraded_reason});
+    if (!ex) ex = std::make_exception_ptr(DbDegraded{degraded_reason()});
     for (auto *s : batch) {
       if (!s->err) s->err = ex;
     }
-    return batch.size();
+    return;
   }
   try {
     file.sync();
@@ -3322,12 +3412,11 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
     for (auto *s : batch) {
       if (!s->err) s->err = ex;
     }
-    return batch.size();
+    return;
   }
+  PreparedRotation rotation;
   try {
-    rotate_active_file(t, published);
-    counters_.file_rotations.fetch_add(1, std::memory_order_relaxed);
-    counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
+    rotation = prepare_rotation(t);
   } catch (...) {
     auto ex = std::current_exception();
     t.apply_degrade(std::format(
@@ -3339,8 +3428,11 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
     for (auto *s : batch) {
       if (!s->err) s->err = ex;
     }
-    return batch.size();
+    return;
   }
+  finish_rotation(t, std::move(rotation));
+  counters_.file_rotations.fetch_add(1, std::memory_order_relaxed);
+  counters_.files_opened.fetch_add(1, std::memory_order_relaxed);
 
   if (any_sync) {
     try {
@@ -3358,7 +3450,7 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
       for (auto *s : batch) {
         if (!s->err) s->err = ex;
       }
-      return batch.size();
+      return;
     }
   }
 
@@ -3369,7 +3461,6 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
     auto &slot = static_cast<EngineSlot &>(*s);
     if (slot.result) slot.result->durable = final_durable_seq >= slot.result->sequence;
   }
-  return batch.size();
 }
 
 #pragma endregion
@@ -3379,7 +3470,7 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
 void DB::flush_pending() {
   auto head = load_head();
   auto published = load_state();
-  if (published->degraded) return;
+  if (refused(*published)) return;
   const bool need_sync = head->sync_requested_seq > published->durable_seq;
   // Nothing appended and no sync asked for. A sync-only write appends
   // nothing but asks for one: the entries it covers may all be published
@@ -3403,6 +3494,9 @@ void DB::flush_pending() {
     commit_delay_.on_sync_end(std::chrono::steady_clock::now() - sync_start);
   }
 
+#ifdef BYTECASK_TESTING
+  if (test_before_publish_) test_before_publish_();
+#endif
   // Publish the head as it stood before the fdatasync. Entries appended
   // since are not claimed: the next flush covers them. O(1): persistent
   // roots are shared, only the integers differ. durable_seq is assigned
@@ -3470,14 +3564,58 @@ void DB::flush_once() {
     }
     if (settled) counters_.flush_settles.fetch_add(1, std::memory_order_relaxed);
   }
-  flush_pending();
+  try {
+    flush_pending();
+  } catch (...) {
+    flush_threw();
+  }
   finish_flush();
+}
+
+void DB::flush_threw() noexcept {
+  // The head's entries are in the file and the flush that should have
+  // published them did not: writes are refused, and every writer waiting
+  // on this flush gets its error, as after a failed fdatasync.
+  {
+    std::lock_guard<std::mutex> lk{durable_mu_};
+    flush_error_ = std::current_exception();
+  }
+  refuse_writes();
+}
+
+auto DB::refused(const EngineState &s) const noexcept -> bool {
+  return s.degraded || write_fault_.load(std::memory_order_acquire);
+}
+
+void DB::refuse_writes() noexcept {
+  write_fault_.store(true, std::memory_order_release);
+  try {
+#ifdef BYTECASK_TESTING
+    if (test_before_refusal_publish_) test_before_refusal_publish_();
+#endif
+    // A state that is degraded already keeps its own reason.
+    if (const auto current = load_state(); !current->degraded) {
+      auto s = current->degraded_copy(kWriteFaultReason);
+      std::lock_guard<std::mutex> lk{durable_mu_};
+      store_state(std::move(s));
+    }
+  } catch (...) {
+    // No memory to publish it: write_fault_ alone refuses until resume().
+  }
+  { std::lock_guard<std::mutex> lk{durable_mu_}; }
+  durable_cv_.notify_all();
 }
 
 auto DB::quiesce() -> FlushRole {
   for (;;) {
     if (!flush_in_flight_.exchange(true, std::memory_order_acq_rel)) {
-      flush_pending();
+      try {
+        flush_pending();
+      } catch (...) {
+        flush_threw();
+        finish_flush();
+        throw;
+      }
       return FlushRole{*this};
     }
     std::unique_lock<std::mutex> lk{durable_mu_};
@@ -3509,7 +3647,7 @@ void DB::commit_wait(EngineSlot &slot) {
       std::lock_guard<std::mutex> lk{durable_mu_};
       if (flush_error_) std::rethrow_exception(flush_error_);
     }
-    if (published->degraded) throw DbDegraded{published->degraded_reason};
+    if (refused(*published)) throw DbDegraded{degraded_reason()};
 
     if (!flush_in_flight_.exchange(true, std::memory_order_acq_rel)) {
       flush_once();
@@ -3670,8 +3808,8 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
   std::lock_guard<std::mutex> vg{*vacuum_mu_};
   if (auto s = load_state(); s->closed) {
     throw DbClosed{};
-  } else if (s->degraded) {
-    throw DbDegraded{s->degraded_reason};
+  } else if (refused(*s)) {
+    throw DbDegraded{degraded_reason()};
   }
   // Publishes scrape idle read caches; with no writes there are none, and
   // what the last writes retired stays pinned by whichever thread went idle
@@ -3735,8 +3873,7 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
 // Drops the old active file's preallocated tail, opens it read-only,
 // dispatches hint generation, and opens a new writable active file.
 // Caller must sync the active file before calling if durability is required.
-void DB::rotate_active_file(TransientEngineState &t,
-                            const std::shared_ptr<const EngineState> &) {
+auto DB::prepare_rotation(TransientEngineState &t) -> PreparedRotation {
   wait_for_hint_backlog();
   t.active_file().shrink_to_fit();
   auto read_only_old = openDataFileForRead(t.active_file().path(), io_backend_, pool_,
@@ -3746,10 +3883,17 @@ void DB::rotate_active_file(TransientEngineState &t,
 #endif
   const auto new_file_id = t.reserve_file_id();
   auto new_file = create_active_file(new_file_id, "io_dir_sync_rotate");
-  t.apply_rotate_file(read_only_old, std::move(new_file), new_file_id);
+  return {std::move(read_only_old), std::move(new_file), new_file_id};
+}
+
+void DB::finish_rotation(TransientEngineState &t, PreparedRotation r) {
+#ifdef BYTECASK_TESTING
+  if (test_in_finish_rotation_) test_in_finish_rotation_();
+#endif
+  t.apply_rotate_file(r.sealed, std::move(r.next), r.next_id);
   // The sealed file's frames become evictable and the new file's pinned.
-  if (pool_) pool_->set_active_file(new_file_id);
-  dispatch_hint(std::move(read_only_old));
+  if (pool_) pool_->set_active_file(r.next_id);
+  dispatch_hint(std::move(r.sealed));
 }
 
 auto DB::create_active_file(std::uint32_t file_id, const char *checkpoint)
@@ -4088,7 +4232,7 @@ void DB::vacuum_commit(std::uint32_t old_file_id,
   // everything the scan saw becomes durable before the source can go.
   if (t.durable_seq() < decided_at) {
     // A sync after a failed one proves nothing (#231).
-    if (current->degraded) throw DbDegraded{current->degraded_reason};
+    if (refused(*current)) throw DbDegraded{degraded_reason()};
     sync_active_file(t, current, "vacuum");
   }
   t.apply_vacuum(old_file_id, scan, std::move(new_sealed_file), dest_file_id);
@@ -4283,11 +4427,14 @@ auto DB::mode() const noexcept -> Mode {
 }
 
 auto DB::is_degraded() const noexcept -> bool {
-  return load_state()->degraded;
+  return refused(*load_state());
 }
 
 auto DB::degraded_reason() const noexcept -> std::string {
-  return load_state()->degraded_reason;
+  const auto s = load_state();
+  if (s->degraded) return s->degraded_reason;
+  if (write_fault_.load(std::memory_order_acquire)) return kWriteFaultReason;
+  return {};
 }
 
 auto DB::stats() const -> std::map<std::string, std::int64_t> {
@@ -4376,7 +4523,7 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
       {"bytecask.hint_backpressure_stall_us",
        counters_.hint_backpressure_stall_us.load(std::memory_order_relaxed)},
       // Gauges — current state, not monotonic.
-      {"bytecask.degraded", s->degraded ? 1 : 0},
+      {"bytecask.degraded", refused(*s) ? 1 : 0},
       // Sealed files whose hint is queued or being written. What close must
       // still write, and what an open after a crash would rebuild.
       {"bytecask.hint_backlog", narrow<std::int64_t>(worker_.pending())},
@@ -4395,7 +4542,7 @@ void DB::set_mode(Mode mode) {
   // reuses its sequence. Only a leader can hold such a write: ingest syncs
   // before it publishes.
   const auto last_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
-  if (mode == Mode::Follower && !current->degraded &&
+  if (mode == Mode::Follower && !refused(*current) &&
       t.durable_seq() < last_seq) {
     sync_active_file(t, current, "set_mode(Follower)");
   }
@@ -4432,14 +4579,14 @@ void DB::deem_as_degraded(std::string reason) {
 void DB::resume() {
   if (auto s = load_state(); s->closed) {
     throw DbClosed{};
-  } else if (!s->degraded) {
+  } else if (!refused(*s)) {
     return;
   }
 
   WriteBarrier barrier{*this};
   auto current = load_state_for_write();
   if (current->closed) throw DbClosed{};
-  if (!current->degraded) return;  // re-check under lock
+  if (!refused(*current)) return;  // re-check under lock
 
   // The failed flush left one or two heads derived from the published
   // state alive in head_. The key directory derives a version only from
@@ -4580,6 +4727,7 @@ void DB::resume() {
   // start clean.
   std::lock_guard<std::mutex> lk{durable_mu_};
   flush_error_ = nullptr;
+  write_fault_.store(false, std::memory_order_release);
 }
 
 void DB::wait_published(std::uint64_t sequence) const {
@@ -4593,7 +4741,7 @@ void DB::wait_published(std::uint64_t sequence) const {
     // flush this waiter's sequence is in, so by the time a state is closed
     // that flush has either published the sequence (C1) or degraded (C2).
     // The test stays so a waiter can never outlive the engine.
-    return s->next_seq > sequence || s->degraded || s->closed;
+    return s->next_seq > sequence || refused(*s) || s->closed;
   });
 }
 
@@ -4639,7 +4787,7 @@ auto DB::create_manifest() -> FileManifest {
 
     auto current = load_state_for_write();
     if (current->closed) throw DbClosed{};
-    if (current->degraded) throw DbDegraded{current->degraded_reason};
+    if (refused(*current)) throw DbDegraded{degraded_reason()};
 
     auto t = current->transient();
 
@@ -4649,13 +4797,22 @@ auto DB::create_manifest() -> FileManifest {
     const auto max_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
 
     // Seal active file, dispatch hint generation, open new active.
+    PreparedRotation rotation;
     try {
-      rotate_active_file(t, current);
+      rotation = prepare_rotation(t);
     } catch (...) {
       t.apply_degrade(
           "create_manifest rotation failed: active file is sealed "
           "but new file could not be created. Call resume() to recover.");
       store_state(current, std::move(t).persistent());
+      throw;
+    }
+    try {
+      finish_rotation(t, std::move(rotation));
+    } catch (...) {
+      // The active file is sealed on disk and t half rotated: refused, so
+      // nothing is appended to the sealed file before resume().
+      refuse_writes();
       throw;
     }
 
@@ -6466,6 +6623,8 @@ void DB::ingest(std::span<const DataEntryView> entries) {
     if (s->degraded) throw DbDegraded{s->degraded_reason};
     throw std::logic_error{"ingest rejected: engine is not in follower mode"};
   }
+  if (write_fault_.load(std::memory_order_acquire))
+    throw DbDegraded{kWriteFaultReason};
   if (entries.empty()) return;
 
   // An atomic batch is written to one file like a plan, so it is held to the
@@ -6502,7 +6661,7 @@ void DB::ingest(std::span<const DataEntryView> entries) {
   auto current = load_state_for_write();
   if (!current->is_ingestion_allowed()) {
     if (current->closed) throw DbClosed{};
-    if (current->degraded) throw DbDegraded{current->degraded_reason};
+    if (refused(*current)) throw DbDegraded{degraded_reason()};
     throw std::logic_error{"ingest rejected: engine is not in follower mode"};
   }
 
@@ -6537,99 +6696,113 @@ void DB::ingest(std::span<const DataEntryView> entries) {
 
   // Chunk-and-rotate loop: write entries in chunks, rotating between chunks
   // at safe boundaries (never inside BulkBegin..BulkEnd).
-  while (!remaining.empty()) {
-    auto &file = t.active_file();
+  // Once a chunk is in the file, a throw that no handler below degraded
+  // for — an allocation, typically — leaves bytes nothing published, and
+  // writes are refused until resume() reconciles them.
+  auto appended = false;
+  try {
+    while (!remaining.empty()) {
+      auto &file = t.active_file();
 
-    const auto next =
-        ingest_chunk(remaining, static_cast<std::uint64_t>(file.size()));
-    const auto chunk_end = next.end;
-    const auto needs_rotation = next.needs_rotation;
+      const auto next =
+          ingest_chunk(remaining, static_cast<std::uint64_t>(file.size()));
+      const auto chunk_end = next.end;
+      const auto needs_rotation = next.needs_rotation;
 
-    auto chunk = remaining.subspan(0, chunk_end);
+      auto chunk = remaining.subspan(0, chunk_end);
 
-    // Phase 1: compute offsets, apply in-memory state.
-    auto file_offset = static_cast<std::uint64_t>(file.size());
-    std::vector<std::uint64_t> offsets(chunk.size());
-    for (std::size_t i = 0; i < chunk.size(); ++i) {
-      offsets[i] = file_offset;
-      file_offset += entry_size(chunk[i].key.size(), chunk[i].value.size());
-    }
+      // Phase 1: compute offsets, apply in-memory state.
+      auto file_offset = static_cast<std::uint64_t>(file.size());
+      std::vector<std::uint64_t> offsets(chunk.size());
+      for (std::size_t i = 0; i < chunk.size(); ++i) {
+        offsets[i] = file_offset;
+        file_offset += entry_size(chunk[i].key.size(), chunk[i].value.size());
+      }
 
-    t.apply_ingest(chunk, offsets);
-    auto chunk_max_seq = chunk.back().sequence;
+      t.apply_ingest(chunk, offsets);
+      auto chunk_max_seq = chunk.back().sequence;
 
-    // Phase 2: writev chunk to active file.
-    std::vector<std::uint64_t> io_offsets(chunk.size());
-    try {
-      file.append_entries(chunk, io_offsets);
-    } catch (...) {
-      auto ex = std::current_exception();
-      try { file.sync(); } catch (...) {}
-      auto err_s = current->degraded_copy(
-          "ingest append IO error: call resume() to recover.");
-      store_state(std::move(err_s));
-      std::rethrow_exception(ex);
-    }
-
-    // Phase 3: if rotation needed, sync before sealing.
-    if (needs_rotation) {
+      // Phase 2: writev chunk to active file.
+      std::vector<std::uint64_t> io_offsets(chunk.size());
       try {
-        file.sync();
-        t.apply_sync(chunk_max_seq);
+        file.append_entries(chunk, io_offsets);
+      } catch (...) {
+        auto ex = std::current_exception();
+        try { file.sync(); } catch (...) {}
+        auto err_s = current->degraded_copy(
+            "ingest append IO error: call resume() to recover.");
+        store_state(std::move(err_s));
+        std::rethrow_exception(ex);
+      }
+      appended = true;
+
+      // Phase 3: if rotation needed, sync before sealing.
+      if (needs_rotation) {
+        try {
+          file.sync();
+          t.apply_sync(chunk_max_seq);
+        } catch (...) {
+          auto err_s = current->degraded_copy(
+              "ingest rotation fdatasync failed: call resume() to recover.");
+          store_state(std::move(err_s));
+          throw;
+        }
+        PreparedRotation rotation;
+        try {
+          rotation = prepare_rotation(t);
+        } catch (...) {
+          t.apply_degrade(
+              "ingest post-rotation file creation failed: call resume().");
+          store_state(current, std::move(t).persistent());
+          throw;
+        }
+        finish_rotation(t, std::move(rotation));
+      }
+
+      remaining = remaining.subspan(chunk_end);
+    }
+
+    // Post-loop rotation: if the last chunk pushed the active file past the
+    // threshold, rotate now so the invariant (active file <= threshold) holds.
+    if (t.is_rotation_needed(rotation_threshold_)) {
+      try {
+        t.active_file().sync();
+        t.apply_sync(t.next_seq() - 1);
       } catch (...) {
         auto err_s = current->degraded_copy(
             "ingest rotation fdatasync failed: call resume() to recover.");
         store_state(std::move(err_s));
         throw;
       }
+      PreparedRotation rotation;
       try {
-        rotate_active_file(t, current);
+        rotation = prepare_rotation(t);
       } catch (...) {
         t.apply_degrade(
             "ingest post-rotation file creation failed: call resume().");
         store_state(current, std::move(t).persistent());
         throw;
       }
+      finish_rotation(t, std::move(rotation));
     }
 
-    remaining = remaining.subspan(chunk_end);
-  }
-
-  // Post-loop rotation: if the last chunk pushed the active file past the
-  // threshold, rotate now so the invariant (active file <= threshold) holds.
-  if (t.is_rotation_needed(rotation_threshold_)) {
+    // Final sync: ensure last chunk is durable before publishing.
     try {
       t.active_file().sync();
       t.apply_sync(t.next_seq() - 1);
     } catch (...) {
       auto err_s = current->degraded_copy(
-          "ingest rotation fdatasync failed: call resume() to recover.");
+          "ingest fdatasync failed: call resume() to recover.");
       store_state(std::move(err_s));
       throw;
     }
-    try {
-      rotate_active_file(t, current);
-    } catch (...) {
-      t.apply_degrade(
-          "ingest post-rotation file creation failed: call resume().");
-      store_state(current, std::move(t).persistent());
-      throw;
-    }
-  }
 
-  // Final sync: ensure last chunk is durable before publishing.
-  try {
-    t.active_file().sync();
-    t.apply_sync(t.next_seq() - 1);
+    assert(t.active_file().size() <= rotation_threshold_);
+    store_state(current, std::move(t).persistent());
   } catch (...) {
-    auto err_s = current->degraded_copy(
-        "ingest fdatasync failed: call resume() to recover.");
-    store_state(std::move(err_s));
+    if (appended) refuse_writes();
     throw;
   }
-
-  assert(t.active_file().size() <= rotation_threshold_);
-  store_state(current, std::move(t).persistent());
 }
 
 #pragma endregion

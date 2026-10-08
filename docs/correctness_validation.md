@@ -211,13 +211,13 @@ can occur at this point:
   the active file, replays any valid committed entries, and creates a
   fresh active file.
 - **H — rotation file creation fails**: The sync succeeded but
-  `rotate_active_file` fails after sealing the active file. The sealed
+  `prepare_rotation` fails after sealing the active file. The sealed
   file cannot accept further appends (`assert(!sealed_)` would fire).
   The engine degrades the DB and publishes the state (writes are on disk,
   LSNs must advance). `resume()` creates a fresh active file and clears
   the degraded state.
 
-Key insight: `rotate_active_file` calls `seal()` before creating the new
+Key insight: `prepare_rotation` calls `seal()` before creating the new
 file. If file creation fails, the active file is sealed and unusable.
 Publishing state without degrading would leave an engine that appears
 healthy but fails on the next append. Degrading is the correct response;
@@ -323,7 +323,7 @@ Four checkpoints exist in the production code:
    advance in `DataFile::append()` (post-write checkpoint)
 3. `io_data_file_sync` — before `fdatasync()` in `DataFile::sync()`
 4. `io_rotate_file_creation` — after sealing, before new file creation
-   in `rotate_active_file()`
+   in `prepare_rotation()`
 
 Six additional checkpoints exist in `bytecask.cpp` (compiled under `BYTECASK_TESTING`):
 
@@ -1894,6 +1894,122 @@ not hold, and the sweep rejects it.
   wrapped: the engine acts on none of their results but `flock`'s, which
   the lock tests cover.
 
+### Counted allocation-failure sweep
+
+The I/O sweep fails calls into the kernel; nothing failed an allocation.
+SQLite fails the n-th allocation of each operation the way it fails the
+n-th I/O call [8], and this sweep does the same (#364): for each operation
+it fails allocation 1, 2, …, n until the operation completes without
+reaching the fault ([`tests/alloc_sweep_test.cpp`](../tests/alloc_sweep_test.cpp)).
+
+**Counting.** [`tests/alloc_faults.cpp`](../tests/alloc_faults.cpp)
+replaces every form of the global `operator new` in `bytecask_tests` with
+one that counts while armed and fails the n-th: `std::bad_alloc`, or
+`nullptr` for the `nothrow` forms. The count is process-wide, since the
+committer thread and the hint worker allocate on an operation's behalf. A
+thread holding `SuspendSyscallFaults` is neither counted nor failed, so the
+`PageCacheModel`'s bookkeeping and the test code that builds an
+operation's inputs are left out, as they are of the I/O sweep. The
+operations are the I/O sweep's, shared through
+[`tests/sweep_operations.h`](../tests/sweep_operations.h). `malloc` is not
+counted: zstd allocates with it and reports a failure as an error code,
+which the hint paths already handle.
+
+**Passes.** *one* fails only the n-th allocation, a transient spike;
+*every one from N on* fails it and every allocation after it until the
+operation ends, sustained pressure, which reaches the handlers that
+allocate while they handle a failure.
+
+**Each run in a child.** An allocation failure could end in
+`std::terminate`, so each run is a forked child, and a termination is an
+outcome to record rather than the end of the test binary. The child runs
+the operation, then the checks, and reports one line on a pipe:
+
+| Outcome | Meaning |
+|---|---|
+| completed | the fault was not reached |
+| returned | the operation returned, its transition whole |
+| threw, unchanged | it threw and published nothing |
+| threw, applied | it threw after publishing its whole transition |
+| degraded | the engine refused writes; `resume()`, with memory back, recovered it |
+| terminated | the process died |
+| hung | no result after 20 s: a waiter whose wake-up the failure lost |
+
+After the fault, with memory back, the child checks that the state is the
+baseline or the whole transition, that it passes `consistency_errors`, that
+a degraded engine resumes, that a write afterwards lands, and that a clean
+reopen recovers the same state serially and in parallel. A terminated
+run's directory is reopened by the parent as after a SIGKILL and must hold
+the baseline or the whole transition. A failed check and a hang fail the
+test. A termination is counted and reported, and fails the test only with
+`BYTECASK_ALLOC_SWEEP_STRICT=1`: whether the engine may end the process
+for lack of memory is not settled, and the sweep is how it will be.
+
+| Operation | Runs per pass | Outcomes, one / every one from N on |
+|---|---:|---|
+| `put` | 17 | 13 threw unchanged, 3 degraded, 1 completed (both) |
+| `del` | 14 | 10 threw unchanged, 3 degraded, 1 completed (both) |
+| `del_range` | 25 | 21 threw unchanged, 3 degraded, 1 completed (both) |
+| `apply_batch` | 27 | 23 threw unchanged, 3 degraded, 1 completed (both) |
+| a put that fills the active file | 119 | 72 / 56 returned, 34 / 50 degraded, 12 threw unchanged |
+| `vacuum` | 159 | 157 / 158 threw unchanged, 1 / 0 returned |
+| `ingest` | 27 | 23 threw unchanged, 3 degraded (both) |
+| `resume()`, unsynced entry | 162 | 90 / 113 degraded, 71 / 48 returned |
+| `resume()`, torn entry | 156 | 86 / 111 degraded, 69 / 44 returned |
+
+No run terminates or hangs. The whole sweep takes about 25 s. It runs on
+the default I/O back-end; `BYTECASK_ALLOC_SWEEP_STRIDE`,
+`BYTECASK_ALLOC_SWEEP_N` and `BYTECASK_ALLOC_SWEEP_PASS` narrow it, and
+`BYTECASK_ALLOC_SWEEP_TRACE=1` prints each run's outcome and the stack of
+each allocation it failed.
+
+**What it found.** Its first run, on every operation:
+
+- *A writer waited forever.* `flush_once` took the flush role and only
+  `finish_flush` gave it back; a throw from `flush_pending` — here the
+  allocation of the published copy — left it taken, and every later
+  `commit_wait` blocked. `quiesce` had the same gap.
+- *A write the caller was told failed came back.* An allocation after the
+  append, of the new head, threw past `execute_group`'s handlers: the bytes
+  were in the file, the engine stayed writable, and the next write reused
+  the failed one's sequences after them. Reads showed the old value; a
+  reopen replayed the failed write.
+- *Freeing memory needed memory.* A transient dropped without publishing
+  freed its nodes through `free_node_subtree_if`, in a `noexcept`
+  destructor, with a heap-allocated work list: under sustained pressure,
+  `std::terminate`. Almost every termination came from here.
+- *A failed publication broke the key directory.* `VersionChain::publish`
+  linked the base to its successor before the allocations that register
+  it, so after a failure every later write threw "a version that already
+  has a successor".
+- *A half-rotated transient was published.* The rotation's handler for the
+  I/O failure of creating the next file also caught an allocation that
+  failed while the files were installed, and published a state with a file
+  and no `file_stats` for it, which `resume()` refused.
+
+The fixes are in `bytecask_design.md`, *A failure after the append that no
+handler degrades for*. Each has a deterministic test, driven by a test hook
+rather than a counted allocation so that it runs in-process — where
+coverage sees it; a forked child's profile is not written — and on the
+sanitizer and WASM builds: `[refuse_writes]` in the same file, and
+`alloc sweep: a transient tree is freed when nothing can be allocated` and
+`alloc sweep: a failed publication leaves the base derivable`. Each has a
+mutation in `tests/durability_mutations/` that reverts it.
+
+**Limits.**
+
+- *Not under ThreadSanitizer, MemorySanitizer or WASM.* Their runtimes
+  define `operator new` themselves (the link fails), and WASM has no
+  `fork`. The hook-driven tests run there.
+- *`malloc` is not counted*, nor anything that allocates with it.
+- *One back-end.* The I/O back-ends differ in their calls far more than in
+  their allocations.
+- *Releasing a version still allocates* (#390): `VersionChain::unpin` frees
+  through vectors, in `noexcept` destructors. No swept operation reaches it
+  under the fault, but releasing the newer of two chained versions does
+  (`retract` grows `pending_`), so `a failed publication leaves the base
+  derivable` releases its version only after disarming.
+
 ### ThreadSanitizer (TSan)
 
 The full test suite (428 test cases, 1.5 M+ assertions) runs clean under
@@ -2427,13 +2543,18 @@ A site whose break nothing has to catch says why instead.
 | `execute_slots`: a failed append syncs what it can before it degrades | not needed: `resume()` rewrites and syncs the file before trusting it (#240) | `no_sync_before_degrade` (chaos, not caught) | — |
 | `execute_slots`: a rotation behind a failed flush stays degraded | `pipeline: rotation behind a failed flush stays degraded` | `rotation_publishes_over_degrade` | #170 |
 | `execute_slots`: a sync write that appends nothing makes earlier unsynced writes durable | `apply_batch: an empty sync plan makes earlier unsynced writes …` | `sync_only_write_skips_sync` | #192 |
+| `execute_group`: a throw after the append refuses writes | `refuse writes: a throw after the append refuses writes until resume()` | `post_append_failure_not_refused` | #364 |
+| `refuse_writes`: the flag refuses when the degraded state cannot be published | `refuse writes: the refusal holds when the degraded state cannot be published` | `refusal_needs_published_state` | #364 |
+| `flush_once`: a `flush_pending` that throws gives the flush role back | `refuse writes: a flush that throws releases the flush role` | `flush_role_kept_on_throw` (hangs) | #364 |
+| `quiesce`: the same for a write barrier's flush | `refuse writes: a barrier's flush that throws releases the flush role` | `barrier_flush_role_kept_on_throw` (hangs) | #364 |
+| `finish_rotation`: a rotation that fails in memory publishes nothing | `refuse writes: a rotation that fails in memory publishes nothing` | `half_rotation_published` | #364 |
 
 ### Rotation and new files
 
 | Site | Guarded by | Mutation | Origin |
 |---|---|---|---|
 | `execute_slots`: a failed rotation `fdatasync` degrades | `class G: key not visible after rotation sync failure` | `rotation_sync_error_ignored` | BC-155 |
-| `rotate_active_file`: `shrink_to_fit` cuts the preallocated tail and syncs the length | not needed: a sealed file's zero tail costs space, not data; open drops a zero tail past the last record (`recovery_check_tail`), and the rotation `fdatasync` before it has already made the data durable | — | — |
+| `prepare_rotation`: `shrink_to_fit` cuts the preallocated tail and syncs the length | not needed: a sealed file's zero tail costs space, not data; open drops a zero tail past the last record (`recovery_check_tail`), and the rotation `fdatasync` before it has already made the data durable | — | — |
 | `create_active_file`: the directory sync before the first write into a new file (open, rotation, `resume()`) | `directory sync: a failed sync at rotation degrades …`, `… in resume() stays degraded`, `… open fails when the active file's entry cannot be synced` | `no_dir_sync_new_data_file` (chaos) | #199 |
 | `sealed_file_size`: a sealed file whose `fstat` fails is not opened as an empty one | `fault sweep: write across a rotation` | `sealed_fstat_failure_reads_empty` | #317 |
 | `rewrite_durably`: a file whose `file_size` fails is not rewritten as an empty one | `fault sweep: resume after a failed sync` | `rewrite_size_failure_reads_empty` | #319 |
@@ -2805,7 +2926,10 @@ result to invariants that need no expected delta; the named checkpoints
 keep the per-class deltas. SQLite counts through its own VFS; the sweep
 counts at the libc boundary, and links the C++ standard library
 statically so that what the engine does through `std::filesystem` crosses
-it in the binary (#319). SQLite's crash tests, which
+it in the binary (#319). Allocations are failed by count too, by the
+[*Counted allocation-failure sweep*](#counted-allocation-failure-sweep),
+which replaces `operator new` where SQLite has its own allocator. SQLite's
+crash tests, which
 run on a VFS that drops or damages unsynced writes at a simulated crash,
 are the ancestor of `PageCacheModel`.
 

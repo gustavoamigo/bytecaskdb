@@ -1,0 +1,23 @@
+A write barrier's flush that throws keeps the flush role, so the next
+barrier or writer waits forever. Reverts #364. The guarded test hangs.
+Guarded-by: "refuse writes: a barrier's flush that throws releases the flush role"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index 9f42cec..21859e7 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3609,13 +3609,7 @@ void DB::refuse_writes() noexcept {
+ auto DB::quiesce() -> FlushRole {
+   for (;;) {
+     if (!flush_in_flight_.exchange(true, std::memory_order_acq_rel)) {
+-      try {
+-        flush_pending();
+-      } catch (...) {
+-        flush_threw();
+-        finish_flush();
+-        throw;
+-      }
++      flush_pending();
+       return FlushRole{*this};
+     }
+     std::unique_lock<std::mutex> lk{durable_mu_};

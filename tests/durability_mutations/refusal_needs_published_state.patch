@@ -1,0 +1,17 @@
+Only a published degraded state refuses: when publishing it fails for
+lack of memory, the flag set before it is ignored. Reverts #364.
+Guarded-by: "refuse writes: the refusal holds when the degraded state cannot be published"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index 9f42cec..1b5e9bb 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3584,7 +3584,7 @@ void DB::flush_threw() noexcept {
+ }
+ 
+ auto DB::refused(const EngineState &s) const noexcept -> bool {
+-  return s.degraded || write_fault_.load(std::memory_order_acquire);
++  return s.degraded;
+ }
+ 
+ void DB::refuse_writes() noexcept {

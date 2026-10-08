@@ -3,14 +3,14 @@ clearing it without resume() while flush_error_ stays set. Reverts #170.
 Guarded-by: "pipeline: rotation behind a failed flush stays degraded"
 
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..c0945966 100644
+index 9f42cec..4dbcd41 100644
 --- a/bytecaskdb/bytecask.cppm
 +++ b/bytecaskdb/bytecask.cppm
-@@ -3136,7 +3136,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
+@@ -3385,7 +3385,7 @@ void DB::commit_appended(TransientEngineState &t,
    // flush_error_ set under a healthy-looking state. The batch fails with
    // that flush's error, like every other write appended behind it; resume()
    // recovers its bytes with theirs.
--  if (published->degraded) {
+-  if (refused(*published)) {
 +  if (false) {
      std::exception_ptr ex;
      {

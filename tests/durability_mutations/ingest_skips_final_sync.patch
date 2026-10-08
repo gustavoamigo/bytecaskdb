@@ -3,14 +3,14 @@ power cut loses entries a follower reported durable.
 Guarded-by: "prove_repl__*"
 
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..38c76c0f 100644
+index 9f42cec..0175ac2 100644
 --- a/bytecaskdb/bytecask.cppm
 +++ b/bytecaskdb/bytecask.cppm
-@@ -6667,7 +6667,6 @@ void DB::ingest(std::span<const DataEntryView> entries) {
+@@ -6788,7 +6788,6 @@ void DB::ingest(std::span<const DataEntryView> entries) {
  
-   // Final sync: ensure last chunk is durable before publishing.
-   try {
--    t.active_file().sync();
-     t.apply_sync(t.next_seq() - 1);
-   } catch (...) {
-     auto err_s = current->degraded_copy(
+     // Final sync: ensure last chunk is durable before publishing.
+     try {
+-      t.active_file().sync();
+       t.apply_sync(t.next_seq() - 1);
+     } catch (...) {
+       auto err_s = current->degraded_copy(

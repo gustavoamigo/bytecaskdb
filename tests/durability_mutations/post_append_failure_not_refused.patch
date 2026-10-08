@@ -1,0 +1,17 @@
+A throw after a batch reached the file fails the batch but leaves the
+engine writable, so the next write appends over bytes nothing published.
+Reverts #364.
+Guarded-by: "refuse writes: a throw after the append refuses writes until resume()"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index 9f42cec..86789e2 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3344,7 +3344,6 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
+     for (auto *s : batch) {
+       if (!s->err) s->err = ex;
+     }
+-    refuse_writes();
+   }
+   return batch.size();
+ }
