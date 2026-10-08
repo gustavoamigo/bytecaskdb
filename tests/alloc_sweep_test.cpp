@@ -641,9 +641,10 @@ TEST_CASE("alloc sweep: a failed publication leaves the base derivable",
 
 // Dropping the last handle of a version frees what only it reached and hands
 // on what it was holding for older ones, in noexcept destructors, often
-// because memory just ran out. Each way a version can die is run in a forked
-// child with every allocation failing: the release must not end the process,
-// and the versions left must still be whole once memory is back (#390).
+// because memory just ran out. Each way a version can die is run with every
+// allocation failing: the release must not end the process, and the versions
+// left must still be whole once memory is back (#390). In-process, so
+// coverage sees the fallbacks; a regression ends the test binary.
 //
 // t is a live base; u1 changes one leaf of it and u2 a leaf far away, so
 // u2's retired nodes park on both u1 and t.
@@ -684,28 +685,22 @@ TEST_CASE("alloc sweep: a version is released when nothing can be allocated",
   SECTION("the head, over a live predecessor") {
     // Retraction: what u2 created is walked and freed, what it retired is
     // live again in u1 and t.
-    CHECK(exits_cleanly_in_child([&] {
-      released_under_fault(u2);
-      still_whole();
-    }));
+    released_under_fault(u2);
+    still_whole();
   }
   SECTION("a version inside the chain") {
     // u1 dies with a successor: the nodes u2 retired from it are freed, and
     // what u1 held for t moves on.
-    CHECK(exits_cleanly_in_child([&] {
-      released_under_fault(u1);
-      still_whole();
-    }));
+    released_under_fault(u1);
+    still_whole();
   }
   SECTION("the base, then the rest of the lineage") {
-    CHECK(exits_cleanly_in_child([&] {
-      released_under_fault(t);
-      still_whole();
-      released_under_fault(u1);
-      still_whole();
-      // The last version of the lineage: everything it retired is freed.
-      released_under_fault(u2);
-    }));
+    released_under_fault(t);
+    still_whole();
+    released_under_fault(u1);
+    still_whole();
+    // The last version of the lineage: everything it retired is freed.
+    released_under_fault(u2);
   }
 }
 
