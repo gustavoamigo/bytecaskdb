@@ -24,7 +24,8 @@ export default defineConfig({
 
     // Test file pattern
     include: ['test/**/*.test.ts'],
-    exclude: ['test/fixtures/**', 'test/helpers/**'],
+    // test/testing/ needs the test-only builds: vitest.testing.config.ts.
+    exclude: ['test/fixtures/**', 'test/helpers/**', 'test/testing/**'],
 
     // Timeouts — async init + WASM can be slow
     testTimeout: 10_000,

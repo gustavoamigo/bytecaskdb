@@ -573,86 +573,98 @@ target("bytecaskdb_python")
 -- node-api-headers)
 -- Build: xmake build bytecaskdb_node
 -- Usage: require("bytecaskdb-node/native/bytecask.node")
-target("bytecaskdb_node")
-    set_kind("shared")
-    set_default(false)
-    add_deps("bytecask")
-    add_files("bytecaskdb-node/native/bytecask_napi.cpp")
-    add_includedirs("include")
-    add_packages("crc32c", "zstd")
-    -- Resolve Node/node-addon-api include paths at configure time, the way
-    -- the Python target resolves nanobind/Python paths — here using npm
-    -- packages installed under bytecaskdb-node/node_modules.
-    --
-    -- on_load runs for every target during `xmake f`/`xmake config`, even
-    -- ones that are never built (this target is set_default(false)) — so it
-    -- must not hard-error when `npm install` hasn't been run yet in
-    -- bytecaskdb-node/ (e.g. a fresh checkout, or CI jobs that only build the
-    -- C++/Python targets). Skip gracefully in that case; an actual attempt
-    -- to build this target will then fail later with a clear missing-header
-    -- error instead of breaking `xmake f` for the whole repository.
-    on_load(function(t)
-        local node_dir = path.join(os.projectdir(), "bytecaskdb-node")
-        local node_addon_api_dir = path.join(node_dir, "node_modules", "node-addon-api")
-        if not os.isdir(node_addon_api_dir) then
-            cprint("${yellow}warning: ${clear}bytecaskdb-node/node_modules not found — " ..
-                   "run 'npm install' in bytecaskdb-node/ before building bytecaskdb_node")
-            return
+-- testing: links bytecask_testing and defines BYTECASK_TESTING, which adds
+-- the testingFailAt/testingClearFault exports (see bytecask_napi.cpp).
+local function node_addon_target(name, engine, basename, testing)
+    target(name)
+        set_kind("shared")
+        set_default(false)
+        add_deps(engine)
+        add_files("bytecaskdb-node/native/bytecask_napi.cpp")
+        add_includedirs("include")
+        add_packages("crc32c", "zstd")
+        -- Resolve Node/node-addon-api include paths at configure time, the way
+        -- the Python target resolves nanobind/Python paths — here using npm
+        -- packages installed under bytecaskdb-node/node_modules.
+        --
+        -- on_load runs for every target during `xmake f`/`xmake config`, even
+        -- ones that are never built (this target is set_default(false)) — so it
+        -- must not hard-error when `npm install` hasn't been run yet in
+        -- bytecaskdb-node/ (e.g. a fresh checkout, or CI jobs that only build the
+        -- C++/Python targets). Skip gracefully in that case; an actual attempt
+        -- to build this target will then fail later with a clear missing-header
+        -- error instead of breaking `xmake f` for the whole repository.
+        on_load(function(t)
+            local node_dir = path.join(os.projectdir(), "bytecaskdb-node")
+            local node_addon_api_dir = path.join(node_dir, "node_modules", "node-addon-api")
+            if not os.isdir(node_addon_api_dir) then
+                cprint("${yellow}warning: ${clear}bytecaskdb-node/node_modules not found — " ..
+                       "run 'npm install' in bytecaskdb-node/ before building bytecaskdb_node")
+                return
+            end
+            local node = os.getenv("BYTECASK_NODE") or "node"
+            -- node-addon-api headers (napi.h, napi-inl.h). Resolve as an
+            -- absolute path directly (rather than via the package's
+            -- cwd-relative include_dir helper) so it is correct regardless of
+            -- xmake's own working directory.
+            t:add("includedirs", node_addon_api_dir)
+            -- node-api-headers headers (node_api.h, js_native_api.h, ...) —
+            -- npm-installable, so the build does not depend on headers bundled
+            -- with a specific Node distribution (e.g. the EMSDK-vendored Node).
+            local api_headers_inc = os.iorunv(node,
+                {"-p", "require.resolve('node-api-headers/include/node_api.h')"},
+                {curdir = node_dir})
+            t:add("includedirs", path.directory(api_headers_inc:trim()))
+            -- Output naming: bytecaskdb-node/native/<basename>.node
+            t:set("basename", basename)
+            t:set("prefixname", "")
+            t:set("extension", ".node")
+            t:set("targetdir", path.join(node_dir, "native"))
+        end)
+        -- Third-party warning suppressions for node-addon-api headers under
+        -- -Weverything, mirroring the Python target's -Wno-* block.
+        add_cxxflags("-Wno-old-style-cast", "-Wno-extra-semi-stmt", "-Wno-shadow",
+                     "-Wno-covered-switch-default", "-Wno-cast-function-type-strict",
+                     "-Wno-sign-conversion", "-Wno-double-promotion", "-Wno-shadow-field",
+                     "-Wno-cast-qual", "-Wno-zero-as-null-pointer-constant",
+                     "-Wno-missing-field-initializers", "-Wno-float-equal",
+                     "-Wno-deprecated-declarations", "-Wno-nested-anon-types",
+                     "-Wno-gnu-anonymous-struct", "-Wno-unused-function",
+                     "-Wno-disabled-macro-expansion", "-Wno-exit-time-destructors",
+                     "-Wno-global-constructors", "-Wno-missing-noreturn",
+                     {force = true})
+        add_cxxflags("-fPIC", {force = true})
+        -- Enable node-addon-api's C++ exception mode: methods that throw C++
+        -- exceptions have them automatically caught and rethrown as JS Errors by
+        -- the generated wrapper, matching the WASM/Embind behavior described in
+        -- docs/native_node_binding_design.md ("Error translation").
+        -- NODE_ADDON_API_CPP_EXCEPTIONS_ALL (not just NAPI_CPP_EXCEPTIONS) is
+        -- required so WrapCallback also catches plain std::exception (the
+        -- engine throws std::system_error / std::runtime_error / invalid_argument,
+        -- not Napi::Error) and rethrows it as a JS Error rather than letting it
+        -- escape the N-API boundary and terminate the process.
+        add_defines("NAPI_CPP_EXCEPTIONS")
+        add_defines("NODE_ADDON_API_CPP_EXCEPTIONS_ALL")
+        if testing then
+            add_defines("BYTECASK_TESTING")
         end
-        local node = os.getenv("BYTECASK_NODE") or "node"
-        -- node-addon-api headers (napi.h, napi-inl.h). Resolve as an
-        -- absolute path directly (rather than via the package's
-        -- cwd-relative include_dir helper) so it is correct regardless of
-        -- xmake's own working directory.
-        t:add("includedirs", node_addon_api_dir)
-        -- node-api-headers headers (node_api.h, js_native_api.h, ...) —
-        -- npm-installable, so the build does not depend on headers bundled
-        -- with a specific Node distribution (e.g. the EMSDK-vendored Node).
-        local api_headers_inc = os.iorunv(node,
-            {"-p", "require.resolve('node-api-headers/include/node_api.h')"},
-            {curdir = node_dir})
-        t:add("includedirs", path.directory(api_headers_inc:trim()))
-        -- Output naming: bytecaskdb-node/native/bytecask.node
-        t:set("basename", "bytecask")
-        t:set("prefixname", "")
-        t:set("extension", ".node")
-        t:set("targetdir", path.join(node_dir, "native"))
-    end)
-    -- Third-party warning suppressions for node-addon-api headers under
-    -- -Weverything, mirroring the Python target's -Wno-* block.
-    add_cxxflags("-Wno-old-style-cast", "-Wno-extra-semi-stmt", "-Wno-shadow",
-                 "-Wno-covered-switch-default", "-Wno-cast-function-type-strict",
-                 "-Wno-sign-conversion", "-Wno-double-promotion", "-Wno-shadow-field",
-                 "-Wno-cast-qual", "-Wno-zero-as-null-pointer-constant",
-                 "-Wno-missing-field-initializers", "-Wno-float-equal",
-                 "-Wno-deprecated-declarations", "-Wno-nested-anon-types",
-                 "-Wno-gnu-anonymous-struct", "-Wno-unused-function",
-                 "-Wno-disabled-macro-expansion", "-Wno-exit-time-destructors",
-                 "-Wno-global-constructors", "-Wno-missing-noreturn",
-                 {force = true})
-    add_cxxflags("-fPIC", {force = true})
-    -- Enable node-addon-api's C++ exception mode: methods that throw C++
-    -- exceptions have them automatically caught and rethrown as JS Errors by
-    -- the generated wrapper, matching the WASM/Embind behavior described in
-    -- docs/native_node_binding_design.md ("Error translation").
-    -- NODE_ADDON_API_CPP_EXCEPTIONS_ALL (not just NAPI_CPP_EXCEPTIONS) is
-    -- required so WrapCallback also catches plain std::exception (the
-    -- engine throws std::system_error / std::runtime_error / invalid_argument,
-    -- not Napi::Error) and rethrows it as a JS Error rather than letting it
-    -- escape the N-API boundary and terminate the process.
-    add_defines("NAPI_CPP_EXCEPTIONS")
-    add_defines("NODE_ADDON_API_CPP_EXCEPTIONS_ALL")
-    -- Undefined N-API symbols are resolved by the host Node process at load
-    -- time — the same "unresolved host symbols" pattern the Python target
-    -- uses for the Python C API. Do NOT pass -Wl,--no-undefined.
-    if is_host("macosx") then
-        add_shflags("-undefined", "dynamic_lookup", {force = true})
-    end
-    on_config(function(t)
-        add_native_syslinks(t)
-        apply_sanitizer(t)
-        add_release_opts(t)
-    end)
+        -- Undefined N-API symbols are resolved by the host Node process at load
+        -- time — the same "unresolved host symbols" pattern the Python target
+        -- uses for the Python C API. Do NOT pass -Wl,--no-undefined.
+        if is_host("macosx") then
+            add_shflags("-undefined", "dynamic_lookup", {force = true})
+        end
+        on_config(function(t)
+            add_native_syslinks(t)
+            apply_sanitizer(t)
+            add_release_opts(t)
+        end)
+    target_end()
+end
+
+node_addon_target("bytecaskdb_node", "bytecask", "bytecask", false)
+-- Test-only addon for test/testing/ (npm run test:testing); never published.
+node_addon_target("bytecaskdb_node_testing", "bytecask_testing", "bytecask_testing", true)
 
 -- Fuzz targets — buffer-level parser harnesses using libFuzzer + ASan.
 -- Build: CLANG_TARGET_TRIPLE=$(clang --print-target-triple) xmake f --sanitizer=fuzzer,address -m debug -y
@@ -837,33 +849,47 @@ target("wasm_smoke_test")
     set_extension(".js")
     set_targetdir(path.join(wasm_dir, "build"))
 
-target("wasm_embind")
-    set_kind("binary")
-    set_default(false)
-    set_wasm_policies()
-    add_wasm_sources()
-    add_files("bytecaskdb-node/wasm/bytecask_embind.cpp")
-    on_config(function(t)
-        t:add("ldflags",
-            "-fwasm-exceptions",
-            "-lembind",
-            -- Exact u64/i64 <-> JS BigInt marshalling for sequence numbers
-            -- (BC-231) — without this, Embind truncates 64-bit values to a
-            -- lossy double at the JS boundary.
-            "-sWASM_BIGINT",
-            "-sNODERAWFS=1", "-sENVIRONMENT=node", "-lnoderawfs.js",
-            -- dlmalloc and the 4 GiB cap: see add_wasm_ldflags.
-            "-sMALLOC=dlmalloc", "-sALLOW_MEMORY_GROWTH", "-sMAXIMUM_MEMORY=4GB",
-            "-sMODULARIZE=1", "-sEXPORT_NAME=createByteCask",
-            "--pre-js", path.join(wasm_dir, "pre.js"),
-            "--js-library", path.join(wasm_dir, "syscall_overrides.js"),
-            "-L" .. path.join(wasm_crc32c, "lib"),
-            {force = true})
-        add_wasm_checks(t)
-    end)
-    set_basename("bytecask")
-    set_extension(".mjs")
-    set_targetdir(path.join(wasm_dir, "build"))
+-- The Embind module the Node package loads (wasm/build/bytecask.mjs), and a
+-- test-only one with BYTECASK_TESTING (bytecask_testing.mjs, never
+-- published) for test/testing/.
+local function wasm_embind_target(name, basename, testing)
+    target(name)
+        set_kind("binary")
+        set_default(false)
+        set_wasm_policies()
+        add_wasm_sources()
+        add_files("bytecaskdb-node/wasm/bytecask_embind.cpp")
+        if testing then
+            -- Compiles the engine with its fault checkpoints, and the
+            -- testingFailAt/testingClearFault exports.
+            add_defines("BYTECASK_TESTING")
+        end
+        on_config(function(t)
+            t:add("ldflags",
+                "-fwasm-exceptions",
+                "-lembind",
+                -- Exact u64/i64 <-> JS BigInt marshalling for sequence numbers
+                -- (BC-231) — without this, Embind truncates 64-bit values to a
+                -- lossy double at the JS boundary.
+                "-sWASM_BIGINT",
+                "-sNODERAWFS=1", "-sENVIRONMENT=node", "-lnoderawfs.js",
+                -- dlmalloc and the 4 GiB cap: see add_wasm_ldflags.
+                "-sMALLOC=dlmalloc", "-sALLOW_MEMORY_GROWTH", "-sMAXIMUM_MEMORY=4GB",
+                "-sMODULARIZE=1", "-sEXPORT_NAME=createByteCask",
+                "--pre-js", path.join(wasm_dir, "pre.js"),
+                "--js-library", path.join(wasm_dir, "syscall_overrides.js"),
+                "-L" .. path.join(wasm_crc32c, "lib"),
+                {force = true})
+            add_wasm_checks(t)
+        end)
+        set_basename(basename)
+        set_extension(".mjs")
+        set_targetdir(path.join(wasm_dir, "build"))
+    target_end()
+end
+
+wasm_embind_target("wasm_embind", "bytecask", false)
+wasm_embind_target("wasm_embind_testing", "bytecask_testing", true)
 
 target("wasm_engine_bench")
     set_kind("binary")

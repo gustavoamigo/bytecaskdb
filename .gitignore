@@ -8,6 +8,7 @@ node_modules/
 
 # Compiled native addon (built via xmake bytecaskdb_node target)
 bytecaskdb-node/native/bytecask.node
+bytecaskdb-node/native/bytecask_testing.node
 
 # MacOS Cache
 .DS_Store

@@ -12,10 +12,17 @@ import { applyDisposeWiring } from "./dispose.js";
 const require = createRequire(import.meta.url);
 
 export async function createNativeBackend(): Promise<ByteCaskFactory> {
-  const addon = require("../native/bytecask.node");
+  return loadNativeModule("bytecask").backend;
+}
+
+// Not exported from index.ts: tests load the BYTECASK_TESTING build
+// ("bytecask_testing") through it and reach its testing* exports.
+export function loadNativeModule(basename: string) {
+  const addon = require(`../native/${basename}.node`);
   applyDisposeWiring(addon);
-  return {
+  const backend: ByteCaskFactory = {
     open: (path, opts) => addon.ByteCaskDB.open(path, opts ?? {}),
     WritePlan: addon.WritePlan,
   };
+  return { backend, module: addon };
 }
