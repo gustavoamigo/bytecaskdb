@@ -98,6 +98,8 @@ PROFILE="acid"
 CAPTURE="off"
 CAPTURE_DIR=""
 
+# The parts of oltp_read_write, one at a time (reads first: the writes change the table):
+#WORKLOADS="oltp_read_write:rw_point_selects oltp_read_write:rw_simple_ranges oltp_read_write:rw_sum_ranges oltp_read_write:rw_order_ranges oltp_read_write:rw_distinct_ranges oltp_read_write:rw_index_updates oltp_read_write:rw_non_index_updates oltp_read_write:rw_delete_inserts"
 #WORKLOADS="oltp_read_only:points_only oltp_read_only:ranges_only oltp_read_only:simple_range oltp_read_only:sum_range oltp_read_only:order_range oltp_read_only:distinct_range"
 
 BYTECASKDB_PORT=3320
@@ -312,8 +314,31 @@ variant_flags() {
     sum_range)      echo "--point-selects=0 --simple-ranges=0 --order-ranges=0 --distinct-ranges=0" ;;
     order_range)    echo "--point-selects=0 --simple-ranges=0 --sum-ranges=0 --distinct-ranges=0" ;;
     distinct_range) echo "--point-selects=0 --simple-ranges=0 --sum-ranges=0 --order-ranges=0" ;;
+    # One part of an oltp_read_write transaction alone, still between BEGIN
+    # and COMMIT, e.g. oltp_read_write:rw_index_updates. Comparing each part's
+    # latency across engines says which part a gap in the full mix comes from.
+    rw_*)           rw_part_flags "${1##*:rw_}" ;;
     *)              echo "" ;;
   esac
+}
+
+# Every query count of an oltp_read_write transaction at 0 except one, at its
+# default: point_selects (10), simple_ranges, sum_ranges, order_ranges,
+# distinct_ranges, index_updates, non_index_updates or delete_inserts (1 each).
+rw_part_flags() {
+  local part="$1" p flags=""
+  local -A defaults=([point_selects]=10 [simple_ranges]=1 [sum_ranges]=1
+    [order_ranges]=1 [distinct_ranges]=1 [index_updates]=1
+    [non_index_updates]=1 [delete_inserts]=1)
+  if [[ -z "${defaults[$part]:-}" ]]; then
+    echo "ERROR: unknown oltp_read_write part '$part'" >&2
+    exit 1
+  fi
+  for p in "${!defaults[@]}"; do
+    if [[ "$p" == "$part" ]]; then flags+=" --${p//_/-}=${defaults[$p]}"
+    else flags+=" --${p//_/-}=0"; fi
+  done
+  echo "$flags"
 }
 
 # ---------------------------------------------------------------------------
