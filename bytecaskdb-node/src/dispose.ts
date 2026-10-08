@@ -41,9 +41,10 @@ export function applyDisposeWiring(module: Record<string, any>): void {
   // BindingError. Check first, so a closed handle reports BC_CLOSED as the
   // native addon's do, and a closed iterator is done, as it is there.
   // Embind also converts the arguments before the C++ guard runs, so an
-  // argument of the wrong type is its BindingError too, with no code: give
-  // it BC_INVALID_ARGUMENT, as the native addon does. The C++ guard's own
-  // errors already carry a code.
+  // argument of the wrong type is its BindingError (or a TypeError, for a
+  // value that is not a BigInt), with no code: give it BC_INVALID_ARGUMENT,
+  // as the native addon does. Anything else uncoded, such as a WebAssembly
+  // trap, is BC_RUNTIME. The C++ guard's own errors already carry a code.
   for (const name of DISPOSABLE_CLASSES) {
     const cls = module[name];
     if (typeof cls?.prototype?.delete !== "function") continue;
@@ -101,7 +102,8 @@ function withCode<T>(call: () => T): T {
     return call();
   } catch (e) {
     if (e instanceof Error && !("code" in e)) {
-      Object.assign(e, { code: "BC_INVALID_ARGUMENT" });
+      const badArgument = e.name === "BindingError" || e instanceof TypeError;
+      Object.assign(e, { code: badArgument ? "BC_INVALID_ARGUMENT" : "BC_RUNTIME" });
     }
     throw e;
   }
