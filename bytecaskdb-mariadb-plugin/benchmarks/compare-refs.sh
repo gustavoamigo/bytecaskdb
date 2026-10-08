@@ -234,3 +234,9 @@ EOF
   done
 } | tee "$OUT/summary.txt"
 echo "=== done $(date)  ($OUT)"
+# Each cell's own fetch hint went into its log; print one for the whole run.
+if [[ "$CAPTURE" == on ]]; then
+  # shellcheck source=lib_capture.sh
+  source "$(dirname "${BASH_SOURCE[0]}")/lib_capture.sh"
+  capture_fetch_hint bench-results "$OUT"  # lands in bench-results/<run>/
+fi
