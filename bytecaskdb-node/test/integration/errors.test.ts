@@ -122,14 +122,10 @@ test('handles invalid database paths gracefully', async ({ wasmBackend }) => {
       // If it succeeds, just close it
       await db.close()
     } catch (error) {
-      // Should get a meaningful path error (could be Error or WebAssembly.Exception)
-      expect(error).toBeInstanceOf(Object) // Accept any error object
-      if (error instanceof Error) {
-        expect(error.message).toMatch(/path|invalid|directory/i)
-      } else {
-        // WASM exceptions might have different structure
-        expect(error).toBeDefined()
-      }
+      // Both backends throw an Error with a code (src/types.ts, ErrorCode).
+      expect(error).toBeInstanceOf(Error)
+      expect((error as { code: string }).code).toMatch(/^BC_(IO|INVALID_ARGUMENT)$/)
+      expect((error as Error).message).not.toBe('')
     }
   }
 })

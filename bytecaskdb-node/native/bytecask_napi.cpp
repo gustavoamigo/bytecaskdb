@@ -23,15 +23,69 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 #include <napi.h>
 
 #include "../../include/bytecask.hpp"
+#include "../shared/error_codes.h"
+#ifdef BYTECASK_TESTING
+#include "../../bytecaskdb/fault_injector.h"
+#endif
 
 using bytecask::Bytes;
 using bytecask::BytesView;
+using bytecask_node::HandleClosed;
+
+// ---------------------------------------------------------------------------
+// Error translation
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The JS Error a call throws for a C++ exception: its message, a `code`
+// (shared/error_codes.h) and, for BC_IO, the `errno`.
+auto make_js_error(Napi::Env env, const std::exception &e) -> Napi::Error {
+  const auto info = bytecask_node::classify_error(e);
+  auto error = Napi::Error::New(env, e.what());
+  error.Value().Set("code", Napi::String::New(env, info.code));
+  if (info.errno_value != 0)
+    error.Value().Set("errno", Napi::Number::New(env, info.errno_value));
+  return error;
+}
+
+// Runs a bound method. A Napi::Error is already a JS error (a call into JS
+// threw) and passes through; any other exception becomes make_js_error's.
+// node-addon-api would convert it too, but to a bare Error with no code.
+template <typename Fn>
+auto guard_call(Napi::Env env, Fn &&fn) -> decltype(fn()) {
+  try {
+    return fn();
+  } catch (const Napi::Error &) {
+    throw;
+  } catch (const std::exception &e) {
+    throw make_js_error(env, e);
+  }
+}
+
+}  // namespace
+
+// Declares, in a wrapped class, what its DefineClass binds in place of each
+// method: Guarded<&C::M> for an instance method, GuardedStatic<&C::F> for a
+// static one. Both run it under guard_call. A wrapper must be a member of
+// the class itself: node-addon-api takes only that class's member pointers.
+#define BC_GUARDED_METHODS                                                    \
+  template <auto M>                                                           \
+  auto Guarded(const Napi::CallbackInfo &info) -> decltype((this->*M)(info)) { \
+    return guard_call(info.Env(), [&] { return (this->*M)(info); });         \
+  }                                                                           \
+  template <auto F>                                                           \
+  static auto GuardedStatic(const Napi::CallbackInfo &info)                   \
+      -> decltype(F(info)) {                                                  \
+    return guard_call(info.Env(), [&] { return F(info); });                  \
+  }
 
 // ---------------------------------------------------------------------------
 // Byte conversion helpers
@@ -221,12 +275,13 @@ class NapiDB : public Napi::ObjectWrap<NapiDB> {
   // Throws if the DB has already been closed; mirrors the Embind layer's
   // explicit-delete-on-close semantics without needing GC to run.
   auto Db() -> bytecask::DB& {
-    if (!db) throw std::runtime_error("Database is closed");
+    if (!db) throw HandleClosed("Database is closed");
     return *db;
   }
 
  private:
   static Napi::FunctionReference constructor;
+  BC_GUARDED_METHODS
 
   static auto Open(const Napi::CallbackInfo& info) -> Napi::Value;
   auto Get(const Napi::CallbackInfo& info) -> Napi::Value;
@@ -268,11 +323,12 @@ class NapiSnapshot : public Napi::ObjectWrap<NapiSnapshot> {
   std::optional<bytecask::Snapshot> snap;
 
   auto Check() const -> void {
-    if (!snap) throw std::runtime_error("Snapshot is closed or has been consumed by a WritePlan");
+    if (!snap) throw HandleClosed("Snapshot is closed or has been consumed by a WritePlan");
   }
 
  private:
   static Napi::FunctionReference constructor;
+  BC_GUARDED_METHODS
 
   auto Get(const Napi::CallbackInfo& info) -> Napi::Value;
   auto ContainsKey(const Napi::CallbackInfo& info) -> Napi::Value;
@@ -295,11 +351,12 @@ class NapiWritePlan : public Napi::ObjectWrap<NapiWritePlan> {
   std::optional<bytecask::WritePlan> plan;
 
   auto Check() const -> void {
-    if (!plan) throw std::runtime_error("WritePlan is closed or has already been applied");
+    if (!plan) throw HandleClosed("WritePlan is closed or has already been applied");
   }
 
  private:
   static Napi::FunctionReference constructor;
+  BC_GUARDED_METHODS
 
   static auto WithSnapshot(const Napi::CallbackInfo& info) -> Napi::Value;
   static auto WithLimits(const Napi::CallbackInfo& info) -> Napi::Value;
@@ -331,6 +388,7 @@ class NapiEntryIterator : public Napi::ObjectWrap<NapiEntryIterator> {
 
  private:
   static Napi::FunctionReference constructor;
+  BC_GUARDED_METHODS
   std::optional<bytecask::EntryIterator> it_;
 
   auto Next(const Napi::CallbackInfo& info) -> Napi::Value;
@@ -345,6 +403,7 @@ class NapiKeyIterator : public Napi::ObjectWrap<NapiKeyIterator> {
 
  private:
   static Napi::FunctionReference constructor;
+  BC_GUARDED_METHODS
   std::optional<bytecask::KeyIterator> it_;
 
   auto Next(const Napi::CallbackInfo& info) -> Napi::Value;
@@ -361,6 +420,7 @@ class NapiReverseEntryIterator
 
  private:
   static Napi::FunctionReference constructor;
+  BC_GUARDED_METHODS
   std::optional<bytecask::ReverseEntryIterator> it_;
 
   auto Next(const Napi::CallbackInfo& info) -> Napi::Value;
@@ -376,6 +436,7 @@ class NapiReverseKeyIterator : public Napi::ObjectWrap<NapiReverseKeyIterator> {
 
  private:
   static Napi::FunctionReference constructor;
+  BC_GUARDED_METHODS
   std::optional<bytecask::ReverseKeyIterator> it_;
 
   auto Next(const Napi::CallbackInfo& info) -> Napi::Value;
@@ -391,6 +452,7 @@ class NapiChangeIterator : public Napi::ObjectWrap<NapiChangeIterator> {
 
  private:
   static Napi::FunctionReference constructor;
+  BC_GUARDED_METHODS
   std::optional<bytecask::ChangeIterator> it_;
 
   auto Next(const Napi::CallbackInfo& info) -> Napi::Value;
@@ -410,6 +472,7 @@ class NapiFileManifest : public Napi::ObjectWrap<NapiFileManifest> {
 
  private:
   static Napi::FunctionReference constructor;
+  BC_GUARDED_METHODS
 
   Napi::ObjectReference snapshot_ref_;  // owns the NapiSnapshot object
   Napi::Reference<Napi::Array> files_ref_;
@@ -431,30 +494,30 @@ auto NapiDB::Init(Napi::Env env, Napi::Object exports) -> void {
   auto func = DefineClass(
       env, "ByteCaskDB",
       {
-          StaticMethod<&NapiDB::Open>("open"),
-          InstanceMethod<&NapiDB::Get>("get"),
-          InstanceMethod<&NapiDB::Put>("put"),
-          InstanceMethod<&NapiDB::Del>("del"),
-          InstanceMethod<&NapiDB::DelRange>("delRange"),
-          InstanceMethod<&NapiDB::ContainsKey>("containsKey"),
-          InstanceMethod<&NapiDB::Snapshot>("snapshot"),
-          InstanceMethod<&NapiDB::ApplyBatch>("applyBatch"),
-          InstanceMethod<&NapiDB::Entries>("entries"),
-          InstanceMethod<&NapiDB::Keys>("keys"),
-          InstanceMethod<&NapiDB::EntriesReverse>("entriesReverse"),
-          InstanceMethod<&NapiDB::KeysReverse>("keysReverse"),
-          InstanceMethod<&NapiDB::Vacuum>("vacuum"),
-          InstanceMethod<&NapiDB::IsDegraded>("isDegraded"),
-          InstanceMethod<&NapiDB::DegradedReason>("degradedReason"),
-          InstanceMethod<&NapiDB::Resume>("resume"),
-          InstanceMethod<&NapiDB::Mode>("mode"),
-          InstanceMethod<&NapiDB::SetMode>("setMode"),
-          InstanceMethod<&NapiDB::DurableSequence>("durableSequence"),
-          InstanceMethod<&NapiDB::CreateManifest>("createManifest"),
-          InstanceMethod<&NapiDB::ChangesSince>("changesSince"),
-          InstanceMethod<&NapiDB::Ingest>("ingest"),
-          InstanceMethod<&NapiDB::Stats>("stats"),
-          InstanceMethod<&NapiDB::Close>("close"),
+          StaticMethod<&NapiDB::GuardedStatic<&NapiDB::Open>>("open"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::Get>>("get"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::Put>>("put"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::Del>>("del"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::DelRange>>("delRange"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::ContainsKey>>("containsKey"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::Snapshot>>("snapshot"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::ApplyBatch>>("applyBatch"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::Entries>>("entries"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::Keys>>("keys"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::EntriesReverse>>("entriesReverse"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::KeysReverse>>("keysReverse"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::Vacuum>>("vacuum"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::IsDegraded>>("isDegraded"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::DegradedReason>>("degradedReason"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::Resume>>("resume"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::Mode>>("mode"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::SetMode>>("setMode"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::DurableSequence>>("durableSequence"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::CreateManifest>>("createManifest"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::ChangesSince>>("changesSince"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::Ingest>>("ingest"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::Stats>>("stats"),
+          InstanceMethod<&NapiDB::Guarded<&NapiDB::Close>>("close"),
       });
   constructor = Napi::Persistent(func);
   constructor.SuppressDestruct();
@@ -497,16 +560,19 @@ auto parse_open_options(const Napi::Value& opts) -> bytecask::Options {
 // Heap-allocating (rather than embedding DB by value) lets Close() destroy
 // it deterministically — releasing the file lock without waiting for GC —
 // mirroring the Embind layer's explicit `delete` in jsdb_close.
-NapiDB::NapiDB(const Napi::CallbackInfo& info)
-    : Napi::ObjectWrap<NapiDB>(info),
-      db{new bytecask::DB(bytecask::DB::open(
-          std::filesystem::path{info[0].As<Napi::String>().Utf8Value()},
-          parse_open_options(opt_arg(info, 1))))} {}
-
 // DB::open() may throw (I/O error, lock contention, CRC failure on
-// recovery); node-addon-api's NAPI_CPP_EXCEPTIONS mode (enabled in
-// xmake.lua) rethrows any C++ exception escaping the constructor as a JS
-// Error.
+// recovery). The JS constructor runs this, not a Guarded method, so it
+// guards itself; Open, which calls the constructor, passes the coded Error
+// on.
+NapiDB::NapiDB(const Napi::CallbackInfo& info)
+    : Napi::ObjectWrap<NapiDB>(info) {
+  db = guard_call(info.Env(), [&] {
+    return std::unique_ptr<bytecask::DB>{new bytecask::DB(bytecask::DB::open(
+        std::filesystem::path{info[0].As<Napi::String>().Utf8Value()},
+        parse_open_options(opt_arg(info, 1))))};
+  });
+}
+
 auto NapiDB::Open(const Napi::CallbackInfo& info) -> Napi::Value {
   return constructor.New({info[0], opt_arg(info, 1)});
 }
@@ -702,13 +768,13 @@ auto NapiSnapshot::Init(Napi::Env env, Napi::Object exports) -> void {
   auto func = DefineClass(
       env, "Snapshot",
       {
-          InstanceMethod<&NapiSnapshot::Get>("get"),
-          InstanceMethod<&NapiSnapshot::ContainsKey>("containsKey"),
-          InstanceMethod<&NapiSnapshot::Entries>("entries"),
-          InstanceMethod<&NapiSnapshot::Keys>("keys"),
-          InstanceMethod<&NapiSnapshot::EntriesReverse>("entriesReverse"),
-          InstanceMethod<&NapiSnapshot::KeysReverse>("keysReverse"),
-          InstanceMethod<&NapiSnapshot::Close>("close"),
+          InstanceMethod<&NapiSnapshot::Guarded<&NapiSnapshot::Get>>("get"),
+          InstanceMethod<&NapiSnapshot::Guarded<&NapiSnapshot::ContainsKey>>("containsKey"),
+          InstanceMethod<&NapiSnapshot::Guarded<&NapiSnapshot::Entries>>("entries"),
+          InstanceMethod<&NapiSnapshot::Guarded<&NapiSnapshot::Keys>>("keys"),
+          InstanceMethod<&NapiSnapshot::Guarded<&NapiSnapshot::EntriesReverse>>("entriesReverse"),
+          InstanceMethod<&NapiSnapshot::Guarded<&NapiSnapshot::KeysReverse>>("keysReverse"),
+          InstanceMethod<&NapiSnapshot::Guarded<&NapiSnapshot::Close>>("close"),
       });
   constructor = Napi::Persistent(func);
   constructor.SuppressDestruct();
@@ -791,18 +857,18 @@ auto NapiWritePlan::Init(Napi::Env env, Napi::Object exports) -> void {
   auto func = DefineClass(
       env, "WritePlan",
       {
-          StaticMethod<&NapiWritePlan::WithSnapshot>("withSnapshot"),
-          StaticMethod<&NapiWritePlan::WithLimits>("withLimits"),
-          InstanceMethod<&NapiWritePlan::Put>("put"),
-          InstanceMethod<&NapiWritePlan::Del>("del"),
-          InstanceMethod<&NapiWritePlan::DelRange>("delRange"),
-          InstanceMethod<&NapiWritePlan::EnsurePresent>("ensurePresent"),
-          InstanceMethod<&NapiWritePlan::EnsureAbsent>("ensureAbsent"),
-          InstanceMethod<&NapiWritePlan::EnsureUnchanged>("ensureUnchanged"),
-          InstanceMethod<&NapiWritePlan::EnsureRangeUnchanged>(
+          StaticMethod<&NapiWritePlan::GuardedStatic<&NapiWritePlan::WithSnapshot>>("withSnapshot"),
+          StaticMethod<&NapiWritePlan::GuardedStatic<&NapiWritePlan::WithLimits>>("withLimits"),
+          InstanceMethod<&NapiWritePlan::Guarded<&NapiWritePlan::Put>>("put"),
+          InstanceMethod<&NapiWritePlan::Guarded<&NapiWritePlan::Del>>("del"),
+          InstanceMethod<&NapiWritePlan::Guarded<&NapiWritePlan::DelRange>>("delRange"),
+          InstanceMethod<&NapiWritePlan::Guarded<&NapiWritePlan::EnsurePresent>>("ensurePresent"),
+          InstanceMethod<&NapiWritePlan::Guarded<&NapiWritePlan::EnsureAbsent>>("ensureAbsent"),
+          InstanceMethod<&NapiWritePlan::Guarded<&NapiWritePlan::EnsureUnchanged>>("ensureUnchanged"),
+          InstanceMethod<&NapiWritePlan::Guarded<&NapiWritePlan::EnsureRangeUnchanged>>(
               "ensureRangeUnchanged"),
-          InstanceMethod<&NapiWritePlan::HasSnapshot>("hasSnapshot"),
-          InstanceMethod<&NapiWritePlan::Close>("close"),
+          InstanceMethod<&NapiWritePlan::Guarded<&NapiWritePlan::HasSnapshot>>("hasSnapshot"),
+          InstanceMethod<&NapiWritePlan::Guarded<&NapiWritePlan::Close>>("close"),
       });
   constructor = Napi::Persistent(func);
   constructor.SuppressDestruct();
@@ -911,8 +977,8 @@ auto NapiWritePlan::Close(const Napi::CallbackInfo&) -> void { plan.reset(); }
   auto ClassName::Init(Napi::Env env, Napi::Object exports) -> void {        \
     auto func = DefineClass(env, JsName,                                     \
                              {                                                \
-                                 InstanceMethod<&ClassName::Next>("next"),    \
-                                 InstanceMethod<&ClassName::Close>("close"),  \
+                                 InstanceMethod<&ClassName::Guarded<&ClassName::Next>>("next"),    \
+                                 InstanceMethod<&ClassName::Guarded<&ClassName::Close>>("close"),  \
                              });                                              \
     constructor = Napi::Persistent(func);                                    \
     constructor.SuppressDestruct();                                          \
@@ -994,11 +1060,11 @@ auto NapiFileManifest::Init(Napi::Env env, Napi::Object exports) -> void {
   auto func = DefineClass(
       env, "FileManifest",
       {
-          InstanceMethod<&NapiFileManifest::GetSnapshot>("getSnapshot"),
-          InstanceMethod<&NapiFileManifest::GetFiles>("getFiles"),
-          InstanceMethod<&NapiFileManifest::GetThroughSequence>(
+          InstanceMethod<&NapiFileManifest::Guarded<&NapiFileManifest::GetSnapshot>>("getSnapshot"),
+          InstanceMethod<&NapiFileManifest::Guarded<&NapiFileManifest::GetFiles>>("getFiles"),
+          InstanceMethod<&NapiFileManifest::Guarded<&NapiFileManifest::GetThroughSequence>>(
               "getThroughSequence"),
-          InstanceMethod<&NapiFileManifest::Close>("close"),
+          InstanceMethod<&NapiFileManifest::Guarded<&NapiFileManifest::Close>>("close"),
       });
   constructor = Napi::Persistent(func);
   constructor.SuppressDestruct();
@@ -1062,7 +1128,38 @@ auto NapiFileManifest::Close(const Napi::CallbackInfo&) -> void {
 // Module init
 // ===========================================================================
 
+#ifdef BYTECASK_TESTING
+// Test builds only (bytecaskdb_node_testing, never published): fail the
+// calling thread's I/O at a named engine checkpoint, as the engine's own
+// tests do, so a test reaches the degraded state through the public API.
+// The injector is per thread; JS calls run on the main thread, which is
+// where a single caller's writes commit.
+namespace {
+
+auto testing_injector() -> bytecask::testing::FaultInjector & {
+  static auto *injector = new bytecask::testing::FaultInjector{};
+  return *injector;
+}
+
+auto TestingFailAt(const Napi::CallbackInfo &info) -> void {
+  auto &injector = testing_injector();
+  injector = bytecask::testing::FaultInjector{};
+  injector.fail_at_name = info[0].As<Napi::String>().Utf8Value();
+  bytecask::testing::active_injector = &injector;
+}
+
+auto TestingClearFault(const Napi::CallbackInfo &) -> void {
+  bytecask::testing::active_injector = nullptr;
+}
+
+}  // namespace
+#endif
+
 auto InitAll(Napi::Env env, Napi::Object exports) -> Napi::Object {
+#ifdef BYTECASK_TESTING
+  exports.Set("testingFailAt", Napi::Function::New<TestingFailAt>(env));
+  exports.Set("testingClearFault", Napi::Function::New<TestingClearFault>(env));
+#endif
   NapiDB::Init(env, exports);
   NapiSnapshot::Init(env, exports);
   NapiWritePlan::Init(env, exports);

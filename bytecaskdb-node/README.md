@@ -188,8 +188,35 @@ snap.close();
 - Iterator objects hold C++ state. Close them when done, or consume to exhaustion, or use `using` declarations. All iterator and resource types support `Symbol.dispose` (Node.js 22+).
 - Call `.close()` on DB, Snapshot, WritePlan, and iterators when done to free C++ memory. There is no garbage collection integration.
 - `db.close()` makes every write durable, `sync: false` ones included, and throws if it could not — a failed final `fdatasync` or hint write. The handle is released either way; a second `close()` does nothing.
-- C++ exceptions (I/O errors, CRC mismatches) are thrown as JS `Error` objects.
+- Every error both backends throw is a JS `Error` with a `code`; see [Errors](#errors).
 - All write methods default to `sync: true`. Pass `{ sync: false }` for async writes.
+
+## Errors
+
+Both backends throw an `Error` whose `code` says what kind of failure it was, so callers need not match message text:
+
+| `code` | When |
+|---|---|
+| `BC_DEGRADED` | A write on a degraded engine. Reads still work; `resume()` recovers. |
+| `BC_FOLLOWER_MODE` | A normal write in follower mode. |
+| `BC_CLOSED` | A call on a closed DB, snapshot or plan, or on a snapshot or plan already consumed. A closed iterator is done instead. |
+| `BC_INVALID_ARGUMENT` | Input refused before anything is written: a key, value or plan over its limit, an empty range, an option over its ceiling. |
+| `BC_IO` | An I/O failure. `errno` holds the system error: Linux's numbering on the native backend, Emscripten's on WASM. |
+| `BC_LOGIC` | A call the engine's state does not allow, such as `ingest` on a leader or a guard on a plan without a snapshot. |
+| `BC_RUNTIME` | Anything else, data corruption included. |
+
+```ts
+import type { ByteCaskError } from 'bytecaskdb';
+
+try {
+  db.put('k', 'v');
+} catch (e) {
+  if ((e as ByteCaskError).code === 'BC_DEGRADED') db.resume();
+  else throw e;
+}
+```
+
+A write that throws `BC_IO` has an unknown outcome, not a failed one: `resume()` replays every complete entry in the active file, so it can be there afterwards.
 
 ## Benchmarks
 

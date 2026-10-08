@@ -436,6 +436,23 @@ jobs:
           BC_TEST_BACKEND: native
         run: npm test
 
+      # Degraded mode through the API needs the engine's fault checkpoints:
+      # test-only builds of both backends (BYTECASK_TESTING), never published.
+      - name: Build test-only addon and WASM module
+        run: |
+          xmake build bytecaskdb_node_testing
+          xmake build wasm_embind_testing
+
+      - name: Run degraded-mode tests (WASM backend)
+        working-directory: bytecaskdb-node
+        run: npm run test:testing
+
+      - name: Run degraded-mode tests (native backend)
+        working-directory: bytecaskdb-node
+        env:
+          BC_TEST_BACKEND: native
+        run: npm run test:testing
+
       # The engine's own Catch2 suite, compiled for WASM: a 32-bit size_t,
       # one thread, NODERAWFS. `xmake run` leaves out the [concurrency] and
       # [lock] cases one thread cannot run; everything else runs, so a 32-bit

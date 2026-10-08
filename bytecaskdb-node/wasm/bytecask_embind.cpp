@@ -19,6 +19,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -27,7 +28,60 @@
 
 import bytecask;
 
+#include "../shared/error_codes.h"
+#ifdef BYTECASK_TESTING
+#include "../../bytecaskdb/fault_injector.h"
+#endif
+
 using namespace emscripten;
+using bytecask_node::HandleClosed;
+
+// ---------------------------------------------------------------------------
+// Error translation
+// ---------------------------------------------------------------------------
+
+// The JS Error a call throws for a C++ exception: its message, a `code`
+// (shared/error_codes.h) and, for BC_IO, the `errno`. Under
+// -fwasm-exceptions a C++ exception that reached JS would carry neither
+// its type nor its what().
+static auto make_js_error(const std::exception &e) -> val {
+  const auto info = bytecask_node::classify_error(e);
+  auto error = val::global("Error").new_(std::string{e.what()});
+  error.set("code", std::string{info.code});
+  if (info.errno_value != 0) error.set("errno", info.errno_value);
+  return error;
+}
+
+// Guarded<&f>::call is what EMSCRIPTEN_BINDINGS registers in place of f: it
+// runs f and turns an exception into make_js_error's Error. The JS throw
+// happens after the catch block has ended, so the C++ exception is freed
+// before JS unwinds the frame.
+template <auto F> struct Guarded;
+
+template <typename R, typename... A, R (*F)(A...)> struct Guarded<F> {
+  static auto call(A... args) -> R {
+    std::optional<val> error;
+    try {
+      return F(std::forward<A>(args)...);
+    } catch (const std::exception &e) {
+      error = make_js_error(e);
+    }
+    error->throw_();
+  }
+};
+
+template <typename R, typename C, typename... A, R (C::*F)(A...)>
+struct Guarded<F> {
+  static auto call(C &self, A... args) -> R {
+    std::optional<val> error;
+    try {
+      return (self.*F)(std::forward<A>(args)...);
+    } catch (const std::exception &e) {
+      error = make_js_error(e);
+    }
+    error->throw_();
+  }
+};
 using bytecask::Bytes;
 using bytecask::BytesView;
 
@@ -126,7 +180,7 @@ struct JsSnapshot {
   explicit JsSnapshot(bytecask::Snapshot s) : snap{std::move(s)} {}
 
   void check() const {
-    if (!snap) throw std::runtime_error("Snapshot consumed by WritePlan");
+    if (!snap) throw HandleClosed("Snapshot consumed by WritePlan");
   }
 };
 
@@ -146,7 +200,7 @@ struct JsWritePlan {
   }
 
   void check() const {
-    if (!plan) throw std::runtime_error("WritePlan already applied");
+    if (!plan) throw HandleClosed("WritePlan already applied");
   }
 };
 
@@ -444,17 +498,9 @@ static auto jsdb_degraded_reason(JsDB &self) -> std::string {
 
 static void jsdb_resume(JsDB &self) { self.db.resume(); }
 
-// Returns what close() reported, or "" if the shutdown was clean. A message,
-// not a throw: under -fwasm-exceptions JS sees a C++ exception without its
-// what(). The JS close() throws it once the handle is deleted (dispose.ts).
-static auto jsdb_close(JsDB &self) -> std::string {
-  try {
-    self.db.close();
-  } catch (const std::exception &e) {
-    return e.what();
-  }
-  return {};
-}
+// Bound as closeDb: the JS close() runs it, then deletes the handle whether
+// or not it threw (dispose.ts).
+static void jsdb_close(JsDB &self) { self.db.close(); }
 
 static auto jsdb_mode(JsDB &self) -> std::string {
   return mode_to_string(self.db.mode());
@@ -684,73 +730,98 @@ static auto jsdb_stats(JsDB &self) -> val {
 // Embind registration
 // ---------------------------------------------------------------------------
 
+#ifdef BYTECASK_TESTING
+// Test builds only (wasm_embind_testing, never published): fail I/O at a
+// named engine checkpoint, as the engine's own tests do, so a test reaches
+// the degraded state through the public API. The WASM build has one thread.
+static auto testing_injector() -> bytecask::testing::FaultInjector & {
+  static auto *injector = new bytecask::testing::FaultInjector{};
+  return *injector;
+}
+
+static void testing_fail_at(const std::string &name) {
+  auto &injector = testing_injector();
+  injector = bytecask::testing::FaultInjector{};
+  injector.fail_at_name = name;
+  bytecask::testing::active_injector = &injector;
+}
+
+static void testing_clear_fault() {
+  bytecask::testing::active_injector = nullptr;
+}
+#endif
+
 EMSCRIPTEN_BINDINGS(bytecask) {
   register_optional<val>();
+#ifdef BYTECASK_TESTING
+  function("testingFailAt", &testing_fail_at);
+  function("testingClearFault", &testing_clear_fault);
+#endif
   class_<JsDB>("ByteCaskDB")
-      .class_function("open", &jsdb_open, allow_raw_pointers())
-      .function("get", &jsdb_get)
-      .function("put", &jsdb_put)
-      .function("del", &jsdb_del)
-      .function("delRange", &jsdb_del_range)
-      .function("containsKey", &jsdb_contains_key)
-      .function("snapshot", &jsdb_snapshot, allow_raw_pointers())
-      .function("applyBatch", &jsdb_apply_batch)
-      .function("entries", &jsdb_entries, allow_raw_pointers())
-      .function("keys", &jsdb_keys, allow_raw_pointers())
-      .function("entriesReverse", &jsdb_entries_reverse, allow_raw_pointers())
-      .function("keysReverse", &jsdb_keys_reverse, allow_raw_pointers())
-      .function("vacuum", &jsdb_vacuum)
-      .function("isDegraded", &jsdb_is_degraded)
-      .function("degradedReason", &jsdb_degraded_reason)
-      .function("resume", &jsdb_resume)
-      .function("closeDb", &jsdb_close)
-      .function("mode", &jsdb_mode)
-      .function("setMode", &jsdb_set_mode)
-      .function("durableSequence", &jsdb_durable_sequence)
-      .function("createManifest", &jsdb_create_manifest, allow_raw_pointers())
-      .function("changesSince", &jsdb_changes_since, allow_raw_pointers())
-      .function("ingest", &jsdb_ingest)
-      .function("stats", &jsdb_stats);
+      .class_function("open", &Guarded<&jsdb_open>::call, allow_raw_pointers())
+      .function("get", &Guarded<&jsdb_get>::call)
+      .function("put", &Guarded<&jsdb_put>::call)
+      .function("del", &Guarded<&jsdb_del>::call)
+      .function("delRange", &Guarded<&jsdb_del_range>::call)
+      .function("containsKey", &Guarded<&jsdb_contains_key>::call)
+      .function("snapshot", &Guarded<&jsdb_snapshot>::call, allow_raw_pointers())
+      .function("applyBatch", &Guarded<&jsdb_apply_batch>::call)
+      .function("entries", &Guarded<&jsdb_entries>::call, allow_raw_pointers())
+      .function("keys", &Guarded<&jsdb_keys>::call, allow_raw_pointers())
+      .function("entriesReverse", &Guarded<&jsdb_entries_reverse>::call, allow_raw_pointers())
+      .function("keysReverse", &Guarded<&jsdb_keys_reverse>::call, allow_raw_pointers())
+      .function("vacuum", &Guarded<&jsdb_vacuum>::call)
+      .function("isDegraded", &Guarded<&jsdb_is_degraded>::call)
+      .function("degradedReason", &Guarded<&jsdb_degraded_reason>::call)
+      .function("resume", &Guarded<&jsdb_resume>::call)
+      .function("closeDb", &Guarded<&jsdb_close>::call)
+      .function("mode", &Guarded<&jsdb_mode>::call)
+      .function("setMode", &Guarded<&jsdb_set_mode>::call)
+      .function("durableSequence", &Guarded<&jsdb_durable_sequence>::call)
+      .function("createManifest", &Guarded<&jsdb_create_manifest>::call, allow_raw_pointers())
+      .function("changesSince", &Guarded<&jsdb_changes_since>::call, allow_raw_pointers())
+      .function("ingest", &Guarded<&jsdb_ingest>::call)
+      .function("stats", &Guarded<&jsdb_stats>::call);
 
   class_<JsSnapshot>("Snapshot")
-      .function("get", &jssnap_get)
-      .function("containsKey", &jssnap_contains_key)
-      .function("entries", &jssnap_entries, allow_raw_pointers())
-      .function("keys", &jssnap_keys, allow_raw_pointers())
-      .function("entriesReverse", &jssnap_entries_reverse, allow_raw_pointers())
-      .function("keysReverse", &jssnap_keys_reverse, allow_raw_pointers());
+      .function("get", &Guarded<&jssnap_get>::call)
+      .function("containsKey", &Guarded<&jssnap_contains_key>::call)
+      .function("entries", &Guarded<&jssnap_entries>::call, allow_raw_pointers())
+      .function("keys", &Guarded<&jssnap_keys>::call, allow_raw_pointers())
+      .function("entriesReverse", &Guarded<&jssnap_entries_reverse>::call, allow_raw_pointers())
+      .function("keysReverse", &Guarded<&jssnap_keys_reverse>::call, allow_raw_pointers());
 
   class_<JsWritePlan>("WritePlan")
       .constructor<>()
-      .class_function("withSnapshot", &jswp_with_snapshot,
+      .class_function("withSnapshot", &Guarded<&jswp_with_snapshot>::call,
                       allow_raw_pointers())
-      .class_function("withLimits", &jswp_with_limits, allow_raw_pointers())
-      .function("put", &jswp_put)
-      .function("del", &jswp_del)
-      .function("delRange", &jswp_del_range)
-      .function("ensurePresent", &jswp_ensure_present)
-      .function("ensureAbsent", &jswp_ensure_absent)
-      .function("ensureUnchanged", &jswp_ensure_unchanged)
-      .function("ensureRangeUnchanged", &jswp_ensure_range_unchanged)
-      .function("hasSnapshot", &jswp_has_snapshot);
+      .class_function("withLimits", &Guarded<&jswp_with_limits>::call, allow_raw_pointers())
+      .function("put", &Guarded<&jswp_put>::call)
+      .function("del", &Guarded<&jswp_del>::call)
+      .function("delRange", &Guarded<&jswp_del_range>::call)
+      .function("ensurePresent", &Guarded<&jswp_ensure_present>::call)
+      .function("ensureAbsent", &Guarded<&jswp_ensure_absent>::call)
+      .function("ensureUnchanged", &Guarded<&jswp_ensure_unchanged>::call)
+      .function("ensureRangeUnchanged", &Guarded<&jswp_ensure_range_unchanged>::call)
+      .function("hasSnapshot", &Guarded<&jswp_has_snapshot>::call);
 
   class_<JsEntryIterator>("EntryIterator")
-      .function("next", &JsEntryIterator::next);
+      .function("next", &Guarded<&JsEntryIterator::next>::call);
 
   class_<JsKeyIterator>("KeyIterator")
-      .function("next", &JsKeyIterator::next);
+      .function("next", &Guarded<&JsKeyIterator::next>::call);
 
   class_<JsReverseEntryIterator>("ReverseEntryIterator")
-      .function("next", &JsReverseEntryIterator::next);
+      .function("next", &Guarded<&JsReverseEntryIterator::next>::call);
 
   class_<JsReverseKeyIterator>("ReverseKeyIterator")
-      .function("next", &JsReverseKeyIterator::next);
+      .function("next", &Guarded<&JsReverseKeyIterator::next>::call);
 
   class_<JsChangeIterator>("ChangeIterator")
-      .function("next", &JsChangeIterator::next);
+      .function("next", &Guarded<&JsChangeIterator::next>::call);
 
   class_<JsFileManifest>("FileManifest")
-      .function("getSnapshot", &js_file_manifest_get_snapshot, allow_raw_pointers())
-      .function("getFiles", &js_file_manifest_get_files)
-      .function("getThroughSequence", &js_file_manifest_get_through_sequence);
+      .function("getSnapshot", &Guarded<&js_file_manifest_get_snapshot>::call, allow_raw_pointers())
+      .function("getFiles", &Guarded<&js_file_manifest_get_files>::call)
+      .function("getThroughSequence", &Guarded<&js_file_manifest_get_through_sequence>::call);
 }

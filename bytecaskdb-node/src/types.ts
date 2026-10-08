@@ -9,6 +9,32 @@ export interface Disposable {
 
 export type EntryType = 'put' | 'delete' | 'bulkBegin' | 'bulkEnd' | 'rangeDel';
 
+// The `code` on every error either backend throws.
+//   BC_DEGRADED          a write on a degraded engine; resume() clears it
+//   BC_FOLLOWER_MODE     a normal write in follower mode
+//   BC_CLOSED            a call on a closed DB, or on a closed or consumed
+//                        snapshot or plan
+//   BC_INVALID_ARGUMENT  input refused before anything is written: a key,
+//                        value or plan over its limit, an empty range, an
+//                        option over its ceiling
+//   BC_IO                an I/O failure; `errno` holds the system error
+//   BC_LOGIC             a call the engine's state does not allow, such as
+//                        ingest on a leader or a guard without a snapshot
+//   BC_RUNTIME           anything else, data corruption included
+export type ErrorCode =
+  | 'BC_DEGRADED'
+  | 'BC_FOLLOWER_MODE'
+  | 'BC_CLOSED'
+  | 'BC_INVALID_ARGUMENT'
+  | 'BC_IO'
+  | 'BC_LOGIC'
+  | 'BC_RUNTIME';
+
+export interface ByteCaskError extends Error {
+  code: ErrorCode;
+  errno?: number;
+}
+
 // Selects how data files are read. 'pread' (default) issues pread(2) per
 // read; 'mmap' memory-maps sealed files for zero-copy reads; 'bufferPool'
 // serves sealed files from a bounded, engine-owned cache — see

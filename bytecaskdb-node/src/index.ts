@@ -3,11 +3,13 @@
 
 export type {
   ByteCaskDB,
+  ByteCaskError,
   ByteCaskFactory,
   BufferPoolOptions,
   CloseableIterator,
   CommitResult,
   Entry,
+  ErrorCode,
   IoBackend,
   OpenOptions,
   ReadOptions,

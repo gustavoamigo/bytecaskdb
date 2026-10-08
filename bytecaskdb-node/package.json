@@ -17,6 +17,8 @@
     "test:ui": "vitest --ui",
     "test:smoke": "cd .. && xmake build wasm_smoke_test && node bytecaskdb-node/wasm/build/wasm_smoke_test.js",
     "test:smoke:native": "npm run build:native && node native/smoke_test.cjs",
+    "build:testing": "cd .. && xmake build bytecaskdb_node_testing && xmake build wasm_embind_testing",
+    "test:testing": "vitest run --config vitest.testing.config.ts",
     "test:wasm": "cd .. && xmake build wasm_tests && node bytecaskdb-node/wasm/build/bytecask_tests.js '~[concurrency]' '~[lock]'",
     "bench:wasm": "cd .. && xmake build wasm_engine_bench && BC_DATASET_SIZE=100000 node bytecaskdb-node/wasm/build/engine_bench_nodefs.js",
     "bench": "npm run build:ts && node scripts/bench.mjs"

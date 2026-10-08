@@ -147,11 +147,38 @@ and a release build passes `undefined` only because it skips that check.
 
 ### Error translation
 
-C++ exceptions become JS `Error`s via `Napi::Error::ThrowAsJavaScriptException`
-(or `NAPI_CPP_EXCEPTIONS`), mirroring the WASM behavior where I/O errors and CRC
-mismatches surface as JS `Error`s. `nullopt` returns (from `del` and
-`applyBatch`) become JS `null`, not exceptions — a conflict is an expected
-outcome, not an error.
+Every exception reaches JS as an `Error` with the exception's message, a
+`code`, and, for an I/O failure, the `errno`. `shared/error_codes.h` maps an
+exception to its code by class, for both backends: `DbDegraded` →
+`BC_DEGRADED`, `DbFollowerMode` → `BC_FOLLOWER_MODE`, `DbClosed` and the
+bindings' own `HandleClosed` (a closed or consumed handle) → `BC_CLOSED`,
+`std::system_error` → `BC_IO`, `std::invalid_argument`, `length_error` and
+`out_of_range` → `BC_INVALID_ARGUMENT`, any other `std::logic_error` →
+`BC_LOGIC`, and anything else → `BC_RUNTIME`. The engine has no class for
+corruption, which it throws as `std::runtime_error`, so corruption is
+`BC_RUNTIME`.
+
+Each binding runs every bound function under a guard that does the mapping.
+The native addon cannot hook node-addon-api's own conversion, which makes a
+bare `Error`: each class declares `Guarded<&C::M>` (`BC_GUARDED_METHODS`),
+and `DefineClass` binds that in place of each method. The Embind layer
+registers `Guarded<&f>::call` in place of each function, and throws the
+`Error` with `val::throw_()` after the catch block has ended; under
+`-fwasm-exceptions` a C++ exception reaching JS would carry neither its type
+nor its message. A deleted Embind handle makes Embind throw its own
+`BindingError`, so `dispose.ts` checks `isDeleted()` first and throws
+`BC_CLOSED`, or reports a closed iterator done, as the native addon does.
+
+`nullopt` returns (from `del` and `applyBatch`) become JS `null`, not
+exceptions — a conflict is an expected outcome, not an error.
+
+Degraded mode cannot be reached through the public API: nothing in it makes
+an `fdatasync` fail. `bytecaskdb_node_testing` and `wasm_embind_testing`
+build the bindings against the engine with `BYTECASK_TESTING`, which adds
+`testingFailAt(checkpoint)` and `testingClearFault()` exports driving the
+engine's fault injector. `test/testing/` runs on them
+(`vitest.testing.config.ts`, `npm run test:testing`); they are never
+published.
 
 ### Iterator protocol
 
