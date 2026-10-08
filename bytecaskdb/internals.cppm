@@ -14,6 +14,7 @@ module;
 #include <map>
 #include <memory>
 #include <optional>
+#include <variant>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -663,8 +664,53 @@ inline auto key_read_buffer() -> std::vector<std::byte> & {
 // registry, so it can outlive the call that made it (keys_from). The key
 // span lives until the next dereference or advance.
 // ---------------------------------------------------------------------------
+// The position a blind key directory iterator holds. On the blind tree
+// it is the tree's own iterator. A buffered key directory's iterator wraps
+// one; over a version with nothing buffered the cursor holds the tree's
+// iterator itself, so a scan steps and reads as on the blind tree (through
+// the wrapper it cost a 50-entry range scan 6-13%), and only a merging
+// iterator reads keys to move.
+template <typename Plain, typename Inner> class KeyDirCursor {
+public:
+  KeyDirCursor() = default;
+  explicit KeyDirCursor(Inner c) {
+    if (auto p = std::move(c).take_plain()) v_.template emplace<Plain>(std::move(*p));
+    else v_.template emplace<Inner>(std::move(c));
+  }
+  explicit KeyDirCursor(Plain p) : v_{std::in_place_type<Plain>, std::move(p)} {}
+  // The buffered iterator while it merges; null for the plain kind.
+  [[nodiscard]] auto merging() noexcept -> Inner * { return std::get_if<Inner>(&v_); }
+  [[nodiscard]] auto plain() noexcept -> Plain & { return *std::get_if<Plain>(&v_); }
+  [[nodiscard]] auto current() const -> BlindRef {
+    if (const auto *p = std::get_if<Plain>(&v_)) [[likely]] return **p;
+    return *std::get<Inner>(v_);
+  }
+  [[nodiscard]] auto at_end() const noexcept -> bool {
+    if (const auto *p = std::get_if<Plain>(&v_)) [[likely]] return *p == std::default_sentinel;
+    return std::get<Inner>(v_) == std::default_sentinel;
+  }
+
+private:
+  std::variant<Plain, Inner> v_;
+};
+template <typename It> class KeyDirCursor<It, It> {
+public:
+  KeyDirCursor() = default;
+  explicit KeyDirCursor(It it) : it_{std::move(it)} {}
+  [[nodiscard]] static auto merging() noexcept -> It * { return nullptr; }
+  [[nodiscard]] auto plain() noexcept -> It & { return it_; }
+  [[nodiscard]] auto current() const -> BlindRef { return *it_; }
+  [[nodiscard]] auto at_end() const noexcept -> bool { return it_ == std::default_sentinel; }
+
+private:
+  It it_;
+};
+
 export template <bool Keyed> class BlindKeyDirIter {
   using Inner = decltype(std::declval<const KeyDirTree &>().begin());
+  // The blind tree's own iterator (KeyDirCursor).
+  using Plain = decltype(std::declval<const PersistentBlindBTree<kBlindLeafBytes> &>().begin());
+  static constexpr bool kTwoKinds = !std::same_as<Plain, Inner>;
 
 public:
   using iterator_category = std::bidirectional_iterator_tag;
@@ -675,21 +721,16 @@ public:
                          KeyDirLoc>;
 
   BlindKeyDirIter() = default;
-  BlindKeyDirIter(Inner cur, const KeyDirCtx &ctx) : cur_{std::move(cur)} {
-    if (ctx.files) {
-      files_ = *ctx.files; // O(1) handle copy: pins the registry
-      owned_ = true;
-    }
-    ctx_ = ctx;
-    ctx_.files = nullptr;
-    const auto c = context();
-    KeyReader reader{c, buf_, lease_};
-    cur_.settle(reader);
-    lease_.reset();
+  BlindKeyDirIter(Inner cur, const KeyDirCtx &ctx) : cur_{std::move(cur)} { init(ctx); }
+  // Over a drained buffered version: the tree's own iterator.
+  BlindKeyDirIter(Plain cur, const KeyDirCtx &ctx)
+    requires kTwoKinds
+      : cur_{std::move(cur)} {
+    init(ctx);
   }
 
   inline auto operator*() const -> value_type {
-    const auto ref = *cur_;
+    const auto ref = current();
     if constexpr (Keyed) {
       const auto ctx = context();
       KeyReader reader{ctx, buf_, lease_};
@@ -704,7 +745,7 @@ public:
   [[nodiscard]] auto key() const -> std::span<const std::byte> {
     const auto ctx = context();
     KeyReader reader{ctx, buf_, lease_};
-    return reader.key_at(*cur_);
+    return reader.key_at(current());
   }
 
   // A copy holds no lease: its first dereference reads again.
@@ -726,10 +767,14 @@ public:
 
   inline auto operator++() -> BlindKeyDirIter & {
     lease_.reset();
-    const auto c = context();
-    KeyReader reader{c, buf_, lease_};
-    cur_.next(reader);
-    lease_.reset();
+    if (auto *m = merging()) {
+      const auto c = context();
+      KeyReader reader{c, buf_, lease_};
+      m->next(reader);
+      lease_.reset();
+      return *this;
+    }
+    ++plain();
     return *this;
   }
   auto operator++(int) -> BlindKeyDirIter {
@@ -739,10 +784,14 @@ public:
   }
   inline auto operator--() -> BlindKeyDirIter & {
     lease_.reset();
-    const auto c = context();
-    KeyReader reader{c, buf_, lease_};
-    cur_.prev(reader);
-    lease_.reset();
+    if (auto *m = merging()) {
+      const auto c = context();
+      KeyReader reader{c, buf_, lease_};
+      m->prev(reader);
+      lease_.reset();
+      return *this;
+    }
+    --plain();
     return *this;
   }
   auto operator--(int) -> BlindKeyDirIter {
@@ -750,15 +799,17 @@ public:
     --*this;
     return tmp;
   }
+  // Same entry: a record location names one record.
   auto operator==(const BlindKeyDirIter &o) const noexcept -> bool {
-    return cur_ == o.cur_;
+    const bool end = at_end();
+    const bool o_end = o.at_end();
+    if (end || o_end) return end == o_end;
+    return current() == o.current();
   }
-  auto operator==(std::default_sentinel_t) const noexcept -> bool {
-    return cur_ == std::default_sentinel;
-  }
+  auto operator==(std::default_sentinel_t) const noexcept -> bool { return at_end(); }
 
 private:
-  Inner cur_;
+  KeyDirCursor<Plain, Inner> cur_;
   PersistentU32Table<std::shared_ptr<DataFile>> files_;
   bool owned_{false};
   KeyDirCtx ctx_;
@@ -766,6 +817,25 @@ private:
   // Pins the pool frame the last key span points into. After buf_, so it is
   // released first.
   mutable FrameLease lease_;
+
+  void init(const KeyDirCtx &ctx) {
+    if (ctx.files) {
+      files_ = *ctx.files; // O(1) handle copy: pins the registry
+      owned_ = true;
+    }
+    ctx_ = ctx;
+    ctx_.files = nullptr;
+    if (auto *m = merging()) {
+      const auto c = context();
+      KeyReader reader{c, buf_, lease_};
+      m->settle(reader);
+      lease_.reset();
+    }
+  }
+  [[nodiscard]] auto merging() noexcept { return cur_.merging(); }
+  [[nodiscard]] auto plain() noexcept -> Plain & { return cur_.plain(); }
+  [[nodiscard]] auto current() const -> BlindRef { return cur_.current(); }
+  [[nodiscard]] auto at_end() const noexcept -> bool { return cur_.at_end(); }
 
   [[nodiscard]] auto context() const -> KeyDirCtx {
     auto c = ctx_;
@@ -881,12 +951,22 @@ export inline auto kd_erase_at(KeyDirTransient &t,
 export inline auto kd_hit(const KeyDirEntry &at) -> KeyDirHit {
   return {to_blind_ref(at), at.value_size()};
 }
+// Runs f on the tree to iterate: a drained buffered key directory's own
+// tree, so its iterators are the blind tree's, or t itself.
+template <typename T, typename F> auto kd_with_tree(const T &t, F &&f) {
+  if constexpr (requires { t.drained_tree(); }) {
+    if (const auto *d = t.drained_tree()) return f(*d);
+  }
+  return f(t);
+}
 export template <typename T>
 auto kd_lower_bound(const T &t, std::span<const std::byte> key,
                     const KeyDirCtx &ctx) -> KeyDirIter {
   FrameLease lease;
   KeyReader reader{ctx, key_read_buffer(), lease};
-  return {t.lower_bound(key, reader), ctx};
+  return kd_with_tree(t, [&](const auto &tree) -> KeyDirIter {
+    return {tree.lower_bound(key, reader), ctx};
+  });
 }
 // Keys in [from, to), counted no further than `limit`: one read to place
 // each end within its leaf, and the leaves between them counted from their
@@ -901,11 +981,11 @@ export inline auto kd_count(const KeyDirTree &t, std::span<const std::byte> from
 }
 export inline auto kd_begin(const KeyDirTree &t, const KeyDirCtx &ctx)
     -> KeyDirIter {
-  return {t.begin(), ctx};
+  return kd_with_tree(t, [&](const auto &tree) -> KeyDirIter { return {tree.begin(), ctx}; });
 }
 export inline auto kd_end(const KeyDirTree &t, const KeyDirCtx &ctx)
     -> KeyDirIter {
-  return {t.end_iter(), ctx};
+  return kd_with_tree(t, [&](const auto &tree) -> KeyDirIter { return {tree.end_iter(), ctx}; });
 }
 export inline auto kd_upper_bound(const KeyDirTree &t,
                                   std::span<const std::byte> key,
@@ -920,22 +1000,22 @@ export inline auto kd_value_lower_bound(const KeyDirTree &t,
                                         std::span<const std::byte> from,
                                         const KeyDirCtx &ctx)
     -> KeyDirValueIter {
-  if (from.empty())
-    return {t.begin(), ctx};
-  FrameLease lease;
-  KeyReader reader{ctx, key_read_buffer(), lease};
-  return {t.lower_bound(from, reader), ctx};
+  return kd_with_tree(t, [&](const auto &tree) -> KeyDirValueIter {
+    if (from.empty()) return {tree.begin(), ctx};
+    FrameLease lease;
+    KeyReader reader{ctx, key_read_buffer(), lease};
+    return {tree.lower_bound(from, reader), ctx};
+  });
 }
 export inline auto kd_value_rlower_bound(const KeyDirTree &t,
                                          std::span<const std::byte> from,
                                          const KeyDirCtx &ctx)
     -> KeyDirReverseValueIter {
   if (from.empty())
-    return KeyDirReverseValueIter{KeyDirValueIter{t.end_iter(), ctx}};
+    return KeyDirReverseValueIter{kd_with_tree(
+        t, [&](const auto &tree) -> KeyDirValueIter { return {tree.end_iter(), ctx}; })};
   // Start past the last key <= from: at the first key > from.
-  FrameLease lease;
-  KeyReader reader{ctx, key_read_buffer(), lease};
-  auto fwd = KeyDirValueIter{t.lower_bound(from, reader), ctx};
+  auto fwd = kd_value_lower_bound(t, from, ctx);
   if (fwd != std::default_sentinel &&
       btree_detail::compare_bytes(fwd.key(), from) == 0)
     ++fwd;

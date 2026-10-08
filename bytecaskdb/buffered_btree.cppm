@@ -261,9 +261,9 @@ struct Layers {
     for (std::size_t i = 0; i < nf; ++i) n += f[i].net;
     return n;
   }
-  [[nodiscard]] auto total() const noexcept -> std::size_t { return total_from(0); }
+  [[nodiscard]] inline auto total() const noexcept -> std::size_t { return total_from(0); }
   // Slots from the i-th frozen buffer on, the active one included.
-  [[nodiscard]] auto total_from(std::size_t i) const noexcept -> std::size_t {
+  [[nodiscard]] inline auto total_from(std::size_t i) const noexcept -> std::size_t {
     std::size_t n = a.total;
     for (; i < nf; ++i) n += f[i].total;
     return n;
@@ -1245,6 +1245,13 @@ public:
     return **this == *o;
   }
 
+  // The tree's own iterator, moved out, if this one is it (a version with
+  // nothing buffered); nullopt for a merging one.
+  [[nodiscard]] auto take_plain() && -> std::optional<TIt> {
+    if (auto *t = plain_mut()) return std::move(*t);
+    return std::nullopt;
+  }
+
   template <BlindKeyResolver R> void settle(R &res) {
     if (auto *c = merging()) c->settle(res);
   }
@@ -1342,6 +1349,9 @@ public:
   // all for nothing.
   template <BlindKeyResolver R>
   [[nodiscard]] auto get(Bytes key, R &res) const -> std::optional<BlindRef> {
+    // A drained version is the tree: skip finding the newest merge, as the
+    // iterators do (a point read paid ~1-2% for it).
+    if (unbuffered()) return tree_.get(key, res);
     const auto [tree, skip] = effective();
     // Nothing buffered: the tree holds every entry, and every record it
     // names is in this version's files.
@@ -1359,6 +1369,7 @@ public:
     return get(key, res).has_value();
   }
   [[nodiscard]] auto holds(Bytes key, BlindRef ref) const -> bool {
+    if (unbuffered()) return tree_.holds(key, ref);
     const auto [tree, skip] = effective();
     if (auto s = buffered_detail::newest(l_, key, skip)) return s->ref == ref;
     return tree->holds(key, ref);
@@ -1479,7 +1490,16 @@ private:
   // version whose merges have finished but are not installed yet merges
   // (through the finished trees, skipping the buffers they cover); the
   // next publish installs them.
-  [[nodiscard]] auto unbuffered() const noexcept -> bool { return l_.total() == 0; }
+  [[nodiscard]] inline auto unbuffered() const noexcept -> bool { return l_.total() == 0; }
+
+public:
+  // The tree itself while nothing is buffered, so a reader can iterate it
+  // with the tree's own iterator; null while something is.
+  [[nodiscard]] auto drained_tree() const noexcept -> const PersistentBlindBTree<LeafBytes> * {
+    return unbuffered() ? &tree_ : nullptr;
+  }
+
+private:
   [[nodiscard]] auto merging(typename Iter::Start start, Bytes at = {}) const -> Iter {
     const auto [tree, skip] = effective();
     return Iter::merge(*tree, skip == 0 ? l_ : l_.from(skip), start, at);
