@@ -599,25 +599,38 @@ TEST_CASE("alloc sweep: a transient tree is freed when nothing can be "
 // A version whose publication fails leaves its base as it was, so the base
 // can still be derived from: a half-published version would make every later
 // write fail with "a version that already has a successor".
+//
+// The base u1 is itself derived from a live t, and the version published from
+// it changes a leaf far from the one u1 changed. Its retired nodes then park
+// on both: the root u1 copied on u1, the path t built on t, which already
+// holds u1's parcel. Parking that allocates, so every allocation of the
+// publication is failed somewhere, the ones after the link included.
 TEST_CASE("alloc sweep: a failed publication leaves the base derivable",
           "[alloc_sweep]") {
   KeyStore res;
   const auto t = deep_tree(res);
+  auto first = t.transient();
+  first.set(to_bytes("aaa"), res.ref("aaa"), res);
+  const auto u1 = std::move(first).persistent();
   for (long n = 1;; ++n) {
     REQUIRE(n <= kMaxAllocations);
-    auto tr = t.transient();
-    tr.set(to_bytes("new"), res.ref("new"), res);
+    auto tr = u1.transient();
+    tr.set(to_bytes("zzz"), res.ref("zzz"), res);
     bool fired = false;
+    // Released once the fault is disarmed: releasing a version still
+    // allocates (#390), and this test is about publishing one.
+    std::optional<Tree> u2;
     {
       ScopedAllocFaults faults{n, false};
       try {
-        const auto u = std::move(tr).persistent();
+        u2.emplace(std::move(tr).persistent());
       } catch (const std::bad_alloc &) {
       }
       fired = faults.report().fired;
     }
+    u2.reset();
     INFO("allocation " << n << " of the publication failed");
-    auto again = t.transient();
+    auto again = u1.transient();
     again.set(to_bytes("other"), res.ref("other"), res);
     CHECK_NOTHROW((void)std::move(again).persistent());
     if (!fired) break;
@@ -689,6 +702,7 @@ TEST_CASE("refuse writes: a throw after the append refuses writes until "
   const auto dir = td.path / "db";
   auto db = open_db(dir, {});
   seed(*db);
+  CHECK(db->degraded_reason().empty());
   db->test_after_append_ = [] { throw std::bad_alloc{}; };
   CHECK_THROWS_AS(db->put({.sync = true}, to_bytes("k1"), to_bytes("over")),
                   std::bad_alloc);
@@ -783,4 +797,55 @@ TEST_CASE("refuse writes: a rotation that fails in memory publishes nothing",
   bytecask::testing::assert_consistent(*db);
   CHECK(value_of(*db, "big") == "<absent>");
   expect_refused_then_resumed(db, dir, opts, "big", big);
+}
+
+// create_manifest seals the active file on disk before it installs the next
+// one in the transient: a failure there must refuse writes, not leave them
+// going to the sealed file.
+TEST_CASE("refuse writes: create_manifest's rotation that fails in memory "
+          "refuses writes",
+          "[refuse_writes]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  auto db = open_db(dir, {});
+  seed(*db);
+  db->test_in_finish_rotation_ = [] { throw std::bad_alloc{}; };
+  CHECK_THROWS_AS((void)db->create_manifest(), std::bad_alloc);
+  db->test_in_finish_rotation_ = nullptr;
+  expect_refused_then_resumed(db, dir, {}, "k1", "v1");
+}
+
+// ingest checks the flag on its own entry path. A slice that crosses a
+// rotation and fails while installing it, with no memory to publish the
+// degraded state, leaves the flag as the only refusal.
+TEST_CASE("refuse writes: ingest is refused by the flag alone",
+          "[refuse_writes]") {
+  TempDir td;
+  const Options opts{.max_file_bytes = 512, .initial_mode = bytecask::Mode::Follower};
+  bytecask::testing::OwnedEntries slice;
+  {
+    auto leader = DB::open(td.path / "leader", {.max_file_bytes = 512});
+    for (int i = 0; i < 3; ++i)
+      leader.put({.sync = true}, to_bytes(std::format("r{}", i)),
+                 to_bytes(std::string(300, static_cast<char>('a' + i))));
+    const auto snap = leader.snapshot();
+    slice = bytecask::testing::collect_changes(leader.changes_since(snap, 0));
+  }
+  const auto dir = td.path / "follower";
+  auto db = open_db(dir, opts);
+  db->test_in_finish_rotation_ = [] { throw std::bad_alloc{}; };
+  db->test_before_refusal_publish_ = [] { throw std::bad_alloc{}; };
+  CHECK_THROWS_AS(db->ingest(slice.views()), std::bad_alloc);
+  db->test_in_finish_rotation_ = nullptr;
+  db->test_before_refusal_publish_ = nullptr;
+  CHECK(db->is_degraded());
+  CHECK_FALSE(db->engine_state()->degraded);
+  CHECK_THROWS_AS(db->ingest(slice.views()), DbDegraded);
+  REQUIRE_NOTHROW(db->resume());
+  CHECK_FALSE(db->is_degraded());
+  db->ingest(slice.views());  // what resume() replayed is skipped
+  for (int i = 0; i < 3; ++i)
+    CHECK(value_of(*db, std::format("r{}", i)) ==
+          std::string(300, static_cast<char>('a' + i)));
+  bytecask::testing::assert_consistent(*db);
 }

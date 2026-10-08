@@ -2006,7 +2006,9 @@ mutation in `tests/durability_mutations/` that reverts it.
   their allocations.
 - *Releasing a version still allocates* (#390): `VersionChain::unpin` frees
   through vectors, in `noexcept` destructors. No swept operation reaches it
-  under the fault; one holding a snapshot across it would.
+  under the fault, but releasing the newer of two chained versions does
+  (`retract` grows `pending_`), so `a failed publication leaves the base
+  derivable` releases its version only after disarming.
 
 ### ThreadSanitizer (TSan)
 
