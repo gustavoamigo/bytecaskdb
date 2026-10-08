@@ -386,9 +386,9 @@ public:
     // Publishes the slice in one step; cut slices after a BulkEnd or a
     // standalone entry.
     // Throws std::logic_error if not in follower mode, DbDegraded if degraded,
-    // std::invalid_argument for a slice that ends inside an atomic batch or
-    // whose entries above durable_sequence() start inside one, a sequence
-    // above 2^48 - 1 or an atomic batch over 1 GiB, before anything is written.
+    // std::invalid_argument for a slice that ends inside an atomic batch, a
+    // sequence above 2^48 - 1 or an atomic batch over 1 GiB, before anything
+    // is written.
     void ingest(std::span<const DataEntryView> entries);
 
     // True if the engine has entered a degraded state from a write-path failure.

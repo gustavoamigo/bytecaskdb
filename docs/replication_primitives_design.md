@@ -114,7 +114,7 @@ auto changes_since(const Snapshot& snap, uint64_t from_sequence) const -> Change
 
 When the iterator is exhausted, all committed durable entries up to `min(snap.sequence(), durable_sequence)` have been delivered in order.
 
-Because entries are sequence-ordered, every prefix of the stream that ends at a batch boundary — after a `BulkEnd` or a standalone entry — is a valid state. The follower can `ingest()` at any such point, not just at iterator exhaustion, and the result is always a consistent, sequence-ordered prefix of the leader's history. A slice that ends inside a batch, or whose entries above the follower's `durable_sequence()` start inside one, is refused with `std::invalid_argument`.
+Because entries are sequence-ordered, every prefix of the stream that ends at a batch boundary — after a `BulkEnd` or a standalone entry — is a valid state. The follower can `ingest()` at any such point, not just at iterator exhaustion, and the result is always a consistent, sequence-ordered prefix of the leader's history. A slice that ends inside a batch is refused with `std::invalid_argument`.
 
 **Failure handling:** on failure mid-iteration, restart Phase 2 with a fresh snapshot and iterator from `follower.durable_sequence()`. Since entries are in sequence order, the follower's recovered state after a crash is a valid prefix — `durable_sequence()` is trustworthy.
 
@@ -135,7 +135,7 @@ After each `ingest`, `next_sequence` reflects `max(next_sequence, max(ingested s
 
 **Constraints:**
 - `ingest` is only callable in `Mode::Follower`.
-- A slice must not end inside an atomic batch, and its entries above `durable_sequence()` must not start inside one: either throws `std::invalid_argument` before anything is written (#188).
+- A slice must not end inside an atomic batch: one that does throws `std::invalid_argument` before anything is written (#188).
 - Appends to data files and updates the key directory, same as the normal write path, but skips guards and sequence assignment.
 - `RangeDel` entries walk the follower's key directory over `[from, to)`, same as the normal write path. If the follower never received the keys in that range (e.g. it started tailing after they were written), the walk is a no-op — the range is simply empty on the follower.
 

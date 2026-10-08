@@ -11168,16 +11168,7 @@ TEST_CASE("ingest refuses a slice that ends inside an atomic batch",
     for (char c = 'a'; c <= 'f'; ++c)
       CHECK_FALSE(follower.contains_key({}, to_bytes(std::string(1, c))));
 
-    // The tail alone starts inside a batch the follower does not hold.
-    const auto tail = std::span{views}.subspan(4);
-    CHECK_THROWS_AS(follower.ingest(tail), std::invalid_argument);
-    CHECK(data_file_bytes(td.path / "follower") == bytes_before);
-    CHECK(follower.durable_sequence() == 0);
-
     follower.ingest(views);
-    CHECK(follower.durable_sequence() == views.back().sequence);
-    // Once held, the tail is skipped as already ingested, not refused.
-    follower.ingest(tail);
     CHECK(follower.durable_sequence() == views.back().sequence);
   }
 

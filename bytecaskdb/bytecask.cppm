@@ -6682,24 +6682,6 @@ void DB::ingest(std::span<const DataEntryView> entries) {
     remaining = remaining.subspan(1);
   }
   if (remaining.empty()) return;
-  // durable_seq is always at a batch boundary, so what is left must start at
-  // one too. A BulkEnd with no BulkBegin before it means the slice starts
-  // inside a batch the follower does not hold: its tail would be published
-  // alone.
-  {
-    auto open = false;
-    for (const auto &e : remaining) {
-      if (e.entry_type == EntryType::BulkBegin) open = true;
-      if (e.entry_type == EntryType::BulkEnd) {
-        if (!open) {
-          throw std::invalid_argument{
-              "ingest: the slice starts inside an atomic batch the follower "
-              "does not hold; resume from durable_sequence()"};
-        }
-        open = false;
-      }
-    }
-  }
 
   // Every file the slice will need is counted before anything is written:
   // a rotation that finds no id would fail after its file was sealed.

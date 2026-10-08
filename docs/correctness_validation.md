@@ -2628,7 +2628,6 @@ A site whose break nothing has to catch says why instead.
 | `ingest`: the final `fdatasync` before publishing | `prove_repl__*` | `ingest_skips_final_sync` | — |
 | `ingest`: that sync failing degrades | `prove_repl__*` | `ingest_sync_failure_ignored` | — |
 | `ingest`: a slice that ends inside a batch is refused, so no rotation seals a `BulkBegin` without its `BulkEnd` | `ingest refuses a slice that ends inside an atomic batch` | `ingest_open_batch_accepted` | #188 |
-| `ingest`: a slice whose unheld part starts inside a batch is refused, so its tail is not published alone | `ingest refuses a slice that ends inside an atomic batch` | `ingest_batch_tail_accepted` | #188 |
 
 ### What building the table found
 
