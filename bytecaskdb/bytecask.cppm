@@ -296,7 +296,9 @@ export struct Options {
 // ---------------------------------------------------------------------------
 // KeyIterator — walks the key directory in ascending key order.
 //
-// In-memory only: no data file I/O. Satisfies std::input_iterator.
+// Reads no values. A key directory that holds no key bytes (the default)
+// reads each key back from its record as the iterator advances, through the
+// file registry the iterator pins. Satisfies std::input_iterator.
 // ---------------------------------------------------------------------------
 export class KeyIterator {
 public:
@@ -1124,7 +1126,8 @@ public:
   auto del_range(const WriteOptions &opts, BytesView from,
                 BytesView to) -> CommitResult;
 
-  // Returns true if key exists in the index (no disk I/O).
+  // Returns true if key exists. A key directory that holds no key bytes
+  // reads the key's record to confirm it.
   [[nodiscard]] auto contains_key(const ReadOptions& opts,
                                   BytesView key) const -> bool;
 
@@ -1206,8 +1209,8 @@ public:
                                BytesView from = {}) const
       -> std::ranges::subrange<EntryIterator, std::default_sentinel_t>;
 
-  // Returns an input range of keys >= from. Walks the in-memory key directory
-  // only; no disk I/O.
+  // Returns an input range of keys >= from. Reads no values; a key directory
+  // that holds no key bytes reads each key's record as the range advances.
   [[nodiscard]] auto keys_from(const ReadOptions &opts,
                                BytesView from = {}) const
       -> std::ranges::subrange<KeyIterator, std::default_sentinel_t>;
@@ -1219,7 +1222,7 @@ public:
                                 BytesView from = {}) const
       -> std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t>;
 
-  // Returns a range of keys in descending order. Pure in-memory — no disk I/O.
+  // Returns a range of keys in descending order. Reads keys as keys_from does.
   [[nodiscard]] auto rkeys_from(const ReadOptions &opts,
                                 BytesView from = {}) const
       -> std::ranges::subrange<ReverseKeyIterator, ReverseKeyIterator>;
@@ -1523,8 +1526,10 @@ private:
   // Called on cold paths only (open, resume).
   void validate_state_consistency(const EngineState &s) const;
   // Writer executors — called by SoloWriter / WriteGroup.
-  // Prepares and applies one slot against the transient. Pure in-memory:
-  // no I/O. Appends prepared entries to all_entries; running_offset is
+  // Prepares and applies one slot against the transient. Appends nothing:
+  // its only I/O is the record reads a key directory that holds no key bytes
+  // needs to place keys and check guards. Appends prepared entries to
+  // all_entries; running_offset is
   // advanced by the total byte size produced. Returns false on validation
   // failure (sets slot.result) or when the slot cannot be written (sets
   // slot.err): its sequences would pass the packed limit, or it would cross
@@ -3136,8 +3141,10 @@ auto DB::apply_batch(WriteOptions opts,
 
 #pragma region Writer executors
 
-// Prepares and applies one slot against the transient. Pure in-memory: no
-// I/O. Entries are appended to all_entries; running_offset is advanced by
+// Prepares and applies one slot against the transient. Appends nothing: its
+// only I/O is the record reads a key directory that holds no key bytes needs
+// to place keys and check guards. Entries are appended to all_entries;
+// running_offset is advanced by
 // the total byte size of entries produced. Returns false on validation
 // failure (slot.result set to nullopt). durable is left false on success;
 // execute_slots fills it in once the batch's durability is known.
@@ -3765,8 +3772,8 @@ auto DB::iter_from(const ReadOptions &opts, BytesView from) const
       std::default_sentinel};
 }
 
-// Returns an input range of keys >= from. Walks the in-memory key directory
-// only; no disk I/O.
+// Returns an input range of keys >= from. Reads no values; a key directory
+// that holds no key bytes reads each key's record as the range advances.
 auto DB::keys_from(const ReadOptions & /*opts*/, BytesView from) const
     -> std::ranges::subrange<KeyIterator, std::default_sentinel_t> {
   auto s = load_state_for_read();
