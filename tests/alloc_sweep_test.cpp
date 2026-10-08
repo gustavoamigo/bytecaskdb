@@ -76,6 +76,7 @@ using bytecask::Options;
 using bytecask::testing::consistency_errors;
 using bytecask::testing::key_values;
 using bytecask::testing::ScopedAllocFaults;
+using bytecask::testing::ExpectedLeaks;
 using bytecask::testing::SuspendSyscallFaults;
 using bytecask::testing::to_bytes;
 using namespace bytecask::testing::sweep_ops;  // NOLINT(google-build-using-namespace)
@@ -650,6 +651,9 @@ TEST_CASE("alloc sweep: a failed publication leaves the base derivable",
 // u2's retired nodes park on both u1 and t.
 TEST_CASE("alloc sweep: a version is released when nothing can be allocated",
           "[alloc_sweep]") {
+  // A parcel hold() cannot add to a version for want of memory is leaked by
+  // design; the trees are built inside this scope so LeakSanitizer accepts it.
+  const ExpectedLeaks leaks;
   KeyStore res;
   auto derive = [&res](const Tree &base, const std::string &k) {
     auto tr = base.transient();

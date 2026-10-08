@@ -13,6 +13,13 @@
 
 #pragma once
 
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#include <sanitizer/lsan_interface.h>
+#define BYTECASK_LSAN 1
+#endif
+#endif
+
 namespace bytecask::testing {
 
 #if defined(__has_feature)
@@ -51,6 +58,26 @@ public:
   auto operator=(ScopedAllocFaults &&) -> ScopedAllocFaults & = delete;
 
   auto report() -> AllocFaultReport;
+};
+
+// Allocations this thread makes while one is alive are not reported as
+// leaks. For a test whose subject leaks by design under memory pressure: a
+// key directory parcel that cannot be placed for want of memory is leaked
+// rather than freed while still reachable (#390). A no-op without
+// LeakSanitizer.
+class ExpectedLeaks {
+public:
+#ifdef BYTECASK_LSAN
+  ExpectedLeaks() { __lsan_disable(); }
+  ~ExpectedLeaks() { __lsan_enable(); }
+#else
+  ExpectedLeaks() = default;
+  ~ExpectedLeaks() = default;
+#endif
+  ExpectedLeaks(const ExpectedLeaks &) = delete;
+  auto operator=(const ExpectedLeaks &) -> ExpectedLeaks & = delete;
+  ExpectedLeaks(ExpectedLeaks &&) = delete;
+  auto operator=(ExpectedLeaks &&) -> ExpectedLeaks & = delete;
 };
 
 }  // namespace bytecask::testing
