@@ -210,6 +210,7 @@ BulkBegin/BulkEnd markers must NOT be skipped by vacuum or ChangeIterator — th
 - Don't pre-empt criticisms with defensive explanations. The right data point makes the point silently.
 - Be honest about weaknesses. Acknowledging a real limitation earns more trust than hiding it.
 - Don't extrapolate benchmark results beyond what has actually been measured.
+- `CONTRACT.md` states what the engine guarantees, not how it works. A sentence that could change while every guarantee stays the same is mechanism and belongs in `docs/bytecask_design.md`. Every name in it is declared in `include/bytecask.hpp`; `scripts/check_contract_vocabulary.py` fails CI on a private name, and its baseline of names still to be rewritten only shrinks (#399).
 
 ## README guidelines
 

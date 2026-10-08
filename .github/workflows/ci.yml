@@ -142,6 +142,17 @@ jobs:
       - name: Every thread_local is tagged
         run: python3 scripts/check_thread_local.py
 
+  contract-vocabulary:
+    # CONTRACT.md states guarantees in public terms: every name in it is
+    # declared in include/bytecask.hpp, or is on a baseline that only
+    # shrinks (#399). A private name describes mechanism, which changes
+    # under refactors that change no guarantee.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: CONTRACT.md names only public API
+        run: python3 scripts/check_contract_vocabulary.py
+
   mutation-patches:
     # The soak's, the chaos rig's and the durability sites' mutations are
     # diffs against engine code.
