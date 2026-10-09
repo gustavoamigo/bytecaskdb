@@ -3,8 +3,8 @@
 What the engine guarantees, and what it does not. *Definitions* and
 *Conditions* come first, then one table per operation: each row is one
 guarantee, and its second cell names the Catch2 tests, by name or by tag,
-that fail if the row is broken, or none. *Exclusions*, at the end,
-lists what no row covers.
+that fail if the row is broken, or none. *Boundaries*, at the end,
+says where each guarantee ends and what holds there.
 
 The test for every sentence here: if it could change while every
 guarantee stays the same, it is mechanism and belongs in
@@ -318,20 +318,20 @@ a live view shows, and never invalidates it either.
 
 ---
 
-## Exclusions
+## Boundaries
 
-What the engine does not promise. Each row names the section whose
-guarantee stops at it.
+Where each guarantee ends, and what holds there. Every row is the far
+side of a guarantee a table above states; none is a gap the engine does
+not know about.
 
-| Not covered | Where the boundary is stated |
+| Boundary | Where the guarantee is stated |
 |---|---|
-| **`sync = false` writes.** One is visible on return and can be lost to a crash before an `fdatasync` covers it, and without a crash when a failed `fdatasync`'s pages are evicted before `resume()` reads them back; `resume()` then refuses and a reopen recovers without them. What survives is a prefix of the write order, batches whole. `durable_sequence()` and `CommitResult::durable` say what is safe. | *`apply_batch`*, *`resume`*, *`open`* |
-| **Storage that lies.** An `fdatasync` that reports success for bytes it did not write, or a directory entry that does not survive its sync, is not detected. Every durability guarantee is conditional on the device keeping what it confirmed. | *Conditions* |
-| **Damage shaped like a crash.** `open` cannot refuse what it cannot tell from a torn write, so in the newest file damage in synced data is truncated with the tail, and a sealed file damaged in one of the shapes a crash leaves opens. `docs/bytecask_design.md`, *Recovering a Hint-less File*, lists the shapes. | *`open`* |
-| **Keys of a file the operator chose to skip.** With `fail_recovery_on_crc_errors = false`, a data file whose hint is bad and that cannot be rescanned is left out, with a warning, and the database opens without its keys. | *Hint files* |
-| **Write skew on an unguarded read.** A plan with a snapshot checks its guards and its own write set, nothing else. A value read from the snapshot and neither written nor guarded can have changed by commit. `ensure_unchanged` and `ensure_range_unchanged` are what make a plan's reads part of its conflict check. | *`apply_batch`* |
-| **The outcome of a thrown write, after recovery.** Before `resume()` or a reopen nothing of it is visible; after, every complete unit that reached the file is, as if the write had returned. A caller that needs to know re-reads. | *`apply_batch`*, *`ingest`* |
-| **A stale view.** Nothing detects one. A span used after its iterator advanced or died, and a moved-from `Snapshot` used for anything but destruction or assignment, read memory the engine no longer vouches for, silently. The rules are written down because no check catches a mistake against them. | *View and span lifetimes* |
-| **An operation racing `~DB`.** Undefined, as using any object whose lifetime is ending; what is already on disk is a valid prefix of the committed history and the next `open` recovers it. `close()` may race; the destructor may not. | *`close`* |
-| **A read the kernel cannot complete under `IoBackend::Mmap`.** It is `SIGBUS`, which ends the process unless the host handles it, not an exception. | *View and span lifetimes* |
-| **Space.** Reclaiming dead bytes is `vacuum()`'s, when it is called; nothing runs it. A file that qualifies holds its dead bytes until then. | *`vacuum`* |
+| **`sync = false` defers durability, it does not drop it.** The write is visible on return and durable at the next `fdatasync`, which `durable_sequence()` and `CommitResult::durable` report; `apply_batch({.sync = true}, WritePlan{})` forces one. A crash before then loses the unsynced writes in order, batches whole, and never a durable value one of them replaced. | *`apply_batch`*, *`CommitResult`*, *`open`*, *`vacuum`* |
+| **Storage is trusted once it confirms a sync.** Every durability guarantee holds on a device that keeps what `fdatasync` confirmed, which is the assumption every engine makes. What the device shows broken is refused rather than opened around. | *Conditions*, *`open`* |
+| **Damage indistinguishable from a torn write is treated as one.** In the newest file it goes with the tail, as PostgreSQL and RocksDB cut their logs; a sealed file damaged in exactly the shape a crash leaves opens. Everything distinguishable is refused. `docs/bytecask_design.md`, *Recovering a Hint-less File*, lists the shapes. | *`open`* |
+| **Opening without a file is the operator's choice.** `fail_recovery_on_crc_errors = false` skips a data file whose hint is bad and that cannot be rescanned, with a warning per file. The default refuses. | *Hint files* |
+| **Snapshot isolation by default, serializability one guard away.** A plan with a snapshot is checked on its write set and its guards. A read the plan depends on but does not write is made part of the check with `ensure_unchanged` or `ensure_range_unchanged`; without a guard it is snapshot isolation, and write skew is possible. | *`apply_batch`* |
+| **A write that threw is settled by `resume()`.** Nothing of it is visible before; every complete unit that reached the file is visible after, as if the call had returned. A caller that needs to know re-reads. | *`apply_batch`*, *`ingest`* |
+| **A view is bound to its iterator.** Its span is valid until the iterator advances or dies, and a moved-from `Snapshot` supports destruction and assignment only. Use past that is undefined, like any use past a lifetime; the move-only iterators are where the compiler enforces it. | *View and span lifetimes* |
+| **`~DB` ends every operation.** `close()` may race a call and settles it; the destructor may not, as with any object whose lifetime is ending. What is on disk at that point is a valid prefix of the committed history, and the next `open` recovers it. | *`close`* |
+| **`IoBackend::Mmap` reports a failed read the way a mapping can.** A page the kernel cannot fill is `SIGBUS`, not an exception. The other back-ends throw `std::system_error`. | *View and span lifetimes* |
