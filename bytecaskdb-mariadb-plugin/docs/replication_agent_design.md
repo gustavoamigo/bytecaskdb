@@ -32,7 +32,10 @@ compare-and-swap on one object, a monotonic timer, and a comparison of terms.
 | From | Taken | Left behind |
 |---|---|---|
 | Patroni | Lease loop and timing rule (`loop_wait + 2·retry_timeout ≤ ttl`), self-demotion on failed renewal, the watchdog armed below the lease, DCS failsafe mode, pause mode, the health endpoints load balancers route by, switchover and failover with candidate checks, the `/sync` set that makes synchronous-mode promotion safe | PostgreSQL: timelines (terms replace them), `pg_rewind` (re-bootstrap only), replication slots (`retain_after`), the Postgres-specific bootstrap methods |
-| Kubernetes | `coordination.k8s.io/v1 Lease` as the lock, pod annotations as member state, a ConfigMap as dynamic configuration, StatefulSet identity, label-selected Services for routing, probes answered by the agent | client-go's leader election helper: it disclaims fencing, and the term check is the fence, so the loop is written to carry the term |
+| Kubernetes | `coordination.k8s.io/v1 Lease` as the lock, pod annotations as member state, a ConfigMap as dynamic configuration, StatefulSet identity, label-selected Services for routing, probes answered by the agent; client-go's `resourcelock.LeaseLock` for the Lease reads and writes | client-go's leader election loop: it disclaims fencing, and the term must travel in the same update as the holder, so the loop is ours |
+| CloudNativePG | The same shape in production for PostgreSQL: a per-pod manager, a Kubernetes Lease the instance must hold before it promotes, no external store. Two rules: a candidate takes an expired Lease only after watching it unchanged for a full `ttl` on its own clock, and a primary that can reach neither the store nor its peers fails its own liveness | The operator deciding the target, and fencing by shutting the process down: the plugin lease is stronger |
+| mariadb-operator | The agent infrastructure for a MariaDB pod, imported as Go packages: HTTP router and probe server, TokenReview and basic auth, TLS from the pod environment, rate limiting | Its failover, which is GTID-based, and its controller |
+| Vitess | Durability policies: a `cross_cell` synchronous mode whose acknowledging followers must sit in another zone than the leader | — |
 | medik8s | Node-level remediation with a watchdog, as the Kubernetes form of Patroni's watchdog | — |
 | LiteFS | The shape of the lease interface: acquire, renew, hand off | Consul, which is BSL |
 
@@ -68,8 +71,21 @@ below. The plugin knows nothing of Kubernetes. It is driven over SQL.
 It speaks SQL to its own server and HTTPS to the API server, and serves a small
 HTTP API for probes, peers and operators. It holds no state that survives a
 restart: everything it needs is in the API server or in its server's status
-table. It is a separate MIT-licensed program outside
-`bytecaskdb-mariadb-plugin/`, since it includes no MariaDB headers.
+table.
+
+It is a Go program, `bytecaskdb-agent`, in its own module and directory
+outside `bytecaskdb-mariadb-plugin/`, MIT-licensed since it includes no
+MariaDB headers. It imports `k8s.io/client-go` for the Lease and the pod
+annotations, and from `github.com/mariadb-operator/mariadb-operator/v26/pkg`
+the packages its own agent is built from: `agent/router`, `agent/server` and
+`agent/handler` for the HTTP API and the probe server, `http` for responses,
+and `environment` for the pod environment. Those give the TokenReview and
+basic-auth paths, TLS from the pod's mounted certificates and rate limiting
+without writing them. The acquire-and-renew loop is not client-go's: the term
+has to change in the same update as the holder, and client-go's loop owns the
+update. The loop is a few hundred lines on top of `resourcelock.LeaseLock`.
+The MariaDB operator's controller is not used; the manifests are ours. A mode
+in that operator can come later and would own nothing the agents rely on.
 
 **The store** is the Kubernetes API server, behind a `Leaser` interface
 (acquire, renew, release, hand off, read members) so that an etcd backend can be
@@ -127,7 +143,14 @@ partition must not keep writing.
 is above the source's, repoint it. If the status table shows `crashed_leader`
 or `diverged`, re-bootstrap from the holder. Publish state.
 
-**The Lease is absent or expired.** Decide whether to run:
+**The Lease is absent, or expired on this agent's clock.** Expiry is never
+read off the Lease's `renewTime`, which is the holder's wall clock. The agent
+records on its own monotonic clock when it first saw the current
+`resourceVersion`, and the Lease counts as expired once that version has stood
+unchanged for `ttl`. A renewal changes the version and restarts the count.
+This is how client-go and CloudNativePG read a Lease, and it is what makes the
+design free of any comparison between two nodes' clocks. Then decide whether
+to run:
 
 1. Not while `pause` is set, not with the `nofailover` tag, not from
    `crashed_leader`, `diverged` or `bootstrapping`.
@@ -148,11 +171,12 @@ term above any seen). If promotion fails, the agent releases the Lease so
 another candidate can try, and reports the error in its state.
 
 The old leader has stopped writing before the new one starts, without any
-message between them: the Lease expires `ttl` after its last renewal; the old
-plugin lease was granted at that renewal for `ttl − safety_margin`; so it
-expired `safety_margin` before any candidate could acquire. `safety_margin`
-covers the SQL round trip of the grant and the drift between the two nodes'
-clock rates over one `ttl`, which is microseconds.
+message between them: the old plugin lease was granted at the last renewal
+for `ttl − safety_margin`; a candidate acquires no sooner than `ttl` after it
+observed that renewal's version, which is after the renewal itself; so the
+plugin lease expired at least `safety_margin` before any acquisition.
+`safety_margin` covers the SQL round trip of the grant and the drift between
+the two nodes' clock rates over one `ttl`, which is microseconds.
 
 **On every branch**, the agent labels its pod with its role, answers probes
 from its last loop, and publishes its state.
@@ -167,7 +191,7 @@ from its last loop, and publishes its state.
 | `safety_margin` | 5 s | How much shorter the plugin lease is than the Lease. |
 | `maximum_lag_on_failover` | unlimited | Highest lag, in sequences, a candidate may have. |
 | `failsafe_mode` | off | Keep leading through a store outage while every member confirms. |
-| `synchronous_mode` | off | Commits wait for `synchronous_node_count` followers. |
+| `synchronous_mode` | off | `on`: commits wait for `synchronous_node_count` followers. `cross_zone`: the same, and the followers counted must be in another `topology.kubernetes.io/zone` than the leader. |
 | `synchronous_node_count` | 1 | |
 | `pause` | off | The agent renews and reports but takes no action. |
 
@@ -303,6 +327,11 @@ follower catches up and is named again. A manual failover can still be forced,
 with the loss that implies. A strict variant that blocks writes instead is a
 later option.
 
+`cross_zone` is Vitess's `cross_cell` policy: the followers that count are in
+a different zone from the leader, read from the node label through the pod's
+`spec.nodeName`. A zone outage then loses no acknowledged write, at the cost
+of a cross-zone round trip on every commit.
+
 ## Failure envelope
 
 What each scenario does, which layer stops it, and the check that would notice
@@ -330,19 +359,28 @@ The last column is the acceptance criterion: a row without a check is not done.
 
 ## Testing
 
-1. **Agent loop against a fake store.** The loop is a library with the store,
-   the clock and the SQL client as interfaces. The Elle cluster harness gains
-   an orchestrator that runs one loop per node against the engine's Python
-   bindings, an in-memory CAS store with injectable unreachability and
-   latency, and a fake clock. Every nemesis in the envelope is a few lines
-   there. This is where the design is validated, before any Kubernetes.
+1. **Agent loop against a model.** The loop is a Go package with the store,
+   the clock and the plugin as interfaces. A test runs N loops against an
+   in-memory CAS store with injectable unreachability and latency, a fake
+   clock, and a model plugin that keeps each node's lease deadline, term and
+   sequence and asserts the safety properties on every step: never two nodes
+   with an unexpired plugin lease, never a promotion with a term at or below
+   one already seen, never a follower pulling from an older term. Random
+   interleavings with a printed seed, in the form of the engine's model-based
+   tests. Every nemesis in the envelope is a few lines there. This is where
+   the design is validated, before any Kubernetes.
 2. **Agent mutations.** `tests/agent_mutations/`, one patch per rule in the
-   envelope, each with `Expected: caught` and what the harness then sees, in
-   the form of the engine's mutation sets.
-3. **Kubernetes end to end.** A `kind` cluster, the real StatefulSet, two or
+   envelope, each with `Expected: caught` and what the test then sees, in the
+   form of the engine's mutation sets.
+3. **The Elle cluster harness** keeps checking the data: its orchestrator
+   already runs promotions, transfers and re-bootstraps against real engines.
+   It gains the diverged-follower case and a promotion chosen by the agent's
+   rule, so what step 1 proves about the agent and what the harness proves
+   about the engine meet on the same protocol.
+4. **Kubernetes end to end.** A `kind` cluster, the real StatefulSet, two or
    three failover rounds with pods killed and the API server blocked by a
    network policy. A smoke test, not the proof: the interleavings are covered
-   in step 1.
+   in steps 1 and 3.
 
 ## Milestones
 
@@ -354,20 +392,21 @@ Replacing #422's list:
    `bytecaskdb_demote` and `bytecaskdb_retain_after`.
 3. Plugin lease on `CLOCK_BOOTTIME` checked per commit, terms, term-start
    entries, follower term check, the diverged rule, crashed-leader refusal.
-4. The agent loop as a library, the fake store, the Elle orchestrator, the
-   agent mutations. The envelope's check column filled in.
+4. The agent loop as a Go package, the model test, the agent mutations, and
+   the Elle harness extended. The envelope's check column filled in.
 5. The Kubernetes store, the agent container, the manifests, bootstrap over
    HTTP, the `kind` test.
-6. Synchronous mode.
+6. Synchronous mode, `on` and `cross_zone`.
 7. An etcd store, for deployments outside Kubernetes. Tracked as an issue when
    milestone 5 lands.
 
 ## Open questions
 
-1. **Agent language.** Python, so milestone 4 reuses the bindings and the Elle
-   harness and the agent is one package with them; or Go, for the Kubernetes
-   client and a static binary. The loop is a few hundred lines either way.
-   Leaning Python until milestone 5 shows a reason not to.
+1. **Settled: Go.** The agent is a Go program on client-go and the MariaDB
+   operator's agent packages, as described under *Components*. Python would
+   have shared the bindings and the Elle harness; Go gets the Lease client,
+   the probe and auth plumbing and a static binary for free, and the harness
+   is met through the protocol rather than shared code.
 2. **File transfer.** The leader's agent serving data and hint files over HTTP
    is the simplest thing; it needs a throttle so a bootstrap does not starve
    the leader's disk.
@@ -377,6 +416,24 @@ Replacing #422's list:
    member needs an explicit tombstone is open.
 4. **Standby clusters** (a whole cluster following another, Patroni's
    `standby_cluster`) are out of scope.
+5. **Packaging.** Milestone 5 ships plain manifests: a StatefulSet, the two
+   Services, the ConfigMap, RBAC for the Lease and pod annotations. Two
+   frameworks could own that layer later, and neither replaces the agent:
+   - A **KubeBlocks addon**: a `ComponentDefinition` whose lifecycle actions
+     (`roleProbe`, `switchover`, `memberJoin`, `memberLeave`) call the agent's
+     HTTP API, plus a chart. KubeBlocks then owns provisioning, scaling,
+     backups and the `OpsRequest` for a planned switchover. Unplanned failover
+     stays with the agent: KubeBlocks leaves it to the engine's own HA layer,
+     as it does with Patroni and Sentinel. The operator is AGPL-3.0, but it
+     runs unmodified as a separate program, the addons repository is
+     Apache-2.0, and an addon is configuration the operator consumes, not a
+     derived work, so nothing here or in the addon takes on AGPL terms.
+   - A **mariadb-operator mode**, in their MIT codebase, which would also own
+     the Services' lag exclusion and their backup tooling. It needs a
+     replication type that does not read `SHOW SLAVE STATUS`, which is a
+     larger upstream change.
+   Both are additive. The agent's API is the seam, so the choice can wait
+   for a deployment that wants one of them.
 
 ## Changes from #422
 
