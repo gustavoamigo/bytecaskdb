@@ -283,9 +283,14 @@ target_compile_options(ha_bytecaskdb PRIVATE -fno-semantic-interposition)
 target_link_options(ha_bytecaskdb PRIVATE -Wl,-Bsymbolic-functions)
 # TLS descriptors, as libbytecask.a is built with: a thread_local in a
 # dlopen'ed object otherwise costs a call to __tls_get_addr per access. An
-# ELF option, so Linux x86-64 only.
+# ELF option, so Linux x86-64 only, and only where the compiler takes it
+# (Clang from 19).
+include(CheckCXXCompilerFlag)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-  target_compile_options(ha_bytecaskdb PRIVATE -mtls-dialect=gnu2)
+  check_cxx_compiler_flag(-mtls-dialect=gnu2 BYTECASKDB_HAVE_TLS_DIALECT_GNU2)
+  if(BYTECASKDB_HAVE_TLS_DIALECT_GNU2)
+    target_compile_options(ha_bytecaskdb PRIVATE -mtls-dialect=gnu2)
+  endif()
 endif()
 
 target_include_directories(ha_bytecaskdb PRIVATE
