@@ -18,7 +18,10 @@ innodb_buffer_pool_size        = 16G
 # No O_DIRECT: data files and redo go through the page cache, which backs the
 # buffer pool as a second-level cache, as it does for bytecaskdb-fast.cnf.
 innodb_flush_method            = fsync
-innodb_log_file_buffering      = ON
+# loose_: MariaDB 10.8 added the option, and an older server aborts on an
+# option it does not know. Before 10.8, fsync already leaves the redo log
+# buffered, so the setting means the same there.
+loose_innodb_log_file_buffering = ON
 
 # Redo: a large log defers checkpoint flushing; a larger buffer absorbs the
 # commit rate between once-a-second flushes.
