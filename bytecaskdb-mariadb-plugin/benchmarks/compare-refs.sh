@@ -217,7 +217,7 @@ EOF
   echo
   for entry in "${LABELS[@]}"; do
     IFS='|' read -r label spec engine <<<"$entry"
-    line=$(grep -hE "(ByteCaskDB|InnoDB):" "$OUT/$label.log" | head -1)
+    line=$(grep -hE "(ByteCaskDB|InnoDB): +[0-9]+ NOPM" "$OUT/$label.log" | head -1)
     nopm=$(echo "$line" | awk '{print $2}'); tpm=$(echo "$line" | awk '{print $5}')
     sha=-
     [[ "$engine" == bytecaskdb ]] && sha=$(cut -c1-10 "$OUT/sha_$(slug_of "$spec")")
@@ -234,3 +234,9 @@ EOF
   done
 } | tee "$OUT/summary.txt"
 echo "=== done $(date)  ($OUT)"
+# Each cell's own fetch hint went into its log; print one for the whole run.
+if [[ "$CAPTURE" == on ]]; then
+  # shellcheck source=lib_capture.sh
+  source "$(dirname "${BASH_SOURCE[0]}")/lib_capture.sh"
+  capture_fetch_hint bench-results "$OUT"  # lands in bench-results/<run>/
+fi
