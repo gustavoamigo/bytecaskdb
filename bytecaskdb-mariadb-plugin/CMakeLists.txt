@@ -465,6 +465,9 @@ list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 include(Catch)
 catch_discover_tests(mariadb_plugin_tests)
 catch_discover_tests(mariadb_proof_tests)
+catch_discover_tests(mariadb_txn_tests)
+# Starts its own mariadbd (port 3308) with the plugin loaded.
+catch_discover_tests(integration_tests)
 
 message(STATUS "Test target: mariadb_plugin_tests")
 message(STATUS "Test target: mariadb_proof_tests")
