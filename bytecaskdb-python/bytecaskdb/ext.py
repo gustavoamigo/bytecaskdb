@@ -8,7 +8,8 @@ Adds:
   - Batch context manager  (db.batch())
   - Transaction context manager with conflict detection  (db.transaction())
   - Pythonic snapshot wrapper  (db.snapshot())
-  - Clean exception hierarchy  (ConflictError, DegradedError)
+  - One exception base, ByteCaskError, for the engine's own errors
+    (DbDegraded, DbFollowerMode, DbClosed) and ConflictError
 """
 
 from __future__ import annotations
@@ -18,22 +19,19 @@ from bytecaskdb import _bytecaskdb as _bc
 __all__ = [
     "DB",
     "Snapshot",
+    "ByteCaskError",
     "ConflictError",
-    "DegradedError",
 ]
 
 # ── Exceptions ───────────────────────────────────────────────────────────────
 
-class ByteCaskError(Exception):
-    """Base for all bytecaskdb_ext errors."""
+# ByteCaskError is defined by the extension, so the errors the engine raises
+# (DbDegraded, DbFollowerMode, DbClosed) and the ones raised here share it.
+ByteCaskError = _bc.ByteCaskError
 
 
 class ConflictError(ByteCaskError):
     """Raised by a Transaction when apply_batch detects a write conflict."""
-
-
-class DegradedError(ByteCaskError):
-    """Raised when the engine enters a degraded state."""
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────

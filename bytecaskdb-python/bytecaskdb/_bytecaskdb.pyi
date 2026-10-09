@@ -9,16 +9,23 @@ import enum
 import os
 from typing import Iterator, overload
 
-class DbDegraded(RuntimeError):
+class ByteCaskError(Exception):
+    """Base of the engine's own errors: a state the database is in.
+
+    I/O failures are ``OSError`` and invalid arguments ``ValueError``; neither
+    is a ``ByteCaskError``.
+    """
+
+class DbDegraded(ByteCaskError, RuntimeError):
     """Raised by write operations when the engine is in a degraded state.
 
     Reads remain available. Call ``DB.resume()`` to attempt recovery.
     """
 
-class DbClosed(ValueError):
+class DbClosed(ByteCaskError, ValueError):
     """Raised by every ``DB`` operation after ``DB.close()``."""
 
-class DbFollowerMode(RuntimeError):
+class DbFollowerMode(ByteCaskError, RuntimeError):
     """Raised by normal write operations when the engine is in follower mode.
 
     Use ``DB.ingest()`` for replication writes in follower mode.
