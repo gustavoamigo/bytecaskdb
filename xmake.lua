@@ -468,19 +468,21 @@ target("bytecask")
     set_kind("static")
     set_default(false)
     add_cxxflags("-fPIC", {force = true})  -- required when linking into a shared object (e.g. MariaDB plugin)
-    -- TLS descriptors: a thread_local in a dlopen'ed object otherwise costs a
-    -- call to __tls_get_addr per access (2.8% of mariadbd's CPU on sysbench
-    -- oltp_read_write). An ELF option, so Linux only (Darwin's Clang rejects
-    -- it); AArch64 uses descriptors already.
-    if is_plat("linux") and is_arch("x86_64") then
-        add_cxxflags("-mtls-dialect=gnu2", {force = true})
-    end
     add_files("bytecaskdb/*.cppm", "bytecaskdb/bytecask_hpp.cpp")
     add_packages("crc32c", "zstd")
     on_config(function(t)
         add_native_syslinks(t)
         apply_sanitizer(t)
         add_release_opts(t)
+        -- TLS descriptors: a thread_local in a dlopen'ed object otherwise
+        -- costs a call to __tls_get_addr per access (2.8% of mariadbd's CPU on
+        -- sysbench oltp_read_write). An ELF option, so Linux only (Darwin's
+        -- Clang rejects it); AArch64 uses descriptors already. Only where the
+        -- compiler takes it: Clang accepts it on x86-64 from 19.
+        if is_plat("linux") and is_arch("x86_64") and
+           t:has_cxxflags("-mtls-dialect=gnu2") then
+            t:add("cxxflags", "-mtls-dialect=gnu2", {force = true})
+        end
     end)
 
 -- Testing variant of the bytecask library with BYTECASK_TESTING defined.
