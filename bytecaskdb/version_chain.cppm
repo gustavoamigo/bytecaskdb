@@ -106,7 +106,9 @@ void free_node_subtree_if(typename Traits::Node *root,
 //     children are never newer than their parent;
 //   - nodes retired by the segment — retiring tag above F — are reachable
 //     from F again and are unparked: live nodes of F once more. With no F
-//     the lineage is over and they are freed as well.
+//     the lineage is over, and there are none: a parcel is parked on a
+//     version below the one that retired it, and the dead head is the only
+//     version of its lineage left.
 // F is then the head of its lineage again. This one rule covers the head
 // dropped after a failed flush (DB::resume), a version a test publishes and
 // drops, the last handle at DB close, and the tail of a recovery partition.
@@ -123,6 +125,15 @@ void free_node_subtree_if(typename Traits::Node *root,
 // once those buffers have settled, which matters because the engine
 // publishes one per batch. The buffers are handed back when the last
 // version of this value type goes.
+//
+// Out of memory. A version is released in a noexcept destructor, often
+// because memory just ran out, so releasing one never throws for want of it
+// (#390): a node that cannot be queued to be freed after the lock is freed
+// under it, a mixed parcel that cannot be split is held whole by the
+// smallest version still reaching any of it, and a parcel that cannot be
+// added to a record is leaked. Each costs time or memory, never a node freed
+// while reachable. Publishing reserves its record before it links the base,
+// and parks its parcel the same way.
 // ---------------------------------------------------------------------------
 export template <typename Traits> class VersionChain {
 public:
@@ -148,11 +159,11 @@ public:
     std::vector<Node *> to_free;
     {
       std::lock_guard<std::mutex> lk{mu_};
-      // Room for the new record and the session's parcel first: once the
-      // base is linked to its successor it cannot be derived from again, so
-      // nothing between the link and the record may fail.
+      // Room for the new record first: once the base is linked to its
+      // successor it cannot be derived from again, so nothing between the
+      // link and the record may fail. Parking the session's parcel after it
+      // does not throw (park).
       records_.reserve(records_.size() + 1);
-      pending_.reserve(pending_.size() + 1);
       auto lineage = tag;
       if (base != 0) {
         auto *b = find(base);
@@ -164,14 +175,9 @@ public:
         lineage = b->lineage;
       }
       add_version(tag, lineage);
-      try {
-        park_retired(tag, lineage, retired, to_free);
-      } catch (const std::bad_alloc &) {
-        // The version is registered and the chain consistent; a parcel that
-        // could not be placed is never freed. A leak is the safe failure
-        // here, under memory pressure, where a throw would leave the version
-        // half published.
-      }
+      if (!retired.empty())
+        park(Parcel{std::move(retired), tag, lineage}, to_free);
+      retired.clear();
     }
     destroy_all(to_free);
   }
@@ -183,7 +189,14 @@ public:
 
   // Drops one handle of `id`. `root` is walked only when this was the last
   // handle and the version has no successor — see the class comment.
-  void unpin(std::uint64_t id, Node *root) {
+  //
+  // Runs in the trees' noexcept destructors, often because memory just ran
+  // out, so it must not throw for want of memory (#390). It still allocates
+  // on the common path — the list of nodes to free after the lock, a parcel
+  // spilling into a record's `more` — but each of those has a fallback that
+  // needs none: free the node now, under the lock (free_later), or keep the
+  // parcel on a version that is certainly still alive (park).
+  void unpin(std::uint64_t id, Node *root) noexcept {
     std::vector<Node *> to_free;
     {
       std::lock_guard<std::mutex> lk{mu_};
@@ -194,13 +207,18 @@ public:
       if (it->successor != 0) {
         // Dead inside the chain: its successor reaches everything it did,
         // except what was parked here — that moves on to the next version
-        // still reaching it, or is freed.
-        take_parcels_if(*it, [](const Parcel &) { return true; });
+        // still reaching it, or is freed. The parcels are moved out, which
+        // allocates nothing, before the record goes.
+        auto parked = std::move(it->parked);
+        auto more = std::move(it->more);
         records_.erase(it);
+        if (!parked.nodes.empty())
+          park(std::move(parked), to_free);
+        for (auto &parcel : more)
+          park(std::move(parcel), to_free);
       } else {
-        retract(it, root, to_free);
+        retract(it, root);
       }
-      drain_pending(to_free);
       release_buffers_if_idle();
     }
     destroy_all(to_free);
@@ -225,8 +243,6 @@ public:
       for (const auto &parcel : rec.more)
         g.parked_nodes += parcel.nodes.size();
     }
-    for (const auto &parcel : pending_)
-      g.parked_nodes += parcel.nodes.size();
     return g;
   }
 
@@ -243,8 +259,6 @@ public:
       for (const auto &parcel : rec.more)
         add(parcel);
     }
-    for (const auto &parcel : pending_)
-      add(parcel);
     return out;
   }
 
@@ -276,9 +290,6 @@ private:
 
   std::mutex mu_;
   std::vector<Record> records_;
-  // Parcels taken off a record and waiting to be placed again or released.
-  // Scratch reused under mu_, so the steady state allocates nothing.
-  std::vector<Parcel> pending_;
 
   // Where `tag` belongs in the sorted record vector.
   [[nodiscard]] auto seat_for(std::uint64_t tag)
@@ -303,22 +314,11 @@ private:
     records_.insert(seat_for(tag), std::move(rec));
   }
 
-  // Under mu_: takes the session's retired list over as one parcel and
-  // places it. Leaves `retired` empty.
-  void park_retired(std::uint64_t tag, std::uint64_t lineage,
-                    std::vector<Node *> &retired, std::vector<Node *> &out) {
-    if (!retired.empty())
-      pending_.push_back(Parcel{std::move(retired), tag, lineage});
-    retired.clear();
-    drain_pending(out);
-  }
-
   // Under mu_: the version at `it` has no successor and no handle left.
   // Frees what the dead segment above the newest live predecessor created,
   // unparks what it retired, and makes that predecessor the head again —
   // see the class comment.
-  void retract(typename std::vector<Record>::iterator it, Node *root,
-               std::vector<Node *> &out) {
+  void retract(typename std::vector<Record>::iterator it, Node *root) {
     const auto tag = it->tag;
     const auto lineage = it->lineage;
     Record *pred = nullptr;
@@ -329,6 +329,9 @@ private:
         break;
       }
     }
+    // A parcel is parked on a version below the one that retired it, and the
+    // head has nothing above it.
+    assert(it->parked.nodes.empty() && it->more.empty());
     const auto floor = pred ? pred->tag : 0;
     // Under the lock: once this version leaves the chain another thread may
     // decide that what it reached is free while this walk is still stepping
@@ -336,55 +339,31 @@ private:
     free_node_subtree_if<Traits>(root, [floor](Node *n) {
       return Traits::tag(n) > floor;
     });
-    // What the segment retired is parked on versions of this lineage at or
-    // below it.
-    for (auto &r : records_) {
-      if (r.lineage == lineage && r.tag <= tag)
-        take_parcels_if(r, [floor](const Parcel &p) {
-          return p.retired_by > floor;
-        });
-    }
-    for (auto &parcel : pending_) {
-      if (pred)
-        Traits::account_retired(
-            -static_cast<std::int64_t>(parcel.nodes.size()));
-      else
-        out.insert(out.end(), parcel.nodes.begin(), parcel.nodes.end());
-    }
-    pending_.clear();
-    if (pred)
+    // What the segment retired is parked on versions of this lineage below
+    // it, and is live in the predecessor once more. It is dropped where it
+    // lies, so nothing here needs memory.
+    if (pred) {
+      for (auto &r : records_) {
+        if (r.lineage == lineage && r.tag < tag)
+          drop_retired_after(r, floor);
+      }
       pred->successor = 0;
+    }
     records_.erase(it);
   }
 
-  // Under mu_: moves every parcel of `rec` for which `pred` holds onto the
-  // pending queue.
-  template <typename Pred> void take_parcels_if(Record &rec, Pred pred) {
-    if (!rec.parked.nodes.empty() && pred(rec.parked)) {
-      pending_.push_back(std::move(rec.parked));
+  // Under mu_: drops every parcel of `rec` retired by a version above
+  // `floor`; its nodes are live again. Allocates nothing.
+  void drop_retired_after(Record &rec, std::uint64_t floor) noexcept {
+    auto dropped = [floor](const Parcel &p) {
+      if (p.retired_by <= floor)
+        return false;
+      Traits::account_retired(-static_cast<std::int64_t>(p.nodes.size()));
+      return true;
+    };
+    if (!rec.parked.nodes.empty() && dropped(rec.parked))
       rec.parked.nodes.clear();
-    }
-    std::size_t kept = 0;
-    for (std::size_t i = 0; i < rec.more.size(); ++i) {
-      if (pred(rec.more[i])) {
-        pending_.push_back(std::move(rec.more[i]));
-        continue;
-      }
-      if (kept != i)
-        rec.more[kept] = std::move(rec.more[i]);
-      ++kept;
-    }
-    rec.more.resize(kept);
-  }
-
-  // Under mu_: places every pending parcel. Runs after the record vector
-  // has stopped moving, so hold() can take a pointer into it.
-  void drain_pending(std::vector<Node *> &out) {
-    while (!pending_.empty()) {
-      auto parcel = std::move(pending_.back());
-      pending_.pop_back();
-      park(std::move(parcel), out);
-    }
+    std::erase_if(rec.more, dropped);
   }
 
   // The free rule. The live version that still reaches a node created by
@@ -405,51 +384,87 @@ private:
   // reaches it, or to `out` when none does. The nodes of one parcel almost
   // always share a blocker — they came off one path in one version — so
   // that case moves the whole list and allocates nothing.
-  void park(Parcel parcel, std::vector<Node *> &out) {
-    const auto first = blocker_for(Traits::tag(parcel.nodes.front()), parcel);
+  //
+  // Never throws for want of memory. Splitting a mixed parcel allocates;
+  // when it cannot, the whole parcel is held by the smallest of its
+  // blockers. That is safe, if late: no node is freed while a version still
+  // reaches it, and the parcel is looked at again when that version dies.
+  void park(Parcel parcel, std::vector<Node *> &out) noexcept {
+    std::uint64_t first = 0;
+    std::uint64_t smallest = 0;
     bool uniform = true;
     for (auto *n : parcel.nodes) {
-      if (blocker_for(Traits::tag(n), parcel) != first) {
+      const auto blocker = blocker_for(Traits::tag(n), parcel);
+      if (n == parcel.nodes.front())
+        first = blocker;
+      else if (blocker != first)
         uniform = false;
-        break;
-      }
+      if (blocker != 0 && (smallest == 0 || blocker < smallest))
+        smallest = blocker;
     }
     if (uniform) {
       if (first == 0)
-        out.insert(out.end(), parcel.nodes.begin(), parcel.nodes.end());
+        free_later(parcel.nodes, out);
       else
         hold(first, std::move(parcel));
       return;
     }
     // Mixed: split by blocker. Rare, and the split lists are short.
-    std::vector<std::pair<std::uint64_t, Parcel>> groups;
-    for (auto *n : parcel.nodes) {
-      const auto blocker = blocker_for(Traits::tag(n), parcel);
-      if (blocker == 0) {
-        out.push_back(n);
-        continue;
+    const auto out_size = out.size();
+    try {
+      std::vector<std::pair<std::uint64_t, Parcel>> groups;
+      for (auto *n : parcel.nodes) {
+        const auto blocker = blocker_for(Traits::tag(n), parcel);
+        if (blocker == 0) {
+          out.push_back(n);
+          continue;
+        }
+        auto group = std::find_if(groups.begin(), groups.end(),
+                                  [blocker](const auto &g) {
+                                    return g.first == blocker;
+                                  });
+        if (group == groups.end())
+          groups.emplace_back(blocker, Parcel{{n}, parcel.retired_by,
+                                              parcel.lineage});
+        else
+          group->second.nodes.push_back(n);
       }
-      auto group = std::find_if(groups.begin(), groups.end(),
-                                [blocker](const auto &g) {
-                                  return g.first == blocker;
-                                });
-      if (group == groups.end())
-        groups.emplace_back(blocker, Parcel{{n}, parcel.retired_by,
-                                            parcel.lineage});
-      else
-        group->second.nodes.push_back(n);
+      for (auto &[blocker, group] : groups)
+        hold(blocker, std::move(group));
+    } catch (const std::bad_alloc &) {
+      // Nothing was held yet: hold() comes last and does not throw. What
+      // went to `out` goes back, since the parcel keeps it.
+      out.erase(out.begin() + static_cast<std::ptrdiff_t>(out_size),
+                out.end());
+      hold(smallest, std::move(parcel));
     }
-    for (auto &[blocker, group] : groups)
-      hold(blocker, std::move(group));
   }
 
-  // Under mu_: hands a parcel to the version that still reaches it.
-  void hold(std::uint64_t blocker, Parcel parcel) {
+  // Under mu_: hands a parcel to the version that still reaches it. A
+  // parcel that cannot be added to `more` for want of memory is never freed:
+  // under memory pressure a leak is the safe failure.
+  void hold(std::uint64_t blocker, Parcel parcel) noexcept {
     auto *rec = find(blocker);
-    if (rec->parked.nodes.empty())
+    if (rec->parked.nodes.empty()) {
       rec->parked = std::move(parcel);
-    else
+      return;
+    }
+    try {
       rec->more.push_back(std::move(parcel));
+    } catch (const std::bad_alloc &) {
+    }
+  }
+
+  // Under mu_: queues `nodes` to be freed once the lock is released, or
+  // frees them now if the queue cannot grow. Nothing reaches them, so
+  // freeing them under the lock is correct; it only holds the lock longer.
+  static void free_later(const std::vector<Node *> &nodes,
+                         std::vector<Node *> &out) noexcept {
+    try {
+      out.insert(out.end(), nodes.begin(), nodes.end());
+    } catch (const std::bad_alloc &) {
+      destroy_all(nodes);
+    }
   }
 
   // Under mu_: when the last version of every tree of this value type is
@@ -459,10 +474,9 @@ private:
   // tree is then provably responsible for no memory at all, which the
   // memory tests check.
   void release_buffers_if_idle() {
-    if (!records_.empty() || !pending_.empty())
+    if (!records_.empty())
       return;
     records_.shrink_to_fit();
-    pending_.shrink_to_fit();
   }
 
   static void destroy_all(const std::vector<Node *> &nodes) noexcept {

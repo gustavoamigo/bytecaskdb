@@ -76,6 +76,7 @@ using bytecask::Options;
 using bytecask::testing::consistency_errors;
 using bytecask::testing::key_values;
 using bytecask::testing::ScopedAllocFaults;
+using bytecask::testing::ExpectedLeaks;
 using bytecask::testing::SuspendSyscallFaults;
 using bytecask::testing::to_bytes;
 using namespace bytecask::testing::sweep_ops;  // NOLINT(google-build-using-namespace)
@@ -497,6 +498,10 @@ TEST_CASE("alloc sweep: put", "[alloc_sweep]") { alloc_sweep(put_operation()); }
 
 TEST_CASE("alloc sweep: del", "[alloc_sweep]") { alloc_sweep(del_operation()); }
 
+TEST_CASE("alloc sweep: put under a snapshot", "[alloc_sweep]") {
+  alloc_sweep(snapshot_put_operation());
+}
+
 TEST_CASE("alloc sweep: del_range", "[alloc_sweep]") {
   alloc_sweep(del_range_operation());
 }
@@ -617,22 +622,141 @@ TEST_CASE("alloc sweep: a failed publication leaves the base derivable",
     auto tr = u1.transient();
     tr.set(to_bytes("zzz"), res.ref("zzz"), res);
     bool fired = false;
-    // Released once the fault is disarmed: releasing a version still
-    // allocates (#390), and this test is about publishing one.
-    std::optional<Tree> u2;
     {
       ScopedAllocFaults faults{n, false};
       try {
-        u2.emplace(std::move(tr).persistent());
+        // Released under the fault too: the version dies with its parcel
+        // parked on u1 and t.
+        (void)std::move(tr).persistent();
       } catch (const std::bad_alloc &) {
       }
       fired = faults.report().fired;
     }
-    u2.reset();
     INFO("allocation " << n << " of the publication failed");
     auto again = u1.transient();
     again.set(to_bytes("other"), res.ref("other"), res);
     CHECK_NOTHROW((void)std::move(again).persistent());
+    if (!fired) break;
+  }
+}
+
+// Dropping the last handle of a version frees what only it reached and hands
+// on what it was holding for older ones, in noexcept destructors, often
+// because memory just ran out. Each way a version can die is run with every
+// allocation failing: the release must not end the process, and the versions
+// left must still be whole once memory is back (#390). In-process, so
+// coverage sees the fallbacks; a regression ends the test binary.
+//
+// t is a live base; u1 changes one leaf of it and u2 a leaf far away, so
+// u2's retired nodes park on both u1 and t.
+TEST_CASE("alloc sweep: a version is released when nothing can be allocated",
+          "[alloc_sweep]") {
+  // A parcel hold() cannot add to a version for want of memory is leaked by
+  // design; the trees are built inside this scope so LeakSanitizer accepts it.
+  const ExpectedLeaks leaks;
+  KeyStore res;
+  auto derive = [&res](const Tree &base, const std::string &k) {
+    auto tr = base.transient();
+    tr.set(to_bytes(k), res.ref(k), res);
+    return std::move(tr).persistent();
+  };
+  std::optional<Tree> t{deep_tree(res)};
+  std::optional<Tree> u1{derive(*t, "aaa")};
+  std::optional<Tree> u2{derive(*u1, "zzz")};
+  const auto keys = t->size();
+
+  auto released_under_fault = [](std::optional<Tree> &v) {
+    ScopedAllocFaults every_allocation_fails{1, true};
+    v.reset();
+  };
+  // validate() reads every node and throws on the first broken invariant,
+  // so a node freed while still reached shows here (or under ASan).
+  auto still_whole = [&] {
+    if (t) {
+      (void)t->validate(res);
+      REQUIRE(t->size() == keys);
+    }
+    if (u1) {
+      (void)u1->validate(res);
+      REQUIRE(u1->contains(to_bytes("aaa"), res));
+    }
+    if (u2) {
+      (void)u2->validate(res);
+      REQUIRE(u2->contains(to_bytes("zzz"), res));
+    }
+  };
+
+  SECTION("the head, over a live predecessor") {
+    // Retraction: what u2 created is walked and freed, what it retired is
+    // live again in u1 and t.
+    released_under_fault(u2);
+    still_whole();
+  }
+  SECTION("a version inside the chain") {
+    // u1 dies with a successor: the nodes u2 retired from it are freed, and
+    // what u1 held for t moves on.
+    released_under_fault(u1);
+    still_whole();
+  }
+  SECTION("the base, then the rest of the lineage") {
+    released_under_fault(t);
+    still_whole();
+    released_under_fault(u1);
+    still_whole();
+    // The last version of the lineage: everything it retired is freed.
+    released_under_fault(u2);
+  }
+}
+
+// A parcel that could not be split when it was parked is held whole by its
+// smallest blocker, and split when that version dies — then some of its
+// nodes may be reached by nothing and others still be (#390).
+//
+// t, v, w, x in one lineage. v changes the leftmost leaf, w the rightmost, x
+// the rightmost and a middle one, so x retires nodes created by w (the path
+// w copied) and by t (the middle path), none by v. Each allocation of x's
+// publication is failed in turn; one of them is the split, and the parcel is
+// held whole on t. w dies holding nothing of it. When t dies the parcel is
+// looked at again: t's nodes are still reached by v, w's by nothing.
+TEST_CASE("alloc sweep: a parcel held whole is split when its holder dies",
+          "[alloc_sweep]") {
+  const ExpectedLeaks leaks;
+  for (long n = 1;; ++n) {
+    REQUIRE(n <= kMaxAllocations);
+    KeyStore res;
+    auto derive = [&res](const Tree &base,
+                         std::initializer_list<std::string> ks) {
+      auto tr = base.transient();
+      for (const auto &k : ks)
+        tr.set(to_bytes(k), res.ref(k), res);
+      return std::move(tr).persistent();
+    };
+    std::optional<Tree> t{deep_tree(res)};
+    const auto keys = t->size();
+    std::optional<Tree> v{derive(*t, {"aaa"})};
+    std::optional<Tree> w{derive(*v, {"zzz"})};
+    std::optional<Tree> x;
+    auto tr = w->transient();
+    for (const auto &k : {std::string{"zzz2"}, std::string{"user::5::y"}})
+      tr.set(to_bytes(k), res.ref(k), res);
+    bool fired = false;
+    {
+      ScopedAllocFaults faults{n, false};
+      try {
+        x.emplace(std::move(tr).persistent());
+      } catch (const std::bad_alloc &) {
+      }
+      fired = faults.report().fired;
+    }
+    INFO("allocation " << n << " of the publication failed");
+    w.reset();
+    t.reset();
+    (void)v->validate(res);
+    REQUIRE(v->size() == keys + 1);
+    if (x) {
+      (void)x->validate(res);
+      REQUIRE(x->contains(to_bytes("user::5::y"), res));
+    }
     if (!fired) break;
   }
 }

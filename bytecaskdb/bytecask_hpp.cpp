@@ -602,7 +602,7 @@ auto DB::is_degraded() const noexcept -> bool {
   return impl_->db.is_degraded();
 }
 
-auto DB::degraded_reason() const noexcept -> std::string {
+auto DB::degraded_reason() const -> std::string {
   return impl_->db.degraded_reason();
 }
 

@@ -120,7 +120,8 @@ The versions above `F` are a dead segment nothing reaches:
   the segment and are freed by a walk, which stops at the first node at or
   below `F` because children are never newer than their parent;
 - nodes the segment retired (retiring tag above `F`) are reachable from `F`
-  again and are unparked. With no `F` the lineage is over and they are freed.
+  again and are unparked. With no `F` the lineage is over and none
+  are left: each was freed when the version it was parked on died.
 
 `F` is then the head again and may be derived from. This one rule covers a
 head dropped after a failed flush (`DB::resume`), a version a test publishes

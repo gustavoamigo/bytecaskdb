@@ -394,7 +394,9 @@ public:
     // True if the engine has entered a degraded state from a write-path failure.
     // Reads remain available; all write operations throw DbDegraded.
     [[nodiscard]] auto is_degraded() const noexcept -> bool;
-    [[nodiscard]] auto degraded_reason() const noexcept -> const std::string&;
+    // Why the engine is degraded, or empty. Returned by value: may throw
+    // std::bad_alloc.
+    [[nodiscard]] auto degraded_reason() const -> std::string;
 
     // Attempts to recover from a degraded state. Rewrites and syncs the
     // active file, so nothing a failed fdatasync left only in the page cache

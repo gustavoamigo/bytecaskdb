@@ -490,7 +490,7 @@ public:
   void set_mode(Mode mode);
 
   [[nodiscard]] auto is_degraded() const noexcept -> bool;
-  [[nodiscard]] auto degraded_reason() const noexcept -> std::string;
+  [[nodiscard]] auto degraded_reason() const -> std::string;
   void resume();
 
   [[nodiscard]] auto snapshot() const -> Snapshot;

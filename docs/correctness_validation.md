@@ -1948,6 +1948,7 @@ for lack of memory is not settled, and the sweep is how it will be.
 | Operation | Runs per pass | Outcomes, one / every one from N on |
 |---|---:|---|
 | `put` | 17 | 13 threw unchanged, 3 degraded, 1 completed (both) |
+| `put` while a snapshot taken before it is held, and released under the fault | 17 | 13 threw unchanged, 3 degraded, 1 completed (both) |
 | `del` | 14 | 10 threw unchanged, 3 degraded, 1 completed (both) |
 | `del_range` | 25 | 21 threw unchanged, 3 degraded, 1 completed (both) |
 | `apply_batch` | 27 | 23 threw unchanged, 3 degraded, 1 completed (both) |
@@ -1986,14 +1987,25 @@ each allocation it failed.
   I/O failure of creating the next file also caught an allocation that
   failed while the files were installed, and published a state with a file
   and no `file_stats` for it, which `resume()` refused.
+- *Releasing a version needed memory* (#390). `VersionChain::unpin`, in the
+  trees' `noexcept` destructors, queued what it freed and re-parked through
+  vectors. No swept operation reached it, but releasing the newer of two
+  chained versions under the fault did, and every way a version can die
+  terminated with every allocation failing. Each allocation left on the
+  release path now has a fallback that needs none (`bytecask_design.md`,
+  *A failure after the append that no handler degrades for*). A parcel held
+  whole because it could not be split is split when its holder dies, into
+  nodes still reached and nodes reached by nothing; `alloc sweep: a parcel
+  held whole is split when its holder dies` builds that case.
 
 The fixes are in `bytecask_design.md`, *A failure after the append that no
 handler degrades for*. Each has a deterministic test, driven by a test hook
 rather than a counted allocation so that it runs in-process — where
 coverage sees it; a forked child's profile is not written — and on the
 sanitizer and WASM builds: `[refuse_writes]` in the same file, and
-`alloc sweep: a transient tree is freed when nothing can be allocated` and
-`alloc sweep: a failed publication leaves the base derivable`. Each has a
+`alloc sweep: a transient tree is freed when nothing can be allocated`,
+`alloc sweep: a failed publication leaves the base derivable` and
+`alloc sweep: a version is released when nothing can be allocated`. Each has a
 mutation in `tests/durability_mutations/` that reverts it.
 
 **Limits.**
@@ -2004,11 +2016,6 @@ mutation in `tests/durability_mutations/` that reverts it.
 - *`malloc` is not counted*, nor anything that allocates with it.
 - *One back-end.* The I/O back-ends differ in their calls far more than in
   their allocations.
-- *Releasing a version still allocates* (#390): `VersionChain::unpin` frees
-  through vectors, in `noexcept` destructors. No swept operation reaches it
-  under the fault, but releasing the newer of two chained versions does
-  (`retract` grows `pending_`), so `a failed publication leaves the base
-  derivable` releases its version only after disarming.
 
 ### ThreadSanitizer (TSan)
 
@@ -2548,6 +2555,9 @@ A site whose break nothing has to catch says why instead.
 | `flush_once`: a `flush_pending` that throws gives the flush role back | `refuse writes: a flush that throws releases the flush role` | `flush_role_kept_on_throw` (hangs) | #364 |
 | `quiesce`: the same for a write barrier's flush | `refuse writes: a barrier's flush that throws releases the flush role` | `barrier_flush_role_kept_on_throw` (hangs) | #364 |
 | `finish_rotation`: a rotation that fails in memory publishes nothing | `refuse writes: a rotation that fails in memory publishes nothing` | `half_rotation_published` | #364 |
+| Key directory: a dropped transient is freed without allocating | `alloc sweep: a transient tree is freed when nothing can be allocated` | `free_subtree_allocates` | #364 |
+| Key directory: `publish` reserves its record before it links the base | `alloc sweep: a failed publication leaves the base derivable` | `publish_links_before_reserving` | #364 |
+| Key directory: releasing a version never throws for want of memory | `alloc sweep: a version is released when nothing can be allocated` | `release_queue_allocates` | #390 |
 
 ### Rotation and new files
 
