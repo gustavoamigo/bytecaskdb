@@ -343,7 +343,8 @@ reachable from the dead root with a tag above `F` were created by the segment
 and are freed by a walk (a node's children are never newer than the node, so
 the walk stops where the test fails); nodes retired by the segment are
 reachable from `F` again and are unparked — live nodes of `F` once more. With
-no `F` the lineage is over and they are freed too. `F` is then the head of its
+no `F` the lineage is over and none are left: each was freed when the version
+it was parked on died. `F` is then the head of its
 lineage again. This one rule covers the head dropped after a failed flush
 (`DB::resume`), a version a test publishes and drops, the last handle at DB
 close, and the tail of a recovery partition, and it is what keeps the tag

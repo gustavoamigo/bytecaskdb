@@ -708,6 +708,59 @@ TEST_CASE("alloc sweep: a version is released when nothing can be allocated",
   }
 }
 
+// A parcel that could not be split when it was parked is held whole by its
+// smallest blocker, and split when that version dies — then some of its
+// nodes may be reached by nothing and others still be (#390).
+//
+// t, v, w, x in one lineage. v changes the leftmost leaf, w the rightmost, x
+// the rightmost and a middle one, so x retires nodes created by w (the path
+// w copied) and by t (the middle path), none by v. Each allocation of x's
+// publication is failed in turn; one of them is the split, and the parcel is
+// held whole on t. w dies holding nothing of it. When t dies the parcel is
+// looked at again: t's nodes are still reached by v, w's by nothing.
+TEST_CASE("alloc sweep: a parcel held whole is split when its holder dies",
+          "[alloc_sweep]") {
+  const ExpectedLeaks leaks;
+  for (long n = 1;; ++n) {
+    REQUIRE(n <= kMaxAllocations);
+    KeyStore res;
+    auto derive = [&res](const Tree &base,
+                         std::initializer_list<std::string> ks) {
+      auto tr = base.transient();
+      for (const auto &k : ks)
+        tr.set(to_bytes(k), res.ref(k), res);
+      return std::move(tr).persistent();
+    };
+    std::optional<Tree> t{deep_tree(res)};
+    const auto keys = t->size();
+    std::optional<Tree> v{derive(*t, {"aaa"})};
+    std::optional<Tree> w{derive(*v, {"zzz"})};
+    std::optional<Tree> x;
+    auto tr = w->transient();
+    for (const auto &k : {std::string{"zzz2"}, std::string{"user::5::y"}})
+      tr.set(to_bytes(k), res.ref(k), res);
+    bool fired = false;
+    {
+      ScopedAllocFaults faults{n, false};
+      try {
+        x.emplace(std::move(tr).persistent());
+      } catch (const std::bad_alloc &) {
+      }
+      fired = faults.report().fired;
+    }
+    INFO("allocation " << n << " of the publication failed");
+    w.reset();
+    t.reset();
+    (void)v->validate(res);
+    REQUIRE(v->size() == keys + 1);
+    if (x) {
+      (void)x->validate(res);
+      REQUIRE(x->contains(to_bytes("user::5::y"), res));
+    }
+    if (!fired) break;
+  }
+}
+
 #else  // BYTECASK_NO_ALLOC_FAULTS
 
 TEST_CASE("alloc sweep: not available in this build", "[alloc_sweep]") {

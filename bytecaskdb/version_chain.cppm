@@ -106,7 +106,9 @@ void free_node_subtree_if(typename Traits::Node *root,
 //     children are never newer than their parent;
 //   - nodes retired by the segment — retiring tag above F — are reachable
 //     from F again and are unparked: live nodes of F once more. With no F
-//     the lineage is over and they are freed as well.
+//     the lineage is over, and there are none: a parcel is parked on a
+//     version below the one that retired it, and the dead head is the only
+//     version of its lineage left.
 // F is then the head of its lineage again. This one rule covers the head
 // dropped after a failed flush (DB::resume), a version a test publishes and
 // drops, the last handle at DB close, and the tail of a recovery partition.
@@ -215,7 +217,7 @@ public:
         for (auto &parcel : more)
           park(std::move(parcel), to_free);
       } else {
-        retract(it, root, to_free);
+        retract(it, root);
       }
       release_buffers_if_idle();
     }
@@ -316,8 +318,7 @@ private:
   // Frees what the dead segment above the newest live predecessor created,
   // unparks what it retired, and makes that predecessor the head again —
   // see the class comment.
-  void retract(typename std::vector<Record>::iterator it, Node *root,
-               std::vector<Node *> &out) {
+  void retract(typename std::vector<Record>::iterator it, Node *root) {
     const auto tag = it->tag;
     const auto lineage = it->lineage;
     Record *pred = nullptr;
@@ -328,6 +329,9 @@ private:
         break;
       }
     }
+    // A parcel is parked on a version below the one that retired it, and the
+    // head has nothing above it.
+    assert(it->parked.nodes.empty() && it->more.empty());
     const auto floor = pred ? pred->tag : 0;
     // Under the lock: once this version leaves the chain another thread may
     // decide that what it reached is free while this walk is still stepping
@@ -335,48 +339,31 @@ private:
     free_node_subtree_if<Traits>(root, [floor](Node *n) {
       return Traits::tag(n) > floor;
     });
-    // What the segment retired is parked on versions of this lineage at or
-    // below it. It is never parked again: with a predecessor it is live in it
-    // once more, without one it is freed. Either way it is handled where it
-    // lies, so nothing here needs room to move it.
-    for (auto &r : records_) {
-      if (r.lineage == lineage && r.tag <= tag)
-        drop_parcels_if(
-            r, [floor](const Parcel &p) { return p.retired_by > floor; },
-            [&](Parcel &p) {
-              if (pred)
-                Traits::account_retired(
-                    -static_cast<std::int64_t>(p.nodes.size()));
-              else
-                free_later(p.nodes, out);
-            });
-    }
-    if (pred)
+    // What the segment retired is parked on versions of this lineage below
+    // it, and is live in the predecessor once more. It is dropped where it
+    // lies, so nothing here needs memory.
+    if (pred) {
+      for (auto &r : records_) {
+        if (r.lineage == lineage && r.tag < tag)
+          drop_retired_after(r, floor);
+      }
       pred->successor = 0;
+    }
     records_.erase(it);
   }
 
-  // Under mu_: hands every parcel of `rec` for which `pred` holds to
-  // `take`, then removes it from the record. Compacts in place, so it
-  // allocates nothing.
-  template <typename Pred, typename Take>
-  void drop_parcels_if(Record &rec, Pred pred, Take take) {
-    if (!rec.parked.nodes.empty() && pred(rec.parked)) {
-      take(rec.parked);
+  // Under mu_: drops every parcel of `rec` retired by a version above
+  // `floor`; its nodes are live again. Allocates nothing.
+  void drop_retired_after(Record &rec, std::uint64_t floor) noexcept {
+    auto dropped = [floor](const Parcel &p) {
+      if (p.retired_by <= floor)
+        return false;
+      Traits::account_retired(-static_cast<std::int64_t>(p.nodes.size()));
+      return true;
+    };
+    if (!rec.parked.nodes.empty() && dropped(rec.parked))
       rec.parked.nodes.clear();
-    }
-    std::size_t kept = 0;
-    for (std::size_t i = 0; i < rec.more.size(); ++i) {
-      if (pred(rec.more[i])) {
-        take(rec.more[i]);
-        continue;
-      }
-      if (kept != i)
-        rec.more[kept] = std::move(rec.more[i]);
-      ++kept;
-    }
-    rec.more.erase(rec.more.begin() + static_cast<std::ptrdiff_t>(kept),
-                   rec.more.end());
+    std::erase_if(rec.more, dropped);
   }
 
   // The free rule. The live version that still reaches a node created by

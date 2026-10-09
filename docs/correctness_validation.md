@@ -1993,7 +1993,10 @@ each allocation it failed.
   chained versions under the fault did, and every way a version can die
   terminated with every allocation failing. Each allocation left on the
   release path now has a fallback that needs none (`bytecask_design.md`,
-  *A failure after the append that no handler degrades for*).
+  *A failure after the append that no handler degrades for*). A parcel held
+  whole because it could not be split is split when its holder dies, into
+  nodes still reached and nodes reached by nothing; `alloc sweep: a parcel
+  held whole is split when its holder dies` builds that case.
 
 The fixes are in `bytecask_design.md`, *A failure after the append that no
 handler degrades for*. Each has a deterministic test, driven by a test hook
