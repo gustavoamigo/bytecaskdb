@@ -55,6 +55,9 @@ bytecaskdb-mariadb-plugin/
 ├── bytecask_view.h        Inline adapters between MariaDB's uint8_t*+size_t
 │                          and bytecask's BytesView (std::span<const std::byte>).
 │
+├── degraded.h             abort_if_degraded(): what every engine write does
+│                          when its failure left the engine degraded.
+│
 ├── tests/
 │   ├── unit/              Catch2 unit tests for pure helpers (key
 │   │                      encoding, row encoding, catalog, txn buffer).
@@ -376,6 +379,22 @@ pass `{}` because `verify_checksums` only affects value reads.
 
 ---
 
+## When a write fails
+
+A write the engine cannot complete — a failed `fdatasync`, an I/O error on
+an append, a full disk — degrades it: reads go on, writes are refused until
+`resume()` or a reopen. The plugin does not call `resume()`. Every engine
+write it makes is followed, on a throw, by `abort_if_degraded()`: if the
+engine is degraded, the reason goes to the error log and the server aborts,
+as MyRocks does on a write I/O error and InnoDB on a failed `fsync`.
+Recovery runs at restart, in `DB::open`, which reads back and syncs a file
+the last process may not have synced and truncates a torn tail. A throw that
+leaves the engine healthy — a conflict, a bad argument — fails the statement
+as usual. A full disk aborts too; the restart fails the same way until space
+is freed (#294).
+
+---
+
 ## Implementation status
 
 | Phase | Description | Status |
@@ -387,7 +406,7 @@ pass `{}` because `verify_checksums` only affects value reads.
 | E | Secondary indexes (write + read path) | Done |
 | F | Isolation levels (RC, RR, Serializable) | Partial |
 | G | `del_range`-backed DDL (O(1) DROP TABLE) | Done |
-| H | Vacuum, resume, replication hooks, backup | Partial (H.1 done) |
+| H | Vacuum, degraded engine, replication hooks, backup | Partial (H.1, H.2 done) |
 
 ### Feature matrix
 

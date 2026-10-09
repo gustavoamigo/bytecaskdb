@@ -123,6 +123,15 @@ def commit_failure_classes():
     }
 
 
+def commit_abort_classes():
+    """Commit failures that degrade the engine: the plugin aborts the server,
+    as MyRocks does, and recovery runs at restart (#294)."""
+    return {
+        PluginFailureClass.ENGINE_DEGRADED,
+        PluginFailureClass.ENGINE_IO_FAIL,
+    }
+
+
 def dml_failure_classes():
     """Failure classes where fault fires during DML (DML throws)."""
     return {
@@ -132,6 +141,8 @@ def dml_failure_classes():
 
 def fault_teardown(failure: PluginFailureClass, txn: TxnShape) -> str:
     """Code after DML for failure classes that fire at commit."""
+    if failure in commit_abort_classes():
+        return ""
     if failure in commit_failure_classes():
         return "int commit_rc = h.commit();"
     return ""
@@ -188,7 +199,12 @@ def assertions(dml: DMLShape, index: IndexShape, txn: TxnShape,
     base = committed_row_count(dml)
     final = expected_final_count(dml, txn, failure)
 
-    if failure in commit_failure_classes():
+    if failure in commit_abort_classes():
+        lines.append("// DML buffers successfully; the fault degrades the engine at")
+        lines.append("// commit, and the plugin aborts.")
+        lines.append("REQUIRE(rc == 0);")
+        lines.append("REQUIRE(h.commit_aborts());")
+    elif failure in commit_failure_classes():
         lines.append("// DML buffers successfully; fault fires at commit.")
         lines.append("REQUIRE(rc == 0);")
         lines.append("REQUIRE(commit_rc != 0);")

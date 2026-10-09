@@ -418,17 +418,18 @@ H.1 — Vacuum: **Done**
 - Future: add status variables (`bytecaskdb_last_vacuum_ms`,
   `_files_reclaimed`).
 
-H.2 — Resume from degraded:
+H.2 — A degraded engine: **Done** (#294), and not by resuming.
 
-- Wrap every write path (`write_row`, `update_row`, `delete_row`,
-  txn commit) in a `DbDegraded` catch. On first catch:
-  1. Log to the MariaDB error log.
-  2. Attempt `db.resume()` on a background worker (not the
-     user thread).
-  3. Return `HA_ERR_GENERIC` to the current statement; retry is the
-     app's responsibility.
-- Expose `bytecaskdb_degraded` (bool) and `bytecaskdb_degraded_reason`
-  (string) status variables so DBAs can see it from SQL.
+- When an engine write throws and the engine is degraded afterwards, the
+  plugin logs the reason and aborts the server (`abort_if_degraded`,
+  `degraded.h`). MyRocks aborts on any write I/O error and InnoDB on a
+  failed `fsync`; MariaDB operators and failover tooling expect a server
+  that fails a write to go down, not to stay up refusing writes.
+- `DB::open` at restart reads back and syncs a file the last process may
+  not have synced and truncates a torn tail: what `resume()` would do.
+- A full disk aborts too, as in MyRocks; the restart fails the same way
+  until space is freed. Whether the engine keeps its degraded state and
+  `resume()` at all is #432.
 
 H.3 — Replication hooks:
 

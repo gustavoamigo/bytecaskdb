@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -52,6 +53,11 @@ public:
 
   // Transaction control.
   int commit();
+  // Runs action in a forked child; true if the child died of SIGABRT, as
+  // the plugin does when a write degrades the engine (#294). The parent's
+  // engine and transaction are untouched.
+  bool aborts(const std::function<void()> &action);
+  bool commit_aborts();
   void rollback();
   void stmt_boundary();   // commit(all=false) — statement boundary within txn
   void begin_stmt();      // external_lock(F_WRLCK) — start a new statement
