@@ -27,6 +27,7 @@
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -680,6 +681,25 @@ bool catalog_copy_meta(uint32_t table_id, TableMeta &out) {
 }
 
 } // namespace bytecaskdb
+
+// ---------------------------------------------------------------------------
+// A degraded engine: abort (#294, degraded.h). Outside PLUGIN_TESTING's
+// exclusion, so the proof tests run the abort they check for.
+// ---------------------------------------------------------------------------
+
+void abort_if_degraded(bytecask::DB &db, const char *what) noexcept {
+  if (!db.is_degraded()) return;
+  std::string reason;
+  try {
+    reason = db.degraded_reason();
+  } catch (...) {
+    // Out of memory for the copy: abort without it.
+  }
+  sql_print_error("ByteCaskDB: %s: the engine refused writes after a write "
+                  "failure (%s). Aborting; recovery runs at restart.",
+                  what, reason.c_str());
+  std::abort();
+}
 
 #ifndef PLUGIN_TESTING
 
