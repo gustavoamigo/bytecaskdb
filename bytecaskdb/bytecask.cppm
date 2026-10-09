@@ -4999,7 +4999,8 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
   } else {
     // Debug-only O(n) checks, sharing one walk: next_seq > max(all key_dir
     // sequences), and every entry inside its file's committed extent
-    // (invariant P — see "View and span lifetimes" in CONTRACT.md).
+    // (invariant P — see "Why a lent view survives file events" in
+    // docs/bytecask_design.md).
     std::uint64_t max_seq = 0;
     for (auto it = kd_begin(new_state->key_dir, new_state->kd_ctx(/*verify=*/false));
          it != std::default_sentinel; ++it) {
@@ -5096,8 +5097,8 @@ void DB::validate_state_consistency(const EngineState &s) const {
     // extent of the file it names. This is what lets resume() shorten the
     // active file under lock-free readers — with use_mmap the mapping stays
     // put and only mmap_end_ moves, so an entry above the new extent would
-    // leave a reader's span addressing a page beyond EOF. See "View and span
-    // lifetimes" in CONTRACT.md.
+    // leave a reader's span addressing a page beyond EOF. See "Why a lent
+    // view survives file events" in docs/bytecask_design.md.
     // Check 4 put every registered file in file_stats.
     const auto size = entry_size(key_span.size(), entry.value_size());
     const auto entry_end = entry.file_offset() + size;

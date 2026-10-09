@@ -3,20 +3,3 @@
 # a guarantee, to be restated in public terms or moved to the design docs.
 # The file only shrinks: a name here that the contract no longer uses fails
 # the check, and the file is deleted when it is empty.
-CommittedEntryIterator
-DataEntry
-DataFile
-EngineState
-FrameLease
-Key
-ReadOnlyMmapDataFile
-WritableMmapDataFile
-durable_seq
-io_buf_
-key_dir
-mmap_end_
-shrink_to_fit
-store_state
-total_bytes
-vacuum_compact_file
-validate_state_consistency
