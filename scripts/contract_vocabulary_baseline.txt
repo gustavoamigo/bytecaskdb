@@ -1,5 +1,0 @@
-# Private names CONTRACT.md used when scripts/check_contract_vocabulary.py
-# was added (#399). Each is a sentence that describes mechanism rather than
-# a guarantee, to be restated in public terms or moved to the design docs.
-# The file only shrinks: a name here that the contract no longer uses fails
-# the check, and the file is deleted when it is empty.

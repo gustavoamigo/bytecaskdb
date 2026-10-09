@@ -604,7 +604,7 @@ If you want to take it in a different direction and fork it into your own thing,
 | [`docs/buffer_pool_design.md`](docs/buffer_pool_design.md) | Buffer pool: bounded, `O_DIRECT`-filled value cache for memory-constrained deployments, with measurements |
 | [`bytecaskdb-python/reference/bytecask_ref.py`](bytecaskdb-python/reference/bytecask_ref.py) | The model in one file: a plain-Python reference implementation of the API and file format, checked against the engine |
 | [`bytecaskdb-node/`](bytecaskdb-node/) | Node.js package: WASM (Embind) and native (N-API) backends behind one TypeScript API |
-| [`CONTRACT.md`](CONTRACT.md) | Per-function behavioral contracts: atomicity, durability, I/O failure safety, sequence invariants |
+| [`CONTRACT.md`](CONTRACT.md) | What the engine guarantees and what it excludes: definitions, conditions, one table per operation with the test that proves each row |
 
 ## License
 

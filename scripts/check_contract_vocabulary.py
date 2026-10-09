@@ -9,11 +9,7 @@ identifier in a backticked span of CONTRACT.md must be one of:
   - a name declared in include/bytecask.hpp, comments excluded;
   - a C++ or standard-library name, or a platform name the contract may use
     because a public option or a stated storage assumption selects it
-    (ALLOWED below);
-  - a name in scripts/contract_vocabulary_baseline.txt: private names the
-    contract used when this check was added. The baseline only shrinks: a
-    name it lists that the contract no longer uses is an error, so the
-    file is deleted once the contract is clean.
+    (ALLOWED below).
 
 Spans that are not identifiers are skipped: file names and paths, test
 tags like `[limits]`, numbers, and the placeholders of examples (`k`, `v1`,
@@ -28,7 +24,6 @@ import sys
 
 CONTRACT = "CONTRACT.md"
 HEADER = "include/bytecask.hpp"
-BASELINE = "scripts/contract_vocabulary_baseline.txt"
 
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 SPAN = re.compile(r"`([^`]*)`")
@@ -85,39 +80,20 @@ def contract_names(root: pathlib.Path) -> dict[str, list[int]]:
     return found
 
 
-def read_baseline(root: pathlib.Path) -> set[str]:
-    path = root / BASELINE
-    if not path.exists():
-        return set()
-    return {
-        line.strip()
-        for line in path.read_text().splitlines()
-        if line.strip() and not line.startswith("#")
-    }
-
-
 def main() -> int:
     root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
     public = public_names(root) | ALLOWED
-    baseline = read_baseline(root)
     used = contract_names(root)
 
-    unknown = {n: ls for n, ls in used.items()
-               if n not in public and n not in baseline}
-    stale = sorted(n for n in baseline if n not in used or n in public)
+    unknown = {n: ls for n, ls in used.items() if n not in public}
 
     for name in sorted(unknown):
         lines = ", ".join(str(l) for l in unknown[name][:5])
         print(f"{CONTRACT}:{lines}: `{name}` is not declared in {HEADER}. "
               "The contract states guarantees in public terms: say what is "
               "guaranteed without naming the mechanism, or declare the name.")
-    for name in stale:
-        print(f"{BASELINE}: `{name}` is no longer a private name the contract "
-              "uses; remove it from the baseline.")
-    if not unknown and not stale:
-        n = len(used)
-        print(f"contract vocabulary: {n} names checked, "
-              f"{len(baseline)} still on the baseline")
+    if not unknown:
+        print(f"contract vocabulary: {len(used)} names checked")
         return 0
     return 1
 
