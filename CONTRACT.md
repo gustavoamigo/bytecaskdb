@@ -13,379 +13,112 @@ Plain language.
 
 ## Definitions
 
-**Visible**: a key-value pair is visible when a subsequent `get()`,
-`contains_key()`, or `snapshot()` can observe it.
+**Write**: a `put`, `del`, `del_range`, `apply_batch` or `ingest` call. A
+write is **acknowledged** when the call returns normally.
 
-**Durable**: a key-value pair is durable when it will survive a process
-crash and be present after recovery.
+**Sequence**: the number the engine assigns to every entry it appends,
+batch markers included. A write's sequence is the highest one it was
+assigned, reported in its `CommitResult`.
 
-**Degraded**: the engine has detected an internal state divergence that
-it cannot resolve on its own. Continuing to accept writes would risk
-persisting data that recovery would not reproduce. A degraded DB must
-refuse all write operations with a `DbDegraded` exception carrying a
-diagnostic reason. Read operations remain available — the in-memory
-state satisfies the **Degraded State Invariant** (below). The service
-calls `resume()` to attempt in-process recovery; on success the engine
-accepts writes again without a restart.
+**Visible**: a write is visible when a `get`, `contains_key`, `snapshot` or
+iterator taken after it can observe it.
 
-**Degraded State Invariant**: at the moment the engine enters a degraded
-state, the published in-memory state equals what recovery would produce
-from the current on-disk files. This is what makes reads safe during
-degradation. The invariant holds because every failure class that
-degrades the engine does so *without* publishing the failed transition:
+**Durable**: a write is durable when it survives a process crash or a
+power loss and is present after the next `open`. `durable_sequence()` is
+the highest sequence confirmed durable.
 
-- Classes B1, B2, B3 (append failures): the in-memory state is never
-  updated — `apply_writes` is not reached because the I/O threw first.
-- Class C (orphaned BulkBegin): same as B — the partial batch is never
-  applied to in-memory state.
-- Classes F, G (sync failures): bytes are in the page cache but the
-  key-directory changes are not published. `next_seq` advances to
-  prevent sequence reuse, but no key-value changes become visible. With
-  the commit pipeline a failed commit fdatasync (F) covers every writer
-  appended since the last successful flush: all of them receive the error
-  and none of their changes are published. `resume()` replays every valid
-  entry it finds in the active file, so a writer that received the error
-  can see its write persisted after recovery — true for the single batch
-  of class F before the pipeline, and now for every batch since the last
-  flush.
-- Class H (rotation failure): the write succeeded and was published, but
-  the rotation to a new file failed. The caller still receives the
-  exception, and the write is visible at once: this is the one failure a
-  caller can observe as both thrown and applied without `resume()`. The
-  published state is consistent with what recovery would find — the
-  committed entries are on disk.
+**Committed unit**: a standalone entry, or a batch from its `BulkBegin`
+through its `BulkEnd`. Recovery takes a unit whole or not at all.
 
-Therefore: the published state at degradation time corresponds only to
-fully-durable committed transitions, and reads against it are safe.
+**Recovery-equivalent**: the state readers see agrees with what `open` on
+the current files would produce.
 
-**Recovery-equivalent**: the in-memory state agrees with what opening
-a fresh DB from the current on-disk files would produce.
-
-**fdatasync trust assumption**: the engine trusts that a successful
-`fdatasync` return means all preceding writes are durable on the
-underlying storage device. On Linux, this trust is not fully earned in
-all configurations — the "fsyncgate" issue (PostgreSQL, 2018) showed
-that on some kernel/filesystem combinations, `fsync` can return success
-after an earlier async writeback error was consumed by another fd.
-PostgreSQL's response was to `PANIC` on any `fsync` error; RocksDB added
-`track_and_verify_wals_in_manifest`. ByteCaskDB does not implement
-writeback error tracking. This is a deliberate simplicity choice for an
-embedded engine targeting local storage — the assumption is stated here
-so that it can be revisited if the engine is deployed on storage
-configurations where it does not hold.
-
-**A failed `fdatasync`** is a different case, and is handled. Linux
-marks the pages a failed `fdatasync` covered clean without writing
-them, and a later `fdatasync` returns 0 without writing them either.
-Reads keep returning the bytes until the pages are evicted. So nothing
-is built from bytes whose durability is unknown until they are made
-durable: `resume()` rewrites the active file and syncs it before it
-scans it, and `DB::open` does the same for every hint-less data file
-before indexing it. What a read returns is written back to the same
-offsets and synced, so what is then published and indexed is on the
-device, relying on no more than the trust assumption above.
+**Degraded**: the engine has met a failure it will not write past. Every
+write throws `DbDegraded`, with the reason in `degraded_reason()`; reads,
+snapshots and iterators keep working, on a recovery-equivalent state.
+`resume()` recovers in process, and `open` after a restart recovers the
+same way. Degrading never publishes the write that failed, with one
+exception a caller can see: a write whose file rotation failed after the
+write itself was synced is applied, visible at once, and still thrown
+(*`apply_batch`*, Consistency).
 
 ---
 
 ## Conditions
 
-### Ranges
+What the engine assumes of its storage and requires of its caller. The
+guarantees in this document hold when these do.
 
-Every range `[from, to)` — `del_range` on `DB` and `WritePlan`,
-`ensure_range_unchanged`, `Snapshot::count_keys` — must have `from < to`.
-`from >= to` throws `std::invalid_argument` before anything is written or
-read; on a `WritePlan` the plan is left as it was. An empty or swapped range
-is refused rather than treated as nothing to do, since it is almost always
-swapped bounds and a write that silently does nothing hides the bug.
-Ingest and recovery still accept a range-delete entry with `from >= to`
-written before this rule: it deletes nothing.
-
-### Caller responsibility
-
-Vacuum must not run between `create_manifest()` and file transfer
-completion. Vacuum unlinks files by path; an in-progress file transfer
-(rsync, cp) would get ENOENT. Serializing vacuum with file transfer is
-the caller's responsibility.
+| Condition | What is required | If it does not hold | Proved by |
+|---|---|---|---|
+| **Storage keeps what it confirmed** | Bytes an `fdatasync` reported written stay as written, and so does a synced directory entry. A failed `fdatasync` is handled (*`apply_batch`*, I/O Failure Safety); one that reports success for bytes it did not write is not detected. | `open` and `resume()` recover what the device holds. Damage they can see is refused (*`open`*); damage shaped like a crash is not. | n/a: an assumption, not a behaviour |
+| **Ranges are non-empty** | Every `[from, to)` — `del_range` on `DB` and `WritePlan`, `ensure_range_unchanged`, `Snapshot::count_keys` — has `from < to`. | `std::invalid_argument` before anything is written or read; a `WritePlan` is left as it was. A range-delete entry with `from >= to` written before this rule still recovers, and deletes nothing. | "Ranges: from >= to is refused, before anything is written" |
+| **No vacuum during a manifest transfer** | `vacuum()` does not run between `create_manifest()` and the end of the file copy the manifest serves. | Vacuum unlinks files by path, so a copy in progress fails with `ENOENT`. Serialising the two is the caller's. | none |
 
 ---
 
 ## Engine-wide guarantees
 
-### Size preconditions
+### Limits
 
-All keys and values in the `WritePlan` must satisfy the size limits
-configured in `Options` (default: 4 KiB keys, 4 MiB values; hard
-ceiling: 65,535 bytes keys, 268,435,455 bytes values). Size validation
-happens at the `WritePlan` API boundary (`put`, `del`, `del_range`, guard
-methods) before any data is copied. `DB::put`, `DB::del`, and
-`DB::del_range` also validate before creating their internal
-`WritePlan`. A plan whose entries, batch markers included, come to more
-than `kMaxBatchBytes` (1 GiB) is refused by `apply_batch` before it joins a
-group. Violations throw `std::invalid_argument`.
+Every limit is checked before any I/O. Reaching one throws, leaves no
+byte in a data file and does not degrade the engine.
 
-### Hard limits
+| Limit | Value | Reached by | What happens | Proved by |
+|---|---|---|---|---|
+| Key size | `max_key_bytes` (default 4 KiB; ceiling 65,535 bytes) | a key or range bound in any write or guard | `std::invalid_argument` | "Size limits: put rejects oversized key", "Size limits: del rejects oversized key", "Size limits: del_range rejects oversized boundary", "Size limits: guard methods validate key size", "Size limits: WritePlan validates from snapshot limits" |
+| Value size | `max_value_bytes` (default 4 MiB; ceiling 268,435,455 bytes) | a value in any write | `std::invalid_argument` | "Size limits: put rejects oversized value" |
+| Option ceilings | `max_key_bytes` 65,535; `max_value_bytes` 268,435,455; `max_file_bytes` 3 GiB; `recovery_threads` at least 1 | `open` | `std::invalid_argument` before the directory is created or locked. `max_file_bytes = 0` is valid: every write seals the file it went into. | "Limits: open rejects options above the hard ceilings", "Options: recovery_threads = 0 is refused at open", "Options: max_file_bytes = 0 seals a file after every write" |
+| Bytes per write | 1 GiB, batch markers included | a `WritePlan`; an atomic batch in an `ingest` slice | `std::invalid_argument` | "Limits: a plan larger than the per-write byte limit is refused before any I/O", "Limits: ingest refuses an atomic batch past the per-write byte limit" |
+| File size | `max_file_bytes` | the active file reaching it | The file is sealed and a new one started. A write never spans two files, so a value larger than `max_file_bytes` gets a file of its own. Writers that commit together can carry a file past `max_file_bytes`, never past 4 GiB. | "Options: a value larger than max_file_bytes gets a file of its own", "Limits: a commit group ends before a slot that would carry the file past the group limit" |
+| File ids | 1,048,575 per process | every rotation, vacuum compaction and `resume()` takes one; `open` renumbers | A write that would need a new file throws `std::runtime_error` and appends nothing; smaller writes still commit. `vacuum()`, `resume()` and an `ingest` slice that needs a new file refuse the same way before touching a file, and `resume()` leaves the engine degraded. `open` refuses a directory with more data files than ids. | "Limits: the last file id is used, then a write that needs another is refused until a reopen", "Limits: ingest refuses a slice that needs a file id it does not have, before any I/O", "Limits: resume without a file id leaves the engine degraded and untouched" |
+| Sequence | 2^48 − 1 | `ingest` of a higher sequence; a leader's write after it | `ingest` throws `std::invalid_argument` for any entry above it, whatever its type. A write that would need a sequence above it throws `std::runtime_error` and appends nothing. At a million writes a second a leader reaches it after about 8.9 years. | "Limits: ingest takes the last packable sequence and refuses the next", "Limits: a KeyDirEntry packs each field at its ceiling and refuses one past" |
 
-Each limit is enforced before any I/O: reaching it never degrades the
-engine and never leaves bytes in a data file. Proved by the `[limits]`
-tests.
+### Sequences
 
-| Limit | Value | Reached by | What happens |
-|---|---|---|---|
-| Key size | 65,535 bytes (u16 on disk) | a key or range bound above `max_key_bytes` | `std::invalid_argument`. `open` refuses a `max_key_bytes` above the ceiling with `std::invalid_argument`. |
-| Value size | 268,435,455 bytes (28-bit packed) | a value above `max_value_bytes` | `std::invalid_argument`. `open` refuses a `max_value_bytes` above the ceiling with `std::invalid_argument`. |
-| Bytes per write | `kMaxBatchBytes`, 1 GiB | a `WritePlan`, or an atomic batch in an `ingest` slice | `std::invalid_argument`. |
-| File size | `kMaxFileBytes`, 3 GiB | `Options::max_file_bytes` | `open` refuses more with `std::invalid_argument`. A file is rotated once it reaches `max_file_bytes`, and a write never spans two files, so every entry starts below `max_file_bytes + kMaxBatchBytes`, inside the 32-bit packed offset. A commit group ends before a write that would carry the file past 2^32 bytes; the next group starts after the rotation. |
-| File ids | 1,048,575 (20-bit packed) per process | each rotation, vacuum compaction and `resume()` takes one; ids are given out from the directory at each `open` and never reused within a process | A write that would take the active file to `max_file_bytes` with no id left throws `std::runtime_error` and appends nothing; smaller writes, and the rest of its group, still commit. `vacuum`, `resume()` and an `ingest` slice that needs a new file refuse the same way before touching a file, and the engine's state is unchanged (`resume()` leaves it degraded). A reopen renumbers the files. `open` refuses a directory holding more than 1,048,575 data files. |
-| Sequence | 2^48 − 1 | `ingest` of a higher sequence; a leader write after it | `ingest` throws `std::invalid_argument` for any entry above the limit, whatever its type. A write that would need a sequence above it throws `std::runtime_error` and appends nothing; at a million writes a second, a leader reaches it after about 8.9 years. |
+| Guarantee | Proved by |
+|---|---|
+| Every entry appended, batch markers included, carries its own sequence, and sequences strictly increase in commit order within a process: a later write's sequence is above every earlier one's. | "CommitResult sequence is monotonic across write operations", "batch write covers marker sequences" |
+| A sequence is never reused, failure or not. After a write that threw, the next write's sequences lie above every sequence the failed one may have put in the file, so no two entries for one key ever share a sequence with different values. Gaps are normal, and nothing a caller sees depends on contiguity. | `[fault_sweep]`, "a write after a restart does not reuse a batch marker's sequence", "recovery refuses two different writes under one sequence" |
+| The highest sequence wins. For any key, the entry with the highest sequence is its state, across files and whichever order recovery reads them in. | `[model]`, "Causality survives recovery" |
+| After `open` or `resume()`, every new sequence is above every sequence on disk, those of failed writes included. | "apply_resume: advances next_seq past highest seen sequence", "a write after a restart does not reuse a batch marker's sequence" |
 
-### Sequence Numbers
+### Durable sequence
 
-Every append to disk must consume a sequence number from `next_seq`.
-Every entry written to disk — including `BulkBegin` and `BulkEnd`
-markers — must consume one sequence.
+`durable_sequence()` is the highest sequence confirmed durable.
 
-**On success**: `next_seq` in the published state must be advanced
-past all consumed sequences. Each `KeyDirEntry` in `key_dir` must record
-the sequence of its write.
+| Guarantee | Proved by |
+|---|---|
+| It never decreases while the engine runs. After `open` or `resume()` it equals the highest recovered sequence: every recovered entry is durable. | "durable_sequence correct after recovery", "durable_sequence correct after resume" |
+| It advances only once an `fdatasync` has confirmed every entry up to it, `sync = false` writes that landed before that sync included. Writes made with `sync = false` alone do not advance it. | "durable_sequence reflects sync writes", "durable_sequence stays at zero for nosync-only writes", "CommitResult nosync writer coalesced with sync writer is durable" |
+| A `sync = true` write is never visible before it is durable. | "class F: key not visible after commit sync failure", "class G: key not visible after rotation sync failure" |
+| A reader, local or a follower fed by `changes_since`, whose `durable_sequence()` is at or above a write's sequence sees every entry of that write. | `[prove_repl]`, "ingest sequence continuity: durable_sequence matches max ingested" |
+| `durable_sequence(min_sequence, timeout)` returns at once when `min_sequence` is 0, already reached, or `timeout` is not positive. Otherwise it waits until the durable sequence reaches `min_sequence`, the timeout passes or the DB closes, then returns the durable sequence. `std::chrono::milliseconds::max()` waits with no deadline. | "durable_sequence returns immediately for reached targets", "durable_sequence long-poll wakes on sync write", "durable_sequence long-poll times out on idle DB", "durable_sequence with no timeout returns an unreached target at once", "durable_sequence wakes a waiter when the DB closes", "Limits: durable_sequence waits with a timeout the clock cannot represent" |
 
-**On failure**: the local working copy of `next_seq` must be discarded
-along with the rest of the local state. The published `next_seq` must
-be unchanged — the engine must only publish new state after all I/O
-and mutations succeed. sequences consumed by the failed partial write are now
-on disk but not reflected in the published counter.
+### `CommitResult`
 
-**Must be true, always:**
+Every write that commits returns one; `del` and `apply_batch` return
+`std::optional<CommitResult>` and report `nullopt` for an absent key or a
+conflict. [`docs/commit_result_api_design.md`](docs/commit_result_api_design.md)
+has the API across the bindings.
 
-- **Monotonicity for new entries.** New entries appended to the active
-  file during `apply_batch` must always have a higher sequence
-  number than any previous new entry in the same file session. The
-  sequence must never go backwards or repeat for new writes.
+| Guarantee | Proved by |
+|---|---|
+| `sequence` is the highest sequence the write was assigned: the `BulkEnd` marker's for a batch of more than one operation. It is 0 when nothing was appended, as for an empty or guard-only plan. | "CommitResult sequence equals BulkEnd sequence for multi-op batch", "CommitResult empty plan returns durable zero sequence", "CommitResult guard-only plan returns durable zero sequence" |
+| `durable` is true when `fdatasync` confirmed the write before the call returned: always for `sync = true`; for `sync = false` when a sync writer in the same group, or a rotation, covered it. | "CommitResult sync write is durable", "CommitResult solo nosync write is not durable", "CommitResult nosync writer coalesced with sync writer is durable" |
+| A `sync = true` write that appends nothing still returns only once every earlier write is durable, so `apply_batch({.sync = true}, WritePlan{})` bounds what a crash can take from a caller that writes with `sync = false`. With `sync = false` it returns at once. If the `fdatasync` it waits for fails, the engine degrades. | "apply_batch: an empty sync plan makes earlier unsynced writes durable with one fdatasync", "apply_batch: a guard-only sync plan makes earlier unsynced writes durable", "apply_batch: an empty sync plan on a fresh DB does not sync", "apply_batch: an empty sync plan whose fdatasync fails degrades the engine" |
 
-- **Uniqueness per key.** Two entries for different logical writes
-  must not share a sequence number for the same key with different
-  values. Same key, same sequence, same value is harmless — it is a
-  duplicate of the same write and recovery handles it. Same key, same
-  sequence, different value is undefined behavior.
+### What the engine refuses
 
-- **next_seq strictly greater than all on-disk sequences.** `next_seq`
-  must always be greater than any sequence number that exists on disk.
-  A future write must never reuse an sequence already present on disk.
+Checks that run in every build, on every publication and at every `open`
+and `resume()`. They are a backstop: a violation means a bug, and the
+engine stops rather than publish it.
 
-- **next_seq advances past all consumed sequences.** If an append fails
-  (classes B1, B2, B3), `next_seq` must be advanced past all sequences consumed
-  by the failed call. Whether or not bytes reached disk is indeterminate from
-  userspace — POSIX does not guarantee that `writev = -1` means no bytes were
-  written (FUSE and network filesystems may write bytes and still return an
-  error). The engine always advances conservatively: gaps are safe, reuse is
-  not. If an append reaches disk but the subsequent `fdatasync` fails
-  (classes F and G), `next_seq` must likewise be advanced past all consumed
-  sequences. The bytes are in the page cache; reusing those sequences on the next write
-  would create ambiguous sequence numbers for the same key. Key-directory
-  changes are not published in these cases — the write is not visible to
-  callers. The engine degrades on F and G: `resume()` is required before
-  further writes are accepted. Gaps are safe. Reuse is not.
-
-- **Recovery produces the same next_seq as a clean run.** Given the
-  same committed writes, opening a fresh DB from disk must produce
-  `next_seq == max(all committed sequences) + 1`, regardless of
-  failed partial writes on disk.
-
-- **Markers consume their own sequences.** `BulkBegin` and `BulkEnd`
-  markers must each consume one sequence. A failed batch must not leave a marker
-  sequence that gets reused by a data entry in a subsequent write.
-
-- **No caller obligation for sequence safety.** The engine must guarantee
-  that after any failure, a subsequent `apply_batch` call with any
-  valid `WritePlan` will not produce sequence reuse. The caller must be
-  free to retry with any plan, modify the plan, or abandon it
-  entirely.
-
-**Gaps are safe, reuse is not.** Nothing in the engine requires sequence
-contiguity. All operations that depend on sequence comparison must use strict
-`<`, never equality for ordering or arithmetic on gaps. Duplicate
-sequences are the actual risk.
-
-### Durable Sequence (`durable_seq`)
-
-`durable_seq` tracks the highest sequence number confirmed by `fdatasync`.
-It is a field on `EngineState`, updated through the normal transient →
-persistent → `store_state` path via `TransientEngineState::apply_sync`.
-
-**Must be true, always:**
-
-- **Monotonicity.** `durable_seq` must never regress. Enforced by
-  `store_state` (same check as `next_seq`, `active_file_id`,
-  `next_file_id`).
-
-- **Only advanced after successful fdatasync.** `durable_seq` advances
-  only after `file.sync()` returns successfully — in `flush_pending`,
-  which publishes the prepared head it captured before the fdatasync
-  with `durable_seq = next_seq - 1`, or through `apply_sync` on the
-  rotation and ingest paths. If sync fails (classes F, G), the published
-  `durable_seq` is unchanged.
-
-- **Covers every entry appended before the fdatasync.** A flush covers
-  the prepared head as it stood when the flush started: every batch
-  appended since the previous flush, including nosync entries, is
-  covered by the single `fdatasync`. Entries appended while the fdatasync
-  was in flight are not claimed; the next flush covers them.
-
-- **Never published ahead of its sync requests.** Every published state
-  satisfies `durable_seq >= sync_requested_seq`, where
-  `sync_requested_seq` is the highest sequence written by a `sync=true`
-  slot. Enforced by `store_state`; a violation degrades the engine.
-
-- **Recovery sets `durable_seq = next_seq - 1`.** Every recovered entry
-  is durable: sealed files were synced before they were sealed, and a
-  file whose durability is unknown — a hint-less file at open, the active
-  file at `resume()` — is rewritten and synced before it is read. After
-  `DB::open()` and `resume()`, `durable_seq` reflects the full recovered
-  state.
-
-- **NoSync-only writes do not advance `durable_seq`.** If the prepared
-  head owes no fdatasync, `flush_pending` publishes it with the previous
-  `durable_seq` unchanged.
-
-`durable_sequence(min_sequence, timeout)` exposes `durable_seq` to callers
-(renamed from `current_sequence` — BC-231; no compatibility alias remains).
-`min_sequence = 0`, an already-reached target, or a nonpositive `timeout`
-return the current watermark immediately without blocking. Otherwise it
-blocks on `durable_cv_` until `durable_seq >= min_sequence` or the timeout
-expires, then returns the watermark. A timeout longer than the steady
-clock can represent from now, such as `milliseconds::max()`, waits with no
-deadline. The condvar notification is
-centralized in `store_state` — one place, one check.
-
-Every committed write (`put`, `del`, `del_range`, `apply_batch`) returns a
-`CommitResult{sequence, durable}` (`std::optional<CommitResult>` for `del`
-and `apply_batch`, which can report `nullopt` on an absent key or a
-conflict). `sequence` is the highest sequence assigned to the write (the
-`BulkEnd` marker's sequence for a multi-op batch); `0` means nothing was
-written (empty plan or guard-only plan) —
-`durable` is always `true` in that case. Such a write with `sync=true` still
-returns only once every earlier write is durable: if an earlier `sync=false`
-write left the active file unsynced, it waits for an `fdatasync` covering
-it, coalesced with group commit like any synced write. So
-`apply_batch({.sync = true}, WritePlan{})` is how a caller that writes with
-`sync=false` bounds what an OS crash can lose. With `sync=false` it returns
-at once. `durable` reports whether
-`fdatasync` confirmed the write before return: always `true` for
-`sync=true`, and possibly `true` for `sync=false` writes coalesced with a
-sync writer in the same group-commit batch or a rotation sync. A reader —
-local or follower — whose `durable_sequence() >= sequence` is guaranteed to
-see every entry of that write. See
-[`docs/commit_result_api_design.md`](docs/commit_result_api_design.md) for
-the full contract.
-
-### `FileStats` sequence bounds
-
-`FileStats::min_sequence` and `max_sequence` track the lowest and highest
-sequence numbers of entries written to each file.
-
-#### Invariants
-
-- Both are zero (no entries) or both are non-zero. A state where one is
-  zero and the other is not is a consistency violation.
-- When both are non-zero: `min_sequence <= max_sequence`.
-- These invariants are enforced by `validate_state_consistency` on every
-  state transition.
-
-#### Tracking
-
-Sequence bounds are updated in every path that writes entries:
-
-- `apply_writes`: captures the batch's start and end sequence.
-- `vacuum_scan_and_copy`: tracks sequences of all entries copied to the
-  destination file, including `BulkBegin`/`BulkEnd` markers.
-- `apply_vacuum`: propagates scan bounds to the compacted file's `FileStats`.
-- `apply_resume`: resets bounds on truncation, then rebuilds from the
-  committed entries.
-- Recovery (serial and parallel): tracks bounds per file during hint
-  replay.
-
-### Runtime Invariant Enforcement
-
-The engine validates structural invariants at runtime, not just in
-tests. Violations are detected before corrupted state becomes visible
-to readers.
-
-#### Hot-path checks (every state publication, always on)
-
-`store_state` compares old and new `EngineState` before publishing:
-
-| Invariant | Rationale |
-|-----------|-----------|
-| `next_seq` must not regress | Prevents sequence reuse (§Sequence Numbers). |
-| `active_file_id` must not regress | File IDs are monotonically assigned; rotation only moves forward. |
-| `next_file_id` must not regress | Same monotonicity as `active_file_id`. |
-| `durable_seq` must not regress | Confirmed-durable sequences cannot un-sync. |
-
-On violation: the engine degrades (publishes nothing, writes blocked,
-reads remain available). Cost: three integer comparisons per write.
-
-#### Hot-path checks (debug builds only)
-
-Under `NDEBUG=0`, `store_state` additionally walks the key directory
-to verify `next_seq > max(all key_dir sequences)`. This is O(n) and
-too expensive for release builds.
-
-#### Cold-path checks (open, resume — always on)
-
-`validate_state_consistency` runs the full structural check on the
-published state after `DB::open()` and `resume()`. The O(n) key
-directory walk is too expensive for release builds, so the invariants
-that need it run in test builds only:
-
-| Invariant | Cost | Build |
-|-----------|------|-------|
-| Active file exists in files registry | O(1) | always |
-| `sync_requested_seq <= durable_seq` | O(1) | always |
-| `file_stats` covers all files | O(f) | always |
-| `min_sequence` / `max_sequence` coherence | O(f) | always |
-| No dangling file references in key_dir | O(n) | test builds |
-| `next_seq > max(all key_dir sequences)` | O(n) | test builds |
-| `live_bytes` matches key_dir | O(n) | test builds |
-| Every entry lies inside its file's committed extent (**P**) | O(n) | test builds |
-
-The same containment check runs in `store_state`'s debug walk, so it
-covers every publication — rotation and vacuum included — not only the
-two cold paths. There a key whose file has no `file_stats` entry is a
-violation too: the cold path rules it out by checking that `file_stats`
-covers every file first, and the walk has no such check before it.
-
-P is the invariant the mmap read path depends on — see *Offset
-containment* under **View and span lifetimes**. It is checked after
-`resume()` specifically because `resume()` is the operation that
-shortens a file that published offsets point into. It holds in release
-builds too, where this check does not run: `resume()` refuses before
-truncating below the published extent, so it can only ever cut bytes no
-published offset addresses.
-
-On violation: throws `std::runtime_error`. The DB does not open or
-`resume()` fails. This is intentional — if recovery produces
-inconsistent state, the engine should not run.
-
-#### Fatal invariants (always on, in release builds too)
-
-**A writable data file must never be created under a name this database
-has already used**, either as `<stem>.data` or as `<stem>.hint`. Reusing
-one would append past a sealed file's end, and those entries would be
-invisible to recovery, because hint generation skips a file whose hint
-already exists. The engine checks this on every data file creation
-(`O_EXCL`) and on vacuum's final placement (which claims the name
-atomically rather than replacing it).
-
-A violation is not an I/O failure and is not degradable: it aborts the
-process rather than degrading. Degrading would be caught by the write
-path, which calls `resume()`, which mints a fresh stem and continues —
-recovering from the symptom while the broken generator that caused it
-stays broken. It is also not reachable by chance: stems carry a 64-bit
-salt drawn per file, so a repeat within one timestamp second is ~1e-13
-at 2,000 files. Reaching this check means the generator itself is
-broken, which no retry fixes.
-
-This is the only class of failure that terminates the process. Every
-other failure either throws or degrades, per the sections above.
+| Refused | What happens | Proved by |
+|---|---|---|
+| A publication that would move a sequence, a file id or the durable sequence backwards, or make a `sync = true` write visible before it is durable. | Not published; the engine degrades, and reads keep the previous state. | none |
+| A recovered state, after `open` or `resume()`, whose active file is missing, that owes an `fdatasync`, or whose per-file accounting misses a file or holds incoherent sequence bounds. | `std::runtime_error`: `open` fails; `resume()` fails and the engine stays degraded. | none |
+| A data file created under a name this database has used before, as a data or a hint file. | The process aborts. This is the only failure that ends the process; every other one throws or degrades. | "createDataFileForWrite panics when the data file already exists", "createDataFileForWrite panics when the stem was already hinted", "renameDataFileExclusive panics rather than replacing a live file" |
 
 ---
 
@@ -586,7 +319,7 @@ Applies pre-sequenced entries from a leader to a follower's storage.
 | **Mode requirement** | Throws `std::logic_error` if `mode() != Mode::Follower`. |
 | **Degraded check** | Throws `DbDegraded` if the engine is degraded. |
 | **Idempotency** | Entries with `sequence <= durable_seq` are silently skipped. Safe for restart-on-failure semantics. |
-| **Limits** | Checked before any I/O, and nothing is written on a refusal: a key or value over the configured size limit, a sequence above 2^48 − 1, or an atomic batch over `kMaxBatchBytes` throws `std::invalid_argument`; a slice that needs more new files than there are file ids left throws `std::runtime_error`. See *Hard limits*. |
+| **Limits** | Checked before any I/O, and nothing is written on a refusal: a key or value over the configured size limit, a sequence above 2^48 − 1, or an atomic batch over `kMaxBatchBytes` throws `std::invalid_argument`; a slice that needs more new files than there are file ids left throws `std::runtime_error`. See *Limits*. |
 | **Batch-safe rotation** | `BulkBegin`/`BulkEnd` pairs always land in the same data file. File rotation only occurs at boundaries where no batch is open. |
 | **Durability** | Every chunk is `fdatasync`'d before rotation. The final chunk is `fdatasync`'d before `store_state` publishes. |
 | **Sequence advancement** | After ingest, `next_seq = max(next_seq, max(ingested sequences) + 1)`. Monotonically non-decreasing. |
@@ -873,7 +606,7 @@ its promises, and refuses any other. Proved by the `[recovery]` tests.
 | **Only the active file is cut** | Every other file was synced whole before the next was started, so a crash can tear only the file being written. `open` cuts that file at its last committed record — whole, if its first page was lost — and syncs the cut. A tail of zeros, preallocated space, is trimmed in any file. |
 | **Damage is refused** | A state no crash can leave on such storage is damage. Where `open` can see it, it throws and cuts nothing: data past the last committed record in a file that is not the newest, such data in more than one file, two files sharing sequences other than an interrupted vacuum's pair. `open` does not open a best-effort subset of a damaged database: to the caller that is data loss with no error. |
 | **Damage that cannot be seen** | Damage that leaves exactly what a crash would is outside this contract: `open` cannot refuse what it cannot tell from a torn write. `docs/bytecask_design.md`, *Recovering a Hint-less File*, lists the known shapes. |
-| **Options** | `max_key_bytes`, `max_value_bytes` or `max_file_bytes` above its hard ceiling (see *Hard limits*), or `recovery_threads = 0`, throws `std::invalid_argument` before the directory is created or locked. `max_file_bytes = 0` is valid: every write seals the file it went into. |
+| **Options** | `max_key_bytes`, `max_value_bytes` or `max_file_bytes` above its hard ceiling (see *Limits*), or `recovery_threads = 0`, throws `std::invalid_argument` before the directory is created or locked. `max_file_bytes = 0` is valid: every write seals the file it went into. |
 | **Hint files** | A hint is a rebuildable index. One that fails its CRC, or that a read fails on, is rebuilt from its data file and costs no keys. |
 | **`fail_recovery_on_crc_errors = false`** | The operator's explicit opt-out from refusal, for one case: a data file whose hint is bad and that cannot be rescanned is skipped with a warning on stderr, and the database opens without its keys. It does not relax the rules on cutting above. |
 
