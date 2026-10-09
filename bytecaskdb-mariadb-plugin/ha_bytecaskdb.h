@@ -282,7 +282,7 @@ private:
   // The table's row and key layout, read from its Fields once in open().
   TableCodec codec_;
 
-  // Scratch buffer for decode_pk() to avoid per-row heap allocation.
+  // Scratch buffer for decode_pk() when a duplicate-key error names the row.
   std::vector<uint8_t> decode_pk_scratch_;
 
   // Reused across secondary-index row lookups to avoid per-row allocation.

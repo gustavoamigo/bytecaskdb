@@ -943,9 +943,8 @@ int ha_bytecaskdb::rnd_next(uchar *buf) {
     return HA_ERR_END_OF_FILE;
   }
 
-  decode_pk(table, codec_, merge_scan_->key_data(), merge_scan_->key_len(), buf,
-            decode_pk_scratch_);
-
+  // The value holds every column, the primary key's too, and decode_row
+  // writes them all: nothing needs restoring from the key.
   merge_scan_->swap_value(row_value_buf_);
   decode_row(codec_.row,
              reinterpret_cast<const uint8_t *>(row_value_buf_.data()),
@@ -1357,9 +1356,8 @@ int ha_bytecaskdb::index_read_current(uchar *buf) {
   }
 
   if (active_index == table->s->primary_key) {
-    // Primary key access: key is encoded PK, value is row data
-    decode_pk(table, codec_, merge_index_->key_data(), merge_index_->key_len(), buf,
-              decode_pk_scratch_);
+    // Primary key access: key is encoded PK, value is row data. The value
+    // holds every column, the primary key's too.
     merge_index_->swap_value(row_value_buf_);
     decode_row(codec_.row,
                reinterpret_cast<const uint8_t *>(row_value_buf_.data()),
@@ -1448,8 +1446,6 @@ int ha_bytecaskdb::rnd_pos(uchar *buf, uchar *pos) {
   int found = txn->get(pos, ref_length, row_value_buf_);
   if (found < 0) { return HA_ERR_GENERIC; }
   if (found == 0) { return HA_ERR_KEY_NOT_FOUND; }
-
-  decode_pk(table, codec_, pos, ref_length, buf, decode_pk_scratch_);
 
   decode_row(codec_.row,
              reinterpret_cast<const uint8_t *>(row_value_buf_.data()),
