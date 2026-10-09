@@ -53,7 +53,8 @@ uint64_t read_be64(const uint8_t *p) {
   return v;
 }
 
-void encode_pk_into(std::vector<uint8_t> &out, TABLE *table, const uchar *buf,
+void encode_pk_into(std::vector<uint8_t> &out, TABLE *table,
+                    [[maybe_unused]] const TableCodec &codec, const uchar *buf,
                     uint32_t table_id, uint64_t synthetic_rowid) {
   const uint pk_idx = table->s->primary_key;
   const uint suffix_len = pk_suffix_length(table);
@@ -73,17 +74,17 @@ void encode_pk_into(std::vector<uint8_t> &out, TABLE *table, const uchar *buf,
              &table->key_info[pk_idx],
              suffix_len);
 #ifndef BYTECASKDB_TESTS
-    normalize_padspace_pk(out.data() + 5, &table->key_info[pk_idx]);
-    make_mem_comparable(out.data() + 5, &table->key_info[pk_idx], suffix_len);
+    normalize_padspace_pk(out.data() + 5, codec.keys[pk_idx]);
+    make_mem_comparable(out.data() + 5, codec.keys[pk_idx], suffix_len);
 #endif
   }
 }
 
-std::vector<uint8_t> encode_pk(TABLE *table, const uchar *buf,
-                                uint32_t table_id,
+std::vector<uint8_t> encode_pk(TABLE *table, const TableCodec &codec,
+                                const uchar *buf, uint32_t table_id,
                                 uint64_t synthetic_rowid) {
   std::vector<uint8_t> key;
-  encode_pk_into(key, table, buf, table_id, synthetic_rowid);
+  encode_pk_into(key, table, codec, buf, table_id, synthetic_rowid);
   return key;
 }
 
@@ -94,8 +95,8 @@ uint pk_suffix_length(TABLE *table) {
   return table->key_info[table->s->primary_key].key_length;
 }
 
-void decode_pk(TABLE *table, const uint8_t *key, std::size_t key_len,
-               uchar *buf, std::vector<uint8_t> &scratch) {
+void decode_pk(TABLE *table, [[maybe_unused]] const TableCodec &codec, const uint8_t *key,
+               std::size_t key_len, uchar *buf, std::vector<uint8_t> &scratch) {
   const uint pk_idx = table->s->primary_key;
   if (pk_idx == MAX_KEY || key_len <= 5) {
     return;
@@ -105,7 +106,7 @@ void decode_pk(TABLE *table, const uint8_t *key, std::size_t key_len,
   uint pk_len = static_cast<uint>(key_len - 5);
   scratch.assign(key + 5, key + key_len);
 #ifndef BYTECASKDB_TESTS
-  undo_mem_comparable(scratch.data(), &table->key_info[pk_idx], pk_len);
+  undo_mem_comparable(scratch.data(), codec.keys[pk_idx], pk_len);
 #endif
   key_restore(buf, scratch.data(), &table->key_info[pk_idx], pk_len);
 }
@@ -134,39 +135,27 @@ std::vector<uint8_t> table_id_upper_bound(uint32_t table_id) {
   return bound;
 }
 
-#ifndef BYTECASKDB_TESTS
 // Fix VARCHAR key encoding by removing the 2-byte LE length prefix that key_copy()
 // inserts (HA_KEY_BLOB_LENGTH = 2).  After stripping, the slot holds raw data
 // left-justified with zero padding, giving correct lexicographic ordering.
 // For PAD SPACE collations, trailing spaces are stripped before zero-padding
 // so that 'a' and 'a ' produce identical keys (SQL standard comparison semantics).
-// Only compiled when full MariaDB headers are available (not in test builds).
-void fix_varchar_key_encoding(uint8_t *key_data, TABLE *table, uint active_index) {
-  const KEY &key_info = table->key_info[active_index];
+void fix_varchar_key_encoding(uint8_t *key_data, const KeyPlan &plan) {
   uint8_t *key_ptr = key_data;
-
-  for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
-    const KEY_PART_INFO &kp = key_info.key_part[i];
-    Field *field = table->field[kp.fieldnr - 1];
-
-    if (field->type() == MYSQL_TYPE_VARCHAR ||
-        (kp.key_part_flag & HA_BLOB_PART)) {
-      uint null_off = (kp.null_bit) ? 1 : 0;
+  for (const auto &kp : plan.parts) {
+    if (kp.varlen) {
+      uint null_off = kp.nullable ? 1 : 0;
       uint16_t length = static_cast<uint16_t>(key_ptr[null_off]) |
                         (static_cast<uint16_t>(key_ptr[null_off + 1]) << 8);
-      if (length > kp.length) length = kp.length;
-
+      if (length > kp.length) length = static_cast<uint16_t>(kp.length);
       std::memmove(key_ptr + null_off, key_ptr + null_off + HA_KEY_BLOB_LENGTH, length);
-
       // PAD SPACE: strip trailing 0x20 so 'a' == 'a ' under default collations.
-      if (!(field->charset()->state & MY_CS_NOPAD)) {
+      if (kp.pad_space) {
         while (length > 0 && key_ptr[null_off + length - 1] == 0x20)
           --length;
       }
-
       std::memset(key_ptr + null_off + length, 0, kp.store_length - null_off - length);
     }
-
     key_ptr += kp.store_length;
   }
 }
@@ -175,17 +164,14 @@ void fix_varchar_key_encoding(uint8_t *key_data, TABLE *table, uint active_index
 // PK format keeps the 2-byte LE length prefix (unlike fix_varchar_key_encoding
 // which strips it). This function trims trailing 0x20 bytes and updates the
 // length prefix so 'a' and 'a ' produce identical PK keys.
-void normalize_padspace_pk(uint8_t *key_data, const KEY *key_info) {
+void normalize_padspace_pk(uint8_t *key_data, const KeyPlan &plan) {
   uint8_t *p = key_data;
-  for (uint i = 0; i < key_info->user_defined_key_parts; ++i) {
-    const KEY_PART_INFO &kp = key_info->key_part[i];
-    Field *field = kp.field;
-    if (field->type() == MYSQL_TYPE_VARCHAR &&
-        !(field->charset()->state & MY_CS_NOPAD)) {
-      uint null_off = (kp.null_bit) ? 1 : 0;
+  for (const auto &kp : plan.parts) {
+    if (kp.varchar && kp.pad_space) {
+      uint null_off = kp.nullable ? 1 : 0;
       uint16_t length = static_cast<uint16_t>(p[null_off]) |
                         (static_cast<uint16_t>(p[null_off + 1]) << 8);
-      if (length > kp.length) length = kp.length;
+      if (length > kp.length) length = static_cast<uint16_t>(kp.length);
       while (length > 0 && p[null_off + 2 + length - 1] == 0x20)
         --length;
       // Update the 2-byte LE length prefix.
@@ -198,9 +184,9 @@ void normalize_padspace_pk(uint8_t *key_data, const KEY *key_info) {
     p += kp.store_length;
   }
 }
-#endif
 
-void encode_sec_key_into(std::vector<uint8_t> &out, TABLE *table, const uchar *buf,
+void encode_sec_key_into(std::vector<uint8_t> &out, TABLE *table,
+                          [[maybe_unused]] const TableCodec &codec, const uchar *buf,
                           uint32_t table_id, uint16_t index_id,
                           uint active_index,
                           uint64_t synthetic_rowid) {
@@ -225,8 +211,8 @@ void encode_sec_key_into(std::vector<uint8_t> &out, TABLE *table, const uchar *b
 
   // Post-process to fix VARCHAR length prefix issue for lexicographic ordering
 #ifndef BYTECASKDB_TESTS
-  fix_varchar_key_encoding(out.data() + 7, table, active_index);
-  make_mem_comparable(out.data() + 7, &key_info, sec_key_len);
+  fix_varchar_key_encoding(out.data() + 7, codec.keys[active_index]);
+  make_mem_comparable(out.data() + 7, codec.keys[active_index], sec_key_len);
 #endif
 
   // Append PK bytes for uniqueness, or synthetic rowid for PK-less tables.
@@ -238,20 +224,20 @@ void encode_sec_key_into(std::vector<uint8_t> &out, TABLE *table, const uchar *b
              &table->key_info[table->s->primary_key],
              suffix_len);
 #ifndef BYTECASKDB_TESTS
-    normalize_padspace_pk(out.data() + 7 + sec_key_len,
-                          &table->key_info[table->s->primary_key]);
-    make_mem_comparable(out.data() + 7 + sec_key_len,
-                        &table->key_info[table->s->primary_key], suffix_len);
+    const KeyPlan &pk_plan = codec.keys[table->s->primary_key];
+    normalize_padspace_pk(out.data() + 7 + sec_key_len, pk_plan);
+    make_mem_comparable(out.data() + 7 + sec_key_len, pk_plan, suffix_len);
 #endif
   }
 }
 
-std::vector<uint8_t> encode_sec_key(TABLE *table, const uchar *buf,
+std::vector<uint8_t> encode_sec_key(TABLE *table, const TableCodec &codec,
+                                     const uchar *buf,
                                      uint32_t table_id, uint16_t index_id,
                                      uint active_index,
                                      uint64_t synthetic_rowid) {
   std::vector<uint8_t> key;
-  encode_sec_key_into(key, table, buf, table_id, index_id, active_index,
+  encode_sec_key_into(key, table, codec, buf, table_id, index_id, active_index,
                        synthetic_rowid);
   return key;
 }
@@ -299,7 +285,8 @@ bool key_belongs_to_index(const uint8_t *key, std::size_t len,
 }
 
 void encode_unique_sec_key_into(std::vector<uint8_t> &out,
-                                 TABLE *table, const uchar *buf,
+                                 TABLE *table, [[maybe_unused]] const TableCodec &codec,
+                                 const uchar *buf,
                                  uint32_t table_id, uint16_t index_id,
                                  uint active_index) {
   const KEY &key_info = table->key_info[active_index];
@@ -322,20 +309,21 @@ void encode_unique_sec_key_into(std::vector<uint8_t> &out,
 
   // Fix VARCHAR encoding to match the format used by encode_sec_key.
 #ifndef BYTECASKDB_TESTS
-  fix_varchar_key_encoding(out.data() + 7, table, active_index);
-  make_mem_comparable(out.data() + 7, &key_info, sec_key_len);
+  fix_varchar_key_encoding(out.data() + 7, codec.keys[active_index]);
+  make_mem_comparable(out.data() + 7, codec.keys[active_index], sec_key_len);
 #endif
 }
 
-std::vector<uint8_t> encode_unique_sec_key(TABLE *table, const uchar *buf,
+std::vector<uint8_t> encode_unique_sec_key(TABLE *table,
+                                            const TableCodec &codec,
+                                            const uchar *buf,
                                             uint32_t table_id, uint16_t index_id,
                                             uint active_index) {
   std::vector<uint8_t> key;
-  encode_unique_sec_key_into(key, table, buf, table_id, index_id, active_index);
+  encode_unique_sec_key_into(key, table, codec, buf, table_id, index_id,
+                             active_index);
   return key;
 }
-
-#ifndef BYTECASKDB_TESTS
 
 namespace {
 
@@ -375,34 +363,63 @@ bool is_float_type(enum_field_types t) {
 // DATETIME2, TIMESTAMP2, TIME2 store data big-endian in key_copy() output.
 // field->type() returns the old enum (MYSQL_TYPE_DATETIME etc.) so we must
 // check real_type() to avoid reversing already-correct BE bytes.
-bool is_new_temporal_be(Field *field) {
-  auto rt = field->real_type();
+bool is_new_temporal_be(enum_field_types rt) {
   return rt == MYSQL_TYPE_DATETIME2 ||
          rt == MYSQL_TYPE_TIMESTAMP2 ||
          rt == MYSQL_TYPE_TIME2;
 }
 
-bool needs_byte_reversal(Field *field) {
-  if (is_new_temporal_be(field)) return false;
-  auto t = field->real_type();
-  return is_signed_integer_type(t) || is_unsigned_le_fixed_type(t) || is_float_type(t);
+KeyPartPlan make_key_part_plan(TABLE *table, const KEY_PART_INFO &kp) {
+  Field *field = kp.field;
+  KeyPartPlan p;
+  p.store_length = kp.store_length;
+  p.length = kp.length;
+  p.record_offset = static_cast<uint32_t>(field->ptr - table->record[0]);
+  p.nullable = kp.null_bit != 0;
+  p.varchar = field->type() == MYSQL_TYPE_VARCHAR;
+  p.varlen = p.varchar || (kp.key_part_flag & HA_BLOB_PART);
+  if (p.varlen) {
+    const CHARSET_INFO *cs = field->charset();
+    p.pad_space = cs != nullptr && !(cs->state & MY_CS_NOPAD);
+  }
+  const auto rt = field->real_type();
+  p.be_temporal = is_new_temporal_be(rt);
+  p.reverse = !p.be_temporal && (is_signed_integer_type(rt) ||
+                                 is_unsigned_le_fixed_type(rt) ||
+                                 is_float_type(rt));
+  if (is_signed_integer_type(field->type()) && !field->is_unsigned()) {
+    p.flip = KeyPartPlan::Flip::kSign;
+  } else if (is_float_type(rt)) {
+    p.flip = KeyPartPlan::Flip::kFloat;
+  }
+  return p;
 }
 
 } // namespace
 
-void make_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len) {
+TableCodec make_table_codec(TABLE *table) {
+  TableCodec codec;
+  codec.row = make_row_plan(table);
+  codec.keys.resize(table->s->keys);
+  for (uint k = 0; k < table->s->keys; ++k) {
+    const KEY &key = table->key_info[k];
+    auto &parts = codec.keys[k].parts;
+    parts.reserve(key.user_defined_key_parts);
+    for (uint i = 0; i < key.user_defined_key_parts; ++i) {
+      parts.push_back(make_key_part_plan(table, key.key_part[i]));
+    }
+  }
+  return codec;
+}
+
+void make_mem_comparable(uint8_t *key_data, const KeyPlan &plan, uint key_len) {
   uint8_t *p = key_data;
   uint8_t *end = key_data + key_len;
 
-  for (uint i = 0; i < key_info->user_defined_key_parts && p < end; ++i) {
-    const KEY_PART_INFO &kp = key_info->key_part[i];
-    Field *field = kp.field;
-
-    bool is_varlen = (field->type() == MYSQL_TYPE_VARCHAR ||
-                      (kp.key_part_flag & HA_BLOB_PART));
-    if (is_varlen) {
-      uint null_bytes = (kp.null_bit) ? 1 : 0;
-      if (null_bytes > 0) {
+  for (const auto &kp : plan.parts) {
+    if (p >= end) break;
+    if (kp.varlen) {
+      if (kp.nullable) {
         p[0] ^= 0x01;
       }
       p += kp.store_length;
@@ -412,13 +429,13 @@ void make_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len) {
     uint null_bytes = kp.store_length - kp.length;
     bool is_not_null = (null_bytes == 0 || p[0] == 0);
 
-    if (is_not_null && needs_byte_reversal(field)) {
+    if (is_not_null && kp.reverse) {
       uint8_t *data = p + null_bytes;
       uint len = kp.length;
       std::reverse(data, data + len);
-      if (is_signed_integer_type(field->type()) && !field->is_unsigned()) {
+      if (kp.flip == KeyPartPlan::Flip::kSign) {
         data[0] ^= 0x80;
-      } else if (is_float_type(field->real_type())) {
+      } else if (kp.flip == KeyPartPlan::Flip::kFloat) {
         // IEEE 754: if sign bit set (negative), flip all bits;
         // if sign bit clear (positive/zero), flip only the sign bit.
         if (data[0] & 0x80) {
@@ -437,19 +454,14 @@ void make_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len) {
   }
 }
 
-void undo_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len) {
+void undo_mem_comparable(uint8_t *key_data, const KeyPlan &plan, uint key_len) {
   uint8_t *p = key_data;
   uint8_t *end = key_data + key_len;
 
-  for (uint i = 0; i < key_info->user_defined_key_parts && p < end; ++i) {
-    const KEY_PART_INFO &kp = key_info->key_part[i];
-    Field *field = kp.field;
-
-    bool is_varlen = (field->type() == MYSQL_TYPE_VARCHAR ||
-                      (kp.key_part_flag & HA_BLOB_PART));
-    if (is_varlen) {
-      uint null_bytes = (kp.null_bit) ? 1 : 0;
-      if (null_bytes > 0) {
+  for (const auto &kp : plan.parts) {
+    if (p >= end) break;
+    if (kp.varlen) {
+      if (kp.nullable) {
         p[0] ^= 0x01;
       }
       p += kp.store_length;
@@ -464,12 +476,12 @@ void undo_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len) {
 
     bool is_not_null = (null_bytes == 0 || p[0] == 0);
 
-    if (is_not_null && needs_byte_reversal(field)) {
+    if (is_not_null && kp.reverse) {
       uint8_t *data = p + null_bytes;
       uint len = kp.length;
-      if (is_signed_integer_type(field->type()) && !field->is_unsigned()) {
+      if (kp.flip == KeyPartPlan::Flip::kSign) {
         data[0] ^= 0x80;
-      } else if (is_float_type(field->real_type())) {
+      } else if (kp.flip == KeyPartPlan::Flip::kFloat) {
         // Undo IEEE 754: if sign bit set (was positive), flip only sign bit;
         // if sign bit clear (was negative), flip all bits.
         if (data[0] & 0x80) {
@@ -485,7 +497,7 @@ void undo_mem_comparable(uint8_t *key_data, const KEY *key_info, uint key_len) {
   }
 }
 
-bool decode_sec_key_into_record(TABLE *table, const KEY *key_info,
+bool decode_sec_key_into_record(const KeyPlan &plan,
                                  const uint8_t *sec_key, std::size_t sec_key_len,
                                  uchar *record) {
   // Skip the 7-byte [ns | tid | iid] prefix.
@@ -493,27 +505,11 @@ bool decode_sec_key_into_record(TABLE *table, const KEY *key_info,
   const uint8_t *p   = sec_key + 7;
   const uint8_t *end = sec_key + sec_key_len;
 
-  for (uint i = 0; i < key_info->user_defined_key_parts; ++i) {
-    const KEY_PART_INFO &kp = key_info->key_part[i];
-    Field *field = kp.field;
-
+  for (const auto &kp : plan.parts) {
     // Bail on anything that's not a non-null fixed-width type we know how
     // to reverse cleanly. The caller falls back to the full row fetch.
-    if (kp.null_bit) return false;
-    if (field->type() == MYSQL_TYPE_VARCHAR ||
-        (kp.key_part_flag & HA_BLOB_PART)) {
-      return false;
-    }
-    auto rt = field->real_type();
-    bool is_be_temporal = (rt == MYSQL_TYPE_DATETIME2 ||
-                            rt == MYSQL_TYPE_TIMESTAMP2 ||
-                            rt == MYSQL_TYPE_TIME2);
-    if (!is_be_temporal &&
-        !is_signed_integer_type(rt) &&
-        !is_unsigned_le_fixed_type(rt) &&
-        !is_float_type(rt)) {
-      return false;
-    }
+    if (kp.nullable || kp.varlen) return false;
+    if (!kp.be_temporal && !kp.reverse) return false;
 
     if (kp.store_length != kp.length) return false;  // unexpected null padding
     if (p + kp.length > end) return false;
@@ -523,10 +519,10 @@ bool decode_sec_key_into_record(TABLE *table, const KEY *key_info,
     if (kp.length > sizeof(tmp)) return false;
     std::memcpy(tmp, p, kp.length);
 
-    if (!is_be_temporal) {
-      if (is_signed_integer_type(rt) && !field->is_unsigned()) {
+    if (kp.reverse) {
+      if (kp.flip == KeyPartPlan::Flip::kSign) {
         tmp[0] ^= 0x80;
-      } else if (is_float_type(rt)) {
+      } else if (kp.flip == KeyPartPlan::Flip::kFloat) {
         if (tmp[0] & 0x80) {
           tmp[0] ^= 0x80;
         } else {
@@ -536,14 +532,11 @@ bool decode_sec_key_into_record(TABLE *table, const KEY *key_info,
       std::reverse(tmp, tmp + kp.length);
     }
 
-    std::ptrdiff_t offset = field->ptr - table->record[0];
-    std::memcpy(record + offset, tmp, kp.length);
+    std::memcpy(record + kp.record_offset, tmp, kp.length);
 
     p += kp.store_length;
   }
   return true;
 }
-
-#endif
 
 } // namespace bytecaskdb

@@ -223,6 +223,8 @@ int ha_bytecaskdb::open(const char *name, int /*mode*/,
     return HA_ERR_NO_SUCH_TABLE;
   }
   table_id_ = tid.value();
+  // Before anything below encodes or decodes a key.
+  codec_ = make_table_codec(table);
 
   TableMeta meta;
   if (catalog_copy_meta(table_id_, meta)) {
@@ -287,7 +289,7 @@ void ha_bytecaskdb::seed_autoinc_counter_if_needed() const {
     if (k.size() >= 5 + pk_len) {
       std::vector<uchar> scratch(table->s->rec_buff_length, 0);
       std::vector<uint8_t> key_tmp(u8_data(k) + 5, u8_data(k) + 5 + pk_len);
-      undo_mem_comparable(key_tmp.data(), &table->key_info[pk_idx], pk_len);
+      undo_mem_comparable(key_tmp.data(), codec_.keys[pk_idx], pk_len);
       key_restore(scratch.data(), key_tmp.data(),
                   &table->key_info[pk_idx], pk_len);
       Field *ai_field = table->found_next_number_field;
@@ -528,9 +530,9 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   const uint64_t rowid = no_pk ? catalog_alloc_rowid(table_id_) : 0;
 
   auto &key = encode_pk_buf_;
-  encode_pk_into(key, table, buf, table_id_, rowid);
+  encode_pk_into(key, table, codec_, buf, table_id_, rowid);
   auto &val = encode_row_buf_;
-  encode_row_into(val, table, buf, schema_version_);
+  encode_row_into(val, codec_.row, buf, schema_version_);
 
   // Deferred PK dup check: a plain autocommit INSERT on a PK-only-unique table
   // does not need to probe the DB (or take a snapshot) per row. The commit-time
@@ -582,7 +584,7 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
         if (has_null) continue;
 
         auto &unique_prefix = encode_unique_sec_key_buf_;
-        encode_unique_sec_key_into(unique_prefix, table, buf, table_id_,
+        encode_unique_sec_key_into(unique_prefix, table, codec_, buf, table_id_,
                                     index.index_id, index.index_id);
 
         auto upper = index_id_upper_bound(table_id_, index.index_id);
@@ -610,7 +612,7 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   if (!indexes_.empty()) {
     for (const auto &index : indexes_) {
       auto &sec_key = encode_sec_key_buf_;
-      encode_sec_key_into(sec_key, table, buf, table_id_,
+      encode_sec_key_into(sec_key, table, codec_, buf, table_id_,
                            index.index_id, index.index_id, rowid);
       txn->buffer_put(sec_key.data(), sec_key.size(), nullptr, 0);
     }
@@ -656,9 +658,9 @@ int ha_bytecaskdb::bulk_copy_write_row(const uchar *buf) {
   const uint64_t rowid = no_pk ? catalog_alloc_rowid(table_id_) : 0;
 
   auto &key = encode_pk_buf_;
-  encode_pk_into(key, table, buf, table_id_, rowid);
+  encode_pk_into(key, table, codec_, buf, table_id_, rowid);
   auto &val = encode_row_buf_;
-  encode_row_into(val, table, buf, schema_version_);
+  encode_row_into(val, codec_.row, buf, schema_version_);
 
   if (!no_pk && txn->bulk_pk_exists(key.data(), key.size())) {
     errkey = saved_errkey_ = table->s->primary_key;
@@ -677,7 +679,7 @@ int ha_bytecaskdb::bulk_copy_write_row(const uchar *buf) {
       if (has_null) { continue; }
 
       auto &unique_prefix = encode_unique_sec_key_buf_;
-      encode_unique_sec_key_into(unique_prefix, table, buf, table_id_,
+      encode_unique_sec_key_into(unique_prefix, table, codec_, buf, table_id_,
                                  index.index_id, index.index_id);
       if (txn->bulk_unique_prefix_exists(unique_prefix.data(),
                                          unique_prefix.size())) {
@@ -696,7 +698,7 @@ int ha_bytecaskdb::bulk_copy_write_row(const uchar *buf) {
   if (!indexes_.empty()) {
     for (const auto &index : indexes_) {
       auto &sec_key = encode_sec_key_buf_;
-      encode_sec_key_into(sec_key, table, buf, table_id_,
+      encode_sec_key_into(sec_key, table, codec_, buf, table_id_,
                           index.index_id, index.index_id, rowid);
       txn->bulk_buffer_put(sec_key.data(), sec_key.size(), nullptr, 0);
     }
@@ -733,7 +735,7 @@ bool ha_bytecaskdb::report_dup_pk(const std::vector<uint8_t> &pk) {
   const uint pk_idx = table->s->primary_key;
   errkey = saved_errkey_ = pk_idx;
 #ifndef PLUGIN_TESTING
-  decode_pk(table, pk.data(), pk.size(), table->record[0], decode_pk_scratch_);
+  decode_pk(table, codec_, pk.data(), pk.size(), table->record[0], decode_pk_scratch_);
   print_keydup_error(table, &table->key_info[pk_idx], MYF(0));
 #else
   my_error(ER_DUP_ENTRY, MYF(0), "", "PRIMARY");
@@ -769,7 +771,7 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
   std::vector<uint8_t> old_pk = current_row_key_;
   if (old_pk.empty()) {
     // Defensive fallback for the PK case if no read happened first.
-    encode_pk_into(old_pk, table, old_data, table_id_);
+    encode_pk_into(old_pk, table, codec_, old_data, table_id_);
   }
 
   // For PK-less tables the rowid persists across the update, so the new
@@ -780,11 +782,11 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
     new_pk = old_pk;  // copy
     if (old_pk.size() >= 13) { rowid = read_be64(old_pk.data() + 5); }
   } else {
-    encode_pk_into(new_pk, table, new_data, table_id_);
+    encode_pk_into(new_pk, table, codec_, new_data, table_id_);
   }
 
   auto &new_val = encode_row_buf_;
-  encode_row_into(new_val, table, new_data, schema_version_);
+  encode_row_into(new_val, codec_.row, new_data, schema_version_);
 
   // Handle secondary indexes.
   if (!indexes_.empty()) {
@@ -812,9 +814,9 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
 
       auto &old_sec_key = encode_old_sec_key_buf_;
       auto &new_sec_key = encode_new_sec_key_buf_;
-      encode_sec_key_into(old_sec_key, table, old_data, table_id_,
+      encode_sec_key_into(old_sec_key, table, codec_, old_data, table_id_,
                            index.index_id, index.index_id, rowid);
-      encode_sec_key_into(new_sec_key, table, new_data, table_id_,
+      encode_sec_key_into(new_sec_key, table, codec_, new_data, table_id_,
                            index.index_id, index.index_id, rowid);
       if (old_sec_key != new_sec_key) {
         if (index.is_unique) {
@@ -827,7 +829,7 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
           if (!has_null) {
             const uint sec_key_field_len = ki.key_length;
             auto &unique_prefix = encode_unique_sec_key_buf_;
-            encode_unique_sec_key_into(unique_prefix, table, new_data, table_id_,
+            encode_unique_sec_key_into(unique_prefix, table, codec_, new_data, table_id_,
                                         index.index_id, index.index_id);
             auto uhi = index_id_upper_bound(table_id_, index.index_id);
             auto uiter = txn->iter_index_prefix(unique_prefix.data(), unique_prefix.size(),
@@ -895,7 +897,7 @@ int ha_bytecaskdb::delete_row(const uchar *buf) {
   // where delete is called without a prior read.
   std::vector<uint8_t> key = current_row_key_;
   if (key.empty()) {
-    key = encode_pk(table, buf, table_id_);
+    key = encode_pk(table, codec_, buf, table_id_);
   }
 
   uint64_t rowid = 0;
@@ -906,7 +908,7 @@ int ha_bytecaskdb::delete_row(const uchar *buf) {
   // Buffer secondary index deletions first.
   for (const auto &index : indexes_) {
     auto &sec_key = encode_sec_key_buf_;
-    encode_sec_key_into(sec_key, table, buf, table_id_,
+    encode_sec_key_into(sec_key, table, codec_, buf, table_id_,
                         index.index_id, index.index_id, rowid);
     txn->buffer_del(sec_key.data(), sec_key.size());
   }
@@ -941,11 +943,11 @@ int ha_bytecaskdb::rnd_next(uchar *buf) {
     return HA_ERR_END_OF_FILE;
   }
 
-  decode_pk(table, merge_scan_->key_data(), merge_scan_->key_len(), buf,
+  decode_pk(table, codec_, merge_scan_->key_data(), merge_scan_->key_len(), buf,
             decode_pk_scratch_);
 
   merge_scan_->swap_value(row_value_buf_);
-  decode_row(table,
+  decode_row(codec_.row,
              reinterpret_cast<const uint8_t *>(row_value_buf_.data()),
              row_value_buf_.size(), buf);
 
@@ -987,7 +989,7 @@ int ha_bytecaskdb::check(THD * /*thd*/, HA_CHECK_OPT * /*check_opt*/) {
       if (table->s->primary_key == MAX_KEY && current_row_key_.size() >= 13) {
         rowid = read_be64(current_row_key_.data() + 5);
       }
-      auto sec_key = encode_sec_key(table, buf, table_id_,
+      auto sec_key = encode_sec_key(table, codec_, buf, table_id_,
                                      index.index_id, index.index_id, rowid);
       if (!txn->exists(sec_key.data(), sec_key.size())) {
         corrupt = true;
@@ -1141,11 +1143,11 @@ std::size_t ha_bytecaskdb::build_search_key(uint idx, const uchar *key,
   // as empty and are left as zeros. The transform is limited to the
   // supplied prefix (whole parts), so only those bytes are rewritten.
   if (on_pk) {
-    normalize_padspace_pk(kp, &key_info);
+    normalize_padspace_pk(kp, codec_.keys[idx]);
   } else {
-    fix_varchar_key_encoding(kp, table, idx);
+    fix_varchar_key_encoding(kp, codec_.keys[idx]);
   }
-  make_mem_comparable(kp, &key_info, prefix_len);
+  make_mem_comparable(kp, codec_.keys[idx], prefix_len);
 
   if (pad_high) {
     std::memset(kp + prefix_len, 0xFF, key_len - prefix_len);
@@ -1195,7 +1197,7 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
     if (found == 0) { return HA_ERR_KEY_NOT_FOUND; }
 
     key_restore(buf, key, const_cast<KEY *>(&key_info), key_len);
-    decode_row(table,
+    decode_row(codec_.row,
                reinterpret_cast<const uint8_t *>(row_value_buf_.data()),
                row_value_buf_.size(), buf);
     save_current_row_key(search_key_buf_.data(), search_key_buf_.size());
@@ -1356,10 +1358,10 @@ int ha_bytecaskdb::index_read_current(uchar *buf) {
 
   if (active_index == table->s->primary_key) {
     // Primary key access: key is encoded PK, value is row data
-    decode_pk(table, merge_index_->key_data(), merge_index_->key_len(), buf,
+    decode_pk(table, codec_, merge_index_->key_data(), merge_index_->key_len(), buf,
               decode_pk_scratch_);
     merge_index_->swap_value(row_value_buf_);
-    decode_row(table,
+    decode_row(codec_.row,
                reinterpret_cast<const uint8_t *>(row_value_buf_.data()),
                row_value_buf_.size(), buf);
     merge_index_->swap_key(current_row_key_);
@@ -1382,7 +1384,7 @@ int ha_bytecaskdb::index_read_current(uchar *buf) {
     // fetching the full row. Falls back to the slow path if any key part
     // is of a type the decoder does not handle (VARCHAR, BLOB, nullable).
     if (keyread_only_ &&
-        decode_sec_key_into_record(table, &key_info,
+        decode_sec_key_into_record(codec_.keys[active_index],
                                     merge_index_->key_data(),
                                     merge_index_->key_len(),
                                     buf)) {
@@ -1412,7 +1414,7 @@ int ha_bytecaskdb::index_read_current(uchar *buf) {
       return HA_ERR_KEY_NOT_FOUND;
     }
 
-    decode_row(table,
+    decode_row(codec_.row,
                reinterpret_cast<const uint8_t *>(row_value_buf_.data()),
                row_value_buf_.size(), buf);
     save_current_row_key(sec_row_key_buf_.data(), sec_row_key_buf_.size());
@@ -1432,7 +1434,7 @@ void ha_bytecaskdb::position(const uchar *record) {
     return;
   }
   // Fallback: re-encode from record (only valid for PK tables).
-  auto pk = encode_pk(table, record, table_id_);
+  auto pk = encode_pk(table, codec_, record, table_id_);
   assert(pk.size() <= ref_length);
   std::memcpy(ref, pk.data(), pk.size());
 }
@@ -1447,9 +1449,9 @@ int ha_bytecaskdb::rnd_pos(uchar *buf, uchar *pos) {
   if (found < 0) { return HA_ERR_GENERIC; }
   if (found == 0) { return HA_ERR_KEY_NOT_FOUND; }
 
-  decode_pk(table, pos, ref_length, buf, decode_pk_scratch_);
+  decode_pk(table, codec_, pos, ref_length, buf, decode_pk_scratch_);
 
-  decode_row(table,
+  decode_row(codec_.row,
              reinterpret_cast<const uint8_t *>(row_value_buf_.data()),
              row_value_buf_.size(), buf);
 

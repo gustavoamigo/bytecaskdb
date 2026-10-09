@@ -332,7 +332,7 @@ TEST_CASE("row encoding round-trip", "[row_encoding]") {
 
   SECTION("encode produces correct envelope") {
     uchar row[8] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80};
-    auto encoded = encode_row(&tbl, row, /*schema_version=*/7);
+    auto encoded = encode_row(make_row_plan(&tbl), row, /*schema_version=*/7);
 
     // 3-byte envelope + 8 bytes null bitmap.
     REQUIRE(encoded.size() == 11);
@@ -345,7 +345,7 @@ TEST_CASE("row encoding round-trip", "[row_encoding]") {
 
   SECTION("schema_version > 255") {
     uchar row[8] = {};
-    auto encoded = encode_row(&tbl, row, /*schema_version=*/0x0301);
+    auto encoded = encode_row(make_row_plan(&tbl), row, /*schema_version=*/0x0301);
 
     REQUIRE(encoded[1] == 0x01);  // low byte
     REQUIRE(encoded[2] == 0x03);  // high byte
@@ -353,10 +353,10 @@ TEST_CASE("row encoding round-trip", "[row_encoding]") {
 
   SECTION("decode restores original data") {
     uchar original[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-    auto encoded = encode_row(&tbl, original, /*schema_version=*/1);
+    auto encoded = encode_row(make_row_plan(&tbl), original, /*schema_version=*/1);
 
     uchar decoded[8] = {};
-    decode_row(&tbl, encoded.data(), encoded.size(), decoded);
+    decode_row(make_row_plan(&tbl), encoded.data(), encoded.size(), decoded);
     REQUIRE(std::memcmp(original, decoded, 8) == 0);
   }
 
@@ -366,7 +366,7 @@ TEST_CASE("row encoding round-trip", "[row_encoding]") {
 
     uchar decoded[8];
     std::memset(decoded, 0xFF, 8);
-    decode_row(&tbl, short_value, sizeof(short_value), decoded);
+    decode_row(make_row_plan(&tbl), short_value, sizeof(short_value), decoded);
 
     // buf zeroed by initial memset in decode.
     for (int i = 0; i < 8; ++i) {
@@ -379,7 +379,7 @@ TEST_CASE("row encoding round-trip", "[row_encoding]") {
     std::memset(decoded, 0xFF, 8);
     // Only 2 bytes — less than the 3-byte envelope.
     uint8_t tiny[] = {0x02, 0x00};
-    decode_row(&tbl, tiny, sizeof(tiny), decoded);
+    decode_row(make_row_plan(&tbl), tiny, sizeof(tiny), decoded);
 
     for (int i = 0; i < 8; ++i) {
       REQUIRE(decoded[i] == 0);
@@ -433,7 +433,7 @@ TEST_CASE("V2 row encoding with compactable CHAR fields", "[row_encoding]") {
     std::memset(record + 5, 0x20, 480);
     std::memcpy(record + 5, "hello", 5);
 
-    auto encoded = encode_row(&tbl, record, /*schema_version=*/1);
+    auto encoded = encode_row(make_row_plan(&tbl), record, /*schema_version=*/1);
 
     // Envelope (3) + null_bytes (1) + int (4) + len_prefix (2) + stripped_data.
     // Minimum stripped length = 480/4 = 120 chars.
@@ -450,12 +450,12 @@ TEST_CASE("V2 row encoding with compactable CHAR fields", "[row_encoding]") {
     std::memset(record + 5, 0x20, 480);
     std::memcpy(record + 5, "world", 5);
 
-    auto encoded = encode_row(&tbl, record, 1);
+    auto encoded = encode_row(make_row_plan(&tbl), record, 1);
 
     // Decode into a fresh buffer.
     uchar decoded[reclength];
     std::memset(decoded, 0xCC, reclength);
-    decode_row(&tbl, encoded.data(), encoded.size(), decoded);
+    decode_row(make_row_plan(&tbl), encoded.data(), encoded.size(), decoded);
 
     // Null bitmap preserved.
     REQUIRE(decoded[0] == 0x00);
@@ -481,10 +481,10 @@ TEST_CASE("V2 row encoding with compactable CHAR fields", "[row_encoding]") {
       record[5 + i] = static_cast<uchar>('A' + (i % 26));
     }
 
-    auto encoded = encode_row(&tbl, record, 7);
+    auto encoded = encode_row(make_row_plan(&tbl), record, 7);
 
     uchar decoded[reclength];
-    decode_row(&tbl, encoded.data(), encoded.size(), decoded);
+    decode_row(make_row_plan(&tbl), encoded.data(), encoded.size(), decoded);
 
     REQUIRE(std::memcmp(record, decoded, reclength) == 0);
   }
@@ -496,7 +496,7 @@ TEST_CASE("V2 row encoding with compactable CHAR fields", "[row_encoding]") {
     // Entire CHAR field is spaces.
     std::memset(record + 5, 0x20, 480);
 
-    auto encoded = encode_row(&tbl, record, 1);
+    auto encoded = encode_row(make_row_plan(&tbl), record, 1);
 
     // stripped to n_chars = 480/4 = 120 bytes (all spaces).
     std::size_t expected_size = 3 + 1 + 4 + 2 + 120;
@@ -504,7 +504,7 @@ TEST_CASE("V2 row encoding with compactable CHAR fields", "[row_encoding]") {
 
     // Round-trip: decoded should be all spaces in the CHAR region.
     uchar decoded[reclength];
-    decode_row(&tbl, encoded.data(), encoded.size(), decoded);
+    decode_row(make_row_plan(&tbl), encoded.data(), encoded.size(), decoded);
     for (uint i = 0; i < 480; ++i) {
       REQUIRE(decoded[5 + i] == 0x20);
     }
@@ -520,14 +520,14 @@ TEST_CASE("V2 row encoding with compactable CHAR fields", "[row_encoding]") {
       record[5 + i] = static_cast<uchar>('X');
     }
 
-    auto encoded = encode_row(&tbl, record, 1);
+    auto encoded = encode_row(make_row_plan(&tbl), record, 1);
 
     // actual_len should be 200 (> n_chars=120, trailing spaces stripped).
     std::size_t expected_size = 3 + 1 + 4 + 2 + 200;
     REQUIRE(encoded.size() == expected_size);
 
     uchar decoded[reclength];
-    decode_row(&tbl, encoded.data(), encoded.size(), decoded);
+    decode_row(make_row_plan(&tbl), encoded.data(), encoded.size(), decoded);
     REQUIRE(std::memcmp(record, decoded, reclength) == 0);
   }
 }
@@ -567,14 +567,14 @@ TEST_CASE("V2 row encoding with non-compactable CHAR (latin1)", "[row_encoding]"
     std::memset(record + 5, 0x20, 120);
     std::memcpy(record + 5, "abc", 3);
 
-    auto encoded = encode_row(&tbl, record, 1);
+    auto encoded = encode_row(make_row_plan(&tbl), record, 1);
 
     // No length prefix for non-compactable: envelope(3) + null(1) + int(4) + char(120)
     std::size_t expected_size = 3 + 1 + 4 + 120;
     REQUIRE(encoded.size() == expected_size);
 
     uchar decoded[reclength];
-    decode_row(&tbl, encoded.data(), encoded.size(), decoded);
+    decode_row(make_row_plan(&tbl), encoded.data(), encoded.size(), decoded);
     REQUIRE(std::memcmp(record, decoded, reclength) == 0);
   }
 }
@@ -592,7 +592,7 @@ TEST_CASE("V2 decode rejects V1 format", "[row_encoding]") {
   uchar decoded[8];
 
   REQUIRE_THROWS_AS(
-      decode_row(&tbl, v1_data, sizeof(v1_data), decoded),
+      decode_row(make_row_plan(&tbl), v1_data, sizeof(v1_data), decoded),
       std::runtime_error);
 }
 
@@ -834,29 +834,29 @@ TEST_CASE("encode_row_into matches encode_row", "[row_encoding]") {
   uchar row[8] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80};
 
   SECTION("equivalent output") {
-    auto returned = encode_row(&tbl, row, 7);
+    auto returned = encode_row(make_row_plan(&tbl), row, 7);
     std::vector<uint8_t> into;
-    encode_row_into(into, &tbl, row, 7);
+    encode_row_into(into, make_row_plan(&tbl), row, 7);
     REQUIRE(into == returned);
   }
 
   SECTION("clear+append semantics — pre-populated buffer is overwritten") {
     std::vector<uint8_t> into(64, 0xCC);
     auto cap_before = into.capacity();
-    encode_row_into(into, &tbl, row, 7);
-    auto returned = encode_row(&tbl, row, 7);
+    encode_row_into(into, make_row_plan(&tbl), row, 7);
+    auto returned = encode_row(make_row_plan(&tbl), row, 7);
     REQUIRE(into == returned);
     REQUIRE(into.capacity() >= cap_before);
   }
 
   SECTION("repeated reuse across rows") {
     std::vector<uint8_t> into;
-    encode_row_into(into, &tbl, row, 7);
+    encode_row_into(into, make_row_plan(&tbl), row, 7);
     auto cap_after_first = into.capacity();
 
     uchar row2[8] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11};
-    encode_row_into(into, &tbl, row2, 9);
-    REQUIRE(into == encode_row(&tbl, row2, 9));
+    encode_row_into(into, make_row_plan(&tbl), row2, 9);
+    REQUIRE(into == encode_row(make_row_plan(&tbl), row2, 9));
     REQUIRE(into.capacity() >= cap_after_first);
   }
 }
@@ -871,26 +871,26 @@ TEST_CASE("encode_pk_into matches encode_pk (PK-less synthetic rowid)",
   uchar buf[1] = {0};
 
   SECTION("equivalent output") {
-    auto returned = encode_pk(&tbl, buf, 42, 0xDEADBEEFCAFEBABEULL);
+    auto returned = encode_pk(&tbl, make_table_codec(&tbl), buf, 42, 0xDEADBEEFCAFEBABEULL);
     std::vector<uint8_t> into;
-    encode_pk_into(into, &tbl, buf, 42, 0xDEADBEEFCAFEBABEULL);
+    encode_pk_into(into, &tbl, make_table_codec(&tbl), buf, 42, 0xDEADBEEFCAFEBABEULL);
     REQUIRE(into == returned);
   }
 
   SECTION("clear+append — pre-populated junk overwritten") {
     std::vector<uint8_t> into(32, 0xAB);
     auto cap_before = into.capacity();
-    encode_pk_into(into, &tbl, buf, 42, 1);
-    REQUIRE(into == encode_pk(&tbl, buf, 42, 1));
+    encode_pk_into(into, &tbl, make_table_codec(&tbl), buf, 42, 1);
+    REQUIRE(into == encode_pk(&tbl, make_table_codec(&tbl), buf, 42, 1));
     REQUIRE(into.capacity() >= cap_before);
   }
 
   SECTION("repeated reuse across rows") {
     std::vector<uint8_t> into;
-    encode_pk_into(into, &tbl, buf, 42, 1);
+    encode_pk_into(into, &tbl, make_table_codec(&tbl), buf, 42, 1);
     auto cap_after_first = into.capacity();
-    encode_pk_into(into, &tbl, buf, 42, 999);
-    REQUIRE(into == encode_pk(&tbl, buf, 42, 999));
+    encode_pk_into(into, &tbl, make_table_codec(&tbl), buf, 42, 999);
+    REQUIRE(into == encode_pk(&tbl, make_table_codec(&tbl), buf, 42, 999));
     REQUIRE(into.capacity() >= cap_after_first);
   }
 }
@@ -922,5 +922,312 @@ TEST_CASE("schema v2 index metadata", "[catalog]") {
     REQUIRE(deserialized.indexes[0].is_unique == 0);
     REQUIRE(deserialized.indexes[1].index_id == 2);
     REQUIRE(deserialized.indexes[1].is_unique == 1);
+  }
+}
+
+// =========================================================================
+// TableCodec — the per-table plan the row and key codecs walk
+// =========================================================================
+
+namespace {
+
+struct UnsignedLongField : Field_long {
+  bool is_unsigned() const override { return true; }
+};
+
+struct DoubleField : Field {
+  enum_field_types type() const override { return MYSQL_TYPE_DOUBLE; }
+  uint pack_length() const override { return 8; }
+};
+
+// One table with a single-part key on `field`, whose value sits at record
+// offset 1 (after a one-byte null bitmap).
+struct OneKeyTable {
+  uchar record[16]{};
+  TABLE_SHARE share{};
+  KEY_PART_INFO part{};
+  KEY key{};
+  Field *fields[1]{};
+  TABLE tbl{};
+
+  OneKeyTable(Field &field, uint length, bool nullable) {
+    field.ptr = record + 1;
+    field.field_length = length;
+    fields[0] = &field;
+    share.reclength = sizeof(record);
+    share.null_bytes = 1;
+    share.fields = 1;
+    share.keys = 1;
+    part.field = &field;
+    part.fieldnr = 1;
+    part.length = length;
+    part.store_length = length + (nullable ? 1 : 0);
+    part.null_bit = nullable ? 1 : 0;
+    key.key_length = part.store_length;
+    key.user_defined_key_parts = 1;
+    key.key_part = &part;
+    tbl.s = &share;
+    tbl.key_info = &key;
+    tbl.field = fields;
+    tbl.record[0] = record;
+  }
+};
+
+template <typename T>
+std::vector<uint8_t> native_bytes(T v) {
+  std::vector<uint8_t> b(sizeof(T));
+  std::memcpy(b.data(), &v, sizeof(T));
+  return b;
+}
+
+// Encodes each value's native bytes, checks the encoded keys sort as the
+// values do, and that undo restores the native bytes exactly.
+template <typename T>
+void check_order_and_round_trip(const KeyPlan &plan, std::vector<T> values) {
+  std::sort(values.begin(), values.end());
+  std::vector<std::vector<uint8_t>> encoded;
+  for (T v : values) {
+    auto bytes = native_bytes(v);
+    auto key = bytes;
+    make_mem_comparable(key.data(), plan, static_cast<uint>(key.size()));
+    auto back = key;
+    undo_mem_comparable(back.data(), plan, static_cast<uint>(back.size()));
+    INFO("value " << v);
+    REQUIRE(back == bytes);
+    encoded.push_back(key);
+  }
+  REQUIRE(std::is_sorted(encoded.begin(), encoded.end()));
+}
+
+}  // namespace
+
+TEST_CASE("make_row_plan reads each column's layout once", "[row_encoding]") {
+  static CHARSET_INFO utf8mb4_cs{45, 0, 1, 4};
+  static CHARSET_INFO latin1_cs{8, 0, 1, 1};
+  uchar record[64]{};
+  TABLE_SHARE share{};
+  share.reclength = sizeof(record);
+  share.null_bytes = 1;
+  share.fields = 4;
+
+  Field_long f_int;
+  f_int.ptr = record + 1;
+  Field_string f_utf8;  // CHAR(4) utf8mb4: compacted
+  f_utf8.ptr = record + 5;
+  f_utf8.field_length = 16;
+  f_utf8.cs_ = &utf8mb4_cs;
+  Field_string f_latin1;  // CHAR(8) latin1: stored as is
+  f_latin1.ptr = record + 21;
+  f_latin1.field_length = 8;
+  f_latin1.cs_ = &latin1_cs;
+  Field_blob f_blob;
+  f_blob.ptr = record + 29;
+  f_blob.pack_len_no_ptr_ = 2;
+
+  Field *fields[] = {&f_int, &f_utf8, &f_latin1, &f_blob};
+  TABLE tbl{};
+  tbl.s = &share;
+  tbl.field = fields;
+  tbl.record[0] = record;
+
+  const RowPlan plan = make_row_plan(&tbl);
+  using Kind = RowPlan::Kind;
+  REQUIRE(plan.null_bytes == 1);
+  REQUIRE(plan.reclength == sizeof(record));
+  REQUIRE(plan.columns.size() == 4);
+  CHECK(plan.columns[0].kind == Kind::kFixed);
+  CHECK(plan.columns[0].offset == 1);
+  CHECK(plan.columns[0].pack_length == 4);
+  CHECK(plan.columns[1].kind == Kind::kCompactChar);
+  CHECK(plan.columns[1].offset == 5);
+  CHECK(plan.columns[1].field_length == 16);
+  CHECK(plan.columns[1].mbmaxlen == 4);
+  CHECK(plan.columns[2].kind == Kind::kFixed);
+  CHECK(plan.columns[2].pack_length == 8);
+  CHECK(plan.columns[3].kind == Kind::kBlob);
+  CHECK(plan.columns[3].offset == 29);
+  CHECK(plan.columns[3].blob_len_bytes == 2);
+  CHECK(plan.columns[3].pack_length == 2 + sizeof(uchar *));
+
+  SECTION("a blob round-trips through the plan") {
+    const char text[] = "blob bytes";
+    const uint16_t len = sizeof(text) - 1;
+    std::memcpy(record + 29, &len, 2);
+    const uchar *data_ptr = reinterpret_cast<const uchar *>(text);
+    std::memcpy(record + 31, &data_ptr, sizeof(data_ptr));
+    auto encoded = encode_row(plan, record, 1);
+
+    uchar decoded[64]{};
+    decode_row(plan, encoded.data(), encoded.size(), decoded);
+    uint16_t got_len = 0;
+    std::memcpy(&got_len, decoded + 29, 2);
+    REQUIRE(got_len == len);
+    const uchar *got_ptr = nullptr;
+    std::memcpy(&got_ptr, decoded + 31, sizeof(got_ptr));
+    REQUIRE(got_ptr != nullptr);
+    REQUIRE(std::memcmp(got_ptr, text, len) == 0);
+  }
+}
+
+TEST_CASE("key plan transforms sort by value and round-trip",
+          "[key_encoding]") {
+  SECTION("signed integer") {
+    Field_long f;
+    OneKeyTable t(f, 4, /*nullable=*/false);
+    const TableCodec codec = make_table_codec(&t.tbl);
+    REQUIRE(codec.keys.size() == 1);
+    const KeyPartPlan &p = codec.keys[0].parts.at(0);
+    CHECK(p.reverse);
+    CHECK(p.flip == KeyPartPlan::Flip::kSign);
+    CHECK(p.record_offset == 1);
+    check_order_and_round_trip<int32_t>(
+        codec.keys[0], {std::numeric_limits<int32_t>::min(), -5, -1, 0, 1, 7,
+                        std::numeric_limits<int32_t>::max()});
+  }
+
+  SECTION("unsigned integer") {
+    UnsignedLongField f;
+    OneKeyTable t(f, 4, false);
+    const TableCodec codec = make_table_codec(&t.tbl);
+    CHECK(codec.keys[0].parts.at(0).flip == KeyPartPlan::Flip::kNone);
+    check_order_and_round_trip<uint32_t>(
+        codec.keys[0], {0u, 1u, 255u, 256u, 0x80000000u, 0xFFFFFFFFu});
+  }
+
+  SECTION("double") {
+    DoubleField f;
+    OneKeyTable t(f, 8, false);
+    const TableCodec codec = make_table_codec(&t.tbl);
+    CHECK(codec.keys[0].parts.at(0).flip == KeyPartPlan::Flip::kFloat);
+    check_order_and_round_trip<double>(
+        codec.keys[0], {-1e10, -2.5, -0.5, 0.0, 0.5, 1.5, 1e10});
+  }
+
+  SECTION("nullable: NULL sorts first and both round-trip") {
+    Field_long f;
+    OneKeyTable t(f, 4, /*nullable=*/true);
+    const TableCodec codec = make_table_codec(&t.tbl);
+    const KeyPlan &plan = codec.keys[0];
+    std::vector<uint8_t> null_key = {1, 0, 0, 0, 0};  // null byte set
+    std::vector<uint8_t> zero_key = {0, 0, 0, 0, 0};  // NOT NULL, value 0
+    auto null_enc = null_key, zero_enc = zero_key;
+    make_mem_comparable(null_enc.data(), plan, 5);
+    make_mem_comparable(zero_enc.data(), plan, 5);
+    REQUIRE(null_enc < zero_enc);
+    undo_mem_comparable(null_enc.data(), plan, 5);
+    undo_mem_comparable(zero_enc.data(), plan, 5);
+    REQUIRE(null_enc == null_key);
+    REQUIRE(zero_enc == zero_key);
+  }
+}
+
+TEST_CASE("decode_sec_key_into_record restores the key's columns",
+          "[key_encoding]") {
+  Field_long f;
+  OneKeyTable t(f, 4, false);
+  const TableCodec codec = make_table_codec(&t.tbl);
+  const KeyPlan &plan = codec.keys[0];
+
+  auto value = native_bytes<int32_t>(-42);
+  auto encoded = value;
+  make_mem_comparable(encoded.data(), plan, 4);
+  std::vector<uint8_t> sec_key = {0x03, 0, 0, 0, 1, 0, 1};  // ns | tid | iid
+  sec_key.insert(sec_key.end(), encoded.begin(), encoded.end());
+
+  uchar record[16]{};
+  REQUIRE(decode_sec_key_into_record(plan, sec_key.data(), sec_key.size(),
+                                     record));
+  REQUIRE(std::memcmp(record + 1, value.data(), 4) == 0);
+
+  SECTION("a nullable part is left to the full row fetch") {
+    Field_long g;
+    OneKeyTable n(g, 4, /*nullable=*/true);
+    const TableCodec ncodec = make_table_codec(&n.tbl);
+    const KeyPlan &nplan = ncodec.keys[0];
+    REQUIRE_FALSE(decode_sec_key_into_record(nplan, sec_key.data(),
+                                             sec_key.size(), record));
+  }
+}
+
+namespace {
+
+// A temporal column as MariaDB reports it: type() is the old enum, and
+// real_type() says whether the column is the big-endian *2 format.
+struct TemporalField : Field {
+  enum_field_types old_type;
+  enum_field_types real;
+  uint bytes;
+  TemporalField(enum_field_types t, enum_field_types r, uint n)
+      : old_type{t}, real{r}, bytes{n} {}
+  enum_field_types type() const override { return old_type; }
+  enum_field_types real_type() const override { return real; }
+  uint pack_length() const override { return bytes; }
+};
+
+}  // namespace
+
+TEST_CASE("key plan leaves big-endian temporal parts as they are",
+          "[key_encoding]") {
+  struct Kind {
+    const char *name;
+    enum_field_types type, real;
+    uint bytes;
+  };
+  const Kind kinds[] = {
+      {"DATETIME2", MYSQL_TYPE_DATETIME, MYSQL_TYPE_DATETIME2, 5},
+      {"TIMESTAMP2", MYSQL_TYPE_TIMESTAMP, MYSQL_TYPE_TIMESTAMP2, 4},
+      {"TIME2", MYSQL_TYPE_TIME, MYSQL_TYPE_TIME2, 3},
+  };
+  for (const auto &k : kinds) {
+    INFO(k.name);
+    TemporalField f{k.type, k.real, k.bytes};
+    OneKeyTable t(f, k.bytes, /*nullable=*/false);
+    const TableCodec codec = make_table_codec(&t.tbl);
+    const KeyPlan &plan = codec.keys[0];
+    const KeyPartPlan &p = plan.parts.at(0);
+    CHECK(p.be_temporal);
+    CHECK_FALSE(p.reverse);
+    CHECK(p.flip == KeyPartPlan::Flip::kNone);
+
+    // key_copy() already wrote these big-endian: the transforms leave them
+    // unchanged both ways, so the stored keys sort as the values do.
+    std::vector<std::vector<uint8_t>> values;
+    for (uint8_t lead : {0x80, 0x81, 0x99, 0xFE}) {
+      std::vector<uint8_t> v(k.bytes, 0);
+      v[0] = lead;
+      v[k.bytes - 1] = 0x01;
+      values.push_back(v);
+    }
+    std::vector<std::vector<uint8_t>> encoded;
+    for (const auto &v : values) {
+      auto key = v;
+      make_mem_comparable(key.data(), plan, k.bytes);
+      REQUIRE(key == v);
+      auto back = key;
+      undo_mem_comparable(back.data(), plan, k.bytes);
+      REQUIRE(back == v);
+      encoded.push_back(key);
+    }
+    REQUIRE(std::is_sorted(encoded.begin(), encoded.end()));
+
+    // The key-only read copies it into the record as it is.
+    std::vector<uint8_t> sec_key = {0x03, 0, 0, 0, 1, 0, 1};
+    sec_key.insert(sec_key.end(), values[2].begin(), values[2].end());
+    uchar record[16]{};
+    REQUIRE(decode_sec_key_into_record(plan, sec_key.data(), sec_key.size(),
+                                       record));
+    REQUIRE(std::memcmp(record + 1, values[2].data(), k.bytes) == 0);
+  }
+
+  SECTION("the old little-endian DATETIME is still reversed") {
+    TemporalField f{MYSQL_TYPE_DATETIME, MYSQL_TYPE_DATETIME, 8};
+    OneKeyTable t(f, 8, false);
+    const TableCodec codec = make_table_codec(&t.tbl);
+    const KeyPartPlan &p = codec.keys[0].parts.at(0);
+    CHECK_FALSE(p.be_temporal);
+    CHECK(p.reverse);
+    CHECK(p.flip == KeyPartPlan::Flip::kNone);
+    check_order_and_round_trip<uint64_t>(
+        codec.keys[0], {0ULL, 1ULL, 20261009000000ULL, 99991231235959ULL});
   }
 }
