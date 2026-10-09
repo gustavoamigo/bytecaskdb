@@ -89,29 +89,30 @@ private:
   // server_pid_ used for tracking in destructor cleanup
 
   void setup_paths() {
-    // Get the bytecask root directory
-    char* bytecask_root = std::getenv("BYTECASK_ROOT");
-    if (!bytecask_root) {
-      // Try to find it relative to current location
-      auto current = fs::current_path();
-      while (current != current.root_path()) {
-        if (fs::exists(current / "xmake.lua") && fs::exists(current / "bytecaskdb-mariadb-plugin")) {
-          bytecask_root = const_cast<char*>(current.c_str());
-          break;
-        }
-        current = current.parent_path();
+    // The repository root, found from the working directory (ctest runs
+    // this from the build tree). Owned: a pointer into the search's path
+    // would dangle once the search's scope ends. Not taken from the
+    // environment: every path below goes into a shell command.
+    std::string bytecask_root;
+    auto current = fs::current_path();
+    while (current != current.root_path()) {
+      if (fs::exists(current / "xmake.lua") && fs::exists(current / "bytecaskdb-mariadb-plugin")) {
+        bytecask_root = current.string();
+        break;
       }
-      if (!bytecask_root) {
-        throw std::runtime_error("Could not find BYTECASK_ROOT");
-      }
+      current = current.parent_path();
+    }
+    if (bytecask_root.empty()) {
+      throw std::runtime_error("Could not find the repository root above " +
+                               fs::current_path().string());
     }
 
-    test_dir_ = std::string(bytecask_root) + "/.mariadb_integration_test";
+    test_dir_ = bytecask_root + "/.mariadb_integration_test";
     data_dir_ = test_dir_ + "/data";
     socket_path_ = test_dir_ + "/mysql.sock";
     pid_file_ = test_dir_ + "/mariadbd.pid";
     log_file_ = test_dir_ + "/error.log";
-    plugin_dir_ = std::string(bytecask_root) + "/bytecaskdb-mariadb-plugin/build";
+    plugin_dir_ = bytecask_root + "/bytecaskdb-mariadb-plugin/build";
   }
 
   void cleanup_previous() {
@@ -197,7 +198,12 @@ private:
                      " --plugin-dir=" + plugin_dir_ +
                      " --plugin-load-add=bytecaskdb=ha_bytecaskdb.so" +
                      " --log-error=" + log_file_ +
-                     " > /dev/null 2>&1 &";
+                     // mariadbd refuses to run as root unless told to; CI
+                     // containers are root.
+                     (geteuid() == 0 ? " --user=root" : "") +
+                     // What it says before it opens its error log, such as
+                     // a refusal to start, lands here.
+                     " > " + test_dir_ + "/mariadbd.stderr 2>&1 &";
 
     int result = std::system(cmd.c_str());
     if (result != 0) {
@@ -218,6 +224,9 @@ private:
     }
 
     // If we get here, server failed to start - check log
+    if (std::ifstream err{test_dir_ + "/mariadbd.stderr"}; err) {
+      std::cout << "mariadbd stderr:\n" << err.rdbuf() << "\n";
+    }
     if (fs::exists(log_file_)) {
       std::ifstream log(log_file_);
       std::string line;
