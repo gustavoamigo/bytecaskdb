@@ -248,11 +248,16 @@ def _range_changed(head: KeyDir, snapshot: KeyDir, start: bytes, stop: bytes) ->
 # ── Public interface: the engine's ───────────────────────────────────────────
 
 
-class DbClosed(ValueError):
+class ByteCaskError(Exception):
+    """Base of the engine's own errors: a state the database is in, not a
+    failed system call (OSError) or a bad argument (ValueError)."""
+
+
+class DbClosed(ByteCaskError, ValueError):
     """Raised by every operation after close()."""
 
 
-class DbDegraded(RuntimeError):
+class DbDegraded(ByteCaskError, RuntimeError):
     """Raised by writes after a write failed with an I/O error. Reads go on;
     reopen the database to write again."""
 

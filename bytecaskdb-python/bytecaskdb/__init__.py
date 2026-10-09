@@ -17,6 +17,7 @@ from ._bytecaskdb import (
     CommitResult,
     DbClosed,
     DbDegraded,
+    DbFollowerMode,
     EntryIterator,
     KeyIterator,
     ReverseEntryIterator,
@@ -27,13 +28,12 @@ from ._bytecaskdb import (
 IoError = OSError
 
 # Pythonic wrapper — the public API.
-from .ext import DB, Snapshot, ConflictError, DegradedError, ByteCaskError
+from .ext import DB, Snapshot, ConflictError, ByteCaskError
 
 __all__ = [
     "DB",
     "Snapshot",
     "ConflictError",
-    "DegradedError",
     "ByteCaskError",
     "IoError",
     "Options",
@@ -43,6 +43,7 @@ __all__ = [
     "CommitResult",
     "DbClosed",
     "DbDegraded",
+    "DbFollowerMode",
     "EntryIterator",
     "KeyIterator",
     "ReverseEntryIterator",

@@ -342,11 +342,21 @@ NB_MODULE(_bytecaskdb, m) {
   // Exceptions
   // -------------------------------------------------------------------------
 
-  nb::exception<bytecask::DbDegraded>(m, "DbDegraded", PyExc_RuntimeError);
-  nb::exception<bytecask::DbFollowerMode>(m, "DbFollowerMode",
-                                          PyExc_RuntimeError);
+  // ByteCaskError is the base of the engine's own errors, so one except
+  // clause catches them; each keeps the builtin base it had before. I/O
+  // failures stay OSError and bad arguments ValueError. PyErr_NewException,
+  // which nb::exception calls, takes a tuple of bases.
+  const auto base = nb::steal(PyErr_NewException(
+      "bytecaskdb._bytecaskdb.ByteCaskError", PyExc_Exception, nullptr));
+  m.attr("ByteCaskError") = base;
+  nb::exception<bytecask::DbDegraded>(
+      m, "DbDegraded", nb::make_tuple(base, nb::handle(PyExc_RuntimeError)));
+  nb::exception<bytecask::DbFollowerMode>(
+      m, "DbFollowerMode",
+      nb::make_tuple(base, nb::handle(PyExc_RuntimeError)));
   // A ValueError, as Python's own operations on a closed file raise.
-  nb::exception<bytecask::DbClosed>(m, "DbClosed", PyExc_ValueError);
+  nb::exception<bytecask::DbClosed>(
+      m, "DbClosed", nb::make_tuple(base, nb::handle(PyExc_ValueError)));
 
   nb::register_exception_translator(
       [](const std::exception_ptr &p, void *) {
