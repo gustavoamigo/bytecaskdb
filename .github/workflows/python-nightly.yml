@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: MIT
+# Nightly sanitizer runs of the Python binding's suite (#291). build-wheels.yml
+# runs it on release builds; these jobs run it again with the extension built
+# under a sanitizer, so a memory error or undefined behaviour in the binding
+# fails the run rather than passing unnoticed:
+#
+#   address    wrappers (DB, Snapshot, WritePlan, the iterators) are freed
+#              in whatever order the collector picks, and the lifetime and
+#              "survives" tests let an iterator outlive its snapshot or DB.
+#              A mistake there is a use-after-free a release build survives.
+#   undefined  UBSan, built with -fno-sanitize-recover=undefined.
+#
+# The interpreter is not instrumented, so the sanitizer runtime is preloaded.
+# Several times slower than the release build, hence nightly, and on every
+# update of a PR that changes this file.
+
+name: Python bindings (nightly)
+
+on:
+  schedule:
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/python-nightly.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  sanitizer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, undefined]
+    container:
+      image: fedora:43
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+      CLANG_TARGET_TRIPLE: x86_64-redhat-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            clang llvm llvm-devel lld compiler-rt \
+            libcxx libcxx-devel libstdc++-static \
+            xmake cmake \
+            python3-pip python3-devel \
+            git ninja-build
+          pip3 install nanobind pytest hypothesis
+
+      # releasedbg, as node-nightly.yml: symbols and frame pointers for the
+      # reports, without debug's per-publish key directory walk. The engine's
+      # own sanitizer jobs cover those checks; this job is after the binding.
+      - name: Configure xmake
+        run: |
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          xmake f --toolchain=clang \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            --sanitizer=${{ matrix.sanitizer }} -m releasedbg -y
+
+      - name: Build extension
+        run: xmake build bytecaskdb_python
+
+      # The runtime the extension was built against, preloaded into python3.
+      #   address: PYTHONMALLOC=malloc routes Python's own objects through
+      #     malloc, where ASan sees them; leak detection is off, since the
+      #     interpreter leaves allocations live at exit by design.
+      #   both: --capture=sys leaves file descriptor 2 to the process, so the
+      #     report reaches the log; pytest's default fd capture loses it when
+      #     the sanitizer ends the process.
+      - name: Run the suite under ${{ matrix.sanitizer }}
+        env:
+          PYTHONPATH: bytecaskdb-python
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          case "${{ matrix.sanitizer }}" in
+            address)
+              RT=$(find "$RESOURCE_DIR" -name 'libclang_rt.asan*.so' \
+                   ! -name '*preinit*' ! -name '*i386*' | head -n 1)
+              export PYTHONMALLOC=malloc ;;
+            undefined)
+              RT=$(find "$RESOURCE_DIR" -name 'libclang_rt.ubsan_standalone*.so' \
+                   ! -name '*i386*' | head -n 1) ;;
+          esac
+          test -n "$RT" || { echo "no ${{ matrix.sanitizer }} runtime found"; exit 1; }
+          echo "Sanitizer runtime: $RT"
+          LD_PRELOAD="$RT" python3 -m pytest -v -p no:cacheprovider --capture=sys \
+            bytecaskdb-python/tests/ tests/proof/test_independence.py
