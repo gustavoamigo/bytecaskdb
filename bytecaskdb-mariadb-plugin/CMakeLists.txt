@@ -272,6 +272,22 @@ if(BYTECASKDB_STATIC_LIBSTDCXX)
   target_link_options(ha_bytecaskdb PRIVATE -static-libstdc++ -static-libgcc)
 endif()
 
+# The plugin's calls to its own functions bind at link time, not through the
+# PLT: nothing interposes them, and the PLT stubs cost 2.3% of mariadbd's CPU
+# on sysbench oltp_read_write. Symbols the plugin takes from mariadbd are
+# undefined here, so they still resolve at load time. So are the C++
+# runtime's, unless BYTECASKDB_STATIC_LIBSTDCXX links it in: then its
+# functions (operator new and delete among them) bind inside the plugin too,
+# and the plugin's objects are allocated and freed by its own copy.
+target_compile_options(ha_bytecaskdb PRIVATE -fno-semantic-interposition)
+target_link_options(ha_bytecaskdb PRIVATE -Wl,-Bsymbolic-functions)
+# TLS descriptors, as libbytecask.a is built with: a thread_local in a
+# dlopen'ed object otherwise costs a call to __tls_get_addr per access. An
+# ELF option, so Linux x86-64 only.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  target_compile_options(ha_bytecaskdb PRIVATE -mtls-dialect=gnu2)
+endif()
+
 target_include_directories(ha_bytecaskdb PRIVATE
   ${MARIADB_SERVER_INCLUDE_DIRS}
   "${BYTECASK_INCLUDE_DIR}"
