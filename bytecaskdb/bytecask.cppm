@@ -1405,7 +1405,8 @@ private:
   // Rewrites a sealed file into a new sealed file containing only live entries.
   [[nodiscard]] auto vacuum_compact_file(std::uint32_t file_id,
                                          std::uint64_t retain_after) -> bool;
-  // Appends live entries from a sealed file into the active file, then removes the sealed file.
+  // Removes a sealed file with no live key and nothing compaction would keep:
+  // the state change and the unlink, no scan.
   void vacuum_remove_file(std::uint32_t file_id);
 
   // State access helpers — raw state_ access is confined here.

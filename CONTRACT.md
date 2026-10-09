@@ -40,7 +40,7 @@ snapshots and iterators keep working, on a recovery-equivalent state.
 same way. Degrading never publishes the write that failed, with one
 exception a caller can see: a write whose file rotation failed after the
 write itself was synced is applied, visible at once, and still thrown
-(*`apply_batch`*, Consistency).
+(*`apply_batch`*).
 
 ---
 
@@ -51,7 +51,7 @@ guarantees in this document hold when these do.
 
 | Condition | What is required | If it does not hold | Proved by |
 |---|---|---|---|
-| **Storage keeps what it confirmed** | Bytes an `fdatasync` reported written stay as written, and so does a synced directory entry. A failed `fdatasync` is handled (*`apply_batch`*, I/O Failure Safety); one that reports success for bytes it did not write is not detected. | `open` and `resume()` recover what the device holds. Damage they can see is refused (*`open`*); damage shaped like a crash is not. | n/a: an assumption, not a behaviour |
+| **Storage keeps what it confirmed** | Bytes an `fdatasync` reported written stay as written, and so does a synced directory entry. A failed `fdatasync` is handled (*`apply_batch`*); one that reports success for bytes it did not write is not detected. | `open` and `resume()` recover what the device holds. Damage they can see is refused (*`open`*); damage shaped like a crash is not. | n/a: an assumption, not a behaviour |
 | **Ranges are non-empty** | Every `[from, to)` — `del_range` on `DB` and `WritePlan`, `ensure_range_unchanged`, `Snapshot::count_keys` — has `from < to`. | `std::invalid_argument` before anything is written or read; a `WritePlan` is left as it was. A range-delete entry with `from >= to` written before this rule still recovers, and deletes nothing. | "Ranges: from >= to is refused, before anything is written" |
 | **No vacuum during a manifest transfer** | `vacuum()` does not run between `create_manifest()` and the end of the file copy the manifest serves. | Vacuum unlinks files by path, so a copy in progress fails with `ENOENT`. Serialising the two is the caller's. | none |
 
@@ -122,477 +122,111 @@ engine stops rather than publish it.
 
 ---
 
-## apply_batch
+## `apply_batch`
 
-The single write path. Every mutation — insert, update, delete — goes
-through `apply_batch`. `put` and `del` are convenience wrappers that
-call it with a guardless `WritePlan`.
+The one write path: `put`, `del` and `del_range` are `apply_batch` with a
+plan of one operation and no guards. A plan applies all of its operations,
+in order, if every guard holds at commit time, and none otherwise;
+`nullopt` reports a conflict.
 
-When called with guards, it is a conditional atomic batch write: apply
-these writes, but only if the caller-specified conditions still hold
-at commit time. Returns `false` with no side effects if they don't.
-This is the primitive that makes read-modify-write sequences safe
-without external locking.
-
-### Atomicity
-
-The engine must apply all writes in the plan and make them visible
-after return, or apply none. Partial application must never be
-observable by a subsequent `get()`, `contains_key()`, or `snapshot()`.
-
-### Causality
-
-If write A completes before write B begins, the observable state must
-reflect B, not A. This holds regardless of whether A and B are
-separate API calls, operations within the same batch, or a mix of
-both.
-
-Specifically:
-
-- **Across calls**: if `put(k, v1)` returns, then `put(k, v2)`
-  returns, a subsequent `get(k)` must return `v2`. If `put(k, v1)`
-  returns, then `del(k)` returns, `get(k)` must return false.
-- **Within a batch**: operations in a single `WritePlan` are applied
-  in insertion order. If a batch contains `put(k, v1)`
-  followed by `del(k)`, `get(k)` must return false. If it contains
-  `del(k)` followed by `put(k, v2)`, `get(k)` must return `v2`.
-- **Across files**: when a key exists in multiple data files (e.g.
-  after file rotation), the entry with the highest sequence determines
-  the key's state. Recovery must produce the same result regardless
-  of which files are replayed first.
-
-This ordering is preserved through recovery: hint file replay and
-parallel merge must produce the same causal result as the original
-writes.
-
-### Durability
-
-If `opts.sync == true` and no exception is thrown, all writes must be
-durable on disk before they become visible to any caller.
-
-If `opts.sync == false` and no exception is thrown, all writes must be
-visible to subsequent reads but may not survive a crash. This is an
-accepted trade-off chosen by the caller.
-
-### Conflict Safety
-
-If any precondition guard, range guard, or implicit W-W check fails,
-`apply_batch` must return `false`. The engine must not attempt any
-writes, perform I/O, or change state. The caller's snapshot must not
-be invalidated.
-
-A conflict is reported no earlier than the moment a retry could see
-what the plan lost to. Plans are validated against writes that are
-applied but not yet published (the commit pipeline's head); a snapshot
-never contains those, so a plan that lost to one is held until that
-write is published — at most one flush — and then reported. A plan whose
-snapshot is already behind the published state is reported at once. This
-is the engine's guarantee against retries that cannot succeed; it is
-*not* a guarantee that a fresh snapshot after a conflict holds the value
-that won, which a later write may already have superseded. Under genuine
-contention — several writers on one key — a retry can still lose; backing
-off between retries is the caller's responsibility, and a tight retry
-loop is not a supported client pattern.
-
-A `WritePlan` with guards but no write operations (no `put` or `del`)
-is not empty — guards are evaluated. If all guards pass, the plan
-returns `true` with no I/O and no state change. If any guard fails,
-the plan returns `false`. This is intentional: it allows callers to
-validate preconditions without committing writes, using the same
-conflict-detection mechanism.
-
-### I/O Failure Safety
-
-If any I/O operation (append, sync) throws during execution:
-
-- The caller must receive the exception.
-- The published key directory must reflect zero operations from this call
-  until `resume()` or a reopen; what either brings back is under
-  *Consistency*. `next_seq` must be advanced past all sequences consumed by appends that reached
-  the file, to prevent reuse of those sequence numbers on the next write.
-- The disk may contain none, some, or all of the bytes from this write.
-  The engine must not assume what was written. Any append failure —
-  whether nothing reached disk, a partial write, or a full write that
-  returned an error — degrades the engine unconditionally. Any `fdatasync`
-  failure (commit sync or rotation sync) likewise degrades the engine:
-  bytes are in the OS page cache but durability is not confirmed, and the
-  key directory does not reflect those bytes. `resume()` rewrites and
-  syncs the active file, scans it, truncates garbage, replays valid
-  committed entries, and creates a fresh active file, restoring normal
-  operation.
-- The DB must remain operational for subsequent calls.
-
-### Allocation Failure Safety
-
-An operation that cannot allocate fails; the engine does not try to go on
-without the memory. What it guarantees is how it fails:
-
-- Before anything is appended: the operation throws (`std::bad_alloc`)
-  and nothing changed. The engine stays writable.
-- After its entries reached the file and before a state covering them was
-  published — or on any other throw on that stretch that no I/O handler
-  degrades for: the operation throws and the engine refuses writes as
-  degraded, with the published state unchanged. `resume()` replays what
-  reached the file, as after a failed `fdatasync`. Refusing allocates
-  nothing: if the degraded state cannot be published, `is_degraded()`,
-  `degraded_reason()` and every write still report it.
-- A writer never waits forever on a flush that threw, and the process is
-  never ended by the engine for lack of memory. Dropping the last handle
-  of a snapshot, an iterator or any other key directory version never
-  throws: what cannot be freed for want of memory is freed later, or
-  leaked, never freed while a version reaches it (#390).
-- `degraded_reason()` returns a copy and may throw `std::bad_alloc`.
-
-The counted allocation-failure sweep fails every allocation of each swept
-operation, once and from then on, and checks these
-(`docs/correctness_validation.md`).
-
-### Consistency
-
-The in-memory state visible to callers must always be recovery-
-equivalent, with one permitted exception: writes completed with
-`sync=false` may be visible in memory but lost on crash — or, without a
-crash, after a failed `fdatasync` whose pages the kernel evicts before
-`resume()` reads them back. `resume()` then refuses, and a reopen
-recovers the state without them.
-
-The specific guarantees:
-
-- **Write succeeds, `sync=true`**: the data must be on disk AND
-  visible to subsequent reads.
-- **Write succeeds, `sync=false`**: the data must be visible to
-  subsequent reads. It may or may not survive a crash.
-- **Write throws**: the data may or may not be partially on disk, and
-  nothing from the write is visible before `resume()` or a reopen. After
-  either, the write is indeterminate, as a timed-out write is: every
-  complete unit that reached the file — a standalone entry, or a batch
-  through its `BulkEnd` — is replayed and becomes visible as if the write
-  had returned, and anything incomplete is cut. A caller that needs to
-  know re-reads after `resume()`. One case publishes at once: a rotation
-  that fails after the write was synced (class H under *Definitions*)
-  makes the write visible and still throws, because the write itself
-  succeeded. Recovery must reach a consistent state either way.
-
-If the engine cannot maintain recovery-equivalence — because a commit-
-phase failure (rotation, state publication) leaves in-memory state in
-a configuration that recovery would not produce — the engine must
-degrade the DB.
-
-Degrading is an acceptable outcome. The engine must not:
-
-1. Allow a caller to read a key-value pair that recovery would not
-   produce.
-2. Prevent a caller from reading a key-value pair that recovery would
-   produce (excluding the `sync=false` crash-loss case).
-3. Continue operating with inconsistent in-memory state without
-   signaling the divergence.
+| Guarantee | Proved by |
+|---|---|
+| **Atomic.** A plan's operations become visible together or not at all. No read, snapshot or iterator sees part of a plan, and a reopen holds the plan whole or not at all. | "apply_batch succeeds with no conflict", "DB WriteOptions sync=false apply_batch results visible", "vacuum compact handles batch with mixed put/del", `[prove_recovery]`, `[model]` |
+| **Ordered.** Of two writes, the one that returned before the other began is the older: the later one's state wins for every key both touch. Within a plan, operations apply in the order they were added. The order survives a reopen, whichever order recovery reads the files in. | "WritePlan: interleaved puts and del_range — correct causality", "Causality survives recovery", "DB recovery: order-independent tombstone", "DB recovery: cross-file tombstone suppresses stale put" |
+| **Durable before visible.** With `sync = true` the plan is durable before it is visible to anyone, and before the call returns. With `sync = false` it is visible on return and may be lost to a crash; `durable_sequence()` says when it has become durable. | "class F: key not visible after commit sync failure", "pipeline: sync write is invisible until its fdatasync returns; a writer appended behind it lands in the next flush", "pipeline: nosync write behind an in-flight flush becomes visible after it, without an fdatasync of its own" |
+| **A conflict leaves no trace.** When a guard, a range guard or the check on the plan's own write set fails, the call returns `nullopt`: nothing is appended, nothing becomes visible, and the plan's snapshot stays usable. Checking a guard may read the key's record; it never writes. | "apply_batch ensure_present fails when key absent", "apply_batch ensure_absent fails when key exists", "apply_batch ensure_unchanged fails on modification", "apply_batch ensure_range_unchanged fails on in-range modification", "CommitResult apply_batch conflict returns nullopt", "range conflicts match a model of the key range", "location tokens: plans checked and applied by location commit and conflict exactly as by key" |
+| **A conflict is reported once a retry can see what won.** A plan that lost to a write not yet published waits for that write to be published, at most one flush, before returning `nullopt`; a plan whose snapshot is already behind the published state is refused at once. This is not a promise that a fresh snapshot holds the winning value, which a later write may have superseded; under contention a retry can lose again, and backing off is the caller's. | "pipeline: a plan that loses to a write not yet published reports the conflict once a retry can see that write", "pipeline: a plan whose snapshot is already behind the published state reports its conflict at once", "a conflict waiting on a write whose flush fails returns when the engine degrades" |
+| **A guard-only plan commits nothing.** Its guards are checked like any plan's. When they hold it returns `{sequence = 0, durable = true}` after appending nothing, and with `sync = true` it first makes every earlier write durable (*`CommitResult`*). | "apply_batch guards-only plan with no writes", "CommitResult guard-only plan returns durable zero sequence", "apply_batch: a guard-only sync plan makes earlier unsynced writes durable" |
+| **A thrown write is unseen until `resume()`, indeterminate after.** On an I/O failure, an append or an `fdatasync`, the caller gets the exception, nothing from the plan is visible, and the engine degrades. After `resume()` or a reopen, every complete unit that reached the file is visible as if the write had returned, and anything incomplete is gone; a caller that needs to know re-reads. The bytes a failed write leaves are the engine's to clean up, never the caller's. One failure publishes at once: a write whose file rotation failed after the write itself was synced is visible and still thrown, because the write succeeded. | `[fault_sweep]`, "class F: key not visible after commit sync failure", "class G: key not visible after rotation sync failure", "pipeline: fdatasync failure fails every writer appended since the last flush and resume() recovers them", "resume() replays unpublished entries from active file" |
+| **Out of memory is a failure like any other.** Before anything is appended: `std::bad_alloc`, and nothing changed. After the entries reached the file: the write throws and the engine refuses writes until `resume()`, which replays what reached the file. Refusing allocates nothing, so `is_degraded()`, `degraded_reason()` and every write report it even when the degraded state itself cannot be published, and no writer waits forever on a flush that threw. Dropping the last handle of a `Snapshot`, an iterator or any other key directory version never throws: what cannot be freed for want of memory is freed later, or leaked, never freed while a version reaches it. `degraded_reason()` returns a copy and may throw `std::bad_alloc`. | `[alloc_sweep]`, "alloc sweep: a version is released when nothing can be allocated", "alloc sweep: a failed publication leaves the base derivable", "refuse writes: a throw after the append refuses writes until resume()", "refuse writes: the refusal holds when the degraded state cannot be published", "refuse writes: a flush that throws releases the flush role" |
+| **Readers always see a recovery-equivalent state**, with `sync = false` writes as the one exception: they can be lost to a crash, or without one when a failed `fdatasync`'s pages are evicted before `resume()` reads them back, in which case `resume()` refuses and a reopen recovers without them. Where the engine cannot keep this, it degrades rather than serve a state recovery would not produce. | `[prove_recovery]`, "reads work on a degraded DB", "resume() refuses when a failed fdatasync's pages were evicted, and a reopen recovers what the device holds" |
 
 ---
 
 ## `resume`
 
-- Garbage is only ever above the **published extent** — the active file's
-  `total_bytes` in the last published state. Damage below it is not a
-  failed write's leftovers but corruption of acknowledged data, and has no
-  recovery contract: `resume()` throws `std::runtime_error` before
-  truncating anything, the file is left exactly as found, and the engine
-  stays degraded on every retry. The same happens when `sync=false` writes
-  a failed `fdatasync` left off the device were evicted from the page
-  cache before `resume()` read them back: they are gone, and the key
-  directory holds no older version of the keys they overwrote. Reopening
-  the database recovers the state the device holds. An I/O error during
-  the scan is rethrown unchanged rather than read as the end of the file.
+Recovers a degraded engine in process. A no-op when the engine is not
+degraded.
 
-### Rotation Safety
-
-If a multi-entry batch fails mid-write, an orphaned `BulkBegin` marker
-may exist on the active file. The engine degrades: `resume()` scans the
-active file, truncates the orphaned batch (no `BulkEnd` found), and creates
-a fresh active file.
+| Guarantee | Proved by |
+|---|---|
+| **What reached the file is kept; what did not is cut.** After it returns, every complete unit in the active file is visible and durable: a failed write's units that landed are in, a batch that failed before its `BulkEnd` is cut whole, and a torn or garbage tail is gone. The engine accepts writes again, into a fresh active file. | `[prove_resume]`, "resume() recovers from degraded state", "resume() replays unpublished entries from active file", "resume() discards pending batch on CRC error in active file", "durable_sequence correct after resume" |
+| **Nothing it trusts is unsynced.** Before it builds anything from the active file, it writes the file back to the device and syncs it, so what it publishes is durable whether or not an earlier `fdatasync` failed. | "resume() makes durable what it publishes after a failed fdatasync", "resume() stays degraded when its rewrite's fdatasync fails, and leaves the file as it was" |
+| **Acknowledged data is refused, never repaired.** It cuts only above the published extent, the bytes the last published state already held. Damage below it, or `sync = false` writes a failed `fdatasync` left off the device and the kernel evicted before the read-back, throws `std::runtime_error`, leaves the file exactly as found and keeps the engine degraded on every retry; a reopen recovers what the device holds. An I/O error during the scan is rethrown, never read as the end of the file. | "resume() refuses when a failed fdatasync's pages were evicted, and a reopen recovers what the device holds", "resume() rethrows an I/O error from its scan and truncates nothing", "resume() does not trust an entry size that runs past the file", `[prove_corruption]` |
+| **It can fail and be retried.** A failure at any step leaves the engine degraded and the file no worse than it found it; the caller may call again. A failed sync after the cut, a failed directory sync, or no file id left for the new active file are such failures. | "resume() stays degraded when the sync after its truncate fails", "directory sync: a failed sync in resume() stays degraded", "Limits: resume without a file id leaves the engine degraded and untouched", "fault sweep: resume after a failed sync", "fault sweep: resume after a torn append", "alloc sweep: resume after a failed sync", "alloc sweep: resume after a torn append" |
+| **Readers are undisturbed.** Snapshots, iterators and spans taken before stay valid (*View and span lifetimes*). | "resume() with live snapshot on degraded DB", "mmap: resume() keeps reader spans valid" |
 
 ---
 
 ## `ingest`
 
-Applies pre-sequenced entries from a leader to a follower's storage.
+Applies entries a leader produced, with their sequences, to a follower.
 
-| Property | Contract |
-|----------|----------|
-| **Mode requirement** | Throws `std::logic_error` if `mode() != Mode::Follower`. |
-| **Degraded check** | Throws `DbDegraded` if the engine is degraded. |
-| **Idempotency** | Entries with `sequence <= durable_seq` are silently skipped. Safe for restart-on-failure semantics. |
-| **Limits** | Checked before any I/O, and nothing is written on a refusal: a key or value over the configured size limit, a sequence above 2^48 − 1, or an atomic batch over `kMaxBatchBytes` throws `std::invalid_argument`; a slice that needs more new files than there are file ids left throws `std::runtime_error`. See *Limits*. |
-| **Batch-safe rotation** | `BulkBegin`/`BulkEnd` pairs always land in the same data file. File rotation only occurs at boundaries where no batch is open. |
-| **Durability** | Every chunk is `fdatasync`'d before rotation. The final chunk is `fdatasync`'d before `store_state` publishes. |
-| **Sequence advancement** | After ingest, `next_seq = max(next_seq, max(ingested sequences) + 1)`. Monotonically non-decreasing. |
-| **Degraded on I/O failure** | Same pattern as `apply_batch`: on `writev`/`fdatasync` failure, advance sequence to prevent reuse, go degraded, rethrow. |
-| **Atomicity** | If ingest throws, no partial state is published to readers. |
-| **Causality** | Entries are applied in the sequence order provided by `changes_since`. If entry A has a lower sequence than entry B, A is applied before B. The follower's state reflects the same causal ordering as the leader's write history. |
-| **I/O failure safety** | If any I/O operation throws, the published key directory reflects zero entries from this call. The engine degrades; `resume()` restores normal operation. `resume()` replays every complete unit it finds in the active file — a standalone entry, or a batch through its `BulkEnd` — so after it the follower may hold the first units of the failed slice, never part of a batch. Re-delivery from `follower.durable_sequence()` then skips those and applies the rest. |
-| **Slices end at batch boundaries** | A slice that ends between a `BulkBegin` and its `BulkEnd` throws `std::invalid_argument` before anything is written. Published, it would expose part of an atomic batch, and a rotation after it would seal the `BulkBegin` into a file with no `BulkEnd`, which recovery drops: the follower would lose entries it had synced and published ([#188](https://github.com/gustavoamigo/bytecaskdb/issues/188)). The caller cuts slices after a `BulkEnd` or a standalone entry. |
+| Guarantee | Proved by |
+|---|---|
+| **Mode.** Throws `std::logic_error` unless `mode()` is `Mode::Follower`, and `DbDegraded` on a degraded engine. | "ingest throws in leader mode", "refuse writes: ingest is refused by the flag alone" |
+| **Idempotent.** Entries at or below `durable_sequence()` are skipped, so a slice can be re-delivered after any failure. | "ingest idempotency: re-ingesting is a no-op" |
+| **Limits are checked before any I/O**, and nothing is written on a refusal (*Limits*). A slice that ends inside an atomic batch throws `std::invalid_argument` the same way: published, it would expose part of a batch, and a rotation after it would leave a `BulkBegin` that recovery drops (#188). The caller cuts slices after a `BulkEnd` or a standalone entry. | "ingest refuses a slice that ends inside an atomic batch", "Limits: ingest refuses an atomic batch past the per-write byte limit", "Limits: ingest takes the last packable sequence and refuses the next", "Limits: ingest refuses a slice that needs a file id it does not have, before any I/O" |
+| **Atomic and durable per slice.** A slice is visible whole or not at all, and durable before it is visible: every file it fills is synced before the next is started, and the last before the slice is published. A batch never spans two files. | "ingest with batches: BulkBegin/BulkEnd preserved", "ingest triggers file rotation", "ingest post-loop rotation: last entry tips file past threshold", "ingest sequence continuity: durable_sequence matches max ingested" |
+| **Same order, same state.** Entries apply in the leader's sequence order, so the follower's state, and what it holds after a reopen, is the leader's through the last sequence ingested. The first write after a promotion takes the next sequence. | "basic ingest: entries from changes_since are ingested correctly", "ingest with range delete", "ingest recovery equivalence: survives close and reopen", "promotion continuity: first put after ingest gets next sequence", `[prove_repl]` |
+| **A thrown slice is unseen until `resume()`.** On an I/O failure the engine degrades and nothing from the slice is visible. `resume()` keeps the complete units that reached the file, so the follower may then hold the first units of the slice, never part of a batch; re-delivery from `durable_sequence()` skips those and applies the rest. | "fault sweep: ingest", "alloc sweep: ingest", `[prove_repl]` |
 
 ---
 
-## vacuum_compact
+## `vacuum`
 
-Rewrites a sealed data file, discarding dead entries. The old file
-must be deferred for deletion when no readers reference it.
+Reclaims the space of overwritten and deleted values by rewriting one
+sealed file without them, or by removing a file with nothing live in it.
+Returns `true` when a file was reclaimed.
 
-### Data Preservation
-
-Every key-value pair readable before `vacuum_compact` is called must
-be readable after it returns, with the same value, and after any later
-reopen. The engine must not lose data or introduce phantom entries.
-
-A tombstone may be dropped only when no other file can hold an older Put
-of a key it deletes: otherwise that Put comes back at the next open.
-Recovery decides this once per open and compaction applies it; a
-tombstone written since the open is always kept. A file whose Puts are all
-dead may be removed without a scan only if it holds no tombstone.
-
-A Put may be dropped as dead only once the write that superseded it is
-durable. Before the old file can be unlinked, vacuum makes every write it
-judged liveness by durable, even `sync = false` ones: a power cut may lose
-a write the caller did not sync, never the durable value it replaced.
-
-### Retention
-
-Vacuum drops no entry with a sequence above `VacuumOptions::retain_after`:
-a dead Put or a droppable tombstone above it is copied into the compacted
-file, and a file is removed whole only when its `max_sequence` is at or
-below it. `kNoRetention` (−1), the default, restricts nothing. The value is
-the caller's: the replication service passes the lowest position a follower
-it counts on could resume from, on every node.
-
-### Size Accounting
-
-A published file's `total_bytes` equals its size on disk. Recovery
-seeds `total_bytes` from the file's length, so anything the compacted
-file contains has to be counted as it is written — including the
-`BulkBegin` / `BulkEnd` markers, which compaction preserves like any
-other entry. `tombstone_bytes` and `marker_bytes` count the tombstones
-and markers the file holds; recovery rebuilds both from the hint files.
-A `file_stats()` reading must not change across a restart.
-
-### Progress
-
-`vacuum()` returns `true` only when a file was actually reclaimed.
-A file is eligible only for its dead Put bytes (`total_bytes` minus
-live, tombstone and marker bytes), so a file that is live data,
-tombstones and markers and nothing else is never selected. If a
-selected file's compaction still cannot make it smaller, the engine
-discards the staged copy and tries the next eligible file, returning
-`false` when none gets smaller, rather than publishing an identical file.
-A file whose every entry is above `retain_after` is not eligible.
-
-This is a termination guarantee, not only an efficiency one: every
-`true` removes bytes, so
-`while (db.vacuum({.fragmentation_threshold = 0.0})) {}` terminates.
-
-### Atomicity
-
-The compacted file must replace the old file in the published state
-in a single atomic state publication. A reader must never see a state
-where
-a key points to neither the old nor the new file.
-
-### I/O Failure Safety
-
-If any I/O operation throws during scan, copy, sync, or rename:
-
-- The caller must receive the exception.
-- The old file must remain in the published state, unchanged and
-  readable.
-- The temporary file (`.data.tmp`) must be removed before the exception
-  propagates. A removal that fails too is left to the next recovery and
-  must not replace the original exception.
-- The DB must remain operational.
-
-If the `fdatasync` that makes those superseding writes durable fails, the
-engine degrades and vacuum throws before committing; the old file stays in
-the published state and on disk. On an engine that is already degraded,
-vacuum throws `DbDegraded`.
-
-If the commit step (`vacuum_commit`) fails after the new file is
-written and renamed:
-
-- The old file must remain in the published state.
-- The new file exists on disk but is unreferenced by `key_dir`.
-- Recovery or next vacuum must handle it.
-
-If the process is killed anywhere between the rename and the unlink of the
-old file — before or after the commit:
-
-- Both files are on disk with the same entries under the same sequences.
-- The next open must succeed with every key the old file held, and must
-  leave sequence-disjoint files: recovery deletes the new file, undoing the
-  vacuum, once it has checked that every entry of the new file is in the
-  old one.
-- Two files that share sequences and fail that check must make `DB::open`
-  throw, with nothing deleted.
-
-### Stale File Safety
-
-The old data file must remain readable through any in-flight reader
-(snapshot or iterator) that holds a shared reference to it. Vacuum
-unlinks the path as soon as the new file is published; the inode
-survives because the `DataFile` object — and with it the open
-descriptor and any mapping — is reference-counted and outlives the
-unlink. Readers continue through their open descriptor; POSIX keeps an
-unlinked file readable until the last one closes. What must never
-happen is the object being destroyed while a reader still references
-it.
-
-This is one row of a general rule. See **View and span lifetimes** for
-every other event that touches a file under a live reader.
-
-### Consistency
-
-Same as `apply_batch`: in-memory state must be recovery-equivalent.
-If `vacuum_commit` would publish a state where a key references a file
-that does not contain the expected entry, the engine must degrade
-itself.
+| Guarantee | Proved by |
+|---|---|
+| **No value is lost and none comes back.** Every key readable before the call reads the same after it, and after any later reopen. A tombstone is dropped only when no other file holds an older value it hides, decided at the last `open`; a tombstone written since is kept. A file with no live value is removed without a rewrite only if it holds no tombstone. | "vacuum compact removes dead entries", "vacuum compact preserves tombstones", "vacuum keeps a tombstone-only file that shadows an older put", "vacuum keeps a tombstone written since the open", "vacuum drops a tombstone no older file needs", "vacuum keeps a range tombstone over a Put in an older file", "Vacuum model-based: dropping tombstones never resurrects a key", "vacuum remaps only the keys no write changed during its copy", "DB recovery: vacuum keeps a data file whose hint was rebuilt" |
+| **A superseded value is dropped only once its replacement is durable.** Before the old file goes, every write the vacuum judged by, `sync = false` ones included, is made durable: a power cut may lose an unsynced write, never the durable value it replaced. If that `fdatasync` fails, the engine degrades, the call throws, and the old file stays. On a degraded engine the call throws `DbDegraded`. | "vacuum does not drop a durable record that only an unsynced write supersedes", "vacuum whose fdatasync fails degrades, keeps the source file, and the durable values survive a power cut" |
+| **Retention.** Nothing with a sequence above `VacuumOptions::retain_after` is dropped: a dead value or droppable tombstone above it is copied, and a file is removed whole only when everything in it is at or below. `kNoRetention`, the default, restricts nothing. A follower resuming `changes_since` at or above `retain_after` misses nothing. | "vacuum keeps dead entries above retain_after", "vacuum keeps tombstones above retain_after", "vacuum with retain_after 0 drops nothing", "Vacuum model-based: a follower resuming at retain_after converges" |
+| **Every `true` reclaims bytes.** A file qualifies by its dead value bytes alone: one holding only live values, tombstones and batch markers is never selected, and a rewrite that would not make the file smaller is discarded and the next candidate tried. So `while (db.vacuum({.fragmentation_threshold = 0.0})) {}` terminates. | "vacuum loop reclaims all fragmentation", "vacuum does not select a file holding only tombstones", "vacuum is not stalled by a file whose only dead bytes are markers", "vacuum is not stalled by a file whose dead entries are all above retain_after", "vacuum no-op when nothing exceeds threshold" |
+| **The swap is atomic.** The compacted file replaces the old one in a single publication; no reader sees a key that points to neither. Batch markers and sequences are preserved, so `changes_since` reads the compacted file as it read the original. | "vacuum preserves BulkBegin/BulkEnd markers", "vacuum compact tracks sequences", "vacuum compact handles batch entries", `[prove_vacuum_compact]` |
+| **A failure leaves nothing behind.** If any step fails, scan, copy, sync, rename, hint or commit, the caller gets the exception, the old file stays published and readable, the copy is removed before the exception propagates, and the engine stays usable. A removal that fails under the same fault is left to the next `open`, which deletes it. | "vacuum that fails between its rename and its commit removes its copy", "open removes staged .data and .hint files and nothing else", "directory sync: a failed sync in vacuum keeps the source", "fault sweep: vacuum", "alloc sweep: vacuum", `[prove_vacuum_compact]` |
+| **A kill between the rename and the unlink is undone.** The next `open` finds the old file and its compacted copy, both holding the same entries under the same sequences, deletes the copy once it has checked that every entry of the copy is in the old file, and opens with every key. Two files that share sequences and fail that check make `open` throw, with nothing deleted. | "recovery undoes a vacuum killed before the source was unlinked", `[prove_vacuum_compact]`, `[prove_corruption]` |
+| **Readers keep the old file.** A snapshot or iterator holding the old file reads it to the end, after the unlink (*View and span lifetimes*). | "vacuum unlinks stale file immediately, snapshot reads via open fd" |
 
 ---
 
 ## `create_manifest`
 
-Rotates the active file, waits for all hint files, and returns a manifest
-of sealed files with a snapshot. Provides a consistent point-in-time view
-for follower bootstrap, backup, or federation.
+Seals the active file and returns the sealed files, with a snapshot, for
+a follower bootstrap or a backup.
 
-### Completeness
-
-The manifest includes every sealed data file and its hint companion. The
-`through_sequence` value equals the highest sequence that was durable at
-the time of rotation. The snapshot reflects exactly the state through
-`through_sequence` — no more, no less.
-
-### Rotation atomicity
-
-`create_manifest` syncs the active file before rotation. The sync advances
-`durable_seq` so that `through_sequence` is fully durable. The state is
-captured under `write_mu_` immediately after `store_state`, preventing a
-concurrent write from slipping between state publication and snapshot
-capture.
-
-### File list accuracy
-
-Every `data_path` in `FileManifest::files` exists on disk at the time of
-return. `worker_.drain()` waits for hint generation to finish before the
-list is built, but a `hint_path` may name a file that does not exist: the
-worker only logs a failed hint write. A missing hint costs no data. A hint
-is a rebuildable index, and the open of a directory holding the copied
-files writes the hint of any data file that has none (#349). A caller
-copies a hint when it exists and skips it when it does not.
-
-### I/O failure safety
-
-If the pre-rotation sync fails, the engine degrades, the exception
-propagates and no manifest is produced. The active file is not sealed.
-As after any failed `fdatasync`, a later sync cannot be trusted to write
-what the failed one did not (#231), so writes throw `DbDegraded` until
-`resume()` rewrites and syncs the file (#281).
-
-If `prepare_rotation` fails (active file sealed but new file creation
-fails), the engine degrades — same pattern as `execute_slots` and
-`ingest`. The sealed active file cannot accept further appends;
-degrading forces `resume()` before the next write. `resume()` creates a
-fresh active file and clears the degraded state.
+| Guarantee | Proved by |
+|---|---|
+| **Complete and durable through `through_sequence`.** The manifest lists every sealed data file. Every write acknowledged before the call, `sync = false` ones included, is synced before the active file is sealed, so `through_sequence` is durable and the snapshot holds exactly the writes through it. No write slips between the seal and the snapshot. | "basic manifest contains sealed files with hints", "empty db manifest", "writes continue after manifest", "manifest after vacuum", `[prove_manifest]` |
+| **Every listed data file exists; a listed hint may not.** Hint writes are waited for before the list is built, but a hint whose write failed is only logged. A missing hint costs no data: opening the copied directory rebuilds it (#349). A caller copies a hint when it exists and skips it when it does not. | `[prove_manifest]` |
+| **A failed sync degrades, and nothing is sealed.** The exception propagates, no manifest is produced, and writes throw `DbDegraded` until `resume()`. A seal that fails after the sync, because the next active file cannot be created, degrades the same way; `resume()` opens a fresh active file. | "create_manifest whose fdatasync fails degrades, and a power cut keeps everything below durable_sequence", "create_manifest after resume() from its failed fdatasync makes every write durable", "refuse writes: create_manifest's rotation that fails in memory refuses writes", "fault sweep: create_manifest" |
+| **Vacuum must not run until the copy is done** (*Conditions*). | none |
 
 ---
 
 ## `set_mode` / `mode`
 
-Controls which write paths are available.
-
-| Property | Contract |
-|----------|----------|
-| **`set_mode(Mode)`** | Acquires `write_mu_` to ensure no in-flight write straddles the transition. Stores mode with release semantics. |
-| **Stepping down is durable** | `set_mode(Follower)` on a leader first `fdatasync`s the active file, so on return `durable_sequence()` covers every write acknowledged before the call, `sync=false` ones included, and `changes_since` can ship them all to the next leader. A failed `fdatasync` degrades the engine and throws; the mode is unchanged. |
-| **`mode()`** | Lock-free atomic read with acquire semantics. Same pattern as `is_degraded()`. |
-| **Leader mode** | Normal writes allowed; `ingest` throws `std::logic_error`. |
-| **Follower mode** | Normal writes (`put`, `del`, `del_range`, `apply_batch`) throw `DbFollowerMode`; `ingest` allowed. Reads, snapshots, vacuum, and `resume()` work in both modes. |
-| **Initial mode** | Set from `Options::initial_mode` (default `Mode::Leader`) after recovery completes. |
+| Guarantee | Proved by |
+|---|---|
+| **No write straddles a mode change.** A write completes before `set_mode` or starts after it. `mode()` is lock-free. | "set_mode transitions: leader -> follower -> leader" |
+| **Stepping down is durable.** `set_mode(Mode::Follower)` on a leader syncs first: on return `durable_sequence()` covers every write acknowledged before the call, `sync = false` ones included, so `changes_since` can ship them all to the next leader. A failed `fdatasync` degrades the engine, throws, and leaves the mode unchanged. A degraded leader steps down without a sync. | "set_mode(Follower) makes unsynced acknowledged writes durable", "set_mode(Follower): a failed fdatasync degrades and keeps the mode", "set_mode(Follower) on a degraded leader steps down without a sync" |
+| **Leader**: `put`, `del`, `del_range` and `apply_batch` are allowed, `ingest` throws `std::logic_error`. **Follower**: those four throw `DbFollowerMode`, `ingest` is allowed. Reads, snapshots, `vacuum()` and `resume()` work in both. The initial mode is `Options::initial_mode`. | "mode enforcement: put/del/apply_batch throw in follower mode", "ingest throws in leader mode" |
 
 ---
 
-## Hint Files
+## Hint files
 
-A hint file is a compact index of a sealed data file. It allows
-recovery to rebuild the key directory without scanning raw data
-entries. One hint file per sealed data file.
+A hint is an index of a sealed data file that `open` reads instead of the
+file. It is never the record; the data file is.
 
-### Correctness
-
-The hint file for a sealed data file must be a faithful summary of
-that file's committed content. Every entry that recovery would accept
-from a raw data scan must be present in the hint file. An entry that
-recovery would reject must not be present.
-
-Specifically:
-
-- Every complete Put and Delete entry outside a batch must be included.
-- Entries inside a `BulkBegin`..`BulkEnd` pair must be included only
-  if the `BulkEnd` is present. If `BulkEnd` is missing (crash mid-
-  batch), all entries after the unmatched `BulkBegin` must be
-  discarded.
-- If the same key appears multiple times in the file, only the entry
-  with the highest sequence number must be kept. This is a per-file
-  deduplication — cross-file conflict resolution happens during
-  recovery.
-
-### Ordering
-
-A hint indexes only bytes the device holds. Its data file is `fdatasync`ed
-before the hint is written — at rotation, before the sealed file is handed
-to the hint worker; at vacuum, before the compacted copy is renamed; at
-open, by rewriting and syncing a hint-less file before scanning it — so a
-power loss can lose a hint, never leave one pointing into bytes that are
-gone. `PageCacheModel::hint_written` checks this at every hint the tests
-write.
-
-### Atomicity
-
-Hint files must be written atomically via a temp-then-rename protocol.
-The file must be written to `.hint.tmp`, synced, then renamed to
-`.hint`. A reader must see either the complete hint file or no hint
-file. A partial `.hint.tmp` left by a crash must be cleaned up on next
-recovery.
-
-### Idempotency
-
-If a `.hint` file already exists for a data file, hint generation
-must be skipped. Generating the same hint file twice must produce the
-same result. The operation must be safe to retry or run concurrently
-from different code paths (rotation dispatch, shutdown, recovery).
-
-### Timing
-
-Hint generation must be dispatched to a background worker when the
-active file is sealed during rotation. It must not block the write
-path.
-
-At shutdown, the engine must drain the background worker, then write
-hint files for any sealed files that do not yet have one.
-
-During recovery, any sealed data file without a `.hint` file must get
-one generated before recovery proceeds. Recovery must never build the
-key directory directly from raw data files. If a sealed data file has
-no hint file, recovery must generate one from the raw data file before
-proceeding. The key directory must always be built from hint files.
-
-### I/O Failure Safety
-
-If hint generation fails (I/O error during scan, write, sync, or
-rename):
-
-- A `.hint` file must not be produced. The `.hint.tmp` may remain on
-  disk.
-- The data file must not be affected.
-- The next recovery must clean up the `.hint.tmp` and regenerate the
-  hint file from the data file.
-- The engine must not lose data.
+| Guarantee | Proved by |
+|---|---|
+| **A hint never costs a key.** A hint that is missing, fails its CRC, that a read fails on, or that a crash left half written is rebuilt from its data file at the next `open`. A hint is built only from bytes the device holds, so it never points past what a power loss keeps. | "DB recovery: a corrupt hint is rebuilt from its data file", "DB::open rebuilds a hint file a read fails on", "DB::open leaves a hint alone on an error that says nothing about its bytes", "DB recovery: a crash while open writes a hint leaves no hint behind it, and the next open recovers", "open fails when the rewrite of a hint-less file cannot be synced, and writes no hint for it", "directory sync: a hint rebuilt at open is synced", `[hintfile]` |
+| **A hint indexes exactly the committed entries of its file**: every complete entry outside a batch, every entry of a batch that has its `BulkEnd`, range tombstones included, and nothing of a batch that lacks one. A key that appears more than once appears each time; recovery keeps the highest sequence. | "recovery checks the layout of a hint file's sorted run", "DB recovery: hint file path after rotation", "Recovery model-based: hints split into many frames", `[model]` |
+| **Hints never block a write, and the work they leave is bounded.** They are written in the background after a file is sealed. At most `max_hint_backlog` sealed files wait for one; a rotation past that waits for the writer, stalling writes, not reads. `close()` writes every hint owed, the active file's included, and reports a failure (*`close`*). `max_hint_backlog = 0` never waits. | "hint backlog: a rotation past max_hint_backlog waits for the worker", "hint backlog: max_hint_backlog = 0 never waits", "DB close writes hint file for sealed file", "a clean close writes the active file's hint", "DB destructor flushes hint files" |
+| **`fail_recovery_on_crc_errors = false`** is the one opt-out: a data file whose hint is bad and that cannot be rescanned is skipped with a warning, and the database opens without its keys (*`open`*). | "DB recovery: strict mode throws when a hint cannot be rebuilt", "DB recovery: lenient mode opens with partial recovery when a hint cannot be rebuilt" |
 
 ---
 
