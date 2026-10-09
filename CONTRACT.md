@@ -1,13 +1,17 @@
 # ByteCaskDB — Correctness Contract
 
-This document defines the behavioral guarantees of every write function
-in the engine. It is the source of truth for both the implementation
-and the proof infrastructure. The invariant checker and fault injection
-harness prove this contract, not the implementation.
+What the engine guarantees, and what it does not. *Definitions* and
+*Conditions* come first, then one table per operation: each row is one
+guarantee, and its second cell names the Catch2 tests, by name or by tag,
+that fail if the row is broken, or none. *Exclusions*, at the end,
+lists what no row covers.
 
-One section per write function, then one for the read path: what the
-engine promises about the views and spans it lends out, and how long.
-Plain language.
+The test for every sentence here: if it could change while every
+guarantee stays the same, it is mechanism and belongs in
+[`docs/bytecask_design.md`](docs/bytecask_design.md), not here. The
+contract names only what `include/bytecask.hpp` declares, and CI
+enforces it. A change to a guarantee is named in the pull request that
+makes it: added, widened, narrowed or removed.
 
 ---
 
@@ -202,7 +206,6 @@ a follower bootstrap or a backup.
 | **Complete and durable through `through_sequence`.** The manifest lists every sealed data file. Every write acknowledged before the call, `sync = false` ones included, is synced before the active file is sealed, so `through_sequence` is durable and the snapshot holds exactly the writes through it. No write slips between the seal and the snapshot. | "basic manifest contains sealed files with hints", "empty db manifest", "writes continue after manifest", "manifest after vacuum", `[prove_manifest]` |
 | **Every listed data file exists; a listed hint may not.** Hint writes are waited for before the list is built, but a hint whose write failed is only logged. A missing hint costs no data: opening the copied directory rebuilds it (#349). A caller copies a hint when it exists and skips it when it does not. | `[prove_manifest]` |
 | **A failed sync degrades, and nothing is sealed.** The exception propagates, no manifest is produced, and writes throw `DbDegraded` until `resume()`. A seal that fails after the sync, because the next active file cannot be created, degrades the same way; `resume()` opens a fresh active file. | "create_manifest whose fdatasync fails degrades, and a power cut keeps everything below durable_sequence", "create_manifest after resume() from its failed fdatasync makes every write durable", "refuse writes: create_manifest's rotation that fails in memory refuses writes", "fault sweep: create_manifest" |
-| **Vacuum must not run until the copy is done** (*Conditions*). | none |
 
 ---
 
@@ -241,7 +244,6 @@ its promises (*Conditions*), and refuses any other.
 | **One file at most is cut.** Only the file being written when the process stopped can hold a torn record. `open` cuts that file at its last committed record, whole if its first page was lost, and syncs the cut. A tail of zeros, preallocated space, is trimmed in any file. | "DB recovery: a hint-less file's tail is truncated only in the newest file", "DB recovery: open fails when the cut of a torn tail cannot be synced, and the next open recovers", "Preallocated tail: sealed files shrink to their logical size", "fault sweep: open after a crash" |
 | **Nothing it indexes is unsynced.** A data file without a hint is written back to the device and synced before anything is built from it, so what `open` publishes is durable whether or not the last process synced it. | "open makes a hint-less file durable before it indexes it: close after a failed fdatasync", "open makes a hint-less file durable before it indexes it: a process killed before its sync", "open fails when the rewrite of a hint-less file cannot be synced, and writes no hint for it" |
 | **Damage is refused, not opened around.** A state no crash leaves on storage that keeps its promises is damage. Where `open` can see it, it throws and cuts nothing: data past the last committed record in a file that is not the newest, such data in more than one file, two files sharing sequences other than an interrupted vacuum's pair. It never opens a best-effort subset of a damaged database, which to the caller would be data loss with no error. The one opt-out is `fail_recovery_on_crc_errors = false` (*Hint files*), and it does not relax the cutting rules. | "DB recovery: a hint-less file's tail is truncated only in the newest file", "recovery refuses two different writes under one sequence", "recovery keeps the full file over a copy of its prefix", "recovery undoes a vacuum killed before the source was unlinked", "DB vacuum: a damaged sealed file is not compacted away" |
-| **Damage shaped like a crash is not covered.** `open` cannot refuse what it cannot tell from a torn write. `docs/bytecask_design.md`, *Recovering a Hint-less File*, lists the known shapes. | n/a: an exclusion |
 | **One process at a time.** A directory another process holds open is refused with `std::system_error`. `close` releases it. | "DB rejects concurrent open on same directory", "DB directory unlocked after close" |
 | **Options are checked first.** `max_key_bytes`, `max_value_bytes` or `max_file_bytes` above its hard ceiling (*Limits*), `recovery_threads = 0`, or a buffer pool under `2 x max_file_bytes`, throws `std::invalid_argument` before the directory is created or locked. `max_file_bytes = 0` is valid: every write seals the file it went into. | "Limits: open rejects options above the hard ceilings", "Options: recovery_threads = 0 is refused at open", "Options: a buffer pool of exactly 2 x max_file_bytes is accepted, one byte less is not", "Options: max_file_bytes = 0 seals a file after every write" |
 
@@ -313,4 +315,23 @@ a live view shows, and never invalidates it either.
 | **A copy is the caller's.** The `Bytes` that `get` fills is the caller's; no event reaches it, and the next `get` into the same vector overwrites it. | "DB get output-param round-trip" |
 | **Under `IoBackend::BufferPool`** a lent `EntryView` whose record lies in one resident cache frame pins that frame until the iterator advances; otherwise the bytes are copied into the iterator and nothing is pinned. Eviction skips a pinned frame and never waits for it, so a span held across a long loop body costs at most one frame, never a stall. | "BufferPool: a leased frame survives eviction pressure", "io_backend=BufferPool: lent entry spans hold while readers evict" |
 | **Under `IoBackend::Mmap`** a read the kernel cannot complete, a media error or a file truncated by something other than the engine, is `SIGBUS`, not `std::system_error`. The other back-ends throw. | none |
-| **Not promised.** Nothing detects a stale view. A span used after its iterator advanced or died, and a moved-from `Snapshot` used for anything but destruction or assignment, read memory the engine no longer vouches for, silently. These rules are written down because no check catches a mistake against them. | n/a: an exclusion |
+
+---
+
+## Exclusions
+
+What the engine does not promise. Each row names the section whose
+guarantee stops at it.
+
+| Not covered | Where the boundary is stated |
+|---|---|
+| **`sync = false` writes.** One is visible on return and can be lost to a crash before an `fdatasync` covers it, and without a crash when a failed `fdatasync`'s pages are evicted before `resume()` reads them back; `resume()` then refuses and a reopen recovers without them. What survives is a prefix of the write order, batches whole. `durable_sequence()` and `CommitResult::durable` say what is safe. | *`apply_batch`*, *`resume`*, *`open`* |
+| **Storage that lies.** An `fdatasync` that reports success for bytes it did not write, or a directory entry that does not survive its sync, is not detected. Every durability guarantee is conditional on the device keeping what it confirmed. | *Conditions* |
+| **Damage shaped like a crash.** `open` cannot refuse what it cannot tell from a torn write, so in the newest file damage in synced data is truncated with the tail, and a sealed file damaged in one of the shapes a crash leaves opens. `docs/bytecask_design.md`, *Recovering a Hint-less File*, lists the shapes. | *`open`* |
+| **Keys of a file the operator chose to skip.** With `fail_recovery_on_crc_errors = false`, a data file whose hint is bad and that cannot be rescanned is left out, with a warning, and the database opens without its keys. | *Hint files* |
+| **Write skew on an unguarded read.** A plan with a snapshot checks its guards and its own write set, nothing else. A value read from the snapshot and neither written nor guarded can have changed by commit. `ensure_unchanged` and `ensure_range_unchanged` are what make a plan's reads part of its conflict check. | *`apply_batch`* |
+| **The outcome of a thrown write, after recovery.** Before `resume()` or a reopen nothing of it is visible; after, every complete unit that reached the file is, as if the write had returned. A caller that needs to know re-reads. | *`apply_batch`*, *`ingest`* |
+| **A stale view.** Nothing detects one. A span used after its iterator advanced or died, and a moved-from `Snapshot` used for anything but destruction or assignment, read memory the engine no longer vouches for, silently. The rules are written down because no check catches a mistake against them. | *View and span lifetimes* |
+| **An operation racing `~DB`.** Undefined, as using any object whose lifetime is ending; what is already on disk is a valid prefix of the committed history and the next `open` recovers it. `close()` may race; the destructor may not. | *`close`* |
+| **A read the kernel cannot complete under `IoBackend::Mmap`.** It is `SIGBUS`, which ends the process unless the host handles it, not an exception. | *View and span lifetimes* |
+| **Space.** Reclaiming dead bytes is `vacuum()`'s, when it is called; nothing runs it. A file that qualifies holds its dead bytes until then. | *`vacuum`* |

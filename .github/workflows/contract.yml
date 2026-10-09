@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: MIT
 # CONTRACT.md states guarantees in public terms: every name in it is
-# declared in include/bytecask.hpp, or is on a baseline that only shrinks
-# (#399). A private name describes mechanism, which changes under refactors
-# that change no guarantee.
+# declared in include/bytecask.hpp (#399). A private name describes
+# mechanism, which changes under refactors that change no guarantee.
 #
 # Its own workflow, because ci.yml ignores Markdown: a change to the
-# contract alone must still run this, and a change to the header, the
-# script or the baseline can break it too.
+# contract alone must still run this, and a change to the header or the
+# script can break it too.
 
 name: Contract
 
@@ -17,14 +16,12 @@ on:
       - CONTRACT.md
       - include/bytecask.hpp
       - scripts/check_contract_vocabulary.py
-      - scripts/contract_vocabulary_baseline.txt
   pull_request:
     branches: [main]
     paths:
       - CONTRACT.md
       - include/bytecask.hpp
       - scripts/check_contract_vocabulary.py
-      - scripts/contract_vocabulary_baseline.txt
   workflow_dispatch:
 
 permissions:
