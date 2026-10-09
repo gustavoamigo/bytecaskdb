@@ -2124,6 +2124,26 @@ so any report fails the job; its leg on the blind tree also runs
 `btree_tests`, which does not depend on `BYTECASK_KEYDIR`. The three MSan
 jobs share one cache entry for the instrumented libc++.
 
+### Sanitizers on the Python binding
+
+`python-nightly.yml` builds the Python extension with ASan and with UBSan,
+one job each, and runs the binding's suite (`bytecaskdb-python/tests/` and
+`tests/proof/test_independence.py`) against it every night (#291). The
+interpreter is not instrumented, so each job preloads the matching runtime
+into `python3`. The ASan job sets `PYTHONMALLOC=malloc`, so Python's own
+objects are allocated where ASan sees them, and turns leak detection off,
+since the interpreter leaves allocations live at exit by design. pytest runs
+with `--capture=sys`: its default capture of file descriptor 2 loses the
+report when the sanitizer ends the process. An out-of-bounds read planted
+in a binding function failed the ASan job at its line, and a planted signed
+overflow failed the UBSan job.
+
+What this guards is the binding's own memory: wrappers freed in whatever
+order the collector picks, and iterators that outlive their snapshot or
+`DB`. Removing the `keep_alive` from `Snapshot.iter_from` was not reported,
+and is not a bug: the engine's iterator owns what it reads, so `keep_alive`
+there is a second guard, not the only one.
+
 ### Fuzz testing (libFuzzer)
 
 Three harnesses feed arbitrary bytes to the code that parses what recovery

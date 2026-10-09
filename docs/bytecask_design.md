@@ -70,6 +70,8 @@ C++23 modules are not portable across compilation unit boundaries when linking e
 
 **Errors.** The engine's own errors share one base, `ByteCaskError`, defined by the extension: `DbDegraded`, `DbFollowerMode` and `DbClosed`, and `ext.py`'s `ConflictError`. Each also keeps the builtin base it maps to — `RuntimeError` for the first two, `ValueError` for `DbClosed` — so code catching those still works. `std::system_error` becomes `OSError` and `std::logic_error` `ValueError`; neither is a `ByteCaskError`, since they report a failed call, not a state of the database. There was a separate `DegradedError` in `ext.py` that nothing raised (#291); it was removed, and `DbDegraded` is the one name. `tests/test_degraded.py` degrades a real engine with no fault-injection build: `RLIMIT_FSIZE` set to the active data file's size, with `SIGXFSZ` ignored, makes the write that has to extend the zero-filled file fail with `EFBIG`.
 
+The suite also runs every night with the extension built under ASan and under UBSan (`python-nightly.yml`; see `correctness_validation.md`, *Sanitizers on the Python binding*).
+
 `DataEntry` is constructible from Python (`DataEntry(sequence, entry_type, key, value)`) with bytes-like key/value inputs. This enables network replication transports to deserialize wire payloads back into `DataEntry` objects before calling `ingest()`.
 
 The locking strategy respects the engine's existing thread model:
