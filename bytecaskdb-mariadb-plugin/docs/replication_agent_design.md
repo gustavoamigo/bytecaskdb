@@ -1,162 +1,243 @@
-# Replication operator: a `bytecaskdb` replication type for mariadb-operator
+# Replication: the plugin and the operator as one design
 
-Status: design, not implemented. Implements the "external operator" of
-[#422](https://github.com/gustavoamigo/bytecaskdb/issues/422) by forking
+Status: design, not implemented. One project with two halves:
+[#422](https://github.com/gustavoamigo/bytecaskdb/issues/422) is the plugin
+half, and a `type: bytecaskdb` replication mode in a fork of
 [mariadb-operator](https://github.com/mariadb-operator/mariadb-operator) (MIT)
-and adding a replication type whose SQL is the plugin's control surface instead
-of the binlog's. Where this document and #422 differ, this document wins; the
-differences are listed at the end.
+is the operator half. This document defines both from one table, so that each
+call the operator makes has exactly one plugin counterpart and the plugin
+exposes nothing the operator does not call. Where #422's control surface
+differs, this document supersedes it; the differences are listed at the end.
 
-## Shape
+## Principle
 
-#422 as written: **the plugin enforces, the operator decides.** The plugin
-refuses to write without an unexpired lease, refuses a promotion with a term it
-has seen, refuses to pull from an older term, and comes up refusing to serve
-after an unclean shutdown as leader. The operator renews the leader's lease,
-notices a dead primary, picks the most advanced follower, promotes it, repoints
-the others, and re-bootstraps the old one.
+The operator already drives a MariaDB node through `SET @@global`, one status
+query, `read_only`, a wait function and probes. ByteCaskDB tables replicate
+through the engine instead of the binlog, so the plugin answers those same
+calls with the engine's primitives. The operator's code paths, state machine,
+status fields, Services, recovery and resources are kept; only what the SQL
+says changes, behind one interface. The plugin is shaped by the operator's
+contract, not the other way round.
 
-mariadb-operator already does the second half for binlog replication: a
-reconciler that configures a primary and its replicas, a pod controller that
-fails over when the primary pod stops being Ready, an eight-phase switchover
-driven by `spec.replication.primary.podIndex`, a per-pod agent that answers the
-probes from replication state, primary and secondary Services, replica
-recovery, and MaxScale, Users, Grants and Databases as resources. The fork
-keeps all of it and changes what the SQL says.
+Safety stays where #422 put it, in the plugin: a write lease checked on every
+commit, terms in the data file, followers that refuse an older term. The
+operator can be late or wrong without corrupting anything. There is no
+sidecar state anywhere: every node boots as a read-only follower, and the
+operator tells it what to be, which is the operator's existing
+`semiSyncBootAsReplica` pattern made the only mode.
 
-A central operator is enough. CloudNativePG runs the same shape in production.
-The operator's own availability is controller-runtime's leader election over a
-Deployment; if every replica of it is down, the leader's lease runs out and the
-cluster goes read-only until the operator returns. That is the cost #422
-accepted, and the plugin lease is what keeps an operator outage, or an operator
-mistake, from corrupting anything.
+## The contract
 
-## What the plugin provides
+Left: the operator's call and where it lives. Middle: what it runs for binlog
+replication. Right: what it runs for `type: bytecaskdb`, and what the plugin
+does.
 
-#422's control surface, with three additions:
+### Boot
 
-| Mechanism | Notes |
+| Operator | Binlog | ByteCaskDB |
+|---|---|---|
+| `init` renders `0-replication.cnf` (`pkg/controller/replication/config.go`) | `log_bin`, `server_id`, `gtid_*`, `rpl_semi_sync_*`, `read_only=ON` with `semiSyncBootAsReplica` | `read_only=ON`, `bytecaskdb_replication=ON`. No binlog. **Plugin:** sets `HA_HAS_OWN_BINLOGGING`; boots in follower mode with no source and no lease; serves reads. Nothing about replication is persisted, so a restarted pod is a follower with no source until the operator configures it. |
+| `init` cleans `master.info`, `relay-log.info` | state files on disk | nothing to clean |
+
+### Configure a replica
+
+| Operator | Binlog | ByteCaskDB |
+|---|---|---|
+| `TopologyManager.ConfigureReplica` | `STOP SLAVE; SET gtid_slave_pos; SET read_only=1; CHANGE MASTER TO MASTER_HOST, MASTER_PORT, MASTER_USER, MASTER_PASSWORD, MASTER_SSL_*, MASTER_CONNECT_RETRY, MASTER_USE_GTID; START SLAVE` | `SET read_only=1;` then the `ChangeMasterOpts` fields one to one: `bytecaskdb_source_host`, `_port`, `_user`, `_password`, `_ssl_ca`, `_ssl_cert`, `_ssl_key`, `_connect_retry`; then `bytecaskdb_source_enabled=1`. **Plugin:** a pull thread connects with those credentials as an ordinary client, reads the leader's entries from its own `durable_sequence`, applies them with `ingest`, cut at batch boundaries. Setting the same values again is a no-op; a changed host restarts the pull. The request carries the follower's highest term; a source on an older term is refused with `last_source_errno = 4001`. |
+| `getReplicaOpts`: `gtid_slave_pos` from a snapshot annotation or the agent's `GET /replication/gtid` | needed, the position is outside the data | **not needed**: the position is the follower's own `durable_sequence`, in its data files |
+
+### Configure the primary
+
+| Operator | Binlog | ByteCaskDB |
+|---|---|---|
+| `TopologyManager.ConfigurePrimary` | `STOP SLAVE; RESET SLAVE ALL; SET gtid_slave_pos=''`; replication user DDL | `bytecaskdb_source_enabled=0; SET GLOBAL bytecaskdb_promote=1`. **Plugin:** refuses unless the pull is stopped, `received_sequence = applied_sequence`, and a lease is granted (when `bytecaskdb_lease_ms > 0`). Takes term = highest term seen in the log + 1 and appends the term-start entry `(term, start_seq)` as its first write. An explicit `bytecaskdb_promote=<term>` is accepted for manual operation and refused if not above the highest seen. The operator keeps no term: the most advanced follower, which is the one it promotes, has seen every term any other node has, because term-start entries are log entries. |
+| `DisableReadOnly` / `EnableReadOnly` | `SET read_only` | unchanged |
+
+### Status
+
+| Operator | Binlog | ByteCaskDB |
+|---|---|---|
+| `sql.Client.ReplicaStatus` → `ReplicaStatusVars` | `SHOW REPLICA STATUS` + `@@gtid_current_pos` | `SELECT * FROM information_schema.BYTECASKDB_REPLICATION`, one row, columns named for the struct fields: `source_running`, `apply_running` (bools; a reconnecting pull reports `source_running = 1`, as `Connecting` does today), `last_source_errno`, `last_source_error`, `last_apply_errno`, `last_apply_error`, `seconds_behind_source` (**NULL when the pull is not running**, as the code's comment on `Seconds_Behind_Master` requires), `received_sequence`, `applied_sequence`, `durable_sequence`, `term`, `role` (`primary`, `replica`), `source_host`, `source_port`, `lease_remaining_ms`. `ReplicaStatusVars` becomes an interface with a binlog and a bytecaskdb implementation; positions are `uint64` behind a `Position` with `GreaterThan`. |
+| `IsReplicationPrimary` | `SHOW MASTER STATUS` | `role = 'primary'` |
+| `IsReplicationRunning` | both threads running | `source_running AND apply_running` |
+| `status.replication.roles` | `Primary`, `Replica`, `PrimaryReplica`, `Unknown` | unchanged. A pod that restarts goes to `Unknown`, which is what makes the reconciler configure it again. |
+
+Error numbers the recovery controller acts on, mirroring 1236:
+
+| `last_source_errno` | Meaning | Recovery |
+|---|---|---|
+| 4001 | source is on an older term than this node has seen | retry: the operator is still repointing |
+| 4002 | **diverged**: this node's `durable_sequence` is above the source's term-start `start_seq`, so it holds writes from a branch the leader never had | immediate, like 1236 |
+| 4003 | history gone: the source has vacuumed below this node's cursor | immediate, like 1236 |
+| other | connection and auth errors | after `errorDurationThreshold`, as today |
+
+### Failover
+
+| Operator | Binlog | ByteCaskDB |
+|---|---|---|
+| `ReconcilePodNotReady` (`pod_replication_controller.go`) | waits `autoFailoverDelay`, patches `podIndex` | unchanged. The webhook floors `autoFailoverDelay` at `lease.ttl + 5 s`, so the old primary's lease has expired before the new one is promoted. |
+| `FurthestAdvancedReplica` (`failover.go`) | Ready; IO and SQL running; no relay-log events; highest `gtid_current_pos`; ties to the lowest name | Ready; `source_running AND apply_running`; `received_sequence = applied_sequence`; highest `durable_sequence`; ties to the lowest name |
+
+### Switchover
+
+The eight phases of `reconcileSwitchover`, in order:
+
+| Phase | Binlog | ByteCaskDB |
+|---|---|---|
+| 1 `lockPrimaryWithReadLock` | `FLUSH TABLES WITH READ LOCK` | no-op |
+| 2 `setPrimaryReadOnly` | `SET read_only=1` | `SET read_only=1; SET GLOBAL bytecaskdb_demote=1`. **Plugin:** `set_mode(Follower)`, which makes every acknowledged write durable first, and revokes the lease. |
+| 3 `waitSync` | `gtid_binlog_pos` on the primary, `MASTER_GTID_WAIT(pos, timeout)` on each replica | `durable_sequence` on the primary, `SELECT BYTECASKDB_WAIT_SEQUENCE(seq, timeout_s)` on each replica. **Plugin:** the UDF is `durable_sequence(seq, timeout)` and returns `0` reached, `-1` timeout, the contract `WaitForReplicaGtid` parses. When the primary is not Ready, `waitForNewPrimarySync` polls until `received_sequence = applied_sequence`. |
+| 4 `configureNewPrimary` | `ConfigurePrimary` | `ConfigurePrimary` |
+| 5 `connectReplicasToNewPrimary` | `ConfigureReplica` with the new `gtid_binlog_pos` | `ConfigureReplica`, no position |
+| 6 `changePrimaryToReplica` | `UNLOCK TABLES`, `ConfigureReplica` with `MASTER_DEMOTE_TO_SLAVE` | `ConfigureReplica` |
+| 7 `reconcileSemiSyncSwitchover` | see below | see below |
+| 8 `disableNewPrimaryReadOnly` | `SET read_only=0` | unchanged |
+
+### Lease
+
+No binlog counterpart. The one thing the operator does that it did not do
+before.
+
+| Operator | ByteCaskDB |
 |---|---|
-| `SET GLOBAL bytecaskdb_replication_source = 'host:port'` | Starts or stops the pull thread. The pull carries the follower's highest term; a source on an older term is refused. |
-| `SET GLOBAL bytecaskdb_promote = <term>` | Refused unless the pull loop is stopped, everything received is applied, the term is above any seen, and a lease is granted. Its first write is the term-start entry `(term, start_seq)`. |
-| `SET GLOBAL bytecaskdb_demote = 1` | **New.** `set_mode(Follower)`, which makes every acknowledged write durable, then `@@read_only = 1` and the lease revoked. |
-| `SET GLOBAL bytecaskdb_lease_ms = <ms>` | A deadline on `CLOCK_BOOTTIME`, **checked on every commit**, not in a background thread, so a process or VM paused past it refuses its next write. `0` revokes. |
-| `SET GLOBAL bytecaskdb_retain_after = <seq>` | **New.** Passed to every vacuum. The operator sets it from the lowest sequence any follower or bootstrap needs. |
-| `bytecaskdb_sync_followers`, `bytecaskdb_sync_count` | **New, later milestone.** A commit returns once `sync_count` of the named followers report `durable_sequence() ≥ seq`. |
-| `information_schema.BYTECASKDB_REPLICATION` | `role`, `term`, `applied_sequence`, `durable_sequence`, `source`, `source_term`, `lag_seconds`, `lease_remaining_ms`, `state` (`running`, `crashed_leader`, `diverged`), `last_error`. |
-| `BYTECASKDB_WAIT_SEQUENCE(seq, timeout_ms)` | UDF over `durable_sequence(seq, timeout)`. |
+| `reconcileReplication`, primary branch: `SET GLOBAL bytecaskdb_lease_ms = lease.ttl`, requeue every `lease.ttl / 3` | **Plugin:** a deadline on `CLOCK_BOOTTIME`, checked inside the write path before every commit, so a process or VM paused past it refuses its next write. On expiry: `set_mode(Follower)`, `read_only=1`. `0` means no lease, for a node run without the operator. |
 
-**Diverged.** A follower reads its source's term-start entry. If its own
-`durable_sequence()` is above that `start_seq`, it holds writes from a branch
-the new leader never had: it stops pulling and reports `diverged`. The
-operator recovers it like any faulty replica. This is the fork the Elle cluster
-check found, made visible when a stale member reappears.
+The renewal is a lightweight reconcile of its own so a slow phase elsewhere
+(a `syncTimeout`, a backup) cannot starve it. A lease missed twice still
+renews on the third attempt before `ttl`.
 
-**Crashed leader.** A server restarting after an unclean shutdown as leader
-comes up as a follower reporting `crashed_leader` and refuses to serve until
-re-bootstrapped. The operator recovers it. A clean restart of the leader is a
-switchover first, as the operator's update strategy already does.
+### Semi-sync
 
-## The fork
-
-A new value `spec.replication.type: bytecaskdb` (default `binlog`), read by
-the places below. Everything not listed is untouched.
-
-| Operator piece | Does today | With `type: bytecaskdb` |
+| Operator | Binlog | ByteCaskDB |
 |---|---|---|
-| `pkg/controller/replication/topology.go` `ConfigurePrimary` | `STOP SLAVE`, `RESET SLAVE`, reset `gtid_slave_pos` | `bytecaskdb_promote = status.replication.term + 1`, then `read_only = 0`; records the term in status |
-| `ConfigureReplica` | `CHANGE MASTER TO …`, `START SLAVE`, `read_only = 1` | `read_only = 1`, `bytecaskdb_replication_source = <primary FQDN>:3306` |
-| `pkg/sql` `ReplicaStatus`, `IsReplicationPrimary`, `GtidCurrentPos` | `SHOW REPLICA STATUS`, `SHOW MASTER STATUS`, `@@gtid_current_pos` | One query on `BYTECASKDB_REPLICATION`; a `ReplicationStatus` interface with the binlog and bytecaskdb implementations behind it |
-| `failover.go` `FurthestAdvancedReplica` | Ready, IO and SQL threads running, no relay-log events, highest GTID | Ready, `state = running`, highest `applied_sequence`; ties to the lowest pod name, as today |
-| `switchover.go`, eight phases | `FLUSH TABLES WITH READ LOCK`, `read_only`, `MASTER_GTID_WAIT`, configure new primary, connect replicas, demote old, semi-sync, `read_only = 0` | Phase 1 is a no-op. Phase 2 is `bytecaskdb_demote`, which syncs. Phase 3 waits with `BYTECASKDB_WAIT_SEQUENCE(old.durable_sequence)` on the target. Phases 4 to 6 as above. Phase 7 is the sync-followers sysvars. Phase 8 unchanged. |
-| `internal/controller/pod_replication_controller.go` `ReconcilePodNotReady` | Waits `autoFailoverDelay`, picks the replica, patches `podIndex` | Unchanged, except `autoFailoverDelay` is floored at `lease_ms + margin` so the old primary's lease has run out before the new one is promoted |
-| `reconcileReplication`, primary branch | Converges semi-sync | **Also renews the lease:** `bytecaskdb_lease_ms = ttl`, and requeues every `ttl / 3`. Sets `bytecaskdb_retain_after`. |
-| `pkg/agent/handler/replication/probe.go` | Liveness from IO and SQL thread errors, readiness from `Seconds_Behind_Master ≤ maxLagSeconds` | Liveness: `state = running` or the pod is primary with a lease. Readiness: `lag_seconds ≤ maxLagSeconds`; a `bootstrapping`, `diverged` or `crashed_leader` node is not ready |
-| `mariadb_controller_replica_recovery.go`, `bootstrapFrom` | Error 1236 or a persistent error triggers a `PhysicalBackup` restore or a PVC from a `VolumeSnapshot` | `diverged` or `crashed_leader` triggers the same flow. The **VolumeSnapshot path works unchanged**: a crash-consistent copy of the data directory is a valid database, and the newest file's torn tail is truncated at open. The copy is opened as a follower and tails from its own `durable_sequence`. The `PhysicalBackup` job path becomes a `create_manifest` copy served by the primary's agent over its existing HTTP API, for clusters without a snapshot class. |
-| `pkg/controller/replication/config.go` | Renders `log_bin`, `server_id`, GTID and semi-sync settings | Renders none of them; the plugin sets `HA_HAS_OWN_BINLOGGING` |
-| `semi_sync.go` | `rpl_semi_sync_*` | The sync-followers sysvars, later milestone |
-| Services, StatefulSet, TLS, Users, Grants, Databases, Connections, MaxScale resources | | Untouched |
+| config | `rpl_semi_sync_slave_enabled=ON` everywhere, `master_enabled=OFF` | nothing: followers always acknowledge |
+| `reconcileSemiSync`: master-side on for the primary only, off for replicas, converged every reconcile | `rpl_semi_sync_master_enabled`, `_timeout`, `_wait_no_slave` | `bytecaskdb_sync_enabled`, `bytecaskdb_sync_timeout_ms`, `bytecaskdb_sync_wait_no_follower`, same semantics. **Plugin:** each pull request carries the follower's `durable_sequence`, which is the acknowledgement. A commit waits until some follower has reported at least its sequence, or `sync_timeout_ms`, after which it falls back to asynchronous and reports `bytecaskdb_sync_status = 'async'` in the status table, as `Rpl_semi_sync_master_status` does. |
 
-Vacuum retention: before taking a snapshot or manifest for a bootstrap, the
-operator sets `retain_after` on the primary to its current `durable_sequence`
-and keeps it there until the new replica reports its own; afterwards it is the
-lowest `durable_sequence` across replicas. This is the ordering the Elle
-harness settled on.
+### Recovery and bootstrap
 
-## Timing
-
-| Setting | Default | Meaning |
+| Operator | Binlog | ByteCaskDB |
 |---|---|---|
-| `spec.replication.lease.ttl` | 30 s | The lease granted on each renewal. `0` turns the lease off, for manual operation only. |
-| renew period | `ttl / 3` | The primary branch's requeue. Two missed renewals still leave a third. |
-| `autoFailoverDelay` | floored at `ttl + 5 s` | A promotion never starts before the old primary's lease has expired. |
-| `syncTimeout` | 10 s | Phase 3 of a switchover, as today. |
-| `maxLagSeconds` | 0 | As today. |
+| `mariadb_controller_replica_recovery.go`: 1236 at once, other errors after `errorDurationThreshold` | | 4002 and 4003 at once, others after the threshold |
+| `bootstrapFrom.volumeSnapshotRef`: delete the PVC, recreate it from the snapshot | needs the GTID from the snapshot annotation | **unchanged and position-free**: a crash-consistent copy of the data directory is a valid database, the newest file's torn tail is truncated at open, and the follower tails from its own `durable_sequence`. |
+| `bootstrapFrom.physicalBackupTemplateRef`: a job runs `mariadb-backup` into the PVC | | the job calls `BYTECASKDB_CREATE_MANIFEST()` on the primary and copies the listed files from the primary agent's HTTP API into the PVC. **Plugin:** the UDF wraps `create_manifest()`, and the agent serves the manifest's files. |
+| nothing | | **`retain_after`.** Before a snapshot or manifest, the operator sets `SET GLOBAL bytecaskdb_retain_after = <primary durable_sequence>` and keeps it until the new replica reports its own; otherwise it is the lowest `durable_sequence` across replicas, converged every reconcile like semi-sync. **Plugin:** passes it to every vacuum. |
 
-An operator outage longer than `ttl` makes the primary read-only until the
-operator is back and renews. That is the trade: no failsafe mode, no quorum,
-one controller.
+### Probes
+
+`pkg/agent/handler/replication/probe.go`, reading the status table through the
+same interface:
+
+| Probe | Binlog | ByteCaskDB |
+|---|---|---|
+| liveness, replica | a stopped thread with errno ≠ 0 fails; a stop with errno 0 is administrative | `source_running` or `apply_running` false with its errno ≠ 0 fails |
+| liveness, primary | `SHOW MASTER STATUS` has a row | `role = 'primary'` |
+| readiness, replica | `Seconds_Behind_Master` NULL fails; `> maxLagSeconds` fails | `seconds_behind_source` NULL fails; `> maxLagSeconds` fails |
+| readiness, primary | as liveness | as liveness |
+
+### Users, grants, databases, SQL jobs
+
+| Operator | Binlog | ByteCaskDB |
+|---|---|---|
+| `pkg/controller/sql`: one client through `NewClientWithMariaDB` | applied on the primary, replicated by the binlog | applied on **every pod** through `NewInternalClientWithPodIndex`, in index order, since nothing else carries `mysql.*` to a follower. The superuser bypasses `read_only`. `CREATE DATABASE` on every pod also gives table discovery (#422 milestone 1) the directory it needs before it can create a follower's `.frm`. |
+
+### Services, StatefulSet, TLS, MaxScale, Connections
+
+Untouched. The primary and secondary Services follow `currentPrimaryPodIndex`
+as today. MaxScale's monitor reads `SHOW SLAVE STATUS` and sees no replication
+here: routing by `@@read_only` works, its automatic failover stays off.
+
+### Spec and webhook
+
+`spec.replication.type: binlog | bytecaskdb` (default `binlog`).
+`spec.replication.lease.ttl` (default 30 s) for `bytecaskdb`. The webhook
+refuses `gtid*`, `syncBinlog`, `serverIdStartIndex` and `semiSyncWaitPoint`
+with `type: bytecaskdb`, requires `lease.ttl > 0`, and floors
+`autoFailoverDelay` at `lease.ttl + 5 s`.
+
+## What is not persisted, and why that is fine
+
+The plugin keeps no `master.info`, no mode file, no term file. Source settings
+live in the operator's spec and status; the term lives in the data file as
+term-start entries; a node's position is its `durable_sequence`. A restarted
+pod is a read-only follower with no source until the reconciler, seeing its
+role as `Unknown`, configures it again. That is one reconcile later, within
+`loop_wait`, and the pod is not Ready until it is. This is what makes "a
+crashed leader is re-bootstrapped, never reopened in place" need no special
+state: it is repointed like any replica, and if it holds a branch, it reports
+4002 and recovery handles it.
 
 ## Fencing
 
 | Layer | Stops |
 |---|---|
-| Plugin lease, per commit | an old primary partitioned from the operator, a paused process or VM, an operator that promoted too early |
+| Plugin lease, checked per commit | an old primary partitioned from the operator, a paused process or VM, an operator that promoted early |
 | Term in the data file | an old primary's writes reaching replicas; a stale node promoting itself |
-| Readiness and the Services | clients that go through the Services reaching a demoted primary |
-| The operator's own rule: no force-delete of a primary pod; recovery recreates the PVC | two pods with one identity |
+| Readiness and the Services | clients through the Services reaching a demoted primary |
+| The operator never force-deletes a primary pod; recovery recreates the PVC | two pods with one identity |
 | Node remediation (medik8s) or the out-of-service taint | a hung node, by the deployment's choice; optional |
 
-Clients that connect to a pod directly are stopped by the lease alone, as in
-#422.
+Clients that connect to a pod directly are stopped by the lease alone.
 
 ## Failure envelope
 
 | Scenario | Outcome | Checked by |
 |---|---|---|
-| Primary pod dies | Read-only for `autoFailoverDelay`, then the most advanced Ready replica is promoted with the next term. Writes above its `durable_sequence` are lost (async). | the operator's envtest suite for `pod_replication_controller`, extended; the Elle topology run for the data |
-| Primary partitioned from the operator, reachable by clients | Writes stop within `ttl`; a replica is promoted after `autoFailoverDelay`. | envtest with a stalled renewal; Elle nemesis: leader paused past its lease |
-| Operator down | Primary goes read-only after `ttl`; nothing else. | envtest |
-| Primary paused past `ttl` and resumed | First commit refused. | plugin test: per-commit deadline; a mutation moving the check off the commit path |
-| Stale replica reappears ahead of the primary | Reports `diverged`, recovered by the operator. | Elle: member hidden through a promotion |
-| Old primary's pull repointed to an older term | Refused. | plugin test; mutation dropping the check |
-| Switchover | `demote` syncs, target waits to the old primary's `durable_sequence`, promotes. No loss. | Elle planned transfer; envtest for the phases |
-| Lease configured above `autoFailoverDelay` | Refused by the webhook. | envtest |
+| Primary pod dies | read-only for `autoFailoverDelay`, then the most advanced Ready replica is promoted; writes above its `durable_sequence` are lost (async) | operator envtest for `pod_replication_controller`; Elle topology run |
+| Primary partitioned from the operator, reachable by clients | writes stop within `ttl`; promotion after `autoFailoverDelay` | envtest with a stalled renewal; Elle nemesis: leader paused past its lease |
+| Operator down | primary read-only after `ttl`; nothing else | envtest |
+| Primary paused past `ttl`, resumed | first commit refused | plugin test; a mutation moving the check off the commit path |
+| Stale replica reappears ahead of the primary | 4002, recovered | Elle: member hidden through a promotion |
+| Pull repointed to an older term | 4001, refused | plugin test; a mutation dropping the check |
+| Vacuum ran below a replica's cursor | 4003, recovered; does not happen while `retain_after` is converged | Elle `cluster-vacuum-unretained` finds it, `cluster-vacuum` does not |
+| Switchover | `demote` syncs, replicas wait to its `durable_sequence`, promote; no loss | Elle planned transfer; envtest for the phases |
+| `lease.ttl` above `autoFailoverDelay` | refused by the webhook | envtest |
 
 ## Milestones
 
-1. Table discovery. Unchanged from #422.
-2. Plugin surface: `HA_HAS_OWN_BINLOGGING`, the sysvars above, the status
-   table, the UDF, terms, the per-commit lease, the diverged and
-   crashed-leader states.
-3. The fork: `type: bytecaskdb` through topology, status, failover,
-   switchover, probes and config; lease renewal and retention in the
-   reconciler; envtest coverage of the rows above.
-4. Bootstrap: the VolumeSnapshot path verified end to end; the manifest copy
-   over the agent for the job path.
-5. Sync followers.
-6. A conversation with upstream about a replication-type seam. Until then
-   the fork tracks upstream by merge; the touched files are the ones in the
-   table.
+One list for both halves; each item is plugin work and operator work that
+land together, with the row above as the test.
 
-## Limitations
-
-- MaxScale's MariaDB Monitor reads `SHOW SLAVE STATUS` and sees no
-  replication. Routing by `@@read_only` still works; its automatic failover
-  must stay off, and the operator's `MaxScale` resource is used without it.
-- Replication is asynchronous until milestone 5, and loses writes acknowledged
-  after the promoted replica's `durable_sequence`.
-- A deployment outside Kubernetes has no operator here; the plugin surface is
-  the same and a script can drive it by hand.
+1. **Table discovery** (#422 milestone 1), plus the `Database` fan-out.
+2. **Boot, configure, status, probes:** `HA_HAS_OWN_BINLOGGING`, follower
+   boot, the `bytecaskdb_source_*` sysvars and pull thread, the status table,
+   the error numbers; `type: bytecaskdb` through config, `ConfigureReplica`,
+   `ReplicaStatusVars`, the probes, the SQL fan-out.
+3. **Promote, terms, lease, failover:** `bytecaskdb_promote`, term-start
+   entries, 4001 and 4002, the per-commit lease, `bytecaskdb_demote`;
+   `ConfigurePrimary`, `FurthestAdvancedReplica`, the lease reconcile, the
+   webhook rules.
+4. **Switchover and retention:** `BYTECASKDB_WAIT_SEQUENCE`,
+   `bytecaskdb_retain_after`, 4003; the eight phases, the retention
+   reconcile.
+5. **Bootstrap:** the VolumeSnapshot path end to end; `BYTECASKDB_CREATE_MANIFEST`
+   and the agent's file endpoint for the job path.
+6. **Semi-sync:** the three sysvars and the acknowledgement in the pull; the
+   semi-sync reconcile.
+7. A conversation with upstream about a replication-type seam; the fork
+   tracks upstream by merge until then.
 
 ## Changes from #422
 
-- The lease is not optional under the operator, and it is checked on every
-  commit, not expired by a thread.
-- `bytecaskdb_demote`, `bytecaskdb_retain_after` and the sync-followers
-  sysvars are added. `retain_after` is set by the operator from what the
-  replicas and bootstraps need, not by the leader from its connected pullers.
-- The diverged-follower rule is added to the term-start entry.
-- The operator is a fork of mariadb-operator, not a bespoke one; the
-  multi-node harness becomes the operator's envtest suite plus the existing
+- Every node boots as a read-only follower; there is no `crashed_leader`
+  state and no lease or mode persisted anywhere. The data files cannot say
+  which node was leader, and the operator knows.
+- `bytecaskdb_promote` takes no term by default; the plugin uses the highest
+  term seen plus one. An explicit term stays for manual operation.
+- `bytecaskdb_replication_source = 'host:port'` becomes the
+  `bytecaskdb_source_*` sysvars mirroring `CHANGE MASTER`'s options,
+  credentials and TLS included, plus `bytecaskdb_source_enabled`.
+- The status table mirrors `SHOW REPLICA STATUS`'s shape: running flags,
+  error numbers and text, `seconds_behind_source` NULL when not running,
+  and `received_sequence` so the operator waits instead of `promote`
+  refusing.
+- Semi-sync has a timeout and falls back to asynchronous, as
+  `rpl_semi_sync_master_timeout` does; "K followers" becomes "a follower",
+  which is what the operator converges.
+- `bytecaskdb_demote` and `bytecaskdb_retain_after` are added;
+  `retain_after` is set by the operator, which knows about bootstraps.
+- The error numbers 4001 to 4003 and the `diverged` rule are added.
+- Users, grants, databases and SQL jobs are applied to every pod by the
+  operator; "users and grants keep the normal binlog" is withdrawn, since
+  there is no binlog.
+- The multi-node harness is the operator's envtest suite plus the existing
   Elle cluster harness.

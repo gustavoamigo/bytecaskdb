@@ -155,7 +155,7 @@ See [`docs/backup_design.md`](docs/backup_design.md) for the full design, vacuum
 | [`docs/mariadb_plugin_plan.md`](docs/mariadb_plugin_plan.md) | Project plan and task tracker |
 | [`docs/correctness_validation.md`](docs/correctness_validation.md) | Proof test matrix for DML/txn/failure scenarios |
 | [`docs/backup_design.md`](docs/backup_design.md) | Backup and restore design |
-| [`docs/replication_agent_design.md`](docs/replication_agent_design.md) | Replication operator design: a `bytecaskdb` replication type for mariadb-operator, the plugin control surface it drives, fencing and the failure envelope (#422) |
+| [`docs/replication_agent_design.md`](docs/replication_agent_design.md) | Replication design: the plugin's control surface and a `bytecaskdb` replication type for mariadb-operator, defined as one contract, call by call (#422) |
 
 ## Sysbench OLTP Benchmarks
 
