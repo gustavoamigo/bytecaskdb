@@ -3,8 +3,10 @@
 # Durability: a commit survives a mariadbd crash but not an OS crash or power
 # loss — the redo log is written at commit and flushed about once a second.
 # Unlike innodb.cnf, the rest is tuned too, so acid and fast differ in more
-# than durability. Sized for ~70 warehouses on a 31 GiB host running one
-# engine at a time; HammerDB runs on the same host.
+# than durability. Sized for ~70–96 warehouses on a host with 31 GiB or more
+# running one engine at a time; HammerDB runs on the same host. Measured on a
+# 16-vCPU desktop (SATA SSD) and a 48-vCPU EC2 host (NVMe instance storage),
+# MariaDB 10.11.
 [mariadbd]
 # Durability: InnoDB's equivalent of ByteCaskDB's bytecaskdb_sync = AT_INTERVAL.
 innodb_flush_log_at_trx_commit = 2
@@ -23,16 +25,20 @@ innodb_flush_method            = fsync
 # buffered, so the setting means the same there.
 loose_innodb_log_file_buffering = ON
 
-# Redo: a large log defers checkpoint flushing; a larger buffer absorbs the
-# commit rate between once-a-second flushes.
-innodb_log_file_size           = 4G
+# Redo: a large log lets a page absorb more updates before a checkpoint has to
+# flush it; a larger buffer absorbs the commit rate between once-a-second
+# flushes. TPROC-C writes ~90 MB/s of redo at 48 users, so 8 GB wraps within
+# the 2-minute ramp-up and the measured window is past the first checkpoint.
+innodb_log_file_size           = 8G
 innodb_log_buffer_size         = 64M
 
 # Page flushing: SSD, so no neighbour flushing; enough I/O budget that dirty
-# pages are written in the background rather than on the commit path.
+# pages are written in the background rather than on the commit path. With
+# the 8 GB log, 20000/40000 beat 4000/8000 on both hosts, the SATA SSD
+# included (TPROC-C: +8.0% at 16 users, +4.9% at 48).
 innodb_flush_neighbors         = 0
-innodb_io_capacity             = 4000
-innodb_io_capacity_max         = 8000
+innodb_io_capacity             = 20000
+innodb_io_capacity_max         = 40000
 innodb_max_dirty_pages_pct     = 90
 innodb_write_io_threads        = 8
 innodb_read_io_threads         = 8
