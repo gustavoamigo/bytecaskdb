@@ -21,17 +21,43 @@
 
 namespace bytecaskdb {
 
-// Encodes the row in `buf` (table->record[0]) into a byte vector.
-// Uses V2 compact format: strips trailing spaces from multi-byte CHAR fields.
-void encode_row_into(std::vector<uint8_t> &out, TABLE *table, const uchar *buf,
-                     uint16_t schema_version);
+// A table's column layout, read from its Fields once (make_row_plan) so the
+// row codecs below do not ask every Field again on every row: each question
+// is a virtual call into the server, and none of the answers change between
+// rows. Built when the handler opens the table; offsets are relative to the
+// record, so one plan serves record[0] and record[1].
+struct RowPlan {
+  enum class Kind : uint8_t {
+    kFixed,        // pack_length bytes, verbatim
+    kBlob,         // length + pointer in the record; data after the fields
+    kCompactChar,  // multibyte CHAR stored without its trailing spaces
+  };
+  struct Column {
+    uint32_t offset{0};         // in the record
+    uint32_t pack_length{0};    // kFixed, kBlob: bytes in the record
+    uint32_t field_length{0};   // kCompactChar: the column's byte length
+    uint32_t mbmaxlen{1};       // kCompactChar: the charset's widest character
+    uint32_t blob_len_bytes{0}; // kBlob: bytes of the length before the pointer
+    Kind kind{Kind::kFixed};
+  };
+  std::size_t null_bytes{0};
+  std::size_t reclength{0};
+  std::vector<Column> columns;
+};
 
-std::vector<uint8_t> encode_row(TABLE *table, const uchar *buf,
+RowPlan make_row_plan(TABLE *table);
+
+// Encodes the row in `buf` (table->record[0] or record[1]) into a byte vector.
+// Uses V2 compact format: strips trailing spaces from multi-byte CHAR fields.
+void encode_row_into(std::vector<uint8_t> &out, const RowPlan &plan,
+                     const uchar *buf, uint16_t schema_version);
+
+std::vector<uint8_t> encode_row(const RowPlan &plan, const uchar *buf,
                                 uint16_t schema_version);
 
-// Decodes a V2-encoded row value back into `buf` (table->record[0]).
-// Fails (zeros buf) if the format byte is not 0x02.
-void decode_row(TABLE *table, const uint8_t *value, std::size_t value_len,
-                uchar *buf);
+// Decodes a V2-encoded row value back into `buf`. A value shorter than the
+// envelope zeros buf; a format byte other than 0x02 throws.
+void decode_row(const RowPlan &plan, const uint8_t *value,
+                std::size_t value_len, uchar *buf);
 
 } // namespace bytecaskdb

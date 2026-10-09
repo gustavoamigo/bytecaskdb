@@ -19,6 +19,7 @@
 #include "bytecask.hpp"
 #include "bytecaskdb_txn.h"
 #include "catalog.h"
+#include "key_encoding.h"
 
 namespace bytecaskdb {
 
@@ -277,6 +278,9 @@ private:
 
   // Reused across index_read_map calls to avoid per-call heap allocation.
   std::vector<uint8_t> search_key_buf_;
+
+  // The table's row and key layout, read from its Fields once in open().
+  TableCodec codec_;
 
   // Scratch buffer for decode_pk() to avoid per-row heap allocation.
   std::vector<uint8_t> decode_pk_scratch_;

@@ -362,6 +362,12 @@ For Phase 4+, a custom encoding may be needed for:
 - Schema evolution (adding/dropping columns without rewriting all rows).
 - Cross-platform portability.
 
+### The per-table codec plan
+
+Encoding and decoding a row or a key needs facts about each column: its offset in the record, its length, whether it is a blob or a compacted multibyte `CHAR`, and, for a key part, which byte transform makes it sort as its value does (reversal of a little-endian integer, a sign-bit flip, the IEEE 754 flip, none for `VARCHAR` and blob parts, trailing-space trimming under a PAD SPACE collation). The `Field` methods that answer these are virtual calls into the server, and asking them per row cost ~130 ns per row returned on sysbench range scans, a third of ByteCaskDB's per-row deficit against InnoDB there.
+
+None of the answers change between rows, so `ha_bytecaskdb::open()` reads them once into a `TableCodec`: a `RowPlan` (one entry per column) and a `KeyPlan` per index (one entry per key part). Every row and key codec walks the plan instead of the `Field`s. The plan holds offsets relative to the record, never pointers, so one plan serves `record[0]` and `record[1]`. It is rebuilt on every `open()`, and an in-place `ALTER` here never changes the row layout (it only renames columns or drops foreign keys), so a plan cannot outlive the definition it was read from.
+
 ---
 
 ## Key Encoding
