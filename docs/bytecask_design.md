@@ -406,7 +406,7 @@ Implementation: `degraded_` is an `atomic<bool>` (release on write, acquire on r
 
 The engine validates structural invariants at runtime before publishing state, not just in tests. `store_state` compares old and new `EngineState` on every publication: `next_seq`, `active_file_id`, `next_file_id`, and `durable_seq` must never regress, and the new state's `durable_seq` must cover its `sync_requested_seq` (durability before visibility). On violation the engine degrades (nothing published, writes blocked, reads remain available). Cost: five integer comparisons per write — unmeasurable against `pwritev` + `fdatasync`. When `durable_seq` advances, `store_state` notifies `durable_cv_` — the condvar used by `durable_sequence(min_sequence, timeout)` for long-poll.
 
-Debug builds (`NDEBUG` unset) add an O(n) walk of the key directory on every publication. On the keyed B+ tree it checks `next_seq > max(key_dir sequences)` and that every entry ends inside its file's committed extent (invariant P, *Offset containment* in `CONTRACT.md`). On the blind-leaf tree, the default, a leaf holds no sequence or size, and reading every record on every publish would make each debug commit O(n) in disk reads, so the walk checks only what the locations show: every entry *starts* inside its file's extent, and names a file that has `file_stats`.
+Debug builds (`NDEBUG` unset) add an O(n) walk of the key directory on every publication. On the keyed B+ tree it checks `next_seq > max(key_dir sequences)` and that every entry ends inside its file's committed extent (invariant P, *Why a lent view survives file events*). On the blind-leaf tree, the default, a leaf holds no sequence or size, and reading every record on every publish would make each debug commit O(n) in disk reads, so the walk checks only what the locations show: every entry *starts* inside its file's extent, and names a file that has `file_stats`.
 
 On cold paths (`DB::open()`, `resume()`), `validate_state_consistency` checks the published state. In every build: the active file is in the registry, `sync_requested_seq <= durable_seq`, `file_stats` covers every file, and each file's `min_sequence`/`max_sequence` are both zero or both set with min at most max. Test builds (`BYTECASK_TESTING`) add the O(n) walk: no dangling file reference, `next_seq` above every key's sequence, `live_bytes` matching the key directory, and every entry ending inside its file's extent (P). P is checked after `resume()` in particular, the one operation that shortens a file published offsets point into; it holds in release builds too, because `resume()` refuses before truncating below the published extent (step 3 above). On violation it throws — the DB does not open or `resume()` fails.
 
@@ -1348,41 +1348,11 @@ using BytesView = std::span<const std::byte>;
 
 ### Iterators
 
-Both `KeyIterator` and `EntryIterator` satisfy `std::bidirectional_iterator`. They yield entries in ascending key order when advanced with `operator++` and descending order with `operator--`. This matches the key directory's iterators, which are themselves bidirectional. Backward traversal steps back through the iterator's stack of `(node, index)` frames — O(1) amortized per step, matching forward iteration.
-
 Forward scans use `iter_from` / `keys_from` (keys >= `from`); reverse scans use `riter_from` / `rkeys_from` (keys <= `from` in descending order). Both are available on `DB` and `Snapshot`. RocksDB equivalents: `Seek` + `Next` ↔ `iter_from`; `SeekForPrev` + `Prev` ↔ `riter_from`.
 
-Reverse iteration is provided by a generic `ReverseIterator<Iter>` template that wraps `KeyIterator` or `EntryIterator`. `std::reverse_iterator` cannot be used because its `operator*` dereferences a temporary copy of the underlying iterator — when the underlying iterator caches its result internally (as both `KeyIterator` and `EntryIterator` do), the returned reference dangles. `ReverseIterator` holds the inner iterator directly and pre-decrements once in the constructor, so the reference remains valid.
+`KeyIterator` is bidirectional: it wraps the key directory's cursor, which is itself bidirectional, and backward traversal steps back through the cursor's stack of `(node, index)` frames, O(1) amortised per step like forward iteration. `EntryIterator` is an input iterator over `EntryView`: it caches the spans `operator*` returns, and a cached span cannot survive a step back. `ReverseKeyIterator` is `ReverseIterator<KeyIterator>`, a generic adaptor that holds the inner iterator and pre-decrements once in its constructor, then steps back with the inner `operator--`. `ReverseEntryIterator` cannot be built that way, since `EntryIterator` has no `operator--`: it is its own class over the key directory's reverse value cursor (`KeyDirReverseValueIter`), with the same cached-span rules as `EntryIterator`. Neither uses `std::reverse_iterator`, whose `operator*` dereferences a temporary copy of the underlying iterator; both iterators cache what they return, so the returned reference would dangle (BC-122; *Lifetime and view safety* in `CLAUDE.md`).
 
-```cpp
-// Yields (key, value) pairs — bidirectional.
-class EntryIterator {
-public:
-    using iterator_category = std::bidirectional_iterator_tag;
-    using value_type      = std::pair<Bytes, Bytes>;
-    using difference_type = std::ptrdiff_t;
-
-    auto operator++() -> EntryIterator&;
-    auto operator--() -> EntryIterator&;
-    auto operator*() const -> const value_type&;
-    auto operator==(std::default_sentinel_t) const noexcept -> bool;
-};
-
-// Yields keys only (no value I/O) — bidirectional.
-class KeyIterator {
-public:
-    using iterator_category = std::bidirectional_iterator_tag;
-    using value_type      = Bytes;
-    using difference_type = std::ptrdiff_t;
-
-    auto operator++() -> KeyIterator&;
-    auto operator--() -> KeyIterator&;
-    auto operator*() const -> const value_type&;
-    auto operator==(std::default_sentinel_t) const noexcept -> bool;
-};
-```
-
-Both integrate with `std::ranges::subrange` so callers can use range-for directly:
+Both integrate with `std::ranges::subrange`, so callers use range-for directly:
 
 ```cpp
 // Forward scan (ascending).
@@ -1394,11 +1364,30 @@ for (auto& [key, value] : db.riter_from(opts, start_key)) { ... }
 for (auto& key : db.rkeys_from(opts, prefix))              { ... }
 ```
 
-- **Lazy**: each dereference reads one value from disk on demand. Early-termination scans pay no I/O cost for unvisited entries.
-- **`KeyIterator` is in-memory only**: walks the in-memory key directory without touching any data file.
+- **Lazy**: each dereference reads one value from disk on demand. Early-termination scans pay no I/O for unvisited entries.
+- **`KeyIterator` reads keys, not values**: on the blind-leaf key directory a leaf holds no key bytes, so each step reads the key's record header from its data file (the keyed B+ tree, `BYTECASK_KEYDIR=btree`, reads nothing). It never reads a value.
 - **Error handling**: throws `std::system_error` on I/O failure.
-- **Self-anchored**: `EntryIterator` and `ReverseEntryIterator` each hold their own `shared_ptr<const EngineState>`, and `KeyIterator` holds the key-directory root it was built from. An iterator therefore keeps every data file it can reach open, and the subtree it walks immutable, independently of the `DB` and of the `Snapshot` it came from — which is why a span may outlive that `Snapshot` but never the iterator. The full per-event table is *View and span lifetimes* in [`CONTRACT.md`](../CONTRACT.md).
-- **Move-only (entry iterators)**: `EntryIterator` and `ReverseEntryIterator` cache the spans `operator*` returns, and on the `pread` path those spans address the iterator's own `io_buf_`. Copying would deep-copy the buffer while carrying the spans unchanged, leaving the copy pointing into the source's storage — so the copy operations are deleted and the hazard is a compile error rather than a comment. Moving is safe: the buffer travels with the spans. `ChangeIterator` is move-only for the same reason. `KeyIterator` materializes an owning `Key` and stays copyable, which `ReverseIterator<KeyIterator>` requires.
+- **Move-only entry iterators**: `EntryIterator` and `ReverseEntryIterator` cache the spans `operator*` returns, and on the `pread` path those spans address the iterator's own `io_buf_`. Copying would deep-copy the buffer while carrying the spans unchanged, leaving the copy pointing into the source's storage, so the copy operations are deleted and the hazard is a compile error rather than a comment. Moving is safe: the buffer travels with the spans. `ChangeIterator` is move-only for the same reason. `KeyIterator` materialises an owning `Key` and stays copyable, which `ReverseIterator<KeyIterator>` requires; `include/bytecask.hpp`'s `KeyIterator` wrapper is move-only all the same, since nothing there needs the copy.
+
+#### Why a lent view survives file events
+
+What a caller is owed is in *View and span lifetimes* in [`CONTRACT.md`](../CONTRACT.md): a view stays valid, with the same bytes, across `resume()`, `vacuum()`, rotation, `set_mode()`, a concurrent write, `close()` and `~DB`, and only its own iterator ends it. Five mechanisms account for every case, and the one invariant that carries the mmap cases is stated here so the rest can refer to it.
+
+**A — Owned copy.** `get` copies the value into the caller's `Bytes`. `KeyIterator` materialises an owning `Key`. `ChangeIterator` reads through `CommittedEntryIterator`, whose scan buffer holds owning `DataEntry` values. No file event can reach any of them.
+
+**B — Iterator-pinned state.** `EntryIterator`, `ReverseEntryIterator` and `ChangeIterator` each hold their own `shared_ptr<const EngineState>`, which holds a `shared_ptr<DataFile>` per file; `KeyIterator` holds the key directory root it was created from and, on the blind-leaf tree, a copy of the file registry handle (`BlindKeyDirIter`), since it reads a record per key. Every descriptor and mapping an iterator can reach stays open for as long as it lives, independently of the `DB`, of the `Snapshot` it came from, and of what the engine publishes next. Rotation registers a new file object and leaves the old one to whoever holds it; vacuum's unlink removes a name, not an open file. `Snapshot::iter_from` and the other four hand the iterator its own state reference, and `changes_since` copies the reference out of the `Snapshot` it is given, which is why a view outlives its `Snapshot` but never its iterator.
+
+**C — Tree-pinned nodes.** A write mutates a key directory node in place only when it holds the sole reference to it, so no node reachable from a published root is ever modified; the subtree an iterator walks is immutable for the iterator's life (*Key Directory*, and `docs/radix_tree_epoch_reclamation_design.md` for the version chain that frees a retired node only once no version reaches it).
+
+**D — Fixed mapping address.** Under `IoBackend::Mmap` the active file's mapping is established once, in `WritableMmapDataFile`'s constructor, and released once, in its destructor; no operation unmaps and remaps it. Only `mmap_end_`, the prefix still backed by the file, moves, only downwards, and only in step with the file's length (*DataFile mmap*). Sealed files are `MAP_PRIVATE` and immutable for their whole life; a span into one is bounded by the `DataFile` object alone, which B pins. The active file is `MAP_SHARED`, so a reader sees what `pwritev` wrote, and two consequences are relied on: data files are append-only, so no byte under a live span is ever rewritten, and the file can shorten under the mapping, by `resume()`'s truncate and by the seal's `shrink_to_fit`, both of which lower `mmap_end_` with the file and neither of which touches the mapping. A read at or past the new bound takes the `pread` fallback and fails as a clean short read rather than faulting on a page beyond end of file.
+
+**L — Frame lease.** Under `IoBackend::BufferPool` an iterator is lent a span straight into a pool frame when the entry sits inside one resident frame, and holds a `FrameLease` on it until it advances. A pinned frame is immutable and cannot be evicted or refilled; the pool is held by the data file, which the iterator holds, so not even `~DB` reaches the frame while the span is live. A lease held across a long loop body keeps one frame out of the pool's hands for that long: one frame, not a stall, since eviction skips it.
+
+> **P (offset containment).** Every offset published in the key directory lies below the committed extent of the file it names.
+
+P is what lets `resume()` and the seal shorten the active file under a live reader without taking anything away from it. It holds by construction: an entry becomes visible only after its bytes are complete on disk, and the scan that establishes a committed extent stops at the first incomplete or corrupt entry, which is always past everything already published. Test builds check it rather than assume it, on every publication and after `resume()` (*Runtime invariant enforcement*), and `resume()` refuses to truncate below the published extent in every build (*Degraded state (`DbDegraded`) and `resume()`*, step 3).
+
+Nothing detects a stale view. A span used after its iterator advanced or died reads memory the engine no longer vouches for, silently; the move-only iterators are the one place the compiler enforces the rule.
 
 ### WriteOptions and ReadOptions
 

@@ -233,18 +233,17 @@ file. It is never the record; the data file is.
 ## `open`
 
 Recovers the database a crash or power loss left, on storage that keeps
-its promises, and refuses any other. Proved by the `[recovery]` tests.
+its promises (*Conditions*), and refuses any other.
 
-| Property | Contract |
-|----------|----------|
-| **Storage assumption** | Bytes an `fdatasync` reported durable stay as written, and so does a synced directory entry. `open` recovers what a crash or power loss leaves on storage that honours this. It does not recover from storage that does not. |
-| **Durability** | Every write acknowledged as durable is in the opened database. `sync = false` writes made after the last sync may be missing; those that survive form a prefix of the write order, and a batch is in whole or not at all. |
-| **Only the active file is cut** | Every other file was synced whole before the next was started, so a crash can tear only the file being written. `open` cuts that file at its last committed record — whole, if its first page was lost — and syncs the cut. A tail of zeros, preallocated space, is trimmed in any file. |
-| **Damage is refused** | A state no crash can leave on such storage is damage. Where `open` can see it, it throws and cuts nothing: data past the last committed record in a file that is not the newest, such data in more than one file, two files sharing sequences other than an interrupted vacuum's pair. `open` does not open a best-effort subset of a damaged database: to the caller that is data loss with no error. |
-| **Damage that cannot be seen** | Damage that leaves exactly what a crash would is outside this contract: `open` cannot refuse what it cannot tell from a torn write. `docs/bytecask_design.md`, *Recovering a Hint-less File*, lists the known shapes. |
-| **Options** | `max_key_bytes`, `max_value_bytes` or `max_file_bytes` above its hard ceiling (see *Limits*), or `recovery_threads = 0`, throws `std::invalid_argument` before the directory is created or locked. `max_file_bytes = 0` is valid: every write seals the file it went into. |
-| **Hint files** | A hint is a rebuildable index. One that fails its CRC, or that a read fails on, is rebuilt from its data file and costs no keys. |
-| **`fail_recovery_on_crc_errors = false`** | The operator's explicit opt-out from refusal, for one case: a data file whose hint is bad and that cannot be rescanned is skipped with a warning on stderr, and the database opens without its keys. It does not relax the rules on cutting above. |
+| Guarantee | Proved by |
+|---|---|
+| **Every durable write is there.** Every write acknowledged as durable is in the opened database, under its sequence. `sync = false` writes made after the last sync may be missing; those that survive are a prefix of the write order, and a batch is in whole or not at all. The database that opens is recovery-equivalent to the one that closed (*Definitions*). | "DB recovery: puts survive restart", "DB recovery: batch survives restart", "DB recovery: incomplete batch is discarded", "pipeline: many concurrent sync writers, every commit durable and visible, recovery agrees", "Recovery model-based: random workload matches oracle", `[model]` |
+| **One file at most is cut.** Only the file being written when the process stopped can hold a torn record. `open` cuts that file at its last committed record, whole if its first page was lost, and syncs the cut. A tail of zeros, preallocated space, is trimmed in any file. | "DB recovery: a hint-less file's tail is truncated only in the newest file", "DB recovery: open fails when the cut of a torn tail cannot be synced, and the next open recovers", "Preallocated tail: sealed files shrink to their logical size", "fault sweep: open after a crash" |
+| **Nothing it indexes is unsynced.** A data file without a hint is written back to the device and synced before anything is built from it, so what `open` publishes is durable whether or not the last process synced it. | "open makes a hint-less file durable before it indexes it: close after a failed fdatasync", "open makes a hint-less file durable before it indexes it: a process killed before its sync", "open fails when the rewrite of a hint-less file cannot be synced, and writes no hint for it" |
+| **Damage is refused, not opened around.** A state no crash leaves on storage that keeps its promises is damage. Where `open` can see it, it throws and cuts nothing: data past the last committed record in a file that is not the newest, such data in more than one file, two files sharing sequences other than an interrupted vacuum's pair. It never opens a best-effort subset of a damaged database, which to the caller would be data loss with no error. The one opt-out is `fail_recovery_on_crc_errors = false` (*Hint files*), and it does not relax the cutting rules. | "DB recovery: a hint-less file's tail is truncated only in the newest file", "recovery refuses two different writes under one sequence", "recovery keeps the full file over a copy of its prefix", "recovery undoes a vacuum killed before the source was unlinked", "DB vacuum: a damaged sealed file is not compacted away" |
+| **Damage shaped like a crash is not covered.** `open` cannot refuse what it cannot tell from a torn write. `docs/bytecask_design.md`, *Recovering a Hint-less File*, lists the known shapes. | n/a: an exclusion |
+| **One process at a time.** A directory another process holds open is refused with `std::system_error`. `close` releases it. | "DB rejects concurrent open on same directory", "DB directory unlocked after close" |
+| **Options are checked first.** `max_key_bytes`, `max_value_bytes` or `max_file_bytes` above its hard ceiling (*Limits*), `recovery_threads = 0`, or a buffer pool under `2 x max_file_bytes`, throws `std::invalid_argument` before the directory is created or locked. `max_file_bytes = 0` is valid: every write seals the file it went into. | "Limits: open rejects options above the hard ceilings", "Options: recovery_threads = 0 is refused at open", "Options: a buffer pool of exactly 2 x max_file_bytes is accepted, one byte less is not", "Options: max_file_bytes = 0 seals a file after every write" |
 
 ---
 
@@ -252,332 +251,66 @@ its promises, and refuses any other. Proved by the `[recovery]` tests.
 
 Shuts the engine down and reports whether the shutdown kept every
 acknowledged write. `~DB` calls it when the caller did not, and swallows
-its errors. Proved by the `[close]` tests.
+its errors.
 
-| Property | Contract |
-|----------|----------|
-| **Durability** | Returns normally only if every write the DB acknowledged — `sync = false` ones included — is durable, and the sync, trim and hint writes all succeeded. |
-| **Failure reporting** | Healthy engine: a failed `fdatasync`, trim or hint write throws `std::system_error`. Degraded engine: throws `DbDegraded` when writes were acknowledged above `durable_seq`; it does not sync, since a sync after a failed one proves nothing (#231). A degraded engine whose acknowledged writes are all durable closes normally. |
-| **Closed either way** | Whatever it throws, the engine is closed and the directory lock released. A failed close leaves on disk what a crash would, and the next `open` recovers it the same way. |
-| **Concurrency** | Waits for a running vacuum and for every in-flight write to be published. A write racing `close` either commits before it — and is covered by its durability verdict — or throws `DbClosed`. A read racing it returns a result or throws `DbClosed`. |
-| **Afterwards** | Every operation throws `DbClosed` (a `std::logic_error`), except `mode()`, `is_degraded()` and `degraded_reason()`, which keep answering. `Snapshot`s, iterators and spans taken before stay valid and readable. |
-| **Idempotency** | A second `close` returns at once and reports nothing: a retry cannot make lost pages durable. |
+| Guarantee | Proved by |
+|---|---|
+| **It returns only if everything acknowledged is durable.** Every write the DB acknowledged, `sync = false` ones included, is on the device, and every hint write succeeded. On a healthy engine the sync and the trim of the active file succeeded too; on a degraded one the trim is best effort, since nothing it could sync can be trusted. | "close() makes unsynced writes durable and writes the active file's hint", "a clean close writes the active file's hint", "DB close writes hint file for sealed file", "fault sweep: close" |
+| **A failure is reported, once.** On a healthy engine a failed `fdatasync`, trim or hint write throws `std::system_error`. On a degraded engine `close` syncs nothing, since a sync after a failed one proves nothing, and throws `DbDegraded` if a write was acknowledged above `durable_sequence()`; one whose acknowledged writes are all durable closes normally. A second `close` returns at once and reports nothing: a retry cannot make lost pages durable. | "close() throws when its fdatasync fails, closes all the same, and a reopen recovers what was durable", "close() on a degraded engine reports acknowledged writes that are not durable", "close() on a degraded engine whose acknowledged writes are all durable returns normally", "after close() every operation throws DbClosed; snapshots taken before stay readable" |
+| **Closed either way.** Whatever it throws, the engine is closed and the directory lock released. A failed `close` leaves on disk what a crash would, and the next `open` recovers it the same way. | "close() throws when its fdatasync fails, closes all the same, and a reopen recovers what was durable", "DB directory unlocked after close" |
+| **A racing operation completes or throws `DbClosed`.** `close` waits for a running vacuum and for every in-flight write to be published. A write that races it either commits first, and is covered by its durability verdict, or throws `DbClosed`; a read returns a result or throws `DbClosed`. | "writers and readers racing close() either complete or throw DbClosed, and every acknowledged write survives" |
+| **Afterwards every call throws `DbClosed`**, a `std::logic_error`, except `close()`, which returns at once, and `mode()`, `is_degraded()` and `degraded_reason()`, which keep answering. Views taken before, a `Snapshot`, an iterator and the spans it lent, stay valid and readable (*View and span lifetimes*). | "after close() every operation throws DbClosed; snapshots taken before stay readable" |
+| **`~DB` closes too.** It calls `close` if the caller did not and swallows what it throws, so a caller that only destroys the `DB` cannot tell a clean shutdown from one that lost its unsynced writes; call `close` to know. No operation may be in flight when `~DB` runs: that is a caller precondition, since it ends the object's lifetime. An operation that races it is undefined. The undefined part does not extend to data already written: the worst on-disk outcome is a shorter valid prefix of the committed history, which the next `open` recovers, and the directory lock is released only once teardown has stopped writing, so no second process opens the directory while it still does. | "DB destructor flushes hint files" |
 
 ---
 
 ## `changes_since`
 
-Returns a lazy iterator over committed, durable entries in ascending
-sequence order. Validated implicitly through the E2E ingest pipeline
-tests, not through standalone `changes_since` proof tests.
+A lazy iterator over the committed, durable entries of a `Snapshot`, in
+ascending sequence order, for replication.
 
-| Property | Contract |
-|----------|----------|
-| **Durable boundary** | Only entries confirmed by `fdatasync` are yielded. The upper bound is `min(snap.sequence(), durable_sequence)`. Entries from NoSync writes not yet covered by a subsequent `fdatasync` are excluded, even if visible via snapshots. |
-| **Completeness** | Every committed durable entry with `sequence > from_sequence` at snapshot time is yielded exactly once, provided every vacuum since `from_sequence` was written ran with `retain_after <= from_sequence`. A vacuum with a higher `retain_after` (or none) may have dropped dead Puts and tombstones above `from_sequence`; the stream then skips them silently, and the caller must re-bootstrap instead (#168). |
-| **Ordering** | Entries are yielded in strictly ascending sequence order. |
-| **Batch integrity** | Incomplete batches (orphaned `BulkBegin` without `BulkEnd`) are excluded. `BulkBegin`/`BulkEnd` markers are preserved in the output. |
-| **Vacuum transparency** | After `vacuum_compact_file`, entries retain original sequences and batch markers. Above the vacuum's `retain_after`, `changes_since` over a vacuumed file yields the same entries as over the pre-vacuum file. |
-| **Snapshot safety** | The iterator holds a `Snapshot` reference, keeping file descriptors open. Safe to run concurrently with vacuum (reads via fd, not path). |
+| Guarantee | Proved by |
+|---|---|
+| **Durable entries only.** It yields the entries that were durable when the `Snapshot` was taken, and nothing a `sync = false` write had left unsynced, even where the `Snapshot` shows that write. | "changes_since stops at the snapshot's durable sequence" |
+| **Complete and exactly once, above the retention point.** Every durable entry with a sequence above `from_sequence` is yielded once, provided every vacuum since that sequence was written ran with `retain_after <= from_sequence`. A vacuum with a higher `retain_after`, or the default, may have dropped dead values and tombstones above `from_sequence`; the stream then skips them silently, and the caller re-bootstraps from a manifest (#168). | "Vacuum model-based: a follower resuming at retain_after converges", "vacuum keeps dead entries above retain_after", "vacuum keeps tombstones above retain_after", "basic ingest: entries from changes_since are ingested correctly", "changes_since empty iterator when no new entries" |
+| **Ascending sequence order**, strictly. | "changes_since iterator yields entries in sequence order", "leader-to-follower replication round-trip" |
+| **Whole batches, markers included.** `BulkBegin` and `BulkEnd` are yielded with the entries between them, so `ingest` can keep the batch atomic. Nothing of a batch that lacks its `BulkEnd` is yielded. | "ingest with batches: BulkBegin/BulkEnd preserved"; the incomplete-batch half: none |
+| **Vacuum is invisible to it.** An entry keeps its sequence and its batch markers when its file is compacted. Above the vacuum's `retain_after`, the stream over a compacted file is the stream over the original. | "Vacuum model-based: a follower resuming at retain_after converges" |
+| **It is a view.** The iterator holds what it reads, independently of the `Snapshot` it was given and of the `DB`; a vacuum or a `close` under it changes nothing it yields (*View and span lifetimes*). | "after close() every operation throws DbClosed; snapshots taken before stay readable" |
 
 ---
 
 ## View and span lifetimes
 
 Every read API either copies bytes out or lends a view of them. A lent
-view — `std::span`, a reference into an iterator's cache — is correct
-only while the memory behind it is still owned and still holds what it
-held. This section says, for each view the engine hands out and each
-event that can move a file underneath it, whether the view stays valid.
+view, a `std::span` or a reference into an iterator, is correct only
+while the memory behind it is still owned and still holds what it held.
+This section says, for each view the engine hands out, what it survives
+and what ends it.
 
-Its scope is memory safety and byte stability, not visibility. A view
-is frozen at the moment it was taken: a concurrent write never changes
-what a live view shows, and never invalidates it either.
+Its scope is memory safety and byte stability, not visibility. A view is
+frozen at the moment it was taken: a concurrent write never changes what
+a live view shows, and never invalidates it either.
 
 ### The views
 
-| View | Handed out by | The bytes live in |
-|------|---------------|-------------------|
-| `Bytes& out` | `DB::get`, `Snapshot::get` | The caller's own vector — a copy, not a view |
-| `EntryView` (`key`, `value`) | `EntryIterator`, `ReverseEntryIterator` — `iter_from`, `riter_from` | The producing iterator's `io_buf_`, or a data file's mapping under `io_backend = mmap` |
-| `const Key&` | `KeyIterator`, `ReverseKeyIterator` — `keys_from`, `rkeys_from` | An owning `Key` member of the producing iterator |
-| `DataEntryView` (`key`, `value`) | `ChangeIterator` — `changes_since` | The producing iterator's scan buffer — owning `DataEntry` storage |
-| `Snapshot` | `DB::snapshot`, `create_manifest` | A reference-counted engine state |
+| View | Handed out by | What it is |
+|------|---------------|------------|
+| `Bytes& out` | `DB::get`, `Snapshot::get` | A copy into the caller's own vector, not a view |
+| `EntryView` (`key`, `value`) | `EntryIterator`, `ReverseEntryIterator`: `iter_from`, `riter_from` | Spans lent by the iterator |
+| `const Bytes&` | `KeyIterator`, `ReverseKeyIterator`: `keys_from`, `rkeys_from` | A reference to a key the iterator owns |
+| `DataEntryView` (`key`, `value`) | `ChangeIterator`: `changes_since` | Spans lent by the iterator |
+| `Snapshot` | `DB::snapshot`, `create_manifest` | A frozen state |
 
-### What holds a view up
+### What a view survives
 
-Four mechanisms account for every answer below. Where a cell is valid,
-it is valid because of one of these, and the grid names which.
-
-**A — Owned copy.** The bytes are in storage the view's owner
-allocated. `get` copies the value into the caller's `Bytes`.
-`KeyIterator` materialises an owning `Key`. `ChangeIterator` reads
-through `CommittedEntryIterator`, whose scan buffer holds owning
-`DataEntry` values. No file event can reach any of them.
-
-**B — Iterator-pinned state.** `EntryIterator`,
-`ReverseEntryIterator` and `ChangeIterator` each hold their own
-`shared_ptr<const EngineState>`, which holds a `shared_ptr<DataFile>`
-per file. Every descriptor and mapping the iterator can reach stays
-open for as long as the iterator lives — independently of the `DB`, of
-the `Snapshot` it came from, and of what the engine publishes next.
-
-**C — Tree-pinned nodes.** `KeyIterator` holds a reference-counted
-pointer to the key-directory root it was created from. A write mutates
-a node in place only when it holds the sole reference to it, so no node
-reachable from a published root is ever modified. The subtree an
-iterator walks is immutable for the iterator's life.
-
-**D — Fixed mapping address.** The active file's mapping is
-established once, in `WritableMmapDataFile`'s constructor, and released
-once, in its destructor. No engine operation unmaps and remaps it. Only
-`mmap_end_` — the prefix still backed by the file — moves, and only
-downwards, and only in step with the file's length.
-
-### Offset containment
-
-One invariant carries the mmap answers, and is stated here so the rest
-can refer to it:
-
-> **P.** Every offset published in `key_dir` lies below the committed
-> extent of the file it names.
-
-P holds by construction: an entry becomes visible only after its bytes
-are complete on disk, and the scan that establishes a committed extent
-stops at the first incomplete or corrupt entry, which is always past
-everything already published. P is what lets `resume()` shorten the
-active file under a live reader without taking anything away from it.
-
-Test builds check P rather than assume it, on every published state:
-`store_state` verifies that each entry ends at or before its file's
-`total_bytes` as part of the key-directory walk it already performs,
-and `validate_state_consistency` repeats the check at `DB::open()` and
-after `resume()` — the latter being the operation that moves a
-committed extent downwards.
-
-### Sealed `MAP_PRIVATE` versus active `MAP_SHARED`
-
-The two mappings give different guarantees, and a span into one is not
-governed by the same rules as a span into the other.
-
-**Sealed files** (`ReadOnlyMmapDataFile`, `MAP_PRIVATE`) are immutable
-for their whole life. Nothing rewrites them, nothing shortens them, and
-vacuum's unlink does not disturb the mapping. A span into a sealed file
-is bounded by one thing only: the lifetime of the `DataFile` object,
-which mechanism B pins.
-
-**The active file** (`WritableMmapDataFile`, `MAP_SHARED`) is written
-while it is mapped, so `MAP_SHARED` is required for a reader to see
-what `pwritev` wrote. Two consequences follow, and both are guarantees,
-not accidents:
-
-- *Contents are stable.* Data files are append-only. `pwritev` writes
-  at the logical end and zero-fill only ever writes at or past the
-  zeroed end, both of which are at or above every published offset. No
-  byte under a live span is ever rewritten.
-- *The file can shorten under the mapping.* `resume()` truncates to the
-  last committed offset and sealing releases the zero-filled tail.
-  Neither touches the mapping; both lower `mmap_end_` with the file,
-  `resume()` before it cuts, so an `ftruncate` that cuts the file and
-  then reports an error leaves no page past the new end readable. By
-  P, neither can take away a page a published offset points into, so no
-  live span loses its backing. A read at or past the new bound takes
-  the `pread` fallback and fails as a clean short read rather than
-  faulting on a page beyond end of file.
-
-Under `pread` neither case arises: every span an iterator hands out
-points into that iterator's own `io_buf_`, which no file event can
-reach. Under the buffer pool an iterator is lent spans straight into a
-pool frame when the entry sits inside one resident frame, and holds a
-`FrameLease` — a pin on that frame — until it advances. A pinned frame
-is immutable and cannot be evicted or refilled, and the pool itself is
-held by the data file, which the iterator holds, so no file event and
-not even `DB` destruction can reach the frame while the span is live.
-Call that **L**.
-
-### The grid
-
-One row per (view, event). **Valid** means the view still addresses
-live memory and still holds the bytes it held. **Invalid** means it
-does not, and nothing reports that. **Invalid, detected** means the
-engine reports it rather than letting the caller read freed memory.
-
-No cell below is *invalid, detected*. Nothing in the engine notices
-that a lent view has gone stale — where a view becomes invalid it does
-so silently. That is what makes these rules worth writing down rather
-than relying on a check to catch a mistake.
-
-The rows below the rule in each table are the producing iterator's own
-lifecycle. They are the only rows that invalidate anything.
-
-*Seal* is not a public call. It is the step that turns the active file
-into a read-only one — release the zero-filled tail, reopen the path
-read-only, swap the registry entry — and it runs inside file rotation,
-`create_manifest`, `resume()` and vacuum's staging copy. It appears as
-its own row because it shortens a file, which is the property that
-matters here.
-
-#### `Bytes& out` from `get`
-
-| Event | Verdict | Why |
-|-------|---------|-----|
-| `resume()` | Valid | A — the caller owns the bytes |
-| `vacuum()` | Valid | A |
-| File rotation | Valid | A |
-| Seal | Valid | A |
-| `set_mode()` | Valid | A |
-| Originating `Snapshot` destroyed | Valid | A |
-| Concurrent write | Valid | A — a later write never reaches a value already copied out |
-| `DB` destruction | Valid | A — the value outlives the engine |
-| — | | |
-| Next `get` into the same `Bytes` | Overwritten | The vector is reused by design; copy it out first if the previous value is still needed |
-
-#### `EntryView` spans, `io_backend` = `pread`
-
-| Event | Verdict | Why |
-|-------|---------|-----|
-| `resume()` | Valid | B — the span is in the iterator's `io_buf_`; truncation cannot reach it |
-| `vacuum()` | Valid | B — the file object outlives the unlink |
-| File rotation | Valid | B — rotation registers a new object; the old one stays alive for anyone holding it |
-| Seal | Valid | B |
-| `set_mode()` | Valid | In-memory transition only |
-| Originating `Snapshot` destroyed | Valid | B — the iterator carries its own state reference |
-| Concurrent write | Valid | B |
-| `DB` destruction | Valid | B — see **`DB` destruction** below |
-| — | | |
-| Next `operator++()` | Invalid | The buffer is reused for the next entry |
-| Iterator destroyed | Invalid | The buffer goes with it |
-| Iterator moved | Valid | The buffer moves with the iterator; the span keeps addressing it |
-| Iterator copied | Not possible | The iterators are move-only. A copy would carry spans addressing the source's buffer while deep-copying that buffer, so the copy is deleted rather than documented |
-
-#### `EntryView` spans, `io_backend` = `buffer_pool`
-
-Spans point into a pool frame under lease when the whole entry lies in
-one resident frame, and into the iterator's `io_buf_` otherwise. Both
-are covered below.
-
-| Event | Verdict | Why |
-|-------|---------|-----|
-| `resume()` | Valid | B + L — truncation lowers the active file's size; the lent entry lies below it and its frame is pinned |
-| `vacuum()` | Valid | B + L — the frame outlives the unlink; file ids are never reused, so nothing looks the frame up again |
-| File rotation | Valid | B + L — the frames of the old active file become evictable, but not while pinned |
-| Seal | Valid | B + L |
-| `set_mode()` | Valid | In-memory transition only |
-| Originating `Snapshot` destroyed | Valid | B |
-| Concurrent write | Valid | B + L — an append extends a frame only past the size the reader is bounded by; a fill never touches a pinned frame |
-| Eviction under memory pressure | Valid | L — CLOCK passes over a pinned frame; it never waits for it |
-| `DB` destruction | Valid | B + L — the pool and its counters are held by the data file, which the iterator holds |
-| — | | |
-| Next `operator++()` | Invalid | The lease is released and the buffer reused |
-| Iterator destroyed | Invalid | The lease and the buffer go with it |
-| Iterator moved | Valid | The lease and the buffer move with the iterator |
-| Iterator copied | Not possible | Move-only, same as above |
-
-A lease held across a long loop body keeps one frame out of the pool's
-hands for that long. That is one frame, not a stall: eviction skips it.
-
-#### `EntryView` spans, `io_backend` = `mmap`
-
-Spans point into a file's mapping when the entry is inside it, and into
-the iterator's `io_buf_` otherwise. Both are covered below.
-
-| Event | Verdict | Why |
-|-------|---------|-----|
-| `resume()` | Valid | B + D + P — the mapping is never replaced; truncation lowers `mmap_end_` but cannot reach a published offset |
-| `vacuum()` | Valid | B + D — the mapping outlives the unlink, sealed bytes are immutable |
-| File rotation | Valid | B + D — the sealed reopen is a second, independent mapping; the old one is untouched |
-| Seal | Valid | B + D + P — releasing the zero tail removes no published byte |
-| `set_mode()` | Valid | In-memory transition only |
-| Originating `Snapshot` destroyed | Valid | B |
-| Concurrent write | Valid | B + D — appends and zero-fill never rewrite a published byte |
-| `DB::close()` / destruction | Valid | B + D + P — close's `shrink_to_fit` releases only the zero tail |
-| — | | |
-| Next `operator++()` | Invalid | Same as above |
-| Iterator destroyed | Invalid | Same as above |
-| Iterator moved | Valid | Same as above |
-| Iterator copied | Not possible | Move-only, same as above |
-
-#### `const Key&` from `keys_from` / `rkeys_from`
-
-| Event | Verdict | Why |
-|-------|---------|-----|
-| `resume()` | Valid | A + C — key iteration touches no file |
-| `vacuum()` | Valid | A + C |
-| File rotation | Valid | A + C |
-| Seal | Valid | A + C |
-| `set_mode()` | Valid | A + C |
-| Originating `Snapshot` destroyed | Valid | C — the iterator pins the key-directory root itself |
-| Concurrent write | Valid | C — a write path-copies; it never mutates a published node |
-| `DB` destruction | Valid | A + C |
-| — | | |
-| Next `operator++()` | Contents replaced | The reference stays bound to the iterator's member; the bytes in it change |
-| Iterator destroyed | Invalid | The member goes with it |
-
-#### `DataEntryView` from `changes_since`
-
-| Event | Verdict | Why |
-|-------|---------|-----|
-| `resume()` | Valid | A + B — the spans are in owning scan storage |
-| `vacuum()` | Valid | A + B |
-| File rotation | Valid | A + B |
-| Seal | Valid | A + B |
-| `set_mode()` | Valid | A + B |
-| `Snapshot` passed to `changes_since` destroyed | Valid | B — the iterator copies the state reference out of it |
-| Concurrent write | Valid | A + B — the stream's upper bound is fixed at construction |
-| `DB` destruction | Valid | A + B |
-| — | | |
-| Next `operator++()` | Invalid | The scan buffer is cleared before the next entry is read |
-| Iterator destroyed | Invalid | The buffer goes with it |
-| Iterator copied | Not possible | `ChangeIterator` is move-only |
-
-#### `Snapshot`
-
-| Event | Verdict | Why |
-|-------|---------|-----|
-| `resume()` | Valid | Holds a reference-counted state; a later publication does not disturb it |
-| `vacuum()` | Valid | Pins every file it names — vacuum's unlink leaves them readable |
-| File rotation | Valid | Pins the pre-rotation file set |
-| Seal | Valid | Reads published offsets only |
-| `set_mode()` | Valid | The snapshot carries the mode it captured |
-| Concurrent write | Valid | A snapshot is a frozen state; writes publish a new one |
-| `DB` destruction | Valid | Carries no reference to the `DB` |
-| — | | |
-| Moved from | Invalid | A moved-from `Snapshot` holds no state. Only destruction and assignment are supported on it — the same rule the standard library applies to its own move-only types |
-
-### A view may outlive the `Snapshot` it came from
-
-`Snapshot::iter_from`, `keys_from`, `riter_from` and `rkeys_from` hand
-the iterator its own reference to the engine state, and `changes_since`
-copies the reference out of the `Snapshot` it is given. The binding is
-to the iterator, not to the snapshot. Destroying or moving the
-`Snapshot` mid-iteration is safe, and so is returning an iterator from
-a scope where the `Snapshot` was a local.
-
-The reverse is not true: a span belongs to the iterator that produced
-it, and does not outlive it. That binding is enforced, not just stated:
-`EntryIterator`, `ReverseEntryIterator` and `ChangeIterator` are
-move-only, so a span can never be separated from the buffer it
-addresses by copying the iterator. Moving is safe — the buffer travels
-with the spans.
-
-### `DB` close and destruction
-
-`close()` may race other operations; see *`close`*. No operation may be
-in flight when `~DB` runs: that is a caller precondition, not something
-the engine enforces, since it ends the object's lifetime.
-
-Views already taken stay valid. An iterator, a `Snapshot`, and the
-spans they hand out hold their own references to the engine state and
-to every data file it names, so they remain valid and remain readable
-after the `DB` is closed or gone.
-
-An operation *racing* the destructor is undefined: it uses an object
-whose lifetime is ending. Undefined here does not extend to data
-already written. Data files are append-only and the close's only
-destructive act is truncating the active file to its logical end, so
-the worst on-disk outcome is a shorter valid prefix of the committed
-history — every surviving entry keeps its CRC, and a cut that lands
-mid-entry is cleaned at the next `open`, which rescans a hint-less data
-file and resizes it to its committed end. The directory lock is
-released only after that truncation completes, so no second process can
-open the directory while teardown is still writing.
+| Guarantee | Proved by |
+|---|---|
+| **Every engine event.** A live view stays valid and keeps its bytes across `resume()`, `vacuum()`, a file rotation, `set_mode()`, a concurrent write, `close()` and the destruction of the `DB`. Nothing the engine does to its files, including deleting one, reaches a view already lent, under any `io_backend`. | "mmap: resume() keeps reader spans valid", "vacuum unlinks stale file immediately, snapshot reads via open fd", "io_backend=BufferPool: an iterator outlives the DB with its spans", "io_backend=BufferPool: lent entry spans hold while readers evict", "resume() with live snapshot on degraded DB", "after close() every operation throws DbClosed; snapshots taken before stay readable" |
+| **Frozen.** A view shows what it showed when it was taken. A later write changes nothing it shows and invalidates nothing. | "Snapshot get is frozen at snapshot time", "Snapshot iter_from is frozen at snapshot time", "Snapshot riter_from is frozen at snapshot time", "count_keys on a snapshot ignores later writes", "DB snapshot isolation under concurrent writes" |
+| **Independent of its `Snapshot`.** An iterator taken from a `Snapshot`, or the one `changes_since` is given, holds what it needs itself. Destroying or moving the `Snapshot` mid-iteration is safe, and so is returning the iterator from the scope the `Snapshot` was local to. | "chaos soak: concurrent readers, writers and lifecycle" (walks `iter_from`, `riter_from` and `keys_from` after destroying their `Snapshot`) |
+| **Bound to its iterator, and no further.** A lent span or key reference belongs to the iterator that produced it: the next `operator++` replaces it, and the iterator's destruction ends it. Moving the iterator keeps it valid; the storage travels with the spans. `EntryIterator`, `ReverseEntryIterator` and `ChangeIterator` are move-only, so a copy can never separate a span from the storage it addresses. `ReverseKeyIterator` is copyable, as its sentinel is itself; a copy owns its own key, and a reference binds to the iterator it was taken from. | "entry iterators are move-only and still model input_iterator" |
+| **A copy is the caller's.** The `Bytes` that `get` fills is the caller's; no event reaches it, and the next `get` into the same vector overwrites it. | "DB get output-param round-trip" |
+| **Under `IoBackend::BufferPool`** a lent `EntryView` whose record lies in one resident cache frame pins that frame until the iterator advances; otherwise the bytes are copied into the iterator and nothing is pinned. Eviction skips a pinned frame and never waits for it, so a span held across a long loop body costs at most one frame, never a stall. | "BufferPool: a leased frame survives eviction pressure", "io_backend=BufferPool: lent entry spans hold while readers evict" |
+| **Under `IoBackend::Mmap`** a read the kernel cannot complete, a media error or a file truncated by something other than the engine, is `SIGBUS`, not `std::system_error`. The other back-ends throw. | none |
+| **Not promised.** Nothing detects a stale view. A span used after its iterator advanced or died, and a moved-from `Snapshot` used for anything but destruction or assignment, read memory the engine no longer vouches for, silently. These rules are written down because no check catches a mistake against them. | n/a: an exclusion |
