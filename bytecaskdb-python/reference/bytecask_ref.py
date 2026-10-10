@@ -844,6 +844,8 @@ class DB:
         caller advances.
         """
         self._check_open()
+        if max_bytes is not None and max_bytes < 0:  # the engine's budget is unsigned
+            raise ValueError(f"max_bytes = {max_bytes} is negative")
         header = ChangeHeader(_marker_at(snapshot._markers, from_sequence), from_sequence)
         return ChangeBatch(header, self._changes(from_sequence, snapshot._durable_sequence, max_bytes))
 

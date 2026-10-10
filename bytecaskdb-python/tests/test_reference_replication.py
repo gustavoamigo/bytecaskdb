@@ -115,6 +115,8 @@ def test_round_trip_in_slices_keeps_batches_whole(tmp_path):
     assert list(follower.iter_from()) == list(leader.iter_from())
     assert history(follower) == history(leader)
     assert replicate(leader, follower) == []  # caught up: an empty slice is accepted
+    with pytest.raises(ValueError):  # the engine's budget is unsigned
+        leader.changes_since(leader.snapshot(), 0, -1)
     follower.close()
     with open_follower(tmp_path / "follower", max_file_bytes=200) as follower:
         assert list(follower.iter_from()) == list(leader.iter_from())

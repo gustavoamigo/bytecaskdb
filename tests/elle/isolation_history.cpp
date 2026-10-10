@@ -749,10 +749,14 @@ auto ingest_owned(bytecask::DB &follower, const bytecask::ChangeHeader &header,
   follower.ingest(header, views);
 }
 
-// What max_bytes asks of changes_since for 1-64 entries of this workload,
-// whose records average a few hundred bytes. The engine cuts after the unit
-// that passes it, so a batch comes through whole.
-constexpr std::size_t kNominalEntryBytes = 256;
+// What max_bytes asks of changes_since for 1-64 entries of this workload.
+// Its records are small — a short key and a list of a few elements — so this
+// errs low: a slice that comes out shorter than 1-64 entries publishes more
+// intermediate states, which is what the replication checks read. At 256
+// the slices grew several times, and the unretained configuration stopped
+// seeing #168 in most rounds. The engine cuts after the unit that passes
+// the budget, so a batch comes through whole.
+constexpr std::size_t kNominalEntryBytes = 48;
 
 // Phase 1 of the protocol, under load: manifest from source, copy, open n as
 // a follower. The source's vacuum is held off from the manifest to the end
