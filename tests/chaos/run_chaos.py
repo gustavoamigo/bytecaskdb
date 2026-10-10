@@ -233,6 +233,8 @@ EVENTS = {"evict", "writeback", "writeback_fail"}
 # Per-life resource limits on the worker. RLIMIT_AS cannot run under ASan,
 # which reserves terabytes of shadow memory: disable it there.
 RESOURCES = {"rlimit_as", "rlimit_nofile"}
+# Lines of worker.log a failure prints: enough for a sanitizer's stacks.
+WORKER_LOG_TAIL = 80
 # Not a hazard: `vacuum` in --disable leaves the worker's vacuum thread out.
 WORKLOAD = {"vacuum"}
 HAZARDS = set(WINDOWS) | set(TERMINATORS) | EVENTS | RESOURCES | WORKLOAD
@@ -491,8 +493,11 @@ class Rig:
             raise Failure("resume() asked for a reopen with no page lost to "
                           "an eviction")
         if not killed and not out_of_memory and not reopen and rc not in (0, 4):
-            raise Failure(f"the worker died on its own (returncode {rc}); "
-                          f"see worker.log")
+            # The Elle child never exits 1 itself; a sanitizer report, a leak
+            # found at exit included, does (#398).
+            sanitizer = self.args.workload == "elle" and rc == 1
+            raise Failure(f"the worker died on its own (returncode {rc}"
+                          f"{', a sanitizer report' if sanitizer else ''})")
         if rc == 4 and not hist.open_failed:
             raise Failure("worker exited 4 without reporting a failed open")
         if plan["terminator"] == "clean" and not exited_early and rc == 0 \
@@ -808,6 +813,15 @@ class Rig:
         print(f"FAIL episode {life['episode']} life {life['n']} seed {life['seed']} "
               f"terminator {life['plan']['terminator']}\n  {what}\n"
               f"  kept in {keep}", file=sys.stderr)
+        # The cause is often in the worker's own output, a sanitizer report
+        # above all, and the job log is all a reader may get (#398).
+        log = keep / "worker.log"
+        lines = log.read_text(errors="replace").splitlines() if log.exists() else []
+        if lines:
+            print(f"  last {min(len(lines), WORKER_LOG_TAIL)} lines of worker.log:",
+                  file=sys.stderr)
+            for line in lines[-WORKER_LOG_TAIL:]:
+                print(f"    {line}", file=sys.stderr)
         return 1
 
 
