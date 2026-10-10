@@ -121,7 +121,7 @@ engine stops rather than publish it.
 | Refused | What happens | Proved by |
 |---|---|---|
 | A publication that would move a sequence, a file id or the durable sequence backwards, or make a `sync = true` write visible before it is durable. | Not published; the engine degrades, and reads keep the previous state. | "pipeline: publishing a state that moves a sequence or a file id backwards degrades the engine", "pipeline: publishing a state that owes an fdatasync degrades the engine" |
-| A recovered state, after `open` or `resume()`, whose active file is missing, that owes an `fdatasync`, or whose per-file accounting misses a file or holds incoherent sequence bounds. | `std::runtime_error`: `open` fails; `resume()` fails and the engine stays degraded. | none |
+| A recovered state, after `open` or `resume()`, whose active file is missing, that owes an `fdatasync`, or whose per-file accounting misses a file or holds incoherent sequence bounds. | `std::runtime_error`: `open` fails; `resume()` fails and the engine stays degraded. | "open and resume() refuse a recovered state that fails the consistency checks" |
 | A data file created under a name this database has used before, as a data or a hint file. | The process aborts. This is the only failure that ends the process; every other one throws or degrades. | "createDataFileForWrite panics when the data file already exists", "createDataFileForWrite panics when the stem was already hinted", "renameDataFileExclusive panics rather than replacing a live file" |
 
 ---
