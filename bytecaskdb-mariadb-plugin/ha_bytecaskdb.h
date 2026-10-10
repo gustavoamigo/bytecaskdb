@@ -29,6 +29,8 @@ namespace bytecaskdb {
 
 extern bytecask::DB  *g_db;
 extern handlerton    *bytecaskdb_hton;
+// Primary-key ranges served by batched reads; SHOW ENGINE BYTECASKDB STATUS.
+extern std::atomic<uint64_t> g_batched_pk_ranges;
 
 // ---------------------------------------------------------------------------
 // Persistent catalog functions — defined in bytecaskdb_plugin.cc.
@@ -147,6 +149,14 @@ public:
   int index_prev(uchar *buf) override;
   int index_first(uchar *buf) override;
   int index_last(uchar *buf) override;
+#ifndef PLUGIN_TESTING
+  // A primary-key range with both ends whose key orders as its bytes is read
+  // in batches and stopped by the engine at its end, with no key_cmp per
+  // row; anything else goes to handler's, through index_read_map/index_next.
+  int read_range_first(const key_range *start_key, const key_range *end_key,
+                       bool eq_range, bool sorted) override;
+  int read_range_next() override;
+#endif
 
   // -------------------------------------------------------------------
   // External lock — transaction lifecycle
@@ -278,6 +288,12 @@ private:
 
   // Reused across index_read_map calls to avoid per-call heap allocation.
   std::vector<uint8_t> search_key_buf_;
+  // read_range_first's encoded end, for the index_read_map it calls.
+  std::vector<uint8_t> range_end_;
+  bool range_end_pending_{false};
+  // merge_index_ is a batched primary-key range (read_range_first): it stops
+  // at the range's end itself. Cleared by every other way into an index.
+  bool batched_range_{false};
 
   // The table's row and key layout, read from its Fields once in open().
   TableCodec codec_;

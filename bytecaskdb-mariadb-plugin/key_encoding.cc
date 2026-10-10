@@ -392,6 +392,12 @@ KeyPartPlan make_key_part_plan(TABLE *table, const KEY_PART_INFO &kp) {
   } else if (is_float_type(rt)) {
     p.flip = KeyPartPlan::Flip::kFloat;
   }
+  // A DESC part is stored ascending while the server compares it in
+  // reverse (#456), so its bytes order the other way from key_cmp.
+  p.order_exact = !p.nullable && !(kp.key_part_flag & HA_REVERSE_SORT) &&
+                  (is_signed_integer_type(rt) || rt == MYSQL_TYPE_DATE ||
+                   rt == MYSQL_TYPE_NEWDATE || rt == MYSQL_TYPE_YEAR ||
+                   p.be_temporal);
   return p;
 }
 
@@ -408,6 +414,9 @@ TableCodec make_table_codec(TABLE *table) {
     for (uint i = 0; i < key.user_defined_key_parts; ++i) {
       parts.push_back(make_key_part_plan(table, key.key_part[i]));
     }
+    codec.keys[k].order_exact =
+        std::all_of(parts.begin(), parts.end(),
+                    [](const KeyPartPlan &p) { return p.order_exact; });
   }
   return codec;
 }

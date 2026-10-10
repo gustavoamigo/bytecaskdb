@@ -24,6 +24,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <random>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -730,6 +731,144 @@ TEST_CASE_METHOD(MariaDBTxnFixture,
     auto bound = row_key(kTid, 4);
     auto it = txn2->riter_prefix(bound.data(), bound.size(), lo.data(), lo.size(), kTid);
     REQUIRE(collect_keys(*it) == std::vector<uint8_t>{3, 1});
+  }
+}
+
+// =========================================================================
+// read_range: the batched merge yields what iter_prefix yields
+// =========================================================================
+
+namespace {
+
+std::vector<uint8_t> row_key16(uint32_t tid, uint16_t n) {
+  auto k = table_id_prefix(tid);
+  k.push_back(static_cast<uint8_t>(n >> 8));
+  k.push_back(static_cast<uint8_t>(n & 0xFF));
+  return k;
+}
+
+using Rows = std::vector<std::pair<std::vector<uint8_t>, std::string>>;
+
+// Every row with its value, each value read before the step past it: a value
+// lent from the reader's batch is only valid until next().
+Rows collect_rows(MariaDBTxn::MergeIterator &it) {
+  Rows out;
+  for (; it.valid(); it.next()) {
+    out.emplace_back(
+        std::vector<uint8_t>(it.key_data(), it.key_data() + it.key_len()),
+        std::string(reinterpret_cast<const char *>(it.value_data()),
+                    it.value_len()));
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(MariaDBTxnFixture,
+                 "MariaDBTxn read_range matches iter_prefix",
+                 "[txn][merge][read_range]") {
+  constexpr uint32_t kTid = 42;
+  constexpr uint16_t kRows = 1200;
+  THD thd{};
+  std::mt19937 rng{20261010};
+
+  // Committed: every third row, values naming the row, and a neighbouring
+  // table's rows on both sides that must never appear.
+  {
+    auto seed = create_txn();
+    for (uint16_t n = 0; n < kRows; n += 3) {
+      auto k = row_key16(kTid, n);
+      auto v = "c" + std::to_string(n);
+      seed->buffer_put(k.data(), k.size(),
+                       reinterpret_cast<const uint8_t *>(v.data()), v.size());
+    }
+    for (uint32_t tid : {kTid - 1, kTid + 1}) {
+      auto k = row_key16(tid, 7);
+      seed->buffer_put(k.data(), k.size(),
+                       reinterpret_cast<const uint8_t *>("x"), 1);
+    }
+    REQUIRE(seed->commit(&thd, true) == 0);
+  }
+
+  // Buffered in the reading transaction: inserts, overwrites and deletes.
+  auto txn = create_txn();
+  for (int i = 0; i < 400; ++i) {
+    const auto n = static_cast<uint16_t>(rng() % kRows);
+    auto k = row_key16(kTid, n);
+    if (rng() % 3 == 0) {
+      txn->buffer_del(k.data(), k.size());
+    } else {
+      auto v = "b" + std::to_string(n) + "." + std::to_string(i);
+      txn->buffer_put(k.data(), k.size(),
+                      reinterpret_cast<const uint8_t *>(v.data()), v.size());
+    }
+  }
+
+  SECTION("random ranges") {
+    for (int i = 0; i < 300; ++i) {
+      auto a = static_cast<uint16_t>(rng() % (kRows + 10));
+      auto b = static_cast<uint16_t>(rng() % (kRows + 10));
+      if (a == b) continue;
+      if (b < a) std::swap(a, b);
+      auto lo = row_key16(kTid, a);
+      auto hi = row_key16(kTid, b);
+      auto batched = txn->read_range(lo.data(), lo.size(), hi.data(), hi.size(), kTid);
+      auto walked = txn->iter_prefix(lo.data(), lo.size(), hi.data(), hi.size(), kTid);
+      REQUIRE(batched);
+      REQUIRE(walked);
+      const auto want = collect_rows(*walked);
+      REQUIRE(collect_rows(*batched) == want);
+    }
+  }
+
+  SECTION("whole table, past several batches") {
+    auto lo = table_id_prefix(kTid);
+    auto hi = table_id_upper_bound(kTid);
+    auto batched = txn->read_range(lo.data(), lo.size(), hi.data(), hi.size(), kTid);
+    auto walked = txn->iter_prefix(lo.data(), lo.size(), hi.data(), hi.size(), kTid);
+    const auto want = collect_rows(*walked);
+    REQUIRE(want.size() > 300);
+    REQUIRE(collect_rows(*batched) == want);
+  }
+
+  SECTION("rows written during the scan are seen as iter_prefix sees them") {
+    // The same writes at the same points of two scans, each in a new
+    // transaction over the committed rows: ahead of the cursor, behind it,
+    // on it, and a delete just ahead.
+    auto twin = create_txn();
+    auto lo = row_key16(kTid, 100);
+    auto hi = row_key16(kTid, 700);
+    auto scan = [&](MariaDBTxn &t, bool batched) {
+      auto it = batched ? t.read_range(lo.data(), lo.size(), hi.data(), hi.size(), kTid)
+                        : t.iter_prefix(lo.data(), lo.size(), hi.data(), hi.size(), kTid);
+      Rows out;
+      for (int step = 0; it->valid(); it->next(), ++step) {
+        out.emplace_back(
+            std::vector<uint8_t>(it->key_data(), it->key_data() + it->key_len()),
+            std::string(reinterpret_cast<const char *>(it->value_data()),
+                        it->value_len()));
+        if (step % 17 == 0) {
+          const uint16_t cur = static_cast<uint16_t>(
+              (it->key_data()[5] << 8) | it->key_data()[6]);
+          auto ahead = row_key16(kTid, static_cast<uint16_t>(cur + 40));
+          auto behind = row_key16(kTid, static_cast<uint16_t>(cur - 5));
+          auto here = row_key16(kTid, cur);
+          const std::string v = "w" + std::to_string(step);
+          const auto *vp = reinterpret_cast<const uint8_t *>(v.data());
+          t.buffer_put(ahead.data(), ahead.size(), vp, v.size());
+          t.buffer_put(behind.data(), behind.size(), vp, v.size());
+          t.buffer_put(here.data(), here.size(), vp, v.size());
+          auto gone = row_key16(kTid, static_cast<uint16_t>(cur + 3));
+          t.buffer_del(gone.data(), gone.size());
+        }
+      }
+      return out;
+    };
+    const auto walked = scan(*twin, false);
+    auto fresh = create_txn();
+    const auto batched = scan(*fresh, true);
+    REQUIRE(walked.size() > 150);
+    REQUIRE(batched == walked);
   }
 }
 

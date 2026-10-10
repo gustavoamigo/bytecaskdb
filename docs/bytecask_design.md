@@ -53,6 +53,8 @@ cached state instead of resolving catalog maps per row. Row-count deltas are
 still tracked in the per-THD transaction object so rollback and failed commit
 can restore the counters exactly.
 
+A primary-key range with both ends, on a key whose bytes order as its values do, is read through `Snapshot::read_range` and ended by the engine, with no comparison per row against the range's end (`bytecaskdb-mariadb-plugin/docs/mariadb_engine_design.md`, *Primary-key range reads*).
+
 The plugin never calls `resume()`. When an engine write throws and the
 engine is degraded afterwards, it logs the reason and aborts the server,
 as MyRocks does on a write I/O error and InnoDB on a failed `fsync`;
