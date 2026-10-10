@@ -349,11 +349,26 @@ static auto header_to_js(const bytecask::ChangeHeader &h) -> val {
   return obj;
 }
 
+// A BigInt that is a sequence or a marker id: non-negative and below 2^64.
+// Anything else would wrap modulo 2^64 and alias a valid value, so it is
+// refused rather than truncated. BigInt.asUintN(64, v) === v exactly when v
+// is in range.
+static auto strict_u64(const val &v, const char *what) -> std::uint64_t {
+  if (v.typeOf().as<std::string>() != "bigint") {
+    throw std::invalid_argument(std::string(what) + " must be a BigInt");
+  }
+  if (!val::global("BigInt").call<val>("asUintN", 64, v).equals(v)) {
+    throw std::invalid_argument(std::string(what) +
+                                " must be a non-negative BigInt below 2^64");
+  }
+  return v.as<std::uint64_t>();
+}
+
 static auto header_from_js(const val &h) -> bytecask::ChangeHeader {
   const auto marker = h["marker"];
-  return {.marker = {.since_sequence = marker["sinceSequence"].as<std::uint64_t>(),
-                     .id = marker["id"].as<std::uint64_t>()},
-          .from_sequence = h["fromSequence"].as<std::uint64_t>()};
+  return {.marker = {.since_sequence = strict_u64(marker["sinceSequence"], "sinceSequence"),
+                     .id = strict_u64(marker["id"], "id")},
+          .from_sequence = strict_u64(h["fromSequence"], "fromSequence")};
 }
 
 // changesSince's maxBytes: missing/undefined/null means no cut. A negative
@@ -621,7 +636,7 @@ static void jsdb_ingest(JsDB &self, val header, val entries) {
 
   for (std::size_t i = 0; i < len; ++i) {
     auto e = entries[i];
-    auto seq = e["sequence"].as<std::uint64_t>();
+    auto seq = strict_u64(e["sequence"], "sequence");
     auto et = string_to_entry_type(e["entryType"].as<std::string>());
 
     key_bufs.push_back(e["key"].as<std::string>());

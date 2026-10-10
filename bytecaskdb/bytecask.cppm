@@ -4726,25 +4726,41 @@ void DB::set_mode(Mode mode) {
           "recover."));
       std::rethrow_exception(ex);
     }
-    t.apply_change_marker(seq, id);
-    counters_.bytes_written.fetch_add(
-        static_cast<std::int64_t>(change_marker_size(EntryType::ChangeMarker)),
-        std::memory_order_relaxed);
-    // Publishes t degraded, marker included, on failure: the entry is in
-    // the file, and resume() finds it there either way.
-    sync_active_file(t, current, "set_mode(Leader)");
-    if (t.is_rotation_needed(rotation_threshold_) && t.file_ids_left() > 0) {
-      PreparedRotation rotation;
-      try {
-        rotation = prepare_rotation(t);
-      } catch (...) {
-        t.apply_degrade(
-            "set_mode(Leader) rotation file creation failed: call resume().");
-        store_state(current, std::move(t).persistent());
-        throw;
+    // From here the marker is in the file. A failure below that no handler
+    // degrades for — an allocation, typically — would leave a healthy
+    // follower whose next promotion appends a second marker under the same
+    // sequence, so writes are refused until resume() reconciles the file, as
+    // after any append (#364).
+    try {
+      t.apply_change_marker(seq, id);
+      counters_.bytes_written.fetch_add(
+          static_cast<std::int64_t>(
+              change_marker_size(EntryType::ChangeMarker)),
+          std::memory_order_relaxed);
+      // Publishes t degraded, marker included, on failure: the entry is in
+      // the file, and resume() finds it there either way.
+      sync_active_file(t, current, "set_mode(Leader)");
+      if (t.is_rotation_needed(rotation_threshold_) &&
+          t.file_ids_left() > 0) {
+        PreparedRotation rotation;
+        try {
+          rotation = prepare_rotation(t);
+        } catch (...) {
+          t.apply_degrade(
+              "set_mode(Leader) rotation file creation failed: call "
+              "resume().");
+          store_state(current, std::move(t).persistent());
+          throw;
+        }
+        finish_rotation(t, std::move(rotation));
       }
-      finish_rotation(t, std::move(rotation));
+      t.apply_set_mode(mode);
+      store_state(current, std::move(t).persistent());
+    } catch (...) {
+      refuse_writes();
+      throw;
     }
+    return;
   }
   t.apply_set_mode(mode);
   store_state(current, std::move(t).persistent());
@@ -6911,6 +6927,13 @@ void DB::ingest(const ChangeHeader &header,
           e.sequence, previous)};
     }
     previous = e.sequence;
+    // A type byte outside the enum would be appended as given and read back
+    // as damage, cutting the follower's newest file at the next open.
+    if (!is_known_entry_type(e.entry_type)) {
+      throw std::invalid_argument{std::format(
+          "ingest: unknown entry type {}",
+          static_cast<unsigned>(e.entry_type))};
+    }
     if (e.entry_type == EntryType::ChangeMarker) {
       // A marker is a unit of its own, and its value is its id.
       if (in_batch || !e.key.empty() ||

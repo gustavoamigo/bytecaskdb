@@ -423,6 +423,7 @@ TEST_CASE("ingest refuses a malformed slice with nothing written",
         {3, EntryType::BulkEnd, {}, {}}}},
       {"marker with a key", {{1, EntryType::ChangeMarker, a, id}}},
       {"marker with a short id", {{1, EntryType::ChangeMarker, {}, short_id}}},
+      {"unknown entry type", {{1, static_cast<EntryType>(9), a, v}}},
   };
   const auto before = data_file_bytes(td.path / "follower");
   for (const auto &[name, entries] : cases) {
@@ -686,10 +687,13 @@ TEST_CASE("Recovery model-based: change markers survive serial and parallel "
                                        std::uint64_t, std::uint64_t,
                                        std::uint64_t, std::uint64_t,
                                        std::uint64_t>>;
+  // Files with bytes in them: an empty active file is sealed at close and
+  // another opened at the next open, which says nothing about recovery.
   auto collect_stats = [](bytecask::DB &db) {
     Stats vals;
     for (const auto &[fid, fs] : db.file_stats())
-      vals.emplace_back(fs.live_bytes, fs.total_bytes, fs.min_sequence,
+      if (fs.total_bytes > 0)
+        vals.emplace_back(fs.live_bytes, fs.total_bytes, fs.min_sequence,
                         fs.max_sequence, fs.tombstone_bytes, fs.marker_bytes,
                         fs.change_marker_bytes);
     std::ranges::sort(vals);
@@ -733,11 +737,12 @@ TEST_CASE("Recovery model-based: change markers survive serial and parallel "
     CHECK(kv(db) == oracle);
     CHECK(markers(db) == serial_markers);
     CHECK(change_marker_bytes(db) == promotions * kMarkerBytes);
+    const auto vacuumed = collect_stats(db);
     db.close();
     auto reopened = bytecask::DB::open(p, {.max_file_bytes = 2048});
     CHECK(kv(reopened) == oracle);
     CHECK(markers(reopened) == serial_markers);
-    CHECK(collect_stats(reopened) == collect_stats(reopened));
+    CHECK(collect_stats(reopened) == vacuumed);
   }
 
   SECTION("resume replays the active file's markers, without duplicates") {
@@ -823,4 +828,37 @@ TEST_CASE("a promotion that fills the active file rotates it, unless no file "
     CHECK(db.durable_sequence() == 2);
     CHECK_FALSE(db.is_degraded());
   }
+}
+
+TEST_CASE("a promotion that fails after its append refuses writes until "
+          "resume(), which finds the marker once",
+          "[replication][change_marker][degraded][resume]") {
+  // The 75-byte put leaves the 100-byte file 25 short, so the marker's
+  // append is followed by a rotation, whose in-memory step is made to throw.
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", follower_opts(100));
+  const std::string value(55, 'v');
+  const std::vector<bytecask::DataEntryView> slice{
+      {1, EntryType::Put, to_bytes("k"), to_bytes(value)}};
+  db.ingest({}, slice);
+  db.test_in_finish_rotation_ = [] { throw std::bad_alloc{}; };
+  CHECK_THROWS_AS(db.set_mode(Mode::Leader), std::bad_alloc);
+  db.test_in_finish_rotation_ = {};
+  // The marker reached the file but nothing was published: a healthy
+  // follower here would append a second marker under the same sequence.
+  CHECK(db.mode() == Mode::Follower);
+  CHECK(db.is_degraded());
+  CHECK_THROWS_AS(db.set_mode(Mode::Leader), bytecask::DbDegraded);
+  CHECK_THROWS_AS(db.ingest({}, {}), bytecask::DbDegraded);
+  REQUIRE_NOTHROW(db.resume());
+  const auto found = markers(db);
+  REQUIRE(found.size() == 1);
+  CHECK(found[0].since_sequence == 2);
+  db.set_mode(Mode::Leader);
+  CHECK(db.mode() == Mode::Leader);
+  REQUIRE(markers(db).size() == 2);
+  CHECK(markers(db)[1].since_sequence > found[0].since_sequence);
+  db.close();
+  auto reopened = bytecask::DB::open(td.path / "db");
+  CHECK(markers(reopened).size() == 2);
 }

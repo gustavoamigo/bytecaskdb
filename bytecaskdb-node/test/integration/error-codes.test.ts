@@ -95,6 +95,15 @@ test('ingest of a diverged history reports BC_CHANGE_MARKER_MISMATCH, of a gap B
   // A gap: the slice starts past the follower's position.
   expectCode(() => behind.ingest({ marker: ORIGIN_MARKER, fromSequence: all.entries[3].sequence },
     all.entries.slice(4)), 'BC_INVALID_ARGUMENT')
+  // A BigInt outside [0, 2^64) is refused, not wrapped into a value that
+  // could alias a real sequence or marker id.
+  expectCode(() => behind.ingest({ marker: { sinceSequence: -1n, id: 0n }, fromSequence: 3n }, []),
+    'BC_INVALID_ARGUMENT')
+  expectCode(() => behind.ingest({ marker: ORIGIN_MARKER, fromSequence: 1n << 64n }, []),
+    'BC_INVALID_ARGUMENT')
+  expectCode(() => behind.ingest({ marker: ORIGIN_MARKER, fromSequence: 3n },
+    [{ ...all.entries[3], sequence: -4n }]), 'BC_INVALID_ARGUMENT')
+  expect(behind.durableSequence()).toBe(3n)
   // Malformed: a slice that ends inside an atomic batch.
   const plan = new wasmBackend.WritePlan()
   plan.put('b1', '1')

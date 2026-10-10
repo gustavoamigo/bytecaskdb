@@ -241,9 +241,24 @@ auto header_to_js(Napi::Env env, const bytecask::ChangeHeader& h) -> Napi::Value
   return obj;
 }
 
-auto bigint_prop(const Napi::Object& obj, const char* name) -> std::uint64_t {
+// A BigInt that is a sequence or a marker id: non-negative and below 2^64.
+// Anything else would wrap modulo 2^64 and alias a valid value, so it is
+// refused rather than truncated.
+auto strict_u64(const Napi::Value& v, const char* what) -> std::uint64_t {
+  if (!v.IsBigInt()) {
+    throw std::invalid_argument(std::string(what) + " must be a BigInt");
+  }
   bool lossless = false;
-  return obj.Get(name).As<Napi::BigInt>().Uint64Value(&lossless);
+  const auto value = v.As<Napi::BigInt>().Uint64Value(&lossless);
+  if (!lossless) {
+    throw std::invalid_argument(std::string(what) +
+                                " must be a non-negative BigInt below 2^64");
+  }
+  return value;
+}
+
+auto bigint_prop(const Napi::Object& obj, const char* name) -> std::uint64_t {
+  return strict_u64(obj.Get(name), name);
 }
 
 auto header_from_js(const Napi::Value& v) -> bytecask::ChangeHeader {
@@ -751,8 +766,7 @@ auto NapiDB::CreateManifest(const Napi::CallbackInfo& info) -> Napi::Value {
 auto NapiDB::ChangesSince(const Napi::CallbackInfo& info) -> Napi::Value {
   auto* snap_wrap = NapiSnapshot::Unwrap(info[0].As<Napi::Object>());
   snap_wrap->Check();
-  bool lossless = false;
-  auto from_seq = info[1].As<Napi::BigInt>().Uint64Value(&lossless);
+  auto from_seq = strict_u64(info[1], "fromSeq");
   auto batch = Db().changes_since(*snap_wrap->snap, from_seq, opt_max_bytes_arg(info, 2));
   auto env = info.Env();
   auto result = Napi::Object::New(env);
@@ -777,8 +791,7 @@ auto NapiDB::Ingest(const Napi::CallbackInfo& info) -> void {
 
   for (std::uint32_t i = 0; i < len; ++i) {
     auto e = entries.Get(i).As<Napi::Object>();
-    bool lossless = false;
-    auto seq = e.Get("sequence").As<Napi::BigInt>().Uint64Value(&lossless);
+    auto seq = strict_u64(e.Get("sequence"), "sequence");
     auto et = string_to_entry_type(e.Get("entryType").As<Napi::String>().Utf8Value());
 
     key_bufs.push_back(arg_to_string(e.Get("key")));
