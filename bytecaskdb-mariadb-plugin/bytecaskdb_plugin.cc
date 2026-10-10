@@ -54,6 +54,7 @@ std::atomic<unsigned long> g_vacuum_busy_interval_ms{500};
 std::atomic<unsigned long> g_vacuum_idle_interval_ms{30000};
 std::atomic<unsigned long> g_sync_mode{kSyncAtEveryCommit};
 std::atomic<unsigned long> g_sync_interval_ms{1000};
+std::atomic<uint64_t>      g_batched_pk_ranges{0};
 }  // namespace bytecaskdb
 
 #ifndef PLUGIN_TESTING
@@ -791,6 +792,9 @@ static bool bytecaskdb_show_status(handlerton * /*hton*/, THD *thd,
   std::string output;
   for (auto &[name, value] : counters)
     output += name + ": " + std::to_string(value) + "\n";
+  output += "plugin.batched_pk_ranges: " +
+            std::to_string(g_batched_pk_ranges.load(std::memory_order_relaxed)) +
+            "\n";
 
   if (g_db->is_degraded())
     output += "degraded_reason: " + g_db->degraded_reason() + "\n";
