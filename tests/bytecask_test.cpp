@@ -5903,27 +5903,32 @@ TEST_CASE("count_keys reads no key per counted entry", "[count_keys]") {
 namespace {
 
 using EntryStrings = std::vector<std::pair<std::string, std::string>>;
+using Model = std::map<std::string, std::string>;
 
-// The entries of [from, to) as iter_from yields them: the reference.
-auto iter_range(const bytecask::Snapshot &snap, const std::string &from,
-                const std::string &to) -> EntryStrings {
-  EntryStrings out;
-  for (const auto &[k, v] : snap.iter_from({}, to_bytes(from))) {
-    if (to_string(k) >= to)
-      break;
-    out.emplace_back(to_string(k), to_string(v));
-  }
-  return out;
+// The entries of [from, to) in the model: the reference. An empty to runs to
+// the last key.
+auto model_range(const Model &model, const std::string &from,
+                 const std::string &to) -> EntryStrings {
+  const auto end = to.empty() ? model.end() : model.lower_bound(to);
+  return {model.lower_bound(from), end};
 }
 
-// The same range through read_range, `batch` entries at a time. Each batch is
+auto keys_of(EntryStrings entries) -> EntryStrings {
+  for (auto &e : entries)
+    e.second.clear();
+  return entries;
+}
+
+// The range through read_range, `batch` entries at a time. Each batch is
 // copied out only after next() has returned all of it, so every span in it
 // must survive the reads that came after it in the same batch.
 auto read_range_all(const bytecask::Snapshot &snap, const std::string &from,
-                    const std::string &to, std::size_t batch)
-    -> EntryStrings {
+                    const std::string &to, std::size_t batch,
+                    bool keys_only = false) -> EntryStrings {
   EntryStrings out;
-  auto reader = snap.read_range({}, {.from = to_bytes(from), .to = to_bytes(to)});
+  auto reader = snap.read_range({}, {.from = to_bytes(from),
+                                     .to = to_bytes(to),
+                                     .keys_only = keys_only});
   for (;;) {
     const auto entries = reader.next(batch);
     if (entries.empty())
@@ -5931,6 +5936,30 @@ auto read_range_all(const bytecask::Snapshot &snap, const std::string &from,
     REQUIRE(entries.size() <= batch);
     for (const auto &e : entries)
       out.emplace_back(to_string(e.key), to_string(e.value));
+  }
+  CHECK(reader.next(batch).empty());
+  return out;
+}
+
+// The range through iter_from and keys_from, stopped at to.
+auto iterate_range(const bytecask::Snapshot &snap, const std::string &from,
+                   const std::string &to) -> EntryStrings {
+  EntryStrings out;
+  for (const auto &[k, v] : snap.iter_from({}, to_bytes(from))) {
+    if (!to.empty() && to_string(k) >= to)
+      break;
+    out.emplace_back(to_string(k), to_string(v));
+  }
+  return out;
+}
+
+auto iterate_keys(const bytecask::Snapshot &snap, const std::string &from,
+                  const std::string &to) -> EntryStrings {
+  EntryStrings out;
+  for (const auto &k : snap.keys_from({}, to_bytes(from))) {
+    if (!to.empty() && to_string(k) >= to)
+      break;
+    out.emplace_back(to_string(k), std::string{});
   }
   return out;
 }
@@ -5947,8 +5976,8 @@ auto random_range_key(std::mt19937 &gen, int min_len) -> std::string {
 
 } // namespace
 
-TEST_CASE("read_range yields what iter_from yields, at every batch size",
-          "[read_range]") {
+TEST_CASE("read_range and the forward iterators yield the model's entries",
+          "[read_range][iterator]") {
   // Small files, so a range crosses many of them and vacuum has work; value
   // sizes from empty to larger than a pread's first guess, so records are
   // lent from frames, the mapping and the scratch buffer within one batch.
@@ -5979,14 +6008,20 @@ TEST_CASE("read_range yields what iter_from yields, at every batch size",
     return v;
   };
 
-  std::vector<bytecask::Snapshot> snaps;
+  // The model follows every write; each snapshot keeps a copy of it.
+  Model model;
+  std::vector<std::pair<bytecask::Snapshot, Model>> snaps;
   for (int op = 1; op <= 4'000; ++op) {
     const auto roll = std::uniform_int_distribution<int>(0, 99)(gen);
     if (roll < 70) {
-      db.put({.sync = false}, to_bytes(random_range_key(gen, 1)),
-             to_bytes(rand_value()));
+      const auto k = random_range_key(gen, 1);
+      const auto v = rand_value();
+      db.put({.sync = false}, to_bytes(k), to_bytes(v));
+      model[k] = v;
     } else if (roll < 85) {
-      (void)db.del({.sync = false}, to_bytes(random_range_key(gen, 1)));
+      const auto k = random_range_key(gen, 1);
+      (void)db.del({.sync = false}, to_bytes(k));
+      model.erase(k);
     } else if (roll < 88) {
       auto a = random_range_key(gen, 1);
       auto b = random_range_key(gen, 1);
@@ -5994,33 +6029,50 @@ TEST_CASE("read_range yields what iter_from yields, at every batch size",
         if (b < a)
           std::swap(a, b);
         db.del_range({.sync = false}, to_bytes(a), to_bytes(b));
+        model.erase(model.lower_bound(a), model.lower_bound(b));
       }
     } else if (roll < 98) {
       bytecask::WritePlan plan;
-      for (int i = 0; i < 8; ++i)
-        plan.put(to_bytes(random_range_key(gen, 1)), to_bytes(rand_value()));
+      for (int i = 0; i < 8; ++i) {
+        const auto k = random_range_key(gen, 1);
+        const auto v = rand_value();
+        plan.put(to_bytes(k), to_bytes(v));
+        model[k] = v;
+      }
       REQUIRE(db.apply_batch({.sync = false}, std::move(plan)));
     } else {
       (void)db.vacuum({.fragmentation_threshold = 0.2});
     }
     if (op % 1'000 == 0)
-      snaps.push_back(db.snapshot());
+      snaps.emplace_back(db.snapshot(), model);
   }
 
   // Older snapshots are read after vacuum has replaced some of their files.
-  for (const auto &snap : snaps) {
-    REQUIRE(read_range_all(snap, "", "g", 64) == iter_range(snap, "", "g"));
+  // An empty to is an open range; an empty from starts at the first key.
+  for (const auto &[snap, at] : snaps) {
+    REQUIRE(read_range_all(snap, "", "", 64) == model_range(at, "", ""));
+    REQUIRE(iterate_range(snap, "", "") == model_range(at, "", ""));
     for (int i = 0; i < 60; ++i) {
       auto from = random_range_key(gen, 0);
-      auto to = random_range_key(gen, 1);
-      if (!(from < to))
+      auto to = i % 4 == 0 ? std::string{} : random_range_key(gen, 1);
+      if (!to.empty() && !(from < to))
         continue;
-      const auto want = iter_range(snap, from, to);
+      const auto want = model_range(at, from, to);
+      const auto where = std::format("[{}, {})", from, to.empty() ? "end" : to);
       for (const std::size_t batch : {1, 2, 7, 64, 128, 300}) {
         if (read_range_all(snap, from, to, batch) != want)
-          FAIL(std::format("[{}, {}) batch {}: differs from iter_from", from,
-                           to, batch));
+          FAIL(std::format("{} batch {}: entries differ from the model", where,
+                           batch));
       }
+      for (const std::size_t batch : {1, 7, 128}) {
+        if (read_range_all(snap, from, to, batch, true) != keys_of(want))
+          FAIL(std::format("{} batch {}: keys differ from the model", where,
+                           batch));
+      }
+      if (iterate_range(snap, from, to) != want)
+        FAIL(std::format("{}: iter_from differs from the model", where));
+      if (iterate_keys(snap, from, to) != keys_of(want))
+        FAIL(std::format("{}: keys_from differs from the model", where));
     }
   }
 }
@@ -6083,12 +6135,11 @@ TEST_CASE("read_range batch spans outlive writes and vacuum until next()",
   CHECK(i == 1'900);
 }
 
-TEST_CASE("read_range: a failed read is retried, not skipped", "[read_range]") {
-  // One value is corrupted on disk; reading the range in batches of 8 fails
-  // on the batch that holds it. Every later call must fail on that same
-  // entry: a reader that skipped it would return the rest of the range.
-  TempDir td;
-  const auto dir = td.path / "db";
+namespace {
+
+// Keys k000..k199, values value-000..value-199, closed; then one byte of
+// k100's value flipped on disk, so its record fails its CRC.
+void make_db_with_one_corrupt_value(const std::filesystem::path &dir) {
   {
     auto db = bytecask::DB::open(dir);
     for (int i = 0; i < 200; ++i)
@@ -6096,7 +6147,6 @@ TEST_CASE("read_range: a failed read is retried, not skipped", "[read_range]") {
              to_bytes(std::format("value-{:03d}", i)));
     db.close();
   }
-  // Flip a byte inside k100's value in whichever data file holds it.
   bool corrupted = false;
   for (const auto &entry : std::filesystem::directory_iterator(dir)) {
     if (entry.path().extension() != ".data")
@@ -6112,6 +6162,17 @@ TEST_CASE("read_range: a failed read is retried, not skipped", "[read_range]") {
     corrupted = true;
   }
   REQUIRE(corrupted);
+}
+
+} // namespace
+
+TEST_CASE("read_range: a failed read is retried, not skipped", "[read_range]") {
+  // Reading the range in batches of 8 fails on the batch that holds the
+  // corrupt record. Every later call must fail on that same entry: a reader
+  // that skipped it would return the rest of the range.
+  TempDir td;
+  const auto dir = td.path / "db";
+  make_db_with_one_corrupt_value(dir);
 
   auto db = bytecask::DB::open(dir);
   const auto snap = db.snapshot();
@@ -6133,6 +6194,77 @@ TEST_CASE("read_range: a failed read is retried, not skipped", "[read_range]") {
   CHECK_THROWS_AS(reader.next(1), std::runtime_error);
 }
 
+TEST_CASE("read_range keys only checks CRCs as ReadOptions asks",
+          "[read_range]") {
+  // Under the blind-leaf key directory a key is read from its record, which
+  // fails its CRC here; the key bytes themselves are intact. The keyed key
+  // directories read no record for a key, so neither read fails.
+  TempDir td;
+  const auto dir = td.path / "db";
+  make_db_with_one_corrupt_value(dir);
+  auto db = bytecask::DB::open(dir);
+  const auto snap = db.snapshot();
+  const auto read_keys = [&](bool verify) {
+    auto reader = snap.read_range({.verify_checksums = verify},
+                                  {.from = to_bytes("k000"),
+                                   .to = to_bytes("k200"),
+                                   .keys_only = true});
+    std::size_t n = 0;
+    for (auto keys = reader.next(64); !keys.empty(); keys = reader.next(64))
+      n += keys.size();
+    return n;
+  };
+  CHECK(read_keys(false) == 200);
+#ifdef BYTECASK_KEYDIR_BLIND
+  CHECK_THROWS_AS(read_keys(true), std::runtime_error);
+#else
+  CHECK(read_keys(true) == 200);
+#endif
+}
+
+TEST_CASE("forward iterators read only the rows they are asked for",
+          "[read_range][iterator]") {
+  // Pool hits count record reads: each lend from a resident frame is one.
+  // The iterators step one row at a time, so three rows are three reads.
+  // The entry iterator reads a record only when dereferenced; the key
+  // iterator reads its first key when it is made, and under the keyed key
+  // directories reads none at all.
+  TempDir td;
+  auto db = bytecask::DB::open(
+      td.path / "db", {.io_backend = bytecask::IoBackend::BufferPool,
+                       .buffer_pool = {.capacity_bytes = 256 * 1024 * 1024}});
+  for (int i = 0; i < 1'000; ++i)
+    db.put({.sync = false}, to_bytes(std::format("k{:04d}", i)),
+           to_bytes("value"));
+  const auto snap = db.snapshot();
+  const auto hits = [&] { return db.stats().at("bytecask.pool_hits"); };
+
+  auto h0 = hits();
+  auto entries = snap.iter_from({});
+  auto e = entries.begin();
+  CHECK(hits() - h0 == 0);
+  CHECK(to_string((*e).key) == "k0000");
+  ++e;
+  CHECK(to_string((*e).key) == "k0001");
+  ++e;
+  CHECK(to_string((*e).key) == "k0002");
+  CHECK(hits() - h0 == 3);
+
+  h0 = hits();
+  auto key_range = snap.keys_from({});
+  auto k = key_range.begin();
+  CHECK(to_string(*k) == "k0000");
+  ++k;
+  CHECK(to_string(*k) == "k0001");
+  ++k;
+  CHECK(to_string(*k) == "k0002");
+#ifdef BYTECASK_KEYDIR_BLIND
+  CHECK(hits() - h0 == 3);
+#else
+  CHECK(hits() - h0 == 0);  // the keyed key directory holds the keys
+#endif
+}
+
 TEST_CASE("read_range refuses what it does not read", "[read_range]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db");
@@ -6149,17 +6281,17 @@ TEST_CASE("read_range refuses what it does not read", "[read_range]") {
                                        .to = to_bytes("a"),
                                        .keys_only = true}),
                   std::invalid_argument);
-  CHECK_THROWS_AS(snap.read_range({}, {.from = to_bytes("a")}),
-                  std::logic_error);
+  CHECK_THROWS_AS(snap.read_range({}, {.from = to_bytes("b"),
+                                       .to = to_bytes("a"),
+                                       .direction = bytecask::Direction::Reverse}),
+                  std::invalid_argument);
   CHECK_THROWS_AS(
       snap.read_range({}, {.from = to_bytes("a"),
                            .to = to_bytes("b"),
                            .direction = bytecask::Direction::Reverse}),
       std::logic_error);
-  CHECK_THROWS_AS(snap.read_range({}, {.from = to_bytes("a"),
-                                       .to = to_bytes("b"),
-                                       .keys_only = true}),
-                  std::logic_error);
+  // An empty to is open, so any from is a range.
+  CHECK_NOTHROW(snap.read_range({}, {.from = to_bytes("z")}));
 
   auto reader = snap.read_range({}, {.to = to_bytes("b")});
   CHECK_THROWS_AS(reader.next(0), std::invalid_argument);

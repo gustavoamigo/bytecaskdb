@@ -372,11 +372,53 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// EntryCursor — one forward step over a state's key directory and the
+// record it names: the step EntryIterator takes one row at a time and
+// RangeReader takes in a loop. Holds the state, so the files it reads stay
+// open. Members are marked inline: in a module interface, a member defined
+// in its class is not inline by default, and these run once per row.
+// ---------------------------------------------------------------------------
+class EntryCursor {
+public:
+  // At the end.
+  EntryCursor() = default;
+  // [from, to) of the state's key directory; an empty from is the first
+  // key, an empty to runs to the last. Places the ends: one record read
+  // each under the blind-leaf key directory.
+  EntryCursor(std::shared_ptr<const EngineState> state, BytesView from,
+              BytesView to, bool verify_checksums);
+
+  [[nodiscard]] inline auto done() const noexcept -> bool {
+    return cur_ == std::default_sentinel || (end_ && cur_ == *end_);
+  }
+
+  // The current record, lent as DataFile::lend_record lends it: the spans
+  // are valid until the next call with the same io_buf and lease.
+  [[nodiscard]] inline auto lend(Bytes &io_buf, FrameLease &lease) const
+      -> DataEntryView {
+    const auto &loc = *cur_;
+    return (*state_->files.get(loc.file_id()))
+        ->lend_record(loc.file_offset(), value_size_hint(loc),
+                      verify_checksums_, io_buf, lease);
+  }
+
+  inline void advance() { ++cur_; }
+
+private:
+  std::shared_ptr<const EngineState> state_;
+  KeyDirValueIter cur_;
+  // Only when to was given: an open walk stops at the last key and builds
+  // no second iterator.
+  std::optional<KeyDirValueIter> end_;
+  bool verify_checksums_{true};
+};
+
+// ---------------------------------------------------------------------------
 // EntryIterator — zero-copy forward iterator over key/value spans.
 //
-// Yields EntryView with non-owning spans into mmap (sealed files) or an
-// internal io_buf (active file). Spans are valid until the next operator++().
-// Uses ValueIterator internally — no key reconstruction during tree walk.
+// Yields EntryView with non-owning spans into a pool frame, the mapping or
+// an internal io_buf. Spans are valid until the next operator++(). Steps an
+// EntryCursor one row at a time: reads a record only when dereferenced.
 // ---------------------------------------------------------------------------
 export class EntryIterator {
 public:
@@ -395,19 +437,11 @@ public:
   EntryIterator(EntryIterator &&) noexcept = default;
   auto operator=(EntryIterator &&) noexcept -> EntryIterator & = default;
 
-  EntryIterator(std::shared_ptr<const EngineState> state,
-                KeyDirValueIter cur,
-                bool verify_checksums = true)
-      : state_{std::move(state)}, cur_{std::move(cur)},
-        verify_checksums_{verify_checksums} {}
+  explicit EntryIterator(EntryCursor cursor) : cursor_{std::move(cursor)} {}
 
   auto operator*() const -> const EntryView & {
     if (!has_cached_) {
-      const auto &dir_entry = *cur_;
-      auto &file = *(*state_->files.get(dir_entry.file_id()));
-      raw_cached_ = file.lend_record(dir_entry.file_offset(),
-                                     value_size_hint(dir_entry),
-                                     verify_checksums_, io_buf_, lease_);
+      raw_cached_ = cursor_.lend(io_buf_, lease_);
       cached_ = EntryView{.key = raw_cached_.key, .value = raw_cached_.value};
       has_cached_ = true;
     }
@@ -415,7 +449,7 @@ public:
   }
 
   auto operator++() -> EntryIterator & {
-    ++cur_;
+    cursor_.advance();
     has_cached_ = false;
     lease_.reset();  // the spans are dead now; let the frame go
     return *this;
@@ -424,13 +458,11 @@ public:
   void operator++(int) { ++*this; }
 
   auto operator==(std::default_sentinel_t) const noexcept -> bool {
-    return cur_ == std::default_sentinel;
+    return cursor_.done();
   }
 
 private:
-  std::shared_ptr<const EngineState> state_;
-  KeyDirValueIter cur_;
-  bool verify_checksums_{true};
+  EntryCursor cursor_;
   mutable DataEntryView raw_cached_;
   mutable EntryView cached_;
   mutable Bytes io_buf_;
@@ -616,6 +648,11 @@ export struct ChangeBatch {
 // from a scratch buffer, and are valid until the next call to next() or the
 // reader's destruction. A batch pins at most one frame per entry.
 //
+// Entries take EntryCursor's step, as EntryIterator does. Keys only walks
+// the key directory's own key iterator, as KeyIterator does — one record read
+// per key under the blind-leaf key directory, none under the keyed ones —
+// with each key copied into the batch; values are empty.
+//
 // Holds the snapshot's engine state: the files it reads stay open, and the
 // entries are those of the snapshot, whatever is written meanwhile.
 // ---------------------------------------------------------------------------
@@ -634,14 +671,22 @@ public:
 
 private:
   friend class Snapshot;
-  RangeReader(std::shared_ptr<const EngineState> state, KeyDirValueIter cur,
-              KeyDirValueIter end, bool verify_checksums)
-      : state_{std::move(state)}, cur_{std::move(cur)}, end_{std::move(end)},
-        verify_checksums_{verify_checksums} {}
+  // [from, to) of the state's key directory; an empty to runs to the last
+  // key.
+  RangeReader(std::shared_ptr<const EngineState> state, BytesView from,
+              BytesView to, bool keys_only, bool verify_checksums);
 
-  // An entry of the batch whose record was lent from io_buf_: copied to
-  // copy_ at `at`, key then value. Its view is filled in only once the whole
-  // batch is read, since copy_ may grow until then.
+  [[nodiscard]] auto keys_done() const noexcept -> bool;
+  void read_entries(std::size_t max);
+  void read_keys(std::size_t max);
+
+  // Batch storage is sized once rather than grown entry by entry, up to
+  // this many entries: a reader is often made for one short range.
+  static constexpr std::size_t kReserveCap = 1024;
+
+  // An entry of the batch whose bytes are in copy_ at `at`, key then value:
+  // a record lent from io_buf_, or a key. Its view is filled in only once
+  // the whole batch is read, since copy_ may grow until then.
   struct Copied {
     std::size_t index;
     std::size_t at;
@@ -649,10 +694,13 @@ private:
     std::size_t value_size;
   };
 
-  std::shared_ptr<const EngineState> state_;
-  KeyDirValueIter cur_;
-  KeyDirValueIter end_;
-  bool verify_checksums_{true};
+  // Entries step cursor_; keys walk the keyed iterators, as KeyIterator
+  // does. The other stays at its end.
+  EntryCursor cursor_;
+  KeyDirIter key_cur_;
+  KeyDirIter key_end_;
+  bool keys_only_{false};
+  bool keys_bounded_{false};
   std::vector<EntryView> views_;
   std::vector<Copied> copied_;
   Bytes io_buf_;
@@ -1956,8 +2004,8 @@ public:
                                 std::size_t limit) const -> std::size_t;
 
   // Reads range in batches; see RangeReader. Throws std::invalid_argument if
-  // from >= to, and std::logic_error for a spec not supported yet: today
-  // only forward reads of full entries with a non-empty to.
+  // to is given and from >= to, and std::logic_error for a reverse read,
+  // not supported yet.
   [[nodiscard]] auto read_range(const ReadOptions &opts,
                                 RangeSpec range) const -> RangeReader;
 
@@ -3919,9 +3967,8 @@ auto Snapshot::get(const ReadOptions& opts, BytesView key,
 
 auto Snapshot::iter_from(const ReadOptions& opts, BytesView from) const
     -> std::ranges::subrange<EntryIterator, std::default_sentinel_t> {
-  auto it = kd_value_lower_bound(state_->key_dir, from, state_->kd_ctx());
   return std::ranges::subrange<EntryIterator, std::default_sentinel_t>{
-      EntryIterator{state_, std::move(it), opts.verify_checksums},
+      EntryIterator{EntryCursor{state_, from, {}, opts.verify_checksums}},
       std::default_sentinel};
 }
 
@@ -3954,17 +4001,39 @@ auto Snapshot::read_range(const ReadOptions &opts, RangeSpec range) const
   // A finite range is checked first, so from >= to is always
   // std::invalid_argument, whatever else the spec asks for.
   if (!range.to.empty()) check_range(range.from, range.to);
-  if (range.direction != Direction::Forward || range.keys_only ||
-      range.to.empty()) {
-    throw std::logic_error{
-        "read_range: only forward reads of full entries with a non-empty "
-        "upper bound are supported"};
+  if (range.direction != Direction::Forward) {
+    throw std::logic_error{"read_range: reverse reads are not supported yet"};
   }
-  const auto ctx = state_->kd_ctx();
-  return RangeReader{state_,
-                     kd_value_lower_bound(state_->key_dir, range.from, ctx),
-                     kd_value_lower_bound(state_->key_dir, range.to, ctx),
+  return RangeReader{state_, range.from, range.to, range.keys_only,
                      opts.verify_checksums};
+}
+
+EntryCursor::EntryCursor(std::shared_ptr<const EngineState> state,
+                         BytesView from, BytesView to, bool verify_checksums)
+    : state_{std::move(state)}, verify_checksums_{verify_checksums} {
+  const auto ctx = state_->kd_ctx();
+  cur_ = kd_value_lower_bound(state_->key_dir, from, ctx);
+  if (!to.empty()) end_ = kd_value_lower_bound(state_->key_dir, to, ctx);
+}
+
+RangeReader::RangeReader(std::shared_ptr<const EngineState> state,
+                         BytesView from, BytesView to, bool keys_only,
+                         bool verify_checksums)
+    : keys_only_{keys_only}, keys_bounded_{keys_only && !to.empty()} {
+  if (!keys_only_) {
+    cursor_ = EntryCursor{std::move(state), from, to, verify_checksums};
+    return;
+  }
+  // The key reads check CRCs as the caller asked, as entry reads do.
+  const auto ctx = state->kd_ctx(verify_checksums);
+  key_cur_ = from.empty() ? kd_begin(state->key_dir, ctx)
+                          : kd_lower_bound(state->key_dir, from, ctx);
+  if (keys_bounded_) key_end_ = kd_lower_bound(state->key_dir, to, ctx);
+}
+
+auto RangeReader::keys_done() const noexcept -> bool {
+  return key_cur_ == std::default_sentinel ||
+         (keys_bounded_ && key_cur_ == key_end_);
 }
 
 auto RangeReader::next(std::size_t max) -> std::span<const EntryView> {
@@ -3975,20 +4044,27 @@ auto RangeReader::next(std::size_t max) -> std::span<const EntryView> {
   copied_.clear();
   copy_.clear();
   leases_.clear();
-  // Sized once rather than grown entry by entry: a reader is often made for
-  // a single short range. Larger batches still grow past the cap.
-  constexpr std::size_t kReserveCap = 1024;
   views_.reserve(std::min(max, kReserveCap));
+  if (keys_only_)
+    read_keys(max);
+  else
+    read_entries(max);
+  for (const auto &c : copied_) {
+    const auto bytes = std::span{copy_}.subspan(c.at);
+    views_[c.index] = {.key = bytes.first(c.key_size),
+                       .value = bytes.subspan(c.key_size, c.value_size)};
+  }
+  return views_;
+}
+
+void RangeReader::read_entries(std::size_t max) {
   leases_.reserve(std::min(max, kReserveCap));
-  while (views_.size() < max && !(cur_ == end_)) {
-    const auto &loc = *cur_;
+  while (views_.size() < max && !cursor_.done()) {
     FrameLease lease;
     // Emptied first: lend_record leaves io_buf_ non-empty exactly when it
     // lent the record from it.
     io_buf_.clear();
-    const auto rec = (*state_->files.get(loc.file_id()))
-                         ->lend_record(loc.file_offset(), value_size_hint(loc),
-                                       verify_checksums_, io_buf_, lease);
+    const auto rec = cursor_.lend(io_buf_, lease);
     if (!io_buf_.empty()) {
       copied_.push_back({.index = views_.size(),
                          .at = copy_.size(),
@@ -4002,14 +4078,23 @@ auto RangeReader::next(std::size_t max) -> std::span<const EntryView> {
       if (lease)
         leases_.push_back(std::move(lease));
     }
-    ++cur_;
+    cursor_.advance();
   }
-  for (const auto &c : copied_) {
-    const auto bytes = std::span{copy_}.subspan(c.at);
-    views_[c.index] = {.key = bytes.first(c.key_size),
-                       .value = bytes.subspan(c.key_size, c.value_size)};
+}
+
+// The key span lives only until the key iterator next moves, so each key is
+// copied.
+void RangeReader::read_keys(std::size_t max) {
+  while (views_.size() < max && !keys_done()) {
+    const auto [key, entry] = *key_cur_;
+    copied_.push_back({.index = views_.size(),
+                       .at = copy_.size(),
+                       .key_size = key.size(),
+                       .value_size = 0});
+    copy_.insert(copy_.end(), key.begin(), key.end());
+    views_.push_back({});
+    ++key_cur_;
   }
-  return views_;
 }
 
 auto Snapshot::rkeys_from(const ReadOptions& /*opts*/, BytesView from) const
@@ -4034,9 +4119,8 @@ auto Snapshot::rkeys_from(const ReadOptions& /*opts*/, BytesView from) const
 auto DB::iter_from(const ReadOptions &opts, BytesView from) const
     -> std::ranges::subrange<EntryIterator, std::default_sentinel_t> {
   auto s = load_state_for_read();
-  auto it = kd_value_lower_bound(s->key_dir, from, s->kd_ctx());
   return std::ranges::subrange<EntryIterator, std::default_sentinel_t>{
-      EntryIterator{s.state(), std::move(it), opts.verify_checksums},
+      EntryIterator{EntryCursor{s.state(), from, {}, opts.verify_checksums}},
       std::default_sentinel};
 }
 

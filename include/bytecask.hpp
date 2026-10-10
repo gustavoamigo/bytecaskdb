@@ -485,8 +485,8 @@ public:
                                 std::size_t limit) const -> std::size_t;
 
   // Reads range in batches; see RangeReader. Throws std::invalid_argument if
-  // from >= to, and std::logic_error for a spec not supported yet: today
-  // only forward reads of full entries with a non-empty to.
+  // to is given and from >= to, and std::logic_error for a reverse read,
+  // not supported yet.
   [[nodiscard]] auto read_range(const ReadOptions& opts,
                                 RangeSpec range) const -> RangeReader;
 
