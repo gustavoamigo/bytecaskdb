@@ -13836,6 +13836,57 @@ TEST_CASE("pipeline: publishing a state that owes an fdatasync degrades the "
   CHECK(s->durable_seq >= s->sync_requested_seq);
 }
 
+TEST_CASE("pipeline: publishing a state that moves a sequence or a file id "
+          "backwards degrades the engine",
+          "[pipeline][invariants][degraded][resume]") {
+  TempDir td;
+  // A file sealed after every write, so the active file id and the next one
+  // are both past their first values and can move back.
+  auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 0});
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v2"));
+
+  const auto before = db.engine_state();
+  REQUIRE(before->active_file_id > 0);
+  auto bad = std::make_shared<bytecask::EngineState>(*before);
+  std::string reason;
+  SECTION("next_seq") {
+    bad->next_seq -= 1;
+    reason = "next_seq regressed";
+  }
+  SECTION("active_file_id") {
+    bad->active_file_id -= 1;
+    reason = "active_file_id regressed";
+  }
+  SECTION("next_file_id") {
+    bad->next_file_id -= 1;
+    reason = "next_file_id regressed";
+  }
+  SECTION("durable_seq") {
+    bad->durable_seq -= 1;
+    reason = "durable_seq regressed";
+  }
+  db.test_publish(bad);
+
+  CHECK(db.is_degraded());
+  CHECK(db.degraded_reason().find(reason) != std::string::npos);
+  CHECK_THROWS_AS(db.put({.sync = true}, to_bytes("k2"), to_bytes("v")),
+                  bytecask::DbDegraded);
+  // The rejected state was never published: the engine still holds the
+  // state before it, and reads are served from it.
+  const auto after = db.engine_state();
+  CHECK(after->next_seq == before->next_seq);
+  CHECK(after->active_file_id == before->active_file_id);
+  CHECK(after->next_file_id == before->next_file_id);
+  CHECK(after->durable_seq == before->durable_seq);
+  bytecask::Bytes out;
+  REQUIRE(db.get({}, to_bytes("k1"), out));
+  CHECK(to_string(out) == "v2");
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+  CHECK(db.put({.sync = true}, to_bytes("k2"), to_bytes("v")).durable);
+}
+
 #ifndef NDEBUG
 TEST_CASE("pipeline: publishing a key outside its file's stats degrades the "
           "engine",
