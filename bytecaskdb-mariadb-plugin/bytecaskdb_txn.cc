@@ -183,6 +183,22 @@ std::size_t MariaDBTxn::count_range(const uint8_t *lo, size_t lo_len,
 // Helpers to extract a single iterator from a subrange<It, sentinel> by
 // moving its begin(). Both forward and reverse now use default_sentinel_t.
 
+std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::read_range(
+    const uint8_t *lo, size_t lo_len,
+    const uint8_t *hi, size_t hi_len,
+    uint32_t table_id) {
+  if (!snap_) {
+    snap_.emplace(db_->snapshot());
+  }
+  auto reader = snap_->read_range(
+      plugin_read_options(),
+      {.from = as_view(lo, lo_len), .to = as_view(hi, hi_len)});
+  auto buf_it = lookup_.lower_bound(std::vector<uint8_t>(lo, lo + lo_len));
+  return std::make_unique<MergeIterator>(
+      std::move(reader), buf_it, lookup_.end(),
+      std::vector<uint8_t>(hi, hi + hi_len), table_id);
+}
+
 std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::iter_prefix(
     const uint8_t *lo, size_t lo_len,
     const uint8_t *hi, size_t hi_len,
@@ -627,6 +643,47 @@ MariaDBTxn::MergeIterator::MergeIterator(
 }
 
 MariaDBTxn::MergeIterator::MergeIterator(
+    bytecask::RangeReader reader,
+    LookupMap::const_iterator buf_it,
+    LookupMap::const_iterator buf_end,
+    std::vector<uint8_t> hi,
+    uint32_t table_id)
+    : snap_range_(std::move(reader)),
+      reverse_(false),
+      buf_it_(buf_it),
+      buf_begin_(buf_it),
+      buf_end_(buf_end),
+      bound_(std::move(hi)),
+      table_id_(table_id) {
+  refill_batch();
+  load_snap_current();
+  advance();
+}
+
+void MariaDBTxn::MergeIterator::refill_batch() {
+  batch_ = snap_range_->next(batch_max_);
+  batch_pos_ = 0;
+  batch_max_ = std::min(batch_max_ * 2, kMaxBatch);
+}
+
+void MariaDBTxn::MergeIterator::swap_value(bytecask::Bytes &other) {
+  if (val_lent_) {
+    assign_bytes(other, lent_val_ptr_, lent_val_len_);
+    return;
+  }
+  cur_val_.swap(other);
+}
+
+bytecask::Bytes MariaDBTxn::MergeIterator::steal_value() {
+  if (val_lent_) {
+    bytecask::Bytes out;
+    assign_bytes(out, lent_val_ptr_, lent_val_len_);
+    return out;
+  }
+  return std::move(cur_val_);
+}
+
+MariaDBTxn::MergeIterator::MergeIterator(
     std::optional<bytecask::KeyIterator> snap_it,
     LookupMap::const_iterator buf_it,
     LookupMap::const_iterator buf_end,
@@ -688,6 +745,7 @@ void MariaDBTxn::MergeIterator::next() {
 }
 
 bool MariaDBTxn::MergeIterator::snap_at_end() const {
+  if (snap_range_) return batch_pos_ >= batch_.size();
   if (!reverse_) {
     if (snap_fwd_) return *snap_fwd_ == std::default_sentinel;
     if (snap_key_fwd_) return *snap_key_fwd_ == std::default_sentinel;
@@ -699,6 +757,10 @@ bool MariaDBTxn::MergeIterator::snap_at_end() const {
 }
 
 void MariaDBTxn::MergeIterator::snap_step() {
+  if (snap_range_) {
+    if (++batch_pos_ == batch_.size()) refill_batch();
+    return;
+  }
   if (!reverse_) {
     if (snap_fwd_) ++(*snap_fwd_);
     else if (snap_key_fwd_) ++(*snap_key_fwd_);
@@ -712,6 +774,17 @@ void MariaDBTxn::MergeIterator::load_snap_current() {
   snap_valid_ = false;
 
   if (snap_at_end()) return;
+
+  if (snap_range_) {
+    // The reader is bounded to [lo, hi) inside this table: nothing to filter.
+    const auto &entry = batch_[batch_pos_];
+    snap_key_ptr_ = reinterpret_cast<const uint8_t *>(entry.key.data());
+    snap_key_len_ = entry.key.size();
+    snap_val_ptr_ = reinterpret_cast<const uint8_t *>(entry.value.data());
+    snap_val_len_ = entry.value.size();
+    snap_valid_ = true;
+    return;
+  }
 
   const uint8_t *kp = nullptr;
   size_t klen = 0;
@@ -802,6 +875,14 @@ void MariaDBTxn::MergeIterator::emit_buf() {
 
 void MariaDBTxn::MergeIterator::emit_snap() {
   cur_key_.assign(snap_key_ptr_, snap_key_ptr_ + snap_key_len_);
+  if (snap_range_) {
+    lent_val_ptr_ = snap_val_ptr_;
+    lent_val_len_ = snap_val_len_;
+    val_lent_ = true;
+    snap_step_pending_ = true;
+    valid_ = true;
+    return;
+  }
   assign_bytes(cur_val_, snap_val_ptr_, snap_val_len_);
   snap_step();
   load_snap_current();
@@ -810,6 +891,12 @@ void MariaDBTxn::MergeIterator::emit_snap() {
 
 void MariaDBTxn::MergeIterator::advance() {
   valid_ = false;
+  val_lent_ = false;
+  if (snap_step_pending_) {
+    snap_step_pending_ = false;
+    snap_step();
+    load_snap_current();
+  }
 
   for (;;) {
     const bool buf_valid = buf_candidate_valid();

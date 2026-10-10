@@ -392,6 +392,10 @@ KeyPartPlan make_key_part_plan(TABLE *table, const KEY_PART_INFO &kp) {
   } else if (is_float_type(rt)) {
     p.flip = KeyPartPlan::Flip::kFloat;
   }
+  p.order_exact = !p.nullable &&
+                  (is_signed_integer_type(rt) || rt == MYSQL_TYPE_DATE ||
+                   rt == MYSQL_TYPE_NEWDATE || rt == MYSQL_TYPE_YEAR ||
+                   p.be_temporal);
   return p;
 }
 
@@ -408,6 +412,9 @@ TableCodec make_table_codec(TABLE *table) {
     for (uint i = 0; i < key.user_defined_key_parts; ++i) {
       parts.push_back(make_key_part_plan(table, key.key_part[i]));
     }
+    codec.keys[k].order_exact =
+        std::all_of(parts.begin(), parts.end(),
+                    [](const KeyPartPlan &p) { return p.order_exact; });
   }
   return codec;
 }

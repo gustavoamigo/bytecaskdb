@@ -40,10 +40,17 @@ struct KeyPartPlan {
   bool be_temporal{false};    // DATETIME2/TIMESTAMP2/TIME2: big-endian already
   bool reverse{false};        // little-endian in the record: stored reversed
   Flip flip{Flip::kNone};     // applied with reverse
+  // Stored bytes order exactly as the server's key_cmp orders the part: a
+  // non-null integer, DATE, YEAR or big-endian temporal. Strings compare by
+  // collation and are stored as bytes; floats have -0.0 and 0.0.
+  bool order_exact{false};
 };
 
 struct KeyPlan {
   std::vector<KeyPartPlan> parts;
+  // Every part is order_exact: a range over this key can be bounded by its
+  // encoded ends alone, with no key_cmp per row.
+  bool order_exact{false};
 };
 
 // Everything the row and key codecs ask of a table's definition, read once

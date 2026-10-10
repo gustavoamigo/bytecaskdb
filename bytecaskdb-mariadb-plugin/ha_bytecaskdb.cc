@@ -1012,10 +1012,12 @@ int ha_bytecaskdb::check(THD * /*thd*/, HA_CHECK_OPT * /*check_opt*/) {
 int ha_bytecaskdb::index_init(uint idx, bool /*sorted*/) {
   active_index = idx;
   keyread_only_ = false;
+  batched_range_ = false;
   return 0;
 }
 
 int ha_bytecaskdb::index_end() {
+  batched_range_ = false;
   merge_index_.reset();
   active_index = MAX_KEY;
   keyread_only_ = false;
@@ -1103,6 +1105,16 @@ SeekMode seek_mode_for(enum ha_rkey_function f) {
   }
 }
 
+// Bytes of a key the keypart_map supplies: its whole leading parts.
+uint supplied_prefix_len(const KEY &key_info, key_part_map keypart_map) {
+  uint len = 0;
+  for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
+    if (!(keypart_map & (key_part_map(1) << i))) break;
+    len += key_info.key_part[i].store_length;
+  }
+  return len;
+}
+
 bool key_has_prefix(const MariaDBTxn::MergeIterator &it,
                     const std::vector<uint8_t> &prefix) {
   return it.key_len() >= prefix.size() &&
@@ -1169,17 +1181,14 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
 
   auto *txn = txn_cached_;
   if (!txn) { return HA_ERR_GENERIC; }
+  // Set only by read_range_first, for this one call.
+  batched_range_ = range_end_pending_;
+  range_end_pending_ = false;
 
   const bool on_pk = (active_index == table->s->primary_key);
   const KEY &key_info = table->key_info[active_index];
   const uint key_len = key_info.key_length;
-
-  // Bytes of `key` that keypart_map marks as supplied (whole leading parts).
-  uint prefix_len = 0;
-  for (uint i = 0; i < key_info.user_defined_key_parts; ++i) {
-    if (!(keypart_map & (key_part_map(1) << i))) break;
-    prefix_len += key_info.key_part[i].store_length;
-  }
+  const uint prefix_len = supplied_prefix_len(key_info, keypart_map);
 
   const SeekMode mode = seek_mode_for(find_flag);
   const std::size_t ns_prefix_len =
@@ -1207,7 +1216,20 @@ int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
   }
 
   const auto idx = static_cast<uint16_t>(active_index);
-  if (mode.reverse) {
+  if (batched_range_) {
+    // read_range_first's range: [this key, range_end_), read in batches and
+    // stopped by the engine. Empty when the ends cross.
+    if (!std::lexicographical_compare(search_key_buf_.begin(),
+                                      search_key_buf_.end(),
+                                      range_end_.begin(), range_end_.end())) {
+      merge_index_.reset();
+      return HA_ERR_END_OF_FILE;
+    }
+    merge_index_ = txn->read_range(search_key_buf_.data(), search_key_buf_.size(),
+                                   range_end_.data(), range_end_.size(),
+                                   table_id_);
+    g_batched_pk_ranges.fetch_add(1, std::memory_order_relaxed);
+  } else if (mode.reverse) {
     auto lo = on_pk ? table_id_prefix(table_id_) : index_id_prefix(table_id_, idx);
     merge_index_ = on_pk
         ? txn->riter_prefix(search_key_buf_.data(), search_key_buf_.size(),
@@ -1290,6 +1312,7 @@ int ha_bytecaskdb::index_first(uchar *buf) {
 
   auto *txn = txn_cached_;
   if (!txn) { return HA_ERR_GENERIC; }
+  batched_range_ = false;
 
   if (active_index == table->s->primary_key) {
     // Primary key iteration: scan table row data [0x02 | table_id]
@@ -1329,6 +1352,7 @@ int ha_bytecaskdb::index_last(uchar *buf) {
 
   auto *txn = txn_cached_;
   if (!txn) { return HA_ERR_GENERIC; }
+  batched_range_ = false;
 
   if (active_index == table->s->primary_key) {
     // Primary key reverse iteration: start from end of table range
@@ -1360,11 +1384,10 @@ int ha_bytecaskdb::index_read_current(uchar *buf) {
 
   if (active_index == table->s->primary_key) {
     // Primary key access: key is encoded PK, value is row data. The value
-    // holds every column, the primary key's too.
-    merge_index_->swap_value(row_value_buf_);
-    decode_row(codec_.row,
-               reinterpret_cast<const uint8_t *>(row_value_buf_.data()),
-               row_value_buf_.size(), buf);
+    // holds every column, the primary key's too. Decoded where the iterator
+    // holds it, which for a batched range is the reader's batch: no copy.
+    decode_row(codec_.row, merge_index_->value_data(),
+               merge_index_->value_len(), buf);
     merge_index_->swap_key(current_row_key_);
     return 0;
   } else {
@@ -1741,6 +1764,66 @@ bool ha_bytecaskdb::commit_inplace_alter_table(TABLE *, Alter_inplace_info *, bo
 }
 int ha_bytecaskdb::get_foreign_key_list(THD *, List<FOREIGN_KEY_INFO> *) {
   return 0;
+}
+#endif
+
+#ifndef PLUGIN_TESTING
+// ---------------------------------------------------------------------------
+// read_range_first() / read_range_next() — batched primary-key ranges.
+//
+// A range over the primary key with both ends, on a key whose stored bytes
+// order as key_cmp does (KeyPlan::order_exact), is read by a merge iterator
+// whose snapshot side is a RangeReader bounded at the encoded end: the engine
+// stops the range, so no row is compared with end_range. The buffer side is
+// the same live walk of the transaction's writes as every other scan, so
+// rows written during the scan are seen exactly as through index_next.
+// Everything else — an equality range, an open end, a secondary index, a key
+// with a string, float or nullable part — is handler's own read, with
+// compare_key per row.
+//
+// The rows are still read through ha_index_read_map and ha_index_next, so
+// the server keeps its Handler_read_* counters, virtual columns and
+// table->status: index_read_map opens the batched iterator when
+// range_end_pending_ is set.
+// ---------------------------------------------------------------------------
+
+int ha_bytecaskdb::read_range_first(const key_range *start_key,
+                                    const key_range *end_key,
+                                    bool eq_range_arg, bool sorted) {
+  const bool batched =
+      !eq_range_arg && start_key && end_key &&
+      active_index == table->s->primary_key &&
+      codec_.keys[active_index].order_exact &&
+      (start_key->flag == HA_READ_KEY_OR_NEXT ||
+       start_key->flag == HA_READ_AFTER_KEY) &&
+      (end_key->flag == HA_READ_AFTER_KEY ||
+       end_key->flag == HA_READ_BEFORE_KEY);
+  if (!batched)
+    return handler::read_range_first(start_key, end_key, eq_range_arg, sorted);
+
+  // What handler::read_range_first records, for the server code that reads
+  // it (compare_key, MRR); this path itself does not.
+  eq_range = false;
+  set_end_range(end_key);
+  range_key_part = table->key_info[active_index].key_part;
+
+  // The end of [from, to): an AFTER_KEY end includes every key with its
+  // prefix (padded high), a BEFORE_KEY end none (padded low).
+  build_search_key(active_index, end_key->key,
+                   supplied_prefix_len(table->key_info[active_index],
+                                       end_key->keypart_map),
+                   end_key->flag == HA_READ_AFTER_KEY);
+  range_end_.swap(search_key_buf_);
+  range_end_pending_ = true;
+  const int rc = ha_index_read_map(table->record[0], start_key->key,
+                                   start_key->keypart_map, start_key->flag);
+  range_end_pending_ = false;
+  return rc == HA_ERR_KEY_NOT_FOUND ? HA_ERR_END_OF_FILE : rc;
+}
+
+int ha_bytecaskdb::read_range_next() {
+  if (!batched_range_) return handler::read_range_next();
+  return ha_index_next(table->record[0]);
 }
 #endif
 

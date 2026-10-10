@@ -28,6 +28,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <span>
 #include <vector>
 
 // Forward declarations for MariaDB types.
@@ -99,6 +100,15 @@ public:
                   std::vector<uint8_t> lo,
                   uint32_t table_id, uint16_t index_id);
 
+    // Forward construction (full table), the snapshot side read in batches
+    // by a RangeReader bounded at hi. Its rows' values are lent, not copied:
+    // value_data() points into the reader's batch until the next next().
+    MergeIterator(bytecask::RangeReader reader,
+                  LookupMap::const_iterator buf_it,
+                  LookupMap::const_iterator buf_end,
+                  std::vector<uint8_t> hi,
+                  uint32_t table_id);
+
     ~MergeIterator() = default;
 
     MergeIterator(const MergeIterator &) = delete;
@@ -107,21 +117,23 @@ public:
     bool valid() const { return valid_; }
     void next();
 
-    // Pointers into internally owned buffers; valid until next().
+    // Pointers into internally owned buffers, or into the reader's batch for
+    // a lent value; valid until next().
     const uint8_t *key_data() const { return cur_key_.data(); }
     size_t key_len() const { return cur_key_.size(); }
     const uint8_t *value_data() const {
-      return reinterpret_cast<const uint8_t *>(cur_val_.data());
+      return val_lent_ ? lent_val_ptr_
+                       : reinterpret_cast<const uint8_t *>(cur_val_.data());
     }
-    size_t value_len() const { return cur_val_.size(); }
+    size_t value_len() const { return val_lent_ ? lent_val_len_ : cur_val_.size(); }
 
     // Swap buffers with caller — preserves capacity across rows, avoiding
-    // per-row heap allocations in steady state.
-    void swap_value(bytecask::Bytes &other) { cur_val_.swap(other); }
+    // per-row heap allocations in steady state. A lent value is copied.
+    void swap_value(bytecask::Bytes &other);
     void swap_key(std::vector<uint8_t> &other) { cur_key_.swap(other); }
 
-    // Moves cur_val_ out — caller takes ownership. Iterator value is left empty.
-    bytecask::Bytes steal_value() { return std::move(cur_val_); }
+    // Moves the value out — caller takes ownership. Iterator value is left empty.
+    bytecask::Bytes steal_value();
 
   private:
     void advance();
@@ -135,7 +147,10 @@ public:
     void emit_buf();
     void emit_snap();
 
+    void refill_batch();
+
     // At most one of these is engaged.
+    std::optional<bytecask::RangeReader>          snap_range_;
     std::optional<bytecask::EntryIterator>        snap_fwd_;
     std::optional<bytecask::ReverseEntryIterator> snap_rev_;
     std::optional<bytecask::KeyIterator>          snap_key_fwd_;
@@ -161,9 +176,24 @@ public:
     size_t snap_val_len_{0};
     bool snap_valid_{false};
 
+    // snap_range_'s current batch. The first is small, so a scan the server
+    // stops early (LIMIT) reads little past it; each refill doubles it up to
+    // kMaxBatch.
+    static constexpr std::size_t kFirstBatch = 8;
+    static constexpr std::size_t kMaxBatch = 128;
+    std::span<const bytecask::EntryView> batch_;
+    std::size_t batch_pos_{0};
+    std::size_t batch_max_{kFirstBatch};
+    // The snapshot row last emitted is still current: its value is lent from
+    // batch_, so the step past it waits for the next advance().
+    bool snap_step_pending_{false};
+
     // Current output.
     std::vector<uint8_t> cur_key_;
     bytecask::Bytes cur_val_;
+    const uint8_t *lent_val_ptr_{nullptr};
+    size_t lent_val_len_{0};
+    bool val_lent_{false};
     bool valid_{false};
   };
 
@@ -240,6 +270,13 @@ public:
   // existence check, and the checks stop at `limit`. 0 if lo >= hi.
   std::size_t count_range(const uint8_t *lo, size_t lo_len,
                           const uint8_t *hi, size_t hi_len, std::size_t limit);
+
+  // Opens a merge iterator over [lo, hi) whose snapshot side is read in
+  // batches (Snapshot::read_range). For a bounded primary-key range; lo < hi.
+  std::unique_ptr<MergeIterator> read_range(
+      const uint8_t *lo, size_t lo_len,
+      const uint8_t *hi, size_t hi_len,
+      uint32_t table_id);
 
   // Opens a merge iterator over [lo, hi) combining snapshot + buffer.
   std::unique_ptr<MergeIterator> iter_prefix(

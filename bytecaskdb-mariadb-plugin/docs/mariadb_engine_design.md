@@ -368,6 +368,28 @@ Encoding and decoding a row or a key needs facts about each column: its offset i
 
 None of the answers change between rows, so `ha_bytecaskdb::open()` reads them once into a `TableCodec`: a `RowPlan` (one entry per column) and a `KeyPlan` per index (one entry per key part). Every row and key codec walks the plan instead of the `Field`s. The plan holds offsets relative to the record, never pointers, so one plan serves `record[0]` and `record[1]`. It is rebuilt on every `open()`, and an in-place `ALTER` here never changes the row layout (it only renames columns or drops foreign keys), so a plan cannot outlive the definition it was read from.
 
+### Primary-key range reads
+
+A primary-key range with both ends is read in batches (`Snapshot::read_range`, `docs/bytecask_design.md`, *Batched range reads*), not row by row through the snapshot's iterator. `read_range_first` takes that path when all of the following hold:
+
+- the range is not an equality range;
+- it has both ends, the start `>=` or `>` (`KEY_OR_NEXT`, `AFTER_KEY`) and the end `<=` or `<` (`AFTER_KEY`, `BEFORE_KEY`);
+- it is on the primary key;
+- every part of the key is `order_exact`.
+
+Anything else goes to `handler::read_range_first`, as before.
+
+- **The end is the engine's.** The end key is encoded once, as a stored key: an `AFTER_KEY` end padded high, so every key with that prefix is inside, and a `BEFORE_KEY` end padded low, so none is. The batched read stops there, so no row is compared with `end_range`. That is only right when the stored bytes order exactly as the server's `key_cmp` does. `KeyPlan::order_exact` says so for a key whose every part is a non-null integer, `DATE`, `YEAR` or big-endian temporal (`DATETIME2`, `TIMESTAMP2`, `TIME2`). Strings are not: they are stored as bytes and compared by collation, so a byte bound can end a case-insensitive range in a different place than `key_cmp`. Floats are not either: `-0.0` and `0.0` are equal but stored differently.
+- **The transaction's own writes.** The batched read is the snapshot side of the same `MergeIterator` every scan uses. The buffer side is the same live walk of the transaction's write buffer, so rows written during the scan (an `UPDATE ... WHERE id BETWEEN`, a primary-key change, `INSERT ... SELECT` from the same table) are seen exactly as through `index_next`.
+- **Batches grow.** The first batch is 8 rows and each refill doubles, up to 128. A scan the server stops early (`LIMIT`) reads little past where it stops. A long range spends most of its rows in full batches.
+- **No copy of the value.** A row from the snapshot is decoded straight from the reader's batch, and the step past it waits for the next `next()`.
+- **The server's own wrappers.** `read_range_first` records the encoded end and calls `ha_index_read_map`, and `index_read_map` opens the batched iterator when it finds that end. `read_range_next` calls `ha_index_next`. The server then keeps its `Handler_read_*` counters, virtual columns and `table->status` itself. The plugin cannot do that bookkeeping: its view of `THD` does not match the server's layout. An `increment_statistics` called from the plugin changed a counter `SHOW STATUS` never showed, so plugin code reads and writes no `THD` member directly.
+- **Observable.** `SHOW ENGINE BYTECASKDB STATUS` reports `plugin.batched_pk_ranges`, the ranges served this way.
+
+Measured with sysbench at 5 M rows, 16 threads, `fast` profile, on the desktop's SATA SSD, alternating builds. `ranges_only` went from 22.6–22.8 k to 23.6–23.7 k tps (+4%). The same workload run again after `oltp_read_write` went from 20.8–20.9 k to 21.9–22.0 k (+5%). `oltp_read_write` went from 7.5–8.3 k to 8.4–8.5 k. Tuned InnoDB on 10.11, run the same afternoon: 22.5 k, 22.4 k and 8.6 k. In a profile of `ranges_only`, the plugin is 12.5% of CPU; the server's own sort and `DISTINCT` work is most of the rest.
+
+Tests: `tests/functional/test_pk_range_read.py` compares range shapes, ranges inside a transaction with its own writes, and statements that write the rows they scan with InnoDB on the same server. It also checks that a range reads no row past either end: the server re-checks `WHERE`, so only `Handler_read_next` shows an over-read. `tests/unit/mariadb_txn_test.cpp` compares the batched merge with `iter_prefix`, writes during the scan included.
+
 ---
 
 ## Key Encoding
