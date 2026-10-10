@@ -1,4 +1,5 @@
 add_rules("mode.debug", "mode.release", "mode.releasedbg")
+set_version("0.1.0")
 
 add_requires("crc32c")
 -- Hint files are zstd-framed (docs/hint_compression_design.md). Built here
