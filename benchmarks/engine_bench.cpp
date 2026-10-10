@@ -926,6 +926,50 @@ template <typename A, int RangeLen> void BM_Range(benchmark::State &state) {
   pool_ratio.attach(state);
 }
 
+// ──────────────────────────── ReverseRange ───────────────────────────────────
+//
+// Range50 in descending order: riter_from from a key, RangeLen entries,
+// CRC checks off as in Range50.
+
+template <typename A, int RangeLen>
+void BM_ReverseRange(benchmark::State &state) {
+  static auto keys = A::generate_keys(kDatasetSize);
+  static auto val = make_value();
+  static auto db = A::open_populated("rrange", keys, val);
+  const PoolHitRatio<A, typename A::Db> pool_ratio{db};
+  bytecask::ReadOptions ro;
+  ro.verify_checksums = false;
+
+  std::size_t idx = 0;
+  std::vector<double> samples;
+  samples.reserve(kMaxSamples);
+
+  for (auto _ : state) {
+    const auto &start_key = keys[idx % keys.size()];
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    auto range = db.engine.riter_from(ro, bc_key(start_key));
+    int count = 0;
+    for (auto it = range.begin(); it != range.end() && count < RangeLen;
+         ++it, ++count) {
+      const auto &entry = *it;
+      benchmark::DoNotOptimize(entry.key.data());
+      benchmark::DoNotOptimize(entry.value.data());
+    }
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    if (samples.size() < kMaxSamples)
+      samples.push_back(static_cast<double>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+              .count()));
+    ++idx;
+  }
+
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * RangeLen);
+  state.counters["scans_per_us"] = benchmark::Counter(
+      static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
+  attach_jitter(state, samples);
+  pool_ratio.attach(state);
+}
+
 // ──────────────────────────── RangeRead ──────────────────────────────────────
 //
 // A bounded range read as the MariaDB plugin makes one: every entry of
@@ -964,7 +1008,8 @@ template <typename A, bool Shuffled> auto rangeread_db() -> typename A::Db & {
   return db;
 }
 
-template <typename A, int RangeLen, std::size_t Batch, bool Shuffled>
+template <typename A, int RangeLen, std::size_t Batch, bool Shuffled,
+          bool Reverse = false>
 void BM_RangeRead(benchmark::State &state) {
   const auto &keys = rangeread_keys<A>();
   auto &db = rangeread_db<A, Shuffled>();
@@ -981,7 +1026,16 @@ void BM_RangeRead(benchmark::State &state) {
     const auto to = bc_key(keys[i + RangeLen]);
     const auto t0 = std::chrono::high_resolution_clock::now();
     std::size_t n = 0;
-    if constexpr (Batch == 0) {
+    if constexpr (Batch == 0 && Reverse) {
+      const auto from = bc_key(keys[i]);
+      for (const auto &[k, v] :
+           snap.riter_from(ro, bc_key(keys[i + RangeLen - 1]))) {
+        if (std::ranges::lexicographical_compare(k, from))
+          break;
+        benchmark::DoNotOptimize(v.data());
+        ++n;
+      }
+    } else if constexpr (Batch == 0) {
       for (const auto &[k, v] : snap.iter_from(ro, bc_key(keys[i]))) {
         if (!std::ranges::lexicographical_compare(k, to))
           break;
@@ -989,7 +1043,11 @@ void BM_RangeRead(benchmark::State &state) {
         ++n;
       }
     } else {
-      auto reader = snap.read_range(ro, {.from = bc_key(keys[i]), .to = to});
+      auto reader = snap.read_range(
+          ro, {.from = bc_key(keys[i]),
+               .to = to,
+               .direction = Reverse ? bytecask::Direction::Reverse
+                                    : bytecask::Direction::Forward});
       for (auto entries = reader.next(Batch); !entries.empty();
            entries = reader.next(Batch)) {
         for (const auto &e : entries)
@@ -1539,6 +1597,7 @@ BENCH(BM_Put<Bc, true>)           ->Name("ByteCaskDB/Put/Sync");
 BENCH(BM_Del<Bc, true>)           ->Name("ByteCaskDB/Del/Sync");
 BENCH(BM_Get<Bc>)                 ->Name("ByteCaskDB/Get");
 BENCH(BM_Range<Bc, kRangeLen>)    ->Name("ByteCaskDB/Range50");
+BENCH(BM_ReverseRange<Bc, kRangeLen>)->Name("ByteCaskDB/RRange50");
 BENCH(BM_CountRange<Bc, 0, false>)    ->Name("ByteCaskDB/CountRange/Count/0");
 BENCH(BM_CountRange<Bc, 0, true>)     ->Name("ByteCaskDB/CountRange/Walk/0");
 BENCH(BM_CountRange<Bc, 1, false>)    ->Name("ByteCaskDB/CountRange/Count/1");
@@ -1577,6 +1636,14 @@ BENCH(BM_RangeRead<Bc, 1000, 64, true>)->Name("ByteCaskDB/RangeRead/Shuffled/100
 BENCH(BM_RangeRead<Bc, 1000, 128, true>)->Name("ByteCaskDB/RangeRead/Shuffled/1000/128");
 BENCH(BM_RangeRead<Bc, 1000, 256, true>)->Name("ByteCaskDB/RangeRead/Shuffled/1000/256");
 BENCH(BM_RangeRead<Bc, 1000, 512, true>)->Name("ByteCaskDB/RangeRead/Shuffled/1000/512");
+BENCH(BM_RangeRead<Bc, 100, 0, false, true>)->Name("ByteCaskDB/RangeRead/Ordered/100/RIter");
+BENCH(BM_RangeRead<Bc, 100, 128, false, true>)->Name("ByteCaskDB/RangeRead/Ordered/100/R128");
+BENCH(BM_RangeRead<Bc, 1000, 0, false, true>)->Name("ByteCaskDB/RangeRead/Ordered/1000/RIter");
+BENCH(BM_RangeRead<Bc, 1000, 128, false, true>)->Name("ByteCaskDB/RangeRead/Ordered/1000/R128");
+BENCH(BM_RangeRead<Bc, 100, 0, true, true>)->Name("ByteCaskDB/RangeRead/Shuffled/100/RIter");
+BENCH(BM_RangeRead<Bc, 100, 128, true, true>)->Name("ByteCaskDB/RangeRead/Shuffled/100/R128");
+BENCH(BM_RangeRead<Bc, 1000, 0, true, true>)->Name("ByteCaskDB/RangeRead/Shuffled/1000/RIter");
+BENCH(BM_RangeRead<Bc, 1000, 128, true, true>)->Name("ByteCaskDB/RangeRead/Shuffled/1000/R128");
 BENCH(BM_MixedBatch<Bc, true>)      ->Name("ByteCaskDB/MixedBatch/Sync");
 
 // --- mmap read path, the bar for the pool's hit path ---
@@ -1584,6 +1651,7 @@ BENCH(BM_MixedBatch<Bc, true>)      ->Name("ByteCaskDB/MixedBatch/Sync");
 #ifndef __EMSCRIPTEN__
 BENCH(BM_Get<BcMmap>)             ->Name("ByteCaskDB_Mmap/Get");
 BENCH(BM_Range<BcMmap, kRangeLen>)->Name("ByteCaskDB_Mmap/Range50");
+BENCH(BM_ReverseRange<BcMmap, kRangeLen>)->Name("ByteCaskDB_Mmap/RRange50");
 #else
 BENCH(BM_Get<BcPread>)             ->Name("ByteCaskDB_Pread/Get");
 BENCH(BM_Range<BcPread, kRangeLen>)->Name("ByteCaskDB_Pread/Range50");

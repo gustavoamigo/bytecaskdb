@@ -5924,11 +5924,15 @@ auto keys_of(EntryStrings entries) -> EntryStrings {
 // must survive the reads that came after it in the same batch.
 auto read_range_all(const bytecask::Snapshot &snap, const std::string &from,
                     const std::string &to, std::size_t batch,
-                    bool keys_only = false) -> EntryStrings {
+                    bool keys_only = false, bool reverse = false)
+    -> EntryStrings {
   EntryStrings out;
-  auto reader = snap.read_range({}, {.from = to_bytes(from),
-                                     .to = to_bytes(to),
-                                     .keys_only = keys_only});
+  auto reader = snap.read_range(
+      {}, {.from = to_bytes(from),
+           .to = to_bytes(to),
+           .direction = reverse ? bytecask::Direction::Reverse
+                                : bytecask::Direction::Forward,
+           .keys_only = keys_only});
   for (;;) {
     const auto entries = reader.next(batch);
     if (entries.empty())
@@ -5950,6 +5954,37 @@ auto iterate_range(const bytecask::Snapshot &snap, const std::string &from,
       break;
     out.emplace_back(to_string(k), to_string(v));
   }
+  return out;
+}
+
+// The model's entries at or below `from` (all of them when from is empty),
+// in descending order: what riter_from and rkeys_from yield.
+auto model_down_from(const Model &model, const std::string &from)
+    -> EntryStrings {
+  const auto end = from.empty() ? model.end() : model.upper_bound(from);
+  EntryStrings out{model.begin(), end};
+  std::ranges::reverse(out);
+  return out;
+}
+
+auto reversed(EntryStrings entries) -> EntryStrings {
+  std::ranges::reverse(entries);
+  return entries;
+}
+
+auto iterate_down(const bytecask::Snapshot &snap, const std::string &from)
+    -> EntryStrings {
+  EntryStrings out;
+  for (const auto &[k, v] : snap.riter_from({}, to_bytes(from)))
+    out.emplace_back(to_string(k), to_string(v));
+  return out;
+}
+
+auto iterate_keys_down(const bytecask::Snapshot &snap, const std::string &from)
+    -> EntryStrings {
+  EntryStrings out;
+  for (const auto &k : snap.rkeys_from({}, to_bytes(from)))
+    out.emplace_back(to_string(k), std::string{});
   return out;
 }
 
@@ -5976,7 +6011,7 @@ auto random_range_key(std::mt19937 &gen, int min_len) -> std::string {
 
 } // namespace
 
-TEST_CASE("read_range and the forward iterators yield the model's entries",
+TEST_CASE("read_range and the iterators yield the model's entries",
           "[read_range][iterator]") {
   // Small files, so a range crosses many of them and vacuum has work; value
   // sizes from empty to larger than a pread's first guess, so records are
@@ -6051,7 +6086,10 @@ TEST_CASE("read_range and the forward iterators yield the model's entries",
   // An empty to is an open range; an empty from starts at the first key.
   for (const auto &[snap, at] : snaps) {
     REQUIRE(read_range_all(snap, "", "", 64) == model_range(at, "", ""));
+    REQUIRE(read_range_all(snap, "", "", 64, false, true) ==
+            reversed(model_range(at, "", "")));
     REQUIRE(iterate_range(snap, "", "") == model_range(at, "", ""));
+    REQUIRE(iterate_down(snap, "") == reversed(model_range(at, "", "")));
     for (int i = 0; i < 60; ++i) {
       auto from = random_range_key(gen, 0);
       auto to = i % 4 == 0 ? std::string{} : random_range_key(gen, 1);
@@ -6069,10 +6107,25 @@ TEST_CASE("read_range and the forward iterators yield the model's entries",
           FAIL(std::format("{} batch {}: keys differ from the model", where,
                            batch));
       }
+      for (const std::size_t batch : {1, 7, 128}) {
+        if (read_range_all(snap, from, to, batch, false, true) != reversed(want))
+          FAIL(std::format("{} batch {}: reverse entries differ from the model",
+                           where, batch));
+        if (read_range_all(snap, from, to, batch, true, true) !=
+            reversed(keys_of(want)))
+          FAIL(std::format("{} batch {}: reverse keys differ from the model",
+                           where, batch));
+      }
       if (iterate_range(snap, from, to) != want)
         FAIL(std::format("{}: iter_from differs from the model", where));
       if (iterate_keys(snap, from, to) != keys_of(want))
         FAIL(std::format("{}: keys_from differs from the model", where));
+      // riter_from and rkeys_from start at the last key <= from.
+      const auto down = model_down_from(at, from);
+      if (iterate_down(snap, from) != down)
+        FAIL(std::format("riter_from({}) differs from the model", from));
+      if (iterate_keys_down(snap, from) != keys_of(down))
+        FAIL(std::format("rkeys_from({}) differs from the model", from));
     }
   }
 }
@@ -6194,6 +6247,49 @@ TEST_CASE("read_range: a failed read is retried, not skipped", "[read_range]") {
   CHECK_THROWS_AS(reader.next(1), std::runtime_error);
 }
 
+TEST_CASE("read_range in reverse: a failed read is retried, not skipped",
+          "[read_range]") {
+  // Down from k199, the corrupt k100 is the 100th entry: twelve whole
+  // batches of 8, then the batch that fails. Keys under the blind-leaf key
+  // directory read their records too, and fail the same way; the keyed key
+  // directories read no record for a key.
+  TempDir td;
+  const auto dir = td.path / "db";
+  make_db_with_one_corrupt_value(dir);
+  auto db = bytecask::DB::open(dir);
+  const auto snap = db.snapshot();
+  for (const bool keys_only : {false, true}) {
+    CAPTURE(keys_only);
+    auto reader = snap.read_range({}, {.from = to_bytes("k000"),
+                                       .to = to_bytes("k200"),
+                                       .direction = bytecask::Direction::Reverse,
+                                       .keys_only = keys_only});
+#ifndef BYTECASK_KEYDIR_BLIND
+    if (keys_only) {
+      std::size_t n = 0;
+      for (auto keys = reader.next(8); !keys.empty(); keys = reader.next(8))
+        n += keys.size();
+      CHECK(n == 200);
+      continue;
+    }
+#endif
+    std::size_t returned = 0;
+    for (;;) {
+      std::span<const bytecask::EntryView> batch;
+      try {
+        batch = reader.next(8);
+      } catch (const std::runtime_error &) {
+        break;
+      }
+      REQUIRE_FALSE(batch.empty());
+      returned += batch.size();
+    }
+    CHECK(returned == 96);
+    CHECK_THROWS_AS(reader.next(8), std::runtime_error);
+    CHECK_THROWS_AS(reader.next(1), std::runtime_error);
+  }
+}
+
 TEST_CASE("read_range keys only checks CRCs as ReadOptions asks",
           "[read_range]") {
   // Under the blind-leaf key directory a key is read from its record, which
@@ -6222,11 +6318,11 @@ TEST_CASE("read_range keys only checks CRCs as ReadOptions asks",
 #endif
 }
 
-TEST_CASE("forward iterators read only the rows they are asked for",
+TEST_CASE("iterators read only the rows they are asked for",
           "[read_range][iterator]") {
   // Pool hits count record reads: each lend from a resident frame is one.
   // The iterators step one row at a time, so three rows are three reads.
-  // The entry iterator reads a record only when dereferenced; the key
+  // The entry iterators read a record only when dereferenced; the key
   // iterator reads its first key when it is made, and under the keyed key
   // directories reads none at all.
   TempDir td;
@@ -6248,6 +6344,17 @@ TEST_CASE("forward iterators read only the rows they are asked for",
   CHECK(to_string((*e).key) == "k0001");
   ++e;
   CHECK(to_string((*e).key) == "k0002");
+  CHECK(hits() - h0 == 3);
+
+  h0 = hits();
+  auto down = snap.riter_from({});
+  auto r = down.begin();
+  CHECK(hits() - h0 == 0);
+  CHECK(to_string((*r).key) == "k0999");
+  ++r;
+  CHECK(to_string((*r).key) == "k0998");
+  ++r;
+  CHECK(to_string((*r).key) == "k0997");
   CHECK(hits() - h0 == 3);
 
   h0 = hits();
@@ -6286,12 +6393,23 @@ TEST_CASE("read_range refuses what it does not read", "[read_range]") {
                                        .direction = bytecask::Direction::Reverse}),
                   std::invalid_argument);
   CHECK_THROWS_AS(
-      snap.read_range({}, {.from = to_bytes("a"),
-                           .to = to_bytes("b"),
+      snap.read_range({}, {.from = to_bytes("b"),
+                           .to = to_bytes("a"),
                            .direction = bytecask::Direction::Reverse}),
-      std::logic_error);
+      std::invalid_argument);
   // An empty to is open, so any from is a range.
   CHECK_NOTHROW(snap.read_range({}, {.from = to_bytes("z")}));
+  // A from above every key is an empty range in either direction, entries
+  // or keys.
+  for (const auto direction :
+       {bytecask::Direction::Forward, bytecask::Direction::Reverse}) {
+    for (const bool keys_only : {false, true}) {
+      auto above = snap.read_range({}, {.from = to_bytes("z"),
+                                        .direction = direction,
+                                        .keys_only = keys_only});
+      CHECK(above.next(10).empty());
+    }
+  }
 
   auto reader = snap.read_range({}, {.to = to_bytes("b")});
   CHECK_THROWS_AS(reader.next(0), std::invalid_argument);

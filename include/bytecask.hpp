@@ -418,8 +418,9 @@ struct ChangeBatch {
 // ---------------------------------------------------------------------------
 // RangeReader — a key range read in batches, from Snapshot::read_range.
 //
-// next(max) returns up to max entries in key order, and an empty span once
-// the range is exhausted. The spans are valid until the next call to next()
+// next(max) returns up to max entries in the range's order (ascending, or
+// descending for Direction::Reverse), and an empty span once the range is
+// exhausted. The spans are valid until the next call to next()
 // or the reader's destruction. Move-only; holds the snapshot's files open.
 // ---------------------------------------------------------------------------
 
@@ -485,8 +486,7 @@ public:
                                 std::size_t limit) const -> std::size_t;
 
   // Reads range in batches; see RangeReader. Throws std::invalid_argument if
-  // to is given and from >= to, and std::logic_error for a reverse read,
-  // not supported yet.
+  // to is given and from >= to.
   [[nodiscard]] auto read_range(const ReadOptions& opts,
                                 RangeSpec range) const -> RangeReader;
 

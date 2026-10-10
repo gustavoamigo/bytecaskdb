@@ -733,6 +733,8 @@ export using KeyDirIter = BlindKeyDirIter<true>;
 export using KeyDirValueIter = BlindKeyDirIter<false>;
 
 // Descending value iterator: holds the forward cursor and pre-decrements.
+// Members are marked inline: in a module interface, a member defined in its
+// class is not inline by default, and these run once per row.
 export class KeyDirReverseValueIter {
 public:
   KeyDirReverseValueIter() = default;
@@ -740,13 +742,19 @@ public:
       : cur_{std::move(past_pos)} {
     --cur_;
   }
-  auto operator*() const -> KeyDirLoc { return *cur_; }
-  auto operator++() -> KeyDirReverseValueIter & {
+  inline auto operator*() const -> KeyDirLoc { return *cur_; }
+  inline auto operator++() -> KeyDirReverseValueIter & {
     --cur_;
     return *this;
   }
-  auto operator==(std::default_sentinel_t) const noexcept -> bool {
+  inline auto operator==(std::default_sentinel_t) const noexcept -> bool {
     return cur_ == std::default_sentinel;
+  }
+  // Same position; over different versions never equal unless both are at
+  // the end.
+  inline auto operator==(const KeyDirReverseValueIter &o) const noexcept
+      -> bool {
+    return cur_ == o.cur_;
   }
 
 private:

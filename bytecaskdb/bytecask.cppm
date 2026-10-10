@@ -414,6 +414,51 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// ReverseEntryCursor — EntryCursor's step in descending key order: from
+// start down to, not including, stop (to the first key when there is none).
+// The step ReverseEntryIterator takes one row at a time and RangeReader
+// takes in a loop. Members are marked inline for the reason EntryCursor's
+// are.
+// ---------------------------------------------------------------------------
+class ReverseEntryCursor {
+public:
+  // At the end.
+  ReverseEntryCursor() = default;
+  ReverseEntryCursor(std::shared_ptr<const EngineState> state,
+                     KeyDirReverseValueIter start,
+                     std::optional<KeyDirReverseValueIter> stop,
+                     bool verify_checksums)
+      : state_{std::move(state)}, cur_{std::move(start)},
+        stop_{std::move(stop)}, verify_checksums_{verify_checksums} {}
+
+  // A cursor that holds no state was never placed (a range with nothing in
+  // it): done. Its default iterator cannot say so itself, since under the
+  // keyed B+ tree a default reverse iterator is not at its end.
+  [[nodiscard]] inline auto done() const noexcept -> bool {
+    return !state_ || cur_ == std::default_sentinel ||
+           (stop_ && cur_ == *stop_);
+  }
+
+  // The current record, lent as DataFile::lend_record lends it: the spans
+  // are valid until the next call with the same io_buf and lease.
+  [[nodiscard]] inline auto lend(Bytes &io_buf, FrameLease &lease) const
+      -> DataEntryView {
+    const auto &loc = *cur_;
+    return (*state_->files.get(loc.file_id()))
+        ->lend_record(loc.file_offset(), value_size_hint(loc),
+                      verify_checksums_, io_buf, lease);
+  }
+
+  inline void advance() { ++cur_; }
+
+private:
+  std::shared_ptr<const EngineState> state_;
+  KeyDirReverseValueIter cur_;
+  std::optional<KeyDirReverseValueIter> stop_;
+  bool verify_checksums_{true};
+};
+
+// ---------------------------------------------------------------------------
 // EntryIterator — zero-copy forward iterator over key/value spans.
 //
 // Yields EntryView with non-owning spans into a pool frame, the mapping or
@@ -528,6 +573,8 @@ export using ReverseKeyIterator = ReverseIterator<KeyIterator>;
 
 // ---------------------------------------------------------------------------
 // ReverseEntryIterator — zero-copy reverse iterator over key/value spans.
+// Steps a ReverseEntryCursor one row at a time: reads a record only when
+// dereferenced. Spans are valid until the next operator++().
 // ---------------------------------------------------------------------------
 export class ReverseEntryIterator {
 public:
@@ -545,19 +592,12 @@ public:
   auto operator=(ReverseEntryIterator &&) noexcept
       -> ReverseEntryIterator & = default;
 
-  ReverseEntryIterator(std::shared_ptr<const EngineState> state,
-                       KeyDirReverseValueIter cur,
-                       bool verify_checksums = true)
-      : state_{std::move(state)}, cur_{std::move(cur)},
-        verify_checksums_{verify_checksums} {}
+  explicit ReverseEntryIterator(ReverseEntryCursor cursor)
+      : cursor_{std::move(cursor)} {}
 
   auto operator*() const -> const EntryView & {
     if (!has_cached_) {
-      const auto &dir_entry = *cur_;
-      auto &file = *(*state_->files.get(dir_entry.file_id()));
-      raw_cached_ = file.lend_record(dir_entry.file_offset(),
-                                     value_size_hint(dir_entry),
-                                     verify_checksums_, io_buf_, lease_);
+      raw_cached_ = cursor_.lend(io_buf_, lease_);
       cached_ = EntryView{.key = raw_cached_.key, .value = raw_cached_.value};
       has_cached_ = true;
     }
@@ -565,7 +605,7 @@ public:
   }
 
   auto operator++() -> ReverseEntryIterator & {
-    ++cur_;
+    cursor_.advance();
     has_cached_ = false;
     lease_.reset();  // the spans are dead now; let the frame go
     return *this;
@@ -574,13 +614,11 @@ public:
   void operator++(int) { ++*this; }
 
   auto operator==(std::default_sentinel_t) const noexcept -> bool {
-    return cur_ == std::default_sentinel;
+    return cursor_.done();
   }
 
 private:
-  std::shared_ptr<const EngineState> state_;
-  KeyDirReverseValueIter cur_;
-  bool verify_checksums_{true};
+  ReverseEntryCursor cursor_;
   mutable DataEntryView raw_cached_;
   mutable EntryView cached_;
   mutable Bytes io_buf_;
@@ -642,14 +680,16 @@ export struct ChangeBatch {
 // ---------------------------------------------------------------------------
 // RangeReader — a key range read in batches, from Snapshot::read_range.
 //
-// next(max) returns up to max entries in key order, and an empty span once
-// the range is exhausted. Its spans point into pool frames the reader pins,
+// next(max) returns up to max entries in the range's order (ascending, or
+// descending for Direction::Reverse), and an empty span once the range is
+// exhausted. Its spans point into pool frames the reader pins,
 // into the mapping, or into the reader's own copy of records a read lent
 // from a scratch buffer, and are valid until the next call to next() or the
 // reader's destruction. A batch pins at most one frame per entry.
 //
-// Entries take EntryCursor's step, as EntryIterator does. Keys only walks
-// the key directory's own key iterator, as KeyIterator does — one record read
+// Entries take EntryCursor's step, as EntryIterator does, or
+// ReverseEntryCursor's, as ReverseEntryIterator does. Keys only walks the
+// key directory's own key iterator, as KeyIterator does — one record read
 // per key under the blind-leaf key directory, none under the keyed ones —
 // with each key copied into the batch; values are empty.
 //
@@ -671,14 +711,15 @@ public:
 
 private:
   friend class Snapshot;
-  // [from, to) of the state's key directory; an empty to runs to the last
-  // key.
-  RangeReader(std::shared_ptr<const EngineState> state, BytesView from,
-              BytesView to, bool keys_only, bool verify_checksums);
+  // [from, to) of the state's key directory, in ascending or descending
+  // order; an empty to runs to the last key.
+  RangeReader(std::shared_ptr<const EngineState> state, const RangeSpec &range,
+              bool verify_checksums);
 
   [[nodiscard]] auto keys_done() const noexcept -> bool;
-  void read_entries(std::size_t max);
+  template <typename Cursor> void read_entries(Cursor &cursor, std::size_t max);
   void read_keys(std::size_t max);
+  void read_keys_reverse(std::size_t max);
 
   // Batch storage is sized once rather than grown entry by entry, up to
   // this many entries: a reader is often made for one short range.
@@ -694,12 +735,16 @@ private:
     std::size_t value_size;
   };
 
-  // Entries step cursor_; keys walk the keyed iterators, as KeyIterator
-  // does. The other stays at its end.
+  // Entries step cursor_ (forward) or reverse_cursor_; keys walk the keyed
+  // iterators, as KeyIterator and ReverseKeyIterator do. The others stay at
+  // their end. Reverse keys walk key_cur_ down to key_end_, the first key
+  // of the range.
   EntryCursor cursor_;
+  ReverseEntryCursor reverse_cursor_;
   KeyDirIter key_cur_;
   KeyDirIter key_end_;
   bool keys_only_{false};
+  bool reverse_{false};
   bool keys_bounded_{false};
   std::vector<EntryView> views_;
   std::vector<Copied> copied_;
@@ -2004,8 +2049,7 @@ public:
                                 std::size_t limit) const -> std::size_t;
 
   // Reads range in batches; see RangeReader. Throws std::invalid_argument if
-  // to is given and from >= to, and std::logic_error for a reverse read,
-  // not supported yet.
+  // to is given and from >= to.
   [[nodiscard]] auto read_range(const ReadOptions &opts,
                                 RangeSpec range) const -> RangeReader;
 
@@ -3985,7 +4029,9 @@ auto Snapshot::riter_from(const ReadOptions& opts, BytesView from) const
     -> std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t> {
   auto it = kd_value_rlower_bound(state_->key_dir, from, state_->kd_ctx());
   return std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t>{
-      ReverseEntryIterator{state_, std::move(it), opts.verify_checksums},
+      ReverseEntryIterator{ReverseEntryCursor{state_, std::move(it),
+                                              std::nullopt,
+                                              opts.verify_checksums}},
       std::default_sentinel};
 }
 
@@ -4001,11 +4047,7 @@ auto Snapshot::read_range(const ReadOptions &opts, RangeSpec range) const
   // A finite range is checked first, so from >= to is always
   // std::invalid_argument, whatever else the spec asks for.
   if (!range.to.empty()) check_range(range.from, range.to);
-  if (range.direction != Direction::Forward) {
-    throw std::logic_error{"read_range: reverse reads are not supported yet"};
-  }
-  return RangeReader{state_, range.from, range.to, range.keys_only,
-                     opts.verify_checksums};
+  return RangeReader{state_, range, opts.verify_checksums};
 }
 
 EntryCursor::EntryCursor(std::shared_ptr<const EngineState> state,
@@ -4017,18 +4059,45 @@ EntryCursor::EntryCursor(std::shared_ptr<const EngineState> state,
 }
 
 RangeReader::RangeReader(std::shared_ptr<const EngineState> state,
-                         BytesView from, BytesView to, bool keys_only,
-                         bool verify_checksums)
-    : keys_only_{keys_only}, keys_bounded_{keys_only && !to.empty()} {
-  if (!keys_only_) {
+                         const RangeSpec &range, bool verify_checksums)
+    : keys_only_{range.keys_only},
+      reverse_{range.direction == Direction::Reverse},
+      keys_bounded_{range.keys_only && !range.to.empty()} {
+  const auto &[from, to, direction, keys_only] = range;
+  const auto &tree = state->key_dir;
+  // The key reads check CRCs as the caller asked, as entry reads do.
+  const auto ctx = state->kd_ctx(verify_checksums);
+  if (!keys_only_ && !reverse_) {
     cursor_ = EntryCursor{std::move(state), from, to, verify_checksums};
     return;
   }
-  // The key reads check CRCs as the caller asked, as entry reads do.
-  const auto ctx = state->kd_ctx(verify_checksums);
-  key_cur_ = from.empty() ? kd_begin(state->key_dir, ctx)
-                          : kd_lower_bound(state->key_dir, from, ctx);
-  if (keys_bounded_) key_end_ = kd_lower_bound(state->key_dir, to, ctx);
+  if (keys_only_ && !reverse_) {
+    key_cur_ = from.empty() ? kd_begin(tree, ctx) : kd_lower_bound(tree, from, ctx);
+    if (keys_bounded_) key_end_ = kd_lower_bound(tree, to, ctx);
+    return;
+  }
+  if (keys_only_) {
+    // Down from just past the range to its first key: each step moves to
+    // the key below, and reaching key_end_ means the range is done.
+    key_cur_ = to.empty() ? kd_end(tree, ctx) : kd_lower_bound(tree, to, ctx);
+    key_end_ = from.empty() ? kd_begin(tree, ctx) : kd_lower_bound(tree, from, ctx);
+    return;
+  }
+  // Reverse entries: start at the last key below to (the last key when to
+  // is open or past every key) and stop below from.
+  std::optional<KeyDirReverseValueIter> stop;
+  if (!from.empty()) {
+    auto low = kd_value_lower_bound(tree, from, ctx);
+    // Every key is below from: the cursor stays unplaced, which is done.
+    if (low == std::default_sentinel) return;
+    stop = KeyDirReverseValueIter{std::move(low)};
+  }
+  auto past = to.empty() ? KeyDirValueIter{} : kd_value_lower_bound(tree, to, ctx);
+  auto start = past == std::default_sentinel
+                   ? kd_value_rlower_bound(tree, {}, ctx)
+                   : KeyDirReverseValueIter{std::move(past)};
+  reverse_cursor_ = ReverseEntryCursor{std::move(state), std::move(start),
+                                       std::move(stop), verify_checksums};
 }
 
 auto RangeReader::keys_done() const noexcept -> bool {
@@ -4045,10 +4114,14 @@ auto RangeReader::next(std::size_t max) -> std::span<const EntryView> {
   copy_.clear();
   leases_.clear();
   views_.reserve(std::min(max, kReserveCap));
-  if (keys_only_)
+  if (keys_only_ && reverse_)
+    read_keys_reverse(max);
+  else if (keys_only_)
     read_keys(max);
+  else if (reverse_)
+    read_entries(reverse_cursor_, max);
   else
-    read_entries(max);
+    read_entries(cursor_, max);
   for (const auto &c : copied_) {
     const auto bytes = std::span{copy_}.subspan(c.at);
     views_[c.index] = {.key = bytes.first(c.key_size),
@@ -4057,14 +4130,15 @@ auto RangeReader::next(std::size_t max) -> std::span<const EntryView> {
   return views_;
 }
 
-void RangeReader::read_entries(std::size_t max) {
+template <typename Cursor>
+void RangeReader::read_entries(Cursor &cursor, std::size_t max) {
   leases_.reserve(std::min(max, kReserveCap));
-  while (views_.size() < max && !cursor_.done()) {
+  while (views_.size() < max && !cursor.done()) {
     FrameLease lease;
     // Emptied first: lend_record leaves io_buf_ non-empty exactly when it
     // lent the record from it.
     io_buf_.clear();
-    const auto rec = cursor_.lend(io_buf_, lease);
+    const auto rec = cursor.lend(io_buf_, lease);
     if (!io_buf_.empty()) {
       copied_.push_back({.index = views_.size(),
                          .at = copy_.size(),
@@ -4078,7 +4152,7 @@ void RangeReader::read_entries(std::size_t max) {
       if (lease)
         leases_.push_back(std::move(lease));
     }
-    cursor_.advance();
+    cursor.advance();
   }
 }
 
@@ -4094,6 +4168,26 @@ void RangeReader::read_keys(std::size_t max) {
     copy_.insert(copy_.end(), key.begin(), key.end());
     views_.push_back({});
     ++key_cur_;
+  }
+}
+
+// key_cur_ is one past the next key, so it steps down before the read; a
+// read that throws steps it back up, and the next call reads that key again.
+void RangeReader::read_keys_reverse(std::size_t max) {
+  while (views_.size() < max && !(key_cur_ == key_end_)) {
+    --key_cur_;
+    try {
+      const auto [key, entry] = *key_cur_;
+      copied_.push_back({.index = views_.size(),
+                         .at = copy_.size(),
+                         .key_size = key.size(),
+                         .value_size = 0});
+      copy_.insert(copy_.end(), key.begin(), key.end());
+      views_.push_back({});
+    } catch (...) {
+      ++key_cur_;
+      throw;
+    }
   }
 }
 
@@ -4140,7 +4234,9 @@ auto DB::riter_from(const ReadOptions &opts, BytesView from) const
   auto s = load_state_for_read();
   auto it = kd_value_rlower_bound(s->key_dir, from, s->kd_ctx());
   return std::ranges::subrange<ReverseEntryIterator, std::default_sentinel_t>{
-      ReverseEntryIterator{s.state(), std::move(it), opts.verify_checksums},
+      ReverseEntryIterator{ReverseEntryCursor{s.state(), std::move(it),
+                                              std::nullopt,
+                                              opts.verify_checksums}},
       std::default_sentinel};
 }
 
