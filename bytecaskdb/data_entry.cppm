@@ -123,9 +123,7 @@ export auto parse_header_and_verify(std::span<const std::byte> buf) -> EntryHead
 
   // A type byte outside the known set is damage, like a bad CRC: refused
   // here rather than left to fall through an exhaustive switch downstream.
-  // mcdc-exempt(C1): the file sweep refuses an unknown type before any
-  // record is read by its location, so a read through a key directory entry
-  // never meets one; this guards the parser on its own.
+  // The file sweep refuses it first, so a read by location never meets one.
   if (!is_known_entry_type(header.entry_type)) {
     throw std::runtime_error{"parse_header_and_verify: unknown entry type"};
   }

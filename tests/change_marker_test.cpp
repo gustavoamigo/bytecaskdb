@@ -791,3 +791,36 @@ TEST_CASE("resume replays a marker an ingest appended but never published",
     CHECK(same_history(history(follower), history(leader)));
   }
 }
+
+TEST_CASE("a promotion that fills the active file rotates it, unless no file "
+          "id is left",
+          "[replication][change_marker][limits]") {
+  // A 75-byte put leaves the 100-byte file 25 short; the 27-byte marker
+  // takes it past the threshold.
+  TempDir td;
+  const std::string value(55, 'v');
+  const std::vector<bytecask::DataEntryView> slice{
+      {1, EntryType::Put, to_bytes("k"), to_bytes(value)}};
+  SECTION("with an id, the file is rotated") {
+    auto db = bytecask::DB::open(td.path / "db", follower_opts(100));
+    db.ingest({}, slice);
+    REQUIRE(db.file_stats().size() == 1);
+    db.set_mode(Mode::Leader);
+    CHECK(db.mode() == Mode::Leader);
+    CHECK(db.file_stats().size() == 2);
+    CHECK(markers(db).size() == 1);
+    CHECK(db.put({}, to_bytes("k2"), to_bytes("v")).sequence == 3);
+  }
+  SECTION("without one, the promotion still goes through and the file "
+          "stays active") {
+    auto db = bytecask::DB::open(td.path / "db", follower_opts(100));
+    db.ingest({}, slice);
+    db.test_set_next_file_id(bytecask::KeyDirEntry::kMaxFileId + 1);
+    db.set_mode(Mode::Leader);
+    CHECK(db.mode() == Mode::Leader);
+    CHECK(db.file_stats().size() == 1);
+    CHECK(markers(db).size() == 1);
+    CHECK(db.durable_sequence() == 2);
+    CHECK_FALSE(db.is_degraded());
+  }
+}

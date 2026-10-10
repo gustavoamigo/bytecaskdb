@@ -714,11 +714,6 @@ public:
   // to the marker list. Cannot fail.
   void apply_change_marker(std::uint64_t sequence, std::uint64_t id);
 
-  [[nodiscard]] auto change_markers() const noexcept
-      -> const std::vector<ChangeMarker> * {
-    return change_markers_.get();
-  }
-
   // State transition: mark engine as degraded with a reason.
   void apply_degrade(std::string reason) {
     degraded_ = true;
@@ -5280,10 +5275,14 @@ void DB::validate_state_consistency(const EngineState &s) const {
   if (const auto *ms = s.change_markers.get()) {
     std::uint64_t prev = 0;
     for (const auto &m : *ms) {
-      if (m.since_sequence <= prev || m.since_sequence >= s.next_seq) {
+      if (m.since_sequence <= prev) {
         throw std::runtime_error{std::format(
-            "state consistency: change marker at {} out of order or at or "
-            "above next_seq {}",
+            "state consistency: change marker at {} out of order after {}",
+            m.since_sequence, prev)};
+      }
+      if (m.since_sequence >= s.next_seq) {
+        throw std::runtime_error{std::format(
+            "state consistency: change marker at {} at or above next_seq {}",
             m.since_sequence, s.next_seq)};
       }
       prev = m.since_sequence;
@@ -5876,16 +5875,19 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
   auto next_data = [&](Cursor &c) -> std::optional<HintEntry> {
     while (auto he = c.scanner.next()) {
       note(c.file_id, *he);
-      if (he->entry_type == EntryType::BulkBegin ||
-          he->entry_type == EntryType::BulkEnd ||
-          he->entry_type == EntryType::ChangeMarker)
-        continue;
-      if (he->entry_type == EntryType::RangeDel) {
+      switch (he->entry_type) {
+      case EntryType::BulkBegin:
+      case EntryType::BulkEnd:
+      case EntryType::ChangeMarker:
+        continue;  // keyless: nothing to park a cursor on
+      case EntryType::RangeDel:
         // Range tombstones only ever sit in the head of a sorted file.
         throw std::runtime_error{
             "bytecask: range tombstone inside a sorted hint run"};
+      case EntryType::Put:
+      case EntryType::Delete:
+        return *he;
       }
-      return *he;
     }
     return std::nullopt;
   };
