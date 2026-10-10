@@ -110,7 +110,9 @@ public:
   // that guess — the value size the caller expects, or 0 when it does not
   // know one. CRC-checked when verify. Spans point into the frame the lease
   // pins, the mapping, or io_buf, and are valid until the next call with the
-  // same io_buf and lease. Each back-end implements it by name rather than
+  // same io_buf and lease. A lend from io_buf resizes it to at least a
+  // header; a lend from a frame or the mapping leaves it as it was, so a
+  // caller that empties io_buf first can tell the two apart. Each back-end implements it by name rather than
   // through a base default, so the copying ones cost one virtual call, not
   // two.
   [[nodiscard]] virtual auto lend_record(Offset offset,

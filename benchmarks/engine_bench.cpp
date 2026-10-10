@@ -926,6 +926,80 @@ template <typename A, int RangeLen> void BM_Range(benchmark::State &state) {
   pool_ratio.attach(state);
 }
 
+// ──────────────────────────── RangeRead ──────────────────────────────────────
+//
+// A bounded range read as the MariaDB plugin makes one: every entry of
+// [k_i, k_{i+Len}) of the sorted key set, keys and values, from one snapshot,
+// CRC-checked as the plugin reads by default. Batch 0 steps iter_from and
+// stops at the bound; otherwise read_range returns Batch entries per call.
+// Unlike the other read benchmarks this one verifies: without it a read
+// touches only a record's header, and the iterator's key comparison against
+// the bound is then the only other touch of the record, which keeps the
+// hardware prefetcher streaming for the iterator and not for the batch.
+// Shuffled writes the keys in random order, so a range's records are spread
+// over the data files as a much-updated table's are; otherwise they are
+// written in key order, as a table is loaded.
+
+template <typename A, int RangeLen, std::size_t Batch, bool Shuffled>
+void BM_RangeRead(benchmark::State &state) {
+  static auto keys = [] {
+    auto k = A::generate_keys(kDatasetSize);
+    std::ranges::sort(k);
+    return k;
+  }();
+  static auto val = make_value();
+  static auto db = [] {
+    auto written = keys;
+    if constexpr (Shuffled)
+      std::ranges::shuffle(written, std::mt19937_64{42});
+    return A::open_populated(Shuffled ? "rangeread_shuffled" : "rangeread",
+                             written, val);
+  }();
+  const PoolHitRatio<A, typename A::Db> pool_ratio{db};
+  const auto snap = db.engine.snapshot();
+  const bytecask::ReadOptions ro;
+
+  std::size_t idx = 0;
+  std::vector<double> samples;
+  samples.reserve(kMaxSamples);
+
+  for (auto _ : state) {
+    const auto i = (idx * 7919) % (keys.size() - RangeLen - 1);
+    const auto to = bc_key(keys[i + RangeLen]);
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    std::size_t n = 0;
+    if constexpr (Batch == 0) {
+      for (const auto &[k, v] : snap.iter_from(ro, bc_key(keys[i]))) {
+        if (!std::ranges::lexicographical_compare(k, to))
+          break;
+        benchmark::DoNotOptimize(v.data());
+        ++n;
+      }
+    } else {
+      auto reader = snap.read_range(ro, {.from = bc_key(keys[i]), .to = to});
+      for (auto entries = reader.next(Batch); !entries.empty();
+           entries = reader.next(Batch)) {
+        for (const auto &e : entries)
+          benchmark::DoNotOptimize(e.value.data());
+        n += entries.size();
+      }
+    }
+    benchmark::DoNotOptimize(n);
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    if (samples.size() < kMaxSamples)
+      samples.push_back(static_cast<double>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+              .count()));
+    ++idx;
+  }
+
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * RangeLen);
+  state.counters["scans_per_us"] = benchmark::Counter(
+      static_cast<double>(state.iterations()), benchmark::Counter::kIsRate);
+  attach_jitter(state, samples);
+  pool_ratio.attach(state);
+}
+
 // ──────────────────────────── Mixed ──────────────────────────────────────────
 // 80% get / 10% put / 10% del
 
@@ -1462,6 +1536,34 @@ BENCH(BM_CountRange<Bc, 1000, false>) ->Name("ByteCaskDB/CountRange/Count/1000")
 BENCH(BM_CountRange<Bc, 1000, true>)  ->Name("ByteCaskDB/CountRange/Walk/1000");
 BENCH(BM_CountRange<Bc, 1024, false>) ->Name("ByteCaskDB/CountRange/Count/1024");
 BENCH(BM_CountRange<Bc, 1024, true>)  ->Name("ByteCaskDB/CountRange/Walk/1024");
+BENCH(BM_RangeRead<Bc, 100, 0, false>)->Name("ByteCaskDB/RangeRead/Ordered/100/Iter");
+BENCH(BM_RangeRead<Bc, 100, 8, false>)->Name("ByteCaskDB/RangeRead/Ordered/100/8");
+BENCH(BM_RangeRead<Bc, 100, 32, false>)->Name("ByteCaskDB/RangeRead/Ordered/100/32");
+BENCH(BM_RangeRead<Bc, 100, 64, false>)->Name("ByteCaskDB/RangeRead/Ordered/100/64");
+BENCH(BM_RangeRead<Bc, 100, 128, false>)->Name("ByteCaskDB/RangeRead/Ordered/100/128");
+BENCH(BM_RangeRead<Bc, 100, 256, false>)->Name("ByteCaskDB/RangeRead/Ordered/100/256");
+BENCH(BM_RangeRead<Bc, 100, 512, false>)->Name("ByteCaskDB/RangeRead/Ordered/100/512");
+BENCH(BM_RangeRead<Bc, 1000, 0, false>)->Name("ByteCaskDB/RangeRead/Ordered/1000/Iter");
+BENCH(BM_RangeRead<Bc, 1000, 8, false>)->Name("ByteCaskDB/RangeRead/Ordered/1000/8");
+BENCH(BM_RangeRead<Bc, 1000, 32, false>)->Name("ByteCaskDB/RangeRead/Ordered/1000/32");
+BENCH(BM_RangeRead<Bc, 1000, 64, false>)->Name("ByteCaskDB/RangeRead/Ordered/1000/64");
+BENCH(BM_RangeRead<Bc, 1000, 128, false>)->Name("ByteCaskDB/RangeRead/Ordered/1000/128");
+BENCH(BM_RangeRead<Bc, 1000, 256, false>)->Name("ByteCaskDB/RangeRead/Ordered/1000/256");
+BENCH(BM_RangeRead<Bc, 1000, 512, false>)->Name("ByteCaskDB/RangeRead/Ordered/1000/512");
+BENCH(BM_RangeRead<Bc, 100, 0, true>)->Name("ByteCaskDB/RangeRead/Shuffled/100/Iter");
+BENCH(BM_RangeRead<Bc, 100, 8, true>)->Name("ByteCaskDB/RangeRead/Shuffled/100/8");
+BENCH(BM_RangeRead<Bc, 100, 32, true>)->Name("ByteCaskDB/RangeRead/Shuffled/100/32");
+BENCH(BM_RangeRead<Bc, 100, 64, true>)->Name("ByteCaskDB/RangeRead/Shuffled/100/64");
+BENCH(BM_RangeRead<Bc, 100, 128, true>)->Name("ByteCaskDB/RangeRead/Shuffled/100/128");
+BENCH(BM_RangeRead<Bc, 100, 256, true>)->Name("ByteCaskDB/RangeRead/Shuffled/100/256");
+BENCH(BM_RangeRead<Bc, 100, 512, true>)->Name("ByteCaskDB/RangeRead/Shuffled/100/512");
+BENCH(BM_RangeRead<Bc, 1000, 0, true>)->Name("ByteCaskDB/RangeRead/Shuffled/1000/Iter");
+BENCH(BM_RangeRead<Bc, 1000, 8, true>)->Name("ByteCaskDB/RangeRead/Shuffled/1000/8");
+BENCH(BM_RangeRead<Bc, 1000, 32, true>)->Name("ByteCaskDB/RangeRead/Shuffled/1000/32");
+BENCH(BM_RangeRead<Bc, 1000, 64, true>)->Name("ByteCaskDB/RangeRead/Shuffled/1000/64");
+BENCH(BM_RangeRead<Bc, 1000, 128, true>)->Name("ByteCaskDB/RangeRead/Shuffled/1000/128");
+BENCH(BM_RangeRead<Bc, 1000, 256, true>)->Name("ByteCaskDB/RangeRead/Shuffled/1000/256");
+BENCH(BM_RangeRead<Bc, 1000, 512, true>)->Name("ByteCaskDB/RangeRead/Shuffled/1000/512");
 BENCH(BM_MixedBatch<Bc, true>)      ->Name("ByteCaskDB/MixedBatch/Sync");
 
 // --- mmap read path, the bar for the pool's hit path ---

@@ -243,6 +243,18 @@ export struct ReadOptions {
   bool verify_checksums{true};
 };
 
+export enum class Direction { Forward, Reverse };
+
+// The keys Snapshot::read_range reads: [from, to) in the given direction.
+// An empty from starts at the first key; an empty to runs to the last.
+// keys_only reads no values.
+export struct RangeSpec {
+  BytesView from;
+  BytesView to;
+  Direction direction{Direction::Forward};
+  bool keys_only{false};
+};
+
 // Options passed to DB::open().
 export struct Options {
   // Active-file rotation threshold in bytes (default 64 MiB). When the active
@@ -585,6 +597,61 @@ private:
   // Implementation details hidden from public interface
   class Impl;
   std::unique_ptr<Impl> impl_;
+};
+
+// ---------------------------------------------------------------------------
+// RangeReader — a key range read in batches, from Snapshot::read_range.
+//
+// next(max) returns up to max entries in key order, and an empty span once
+// the range is exhausted. Its spans point into pool frames the reader pins,
+// into the mapping, or into the reader's own copy of records a read lent
+// from a scratch buffer, and are valid until the next call to next() or the
+// reader's destruction. A batch pins at most one frame per entry.
+//
+// Holds the snapshot's engine state: the files it reads stay open, and the
+// entries are those of the snapshot, whatever is written meanwhile.
+// ---------------------------------------------------------------------------
+export class RangeReader {
+public:
+  RangeReader(const RangeReader &) = delete;
+  auto operator=(const RangeReader &) -> RangeReader & = delete;
+  RangeReader(RangeReader &&) noexcept = default;
+  auto operator=(RangeReader &&) noexcept -> RangeReader & = default;
+  ~RangeReader() = default;
+
+  // Throws std::invalid_argument if max is 0, std::system_error on I/O
+  // failure and std::runtime_error on a CRC mismatch. A throw leaves the
+  // reader at the entry that failed: the next call reads it again.
+  [[nodiscard]] auto next(std::size_t max) -> std::span<const EntryView>;
+
+private:
+  friend class Snapshot;
+  RangeReader(std::shared_ptr<const EngineState> state, KeyDirValueIter cur,
+              KeyDirValueIter end, bool verify_checksums)
+      : state_{std::move(state)}, cur_{std::move(cur)}, end_{std::move(end)},
+        verify_checksums_{verify_checksums} {}
+
+  // An entry of the batch whose record was lent from io_buf_: copied to
+  // copy_ at `at`, key then value. Its view is filled in only once the whole
+  // batch is read, since copy_ may grow until then.
+  struct Copied {
+    std::size_t index;
+    std::size_t at;
+    std::size_t key_size;
+    std::size_t value_size;
+  };
+
+  std::shared_ptr<const EngineState> state_;
+  KeyDirValueIter cur_;
+  KeyDirValueIter end_;
+  bool verify_checksums_{true};
+  std::vector<EntryView> views_;
+  std::vector<Copied> copied_;
+  Bytes io_buf_;
+  Bytes copy_;
+  // After the buffers, so the pins drop first: nothing may still reference
+  // a frame when its pin is released.
+  std::vector<FrameLease> leases_;
 };
 
 // ---------------------------------------------------------------------------
@@ -1827,6 +1894,12 @@ public:
   // end, and none under the keyed ones.
   [[nodiscard]] auto count_keys(BytesView from, BytesView to,
                                 std::size_t limit) const -> std::size_t;
+
+  // Reads range in batches; see RangeReader. Throws std::invalid_argument if
+  // from >= to, and std::logic_error for a spec not supported yet: today
+  // only forward reads of full entries with a non-empty to.
+  [[nodiscard]] auto read_range(const ReadOptions &opts,
+                                RangeSpec range) const -> RangeReader;
 
 private:
   explicit Snapshot(std::shared_ptr<const EngineState> state,
@@ -3746,6 +3819,67 @@ auto Snapshot::count_keys(BytesView from, BytesView to,
   check_range(from, to);
   if (limit == 0) return 0;
   return kd_count(state_->key_dir, from, to, limit, state_->kd_ctx());
+}
+
+auto Snapshot::read_range(const ReadOptions &opts, RangeSpec range) const
+    -> RangeReader {
+  if (range.direction != Direction::Forward || range.keys_only ||
+      range.to.empty()) {
+    throw std::logic_error{
+        "read_range: only forward reads of full entries with a non-empty "
+        "upper bound are supported"};
+  }
+  check_range(range.from, range.to);
+  const auto ctx = state_->kd_ctx();
+  return RangeReader{state_,
+                     kd_value_lower_bound(state_->key_dir, range.from, ctx),
+                     kd_value_lower_bound(state_->key_dir, range.to, ctx),
+                     opts.verify_checksums};
+}
+
+auto RangeReader::next(std::size_t max) -> std::span<const EntryView> {
+  if (max == 0)
+    throw std::invalid_argument{"RangeReader::next: max must be positive"};
+  // The last batch's spans die here.
+  views_.clear();
+  copied_.clear();
+  copy_.clear();
+  leases_.clear();
+  // Sized once rather than grown entry by entry: a reader is often made for
+  // a single short range. Larger batches still grow past the cap.
+  constexpr std::size_t kReserveCap = 1024;
+  views_.reserve(std::min(max, kReserveCap));
+  leases_.reserve(std::min(max, kReserveCap));
+  while (views_.size() < max && !(cur_ == end_)) {
+    const auto &loc = *cur_;
+    FrameLease lease;
+    // Emptied first: lend_record leaves io_buf_ non-empty exactly when it
+    // lent the record from it.
+    io_buf_.clear();
+    const auto rec = (*state_->files.get(loc.file_id()))
+                         ->lend_record(loc.file_offset(), value_size_hint(loc),
+                                       verify_checksums_, io_buf_, lease);
+    if (!io_buf_.empty()) {
+      copied_.push_back({.index = views_.size(),
+                         .at = copy_.size(),
+                         .key_size = rec.key.size(),
+                         .value_size = rec.value.size()});
+      copy_.insert(copy_.end(), rec.key.begin(), rec.key.end());
+      copy_.insert(copy_.end(), rec.value.begin(), rec.value.end());
+      views_.push_back({});
+    } else {
+      views_.push_back({.key = rec.key, .value = rec.value});
+      if (lease)
+        leases_.push_back(std::move(lease));
+    }
+    ++cur_;
+  }
+  for (const auto &c : copied_) {
+    const auto bytes = std::span{copy_}.subspan(c.at);
+    views_[c.index] = {.key = bytes.first(c.key_size),
+                       .value = bytes.subspan(c.key_size, c.value_size)};
+  }
+  return views_;
 }
 
 auto Snapshot::rkeys_from(const ReadOptions& /*opts*/, BytesView from) const

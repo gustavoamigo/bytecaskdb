@@ -21,7 +21,7 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 ## Features
 
 - **Sequential write path** — all I/O is sequential appends; no random writes. Every `put` and `del` is one append. `apply_batch` with N operations appends a begin marker, N entries, and an end marker in a single `pwritev` — still no WAL, no random writes. Because the key directory stores no key bytes, a `put` or `del` also reads one record (the key's own, or a neighbour's on an insert) to place the key. The whole record is read and CRC-checked, value included, so its cost grows with that record's value size; it is served from the buffer pool or page cache, and if it fails the operation fails before anything is appended.
-- **Ordered range iteration** — scan from any key prefix in key order. Keys are read from their records as the iterator advances, values lazily. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`. `Snapshot::count_keys` counts the keys in a range, up to a limit, from the key directory's leaf sizes: at most two record reads, whatever the range holds.
+- **Ordered range iteration** — scan from any key prefix in key order. Keys are read from their records as the iterator advances, values lazily. Bidirectional: scan forward with `iter_from`/`keys_from` or backward with `riter_from`/`rkeys_from`. `Snapshot::count_keys` counts the keys in a range, up to a limit, from the key directory's leaf sizes: at most two record reads, whatever the range holds. `Snapshot::read_range` reads a bounded range `[from, to)` in batches, for callers that consume rows a batch at a time; today it reads forward, keys and values.
 - **Range deletion** — `del_range(opts, from, to)` deletes all keys in `[from, to)` with a single data file append, whatever the size of the range. A range with `from >= to` is refused with `std::invalid_argument`, here and in range guards and counts, rather than silently doing nothing. Removing the keys from the key directory reads each of them back from its data file (twice, today), so that part grows with the number of keys removed. Available on `DB` and `WritePlan`.
 - **Atomic writes** — every `put`, `del`, and `del_range` is atomic. `apply_batch` makes multiple puts, deletes, and range deletes atomic as a group.
 - **Hard limits, checked up front** — keys up to 65,535 bytes, values up to 256 MiB, one write up to 1 GiB, data files up to 3 GiB. Anything over a limit is refused before a byte reaches disk, and an option over its ceiling is refused at `open`. One process can create about a million data files (64 TiB written at the default 64 MiB file size, far fewer with tiny files); past that a write that needs a new file is refused, the engine stays writable below it, and a reopen renumbers.
@@ -191,6 +191,13 @@ if (!db.apply_batch({}, std::move(order))) {
 // Prefix scan — keys and values fetched lazily from disk as it advances.
 for (auto& [key, value] : db.iter_from({}, to_bytes("user:"))) {
     // Iterates all keys >= "user:" in ascending order.
+}
+
+// Bounded range in batches — [from, to), up to 128 entries per call.
+auto snap3 = db.snapshot();
+auto reader = snap3.read_range({}, {.from = to_bytes("user:"), .to = to_bytes("user;")});
+for (auto batch = reader.next(128); !batch.empty(); batch = reader.next(128)) {
+    for (const auto& [key, value] : batch) { ... }  // valid until the next call
 }
 
 // Keys-only prefix scan — reads each key's record header, skips the value.
@@ -453,6 +460,30 @@ public:
     // Throws std::invalid_argument if from >= to.
     [[nodiscard]] auto count_keys(BytesView from, BytesView to,
                                   std::size_t limit) const -> std::size_t;
+    // Reads [from, to) in batches; see RangeReader. Throws
+    // std::invalid_argument if from >= to, and std::logic_error for a spec
+    // not supported yet: today forward reads of keys and values, with a
+    // non-empty to.
+    [[nodiscard]] auto read_range(const ReadOptions& opts,
+                                  RangeSpec range) const -> RangeReader;
+};
+
+enum class Direction { Forward, Reverse };
+
+struct RangeSpec {
+    BytesView from;       // first key included; empty = from the first key
+    BytesView to;         // first key excluded; empty = to the last key
+    Direction direction{Direction::Forward};
+    bool keys_only{false};
+};
+
+// Move-only. Holds the snapshot's files open while it lives.
+class RangeReader {
+public:
+    // Up to max entries in key order; empty once the range is done. The
+    // spans are valid until the next call or the reader's destruction.
+    // Throws std::invalid_argument if max is 0.
+    [[nodiscard]] auto next(std::size_t max) -> std::span<const EntryView>;
 };
 
 // Sealed file descriptor returned by create_manifest().
