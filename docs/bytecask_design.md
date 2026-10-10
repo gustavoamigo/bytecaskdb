@@ -523,6 +523,17 @@ Benchmarks on a 22-vCPU instance (50k keys, 1 KiB random values):
 
 Throughput scales near-linearly with thread count for read-heavy workloads.
 
+#### Batched range reads (`RangeReader`)
+
+`Snapshot::read_range(opts, RangeSpec{from, to})` returns a `RangeReader`, and `next(max)` returns the next `max` entries of `[from, to)` as a `span<const EntryView>`, empty once the range is done. It is for callers that consume a range a batch at a time, the MariaDB plugin first: one call per batch instead of three per row, and the bound checked once by the engine instead of by the caller on every key.
+
+- **Bounds.** Both ends are placed once, at construction, as two value iterators over the snapshot's tree (`kd_value_lower_bound` of `from` and of `to`: one record read each under the blind key directory). A batch stops when the first reaches the second, so no key is read or compared to find the end. `from >= to` throws `std::invalid_argument`, as `count_keys` does.
+- **Span lifetime.** A batch's spans are valid until the next `next()` or the reader's destruction. A record lent from a pool frame keeps that frame pinned: the reader holds one `FrameLease` per entry, so a batch pins at most `max` frames, and a pool with every frame pinned serves the rest of the batch by reading around it. A record lent from the mapping needs nothing held. A record lent from the reader's scratch buffer (pread, a record straddling frames, a miss) is copied into a per-batch buffer before the next read reuses the scratch; its views are built only after the whole batch is read, since that buffer may grow until then.
+- **Errors.** A read that throws leaves the reader on the entry that failed; the entries already read in that batch are dropped, and the next call reads the failed entry again.
+- **Scope today.** Forward reads of full entries with a non-empty `to`. `RangeSpec` also names `direction` and `keys_only`, and an empty `to` meaning the last key; those throw `std::logic_error` until a caller needs them. `EntryIterator` and `ReverseEntryIterator` keep their own implementation until they move onto the reader.
+
+In-engine the reader is about level with `iter_from` stopped at the bound (`engine_bench` `RangeRead`, 1 M keys, buffer pool, CRC-checked): 5–8% faster over 1,000-row ranges written in key order, level over 100-row ones, and up to 8% slower over shuffled ones, where placing `to` costs one more random record read. Batch sizes from 8 to 128 are within a few percent of each other. The gain it exists for is in the caller: in the plugin, a row through the iterator costs a handler call, a key comparison and an iterator step. Measured with CRC checks off, the reader came out 30% slower, and not because of anything it does: a read then touches only a record's header, and the iterator's key comparison against the bound, right after, was the touch that kept the hardware prefetcher streaming through the file. With the checks on, as the plugin reads by default, every byte of the record is read and the difference goes away. The benchmark verifies for that reason.
+
 #### Read consistency
 
 A read (`get`, `contains_key`, the iterators, `snapshot()`) sees every write that returned before the read began, and every write another read has already seen, on any thread. There is no option to relax this. `ReadOptions` carries only `verify_checksums`.

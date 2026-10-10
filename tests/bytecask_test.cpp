@@ -5893,6 +5893,218 @@ TEST_CASE("count_keys reads no key per counted entry", "[count_keys]") {
 }
 
 // ---------------------------------------------------------------------------
+// read_range tests
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using EntryStrings = std::vector<std::pair<std::string, std::string>>;
+
+// The entries of [from, to) as iter_from yields them: the reference.
+auto iter_range(const bytecask::Snapshot &snap, const std::string &from,
+                const std::string &to) -> EntryStrings {
+  EntryStrings out;
+  for (const auto &[k, v] : snap.iter_from({}, to_bytes(from))) {
+    if (to_string(k) >= to)
+      break;
+    out.emplace_back(to_string(k), to_string(v));
+  }
+  return out;
+}
+
+// The same range through read_range, `batch` entries at a time. Each batch is
+// copied out only after next() has returned all of it, so every span in it
+// must survive the reads that came after it in the same batch.
+auto read_range_all(const bytecask::Snapshot &snap, const std::string &from,
+                    const std::string &to, std::size_t batch)
+    -> EntryStrings {
+  EntryStrings out;
+  auto reader = snap.read_range({}, {.from = to_bytes(from), .to = to_bytes(to)});
+  for (;;) {
+    const auto entries = reader.next(batch);
+    if (entries.empty())
+      break;
+    REQUIRE(entries.size() <= batch);
+    for (const auto &e : entries)
+      out.emplace_back(to_string(e.key), to_string(e.value));
+  }
+  return out;
+}
+
+auto random_range_key(std::mt19937 &gen, int min_len) -> std::string {
+  static constexpr std::string_view alphabet = "abcdef";
+  const auto len = std::uniform_int_distribution<int>(min_len, 5)(gen);
+  std::string k;
+  for (int i = 0; i < len; ++i)
+    k += alphabet[static_cast<std::size_t>(
+        std::uniform_int_distribution<int>(0, 5)(gen))];
+  return k;
+}
+
+} // namespace
+
+TEST_CASE("read_range yields what iter_from yields, at every batch size",
+          "[read_range]") {
+  // Small files, so a range crosses many of them and vacuum has work; value
+  // sizes from empty to larger than a pread's first guess, so records are
+  // lent from frames, the mapping and the scratch buffer within one batch.
+  // The pool is the smallest open allows, so a batch can pin every frame and
+  // the rest of it reads around the pool.
+  const auto backend = GENERATE(bytecask::IoBackend::Pread,
+                                bytecask::IoBackend::Mmap,
+                                bytecask::IoBackend::BufferPool);
+#ifdef __EMSCRIPTEN__
+  if (backend == bytecask::IoBackend::Mmap) SKIP("DB::open rejects Mmap on WASM");
+#endif
+  constexpr std::uint64_t kFileBytes = 64 * 1024;
+  TempDir td;
+  auto db = bytecask::DB::open(
+      td.path / "db", {.max_file_bytes = kFileBytes,
+                       .io_backend = backend,
+                       .buffer_pool = {.capacity_bytes = 2 * kFileBytes}});
+
+  std::mt19937 gen(4242);
+  auto rand_value = [&] {
+    const auto kind = std::uniform_int_distribution<int>(0, 9)(gen);
+    const auto len = kind == 0   ? 0
+                     : kind == 1 ? std::uniform_int_distribution<int>(1000, 9000)(gen)
+                                 : std::uniform_int_distribution<int>(1, 64)(gen);
+    std::string v(static_cast<std::size_t>(len), 'x');
+    for (auto &c : v)
+      c = static_cast<char>(std::uniform_int_distribution<int>('A', 'z')(gen));
+    return v;
+  };
+
+  std::vector<bytecask::Snapshot> snaps;
+  for (int op = 1; op <= 4'000; ++op) {
+    const auto roll = std::uniform_int_distribution<int>(0, 99)(gen);
+    if (roll < 70) {
+      db.put({.sync = false}, to_bytes(random_range_key(gen, 1)),
+             to_bytes(rand_value()));
+    } else if (roll < 85) {
+      (void)db.del({.sync = false}, to_bytes(random_range_key(gen, 1)));
+    } else if (roll < 88) {
+      auto a = random_range_key(gen, 1);
+      auto b = random_range_key(gen, 1);
+      if (a != b) {
+        if (b < a)
+          std::swap(a, b);
+        db.del_range({.sync = false}, to_bytes(a), to_bytes(b));
+      }
+    } else if (roll < 98) {
+      bytecask::WritePlan plan;
+      for (int i = 0; i < 8; ++i)
+        plan.put(to_bytes(random_range_key(gen, 1)), to_bytes(rand_value()));
+      REQUIRE(db.apply_batch({.sync = false}, std::move(plan)));
+    } else {
+      (void)db.vacuum({.fragmentation_threshold = 0.2});
+    }
+    if (op % 1'000 == 0)
+      snaps.push_back(db.snapshot());
+  }
+
+  // Older snapshots are read after vacuum has replaced some of their files.
+  for (const auto &snap : snaps) {
+    REQUIRE(read_range_all(snap, "", "g", 64) == iter_range(snap, "", "g"));
+    for (int i = 0; i < 60; ++i) {
+      auto from = random_range_key(gen, 0);
+      auto to = random_range_key(gen, 1);
+      if (!(from < to))
+        continue;
+      const auto want = iter_range(snap, from, to);
+      for (const std::size_t batch : {1, 2, 7, 64, 128, 300}) {
+        if (read_range_all(snap, from, to, batch) != want)
+          FAIL(std::format("[{}, {}) batch {}: differs from iter_from", from,
+                           to, batch));
+      }
+    }
+  }
+}
+
+TEST_CASE("read_range batch spans outlive writes and vacuum until next()",
+          "[read_range]") {
+  const auto backend = GENERATE(bytecask::IoBackend::Pread,
+                                bytecask::IoBackend::Mmap,
+                                bytecask::IoBackend::BufferPool);
+#ifdef __EMSCRIPTEN__
+  if (backend == bytecask::IoBackend::Mmap) SKIP("DB::open rejects Mmap on WASM");
+#endif
+  constexpr std::uint64_t kFileBytes = 16 * 1024;
+  TempDir td;
+  auto db = bytecask::DB::open(
+      td.path / "db", {.max_file_bytes = kFileBytes,
+                       .io_backend = backend,
+                       .buffer_pool = {.capacity_bytes = 2 * kFileBytes}});
+  const auto value = [](int i) { return std::format("value-{:05d}", i); };
+  for (int i = 0; i < 2'000; ++i)
+    db.put({.sync = false}, to_bytes(std::format("k{:05d}", i)),
+           to_bytes(value(i)));
+
+  const auto snap = db.snapshot();
+  auto reader = snap.read_range({}, {.from = to_bytes("k00100"),
+                                     .to = to_bytes("k01900")});
+  const auto batch = reader.next(256);
+  REQUIRE(batch.size() == 256);
+
+  // Overwrite everything and compact: the files the batch was read from are
+  // deleted from the directory, and the pool's frames are reused.
+  for (int round = 0; round < 3; ++round)
+    for (int i = 0; i < 2'000; ++i)
+      db.put({.sync = false}, to_bytes(std::format("k{:05d}", i)),
+             to_bytes("overwritten"));
+  while (db.vacuum({.fragmentation_threshold = 0.0})) {
+  }
+
+  for (std::size_t j = 0; j < batch.size(); ++j) {
+    const auto i = 100 + static_cast<int>(j);
+    CHECK(to_string(batch[j].key) == std::format("k{:05d}", i));
+    CHECK(to_string(batch[j].value) == value(i));
+  }
+  // The rest of the range is still the snapshot's.
+  int i = 356;
+  for (auto entries = reader.next(100); !entries.empty();
+       entries = reader.next(100)) {
+    for (const auto &e : entries) {
+      CHECK(to_string(e.key) == std::format("k{:05d}", i));
+      CHECK(to_string(e.value) == value(i));
+      ++i;
+    }
+  }
+  CHECK(i == 1'900);
+}
+
+TEST_CASE("read_range refuses what it does not read", "[read_range]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({}, to_bytes("a"), to_bytes("1"));
+  const auto snap = db.snapshot();
+
+  CHECK_THROWS_AS(snap.read_range({}, {.from = to_bytes("b"), .to = to_bytes("a")}),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(snap.read_range({}, {.from = to_bytes("a"), .to = to_bytes("a")}),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(snap.read_range({}, {.from = to_bytes("a")}),
+                  std::logic_error);
+  CHECK_THROWS_AS(
+      snap.read_range({}, {.from = to_bytes("a"),
+                           .to = to_bytes("b"),
+                           .direction = bytecask::Direction::Reverse}),
+      std::logic_error);
+  CHECK_THROWS_AS(snap.read_range({}, {.from = to_bytes("a"),
+                                       .to = to_bytes("b"),
+                                       .keys_only = true}),
+                  std::logic_error);
+
+  auto reader = snap.read_range({}, {.to = to_bytes("b")});
+  CHECK_THROWS_AS(reader.next(0), std::invalid_argument);
+  const auto entries = reader.next(10);
+  REQUIRE(entries.size() == 1);
+  CHECK(to_string(entries[0].key) == "a");
+  CHECK(reader.next(10).empty());
+  CHECK(reader.next(10).empty());
+}
+
+// ---------------------------------------------------------------------------
 // WritePlan guard tests
 // ---------------------------------------------------------------------------
 

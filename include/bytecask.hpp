@@ -153,6 +153,18 @@ struct EntryView {
   std::span<const std::byte> value;
 };
 
+enum class Direction { Forward, Reverse };
+
+// The keys Snapshot::read_range reads: [from, to) in the given direction.
+// An empty from starts at the first key; an empty to runs to the last.
+// keys_only reads no values.
+struct RangeSpec {
+  BytesView from;
+  BytesView to;
+  Direction direction{Direction::Forward};
+  bool keys_only{false};
+};
+
 // Thrown by write operations when the engine is degraded. Reads remain
 // available. Call DB::resume() for in-process recovery.
 //
@@ -359,6 +371,35 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// RangeReader — a key range read in batches, from Snapshot::read_range.
+//
+// next(max) returns up to max entries in key order, and an empty span once
+// the range is exhausted. The spans are valid until the next call to next()
+// or the reader's destruction. Move-only; holds the snapshot's files open.
+// ---------------------------------------------------------------------------
+
+class RangeReader {
+public:
+  struct Impl;
+
+  ~RangeReader();
+  RangeReader(const RangeReader&) = delete;
+  RangeReader& operator=(const RangeReader&) = delete;
+  RangeReader(RangeReader&&) noexcept;
+  RangeReader& operator=(RangeReader&&) noexcept;
+
+  // Throws std::invalid_argument if max is 0, std::system_error on I/O
+  // failure and std::runtime_error on a CRC mismatch. A throw leaves the
+  // reader at the entry that failed: the next call reads it again.
+  [[nodiscard]] auto next(std::size_t max) -> std::span<const EntryView>;
+
+private:
+  explicit RangeReader(std::unique_ptr<Impl> impl) noexcept;
+  std::unique_ptr<Impl> impl_;
+  friend class Snapshot;
+};
+
+// ---------------------------------------------------------------------------
 // Snapshot — frozen, move-only, read-only view of DB state.
 // ---------------------------------------------------------------------------
 
@@ -397,6 +438,12 @@ public:
   // std::invalid_argument.
   [[nodiscard]] auto count_keys(BytesView from, BytesView to,
                                 std::size_t limit) const -> std::size_t;
+
+  // Reads range in batches; see RangeReader. Throws std::invalid_argument if
+  // from >= to, and std::logic_error for a spec not supported yet: today
+  // only forward reads of full entries with a non-empty to.
+  [[nodiscard]] auto read_range(const ReadOptions& opts,
+                                RangeSpec range) const -> RangeReader;
 
 private:
   explicit Snapshot(std::unique_ptr<Impl> impl) noexcept;
@@ -561,6 +608,9 @@ using SizeLimits           = internal::SizeLimits;
 using FileInfo             = internal::FileInfo;
 using DataEntryView        = internal::DataEntryView;
 using EntryView            = internal::EntryView;
+using Direction            = internal::Direction;
+using RangeSpec            = internal::RangeSpec;
+using RangeReader          = internal::RangeReader;
 using DbDegraded           = internal::DbDegraded;
 using DbFollowerMode       = internal::DbFollowerMode;
 using DbClosed             = internal::DbClosed;

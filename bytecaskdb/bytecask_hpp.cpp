@@ -103,6 +103,16 @@ auto to_module(bytecask::internal::Options o) noexcept -> bytecask::Options {
   };
 }
 
+auto to_module(const bytecask::internal::RangeSpec& r) noexcept
+    -> bytecask::RangeSpec {
+  return {.from = r.from,
+          .to = r.to,
+          .direction = r.direction == bytecask::internal::Direction::Forward
+                           ? bytecask::Direction::Forward
+                           : bytecask::Direction::Reverse,
+          .keys_only = r.keys_only};
+}
+
 auto to_module(bytecask::internal::Mode m) noexcept -> bytecask::Mode {
   return static_cast<bytecask::Mode>(m);
 }
@@ -409,6 +419,31 @@ auto ChangeIterator::operator==(std::default_sentinel_t) const noexcept -> bool 
 }
 
 // ---------------------------------------------------------------------------
+// RangeReader::Impl
+// ---------------------------------------------------------------------------
+
+struct RangeReader::Impl {
+  bytecask::RangeReader reader;
+  // The module's views, retyped for this header: same members, distinct type.
+  std::vector<EntryView> views;
+  explicit Impl(bytecask::RangeReader r) : reader{std::move(r)} {}
+};
+
+RangeReader::~RangeReader() = default;
+RangeReader::RangeReader(RangeReader&&) noexcept = default;
+RangeReader& RangeReader::operator=(RangeReader&&) noexcept = default;
+RangeReader::RangeReader(std::unique_ptr<Impl> impl) noexcept
+    : impl_{std::move(impl)} {}
+
+auto RangeReader::next(std::size_t max) -> std::span<const EntryView> {
+  const auto batch = impl_->reader.next(max);
+  impl_->views.clear();
+  for (const auto& e : batch)
+    impl_->views.push_back(EntryView{e.key, e.value});
+  return impl_->views;
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot::Impl
 // ---------------------------------------------------------------------------
 
@@ -453,6 +488,12 @@ auto Snapshot::keys_from(const ReadOptions& opts,
 auto Snapshot::count_keys(BytesView from, BytesView to,
                           std::size_t limit) const -> std::size_t {
   return impl_->snap.count_keys(from, to, limit);
+}
+
+auto Snapshot::read_range(const ReadOptions& opts, RangeSpec range) const
+    -> RangeReader {
+  return RangeReader{std::make_unique<RangeReader::Impl>(
+      impl_->snap.read_range(to_module(opts), to_module(range)))};
 }
 
 auto Snapshot::riter_from(const ReadOptions& opts,
