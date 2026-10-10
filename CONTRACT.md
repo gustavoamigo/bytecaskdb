@@ -56,7 +56,7 @@ guarantees in this document hold when these do.
 | Condition | What is required | If it does not hold | Proved by |
 |---|---|---|---|
 | **Storage keeps what it confirmed** | Bytes an `fdatasync` reported written stay as written, and so does a synced directory entry. A failed `fdatasync` is handled (*`apply_batch`*); one that reports success for bytes it did not write is not detected. | `open` and `resume()` recover what the device holds. Damage they can see is refused (*`open`*); damage shaped like a crash is not. | n/a: an assumption, not a behaviour |
-| **Ranges are non-empty** | Every `[from, to)` — `del_range` on `DB` and `WritePlan`, `ensure_range_unchanged`, `Snapshot::count_keys` — has `from < to`. | `std::invalid_argument` before anything is written or read; a `WritePlan` is left as it was. A range-delete entry with `from >= to` written before this rule still recovers, and deletes nothing. | "Ranges: from >= to is refused, before anything is written" |
+| **Ranges are non-empty** | Every `[from, to)` — `del_range` on `DB` and `WritePlan`, `ensure_range_unchanged`, `Snapshot::count_keys`, `Snapshot::read_range` — has `from < to`. | `std::invalid_argument` before anything is written or read; a `WritePlan` is left as it was. A range-delete entry with `from >= to` written before this rule still recovers, and deletes nothing. | "Ranges: from >= to is refused, before anything is written", "read_range refuses what it does not read" |
 | **No vacuum during a manifest transfer** | `vacuum()` does not run between `create_manifest()` and the end of the file copy the manifest serves. | Vacuum unlinks files by path, so a copy that opens a listed file after the vacuum fails with `ENOENT`; a descriptor already open still reads the whole file, and the engine and the manifest's `Snapshot` are unaffected. Serialising the two is the caller's. | "a vacuum during a manifest transfer fails the copy with ENOENT, and nothing else" |
 
 ---
@@ -289,6 +289,21 @@ in ascending sequence order.
 
 ---
 
+## `read_range`
+
+`Snapshot::read_range` returns a `RangeReader`; each `next(max)` returns up
+to `max` entries of the range as `EntryView`s, and an empty span once the
+range is done. Today it reads forward, keys and values, with a non-empty
+`to`; any other `RangeSpec` throws `std::logic_error`.
+
+| Guarantee | Proved by |
+|---|---|
+| **The snapshot's entries, in key order.** When no call throws, a reader yields, over all its calls, exactly the live entries of `[from, to)` in the `Snapshot` it was taken from, each once, in ascending key order; at most `max` per call. A write after the `Snapshot` changes nothing it yields. | "read_range yields what iter_from yields, at every batch size", "read_range batch spans outlive writes and vacuum until next()" |
+| **A failed read is retried, not skipped.** A call that throws (`std::system_error` on I/O failure, `std::runtime_error` on a CRC mismatch) leaves the reader at the entry that failed: the next call reads that entry again. Entries the failed call had already read are not returned. | "read_range: a failed read is retried, not skipped" |
+| **`max` must be positive.** `next(0)` throws `std::invalid_argument`. | "read_range refuses what it does not read" |
+
+---
+
 ## View and span lifetimes
 
 Every read API either copies bytes out or lends a view of them. A lent
@@ -307,6 +322,7 @@ a live view shows, and never invalidates it either.
 |------|---------------|------------|
 | `Bytes& out` | `DB::get`, `Snapshot::get` | A copy into the caller's own vector, not a view |
 | `EntryView` (`key`, `value`) | `EntryIterator`, `ReverseEntryIterator`: `iter_from`, `riter_from` | Spans lent by the iterator |
+| `span<const EntryView>` | `RangeReader::next`: `read_range` | A batch of spans lent by the reader |
 | `const Bytes&` | `KeyIterator`, `ReverseKeyIterator`: `keys_from`, `rkeys_from` | A reference to a key the iterator owns |
 | `DataEntryView` (`key`, `value`) | `ChangeIterator`: `changes_since` | Spans lent by the iterator |
 | `Snapshot` | `DB::snapshot`, `create_manifest` | A frozen state |
@@ -315,11 +331,11 @@ a live view shows, and never invalidates it either.
 
 | Guarantee | Proved by |
 |---|---|
-| **Every engine event.** A live view stays valid and keeps its bytes across `resume()`, `vacuum()`, a file rotation, `set_mode()`, a concurrent write, `close()` and the destruction of the `DB`. Nothing the engine does to its files, including deleting one, reaches a view already lent, under any `io_backend`. | "mmap: resume() keeps reader spans valid", "vacuum unlinks stale file immediately, snapshot reads via open fd", "io_backend=BufferPool: an iterator outlives the DB with its spans", "io_backend=BufferPool: lent entry spans hold while readers evict", "resume() with live snapshot on degraded DB", "after close() every operation throws DbClosed; snapshots taken before stay readable" |
+| **Every engine event.** A live view stays valid and keeps its bytes across `resume()`, `vacuum()`, a file rotation, `set_mode()`, a concurrent write, `close()` and the destruction of the `DB`. Nothing the engine does to its files, including deleting one, reaches a view already lent, under any `io_backend`. | "mmap: resume() keeps reader spans valid", "read_range batch spans outlive writes and vacuum until next()", "vacuum unlinks stale file immediately, snapshot reads via open fd", "io_backend=BufferPool: an iterator outlives the DB with its spans", "io_backend=BufferPool: lent entry spans hold while readers evict", "resume() with live snapshot on degraded DB", "after close() every operation throws DbClosed; snapshots taken before stay readable" |
 | **Frozen.** A view shows what it showed when it was taken. A later write changes nothing it shows and invalidates nothing. | "Snapshot get is frozen at snapshot time", "Snapshot iter_from is frozen at snapshot time", "Snapshot riter_from is frozen at snapshot time", "count_keys on a snapshot ignores later writes", "DB snapshot isolation under concurrent writes" |
 | **Independent of its `Snapshot`.** An iterator taken from a `Snapshot`, or the one `changes_since` is given, holds what it needs itself. Destroying or moving the `Snapshot` mid-iteration is safe, and so is returning the iterator from the scope the `Snapshot` was local to. | "chaos soak: concurrent readers, writers and lifecycle" (walks `iter_from`, `riter_from` and `keys_from` after destroying their `Snapshot`) |
-| **Bound to its iterator, and no further.** A lent span or key reference belongs to the iterator that produced it: the next `operator++` replaces it, and the iterator's destruction ends it. Moving the iterator keeps it valid; the storage travels with the spans. `EntryIterator`, `ReverseEntryIterator` and `ChangeIterator` are move-only, so a copy can never separate a span from the storage it addresses. `ReverseKeyIterator` is copyable, as its sentinel is itself; a copy owns its own key, and a reference binds to the iterator it was taken from. | "entry iterators are move-only and still model input_iterator" |
+| **Bound to its iterator, and no further.** A lent span or key reference belongs to the iterator that produced it: the next `operator++` replaces it, and the iterator's destruction ends it. Moving the iterator keeps it valid; the storage travels with the spans. `EntryIterator`, `ReverseEntryIterator` and `ChangeIterator` are move-only, so a copy can never separate a span from the storage it addresses. `ReverseKeyIterator` is copyable, as its sentinel is itself; a copy owns its own key, and a reference binds to the iterator it was taken from. A batch from `RangeReader::next` belongs to its reader in the same way: the next `next()` replaces every span in it, the reader's destruction ends them, and moving the reader keeps them valid; `RangeReader` is move-only. | "entry iterators are move-only and still model input_iterator", "read_range batch spans outlive writes and vacuum until next()" |
 | **A copy is the caller's.** The `Bytes` that `get` fills is the caller's; no event reaches it, and the next `get` into the same vector overwrites it. | "DB get output-param round-trip" |
-| **Under `IoBackend::BufferPool`** a lent `EntryView` whose record lies in one resident cache frame pins that frame until the iterator advances; otherwise the bytes are copied into the iterator and nothing is pinned. Eviction skips a pinned frame and never waits for it, so a span held across a long loop body costs at most one frame, never a stall. | "BufferPool: a leased frame survives eviction pressure", "io_backend=BufferPool: lent entry spans hold while readers evict" |
+| **Under `IoBackend::BufferPool`** a lent `EntryView` whose record lies in one resident cache frame pins that frame until the iterator advances; otherwise the bytes are copied into the iterator and nothing is pinned. Eviction skips a pinned frame and never waits for it, so a span held across a long loop body costs at most one frame, never a stall. A `RangeReader` batch pins at most one frame per entry, so at most `max` frames, until the next `next()`; a pool with every frame pinned serves the rest of the batch by copying. | "BufferPool: a leased frame survives eviction pressure", "io_backend=BufferPool: lent entry spans hold while readers evict", "read_range yields what iter_from yields, at every batch size" |
 | **Under `IoBackend::Mmap`** a read the kernel cannot complete, a media error or a file truncated by something other than the engine, is `SIGBUS`, not `std::system_error`. The other back-ends throw. | "a sealed file truncated underneath: Mmap is SIGBUS", "a sealed file truncated underneath: Pread and BufferPool throw" |
 
