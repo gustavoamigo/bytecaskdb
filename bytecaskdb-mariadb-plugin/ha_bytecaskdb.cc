@@ -12,6 +12,7 @@
 #include "key.h"
 #include "bytecask.hpp"
 #include "bytecask_view.h"
+#include "degraded.h"
 #include "catalog.h"
 #include "key_encoding.h"
 #include "row_encoding.h"
@@ -406,6 +407,7 @@ int ha_bytecaskdb::delete_table(const char *name) {
   try {
     (void)g_db->apply_batch({.sync = true}, std::move(plan));
   } catch (const std::exception &) {
+    abort_if_degraded(*g_db, "drop table");
     return HA_ERR_GENERIC;
   }
 
@@ -435,6 +437,7 @@ int ha_bytecaskdb::delete_all_rows() {
   try {
     (void)g_db->apply_batch({.sync = true}, std::move(plan));
   } catch (const std::exception &) {
+    abort_if_degraded(*g_db, "truncate");
     return HA_ERR_GENERIC;
   }
 

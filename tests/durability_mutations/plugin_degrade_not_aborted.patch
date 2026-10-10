@@ -1,0 +1,18 @@
+The MariaDB plugin never aborts on a degraded engine: a write that degrades
+it fails the statement, and every later write fails until mariadbd restarts.
+Reverts #294. The guard is in mariadb_proof_tests (bytecaskdb-mariadb-plugin).
+Guarded-by: "prove_plugin__single_insert__pk_only__autocommit__ENGINE_DEGRADED"
+
+diff --git a/bytecaskdb-mariadb-plugin/bytecaskdb_plugin.cc b/bytecaskdb-mariadb-plugin/bytecaskdb_plugin.cc
+index f8a36cc..1cd09cf 100644
+--- a/bytecaskdb-mariadb-plugin/bytecaskdb_plugin.cc
++++ b/bytecaskdb-mariadb-plugin/bytecaskdb_plugin.cc
+@@ -688,7 +688,7 @@ bool catalog_copy_meta(uint32_t table_id, TableMeta &out) {
+ // ---------------------------------------------------------------------------
+ 
+ void abort_if_degraded(bytecask::DB &db, const char *what) noexcept {
+-  if (!db.is_degraded()) return;
++  if (true) return;
+   std::string reason;
+   try {
+     reason = db.degraded_reason();

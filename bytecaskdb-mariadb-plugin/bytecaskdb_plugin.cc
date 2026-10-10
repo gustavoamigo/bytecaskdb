@@ -20,12 +20,14 @@
 #include "catalog.h"
 #include "bytecaskdb_txn.h"
 #include "bytecask_view.h"
+#include "degraded.h"
 #include "key_encoding.h"
 
 #include <atomic>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -518,6 +520,7 @@ uint32_t catalog_alloc_table_id(bytecask::DB *db) {
       committed = db->apply_batch(bytecask::WriteOptions{.sync = true},
                                   std::move(plan)).has_value();
     } catch (const std::exception &e) {
+      abort_if_degraded(*db, "alloc_table_id");
       sql_print_error("ByteCaskDB: alloc_table_id apply failed: %s",
               e.what());
       return 0;
@@ -542,6 +545,7 @@ bool catalog_put_table_meta(bytecask::DB *db, const TableMeta &meta,
             as_view(key.data(), key.size()),
             as_view(val.data(), val.size()));
   } catch (const std::exception &e) {
+    abort_if_degraded(*db, "put_table_meta");
     sql_print_error("ByteCaskDB: put_table_meta failed: %s", e.what());
     return false;
   }
@@ -561,6 +565,7 @@ bool catalog_delete_table_meta(bytecask::DB *db, const char *name) {
     (void)db->del(bytecask::WriteOptions{.sync = true},
                   as_view(key.data(), key.size()));
   } catch (const std::exception &e) {
+    abort_if_degraded(*db, "delete_table_meta");
     sql_print_error("ByteCaskDB: delete_table_meta failed: %s",
             e.what());
     return false;
@@ -632,6 +637,7 @@ bool catalog_rename_table_meta(bytecask::DB *db,
     committed = db->apply_batch(bytecask::WriteOptions{.sync = true},
                                 std::move(plan)).has_value();
   } catch (const std::exception &e) {
+    abort_if_degraded(*db, "rename_table_meta");
     sql_print_error("ByteCaskDB: rename_table_meta apply failed: %s",
             e.what());
     return false;
@@ -675,6 +681,25 @@ bool catalog_copy_meta(uint32_t table_id, TableMeta &out) {
 }
 
 } // namespace bytecaskdb
+
+// ---------------------------------------------------------------------------
+// A degraded engine: abort (#294, degraded.h). Outside PLUGIN_TESTING's
+// exclusion, so the proof tests run the abort they check for.
+// ---------------------------------------------------------------------------
+
+void abort_if_degraded(bytecask::DB &db, const char *what) noexcept {
+  if (!db.is_degraded()) return;
+  std::string reason;
+  try {
+    reason = db.degraded_reason();
+  } catch (...) {
+    // Out of memory for the copy: abort without it.
+  }
+  sql_print_error("ByteCaskDB: %s: the engine refused writes after a write "
+                  "failure (%s). Aborting; recovery runs at restart.",
+                  what, reason.c_str());
+  std::abort();
+}
 
 #ifndef PLUGIN_TESTING
 
@@ -803,6 +828,9 @@ static void vacuum_loop() {
             .fragmentation_threshold = g_vacuum_fragmentation_threshold.load(
                 std::memory_order_relaxed)});
       } catch (const std::exception &e) {
+        // A vacuum that fails cleans up its own copy and leaves the engine
+        // writable; one that degraded it is a write failure like any other.
+        abort_if_degraded(*g_db, "vacuum");
         sql_print_error("ByteCaskDB: vacuum error: %s", e.what());
       }
       lk.lock();
@@ -857,6 +885,7 @@ static void sync_loop() {
                                 bytecask::WritePlan{});
         failing = false;
       } catch (const std::exception &e) {
+        abort_if_degraded(*g_db, "background sync");
         if (!failing) {
           sql_print_error("ByteCaskDB: background sync failed: %s", e.what());
         }
@@ -949,7 +978,15 @@ static void bytecaskdb_prepare_for_backup() {
   s_vacuum_idle_cv.wait(lk, [] { return !s_vacuum_in_progress; });
 
   lk.unlock();
-  auto manifest = g_db->create_manifest();
+  // create_manifest rotates the active file, a write like any other.
+  auto manifest = [] {
+    try {
+      return g_db->create_manifest();
+    } catch (const std::exception &) {
+      abort_if_degraded(*g_db, "backup");
+      throw;
+    }
+  }();
   std::string db_path = std::string(mysql_real_data_home) + "bytecaskdb";
   write_backup_manifest(db_path, manifest);
   lk.lock();

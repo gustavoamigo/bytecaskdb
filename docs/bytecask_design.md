@@ -53,6 +53,13 @@ cached state instead of resolving catalog maps per row. Row-count deltas are
 still tracked in the per-THD transaction object so rollback and failed commit
 can restore the counters exactly.
 
+The plugin never calls `resume()`. When an engine write throws and the
+engine is degraded afterwards, it logs the reason and aborts the server,
+as MyRocks does on a write I/O error and InnoDB on a failed `fsync`;
+`DB::open` at restart does the recovery `resume()` would have
+(`bytecaskdb-mariadb-plugin/degraded.h`, #294). Whether the engine keeps the
+degraded state and `resume()` at all is #432.
+
 ### C++ Public Header (`include/bytecask.hpp`)
 
 C++23 modules are not portable across compilation unit boundaries when linking external code. For consumers that link `libbytecask.a` without importing the modules (the MariaDB plugin, and anything else out of tree), a PIMPL header is provided:

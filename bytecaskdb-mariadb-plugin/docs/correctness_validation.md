@@ -57,9 +57,9 @@ A plugin operation is correct if and only if:
 
 3. **If `apply_batch` throws** — same as the conflict case, plus the
    exception is mapped to a sane `HA_ERR_*` and the transaction is
-   discarded. If the engine is degraded, subsequent SQL statements either
-   fail cleanly until the engine is resumed, or succeed if the plugin
-   surfaces `resume()`.
+   discarded. If the throw left the engine degraded, the plugin aborts the
+   server instead, as MyRocks does on a write I/O error, and recovery runs
+   at restart (#294).
 
 There is no valid intermediate state. A transaction either commits
 in full or is fully absent — both at the engine level *and* in the
@@ -289,25 +289,29 @@ When `apply_batch` returns `false`:
 - A retry of the same SQL statement against the post-conflict state
   is well-formed (no leaked state from the failed attempt).
 
-When `apply_batch` throws `DbDegraded`:
+When `apply_batch` throws and the engine is degraded afterwards — the
+write that failed degraded it, or an earlier one did and this one got
+`DbDegraded` — the plugin logs the reason with `sql_print_error` and aborts
+the server (`abort_if_degraded`, `degraded.h`; #294). It never calls
+`resume()`: MariaDB's engines do not stay up refusing writes, and
+`DB::open` at restart does what `resume()` would. The same check follows
+every engine write the plugin makes: commit, bulk-copy flush, catalog
+writes, DROP and TRUNCATE, the background sync and vacuum threads, and the
+backup manifest's rotation. A throw that leaves the engine healthy (a
+conflict, a bad argument) is reported to the statement as before.
 
-- The plugin returns a stable `HA_ERR_*` (e.g. `HA_ERR_CRASHED`).
-- Transaction state is discarded as in the conflict case.
-- Subsequent statements either fail cleanly or succeed after `resume()`.
+When the write is durable and published but the rotation after it fails
+(engine class H — the active file is sealed and the next cannot be
+created):
 
-When `apply_batch` returns successfully but the engine is degraded
-(engine class H — writes durable, but the active file cannot accept
-further appends):
-
-- The plugin returns success to MariaDB. The writes from this
-  transaction are committed and visible.
-- `is_degraded()` is *not* checked in the commit path. The degraded
-  state is surfaced to MariaDB on the next statement that attempts a
-  write, where `apply_batch` will throw `DbDegraded`.
-- Rationale: the writes succeeded; reporting them as failed would
-  contradict the engine's contract for class H. Eager checking would
-  also race with a concurrent `resume()`. Surfacing on the next
-  attempt is the cheapest correct option.
+- The engine degrades and `apply_batch` still throws, to every writer in
+  the group: their writes are in the data file, synced, and visible.
+- The plugin aborts, as for any throw that leaves the engine degraded. The
+  client sees its connection drop, not an error code, so the commit's
+  outcome is unknown to it; at restart the write is there.
+- `P-DEGRADE-1` (`tests/proof/prove_degraded.cpp`) opens the DB with
+  `max_file_bytes = 0`, so every commit rotates, fails the rotation with
+  `io_rotate_file_creation`, and checks the commit aborts.
 
 ### P-INV-7 — Catalog atomicity (plugin side)
 
@@ -376,9 +380,9 @@ engine fault classes already cover.
 |---|---|---|---|---|---|
 | SUCCESS | Yes | Yes | Bumped & kept | Yes | 0 |
 | OCC_CONFLICT | Yes | No (returns false) | Restored | Yes | 1213 |
-| ENGINE_DEGRADED | Yes | No (throws) | Restored | Yes | HA_ERR_CRASHED |
-| ENGINE_IO_FAIL | Yes | No (throws) | Restored | Yes | HA_ERR_CRASHED |
-| ENGINE_PARTIAL_COMMIT | Yes | Yes (engine class H) | Bumped & kept | Yes | 0 + degraded |
+| ENGINE_DEGRADED | Yes | No (throws) | n/a | n/a | none: the server aborts |
+| ENGINE_IO_FAIL | Yes | No (throws) | n/a | n/a | none: the server aborts |
+| ENGINE_PARTIAL_COMMIT | Yes | Yes, then throws (engine class H) | n/a | n/a | none: the server aborts |
 | PLUGIN_ROWCOUNT_BEFORE_COMMIT | No | No | Restored | Yes | HA_ERR_GENERIC |
 | PLUGIN_INDEX_HALF_BUFFERED | No | No | Restored | Yes | HA_ERR_GENERIC |
 | PLUGIN_DDL_MIDPOINT | Catalog only | Catalog only | n/a | n/a | HA_ERR_GENERIC; recovery cleans up |

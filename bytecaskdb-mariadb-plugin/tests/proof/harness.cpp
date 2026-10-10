@@ -7,12 +7,16 @@
 #include "key_encoding.h"
 #include "row_encoding.h"
 
+#include <csignal>
+#include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace bytecaskdb::testing {
 
-PluginTestHarness::PluginTestHarness(TableSpec spec) {
+PluginTestHarness::PluginTestHarness(TableSpec spec, bytecask::Options opts) {
   static std::atomic<int> counter{0};
   path_ = std::filesystem::temp_directory_path() /
           ("bcdb_proof_" + std::to_string(::getpid()) +
@@ -20,7 +24,7 @@ PluginTestHarness::PluginTestHarness(TableSpec spec) {
   std::filesystem::remove_all(path_);
   std::filesystem::create_directories(path_);
 
-  holder_ = std::make_unique<DBHolder>(path_);
+  holder_ = std::make_unique<DBHolder>(path_, opts);
   g_db = &holder_->db;
   bytecaskdb_hton = &hton_;
 
@@ -214,6 +218,33 @@ int PluginTestHarness::commit() {
   handler_->external_lock(&thd_, F_WRLCK);
   txn_ = static_cast<MariaDBTxn *>(thd_get_ha_data(&thd_, &hton_));
   return rc;
+}
+
+bool PluginTestHarness::aborts(const std::function<void()> &action) {
+  std::fflush(nullptr);
+  const pid_t pid = ::fork();
+  if (pid < 0) return false;
+  if (pid == 0) {
+    // The child: stderr to /dev/null, SIGABRT to its default, and a
+    // deadline, so an action that hangs fails the test instead of stalling it.
+    std::signal(SIGABRT, SIG_DFL);
+    if (const int null = ::open("/dev/null", O_WRONLY); null != -1)
+      ::dup2(null, STDERR_FILENO);
+    ::alarm(30);
+    try {
+      action();
+    } catch (...) {
+      ::_exit(2);  // threw: an uncaught throw would be SIGABRT, not the plugin
+    }
+    ::_exit(0);  // the action returned: the plugin did not abort
+  }
+  int status = 0;
+  if (::waitpid(pid, &status, 0) != pid) return false;
+  return WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+}
+
+bool PluginTestHarness::commit_aborts() {
+  return aborts([this] { (void)txn_->commit(&thd_, true); });
 }
 
 void PluginTestHarness::rollback() {

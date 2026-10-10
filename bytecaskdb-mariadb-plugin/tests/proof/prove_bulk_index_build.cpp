@@ -95,7 +95,9 @@ TEST_CASE("P-BULK-1: batches land mid-copy; commit persists every row",
   CHECK(h.row_counter() == kRows);
 }
 
-TEST_CASE("P-BULK-2: a flush I/O failure aborts the copy",
+// A flush that fails to append degrades the engine, and the plugin aborts
+// the server rather than carry on refusing writes (#294).
+TEST_CASE("P-BULK-2: a flush I/O failure aborts the server",
           "[proof][bulk][inv2]") {
   PluginTestHarness h(index_build_spec());
 
@@ -103,14 +105,11 @@ TEST_CASE("P-BULK-2: a flush I/O failure aborts the copy",
 
   ScopedFaultInjector guard("io_data_file_append");
 
-  int rc = 0;
-  for (int i = 0; i < 100 && rc == 0; ++i) {
-    rc = h.insert_row({i, i * 10, i * 100});
-  }
-  REQUIRE(rc != 0);  // a batch flush failed and the failure propagated
-
-  h.rollback();
-  REQUIRE_FALSE(h.txn().in_bulk_copy());
+  REQUIRE(h.aborts([&h] {
+    for (int i = 0; i < 100; ++i) {
+      (void)h.insert_row({i, i * 10, i * 100});
+    }
+  }));
 }
 
 TEST_CASE("P-BULK-3: an aborted copy's flushed rows are reclaimable",

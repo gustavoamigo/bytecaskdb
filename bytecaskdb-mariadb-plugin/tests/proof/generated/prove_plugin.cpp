@@ -38,12 +38,10 @@ TEST_CASE("prove_plugin__single_insert__pk_only__autocommit__ENGINE_DEGRADED", "
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__pk_only__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -57,12 +55,10 @@ TEST_CASE("prove_plugin__single_insert__pk_only__autocommit__ENGINE_IO_FAIL", "[
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__pk_only__multi_statement__SUCCESS", "[prove_plugin]") {
@@ -97,12 +93,10 @@ h.stmt_boundary();
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__pk_only__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -120,12 +114,10 @@ h.stmt_boundary();
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__pk_only__with_savepoint__SUCCESS", "[prove_plugin]") {
@@ -160,12 +152,10 @@ h.stmt_boundary();
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__pk_only__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -183,12 +173,10 @@ h.stmt_boundary();
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__one_nonunique__autocommit__SUCCESS", "[prove_plugin]") {
@@ -217,12 +205,10 @@ TEST_CASE("prove_plugin__single_insert__one_nonunique__autocommit__ENGINE_DEGRAD
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__one_nonunique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -237,12 +223,10 @@ TEST_CASE("prove_plugin__single_insert__one_nonunique__autocommit__ENGINE_IO_FAI
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__one_nonunique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -303,12 +287,10 @@ h.stmt_boundary();
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__one_nonunique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -327,12 +309,10 @@ h.stmt_boundary();
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__one_nonunique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -397,12 +377,10 @@ h.stmt_boundary();
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__one_nonunique__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -421,12 +399,10 @@ h.stmt_boundary();
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__one_nonunique__with_savepoint__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -483,12 +459,10 @@ TEST_CASE("prove_plugin__single_insert__one_unique__autocommit__ENGINE_DEGRADED"
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__one_unique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -503,12 +477,10 @@ TEST_CASE("prove_plugin__single_insert__one_unique__autocommit__ENGINE_IO_FAIL",
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__one_unique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -569,12 +541,10 @@ h.stmt_boundary();
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__one_unique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -593,12 +563,10 @@ h.stmt_boundary();
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__one_unique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -663,12 +631,10 @@ h.stmt_boundary();
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__one_unique__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -687,12 +653,10 @@ h.stmt_boundary();
 
   int rc = h.insert_row({100, 200, 300});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_insert__one_unique__with_savepoint__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -778,12 +742,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__pk_only__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -801,12 +763,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__pk_only__multi_statement__SUCCESS", "[prove_plugin]") {
@@ -876,12 +836,10 @@ h.stmt_boundary();
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__pk_only__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -903,12 +861,10 @@ h.stmt_boundary();
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__pk_only__with_savepoint__SUCCESS", "[prove_plugin]") {
@@ -978,12 +934,10 @@ h.stmt_boundary();
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__pk_only__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -1005,12 +959,10 @@ h.stmt_boundary();
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__one_nonunique__autocommit__SUCCESS", "[prove_plugin]") {
@@ -1071,12 +1023,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__one_nonunique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -1095,12 +1045,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__one_nonunique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -1201,12 +1149,10 @@ h.stmt_boundary();
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__one_nonunique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -1229,12 +1175,10 @@ h.stmt_boundary();
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__one_nonunique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -1339,12 +1283,10 @@ h.stmt_boundary();
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__one_nonunique__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -1367,12 +1309,10 @@ h.stmt_boundary();
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__one_nonunique__with_savepoint__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -1465,12 +1405,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__one_unique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -1489,12 +1427,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__one_unique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -1595,12 +1531,10 @@ h.stmt_boundary();
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__one_unique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -1623,12 +1557,10 @@ h.stmt_boundary();
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__one_unique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -1733,12 +1665,10 @@ h.stmt_boundary();
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__one_unique__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -1761,12 +1691,10 @@ h.stmt_boundary();
 
   int rc = h.delete_row({10, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_delete__one_unique__with_savepoint__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -1856,12 +1784,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__pk_only__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -1879,12 +1805,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__pk_only__multi_statement__SUCCESS", "[prove_plugin]") {
@@ -1954,12 +1878,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__pk_only__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -1981,12 +1903,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__pk_only__with_savepoint__SUCCESS", "[prove_plugin]") {
@@ -2056,12 +1976,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__pk_only__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -2083,12 +2001,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__autocommit__SUCCESS", "[prove_plugin]") {
@@ -2149,12 +2065,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -2173,12 +2087,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -2279,12 +2191,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -2307,12 +2217,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -2417,12 +2325,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -2445,12 +2351,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__one_nonunique__with_savepoint__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -2543,12 +2447,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__one_unique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -2567,12 +2469,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__one_unique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -2673,12 +2573,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__one_unique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -2701,12 +2599,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__one_unique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -2811,12 +2707,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__one_unique__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -2839,12 +2733,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 99, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_index_change__one_unique__with_savepoint__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -2934,12 +2826,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__pk_only__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -2957,12 +2847,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__pk_only__multi_statement__SUCCESS", "[prove_plugin]") {
@@ -3032,12 +2920,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__pk_only__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -3059,12 +2945,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__pk_only__with_savepoint__SUCCESS", "[prove_plugin]") {
@@ -3134,12 +3018,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__pk_only__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -3161,12 +3043,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__autocommit__SUCCESS", "[prove_plugin]") {
@@ -3227,12 +3107,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -3251,12 +3129,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -3357,12 +3233,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -3385,12 +3259,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -3495,12 +3367,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -3523,12 +3393,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__one_nonunique__with_savepoint__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -3621,12 +3489,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -3645,12 +3511,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -3751,12 +3615,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -3779,12 +3641,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -3889,12 +3749,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__with_savepoint__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -3917,12 +3775,10 @@ h.stmt_boundary();
 
   int rc = h.update_row({10, 20, 30}, {10, 20, 99});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_no_index_change__one_unique__with_savepoint__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -4012,12 +3868,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {50, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_pk_change__pk_only__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -4035,12 +3889,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {50, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_pk_change__one_nonunique__autocommit__SUCCESS", "[prove_plugin]") {
@@ -4101,12 +3953,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {50, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_pk_change__one_nonunique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -4125,12 +3975,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {50, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_pk_change__one_nonunique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -4219,12 +4067,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {50, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_pk_change__one_unique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -4243,12 +4089,10 @@ REQUIRE(h.commit() == 0);
 
   int rc = h.update_row({10, 20, 30}, {50, 20, 30});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 1);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__single_update_pk_change__one_unique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -4307,12 +4151,10 @@ TEST_CASE("prove_plugin__multi_row_insert__pk_only__autocommit__ENGINE_DEGRADED"
     if (rc == 0) rc = h.insert_row({101, 201, 301});
     if (rc == 0) rc = h.insert_row({102, 202, 302});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__multi_row_insert__pk_only__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -4328,12 +4170,10 @@ TEST_CASE("prove_plugin__multi_row_insert__pk_only__autocommit__ENGINE_IO_FAIL",
     if (rc == 0) rc = h.insert_row({101, 201, 301});
     if (rc == 0) rc = h.insert_row({102, 202, 302});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__multi_row_insert__pk_only__multi_statement__SUCCESS", "[prove_plugin]") {
@@ -4372,12 +4212,10 @@ h.stmt_boundary();
     if (rc == 0) rc = h.insert_row({101, 201, 301});
     if (rc == 0) rc = h.insert_row({102, 202, 302});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__multi_row_insert__pk_only__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -4397,12 +4235,10 @@ h.stmt_boundary();
     if (rc == 0) rc = h.insert_row({101, 201, 301});
     if (rc == 0) rc = h.insert_row({102, 202, 302});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__multi_row_insert__one_nonunique__autocommit__SUCCESS", "[prove_plugin]") {
@@ -4435,12 +4271,10 @@ TEST_CASE("prove_plugin__multi_row_insert__one_nonunique__autocommit__ENGINE_DEG
     if (rc == 0) rc = h.insert_row({101, 201, 301});
     if (rc == 0) rc = h.insert_row({102, 202, 302});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__multi_row_insert__one_nonunique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -4457,12 +4291,10 @@ TEST_CASE("prove_plugin__multi_row_insert__one_nonunique__autocommit__ENGINE_IO_
     if (rc == 0) rc = h.insert_row({101, 201, 301});
     if (rc == 0) rc = h.insert_row({102, 202, 302});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__multi_row_insert__one_nonunique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -4529,12 +4361,10 @@ h.stmt_boundary();
     if (rc == 0) rc = h.insert_row({101, 201, 301});
     if (rc == 0) rc = h.insert_row({102, 202, 302});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__multi_row_insert__one_nonunique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -4555,12 +4385,10 @@ h.stmt_boundary();
     if (rc == 0) rc = h.insert_row({101, 201, 301});
     if (rc == 0) rc = h.insert_row({102, 202, 302});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__multi_row_insert__one_nonunique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -4623,12 +4451,10 @@ TEST_CASE("prove_plugin__multi_row_insert__one_unique__autocommit__ENGINE_DEGRAD
     if (rc == 0) rc = h.insert_row({101, 201, 301});
     if (rc == 0) rc = h.insert_row({102, 202, 302});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__multi_row_insert__one_unique__autocommit__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -4645,12 +4471,10 @@ TEST_CASE("prove_plugin__multi_row_insert__one_unique__autocommit__ENGINE_IO_FAI
     if (rc == 0) rc = h.insert_row({101, 201, 301});
     if (rc == 0) rc = h.insert_row({102, 202, 302});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__multi_row_insert__one_unique__autocommit__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {
@@ -4717,12 +4541,10 @@ h.stmt_boundary();
     if (rc == 0) rc = h.insert_row({101, 201, 301});
     if (rc == 0) rc = h.insert_row({102, 202, 302});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__multi_row_insert__one_unique__multi_statement__ENGINE_IO_FAIL", "[prove_plugin]") {
@@ -4743,12 +4565,10 @@ h.stmt_boundary();
     if (rc == 0) rc = h.insert_row({101, 201, 301});
     if (rc == 0) rc = h.insert_row({102, 202, 302});
 
-  int commit_rc = h.commit();
-
-  // DML buffers successfully; fault fires at commit.
+  // DML buffers successfully; the fault degrades the engine at
+  // commit, and the plugin aborts.
   REQUIRE(rc == 0);
-  REQUIRE(commit_rc != 0);
-  REQUIRE(h.row_counter() == 0);
+  REQUIRE(h.commit_aborts());
 }
 
 TEST_CASE("prove_plugin__multi_row_insert__one_unique__multi_statement__PLUGIN_INDEX_HALF_BUFFERED", "[prove_plugin]") {

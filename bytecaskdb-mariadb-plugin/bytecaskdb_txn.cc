@@ -4,6 +4,7 @@
 // bytecaskdb_txn.cc — MariaDBTxn implementation.
 
 #include "bytecaskdb_txn.h"
+#include "degraded.h"
 #include "ha_bytecaskdb.h"
 #include "key_encoding.h"
 
@@ -354,6 +355,7 @@ int MariaDBTxn::commit(THD * /*thd*/, bool all) {
     reset();
     return 0;
   } catch (const std::exception &e) {
+    abort_if_degraded(*db_, "commit");
     fprintf(stderr, "[bytecaskdb] commit failed: %s\n", e.what());
     revert_row_count_deltas();
     reset();
@@ -525,6 +527,7 @@ int MariaDBTxn::bulk_flush(bool sync) {
     }
     return 0;
   } catch (const std::exception &e) {
+    abort_if_degraded(*db_, "bulk flush");
     fprintf(stderr, "[bytecaskdb] bulk flush failed: %s\n", e.what());
     bulk_plan_ = bytecask::WritePlan{};
     bulk_bytes_ = 0;
