@@ -45,6 +45,7 @@ export struct HintEntry {
   std::span<const std::byte> key;
   std::uint32_t value_size{};
   std::span<const std::byte> end_key; // non-empty only for RangeDel
+  std::uint64_t marker_id{};          // non-zero only for ChangeMarker
 };
 
 // Serializes one hint entry into a flat byte vector (header + key, no CRC).
@@ -82,6 +83,25 @@ export auto serialize_range_del_entry(std::uint64_t sequence,
   w.put_bytes(start_key);
   w.put(narrow<std::uint16_t>(end_key.size()));
   w.put_bytes(end_key);
+  return buf;
+}
+
+// Serializes a ChangeMarker hint entry: header with an empty key and
+// value_size = 8, then the marker's id as [id: u64 LE]. Recovery rebuilds the
+// engine's marker list from hints alone, so the id travels with the entry
+// the way a RangeDel's end key does.
+export auto serialize_change_marker_entry(std::uint64_t sequence,
+                                          std::uint64_t file_offset,
+                                          std::uint64_t id)
+    -> std::vector<std::byte> {
+  std::vector<std::byte> buf(kHintHeaderSize + sizeof(std::uint64_t));
+  ByteWriter w{buf};
+  w.put(sequence);
+  w.put(static_cast<std::uint8_t>(EntryType::ChangeMarker));
+  w.put(file_offset);
+  w.put(static_cast<std::uint32_t>(kChangeMarkerIdBytes));
+  w.put(static_cast<std::uint16_t>(0));
+  w.put(id);
   return buf;
 }
 
@@ -126,12 +146,24 @@ export auto deserialize_entry(std::span<const std::byte> buf)
         trailer_offset + sizeof(std::uint16_t), end_key_len);
   }
 
+  // For ChangeMarker, the id is appended after the (empty) key.
+  std::uint64_t marker_id = 0;
+  if (entry_type == EntryType::ChangeMarker) {
+    if (buf.size() < total + sizeof(std::uint64_t)) {
+      throw std::runtime_error{
+          "deserialize_entry (hint): truncated ChangeMarker id"};
+    }
+    marker_id = read_le<std::uint64_t>(buf, total);
+    total += sizeof(std::uint64_t);
+  }
+
   return {HintEntry{.sequence    = sequence,
                     .entry_type  = entry_type,
                     .file_offset = file_offset,
                     .key         = key_span,
                     .value_size  = value_size,
-                    .end_key     = end_key_span},
+                    .end_key     = end_key_span,
+                    .marker_id   = marker_id},
           total};
 }
 

@@ -73,13 +73,17 @@ Both file formats share the same entry type discriminant:
 | 0x03  | `BulkBegin` | Start-of-batch marker — key and value are empty. |
 | 0x04  | `BulkEnd`   | End-of-batch marker — key and value are empty.  |
 | 0x05  | `RangeDel`  | Range tombstone — key is start_key, value is end_key. Deletes all keys in [start, end). |
+| 0x06  | `ChangeMarker` | A promotion — key is empty, value is the marker's 8-byte id. Names the history from this sequence on. |
 
 A zero byte in the `EntryType` field always means corrupt or uninitialized
 storage. No valid type maps to 0, so the scanner can detect truncated writes
-without a separate magic number.
+without a separate magic number. Any other value outside this table is
+damage: the scanner stops at it as it does at a failed CRC, so in the newest
+file it is cut with the tail, and anywhere else the open is refused.
 
-`BulkBegin` and `BulkEnd` appear only in data files. Hint files contain only
-`Put`, `Delete`, and `RangeDel` entries.
+Every type appears in both files. A hint file carries `BulkBegin` and
+`BulkEnd` with no key, and a `ChangeMarker` with its id (see the hint entry
+extensions below).
 
 ---
 
@@ -117,8 +121,8 @@ Total entry size: `15 + key_size + value_size + 4` bytes.
 |--------|------|--------------|--------|-------------|-------------|
 | 0      | 8    | `sequence`   | u64 LE | Globally monotonic, never 0 | Log Sequence Number (LSN) |
 | 8      | 1    | `entry_type` | u8     | One of the values in the EntryType table | Entry kind |
-| 9      | 2    | `key_size`   | u16 LE | 0 for `BulkBegin`/`BulkEnd`; 1–65535 otherwise | Key length in bytes |
-| 11     | 4    | `value_size` | u32 LE | 0 for `Delete`/`BulkBegin`/`BulkEnd`; for `RangeDel`, holds `end_key` length | Value length in bytes |
+| 9      | 2    | `key_size`   | u16 LE | 0 for `BulkBegin`/`BulkEnd`/`ChangeMarker`; 1–65535 otherwise | Key length in bytes |
+| 11     | 4    | `value_size` | u32 LE | 0 for `Delete`/`BulkBegin`/`BulkEnd`; 8 for `ChangeMarker`; for `RangeDel`, holds `end_key` length | Value length in bytes |
 
 **Hard limits**: The wire format imposes absolute ceilings of 65,535 bytes for keys (u16) and 4,294,967,295 bytes for values (u32); the engine's in-memory packing lowers the value ceiling to 268,435,455 bytes (2^28 − 1), and a data file's entries all start below 2^32 bytes. The engine enforces configurable limits via `Options::max_key_bytes` (default 4 KiB) and `Options::max_value_bytes` (default 4 MiB), validated at the API boundary before any data is written to disk.
 
@@ -174,10 +178,12 @@ On disk: `entry_type = 0x05`, `key_size = start_key length`,
 Hint files are compact companion files to sealed data files. Each entry stores
 enough metadata and the full key to reconstruct the in-memory key directory
 without reading value bytes. `Put`, `Delete` and `RangeDel` entries are
-written, and `BulkBegin`/`BulkEnd` markers are carried through with no key.
+written, `BulkBegin`/`BulkEnd` markers are carried through with no key, and a
+`ChangeMarker` with no key and its id, so recovery rebuilds the engine's list
+of markers from hints alone.
 
-Ordering: the keyless markers and the range tombstones come first, in
-data-file append order, then the `Put` and `Delete` entries sorted by key
+Ordering: the keyless markers, change markers and the range tombstones come
+first, in data-file append order, then the `Put` and `Delete` entries sorted by key
 ascending and, within one key, by sequence descending. One key may appear more
 than once — the file is not deduplicated. Sorting is what lets recovery
 bulk-load the key directory instead of inserting key by key, and it costs one
@@ -262,9 +268,9 @@ Total entry size: `23 + key_len` bytes.
 | Offset | Size | Field         | Type   | Description |
 |--------|------|---------------|--------|-------------|
 | 0      | 8    | `sequence`    | u64 LE | LSN copied from the data file entry |
-| 8      | 1    | `entry_type`  | u8     | `Put` (0x01), `Delete` (0x02), or `RangeDel` (0x05) |
+| 8      | 1    | `entry_type`  | u8     | Any value of the EntryType table |
 | 9      | 8    | `file_offset` | u64 LE | Byte offset of the entry in the companion `.data` file |
-| 17     | 4    | `value_size`  | u32 LE | Value length in bytes (0 for `Delete`) |
+| 17     | 4    | `value_size`  | u32 LE | Value length in bytes (0 for `Delete` and the batch markers, 8 for `ChangeMarker`) |
 | 21     | 2    | `key_len`     | u16 LE | Length of the key bytes that follow this header |
 
 ### File Trailer
@@ -275,6 +281,19 @@ Total entry size: `23 + key_len` bytes.
 
 Reading a hint file with a mismatched trailer CRC is a hard error. The engine
 discards the hint file and regenerates it from the raw data file during recovery.
+
+### Change Marker (ChangeMarker)
+
+A promotion (`set_mode(Mode::Leader)` on a follower) appends one entry of type
+`0x06` with an empty key and an 8-byte little-endian value, a random id. The
+entry's own sequence and that id together identify the history from this
+sequence on: two databases holding the same marker at a sequence hold the
+same history up to it. A leader that was never promoted holds no marker.
+Vacuum copies every change marker and never removes a file holding one, so a
+database's marker at any sequence is the same after any vacuum.
+
+On disk: `entry_type = 0x06`, `key_size = 0`, `value_size = 8`, then the id.
+Total size: 15 + 8 + 4 = 27 bytes.
 
 ### Size Constants
 
@@ -301,6 +320,21 @@ The `value_size` field in the hint header holds the end key length (same as in
 the data file).
 
 Total RangeDel hint entry size: `23 + key_len + 2 + end_key_len` bytes.
+
+### ChangeMarker Hint Entry Extension
+
+When `entry_type == ChangeMarker` (0x06), `key_len` is 0, `value_size` is 8,
+and the entry appends the marker's id after the header, as the data file
+entry holds it in its value:
+
+```
+ [normal hint header: 23 bytes]
+ [id:                 u64 LE, 8 bytes]
+```
+
+Total ChangeMarker hint entry size: 31 bytes. The hint file's version does
+not change: a new entry type with its own extension is how `RangeDel` was
+added, and a hint written before change markers existed holds none.
 
 ---
 

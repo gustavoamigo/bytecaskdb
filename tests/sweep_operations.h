@@ -323,14 +323,14 @@ inline auto ingest_operation() -> Operation {
 
   return {.name = "ingest",
           .opts = {.initial_mode = Mode::Follower},
-          .setup = [first](DB &db) { db.ingest(first->views()); },
+          .setup = [first](DB &db) { db.ingest(first->header, first->views()); },
           .run =
               [second](DB &db) {
                 auto views = [&] {
                   const SuspendSyscallFaults inputs;
                   return second->views();
                 }();
-                db.ingest(views);
+                db.ingest(second->header, views);
                 return db.durable_sequence() ==
                        second->entries.back().sequence;
               },
@@ -348,7 +348,7 @@ inline auto ingest_operation() -> Operation {
                 put_only["k1"] = bytes("over");
                 return std::vector<KeyValues>{put_only};
               },
-          .retry = [second](DB &db) { db.ingest(second->views()); }};
+          .retry = [second](DB &db) { db.ingest(second->header, second->views()); }};
 }
 
 // resume() itself under fault, from each state a failed write leaves: the

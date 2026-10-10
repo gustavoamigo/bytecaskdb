@@ -1950,6 +1950,14 @@ private:
     if (offset + kHeaderSize > end) return;
     const auto hdr = bytecask::read_header(buffered(offset, kHeaderSize));
     if (hdr.sequence == 0) return;
+    // An unknown type byte is damage, as a failed CRC is.
+    if (!is_known_entry_type(hdr.entry_type)) {
+      if (on_damage_ == OnDamage::Stop) return;
+      throw std::runtime_error{std::format(
+          "bytecask: unknown entry type {} at offset {} of '{}'",
+          static_cast<unsigned>(hdr.entry_type), offset,
+          file_->path().string())};
+    }
     const auto total = record_bytes(hdr);
     if (offset + total > end) return;
     const auto raw = buffered(offset, total);

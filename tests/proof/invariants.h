@@ -637,7 +637,7 @@ inline auto count_structural_entries(const DB &db) -> std::map<EntryType, int> {
                                   {EntryType::BulkEnd, 0},
                                   {EntryType::RangeDel, 0}};
   auto snap = db.snapshot();
-  for (const auto &e : db.changes_since(snap, 0)) {
+  for (const auto &e : db.changes_since(snap, 0).entries) {
     auto it = counts.find(e.entry_type);
     if (it != counts.end()) ++it->second;
   }
@@ -832,9 +832,9 @@ inline void assert_vacuum_recoverable(const std::filesystem::path &dir,
 
 // ---- Replication helpers ----------------------------------------------------
 
-// Owned copies of entries collected from a ChangeIterator. The views
-// returned by the iterator are transient — they point into the
-// iterator's internal buffer and are invalidated on advance.
+// Owned copies of a changes_since slice: its header and its entries. The
+// views the iterator returns are transient — they point into the iterator's
+// internal buffer and are invalidated on advance.
 struct OwnedEntries {
   struct Entry {
     std::uint64_t sequence;
@@ -842,6 +842,7 @@ struct OwnedEntries {
     Bytes key;
     Bytes value;
   };
+  ChangeHeader header;
   std::vector<Entry> entries;
 
   // Builds a DataEntryView span referencing the owned data.
@@ -853,13 +854,32 @@ struct OwnedEntries {
     }
     return v;
   }
+
+  // The header of the slice that starts after the first n entries, as the
+  // source would have produced it: from = the n-th entry's sequence, marker
+  // = the last ChangeMarker among the first n entries, or this slice's.
+  [[nodiscard]] auto header_after(std::size_t n) const -> ChangeHeader {
+    auto h = header;
+    for (std::size_t i = 0; i < n && i < entries.size(); ++i) {
+      h.from_sequence = entries[i].sequence;
+      if (entries[i].entry_type == EntryType::ChangeMarker) {
+        std::uint64_t id = 0;
+        for (std::size_t b = 0; b < 8 && b < entries[i].value.size(); ++b)
+          id |= static_cast<std::uint64_t>(
+                    std::to_integer<std::uint8_t>(entries[i].value[b]))
+                << (8 * b);
+        h.marker = {entries[i].sequence, id};
+      }
+    }
+    return h;
+  }
 };
 
-// Collects all entries from a changes_since range into owned storage.
-template <typename Range>
-inline auto collect_changes(Range &&range) -> OwnedEntries {
+// Collects a changes_since slice, header and entries, into owned storage.
+inline auto collect_changes(ChangeBatch batch) -> OwnedEntries {
   OwnedEntries result;
-  for (const auto &e : range) {
+  result.header = batch.header;
+  for (const auto &e : batch.entries) {
     result.entries.push_back({
         e.sequence,
         e.entry_type,
@@ -900,6 +920,7 @@ inline void apply_replicated(std::map<std::string, Bytes> &kv, EntryType type,
     }
     case EntryType::BulkBegin:
     case EntryType::BulkEnd:
+    case EntryType::ChangeMarker:
       break;
   }
 }
@@ -925,7 +946,7 @@ inline auto capture_replication_baseline(const DB &db,
   }
   // Respects the durable_seq boundary: unsync'd entries are excluded.
   auto snap = db.snapshot();
-  for (const auto &e : db.changes_since(snap, from)) {
+  for (const auto &e : db.changes_since(snap, from).entries) {
     apply_replicated(bl.key_values, e.entry_type, e.key, e.value);
   }
   return bl;
@@ -946,7 +967,7 @@ inline void seed_follower(DB &follower, const OwnedEntries &history,
     seed.push_back({e.sequence, e.entry_type, e.key, e.value});
   }
   REQUIRE_FALSE(in_batch);
-  follower.ingest(seed);
+  follower.ingest(history.header, seed);
   REQUIRE(follower.durable_sequence() == upto);
 }
 

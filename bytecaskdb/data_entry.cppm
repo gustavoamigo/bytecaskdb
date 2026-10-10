@@ -121,6 +121,15 @@ export auto parse_header_and_verify(std::span<const std::byte> buf) -> EntryHead
 
   const auto header = read_header(buf);
 
+  // A type byte outside the known set is damage, like a bad CRC: refused
+  // here rather than left to fall through an exhaustive switch downstream.
+  // mcdc-exempt(C1): the file sweep refuses an unknown type before any
+  // record is read by its location, so a read through a key directory entry
+  // never meets one; this guards the parser on its own.
+  if (!is_known_entry_type(header.entry_type)) {
+    throw std::runtime_error{"parse_header_and_verify: unknown entry type"};
+  }
+
   if (buf.size() !=
       kHeaderSize + header.key_size + header.value_size + kCrcSize) {
     throw std::runtime_error{"parse_header_and_verify: buffer size mismatch"};
