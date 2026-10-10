@@ -1,0 +1,17 @@
+Drops store_state's check that a published state owes no fdatasync, so a
+state making sync = true writes visible before they are durable is published.
+Guarded-by: "pipeline: publishing a state that owes an fdatasync degrades the engine"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index d3f22be..47bd8b7 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -4953,7 +4953,7 @@ void DB::store_state(const std::shared_ptr<const EngineState> &old_state,
+   }
+   // Durability before visibility: a published state never contains a
+   // sync=true write that fdatasync has not confirmed.
+-  if (new_state->sync_requested_seq > new_state->durable_seq) {
++  if (false) {
+     deem_as_degraded(std::format(
+         "invariant violation: publishing sync_requested_seq {} above "
+         "durable_seq {}",
