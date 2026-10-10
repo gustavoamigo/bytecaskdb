@@ -6720,7 +6720,12 @@ public:
        std::uint64_t durable_sequence,
        std::size_t max_bytes)
     : state_(std::move(state)), from_sequence_(from_sequence),
-      durable_sequence_(durable_sequence), max_bytes_(max_bytes) {
+      durable_sequence_(durable_sequence),
+      // Counted in 64 bits whatever size_t is, so a scan past 4 GiB on a
+      // 32-bit build neither wraps the count nor ends an unlimited slice.
+      max_bytes_(max_bytes == kUnlimitedBytes
+                     ? std::numeric_limits<std::uint64_t>::max()
+                     : static_cast<std::uint64_t>(max_bytes)) {
 
     // Build sorted file list — O(num_files), typically tiny.
     for (const auto [file_id, stats] : state_->file_stats.all()) {
@@ -6821,8 +6826,8 @@ private:
   std::shared_ptr<const EngineState> state_;
   std::uint64_t from_sequence_;
   std::uint64_t durable_sequence_;
-  std::size_t max_bytes_;
-  std::size_t sent_{0};     // bytes of the entries yielded so far
+  std::uint64_t max_bytes_;
+  std::uint64_t sent_{0};   // bytes of the entries yielded so far
   bool in_batch_{false};    // inside a BulkBegin..BulkEnd of the current file
   bool included_{false};    // whether the current unit is in the slice
   bool done_{false};        // the slice ended: cut, or past durable
@@ -6951,9 +6956,19 @@ void DB::ingest(const ChangeHeader &header,
           "ingest: sequence {} exceeds the limit of {}", e.sequence,
           KeyDirEntry::kMaxSequence)};
     }
+    // A batch is whole or nothing: a BulkBegin inside one, or a BulkEnd
+    // with none open, is a slice cut inside a batch somewhere else.
     if (e.entry_type == EntryType::BulkBegin) {
+      if (in_batch) {
+        throw std::invalid_argument{
+            "ingest: a BulkBegin inside an atomic batch"};
+      }
       in_batch = true;
       batch_bytes = 0;
+    }
+    if (e.entry_type == EntryType::BulkEnd && !in_batch) {
+      throw std::invalid_argument{
+          "ingest: a BulkEnd with no atomic batch open"};
     }
     if (in_batch) {
       batch_bytes += entry_size(e.key.size(), e.value.size());
