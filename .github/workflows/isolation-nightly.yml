@@ -80,130 +80,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # PROBE for #447, not for merging: does a chaos failure directory reach
+      # the uploaded artifact? Two failures are made, then uploaded with the
+      # same paths the real workflow uses.
       - name: Install dependencies
         run: |
-          dnf install -y \
-            clang llvm llvm-devel lld \
-            libcxx libcxx-devel \
-            xmake \
-            python3-pip python3-devel \
-            git ninja-build \
-            java-21-openjdk-headless \
-            graphviz \
-            fuse3 fuse3-libs
-          # xmake f loads every target, and bytecaskdb_python's on_load asks
-          # nanobind for its include dir. graphviz: elle-cli renders every
-          # cycle it finds with dot, including the write skew the unguarded
-          # configuration is expected to show, and crashes without it.
-          pip3 install nanobind mfusepy
+          dnf install -y python3-pip fuse3 fuse3-libs
+          pip3 install mfusepy
 
-      - name: Cache elle-cli
-        id: elle-cache
-        uses: actions/cache@v4
-        with:
-          path: elle-cli.jar
-          key: elle-cli-${{ env.ELLE_CLI_REF }}
-
-      - name: Build elle-cli
-        if: steps.elle-cache.outputs.cache-hit != 'true'
+      - name: Probe
         run: |
-          curl -fsSLo /usr/local/bin/lein \
-            https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein
-          chmod +x /usr/local/bin/lein
-          git clone https://github.com/ligurio/elle-cli "$RUNNER_TEMP/elle-cli"
-          cd "$RUNNER_TEMP/elle-cli"
-          git checkout "$ELLE_CLI_REF"
-          lein uberjar
-          cp target/elle-cli-*-standalone.jar "$GITHUB_WORKSPACE/elle-cli.jar"
-
-      - name: Configure xmake
-        run: |
-          RESOURCE_DIR=$(clang --print-resource-dir)
-          SAN=""
-          if [ -n "${{ matrix.sanitizer }}" ]; then SAN="--sanitizer=${{ matrix.sanitizer }}"; fi
-          xmake f --toolchain=clang \
-            --cxflags="-resource-dir=${RESOURCE_DIR}" \
-            $SAN -m ${{ matrix.mode }} -y
-
-      - name: Build
-        run: xmake build isolation_history
-
-      - name: Run isolation check
-        env:
-          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
-          ROUNDS: ${{ github.event.inputs.rounds || '4' }}
-          SEED: ${{ github.event.inputs.seed || '' }}
-        run: |
-          ARGS="--binary build/linux/x86_64/${{ matrix.mode }}/isolation_history"
-          ARGS="$ARGS --elle-jar elle-cli.jar --rounds $ROUNDS"
-          ARGS="$ARGS --txns ${{ matrix.txns }} --out $RUNNER_TEMP/isolation"
-          if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
-          python3 scripts/run_isolation_check.py $ARGS
-
-      # Guarded and unguarded with the writer process SIGKILLed and reopened
-      # ten times per history (#176): recovery under concurrent group-commit
-      # writers.
-      - name: Run kill check
-        env:
-          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
-          ROUNDS: ${{ github.event.inputs.kill_rounds || '4' }}
-          SEED: ${{ github.event.inputs.seed || '' }}
-        run: |
-          ARGS="--binary build/linux/x86_64/${{ matrix.mode }}/isolation_history"
-          ARGS="$ARGS --elle-jar elle-cli.jar --kill --rounds $ROUNDS"
-          ARGS="$ARGS --txns ${{ matrix.txns }} --out $RUNNER_TEMP/isolation-kill"
-          if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
-          python3 scripts/run_isolation_check.py $ARGS
-
-      # Guarded and unguarded under the chaos rig (#232): chaosfs cuts the
-      # power, fails fdatasync with Linux semantics, evicts, fills the disk,
-      # stalls, and each writer process ends in a power cut, SIGKILL or clean
-      # close. Each episode's history must pass the cross-check and Elle.
-      - name: Run chaos check
-        env:
-          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
-          MINUTES: ${{ github.event.inputs.chaos_minutes || '10' }}
-          SEED: ${{ github.event.inputs.seed || github.run_id }}
-        run: |
-          for config in guarded unguarded; do
-            python3 tests/chaos/run_chaos.py --workload elle --config $config \
-              --worker build/linux/x86_64/${{ matrix.mode }}/isolation_history \
-              --elle-jar elle-cli.jar --minutes $MINUTES --seed $SEED --lives 6 \
-              --max-life-s ${{ matrix.sanitizer == 'address' && '10' || '4' }} \
-              --work $RUNNER_TEMP/isolation-chaos-$config
-          done
-
-      # Leader plus two followers through bootstrap and tailing
-      # (docs/replication_checking_design.md). cluster-vacuum vacuums with
-      # retain_after and must pass; cluster-vacuum-unretained must detect
-      # #168 at least once per run.
-      - name: Run cluster check
-        env:
-          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
-          ROUNDS: ${{ github.event.inputs.cluster_rounds || '8' }}
-          SEED: ${{ github.event.inputs.seed || '' }}
-        run: |
-          ARGS="--binary build/linux/x86_64/${{ matrix.mode }}/isolation_history"
-          ARGS="$ARGS --elle-jar elle-cli.jar --cluster --rounds $ROUNDS"
-          ARGS="$ARGS --txns ${{ matrix.txns }} --out $RUNNER_TEMP/isolation-cluster"
-          if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
-          python3 scripts/run_isolation_check.py $ARGS
-
-      # The same cluster while leadership moves: planned transfers,
-      # unplanned promotions, re-targeting and re-bootstrap.
-      # topology-behind promotes the least advanced follower and must be
-      # caught forking at least once per run.
-      - name: Run topology check
-        env:
-          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
-          ROUNDS: ${{ github.event.inputs.topology_rounds || '6' }}
-          SEED: ${{ github.event.inputs.seed || '' }}
-        run: |
-          ARGS="--binary build/linux/x86_64/${{ matrix.mode }}/isolation_history"
-          ARGS="$ARGS --elle-jar elle-cli.jar --topology --rounds $ROUNDS"
-          ARGS="$ARGS --txns ${{ matrix.txns }} --out $RUNNER_TEMP/isolation-topology"
-          if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
-          python3 scripts/run_isolation_check.py $ARGS
+          # A stub: a known file where the rig keeps the unguarded failure.
+          mkdir -p "$RUNNER_TEMP/isolation/round-0" \
+                   "$RUNNER_TEMP/isolation-chaos-unguarded/failure"
+          echo isolation > "$RUNNER_TEMP/isolation/round-0/marker.txt"
+          echo stub > "$RUNNER_TEMP/isolation-chaos-unguarded/failure/marker.txt"
+          # The real rig, failing at once: a worker that exits 1.
+          printf '#!/bin/sh\necho "probe worker exits 1"\nexit 1\n' > "$RUNNER_TEMP/fake_worker.sh"
+          chmod +x "$RUNNER_TEMP/fake_worker.sh"
+          python3 tests/chaos/run_chaos.py --workload elle --config guarded \
+            --worker "$RUNNER_TEMP/fake_worker.sh" --minutes 0.2 --seed 1 --lives 1 \
+            --work "$RUNNER_TEMP/isolation-chaos-guarded" || true
+          echo "RUNNER_TEMP=$RUNNER_TEMP"
+          find "$RUNNER_TEMP" -maxdepth 3 -not -path "*/mnt/*" | sort
+          false
 
       - name: Upload histories and Elle output
         if: failure()
