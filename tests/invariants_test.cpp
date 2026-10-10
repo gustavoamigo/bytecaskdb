@@ -4,8 +4,11 @@
 // Tests for the invariant-checking helpers (Phase 2 of correctness validation).
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <format>
+#include <memory>
+#include <string>
 #include <system_error>
 
 #ifdef BYTECASK_TESTING
@@ -320,4 +323,106 @@ TEST_CASE("validate_state_consistency throws on live_bytes mismatch",
   bad.file_stats = std::move(fstats_t).persistent();
   REQUIRE_THROWS_AS(db.test_validate_state_consistency(bad),
                     std::runtime_error);
+}
+
+// Sets DB::test_before_validate_ for one scope.
+struct BreakRecoveredState {
+  explicit BreakRecoveredState(void (*fn)(bytecask::EngineState &)) {
+    bytecask::DB::test_before_validate_ = fn;
+  }
+  BreakRecoveredState(const BreakRecoveredState &) = delete;
+  auto operator=(const BreakRecoveredState &) -> BreakRecoveredState & = delete;
+  ~BreakRecoveredState() { bytecask::DB::test_before_validate_ = nullptr; }
+};
+
+// Rewrites the active file's sequence bounds.
+void set_active_bounds(bytecask::EngineState &s, std::uint64_t min_seq,
+                       std::uint64_t max_seq) {
+  auto stats = s.file_stats.transient();
+  auto fs = *stats.get(s.active_file_id);
+  fs.min_sequence = min_seq;
+  fs.max_sequence = max_seq;
+  stats.set(s.active_file_id, fs);
+  s.file_stats = std::move(stats).persistent();
+}
+
+TEST_CASE("open and resume() refuse a recovered state that fails the "
+          "consistency checks",
+          "[invariants][recovery][resume]") {
+  // No damaged directory or I/O fault produces these states: open and
+  // resume() build them from what they read. The hook breaks the state
+  // between that and the check, so the check is reached through its real
+  // callers.
+  void (*breaker)(bytecask::EngineState &) = nullptr;
+  std::string reason;
+  SECTION("active file not registered") {
+    breaker = [](bytecask::EngineState &s) { s.active_file_id = 999; };
+    reason = "not in files registry";
+  }
+  SECTION("owes an fdatasync") {
+    breaker = [](bytecask::EngineState &s) {
+      s.sync_requested_seq = s.durable_seq + 1;
+    };
+    reason = "sync_requested_seq";
+  }
+  SECTION("a file without stats") {
+    breaker = [](bytecask::EngineState &s) {
+      auto stats = s.file_stats.transient();
+      stats.erase(s.active_file_id);
+      s.file_stats = std::move(stats).persistent();
+    };
+    reason = "missing from file_stats";
+  }
+  SECTION("sequence bounds with one of them zero") {
+    breaker = [](bytecask::EngineState &s) { set_active_bounds(s, 0, 5); };
+    reason = "one is zero";
+  }
+  SECTION("min_sequence above max_sequence") {
+    breaker = [](bytecask::EngineState &s) { set_active_bounds(s, 7, 5); };
+    reason = "min_sequence 7 > max_sequence 5";
+  }
+
+  TempDir td;
+  const auto dir = td.path / "db";
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({}, to_bytes("k"), to_bytes("v"));
+    db.close();
+  }
+
+  // open throws, hands out no DB, and releases the directory.
+  {
+    BreakRecoveredState broken{breaker};
+    try {
+      auto db = bytecask::DB::open(dir);
+      FAIL("open accepted a state that fails the consistency checks");
+    } catch (const std::runtime_error &e) {
+      CHECK(std::string{e.what()}.find(reason) != std::string::npos);
+    }
+  }
+  auto db = bytecask::DB::open(dir);
+  REQUIRE(db.contains_key({}, to_bytes("k")));
+
+  // resume() throws and the engine stays degraded. A published state that
+  // owes an fdatasync is refused, which degrades the engine.
+  auto owes = std::make_shared<bytecask::EngineState>(*db.engine_state());
+  owes->sync_requested_seq = owes->durable_seq + 1;
+  db.test_publish(owes);
+  REQUIRE(db.is_degraded());
+  {
+    BreakRecoveredState broken{breaker};
+    try {
+      db.resume();
+      FAIL("resume() accepted a state that fails the consistency checks");
+    } catch (const std::runtime_error &e) {
+      CHECK(std::string{e.what()}.find(reason) != std::string::npos);
+    }
+    CHECK(db.is_degraded());
+    CHECK_THROWS_AS(db.put({}, to_bytes("k2"), to_bytes("v")),
+                    bytecask::DbDegraded);
+  }
+  REQUIRE_NOTHROW(db.resume());
+  CHECK_FALSE(db.is_degraded());
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v"));
+  CHECK(db.contains_key({}, to_bytes("k")));
 }

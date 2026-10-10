@@ -1763,6 +1763,11 @@ public:
   // by key, as before record locations were used as version tokens. The
   // differential test runs one workload both ways.
   bool test_resolve_by_key_{false};
+  // Called on the state open or resume() is about to validate, so a test can
+  // break it and drive the cold-path consistency checks through their real
+  // callers. Static: open has no DB to hang a hook on yet. A plain pointer,
+  // so the hook has no constructor or destructor to run at program exit.
+  static inline void (*test_before_validate_)(EngineState &) = nullptr;
   // Publishes s through the checked store_state under a write barrier, so
   // tests can drive the runtime invariant checks with a crafted state.
   void test_publish(std::shared_ptr<EngineState> s) {
@@ -2856,6 +2861,9 @@ DB::DB(std::filesystem::path dir, Options opts)
     initial->durable_seq =
         initial->next_seq > 0 ? initial->next_seq - 1 : 0;
     initial->mode = opts.initial_mode;
+#ifdef BYTECASK_TESTING
+    if (test_before_validate_) test_before_validate_(*initial);
+#endif
     validate_state_consistency(*initial);
     store_initial_state(std::move(initial));
   } catch (...) {
@@ -4732,6 +4740,9 @@ void DB::resume() {
   t.apply_sync(t.next_seq() > 0 ? t.next_seq() - 1 : 0);
   t.apply_clear_degraded();
   auto resumed = std::move(t).persistent();
+#ifdef BYTECASK_TESTING
+  if (test_before_validate_) test_before_validate_(*resumed);
+#endif
   validate_state_consistency(*resumed);
   store_state(current, std::move(resumed));
   // Writers appended since the failed flush have all been told; new ones
