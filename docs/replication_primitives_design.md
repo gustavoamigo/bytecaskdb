@@ -83,9 +83,9 @@ Each file's stats track the minimum and maximum sequence of entries it contains.
 
 This invariant makes `changes_since` efficient: each file is a sorted run, so the min-heap merge is optimal. It also enables **binary search within a file** using hint files (each hint entry carries the sequence), allowing `changes_since` to seek directly to the first entry with `sequence > from_sequence` rather than scanning from byte 0.
 
-### 4. `changes_since(snap, from_sequence)` — iterator
+### 4. `changes_since(snap, from_sequence, max_bytes)` — one slice
 
-Returns an iterator that yields raw entries (sequence, entry_type, key, value) for all committed, durable entries with `sequence > from_sequence`, **in ascending sequence order**. The upper bound is `min(snap.sequence(), durable_sequence)` — entries visible in the snapshot but not yet `fdatasync`'d are excluded (see [Durable Sequence](#durable-sequence)).
+Returns a `ChangeBatch`: a `ChangeHeader` — this node's change marker at `from_sequence`, and `from_sequence` — and a lazy iterator over the raw entries (sequence, entry_type, key, value) of the whole units whose first sequence is above `from_sequence`, **in ascending sequence order**. A unit is a standalone entry, a `ChangeMarker`, or a batch with its `BulkBegin` and `BulkEnd`; a batch straddling `from_sequence` is left out, since a node positioned at a unit boundary below it holds it already. The upper bound is the snapshot's durable sequence — entries visible in the snapshot but not yet `fdatasync`'d are excluded (see [Durable Sequence](#durable-sequence)) — or, with `max_bytes`, the unit that takes the slice past it. One `changes_since` is one `ingest`: the header describes one slice, so the engine cuts the slice, not the caller (#397).
 
 Implementation:
 
@@ -109,24 +109,35 @@ So vacuum has to be coordinated with replication, and the replication service de
 With that, `changes_since(snap, from)` is complete for every follower the service counts, across leader restarts, promotions and bootstraps.
 
 ```cpp
-auto changes_since(const Snapshot& snap, uint64_t from_sequence) const -> ChangeIterator;
+struct ChangeMarker { uint64_t since_sequence; uint64_t id; };  // kOriginMarker = {0, 0}
+struct ChangeHeader { ChangeMarker marker; uint64_t from_sequence; };
+struct ChangeBatch { ChangeHeader header; /* lazy */ ChangeIterator entries; };
+auto changes_since(const Snapshot& snap, uint64_t from_sequence,
+                   size_t max_bytes = kUnlimitedBytes) const -> ChangeBatch;
 ```
 
-When the iterator is exhausted, all committed durable entries up to `min(snap.sequence(), durable_sequence)` have been delivered in order.
-
-Because entries are sequence-ordered, every prefix of the stream that ends at a batch boundary — after a `BulkEnd` or a standalone entry — is a valid state. The follower can `ingest()` at any such point, not just at iterator exhaustion, and the result is always a consistent, sequence-ordered prefix of the leader's history. A slice that ends inside a batch is refused with `std::invalid_argument`.
+When the iterator is exhausted, every unit up to the snapshot's durable sequence, or up to the cut, has been delivered in order. Because the slice is whole units in sequence order, ingesting it leaves the follower a consistent, sequence-ordered prefix of the leader's history. The header is three `u64` fields; encoding it and the entries is the transport's job.
 
 **Failure handling:** on failure mid-iteration, restart Phase 2 with a fresh snapshot and iterator from `follower.durable_sequence()`. Since entries are in sequence order, the follower's recovered state after a crash is a valid prefix — `durable_sequence()` is trustworthy.
 
-### 5. `ingest(entries)` and `durable_sequence()` on the follower
+### 5. `ingest(header, entries)` and `durable_sequence()` on the follower
 
-**`ingest(entries)`** applies raw entries to the key directory and publishes the updated state to readers immediately. Because `changes_since` delivers entries in ascending sequence order, every `ingest` call produces a valid, consistent prefix of the leader's history — no separate commit step is needed.
+**`ingest(header, entries)`** applies one slice, as `changes_since` produced it, and publishes the updated state to readers immediately. Because `changes_since` delivers whole units in ascending sequence order, every `ingest` call produces a valid, consistent prefix of the source's history — no separate commit step is needed.
+
+Before anything is written, `ingest` checks that the slice continues this node's own history (#397). With P = `durable_sequence()` and X the lower of P and the slice's last sequence (`from_sequence` if the slice is empty):
+
+- `from_sequence > P` is a **gap**: the slice starts past this node and what lies between is missing. `std::invalid_argument`.
+- The source's marker at X — the last `ChangeMarker` entry in the slice at or below X, or `header.marker` — must be this node's marker at X. Two nodes with the same marker at X hold the same history up to it, so a different one means the histories diverged at a promotion, a **fork**: `DbChangeMarkerMismatch`. X stops at the slice's last sequence because the slice says nothing past it, and at P because the slice is skipped as duplicates up to there. An empty slice is checked at `from_sequence`: a follower ahead of its source on another history is caught by the slice that carries nothing.
+- A slice not strictly increasing above `from_sequence`, or holding a `ChangeMarker` inside a batch, with a key or without its 8-byte id, is malformed: `std::invalid_argument`.
+
+The remedy for a fork is a re-bootstrap from the source's manifest; the engine never repairs or truncates. Two histories that were never promoted carry the origin marker on both sides and cannot be told apart.
 
 **`durable_sequence()`** returns the last ingested sequence — identical semantics on both leader and follower. On the leader it reflects the latest write; on the follower it reflects the last `ingest`. External code does not need to know which mode it's talking to. The orchestrator compares `leader.durable_sequence()` and `follower.durable_sequence()` to measure replication lag.
 
 ```cpp
-void ingest(std::span<const DataEntryView> entries);  // applies and publishes
-auto durable_sequence() const -> uint64_t;        // last committed sequence
+void ingest(const ChangeHeader& header,
+            std::span<const DataEntryView> entries);  // checks, applies and publishes
+auto durable_sequence() const -> uint64_t;            // last committed sequence
 ```
 
 After each `ingest`, `next_sequence` reflects `max(next_sequence, max(ingested sequences) + 1)` — it never decreases, preserving the runtime invariant enforced by `store_state`.
@@ -135,7 +146,8 @@ After each `ingest`, `next_sequence` reflects `max(next_sequence, max(ingested s
 
 **Constraints:**
 - `ingest` is only callable in `Mode::Follower`.
-- A slice must not end inside an atomic batch: one that does throws `std::invalid_argument` before anything is written (#188).
+- A slice must not end inside an atomic batch: one that does throws `std::invalid_argument` before anything is written (#188). `changes_since` never produces one.
+- A `ChangeMarker` entry in the slice is stored, counted in the file's `change_marker_bytes`, and is this node's marker from its sequence on.
 - Appends to data files and updates the key directory, same as the normal write path, but skips guards and sequence assignment.
 - `RangeDel` entries walk the follower's key directory over `[from, to)`, same as the normal write path. If the follower never received the keys in that range (e.g. it started tailing after they were written), the walk is a no-op — the range is simply empty on the follower.
 
@@ -152,7 +164,7 @@ void set_mode(Mode mode);
 auto mode() const -> Mode;
 ```
 
-**Promotion:** switch from `Follower` to `Leader`. The engine's `next_sequence` is already correct (advanced by `ingest`), so writes pick up where the old leader left off.
+**Promotion:** switch from `Follower` to `Leader`. The engine appends a `ChangeMarker` entry at the next sequence — a random 64-bit id that, with the entry's sequence, names the history from here on — and `fdatasync`s it before the mode changes; the first write takes the sequence after the marker's. `changes_since` carries the marker to the followers, which store it. A failed append or sync degrades the engine and leaves the mode; a degraded follower cannot be promoted (`DbDegraded`); a promotion that would need a sequence past the packable limit is refused like a write. `set_mode(Mode::Leader)` on a leader writes nothing, and opening in Leader mode is not a promotion: a crashed leader reopened in place keeps writing under the origin marker, which is why the protocol re-bootstraps it instead (#397).
 
 ---
 
@@ -250,10 +262,10 @@ loop:
           already ahead of the follower; blocks only when there is
           genuinely nothing new to replicate
     snap = leader.snapshot()               — captures sequence boundary
-    it = leader.changes_since(snap, follower.durable_sequence())
-    for entry in it:
-        follower.ingest(entry)
-    // on failure at any point: loop restarts from follower.durable_sequence()
+    batch = leader.changes_since(snap, follower.durable_sequence(), max_bytes)
+    follower.ingest(batch.header, collect(batch.entries))
+    // on failure at any point: loop restarts from follower.durable_sequence();
+    // DbChangeMarkerMismatch means this node is on another history: re-bootstrap it
 ```
 
 The snapshot determines the upper bound of the stream — `changes_since` yields entries up to `snap.sequence()`. No separate call is needed to define that upper bound; the snapshot is the target. The leading `durable_sequence(min_sequence, timeout)` call serves only as a wake-up: unlike the old advance-based form, a leader that is already ahead of the follower wakes the loop immediately — blocking happens only when there is genuinely nothing to replicate (see the idle-leader note under [Primitive 1](#1-durable_sequencemin_sequence-timeout)).
@@ -270,9 +282,9 @@ The snapshot determines the upper bound of the stream — `changes_since` yields
 7. The old leader, if it comes back, is re-bootstrapped from a manifest
 ```
 
-No sequence reset, no gap. The promoted follower's sequence space is a strict continuation of the old leader's.
+No sequence reset, no gap. The promoted follower's sequence space is a strict continuation of the old leader's, with the promotion's change marker as its first entry.
 
-The promoted follower must be the most advanced one. A follower ahead of it holds entries at sequences the new leader will assign to new writes, and `ingest` skips an entry at or below the follower's `durable_sequence()` as a duplicate: that follower would keep the old leader's writes, drop the new leader's, and never report it. Step 2 must finish before step 3, so no follower advances after the choice. The old leader's writes above the promoted follower's `durable_sequence()` are lost; replication is asynchronous.
+The promoted follower must be the most advanced one. A follower ahead of it holds entries at sequences the new leader will assign to new writes. Step 2 must finish before step 3, so no follower advances after the choice. The old leader's writes above the promoted follower's `durable_sequence()` are lost; replication is asynchronous. The engine detects a violation of this rule (#397): the new leader's marker sits at the first sequence it assigns, so a follower ahead of it, or the old leader rejoining with unreplicated writes, holds a different entry there, and its first `ingest` from the new leader — even an empty slice — throws `DbChangeMarkerMismatch` with nothing written. The coordinator re-bootstraps that node. Example: L dies at 20, N is promoted at 10 and writes marker `{11, B}`; F at 20 holds L's 11–20, so N's marker at 20 is `{11, B}` and F's is the origin: refused. A follower at 10 or below catches up and receives the marker.
 
 ### Leadership Transfer (planned)
 
@@ -282,8 +294,8 @@ Graceful leadership transfer uses `set_mode(Mode::Follower)` on the old leader t
 1. old_leader.set_mode(Mode::Follower)        — writes stop immediately
 2. Replication loop continues                  — changes_since and durable_sequence are reads
 3. Wait: follower.durable_sequence() == old_leader.durable_sequence()
-4. follower.set_mode(Mode::Leader)             — writes resume on new leader
-5. Other followers re-target the new leader
+4. follower.set_mode(Mode::Leader)             — appends the change marker; writes resume on new leader
+5. Other followers re-target the new leader; the old leader follows too, and receives the marker
 ```
 
 No drain mode is needed. Writes are mutex-serialized — a write is either holding the lock and completes before the mode switch, or it doesn't hold the lock and the next attempt is rejected. There is no intermediate "in-flight" state, so the mode switch is a clean cut.
@@ -372,7 +384,7 @@ How entries are delivered to the follower. Each shape exercises a different prop
 | `duplicate_delivery` | Re-deliver entries the follower already has | Idempotency — entries with sequence <= durable_sequence() are silently skipped, no state change |
 | `planned_promotion` | Replicate NodeA (Leader) → NodeB (Follower) fully, transfer leadership to NodeB, write new entries on NodeB, replicate NodeB → NodeA (backward sync) | Sequence continuity on promoted NodeB; NodeA rejects writes after demotion; NodeA catches up from NodeB and its key_dir matches NodeB's state |
 
-**Out of scope for the primitive proof:** unplanned promotion (old leader crashes, follower promotes, old leader later rejoins). A crashed leader may have locally-recovered entries past the follower's durable sequence, creating a log fork. Reconciling a fork is a coordinator-level concern, not a primitive-level guarantee. The required recovery protocol is simple: a crashed leader must be re-bootstrapped from the new leader via `create_manifest` before rejoining as a follower — never reopened in place.
+**Out of scope for the primitive proof:** unplanned promotion (old leader crashes, follower promotes, old leader later rejoins). A crashed leader may have locally-recovered entries past the follower's durable sequence, creating a log fork. The engine detects the fork through the change marker and refuses the stream with `DbChangeMarkerMismatch` (#397, tested in `tests/change_marker_test.cpp` and the reference's cluster model); reconciling it is a coordinator-level concern: a crashed leader is re-bootstrapped from the new leader via `create_manifest` before rejoining as a follower, never reopened in place.
 
 ### FailureClasses
 

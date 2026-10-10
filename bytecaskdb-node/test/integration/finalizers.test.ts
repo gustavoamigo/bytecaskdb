@@ -26,7 +26,7 @@ function abandonWrappers(backend: ByteCaskFactory, db: ByteCaskDB): void {
   const snap = db.snapshot()
   for (const it of [
     db.entries(''), db.keys(''), db.entriesReverse('k~'), db.keysReverse('k~'),
-    snap.entries(''), snap.keys(''), db.changesSince(snap, 0n),
+    snap.entries(''), snap.keys(''), db.changesSince(snap, 0n).entries,
   ]) {
     it.next()
   }

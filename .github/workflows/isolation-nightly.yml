@@ -191,8 +191,9 @@ jobs:
 
       # The same cluster while leadership moves: planned transfers,
       # unplanned promotions, re-targeting and re-bootstrap.
-      # topology-behind promotes the least advanced follower and must be
-      # caught forking at least once per run.
+      # topology-behind promotes the least advanced follower; the engine
+      # must refuse the forked follower's slice (forks_detected >= 1) in at
+      # least one round per run, and topology must see no refusal.
       - name: Run topology check
         env:
           ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}

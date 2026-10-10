@@ -7,16 +7,23 @@ export interface Disposable {
   [Symbol.dispose](): void;
 }
 
-export type EntryType = 'put' | 'delete' | 'bulkBegin' | 'bulkEnd' | 'rangeDel';
+// 'changeMarker' is a promotion: the entry a follower appends when it becomes
+// leader. Its key is empty and its value the marker's 8-byte little-endian id.
+export type EntryType = 'put' | 'delete' | 'bulkBegin' | 'bulkEnd' | 'rangeDel' | 'changeMarker';
 
 // The `code` on every error either backend throws.
 //   BC_DEGRADED          a write on a degraded engine; resume() clears it
 //   BC_FOLLOWER_MODE     a normal write in follower mode
+//   BC_CHANGE_MARKER_MISMATCH
+//                        ingest of a slice from a history that diverged from
+//                        this node's at a promotion (a fork); nothing was
+//                        written, and the node needs a new bootstrap
 //   BC_CLOSED            a call on a closed DB or file manifest, or on a
 //                        closed or consumed snapshot or plan
 //   BC_INVALID_ARGUMENT  input refused before anything is written: a key,
 //                        value or plan over its limit, an empty range, an
-//                        option over its ceiling
+//                        option over its ceiling, an ingest slice that starts
+//                        past the follower (a gap) or is malformed
 //   BC_IO                an I/O failure; `errno` holds the system error
 //   BC_LOGIC             a call the engine's state does not allow, such as
 //                        ingest on a leader or a guard without a snapshot
@@ -24,6 +31,7 @@ export type EntryType = 'put' | 'delete' | 'bulkBegin' | 'bulkEnd' | 'rangeDel';
 export type ErrorCode =
   | 'BC_DEGRADED'
   | 'BC_FOLLOWER_MODE'
+  | 'BC_CHANGE_MARKER_MISMATCH'
   | 'BC_CLOSED'
   | 'BC_INVALID_ARGUMENT'
   | 'BC_IO'
@@ -98,6 +106,33 @@ export interface DataEntry {
   value: Uint8Array;
 }
 
+// The identity of a history from a promotion on: the changeMarker entry's own
+// sequence and its random id. A node's marker at a sequence is its last marker
+// at or below it, ORIGIN_MARKER if it holds none. Two nodes with the same
+// marker at a sequence hold the same history up to it.
+export interface ChangeMarker {
+  sinceSequence: bigint;
+  id: bigint;
+}
+
+// The history before any promotion: the marker at every position of a
+// database that was never promoted.
+export const ORIGIN_MARKER: Readonly<ChangeMarker> = Object.freeze({ sinceSequence: 0n, id: 0n });
+
+// Where a slice of a history starts: the source's marker at fromSequence, and
+// fromSequence. The slice holds the source's entries above it, in order.
+export interface ChangeHeader {
+  marker: ChangeMarker;
+  fromSequence: bigint;
+}
+
+// One changesSince result, which is one ingest call: where the slice starts
+// and which history it is from, and the entries, read lazily.
+export interface ChangeBatch {
+  header: ChangeHeader;
+  entries: CloseableIterator<DataEntry>;
+}
+
 export interface FileInfo {
   fileId: number;
   dataPath: string;
@@ -167,10 +202,20 @@ export interface ByteCaskDB extends Disposable {
   // sequence reaches minSequence or the timeout expires.
   durableSequence(minSequence?: bigint, timeoutMs?: number): bigint;
   createManifest(): FileManifest;
-  changesSince(snap: Snapshot, fromSeq: bigint): CloseableIterator<DataEntry>;
-  // Follower mode only. Throws, before anything is written, if the slice
-  // ends inside an atomic batch: cut after a bulkEnd or a standalone entry.
-  ingest(entries: DataEntry[]): void;
+  // One slice of this node's history for ingest: the whole units above
+  // fromSeq that were durable at snap, cut after the unit that passes
+  // maxBytes (omitted: no cut), with a header naming the marker at fromSeq.
+  // The entries are read lazily; close them, or read them to the end.
+  changesSince(snap: Snapshot, fromSeq: bigint, maxBytes?: number): ChangeBatch;
+  // Applies one slice, as changesSince produced it, atomically and durably.
+  // Follower mode only (BC_LOGIC on a leader). Refused before anything is
+  // written: a slice starting past durableSequence() is a gap, and one not
+  // strictly increasing, holding a changeMarker inside a batch or ending
+  // inside a batch is malformed (BC_INVALID_ARGUMENT); one from a history
+  // that diverged at a promotion is a fork (BC_CHANGE_MARKER_MISMATCH).
+  // Entries at or below durableSequence() are skipped, so a slice can be
+  // delivered again after any failure.
+  ingest(header: ChangeHeader, entries: DataEntry[]): void;
   stats(): Record<string, number>;
   // Makes every write durable, writes the hint files and releases the
   // directory lock and the handle. Throws if an acknowledged write is not

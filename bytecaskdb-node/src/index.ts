@@ -6,9 +6,14 @@ export type {
   ByteCaskError,
   ByteCaskFactory,
   BufferPoolOptions,
+  ChangeBatch,
+  ChangeHeader,
+  ChangeMarker,
   CloseableIterator,
   CommitResult,
+  DataEntry,
   Entry,
+  EntryType,
   ErrorCode,
   IoBackend,
   OpenOptions,
@@ -18,6 +23,8 @@ export type {
   WritePlanConstructor,
   WriteOptions,
 } from "./types.js";
+
+export { ORIGIN_MARKER } from "./types.js";
 
 export { createWasmBackend } from "./wasm-backend.js";
 export { createNativeBackend } from "./native-backend.js";

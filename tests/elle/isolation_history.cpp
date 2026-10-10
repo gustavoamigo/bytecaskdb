@@ -309,6 +309,7 @@ struct Event {
   int process{0};
   int node{0};               // the node the operation ran on
   int epoch{0};              // cluster epoch when it was invoked
+  int life{0};               // the node's bootstrap count at the time
   Role role{Role::Leader};
   std::uint64_t wait_seq{0}; // session read: the durable_sequence waited for
   EventType type{EventType::Invoke};
@@ -371,10 +372,10 @@ auto write_history(const fs::path &path, std::vector<Event> events) -> void {
     const auto &e = events[i];
     line.clear();
     line += std::format(R"({{"index":{},"process":{},"node":{},"epoch":{},)"
-                        R"("role":"{}","type":"{}","f":"txn","time":{},)"
-                        R"("value":[)",
-                        e.index, e.process, e.node, e.epoch, role_name(e.role),
-                        event_type_name(e.type), e.time_ns);
+                        R"("life":{},"role":"{}","type":"{}","f":"txn",)"
+                        R"("time":{},"value":[)",
+                        e.index, e.process, e.node, e.epoch, e.life,
+                        role_name(e.role), event_type_name(e.type), e.time_ns);
     for (std::size_t j = 0; j < e.value.size(); ++j) {
       const auto &m = e.value[j];
       if (j != 0) line.push_back(',');
@@ -503,6 +504,7 @@ struct Placement {
   int process{0};
   int node{0};
   int epoch{0};
+  int life{0};
   Role role{Role::Leader};
   std::uint64_t wait_seq{0};
 };
@@ -515,6 +517,7 @@ auto run_one(bytecask::DB &db, Mode mode, Placement at, Recorder &rec,
   inv.process = at.process;
   inv.node = at.node;
   inv.epoch = at.epoch;
+  inv.life = at.life;
   inv.role = at.role;
   inv.wait_seq = at.wait_seq;
   inv.value = mops;
@@ -540,6 +543,7 @@ auto run_one(bytecask::DB &db, Mode mode, Placement at, Recorder &rec,
   done.process = at.process;
   done.node = at.node;
   done.epoch = at.epoch;
+  done.life = at.life;
   done.role = at.role;
   done.wait_seq = at.wait_seq;
   done.type = outcome.type;
@@ -604,6 +608,17 @@ struct Node {
   std::atomic<std::uint64_t> joining_at{0};
   // Where replicate() last gave up on an iteration, for the stuck report.
   std::atomic<int> repl_stall{0};
+  // How many times the node was bootstrapped; every operation records the
+  // life it ran in, so what a node read of a branch it later turned out to
+  // be on can be told from what it read once re-bootstrapped.
+  std::atomic<int> life{0};
+  // The source and view epoch of the node's last completed pull: an ingest
+  // that returned, or one the engine refused as a fork. A pull at a new pair
+  // runs even when the node is not behind, since an empty slice is how the
+  // engine compares the histories of a node ahead of its source (#397).
+  // Reset by bootstrap.
+  std::atomic<int> pulled_src{-1};
+  std::atomic<int> pulled_epoch{-1};
 };
 
 // A shared lock on the node's gate if it has a DB and nobody is waiting for
@@ -677,16 +692,18 @@ struct Bootstrap {
   std::int64_t mismatches{0};
 };
 
-// A topology event, for the summary. kind is "planned", "unplanned" or
-// "retarget"; durable is the promoted node's durable_sequence() when it
-// stopped tailing (for a retarget, the retargeted node's).
+// A topology event, for the summary. kind is "planned", "unplanned",
+// "retarget" or "fork"; durable is the promoted node's durable_sequence()
+// when it stopped tailing (for a retarget, the retargeted node's; for a
+// fork, the position the refused node pulled from).
 struct TopologyEvent {
   std::string kind;
   int epoch{0};
-  int from{0};
-  int to{0};
+  int from{0}; // fork: the source
+  int to{0};   // fork: the refused node
   std::uint64_t durable{0};
-  std::uint64_t other_durable{0}; // planned: the old leader's; retarget: the source's
+  std::uint64_t other_durable{0}; // planned: the old leader's; retarget, fork: the source's
+  int life{0};                    // fork: the refused node's life
 };
 
 struct ClusterStats {
@@ -696,6 +713,7 @@ struct ClusterStats {
   std::vector<std::string> errors;    // under mu
   std::atomic<int> ingests{0};
   std::atomic<int> ingest_errors{0};
+  std::atomic<int> forks_detected{0}; // slices the engine refused as forks
   std::atomic<int> restarts{0};
   std::atomic<int> duplicates{0};
   std::atomic<int> lag_pauses{0};
@@ -721,15 +739,20 @@ struct OwnedEntry {
   bytecask::Bytes value;
 };
 
-auto ingest_owned(bytecask::DB &follower, const std::vector<OwnedEntry> &buf)
-    -> void {
+auto ingest_owned(bytecask::DB &follower, const bytecask::ChangeHeader &header,
+                  const std::vector<OwnedEntry> &buf) -> void {
   std::vector<bytecask::DataEntryView> views;
   views.reserve(buf.size());
   for (const auto &e : buf) {
     views.push_back({e.sequence, e.entry_type, e.key, e.value});
   }
-  follower.ingest(views);
+  follower.ingest(header, views);
 }
+
+// What max_bytes asks of changes_since for 1-64 entries of this workload,
+// whose records average a few hundred bytes. The engine cuts after the unit
+// that passes it, so a batch comes through whole.
+constexpr std::size_t kNominalEntryBytes = 256;
 
 // Phase 1 of the protocol, under load: manifest from source, copy, open n as
 // a follower. The source's vacuum is held off from the manifest to the end
@@ -777,6 +800,9 @@ auto bootstrap(Node &source, Node &n, std::mutex &vacuum_gate,
       }
       NodeExclusive x{n};
       n.holder = std::move(h);
+      n.life.fetch_add(1, std::memory_order_acq_rel);
+      n.pulled_src.store(-1, std::memory_order_release);
+      n.pulled_epoch.store(-1, std::memory_order_release);
       return;
     } catch (const std::exception &) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -785,11 +811,17 @@ auto bootstrap(Node &source, Node &n, std::mutex &vacuum_gate,
 }
 
 // Phase 2 for node n, from whichever node the view says it tails: wake on
-// the source's durable sequence, stream changes_since from n's
-// durable_sequence(), ingest in slices cut at batch boundaries. Nemeses:
-// lag pauses, duplicate delivery, vacuum on n and restarts of n. The view
-// is read with n's gate held, so a promotion (which changes n's source
-// while holding n exclusively) never races an ingest into n.
+// the source's durable sequence, then drain what one snapshot of it holds
+// above n's durable_sequence() as changes_since slices, each cut by the
+// engine at a random max_bytes and given to one ingest. The first pull from
+// a new source or epoch skips the wake: a node that is not behind still
+// delivers an empty slice, which is how the engine finds one ahead of its
+// source on another history. A slice the engine refuses as a fork (#397)
+// takes n out of service; the orchestrator re-bootstraps it like a node an
+// unplanned promotion abandoned. Nemeses, once per drain: lag pauses,
+// duplicate delivery, vacuum on n and restarts of n. The view is read with
+// n's gate held, so a promotion (which changes n's source while holding n
+// exclusively) never races an ingest into n.
 // The retain_after a vacuum on node `self` must use: the lowest position a
 // node could resume changes_since from, over every node that is serving or
 // joining, `self` aside. This is the replication service's decision, not
@@ -818,9 +850,8 @@ auto retention_point(std::vector<std::unique_ptr<Node>> &nodes,
 }
 
 auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
-               const ClusterView &view, bool lag, bool retain,
-               std::uint64_t seed, const std::atomic<bool> &stop,
-               ClusterStats &stats) -> void {
+               ClusterView &view, bool lag, bool retain, std::uint64_t seed,
+               const std::atomic<bool> &stop, ClusterStats &stats) -> void {
   std::mt19937_64 rng{seed};
   // A run lasts a few seconds, so the nemeses fire every few hundred ms.
   auto next_restart =
@@ -868,6 +899,10 @@ auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
     }
     auto &fdb = n.holder->db;
     auto &leader = sn.holder->db;
+    const auto first_pull =
+        n.pulled_src.load(std::memory_order_acquire) != src ||
+        n.pulled_epoch.load(std::memory_order_acquire) != v.epoch;
+    std::uint64_t from = 0;
     try {
       if (rng() % 50 == 0) {
         const auto threshold = static_cast<double>(rng() % 60) / 100.0;
@@ -876,9 +911,10 @@ auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
                         .retain_after = retain_after}))
           stats.follower_vacuums.fetch_add(1, std::memory_order_relaxed);
       }
-      auto from = fdb.durable_sequence();
-      if (leader.durable_sequence(from + 1, std::chrono::milliseconds(20)) <=
-          from) {
+      from = fdb.durable_sequence();
+      if (!first_pull &&
+          leader.durable_sequence(from + 1, std::chrono::milliseconds(20)) <=
+              from) {
         n.repl_stall.store(4, std::memory_order_relaxed);
         continue;
       }
@@ -889,31 +925,41 @@ auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
       }
       auto snap = leader.snapshot();
       std::vector<OwnedEntry> buf;
-      auto target = 1 + rng() % 64;
-      auto in_batch = false;
-      for (const auto &e : leader.changes_since(snap, from)) {
-        buf.push_back({e.sequence, e.entry_type,
-                       bytecask::Bytes{e.key.begin(), e.key.end()},
-                       bytecask::Bytes{e.value.begin(), e.value.end()}});
-        if (e.entry_type == bytecask::EntryType::BulkBegin) in_batch = true;
-        if (e.entry_type == bytecask::EntryType::BulkEnd) in_batch = false;
-        // Slices end at batch boundaries: ingest refuses a slice cut inside
-        // a batch (CONTRACT.md, ingest).
-        if (!in_batch && buf.size() >= target) {
-          ingest_owned(fdb, buf);
-          stats.ingests.fetch_add(1, std::memory_order_relaxed);
-          buf.clear();
-          target = 1 + rng() % 64;
+      // The drain ends on an empty slice, which is also what a node that
+      // is not behind delivers: a slice the engine checks, and that writes
+      // nothing.
+      do {
+        from = buf.empty() ? from : buf.back().sequence;
+        buf.clear();
+        auto batch = leader.changes_since(
+            snap, from, (1 + rng() % 64) * kNominalEntryBytes);
+        for (const auto &e : batch.entries) {
+          buf.push_back({e.sequence, e.entry_type,
+                         bytecask::Bytes{e.key.begin(), e.key.end()},
+                         bytecask::Bytes{e.value.begin(), e.value.end()}});
         }
-      }
-      if (in_batch) {
-        stats.error(std::format(
-            "node {}: changes_since from node {} ended inside a batch after {}",
-            n.id, src, buf.empty() ? 0 : buf.back().sequence));
-      } else if (!buf.empty()) {
-        ingest_owned(fdb, buf);
+        ingest_owned(fdb, batch.header, buf);
         stats.ingests.fetch_add(1, std::memory_order_relaxed);
-      }
+        n.pulled_src.store(src, std::memory_order_release);
+        n.pulled_epoch.store(v.epoch, std::memory_order_release);
+      } while (!buf.empty() && !stop.load(std::memory_order_relaxed));
+    } catch (const bytecask::DbChangeMarkerMismatch &e) {
+      // n's history diverged from its source's at a promotion, and the
+      // engine refused the slice before writing anything. n stops serving
+      // and tailing here; rebootstrap_abandoned() rebuilds it from the
+      // leader's manifest, the remedy for a fork.
+      stats.forks_detected.fetch_add(1, std::memory_order_relaxed);
+      stats.event({.kind = "fork", .epoch = v.epoch, .from = src, .to = n.id,
+                   .durable = from, .other_durable = leader.durable_sequence(),
+                   .life = n.life.load(std::memory_order_acquire)});
+      std::fprintf(stderr, "node %d: slice from node %d at %llu refused: %s\n",
+                   n.id, src, static_cast<unsigned long long>(from), e.what());
+      view.update([&](View &w) {
+        w.serving[static_cast<std::size_t>(n.id)] = false;
+        at(w.source, n.id) = -1;
+      });
+      n.pulled_src.store(src, std::memory_order_release);
+      n.pulled_epoch.store(v.epoch, std::memory_order_release);
     } catch (const std::exception &) {
       // Restart from n's durable_sequence(), as the protocol says. A
       // degraded node recovers through resume().
@@ -996,7 +1042,8 @@ auto planned_transfer(std::vector<std::unique_ptr<Node>> &nodes,
 // leader lacks. The old leader is abandoned and re-bootstrapped later;
 // the writes it acknowledged above the promoted node's durable sequence
 // are lost. promote_least takes the least advanced follower instead, the
-// protocol with the rule inverted: a follower ahead of the target forks.
+// protocol with the rule inverted: a follower ahead of the target forks, and
+// the engine refuses its first slice from the new leader (#397).
 auto unplanned_promotion(std::vector<std::unique_ptr<Node>> &nodes,
                          ClusterView &view, bool promote_least,
                          ClusterStats &stats) -> void {
@@ -1014,11 +1061,14 @@ auto unplanned_promotion(std::vector<std::unique_ptr<Node>> &nodes,
   }
   // replicate() reads the view under the node's gate: once the gate has
   // been held exclusively, no ingest from the old leader is left running.
+  // A node out of service, abandoned or refused as a fork and waiting for
+  // its re-bootstrap, is not a candidate.
+  const auto serving = view.get().serving;
   std::vector<int> candidates;
   std::vector<std::uint64_t> durables;
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     const auto id = static_cast<int>(i);
-    if (id == old) continue;
+    if (id == old || !serving[i]) continue;
     NodeExclusive x{*nodes[i]};
     if (!nodes[i]->holder) continue;
     candidates.push_back(id);
@@ -1091,20 +1141,22 @@ auto write_cluster_summary(const fs::path &path, ClusterStats &stats,
   for (std::size_t i = 0; i < stats.events.size(); ++i) {
     const auto &e = stats.events[i];
     out << std::format(R"({}{{"kind":"{}","epoch":{},"from":{},"to":{},)"
-                       R"("durable":{},"other_durable":{}}})",
+                       R"("durable":{},"other_durable":{},"life":{}}})",
                        i == 0 ? "" : ",", e.kind, e.epoch, e.from, e.to,
-                       e.durable, e.other_durable);
+                       e.durable, e.other_durable, e.life);
   }
   out << "],\"errors\":[";
   for (std::size_t i = 0; i < stats.errors.size(); ++i) {
     out << (i == 0 ? "" : ",") << '"' << json_escape(stats.errors[i]) << '"';
   }
   out << std::format(
-      R"(],"final_leader":{},"ingests":{},"ingest_errors":{},"restarts":{},)"
+      R"(],"final_leader":{},"ingests":{},"ingest_errors":{},)"
+      R"("forks_detected":{},"restarts":{},)"
       R"("duplicates":{},"lag_pauses":{},"follower_vacuums":{},)"
       R"("session_reads":{}}})",
       final_leader, stats.ingests.load(), stats.ingest_errors.load(),
-      stats.restarts.load(), stats.duplicates.load(),
+      stats.forks_detected.load(), stats.restarts.load(),
+      stats.duplicates.load(),
       stats.lag_pauses.load(), stats.follower_vacuums.load(),
       stats.session_reads.load());
   out << "\n";
@@ -2133,6 +2185,7 @@ auto run(const RunOptions &o) -> int {
               mops.push_back({.append = false, .key = keys.pick(rrng, false),
                               .element = 0, .read = {}});
             Placement pl{.process = process, .node = i, .epoch = v.epoch,
+                         .life = n.life.load(std::memory_order_acquire),
                          .role = Role::Reader, .wait_seq = 0};
             if (rrng() % 4 == 0) {
               const auto seq = last_acked.load(std::memory_order_acquire);
@@ -2158,7 +2211,8 @@ auto run(const RunOptions &o) -> int {
 
   // Topology: once every follower is up, planned transfers to a random
   // node and unplanned promotions of the most advanced one, and
-  // re-bootstrap of any node an unplanned promotion abandoned.
+  // re-bootstrap of any node out of service: one an unplanned promotion
+  // abandoned, or one the engine refused as a fork.
   auto rebootstrap_abandoned = [&] {
     const auto v = view.get();
     for (int i = 0; i < node_count; ++i) {
@@ -2234,8 +2288,9 @@ auto run(const RunOptions &o) -> int {
             store_max(last_acked,
                       run_one(ln.holder->db, o.mode,
                               {.process = p, .node = v.leader,
-                               .epoch = v.epoch, .role = Role::Leader,
-                               .wait_seq = 0},
+                               .epoch = v.epoch,
+                               .life = ln.life.load(std::memory_order_acquire),
+                               .role = Role::Leader, .wait_seq = 0},
                               rec, events, random_txn(crng, keys, next_element),
                               {.sync = sync}, false, totals));
             break;
@@ -2248,48 +2303,64 @@ auto run(const RunOptions &o) -> int {
   if (orchestrator.joinable()) orchestrator.join();
   if (nemesis_thread.joinable()) nemesis_thread.join();
   if (vacuum_thread.joinable()) vacuum_thread.join();
-  if (o.topology && o.followers > 0) rebootstrap_abandoned();
   const auto final_leader = view.get().leader;
   auto &leader_db = node(final_leader).holder->db;
   if (leader_db.is_degraded()) leader_db.resume();
 
   // Convergence: a sync write makes every leader entry durable, so
   // changes_since can deliver all of it; every other node must then reach
-  // the leader's durable sequence.
+  // the leader's durable sequence, and have pulled from the final leader in
+  // the final epoch, since a node ahead of it on another history reaches the
+  // sequence without holding the writes. A node the engine refuses during
+  // the wait is re-bootstrapped and the wait repeated.
   if (o.followers > 0) {
     leader_db.put({.sync = true}, as_view("fence"), as_view(""));
     const auto target = leader_db.durable_sequence();
-    for (int i = 0; i < node_count; ++i) {
-      if (i == final_leader) continue;
-      const auto deadline = Clock::now() + std::chrono::seconds(20);
-      while (durable_of(node(i)).value_or(0) < target) {
-        if (Clock::now() >= deadline) {
-          // What the leader would send it: the first entries past where it
-          // stands, to tell a stream that is empty from one that is refused.
-          const auto at_seq = durable_of(node(i)).value_or(0);
-          std::string head;
-          std::int64_t count = 0;
-          auto snap = leader_db.snapshot();
-          for (const auto &e : leader_db.changes_since(snap, at_seq)) {
-            if (count < 8)
-              head += std::format(" {}:{}", e.sequence,
-                                  static_cast<int>(e.entry_type));
-            ++count;
+    for (int pass = 0;; ++pass) {
+      if (o.topology) rebootstrap_abandoned();
+      const auto epoch = view.get().epoch;
+      for (int i = 0; i < node_count; ++i) {
+        if (i == final_leader) continue;
+        const auto deadline = Clock::now() + std::chrono::seconds(20);
+        while (durable_of(node(i)).value_or(0) < target ||
+               node(i).pulled_epoch.load(std::memory_order_acquire) != epoch) {
+          // Refused as a fork meanwhile: the next pass re-bootstraps it.
+          if (!view.get().serving[static_cast<std::size_t>(i)]) break;
+          if (Clock::now() >= deadline) {
+            // What the leader would send it: the first entries past where it
+            // stands, to tell a stream that is empty from one that is refused.
+            const auto at_seq = durable_of(node(i)).value_or(0);
+            std::string head;
+            std::int64_t count = 0;
+            auto snap = leader_db.snapshot();
+            for (const auto &e :
+                 leader_db.changes_since(snap, at_seq).entries) {
+              if (count < 8)
+                head += std::format(" {}:{}", e.sequence,
+                                    static_cast<int>(e.entry_type));
+              ++count;
+            }
+            auto v = view.get();
+            cluster.error(std::format(
+                "node {}: stuck at durable sequence {} below the leader's {} "
+                "(node {}) after 20s; changes_since yields {} entries:{}; "
+                "source {} serving {} stall {} wanted {} leader-wanted {} "
+                "pulled from {} in epoch {} of {}",
+                i, at_seq, target, final_leader, count, head,
+                at(v.source, i),
+                v.serving[static_cast<std::size_t>(i)] ? 1 : 0,
+                node(i).repl_stall.load(), node(i).exclusive_wanted.load(),
+                node(final_leader).exclusive_wanted.load(),
+                node(i).pulled_src.load(), node(i).pulled_epoch.load(), epoch));
+            break;
           }
-          auto v = view.get();
-          cluster.error(std::format(
-              "node {}: stuck at durable sequence {} below the leader's {} "
-              "(node {}) after 20s; changes_since yields {} entries:{}; "
-              "source {} serving {} stall {} wanted {} leader-wanted {}",
-              i, at_seq, target, final_leader, count, head,
-              at(v.source, i),
-              v.serving[static_cast<std::size_t>(i)] ? 1 : 0,
-              node(i).repl_stall.load(), node(i).exclusive_wanted.load(),
-              node(final_leader).exclusive_wanted.load()));
-          break;
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
       }
+      const auto serving = view.get().serving;
+      if (!o.topology || pass >= node_count ||
+          std::ranges::all_of(serving, [](bool b) { return b; }))
+        break;
     }
     readers_stop.store(true, std::memory_order_relaxed);
     reader_threads.clear();
@@ -2312,6 +2383,7 @@ auto run(const RunOptions &o) -> int {
         mops.push_back({.append = false, .key = k, .element = 0, .read = {}});
       run_one(n.holder->db, o.followers > 0 ? Mode::Guarded : o.mode,
               {.process = process, .node = i, .epoch = final_epoch,
+               .life = n.life.load(std::memory_order_acquire),
                .role = Role::Final, .wait_seq = 0},
               rec, events, std::move(mops), {}, false, totals);
     }
@@ -2327,12 +2399,13 @@ auto run(const RunOptions &o) -> int {
     summary += ".cluster.json";
     write_cluster_summary(summary, cluster, final_leader);
     std::printf("  cluster: bootstraps=%zu events=%zu ingests=%d "
-                "ingest_errors=%d restarts=%d duplicates=%d lag_pauses=%d "
-                "follower_vacuums=%d session_reads=%d errors=%zu "
-                "final_leader=%d\n",
+                "ingest_errors=%d forks_detected=%d restarts=%d "
+                "duplicates=%d lag_pauses=%d follower_vacuums=%d "
+                "session_reads=%d errors=%zu final_leader=%d\n",
                 cluster.bootstraps.size(), cluster.events.size(),
                 cluster.ingests.load(), cluster.ingest_errors.load(),
-                cluster.restarts.load(), cluster.duplicates.load(),
+                cluster.forks_detected.load(), cluster.restarts.load(),
+                cluster.duplicates.load(),
                 cluster.lag_pauses.load(), cluster.follower_vacuums.load(),
                 cluster.session_reads.load(), cluster.errors.size(),
                 final_leader);

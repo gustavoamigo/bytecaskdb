@@ -150,7 +150,8 @@ and a release build passes `undefined` only because it skips that check.
 Every exception reaches JS as an `Error` with the exception's message, a
 `code`, and, for an I/O failure, the `errno`. `shared/error_codes.h` maps an
 exception to its code by class, for both backends: `DbDegraded` →
-`BC_DEGRADED`, `DbFollowerMode` → `BC_FOLLOWER_MODE`, `DbClosed` and the
+`BC_DEGRADED`, `DbFollowerMode` → `BC_FOLLOWER_MODE`, `DbChangeMarkerMismatch`
+→ `BC_CHANGE_MARKER_MISMATCH`, `DbClosed` and the
 bindings' own `HandleClosed` (a closed or consumed handle) → `BC_CLOSED`,
 `std::system_error` → `BC_IO`, `std::invalid_argument`, `length_error` and
 `out_of_range` → `BC_INVALID_ARGUMENT`, any other `std::logic_error` →

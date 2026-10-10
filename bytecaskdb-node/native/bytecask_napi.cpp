@@ -209,6 +209,7 @@ auto entry_type_to_string(bytecask::EntryType et) -> const char* {
     case bytecask::EntryType::BulkBegin: return "bulkBegin";
     case bytecask::EntryType::BulkEnd: return "bulkEnd";
     case bytecask::EntryType::RangeDel: return "rangeDel";
+    case bytecask::EntryType::ChangeMarker: return "changeMarker";
   }
   throw std::logic_error("unreachable: unknown EntryType");
 }
@@ -219,7 +220,53 @@ auto string_to_entry_type(const std::string& s) -> bytecask::EntryType {
   if (s == "bulkBegin") return bytecask::EntryType::BulkBegin;
   if (s == "bulkEnd") return bytecask::EntryType::BulkEnd;
   if (s == "rangeDel") return bytecask::EntryType::RangeDel;
+  if (s == "changeMarker") return bytecask::EntryType::ChangeMarker;
   throw std::invalid_argument("Invalid entryType: " + s);
+}
+
+// A ChangeMarker crosses as {sinceSequence: bigint, id: bigint} and a
+// ChangeHeader as {marker, fromSequence: bigint}, every sequence an exact
+// BigInt, as in commit_result_to_js.
+auto marker_to_js(Napi::Env env, const bytecask::ChangeMarker& m) -> Napi::Value {
+  auto obj = Napi::Object::New(env);
+  obj.Set("sinceSequence", Napi::BigInt::New(env, m.since_sequence));
+  obj.Set("id", Napi::BigInt::New(env, m.id));
+  return obj;
+}
+
+auto header_to_js(Napi::Env env, const bytecask::ChangeHeader& h) -> Napi::Value {
+  auto obj = Napi::Object::New(env);
+  obj.Set("marker", marker_to_js(env, h.marker));
+  obj.Set("fromSequence", Napi::BigInt::New(env, h.from_sequence));
+  return obj;
+}
+
+// A BigInt that is a sequence or a marker id: non-negative and below 2^64.
+// Anything else would wrap modulo 2^64 and alias a valid value, so it is
+// refused rather than truncated.
+auto strict_u64(const Napi::Value& v, const char* what) -> std::uint64_t {
+  if (!v.IsBigInt()) {
+    throw std::invalid_argument(std::string(what) + " must be a BigInt");
+  }
+  bool lossless = false;
+  const auto value = v.As<Napi::BigInt>().Uint64Value(&lossless);
+  if (!lossless) {
+    throw std::invalid_argument(std::string(what) +
+                                " must be a non-negative BigInt below 2^64");
+  }
+  return value;
+}
+
+auto bigint_prop(const Napi::Object& obj, const char* name) -> std::uint64_t {
+  return strict_u64(obj.Get(name), name);
+}
+
+auto header_from_js(const Napi::Value& v) -> bytecask::ChangeHeader {
+  auto obj = v.As<Napi::Object>();
+  auto marker = obj.Get("marker").As<Napi::Object>();
+  return {.marker = {.since_sequence = bigint_prop(marker, "sinceSequence"),
+                     .id = bigint_prop(marker, "id")},
+          .from_sequence = bigint_prop(obj, "fromSequence")};
 }
 
 // A missing/undefined/null argument at `index` yields Env().Undefined(),
@@ -248,6 +295,18 @@ auto opt_uint32_arg(const Napi::CallbackInfo& info, std::size_t index)
   auto v = info[index];
   if (v.IsUndefined() || v.IsNull()) return 0;
   return v.As<Napi::Number>().Uint32Value();
+}
+
+// changesSince's maxBytes: missing/undefined/null means no cut. A negative
+// number or NaN is refused; one beyond size_t is no cut as well.
+auto opt_max_bytes_arg(const Napi::CallbackInfo& info, std::size_t index)
+    -> std::size_t {
+  auto v = opt_arg(info, index);
+  if (v.IsUndefined()) return bytecask::kUnlimitedBytes;
+  auto d = v.As<Napi::Number>().DoubleValue();
+  if (!(d >= 0)) throw std::invalid_argument("maxBytes must be a non-negative number");
+  if (d >= static_cast<double>(bytecask::kUnlimitedBytes)) return bytecask::kUnlimitedBytes;
+  return static_cast<std::size_t>(d);
 }
 
 }  // namespace
@@ -707,14 +766,18 @@ auto NapiDB::CreateManifest(const Napi::CallbackInfo& info) -> Napi::Value {
 auto NapiDB::ChangesSince(const Napi::CallbackInfo& info) -> Napi::Value {
   auto* snap_wrap = NapiSnapshot::Unwrap(info[0].As<Napi::Object>());
   snap_wrap->Check();
-  bool lossless = false;
-  auto from_seq = info[1].As<Napi::BigInt>().Uint64Value(&lossless);
-  auto range = Db().changes_since(*snap_wrap->snap, from_seq);
-  return NapiChangeIterator::NewInstance(info.Env(), range.begin());
+  auto from_seq = strict_u64(info[1], "fromSeq");
+  auto batch = Db().changes_since(*snap_wrap->snap, from_seq, opt_max_bytes_arg(info, 2));
+  auto env = info.Env();
+  auto result = Napi::Object::New(env);
+  result.Set("header", header_to_js(env, batch.header));
+  result.Set("entries", NapiChangeIterator::NewInstance(env, batch.entries.begin()));
+  return result;
 }
 
 auto NapiDB::Ingest(const Napi::CallbackInfo& info) -> void {
-  auto entries = info[0].As<Napi::Array>();
+  auto header = header_from_js(info[0]);
+  auto entries = info[1].As<Napi::Array>();
   auto len = entries.Length();
 
   std::vector<bytecask::DataEntryView> views;
@@ -728,8 +791,7 @@ auto NapiDB::Ingest(const Napi::CallbackInfo& info) -> void {
 
   for (std::uint32_t i = 0; i < len; ++i) {
     auto e = entries.Get(i).As<Napi::Object>();
-    bool lossless = false;
-    auto seq = e.Get("sequence").As<Napi::BigInt>().Uint64Value(&lossless);
+    auto seq = strict_u64(e.Get("sequence"), "sequence");
     auto et = string_to_entry_type(e.Get("entryType").As<Napi::String>().Utf8Value());
 
     key_bufs.push_back(arg_to_string(e.Get("key")));
@@ -742,7 +804,7 @@ auto NapiDB::Ingest(const Napi::CallbackInfo& info) -> void {
         .value = to_view(val_bufs.back()),
     });
   }
-  Db().ingest(views);
+  Db().ingest(header, views);
 }
 
 auto NapiDB::Stats(const Napi::CallbackInfo& info) -> Napi::Value {

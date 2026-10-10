@@ -247,15 +247,18 @@ def gen_fault_injector(config: FaultConfig) -> str:
 # ---------------------------------------------------------------------------
 
 
-def gen_ingest_call(throwing: bool, var: str = "views") -> str:
-    """Generate the ingest call with or without REQUIRE_THROWS."""
+def gen_ingest_call(throwing: bool, var: str = "views",
+                    header: str = "owned.header") -> str:
+    """Generate the ingest call with or without REQUIRE_THROWS. header is the
+    slice's ChangeHeader: the collected slice's for the whole stream, or
+    header_after(split) for the part after a split (#397)."""
     if throwing:
         return (
             "        REQUIRE_THROWS_AS(\n"
-            f"            follower.ingest({var}),\n"
+            f"            follower.ingest({header}, {var}),\n"
             "            std::system_error);"
         )
-    return f"        follower.ingest({var});"
+    return f"        follower.ingest({header}, {var});"
 
 
 def gen_assertions_success(state: StateShape) -> str:
@@ -422,7 +425,8 @@ def gen_incremental_test(
 
     # First chunk always succeeds.
     parts.append("    // First chunk: always succeeds.")
-    parts.append("    if (!chunk1.empty()) follower.ingest(chunk1);")
+    parts.append("    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);")
+    parts.append("    const auto header2 = owned.header_after(split);")
     parts.append("")
 
     # Capture follower baseline AFTER chunk 1 so that failure assertions
@@ -437,11 +441,11 @@ def gen_incremental_test(
         parts.append("    // Second chunk: inject fault.")
         parts.append("    if (!chunk2.empty()) {")
         parts.append(fi_code)
-        parts.append(gen_ingest_call(delta.threw))
+        parts.append(gen_ingest_call(delta.threw, "chunk2", "header2"))
         parts.append("    }")
     else:
         parts.append("    // Second chunk.")
-        parts.append("    if (!chunk2.empty()) follower.ingest(chunk2);")
+        parts.append("    if (!chunk2.empty()) follower.ingest(header2, chunk2);")
 
     parts.append("")
 
@@ -517,7 +521,7 @@ def gen_restart_midstream_test(
         f"\n          {{{follower_opts}.initial_mode = bytecask::Mode::Follower}});"
     )
     parts.extend(seed_call(state, "      "))
-    parts.append("      if (!chunk1.empty()) follower.ingest(chunk1);")
+    parts.append("      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);")
     parts.append("    }")
     parts.append("")
 
@@ -548,13 +552,13 @@ def gen_restart_midstream_test(
         parts.append("      if (!views2.empty()) {")
         parts.append(fi_code)
         parts.append("        try {")
-        parts.append(f"          follower.ingest(views2);")
+        parts.append("          follower.ingest(owned2.header, views2);")
         parts.append("        } catch (const std::system_error&) {")
         parts.append("          threw = true;")
         parts.append("        }")
         parts.append("      }")
     else:
-        parts.append("      if (!views2.empty()) follower.ingest(views2);")
+        parts.append("      if (!views2.empty()) follower.ingest(owned2.header, views2);")
 
     parts.append("")
 
@@ -597,11 +601,11 @@ def gen_duplicate_delivery_test(state: StateShape) -> str:
         f"\n        {{{follower_opts}.initial_mode = bytecask::Mode::Follower}});"
     )
     parts.extend(seed_call(state, "    "))
-    parts.append("    follower.ingest(views);")
+    parts.append("    follower.ingest(owned.header, views);")
     parts.append("    auto seq_after = follower.durable_sequence();")
     parts.append("")
     parts.append("    // Re-deliver same entries — must be a no-op.")
-    parts.append("    follower.ingest(views);")
+    parts.append("    follower.ingest(owned.header, views);")
     parts.append("    CHECK(follower.durable_sequence() == seq_after);")
     parts.append("    assert_replication_match(leader_bl, follower);")
 
@@ -635,7 +639,7 @@ def gen_planned_promotion_test(state: StateShape) -> str:
         f"\n        {{{follower_opts}.initial_mode = bytecask::Mode::Follower}});"
     )
     parts.extend(seed_call(state, "    "))
-    parts.append("    follower.ingest(views);")
+    parts.append("    follower.ingest(owned.header, views);")
     parts.append("    assert_replication_match(init_leader_bl, follower);")
     parts.append("")
 
@@ -652,7 +656,7 @@ def gen_planned_promotion_test(state: StateShape) -> str:
         parts.append("    snap = leader.snapshot();")
         parts.append("    owned = collect_changes(leader.changes_since(snap, stream_from));")
         parts.append("    views = owned.views();")
-        parts.append("    follower.ingest(views);")
+        parts.append("    follower.ingest(owned.header, views);")
         parts.append("")
     parts.append("    // Leadership transfer: leader → follower, follower → leader.")
     parts.append("    leader.set_mode(bytecask::Mode::Follower);")
@@ -660,6 +664,7 @@ def gen_planned_promotion_test(state: StateShape) -> str:
     parts.append('        leader.put({}, to_bytes("reject"), to_bytes("x")),')
     parts.append("        bytecask::DbFollowerMode);")
     parts.append("")
+    parts.append("    // A promotion: the marker takes the next sequence, synced.")
     parts.append("    follower.set_mode(bytecask::Mode::Leader);")
     parts.append("    auto seq_before = follower.durable_sequence();")
     parts.append('    follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));')
@@ -674,7 +679,7 @@ def gen_planned_promotion_test(state: StateShape) -> str:
         " leader.durable_sequence()));"
     )
     parts.append("    auto views2 = owned2.views();")
-    parts.append("    leader.ingest(views2);")
+    parts.append("    leader.ingest(owned2.header, views2);")
     parts.append("")
 
     # Verify convergence — set outer leader_bl to follower's final state

@@ -574,7 +574,8 @@ public:
   // Constructor for implementation use - not part of public API
   explicit ChangeIterator(std::shared_ptr<const EngineState> state,
                           std::uint64_t from_sequence,
-                          std::uint64_t durable_sequence);
+                          std::uint64_t durable_sequence,
+                          std::size_t max_bytes);
 
   auto operator++() -> ChangeIterator &;
   void operator++(int);
@@ -585,6 +586,13 @@ private:
   // Implementation details hidden from public interface
   class Impl;
   std::unique_ptr<Impl> impl_;
+};
+
+// One changes_since result, which is one ingest call: where the slice starts
+// and which history it is from, and the entries, read lazily.
+export struct ChangeBatch {
+  ChangeHeader header;
+  std::ranges::subrange<ChangeIterator, std::default_sentinel_t> entries;
 };
 
 // ---------------------------------------------------------------------------
@@ -701,6 +709,11 @@ public:
   // State transition: set engine mode (Leader/Follower).
   void apply_set_mode(Mode mode) { mode_ = mode; }
 
+  // State transition: a ChangeMarker appended to the active file by a
+  // promotion. Counts it in the file's stats, advances next_seq and adds it
+  // to the marker list. Cannot fail.
+  void apply_change_marker(std::uint64_t sequence, std::uint64_t id);
+
   // State transition: mark engine as degraded with a reason.
   void apply_degrade(std::string reason) {
     degraded_ = true;
@@ -772,7 +785,12 @@ private:
                        std::uint64_t sync_requested_seq,
                        Mode mode,
                        bool degraded,
-                       std::string degraded_reason);
+                       std::string degraded_reason,
+                       std::shared_ptr<const std::vector<ChangeMarker>>
+                           change_markers);
+
+  // Adds m to the marker list, which is immutable: copied and replaced.
+  void append_marker(ChangeMarker m);
 
   KeyDirTransient key_dir_;
   TransientU32Table<std::shared_ptr<DataFile>> files_;
@@ -788,6 +806,7 @@ private:
   Mode mode_;
   bool degraded_;
   std::string degraded_reason_;
+  std::shared_ptr<const std::vector<ChangeMarker>> change_markers_;
 };
 
 // ---------------------------------------------------------------------------
@@ -819,6 +838,21 @@ public:
   DbFollowerMode(const DbFollowerMode &) = default;
   auto operator=(const DbFollowerMode &) -> DbFollowerMode & = default;
   ~DbFollowerMode() override;
+};
+
+// ---------------------------------------------------------------------------
+// DbChangeMarkerMismatch — thrown by ingest for a slice of a history that is
+// not this node's: the two diverged at a promotion one of them did not
+// follow. Nothing was written. The remedy is a re-bootstrap from the
+// source's manifest; the engine never repairs or truncates (#397).
+// ---------------------------------------------------------------------------
+export class DbChangeMarkerMismatch : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+  DbChangeMarkerMismatch(const DbChangeMarkerMismatch &) = default;
+  auto operator=(const DbChangeMarkerMismatch &)
+      -> DbChangeMarkerMismatch & = default;
+  ~DbChangeMarkerMismatch() override;
 };
 
 // ---------------------------------------------------------------------------
@@ -1139,6 +1173,12 @@ public:
   // Leader -> Follower first fdatasyncs, so durable_sequence() covers every
   // write acknowledged before the switch, sync or not. A failed fdatasync
   // degrades the engine and throws; the mode is unchanged.
+  // Follower -> Leader is a promotion: it appends a ChangeMarker at the next
+  // sequence and fdatasyncs it before the mode changes, so the first write
+  // after it takes the sequence after the marker's. A failed append or sync
+  // degrades, throws and leaves the mode; so does a promotion on a degraded
+  // engine, with DbDegraded. Leader -> Leader writes nothing; opening in
+  // Leader mode is not a promotion (#397).
   void set_mode(Mode mode);
 
   // Returns true if the engine has entered a degraded state. A degraded DB
@@ -1269,21 +1309,36 @@ public:
   // completion (caller responsibility).
   [[nodiscard]] auto create_manifest() -> FileManifest;
 
-  // Returns an iterator that yields raw entries (sequence, entry_type, key, value)
-  // for all committed, durable entries with sequence > from_sequence, in ascending
-  // sequence order. Used for replication.
-  // The upper bound is min(snap.sequence(), durable_sequence) — entries visible
-  // in the snapshot but not yet fdatasync'd are excluded.
-  [[nodiscard]] auto changes_since(const Snapshot& snap, std::uint64_t from_sequence) const
-      -> std::ranges::subrange<ChangeIterator, std::default_sentinel_t>;
+  // One slice of this node's history for ingest: a header (this node's
+  // marker at from_sequence, and from_sequence) and the whole units above
+  // from_sequence that were durable at snap, in ascending sequence order.
+  // A unit is a standalone entry, a ChangeMarker or a BulkBegin..BulkEnd
+  // batch; a batch straddling from_sequence is left out, since a node whose
+  // position is a unit boundary below it holds it already. The slice ends
+  // at the snapshot's durable sequence, or after the unit that takes it
+  // past max_bytes, so it never ends inside a batch. Entries visible in the
+  // snapshot but not yet fdatasync'd are excluded. The entries are read
+  // lazily, one file at a time.
+  [[nodiscard]] auto changes_since(const Snapshot& snap,
+                                   std::uint64_t from_sequence,
+                                   std::size_t max_bytes = kUnlimitedBytes)
+      const -> ChangeBatch;
 
-  // Applies pre-sequenced entries from a trusted leader. Only callable in
-  // Follower mode (throws std::logic_error otherwise). Entries with
-  // sequence <= current durable_seq are silently skipped (idempotency).
-  // Always syncs; never splits a BulkBegin..BulkEnd across files.
-  // Publishes the slice in one step, so the caller must end it at a batch
-  // boundary: a slice ending inside a batch publishes part of it (#188).
-  void ingest(std::span<const DataEntryView> entries);
+  // Applies one slice of a source's history, as changes_since produced it.
+  // Follower mode only (std::logic_error otherwise). Checks, before anything
+  // is written, with P = durable_sequence() and X = min(P, L), L the slice's
+  // last sequence or header.from_sequence if it is empty:
+  //   - header.from_sequence > P: a gap, std::invalid_argument;
+  //   - the source's marker at X (the last ChangeMarker in the slice at or
+  //     below X, or header.marker) differs from this node's marker at X: a
+  //     fork, DbChangeMarkerMismatch;
+  //   - a slice not strictly increasing above from_sequence, a ChangeMarker
+  //     inside a batch or malformed, or a slice ending inside a batch:
+  //     std::invalid_argument (#188).
+  // Entries at or below P are skipped (idempotency); the rest is appended,
+  // synced and published in one step, a batch never split across files.
+  void ingest(const ChangeHeader &header,
+              std::span<const DataEntryView> entries);
 
   // Returns all operational counters and gauges as a flat map.
   // Copies atomic counters (relaxed load) and reads current gauges from
@@ -2094,6 +2149,7 @@ export struct EngineSlot : Slot {
 
 DbDegraded::~DbDegraded() = default;
 DbFollowerMode::~DbFollowerMode() = default;
+DbChangeMarkerMismatch::~DbChangeMarkerMismatch() = default;
 DbClosed::~DbClosed() = default;
 
 #pragma region Internal helpers
@@ -2144,6 +2200,25 @@ auto make_data_file_stem() -> std::string {
                      tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, salt);
 }
 
+// A ChangeMarker's id: 64 random bits, from the entropy source, like the
+// file stem's salt. Two promotions anywhere must not share one.
+auto random_marker_id() -> std::uint64_t {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+  // TLS: process — an entropy source; no DB data.
+  static thread_local std::random_device rd;
+#pragma clang diagnostic pop
+  return (static_cast<std::uint64_t>(rd()) << 32) | rd();
+}
+
+// The marker list recovery publishes: sorted by sequence, null when empty.
+auto sorted_markers(std::vector<ChangeMarker> markers)
+    -> std::shared_ptr<const std::vector<ChangeMarker>> {
+  if (markers.empty()) return nullptr;
+  std::ranges::sort(markers, {}, &ChangeMarker::since_sequence);
+  return std::make_shared<const std::vector<ChangeMarker>>(std::move(markers));
+}
+
 } // namespace
 
 #pragma endregion
@@ -2157,19 +2232,38 @@ TransientEngineState::TransientEngineState(
     std::uint32_t active_file_id, std::uint32_t next_file_id,
     std::uint64_t next_seq, std::uint64_t durable_seq,
     std::uint64_t sync_requested_seq,
-    Mode mode, bool degraded, std::string degraded_reason)
+    Mode mode, bool degraded, std::string degraded_reason,
+    std::shared_ptr<const std::vector<ChangeMarker>> change_markers)
     : key_dir_{std::move(key_dir)}, files_{std::move(files)},
       file_stats_{std::move(file_stats)}, active_file_id_{active_file_id},
       next_file_id_{next_file_id}, next_seq_{next_seq},
       durable_seq_{durable_seq}, sync_requested_seq_{sync_requested_seq},
       mode_{mode}, degraded_{degraded},
-      degraded_reason_{std::move(degraded_reason)} {}
+      degraded_reason_{std::move(degraded_reason)},
+      change_markers_{std::move(change_markers)} {}
 
 auto EngineState::transient() const -> TransientEngineState {
   return TransientEngineState{
       key_dir.transient(), files.transient(), file_stats.transient(),
       active_file_id, next_file_id, next_seq, durable_seq,
-      sync_requested_seq, mode, degraded, degraded_reason};
+      sync_requested_seq, mode, degraded, degraded_reason, change_markers};
+}
+
+void TransientEngineState::append_marker(ChangeMarker m) {
+  auto list = change_markers_ ? *change_markers_ : std::vector<ChangeMarker>{};
+  list.push_back(m);
+  change_markers_ =
+      std::make_shared<const std::vector<ChangeMarker>>(std::move(list));
+}
+
+void TransientEngineState::apply_change_marker(std::uint64_t sequence,
+                                               std::uint64_t id) {
+  const auto sz = change_marker_size(EntryType::ChangeMarker);
+  file_stats_.patch(active_file_id_,
+                    {.total_added = sz, .change_marker_added = sz,
+                     .min_sequence = sequence, .max_sequence = sequence});
+  if (sequence >= next_seq_) next_seq_ = sequence + 1;
+  append_marker({sequence, id});
 }
 
 auto TransientEngineState::validate_preconditions(
@@ -2481,6 +2575,16 @@ void TransientEngineState::apply_ingest(
       break;
     }
 
+    case EntryType::ChangeMarker: {
+      // The source's promotion, stored as this node's: from here on the two
+      // histories carry the same identity (#397).
+      const auto m = change_marker_size(e.entry_type);
+      file_stats_.patch(active_file_id_,
+                        {.total_added = m, .change_marker_added = m});
+      append_marker({e.sequence, decode_marker_id(e.value)});
+      break;
+    }
+
     case EntryType::Put: {
       const auto val_size = narrow<std::uint32_t>(e.value.size());
       note_pending(offset, e.sequence, e.key, val_size);
@@ -2594,7 +2698,8 @@ void TransientEngineState::apply_vacuum(
   file_stats_.set(dest_file_id,
                   FileStats{actual_live_bytes, scan.total_bytes,
                             scan.min_sequence, scan.max_sequence,
-                            scan.tombstone_bytes, scan.marker_bytes});
+                            scan.tombstone_bytes, scan.marker_bytes,
+                            scan.change_marker_bytes});
 }
 
 void TransientEngineState::apply_resume(
@@ -2605,6 +2710,7 @@ void TransientEngineState::apply_resume(
   std::uint64_t seq_max = 0;
   std::uint64_t tomb = 0;
   std::uint64_t mark = 0;
+  std::uint64_t cm = 0;
   for (const auto &e : entries) {
     const std::span<const std::byte> key_span{e.key};
     if (e.sequence > max_seq) max_seq = e.sequence;
@@ -2614,6 +2720,7 @@ void TransientEngineState::apply_resume(
     // tombstones are rebuilt from scratch here, like its bounds.
     tomb += tombstone_size(e.entry_type, e.key.size(), e.range_end.size());
     mark += marker_size(e.entry_type);
+    cm += change_marker_size(e.entry_type);
 
     switch (e.entry_type) {
     case EntryType::Put: {
@@ -2662,6 +2769,17 @@ void TransientEngineState::apply_resume(
         (void)kd_erase(key_dir_, std::span<const std::byte>{k}, kd_ctx());
       break;
     }
+    case EntryType::ChangeMarker:
+      // A promotion whose marker reached the file but was never published —
+      // set_mode(Leader) failed after its append — is in the list from here.
+      // One already published is in it already, so only a marker above the
+      // list's last is added.
+      // The list is never empty when it exists.
+      if (const auto *ms = change_markers_.get();
+          !ms || ms->back().since_sequence < e.sequence) {
+        append_marker({e.sequence, e.marker_id});
+      }
+      break;
     case EntryType::BulkBegin:
     case EntryType::BulkEnd:
       // A marker carries no key and no value, so it moves no key directory
@@ -2687,6 +2805,7 @@ void TransientEngineState::apply_resume(
     fs->max_sequence = seq_max;
     fs->tombstone_bytes = tomb;
     fs->marker_bytes = mark;
+    fs->change_marker_bytes = cm;
     file_stats_.set(file_id, *fs);
   }
 }
@@ -2739,6 +2858,7 @@ auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
   s->mode = mode_;
   s->degraded = degraded_;
   s->degraded_reason = std::move(degraded_reason_);
+  s->change_markers = std::move(change_markers_);
   return s;
 }
 
@@ -3871,8 +3991,10 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
     // it. A tombstone may need keeping even with no live key left: dropping
     // it could let recovery resurrect a Put it shadows in an older file, and
     // only compaction decides which tombstones can go. Nor may a file go
-    // whole while it holds an entry above retain_after.
+    // whole while it holds an entry above retain_after, or a change marker,
+    // which is kept for ever.
     if (target.live_bytes == 0 && target.tombstone_bytes == 0 &&
+        target.change_marker_bytes == 0 &&
         target.max_sequence <= opts.retain_after) {
       vacuum_remove_file(fid);
       return true;
@@ -4072,6 +4194,13 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
       hint.append(entry.sequence, entry.entry_type, entry_off, {}, 0);
       continue;
     }
+    if (entry.entry_type == EntryType::ChangeMarker) {
+      // Recovery rebuilds the marker list from hints alone, so the id goes
+      // with the entry. Keyless, like the batch markers, ahead of the run.
+      hint.append_change_marker(entry.sequence, entry_off,
+                                decode_marker_id(entry.value));
+      continue;
+    }
     if (entry.entry_type == EntryType::RangeDel) {
       // A range tombstone's key is a range bound, not a key of the file, so
       // it must not join the sorted run — deduplicating by key would let it
@@ -4209,6 +4338,16 @@ auto DB::vacuum_scan_and_copy(
       const auto sz = entry_size(entry.key.size(), entry.value.size());
       result.total_bytes += sz;
       result.tombstone_bytes += sz;
+      track_seq(entry.sequence);
+      break;
+    }
+    case EntryType::ChangeMarker: {
+      // Kept for ever: the identity of the history from here on (#397).
+      std::ignore = dest_file.append_entry(entry.sequence, entry.entry_type,
+                                           {}, entry.value);
+      const auto sz = entry_size(0, entry.value.size());
+      result.total_bytes += sz;
+      result.change_marker_bytes += sz;
       track_seq(entry.sequence);
       break;
     }
@@ -4554,6 +4693,7 @@ void DB::set_mode(Mode mode) {
   WriteBarrier barrier{*this};
   auto current = load_state_for_write();
   if (current->closed) throw DbClosed{};
+  if (mode == current->mode) return;
   auto t = current->transient();
   // A leader stepping down makes every write it acknowledged durable, and
   // so shippable: changes_since stops at durable_sequence, and a sync=false
@@ -4561,9 +4701,74 @@ void DB::set_mode(Mode mode) {
   // reuses its sequence. Only a leader can hold such a write: ingest syncs
   // before it publishes.
   const auto last_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
-  if (mode == Mode::Follower && !refused(*current) &&
-      t.durable_seq() < last_seq) {
-    sync_active_file(t, current, "set_mode(Follower)");
+  if (mode == Mode::Follower) {
+    if (!refused(*current) && t.durable_seq() < last_seq) {
+      sync_active_file(t, current, "set_mode(Follower)");
+    }
+  } else {
+    // A promotion. The marker names the history from here on, so it has to
+    // be on disk before any write of the new leader is, and the mode must
+    // not change without it: a degraded engine cannot write it and stays a
+    // follower (#397).
+    if (refused(*current)) throw DbDegraded{degraded_reason()};
+    const auto seq = t.next_seq();
+    // The marker is a write: past the last packable sequence it is refused
+    // as a write is, and the engine stays a healthy follower.
+    if (seq > KeyDirEntry::kMaxSequence) {
+      throw std::runtime_error{std::format(
+          "sequence space exhausted: a promotion needs sequence {}, past the "
+          "limit of {}",
+          seq, KeyDirEntry::kMaxSequence)};
+    }
+    const auto id = random_marker_id();
+    const auto id_bytes = encode_marker_id(id);
+    auto &file = t.active_file();
+    try {
+      std::ignore = file.append_entry(seq, EntryType::ChangeMarker, {},
+                                      id_bytes);
+    } catch (...) {
+      auto ex = std::current_exception();
+      try { file.sync(); } catch (...) {}
+      store_state(current->degraded_copy(
+          "set_mode(Leader) marker append IO error: call resume() to "
+          "recover."));
+      std::rethrow_exception(ex);
+    }
+    // From here the marker is in the file. A failure below that no handler
+    // degrades for — an allocation, typically — would leave a healthy
+    // follower whose next promotion appends a second marker under the same
+    // sequence, so writes are refused until resume() reconciles the file, as
+    // after any append (#364).
+    try {
+      t.apply_change_marker(seq, id);
+      counters_.bytes_written.fetch_add(
+          static_cast<std::int64_t>(
+              change_marker_size(EntryType::ChangeMarker)),
+          std::memory_order_relaxed);
+      // Publishes t degraded, marker included, on failure: the entry is in
+      // the file, and resume() finds it there either way.
+      sync_active_file(t, current, "set_mode(Leader)");
+      if (t.is_rotation_needed(rotation_threshold_) &&
+          t.file_ids_left() > 0) {
+        PreparedRotation rotation;
+        try {
+          rotation = prepare_rotation(t);
+        } catch (...) {
+          t.apply_degrade(
+              "set_mode(Leader) rotation file creation failed: call "
+              "resume().");
+          store_state(current, std::move(t).persistent());
+          throw;
+        }
+        finish_rotation(t, std::move(rotation));
+      }
+      t.apply_set_mode(mode);
+      store_state(current, std::move(t).persistent());
+    } catch (...) {
+      refuse_writes();
+      throw;
+    }
+    return;
   }
   t.apply_set_mode(mode);
   store_state(current, std::move(t).persistent());
@@ -4662,7 +4867,10 @@ void DB::resume() {
       committed.push_back({entry.sequence, entry.entry_type, entry_off,
                            narrow<std::uint32_t>(entry.value.size()),
                            {entry.key.begin(), entry.key.end()},
-                           std::move(range_end)});
+                           std::move(range_end),
+                           entry.entry_type == EntryType::ChangeMarker
+                               ? decode_marker_id(entry.value)
+                               : 0});
       // Every entry yielded lies below the iterator's committed offset, so
       // recording it here keeps valid_offset in step with `committed` even
       // when the next entry is corrupt and ++iter throws.
@@ -5087,6 +5295,24 @@ void DB::validate_state_consistency(const EngineState &s) const {
     if (!s.file_stats.contains(file_id)) {
       throw std::runtime_error{std::format(
           "state consistency: file_id {} missing from file_stats", file_id)};
+    }
+  }
+
+  // 5. The marker list is in sequence order and below next_seq.
+  if (const auto *ms = s.change_markers.get()) {
+    std::uint64_t prev = 0;
+    for (const auto &m : *ms) {
+      if (m.since_sequence <= prev) {
+        throw std::runtime_error{std::format(
+            "state consistency: change marker at {} out of order after {}",
+            m.since_sequence, prev)};
+      }
+      if (m.since_sequence >= s.next_seq) {
+        throw std::runtime_error{std::format(
+            "state consistency: change marker at {} at or above next_seq {}",
+            m.since_sequence, s.next_seq)};
+      }
+      prev = m.since_sequence;
     }
   }
 
@@ -5599,6 +5825,7 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
   std::vector<RangeTombstone> range_tombstones;
   std::vector<std::uint64_t> needed;
   bool skipped = false;
+  std::vector<ChangeMarker> markers;
   std::unordered_map<std::uint32_t, FileStats> fstats_scratch;
   for (const auto &rf : files)
     fstats_scratch.emplace(rf.file_id, FileStats{0, rf.total_bytes});
@@ -5612,6 +5839,7 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
     fs.tombstone_bytes +=
         tombstone_size(he.entry_type, he.key.size(), he.end_key.size());
     fs.marker_bytes += marker_size(he.entry_type);
+    fs.change_marker_bytes += change_marker_size(he.entry_type);
   };
 
   // One cursor per hint file, parked on its next Put or Delete. A scanner's
@@ -5651,6 +5879,10 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
           he->entry_type == EntryType::BulkEnd) {
         continue;
       }
+      if (he->entry_type == EntryType::ChangeMarker) {
+        markers.push_back({he->sequence, he->marker_id});
+        continue;
+      }
       c.lookahead.assign(*he);
       c.has_lookahead = true;
       break;
@@ -5670,15 +5902,19 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
   auto next_data = [&](Cursor &c) -> std::optional<HintEntry> {
     while (auto he = c.scanner.next()) {
       note(c.file_id, *he);
-      if (he->entry_type == EntryType::BulkBegin ||
-          he->entry_type == EntryType::BulkEnd)
-        continue;
-      if (he->entry_type == EntryType::RangeDel) {
+      switch (he->entry_type) {
+      case EntryType::BulkBegin:
+      case EntryType::BulkEnd:
+      case EntryType::ChangeMarker:
+        continue;  // keyless: nothing to park a cursor on
+      case EntryType::RangeDel:
         // Range tombstones only ever sit in the head of a sorted file.
         throw std::runtime_error{
             "bytecask: range tombstone inside a sorted hint run"};
+      case EntryType::Put:
+      case EntryType::Delete:
+        return *he;
       }
-      return *he;
     }
     return std::nullopt;
   };
@@ -5799,7 +6035,8 @@ auto DB::recovery_build_sorted(std::span<RecoveredFile> files, bool strict)
 
   return {std::move(out).finish(), std::move(tombstones),
           std::move(range_tombstones), max_seq,
-          std::move(fstats_t).persistent(), std::move(needed), skipped};
+          std::move(fstats_t).persistent(), std::move(needed), skipped,
+          std::move(markers)};
 }
 
 // ---------------------------------------------------------------------------
@@ -5875,9 +6112,12 @@ auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
   std::vector<RangeTombstone> range_tombstones;
   std::vector<std::uint64_t> needed;
   std::unordered_map<std::uint32_t, FileStats> fstats;
+  std::vector<ChangeMarker> change_markers;
   std::uint64_t max_seq = 0;
   for (auto &part : parts) {
     max_seq = std::max(max_seq, part.max_seq);
+    change_markers.insert(change_markers.end(), part.change_markers.begin(),
+                          part.change_markers.end());
     for (const auto &[key, tomb] : part.tombstones) {
       auto &existing = tombstones[key];
       if (tomb.seq > existing.seq) existing = tomb;
@@ -6092,6 +6332,7 @@ auto DB::recovery_load_ranged(EngineState s, std::vector<RecoveredFile> files,
   s.key_dir = key_dir_from_recovered(std::move(key_dir));
   s.next_seq = max_seq + 1;
   s.file_stats = FileStatsMap{std::move(fstats_t).persistent()};
+  s.change_markers = sorted_markers(std::move(change_markers));
   return s;
 }
 
@@ -6148,6 +6389,7 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
     std::vector<RangeTombstone> range_tombstones;
     FileStats stats;
     std::uint64_t max_seq{0};
+    std::vector<ChangeMarker> markers;
   };
   std::vector<FileRun> runs(files.size());
 
@@ -6174,9 +6416,13 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
           tombstone_size(he->entry_type, he->key.size(), he->end_key.size());
       run.max_seq = std::max(run.max_seq, he->sequence);
       run.stats.marker_bytes += marker_size(he->entry_type);
+      run.stats.change_marker_bytes += change_marker_size(he->entry_type);
       switch (he->entry_type) {
       case EntryType::BulkBegin:
       case EntryType::BulkEnd:
+        continue;
+      case EntryType::ChangeMarker:
+        run.markers.push_back({he->sequence, he->marker_id});
         continue;
       case EntryType::RangeDel:
         // Range tombstones only ever sit in the head of a sorted file.
@@ -6216,8 +6462,11 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
 
   std::uint64_t max_seq = 0;
   std::vector<RangeTombstone> range_tombstones;
+  std::vector<ChangeMarker> change_markers;
   for (auto &run : runs) {
     max_seq = std::max(max_seq, run.max_seq);
+    change_markers.insert(change_markers.end(), run.markers.begin(),
+                          run.markers.end());
     range_tombstones.insert(
         range_tombstones.end(),
         std::make_move_iterator(run.range_tombstones.begin()),
@@ -6457,6 +6706,7 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
   plog.mark("concat");
   s.next_seq = max_seq + 1;
   s.file_stats = FileStatsMap{std::move(fstats_t).persistent()};
+  s.change_markers = sorted_markers(std::move(change_markers));
   return s;
 }
 #endif  // BYTECASK_KEYDIR_BLIND
@@ -6478,9 +6728,10 @@ class ChangeIterator::Impl {
 public:
   Impl(std::shared_ptr<const EngineState> state,
        std::uint64_t from_sequence,
-       std::uint64_t durable_sequence)
+       std::uint64_t durable_sequence,
+       std::size_t max_bytes)
     : state_(std::move(state)), from_sequence_(from_sequence),
-      durable_sequence_(durable_sequence) {
+      durable_sequence_(durable_sequence), max_bytes_(max_bytes) {
 
     // Build sorted file list — O(num_files), typically tiny.
     for (const auto [file_id, stats] : state_->file_stats.all()) {
@@ -6503,15 +6754,18 @@ public:
   }
 
 private:
-  auto should_include(std::uint64_t seq) const -> bool {
-    return seq > from_sequence_ && seq <= durable_sequence_;
-  }
-
-  // Scans forward across entries and files until a valid entry is found
-  // or all files are exhausted. The cached BytesView spans point into
-  // the iterator's current entry, so we must NOT advance the iterator
-  // after caching — that would invalidate the view. Instead, we set
-  // needs_advance_ and increment on the next call.
+  // Scans forward across entries and files until the next entry of the
+  // slice is found, the slice is cut, or all files are exhausted. The cached
+  // BytesView spans point into the iterator's current entry, so we must NOT
+  // advance the iterator after caching — that would invalidate the view.
+  // Instead, we set needs_advance_ and increment on the next call.
+  //
+  // The slice is whole units. A unit starts at any entry outside a batch; it
+  // is in the slice when its first sequence is above from_sequence_, so a
+  // batch that straddles from_sequence_ is left out whole. Durability is
+  // per unit too: the durable sequence always sits on a unit boundary, so
+  // the first entry above it ends the slice, and a torn batch at the end of
+  // the active file, which lies above it, is never reached.
   void advance_to_next_valid() {
     has_entry_ = false;
 
@@ -6521,24 +6775,36 @@ private:
       ++(*entry_iter_);
       needs_advance_ = false;
     }
+    if (done_) return;
 
     while (true) {
       // Try next entry in the current file.
       if (entry_iter_ && !(*entry_iter_ == std::default_sentinel)) {
         const auto& [entry, entry_off] = **entry_iter_;
-        if (should_include(entry.sequence)) {
-          cache_entry(entry);
-          needs_advance_ = true;
+        if (!in_batch_) included_ = entry.sequence > from_sequence_;
+        if (entry.entry_type == EntryType::BulkBegin) in_batch_ = true;
+        else if (entry.entry_type == EntryType::BulkEnd) in_batch_ = false;
+        if (!included_) {
+          ++(*entry_iter_);
+          continue;
+        }
+        if (entry.sequence > durable_sequence_) {
+          done_ = true;
           return;
         }
-        ++(*entry_iter_);
-        continue;
+        cache_entry(entry);
+        needs_advance_ = true;
+        sent_ += entry_size(entry.key.size(), entry.value.size());
+        // Cut after the unit that passes max_bytes: never inside a batch.
+        if (sent_ >= max_bytes_ && !in_batch_) done_ = true;
+        return;
       }
 
-      // Try next file.
+      // Try next file. A batch never spans two files.
       if (file_idx_ < file_queue_.size()) {
         auto file_id = file_queue_[file_idx_].second;
         ++file_idx_;
+        in_batch_ = false;
         auto file_ptr = state_->files.get(file_id);
         if (file_ptr) {
           entry_iter_.emplace(DataFileIterator{**file_ptr});
@@ -6566,6 +6832,11 @@ private:
   std::shared_ptr<const EngineState> state_;
   std::uint64_t from_sequence_;
   std::uint64_t durable_sequence_;
+  std::size_t max_bytes_;
+  std::size_t sent_{0};     // bytes of the entries yielded so far
+  bool in_batch_{false};    // inside a BulkBegin..BulkEnd of the current file
+  bool included_{false};    // whether the current unit is in the slice
+  bool done_{false};        // the slice ended: cut, or past durable
 
   // File traversal — sorted by min_sequence.
   std::vector<std::pair<std::uint64_t, std::uint32_t>> file_queue_;
@@ -6583,8 +6854,10 @@ private:
 // ChangeIterator methods
 ChangeIterator::ChangeIterator(std::shared_ptr<const EngineState> state,
                                std::uint64_t from_sequence,
-                               std::uint64_t durable_sequence)
-  : impl_(std::make_unique<Impl>(std::move(state), from_sequence, durable_sequence)) {}
+                               std::uint64_t durable_sequence,
+                               std::size_t max_bytes)
+  : impl_(std::make_unique<Impl>(std::move(state), from_sequence,
+                                 durable_sequence, max_bytes)) {}
 
 ChangeIterator::~ChangeIterator() = default;
 
@@ -6611,12 +6884,14 @@ auto ChangeIterator::operator==(std::default_sentinel_t) const noexcept -> bool 
 }
 
 // DB::changes_since implementation
-auto DB::changes_since(const Snapshot& snap, std::uint64_t from_sequence) const
-    -> std::ranges::subrange<ChangeIterator, std::default_sentinel_t> {
+auto DB::changes_since(const Snapshot& snap, std::uint64_t from_sequence,
+                       std::size_t max_bytes) const -> ChangeBatch {
   if (load_state()->closed) throw DbClosed{};
   auto state = snap.state();
-  auto begin = ChangeIterator{state, from_sequence, state->durable_seq};
-  return {std::move(begin), std::default_sentinel};
+  ChangeHeader header{state->marker_at(from_sequence), from_sequence};
+  auto begin =
+      ChangeIterator{state, from_sequence, state->durable_seq, max_bytes};
+  return {header, {std::move(begin), std::default_sentinel}};
 }
 
 #pragma endregion
@@ -6640,7 +6915,8 @@ auto DB::ingest_chunk(std::span<const DataEntryView> entries,
           .end_size = file_size};
 }
 
-void DB::ingest(std::span<const DataEntryView> entries) {
+void DB::ingest(const ChangeHeader &header,
+                std::span<const DataEntryView> entries) {
   if (auto s = load_state(); !s->is_ingestion_allowed()) {
     if (s->closed) throw DbClosed{};
     if (s->degraded) throw DbDegraded{s->degraded_reason};
@@ -6648,13 +6924,35 @@ void DB::ingest(std::span<const DataEntryView> entries) {
   }
   if (write_fault_.load(std::memory_order_acquire))
     throw DbDegraded{kWriteFaultReason};
-  if (entries.empty()) return;
 
   // An atomic batch is written to one file like a plan, so it is held to the
   // same byte limit; with it every entry's offset fits the packed field.
   std::uint64_t batch_bytes = 0;
   auto in_batch = false;
+  auto previous = header.from_sequence;
   for (const auto &e : entries) {
+    if (e.sequence <= previous) {
+      throw std::invalid_argument{std::format(
+          "ingest: sequence {} after {}: a slice is strictly increasing "
+          "above its header's from_sequence",
+          e.sequence, previous)};
+    }
+    previous = e.sequence;
+    // A type byte outside the enum would be appended as given and read back
+    // as damage, cutting the follower's newest file at the next open.
+    if (!is_known_entry_type(e.entry_type)) {
+      throw std::invalid_argument{std::format(
+          "ingest: unknown entry type {}",
+          static_cast<unsigned>(e.entry_type))};
+    }
+    if (e.entry_type == EntryType::ChangeMarker) {
+      // A marker is a unit of its own, and its value is its id.
+      if (in_batch || !e.key.empty() ||
+          e.value.size() != kChangeMarkerIdBytes) {
+        throw std::invalid_argument{
+            "ingest: a change marker inside an atomic batch, or malformed"};
+      }
+    }
     check_key_size(e.key.size(), size_limits_.max_key_bytes);
     if (e.entry_type == EntryType::Put) {
       check_value_size(e.value.size(), size_limits_.max_value_bytes);
@@ -6694,6 +6992,38 @@ void DB::ingest(std::span<const DataEntryView> entries) {
     if (current->closed) throw DbClosed{};
     if (refused(*current)) throw DbDegraded{degraded_reason()};
     throw std::logic_error{"ingest rejected: engine is not in follower mode"};
+  }
+
+  // The slice must continue this node's own history (#397). With P the
+  // position and X the lower of P and the slice's last sequence: a slice
+  // that starts past P has a hole before it, and the source's marker at X
+  // must be this node's, or the two histories diverged at a promotion. X
+  // stops at the slice's last sequence because the slice says nothing past
+  // it, and at P because the slice is skipped as duplicates up to there.
+  // An empty slice compares at from_sequence, which is how a node ahead of
+  // its source on another history is found out.
+  const auto position = current->durable_seq;
+  if (header.from_sequence > position) {
+    throw std::invalid_argument{std::format(
+        "ingest: the slice starts at {}, past this node's durable sequence "
+        "{}: a gap",
+        header.from_sequence, position)};
+  }
+  const auto last =
+      entries.empty() ? header.from_sequence : entries.back().sequence;
+  const auto at = std::min(position, last);
+  auto source = header.marker;
+  for (const auto &e : entries) {
+    if (e.sequence > at) break;
+    if (e.entry_type == EntryType::ChangeMarker)
+      source = {e.sequence, decode_marker_id(e.value)};
+  }
+  if (const auto mine = current->marker_at(at); source != mine) {
+    throw DbChangeMarkerMismatch{std::format(
+        "ingest: at sequence {} the source's history is marker {{{}, {:#x}}} "
+        "and this node's is {{{}, {:#x}}}: they diverged at a promotion; "
+        "re-bootstrap this node",
+        at, source.since_sequence, source.id, mine.since_sequence, mine.id)};
   }
 
   auto t = current->transient();

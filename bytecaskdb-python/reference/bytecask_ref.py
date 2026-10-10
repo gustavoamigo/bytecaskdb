@@ -45,9 +45,17 @@ on the engine: ``bytecaskdb.DB.open(path, backend=bytecask_ref)``.
 Files are the engine's V01 format (docs/file_format.md): the C++ engine opens
 a database written here, and this opens one the engine wrote.
 
+Replication is the engine's too: ``changes_since`` streams a leader's durable
+entries, ``ingest`` applies them on a follower under their own sequences, and
+a promotion (``set_mode(Mode.Leader)`` on a follower) appends a change marker
+that names the history from there on, so ``ingest`` refuses a stream from a
+history that diverged at a promotion, or one that starts past the follower
+(#397). ``create_manifest`` seals the files a new follower is copied from.
+
 Left out, because none of it changes what a read returns: hint files, vacuum,
-group commit, the buffer pool, preallocation, replication and resume(). After
-an I/O error on a write, writes stop until the database is reopened.
+group commit, the buffer pool, preallocation, resume() and the waiting form of
+durable_sequence(). After an I/O error on a write, writes stop until the
+database is reopened.
 
 What the engine guarantees and this does not:
 
@@ -97,6 +105,7 @@ class EntryType(enum.IntEnum):
     BULK_BEGIN = 3
     BULK_END = 4
     RANGE_DELETE = 5  # key = range start, value = range end (exclusive)
+    CHANGE_MARKER = 6  # a promotion: key empty, value = the marker's 8-byte id
 
 
 _HEADER = struct.Struct("<QBHI")
@@ -108,6 +117,9 @@ class Entry(NamedTuple):
     type: EntryType
     key: bytes = b""
     value: bytes = b""
+
+    def size(self) -> int:
+        return _HEADER.size + len(self.key) + len(self.value) + _CRC.size
 
     def encode(self) -> bytes:
         body = _HEADER.pack(self.sequence, self.type, len(self.key), len(self.value))
@@ -122,8 +134,8 @@ class Entry(NamedTuple):
         sequence, raw_type, key_size, value_size = _HEADER.unpack_from(buf, offset)
         try:
             entry_type = EntryType(raw_type)
-        except ValueError:  # 0 is never a type: zeros are unwritten space
-            return None
+        except ValueError:  # 0 is never a type: zeros are unwritten space.
+            return None     # Any other unknown type is damage, like a bad CRC.
         key_at = offset + _HEADER.size
         value_at = key_at + key_size
         crc_at = value_at + value_size
@@ -147,10 +159,11 @@ def scan_committed(buf: bytes) -> tuple[list[Placed], int]:
     """The committed entries of a data file, and the offset where they end.
 
     A file is a sequence of units; a batch is committed once its BULK_END is
-    read, so one a crash tore (a BULK_BEGIN without its end) is not::
+    read, so one a crash tore (a BULK_BEGIN without its end) is not. A change
+    marker is a unit of its own, never part of a batch::
 
         file := unit*
-        unit := entry | BULK_BEGIN entry* BULK_END
+        unit := entry | CHANGE_MARKER | BULK_BEGIN entry* BULK_END
 
     The scan stops at the first entry that does not parse or does not fit.
     """
@@ -168,6 +181,8 @@ def scan_committed(buf: bytes) -> tuple[list[Placed], int]:
                 end = next_offset
             case EntryType.BULK_BEGIN | EntryType.BULK_END:
                 break  # a marker out of place: damage
+            case EntryType.CHANGE_MARKER if batch is not None:
+                break  # nothing writes one inside a batch: damage
             case _ if batch is not None:
                 batch.append(Placed(offset, entry))
             case _:
@@ -189,6 +204,8 @@ def dump(path: str | os.PathLike[str]) -> None:
                     fields = f"{e.key!r}"
                 case EntryType.BULK_BEGIN | EntryType.BULK_END:
                     fields = ""
+                case EntryType.CHANGE_MARKER:
+                    fields = f"id {e.value.hex()}"
             print(f"{offset:8}  seq {e.sequence}  {e.type.name:<12}{fields}".rstrip())
 
 
@@ -223,7 +240,7 @@ def apply_entry(keydir: KeyDir, file_id: int, placed: Placed) -> KeyDir:
             for key, _ in list(keydir.ascending(entry.key, entry.value)):
                 keydir = keydir.remove(key)
             return keydir
-        case EntryType.BULK_BEGIN | EntryType.BULK_END:
+        case EntryType.BULK_BEGIN | EntryType.BULK_END | EntryType.CHANGE_MARKER:
             return keydir
 
 
@@ -262,6 +279,83 @@ class DbDegraded(ByteCaskError, RuntimeError):
     reopen the database to write again."""
 
 
+class DbFollowerMode(ByteCaskError, RuntimeError):
+    """Raised by put, del_, del_range and apply_batch in follower mode."""
+
+
+class DbChangeMarkerMismatch(ByteCaskError, RuntimeError):
+    """Raised by ingest for a slice of a history that is not this node's: the
+    two diverged at a promotion. Re-bootstrap from the source's manifest."""
+
+
+# ── Replication ──────────────────────────────────────────────────────────────
+#
+# A leader's durable entries reach a follower through changes_since and
+# ingest, under the sequences the leader gave them. Sequences alone cannot
+# tell two histories apart: after a promotion, the new leader's writes take
+# the sequences an old leader's unreplicated writes took. So a promotion
+# appends a change marker, the identity of the history from that point, and
+# ingest compares markers before it applies anything.
+
+
+class Mode(enum.Enum):
+    Leader = enum.auto()  # put, del_, del_range and apply_batch; ingest is refused
+    Follower = enum.auto()  # ingest; the four writes raise DbFollowerMode
+
+
+class ChangeMarker(NamedTuple):
+    """The identity of a history from a promotion on: the marker entry's own
+    sequence and a random id. A node's marker at a sequence is its last marker
+    at or below it, the origin if it holds none. Two nodes with the same marker
+    at a sequence hold the same history up to it."""
+
+    since_sequence: int
+    id: int
+
+
+ORIGIN_MARKER = ChangeMarker(0, 0)  # the history before any promotion
+_MARKER_ID = struct.Struct("<Q")  # a CHANGE_MARKER entry's value
+
+
+def _marker_at(markers: tuple[ChangeMarker, ...], sequence: int) -> ChangeMarker:
+    at = ORIGIN_MARKER
+    for marker in markers:
+        if marker.since_sequence > sequence:
+            break
+        at = marker
+    return at
+
+
+def _marker_of(entry: Entry) -> ChangeMarker:
+    return ChangeMarker(entry.sequence, _MARKER_ID.unpack(entry.value)[0])
+
+
+class ChangeHeader(NamedTuple):
+    """Where a slice of a history starts: the source's marker at from_sequence,
+    and from_sequence. The slice holds the source's entries above it, in order."""
+
+    marker: ChangeMarker
+    from_sequence: int
+
+
+class ChangeBatch(NamedTuple):
+    """One changes_since result, which is one ingest call."""
+
+    header: ChangeHeader
+    entries: Iterator[Entry]
+
+
+class FileManifest(NamedTuple):
+    """The sealed files of a database, with a snapshot taken as they were
+    sealed. Copied into an empty directory, they open as a database holding
+    every write through through_sequence: that is how a follower is
+    bootstrapped."""
+
+    snapshot: Snapshot
+    files: list[Path]
+    through_sequence: int
+
+
 # Hard ceilings. Options above them are refused at open. A value is limited
 # by the engine's packed in-memory entry, not the u32 on disk; one write (its
 # entries and batch markers) and the file size are capped so that every entry
@@ -284,6 +378,7 @@ class Options:
     max_file_bytes: int = 64 * 1024 * 1024
     max_key_bytes: int = 4096
     max_value_bytes: int = 4 * 1024 * 1024
+    initial_mode: Mode = Mode.Leader  # opening in Leader mode is not a promotion
 
     def _check(self) -> None:
         for name, ceiling in (("max_file_bytes", MAX_FILE_BYTES),
@@ -316,9 +411,12 @@ class Snapshot:
     WritePlan(snapshot) consumes it, as in the engine; it cannot be read after.
     """
 
-    def __init__(self, db: DB, keydir: KeyDir) -> None:
+    def __init__(self, db: DB, keydir: KeyDir, durable_sequence: int = 0,
+                 markers: tuple[ChangeMarker, ...] = ()) -> None:
         self._db = db
         self._keydir: KeyDir | None = keydir
+        self._durable_sequence = durable_sequence  # changes_since ships up to it
+        self._markers = markers
 
     def _view(self) -> KeyDir:
         if self._keydir is None:
@@ -455,8 +553,12 @@ class DB:
         self._opts = opts
         self._lock = threading.Lock()  # writers only
         self._fds: dict[int, int] = {}  # file_id -> descriptor
+        self._paths: dict[int, Path] = {}
         self._head = KeyDir()  # the published key directory; replaced, never changed
+        self._markers: tuple[ChangeMarker, ...] = ()  # by sequence; replaced, never changed
         self._next_sequence = 1
+        self._durable_sequence = 0  # the highest sequence fdatasync confirmed
+        self._mode = opts.initial_mode
         self._active_id = 0
         self._active_size = 0
         self._closed = False
@@ -484,7 +586,7 @@ class DB:
 
     def snapshot(self) -> Snapshot:
         self._check_open()
-        return Snapshot(self, self._head)
+        return Snapshot(self, self._head, self._durable_sequence, self._markers)
 
     def get(self, key: bytes, opts: ReadOptions | None = None) -> bytes | None:
         return self.snapshot().get(key, opts)
@@ -555,15 +657,16 @@ class DB:
         self._check_sizes(plan._writes)
         with self._lock, self._stop_writes_on_io_error():
             self._check_open()
-            if self._failure is not None:
-                raise DbDegraded(f"writes stopped after an I/O error: {self._failure}")
+            self._check_writable()
+            if self._mode is not Mode.Leader:
+                raise DbFollowerMode("a follower takes writes through ingest only")
 
             # 1. Check the guards against the head.
             if not plan._holds(self._head):
                 return None
             if not plan._writes:
                 if sync:
-                    _datasync(self._fds[self._active_id])
+                    self._sync_active()
                 return CommitResult(0, True)
 
             # 2. Frame: more than one write is wrapped in markers, so the batch
@@ -573,22 +676,23 @@ class DB:
                 writes = [Entry(0, EntryType.BULK_BEGIN), *writes, Entry(0, EntryType.BULK_END)]
             entries = [w._replace(sequence=self._next_sequence + i) for i, w in enumerate(writes)]
 
-            # 3. Append, in one write.
-            placed = self._append(entries)
-
-            # 4. Sync, if asked.
-            if sync:
-                _datasync(self._fds[self._active_id])
-
-            # 5. Publish the next key directory: durable before visible.
-            head = self._head
-            for p in placed:
-                head = apply_entry(head, self._active_id, p)
-            self._head = head
-
-            if self._active_size >= self._opts.max_file_bytes:
-                self._rotate()
+            # 3. Append, in one write. 4. Sync, if asked. 5. Publish.
+            self._publish(self._append(entries), sync)
             return CommitResult(entries[-1].sequence, sync)
+
+    def _publish(self, placed: list[Placed], sync: bool = True) -> None:
+        """Syncs what was appended, if asked, then publishes the next key
+        directory: durable before visible."""
+        if sync:
+            self._sync_active()
+        head, markers = self._head, self._markers
+        for p in placed:
+            head = apply_entry(head, self._active_id, p)
+            if p.entry.type is EntryType.CHANGE_MARKER:
+                markers += (_marker_of(p.entry),)
+        self._head, self._markers = head, markers
+        if self._active_size >= self._opts.max_file_bytes:
+            self._rotate()
 
     def _append(self, entries: list[Entry]) -> list[Placed]:
         encoded = [entry.encode() for entry in entries]
@@ -604,17 +708,29 @@ class DB:
 
     def _check_sizes(self, writes: list[Entry]) -> None:
         for write in writes:
-            if len(write.key) > self._opts.max_key_bytes:
-                raise ValueError(f"key size {len(write.key)} exceeds limit {self._opts.max_key_bytes}")
-            limit = (self._opts.max_key_bytes if write.type is EntryType.RANGE_DELETE
-                     else self._opts.max_value_bytes)
-            if len(write.value) > limit:
-                raise ValueError(f"value size {len(write.value)} exceeds limit {limit}")
-        framed = sum(_HEADER.size + len(w.key) + len(w.value) + _CRC.size for w in writes)
+            self._check_entry_size(write)
+        framed = sum(w.size() for w in writes)
         if len(writes) > 1:
-            framed += 2 * (_HEADER.size + _CRC.size)
+            framed += 2 * Entry(0, EntryType.BULK_BEGIN).size()
         if framed > MAX_BATCH_BYTES:
             raise ValueError(f"write plan of {framed} bytes exceeds the limit of {MAX_BATCH_BYTES} bytes per write")
+
+    def _check_entry_size(self, entry: Entry) -> None:
+        if len(entry.key) > self._opts.max_key_bytes:
+            raise ValueError(f"key size {len(entry.key)} exceeds limit {self._opts.max_key_bytes}")
+        limit = (self._opts.max_key_bytes if entry.type is EntryType.RANGE_DELETE
+                 else self._opts.max_value_bytes)
+        if len(entry.value) > limit:
+            raise ValueError(f"value size {len(entry.value)} exceeds limit {limit}")
+
+    def _check_writable(self) -> None:
+        if self._failure is not None:
+            raise DbDegraded(f"writes stopped after an I/O error: {self._failure}")
+
+    def _sync_active(self) -> None:
+        """fdatasync of the active file: every sequence given out is durable after it."""
+        _datasync(self._fds[self._active_id])
+        self._durable_sequence = self._next_sequence - 1
 
     @contextlib.contextmanager
     def _stop_writes_on_io_error(self) -> Iterator[None]:
@@ -653,7 +769,7 @@ class DB:
             self._closed = True
             try:
                 if self._failure is None:
-                    _datasync(self._fds[self._active_id])
+                    self._sync_active()
             finally:
                 for fd in self._fds.values():
                     os.close(fd)
@@ -665,6 +781,176 @@ class DB:
         if self._closed:
             raise DbClosed("database is closed")
 
+    # ── Replication ──────────────────────────────────────────────────────────
+
+    @property
+    def mode(self) -> Mode:
+        return self._mode
+
+    def durable_sequence(self) -> int:
+        """The highest sequence fdatasync has confirmed. Every entry up to it
+        is on disk, and changes_since ships nothing above it."""
+        self._check_open()
+        return self._durable_sequence
+
+    def set_mode(self, mode: Mode) -> None:
+        """Switches mode under the write lock, so no write straddles it.
+
+        A leader stepping down syncs first: every write it acknowledged is
+        durable, so changes_since can ship it to the next leader. A follower
+        promoted appends a change marker at the next sequence and syncs it
+        before the mode changes; the first write after a promotion takes the
+        sequence after the marker's. A failed write or sync stops writes,
+        raises, and leaves the mode; so does a promotion once writes have
+        stopped, which raises DbDegraded, since the marker cannot be written.
+        """
+        with self._lock, self._stop_writes_on_io_error():
+            self._check_open()
+            if mode is self._mode:
+                return
+            if mode is Mode.Follower:
+                if self._failure is None and self._durable_sequence < self._next_sequence - 1:
+                    self._sync_active()
+            else:
+                self._check_writable()
+                marker = Entry(self._next_sequence, EntryType.CHANGE_MARKER,
+                               value=_MARKER_ID.pack(secrets.randbits(64)))
+                self._publish(self._append([marker]))
+            self._mode = mode
+
+    def create_manifest(self) -> FileManifest:
+        """Seals the active file, synced whole, and lists the sealed ones."""
+        with self._lock, self._stop_writes_on_io_error():
+            self._check_open()
+            self._check_writable()
+            self._rotate()
+            files = [self._paths[file_id] for file_id in sorted(self._fds) if file_id != self._active_id]
+            return FileManifest(self.snapshot(), files, self._durable_sequence)
+
+    def changes_since(self, snapshot: Snapshot, from_sequence: int,
+                      max_bytes: int | None = None) -> ChangeBatch:
+        """The entries above from_sequence that were durable when the snapshot
+        was taken, in sequence order, as one slice for one ingest call.
+
+        The slice is whole units: those whose first sequence is above
+        from_sequence, up to the snapshot's durable sequence, or up to the
+        unit that takes it past max_bytes. It never starts or ends inside a
+        batch. A batch that straddles from_sequence is left out: a node whose
+        position is a unit boundary below it holds it already. Change markers
+        come through as entries. The header says where the slice starts and
+        which history it is from. Entries are read, file by file, as the
+        caller advances.
+        """
+        self._check_open()
+        header = ChangeHeader(_marker_at(snapshot._markers, from_sequence), from_sequence)
+        return ChangeBatch(header, self._changes(from_sequence, snapshot._durable_sequence, max_bytes))
+
+    def _changes(self, from_sequence: int, durable: int, max_bytes: int | None) -> Iterator[Entry]:
+        # Files never share a sequence, so file order by first sequence is
+        # sequence order. A write in progress past durable may be torn, and
+        # the scan stops there; everything durable comes before it.
+        files = []
+        for fd in list(self._fds.values()):
+            committed, _ = scan_committed(os.pread(fd, os.fstat(fd).st_size, 0))
+            if committed and committed[-1].entry.sequence > from_sequence:
+                files.append(committed)
+        files.sort(key=lambda committed: committed[0].entry.sequence)
+        sent = 0
+        in_batch = included = False
+        for committed in files:
+            for _, entry in committed:
+                if not in_batch:  # a unit starts: in or out, whole
+                    included = entry.sequence > from_sequence
+                if entry.type is EntryType.BULK_BEGIN:
+                    in_batch = True
+                elif entry.type is EntryType.BULK_END:
+                    in_batch = False
+                if not included:
+                    continue
+                if entry.sequence > durable:
+                    return
+                yield entry
+                sent += entry.size()
+                if max_bytes is not None and sent >= max_bytes and not in_batch:
+                    return
+
+    def ingest(self, header: ChangeHeader, entries: list[Entry]) -> None:
+        """Applies a slice of a source's history. Follower mode only.
+
+        Checks, before anything is written, with P = durable_sequence() and
+        X the lower of P and the slice's last sequence (from_sequence, if the
+        slice is empty):
+
+        - from_sequence > P: the slice starts past this node and what lies
+          between is missing, a gap. ValueError.
+        - The source's marker at X (the last marker in the slice at or below
+          X, or the header's) must be this node's marker at X. Two nodes with
+          the same marker at X hold the same history up to it, so a different
+          one means the histories diverged at a promotion:
+          DbChangeMarkerMismatch. X stops at the slice's last sequence because
+          the slice says nothing past it, and at P because the slice is
+          skipped as duplicates up to there.
+        - A slice not strictly increasing above from_sequence, or holding a
+          change marker inside a batch, or ending inside a batch: ValueError.
+
+        Entries at or below P are skipped, so a slice can be re-delivered after
+        any failure. The rest is appended, synced and published whole.
+        """
+        entries = list(entries)
+        with self._lock, self._stop_writes_on_io_error():
+            self._check_open()
+            self._check_writable()
+            if self._mode is not Mode.Follower:
+                raise ValueError("ingest: not in follower mode")
+            self._check_slice(header, entries)
+            durable = self._durable_sequence
+            if header.from_sequence > durable:
+                raise ValueError(f"ingest: the slice starts at {header.from_sequence}, past this "
+                                 f"node's durable sequence {durable}: a gap")
+            last = entries[-1].sequence if entries else header.from_sequence
+            at = min(durable, last)
+            source = header.marker
+            for entry in entries:
+                if entry.sequence > at:
+                    break
+                if entry.type is EntryType.CHANGE_MARKER:
+                    source = _marker_of(entry)
+            mine = _marker_at(self._markers, at)
+            if source != mine:
+                raise DbChangeMarkerMismatch(f"ingest: at sequence {at} the source's history is "
+                                             f"{source} and this node's is {mine}: they diverged")
+            new = [entry for entry in entries if entry.sequence > durable]
+            if new:
+                self._publish(self._append(new))
+
+    def _check_slice(self, header: ChangeHeader, entries: list[Entry]) -> None:
+        previous = header.from_sequence
+        batch_bytes = None  # the open batch's size so far, if one is open
+        for entry in entries:
+            if entry.sequence <= previous:
+                raise ValueError(f"ingest: sequence {entry.sequence} after {previous}: a slice "
+                                 "is strictly increasing above from_sequence")
+            previous = entry.sequence
+            self._check_entry_size(entry)
+            if entry.type is EntryType.BULK_BEGIN:
+                if batch_bytes is not None:
+                    raise ValueError("ingest: a BULK_BEGIN inside a batch")
+                batch_bytes = 0
+            if entry.type is EntryType.BULK_END and batch_bytes is None:
+                raise ValueError("ingest: a BULK_END outside a batch")
+            if entry.type is EntryType.CHANGE_MARKER and (
+                    batch_bytes is not None or entry.key or len(entry.value) != _MARKER_ID.size):
+                raise ValueError("ingest: a change marker inside a batch, or malformed")
+            if batch_bytes is not None:
+                batch_bytes += entry.size()
+                if batch_bytes > MAX_BATCH_BYTES:
+                    raise ValueError(f"ingest: an atomic batch exceeds the limit of {MAX_BATCH_BYTES} bytes")
+                if entry.type is EntryType.BULK_END:
+                    batch_bytes = None
+        if batch_bytes is not None:
+            raise ValueError("ingest: the slice ends inside an atomic batch; cut slices after "
+                             "a BULK_END or a standalone entry")
+
     # ── Files ────────────────────────────────────────────────────────────────
 
     def _start_active_file(self) -> None:
@@ -674,11 +960,12 @@ class DB:
         _sync_dir(self._dir)  # the file's name is durable before anything is written to it
         self._active_id = max(self._fds, default=0) + 1
         self._fds[self._active_id] = fd
+        self._paths[self._active_id] = path
         self._active_size = 0
 
     def _rotate(self) -> None:
         """Seals the active file, synced whole, and starts the next one."""
-        _datasync(self._fds[self._active_id])
+        self._sync_active()
         self._start_active_file()
 
     def _recover(self) -> None:
@@ -711,9 +998,15 @@ class DB:
             if is_newest or f.end < f.size:
                 _rewrite_durably(f.path, f.end)
             self._fds[f.file_id] = os.open(f.path, os.O_RDWR)
+            self._paths[f.file_id] = f.path
             for p in f.committed:
                 self._head = apply_entry(self._head, f.file_id, p)
+                if p.entry.type is EntryType.CHANGE_MARKER:
+                    self._markers += (_marker_of(p.entry),)
                 self._next_sequence = max(self._next_sequence, p.entry.sequence + 1)
+        # Every recovered entry is on disk: synced before its file was sealed,
+        # or rewritten durably just now.
+        self._durable_sequence = self._next_sequence - 1
 
 
 @dataclass

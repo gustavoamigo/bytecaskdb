@@ -4003,7 +4003,7 @@ TEST_CASE("recovery undoes a vacuum killed before the source was unlinked",
     // too (#129).
     auto snap = db.snapshot();
     std::vector<std::uint64_t> seqs;
-    for (const auto &entry : db.changes_since(snap, 0)) {
+    for (const auto &entry : db.changes_since(snap, 0).entries) {
       seqs.push_back(entry.sequence);
     }
     auto sorted = seqs;
@@ -4717,15 +4717,16 @@ TEST_CASE("Vacuum model-based: a follower resuming at retain_after converges",
                              .initial_mode = bytecask::Mode::Follower});
   auto catch_up = [&](bytecask::DB &leader) {
     auto snap = leader.snapshot();
+    auto batch = leader.changes_since(snap, follower.durable_sequence());
     std::vector<bytecask::DataEntry> owned;
-    for (const auto &e : leader.changes_since(snap, follower.durable_sequence()))
+    for (const auto &e : batch.entries)
       owned.push_back({e.sequence, e.entry_type,
                        {e.key.begin(), e.key.end()},
                        {e.value.begin(), e.value.end()}});
     std::vector<bytecask::DataEntryView> views;
     for (const auto &e : owned)
       views.push_back({e.sequence, e.entry_type, e.key, e.value});
-    if (!views.empty()) follower.ingest(views);
+    if (!views.empty()) follower.ingest(batch.header, views);
     CHECK(follower.durable_sequence() == leader.durable_sequence());
     CHECK(collect_kv(follower) == collect_kv(leader));
   };
@@ -4820,7 +4821,7 @@ auto stream_sequences(const bytecask::DB &db, std::uint64_t from)
     -> std::vector<std::uint64_t> {
   auto snap = db.snapshot();
   std::vector<std::uint64_t> seqs;
-  for (const auto &e : db.changes_since(snap, from)) seqs.push_back(e.sequence);
+  for (const auto &e : db.changes_since(snap, from).entries) seqs.push_back(e.sequence);
   return seqs;
 }
 
@@ -7377,7 +7378,7 @@ TEST_CASE("after close() every operation throws DbClosed; snapshots taken "
   CHECK_THROWS_AS(db.set_mode(bytecask::Mode::Follower), bytecask::DbClosed);
   CHECK_THROWS_AS(db.resume(), bytecask::DbClosed);
   CHECK_THROWS_AS((void)db.stats(), bytecask::DbClosed);
-  CHECK_THROWS_AS(db.ingest({}), bytecask::DbClosed);
+  CHECK_THROWS_AS(db.ingest({}, {}), bytecask::DbClosed);
   CHECK(db.mode() == bytecask::Mode::Leader);
   CHECK_FALSE(db.is_degraded());
 
@@ -9152,7 +9153,7 @@ TEST_CASE("CommitResult sequence equals BulkEnd sequence for multi-op batch",
   auto snap = db.snapshot();
   auto changes = db.changes_since(snap, from_seq);
   bool found_bulk_end = false;
-  for (const auto &entry : changes) {
+  for (const auto &entry : changes.entries) {
     if (entry.entry_type == bytecask::EntryType::BulkEnd) {
       found_bulk_end = true;
       CHECK(entry.sequence == result->sequence);
@@ -9751,7 +9752,7 @@ TEST_CASE("changes_since iterator yields entries in sequence order", "[replicati
   std::vector<std::string> collected_values;
   std::vector<std::uint64_t> collected_sequences;
 
-  for (const auto& entry : changes) {
+  for (const auto& entry : changes.entries) {
     collected_sequences.push_back(entry.sequence);
     collected_keys.emplace_back(reinterpret_cast<const char*>(entry.key.data()), entry.key.size());
     collected_values.emplace_back(reinterpret_cast<const char*>(entry.value.data()), entry.value.size());
@@ -9807,7 +9808,7 @@ TEST_CASE("iterators advance by post-increment as by pre-increment",
 
   auto snap = db.snapshot();
   auto changes = db.changes_since(snap, 0);
-  auto c = changes.begin();
+  auto c = changes.entries.begin();
   c++;
   CHECK(to_string((*c).key) == "b");
   bytecask::ChangeIterator moved;
@@ -9824,7 +9825,7 @@ TEST_CASE("changes_since stops at the snapshot's durable sequence",
   REQUIRE_FALSE(unsynced.durable);
   auto snap = db.snapshot();
   std::vector<std::uint64_t> seqs;
-  for (const auto &e : db.changes_since(snap, 0)) seqs.push_back(e.sequence);
+  for (const auto &e : db.changes_since(snap, 0).entries) seqs.push_back(e.sequence);
   CHECK(seqs == std::vector<std::uint64_t>{synced.sequence});
 }
 
@@ -9848,7 +9849,7 @@ TEST_CASE("changes_since empty iterator when no new entries", "[replication]") {
   auto changes = db.changes_since(snap, from_seq);
 
   std::vector<bytecask::DataEntryView> entries;
-  for (const auto& entry : changes) {
+  for (const auto& entry : changes.entries) {
     entries.push_back({
       .sequence = entry.sequence,
       .entry_type = entry.entry_type,
@@ -9896,7 +9897,7 @@ TEST_CASE("ingest throws in leader mode", "[replication]") {
   auto db = bytecask::DB::open(td.path / "db");
 
   std::vector<bytecask::DataEntryView> entries;
-  CHECK_THROWS_AS(db.ingest(entries), std::logic_error);
+  CHECK_THROWS_AS(db.ingest({}, entries), std::logic_error);
 }
 
 TEST_CASE("set_mode transitions: leader -> follower -> leader", "[replication]") {
@@ -9933,7 +9934,7 @@ TEST_CASE("set_mode(Follower) makes unsynced acknowledged writes durable",
   // What stepping down made durable is what a new leader can be sent.
   auto snap = db.snapshot();
   auto shipped = false;
-  for (const auto &e : db.changes_since(snap, synced)) {
+  for (const auto &e : db.changes_since(snap, synced).entries) {
     if (e.sequence == r.sequence) shipped = true;
   }
   CHECK(shipped);
@@ -9998,7 +9999,7 @@ TEST_CASE("basic ingest: entries from changes_since are ingested correctly",
     bytecask::Bytes value;
   };
   std::vector<OwnedEntry> owned;
-  for (const auto &e : changes) {
+  for (const auto &e : changes.entries) {
     owned.push_back({e.sequence, e.entry_type,
                      bytecask::Bytes{e.key.begin(), e.key.end()},
                      bytecask::Bytes{e.value.begin(), e.value.end()}});
@@ -10014,7 +10015,7 @@ TEST_CASE("basic ingest: entries from changes_since are ingested correctly",
   // Follower ingests.
   auto follower = bytecask::DB::open(td.path / "follower",
                                      {.initial_mode = bytecask::Mode::Follower});
-  follower.ingest(views);
+  follower.ingest(changes.header, views);
 
   // Verify all keys match.
   bytecask::Bytes out;
@@ -10043,7 +10044,7 @@ TEST_CASE("ingest idempotency: re-ingesting is a no-op", "[replication]") {
     bytecask::Bytes value;
   };
   std::vector<OwnedEntry> owned;
-  for (const auto &e : changes) {
+  for (const auto &e : changes.entries) {
     owned.push_back({e.sequence, e.entry_type,
                      bytecask::Bytes{e.key.begin(), e.key.end()},
                      bytecask::Bytes{e.value.begin(), e.value.end()}});
@@ -10055,11 +10056,11 @@ TEST_CASE("ingest idempotency: re-ingesting is a no-op", "[replication]") {
 
   auto follower = bytecask::DB::open(td.path / "follower",
                                      {.initial_mode = bytecask::Mode::Follower});
-  follower.ingest(views);
+  follower.ingest(changes.header, views);
   auto seq_after_first = follower.durable_sequence();
 
   // Re-ingest same entries — should be a no-op.
-  follower.ingest(views);
+  follower.ingest(changes.header, views);
   CHECK(follower.durable_sequence() == seq_after_first);
 }
 
@@ -10083,7 +10084,7 @@ TEST_CASE("ingest with batches: BulkBegin/BulkEnd preserved", "[replication]") {
     bytecask::Bytes value;
   };
   std::vector<OwnedEntry> owned;
-  for (const auto &e : changes) {
+  for (const auto &e : changes.entries) {
     owned.push_back({e.sequence, e.entry_type,
                      bytecask::Bytes{e.key.begin(), e.key.end()},
                      bytecask::Bytes{e.value.begin(), e.value.end()}});
@@ -10099,7 +10100,7 @@ TEST_CASE("ingest with batches: BulkBegin/BulkEnd preserved", "[replication]") {
 
   auto follower = bytecask::DB::open(td.path / "follower",
                                      {.initial_mode = bytecask::Mode::Follower});
-  follower.ingest(views);
+  follower.ingest(changes.header, views);
 
   bytecask::Bytes out;
   REQUIRE(follower.get({}, to_bytes("batch:1"), out));
@@ -10130,7 +10131,7 @@ TEST_CASE("ingest with range delete", "[replication]") {
     bytecask::Bytes value;
   };
   std::vector<OwnedEntry> owned;
-  for (const auto &e : changes) {
+  for (const auto &e : changes.entries) {
     owned.push_back({e.sequence, e.entry_type,
                      bytecask::Bytes{e.key.begin(), e.key.end()},
                      bytecask::Bytes{e.value.begin(), e.value.end()}});
@@ -10142,7 +10143,7 @@ TEST_CASE("ingest with range delete", "[replication]") {
 
   auto follower = bytecask::DB::open(td.path / "follower",
                                      {.initial_mode = bytecask::Mode::Follower});
-  follower.ingest(views);
+  follower.ingest(changes.header, views);
 
   bytecask::Bytes out;
   CHECK(follower.get({}, to_bytes("a"), out));
@@ -10170,7 +10171,7 @@ TEST_CASE("ingest sequence continuity: durable_sequence matches max ingested",
     bytecask::Bytes value;
   };
   std::vector<OwnedEntry> owned;
-  for (const auto &e : changes) {
+  for (const auto &e : changes.entries) {
     owned.push_back({e.sequence, e.entry_type,
                      bytecask::Bytes{e.key.begin(), e.key.end()},
                      bytecask::Bytes{e.value.begin(), e.value.end()}});
@@ -10182,7 +10183,7 @@ TEST_CASE("ingest sequence continuity: durable_sequence matches max ingested",
 
   auto follower = bytecask::DB::open(td.path / "follower",
                                      {.initial_mode = bytecask::Mode::Follower});
-  follower.ingest(views);
+  follower.ingest(changes.header, views);
 
   CHECK(follower.durable_sequence() == leader_seq);
 }
@@ -10205,7 +10206,7 @@ TEST_CASE("ingest recovery equivalence: survives close and reopen",
     bytecask::Bytes value;
   };
   std::vector<OwnedEntry> owned;
-  for (const auto &e : changes) {
+  for (const auto &e : changes.entries) {
     owned.push_back({e.sequence, e.entry_type,
                      bytecask::Bytes{e.key.begin(), e.key.end()},
                      bytecask::Bytes{e.value.begin(), e.value.end()}});
@@ -10218,7 +10219,7 @@ TEST_CASE("ingest recovery equivalence: survives close and reopen",
   {
     auto follower = bytecask::DB::open(td.path / "follower",
                                        {.initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(changes.header, views);
   }
 
   // Reopen and verify state survived recovery.
@@ -10247,7 +10248,7 @@ TEST_CASE("promotion continuity: first put after ingest gets next sequence",
     bytecask::Bytes value;
   };
   std::vector<OwnedEntry> owned;
-  for (const auto &e : changes) {
+  for (const auto &e : changes.entries) {
     owned.push_back({e.sequence, e.entry_type,
                      bytecask::Bytes{e.key.begin(), e.key.end()},
                      bytecask::Bytes{e.value.begin(), e.value.end()}});
@@ -10259,14 +10260,16 @@ TEST_CASE("promotion continuity: first put after ingest gets next sequence",
 
   auto follower = bytecask::DB::open(td.path / "follower",
                                      {.initial_mode = bytecask::Mode::Follower});
-  follower.ingest(views);
+  follower.ingest(changes.header, views);
   auto seq_after_ingest = follower.durable_sequence();
 
-  // Promote to leader and write.
+  // Promote to leader and write. The promotion takes the next sequence for
+  // its change marker (#397); the first write takes the one after.
   follower.set_mode(bytecask::Mode::Leader);
-  follower.put({}, to_bytes("k2"), to_bytes("v2"));
-
   CHECK(follower.durable_sequence() == seq_after_ingest + 1);
+  const auto r = follower.put({}, to_bytes("k2"), to_bytes("v2"));
+  CHECK(r.sequence == seq_after_ingest + 2);
+  CHECK(follower.durable_sequence() == seq_after_ingest + 2);
 }
 
 TEST_CASE("ingest triggers file rotation", "[replication]") {
@@ -10290,7 +10293,7 @@ TEST_CASE("ingest triggers file rotation", "[replication]") {
     bytecask::Bytes value;
   };
   std::vector<OwnedEntry> owned;
-  for (const auto &e : changes) {
+  for (const auto &e : changes.entries) {
     owned.push_back({e.sequence, e.entry_type,
                      bytecask::Bytes{e.key.begin(), e.key.end()},
                      bytecask::Bytes{e.value.begin(), e.value.end()}});
@@ -10305,7 +10308,7 @@ TEST_CASE("ingest triggers file rotation", "[replication]") {
     auto follower = bytecask::DB::open(td.path / "follower",
                                        {.max_file_bytes = 256,
                                         .initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(changes.header, views);
 
     // Verify all data is present.
     bytecask::Bytes out;
@@ -10348,7 +10351,7 @@ TEST_CASE("ingest post-loop rotation: last entry tips file past threshold",
     bytecask::Bytes value;
   };
   std::vector<OwnedEntry> owned;
-  for (const auto &e : changes) {
+  for (const auto &e : changes.entries) {
     owned.push_back({e.sequence, e.entry_type,
                      bytecask::Bytes{e.key.begin(), e.key.end()},
                      bytecask::Bytes{e.value.begin(), e.value.end()}});
@@ -10366,7 +10369,7 @@ TEST_CASE("ingest post-loop rotation: last entry tips file past threshold",
     auto follower = bytecask::DB::open(
         td.path / "follower",
         {.max_file_bytes = 100, .initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(changes.header, views);
 
     for (char c = 'a'; c <= 'e'; ++c) {
       REQUIRE(follower.get({}, to_bytes(std::string(1, c)), out));
@@ -10411,7 +10414,7 @@ TEST_CASE("batch-safe rotation: batch is not split across files",
     bytecask::Bytes value;
   };
   std::vector<OwnedEntry> owned;
-  for (const auto &e : changes) {
+  for (const auto &e : changes.entries) {
     owned.push_back({e.sequence, e.entry_type,
                      bytecask::Bytes{e.key.begin(), e.key.end()},
                      bytecask::Bytes{e.value.begin(), e.value.end()}});
@@ -10426,7 +10429,7 @@ TEST_CASE("batch-safe rotation: batch is not split across files",
     auto follower = bytecask::DB::open(td.path / "follower",
                                        {.max_file_bytes = 256,
                                         .initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(changes.header, views);
 
     bytecask::Bytes out;
     REQUIRE(follower.get({}, to_bytes("batch:a"), out));
@@ -10480,7 +10483,7 @@ TEST_CASE("leader-to-follower replication round-trip", "[replication]") {
     bytecask::Bytes value;
   };
   std::vector<OwnedEntry> owned;
-  for (const auto &e : changes) {
+  for (const auto &e : changes.entries) {
     owned.push_back({e.sequence, e.entry_type,
                      bytecask::Bytes{e.key.begin(), e.key.end()},
                      bytecask::Bytes{e.value.begin(), e.value.end()}});
@@ -10492,7 +10495,7 @@ TEST_CASE("leader-to-follower replication round-trip", "[replication]") {
 
   auto follower = bytecask::DB::open(td.path / "follower",
                                      {.initial_mode = bytecask::Mode::Follower});
-  follower.ingest(views);
+  follower.ingest(changes.header, views);
 
   // Verify key-value equivalence with leader.
   bytecask::Bytes leader_out, follower_out;
@@ -10909,14 +10912,15 @@ TEST_CASE("Edges: an empty key and an empty value behave like any other",
   auto follower = bytecask::DB::open(
       td.path / "f", {.initial_mode = bytecask::Mode::Follower});
   auto snap = leader.snapshot();
+  auto batch = leader.changes_since(snap, 0);
   std::vector<bytecask::DataEntry> owned;
-  for (const auto &e : leader.changes_since(snap, 0))
+  for (const auto &e : batch.entries)
     owned.push_back({e.sequence, e.entry_type, {e.key.begin(), e.key.end()},
                      {e.value.begin(), e.value.end()}});
   std::vector<bytecask::DataEntryView> views;
   for (const auto &e : owned)
     views.push_back({e.sequence, e.entry_type, e.key, e.value});
-  follower.ingest(views);
+  follower.ingest(batch.header, views);
   CHECK(collect_kv(follower) == expected);
 }
 
@@ -11139,9 +11143,12 @@ TEST_CASE("ingest refuses a slice that ends inside an atomic batch",
     bytecask::Bytes value;
   };
   std::vector<OwnedEntry> owned;
+  bytecask::ChangeHeader header;
   {
     auto snap = leader.snapshot();
-    for (const auto &e : leader.changes_since(snap, 0)) {
+    auto batch = leader.changes_since(snap, 0);
+    header = batch.header;
+    for (const auto &e : batch.entries) {
       owned.push_back({e.sequence, e.entry_type,
                        bytecask::Bytes{e.key.begin(), e.key.end()},
                        bytecask::Bytes{e.value.begin(), e.value.end()}});
@@ -11161,14 +11168,14 @@ TEST_CASE("ingest refuses a slice that ends inside an atomic batch",
         td.path / "follower",
         {.max_file_bytes = 128, .initial_mode = bytecask::Mode::Follower});
     const auto bytes_before = data_file_bytes(td.path / "follower");
-    CHECK_THROWS_AS(follower.ingest(head), std::invalid_argument);
+    CHECK_THROWS_AS(follower.ingest(header, head), std::invalid_argument);
     CHECK(data_file_bytes(td.path / "follower") == bytes_before);
     CHECK(follower.durable_sequence() == 0);
     CHECK_FALSE(follower.is_degraded());
     for (char c = 'a'; c <= 'f'; ++c)
       CHECK_FALSE(follower.contains_key({}, to_bytes(std::string(1, c))));
 
-    follower.ingest(views);
+    follower.ingest(header, views);
     CHECK(follower.durable_sequence() == views.back().sequence);
   }
 
@@ -11200,7 +11207,7 @@ TEST_CASE("Limits: ingest refuses an atomic batch past the per-write byte "
   slice.push_back({seq++, bytecask::EntryType::BulkEnd, {}, {}});
 
   const auto bytes_before = data_file_bytes(td.path / "db");
-  CHECK_THROWS_AS(db.ingest(slice), std::invalid_argument);
+  CHECK_THROWS_AS(db.ingest({}, slice), std::invalid_argument);
   CHECK(data_file_bytes(td.path / "db") == bytes_before);
   CHECK(db.durable_sequence() == 0);
   CHECK_FALSE(db.is_degraded());
@@ -11225,27 +11232,35 @@ TEST_CASE("Limits: ingest takes the last packable sequence and refuses the "
       const std::array past{bytecask::DataEntryView{
           E::kMaxSequence + 1, type, k,
           type == bytecask::EntryType::Put ? v : bytecask::BytesView{}}};
-      CHECK_THROWS_AS(db.ingest(past), std::invalid_argument);
+      CHECK_THROWS_AS(db.ingest({}, past), std::invalid_argument);
     }
     CHECK(db.durable_sequence() == 0);
 
     const std::array at{bytecask::DataEntryView{
         E::kMaxSequence, bytecask::EntryType::Put, k, v}};
-    db.ingest(at);
+    db.ingest({}, at);
     CHECK(db.durable_sequence() == E::kMaxSequence);
 
-    // The sequence space is used up: a leader write needs the next one and
-    // is refused before it appends, leaving the engine healthy.
-    db.set_mode(bytecask::Mode::Leader);
+    // The sequence space is used up. A promotion needs the next sequence
+    // for its change marker and is refused before it appends, leaving the
+    // follower as it was (#397).
     const auto bytes_before = db.stats().at("bytecask.bytes_written");
-    CHECK_THROWS_AS(db.put({}, to_bytes("k2"), v), std::runtime_error);
+    CHECK_THROWS_AS(db.set_mode(bytecask::Mode::Leader), std::runtime_error);
+    CHECK(db.mode() == bytecask::Mode::Follower);
     CHECK(db.stats().at("bytecask.bytes_written") == bytes_before);
     CHECK_FALSE(db.is_degraded());
     CHECK(get_str(db, k) == "v");
   }
+  // Reopened as a leader, which is not a promotion, a write needs the next
+  // sequence and is refused before it appends, leaving the engine healthy.
   auto db = bytecask::DB::open(dir);
   CHECK(get_str(db, to_bytes("k")) == "v");
   CHECK(db.durable_sequence() == E::kMaxSequence);
+  const auto bytes_before = db.stats().at("bytecask.bytes_written");
+  CHECK_THROWS_AS(db.put({}, to_bytes("k2"), to_bytes("v")),
+                  std::runtime_error);
+  CHECK(db.stats().at("bytecask.bytes_written") == bytes_before);
+  CHECK_FALSE(db.is_degraded());
 }
 
 TEST_CASE("Limits: the last file id is used, then a write that needs another "
@@ -11309,13 +11324,13 @@ TEST_CASE("Limits: ingest refuses a slice that needs a file id it does not "
       bytecask::DataEntryView{2, bytecask::EntryType::Put, k, to_bytes(big)}};
 
   const auto bytes_before = data_file_bytes(td.path / "db");
-  CHECK_THROWS_WITH(db.ingest(slice),
+  CHECK_THROWS_WITH(db.ingest({}, slice),
                     Catch::Matchers::ContainsSubstring("exhausted"));
   CHECK(data_file_bytes(td.path / "db") == bytes_before);
   CHECK(db.durable_sequence() == 0);
   CHECK_FALSE(db.is_degraded());
   // A slice that stays below the threshold still goes in.
-  db.ingest(std::span{slice}.first(1));
+  db.ingest({}, std::span{slice}.first(1));
   CHECK(db.durable_sequence() == 1);
 }
 
