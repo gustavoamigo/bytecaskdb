@@ -2565,6 +2565,7 @@ A site whose break nothing has to catch says why instead.
 |---|---|---|---|
 | `flush_pending`: the commit `fdatasync` before `durable_seq` moves | `a sync write survives a power cut as soon as it returns` | `commit_skips_fdatasync` (chaos) | — |
 | `flush_pending`: the state is published only after the `fdatasync` | `pipeline: sync write is invisible until its fdatasync returns; …` | `publish_before_fdatasync` (soak) | #92 |
+| `store_state`: a state whose `sync = true` writes are not yet durable is refused, for every publisher | `pipeline: publishing a state that owes an fdatasync degrades the engine` | `publish_owes_fdatasync` | #427 |
 | `flush_pending`: a failed commit sync degrades and publishes nothing | `class F: key not visible after commit sync failure` | `commit_sync_error_ignored` | BC-155, BC-163 |
 | `execute_slots`: a failed append degrades | `*__group_append_fails` (`prove_group_commit`) | `append_failure_not_degraded` | BC-163 |
 | `execute_slots`: a failed append syncs what it can before it degrades | not needed: `resume()` rewrites and syncs the file before trusting it (#240) | `no_sync_before_degrade` (chaos, not caught) | — |
