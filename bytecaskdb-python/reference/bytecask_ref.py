@@ -183,6 +183,8 @@ def scan_committed(buf: bytes) -> tuple[list[Placed], int]:
                 break  # a marker out of place: damage
             case EntryType.CHANGE_MARKER if batch is not None:
                 break  # nothing writes one inside a batch: damage
+            case EntryType.CHANGE_MARKER if entry.key or len(entry.value) != _MARKER_ID.size:
+                break  # a promotion writes a keyless entry with an 8-byte id: damage
             case _ if batch is not None:
                 batch.append(Placed(offset, entry))
             case _:

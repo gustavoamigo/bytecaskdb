@@ -127,6 +127,11 @@ export auto parse_header_and_verify(std::span<const std::byte> buf) -> EntryHead
   if (!is_known_entry_type(header.entry_type)) {
     throw std::runtime_error{"parse_header_and_verify: unknown entry type"};
   }
+  if (header.entry_type == EntryType::ChangeMarker &&
+      (header.key_size != 0 || header.value_size != kChangeMarkerIdBytes)) {
+    throw std::runtime_error{
+        "parse_header_and_verify: malformed change marker"};
+  }
 
   if (buf.size() !=
       kHeaderSize + header.key_size + header.value_size + kCrcSize) {

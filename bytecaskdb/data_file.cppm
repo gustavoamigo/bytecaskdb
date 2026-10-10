@@ -1938,6 +1938,10 @@ public:
     return next_offset_;
   }
 
+  [[nodiscard]] auto on_damage() const noexcept -> OnDamage {
+    return on_damage_;
+  }
+
 private:
   // The sweep ends at a short header, a zeroed header (sequence 0: the
   // preallocated tail of an active file) or an entry running past size().
@@ -1956,6 +1960,15 @@ private:
       throw std::runtime_error{std::format(
           "bytecask: unknown entry type {} at offset {} of '{}'",
           static_cast<unsigned>(hdr.entry_type), offset,
+          file_->path().string())};
+    }
+    // A change marker is keyless with an 8-byte id; no promotion writes any
+    // other shape, so one is damage too, before any consumer decodes it.
+    if (hdr.entry_type == EntryType::ChangeMarker &&
+        (hdr.key_size != 0 || hdr.value_size != kChangeMarkerIdBytes)) {
+      if (on_damage_ == OnDamage::Stop) return;
+      throw std::runtime_error{std::format(
+          "bytecask: malformed change marker at offset {} of '{}'", offset,
           file_->path().string())};
     }
     const auto total = record_bytes(hdr);

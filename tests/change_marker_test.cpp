@@ -866,3 +866,64 @@ TEST_CASE("a promotion that fails after its append refuses writes until "
   auto reopened = bytecask::DB::open(td.path / "db");
   CHECK(markers(reopened).size() == 2);
 }
+
+TEST_CASE("a change marker inside a batch, with a key or with a short id on "
+          "disk is damage: cut from the newest file's tail, refused anywhere "
+          "else",
+          "[replication][change_marker][recovery]") {
+  const auto id = bytecask::encode_marker_id(7);
+  auto rec = [](std::uint64_t seq, EntryType type, bytecask::BytesView key,
+                bytecask::BytesView value) {
+    return bytecask::serialize_entry(seq, type, key, value);
+  };
+  std::vector<std::byte> in_batch;
+  for (const auto &r : {rec(10, EntryType::BulkBegin, {}, {}),
+                        rec(11, EntryType::Put, to_bytes("c"), to_bytes("3")),
+                        rec(12, EntryType::ChangeMarker, {}, id),
+                        rec(13, EntryType::BulkEnd, {}, {})})
+    in_batch.insert(in_batch.end(), r.begin(), r.end());
+  const std::vector<std::pair<std::string, std::vector<std::byte>>> cases{
+      {"inside a batch", in_batch},
+      {"with a key", rec(10, EntryType::ChangeMarker, to_bytes("k"), id)},
+      {"with a short id", rec(10, EntryType::ChangeMarker, {}, to_bytes("1234"))},
+  };
+  for (const auto &[name, bad] : cases) {
+    INFO(name);
+    TempDir td;
+    const auto dir = td.path / "db";
+    std::filesystem::path sealed;
+    {
+      auto db = bytecask::DB::open(dir);
+      db.put({}, to_bytes("a"), to_bytes("1"));
+      sealed = db.create_manifest().files.at(0).data_path;
+      db.put({}, to_bytes("b"), to_bytes("2"));
+    }
+    auto remove_hints = [&] {
+      for (const auto &e : std::filesystem::directory_iterator{dir})
+        if (e.path().extension() == ".hint") std::filesystem::remove(e.path());
+    };
+    std::filesystem::path newest;
+    for (const auto &e : std::filesystem::directory_iterator{dir})
+      if (e.path().extension() == ".data" && e.path() != sealed) newest = e.path();
+    REQUIRE_FALSE(newest.empty());
+    auto append = [&](const std::filesystem::path &p) {
+      std::ofstream f{p, std::ios::binary | std::ios::app};
+      f.write(reinterpret_cast<const char *>(bad.data()),
+              static_cast<std::streamsize>(bad.size()));
+    };
+
+    remove_hints();
+    const auto newest_size = std::filesystem::file_size(newest);
+    append(newest);
+    {
+      auto db = bytecask::DB::open(dir);  // the tail is cut, the marker with it
+      CHECK(kv(db) == std::map<std::string, std::string>{{"a", "1"}, {"b", "2"}});
+      CHECK(markers(db).empty());
+    }
+    CHECK(std::filesystem::file_size(newest) == newest_size);
+
+    remove_hints();
+    append(sealed);
+    CHECK_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
+  }
+}

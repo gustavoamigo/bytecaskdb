@@ -466,6 +466,11 @@ def test_on_disk_a_marker_inside_a_batch_and_an_unknown_type_are_damage():
     committed, end = ref.scan_committed(b"".join(e.encode() for e in good) + unknown)
     assert [p.entry for p in committed] == good and end == sum(e.size() for e in good)
 
+    # A marker with a key, or without its 8-byte id, is damage too.
+    for bad in (Entry(3, T.CHANGE_MARKER, b"k", bytes(8)), Entry(3, T.CHANGE_MARKER, value=bytes(4))):
+        committed, end = ref.scan_committed(b"".join(e.encode() for e in [*good, bad]))
+        assert [p.entry for p in committed] == good and end == sum(e.size() for e in good)
+
 
 # ---------------------------------------------------------------------------
 # The cluster model
