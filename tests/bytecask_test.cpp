@@ -21,6 +21,8 @@
 #include <array>
 #include <format>
 #include <cerrno>
+#include <csignal>
+#include <cstdio>
 #include <fstream>
 #include <functional>
 #include <iterator>
@@ -9773,6 +9775,81 @@ TEST_CASE("a vacuum during a manifest transfer fails the copy with ENOENT, "
   CHECK(db.get({}, to_bytes("k2"), out));
   CHECK(to_string(out) == "v2");
 }
+
+// CONTRACT.md, View and span lifetimes: under IoBackend::Mmap a read the
+// kernel cannot complete is SIGBUS, not std::system_error; the other
+// back-ends throw. A media error cannot be induced, but the other cause the
+// row names can: a sealed file truncated by something other than the engine.
+namespace {
+
+// Writes k and closes, leaving one sealed data file, and returns its path.
+// A reopen starts every back-end cold, so the read goes to the file.
+auto sealed_file_with_key(const std::filesystem::path &dir)
+    -> std::filesystem::path {
+  {
+    auto db = bytecask::DB::open(dir);
+    db.put({.sync = true}, to_bytes("k"), to_bytes(std::string(8192, 'v')));
+    db.close();
+  }
+  const auto files = data_files_in(dir);
+  REQUIRE(files.size() == 1);
+  return dir / *files.begin();
+}
+
+}  // namespace
+
+TEST_CASE("a sealed file truncated underneath: Pread and BufferPool throw",
+          "[bytecask][io_backend]") {
+  const auto io_backend = GENERATE(bytecask::IoBackend::Pread,
+                                   bytecask::IoBackend::BufferPool);
+  CAPTURE(static_cast<int>(io_backend));
+  TempDir td;
+  const auto dir = td.path / "db";
+  const auto sealed = sealed_file_with_key(dir);
+  bytecask::Options opts{.io_backend = io_backend};
+  if (io_backend == bytecask::IoBackend::BufferPool)
+    opts.buffer_pool.capacity_bytes = 2 * opts.max_file_bytes;
+  auto db = bytecask::DB::open(dir, opts);
+
+  REQUIRE(::truncate(sealed.c_str(), 0) == 0);
+  bytecask::Bytes out;
+  CHECK_THROWS_AS(db.get({}, to_bytes("k"), out), std::system_error);
+  // A failed read is reported to the reader; it does not degrade the engine.
+  CHECK_FALSE(db.is_degraded());
+}
+
+#ifndef __EMSCRIPTEN__
+TEST_CASE("a sealed file truncated underneath: Mmap is SIGBUS",
+          "[bytecask][io_backend]") {
+  TempDir td;
+  const auto dir = td.path / "db";
+  const auto sealed = sealed_file_with_key(dir);
+  auto db = bytecask::DB::open(dir, {.io_backend = bytecask::IoBackend::Mmap});
+  REQUIRE(::truncate(sealed.c_str(), 0) == 0);
+
+  // The read faults, so it runs in a child the signal can kill.
+  const auto pid = ::fork();
+  REQUIRE(pid != -1);
+  if (pid == 0) {
+    // Catch2 traps SIGBUS and reports from its handler; in the child that
+    // report would land in the parent's output. Take the default back.
+    std::signal(SIGBUS, SIG_DFL);
+    ::alarm(30);
+    std::ignore = std::freopen("/dev/null", "w", stderr);
+    try {
+      bytecask::Bytes out;
+      std::ignore = db.get({}, to_bytes("k"), out);
+    } catch (...) {
+      ::_exit(2);  // threw: what the other back-ends do
+    }
+    ::_exit(0);  // returned: read bytes that are not there
+  }
+  int status = 0;
+  REQUIRE(::waitpid(pid, &status, 0) == pid);
+  CHECK(WIFSIGNALED(status));
+  CHECK(WTERMSIG(status) == SIGBUS);
+}
+#endif
 
 // ===========================================================================
 // changes_since iterator tests
