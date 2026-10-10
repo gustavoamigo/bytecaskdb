@@ -16,7 +16,7 @@
 
 namespace bytecaskdb::testing {
 
-PluginTestHarness::PluginTestHarness(TableSpec spec) {
+PluginTestHarness::PluginTestHarness(TableSpec spec, bytecask::Options opts) {
   static std::atomic<int> counter{0};
   path_ = std::filesystem::temp_directory_path() /
           ("bcdb_proof_" + std::to_string(::getpid()) +
@@ -24,7 +24,7 @@ PluginTestHarness::PluginTestHarness(TableSpec spec) {
   std::filesystem::remove_all(path_);
   std::filesystem::create_directories(path_);
 
-  holder_ = std::make_unique<DBHolder>(path_);
+  holder_ = std::make_unique<DBHolder>(path_, opts);
   g_db = &holder_->db;
   bytecaskdb_hton = &hton_;
 
@@ -231,7 +231,11 @@ bool PluginTestHarness::aborts(const std::function<void()> &action) {
     if (const int null = ::open("/dev/null", O_WRONLY); null != -1)
       ::dup2(null, STDERR_FILENO);
     ::alarm(30);
-    action();
+    try {
+      action();
+    } catch (...) {
+      ::_exit(2);  // threw: an uncaught throw would be SIGABRT, not the plugin
+    }
     ::_exit(0);  // the action returned: the plugin did not abort
   }
   int status = 0;

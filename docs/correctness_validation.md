@@ -2663,7 +2663,7 @@ A site whose break nothing has to catch says why instead.
 
 | Site | Guarded by | Mutation | Origin |
 |---|---|---|---|
-| `abort_if_degraded`: a write that leaves the engine degraded aborts the server; recovery runs at restart | `prove_plugin__*__ENGINE_DEGRADED`, `*__ENGINE_IO_FAIL` and `P-BULK-2` (`mariadb_proof_tests`) | `plugin_degrade_not_aborted` | #294 |
+| `abort_if_degraded`: a write that leaves the engine degraded aborts the server; recovery runs at restart | `prove_plugin__*__ENGINE_DEGRADED`, `*__ENGINE_IO_FAIL`, `P-BULK-2` and `P-DEGRADE-1` (`mariadb_proof_tests`) | `plugin_degrade_not_aborted` | #294 |
 
 ### What building the table found
 

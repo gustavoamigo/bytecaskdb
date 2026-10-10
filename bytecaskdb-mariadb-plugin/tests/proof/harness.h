@@ -39,7 +39,8 @@ struct TableSpec {
 
 class PluginTestHarness {
 public:
-  explicit PluginTestHarness(TableSpec spec);
+  // opts opens the DB: max_file_bytes = 0, say, rotates on every commit.
+  explicit PluginTestHarness(TableSpec spec, bytecask::Options opts = {});
   ~PluginTestHarness();
 
   PluginTestHarness(const PluginTestHarness &) = delete;
@@ -54,8 +55,9 @@ public:
   // Transaction control.
   int commit();
   // Runs action in a forked child; true if the child died of SIGABRT, as
-  // the plugin does when a write degrades the engine (#294). The parent's
-  // engine and transaction are untouched.
+  // the plugin does when a write degrades the engine (#294). An exception
+  // that escapes action counts as no abort: std::terminate would raise
+  // SIGABRT too. The parent's engine and transaction are untouched.
   bool aborts(const std::function<void()> &action);
   bool commit_aborts();
   void rollback();
@@ -80,8 +82,8 @@ private:
 
   struct DBHolder {
     bytecask::DB db;
-    explicit DBHolder(const std::filesystem::path &dir)
-        : db{bytecask::DB::open(dir)} {}
+    DBHolder(const std::filesystem::path &dir, bytecask::Options opts)
+        : db{bytecask::DB::open(dir, opts)} {}
   };
 
   std::filesystem::path path_;

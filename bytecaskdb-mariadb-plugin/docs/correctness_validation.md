@@ -300,17 +300,18 @@ writes, DROP and TRUNCATE, the background sync and vacuum threads, and the
 backup manifest's rotation. A throw that leaves the engine healthy (a
 conflict, a bad argument) is reported to the statement as before.
 
-When `apply_batch` returns successfully but the engine is degraded
-(engine class H — writes durable, but the active file cannot accept
-further appends):
+When the write is durable and published but the rotation after it fails
+(engine class H — the active file is sealed and the next cannot be
+created):
 
-- The plugin returns success to MariaDB. The writes from this
-  transaction are committed and visible.
-- `is_degraded()` is *not* checked after a commit that succeeded. The
-  next write that reaches the engine — a statement, or the background
-  sync — throws `DbDegraded`, and the plugin aborts there.
-- Rationale: the writes succeeded; reporting them as failed would
-  contradict the engine's contract for class H.
+- The engine degrades and `apply_batch` still throws, to every writer in
+  the group: their writes are in the data file, synced, and visible.
+- The plugin aborts, as for any throw that leaves the engine degraded. The
+  client sees its connection drop, not an error code, so the commit's
+  outcome is unknown to it; at restart the write is there.
+- `P-DEGRADE-1` (`tests/proof/prove_degraded.cpp`) opens the DB with
+  `max_file_bytes = 0`, so every commit rotates, fails the rotation with
+  `io_rotate_file_creation`, and checks the commit aborts.
 
 ### P-INV-7 — Catalog atomicity (plugin side)
 
@@ -379,9 +380,9 @@ engine fault classes already cover.
 |---|---|---|---|---|---|
 | SUCCESS | Yes | Yes | Bumped & kept | Yes | 0 |
 | OCC_CONFLICT | Yes | No (returns false) | Restored | Yes | 1213 |
-| ENGINE_DEGRADED | Yes | No (throws) | Restored | Yes | HA_ERR_CRASHED |
-| ENGINE_IO_FAIL | Yes | No (throws) | Restored | Yes | HA_ERR_CRASHED |
-| ENGINE_PARTIAL_COMMIT | Yes | Yes (engine class H) | Bumped & kept | Yes | 0 + degraded |
+| ENGINE_DEGRADED | Yes | No (throws) | n/a | n/a | none: the server aborts |
+| ENGINE_IO_FAIL | Yes | No (throws) | n/a | n/a | none: the server aborts |
+| ENGINE_PARTIAL_COMMIT | Yes | Yes, then throws (engine class H) | n/a | n/a | none: the server aborts |
 | PLUGIN_ROWCOUNT_BEFORE_COMMIT | No | No | Restored | Yes | HA_ERR_GENERIC |
 | PLUGIN_INDEX_HALF_BUFFERED | No | No | Restored | Yes | HA_ERR_GENERIC |
 | PLUGIN_DDL_MIDPOINT | Catalog only | Catalog only | n/a | n/a | HA_ERR_GENERIC; recovery cleans up |
