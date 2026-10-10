@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <array>
 #include <format>
+#include <cerrno>
 #include <fstream>
 #include <functional>
 #include <iterator>
@@ -9718,6 +9719,59 @@ TEST_CASE("manifest after vacuum", "[manifest]") {
   CHECK(to_string(out) == "v2");
   CHECK(manifest.snap.get({}, to_bytes("k3"), out));
   CHECK(to_string(out) == "v3");
+}
+
+// CONTRACT.md, Conditions: a vacuum between create_manifest() and the end of
+// the copy breaks the copy, and only the copy. vacuum unlinks the listed file
+// by path: a copy that opens it afterwards fails with ENOENT rather than
+// reading a short or stale file, a copy already open keeps reading it whole,
+// and the engine is unharmed.
+TEST_CASE("a vacuum during a manifest transfer fails the copy with ENOENT, "
+          "and nothing else",
+          "[manifest][vacuum]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db");
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1"));
+  db.put({.sync = true}, to_bytes("k2"), to_bytes("v2"));
+
+  auto manifest = db.create_manifest();
+  REQUIRE(manifest.files.size() == 1);
+  const auto listed = manifest.files.front().data_path;
+  const auto bytes = read_all(listed);
+  REQUIRE_FALSE(bytes.empty());
+
+  // A copy in progress: the file is open when the vacuum runs.
+  const auto fd = ::open(listed.c_str(), O_RDONLY | O_CLOEXEC);
+  REQUIRE(fd >= 0);
+
+  // Overwriting k1 leaves the listed file half dead, so vacuum compacts it.
+  db.put({.sync = true}, to_bytes("k1"), to_bytes("v1_new"));
+  REQUIRE(db.vacuum({.fragmentation_threshold = 0.0}));
+
+  // A copy that opens the file now fails with ENOENT.
+  errno = 0;
+  CHECK(::open(listed.c_str(), O_RDONLY | O_CLOEXEC) == -1);
+  CHECK(errno == ENOENT);
+
+  // The copy already open reads the whole file, as it was.
+  std::string read_back(bytes.size() + 1, '\0');
+  const auto n = ::pread(fd, read_back.data(), read_back.size(), 0);
+  ::close(fd);
+  REQUIRE(n == std::ssize(bytes));
+  read_back.resize(bytes.size());
+  CHECK(read_back == bytes);
+
+  // The manifest's snapshot still serves the file, and the DB is unharmed.
+  bytecask::Bytes out;
+  CHECK(manifest.snap.get({}, to_bytes("k1"), out));
+  CHECK(to_string(out) == "v1");
+  CHECK(manifest.snap.get({}, to_bytes("k2"), out));
+  CHECK(to_string(out) == "v2");
+  CHECK_FALSE(db.is_degraded());
+  CHECK(db.get({}, to_bytes("k1"), out));
+  CHECK(to_string(out) == "v1_new");
+  CHECK(db.get({}, to_bytes("k2"), out));
+  CHECK(to_string(out) == "v2");
 }
 
 // ===========================================================================
