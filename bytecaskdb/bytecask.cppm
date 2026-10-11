@@ -6860,6 +6860,7 @@ private:
         if (file_ptr) {
           file_id_ = file_id;
           plan_ = index_->plan(file_id);
+          laying_ = true;
           Offset start = 0;
           if (min_sequence <= from_sequence_) start = seek(**file_ptr);
           entry_iter_.emplace(DataFileIterator{**file_ptr, start});
@@ -6909,26 +6910,31 @@ private:
   // next one. The entry at offset starts a unit at or below the durable
   // sequence. Every kHandOverFences fences are handed over on the spot, so
   // a sweep holds at most that many (4 KiB) whatever the file's size, and
-  // the plan is re-read: the table may have thinned, or another sweep may
-  // have carried it further.
+  // goes on with the plan the index returns: the table may have thinned, or
+  // another sweep may have carried it further. A sweep whose table is gone
+  // lays no more for the file: fences from the middle of a file must not
+  // start a table, which a sweep from the first byte could then never fill
+  // in, since plan() would start it past them.
   static constexpr std::size_t kHandOverFences = 256;
   void lay_fence(std::uint64_t sequence, Offset offset) {
+    if (!laying_) return;
     if (offset < plan_.next_offset) return;
     pending_fences_.push_back({sequence, offset});
     plan_.next_offset = offset + plan_.spacing;
-    if (pending_fences_.size() >= kHandOverFences) {
-      hand_over_fences();
-      plan_ = index_->plan(file_id_);
-    }
+    if (pending_fences_.size() >= kHandOverFences) hand_over_fences();
   }
 
-  // Hands the fences laid in the current file to the index. The index is a
-  // cache: if it cannot take them, the slice is unaffected and the next
-  // sweep lays them again.
+  // Hands the fences laid in the current file to the index and takes the
+  // plan to go on with. The index is a cache: if it cannot take them, the
+  // slice is unaffected and the next sweep lays them again.
   void hand_over_fences() noexcept {
     if (pending_fences_.empty()) return;
     try {
-      index_->extend(file_id_, pending_fences_);
+      if (auto next = index_->extend(file_id_, plan_.generation, pending_fences_)) {
+        plan_ = *next;
+      } else {
+        laying_ = false;
+      }
     } catch (...) {
     }
     pending_fences_.clear();
@@ -6965,6 +6971,7 @@ private:
   bool needs_advance_{false};
   std::uint32_t file_id_{0};
   FencePlan plan_{};
+  bool laying_{false};  // false once the table this sweep extends is gone
   std::vector<ChangeFence> pending_fences_;
 
   // Cached current entry — BytesView into entry_iter_'s internal buffer.

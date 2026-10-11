@@ -288,6 +288,32 @@ TEST_CASE("fences are handed over during the sweep, a bounded number at a time",
   (void)check_slices(db, snap, history, 997);
 }
 
+TEST_CASE("a sweep whose table was evicted does not start a tail-only one",
+          "[replication][change_index]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", one_file());
+  fill(db, 8000, 200);  // ~1.8 MiB: several hand-overs
+  const auto snap = db.snapshot();
+  auto &idx = db.test_change_index();
+  {
+    auto batch = db.changes_since(snap, 0);
+    auto it = std::move(batch.entries).begin();
+    for (std::size_t i = 0; i < 6000; ++i) ++it;  // past the first hand-over
+    REQUIRE(idx.files() == 1);
+    const auto id = idx.file_ids().at(0);
+    idx.forget(id);  // what eviction by other pulls would do
+    while (!(it == std::default_sentinel)) ++it;
+  }
+  // The rest of that sweep went to no table: a table starts at the file's
+  // first fence or not at all, so a sweep from the first byte can rebuild it.
+  CHECK(idx.files() == 0);
+  const auto history = pull(db, snap, 0);
+  const auto fences = idx.fences(idx.file_ids().at(0));
+  REQUIRE(fences.size() > 400);
+  CHECK(fences.front().offset < 2 * kSpacing);
+  (void)check_slices(db, snap, history, 997);
+}
+
 TEST_CASE("nothing above the durable sequence gets a fence",
           "[replication][change_index]") {
   TempDir td;
@@ -381,7 +407,7 @@ TEST_CASE("a fence that does not hold is dropped and the file swept from its "
     REQUIRE(bad.back().sequence <= from);
   }
   idx.forget(id);
-  idx.extend(id, bad);
+  REQUIRE(idx.extend(id, 0, bad));
   REQUIRE(idx.seek(id, from) == bad.back());
 
   const auto hits0 = stat(db, "bytecask.change_index_hits");
@@ -439,7 +465,10 @@ TEST_CASE("ChangeIndex: seek returns the last fence at or below from",
           "[change_index]") {
   ChangeIndex idx;
   const std::vector<ChangeFence> f{{10, 4096}, {20, 8192}, {30, 12288}};
-  idx.extend(1, f);
+  const auto plan = idx.extend(1, 0, f);
+  REQUIRE(plan);
+  CHECK(plan->generation != 0);
+  CHECK(plan->next_offset == 12288 + kSpacing);
   CHECK(!idx.seek(2, 10));  // no table
   CHECK(!idx.seek(1, 9));   // none that low
   CHECK(idx.seek(1, 10) == f[0]);
@@ -449,20 +478,45 @@ TEST_CASE("ChangeIndex: seek returns the last fence at or below from",
   CHECK(idx.plan(1).spacing == kSpacing);
   CHECK(idx.plan(2).next_offset == kSpacing);
   CHECK(idx.plan(2).spacing == kSpacing);
+  CHECK(idx.plan(2).generation == 0);
   CHECK(idx.file_ids() == std::vector<std::uint32_t>{1});
   idx.forget(1);
   CHECK(!idx.seek(1, 1000));
   CHECK(idx.files() == 0);
 }
 
+TEST_CASE("ChangeIndex: fences go only to the table their plan came from",
+          "[change_index]") {
+  ChangeIndex idx;
+  const auto first = idx.extend(1, 0, std::vector<ChangeFence>{{10, 4096}});
+  REQUIRE(first);
+  // The table is gone: its sweep's fences start no new table.
+  idx.forget(1);
+  CHECK(!idx.extend(1, first->generation, std::vector<ChangeFence>{{20, 8192}}));
+  CHECK(idx.files() == 0);
+  // Another sweep from the first byte made a new table: the old plan's
+  // fences are refused, the new table's own are taken.
+  const auto second = idx.extend(1, 0, std::vector<ChangeFence>{{11, 4100}});
+  REQUIRE(second);
+  CHECK(second->generation != first->generation);
+  CHECK(!idx.extend(1, first->generation, std::vector<ChangeFence>{{20, 8192}}));
+  CHECK(idx.extend(1, second->generation, std::vector<ChangeFence>{{21, 8200}}));
+  CHECK(idx.fences(1) == std::vector<ChangeFence>{{11, 4100}, {21, 8200}});
+  // A plan for no table does not extend an existing one either.
+  CHECK(!idx.extend(1, 0, std::vector<ChangeFence>{{30, 12300}}));
+  CHECK(idx.fences(1).size() == 2);
+}
+
 TEST_CASE("ChangeIndex: a fence not a spacing past the last is dropped",
           "[change_index]") {
   ChangeIndex idx;
-  idx.extend(1, std::vector<ChangeFence>{{5, 100}});  // below the first spacing
+  CHECK(!idx.extend(1, 0, std::vector<ChangeFence>{{5, 100}}));  // below the first spacing
   CHECK(idx.files() == 0);
-  idx.extend(1, std::vector<ChangeFence>{{10, 4096}});
-  idx.extend(1, std::vector<ChangeFence>{{12, 6000}, {20, 8192}});
-  idx.extend(1, std::vector<ChangeFence>{{20, 8192}});  // a concurrent sweep's
+  const auto plan = idx.extend(1, 0, std::vector<ChangeFence>{{10, 4096}});
+  REQUIRE(plan);
+  const auto gen = plan->generation;
+  CHECK(idx.extend(1, gen, std::vector<ChangeFence>{{12, 6000}, {20, 8192}}));
+  CHECK(idx.extend(1, gen, std::vector<ChangeFence>{{20, 8192}}));  // a concurrent sweep's
   CHECK(idx.fences(1) == std::vector<ChangeFence>{{10, 4096}, {20, 8192}});
   CHECK(idx.bytes() == 2 * sizeof(ChangeFence));
   idx.clear();
@@ -473,13 +527,14 @@ TEST_CASE("ChangeIndex: a fence not a spacing past the last is dropped",
 TEST_CASE("ChangeIndex: the least recently used table goes past max_files",
           "[change_index]") {
   ChangeIndex idx{2};
-  idx.extend(1, std::vector<ChangeFence>{{10, 4096}});
-  idx.extend(2, std::vector<ChangeFence>{{20, 4096}});
+  const auto one = idx.extend(1, 0, std::vector<ChangeFence>{{10, 4096}});
+  REQUIRE(one);
+  REQUIRE(idx.extend(2, 0, std::vector<ChangeFence>{{20, 4096}}));
   (void)idx.seek(1, 10);  // 1 is now the more recent
-  idx.extend(3, std::vector<ChangeFence>{{30, 4096}});
+  REQUIRE(idx.extend(3, 0, std::vector<ChangeFence>{{30, 4096}}));
   CHECK(idx.file_ids() == std::vector<std::uint32_t>{1, 3});
-  idx.extend(1, std::vector<ChangeFence>{{11, 8192}});  // 1 again
-  idx.extend(4, std::vector<ChangeFence>{{40, 4096}});
+  REQUIRE(idx.extend(1, one->generation, std::vector<ChangeFence>{{11, 8192}}));  // 1 again
+  REQUIRE(idx.extend(4, 0, std::vector<ChangeFence>{{40, 4096}}));
   CHECK(idx.file_ids() == std::vector<std::uint32_t>{1, 4});
 }
 
@@ -487,15 +542,17 @@ TEST_CASE("ChangeIndex: a full table keeps every other fence and doubles its "
           "spacing",
           "[change_index]") {
   ChangeIndex idx{ChangeIndex::kMaxFiles, 4};
-  idx.extend(1, std::vector<ChangeFence>{
-                    {1, 4096}, {2, 8192}, {3, 12288}, {4, 16384}});
+  const auto plan = idx.extend(1, 0, std::vector<ChangeFence>{
+                                         {1, 4096}, {2, 8192}, {3, 12288}, {4, 16384}});
+  REQUIRE(plan);
+  const auto gen = plan->generation;
   CHECK(idx.fences(1) == std::vector<ChangeFence>{{1, 4096}, {3, 12288}});
   CHECK(idx.spacing(1) == 8192);
-  CHECK(idx.plan(1).next_offset == 12288 + 8192);
-  CHECK(idx.plan(1).spacing == 8192);
-  idx.extend(1, std::vector<ChangeFence>{{5, 16384}});  // a spacing ago
+  CHECK(plan->next_offset == 12288 + 8192);
+  CHECK(plan->spacing == 8192);
+  CHECK(idx.extend(1, gen, std::vector<ChangeFence>{{5, 16384}}));  // a spacing ago: dropped, table kept
   CHECK(idx.fences(1).size() == 2);
-  idx.extend(1, std::vector<ChangeFence>{{6, 20480}, {7, 28672}});
+  CHECK(idx.extend(1, gen, std::vector<ChangeFence>{{6, 20480}, {7, 28672}}));
   CHECK(idx.fences(1) == std::vector<ChangeFence>{{1, 4096}, {6, 20480}});
   CHECK(idx.spacing(1) == 16384);
   CHECK(idx.seek(1, 6) == ChangeFence{6, 20480});

@@ -41,10 +41,15 @@ export struct ChangeFence {
   auto operator==(const ChangeFence &) const -> bool = default;
 };
 
-// Where a sweep of a file lays its next fence, and how far apart they go.
+// Where a sweep of a file lays its next fence, how far apart they go, and
+// which table it is extending: 0 is no table, and a sweep that holds a plan
+// for no table began at the file's first byte. A table lost to eviction is
+// not recreated from its tail: extend() takes fences only for the table the
+// plan was taken from, so a table always starts at the file's first fence.
 export struct FencePlan {
   Offset next_offset;
   Offset spacing;
+  std::uint64_t generation;
 };
 
 export struct ChangeIndexCounters {
@@ -84,24 +89,31 @@ public:
   [[nodiscard]] auto plan(std::uint32_t file_id) const -> FencePlan {
     std::lock_guard<std::mutex> lk{mu_};
     auto it = tables_.find(file_id);
-    if (it == tables_.end()) return {kFenceSpacing, kFenceSpacing};
-    const auto &t = it->second;
-    const auto last = t.fences.empty() ? Offset{0} : t.fences.back().offset;
-    return {last + t.spacing, t.spacing};
+    if (it == tables_.end()) return {kFenceSpacing, kFenceSpacing, 0};
+    return it->second.plan();
   }
 
-  // Appends the fences a sweep laid, in offset order. One not a spacing past
-  // the table's last fence is dropped: a concurrent sweep laid it first. A
-  // table that reaches max_fences keeps every other fence and doubles its
-  // spacing. Creates the table, the least recently used one out past
-  // max_files.
-  void extend(std::uint32_t file_id, std::span<const ChangeFence> fences) {
-    if (fences.empty()) return;
+  // Appends the fences a sweep laid, in offset order, to the table its plan
+  // was taken from, and returns the table's plan now, for the sweep to go
+  // on with: the table may have thinned, or another sweep carried it
+  // further. A fence not a spacing past the table's last is dropped: a
+  // concurrent sweep laid it first. A table that reaches max_fences keeps
+  // every other fence and doubles its spacing. A plan for no table creates
+  // the table, the least recently used one out past max_files. nullopt when
+  // the fences went to no table: the plan's table is gone, or another has
+  // taken its place; the sweep then lays no more for this file.
+  [[nodiscard]] auto extend(std::uint32_t file_id, std::uint64_t generation,
+                            std::span<const ChangeFence> fences)
+      -> std::optional<FencePlan> {
     std::lock_guard<std::mutex> lk{mu_};
     auto it = tables_.find(file_id);
     if (it == tables_.end()) {
+      if (generation != 0) return std::nullopt;
       if (tables_.size() >= max_files_) evict_oldest();
       it = tables_.try_emplace(file_id).first;
+      it->second.generation = ++clock_;
+    } else if (it->second.generation != generation) {
+      return std::nullopt;
     }
     auto &t = it->second;
     t.used = ++clock_;
@@ -112,7 +124,11 @@ public:
       t.fences.push_back(f);
       if (t.fences.size() >= max_fences_) t.thin();
     }
-    if (t.fences.empty()) tables_.erase(it);  // nothing accepted: no table
+    if (t.fences.empty()) {  // nothing accepted: no table
+      tables_.erase(it);
+      return std::nullopt;
+    }
+    return t.plan();
   }
 
   void forget(std::uint32_t file_id) {
@@ -163,7 +179,13 @@ private:
   struct Table {
     std::vector<ChangeFence> fences;  // ascending in sequence and offset
     Offset spacing{kFenceSpacing};
-    std::uint64_t used{0};  // clock_ at the last seek or extend
+    std::uint64_t used{0};        // clock_ at the last seek or extend
+    std::uint64_t generation{0};  // clock_ at creation; never 0
+
+    [[nodiscard]] auto plan() const -> FencePlan {
+      const auto last = fences.empty() ? Offset{0} : fences.back().offset;
+      return {last + spacing, spacing, generation};
+    }
 
     // Keeps every other fence, the first included, and doubles the spacing;
     // what remains is still at least a spacing apart.
