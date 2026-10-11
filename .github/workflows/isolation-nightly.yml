@@ -206,16 +206,33 @@ jobs:
           if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
           python3 scripts/run_isolation_check.py $ARGS
 
+      # The job runs in a container, and the runner rewrites the host's
+      # runner.temp to the container's path only at the start of an input:
+      # in a multi-line path: every line but the first matched nothing, so
+      # no chaos failure ever reached the artifact (#447). Everything to keep
+      # is staged under one directory and uploaded as a single path.
+      - name: Stage histories and Elle output
+        if: failure()
+        run: |
+          mkdir -p "$RUNNER_TEMP/upload"
+          for d in isolation isolation-cluster isolation-topology isolation-kill; do
+            if [ -d "$RUNNER_TEMP/$d" ]; then cp -a "$RUNNER_TEMP/$d" "$RUNNER_TEMP/upload/"; fi
+          done
+          for config in guarded unguarded; do
+            if [ -d "$RUNNER_TEMP/isolation-chaos-$config/failure" ]; then
+              mkdir -p "$RUNNER_TEMP/upload/isolation-chaos-$config"
+              cp -a "$RUNNER_TEMP/isolation-chaos-$config/failure" \
+                "$RUNNER_TEMP/upload/isolation-chaos-$config/"
+            fi
+          done
+          find "$RUNNER_TEMP/upload" -maxdepth 2 | sort
+
       - name: Upload histories and Elle output
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: isolation-failure-${{ matrix.name }}
-          path: |
-            ${{ runner.temp }}/isolation
-            ${{ runner.temp }}/isolation-cluster
-            ${{ runner.temp }}/isolation-topology
-            ${{ runner.temp }}/isolation-kill
-            ${{ runner.temp }}/isolation-chaos-guarded/failure
-            ${{ runner.temp }}/isolation-chaos-unguarded/failure
-          if-no-files-found: ignore
+          path: ${{ runner.temp }}/upload
+          # Nothing staged means the job failed before any check wrote its
+          # output, a build failure, say. Warn rather than pass in silence.
+          if-no-files-found: warn
