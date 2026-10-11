@@ -32,6 +32,7 @@
 
 import bytecask;
 import bytecask.data_entry;
+import bytecask.hint_entry;
 
 #include "proof/invariants.h"
 
@@ -926,4 +927,34 @@ TEST_CASE("a change marker inside a batch, with a key or with a short id on "
     append(sealed);
     CHECK_THROWS_AS(bytecask::DB::open(dir), std::runtime_error);
   }
+}
+
+TEST_CASE("a hint entry for a change marker is refused unless it is keyless "
+          "with an 8-byte id",
+          "[replication][change_marker][recovery]") {
+  // The data file module has a deserialize_entry of its own over the same
+  // span type; the hint one is named by its signature.
+  constexpr auto parse = static_cast<std::pair<bytecask::HintEntry, std::size_t> (*)(
+      std::span<const std::byte>)>(&bytecask::deserialize_entry);
+  const auto good = bytecask::serialize_change_marker_entry(5, 40, 0x1234);
+  const auto [entry, consumed] = parse(good);
+  CHECK(consumed == good.size());
+  CHECK(entry.entry_type == EntryType::ChangeMarker);
+  CHECK(entry.sequence == 5);
+  CHECK(entry.file_offset == 40);
+  CHECK(entry.marker_id == 0x1234);
+  CHECK(entry.key.empty());
+
+  // A key where there must be none would shift the id to the wrong bytes.
+  const auto keyed = bytecask::serialize_entry(
+      5, EntryType::ChangeMarker, 40, bytecask::kChangeMarkerIdBytes,
+      to_bytes("k"));
+  CHECK_THROWS_AS(parse(keyed), std::runtime_error);
+  // A value size other than the id's.
+  const auto short_id =
+      bytecask::serialize_entry(5, EntryType::ChangeMarker, 40, 4, {});
+  CHECK_THROWS_AS(parse(short_id), std::runtime_error);
+  // A well-formed header whose id was cut off.
+  const std::vector<std::byte> cut(good.begin(), good.end() - 3);
+  CHECK_THROWS_AS(parse(cut), std::runtime_error);
 }

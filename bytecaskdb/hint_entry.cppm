@@ -146,9 +146,16 @@ export auto deserialize_entry(std::span<const std::byte> buf)
         trailer_offset + sizeof(std::uint16_t), end_key_len);
   }
 
-  // For ChangeMarker, the id is appended after the (empty) key.
+  // For ChangeMarker, the id is appended after the (empty) key. The entry's
+  // shape is checked before the id is trusted: recovery takes the id as the
+  // history's identity without consulting the data file, and a hint that
+  // does not parse is rebuilt from it.
   std::uint64_t marker_id = 0;
   if (entry_type == EntryType::ChangeMarker) {
+    if (key_len != 0 || value_size != kChangeMarkerIdBytes) {
+      throw std::runtime_error{
+          "deserialize_entry (hint): malformed ChangeMarker entry"};
+    }
     if (buf.size() < total + sizeof(std::uint64_t)) {
       throw std::runtime_error{
           "deserialize_entry (hint): truncated ChangeMarker id"};
