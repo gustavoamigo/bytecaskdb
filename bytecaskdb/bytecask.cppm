@@ -47,8 +47,10 @@ module;
 export module bytecask;
 
 export import :internals;
+export import :change_iterator;
 import bytecask.batch_iterator;
 import bytecask.blind_btree;
+import bytecask.change_index;
 import bytecask.btree;
 import bytecask.concurrency;
 export import bytecask.buffer_pool;
@@ -545,54 +547,6 @@ private:
   // first: nothing may still reference the frame when the pin drops.
   mutable FrameLease lease_;
   mutable bool has_cached_{false};
-};
-
-// ---------------------------------------------------------------------------
-// ChangeIterator — yields raw entries in ascending sequence order (lazy)
-//
-// Used by changes_since() for replication. Walks data files lazily in
-// min_sequence order, scanning one entry at a time via CommittedEntryIterator.
-// Yields entries with sequence > from_sequence.
-// Holds a snapshot reference to keep file descriptors open during iteration.
-// ---------------------------------------------------------------------------
-
-export class ChangeIterator {
-public:
-  using iterator_category = std::input_iterator_tag;
-  using value_type = DataEntryView;
-  using difference_type = std::ptrdiff_t;
-
-  ChangeIterator() = default;
-  ~ChangeIterator(); // Defined in .cpp where Impl is complete
-
-  // Move-only semantics
-  ChangeIterator(const ChangeIterator&) = delete;
-  ChangeIterator& operator=(const ChangeIterator&) = delete;
-  ChangeIterator(ChangeIterator&&) noexcept; // Defined in .cpp where Impl is complete
-  ChangeIterator& operator=(ChangeIterator&&) noexcept; // Defined in .cpp where Impl is complete
-
-  // Constructor for implementation use - not part of public API
-  explicit ChangeIterator(std::shared_ptr<const EngineState> state,
-                          std::uint64_t from_sequence,
-                          std::uint64_t durable_sequence,
-                          std::size_t max_bytes);
-
-  auto operator++() -> ChangeIterator &;
-  void operator++(int);
-  auto operator*() const -> const value_type &;
-  auto operator==(std::default_sentinel_t) const noexcept -> bool;
-
-private:
-  // Implementation details hidden from public interface
-  class Impl;
-  std::unique_ptr<Impl> impl_;
-};
-
-// One changes_since result, which is one ingest call: where the slice starts
-// and which history it is from, and the entries, read lazily.
-export struct ChangeBatch {
-  ChangeHeader header;
-  std::ranges::subrange<ChangeIterator, std::default_sentinel_t> entries;
 };
 
 // ---------------------------------------------------------------------------
@@ -1703,6 +1657,11 @@ private:
   std::shared_ptr<BufferPool> pool_;
   SizeLimits size_limits_;
   mutable Counters counters_;
+  // Bookmarks for changes_since to enter a file near from_sequence (#443).
+  // Shared with every ChangeIterator, which hands it the bookmarks it lays and
+  // can outlive the DB. Cleared by resume(); a file vacuum removes is
+  // forgotten.
+  std::shared_ptr<ChangeIndex> change_index_{std::make_shared<ChangeIndex>()};
   // All mutable state — SWMR. Writers publish via atomic_store()
   // under write_mu_; readers call atomic_load() (never acquiring write_mu_).
   // Note: std::atomic<std::shared_ptr<T>> (C++20 P0718R2) is not yet
@@ -1780,6 +1739,7 @@ private:
 #ifdef BYTECASK_TESTING
 public:
   auto& test_write_group() { return write_group_; }
+  auto& test_change_index() { return *change_index_; }
   auto& test_commit_delay() { return commit_delay_; }
   // Called by flush_pending on the flushing thread just before the
   // fdatasync. Lets a test hold a flush in flight while other writers
@@ -4417,6 +4377,7 @@ void DB::vacuum_unlink_old_file(
   if (pool_) {
     pool_->release_file(file_id, old_data_file->size());
   }
+  change_index_->forget(file_id);
   counters_.vacuum_files_unlinked.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -4680,12 +4641,25 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.hint_backpressure_stalls.load(std::memory_order_relaxed)},
       {"bytecask.hint_backpressure_stall_us",
        counters_.hint_backpressure_stall_us.load(std::memory_order_relaxed)},
+      // changes_since slices that looked the change index up, because their
+      // first file holds from_sequence: those that entered it at a bookmark,
+      // and those that scanned it from its first byte. A slice starting at a
+      // file boundary looks nothing up and counts in neither.
+      {"bytecask.change_index_hits",
+       change_index_->counters().hits.load(std::memory_order_relaxed)},
+      {"bytecask.change_index_misses",
+       change_index_->counters().misses.load(std::memory_order_relaxed)},
       // Gauges — current state, not monotonic.
       {"bytecask.degraded", refused(*s) ? 1 : 0},
       // Sealed files whose hint is queued or being written. What close must
       // still write, and what an open after a crash would rebuild.
       {"bytecask.hint_backlog", narrow<std::int64_t>(worker_.pending())},
       {"bytecask.open_files", open_files},
+      // Files the change index holds bookmarks for, and the bytes they take.
+      {"bytecask.change_index_files",
+       narrow<std::int64_t>(change_index_->files())},
+      {"bytecask.change_index_bytes",
+       narrow<std::int64_t>(change_index_->bytes())},
   };
 }
 
@@ -4953,6 +4927,9 @@ void DB::resume() {
 #endif
   validate_state_consistency(*resumed);
   store_state(current, std::move(resumed));
+  // The bookmarks of the file just cut all named durable units below the cut,
+  // but a cache that rebuilds from a scan needs no argument to stay right.
+  change_index_->clear();
   // Writers appended since the failed flush have all been told; new ones
   // start clean.
   std::lock_guard<std::mutex> lk{durable_mu_};
@@ -6716,186 +6693,14 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
 #pragma region Change Since
 
 
-// ---------------------------------------------------------------------------
-// ChangeIterator implementation
-// ---------------------------------------------------------------------------
-// Lazy ChangeIterator: walks files in min_sequence order, scanning one
-// batch at a time. Only the current batch's entries are held in memory.
-// Files in a single-writer engine have disjoint, monotonically increasing
-// sequence ranges, so iterating files by min_sequence and scanning forward
-// within each file yields globally ascending sequence order.
-class ChangeIterator::Impl {
-public:
-  Impl(std::shared_ptr<const EngineState> state,
-       std::uint64_t from_sequence,
-       std::uint64_t durable_sequence,
-       std::size_t max_bytes)
-    : state_(std::move(state)), from_sequence_(from_sequence),
-      durable_sequence_(durable_sequence),
-      // Counted in 64 bits whatever size_t is, so a scan past 4 GiB on a
-      // 32-bit build neither wraps the count nor ends an unlimited slice.
-      max_bytes_(max_bytes == kUnlimitedBytes
-                     ? std::numeric_limits<std::uint64_t>::max()
-                     : static_cast<std::uint64_t>(max_bytes)) {
-
-    // Build sorted file list — O(num_files), typically tiny.
-    for (const auto [file_id, stats] : state_->file_stats.all()) {
-      if (stats.max_sequence > from_sequence && stats.min_sequence <= durable_sequence) {
-        file_queue_.emplace_back(stats.min_sequence, file_id);
-      }
-    }
-    std::sort(file_queue_.begin(), file_queue_.end());
-
-    // Position at first valid entry.
-    advance_to_next_valid();
-  }
-
-  auto has_more() const -> bool { return has_entry_; }
-
-  auto current() const -> const DataEntryView& { return cached_entry_; }
-
-  void advance() {
-    advance_to_next_valid();
-  }
-
-private:
-  // Scans forward across entries and files until the next entry of the
-  // slice is found, the slice is cut, or all files are exhausted. The cached
-  // BytesView spans point into the iterator's current entry, so we must NOT
-  // advance the iterator after caching — that would invalidate the view.
-  // Instead, we set needs_advance_ and increment on the next call.
-  //
-  // The slice is whole units. A unit starts at any entry outside a batch; it
-  // is in the slice when its first sequence is above from_sequence_, so a
-  // batch that straddles from_sequence_ is left out whole. Durability is
-  // per unit too: the durable sequence always sits on a unit boundary, so
-  // the first entry above it ends the slice, and a torn batch at the end of
-  // the active file, which lies above it, is never reached.
-  void advance_to_next_valid() {
-    has_entry_ = false;
-
-    // Advance past the previously cached entry (deferred from last call).
-    // Set only once an entry was read from entry_iter_.
-    if (needs_advance_) {
-      ++(*entry_iter_);
-      needs_advance_ = false;
-    }
-    if (done_) return;
-
-    while (true) {
-      // Try next entry in the current file.
-      if (entry_iter_ && !(*entry_iter_ == std::default_sentinel)) {
-        const auto& [entry, entry_off] = **entry_iter_;
-        if (!in_batch_) included_ = entry.sequence > from_sequence_;
-        if (entry.entry_type == EntryType::BulkBegin) in_batch_ = true;
-        else if (entry.entry_type == EntryType::BulkEnd) in_batch_ = false;
-        if (!included_) {
-          ++(*entry_iter_);
-          continue;
-        }
-        if (entry.sequence > durable_sequence_) {
-          done_ = true;
-          return;
-        }
-        cache_entry(entry);
-        needs_advance_ = true;
-        sent_ += entry_size(entry.key.size(), entry.value.size());
-        // Cut after the unit that passes max_bytes: never inside a batch.
-        if (sent_ >= max_bytes_ && !in_batch_) done_ = true;
-        return;
-      }
-
-      // Try next file. A batch never spans two files.
-      if (file_idx_ < file_queue_.size()) {
-        auto file_id = file_queue_[file_idx_].second;
-        ++file_idx_;
-        in_batch_ = false;
-        auto file_ptr = state_->files.get(file_id);
-        if (file_ptr) {
-          entry_iter_.emplace(DataFileIterator{**file_ptr});
-        }
-        continue;
-      }
-
-      // All files exhausted.
-      return;
-    }
-  }
-
-  // Caches the current entry. The BytesView spans point into
-  // the iterator's internal buffer which stays alive until advance().
-  void cache_entry(const DataEntry& entry) {
-    cached_entry_ = {
-      .sequence = entry.sequence,
-      .entry_type = entry.entry_type,
-      .key = BytesView{entry.key},
-      .value = BytesView{entry.value}
-    };
-    has_entry_ = true;
-  }
-
-  std::shared_ptr<const EngineState> state_;
-  std::uint64_t from_sequence_;
-  std::uint64_t durable_sequence_;
-  std::uint64_t max_bytes_;
-  std::uint64_t sent_{0};   // bytes of the entries yielded so far
-  bool in_batch_{false};    // inside a BulkBegin..BulkEnd of the current file
-  bool included_{false};    // whether the current unit is in the slice
-  bool done_{false};        // the slice ended: cut, or past durable
-
-  // File traversal — sorted by min_sequence.
-  std::vector<std::pair<std::uint64_t, std::uint32_t>> file_queue_;
-  std::size_t file_idx_{0};
-
-  // Current file's committed entry scanner.
-  std::optional<CommittedEntryIterator> entry_iter_;
-  bool needs_advance_{false};
-
-  // Cached current entry — BytesView into entry_iter_'s internal buffer.
-  bool has_entry_{false};
-  DataEntryView cached_entry_;
-};
-
-// ChangeIterator methods
-ChangeIterator::ChangeIterator(std::shared_ptr<const EngineState> state,
-                               std::uint64_t from_sequence,
-                               std::uint64_t durable_sequence,
-                               std::size_t max_bytes)
-  : impl_(std::make_unique<Impl>(std::move(state), from_sequence,
-                                 durable_sequence, max_bytes)) {}
-
-ChangeIterator::~ChangeIterator() = default;
-
-ChangeIterator::ChangeIterator(ChangeIterator&&) noexcept = default;
-ChangeIterator& ChangeIterator::operator=(ChangeIterator&&) noexcept = default;
-
-auto ChangeIterator::operator++() -> ChangeIterator& {
-  if (impl_) {
-    impl_->advance();
-  }
-  return *this;
-}
-
-void ChangeIterator::operator++(int) {
-  ++(*this);
-}
-
-auto ChangeIterator::operator*() const -> const value_type& {
-  return impl_->current();
-}
-
-auto ChangeIterator::operator==(std::default_sentinel_t) const noexcept -> bool {
-  return !impl_ || !impl_->has_more();
-}
-
 // DB::changes_since implementation
 auto DB::changes_since(const Snapshot& snap, std::uint64_t from_sequence,
                        std::size_t max_bytes) const -> ChangeBatch {
   if (load_state()->closed) throw DbClosed{};
   auto state = snap.state();
   ChangeHeader header{state->marker_at(from_sequence), from_sequence};
-  auto begin =
-      ChangeIterator{state, from_sequence, state->durable_seq, max_bytes};
+  auto begin = ChangeIterator{state, change_index_, from_sequence,
+                              state->durable_seq, max_bytes};
   return {header, {std::move(begin), std::default_sentinel}};
 }
 

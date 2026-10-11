@@ -21,8 +21,11 @@ XMAKE_P=(-P "$PROJECT_DIR")
 # MC/DC is held at 100% on the durability and recovery code, after the
 # conditions marked `mcdc-exempt:` at their site (scripts/mcdc_report.py).
 # MCDC_MAX_EXEMPT caps those marks: raising it is a reviewed change.
+# change_index.cppm is not listed: it has no decision with two or more
+# conditions, so the build records no MC/DC for it, and the report refuses a
+# required file without data.
 MCDC_REQUIRED=(bytecaskdb/data_file.cppm bytecaskdb/hint_file.cppm
-               bytecaskdb/bytecask.cppm)
+               bytecaskdb/bytecask.cppm bytecaskdb/change_iterator.cppm)
 MCDC_MAX_EXEMPT=2
 
 # Configure and build with coverage instrumentation
