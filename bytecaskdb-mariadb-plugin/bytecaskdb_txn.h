@@ -118,9 +118,11 @@ public:
     void next();
 
     // Pointers into internally owned buffers, or into the reader's batch for
-    // a lent value; valid until next().
-    const uint8_t *key_data() const { return cur_key_.data(); }
-    size_t key_len() const { return cur_key_.size(); }
+    // a lent key or value; valid until next().
+    const uint8_t *key_data() const {
+      return key_lent_ ? lent_key_ptr_ : cur_key_.data();
+    }
+    size_t key_len() const { return key_lent_ ? lent_key_len_ : cur_key_.size(); }
     const uint8_t *value_data() const {
       return val_lent_ ? lent_val_ptr_
                        : reinterpret_cast<const uint8_t *>(cur_val_.data());
@@ -130,7 +132,8 @@ public:
     // Swap buffers with caller — preserves capacity across rows, avoiding
     // per-row heap allocations in steady state. A lent value is copied.
     void swap_value(bytecask::Bytes &other);
-    void swap_key(std::vector<uint8_t> &other) { cur_key_.swap(other); }
+    // A lent key is copied.
+    void swap_key(std::vector<uint8_t> &other);
 
     // Moves the value out — caller takes ownership. Iterator value is left empty.
     bytecask::Bytes steal_value();
@@ -148,6 +151,9 @@ public:
     void emit_snap();
 
     void refill_batch();
+    // advance() once the buffer side can offer no row for the rest of the
+    // scan: the next row straight from the batch, lent.
+    void advance_snapshot_only();
 
     // At most one of these is engaged.
     std::optional<bytecask::RangeReader>          snap_range_;
@@ -184,15 +190,23 @@ public:
     std::span<const bytecask::EntryView> batch_;
     std::size_t batch_pos_{0};
     std::size_t batch_max_{kFirstBatch};
-    // The snapshot row last emitted is still current: its value is lent from
-    // batch_, so the step past it waits for the next advance().
+    // The snapshot row last emitted is still current: its key and value are
+    // lent from batch_, so the step past it waits for the next advance().
     bool snap_step_pending_{false};
+    // The buffer cursor offers no row in this scan and never will: it is at
+    // the buffer's end or on a key past the range, and later writes to the
+    // buffer do not move it (std::map inserts move no iterator). Every row
+    // from here on is the batch's.
+    bool buf_exhausted_{false};
 
     // Current output.
     std::vector<uint8_t> cur_key_;
     bytecask::Bytes cur_val_;
+    const uint8_t *lent_key_ptr_{nullptr};
+    size_t lent_key_len_{0};
     const uint8_t *lent_val_ptr_{nullptr};
     size_t lent_val_len_{0};
+    bool key_lent_{false};
     bool val_lent_{false};
     bool valid_{false};
   };

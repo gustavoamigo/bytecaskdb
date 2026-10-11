@@ -674,6 +674,14 @@ void MariaDBTxn::MergeIterator::swap_value(bytecask::Bytes &other) {
   cur_val_.swap(other);
 }
 
+void MariaDBTxn::MergeIterator::swap_key(std::vector<uint8_t> &other) {
+  if (key_lent_) {
+    other.assign(lent_key_ptr_, lent_key_ptr_ + lent_key_len_);
+    return;
+  }
+  cur_key_.swap(other);
+}
+
 bytecask::Bytes MariaDBTxn::MergeIterator::steal_value() {
   if (val_lent_) {
     bytecask::Bytes out;
@@ -874,8 +882,10 @@ void MariaDBTxn::MergeIterator::emit_buf() {
 }
 
 void MariaDBTxn::MergeIterator::emit_snap() {
-  cur_key_.assign(snap_key_ptr_, snap_key_ptr_ + snap_key_len_);
   if (snap_range_) {
+    lent_key_ptr_ = snap_key_ptr_;
+    lent_key_len_ = snap_key_len_;
+    key_lent_ = true;
     lent_val_ptr_ = snap_val_ptr_;
     lent_val_len_ = snap_val_len_;
     val_lent_ = true;
@@ -883,15 +893,38 @@ void MariaDBTxn::MergeIterator::emit_snap() {
     valid_ = true;
     return;
   }
+  cur_key_.assign(snap_key_ptr_, snap_key_ptr_ + snap_key_len_);
   assign_bytes(cur_val_, snap_val_ptr_, snap_val_len_);
   snap_step();
   load_snap_current();
   valid_ = true;
 }
 
+void MariaDBTxn::MergeIterator::advance_snapshot_only() {
+  if (snap_step_pending_) {
+    snap_step_pending_ = false;
+    if (++batch_pos_ == batch_.size()) refill_batch();
+  }
+  if (batch_pos_ >= batch_.size()) return;
+  const auto &entry = batch_[batch_pos_];
+  lent_key_ptr_ = reinterpret_cast<const uint8_t *>(entry.key.data());
+  lent_key_len_ = entry.key.size();
+  lent_val_ptr_ = reinterpret_cast<const uint8_t *>(entry.value.data());
+  lent_val_len_ = entry.value.size();
+  key_lent_ = true;
+  val_lent_ = true;
+  snap_step_pending_ = true;
+  valid_ = true;
+}
+
 void MariaDBTxn::MergeIterator::advance() {
   valid_ = false;
+  key_lent_ = false;
   val_lent_ = false;
+  if (buf_exhausted_) {
+    advance_snapshot_only();
+    return;
+  }
   if (snap_step_pending_) {
     snap_step_pending_ = false;
     snap_step();
@@ -912,6 +945,8 @@ void MariaDBTxn::MergeIterator::advance() {
     }
 
     if (!buf_valid) {
+      // Forward and batched: the buffer side is done for this scan.
+      if (snap_range_) buf_exhausted_ = true;
       emit_snap();
       return;
     }
