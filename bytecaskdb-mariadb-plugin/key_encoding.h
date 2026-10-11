@@ -40,6 +40,7 @@ struct KeyPartPlan {
   bool be_temporal{false};    // DATETIME2/TIMESTAMP2/TIME2: big-endian already
   bool reverse{false};        // little-endian in the record: stored reversed
   Flip flip{Flip::kNone};     // applied with reverse
+  bool desc{false};           // DESC part: its stored bytes are inverted
 };
 
 struct KeyPlan {
@@ -170,7 +171,9 @@ void normalize_padspace_pk(uint8_t *key_data, const KeyPlan &plan);
 // mem-comparable encoding (big-endian, sign-bit flipped for signed types).
 // Operates in-place on the key_data starting immediately after any prefix
 // (5-byte for PK, 7-byte for secondary). Only affects integer field types;
-// VARCHARs and other types are left untouched.
+// VARCHARs and other types are left untouched. A DESC part then has every
+// byte, null indicator included, inverted, so its stored keys sort in the
+// index's order — descending, NULLs last — as the server reads it.
 void make_mem_comparable(uint8_t *key_data, const KeyPlan &plan, uint key_len);
 
 // Reverses make_mem_comparable(): restores native little-endian format from

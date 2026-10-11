@@ -19,6 +19,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace bytecaskdb;
@@ -1118,6 +1119,129 @@ TEST_CASE("key plan transforms sort by value and round-trip",
     undo_mem_comparable(zero_enc.data(), plan, 5);
     REQUIRE(null_enc == null_key);
     REQUIRE(zero_enc == zero_key);
+  }
+}
+
+TEST_CASE("DESC key parts are stored in descending order",
+          "[key_encoding]") {
+  SECTION("signed integer: descending, and round-trips") {
+    Field_long f;
+    OneKeyTable t(f, 4, /*nullable=*/false);
+    t.part.key_part_flag = HA_REVERSE_SORT;
+    const TableCodec codec = make_table_codec(&t.tbl);
+    const KeyPlan &plan = codec.keys[0];
+    CHECK(plan.parts.at(0).desc);
+
+    std::vector<int32_t> values = {std::numeric_limits<int32_t>::min(), -5,
+                                   -1, 0, 1, 7,
+                                   std::numeric_limits<int32_t>::max()};
+    std::vector<std::vector<uint8_t>> encoded;
+    for (int32_t v : values) {
+      auto bytes = native_bytes(v);
+      auto key = bytes;
+      make_mem_comparable(key.data(), plan, 4);
+      auto back = key;
+      undo_mem_comparable(back.data(), plan, 4);
+      INFO("value " << v);
+      REQUIRE(back == bytes);
+      encoded.push_back(key);
+    }
+    REQUIRE(std::is_sorted(encoded.rbegin(), encoded.rend()));
+  }
+
+  SECTION("an ASC part is unaffected") {
+    Field_long f;
+    OneKeyTable t(f, 4, false);
+    const TableCodec codec = make_table_codec(&t.tbl);
+    CHECK_FALSE(codec.keys[0].parts.at(0).desc);
+  }
+
+  SECTION("nullable: NULL sorts last and both round-trip") {
+    Field_long f;
+    OneKeyTable t(f, 4, /*nullable=*/true);
+    t.part.key_part_flag = HA_REVERSE_SORT;
+    const TableCodec codec = make_table_codec(&t.tbl);
+    const KeyPlan &plan = codec.keys[0];
+    std::vector<uint8_t> null_key = {1, 0, 0, 0, 0};
+    std::vector<uint8_t> max_key = {0, 0xFF, 0xFF, 0xFF, 0x7F};  // INT_MAX
+    std::vector<uint8_t> min_key = {0, 0, 0, 0, 0x80};           // INT_MIN
+    auto null_enc = null_key, max_enc = max_key, min_enc = min_key;
+    make_mem_comparable(null_enc.data(), plan, 5);
+    make_mem_comparable(max_enc.data(), plan, 5);
+    make_mem_comparable(min_enc.data(), plan, 5);
+    REQUIRE(max_enc < min_enc);
+    REQUIRE(min_enc < null_enc);
+    undo_mem_comparable(null_enc.data(), plan, 5);
+    undo_mem_comparable(max_enc.data(), plan, 5);
+    undo_mem_comparable(min_enc.data(), plan, 5);
+    REQUIRE(null_enc == null_key);
+    REQUIRE(max_enc == max_key);
+    REQUIRE(min_enc == min_key);
+  }
+
+  SECTION("secondary VARCHAR: longer and larger strings sort first") {
+    struct VarcharField : Field {
+      enum_field_types type() const override { return MYSQL_TYPE_VARCHAR; }
+    } f;
+    OneKeyTable t(f, 4, false);
+    t.part.store_length = 4 + HA_KEY_BLOB_LENGTH;
+    t.key.key_length = t.part.store_length;
+    t.part.key_part_flag = HA_REVERSE_SORT;
+    const TableCodec codec = make_table_codec(&t.tbl);
+    const KeyPlan &plan = codec.keys[0];
+    REQUIRE(plan.parts.at(0).varlen);
+
+    // key_copy() layout: 2-byte LE length, then the bytes, zero-padded.
+    auto key_of = [&](std::string_view s) {
+      std::vector<uint8_t> k(t.part.store_length, 0);
+      k[0] = static_cast<uint8_t>(s.size());
+      std::memcpy(k.data() + 2, s.data(), s.size());
+      fix_varchar_key_encoding(k.data(), plan);
+      make_mem_comparable(k.data(), plan, static_cast<uint>(k.size()));
+      return k;
+    };
+    REQUIRE(key_of("b") < key_of("ab"));
+    REQUIRE(key_of("ab") < key_of("a"));
+    REQUIRE(key_of("a") < key_of(""));
+  }
+
+  SECTION("a search prefix inverts only the parts it holds") {
+    Field_long f, g;
+    OneKeyTable t(f, 4, false);
+    KEY_PART_INFO parts[2] = {t.part, t.part};
+    parts[0].key_part_flag = HA_REVERSE_SORT;
+    parts[1].field = &g;
+    g.ptr = t.record + 5;
+    t.key.key_part = parts;
+    t.key.user_defined_key_parts = 2;
+    t.key.key_length = 8;
+    const TableCodec codec = make_table_codec(&t.tbl);
+    const KeyPlan &plan = codec.keys[0];
+    CHECK(plan.parts.at(0).desc);
+    CHECK_FALSE(plan.parts.at(1).desc);
+
+    std::vector<uint8_t> key(8, 0xAA);
+    make_mem_comparable(key.data(), plan, 4);
+    // Part 0: 0xAAAAAAAA reversed, sign-flipped (0x2A...), then inverted.
+    REQUIRE(key == std::vector<uint8_t>{0xD5, 0x55, 0x55, 0x55,
+                                        0xAA, 0xAA, 0xAA, 0xAA});
+  }
+
+  SECTION("the key-only read inverts it back") {
+    Field_long f;
+    OneKeyTable t(f, 4, false);
+    t.part.key_part_flag = HA_REVERSE_SORT;
+    const TableCodec codec = make_table_codec(&t.tbl);
+    const KeyPlan &plan = codec.keys[0];
+    auto value = native_bytes<int32_t>(-42);
+    auto encoded = value;
+    make_mem_comparable(encoded.data(), plan, 4);
+    std::vector<uint8_t> sec_key = {0x03, 0, 0, 0, 1, 0, 1};
+    sec_key.insert(sec_key.end(), encoded.begin(), encoded.end());
+    uchar record[16]{};
+    REQUIRE(decode_sec_key_into_record(plan, sec_key.data(), sec_key.size(),
+                                       record));
+    REQUIRE(std::memcmp(record + 1, value.data(), 4) == 0);
   }
 }
 

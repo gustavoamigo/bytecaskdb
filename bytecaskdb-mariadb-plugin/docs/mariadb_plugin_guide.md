@@ -132,6 +132,15 @@ lexicographically sortable. The plugin applies a post-processing step
   which strips the 2-byte LE length prefix and left-justifies data with
   zero padding. Skipped by `make_mem_comparable` since they're already
   in correct lexicographic order after the fix.
+- **DESC key parts** (`HA_REVERSE_SORT`): after the transform above, every
+  byte of the part, null indicator included, is inverted. The server reads
+  a DESC part as descending, NULLs last, and expects `index_first` /
+  `index_next` and every seek to follow that order; inverting the bytes
+  makes the stored order match it. Search keys go through the same
+  transform, so ranges and ordered scans need nothing else. A table with
+  DESC parts created before this encoding stored them ascending: rebuild it
+  with `ALTER TABLE t FORCE` (its rows hold every column, so the copy reads
+  them correctly).
 
 The inverse (`undo_mem_comparable`) is applied by `decode_pk()` before
 calling `key_restore()` to recover the native key format.
@@ -427,6 +436,7 @@ is freed (#294).
 | `HA_READ_PREFIX_LAST` (reverse PK prefix scan) | Done | Used by composite PK auto-increment |
 | Negative integer ordering | Done | Sign-bit flip (XOR 0x80) on MSB after BE conversion |
 | FLOAT/DOUBLE index ordering | Done | IEEE 754 mem-comparable encoding (LE→BE + sign transform) |
+| DESC key parts (`PRIMARY KEY (id DESC)`, `INDEX (c DESC)`) | Done | Part's bytes inverted after the mem-comparable transform |
 | `HA_READ_AFTER_KEY` (loose index scan) | Done | Used by SELECT DISTINCT / GROUP BY on secondary indexes |
 | Batched ALTER / CREATE INDEX on large tables | Done | Bulk-copy mode flushes the copy in `bytecaskdb_bulk_copy_flush_bytes` batches (default 64 MiB); bounded memory regardless of row count |
 
@@ -484,4 +494,5 @@ features) is the remaining gap before production use.
 - **`make_mem_comparable` skips VARCHAR/BLOB key parts.** Those parts are
   handled by `fix_varchar_key_encoding` which runs first. Applying
   `make_mem_comparable` to them would corrupt data by misinterpreting the
-  `store_length - length` bytes as null indicators.
+  `store_length - length` bytes as null indicators. The one exception is a
+  DESC part, whose bytes are inverted whatever its type.

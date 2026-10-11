@@ -274,34 +274,45 @@ void ha_bytecaskdb::seed_rowid_counter_if_needed() const {
 }
 
 // Seeds the autoinc counter on first open of a PK table with AUTO_INCREMENT.
-// Reverse-scans the row namespace to find the last key, restores it into a
-// scratch buffer, then reads the autoinc field value.
+// Finds the key holding the largest leading PK value — the last stored key,
+// or the first when that part is DESC and stored inverted — restores it into
+// a scratch buffer, then reads the autoinc field value.
 void ha_bytecaskdb::seed_autoinc_counter_if_needed() const {
   if (catalog_peek_autoinc(table_id_) != 0) { return; }
 
   const uint pk_idx = table->s->primary_key;
   const uint pk_len = table->key_info[pk_idx].key_length;
-  auto upper = table_id_upper_bound(table_id_);
   bytecask::Snapshot snap = g_db->snapshot();
   uint64_t hw = 0;
 
-  for (auto &k : snap.rkeys_from({}, as_view(upper))) {
-    if (!key_belongs_to_table(u8_data(k), k.size(), table_id_)) { break; }
-    if (k.size() >= 5 + pk_len) {
-      std::vector<uchar> scratch(table->s->rec_buff_length, 0);
-      std::vector<uint8_t> key_tmp(u8_data(k) + 5, u8_data(k) + 5 + pk_len);
-      undo_mem_comparable(key_tmp.data(), codec_.keys[pk_idx], pk_len);
-      key_restore(scratch.data(), key_tmp.data(),
-                  &table->key_info[pk_idx], pk_len);
-      Field *ai_field = table->found_next_number_field;
-      if (ai_field) {
-        uchar *saved_ptr = ai_field->ptr;
-        ai_field->ptr = scratch.data() + ai_field->offset(table->record[0]);
-        hw = static_cast<uint64_t>(ai_field->val_int());
-        ai_field->ptr = saved_ptr;
-      }
+  auto read_hw = [&](const auto &k) {
+    if (k.size() < 5 + pk_len) { return; }
+    std::vector<uchar> scratch(table->s->rec_buff_length, 0);
+    std::vector<uint8_t> key_tmp(u8_data(k) + 5, u8_data(k) + 5 + pk_len);
+    undo_mem_comparable(key_tmp.data(), codec_.keys[pk_idx], pk_len);
+    key_restore(scratch.data(), key_tmp.data(),
+                &table->key_info[pk_idx], pk_len);
+    Field *ai_field = table->found_next_number_field;
+    if (ai_field) {
+      uchar *saved_ptr = ai_field->ptr;
+      ai_field->ptr = scratch.data() + ai_field->offset(table->record[0]);
+      hw = static_cast<uint64_t>(ai_field->val_int());
+      ai_field->ptr = saved_ptr;
     }
-    break;
+  };
+
+  if (codec_.keys[pk_idx].parts.at(0).desc) {
+    auto lower = table_id_prefix(table_id_);
+    for (auto &k : snap.keys_from({}, as_view(lower))) {
+      if (key_belongs_to_table(u8_data(k), k.size(), table_id_)) { read_hw(k); }
+      break;
+    }
+  } else {
+    auto upper = table_id_upper_bound(table_id_);
+    for (auto &k : snap.rkeys_from({}, as_view(upper))) {
+      if (key_belongs_to_table(u8_data(k), k.size(), table_id_)) { read_hw(k); }
+      break;
+    }
   }
   catalog_seed_autoinc(table_id_, hw);
 }
