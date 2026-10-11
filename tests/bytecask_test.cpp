@@ -9818,7 +9818,9 @@ TEST_CASE("a sealed file truncated underneath: Pread and BufferPool throw",
   CHECK_FALSE(db.is_degraded());
 }
 
-#ifndef __EMSCRIPTEN__
+// Linux only: on macOS the private mapping keeps serving the truncated file's
+// old pages, so the read returns the old value (#452).
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
 TEST_CASE("a sealed file truncated underneath: Mmap is SIGBUS",
           "[bytecask][io_backend]") {
   TempDir td;
