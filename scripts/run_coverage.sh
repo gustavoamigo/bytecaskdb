@@ -22,7 +22,8 @@ XMAKE_P=(-P "$PROJECT_DIR")
 # conditions marked `mcdc-exempt:` at their site (scripts/mcdc_report.py).
 # MCDC_MAX_EXEMPT caps those marks: raising it is a reviewed change.
 MCDC_REQUIRED=(bytecaskdb/data_file.cppm bytecaskdb/hint_file.cppm
-               bytecaskdb/bytecask.cppm)
+               bytecaskdb/bytecask.cppm bytecaskdb/change_iterator.cppm
+               bytecaskdb/change_index.cppm)
 MCDC_MAX_EXEMPT=2
 
 # Configure and build with coverage instrumentation
