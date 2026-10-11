@@ -851,17 +851,21 @@ class DB:
 
     def _changes(self, from_sequence: int, durable: int, max_bytes: int | None) -> Iterator[Entry]:
         # Files never share a sequence, so file order by first sequence is
-        # sequence order. A write in progress past durable may be torn, and
-        # the scan stops there; everything durable comes before it.
+        # sequence order, and a file's first sequence is in its first header.
+        # Only the file list is built up front; each file is read and scanned
+        # when the slice reaches it, and released before the next. A write in
+        # progress past durable may be torn, and the scan stops there;
+        # everything durable comes before it.
         files = []
         for fd in list(self._fds.values()):
-            committed, _ = scan_committed(os.pread(fd, os.fstat(fd).st_size, 0))
-            if committed and committed[-1].entry.sequence > from_sequence:
-                files.append(committed)
-        files.sort(key=lambda committed: committed[0].entry.sequence)
+            head = os.pread(fd, _HEADER.size, 0)
+            if len(head) == _HEADER.size and (first := _HEADER.unpack(head)[0]) <= durable:
+                files.append((first, fd))
+        files.sort()
         sent = 0
         in_batch = included = False
-        for committed in files:
+        for _, fd in files:
+            committed, _ = scan_committed(os.pread(fd, os.fstat(fd).st_size, 0))
             for _, entry in committed:
                 if not in_batch:  # a unit starts: in or out, whole
                     included = entry.sequence > from_sequence
