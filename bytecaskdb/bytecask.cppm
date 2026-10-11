@@ -4692,8 +4692,10 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.hint_backpressure_stalls.load(std::memory_order_relaxed)},
       {"bytecask.hint_backpressure_stall_us",
        counters_.hint_backpressure_stall_us.load(std::memory_order_relaxed)},
-      // changes_since slices that entered their first file at a fence of the
-      // change index, and that swept it from its first byte.
+      // changes_since slices that looked the change index up, because their
+      // first file holds from_sequence: those that entered it at a fence,
+      // and those that swept it from its first byte. A slice starting at a
+      // file boundary looks nothing up and counts in neither.
       {"bytecask.change_index_hits",
        change_index_->counters().hits.load(std::memory_order_relaxed)},
       {"bytecask.change_index_misses",
@@ -6837,14 +6839,14 @@ private:
           continue;
         }
         if (entry.sequence > durable_sequence_) {
-          done_ = true;
+          finish();
           return;
         }
         cache_entry(entry);
         needs_advance_ = true;
         sent_ += entry_size(entry.key.size(), entry.value.size());
         // Cut after the unit that passes max_bytes: never inside a batch.
-        if (sent_ >= max_bytes_ && !in_batch_) done_ = true;
+        if (sent_ >= max_bytes_ && !in_batch_) finish();
         return;
       }
 
@@ -6866,8 +6868,16 @@ private:
       }
 
       // All files exhausted.
+      hand_over_fences();
       return;
     }
+  }
+
+  // The slice ended: cut, or past durable. Its fences go to the index now,
+  // not when the caller is done with the slice.
+  void finish() {
+    done_ = true;
+    hand_over_fences();
   }
 
   // Where the sweep of the file holding from_sequence_ starts: the index's
@@ -6897,11 +6907,19 @@ private:
 
   // A fence at the first unit boundary at or past where the plan put the
   // next one. The entry at offset starts a unit at or below the durable
-  // sequence.
+  // sequence. Every kHandOverFences fences are handed over on the spot, so
+  // a sweep holds at most that many (4 KiB) whatever the file's size, and
+  // the plan is re-read: the table may have thinned, or another sweep may
+  // have carried it further.
+  static constexpr std::size_t kHandOverFences = 256;
   void lay_fence(std::uint64_t sequence, Offset offset) {
     if (offset < plan_.next_offset) return;
     pending_fences_.push_back({sequence, offset});
     plan_.next_offset = offset + plan_.spacing;
+    if (pending_fences_.size() >= kHandOverFences) {
+      hand_over_fences();
+      plan_ = index_->plan(file_id_);
+    }
   }
 
   // Hands the fences laid in the current file to the index. The index is a

@@ -263,6 +263,31 @@ TEST_CASE("a slice that stops early indexes what it crossed",
   CHECK(idx.fences(id).size() > laid.size() * 5);
 }
 
+TEST_CASE("fences are handed over during the sweep, a bounded number at a time",
+          "[replication][change_index]") {
+  TempDir td;
+  auto db = bytecask::DB::open(td.path / "db", one_file());
+  fill(db, 8000, 200);  // ~1.8 MiB: more than 256 fences
+  const auto snap = db.snapshot();
+  auto &idx = db.test_change_index();
+  auto batch = db.changes_since(snap, 0);
+  auto it = std::move(batch.entries).begin();
+  for (std::size_t i = 0; i < 6000 && !(it == std::default_sentinel); ++i) ++it;
+  REQUIRE(!(it == std::default_sentinel));
+  // The sweep is still in the file: the first chunk is already in the index.
+  const auto ids = idx.file_ids();
+  REQUIRE(ids.size() == 1);
+  const auto mid = idx.fences(ids[0]).size();
+  CHECK(mid >= 256);
+  CHECK(mid % 256 == 0);
+  while (!(it == std::default_sentinel)) ++it;
+  const auto at_end = idx.fences(ids[0]).size();
+  CHECK(at_end > mid);  // the tail went with the sweep's end
+  CHECK(at_end > 400);
+  const auto history = pull(db, snap, 0);
+  (void)check_slices(db, snap, history, 997);
+}
+
 TEST_CASE("nothing above the durable sequence gets a fence",
           "[replication][change_index]") {
   TempDir td;
