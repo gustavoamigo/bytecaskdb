@@ -1,0 +1,19 @@
+ingest skips the change marker comparison: a slice from a history that
+diverged at a promotion is applied, so a follower ahead of a newly
+promoted leader, or an old leader rejoining with unreplicated writes,
+keeps its own entries and silently takes the new leader's later ones (#397).
+Guarded-by: "promoting the less advanced follower forks the one ahead"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index 590490e..b660a82 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -6982,7 +6982,7 @@ void DB::ingest(const ChangeHeader &header,
+     if (e.entry_type == EntryType::ChangeMarker)
+       source = {e.sequence, decode_marker_id(e.value)};
+   }
+-  if (const auto mine = current->marker_at(at); source != mine) {
++  if (const auto mine = current->marker_at(at); false && source != mine) {
+     throw DbChangeMarkerMismatch{std::format(
+         "ingest: at sequence {} the source's history is marker {{{}, {:#x}}} "
+         "and this node's is {{{}, {:#x}}}: they diverged at a promotion; "

@@ -565,6 +565,12 @@ public:
                                         end_key));
   }
 
+  // Serializes a ChangeMarker hint entry into the current frame.
+  void append_change_marker(std::uint64_t sequence, std::uint64_t file_offset,
+                            std::uint64_t id) {
+    add_entry(serialize_change_marker_entry(sequence, file_offset, id));
+  }
+
   // Writes the last frame and the trailer, calls fdatasync, and closes the
   // fd. Must be called exactly once on a write-mode HintFile.
   void close() {

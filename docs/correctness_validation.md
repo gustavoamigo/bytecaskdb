@@ -2659,6 +2659,9 @@ A site whose break nothing has to catch says why instead.
 | `ingest`: the final `fdatasync` before publishing | `prove_repl__*` | `ingest_skips_final_sync` | — |
 | `ingest`: that sync failing degrades | `prove_repl__*` | `ingest_sync_failure_ignored` | — |
 | `ingest`: a slice that ends inside a batch is refused, so no rotation seals a `BulkBegin` without its `BulkEnd` | `ingest refuses a slice that ends inside an atomic batch` | `ingest_open_batch_accepted` | #188 |
+| `ingest`: a slice from a history that diverged at a promotion is refused before anything is written | `promoting the less advanced follower forks the one ahead` | `ingest_fork_check_removed` | #397 |
+| `set_mode(Leader)`: the change marker's `fdatasync` before the mode changes | `a promotion whose fdatasync fails degrades and keeps the mode; resume finds its marker once` | `promotion_marker_not_synced` | #397 |
+| `vacuum`: a file holding a change marker is never removed whole | `vacuum keeps a change marker: compaction leaves it in a file of its own, and never removes that file` | `vacuum_removes_marker_file` | #397 |
 
 ### MariaDB plugin
 

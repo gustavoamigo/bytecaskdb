@@ -65,8 +65,12 @@ view under a shared lock, and topology changes take it exclusively.
     `:fail`. If that write ever becomes visible, Elle reports it as G1a.
   - Any other exception is `:info`, as in #94.
 - **Replication threads,** one per follower, run Phase 2 against the node
-  the view names as that follower's source. `ingest` is always given
-  slices that end at a batch boundary (see *Open questions*).
+  the view names as that follower's source. Each pull is one
+  `changes_since` slice, cut by the engine at a random `max_bytes` and
+  given to one `ingest` with its header. The first pull from a new source
+  or epoch is made even when the follower is not behind: an empty slice is
+  how the engine compares the two histories at the follower's position
+  (#397).
 - **Follower clients** run read-only transactions on a follower. A quarter
   of them are **session reads**. The client takes the `CommitResult.sequence`
   of a transaction that has already returned `:ok`, waits for
@@ -80,6 +84,7 @@ view under a shared lock, and topology changes take it exclusively.
 | Bootstrap | pause leader vacuum; `create_manifest()`; copy the manifest files; open a follower on them; resume vacuum; start tailing from its `durable_sequence()` | the first `changes_since` after the manifest continues at `through_sequence + 1`, with no gap and no overlap |
 | Planned transfer | `leader.set_mode(Follower)`; wait until the target's `durable_sequence()` equals the old leader's; `target.set_mode(Leader)`; re-target the other followers; switch the view | every write acknowledged by the old leader is on the new one; writes refused by the old leader stay invisible |
 | Unplanned promotion | cut every follower off the old leader and fence it (`set_mode(Follower)`); let any ingest in flight finish; promote the follower with the highest `durable_sequence()`; re-target the others; switch the view; re-bootstrap the old leader later from the new leader | the promoted node's history is a prefix of the old leader's durable history, and no follower is ahead of it |
+| Fork refused | `ingest` throws `DbChangeMarkerMismatch`: the follower's history diverged from its source's at a promotion; take the follower out of service and re-bootstrap it from the leader | nothing was written; only `topology-behind` sees one |
 | Follower restart | close a follower and reopen it; resume tailing from its `durable_sequence()` | monotonic reads across the restart |
 | Lag | pause one replication thread for 50–500 ms | nothing, beyond the checks below |
 | Duplicate delivery | restart one `changes_since` from `durable_sequence() - k` | `ingest` skips what it already holds |
@@ -120,24 +125,23 @@ but not older than".
 | `cluster` | off | all | every check passes |
 | `cluster-vacuum` | on | all, with lag; every vacuum, leader or follower, passes `retain_after` = the lowest position a serving or joining node could resume from | every check passes |
 | `cluster-vacuum-unretained` | on | as `cluster-vacuum`, without `retain_after` | **detects #168** in at least one round of the run: a follower that resumes `changes_since` below a compacted file receives a batch with entries missing |
-| `topology` | off | tailing, planned transfers, unplanned promotions of the most advanced follower, re-bootstrap | every check passes |
-| `topology-behind` | off | as `topology`, but an unplanned promotion takes the least advanced follower | **detects the fork** below in at least one round of the run |
+| `topology` | off | tailing, planned transfers, unplanned promotions of the most advanced follower, re-bootstrap | every check passes, and the engine refuses no slice as a fork (`forks_detected` = 0 in every round) |
+| `topology-behind` | off | as `topology`, but an unplanned promotion takes the least advanced follower | **the engine refuses the fork** (#397): `forks_detected` >= 1 in at least one round of the run, the refused node is re-bootstrapped, and every other check passes |
 
 `cluster-vacuum-unretained` plays the role `blind` plays in #94: it shows
 that the harness finds the failure retention prevents. `topology-behind`
-does the same for the promotion rule: without it, the checks must find a
-fork.
-Once a forked node leads in turn, the fork reaches the leader history too,
-so any finding counts there.
+does the same for the promotion rule: without it, a follower is left ahead
+of the new leader on another history, and the run must show the engine
+refusing its first slice. What that follower read of the lost branch before
+the refusal is relabelled `:info`, like the old leader's own operations; a
+lost write that shows up anywhere else still fails the run.
 
 ## Open questions
 
-1. **Mid-batch `ingest` slices.** Settled: `ingest` publishes whatever
-   slice it is given in one step, so a slice cut between `BulkBegin` and
-   `BulkEnd` publishes half a batch. `CONTRACT.md` now states that the
-   caller must cut at batch boundaries, and the harness does.
-   [#188](https://github.com/gustavoamigo/bytecaskdb/issues/188) tracks
-   having `ingest` hold back or refuse a trailing incomplete batch.
+1. **Mid-batch `ingest` slices.** Settled: `changes_since` cuts the slice
+   itself, after the unit that passes `max_bytes` and never inside a
+   batch, and `ingest` refuses a slice that ends inside one (#397). The
+   harness no longer cuts anything.
 2. **#168's fix shape.** Settled: the replication service owns
    retention. Every vacuum takes `retain_after`, the lowest position a
    follower it counts on could resume from, and drops nothing above it.
@@ -152,6 +156,8 @@ so any finding counts there.
    promotes the most advanced follower, and `topology-behind`, which
    promotes the least advanced, is the sensitivity check. A random target
    forked in only about 40% of rounds, too few for a nightly assertion.
+   Since #397 the engine refuses the fork, so the check asserts on that
+   refusal rather than on the damage.
 
 ## Implementation
 
@@ -170,10 +176,11 @@ Step 1 as built:
     the leader is under load. Leader vacuum is held off from the manifest to
     the end of the copy. The follower's state at open is compared key by key
     with the manifest's snapshot.
-  - is tailed by its own thread, which cuts `ingest` slices at batch
-    boundaries. That thread also runs the nemeses: lag pauses of 20–200 ms,
-    duplicate delivery from up to 32 sequences back, follower vacuum, and a
-    restart every 100–500 ms.
+  - is tailed by its own thread, one `changes_since` slice per `ingest`,
+    with a random `max_bytes` standing in for 1–64 entries. That thread
+    also runs the nemeses: lag pauses of 20–200 ms, duplicate delivery from
+    up to 32 sequences back, follower vacuum, and a restart every
+    100–500 ms.
   - has 4 reader threads, with 0.5–2 ms of think time. A quarter of their
     reads are session reads, after a `durable_sequence` wait of up to
     200 ms.
@@ -215,22 +222,32 @@ Step 2 as built:
   picks a random target. An unplanned promotion is described in the table above;
   `--promote-least` inverts its choice of target. A node the
   promotion abandoned is re-bootstrapped from the new leader before the
-  next event.
+  next event, and so is a node whose slice the engine refused as a fork:
+  the replication thread counts the refusal in `forks_detected`, records a
+  `fork` event with the node, its source and its position, and takes the
+  node out of service. A node out of service is never a promotion
+  candidate.
 - Every operation carries its `epoch` and `role` (`leader`, `reader`,
   `final`). The summary records each event with the promoted node's
   `durable_sequence()` and, for a re-target, the re-targeted node's.
 - At the end, abandoned nodes are re-bootstrapped, a sync write goes to the
-  final leader, every node must catch up to it, and every node reads every
-  key.
+  final leader, every node must catch up to it and have pulled from it in
+  the final epoch (a node ahead on another history reaches the sequence
+  without the writes), and every node reads every key. A node refused as a
+  fork during that wait is re-bootstrapped and the wait repeated.
 - `run_isolation_check.py --topology` relabels what an unplanned promotion
   lost: an `:ok` operation on the old leader in its last epoch that wrote or
   read an element above the promoted node's `durable_sequence()` becomes
   `:info` with its reads cleared. A session read there that waited above
   that sequence waited on the lost branch, whose sequences the new leader
-  reassigns, so its wait is capped at it. The leader history is every
-  `leader` operation plus the final leader's final reads; it goes through
-  the #94 checks. The replication checks run over every node, with
-  convergence against the final leader.
+  reassigns, so its wait is capped at it. The same relabelling applies to
+  the node a `fork` event names, in the bootstrap life it names: every
+  operation carries `life`, the node's bootstrap count, so what it read of
+  the lost branch before the engine refused it is told from what it read
+  once re-bootstrapped. The leader history is every `leader` operation plus
+  the final leader's final reads; it goes through the #94 checks. The
+  replication checks run over every node, with convergence against the
+  final leader.
 
 The manifest-boundary check is done at bootstrap, not on the first tailed
 entry. A failed write consumes sequences, so a gap after `through_sequence`
@@ -280,10 +297,16 @@ new writes sequences `n2` already held, and `ingest` skipped them as
 duplicates: `n2` kept the old leader's writes and dropped `n1`'s, with no
 error. It showed as convergence and prefix violations in 5 of 6 seeds, and
 Elle reported the whole history not serializable (G2-item). The leader
-history stayed strict-serializable. The fix is in the protocol, not the
-engine: cut every follower off the old leader, let the ingest in flight
-finish, and promote the most advanced follower. No follower can then be
-ahead of the new leader. `replication_primitives_design.md` now says so.
+history stayed strict-serializable. The protocol rule stands: cut every
+follower off the old leader, let the ingest in flight finish, and promote
+the most advanced follower, so that no follower is ahead of the new leader.
+`replication_primitives_design.md` says so. The engine now detects a
+violation of it (#397): a promotion writes a change marker, `changes_since`
+names the source's marker at the slice's start, and `ingest` refuses a
+slice whose history is not the follower's own with
+`DbChangeMarkerMismatch`, writing nothing. `topology-behind` breaks the
+rule on purpose and asserts on the refusal; the refused node is
+re-bootstrapped and the run must then pass every check.
 
 **A planned transfer lost acknowledged `sync=false` writes.** In a run
 with only planned transfers, node 1 acknowledged an append at sequence
@@ -305,5 +328,8 @@ With both fixes, `topology` passed every local round.
 - `cluster-vacuum` passes with retention, and `cluster-vacuum-unretained`
   detects #168 at least once per run.
 - Seeds are printed, and a failure uploads the histories and the event log.
+- `topology` passes with no refused slice, and `topology-behind` has the
+  engine refuse a fork at least once per run and passes every other check.
 - `replication_primitives_design.md` cites the checked guarantees, the
-  #168 result and whatever the fork case settles.
+  #168 result and the fork case: the promotion rule, and the engine's
+  refusal of a slice that breaks it.

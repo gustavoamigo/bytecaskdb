@@ -9,6 +9,7 @@
 import errno
 import os
 import random
+import shutil
 import sys
 from pathlib import Path
 
@@ -410,6 +411,211 @@ def test_differential_against_native(tmp_path, bc, seed):
     assert list(r.iter_from()) == list(n.iter_from())
     r.close()
     n.close()
+
+
+# ---------------------------------------------------------------------------
+# Replication, differentially: the same cluster script on both engines
+# ---------------------------------------------------------------------------
+
+MASKED_ID = b"<id>"  # a marker's id is random per node, so histories compare without it
+
+
+class Replication:
+    """One engine's replication interface behind the names the script uses.
+
+    Histories are (sequence, type value, key, value) with marker ids masked;
+    outcomes are "ok", "gap" (ValueError) or "fork" (DbChangeMarkerMismatch).
+    """
+
+    def __init__(self, root):
+        self.root = Path(root)
+
+    def outcome(self, source, follower, from_sequence=None):
+        if from_sequence is None:
+            from_sequence = follower.durable_sequence()
+        header, entries = self.slice(source, from_sequence)
+        try:
+            follower.ingest(header, entries)
+        except ValueError:
+            return "gap"
+        except self.fork_error:
+            return "fork"
+        return "ok"
+
+    def catch_up(self, source, follower, max_bytes=None):
+        slices = []
+        while follower.durable_sequence() < source.durable_sequence():
+            header, entries = self.slice(source, follower.durable_sequence(), max_bytes)
+            follower.ingest(header, entries)
+            slices.append([e[0] for e in self.normalize(entries)])
+        return slices
+
+    def history(self, db):
+        _, entries = self.slice(db, 0)
+        return self.normalize(entries)
+
+    def bootstrap(self, source, name):
+        files, through = self.manifest_files(source)
+        path = self.root / name
+        shutil.rmtree(path, ignore_errors=True)
+        path.mkdir()
+        for file in files:
+            if Path(file).exists():
+                shutil.copy(file, path / Path(file).name)
+        follower = self.open(name, follower=True)
+        assert follower.durable_sequence() == through
+        return follower
+
+    @staticmethod
+    def mask(sequence, kind, key, value):
+        return (sequence, kind, key, MASKED_ID if kind == int(T.CHANGE_MARKER) else value)
+
+
+class ReferenceReplication(Replication):
+    fork_error = ref.DbChangeMarkerMismatch
+
+    def open(self, name, follower=False, max_file_bytes=1024):
+        mode = ref.Mode.Follower if follower else ref.Mode.Leader
+        return ref.DB.open(self.root / name, ref.Options(initial_mode=mode, max_file_bytes=max_file_bytes))
+
+    def set_leader(self, db):
+        db.set_mode(ref.Mode.Leader)
+
+    def set_follower(self, db):
+        db.set_mode(ref.Mode.Follower)
+
+    def slice(self, source, from_sequence, max_bytes=None):
+        batch = source.changes_since(source.snapshot(), from_sequence, max_bytes)
+        return batch.header, list(batch.entries)
+
+    def normalize(self, entries):
+        return [self.mask(e.sequence, int(e.type), e.key, e.value) for e in entries]
+
+    def manifest_files(self, source):
+        manifest = source.create_manifest()
+        return manifest.files, manifest.through_sequence
+
+    def apply_batch(self, db, writes):
+        return db.apply_batch(batch(*writes)).sequence
+
+
+class NativeReplication(Replication):
+    def __init__(self, bc, root):
+        super().__init__(root)
+        self.bc = bc
+        self.fork_error = bc.DbChangeMarkerMismatch
+
+    def open(self, name, follower=False, max_file_bytes=1024):
+        opts = native_options(self.bc, max_file_bytes)
+        opts.initial_mode = self.bc.Mode.Follower if follower else self.bc.Mode.Leader
+        return self.bc.DB.open(str(self.root / name), opts)
+
+    def set_leader(self, db):
+        db.set_mode(self.bc.Mode.Leader)
+
+    def set_follower(self, db):
+        db.set_mode(self.bc.Mode.Follower)
+
+    def slice(self, source, from_sequence, max_bytes=None):
+        batch = source.changes_since(source.snapshot(), from_sequence, max_bytes)
+        return batch.header, list(batch.entries)
+
+    def normalize(self, entries):
+        return [self.mask(e.sequence, e.entry_type.value, e.key, e.value) for e in entries]
+
+    def manifest_files(self, source):
+        manifest = source.create_manifest()
+        files = [p for f in manifest.files for p in (f.data_path, f.hint_path)]
+        return files, manifest.through_sequence
+
+    def apply_batch(self, db, writes):
+        plan = self.bc.WritePlan()
+        for key, value in writes:
+            plan.put(key, value)
+        return db.apply_batch(plan).sequence
+
+
+def replication_script(x):
+    """The design's unplanned failover, then a gap, re-deliveries, a planned
+    transfer and slicing, on one engine. Yields (step, observation)."""
+    L = x.open("L")
+    for i in range(10):
+        yield f"put {i}", L.put(f"k{i:02}".encode(), b"L").sequence
+    N = x.bootstrap(L, "N")
+    G = x.bootstrap(L, "G")
+    for i in range(10, 20):
+        L.put(f"k{i:02}".encode(), b"L")
+    yield "batch on L", x.apply_batch(L, [(b"b1", b"1"), (b"b2", b"2")])
+    F = x.bootstrap(L, "F")
+    yield "positions", (N.durable_sequence(), G.durable_sequence(), F.durable_sequence())
+    header = x.slice(L, 0)[0]
+    yield "origin header", (header.marker.since_sequence, header.marker.id, header.from_sequence)
+    L.close()  # L dies
+
+    x.set_leader(N)  # the wrong choice: F is ahead
+    yield "N's first write after the marker", N.put(b"n", b"1").sequence
+    yield "N history", x.history(N)
+    yield "N's marker at 20", x.slice(N, 20)[0].marker.since_sequence
+    yield "F's marker at 20", x.slice(F, 20)[0].marker.since_sequence
+    yield "N -> F", x.outcome(N, F)
+    yield "N -> F from 5", x.outcome(N, F, from_sequence=5)
+    yield "F untouched", (F.durable_sequence(), x.history(F))
+    yield "N -> G catch up", x.catch_up(N, G)
+    yield "G history", x.history(G)
+    L = x.open("L", follower=True)
+    yield "L rejoins", (L.durable_sequence(), x.outcome(N, L))
+    yield "N -> F, empty slice at F's position", x.outcome(N, F, from_sequence=F.durable_sequence())
+
+    # A gap: a fresh follower asked to start past its position.
+    E = x.open("E", follower=True)
+    yield "gap", x.outcome(N, E, from_sequence=3)
+    yield "E untouched", (E.durable_sequence(), x.history(E))
+    yield "E from 0, one unit per slice", x.catch_up(N, E, max_bytes=1)
+
+    # Re-delivery of the same history, with the marker in the range.
+    yield "N -> G from 5 again", x.outcome(N, G, from_sequence=5)
+    yield "N -> G from the marker", x.outcome(N, G, from_sequence=11)
+    yield "N -> G from 0", x.outcome(N, G, from_sequence=0)
+
+    # Planned transfer: N steps down, G is promoted, N follows G.
+    x.set_follower(N)
+    x.set_leader(G)
+    yield "G's first write after its marker", G.put(b"g", b"1").sequence
+    yield "G -> N", x.catch_up(G, N)
+    yield "G -> E", x.catch_up(G, E, max_bytes=1)
+    yield "N -> F after the transfer", x.outcome(G, F)
+
+    # Re-bootstrap F and L from G: everything converges.
+    F.close()
+    L.close()
+    F = x.bootstrap(G, "F2")
+    L = x.bootstrap(G, "L2")
+    yield "batch on G", x.apply_batch(G, [(b"b1", b"3"), (b"b3", b"4")])
+    for name, node in (("N", N), ("E", E), ("F", F), ("L", L)):
+        x.catch_up(G, node)
+        yield f"{name} converged", (node.durable_sequence(), x.history(node) == x.history(G),
+                                    list(node.iter_from()) == list(G.iter_from()))
+    yield "G history", x.history(G)
+    yield "G keys", list(G.iter_from())
+    for node in (N, G, E, F, L):
+        node.close()
+    N = x.open("N")  # reopening in Leader mode is not a promotion
+    yield "N reopened", (N.durable_sequence(), N.put(b"z", b"1").sequence, x.history(N)[-3:])
+    N.close()
+
+
+def test_replication_differential_against_native(tmp_path, bc):
+    """The same scripted cluster on the reference and on the engine: every
+    outcome (accepted, gap, fork), durable sequence and history must agree,
+    with marker ids, random per node, masked."""
+    reference = replication_script(ReferenceReplication(tmp_path / "ref"))
+    native = replication_script(NativeReplication(bc, tmp_path / "native"))
+    steps = 0
+    for (r_step, r_seen), (n_step, n_seen) in zip(reference, native, strict=True):
+        assert r_step == n_step
+        assert r_seen == n_seen, r_step
+        steps += 1
+    assert steps > 30
 
 
 # ---------------------------------------------------------------------------

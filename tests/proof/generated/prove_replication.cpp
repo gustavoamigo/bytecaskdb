@@ -73,7 +73,7 @@ TEST_CASE("prove_repl__single_key__full_stream__success", "[prove_repl]") {
         {.initial_mode = bytecask::Mode::Follower});
 
       {
-        follower.ingest(views);
+        follower.ingest(owned.header, views);
       }
 
       assert_replication_match(leader_bl, follower);
@@ -110,7 +110,7 @@ TEST_CASE("prove_repl__single_key__full_stream__append_fails_nothing_written", "
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -146,7 +146,7 @@ TEST_CASE("prove_repl__single_key__full_stream__append_fails_partial_write", "[p
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -181,7 +181,7 @@ TEST_CASE("prove_repl__single_key__full_stream__sync_fails", "[prove_repl]") {
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -230,10 +230,11 @@ TEST_CASE("prove_repl__single_key__incremental__success", "[prove_repl]") {
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     // Second chunk.
-    if (!chunk2.empty()) follower.ingest(chunk2);
+    if (!chunk2.empty()) follower.ingest(header2, chunk2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -278,7 +279,8 @@ TEST_CASE("prove_repl__single_key__incremental__append_fails_nothing_written", "
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -286,7 +288,7 @@ TEST_CASE("prove_repl__single_key__incremental__append_fails_nothing_written", "
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -344,7 +346,8 @@ TEST_CASE("prove_repl__single_key__incremental__append_fails_partial_write", "[p
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -353,7 +356,7 @@ TEST_CASE("prove_repl__single_key__incremental__append_fails_partial_write", "[p
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -411,7 +414,8 @@ TEST_CASE("prove_repl__single_key__incremental__sync_fails", "[prove_repl]") {
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -419,7 +423,7 @@ TEST_CASE("prove_repl__single_key__incremental__sync_fails", "[prove_repl]") {
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -471,7 +475,7 @@ TEST_CASE("prove_repl__single_key__restart_midstream__success", "[prove_repl]") 
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -483,7 +487,7 @@ TEST_CASE("prove_repl__single_key__restart_midstream__success", "[prove_repl]") 
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
 
-      if (!views2.empty()) follower.ingest(views2);
+      if (!views2.empty()) follower.ingest(owned2.header, views2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -525,7 +529,7 @@ TEST_CASE("prove_repl__single_key__restart_midstream__append_fails_nothing_writt
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -542,7 +546,7 @@ TEST_CASE("prove_repl__single_key__restart_midstream__append_fails_nothing_writt
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -597,7 +601,7 @@ TEST_CASE("prove_repl__single_key__restart_midstream__append_fails_partial_write
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -615,7 +619,7 @@ TEST_CASE("prove_repl__single_key__restart_midstream__append_fails_partial_write
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -670,7 +674,7 @@ TEST_CASE("prove_repl__single_key__restart_midstream__sync_fails", "[prove_repl]
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -687,7 +691,7 @@ TEST_CASE("prove_repl__single_key__restart_midstream__sync_fails", "[prove_repl]
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -723,11 +727,11 @@ TEST_CASE("prove_repl__single_key__duplicate_delivery__success", "[prove_repl]")
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
@@ -750,7 +754,7 @@ TEST_CASE("prove_repl__single_key__planned_promotion__success", "[prove_repl]") 
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     assert_replication_match(init_leader_bl, follower);
 
     // Leadership transfer: leader → follower, follower → leader.
@@ -759,6 +763,7 @@ TEST_CASE("prove_repl__single_key__planned_promotion__success", "[prove_repl]") 
         leader.put({}, to_bytes("reject"), to_bytes("x")),
         bytecask::DbFollowerMode);
 
+    // A promotion: the marker takes the next sequence, synced.
     follower.set_mode(bytecask::Mode::Leader);
     auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
@@ -768,7 +773,7 @@ TEST_CASE("prove_repl__single_key__planned_promotion__success", "[prove_repl]") 
     auto snap2 = follower.snapshot();
     auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
-    leader.ingest(views2);
+    leader.ingest(owned2.header, views2);
 
     auto follower_final = capture_replication_baseline(follower);
     assert_replication_match(follower_final, leader);
@@ -803,7 +808,7 @@ TEST_CASE("prove_repl__multi_key__full_stream__success", "[prove_repl]") {
         {.initial_mode = bytecask::Mode::Follower});
 
       {
-        follower.ingest(views);
+        follower.ingest(owned.header, views);
       }
 
       assert_replication_match(leader_bl, follower);
@@ -844,7 +849,7 @@ TEST_CASE("prove_repl__multi_key__full_stream__append_fails_nothing_written", "[
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -884,7 +889,7 @@ TEST_CASE("prove_repl__multi_key__full_stream__append_fails_partial_write", "[pr
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -923,7 +928,7 @@ TEST_CASE("prove_repl__multi_key__full_stream__sync_fails", "[prove_repl]") {
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -976,10 +981,11 @@ TEST_CASE("prove_repl__multi_key__incremental__success", "[prove_repl]") {
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     // Second chunk.
-    if (!chunk2.empty()) follower.ingest(chunk2);
+    if (!chunk2.empty()) follower.ingest(header2, chunk2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -1028,7 +1034,8 @@ TEST_CASE("prove_repl__multi_key__incremental__append_fails_nothing_written", "[
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -1036,7 +1043,7 @@ TEST_CASE("prove_repl__multi_key__incremental__append_fails_nothing_written", "[
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -1098,7 +1105,8 @@ TEST_CASE("prove_repl__multi_key__incremental__append_fails_partial_write", "[pr
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -1107,7 +1115,7 @@ TEST_CASE("prove_repl__multi_key__incremental__append_fails_partial_write", "[pr
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -1169,7 +1177,8 @@ TEST_CASE("prove_repl__multi_key__incremental__sync_fails", "[prove_repl]") {
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -1177,7 +1186,7 @@ TEST_CASE("prove_repl__multi_key__incremental__sync_fails", "[prove_repl]") {
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -1233,7 +1242,7 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__success", "[prove_repl]") {
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -1245,7 +1254,7 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__success", "[prove_repl]") {
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
 
-      if (!views2.empty()) follower.ingest(views2);
+      if (!views2.empty()) follower.ingest(owned2.header, views2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -1291,7 +1300,7 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__append_fails_nothing_writte
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -1308,7 +1317,7 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__append_fails_nothing_writte
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -1367,7 +1376,7 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__append_fails_partial_write"
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -1385,7 +1394,7 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__append_fails_partial_write"
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -1444,7 +1453,7 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__sync_fails", "[prove_repl]"
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -1461,7 +1470,7 @@ TEST_CASE("prove_repl__multi_key__restart_midstream__sync_fails", "[prove_repl]"
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -1501,11 +1510,11 @@ TEST_CASE("prove_repl__multi_key__duplicate_delivery__success", "[prove_repl]") 
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
@@ -1532,7 +1541,7 @@ TEST_CASE("prove_repl__multi_key__planned_promotion__success", "[prove_repl]") {
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     assert_replication_match(init_leader_bl, follower);
 
     // Leadership transfer: leader → follower, follower → leader.
@@ -1541,6 +1550,7 @@ TEST_CASE("prove_repl__multi_key__planned_promotion__success", "[prove_repl]") {
         leader.put({}, to_bytes("reject"), to_bytes("x")),
         bytecask::DbFollowerMode);
 
+    // A promotion: the marker takes the next sequence, synced.
     follower.set_mode(bytecask::Mode::Leader);
     auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
@@ -1550,7 +1560,7 @@ TEST_CASE("prove_repl__multi_key__planned_promotion__success", "[prove_repl]") {
     auto snap2 = follower.snapshot();
     auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
-    leader.ingest(views2);
+    leader.ingest(owned2.header, views2);
 
     auto follower_final = capture_replication_baseline(follower);
     assert_replication_match(follower_final, leader);
@@ -1582,7 +1592,7 @@ TEST_CASE("prove_repl__overwrites__full_stream__success", "[prove_repl]") {
         {.initial_mode = bytecask::Mode::Follower});
 
       {
-        follower.ingest(views);
+        follower.ingest(owned.header, views);
       }
 
       assert_replication_match(leader_bl, follower);
@@ -1620,7 +1630,7 @@ TEST_CASE("prove_repl__overwrites__full_stream__append_fails_nothing_written", "
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -1657,7 +1667,7 @@ TEST_CASE("prove_repl__overwrites__full_stream__append_fails_partial_write", "[p
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -1693,7 +1703,7 @@ TEST_CASE("prove_repl__overwrites__full_stream__sync_fails", "[prove_repl]") {
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -1743,10 +1753,11 @@ TEST_CASE("prove_repl__overwrites__incremental__success", "[prove_repl]") {
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     // Second chunk.
-    if (!chunk2.empty()) follower.ingest(chunk2);
+    if (!chunk2.empty()) follower.ingest(header2, chunk2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -1792,7 +1803,8 @@ TEST_CASE("prove_repl__overwrites__incremental__append_fails_nothing_written", "
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -1800,7 +1812,7 @@ TEST_CASE("prove_repl__overwrites__incremental__append_fails_nothing_written", "
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -1859,7 +1871,8 @@ TEST_CASE("prove_repl__overwrites__incremental__append_fails_partial_write", "[p
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -1868,7 +1881,7 @@ TEST_CASE("prove_repl__overwrites__incremental__append_fails_partial_write", "[p
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -1927,7 +1940,8 @@ TEST_CASE("prove_repl__overwrites__incremental__sync_fails", "[prove_repl]") {
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -1935,7 +1949,7 @@ TEST_CASE("prove_repl__overwrites__incremental__sync_fails", "[prove_repl]") {
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -1988,7 +2002,7 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__success", "[prove_repl]") 
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -2000,7 +2014,7 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__success", "[prove_repl]") 
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
 
-      if (!views2.empty()) follower.ingest(views2);
+      if (!views2.empty()) follower.ingest(owned2.header, views2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -2043,7 +2057,7 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__append_fails_nothing_writt
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -2060,7 +2074,7 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__append_fails_nothing_writt
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -2116,7 +2130,7 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__append_fails_partial_write
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -2134,7 +2148,7 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__append_fails_partial_write
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -2190,7 +2204,7 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__sync_fails", "[prove_repl]
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -2207,7 +2221,7 @@ TEST_CASE("prove_repl__overwrites__restart_midstream__sync_fails", "[prove_repl]
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -2244,11 +2258,11 @@ TEST_CASE("prove_repl__overwrites__duplicate_delivery__success", "[prove_repl]")
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
@@ -2272,7 +2286,7 @@ TEST_CASE("prove_repl__overwrites__planned_promotion__success", "[prove_repl]") 
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     assert_replication_match(init_leader_bl, follower);
 
     // Leadership transfer: leader → follower, follower → leader.
@@ -2281,6 +2295,7 @@ TEST_CASE("prove_repl__overwrites__planned_promotion__success", "[prove_repl]") 
         leader.put({}, to_bytes("reject"), to_bytes("x")),
         bytecask::DbFollowerMode);
 
+    // A promotion: the marker takes the next sequence, synced.
     follower.set_mode(bytecask::Mode::Leader);
     auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
@@ -2290,7 +2305,7 @@ TEST_CASE("prove_repl__overwrites__planned_promotion__success", "[prove_repl]") 
     auto snap2 = follower.snapshot();
     auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
-    leader.ingest(views2);
+    leader.ingest(owned2.header, views2);
 
     auto follower_final = capture_replication_baseline(follower);
     assert_replication_match(follower_final, leader);
@@ -2322,7 +2337,7 @@ TEST_CASE("prove_repl__deletes__full_stream__success", "[prove_repl]") {
         {.initial_mode = bytecask::Mode::Follower});
 
       {
-        follower.ingest(views);
+        follower.ingest(owned.header, views);
       }
 
       assert_replication_match(leader_bl, follower);
@@ -2360,7 +2375,7 @@ TEST_CASE("prove_repl__deletes__full_stream__append_fails_nothing_written", "[pr
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -2397,7 +2412,7 @@ TEST_CASE("prove_repl__deletes__full_stream__append_fails_partial_write", "[prov
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -2433,7 +2448,7 @@ TEST_CASE("prove_repl__deletes__full_stream__sync_fails", "[prove_repl]") {
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -2483,10 +2498,11 @@ TEST_CASE("prove_repl__deletes__incremental__success", "[prove_repl]") {
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     // Second chunk.
-    if (!chunk2.empty()) follower.ingest(chunk2);
+    if (!chunk2.empty()) follower.ingest(header2, chunk2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -2532,7 +2548,8 @@ TEST_CASE("prove_repl__deletes__incremental__append_fails_nothing_written", "[pr
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -2540,7 +2557,7 @@ TEST_CASE("prove_repl__deletes__incremental__append_fails_nothing_written", "[pr
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -2599,7 +2616,8 @@ TEST_CASE("prove_repl__deletes__incremental__append_fails_partial_write", "[prov
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -2608,7 +2626,7 @@ TEST_CASE("prove_repl__deletes__incremental__append_fails_partial_write", "[prov
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -2667,7 +2685,8 @@ TEST_CASE("prove_repl__deletes__incremental__sync_fails", "[prove_repl]") {
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -2675,7 +2694,7 @@ TEST_CASE("prove_repl__deletes__incremental__sync_fails", "[prove_repl]") {
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -2728,7 +2747,7 @@ TEST_CASE("prove_repl__deletes__restart_midstream__success", "[prove_repl]") {
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -2740,7 +2759,7 @@ TEST_CASE("prove_repl__deletes__restart_midstream__success", "[prove_repl]") {
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
 
-      if (!views2.empty()) follower.ingest(views2);
+      if (!views2.empty()) follower.ingest(owned2.header, views2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -2783,7 +2802,7 @@ TEST_CASE("prove_repl__deletes__restart_midstream__append_fails_nothing_written"
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -2800,7 +2819,7 @@ TEST_CASE("prove_repl__deletes__restart_midstream__append_fails_nothing_written"
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -2856,7 +2875,7 @@ TEST_CASE("prove_repl__deletes__restart_midstream__append_fails_partial_write", 
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -2874,7 +2893,7 @@ TEST_CASE("prove_repl__deletes__restart_midstream__append_fails_partial_write", 
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -2930,7 +2949,7 @@ TEST_CASE("prove_repl__deletes__restart_midstream__sync_fails", "[prove_repl]") 
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -2947,7 +2966,7 @@ TEST_CASE("prove_repl__deletes__restart_midstream__sync_fails", "[prove_repl]") 
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -2984,11 +3003,11 @@ TEST_CASE("prove_repl__deletes__duplicate_delivery__success", "[prove_repl]") {
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
@@ -3012,7 +3031,7 @@ TEST_CASE("prove_repl__deletes__planned_promotion__success", "[prove_repl]") {
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     assert_replication_match(init_leader_bl, follower);
 
     // Leadership transfer: leader → follower, follower → leader.
@@ -3021,6 +3040,7 @@ TEST_CASE("prove_repl__deletes__planned_promotion__success", "[prove_repl]") {
         leader.put({}, to_bytes("reject"), to_bytes("x")),
         bytecask::DbFollowerMode);
 
+    // A promotion: the marker takes the next sequence, synced.
     follower.set_mode(bytecask::Mode::Leader);
     auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
@@ -3030,7 +3050,7 @@ TEST_CASE("prove_repl__deletes__planned_promotion__success", "[prove_repl]") {
     auto snap2 = follower.snapshot();
     auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
-    leader.ingest(views2);
+    leader.ingest(owned2.header, views2);
 
     auto follower_final = capture_replication_baseline(follower);
     assert_replication_match(follower_final, leader);
@@ -3066,7 +3086,7 @@ TEST_CASE("prove_repl__range_deletes__full_stream__success", "[prove_repl]") {
         {.initial_mode = bytecask::Mode::Follower});
 
       {
-        follower.ingest(views);
+        follower.ingest(owned.header, views);
       }
 
       assert_replication_match(leader_bl, follower);
@@ -3108,7 +3128,7 @@ TEST_CASE("prove_repl__range_deletes__full_stream__append_fails_nothing_written"
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -3149,7 +3169,7 @@ TEST_CASE("prove_repl__range_deletes__full_stream__append_fails_partial_write", 
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -3189,7 +3209,7 @@ TEST_CASE("prove_repl__range_deletes__full_stream__sync_fails", "[prove_repl]") 
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -3243,10 +3263,11 @@ TEST_CASE("prove_repl__range_deletes__incremental__success", "[prove_repl]") {
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     // Second chunk.
-    if (!chunk2.empty()) follower.ingest(chunk2);
+    if (!chunk2.empty()) follower.ingest(header2, chunk2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -3296,7 +3317,8 @@ TEST_CASE("prove_repl__range_deletes__incremental__append_fails_nothing_written"
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -3304,7 +3326,7 @@ TEST_CASE("prove_repl__range_deletes__incremental__append_fails_nothing_written"
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -3367,7 +3389,8 @@ TEST_CASE("prove_repl__range_deletes__incremental__append_fails_partial_write", 
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -3376,7 +3399,7 @@ TEST_CASE("prove_repl__range_deletes__incremental__append_fails_partial_write", 
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -3439,7 +3462,8 @@ TEST_CASE("prove_repl__range_deletes__incremental__sync_fails", "[prove_repl]") 
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -3447,7 +3471,7 @@ TEST_CASE("prove_repl__range_deletes__incremental__sync_fails", "[prove_repl]") 
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -3504,7 +3528,7 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__success", "[prove_repl]
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -3516,7 +3540,7 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__success", "[prove_repl]
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
 
-      if (!views2.empty()) follower.ingest(views2);
+      if (!views2.empty()) follower.ingest(owned2.header, views2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -3563,7 +3587,7 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__append_fails_nothing_wr
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -3580,7 +3604,7 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__append_fails_nothing_wr
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -3640,7 +3664,7 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__append_fails_partial_wr
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -3658,7 +3682,7 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__append_fails_partial_wr
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -3718,7 +3742,7 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__sync_fails", "[prove_re
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -3735,7 +3759,7 @@ TEST_CASE("prove_repl__range_deletes__restart_midstream__sync_fails", "[prove_re
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -3776,11 +3800,11 @@ TEST_CASE("prove_repl__range_deletes__duplicate_delivery__success", "[prove_repl
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
@@ -3808,7 +3832,7 @@ TEST_CASE("prove_repl__range_deletes__planned_promotion__success", "[prove_repl]
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     assert_replication_match(init_leader_bl, follower);
 
     // Leadership transfer: leader → follower, follower → leader.
@@ -3817,6 +3841,7 @@ TEST_CASE("prove_repl__range_deletes__planned_promotion__success", "[prove_repl]
         leader.put({}, to_bytes("reject"), to_bytes("x")),
         bytecask::DbFollowerMode);
 
+    // A promotion: the marker takes the next sequence, synced.
     follower.set_mode(bytecask::Mode::Leader);
     auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
@@ -3826,7 +3851,7 @@ TEST_CASE("prove_repl__range_deletes__planned_promotion__success", "[prove_repl]
     auto snap2 = follower.snapshot();
     auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
-    leader.ingest(views2);
+    leader.ingest(owned2.header, views2);
 
     auto follower_final = capture_replication_baseline(follower);
     assert_replication_match(follower_final, leader);
@@ -3863,7 +3888,7 @@ TEST_CASE("prove_repl__batches__full_stream__success", "[prove_repl]") {
         {.initial_mode = bytecask::Mode::Follower});
 
       {
-        follower.ingest(views);
+        follower.ingest(owned.header, views);
       }
 
       assert_replication_match(leader_bl, follower);
@@ -3906,7 +3931,7 @@ TEST_CASE("prove_repl__batches__full_stream__append_fails_nothing_written", "[pr
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -3948,7 +3973,7 @@ TEST_CASE("prove_repl__batches__full_stream__append_fails_partial_write", "[prov
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -3989,7 +4014,7 @@ TEST_CASE("prove_repl__batches__full_stream__sync_fails", "[prove_repl]") {
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -4028,7 +4053,7 @@ TEST_CASE("prove_repl__batches__full_stream__crash_mid_batch", "[prove_repl]") {
       {
         bytecask::testing::ScopedFaultInjector fi{2};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -4085,10 +4110,11 @@ TEST_CASE("prove_repl__batches__incremental__success", "[prove_repl]") {
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     // Second chunk.
-    if (!chunk2.empty()) follower.ingest(chunk2);
+    if (!chunk2.empty()) follower.ingest(header2, chunk2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -4139,7 +4165,8 @@ TEST_CASE("prove_repl__batches__incremental__append_fails_nothing_written", "[pr
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -4147,7 +4174,7 @@ TEST_CASE("prove_repl__batches__incremental__append_fails_nothing_written", "[pr
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -4211,7 +4238,8 @@ TEST_CASE("prove_repl__batches__incremental__append_fails_partial_write", "[prov
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -4220,7 +4248,7 @@ TEST_CASE("prove_repl__batches__incremental__append_fails_partial_write", "[prov
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -4284,7 +4312,8 @@ TEST_CASE("prove_repl__batches__incremental__sync_fails", "[prove_repl]") {
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -4292,7 +4321,7 @@ TEST_CASE("prove_repl__batches__incremental__sync_fails", "[prove_repl]") {
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -4354,7 +4383,8 @@ TEST_CASE("prove_repl__batches__incremental__crash_mid_batch", "[prove_repl]") {
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -4362,7 +4392,7 @@ TEST_CASE("prove_repl__batches__incremental__crash_mid_batch", "[prove_repl]") {
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{2};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -4422,7 +4452,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__success", "[prove_repl]") {
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -4434,7 +4464,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__success", "[prove_repl]") {
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
 
-      if (!views2.empty()) follower.ingest(views2);
+      if (!views2.empty()) follower.ingest(owned2.header, views2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -4482,7 +4512,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__append_fails_nothing_written"
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -4499,7 +4529,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__append_fails_nothing_written"
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -4560,7 +4590,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__append_fails_partial_write", 
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -4578,7 +4608,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__append_fails_partial_write", 
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -4639,7 +4669,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__sync_fails", "[prove_repl]") 
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -4656,7 +4686,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__sync_fails", "[prove_repl]") 
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -4715,7 +4745,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__crash_mid_batch", "[prove_rep
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -4732,7 +4762,7 @@ TEST_CASE("prove_repl__batches__restart_midstream__crash_mid_batch", "[prove_rep
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{2};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -4776,11 +4806,11 @@ TEST_CASE("prove_repl__batches__duplicate_delivery__success", "[prove_repl]") {
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
@@ -4809,7 +4839,7 @@ TEST_CASE("prove_repl__batches__planned_promotion__success", "[prove_repl]") {
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     assert_replication_match(init_leader_bl, follower);
 
     // Leadership transfer: leader → follower, follower → leader.
@@ -4818,6 +4848,7 @@ TEST_CASE("prove_repl__batches__planned_promotion__success", "[prove_repl]") {
         leader.put({}, to_bytes("reject"), to_bytes("x")),
         bytecask::DbFollowerMode);
 
+    // A promotion: the marker takes the next sequence, synced.
     follower.set_mode(bytecask::Mode::Leader);
     auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
@@ -4827,7 +4858,7 @@ TEST_CASE("prove_repl__batches__planned_promotion__success", "[prove_repl]") {
     auto snap2 = follower.snapshot();
     auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
-    leader.ingest(views2);
+    leader.ingest(owned2.header, views2);
 
     auto follower_final = capture_replication_baseline(follower);
     assert_replication_match(follower_final, leader);
@@ -4862,7 +4893,7 @@ TEST_CASE("prove_repl__multi_file__full_stream__success", "[prove_repl]") {
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
 
       {
-        follower.ingest(views);
+        follower.ingest(owned.header, views);
       }
 
       assert_replication_match(leader_bl, follower);
@@ -4903,7 +4934,7 @@ TEST_CASE("prove_repl__multi_file__full_stream__append_fails_nothing_written", "
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -4943,7 +4974,7 @@ TEST_CASE("prove_repl__multi_file__full_stream__append_fails_partial_write", "[p
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -4982,7 +5013,7 @@ TEST_CASE("prove_repl__multi_file__full_stream__sync_fails", "[prove_repl]") {
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -5019,7 +5050,7 @@ TEST_CASE("prove_repl__multi_file__full_stream__rotation_sync_fails", "[prove_re
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -5056,7 +5087,7 @@ TEST_CASE("prove_repl__multi_file__full_stream__rotation_file_creation_fails", "
       {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -5111,10 +5142,11 @@ TEST_CASE("prove_repl__multi_file__incremental__success", "[prove_repl]") {
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     // Second chunk.
-    if (!chunk2.empty()) follower.ingest(chunk2);
+    if (!chunk2.empty()) follower.ingest(header2, chunk2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -5163,7 +5195,8 @@ TEST_CASE("prove_repl__multi_file__incremental__append_fails_nothing_written", "
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -5171,7 +5204,7 @@ TEST_CASE("prove_repl__multi_file__incremental__append_fails_nothing_written", "
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -5233,7 +5266,8 @@ TEST_CASE("prove_repl__multi_file__incremental__append_fails_partial_write", "[p
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -5242,7 +5276,7 @@ TEST_CASE("prove_repl__multi_file__incremental__append_fails_partial_write", "[p
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -5304,7 +5338,8 @@ TEST_CASE("prove_repl__multi_file__incremental__sync_fails", "[prove_repl]") {
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -5312,7 +5347,7 @@ TEST_CASE("prove_repl__multi_file__incremental__sync_fails", "[prove_repl]") {
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -5372,7 +5407,8 @@ TEST_CASE("prove_repl__multi_file__incremental__rotation_sync_fails", "[prove_re
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -5380,7 +5416,7 @@ TEST_CASE("prove_repl__multi_file__incremental__rotation_sync_fails", "[prove_re
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -5440,7 +5476,8 @@ TEST_CASE("prove_repl__multi_file__incremental__rotation_file_creation_fails", "
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -5448,7 +5485,7 @@ TEST_CASE("prove_repl__multi_file__incremental__rotation_file_creation_fails", "
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -5506,7 +5543,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__success", "[prove_repl]") 
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -5518,7 +5555,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__success", "[prove_repl]") 
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
 
-      if (!views2.empty()) follower.ingest(views2);
+      if (!views2.empty()) follower.ingest(owned2.header, views2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -5564,7 +5601,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__append_fails_nothing_writt
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -5581,7 +5618,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__append_fails_nothing_writt
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -5640,7 +5677,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__append_fails_partial_write
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -5658,7 +5695,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__append_fails_partial_write
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -5717,7 +5754,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__sync_fails", "[prove_repl]
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -5734,7 +5771,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__sync_fails", "[prove_repl]
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -5791,7 +5828,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__rotation_sync_fails", "[pr
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -5808,7 +5845,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__rotation_sync_fails", "[pr
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -5865,7 +5902,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__rotation_file_creation_fai
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -5882,7 +5919,7 @@ TEST_CASE("prove_repl__multi_file__restart_midstream__rotation_file_creation_fai
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -5924,11 +5961,11 @@ TEST_CASE("prove_repl__multi_file__duplicate_delivery__success", "[prove_repl]")
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
@@ -5955,7 +5992,7 @@ TEST_CASE("prove_repl__multi_file__planned_promotion__success", "[prove_repl]") 
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     assert_replication_match(init_leader_bl, follower);
 
     // Leadership transfer: leader → follower, follower → leader.
@@ -5964,6 +6001,7 @@ TEST_CASE("prove_repl__multi_file__planned_promotion__success", "[prove_repl]") 
         leader.put({}, to_bytes("reject"), to_bytes("x")),
         bytecask::DbFollowerMode);
 
+    // A promotion: the marker takes the next sequence, synced.
     follower.set_mode(bytecask::Mode::Leader);
     auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
@@ -5973,7 +6011,7 @@ TEST_CASE("prove_repl__multi_file__planned_promotion__success", "[prove_repl]") 
     auto snap2 = follower.snapshot();
     auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
-    leader.ingest(views2);
+    leader.ingest(owned2.header, views2);
 
     auto follower_final = capture_replication_baseline(follower);
     assert_replication_match(follower_final, leader);
@@ -6007,7 +6045,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__full_stream__success", "[prove_repl]")
         {.initial_mode = bytecask::Mode::Follower});
 
       {
-        follower.ingest(views);
+        follower.ingest(owned.header, views);
       }
 
       assert_replication_match(leader_bl, follower);
@@ -6047,7 +6085,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__full_stream__append_fails_nothing_writ
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -6086,7 +6124,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__full_stream__append_fails_partial_writ
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -6124,7 +6162,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__full_stream__sync_fails", "[prove_repl
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -6176,10 +6214,11 @@ TEST_CASE("prove_repl__mixed_sync_nosync__incremental__success", "[prove_repl]")
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     // Second chunk.
-    if (!chunk2.empty()) follower.ingest(chunk2);
+    if (!chunk2.empty()) follower.ingest(header2, chunk2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -6227,7 +6266,8 @@ TEST_CASE("prove_repl__mixed_sync_nosync__incremental__append_fails_nothing_writ
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -6235,7 +6275,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__incremental__append_fails_nothing_writ
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -6296,7 +6336,8 @@ TEST_CASE("prove_repl__mixed_sync_nosync__incremental__append_fails_partial_writ
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -6305,7 +6346,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__incremental__append_fails_partial_writ
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -6366,7 +6407,8 @@ TEST_CASE("prove_repl__mixed_sync_nosync__incremental__sync_fails", "[prove_repl
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -6374,7 +6416,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__incremental__sync_fails", "[prove_repl
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -6429,7 +6471,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__success", "[prove_r
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -6441,7 +6483,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__success", "[prove_r
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
 
-      if (!views2.empty()) follower.ingest(views2);
+      if (!views2.empty()) follower.ingest(owned2.header, views2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -6486,7 +6528,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__append_fails_nothin
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -6503,7 +6545,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__append_fails_nothin
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -6561,7 +6603,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__append_fails_partia
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -6579,7 +6621,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__append_fails_partia
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -6637,7 +6679,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__sync_fails", "[prov
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -6654,7 +6696,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__restart_midstream__sync_fails", "[prov
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -6693,11 +6735,11 @@ TEST_CASE("prove_repl__mixed_sync_nosync__duplicate_delivery__success", "[prove_
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
@@ -6723,7 +6765,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__planned_promotion__success", "[prove_r
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     assert_replication_match(init_leader_bl, follower);
 
     // Flush nosync entries to durable state before leadership transfer.
@@ -6734,7 +6776,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__planned_promotion__success", "[prove_r
     snap = leader.snapshot();
     owned = collect_changes(leader.changes_since(snap, stream_from));
     views = owned.views();
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
 
     // Leadership transfer: leader → follower, follower → leader.
     leader.set_mode(bytecask::Mode::Follower);
@@ -6742,6 +6784,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__planned_promotion__success", "[prove_r
         leader.put({}, to_bytes("reject"), to_bytes("x")),
         bytecask::DbFollowerMode);
 
+    // A promotion: the marker takes the next sequence, synced.
     follower.set_mode(bytecask::Mode::Leader);
     auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
@@ -6751,7 +6794,7 @@ TEST_CASE("prove_repl__mixed_sync_nosync__planned_promotion__success", "[prove_r
     auto snap2 = follower.snapshot();
     auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
-    leader.ingest(views2);
+    leader.ingest(owned2.header, views2);
 
     auto follower_final = capture_replication_baseline(follower);
     assert_replication_match(follower_final, leader);
@@ -6786,7 +6829,7 @@ TEST_CASE("prove_repl__nosync_only__full_stream__success", "[prove_repl]") {
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
 
       {
-        follower.ingest(views);
+        follower.ingest(owned.header, views);
       }
 
       assert_replication_match(leader_bl, follower);
@@ -6827,7 +6870,7 @@ TEST_CASE("prove_repl__nosync_only__full_stream__append_fails_nothing_written", 
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -6867,7 +6910,7 @@ TEST_CASE("prove_repl__nosync_only__full_stream__append_fails_partial_write", "[
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -6906,7 +6949,7 @@ TEST_CASE("prove_repl__nosync_only__full_stream__sync_fails", "[prove_repl]") {
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -6943,7 +6986,7 @@ TEST_CASE("prove_repl__nosync_only__full_stream__rotation_sync_fails", "[prove_r
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -6980,7 +7023,7 @@ TEST_CASE("prove_repl__nosync_only__full_stream__rotation_file_creation_fails", 
       {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -7035,10 +7078,11 @@ TEST_CASE("prove_repl__nosync_only__incremental__success", "[prove_repl]") {
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     // Second chunk.
-    if (!chunk2.empty()) follower.ingest(chunk2);
+    if (!chunk2.empty()) follower.ingest(header2, chunk2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -7087,7 +7131,8 @@ TEST_CASE("prove_repl__nosync_only__incremental__append_fails_nothing_written", 
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -7095,7 +7140,7 @@ TEST_CASE("prove_repl__nosync_only__incremental__append_fails_nothing_written", 
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -7157,7 +7202,8 @@ TEST_CASE("prove_repl__nosync_only__incremental__append_fails_partial_write", "[
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -7166,7 +7212,7 @@ TEST_CASE("prove_repl__nosync_only__incremental__append_fails_partial_write", "[
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -7228,7 +7274,8 @@ TEST_CASE("prove_repl__nosync_only__incremental__sync_fails", "[prove_repl]") {
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -7236,7 +7283,7 @@ TEST_CASE("prove_repl__nosync_only__incremental__sync_fails", "[prove_repl]") {
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -7296,7 +7343,8 @@ TEST_CASE("prove_repl__nosync_only__incremental__rotation_sync_fails", "[prove_r
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -7304,7 +7352,7 @@ TEST_CASE("prove_repl__nosync_only__incremental__rotation_sync_fails", "[prove_r
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -7364,7 +7412,8 @@ TEST_CASE("prove_repl__nosync_only__incremental__rotation_file_creation_fails", 
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -7372,7 +7421,7 @@ TEST_CASE("prove_repl__nosync_only__incremental__rotation_file_creation_fails", 
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -7430,7 +7479,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__success", "[prove_repl]")
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -7442,7 +7491,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__success", "[prove_repl]")
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
 
-      if (!views2.empty()) follower.ingest(views2);
+      if (!views2.empty()) follower.ingest(owned2.header, views2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -7488,7 +7537,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__append_fails_nothing_writ
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -7505,7 +7554,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__append_fails_nothing_writ
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -7564,7 +7613,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__append_fails_partial_writ
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -7582,7 +7631,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__append_fails_partial_writ
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -7641,7 +7690,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__sync_fails", "[prove_repl
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -7658,7 +7707,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__sync_fails", "[prove_repl
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -7715,7 +7764,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__rotation_sync_fails", "[p
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -7732,7 +7781,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__rotation_sync_fails", "[p
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -7789,7 +7838,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__rotation_file_creation_fa
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -7806,7 +7855,7 @@ TEST_CASE("prove_repl__nosync_only__restart_midstream__rotation_file_creation_fa
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -7848,11 +7897,11 @@ TEST_CASE("prove_repl__nosync_only__duplicate_delivery__success", "[prove_repl]"
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
@@ -7879,7 +7928,7 @@ TEST_CASE("prove_repl__nosync_only__planned_promotion__success", "[prove_repl]")
 
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     assert_replication_match(init_leader_bl, follower);
 
     // Flush nosync entries to durable state before leadership transfer.
@@ -7890,7 +7939,7 @@ TEST_CASE("prove_repl__nosync_only__planned_promotion__success", "[prove_repl]")
     snap = leader.snapshot();
     owned = collect_changes(leader.changes_since(snap, stream_from));
     views = owned.views();
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
 
     // Leadership transfer: leader → follower, follower → leader.
     leader.set_mode(bytecask::Mode::Follower);
@@ -7898,6 +7947,7 @@ TEST_CASE("prove_repl__nosync_only__planned_promotion__success", "[prove_repl]")
         leader.put({}, to_bytes("reject"), to_bytes("x")),
         bytecask::DbFollowerMode);
 
+    // A promotion: the marker takes the next sequence, synced.
     follower.set_mode(bytecask::Mode::Leader);
     auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
@@ -7907,7 +7957,7 @@ TEST_CASE("prove_repl__nosync_only__planned_promotion__success", "[prove_repl]")
     auto snap2 = follower.snapshot();
     auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
-    leader.ingest(views2);
+    leader.ingest(owned2.header, views2);
 
     auto follower_final = capture_replication_baseline(follower);
     assert_replication_match(follower_final, leader);
@@ -7941,7 +7991,7 @@ TEST_CASE("prove_repl__nosync_then_sync__full_stream__success", "[prove_repl]") 
         {.initial_mode = bytecask::Mode::Follower});
 
       {
-        follower.ingest(views);
+        follower.ingest(owned.header, views);
       }
 
       assert_replication_match(leader_bl, follower);
@@ -7981,7 +8031,7 @@ TEST_CASE("prove_repl__nosync_then_sync__full_stream__append_fails_nothing_writt
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -8020,7 +8070,7 @@ TEST_CASE("prove_repl__nosync_then_sync__full_stream__append_fails_partial_write
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -8058,7 +8108,7 @@ TEST_CASE("prove_repl__nosync_then_sync__full_stream__sync_fails", "[prove_repl]
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -8110,10 +8160,11 @@ TEST_CASE("prove_repl__nosync_then_sync__incremental__success", "[prove_repl]") 
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     // Second chunk.
-    if (!chunk2.empty()) follower.ingest(chunk2);
+    if (!chunk2.empty()) follower.ingest(header2, chunk2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -8161,7 +8212,8 @@ TEST_CASE("prove_repl__nosync_then_sync__incremental__append_fails_nothing_writt
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -8169,7 +8221,7 @@ TEST_CASE("prove_repl__nosync_then_sync__incremental__append_fails_nothing_writt
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -8230,7 +8282,8 @@ TEST_CASE("prove_repl__nosync_then_sync__incremental__append_fails_partial_write
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -8239,7 +8292,7 @@ TEST_CASE("prove_repl__nosync_then_sync__incremental__append_fails_partial_write
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -8300,7 +8353,8 @@ TEST_CASE("prove_repl__nosync_then_sync__incremental__sync_fails", "[prove_repl]
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -8308,7 +8362,7 @@ TEST_CASE("prove_repl__nosync_then_sync__incremental__sync_fails", "[prove_repl]
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -8363,7 +8417,7 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__success", "[prove_re
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -8375,7 +8429,7 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__success", "[prove_re
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
 
-      if (!views2.empty()) follower.ingest(views2);
+      if (!views2.empty()) follower.ingest(owned2.header, views2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -8420,7 +8474,7 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__append_fails_nothing
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -8437,7 +8491,7 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__append_fails_nothing
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -8495,7 +8549,7 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__append_fails_partial
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -8513,7 +8567,7 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__append_fails_partial
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -8571,7 +8625,7 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__sync_fails", "[prove
     {
       auto follower = bytecask::DB::open(follower_dir,
           {.initial_mode = bytecask::Mode::Follower});
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -8588,7 +8642,7 @@ TEST_CASE("prove_repl__nosync_then_sync__restart_midstream__sync_fails", "[prove
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -8627,11 +8681,11 @@ TEST_CASE("prove_repl__nosync_then_sync__duplicate_delivery__success", "[prove_r
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
@@ -8657,7 +8711,7 @@ TEST_CASE("prove_repl__nosync_then_sync__planned_promotion__success", "[prove_re
 
     auto follower = bytecask::DB::open(follower_dir,
         {.initial_mode = bytecask::Mode::Follower});
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     assert_replication_match(init_leader_bl, follower);
 
     // Flush nosync entries to durable state before leadership transfer.
@@ -8668,7 +8722,7 @@ TEST_CASE("prove_repl__nosync_then_sync__planned_promotion__success", "[prove_re
     snap = leader.snapshot();
     owned = collect_changes(leader.changes_since(snap, stream_from));
     views = owned.views();
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
 
     // Leadership transfer: leader → follower, follower → leader.
     leader.set_mode(bytecask::Mode::Follower);
@@ -8676,6 +8730,7 @@ TEST_CASE("prove_repl__nosync_then_sync__planned_promotion__success", "[prove_re
         leader.put({}, to_bytes("reject"), to_bytes("x")),
         bytecask::DbFollowerMode);
 
+    // A promotion: the marker takes the next sequence, synced.
     follower.set_mode(bytecask::Mode::Leader);
     auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
@@ -8685,7 +8740,7 @@ TEST_CASE("prove_repl__nosync_then_sync__planned_promotion__success", "[prove_re
     auto snap2 = follower.snapshot();
     auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
-    leader.ingest(views2);
+    leader.ingest(owned2.header, views2);
 
     auto follower_final = capture_replication_baseline(follower);
     assert_replication_match(follower_final, leader);
@@ -8738,7 +8793,7 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__success", "[prove_repl]") 
     seed_follower(follower, pre_vacuum, stream_from);
 
       {
-        follower.ingest(views);
+        follower.ingest(owned.header, views);
       }
 
       assert_replication_match(leader_bl, follower);
@@ -8797,7 +8852,7 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__append_fails_nothing_writt
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -8855,7 +8910,7 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__append_fails_partial_write
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -8912,7 +8967,7 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__sync_fails", "[prove_repl]
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -8967,7 +9022,7 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__crash_mid_batch", "[prove_
       {
         bytecask::testing::ScopedFaultInjector fi{2};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -9024,7 +9079,7 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__rotation_sync_fails", "[pr
       {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -9079,7 +9134,7 @@ TEST_CASE("prove_repl__vacuumed_batches__full_stream__rotation_file_creation_fai
       {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(owned.header, views),
             std::system_error);
       }
 
@@ -9152,10 +9207,11 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__success", "[prove_repl]") 
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     // Second chunk.
-    if (!chunk2.empty()) follower.ingest(chunk2);
+    if (!chunk2.empty()) follower.ingest(header2, chunk2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -9222,7 +9278,8 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__append_fails_nothing_writt
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -9230,7 +9287,7 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__append_fails_nothing_writt
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -9310,7 +9367,8 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__append_fails_partial_write
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -9319,7 +9377,7 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__append_fails_partial_write
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -9399,7 +9457,8 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__sync_fails", "[prove_repl]
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -9407,7 +9466,7 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__sync_fails", "[prove_repl]
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -9485,7 +9544,8 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__crash_mid_batch", "[prove_
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -9493,7 +9553,7 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__crash_mid_batch", "[prove_
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{2};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -9573,7 +9633,8 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__rotation_sync_fails", "[pr
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -9581,7 +9642,7 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__rotation_sync_fails", "[pr
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -9659,7 +9720,8 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__rotation_file_creation_fai
     auto chunk2 = std::span<const bytecask::DataEntryView>{views.data() + split, views.size() - split};
 
     // First chunk: always succeeds.
-    if (!chunk1.empty()) follower.ingest(chunk1);
+    if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
+    const auto header2 = owned.header_after(split);
 
     auto follower_bl = capture_baseline(follower);
 
@@ -9667,7 +9729,7 @@ TEST_CASE("prove_repl__vacuumed_batches__incremental__rotation_file_creation_fai
     if (!chunk2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         REQUIRE_THROWS_AS(
-            follower.ingest(views),
+            follower.ingest(header2, chunk2),
             std::system_error);
     }
 
@@ -9743,7 +9805,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__success", "[prove_re
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
       seed_follower(follower, pre_vacuum, stream_from);
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -9755,7 +9817,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__success", "[prove_re
       auto owned2 = collect_changes(leader.changes_since(snap2, from_seq));
       auto views2 = owned2.views();
 
-      if (!views2.empty()) follower.ingest(views2);
+      if (!views2.empty()) follower.ingest(owned2.header, views2);
 
       assert_replication_match(leader_bl, follower);
       CHECK_FALSE(follower.is_degraded());
@@ -9819,7 +9881,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__append_fails_nothing
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
       seed_follower(follower, pre_vacuum, stream_from);
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -9836,7 +9898,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__append_fails_nothing
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -9913,7 +9975,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__append_fails_partial
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
       seed_follower(follower, pre_vacuum, stream_from);
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -9931,7 +9993,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__append_fails_partial
         using PW = bytecask::testing::PostWriteMode;
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_append_partial", PW::short_write, 5};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -10008,7 +10070,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__sync_fails", "[prove
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
       seed_follower(follower, pre_vacuum, stream_from);
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -10025,7 +10087,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__sync_fails", "[prove
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -10100,7 +10162,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__crash_mid_batch", "[
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
       seed_follower(follower, pre_vacuum, stream_from);
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -10117,7 +10179,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__crash_mid_batch", "[
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{2};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -10194,7 +10256,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__rotation_sync_fails"
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
       seed_follower(follower, pre_vacuum, stream_from);
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -10211,7 +10273,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__rotation_sync_fails"
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_data_file_sync"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -10286,7 +10348,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__rotation_file_creati
       auto follower = bytecask::DB::open(follower_dir,
           {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
       seed_follower(follower, pre_vacuum, stream_from);
-      if (!chunk1.empty()) follower.ingest(chunk1);
+      if (!chunk1.empty()) follower.ingest(owned.header, chunk1);
     }
 
     // Second pass: reopen, ingest remainder.
@@ -10303,7 +10365,7 @@ TEST_CASE("prove_repl__vacuumed_batches__restart_midstream__rotation_file_creati
       if (!views2.empty()) {
         bytecask::testing::ScopedFaultInjector fi{"io_rotate_file_creation"};
         try {
-          follower.ingest(views2);
+          follower.ingest(owned2.header, views2);
         } catch (const std::system_error&) {
           threw = true;
         }
@@ -10363,11 +10425,11 @@ TEST_CASE("prove_repl__vacuumed_batches__duplicate_delivery__success", "[prove_r
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
     seed_follower(follower, pre_vacuum, stream_from);
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     auto seq_after = follower.durable_sequence();
 
     // Re-deliver same entries — must be a no-op.
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     CHECK(follower.durable_sequence() == seq_after);
     assert_replication_match(leader_bl, follower);
   }
@@ -10412,7 +10474,7 @@ TEST_CASE("prove_repl__vacuumed_batches__planned_promotion__success", "[prove_re
     auto follower = bytecask::DB::open(follower_dir,
         {.max_file_bytes = 256, .initial_mode = bytecask::Mode::Follower});
     seed_follower(follower, pre_vacuum, stream_from);
-    follower.ingest(views);
+    follower.ingest(owned.header, views);
     assert_replication_match(init_leader_bl, follower);
 
     // Leadership transfer: leader → follower, follower → leader.
@@ -10421,6 +10483,7 @@ TEST_CASE("prove_repl__vacuumed_batches__planned_promotion__success", "[prove_re
         leader.put({}, to_bytes("reject"), to_bytes("x")),
         bytecask::DbFollowerMode);
 
+    // A promotion: the marker takes the next sequence, synced.
     follower.set_mode(bytecask::Mode::Leader);
     auto seq_before = follower.durable_sequence();
     follower.put({}, to_bytes("promoted_key"), to_bytes("promoted_val"));
@@ -10430,7 +10493,7 @@ TEST_CASE("prove_repl__vacuumed_batches__planned_promotion__success", "[prove_re
     auto snap2 = follower.snapshot();
     auto owned2 = collect_changes(follower.changes_since(snap2, leader.durable_sequence()));
     auto views2 = owned2.views();
-    leader.ingest(views2);
+    leader.ingest(owned2.header, views2);
 
     auto follower_final = capture_replication_baseline(follower);
     assert_replication_match(follower_final, leader);

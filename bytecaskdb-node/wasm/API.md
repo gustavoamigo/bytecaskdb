@@ -263,22 +263,28 @@ Rotates the active file, waits for all hint files, and returns a manifest of sea
 
 ---
 
-### `.changesSince(snap, fromSeq)`
+### `.changesSince(snap, fromSeq, maxBytes?)`
 
-Returns a lazy iterator over data entries with sequence > `fromSeq`.
+One slice of this node's history for `ingest`: the whole units above `fromSeq` that were durable at `snap`, cut after the unit that passes `maxBytes`, with a header naming the marker at `fromSeq`. A slice never starts or ends inside an atomic batch. Entries are read lazily as the iterator advances; close it, or read it to the end.
 
 - **snap** `Snapshot`
-- **fromSeq** `number`
-- **returns** `ChangeIterator`
+- **fromSeq** `bigint`
+- **maxBytes** `number` (optional; omitted means no cut)
+- **returns** `ChangeBatch` — `{ header: ChangeHeader, entries: ChangeIterator }`
+
+`ChangeHeader` is `{ marker: { sinceSequence: bigint, id: bigint }, fromSequence: bigint }`. The marker is the identity of the source's history at `fromSeq`: its last `changeMarker` entry at or below it, or `ORIGIN_MARKER` (`{ sinceSequence: 0n, id: 0n }`) if it holds none.
+
+A `changeMarker` entry is a promotion: `setMode('leader')` on a follower appends one, with an empty key and the marker's 8-byte little-endian id as its value, before the first write it accepts.
 
 ---
 
-### `.ingest(entries)`
+### `.ingest(header, entries)`
 
-Applies pre-sequenced entries from a leader. Follower mode only.
+Applies one slice, as `changesSince` produced it, atomically and durably. Follower mode only. Entries at or below `durableSequence()` are skipped, so a slice can be delivered again after any failure.
 
+- **header** `ChangeHeader`
 - **entries** `DataEntry[]`
-- **throws** if not in follower mode or engine is degraded
+- **throws** before anything is written: `BC_LOGIC` on a leader; `BC_INVALID_ARGUMENT` for a slice that starts past `durableSequence()` (a gap), is not strictly increasing, holds a `changeMarker` inside a batch or ends inside a batch; `BC_CHANGE_MARKER_MISMATCH` for a slice from a history that diverged from this node's at a promotion (a fork, which only a new bootstrap repairs); `BC_DEGRADED` if the engine is degraded
 
 ---
 

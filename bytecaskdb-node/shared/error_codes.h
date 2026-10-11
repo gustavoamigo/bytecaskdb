@@ -8,8 +8,8 @@
 // "Error translation".
 //
 // Include after the engine's types are in scope (`import bytecask;` or
-// include/bytecask.hpp): it names bytecask::DbDegraded, DbFollowerMode and
-// DbClosed.
+// include/bytecask.hpp): it names bytecask::DbDegraded, DbFollowerMode,
+// DbChangeMarkerMismatch and DbClosed.
 
 #pragma once
 
@@ -37,14 +37,17 @@ struct ErrorInfo {
   int errno_value;  // the system error's errno for BC_IO, otherwise 0
 };
 
-// Most specific class first: DbDegraded and system_error are runtime_errors,
-// DbClosed and invalid_argument logic_errors. A runtime_error that is none of
+// Most specific class first: DbDegraded, DbFollowerMode, DbChangeMarkerMismatch
+// and system_error are runtime_errors, DbClosed and invalid_argument
+// logic_errors. A runtime_error that is none of
 // them (corruption, a packed limit) is BC_RUNTIME; the engine has no finer
 // class for corruption yet.
 inline auto classify_error(const std::exception &e) -> ErrorInfo {
   if (dynamic_cast<const bytecask::DbDegraded *>(&e)) return {"BC_DEGRADED", 0};
   if (dynamic_cast<const bytecask::DbFollowerMode *>(&e))
     return {"BC_FOLLOWER_MODE", 0};
+  if (dynamic_cast<const bytecask::DbChangeMarkerMismatch *>(&e))
+    return {"BC_CHANGE_MARKER_MISMATCH", 0};
   if (dynamic_cast<const bytecask::DbClosed *>(&e) ||
       dynamic_cast<const HandleClosed *>(&e))
     return {"BC_CLOSED", 0};

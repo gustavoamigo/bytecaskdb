@@ -5,7 +5,18 @@
 import { test, expect } from '../fixtures/index.js'
 import { join } from 'node:path'
 import { readdir, rm, writeFile, open as openFile } from 'node:fs/promises'
-import type { ByteCaskError, ErrorCode } from '../../src/types.js'
+import { ORIGIN_MARKER } from '../../src/types.js'
+import type { ByteCaskDB, ByteCaskError, DataEntry, ErrorCode } from '../../src/types.js'
+
+// One changesSince result read whole.
+function slice(src: ByteCaskDB, fromSeq: bigint) {
+  const snap = src.snapshot()
+  const batch = src.changesSince(snap, fromSeq)
+  const entries: DataEntry[] = [...batch.entries]
+  batch.entries.close()
+  snap.close()
+  return { header: batch.header, entries }
+}
 
 function caught(fn: () => unknown): ByteCaskError {
   try {
@@ -72,6 +83,46 @@ test('a write on a follower reports BC_FOLLOWER_MODE', async ({ tmpDir, wasmBack
   db.close()
 })
 
+test('ingest of a diverged history reports BC_CHANGE_MARKER_MISMATCH, of a gap BC_INVALID_ARGUMENT', async ({ tmpDir, wasmBackend }) => {
+  const leader = wasmBackend.open(join(tmpDir, 'fork-leader'))
+  const ahead = wasmBackend.open(join(tmpDir, 'fork-ahead'), { initialMode: 'follower' })
+  const behind = wasmBackend.open(join(tmpDir, 'fork-behind'), { initialMode: 'follower' })
+  for (let i = 1; i <= 5; i++) leader.put(`k${i}`, 'v')
+  const all = slice(leader, 0n)
+  ahead.ingest(all.header, all.entries)
+  behind.ingest(all.header, all.entries.slice(0, 3))
+
+  // A gap: the slice starts past the follower's position.
+  expectCode(() => behind.ingest({ marker: ORIGIN_MARKER, fromSequence: all.entries[3].sequence },
+    all.entries.slice(4)), 'BC_INVALID_ARGUMENT')
+  // A BigInt outside [0, 2^64) is refused, not wrapped into a value that
+  // could alias a real sequence or marker id.
+  expectCode(() => behind.ingest({ marker: { sinceSequence: -1n, id: 0n }, fromSequence: 3n }, []),
+    'BC_INVALID_ARGUMENT')
+  expectCode(() => behind.ingest({ marker: ORIGIN_MARKER, fromSequence: 1n << 64n }, []),
+    'BC_INVALID_ARGUMENT')
+  expectCode(() => behind.ingest({ marker: ORIGIN_MARKER, fromSequence: 3n },
+    [{ ...all.entries[3], sequence: -4n }]), 'BC_INVALID_ARGUMENT')
+  expect(behind.durableSequence()).toBe(3n)
+  // Malformed: a slice that ends inside an atomic batch.
+  const plan = new wasmBackend.WritePlan()
+  plan.put('b1', '1')
+  plan.put('b2', '2')
+  leader.applyBatch(plan)
+  const withBatch = slice(leader, all.entries.at(-1)!.sequence)
+  expectCode(() => ahead.ingest(withBatch.header, withBatch.entries.slice(0, -1)), 'BC_INVALID_ARGUMENT')
+
+  // The less advanced follower is promoted: its history forks from the
+  // leader's at its marker, and the follower ahead cannot take it.
+  behind.setMode('leader')
+  const fork = slice(behind, ahead.durableSequence())
+  expectCode(() => ahead.ingest(fork.header, fork.entries), 'BC_CHANGE_MARKER_MISMATCH')
+
+  behind.close()
+  ahead.close()
+  leader.close()
+})
+
 test('input refused before anything is written reports BC_INVALID_ARGUMENT', async ({ db, wasmBackend }) => {
   expectCode(() => db.delRange('b', 'a'), 'BC_INVALID_ARGUMENT')
   // A JS argument of the wrong type, refused by the binding itself.
@@ -85,11 +136,9 @@ test('input refused before anything is written reports BC_INVALID_ARGUMENT', asy
 
 test('a call the engine state does not allow reports BC_LOGIC', async ({ db, wasmBackend }) => {
   db.put('a', '1')
-  const snap = db.snapshot()
-  const entries = [...db.changesSince(snap, 0n)]
-  snap.close()
+  const { header, entries } = slice(db, 0n)
   // ingest is for followers.
-  expectCode(() => db.ingest(entries), 'BC_LOGIC')
+  expectCode(() => db.ingest(header, entries), 'BC_LOGIC')
   // ensureUnchanged needs a plan built from a snapshot.
   const plan = new wasmBackend.WritePlan()
   expectCode(() => plan.ensureUnchanged('a'), 'BC_LOGIC')

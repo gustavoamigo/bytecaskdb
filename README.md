@@ -33,6 +33,7 @@ Built on the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) append-only fo
 - **Crash safety** — CRC-verified entries, atomic hint file generation (`write → fdatasync → rename`), and append-only data files as the primary durable store. A new or renamed file's directory entry is synced before anything depends on it — before the first write into a new data file is acknowledged, and before vacuum removes the file it compacted — so a power loss cannot keep a file's contents and lose its name. Hint files are an index, not the record: one that fails its CRC, or that a read fails on, is rebuilt from its data file at recovery rather than dropped, so a damaged index costs the time to rebuild it and not the keys behind it. A process killed in the middle of a vacuum leaves the file being compacted and its compacted copy side by side; the next open deletes the copy once it has checked that every entry in it is also in the original, and refuses to open on any other pair of files that share sequence numbers. A vacuum that fails before it commits, rather than being killed, removes its copy itself, so retrying it under a persistent fault leaves nothing behind. On unrecoverable write-path failures (e.g. isolation rotation fails), the engine enters a degraded state: reads remain available, all writes throw `DbDegraded`, and the service calls `resume()` to recover without a restart. Running out of memory is handled the same way: an operation that cannot allocate throws `std::bad_alloc`, and if its write had already reached the data file, the engine refuses writes until `resume()`. Refusing allocates nothing, and no failed allocation leaves a writer waiting forever. A test fails each allocation of each write operation in turn, once and under sustained pressure, and checks what the engine and a reopen hold afterwards. A failed `fdatasync` is not retried on trust: Linux leaves the pages it failed to write clean in the page cache, and a second `fdatasync` returns success without writing them. So `resume()`, and `open` for a file the last process may not have synced, read the file back, write it to the same offsets and sync it before building anything from it. `sync=false` writes caught in a failed sync can then be lost without a crash, if the kernel evicted their pages first; `resume()` refuses in that case, and a reopen recovers what the disk holds. Corruption of data already acknowledged is refused rather than repaired: `resume()` throws instead of cutting the file back to the last entry it can parse, and `open` refuses damage in any data file but the newest. The newest file is the one a crash can leave with a torn tail, and nothing but its own bytes says how much of it was synced, so `open` truncates it at the first record that does not parse — as PostgreSQL and RocksDB truncate their logs — and damage in that file goes with the tail.
 - **Bounded value cache** — `IoBackend::BufferPool` serves data files from a frame cache whose size the operator sets, filled with `O_DIRECT`, for deployments where the dataset far exceeds RAM and the footprint has to be a number rather than whatever the kernel's page cache settles on. Reads stay lock-free; the active file is resident from the moment its bytes are written, and until it is full a miss fills the 128 KiB around it, so a cold pool warms at readahead speed. `capacity_bytes` is the total footprint, and `stats()` reports a hit ratio to size against — something a page cache cannot give. When vacuum deletes a file, its frames are freed at once rather than left for eviction to find. On a resident dataset a hit is ~15 ns behind `mmap` and scales with reader threads the same way; it is off by default, and worth turning on when there is a memory budget to enforce. In the WASM build it is also the fast read path: every `pread` there is a call into Node's `fs`, and a hit skips it.
 - **Operational counters** — `stats()` returns a flat `map<string, int64_t>` of monotonic counters (bytes written, fsyncs, group writer batches, time spent in the write path's serial section, commit delay waits, vacuum bytes reclaimed, tombstones dropped, hint backpressure stalls, CRC failures, I/O errors, degraded transitions) and gauges (degraded state, open files, hint backlog, live key count, buffer pool hit/miss, residency and frames freed when vacuum deletes a file, key directory versions alive and retired nodes they pin, freed key directory nodes held for reuse, tombstones vacuum must keep). Designed for pull-based scraping (Prometheus, logging). Counters only track what the engine can see internally — request counts and latency are the caller's responsibility.
+- **Replication with fork detection** — `changes_since` hands a follower one slice at a time: a header naming the history it comes from, and whole units up to a byte budget, never cut inside a batch. A promotion appends a change marker, the identity of the history from that point. `ingest` refuses, before writing anything, a slice that starts past the follower (a gap) or that comes from a history which diverged at a promotion (a fork: a follower ahead of a newly promoted leader, or an old leader rejoining with writes nobody replicated), with `DbChangeMarkerMismatch`. The remedy is a re-bootstrap; the engine never repairs or truncates. Markers are kept by vacuum for ever, and cost 16 bytes of memory per promotion.
 - **Replication transport in Python** — Python bindings expose a `DataEntry(sequence, entry_type, key, value)` constructor accepting bytes-like payloads, so `changes_since()` output can be serialized over the wire and reconstructed before `ingest()`.
 
 ## Performance
@@ -378,18 +379,32 @@ public:
     [[nodiscard]] auto mode() const noexcept -> Mode;
     // Switches mode under the write mutex. No in-flight write straddles the transition.
     // A leader stepping down fdatasyncs first: every write it acknowledged,
-    // sync or not, is durable and so shippable by changes_since.
+    // sync or not, is durable and so shippable by changes_since. A follower
+    // promoted appends a change marker at the next sequence and fdatasyncs it
+    // before the mode changes; the first write takes the sequence after it.
+    // A failed append or sync degrades and leaves the mode. Leader -> Leader
+    // writes nothing; opening in Leader mode is not a promotion.
     void set_mode(Mode mode);
 
-    // Applies pre-sequenced entries from a leader. Follower mode only.
+    // One slice of this node's history for ingest: a header naming this
+    // node's marker at from_sequence, and the whole units above it that were
+    // durable at snap, cut after the unit that passes max_bytes. The entries
+    // are read lazily.
+    [[nodiscard]] auto changes_since(const Snapshot& snap, std::uint64_t from_sequence,
+                                     std::size_t max_bytes = kUnlimitedBytes) const
+        -> ChangeBatch;
+
+    // Applies one slice, as changes_since produced it. Follower mode only.
     // Idempotent: entries with sequence <= durable_sequence() are skipped.
-    // Publishes the slice in one step; cut slices after a BulkEnd or a
-    // standalone entry.
-    // Throws std::logic_error if not in follower mode, DbDegraded if degraded,
-    // std::invalid_argument for a slice that ends inside an atomic batch, a
-    // sequence above 2^48 - 1 or an atomic batch over 1 GiB, before anything
-    // is written.
-    void ingest(std::span<const DataEntryView> entries);
+    // Before anything is written: a slice whose from_sequence is past
+    // durable_sequence() is a gap (std::invalid_argument); one whose marker
+    // at the comparison point is not this node's comes from a history that
+    // diverged at a promotion (DbChangeMarkerMismatch). An empty slice is
+    // checked too. Throws std::logic_error if not in follower mode,
+    // DbDegraded if degraded, std::invalid_argument for a slice that ends
+    // inside an atomic batch, is not strictly increasing, holds a malformed
+    // marker, a sequence above 2^48 - 1 or an atomic batch over 1 GiB.
+    void ingest(const ChangeHeader& header, std::span<const DataEntryView> entries);
 
     // True if the engine has entered a degraded state from a write-path failure.
     // Reads remain available; all write operations throw DbDegraded.
@@ -495,6 +510,26 @@ public:
     [[nodiscard]] auto has_snapshot() const noexcept -> bool;
 };
 
+// The identity of a history from a promotion on: the marker entry's own
+// sequence and a random id. A node's marker at a sequence is its last marker
+// at or below it, kOriginMarker ({0, 0}) if it holds none.
+struct ChangeMarker {
+    std::uint64_t since_sequence;
+    std::uint64_t id;
+};
+
+// Where a slice starts: the source's marker at from_sequence, and from_sequence.
+struct ChangeHeader {
+    ChangeMarker marker;
+    std::uint64_t from_sequence;
+};
+
+// One changes_since result, which is one ingest call.
+struct ChangeBatch {
+    ChangeHeader header;
+    std::ranges::subrange<ChangeIterator, std::default_sentinel_t> entries;  // lazy
+};
+
 // Non-owning view of a data entry. Used by changes_since (read path) and
 // ingest (write path). The owning counterpart is DataEntry.
 struct DataEntryView {
@@ -510,13 +545,17 @@ class DbDegraded : public std::runtime_error { /* ... */ };
 // Thrown by put/del/del_range/apply_batch when the engine is in follower mode.
 class DbFollowerMode : public std::runtime_error { /* ... */ };
 
+// Thrown by ingest for a slice of a history that diverged from this node's
+// at a promotion. Nothing was written; re-bootstrap from a manifest.
+class DbChangeMarkerMismatch : public std::runtime_error { /* ... */ };
+
 // Thrown by every DB operation after close().
 class DbClosed : public std::logic_error { /* ... */ };
 
 } // namespace bytecask
 ```
 
-Error handling follows the throw-on-failure convention used by the C++ standard library: a key, value or plan over its limit, or an option over its hard ceiling at `open`, throws `std::invalid_argument` before anything is written; I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; an internal invariant violation that cannot be continued through safely — currently only a reused data file name, which would silently drop writes at recovery — prints to stderr and aborts the process rather than throwing, since the write path would otherwise catch it and retry into the same corrupt state; write operations on a degraded engine throw `DbDegraded` (a `std::runtime_error` subclass, catchable separately); normal writes in follower mode throw `DbFollowerMode`; any call on a closed `DB` throws `DbClosed` (a `std::logic_error`). Key-not-found is signalled by `get` returning `false`; `apply_batch` (and `del`) return `nullopt` on precondition or W-W conflict — conflicts are expected outcomes, not exceptional errors. Every committed write returns a `CommitResult{sequence, durable}` — a wait-friendly token for read-your-own-writes across replication (see `durable_sequence` above).
+Error handling follows the throw-on-failure convention used by the C++ standard library: a key, value or plan over its limit, or an option over its hard ceiling at `open`, throws `std::invalid_argument` before anything is written; I/O failures throw `std::system_error`; data corruption throws `std::runtime_error`; an internal invariant violation that cannot be continued through safely — currently only a reused data file name, which would silently drop writes at recovery — prints to stderr and aborts the process rather than throwing, since the write path would otherwise catch it and retry into the same corrupt state; write operations on a degraded engine throw `DbDegraded` (a `std::runtime_error` subclass, catchable separately); normal writes in follower mode throw `DbFollowerMode`; an `ingest` from a history that diverged at a promotion throws `DbChangeMarkerMismatch`; any call on a closed `DB` throws `DbClosed` (a `std::logic_error`). Key-not-found is signalled by `get` returning `false`; `apply_batch` (and `del`) return `nullopt` on precondition or W-W conflict — conflicts are expected outcomes, not exceptional errors. Every committed write returns a `CommitResult{sequence, durable}` — a wait-friendly token for read-your-own-writes across replication (see `durable_sequence` above).
 
 
 ## Architecture

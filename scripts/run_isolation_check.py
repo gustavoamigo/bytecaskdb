@@ -44,12 +44,18 @@ every follower to the new leader, and re-bootstrap of the abandoned one. The
 old leader's writes that an unplanned promotion lost are relabelled :info.
 
     topology         an unplanned promotion takes the most advanced follower.
-                     Must pass everything the cluster configuration does.
+                     Must pass everything the cluster configuration does, and
+                     the engine must refuse no slice as a fork
+                     (forks_detected = 0 in every round).
     topology-behind  an unplanned promotion takes the least advanced
-                     follower. A follower ahead of the new leader keeps writes
-                     the leader lost, and at least one round over the run has
-                     to detect that fork. Once the forked node leads in turn, the fork
-                     reaches the leader history, so any finding counts.
+                     follower. A follower ahead of the new leader holds writes
+                     the leader lost: its first slice from the new leader is a
+                     fork, which the engine refuses (#397); the harness takes
+                     the node out of service and re-bootstraps it. At least
+                     one round over the run has to see a refusal
+                     (forks_detected >= 1), and every other check passes:
+                     what the forked node read of the lost writes before the
+                     refusal is relabelled :info, as the old leader's are.
 
 With --kill each round runs guarded and unguarded as above, but the writers
 run in a child process that is SIGKILLed at a random point of its workload
@@ -209,48 +215,98 @@ def describe(analysis: dict) -> str:
             f"not={analysis.get('not', [])}")
 
 
-def relabel_lost_writes(history: list[dict], summary: dict) -> int:
+def relabel_lost(ops: list[dict], lost: set[int], cap: int) -> int:
+    """Relabels the :ok operations in ops that touched a lost element as
+    :info with their reads cleared, which Elle and the cross-checks accept
+    either way, and caps their session waits at cap: a wait above it was
+    on the lost branch, whose sequences the new leader reassigned, and what
+    it waited for still holds up to cap. Returns how many were relabelled."""
+    changed = 0
+    for op in ops:
+        if op.get("wait", 0) > cap:
+            op["wait"] = cap
+        wrote_lost = any(m[0] == "append" and m[2] in lost
+                         for m in op["value"])
+        read_lost = any(m[0] == "r" and set(m[2] or []) & lost
+                        for m in op["value"])
+        if wrote_lost or read_lost:
+            op["type"] = "info"
+            op["value"] = [[m[0], m[1], None] if m[0] == "r" else m
+                           for m in op["value"]]
+            op.pop("sequence", None)
+            changed += 1
+    return changed
+
+
+def lost_by_promotion(history: list[dict],
+                      summary: dict) -> list[tuple[dict, set[int]]]:
+    """Each unplanned promotion with the elements it lost: the old leader's
+    appends above the promoted node's durable_sequence() in its last term."""
+    out = []
+    for ev in summary.get("events", []):
+        if ev["kind"] != "unplanned":
+            continue
+        lost = {m[2] for op in history
+                if op.get("node") == ev["from"]
+                and op.get("epoch") == ev["epoch"] - 1
+                and op["type"] == "ok" and op.get("role") == "leader"
+                and op.get("sequence", 0) > ev["durable"]
+                for m in op["value"] if m[0] == "append"}
+        out.append((ev, lost))
+    return out
+
+
+def relabel_lost_writes(history: list[dict],
+                        promotions: list[tuple[dict, set[int]]]) -> int:
     """Marks what an unplanned promotion lost as indeterminate.
 
     Replication is asynchronous: when a follower is promoted without the old
     leader, the old leader's writes above the promoted node's
     durable_sequence() in its last term are lost by design, and so is
-    anything its clients read of them. Those :ok operations become :info
-    with their reads cleared, which Elle and the cross-checks accept either
-    way. A session read there that waited above that sequence waited on the
-    lost branch, so its wait is capped at it. A lost write that shows up on
-    another node is still caught: only operations on the old leader are
-    relabelled. Returns how many.
+    anything its clients read of them. A lost write that shows up on another
+    node is still caught: only operations on the old leader are relabelled.
+    Returns how many.
+    """
+    changed = 0
+    for ev, lost in promotions:
+        tenure = [op for op in history
+                  if op.get("node") == ev["from"]
+                  and op.get("epoch") == ev["epoch"] - 1
+                  and op["type"] == "ok"]
+        changed += relabel_lost(tenure, lost, ev["durable"])
+    return changed
+
+
+def relabel_forked_reads(history: list[dict], summary: dict,
+                         promotions: list[tuple[dict, set[int]]]) -> int:
+    """Marks what a forked node read of a lost branch as indeterminate.
+
+    A follower ahead of an unplanned promotion's target (topology-behind)
+    holds the old leader's lost writes and serves reads of them until the
+    engine refuses its first slice from the new leader as a fork and the
+    harness re-bootstraps it. Those reads are the consequence the promotion
+    rule prevents, not a finding: on the node a fork event names, in the
+    life it names, operations that read a lost element become :info and
+    session waits are capped, as the old leader's are. The branch point is
+    one of the promotions up to the fork's epoch, so every one of them
+    counts: a lower cap only weakens the session check on that node's
+    reads. Reads in its next life, and on every other node, stay as they
+    are. Returns how many.
     """
     changed = 0
     for ev in summary.get("events", []):
-        if ev["kind"] != "unplanned":
+        if ev["kind"] != "fork":
             continue
-        old, epoch, durable = ev["from"], ev["epoch"], ev["durable"]
-        tenure = [op for op in history
-                  if op.get("node") == old and op.get("epoch") == epoch - 1
-                  and op["type"] == "ok"]
-        lost_elements: set[int] = set()
-        for op in tenure:
-            if op.get("role") == "leader" and op.get("sequence", 0) > durable:
-                lost_elements.update(
-                    m[2] for m in op["value"] if m[0] == "append")
-        for op in tenure:
-            # A session read there waited on the lost branch: sequences above
-            # durable were reassigned by the new leader. What it waited for
-            # still holds up to durable.
-            if op.get("wait", 0) > durable:
-                op["wait"] = durable
-            wrote_lost = any(m[0] == "append" and m[2] in lost_elements
-                             for m in op["value"])
-            read_lost = any(m[0] == "r" and set(m[2] or []) & lost_elements
-                            for m in op["value"])
-            if wrote_lost or read_lost:
-                op["type"] = "info"
-                op["value"] = [[m[0], m[1], None] if m[0] == "r" else m
-                               for m in op["value"]]
-                op.pop("sequence", None)
-                changed += 1
+        before = [(p, lost) for p, lost in promotions
+                  if p["epoch"] <= ev["epoch"]]
+        if not before:
+            continue
+        lost = set().union(*(l for _, l in before))
+        cap = min(p["durable"] for p, _ in before)
+        life = [op for op in history
+                if op.get("node") == ev["to"] and op.get("life") == ev["life"]
+                and op["type"] == "ok"]
+        changed += relabel_lost(life, lost, cap)
     return changed
 
 
@@ -400,11 +456,17 @@ def check_cluster_round(args: argparse.Namespace, seed: int,
         summary = json.loads(
             Path(str(history_path) + ".cluster.json").read_text())
         final_leader = summary.get("final_leader", 0)
-        relabelled = relabel_lost_writes(history, summary)
-        if relabelled:
+        # Computed before either relabelling turns the lost appends :info.
+        promotions = lost_by_promotion(history, summary)
+        relabelled = relabel_lost_writes(history, promotions)
+        forked_reads = relabel_forked_reads(history, summary, promotions)
+        if relabelled or forked_reads:
             history_path.write_text(json.dumps(history))
+        forks = summary.get("forks_detected", 0)
         print(f"  {config}: events {describe_events(summary)}; "
-              f"{relabelled} operations lost to unplanned promotions")
+              f"{relabelled} operations lost to unplanned promotions; "
+              f"forks_detected={forks}, {forked_reads} reads of a lost "
+              f"branch on a forked node")
         setup = cluster_summary_problems(summary)
         if setup:
             for p in setup[:10]:
@@ -439,13 +501,19 @@ def check_cluster_round(args: argparse.Namespace, seed: int,
             if leader_problems or not leader_valid:
                 raise CheckFailed(f"{config}: leader checks failed")
             args.v168_seen |= bool(problems) or elle_found
-        elif config == "topology-behind":
-            # A forked follower can later lead, so the fork may show in the
-            # leader history too: any finding counts.
-            args.fork_seen |= (bool(leader_problems) or not leader_valid
-                               or bool(problems) or elle_found)
-        elif leader_problems or not leader_valid or problems or elle_found:
+            continue
+        if leader_problems or not leader_valid or problems or elle_found:
             raise CheckFailed(f"{config}: checks failed")
+        if config == "topology-behind":
+            # The engine refuses the forked follower's slice and the harness
+            # re-bootstraps it, so the histories stay valid; the refusal
+            # itself is the detection.
+            args.fork_seen |= forks >= 1
+        elif forks:
+            raise CheckFailed(
+                f"{config}: the engine refused {forks} slices as forks; "
+                f"with the most advanced follower promoted, no node is "
+                f"ahead of its source")
 
 
 def check_round(args: argparse.Namespace, seed: int, round_dir: Path) -> None:
@@ -574,8 +642,9 @@ def main() -> int:
                 "changes_since")
         if args.topology and not args.fork_seen:
             raise CheckFailed(
-                "topology-behind: no round detected a fork; the harness is "
-                "not shown to be sensitive to a follower ahead of its leader")
+                "topology-behind: the engine refused no slice as a fork in "
+                "any round; the run is not shown to put a follower ahead of "
+                "its leader")
         if args.kill and args.group_kills == 0:
             raise CheckFailed(
                 "kill: no kill landed with two or more sync writers in "

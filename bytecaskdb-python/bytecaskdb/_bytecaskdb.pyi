@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import enum
 import os
-from typing import Iterator, overload
+from typing import Iterable, Iterator, overload
 
 class ByteCaskError(Exception):
     """Base of the engine's own errors: a state the database is in.
@@ -31,6 +31,12 @@ class DbFollowerMode(ByteCaskError, RuntimeError):
     Use ``DB.ingest()`` for replication writes in follower mode.
     """
 
+class DbChangeMarkerMismatch(ByteCaskError, RuntimeError):
+    """Raised by ``DB.ingest()`` for a slice of a history that is not this
+    node's: the two diverged at a promotion. Nothing was written;
+    re-bootstrap from the source's manifest.
+    """
+
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
@@ -49,6 +55,8 @@ class EntryType(enum.Enum):
     BulkBegin = ...
     BulkEnd = ...
     RangeDel = ...
+    ChangeMarker = ...
+    """A promotion: key empty, value = the marker's 8-byte little-endian id."""
 
 class IoBackend(enum.Enum):
     """Selects how data files are read.
@@ -194,6 +202,73 @@ class ChangeIterator:
 
     def __iter__(self) -> ChangeIterator: ...
     def __next__(self) -> DataEntry: ...
+
+# ---------------------------------------------------------------------------
+# Replication: ChangeMarker / ChangeHeader / ChangeBatch
+# ---------------------------------------------------------------------------
+
+class ChangeMarker:
+    """The identity of a history from a promotion on: the ``ChangeMarker``
+    entry's own sequence and a random id.
+
+    A node's marker at a sequence is its last marker at or below it,
+    ``ORIGIN_MARKER`` if it holds none. Two nodes with the same marker at a
+    sequence hold the same history up to it. Immutable; compares by value.
+    """
+
+    def __init__(self, since_sequence: int = 0, id: int = 0) -> None: ...
+
+    @property
+    def since_sequence(self) -> int:
+        """The marker entry's own sequence; 0 for ``ORIGIN_MARKER``."""
+        ...
+
+    @property
+    def id(self) -> int:
+        """The random 64-bit id the promotion drew; 0 for ``ORIGIN_MARKER``."""
+        ...
+
+    def __eq__(self, other: object) -> bool: ...
+    def __hash__(self) -> int: ...
+
+ORIGIN_MARKER: ChangeMarker
+"""The history before any promotion: the marker at every position of a
+database that was never promoted. Equal to ``ChangeMarker(0, 0)``."""
+
+class ChangeHeader:
+    """Where a slice of a history starts: the source's marker at
+    ``from_sequence``, and ``from_sequence``. The slice holds the source's
+    entries above it, in order. Immutable; compares by value.
+    """
+
+    def __init__(
+        self, marker: ChangeMarker = ..., from_sequence: int = 0
+    ) -> None: ...
+
+    @property
+    def marker(self) -> ChangeMarker:
+        """The source's marker at ``from_sequence``."""
+        ...
+
+    @property
+    def from_sequence(self) -> int:
+        """The slice holds the source's entries above this sequence."""
+        ...
+
+    def __eq__(self, other: object) -> bool: ...
+
+class ChangeBatch:
+    """One ``DB.changes_since()`` result, which is one ``DB.ingest()`` call.
+
+    ``header`` is known up front; ``entries`` are read lazily as they are
+    iterated, one pass. Iterating the batch iterates its entries.
+    """
+
+    @property
+    def header(self) -> ChangeHeader: ...
+    @property
+    def entries(self) -> ChangeIterator: ...
+    def __iter__(self) -> ChangeIterator: ...
 
 # ---------------------------------------------------------------------------
 # DataEntry / FileInfo / FileManifest
@@ -516,7 +591,17 @@ class DB:
         ...
 
     def set_mode(self, mode: Mode) -> None:
-        """Switch engine mode."""
+        """Switch engine mode. No in-flight write straddles the transition.
+
+        A leader stepping down fdatasyncs first: every write it acknowledged,
+        sync or not, is durable and so shippable by ``changes_since``. A
+        follower promoted appends a ``ChangeMarker`` entry at the next
+        sequence and syncs it before the mode changes; the first write after
+        a promotion takes the sequence after the marker's. Leader to Leader
+        writes nothing: reopening a follower in Leader mode is not a
+        promotion. A failed write or sync raises and leaves the mode; so
+        does a promotion on a degraded engine (``DbDegraded``).
+        """
         ...
 
     def durable_sequence(self, min_sequence: int = 0, timeout_ms: int = 0) -> int:
@@ -533,16 +618,37 @@ class DB:
         ...
 
     def changes_since(
-        self, snapshot: Snapshot, from_sequence: int
-    ) -> ChangeIterator:
-        """Iterate data entries with sequence > from_sequence."""
+        self, snapshot: Snapshot, from_sequence: int, max_bytes: int | None = None
+    ) -> ChangeBatch:
+        """One slice of this node's history for ``ingest``.
+
+        The whole units above *from_sequence* that were durable at
+        *snapshot*, cut after the unit that passes *max_bytes* (``None``:
+        no cut), never inside an atomic batch, with a header naming the
+        marker at *from_sequence*. A batch that straddles *from_sequence*
+        is left out: a node positioned at a unit boundary below it already
+        holds it. Change markers above *from_sequence* come through as
+        entries of type ``EntryType.ChangeMarker``.
+        """
         ...
 
-    def ingest(self, entries: list[DataEntry]) -> None:
-        """Ingest pre-sequenced entries from a leader (follower mode only).
+    def ingest(
+        self, header: ChangeHeader, entries: Iterable[DataEntry]
+    ) -> None:
+        """Apply one slice, as ``changes_since`` produced it. Follower mode
+        only.
 
-        Raises ValueError, before anything is written, if the list ends
-        inside an atomic batch: cut after a BulkEnd or a standalone entry."""
+        Before anything is written: a slice starting past
+        ``durable_sequence()`` is a gap (``ValueError``); one from a
+        history that diverged at a promotion is a fork
+        (``DbChangeMarkerMismatch``). A slice that is not strictly
+        increasing above ``header.from_sequence``, holds a change marker
+        inside a batch, or ends inside an atomic batch is malformed
+        (``ValueError``): cut slices after a ``BulkEnd`` or a standalone
+        entry. Entries at or below ``durable_sequence()`` are skipped, so a
+        slice can be re-delivered after any failure; the rest is appended,
+        synced and published whole.
+        """
         ...
 
     def stats(self) -> dict[str, int]:

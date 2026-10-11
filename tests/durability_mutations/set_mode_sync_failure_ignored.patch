@@ -3,18 +3,18 @@ its unsynced writes unconfirmed. Reverts #190's failure path.
 Guarded-by: "set_mode(Follower): a failed fdatasync degrades and keeps the mode"
 
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index 666865f..fac150b 100644
+index 590490e..82c497e 100644
 --- a/bytecaskdb/bytecask.cppm
 +++ b/bytecaskdb/bytecask.cppm
-@@ -4281,7 +4281,10 @@ void DB::set_mode(Mode mode) {
+@@ -4700,7 +4700,10 @@ void DB::set_mode(Mode mode) {
    const auto last_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
-   if (mode == Mode::Follower && !current->degraded &&
-       t.durable_seq() < last_seq) {
--    sync_active_file(t, current, "set_mode(Follower)");
-+    try {
-+      t.active_file().sync();
-+    } catch (...) {
-+    }
-   }
-   t.apply_set_mode(mode);
-   store_state(current, std::move(t).persistent());
+   if (mode == Mode::Follower) {
+     if (!refused(*current) && t.durable_seq() < last_seq) {
+-      sync_active_file(t, current, "set_mode(Follower)");
++      try {
++        t.active_file().sync();
++      } catch (...) {
++      }
+     }
+   } else {
+     // A promotion. The marker names the history from here on, so it has to

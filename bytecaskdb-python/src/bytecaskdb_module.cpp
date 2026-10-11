@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -315,6 +316,22 @@ struct PyChangeIterator {
 };
 
 // ---------------------------------------------------------------------------
+// PyChangeBatch — one changes_since result: the header, known up front, and
+// the entries, read lazily. Python's `entries` attribute borrows the iterator
+// from the batch, so the batch outlives it.
+// ---------------------------------------------------------------------------
+
+struct PyChangeBatch {
+  bytecask::ChangeHeader header;
+  PyChangeIterator entries;
+};
+
+auto marker_repr(const bytecask::ChangeMarker &m) -> std::string {
+  return std::format("ChangeMarker(since_sequence={}, id={})", m.since_sequence,
+                     m.id);
+}
+
+// ---------------------------------------------------------------------------
 // PyFileInfo / PyFileManifest — wraps FileManifest from create_manifest().
 // ---------------------------------------------------------------------------
 
@@ -354,6 +371,9 @@ NB_MODULE(_bytecaskdb, m) {
   nb::exception<bytecask::DbFollowerMode>(
       m, "DbFollowerMode",
       nb::make_tuple(base, nb::handle(PyExc_RuntimeError)));
+  nb::exception<bytecask::DbChangeMarkerMismatch>(
+      m, "DbChangeMarkerMismatch",
+      nb::make_tuple(base, nb::handle(PyExc_RuntimeError)));
   // A ValueError, as Python's own operations on a closed file raise.
   nb::exception<bytecask::DbClosed>(
       m, "DbClosed", nb::make_tuple(base, nb::handle(PyExc_ValueError)));
@@ -365,6 +385,8 @@ NB_MODULE(_bytecaskdb, m) {
         } catch (const bytecask::DbDegraded &) {
           throw;
         } catch (const bytecask::DbFollowerMode &) {
+          throw;
+        } catch (const bytecask::DbChangeMarkerMismatch &) {
           throw;
         } catch (const bytecask::DbClosed &) {
           throw;
@@ -388,7 +410,10 @@ NB_MODULE(_bytecaskdb, m) {
       .value("Delete", bytecask::EntryType::Delete)
       .value("BulkBegin", bytecask::EntryType::BulkBegin)
       .value("BulkEnd", bytecask::EntryType::BulkEnd)
-      .value("RangeDel", bytecask::EntryType::RangeDel);
+      .value("RangeDel", bytecask::EntryType::RangeDel)
+      .value("ChangeMarker", bytecask::EntryType::ChangeMarker,
+             "A promotion: key empty, value = the marker's 8-byte "
+             "little-endian id.");
 
   nb::enum_<bytecask::IoBackend>(m, "IoBackend",
       "Selects how data files are read. Pread (default) issues pread(2) per "
@@ -545,6 +570,82 @@ NB_MODULE(_bytecaskdb, m) {
         return self;
       })
       .def("__next__", &PyChangeIterator::next, nb::lock_self());
+
+  nb::class_<bytecask::ChangeMarker>(m, "ChangeMarker",
+      "The identity of a history from a promotion on: the ChangeMarker "
+      "entry's own sequence and a random id. A node's marker at a sequence "
+      "is its last marker at or below it, ORIGIN_MARKER if it holds none. "
+      "Two nodes with the same marker at a sequence hold the same history "
+      "up to it.")
+      .def("__init__",
+           [](bytecask::ChangeMarker *self, std::uint64_t since_sequence,
+              std::uint64_t id) {
+             new (self) bytecask::ChangeMarker{.since_sequence = since_sequence,
+                                               .id = id};
+           },
+           "since_sequence"_a = 0, "id"_a = 0)
+      .def_ro("since_sequence", &bytecask::ChangeMarker::since_sequence,
+              "The marker entry's own sequence; 0 for ORIGIN_MARKER.")
+      .def_ro("id", &bytecask::ChangeMarker::id,
+              "The random 64-bit id the promotion drew; 0 for ORIGIN_MARKER.")
+      .def("__eq__",
+           [](const bytecask::ChangeMarker &a,
+              const bytecask::ChangeMarker &b) { return a == b; },
+           nb::is_operator())
+      .def("__hash__",
+           [](const bytecask::ChangeMarker &m) -> std::size_t {
+             return std::hash<std::uint64_t>{}(m.since_sequence) ^
+                    (std::hash<std::uint64_t>{}(m.id) << 1);
+           })
+      .def("__repr__", &marker_repr);
+
+  // The history before any promotion: the marker at every position of a
+  // database that was never promoted.
+  m.attr("ORIGIN_MARKER") = nb::cast(bytecask::kOriginMarker);
+
+  nb::class_<bytecask::ChangeHeader>(m, "ChangeHeader",
+      "Where a slice of a history starts: the source's marker at "
+      "from_sequence, and from_sequence. The slice holds the source's "
+      "entries above it, in order.")
+      .def("__init__",
+           [](bytecask::ChangeHeader *self, bytecask::ChangeMarker marker,
+              std::uint64_t from_sequence) {
+             new (self) bytecask::ChangeHeader{.marker = marker,
+                                               .from_sequence = from_sequence};
+           },
+           "marker"_a = bytecask::kOriginMarker, "from_sequence"_a = 0)
+      .def_ro("marker", &bytecask::ChangeHeader::marker,
+              "The source's marker at from_sequence.")
+      .def_ro("from_sequence", &bytecask::ChangeHeader::from_sequence,
+              "The slice holds the source's entries above this sequence.")
+      .def("__eq__",
+           [](const bytecask::ChangeHeader &a,
+              const bytecask::ChangeHeader &b) {
+             return a.marker == b.marker && a.from_sequence == b.from_sequence;
+           },
+           nb::is_operator())
+      .def("__repr__", [](const bytecask::ChangeHeader &h) {
+        return std::format("ChangeHeader(marker={}, from_sequence={})",
+                           marker_repr(h.marker), h.from_sequence);
+      });
+
+  nb::class_<PyChangeBatch>(m, "ChangeBatch",
+      "One changes_since result, which is one ingest call: the header, "
+      "naming where the slice starts and which history it is from, and "
+      "the entries, read lazily as they are iterated.")
+      .def_ro("header", &PyChangeBatch::header)
+      .def_prop_ro("entries",
+                   [](PyChangeBatch &self) -> PyChangeIterator & {
+                     return self.entries;
+                   },
+                   nb::rv_policy::reference_internal,
+                   "The slice's entries, in sequence order. One pass: the "
+                   "iterator is the batch's own.")
+      .def("__iter__",
+           [](PyChangeBatch &self) -> PyChangeIterator & {
+             return self.entries;
+           },
+           nb::rv_policy::reference_internal);
 
   nb::class_<PyFileInfo>(m, "FileInfo",
       "Sealed file descriptor: file_id, data_path, hint_path.")
@@ -891,7 +992,13 @@ NB_MODULE(_bytecaskdb, m) {
           [](PyDB &self, bytecask::Mode mode) {
             self.db.set_mode(mode);
           },
-          "Switch engine mode.", "mode"_a)
+          "Switch engine mode. A leader stepping down fdatasyncs first, so "
+          "every write it acknowledged can be shipped by changes_since. A "
+          "follower promoted appends a ChangeMarker entry at the next "
+          "sequence and syncs it before the mode changes: the first write "
+          "after it takes the sequence after the marker's. Leader to Leader "
+          "writes nothing.",
+          "mode"_a)
       .def(
           "durable_sequence",
           [](PyDB &self, std::uint64_t min_sequence,
@@ -922,31 +1029,34 @@ NB_MODULE(_bytecaskdb, m) {
           nb::rv_policy::take_ownership)
       .def(
           "changes_since",
-          [](PyDB &self, PySnapshot &snap,
-             std::uint64_t from_sequence) -> PyChangeIterator * {
+          [](PyDB &self, PySnapshot &snap, std::uint64_t from_sequence,
+             std::optional<std::size_t> max_bytes) -> PyChangeBatch * {
             snap.check();
-            auto range = self.db.changes_since(*snap.snap, from_sequence);
-            return new PyChangeIterator{std::move(range.begin())};
+            auto batch = self.db.changes_since(
+                *snap.snap, from_sequence,
+                max_bytes.value_or(bytecask::kUnlimitedBytes));
+            return new PyChangeBatch{
+                .header = batch.header,
+                .entries = PyChangeIterator{std::move(batch.entries.begin())}};
           },
-          "Iterate data entries with sequence > from_sequence.",
-          "snapshot"_a, "from_sequence"_a,
+          "One slice of this node's history for ingest: the whole units "
+          "above from_sequence that were durable at snapshot, cut after the "
+          "unit that passes max_bytes (None: no cut), never inside an atomic "
+          "batch, with a header naming the marker at from_sequence.",
+          "snapshot"_a, "from_sequence"_a, "max_bytes"_a = nb::none(),
           nb::keep_alive<0, 2>(),
           nb::rv_policy::take_ownership)
       .def(
           "ingest",
-          [](PyDB &self, nb::list entries) {
-            // Build owning buffers for keys/values, then construct views.
-            auto n = nb::len(entries);
+          [](PyDB &self, const bytecask::ChangeHeader &header,
+             nb::iterable entries) {
+            // The views borrow each entry's Python bytes, which key_refs and
+            // val_refs keep alive until ingest returns.
             std::vector<bytecask::DataEntryView> views;
-            views.reserve(n);
-            // Keep references alive during ingest.
             std::vector<nb::bytes> key_refs;
             std::vector<nb::bytes> val_refs;
-            key_refs.reserve(n);
-            val_refs.reserve(n);
-
-            for (std::size_t i = 0; i < n; ++i) {
-              auto entry = nb::cast<PyDataEntry &>(entries[i]);
+            for (nb::handle item : entries) {
+              const auto &entry = nb::cast<const PyDataEntry &>(item);
               key_refs.push_back(entry.key);
               val_refs.push_back(entry.value);
               views.push_back(bytecask::DataEntryView{
@@ -957,12 +1067,17 @@ NB_MODULE(_bytecaskdb, m) {
               });
             }
             BC_GIL_RELEASE;
-            self.db.ingest(views);
+            self.db.ingest(header, views);
           },
-          "Ingest pre-sequenced entries from a leader (follower mode only). "
-          "Raises ValueError, before anything is written, if the list ends "
-          "inside an atomic batch.",
-          "entries"_a)
+          "Apply one slice, as changes_since produced it (follower mode "
+          "only). Before anything is written: a slice starting past "
+          "durable_sequence() is a gap (ValueError); one from a history that "
+          "diverged at a promotion is a fork (DbChangeMarkerMismatch); a "
+          "slice that is not strictly increasing, holds a change marker "
+          "inside a batch, or ends inside an atomic batch is malformed "
+          "(ValueError). Entries at or below durable_sequence() are skipped, "
+          "so a slice can be re-delivered.",
+          "header"_a, "entries"_a)
       .def(
           "stats",
           [](PyDB &self) -> std::map<std::string, std::int64_t> {

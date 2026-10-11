@@ -5,13 +5,17 @@
 //
 // Yields individual std::pair<DataEntry, Offset> values, including
 // BulkBegin/BulkEnd markers. Incomplete batches (BulkBegin without
-// a matching BulkEnd before EOF) are silently discarded.
+// a matching BulkEnd before EOF) are silently discarded. A ChangeMarker
+// inside a batch is damage, which nothing writes: the sweep stops there
+// under OnDamage::Stop and throws under OnDamage::Throw, as it does for a
+// record that does not parse.
 
 module;
 #include <cstdint>
 #include <iterator>
 #include <optional>
 #include <ranges>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -87,6 +91,7 @@ private:
   void advance() {
     pending_size_ = 0;
     emit_idx_ = 0;
+    if (stopped_) return;
     if (step_pending_) {
       step_pending_ = false;
       ++cur_;
@@ -101,6 +106,16 @@ private:
         ++cur_;
 
         while (!(cur_ == std::default_sentinel)) {
+          if ((*cur_).first.entry_type == EntryType::ChangeMarker) {
+            // A marker is a unit of its own; inside a batch it is damage.
+            if (cur_.on_damage() == OnDamage::Stop) {
+              pending_size_ = 0;  // the batch it was in goes with it
+              stopped_ = true;
+              return;
+            }
+            throw std::runtime_error{
+                "bytecask: change marker inside an atomic batch"};
+          }
           stage(*cur_);
           if ((*cur_).first.entry_type == EntryType::BulkEnd) {
             committed_offset_ = cur_.next_offset();
@@ -127,6 +142,7 @@ private:
   std::size_t pending_size_{0};  // live prefix of pending_
   std::size_t emit_idx_{0};
   Offset committed_offset_{};
+  bool stopped_{false};  // damage under OnDamage::Stop ended the sweep
   // The scan past the last committed entry or batch is deferred to the next
   // advance(), so the entry after it is parsed only once the caller moves on.
   // A damaged entry then throws out of the operator++ that steps past an

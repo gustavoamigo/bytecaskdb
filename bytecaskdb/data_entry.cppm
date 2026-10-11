@@ -121,6 +121,18 @@ export auto parse_header_and_verify(std::span<const std::byte> buf) -> EntryHead
 
   const auto header = read_header(buf);
 
+  // A type byte outside the known set is damage, like a bad CRC: refused
+  // here rather than left to fall through an exhaustive switch downstream.
+  // The file sweep refuses it first, so a read by location never meets one.
+  if (!is_known_entry_type(header.entry_type)) {
+    throw std::runtime_error{"parse_header_and_verify: unknown entry type"};
+  }
+  if (header.entry_type == EntryType::ChangeMarker &&
+      (header.key_size != 0 || header.value_size != kChangeMarkerIdBytes)) {
+    throw std::runtime_error{
+        "parse_header_and_verify: malformed change marker"};
+  }
+
   if (buf.size() !=
       kHeaderSize + header.key_size + header.value_size + kCrcSize) {
     throw std::runtime_error{"parse_header_and_verify: buffer size mismatch"};

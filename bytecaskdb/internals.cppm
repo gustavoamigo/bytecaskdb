@@ -55,12 +55,17 @@ export struct FileStats {
   std::uint64_t max_sequence{0};
   std::uint64_t tombstone_bytes{0};
   std::uint64_t marker_bytes{0};
+  // ChangeMarker entries: kept for ever, so a file holding one is never
+  // removed whole and compaction publishes it even when the marker is all it
+  // kept (#397).
+  std::uint64_t change_marker_bytes{0};
 
   // Dead Put bytes: what compacting this file is sure to reclaim. Vacuum
   // selects files by it, so a file that is mostly tombstones or markers is
   // not picked again and again for a compaction that cannot shrink it.
   [[nodiscard]] auto reclaimable_bytes() const noexcept -> std::uint64_t {
-    const auto kept = live_bytes + tombstone_bytes + marker_bytes;
+    const auto kept =
+        live_bytes + tombstone_bytes + marker_bytes + change_marker_bytes;
     return total_bytes > kept ? total_bytes - kept : 0;
   }
 };
@@ -72,12 +77,17 @@ struct FileStats {
   std::uint64_t max_sequence{0};
   std::uint64_t tombstone_bytes{0};
   std::uint64_t marker_bytes{0};
+  // ChangeMarker entries: kept for ever, so a file holding one is never
+  // removed whole and compaction publishes it even when the marker is all it
+  // kept (#397).
+  std::uint64_t change_marker_bytes{0};
 
   // Dead Put bytes: what compacting this file is sure to reclaim. Vacuum
   // selects files by it, so a file that is mostly tombstones or markers is
   // not picked again and again for a compaction that cannot shrink it.
   [[nodiscard]] auto reclaimable_bytes() const noexcept -> std::uint64_t {
-    const auto kept = live_bytes + tombstone_bytes + marker_bytes;
+    const auto kept =
+        live_bytes + tombstone_bytes + marker_bytes + change_marker_bytes;
     return total_bytes > kept ? total_bytes - kept : 0;
   }
 };
@@ -92,6 +102,7 @@ struct FileStatsDelta {
   std::uint64_t total_added{0};
   std::uint64_t tombstone_added{0};
   std::uint64_t marker_added{0};
+  std::uint64_t change_marker_added{0};
   std::uint64_t min_sequence{0}; // first batch's first sequence; 0 = none
   std::uint64_t max_sequence{0};
 };
@@ -106,6 +117,7 @@ struct FileStatsPolicy {
     fs.total_bytes += d.total_added;
     fs.tombstone_bytes += d.tombstone_added;
     fs.marker_bytes += d.marker_added;
+    fs.change_marker_bytes += d.change_marker_added;
     // A file's sequences ascend, so its minimum is its first batch's.
     if (fs.min_sequence == 0) fs.min_sequence = d.min_sequence;
     fs.max_sequence = std::max(fs.max_sequence, d.max_sequence);
@@ -116,6 +128,7 @@ struct FileStatsPolicy {
     older.total_added += d.total_added;
     older.tombstone_added += d.tombstone_added;
     older.marker_added += d.marker_added;
+    older.change_marker_added += d.change_marker_added;
     if (older.min_sequence == 0) older.min_sequence = d.min_sequence;
     older.max_sequence = std::max(older.max_sequence, d.max_sequence);
   }
@@ -273,6 +286,7 @@ export inline constexpr auto tombstone_size(EntryType type,
   case EntryType::Put:
   case EntryType::BulkBegin:
   case EntryType::BulkEnd:
+  case EntryType::ChangeMarker:
     return 0;
   }
   return 0;
@@ -288,9 +302,41 @@ export inline constexpr auto marker_size(EntryType type) -> std::uint64_t {
   case EntryType::Put:
   case EntryType::Delete:
   case EntryType::RangeDel:
+  case EntryType::ChangeMarker:
     return 0;
   }
   return 0;
+}
+
+// The bytes an entry adds to FileStats::change_marker_bytes: a ChangeMarker
+// entry's whole record (its value is the 8-byte id), 0 otherwise.
+export inline constexpr auto change_marker_size(EntryType type)
+    -> std::uint64_t {
+  switch (type) {
+  case EntryType::ChangeMarker:
+    return entry_size(0, kChangeMarkerIdBytes);
+  case EntryType::Put:
+  case EntryType::Delete:
+  case EntryType::BulkBegin:
+  case EntryType::BulkEnd:
+  case EntryType::RangeDel:
+    return 0;
+  }
+  return 0;
+}
+
+// A node's marker at sequence: the last of markers (sorted by
+// since_sequence) at or below it, kOriginMarker if none. A null list holds
+// none.
+export inline auto marker_at(const std::vector<ChangeMarker> *markers,
+                             std::uint64_t sequence) noexcept -> ChangeMarker {
+  auto at = kOriginMarker;
+  if (!markers) return at;
+  for (const auto &m : *markers) {
+    if (m.since_sequence > sequence) break;
+    at = m;
+  }
+  return at;
 }
 
 // Forward declaration — defined in bytecask.cppm (primary interface).
@@ -885,6 +931,16 @@ export struct EngineState {
   // Set by DB::close(). A closed state is the last one a DB publishes and
   // holds no files or key directory (see closed_copy).
   bool closed{false};
+  // Every ChangeMarker the data files hold, by since_sequence: 16 bytes per
+  // promotion. Immutable; a promotion or an ingested marker publishes a new
+  // list. Null when there is none.
+  std::shared_ptr<const std::vector<ChangeMarker>> change_markers;
+
+  // This node's marker at sequence (see ChangeMarker).
+  [[nodiscard]] auto marker_at(std::uint64_t sequence) const noexcept
+      -> ChangeMarker {
+    return bytecask::marker_at(change_markers.get(), sequence);
+  }
 
   [[nodiscard]] auto is_write_allowed() const noexcept -> bool {
     return mode == Mode::Leader && !degraded && !closed;
@@ -965,6 +1021,8 @@ export struct ResumeEntry {
   // its exclusive upper bound. Empty for every other entry type.
   std::vector<std::byte> key;
   std::vector<std::byte> range_end;
+  // For ChangeMarker, the id its value holds. 0 for every other entry type.
+  std::uint64_t marker_id{0};
 };
 
 export struct VacuumScanResult {
@@ -975,6 +1033,7 @@ export struct VacuumScanResult {
   std::uint64_t max_sequence{0};
   std::uint64_t tombstone_bytes{0};
   std::uint64_t marker_bytes{0};
+  std::uint64_t change_marker_bytes{0};
   std::uint64_t tombstones_dropped{0};
 };
 
@@ -1044,6 +1103,8 @@ export struct RecoveryResult {
   // A lenient open skipped a file it could not read. Its Puts were never
   // seen, so no tombstone can be shown unneeded.
   bool skipped_files{false};
+  // The ChangeMarkers of these files, in the order found; sorted by the caller.
+  std::vector<ChangeMarker> change_markers;
 };
 
 // ---------------------------------------------------------------------------

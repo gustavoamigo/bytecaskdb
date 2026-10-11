@@ -98,7 +98,8 @@ Its interface is the engine's, as the native binding (`bytecaskdb._bytecaskdb`) 
 - `apply_batch(WritePlan)`, with every guard;
 - `put`/`del_`/`del_range`, `get`/`contains_key`, and the four iterators;
 - `Snapshot`, which a `WritePlan` consumes;
-- `CommitResult`, and option objects.
+- `CommitResult`, and option objects;
+- replication: `mode`/`set_mode`, `durable_sequence()`, `create_manifest`, `changes_since` and `ingest`, with the change marker of #397.
 
 The Pythonic interface (`db[k]`, `with db.transaction()`) stays in `bytecaskdb/ext.py`. A test can run `ext.py` on the reference through `bytecaskdb.DB.open(path, backend=bytecask_ref)`. `ext.py` builds options and plans through the backend module it was opened with, and the default is the native extension. This is a test seam: `reference/` is not part of the `bytecaskdb` package and must be on `sys.path`.
 
@@ -118,9 +119,10 @@ The docstring shows, with `dump(path)`, what a put followed by a two-write batch
   - data follows, anywhere else: open refuses.
   - Before replaying, the newest file's committed bytes are written back and synced, and so is any cut. This is the engine's `rewrite_durably`/`truncate_durably`. Without it, a failed sync could leave those bytes only in the page cache, and a cut that was never synced could bring a torn tail back into a file that is no longer the newest.
 - **I/O errors.** A write or sync that fails with an I/O error stops all writes: they raise `DbDegraded`, while reads go on. `close()` raises `DbDegraded` too. Reopening is the only way back, and it rewrites the file as above. The engine also offers `resume()`; the reference does not.
+- **Replication.** `durable_sequence()` is raised by every sync of the active file. `changes_since(snapshot, from, max_bytes)` returns a `ChangeBatch`: a header naming the source's marker at `from`, and the whole units above `from` that were durable at the snapshot, cut after the unit that passes `max_bytes`. `ingest(header, entries)` checks the slice as the design on #397 says: a gap (`from` past the follower) is a `ValueError`, a fork (the source's marker at X, the lower of the follower's position and the slice's last sequence, is not the follower's) is `DbChangeMarkerMismatch`, and only then are the entries above the follower's position appended, synced and published. `set_mode(Mode.Leader)` on a follower appends a `CHANGE_MARKER` entry and syncs it before the mode changes; stepping down syncs. The markers are kept in memory as a tuple and rebuilt at open from the committed entries. A `CHANGE_MARKER` inside a batch, and any unknown type byte, are damage to the scan. `create_manifest` seals the active file and lists the sealed ones; copying them bootstraps a follower.
 - **Guards.** These match `validate_preconditions`. With a snapshot, the plan collects the keys and ranges that must be unchanged: explicit guards plus the keys it writes, and range guards plus its range deletes. It then checks each one the same way. A key is unchanged if its sequence, or its absence, is the same in the snapshot and the head. A key created and then deleted after the snapshot is absent from both, so it does not conflict.
 
-It writes the V01 format, so the engine opens a database it wrote (generating the hints) and it opens one the engine wrote (ignoring the hints). Hints, vacuum, group commit, preallocation, the buffer pool, replication and `resume()` are left out. A database the engine left mid-vacuum, with a compacted copy beside the original, is for the engine to open first.
+It writes the V01 format, so the engine opens a database it wrote (generating the hints) and it opens one the engine wrote (ignoring the hints). Hints, vacuum, group commit, preallocation, the buffer pool, `resume()` and the waiting form of `durable_sequence` are left out. A database the engine left mid-vacuum, with a compacted copy beside the original, is for the engine to open first.
 
 It does not give the engine's other guarantees:
 - **Exclusive access.** There is no directory lock.
@@ -128,7 +130,7 @@ It does not give the engine's other guarantees:
 - **Flat latency.** There is no group commit, the tree is unbalanced, range deletes and range guards are linear in the keys they cover, and opening reads every file whole.
 - **Fault testing.** The crash, chaos and fault-injection rigs have never run against it; its crash and I/O-error handling have unit tests only.
 
-`bytecaskdb-python/tests/test_persistent_tree.py` checks the tree and the CRC on their own. `bytecaskdb-python/tests/test_reference.py` runs the reference and the native binding through the same calls at the engine's interface. A seeded workload runs on both: puts, deletes, range deletes, and guarded plans whose snapshots were taken several writes earlier. Snapshots are held across writes, rotation, reopens and native vacuum. Every commit or conflict must agree, and so must every sequence and every `get` and scan.
+`bytecaskdb-python/tests/test_persistent_tree.py` checks the tree and the CRC on their own. `bytecaskdb-python/tests/test_reference.py` runs the reference and the native binding through the same calls at the engine's interface. A seeded workload runs on both: puts, deletes, range deletes, and guarded plans whose snapshots were taken several writes earlier. Snapshots are held across writes, rotation, reopens and native vacuum. Every commit or conflict must agree, and so must every sequence and every `get` and scan. `bytecaskdb-python/tests/test_reference_replication.py` runs replication on the reference alone: slicing, promotion, the gap and fork refusals, re-delivery, and a cluster model of four nodes driven by random writes, lag, planned transfers, unplanned promotions of the most and of the least advanced follower, restarts, zombie leaders reopened in place, re-delivery and re-bootstrap. Every `ingest` in the model is checked against an oracle that compares the two histories up to the point the design names, and the model ends with every node converged on the leader.
 
 A second test runs one `ext.py` script on both backends and compares the results. Because `ext.py` is shared, the differential test cannot see a bug in it; `ext.py`'s own tests (`test_safety.py`) cover it. File-format tests cover both directions. It all runs in `ci.yml`.
 
@@ -644,13 +646,14 @@ ByteeCask implements a **conservative online vacuum**: the engine continues to s
 The fragmentation of a sealed data file is the fraction of disk space compaction is sure to reclaim — its dead Puts:
 
 ```
-fragmentation = 1 − (live_bytes + tombstone_bytes + marker_bytes) / total_bytes
+fragmentation = 1 − (live_bytes + tombstone_bytes + marker_bytes + change_marker_bytes) / total_bytes
 ```
 
 - `total_bytes` — physical file size: all appended bytes, including dead puts, tombstones, and BulkBegin/BulkEnd markers.
 - `live_bytes` — sum of entry sizes (`kHeaderSize + key_size + value_size + kCrcSize`) for Put entries currently referenced by the key directory.
 - `tombstone_bytes` — sum of entry sizes for Delete and RangeDel entries in the file. Tombstones are never live and count as kept: compaction copies every one recovery found still needed (see **Tombstone handling**), and the ones it may drop are not what a file is compacted for. A file holding nothing but tombstones has fragmentation 0 and is never selected.
 - `marker_bytes` — `kHeaderSize + kCrcSize` per BulkBegin/BulkEnd marker. Compaction keeps every marker, so they count as kept too; without that, a file whose only dead bytes were markers stayed eligible, and every `vacuum()` call staged an identical copy of it and gave up (#169).
+- `change_marker_bytes` — the whole record (27 bytes) per ChangeMarker. Kept for ever: compaction copies it and a file holding one is never removed whole (#397).
 
 Tombstones and markers count as neither live nor dead. Counting them as dead (the formula was `1 − live_bytes / total_bytes`) made a file of tombstones measure 100% fragmented however often it was compacted: every `vacuum()` call picked it, staged an identical copy and discarded it (#169). Tombstones that recovery found droppable are not counted as reclaimable either — a file is never compacted just to drop tombstones; they go when the file is compacted for its dead Puts.
 
@@ -668,6 +671,7 @@ struct FileStats {
   std::uint64_t max_sequence{0};  // highest sequence in this file (0 = no entries)
   std::uint64_t tombstone_bytes{0};  // Delete + RangeDel entries: not live
   std::uint64_t marker_bytes{0};     // BulkBegin + BulkEnd markers: not live
+  std::uint64_t change_marker_bytes{0};  // ChangeMarker entries: kept for ever
 };
 ```
 
@@ -683,6 +687,7 @@ All stats updates happen inside `TransientEngineState::apply_writes` (and `apply
 - **On Del**: if the key exists, subtract `entry_size(key.size(), old_entry.value_size)` from `file_stats[old_entry.file_id].live_bytes`. Add the tombstone size (`kHeaderSize + key.size() + kCrcSize`) to `file_stats[active_file_id].total_bytes` and `.tombstone_bytes`. The tombstone is never added to `live_bytes` — tombstones are never referenced by the key directory.
 - **On DelRange**: subtract each erased key's entry size from its file's `live_bytes`, and add the range tombstone's size (`entry_size(from.size(), to.size())`) to the active file's `total_bytes` and `tombstone_bytes`.
 - **BulkBegin/BulkEnd markers**: each add `kHeaderSize + kCrcSize` to the active file's `total_bytes` and `marker_bytes` — they are never referenced by the key directory.
+- **ChangeMarker**: adds its 27 bytes to the active file's `total_bytes` and `change_marker_bytes`, in `apply_change_marker` (a promotion) and `apply_ingest` (a source's promotion).
 - **On rotation**: `apply_rotate_file` inserts `FileStats{0, 0}` for the new active file.
 
 At vacuum time fragmentation is an O(1) integer division per file — no scanning, no I/O, no additional lock contention.
@@ -694,7 +699,7 @@ The active file's `live_bytes` may be non-zero (it holds the current live writes
 `file_stats` must be rebuilt on startup. Both `total_bytes` and `live_bytes` are reconstructed without scanning data files or traversing the key directory:
 
 - **`total_bytes`**: computed via `std::filesystem::file_size(path)` per sealed file in `open_and_prepare_files()`. Exact for append-only files. O(1) per file, no I/O beyond a `stat` call.
-- **`tombstone_bytes`, `marker_bytes`**: summed per file from its hint file's Delete and RangeDel entries and its BulkBegin/BulkEnd markers, in every recovery path, as the sequence bounds are. Hint files carry all of them, so this needs no data file read. `apply_resume` rebuilds both for the resumed file from the committed entries it scans.
+- **`tombstone_bytes`, `marker_bytes`, `change_marker_bytes`**: summed per file from its hint file's Delete and RangeDel entries, its BulkBegin/BulkEnd markers and its ChangeMarker entries, in every recovery path, as the sequence bounds are. Hint files carry all of them, so this needs no data file read. `apply_resume` rebuilds them for the resumed file from the committed entries it scans.
 - **`live_bytes`**: reconstructed as a side-effect of the existing hint-file recovery pass. The hint entry carries `key_size` (from `key.size()`) and `value_size`, so `entry_size(key_size, value_size)` is computable without touching the data file.
 
 The displacement logic mirrors write-path updates:
@@ -744,6 +749,7 @@ Used when the file's live data is too large to fit into the active file. Produce
    - *Put entry*: check whether the snapshot's key directory entry for that key points to the old file at this offset with the same sequence number. If yes (live), write it to the new file at its new offset, recording `(key → new_file_id, new_offset)`. If no (dead), skip.
    - *Delete or RangeDel entry*: dropped if `NeededTombstones::droppable(sequence)`, otherwise copied verbatim (same sequence number, same key). See **Tombstone handling** below.
    - *BulkBegin/BulkEnd marker*: always copied.
+   - *ChangeMarker*: always copied, and counted as kept, so a file whose only kept bytes are a change marker is still published rather than removed.
    If nothing at all is left to copy — every Put dead, every tombstone droppable — the staged file is discarded and the source is removed with `vacuum_remove_file` instead of publishing an empty file.
 3. **Seal and durability** — `fdatasync` the tmp file, close it. Rename `.data.tmp` → `.data` atomically. Open a new `DataFile` at the final path and seal it. Write a hint file by scanning the compacted file (no batches in the output), using the temp-then-rename protocol (`.hint.tmp` → `.hint`).
 4. **Atomic commit** (under `write_mu_`):
@@ -759,7 +765,7 @@ Used when the file's live data is too large to fit into the active file. Produce
 
 ##### `vacuum_remove_file(file_id)` — delete a file with nothing to keep
 
-Used when `live_bytes == 0` and `tombstone_bytes == 0` — the file holds only superseded puts and batch markers. No I/O is required. Also used by `vacuum_compact_file` when its scan left nothing to copy — every Put dead and every tombstone droppable — instead of publishing an empty file.
+Used when `live_bytes == 0`, `tombstone_bytes == 0` and `change_marker_bytes == 0` — the file holds only superseded puts and batch markers. No I/O is required. Also used by `vacuum_compact_file` when its scan left nothing to copy — every Put dead and every tombstone droppable — instead of publishing an empty file.
 
 A file with no live entries but with tombstones goes through `vacuum_compact_file` instead, which keeps the tombstones still needed and drops the rest. Dropping it whole would drop them all, and a Put they shadow in an older file would come back at the next open (#166).
 
@@ -852,7 +858,7 @@ Vacuum removes history, and a follower resuming `changes_since` below what it re
 - A dead Put above it is copied into the compacted file instead of dropped. It is counted in `total_bytes` and not in `live_bytes`, so it stays reclaimable, and a later vacuum with a higher `retain_after` drops it. It has no key-directory mapping; recovery resolves it by sequence like any overwritten Put.
 - A tombstone above it is kept even when recovery marked it droppable.
 - A file is removed whole only when its `max_sequence` is at or below it; a file whose `min_sequence` is above it is not a candidate.
-- Batch markers are always kept, as before.
+- Batch markers are always kept, as before, and change markers whatever `retain_after`.
 
 `changes_since(snap, from)` is then complete for any `from >= retain_after` of every vacuum since `from`. The replication service passes the lowest `durable_sequence()` among the followers it counts on, on every node, since a follower can become leader, and counts a node it is bootstrapping from the manifest's `through_sequence` on. A follower it leaves out has to be re-bootstrapped. The default, `kNoRetention` (−1 as an unsigned sequence), restricts nothing, so a single-node database vacuums as before.
 
@@ -1780,22 +1786,25 @@ enum class Mode { Leader, Follower };
 
 A leader stepping down (`set_mode(Mode::Follower)` from `Leader`) calls `fdatasync` on the active file before it publishes the new mode, and raises `durable_seq` to the last assigned sequence. `changes_since` ships only up to `durable_seq`, so without the sync a write acknowledged with `sync = false` stays unshippable: a planned transfer would complete without it, and the new leader would reuse its sequence (found by the topology replication check, #178). The sync is skipped when nothing is above `durable_seq`, which is always the case for a follower: `ingest` syncs before it publishes, so the test does not look at the mode being left. It is skipped too on a degraded engine, where a sync after a failed one proves nothing (#231): a degraded leader steps down with its unsynced writes still above `durable_seq`. A failed `fdatasync` degrades the engine, publishes nothing else, and rethrows; the mode stays `Leader`, and `resume()` recovers as after any failed commit sync.
 
+A follower promoted (`set_mode(Mode::Leader)` from `Follower`) appends a `ChangeMarker` entry at the next sequence and `fdatasync`s it before it publishes the new mode (#397, *Change markers* below). The first write after a promotion takes the sequence after the marker's. A failed append or sync degrades the engine, publishes the degraded state with the mode unchanged, and rethrows; a promotion on a degraded engine throws `DbDegraded` and leaves the mode, since it cannot write its marker; a promotion that would need a sequence past the packable limit throws `std::runtime_error` and appends nothing. `set_mode(Mode::Leader)` on a leader writes nothing, and opening in Leader mode is not a promotion. If the marker takes the active file past `max_file_bytes`, the file is rotated as after a write.
+
 Every sync of the active file degrades the engine when it fails, whatever called it: the commit flush, a rotation, `set_mode`, vacuum, `create_manifest` and `ingest`. A caller that only threw would leave a healthy engine whose next `fdatasync` returns 0 without writing the failed pages, and `durable_seq` would rise over writes the device does not hold. `create_manifest` did exactly that until #281.
 
 ### Leader-side: `durable_sequence`, `create_manifest`, `changes_since`
 
 - `durable_sequence(min_sequence, timeout)` — the single sequence primitive (renamed from `current_sequence` — BC-231). Blocks until the durable sequence reaches at least `min_sequence` or the timeout expires, then returns the durable sequence; `min_sequence = 0`/an already-reached target/a nonpositive timeout return immediately without blocking (useful for polling replicas or waking a replication loop only when the leader is genuinely ahead).
 - `create_manifest()` — rotates the active file, waits for all hint files, and returns a `FileManifest` of sealed files with a snapshot. Used for initial bootstrap. Every listed data file exists; a hint may not, since the background worker only logs a failed hint write. That is safe because a hint is a rebuildable index: the receiver's open writes the hint of any data file that lacks one, at the cost of one scan of that file. The manifest builds `hint_path` from the file's name rather than checking it, and callers copy a hint only when it exists (#349). The active file is synced before it is sealed, so `through_sequence` is durable, and the snapshot is taken under `write_mu_` right after the rotation's state is published, so no write slips between the seal and the snapshot.
-- `changes_since(seq, snap)` — returns a lazy `ChangeIterator` that walks sealed files in sequence order, yielding `DataEntryView` entries with `sequence > seq`. Constant memory — scans one entry at a time.
+- `changes_since(snap, from, max_bytes)` — returns a `ChangeBatch`: a `ChangeHeader` naming this node's marker at `from` (*Change markers*), and a lazy `ChangeIterator` that walks the files in sequence order. The slice is whole units — a standalone entry, a `ChangeMarker`, or a batch from its `BulkBegin` to its `BulkEnd` — whose first sequence is above `from`: a batch straddling `from` is left out whole, since a node positioned at a unit boundary below it holds it already. It ends at the snapshot's durable sequence, which always sits on a unit boundary, or after the unit that takes it past `max_bytes`, so it never ends inside a batch. One `changes_since` is one `ingest`: the header describes one slice, so the engine cuts the slice rather than the caller. Constant memory — scans one entry at a time.
 
 ### Follower-side: `ingest`
 
 ```cpp
-void ingest(std::span<const DataEntryView> entries);
+void ingest(const ChangeHeader &header, std::span<const DataEntryView> entries);
 ```
 
-`ingest` applies pre-sequenced entries from a leader to the follower's storage. Key properties:
+`ingest` applies one slice of a source's history, as `changes_since` produced it, to the follower's storage. Key properties:
 
+- **It continues this node's history, or nothing is written** (#397, *Change markers*). With P = `durable_seq` and X = min(P, the slice's last sequence, or `header.from_sequence` if it is empty): `header.from_sequence > P` is a gap and throws `std::invalid_argument`; the source's marker at X — the last `ChangeMarker` entry in the slice at or below X, or `header.marker` — must equal this node's marker at X, or the slice throws `DbChangeMarkerMismatch`. An empty slice is checked at `from_sequence`: that is how a follower ahead of its source on another history is caught. A slice not strictly increasing above `from_sequence`, or holding a `ChangeMarker` inside a batch, with a key or without its 8-byte id, is malformed: `std::invalid_argument`. All of this before any I/O.
 - **Idempotent**: entries with `sequence <= durable_seq` are silently skipped.
 - **Batch-safe rotation**: `BulkBegin`/`BulkEnd` pairs always land in the same data file. Rotation only occurs at boundaries where no batch is open.
 - **Whole batches only**: a slice that ends inside a batch is refused with `std::invalid_argument` before anything is written. It used to be applied as given: part of the batch became visible, and when the slice filled the active file, the rotation after the loop sealed the `BulkBegin` into a file with no `BulkEnd`. Recovery drops an unterminated batch, so a reopen lost entries the follower had synced and published, and `durable_sequence()` went backwards (#188). Holding the open batch back for the next call was the alternative; refusing keeps no entries in memory between calls, and every caller already cut slices at batch boundaries. Since every accepted slice ends outside a batch, the rotation after the loop, like the ones inside it, never splits a batch.
@@ -1804,6 +1813,19 @@ void ingest(std::span<const DataEntryView> entries);
 - **Degraded-state on failure**: same pattern as the normal write path — on I/O failure, the engine goes degraded and `resume()` recovers.
 
 Correctness is validated by 211 generated proof tests (178 ingest + 33 manifest) covering the full (StateShape × OpsShape × FailureClass) matrix. See [`correctness_validation.md`](correctness_validation.md) for the proof framework and [`replication_primitives_design.md`](replication_primitives_design.md) for the invariants.
+
+### Change markers
+
+`ingest` used to assume the entries it was given continued the follower's own history, and never checked. Two things broke that assumption silently (#397): a caller resuming past the follower's position (a gap, which could publish the tail of a batch without its head), and a history that diverged at a promotion (a fork: a follower ahead of a newly promoted leader, or an old leader rejoining with writes nobody replicated, kept its own entries and skipped the new leader's as duplicates). Sequences alone cannot tell two histories apart, since the diverged histories reuse the same numbers, and they are not dense, so "the next entry must be P+1" would refuse legitimate streams.
+
+Divergence starts only at a promotion, so that is where the identity is recorded, as PostgreSQL's timeline ids and Redis's `replid` do, and here in the data file, the only record:
+
+- **The entry.** `EntryType::ChangeMarker` (0x06): key empty, value an 8-byte random id. A promotion appends one at the next sequence. `ChangeMarker{since_sequence, id}` is the entry's sequence and its id. A node's **marker at a sequence** is its last marker at or below it, `kOriginMarker` (`{0, 0}`) if it holds none: sequence 0 is below every sequence the engine assigns, so a database that was never promoted carries the origin everywhere. Two nodes with the same marker at X hold the same history up to X: each received that marker through a checked `ingest` or wrote it, so they agree below it by induction, and between it and X no other promotion happened or the marker at X would differ. Two histories that were never promoted — a file copy of a running leader opened as a leader beside it — both carry the origin and cannot be told apart; every fork that involves a promotion is caught once the branches meet.
+- **The check** is one comparison at one point, X = min(P, L), described under *Follower-side: `ingest`*. X stops at L because a slice cut by `max_bytes` says nothing past its last entry, and at P because the slice is skipped as duplicates up to there; on a normal delivery X = `from_sequence` = P.
+- **In memory.** `EngineState::change_markers` is an immutable list sorted by sequence, 16 bytes per promotion, null when there is none; a promotion or an ingested marker publishes a new list. Recovery rebuilds it from the hint files alone: a hint carries each marker with its id appended, the way a `RangeDel` entry carries its end key (`file_format.md`), in the keyless head of the file. `resume()` rebuilds the active file's part from the scan it already does, adding a marker only above the list's last, since a marker whose `set_mode(Leader)` failed after the append is already published while one an `ingest` appended and never published is not.
+- **Kept for ever.** A marker is counted in `FileStats::change_marker_bytes`, kept bytes like `tombstone_bytes`: a file holding one has nothing reclaimable for the marker's sake, is never removed whole by `vacuum_remove_file`, and `vacuum_compact_file` publishes the compacted file even when the marker is all it kept. Batch markers are not kept this way, and a file of dead puts and batch markers still goes whole.
+- **Unknown entry types are damage.** The data file parser used to cast the type byte without checking it, and every switch over `EntryType` is exhaustive with no default, so an unknown type would have fallen through. The file sweep now refuses a type byte outside the known set as it refuses a failed CRC: in the newest file it is cut with the tail, anywhere else the open is refused.
+- **Harness.** The topology replication check (`replication_checking_design.md`) promotes the least advanced follower on purpose in `topology-behind`; the fork now shows as `DbChangeMarkerMismatch` on the follower that was ahead, which the harness counts and answers with a re-bootstrap. The Python reference implements the same marker and checks, and `bytecaskdb-python/tests/test_reference_replication.py` runs a cluster model over it with an oracle on the histories; `test_reference.py` runs one scripted scenario on the reference and the engine and compares every outcome.
 
 ## Working agreement
 

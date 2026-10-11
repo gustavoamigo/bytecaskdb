@@ -76,7 +76,34 @@ enum class EntryType : std::uint8_t {
   BulkBegin = 0x03,
   BulkEnd   = 0x04,
   RangeDel  = 0x05,
+  ChangeMarker = 0x06,  // a promotion: key empty, value = the marker's 8-byte id
 };
+
+// The identity of a history from a promotion on: the ChangeMarker entry's
+// own sequence and a random id. A node's marker at a sequence is its last
+// marker at or below it, kOriginMarker if it holds none. Two nodes with the
+// same marker at a sequence hold the same history up to it.
+struct ChangeMarker {
+  std::uint64_t since_sequence{0};
+  std::uint64_t id{0};
+  friend auto operator==(const ChangeMarker&, const ChangeMarker&) noexcept
+      -> bool = default;
+};
+
+// The history before any promotion: the marker at every position of a
+// database that was never promoted.
+inline constexpr ChangeMarker kOriginMarker{};
+
+// Where a slice of a history starts: the source's marker at from_sequence,
+// and from_sequence. The slice holds the source's entries above it, in order.
+struct ChangeHeader {
+  ChangeMarker marker{};
+  std::uint64_t from_sequence{0};
+};
+
+// changes_since's max_bytes meaning no cut.
+inline constexpr std::size_t kUnlimitedBytes =
+    std::numeric_limits<std::size_t>::max();
 
 struct WriteOptions {
   bool sync{true};
@@ -176,6 +203,17 @@ public:
   DbFollowerMode(const DbFollowerMode&) = default;
   DbFollowerMode& operator=(const DbFollowerMode&) = default;
   ~DbFollowerMode() override = default;
+};
+
+// Thrown by ingest for a slice of a history that is not this node's: the two
+// diverged at a promotion. Nothing was written; re-bootstrap from the
+// source's manifest.
+class DbChangeMarkerMismatch : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+  DbChangeMarkerMismatch(const DbChangeMarkerMismatch&) = default;
+  DbChangeMarkerMismatch& operator=(const DbChangeMarkerMismatch&) = default;
+  ~DbChangeMarkerMismatch() override = default;
 };
 
 // Thrown by every DB operation after DB::close().
@@ -358,6 +396,13 @@ private:
   friend class DB;
 };
 
+// One changes_since result, which is one ingest call: where the slice starts
+// and which history it is from, and the entries, read lazily.
+struct ChangeBatch {
+  ChangeHeader header;
+  std::ranges::subrange<ChangeIterator, std::default_sentinel_t> entries;
+};
+
 // ---------------------------------------------------------------------------
 // Snapshot — frozen, move-only, read-only view of DB state.
 // ---------------------------------------------------------------------------
@@ -519,11 +564,19 @@ public:
 
   [[nodiscard]] auto create_manifest() -> FileManifest;
 
+  // One slice of this node's history for ingest: the whole units above
+  // from_sequence that were durable at snap, cut after the unit that passes
+  // max_bytes, with a header naming the marker at from_sequence.
   [[nodiscard]] auto changes_since(const Snapshot& snap,
-                                   std::uint64_t from_sequence) const
-      -> std::ranges::subrange<ChangeIterator, std::default_sentinel_t>;
+                                   std::uint64_t from_sequence,
+                                   std::size_t max_bytes = kUnlimitedBytes)
+      const -> ChangeBatch;
 
-  void ingest(std::span<const DataEntryView> entries);
+  // Applies one slice, as changes_since produced it. Before anything is
+  // written: a slice starting past durable_sequence() is a gap
+  // (std::invalid_argument); one from a history that diverged at a
+  // promotion is a fork (DbChangeMarkerMismatch).
+  void ingest(const ChangeHeader& header, std::span<const DataEntryView> entries);
 
   [[nodiscard]] auto stats() const -> std::map<std::string, std::int64_t>;
 
@@ -561,8 +614,14 @@ using SizeLimits           = internal::SizeLimits;
 using FileInfo             = internal::FileInfo;
 using DataEntryView        = internal::DataEntryView;
 using EntryView            = internal::EntryView;
+using ChangeMarker         = internal::ChangeMarker;
+using internal::kOriginMarker;
+using ChangeHeader         = internal::ChangeHeader;
+using ChangeBatch          = internal::ChangeBatch;
+using internal::kUnlimitedBytes;
 using DbDegraded           = internal::DbDegraded;
 using DbFollowerMode       = internal::DbFollowerMode;
+using DbChangeMarkerMismatch = internal::DbChangeMarkerMismatch;
 using DbClosed             = internal::DbClosed;
 using DB                   = internal::DB;
 using Snapshot             = internal::Snapshot;

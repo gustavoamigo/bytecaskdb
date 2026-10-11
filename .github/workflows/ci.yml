@@ -93,6 +93,7 @@ jobs:
           xmake build bytecaskdb_python
           PYTHONPATH=bytecaskdb-python python3 -m pytest tests/proof/test_independence.py \
             bytecaskdb-python/tests/test_reference.py \
+            bytecaskdb-python/tests/test_reference_replication.py \
             bytecaskdb-python/tests/test_persistent_tree.py -v
 
       - name: Enrich JUnit reports with source metadata

@@ -126,6 +126,16 @@ auto from_module(bytecask::CommitResult r) noexcept
   return {r.sequence, r.durable};
 }
 
+auto to_module(const bytecask::internal::ChangeHeader& h) noexcept
+    -> bytecask::ChangeHeader {
+  return {{h.marker.since_sequence, h.marker.id}, h.from_sequence};
+}
+
+auto from_module(const bytecask::ChangeHeader& h) noexcept
+    -> bytecask::internal::ChangeHeader {
+  return {{h.marker.since_sequence, h.marker.id}, h.from_sequence};
+}
+
 auto from_module(std::optional<bytecask::CommitResult> r) noexcept
     -> std::optional<bytecask::internal::CommitResult> {
   if (!r) return std::nullopt;
@@ -144,6 +154,8 @@ auto translate_exceptions(F&& f) -> decltype(std::forward<F>(f)()) {
     throw bytecask::internal::DbDegraded(e.what());
   } catch (const bytecask::DbFollowerMode& e) {
     throw bytecask::internal::DbFollowerMode(e.what());
+  } catch (const bytecask::DbChangeMarkerMismatch& e) {
+    throw bytecask::internal::DbChangeMarkerMismatch(e.what());
   } catch (const bytecask::DbClosed&) {
     throw bytecask::internal::DbClosed{};
   }
@@ -687,24 +699,28 @@ auto DB::create_manifest() -> FileManifest {
   };
 }
 
-auto DB::changes_since(const Snapshot& snap, std::uint64_t from_sequence) const
-    -> std::ranges::subrange<ChangeIterator, std::default_sentinel_t> {
-  auto r = translate_exceptions(
-      [&] { return impl_->db.changes_since(snap.impl_->snap, from_sequence); });
-  return {
-    ChangeIterator{std::make_unique<ChangeIterator::Impl>(std::move(r).begin())},
-    std::default_sentinel
+auto DB::changes_since(const Snapshot& snap, std::uint64_t from_sequence,
+                       std::size_t max_bytes) const -> ChangeBatch {
+  auto r = translate_exceptions([&] {
+    return impl_->db.changes_since(snap.impl_->snap, from_sequence, max_bytes);
+  });
+  return ChangeBatch{
+    from_module(r.header),
+    {ChangeIterator{std::make_unique<ChangeIterator::Impl>(
+         std::move(r.entries).begin())},
+     std::default_sentinel}
   };
 }
 
-void DB::ingest(std::span<const DataEntryView> entries) {
+void DB::ingest(const ChangeHeader& header,
+                std::span<const DataEntryView> entries) {
   std::vector<bytecask::DataEntryView> module_entries;
   module_entries.reserve(entries.size());
   for (const auto& e : entries) {
     module_entries.push_back(to_module(e));
   }
   translate_exceptions([&] {
-    impl_->db.ingest(module_entries);
+    impl_->db.ingest(to_module(header), module_entries);
   });
 }
 

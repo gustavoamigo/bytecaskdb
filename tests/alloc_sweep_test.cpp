@@ -959,15 +959,15 @@ TEST_CASE("refuse writes: ingest is refused by the flag alone",
   auto db = open_db(dir, opts);
   db->test_in_finish_rotation_ = [] { throw std::bad_alloc{}; };
   db->test_before_refusal_publish_ = [] { throw std::bad_alloc{}; };
-  CHECK_THROWS_AS(db->ingest(slice.views()), std::bad_alloc);
+  CHECK_THROWS_AS(db->ingest(slice.header, slice.views()), std::bad_alloc);
   db->test_in_finish_rotation_ = nullptr;
   db->test_before_refusal_publish_ = nullptr;
   CHECK(db->is_degraded());
   CHECK_FALSE(db->engine_state()->degraded);
-  CHECK_THROWS_AS(db->ingest(slice.views()), DbDegraded);
+  CHECK_THROWS_AS(db->ingest(slice.header, slice.views()), DbDegraded);
   REQUIRE_NOTHROW(db->resume());
   CHECK_FALSE(db->is_degraded());
-  db->ingest(slice.views());  // what resume() replayed is skipped
+  db->ingest(slice.header, slice.views());  // what resume() replayed is skipped
   for (int i = 0; i < 3; ++i)
     CHECK(value_of(*db, std::format("r{}", i)) ==
           std::string(300, static_cast<char>('a' + i)));

@@ -1,0 +1,18 @@
+vacuum removes a file whole when it holds no live value and no tombstone,
+without looking at its change marker: the marker goes with the file, and
+the node's marker at every later sequence silently becomes an earlier one,
+so ingest compares the wrong identity (#397).
+Guarded-by: "vacuum keeps a change marker: compaction leaves it in a file of its own, and never removes that file"
+
+diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
+index 590490e..68df748 100644
+--- a/bytecaskdb/bytecask.cppm
++++ b/bytecaskdb/bytecask.cppm
+@@ -3991,7 +3991,6 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
+     // whole while it holds an entry above retain_after, or a change marker,
+     // which is kept for ever.
+     if (target.live_bytes == 0 && target.tombstone_bytes == 0 &&
+-        target.change_marker_bytes == 0 &&
+         target.max_sequence <= opts.retain_after) {
+       vacuum_remove_file(fid);
+       return true;

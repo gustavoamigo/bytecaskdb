@@ -3,15 +3,15 @@ they shadow in an older file comes back. Reverts #171 (#166).
 Guarded-by: "vacuum keeps a tombstone-only file that shadows an older put"
 
 diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..ced55508 100644
+index 590490e..6edb4e1 100644
 --- a/bytecaskdb/bytecask.cppm
 +++ b/bytecaskdb/bytecask.cppm
-@@ -3550,7 +3550,7 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
-     // it could let recovery resurrect a Put it shadows in an older file, and
+@@ -3990,7 +3990,7 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
      // only compaction decides which tombstones can go. Nor may a file go
-     // whole while it holds an entry above retain_after.
+     // whole while it holds an entry above retain_after, or a change marker,
+     // which is kept for ever.
 -    if (target.live_bytes == 0 && target.tombstone_bytes == 0 &&
 +    if (target.live_bytes == 0 &&
+         target.change_marker_bytes == 0 &&
          target.max_sequence <= opts.retain_after) {
        vacuum_remove_file(fid);
-       return true;

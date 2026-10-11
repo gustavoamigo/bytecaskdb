@@ -318,7 +318,68 @@ static auto entry_type_to_string(bytecask::EntryType et) -> const char * {
     case bytecask::EntryType::BulkBegin: return "bulkBegin";
     case bytecask::EntryType::BulkEnd: return "bulkEnd";
     case bytecask::EntryType::RangeDel: return "rangeDel";
+    case bytecask::EntryType::ChangeMarker: return "changeMarker";
   }
+}
+
+static auto string_to_entry_type(const std::string &s) -> bytecask::EntryType {
+  if (s == "put") return bytecask::EntryType::Put;
+  if (s == "delete") return bytecask::EntryType::Delete;
+  if (s == "bulkBegin") return bytecask::EntryType::BulkBegin;
+  if (s == "bulkEnd") return bytecask::EntryType::BulkEnd;
+  if (s == "rangeDel") return bytecask::EntryType::RangeDel;
+  if (s == "changeMarker") return bytecask::EntryType::ChangeMarker;
+  throw std::invalid_argument("Invalid entryType: " + s);
+}
+
+// A ChangeMarker crosses as {sinceSequence: bigint, id: bigint} and a
+// ChangeHeader as {marker, fromSequence: bigint}; with -sWASM_BIGINT each
+// uint64_t is an exact BigInt, as in commit_result_to_js.
+static auto marker_to_js(const bytecask::ChangeMarker &m) -> val {
+  auto obj = val::object();
+  obj.set("sinceSequence", m.since_sequence);
+  obj.set("id", m.id);
+  return obj;
+}
+
+static auto header_to_js(const bytecask::ChangeHeader &h) -> val {
+  auto obj = val::object();
+  obj.set("marker", marker_to_js(h.marker));
+  obj.set("fromSequence", h.from_sequence);
+  return obj;
+}
+
+// A BigInt that is a sequence or a marker id: non-negative and below 2^64.
+// Anything else would wrap modulo 2^64 and alias a valid value, so it is
+// refused rather than truncated. BigInt.asUintN(64, v) === v exactly when v
+// is in range.
+static auto strict_u64(const val &v, const char *what) -> std::uint64_t {
+  if (v.typeOf().as<std::string>() != "bigint") {
+    throw std::invalid_argument(std::string(what) + " must be a BigInt");
+  }
+  if (!val::global("BigInt").call<val>("asUintN", 64, v).equals(v)) {
+    throw std::invalid_argument(std::string(what) +
+                                " must be a non-negative BigInt below 2^64");
+  }
+  return v.as<std::uint64_t>();
+}
+
+static auto header_from_js(const val &h) -> bytecask::ChangeHeader {
+  const auto marker = h["marker"];
+  return {.marker = {.since_sequence = strict_u64(marker["sinceSequence"], "sinceSequence"),
+                     .id = strict_u64(marker["id"], "id")},
+          .from_sequence = strict_u64(h["fromSequence"], "fromSequence")};
+}
+
+// changesSince's maxBytes: missing/undefined/null means no cut. A negative
+// number or NaN is refused; one beyond size_t is no cut as well.
+static auto max_bytes_from_js(const OptionalVal &arg) -> std::size_t {
+  const auto v = value_or_undefined(arg);
+  if (v.isUndefined() || v.isNull()) return bytecask::kUnlimitedBytes;
+  const auto d = v.as<double>();
+  if (!(d >= 0)) throw std::invalid_argument("maxBytes must be a non-negative number");
+  if (d >= static_cast<double>(bytecask::kUnlimitedBytes)) return bytecask::kUnlimitedBytes;
+  return static_cast<std::size_t>(d);
 }
 
 static auto string_to_mode(const std::string &s) -> bytecask::Mode {
@@ -549,14 +610,20 @@ static auto jsdb_create_manifest(JsDB &self) -> JsFileManifest * {
       snap, std::move(js_files), manifest.through_sequence};
 }
 
-static auto jsdb_changes_since(JsDB &self, JsSnapshot &snap,
-                               std::uint64_t from_seq) -> JsChangeIterator * {
+// Returns {header, entries}: the entries are a ChangeIterator handle JS
+// owns and deletes, as a method bound with allow_raw_pointers() hands out.
+static auto jsdb_changes_since(JsDB &self, JsSnapshot &snap, std::uint64_t from_seq,
+                               OptionalVal max_bytes) -> val {
   snap.check();
-  auto range = self.db.changes_since(*snap.snap, from_seq);
-  return new JsChangeIterator{std::move(range)};
+  auto batch = self.db.changes_since(*snap.snap, from_seq, max_bytes_from_js(max_bytes));
+  auto result = val::object();
+  result.set("header", header_to_js(batch.header));
+  result.set("entries", val(new JsChangeIterator{std::move(batch.entries)}, allow_raw_pointers()));
+  return result;
 }
 
-static void jsdb_ingest(JsDB &self, val entries) {
+static void jsdb_ingest(JsDB &self, val header, val entries) {
+  const auto h = header_from_js(header);
   auto len = entries["length"].as<std::size_t>();
   std::vector<bytecask::DataEntryView> views;
   views.reserve(len);
@@ -569,16 +636,8 @@ static void jsdb_ingest(JsDB &self, val entries) {
 
   for (std::size_t i = 0; i < len; ++i) {
     auto e = entries[i];
-    auto seq = e["sequence"].as<std::uint64_t>();
-    auto et_str = e["entryType"].as<std::string>();
-
-    bytecask::EntryType et;
-    if (et_str == "put") et = bytecask::EntryType::Put;
-    else if (et_str == "delete") et = bytecask::EntryType::Delete;
-    else if (et_str == "bulkBegin") et = bytecask::EntryType::BulkBegin;
-    else if (et_str == "bulkEnd") et = bytecask::EntryType::BulkEnd;
-    else if (et_str == "rangeDel") et = bytecask::EntryType::RangeDel;
-    else throw std::invalid_argument("Invalid entryType: " + et_str);
+    auto seq = strict_u64(e["sequence"], "sequence");
+    auto et = string_to_entry_type(e["entryType"].as<std::string>());
 
     key_bufs.push_back(e["key"].as<std::string>());
     val_bufs.push_back(e["value"].as<std::string>());
@@ -590,7 +649,7 @@ static void jsdb_ingest(JsDB &self, val entries) {
         .value = to_view(val_bufs.back()),
     });
   }
-  self.db.ingest(views);
+  self.db.ingest(h, views);
 }
 
 // ---------------------------------------------------------------------------
@@ -779,7 +838,7 @@ EMSCRIPTEN_BINDINGS(bytecask) {
       .function("setMode", &Guarded<&jsdb_set_mode>::call)
       .function("durableSequence", &Guarded<&jsdb_durable_sequence>::call)
       .function("createManifest", &Guarded<&jsdb_create_manifest>::call, allow_raw_pointers())
-      .function("changesSince", &Guarded<&jsdb_changes_since>::call, allow_raw_pointers())
+      .function("changesSince", &Guarded<&jsdb_changes_since>::call)
       .function("ingest", &Guarded<&jsdb_ingest>::call)
       .function("stats", &Guarded<&jsdb_stats>::call);
 
