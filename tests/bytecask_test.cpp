@@ -9846,6 +9846,8 @@ TEST_CASE("a sealed file truncated underneath: Mmap is SIGBUS",
   }
   int status = 0;
   REQUIRE(::waitpid(pid, &status, 0) == pid);
+  // 2: the read threw; 0: it returned bytes the file no longer has.
+  INFO("child exit status " << (WIFEXITED(status) ? WEXITSTATUS(status) : -1));
   CHECK(WIFSIGNALED(status));
   CHECK(WTERMSIG(status) == SIGBUS);
 }
