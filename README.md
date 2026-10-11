@@ -250,8 +250,9 @@ struct Options {
 // way in every mode.
 enum class IoBackend {
     Pread,       // pread(2) per read (default)
-    Mmap,        // sealed files memory-mapped; zero-copy reads. A read the
-                 // kernel cannot complete is SIGBUS, not std::system_error
+    Mmap,        // sealed files memory-mapped; zero-copy reads. On Linux a read
+                 // the kernel cannot complete is SIGBUS, not std::system_error;
+                 // on macOS a file truncated underneath can serve its old bytes
     BufferPool,  // sealed files served from a bounded, engine-owned cache
 };
 

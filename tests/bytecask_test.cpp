@@ -9819,7 +9819,9 @@ TEST_CASE("a sealed file truncated underneath: Pread and BufferPool throw",
   CHECK_FALSE(db.is_degraded());
 }
 
-#ifndef __EMSCRIPTEN__
+// Linux only: on macOS the private mapping keeps serving the truncated file's
+// old pages, so the read returns the old value (#452).
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
 TEST_CASE("a sealed file truncated underneath: Mmap is SIGBUS",
           "[bytecask][io_backend]") {
   TempDir td;
@@ -9847,6 +9849,8 @@ TEST_CASE("a sealed file truncated underneath: Mmap is SIGBUS",
   }
   int status = 0;
   REQUIRE(::waitpid(pid, &status, 0) == pid);
+  // 2: the read threw; 0: it returned bytes the file no longer has.
+  INFO("child exit status " << (WIFEXITED(status) ? WEXITSTATUS(status) : -1));
   CHECK(WIFSIGNALED(status));
   CHECK(WTERMSIG(status) == SIGBUS);
 }
