@@ -2,10 +2,10 @@
 // Copyright (c) 2026 Gustavo Amigo
 //
 // The change index (#443): a sparse per-file index of unit boundaries that
-// changes_since builds as it sweeps, so a later slice enters the file holding
+// changes_since builds as it scans, so a later slice enters the file holding
 // its from_sequence near it instead of parsing the file from its first byte.
-// A cache: wrong only by a bug, checked at the fence all the same, and
-// rebuilt by the sweep that finds it missing.
+// A cache: wrong only by a bug, checked at the bookmark all the same, and
+// rebuilt by the scan that finds it missing.
 
 #include <algorithm>
 #include <chrono>
@@ -30,14 +30,14 @@ import bytecask.change_index;
 
 namespace {
 
-using bytecask::ChangeFence;
+using bytecask::Bookmark;
 using bytecask::ChangeIndex;
 using bytecask::EntryType;
 using bytecask::testing::collect_changes;
 using bytecask::testing::OwnedEntries;
 using bytecask::testing::to_bytes;
 
-constexpr auto kSpacing = ChangeIndex::kFenceSpacing;
+constexpr auto kSpacing = ChangeIndex::kBookmarkSpacing;
 
 // The test build rotates at 64 KiB; these tests want one file.
 auto one_file() -> bytecask::Options {
@@ -131,33 +131,33 @@ auto check_slices(bytecask::DB &db, const bytecask::Snapshot &snap,
 
 }  // namespace
 
-TEST_CASE("a slice from inside a file enters it at a fence and matches a "
-          "sweep from the first byte",
+TEST_CASE("a slice from inside a file enters it at a bookmark and matches a "
+          "scan from the first byte",
           "[replication][change_index]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db", one_file());
-  fill(db, 3000, 200);  // ~700 KiB: a fence every 4 KiB is ~170 fences
+  fill(db, 3000, 200);  // ~700 KiB: a bookmark every 4 KiB is ~170 bookmarks
   const auto snap = db.snapshot();
-  const auto history = pull(db, snap, 0);  // from 0: no lookup, lays the fences
+  const auto history = pull(db, snap, 0);  // from 0: no lookup, lays the bookmarks
   REQUIRE(history.entries.size() == 3000);
 
   auto &idx = db.test_change_index();
   const auto ids = idx.file_ids();
   REQUIRE(ids.size() == 1);
-  const auto fences = idx.fences(ids[0]);
-  REQUIRE(fences.size() > 100);
-  CHECK(fences.front().offset >= kSpacing);
+  const auto bookmarks = idx.bookmarks(ids[0]);
+  REQUIRE(bookmarks.size() > 100);
+  CHECK(bookmarks.front().offset >= kSpacing);
   const auto starts = unit_starts(history);
-  for (std::size_t i = 0; i < fences.size(); ++i) {
-    CHECK(starts.contains(fences[i].sequence));
+  for (std::size_t i = 0; i < bookmarks.size(); ++i) {
+    CHECK(starts.contains(bookmarks[i].sequence));
     if (i > 0) {
-      CHECK(fences[i].offset >= fences[i - 1].offset + kSpacing);
-      CHECK(fences[i].sequence > fences[i - 1].sequence);
+      CHECK(bookmarks[i].offset >= bookmarks[i - 1].offset + kSpacing);
+      CHECK(bookmarks[i].sequence > bookmarks[i - 1].sequence);
     }
   }
   CHECK(stat(db, "bytecask.change_index_files") == 1);
   CHECK(stat(db, "bytecask.change_index_bytes") ==
-        std::ssize(fences) * static_cast<std::int64_t>(sizeof(ChangeFence)));
+        std::ssize(bookmarks) * static_cast<std::int64_t>(sizeof(Bookmark)));
 
   const auto hits0 = stat(db, "bytecask.change_index_hits");
   const auto misses0 = stat(db, "bytecask.change_index_misses");
@@ -165,19 +165,19 @@ TEST_CASE("a slice from inside a file enters it at a fence and matches a "
   const auto hits = stat(db, "bytecask.change_index_hits") - hits0;
   const auto misses = stat(db, "bytecask.change_index_misses") - misses0;
   CHECK(hits + misses == lookups);
-  // Only a from below the first fence's sequence has no fence to enter at.
+  // Only a from below the first bookmark's sequence has no bookmark to enter at.
   CHECK(misses == 1);
   CHECK(hits == lookups - 1);
 }
 
-TEST_CASE("fences sit on unit boundaries; a slice from inside a batch leaves "
+TEST_CASE("bookmarks sit on unit boundaries; a slice from inside a batch leaves "
           "the batch out",
           "[replication][change_index]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db", one_file());
   const std::string value(600, 'v');
   for (std::size_t i = 0; i < 200; ++i) {
-    if (i % 3 != 2) {  // two batches, a single, so fences meet both
+    if (i % 3 != 2) {  // two batches, a single, so bookmarks meet both
       bytecask::WritePlan plan;  // ~7 KiB on disk: longer than a spacing
       for (std::size_t j = 0; j < 12; ++j)
         plan.put(to_bytes(std::format("b{:04}-{:02}", i, j)), to_bytes(value));
@@ -194,18 +194,18 @@ TEST_CASE("fences sit on unit boundaries; a slice from inside a batch leaves "
   auto &idx = db.test_change_index();
   const auto ids = idx.file_ids();
   REQUIRE(ids.size() == 1);
-  const auto fences = idx.fences(ids[0]);
-  REQUIRE(fences.size() > 50);
+  const auto bookmarks = idx.bookmarks(ids[0]);
+  REQUIRE(bookmarks.size() > 50);
   const auto starts = unit_starts(history);
   std::size_t on_batches = 0;
-  for (const auto &f : fences) {
+  for (const auto &f : bookmarks) {
     CHECK(starts.contains(f.sequence));
     const auto it = std::ranges::find(history.entries, f.sequence,
                                       &OwnedEntries::Entry::sequence);
     REQUIRE(it != history.entries.end());
     if (it->entry_type == EntryType::BulkBegin) ++on_batches;
   }
-  CHECK(on_batches > 0);  // a batch longer than a spacing takes the fence
+  CHECK(on_batches > 0);  // a batch longer than a spacing takes the bookmark
   (void)check_slices(db, snap, history, 7);
 }
 
@@ -221,7 +221,7 @@ TEST_CASE("the active file's table grows with the pulls",
   }
   auto &idx = db.test_change_index();
   const auto id = idx.file_ids().at(0);
-  const auto n1 = idx.fences(id).size();
+  const auto n1 = idx.bookmarks(id).size();
   REQUIRE(n1 > 10);
 
   fill(db, 1000, 200, 1000);
@@ -230,9 +230,9 @@ TEST_CASE("the active file's table grows with the pulls",
   const auto hits0 = stat(db, "bytecask.change_index_hits");
   CHECK(seqs(pull(db, snap, durable1)) == expected_after(history, durable1));
   CHECK(stat(db, "bytecask.change_index_hits") == hits0 + 1);
-  const auto fences = idx.fences(id);
-  CHECK(fences.size() > n1 + 10);
-  CHECK(fences.back().sequence > durable1);
+  const auto bookmarks = idx.bookmarks(id);
+  CHECK(bookmarks.size() > n1 + 10);
+  CHECK(bookmarks.back().sequence > durable1);
   CHECK(idx.file_ids().size() == 1);
 }
 
@@ -249,46 +249,46 @@ TEST_CASE("a slice that stops early indexes what it crossed",
 
   auto &idx = db.test_change_index();
   const auto id = idx.file_ids().at(0);
-  const auto laid = idx.fences(id);
+  const auto laid = idx.bookmarks(id);
   CHECK(laid.size() >= kBudget / kSpacing - 1);
   CHECK(laid.size() <= kBudget / kSpacing + 1);
   CHECK(laid.back().sequence <= first.entries.back().sequence);
 
-  // A later slice enters at the last fence and sweeps on from there.
+  // A later slice enters at the last bookmark and scans on from there.
   const auto history = pull(db, snap, 0);
   const auto hits0 = stat(db, "bytecask.change_index_hits");
   CHECK(seqs(pull(db, snap, durable - 10)) ==
         expected_after(history, durable - 10));
   CHECK(stat(db, "bytecask.change_index_hits") == hits0 + 1);
-  CHECK(idx.fences(id).size() > laid.size() * 5);
+  CHECK(idx.bookmarks(id).size() > laid.size() * 5);
 }
 
-TEST_CASE("fences are handed over during the sweep, a bounded number at a time",
+TEST_CASE("bookmarks are handed over during the scan, a bounded number at a time",
           "[replication][change_index]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db", one_file());
-  fill(db, 8000, 200);  // ~1.8 MiB: more than 256 fences
+  fill(db, 8000, 200);  // ~1.8 MiB: more than 256 bookmarks
   const auto snap = db.snapshot();
   auto &idx = db.test_change_index();
   auto batch = db.changes_since(snap, 0);
   auto it = std::move(batch.entries).begin();
   for (std::size_t i = 0; i < 6000 && !(it == std::default_sentinel); ++i) ++it;
   REQUIRE(!(it == std::default_sentinel));
-  // The sweep is still in the file: the first chunk is already in the index.
+  // The scan is still in the file: the first chunk is already in the index.
   const auto ids = idx.file_ids();
   REQUIRE(ids.size() == 1);
-  const auto mid = idx.fences(ids[0]).size();
+  const auto mid = idx.bookmarks(ids[0]).size();
   CHECK(mid >= 256);
   CHECK(mid % 256 == 0);
   while (!(it == std::default_sentinel)) ++it;
-  const auto at_end = idx.fences(ids[0]).size();
-  CHECK(at_end > mid);  // the tail went with the sweep's end
+  const auto at_end = idx.bookmarks(ids[0]).size();
+  CHECK(at_end > mid);  // the tail went with the scan's end
   CHECK(at_end > 400);
   const auto history = pull(db, snap, 0);
   (void)check_slices(db, snap, history, 997);
 }
 
-TEST_CASE("a sweep whose table was evicted does not start a tail-only one",
+TEST_CASE("a scan whose table was evicted does not start a tail-only one",
           "[replication][change_index]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db", one_file());
@@ -304,17 +304,17 @@ TEST_CASE("a sweep whose table was evicted does not start a tail-only one",
     idx.forget(id);  // what eviction by other pulls would do
     while (!(it == std::default_sentinel)) ++it;
   }
-  // The rest of that sweep went to no table: a table starts at the file's
-  // first fence or not at all, so a sweep from the first byte can rebuild it.
+  // The rest of that scan went to no table: a table starts at the file's
+  // first bookmark or not at all, so a scan from the first byte can rebuild it.
   CHECK(idx.files() == 0);
   const auto history = pull(db, snap, 0);
-  const auto fences = idx.fences(idx.file_ids().at(0));
-  REQUIRE(fences.size() > 400);
-  CHECK(fences.front().offset < 2 * kSpacing);
+  const auto bookmarks = idx.bookmarks(idx.file_ids().at(0));
+  REQUIRE(bookmarks.size() > 400);
+  CHECK(bookmarks.front().offset < 2 * kSpacing);
   (void)check_slices(db, snap, history, 997);
 }
 
-TEST_CASE("nothing above the durable sequence gets a fence",
+TEST_CASE("nothing above the durable sequence gets a bookmark",
           "[replication][change_index]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db", one_file());
@@ -329,12 +329,12 @@ TEST_CASE("nothing above the durable sequence gets a fence",
   REQUIRE(history.entries.back().sequence == durable);
 
   auto &idx = db.test_change_index();
-  const auto fences = idx.fences(idx.file_ids().at(0));
-  REQUIRE(!fences.empty());
-  for (const auto &f : fences) CHECK(f.sequence <= durable);
+  const auto bookmarks = idx.bookmarks(idx.file_ids().at(0));
+  REQUIRE(!bookmarks.empty());
+  for (const auto &f : bookmarks) CHECK(f.sequence <= durable);
 }
 
-TEST_CASE("a compacted file is swept from its first byte and indexed again",
+TEST_CASE("a compacted file is scanned from its first byte and indexed again",
           "[replication][change_index][vacuum]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 32 * 1024});
@@ -361,7 +361,7 @@ TEST_CASE("a compacted file is swept from its first byte and indexed again",
 
   REQUIRE(db.vacuum());
   // The compacted file is gone from the index; its copy is a new id that
-  // no sweep has crossed yet.
+  // no scan has crossed yet.
   const auto after = idx.file_ids();
   CHECK(!std::ranges::contains(after, before.front()));
   CHECK(after.size() == before.size() - 1);
@@ -370,12 +370,12 @@ TEST_CASE("a compacted file is swept from its first byte and indexed again",
   const auto history = pull(db, snap, 0);
   const auto copy = idx.file_ids().back();
   CHECK(copy > before.back());
-  // A sequence the copy holds, past its first fence.
+  // A sequence the copy holds, past its first bookmark.
   const auto from = history.entries.at(50).sequence;
-  REQUIRE(from < idx.fences(copy).back().sequence);
+  REQUIRE(from < idx.bookmarks(copy).back().sequence);
   const auto hits0 = stat(db, "bytecask.change_index_hits");
   const auto misses0 = stat(db, "bytecask.change_index_misses");
-  idx.forget(copy);  // as before the sweep that laid them
+  idx.forget(copy);  // as before the scan that laid them
   CHECK(seqs(pull(db, snap, from)) == expected_after(history, from));
   CHECK(stat(db, "bytecask.change_index_hits") == hits0);
   CHECK(stat(db, "bytecask.change_index_misses") == misses0 + 1);
@@ -383,7 +383,7 @@ TEST_CASE("a compacted file is swept from its first byte and indexed again",
   CHECK(stat(db, "bytecask.change_index_hits") == hits0 + 1);
 }
 
-TEST_CASE("a fence that does not hold is dropped and the file swept from its "
+TEST_CASE("a bookmark that does not hold is dropped and the file scanned from its "
           "first byte",
           "[replication][change_index]") {
   TempDir td;
@@ -394,10 +394,10 @@ TEST_CASE("a fence that does not hold is dropped and the file swept from its "
   const auto history = pull(db, snap, 0);
   auto &idx = db.test_change_index();
   const auto id = idx.file_ids().at(0);
-  const auto fences = idx.fences(id);
-  REQUIRE(fences.size() > 3);
+  const auto bookmarks = idx.bookmarks(id);
+  REQUIRE(bookmarks.size() > 3);
   const auto from = durable - 1;
-  auto bad = fences;
+  auto bad = bookmarks;
 
   SECTION("past the end of the file") {
     bad.push_back({from, std::uint64_t{1} << 40});
@@ -415,14 +415,14 @@ TEST_CASE("a fence that does not hold is dropped and the file swept from its "
   CHECK(seqs(pull(db, snap, from)) == expected_after(history, from));
   CHECK(stat(db, "bytecask.change_index_hits") == hits0);
   CHECK(stat(db, "bytecask.change_index_misses") == misses0 + 1);
-  CHECK(idx.fences(id) == fences);  // the sweep from the first byte relaid them
+  CHECK(idx.bookmarks(id) == bookmarks);  // the scan from the first byte relaid them
 }
 
 TEST_CASE("at most kMaxFiles files are indexed, the least recently pulled out",
           "[replication][change_index]") {
   TempDir td;
   auto db = bytecask::DB::open(td.path / "db", {.max_file_bytes = 16 * 1024});
-  fill(db, 3000, 100);  // ~24 files of 16 KiB, 3 fences each
+  fill(db, 3000, 100);  // ~24 files of 16 KiB, 3 bookmarks each
   constexpr auto kMaxFiles = static_cast<std::int64_t>(ChangeIndex::kMaxFiles);
   REQUIRE(stat(db, "bytecask.open_files") > kMaxFiles);
   const auto snap = db.snapshot();
@@ -461,10 +461,10 @@ TEST_CASE("resume clears the index", "[replication][change_index][resume]") {
 // The index on its own.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("ChangeIndex: seek returns the last fence at or below from",
+TEST_CASE("ChangeIndex: seek returns the last bookmark at or below from",
           "[change_index]") {
   ChangeIndex idx;
-  const std::vector<ChangeFence> f{{10, 4096}, {20, 8192}, {30, 12288}};
+  const std::vector<Bookmark> f{{10, 4096}, {20, 8192}, {30, 12288}};
   const auto plan = idx.extend(1, 0, f);
   REQUIRE(plan);
   CHECK(plan->generation != 0);
@@ -485,40 +485,40 @@ TEST_CASE("ChangeIndex: seek returns the last fence at or below from",
   CHECK(idx.files() == 0);
 }
 
-TEST_CASE("ChangeIndex: fences go only to the table their plan came from",
+TEST_CASE("ChangeIndex: bookmarks go only to the table their plan came from",
           "[change_index]") {
   ChangeIndex idx;
-  const auto first = idx.extend(1, 0, std::vector<ChangeFence>{{10, 4096}});
+  const auto first = idx.extend(1, 0, std::vector<Bookmark>{{10, 4096}});
   REQUIRE(first);
-  // The table is gone: its sweep's fences start no new table.
+  // The table is gone: its scan's bookmarks start no new table.
   idx.forget(1);
-  CHECK(!idx.extend(1, first->generation, std::vector<ChangeFence>{{20, 8192}}));
+  CHECK(!idx.extend(1, first->generation, std::vector<Bookmark>{{20, 8192}}));
   CHECK(idx.files() == 0);
-  // Another sweep from the first byte made a new table: the old plan's
-  // fences are refused, the new table's own are taken.
-  const auto second = idx.extend(1, 0, std::vector<ChangeFence>{{11, 4100}});
+  // Another scan from the first byte made a new table: the old plan's
+  // bookmarks are refused, the new table's own are taken.
+  const auto second = idx.extend(1, 0, std::vector<Bookmark>{{11, 4100}});
   REQUIRE(second);
   CHECK(second->generation != first->generation);
-  CHECK(!idx.extend(1, first->generation, std::vector<ChangeFence>{{20, 8192}}));
-  CHECK(idx.extend(1, second->generation, std::vector<ChangeFence>{{21, 8200}}));
-  CHECK(idx.fences(1) == std::vector<ChangeFence>{{11, 4100}, {21, 8200}});
+  CHECK(!idx.extend(1, first->generation, std::vector<Bookmark>{{20, 8192}}));
+  CHECK(idx.extend(1, second->generation, std::vector<Bookmark>{{21, 8200}}));
+  CHECK(idx.bookmarks(1) == std::vector<Bookmark>{{11, 4100}, {21, 8200}});
   // A plan for no table does not extend an existing one either.
-  CHECK(!idx.extend(1, 0, std::vector<ChangeFence>{{30, 12300}}));
-  CHECK(idx.fences(1).size() == 2);
+  CHECK(!idx.extend(1, 0, std::vector<Bookmark>{{30, 12300}}));
+  CHECK(idx.bookmarks(1).size() == 2);
 }
 
-TEST_CASE("ChangeIndex: a fence not a spacing past the last is dropped",
+TEST_CASE("ChangeIndex: a bookmark not a spacing past the last is dropped",
           "[change_index]") {
   ChangeIndex idx;
-  CHECK(!idx.extend(1, 0, std::vector<ChangeFence>{{5, 100}}));  // below the first spacing
+  CHECK(!idx.extend(1, 0, std::vector<Bookmark>{{5, 100}}));  // below the first spacing
   CHECK(idx.files() == 0);
-  const auto plan = idx.extend(1, 0, std::vector<ChangeFence>{{10, 4096}});
+  const auto plan = idx.extend(1, 0, std::vector<Bookmark>{{10, 4096}});
   REQUIRE(plan);
   const auto gen = plan->generation;
-  CHECK(idx.extend(1, gen, std::vector<ChangeFence>{{12, 6000}, {20, 8192}}));
-  CHECK(idx.extend(1, gen, std::vector<ChangeFence>{{20, 8192}}));  // a concurrent sweep's
-  CHECK(idx.fences(1) == std::vector<ChangeFence>{{10, 4096}, {20, 8192}});
-  CHECK(idx.bytes() == 2 * sizeof(ChangeFence));
+  CHECK(idx.extend(1, gen, std::vector<Bookmark>{{12, 6000}, {20, 8192}}));
+  CHECK(idx.extend(1, gen, std::vector<Bookmark>{{20, 8192}}));  // a concurrent scan's
+  CHECK(idx.bookmarks(1) == std::vector<Bookmark>{{10, 4096}, {20, 8192}});
+  CHECK(idx.bytes() == 2 * sizeof(Bookmark));
   idx.clear();
   CHECK(idx.files() == 0);
   CHECK(idx.bytes() == 0);
@@ -527,35 +527,35 @@ TEST_CASE("ChangeIndex: a fence not a spacing past the last is dropped",
 TEST_CASE("ChangeIndex: the least recently used table goes past max_files",
           "[change_index]") {
   ChangeIndex idx{2};
-  const auto one = idx.extend(1, 0, std::vector<ChangeFence>{{10, 4096}});
+  const auto one = idx.extend(1, 0, std::vector<Bookmark>{{10, 4096}});
   REQUIRE(one);
-  REQUIRE(idx.extend(2, 0, std::vector<ChangeFence>{{20, 4096}}));
+  REQUIRE(idx.extend(2, 0, std::vector<Bookmark>{{20, 4096}}));
   (void)idx.seek(1, 10);  // 1 is now the more recent
-  REQUIRE(idx.extend(3, 0, std::vector<ChangeFence>{{30, 4096}}));
+  REQUIRE(idx.extend(3, 0, std::vector<Bookmark>{{30, 4096}}));
   CHECK(idx.file_ids() == std::vector<std::uint32_t>{1, 3});
-  REQUIRE(idx.extend(1, one->generation, std::vector<ChangeFence>{{11, 8192}}));  // 1 again
-  REQUIRE(idx.extend(4, 0, std::vector<ChangeFence>{{40, 4096}}));
+  REQUIRE(idx.extend(1, one->generation, std::vector<Bookmark>{{11, 8192}}));  // 1 again
+  REQUIRE(idx.extend(4, 0, std::vector<Bookmark>{{40, 4096}}));
   CHECK(idx.file_ids() == std::vector<std::uint32_t>{1, 4});
 }
 
-TEST_CASE("ChangeIndex: a full table keeps every other fence and doubles its "
+TEST_CASE("ChangeIndex: a full table keeps every other bookmark and doubles its "
           "spacing",
           "[change_index]") {
   ChangeIndex idx{ChangeIndex::kMaxFiles, 4};
-  const auto plan = idx.extend(1, 0, std::vector<ChangeFence>{
+  const auto plan = idx.extend(1, 0, std::vector<Bookmark>{
                                          {1, 4096}, {2, 8192}, {3, 12288}, {4, 16384}});
   REQUIRE(plan);
   const auto gen = plan->generation;
-  CHECK(idx.fences(1) == std::vector<ChangeFence>{{1, 4096}, {3, 12288}});
+  CHECK(idx.bookmarks(1) == std::vector<Bookmark>{{1, 4096}, {3, 12288}});
   CHECK(idx.spacing(1) == 8192);
   CHECK(plan->next_offset == 12288 + 8192);
   CHECK(plan->spacing == 8192);
-  CHECK(idx.extend(1, gen, std::vector<ChangeFence>{{5, 16384}}));  // a spacing ago: dropped, table kept
-  CHECK(idx.fences(1).size() == 2);
-  CHECK(idx.extend(1, gen, std::vector<ChangeFence>{{6, 20480}, {7, 28672}}));
-  CHECK(idx.fences(1) == std::vector<ChangeFence>{{1, 4096}, {6, 20480}});
+  CHECK(idx.extend(1, gen, std::vector<Bookmark>{{5, 16384}}));  // a spacing ago: dropped, table kept
+  CHECK(idx.bookmarks(1).size() == 2);
+  CHECK(idx.extend(1, gen, std::vector<Bookmark>{{6, 20480}, {7, 28672}}));
+  CHECK(idx.bookmarks(1) == std::vector<Bookmark>{{1, 4096}, {6, 20480}});
   CHECK(idx.spacing(1) == 16384);
-  CHECK(idx.seek(1, 6) == ChangeFence{6, 20480});
+  CHECK(idx.seek(1, 6) == Bookmark{6, 20480});
 }
 
 // The reproduction on #443: one-unit slices pulled from points spread across

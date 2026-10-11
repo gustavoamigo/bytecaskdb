@@ -555,8 +555,8 @@ private:
 // min_sequence order, scanning one entry at a time via CommittedEntryIterator.
 // Yields entries with sequence > from_sequence.
 // Holds a snapshot reference to keep file descriptors open during iteration.
-// The file holding from_sequence is entered at the change index's fence
-// below it, when the index has one, and every sweep lays fences for the
+// The file holding from_sequence is entered at the change index's bookmark
+// below it, when the index has one, and every scan lays bookmarks for the
 // index as it goes (#443).
 // ---------------------------------------------------------------------------
 
@@ -1708,8 +1708,8 @@ private:
   std::shared_ptr<BufferPool> pool_;
   SizeLimits size_limits_;
   mutable Counters counters_;
-  // Fences for changes_since to enter a file near from_sequence (#443).
-  // Shared with every ChangeIterator, which hands it the fences it lays and
+  // Bookmarks for changes_since to enter a file near from_sequence (#443).
+  // Shared with every ChangeIterator, which hands it the bookmarks it lays and
   // can outlive the DB. Cleared by resume(); a file vacuum removes is
   // forgotten.
   std::shared_ptr<ChangeIndex> change_index_{std::make_shared<ChangeIndex>()};
@@ -4693,8 +4693,8 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
       {"bytecask.hint_backpressure_stall_us",
        counters_.hint_backpressure_stall_us.load(std::memory_order_relaxed)},
       // changes_since slices that looked the change index up, because their
-      // first file holds from_sequence: those that entered it at a fence,
-      // and those that swept it from its first byte. A slice starting at a
+      // first file holds from_sequence: those that entered it at a bookmark,
+      // and those that scanned it from its first byte. A slice starting at a
       // file boundary looks nothing up and counts in neither.
       {"bytecask.change_index_hits",
        change_index_->counters().hits.load(std::memory_order_relaxed)},
@@ -4706,7 +4706,7 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
       // still write, and what an open after a crash would rebuild.
       {"bytecask.hint_backlog", narrow<std::int64_t>(worker_.pending())},
       {"bytecask.open_files", open_files},
-      // Files the change index holds fences for, and the bytes they take.
+      // Files the change index holds bookmarks for, and the bytes they take.
       {"bytecask.change_index_files",
        narrow<std::int64_t>(change_index_->files())},
       {"bytecask.change_index_bytes",
@@ -4978,8 +4978,8 @@ void DB::resume() {
 #endif
   validate_state_consistency(*resumed);
   store_state(current, std::move(resumed));
-  // The fences of the file just cut all named durable units below the cut,
-  // but a cache that rebuilds from a sweep needs no argument to stay right.
+  // The bookmarks of the file just cut all named durable units below the cut,
+  // but a cache that rebuilds from a scan needs no argument to stay right.
   change_index_->clear();
   // Writers appended since the failed flush have all been told; new ones
   // start clean.
@@ -6754,9 +6754,9 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
 // within each file yields globally ascending sequence order.
 //
 // Only the first file can hold from_sequence; it is entered at the index's
-// fence below from_sequence when there is one that holds, else at its first
-// byte. Every file is swept with the index's plan for it, and the fences
-// laid are handed to the index when the sweep leaves the file or ends, so a
+// bookmark below from_sequence when there is one that holds, else at its first
+// byte. Every file is scanned with the index's plan for it, and the bookmarks
+// laid are handed to the index when the scan leaves the file or ends, so a
 // slice that stops early, or is dropped, still indexes what it crossed.
 class ChangeIterator::Impl {
 public:
@@ -6786,7 +6786,7 @@ public:
     advance_to_next_valid();
   }
 
-  ~Impl() { hand_over_fences(); }
+  ~Impl() { hand_over_bookmarks(); }
   Impl(const Impl &) = delete;
   auto operator=(const Impl &) -> Impl & = delete;
 
@@ -6828,9 +6828,9 @@ private:
         const auto& [entry, entry_off] = **entry_iter_;
         if (!in_batch_) {
           included_ = entry.sequence > from_sequence_;
-          // A fence names a durable unit boundary: nothing above the durable
+          // A bookmark names a durable unit boundary: nothing above the durable
           // sequence, which resume() may yet cut.
-          if (entry.sequence <= durable_sequence_) lay_fence(entry.sequence, entry_off);
+          if (entry.sequence <= durable_sequence_) lay_bookmark(entry.sequence, entry_off);
         }
         if (entry.entry_type == EntryType::BulkBegin) in_batch_ = true;
         else if (entry.entry_type == EntryType::BulkEnd) in_batch_ = false;
@@ -6852,7 +6852,7 @@ private:
 
       // Try next file. A batch never spans two files.
       if (file_idx_ < file_queue_.size()) {
-        hand_over_fences();
+        hand_over_bookmarks();
         const auto [min_sequence, file_id] = file_queue_[file_idx_];
         ++file_idx_;
         in_batch_ = false;
@@ -6869,29 +6869,29 @@ private:
       }
 
       // All files exhausted.
-      hand_over_fences();
+      hand_over_bookmarks();
       return;
     }
   }
 
-  // The slice ended: cut, or past durable. Its fences go to the index now,
+  // The slice ended: cut, or past durable. Its bookmarks go to the index now,
   // not when the caller is done with the slice.
   void finish() {
     done_ = true;
-    hand_over_fences();
+    hand_over_bookmarks();
   }
 
-  // Where the sweep of the file holding from_sequence_ starts: the index's
-  // fence below it, if the header there carries the fence's sequence, else
-  // the first byte, with the file's table dropped for the sweep to rebuild.
-  // A fence can only be wrong by a bug, since nothing it names moves; the
+  // Where the scan of the file holding from_sequence_ starts: the index's
+  // bookmark below it, if the header there carries the bookmark's sequence, else
+  // the first byte, with the file's table dropped for the scan to rebuild.
+  // A bookmark can only be wrong by a bug, since nothing it names moves; the
   // check costs one header read.
   auto seek(const DataFile& file) -> Offset {
     auto& counters = index_->counters();
-    if (auto fence = index_->seek(file_id_, from_sequence_)) {
-      if (fence_holds(file, *fence)) {
+    if (auto bookmark = index_->seek(file_id_, from_sequence_)) {
+      if (bookmark_holds(file, *bookmark)) {
         counters.hits.fetch_add(1, std::memory_order_relaxed);
-        return fence->offset;
+        return bookmark->offset;
       }
       index_->forget(file_id_);
       plan_ = index_->plan(file_id_);
@@ -6900,44 +6900,44 @@ private:
     return 0;
   }
 
-  static auto fence_holds(const DataFile& file, const ChangeFence& fence) -> bool {
+  static auto bookmark_holds(const DataFile& file, const Bookmark& bookmark) -> bool {
     std::array<std::byte, kHeaderSize> header;
-    if (file.read_raw(fence.offset, header) < kHeaderSize) return false;
-    return read_header(header).sequence == fence.sequence;
+    if (file.read_raw(bookmark.offset, header) < kHeaderSize) return false;
+    return read_header(header).sequence == bookmark.sequence;
   }
 
-  // A fence at the first unit boundary at or past where the plan put the
+  // A bookmark at the first unit boundary at or past where the plan put the
   // next one. The entry at offset starts a unit at or below the durable
-  // sequence. Every kHandOverFences fences are handed over on the spot, so
-  // a sweep holds at most that many (4 KiB) whatever the file's size, and
+  // sequence. Every kHandOverBookmarks bookmarks are handed over on the spot, so
+  // a scan holds at most that many (4 KiB) whatever the file's size, and
   // goes on with the plan the index returns: the table may have thinned, or
-  // another sweep may have carried it further. A sweep whose table is gone
-  // lays no more for the file: fences from the middle of a file must not
-  // start a table, which a sweep from the first byte could then never fill
+  // another scan may have carried it further. A scan whose table is gone
+  // lays no more for the file: bookmarks from the middle of a file must not
+  // start a table, which a scan from the first byte could then never fill
   // in, since plan() would start it past them.
-  static constexpr std::size_t kHandOverFences = 256;
-  void lay_fence(std::uint64_t sequence, Offset offset) {
+  static constexpr std::size_t kHandOverBookmarks = 256;
+  void lay_bookmark(std::uint64_t sequence, Offset offset) {
     if (!laying_) return;
     if (offset < plan_.next_offset) return;
-    pending_fences_.push_back({sequence, offset});
+    pending_bookmarks_.push_back({sequence, offset});
     plan_.next_offset = offset + plan_.spacing;
-    if (pending_fences_.size() >= kHandOverFences) hand_over_fences();
+    if (pending_bookmarks_.size() >= kHandOverBookmarks) hand_over_bookmarks();
   }
 
-  // Hands the fences laid in the current file to the index and takes the
+  // Hands the bookmarks laid in the current file to the index and takes the
   // plan to go on with. The index is a cache: if it cannot take them, the
-  // slice is unaffected and the next sweep lays them again.
-  void hand_over_fences() noexcept {
-    if (pending_fences_.empty()) return;
+  // slice is unaffected and the next scan lays them again.
+  void hand_over_bookmarks() noexcept {
+    if (pending_bookmarks_.empty()) return;
     try {
-      if (auto next = index_->extend(file_id_, plan_.generation, pending_fences_)) {
+      if (auto next = index_->extend(file_id_, plan_.generation, pending_bookmarks_)) {
         plan_ = *next;
       } else {
         laying_ = false;
       }
     } catch (...) {
     }
-    pending_fences_.clear();
+    pending_bookmarks_.clear();
   }
 
   // Caches the current entry. The BytesView spans point into
@@ -6966,13 +6966,13 @@ private:
   std::vector<std::pair<std::uint64_t, std::uint32_t>> file_queue_;
   std::size_t file_idx_{0};
 
-  // Current file's committed entry scanner, and the fences laid in it.
+  // Current file's committed entry scanner, and the bookmarks laid in it.
   std::optional<CommittedEntryIterator> entry_iter_;
   bool needs_advance_{false};
   std::uint32_t file_id_{0};
-  FencePlan plan_{};
-  bool laying_{false};  // false once the table this sweep extends is gone
-  std::vector<ChangeFence> pending_fences_;
+  BookmarkPlan plan_{};
+  bool laying_{false};  // false once the table this scan extends is gone
+  std::vector<Bookmark> pending_bookmarks_;
 
   // Cached current entry — BytesView into entry_iter_'s internal buffer.
   bool has_entry_{false};

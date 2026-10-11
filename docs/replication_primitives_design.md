@@ -81,7 +81,7 @@ Each file's stats track the minimum and maximum sequence of entries it contains.
 
 **Per-file sequence monotonicity invariant:** every data file (active or sealed) contains entries in strictly ascending sequence order. This is naturally true for the active file (sequences are assigned monotonically) and for sealed files produced by rotation. `vacuum_compact_file` preserves it — it scans the source file sequentially, skipping dead entries, so surviving entries retain their original order. `vacuum_remove_file` deletes the file entirely — no ordering concern. `vacuum_absorb_file` is not used — it would interleave old sequences into the active file, violating this invariant.
 
-This invariant makes `changes_since` efficient: each file is a sorted run, so the files are walked in order with no merge. Within a file, a sparse index of unit boundaries that the sweeps themselves build lets a slice enter the file holding `from_sequence` near it rather than at byte 0 (the *change index*, #443; `bytecask_design.md`, *Change index*).
+This invariant makes `changes_since` efficient: each file is a sorted run, so the files are walked in order with no merge. Within a file, a sparse index of unit boundaries that the scans themselves build lets a slice enter the file holding `from_sequence` near it rather than at byte 0 (the *change index*, #443; `bytecask_design.md`, *Change index*).
 
 ### 4. `changes_since(snap, from_sequence, max_bytes)` — one slice
 
@@ -91,7 +91,7 @@ Implementation:
 
 1. Filter files where `max_sequence > from_sequence` (using file_stats).
 2. Sort qualifying files by `min_sequence` in ascending order. The sequence-disjoint files invariant guarantees that files have non-overlapping sequence ranges.
-3. **Linear file scan:** iterate through files in sequence order. The file holding `from_sequence` is entered at the change index's last fence at or below it, when a sweep has laid one; the others at their first byte. Within each file, skip entries with `sequence <= from_sequence`. **No merge needed** — files are naturally ordered by sequence range.
+3. **Linear file scan:** iterate through files in sequence order. The file holding `from_sequence` is entered at the change index's last bookmark at or below it, when a scan has laid one; the others at their first byte. Within each file, skip entries with `sequence <= from_sequence`. **No merge needed** — files are naturally ordered by sequence range.
 4. **Lazy value fetch:** the actual value bytes are read from the data file via `pread` only when the caller consumes the entry. Deletes and range deletes require no data file read at all.
 5. **Committed entry scanning:** each per-file cursor uses `CommittedEntryIterator`, the same iterator used by `flush_hints_for` and `vacuum_scan_and_copy`. Entries between `BulkBegin` and `BulkEnd` are buffered internally; the entries (with markers) are only yielded when `BulkEnd` is seen. If the file ends without `BulkEnd`, the buffered entries are discarded — the batch was incomplete (crash during `apply_batch`). All data file scanners in the engine handle incomplete batches identically.
 
