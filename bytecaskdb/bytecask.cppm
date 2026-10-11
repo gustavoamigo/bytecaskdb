@@ -49,6 +49,7 @@ export module bytecask;
 export import :internals;
 import bytecask.batch_iterator;
 import bytecask.blind_btree;
+import bytecask.change_index;
 import bytecask.btree;
 import bytecask.concurrency;
 export import bytecask.buffer_pool;
@@ -554,6 +555,9 @@ private:
 // min_sequence order, scanning one entry at a time via CommittedEntryIterator.
 // Yields entries with sequence > from_sequence.
 // Holds a snapshot reference to keep file descriptors open during iteration.
+// The file holding from_sequence is entered at the change index's fence
+// below it, when the index has one, and every sweep lays fences for the
+// index as it goes (#443).
 // ---------------------------------------------------------------------------
 
 export class ChangeIterator {
@@ -573,6 +577,7 @@ public:
 
   // Constructor for implementation use - not part of public API
   explicit ChangeIterator(std::shared_ptr<const EngineState> state,
+                          std::shared_ptr<ChangeIndex> index,
                           std::uint64_t from_sequence,
                           std::uint64_t durable_sequence,
                           std::size_t max_bytes);
@@ -1703,6 +1708,11 @@ private:
   std::shared_ptr<BufferPool> pool_;
   SizeLimits size_limits_;
   mutable Counters counters_;
+  // Fences for changes_since to enter a file near from_sequence (#443).
+  // Shared with every ChangeIterator, which hands it the fences it lays and
+  // can outlive the DB. Cleared by resume(); a file vacuum removes is
+  // forgotten.
+  std::shared_ptr<ChangeIndex> change_index_{std::make_shared<ChangeIndex>()};
   // All mutable state — SWMR. Writers publish via atomic_store()
   // under write_mu_; readers call atomic_load() (never acquiring write_mu_).
   // Note: std::atomic<std::shared_ptr<T>> (C++20 P0718R2) is not yet
@@ -1780,6 +1790,7 @@ private:
 #ifdef BYTECASK_TESTING
 public:
   auto& test_write_group() { return write_group_; }
+  auto& test_change_index() { return *change_index_; }
   auto& test_commit_delay() { return commit_delay_; }
   // Called by flush_pending on the flushing thread just before the
   // fdatasync. Lets a test hold a flush in flight while other writers
@@ -4417,6 +4428,7 @@ void DB::vacuum_unlink_old_file(
   if (pool_) {
     pool_->release_file(file_id, old_data_file->size());
   }
+  change_index_->forget(file_id);
   counters_.vacuum_files_unlinked.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -4680,12 +4692,23 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
        counters_.hint_backpressure_stalls.load(std::memory_order_relaxed)},
       {"bytecask.hint_backpressure_stall_us",
        counters_.hint_backpressure_stall_us.load(std::memory_order_relaxed)},
+      // changes_since slices that entered their first file at a fence of the
+      // change index, and that swept it from its first byte.
+      {"bytecask.change_index_hits",
+       change_index_->counters().hits.load(std::memory_order_relaxed)},
+      {"bytecask.change_index_misses",
+       change_index_->counters().misses.load(std::memory_order_relaxed)},
       // Gauges — current state, not monotonic.
       {"bytecask.degraded", refused(*s) ? 1 : 0},
       // Sealed files whose hint is queued or being written. What close must
       // still write, and what an open after a crash would rebuild.
       {"bytecask.hint_backlog", narrow<std::int64_t>(worker_.pending())},
       {"bytecask.open_files", open_files},
+      // Files the change index holds fences for, and the bytes they take.
+      {"bytecask.change_index_files",
+       narrow<std::int64_t>(change_index_->files())},
+      {"bytecask.change_index_bytes",
+       narrow<std::int64_t>(change_index_->bytes())},
   };
 }
 
@@ -4953,6 +4976,9 @@ void DB::resume() {
 #endif
   validate_state_consistency(*resumed);
   store_state(current, std::move(resumed));
+  // The fences of the file just cut all named durable units below the cut,
+  // but a cache that rebuilds from a sweep needs no argument to stay right.
+  change_index_->clear();
   // Writers appended since the failed flush have all been told; new ones
   // start clean.
   std::lock_guard<std::mutex> lk{durable_mu_};
@@ -6724,13 +6750,21 @@ auto DB::recovery_load_streams(EngineState s, std::vector<RecoveredFile> files,
 // Files in a single-writer engine have disjoint, monotonically increasing
 // sequence ranges, so iterating files by min_sequence and scanning forward
 // within each file yields globally ascending sequence order.
+//
+// Only the first file can hold from_sequence; it is entered at the index's
+// fence below from_sequence when there is one that holds, else at its first
+// byte. Every file is swept with the index's plan for it, and the fences
+// laid are handed to the index when the sweep leaves the file or ends, so a
+// slice that stops early, or is dropped, still indexes what it crossed.
 class ChangeIterator::Impl {
 public:
   Impl(std::shared_ptr<const EngineState> state,
+       std::shared_ptr<ChangeIndex> index,
        std::uint64_t from_sequence,
        std::uint64_t durable_sequence,
        std::size_t max_bytes)
-    : state_(std::move(state)), from_sequence_(from_sequence),
+    : state_(std::move(state)), index_(std::move(index)),
+      from_sequence_(from_sequence),
       durable_sequence_(durable_sequence),
       // Counted in 64 bits whatever size_t is, so a scan past 4 GiB on a
       // 32-bit build neither wraps the count nor ends an unlimited slice.
@@ -6749,6 +6783,10 @@ public:
     // Position at first valid entry.
     advance_to_next_valid();
   }
+
+  ~Impl() { hand_over_fences(); }
+  Impl(const Impl &) = delete;
+  auto operator=(const Impl &) -> Impl & = delete;
 
   auto has_more() const -> bool { return has_entry_; }
 
@@ -6786,7 +6824,12 @@ private:
       // Try next entry in the current file.
       if (entry_iter_ && !(*entry_iter_ == std::default_sentinel)) {
         const auto& [entry, entry_off] = **entry_iter_;
-        if (!in_batch_) included_ = entry.sequence > from_sequence_;
+        if (!in_batch_) {
+          included_ = entry.sequence > from_sequence_;
+          // A fence names a durable unit boundary: nothing above the durable
+          // sequence, which resume() may yet cut.
+          if (entry.sequence <= durable_sequence_) lay_fence(entry.sequence, entry_off);
+        }
         if (entry.entry_type == EntryType::BulkBegin) in_batch_ = true;
         else if (entry.entry_type == EntryType::BulkEnd) in_batch_ = false;
         if (!included_) {
@@ -6807,12 +6850,17 @@ private:
 
       // Try next file. A batch never spans two files.
       if (file_idx_ < file_queue_.size()) {
-        auto file_id = file_queue_[file_idx_].second;
+        hand_over_fences();
+        const auto [min_sequence, file_id] = file_queue_[file_idx_];
         ++file_idx_;
         in_batch_ = false;
         auto file_ptr = state_->files.get(file_id);
         if (file_ptr) {
-          entry_iter_.emplace(DataFileIterator{**file_ptr});
+          file_id_ = file_id;
+          plan_ = index_->plan(file_id);
+          Offset start = 0;
+          if (min_sequence <= from_sequence_) start = seek(**file_ptr);
+          entry_iter_.emplace(DataFileIterator{**file_ptr, start});
         }
         continue;
       }
@@ -6820,6 +6868,52 @@ private:
       // All files exhausted.
       return;
     }
+  }
+
+  // Where the sweep of the file holding from_sequence_ starts: the index's
+  // fence below it, if the header there carries the fence's sequence, else
+  // the first byte, with the file's table dropped for the sweep to rebuild.
+  // A fence can only be wrong by a bug, since nothing it names moves; the
+  // check costs one header read.
+  auto seek(const DataFile& file) -> Offset {
+    auto& counters = index_->counters();
+    if (auto fence = index_->seek(file_id_, from_sequence_)) {
+      if (fence_holds(file, *fence)) {
+        counters.hits.fetch_add(1, std::memory_order_relaxed);
+        return fence->offset;
+      }
+      index_->forget(file_id_);
+      plan_ = index_->plan(file_id_);
+    }
+    counters.misses.fetch_add(1, std::memory_order_relaxed);
+    return 0;
+  }
+
+  static auto fence_holds(const DataFile& file, const ChangeFence& fence) -> bool {
+    std::array<std::byte, kHeaderSize> header;
+    if (file.read_raw(fence.offset, header) < kHeaderSize) return false;
+    return read_header(header).sequence == fence.sequence;
+  }
+
+  // A fence at the first unit boundary at or past where the plan put the
+  // next one. The entry at offset starts a unit at or below the durable
+  // sequence.
+  void lay_fence(std::uint64_t sequence, Offset offset) {
+    if (offset < plan_.next_offset) return;
+    pending_fences_.push_back({sequence, offset});
+    plan_.next_offset = offset + plan_.spacing;
+  }
+
+  // Hands the fences laid in the current file to the index. The index is a
+  // cache: if it cannot take them, the slice is unaffected and the next
+  // sweep lays them again.
+  void hand_over_fences() noexcept {
+    if (pending_fences_.empty()) return;
+    try {
+      index_->extend(file_id_, pending_fences_);
+    } catch (...) {
+    }
+    pending_fences_.clear();
   }
 
   // Caches the current entry. The BytesView spans point into
@@ -6835,6 +6929,7 @@ private:
   }
 
   std::shared_ptr<const EngineState> state_;
+  std::shared_ptr<ChangeIndex> index_;
   std::uint64_t from_sequence_;
   std::uint64_t durable_sequence_;
   std::uint64_t max_bytes_;
@@ -6847,9 +6942,12 @@ private:
   std::vector<std::pair<std::uint64_t, std::uint32_t>> file_queue_;
   std::size_t file_idx_{0};
 
-  // Current file's committed entry scanner.
+  // Current file's committed entry scanner, and the fences laid in it.
   std::optional<CommittedEntryIterator> entry_iter_;
   bool needs_advance_{false};
+  std::uint32_t file_id_{0};
+  FencePlan plan_{};
+  std::vector<ChangeFence> pending_fences_;
 
   // Cached current entry — BytesView into entry_iter_'s internal buffer.
   bool has_entry_{false};
@@ -6858,11 +6956,12 @@ private:
 
 // ChangeIterator methods
 ChangeIterator::ChangeIterator(std::shared_ptr<const EngineState> state,
+                               std::shared_ptr<ChangeIndex> index,
                                std::uint64_t from_sequence,
                                std::uint64_t durable_sequence,
                                std::size_t max_bytes)
-  : impl_(std::make_unique<Impl>(std::move(state), from_sequence,
-                                 durable_sequence, max_bytes)) {}
+  : impl_(std::make_unique<Impl>(std::move(state), std::move(index),
+                                 from_sequence, durable_sequence, max_bytes)) {}
 
 ChangeIterator::~ChangeIterator() = default;
 
@@ -6894,8 +6993,8 @@ auto DB::changes_since(const Snapshot& snap, std::uint64_t from_sequence,
   if (load_state()->closed) throw DbClosed{};
   auto state = snap.state();
   ChangeHeader header{state->marker_at(from_sequence), from_sequence};
-  auto begin =
-      ChangeIterator{state, from_sequence, state->durable_seq, max_bytes};
+  auto begin = ChangeIterator{state, change_index_, from_sequence,
+                              state->durable_seq, max_bytes};
   return {header, {std::move(begin), std::default_sentinel}};
 }
 

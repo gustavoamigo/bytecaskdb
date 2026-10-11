@@ -11790,9 +11790,13 @@ TEST_CASE("stats: all expected keys are present in dump",
       "bytecask.degraded_transitions",
       "bytecask.hint_backpressure_stalls",
       "bytecask.hint_backpressure_stall_us",
+      "bytecask.change_index_hits",
+      "bytecask.change_index_misses",
       "bytecask.degraded",
       "bytecask.hint_backlog",
       "bytecask.open_files",
+      "bytecask.change_index_files",
+      "bytecask.change_index_bytes",
   };
   for (const auto &name : expected) {
     CHECK(s.contains(name));
