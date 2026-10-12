@@ -274,9 +274,9 @@ void ha_bytecaskdb::seed_rowid_counter_if_needed() const {
 }
 
 // Seeds the autoinc counter on first open of a PK table with AUTO_INCREMENT.
-// Finds the key holding the largest leading PK value — the last stored key,
-// or the first when that part is DESC and stored inverted — restores it into
-// a scratch buffer, then reads the autoinc field value.
+// Restores the last stored key into a scratch buffer and reads the autoinc
+// field from it. When the autoinc column is the leading PK part and DESC, its
+// largest value is stored inverted at the front, so the first key is read.
 void ha_bytecaskdb::seed_autoinc_counter_if_needed() const {
   if (catalog_peek_autoinc(table_id_) != 0) { return; }
 
@@ -301,7 +301,10 @@ void ha_bytecaskdb::seed_autoinc_counter_if_needed() const {
     }
   };
 
-  if (codec_.keys[pk_idx].parts.at(0).desc) {
+  const bool autoinc_leads_desc = table->s->next_number_index == pk_idx &&
+                                  table->s->next_number_keypart == 0 &&
+                                  codec_.keys[pk_idx].parts.at(0).desc;
+  if (autoinc_leads_desc) {
     auto lower = table_id_prefix(table_id_);
     for (auto &k : snap.keys_from({}, as_view(lower))) {
       if (key_belongs_to_table(u8_data(k), k.size(), table_id_)) { read_hw(k); }

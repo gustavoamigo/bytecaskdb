@@ -140,7 +140,8 @@ lexicographically sortable. The plugin applies a post-processing step
   transform, so ranges and ordered scans need nothing else. A table with
   DESC parts created before this encoding stored them ascending: rebuild it
   with `ALTER TABLE t FORCE` (its rows hold every column, so the copy reads
-  them correctly).
+  them correctly). A `VARCHAR` primary-key part still keeps its length
+  prefix and sorts by length first, ASC or DESC (#459).
 
 The inverse (`undo_mem_comparable`) is applied by `decode_pk()` before
 calling `key_restore()` to recover the native key format.

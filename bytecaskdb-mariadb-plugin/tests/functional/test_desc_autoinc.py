@@ -3,7 +3,9 @@
 #
 # test_desc_autoinc.py — the AUTO_INCREMENT counter is seeded from the largest
 # stored id after a restart when the primary key is DESC (#456): its keys are
-# stored largest first, so the seed reads the first key, not the last.
+# stored largest first, so the seed reads the first key, not the last. A DESC
+# part ahead of the AUTO_INCREMENT column does not move where its largest
+# value is stored within a group.
 
 import os
 
@@ -23,6 +25,11 @@ def test_desc_pk_autoinc_seeds_after_restart():
                 "CREATE TABLE desc_ai.t (id INT NOT NULL AUTO_INCREMENT, v INT,"
                 " PRIMARY KEY (id DESC)) ENGINE=bytecaskdb")
             cur.execute("INSERT INTO desc_ai.t (v) VALUES (1), (2), (3)")
+            cur.execute(
+                "CREATE TABLE desc_ai.c (a INT NOT NULL,"
+                " b INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (a DESC, b))"
+                " ENGINE=bytecaskdb")
+            cur.execute("INSERT INTO desc_ai.c (a) VALUES (1), (1), (1)")
         conn.close()
 
         server.restart()
@@ -32,6 +39,9 @@ def test_desc_pk_autoinc_seeds_after_restart():
             cur.execute("INSERT INTO desc_ai.t (v) VALUES (4)")
             cur.execute("SELECT id, v FROM desc_ai.t ORDER BY id")
             assert cur.fetchall() == ((1, 1), (2, 2), (3, 3), (4, 4))
+            cur.execute("INSERT INTO desc_ai.c (a) VALUES (1)")
+            cur.execute("SELECT a, b FROM desc_ai.c ORDER BY b")
+            assert cur.fetchall() == ((1, 1), (1, 2), (1, 3), (1, 4))
         conn.close()
     finally:
         server.cleanup()
