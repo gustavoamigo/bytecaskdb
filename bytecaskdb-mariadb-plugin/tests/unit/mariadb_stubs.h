@@ -185,6 +185,7 @@ struct TABLE_SHARE {
   uint fields{0};
   uint keys{0};
   uint32_t rec_buff_length{0};
+  uint next_number_index{0};
   uint next_number_keypart{0};
 };
 
