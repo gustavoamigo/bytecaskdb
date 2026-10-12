@@ -122,9 +122,9 @@ jobs:
         if: ${{ always() && !cancelled() }}
         uses: codecov/codecov-action@v5
         with:
-          files: |
-            ./test-results/bytecask_tests.xml
-            ./test-results/btree_tests.xml
+          # Comma-separated: the action passes a multi-line value to the CLI
+          # as one path, which it cannot find.
+          files: ./test-results/bytecask_tests.xml,./test-results/btree_tests.xml
           report_type: test_results
           flags: cpp
           name: bytecask-cpp-tests
@@ -301,9 +301,9 @@ jobs:
         if: ${{ always() && !cancelled() }}
         uses: codecov/codecov-action@v5
         with:
-          files: |
-            ./test-results/mariadb_plugin_ctest.xml
-            ./test-results/mariadb_plugin_functional.xml
+          # Comma-separated: the action passes a multi-line value to the CLI
+          # as one path, which it cannot find.
+          files: ./test-results/mariadb_plugin_ctest.xml,./test-results/mariadb_plugin_functional.xml
           report_type: test_results
           flags: mariadb-plugin
           name: mariadb-plugin-tests
