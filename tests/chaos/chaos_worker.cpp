@@ -209,10 +209,11 @@ auto recover(bytecask::DB &db, Channel &ch, std::mt19937_64 &rng, bool on_stop)
 
 // strict_reads: the run injects nothing that can make a read fail (no read
 // faults, evictions or descriptor limit), so an I/O error on a read is the
-// engine's, not the filesystem's.
+// engine's, not the filesystem's. alloc_limited: the life runs under the
+// rig's address-space limit, so a read may honestly fail to allocate.
 void reader_loop(const bytecask::DB &db, Channel &ch, std::uint64_t seed,
                  const std::atomic<std::uint64_t> &issued, int id,
-                 bool strict_reads) {
+                 bool strict_reads, bool alloc_limited) {
   std::mt19937_64 rng{seed + 100 + static_cast<std::uint64_t>(id)};
   const auto own = std::format("{:016x}.", seed);
   bytecask::Bytes out;
@@ -237,6 +238,14 @@ void reader_loop(const bytecask::DB &db, Channel &ch, std::uint64_t seed,
         }
       }
     } catch (const bytecask::DbDegraded &) {
+    } catch (const std::bad_alloc &e) {
+      // A read that cannot allocate throws (README, Crash safety); without
+      // the limit nothing the rig does makes one fail to allocate.
+      if (!alloc_limited)
+        ch.text(FrameType::Violation,
+                std::format("get({}) failed to allocate with no address-space "
+                            "limit: {}",
+                            key, e.what()));
     } catch (const std::system_error &e) {
       // An I/O error on a read is an honest failure, unless nothing in the
       // run can make a read fail.
@@ -262,7 +271,8 @@ void reader_loop(const bytecask::DB &db, Channel &ch, std::uint64_t seed,
 // engine failing, so it exits as out of memory.
 auto start_threads(bytecask::DB *db, Channel &ch, const Config &cfg,
                    std::uint64_t seed, const std::atomic<std::uint64_t> &issued,
-                   bool strict_reads) -> std::vector<std::jthread> {
+                   bool strict_reads, bool alloc_limited)
+    -> std::vector<std::jthread> {
   std::vector<std::jthread> threads;
   try {
     if (cfg.vacuum) {
@@ -283,8 +293,9 @@ auto start_threads(bytecask::DB *db, Channel &ch, const Config &cfg,
       });
     }
     for (int i = 0; i < cfg.readers; ++i)
-      threads.emplace_back([db, &ch, seed, &issued, i, strict_reads] {
-        reader_loop(*db, ch, seed, issued, i, strict_reads);
+      threads.emplace_back([db, &ch, seed, &issued, i, strict_reads,
+                            alloc_limited] {
+        reader_loop(*db, ch, seed, issued, i, strict_reads, alloc_limited);
       });
   } catch (const std::system_error &) {
     std::_Exit(5);
@@ -329,6 +340,14 @@ void lift_limits() {
     r.rlim_cur = r.rlim_max;
     ::setrlimit(resource, &r);
   }
+}
+
+// Whether the life runs under the rig's address-space limit: one set by the
+// orchestrator before exec (soft below hard), or one the worker sets once open.
+auto alloc_limited(const RunLimits &l) -> bool {
+  rlimit r{};
+  ::getrlimit(RLIMIT_AS, &r);
+  return l.as_headroom > 0 || r.rlim_cur < r.rlim_max;
 }
 
 void apply_run_limits(const RunLimits &l) {
@@ -389,7 +408,8 @@ auto run_open(bytecask::DB &db_ref, Channel &ch, const Config &cfg,
   }
 
   std::atomic<std::uint64_t> issued{0};
-  auto threads = start_threads(db, ch, cfg, seed, issued, limits.strict_reads);
+  auto threads = start_threads(db, ch, cfg, seed, issued, limits.strict_reads,
+                               alloc_limited(limits));
   apply_run_limits(limits);
 
   std::uint64_t value_id = 0;

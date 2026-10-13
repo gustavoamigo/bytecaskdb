@@ -331,7 +331,8 @@ Where the first version differs from the design above, and why.
   arenas reserved at startup, and the limit never bites after open. A
   `std::bad_alloc` from a write is recorded like an I/O error, as an unknown
   outcome the next View settles, so the rig checks the engine's exception
-  safety as well. One that escapes a background thread reaches the worker's
+  safety as well. One from a reader's `get` is an honest failure, as the
+  contract allows; without the limit it is a violation. One that escapes a background thread reaches the worker's
   terminate handler, which exits with code 5, the one abort the invariants
   allow. The worker lifts its limits on SIGTERM, since the clean close runs
   with every hazard lifted. The ASan leg disables `RLIMIT_AS`. The cgroup
