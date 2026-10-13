@@ -2,11 +2,11 @@ create_manifest publishes a healthy state when its rotation seals the
 active file and cannot create the next one. Reverts 362cc590.
 Guarded-by: "prove_manifest__*"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index 9f42cec..07de31e 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -4801,7 +4801,7 @@ auto DB::create_manifest() -> FileManifest {
+diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
+index dcda96c..87f3001 100644
+--- a/bytecaskdb/db_replication.cpp
++++ b/bytecaskdb/db_replication.cpp
+@@ -144,7 +144,7 @@ auto DB::create_manifest() -> FileManifest {
      try {
        rotation = prepare_rotation(t);
      } catch (...) {

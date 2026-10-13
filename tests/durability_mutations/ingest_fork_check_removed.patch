@@ -4,11 +4,11 @@ promoted leader, or an old leader rejoining with unreplicated writes,
 keeps its own entries and silently takes the new leader's later ones (#397).
 Guarded-by: "promoting the less advanced follower forks the one ahead"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index 590490e..b660a82 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -6982,7 +6982,7 @@ void DB::ingest(const ChangeHeader &header,
+diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
+index dcda96c..f0b1088 100644
+--- a/bytecaskdb/db_replication.cpp
++++ b/bytecaskdb/db_replication.cpp
+@@ -324,7 +324,7 @@ void DB::ingest(const ChangeHeader &header,
      if (e.entry_type == EntryType::ChangeMarker)
        source = {e.sequence, decode_marker_id(e.value)};
    }

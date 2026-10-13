@@ -4,11 +4,11 @@ no later fdatasync (#231), so the next sync write moves durable_sequence over
 writes a power cut then loses. Reverts #282 (#281).
 Guarded-by: "create_manifest whose fdatasync fails degrades, and a power cut keeps everything below durable_sequence"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..c423b3d2 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -4417,8 +4417,9 @@ auto DB::create_manifest() -> FileManifest {
+diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
+index dcda96c..cd37595 100644
+--- a/bytecaskdb/db_replication.cpp
++++ b/bytecaskdb/db_replication.cpp
+@@ -136,8 +136,9 @@ auto DB::create_manifest() -> FileManifest {
  
      // Make every entry durable before sealing. A failure degrades: the pages
      // it left clean are written by no later fdatasync (#231, #281).
@@ -18,4 +18,4 @@ index e0317da8..c423b3d2 100644
 +    t.apply_sync(max_seq);
  
      // Seal active file, dispatch hint generation, open new active.
-     try {
+     PreparedRotation rotation;

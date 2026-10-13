@@ -1,11 +1,11 @@
 ingest ignores a failed final fdatasync and publishes the slice as durable.
 Guarded-by: "prove_repl__*"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index 9f42cec..68ef8cc 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -6791,10 +6791,7 @@ void DB::ingest(std::span<const DataEntryView> entries) {
+diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
+index dcda96c..07cd6b0 100644
+--- a/bytecaskdb/db_replication.cpp
++++ b/bytecaskdb/db_replication.cpp
+@@ -458,10 +458,7 @@ void DB::ingest(const ChangeHeader &header,
        t.active_file().sync();
        t.apply_sync(t.next_seq() - 1);
      } catch (...) {

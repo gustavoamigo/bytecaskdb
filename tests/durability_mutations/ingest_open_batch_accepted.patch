@@ -3,11 +3,11 @@ is published, and a rotation after the slice seals its BulkBegin into a file
 with no BulkEnd, so a reopen drops entries the follower synced (#188).
 Guarded-by: "ingest refuses a slice that ends inside an atomic batch"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index 3838253..8b00e8f 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -6658,7 +6658,7 @@ void DB::ingest(std::span<const DataEntryView> entries) {
+diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
+index dcda96c..ff0a920 100644
+--- a/bytecaskdb/db_replication.cpp
++++ b/bytecaskdb/db_replication.cpp
+@@ -285,7 +285,7 @@ void DB::ingest(const ChangeHeader &header,
    // A slice published as given would expose half a batch, and a rotation
    // after it would seal the BulkBegin into a file with no BulkEnd: recovery
    // then drops entries this follower acknowledged and synced (#188).
