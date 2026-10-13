@@ -29,6 +29,7 @@ typedef uint64_t ha_rows;
 // MariaDB key flags.
 #define HA_NOSAME 1
 #define HA_BLOB_PART 4
+#define HA_REVERSE_SORT 128
 #define HA_KEY_BLOB_LENGTH 2
 
 // MariaDB error codes used by the handler.
@@ -184,6 +185,7 @@ struct TABLE_SHARE {
   uint fields{0};
   uint keys{0};
   uint32_t rec_buff_length{0};
+  uint next_number_index{0};
   uint next_number_keypart{0};
 };
 

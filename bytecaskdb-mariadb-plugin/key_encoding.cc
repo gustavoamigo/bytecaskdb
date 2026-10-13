@@ -392,7 +392,17 @@ KeyPartPlan make_key_part_plan(TABLE *table, const KEY_PART_INFO &kp) {
   } else if (is_float_type(rt)) {
     p.flip = KeyPartPlan::Flip::kFloat;
   }
+#ifdef HA_REVERSE_SORT  // DESC key parts exist from MariaDB 10.8
+  p.desc = (kp.key_part_flag & HA_REVERSE_SORT) != 0;
+#endif
   return p;
+}
+
+// Inverts a DESC part's stored bytes; its own inverse, so it both applies and
+// undoes the descending order. A search key may end inside the part.
+void invert_desc_part(uint8_t *p, const uint8_t *end, const KeyPartPlan &kp) {
+  const uint8_t *part_end = std::min<const uint8_t *>(p + kp.store_length, end);
+  for (; p < part_end; ++p) *p = static_cast<uint8_t>(~*p);
 }
 
 } // namespace
@@ -422,6 +432,7 @@ void make_mem_comparable(uint8_t *key_data, const KeyPlan &plan, uint key_len) {
       if (kp.nullable) {
         p[0] ^= 0x01;
       }
+      if (kp.desc) invert_desc_part(p, end, kp);
       p += kp.store_length;
       continue;
     }
@@ -450,6 +461,7 @@ void make_mem_comparable(uint8_t *key_data, const KeyPlan &plan, uint key_len) {
       p[0] ^= 0x01;
     }
 
+    if (kp.desc) invert_desc_part(p, end, kp);
     p += kp.store_length;
   }
 }
@@ -460,6 +472,7 @@ void undo_mem_comparable(uint8_t *key_data, const KeyPlan &plan, uint key_len) {
 
   for (const auto &kp : plan.parts) {
     if (p >= end) break;
+    if (kp.desc) invert_desc_part(p, end, kp);
     if (kp.varlen) {
       if (kp.nullable) {
         p[0] ^= 0x01;
@@ -518,6 +531,9 @@ bool decode_sec_key_into_record(const KeyPlan &plan,
     uint8_t tmp[16];
     if (kp.length > sizeof(tmp)) return false;
     std::memcpy(tmp, p, kp.length);
+    if (kp.desc) {
+      for (uint j = 0; j < kp.length; ++j) tmp[j] = static_cast<uint8_t>(~tmp[j]);
+    }
 
     if (kp.reverse) {
       if (kp.flip == KeyPartPlan::Flip::kSign) {

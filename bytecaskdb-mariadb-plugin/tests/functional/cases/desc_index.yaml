@@ -1,0 +1,87 @@
+# desc_index.yaml — DESC key parts (#456): ranges and ordered scans return the
+# same rows as on an ASC key.
+
+- name: DESC primary key ranges and ordered scans
+  setup:
+    - DROP DATABASE IF EXISTS desc1
+    - CREATE DATABASE desc1
+    - CREATE TABLE desc1.t (id INT NOT NULL, v INT, PRIMARY KEY (id DESC)) ENGINE=bytecaskdb
+    - INSERT INTO desc1.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 100) SELECT n, n * 10 FROM s
+  steps:
+    - sql: SELECT COUNT(*), MIN(id), MAX(id) FROM desc1.t WHERE id BETWEEN 10 AND 20
+      expected: [['11', '10', '20']]
+    - sql: SELECT id FROM desc1.t WHERE id BETWEEN 10 AND 13 ORDER BY id
+      expected: [['10'], ['11'], ['12'], ['13']]
+    - sql: SELECT id FROM desc1.t WHERE id BETWEEN 10 AND 13 ORDER BY id DESC
+      expected: [['13'], ['12'], ['11'], ['10']]
+    - sql: SELECT id FROM desc1.t WHERE id > 96 ORDER BY id DESC
+      expected: [['100'], ['99'], ['98'], ['97']]
+    - sql: SELECT id FROM desc1.t WHERE id < 4 ORDER BY id
+      expected: [['1'], ['2'], ['3']]
+    - sql: SELECT id FROM desc1.t FORCE INDEX (PRIMARY) WHERE id >= 30 AND id < 35 ORDER BY id
+      expected: [['30'], ['31'], ['32'], ['33'], ['34']]
+    - sql: SELECT id FROM desc1.t ORDER BY id DESC LIMIT 3
+      expected: [['100'], ['99'], ['98']]
+    - sql: SELECT id FROM desc1.t ORDER BY id LIMIT 3
+      expected: [['1'], ['2'], ['3']]
+    - sql: SELECT v FROM desc1.t WHERE id = 42
+      expected: [['420']]
+    - sql: SELECT MIN(id), MAX(id) FROM desc1.t
+      expected: [['1', '100']]
+  teardown:
+    - DROP DATABASE IF EXISTS desc1
+
+- name: DESC secondary index ranges, NULLs and covering reads
+  setup:
+    - DROP DATABASE IF EXISTS desc2
+    - CREATE DATABASE desc2
+    - CREATE TABLE desc2.t (id INT PRIMARY KEY, b INT, c VARCHAR(8), INDEX ib (b DESC), INDEX ic (c DESC)) ENGINE=bytecaskdb
+    - INSERT INTO desc2.t VALUES (1, -5, 'a'), (2, 0, 'ab'), (3, 7, 'b'), (4, NULL, NULL), (5, 3, ''), (6, -1, 'ba')
+  steps:
+    - sql: SELECT b FROM desc2.t FORCE INDEX (ib) WHERE b BETWEEN -1 AND 7 ORDER BY b DESC
+      expected: [['7'], ['3'], ['0'], ['-1']]
+    - sql: SELECT b FROM desc2.t FORCE INDEX (ib) WHERE b < 1 ORDER BY b
+      expected: [['-5'], ['-1'], ['0']]
+    - sql: SELECT b FROM desc2.t FORCE INDEX (ib) ORDER BY b
+      expected: [[null], ['-5'], ['-1'], ['0'], ['3'], ['7']]
+    - sql: SELECT id FROM desc2.t FORCE INDEX (ib) WHERE b IS NULL
+      expected: [['4']]
+    - sql: SELECT id FROM desc2.t FORCE INDEX (ib) WHERE b = 3
+      expected: [['5']]
+    - sql: SELECT c FROM desc2.t FORCE INDEX (ic) WHERE c >= 'ab' ORDER BY c DESC
+      expected: [['ba'], ['b'], ['ab']]
+    - sql: SELECT c FROM desc2.t FORCE INDEX (ic) WHERE c < 'b' ORDER BY c
+      expected: [[''], ['a'], ['ab']]
+  teardown:
+    - DROP DATABASE IF EXISTS desc2
+
+- name: Mixed ASC/DESC composite key
+  setup:
+    - DROP DATABASE IF EXISTS desc3
+    - CREATE DATABASE desc3
+    - CREATE TABLE desc3.t (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b DESC)) ENGINE=bytecaskdb
+    - INSERT INTO desc3.t VALUES (1, 1), (1, 2), (1, 3), (2, 1), (2, 2), (3, 5)
+  steps:
+    - sql: SELECT a, b FROM desc3.t ORDER BY a, b DESC
+      expected: [['1', '3'], ['1', '2'], ['1', '1'], ['2', '2'], ['2', '1'], ['3', '5']]
+    - sql: SELECT b FROM desc3.t WHERE a = 1 AND b >= 2 ORDER BY b
+      expected: [['2'], ['3']]
+    - sql: SELECT b FROM desc3.t WHERE a = 2 ORDER BY b DESC
+      expected: [['2'], ['1']]
+    - sql: SELECT a, b FROM desc3.t WHERE a >= 2 ORDER BY a DESC, b
+      expected: [['3', '5'], ['2', '1'], ['2', '2']]
+  teardown:
+    - DROP DATABASE IF EXISTS desc3
+
+- name: AUTO_INCREMENT on a DESC primary key
+  setup:
+    - DROP DATABASE IF EXISTS desc4
+    - CREATE DATABASE desc4
+    - CREATE TABLE desc4.t (id INT NOT NULL AUTO_INCREMENT, v INT, PRIMARY KEY (id DESC)) ENGINE=bytecaskdb
+    - INSERT INTO desc4.t (v) VALUES (1), (2), (3)
+  steps:
+    - sql: INSERT INTO desc4.t (v) VALUES (4)
+    - sql: SELECT id, v FROM desc4.t ORDER BY id DESC LIMIT 2
+      expected: [['4', '4'], ['3', '3']]
+  teardown:
+    - DROP DATABASE IF EXISTS desc4
