@@ -2,7 +2,7 @@ create_manifest syncs the active file with a bare fdatasync, and a failure
 throws without degrading. The pages the failed sync left clean are written by
 no later fdatasync (#231), so the next sync write moves durable_sequence over
 writes a power cut then loses. Reverts #282 (#281).
-Guarded-by: "create_manifest whose fdatasync fails degrades, and a power cut keeps everything below durable_sequence"
+Guarded-by: "create_manifest whose fdatasync fails degrades\, and a power cut keeps everything below durable_sequence"
 
 diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
 index dcda96c..cd37595 100644
