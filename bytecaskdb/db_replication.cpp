@@ -4,11 +4,15 @@
 // ByteCaskDB — replication: mode changes, manifests, changes_since and ingest
 
 module;
+#include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <format>
+#include <iterator>
 #include <memory>
 #include <random>
 #include <span>
