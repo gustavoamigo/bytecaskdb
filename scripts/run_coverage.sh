@@ -24,13 +24,17 @@ XMAKE_P=(-P "$PROJECT_DIR")
 # change_index.cppm is not listed: it has no decision with two or more
 # conditions, so the build records no MC/DC for it, and the report refuses a
 # required file without data. The engine's implementation units
-# (bytecaskdb/db_*.cpp, split out of bytecask.cppm, #331) are required by
-# glob, so code moved out of the interface stays under the gate; the glob
-# is expanded in PROJECT_DIR, as the script may run from anywhere.
+# (bytecaskdb/*.cpp but the PIMPL header's unit, the set add_engine_files()
+# in xmake.lua compiles; split out of bytecask.cppm, #331) are required when
+# they hold a decision of two or more conditions, which needs && or ||: so
+# code moved out of the interface stays under the gate, and a unit joins it
+# when it gains one. Expanded in PROJECT_DIR, as the script may run from
+# anywhere.
 MCDC_REQUIRED=(bytecaskdb/data_file.cppm bytecaskdb/hint_file.cppm
                bytecaskdb/bytecask.cppm bytecaskdb/change_iterator.cppm)
 mapfile -t -O "${#MCDC_REQUIRED[@]}" MCDC_REQUIRED \
-    < <(cd "$PROJECT_DIR" && printf '%s\n' bytecaskdb/db_*.cpp)
+    < <(cd "$PROJECT_DIR" &&
+        grep -lE '&&|\|\|' bytecaskdb/*.cpp | grep -vx bytecaskdb/bytecask_hpp.cpp)
 MCDC_MAX_EXEMPT=2
 
 # Configure and build with coverage instrumentation

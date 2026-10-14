@@ -1573,8 +1573,9 @@ of two or more conditions; a single condition is branch coverage's.
 **The gate.** `scripts/run_coverage.sh` builds the coverage binaries with
 `-fcoverage-mcdc`, and `scripts/mcdc_report.py` fails the `coverage` CI job
 unless every condition in `data_file.cppm`, `hint_file.cppm`,
-`bytecask.cppm` and the engine's implementation units (`db_*.cpp`, split
-out of it) — the write path, recovery and vacuum — is covered or exempt. Elsewhere MC/DC is reported, not gated; the key directory modules
+`bytecask.cppm` and the engine's implementation units split out of it
+(those holding a decision of two or more conditions) — the write path,
+recovery and vacuum — is covered or exempt. Elsewhere MC/DC is reported, not gated; the key directory modules
 are #357.
 
 **Merged per build.** The engine suite runs on all three key directories, and
