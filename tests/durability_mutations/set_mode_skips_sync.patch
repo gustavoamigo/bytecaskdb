@@ -3,11 +3,11 @@ durable_sequence, are never shipped, and the next leader reuses their
 sequences. Reverts #190.
 Guarded-by: "set_mode(Follower) makes unsynced acknowledged writes durable"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index 590490e..38a54c3 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -4700,7 +4700,7 @@ void DB::set_mode(Mode mode) {
+diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
+index dcda96c..e81f448 100644
+--- a/bytecaskdb/db_replication.cpp
++++ b/bytecaskdb/db_replication.cpp
+@@ -51,7 +51,7 @@ void DB::set_mode(Mode mode) {
    const auto last_seq = t.next_seq() > 0 ? t.next_seq() - 1 : 0;
    if (mode == Mode::Follower) {
      if (!refused(*current) && t.durable_seq() < last_seq) {

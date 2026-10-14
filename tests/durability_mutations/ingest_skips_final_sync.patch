@@ -2,11 +2,11 @@ ingest publishes a slice and its durable_sequence without syncing it, so a
 power cut loses entries a follower reported durable.
 Guarded-by: "prove_repl__*"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index 9f42cec..0175ac2 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -6788,7 +6788,6 @@ void DB::ingest(std::span<const DataEntryView> entries) {
+diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
+index dcda96c..6535d6d 100644
+--- a/bytecaskdb/db_replication.cpp
++++ b/bytecaskdb/db_replication.cpp
+@@ -455,7 +455,6 @@ void DB::ingest(const ChangeHeader &header,
  
      // Final sync: ensure last chunk is durable before publishing.
      try {
