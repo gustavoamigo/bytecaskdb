@@ -2,11 +2,11 @@ Compaction drops BulkBegin/BulkEnd markers, so a compacted batch is no
 longer atomic at recovery. Reverts BC-197.
 Guarded-by: "vacuum preserves BulkBegin/BulkEnd markers"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..6c39bda1 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -3885,6 +3885,7 @@ auto DB::vacuum_scan_and_copy(
+diff --git a/bytecaskdb/db_vacuum.cpp b/bytecaskdb/db_vacuum.cpp
+index 056e1d5..db55552 100644
+--- a/bytecaskdb/db_vacuum.cpp
++++ b/bytecaskdb/db_vacuum.cpp
+@@ -167,6 +167,7 @@ auto DB::vacuum_scan_and_copy(
      }
      case EntryType::BulkBegin:
      case EntryType::BulkEnd:

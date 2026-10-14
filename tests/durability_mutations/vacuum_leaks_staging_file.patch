@@ -2,11 +2,11 @@ A compaction that fails before its rename leaves its .data.tmp behind, one
 full copy per retry under a persistent fault. Reverts #247 (#235).
 Guarded-by: "prove_vacuum_compact__*"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index 729c047..b336e1b 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -3974,7 +3974,7 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
+diff --git a/bytecaskdb/db_vacuum.cpp b/bytecaskdb/db_vacuum.cpp
+index 056e1d5..224be5d 100644
+--- a/bytecaskdb/db_vacuum.cpp
++++ b/bytecaskdb/db_vacuum.cpp
+@@ -264,7 +264,7 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
    // source at open; it must not replace the exception in flight.
    struct CopyCleanup {
      std::vector<std::filesystem::path> paths;

@@ -3,11 +3,11 @@ while the files are installed in the transient, and publishes it half
 rotated. Reverts #364.
 Guarded-by: "refuse writes: a rotation that fails in memory publishes nothing"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index 9f42cec..186e0d5 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -3417,6 +3417,7 @@ void DB::commit_appended(TransientEngineState &t,
+diff --git a/bytecaskdb/db_commit.cpp b/bytecaskdb/db_commit.cpp
+index 07f87ad..26a5919 100644
+--- a/bytecaskdb/db_commit.cpp
++++ b/bytecaskdb/db_commit.cpp
+@@ -309,6 +309,7 @@ void DB::commit_appended(TransientEngineState &t,
    PreparedRotation rotation;
    try {
      rotation = prepare_rotation(t);

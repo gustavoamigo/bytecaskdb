@@ -3,11 +3,11 @@ unpublished tail, so a power cut can bring the tail back into a sealed file,
 where a later hint rebuild refuses it.
 Guarded-by: "resume() stays degraded when the sync after its truncate fails"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..277c57af 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -4340,7 +4340,6 @@ void DB::resume() {
+diff --git a/bytecaskdb/db_degraded.cpp b/bytecaskdb/db_degraded.cpp
+index ad938b0..2fe0bc4 100644
+--- a/bytecaskdb/db_degraded.cpp
++++ b/bytecaskdb/db_degraded.cpp
+@@ -173,7 +173,6 @@ void DB::resume() {
  #ifdef BYTECASK_TESTING
    FAULT_INJECTION(io_resume_sync);
  #endif

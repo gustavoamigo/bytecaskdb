@@ -3,11 +3,11 @@ breaking durability-before-visibility. Named in #92's acceptance list.
 Expected: caught.
 Guarded-by: "pipeline: sync write is invisible until its fdatasync returns; a writer appended behind it lands in the next flush"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index 9f42cec..d24a24d 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -3477,6 +3477,9 @@ void DB::flush_pending() {
+diff --git a/bytecaskdb/db_commit.cpp b/bytecaskdb/db_commit.cpp
+index 07f87ad..fc4006b 100644
+--- a/bytecaskdb/db_commit.cpp
++++ b/bytecaskdb/db_commit.cpp
+@@ -365,6 +365,9 @@ void DB::flush_pending() {
    // already, by flushes that did not sync them.
    if (head->next_seq <= published->next_seq && !need_sync) return;
  
@@ -17,7 +17,7 @@ index 9f42cec..d24a24d 100644
    if (need_sync) {
  #ifdef BYTECASK_TESTING
      if (test_before_flush_sync_) test_before_flush_sync_();
-@@ -3497,13 +3500,6 @@ void DB::flush_pending() {
+@@ -385,13 +388,6 @@ void DB::flush_pending() {
  #ifdef BYTECASK_TESTING
    if (test_before_publish_) test_before_publish_();
  #endif

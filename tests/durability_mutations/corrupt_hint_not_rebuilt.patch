@@ -2,11 +2,11 @@ A hint that fails its CRC or a read is not rebuilt from its data file: open
 refuses (strict) or skips the file and its keys (lenient). Reverts #123.
 Guarded-by: "DB recovery: a corrupt hint is rebuilt from its data file"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..e2662df1 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -3665,7 +3665,7 @@ auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
+diff --git a/bytecaskdb/db_rotation.cpp b/bytecaskdb/db_rotation.cpp
+index 79e54d3..9715789 100644
+--- a/bytecaskdb/db_rotation.cpp
++++ b/bytecaskdb/db_rotation.cpp
+@@ -117,7 +117,7 @@ auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
    try {
      return HintFile::OpenForRead(hint_path);
    } catch (const std::exception &e) {

@@ -2,11 +2,11 @@ A failed append fails its batch but leaves the engine healthy, so the next
 write appends after the bytes the failed one left. Reverts BC-163.
 Guarded-by: "*__group_append_fails"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..bad6f110 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -3102,7 +3102,7 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
+diff --git a/bytecaskdb/db_commit.cpp b/bytecaskdb/db_commit.cpp
+index 07f87ad..81530fd 100644
+--- a/bytecaskdb/db_commit.cpp
++++ b/bytecaskdb/db_commit.cpp
+@@ -215,7 +215,7 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
          "append IO error on '{}': call resume() to recover.",
          file.path().string()));
      counters_.io_errors.fetch_add(1, std::memory_order_relaxed);

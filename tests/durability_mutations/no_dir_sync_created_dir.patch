@@ -2,11 +2,11 @@ open creates the database directory without syncing its parent, so a power
 cut can lose the directory and every file in it. Reverts #200's site (#199).
 Guarded-by: "directory sync: open syncs each directory it creates"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..faa7f101 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -2662,7 +2662,7 @@ DB::DB(std::filesystem::path dir, Options opts)
+diff --git a/bytecaskdb/db.cpp b/bytecaskdb/db.cpp
+index c06da65..dd01e41 100644
+--- a/bytecaskdb/db.cpp
++++ b/bytecaskdb/db.cpp
+@@ -88,7 +88,7 @@ DB::DB(std::filesystem::path dir, Options opts)
    }
    std::filesystem::create_directories(dir_);
    for (const auto &p : created)

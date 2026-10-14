@@ -5,11 +5,11 @@ bytes that are not on disk. Reverts #240's resume() half (#231).
 Expected: caught.
 Guarded-by: "resume() makes durable what it publishes after a failed fdatasync"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index aab1a99e..c960aad7 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -4221,7 +4221,6 @@ void DB::resume() {
+diff --git a/bytecaskdb/db_degraded.cpp b/bytecaskdb/db_degraded.cpp
+index ad938b0..1992b77 100644
+--- a/bytecaskdb/db_degraded.cpp
++++ b/bytecaskdb/db_degraded.cpp
+@@ -89,7 +89,6 @@ void DB::resume() {
    // return durable before the scan reads it (throws → stays degraded). Up to
    // the logical end, where the scan stops: past it lie only the zero-filled
    // preallocation and the bytes of an append that failed.

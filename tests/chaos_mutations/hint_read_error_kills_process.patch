@@ -6,11 +6,11 @@ the mapping.
 Expected: caught.
 Guarded-by: "DB::open rebuilds a hint file a read fails on"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index baca3a34..c364a8e0 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -3665,6 +3665,7 @@ auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
+diff --git a/bytecaskdb/db_rotation.cpp b/bytecaskdb/db_rotation.cpp
+index 79e54d3..5f39452 100644
+--- a/bytecaskdb/db_rotation.cpp
++++ b/bytecaskdb/db_rotation.cpp
+@@ -117,6 +117,7 @@ auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
    try {
      return HintFile::OpenForRead(hint_path);
    } catch (const std::exception &e) {

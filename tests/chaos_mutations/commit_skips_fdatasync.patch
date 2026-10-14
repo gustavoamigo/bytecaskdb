@@ -3,13 +3,13 @@ sync write returns durable = true with its bytes only in the page cache.
 Expected: caught.
 Guarded-by: "a sync write survives a power cut as soon as it returns"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index aab1a99e..8272b9d7 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -3221,7 +3221,6 @@ void DB::flush_pending() {
-     if (test_before_flush_sync_) test_before_flush_sync_();
- #endif
+diff --git a/bytecaskdb/db_commit.cpp b/bytecaskdb/db_commit.cpp
+index 07f87ad..7500ea7 100644
+--- a/bytecaskdb/db_commit.cpp
++++ b/bytecaskdb/db_commit.cpp
+@@ -372,7 +372,6 @@ void DB::flush_pending() {
+     commit_delay_.on_sync_start();
+     const auto sync_start = std::chrono::steady_clock::now();
      try {
 -      static_cast<WritableDataFile &>(head->active_file()).sync();
        counters_.fsyncs.fetch_add(1, std::memory_order_relaxed);

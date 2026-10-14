@@ -2,11 +2,11 @@ Compaction stops at the first damaged entry instead of failing, publishes a
 copy of what came before it, and unlinks the original. Reverts #136.
 Guarded-by: "DB vacuum: a damaged sealed file is not compacted away"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..03f08915 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -3898,7 +3898,8 @@ auto DB::vacuum_scan_and_copy(
+diff --git a/bytecaskdb/db_vacuum.cpp b/bytecaskdb/db_vacuum.cpp
+index 056e1d5..ca4db71 100644
+--- a/bytecaskdb/db_vacuum.cpp
++++ b/bytecaskdb/db_vacuum.cpp
+@@ -180,7 +180,8 @@ auto DB::vacuum_scan_and_copy(
      }
    };
  

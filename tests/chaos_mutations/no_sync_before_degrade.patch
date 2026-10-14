@@ -2,11 +2,11 @@ A failed append degrades without first syncing what the page cache holds
 (classes B1-B3). resume() now rewrites and syncs the tail before it trusts
 it (#240), so nothing it publishes depends on that sync.
 Expected: NOT caught.
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index aab1a99e..3bc3f195 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -3084,7 +3084,6 @@ void DB::execute_slots(std::vector<Slot *> &batch) {
+diff --git a/bytecaskdb/db_commit.cpp b/bytecaskdb/db_commit.cpp
+index 07f87ad..80e223f 100644
+--- a/bytecaskdb/db_commit.cpp
++++ b/bytecaskdb/db_commit.cpp
+@@ -207,7 +207,6 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
      file.append_entries(all_entries, io_offsets);
    } catch (...) {
      auto ex = std::current_exception();

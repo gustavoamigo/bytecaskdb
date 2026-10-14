@@ -7,15 +7,15 @@ Disable: power,sigkill
 Expected: caught.
 Guarded-by: "close() throws when its fdatasync fails, closes all the same, and a reopen recovers what was durable"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index aab1a99e..ac0af9a2 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -2783,7 +2783,6 @@ void DB::close() {
+diff --git a/bytecaskdb/db.cpp b/bytecaskdb/db.cpp
+index c06da65..725beff 100644
+--- a/bytecaskdb/db.cpp
++++ b/bytecaskdb/db.cpp
+@@ -227,7 +227,6 @@ void DB::close() {
      ::close(lock_fd_);
      lock_fd_ = -1;
    }
 -  if (error) std::rethrow_exception(error);
  }
  
- #pragma endregion
+ // Writes the value for key into out, reusing its existing capacity to
