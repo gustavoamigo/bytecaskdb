@@ -3,11 +3,11 @@ at the other hint-less files, so damage that leaves two such files, a
 zeroed first header beside a torn newest file, is cut as two torn tails.
 Guarded-by: "DB recovery: a hint-less file's tail is truncated only in the newest file"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index 4f27cdd..e3ea5ef 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -5061,7 +5061,7 @@ void DB::recovery_check_tail(
+diff --git a/bytecaskdb/db_recovery.cpp b/bytecaskdb/db_recovery.cpp
+index ec428ae..641b509 100644
+--- a/bytecaskdb/db_recovery.cpp
++++ b/bytecaskdb/db_recovery.cpp
+@@ -331,7 +331,7 @@ void DB::recovery_check_tail(
      }
      auto hint = other;
      hint.replace_extension(".hint");

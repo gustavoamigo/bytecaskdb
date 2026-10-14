@@ -6,11 +6,11 @@ the hint points at. Reverts #240's open half (#231).
 Expected: caught.
 Guarded-by: "open makes a hint-less file durable before it indexes it: a process killed before its sync"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index aab1a99e..7e0b29c8 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -4880,7 +4880,6 @@ auto DB::recovery_prepare_files(EngineState &s)
+diff --git a/bytecaskdb/db_recovery.cpp b/bytecaskdb/db_recovery.cpp
+index ec428ae..424c1dd 100644
+--- a/bytecaskdb/db_recovery.cpp
++++ b/bytecaskdb/db_recovery.cpp
+@@ -229,7 +229,6 @@ auto DB::recovery_prepare_files(EngineState &s)
      // durable before anything reads them — every hint-less file, since none
      // of them says which one was active.
      // No writer says where its entries end, so the whole file.
@@ -18,9 +18,9 @@ index aab1a99e..7e0b29c8 100644
      auto data_file =
          openDataFileForRead(p, io_backend_, pool_, file_id);
  
-@@ -4895,7 +4894,7 @@ auto DB::recovery_prepare_files(EngineState &s)
-       });
-       if (end && *end < std::filesystem::file_size(p)) {
+@@ -246,7 +245,7 @@ auto DB::recovery_prepare_files(EngineState &s)
+       // end of what it indexed.
+       if (end.value() < std::filesystem::file_size(p)) {
          data_file.reset();
 -        truncate_durably(p, *end);
 +        std::filesystem::resize_file(p, *end);
