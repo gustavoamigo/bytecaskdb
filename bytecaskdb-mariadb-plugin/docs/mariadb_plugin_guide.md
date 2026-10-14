@@ -139,19 +139,24 @@ lexicographically sortable. The plugin applies a post-processing step
 - **Padding** follows the collation. A PAD SPACE collation compares a
   shorter value as if padded with spaces, so `'a\0b'` sorts before `'a'`:
   such a part is padded with spaces, its trailing spaces having been
-  trimmed already, so equal padded bytes mean equal values. Under NO PAD or
-  a binary collation it is padded with zero bytes, and the PK's length puts
-  the shorter of `'a'` and `'a\0'` first, as the server does. A LIKE
+  trimmed already, so equal padded bytes mean equal values. Both trimming
+  and padding work in whole spaces of the column's charset (`00 20` in
+  `ucs2`/`utf16`, `00 00 00 20` in `utf32`), read once from the charset;
+  trimming `0x20` bytes, as format 0 does, would cut a `U+2020` in two.
+  Under NO PAD or a binary collation the part is padded with zero bytes,
+  and the PK's length puts the shorter of `'a'` and `'a\0'` first, as the
+  server does. A LIKE
   range's synthetic lower bound (zero bytes to the full length under a
   non-binary PAD SPACE collation) then lands where the server expects it.
 - **Formats.** Tables keep the encoding they were created with: the catalog
   records a `key_format` per table. One created before it existed
   (format 0) keeps the length-prefixed PK, which sorts by length first, and
-  zero-padded secondary keys, until `ALTER TABLE t FORCE` rebuilds it
-  (#459).
+  zero-padded secondary keys, trimmed by `0x20` byte, until
+  `ALTER TABLE t FORCE` rebuilds it (#459).
 - **Collation weights are not applied.** Keys hold bytes, so under a case-
-  or accent-insensitive collation they sort, match and enforce uniqueness
-  by byte, not by the collation (#468).
+  or accent-insensitive collation, or `utf16le` (whose bytes are not in
+  code-point order), they sort, match and enforce uniqueness by byte, not
+  by the collation (#468).
 - **DESC key parts** (`HA_REVERSE_SORT`): after the transform above, every
   byte of the part, null indicator included, is inverted. The server reads
   a DESC part as descending, NULLs last, and expects `index_first` /

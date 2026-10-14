@@ -98,3 +98,33 @@
       expected: [['1', '61'], ['1', ''], ['1', '01'], ['0', '7A']]
   teardown:
     - DROP DATABASE IF EXISTS vco6
+
+- name: Multibyte PAD SPACE charsets pad and trim by whole spaces
+  setup:
+    - DROP DATABASE IF EXISTS vco7
+    - CREATE DATABASE vco7
+    - CREATE TABLE vco7.p2 (v VARCHAR(8) CHARACTER SET ucs2 COLLATE ucs2_bin NOT NULL, PRIMARY KEY (v)) ENGINE=bytecaskdb
+    - CREATE TABLE vco7.s2 (id INT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(8) CHARACTER SET utf16 COLLATE utf16_bin NOT NULL, KEY kv (v)) ENGINE=bytecaskdb
+    - CREATE TABLE vco7.p4 (v VARCHAR(8) CHARACTER SET utf32 COLLATE utf32_bin NOT NULL, PRIMARY KEY (v)) ENGINE=bytecaskdb
+    - INSERT INTO vco7.p2 (v) VALUES ('ab'), ('a'), ('b')
+    - INSERT INTO vco7.s2 (v) VALUES ('ab'), ('a'), ('b')
+    - INSERT INTO vco7.p4 (v) VALUES ('ab'), ('a'), ('b')
+  steps:
+    - sql: SELECT HEX(v) FROM vco7.p2 FORCE INDEX (PRIMARY) ORDER BY v
+      expected: [['0061'], ['00610062'], ['0062']]
+    - sql: SELECT HEX(v) FROM vco7.p2 FORCE INDEX (PRIMARY) WHERE v > 'a' ORDER BY v
+      expected: [['00610062'], ['0062']]
+    - sql: SELECT HEX(v) FROM vco7.s2 FORCE INDEX (kv) ORDER BY v
+      expected: [['0061'], ['00610062'], ['0062']]
+    - sql: SELECT HEX(v) FROM vco7.s2 FORCE INDEX (kv) WHERE v > 'a' ORDER BY v
+      expected: [['00610062'], ['0062']]
+    - sql: SELECT HEX(v) FROM vco7.p4 FORCE INDEX (PRIMARY) WHERE v > 'a' ORDER BY v
+      expected: [['0000006100000062'], ['00000062']]
+    # 'a ' equals 'a' under PAD SPACE; 'a' followed by U+2020 does not.
+    - sql: INSERT INTO vco7.p2 (v) VALUES ('a ')
+      error: 1062
+    - sql: INSERT INTO vco7.p2 (v) VALUES (CONCAT('a', _utf8mb4 X'E280A0'))
+    - sql: SELECT COUNT(*) FROM vco7.p2
+      expected: [['4']]
+  teardown:
+    - DROP DATABASE IF EXISTS vco7

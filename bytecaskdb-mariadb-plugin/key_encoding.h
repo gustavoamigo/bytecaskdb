@@ -37,6 +37,11 @@ struct KeyPartPlan {
   bool varchar{false};        // VARCHAR column
   bool varlen{false};         // VARCHAR or BLOB part: no byte transform
   bool pad_space{false};      // varlen under a PAD SPACE collation
+  // A space in the column's charset: 0x20, 00 20 in ucs2/utf16, 20 00 in
+  // utf16le, 00 00 00 20 in utf32. Format 1 trims and pads by whole spaces;
+  // space_len 0 (charset could not encode one) leaves the value unpadded.
+  uint8_t space[4]{0x20, 0, 0, 0};
+  uint8_t space_len{1};
   bool be_temporal{false};    // DATETIME2/TIMESTAMP2/TIME2: big-endian already
   bool reverse{false};        // little-endian in the record: stored reversed
   Flip flip{Flip::kNone};     // applied with reverse
@@ -50,8 +55,9 @@ struct KeyPlan {
   // part sorts by value and still restores exactly.
   bool varlen_length_last{false};
   // kKeyFormatValueOrderedPk, every key: a VARCHAR or BLOB part under a PAD
-  // SPACE collation is padded with spaces, not zero bytes, so it sorts as
-  // the collation compares it ('a\0b' before 'a').
+  // SPACE collation has its trailing spaces trimmed, and is padded, by whole
+  // characters of its charset, so it sorts as the collation compares it
+  // ('a\0b' before 'a'). Format 0 trims 0x20 bytes and pads with zeros.
   bool space_pad{false};
 };
 

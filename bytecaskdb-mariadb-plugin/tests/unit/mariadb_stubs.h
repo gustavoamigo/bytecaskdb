@@ -192,11 +192,16 @@ struct TABLE_SHARE {
 // Minimal CHARSET_INFO stub.
 #define MY_CS_BINSORT 16
 #define MY_CS_NOPAD 0x2000
+struct CHARSET_INFO;
+struct MY_CHARSET_HANDLER {
+  int (*wc_mb)(const CHARSET_INFO *, unsigned long, uchar *, uchar *);
+};
 struct CHARSET_INFO {
   uint number{0};
   uint state{0};
   uint mbminlen{1};
   uint mbmaxlen{1};
+  const MY_CHARSET_HANDLER *cset{nullptr};
 };
 
 struct Field {

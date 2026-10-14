@@ -1390,6 +1390,56 @@ TEST_CASE("VARCHAR primary-key parts sort by value and restore exactly",
             std::vector<uint8_t>{'a', 0, 0, 0, 0, 0});
   }
 
+  SECTION("two-byte PAD SPACE charset: trims and pads by whole spaces") {
+    static const MY_CHARSET_HANDLER ucs2_handler{
+        [](const CHARSET_INFO *, unsigned long wc, uchar *s, uchar *e) {
+          if (e - s < 2) return 0;
+          s[0] = static_cast<uchar>(wc >> 8);
+          s[1] = static_cast<uchar>(wc & 0xFF);
+          return 2;
+        }};
+    static CHARSET_INFO ucs2_cs{90, 0, 2, 2, &ucs2_handler};  // ucs2_bin
+    struct Ucs2VarcharField : Field {
+      enum_field_types type() const override { return MYSQL_TYPE_VARCHAR; }
+      const CHARSET_INFO *charset() const override { return &ucs2_cs; }
+    } g;
+    OneKeyTable u(g, 8, false);  // four characters
+    u.part.store_length = 8 + HA_KEY_BLOB_LENGTH;
+    u.key.key_length = u.part.store_length;
+    const TableCodec codec = make_table_codec(&u.tbl, kKeyFormatCurrent);
+    const KeyPlan &plan = codec.keys[0];
+    REQUIRE(plan.parts.at(0).space_len == 2);
+    auto ucs2 = [](std::initializer_list<uint16_t> units) {
+      std::string out;
+      for (uint16_t c : units) {
+        out.push_back(static_cast<char>(c >> 8));
+        out.push_back(static_cast<char>(c & 0xFF));
+      }
+      return out;
+    };
+    auto pk = [&](const std::string &v) {
+      std::vector<uint8_t> k(u.part.store_length, 0);
+      k[0] = static_cast<uint8_t>(v.size());
+      std::memcpy(k.data() + 2, v.data(), v.size());
+      normalize_padspace_pk(k.data(), plan);
+      make_mem_comparable(k.data(), plan, static_cast<uint>(k.size()));
+      return k;
+    };
+    // As InnoDB orders them under ucs2_bin.
+    REQUIRE(pk(ucs2({0x61, 0x01})) < pk(ucs2({0x61})));
+    REQUIRE(pk(ucs2({0x61})) < pk(ucs2({0x61, 0x62})));
+    REQUIRE(pk(ucs2({0x61, 0x62})) < pk(ucs2({0x62})));
+    // A trailing space is one 00 20 unit; U+2020 is not a space.
+    REQUIRE(pk(ucs2({0x61, 0x20})) == pk(ucs2({0x61})));
+    REQUIRE(pk(ucs2({0x61, 0x2020})) != pk(ucs2({0x61})));
+    // Restores exactly.
+    auto k = pk(ucs2({0x61, 0x62}));
+    undo_mem_comparable(k.data(), plan, static_cast<uint>(k.size()));
+    REQUIRE(k[0] == 4);
+    REQUIRE(std::string(reinterpret_cast<char *>(k.data()) + 2, 4) ==
+            ucs2({0x61, 0x62}));
+  }
+
   SECTION("format 0 keeps the length prefix its rows were written with") {
     const TableCodec codec =
         make_table_codec(&t.tbl, kKeyFormatLengthPrefixedPk);
