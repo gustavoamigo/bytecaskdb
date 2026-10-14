@@ -1180,7 +1180,7 @@ std::size_t ha_bytecaskdb::build_search_key(uint idx, const uchar *key,
   std::memcpy(kp, key, prefix_len);
 
   // The fix-ups walk every key part; the zero-filled unsupplied parts read
-  // as empty and are left as zeros. The transform is limited to the
+  // as empty, and are reset to zeros below. The transform is limited to the
   // supplied prefix (whole parts), so only those bytes are rewritten.
   if (on_pk) {
     normalize_padspace_pk(kp, codec_.keys[idx]);
@@ -1188,6 +1188,10 @@ std::size_t ha_bytecaskdb::build_search_key(uint idx, const uchar *key,
     fix_varchar_key_encoding(kp, codec_.keys[idx]);
   }
   make_mem_comparable(kp, codec_.keys[idx], prefix_len);
+  // The fix-ups pad an unsupplied VARCHAR part as a stored key would (with
+  // spaces under PAD SPACE); a low bound needs zero bytes there, below every
+  // stored key sharing the prefix.
+  std::memset(kp + prefix_len, 0, key_len - prefix_len);
 
   if (pad_high) {
     std::memset(kp + prefix_len, 0xFF, key_len - prefix_len);

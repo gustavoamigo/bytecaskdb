@@ -83,3 +83,18 @@
       expected: [['61'], ['6100'], ['610062'], ['6101'], ['6162']]
   teardown:
     - DROP DATABASE IF EXISTS vco5
+- name: Composite secondary index, lookup on its leading part only
+  setup:
+    - DROP DATABASE IF EXISTS vco6
+    - CREATE DATABASE vco6
+    - CREATE TABLE vco6.t (id INT AUTO_INCREMENT PRIMARY KEY, a INT NOT NULL, v VARCHAR(8) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL, KEY kav (a, v)) ENGINE=bytecaskdb
+    - INSERT INTO vco6.t (a, v) VALUES (1, CHAR(1)), (1, ''), (1, 'a'), (2, CHAR(1)), (0, 'z')
+  steps:
+    - sql: SELECT HEX(v) FROM vco6.t FORCE INDEX (kav) WHERE a = 1 ORDER BY v
+      expected: [['01'], [''], ['61']]
+    - sql: SELECT a, HEX(v) FROM vco6.t FORCE INDEX (kav) WHERE a >= 1 ORDER BY a, v
+      expected: [['1', '01'], ['1', ''], ['1', '61'], ['2', '01']]
+    - sql: SELECT a, HEX(v) FROM vco6.t FORCE INDEX (kav) WHERE a <= 1 ORDER BY a DESC, v DESC
+      expected: [['1', '61'], ['1', ''], ['1', '01'], ['0', '7A']]
+  teardown:
+    - DROP DATABASE IF EXISTS vco6
