@@ -3,11 +3,11 @@ without checking, and the smaller one is deleted whatever it holds.
 Reverts #137's check.
 Guarded-by: "recovery refuses two different writes under one sequence"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..a42000af 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -4861,7 +4861,7 @@ void DB::recovery_undo_interrupted_vacuum(const std::filesystem::path &a,
+diff --git a/bytecaskdb/db_recovery.cpp b/bytecaskdb/db_recovery.cpp
+index ec428ae..7d953f7 100644
+--- a/bytecaskdb/db_recovery.cpp
++++ b/bytecaskdb/db_recovery.cpp
+@@ -167,7 +167,7 @@ void DB::recovery_undo_interrupted_vacuum(const std::filesystem::path &a,
        std::filesystem::file_size(a) <= std::filesystem::file_size(b);
    const auto &copy = a_smaller ? a : b;
    const auto &source = a_smaller ? b : a;

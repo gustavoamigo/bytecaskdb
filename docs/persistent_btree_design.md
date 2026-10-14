@@ -369,7 +369,7 @@ instead, and `merge` is left as the two-way primitive the API promises.
 
 ### Range-partitioned recovery
 
-`DB::recovery_load_ranged` (`bytecask.cppm`, selected by
+`DB::recovery_load_ranged` (`db_recovery.cpp`, selected by
 `BYTECASK_USE_BTREE`) replaces the fold with a partition:
 
 1. Round-robin the hint files to `W` workers; each builds its own tree,
