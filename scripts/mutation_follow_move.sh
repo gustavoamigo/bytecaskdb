@@ -45,21 +45,30 @@ for patch in "$@"; do
     status=1
     continue
   fi
-  git -C "$wt" diff HEAD -- "$from" |
-    sed -e "s|a/$from|a/$to|g" -e "s|b/$from|b/$to|g" -e '/^index /d' \
-      > "$tmp"
-  (cd "$wt" && "$merge" revert "$patch" >/dev/null 2>&1)
+  if ! git -C "$wt" diff HEAD -- "$from" |
+      sed -e "s|a/$from|a/$to|g" -e "s|b/$from|b/$to|g" -e '/^index /d' \
+        > "$tmp" ||
+     ! (cd "$wt" && "$merge" revert "$patch" >/dev/null 2>&1); then
+    # The worktree may still hold this patch: stop before it skews the next.
+    echo "mutation_follow_move: $patch: cannot diff or revert it at $base" >&2
+    exit 1
+  fi
   if ! git apply "$tmp" >/dev/null 2>&1; then
     echo "mutation_follow_move: $patch does not apply to $to" >&2
     status=1
     continue
   fi
-  {
-    sed '/^diff --git /,$d' "$patch"
-    git diff -- "$to"
-  } > "$tmp.new"
-  git checkout -q HEAD -- "$to"
-  mv "$tmp.new" "$patch"
+  if ! { sed '/^diff --git /,$d' "$patch" && git diff -- "$to"; } \
+       > "$tmp.new" ||
+     ! grep -q '^diff --git ' "$tmp.new"; then
+    git checkout -q HEAD -- "$to"
+    echo "mutation_follow_move: $patch: cannot record the new diff" >&2
+    exit 1
+  fi
+  if ! git checkout -q HEAD -- "$to" || ! mv "$tmp.new" "$patch"; then
+    echo "mutation_follow_move: $patch: cannot restore $to or write the patch" >&2
+    exit 1
+  fi
   echo "mutation_follow_move: $patch now targets $to"
 done
 exit "$status"
