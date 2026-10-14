@@ -194,7 +194,7 @@ int PluginTestHarness::update_row(const std::vector<int32_t> &old_vals,
   // current_row_key_ as if a prior read had positioned the cursor.
   std::vector<uchar> old_buf(share_.reclength, 0);
   fill_record(old_buf.data(), old_vals);
-  auto old_key = encode_pk(&table_, make_table_codec(&table_), old_buf.data(), table_id_);
+  auto old_key = encode_pk(&table_, make_table_codec(&table_, kKeyFormatCurrent), old_buf.data(), table_id_);
   handler_->set_current_row_key(old_key);
 
   // Encode new record into record[0].
@@ -206,7 +206,7 @@ int PluginTestHarness::update_row(const std::vector<int32_t> &old_vals,
 int PluginTestHarness::delete_row(const std::vector<int32_t> &column_values) {
   // Simulate the read-before-delete protocol.
   fill_record(record_buf_.data(), column_values);
-  auto key = encode_pk(&table_, make_table_codec(&table_), record_buf_.data(), table_id_);
+  auto key = encode_pk(&table_, make_table_codec(&table_, kKeyFormatCurrent), record_buf_.data(), table_id_);
   handler_->set_current_row_key(key);
 
   return handler_->delete_row(record_buf_.data());
@@ -275,7 +275,7 @@ void PluginTestHarness::inject_concurrent_write(
   }
 
   // Encode the PK for this row.
-  auto key = encode_pk(&table_, make_table_codec(&table_), buf.data(), table_id_);
+  auto key = encode_pk(&table_, make_table_codec(&table_, kKeyFormatCurrent), buf.data(), table_id_);
 
   // Write directly to the DB, bypassing the transaction — this creates
   // a concurrent modification that the harness's snapshot won't see.

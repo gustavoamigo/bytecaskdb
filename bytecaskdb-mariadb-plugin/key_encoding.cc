@@ -381,6 +381,8 @@ KeyPartPlan make_key_part_plan(TABLE *table, const KEY_PART_INFO &kp) {
   if (p.varlen) {
     const CHARSET_INFO *cs = field->charset();
     p.pad_space = cs != nullptr && !(cs->state & MY_CS_NOPAD);
+    p.shorter_first =
+        cs == nullptr || (cs->state & (MY_CS_BINSORT | MY_CS_NOPAD)) != 0;
   }
   const auto rt = field->real_type();
   p.be_temporal = is_new_temporal_be(rt);
@@ -398,6 +400,40 @@ KeyPartPlan make_key_part_plan(TABLE *table, const KEY_PART_INFO &kp) {
   return p;
 }
 
+// A VARCHAR or BLOB slot as key_copy() writes it: a 2-byte little-endian
+// length, then up to kp.length bytes. Rewritten in place, in the same width,
+// as the bytes zero-padded to kp.length and then a big-endian length, so the
+// part sorts by value. Values whose padded bytes are equal differ only in
+// trailing zero bytes; which comes first follows the collation, the way the
+// server builds a LIKE range's lower bound: a binary-sort or NO PAD
+// collation gives it the prefix's own length and orders the shorter value
+// first, so the length is stored as is; a PAD SPACE collation pads it with
+// zero bytes to the full length and orders 'a\0' before 'a', so the length
+// is stored complemented and the longer value sorts first.
+void move_length_last(uint8_t *slot, const KeyPartPlan &kp) {
+  uint16_t length = static_cast<uint16_t>(slot[0] | (slot[1] << 8));
+  if (length > kp.length) length = static_cast<uint16_t>(kp.length);
+  std::memmove(slot, slot + HA_KEY_BLOB_LENGTH, length);
+  std::memset(slot + length, 0, kp.length - length);
+  const auto stored =
+      static_cast<uint16_t>(kp.shorter_first ? length : 0xFFFF - length);
+  slot[kp.length]     = static_cast<uint8_t>(stored >> 8);
+  slot[kp.length + 1] = static_cast<uint8_t>(stored & 0xFF);
+}
+
+// Inverse of move_length_last: back to key_copy()'s layout for key_restore().
+void move_length_first(uint8_t *slot, const KeyPartPlan &kp) {
+  const auto stored = static_cast<uint16_t>((slot[kp.length] << 8) |
+                                            slot[kp.length + 1]);
+  uint16_t length =
+      kp.shorter_first ? stored : static_cast<uint16_t>(0xFFFF - stored);
+  if (length > kp.length) length = static_cast<uint16_t>(kp.length);
+  std::memmove(slot + HA_KEY_BLOB_LENGTH, slot, length);
+  std::memset(slot + HA_KEY_BLOB_LENGTH + length, 0, kp.length - length);
+  slot[0] = static_cast<uint8_t>(length & 0xFF);
+  slot[1] = static_cast<uint8_t>(length >> 8);
+}
+
 // Inverts a DESC part's stored bytes; its own inverse, so it both applies and
 // undoes the descending order. A search key may end inside the part.
 void invert_desc_part(uint8_t *p, const uint8_t *end, const KeyPartPlan &kp) {
@@ -407,7 +443,7 @@ void invert_desc_part(uint8_t *p, const uint8_t *end, const KeyPartPlan &kp) {
 
 } // namespace
 
-TableCodec make_table_codec(TABLE *table) {
+TableCodec make_table_codec(TABLE *table, uint8_t key_format) {
   TableCodec codec;
   codec.row = make_row_plan(table);
   codec.keys.resize(table->s->keys);
@@ -419,6 +455,12 @@ TableCodec make_table_codec(TABLE *table) {
       parts.push_back(make_key_part_plan(table, key.key_part[i]));
     }
   }
+  // Secondary keys drop the length altogether (fix_varchar_key_encoding);
+  // only the primary key, which must restore, carries it.
+  const uint pk = table->s->primary_key;
+  if (pk != MAX_KEY && key_format >= kKeyFormatValueOrderedPk) {
+    codec.keys[pk].varlen_length_last = true;
+  }
   return codec;
 }
 
@@ -429,6 +471,9 @@ void make_mem_comparable(uint8_t *key_data, const KeyPlan &plan, uint key_len) {
   for (const auto &kp : plan.parts) {
     if (p >= end) break;
     if (kp.varlen) {
+      if (plan.varlen_length_last) {
+        move_length_last(p + (kp.nullable ? 1 : 0), kp);
+      }
       if (kp.nullable) {
         p[0] ^= 0x01;
       }
@@ -476,6 +521,9 @@ void undo_mem_comparable(uint8_t *key_data, const KeyPlan &plan, uint key_len) {
     if (kp.varlen) {
       if (kp.nullable) {
         p[0] ^= 0x01;
+      }
+      if (plan.varlen_length_last) {
+        move_length_first(p + (kp.nullable ? 1 : 0), kp);
       }
       p += kp.store_length;
       continue;

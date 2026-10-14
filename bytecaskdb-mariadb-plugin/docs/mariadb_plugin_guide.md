@@ -128,10 +128,25 @@ lexicographically sortable. The plugin applies a post-processing step
   negative numbers and zero.
 - **New temporal types** (DATETIME2, TIMESTAMP2, TIME2): already stored
   big-endian by `key_copy()` — no transformation needed.
-- **VARCHAR and BLOB prefix keys**: handled by `fix_varchar_key_encoding`
-  which strips the 2-byte LE length prefix and left-justifies data with
-  zero padding. Skipped by `make_mem_comparable` since they're already
-  in correct lexicographic order after the fix.
+- **VARCHAR and BLOB prefix keys, secondary indexes**: handled by
+  `fix_varchar_key_encoding`, which strips the 2-byte LE length prefix and
+  left-justifies the data with zero padding. The PK suffix tells apart
+  values that differ only in trailing zero bytes.
+- **VARCHAR and BLOB prefix keys, primary key**: the key must restore
+  (`decode_pk`, the AUTO_INCREMENT seed) and must keep `'a'` and `'a\0'`
+  apart, so the length stays, but `make_mem_comparable` moves it behind the
+  zero-padded bytes, big-endian, in the same slot. The part then sorts by
+  value. Of two values whose padded bytes are equal, a binary-sort or NO PAD
+  collation puts the shorter first and a PAD SPACE collation the longer
+  (its length is stored complemented), which is how the server orders them
+  and how it builds a LIKE range's lower bound: at the prefix's own length
+  in the first case, zero-padded to the full length in the second. A
+  `_bin` collation is binary-sort but PAD SPACE, and orders such a pair
+  shorter-first, the reverse of the server; nothing else is affected.
+  Tables keep the encoding they were created with: the catalog records a
+  `key_format` per table, and one created before it existed (format 0)
+  keeps the length prefix, and with it the length-first order, until
+  `ALTER TABLE t FORCE` rebuilds it (#459).
 - **DESC key parts** (`HA_REVERSE_SORT`): after the transform above, every
   byte of the part, null indicator included, is inverted. The server reads
   a DESC part as descending, NULLs last, and expects `index_first` /
@@ -140,8 +155,7 @@ lexicographically sortable. The plugin applies a post-processing step
   transform, so ranges and ordered scans need nothing else. A table with
   DESC parts created before this encoding stored them ascending: rebuild it
   with `ALTER TABLE t FORCE` (its rows hold every column, so the copy reads
-  them correctly). A `VARCHAR` primary-key part still keeps its length
-  prefix and sorts by length first, ASC or DESC (#459).
+  them correctly).
 
 The inverse (`undo_mem_comparable`) is applied by `decode_pk()` before
 calling `key_restore()` to recover the native key format.
@@ -425,13 +439,14 @@ is freed (#294).
 | Integer index ordering (all widths) | Done | Mem-comparable encoding with sign-flip |
 | Temporal index ordering (DATE, DATETIME, TIMESTAMP, TIME, YEAR) | Done | LE→BE reversal; new temporals (DATETIME2 etc.) pass through |
 | SET/ENUM index ordering | Done | `real_type()` dispatch for correct type identification |
-| VARCHAR/CHAR index ordering | Done | `fix_varchar_key_encoding` + skip in `make_mem_comparable` |
+| VARCHAR/CHAR index ordering | Done | Secondary: `fix_varchar_key_encoding`. Primary key: length moved behind the bytes (`key_format` 1) |
 | BLOB/TEXT prefix indexes | Done | `HA_BLOB_PART` handling in `fix_varchar_key_encoding` |
 | BLOB/TEXT storage | Done | Encode appends data; decode patches pointers into value buffer |
 | MEDIUMBLOB support (16 MiB) | Done | `max_value_bytes = 16 MiB` |
 | Virtual/generated columns | Done | `HA_CAN_VIRTUAL_COLUMNS` flag |
 | AUTO_INCREMENT (single PK) | Done | Monotonic counter via catalog |
 | AUTO_INCREMENT (composite PK) | Done | Per-row allocation avoids gaps |
+| AUTO_INCREMENT after a restart | Done | Seeded from the column's largest value in its index: one end of the index when the column leads it, one scan of the index when it does not, PK or not |
 | CHECKSUM TABLE EXTENDED | Done | Inherited `handler::calculate_checksum()` full-scan |
 | SHOW ENGINE STATUS | Done | Exposes `g_db->stats()` counters |
 | `HA_READ_PREFIX_LAST` (reverse PK prefix scan) | Done | Used by composite PK auto-increment |
@@ -492,8 +507,9 @@ features) is the remaining gap before production use.
   Never advance an iterator or reuse the value buffer while MariaDB may
   still be reading BLOB data through those pointers.
 
-- **`make_mem_comparable` skips VARCHAR/BLOB key parts.** Those parts are
-  handled by `fix_varchar_key_encoding` which runs first. Applying
-  `make_mem_comparable` to them would corrupt data by misinterpreting the
-  `store_length - length` bytes as null indicators. The one exception is a
-  DESC part, whose bytes are inverted whatever its type.
+- **`make_mem_comparable` does not byte-transform VARCHAR/BLOB key parts.**
+  In a secondary key they are handled by `fix_varchar_key_encoding`, which
+  runs first. Applying the integer transforms to them would corrupt data by
+  misinterpreting the `store_length - length` bytes as null indicators. It
+  does move a primary-key part's length behind its bytes when the plan says
+  so (`varlen_length_last`), and inverts a DESC part whatever its type.

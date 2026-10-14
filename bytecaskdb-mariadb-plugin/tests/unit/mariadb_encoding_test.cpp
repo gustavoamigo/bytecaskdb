@@ -233,8 +233,35 @@ TEST_CASE("TableMeta round-trip", "[catalog]") {
     TableMeta out;
     REQUIRE_FALSE(deserialize_table_meta(buf.data(), 5, out));
     REQUIRE_FALSE(deserialize_table_meta(buf.data(), 0, out));
-    // Truncate in the middle of columns.
-    REQUIRE_FALSE(deserialize_table_meta(buf.data(), buf.size() - 1, out));
+    // Truncate in the middle of the index count (the last byte is the
+    // optional key_format).
+    REQUIRE_FALSE(deserialize_table_meta(buf.data(), buf.size() - 2, out));
+  }
+
+  SECTION("key_format round-trips; an entry without it reads as format 0") {
+    TableMeta meta;
+    meta.table_id       = 7;
+    meta.schema_version = 3;
+    meta.full_name      = "db";
+    meta.reclength      = 8;
+    meta.null_bytes     = 0;
+    meta.pk_parts       = 1;
+    meta.columns        = {{3, 11, 0, 0}};
+    meta.fks            = {{"fk", "db", "p", {"a"}, {"id"}, 1, 2}};
+    meta.key_format     = kKeyFormatValueOrderedPk;
+
+    auto buf = serialize_table_meta(meta);
+    TableMeta out;
+    REQUIRE(deserialize_table_meta(buf.data(), buf.size(), out));
+    REQUIRE(out.key_format == kKeyFormatValueOrderedPk);
+    REQUIRE(out.fks.size() == 1);
+    REQUIRE(out.fks[0].delete_opt == 2);
+
+    // Written before key_format existed: the same bytes without the last.
+    TableMeta legacy;
+    REQUIRE(deserialize_table_meta(buf.data(), buf.size() - 1, legacy));
+    REQUIRE(legacy.key_format == kKeyFormatLengthPrefixedPk);
+    REQUIRE(legacy.fks.size() == 1);
   }
 }
 
@@ -872,26 +899,26 @@ TEST_CASE("encode_pk_into matches encode_pk (PK-less synthetic rowid)",
   uchar buf[1] = {0};
 
   SECTION("equivalent output") {
-    auto returned = encode_pk(&tbl, make_table_codec(&tbl), buf, 42, 0xDEADBEEFCAFEBABEULL);
+    auto returned = encode_pk(&tbl, make_table_codec(&tbl, kKeyFormatCurrent), buf, 42, 0xDEADBEEFCAFEBABEULL);
     std::vector<uint8_t> into;
-    encode_pk_into(into, &tbl, make_table_codec(&tbl), buf, 42, 0xDEADBEEFCAFEBABEULL);
+    encode_pk_into(into, &tbl, make_table_codec(&tbl, kKeyFormatCurrent), buf, 42, 0xDEADBEEFCAFEBABEULL);
     REQUIRE(into == returned);
   }
 
   SECTION("clear+append — pre-populated junk overwritten") {
     std::vector<uint8_t> into(32, 0xAB);
     auto cap_before = into.capacity();
-    encode_pk_into(into, &tbl, make_table_codec(&tbl), buf, 42, 1);
-    REQUIRE(into == encode_pk(&tbl, make_table_codec(&tbl), buf, 42, 1));
+    encode_pk_into(into, &tbl, make_table_codec(&tbl, kKeyFormatCurrent), buf, 42, 1);
+    REQUIRE(into == encode_pk(&tbl, make_table_codec(&tbl, kKeyFormatCurrent), buf, 42, 1));
     REQUIRE(into.capacity() >= cap_before);
   }
 
   SECTION("repeated reuse across rows") {
     std::vector<uint8_t> into;
-    encode_pk_into(into, &tbl, make_table_codec(&tbl), buf, 42, 1);
+    encode_pk_into(into, &tbl, make_table_codec(&tbl, kKeyFormatCurrent), buf, 42, 1);
     auto cap_after_first = into.capacity();
-    encode_pk_into(into, &tbl, make_table_codec(&tbl), buf, 42, 999);
-    REQUIRE(into == encode_pk(&tbl, make_table_codec(&tbl), buf, 42, 999));
+    encode_pk_into(into, &tbl, make_table_codec(&tbl, kKeyFormatCurrent), buf, 42, 999);
+    REQUIRE(into == encode_pk(&tbl, make_table_codec(&tbl, kKeyFormatCurrent), buf, 42, 999));
     REQUIRE(into.capacity() >= cap_after_first);
   }
 }
@@ -1075,7 +1102,7 @@ TEST_CASE("key plan transforms sort by value and round-trip",
   SECTION("signed integer") {
     Field_long f;
     OneKeyTable t(f, 4, /*nullable=*/false);
-    const TableCodec codec = make_table_codec(&t.tbl);
+    const TableCodec codec = make_table_codec(&t.tbl, kKeyFormatCurrent);
     REQUIRE(codec.keys.size() == 1);
     const KeyPartPlan &p = codec.keys[0].parts.at(0);
     CHECK(p.reverse);
@@ -1089,7 +1116,7 @@ TEST_CASE("key plan transforms sort by value and round-trip",
   SECTION("unsigned integer") {
     UnsignedLongField f;
     OneKeyTable t(f, 4, false);
-    const TableCodec codec = make_table_codec(&t.tbl);
+    const TableCodec codec = make_table_codec(&t.tbl, kKeyFormatCurrent);
     CHECK(codec.keys[0].parts.at(0).flip == KeyPartPlan::Flip::kNone);
     check_order_and_round_trip<uint32_t>(
         codec.keys[0], {0u, 1u, 255u, 256u, 0x80000000u, 0xFFFFFFFFu});
@@ -1098,7 +1125,7 @@ TEST_CASE("key plan transforms sort by value and round-trip",
   SECTION("double") {
     DoubleField f;
     OneKeyTable t(f, 8, false);
-    const TableCodec codec = make_table_codec(&t.tbl);
+    const TableCodec codec = make_table_codec(&t.tbl, kKeyFormatCurrent);
     CHECK(codec.keys[0].parts.at(0).flip == KeyPartPlan::Flip::kFloat);
     check_order_and_round_trip<double>(
         codec.keys[0], {-1e10, -2.5, -0.5, 0.0, 0.5, 1.5, 1e10});
@@ -1107,7 +1134,7 @@ TEST_CASE("key plan transforms sort by value and round-trip",
   SECTION("nullable: NULL sorts first and both round-trip") {
     Field_long f;
     OneKeyTable t(f, 4, /*nullable=*/true);
-    const TableCodec codec = make_table_codec(&t.tbl);
+    const TableCodec codec = make_table_codec(&t.tbl, kKeyFormatCurrent);
     const KeyPlan &plan = codec.keys[0];
     std::vector<uint8_t> null_key = {1, 0, 0, 0, 0};  // null byte set
     std::vector<uint8_t> zero_key = {0, 0, 0, 0, 0};  // NOT NULL, value 0
@@ -1128,7 +1155,7 @@ TEST_CASE("DESC key parts are stored in descending order",
     Field_long f;
     OneKeyTable t(f, 4, /*nullable=*/false);
     t.part.key_part_flag = HA_REVERSE_SORT;
-    const TableCodec codec = make_table_codec(&t.tbl);
+    const TableCodec codec = make_table_codec(&t.tbl, kKeyFormatCurrent);
     const KeyPlan &plan = codec.keys[0];
     CHECK(plan.parts.at(0).desc);
 
@@ -1152,7 +1179,7 @@ TEST_CASE("DESC key parts are stored in descending order",
   SECTION("an ASC part is unaffected") {
     Field_long f;
     OneKeyTable t(f, 4, false);
-    const TableCodec codec = make_table_codec(&t.tbl);
+    const TableCodec codec = make_table_codec(&t.tbl, kKeyFormatCurrent);
     CHECK_FALSE(codec.keys[0].parts.at(0).desc);
   }
 
@@ -1160,7 +1187,7 @@ TEST_CASE("DESC key parts are stored in descending order",
     Field_long f;
     OneKeyTable t(f, 4, /*nullable=*/true);
     t.part.key_part_flag = HA_REVERSE_SORT;
-    const TableCodec codec = make_table_codec(&t.tbl);
+    const TableCodec codec = make_table_codec(&t.tbl, kKeyFormatCurrent);
     const KeyPlan &plan = codec.keys[0];
     std::vector<uint8_t> null_key = {1, 0, 0, 0, 0};
     std::vector<uint8_t> max_key = {0, 0xFF, 0xFF, 0xFF, 0x7F};  // INT_MAX
@@ -1184,12 +1211,14 @@ TEST_CASE("DESC key parts are stored in descending order",
       enum_field_types type() const override { return MYSQL_TYPE_VARCHAR; }
     } f;
     OneKeyTable t(f, 4, false);
+    t.share.primary_key = MAX_KEY;  // key 0 is a secondary index
     t.part.store_length = 4 + HA_KEY_BLOB_LENGTH;
     t.key.key_length = t.part.store_length;
     t.part.key_part_flag = HA_REVERSE_SORT;
-    const TableCodec codec = make_table_codec(&t.tbl);
+    const TableCodec codec = make_table_codec(&t.tbl, kKeyFormatCurrent);
     const KeyPlan &plan = codec.keys[0];
     REQUIRE(plan.parts.at(0).varlen);
+    REQUIRE_FALSE(plan.varlen_length_last);
 
     // key_copy() layout: 2-byte LE length, then the bytes, zero-padded.
     auto key_of = [&](std::string_view s) {
@@ -1215,7 +1244,7 @@ TEST_CASE("DESC key parts are stored in descending order",
     t.key.key_part = parts;
     t.key.user_defined_key_parts = 2;
     t.key.key_length = 8;
-    const TableCodec codec = make_table_codec(&t.tbl);
+    const TableCodec codec = make_table_codec(&t.tbl, kKeyFormatCurrent);
     const KeyPlan &plan = codec.keys[0];
     CHECK(plan.parts.at(0).desc);
     CHECK_FALSE(plan.parts.at(1).desc);
@@ -1231,7 +1260,7 @@ TEST_CASE("DESC key parts are stored in descending order",
     Field_long f;
     OneKeyTable t(f, 4, false);
     t.part.key_part_flag = HA_REVERSE_SORT;
-    const TableCodec codec = make_table_codec(&t.tbl);
+    const TableCodec codec = make_table_codec(&t.tbl, kKeyFormatCurrent);
     const KeyPlan &plan = codec.keys[0];
     auto value = native_bytes<int32_t>(-42);
     auto encoded = value;
@@ -1245,11 +1274,102 @@ TEST_CASE("DESC key parts are stored in descending order",
   }
 }
 
+TEST_CASE("VARCHAR primary-key parts sort by value and restore exactly",
+          "[key_encoding]") {
+  struct VarcharField : Field {
+    enum_field_types type() const override { return MYSQL_TYPE_VARCHAR; }
+  } f;
+  OneKeyTable t(f, 4, false);  // key 0 is the primary key
+  t.part.store_length = 4 + HA_KEY_BLOB_LENGTH;
+  t.key.key_length = t.part.store_length;
+
+  // key_copy() layout: 2-byte LE length, then the bytes, zero-padded.
+  auto copy_of = [&](std::string_view s) {
+    std::vector<uint8_t> k(t.part.store_length, 0);
+    k[0] = static_cast<uint8_t>(s.size());
+    std::memcpy(k.data() + 2, s.data(), s.size());
+    return k;
+  };
+  auto encode = [&](const KeyPlan &plan, std::string_view s) {
+    auto k = copy_of(s);
+    make_mem_comparable(k.data(), plan, static_cast<uint>(k.size()));
+    return k;
+  };
+  // Binary strings, so a trailing zero byte is part of the value.
+  const std::vector<std::string> sorted = {
+      "", std::string("\0", 1), "a", std::string("a\0", 2), "ab", "abc",
+      "b", "c"};
+
+  SECTION("current format: value order, round-trip") {
+    const TableCodec codec = make_table_codec(&t.tbl, kKeyFormatCurrent);
+    const KeyPlan &plan = codec.keys[0];
+    REQUIRE(plan.varlen_length_last);
+    std::vector<std::vector<uint8_t>> encoded;
+    for (const auto &s : sorted) {
+      auto k = encode(plan, s);
+      auto back = k;
+      undo_mem_comparable(back.data(), plan, static_cast<uint>(back.size()));
+      INFO("value '" << s << "'");
+      REQUIRE(back == copy_of(s));
+      encoded.push_back(k);
+    }
+    REQUIRE(std::is_sorted(encoded.begin(), encoded.end()));
+    REQUIRE(std::adjacent_find(encoded.begin(), encoded.end()) ==
+            encoded.end());
+  }
+
+  SECTION("DESC: reverse value order") {
+    t.part.key_part_flag = HA_REVERSE_SORT;
+    const TableCodec codec = make_table_codec(&t.tbl, kKeyFormatCurrent);
+    std::vector<std::vector<uint8_t>> encoded;
+    for (const auto &s : sorted) encoded.push_back(encode(codec.keys[0], s));
+    REQUIRE(std::is_sorted(encoded.rbegin(), encoded.rend()));
+  }
+
+  SECTION("PAD SPACE collation: trailing zero bytes sort first, so a LIKE "
+          "bound padded to full length still sorts before its prefix") {
+    static CHARSET_INFO pad_cs{45, 0, 1, 4};  // neither BINSORT nor NOPAD
+    struct PadVarcharField : Field {
+      enum_field_types type() const override { return MYSQL_TYPE_VARCHAR; }
+      const CHARSET_INFO *charset() const override { return &pad_cs; }
+    } g;
+    OneKeyTable u(g, 4, false);
+    u.part.store_length = 4 + HA_KEY_BLOB_LENGTH;
+    u.key.key_length = u.part.store_length;
+    const TableCodec codec = make_table_codec(&u.tbl, kKeyFormatCurrent);
+    const KeyPlan &plan = codec.keys[0];
+    REQUIRE_FALSE(plan.parts.at(0).shorter_first);
+    const std::vector<std::string> pad_sorted = {
+        "", std::string("a\0", 2), "a", "ab", "abc", "b"};
+    std::vector<std::vector<uint8_t>> encoded;
+    for (const auto &s : pad_sorted) {
+      auto k = encode(plan, s);
+      auto back = k;
+      undo_mem_comparable(back.data(), plan, static_cast<uint>(back.size()));
+      REQUIRE(back == copy_of(s));
+      encoded.push_back(k);
+    }
+    REQUIRE(std::is_sorted(encoded.begin(), encoded.end()));
+    // LIKE 'ab%': lower bound 'ab' + zero bytes, at the full length.
+    std::vector<uint8_t> bound = {4, 0, 'a', 'b', 0, 0};
+    make_mem_comparable(bound.data(), plan, static_cast<uint>(bound.size()));
+    REQUIRE(bound <= encode(plan, "ab"));
+    REQUIRE(encode(plan, "a") < bound);
+  }
+
+  SECTION("format 0 keeps the length prefix its rows were written with") {
+    const TableCodec codec =
+        make_table_codec(&t.tbl, kKeyFormatLengthPrefixedPk);
+    REQUIRE_FALSE(codec.keys[0].varlen_length_last);
+    REQUIRE(encode(codec.keys[0], "ab") == copy_of("ab"));
+  }
+}
+
 TEST_CASE("decode_sec_key_into_record restores the key's columns",
           "[key_encoding]") {
   Field_long f;
   OneKeyTable t(f, 4, false);
-  const TableCodec codec = make_table_codec(&t.tbl);
+  const TableCodec codec = make_table_codec(&t.tbl, kKeyFormatCurrent);
   const KeyPlan &plan = codec.keys[0];
 
   auto value = native_bytes<int32_t>(-42);
@@ -1266,7 +1386,7 @@ TEST_CASE("decode_sec_key_into_record restores the key's columns",
   SECTION("a nullable part is left to the full row fetch") {
     Field_long g;
     OneKeyTable n(g, 4, /*nullable=*/true);
-    const TableCodec ncodec = make_table_codec(&n.tbl);
+    const TableCodec ncodec = make_table_codec(&n.tbl, kKeyFormatCurrent);
     const KeyPlan &nplan = ncodec.keys[0];
     REQUIRE_FALSE(decode_sec_key_into_record(nplan, sec_key.data(),
                                              sec_key.size(), record));
@@ -1306,7 +1426,7 @@ TEST_CASE("key plan leaves big-endian temporal parts as they are",
     INFO(k.name);
     TemporalField f{k.type, k.real, k.bytes};
     OneKeyTable t(f, k.bytes, /*nullable=*/false);
-    const TableCodec codec = make_table_codec(&t.tbl);
+    const TableCodec codec = make_table_codec(&t.tbl, kKeyFormatCurrent);
     const KeyPlan &plan = codec.keys[0];
     const KeyPartPlan &p = plan.parts.at(0);
     CHECK(p.be_temporal);
@@ -1346,7 +1466,7 @@ TEST_CASE("key plan leaves big-endian temporal parts as they are",
   SECTION("the old little-endian DATETIME is still reversed") {
     TemporalField f{MYSQL_TYPE_DATETIME, MYSQL_TYPE_DATETIME, 8};
     OneKeyTable t(f, 8, false);
-    const TableCodec codec = make_table_codec(&t.tbl);
+    const TableCodec codec = make_table_codec(&t.tbl, kKeyFormatCurrent);
     const KeyPartPlan &p = codec.keys[0].parts.at(0);
     CHECK_FALSE(p.be_temporal);
     CHECK(p.reverse);

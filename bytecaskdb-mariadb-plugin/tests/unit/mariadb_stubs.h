@@ -190,6 +190,7 @@ struct TABLE_SHARE {
 };
 
 // Minimal CHARSET_INFO stub.
+#define MY_CS_BINSORT 16
 #define MY_CS_NOPAD 0x2000
 struct CHARSET_INFO {
   uint number{0};

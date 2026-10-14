@@ -97,6 +97,16 @@ struct FKMeta {
   uint8_t delete_opt{0};
 };
 
+// How a table's keys are encoded, fixed when the table is created. A table
+// keeps the format its rows were written in until it is rebuilt.
+//   0: a VARCHAR or BLOB part of the primary key keeps key_copy()'s
+//      little-endian length prefix, so it sorts by length first (#459).
+//   1: that length is stored after the zero-padded bytes, big-endian, so
+//      the part sorts by value.
+inline constexpr uint8_t kKeyFormatLengthPrefixedPk = 0;
+inline constexpr uint8_t kKeyFormatValueOrderedPk   = 1;
+inline constexpr uint8_t kKeyFormatCurrent          = kKeyFormatValueOrderedPk;
+
 struct TableMeta {
   uint32_t    table_id;
   uint32_t    schema_version;
@@ -107,6 +117,7 @@ struct TableMeta {
   std::vector<ColumnMeta> columns;
   std::vector<IndexMeta>  indexes;        // non-PK secondary indexes
   std::vector<FKMeta>     fks;            // FK constraint names (DDL lifecycle only)
+  uint8_t     key_format{kKeyFormatLengthPrefixedPk};
 };
 
 // Serializes a TableMeta into a byte vector (all little-endian).
