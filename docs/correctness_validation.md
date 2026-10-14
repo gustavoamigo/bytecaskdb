@@ -1572,9 +1572,9 @@ of two or more conditions; a single condition is branch coverage's.
 
 **The gate.** `scripts/run_coverage.sh` builds the coverage binaries with
 `-fcoverage-mcdc`, and `scripts/mcdc_report.py` fails the `coverage` CI job
-unless every condition in `data_file.cppm`, `hint_file.cppm` and
-`bytecask.cppm` — the write path, recovery and vacuum — is covered or
-exempt. Elsewhere MC/DC is reported, not gated; the key directory modules
+unless every condition in `data_file.cppm`, `hint_file.cppm`,
+`bytecask.cppm` and the engine's implementation units (`db_*.cpp`, split
+out of it) — the write path, recovery and vacuum — is covered or exempt. Elsewhere MC/DC is reported, not gated; the key directory modules
 are #357.
 
 **Merged per build.** The engine suite runs on all three key directories, and
@@ -2511,7 +2511,11 @@ The set is kept current as the engine moves. Patches apply by three-way
 merge (`scripts/mutation_patch.sh`, for both mutation sets): a change
 elsewhere in a file merges, and only a conflict, when the targeted code or a
 line directly next to it changed, means the patch must be regenerated.
-`ci.yml` fails on a conflicting patch. A fix for a bug the rig found adds a
+`ci.yml` fails on a conflicting patch. The merge does not follow code that
+moves to another file: `scripts/mutation_follow_move.sh` regenerates the
+patches a verbatim move strands, by merging each into the file as it was
+before the move and applying the result to the new file by context. A fix
+for a bug the rig found adds a
 patch reverting it, and a change to the rig, or to engine code a mutation
 patches, runs the check and reports its summary. It is not scheduled: it only
 goes stale when one of those changes.

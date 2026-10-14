@@ -4,11 +4,11 @@ synced later, survive, so the history that follows has no identity and a
 forked follower is not refused (#397).
 Guarded-by: "a promotion whose fdatasync fails degrades and keeps the mode; resume finds its marker once"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index 9315a02..d5a71e9 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -4739,7 +4739,7 @@ void DB::set_mode(Mode mode) {
+diff --git a/bytecaskdb/db_replication.cpp b/bytecaskdb/db_replication.cpp
+index dcda96c..b8e3365 100644
+--- a/bytecaskdb/db_replication.cpp
++++ b/bytecaskdb/db_replication.cpp
+@@ -95,7 +95,7 @@ void DB::set_mode(Mode mode) {
            std::memory_order_relaxed);
        // Publishes t degraded, marker included, on failure: the entry is in
        // the file, and resume() finds it there either way.
