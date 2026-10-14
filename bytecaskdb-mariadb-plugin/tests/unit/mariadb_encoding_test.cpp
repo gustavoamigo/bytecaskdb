@@ -1326,9 +1326,8 @@ TEST_CASE("VARCHAR primary-key parts sort by value and restore exactly",
     REQUIRE(std::is_sorted(encoded.rbegin(), encoded.rend()));
   }
 
-  SECTION("PAD SPACE collation: trailing zero bytes sort first, so a LIKE "
-          "bound padded to full length still sorts before its prefix") {
-    static CHARSET_INFO pad_cs{45, 0, 1, 4};  // neither BINSORT nor NOPAD
+  SECTION("PAD SPACE collation: the order InnoDB gives, LIKE bound included") {
+    static CHARSET_INFO pad_cs{8, 0, 1, 1};  // latin1_bin: not NOPAD
     struct PadVarcharField : Field {
       enum_field_types type() const override { return MYSQL_TYPE_VARCHAR; }
       const CHARSET_INFO *charset() const override { return &pad_cs; }
@@ -1338,23 +1337,57 @@ TEST_CASE("VARCHAR primary-key parts sort by value and restore exactly",
     u.key.key_length = u.part.store_length;
     const TableCodec codec = make_table_codec(&u.tbl, kKeyFormatCurrent);
     const KeyPlan &plan = codec.keys[0];
-    REQUIRE_FALSE(plan.parts.at(0).shorter_first);
+    REQUIRE(plan.parts.at(0).pad_space);
+    // As InnoDB orders them under latin1_bin: a shorter value compares as if
+    // padded with spaces, so anything below 0x20 after a prefix sorts first.
     const std::vector<std::string> pad_sorted = {
-        "", std::string("a\0", 2), "a", "ab", "abc", "b"};
+        "\x01", "", std::string("a\0", 2), std::string("a\0b", 3), "a\x01",
+        "a", "ab", "b"};
     std::vector<std::vector<uint8_t>> encoded;
     for (const auto &s : pad_sorted) {
       auto k = encode(plan, s);
       auto back = k;
       undo_mem_comparable(back.data(), plan, static_cast<uint>(back.size()));
+      INFO("value '" << s << "'");
       REQUIRE(back == copy_of(s));
       encoded.push_back(k);
     }
     REQUIRE(std::is_sorted(encoded.begin(), encoded.end()));
-    // LIKE 'ab%': lower bound 'ab' + zero bytes, at the full length.
+    REQUIRE(std::adjacent_find(encoded.begin(), encoded.end()) ==
+            encoded.end());
+    // A non-binary PAD SPACE collation's LIKE 'ab%' lower bound: 'ab' then
+    // zero bytes, at the full length. It sorts before 'ab' and after 'a'.
     std::vector<uint8_t> bound = {4, 0, 'a', 'b', 0, 0};
     make_mem_comparable(bound.data(), plan, static_cast<uint>(bound.size()));
-    REQUIRE(bound <= encode(plan, "ab"));
+    REQUIRE(bound < encode(plan, "ab"));
     REQUIRE(encode(plan, "a") < bound);
+  }
+
+  SECTION("secondary index, PAD SPACE: padded with spaces") {
+    static CHARSET_INFO pad_cs{8, 0, 1, 1};
+    struct PadVarcharField : Field {
+      enum_field_types type() const override { return MYSQL_TYPE_VARCHAR; }
+      const CHARSET_INFO *charset() const override { return &pad_cs; }
+    } g;
+    OneKeyTable u(g, 4, false);
+    u.share.primary_key = MAX_KEY;  // key 0 is a secondary index
+    u.part.store_length = 4 + HA_KEY_BLOB_LENGTH;
+    u.key.key_length = u.part.store_length;
+    auto sec = [&](uint8_t format, std::string_view v) {
+      const TableCodec codec = make_table_codec(&u.tbl, format);
+      std::vector<uint8_t> k(u.part.store_length, 0);
+      k[0] = static_cast<uint8_t>(v.size());
+      std::memcpy(k.data() + 2, v.data(), v.size());
+      fix_varchar_key_encoding(k.data(), codec.keys[0]);
+      return k;
+    };
+    REQUIRE(sec(kKeyFormatCurrent, "a") ==
+            std::vector<uint8_t>{'a', ' ', ' ', ' ', ' ', ' '});
+    REQUIRE(sec(kKeyFormatCurrent, std::string_view("a\0b", 3)) <
+            sec(kKeyFormatCurrent, "a"));
+    // Format 0 keeps the zero padding its keys were written with.
+    REQUIRE(sec(kKeyFormatLengthPrefixedPk, "a") ==
+            std::vector<uint8_t>{'a', 0, 0, 0, 0, 0});
   }
 
   SECTION("format 0 keeps the length prefix its rows were written with") {

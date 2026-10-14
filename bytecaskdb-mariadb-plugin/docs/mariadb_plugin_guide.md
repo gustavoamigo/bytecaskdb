@@ -130,23 +130,28 @@ lexicographically sortable. The plugin applies a post-processing step
   big-endian by `key_copy()` — no transformation needed.
 - **VARCHAR and BLOB prefix keys, secondary indexes**: handled by
   `fix_varchar_key_encoding`, which strips the 2-byte LE length prefix and
-  left-justifies the data with zero padding. The PK suffix tells apart
-  values that differ only in trailing zero bytes.
+  left-justifies the data, padded to the slot's width. The PK suffix tells
+  apart values that differ only in trailing padding.
 - **VARCHAR and BLOB prefix keys, primary key**: the key must restore
   (`decode_pk`, the AUTO_INCREMENT seed) and must keep `'a'` and `'a\0'`
   apart, so the length stays, but `make_mem_comparable` moves it behind the
-  zero-padded bytes, big-endian, in the same slot. The part then sorts by
-  value. Of two values whose padded bytes are equal, a binary-sort or NO PAD
-  collation puts the shorter first and a PAD SPACE collation the longer
-  (its length is stored complemented), which is how the server orders them
-  and how it builds a LIKE range's lower bound: at the prefix's own length
-  in the first case, zero-padded to the full length in the second. A
-  `_bin` collation is binary-sort but PAD SPACE, and orders such a pair
-  shorter-first, the reverse of the server; nothing else is affected.
-  Tables keep the encoding they were created with: the catalog records a
-  `key_format` per table, and one created before it existed (format 0)
-  keeps the length prefix, and with it the length-first order, until
-  `ALTER TABLE t FORCE` rebuilds it (#459).
+  padded bytes, big-endian, in the same slot. The part then sorts by value.
+- **Padding** follows the collation. A PAD SPACE collation compares a
+  shorter value as if padded with spaces, so `'a\0b'` sorts before `'a'`:
+  such a part is padded with spaces, its trailing spaces having been
+  trimmed already, so equal padded bytes mean equal values. Under NO PAD or
+  a binary collation it is padded with zero bytes, and the PK's length puts
+  the shorter of `'a'` and `'a\0'` first, as the server does. A LIKE
+  range's synthetic lower bound (zero bytes to the full length under a
+  non-binary PAD SPACE collation) then lands where the server expects it.
+- **Formats.** Tables keep the encoding they were created with: the catalog
+  records a `key_format` per table. One created before it existed
+  (format 0) keeps the length-prefixed PK, which sorts by length first, and
+  zero-padded secondary keys, until `ALTER TABLE t FORCE` rebuilds it
+  (#459).
+- **Collation weights are not applied.** Keys hold bytes, so under a case-
+  or accent-insensitive collation they sort, match and enforce uniqueness
+  by byte, not by the collation (#468).
 - **DESC key parts** (`HA_REVERSE_SORT`): after the transform above, every
   byte of the part, null indicator included, is inverted. The server reads
   a DESC part as descending, NULLs last, and expects `index_first` /
@@ -439,7 +444,7 @@ is freed (#294).
 | Integer index ordering (all widths) | Done | Mem-comparable encoding with sign-flip |
 | Temporal index ordering (DATE, DATETIME, TIMESTAMP, TIME, YEAR) | Done | LE→BE reversal; new temporals (DATETIME2 etc.) pass through |
 | SET/ENUM index ordering | Done | `real_type()` dispatch for correct type identification |
-| VARCHAR/CHAR index ordering | Done | Secondary: `fix_varchar_key_encoding`. Primary key: length moved behind the bytes (`key_format` 1) |
+| VARCHAR/CHAR index ordering | Partial | By byte, padded per PAD SPACE / NO PAD (`key_format` 1); collation weights not applied (#468) |
 | BLOB/TEXT prefix indexes | Done | `HA_BLOB_PART` handling in `fix_varchar_key_encoding` |
 | BLOB/TEXT storage | Done | Encode appends data; decode patches pointers into value buffer |
 | MEDIUMBLOB support (16 MiB) | Done | `max_value_bytes = 16 MiB` |

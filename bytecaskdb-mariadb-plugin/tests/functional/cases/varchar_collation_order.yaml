@@ -1,0 +1,85 @@
+# varchar_collation_order.yaml — VARCHAR keys sort as the collation compares
+# them, in the primary key and in a secondary index (#459): under PAD SPACE
+# a shorter value compares as if padded with spaces, so a byte below 0x20
+# after a prefix sorts first; under NO PAD the shorter value sorts first.
+# Expected rows are InnoDB's on MariaDB 10.11.
+
+- name: latin1_bin primary key
+  setup:
+    - DROP DATABASE IF EXISTS vco1
+    - CREATE DATABASE vco1
+    - CREATE TABLE vco1.t (v VARCHAR(8) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL, PRIMARY KEY (v)) ENGINE=bytecaskdb
+    - INSERT INTO vco1.t (v) VALUES ('a'), (CONCAT('a', CHAR(0))), (CONCAT('a', CHAR(0), 'b')), (CONCAT('a', CHAR(1))), (''), (CHAR(1)), ('ab'), ('b')
+  steps:
+    - sql: SELECT HEX(v) FROM vco1.t FORCE INDEX (PRIMARY) ORDER BY v
+      expected: [['01'], [''], ['6100'], ['610062'], ['6101'], ['61'], ['6162'], ['62']]
+    - sql: SELECT HEX(v) FROM vco1.t FORCE INDEX (PRIMARY) WHERE v < 'a' ORDER BY v
+      expected: [['01'], [''], ['6100'], ['610062'], ['6101']]
+    - sql: SELECT HEX(v) FROM vco1.t FORCE INDEX (PRIMARY) WHERE v LIKE 'a%' ORDER BY v
+      expected: [['61'], ['6162']]
+  teardown:
+    - DROP DATABASE IF EXISTS vco1
+
+- name: latin1_bin secondary index
+  setup:
+    - DROP DATABASE IF EXISTS vco2
+    - CREATE DATABASE vco2
+    - CREATE TABLE vco2.t (v VARCHAR(8) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL, id INT AUTO_INCREMENT PRIMARY KEY, KEY kv (v)) ENGINE=bytecaskdb
+    - INSERT INTO vco2.t (v) VALUES ('a'), (CONCAT('a', CHAR(0))), (CONCAT('a', CHAR(0), 'b')), (CONCAT('a', CHAR(1))), (''), (CHAR(1)), ('ab'), ('b')
+  steps:
+    - sql: SELECT HEX(v) FROM vco2.t FORCE INDEX (kv) ORDER BY v
+      expected: [['01'], [''], ['6100'], ['610062'], ['6101'], ['61'], ['6162'], ['62']]
+    - sql: SELECT HEX(v) FROM vco2.t FORCE INDEX (kv) WHERE v < 'a' ORDER BY v
+      expected: [['01'], [''], ['6100'], ['610062'], ['6101']]
+    - sql: SELECT HEX(v) FROM vco2.t FORCE INDEX (kv) WHERE v LIKE 'a%' ORDER BY v
+      expected: [['61'], ['6162']]
+  teardown:
+    - DROP DATABASE IF EXISTS vco2
+
+- name: latin1_swedish_ci primary key
+  setup:
+    - DROP DATABASE IF EXISTS vco3
+    - CREATE DATABASE vco3
+    - CREATE TABLE vco3.t (v VARCHAR(8) CHARACTER SET latin1 COLLATE latin1_swedish_ci NOT NULL, PRIMARY KEY (v)) ENGINE=bytecaskdb
+    - INSERT INTO vco3.t (v) VALUES ('a'), (CONCAT('a', CHAR(0))), (CONCAT('a', CHAR(0), 'b')), (CONCAT('a', CHAR(1))), (''), (CHAR(1)), ('ab'), ('b')
+  steps:
+    - sql: SELECT HEX(v) FROM vco3.t FORCE INDEX (PRIMARY) ORDER BY v
+      expected: [['01'], [''], ['6100'], ['610062'], ['6101'], ['61'], ['6162'], ['62']]
+    - sql: SELECT HEX(v) FROM vco3.t FORCE INDEX (PRIMARY) WHERE v < 'a' ORDER BY v
+      expected: [['01'], [''], ['6100'], ['610062'], ['6101']]
+    - sql: SELECT HEX(v) FROM vco3.t FORCE INDEX (PRIMARY) WHERE v LIKE 'a%' ORDER BY v
+      expected: [['6100'], ['610062'], ['6101'], ['61'], ['6162']]
+  teardown:
+    - DROP DATABASE IF EXISTS vco3
+
+- name: latin1_swedish_ci secondary index
+  setup:
+    - DROP DATABASE IF EXISTS vco4
+    - CREATE DATABASE vco4
+    - CREATE TABLE vco4.t (v VARCHAR(8) CHARACTER SET latin1 COLLATE latin1_swedish_ci NOT NULL, id INT AUTO_INCREMENT PRIMARY KEY, KEY kv (v)) ENGINE=bytecaskdb
+    - INSERT INTO vco4.t (v) VALUES ('a'), (CONCAT('a', CHAR(0))), (CONCAT('a', CHAR(0), 'b')), (CONCAT('a', CHAR(1))), (''), (CHAR(1)), ('ab'), ('b')
+  steps:
+    - sql: SELECT HEX(v) FROM vco4.t FORCE INDEX (kv) ORDER BY v
+      expected: [['01'], [''], ['6100'], ['610062'], ['6101'], ['61'], ['6162'], ['62']]
+    - sql: SELECT HEX(v) FROM vco4.t FORCE INDEX (kv) WHERE v < 'a' ORDER BY v
+      expected: [['01'], [''], ['6100'], ['610062'], ['6101']]
+    - sql: SELECT HEX(v) FROM vco4.t FORCE INDEX (kv) WHERE v LIKE 'a%' ORDER BY v
+      expected: [['6100'], ['610062'], ['6101'], ['61'], ['6162']]
+  teardown:
+    - DROP DATABASE IF EXISTS vco4
+
+- name: latin1_nopad_bin primary key
+  setup:
+    - DROP DATABASE IF EXISTS vco5
+    - CREATE DATABASE vco5
+    - CREATE TABLE vco5.t (v VARCHAR(8) CHARACTER SET latin1 COLLATE latin1_nopad_bin NOT NULL, PRIMARY KEY (v)) ENGINE=bytecaskdb
+    - INSERT INTO vco5.t (v) VALUES ('a'), (CONCAT('a', CHAR(0))), (CONCAT('a', CHAR(0), 'b')), (CONCAT('a', CHAR(1))), (''), (CHAR(1)), ('ab'), ('b')
+  steps:
+    - sql: SELECT HEX(v) FROM vco5.t FORCE INDEX (PRIMARY) ORDER BY v
+      expected: [[''], ['01'], ['61'], ['6100'], ['610062'], ['6101'], ['6162'], ['62']]
+    - sql: SELECT HEX(v) FROM vco5.t FORCE INDEX (PRIMARY) WHERE v < 'a' ORDER BY v
+      expected: [[''], ['01']]
+    - sql: SELECT HEX(v) FROM vco5.t FORCE INDEX (PRIMARY) WHERE v LIKE 'a%' ORDER BY v
+      expected: [['61'], ['6100'], ['610062'], ['6101'], ['6162']]
+  teardown:
+    - DROP DATABASE IF EXISTS vco5

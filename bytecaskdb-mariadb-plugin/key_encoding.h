@@ -37,10 +37,6 @@ struct KeyPartPlan {
   bool varchar{false};        // VARCHAR column
   bool varlen{false};         // VARCHAR or BLOB part: no byte transform
   bool pad_space{false};      // varlen under a PAD SPACE collation
-  // varlen under a binary-sort or NO PAD collation: of two values whose
-  // zero-padded bytes are equal, the shorter sorts first; otherwise the
-  // longer does (see move_length_last).
-  bool shorter_first{true};
   bool be_temporal{false};    // DATETIME2/TIMESTAMP2/TIME2: big-endian already
   bool reverse{false};        // little-endian in the record: stored reversed
   Flip flip{Flip::kNone};     // applied with reverse
@@ -50,9 +46,13 @@ struct KeyPartPlan {
 struct KeyPlan {
   std::vector<KeyPartPlan> parts;
   // Primary key of a kKeyFormatValueOrderedPk table: a VARCHAR or BLOB part
-  // keeps its slot, but its length moves behind the zero-padded bytes, so
-  // the part sorts by value and still restores exactly.
+  // keeps its slot, but its length moves behind the padded bytes, so the
+  // part sorts by value and still restores exactly.
   bool varlen_length_last{false};
+  // kKeyFormatValueOrderedPk, every key: a VARCHAR or BLOB part under a PAD
+  // SPACE collation is padded with spaces, not zero bytes, so it sorts as
+  // the collation compares it ('a\0b' before 'a').
+  bool space_pad{false};
 };
 
 // Everything the row and key codecs ask of a table's definition, read once

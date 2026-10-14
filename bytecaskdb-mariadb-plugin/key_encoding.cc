@@ -43,6 +43,16 @@ uint16_t read_be16(const uint8_t *p) {
                                static_cast<uint16_t>(p[1]));
 }
 
+// The byte a varlen part is padded with to its full width. A PAD SPACE
+// collation compares a shorter value as if padded with spaces, so 'a\0b'
+// sorts before 'a'; padding with spaces makes the bytes sort that way. Its
+// trailing spaces are already gone (normalize_padspace_pk,
+// fix_varchar_key_encoding), so equal padded bytes mean equal values. Any
+// other collation, and a format 0 table, pads with zero bytes.
+uint8_t pad_byte(const KeyPlan &plan, const KeyPartPlan &kp) {
+  return plan.space_pad && kp.pad_space ? 0x20 : 0x00;
+}
+
 } // namespace
 
 uint64_t read_be64(const uint8_t *p) {
@@ -137,8 +147,8 @@ std::vector<uint8_t> table_id_upper_bound(uint32_t table_id) {
 
 // Fix VARCHAR key encoding by removing the 2-byte LE length prefix that key_copy()
 // inserts (HA_KEY_BLOB_LENGTH = 2).  After stripping, the slot holds raw data
-// left-justified with zero padding, giving correct lexicographic ordering.
-// For PAD SPACE collations, trailing spaces are stripped before zero-padding
+// left-justified and padded (pad_byte), giving correct lexicographic ordering.
+// For PAD SPACE collations, trailing spaces are stripped before padding
 // so that 'a' and 'a ' produce identical keys (SQL standard comparison semantics).
 void fix_varchar_key_encoding(uint8_t *key_data, const KeyPlan &plan) {
   uint8_t *key_ptr = key_data;
@@ -154,7 +164,8 @@ void fix_varchar_key_encoding(uint8_t *key_data, const KeyPlan &plan) {
         while (length > 0 && key_ptr[null_off + length - 1] == 0x20)
           --length;
       }
-      std::memset(key_ptr + null_off + length, 0, kp.store_length - null_off - length);
+      std::memset(key_ptr + null_off + length, pad_byte(plan, kp),
+                  kp.store_length - null_off - length);
     }
     key_ptr += kp.store_length;
   }
@@ -381,8 +392,6 @@ KeyPartPlan make_key_part_plan(TABLE *table, const KEY_PART_INFO &kp) {
   if (p.varlen) {
     const CHARSET_INFO *cs = field->charset();
     p.pad_space = cs != nullptr && !(cs->state & MY_CS_NOPAD);
-    p.shorter_first =
-        cs == nullptr || (cs->state & (MY_CS_BINSORT | MY_CS_NOPAD)) != 0;
   }
   const auto rt = field->real_type();
   p.be_temporal = is_new_temporal_be(rt);
@@ -402,31 +411,24 @@ KeyPartPlan make_key_part_plan(TABLE *table, const KEY_PART_INFO &kp) {
 
 // A VARCHAR or BLOB slot as key_copy() writes it: a 2-byte little-endian
 // length, then up to kp.length bytes. Rewritten in place, in the same width,
-// as the bytes zero-padded to kp.length and then a big-endian length, so the
-// part sorts by value. Values whose padded bytes are equal differ only in
-// trailing zero bytes; which comes first follows the collation, the way the
-// server builds a LIKE range's lower bound: a binary-sort or NO PAD
-// collation gives it the prefix's own length and orders the shorter value
-// first, so the length is stored as is; a PAD SPACE collation pads it with
-// zero bytes to the full length and orders 'a\0' before 'a', so the length
-// is stored complemented and the longer value sorts first.
-void move_length_last(uint8_t *slot, const KeyPartPlan &kp) {
+// as the bytes padded to kp.length and then the length, big-endian, so the
+// part sorts by value: under NO PAD or a binary collation the padding is
+// zero bytes and, of 'a' and 'a\0', the shorter sorts first, as the server
+// orders them; under PAD SPACE equal padded bytes never differ in length.
+void move_length_last(uint8_t *slot, const KeyPlan &plan,
+                      const KeyPartPlan &kp) {
   uint16_t length = static_cast<uint16_t>(slot[0] | (slot[1] << 8));
   if (length > kp.length) length = static_cast<uint16_t>(kp.length);
   std::memmove(slot, slot + HA_KEY_BLOB_LENGTH, length);
-  std::memset(slot + length, 0, kp.length - length);
-  const auto stored =
-      static_cast<uint16_t>(kp.shorter_first ? length : 0xFFFF - length);
-  slot[kp.length]     = static_cast<uint8_t>(stored >> 8);
-  slot[kp.length + 1] = static_cast<uint8_t>(stored & 0xFF);
+  std::memset(slot + length, pad_byte(plan, kp), kp.length - length);
+  slot[kp.length]     = static_cast<uint8_t>(length >> 8);
+  slot[kp.length + 1] = static_cast<uint8_t>(length & 0xFF);
 }
 
 // Inverse of move_length_last: back to key_copy()'s layout for key_restore().
 void move_length_first(uint8_t *slot, const KeyPartPlan &kp) {
-  const auto stored = static_cast<uint16_t>((slot[kp.length] << 8) |
-                                            slot[kp.length + 1]);
-  uint16_t length =
-      kp.shorter_first ? stored : static_cast<uint16_t>(0xFFFF - stored);
+  uint16_t length = static_cast<uint16_t>((slot[kp.length] << 8) |
+                                          slot[kp.length + 1]);
   if (length > kp.length) length = static_cast<uint16_t>(kp.length);
   std::memmove(slot + HA_KEY_BLOB_LENGTH, slot, length);
   std::memset(slot + HA_KEY_BLOB_LENGTH + length, 0, kp.length - length);
@@ -457,9 +459,10 @@ TableCodec make_table_codec(TABLE *table, uint8_t key_format) {
   }
   // Secondary keys drop the length altogether (fix_varchar_key_encoding);
   // only the primary key, which must restore, carries it.
-  const uint pk = table->s->primary_key;
-  if (pk != MAX_KEY && key_format >= kKeyFormatValueOrderedPk) {
-    codec.keys[pk].varlen_length_last = true;
+  if (key_format >= kKeyFormatValueOrderedPk) {
+    for (auto &plan : codec.keys) plan.space_pad = true;
+    const uint pk = table->s->primary_key;
+    if (pk != MAX_KEY) codec.keys[pk].varlen_length_last = true;
   }
   return codec;
 }
@@ -472,7 +475,7 @@ void make_mem_comparable(uint8_t *key_data, const KeyPlan &plan, uint key_len) {
     if (p >= end) break;
     if (kp.varlen) {
       if (plan.varlen_length_last) {
-        move_length_last(p + (kp.nullable ? 1 : 0), kp);
+        move_length_last(p + (kp.nullable ? 1 : 0), plan, kp);
       }
       if (kp.nullable) {
         p[0] ^= 0x01;
