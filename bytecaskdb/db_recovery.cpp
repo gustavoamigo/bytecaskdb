@@ -393,9 +393,9 @@ static auto recovery_span_of(const Key &k) noexcept
 // here once every thread is joined: a failure in any phase — a range
 // merge's SequenceOverlap among them — is an exception from DB::open.
 //
-// std::thread, not std::jthread: a jthread's destructor pulls in libc++'s
-// stop_token lock, whose static lambda member a module implementation unit
-// references but does not emit, and the MSan build then fails to link.
+// std::thread, not std::jthread: libc++ 21's jthread leaves
+// __atomic_unique_lock::__set_locked_bit undefined and the MSan build fails
+// to link (llvm/llvm-project#172241).
 template <typename Body>
 static void recovery_parallel_for(unsigned n, Body &body) {
 #ifdef BYTECASK_SINGLE_THREADED
