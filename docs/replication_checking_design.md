@@ -251,7 +251,11 @@ Step 2 as built:
   `:info` with its reads cleared. If the promoted node holds an earlier
   epoch's history (`held` below the old epoch), the bound is where that
   history and the old leader's part, and the lost elements include those
-  the old leader inherited from its own branch. A session read there that waited above
+  the old leader inherited from its own branch. On the old leader the
+  relabelling covers the whole bootstrap life it led in, its follower
+  reads before the term included; its next life is checked as it is.
+  `held` is set only by a drain that ended on an empty slice: a duplicate
+  slice rewound below the node's position proves nothing above it. A session read there that waited above
   that sequence waited on the lost branch, whose sequences the new leader
   reassigns, so its wait is capped at it. The same relabelling applies to
   the node a `fork` event names, in the bootstrap life it names: every

@@ -309,16 +309,22 @@ def relabel_lost_writes(history: list[dict],
     Replication is asynchronous: when a follower is promoted without the old
     leader, the old leader's writes in its last term above what the
     promoted node kept of it are lost by design, and so is
-    anything its clients read of them. A lost write that shows up on another
-    node is still caught: only operations on the old leader are relabelled.
-    Returns how many.
+    anything its clients read of them. The old leader is abandoned and
+    re-bootstrapped, so what it read of the lost elements in the bootstrap
+    life it led in, as a follower before its term included, is relabelled
+    too. A lost write that shows up on another node, or in a later life, is
+    still caught. Returns how many.
     """
     changed = 0
     for ev, lost in promotions:
+        lives = {op.get("life") for op in history
+                 if op.get("node") == ev["from"]
+                 and op.get("epoch") == ev["epoch"] - 1
+                 and op.get("role") == "leader"}
         tenure = [op for op in history
-                  if op.get("node") == ev["from"]
-                  and op.get("epoch") == ev["epoch"] - 1
-                  and op["type"] == "ok"]
+                  if op.get("node") == ev["from"] and op["type"] == "ok"
+                  and (op.get("life") in lives if lives
+                       else op.get("epoch") == ev["epoch"] - 1)]
         changed += relabel_lost(tenure, lost, ev["kept"])
     return changed
 

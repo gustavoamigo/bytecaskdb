@@ -957,9 +957,12 @@ auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
         stats.ingests.fetch_add(1, std::memory_order_relaxed);
         n.pulled_src.store(src, std::memory_order_release);
         n.pulled_epoch.store(v.epoch, std::memory_order_release);
-        if (src == v.leader)
-          n.held_epoch.store(v.epoch, std::memory_order_release);
       } while (!buf.empty() && !stop.load(std::memory_order_relaxed));
+      // Only a drain that ended on an empty slice has had the engine compare
+      // the histories at or above n's own position: a duplicate slice
+      // rewound below it, accepted, proves nothing about what n holds above.
+      if (buf.empty() && src == v.leader)
+        n.held_epoch.store(v.epoch, std::memory_order_release);
     } catch (const bytecask::DbChangeMarkerMismatch &e) {
       // n's history diverged from its source's at a promotion, and the
       // engine refused the slice before writing anything. n stops serving

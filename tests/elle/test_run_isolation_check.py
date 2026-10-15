@@ -42,6 +42,28 @@ def topology_history(held: int) -> tuple[list[dict], dict]:
     return history, summary
 
 
+def op(index, process, node, epoch, role, value, sequence=None, life=1):
+    """An invoke and its :ok completion."""
+    o = {"index": index, "process": process, "type": "ok", "node": node,
+         "epoch": epoch, "life": life, "role": role, "value": value}
+    if sequence is not None:
+        o["sequence"] = sequence
+    inv = {**o, "type": "invoke", "index": index - 1,
+           "value": [[m[0], m[1], None] if m[0] == "r" else m for m in value]}
+    inv.pop("sequence", None)
+    return [inv, o]
+
+
+CHAIN_EVENTS = [
+    {"kind": "unplanned", "epoch": 1, "from": 0, "to": 1, "durable": 100,
+     "held": 0},
+    {"kind": "unplanned", "epoch": 2, "from": 1, "to": 2, "durable": 150,
+     "held": 0},
+    {"kind": "unplanned", "epoch": 3, "from": 2, "to": 0, "durable": 200,
+     "held": 1},
+]
+
+
 def leader_problems(history: list[dict], summary: dict) -> list[str]:
     promotions = ric.lost_by_promotion(history, summary)
     ric.relabel_lost_writes(history, promotions)
@@ -68,38 +90,34 @@ class LostByPromotionTest(unittest.TestCase):
         # (held 0) and reads [10]. Epoch 3: A is promoted holding B's
         # history (held 1); its final read is [20]. C's read of A's branch
         # must count as lost with C's term.
-        def op(index, process, node, epoch, role, value, sequence=None):
-            o = {"index": index, "process": process, "type": "ok",
-                 "node": node, "epoch": epoch, "life": 1, "role": role,
-                 "value": value}
-            if sequence is not None:
-                o["sequence"] = sequence
-            inv = {**o, "type": "invoke", "index": index - 1,
-                   "value": [[m[0], m[1], None] if m[0] == "r" else m
-                             for m in value]}
-            inv.pop("sequence", None)
-            return [inv, o]
-
         history = (op(1, 0, 0, 0, "leader", [["append", 1, 10]], 120)
                    + op(3, 1, 1, 1, "leader", [["append", 1, 20]], 180)
                    + op(5, 2, 2, 2, "leader", [["r", 1, [10]]])
                    + op(7, 9, 0, 3, "final", [["r", 1, [20]]]))
-        summary = {
-            "final_leader": 0,
-            "events": [
-                {"kind": "unplanned", "epoch": 1, "from": 0, "to": 1,
-                 "durable": 100, "held": 0},
-                {"kind": "unplanned", "epoch": 2, "from": 1, "to": 2,
-                 "durable": 150, "held": 0},
-                {"kind": "unplanned", "epoch": 3, "from": 2, "to": 0,
-                 "durable": 200, "held": 1},
-            ],
-        }
+        summary = {"final_leader": 0, "events": CHAIN_EVENTS}
         promotions = ric.lost_by_promotion(history, summary)
         self.assertEqual([lost for _, lost in promotions],
                          [{10}, {20}, {10}])
         self.assertEqual(leader_problems(history, summary), [])
         self.assertEqual(history[5]["type"], "info")
+
+    def test_stale_leader_follower_reads_lost_in_its_life(self):
+        # The chain above, with a second append (11 at 130) on A's branch.
+        # C reads [10, 11] as a follower in epoch 1 before its term, in the
+        # life it leads in, and is re-bootstrapped after epoch 3 (life 2)
+        # with [20]. Its life-1 reads count as lost; the life-2 read stays.
+        history = (op(1, 0, 0, 0, "leader", [["append", 1, 10]], 120)
+                   + op(3, 0, 0, 0, "leader", [["append", 1, 11]], 130)
+                   + op(5, 1, 1, 1, "leader", [["append", 1, 20]], 180)
+                   + op(7, 2, 2, 1, "reader", [["r", 1, [10, 11]]])
+                   + op(9, 3, 2, 2, "leader", [["r", 1, [10, 11]]])
+                   + op(11, 9, 0, 3, "final", [["r", 1, [20]]])
+                   + op(13, 8, 2, 3, "final", [["r", 1, [20]]], life=2))
+        summary = {"final_leader": 0, "events": CHAIN_EVENTS}
+        self.assertEqual(leader_problems(history, summary), [])
+        self.assertEqual(ric.replication_checks(history, 0), [])
+        self.assertEqual(history[7]["type"], "info")
+        self.assertEqual(history[13]["type"], "ok")
 
 
 if __name__ == "__main__":
