@@ -1,6 +1,6 @@
 Vacuum carries on when the sync of what superseded its dropped records
 fails, and unlinks the source anyway. Reverts #261's failure path (#245).
-Guarded-by: "vacuum whose fdatasync fails degrades, keeps the source file*"
+Guarded-by: "vacuum whose fdatasync fails degrades\, keeps the source file*"
 
 diff --git a/bytecaskdb/db_vacuum.cpp b/bytecaskdb/db_vacuum.cpp
 index 056e1d5..b40aaa4 100644
