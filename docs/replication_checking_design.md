@@ -94,7 +94,12 @@ asynchronous, so the old leader's writes with sequence above the promoted
 node's `durable_sequence()` are lost by design. At promotion, the harness
 records that sequence. The script then relabels every leader `:ok` with a
 higher sequence, acknowledged in the old epoch, as `:info`. Those writes may
-or may not appear anywhere, and that is correct.
+or may not appear anywhere, and that is correct. The sequence only bounds
+what the promoted node holds of the old leader's term if it tailed that
+term. Under `--promote-least` a node left ahead of one promotion keeps its
+old branch until its first pull is refused, and the next promotion can
+take it before then: it holds none of the old leader's term, so the
+harness records `tailed: false` and every write of that term counts as lost.
 
 **A crashed node never rejoins in place.** An abandoned leader is only ever
 re-bootstrapped: its directory is wiped and filled from a new manifest, as
@@ -238,7 +243,9 @@ Step 2 as built:
 - `run_isolation_check.py --topology` relabels what an unplanned promotion
   lost: an `:ok` operation on the old leader in its last epoch that wrote or
   read an element above the promoted node's `durable_sequence()` becomes
-  `:info` with its reads cleared. A session read there that waited above
+  `:info` with its reads cleared. If the promoted node never tailed that
+  epoch (`tailed: false`: it was last bootstrapped or fed by an earlier
+  leader), the bound is the start of the old leader's term instead. A session read there that waited above
   that sequence waited on the lost branch, whose sequences the new leader
   reassigns, so its wait is capped at it. The same relabelling applies to
   the node a `fork` event names, in the bootstrap life it names: every

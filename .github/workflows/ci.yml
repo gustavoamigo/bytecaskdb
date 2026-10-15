@@ -88,6 +88,11 @@ jobs:
         # in chaos-nightly.yml.
         run: python3 -m unittest tests/chaos/test_chaosfs.py -v
 
+      - name: Run isolation check accounting tests
+        # The lost-write accounting of run_isolation_check.py; the check
+        # itself runs in isolation-nightly.yml.
+        run: python3 -m unittest tests/elle/test_run_isolation_check.py -v
+
       - name: Run proof independence tests (Hypothesis) and the Python reference
         run: |
           xmake build bytecaskdb_python

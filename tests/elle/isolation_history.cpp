@@ -619,6 +619,12 @@ struct Node {
   // Reset by bootstrap.
   std::atomic<int> pulled_src{-1};
   std::atomic<int> pulled_epoch{-1};
+  // The last epoch whose leader the node is known to hold a prefix of: the
+  // one it was bootstrapped from the leader in, or last ingested from the
+  // leader in. Under --promote-least a node ahead of a promotion keeps its
+  // old branch until its first pull is refused; promoted before that, it
+  // holds none of the old leader's term.
+  std::atomic<int> held_epoch{-1};
 };
 
 // A shared lock on the node's gate if it has a DB and nobody is waiting for
@@ -695,7 +701,10 @@ struct Bootstrap {
 // A topology event, for the summary. kind is "planned", "unplanned",
 // "retarget" or "fork"; durable is the promoted node's durable_sequence()
 // when it stopped tailing (for a retarget, the retargeted node's; for a
-// fork, the position the refused node pulled from).
+// fork, the position the refused node pulled from). tailed, for an
+// unplanned promotion, is whether the promoted node held the old leader's
+// term: false means it led from another branch, and every write of that
+// term is lost, whatever its sequence.
 struct TopologyEvent {
   std::string kind;
   int epoch{0};
@@ -704,6 +713,7 @@ struct TopologyEvent {
   std::uint64_t durable{0};
   std::uint64_t other_durable{0}; // planned: the old leader's; retarget, fork: the source's
   int life{0};                    // fork: the refused node's life
+  bool tailed{true};
 };
 
 struct ClusterStats {
@@ -946,6 +956,8 @@ auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
         stats.ingests.fetch_add(1, std::memory_order_relaxed);
         n.pulled_src.store(src, std::memory_order_release);
         n.pulled_epoch.store(v.epoch, std::memory_order_release);
+        if (src == v.leader)
+          n.held_epoch.store(v.epoch, std::memory_order_release);
       } while (!buf.empty() && !stop.load(std::memory_order_relaxed));
     } catch (const bytecask::DbChangeMarkerMismatch &e) {
       // n's history diverged from its source's at a promotion, and the
@@ -1102,9 +1114,11 @@ auto unplanned_promotion(std::vector<std::unique_ptr<Node>> &nodes,
   auto &tn = *nodes[static_cast<std::size_t>(target)];
   int epoch = 0;
   std::uint64_t promoted_at = 0;
+  bool tailed = true;
   {
     NodeExclusive x{tn};
     promoted_at = tn.holder->db.durable_sequence();
+    tailed = tn.held_epoch.load(std::memory_order_acquire) == view.get().epoch;
     tn.holder->db.set_mode(bytecask::Mode::Leader);
     view.update([&](View &v) {
       v.leader = target;
@@ -1116,7 +1130,7 @@ auto unplanned_promotion(std::vector<std::unique_ptr<Node>> &nodes,
     });
   }
   stats.event({.kind = "unplanned", .epoch = epoch, .from = old, .to = target,
-               .durable = promoted_at, .other_durable = 0});
+               .durable = promoted_at, .other_durable = 0, .tailed = tailed});
   const auto v = view.get();
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     const auto id = static_cast<int>(i);
@@ -1145,9 +1159,10 @@ auto write_cluster_summary(const fs::path &path, ClusterStats &stats,
   for (std::size_t i = 0; i < stats.events.size(); ++i) {
     const auto &e = stats.events[i];
     out << std::format(R"({}{{"kind":"{}","epoch":{},"from":{},"to":{},)"
-                       R"("durable":{},"other_durable":{},"life":{}}})",
+                       R"("durable":{},"other_durable":{},"life":{},)"
+                       R"("tailed":{}}})",
                        i == 0 ? "" : ",", e.kind, e.epoch, e.from, e.to,
-                       e.durable, e.other_durable, e.life);
+                       e.durable, e.other_durable, e.life, e.tailed);
   }
   out << "],\"errors\":[";
   for (std::size_t i = 0; i < stats.errors.size(); ++i) {
@@ -2160,6 +2175,7 @@ auto run(const RunOptions &o) -> int {
           view.update([&](View &v) {
             v.serving[static_cast<std::size_t>(i)] = true;
             at(v.source, i) = v.leader;
+            node(i).held_epoch.store(v.epoch, std::memory_order_release);
           });
           node(i).joining.store(false, std::memory_order_release);
         }
@@ -2229,6 +2245,7 @@ auto run(const RunOptions &o) -> int {
       view.update([&](View &w) {
         w.serving[static_cast<std::size_t>(i)] = true;
         at(w.source, i) = w.leader;
+        node(i).held_epoch.store(w.epoch, std::memory_order_release);
       });
       node(i).joining.store(false, std::memory_order_release);
     }

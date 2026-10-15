@@ -238,19 +238,37 @@ def relabel_lost(ops: list[dict], lost: set[int], cap: int) -> int:
     return changed
 
 
+def kept_by_promotion(ev: dict, events: list[dict]) -> int:
+    """The sequence up to which an unplanned promotion's target holds the
+    old leader's history: its durable_sequence(), or, if it never tailed
+    the old leader's term (a node left ahead of an earlier promotion under
+    --promote-least and promoted before its first pull was refused), the
+    start of that term, so every write of the term counts as lost."""
+    if ev.get("tailed", True):
+        return ev["durable"]
+    start = next((p["durable"] for p in events
+                  if p["kind"] in ("planned", "unplanned")
+                  and p["to"] == ev["from"]
+                  and p["epoch"] == ev["epoch"] - 1), 0)
+    return min(ev["durable"], start)
+
+
 def lost_by_promotion(history: list[dict],
                       summary: dict) -> list[tuple[dict, set[int]]]:
     """Each unplanned promotion with the elements it lost: the old leader's
-    appends above the promoted node's durable_sequence() in its last term."""
+    appends in its last term above what the promoted node kept of it. The
+    returned event carries that sequence as "kept"."""
     out = []
-    for ev in summary.get("events", []):
+    events = summary.get("events", [])
+    for ev in events:
         if ev["kind"] != "unplanned":
             continue
+        ev = {**ev, "kept": kept_by_promotion(ev, events)}
         lost = {m[2] for op in history
                 if op.get("node") == ev["from"]
                 and op.get("epoch") == ev["epoch"] - 1
                 and op["type"] == "ok" and op.get("role") == "leader"
-                and op.get("sequence", 0) > ev["durable"]
+                and op.get("sequence", 0) > ev["kept"]
                 for m in op["value"] if m[0] == "append"}
         out.append((ev, lost))
     return out
@@ -261,8 +279,8 @@ def relabel_lost_writes(history: list[dict],
     """Marks what an unplanned promotion lost as indeterminate.
 
     Replication is asynchronous: when a follower is promoted without the old
-    leader, the old leader's writes above the promoted node's
-    durable_sequence() in its last term are lost by design, and so is
+    leader, the old leader's writes in its last term above what the
+    promoted node kept of it are lost by design, and so is
     anything its clients read of them. A lost write that shows up on another
     node is still caught: only operations on the old leader are relabelled.
     Returns how many.
@@ -273,7 +291,7 @@ def relabel_lost_writes(history: list[dict],
                   if op.get("node") == ev["from"]
                   and op.get("epoch") == ev["epoch"] - 1
                   and op["type"] == "ok"]
-        changed += relabel_lost(tenure, lost, ev["durable"])
+        changed += relabel_lost(tenure, lost, ev["kept"])
     return changed
 
 
@@ -302,7 +320,7 @@ def relabel_forked_reads(history: list[dict], summary: dict,
         if not before:
             continue
         lost = set().union(*(l for _, l in before))
-        cap = min(p["durable"] for p, _ in before)
+        cap = min(p["kept"] for p, _ in before)
         life = [op for op in history
                 if op.get("node") == ev["to"] and op.get("life") == ev["life"]
                 and op["type"] == "ok"]
