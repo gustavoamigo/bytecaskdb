@@ -2,7 +2,7 @@ vacuum removes a file whole when it holds no live value and no tombstone,
 without looking at its change marker: the marker goes with the file, and
 the node's marker at every later sequence silently becomes an earlier one,
 so ingest compares the wrong identity (#397).
-Guarded-by: "vacuum keeps a change marker: compaction leaves it in a file of its own, and never removes that file"
+Guarded-by: "vacuum keeps a change marker: compaction leaves it in a file of its own\, and never removes that file"
 
 diff --git a/bytecaskdb/db_vacuum.cpp b/bytecaskdb/db_vacuum.cpp
 index 056e1d5..f81c89d 100644
