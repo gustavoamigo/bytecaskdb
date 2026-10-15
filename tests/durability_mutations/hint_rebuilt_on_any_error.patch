@@ -3,11 +3,11 @@ ENOMEM, which say nothing about its bytes: a good hint is deleted and the
 rebuild fails the same way. Reverts #270 (#262).
 Guarded-by: "DB::open leaves a hint alone on an error that says nothing about*"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..c21fe845 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -3665,7 +3665,6 @@ auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
+diff --git a/bytecaskdb/db_rotation.cpp b/bytecaskdb/db_rotation.cpp
+index 79e54d3..5a4965a 100644
+--- a/bytecaskdb/db_rotation.cpp
++++ b/bytecaskdb/db_rotation.cpp
+@@ -117,7 +117,6 @@ auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
    try {
      return HintFile::OpenForRead(hint_path);
    } catch (const std::exception &e) {

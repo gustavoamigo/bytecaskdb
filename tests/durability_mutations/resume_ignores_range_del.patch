@@ -2,11 +2,11 @@ resume() replays range tombstones as no-ops, so the keys they deleted stay
 visible until the next open. Reverts #135.
 Guarded-by: "prove_resume__degrade_F_range__*"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..897e17f1 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -2522,6 +2522,7 @@ void TransientEngineState::apply_resume(
+diff --git a/bytecaskdb/engine_state.cpp b/bytecaskdb/engine_state.cpp
+index 5a81066..8f40fa3 100644
+--- a/bytecaskdb/engine_state.cpp
++++ b/bytecaskdb/engine_state.cpp
+@@ -551,6 +551,7 @@ void TransientEngineState::apply_resume(
        // lower sequence. Skipping it here would leave the resumed key
        // directory holding keys a fresh open would not — the one divergence
        // resume() exists to prevent.

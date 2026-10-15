@@ -11,11 +11,11 @@ rare, so it is not held to the budget.
 Expected: caught (rare).
 Guarded-by: "vacuum does not drop a durable record that only an unsynced write supersedes"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index 9f42cec..f655a50 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -4230,11 +4230,6 @@ void DB::vacuum_commit(std::uint32_t old_file_id,
+diff --git a/bytecaskdb/db_vacuum.cpp b/bytecaskdb/db_vacuum.cpp
+index 056e1d5..f2f9cec 100644
+--- a/bytecaskdb/db_vacuum.cpp
++++ b/bytecaskdb/db_vacuum.cpp
+@@ -202,11 +202,6 @@ void DB::vacuum_commit(std::uint32_t old_file_id,
    // unlinked, but what superseded it may be a sync=false write a crash can
    // still lose, taking the key's last durable value with it (#245). So
    // everything the scan saw becomes durable before the source can go.

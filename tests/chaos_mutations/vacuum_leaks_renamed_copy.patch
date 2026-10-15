@@ -9,11 +9,11 @@ after its rename, and the open must then outlast a wall-clock timeout.
 Expected: caught (rare).
 Guarded-by: "vacuum that fails between its rename and its commit removes its copy"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index 729c047..dfb94da 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -4025,8 +4025,7 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
+diff --git a/bytecaskdb/db_vacuum.cpp b/bytecaskdb/db_vacuum.cpp
+index 056e1d5..dc3d0dc 100644
+--- a/bytecaskdb/db_vacuum.cpp
++++ b/bytecaskdb/db_vacuum.cpp
+@@ -318,8 +318,7 @@ auto DB::vacuum_compact_file(std::uint32_t file_id, std::uint64_t retain_after)
    // rotation minted. Frames the hint scan admits under the buffer pool are
    // left to eviction if the copy goes: their file id was reserved for it and
    // is never reused.

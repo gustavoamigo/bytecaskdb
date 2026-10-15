@@ -4,11 +4,11 @@ the node's marker at every later sequence silently becomes an earlier one,
 so ingest compares the wrong identity (#397).
 Guarded-by: "vacuum keeps a change marker: compaction leaves it in a file of its own, and never removes that file"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index 590490e..68df748 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -3991,7 +3991,6 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
+diff --git a/bytecaskdb/db_vacuum.cpp b/bytecaskdb/db_vacuum.cpp
+index 056e1d5..f81c89d 100644
+--- a/bytecaskdb/db_vacuum.cpp
++++ b/bytecaskdb/db_vacuum.cpp
+@@ -79,7 +79,6 @@ auto DB::vacuum(VacuumOptions opts) -> bool {
      // whole while it holds an entry above retain_after, or a change marker,
      // which is kept for ever.
      if (target.live_bytes == 0 && target.tombstone_bytes == 0 &&

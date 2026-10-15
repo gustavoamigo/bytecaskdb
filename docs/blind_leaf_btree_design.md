@@ -784,7 +784,7 @@ The engine reads a key's sequence from its record (§6.2). This is the design th
 
 | Use of `sequence()` today | Replacement |
 |---|---|
-| W-W check and `ensure_unchanged` (`bytecask.cppm` §validate) | Compare the **locations** the snapshot and the head resolve to. Equal means unchanged, by the location invariant: the same record, or the same neighbour in both, which means the key is absent in both. Different means a write, or vacuum moved the record: read both entry headers and compare sequences. |
+| W-W check and `ensure_unchanged` (`engine_state.cpp`, validation) | Compare the **locations** the snapshot and the head resolve to. Equal means unchanged, by the location invariant: the same record, or the same neighbour in both, which means the key is absent in both. Different means a write, or vacuum moved the record: read both entry headers and compare sequences. |
 | Range guards and a range delete's conflict check | Walk the snapshot's and the head's leaves over `[from, to)` together. Identical leaf pointers are skipped whole, since the versions share them. A run whose locations match is unchanged. A mismatch reads headers, as above. |
 | `lost_to` on a conflict | Read the head entry's header. Conflicts are the slow path. |
 | Vacuum liveness (`vacuum_scan_and_copy`) | The record is live when the key resolves to `(source_file, entry_off)`. Vacuum holds the key, so the blind search lands on it if present, and location equality confirms it with no read. |

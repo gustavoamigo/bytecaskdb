@@ -1,6 +1,6 @@
 # ByteCaskDB Transaction Design
 
-**Status: implemented.** `DB::snapshot()`, `Snapshot`, `WritePlan` with its guards, and the conditional `DB::apply_batch(opts, plan)` are in `bytecaskdb/bytecask.cppm`. A higher-level `Transaction` type (buffered writes, read-your-own-writes, merged iterators, read-set tracking) was considered and not built; callers that need one, such as the MariaDB plugin (`bytecaskdb-mariadb-plugin/bytecaskdb_txn.cc`), build it on the primitives described here.
+**Status: implemented.** `DB::snapshot()`, `Snapshot`, `WritePlan` with its guards, and the conditional `DB::apply_batch(opts, plan)` are declared in `bytecaskdb/bytecask.cppm`; `apply_batch` is defined in `db.cpp`, and the guards are checked by `TransientEngineState` in `engine_state.cpp`. A higher-level `Transaction` type (buffered writes, read-your-own-writes, merged iterators, read-set tracking) was considered and not built; callers that need one, such as the MariaDB plugin (`bytecaskdb-mariadb-plugin/bytecaskdb_txn.cc`), build it on the primitives described here.
 
 ## Purpose
 

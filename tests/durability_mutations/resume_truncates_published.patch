@@ -3,11 +3,11 @@ acknowledged data it found damaged or evicted instead of refusing.
 Reverts #136 / #240's refusal.
 Guarded-by: "resume() refuses when a failed fdatasync's pages were evicted*"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..4cb3004d 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -4319,7 +4319,7 @@ void DB::resume() {
+diff --git a/bytecaskdb/db_degraded.cpp b/bytecaskdb/db_degraded.cpp
+index ad938b0..125de76 100644
+--- a/bytecaskdb/db_degraded.cpp
++++ b/bytecaskdb/db_degraded.cpp
+@@ -152,7 +152,7 @@ void DB::resume() {
    // holds. This is detection, not repair: resume() makes no promise about
    // what a damaged file still holds, only that it will not truncate
    // acknowledged bytes or report success over them.

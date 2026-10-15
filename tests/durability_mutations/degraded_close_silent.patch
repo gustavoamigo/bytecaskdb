@@ -2,11 +2,11 @@ close() on a degraded engine returns quietly although writes it
 acknowledged are not durable. Reverts part of #260 (#257).
 Guarded-by: "close() on a degraded engine reports acknowledged writes*"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index e0317da8..d7147df5 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -2754,7 +2754,7 @@ void DB::close() {
+diff --git a/bytecaskdb/db.cpp b/bytecaskdb/db.cpp
+index c06da65..a5f0ade 100644
+--- a/bytecaskdb/db.cpp
++++ b/bytecaskdb/db.cpp
+@@ -186,7 +186,7 @@ void DB::close() {
        // clean that a later one does not write (#231). What was durable when
        // the engine degraded is what is durable. The trim is best effort; a
        // degraded active file may already be sealed.

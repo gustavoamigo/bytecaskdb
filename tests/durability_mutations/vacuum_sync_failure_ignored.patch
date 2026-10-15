@@ -2,11 +2,11 @@ Vacuum carries on when the sync of what superseded its dropped records
 fails, and unlinks the source anyway. Reverts #261's failure path (#245).
 Guarded-by: "vacuum whose fdatasync fails degrades, keeps the source file*"
 
-diff --git a/bytecaskdb/bytecask.cppm b/bytecaskdb/bytecask.cppm
-index 9f42cec..865c6ee 100644
---- a/bytecaskdb/bytecask.cppm
-+++ b/bytecaskdb/bytecask.cppm
-@@ -4233,7 +4233,12 @@ void DB::vacuum_commit(std::uint32_t old_file_id,
+diff --git a/bytecaskdb/db_vacuum.cpp b/bytecaskdb/db_vacuum.cpp
+index 056e1d5..b40aaa4 100644
+--- a/bytecaskdb/db_vacuum.cpp
++++ b/bytecaskdb/db_vacuum.cpp
+@@ -205,7 +205,12 @@ void DB::vacuum_commit(std::uint32_t old_file_id,
    if (t.durable_seq() < decided_at) {
      // A sync after a failed one proves nothing (#231).
      if (refused(*current)) throw DbDegraded{degraded_reason()};
