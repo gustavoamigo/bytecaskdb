@@ -13,12 +13,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 import run_isolation_check as ric  # noqa: E402
 
 
-def topology_history(tailed: bool) -> tuple[list[dict], dict]:
+def topology_history(held: int) -> tuple[list[dict], dict]:
     """Node 0 leads from sequence 100 (epoch 1) and acknowledges an append
     at 120. An unplanned promotion then makes node 1 leader at its
-    durable_sequence() 150. When node 1 never tailed node 0's term, its 150
-    is on node 2's older branch, so the append is lost and the final read
-    on node 1 does not show it."""
+    durable_sequence() 150. When node 1 holds epoch 0's history rather than
+    node 0's term, its 150 is on node 2's older branch, so the append is
+    lost and the final read on node 1 does not show it."""
     history = [
         {"index": 0, "process": 0, "type": "invoke", "node": 0, "epoch": 1,
          "life": 1, "role": "leader", "value": [["append", 1, 10]]},
@@ -34,9 +34,9 @@ def topology_history(tailed: bool) -> tuple[list[dict], dict]:
         "final_leader": 1,
         "events": [
             {"kind": "unplanned", "epoch": 1, "from": 2, "to": 0,
-             "durable": 100, "other_durable": 0, "life": 0, "tailed": True},
+             "durable": 100, "other_durable": 0, "life": 0, "held": 0},
             {"kind": "unplanned", "epoch": 2, "from": 0, "to": 1,
-             "durable": 150, "other_durable": 0, "life": 0, "tailed": tailed},
+             "durable": 150, "other_durable": 0, "life": 0, "held": held},
         ],
     }
     return history, summary
@@ -51,15 +51,55 @@ def leader_problems(history: list[dict], summary: dict) -> list[str]:
 
 class LostByPromotionTest(unittest.TestCase):
     def test_target_that_never_tailed_the_term_loses_all_of_it(self):
-        history, summary = topology_history(tailed=False)
+        history, summary = topology_history(held=0)
         self.assertEqual(leader_problems(history, summary), [])
         self.assertEqual(history[1]["type"], "info")
 
     def test_target_that_tailed_the_term_keeps_up_to_its_durable(self):
-        history, summary = topology_history(tailed=True)
+        history, summary = topology_history(held=1)
         problems = leader_problems(history, summary)
         self.assertTrue(any("missing from final read" in p for p in problems),
                         problems)
+
+    def test_inherited_branch_lost_with_the_term_that_led_from_it(self):
+        # Epoch 0: node 0 (A) appends 10 at 120. Epoch 1: node 1 (B),
+        # promoted at 100, appends 20 at 180; A is re-bootstrapped from B.
+        # Epoch 2: node 2 (C), left ahead on A's branch at 150, is promoted
+        # (held 0) and reads [10]. Epoch 3: A is promoted holding B's
+        # history (held 1); its final read is [20]. C's read of A's branch
+        # must count as lost with C's term.
+        def op(index, process, node, epoch, role, value, sequence=None):
+            o = {"index": index, "process": process, "type": "ok",
+                 "node": node, "epoch": epoch, "life": 1, "role": role,
+                 "value": value}
+            if sequence is not None:
+                o["sequence"] = sequence
+            inv = {**o, "type": "invoke", "index": index - 1,
+                   "value": [[m[0], m[1], None] if m[0] == "r" else m
+                             for m in value]}
+            inv.pop("sequence", None)
+            return [inv, o]
+
+        history = (op(1, 0, 0, 0, "leader", [["append", 1, 10]], 120)
+                   + op(3, 1, 1, 1, "leader", [["append", 1, 20]], 180)
+                   + op(5, 2, 2, 2, "leader", [["r", 1, [10]]])
+                   + op(7, 9, 0, 3, "final", [["r", 1, [20]]]))
+        summary = {
+            "final_leader": 0,
+            "events": [
+                {"kind": "unplanned", "epoch": 1, "from": 0, "to": 1,
+                 "durable": 100, "held": 0},
+                {"kind": "unplanned", "epoch": 2, "from": 1, "to": 2,
+                 "durable": 150, "held": 0},
+                {"kind": "unplanned", "epoch": 3, "from": 2, "to": 0,
+                 "durable": 200, "held": 1},
+            ],
+        }
+        promotions = ric.lost_by_promotion(history, summary)
+        self.assertEqual([lost for _, lost in promotions],
+                         [{10}, {20}, {10}])
+        self.assertEqual(leader_problems(history, summary), [])
+        self.assertEqual(history[5]["type"], "info")
 
 
 if __name__ == "__main__":

@@ -619,12 +619,13 @@ struct Node {
   // Reset by bootstrap.
   std::atomic<int> pulled_src{-1};
   std::atomic<int> pulled_epoch{-1};
-  // The last epoch whose leader the node is known to hold a prefix of: the
-  // one it was bootstrapped from the leader in, or last ingested from the
-  // leader in. Under --promote-least a node ahead of a promotion keeps its
-  // old branch until its first pull is refused; promoted before that, it
-  // holds none of the old leader's term.
-  std::atomic<int> held_epoch{-1};
+  // The last epoch whose leader's history the node is known to hold a
+  // prefix of: the epoch it was bootstrapped from the leader in, last
+  // ingested from the leader in, or led itself. Under --promote-least a node
+  // ahead of a promotion keeps its old branch until its first pull is
+  // refused; promoted before that, it leads from that branch. Node 0 starts
+  // as the leader of epoch 0; any other node sets it at bootstrap.
+  std::atomic<int> held_epoch{0};
 };
 
 // A shared lock on the node's gate if it has a DB and nobody is waiting for
@@ -701,10 +702,10 @@ struct Bootstrap {
 // A topology event, for the summary. kind is "planned", "unplanned",
 // "retarget" or "fork"; durable is the promoted node's durable_sequence()
 // when it stopped tailing (for a retarget, the retargeted node's; for a
-// fork, the position the refused node pulled from). tailed, for an
-// unplanned promotion, is whether the promoted node held the old leader's
-// term: false means it led from another branch, and every write of that
-// term is lost, whatever its sequence.
+// fork, the position the refused node pulled from). held, for an
+// unplanned promotion, is the epoch whose leader's history the promoted
+// node held a prefix of: the old leader's epoch when it tailed it, an
+// earlier one when it leads from another branch.
 struct TopologyEvent {
   std::string kind;
   int epoch{0};
@@ -713,7 +714,7 @@ struct TopologyEvent {
   std::uint64_t durable{0};
   std::uint64_t other_durable{0}; // planned: the old leader's; retarget, fork: the source's
   int life{0};                    // fork: the refused node's life
-  bool tailed{true};
+  int held{-1};                   // unplanned: see above
 };
 
 struct ClusterStats {
@@ -1042,6 +1043,7 @@ auto planned_transfer(std::vector<std::unique_ptr<Node>> &nodes,
   view.update([&](View &v) {
     v.leader = target;
     epoch = ++v.epoch;
+    tn.held_epoch.store(epoch, std::memory_order_release);
     for (std::size_t i = 0; i < v.source.size(); ++i) {
       if (static_cast<int>(i) != target && v.serving[i])
         v.source[i] = target;
@@ -1114,15 +1116,16 @@ auto unplanned_promotion(std::vector<std::unique_ptr<Node>> &nodes,
   auto &tn = *nodes[static_cast<std::size_t>(target)];
   int epoch = 0;
   std::uint64_t promoted_at = 0;
-  bool tailed = true;
+  int held = 0;
   {
     NodeExclusive x{tn};
     promoted_at = tn.holder->db.durable_sequence();
-    tailed = tn.held_epoch.load(std::memory_order_acquire) == view.get().epoch;
+    held = tn.held_epoch.load(std::memory_order_acquire);
     tn.holder->db.set_mode(bytecask::Mode::Leader);
     view.update([&](View &v) {
       v.leader = target;
       epoch = ++v.epoch;
+      tn.held_epoch.store(epoch, std::memory_order_release);
       for (std::size_t i = 0; i < v.source.size(); ++i) {
         if (static_cast<int>(i) != target && v.serving[i])
           v.source[i] = target;
@@ -1130,7 +1133,7 @@ auto unplanned_promotion(std::vector<std::unique_ptr<Node>> &nodes,
     });
   }
   stats.event({.kind = "unplanned", .epoch = epoch, .from = old, .to = target,
-               .durable = promoted_at, .other_durable = 0, .tailed = tailed});
+               .durable = promoted_at, .other_durable = 0, .held = held});
   const auto v = view.get();
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     const auto id = static_cast<int>(i);
@@ -1160,9 +1163,9 @@ auto write_cluster_summary(const fs::path &path, ClusterStats &stats,
     const auto &e = stats.events[i];
     out << std::format(R"({}{{"kind":"{}","epoch":{},"from":{},"to":{},)"
                        R"("durable":{},"other_durable":{},"life":{},)"
-                       R"("tailed":{}}})",
+                       R"("held":{}}})",
                        i == 0 ? "" : ",", e.kind, e.epoch, e.from, e.to,
-                       e.durable, e.other_durable, e.life, e.tailed);
+                       e.durable, e.other_durable, e.life, e.held);
   }
   out << "],\"errors\":[";
   for (std::size_t i = 0; i < stats.errors.size(); ++i) {

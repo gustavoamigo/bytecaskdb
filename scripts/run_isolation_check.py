@@ -238,39 +238,67 @@ def relabel_lost(ops: list[dict], lost: set[int], cap: int) -> int:
     return changed
 
 
-def kept_by_promotion(ev: dict, events: list[dict]) -> int:
-    """The sequence up to which an unplanned promotion's target holds the
-    old leader's history: its durable_sequence(), or, if it never tailed
-    the old leader's term (a node left ahead of an earlier promotion under
-    --promote-least and promoted before its first pull was refused), the
-    start of that term, so every write of the term counts as lost."""
-    if ev.get("tailed", True):
-        return ev["durable"]
-    start = next((p["durable"] for p in events
-                  if p["kind"] in ("planned", "unplanned")
-                  and p["to"] == ev["from"]
-                  and p["epoch"] == ev["epoch"] - 1), 0)
-    return min(ev["durable"], start)
+def term_lineage(events: list[dict]) -> tuple[dict, dict, dict]:
+    """Each leader term's lineage: term k's history is term parent[k]'s up to
+    branch[k], then the writes of leader[k] in k. A planned transfer's
+    target caught up with the old leader; an unplanned promotion's target
+    holds the history of the term it last tailed ("held"), which is an
+    earlier one when it was left ahead of a promotion under --promote-least
+    and promoted again before its first pull was refused."""
+    parent: dict[int, int] = {}
+    branch = {0: 0}
+    leader = {0: 0}
+    for ev in events:
+        if ev["kind"] not in ("planned", "unplanned"):
+            continue
+        k = ev["epoch"]
+        parent[k] = ev.get("held", k - 1) if ev["kind"] == "unplanned" else k - 1
+        branch[k] = ev["durable"]
+        leader[k] = ev["to"]
+    return parent, branch, leader
+
+
+def common_prefix(a: int, b: int, parent: dict, branch: dict) -> float:
+    """The sequence up to which the histories of terms a and b agree."""
+    limit = float("inf")
+    while a != b:
+        if a > b:
+            limit, a = min(limit, branch[a]), parent[a]
+        else:
+            limit, b = min(limit, branch[b]), parent[b]
+    return limit
 
 
 def lost_by_promotion(history: list[dict],
                       summary: dict) -> list[tuple[dict, set[int]]]:
-    """Each unplanned promotion with the elements it lost: the old leader's
-    appends in its last term above what the promoted node kept of it. The
-    returned event carries that sequence as "kept"."""
-    out = []
+    """Each unplanned promotion with the elements it lost: those in the old
+    leader's history, its own term's and any it inherited from an earlier
+    branch, above the sequence where the promoted node's history departs
+    from it. The returned event carries that sequence as "kept"."""
     events = summary.get("events", [])
+    parent, branch, leader = term_lineage(events)
+    writes: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for op in history:
+        t = op.get("epoch")
+        if (op["type"] == "ok" and op.get("role") == "leader"
+                and leader.get(t) == op.get("node")):
+            writes[t].extend((op.get("sequence", 0), m[2])
+                             for m in op["value"] if m[0] == "append")
+    out = []
     for ev in events:
         if ev["kind"] != "unplanned":
             continue
-        ev = {**ev, "kept": kept_by_promotion(ev, events)}
-        lost = {m[2] for op in history
-                if op.get("node") == ev["from"]
-                and op.get("epoch") == ev["epoch"] - 1
-                and op["type"] == "ok" and op.get("role") == "leader"
-                and op.get("sequence", 0) > ev["kept"]
-                for m in op["value"] if m[0] == "append"}
-        out.append((ev, lost))
+        old = ev["epoch"] - 1
+        kept = min(ev["durable"],
+                   common_prefix(old, parent[ev["epoch"]], parent, branch))
+        lost: set[int] = set()
+        term, cutoff = old, float("inf")
+        while cutoff > kept:
+            lost.update(e for seq, e in writes[term] if kept < seq <= cutoff)
+            if term == 0:
+                break
+            cutoff, term = min(cutoff, branch[term]), parent[term]
+        out.append(({**ev, "kept": kept}, lost))
     return out
 
 
