@@ -392,6 +392,10 @@ static auto recovery_span_of(const Key &k) noexcept
 // std::terminate, so each thread catches its own and the first is rethrown
 // here once every thread is joined: a failure in any phase — a range
 // merge's SequenceOverlap among them — is an exception from DB::open.
+//
+// std::thread, not std::jthread: a jthread's destructor pulls in libc++'s
+// stop_token lock, whose static lambda member a module implementation unit
+// references but does not emit, and the MSan build then fails to link.
 template <typename Body>
 static void recovery_parallel_for(unsigned n, Body &body) {
 #ifdef BYTECASK_SINGLE_THREADED
@@ -402,9 +406,11 @@ static void recovery_parallel_for(unsigned n, Body &body) {
     return;
   }
   std::vector<std::exception_ptr> errors(n);
-  {
-    std::vector<std::jthread> threads;
-    threads.reserve(n);
+  std::vector<std::thread> threads;
+  threads.reserve(n);
+  // Destroying a joinable std::thread is std::terminate: a failed spawn
+  // joins the threads already running before it propagates.
+  try {
     for (unsigned i = 0; i < n; ++i) {
       threads.emplace_back([&body, &errors, i] {
         try {
@@ -414,7 +420,11 @@ static void recovery_parallel_for(unsigned n, Body &body) {
         }
       });
     }
+  } catch (...) {
+    for (auto &t : threads) t.join();
+    throw;
   }
+  for (auto &t : threads) t.join();
   for (const auto &err : errors) {
     if (err) std::rethrow_exception(err);
   }
