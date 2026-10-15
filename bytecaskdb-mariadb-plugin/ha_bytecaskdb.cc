@@ -127,6 +127,7 @@ int ha_bytecaskdb::create(const char *name, TABLE *table_arg,
   meta.table_id       = tid;
   meta.schema_version = 2;  // may be upgraded to 3 if FKs present
   meta.full_name      = normalize_table_name(name);
+  meta.key_format     = kKeyFormatCurrent;
   meta.reclength      = static_cast<uint16_t>(table_arg->s->reclength);
   meta.null_bytes     = static_cast<uint16_t>(table_arg->s->null_bytes);
   meta.pk_parts       = (table_arg->s->primary_key != MAX_KEY)
@@ -224,16 +225,18 @@ int ha_bytecaskdb::open(const char *name, int /*mode*/,
     return HA_ERR_NO_SUCH_TABLE;
   }
   table_id_ = tid.value();
-  // Before anything below encodes or decodes a key.
-  codec_ = make_table_codec(table);
 
   TableMeta meta;
+  uint8_t key_format = kKeyFormatLengthPrefixedPk;
   if (catalog_copy_meta(table_id_, meta)) {
     schema_version_ = static_cast<uint16_t>(meta.schema_version);
+    key_format = meta.key_format;
     indexes_ = std::move(meta.indexes);
   } else {
     indexes_.clear();
   }
+  // Before anything below encodes or decodes a key.
+  codec_ = make_table_codec(table, key_format);
 
   // ref_length: 5-byte prefix (1 ns + 4 tid) + PK key length (or 8-byte
   // synthetic rowid for PK-less tables).
@@ -243,9 +246,9 @@ int ha_bytecaskdb::open(const char *name, int /*mode*/,
     seed_rowid_counter_if_needed();
   } else {
     ref_length = 5 + table->key_info[pk].key_length;
-    if (table->found_next_number_field) {
-      seed_autoinc_counter_if_needed();
-    }
+  }
+  if (table->found_next_number_field) {
+    seed_autoinc_counter_if_needed();
   }
 
   row_count_atomic_ = catalog_row_count_ptr(table_id_);
@@ -273,48 +276,69 @@ void ha_bytecaskdb::seed_rowid_counter_if_needed() const {
   catalog_seed_rowid(table_id_, hw);
 }
 
-// Seeds the autoinc counter on first open of a PK table with AUTO_INCREMENT.
-// Restores the last stored key into a scratch buffer and reads the autoinc
-// field from it. When the autoinc column is the leading PK part and DESC, its
-// largest value is stored inverted at the front, so the first key is read.
+// Seeds the autoinc counter on first open of a table with AUTO_INCREMENT,
+// from the largest value of the column in the index MariaDB keeps it in
+// (next_number_index). When the column leads that index, the value sits at
+// one end: the last key, or the first if the part is DESC and so stored
+// inverted. Otherwise each group of leading values holds its own maximum,
+// and the index is scanned once.
 void ha_bytecaskdb::seed_autoinc_counter_if_needed() const {
   if (catalog_peek_autoinc(table_id_) != 0) { return; }
 
-  const uint pk_idx = table->s->primary_key;
-  const uint pk_len = table->key_info[pk_idx].key_length;
-  bytecask::Snapshot snap = g_db->snapshot();
-  uint64_t hw = 0;
+  const uint idx = table->s->next_number_index;
+  const uint part = table->s->next_number_keypart;
+  const bool on_pk = idx == table->s->primary_key;
+  const KeyPlan &plan = codec_.keys[idx];
+  const KeyPartPlan &kp = plan.parts.at(part);
+  Field *ai_field = table->found_next_number_field;
 
-  auto read_hw = [&](const auto &k) {
-    if (k.size() < 5 + pk_len) { return; }
-    std::vector<uchar> scratch(table->s->rec_buff_length, 0);
-    std::vector<uint8_t> key_tmp(u8_data(k) + 5, u8_data(k) + 5 + pk_len);
-    undo_mem_comparable(key_tmp.data(), codec_.keys[pk_idx], pk_len);
-    key_restore(scratch.data(), key_tmp.data(),
-                &table->key_info[pk_idx], pk_len);
-    Field *ai_field = table->found_next_number_field;
-    if (ai_field) {
-      uchar *saved_ptr = ai_field->ptr;
-      ai_field->ptr = scratch.data() + ai_field->offset(table->record[0]);
-      hw = static_cast<uint64_t>(ai_field->val_int());
-      ai_field->ptr = saved_ptr;
+  // The part's slot in a stored key: every slot ahead of it is fixed-width.
+  std::size_t offset = on_pk ? 5 : 7;
+  for (uint i = 0; i < part; ++i) { offset += plan.parts[i].store_length; }
+  const KeyPlan part_plan{{kp}, plan.varlen_length_last};
+
+  uint64_t hw = 0;
+  std::vector<uint8_t> slot(kp.store_length);
+  std::vector<uchar> scratch(table->s->rec_buff_length, 0);
+  auto take = [&](const uint8_t *key, std::size_t len) {
+    if (len < offset + kp.store_length) { return; }
+    slot.assign(key + offset, key + offset + kp.store_length);
+    undo_mem_comparable(slot.data(), part_plan, kp.store_length);
+    const uint null_bytes = kp.store_length - kp.length;
+    if (null_bytes > 0 && slot[0] != 0) { return; }  // NULL
+    std::memcpy(scratch.data() + kp.record_offset, slot.data() + null_bytes,
+                kp.length);
+    uchar *saved_ptr = ai_field->ptr;
+    ai_field->ptr = scratch.data() + kp.record_offset;
+    const auto v = ai_field->val_int();
+    ai_field->ptr = saved_ptr;
+    // A negative signed value never raises the counter.
+    if (ai_field->is_unsigned() || v > 0) {
+      hw = std::max(hw, static_cast<uint64_t>(v));
     }
   };
 
-  const bool autoinc_leads_desc = table->s->next_number_index == pk_idx &&
-                                  table->s->next_number_keypart == 0 &&
-                                  codec_.keys[pk_idx].parts.at(0).desc;
-  if (autoinc_leads_desc) {
-    auto lower = table_id_prefix(table_id_);
-    for (auto &k : snap.keys_from({}, as_view(lower))) {
-      if (key_belongs_to_table(u8_data(k), k.size(), table_id_)) { read_hw(k); }
+  const auto iid = static_cast<uint16_t>(idx);
+  const auto lower = on_pk ? table_id_prefix(table_id_)
+                           : index_id_prefix(table_id_, iid);
+  const auto upper = on_pk ? table_id_upper_bound(table_id_)
+                           : index_id_upper_bound(table_id_, iid);
+  auto in_index = [&](const auto &k) {
+    return on_pk ? key_belongs_to_table(u8_data(k), k.size(), table_id_)
+                 : key_belongs_to_index(u8_data(k), k.size(), table_id_, iid);
+  };
+
+  bytecask::Snapshot snap = g_db->snapshot();
+  if (part == 0 && !kp.desc) {
+    for (auto &k : snap.rkeys_from({}, as_view(upper))) {
+      if (in_index(k)) { take(u8_data(k), k.size()); }
       break;
     }
   } else {
-    auto upper = table_id_upper_bound(table_id_);
-    for (auto &k : snap.rkeys_from({}, as_view(upper))) {
-      if (key_belongs_to_table(u8_data(k), k.size(), table_id_)) { read_hw(k); }
-      break;
+    for (auto &k : snap.keys_from({}, as_view(lower))) {
+      if (!in_index(k)) { break; }
+      take(u8_data(k), k.size());
+      if (part == 0) { break; }  // DESC: the largest value comes first
     }
   }
   catalog_seed_autoinc(table_id_, hw);
@@ -1156,7 +1180,7 @@ std::size_t ha_bytecaskdb::build_search_key(uint idx, const uchar *key,
   std::memcpy(kp, key, prefix_len);
 
   // The fix-ups walk every key part; the zero-filled unsupplied parts read
-  // as empty and are left as zeros. The transform is limited to the
+  // as empty, and are reset to zeros below. The transform is limited to the
   // supplied prefix (whole parts), so only those bytes are rewritten.
   if (on_pk) {
     normalize_padspace_pk(kp, codec_.keys[idx]);
@@ -1164,6 +1188,10 @@ std::size_t ha_bytecaskdb::build_search_key(uint idx, const uchar *key,
     fix_varchar_key_encoding(kp, codec_.keys[idx]);
   }
   make_mem_comparable(kp, codec_.keys[idx], prefix_len);
+  // The fix-ups pad an unsupplied VARCHAR part as a stored key would (with
+  // spaces under PAD SPACE); a low bound needs zero bytes there, below every
+  // stored key sharing the prefix.
+  std::memset(kp + prefix_len, 0, key_len - prefix_len);
 
   if (pad_high) {
     std::memset(kp + prefix_len, 0xFF, key_len - prefix_len);

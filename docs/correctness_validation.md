@@ -2177,7 +2177,9 @@ behind hint generation at open, `resume()`, vacuum's copy and
 - `CommittedEntryIterator` yields the raw entries minus a batch still open
   at the end, never part of a batch, and its `committed_offset()` is the
   end of the last entry it yielded; when the sweep throws, what it yielded
-  before is a prefix of that.
+  before is a prefix of that;
+- a change marker inside a batch is damage: `CommittedEntryIterator` throws
+  there under `Throw`, and under `Stop` ends the sweep without that batch.
 
 The file is held in memory (a `DataFile` whose point reads abort, since the
 sweep never makes them), so a run is not bound by syscalls. Bits 2–3 of the

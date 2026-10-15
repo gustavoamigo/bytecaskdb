@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (c) 2026 Gustavo Amigo
 #
-# test_desc_autoinc.py — the AUTO_INCREMENT counter is seeded from the largest
-# stored id after a restart when the primary key is DESC (#456): its keys are
-# stored largest first, so the seed reads the first key, not the last. A DESC
-# part ahead of the AUTO_INCREMENT column does not move where its largest
-# value is stored within a group.
+# test_desc_autoinc.py — after a restart, the AUTO_INCREMENT counter is seeded
+# from the largest value of the column, wherever its index keeps it: the
+# first key of a DESC primary key (#456), every group of a composite key whose
+# leading column is not the counter's (#460), a secondary index, and a table
+# with no primary key.
 
 import os
 
@@ -30,6 +30,22 @@ def test_desc_pk_autoinc_seeds_after_restart():
                 " b INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (a DESC, b))"
                 " ENGINE=bytecaskdb")
             cur.execute("INSERT INTO desc_ai.c (a) VALUES (1), (1), (1)")
+            # The largest b is in the smallest a's group: (2,1),(1,2),(1,3),(1,4).
+            cur.execute(
+                "CREATE TABLE desc_ai.g (a INT NOT NULL,"
+                " b INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (a, b))"
+                " ENGINE=bytecaskdb")
+            cur.execute("INSERT INTO desc_ai.g (a) VALUES (2), (1), (1), (1)")
+            # Counter in a secondary index, under a primary key it is not in.
+            cur.execute(
+                "CREATE TABLE desc_ai.s (k INT NOT NULL PRIMARY KEY,"
+                " n INT NOT NULL AUTO_INCREMENT, KEY (n)) ENGINE=bytecaskdb")
+            cur.execute("INSERT INTO desc_ai.s (k) VALUES (30), (20), (10)")
+            # No primary key at all.
+            cur.execute(
+                "CREATE TABLE desc_ai.n (n INT NOT NULL AUTO_INCREMENT, v INT,"
+                " KEY (n)) ENGINE=bytecaskdb")
+            cur.execute("INSERT INTO desc_ai.n (v) VALUES (1), (2), (3)")
         conn.close()
 
         server.restart()
@@ -42,6 +58,15 @@ def test_desc_pk_autoinc_seeds_after_restart():
             cur.execute("INSERT INTO desc_ai.c (a) VALUES (1)")
             cur.execute("SELECT a, b FROM desc_ai.c ORDER BY b")
             assert cur.fetchall() == ((1, 1), (1, 2), (1, 3), (1, 4))
+            cur.execute("INSERT INTO desc_ai.g (a) VALUES (1)")
+            cur.execute("SELECT MAX(b) FROM desc_ai.g")
+            assert cur.fetchall() == ((5,),)
+            cur.execute("INSERT INTO desc_ai.s (k) VALUES (40)")
+            cur.execute("SELECT n FROM desc_ai.s WHERE k = 40")
+            assert cur.fetchall() == ((4,),)
+            cur.execute("INSERT INTO desc_ai.n (v) VALUES (4)")
+            cur.execute("SELECT n, v FROM desc_ai.n ORDER BY n")
+            assert cur.fetchall() == ((1, 1), (2, 2), (3, 3), (4, 4))
         conn.close()
     finally:
         server.cleanup()

@@ -37,6 +37,11 @@ struct KeyPartPlan {
   bool varchar{false};        // VARCHAR column
   bool varlen{false};         // VARCHAR or BLOB part: no byte transform
   bool pad_space{false};      // varlen under a PAD SPACE collation
+  // A space in the column's charset: 0x20, 00 20 in ucs2/utf16, 20 00 in
+  // utf16le, 00 00 00 20 in utf32. Format 1 trims and pads by whole spaces;
+  // space_len 0 (charset could not encode one) leaves the value unpadded.
+  uint8_t space[4]{0x20, 0, 0, 0};
+  uint8_t space_len{1};
   bool be_temporal{false};    // DATETIME2/TIMESTAMP2/TIME2: big-endian already
   bool reverse{false};        // little-endian in the record: stored reversed
   Flip flip{Flip::kNone};     // applied with reverse
@@ -45,6 +50,15 @@ struct KeyPartPlan {
 
 struct KeyPlan {
   std::vector<KeyPartPlan> parts;
+  // Primary key of a kKeyFormatValueOrderedPk table: a VARCHAR or BLOB part
+  // keeps its slot, but its length moves behind the padded bytes, so the
+  // part sorts by value and still restores exactly.
+  bool varlen_length_last{false};
+  // kKeyFormatValueOrderedPk, every key: a VARCHAR or BLOB part under a PAD
+  // SPACE collation has its trailing spaces trimmed, and is padded, by whole
+  // characters of its charset, so it sorts as the collation compares it
+  // ('a\0b' before 'a'). Format 0 trims 0x20 bytes and pads with zeros.
+  bool space_pad{false};
 };
 
 // Everything the row and key codecs ask of a table's definition, read once
@@ -56,7 +70,8 @@ struct TableCodec {
   std::vector<KeyPlan> keys;  // by key number, as table->key_info
 };
 
-TableCodec make_table_codec(TABLE *table);
+// `key_format` is the table's kKeyFormat* from its catalog entry.
+TableCodec make_table_codec(TABLE *table, uint8_t key_format);
 
 // Encodes the primary-key columns of the row at `buf` (table->record[0] or
 // table->record[1]) into a ByteCaskDB key: namespace byte (0x02) + 4-byte
@@ -171,7 +186,8 @@ void normalize_padspace_pk(uint8_t *key_data, const KeyPlan &plan);
 // mem-comparable encoding (big-endian, sign-bit flipped for signed types).
 // Operates in-place on the key_data starting immediately after any prefix
 // (5-byte for PK, 7-byte for secondary). Only affects integer field types;
-// VARCHARs and other types are left untouched. A DESC part then has every
+// VARCHARs and other types are left untouched, except that a plan with
+// varlen_length_last moves their length behind their bytes. A DESC part then has every
 // byte, null indicator included, inverted, so its stored keys sort in the
 // index's order — descending, NULLs last — as the server reads it.
 void make_mem_comparable(uint8_t *key_data, const KeyPlan &plan, uint key_len);

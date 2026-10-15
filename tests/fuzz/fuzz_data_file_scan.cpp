@@ -23,7 +23,8 @@
 //   - under Stop the sweep never throws;
 //   - CommittedEntryIterator yields exactly the raw entries minus a trailing
 //     unfinished batch, never part of a batch, and committed_offset() is the
-//     end of the last entry it yielded.
+//     end of the last entry it yielded; a change marker inside a batch throws
+//     under Throw and ends the sweep before that batch under Stop.
 //
 // Build:  xmake f --sanitizer=fuzzer,address -m debug -y
 //         xmake build fuzz_data_file_scan
@@ -163,20 +164,31 @@ auto sweep_raw(const MemoryDataFile &file, std::span<const std::byte> bytes,
 }
 
 // What CommittedEntryIterator must yield from the raw entries of a sweep
-// that did not throw: everything but a batch still open at the end.
-auto committed_model(const std::vector<std::pair<DataEntry, Offset>> &raw)
-    -> std::vector<std::pair<DataEntry, Offset>> {
-  std::vector<std::pair<DataEntry, Offset>> out;
+// that did not throw: everything but a batch still open at the end. A change
+// marker inside a batch is damage: the batch goes, and the sweep throws there
+// under OnDamage::Throw or ends there under OnDamage::Stop.
+struct Committed {
+  std::vector<std::pair<DataEntry, Offset>> entries;
+  bool threw{false};
+};
+
+auto committed_model(const std::vector<std::pair<DataEntry, Offset>> &raw,
+                     OnDamage on_damage) -> Committed {
+  Committed out;
   std::optional<std::size_t> open_batch;
   for (const auto &e : raw) {
+    if (open_batch && e.first.entry_type == EntryType::ChangeMarker) {
+      out.threw = on_damage == OnDamage::Throw;
+      break;
+    }
     if (!open_batch && e.first.entry_type == EntryType::BulkBegin) {
-      open_batch = out.size();
+      open_batch = out.entries.size();
     } else if (open_batch && e.first.entry_type == EntryType::BulkEnd) {
       open_batch.reset();
     }
-    out.push_back(e);
+    out.entries.push_back(e);
   }
-  if (open_batch) out.resize(*open_batch);
+  if (open_batch) out.entries.resize(*open_batch);
   return out;
 }
 
@@ -198,8 +210,9 @@ void sweep_committed(const MemoryDataFile &file,
   } catch (const std::runtime_error &) {
     threw = true;
   }
-  check(threw == raw.threw);
-  const auto want = committed_model(raw.entries);
+  const auto model = committed_model(raw.entries, sweep.on_damage);
+  check(threw == (raw.threw || model.threw));
+  const auto &want = model.entries;
   if (threw) {
     // A throw ends the sweep before the batch it was staging is yielded, so
     // what was yielded is a prefix of the model.

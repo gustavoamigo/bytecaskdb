@@ -178,6 +178,10 @@ std::string normalize_table_name(const char *name) {
 //       [col:        col_len bytes]
 //     [update_opt:   1 byte]
 //     [delete_opt:   1 byte]
+//
+// Then, in either version:
+//   [key_format:     1 byte]    -- absent in entries written before it
+//                                  existed, which read as format 0
 // ---------------------------------------------------------------------------
 
 std::vector<uint8_t> serialize_table_meta(const TableMeta &meta) {
@@ -208,6 +212,7 @@ std::vector<uint8_t> serialize_table_meta(const TableMeta &meta) {
       total += 2; // update_opt + delete_opt
     }
   }
+  total += 1; // key_format
 
   std::vector<uint8_t> buf(total);
   uint8_t *p = buf.data();
@@ -274,6 +279,8 @@ std::vector<uint8_t> serialize_table_meta(const TableMeta &meta) {
       *p++ = fk.delete_opt;
     }
   }
+
+  *p++ = meta.key_format;
 
   return buf;
 }
@@ -412,6 +419,9 @@ bool deserialize_table_meta(const uint8_t *data, std::size_t len,
       out.fks[i].delete_opt = *p++; remaining -= 1;
     }
   }
+
+  remaining = len - static_cast<std::size_t>(p - data);
+  out.key_format = remaining >= 1 ? *p : kKeyFormatLengthPrefixedPk;
 
   return true;
 }

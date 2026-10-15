@@ -146,6 +146,21 @@ void gen_data_file_scan_corpus(const std::filesystem::path &dir) {
       concat({put(1, "a", "alpha"), damaged, put(3, "c", "charlie")});
   write_seed(dir / "damaged_throw", std::byte{0}, with_damage);
   write_seed(dir / "damaged_stop", kOnDamageStop, with_damage);
+
+  // A change marker on its own, then one inside a batch, which is damage:
+  // Throw and Stop.
+  const auto change_marker = [](std::uint64_t seq) {
+    const std::vector<std::byte> id(bytecask::kChangeMarkerIdBytes,
+                                    std::byte{0x5a});
+    return serialize_entry(seq, EntryType::ChangeMarker, {}, id);
+  };
+  const auto marker_in_batch =
+      concat({put(1, "a", "alpha"), change_marker(2),
+              marker(3, EntryType::BulkBegin), put(4, "b", "bravo"),
+              change_marker(5), marker(6, EntryType::BulkEnd)});
+  write_seed(dir / "marker_in_batch_throw", kFixUpCrc, marker_in_batch);
+  write_seed(dir / "marker_in_batch_stop", kFixUpCrc | kOnDamageStop,
+             marker_in_batch);
 }
 
 // --- Hint entry seeds ---

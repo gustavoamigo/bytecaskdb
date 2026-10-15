@@ -1,0 +1,61 @@
+# varchar_pk_order.yaml — a VARCHAR primary key sorts by value, not by length
+# (#459): ranges and ordered scans return the rows InnoDB would.
+
+- name: VARCHAR primary key ranges and ordered scans
+  setup:
+    - DROP DATABASE IF EXISTS vpk1
+    - CREATE DATABASE vpk1
+    - CREATE TABLE vpk1.t (v VARCHAR(8) NOT NULL, n INT, PRIMARY KEY (v)) ENGINE=bytecaskdb
+    - INSERT INTO vpk1.t VALUES ('b', 1), ('ab', 2), ('a', 3), ('abc', 4), ('c', 5), ('', 6)
+  steps:
+    - sql: SELECT v FROM vpk1.t ORDER BY v
+      expected: [[''], ['a'], ['ab'], ['abc'], ['b'], ['c']]
+    - sql: SELECT v FROM vpk1.t WHERE v > 'a' ORDER BY v
+      expected: [['ab'], ['abc'], ['b'], ['c']]
+    - sql: SELECT v FROM vpk1.t FORCE INDEX (PRIMARY) WHERE v BETWEEN 'ab' AND 'b' ORDER BY v
+      expected: [['ab'], ['abc'], ['b']]
+    - sql: SELECT v FROM vpk1.t ORDER BY v DESC LIMIT 2
+      expected: [['c'], ['b']]
+    - sql: SELECT n FROM vpk1.t WHERE v = 'abc'
+      expected: [['4']]
+    - sql: SELECT v FROM vpk1.t WHERE v LIKE 'ab%' ORDER BY v
+      expected: [['ab'], ['abc']]
+    - sql: UPDATE vpk1.t SET v = 'bb' WHERE v = 'ab'
+    - sql: SELECT v FROM vpk1.t WHERE v >= 'b' ORDER BY v
+      expected: [['b'], ['bb'], ['c']]
+    - sql: INSERT INTO vpk1.t VALUES ('abc', 9)
+      error: 1062
+    - sql: SELECT COUNT(*) FROM vpk1.t
+      expected: [['6']]
+  teardown:
+    - DROP DATABASE IF EXISTS vpk1
+
+- name: DESC VARCHAR primary key
+  setup:
+    - DROP DATABASE IF EXISTS vpk2
+    - CREATE DATABASE vpk2
+    - CREATE TABLE vpk2.t (v VARCHAR(8) NOT NULL, PRIMARY KEY (v DESC)) ENGINE=bytecaskdb
+    - INSERT INTO vpk2.t VALUES ('b'), ('ab'), ('a'), ('abc'), ('c')
+  steps:
+    - sql: SELECT v FROM vpk2.t ORDER BY v DESC
+      expected: [['c'], ['b'], ['abc'], ['ab'], ['a']]
+    - sql: SELECT v FROM vpk2.t FORCE INDEX (PRIMARY) WHERE v BETWEEN 'ab' AND 'b' ORDER BY v
+      expected: [['ab'], ['abc'], ['b']]
+  teardown:
+    - DROP DATABASE IF EXISTS vpk2
+
+- name: Composite primary key with a VARCHAR leading part
+  setup:
+    - DROP DATABASE IF EXISTS vpk3
+    - CREATE DATABASE vpk3
+    - CREATE TABLE vpk3.t (s VARCHAR(8) NOT NULL, i INT NOT NULL, PRIMARY KEY (s, i), KEY ki (i)) ENGINE=bytecaskdb
+    - INSERT INTO vpk3.t VALUES ('b', 1), ('ab', 2), ('ab', 1), ('a', 7), ('abc', 0)
+  steps:
+    - sql: SELECT s, i FROM vpk3.t ORDER BY s, i
+      expected: [['a', '7'], ['ab', '1'], ['ab', '2'], ['abc', '0'], ['b', '1']]
+    - sql: SELECT i FROM vpk3.t WHERE s = 'ab' ORDER BY i
+      expected: [['1'], ['2']]
+    - sql: SELECT s FROM vpk3.t FORCE INDEX (ki) WHERE i = 1 ORDER BY s
+      expected: [['ab'], ['b']]
+  teardown:
+    - DROP DATABASE IF EXISTS vpk3
