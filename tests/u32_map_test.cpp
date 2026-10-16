@@ -36,6 +36,40 @@ auto contents(const std::map<std::uint32_t, int> &m)
   return {m.begin(), m.end()};
 }
 
+// Two iterators are equal exactly when both are at the end, or both are
+// over the same table at the same key. A copy built separately is another
+// table, so its iterators equal the original's only at the end.
+template <typename P> void check_iterator_equality(const P &m) {
+  auto c = P{}.transient();
+  for (auto it = m.begin(); it != std::default_sentinel; ++it) {
+    const auto [k, v] = *it;
+    c.set(k, v);
+  }
+  const auto copy = std::move(c).persistent();
+  using It = decltype(m.begin());
+  struct Pos {
+    It it;
+    int table;
+    std::uint32_t key;
+    bool end;
+  };
+  std::vector<Pos> pos;
+  auto walk = [&](const P &t, int table) {
+    auto it = t.begin();
+    for (; it != std::default_sentinel; ++it)
+      pos.push_back({it, table, (*it).first, false});
+    pos.push_back({it, table, 0, true});
+  };
+  walk(m, 0);
+  walk(copy, 1);
+  pos.push_back({It{}, 2, 0, true});
+  for (const auto &a : pos)
+    for (const auto &b : pos)
+      REQUIRE((a.it == b.it) ==
+              (a.end ? b.end
+                     : !b.end && a.table == b.table && a.key == b.key));
+}
+
 } // namespace
 
 TEMPLATE_TEST_CASE("u32 map matches a std::map model", "[u32_map]",
@@ -43,6 +77,7 @@ TEMPLATE_TEST_CASE("u32 map matches a std::map model", "[u32_map]",
   std::mt19937 rng{7};
   std::map<std::uint32_t, int> model;
   TestType map;
+  REQUIRE(map.empty());
   // Keys in a narrow, shifting window, as file ids are: minted upwards,
   // erased from anywhere.
   std::uint32_t lo = 100;
@@ -77,6 +112,7 @@ TEMPLATE_TEST_CASE("u32 map matches a std::map model", "[u32_map]",
     REQUIRE(contents(map) == contents(model));
     REQUIRE(map.empty() == model.empty());
     for (const auto &[k, v] : model) REQUIRE(*map.get(k) == v);
+    check_iterator_equality(map);
     // The version before this round is untouched.
     REQUIRE(contents(before) == contents(before_model));
     if (rng() % 8 == 0) lo += 10;

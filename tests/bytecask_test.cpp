@@ -5450,6 +5450,91 @@ TEST_CASE("DB riter_from with a key that is a strict prefix of an existing "
   }
 }
 
+// Scans against a std::map: forward and reverse, keys and entries, each
+// started from a key that is present, absent, before the first or past the
+// last — the starting points where the key directory's bounds decide
+// something. Files are small, so a scan crosses several of them.
+TEST_CASE("model: scans from any starting key match a std::map",
+          "[bytecask][iteration][model]") {
+  TempDir td;
+  bytecask::Options opts;
+  opts.max_file_bytes = 4096;
+  auto db = bytecask::DB::open(td.path / "db", opts);
+  std::mt19937_64 rng{31};
+  std::map<std::string, std::string> model;
+  constexpr std::size_t kTake = 4;
+
+  auto check_from = [&](const std::string &from) {
+    INFO("from " << from);
+    std::vector<std::pair<std::string, std::string>> want;
+    for (auto it = model.lower_bound(from);
+         it != model.end() && want.size() < kTake; ++it)
+      want.emplace_back(it->first, it->second);
+    std::vector<std::pair<std::string, std::string>> got;
+    for (const auto &entry : db.iter_from({}, to_bytes(from))) {
+      if (got.size() == kTake) break;
+      got.emplace_back(to_string(entry.key), to_string(entry.value));
+    }
+    REQUIRE(got == want);
+    std::vector<std::string> got_keys;
+    for (const auto &k : db.keys_from({}, to_bytes(from))) {
+      if (got_keys.size() == kTake) break;
+      got_keys.push_back(to_string(k));
+    }
+    REQUIRE(got_keys.size() == want.size());
+    for (std::size_t i = 0; i < want.size(); ++i)
+      REQUIRE(got_keys[i] == want[i].first);
+
+    // Reverse: from the last key <= from.
+    want.clear();
+    for (auto it = model.upper_bound(from);
+         it != model.begin() && want.size() < kTake;) {
+      --it;
+      want.emplace_back(it->first, it->second);
+    }
+    got.clear();
+    for (const auto &entry : db.riter_from({}, to_bytes(from))) {
+      if (got.size() == kTake) break;
+      got.emplace_back(to_string(entry.key), to_string(entry.value));
+    }
+    REQUIRE(got == want);
+    got_keys.clear();
+    for (const auto &k : db.rkeys_from({}, to_bytes(from))) {
+      if (got_keys.size() == kTake) break;
+      got_keys.push_back(to_string(k));
+    }
+    REQUIRE(got_keys.size() == want.size());
+    for (std::size_t i = 0; i < want.size(); ++i)
+      REQUIRE(got_keys[i] == want[i].first);
+  };
+
+  for (int round = 0; round < 6; ++round) {
+    for (int op = 0; op < 150; ++op) {
+      const auto key = "k" + std::to_string(rng() % 300);
+      if (rng() % 4 == 0) {
+        (void)db.del({.sync = false}, to_bytes(key));
+        model.erase(key);
+      } else {
+        const auto value = std::to_string(rng());
+        db.put({.sync = false}, to_bytes(key), to_bytes(value));
+        model[key] = value;
+      }
+    }
+    // Before every key, past every key, and keys in between.
+    check_from("a");
+    check_from("z");
+    for (int i = 0; i < 30; ++i) {
+      if (!model.empty() && rng() % 2 == 0) {
+        auto it = model.begin();
+        std::advance(it, static_cast<std::ptrdiff_t>(rng() % model.size()));
+        check_from(it->first);
+      } else {
+        check_from("k" + std::to_string(rng() % 300) + "x");
+      }
+    }
+  }
+}
+
 TEST_CASE("DB rkeys_from returns all keys in descending order",
           "[bytecask]") {
   TempDir td;
@@ -7351,10 +7436,14 @@ TEST_CASE("vacuum whose fdatasync fails degrades, keeps the source file, and "
 TEST_CASE("after close() every operation throws DbClosed; snapshots taken "
           "before stay readable",
           "[close]") {
+  // In both modes: a closed follower refuses ingest for being closed, not
+  // for its mode.
+  const auto mode = GENERATE(bytecask::Mode::Leader, bytecask::Mode::Follower);
   TempDir td;
   const auto dir = td.path / "db";
   auto db = bytecask::DB::open(dir);
   db.put({}, to_bytes("k"), to_bytes("v"));
+  db.set_mode(mode);
   auto snap = db.snapshot();
   auto it = db.iter_from({}, to_bytes("k")).begin();
   db.close();
@@ -7382,7 +7471,7 @@ TEST_CASE("after close() every operation throws DbClosed; snapshots taken "
   CHECK_THROWS_AS(db.resume(), bytecask::DbClosed);
   CHECK_THROWS_AS((void)db.stats(), bytecask::DbClosed);
   CHECK_THROWS_AS(db.ingest({}, {}), bytecask::DbClosed);
-  CHECK(db.mode() == bytecask::Mode::Leader);
+  CHECK(db.mode() == mode);
   CHECK_FALSE(db.is_degraded());
 
   CHECK(snap.get({}, to_bytes("k"), out));

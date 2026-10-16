@@ -560,7 +560,9 @@ private:
       {
         std::unique_lock<std::mutex> lk{mu_};
         cv_task_.wait(lk, [this] { return stop_ || !queue_.empty(); });
-        if (stop_ && queue_.empty())
+        // Woken with nothing queued only when stopping; a stop with tasks
+        // queued runs them first.
+        if (queue_.empty())
           return;
         task = std::move(queue_.front());
         queue_.pop();
