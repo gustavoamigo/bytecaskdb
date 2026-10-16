@@ -83,6 +83,12 @@ jobs:
           build/linux/x86_64/release/btree_tests --reporter junit --out test-results/btree_tests.xml || status=1
           exit "$status"
 
+      - name: Every mutation's Guarded-by spec selects a test
+        # Catch2 reads an unescaped comma in a spec as OR (#463); see
+        # scripts/check_guarded_by.py. Plugin patches are checked in
+        # mariadb-plugin.
+        run: python3 scripts/check_guarded_by.py --scope engine build/linux/x86_64/release/bytecask_tests
+
       - name: Run chaosfs model tests
         # The chaos rig's filesystem model, without FUSE; the rig itself runs
         # in chaos-nightly.yml.
@@ -272,6 +278,9 @@ jobs:
           cd bytecaskdb-mariadb-plugin/build
           ctest --output-on-failure \
             --output-junit "${GITHUB_WORKSPACE}/test-results/mariadb_plugin_ctest.xml"
+
+      - name: Every plugin mutation's Guarded-by spec selects a test
+        run: python3 scripts/check_guarded_by.py --scope plugin bytecaskdb-mariadb-plugin/build/mariadb_proof_tests
 
       - name: Run functional tests against mariadbd
         run: |

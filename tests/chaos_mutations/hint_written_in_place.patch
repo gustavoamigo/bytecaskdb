@@ -10,7 +10,7 @@ Unfocused runs caught it twice in about 45 minutes; focusing on power cuts
 without the latency and stalls that slow opens down caught it less, so it
 runs unfocused and is not held to a budget.
 Expected: caught (rare).
-Guarded-by: "DB recovery: a crash while open writes a hint leaves no hint behind it, and the next open recovers"
+Guarded-by: "DB recovery: a crash while open writes a hint leaves no hint behind it\, and the next open recovers"
 
 diff --git a/bytecaskdb/db_rotation.cpp b/bytecaskdb/db_rotation.cpp
 index 79e54d3..1817944 100644
