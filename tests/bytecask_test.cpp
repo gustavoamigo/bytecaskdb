@@ -12927,6 +12927,77 @@ TEST_CASE("BC-243: thread-local read cache does not leak across DB instances",
   CHECK(b.contains_key({}, to_bytes("only_in_b")));
 }
 
+// #384: a thread's scratch buffers grew to the largest record it had read or
+// written and kept that memory after close(), for as long as the thread
+// lived. A thread that reads and writes large records must hold no more than
+// kScratchKeepBytes per buffer once the DB is closed.
+TEST_CASE("#384: thread scratch gives back a large record after close",
+          "[bytecask][tl-cache]") {
+  const auto io_backend =
+      GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::BufferPool);
+  CAPTURE(static_cast<int>(io_backend));
+  bytecask::Options opts{.max_key_bytes = bytecask::kMaxKeySize,
+                         .io_backend = io_backend};
+  // A 3 MiB value is below the pool's oversize limit, so a cold read of it
+  // is one fill through the pool's scratch.
+  opts.buffer_pool.capacity_bytes = 64 * 1024 * 1024;
+  constexpr std::size_t kValueBytes = 3 * 1024 * 1024;
+  static_assert(kValueBytes > bytecask::kScratchKeepBytes);
+  // 32 keys of 60 KiB in one chunk: the append scratch holds ~1.9 MiB.
+  constexpr std::size_t kKeys = 32;
+  constexpr std::size_t kKeyBytes = 60 * 1024;
+  static_assert(kKeys * kKeyBytes > bytecask::kScratchKeepBytes);
+  ScopedWritevLimits limits{{kKeys + 2, bytecask::kMaxBytesPerWritev}};
+
+  TempDir td;
+  const std::string big(kValueBytes, 'v');
+  const auto long_key = [](std::size_t i) {
+    auto k = std::string(kKeyBytes, 'k');
+    k.back() = static_cast<char>('a' + i);
+    return k;
+  };
+
+  // A thread of its own, so nothing another test left on the main thread
+  // counts, and the scratch measured is what this thread kept.
+  std::size_t retained = 0;
+  bool read_back = false;
+  const auto work = [&] {
+    {
+      auto db = bytecask::DB::open(td.path, opts);
+      db.put({}, to_bytes("big"), to_bytes(big));
+      bytecask::WritePlan plan{
+          bytecask::SizeLimits{bytecask::kMaxKeySize, opts.max_value_bytes}};
+      for (std::size_t i = 0; i < kKeys; ++i)
+        plan.put(to_bytes(long_key(i)), to_bytes("v"));
+      (void)db.apply_batch({}, std::move(plan));
+      db.close();
+    }
+    // Reopened, so the value is read from a sealed file through a cold pool.
+    auto db = bytecask::DB::open(td.path, opts);
+    bytecask::Bytes out;
+    read_back = db.get({}, to_bytes("big"), out) && out.size() == kValueBytes;
+    auto snap = db.snapshot();
+    read_back = read_back && snap.get({}, to_bytes("big"), out) &&
+                snap.contains_key({}, to_bytes(long_key(kKeys - 1)));
+    db.close();
+    retained = bytecask::test_thread_scratch_bytes();
+  };
+  std::exception_ptr failure;
+  std::thread worker{[&] {
+    try {
+      work();
+    } catch (...) {
+      failure = std::current_exception();
+    }
+  }};
+  worker.join();
+  if (failure) std::rethrow_exception(failure);
+
+  REQUIRE(read_back);
+  // Read, fill and append scratch: each at most kScratchKeepBytes.
+  CHECK(retained <= bytecask::kScratchKeepBytes);
+}
+
 // ===========================================================================
 // Commit pipeline (docs/commit_pipeline_design.md): stage 1 of the next
 // batch overlaps the in-flight fdatasync; publication waits for the flush.

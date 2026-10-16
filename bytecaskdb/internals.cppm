@@ -416,6 +416,16 @@ export using KeyDirValueIter = BTreeValueIterator<KeyDirEntry>;
 export using KeyDirReverseValueIter = ReverseBTreeValueIterator<KeyDirEntry>;
 export using KeyDirHit = KeyDirEntry;
 
+// Scratch for the record DB::get and Snapshot::get read, reused per thread.
+inline auto value_read_scratch() -> ThreadScratch<std::vector<std::byte>> & {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+  // TLS: scratch — this call's record; freed past kScratchKeepBytes (#384).
+  thread_local ThreadScratch<std::vector<std::byte>> s;
+#pragma clang diagnostic pop
+  return s;
+}
+
 // The value size a value iterator's entry expects, as a read hint.
 export inline auto value_size_hint(const KeyDirEntry &e) noexcept
     -> std::uint32_t {
@@ -610,13 +620,13 @@ export struct KeyReader {
 };
 
 // Scratch buffer for the reads of one call, reused per thread.
-inline auto key_read_buffer() -> std::vector<std::byte> & {
+inline auto key_read_scratch() -> ThreadScratch<std::vector<std::byte>> & {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
-  // TLS: scratch — this call's records; keeps the largest record's size (#384).
-  thread_local std::vector<std::byte> buf;
+  // TLS: scratch — this call's records; freed past kScratchKeepBytes (#384).
+  thread_local ThreadScratch<std::vector<std::byte>> s;
 #pragma clang diagnostic pop
-  return buf;
+  return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -759,7 +769,8 @@ export template <typename T>
 auto kd_get(const T &t, std::span<const std::byte> key, const KeyDirCtx &ctx)
     -> std::optional<KeyDirEntry> {
   FrameLease lease;
-  KeyReader reader{ctx, key_read_buffer(), lease};
+  ScratchUse scratch{key_read_scratch()};
+  KeyReader reader{ctx, scratch.buf(), lease};
   const auto ref = t.get(key, reader);
   if (!ref)
     return std::nullopt;
@@ -770,7 +781,8 @@ export template <typename T>
 auto kd_contains(const T &t, std::span<const std::byte> key,
                  const KeyDirCtx &ctx) -> bool {
   FrameLease lease;
-  KeyReader reader{ctx, key_read_buffer(), lease};
+  ScratchUse scratch{key_read_scratch()};
+  KeyReader reader{ctx, scratch.buf(), lease};
   return t.get(key, reader).has_value();
 }
 // Looks the key up and copies its value into `out`: the read that confirms
@@ -780,7 +792,8 @@ export inline auto kd_read_value(const KeyDirTree &t,
                                  const KeyDirCtx &ctx,
                                  std::vector<std::byte> &out) -> bool {
   FrameLease lease;
-  KeyReader reader{ctx, key_read_buffer(), lease};
+  ScratchUse scratch{key_read_scratch()};
+  KeyReader reader{ctx, scratch.buf(), lease};
   const auto ref = t.get(key, reader);
   if (!ref)
     return false;
@@ -793,7 +806,8 @@ export inline auto kd_put(KeyDirTransient &t, std::span<const std::byte> key,
                           const KeyDirEntry &e, const KeyDirCtx &ctx)
     -> std::optional<KeyDirHit> {
   FrameLease lease;
-  KeyReader reader{ctx, key_read_buffer(), lease};
+  ScratchUse scratch{key_read_scratch()};
+  KeyReader reader{ctx, scratch.buf(), lease};
   const auto displaced = t.upsert(
       key, to_blind_ref(e), reader,
       [](const BlindRef &, const BlindRef &) { return true; });
@@ -804,7 +818,8 @@ export inline auto kd_put(KeyDirTransient &t, std::span<const std::byte> key,
 export inline auto kd_erase(KeyDirTransient &t, std::span<const std::byte> key,
                             const KeyDirCtx &ctx) -> std::optional<KeyDirHit> {
   FrameLease lease;
-  KeyReader reader{ctx, key_read_buffer(), lease};
+  ScratchUse scratch{key_read_scratch()};
+  KeyReader reader{ctx, scratch.buf(), lease};
   const auto erased = t.erase(key, reader);
   if (!erased)
     return std::nullopt;
@@ -839,7 +854,8 @@ export template <typename T>
 auto kd_lower_bound(const T &t, std::span<const std::byte> key,
                     const KeyDirCtx &ctx) -> KeyDirIter {
   FrameLease lease;
-  KeyReader reader{ctx, key_read_buffer(), lease};
+  ScratchUse scratch{key_read_scratch()};
+  KeyReader reader{ctx, scratch.buf(), lease};
   return {t.lower_bound(key, reader), ctx};
 }
 // Keys in [from, to), counted no further than `limit`: one read to place
@@ -849,7 +865,8 @@ export inline auto kd_count(const KeyDirTree &t, std::span<const std::byte> from
                             std::span<const std::byte> to, std::size_t limit,
                             const KeyDirCtx &ctx) -> std::size_t {
   FrameLease lease;
-  KeyReader reader{ctx, key_read_buffer(), lease};
+  ScratchUse scratch{key_read_scratch()};
+  KeyReader reader{ctx, scratch.buf(), lease};
   const auto first = t.lower_bound(from, reader);
   return first.count_until(t.lower_bound(to, reader), limit);
 }
@@ -877,7 +894,8 @@ export inline auto kd_value_lower_bound(const KeyDirTree &t,
   if (from.empty())
     return {t.begin(), ctx};
   FrameLease lease;
-  KeyReader reader{ctx, key_read_buffer(), lease};
+  ScratchUse scratch{key_read_scratch()};
+  KeyReader reader{ctx, scratch.buf(), lease};
   return {t.lower_bound(from, reader), ctx};
 }
 export inline auto kd_value_rlower_bound(const KeyDirTree &t,
@@ -888,7 +906,8 @@ export inline auto kd_value_rlower_bound(const KeyDirTree &t,
     return KeyDirReverseValueIter{KeyDirValueIter{t.end_iter(), ctx}};
   // Start past the last key <= from: at the first key > from.
   FrameLease lease;
-  KeyReader reader{ctx, key_read_buffer(), lease};
+  ScratchUse scratch{key_read_scratch()};
+  KeyReader reader{ctx, scratch.buf(), lease};
   auto fwd = KeyDirValueIter{t.lower_bound(from, reader), ctx};
   if (fwd != std::default_sentinel &&
       btree_detail::compare_bytes(fwd.key(), from) == 0)

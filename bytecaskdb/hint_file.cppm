@@ -94,6 +94,8 @@ constexpr std::size_t kMaxHintEntryBytes =
 constexpr std::size_t kMaxFrameBytes = kHintFrameBytes + kMaxHintEntryBytes;
 // The most such a frame takes on disk: its entries, not compressed at all.
 constexpr std::size_t kMaxPackedFrameBytes = ZSTD_COMPRESSBOUND(kMaxFrameBytes);
+static_assert(kMaxPackedFrameBytes <= kScratchKeepBytes,
+              "thread_packed_frame would keep a large frame after the read");
 
 // ZSTD_CONTENTSIZE_UNKNOWN and ZSTD_CONTENTSIZE_ERROR are the two largest
 // 64-bit values, so the cap alone refuses a frame that does not declare its
@@ -145,7 +147,8 @@ auto thread_packed_frame() -> std::vector<std::byte> & {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
   // The destructor is wanted: it frees the buffer when the thread exits.
-  // TLS: scratch — one compressed frame; keeps the largest frame's size (#384).
+  // TLS: scratch — one compressed frame, at most kMaxPackedFrameBytes: below
+  // kScratchKeepBytes, so it needs no ScratchUse to give memory back (#384).
   thread_local std::vector<std::byte> buf;
 #pragma clang diagnostic pop
   return buf;

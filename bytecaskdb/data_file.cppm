@@ -157,6 +157,25 @@ export struct WritevLimits {
 export inline WritevLimits test_writev_limits{2, kMaxBytesPerWritev};
 #endif
 
+// Scratch append_entries serializes a chunk's entries into, back to back.
+inline auto append_scratch() -> ThreadScratch<std::vector<std::byte>> & {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+  // TLS: scratch — one chunk's entries. Reused by the one thread that
+  // appends, so the commit path allocates only while it grows; freed past
+  // kScratchKeepBytes (#384).
+  thread_local ThreadScratch<std::vector<std::byte>> s;
+#pragma clang diagnostic pop
+  return s;
+}
+
+#ifdef BYTECASK_TESTING
+// Bytes the calling thread's append scratch holds between writes.
+export inline auto append_scratch_bytes() noexcept -> std::size_t {
+  return append_scratch().buf.capacity();
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // WritableDataFile — pure interface for the write API.
 //
@@ -570,10 +589,6 @@ struct WritableFileOps {
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
-    // TLS: scratch — the chunk's entries serialized back to back. Reused by
-    // the one thread that appends, so the commit path allocates only while
-    // it grows.
-    thread_local std::vector<std::byte> buf;
     struct Piece {
       const std::byte *ext;  // out-of-line value, or nullptr: buf[at, at+len)
       std::size_t at;
@@ -586,6 +601,8 @@ struct WritableFileOps {
     // TLS: scratch — the pieces as iovecs, rebuilt per chunk.
     thread_local std::vector<::iovec> iov;
 #pragma clang diagnostic pop
+    ScratchUse buf_use{append_scratch()};
+    auto &buf = buf_use.buf();
 
     const auto to_iovecs = [&] {
       iov.clear();

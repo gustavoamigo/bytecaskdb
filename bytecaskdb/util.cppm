@@ -48,6 +48,38 @@ export [[noreturn]] inline void panic(std::string_view msg) {
   std::abort();
 }
 
+// A thread's scratch keeps its memory between calls, so a hot path does not
+// allocate. Past this size it is given back when the call ends: one large
+// value must not stay with a thread, which can outlive every DB (#384).
+export inline constexpr std::size_t kScratchKeepBytes = std::size_t{1} << 20;
+
+// A per-thread buffer, and how many calls on the thread are using it.
+export template <typename Buf> struct ThreadScratch {
+  Buf buf;
+  int users{0};
+};
+
+// One call's use of a ThreadScratch. When the outermost use ends, a buffer
+// grown past kScratchKeepBytes is freed, so a nested use never frees what an
+// outer one still points into. Buf needs capacity() and a noexcept move.
+export template <typename Buf> class ScratchUse {
+public:
+  explicit ScratchUse(ThreadScratch<Buf> &s) noexcept : s_{s} { ++s_.users; }
+  ~ScratchUse() {
+    if (--s_.users == 0 && s_.buf.capacity() > kScratchKeepBytes)
+      s_.buf = Buf{};
+  }
+  ScratchUse(const ScratchUse &) = delete;
+  auto operator=(const ScratchUse &) -> ScratchUse & = delete;
+
+  [[nodiscard]] auto buf() noexcept -> Buf & { return s_.buf; }
+
+private:
+  ThreadScratch<Buf> &s_;
+};
+export template <typename Buf>
+ScratchUse(ThreadScratch<Buf> &) -> ScratchUse<Buf>;
+
 // Reads from offset until dst is full or the file ends, and returns how many
 // bytes it read. Throws std::system_error when pread fails.
 export [[nodiscard]] inline auto pread_upto(int fd, std::uint64_t offset,

@@ -258,16 +258,10 @@ auto DB::get(const ReadOptions &opts, BytesView key,
     out.clear();
     return true;
   }
-  // Per-thread I/O scratch buffer — reused across calls to avoid heap churn.
-  // Thread-exit destructor is intentional; suppress the Clang diagnostic.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wexit-time-destructors"
-  // TLS: scratch — this call's record; keeps the largest value's size (#384).
-  thread_local Bytes io_buf;
-#pragma clang diagnostic pop
+  ScratchUse scratch{value_read_scratch()};
   (*s->files.get(kv->file_id()))
       ->read_value(kv->file_offset(), narrow<std::uint16_t>(key.size()),
-                   kv->value_size(), opts.verify_checksums, io_buf, out);
+                   kv->value_size(), opts.verify_checksums, scratch.buf(), out);
   counters_.disk_reads.add(1);
   counters_.disk_read_bytes.add(static_cast<std::int64_t>(kv->value_size()));
   return true;

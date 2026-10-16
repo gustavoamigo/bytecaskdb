@@ -164,6 +164,20 @@ export inline std::uint64_t test_max_group_file_bytes =
 #endif
 }
 
+#ifdef BYTECASK_TESTING
+// The most bytes any of the calling thread's read, fill and append scratch
+// keeps between calls: at most kScratchKeepBytes (#384).
+export inline auto test_thread_scratch_bytes() noexcept -> std::size_t {
+#ifdef BYTECASK_KEYDIR_BLIND
+  const auto reads = key_read_scratch().buf.capacity();
+#else
+  const auto reads = value_read_scratch().buf.capacity();
+#endif
+  return std::max({reads, BufferPool::thread_scratch_bytes(),
+                   append_scratch_bytes()});
+}
+#endif
+
 // Sensible defaults — keys live in RAM (the key directory), values go to disk.
 export inline constexpr std::uint32_t kDefaultMaxKeyBytes = 4096;
 export inline constexpr std::uint32_t kDefaultMaxValueBytes =

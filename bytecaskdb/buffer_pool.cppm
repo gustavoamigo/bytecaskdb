@@ -22,6 +22,7 @@ module;
 #include <span>
 #include <stdexcept>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include <cerrno>
@@ -341,6 +342,13 @@ public:
     counters_.direct_io_fallbacks.fetch_add(1, std::memory_order_relaxed);
   }
 
+#ifdef BYTECASK_TESTING
+  // Bytes the calling thread's fill scratch holds between reads.
+  [[nodiscard]] static auto thread_scratch_bytes() noexcept -> std::size_t {
+    return fill_scratch().buf.capacity();
+  }
+#endif
+
 private:
   friend class FrameLease;
 
@@ -435,15 +443,22 @@ private:
     return (v + a - 1) / a * a;
   }
 
-  // Page-aligned, grow-only scratch for fills, held thread_local by read_at:
-  // a fresh buffer would heap-allocate on every miss, and a direct read needs
-  // an aligned one anyway.
+  // Page-aligned scratch for fills, held thread_local by read_at: a fresh
+  // buffer would heap-allocate on every miss, and a direct read needs an
+  // aligned one anyway.
   class AlignedScratch {
   public:
     AlignedScratch() = default;
     ~AlignedScratch() { std::free(p_); }
     AlignedScratch(const AlignedScratch &) = delete;
     auto operator=(const AlignedScratch &) -> AlignedScratch & = delete;
+    auto operator=(AlignedScratch &&o) noexcept -> AlignedScratch & {
+      std::swap(p_, o.p_);
+      std::swap(cap_, o.cap_);
+      return *this;
+    }
+
+    [[nodiscard]] auto capacity() const noexcept -> std::size_t { return cap_; }
 
     // bytes must be a multiple of kPoolFrameBytes (aligned_alloc requires it).
     [[nodiscard]] auto ensure(std::size_t bytes) -> std::byte * {
@@ -463,6 +478,15 @@ private:
     std::byte *p_{nullptr};
     std::size_t cap_{0};
   };
+
+  static auto fill_scratch() noexcept -> ThreadScratch<AlignedScratch> & {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+    // TLS: scratch — one fill's bytes; freed past kScratchKeepBytes (#384).
+    thread_local ThreadScratch<AlignedScratch> s;
+#pragma clang diagnostic pop
+    return s;
+  }
 
   // Copies this frame's overlap with [offset, offset+len) into dst. Returns
   // false on a miss or after losing a race to an eviction; callers then
@@ -748,16 +772,10 @@ auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
       avail = std::min(avail, from + got);
       return;
     }
-    // Declared on the miss path so a hit never touches thread-local storage.
-    // Thread-exit destructor is intentional; suppress the Clang diagnostic.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wexit-time-destructors"
-    // TLS: scratch — this fill's bytes; keeps the largest fill run's size
-    // (#384).
-    thread_local AlignedScratch scratch;
-#pragma clang diagnostic pop
+    // Taken on the miss path so a hit never touches thread-local storage.
+    ScratchUse scratch{fill_scratch()};
     const auto run_len = static_cast<std::size_t>(run_end - run_start);
-    auto *buf = scratch.ensure(align_up(run_len, kPoolFrameBytes));
+    auto *buf = scratch.buf().ensure(align_up(run_len, kPoolFrameBytes));
     auto got = run_len;
     if (file.direct < 0 || !pread_direct(file.direct, buf, run_len, run_start)) {
       got = pread_upto(file.buffered, run_start, {buf, run_len});
