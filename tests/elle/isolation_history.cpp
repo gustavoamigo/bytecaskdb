@@ -619,6 +619,13 @@ struct Node {
   // Reset by bootstrap.
   std::atomic<int> pulled_src{-1};
   std::atomic<int> pulled_epoch{-1};
+  // The last epoch whose leader's history the node is known to hold a
+  // prefix of: the epoch it was bootstrapped from the leader in, last
+  // ingested from the leader in, or led itself. Under --promote-least a node
+  // ahead of a promotion keeps its old branch until its first pull is
+  // refused; promoted before that, it leads from that branch. Node 0 starts
+  // as the leader of epoch 0; any other node sets it at bootstrap.
+  std::atomic<int> held_epoch{0};
 };
 
 // A shared lock on the node's gate if it has a DB and nobody is waiting for
@@ -695,7 +702,10 @@ struct Bootstrap {
 // A topology event, for the summary. kind is "planned", "unplanned",
 // "retarget" or "fork"; durable is the promoted node's durable_sequence()
 // when it stopped tailing (for a retarget, the retargeted node's; for a
-// fork, the position the refused node pulled from).
+// fork, the position the refused node pulled from). held, for an
+// unplanned promotion, is the epoch whose leader's history the promoted
+// node held a prefix of: the old leader's epoch when it tailed it, an
+// earlier one when it leads from another branch.
 struct TopologyEvent {
   std::string kind;
   int epoch{0};
@@ -704,6 +714,7 @@ struct TopologyEvent {
   std::uint64_t durable{0};
   std::uint64_t other_durable{0}; // planned: the old leader's; retarget, fork: the source's
   int life{0};                    // fork: the refused node's life
+  int held{-1};                   // unplanned: see above
 };
 
 struct ClusterStats {
@@ -947,6 +958,11 @@ auto replicate(std::vector<std::unique_ptr<Node>> &nodes, Node &n,
         n.pulled_src.store(src, std::memory_order_release);
         n.pulled_epoch.store(v.epoch, std::memory_order_release);
       } while (!buf.empty() && !stop.load(std::memory_order_relaxed));
+      // Only a drain that ended on an empty slice has had the engine compare
+      // the histories at or above n's own position: a duplicate slice
+      // rewound below it, accepted, proves nothing about what n holds above.
+      if (buf.empty() && src == v.leader)
+        n.held_epoch.store(v.epoch, std::memory_order_release);
     } catch (const bytecask::DbChangeMarkerMismatch &e) {
       // n's history diverged from its source's at a promotion, and the
       // engine refused the slice before writing anything. n stops serving
@@ -1030,6 +1046,7 @@ auto planned_transfer(std::vector<std::unique_ptr<Node>> &nodes,
   view.update([&](View &v) {
     v.leader = target;
     epoch = ++v.epoch;
+    tn.held_epoch.store(epoch, std::memory_order_release);
     for (std::size_t i = 0; i < v.source.size(); ++i) {
       if (static_cast<int>(i) != target && v.serving[i])
         v.source[i] = target;
@@ -1102,13 +1119,16 @@ auto unplanned_promotion(std::vector<std::unique_ptr<Node>> &nodes,
   auto &tn = *nodes[static_cast<std::size_t>(target)];
   int epoch = 0;
   std::uint64_t promoted_at = 0;
+  int held = 0;
   {
     NodeExclusive x{tn};
     promoted_at = tn.holder->db.durable_sequence();
+    held = tn.held_epoch.load(std::memory_order_acquire);
     tn.holder->db.set_mode(bytecask::Mode::Leader);
     view.update([&](View &v) {
       v.leader = target;
       epoch = ++v.epoch;
+      tn.held_epoch.store(epoch, std::memory_order_release);
       for (std::size_t i = 0; i < v.source.size(); ++i) {
         if (static_cast<int>(i) != target && v.serving[i])
           v.source[i] = target;
@@ -1116,7 +1136,7 @@ auto unplanned_promotion(std::vector<std::unique_ptr<Node>> &nodes,
     });
   }
   stats.event({.kind = "unplanned", .epoch = epoch, .from = old, .to = target,
-               .durable = promoted_at, .other_durable = 0});
+               .durable = promoted_at, .other_durable = 0, .held = held});
   const auto v = view.get();
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     const auto id = static_cast<int>(i);
@@ -1145,9 +1165,10 @@ auto write_cluster_summary(const fs::path &path, ClusterStats &stats,
   for (std::size_t i = 0; i < stats.events.size(); ++i) {
     const auto &e = stats.events[i];
     out << std::format(R"({}{{"kind":"{}","epoch":{},"from":{},"to":{},)"
-                       R"("durable":{},"other_durable":{},"life":{}}})",
+                       R"("durable":{},"other_durable":{},"life":{},)"
+                       R"("held":{}}})",
                        i == 0 ? "" : ",", e.kind, e.epoch, e.from, e.to,
-                       e.durable, e.other_durable, e.life);
+                       e.durable, e.other_durable, e.life, e.held);
   }
   out << "],\"errors\":[";
   for (std::size_t i = 0; i < stats.errors.size(); ++i) {
@@ -2177,6 +2198,7 @@ auto run(const RunOptions &o) -> int {
           view.update([&](View &v) {
             v.serving[static_cast<std::size_t>(i)] = true;
             at(v.source, i) = v.leader;
+            node(i).held_epoch.store(v.epoch, std::memory_order_release);
           });
           node(i).joining.store(false, std::memory_order_release);
         }
@@ -2246,6 +2268,7 @@ auto run(const RunOptions &o) -> int {
       view.update([&](View &w) {
         w.serving[static_cast<std::size_t>(i)] = true;
         at(w.source, i) = w.leader;
+        node(i).held_epoch.store(w.epoch, std::memory_order_release);
       });
       node(i).joining.store(false, std::memory_order_release);
     }
