@@ -410,6 +410,11 @@ class Rig:
         # Whether an eviction dropped pages during or after the life, from
         # chaosfs's own count: it evicts on its own too (evict_failed).
         evicted_before = self.ctl("stats")["pages_evicted"]
+        # chaosfs's count once the open is seen to complete. An eviction
+        # before then can take what the last life left only in the page
+        # cache before this open makes it durable (#437). Sampled late, it
+        # can only count a later eviction as an earlier one.
+        evicted_at_open: int | None = None
         # After a failed open, the next open must succeed with no hazard in
         # force (I5): its timeline starts once the database is open.
         start = time.monotonic()
@@ -417,6 +422,8 @@ class Rig:
         exited_early = False
         while True:
             self.check_fs_alive()
+            if evicted_at_open is None and hist.opened_at is not None:
+                evicted_at_open = self.ctl("stats")["pages_evicted"]
             now = time.monotonic()
             if quiet_open:
                 if hist.opened_at is None:
@@ -476,7 +483,11 @@ class Rig:
                               f"{self.args.close_timeout} s with every hazard "
                               f"lifted (I9); stacks in stacks.txt")
         self.ctl("clear")
-        outcome["evicted"] = self.ctl("stats")["pages_evicted"] > evicted_before
+        evicted_after = self.ctl("stats")["pages_evicted"]
+        outcome["evicted"] = evicted_after > evicted_before
+        outcome["evicted_before_open"] = (
+            evicted_at_open if evicted_at_open is not None else evicted_after
+        ) > evicted_before
         hist.join(30)
         life["history"].write_bytes(bytes(hist.raw))
         rc = proc.returncode
@@ -599,7 +610,8 @@ class Rig:
         closed_ok = "\nX ok" in "\n" + text
         e["manifest"].append(
             f"epoch {e['epoch']} {outcome['ended_ns']} "
-            f"{int(power or outcome['evicted'])} {int(opened)} {int(closed_ok)} {stream}")
+            f"{int(power or outcome['evicted'])} {int(outcome['evicted_before_open'])} "
+            f"{int(opened)} {int(closed_ok)} {stream}")
         e["epoch"] += 1
         open_failed = "\nF " in "\n" + text
         if open_failed:

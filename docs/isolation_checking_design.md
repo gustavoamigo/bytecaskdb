@@ -255,7 +255,15 @@ read saw a write the contract lets a crash take, and without the rule a
 later read that no longer sees it would count as a lost write. An element
 stays "not durable on the mount" from the life that wrote it until a later
 life's `DB::open` completes (open makes what it trusts durable, #240) or a
-`close()` returns. Reads of durable data are checked in full.
+`close()` returns. An eviction while that open runs, before it has read the
+pages, takes what the earlier lives left there, and the open truncates it as
+a torn tail (#437). So the orchestrator records, per life, whether pages were
+evicted before it saw the open complete, and `--absorb` applies that loss to
+the earlier lives' reads before the open clears them. The life's own reads
+came after the open and are not touched by it. The orchestrator samples
+chaosfs's count only once it sees the `O` line, so a late sample can only
+count an eviction after the open as one before it. Reads of durable data are
+checked in full.
 
 **Sensitivity.** With `commit_skips_fdatasync` from `tests/chaos_mutations/`
 applied (the commit flush skips its `fdatasync` and still reports durable),

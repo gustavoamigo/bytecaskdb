@@ -94,6 +94,13 @@ jobs:
         # in chaos-nightly.yml.
         run: python3 -m unittest tests/chaos/test_chaosfs.py -v
 
+      - name: Run isolation_history --absorb tests
+        # How a chaos episode's lives become one history; the episodes run in
+        # isolation-nightly.yml.
+        env:
+          ISOLATION_HISTORY: build/linux/x86_64/release/isolation_history
+        run: python3 -m unittest tests/elle/test_absorb.py -v
+
       - name: Run proof independence tests (Hypothesis) and the Python reference
         run: |
           xmake build bytecaskdb_python

@@ -1785,13 +1785,17 @@ struct ChaosEpoch {
   int epoch{0};
   std::int64_t ended_at{0}; // CLOCK_MONOTONIC ns when the life was ended
   bool cache_lost{false};   // a power cut, or an eviction that dropped pages
+  // An eviction dropped pages before the life's DB::open was seen to
+  // complete: before the open made the earlier lives' writes durable (#437).
+  bool lost_before_open{false};
   bool opened{false};       // the life's DB::open completed
   bool closed_ok{false};    // close() returned at a clean stop
   fs::path stream;
 };
 
 // The manifest: "start <ns>", then one line per life:
-//   epoch <n> <ended_at_ns> <cache_lost> <opened> <closed_ok> <stream path>
+//   epoch <n> <ended_at_ns> <cache_lost> <lost_before_open> <opened> <closed_ok>
+//         <stream path>
 auto read_manifest(const fs::path &path, std::int64_t &start_ns)
     -> std::vector<ChaosEpoch> {
   std::ifstream in{path};
@@ -1803,12 +1807,15 @@ auto read_manifest(const fs::path &path, std::int64_t &start_ns)
     } else if (tag == "epoch") {
       ChaosEpoch e;
       int lost = 0;
+      int lost_before_open = 0;
       int opened = 0;
       int closed = 0;
-      in >> e.epoch >> e.ended_at >> lost >> opened >> closed >> std::ws;
+      in >> e.epoch >> e.ended_at >> lost >> lost_before_open >> opened >>
+          closed >> std::ws;
       std::string p;
       std::getline(in, p);
       e.cache_lost = lost != 0;
+      e.lost_before_open = lost_before_open != 0;
       e.opened = opened != 0;
       e.closed_ok = closed != 0;
       e.stream = p;
@@ -1834,7 +1841,8 @@ auto read_whole(const fs::path &p) -> std::string {
 // visible but never durable, so a read that returned one of them is :info:
 // its result is not one the database had to keep. A write stays "not durable
 // on the mount" until a later life's open completes (open makes what it
-// trusts durable, #240), or a close() returns.
+// trusts durable, #240), or a close() returns. An eviction while that open
+// runs comes first: it takes what the earlier lives left (#437).
 auto run_absorb(const RunOptions &o) -> int {
   std::int64_t start_ns = 0;
   const auto epochs = read_manifest(o.absorb, start_ns);
@@ -1848,6 +1856,27 @@ auto run_absorb(const RunOptions &o) -> int {
   std::int64_t lost_reads = 0;
   int cache_losses = 0;
 
+  // Every :ok read of an element in unsynced, among events before `end`,
+  // becomes :info.
+  auto lose_unsynced = [&](std::size_t end) {
+    for (const auto e : unsynced) {
+      const auto it = readers_of.find(e);
+      if (it == readers_of.end()) continue;
+      for (const auto i : it->second) {
+        if (i >= end || events[i].type != EventType::Ok) continue;
+        events[i].type = EventType::Info;
+        events[i].sequence = 0;
+        events[i].error = "read a write the page cache lost";
+        // An :info read's result is unknown, as for the kill mode's
+        // downgrades: Elle would otherwise still order by what it saw.
+        for (auto &m : events[i].value)
+          if (!m.append) m.read.reset();
+        ++lost_reads;
+      }
+    }
+    unsynced.clear();
+  };
+
   for (const auto &ep : epochs) {
     const auto first = events.size();
     std::vector<std::int64_t> not_durable;
@@ -1859,26 +1888,14 @@ auto run_absorb(const RunOptions &o) -> int {
         if (m.read)
           for (const auto e : *m.read) readers_of[e].push_back(i);
     }
+    // Before the open below could make them durable. This life's reads
+    // came after it: what they saw, the open recovered and made durable.
+    if (ep.lost_before_open) lose_unsynced(first);
     if (ep.opened) unsynced.clear();
     unsynced.insert(not_durable.begin(), not_durable.end());
     if (ep.cache_lost) {
       ++cache_losses;
-      for (const auto e : unsynced) {
-        const auto it = readers_of.find(e);
-        if (it == readers_of.end()) continue;
-        for (const auto i : it->second) {
-          if (events[i].type != EventType::Ok) continue;
-          events[i].type = EventType::Info;
-          events[i].sequence = 0;
-          events[i].error = "read a write the page cache lost";
-          // An :info read's result is unknown, as for the kill mode's
-          // downgrades: Elle would otherwise still order by what it saw.
-          for (auto &m : events[i].value)
-            if (!m.append) m.read.reset();
-          ++lost_reads;
-        }
-      }
-      unsynced.clear();
+      lose_unsynced(events.size());
     }
     if (ep.closed_ok) unsynced.clear();
   }
