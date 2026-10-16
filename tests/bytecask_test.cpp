@@ -1382,6 +1382,16 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
       // first page is lost and a later one reaches the disk.
       {"first header lost, later entries landed",
        [](auto &f) { zero_at(f[2], 0, 15); }, true, {10, 11, 12, 13}, 0},
+      // A failed or short write landed one byte of the first record: the
+      // low byte of a sequence that needs two, so the header reads below
+      // f1's first sequence. In #471, 0x96 of 2454 read as 150.
+      {"first write landed one byte of its sequence",
+       [](auto &f) {
+         std::filesystem::resize_file(f[2], 0);
+         add_zero_tail(f[2]);
+         write_at(f[2], 0, "\x02");
+       },
+       true, {10, 11, 12, 13}, 0},
       {"sealed zero tail, newest torn",
        [](auto &f) {
          drop_hint(f[0]);

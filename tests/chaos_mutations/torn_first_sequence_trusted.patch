@@ -1,0 +1,25 @@
+Open trusts the sequence in a hint-less file's first header whatever its
+type byte says. A write that failed or came back short after landing part
+of a fresh active file's first record leaves the low bytes of its
+sequence and zeros, which read as a sequence below an older file's, and
+every open after refuses the database (#471). Reverts the fix.
+It takes a write that lands fewer bytes than the sequence needs, into a
+file's first record, and a kill before resume(); the Elle chaos run that
+found it caught it once in about 190 episodes, so it is not held to a
+budget.
+Expected: caught (rare).
+Guarded-by: "DB recovery: a hint-less file's tail is truncated only in the newest file"
+
+diff --git a/bytecaskdb/db_recovery.cpp b/bytecaskdb/db_recovery.cpp
+index 4696028..f823b22 100644
+--- a/bytecaskdb/db_recovery.cpp
++++ b/bytecaskdb/db_recovery.cpp
+@@ -278,7 +278,7 @@ auto first_sequence(const DataFile &file) -> std::uint64_t {
+   std::array<std::byte, kHeaderSize> hdr{};
+   if (file.read_raw(0, hdr) < kHeaderSize) return 0;
+   const auto h = read_header(hdr);
+-  return is_known_entry_type(h.entry_type) ? h.sequence : 0;
++  return h.sequence;
+ }
+ 
+ // Whether every byte of file from end on is zero.

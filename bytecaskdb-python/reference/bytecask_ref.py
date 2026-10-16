@@ -996,7 +996,8 @@ class DB:
             #   - nothing, or zeros (unwritten space): cut;
             #   - a write a crash tore, in the newest file: cut. A file with
             #     no first sequence may be the newest, its first page lost at
-            #     a power cut and a later one kept, so it is cut too;
+            #     a power cut and a later one kept, or its first write landed
+            #     only part of its header, so it is cut too;
             #   - anything else: damage to acknowledged data, refused.
             is_newest = f.first_sequence == newest
             has_no_sequence = f.first_sequence == 0
@@ -1021,7 +1022,7 @@ class DB:
 class _ScannedFile:
     file_id: int
     path: Path
-    first_sequence: int  # read without its CRC; 0 if the file is shorter than a header
+    first_sequence: int  # read without its CRC; 0 if the file is shorter than a header or its type is unknown
     committed: list[Placed]
     end: int  # where committed data ends
     size: int
@@ -1031,7 +1032,14 @@ class _ScannedFile:
     def read(cls, file_id: int, path: Path) -> _ScannedFile:
         buf = path.read_bytes()
         committed, end = scan_committed(buf)
-        first = _HEADER.unpack_from(buf)[0] if len(buf) >= _HEADER.size else 0
+        first = 0
+        if len(buf) >= _HEADER.size:
+            # A failed or short write can land part of the first record, and
+            # one byte of a sequence reads as a smaller one. The type byte
+            # follows the sequence: a known type says all of it landed.
+            sequence, raw_type, _, _ = _HEADER.unpack_from(buf)
+            if raw_type in EntryType._value2member_map_:
+                first = sequence
         return cls(file_id, path, first, committed, end, len(buf), any(buf[end:]))
 
 

@@ -270,11 +270,15 @@ namespace {
 
 // The sequence in the file's first header, 0 when there is none. Read
 // without its CRC: in the file a crash tore, the first record may be the
-// torn one.
+// torn one. A write that fails or comes back short can land any prefix of
+// that record, and the rest of the file is zeros: one byte of sequence 2454
+// reads as 150 (#471). The type byte follows the sequence, so a known type
+// says all eight bytes of it landed; anything else is no sequence.
 auto first_sequence(const DataFile &file) -> std::uint64_t {
   std::array<std::byte, kHeaderSize> hdr{};
   if (file.read_raw(0, hdr) < kHeaderSize) return 0;
-  return read_header(hdr).sequence;
+  const auto h = read_header(hdr);
+  return is_known_entry_type(h.entry_type) ? h.sequence : 0;
 }
 
 // Whether every byte of file from end on is zero.
@@ -308,9 +312,10 @@ auto tail_is_zero(const DataFile &file, Offset end) -> bool {
 // - anything else, in any other file: damage in data that was synced.
 //   Refused, in every mode, and the file is left as it was.
 // "Written last" is read off sequences, which no two files share: no other
-// file may start at a higher one. A file whose first header is zero has no
-// sequence to compare. It may be the newest, its first page lost at a power
-// cut and a later one kept, so it goes whole.
+// file may start at a higher one. A file whose first header is zero, or
+// whose first write landed only part of its sequence, has no sequence to
+// compare. It may be the newest, its first page lost at a power cut and a
+// later one kept, so it goes whole.
 // Either way it is the one file a crash tore, so no other file may need such
 // a cut. The files open handled before this one have their hints by now;
 // the rest are scanned here, before anything is cut.
