@@ -128,14 +128,36 @@ lexicographically sortable. The plugin applies a post-processing step
   negative numbers and zero.
 - **New temporal types** (DATETIME2, TIMESTAMP2, TIME2): already stored
   big-endian by `key_copy()` — no transformation needed.
-- **VARCHAR and BLOB prefix keys, secondary indexes**: handled by
-  `fix_varchar_key_encoding`, which strips the 2-byte LE length prefix and
-  left-justifies the data, padded to the slot's width. The PK suffix tells
-  apart values that differ only in trailing padding.
-- **VARCHAR and BLOB prefix keys, primary key**: the key must restore
-  (`decode_pk`, the AUTO_INCREMENT seed) and must keep `'a'` and `'a\0'`
-  apart, so the length stays, but `make_mem_comparable` moves it behind the
-  padded bytes, big-endian, in the same slot. The part then sorts by value.
+- **CHAR, VARCHAR and TEXT parts under a non-binary charset** (format 2):
+  stored as the collation's sort key, `strnxfrm`, the bytes filesort sorts
+  by. Keys then compare as the collation does: under `utf8mb4_general_ci`
+  `'a'` and `'A'` are one key, `'é'` sorts with `'E'`, and a UNIQUE index
+  refuses the second. The slot is the null byte, `strnxfrmlen(length)`
+  weight bytes and, under NO PAD, the weights' own length, big-endian.
+  Under PAD SPACE the weights are padded with the space's weight, so values
+  equal up to trailing spaces make equal bytes; under NO PAD they are
+  padded with zeros, and the length orders a value before a longer one
+  that extends it. `encode_key_parts` writes these slots after the
+  in-place transforms below have run on the other parts; offsets into a
+  stored key (the PK suffix of a secondary entry, `ref_length`, the
+  AUTO_INCREMENT seed's slot) count the stored width, `stored_length`, not
+  `key_length`. A part stored as weights cannot be restored: rows carry
+  every column, so nothing reads a value back from a key but the
+  key-only read, which leaves such parts to the row fetch, and a
+  commit-time duplicate-key message renders the row the INSERT tried to
+  write. A UCA collation reserves 16 bytes a character for each of its
+  levels, so a key can outgrow the 3072 `key_copy()` bytes the server
+  limits it by: `create()` refuses, with `ER_TOO_LONG_KEY`, a table whose
+  longest stored key would pass the engine's 65,535-byte ceiling.
+- **VARCHAR and BLOB prefix keys, secondary indexes** (binary strings, and
+  every string before format 2): handled by `fix_varchar_key_encoding`,
+  which strips the 2-byte LE length prefix and left-justifies the data,
+  padded to the slot's width. The PK suffix tells apart values that differ
+  only in trailing padding.
+- **VARCHAR and BLOB prefix keys, primary key** (the same): the key must
+  keep `'a'` and `'a\0'` apart, so the length stays, but
+  `make_mem_comparable` moves it behind the padded bytes, big-endian, in
+  the same slot. The part then sorts by value.
 - **Padding** follows the collation. A PAD SPACE collation compares a
   shorter value as if padded with spaces, so `'a\0b'` sorts before `'a'`:
   such a part is padded with spaces, its trailing spaces having been
@@ -152,11 +174,13 @@ lexicographically sortable. The plugin applies a post-processing step
   records a `key_format` per table. One created before it existed
   (format 0) keeps the length-prefixed PK, which sorts by length first, and
   zero-padded secondary keys, trimmed by `0x20` byte, until
-  `ALTER TABLE t FORCE` rebuilds it (#459).
-- **Collation weights are not applied.** Keys hold bytes, so under a case-
-  or accent-insensitive collation, or `utf16le` (whose bytes are not in
-  code-point order), they sort, match and enforce uniqueness by byte, not
-  by the collation (#468).
+  `ALTER TABLE t FORCE` rebuilds it (#459). A format 0 or 1 table keeps
+  string keys in bytes, so under a case- or accent-insensitive collation,
+  or `utf16le` (whose bytes are not in code-point order), it sorts, matches
+  and enforces uniqueness by byte, not by the collation, until it is
+  rebuilt into format 2 (#468). A rebuild of a table holding values its
+  collation calls equal, `'a'` and `'A'` in one UNIQUE index, fails with a
+  duplicate-key error, as it would on InnoDB.
 - **DESC key parts** (`HA_REVERSE_SORT`): after the transform above, every
   byte of the part, null indicator included, is inverted. The server reads
   a DESC part as descending, NULLs last, and expects `index_first` /
@@ -167,8 +191,8 @@ lexicographically sortable. The plugin applies a post-processing step
   with `ALTER TABLE t FORCE` (its rows hold every column, so the copy reads
   them correctly).
 
-The inverse (`undo_mem_comparable`) is applied by `decode_pk()` before
-calling `key_restore()` to recover the native key format.
+The inverse (`undo_mem_comparable`) is applied by the AUTO_INCREMENT seed
+to read the counter's column back from the largest key.
 
 The type dispatch uses `Field::real_type()` (not `Field::type()`) to
 correctly distinguish new temporal types (which are already BE) from old
@@ -449,7 +473,7 @@ is freed (#294).
 | Integer index ordering (all widths) | Done | Mem-comparable encoding with sign-flip |
 | Temporal index ordering (DATE, DATETIME, TIMESTAMP, TIME, YEAR) | Done | LE→BE reversal; new temporals (DATETIME2 etc.) pass through |
 | SET/ENUM index ordering | Done | `real_type()` dispatch for correct type identification |
-| VARCHAR/CHAR index ordering | Partial | By byte, padded per PAD SPACE / NO PAD (`key_format` 1); collation weights not applied (#468) |
+| VARCHAR/CHAR index ordering | Done | Collation weights (`strnxfrm`), `key_format` 2; tables created before it compare bytes until `ALTER TABLE t FORCE` (#468) |
 | BLOB/TEXT prefix indexes | Done | `HA_BLOB_PART` handling in `fix_varchar_key_encoding` |
 | BLOB/TEXT storage | Done | Encode appends data; decode patches pointers into value buffer |
 | MEDIUMBLOB support (16 MiB) | Done | `max_value_bytes = 16 MiB` |

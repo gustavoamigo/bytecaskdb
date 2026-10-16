@@ -318,7 +318,7 @@ int MariaDBTxn::commit(THD * /*thd*/, bool all) {
     // Build the WritePlan and replay ops in insertion order. A deferred
     // INSERT has no snapshot — its ensure_absent guards do the dup check.
     bytecask::WritePlan plan = snap_ ? bytecask::WritePlan{std::move(*snap_)}
-                                     : bytecask::WritePlan{};
+                                     : bytecask::WritePlan{kPluginSizeLimits};
     snap_.reset();
 
     for (const auto &op : ops_) {
@@ -416,7 +416,7 @@ void MariaDBTxn::restore_row_count_deltas(const RowCountDeltas &saved) {
 void MariaDBTxn::report_deferred_dup_key() {
   // ops_ is still intact here; the first guarded key that exists in the
   // live DB is the one the ensure_absent guard rejected.
-  const std::vector<uint8_t> *dup = nullptr;
+  const Op *dup = nullptr;
   for (const auto &op : ops_) {
     if (op.kind != Op::Put || !op.guard_absent) { continue; }
     bool present = false;
@@ -425,9 +425,9 @@ void MariaDBTxn::report_deferred_dup_key() {
     } catch (...) {
       present = false;
     }
-    if (present) { dup = &op.key; break; }
+    if (present) { dup = &op; break; }
   }
-  if (deferred_reporter_ && dup && deferred_reporter_(*dup)) {
+  if (deferred_reporter_ && dup && deferred_reporter_(dup->key, dup->val)) {
     return;
   }
   // No handler (or no identifiable key): same error code the server uses,
@@ -484,14 +484,14 @@ void MariaDBTxn::revert_row_count_deltas() {
 void MariaDBTxn::begin_bulk_copy(std::size_t flush_threshold_bytes) {
   bulk_copy_mode_ = true;
   bulk_flush_threshold_ = flush_threshold_bytes;
-  bulk_plan_ = bytecask::WritePlan{};
+  bulk_plan_ = bytecask::WritePlan{kPluginSizeLimits};
   bulk_bytes_ = 0;
   bulk_seen_.clear();
 }
 
 void MariaDBTxn::bulk_reset() {
   bulk_copy_mode_ = false;
-  bulk_plan_ = bytecask::WritePlan{};
+  bulk_plan_ = bytecask::WritePlan{kPluginSizeLimits};
   bulk_bytes_ = 0;
   bulk_flush_threshold_ = 0;
   bulk_seen_.clear();
@@ -518,7 +518,7 @@ int MariaDBTxn::bulk_flush(bool sync) {
     bool committed =
         db_->apply_batch(bytecask::WriteOptions{.sync = sync},
                          std::move(bulk_plan_)).has_value();
-    bulk_plan_ = bytecask::WritePlan{};
+    bulk_plan_ = bytecask::WritePlan{kPluginSizeLimits};
     bulk_bytes_ = 0;
     bulk_seen_.clear();
     if (!committed) {
@@ -529,7 +529,7 @@ int MariaDBTxn::bulk_flush(bool sync) {
   } catch (const std::exception &e) {
     abort_if_degraded(*db_, "bulk flush");
     fprintf(stderr, "[bytecaskdb] bulk flush failed: %s\n", e.what());
-    bulk_plan_ = bytecask::WritePlan{};
+    bulk_plan_ = bytecask::WritePlan{kPluginSizeLimits};
     bulk_bytes_ = 0;
     bulk_seen_.clear();
     return HA_ERR_INTERNAL_ERROR;

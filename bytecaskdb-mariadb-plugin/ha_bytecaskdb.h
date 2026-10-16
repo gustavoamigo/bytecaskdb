@@ -119,11 +119,13 @@ public:
   int end_bulk_insert() override;
 
   // Raises ER_DUP_ENTRY for the encoded primary key `pk` with the server's
-  // standard message, and records the PK as the duplicate key for
+  // standard message, rendering the key columns of `row`, the encoded row
+  // the INSERT tried to write, and records the PK as the duplicate key for
   // get_dup_key(). Called by MariaDBTxn when a deferred INSERT's
   // commit-time ensure_absent guard fails; see begin_deferred_insert.
   // Returns false without reporting if `pk` is not this table's key.
-  bool report_dup_pk(const std::vector<uint8_t> &pk);
+  bool report_dup_pk(const std::vector<uint8_t> &pk,
+                     const std::vector<uint8_t> &row);
 
   // -------------------------------------------------------------------
   // Full table scan
@@ -278,12 +280,11 @@ private:
 
   // Reused across index_read_map calls to avoid per-call heap allocation.
   std::vector<uint8_t> search_key_buf_;
+  // The optimizer's key, copied for encoding (encode_key_parts rewrites it).
+  std::vector<uint8_t> search_key_src_;
 
   // The table's row and key layout, read from its Fields once in open().
   TableCodec codec_;
-
-  // Scratch buffer for decode_pk() when a duplicate-key error names the row.
-  std::vector<uint8_t> decode_pk_scratch_;
 
   // Reused across secondary-index row lookups to avoid per-row allocation.
   std::vector<uint8_t> sec_row_key_buf_;

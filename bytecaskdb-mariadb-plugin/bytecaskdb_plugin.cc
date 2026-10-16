@@ -627,7 +627,7 @@ bool catalog_rename_table_meta(bytecask::DB *db,
   auto new_val = serialize_table_meta(meta);
 
   // Atomic: delete old + put new.
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{kPluginSizeLimits};
   plan.del(as_view(old_key.data(), old_key.size()));
   plan.put(as_view(new_key.data(), new_key.size()),
            as_view(new_val.data(), new_val.size()));
@@ -1045,8 +1045,12 @@ static int bytecaskdb_init(void *p) {
 
   bytecask::Options opts;
   opts.recovery_threads = 4;
-  opts.max_value_bytes = 16 * 1024 * 1024;  // MEDIUMBLOB (16 MiB)
-  opts.max_key_bytes = 8192;  // secondary index key + PK suffix can exceed 4096
+  // Collation weights take up to 16 bytes a character per level: a
+  // secondary entry with its PK suffix can reach the hard ceiling, and
+  // create() refuses a table whose keys would pass it.
+  static_assert(kPluginSizeLimits.max_key_bytes == kMaxStoredKeyBytes);
+  opts.max_key_bytes = kPluginSizeLimits.max_key_bytes;
+  opts.max_value_bytes = kPluginSizeLimits.max_value_bytes;
   opts.io_backend = static_cast<bytecask::IoBackend>(sysvar_io_backend);
   opts.buffer_pool.capacity_bytes =
       static_cast<std::size_t>(sysvar_buffer_pool_size);

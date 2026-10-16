@@ -46,6 +46,19 @@ struct KeyPartPlan {
   bool reverse{false};        // little-endian in the record: stored reversed
   Flip flip{Flip::kNone};     // applied with reverse
   bool desc{false};           // DESC part: its stored bytes are inverted
+  // kKeyFormatCollationWeights: a CHAR, VARCHAR or TEXT part under any
+  // collation but binary is stored as its collation's sort key (strnxfrm),
+  // so it compares as the collation does: case- and accent-insensitive
+  // collations make equal keys of 'a' and 'A'. Its slot is the null byte,
+  // weight_width weight bytes and, under NO PAD, the weights' own length,
+  // big-endian. The value cannot be restored from it; rows carry every
+  // column. nullptr: the part is stored in key_copy()'s width.
+  const CHARSET_INFO *weights_cs{nullptr};
+  uint32_t weight_width{0};
+  uint32_t nweights{0};       // strnxfrm's character budget for the part
+  bool weight_length{false};  // NO PAD: weight length follows the weights
+  // Width of the part in a stored key: store_length, or the weight slot.
+  uint32_t stored_length{0};
 };
 
 struct KeyPlan {
@@ -59,6 +72,11 @@ struct KeyPlan {
   // characters of its charset, so it sorts as the collation compares it
   // ('a\0b' before 'a'). Format 0 trims 0x20 bytes and pads with zeros.
   bool space_pad{false};
+  // Width of a stored key's columns: key_length, unless a part is stored as
+  // collation weights. Offsets into stored keys (the PK suffix of a
+  // secondary entry, ref_length) are counted in it.
+  uint32_t stored_length{0};
+  bool weights{false};        // some part is stored as collation weights
 };
 
 // Everything the row and key codecs ask of a table's definition, read once
@@ -90,13 +108,6 @@ void encode_pk_into(std::vector<uint8_t> &out, TABLE *table,
 std::vector<uint8_t> encode_pk(TABLE *table, const TableCodec &codec,
                                 const uchar *buf, uint32_t table_id,
                                 uint64_t synthetic_rowid = 0);
-
-// Decodes a previously encoded key back into the row buffer `buf` using
-// key_restore().  Strips the 1-byte namespace + 4-byte table_id prefix first.
-// `scratch` is a caller-owned buffer reused across calls to avoid per-row
-// heap allocations.
-void decode_pk(TABLE *table, const TableCodec &codec, const uint8_t *key,
-               std::size_t key_len, uchar *buf, std::vector<uint8_t> &scratch);
 
 // Returns the 5-byte prefix [0x02 | table_id(BE,4)] for iterating a table's
 // row keys.
@@ -130,8 +141,18 @@ std::vector<uint8_t> encode_sec_key(TABLE *table, const TableCodec &codec,
                                      uint64_t synthetic_rowid = 0);
 
 // Returns the byte length of the trailing PK / rowid suffix used by
-// encode_pk and encode_sec_key. 8 for PK-less tables, key_length otherwise.
-uint pk_suffix_length(TABLE *table);
+// encode_pk and encode_sec_key: 8 for PK-less tables, the primary key's
+// stored_length otherwise.
+uint pk_suffix_length(TABLE *table, const TableCodec &codec);
+
+// Longest key the plugin stores: the engine's hard ceiling (u16 length).
+inline constexpr uint32_t kMaxStoredKeyBytes = 65535;
+
+// Longest key the table's definition can produce, a search key past a whole
+// primary key included. Collation weights can make it larger than the
+// server's own key limit, which counts key_copy() bytes; create() refuses a
+// table whose keys would not fit in kMaxStoredKeyBytes.
+std::size_t max_stored_key_bytes(TABLE *table, const TableCodec &codec);
 
 // Reads a 8-byte big-endian unsigned integer from `p`.
 uint64_t read_be64(const uint8_t *p);
@@ -173,17 +194,26 @@ std::vector<uint8_t> encode_unique_sec_key(TABLE *table,
 // Removes the VARCHAR length prefix from packed secondary-index key bytes,
 // converting key_copy() output to the same format used by encode_sec_key().
 // Must be called on the key bytes starting immediately after the 7-byte prefix
-// (kNsIndex + table_id + index_id). Used by index_read_map() to bring
-// the optimizer-supplied search key into the same encoding as stored keys.
+// (kNsIndex + table_id + index_id). Parts stored as weights are left alone.
 void fix_varchar_key_encoding(uint8_t *key_data, const KeyPlan &plan);
 
 // Normalizes VARCHAR key parts for PAD SPACE collations in PK encoding.
 // Strips trailing 0x20 bytes and updates the 2-byte LE length prefix so that
-// 'a' and 'a ' produce identical encoded keys.
+// 'a' and 'a ' produce identical encoded keys. Parts stored as weights are
+// left alone.
 void normalize_padspace_pk(uint8_t *key_data, const KeyPlan &plan);
+
+// Encodes key_copy() bytes `src` — the first `src_len` bytes of a key, whole
+// parts — into their stored form at `dst`, which must hold
+// plan.stored_length bytes: the same transform encode_pk_into (`pk`) or
+// encode_sec_key_into applies. `src` is rewritten in place on the way.
+// Returns the stored bytes those parts take, a search key's prefix length.
+uint encode_key_parts(uint8_t *dst, uint8_t *src, const KeyPlan &plan,
+                      uint src_len, bool pk);
 
 // Transforms key_copy() output (native little-endian integers) into a
 // mem-comparable encoding (big-endian, sign-bit flipped for signed types).
+// Parts stored as weights are skipped: encode_key_parts writes them.
 // Operates in-place on the key_data starting immediately after any prefix
 // (5-byte for PK, 7-byte for secondary). Only affects integer field types;
 // VARCHARs and other types are left untouched, except that a plan with
