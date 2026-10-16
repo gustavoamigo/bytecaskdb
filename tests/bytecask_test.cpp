@@ -12957,43 +12957,30 @@ TEST_CASE("#384: thread scratch gives back a large record after close",
     return k;
   };
 
-  // A thread of its own, so nothing another test left on the main thread
-  // counts, and the scratch measured is what this thread kept.
-  std::size_t retained = 0;
-  bool read_back = false;
-  const auto work = [&] {
-    {
-      auto db = bytecask::DB::open(td.path, opts);
-      db.put({}, to_bytes("big"), to_bytes(big));
-      bytecask::WritePlan plan{
-          bytecask::SizeLimits{bytecask::kMaxKeySize, opts.max_value_bytes}};
-      for (std::size_t i = 0; i < kKeys; ++i)
-        plan.put(to_bytes(long_key(i)), to_bytes("v"));
-      (void)db.apply_batch({}, std::move(plan));
-      db.close();
-    }
-    // Reopened, so the value is read from a sealed file through a cold pool.
+  // Measured on this thread: a buffer it kept past the cap from any earlier
+  // test would fail the check as surely as one this test grew. No thread of
+  // its own, so it runs in the WASM build too.
+  {
     auto db = bytecask::DB::open(td.path, opts);
-    bytecask::Bytes out;
-    read_back = db.get({}, to_bytes("big"), out) && out.size() == kValueBytes;
-    auto snap = db.snapshot();
-    read_back = read_back && snap.get({}, to_bytes("big"), out) &&
-                snap.contains_key({}, to_bytes(long_key(kKeys - 1)));
+    db.put({}, to_bytes("big"), to_bytes(big));
+    bytecask::WritePlan plan{
+        bytecask::SizeLimits{bytecask::kMaxKeySize, opts.max_value_bytes}};
+    for (std::size_t i = 0; i < kKeys; ++i)
+      plan.put(to_bytes(long_key(i)), to_bytes("v"));
+    (void)db.apply_batch({}, std::move(plan));
     db.close();
-    retained = bytecask::test_thread_scratch_bytes();
-  };
-  std::exception_ptr failure;
-  std::thread worker{[&] {
-    try {
-      work();
-    } catch (...) {
-      failure = std::current_exception();
-    }
-  }};
-  worker.join();
-  if (failure) std::rethrow_exception(failure);
+  }
+  // Reopened, so the value is read from a sealed file through a cold pool.
+  auto db = bytecask::DB::open(td.path, opts);
+  bytecask::Bytes out;
+  REQUIRE(db.get({}, to_bytes("big"), out));
+  CHECK(out.size() == kValueBytes);
+  auto snap = db.snapshot();
+  REQUIRE(snap.get({}, to_bytes("big"), out));
+  CHECK(snap.contains_key({}, to_bytes(long_key(kKeys - 1))));
+  db.close();
+  const auto retained = bytecask::test_thread_scratch_bytes();
 
-  REQUIRE(read_back);
   // Read, fill and append scratch: each at most kScratchKeepBytes.
   CHECK(retained <= bytecask::kScratchKeepBytes);
 }
