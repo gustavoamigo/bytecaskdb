@@ -1608,6 +1608,11 @@ fails the gate, so a marker cannot outlive the miss it excused.
 a line a reviewer sees, so the gate cannot be held by exempting what a test
 should cover.
 
+**Asserts are not counted.** An `assert`'s condition holds in every passing
+run, so no test can show one of its conditions deciding it: it is an
+invariant, not a decision. `mcdc_report.py` drops a decision that is the
+condition of an `assert` rather than asking for a marker on each one.
+
 SQLite's alternative, `ALWAYS(x)` / `NEVER(x)` macros that a coverage build
 compiles to constants, was not taken: the coverage build would stop checking
 the conditions it exempts, so the build that runs the tests would differ from
@@ -1681,7 +1686,7 @@ property that every single-point corruption of a valid tree makes
 
 | Site | Answer |
 |---|---|
-| `assert(a && b)` in `bit`, `TransientBTree::persistent`, `VersionChain::unpin`, `find`, `retract` | Simplified: one assert per invariant. |
+| `assert(a && b)` in `bit`, `TransientBTree::persistent`, `VersionChain::unpin`, `find`, `retract` | Not counted: `mcdc_report.py` skips an assert's condition (see below). |
 | `NodePool::pooled`: `kNodePoolEnabled && bytes == size` | Simplified: `if constexpr` on the constant. |
 | `BuildSession::split`: `pos >= 1 && pos + 1 < total` | Simplified: `pos` is one past an earlier insert. |
 | `BulkLoader::first_leaf`: `levels_.empty() \|\| levels_[0].children.empty()` | Simplified: a level exists only once a child was added. |

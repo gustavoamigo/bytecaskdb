@@ -92,7 +92,7 @@ export inline constexpr std::uint32_t kPosShift = 4;
 export inline auto bit(Bytes k, std::uint32_t p) noexcept -> std::uint32_t {
   const std::size_t i = p >> kPosShift;
   const auto r = p & 15u;
-  assert(r <= 8); // a position with r > 8 is not encodable
+  assert(r <= 8 && "bit position with r > 8 is not encodable");
   if (i >= k.size())
     return 0;
   if (r == 0)

@@ -2288,8 +2288,7 @@ public:
   [[nodiscard]] auto persistent() && -> PersistentBTree<V> {
     ensure_active();
     if (!changed_) {
-      assert(root_ == base_.root_);
-      assert(session_.retired_list().empty());
+      assert(root_ == base_.root_ && session_.retired_list().empty());
       session_.finish();
       root_ = nullptr;
       size_ = 0;
