@@ -386,9 +386,14 @@ TEST_CASE("BTree model: validate rejects every single-point corruption",
     const auto t = std::move(tr).persistent();
     std::vector<Node *> leaves;
     std::vector<Node *> inners;
+    // An inner node may hold its first child alone — a split can push its
+    // last separator up — and has no separator to corrupt.
     t.visit_nodes([&](const void *p) {
       auto *n = static_cast<Node *>(const_cast<void *>(p));
-      (n->is_leaf ? leaves : inners).push_back(n);
+      if (n->is_leaf)
+        leaves.push_back(n);
+      else if (n->count > 0)
+        inners.push_back(n);
     });
     REQUIRE(!inners.empty());
     auto pick = [&](const std::vector<Node *> &v) {
