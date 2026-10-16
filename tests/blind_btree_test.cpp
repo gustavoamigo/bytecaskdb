@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <random>
@@ -331,6 +332,176 @@ TEST_CASE("blind tree: random operations match std::map", "[blind]") {
     check_accounting(foreign, {&t});
     for (const auto &[snap, m] : snaps)
       check_accounting(foreign, {&t, &snap});
+  }
+}
+
+namespace {
+
+// "a" and a 24-bit counter, big-endian: a stream in key order.
+auto counter_key(std::uint32_t v) -> std::string {
+  return {'a', static_cast<char>((v >> 16) & 0xFF),
+          static_cast<char>((v >> 8) & 0xFF), static_cast<char>(v & 0xFF)};
+}
+
+// Key shapes the split rules tell apart: random keys, a stream that ascends,
+// one that descends, and an ascending stream with other keys landing among it.
+auto shaped_key(std::mt19937_64 &rng, int shape, std::uint32_t &up,
+                std::uint32_t &down) -> std::string {
+  switch (shape) {
+  case 0:
+    return nasty_key(rng, 8);
+  case 1:
+    return counter_key(up++);
+  case 2:
+    return counter_key(down--);
+  default:
+    return rng() % 4 == 0 ? bit_key(rng) : counter_key(up++);
+  }
+}
+
+// lower_bound agrees with the model's, and two iterators compare equal
+// exactly when the model's iterators for the same seeks do.
+void check_seeks(const SmallTree &t, const std::map<std::string, BlindRef> &model,
+                 MemResolver &res, std::mt19937_64 &rng) {
+  using It = decltype(t.begin());
+  std::vector<std::pair<It, std::map<std::string, BlindRef>::const_iterator>>
+      seen;
+  seen.emplace_back(t.begin(), model.begin());
+  seen.emplace_back(t.end_iter(), model.end());
+  for (int i = 0; i < 12; ++i) {
+    std::string target;
+    if (!model.empty() && rng() % 2 == 0) {
+      auto o = model.begin();
+      std::advance(o, static_cast<std::ptrdiff_t>(rng() % model.size()));
+      target = o->first;
+    } else {
+      auto up = static_cast<std::uint32_t>(rng() % 0x1000000);
+      auto down = up;
+      target = shaped_key(rng, static_cast<int>(rng() % 4), up, down);
+    }
+    auto it = t.lower_bound(to_bytes(target), res);
+    auto o = model.lower_bound(target);
+    REQUIRE((it == std::default_sentinel) == (o == model.end()));
+    if (o != model.end()) {
+      REQUIRE(to_string(it.key(res)) == o->first);
+      REQUIRE(*it == o->second);
+    }
+    seen.emplace_back(std::move(it), o);
+  }
+  for (const auto &[a, oa] : seen)
+    for (const auto &[b, ob] : seen)
+      REQUIRE((a == b) == (oa == ob));
+}
+
+} // namespace
+
+TEST_CASE("blind tree model: key streams and seeks match std::map",
+          "[blind][model]") {
+  std::mt19937_64 rng{11};
+  const auto foreign = foreign_nodes();
+  MemResolver res;
+  std::map<std::string, BlindRef> model;
+  SmallTree t;
+  check_seeks(t, model, res, rng);
+  std::uint32_t up = 0;
+  std::uint32_t down = 0xFFFFFF;
+  for (int batch = 0; batch < 80; ++batch) {
+    const auto shape = batch % 4;
+    auto tr = t.transient();
+    for (int op = 0; op < 80; ++op) {
+      const auto k = shaped_key(rng, shape, up, down);
+      if (rng() % 8 == 0) {
+        const auto erased = tr.erase(to_bytes(k), res);
+        REQUIRE(erased.has_value() == model.contains(k));
+        model.erase(k);
+      } else {
+        const auto ref = model.contains(k) ? res.fresh(k) : res.ref(k);
+        tr.set(to_bytes(k), ref, res);
+        model[k] = ref;
+      }
+    }
+    // Halfway, drain the tree: seeks on a tree emptied by erase.
+    if (batch == 39) {
+      for (const auto &[k, v] : model)
+        REQUIRE(tr.erase(to_bytes(k), res).has_value());
+      model.clear();
+    }
+    t = std::move(tr).persistent();
+    REQUIRE(t.size() == model.size());
+    t.validate(res);
+    check_seeks(t, model, res, rng);
+  }
+  check_accounting(foreign, {&t});
+}
+
+// validate() is the oracle every model test above leans on for structure, so
+// it must reject a broken tree: each single-point corruption of a valid tree
+// makes it throw, and undoing it makes it pass again.
+TEST_CASE("blind tree model: validate rejects every single-point corruption",
+          "[blind][model]") {
+  using Node = bytecask::btree_detail::Node<BlindRef>;
+  std::mt19937_64 rng{13};
+  for (int round = 0; round < 6; ++round) {
+    MemResolver res;
+    auto tr = SmallTree{}.transient();
+    std::uint32_t up = 0;
+    std::uint32_t down = 0xFFFFFF;
+    for (int i = 0; i < 3000; ++i) {
+      const auto k = shaped_key(rng, (i / 200) % 4, up, down);
+      tr.set(to_bytes(k), res.ref(k), res);
+    }
+    const auto t = std::move(tr).persistent();
+    std::vector<Node *> leaves;
+    std::vector<Node *> inners;
+    // An inner node may hold its first child alone — a split can push its
+    // last separator up — and has no separator to corrupt.
+    t.visit_nodes([&](const void *p) {
+      auto *n = static_cast<Node *>(const_cast<void *>(p));
+      if (n->is_leaf)
+        leaves.push_back(n);
+      else if (n->count > 0)
+        inners.push_back(n);
+    });
+    REQUIRE(!inners.empty());
+    auto pick = [&](const std::vector<Node *> &v) {
+      return v[static_cast<std::size_t>(rng() % v.size())];
+    };
+    auto rejected = [&](auto corrupt, auto restore) {
+      corrupt();
+      CHECK_THROWS_AS(t.validate(res), std::logic_error);
+      restore();
+      t.validate(res);
+    };
+
+    for (int trial = 0; trial < 8; ++trial) {
+      // A leaf count of zero, or past the leaf's capacity.
+      auto *leaf = pick(leaves);
+      const auto leaf_count = leaf->count;
+      rejected([&] { leaf->count = 0; }, [&] { leaf->count = leaf_count; });
+      rejected(
+          [&] {
+            leaf->count = static_cast<std::uint32_t>(SmallTree::kLeafEntries) + 1;
+          },
+          [&] { leaf->count = leaf_count; });
+
+      // Two separators out of order.
+      auto *inner = pick(inners);
+      if (inner->count >= 2) {
+        const auto j = static_cast<std::uint32_t>(rng() % (inner->count - 1));
+        rejected([&] { std::swap(inner->slots()[j], inner->slots()[j + 1]); },
+                 [&] { std::swap(inner->slots()[j], inner->slots()[j + 1]); });
+      }
+
+      // A child whose keys fall below its lower bound (its left sibling in
+      // its place) or at or above its upper bound (its right sibling).
+      const auto c = static_cast<std::uint32_t>(rng() % inner->count);
+      auto *left = inner->child(c);
+      auto *right = inner->child(c + 1);
+      rejected([&] { inner->set_child(c + 1, left); },
+               [&] { inner->set_child(c + 1, right); });
+      rejected([&] { inner->set_child(c, right); },
+               [&] { inner->set_child(c, left); });
+    }
   }
 }
 

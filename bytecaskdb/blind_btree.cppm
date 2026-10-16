@@ -847,6 +847,9 @@ private:
       stack_.push_back({cur, idx});
       cur = cur->child(idx);
     }
+    // mcdc-exempt(C2): erase drops a leaf when it empties and validate()
+    // rejects an empty one, so no version holds one. The test stays: past
+    // an empty leaf, stepping back to count - 1 would wrap.
     if (!cur || cur->count == 0) {
       // An empty leaf is the end; inner frames left above it would not be.
       stack_.clear();

@@ -372,8 +372,8 @@ private:
   // no version reaches the node any more and it can be freed.
   [[nodiscard]] auto blocker_for(std::uint64_t node_tag, const Parcel &parcel)
       -> std::uint64_t {
-    for (auto it = seat_for(node_tag);
-         it != records_.end() && it->tag < parcel.retired_by; ++it) {
+    const auto window_end = seat_for(parcel.retired_by);
+    for (auto it = seat_for(node_tag); it < window_end; ++it) {
       if (it->lineage == parcel.lineage)
         return it->tag;
     }

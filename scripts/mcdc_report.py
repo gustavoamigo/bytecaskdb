@@ -34,6 +34,9 @@ instantiations: a condition counts as covered if some build or instantiation
 shows it independent. Exports are merged here rather than by llvm-profdata,
 which drops a function whose MC/DC bitmap differs between builds.
 
+The condition of an `assert` is not counted: it holds in every passing run,
+so no test can show one of its conditions deciding it.
+
 A decision that ran but recorded no test vectors is marked `[no vectors]`.
 Clang 21 records none for a decision that is the condition of a `?:` whose
 result has class type; name the decision as a bool first.
@@ -99,6 +102,22 @@ def comment_text(line: str) -> str | None:
     return s[2:].strip() if s.startswith("//") else None
 
 
+def is_assert(src: list[str], d: Decision) -> bool:
+    """True for the condition of an assert: it holds in every passing run, so
+    no test can show one of its conditions deciding it. An invariant, not a
+    decision; it is not counted."""
+    if not 0 < d.line <= len(src):
+        return False
+    # Clang places the decision at the macro, or at the condition inside it.
+    line = src[d.line - 1]
+    if line[d.col - 1:].startswith("assert("):
+        return True
+    before = line[:d.col - 1].rstrip()
+    if not before and d.line > 1:
+        before = src[d.line - 2].rstrip()
+    return before.endswith("assert(")
+
+
 def find_markers(src: list[str]) -> dict[int, tuple[int, str, set[int] | None]]:
     """Maps the 1-based line a marker applies to -> (marker line, reason,
     exempt condition indices or None for all).
@@ -159,6 +178,7 @@ def build_report(path: str, fobjs: list[dict]) -> FileReport:
         src = Path(path).read_text().split("\n")
     except OSError:
         return rep
+    rep.decisions = [d for d in rep.decisions if not is_assert(src, d)]
     markers = find_markers(src)
     used: set[int] = set()
     for d in rep.decisions:
