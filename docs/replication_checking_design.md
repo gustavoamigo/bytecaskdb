@@ -94,7 +94,17 @@ asynchronous, so the old leader's writes with sequence above the promoted
 node's `durable_sequence()` are lost by design. At promotion, the harness
 records that sequence. The script then relabels every leader `:ok` with a
 higher sequence, acknowledged in the old epoch, as `:info`. Those writes may
-or may not appear anywhere, and that is correct.
+or may not appear anywhere, and that is correct. The sequence only bounds
+what the promoted node holds of the old leader's history if it tailed the
+old leader. Under `--promote-least` a node left ahead of one promotion
+keeps its old branch until its first pull is refused, and the next
+promotion can take it before then: it leads from that branch. So each
+promotion also records `held`, the epoch whose leader's history the target
+holds a prefix of, and the script keeps a lineage per term: its parent
+term's history up to the branch point, then its own writes. What a
+promotion loses is everything in the old leader's history, its own term's
+writes and any it inherited, above the sequence where the two lineages
+part.
 
 **A crashed node never rejoins in place.** An abandoned leader is only ever
 re-bootstrapped: its directory is wiped and filled from a new manifest, as
@@ -238,7 +248,14 @@ Step 2 as built:
 - `run_isolation_check.py --topology` relabels what an unplanned promotion
   lost: an `:ok` operation on the old leader in its last epoch that wrote or
   read an element above the promoted node's `durable_sequence()` becomes
-  `:info` with its reads cleared. A session read there that waited above
+  `:info` with its reads cleared. If the promoted node holds an earlier
+  epoch's history (`held` below the old epoch), the bound is where that
+  history and the old leader's part, and the lost elements include those
+  the old leader inherited from its own branch. On the old leader the
+  relabelling covers the whole bootstrap life it led in, its follower
+  reads before the term included; its next life is checked as it is.
+  `held` is set only by a drain that ended on an empty slice: a duplicate
+  slice rewound below the node's position proves nothing above it. A session read there that waited above
   that sequence waited on the lost branch, whose sequences the new leader
   reassigns, so its wait is capped at it. The same relabelling applies to
   the node a `fork` event names, in the bootstrap life it names: every

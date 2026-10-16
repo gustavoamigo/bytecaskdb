@@ -1462,9 +1462,19 @@ TEST_CASE("chaos soak: concurrent readers, writers and lifecycle",
         for (unsigned i = 0; i < cfg.readers; ++i)
           readers.push_back(std::make_unique<Reader>(sh, i));
         Lifecycle lifecycle{sh, lifecycle_counter};
-        // Declared last so it is destroyed — joined — before the objects
-        // its threads run on.
-        std::vector<std::jthread> threads;
+        // Declared last, with the guard that joins them, so they are joined
+        // before the objects their threads run on are destroyed.
+        // std::thread, not std::jthread: libc++ 21's jthread leaves
+        // __atomic_unique_lock::__set_locked_bit undefined and the MSan build
+        // fails to link (llvm/llvm-project#172241).
+        std::vector<std::thread> threads;
+        struct JoinAll {
+          std::vector<std::thread> &threads;
+          ~JoinAll() {
+            for (auto &t : threads)
+              if (t.joinable()) t.join();
+          }
+        } join_all{threads};
 
         const auto guarded = [&](std::function<void()> fn) {
           return [&sh, body = std::move(fn)] {
