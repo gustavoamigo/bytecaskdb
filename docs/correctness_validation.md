@@ -1576,11 +1576,11 @@ unless every condition in `data_file.cppm`, `hint_file.cppm`,
 `bytecask.cppm` and the engine's implementation units split out of it
 (those holding a decision of two or more conditions) — the write path,
 recovery and vacuum — and in the key directory — `blind_btree.cppm`,
-`btree.cppm` and `version_chain.cppm` — is covered or exempt. The tree tests
-(`tests/btree_test.cpp`, `tests/blind_btree_test.cpp`) are compiled into
-`bytecask_tests`, so they count alongside the engine suite. Elsewhere MC/DC
-is reported, not gated; `internals.cppm`, `u32_map.cppm` and
-`concurrency.cppm` are #357.
+`btree.cppm` and `version_chain.cppm` — and in the engine's shared internals
+— `internals.cppm`, `u32_map.cppm` and `concurrency.cppm` — is covered or
+exempt. The tree tests (`tests/btree_test.cpp`, `tests/blind_btree_test.cpp`)
+are compiled into `bytecask_tests`, so they count alongside the engine
+suite. Elsewhere MC/DC is reported, not gated.
 
 **Merged per build.** The engine suite runs on both key directories, and
 each build compiles paths the others do not. `llvm-profdata` cannot merge
@@ -1675,8 +1675,8 @@ simplification (the condition could not decide anything), or an exemption.
 | `ChangeIterator`: `needs_advance_ && entry_iter_` | Simplified: set only after a read from `entry_iter_`. |
 | `ChangeIterator`: `!impl_ \|\| !has_more()` | Test: a default iterator is at its end. |
 
-**Triage record (#357).** The same for the key directory, when it joined the
-gate. The tree conditions are reached through the tree model tests
+**Triage record (#357).** The same for the key directory and the shared
+internals, when they joined the gate. The tree conditions are reached through the tree model tests
 (`[model]` in `tests/btree_test.cpp` and `tests/blind_btree_test.cpp`)
 rather than through single-purpose unit tests: workloads shaped as random
 keys, ascending and descending streams and interleaved key families, with
@@ -1697,6 +1697,11 @@ property that every single-point corruption of a valid tree makes
 | Iterator `==` (both trees) | Model: seeks compared pairwise against `std::map` iterators. |
 | Iterator seek: `!cur \|\| cur->count == 0` (both trees) | Exempt (C2): no version holds an empty leaf; the guard keeps `count - 1` from wrapping. |
 | `validate` checks (both trees): empty or overfull node, head, order, bounds | Model: the corruption property. |
+| `kd_upper_bound`: `it != end && key == from` (reached by `rkeys_from(from)`) | Model: scans from present, absent, first and past-the-end keys against `std::map`. |
+| `EngineState::is_ingestion_allowed`: `Follower && !degraded && !closed` | Test: the `DbClosed` test runs on a closed follower too. |
+| `U32TableIterator` `==`: other not at end, same table, page, slot | Model: iterators compared pairwise, against each other and a separately built copy. |
+| `PersistentU32Table::empty`: `!dir_ \|\| pages.empty()` | Model: a table never written to is empty. |
+| `BackgroundWorker::run`: `stop_ && queue_.empty()` | Simplified to `queue_.empty()`: the wait returns with nothing queued only when stopping. |
 
 Functions in the same files that no build called were tested (the iterators'
 post-increment, `ChangeIterator`'s move assignment) or deleted:

@@ -18,9 +18,11 @@ CLANG_TARGET_TRIPLE="$(clang --print-target-triple)"
 # enclosing project.
 XMAKE_P=(-P "$PROJECT_DIR")
 
-# MC/DC is held at 100% on the durability and recovery code and on the key
+# MC/DC is held at 100% on the durability and recovery code, on the key
 # directory (both B+ trees and the version chain that frees their nodes;
-# the tree tests are compiled into bytecask_tests), after the
+# the tree tests are compiled into bytecask_tests) and on the engine's
+# shared internals (engine state, the file table, the background worker),
+# after the
 # conditions marked `mcdc-exempt:` at their site (scripts/mcdc_report.py).
 # MCDC_MAX_EXEMPT caps those marks: raising it is a reviewed change.
 # change_index.cppm is not listed: it has no decision with two or more
@@ -35,7 +37,8 @@ XMAKE_P=(-P "$PROJECT_DIR")
 MCDC_REQUIRED=(bytecaskdb/data_file.cppm bytecaskdb/hint_file.cppm
                bytecaskdb/bytecask.cppm bytecaskdb/change_iterator.cppm
                bytecaskdb/blind_btree.cppm bytecaskdb/btree.cppm
-               bytecaskdb/version_chain.cppm)
+               bytecaskdb/version_chain.cppm bytecaskdb/internals.cppm
+               bytecaskdb/u32_map.cppm bytecaskdb/concurrency.cppm)
 mapfile -t -O "${#MCDC_REQUIRED[@]}" MCDC_REQUIRED \
     < <(cd "$PROJECT_DIR" &&
         grep -lE '&&|\|\|' bytecaskdb/*.cpp | grep -vx bytecaskdb/bytecask_hpp.cpp)
