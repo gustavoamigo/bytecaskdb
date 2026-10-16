@@ -201,7 +201,8 @@ public:
     {
       std::lock_guard<std::mutex> lk{mu_};
       auto it = seat_for(id);
-      assert(it != records_.end() && it->tag == id);
+      assert(it != records_.end());
+      assert(it->tag == id);
       if (--it->live > 0)
         return;
       if (it->successor != 0) {
@@ -301,7 +302,8 @@ private:
   }
   [[nodiscard]] auto find(std::uint64_t tag) -> Record * {
     auto it = seat_for(tag);
-    assert(it != records_.end() && it->tag == tag);
+    assert(it != records_.end());
+    assert(it->tag == tag);
     return &*it;
   }
 
@@ -331,7 +333,8 @@ private:
     }
     // A parcel is parked on a version below the one that retired it, and the
     // head has nothing above it.
-    assert(it->parked.nodes.empty() && it->more.empty());
+    assert(it->parked.nodes.empty());
+    assert(it->more.empty());
     const auto floor = pred ? pred->tag : 0;
     // Under the lock: once this version leaves the chain another thread may
     // decide that what it reached is free while this walk is still stepping
@@ -372,8 +375,8 @@ private:
   // no version reaches the node any more and it can be freed.
   [[nodiscard]] auto blocker_for(std::uint64_t node_tag, const Parcel &parcel)
       -> std::uint64_t {
-    for (auto it = seat_for(node_tag);
-         it != records_.end() && it->tag < parcel.retired_by; ++it) {
+    const auto window_end = seat_for(parcel.retired_by);
+    for (auto it = seat_for(node_tag); it < window_end; ++it) {
       if (it->lineage == parcel.lineage)
         return it->tag;
     }

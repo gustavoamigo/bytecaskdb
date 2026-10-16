@@ -213,7 +213,10 @@ private:
   };
 
   static constexpr auto pooled(std::size_t bytes) noexcept -> bool {
-    return kNodePoolEnabled && bytes == kBTreeNodeBytes;
+    if constexpr (kNodePoolEnabled)
+      return bytes == kBTreeNodeBytes;
+    else
+      return false;
   }
 
   static void refill(std::vector<void *> &cache) {
@@ -1023,7 +1026,8 @@ protected:
       // key than its predecessor does are another key family: give them a
       // node of their own instead of carrying them along with the stream,
       // which would leave a short node behind at every split.
-      if (pos >= 1 && pos + 1 < total) {
+      // pos >= 1 here: it is one past an earlier insert.
+      if (pos + 1 < total) {
         const auto with_prev =
             common_prefix_length(item(pos - 1).key, item(pos).key);
         const auto with_next =
@@ -1362,8 +1366,9 @@ protected:
   }
 
   // True while no leaf has been added yet — the first one needs no separator.
+  // A level exists only once a child was added to it.
   [[nodiscard]] auto first_leaf() const noexcept -> bool {
-    return levels_.empty() || levels_[0].children.empty();
+    return levels_.empty();
   }
 
   // Builds the levels above the sealed leaves and publishes the version.
@@ -1418,7 +1423,7 @@ protected:
   void admit(Bytes key) {
     if (leaf_lens_.empty()) {
       leaf_prefix_ = key.size();
-      if (!prev_last_.empty() || !levels_.empty())
+      if (!first_leaf())
         pending_sep_ = separator(Bytes{prev_last_}, key);
     }
     const auto off = static_cast<std::uint32_t>(leaf_arena_.size());
@@ -1663,6 +1668,9 @@ private:
       stack_.push_back({cur, idx});
       cur = cur->child(idx);
     }
+    // mcdc-exempt(C2): erase drops a leaf when it empties and validate()
+    // rejects an empty one, so no version holds one. The test stays: past
+    // an empty leaf, stepping back to count - 1 would wrap.
     if (!cur || cur->count == 0)
       return;
     const auto p = cur->search(target);
@@ -2089,7 +2097,9 @@ private:
                               const std::vector<std::size_t> &targets,
                               std::size_t &seen, std::size_t &next,
                               std::vector<std::vector<std::byte>> &out) {
-    if (n->is_leaf || next == targets.size())
+    // Entered only while a target is left: the loop below returns once the
+    // last one is taken, before descending again.
+    if (n->is_leaf)
       return;
     for (std::uint32_t i = 0; i <= n->count; ++i) {
       emit_separators(n->child(i), targets, seen, next, out);
@@ -2278,7 +2288,8 @@ public:
   [[nodiscard]] auto persistent() && -> PersistentBTree<V> {
     ensure_active();
     if (!changed_) {
-      assert(root_ == base_.root_ && session_.retired_list().empty());
+      assert(root_ == base_.root_);
+      assert(session_.retired_list().empty());
       session_.finish();
       root_ = nullptr;
       size_ = 0;

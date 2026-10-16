@@ -1575,10 +1575,14 @@ of two or more conditions; a single condition is branch coverage's.
 unless every condition in `data_file.cppm`, `hint_file.cppm`,
 `bytecask.cppm` and the engine's implementation units split out of it
 (those holding a decision of two or more conditions) — the write path,
-recovery and vacuum — is covered or exempt. Elsewhere MC/DC is reported, not gated; the key directory modules
-are #357.
+recovery and vacuum — and in the key directory — `blind_btree.cppm`,
+`btree.cppm` and `version_chain.cppm` — is covered or exempt. The tree tests
+(`tests/btree_test.cpp`, `tests/blind_btree_test.cpp`) are compiled into
+`bytecask_tests`, so they count alongside the engine suite. Elsewhere MC/DC
+is reported, not gated; `internals.cppm`, `u32_map.cppm` and
+`concurrency.cppm` are #357.
 
-**Merged per build.** The engine suite runs on all three key directories, and
+**Merged per build.** The engine suite runs on both key directories, and
 each build compiles paths the others do not. `llvm-profdata` cannot merge
 them: a function whose MC/DC bitmap differs between builds (`store_state`'s
 debug walk differs per key directory) keeps one build's counters and drops
@@ -1665,6 +1669,29 @@ simplification (the condition could not decide anything), or an exemption.
 | `ChangeIterator`: `seq > from && seq <= durable` | Test: an unsynced write is not shipped. |
 | `ChangeIterator`: `needs_advance_ && entry_iter_` | Simplified: set only after a read from `entry_iter_`. |
 | `ChangeIterator`: `!impl_ \|\| !has_more()` | Test: a default iterator is at its end. |
+
+**Triage record (#357).** The same for the key directory, when it joined the
+gate. The tree conditions are reached through the tree model tests
+(`[model]` in `tests/btree_test.cpp` and `tests/blind_btree_test.cpp`)
+rather than through single-purpose unit tests: workloads shaped as random
+keys, ascending and descending streams and interleaved key families, with
+`lower_bound` and iterator equality checked against `std::map`, and a
+property that every single-point corruption of a valid tree makes
+`validate()` throw.
+
+| Site | Answer |
+|---|---|
+| `assert(a && b)` in `bit`, `TransientBTree::persistent`, `VersionChain::unpin`, `find`, `retract` | Simplified: one assert per invariant. |
+| `NodePool::pooled`: `kNodePoolEnabled && bytes == size` | Simplified: `if constexpr` on the constant. |
+| `BuildSession::split`: `pos >= 1 && pos + 1 < total` | Simplified: `pos` is one past an earlier insert. |
+| `BulkLoader::first_leaf`: `levels_.empty() \|\| levels_[0].children.empty()` | Simplified: a level exists only once a child was added. |
+| `BulkLoader::admit`: `!prev_last_.empty() \|\| !levels_.empty()` | Simplified to `!first_leaf()`: a previous last key implies a sealed leaf. |
+| `emit_separators`: `is_leaf \|\| next == targets.size()` | Simplified: entered only while a target is left. |
+| `VersionChain::blocker_for`: `it != end && it->tag < retired_by` | Simplified to the record range `[seat_for(node_tag), seat_for(retired_by))`: the lineage's head always sits at or above `retired_by`. |
+| blind `split_leaf`: `idx == 0 && last_pos == 0` | Model: descending streams. |
+| Iterator `==` (both trees) | Model: seeks compared pairwise against `std::map` iterators. |
+| Iterator seek: `!cur \|\| cur->count == 0` (both trees) | Exempt (C2): no version holds an empty leaf; the guard keeps `count - 1` from wrapping. |
+| `validate` checks (both trees): empty or overfull node, head, order, bounds | Model: the corruption property. |
 
 Functions in the same files that no build called were tested (the iterators'
 post-increment, `ChangeIterator`'s move assignment) or deleted:

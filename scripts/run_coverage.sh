@@ -18,7 +18,9 @@ CLANG_TARGET_TRIPLE="$(clang --print-target-triple)"
 # enclosing project.
 XMAKE_P=(-P "$PROJECT_DIR")
 
-# MC/DC is held at 100% on the durability and recovery code, after the
+# MC/DC is held at 100% on the durability and recovery code and on the key
+# directory (both B+ trees and the version chain that frees their nodes;
+# the tree tests are compiled into bytecask_tests), after the
 # conditions marked `mcdc-exempt:` at their site (scripts/mcdc_report.py).
 # MCDC_MAX_EXEMPT caps those marks: raising it is a reviewed change.
 # change_index.cppm is not listed: it has no decision with two or more
@@ -31,11 +33,13 @@ XMAKE_P=(-P "$PROJECT_DIR")
 # when it gains one. Expanded in PROJECT_DIR, as the script may run from
 # anywhere.
 MCDC_REQUIRED=(bytecaskdb/data_file.cppm bytecaskdb/hint_file.cppm
-               bytecaskdb/bytecask.cppm bytecaskdb/change_iterator.cppm)
+               bytecaskdb/bytecask.cppm bytecaskdb/change_iterator.cppm
+               bytecaskdb/blind_btree.cppm bytecaskdb/btree.cppm
+               bytecaskdb/version_chain.cppm)
 mapfile -t -O "${#MCDC_REQUIRED[@]}" MCDC_REQUIRED \
     < <(cd "$PROJECT_DIR" &&
         grep -lE '&&|\|\|' bytecaskdb/*.cpp | grep -vx bytecaskdb/bytecask_hpp.cpp)
-MCDC_MAX_EXEMPT=2
+MCDC_MAX_EXEMPT=4
 
 # Configure and build with coverage instrumentation
 echo "==> Configuring with coverage..."

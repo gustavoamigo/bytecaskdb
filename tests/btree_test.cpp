@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <format>
 #include <initializer_list>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -270,6 +271,176 @@ TEST_CASE("BTree model: random operations against std::map", "[btree]") {
       check(snap, m);
   }
   check_accounting({&t});
+}
+
+namespace {
+
+// Key shapes the split rules tell apart: random keys, a stream that ascends,
+// one that descends, and an ascending stream with keys of another family
+// landing among it.
+auto shaped_key(std::mt19937_64 &rng, int shape, std::uint32_t &up,
+                std::uint32_t &down) -> std::string {
+  switch (shape) {
+  case 0:
+    return "k" + std::to_string(rng() % 3000) +
+           std::string(static_cast<std::size_t>(rng() % 4 == 0 ? rng() % 60 : 0),
+                       'x');
+  case 1:
+    return std::format("s{:08}", up++);
+  case 2:
+    return std::format("s{:08}", down--);
+  default:
+    // The stream shares a long prefix; the other family sorts just above it.
+    if (rng() % 4 == 0)
+      return std::format("f/z{}", rng() % 100000);
+    return std::format("f/stream-0000000000/{:08}", up++);
+  }
+}
+
+// lower_bound agrees with the oracle's, and two iterators compare equal
+// exactly when the oracle's iterators for the same seeks do.
+void check_seeks(const Tree &t, const std::map<std::string, int> &oracle,
+                 std::mt19937_64 &rng) {
+  using It = bytecask::BTreeIterator<int>;
+  std::vector<std::pair<It, std::map<std::string, int>::const_iterator>> seen;
+  seen.emplace_back(t.begin(), oracle.begin());
+  seen.emplace_back(t.end_iter(), oracle.end());
+  for (int i = 0; i < 12; ++i) {
+    std::string target;
+    if (!oracle.empty() && rng() % 2 == 0) {
+      auto o = oracle.begin();
+      std::advance(o, static_cast<std::ptrdiff_t>(rng() % oracle.size()));
+      target = o->first;
+    } else {
+      std::uint32_t up = static_cast<std::uint32_t>(rng() % 100000);
+      std::uint32_t down = up;
+      target = shaped_key(rng, static_cast<int>(rng() % 4), up, down);
+    }
+    auto it = t.lower_bound(to_bytes(target));
+    auto o = oracle.lower_bound(target);
+    REQUIRE((it == std::default_sentinel) == (o == oracle.end()));
+    if (o != oracle.end()) {
+      auto [k, v] = *it;
+      REQUIRE(to_string(k) == o->first);
+      REQUIRE(v == o->second);
+    }
+    seen.emplace_back(std::move(it), o);
+  }
+  for (const auto &[a, oa] : seen)
+    for (const auto &[b, ob] : seen)
+      REQUIRE((a == b) == (oa == ob));
+}
+
+} // namespace
+
+TEST_CASE("BTree model: key streams and seeks against std::map",
+          "[btree][model]") {
+  std::mt19937_64 rng{23};
+  std::map<std::string, int> oracle;
+  Tree t;
+  check_seeks(t, oracle, rng);
+  std::uint32_t up = 0;
+  std::uint32_t down = 99'999'999;
+  for (int batch = 0; batch < 48; ++batch) {
+    const auto shape = batch % 4;
+    auto tr = t.transient();
+    for (int op = 0; op < 400; ++op) {
+      const auto key = shaped_key(rng, shape, up, down);
+      if (rng() % 8 == 0) {
+        const bool removed = tr.erase(to_bytes(key));
+        REQUIRE(removed == (oracle.erase(key) > 0));
+      } else {
+        const auto val = static_cast<int>(rng() % 100000);
+        tr.set(to_bytes(key), val);
+        oracle[key] = val;
+      }
+    }
+    // Halfway, drain the tree: seeks on a tree emptied by erase.
+    if (batch == 23) {
+      for (const auto &[k, v] : oracle)
+        REQUIRE(tr.erase(to_bytes(k)));
+      oracle.clear();
+    }
+    t = std::move(tr).persistent();
+    REQUIRE(t.size() == oracle.size());
+    (void)t.validate();
+    REQUIRE(keys_of(t).size() == oracle.size());
+    check_seeks(t, oracle, rng);
+  }
+  check_accounting({&t});
+}
+
+// validate() is the oracle every model test above leans on for structure, so
+// it must reject a broken tree: each single-point corruption of a valid tree
+// makes it throw, and undoing it makes it pass again.
+TEST_CASE("BTree model: validate rejects every single-point corruption",
+          "[btree][model]") {
+  using Node = bytecask::btree_detail::Node<int>;
+  std::mt19937_64 rng{29};
+  for (int round = 0; round < 6; ++round) {
+    auto tr = Tree{}.transient();
+    std::uint32_t up = 0;
+    std::uint32_t down = 99'999'999;
+    for (int i = 0; i < 8000; ++i)
+      tr.set(to_bytes(shaped_key(rng, (i / 500) % 4, up, down)), i);
+    const auto t = std::move(tr).persistent();
+    std::vector<Node *> leaves;
+    std::vector<Node *> inners;
+    t.visit_nodes([&](const void *p) {
+      auto *n = static_cast<Node *>(const_cast<void *>(p));
+      (n->is_leaf ? leaves : inners).push_back(n);
+    });
+    REQUIRE(!inners.empty());
+    auto pick = [&](const std::vector<Node *> &v) {
+      return v[static_cast<std::size_t>(rng() % v.size())];
+    };
+    auto rejected = [&](auto corrupt, auto restore) {
+      corrupt();
+      CHECK_THROWS_AS((void)t.validate(), std::logic_error);
+      restore();
+      (void)t.validate();
+    };
+
+    for (int trial = 0; trial < 8; ++trial) {
+      // An empty leaf; an inner node without separators, with and without
+      // its first child.
+      auto *leaf = pick(leaves);
+      const auto leaf_count = leaf->count;
+      rejected([&] { leaf->count = 0; }, [&] { leaf->count = leaf_count; });
+      auto *inner = pick(inners);
+      const auto inner_count = inner->count;
+      auto *first = inner->first_child;
+      rejected([&] { inner->count = 0; }, [&] { inner->count = inner_count; });
+      rejected([&] { inner->count = 0; inner->first_child = nullptr; },
+               [&] { inner->count = inner_count; inner->first_child = first; });
+
+      // A slot whose cached head no longer matches its suffix.
+      auto *n = rng() % 2 == 0 ? pick(leaves) : pick(inners);
+      const auto i = static_cast<std::uint32_t>(rng() % n->count);
+      if (!n->suffix(i).empty()) {
+        constexpr auto kHeadBit = std::uint64_t{1} << 63;
+        rejected([&] { n->slots()[i] ^= kHeadBit; },
+                 [&] { n->slots()[i] ^= kHeadBit; });
+      }
+
+      // Two neighbours out of order.
+      if (n->count >= 2) {
+        const auto j = static_cast<std::uint32_t>(rng() % (n->count - 1));
+        rejected([&] { std::swap(n->slots()[j], n->slots()[j + 1]); },
+                 [&] { std::swap(n->slots()[j], n->slots()[j + 1]); });
+      }
+
+      // A child whose keys fall below its lower bound (its left sibling in
+      // its place) or at or above its upper bound (its right sibling).
+      const auto c = static_cast<std::uint32_t>(rng() % inner->count);
+      auto *left = inner->child(c);
+      auto *right = inner->child(c + 1);
+      rejected([&] { inner->set_child(c + 1, left); },
+               [&] { inner->set_child(c + 1, right); });
+      rejected([&] { inner->set_child(c, right); },
+               [&] { inner->set_child(c, left); });
+    }
+  }
 }
 
 TEST_CASE("BTree prefix and head edge cases", "[btree]") {
