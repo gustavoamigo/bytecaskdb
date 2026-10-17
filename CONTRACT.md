@@ -78,6 +78,12 @@ byte in a data file and does not degrade the engine.
 | File ids | 1,048,575 per process | every rotation, vacuum compaction and `resume()` takes one; `open` renumbers | A write that would need a new file throws `std::runtime_error` and appends nothing; smaller writes still commit. `vacuum()`, `resume()` and an `ingest` slice that needs a new file refuse the same way before touching a file, and `resume()` leaves the engine degraded. `open` refuses a directory with more data files than ids. | "Limits: the last file id is used, then a write that needs another is refused until a reopen", "Limits: ingest refuses a slice that needs a file id it does not have, before any I/O", "Limits: resume without a file id leaves the engine degraded and untouched" |
 | Sequence | 2^48 − 1 | `ingest` of a higher sequence; a leader's write after it; a promotion, whose marker takes a sequence | `ingest` throws `std::invalid_argument` for any entry above it, whatever its type. A write or a promotion that would need a sequence above it throws `std::runtime_error` and appends nothing; a refused promotion leaves the mode. At a million writes a second a leader reaches it after about 8.9 years. | "Limits: ingest takes the last packable sequence and refuses the next", "Limits: a KeyDirEntry packs each field at its ceiling and refuses one past" |
 
+### Thread memory
+
+| Guarantee | Proved by |
+|---|---|
+| Between calls, a thread keeps at most `thread_scratch_limit()` bytes in each buffer it reads or writes records through, whatever the size of the records it has handled and whether or not a `DB` is still open. `set_thread_scratch_limit` sets it for the whole process, default `kDefaultThreadScratchLimit`, and it applies to each thread from its next call; below `kMinThreadScratchLimit` it throws `std::invalid_argument` and leaves the limit as it was. | "#384: thread scratch gives back a large record after close", "#384: a raised thread scratch limit keeps a large record's buffer", "thread scratch limit: defaults, applies and refuses a value below the minimum" |
+
 ### Sequences
 
 | Guarantee | Proved by |

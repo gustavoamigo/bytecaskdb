@@ -420,7 +420,8 @@ export using KeyDirHit = KeyDirEntry;
 inline auto value_read_scratch() -> ThreadScratch<std::vector<std::byte>> & {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
-  // TLS: scratch — this call's record; freed past kScratchKeepBytes (#384).
+  // TLS: scratch — this call's record; freed past thread_scratch_limit()
+  // (#384).
   thread_local ThreadScratch<std::vector<std::byte>> s;
 #pragma clang diagnostic pop
   return s;
@@ -623,7 +624,8 @@ export struct KeyReader {
 inline auto key_read_scratch() -> ThreadScratch<std::vector<std::byte>> & {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
-  // TLS: scratch — this call's records; freed past kScratchKeepBytes (#384).
+  // TLS: scratch — this call's records; freed past thread_scratch_limit()
+  // (#384).
   thread_local ThreadScratch<std::vector<std::byte>> s;
 #pragma clang diagnostic pop
   return s;

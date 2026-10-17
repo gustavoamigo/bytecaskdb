@@ -18,6 +18,7 @@ module;
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <limits>
 #include <format>
 #include <iterator>
 #include <memory>
@@ -162,8 +163,8 @@ inline auto append_scratch() -> ThreadScratch<std::vector<std::byte>> & {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
   // TLS: scratch — one chunk's entries. Reused by the one thread that
-  // appends, so the commit path allocates only while it grows; freed past
-  // kScratchKeepBytes (#384).
+  // appends, so the commit path allocates only while it grows; a chunk is
+  // cut before it passes thread_scratch_limit() (#384).
   thread_local ThreadScratch<std::vector<std::byte>> s;
 #pragma clang diagnostic pop
   return s;
@@ -171,7 +172,8 @@ inline auto append_scratch() -> ThreadScratch<std::vector<std::byte>> & {
 
 #ifdef BYTECASK_TESTING
 // Bytes the calling thread's append scratch holds between writes.
-export inline auto append_scratch_bytes() noexcept -> std::size_t {
+export [[nodiscard]] inline auto append_scratch_bytes() noexcept
+    -> std::size_t {
   return append_scratch().buf.capacity();
 }
 #endif
@@ -627,18 +629,40 @@ struct WritableFileOps {
       buf.insert(buf.end(), p, p + n);
     };
 
+    // What an entry copies into buf: all of it but an out-of-line value.
+    const auto inline_bytes = [](const DataEntryView &e) {
+      return kHeaderSize + e.key.size() +
+             (e.value.size() <= kInlineValueBytes ? e.value.size() : 0) +
+             kCrcSize;
+    };
+
+    const auto keep = thread_scratch_limit();
     for (std::size_t base = 0; base < entries.size();) {
       // At least one entry, so an entry larger than max_bytes still goes
-      // out; the largest one an engine can write is well under it.
+      // out; the largest one an engine can write is well under it. The
+      // chunk also ends before its inline bytes pass the thread scratch
+      // limit, so the scratch stays within it and is kept between commits
+      // (#384): a bulk load of 4 KiB values would otherwise free and
+      // allocate it on every commit. Only one entry larger than the limit
+      // on its own, a key near 64 KiB under a limit near the minimum, has
+      // its buffer freed after the commit.
       auto chunk_end = base;
+      std::size_t chunk_inline = 0;
       for (std::size_t chunk_bytes = 0;
            chunk_end < entries.size() && chunk_end - base < max_entries;
            ++chunk_end) {
         const auto &e = entries[chunk_end];
         chunk_bytes += kHeaderSize + e.key.size() + e.value.size() + kCrcSize;
-        if (chunk_end > base && chunk_bytes > max_bytes) break;
+        const auto next_inline = chunk_inline + inline_bytes(e);
+        if (chunk_end > base &&
+            (chunk_bytes > max_bytes || next_inline > keep))
+          break;
+        chunk_inline = next_inline;
       }
       buf.clear();
+      // Exactly what the chunk copies, so growth inside it cannot carry the
+      // capacity past the cap.
+      buf.reserve(chunk_inline);
       pieces.clear();
 
       std::size_t total_bytes = 0;

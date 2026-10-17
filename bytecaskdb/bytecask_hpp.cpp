@@ -728,4 +728,15 @@ auto DB::stats() const -> std::map<std::string, std::int64_t> {
   return translate_exceptions([&] { return impl_->db.stats(); });
 }
 
+static_assert(kDefaultThreadScratchLimit == bytecask::kDefaultThreadScratchLimit);
+static_assert(kMinThreadScratchLimit == bytecask::kMinThreadScratchLimit);
+
+void set_thread_scratch_limit(std::size_t bytes) {
+  bytecask::set_thread_scratch_limit(bytes);
+}
+
+auto thread_scratch_limit() noexcept -> std::size_t {
+  return bytecask::thread_scratch_limit();
+}
+
 } // namespace bytecask::internal

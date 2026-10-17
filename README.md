@@ -553,6 +553,15 @@ class DbChangeMarkerMismatch : public std::runtime_error { /* ... */ };
 // Thrown by every DB operation after close().
 class DbClosed : public std::logic_error { /* ... */ };
 
+// The thread scratch limit: the most bytes each of a thread's record buffers
+// keeps between calls, and so the largest record a call serves without
+// allocating (default 256 KiB). Process-wide, not per DB: a thread shares its
+// buffers between every DB it touches. A new limit reaches each thread at its
+// next call. Below kMinThreadScratchLimit (64 KiB) it throws
+// std::invalid_argument.
+void set_thread_scratch_limit(std::size_t bytes);
+[[nodiscard]] auto thread_scratch_limit() noexcept -> std::size_t;
+
 } // namespace bytecask
 ```
 

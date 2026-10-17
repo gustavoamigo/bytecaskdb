@@ -118,6 +118,13 @@ export inline constexpr std::uint64_t kDefaultRotationThreshold =
     64ULL * 1024 * 1024;
 #endif
 
+// The thread scratch limit: what each of a thread's record buffers keeps
+// between calls, process-wide (bytecask.util).
+export using bytecask::kDefaultThreadScratchLimit;
+export using bytecask::kMinThreadScratchLimit;
+export using bytecask::set_thread_scratch_limit;
+export using bytecask::thread_scratch_limit;
+
 // Hard limits imposed by the on-disk entry header format and in-memory packing.
 // key_size is u16 on disk; value_size is 28 bits in a packed KeyDirEntry.
 export inline constexpr std::uint32_t kMaxKeySize = 65535;
@@ -165,16 +172,17 @@ export inline std::uint64_t test_max_group_file_bytes =
 }
 
 #ifdef BYTECASK_TESTING
-// The most bytes any of the calling thread's read, fill and append scratch
-// keeps between calls: at most kScratchKeepBytes (#384).
-export inline auto test_thread_scratch_bytes() noexcept -> std::size_t {
+// The most bytes any of the calling thread's read, fill, append and hint
+// scratch keeps between calls: at most thread_scratch_limit() (#384).
+export [[nodiscard]] inline auto test_thread_scratch_bytes() noexcept
+    -> std::size_t {
 #ifdef BYTECASK_KEYDIR_BLIND
   const auto reads = key_read_scratch().buf.capacity();
 #else
   const auto reads = value_read_scratch().buf.capacity();
 #endif
   return std::max({reads, BufferPool::thread_scratch_bytes(),
-                   append_scratch_bytes()});
+                   append_scratch_bytes(), hint_scratch_bytes()});
 }
 #endif
 

@@ -4,6 +4,7 @@
 // ByteCaskDB — filesystem utilities, RNG helpers, and string formatting
 
 module;
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -49,25 +50,60 @@ export [[noreturn]] inline void panic(std::string_view msg) {
 }
 
 // A thread's scratch keeps its memory between calls, so a hot path does not
-// allocate. Past this size it is given back when the call ends: one large
-// value must not stay with a thread, which can outlive every DB (#384).
-export inline constexpr std::size_t kScratchKeepBytes = std::size_t{1} << 20;
+// allocate, but not past the thread scratch limit: a thread can outlive
+// every DB, and one large record must not stay with it (#384). It is the
+// largest record a thread serves without allocating, and what each of its
+// scratch buffers keeps at most, so it is process-wide, not per DB: a thread
+// shares its scratch between every DB it touches.
+export inline constexpr std::size_t kDefaultThreadScratchLimit =
+    std::size_t{256} << 10;
+// Below this a buffer pool fill run or a commit chunk would hold a handful
+// of frames or entries; there is no use for a smaller limit.
+export inline constexpr std::size_t kMinThreadScratchLimit = std::size_t{64}
+                                                              << 10;
 
-// A per-thread buffer, and how many calls on the thread are using it.
+// Relaxed: a new limit only has to reach each thread at some next call; it
+// orders nothing else.
+inline std::atomic<std::size_t> thread_scratch_limit_bytes{
+    kDefaultThreadScratchLimit};
+
+export [[nodiscard]] inline auto thread_scratch_limit() noexcept
+    -> std::size_t {
+  return thread_scratch_limit_bytes.load(std::memory_order_relaxed);
+}
+
+// Takes effect on each thread at its next call that uses a scratch buffer: a
+// thread already holding more keeps it until then.
+export inline void set_thread_scratch_limit(std::size_t bytes) {
+  if (bytes < kMinThreadScratchLimit)
+    throw std::invalid_argument{std::format(
+        "thread scratch limit {} is below the minimum {}", bytes,
+        kMinThreadScratchLimit)};
+  thread_scratch_limit_bytes.store(bytes, std::memory_order_relaxed);
+}
+
+// A per-thread buffer, and whether a call on the thread is using it.
 export template <typename Buf> struct ThreadScratch {
   Buf buf;
-  int users{0};
+  bool in_use{false};
 };
 
-// One call's use of a ThreadScratch. When the outermost use ends, a buffer
-// grown past kScratchKeepBytes is freed, so a nested use never frees what an
-// outer one still points into. Buf needs capacity() and a noexcept move.
+// One call's use of a ThreadScratch. A second use while one is open would
+// hand the same buffer to two callers, and the inner one's growth would
+// leave the outer one's spans dangling, so it is a bug: refused with
+// std::logic_error before the buffer is handed out. A buffer
+// left past thread_scratch_limit() is freed when the use ends. Buf needs
+// capacity() and a noexcept move.
 export template <typename Buf> class ScratchUse {
 public:
-  explicit ScratchUse(ThreadScratch<Buf> &s) noexcept : s_{s} { ++s_.users; }
+  explicit ScratchUse(ThreadScratch<Buf> &s) : s_{s} {
+    if (s_.in_use)
+      throw std::logic_error{"thread scratch taken while already in use"};
+    s_.in_use = true;
+  }
   ~ScratchUse() {
-    if (--s_.users == 0 && s_.buf.capacity() > kScratchKeepBytes)
-      s_.buf = Buf{};
+    s_.in_use = false;
+    if (s_.buf.capacity() > thread_scratch_limit()) s_.buf = Buf{};
   }
   ScratchUse(const ScratchUse &) = delete;
   auto operator=(const ScratchUse &) -> ScratchUse & = delete;

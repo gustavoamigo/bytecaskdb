@@ -12930,7 +12930,7 @@ TEST_CASE("BC-243: thread-local read cache does not leak across DB instances",
 // #384: a thread's scratch buffers grew to the largest record it had read or
 // written and kept that memory after close(), for as long as the thread
 // lived. A thread that reads and writes large records must hold no more than
-// kScratchKeepBytes per buffer once the DB is closed.
+// the thread scratch limit per buffer once the DB is closed.
 TEST_CASE("#384: thread scratch gives back a large record after close",
           "[bytecask][tl-cache]") {
   const auto io_backend =
@@ -12942,11 +12942,11 @@ TEST_CASE("#384: thread scratch gives back a large record after close",
   // is one fill through the pool's scratch.
   opts.buffer_pool.capacity_bytes = 64 * 1024 * 1024;
   constexpr std::size_t kValueBytes = 3 * 1024 * 1024;
-  static_assert(kValueBytes > bytecask::kScratchKeepBytes);
+  static_assert(kValueBytes > bytecask::kDefaultThreadScratchLimit);
   // 32 keys of 60 KiB in one chunk: the append scratch holds ~1.9 MiB.
   constexpr std::size_t kKeys = 32;
   constexpr std::size_t kKeyBytes = 60 * 1024;
-  static_assert(kKeys * kKeyBytes > bytecask::kScratchKeepBytes);
+  static_assert(kKeys * kKeyBytes > bytecask::kDefaultThreadScratchLimit);
   ScopedWritevLimits limits{{kKeys + 2, bytecask::kMaxBytesPerWritev}};
 
   TempDir td;
@@ -12977,12 +12977,42 @@ TEST_CASE("#384: thread scratch gives back a large record after close",
   CHECK(out.size() == kValueBytes);
   auto snap = db.snapshot();
   REQUIRE(snap.get({}, to_bytes("big"), out));
-  CHECK(snap.contains_key({}, to_bytes(long_key(kKeys - 1))));
+  for (std::size_t i = 0; i < kKeys; ++i)
+    CHECK(snap.contains_key({}, to_bytes(long_key(i))));
   db.close();
   const auto retained = bytecask::test_thread_scratch_bytes();
 
-  // Read, fill and append scratch: each at most kScratchKeepBytes.
-  CHECK(retained <= bytecask::kScratchKeepBytes);
+  // Read, fill, append and hint scratch: each at most the limit.
+  CHECK(retained <= bytecask::thread_scratch_limit());
+  // The batch's chunks were cut at the cap, so the append scratch stayed
+  // under it and was kept, not freed after the commit.
+  CHECK(bytecask::append_scratch_bytes() > 0);
+}
+
+// The limit is process-wide: raised, a thread keeps a large record's buffer
+// for the next call; lowered again, its next call gives it back.
+TEST_CASE("#384: a raised thread scratch limit keeps a large record's buffer",
+          "[bytecask][tl-cache]") {
+  struct RestoreLimit {
+    ~RestoreLimit() {
+      bytecask::set_thread_scratch_limit(bytecask::kDefaultThreadScratchLimit);
+    }
+  } restore;
+  constexpr std::size_t kValueBytes = 3 * 1024 * 1024;
+  TempDir td;
+  auto db = bytecask::DB::open(td.path);
+  db.put({}, to_bytes("big"), to_bytes(std::string(kValueBytes, 'v')));
+  db.put({}, to_bytes("small"), to_bytes("s"));
+  bytecask::Bytes out;
+
+  bytecask::set_thread_scratch_limit(8 * 1024 * 1024);
+  REQUIRE(db.get({}, to_bytes("big"), out));
+  CHECK(bytecask::test_thread_scratch_bytes() > kValueBytes);
+
+  bytecask::set_thread_scratch_limit(bytecask::kDefaultThreadScratchLimit);
+  REQUIRE(db.get({}, to_bytes("small"), out));
+  CHECK(bytecask::test_thread_scratch_bytes() <=
+        bytecask::kDefaultThreadScratchLimit);
 }
 
 // ===========================================================================
