@@ -112,6 +112,37 @@ _HEADER = struct.Struct("<QBHI")
 _CRC = struct.Struct("<I")
 
 
+def _known_type(raw: int) -> bool:
+    """0 is never a type: zeros are unwritten space. Any other unknown type is
+    damage, like a bad CRC."""
+    try:
+        EntryType(raw)
+    except ValueError:
+        return False
+    return True
+
+
+_TYPE_OFFSET = 8  # entry_type follows the u64 sequence
+
+
+def _first_sequence(buf: bytes) -> int:
+    """The sequence in a file's first header, read without its CRC; 0 if
+    there is none.
+
+    A write that fails or comes back short can land a prefix of the first
+    record into the zeros the engine preallocates, and a prefix shorter than
+    the sequence reads as a smaller one (#471). The type byte follows the
+    sequence, so an unknown type with only zeros after the sequence field is
+    such a prefix and has no sequence. An unknown type with anything after it
+    is damage, and its sequence is read as it stands."""
+    if len(buf) < _HEADER.size:
+        return 0
+    sequence, raw_type, _, _ = _HEADER.unpack_from(buf)
+    if not _known_type(raw_type) and not any(buf[_TYPE_OFFSET:]):
+        return 0
+    return sequence
+
+
 class Entry(NamedTuple):
     sequence: int
     type: EntryType
@@ -132,10 +163,9 @@ class Entry(NamedTuple):
         if offset + _HEADER.size > len(buf):
             return None
         sequence, raw_type, key_size, value_size = _HEADER.unpack_from(buf, offset)
-        try:
-            entry_type = EntryType(raw_type)
-        except ValueError:  # 0 is never a type: zeros are unwritten space.
-            return None     # Any other unknown type is damage, like a bad CRC.
+        if not _known_type(raw_type):
+            return None
+        entry_type = EntryType(raw_type)
         key_at = offset + _HEADER.size
         value_at = key_at + key_size
         crc_at = value_at + value_size
@@ -852,6 +882,8 @@ class DB:
     def _changes(self, from_sequence: int, durable: int, max_bytes: int | None) -> Iterator[Entry]:
         # Files never share a sequence, so file order by first sequence is
         # sequence order, and a file's first sequence is in its first header.
+        # Recovery cut every file whose first header _first_sequence finds
+        # torn, so the header of an open file is whole.
         # Only the file list is built up front; each file is read and scanned
         # when the slice reaches it, and released before the next. A write in
         # progress past durable may be torn, and the scan stops there;
@@ -996,7 +1028,8 @@ class DB:
             #   - nothing, or zeros (unwritten space): cut;
             #   - a write a crash tore, in the newest file: cut. A file with
             #     no first sequence may be the newest, its first page lost at
-            #     a power cut and a later one kept, so it is cut too;
+            #     a power cut and a later one kept, or its first write landed
+            #     only part of its header, so it is cut too;
             #   - anything else: damage to acknowledged data, refused.
             is_newest = f.first_sequence == newest
             has_no_sequence = f.first_sequence == 0
@@ -1021,7 +1054,7 @@ class DB:
 class _ScannedFile:
     file_id: int
     path: Path
-    first_sequence: int  # read without its CRC; 0 if the file is shorter than a header
+    first_sequence: int  # see _first_sequence
     committed: list[Placed]
     end: int  # where committed data ends
     size: int
@@ -1031,7 +1064,7 @@ class _ScannedFile:
     def read(cls, file_id: int, path: Path) -> _ScannedFile:
         buf = path.read_bytes()
         committed, end = scan_committed(buf)
-        first = _HEADER.unpack_from(buf)[0] if len(buf) >= _HEADER.size else 0
+        first = _first_sequence(buf)
         return cls(file_id, path, first, committed, end, len(buf), any(buf[end:]))
 
 

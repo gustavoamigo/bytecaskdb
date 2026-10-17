@@ -1382,6 +1382,16 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
       // first page is lost and a later one reaches the disk.
       {"first header lost, later entries landed",
        [](auto &f) { zero_at(f[2], 0, 15); }, true, {10, 11, 12, 13}, 0},
+      // A failed or short write landed one byte of the first record: the
+      // low byte of a sequence that needs two, so the header reads below
+      // f1's first sequence. In #471, 0x96 of 2454 read as 150.
+      {"first write landed one byte of its sequence",
+       [](auto &f) {
+         std::filesystem::resize_file(f[2], 0);
+         add_zero_tail(f[2]);
+         write_at(f[2], 0, "\x02");
+       },
+       true, {10, 11, 12, 13}, 0},
       {"sealed zero tail, newest torn",
        [](auto &f) {
          drop_hint(f[0]);
@@ -1401,6 +1411,15 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
        [](auto &f) {
          drop_hint(f[0]);
          flip_byte(f[0], kEntry + 15);
+       },
+       false, {}, 0},
+      // An unknown first type byte is a torn prefix only with zeros after
+      // the sequence field. Here the records after it are intact: damage,
+      // not a file with no sequence, so it is refused and not cut whole.
+      {"sealed first type byte damaged, records intact",
+       [](auto &f) {
+         drop_hint(f[0]);
+         write_at(f[0], 8, "\x7f");
        },
        false, {}, 0},
       {"sealed zeroed entry",
@@ -1438,6 +1457,28 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
          zero_at(f[2], 0, 8);
        },
        false, {}, 1},
+      // A file with no first sequence is compared with no other, so damage
+      // in the sealed file just below it (no file above it starts higher)
+      // is refused only by the hint-less scan: a crash tears one file. Once
+      // for each file, since the row checks one.
+      {"sealed damage, newest landed one byte: the sealed file",
+       [](auto &f) {
+         drop_hint(f[1]);
+         flip_byte(f[1], kEntry + 15);
+         std::filesystem::resize_file(f[2], 0);
+         add_zero_tail(f[2]);
+         write_at(f[2], 0, "\x02");
+       },
+       false, {}, 1},
+      {"sealed damage, newest landed one byte: the newest file",
+       [](auto &f) {
+         drop_hint(f[1]);
+         flip_byte(f[1], kEntry + 15);
+         std::filesystem::resize_file(f[2], 0);
+         add_zero_tail(f[2]);
+         write_at(f[2], 0, "\x02");
+       },
+       false, {}, 2},
       {"sealed damage, newest torn too",
        [](auto &f) {
          drop_hint(f[1]);

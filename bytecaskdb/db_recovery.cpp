@@ -268,15 +268,6 @@ auto DB::recovery_prepare_files(EngineState &s)
 
 namespace {
 
-// The sequence in the file's first header, 0 when there is none. Read
-// without its CRC: in the file a crash tore, the first record may be the
-// torn one.
-auto first_sequence(const DataFile &file) -> std::uint64_t {
-  std::array<std::byte, kHeaderSize> hdr{};
-  if (file.read_raw(0, hdr) < kHeaderSize) return 0;
-  return read_header(hdr).sequence;
-}
-
 // Whether every byte of file from end on is zero.
 auto tail_is_zero(const DataFile &file, Offset end) -> bool {
   if (end >= file.size()) return true;
@@ -291,6 +282,26 @@ auto tail_is_zero(const DataFile &file, Offset end) -> bool {
     off += n;
   }
   return true;
+}
+
+// The sequence in the file's first header, 0 when there is none. Read
+// without its CRC: in the file a crash tore, the first record may be the
+// torn one. A write that fails or comes back short can land any prefix of
+// that record into the zeros the active file was preallocated with, and a
+// prefix shorter than the sequence reads as a smaller one: one byte of 2454
+// reads as 150 (#471). The type byte follows the sequence, so a header whose
+// type is unknown and that has nothing but zeros after the sequence field is
+// such a prefix, and has no sequence. An unknown type with anything after it
+// is damage: its sequence is read as it stands, so a sealed file keeps the
+// refusal below.
+auto first_sequence(const DataFile &file) -> std::uint64_t {
+  std::array<std::byte, kHeaderSize> hdr{};
+  if (file.read_raw(0, hdr) < kHeaderSize) return 0;
+  const auto h = read_header(hdr);
+  if (!is_known_entry_type(h.entry_type) &&
+      tail_is_zero(file, kEntryTypeOffset))
+    return 0;
+  return h.sequence;
 }
 
 } // namespace
@@ -308,9 +319,10 @@ auto tail_is_zero(const DataFile &file, Offset end) -> bool {
 // - anything else, in any other file: damage in data that was synced.
 //   Refused, in every mode, and the file is left as it was.
 // "Written last" is read off sequences, which no two files share: no other
-// file may start at a higher one. A file whose first header is zero has no
-// sequence to compare. It may be the newest, its first page lost at a power
-// cut and a later one kept, so it goes whole.
+// file may start at a higher one. A file whose first header is zero, or
+// whose first write landed only part of its sequence, has no sequence to
+// compare. It may be the newest, its first page lost at a power cut and a
+// later one kept, so it goes whole.
 // Either way it is the one file a crash tore, so no other file may need such
 // a cut. The files open handled before this one have their hints by now;
 // the rest are scanned here, before anything is cut.

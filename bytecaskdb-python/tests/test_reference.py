@@ -172,6 +172,42 @@ def test_a_torn_first_write_of_a_file_is_cut(tmp_path, torn_to):
     assert second.stat().st_size == 0
 
 
+def test_a_first_write_that_landed_one_byte_is_cut(tmp_path):
+    """A failed or short write can land a prefix of a file's first record. One
+    byte of a two-byte sequence reads as a smaller one, below an older file's
+    (#471). The type byte is unknown, so the file has no first sequence."""
+    with ref.DB.open(tmp_path) as db:
+        db.put(b"a", b"1")
+    with ref.DB.open(tmp_path) as db:
+        for i in range(3):
+            db.put(f"k{i}".encode(), b"v")
+    with ref.DB.open(tmp_path) as db:
+        db.put(b"z", b"2")
+    third = file_starting_at(tmp_path, 5)
+    third.write_bytes(b"\x01" + bytes(4095))  # reads as 1, below the second's 2
+    with ref.DB.open(tmp_path) as db:
+        assert list(db.keys_from()) == [b"a", b"k0", b"k1", b"k2"]
+    assert third.stat().st_size == 0
+
+
+def test_a_damaged_first_type_byte_before_intact_records_is_refused(tmp_path):
+    """An unknown first type byte is a torn prefix only with zeros after the
+    sequence field. With records after it, it is damage in an older file, and
+    open refuses rather than cut the file whole."""
+    with ref.DB.open(tmp_path) as db:
+        for i in range(3):
+            db.put(f"k{i}".encode(), b"v")
+    with ref.DB.open(tmp_path) as db:
+        db.put(b"z", b"2")
+    first = file_starting_at(tmp_path, 1)
+    raw = bytearray(first.read_bytes())
+    raw[8] = 0x7F
+    first.write_bytes(bytes(raw))
+    with pytest.raises(RuntimeError, match="corrupt"):
+        ref.DB.open(tmp_path)
+    assert first.read_bytes() == bytes(raw)
+
+
 def test_a_file_whose_first_page_was_lost_is_cut(tmp_path):
     """A power cut can lose the first page of a file that was never synced
     and keep a later one. The file has no first sequence, and goes whole."""
