@@ -221,6 +221,28 @@ TEST_CASE("BufferPool: a miss longer than the scratch limit is read in runs",
   CHECK(pool.counters().hits.load() == 1);
 }
 
+// Pools of two DBs share a thread's fill scratch: after a read through each,
+// the thread keeps at most that pool's limit.
+TEST_CASE("BufferPool: a read gives back fill scratch past its pool's limit",
+          "[buffer_pool]") {
+  constexpr std::size_t kLarge = 2 * 1024 * 1024;
+  constexpr std::size_t kSmall = 1024 * 1024;
+  ScratchFile file{4 * 1024 * 1024};
+  const bytecask::BufferPoolOptions opts{.capacity_bytes = 64 * 1024 * 1024};
+  bytecask::BufferPool large{opts, kLarge};
+  bytecask::BufferPool small{opts, kSmall};
+
+  std::vector<std::byte> got(kLarge);
+  large.read_at(1, file.fd(), 0, got.size(), file.size(), got.data());
+  CHECK(got == file.expected(0, got.size()));
+  REQUIRE(bytecask::BufferPool::thread_scratch_bytes() == kLarge);
+
+  std::vector<std::byte> one(16);
+  small.read_at(1, file.fd(), 0, one.size(), file.size(), one.data());
+  CHECK(one == file.expected(0, one.size()));
+  CHECK(bytecask::BufferPool::thread_scratch_bytes() <= kSmall);
+}
+
 TEST_CASE("BufferPool: a short tail frame is correct but never admitted",
           "[buffer_pool]") {
   // Final frame is partial, so it must be served without being cached.
