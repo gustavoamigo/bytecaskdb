@@ -244,7 +244,7 @@ struct Options {
     // reads), so the work left for close — and for the next open after a
     // crash — stays bounded. 0 turns the bound off.
     uint32_t max_hint_backlog{4};
-    size_t thread_scratch_bytes{1024 * 1024};   // most a thread's record buffers keep after a call (at least 64 KiB)
+    size_t thread_scratch_bytes{1024 * 1024};   // most a thread's record buffers keep after a call (at least 256 KiB)
 };
 
 // Selects how sealed data files are read. The active file is written the same

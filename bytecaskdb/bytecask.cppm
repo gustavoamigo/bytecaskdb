@@ -313,7 +313,7 @@ export struct Options {
   // Most bytes a thread's record buffers keep after a call on this DB, and
   // so the largest record a call serves without allocating. A thread shares
   // its buffers between the DBs it touches: after a call on a DB it keeps at
-  // most that DB's value (#384). Below 64 KiB, open throws
+  // most that DB's value (#384). Below 256 KiB, open throws
   // std::invalid_argument.
   std::size_t thread_scratch_bytes{kDefaultThreadScratchBytes};
 };
@@ -764,7 +764,8 @@ private:
                        bool degraded,
                        std::string degraded_reason,
                        std::shared_ptr<const std::vector<ChangeMarker>>
-                           change_markers);
+                           change_markers,
+                       std::size_t scratch_bytes);
 
   // Adds m to the marker list, which is immutable: copied and replaced.
   void append_marker(ChangeMarker m);
@@ -784,7 +785,7 @@ private:
   bool degraded_;
   std::string degraded_reason_;
   std::shared_ptr<const std::vector<ChangeMarker>> change_markers_;
-  std::size_t scratch_bytes_{kDefaultThreadScratchBytes};
+  std::size_t scratch_bytes_;
 };
 
 // ---------------------------------------------------------------------------

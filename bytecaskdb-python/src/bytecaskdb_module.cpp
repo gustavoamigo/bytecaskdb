@@ -464,7 +464,10 @@ NB_MODULE(_bytecaskdb, m) {
               "Only read when io_backend is IoBackend.BufferPool.")
       .def_rw("max_hint_backlog", &bytecask::Options::max_hint_backlog,
               "Most sealed files waiting for a hint file before rotation "
-              "stalls writes (default 4; 0 = unbounded).");
+              "stalls writes (default 4; 0 = unbounded).")
+      .def_rw("thread_scratch_bytes", &bytecask::Options::thread_scratch_bytes,
+              "Most bytes a thread's record buffers keep after a call on "
+              "this DB (default 1 MiB; at least 256 KiB).");
 
   nb::class_<bytecask::WriteOptions>(m, "WriteOptions",
       "Per-write options for put, del_, apply_batch, etc.")

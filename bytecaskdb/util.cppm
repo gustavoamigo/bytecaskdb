@@ -55,7 +55,10 @@ export [[noreturn]] inline void panic(std::string_view msg) {
 // large record must not stay with it (#384).
 export inline constexpr std::size_t kDefaultThreadScratchBytes =
     std::size_t{1} << 20;
-export inline constexpr std::size_t kMinThreadScratchBytes = std::size_t{64}
+// At least the engine's own largest record buffers: a compressed hint frame
+// (~148 KiB) and a commit entry with a maximal key and an inline value
+// (~70 KiB), each pinned by a static_assert where it is built.
+export inline constexpr std::size_t kMinThreadScratchBytes = std::size_t{256}
                                                               << 10;
 
 // One call's use of a per-thread scratch buffer: when the use ends, a

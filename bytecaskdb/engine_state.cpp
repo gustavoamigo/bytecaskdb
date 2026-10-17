@@ -30,22 +30,23 @@ TransientEngineState::TransientEngineState(
     std::uint64_t next_seq, std::uint64_t durable_seq,
     std::uint64_t sync_requested_seq,
     Mode mode, bool degraded, std::string degraded_reason,
-    std::shared_ptr<const std::vector<ChangeMarker>> change_markers)
+    std::shared_ptr<const std::vector<ChangeMarker>> change_markers,
+    std::size_t scratch_bytes)
     : key_dir_{std::move(key_dir)}, files_{std::move(files)},
       file_stats_{std::move(file_stats)}, active_file_id_{active_file_id},
       next_file_id_{next_file_id}, next_seq_{next_seq},
       durable_seq_{durable_seq}, sync_requested_seq_{sync_requested_seq},
       mode_{mode}, degraded_{degraded},
       degraded_reason_{std::move(degraded_reason)},
-      change_markers_{std::move(change_markers)} {}
+      change_markers_{std::move(change_markers)},
+      scratch_bytes_{scratch_bytes} {}
 
 auto EngineState::transient() const -> TransientEngineState {
-  auto t = TransientEngineState{
+  return TransientEngineState{
       key_dir.transient(), files.transient(), file_stats.transient(),
       active_file_id, next_file_id, next_seq, durable_seq,
-      sync_requested_seq, mode, degraded, degraded_reason, change_markers};
-  t.scratch_bytes_ = scratch_bytes;
-  return t;
+      sync_requested_seq, mode, degraded, degraded_reason, change_markers,
+      scratch_bytes};
 }
 
 void TransientEngineState::append_marker(ChangeMarker m) {

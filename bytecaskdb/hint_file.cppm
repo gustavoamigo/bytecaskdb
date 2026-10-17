@@ -95,8 +95,9 @@ constexpr std::size_t kMaxHintEntryBytes =
 constexpr std::size_t kMaxFrameBytes = kHintFrameBytes + kMaxHintEntryBytes;
 // The most such a frame takes on disk: its entries, not compressed at all.
 constexpr std::size_t kMaxPackedFrameBytes = ZSTD_COMPRESSBOUND(kMaxFrameBytes);
-// thread_packed_frame keeps at most this, whatever the frames it decoded.
-static_assert(kMaxPackedFrameBytes <= kDefaultThreadScratchBytes);
+// thread_packed_frame keeps at most this, whatever the frames it decoded:
+// within the lowest limit a DB can set.
+static_assert(kMaxPackedFrameBytes <= kMinThreadScratchBytes);
 
 // ZSTD_CONTENTSIZE_UNKNOWN and ZSTD_CONTENTSIZE_ERROR are the two largest
 // 64-bit values, so the cap alone refuses a frame that does not declare its

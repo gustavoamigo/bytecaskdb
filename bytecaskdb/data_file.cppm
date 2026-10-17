@@ -18,6 +18,7 @@ module;
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <limits>
 #include <format>
 #include <iterator>
 #include <memory>
@@ -631,6 +632,11 @@ struct WritableFileOps {
       buf.insert(buf.end(), p, p + n);
     };
 
+    // One entry always fits within the lowest limit a DB can set, so a chunk
+    // cut at the limit never holds a lone entry over it.
+    static_assert(kHeaderSize + std::numeric_limits<std::uint16_t>::max() +
+                      kInlineValueBytes + kCrcSize <=
+                  kMinThreadScratchBytes);
     // What an entry copies into buf: all of it but an out-of-line value.
     const auto inline_bytes = [](const DataEntryView &e) {
       return kHeaderSize + e.key.size() +

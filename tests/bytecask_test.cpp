@@ -13014,13 +13014,14 @@ TEST_CASE("#384: after a call on a DB, a thread keeps at most its limit",
   CHECK(bytecask::test_thread_scratch_bytes() > kSmall);
 }
 
-TEST_CASE("Options: thread_scratch_bytes below 64 KiB is refused at open",
+TEST_CASE("Options: thread_scratch_bytes below 256 KiB is refused at open",
           "[bytecask]") {
   TempDir td;
   CHECK_THROWS_AS(
-      bytecask::DB::open(td.path, {.thread_scratch_bytes = 64 * 1024 - 1}),
+      bytecask::DB::open(td.path, {.thread_scratch_bytes = 256 * 1024 - 1}),
       std::invalid_argument);
-  CHECK_NOTHROW(bytecask::DB::open(td.path, {.thread_scratch_bytes = 64 * 1024}));
+  CHECK_NOTHROW(
+      bytecask::DB::open(td.path, {.thread_scratch_bytes = 256 * 1024}));
 }
 
 // ===========================================================================
