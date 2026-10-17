@@ -48,6 +48,36 @@ export [[noreturn]] inline void panic(std::string_view msg) {
   std::abort();
 }
 
+// A thread's scratch keeps its memory between calls, so a hot path does not
+// allocate, but not past the limit of the DB the call is on
+// (Options::thread_scratch_bytes): a thread can outlive every DB, and one
+// large record must not stay with it (#384). The lowest limit a DB can set
+// is above the engine's own largest record buffers: a compressed hint frame
+// (~148 KiB) and a commit entry with a maximal key and an inline value
+// (~70 KiB), each pinned by a static_assert where it is built.
+export inline constexpr std::size_t kMinThreadScratchBytes = std::size_t{256}
+                                                              << 10;
+
+// One call's use of a per-thread scratch buffer: when the use ends, a buffer
+// left past `limit` is freed. Buf needs capacity() and a noexcept move.
+export template <typename Buf> class ScratchUse {
+public:
+  ScratchUse(Buf &buf, std::size_t limit) noexcept : buf_{buf}, limit_{limit} {}
+  ~ScratchUse() {
+    if (buf_.capacity() > limit_) buf_ = Buf{};
+  }
+  ScratchUse(const ScratchUse &) = delete;
+  auto operator=(const ScratchUse &) -> ScratchUse & = delete;
+
+  [[nodiscard]] auto buf() noexcept -> Buf & { return buf_; }
+
+private:
+  Buf &buf_;
+  std::size_t limit_;
+};
+export template <typename Buf>
+ScratchUse(Buf &, std::size_t) -> ScratchUse<Buf>;
+
 // Reads from offset until dst is full or the file ends, and returns how many
 // bytes it read. Throws std::system_error when pread fails.
 export [[nodiscard]] inline auto pread_upto(int fd, std::uint64_t offset,

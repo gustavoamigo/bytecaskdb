@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <string>
 #include <system_error>
+#include <vector>
 import bytecask.util;
 
 namespace {
@@ -52,4 +53,27 @@ TEST_CASE("check_write: a short count is EIO with the byte counts",
         std::format("test write: short write: the file took {} of 10 bytes",
                     written)));
   }
+}
+
+// #384: a scratch buffer left past its limit is freed when the use ends; one
+// at or below it is kept for the next use.
+TEST_CASE("ScratchUse: frees a buffer left past its limit", "[util]") {
+  constexpr std::size_t kLimit = 64 * 1024;
+  std::vector<std::byte> buf;
+  {
+    bytecask::ScratchUse use{buf, kLimit};
+    use.buf().resize(kLimit + 1);
+  }
+  CHECK(buf.capacity() == 0);
+}
+
+TEST_CASE("ScratchUse: keeps a buffer at its limit", "[util]") {
+  constexpr std::size_t kLimit = 64 * 1024;
+  std::vector<std::byte> buf;
+  {
+    bytecask::ScratchUse use{buf, kLimit};
+    use.buf().reserve(kLimit);
+    use.buf().resize(kLimit);
+  }
+  CHECK(buf.capacity() == kLimit);
 }

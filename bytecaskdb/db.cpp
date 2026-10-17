@@ -35,7 +35,8 @@ DB::DB(std::filesystem::path dir, Options opts)
       max_hint_backlog_{opts.max_hint_backlog},
       io_backend_{opts.io_backend},
       size_limits_{opts.max_key_bytes, opts.max_value_bytes},
-      state_{std::make_shared<EngineState>()} {
+      scratch_bytes_{opts.thread_scratch_bytes},
+      state_{std::make_shared<EngineState>(opts.thread_scratch_bytes)} {
   // A setting above a hard ceiling is refused, not lowered: the engine never
   // runs with a limit other than the one asked for.
   if (opts.max_key_bytes > kMaxKeySize) {
@@ -52,6 +53,11 @@ DB::DB(std::filesystem::path dir, Options opts)
     throw std::invalid_argument{std::format(
         "max_file_bytes = {} exceeds the hard ceiling of {}",
         opts.max_file_bytes, kMaxFileBytes)};
+  }
+  if (opts.thread_scratch_bytes < kMinThreadScratchBytes) {
+    throw std::invalid_argument{std::format(
+        "thread_scratch_bytes = {} is below the minimum of {}",
+        opts.thread_scratch_bytes, kMinThreadScratchBytes)};
   }
   if (opts.recovery_threads == 0) {
     throw std::invalid_argument{
@@ -77,7 +83,7 @@ DB::DB(std::filesystem::path dir, Options opts)
           "max_file_bytes — the two are coupled.",
           opts.buffer_pool.capacity_bytes, 2 * opts.max_file_bytes)};
     }
-    pool_ = std::make_shared<BufferPool>(opts.buffer_pool);
+    pool_ = std::make_shared<BufferPool>(opts.buffer_pool, scratch_bytes_);
   }
   // The directories open creates, each named by an entry in its parent that
   // has to be durable before the database's files can be.
@@ -258,16 +264,10 @@ auto DB::get(const ReadOptions &opts, BytesView key,
     out.clear();
     return true;
   }
-  // Per-thread I/O scratch buffer — reused across calls to avoid heap churn.
-  // Thread-exit destructor is intentional; suppress the Clang diagnostic.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wexit-time-destructors"
-  // TLS: scratch — this call's record; keeps the largest value's size (#384).
-  thread_local Bytes io_buf;
-#pragma clang diagnostic pop
+  ScratchUse io_buf{value_read_buffer(), scratch_bytes_};
   (*s->files.get(kv->file_id()))
       ->read_value(kv->file_offset(), narrow<std::uint16_t>(key.size()),
-                   kv->value_size(), opts.verify_checksums, io_buf, out);
+                   kv->value_size(), opts.verify_checksums, io_buf.buf(), out);
   counters_.disk_reads.add(1);
   counters_.disk_read_bytes.add(static_cast<std::int64_t>(kv->value_size()));
   return true;

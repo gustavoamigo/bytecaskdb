@@ -151,6 +151,9 @@ struct Options {
   // Most sealed files allowed to wait for their hint file before a rotation
   // waits for the background writer. 0 = unbounded.
   std::uint32_t max_hint_backlog{4};
+  // Most bytes a thread's record buffers keep after a call on this DB
+  // (default 1 MiB, at least 256 KiB).
+  std::size_t thread_scratch_bytes{std::size_t{1} << 20};
 };
 
 struct SizeLimits {

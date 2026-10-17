@@ -52,6 +52,9 @@ import bytecask.counters;
 
 namespace {
 
+// What a DB opened with default Options passes as thread_scratch_bytes.
+constexpr std::size_t kScratchBytes = std::size_t{1} << 20;
+
 auto to_bytes(std::string_view sv) -> std::span<const std::byte> {
   return std::as_bytes(std::span{sv.data(), sv.size()});
 }
@@ -176,7 +179,7 @@ TEST_CASE("DataFile::append_entries batches multiple entries into one writev",
       {3, bytecask::EntryType::Delete, k2, {}},
   }};
   std::array<bytecask::Offset, 3> offsets{};
-  file->append_entries(entries, offsets);
+  file->append_entries(entries, offsets, kScratchBytes);
   file->sync();
 
   // Offsets must be sequential and start at 0.
@@ -228,7 +231,7 @@ TEST_CASE("DataFile::append_entries writes the bytes append_entry would",
   CAPTURE(static_cast<int>(io_backend));
   const auto dir = std::filesystem::temp_directory_path();
   auto pool = std::make_shared<bytecask::BufferPool>(
-      bytecask::BufferPoolOptions{.capacity_bytes = 32 << 20});
+      bytecask::BufferPoolOptions{.capacity_bytes = 32 << 20}, kScratchBytes);
   pool->set_active_file(21);  // appends to file 21 take the reserved-frame path
   std::filesystem::remove(dir / "bc_test_batched.data");
   std::filesystem::remove(dir / "bc_test_single.data");
@@ -260,7 +263,7 @@ TEST_CASE("DataFile::append_entries writes the bytes append_entry would",
   for (std::size_t at = 0; at < kEntries;) {
     const auto n = std::min<std::size_t>(1 + rng() % 40, kEntries - at);
     std::vector<bytecask::Offset> out(n);
-    batched->append_entries(std::span{all}.subspan(at, n), out);
+    batched->append_entries(std::span{all}.subspan(at, n), out, kScratchBytes);
     offsets.insert(offsets.end(), out.begin(), out.end());
     at += n;
   }
@@ -444,7 +447,7 @@ TEST_CASE("WritableDataFile: fresh file has no unwritten extents",
   constexpr std::size_t kCapacity = 8 * 1024 * 1024;
   // Required by the BufferPool back-end, ignored by the other two.
   auto pool = std::make_shared<bytecask::BufferPool>(
-      bytecask::BufferPoolOptions{.capacity_bytes = 4 * kCapacity});
+      bytecask::BufferPoolOptions{.capacity_bytes = 4 * kCapacity}, kScratchBytes);
   auto file = bytecask::createDataFileForWrite(
       std::filesystem::temp_directory_path(), "bc_test_zero_fill", ".data",
       kCapacity, io_backend, pool, /*file_id=*/1);
@@ -882,7 +885,7 @@ TEST_CASE("DataFileIterator sweeps across chunk boundaries", "[data_file][iterat
   constexpr std::size_t kCapacity = 8 * 1024 * 1024;
   constexpr auto kChunk = bytecask::DataFileIterator::kChunkBytes;
   auto pool = std::make_shared<bytecask::BufferPool>(
-      bytecask::BufferPoolOptions{.capacity_bytes = 4 * kCapacity});
+      bytecask::BufferPoolOptions{.capacity_bytes = 4 * kCapacity}, kScratchBytes);
 
   struct Expected {
     std::uint64_t seq;
@@ -991,7 +994,7 @@ TEST_CASE("DataFile::read_raw stops at size()", "[data_file][iterator]") {
   std::filesystem::create_directories(dir);
   constexpr std::size_t kCapacity = 8 * 1024 * 1024;
   auto pool = std::make_shared<bytecask::BufferPool>(bytecask::BufferPoolOptions{
-      .capacity_bytes = 4 * kCapacity, .direct_io = direct_io});
+      .capacity_bytes = 4 * kCapacity, .direct_io = direct_io}, kScratchBytes);
 
   std::shared_ptr<bytecask::DataFile> file;
   {
@@ -1474,7 +1477,7 @@ TEST_CASE("DataFile::lend_record reads any record with or without a hint",
 
   constexpr std::size_t kCapacity = 1 << 20;
   auto pool = std::make_shared<bytecask::BufferPool>(
-      bytecask::BufferPoolOptions{.capacity_bytes = 8 * kCapacity});
+      bytecask::BufferPoolOptions{.capacity_bytes = 8 * kCapacity}, kScratchBytes);
   auto writer = bytecask::createDataFileForWrite(
       dir, "bc_test_lend_record", ".data", kCapacity, io_backend, pool,
       /*file_id=*/7);
@@ -1523,7 +1526,7 @@ TEST_CASE("DataFile::lend_record rejects a damaged record when verifying",
   const auto path = dir / "bc_test_lend_record_crc.data";
   std::filesystem::remove(path);
   auto pool = std::make_shared<bytecask::BufferPool>(
-      bytecask::BufferPoolOptions{.capacity_bytes = 8 << 20});
+      bytecask::BufferPoolOptions{.capacity_bytes = 8 << 20}, kScratchBytes);
   {
     auto writer = bytecask::createDataFileForWrite(
         dir, "bc_test_lend_record_crc", ".data", 1 << 20,
@@ -1568,7 +1571,7 @@ TEST_CASE("DataFile::lend_record past the end names the file and offset",
   const auto path = dir / "bc_test_lend_past_end.data";
   std::filesystem::remove(path);
   auto pool = std::make_shared<bytecask::BufferPool>(
-      bytecask::BufferPoolOptions{.capacity_bytes = 8 << 20});
+      bytecask::BufferPoolOptions{.capacity_bytes = 8 << 20}, kScratchBytes);
   auto writer = bytecask::createDataFileForWrite(
       dir, "bc_test_lend_past_end", ".data", 1 << 20, io_backend, pool,
       /*file_id=*/11);
@@ -1789,7 +1792,7 @@ TEST_CASE("DataFile: a write cut short by a full file reports a short write",
     };
     std::array<bytecask::Offset, 2> offsets{};
     const auto error = bytecask_test::write_error_under_fsize_limit(
-        writer->size() + 10, [&] { writer->append_entries(entries, offsets); });
+        writer->size() + 10, [&] { writer->append_entries(entries, offsets, kScratchBytes); });
     INFO(error.what);
     CHECK(error.is_short_write());
   }
@@ -1922,7 +1925,7 @@ TEST_CASE("DataFile: records across buffer pool frames read whole",
   const auto path = dir / "bc_test_straddle.data";
   std::filesystem::remove(path);
   auto pool = std::make_shared<bytecask::BufferPool>(
-      bytecask::BufferPoolOptions{.capacity_bytes = 8 << 20});
+      bytecask::BufferPoolOptions{.capacity_bytes = 8 << 20}, kScratchBytes);
   const auto recs = straddlers();
   auto writer = bytecask::createDataFileForWrite(
       dir, "bc_test_straddle", ".data", 1 << 20,
@@ -1987,7 +1990,7 @@ TEST_CASE("DataFile: a damaged record across pool frames fails verification",
     f.put('X');
   }
   auto pool = std::make_shared<bytecask::BufferPool>(
-      bytecask::BufferPoolOptions{.capacity_bytes = 8 << 20});
+      bytecask::BufferPoolOptions{.capacity_bytes = 8 << 20}, kScratchBytes);
   auto file = bytecask::openDataFileForRead(
       path, bytecask::IoBackend::BufferPool, pool, /*file_id=*/23);
   std::vector<std::byte> io_buf;
@@ -2048,7 +2051,7 @@ TEST_CASE("DataFile: a sealed file past 4 GiB keeps its size and its records",
   }
   SECTION("buffer pool") {
     auto pool = std::make_shared<bytecask::BufferPool>(
-        bytecask::BufferPoolOptions{.capacity_bytes = 1 << 20});
+        bytecask::BufferPoolOptions{.capacity_bytes = 1 << 20}, kScratchBytes);
     const auto file = bytecask::openDataFileForRead(
         path, bytecask::IoBackend::BufferPool, pool, /*file_id=*/7);
     check(*file);

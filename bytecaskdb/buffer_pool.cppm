@@ -22,6 +22,7 @@ module;
 #include <span>
 #include <stdexcept>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include <cerrno>
@@ -226,9 +227,12 @@ private:
 // ---------------------------------------------------------------------------
 export class BufferPool {
 public:
-  explicit BufferPool(const BufferPoolOptions &opts)
+  // scratch_bytes is the DB's Options::thread_scratch_bytes: the most a
+  // thread's fill buffer keeps after a read.
+  BufferPool(const BufferPoolOptions &opts, std::size_t scratch_bytes)
       : direct_io_{opts.direct_io},
-        oversize_limit_{opts.capacity_bytes / kOversizeDivisor} {
+        oversize_limit_{opts.capacity_bytes / kOversizeDivisor},
+        scratch_bytes_{scratch_bytes} {
     // The table is a power of two at most 70 % full; the arena and the pin
     // words take what is left of the budget. Frame count is derived from the
     // budget, never the budget from the frame count — the bound is the
@@ -341,6 +345,13 @@ public:
     counters_.direct_io_fallbacks.fetch_add(1, std::memory_order_relaxed);
   }
 
+#ifdef BYTECASK_TESTING
+  // Bytes the calling thread's fill scratch holds between reads.
+  [[nodiscard]] static auto thread_scratch_bytes() noexcept -> std::size_t {
+    return fill_scratch().capacity();
+  }
+#endif
+
 private:
   friend class FrameLease;
 
@@ -435,15 +446,24 @@ private:
     return (v + a - 1) / a * a;
   }
 
-  // Page-aligned, grow-only scratch for fills, held thread_local by read_at:
-  // a fresh buffer would heap-allocate on every miss, and a direct read needs
-  // an aligned one anyway.
+  // Page-aligned scratch for fills, held thread_local by read_at: a fresh
+  // buffer would heap-allocate on every miss, and a direct read needs an
+  // aligned one anyway.
   class AlignedScratch {
   public:
     AlignedScratch() = default;
     ~AlignedScratch() { std::free(p_); }
     AlignedScratch(const AlignedScratch &) = delete;
     auto operator=(const AlignedScratch &) -> AlignedScratch & = delete;
+    AlignedScratch(AlignedScratch &&o) noexcept
+        : p_{std::exchange(o.p_, nullptr)}, cap_{std::exchange(o.cap_, 0)} {}
+    auto operator=(AlignedScratch &&o) noexcept -> AlignedScratch & {
+      std::swap(p_, o.p_);
+      std::swap(cap_, o.cap_);
+      return *this;
+    }
+
+    [[nodiscard]] auto capacity() const noexcept -> std::size_t { return cap_; }
 
     // bytes must be a multiple of kPoolFrameBytes (aligned_alloc requires it).
     [[nodiscard]] auto ensure(std::size_t bytes) -> std::byte * {
@@ -463,6 +483,16 @@ private:
     std::byte *p_{nullptr};
     std::size_t cap_{0};
   };
+
+  static auto fill_scratch() noexcept -> AlignedScratch & {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wexit-time-destructors"
+    // TLS: scratch — one fill's bytes; freed past the DB's
+    // thread_scratch_bytes (#384).
+    thread_local AlignedScratch scratch;
+#pragma clang diagnostic pop
+    return scratch;
+  }
 
   // Copies this frame's overlap with [offset, offset+len) into dst. Returns
   // false on a miss or after losing a race to an eviction; callers then
@@ -680,6 +710,7 @@ private:
   PoolCounters counters_;
   bool direct_io_;
   std::size_t oversize_limit_;
+  std::size_t scratch_bytes_;
   std::size_t frame_count_{0};
   std::size_t table_mask_{0};
   std::vector<std::byte> arena_;
@@ -748,16 +779,10 @@ auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
       avail = std::min(avail, from + got);
       return;
     }
-    // Declared on the miss path so a hit never touches thread-local storage.
-    // Thread-exit destructor is intentional; suppress the Clang diagnostic.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wexit-time-destructors"
-    // TLS: scratch — this fill's bytes; keeps the largest fill run's size
-    // (#384).
-    thread_local AlignedScratch scratch;
-#pragma clang diagnostic pop
+    // Taken on the miss path so a hit never touches thread-local storage.
+    ScratchUse scratch{fill_scratch(), scratch_bytes_};
     const auto run_len = static_cast<std::size_t>(run_end - run_start);
-    auto *buf = scratch.ensure(align_up(run_len, kPoolFrameBytes));
+    auto *buf = scratch.buf().ensure(align_up(run_len, kPoolFrameBytes));
     auto got = run_len;
     if (file.direct < 0 || !pread_direct(file.direct, buf, run_len, run_start)) {
       got = pread_upto(file.buffered, run_start, {buf, run_len});

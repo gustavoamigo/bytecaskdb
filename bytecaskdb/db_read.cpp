@@ -22,7 +22,6 @@ auto Snapshot::contains_key(const ReadOptions& opts,
 }
 
 // Reads the value for key from the frozen snapshot state into out.
-// Thread-local I/O buffer reused across calls to amortize allocation.
 auto Snapshot::get(const ReadOptions& opts, BytesView key,
                    Bytes &out) const -> bool {
 #ifdef BYTECASK_KEYDIR_BLIND
@@ -35,14 +34,10 @@ auto Snapshot::get(const ReadOptions& opts, BytesView key,
     out.clear();
     return true;
   }
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wexit-time-destructors"
-  // TLS: scratch — this call's record; keeps the largest value's size (#384).
-  thread_local Bytes io_buf;
-#pragma clang diagnostic pop
+  ScratchUse io_buf{value_read_buffer(), state_->scratch_bytes};
   (*state_->files.get(kv->file_id()))
       ->read_value(kv->file_offset(), narrow<std::uint16_t>(key.size()),
-                   kv->value_size(), opts.verify_checksums, io_buf, out);
+                   kv->value_size(), opts.verify_checksums, io_buf.buf(), out);
   return true;
 #endif
 }

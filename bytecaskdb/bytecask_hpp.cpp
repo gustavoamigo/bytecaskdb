@@ -100,6 +100,7 @@ auto to_module(bytecask::internal::Options o) noexcept -> bytecask::Options {
     to_module(o.io_backend),
     to_module(o.buffer_pool),
     o.max_hint_backlog,
+    o.thread_scratch_bytes,
   };
 }
 
