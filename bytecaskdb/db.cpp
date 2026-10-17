@@ -36,7 +36,7 @@ DB::DB(std::filesystem::path dir, Options opts)
       io_backend_{opts.io_backend},
       size_limits_{opts.max_key_bytes, opts.max_value_bytes},
       scratch_bytes_{opts.thread_scratch_bytes},
-      state_{std::make_shared<EngineState>()} {
+      state_{std::make_shared<EngineState>(opts.thread_scratch_bytes)} {
   // A setting above a hard ceiling is refused, not lowered: the engine never
   // runs with a limit other than the one asked for.
   if (opts.max_key_bytes > kMaxKeySize) {

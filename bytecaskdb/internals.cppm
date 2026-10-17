@@ -958,8 +958,8 @@ export struct EngineState {
   // Options::thread_scratch_bytes, for the key directory's reads.
   std::size_t scratch_bytes;
 
-  explicit EngineState(std::size_t scratch_bytes)
-      : scratch_bytes{scratch_bytes} {}
+  explicit EngineState(std::size_t scratch_limit)
+      : scratch_bytes{scratch_limit} {}
   // Every ChangeMarker the data files hold, by since_sequence: 16 bytes per
   // promotion. Immutable; a promotion or an ingested marker publishes a new
   // list. Null when there is none.

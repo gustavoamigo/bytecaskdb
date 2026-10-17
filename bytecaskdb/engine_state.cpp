@@ -646,7 +646,7 @@ void TransientEngineState::note_sync_requested(std::uint64_t seq) {
 }
 
 auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
-  auto s = std::make_shared<EngineState>();
+  auto s = std::make_shared<EngineState>(scratch_bytes_);
   s->key_dir = std::move(key_dir_).persistent();
   s->files = std::move(files_).persistent();
   s->file_stats = std::move(file_stats_).persistent();
@@ -659,7 +659,6 @@ auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
   s->degraded = degraded_;
   s->degraded_reason = std::move(degraded_reason_);
   s->change_markers = std::move(change_markers_);
-  s->scratch_bytes = scratch_bytes_;
   return s;
 }
 

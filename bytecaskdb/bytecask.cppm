@@ -184,6 +184,7 @@ export inline constexpr std::uint32_t kDefaultMaxKeyBytes = 4096;
 export inline constexpr std::uint32_t kDefaultMaxValueBytes =
     4U * 1024 * 1024; // 4 MiB
 export inline constexpr std::uint32_t kDefaultMaxHintBacklog = 4;
+inline constexpr std::size_t kDefaultThreadScratchBytes = std::size_t{1} << 20;
 
 // Carried by Snapshot and WritePlan so size checks happen at the API boundary.
 export struct SizeLimits {

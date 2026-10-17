@@ -582,8 +582,6 @@ struct WritableFileOps {
     assert(entries.size() == offsets_out.size());
     if (entries.empty()) return;
 
-    // A value above this keeps an iovec of its own and is not copied.
-    static constexpr std::size_t kInlineValueBytes = 4096;
 #ifdef BYTECASK_TESTING
     const auto max_entries = test_writev_limits.entries;
     const auto max_bytes = test_writev_limits.bytes;
@@ -637,12 +635,6 @@ struct WritableFileOps {
     static_assert(kHeaderSize + std::numeric_limits<std::uint16_t>::max() +
                       kInlineValueBytes + kCrcSize <=
                   kMinThreadScratchBytes);
-    // What an entry copies into buf: all of it but an out-of-line value.
-    const auto inline_bytes = [](const DataEntryView &e) {
-      return kHeaderSize + e.key.size() +
-             (e.value.size() <= kInlineValueBytes ? e.value.size() : 0) +
-             kCrcSize;
-    };
 
     for (std::size_t base = 0; base < entries.size();) {
       // At least one entry, so an entry larger than max_bytes still goes
@@ -655,7 +647,7 @@ struct WritableFileOps {
            chunk_end < entries.size() && chunk_end - base < max_entries;
            ++chunk_end) {
         const auto &e = entries[chunk_end];
-        chunk_bytes += kHeaderSize + e.key.size() + e.value.size() + kCrcSize;
+        chunk_bytes += record_bytes(e);
         const auto next_inline = chunk_inline + inline_bytes(e);
         if (chunk_end > base &&
             (chunk_bytes > max_bytes || next_inline > scratch_bytes))
@@ -688,7 +680,7 @@ struct WritableFileOps {
         const auto from = buf.size();
         put(hdr_crc.data(), kHeaderSize);
         put(e.key.data(), e.key.size());
-        if (e.value.size() <= kInlineValueBytes) {
+        if (inline_bytes(e) == record_bytes(e)) {
           put(e.value.data(), e.value.size());
           put(hdr_crc.data() + kHeaderSize, kCrcSize);
           run_to_end(from);
@@ -700,7 +692,7 @@ struct WritableFileOps {
           run_to_end(crc_at);
         }
 
-        total_bytes += kHeaderSize + e.key.size() + e.value.size() + kCrcSize;
+        total_bytes += record_bytes(e);
 #ifdef BYTECASK_TESTING
         ++serialized;
 #endif

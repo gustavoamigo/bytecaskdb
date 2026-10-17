@@ -118,8 +118,7 @@ auto DB::recovery_open(const Options &opts) -> EngineState {
     // directory leaves it empty, which keeps every tombstone.
     needed_tombstones_ = {};
     {
-      EngineState s;
-      s.scratch_bytes = scratch_bytes_;
+      EngineState s{scratch_bytes_};
       auto files = recovery_prepare_files(s);
       // Maps the file ids in a SequenceOverlap back to paths once s is gone.
       const auto registered = s.files;
