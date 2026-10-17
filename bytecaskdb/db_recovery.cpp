@@ -268,19 +268,6 @@ auto DB::recovery_prepare_files(EngineState &s)
 
 namespace {
 
-// The sequence in the file's first header, 0 when there is none. Read
-// without its CRC: in the file a crash tore, the first record may be the
-// torn one. A write that fails or comes back short can land any prefix of
-// that record, and the rest of the file is zeros: one byte of sequence 2454
-// reads as 150 (#471). The type byte follows the sequence, so a known type
-// says all eight bytes of it landed; anything else is no sequence.
-auto first_sequence(const DataFile &file) -> std::uint64_t {
-  std::array<std::byte, kHeaderSize> hdr{};
-  if (file.read_raw(0, hdr) < kHeaderSize) return 0;
-  const auto h = read_header(hdr);
-  return is_known_entry_type(h.entry_type) ? h.sequence : 0;
-}
-
 // Whether every byte of file from end on is zero.
 auto tail_is_zero(const DataFile &file, Offset end) -> bool {
   if (end >= file.size()) return true;
@@ -295,6 +282,26 @@ auto tail_is_zero(const DataFile &file, Offset end) -> bool {
     off += n;
   }
   return true;
+}
+
+// The sequence in the file's first header, 0 when there is none. Read
+// without its CRC: in the file a crash tore, the first record may be the
+// torn one. A write that fails or comes back short can land any prefix of
+// that record into the zeros the active file was preallocated with, and a
+// prefix shorter than the sequence reads as a smaller one: one byte of 2454
+// reads as 150 (#471). The type byte follows the sequence, so a header whose
+// type is unknown and that has nothing but zeros after the sequence field is
+// such a prefix, and has no sequence. An unknown type with anything after it
+// is damage: its sequence is read as it stands, so a sealed file keeps the
+// refusal below.
+auto first_sequence(const DataFile &file) -> std::uint64_t {
+  std::array<std::byte, kHeaderSize> hdr{};
+  if (file.read_raw(0, hdr) < kHeaderSize) return 0;
+  const auto h = read_header(hdr);
+  if (!is_known_entry_type(h.entry_type) &&
+      tail_is_zero(file, sizeof(std::uint64_t)))
+    return 0;
+  return h.sequence;
 }
 
 } // namespace

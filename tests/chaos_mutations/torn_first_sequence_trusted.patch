@@ -11,15 +11,16 @@ Expected: caught (rare).
 Guarded-by: "DB recovery: a hint-less file's tail is truncated only in the newest file"
 
 diff --git a/bytecaskdb/db_recovery.cpp b/bytecaskdb/db_recovery.cpp
-index 4696028..f823b22 100644
+index 6d52b3a..71cb7f4 100644
 --- a/bytecaskdb/db_recovery.cpp
 +++ b/bytecaskdb/db_recovery.cpp
-@@ -278,7 +278,7 @@ auto first_sequence(const DataFile &file) -> std::uint64_t {
+@@ -298,9 +298,6 @@ auto first_sequence(const DataFile &file) -> std::uint64_t {
    std::array<std::byte, kHeaderSize> hdr{};
    if (file.read_raw(0, hdr) < kHeaderSize) return 0;
    const auto h = read_header(hdr);
--  return is_known_entry_type(h.entry_type) ? h.sequence : 0;
-+  return h.sequence;
+-  if (!is_known_entry_type(h.entry_type) &&
+-      tail_is_zero(file, sizeof(std::uint64_t)))
+-    return 0;
+   return h.sequence;
  }
  
- // Whether every byte of file from end on is zero.

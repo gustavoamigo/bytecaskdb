@@ -84,7 +84,7 @@ import struct
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -112,6 +112,35 @@ _HEADER = struct.Struct("<QBHI")
 _CRC = struct.Struct("<I")
 
 
+def _known_type(raw: int) -> bool:
+    """0 is never a type: zeros are unwritten space. Any other unknown type is
+    damage, like a bad CRC."""
+    try:
+        EntryType(raw)
+    except ValueError:
+        return False
+    return True
+
+
+def _first_sequence(pread: Callable[[int, int], bytes], size: int) -> int:
+    """The sequence in a file's first header, read without its CRC; 0 if
+    there is none. pread(n, offset) reads the file of length size.
+
+    A write that fails or comes back short can land a prefix of the first
+    record into preallocated zeros, and a prefix shorter than the sequence
+    reads as a smaller one (#471). The type byte follows the sequence, so an
+    unknown type with only zeros after the sequence field is such a prefix and
+    has no sequence. An unknown type with anything after it is damage, and its
+    sequence is read as it stands."""
+    head = pread(_HEADER.size, 0)
+    if len(head) < _HEADER.size:
+        return 0
+    sequence, raw_type, _, _ = _HEADER.unpack(head)
+    if not _known_type(raw_type) and not any(pread(size - 8, 8)):
+        return 0
+    return sequence
+
+
 class Entry(NamedTuple):
     sequence: int
     type: EntryType
@@ -132,10 +161,9 @@ class Entry(NamedTuple):
         if offset + _HEADER.size > len(buf):
             return None
         sequence, raw_type, key_size, value_size = _HEADER.unpack_from(buf, offset)
-        try:
-            entry_type = EntryType(raw_type)
-        except ValueError:  # 0 is never a type: zeros are unwritten space.
-            return None     # Any other unknown type is damage, like a bad CRC.
+        if not _known_type(raw_type):
+            return None
+        entry_type = EntryType(raw_type)
         key_at = offset + _HEADER.size
         value_at = key_at + key_size
         crc_at = value_at + value_size
@@ -851,15 +879,17 @@ class DB:
 
     def _changes(self, from_sequence: int, durable: int, max_bytes: int | None) -> Iterator[Entry]:
         # Files never share a sequence, so file order by first sequence is
-        # sequence order, and a file's first sequence is in its first header.
+        # sequence order, and a file's first sequence is in its first header
+        # (_first_sequence).
         # Only the file list is built up front; each file is read and scanned
         # when the slice reaches it, and released before the next. A write in
         # progress past durable may be torn, and the scan stops there;
         # everything durable comes before it.
         files = []
         for fd in list(self._fds.values()):
-            head = os.pread(fd, _HEADER.size, 0)
-            if len(head) == _HEADER.size and (first := _HEADER.unpack(head)[0]) <= durable:
+            size = os.fstat(fd).st_size
+            first = _first_sequence(lambda n, off, fd=fd: os.pread(fd, n, off), size)
+            if size >= _HEADER.size and first <= durable:
                 files.append((first, fd))
         files.sort()
         sent = 0
@@ -1022,7 +1052,7 @@ class DB:
 class _ScannedFile:
     file_id: int
     path: Path
-    first_sequence: int  # read without its CRC; 0 if the file is shorter than a header or its type is unknown
+    first_sequence: int  # see _first_sequence
     committed: list[Placed]
     end: int  # where committed data ends
     size: int
@@ -1032,14 +1062,7 @@ class _ScannedFile:
     def read(cls, file_id: int, path: Path) -> _ScannedFile:
         buf = path.read_bytes()
         committed, end = scan_committed(buf)
-        first = 0
-        if len(buf) >= _HEADER.size:
-            # A failed or short write can land part of the first record, and
-            # one byte of a sequence reads as a smaller one. The type byte
-            # follows the sequence: a known type says all of it landed.
-            sequence, raw_type, _, _ = _HEADER.unpack_from(buf)
-            if raw_type in EntryType._value2member_map_:
-                first = sequence
+        first = _first_sequence(lambda n, off: buf[off:off + n], len(buf))
         return cls(file_id, path, first, committed, end, len(buf), any(buf[end:]))
 
 

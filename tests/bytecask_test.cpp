@@ -1413,6 +1413,15 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
          flip_byte(f[0], kEntry + 15);
        },
        false, {}, 0},
+      // An unknown first type byte is a torn prefix only with zeros after
+      // the sequence field. Here the records after it are intact: damage,
+      // not a file with no sequence, so it is refused and not cut whole.
+      {"sealed first type byte damaged, records intact",
+       [](auto &f) {
+         drop_hint(f[0]);
+         write_at(f[0], 8, "\x7f");
+       },
+       false, {}, 0},
       {"sealed zeroed entry",
        [](auto &f) {
          drop_hint(f[0]);
