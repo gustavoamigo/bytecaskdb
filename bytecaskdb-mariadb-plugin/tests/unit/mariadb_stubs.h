@@ -41,6 +41,8 @@ typedef uint64_t ha_rows;
 #define HA_ERR_INTERNAL_ERROR 122
 #define HA_ERR_TABLE_DEF_CHANGED 1412
 #define HA_ERR_TABLE_EXIST    156
+#define HA_WRONG_CREATE_OPTION 140
+#define HA_ERR_INCOMPATIBLE_DEFINITION 190
 #define HA_ERR_NO_SUCH_TABLE  157
 
 // File lock constants.
@@ -196,13 +198,30 @@ struct CHARSET_INFO;
 struct MY_CHARSET_HANDLER {
   int (*wc_mb)(const CHARSET_INFO *, unsigned long, uchar *, uchar *);
 };
+#define MY_STRXFRM_PAD_WITH_SPACE 0x00000040
+#define MY_STRXFRM_PAD_TO_MAXLEN  0x00000080
 struct CHARSET_INFO {
   uint number{0};
   uint state{0};
   uint mbminlen{1};
   uint mbmaxlen{1};
   const MY_CHARSET_HANDLER *cset{nullptr};
+  uint strxfrm_multiply{1};
+  // The collation's sort key, as MariaDB's coll->strnxfrm / strnxfrmlen.
+  size_t (*strnxfrm_fn)(const CHARSET_INFO *, uchar *dst, size_t dstlen,
+                        uint nweights, const uchar *src, size_t srclen,
+                        uint flags){nullptr};
+  size_t (*strnxfrmlen_fn)(const CHARSET_INFO *, size_t){nullptr};
+
+  size_t strnxfrm(uchar *dst, size_t dstlen, uint nweights, const uchar *src,
+                  size_t srclen, uint flags) const {
+    return strnxfrm_fn(this, dst, dstlen, nweights, src, srclen, flags);
+  }
+  size_t strnxfrmlen(size_t length) const {
+    return strnxfrmlen_fn(this, length);
+  }
 };
+inline CHARSET_INFO my_charset_bin{63, MY_CS_BINSORT | MY_CS_NOPAD};
 
 struct Field {
   uchar *ptr{nullptr};
@@ -377,6 +396,7 @@ inline void my_printf_error(int error, const char * /*format*/,
 #define ER_LOCK_DEADLOCK 1213
 #define ER_DUP_ENTRY 1062
 #define ER_DUP_ENTRY_WITH_KEY_NAME 1586
+#define ER_TOO_LONG_KEY 1071
 
 // Stubs for key_copy / key_restore — these are MariaDB server functions.
 // For proof tests, key_copy must actually copy field data into the key buffer

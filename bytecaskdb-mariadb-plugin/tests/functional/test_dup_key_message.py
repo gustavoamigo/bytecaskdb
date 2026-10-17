@@ -56,3 +56,33 @@ def test_duplicate_pk_message_on_all_insert_paths(make_connection):
     finally:
         conn.close()
     _run(make_connection, "DROP DATABASE IF EXISTS dupmsg")
+
+
+def test_duplicate_under_case_insensitive_collation_names_the_new_value(make_connection):
+    # 'A' duplicates 'a' under utf8mb4_general_ci (#468). The key holds
+    # collation weights, not the value, so the message renders the row the
+    # INSERT tried to write, as InnoDB does.
+    _run(
+        make_connection,
+        "DROP DATABASE IF EXISTS dupci",
+        "CREATE DATABASE dupci",
+        "CREATE TABLE dupci.t (v VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL PRIMARY KEY, n INT) ENGINE=bytecaskdb",
+        "CREATE TABLE dupci.c (a INT NOT NULL, b VARCHAR(8) COLLATE utf8mb4_general_ci NOT NULL, PRIMARY KEY (a, b)) ENGINE=bytecaskdb",
+        "INSERT INTO dupci.t VALUES ('a', 1)",
+        "INSERT INTO dupci.c VALUES (1, 'x')",
+    )
+    conn = make_connection()
+    try:
+        with conn.cursor() as cur:
+            # Deferred, commit-time check.
+            _expect_dup(cur, "INSERT INTO dupci.t VALUES ('A', 2)", "A")
+            _expect_dup(cur, "INSERT INTO dupci.c VALUES (1, 'X')", "1-X")
+            # Eager check inside an explicit transaction.
+            cur.execute("BEGIN")
+            _expect_dup(cur, "INSERT INTO dupci.t VALUES ('A ', 2)", "A ")
+            cur.execute("ROLLBACK")
+            cur.execute("SELECT v, n FROM dupci.t")
+            assert cur.fetchall() == (("a", 1),)
+    finally:
+        conn.close()
+    _run(make_connection, "DROP DATABASE IF EXISTS dupci")

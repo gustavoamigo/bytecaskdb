@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+using namespace bytecaskdb;
 using namespace bytecaskdb::testing;
 
 TEST_CASE("P-INV-1: insert increments row counter", "[proof][insert][inv1]") {
@@ -68,4 +69,27 @@ TEST_CASE("P-INV-4: rollback leaves row counter at zero", "[proof][insert][inv4]
 
   h.rollback();
   REQUIRE(h.row_counter() == 0);
+}
+
+TEST_CASE("P-FMT-1: open refuses a key format newer than this build",
+          "[proof][open][key_format]") {
+  // A newer format sizes its stored keys in ways this build cannot see
+  // (format 2's weights are not key_length wide); read as an older one,
+  // every offset into a stored key would be wrong.
+  TableSpec spec;
+  spec.num_int_columns = 2;
+  spec.has_pk = true;
+  PluginTestHarness h(spec);
+
+  TableMeta meta;
+  REQUIRE(catalog_copy_meta(h.table_id(), meta));
+  meta.key_format = kKeyFormatCurrent + 1;
+  REQUIRE(catalog_put_table_meta(&h.db(), meta, "./test/proof_t"));
+  REQUIRE(h.handler().close() == 0);
+  REQUIRE(h.handler().open("./test/proof_t", 0, 0) ==
+          HA_ERR_INCOMPATIBLE_DEFINITION);
+
+  meta.key_format = kKeyFormatCurrent;
+  REQUIRE(catalog_put_table_meta(&h.db(), meta, "./test/proof_t"));
+  REQUIRE(h.handler().open("./test/proof_t", 0, 0) == 0);
 }

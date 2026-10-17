@@ -16,8 +16,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -1008,6 +1010,17 @@ std::vector<uint8_t> native_bytes(T v) {
   return b;
 }
 
+// encode_key_parts in place, as encode_pk_into (`pk`) or encode_sec_key_into
+// does to a key_copy() buffer under a plan without weights.
+void encode_in_place(uint8_t *k, const KeyPlan &plan, uint len, bool pk = true) {
+  REQUIRE(encode_key_parts(k, k, plan, len, pk) == len);
+}
+
+// undo_fixed_width_part on a one-part plan's slot.
+void undo_in_place(uint8_t *k, const KeyPlan &plan) {
+  REQUIRE(undo_fixed_width_part(k, plan.parts.at(0)));
+}
+
 // Encodes each value's native bytes, checks the encoded keys sort as the
 // values do, and that undo restores the native bytes exactly.
 template <typename T>
@@ -1017,9 +1030,9 @@ void check_order_and_round_trip(const KeyPlan &plan, std::vector<T> values) {
   for (T v : values) {
     auto bytes = native_bytes(v);
     auto key = bytes;
-    make_mem_comparable(key.data(), plan, static_cast<uint>(key.size()));
+    encode_in_place(key.data(), plan, static_cast<uint>(key.size()));
     auto back = key;
-    undo_mem_comparable(back.data(), plan, static_cast<uint>(back.size()));
+    undo_in_place(back.data(), plan);
     INFO("value " << v);
     REQUIRE(back == bytes);
     encoded.push_back(key);
@@ -1139,11 +1152,11 @@ TEST_CASE("key plan transforms sort by value and round-trip",
     std::vector<uint8_t> null_key = {1, 0, 0, 0, 0};  // null byte set
     std::vector<uint8_t> zero_key = {0, 0, 0, 0, 0};  // NOT NULL, value 0
     auto null_enc = null_key, zero_enc = zero_key;
-    make_mem_comparable(null_enc.data(), plan, 5);
-    make_mem_comparable(zero_enc.data(), plan, 5);
+    encode_in_place(null_enc.data(), plan, 5);
+    encode_in_place(zero_enc.data(), plan, 5);
     REQUIRE(null_enc < zero_enc);
-    undo_mem_comparable(null_enc.data(), plan, 5);
-    undo_mem_comparable(zero_enc.data(), plan, 5);
+    undo_in_place(null_enc.data(), plan);
+    undo_in_place(zero_enc.data(), plan);
     REQUIRE(null_enc == null_key);
     REQUIRE(zero_enc == zero_key);
   }
@@ -1166,9 +1179,9 @@ TEST_CASE("DESC key parts are stored in descending order",
     for (int32_t v : values) {
       auto bytes = native_bytes(v);
       auto key = bytes;
-      make_mem_comparable(key.data(), plan, 4);
+      encode_in_place(key.data(), plan, 4);
       auto back = key;
-      undo_mem_comparable(back.data(), plan, 4);
+      undo_in_place(back.data(), plan);
       INFO("value " << v);
       REQUIRE(back == bytes);
       encoded.push_back(key);
@@ -1193,14 +1206,14 @@ TEST_CASE("DESC key parts are stored in descending order",
     std::vector<uint8_t> max_key = {0, 0xFF, 0xFF, 0xFF, 0x7F};  // INT_MAX
     std::vector<uint8_t> min_key = {0, 0, 0, 0, 0x80};           // INT_MIN
     auto null_enc = null_key, max_enc = max_key, min_enc = min_key;
-    make_mem_comparable(null_enc.data(), plan, 5);
-    make_mem_comparable(max_enc.data(), plan, 5);
-    make_mem_comparable(min_enc.data(), plan, 5);
+    encode_in_place(null_enc.data(), plan, 5);
+    encode_in_place(max_enc.data(), plan, 5);
+    encode_in_place(min_enc.data(), plan, 5);
     REQUIRE(max_enc < min_enc);
     REQUIRE(min_enc < null_enc);
-    undo_mem_comparable(null_enc.data(), plan, 5);
-    undo_mem_comparable(max_enc.data(), plan, 5);
-    undo_mem_comparable(min_enc.data(), plan, 5);
+    undo_in_place(null_enc.data(), plan);
+    undo_in_place(max_enc.data(), plan);
+    undo_in_place(min_enc.data(), plan);
     REQUIRE(null_enc == null_key);
     REQUIRE(max_enc == max_key);
     REQUIRE(min_enc == min_key);
@@ -1225,8 +1238,7 @@ TEST_CASE("DESC key parts are stored in descending order",
       std::vector<uint8_t> k(t.part.store_length, 0);
       k[0] = static_cast<uint8_t>(s.size());
       std::memcpy(k.data() + 2, s.data(), s.size());
-      fix_varchar_key_encoding(k.data(), plan);
-      make_mem_comparable(k.data(), plan, static_cast<uint>(k.size()));
+      encode_in_place(k.data(), plan, static_cast<uint>(k.size()), false);
       return k;
     };
     REQUIRE(key_of("b") < key_of("ab"));
@@ -1250,7 +1262,7 @@ TEST_CASE("DESC key parts are stored in descending order",
     CHECK_FALSE(plan.parts.at(1).desc);
 
     std::vector<uint8_t> key(8, 0xAA);
-    make_mem_comparable(key.data(), plan, 4);
+    encode_in_place(key.data(), plan, 4);
     // Part 0: 0xAAAAAAAA reversed, sign-flipped (0x2A...), then inverted.
     REQUIRE(key == std::vector<uint8_t>{0xD5, 0x55, 0x55, 0x55,
                                         0xAA, 0xAA, 0xAA, 0xAA});
@@ -1264,7 +1276,7 @@ TEST_CASE("DESC key parts are stored in descending order",
     const KeyPlan &plan = codec.keys[0];
     auto value = native_bytes<int32_t>(-42);
     auto encoded = value;
-    make_mem_comparable(encoded.data(), plan, 4);
+    encode_in_place(encoded.data(), plan, 4);
     std::vector<uint8_t> sec_key = {0x03, 0, 0, 0, 1, 0, 1};
     sec_key.insert(sec_key.end(), encoded.begin(), encoded.end());
     uchar record[16]{};
@@ -1274,7 +1286,7 @@ TEST_CASE("DESC key parts are stored in descending order",
   }
 }
 
-TEST_CASE("VARCHAR primary-key parts sort by value and restore exactly",
+TEST_CASE("VARCHAR primary-key parts sort by value",
           "[key_encoding]") {
   struct VarcharField : Field {
     enum_field_types type() const override { return MYSQL_TYPE_VARCHAR; }
@@ -1292,7 +1304,7 @@ TEST_CASE("VARCHAR primary-key parts sort by value and restore exactly",
   };
   auto encode = [&](const KeyPlan &plan, std::string_view s) {
     auto k = copy_of(s);
-    make_mem_comparable(k.data(), plan, static_cast<uint>(k.size()));
+    encode_in_place(k.data(), plan, static_cast<uint>(k.size()));
     return k;
   };
   // Binary strings, so a trailing zero byte is part of the value.
@@ -1300,18 +1312,13 @@ TEST_CASE("VARCHAR primary-key parts sort by value and restore exactly",
       "", std::string("\0", 1), "a", std::string("a\0", 2), "ab", "abc",
       "b", "c"};
 
-  SECTION("current format: value order, round-trip") {
+  SECTION("current format: value order") {
     const TableCodec codec = make_table_codec(&t.tbl, kKeyFormatCurrent);
     const KeyPlan &plan = codec.keys[0];
     REQUIRE(plan.varlen_length_last);
     std::vector<std::vector<uint8_t>> encoded;
     for (const auto &s : sorted) {
-      auto k = encode(plan, s);
-      auto back = k;
-      undo_mem_comparable(back.data(), plan, static_cast<uint>(back.size()));
-      INFO("value '" << s << "'");
-      REQUIRE(back == copy_of(s));
-      encoded.push_back(k);
+      encoded.push_back(encode(plan, s));
     }
     REQUIRE(std::is_sorted(encoded.begin(), encoded.end()));
     REQUIRE(std::adjacent_find(encoded.begin(), encoded.end()) ==
@@ -1335,7 +1342,7 @@ TEST_CASE("VARCHAR primary-key parts sort by value and restore exactly",
     OneKeyTable u(g, 4, false);
     u.part.store_length = 4 + HA_KEY_BLOB_LENGTH;
     u.key.key_length = u.part.store_length;
-    const TableCodec codec = make_table_codec(&u.tbl, kKeyFormatCurrent);
+    const TableCodec codec = make_table_codec(&u.tbl, kKeyFormatValueOrderedPk);
     const KeyPlan &plan = codec.keys[0];
     REQUIRE(plan.parts.at(0).pad_space);
     // As InnoDB orders them under latin1_bin: a shorter value compares as if
@@ -1345,12 +1352,7 @@ TEST_CASE("VARCHAR primary-key parts sort by value and restore exactly",
         "a", "ab", "b"};
     std::vector<std::vector<uint8_t>> encoded;
     for (const auto &s : pad_sorted) {
-      auto k = encode(plan, s);
-      auto back = k;
-      undo_mem_comparable(back.data(), plan, static_cast<uint>(back.size()));
-      INFO("value '" << s << "'");
-      REQUIRE(back == copy_of(s));
-      encoded.push_back(k);
+      encoded.push_back(encode(plan, s));
     }
     REQUIRE(std::is_sorted(encoded.begin(), encoded.end()));
     REQUIRE(std::adjacent_find(encoded.begin(), encoded.end()) ==
@@ -1358,7 +1360,7 @@ TEST_CASE("VARCHAR primary-key parts sort by value and restore exactly",
     // A non-binary PAD SPACE collation's LIKE 'ab%' lower bound: 'ab' then
     // zero bytes, at the full length. It sorts before 'ab' and after 'a'.
     std::vector<uint8_t> bound = {4, 0, 'a', 'b', 0, 0};
-    make_mem_comparable(bound.data(), plan, static_cast<uint>(bound.size()));
+    encode_in_place(bound.data(), plan, static_cast<uint>(bound.size()));
     REQUIRE(bound < encode(plan, "ab"));
     REQUIRE(encode(plan, "a") < bound);
   }
@@ -1378,13 +1380,14 @@ TEST_CASE("VARCHAR primary-key parts sort by value and restore exactly",
       std::vector<uint8_t> k(u.part.store_length, 0);
       k[0] = static_cast<uint8_t>(v.size());
       std::memcpy(k.data() + 2, v.data(), v.size());
-      fix_varchar_key_encoding(k.data(), codec.keys[0]);
+      encode_in_place(k.data(), codec.keys[0], static_cast<uint>(k.size()),
+                      false);
       return k;
     };
-    REQUIRE(sec(kKeyFormatCurrent, "a") ==
+    REQUIRE(sec(kKeyFormatValueOrderedPk, "a") ==
             std::vector<uint8_t>{'a', ' ', ' ', ' ', ' ', ' '});
-    REQUIRE(sec(kKeyFormatCurrent, std::string_view("a\0b", 3)) <
-            sec(kKeyFormatCurrent, "a"));
+    REQUIRE(sec(kKeyFormatValueOrderedPk, std::string_view("a\0b", 3)) <
+            sec(kKeyFormatValueOrderedPk, "a"));
     // Format 0 keeps the zero padding its keys were written with.
     REQUIRE(sec(kKeyFormatLengthPrefixedPk, "a") ==
             std::vector<uint8_t>{'a', 0, 0, 0, 0, 0});
@@ -1406,7 +1409,7 @@ TEST_CASE("VARCHAR primary-key parts sort by value and restore exactly",
     OneKeyTable u(g, 8, false);  // four characters
     u.part.store_length = 8 + HA_KEY_BLOB_LENGTH;
     u.key.key_length = u.part.store_length;
-    const TableCodec codec = make_table_codec(&u.tbl, kKeyFormatCurrent);
+    const TableCodec codec = make_table_codec(&u.tbl, kKeyFormatValueOrderedPk);
     const KeyPlan &plan = codec.keys[0];
     REQUIRE(plan.parts.at(0).space_len == 2);
     auto ucs2 = [](std::initializer_list<uint16_t> units) {
@@ -1421,8 +1424,7 @@ TEST_CASE("VARCHAR primary-key parts sort by value and restore exactly",
       std::vector<uint8_t> k(u.part.store_length, 0);
       k[0] = static_cast<uint8_t>(v.size());
       std::memcpy(k.data() + 2, v.data(), v.size());
-      normalize_padspace_pk(k.data(), plan);
-      make_mem_comparable(k.data(), plan, static_cast<uint>(k.size()));
+      encode_in_place(k.data(), plan, static_cast<uint>(k.size()));
       return k;
     };
     // As InnoDB orders them under ucs2_bin.
@@ -1432,12 +1434,9 @@ TEST_CASE("VARCHAR primary-key parts sort by value and restore exactly",
     // A trailing space is one 00 20 unit; U+2020 is not a space.
     REQUIRE(pk(ucs2({0x61, 0x20})) == pk(ucs2({0x61})));
     REQUIRE(pk(ucs2({0x61, 0x2020})) != pk(ucs2({0x61})));
-    // Restores exactly.
-    auto k = pk(ucs2({0x61, 0x62}));
-    undo_mem_comparable(k.data(), plan, static_cast<uint>(k.size()));
-    REQUIRE(k[0] == 4);
-    REQUIRE(std::string(reinterpret_cast<char *>(k.data()) + 2, 4) ==
-            ucs2({0x61, 0x62}));
+    // The bytes padded with whole spaces, then the length, big-endian.
+    REQUIRE(pk(ucs2({0x61, 0x62})) ==
+            std::vector<uint8_t>{0, 0x61, 0, 0x62, 0, 0x20, 0, 0x20, 0, 4});
   }
 
   SECTION("format 0 keeps the length prefix its rows were written with") {
@@ -1457,7 +1456,7 @@ TEST_CASE("decode_sec_key_into_record restores the key's columns",
 
   auto value = native_bytes<int32_t>(-42);
   auto encoded = value;
-  make_mem_comparable(encoded.data(), plan, 4);
+  encode_in_place(encoded.data(), plan, 4);
   std::vector<uint8_t> sec_key = {0x03, 0, 0, 0, 1, 0, 1};  // ns | tid | iid
   sec_key.insert(sec_key.end(), encoded.begin(), encoded.end());
 
@@ -1528,10 +1527,10 @@ TEST_CASE("key plan leaves big-endian temporal parts as they are",
     std::vector<std::vector<uint8_t>> encoded;
     for (const auto &v : values) {
       auto key = v;
-      make_mem_comparable(key.data(), plan, k.bytes);
+      encode_in_place(key.data(), plan, k.bytes);
       REQUIRE(key == v);
       auto back = key;
-      undo_mem_comparable(back.data(), plan, k.bytes);
+      undo_in_place(back.data(), plan);
       REQUIRE(back == v);
       encoded.push_back(key);
     }
@@ -1557,4 +1556,308 @@ TEST_CASE("key plan leaves big-endian temporal parts as they are",
     check_order_and_round_trip<uint64_t>(
         codec.keys[0], {0ULL, 1ULL, 20261009000000ULL, 99991231235959ULL});
   }
+}
+
+// =========================================================================
+// Collation weights (key format 2, #468)
+// =========================================================================
+
+namespace {
+
+// A toy single-byte case-insensitive collation: a byte weighs its upper
+// case, one weight byte a character. PAD SPACE pads with the space's weight
+// as MariaDB's strnxfrm does under MY_STRXFRM_PAD_WITH_SPACE.
+size_t toy_strnxfrm(const CHARSET_INFO *, uchar *dst, size_t dstlen,
+                    uint nweights, const uchar *src, size_t srclen,
+                    uint flags) {
+  size_t n = std::min({dstlen, srclen, size_t{nweights}});
+  for (size_t i = 0; i < n; ++i) {
+    dst[i] = static_cast<uchar>(std::toupper(src[i]));
+  }
+  if (flags & MY_STRXFRM_PAD_TO_MAXLEN) {
+    std::memset(dst + n, 0x20, dstlen - n);
+    n = dstlen;
+  }
+  return n;
+}
+size_t toy_strnxfrmlen(const CHARSET_INFO *, size_t len) { return len; }
+
+CHARSET_INFO toy_ci{8, 0, 1, 1, nullptr, 1, toy_strnxfrm, toy_strnxfrmlen};
+CHARSET_INFO toy_nopad_ci{1032, MY_CS_NOPAD, 1, 1, nullptr, 1, toy_strnxfrm,
+                          toy_strnxfrmlen};
+
+struct CsVarcharField : Field {
+  const CHARSET_INFO *cs;
+  explicit CsVarcharField(const CHARSET_INFO *c) : cs(c) {}
+  enum_field_types type() const override { return MYSQL_TYPE_VARCHAR; }
+  const CHARSET_INFO *charset() const override { return cs; }
+};
+
+// One VARCHAR(4) key part under `cs`.
+struct VarcharKey {
+  CsVarcharField f;
+  OneKeyTable t;
+  VarcharKey(const CHARSET_INFO *cs, bool nullable)
+      : f(cs), t(f, 4, nullable) {
+    t.part.store_length = 4 + HA_KEY_BLOB_LENGTH + (nullable ? 1 : 0);
+    t.key.key_length = t.part.store_length;
+  }
+  // The stored key part for `v` (nullopt: NULL), through encode_key_parts.
+  std::vector<uint8_t> encode(const KeyPlan &plan,
+                              std::optional<std::string_view> v,
+                              bool pk = true) const {
+    std::vector<uint8_t> src(t.part.store_length, 0);
+    const uint off = t.part.null_bit ? 1 : 0;
+    if (!v) {
+      src[0] = 1;
+    } else {
+      src[off] = static_cast<uint8_t>(v->size());
+      std::memcpy(src.data() + off + 2, v->data(), v->size());
+    }
+    std::vector<uint8_t> out(plan.stored_length, 0xAA);
+    const uint n = encode_key_parts(out.data(), src.data(), plan,
+                                    static_cast<uint>(src.size()), pk);
+    REQUIRE(n == plan.stored_length);
+    return out;
+  }
+};
+
+}  // namespace
+
+TEST_CASE("String key parts are stored as their collation's weights",
+          "[key_encoding]") {
+  SECTION("format 2 stores a non-binary string part as weights") {
+    VarcharKey k(&toy_ci, false);
+    const TableCodec codec = make_table_codec(&k.t.tbl, kKeyFormatCurrent);
+    const KeyPartPlan &p = codec.keys[0].parts.at(0);
+    REQUIRE(p.weights_cs == &toy_ci);
+    REQUIRE(p.weight_width == 4);
+    REQUIRE_FALSE(p.weight_length);
+    REQUIRE(p.stored_length == 4);
+    REQUIRE(codec.keys[0].weights);
+    REQUIRE(codec.keys[0].stored_length == 4);
+  }
+
+  SECTION("NO PAD: the weights' length follows them; NULL adds its byte") {
+    VarcharKey k(&toy_nopad_ci, true);
+    const TableCodec codec = make_table_codec(&k.t.tbl, kKeyFormatCurrent);
+    const KeyPartPlan &p = codec.keys[0].parts.at(0);
+    REQUIRE(p.weight_length);
+    REQUIRE(p.stored_length == 1 + 4 + 2);
+    REQUIRE(codec.keys[0].stored_length == 7);
+  }
+
+  SECTION("binary strings, other types and older formats keep their bytes") {
+    VarcharKey bin(&my_charset_bin, false);
+    REQUIRE_FALSE(make_table_codec(&bin.t.tbl, kKeyFormatCurrent).keys[0].weights);
+    VarcharKey old(&toy_ci, false);
+    const TableCodec v1 = make_table_codec(&old.t.tbl, kKeyFormatValueOrderedPk);
+    REQUIRE_FALSE(v1.keys[0].weights);
+    REQUIRE(v1.keys[0].stored_length == old.t.key.key_length);
+    Field_long f;
+    OneKeyTable i(f, 4, false);
+    REQUIRE(make_table_codec(&i.tbl, kKeyFormatCurrent).keys[0].stored_length == 4);
+  }
+
+  SECTION("PAD SPACE: equal under the collation means equal keys") {
+    VarcharKey k(&toy_ci, false);
+    const TableCodec codec = make_table_codec(&k.t.tbl, kKeyFormatCurrent);
+    const KeyPlan &plan = codec.keys[0];
+    for (bool pk : {true, false}) {
+      REQUIRE(k.encode(plan, "a", pk) == k.encode(plan, "A", pk));
+      REQUIRE(k.encode(plan, "a", pk) == k.encode(plan, "a ", pk));
+      REQUIRE(k.encode(plan, "ab", pk) == k.encode(plan, "AB", pk));
+      // The issue's rows sort a, B, C as the collation orders them.
+      REQUIRE(k.encode(plan, "a", pk) < k.encode(plan, "B", pk));
+      REQUIRE(k.encode(plan, "B", pk) < k.encode(plan, "c", pk));
+      // Shorter compares as if padded with spaces.
+      REQUIRE(k.encode(plan, "a\x01", pk) < k.encode(plan, "a", pk));
+      REQUIRE(k.encode(plan, "a", pk) < k.encode(plan, "ab", pk));
+    }
+    REQUIRE(k.encode(plan, "ab") == std::vector<uint8_t>{'A', 'B', ' ', ' '});
+  }
+
+  SECTION("NO PAD: trailing spaces count, and a shorter value sorts first") {
+    VarcharKey k(&toy_nopad_ci, false);
+    const TableCodec codec = make_table_codec(&k.t.tbl, kKeyFormatCurrent);
+    const KeyPlan &plan = codec.keys[0];
+    REQUIRE(k.encode(plan, "a") == k.encode(plan, "A"));
+    REQUIRE(k.encode(plan, "a") != k.encode(plan, "a "));
+    const std::vector<std::string> sorted = {
+        "", std::string("\0", 1), "a", std::string("a\0", 2), "a ", "Ab", "b"};
+    std::vector<std::vector<uint8_t>> encoded;
+    for (const auto &s : sorted) encoded.push_back(k.encode(plan, s));
+    REQUIRE(std::is_sorted(encoded.begin(), encoded.end()));
+    REQUIRE(std::adjacent_find(encoded.begin(), encoded.end()) == encoded.end());
+    REQUIRE(k.encode(plan, "ab") ==
+            std::vector<uint8_t>{'A', 'B', 0, 0, 0, 2});
+  }
+
+  SECTION("NULL sorts first; DESC reverses the order, NULLs last") {
+    VarcharKey k(&toy_ci, true);
+    const TableCodec codec = make_table_codec(&k.t.tbl, kKeyFormatCurrent);
+    const KeyPlan &plan = codec.keys[0];
+    REQUIRE(k.encode(plan, std::nullopt) == std::vector<uint8_t>{0, 0, 0, 0, 0});
+    REQUIRE(k.encode(plan, std::nullopt) < k.encode(plan, ""));
+    REQUIRE(k.encode(plan, "a") == std::vector<uint8_t>{1, 'A', ' ', ' ', ' '});
+
+    k.t.part.key_part_flag = HA_REVERSE_SORT;
+    const TableCodec dcodec = make_table_codec(&k.t.tbl, kKeyFormatCurrent);
+    const KeyPlan &desc = dcodec.keys[0];
+    REQUIRE(k.encode(desc, "b") < k.encode(desc, "A"));
+    REQUIRE(k.encode(desc, "A") < k.encode(desc, std::nullopt));
+  }
+
+  SECTION("a search key's prefix is counted in stored bytes") {
+    // (VARCHAR(4) toy_nopad_ci, INT): weights 4 + length 2, then the int.
+    KeyPlan plan;
+    KeyPartPlan s;
+    s.store_length = 6;
+    s.length = 4;
+    s.varlen = s.varchar = true;
+    s.weights_cs = &toy_nopad_ci;
+    s.weight_width = 4;
+    s.nweights = 4;
+    s.weight_length = true;
+    s.stored_length = 6;
+    KeyPartPlan i;
+    i.store_length = i.length = i.stored_length = 4;
+    i.reverse = true;
+    i.flip = KeyPartPlan::Flip::kSign;
+    plan.parts = {s, i};
+    plan.stored_length = 10;
+    plan.weights = true;
+
+    std::vector<uint8_t> src = {2, 0, 'x', 'y', 0, 0, 0, 0, 0, 0};
+    const auto one = native_bytes<int32_t>(1);
+    std::memcpy(src.data() + 6, one.data(), 4);
+    std::vector<uint8_t> out(10, 0xAA);
+    auto whole = src;
+    REQUIRE(encode_key_parts(out.data(), whole.data(), plan, 10, true) == 10);
+    REQUIRE(out == std::vector<uint8_t>{'X', 'Y', 0, 0, 0, 2, 0x80, 0, 0, 1});
+
+    std::vector<uint8_t> prefix(10, 0xAA);
+    auto first = src;
+    REQUIRE(encode_key_parts(prefix.data(), first.data(), plan, 6, true) == 6);
+    REQUIRE(std::equal(prefix.begin(), prefix.begin() + 6, out.begin()));
+  }
+
+  SECTION("stored widths size the PK suffix and the longest key") {
+    VarcharKey k(&toy_nopad_ci, false);
+    const TableCodec codec = make_table_codec(&k.t.tbl, kKeyFormatCurrent);
+    REQUIRE(pk_suffix_length(&k.t.tbl, codec) == 6);
+    REQUIRE(max_stored_key_bytes(&k.t.tbl, codec) == 5 + 6 + 1);
+    k.t.share.primary_key = MAX_KEY;  // key 0 is a secondary index
+    REQUIRE(pk_suffix_length(&k.t.tbl, codec) == 8);
+    REQUIRE(max_stored_key_bytes(&k.t.tbl, codec) == 7 + 6 + 8);
+  }
+}
+
+namespace {
+
+// Like toy_ci, but two weight bytes a character (00, upper case): its sort
+// key is twice key_copy()'s width, so stored offsets differ from key_length.
+size_t wide_strnxfrm(const CHARSET_INFO *, uchar *dst, size_t dstlen,
+                     uint nweights, const uchar *src, size_t srclen,
+                     uint flags) {
+  size_t n = 0;
+  for (size_t i = 0; i < srclen && i < nweights && n + 2 <= dstlen; ++i) {
+    dst[n++] = 0;
+    dst[n++] = static_cast<uchar>(std::toupper(src[i]));
+  }
+  if (flags & MY_STRXFRM_PAD_TO_MAXLEN) {
+    for (; n + 2 <= dstlen; n += 2) {
+      dst[n] = 0;
+      dst[n + 1] = 0x20;
+    }
+  }
+  return n;
+}
+size_t wide_strnxfrmlen(const CHARSET_INFO *, size_t len) { return 2 * len; }
+CHARSET_INFO wide_ci{9, 0, 1, 1, nullptr, 1, wide_strnxfrm, wide_strnxfrmlen};
+
+// (c CHAR(4) PRIMARY KEY, s CHAR(4), KEY (s)), both under wide_ci, laid out
+// as the stub key_copy() reads it: each column's bytes at its field's ptr.
+struct WeightsTable {
+  uchar record[16]{};
+  TABLE_SHARE share{};
+  Field_string pk_field, sec_field;
+  Field *fields[2]{};
+  KEY_PART_INFO parts[2]{};
+  KEY keys[2]{};
+  TABLE tbl{};
+
+  WeightsTable() {
+    Field_string *f[2] = {&pk_field, &sec_field};
+    for (uint i = 0; i < 2; ++i) {
+      f[i]->cs_ = &wide_ci;
+      f[i]->ptr = record + 1 + 4 * i;
+      f[i]->field_length = 4;
+      f[i]->field_index = static_cast<uint16_t>(i);
+      fields[i] = f[i];
+      parts[i].field = f[i];
+      parts[i].fieldnr = static_cast<uint16_t>(i + 1);
+      parts[i].length = parts[i].store_length = 4;
+      keys[i].key_length = 4;
+      keys[i].user_defined_key_parts = 1;
+      keys[i].key_part = &parts[i];
+    }
+    share.reclength = sizeof(record);
+    share.null_bytes = 1;
+    share.fields = 2;
+    share.keys = 2;
+    share.primary_key = 0;
+    tbl.s = &share;
+    tbl.key_info = keys;
+    tbl.field = fields;
+    tbl.record[0] = record;
+  }
+  void set(std::string_view pk, std::string_view sec) {
+    std::memcpy(record + 1, pk.data(), 4);
+    std::memcpy(record + 5, sec.data(), 4);
+  }
+};
+
+}  // namespace
+
+TEST_CASE("Stored keys put weights parts at their stored widths",
+          "[key_encoding]") {
+  WeightsTable t;
+  const TableCodec codec = make_table_codec(&t.tbl, kKeyFormatCurrent);
+  REQUIRE(codec.keys[0].stored_length == 8);
+  REQUIRE(codec.keys[1].stored_length == 8);
+  const std::vector<uint8_t> pk_weights = {0, 'P', 0, 'K', 0, ' ', 0, ' '};
+  const std::vector<uint8_t> sec_weights = {0, 'A', 0, 'B', 0, ' ', 0, ' '};
+  auto cat = [](std::vector<uint8_t> a, const std::vector<uint8_t> &b) {
+    a.insert(a.end(), b.begin(), b.end());
+    return a;
+  };
+
+  t.set("pk  ", "ab  ");
+  // [02 | table_id | PK weights]: 5 + 8, not 5 + key_length.
+  const auto pk = encode_pk(&t.tbl, codec, t.record, 42);
+  REQUIRE(pk == cat({0x02, 0, 0, 0, 42}, pk_weights));
+  // [03 | table_id | index_id | index weights | PK weights].
+  const auto sec = encode_sec_key(&t.tbl, codec, t.record, 42, 1, 1);
+  REQUIRE(sec == cat(cat({0x03, 0, 0, 0, 42, 0, 1}, sec_weights), pk_weights));
+  std::size_t pk_len = 0;
+  const uint8_t *suffix = extract_pk_from_sec_key(
+      sec.data(), sec.size(), codec.keys[1].stored_length, &pk_len);
+  REQUIRE(pk_len == 8);
+  REQUIRE(std::vector<uint8_t>(suffix, suffix + pk_len) == pk_weights);
+  const auto unique = encode_unique_sec_key(&t.tbl, codec, t.record, 42, 1, 1);
+  REQUIRE(unique == cat({0x03, 0, 0, 0, 42, 0, 1}, sec_weights));
+
+  // Equal under the collation: the same keys, every one of them.
+  t.set("PK  ", "AB  ");
+  REQUIRE(encode_pk(&t.tbl, codec, t.record, 42) == pk);
+  REQUIRE(encode_sec_key(&t.tbl, codec, t.record, 42, 1, 1) == sec);
+  REQUIRE(encode_unique_sec_key(&t.tbl, codec, t.record, 42, 1, 1) == unique);
+
+  // The _into forms reuse a longer buffer and still end at the key.
+  std::vector<uint8_t> into(64, 0xEE);
+  encode_sec_key_into(into, &t.tbl, codec, t.record, 42, 1, 1);
+  REQUIRE(into == sec);
+  encode_pk_into(into, &t.tbl, codec, t.record, 42);
+  REQUIRE(into == pk);
 }

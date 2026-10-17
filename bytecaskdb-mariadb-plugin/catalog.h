@@ -103,9 +103,13 @@ struct FKMeta {
 //      little-endian length prefix, so it sorts by length first (#459).
 //   1: that length is stored after the zero-padded bytes, big-endian, so
 //      the part sorts by value.
+//   2: a CHAR, VARCHAR or TEXT part under a non-binary charset is stored as
+//      its collation's sort key, so keys compare as the collation does
+//      (case- and accent-insensitive collations included, #468).
 inline constexpr uint8_t kKeyFormatLengthPrefixedPk = 0;
 inline constexpr uint8_t kKeyFormatValueOrderedPk   = 1;
-inline constexpr uint8_t kKeyFormatCurrent          = kKeyFormatValueOrderedPk;
+inline constexpr uint8_t kKeyFormatCollationWeights = 2;
+inline constexpr uint8_t kKeyFormatCurrent          = kKeyFormatCollationWeights;
 
 struct TableMeta {
   uint32_t    table_id;

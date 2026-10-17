@@ -200,7 +200,9 @@ public:
   // case that order is ever different. Cleared by reset().
   // Returns true if it reported the error; false to fall back to the
   // generic report (the key belongs to a table the reporter does not own).
-  using DupKeyReporter = std::function<bool(const std::vector<uint8_t> &pk)>;
+  // Given the duplicate key and the row the INSERT tried to write with it.
+  using DupKeyReporter = std::function<bool(const std::vector<uint8_t> &pk,
+                                            const std::vector<uint8_t> &row)>;
   bool in_deferred_insert() const { return deferred_insert_; }
   // True once this statement/transaction holds a snapshot or buffered
   // writes. Deferred-INSERT mode may only begin before either exists.
@@ -387,7 +389,7 @@ private:
 
   // Bulk-copy mode state (see begin_bulk_copy). Isolated from ops_/lookup_.
   bool bulk_copy_mode_{false};
-  bytecask::WritePlan bulk_plan_{};
+  bytecask::WritePlan bulk_plan_{kPluginSizeLimits};
   std::size_t bulk_bytes_{0};
   std::size_t bulk_flush_threshold_{0};
   std::set<std::vector<uint8_t>> bulk_seen_;

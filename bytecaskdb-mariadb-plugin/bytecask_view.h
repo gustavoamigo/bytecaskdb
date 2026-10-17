@@ -19,6 +19,13 @@
 
 namespace bytecaskdb {
 
+// The key and value limits the plugin opens the DB with. A WritePlan built
+// without a snapshot checks the limits it is given, the engine's defaults
+// (4 KiB keys, 4 MiB values) if none, so every such plan takes these.
+inline constexpr bytecask::SizeLimits kPluginSizeLimits{
+    65535,              // the engine's hard ceiling: collation weights need it
+    16 * 1024 * 1024};  // MEDIUMBLOB (16 MiB)
+
 inline bytecask::BytesView as_view(const uint8_t *p, std::size_t n) {
   return std::as_bytes(std::span{p, n});
 }

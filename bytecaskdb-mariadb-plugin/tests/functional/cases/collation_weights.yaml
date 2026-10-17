@@ -1,0 +1,161 @@
+# collation_weights.yaml — string keys compare as their collation does (#468):
+# under a case- or accent-insensitive collation, ordering, ranges, equality
+# lookups through an index and uniqueness follow the collation's weights,
+# not the bytes. Expected rows are InnoDB's on MariaDB 10.11.
+
+- name: The issue's table, PRIMARY KEY under utf8mb4_general_ci
+  setup:
+    - DROP DATABASE IF EXISTS cw1
+    - CREATE DATABASE cw1
+    - CREATE TABLE cw1.t (v VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL, PRIMARY KEY (v)) ENGINE=bytecaskdb
+    - INSERT INTO cw1.t VALUES ('B'), ('a'), ('C'), ('é')
+  steps:
+    - sql: SELECT v FROM cw1.t FORCE INDEX (PRIMARY) ORDER BY v
+      expected: [['a'], ['B'], ['C'], ['é']]
+    - sql: SELECT v FROM cw1.t FORCE INDEX (PRIMARY) WHERE v >= 'b' ORDER BY v
+      expected: [['B'], ['C'], ['é']]
+    - sql: SELECT v FROM cw1.t FORCE INDEX (PRIMARY) WHERE v = 'A'
+      expected: [['a']]
+    - sql: SELECT v FROM cw1.t FORCE INDEX (PRIMARY) WHERE v = 'E'
+      expected: [['é']]
+    - sql: SELECT v FROM cw1.t FORCE INDEX (PRIMARY) ORDER BY v DESC
+      expected: [['é'], ['C'], ['B'], ['a']]
+    - sql: INSERT INTO cw1.t VALUES ('A')
+      error: 1062
+    - sql: INSERT INTO cw1.t VALUES ('b ')
+      error: 1062
+    # The PK's value changes only in case: same key, new row.
+    - sql: UPDATE cw1.t SET v = 'A' WHERE v = 'a'
+    - sql: SELECT v FROM cw1.t WHERE v = 'a'
+      expected: [['A']]
+    - sql: SELECT COUNT(*) FROM cw1.t
+      expected: [['4']]
+  teardown:
+    - DROP DATABASE IF EXISTS cw1
+
+- name: The issue's table, KEY and UNIQUE KEY under utf8mb4_general_ci
+  setup:
+    - DROP DATABASE IF EXISTS cw2
+    - CREATE DATABASE cw2
+    - CREATE TABLE cw2.k (id INT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL, KEY kv (v)) ENGINE=bytecaskdb
+    - CREATE TABLE cw2.u (id INT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL, UNIQUE KEY kv (v)) ENGINE=bytecaskdb
+    - INSERT INTO cw2.k (v) VALUES ('B'), ('a'), ('C'), ('é')
+    - INSERT INTO cw2.u (v) VALUES ('B'), ('a'), ('C'), ('é')
+  steps:
+    - sql: SELECT v FROM cw2.k FORCE INDEX (kv) ORDER BY v
+      expected: [['a'], ['B'], ['C'], ['é']]
+    - sql: SELECT v FROM cw2.k FORCE INDEX (kv) WHERE v >= 'b' ORDER BY v
+      expected: [['B'], ['C'], ['é']]
+    - sql: SELECT v FROM cw2.k FORCE INDEX (kv) WHERE v = 'A'
+      expected: [['a']]
+    - sql: SELECT v FROM cw2.u FORCE INDEX (kv) ORDER BY v
+      expected: [['a'], ['B'], ['C'], ['é']]
+    - sql: SELECT v FROM cw2.u FORCE INDEX (kv) WHERE v = 'A'
+      expected: [['a']]
+    - sql: INSERT INTO cw2.u (v) VALUES ('A')
+      error: 1062
+    - sql: INSERT INTO cw2.u (v) VALUES ('e')
+      error: 1062
+    - sql: UPDATE cw2.u SET v = 'c' WHERE v = 'a'
+      error: 1062
+    # A row may change its own value's case.
+    - sql: UPDATE cw2.u SET v = 'b' WHERE v = 'B'
+    - sql: SELECT v FROM cw2.u FORCE INDEX (kv) WHERE v = 'B'
+      expected: [['b']]
+    # A non-unique index takes both, and finds both.
+    - sql: INSERT INTO cw2.k (v) VALUES ('A')
+    - sql: SELECT v FROM cw2.k FORCE INDEX (kv) WHERE v = 'a' ORDER BY id
+      expected: [['a'], ['A']]
+    - sql: SELECT v FROM cw2.k FORCE INDEX (kv) WHERE v LIKE 'b%'
+      expected: [['B']]
+  teardown:
+    - DROP DATABASE IF EXISTS cw2
+
+- name: Accent-insensitive UCA collations
+  setup:
+    - DROP DATABASE IF EXISTS cw3
+    - CREATE DATABASE cw3
+    - CREATE TABLE cw3.t (id INT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL, UNIQUE KEY kv (v)) ENGINE=bytecaskdb
+    - CREATE TABLE cw3.p (v VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_uca1400_ai_ci NOT NULL PRIMARY KEY) ENGINE=bytecaskdb
+    - INSERT INTO cw3.t (v) VALUES ('f'), ('e'), ('ß'), ('d')
+    - INSERT INTO cw3.p (v) VALUES ('f'), ('e'), ('d')
+  steps:
+    - sql: SELECT v FROM cw3.t FORCE INDEX (kv) ORDER BY v
+      expected: [['d'], ['e'], ['f'], ['ß']]
+    - sql: SELECT v FROM cw3.t FORCE INDEX (kv) WHERE v = 'É'
+      expected: [['e']]
+    # 'ß' expands to two weights, as 'ss'.
+    - sql: SELECT v FROM cw3.t FORCE INDEX (kv) WHERE v = 'ss'
+      expected: [['ß']]
+    - sql: INSERT INTO cw3.t (v) VALUES ('ê')
+      error: 1062
+    - sql: SELECT v FROM cw3.p FORCE INDEX (PRIMARY) WHERE v > 'E' ORDER BY v
+      expected: [['f']]
+    - sql: INSERT INTO cw3.p (v) VALUES ('Ê')
+      error: 1062
+  teardown:
+    - DROP DATABASE IF EXISTS cw3
+
+- name: NO PAD case-insensitive collation keeps trailing spaces
+  setup:
+    - DROP DATABASE IF EXISTS cw4
+    - CREATE DATABASE cw4
+    - CREATE TABLE cw4.t (v VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_nopad_ci NOT NULL PRIMARY KEY) ENGINE=bytecaskdb
+    - INSERT INTO cw4.t VALUES ('b'), ('a'), ('a ')
+  steps:
+    - sql: SELECT HEX(v) FROM cw4.t FORCE INDEX (PRIMARY) ORDER BY v
+      expected: [['61'], ['6120'], ['62']]
+    - sql: INSERT INTO cw4.t VALUES ('A')
+      error: 1062
+    - sql: SELECT HEX(v) FROM cw4.t FORCE INDEX (PRIMARY) WHERE v = 'A '
+      expected: [['6120']]
+  teardown:
+    - DROP DATABASE IF EXISTS cw4
+
+- name: CHAR, prefix, nullable DESC and composite keys
+  setup:
+    - DROP DATABASE IF EXISTS cw5
+    - CREATE DATABASE cw5
+    - CREATE TABLE cw5.c (v CHAR(4) CHARACTER SET latin1 COLLATE latin1_swedish_ci NOT NULL PRIMARY KEY) ENGINE=bytecaskdb
+    - INSERT INTO cw5.c VALUES ('bc'), ('ab'), ('Ac')
+    - CREATE TABLE cw5.p (id INT PRIMARY KEY, v VARCHAR(16) COLLATE utf8mb4_general_ci, KEY kp (v(2)), KEY kd (v DESC)) ENGINE=bytecaskdb
+    - INSERT INTO cw5.p VALUES (1, 'abc'), (2, 'ABD'), (3, NULL), (4, 'b')
+    - CREATE TABLE cw5.m (a INT NOT NULL, v VARCHAR(8) COLLATE utf8mb4_general_ci NOT NULL, n INT, PRIMARY KEY (a, v), KEY kn (n)) ENGINE=bytecaskdb
+    - INSERT INTO cw5.m VALUES (1, 'x', 10), (1, 'Y', 11), (2, 'x', 12)
+  steps:
+    - sql: SELECT v FROM cw5.c FORCE INDEX (PRIMARY) ORDER BY v
+      expected: [['ab'], ['Ac'], ['bc']]
+    - sql: INSERT INTO cw5.c VALUES ('AB')
+      error: 1062
+    - sql: SELECT id FROM cw5.p FORCE INDEX (kp) WHERE v = 'ABC'
+      expected: [['1']]
+    - sql: SELECT id FROM cw5.p FORCE INDEX (kp) WHERE v LIKE 'ab%' ORDER BY id
+      expected: [['1'], ['2']]
+    - sql: SELECT id FROM cw5.p FORCE INDEX (kd) ORDER BY v DESC
+      expected: [['4'], ['2'], ['1'], ['3']]
+    - sql: SELECT n FROM cw5.m FORCE INDEX (PRIMARY) WHERE a = 1 AND v = 'X'
+      expected: [['10']]
+    - sql: SELECT v FROM cw5.m FORCE INDEX (PRIMARY) WHERE a = 1 ORDER BY v
+      expected: [['x'], ['Y']]
+    # Through the secondary index, the row is fetched by its weight-encoded PK.
+    - sql: SELECT a, v FROM cw5.m FORCE INDEX (kn) WHERE n >= 11 ORDER BY n
+      expected: [['1', 'Y'], ['2', 'x']]
+  teardown:
+    - DROP DATABASE IF EXISTS cw5
+
+- name: A key whose weights pass the engine's key limit is refused at CREATE
+  setup:
+    - DROP DATABASE IF EXISTS cw6
+    - CREATE DATABASE cw6
+  steps:
+    # ByteCaskDB's own limit (InnoDB takes this table): three levels of up
+    # to 16 bytes a character make each 768-character key 36,864 bytes, and
+    # a secondary entry carries the PK's too.
+    - sql: CREATE TABLE cw6.t (a VARCHAR(768) CHARACTER SET utf8mb4 COLLATE utf8mb4_uca1400_as_cs NOT NULL PRIMARY KEY, b VARCHAR(768) CHARACTER SET utf8mb4 COLLATE utf8mb4_uca1400_as_cs, KEY kb (b)) ENGINE=bytecaskdb
+      error: 1071
+    - sql: CREATE TABLE cw6.ok (a VARCHAR(768) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL PRIMARY KEY, b VARCHAR(768) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci, KEY kb (b)) ENGINE=bytecaskdb
+    - sql: INSERT INTO cw6.ok VALUES (REPEAT('a', 768), REPEAT('B', 768))
+    - sql: SELECT LENGTH(a) FROM cw6.ok FORCE INDEX (kb) WHERE b = REPEAT('b', 768)
+      expected: [['768']]
+  teardown:
+    - DROP DATABASE IF EXISTS cw6

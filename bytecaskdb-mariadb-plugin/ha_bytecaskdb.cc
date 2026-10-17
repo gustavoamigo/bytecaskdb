@@ -116,6 +116,15 @@ int ha_bytecaskdb::create(const char *name, TABLE *table_arg,
     return HA_ERR_TABLE_EXIST;
   }
 
+  // Collation weights can make a stored key longer than the key_copy()
+  // bytes the server limited it by.
+  if (const auto longest =
+          max_stored_key_bytes(table_arg, make_table_codec(table_arg, kKeyFormatCurrent));
+      longest > kMaxStoredKeyBytes) {
+    my_error(ER_TOO_LONG_KEY, MYF(0), static_cast<int>(kMaxStoredKeyBytes));
+    return HA_WRONG_CREATE_OPTION;
+  }
+
   // Allocate a new table_id.
   uint32_t tid = catalog_alloc_table_id(g_db);
   if (tid == 0) {
@@ -231,6 +240,16 @@ int ha_bytecaskdb::open(const char *name, int /*mode*/,
   if (catalog_copy_meta(table_id_, meta)) {
     schema_version_ = static_cast<uint16_t>(meta.schema_version);
     key_format = meta.key_format;
+    // A format newer than this build sizes its keys in ways this build
+    // cannot see: read as an older one, every offset into a stored key
+    // would be wrong. Refuse the table rather than misread it.
+    if (key_format > kKeyFormatCurrent) {
+      sql_print_error("ByteCaskDB: table %s has key format %u; this build "
+                      "reads formats up to %u",
+                      name, static_cast<unsigned>(key_format),
+                      static_cast<unsigned>(kKeyFormatCurrent));
+      return HA_ERR_INCOMPATIBLE_DEFINITION;
+    }
     indexes_ = std::move(meta.indexes);
   } else {
     indexes_.clear();
@@ -238,14 +257,11 @@ int ha_bytecaskdb::open(const char *name, int /*mode*/,
   // Before anything below encodes or decodes a key.
   codec_ = make_table_codec(table, key_format);
 
-  // ref_length: 5-byte prefix (1 ns + 4 tid) + PK key length (or 8-byte
+  // ref_length: 5-byte prefix (1 ns + 4 tid) + the stored PK (or 8-byte
   // synthetic rowid for PK-less tables).
-  const uint pk = table->s->primary_key;
-  if (pk == MAX_KEY) {
-    ref_length = 5 + 8;
+  ref_length = 5 + pk_suffix_length(table, codec_);
+  if (table->s->primary_key == MAX_KEY) {
     seed_rowid_counter_if_needed();
-  } else {
-    ref_length = 5 + table->key_info[pk].key_length;
   }
   if (table->found_next_number_field) {
     seed_autoinc_counter_if_needed();
@@ -294,8 +310,7 @@ void ha_bytecaskdb::seed_autoinc_counter_if_needed() const {
 
   // The part's slot in a stored key: every slot ahead of it is fixed-width.
   std::size_t offset = on_pk ? 5 : 7;
-  for (uint i = 0; i < part; ++i) { offset += plan.parts[i].store_length; }
-  const KeyPlan part_plan{{kp}, plan.varlen_length_last};
+  for (uint i = 0; i < part; ++i) { offset += plan.parts[i].stored_length; }
 
   uint64_t hw = 0;
   std::vector<uint8_t> slot(kp.store_length);
@@ -303,7 +318,8 @@ void ha_bytecaskdb::seed_autoinc_counter_if_needed() const {
   auto take = [&](const uint8_t *key, std::size_t len) {
     if (len < offset + kp.store_length) { return; }
     slot.assign(key + offset, key + offset + kp.store_length);
-    undo_mem_comparable(slot.data(), part_plan, kp.store_length);
+    // The counter's column is an integer: never a part that cannot restore.
+    if (!undo_fixed_width_part(slot.data(), kp)) { return; }
     const uint null_bytes = kp.store_length - kp.length;
     if (null_bytes > 0 && slot[0] != 0) { return; }  // NULL
     std::memcpy(scratch.data() + kp.record_offset, slot.data() + null_bytes,
@@ -425,7 +441,7 @@ int ha_bytecaskdb::delete_table(const char *name) {
   auto upper = table_id_upper_bound(tid.value());
   auto cat_key = table_meta_key(name);
 
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{kPluginSizeLimits};
 
   // Delete all primary key data [0x02 | table_id].
   plan.del_range(as_view(lower), as_view(upper));
@@ -463,7 +479,7 @@ int ha_bytecaskdb::delete_all_rows() {
   auto lower = table_id_prefix(table_id_);
   auto upper = table_id_upper_bound(table_id_);
 
-  bytecask::WritePlan plan;
+  bytecask::WritePlan plan{kPluginSizeLimits};
   plan.del_range(as_view(lower), as_view(upper));
 
   for (const auto &index : indexes_) {
@@ -608,7 +624,10 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   }
   if (defer_dup && !txn->in_deferred_insert()) {
     txn->begin_deferred_insert(
-        this, [this](const std::vector<uint8_t> &pk) { return report_dup_pk(pk); });
+        this, [this](const std::vector<uint8_t> &pk,
+                     const std::vector<uint8_t> &row) {
+          return report_dup_pk(pk, row);
+        });
   }
 
   // Check unique secondary index constraints.
@@ -764,19 +783,21 @@ int ha_bytecaskdb::bulk_copy_write_row(const uchar *buf) {
 // report_dup_pk() — deferred-INSERT duplicate, reported at commit time.
 //
 // The statement has already failed, so record[0] is free to receive the
-// duplicate's key columns; print_keydup_error renders them exactly as the
-// eager write_row path would have (code ER_DUP_ENTRY, "Duplicate entry
-// '...' for key 'PRIMARY'").
+// row the INSERT tried to write; print_keydup_error renders its key columns
+// exactly as the eager write_row path would have (code ER_DUP_ENTRY,
+// "Duplicate entry '...' for key 'PRIMARY'"). The row, not the key: a key
+// stored as collation weights cannot be turned back into the value.
 // ---------------------------------------------------------------------------
 
-bool ha_bytecaskdb::report_dup_pk(const std::vector<uint8_t> &pk) {
+bool ha_bytecaskdb::report_dup_pk(const std::vector<uint8_t> &pk,
+                                  [[maybe_unused]] const std::vector<uint8_t> &row) {
   if (!key_belongs_to_table(pk.data(), pk.size(), table_id_)) {
     return false;  // another table's key: let the caller report generically
   }
   const uint pk_idx = table->s->primary_key;
   errkey = saved_errkey_ = pk_idx;
 #ifndef PLUGIN_TESTING
-  decode_pk(table, codec_, pk.data(), pk.size(), table->record[0], decode_pk_scratch_);
+  decode_row(codec_.row, row.data(), row.size(), table->record[0]);
   print_keydup_error(table, &table->key_info[pk_idx], MYF(0));
 #else
   my_error(ER_DUP_ENTRY, MYF(0), "", "PRIMARY");
@@ -868,7 +889,7 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
             if (f->is_null_in_record(new_data)) { has_null = true; break; }
           }
           if (!has_null) {
-            const uint sec_key_field_len = ki.key_length;
+            const uint sec_key_field_len = codec_.keys[index.index_id].stored_length;
             auto &unique_prefix = encode_unique_sec_key_buf_;
             encode_unique_sec_key_into(unique_prefix, table, codec_, new_data, table_id_,
                                         index.index_id, index.index_id);
@@ -1163,11 +1184,11 @@ bool key_has_prefix(const MariaDBTxn::MergeIterator &it,
 std::size_t ha_bytecaskdb::build_search_key(uint idx, const uchar *key,
                                             uint prefix_len, bool pad_high) {
   const bool on_pk = (idx == table->s->primary_key);
-  const KEY &key_info = table->key_info[idx];
-  const uint key_len = key_info.key_length;
+  const KeyPlan &plan = codec_.keys[idx];
+  const uint stored_len = plan.stored_length;
   const std::size_t ns_len = on_pk ? 5 : 7;
 
-  search_key_buf_.assign(ns_len + key_len, 0);
+  search_key_buf_.assign(ns_len + stored_len, 0);
   uint8_t *p = search_key_buf_.data();
   p[0] = on_pk ? kNsRow : kNsIndex;
   write_table_id_prefix(p + 1, table_id_);
@@ -1176,32 +1197,22 @@ std::size_t ha_bytecaskdb::build_search_key(uint idx, const uchar *key,
     p[6] = static_cast<uint8_t>( idx       & 0xFF);
   }
 
+  // Only the supplied parts are encoded; the unsupplied ones stay zero, a
+  // low bound below every stored key sharing the prefix.
+  search_key_src_.assign(key, key + prefix_len);
   uint8_t *kp = p + ns_len;
-  std::memcpy(kp, key, prefix_len);
-
-  // The fix-ups walk every key part; the zero-filled unsupplied parts read
-  // as empty, and are reset to zeros below. The transform is limited to the
-  // supplied prefix (whole parts), so only those bytes are rewritten.
-  if (on_pk) {
-    normalize_padspace_pk(kp, codec_.keys[idx]);
-  } else {
-    fix_varchar_key_encoding(kp, codec_.keys[idx]);
-  }
-  make_mem_comparable(kp, codec_.keys[idx], prefix_len);
-  // The fix-ups pad an unsupplied VARCHAR part as a stored key would (with
-  // spaces under PAD SPACE); a low bound needs zero bytes there, below every
-  // stored key sharing the prefix.
-  std::memset(kp + prefix_len, 0, key_len - prefix_len);
+  const uint stored_prefix =
+      encode_key_parts(kp, search_key_src_.data(), plan, prefix_len, on_pk);
 
   if (pad_high) {
-    std::memset(kp + prefix_len, 0xFF, key_len - prefix_len);
+    std::memset(kp + stored_prefix, 0xFF, stored_len - stored_prefix);
     // Sort after every stored key carrying the prefix, including the key
     // itself when the whole key was supplied: a secondary entry continues
     // with its PK suffix, a PK key with nothing, so extend past both.
-    const std::size_t tail = on_pk ? 1 : pk_suffix_length(table);
-    search_key_buf_.resize(ns_len + key_len + tail, 0xFF);
+    const std::size_t tail = on_pk ? 1 : pk_suffix_length(table, codec_);
+    search_key_buf_.resize(ns_len + stored_len + tail, 0xFF);
   }
-  return ns_len + prefix_len;
+  return ns_len + stored_prefix;
 }
 
 int ha_bytecaskdb::index_read_map(uchar *buf, const uchar *key,
@@ -1412,8 +1423,7 @@ int ha_bytecaskdb::index_read_current(uchar *buf) {
   } else {
     // Secondary index access: two-step lookup
     // 1. Extract PK from secondary index key
-    const KEY &key_info = table->key_info[active_index];
-    uint sec_key_len = key_info.key_length;
+    const uint sec_key_len = codec_.keys[active_index].stored_length;
     std::size_t pk_len = 0;
     const uint8_t *pk_ptr = extract_pk_from_sec_key(
         merge_index_->key_data(), merge_index_->key_len(),
