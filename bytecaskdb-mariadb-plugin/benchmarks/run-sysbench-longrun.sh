@@ -106,6 +106,14 @@ for arg in "$@"; do
   esac
 done
 
+# A malformed number reaches sysbench, which misreads it rather than refusing
+# it: --table-size==N ran the whole matrix with ids that overflow INTEGER.
+require_count() {  # option, value: a positive integer
+  [[ "$2" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: $1 must be a positive integer, got '$2'" >&2; exit 1; }
+}
+require_count --table-size "$TABLE_SIZE"
+require_count --threads "$THREADS"
+
 # Accepts N, Ns, Nm, Nh, or Nd and echoes whole seconds.
 to_seconds() {
   local raw="$1"

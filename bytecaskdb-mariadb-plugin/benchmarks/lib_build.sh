@@ -26,8 +26,8 @@ build_bytecask_lib() {  # tree root, key directory
   local root="$1" kd="$2" lib="$1/build/linux/$(uname -m)/release/libbytecask.a"
   echo "=== Building libbytecask.a from scratch: keydir=$kd, for $(lscpu | sed -n 's/^Model name: *//p') ==="
   rm -rf "$root/build" "$root/.xmake" || return 1
-  (cd "$root" && BYTECASK_KEYDIR="$kd" xmake f -c -y -m release --cxflags=-g &&
-     BYTECASK_KEYDIR="$kd" xmake build -y bytecask) || return 1
+  (cd "$root" && BYTECASK_KEYDIR="$kd" xmake f -P . -c -y -m release --cxflags=-g &&
+     BYTECASK_KEYDIR="$kd" xmake build -P . -y bytecask) || return 1
   local is_buffered=no
   strings "$lib" | grep -q 'buffered key directory' && is_buffered=yes
   if [[ "$kd" == buffered && "$is_buffered" == no ]] ||
