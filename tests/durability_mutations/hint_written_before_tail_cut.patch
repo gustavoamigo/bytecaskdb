@@ -1,0 +1,29 @@
+open writes a hint-less file's hint before it cuts the torn tail, so a cut
+that fails, or a crash between the two, leaves a hint over a file that keeps
+the tail, and no later open cuts it. Reverts #476.
+Guarded-by: "DB recovery: open fails when the cut of a torn tail cannot be synced*"
+
+diff --git a/bytecaskdb/db_recovery.cpp b/bytecaskdb/db_recovery.cpp
+index 87f0600..fe09493 100644
+--- a/bytecaskdb/db_recovery.cpp
++++ b/bytecaskdb/db_recovery.cpp
+@@ -243,13 +243,13 @@ auto DB::recovery_prepare_files(EngineState &s)
+       // cuts its file, so a hint over a file whose cut failed, or that a
+       // crash interrupted, would keep the tail for good.
+       auto cut = false;
+-      (void)flush_hints_for(data_file, dir_, [&](Offset end) {
+-        recovery_check_tail(*data_file, end, data_paths);
+-        if (end < std::filesystem::file_size(p)) {
+-          truncate_durably(p, end);
+-          cut = true;
+-        }
++      const auto end = flush_hints_for(data_file, dir_, [&](Offset e) {
++        recovery_check_tail(*data_file, e, data_paths);
+       });
++      if (end.value() < std::filesystem::file_size(p)) {
++        truncate_durably(p, *end);
++        cut = true;
++      }
+       if (cut) {
+         // Same file_id as the open above, deliberately. Under the buffer
+         // pool that open's hint scan may have admitted frames under this id,

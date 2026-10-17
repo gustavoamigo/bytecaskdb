@@ -1577,6 +1577,8 @@ TEST_CASE("DB recovery: a crash while open writes a hint leaves no hint behind "
 // Open cuts a torn tail with truncate_durably, whose fdatasync persists the
 // new length. The first io_rewrite_sync is the hint-less file's rewrite, the
 // second the cut's; failing the second fails the open only while it is made.
+// The cut comes before the hint (#476): a hint written first would outlive a
+// failed cut, and every later open, trusting it, would keep the tail.
 TEST_CASE("DB recovery: open fails when the cut of a torn tail cannot be "
           "synced, and the next open recovers",
           "[bytecask][recovery][corruption]") {
@@ -1592,15 +1594,21 @@ TEST_CASE("DB recovery: open fails when the cut of a torn tail cannot be "
   const auto files = data_files_by_sequence(dir);
   REQUIRE(files.size() == 3);
   drop_hint(files[2]);
+  const auto committed_end = std::filesystem::file_size(files[2]) - kEntry;
   tear_last_entry(files[2]);
+  auto hint = files[2];
+  hint.replace_extension(".hint");
 
   {
     bytecask::testing::ScopedFaultInjector fi{"io_rewrite_sync"};
     fi.inj.fail_on_nth_match = 2;
     REQUIRE_THROWS_AS(bytecask::DB::open(dir, opts), std::system_error);
   }
+  CHECK_FALSE(std::filesystem::exists(hint));
 
   auto db = bytecask::DB::open(dir, opts);
+  CHECK(std::filesystem::exists(hint));
+  CHECK(std::filesystem::file_size(files[2]) == committed_end);
   for (int i = 0; i < 13; ++i) {
     INFO("key " << i);
     CHECK(db.contains_key({}, to_bytes(std::format("k{:x}", i))));
