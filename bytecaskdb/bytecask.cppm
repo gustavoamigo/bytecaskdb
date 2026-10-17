@@ -1369,18 +1369,19 @@ private:
   void wait_for_hint_backlog();
   // Queues hint generation for a sealed file on the background worker.
   void dispatch_hint(std::shared_ptr<DataFile> file);
-  // Decides, before a hint is renamed into place, whether the file may end
-  // at `end`, the end of its last committed record. Throws to refuse it.
-  using TailCheck = std::function<void(Offset end)>;
+  // Runs after the scan and before the hint is written: rules on whether the
+  // file may end at `end`, the end of its last committed record, and cuts it
+  // there. Throws to refuse it, or when the cut fails.
+  using TailCut = std::function<void(Offset end)>;
   // Writes hint file via temp-then-rename. Batch-aware; idempotent if .hint
   // exists. Returns the offset past the last committed entry, or nullopt
-  // when the hint already existed and nothing was scanned. Without a check,
+  // when the hint already existed and nothing was scanned. Without a cut,
   // an entry that fails its CRC throws. With one, the scan stops there as it
-  // does at a zeroed header, and the check rules on what lies past it; a
-  // refusal leaves no hint behind.
+  // does at a zeroed header, and the cut rules on what lies past it; a throw
+  // from it leaves no hint behind.
   static auto flush_hints_for(const std::shared_ptr<DataFile> &file,
                               const std::filesystem::path &dir,
-                              const TailCheck &check = {})
+                              const TailCut &cut = {})
       -> std::optional<Offset>;
   // recovery_prepare_files' check on a hint-less file, which is where a
   // crash can leave a torn tail. See docs/bytecask_design.md, *Recovering a

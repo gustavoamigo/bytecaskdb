@@ -2685,6 +2685,7 @@ A site whose break nothing has to catch says why instead.
 | `recovery_check_tail`: a first header with an unknown type and only zeros after its sequence field has no sequence, so a first write that landed only part of its sequence is cut, while an unknown type before intact records is still refused | `DB recovery: a hint-less file's tail is truncated only in the newest file` | `torn_first_sequence_trusted` (chaos) | #471 |
 | `recovery_check_tail`: a tail is cut in one file per open | `DB recovery: a hint-less file's tail is truncated only in the newest file` | `two_torn_files_both_cut` | #303 |
 | `truncate_durably`: the cut's new length is synced | `DB recovery: open fails when the cut of a torn tail cannot be synced, …` | `open_truncate_not_synced` | — |
+| `recovery_prepare_files`: a hint-less file is cut, and the cut synced, before its hint is written | `DB recovery: open fails when the cut of a torn tail cannot be synced, …` | `hint_written_before_tail_cut` | #476 |
 | `DataFileIterator`: an entry whose size runs past the file ends the sweep | `resume() does not trust an entry size that runs past the file` | `scan_trusts_entry_size` | #36, ed3ad5df |
 | `recovery_undo_interrupted_vacuum`: only a compacted copy of the other file is removed | `recovery refuses two different writes under one sequence` | `interrupted_vacuum_any_pair` | #137 |
 | recovery workers hand their errors to the open instead of terminating | `DB parallel recovery: an unrebuildable hint throws instead of …` | `recovery_worker_error_terminates` | BC-157 |

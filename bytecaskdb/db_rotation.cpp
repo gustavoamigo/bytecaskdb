@@ -152,7 +152,7 @@ auto DB::open_hint_or_skip(const std::shared_ptr<DataFile> &data_file,
 
 auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
                          const std::filesystem::path &dir,
-                         const TailCheck &check) -> std::optional<Offset> {
+                         const TailCut &cut) -> std::optional<Offset> {
   const auto stem = file->path().stem().string();
   const auto hint_path = dir / (stem + ".hint");
   const auto tmp_path = dir / (stem + ".hint.tmp");
@@ -185,7 +185,7 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
   std::vector<std::byte> key_arena;
 
   auto committed =
-      scan_committed(*file, 0, check ? OnDamage::Stop : OnDamage::Throw);
+      scan_committed(*file, 0, cut ? OnDamage::Stop : OnDamage::Throw);
   auto it = committed.begin();
   for (; it != std::default_sentinel; ++it) {
     const auto &[entry, entry_off] = *it;
@@ -220,9 +220,9 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
     }
   }
 
-  if (check) {
+  if (cut) {
     try {
-      check(it.committed_offset());
+      cut(it.committed_offset());
     } catch (...) {
       std::error_code ec;
       std::filesystem::remove(tmp_path, ec);
