@@ -442,7 +442,7 @@ public:
       const auto at = src_->units[i];
       const auto len = narrow<std::size_t>(src_->units[i + 1] - at);
       auto &packed = thread_packed_frame();
-      resize_exact(packed, len);
+      packed.resize(len);
       read_unit(packed, at);
       const auto size = ZSTD_getFrameContentSize(packed.data(), len);
       if (!valid_frame_size(size))

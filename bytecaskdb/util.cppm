@@ -18,7 +18,6 @@ module;
 #include <system_error>
 #include <unistd.h>
 #include <utility>
-#include <vector>
 
 export module bytecask.util;
 
@@ -62,13 +61,21 @@ export inline constexpr std::size_t kMinThreadScratchBytes = std::size_t{256}
                                                               << 10;
 
 // One call's use of a per-thread scratch buffer: when the use ends, a
-// buffer left past `limit` is freed. Buf needs capacity() and a noexcept
-// move.
+// buffer whose capacity is past `limit` is shrunk to its contents if they
+// are within it, since growth can overshoot a record that fits, and freed
+// otherwise. Buf needs capacity() and a noexcept move.
 export template <typename Buf> class ScratchUse {
 public:
   ScratchUse(Buf &buf, std::size_t limit) noexcept : buf_{buf}, limit_{limit} {}
   ~ScratchUse() {
-    if (buf_.capacity() > limit_) buf_ = Buf{};
+    if (buf_.capacity() <= limit_) return;
+    if constexpr (requires { buf_.shrink_to_fit(); }) {
+      if (buf_.size() <= limit_) {
+        buf_.shrink_to_fit();
+        if (buf_.capacity() <= limit_) return;
+      }
+    }
+    buf_ = Buf{};
   }
   ScratchUse(const ScratchUse &) = delete;
   auto operator=(const ScratchUse &) -> ScratchUse & = delete;
@@ -81,14 +88,6 @@ private:
 };
 export template <typename Buf>
 ScratchUse(Buf &, std::size_t) -> ScratchUse<Buf>;
-
-// Resizes buf to n, and when it must grow, to a capacity of exactly n:
-// resize alone may double the capacity (libc++ does), which would carry a
-// scratch buffer past its limit for a record within it.
-export inline void resize_exact(std::vector<std::byte> &buf, std::size_t n) {
-  if (n > buf.capacity()) buf.reserve(n);
-  buf.resize(n);
-}
 
 // Reads from offset until dst is full or the file ends, and returns how many
 // bytes it read. Throws std::system_error when pread fails.

@@ -304,7 +304,7 @@ auto fetch_record(const std::filesystem::path &path, Offset offset,
     -> DataEntryView {
   const auto first = first_read_length(offset, value_size_hint, end);
   if (first < kHeaderSize) throw_header_past_end(path, offset, end);
-  resize_exact(io_buf, first);
+  io_buf.resize(first);
   const std::size_t got = fetch(offset, first, io_buf.data());
   if (got < kHeaderSize) throw_short_read(offset, kHeaderSize, got);
   const auto hdr = bytecask::read_header(
@@ -313,7 +313,7 @@ auto fetch_record(const std::filesystem::path &path, Offset offset,
   if (offset + total > end) throw_record_past_end(path, offset, hdr, end);
   if (total > got) {
     if (got < first) throw_short_read(offset, total, got);
-    resize_exact(io_buf, total);
+    io_buf.resize(total);
     const std::size_t rest =
         fetch(offset + first, total - first, io_buf.data() + first);
     if (rest < total - first) throw_short_read(offset, total, first + rest);
@@ -1062,7 +1062,7 @@ private:
           .value = body.subspan(key_size, value_size),
       };
     }
-    resize_exact(io_buf, total);
+    io_buf.resize(total);
     pread_exact(ops_.fd_, offset, io_buf);
     std::span<const std::byte> raw = io_buf;
     const auto header = parse_header_and_verify(raw);
@@ -1229,7 +1229,7 @@ private:
                                               std::vector<std::byte> &io_buf) const
       -> DataEntryView {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
-    resize_exact(io_buf, total);
+    io_buf.resize(total);
     fetch(offset, total, io_buf.data());
     const auto header = parse_header_and_verify(io_buf);
     auto body = std::span<const std::byte>{io_buf}.subspan(kHeaderSize);
@@ -1349,7 +1349,7 @@ private:
                                               std::vector<std::byte> &io_buf) const
       -> DataEntryView {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
-    resize_exact(io_buf, total);
+    io_buf.resize(total);
     pread_exact(fd_, offset, io_buf);
     const auto header = parse_header_and_verify(io_buf);
     auto body = std::span<const std::byte>{io_buf}.subspan(kHeaderSize);
@@ -1648,7 +1648,7 @@ private:
       Offset offset, std::uint16_t key_size, std::uint32_t value_size,
       std::vector<std::byte> &io_buf, Source source) const -> DataEntryView {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
-    resize_exact(io_buf, total);
+    io_buf.resize(total);
     fetch(offset, total, io_buf.data(), source);
     const auto header = parse_header_and_verify(io_buf);
     auto body = std::span<const std::byte>{io_buf}.subspan(kHeaderSize);
