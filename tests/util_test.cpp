@@ -77,18 +77,3 @@ TEST_CASE("ScratchUse: keeps a buffer at its limit", "[util]") {
   }
   CHECK(buf.capacity() == kLimit);
 }
-
-// Growth can carry the capacity past the limit for contents within it: the
-// buffer is shrunk to them, not freed.
-TEST_CASE("ScratchUse: shrinks a buffer whose growth overshot its limit",
-          "[util]") {
-  constexpr std::size_t kLimit = 64 * 1024;
-  std::vector<std::byte> buf;
-  {
-    bytecask::ScratchUse use{buf, kLimit};
-    use.buf().reserve(kLimit * 2);
-    use.buf().resize(kLimit - 1);
-  }
-  CHECK(buf.capacity() >= kLimit - 1);
-  CHECK(buf.capacity() <= kLimit);
-}

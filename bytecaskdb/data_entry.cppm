@@ -83,6 +83,25 @@ export void write_header_and_crc(
   w.put(crc.finalize());
 }
 
+// A value above this is not copied into a write buffer: it is written from
+// the caller's bytes, through an iovec of its own.
+export inline constexpr std::size_t kInlineValueBytes = 4096;
+
+// The bytes an entry takes on disk.
+export constexpr auto record_bytes(const DataEntryView &e) noexcept
+    -> std::size_t {
+  return kHeaderSize + e.key.size() + e.value.size() + kCrcSize;
+}
+
+// The bytes of an entry a write buffer holds: all of record_bytes but a value
+// above kInlineValueBytes. Equal to record_bytes exactly when the value is
+// copied too.
+export constexpr auto inline_bytes(const DataEntryView &e) noexcept
+    -> std::size_t {
+  return e.value.size() <= kInlineValueBytes ? record_bytes(e)
+                                             : record_bytes(e) - e.value.size();
+}
+
 // Serialize a single entry into a contiguous byte buffer.
 // Used by tests and any path that needs a complete in-memory entry.
 export auto serialize_entry(std::uint64_t sequence, EntryType entry_type,

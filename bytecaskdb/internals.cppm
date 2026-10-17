@@ -375,7 +375,7 @@ export struct KeyDirCtx {
   bool verify{true};
   // The DB's Options::thread_scratch_bytes: what the thread's record buffer
   // may keep after the call.
-  std::size_t scratch_bytes{kDefaultThreadScratchBytes};
+  std::size_t scratch_bytes;
 
   [[nodiscard]] auto file(std::uint32_t id) const -> const DataFile * {
     const auto *f = files ? files->get(id) : writer_files->get(id);
@@ -956,7 +956,10 @@ export struct EngineState {
   // holds no files or key directory (see closed_copy).
   bool closed{false};
   // Options::thread_scratch_bytes, for the key directory's reads.
-  std::size_t scratch_bytes{kDefaultThreadScratchBytes};
+  std::size_t scratch_bytes;
+
+  explicit EngineState(std::size_t scratch_bytes)
+      : scratch_bytes{scratch_bytes} {}
   // Every ChangeMarker the data files hold, by since_sequence: 16 bytes per
   // promotion. Immutable; a promotion or an ingested marker publishes a new
   // list. Null when there is none.
@@ -1009,7 +1012,7 @@ export struct EngineState {
   // degraded reason, without its files or key directory, so the DB stops
   // holding them. Snapshots and iterators keep the versions they hold.
   [[nodiscard]] auto closed_copy() const -> std::shared_ptr<EngineState> {
-    auto s = std::make_shared<EngineState>();
+    auto s = std::make_shared<EngineState>(scratch_bytes);
     s->active_file_id = active_file_id;
     s->next_file_id = next_file_id;
     s->next_seq = next_seq;

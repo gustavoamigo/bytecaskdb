@@ -7794,7 +7794,7 @@ auto kde(std::uint64_t seq, std::uint64_t off, std::uint32_t fid,
 auto make_state(
     std::initializer_list<std::pair<std::string, bytecask::KeyDirEntry>> entries)
     -> std::shared_ptr<bytecask::EngineState> {
-  auto s = std::make_shared<bytecask::EngineState>();
+  auto s = std::make_shared<bytecask::EngineState>(std::size_t{1} << 20);
   s->active_file_id = 1;
   s->next_file_id = 2;
   s->next_seq = 100;
@@ -12939,7 +12939,7 @@ TEST_CASE("#384: thread scratch gives back a large record after close",
   bytecask::Options opts{.max_key_bytes = bytecask::kMaxKeySize,
                          .io_backend = io_backend};
   // A 3 MiB value is below the pool's oversize limit, so a cold read of it
-  // fills through the pool's scratch, in runs of at most the limit.
+  // fills through the pool's scratch, which the read then gives back.
   opts.buffer_pool.capacity_bytes = 64 * 1024 * 1024;
   constexpr std::size_t kValueBytes = 3 * 1024 * 1024;
   REQUIRE(kValueBytes > opts.thread_scratch_bytes);

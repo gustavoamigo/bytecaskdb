@@ -51,31 +51,20 @@ export [[noreturn]] inline void panic(std::string_view msg) {
 // A thread's scratch keeps its memory between calls, so a hot path does not
 // allocate, but not past the limit of the DB the call is on
 // (Options::thread_scratch_bytes): a thread can outlive every DB, and one
-// large record must not stay with it (#384).
-export inline constexpr std::size_t kDefaultThreadScratchBytes =
-    std::size_t{1} << 20;
-// At least the engine's own largest record buffers: a compressed hint frame
+// large record must not stay with it (#384). The lowest limit a DB can set
+// is above the engine's own largest record buffers: a compressed hint frame
 // (~148 KiB) and a commit entry with a maximal key and an inline value
 // (~70 KiB), each pinned by a static_assert where it is built.
 export inline constexpr std::size_t kMinThreadScratchBytes = std::size_t{256}
                                                               << 10;
 
-// One call's use of a per-thread scratch buffer: when the use ends, a
-// buffer whose capacity is past `limit` is shrunk to its contents if they
-// are within it, since growth can overshoot a record that fits, and freed
-// otherwise. Buf needs capacity() and a noexcept move.
+// One call's use of a per-thread scratch buffer: when the use ends, a buffer
+// left past `limit` is freed. Buf needs capacity() and a noexcept move.
 export template <typename Buf> class ScratchUse {
 public:
   ScratchUse(Buf &buf, std::size_t limit) noexcept : buf_{buf}, limit_{limit} {}
   ~ScratchUse() {
-    if (buf_.capacity() <= limit_) return;
-    if constexpr (requires { buf_.shrink_to_fit(); }) {
-      if (buf_.size() <= limit_) {
-        buf_.shrink_to_fit();
-        if (buf_.capacity() <= limit_) return;
-      }
-    }
-    buf_ = Buf{};
+    if (buf_.capacity() > limit_) buf_ = Buf{};
   }
   ScratchUse(const ScratchUse &) = delete;
   auto operator=(const ScratchUse &) -> ScratchUse & = delete;

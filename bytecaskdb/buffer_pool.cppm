@@ -19,7 +19,6 @@ module;
 #include <format>
 #include <mutex>
 #include <new>
-#include <optional>
 #include <span>
 #include <stdexcept>
 #include <system_error>
@@ -229,12 +228,11 @@ private:
 export class BufferPool {
 public:
   // scratch_bytes is the DB's Options::thread_scratch_bytes: the most a
-  // thread's fill buffer keeps after a read, and so the longest fill run.
-  explicit BufferPool(const BufferPoolOptions &opts,
-                      std::size_t scratch_bytes = kDefaultThreadScratchBytes)
+  // thread's fill buffer keeps after a read.
+  BufferPool(const BufferPoolOptions &opts, std::size_t scratch_bytes)
       : direct_io_{opts.direct_io},
         oversize_limit_{opts.capacity_bytes / kOversizeDivisor},
-        run_frames_{std::max<std::size_t>(scratch_bytes / kPoolFrameBytes, 1)} {
+        scratch_bytes_{scratch_bytes} {
     // The table is a power of two at most 70 % full; the arena and the pin
     // words take what is left of the budget. Frame count is derived from the
     // budget, never the budget from the frame count — the bound is the
@@ -457,6 +455,8 @@ private:
     ~AlignedScratch() { std::free(p_); }
     AlignedScratch(const AlignedScratch &) = delete;
     auto operator=(const AlignedScratch &) -> AlignedScratch & = delete;
+    AlignedScratch(AlignedScratch &&o) noexcept
+        : p_{std::exchange(o.p_, nullptr)}, cap_{std::exchange(o.cap_, 0)} {}
     auto operator=(AlignedScratch &&o) noexcept -> AlignedScratch & {
       std::swap(p_, o.p_);
       std::swap(cap_, o.cap_);
@@ -487,7 +487,8 @@ private:
   static auto fill_scratch() noexcept -> AlignedScratch & {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
-    // TLS: scratch — one fill's bytes, a run of at most run_frames_ (#384).
+    // TLS: scratch — one fill's bytes; freed past the DB's
+    // thread_scratch_bytes (#384).
     thread_local AlignedScratch scratch;
 #pragma clang diagnostic pop
     return scratch;
@@ -709,7 +710,7 @@ private:
   PoolCounters counters_;
   bool direct_io_;
   std::size_t oversize_limit_;
-  std::size_t run_frames_;
+  std::size_t scratch_bytes_;
   std::size_t frame_count_{0};
   std::size_t table_mask_{0};
   std::vector<std::byte> arena_;
@@ -761,15 +762,10 @@ auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
   const auto first = offset / kPoolFrameBytes;
   const auto last = (offset + len - 1) / kPoolFrameBytes;
 
-  // The fill buffer, taken at the first miss so a hit never touches
-  // thread-local storage, and held for the whole read.
-  std::optional<ScratchUse<AlignedScratch>> scratch;
-
   // Reads frames [a, b] in one I/O, copies their overlap with the request
   // into dst, and admits each whole frame. The caller's bytes come from the
   // read buffer, not from the frames: a frame admitted here can be evicted
-  // before we would copy out of it. At most run_frames_ frames, so the
-  // buffer stays within the DB's thread_scratch_bytes (#384).
+  // before we would copy out of it.
   const auto fill_run = [&](std::uint64_t a, std::uint64_t b) {
     const auto run_start = a * kPoolFrameBytes;
     const auto run_end =
@@ -783,9 +779,10 @@ auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
       avail = std::min(avail, from + got);
       return;
     }
-    if (!scratch) scratch.emplace(fill_scratch(), run_frames_ * kPoolFrameBytes);
+    // Taken on the miss path so a hit never touches thread-local storage.
+    ScratchUse scratch{fill_scratch(), scratch_bytes_};
     const auto run_len = static_cast<std::size_t>(run_end - run_start);
-    auto *buf = scratch->buf().ensure(align_up(run_len, kPoolFrameBytes));
+    auto *buf = scratch.buf().ensure(align_up(run_len, kPoolFrameBytes));
     auto got = run_len;
     if (file.direct < 0 || !pread_direct(file.direct, buf, run_len, run_start)) {
       got = pread_upto(file.buffered, run_start, {buf, run_len});
@@ -834,7 +831,6 @@ auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
       a = a / kBlockFrames * kBlockFrames;
       b = (b / kBlockFrames + 1) * kBlockFrames - 1;
     }
-    for (; b - a >= run_frames_; a += run_frames_) fill_run(a, a + run_frames_ - 1);
     fill_run(a, b);
   };
 
