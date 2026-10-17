@@ -42,6 +42,7 @@ typedef uint64_t ha_rows;
 #define HA_ERR_TABLE_DEF_CHANGED 1412
 #define HA_ERR_TABLE_EXIST    156
 #define HA_WRONG_CREATE_OPTION 140
+#define HA_ERR_INCOMPATIBLE_DEFINITION 190
 #define HA_ERR_NO_SUCH_TABLE  157
 
 // File lock constants.

@@ -65,7 +65,7 @@ struct KeyPlan {
   std::vector<KeyPartPlan> parts;
   // Primary key of a kKeyFormatValueOrderedPk table: a VARCHAR or BLOB part
   // keeps its slot, but its length moves behind the padded bytes, so the
-  // part sorts by value and still restores exactly.
+  // part sorts by value and 'a' and 'a\0' stay apart under NO PAD.
   bool varlen_length_last{false};
   // kKeyFormatValueOrderedPk, every key: a VARCHAR or BLOB part under a PAD
   // SPACE collation has its trailing spaces trimmed, and is padded, by whole
@@ -191,40 +191,27 @@ std::vector<uint8_t> encode_unique_sec_key(TABLE *table,
                                             uint32_t table_id, uint16_t index_id,
                                             uint active_index);
 
-// Removes the VARCHAR length prefix from packed secondary-index key bytes,
-// converting key_copy() output to the same format used by encode_sec_key().
-// Must be called on the key bytes starting immediately after the 7-byte prefix
-// (kNsIndex + table_id + index_id). Parts stored as weights are left alone.
-void fix_varchar_key_encoding(uint8_t *key_data, const KeyPlan &plan);
-
-// Normalizes VARCHAR key parts for PAD SPACE collations in PK encoding.
-// Strips trailing 0x20 bytes and updates the 2-byte LE length prefix so that
-// 'a' and 'a ' produce identical encoded keys. Parts stored as weights are
-// left alone.
-void normalize_padspace_pk(uint8_t *key_data, const KeyPlan &plan);
-
 // Encodes key_copy() bytes `src` — the first `src_len` bytes of a key, whole
 // parts — into their stored form at `dst`, which must hold
-// plan.stored_length bytes: the same transform encode_pk_into (`pk`) or
-// encode_sec_key_into applies. `src` is rewritten in place on the way.
+// plan.stored_length bytes, in one pass over the parts: the transform
+// encode_pk_into (`pk`) or encode_sec_key_into applies. A weights part is
+// written straight from its key_copy() slot (write_weights); every other
+// part is made mem-comparable in place in `src` — integers big-endian with
+// the sign flipped, floats IEEE-flipped, a VARCHAR or BLOB part padded per
+// its collation and, in the primary key, its length moved behind its bytes,
+// the null indicator flipped and a DESC part inverted, so stored keys sort
+// in the index's order as the server reads it — then copied. `dst` may be
+// `src` only for a plan without weights, whose parts keep their widths.
 // Returns the stored bytes those parts take, a search key's prefix length.
 uint encode_key_parts(uint8_t *dst, uint8_t *src, const KeyPlan &plan,
                       uint src_len, bool pk);
 
-// Transforms key_copy() output (native little-endian integers) into a
-// mem-comparable encoding (big-endian, sign-bit flipped for signed types).
-// Parts stored as weights are skipped: encode_key_parts writes them.
-// Operates in-place on the key_data starting immediately after any prefix
-// (5-byte for PK, 7-byte for secondary). Only affects integer field types;
-// VARCHARs and other types are left untouched, except that a plan with
-// varlen_length_last moves their length behind their bytes. A DESC part then has every
-// byte, null indicator included, inverted, so its stored keys sort in the
-// index's order — descending, NULLs last — as the server reads it.
-void make_mem_comparable(uint8_t *key_data, const KeyPlan &plan, uint key_len);
-
-// Reverses make_mem_comparable(): restores native little-endian format from
-// the mem-comparable encoding. Must be called before key_restore().
-void undo_mem_comparable(uint8_t *key_data, const KeyPlan &plan, uint key_len);
+// Restores one fixed-width part's stored bytes at `slot` (store_length of
+// them, null indicator included) to key_copy()'s native layout, in place.
+// Read by the AUTO_INCREMENT seed, which takes the counter's integer column
+// back from the largest key. False, and nothing changed, for a VARCHAR,
+// BLOB or weights part: those are not restorable.
+[[nodiscard]] bool undo_fixed_width_part(uint8_t *slot, const KeyPartPlan &kp);
 
 // Decodes the key parts of `sec_key` directly into `record` for the columns
 // covered by `plan`. Used to short-circuit the secondary→PK row fetch

@@ -112,9 +112,9 @@ Key encoding lives in `key_encoding.h/cc` (primary and secondary keys) and
 #### Mem-comparable key encoding
 
 MariaDB's `key_copy()` produces key bytes that are not always
-lexicographically sortable. The plugin applies a post-processing step
-(`make_mem_comparable`) that transforms the key into a byte sequence where
-`memcmp` ordering matches the column's logical ordering:
+lexicographically sortable. The plugin encodes it (`encode_key_parts`, one
+pass over the key's parts) into a byte sequence where `memcmp` ordering
+matches the column's logical ordering:
 
 - **Signed integers** (TINY, SHORT, INT24, LONG, LONGLONG): bytes are
   reversed from LE to BE, then the MSB is flipped (XOR 0x80) so negative
@@ -137,26 +137,30 @@ lexicographically sortable. The plugin applies a post-processing step
   Under PAD SPACE the weights are padded with the space's weight, so values
   equal up to trailing spaces make equal bytes; under NO PAD they are
   padded with zeros, and the length orders a value before a longer one
-  that extends it. `encode_key_parts` writes these slots after the
-  in-place transforms below have run on the other parts; offsets into a
-  stored key (the PK suffix of a secondary entry, `ref_length`, the
-  AUTO_INCREMENT seed's slot) count the stored width, `stored_length`, not
-  `key_length`. A part stored as weights cannot be restored: rows carry
+  that extends it. `encode_key_parts` writes such a slot straight from
+  `key_copy()`'s, and transforms every other part in place; since the
+  widths differ, `key_copy()` writes behind the stored slot, in the output
+  buffer's tail, so no bound on a key's `key_copy()` size is assumed.
+  Offsets into a stored key (the PK suffix of a secondary entry,
+  `ref_length`, search keys, the AUTO_INCREMENT seed's slot) count the
+  stored width, `stored_length`, not `key_length`. A build opening a table
+  whose `key_format` is newer than it knows refuses it
+  (`HA_ERR_INCOMPATIBLE_DEFINITION`) rather than size its keys wrong. A part stored as weights cannot be restored: rows carry
   every column, so nothing reads a value back from a key but the
   key-only read, which leaves such parts to the row fetch, and a
   commit-time duplicate-key message renders the row the INSERT tried to
   write. A UCA collation reserves 16 bytes a character for each of its
-  levels, so a key can outgrow the 3072 `key_copy()` bytes the server
-  limits it by: `create()` refuses, with `ER_TOO_LONG_KEY`, a table whose
+  levels, so a key can outgrow the `key_copy()` bytes the server limits
+  it by: `create()` refuses, with `ER_TOO_LONG_KEY`, a table whose
   longest stored key would pass the engine's 65,535-byte ceiling.
 - **VARCHAR and BLOB prefix keys, secondary indexes** (binary strings, and
-  every string before format 2): handled by `fix_varchar_key_encoding`,
-  which strips the 2-byte LE length prefix and left-justifies the data,
+  every string before format 2): the 2-byte LE length prefix is stripped
+  (`strip_varlen_length`) and the data left-justified,
   padded to the slot's width. The PK suffix tells apart values that differ
   only in trailing padding.
 - **VARCHAR and BLOB prefix keys, primary key** (the same): the key must
   keep `'a'` and `'a\0'` apart, so the length stays, but
-  `make_mem_comparable` moves it behind the padded bytes, big-endian, in
+  `move_length_last` moves it behind the padded bytes, big-endian, in
   the same slot. The part then sorts by value.
 - **Padding** follows the collation. A PAD SPACE collation compares a
   shorter value as if padded with spaces, so `'a\0b'` sorts before `'a'`:
@@ -191,8 +195,9 @@ lexicographically sortable. The plugin applies a post-processing step
   with `ALTER TABLE t FORCE` (its rows hold every column, so the copy reads
   them correctly).
 
-The inverse (`undo_mem_comparable`) is applied by the AUTO_INCREMENT seed
-to read the counter's column back from the largest key.
+The inverse exists for fixed-width parts only (`undo_fixed_width_part`):
+the AUTO_INCREMENT seed reads the counter's integer column back from the
+largest key with it. No VARCHAR, BLOB or weights part is ever restored.
 
 The type dispatch uses `Field::real_type()` (not `Field::type()`) to
 correctly distinguish new temporal types (which are already BE) from old
@@ -474,7 +479,7 @@ is freed (#294).
 | Temporal index ordering (DATE, DATETIME, TIMESTAMP, TIME, YEAR) | Done | LE→BE reversal; new temporals (DATETIME2 etc.) pass through |
 | SET/ENUM index ordering | Done | `real_type()` dispatch for correct type identification |
 | VARCHAR/CHAR index ordering | Done | Collation weights (`strnxfrm`), `key_format` 2; tables created before it compare bytes until `ALTER TABLE t FORCE` (#468) |
-| BLOB/TEXT prefix indexes | Done | `HA_BLOB_PART` handling in `fix_varchar_key_encoding` |
+| BLOB/TEXT prefix indexes | Done | `HA_BLOB_PART` handling in `encode_key_parts` (weights, or `strip_varlen_length` for binary) |
 | BLOB/TEXT storage | Done | Encode appends data; decode patches pointers into value buffer |
 | MEDIUMBLOB support (16 MiB) | Done | `max_value_bytes = 16 MiB` |
 | Virtual/generated columns | Done | `HA_CAN_VIRTUAL_COLUMNS` flag |
@@ -541,9 +546,10 @@ features) is the remaining gap before production use.
   Never advance an iterator or reuse the value buffer while MariaDB may
   still be reading BLOB data through those pointers.
 
-- **`make_mem_comparable` does not byte-transform VARCHAR/BLOB key parts.**
-  In a secondary key they are handled by `fix_varchar_key_encoding`, which
-  runs first. Applying the integer transforms to them would corrupt data by
+- **The integer transforms do not apply to VARCHAR/BLOB key parts.**
+  `encode_key_parts` dispatches per part: a weights part to
+  `write_weights`, a binary one in a secondary key to
+  `strip_varlen_length`. Applying the integer transforms to them would corrupt data by
   misinterpreting the `store_length - length` bytes as null indicators. It
   does move a primary-key part's length behind its bytes when the plan says
   so (`varlen_length_last`), and inverts a DESC part whatever its type.

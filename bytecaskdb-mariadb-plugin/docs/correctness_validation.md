@@ -553,7 +553,7 @@ the gaps explicitly:
   contract is assumed to hold; validating it is out of scope.
 - **Encoding correctness for new field types.** A new MariaDB type
   (JSON, INET6, extended temporal) needs an entry in
-  `make_mem_comparable` and a regression in
+  `encode_key_parts` (its per-part transform) and a regression in
   `mariadb_encoding_test.cpp` — not a proof matrix entry. The MTR
   `type_*_indexes` suite is the right venue for end-to-end
   validation.

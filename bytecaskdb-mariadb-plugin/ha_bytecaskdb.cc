@@ -240,6 +240,16 @@ int ha_bytecaskdb::open(const char *name, int /*mode*/,
   if (catalog_copy_meta(table_id_, meta)) {
     schema_version_ = static_cast<uint16_t>(meta.schema_version);
     key_format = meta.key_format;
+    // A format newer than this build sizes its keys in ways this build
+    // cannot see: read as an older one, every offset into a stored key
+    // would be wrong. Refuse the table rather than misread it.
+    if (key_format > kKeyFormatCurrent) {
+      sql_print_error("ByteCaskDB: table %s has key format %u; this build "
+                      "reads formats up to %u",
+                      name, static_cast<unsigned>(key_format),
+                      static_cast<unsigned>(kKeyFormatCurrent));
+      return HA_ERR_INCOMPATIBLE_DEFINITION;
+    }
     indexes_ = std::move(meta.indexes);
   } else {
     indexes_.clear();
@@ -301,7 +311,6 @@ void ha_bytecaskdb::seed_autoinc_counter_if_needed() const {
   // The part's slot in a stored key: every slot ahead of it is fixed-width.
   std::size_t offset = on_pk ? 5 : 7;
   for (uint i = 0; i < part; ++i) { offset += plan.parts[i].stored_length; }
-  const KeyPlan part_plan{{kp}, plan.varlen_length_last};
 
   uint64_t hw = 0;
   std::vector<uint8_t> slot(kp.store_length);
@@ -309,7 +318,8 @@ void ha_bytecaskdb::seed_autoinc_counter_if_needed() const {
   auto take = [&](const uint8_t *key, std::size_t len) {
     if (len < offset + kp.store_length) { return; }
     slot.assign(key + offset, key + offset + kp.store_length);
-    undo_mem_comparable(slot.data(), part_plan, kp.store_length);
+    // The counter's column is an integer: never a part that cannot restore.
+    if (!undo_fixed_width_part(slot.data(), kp)) { return; }
     const uint null_bytes = kp.store_length - kp.length;
     if (null_bytes > 0 && slot[0] != 0) { return; }  // NULL
     std::memcpy(scratch.data() + kp.record_offset, slot.data() + null_bytes,
@@ -1175,7 +1185,6 @@ std::size_t ha_bytecaskdb::build_search_key(uint idx, const uchar *key,
                                             uint prefix_len, bool pad_high) {
   const bool on_pk = (idx == table->s->primary_key);
   const KeyPlan &plan = codec_.keys[idx];
-  const uint key_len = table->key_info[idx].key_length;
   const uint stored_len = plan.stored_length;
   const std::size_t ns_len = on_pk ? 5 : 7;
 
@@ -1188,18 +1197,12 @@ std::size_t ha_bytecaskdb::build_search_key(uint idx, const uchar *key,
     p[6] = static_cast<uint8_t>( idx       & 0xFF);
   }
 
-  // The fix-ups walk every key part; the zero-filled unsupplied parts read
-  // as empty, and are reset to zeros below. The transform is limited to the
-  // supplied prefix (whole parts), so only those bytes are written.
-  search_key_src_.assign(key_len, 0);
-  std::memcpy(search_key_src_.data(), key, prefix_len);
+  // Only the supplied parts are encoded; the unsupplied ones stay zero, a
+  // low bound below every stored key sharing the prefix.
+  search_key_src_.assign(key, key + prefix_len);
   uint8_t *kp = p + ns_len;
   const uint stored_prefix =
       encode_key_parts(kp, search_key_src_.data(), plan, prefix_len, on_pk);
-  // The fix-ups pad an unsupplied VARCHAR part as a stored key would (with
-  // spaces under PAD SPACE); a low bound needs zero bytes there, below every
-  // stored key sharing the prefix.
-  std::memset(kp + stored_prefix, 0, stored_len - stored_prefix);
 
   if (pad_high) {
     std::memset(kp + stored_prefix, 0xFF, stored_len - stored_prefix);
