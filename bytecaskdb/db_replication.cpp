@@ -396,7 +396,7 @@ void DB::ingest(const ChangeHeader &header,
       // Phase 2: writev chunk to active file.
       std::vector<std::uint64_t> io_offsets(chunk.size());
       try {
-        file.append_entries(chunk, io_offsets);
+        file.append_entries(chunk, io_offsets, scratch_bytes_);
       } catch (...) {
         auto ex = std::current_exception();
         try { file.sync(); } catch (...) {}

@@ -7,7 +7,6 @@
 #include <cerrno>
 #include <format>
 #include <sys/types.h>
-#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -56,65 +55,24 @@ TEST_CASE("check_write: a short count is EIO with the byte counts",
   }
 }
 
-// #384: a scratch buffer left past the thread scratch limit is freed when its use
-// ends; one at or below the cap is kept for the next use.
-TEST_CASE("ScratchUse: frees a buffer left past the cap when the use ends",
-          "[util]") {
-  bytecask::ThreadScratch<std::vector<std::byte>> s;
+// #384: a scratch buffer left past its limit is freed when the use ends; one
+// at or below it is kept for the next use.
+TEST_CASE("ScratchUse: frees a buffer left past its limit", "[util]") {
+  constexpr std::size_t kLimit = 64 * 1024;
+  std::vector<std::byte> buf;
   {
-    bytecask::ScratchUse use{s};
-    CHECK(s.in_use);
-    use.buf().resize(bytecask::thread_scratch_limit() + 1);
+    bytecask::ScratchUse use{buf, kLimit};
+    use.buf().resize(kLimit + 1);
   }
-  CHECK_FALSE(s.in_use);
-  CHECK(s.buf.capacity() == 0);
+  CHECK(buf.capacity() == 0);
 }
 
-TEST_CASE("ScratchUse: a second use while one is open is refused",
-          "[util]") {
-  bytecask::ThreadScratch<std::vector<std::byte>> s;
-  bytecask::ScratchUse outer{s};
-  CHECK_THROWS_AS([&] { bytecask::ScratchUse inner{s}; }(), std::logic_error);
-  CHECK(s.in_use);  // the outer use still holds it
-}
-
-TEST_CASE("ScratchUse: keeps a buffer at or below the cap", "[util]") {
-  bytecask::ThreadScratch<std::vector<std::byte>> s;
-  const std::byte *held = nullptr;
+TEST_CASE("ScratchUse: keeps a buffer at its limit", "[util]") {
+  constexpr std::size_t kLimit = 64 * 1024;
+  std::vector<std::byte> buf;
   {
-    bytecask::ScratchUse use{s};
-    use.buf().resize(bytecask::thread_scratch_limit());
-    use.buf().shrink_to_fit();
-    REQUIRE(use.buf().capacity() <= bytecask::thread_scratch_limit());
-    held = use.buf().data();
+    bytecask::ScratchUse use{buf, kLimit};
+    bytecask::resize_exact(use.buf(), kLimit);
   }
-  CHECK(s.buf.data() == held);
-  // The next use gets the same buffer.
-  bytecask::ScratchUse again{s};
-  CHECK(again.buf().data() == held);
-}
-
-TEST_CASE("thread scratch limit: defaults, applies and refuses a value "
-          "below the minimum",
-          "[util]") {
-  REQUIRE(bytecask::thread_scratch_limit() ==
-          bytecask::kDefaultThreadScratchLimit);
-  CHECK_THROWS_AS(
-      bytecask::set_thread_scratch_limit(bytecask::kMinThreadScratchLimit - 1),
-      std::invalid_argument);
-  CHECK(bytecask::thread_scratch_limit() ==
-        bytecask::kDefaultThreadScratchLimit);
-
-  bytecask::ThreadScratch<std::vector<std::byte>> s;
-  const auto big = bytecask::kDefaultThreadScratchLimit * 4;
-  bytecask::set_thread_scratch_limit(big);
-  {
-    bytecask::ScratchUse use{s};
-    use.buf().resize(big);
-  }
-  CHECK(s.buf.capacity() >= big);  // within the raised limit: kept
-  bytecask::set_thread_scratch_limit(bytecask::kMinThreadScratchLimit);
-  { bytecask::ScratchUse use{s}; }
-  CHECK(s.buf.capacity() == 0);  // over the lowered one: freed at next use
-  bytecask::set_thread_scratch_limit(bytecask::kDefaultThreadScratchLimit);
+  CHECK(buf.capacity() == kLimit);
 }

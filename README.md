@@ -244,6 +244,7 @@ struct Options {
     // reads), so the work left for close — and for the next open after a
     // crash — stays bounded. 0 turns the bound off.
     uint32_t max_hint_backlog{4};
+    size_t thread_scratch_bytes{1024 * 1024};   // most a thread's record buffers keep after a call (at least 64 KiB)
 };
 
 // Selects how sealed data files are read. The active file is written the same
@@ -552,15 +553,6 @@ class DbChangeMarkerMismatch : public std::runtime_error { /* ... */ };
 
 // Thrown by every DB operation after close().
 class DbClosed : public std::logic_error { /* ... */ };
-
-// The thread scratch limit: the most bytes each of a thread's record buffers
-// keeps between calls, and so the largest record a call serves without
-// allocating (default 256 KiB). Process-wide, not per DB: a thread shares its
-// buffers between every DB it touches. A new limit reaches each thread at its
-// next call. Below kMinThreadScratchLimit (64 KiB) it throws
-// std::invalid_argument.
-void set_thread_scratch_limit(std::size_t bytes);
-[[nodiscard]] auto thread_scratch_limit() noexcept -> std::size_t;
 
 } // namespace bytecask
 ```

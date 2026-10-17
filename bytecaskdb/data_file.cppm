@@ -18,7 +18,6 @@ module;
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
-#include <limits>
 #include <format>
 #include <iterator>
 #include <memory>
@@ -159,22 +158,22 @@ export inline WritevLimits test_writev_limits{2, kMaxBytesPerWritev};
 #endif
 
 // Scratch append_entries serializes a chunk's entries into, back to back.
-inline auto append_scratch() -> ThreadScratch<std::vector<std::byte>> & {
+inline auto append_scratch() -> std::vector<std::byte> & {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
   // TLS: scratch — one chunk's entries. Reused by the one thread that
   // appends, so the commit path allocates only while it grows; a chunk is
-  // cut before it passes thread_scratch_limit() (#384).
-  thread_local ThreadScratch<std::vector<std::byte>> s;
+  // cut at the DB's thread_scratch_bytes (#384).
+  thread_local std::vector<std::byte> buf;
 #pragma clang diagnostic pop
-  return s;
+  return buf;
 }
 
 #ifdef BYTECASK_TESTING
 // Bytes the calling thread's append scratch holds between writes.
 export [[nodiscard]] inline auto append_scratch_bytes() noexcept
     -> std::size_t {
-  return append_scratch().buf.capacity();
+  return append_scratch().capacity();
 }
 #endif
 
@@ -193,8 +192,11 @@ public:
       std::span<const std::byte> key,
       std::span<const std::byte> value) -> Offset = 0;
 
+  // scratch_bytes is the DB's Options::thread_scratch_bytes: a chunk is
+  // cut before the bytes it copies pass it.
   virtual void append_entries(std::span<const DataEntryView> entries,
-                              std::span<Offset> offsets_out) = 0;
+                              std::span<Offset> offsets_out,
+                              std::size_t scratch_bytes) = 0;
 
   virtual void sync() = 0;
 
@@ -301,7 +303,7 @@ auto fetch_record(const std::filesystem::path &path, Offset offset,
     -> DataEntryView {
   const auto first = first_read_length(offset, value_size_hint, end);
   if (first < kHeaderSize) throw_header_past_end(path, offset, end);
-  io_buf.resize(first);
+  resize_exact(io_buf, first);
   const std::size_t got = fetch(offset, first, io_buf.data());
   if (got < kHeaderSize) throw_short_read(offset, kHeaderSize, got);
   const auto hdr = bytecask::read_header(
@@ -310,7 +312,7 @@ auto fetch_record(const std::filesystem::path &path, Offset offset,
   if (offset + total > end) throw_record_past_end(path, offset, hdr, end);
   if (total > got) {
     if (got < first) throw_short_read(offset, total, got);
-    io_buf.resize(total);
+    resize_exact(io_buf, total);
     const std::size_t rest =
         fetch(offset + first, total - first, io_buf.data() + first);
     if (rest < total - first) throw_short_read(offset, total, first + rest);
@@ -575,7 +577,7 @@ struct WritableFileOps {
   // rather than once per piece. A value above kInlineValueBytes is not
   // copied: it gets an iovec of its own, pointing at the caller's bytes.
   void append_entries(std::span<const DataEntryView> entries,
-                      std::span<Offset> offsets_out) {
+                      std::span<Offset> offsets_out, std::size_t scratch_bytes) {
     assert(entries.size() == offsets_out.size());
     if (entries.empty()) return;
 
@@ -603,7 +605,7 @@ struct WritableFileOps {
     // TLS: scratch — the pieces as iovecs, rebuilt per chunk.
     thread_local std::vector<::iovec> iov;
 #pragma clang diagnostic pop
-    ScratchUse buf_use{append_scratch()};
+    ScratchUse buf_use{append_scratch(), scratch_bytes};
     auto &buf = buf_use.buf();
 
     const auto to_iovecs = [&] {
@@ -636,16 +638,11 @@ struct WritableFileOps {
              kCrcSize;
     };
 
-    const auto keep = thread_scratch_limit();
     for (std::size_t base = 0; base < entries.size();) {
       // At least one entry, so an entry larger than max_bytes still goes
-      // out; the largest one an engine can write is well under it. The
-      // chunk also ends before its inline bytes pass the thread scratch
-      // limit, so the scratch stays within it and is kept between commits
-      // (#384): a bulk load of 4 KiB values would otherwise free and
-      // allocate it on every commit. Only one entry larger than the limit
-      // on its own, a key near 64 KiB under a limit near the minimum, has
-      // its buffer freed after the commit.
+      // out; the largest one an engine can write is well under it. The chunk
+      // also ends before the bytes it copies pass scratch_bytes, so buf stays
+      // within it and is kept between commits (#384).
       auto chunk_end = base;
       std::size_t chunk_inline = 0;
       for (std::size_t chunk_bytes = 0;
@@ -655,13 +652,13 @@ struct WritableFileOps {
         chunk_bytes += kHeaderSize + e.key.size() + e.value.size() + kCrcSize;
         const auto next_inline = chunk_inline + inline_bytes(e);
         if (chunk_end > base &&
-            (chunk_bytes > max_bytes || next_inline > keep))
+            (chunk_bytes > max_bytes || next_inline > scratch_bytes))
           break;
         chunk_inline = next_inline;
       }
       buf.clear();
-      // Exactly what the chunk copies, so growth inside it cannot carry the
-      // capacity past the cap.
+      // Exactly the chunk's bytes: growth inside it cannot carry the
+      // capacity past the limit.
       buf.reserve(chunk_inline);
       pieces.clear();
 
@@ -914,8 +911,9 @@ public:
   }
 
   void append_entries(std::span<const DataEntryView> entries,
-                      std::span<Offset> offsets_out) override {
-    ops_.append_entries(entries, offsets_out);
+                      std::span<Offset> offsets_out,
+                      std::size_t scratch_bytes) override {
+    ops_.append_entries(entries, offsets_out, scratch_bytes);
   }
 
   [[nodiscard]] auto read_raw(Offset offset, std::span<std::byte> dst) const
@@ -1058,7 +1056,7 @@ private:
           .value = body.subspan(key_size, value_size),
       };
     }
-    io_buf.resize(total);
+    resize_exact(io_buf, total);
     pread_exact(ops_.fd_, offset, io_buf);
     std::span<const std::byte> raw = io_buf;
     const auto header = parse_header_and_verify(raw);
@@ -1121,8 +1119,9 @@ public:
   }
 
   void append_entries(std::span<const DataEntryView> entries,
-                      std::span<Offset> offsets_out) override {
-    ops_.append_entries(entries, offsets_out);
+                      std::span<Offset> offsets_out,
+                      std::size_t scratch_bytes) override {
+    ops_.append_entries(entries, offsets_out, scratch_bytes);
   }
 
   [[nodiscard]] auto read_raw(Offset offset, std::span<std::byte> dst) const
@@ -1224,7 +1223,7 @@ private:
                                               std::vector<std::byte> &io_buf) const
       -> DataEntryView {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
-    io_buf.resize(total);
+    resize_exact(io_buf, total);
     fetch(offset, total, io_buf.data());
     const auto header = parse_header_and_verify(io_buf);
     auto body = std::span<const std::byte>{io_buf}.subspan(kHeaderSize);
@@ -1344,7 +1343,7 @@ private:
                                               std::vector<std::byte> &io_buf) const
       -> DataEntryView {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
-    io_buf.resize(total);
+    resize_exact(io_buf, total);
     pread_exact(fd_, offset, io_buf);
     const auto header = parse_header_and_verify(io_buf);
     auto body = std::span<const std::byte>{io_buf}.subspan(kHeaderSize);
@@ -1643,7 +1642,7 @@ private:
       Offset offset, std::uint16_t key_size, std::uint32_t value_size,
       std::vector<std::byte> &io_buf, Source source) const -> DataEntryView {
     const auto total = kHeaderSize + key_size + value_size + kCrcSize;
-    io_buf.resize(total);
+    resize_exact(io_buf, total);
     fetch(offset, total, io_buf.data(), source);
     const auto header = parse_header_and_verify(io_buf);
     auto body = std::span<const std::byte>{io_buf}.subspan(kHeaderSize);

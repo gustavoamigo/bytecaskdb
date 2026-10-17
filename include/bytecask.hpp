@@ -105,17 +105,6 @@ struct ChangeHeader {
 inline constexpr std::size_t kUnlimitedBytes =
     std::numeric_limits<std::size_t>::max();
 
-// The thread scratch limit: the most bytes each of a thread's record buffers
-// keeps between calls, and so the largest record a call serves without
-// allocating. Process-wide, not per DB: a thread shares its buffers between
-// every DB it touches. A new limit reaches each thread at its next call.
-// set_thread_scratch_limit throws std::invalid_argument below
-// kMinThreadScratchLimit.
-inline constexpr std::size_t kDefaultThreadScratchLimit = std::size_t{256} << 10;
-inline constexpr std::size_t kMinThreadScratchLimit = std::size_t{64} << 10;
-void set_thread_scratch_limit(std::size_t bytes);
-[[nodiscard]] auto thread_scratch_limit() noexcept -> std::size_t;
-
 struct WriteOptions {
   bool sync{true};
   bool solo{false};
@@ -162,6 +151,9 @@ struct Options {
   // Most sealed files allowed to wait for their hint file before a rotation
   // waits for the background writer. 0 = unbounded.
   std::uint32_t max_hint_backlog{4};
+  // Most bytes a thread's record buffers keep after a call on this DB
+  // (default 1 MiB, at least 64 KiB).
+  std::size_t thread_scratch_bytes{std::size_t{1} << 20};
 };
 
 struct SizeLimits {
@@ -630,10 +622,6 @@ using internal::kOriginMarker;
 using ChangeHeader         = internal::ChangeHeader;
 using ChangeBatch          = internal::ChangeBatch;
 using internal::kUnlimitedBytes;
-using internal::kDefaultThreadScratchLimit;
-using internal::kMinThreadScratchLimit;
-using internal::set_thread_scratch_limit;
-using internal::thread_scratch_limit;
 using DbDegraded           = internal::DbDegraded;
 using DbFollowerMode       = internal::DbFollowerMode;
 using DbChangeMarkerMismatch = internal::DbChangeMarkerMismatch;

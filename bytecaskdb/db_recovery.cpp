@@ -119,6 +119,7 @@ auto DB::recovery_open(const Options &opts) -> EngineState {
     needed_tombstones_ = {};
     {
       EngineState s;
+      s.scratch_bytes = scratch_bytes_;
       auto files = recovery_prepare_files(s);
       // Maps the file ids in a SequenceOverlap back to paths once s is gone.
       const auto registered = s.files;
@@ -147,7 +148,8 @@ auto DB::recovery_open(const Options &opts) -> EngineState {
     recovery_undo_interrupted_vacuum(a, b);
     // The next pass numbers files afresh, so an id can now name a different
     // file. The pool keys frames by id; a fresh one holds none of the old.
-    if (pool_) pool_ = std::make_shared<BufferPool>(opts.buffer_pool);
+    if (pool_)
+      pool_ = std::make_shared<BufferPool>(opts.buffer_pool, scratch_bytes_);
   }
 }
 

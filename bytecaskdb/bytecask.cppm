@@ -118,13 +118,6 @@ export inline constexpr std::uint64_t kDefaultRotationThreshold =
     64ULL * 1024 * 1024;
 #endif
 
-// The thread scratch limit: what each of a thread's record buffers keeps
-// between calls, process-wide (bytecask.util).
-export using bytecask::kDefaultThreadScratchLimit;
-export using bytecask::kMinThreadScratchLimit;
-export using bytecask::set_thread_scratch_limit;
-export using bytecask::thread_scratch_limit;
-
 // Hard limits imposed by the on-disk entry header format and in-memory packing.
 // key_size is u16 on disk; value_size is 28 bits in a packed KeyDirEntry.
 export inline constexpr std::uint32_t kMaxKeySize = 65535;
@@ -172,17 +165,17 @@ export inline std::uint64_t test_max_group_file_bytes =
 }
 
 #ifdef BYTECASK_TESTING
-// The most bytes any of the calling thread's read, fill, append and hint
-// scratch keeps between calls: at most thread_scratch_limit() (#384).
+// The most bytes any of the calling thread's record, fill and append
+// scratch keeps between calls (#384).
 export [[nodiscard]] inline auto test_thread_scratch_bytes() noexcept
     -> std::size_t {
 #ifdef BYTECASK_KEYDIR_BLIND
-  const auto reads = key_read_scratch().buf.capacity();
+  const auto reads = key_read_buffer().capacity();
 #else
-  const auto reads = value_read_scratch().buf.capacity();
+  const auto reads = value_read_buffer().capacity();
 #endif
   return std::max({reads, BufferPool::thread_scratch_bytes(),
-                   append_scratch_bytes(), hint_scratch_bytes()});
+                   append_scratch_bytes()});
 }
 #endif
 
@@ -317,6 +310,12 @@ export struct Options {
   // out, and the next open after a crash, which rebuilds whatever is missing.
   // 0 turns the bound off: writes never wait and close/open are unbounded.
   std::uint32_t max_hint_backlog{kDefaultMaxHintBacklog};
+  // Most bytes a thread's record buffers keep after a call on this DB, and
+  // so the largest record a call serves without allocating. A thread shares
+  // its buffers between the DBs it touches: after a call on a DB it keeps at
+  // most that DB's value (#384). Below 64 KiB, open throws
+  // std::invalid_argument.
+  std::size_t thread_scratch_bytes{kDefaultThreadScratchBytes};
 };
 
 // ---------------------------------------------------------------------------
@@ -738,7 +737,7 @@ private:
   // Where key_dir_ reads the keys it does not store: this transient's files
   // and the records it has not written yet.
   [[nodiscard]] auto kd_ctx() const -> KeyDirCtx {
-    return {nullptr, &files_, &pending_, true};
+    return {nullptr, &files_, &pending_, true, scratch_bytes_};
   }
   // Records a put this transient placed at `offset` of the active file,
   // before the batch is written. A no-op for key directories that store
@@ -785,6 +784,7 @@ private:
   bool degraded_;
   std::string degraded_reason_;
   std::shared_ptr<const std::vector<ChangeMarker>> change_markers_;
+  std::size_t scratch_bytes_{kDefaultThreadScratchBytes};
 };
 
 // ---------------------------------------------------------------------------
@@ -1680,6 +1680,7 @@ private:
   // pool's frames and can outlive the DB in an iterator's hands.
   std::shared_ptr<BufferPool> pool_;
   SizeLimits size_limits_;
+  std::size_t scratch_bytes_;
   mutable Counters counters_;
   // Bookmarks for changes_since to enter a file near from_sequence (#443).
   // Shared with every ChangeIterator, which hands it the bookmarks it lays and

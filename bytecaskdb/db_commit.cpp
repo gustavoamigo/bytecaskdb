@@ -204,7 +204,7 @@ auto DB::execute_group(std::span<Slot *> batch) -> std::size_t {
   // Phase 2: one I/O call for all collected entries.
   std::vector<std::uint64_t> io_offsets(all_entries.size());
   try {
-    file.append_entries(all_entries, io_offsets);
+    file.append_entries(all_entries, io_offsets, scratch_bytes_);
   } catch (...) {
     auto ex = std::current_exception();
     try { file.sync(); } catch (...) {}

@@ -373,6 +373,9 @@ export struct KeyDirCtx {
   const TransientU32Table<std::shared_ptr<DataFile>> *writer_files{nullptr};
   const PendingRecords *pending{nullptr};
   bool verify{true};
+  // The DB's Options::thread_scratch_bytes: what the thread's record buffer
+  // may keep after the call.
+  std::size_t scratch_bytes{kDefaultThreadScratchBytes};
 
   [[nodiscard]] auto file(std::uint32_t id) const -> const DataFile * {
     const auto *f = files ? files->get(id) : writer_files->get(id);
@@ -417,14 +420,14 @@ export using KeyDirReverseValueIter = ReverseBTreeValueIterator<KeyDirEntry>;
 export using KeyDirHit = KeyDirEntry;
 
 // Scratch for the record DB::get and Snapshot::get read, reused per thread.
-inline auto value_read_scratch() -> ThreadScratch<std::vector<std::byte>> & {
+inline auto value_read_buffer() -> std::vector<std::byte> & {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
-  // TLS: scratch — this call's record; freed past thread_scratch_limit()
-  // (#384).
-  thread_local ThreadScratch<std::vector<std::byte>> s;
+  // TLS: scratch — this call's record; freed past the DB's
+  // thread_scratch_bytes (#384).
+  thread_local std::vector<std::byte> buf;
 #pragma clang diagnostic pop
-  return s;
+  return buf;
 }
 
 // The value size a value iterator's entry expects, as a read hint.
@@ -621,14 +624,14 @@ export struct KeyReader {
 };
 
 // Scratch buffer for the reads of one call, reused per thread.
-inline auto key_read_scratch() -> ThreadScratch<std::vector<std::byte>> & {
+inline auto key_read_buffer() -> std::vector<std::byte> & {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
-  // TLS: scratch — this call's records; freed past thread_scratch_limit()
-  // (#384).
-  thread_local ThreadScratch<std::vector<std::byte>> s;
+  // TLS: scratch — this call's records; freed past the DB's
+  // thread_scratch_bytes (#384).
+  thread_local std::vector<std::byte> buf;
 #pragma clang diagnostic pop
-  return s;
+  return buf;
 }
 
 // ---------------------------------------------------------------------------
@@ -771,7 +774,7 @@ export template <typename T>
 auto kd_get(const T &t, std::span<const std::byte> key, const KeyDirCtx &ctx)
     -> std::optional<KeyDirEntry> {
   FrameLease lease;
-  ScratchUse scratch{key_read_scratch()};
+  ScratchUse scratch{key_read_buffer(), ctx.scratch_bytes};
   KeyReader reader{ctx, scratch.buf(), lease};
   const auto ref = t.get(key, reader);
   if (!ref)
@@ -783,7 +786,7 @@ export template <typename T>
 auto kd_contains(const T &t, std::span<const std::byte> key,
                  const KeyDirCtx &ctx) -> bool {
   FrameLease lease;
-  ScratchUse scratch{key_read_scratch()};
+  ScratchUse scratch{key_read_buffer(), ctx.scratch_bytes};
   KeyReader reader{ctx, scratch.buf(), lease};
   return t.get(key, reader).has_value();
 }
@@ -794,7 +797,7 @@ export inline auto kd_read_value(const KeyDirTree &t,
                                  const KeyDirCtx &ctx,
                                  std::vector<std::byte> &out) -> bool {
   FrameLease lease;
-  ScratchUse scratch{key_read_scratch()};
+  ScratchUse scratch{key_read_buffer(), ctx.scratch_bytes};
   KeyReader reader{ctx, scratch.buf(), lease};
   const auto ref = t.get(key, reader);
   if (!ref)
@@ -808,7 +811,7 @@ export inline auto kd_put(KeyDirTransient &t, std::span<const std::byte> key,
                           const KeyDirEntry &e, const KeyDirCtx &ctx)
     -> std::optional<KeyDirHit> {
   FrameLease lease;
-  ScratchUse scratch{key_read_scratch()};
+  ScratchUse scratch{key_read_buffer(), ctx.scratch_bytes};
   KeyReader reader{ctx, scratch.buf(), lease};
   const auto displaced = t.upsert(
       key, to_blind_ref(e), reader,
@@ -820,7 +823,7 @@ export inline auto kd_put(KeyDirTransient &t, std::span<const std::byte> key,
 export inline auto kd_erase(KeyDirTransient &t, std::span<const std::byte> key,
                             const KeyDirCtx &ctx) -> std::optional<KeyDirHit> {
   FrameLease lease;
-  ScratchUse scratch{key_read_scratch()};
+  ScratchUse scratch{key_read_buffer(), ctx.scratch_bytes};
   KeyReader reader{ctx, scratch.buf(), lease};
   const auto erased = t.erase(key, reader);
   if (!erased)
@@ -856,7 +859,7 @@ export template <typename T>
 auto kd_lower_bound(const T &t, std::span<const std::byte> key,
                     const KeyDirCtx &ctx) -> KeyDirIter {
   FrameLease lease;
-  ScratchUse scratch{key_read_scratch()};
+  ScratchUse scratch{key_read_buffer(), ctx.scratch_bytes};
   KeyReader reader{ctx, scratch.buf(), lease};
   return {t.lower_bound(key, reader), ctx};
 }
@@ -867,7 +870,7 @@ export inline auto kd_count(const KeyDirTree &t, std::span<const std::byte> from
                             std::span<const std::byte> to, std::size_t limit,
                             const KeyDirCtx &ctx) -> std::size_t {
   FrameLease lease;
-  ScratchUse scratch{key_read_scratch()};
+  ScratchUse scratch{key_read_buffer(), ctx.scratch_bytes};
   KeyReader reader{ctx, scratch.buf(), lease};
   const auto first = t.lower_bound(from, reader);
   return first.count_until(t.lower_bound(to, reader), limit);
@@ -896,7 +899,7 @@ export inline auto kd_value_lower_bound(const KeyDirTree &t,
   if (from.empty())
     return {t.begin(), ctx};
   FrameLease lease;
-  ScratchUse scratch{key_read_scratch()};
+  ScratchUse scratch{key_read_buffer(), ctx.scratch_bytes};
   KeyReader reader{ctx, scratch.buf(), lease};
   return {t.lower_bound(from, reader), ctx};
 }
@@ -908,7 +911,7 @@ export inline auto kd_value_rlower_bound(const KeyDirTree &t,
     return KeyDirReverseValueIter{KeyDirValueIter{t.end_iter(), ctx}};
   // Start past the last key <= from: at the first key > from.
   FrameLease lease;
-  ScratchUse scratch{key_read_scratch()};
+  ScratchUse scratch{key_read_buffer(), ctx.scratch_bytes};
   KeyReader reader{ctx, scratch.buf(), lease};
   auto fwd = KeyDirValueIter{t.lower_bound(from, reader), ctx};
   if (fwd != std::default_sentinel &&
@@ -952,6 +955,8 @@ export struct EngineState {
   // Set by DB::close(). A closed state is the last one a DB publishes and
   // holds no files or key directory (see closed_copy).
   bool closed{false};
+  // Options::thread_scratch_bytes, for the key directory's reads.
+  std::size_t scratch_bytes{kDefaultThreadScratchBytes};
   // Every ChangeMarker the data files hold, by since_sequence: 16 bytes per
   // promotion. Immutable; a promotion or an ingested marker publishes a new
   // list. Null when there is none.
@@ -973,7 +978,7 @@ export struct EngineState {
 
   // Where this state's key directory reads the keys it does not store.
   [[nodiscard]] auto kd_ctx(bool verify = true) const -> KeyDirCtx {
-    return {&files, nullptr, nullptr, verify};
+    return {&files, nullptr, nullptr, verify, scratch_bytes};
   }
 
   [[nodiscard]] auto active_file() -> DataFile & {

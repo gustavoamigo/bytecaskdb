@@ -95,6 +95,8 @@ constexpr std::size_t kMaxHintEntryBytes =
 constexpr std::size_t kMaxFrameBytes = kHintFrameBytes + kMaxHintEntryBytes;
 // The most such a frame takes on disk: its entries, not compressed at all.
 constexpr std::size_t kMaxPackedFrameBytes = ZSTD_COMPRESSBOUND(kMaxFrameBytes);
+// thread_packed_frame keeps at most this, whatever the frames it decoded.
+static_assert(kMaxPackedFrameBytes <= kDefaultThreadScratchBytes);
 
 // ZSTD_CONTENTSIZE_UNKNOWN and ZSTD_CONTENTSIZE_ERROR are the two largest
 // 64-bit values, so the cap alone refuses a frame that does not declare its
@@ -142,15 +144,15 @@ auto thread_dctx() -> ZSTD_DCtx & {
 // Scratch for the compressed bytes of the frame being decoded: a scanner
 // needs them only until the frame is decompressed into its own buffer, so
 // every scanner a thread drives shares one.
-auto thread_packed_frame() -> ThreadScratch<std::vector<std::byte>> & {
+auto thread_packed_frame() -> std::vector<std::byte> & {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
   // The destructor is wanted: it frees the buffer when the thread exits.
-  // TLS: scratch — one compressed frame, at most kMaxPackedFrameBytes; freed
-  // past thread_scratch_limit() (#384).
-  thread_local ThreadScratch<std::vector<std::byte>> s;
+  // TLS: scratch — one compressed frame, at most kMaxPackedFrameBytes by
+  // the frame format, so it needs no limit (#384).
+  thread_local std::vector<std::byte> buf;
 #pragma clang diagnostic pop
-  return s;
+  return buf;
 }
 
 // Reads exactly out.size() bytes at offset. Every read of a hint file goes
@@ -348,13 +350,6 @@ auto open_source(std::filesystem::path path)
 } // namespace
 
 #ifdef BYTECASK_TESTING
-// Bytes the calling thread's compressed-frame scratch holds between reads.
-export [[nodiscard]] auto hint_scratch_bytes() noexcept -> std::size_t {
-  return thread_packed_frame().buf.capacity();
-}
-#endif
-
-#ifdef BYTECASK_TESTING
 // Makes every hint file written afterwards cut frames at `bytes` instead of
 // kHintFrameBytes; 0 restores the default. Tests use tiny frames so that
 // every scan and merge crosses frame boundaries.
@@ -445,9 +440,8 @@ public:
       }
       const auto at = src_->units[i];
       const auto len = narrow<std::size_t>(src_->units[i + 1] - at);
-      ScratchUse scratch{thread_packed_frame()};
-      auto &packed = scratch.buf();
-      packed.resize(len);
+      auto &packed = thread_packed_frame();
+      resize_exact(packed, len);
       read_unit(packed, at);
       const auto size = ZSTD_getFrameContentSize(packed.data(), len);
       if (!valid_frame_size(size))

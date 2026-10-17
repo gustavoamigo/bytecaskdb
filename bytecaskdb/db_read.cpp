@@ -34,10 +34,10 @@ auto Snapshot::get(const ReadOptions& opts, BytesView key,
     out.clear();
     return true;
   }
-  ScratchUse scratch{value_read_scratch()};
+  ScratchUse io_buf{value_read_buffer(), state_->scratch_bytes};
   (*state_->files.get(kv->file_id()))
       ->read_value(kv->file_offset(), narrow<std::uint16_t>(key.size()),
-                   kv->value_size(), opts.verify_checksums, scratch.buf(), out);
+                   kv->value_size(), opts.verify_checksums, io_buf.buf(), out);
   return true;
 #endif
 }

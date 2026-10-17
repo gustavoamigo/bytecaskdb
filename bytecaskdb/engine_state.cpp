@@ -40,10 +40,12 @@ TransientEngineState::TransientEngineState(
       change_markers_{std::move(change_markers)} {}
 
 auto EngineState::transient() const -> TransientEngineState {
-  return TransientEngineState{
+  auto t = TransientEngineState{
       key_dir.transient(), files.transient(), file_stats.transient(),
       active_file_id, next_file_id, next_seq, durable_seq,
       sync_requested_seq, mode, degraded, degraded_reason, change_markers};
+  t.scratch_bytes_ = scratch_bytes;
+  return t;
 }
 
 void TransientEngineState::append_marker(ChangeMarker m) {
@@ -656,6 +658,7 @@ auto TransientEngineState::persistent() && -> std::shared_ptr<EngineState> {
   s->degraded = degraded_;
   s->degraded_reason = std::move(degraded_reason_);
   s->change_markers = std::move(change_markers_);
+  s->scratch_bytes = scratch_bytes_;
   return s;
 }
 

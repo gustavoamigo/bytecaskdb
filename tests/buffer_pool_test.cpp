@@ -24,7 +24,6 @@
 
 import bytecask.buffer_pool;
 import bytecask.counters;
-import bytecask.util;
 
 namespace {
 
@@ -195,26 +194,25 @@ TEST_CASE("BufferPool: reads spanning frames are served whole",
   CHECK(pool.counters().hits.load() == 1);  // every covered frame was resident
 }
 
-// #384: one fill reads at most the thread scratch limit, so the thread's fill
-// scratch never grows past it and is kept between reads rather than freed
-// and allocated again. A longer miss is several runs, and serves the same
-// bytes.
-TEST_CASE("BufferPool: a miss longer than the scratch cap is read in runs",
+// #384: a fill reads at most the DB's thread_scratch_bytes, so the thread's
+// fill scratch never grows past it and is kept between reads. A longer miss
+// is several runs, and serves the same bytes.
+TEST_CASE("BufferPool: a miss longer than the scratch limit is read in runs",
           "[buffer_pool]") {
+  constexpr std::size_t kLimit = 1024 * 1024;
   ScratchFile file{4 * 1024 * 1024};
   // Oversize guard at an eighth of capacity: 8 MiB, well over the read.
   bytecask::BufferPool pool{
-      bytecask::BufferPoolOptions{.capacity_bytes = 64 * 1024 * 1024}};
+      bytecask::BufferPoolOptions{.capacity_bytes = 64 * 1024 * 1024}, kLimit};
 
   const std::size_t offset = 100;  // not frame-aligned
-  const std::size_t len = 3 * bytecask::thread_scratch_limit() + 5000;
+  const std::size_t len = 3 * kLimit + 5000;
   std::vector<std::byte> got(len);
   pool.read_at(1, file.fd(), offset, len, file.size(), got.data());
   CHECK(got == file.expected(offset, len));
   CHECK(pool.counters().misses.load() == 1);
-  // Kept at the cap: the last run was a full one.
-  CHECK(bytecask::BufferPool::thread_scratch_bytes() ==
-        bytecask::thread_scratch_limit());
+  // Kept at the limit: the last full run.
+  CHECK(bytecask::BufferPool::thread_scratch_bytes() == kLimit);
 
   // Every frame the runs read was admitted.
   std::fill(got.begin(), got.end(), std::byte{0});

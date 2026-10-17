@@ -49,6 +49,7 @@ import bytecask.data_entry;
 import bytecask.types;
 import bytecask.buffer_pool;
 import bytecask.counters;
+import bytecask.util;
 
 namespace {
 
@@ -176,7 +177,7 @@ TEST_CASE("DataFile::append_entries batches multiple entries into one writev",
       {3, bytecask::EntryType::Delete, k2, {}},
   }};
   std::array<bytecask::Offset, 3> offsets{};
-  file->append_entries(entries, offsets);
+  file->append_entries(entries, offsets, bytecask::kDefaultThreadScratchBytes);
   file->sync();
 
   // Offsets must be sequential and start at 0.
@@ -260,7 +261,7 @@ TEST_CASE("DataFile::append_entries writes the bytes append_entry would",
   for (std::size_t at = 0; at < kEntries;) {
     const auto n = std::min<std::size_t>(1 + rng() % 40, kEntries - at);
     std::vector<bytecask::Offset> out(n);
-    batched->append_entries(std::span{all}.subspan(at, n), out);
+    batched->append_entries(std::span{all}.subspan(at, n), out, bytecask::kDefaultThreadScratchBytes);
     offsets.insert(offsets.end(), out.begin(), out.end());
     at += n;
   }
@@ -1789,7 +1790,7 @@ TEST_CASE("DataFile: a write cut short by a full file reports a short write",
     };
     std::array<bytecask::Offset, 2> offsets{};
     const auto error = bytecask_test::write_error_under_fsize_limit(
-        writer->size() + 10, [&] { writer->append_entries(entries, offsets); });
+        writer->size() + 10, [&] { writer->append_entries(entries, offsets, bytecask::kDefaultThreadScratchBytes); });
     INFO(error.what);
     CHECK(error.is_short_write());
   }

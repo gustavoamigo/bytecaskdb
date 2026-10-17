@@ -100,6 +100,7 @@ auto to_module(bytecask::internal::Options o) noexcept -> bytecask::Options {
     to_module(o.io_backend),
     to_module(o.buffer_pool),
     o.max_hint_backlog,
+    o.thread_scratch_bytes,
   };
 }
 
@@ -726,17 +727,6 @@ void DB::ingest(const ChangeHeader& header,
 
 auto DB::stats() const -> std::map<std::string, std::int64_t> {
   return translate_exceptions([&] { return impl_->db.stats(); });
-}
-
-static_assert(kDefaultThreadScratchLimit == bytecask::kDefaultThreadScratchLimit);
-static_assert(kMinThreadScratchLimit == bytecask::kMinThreadScratchLimit);
-
-void set_thread_scratch_limit(std::size_t bytes) {
-  bytecask::set_thread_scratch_limit(bytes);
-}
-
-auto thread_scratch_limit() noexcept -> std::size_t {
-  return bytecask::thread_scratch_limit();
 }
 
 } // namespace bytecask::internal

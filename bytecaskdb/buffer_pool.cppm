@@ -10,7 +10,6 @@
 
 module;
 #include <algorithm>
-#include <cassert>
 #include <atomic>
 #include <bit>
 #include <cstddef>
@@ -52,7 +51,6 @@ export inline constexpr std::size_t kPoolFrameBytes = 4096;
 // is the kernel's default readahead, the rate the page-cache backends warm at.
 export inline constexpr std::size_t kPoolFillBlockBytes = 128 * 1024;
 static_assert(kPoolFillBlockBytes % kPoolFrameBytes == 0);
-static_assert(kMinThreadScratchLimit >= kPoolFrameBytes);
 
 export struct BufferPoolOptions {
   // TOTAL footprint — frames and the index table both come out of it, so
@@ -230,9 +228,13 @@ private:
 // ---------------------------------------------------------------------------
 export class BufferPool {
 public:
-  explicit BufferPool(const BufferPoolOptions &opts)
+  // scratch_bytes is the DB's Options::thread_scratch_bytes: the most a
+  // thread's fill buffer keeps after a read, and so the longest fill run.
+  explicit BufferPool(const BufferPoolOptions &opts,
+                      std::size_t scratch_bytes = kDefaultThreadScratchBytes)
       : direct_io_{opts.direct_io},
-        oversize_limit_{opts.capacity_bytes / kOversizeDivisor} {
+        oversize_limit_{opts.capacity_bytes / kOversizeDivisor},
+        run_frames_{std::max<std::size_t>(scratch_bytes / kPoolFrameBytes, 1)} {
     // The table is a power of two at most 70 % full; the arena and the pin
     // words take what is left of the budget. Frame count is derived from the
     // budget, never the budget from the frame count — the bound is the
@@ -348,7 +350,7 @@ public:
 #ifdef BYTECASK_TESTING
   // Bytes the calling thread's fill scratch holds between reads.
   [[nodiscard]] static auto thread_scratch_bytes() noexcept -> std::size_t {
-    return fill_scratch().buf.capacity();
+    return fill_scratch().capacity();
   }
 #endif
 
@@ -482,13 +484,13 @@ private:
     std::size_t cap_{0};
   };
 
-  static auto fill_scratch() noexcept -> ThreadScratch<AlignedScratch> & {
+  static auto fill_scratch() noexcept -> AlignedScratch & {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
-    // TLS: scratch — one fill's bytes, at most thread_scratch_limit() (#384).
-    thread_local ThreadScratch<AlignedScratch> s;
+    // TLS: scratch — one fill's bytes, a run of at most run_frames_ (#384).
+    thread_local AlignedScratch scratch;
 #pragma clang diagnostic pop
-    return s;
+    return scratch;
   }
 
   // Copies this frame's overlap with [offset, offset+len) into dst. Returns
@@ -707,6 +709,7 @@ private:
   PoolCounters counters_;
   bool direct_io_;
   std::size_t oversize_limit_;
+  std::size_t run_frames_;
   std::size_t frame_count_{0};
   std::size_t table_mask_{0};
   std::vector<std::byte> arena_;
@@ -759,19 +762,15 @@ auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
   const auto last = (offset + len - 1) / kPoolFrameBytes;
 
   // The fill buffer, taken at the first miss so a hit never touches
-  // thread-local storage, and held for the whole read: every run of it
-  // reuses one buffer.
+  // thread-local storage, and held for the whole read.
   std::optional<ScratchUse<AlignedScratch>> scratch;
 
   // Reads frames [a, b] in one I/O, copies their overlap with the request
   // into dst, and admits each whole frame. The caller's bytes come from the
   // read buffer, not from the frames: a frame admitted here can be evicted
-  // before we would copy out of it. At most run_frames frames, so the
-  // buffer stays within thread_scratch_limit() and is kept between reads
-  // (#384): a longer miss is several runs.
-  const std::uint64_t run_frames = thread_scratch_limit() / kPoolFrameBytes;
+  // before we would copy out of it. At most run_frames_ frames, so the
+  // buffer stays within the DB's thread_scratch_bytes (#384).
   const auto fill_run = [&](std::uint64_t a, std::uint64_t b) {
-    assert(b - a < run_frames);
     const auto run_start = a * kPoolFrameBytes;
     const auto run_end =
         std::min<std::uint64_t>((b + 1) * kPoolFrameBytes, file_size);
@@ -784,7 +783,7 @@ auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
       avail = std::min(avail, from + got);
       return;
     }
-    if (!scratch) scratch.emplace(fill_scratch());
+    if (!scratch) scratch.emplace(fill_scratch(), run_frames_ * kPoolFrameBytes);
     const auto run_len = static_cast<std::size_t>(run_end - run_start);
     auto *buf = scratch->buf().ensure(align_up(run_len, kPoolFrameBytes));
     auto got = run_len;
@@ -835,8 +834,7 @@ auto BufferPool::read_upto(std::uint32_t file_id, PoolFile file,
       a = a / kBlockFrames * kBlockFrames;
       b = (b / kBlockFrames + 1) * kBlockFrames - 1;
     }
-    for (; b - a >= run_frames; a += run_frames)
-      fill_run(a, a + run_frames - 1);
+    for (; b - a >= run_frames_; a += run_frames_) fill_run(a, a + run_frames_ - 1);
     fill_run(a, b);
   };
 
