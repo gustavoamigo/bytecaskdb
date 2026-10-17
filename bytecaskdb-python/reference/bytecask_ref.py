@@ -84,7 +84,7 @@ import struct
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -122,21 +122,23 @@ def _known_type(raw: int) -> bool:
     return True
 
 
-def _first_sequence(pread: Callable[[int, int], bytes], size: int) -> int:
+_TYPE_OFFSET = 8  # entry_type follows the u64 sequence
+
+
+def _first_sequence(buf: bytes) -> int:
     """The sequence in a file's first header, read without its CRC; 0 if
-    there is none. pread(n, offset) reads the file of length size.
+    there is none.
 
     A write that fails or comes back short can land a prefix of the first
-    record into preallocated zeros, and a prefix shorter than the sequence
-    reads as a smaller one (#471). The type byte follows the sequence, so an
-    unknown type with only zeros after the sequence field is such a prefix and
-    has no sequence. An unknown type with anything after it is damage, and its
-    sequence is read as it stands."""
-    head = pread(_HEADER.size, 0)
-    if len(head) < _HEADER.size:
+    record into the zeros the engine preallocates, and a prefix shorter than
+    the sequence reads as a smaller one (#471). The type byte follows the
+    sequence, so an unknown type with only zeros after the sequence field is
+    such a prefix and has no sequence. An unknown type with anything after it
+    is damage, and its sequence is read as it stands."""
+    if len(buf) < _HEADER.size:
         return 0
-    sequence, raw_type, _, _ = _HEADER.unpack(head)
-    if not _known_type(raw_type) and not any(pread(size - 8, 8)):
+    sequence, raw_type, _, _ = _HEADER.unpack_from(buf)
+    if not _known_type(raw_type) and not any(buf[_TYPE_OFFSET:]):
         return 0
     return sequence
 
@@ -879,17 +881,17 @@ class DB:
 
     def _changes(self, from_sequence: int, durable: int, max_bytes: int | None) -> Iterator[Entry]:
         # Files never share a sequence, so file order by first sequence is
-        # sequence order, and a file's first sequence is in its first header
-        # (_first_sequence).
+        # sequence order, and a file's first sequence is in its first header.
+        # Recovery cut every file whose first header _first_sequence finds
+        # torn, so the header of an open file is whole.
         # Only the file list is built up front; each file is read and scanned
         # when the slice reaches it, and released before the next. A write in
         # progress past durable may be torn, and the scan stops there;
         # everything durable comes before it.
         files = []
         for fd in list(self._fds.values()):
-            size = os.fstat(fd).st_size
-            first = _first_sequence(lambda n, off, fd=fd: os.pread(fd, n, off), size)
-            if size >= _HEADER.size and first <= durable:
+            head = os.pread(fd, _HEADER.size, 0)
+            if len(head) == _HEADER.size and (first := _HEADER.unpack(head)[0]) <= durable:
                 files.append((first, fd))
         files.sort()
         sent = 0
@@ -1062,7 +1064,7 @@ class _ScannedFile:
     def read(cls, file_id: int, path: Path) -> _ScannedFile:
         buf = path.read_bytes()
         committed, end = scan_committed(buf)
-        first = _first_sequence(lambda n, off: buf[off:off + n], len(buf))
+        first = _first_sequence(buf)
         return cls(file_id, path, first, committed, end, len(buf), any(buf[end:]))
 
 

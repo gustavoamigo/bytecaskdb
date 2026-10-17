@@ -1457,6 +1457,28 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
          zero_at(f[2], 0, 8);
        },
        false, {}, 1},
+      // A file with no first sequence is compared with no other, so damage
+      // in the sealed file just below it (no file above it starts higher)
+      // is refused only by the hint-less scan: a crash tears one file. Once
+      // for each file, since the row checks one.
+      {"sealed damage, newest landed one byte: the sealed file",
+       [](auto &f) {
+         drop_hint(f[1]);
+         flip_byte(f[1], kEntry + 15);
+         std::filesystem::resize_file(f[2], 0);
+         add_zero_tail(f[2]);
+         write_at(f[2], 0, "\x02");
+       },
+       false, {}, 1},
+      {"sealed damage, newest landed one byte: the newest file",
+       [](auto &f) {
+         drop_hint(f[1]);
+         flip_byte(f[1], kEntry + 15);
+         std::filesystem::resize_file(f[2], 0);
+         add_zero_tail(f[2]);
+         write_at(f[2], 0, "\x02");
+       },
+       false, {}, 2},
       {"sealed damage, newest torn too",
        [](auto &f) {
          drop_hint(f[1]);

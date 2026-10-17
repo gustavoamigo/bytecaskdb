@@ -40,6 +40,9 @@ export struct EntryHeader {
 };
 
 export constexpr std::size_t kHeaderSize = 15; // fixed leading fields
+// Where entry_type sits: right after the u64 sequence, which a write that
+// lands only a prefix of a header can leave incomplete.
+export constexpr std::size_t kEntryTypeOffset = 8;
 export constexpr std::size_t kCrcSize = 4;     // trailing CRC
 
 export struct DataEntry {

@@ -299,7 +299,7 @@ auto first_sequence(const DataFile &file) -> std::uint64_t {
   if (file.read_raw(0, hdr) < kHeaderSize) return 0;
   const auto h = read_header(hdr);
   if (!is_known_entry_type(h.entry_type) &&
-      tail_is_zero(file, sizeof(std::uint64_t)))
+      tail_is_zero(file, kEntryTypeOffset))
     return 0;
   return h.sequence;
 }
