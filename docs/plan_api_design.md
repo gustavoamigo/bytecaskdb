@@ -168,9 +168,10 @@ typedef struct {
 ```
 
 Table ids, index ids, layout ids and column offsets are constants the
-compiler emits into each plan from the catalog. They are opaque to the plan
-and checked by the fingerprint; a column offset outside its row is
-`BC_E_HANDLE` at the access.
+compiler emits into each plan from the catalog, resolved from permanent
+column ids (*Row format*). They are opaque to the plan and validated by the
+compatibility check at `bc_ctx_run`; a column offset outside its row reads
+as null (a shorter row) or is `BC_E_HANDLE` (a malformed one) at the access.
 
 ## Function reference
 
@@ -187,13 +188,13 @@ Called by the server, never by a plan.
 bc_ctx *bc_ctx_new(bc_db *db, const bc_catalog *cat, uint32_t arena_bytes);
 void    bc_ctx_free(bc_ctx *);
 void    bc_ctx_begin(bc_ctx *, const bc_params *params, bc_budget budget);  /* takes the snapshot */
-void    bc_ctx_run(bc_ctx *, bc_plan_fn plan, uint64_t plan_fingerprint);
+void    bc_ctx_run(bc_ctx *, bc_plan_fn plan, const bc_schema_ref *compiled_against);
 enum bc_commit_result bc_ctx_commit(bc_ctx *, bool sync);
 bool    bc_ctx_next_result(bc_ctx *, const uint8_t **row, uint32_t *len);     /* result rows, in emit order */
 void    bc_ctx_reset(bc_ctx *);                                               /* drops snapshot, plan, arena */
 enum bc_error_code bc_error(const bc_ctx *);
 const char *bc_error_message(const bc_ctx *);
-int     bc_execute(bc_ctx *, bc_plan_fn, uint64_t fingerprint, const bc_params *,
+int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params *,
                    bc_budget, bool sync, uint32_t max_retries);               /* the retry loop */
 ```
 
@@ -201,7 +202,7 @@ int     bc_execute(bc_ctx *, bc_plan_fn, uint64_t fingerprint, const bc_params *
 |---|---|
 | `bc_ctx_new` | Allocates a context bound to an open engine and a catalog, with an arena of `arena_bytes`. The arena is allocated once and reused. |
 | `bc_ctx_begin` | Takes a snapshot, binds the parameters, sets the budget. Clears the error. Must precede `bc_ctx_run`. |
-| `bc_ctx_run` | Checks `plan_fingerprint` against the catalog (`BC_E_LAYOUT` if it differs, and the plan does not run), then calls the plan. Returns when the plan returns. |
+| `bc_ctx_run` | Checks that the schema version the plan was compiled against is compatible with the live catalog: every column id it reads still has its offset and type, every table and index it writes still exists with the same key. A plan that fails the check sets `BC_E_LAYOUT` and does not run; the server recompiles it from the SQL it cached. Adding a column never invalidates a plan; adding an index invalidates the write plans of that table, which must maintain it. Then calls the plan and returns when it returns. |
 | `bc_ctx_commit` | Submits the write plan with `apply_batch`. `BC_COMMITTED` on success. `BC_CONFLICT` when the engine reports a guard or write-write conflict: nothing was written. `BC_FAILED` when `bc_error` is set, including an error raised during the plan: nothing is committed. A plan with no writes and no guards commits nothing and returns `BC_COMMITTED`. |
 | `bc_ctx_next_result` | Iterates the result buffer. Rows are in the row format of the layout the plan emitted. The runtime, not a plan, sees raw pointers here; valid until `bc_ctx_reset`. |
 | `bc_ctx_reset` | Releases the snapshot, drops the write plan and result buffer, resets the arena, bumps every generation so every handle and view the plan held is invalid. |
@@ -344,8 +345,8 @@ bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: live
 
 | Function | What it does |
 |---|---|
-| `bc_col_null` | Tests column `col`'s bit in the null bitmap. The compiler emits it before any decoder of a nullable column. |
-| `bc_col_i64`, `bc_col_i32`, `bc_col_f64` | Loads the fixed-width column at byte offset `off`. A null column reads as zero; the bitmap decides first. Little-endian in the row. |
+| `bc_col_null` | True if column `col`'s bit is set in the null bitmap, or if the column lies past the end of the row (written before the column existed). The compiler emits it before any decoder of a nullable column, and before any column added after the table was created. |
+| `bc_col_i64`, `bc_col_i32`, `bc_col_f64` | Loads the fixed-width column at byte offset `off`. A null column, or one past the end of a shorter row, reads as zero; `bc_col_null` decides first and reports both as null. Little-endian in the row. |
 | `bc_col_bytes` | The variable-length column in slot `slot`, as a view with the row's lifetime. |
 | `bc_row_pk` | Encodes the row's primary key from its columns, for an `UPDATE` or `DELETE` reached through a scan or a lookup. Built in the arena. |
 | `bc_row_begin` | Starts an empty row of `layout`: every column null. |
@@ -442,7 +443,7 @@ the language's definition, and the C compiler is a backend for programs that
 already passed them.
 
 **Structure.** One comment with the SQL text, the isolation level and the
-catalog fingerprint; `#include "bc_plan.h"` and nothing else; one `enum` of
+schema version the plan was compiled against; `#include "bc_plan.h"` and nothing else; one `enum` of
 catalog constants; one function `void plan(bc_ctx *cx)`. No other
 declarations: no globals, no `static`, no other functions, no macros, no
 `typedef`.
@@ -491,7 +492,7 @@ Payment's customer lookup by last name, serializable:
 /* SELECT c_id, c_first, c_balance FROM customer
    WHERE c_w_id = $1 AND c_d_id = $2 AND c_last = $3
    ORDER BY c_first LIMIT 1 OFFSET (count / 2)
-   isolation: serializable   catalog: 0x5a1c…   */
+   isolation: serializable   schema: customer v7   */
 #include "bc_plan.h"
 enum { TBL_CUSTOMER = 7, IDX_CUST_BY_NAME = 12, LAY_RESULT = 31,
        CUST_ID_OFF = 24, CUST_BALANCE_OFF = 40, CUST_FIRST_SLOT = 1 };
@@ -555,21 +556,51 @@ does, and the row carries the original value.
 ## Row format
 
 ```
-u16   layout_version        ; the catalog's version of this table's layout
+u16   layout_generation     ; which offset table decodes this row (see below)
+u16   row_bytes             ; length of the row; columns beyond it are null
 u8[]  null_bitmap           ; ceil(ncols / 8) bytes, bit set = null
-      fixed columns         ; at constant offsets, little-endian, 8-byte aligned region
+      fixed columns         ; at permanent offsets, little-endian, 8-byte aligned region
 u32[] var_end               ; nvar end offsets, relative to the start of var data
 u8[]  var data
 ```
 
 Fixed columns are `i64`, `i32`, `f64`, `bool`, and fixed-width binary. A
-variable column `k` occupies `[var_end[k-1], var_end[k])`. The layout
-version lets `ADD COLUMN` be a catalog change: a row at an older version
-decodes with that version's layout and new columns read as null or default.
-The decoders check every access against the row's length and the offset
-table, so a row that disagrees with its layout is `BC_E_HANDLE`, not a read
-past the end. Values over the engine's limit are refused at `bc_row_end`
-with `BC_E_LIMIT`; the engine's value ceiling applies to the whole row.
+variable column `k` occupies `[var_end[k-1], var_end[k])`.
+
+**Columns have permanent ids.** A column is given a small integer id when it
+is created, and the id is never reused, even after the column is dropped.
+Plans, rows and the catalog speak ids; names exist only in the compiler's
+binder. This is protobuf's field number, and it is what lets several schema
+versions of one table be served at once (see *Deferred*).
+
+**Positions are permanent and rows may be short.** Within a layout
+generation, a column's byte offset or variable slot is assigned when the
+column is created and never changes. New columns append; a dropped column
+leaves its offset or slot reserved. A row may be shorter than the current
+layout: a fixed column whose offset is at or past `row_bytes`, or a variable
+slot past the end of `var_end`, reads as null. So a plan compiled against an
+older version of the table decodes rows written by a newer one, ignoring
+the bytes it does not know, and a plan compiled against a newer version
+decodes older rows, seeing null where the column did not yet exist. Both
+use the same compile-time offsets and no per-row indirection; this is
+Cap'n Proto's evolution rule rather than FlatBuffers' per-row offset table.
+
+**Generations bound the cost of the rule.** Dropped fixed columns leave
+holes in every new row, and a type cannot change in place: a type change is
+a new column id. When the holes are worth reclaiming, an explicit
+`ALTER TABLE … REBUILD` starts a new layout generation with fresh offsets.
+`layout_generation` in the header says which generation's offsets decode
+the row. A plan's constants are its own generation's; a row of another
+generation takes the slow path, mapping each column id through that
+generation's offset table in the catalog. Rebuilds are rare and explicit,
+and updates and vacuum rewrite rows into the current generation, so the
+slow path stays rare.
+
+The decoders check every access against `row_bytes` and the offset table,
+so a row that disagrees with its layout is null or `BC_E_HANDLE`, never a
+read past the end. Values over the engine's limit are refused at
+`bc_row_end` with `BC_E_LIMIT`; the engine's value ceiling applies to the
+whole row.
 
 ## Validation plan
 
@@ -610,6 +641,18 @@ beside the record read.
 
 ## Deferred
 
+- **Several schema versions served at once.** The row format and the
+  permanent column ids above are the storage half, and are in the first
+  phase. The rest is catalog and DDL: the catalog keeps every version of a
+  table; a session declares the version it speaks and the binder resolves
+  that version's names and defaults; generated plans always write the
+  current layout and maintain the current indexes, filling defaults for
+  columns the client's version does not know, and read rows of any version
+  by the short-row rule. `ADD COLUMN` with a default and `DROP COLUMN` are
+  compatible changes and bump the version; `ALTER TABLE … REBUILD` starts a
+  layout generation; the catalog records which versions are still served so
+  an old one can be retired. Nothing is migrated for a client to keep
+  working.
 - **Read-your-own-writes across statements.** An interactive transaction is
   a snapshot and an accumulating write plan; later statements' cursors read
   through an overlay of the earlier writes. The overlay is the session
