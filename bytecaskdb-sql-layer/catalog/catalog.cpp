@@ -952,7 +952,8 @@ auto LiveCatalog::prepare(const Ddl& ddl) const -> Prepared {
     }
   } catch (const std::invalid_argument& e) {
     if (!p.backfill) throw;
-    throw std::length_error(std::string{"backfill does not fit one engine batch: "} + e.what());
+    throw std::length_error(std::string{"backfill refused by the engine (a key, or the 1 GiB batch, over its limit): "} +
+                            e.what());
   }
   return p;
 }
@@ -977,7 +978,8 @@ auto LiveCatalog::commit(Prepared p) -> bool {
   } catch (const std::invalid_argument& e) {
     done();
     if (!p.backfill) throw;
-    throw std::length_error(std::string{"backfill does not fit one engine batch: "} + e.what());
+    throw std::length_error(std::string{"backfill refused by the engine (a key, or the 1 GiB batch, over its limit): "} +
+                            e.what());
   } catch (...) {
     done();
     throw;

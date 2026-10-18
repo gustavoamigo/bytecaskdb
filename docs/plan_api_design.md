@@ -766,11 +766,12 @@ merged without a job doing so.
    interpreter for the subset.
 
 Layout: `bytecaskdb-sql-layer/algebra/` holds `bc_plan.h` and its C++
-implementation; `codec/` the key and row codecs; `catalog/` the catalog and
-the TPROC-C fixture; `plans/` the hand-written plan files, each with its SQL
+implementation; `codec/` the key and row codecs; `catalog/` the catalog
+(`docs/sql_layer_catalog_design.md`); `plans/` the hand-written plan files, each with its SQL
 in the header comment; `sql/` the parser transformer and binder; `plan/` the
 planner, code generator and loader; `api/` the embedded API; `check/` the
-checker; `tests/` the property tests, fault tests and the harness. Files
+checker; `tests/` the property tests, fault tests, the harness and the
+TPROC-C schema fixture (`tests/tpcc_schema.cppm`). Files
 marked `// prototype:` are disposable and are replaced in place. The C++ is
 organized as C++23 modules (`bytecask.sql.*`), as the engine is; `bc_plan.h`
 is a header because C reads it, and the only other headers are the ones

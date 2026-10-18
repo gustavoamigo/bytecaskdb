@@ -211,7 +211,10 @@ only; nothing is checked by version equality. A plan is compatible when:
 
 So adding a column invalidates nothing: no plan names the new column, and
 rows that plans compiled before it write get its default from
-`bc_row_begin`. Adding an index invalidates the write plans of its table,
+`bc_row_begin`. The binder keeps that true for statement text too: an
+`INSERT` without a column list fills the leading columns and gives the rest
+their defaults, as PostgreSQL does, so the same text binds the same way
+before and after the column is added. Adding an index invalidates the write plans of its table,
 which must maintain it, and no read plan. Dropping an index invalidates the
 plans that scan it and the write plans of its table. Dropping a table
 invalidates every plan on it, and recompiling one fails at bind. An
@@ -290,10 +293,13 @@ byte, with a bad type code, an unknown key column or trailing bytes, and a
 format-2 record, are refused; each DDL survives a reopen; a DDL refused by
 the engine (a follower) leaves nothing on disk or in memory; a drop leaves
 no key under the table's or index's prefix; the name entries and the
-records agree. `tests/api_test.cpp` and `tests/plan_api_test.cpp`: the
-compatibility cases (`ADD COLUMN` keeps a plan, `CREATE INDEX` recompiles
-a write plan and not a read plan, a drop recompiles or refuses), a write
-committed across a DDL is a conflict, a backfill raced by a write is
-retried, unique and `DESC` indexes through SQL. `tests/tpcc_test.cpp`: the
+records agree; a backfill raced by a write, and a DDL raced by another
+catalog's, are conflicts. `tests/plan_api_test.cpp`: each compatibility
+rule, and a write committed across a DDL on its table is a conflict.
+`tests/api_test.cpp`: through SQL, `ADD COLUMN` keeps every cached plan,
+`CREATE INDEX` recompiles the write plans and no read plan, a drop
+refuses at recompile; unique indexes and ranges on `DESC` parts, nullable
+and not. `tests/tcc_test.cpp`: a unique insert raced by another commit
+conflicts, and its retry raises the duplicate. `tests/tpcc_test.cpp`: the
 nine TPROC-C tables and their indexes, created by SQL DDL, reopened and
 checked.

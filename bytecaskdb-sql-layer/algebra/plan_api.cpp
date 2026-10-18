@@ -517,12 +517,11 @@ auto written_tables(const bc_ctx* cx) -> std::vector<std::uint32_t> {
   };
   for (const auto& e : cx->effects) {
     switch (e.kind) {
+      // A range's upper bound is often the next object's prefix: only its
+      // lower bound names what it deletes.
       case EffectKind::Put:
-      case EffectKind::Del: note(e.a); break;
-      case EffectKind::DelRange:
-        note(e.a);
-        note(e.b);
-        break;
+      case EffectKind::Del:
+      case EffectKind::DelRange: note(e.a); break;
       case EffectKind::GuardUnchanged:
       case EffectKind::GuardRange:
       case EffectKind::GuardPresent:
