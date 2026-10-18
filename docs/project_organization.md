@@ -33,6 +33,18 @@ These files contain **no MariaDB headers** and impose no GPL obligations on
 callers. A third party can embed them, link them, or ship them under their
 own MIT-compatible terms.
 
+### MIT — SQL Layer (`bytecaskdb-sql-layer/`)
+
+A SQL layer on the engine's public API (#487), MIT like the core. It links
+`libbytecask.a` through `include/bytecask.hpp`, as the tests do, and includes
+no MariaDB header: the plugin may depend on it, never the reverse. Today it
+holds the end-to-end prototype of #497; files marked `// prototype:` are
+disposable and will be replaced by the designed layers.
+
+Its third-party dependencies are fetched at build time, not vendored:
+libpg_query (PostgreSQL licence, with its bundled protobuf-c, MIT/BSD) and
+TinyCC (LGPL-2.1). The xmake targets that use them are not built by default.
+
 ### GPL-2.0 — MariaDB Integration (`bytecaskdb-mariadb-plugin/`)
 
 Files under `bytecaskdb-mariadb-plugin/` `#include` MariaDB server headers (`handler.h`,
@@ -76,6 +88,8 @@ bytecask/
 │   ├── key_encoding.h/cc
 │   └── row_encoding.h/cc
 │
+├── bytecaskdb-sql-layer/ # MIT — SQL layer on the public API (#487)
+│
 ├── tests/                # MIT — engine tests (no MariaDB)
 ├── benchmarks/           # MIT — engine benchmarks
 ├── docs/                 # Documentation
@@ -103,6 +117,7 @@ Builds the C++23 engine. Targets:
 | `engine_bench` | binary | Engine benchmarks vs RocksDB |
 | `bytecask_bench` | binary | Map structure benchmarks |
 | `bytecask` | static lib | `libbytecask.a` — consumed by MariaDB CMake |
+| `sql_layer_tests` | binary | SQL layer tests (Catch2), from `bytecaskdb-sql-layer/xmake.lua` |
 
 The `bytecask` static target compiles `bytecaskdb/` sources plus
 `bytecaskdb/bytecask_hpp.cpp` (the header's bridge to the modules). Tests

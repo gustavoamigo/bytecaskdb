@@ -992,3 +992,5 @@ target("wasm_tests")
     end)
 
 end -- if os.getenv("EMSDK")
+-- SQL layer (#487); its targets are not built by default.
+includes("bytecaskdb-sql-layer")
