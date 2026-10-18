@@ -43,6 +43,8 @@ class Writer {
 public:
   explicit Writer(const Catalog& cat, const Table& t) : cat_{cat}, t_{t} {}
 
+  [[nodiscard]] auto catalog() const -> const Catalog& { return cat_; }
+
   void line(const std::string& s) { body_ += std::string(2 * depth_, ' ') + s + "\n"; }
   void open(const std::string& s) {
     line(s + " {");
@@ -273,6 +275,11 @@ auto select_by_index(Writer& w, const bound::Select& s) -> void {
 
   auto type = t.column(col_id)->type;
   auto nullable = t.column(col_id)->nullable;
+  // The bounds below assume ASC: nulls first, successor for > and <=. A DESC
+  // part inverts both, which this generator does not handle yet (#489 adds DESC).
+  if (const auto* kl = w.catalog().key_layout(ix.id); kl == nullptr || kl->parts.empty() || kl->parts[0].desc) {
+    no_plan("a range on a DESC index part is not supported");
+  }
   // null_part: the bound is the null part itself. A comparison with NULL is
   // never true, so a scan with no lower bound starts past the null entries,
   // which sort first: at the successor of the null part.

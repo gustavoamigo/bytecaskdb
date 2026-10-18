@@ -24,30 +24,6 @@ export import bytecask.sql.tests.util;
 
 export namespace sql_test {
 
-// Every column of a row, by its layout: NULL, or the typed value.
-inline auto decode_row(const bytecask::sql::RowLayout& layout, bytecask::sql::BytesView row)
-    -> std::vector<bc_value> {
-  using bytecask::sql::PhysType;
-  std::vector<bc_value> out;
-  for (const auto& c : layout.columns) {
-    if (bytecask::sql::row_is_null(row, c)) {
-      out.emplace_back(std::monostate{});
-      continue;
-    }
-    switch (c.type) {
-      case PhysType::I64: out.emplace_back(bytecask::sql::row_i64(row, c.pos).value_or(0)); break;
-      case PhysType::F64: out.emplace_back(bytecask::sql::row_f64(row, c.pos).value_or(0.0)); break;
-      case PhysType::Bool: out.emplace_back(bytecask::sql::row_bool(row, c.pos).value_or(false)); break;
-      case PhysType::Bytes: {
-        auto v = bytecask::sql::row_bytes(row, c.pos).value_or(bytecask::sql::BytesView{});
-        out.emplace_back(bytecask::sql::Bytes(v.begin(), v.end()));
-        break;
-      }
-    }
-  }
-  return out;
-}
-
 struct Fixture {
   TempDir dir{"plan"};
   std::unique_ptr<bytecask::DB> db;  // DB is not movable: open() is elided into new
@@ -95,7 +71,7 @@ struct Fixture {
     const std::uint8_t* row = nullptr;
     std::uint32_t len = 0;
     while (bc_ctx_next_result(cx, &row, &len)) {
-      out.push_back(decode_row(rl, std::as_bytes(std::span{row, len})));
+      out.push_back(bytecask::sql::decode_row(rl, std::as_bytes(std::span{row, len})));
     }
     return out;
   }
@@ -103,9 +79,7 @@ struct Fixture {
 
 // A plan's result_types as the bc_type codes a bc_schema_ref carries.
 inline auto type_codes(std::span<const bytecask::sql::PhysType> types) -> std::vector<std::uint8_t> {
-  std::vector<std::uint8_t> out;
-  for (auto t : types) out.push_back(static_cast<std::uint8_t>(t));
-  return out;
+  return bytecask::sql::result_type_codes(types);
 }
 
 inline auto params(std::vector<bc_value> v) -> bc_params { return bc_params{std::move(v)}; }

@@ -30,27 +30,6 @@ namespace {
 constexpr std::uint32_t kArenaBytes = 4u << 20;
 constexpr std::uint32_t kMaxRetries = 3;
 
-auto decode_row(const RowLayout& layout, BytesView row) -> std::vector<Value> {
-  std::vector<Value> out;
-  for (const auto& c : layout.columns) {
-    if (row_is_null(row, c)) {
-      out.emplace_back(std::monostate{});
-      continue;
-    }
-    switch (c.type) {
-      case PhysType::I64: out.emplace_back(row_i64(row, c.pos).value_or(0)); break;
-      case PhysType::F64: out.emplace_back(row_f64(row, c.pos).value_or(0.0)); break;
-      case PhysType::Bool: out.emplace_back(row_bool(row, c.pos).value_or(false)); break;
-      case PhysType::Bytes: {
-        auto v = row_bytes(row, c.pos).value_or(BytesView{});
-        out.emplace_back(Bytes(v.begin(), v.end()));
-        break;
-      }
-    }
-  }
-  return out;
-}
-
 auto matches(const Value& v, PhysType t) -> bool {
   if (std::holds_alternative<std::monostate>(v)) return true;
   switch (t) {
@@ -114,8 +93,7 @@ void Database::compile(Statement& s) {
     for (auto id : sel->targets) s.columns_.push_back(sel->table->column(id)->name);
   }
   s.plan_ = std::make_unique<GeneratedPlan>(generate_plan(bound, cat_, s.sql_));
-  s.result_codes_.clear();
-  for (auto t : s.plan_->result_types) s.result_codes_.push_back(static_cast<std::uint8_t>(t));
+  s.result_codes_ = result_type_codes(s.plan_->result_types);
   s.result_layout_ = make_result_layout(s.plan_->result_types);
   s.code_ = TccPlan::compile(s.plan_->source);
 }
@@ -164,9 +142,6 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
                     static_cast<std::uint32_t>(stmt.result_codes_.size())};
   auto r = bc_execute(cx_, stmt.code_->fn(), &ref, &bp, {}, true, kMaxRetries);
   if (r == BC_CONFLICT) throw ExecError("conflict: a guard failed on every attempt", BC_CONFLICT);
-  if (r == BC_FAILED && bc_error(cx_) == BC_E_CONSTRAINT) {
-    throw ExecError(constraint_message(bc_error_detail(cx_)), BC_E_CONSTRAINT);
-  }
   if (r == BC_FAILED) throw ExecError(bc_error_message(cx_), bc_error(cx_));
 
   out.affected = bc_ctx_affected(cx_);

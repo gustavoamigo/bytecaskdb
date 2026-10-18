@@ -7,6 +7,8 @@ module;
 #include <cstdint>
 #include <span>
 #include <string>
+#include <variant>
+#include <vector>
 
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
 
@@ -22,6 +24,39 @@ auto fn_addr(F* f) -> const void* {
 }
 
 }  // namespace
+
+namespace bytecask::sql {
+
+auto decode_row(const RowLayout& layout, BytesView row) -> std::vector<bc_value> {
+  std::vector<bc_value> out;
+  out.reserve(layout.columns.size());
+  for (const auto& c : layout.columns) {
+    if (row_is_null(row, c)) {
+      out.emplace_back(std::monostate{});
+      continue;
+    }
+    switch (c.type) {
+      case PhysType::I64: out.emplace_back(row_i64(row, c.pos).value_or(0)); break;
+      case PhysType::F64: out.emplace_back(row_f64(row, c.pos).value_or(0.0)); break;
+      case PhysType::Bool: out.emplace_back(row_bool(row, c.pos).value_or(false)); break;
+      case PhysType::Bytes: {
+        auto v = row_bytes(row, c.pos).value_or(BytesView{});
+        out.emplace_back(Bytes(v.begin(), v.end()));
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+auto result_type_codes(std::span<const PhysType> types) -> std::vector<std::uint8_t> {
+  std::vector<std::uint8_t> out;
+  out.reserve(types.size());
+  for (auto t : types) out.push_back(static_cast<std::uint8_t>(t));
+  return out;
+}
+
+}  // namespace bytecask::sql
 
 auto constraint_message(std::uint32_t detail) -> std::string {
   auto object = std::to_string(detail & 0x00FF'FFFFu);

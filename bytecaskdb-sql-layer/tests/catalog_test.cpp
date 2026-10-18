@@ -118,6 +118,28 @@ TEST_CASE("catalog: a record of the prototype's format 1 is refused, not misread
   }
 }
 
+TEST_CASE("catalog: a record whose row layout breaks the format is refused at load", "[sql][catalog]") {
+  sql_test::TempDir dir{"catalog_layout"};
+  Bytes key;
+  {
+    auto db = bytecask::DB::open(dir.path());
+    auto cat = Catalog::load(db);
+    const auto& t = create_t(cat, db);
+    key = {std::byte{kNsCatalog}, std::byte{0x02}, std::byte{0}, std::byte{0}, std::byte{0},
+           static_cast<std::byte>(t.id)};
+    Bytes rec;
+    REQUIRE(db.get({}, key, rec));
+    // format u16, id u32, name (u16 length + "t"), version u32, layout id u32,
+    // generation u16: bitmap_bytes sits at byte 19.
+    rec[19] = std::byte{7};
+    rec[20] = std::byte{0};
+    db.put({}, key, rec);
+    db.close();
+  }
+  auto db = bytecask::DB::open(dir.path());
+  CHECK_THROWS_AS(Catalog::load(db), std::runtime_error);
+}
+
 TEST_CASE("catalog: the constants block a plan needs", "[sql][catalog]") {
   sql_test::TempDir dir{"catalog_consts"};
   auto db = bytecask::DB::open(dir.path());

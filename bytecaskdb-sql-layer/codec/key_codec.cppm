@@ -66,7 +66,7 @@ public:
   [[nodiscard]] auto read_bool(KeyPart part) -> std::optional<bool>;
   [[nodiscard]] auto read_bytes(KeyPart part) -> std::optional<Bytes>;
   // Skips one part, null or not; false if the key is malformed.
-  auto skip(KeyPart part) -> bool;
+  [[nodiscard]] auto skip(KeyPart part) -> bool;
 
   [[nodiscard]] auto ok() const noexcept -> bool { return ok_; }
   [[nodiscard]] auto last_was_null() const noexcept -> bool { return null_; }

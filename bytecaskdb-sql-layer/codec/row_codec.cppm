@@ -88,7 +88,12 @@ struct ColumnDef {
 // False, and nothing appended, if a column id has no bit in the bitmap or
 // the fixed region would outgrow the header's 16-bit var_table: the layout
 // needs a REBUILD.
-auto append_columns(RowLayout& layout, std::span<const ColumnDef> cols) -> bool;
+[[nodiscard]] auto append_columns(RowLayout& layout, std::span<const ColumnDef> cols) -> bool;
+// Whether a layout keeps the format's invariants: the bitmap a multiple of 8
+// bytes, every column id below its ceiling, fixed columns on word boundaries
+// inside the fixed region, slots below nvar, the header's 16-bit fields, a
+// known type. What a layout read from the catalog is checked against.
+[[nodiscard]] auto layout_valid(const RowLayout& layout) -> bool;
 // The layout of a plan's result rows: column i has id i and is nullable.
 [[nodiscard]] auto make_result_layout(std::span<const PhysType> types) -> RowLayout;
 
@@ -100,14 +105,15 @@ public:
   void reset();
   void copy_from(BytesView old);  // every column of old that this layout knows
   // false if col_id is not in the layout or has another type.
-  auto set_i64(std::uint32_t col_id, std::int64_t v) -> bool;
-  auto set_f64(std::uint32_t col_id, double v) -> bool;
-  auto set_bool(std::uint32_t col_id, bool v) -> bool;
-  auto set_bytes(std::uint32_t col_id, BytesView v) -> bool;
-  auto set_null(std::uint32_t col_id) -> bool;
+  [[nodiscard]] auto set_i64(std::uint32_t col_id, std::int64_t v) -> bool;
+  [[nodiscard]] auto set_f64(std::uint32_t col_id, double v) -> bool;
+  [[nodiscard]] auto set_bool(std::uint32_t col_id, bool v) -> bool;
+  [[nodiscard]] auto set_bytes(std::uint32_t col_id, BytesView v) -> bool;
+  [[nodiscard]] auto set_null(std::uint32_t col_id) -> bool;
   [[nodiscard]] auto missing_required() const -> bool;  // a non-nullable column is null
-  // Appends the row to out; false, and nothing appended, if it exceeds max_bytes.
-  auto finish(Bytes& out, std::size_t max_bytes = kMaxRowBytes) const -> bool;
+  // Appends the row to out; false, and nothing appended, if it exceeds
+  // max_bytes or the layout is not valid.
+  [[nodiscard]] auto finish(Bytes& out, std::size_t max_bytes = kMaxRowBytes) const -> bool;
 
 private:
   auto set_word(std::uint32_t col_id, PhysType type, std::uint64_t word) -> bool;

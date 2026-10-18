@@ -169,6 +169,12 @@ struct bc_ctx {
       fail(BC_E_DEGRADED, e.what());
     } catch (const bytecask::DbClosed& e) {
       fail(BC_E_CLOSED, e.what());
+    } catch (const bytecask::DbFollowerMode& e) {
+      fail(BC_E_DEGRADED, e.what());  // writes refused: the engine is a follower
+    } catch (const std::length_error& e) {
+      fail(BC_E_LIMIT, e.what());
+    } catch (const std::overflow_error& e) {
+      fail(BC_E_LIMIT, e.what());
     } catch (const std::system_error& e) {
       fail(BC_E_IO, e.what());
     } catch (const std::invalid_argument& e) {
@@ -182,12 +188,15 @@ struct bc_ctx {
 
   auto charge(std::uint64_t units = 1) -> bool {
     if (!ok()) return false;
+    auto before = reads;
     reads += units;
     if (budget.max_reads != 0 && reads > budget.max_reads) {
       fail(BC_E_BUDGET, "work budget exhausted");
       return false;
     }
-    if (budget.deadline_ns != 0 && (reads & 63) == 0) {
+    // Every 64 units, whatever the step: a charge of several units must not
+    // jump over the check.
+    if (budget.deadline_ns != 0 && before / 64 != reads / 64) {
       auto now = std::chrono::steady_clock::now().time_since_epoch();
       if (static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count()) >
           budget.deadline_ns) {
@@ -518,7 +527,12 @@ auto check_schema(bc_ctx* cx, const bc_schema_ref* ref) -> bool {
   // Kept across executions: a retry, or the next run of the same plan, does
   // not rebuild it.
   if (!cx->result_layout || types != cx->result_types) {
-    cx->result_layout.emplace(bytecask::sql::make_result_layout(types));
+    try {
+      cx->result_layout.emplace(bytecask::sql::make_result_layout(types));
+    } catch (const std::length_error&) {
+      cx->fail(BC_E_LAYOUT, "the plan's result row has too many columns for one row layout");
+      return false;
+    }
     cx->result_types = std::move(types);
   }
   return true;
@@ -617,6 +631,11 @@ void bc_ctx_run(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* compiled_again
 enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
   if (!cx->ok()) return BC_FAILED;
   if (cx->effects.empty()) return BC_COMMITTED;
+  if (!cx->snap) {
+    // Committed already (the write plan took the snapshot), or never begun.
+    cx->fail(BC_E_HANDLE, "bc_ctx_commit without a run to commit");
+    return BC_FAILED;
+  }
   try {
     cx->cursors.clear();
     bytecask::WritePlan plan{std::move(*cx->snap)};
@@ -632,6 +651,7 @@ enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
         case EffectKind::GuardAbsent: plan.ensure_absent(e.a); break;
       }
     }
+    cx->effects.clear();  // handed to the engine: a second commit has nothing to submit
     auto r = cx->db->apply_batch({.sync = sync}, std::move(plan));
     return r ? BC_COMMITTED : BC_CONFLICT;
   } catch (...) {
@@ -764,17 +784,17 @@ void bc_emit_end(bc_ctx* cx) {
     return;
   }
   BC_GUARD_BEGIN
-  Bytes row;
-  if (!cx->emit->finish(row)) {
+  // prototype: the result buffer is a heap vector, not part of the arena.
+  // The row is encoded straight into it, after its length.
+  auto at = cx->results.size();
+  cx->results.resize(at + 4);
+  if (!cx->emit->finish(cx->results)) {
+    cx->results.resize(at);
     cx->fail(BC_E_LIMIT, "result row over the row format's limit");
     return;
   }
-  // prototype: the result buffer is a heap vector, not part of the arena.
-  auto n = static_cast<std::uint32_t>(row.size());
-  auto at = cx->results.size();
-  cx->results.resize(at + 4 + n);
+  auto n = static_cast<std::uint32_t>(cx->results.size() - at - 4);
   std::memcpy(cx->results.data() + at, &n, 4);
-  std::memcpy(cx->results.data() + at + 4, row.data(), n);
   cx->emit.reset();
   BC_GUARD_END(cx)
 }
@@ -1158,8 +1178,8 @@ bc_view bc_col_bytes(bc_ctx* cx, bc_view row, uint32_t slot) {
 }
 
 bc_view bc_row_pk(bc_ctx* cx, uint32_t table, bc_view row) {
-  auto r = cx->resolve(row);
-  if (!r || !cx->ok()) return {};
+  auto r = resolve_row(cx, row);
+  if (!r) return {};
   const auto* t = cx->cat->table(table);
   if (t == nullptr) {
     cx->fail(BC_E_HANDLE, "no table " + std::to_string(table));
@@ -1191,12 +1211,16 @@ bc_row bc_row_begin(bc_ctx* cx, uint32_t layout) {
 }
 
 bc_row bc_row_from(bc_ctx* cx, uint32_t layout, bc_view old) {
-  auto o = cx->resolve(old);
+  auto o = resolve_row(cx, old);
   if (!o) return {};
   auto r = bc_row_begin(cx, layout);
   if (!cx->ok()) return {};
-  if (!bytecask::sql::row_valid(*o) || bytecask::sql::row_generation(*o) != cx->rows[r.i].layout->generation) {
-    cx->fail(BC_E_LAYOUT, "row is not of this layout");
+  if (!bytecask::sql::row_valid(*o)) {
+    cx->fail(BC_E_CORRUPT, "malformed row");
+    return {};
+  }
+  if (bytecask::sql::row_generation(*o) != cx->rows[r.i].layout->generation) {
+    cx->fail(BC_E_LAYOUT, "row is not of this layout generation");
     return {};
   }
   BC_GUARD_BEGIN

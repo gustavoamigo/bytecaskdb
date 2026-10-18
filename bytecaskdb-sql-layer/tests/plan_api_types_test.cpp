@@ -742,3 +742,88 @@ TEST_CASE("plan API: a stored row that does not parse is BC_E_CORRUPT, never NUL
   CHECK(run(f, null_of_empty, {}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
 }
+
+namespace {
+void row_pk_of_get(bc_ctx* cx) {
+  bc_key kb = bc_key_begin(cx, kTbl);
+  bc_key_i64(cx, kb, bc_param_i64(cx, 0));
+  bool found = false;
+  bc_view row = bc_get(cx, bc_key_end(cx, kb), &found);
+  bc_row_pk(cx, kTbl, row);
+}
+void row_from_get(bc_ctx* cx) {
+  bc_key kb = bc_key_begin(cx, kTbl);
+  bc_key_i64(cx, kb, bc_param_i64(cx, 0));
+  bool found = false;
+  bc_view row = bc_get(cx, bc_key_end(cx, kb), &found);
+  bc_row_from(cx, kLay, row);
+}
+// One read, then per scan step one unit and two counts of two units: the
+// total moves 1, 6, 11, ... and first lands on a multiple of 64 at 256.
+void step_by_five(bc_ctx* cx) {
+  bool found = false;
+  bc_key kb = bc_key_begin(cx, kTbl);
+  bc_key_i64(cx, kb, 1);
+  bc_get(cx, bc_key_end(cx, kb), &found);
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_count_range(cx, kTbl, bc_empty(cx), bc_empty(cx), 1);
+    bc_count_range(cx, kTbl, bc_empty(cx), bc_empty(cx), 1);
+  }
+}
+}  // namespace
+
+TEST_CASE("plan API: bc_row_pk and bc_row_from report a damaged row as BC_E_CORRUPT", "[sql][algebra]") {
+  Fixture f;
+  seed_t(f);
+  Bytes key;
+  bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
+  bytecask::sql::key_put_i64(key, 1, {PhysType::I64});
+  Bytes good;
+  REQUIRE(f.db->get({}, key, good));
+  auto bad = good;
+  bad.push_back(std::byte{0});  // row_bytes no longer matches the length
+  f.db->put({}, key, bad);
+  CHECK(run(f, row_pk_of_get, {std::int64_t{1}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CORRUPT);
+  CHECK(run(f, row_from_get, {std::int64_t{1}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CORRUPT);
+  // A header that parses with a var_end past the row: row_from's full check.
+  auto bad_var = good;
+  auto var_table = std::to_integer<std::size_t>(good[4]) | (std::to_integer<std::size_t>(good[5]) << 8);
+  bad_var[var_table] = std::byte{0xFF};
+  bad_var[var_table + 1] = std::byte{0xFF};
+  f.db->put({}, key, bad_var);
+  CHECK(run(f, row_from_get, {std::int64_t{1}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CORRUPT);
+}
+
+TEST_CASE("plan API: a charge of several units does not step over the deadline check", "[sql][algebra]") {
+  Fixture f;
+  for (std::int64_t i = 1; i <= 30; ++i) REQUIRE(run(f, insert_t, {i, bytes("n"), i}) == BC_COMMITTED);
+  auto ps = params({});
+  // No read budget, and a deadline long past: the first check must fail.
+  CHECK(bc_execute(f.cx, step_by_five, nullptr, &ps, {.max_reads = 0, .deadline_ns = 1}, false, 0) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_BUDGET);
+  CHECK(std::string{bc_error_message(f.cx)}.find("deadline") != std::string::npos);
+}
+
+TEST_CASE("plan API: a second commit and a too-wide result are plan errors, not UB or corruption", "[sql][algebra]") {
+  Fixture f;
+  auto ps = params({std::int64_t{1}, bytes("a"), std::int64_t{5}});
+  bc_ctx_begin(f.cx, &ps, {});
+  bc_ctx_run(f.cx, insert_t, nullptr);
+  CHECK(bc_ctx_commit(f.cx, false) == BC_COMMITTED);
+  CHECK(bc_ctx_commit(f.cx, false) == BC_COMMITTED);  // nothing left to submit
+  bc_ctx_reset(f.cx);
+  bc_ctx_begin(f.cx, &ps, {});
+  bc_ctx_run(f.cx, insert_t, nullptr);
+  bc_ctx_reset(f.cx);  // drops the snapshot and the write plan
+  CHECK(bc_ctx_commit(f.cx, false) == BC_COMMITTED);  // reset dropped the effects too
+
+  std::vector<std::uint8_t> wide(9000, BC_T_I64);
+  bc_schema_ref ref{f.cat.version(), nullptr, nullptr, 0, 0, wide.data(), static_cast<std::uint32_t>(wide.size())};
+  auto none = params({});
+  CHECK(bc_execute(f.cx, scan_all_forward, &ref, &none, {}, false, 0) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+}

@@ -545,6 +545,34 @@ TEST_CASE("row format: the bitmap is sized at create and has a ceiling", "[sql][
   CHECK_FALSE(row_present_bit(row, 1000));
 }
 
+TEST_CASE("row format: layout_valid holds the format's invariants, and finish refuses a broken layout", "[sql][codec]") {
+  const std::array<ColumnDef, 2> defs{{{0, PhysType::I64, false}, {1, PhysType::Bytes, true}}};
+  auto good = make_layout(defs);
+  CHECK(layout_valid(good));
+  auto past_ceiling = good;
+  past_ceiling.columns[1].col_id = good.id_ceiling();
+  CHECK_FALSE(layout_valid(past_ceiling));
+  auto odd_bitmap = good;
+  odd_bitmap.bitmap_bytes = 7;
+  CHECK_FALSE(layout_valid(odd_bitmap));
+  auto bad_type = good;
+  bad_type.columns[0].type = static_cast<PhysType>(9);
+  CHECK_FALSE(layout_valid(bad_type));
+  auto off_word = good;
+  off_word.columns[0].pos += 1;
+  CHECK_FALSE(layout_valid(off_word));
+  auto bad_slot = good;
+  bad_slot.columns[1].pos = 5;
+  CHECK_FALSE(layout_valid(bad_slot));
+  // A writer over a broken layout appends nothing rather than writing past the bitmap.
+  RowWriter w{past_ceiling};
+  REQUIRE(w.set_i64(0, 1));
+  REQUIRE(w.set_bytes(good.id_ceiling(), Bytes{std::byte{1}}));
+  Bytes out;
+  CHECK_FALSE(w.finish(out));
+  CHECK(out.empty());
+}
+
 TEST_CASE("row format: result layouts come from the plan's types", "[sql][codec]") {
   const std::array<PhysType, 3> types{PhysType::I64, PhysType::Bytes, PhysType::F64};
   auto layout = make_result_layout(types);

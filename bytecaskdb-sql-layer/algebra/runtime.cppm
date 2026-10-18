@@ -60,6 +60,17 @@ export using ::bc_ctx_affected;
 // and the embedded API's exception.
 export [[nodiscard]] auto constraint_message(std::uint32_t detail) -> std::string;
 
+export namespace bytecask::sql {
+
+// Every column of a result row, by its layout: NULL, or the typed value. The
+// one decoder of result rows, for the embedded API and the tests.
+[[nodiscard]] auto decode_row(const RowLayout& layout, BytesView row) -> std::vector<bc_value>;
+
+// A plan's result_types as the bc_type codes a bc_schema_ref carries.
+[[nodiscard]] auto result_type_codes(std::span<const PhysType> types) -> std::vector<std::uint8_t>;
+
+}  // namespace bytecask::sql
+
 export struct ApiSymbol {
   const char* name;
   const void* address;

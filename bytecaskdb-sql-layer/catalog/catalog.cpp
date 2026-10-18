@@ -185,6 +185,9 @@ auto deserialize(BytesView in) -> Table {
     }
     t.columns.push_back(std::move(c));
   }
+  if (!layout_valid(t.layout)) {
+    throw std::runtime_error("catalog record of table " + t.name + " has a malformed row layout");
+  }
   auto npk = r.u16();
   for (std::uint32_t i = 0; i < npk; ++i) t.pk_col_ids.push_back(r.u32());
   auto nidx = r.u16();
@@ -195,6 +198,12 @@ auto deserialize(BytesView in) -> Table {
     auto n = r.u16();
     for (std::uint32_t j = 0; j < n; ++j) ix.col_ids.push_back(r.u32());
     t.indexes.push_back(std::move(ix));
+  }
+  // Every key column must be a column of the table.
+  auto known = [&](std::uint32_t id) { return t.column(id) != nullptr; };
+  auto index_ok = [&](const Index& ix) { return std::ranges::all_of(ix.col_ids, known); };
+  if (t.pk_col_ids.empty() || !std::ranges::all_of(t.pk_col_ids, known) || !std::ranges::all_of(t.indexes, index_ok)) {
+    throw std::runtime_error("catalog record of table " + t.name + " names a key column it does not have");
   }
   return t;
 }

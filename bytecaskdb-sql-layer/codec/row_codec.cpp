@@ -5,6 +5,7 @@
 
 module;
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -207,34 +208,64 @@ auto RowWriter::finish(Bytes& out, std::size_t max_bytes) const -> bool {
   auto total = std::size_t{l.fixed_end} + 4 * std::size_t{l.nvar} + var_bytes;
   if (total > max_bytes || total > kMaxRowBytes) return false;
 
-  Bytes row(total, std::byte{0});
-  store_le(row, 0, l.generation, 2);
-  store_le(row, 2, narrow<std::uint16_t>(l.bitmap_bytes), 2);
-  store_le(row, 4, narrow<std::uint16_t>(l.fixed_end), 2);
-  store_le(row, 6, narrow<std::uint16_t>(l.nvar), 2);
-  store_le(row, 8, narrow<std::uint32_t>(total), 4);
+  // A layout that breaks the format's invariants is refused, never encoded
+  // past the bitmap or the header's fields.
+  if (!layout_valid(l)) return false;
+  auto header_fields = std::array{narrow<std::uint16_t>(l.bitmap_bytes), narrow<std::uint16_t>(l.fixed_end),
+                                  narrow<std::uint16_t>(l.nvar)};
 
-  std::vector<std::size_t> var_src(l.nvar, 0);
+  // Encoded in place at the end of out: no temporary row.
+  auto at = out.size();
+  out.resize(at + total, std::byte{0});
+  store_le(out, at, l.generation, 2);
+  for (std::size_t f = 0; f < header_fields.size(); ++f) store_le(out, at + 2 + 2 * f, header_fields[f], 2);
+  store_le(out, at + 8, narrow<std::uint32_t>(total), 4);
+
+  auto data = at + std::size_t{l.fixed_end} + 4 * std::size_t{l.nvar};
   for (std::size_t i = 0; i < l.columns.size(); ++i) {
     const auto& c = l.columns[i];
-    if (present_[i]) {
-      row[kRowHeaderBytes + c.col_id / 8] |= static_cast<std::byte>(1u << (c.col_id % 8));
-    }
-    if (is_fixed(c.type)) {
-      store_le(row, c.pos, fixed_[i], kFixedColumnBytes);
-    } else {
-      var_src[c.pos] = i;
-    }
+    if (present_[i]) out[at + kRowHeaderBytes + c.col_id / 8] |= static_cast<std::byte>(1u << (c.col_id % 8));
+    if (is_fixed(c.type)) store_le(out, at + c.pos, fixed_[i], kFixedColumnBytes);
   }
-  auto data = std::size_t{l.fixed_end} + 4 * std::size_t{l.nvar};
+  // Variable data in slot order; a slot no column holds (a dropped column) is empty.
   auto end = std::size_t{0};
   for (std::uint32_t s = 0; s < l.nvar; ++s) {
-    const auto& v = var_[var_src[s]];
-    std::ranges::copy(v, row.begin() + static_cast<std::ptrdiff_t>(data + end));
-    end += v.size();
-    store_le(row, l.fixed_end + 4 * std::size_t{s}, end, 4);
+    for (std::size_t i = 0; i < l.columns.size(); ++i) {
+      const auto& c = l.columns[i];
+      if (is_fixed(c.type) || c.pos != s) continue;
+      std::ranges::copy(var_[i], out.begin() + static_cast<std::ptrdiff_t>(data + end));
+      end += var_[i].size();
+      break;
+    }
+    store_le(out, at + l.fixed_end + 4 * std::size_t{s}, end, 4);
   }
-  out.insert(out.end(), row.begin(), row.end());
+  return true;
+}
+
+auto layout_valid(const RowLayout& l) -> bool {
+  if (l.bitmap_bytes == 0 || l.bitmap_bytes % 8 != 0) return false;
+  if (l.fixed_start != kRowHeaderBytes + l.bitmap_bytes || l.fixed_end < l.fixed_start) return false;
+  if (l.fixed_end > kMaxVarTable || l.nvar > kMaxVarTable) return false;
+  if ((l.fixed_end - l.fixed_start) % kFixedColumnBytes != 0) return false;
+  for (const auto& c : l.columns) {
+    if (c.col_id >= l.id_ceiling()) return false;
+    // A type code no build knows (a damaged record) is out of the enum's range.
+    auto code = static_cast<int>(c.type);
+    if (code < static_cast<int>(PhysType::I64) || code > static_cast<int>(PhysType::Bytes)) return false;
+    switch (c.type) {
+      case PhysType::I64:
+      case PhysType::F64:
+      case PhysType::Bool:
+        if (c.pos < l.fixed_start || c.pos + kFixedColumnBytes > l.fixed_end ||
+            (c.pos - l.fixed_start) % kFixedColumnBytes != 0) {
+          return false;
+        }
+        break;
+      case PhysType::Bytes:
+        if (c.pos >= l.nvar) return false;
+        break;
+    }
+  }
   return true;
 }
 
