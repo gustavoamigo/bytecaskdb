@@ -60,6 +60,17 @@ jobs:
             git ninja-build
           pip3 install nanobind pytest hypothesis
 
+      # The packages xmake builds from source, libpg_query and TinyCC among
+      # them (bytecaskdb-sql-layer/xmake.lua), each a git clone and a build
+      # per run otherwise. The key carries every pinned version: a bump in
+      # either file is a new entry, and a GitHub fetch failure for one of the
+      # repositories then costs a cache miss, not the run.
+      - name: Cache xmake packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.xmake/packages
+          key: xmake-packages-fedora43-${{ hashFiles('xmake.lua', 'bytecaskdb-sql-layer/xmake.lua') }}
+
       - name: Configure xmake
         run: |
           RESOURCE_DIR=$(clang --print-resource-dir)

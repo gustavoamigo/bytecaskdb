@@ -68,11 +68,12 @@ jobs:
           dnf install -y \
             clang llvm llvm-devel lld \
             libcxx libcxx-devel libstdc++-static \
-            xmake cmake \
+            xmake cmake make which \
             python3-pip python3-devel \
             git ninja-build
           # bytecaskdb_python's on_load() asks nanobind for its include dir,
-          # and xmake f loads every target.
+          # and xmake f loads every target. make and which: the libpg_query
+          # and TinyCC builds sql_layer_tests needs.
           pip3 install nanobind pytest hypothesis
 
       # build_msan_libcxx.sh picks its llvm-project release branch from the
@@ -112,6 +113,23 @@ jobs:
           if [ "${{ matrix.sanitizer }}" = "undefined" ] && [ "${{ matrix.keydir }}" = "blind" ]; then
             xmake build btree_tests
           fi
+
+      # The SQL layer (bytecaskdb-sql-layer), whose plans TinyCC compiles at
+      # run time and which call back into plan_api.cpp. Not under MSan:
+      # libpg_query and TinyCC are built uninstrumented by their package
+      # rules, and MSan reports their stores as uninitialized reads. Its
+      # catalog does not depend on BYTECASK_KEYDIR, so one key directory runs
+      # it. -y confirms the two package fetches.
+      - name: Build sql_layer_tests
+        if: matrix.sanitizer != 'memory' && matrix.keydir == 'blind'
+        run: xmake build -y sql_layer_tests
+
+      - name: Run sql_layer_tests under ${{ matrix.sanitizer }} sanitizer
+        if: matrix.sanitizer != 'memory' && matrix.keydir == 'blind'
+        env:
+          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
+          TSAN_OPTIONS: ${{ matrix.sanitizer == 'thread' && 'halt_on_error=0 history_size=4' || '' }}
+        run: xmake run sql_layer_tests --durations yes
 
       # The key-directory trees' own tests, where the bit arithmetic is
       # exercised most directly. They do not depend on BYTECASK_KEYDIR, so
