@@ -50,14 +50,14 @@ package("tinycc")
 package_end()
 add_requires("tinycc 2026.09.26", {optional = true})
 
--- C++23 modules, as the engine: one interface unit per module
--- (bytecask.sql.<name>), public so sql_layer_tests imports them. The one
--- header is algebra/bc_plan.h, the C contract; the one plain translation unit
--- is algebra/plan_api.cpp, its extern "C" definitions.
+-- C++23 modules, as the engine (the root sets the modules policy for every
+-- target): one interface unit per module (bytecask.sql.<name>), public so
+-- sql_layer_tests imports them. The one header is algebra/bc_plan.h, the C
+-- contract; the one plain translation unit is algebra/plan_api.cpp, its
+-- extern "C" definitions.
 target("sql_layer")
     set_kind("static")
     set_default(false)
-    set_policy("build.c++.modules", true)
     add_deps("bytecask")
     add_rules("bytecask.native_flags")
     add_includedirs("..", {public = true})
