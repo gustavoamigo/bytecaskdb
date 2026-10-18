@@ -234,14 +234,13 @@ local function add_release_opts(t)
     end
 end
 
--- The flags of a native target: pthread, the sanitizer, the release options.
--- A target adds this rule where it would call the three functions above; the
--- targets that also call apply_coverage keep an explicit on_config. Included
--- files (bytecaskdb-sql-layer/xmake.lua) cannot call the functions, only add
--- the rule. Under MSan the test targets add what pairs with the libc++ flags
--- through bytecask.catch2 below; the sql-layer's libpg_query and TinyCC are
--- built uninstrumented, so an MSan binary of it builds but reports their
--- stores as uninitialized reads.
+-- The same flags for a native target that an included file defines
+-- (bytecaskdb-sql-layer/xmake.lua), which cannot call this file's local
+-- functions: its targets add this rule where the targets below call them.
+-- Moving the targets below onto the rule is #502. Under MSan the test targets
+-- add what pairs with the libc++ flags through bytecask.catch2; the
+-- sql-layer's libpg_query and TinyCC are built uninstrumented, so an MSan
+-- binary of it builds but reports their stores as uninitialized reads.
 rule("bytecask.native_flags")
     on_config(function (t)
         add_native_syslinks(t)
@@ -372,7 +371,11 @@ target("map_bench")
     add_cxflags("-Wno-global-constructors")
     add_packages("benchmark", "crc32c", "zstd")
     add_defines("BYTECASK_TESTING")
-    add_rules("bytecask.native_flags")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
 
 target("engine_bench")
     set_kind("binary")
@@ -388,7 +391,11 @@ target("engine_bench")
     else
         add_packages("benchmark", "crc32c", "zstd", "rocksdb")
     end
-    add_rules("bytecask.native_flags")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
 
 -- Serial section of the write path under many writers: throughput, batch
 -- shape and group_writer_busy_us for a TPROC-C-shaped commit
@@ -399,7 +406,11 @@ target("commit_probe")
     add_files("benchmarks/commit_probe.cpp")
     add_engine_files()
     add_packages("crc32c", "zstd")
-    add_rules("bytecask.native_flags")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
 
 -- Buffer pool sweep over pool_bytes / dataset_bytes. Deliberately independent
 -- of engine_bench: no RocksDB, no Google Benchmark, since this is a parameter
@@ -410,7 +421,11 @@ target("pool_bench")
     add_files("benchmarks/pool_bench.cpp")
     add_engine_files()
     add_packages("crc32c", "zstd")
-    add_rules("bytecask.native_flags")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
 
 target("memory_profile")
     set_kind("binary")
@@ -419,7 +434,11 @@ target("memory_profile")
     add_engine_files()
     add_packages("crc32c", "zstd", "jemalloc")
     add_defines("BYTECASK_TESTING")
-    add_rules("bytecask.native_flags")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
 
 -- Crash-consistency harness (tests/crash/crash_consistency.cpp): SIGKILLs a
 -- writer process at random points and checks the durable prefix on reopen.
@@ -433,7 +452,11 @@ target("crash_consistency")
     add_includedirs("bytecaskdb")
     add_packages("crc32c", "zstd")
     add_defines("BYTECASK_TESTING")
-    add_rules("bytecask.native_flags")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
 
 -- Chaos worker (tests/chaos/chaos_worker.cpp): runs the crash workload on a
 -- chaosfs mount under I/O faults and power loss, and checks each process
@@ -446,7 +469,11 @@ target("chaos_worker")
     add_includedirs("bytecaskdb")
     add_packages("crc32c", "zstd")
     add_defines("BYTECASK_TESTING")
-    add_rules("bytecask.native_flags")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
 
 -- Isolation history generator for Elle. See docs/isolation_checking_design.md.
 -- BYTECASK_TESTING exposes the fault injector the degrade nemesis arms.
@@ -458,7 +485,11 @@ target("isolation_history")
     add_includedirs("bytecaskdb")
     add_packages("crc32c", "zstd")
     add_defines("BYTECASK_TESTING")
-    add_rules("bytecask.native_flags")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
 
 -- Static library target for out-of-tree consumers (e.g. the MariaDB plugin).
 -- Compiles all C++23 module sources and exposes them via libbytecask.a.
@@ -476,8 +507,10 @@ target("bytecask")
     add_files("bytecaskdb/bytecask_hpp.cpp")
     add_engine_files()
     add_packages("crc32c", "zstd")
-    add_rules("bytecask.native_flags")
     on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
         -- TLS descriptors: a thread_local in a dlopen'ed object otherwise
         -- costs a call to __tls_get_addr per access (2.8% of mariadbd's CPU on
         -- sysbench oltp_read_write). An ELF option, so Linux only (Darwin's
@@ -574,7 +607,11 @@ target("bytecaskdb_python")
     if is_host("macosx") then
         add_shflags("-undefined", "dynamic_lookup", {force = true})
     end
-    add_rules("bytecask.native_flags")
+    on_config(function(t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
 
 -- Native Node.js addon via node-addon-api (N-API). Wraps the public PIMPL
 -- header (include/bytecask.hpp) and links against the bytecask static
