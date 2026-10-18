@@ -43,8 +43,9 @@ holds the end-to-end prototype of #497; files marked `// prototype:` are
 disposable and will be replaced by the designed layers.
 
 Its C++ is organized as C++23 modules, as the engine's is: one interface unit
-per module, named `bytecask.sql.<name>`, holding the declarations and the
-definitions.
+per module, named `bytecask.sql.<name>`, with the exported declarations, and
+an implementation unit beside it (`<name>.cpp`, `module bytecask.sql.<name>;`)
+with the definitions, so a body edit recompiles no importer.
 
 | Module | File | What it is |
 |--------|------|------------|
@@ -53,10 +54,10 @@ definitions.
 | `bytecask.sql.catalog` | `catalog/catalog.cppm` | Tables, permanent column ids, indexes, persisted under namespace `0x01` |
 | `bytecask.sql.runtime` | `algebra/runtime.cppm` | The C++ side of the plan API: the types `bc_plan.h` leaves opaque, and the symbol table a run-time loader links plans against |
 | `bytecask.sql.ast` | `sql/ast.cppm` | The AST the parser hands the binder |
-| `bytecask.sql.parser` | `sql/parser.cppm` | libpg_query behind `parse()`; the only unit that sees its headers |
+| `bytecask.sql.parser` | `sql/parser.cppm` | libpg_query behind `parse()`; `parser.cpp` is the only unit that sees its headers |
 | `bytecask.sql.binder` | `sql/binder.cppm` | Names to ids, parameter types from use |
 | `bytecask.sql.codegen` | `plan/codegen.cppm` | Planner and code generator |
-| `bytecask.sql.tcc_loader` | `plan/tcc_loader.cppm` | TinyCC in process; the only unit that sees `libtcc.h` |
+| `bytecask.sql.tcc_loader` | `plan/tcc_loader.cppm` | TinyCC in process; with `tcc_loader.cpp` the only unit that sees `libtcc.h` |
 | `bytecask.sql.api` | `api/database.cppm` | The embedded API |
 
 One header: `algebra/bc_plan.h`, the C contract, which generated plans,
@@ -121,7 +122,7 @@ bytecask/
 │
 ├── bytecaskdb-sql-layer/ # MIT — SQL layer on the public API (#487)
 │   ├── algebra/          # bc_plan.h (the one header), plan_api.cpp, runtime.cppm
-│   ├── codec/ catalog/ sql/ plan/ api/   # bytecask.sql.* module interface units
+│   ├── codec/ catalog/ sql/ plan/ api/   # bytecask.sql.* interface (.cppm) and implementation (.cpp) units
 │   ├── plans/            # Hand-written plans, C
 │   ├── tests/            # Catch2 tests; shared fixtures as bytecask.sql.tests.* modules
 │   └── xmake.lua         # sql_layer, sql_layer_tests; libpg_query and TinyCC package rules

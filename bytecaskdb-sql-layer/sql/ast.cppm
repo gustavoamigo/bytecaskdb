@@ -5,7 +5,8 @@
 // statement forms and nothing else. Names are as written; positions are
 // byte offsets into the statement text, -1 where libpg_query gives none.
 //
-// prototype: replaced by the designed front end (#492).
+// prototype: replaced by the designed front end (#492). SqlError's
+// destructor is in ast.cpp.
 
 module;
 #include <cstdint>
@@ -105,11 +106,5 @@ struct Delete {
 };
 
 using Statement = std::variant<CreateTable, CreateIndex, Insert, Select, Update, Delete>;
-
-}  // namespace bytecask::sql::ast
-
-namespace bytecask::sql::ast {
-
-SqlError::~SqlError() = default;
 
 }  // namespace bytecask::sql::ast

@@ -52,9 +52,11 @@ add_requires("tinycc 2026.09.26", {optional = true})
 
 -- C++23 modules, as the engine (the root sets the modules policy for every
 -- target): one interface unit per module (bytecask.sql.<name>), public so
--- sql_layer_tests imports them. The one header is algebra/bc_plan.h, the C
--- contract; the one plain translation unit is algebra/plan_api.cpp, its
--- extern "C" definitions.
+-- sql_layer_tests imports them, and one implementation unit beside it with
+-- the definitions, laid out as add_engine_files() lays out the engine's. The
+-- one header is algebra/bc_plan.h, the C contract; algebra/plan_api.cpp, its
+-- extern "C" definitions, is a plain translation unit among the
+-- implementation units.
 target("sql_layer")
     set_kind("static")
     set_default(false)
@@ -63,7 +65,7 @@ target("sql_layer")
     add_includedirs("..", {public = true})
     add_files("codec/*.cppm", "catalog/*.cppm", "algebra/*.cppm", "sql/*.cppm", "plan/*.cppm", "api/*.cppm",
               {public = true})
-    add_files("algebra/plan_api.cpp")
+    add_files("codec/*.cpp", "catalog/*.cpp", "algebra/*.cpp", "sql/*.cpp", "plan/*.cpp", "api/*.cpp")
     add_packages("libpg_query", "tinycc", {public = true})
     add_defines("SQL_LAYER_ALGEBRA_DIR=\"" .. path.join(os.scriptdir(), "algebra") .. "\"")
     on_config(function (t)
