@@ -230,6 +230,72 @@ jobs:
           build/linux/x86_64/release/bytecask_tests
 
   # ---------------------------------------------------------------------------
+  # SQL layer (bytecaskdb-sql-layer, #487): builds and runs sql_layer_tests.
+  # libpg_query and TinyCC are fetched and built from source through the
+  # package rules in bytecaskdb-sql-layer/xmake.lua. No MariaDB development
+  # package is installed: nothing under bytecaskdb-sql-layer/ may include a
+  # MariaDB header, and this job is what keeps that true. Runs with the rest
+  # of this workflow, so on every change under bytecaskdb-sql-layer/,
+  # xmake.lua, include/ or bytecaskdb/.
+  # ---------------------------------------------------------------------------
+  sql-layer:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+    permissions:
+      contents: read
+      checks: write
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        # make and which: libpg_query's and TinyCC's own builds. nanobind:
+        # bytecaskdb_python's on_load() asks it for its include dir, and
+        # xmake f loads every target.
+        run: |
+          dnf install -y \
+            clang llvm llvm-devel lld \
+            libcxx libcxx-devel libstdc++-static \
+            xmake make which \
+            python3-pip python3-devel \
+            git ninja-build
+          pip3 install nanobind
+
+      - name: Configure xmake
+        run: |
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          xmake f --toolchain=clang \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            -y
+
+      - name: Build sql_layer_tests
+        # -y confirms the libpg_query and TinyCC fetches.
+        run: xmake build -y sql_layer_tests
+
+      - name: Run sql_layer_tests
+        run: |
+          mkdir -p test-results
+          build/linux/x86_64/release/sql_layer_tests --reporter junit --out test-results/sql_layer_tests.xml
+
+      - name: Publish test results in GitHub Checks
+        if: ${{ always() && !cancelled() }}
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          files: test-results/sql_layer_tests.xml
+          check_name: SQL Layer Test Results
+          comment_mode: off
+
+      - name: Upload JUnit reports artifact
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-sql-layer-results
+          path: test-results/sql_layer_tests.xml
+
+  # ---------------------------------------------------------------------------
   # MariaDB storage engine plugin: unit + proof tests (Catch2/ctest) and the
   # functional suite against a live mariadbd (pytest).
   # ---------------------------------------------------------------------------
