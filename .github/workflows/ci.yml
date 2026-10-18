@@ -50,10 +50,12 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # make and which: the libpg_query and TinyCC builds sql_layer_tests
+          # needs (bytecaskdb-sql-layer/xmake.lua).
           dnf install -y \
             clang llvm llvm-devel lld \
             libcxx libcxx-devel libstdc++-static \
-            xmake \
+            xmake make which \
             python3-pip python3-devel \
             git ninja-build
           pip3 install nanobind pytest hypothesis
@@ -69,6 +71,12 @@ jobs:
         run: |
           xmake build bytecask_tests
           xmake build btree_tests
+          # The SQL layer (bytecaskdb-sql-layer, #487), on the engine just
+          # built. -y confirms the libpg_query and TinyCC fetches; both are
+          # built from source. This job installs no MariaDB development
+          # package, and nothing under bytecaskdb-sql-layer/ may include a
+          # MariaDB header: building it here is what keeps that true.
+          xmake build -y sql_layer_tests
           # Built here so a break shows up on the PR; they run in
           # crash-nightly.yml, isolation-nightly.yml and chaos-nightly.yml.
           xmake build crash_consistency
@@ -81,6 +89,7 @@ jobs:
           status=0
           build/linux/x86_64/release/bytecask_tests --reporter junit --out test-results/bytecask_tests.xml || status=1
           build/linux/x86_64/release/btree_tests --reporter junit --out test-results/btree_tests.xml || status=1
+          build/linux/x86_64/release/sql_layer_tests --reporter junit --out test-results/sql_layer_tests.xml || status=1
           exit "$status"
 
       - name: Every mutation's Guarded-by spec selects a test
@@ -119,7 +128,8 @@ jobs:
         run: |
           /usr/bin/python scripts/enrich_junit_sources.py \
             --pair build/linux/x86_64/release/bytecask_tests:test-results/bytecask_tests.xml \
-            --pair build/linux/x86_64/release/btree_tests:test-results/btree_tests.xml
+            --pair build/linux/x86_64/release/btree_tests:test-results/btree_tests.xml \
+            --pair build/linux/x86_64/release/sql_layer_tests:test-results/sql_layer_tests.xml
 
       - name: Publish test results in GitHub Checks
         if: ${{ always() && !cancelled() }}
@@ -142,7 +152,7 @@ jobs:
         with:
           # Comma-separated: the action passes a multi-line value to the CLI
           # as one path, which it cannot find.
-          files: ./test-results/bytecask_tests.xml,./test-results/btree_tests.xml
+          files: ./test-results/bytecask_tests.xml,./test-results/btree_tests.xml,./test-results/sql_layer_tests.xml
           report_type: test_results
           flags: cpp
           name: bytecask-cpp-tests
@@ -228,72 +238,6 @@ jobs:
         run: |
           xmake build bytecask_tests
           build/linux/x86_64/release/bytecask_tests
-
-  # ---------------------------------------------------------------------------
-  # SQL layer (bytecaskdb-sql-layer, #487): builds and runs sql_layer_tests.
-  # libpg_query and TinyCC are fetched and built from source through the
-  # package rules in bytecaskdb-sql-layer/xmake.lua. No MariaDB development
-  # package is installed: nothing under bytecaskdb-sql-layer/ may include a
-  # MariaDB header, and this job is what keeps that true. Runs with the rest
-  # of this workflow, so on every change under bytecaskdb-sql-layer/,
-  # xmake.lua, include/ or bytecaskdb/.
-  # ---------------------------------------------------------------------------
-  sql-layer:
-    runs-on: ubuntu-latest
-    container:
-      image: fedora:43
-    permissions:
-      contents: read
-      checks: write
-    env:
-      BYTECASK_MARCH: x86-64-v3
-      XMAKE_ROOT: "y"
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        # make and which: libpg_query's and TinyCC's own builds. nanobind:
-        # bytecaskdb_python's on_load() asks it for its include dir, and
-        # xmake f loads every target.
-        run: |
-          dnf install -y \
-            clang llvm llvm-devel lld \
-            libcxx libcxx-devel libstdc++-static \
-            xmake make which \
-            python3-pip python3-devel \
-            git ninja-build
-          pip3 install nanobind
-
-      - name: Configure xmake
-        run: |
-          RESOURCE_DIR=$(clang --print-resource-dir)
-          xmake f --toolchain=clang \
-            --cxflags="-resource-dir=${RESOURCE_DIR}" \
-            -y
-
-      - name: Build sql_layer_tests
-        # -y confirms the libpg_query and TinyCC fetches.
-        run: xmake build -y sql_layer_tests
-
-      - name: Run sql_layer_tests
-        run: |
-          mkdir -p test-results
-          build/linux/x86_64/release/sql_layer_tests --reporter junit --out test-results/sql_layer_tests.xml
-
-      - name: Publish test results in GitHub Checks
-        if: ${{ always() && !cancelled() }}
-        uses: EnricoMi/publish-unit-test-result-action@v2
-        with:
-          files: test-results/sql_layer_tests.xml
-          check_name: SQL Layer Test Results
-          comment_mode: off
-
-      - name: Upload JUnit reports artifact
-        if: ${{ always() && !cancelled() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: junit-sql-layer-results
-          path: test-results/sql_layer_tests.xml
 
   # ---------------------------------------------------------------------------
   # MariaDB storage engine plugin: unit + proof tests (Catch2/ctest) and the
