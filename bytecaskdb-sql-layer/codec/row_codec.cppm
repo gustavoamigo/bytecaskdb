@@ -70,12 +70,14 @@ struct ColumnDef {
 };
 
 // Assigns positions in column order: fixed columns one word each after the
-// bitmap, variable columns the next slot.
+// bitmap, variable columns the next slot. Throws std::length_error if the
+// fixed region would outgrow the header's 16-bit var_table.
 [[nodiscard]] auto make_layout(std::span<const ColumnDef> cols, std::uint16_t generation = 1)
     -> RowLayout;
 // Appends columns to a layout, keeping every existing position (ADD COLUMN).
-// False, and nothing appended, if a column id has no bit in the bitmap: the
-// layout needs a REBUILD.
+// False, and nothing appended, if a column id has no bit in the bitmap or
+// the fixed region would outgrow the header's 16-bit var_table: the layout
+// needs a REBUILD.
 auto append_columns(RowLayout& layout, std::span<const ColumnDef> cols) -> bool;
 // The layout of a plan's result rows: column i has id i and is nullable.
 [[nodiscard]] auto make_result_layout(std::span<const PhysType> types) -> RowLayout;

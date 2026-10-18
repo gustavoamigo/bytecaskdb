@@ -36,7 +36,7 @@ constexpr std::uint32_t kTbl = 1;
 constexpr std::uint32_t kLay = 2;
 constexpr std::uint32_t kIdx = 3;
 constexpr std::uint32_t kIdCol = 0, kNameCol = 1, kQtyCol = 2;
-constexpr std::uint32_t kIdOff = 20, kNameSlot = 0;
+constexpr std::uint32_t kIdOff = 20;
 
 // A second table with the other physical types: m (k BIGINT PRIMARY KEY,
 // x DOUBLE PRECISION, b BOOLEAN) with an index on x. Ids follow t's.

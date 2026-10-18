@@ -20,6 +20,7 @@
 #include <optional>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 import bytecask.sql.row_codec;
@@ -510,6 +511,22 @@ TEST_CASE("row format: the bitmap is sized at create and has a ceiling", "[sql][
   defs.push_back({48, PhysType::I64, true});
   CHECK(make_layout(defs).bitmap_bytes == 16);
   CHECK(make_layout(std::span<const ColumnDef>{}).bitmap_bytes == 8);
+
+  // The fixed region ends where the header's 16-bit var_table does.
+  std::vector<ColumnDef> many;
+  for (std::uint32_t i = 0; i < 9000; ++i) many.push_back({i, PhysType::I64, true});
+  auto wide = make_layout(std::span<const ColumnDef>{many}.first(8000));
+  CHECK(wide.fixed_end <= 0xFFFF);
+  CHECK(wide.columns.size() == 8000);
+  CHECK_FALSE(append_columns(wide, std::span<const ColumnDef>{many}.subspan(8000, 1000)));
+  CHECK(wide.columns.size() == 8000);
+  CHECK_THROWS_AS(make_layout(many), std::length_error);
+  RowWriter ww{wide};
+  for (std::uint32_t i = 0; i < 8000; ++i) REQUIRE(ww.set_i64(i, i));
+  Bytes wide_row;
+  REQUIRE(ww.finish(wide_row));
+  CHECK(row_valid(wide_row));
+  CHECK(row_i64(wide_row, wide.find(7999)->pos) == 7999);
 
   // The row carries the size, and a bit past the bitmap is clear.
   RowWriter w{layout};

@@ -10,6 +10,7 @@ module;
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 module bytecask.sql.row_codec;
@@ -19,6 +20,7 @@ namespace bytecask::sql {
 namespace {
 
 constexpr std::uint32_t kBitmapGranuleBits = 64;
+constexpr std::uint32_t kMaxVarTable = 0xFFFF;
 
 auto load_le(BytesView b, std::size_t at, std::size_t width) -> std::uint64_t {
   std::uint64_t v = 0;
@@ -77,13 +79,25 @@ auto make_layout(std::span<const ColumnDef> cols, std::uint16_t generation) -> R
   l.bitmap_bytes = bitmap_bytes_for(id_ceiling);
   l.fixed_start = static_cast<std::uint32_t>(kRowHeaderBytes) + l.bitmap_bytes;
   l.fixed_end = l.fixed_start;
-  (void)append_columns(l, cols);  // every id is below the ceiling by construction
+  // Every id is below the ceiling by construction; only the 16-bit bound on
+  // the fixed region can refuse.
+  if (!append_columns(l, cols)) throw std::length_error("too many columns for one row layout");
   return l;
 }
 
 auto append_columns(RowLayout& layout, std::span<const ColumnDef> cols) -> bool {
+  auto fixed_end = layout.fixed_end;
+  auto nvar = layout.nvar;
   for (const auto& c : cols) {
     if (c.col_id >= layout.id_ceiling()) return false;
+    // The header stores var_table and nvar in 16 bits.
+    if (is_fixed(c.type)) {
+      if (fixed_end + kFixedColumnBytes > kMaxVarTable) return false;
+      fixed_end += kFixedColumnBytes;
+    } else {
+      if (nvar + 1 > kMaxVarTable) return false;
+      ++nvar;
+    }
   }
   for (const auto& c : cols) {
     ColumnSlot s{c.col_id, c.type, c.nullable, 0};
