@@ -38,7 +38,7 @@ struct GeneratedPlan {
   bool returns_rows{false};
   std::vector<PhysType> result_types;  // the plan's result layout, for its bc_schema_ref
   // What its bc_schema_ref lists (docs/sql_layer_catalog_design.md,
-  // *Compatibility*). A plan whose version is the live one is compatible without the walk.
+  // *Compatibility*). The embedded API skips the walk while the version is unchanged.
   std::uint64_t catalog_version{0};
   std::vector<std::uint32_t> objects_read, tables_written, indexes_written;
   std::vector<ColumnDep> columns;

@@ -1,6 +1,6 @@
-/* INSERT INTO t VALUES ($1, $2, $3)
-   isolation: snapshot   schema: catalog v2
-   objects: TBL_1 t, LAY_2 t layout, IDX_3 t_by_name, COL_1_0 t.id, COL_1_1 t.name, COL_1_2 t.qty */
+// INSERT INTO t VALUES ($1, $2, $3)
+// isolation: snapshot   schema: catalog v2
+// objects: TBL_1 t, LAY_2 t layout, IDX_3 t_by_name, COL_1_0 t.id, COL_1_1 t.name, COL_1_2 t.qty
 #include "bc_plan.h"
 enum { TBL_1 = 1, LAY_2 = 2, IDX_3 = 3, COL_1_0_COL = 0, COL_1_1_COL = 1, COL_1_2_COL = 2 };
 

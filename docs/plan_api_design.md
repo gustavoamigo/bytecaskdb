@@ -218,7 +218,7 @@ typedef struct { uint32_t layout, col, pos; uint8_t type; } bc_col_ref;
    *Compatibility*); the result layout is the plan's own and is not a
    catalog object. */
 typedef struct {
-  uint64_t catalog_version;                                     /* equal to the pinned version: compatible */
+  uint64_t catalog_version;                                     /* compiled against; a cache's cheap check */
   const uint32_t   *objects_read;    uint32_t n_read;           /* tables and indexes it reads */
   const uint32_t   *tables_written;  uint32_t n_written;        /* tables whose rows it writes */
   const uint32_t   *indexes_written; uint32_t n_indexes_written;/* every index of those tables it maintains */
@@ -535,9 +535,10 @@ for the subset; a file it rejects never reaches a compiler. The rules are
 the language's definition, and the C compiler is a backend for programs that
 already passed them.
 
-**Structure.** One comment with the SQL text, the isolation level, the
-schema version the plan was compiled against and the objects its constants
-stand for; `#include "bc_plan.h"` and nothing else; one `enum` of
+**Structure.** Three `//` comment lines: the SQL text, the isolation level
+and schema version the plan was compiled against, and the objects its
+constants stand for, every byte of user text outside printable ASCII (and
+`\` and `?`) written as `\xNN` so none can end or splice a line; `#include "bc_plan.h"` and nothing else; one `enum` of
 catalog constants; one function `void plan(bc_ctx *cx)`. A plan file is its
 own compilation unit, and `plan` is the only symbol it exports; a loader
 compiles one file per plan, and a build that links several plans into one
@@ -587,12 +588,9 @@ call were to misreport.
 Payment's customer lookup by last name, serializable:
 
 ```c
-/* SELECT c_id, c_first, c_balance FROM customer
-   WHERE c_w_id = $1 AND c_d_id = $2 AND c_last = $3
-   ORDER BY c_first LIMIT 1 OFFSET (count / 2)
-   isolation: serializable   schema: customer v7
-   objects: TBL_7 customer, IDX_12 cust_by_name, COL_7_0 customer.c_id,
-            COL_7_3 customer.c_first, COL_7_16 customer.c_balance */
+// SELECT c_id, c_first, c_balance FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_last = $3 ORDER BY c_first LIMIT 1 OFFSET (count / 2)
+// isolation: serializable   schema: customer v7
+// objects: TBL_7 customer, IDX_12 cust_by_name, COL_7_0 customer.c_id, COL_7_3 customer.c_first, COL_7_16 customer.c_balance
 #include "bc_plan.h"
 enum { TBL_7 = 7, IDX_12 = 12,
        COL_7_0_OFF = 24, COL_7_16_OFF = 40, COL_7_3_SLOT = 1 };
@@ -888,8 +886,9 @@ and the API changed where implementing them showed a gap.
   written and the indexes it maintains, columns with their positions and
   types, as `bc_col_ref`) instead of a catalog version to match: the
   version-equality check recompiled every plan on every DDL, and the
-  per-column rule the design always stated needs the columns. A plan
-  compiled against the pinned version itself skips the walk.
+  per-column rule the design always stated needs the columns. The
+  embedded API skips the walk for a cached plan while the version is
+  unchanged; `bc_ctx_run` always walks.
 - `bc_ctx_begin` pins a catalog version with its snapshot, and
   `bc_ctx_commit` guards the catalog record of every table it writes, so a
   plan never commits rows shaped by a catalog the engine has moved past.
@@ -902,5 +901,7 @@ and the API changed where implementing them showed a gap.
   adopted.
 - A plan's constants are named from ids (`TBL_<table>`, `LAY_<layout>`,
   `IDX_<index>`, `COL_<table>_<column>_OFF|_SLOT|_COL`), with the objects
-  they stand for listed in the header comment: a SQL name need not be a C
-  identifier, and two names cannot produce the same constant.
+  they stand for listed in the header: a SQL name need not be a C
+  identifier, and two names cannot produce the same constant. The header
+  is `//` lines with user bytes outside printable ASCII, `\` and `?`
+  escaped as `\xNN`, so no name or SQL text can end or splice it.

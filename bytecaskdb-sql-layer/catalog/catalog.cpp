@@ -958,28 +958,31 @@ auto LiveCatalog::pin() const -> Pinned {
     auto g = gen_.load();
     auto cat = current();
     auto snap = db_.snapshot();
-    if (gen_.load() != g) continue;  // a DDL commit began or ended in between
-    if (g % 2 == 0) return Pinned{std::move(cat), std::move(snap)};
-    // A DDL's commit is in flight. The engine publishes a batch only after
-    // its sync, so for most of the commit the snapshot is still the old
-    // catalog's; it holds the DDL only between the engine's publication and
-    // the swap of current_. One read tells which, and only then is there a
-    // wait, for the swap.
-    if (snapshot_version(snap) == cat->version()) return Pinned{std::move(cat), std::move(snap)};
-    gen_.wait(g);
+    // One read: the catalog version the snapshot holds. The version was
+    // loaded before the snapshot was taken, so the snapshot is never behind.
+    auto version = snapshot_version(snap);
+    if (version == cat->version()) return Pinned{std::move(cat), std::move(snap)};
+    if (g % 2 == 1 || gen_.load() != g) {
+      // This catalog's own DDL is between the engine's publication and the
+      // swap of current_ (or has just finished): wait for the swap.
+      if (g % 2 == 1) gen_.wait(g);
+      continue;
+    }
+    // Another catalog on this database moved the version (only tests open
+    // two): catch up from the snapshot rather than pair it with a stale
+    // version. A racing publisher's version wins the swap; this one is
+    // consistent with this snapshot either way.
+    auto fresh = std::make_shared<const Catalog>(Catalog::load(snap));
+    (void)current_.compare_exchange_strong(cat, fresh);
+    return Pinned{std::move(fresh), std::move(snap)};
   }
 }
 
 auto LiveCatalog::prepare(const Ddl& ddl) -> Prepared {
+  // pin() pairs the snapshot with the catalog version it holds, reloading
+  // when another catalog on the database moved it: a DDL never builds on a
+  // stale version, which would hand out its ids again.
   auto [base, snap] = pin();
-  // Another catalog on this database (a second LiveCatalog, which nothing
-  // but tests opens) may have committed DDL this one has not seen: a DDL
-  // built on the stale version would hand out its ids again. Build on what
-  // the snapshot holds, and publish it.
-  if (snapshot_version(snap) != base->version()) {
-    base = std::make_shared<const Catalog>(Catalog::load(snap));
-    current_.store(base);
-  }
   std::vector<Catalog::DdlOp> ops;
   Prepared p{base, nullptr, nullptr, false};
   p.next = base->next_version(ddl, snap, ops, p.backfill, backfill_limit_);

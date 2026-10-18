@@ -95,7 +95,7 @@ typedef struct {
    (docs/sql_layer_catalog_design.md, *Compatibility*); the result layout is
    the plan's own and is not a catalog object. */
 typedef struct {
-  uint64_t catalog_version;                                       /* equal to the pinned version: compatible */
+  uint64_t catalog_version;                                       /* compiled against; a cache's cheap check */
   const uint32_t   *objects_read;    uint32_t n_read;             /* tables and indexes it reads */
   const uint32_t   *tables_written;  uint32_t n_written;          /* tables whose rows it writes */
   const uint32_t   *indexes_written; uint32_t n_indexes_written;  /* every index of those tables it maintains */

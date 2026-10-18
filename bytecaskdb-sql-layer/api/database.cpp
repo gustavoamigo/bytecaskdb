@@ -142,7 +142,12 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   }
   // A plan the catalog has moved past is recompiled from its text; one a
   // DDL left compatible keeps running.
-  if (schema_incompatibility(*live_->current(), stmt.ref_)) compile(stmt);
+  // The walk runs only when the catalog has moved since the compile: an
+  // unchanged version is one compare. bc_ctx_run checks in full regardless.
+  if (auto cat = live_->current();
+      stmt.ref_.catalog_version != cat->version() && schema_incompatibility(*cat, stmt.ref_)) {
+    compile(stmt);
+  }
 
   const auto& types = stmt.plan_->param_types;
   if (params.size() != types.size()) {

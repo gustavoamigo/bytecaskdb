@@ -280,9 +280,9 @@ TEST_CASE("embedded API: names that are not C identifiers work end to end", "[sq
   CHECK(db->execute(kIns, {i(1), bytes("p"), i(10)}).affected == 1);
   CHECK(db->execute(kIns, {i(2), bytes("q"), i(20)}).affected == 1);
   CHECK_THROWS_AS(db->execute(kIns, {i(3), bytes("q"), i(30)}), ExecError);
-  // The header comment names the objects, with the "*/" in a name defused.
+  // The header names the objects; in a // line "*/" is plain text.
   const auto& ins = db->prepare(kIns);
-  CHECK(ins.plan_source().find("a-b c.x* /y") != std::string::npos);
+  CHECK(ins.plan_source().find("a-b c.x*/y") != std::string::npos);
   CHECK(ids(db->execute(R"(SELECT "my id" FROM "a-b c" WHERE "x*/y" >= $1 AND "x*/y" < $2)", {bytes("a"), bytes("z")})) ==
         std::vector<std::int64_t>{1, 2});
   CHECK(db->execute(R"(UPDATE "a-b c" SET "1st" = "1st" - $2 WHERE "my id" = $1)", {i(1), i(3)}).affected == 1);
@@ -302,16 +302,39 @@ TEST_CASE("embedded API: a quoted name keeps its case, and nothing in a name esc
   CHECK(db->execute(R"(SELECT v FROM "Foo" WHERE k = $1)", {i(1)}).rows == Grid{{i(10)}});
   CHECK(db->execute("SELECT v FROM FOO WHERE k = $1", {i(1)}).rows == Grid{{i(20)}});  // unquoted folds to foo
 
-  // A column whose name splices "*\<newline>/" would close the header comment
-  // and compile what follows as code; here that code would fail to compile.
-  constexpr auto kEvil = "*\\\n/\n#error injected\n/*";
-  (void)db->execute(std::string{R"(CREATE TABLE e (k BIGINT PRIMARY KEY, ")"} + kEvil + R"(" BIGINT))");
-  auto sel = std::string{R"(SELECT ")"} + kEvil + R"(" FROM e WHERE k = $1)";
-  (void)db->execute("INSERT INTO e VALUES ($1, $2)", {i(1), i(5)});
-  CHECK(db->execute(sel, {i(1)}).rows == Grid{{i(5)}});
-  const auto& src = db->prepare(sel).plan_source();
-  auto header = src.substr(0, src.find("*/"));
-  CHECK(header.find('\\') == std::string::npos);
-  CHECK(src.find("#error") != std::string::npos);  // still there, inside the comment
-  CHECK(src.find("\n#error") == std::string::npos);
+  // Names that would end or splice a C comment: a backslash-newline before
+  // "/", a "*/", a carriage return, "??/" (a backslash as a trigraph). Were
+  // any of them to reach the lexer as more than comment text, the "#error"
+  // line would be compiled and the plan would not build.
+  const std::vector<std::string> evils{"*\\\n/\n#error injected\n/*", "x */\n#error injected\n",
+                                       "cr\r\n#error injected", "t?" "?/\n#error injected", "back\\slash\\"};
+  for (const auto& evil : evils) {
+    INFO(evil);
+    auto quoted = "\"" + evil + "\"";
+    (void)db->execute("CREATE TABLE e (k BIGINT PRIMARY KEY, " + quoted + " BIGINT)");
+    (void)db->execute("INSERT INTO e VALUES ($1, $2)", {i(1), i(5)});
+    auto sel = "SELECT " + quoted + " FROM e WHERE k = $1";
+    CHECK(db->execute(sel, {i(1)}).rows == Grid{{i(5)}});
+    const auto& src = db->prepare(sel).plan_source();
+    // Three header lines, each a // comment with no raw backslash, "?" or
+    // carriage return: only \xNN escapes.
+    auto header = src.substr(0, src.find("#include"));
+    std::size_t lines = 0;
+    for (std::size_t at = 0; at < header.size();) {
+      auto end = header.find('\n', at);
+      auto line = header.substr(at, end - at);
+      CHECK(line.starts_with("// "));
+      for (std::size_t k = line.find('\\'); k != std::string::npos; k = line.find('\\', k + 1)) {
+        CHECK(line.compare(k, 2, "\\x") == 0);
+      }
+      CHECK(line.find('\r') == std::string::npos);
+      CHECK(line.find('?') == std::string::npos);
+      CHECK_FALSE(line.ends_with("\\"));
+      ++lines;
+      at = end + 1;
+    }
+    CHECK(lines == 3);
+    CHECK(src.find("\n#error") == std::string::npos);
+    (void)db->execute("DROP TABLE e");
+  }
 }

@@ -1,6 +1,6 @@
-/* DELETE FROM t WHERE id = $1
-   isolation: snapshot   schema: catalog v2
-   objects: TBL_1 t, IDX_3 t_by_name, COL_1_1 t.name */
+// DELETE FROM t WHERE id = $1
+// isolation: snapshot   schema: catalog v2
+// objects: TBL_1 t, IDX_3 t_by_name, COL_1_1 t.name
 #include "bc_plan.h"
 enum { TBL_1 = 1, IDX_3 = 3, COL_1_1_SLOT = 0, COL_1_1_COL = 1 };
 

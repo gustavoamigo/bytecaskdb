@@ -313,7 +313,7 @@ public:
 private:
   DB& db_;
   // Readers load it without a lock; a DDL stores the next version.
-  std::atomic<std::shared_ptr<const Catalog>> current_;
+  mutable std::atomic<std::shared_ptr<const Catalog>> current_;  // pin() may catch up with another catalog
   [[nodiscard]] auto commit_locked(Prepared p) -> bool;
 
   std::mutex ddl_mu_;  // one DDL at a time: apply holds it from prepare to publication

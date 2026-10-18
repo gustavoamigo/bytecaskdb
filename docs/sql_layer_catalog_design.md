@@ -20,7 +20,7 @@ GPL-2.0, and nothing of it is copied.
 | Field | Meaning |
 |---|---|
 | `id` | Permanent object id, from the one counter below. Never reused. |
-| `name` | As the parser hands it over: an unquoted identifier folded to lower case by PostgreSQL's rules, a quoted one exactly as written, so `"Foo"` and `foo` are two tables. Plans never paste a name into C: their constants are named from ids (`TBL_1`, `LAY_2`, `IDX_3`, `COL_1_2_OFF`, `COL_1_2_COL`), so a name need not be an identifier and two objects' constants cannot collide. The plan's header comment lists what each constant stands for. |
+| `name` | As the parser hands it over: an unquoted identifier folded to lower case by PostgreSQL's rules, a quoted one exactly as written, so `"Foo"` and `foo` are two tables. Plans never paste a name into C: their constants are named from ids (`TBL_1`, `LAY_2`, `IDX_3`, `COL_1_2_OFF`, `COL_1_2_COL`), so a name need not be an identifier and two objects' constants cannot collide. The plan's header lists what each constant stands for, in `//` lines whose user bytes outside printable ASCII, `\` and `?` are `\xNN` escapes. |
 | `version` | Per-table counter, bumped by every DDL on the table. Not checked by plans (see *Compatibility*); kept for stage 2. |
 | `next_col_id` | The next column id. Column ids are permanent and never reused, even after a column is dropped. |
 | columns | Each: permanent `id`, `name`, SQL type (kind, `VARCHAR` length, `DECIMAL` precision and scale), nullability, default. The physical type follows from the SQL type (`docs/sql_layer_types_design.md`, *Stage-1 types*). |
@@ -179,16 +179,16 @@ length of a `CREATE INDEX`.
 Two rules make a pinned version agree with the engine:
 
 1. **A version and a snapshot are taken together.** `LiveCatalog::pin`
-   reads a generation counter, takes the version and the snapshot, and
-   reads the counter again, retrying if it changed. A DDL makes the counter
-   odd before its batch reaches the engine and even after it swaps the
-   version in. The engine publishes a batch only after its sync, so while
-   the counter is odd the snapshot is almost always still the old
-   version's; a pin that finds it odd reads the catalog version from its
-   snapshot (one record read) and waits only if the engine has already
-   published the DDL and the swap has not happened yet. So no plan pairs a
-   snapshot that holds a DDL with the version before it, or the reverse,
-   and no reader waits through a backfill's write and sync.
+   loads the current version, takes a snapshot, and reads the catalog
+   version the snapshot holds (one record read). Equal, they agree. The
+   snapshot can only be ahead: either this catalog's own DDL has reached the
+   engine and not yet swapped the version in, which a generation counter
+   (odd from just before the batch reaches the engine until the swap) tells
+   apart, and the pin waits for the swap; or another catalog on the same
+   database moved it, and the pin reloads the catalog from the snapshot and
+   publishes it. The engine publishes a batch only after its sync, so no
+   reader waits through a backfill's write and sync, and no plan pairs a
+   snapshot with a version it does not hold.
 2. **A write commit guards the records of the tables it writes.**
    `bc_ctx_commit` adds `ensure_unchanged(01 02 <table_id>)` for every table
    whose rows or index entries the write plan touches, found from the keys
@@ -201,17 +201,16 @@ Two rules make a pinned version agree with the engine:
 DDL statements are serialized by a mutex in `LiveCatalog`, held from the
 prepare to the publication, so a DDL never conflicts with another of the
 same catalog; the engine's directory lock keeps a second process out. A
-second `LiveCatalog` on the same open database (only tests open one) is
-caught at its next DDL: `prepare` compares the snapshot's catalog version
-with its own and, if another catalog moved it, reloads from the snapshot
-before building, so no id is handed out twice.
+second `LiveCatalog` on the same open database (only tests open one)
+catches up at its next pin, so its DDL never builds on a stale version and
+never hands out an id twice.
 
 ## Compatibility
 
 `bc_schema_ref` lists what a plan depends on, and `bc_ctx_run` checks it
-against the pinned version. A plan compiled against the pinned version itself
-is compatible without more: version equality is the fast path, one compare
-per execution. Otherwise a plan is compatible when:
+against the pinned version, in full on every execution. (The embedded API
+asks the same question of a cached plan only when the catalog version has
+moved since it compiled it.) A plan is compatible when:
 
 - **every table and index it reads exists.** Ids are never reused, and a
   table's primary key and an index's parts never change, so existence is

@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -528,6 +529,32 @@ TEST_CASE("catalog: a backfill raced by a write, and two catalogs on one databas
   auto s2 = fresh.prepare(CreateTableDdl{"w2", {col("k", SqlKind::BigInt)}, {"k"}});
   CHECK(fresh.commit(std::move(s1)));
   CHECK_FALSE(fresh.commit(std::move(s2)));
+}
+
+TEST_CASE("catalog: two catalogs on one database interleave DDL without reusing an id", "[sql][catalog]") {
+  sql_test::TempDir dir{"catalog_two"};
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog a{db};
+    LiveCatalog b{db};
+    for (int i = 0; i < 10; ++i) {
+      (void)a.apply(CreateTableDdl{"a" + std::to_string(i), {col("k", SqlKind::BigInt)}, {"k"}});
+      // b's next pin sees a's table: a reader catches up, not only a DDL.
+      CHECK(b.pin().cat->table("a" + std::to_string(i)) != nullptr);
+      (void)b.apply(CreateTableDdl{"b" + std::to_string(i), {col("k", SqlKind::BigInt)}, {"k"}});
+    }
+    db.close();
+  }
+  auto db = DB::open(dir.path());
+  LiveCatalog again{db};
+  auto cat = again.current();
+  REQUIRE(cat->tables().size() == 20);
+  std::set<std::uint32_t> ids;
+  for (const auto& [id, t] : cat->tables()) {
+    CHECK(ids.insert(t.id).second);
+    CHECK(ids.insert(t.layout_id).second);
+  }
+  CHECK(cat->version() == 20);
 }
 
 TEST_CASE("catalog: a backfill past the batch limit is refused before it gathers the table", "[sql][catalog]") {

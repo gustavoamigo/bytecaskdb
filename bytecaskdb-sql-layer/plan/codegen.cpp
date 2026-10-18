@@ -39,27 +39,26 @@ auto suffix(PhysType t) -> std::string {
   return "i64";
 }
 
-// Text for the plan's header comment. SQL and names are the user's, and the
-// comment must end where the plan ends it, so nothing in them may close it:
-// "*/" is broken by a space, and a backslash (a line splice before "/"),
-// "?" (the "??/" trigraph is a backslash) and "%" (the escape itself) are
-// written as %XX, as are control characters, a newline included. What is
-// left cannot end or splice the comment.
-auto comment_safe(std::string_view s) -> std::string {
-  constexpr std::string_view kHex = "0123456789ABCDEF";
-  std::string out;
-  for (std::size_t i = 0; i < s.size(); ++i) {
-    auto c = static_cast<unsigned char>(s[i]);
-    if (c < 0x20 || c == 0x7F || c == '\\' || c == '?' || c == '%') {
-      out += '%';
-      out += kHex[c >> 4];
-      out += kHex[c & 0x0F];
+// One line of the plan's header, as a // comment. SQL and names are the
+// user's, and none of their bytes may reach the C lexer as anything but
+// comment text: a newline would end the comment, a backslash before one (or
+// "??/", its trigraph) would splice the next line into it. So every byte
+// outside letters, digits, space and printable punctuation other than "\"
+// and "?" is written as \xNN; a line can then neither end early nor splice.
+auto comment_line(std::string_view s) -> std::string {
+  constexpr std::string_view kHex = "0123456789abcdef";
+  std::string out = "// ";
+  for (auto ch : s) {
+    auto c = static_cast<unsigned char>(ch);
+    if (c >= 0x20 && c < 0x7F && c != '\\' && c != '?') {
+      out.push_back(ch);
       continue;
     }
-    out.push_back(s[i]);
-    if (s[i] == '*' && i + 1 < s.size() && s[i + 1] == '/') out.push_back(' ');
+    out += "\\x";
+    out += kHex[c >> 4];
+    out += kHex[c & 0x0F];
   }
-  return out;
+  return out + "\n";
 }
 
 // Writes the body line by line, and records which catalog constants it used.
@@ -565,9 +564,8 @@ auto generate_plan(const bound::Bound& b, const Catalog& cat, std::string_view s
   auto build = [&](const Table& t, auto&& body) {
     Writer w{t};
     body(w);
-    out.source = "/* " + comment_safe(sql) + "\n   isolation: snapshot   schema: catalog v" +
-                 std::to_string(cat.version()) + "\n   objects: " + comment_safe(w.legend()) +
-                 " */\n#include \"bc_plan.h\"\n" + w.constants() +
+    out.source = comment_line(sql) + comment_line("isolation: snapshot   schema: catalog v" + std::to_string(cat.version())) +
+                 comment_line("objects: " + w.legend()) + "#include \"bc_plan.h\"\n" + w.constants() +
                  "\n\nvoid plan(bc_ctx *cx) {\n" + w.body() + "}\n";
     out.objects_read = w.objects_read();
     out.columns = w.columns_used();

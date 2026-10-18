@@ -52,9 +52,6 @@ auto decode_row(const RowLayout& layout, BytesView row) -> std::vector<bc_value>
 }
 
 auto schema_incompatibility(const Catalog& cat, const bc_schema_ref& ref) -> std::optional<std::string> {
-  // A plan compiled against this very version is compatible with it: the
-  // walk below is for a catalog that has moved since.
-  if (ref.catalog_version == cat.version()) return std::nullopt;
   auto ids = [](const std::uint32_t* p, std::uint32_t n) { return std::span{p, p == nullptr ? 0 : n}; };
   for (auto id : ids(ref.objects_read, ref.n_read)) {
     if (cat.key_layout(id) == nullptr) return "table or index " + std::to_string(id) + " the plan reads no longer exists";
