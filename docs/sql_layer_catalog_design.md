@@ -20,7 +20,7 @@ GPL-2.0, and nothing of it is copied.
 | Field | Meaning |
 |---|---|
 | `id` | Permanent object id, from the one counter below. Never reused. |
-| `name` | Folded to lower case, as SQL folds an unquoted identifier. |
+| `name` | Folded to lower case, as SQL folds an unquoted identifier. Letters, digits and underscores, not starting with a digit: generated plans name objects by C constants built from names (`TBL_T`, `IDX_T_BY_NAME`, `T_QTY_COL`), so a DDL whose names would not make an identifier, or would give one table two equal constants (table `idx` with column `foo`, and an index `foo_col`), is refused. |
 | `version` | Per-table counter, bumped by every DDL on the table. Not checked by plans (see *Compatibility*); kept for stage 2. |
 | `next_col_id` | The next column id. Column ids are permanent and never reused, even after a column is dropped. |
 | columns | Each: permanent `id`, `name`, SQL type (kind, `VARCHAR` length, `DECIMAL` precision and scale), nullability, default. The physical type follows from the SQL type (`docs/sql_layer_types_design.md`, *Stage-1 types*). |
@@ -72,7 +72,7 @@ for; formats 2 and 3 share the 12-byte-header row format.
 **A record that does not parse is refused at load**, with the table's id:
 a truncated field, a type kind or tag outside its set, a physical type that
 disagrees with the SQL type, a key or index column that is not a column of
-the table, a layout that fails the row format's invariants, trailing bytes
+the table or appears twice, a layout that fails the row format's invariants, trailing bytes
 after the last field. The catalog never opens a database it cannot decode
 correctly.
 
@@ -87,7 +87,8 @@ Namespace `0x01`, as the plugin's catalog is:
 | `01 02 <id:4>` | The table record above, indexes and layouts included. |
 | `01 03 <name>` | Name entry: kind (1 table, 2 index) and id (4, big-endian). |
 
-**One id counter** gives every table, index and layout its id, so an id
+**The counters are 8 bytes**, and the next id at most one past
+`kMaxObjectId`; any other value is refused at load. **One id counter** gives every table, index and layout its id, so an id
 names one object for ever, and `bc_key_begin(table_or_index)` and
 `bc_raise`'s object id need no kind. Ids stay at or below `kMaxObjectId`,
 `0x00FFFFFF`: `bc_error_detail` carries one in 24 bits. A DDL that would
@@ -167,7 +168,8 @@ the catalog before it. Lookups are `const` and allocate nothing.
 **Readers share it through immutable versions.** `LiveCatalog` holds the
 current version as a `shared_ptr<const Catalog>`; a DDL builds the next
 version and publishes it by swapping the pointer. A context pins one version
-for an execution and drops it at reset; nothing a reader holds changes under
+for an execution and drops it at reset, so an idle context holds no
+superseded version; nothing a reader holds changes under
 it, and a reader never waits for a DDL's backfill. A lock taken by every
 execution would be simpler to state but would put a shared cache line on the
 read path the engine keeps lock-free, and would stop every query for the
@@ -178,9 +180,14 @@ Two rules make a pinned version agree with the engine:
 1. **A version and a snapshot are taken together.** `LiveCatalog::pin`
    reads a generation counter, takes the version and the snapshot, and
    reads the counter again, retrying if it changed. A DDL makes the counter
-   odd before its commit reaches the engine and even after it publishes, and
-   a pin that finds it odd waits for it. So no plan pairs a snapshot that
-   holds a DDL with the version before it, or the reverse.
+   odd before its batch reaches the engine and even after it swaps the
+   version in. The engine publishes a batch only after its sync, so while
+   the counter is odd the snapshot is almost always still the old
+   version's; a pin that finds it odd reads the catalog version from its
+   snapshot (one record read) and waits only if the engine has already
+   published the DDL and the swap has not happened yet. So no plan pairs a
+   snapshot that holds a DDL with the version before it, or the reverse,
+   and no reader waits through a backfill's write and sync.
 2. **A write commit guards the records of the tables it writes.**
    `bc_ctx_commit` adds `ensure_unchanged(01 02 <table_id>)` for every table
    whose rows or index entries the write plan touches, found from the keys

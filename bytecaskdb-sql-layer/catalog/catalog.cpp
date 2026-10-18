@@ -76,6 +76,10 @@ auto upper(std::string_view name) -> std::string {
 
 [[noreturn]] void corrupt(const std::string& what) { throw std::runtime_error("catalog: " + what); }
 
+// Stored name bytes as the string they were written from: the one place the
+// catalog reads bytes as chars.
+auto as_string(BytesView b) -> std::string { return {reinterpret_cast<const char*>(b.data()), b.size()}; }
+
 // Little-endian, append-only: a later format adds fields at the end of the
 // record or of an entry.
 class RecordWriter {
@@ -117,7 +121,7 @@ public:
   auto u64() -> std::uint64_t { return le(8); }
   auto str() -> std::string {
     auto b = take(u16());
-    return {reinterpret_cast<const char*>(b.data()), b.size()};  // bytes to chars, as the name was written
+    return as_string(b);
   }
   auto blob() -> BytesView { return take(u32()); }
   [[nodiscard]] auto at_end() const -> bool { return pos_ == in_.size(); }
@@ -280,6 +284,20 @@ auto reserve_ids(std::uint64_t& next_id, std::uint32_t n) -> std::uint32_t {
   if (first + n - 1 > Catalog::kMaxObjectId) throw std::length_error("catalog object ids exhausted");
   next_id += n;
   return static_cast<std::uint32_t>(first);
+}
+
+// A name a generated plan can paste into a C identifier (TBL_, IDX_,
+// <TABLE>_<COLUMN>_COL): what an unquoted SQL identifier folds to.
+void check_name(const std::string& n) {
+  auto ok = !n.empty() && (std::islower(static_cast<unsigned char>(n[0])) != 0 || n[0] == '_') &&
+            std::ranges::all_of(n, [](char ch) {
+              auto c = static_cast<unsigned char>(ch);
+              return std::islower(c) != 0 || std::isdigit(c) != 0 || ch == '_';
+            });
+  if (!ok) {
+    throw std::invalid_argument("name \"" + n +
+                                "\" is not supported: letters, digits and underscores, not starting with a digit");
+  }
 }
 
 void check_column_spec(const ColumnSpec& c) {
@@ -522,7 +540,11 @@ auto parse_table(BytesView in) -> Table {
     t.columns.push_back(std::move(c));
   }
   auto npk = r.u16();
-  for (std::uint32_t i = 0; i < npk; ++i) t.pk_col_ids.push_back(r.u32());
+  for (std::uint32_t i = 0; i < npk; ++i) {
+    auto id = r.u32();
+    if (std::ranges::find(t.pk_col_ids, id) != t.pk_col_ids.end()) corrupt("table " + t.name + " repeats a key column");
+    t.pk_col_ids.push_back(id);
+  }
   auto nidx = r.u16();
   for (std::uint32_t i = 0; i < nidx; ++i) {
     RecordReader e{r.blob()};
@@ -537,6 +559,9 @@ auto parse_table(BytesView in) -> Table {
       auto desc = e.u8();
       if (desc > 1) corrupt("index " + ix.name + " has a bad direction flag");
       p.desc = desc == 1;
+      if (std::ranges::find(ix.parts, p.col_id, &IndexPart::col_id) != ix.parts.end()) {
+        corrupt("index " + ix.name + " repeats a column");
+      }
       ix.parts.push_back(p);
     }
     e.expect_end("index entry of table " + t.name);
@@ -587,8 +612,16 @@ auto Table::index(std::string_view n) const -> const Index* {
 auto Catalog::load(const Snapshot& snap) -> Catalog {
   Catalog cat;
   Bytes v;
-  if (snap.get({}, counter_key(kCounterNextId), v)) cat.next_id_ = be_value(v);
-  if (snap.get({}, counter_key(kCounterVersion), v)) cat.version_ = be_value(v);
+  // A counter is 8 bytes; the next id is past every id in use and at most
+  // one past kMaxObjectId.
+  auto counter = [&](std::byte id, std::uint64_t& out) {
+    if (!snap.get({}, counter_key(id), v)) return;
+    if (v.size() != 8) corrupt("a counter is not 8 bytes");
+    out = be_value(v);
+  };
+  counter(kCounterNextId, cat.next_id_);
+  counter(kCounterVersion, cat.version_);
+  if (cat.next_id_ == 0 || cat.next_id_ > std::uint64_t{kMaxObjectId} + 1) corrupt("next object id out of range");
   auto tables = Bytes{std::byte{kNsCatalog}, kSubTable};
   for (const auto& e : snap.iter_from({}, tables)) {
     if (!has_prefix(e.key, tables)) break;
@@ -618,7 +651,7 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
   auto names = Bytes{std::byte{kNsCatalog}, kSubName};
   for (const auto& e : snap.iter_from({}, names)) {
     if (!has_prefix(e.key, names)) break;
-    std::string name{reinterpret_cast<const char*>(e.key.data()) + names.size(), e.key.size() - names.size()};
+    auto name = as_string(e.key.subspan(names.size()));
     auto it = cat.names_.find(name);
     auto kind = e.value.empty() ? 0 : std::to_integer<std::uint8_t>(e.value[0]);
     if (it == cat.names_.end() || e.value.size() != 5 || be_value(e.value.subspan(1)) != it->second ||
@@ -727,6 +760,17 @@ auto Catalog::constants(const Table& t) const -> std::vector<std::pair<std::stri
 
 auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<DdlOp>& ops, bool& backfill) const
     -> std::shared_ptr<const Catalog> {
+  // A plan on a table names its objects by constants built from their names:
+  // two that print the same (table idx with column foo, index foo_col) would
+  // make every plan on the table fail to compile.
+  auto check_constants = [&](const Table& t) {
+    std::vector<std::string> names;
+    for (const auto& kv : constants(t)) names.push_back(kv.first);
+    std::ranges::sort(names);
+    if (auto dup = std::ranges::adjacent_find(names); dup != names.end()) {
+      throw std::invalid_argument("names on table \"" + t.name + "\" give the plan constant " + *dup + " twice");
+    }
+  };
   auto next = std::make_shared<Catalog>(clone());
   next->version_ = version_ + 1;
   auto finish = [&] {
@@ -747,6 +791,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
 
   if (const auto* ct = std::get_if<CreateTableDdl>(&ddl)) {
     auto name = fold(ct->name);
+    check_name(name);
     name_free(name);
     if (ct->columns.empty() || ct->pk.empty()) throw std::invalid_argument("a table needs columns and a primary key");
     Table t;
@@ -755,6 +800,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     for (const auto& spec : ct->columns) {
       check_column_spec(spec);
       auto cname = fold(spec.name);
+      check_name(cname);
       if (t.column(cname) != nullptr) throw std::invalid_argument("column \"" + cname + "\" specified more than once");
       auto in_pk = std::ranges::any_of(ct->pk, [&](const std::string& p) { return fold(p) == cname; });
       Column c{t.next_col_id++, cname, spec.sql, phys_type(spec.sql), spec.nullable && !in_pk, spec.default_value};
@@ -775,12 +821,14 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     put_op(ops, DdlOp::Kind::EnsureAbsent, name_entry_key(name));
     put_op(ops, DdlOp::Kind::Put, name_entry_key(name), name_value(kKindTable, t.id));
     put_op(ops, DdlOp::Kind::Put, table_record_key(t.id), serialize_table(t));
+    check_constants(t);
     next->put_table(std::move(t));
     return finish();
   }
 
   if (const auto* ci = std::get_if<CreateIndexDdl>(&ddl)) {
     auto name = fold(ci->name);
+    check_name(name);
     name_free(name);
     auto t = find_table(ci->table);
     if (ci->columns.empty()) throw std::invalid_argument("an index needs columns");
@@ -819,6 +867,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       put_op(ops, DdlOp::Kind::Put, std::move(k));
     });
     guard_rows(ops, t.id);
+    check_constants(t);
     next->put_table(std::move(t));
     return finish();
   }
@@ -867,6 +916,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   auto t = find_table(ac.table);
   check_column_spec(ac.column);
   auto cname = fold(ac.column.name);
+  check_name(cname);
   if (t.column(cname) != nullptr) {
     throw std::invalid_argument("column \"" + cname + "\" of relation \"" + t.name + "\" already exists");
   }
@@ -902,6 +952,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     });
     guard_rows(ops, t.id);
   }
+  check_constants(t);
   next->put_table(std::move(t));
   return finish();
 }
@@ -921,14 +972,19 @@ auto LiveCatalog::current() const -> std::shared_ptr<const Catalog> {
 auto LiveCatalog::pin() const -> Pinned {
   for (;;) {
     auto g = gen_.load();
-    if (g % 2 == 1) {
-      gen_.wait(g);
-      continue;
-    }
     auto cat = current();
     auto snap = db_.snapshot();
-    // A DDL that reached the engine before the snapshot made gen_ odd first.
-    if (gen_.load() == g) return Pinned{std::move(cat), std::move(snap)};
+    if (gen_.load() != g) continue;  // a DDL commit began or ended in between
+    if (g % 2 == 0) return Pinned{std::move(cat), std::move(snap)};
+    // A DDL's commit is in flight. The engine publishes a batch only after
+    // its sync, so for most of the commit the snapshot is still the old
+    // catalog's; it holds the DDL only between the engine's publication and
+    // the swap of current_. One read tells which, and only then is there a
+    // wait, for the swap.
+    Bytes v;
+    auto version = snap.get({}, counter_key(kCounterVersion), v) ? be_value(v) : 0;
+    if (version == cat->version()) return Pinned{std::move(cat), std::move(snap)};
+    gen_.wait(g);
   }
 }
 
@@ -940,7 +996,9 @@ auto LiveCatalog::prepare(const Ddl& ddl) const -> Prepared {
   if (!p.next) return p;
   try {
     p.plan = std::make_unique<WritePlan>(std::move(snap));
-    for (const auto& op : ops) {
+    // Each op's bytes are freed once the plan holds its copy, so a backfill
+    // near the batch limit is in memory about once, not twice.
+    for (auto& op : ops) {
       switch (op.kind) {
         case Catalog::DdlOp::Kind::Put: p.plan->put(op.a, op.b); break;
         case Catalog::DdlOp::Kind::Del: p.plan->del(op.a); break;
@@ -949,6 +1007,8 @@ auto LiveCatalog::prepare(const Ddl& ddl) const -> Prepared {
         case Catalog::DdlOp::Kind::EnsureUnchanged: p.plan->ensure_unchanged(op.a); break;
         case Catalog::DdlOp::Kind::EnsureRangeUnchanged: p.plan->ensure_range_unchanged(op.a, op.b); break;
       }
+      Bytes{}.swap(op.a);
+      Bytes{}.swap(op.b);
     }
   } catch (const std::invalid_argument& e) {
     if (!p.backfill) throw;
@@ -990,7 +1050,8 @@ auto LiveCatalog::apply(const Ddl& ddl) -> std::shared_ptr<const Catalog> {
   for (int attempt = 0; attempt < kDdlAttempts; ++attempt) {
     auto p = prepare(ddl);
     if (!p.next) return p.base;
-    if (commit(std::move(p))) return current();
+    auto next = p.next;  // what this DDL publishes; current() may be a later DDL's by the time it returns
+    if (commit(std::move(p))) return next;
   }
   throw std::runtime_error("DDL conflicted with concurrent writes on every attempt");
 }

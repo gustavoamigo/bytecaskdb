@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -233,6 +234,20 @@ TEST_CASE("plan API: bc_ctx_run checks what a plan depends on, not a catalog ver
   auto no_index = ok;
   no_index.indexes.clear();
   CHECK(run_with(no_index) == BC_COMMITTED);
+}
+
+TEST_CASE("plan API: a context holds a catalog version only while it executes", "[sql][algebra][catalog]") {
+  Fixture f;
+  std::weak_ptr<const bytecask::sql::Catalog> seen = f.live->current();
+  auto ps = params({std::int64_t{1}, bytes("a"), std::int64_t{5}});
+  bc_ctx_begin(f.cx, &ps, {});
+  CHECK(seen.use_count() == 2);  // the live catalog and the context
+  bc_ctx_run(f.cx, insert_plan_ok, nullptr);
+  CHECK(bc_ctx_commit(f.cx, false) == BC_COMMITTED);
+  bc_ctx_reset(f.cx);
+  CHECK(seen.use_count() == 1);
+  f.ddl(bytecask::sql::AddColumnDdl{"t", {"x", {bytecask::sql::SqlKind::BigInt}, true, {}}});
+  CHECK(seen.expired());  // superseded, and no idle context keeps it
 }
 
 TEST_CASE("plan API: a write committed across a DDL on its table is a conflict", "[sql][algebra][catalog]") {

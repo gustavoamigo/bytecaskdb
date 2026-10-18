@@ -180,6 +180,52 @@ TEST_CASE("catalog: a damaged or foreign-format record is refused", "[sql][catal
   CHECK_THROWS_AS(parse_table(broken([](Table& t) { t.layout.columns[1].pos = t.layout.columns[0].pos; })),
                   std::runtime_error);
   CHECK_THROWS_AS(parse_table(broken([](Table& t) { t.layout.columns.pop_back(); })), std::runtime_error);
+  CHECK_THROWS_AS(parse_table(broken([](Table& t) { t.pk_col_ids = {0, 0}; })), std::runtime_error);
+  CHECK_THROWS_AS(parse_table(broken([](Table& t) { t.indexes[0].parts = {{2, false}, {2, true}}; })),
+                  std::runtime_error);
+}
+
+TEST_CASE("catalog: counters of the wrong width or past the id ceiling are refused at load", "[sql][catalog]") {
+  sql_test::TempDir dir{"catalog_counters"};
+  auto counter = Bytes{std::byte{kNsCatalog}, std::byte{0x01}, std::byte{0x01}};
+  {
+    auto db = DB::open(dir.path());
+    db.put({}, counter, Bytes(9, std::byte{0}));  // nine bytes: would overflow be_value
+    CHECK_THROWS_AS(LiveCatalog{db}, std::runtime_error);
+    Bytes past(8, std::byte{0});
+    past[4] = std::byte{0x01};  // 2^24 + 1, past kMaxObjectId + 1
+    past[7] = std::byte{0x01};
+    db.put({}, counter, past);
+    CHECK_THROWS_AS(LiveCatalog{db}, std::runtime_error);
+    Bytes last(8, std::byte{0});
+    last[4] = std::byte{0x01};  // 2^24: every id used, none reused
+    db.put({}, counter, last);
+    LiveCatalog full{db};
+    CHECK_THROWS_AS(full.apply(create_t()), std::length_error);
+  }
+}
+
+TEST_CASE("catalog: names must be plan identifiers, and a table's plan constants distinct", "[sql][catalog]") {
+  sql_test::TempDir dir{"catalog_idents"};
+  auto db = DB::open(dir.path());
+  LiveCatalog live{db};
+  CHECK_THROWS_AS(live.apply(CreateTableDdl{"a-b", {col("k", SqlKind::BigInt)}, {"k"}}), std::invalid_argument);
+  CHECK_THROWS_AS(live.apply(CreateTableDdl{"t2", {col("my col", SqlKind::BigInt)}, {"my col"}}), std::invalid_argument);
+  CHECK_THROWS_AS(live.apply(CreateTableDdl{"1t", {col("k", SqlKind::BigInt)}, {"k"}}), std::invalid_argument);
+  (void)live.apply(CreateTableDdl{"idx", {col("foo", SqlKind::BigInt, false), col("v", SqlKind::BigInt)}, {"foo"}});
+  CHECK_THROWS_AS(live.apply(CreateIndexDdl{"my idx", "idx", {{"v"}}}), std::invalid_argument);
+  // Table idx's column foo is IDX_FOO_COL; so would an index named foo_col be.
+  try {
+    (void)live.apply(CreateIndexDdl{"foo_col", "idx", {{"v"}}});
+    FAIL("colliding plan constants must be refused");
+  } catch (const std::invalid_argument& e) {
+    CHECK(std::string{e.what()}.find("IDX_FOO_COL") != std::string::npos);
+  }
+  CHECK_THROWS_AS(live.apply(AddColumnDdl{"idx", col("x-y", SqlKind::BigInt)}), std::invalid_argument);
+  CHECK(live.current()->table("idx")->indexes.empty());
+  // apply returns the version its own DDL published.
+  auto v = live.current()->version();
+  CHECK(live.apply(CreateIndexDdl{"idx_v", "idx", {{"v"}}})->version() == v + 1);
 }
 
 TEST_CASE("catalog: an empty database bootstraps without writing", "[sql][catalog]") {

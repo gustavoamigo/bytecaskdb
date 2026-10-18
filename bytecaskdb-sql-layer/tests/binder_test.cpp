@@ -156,6 +156,20 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
 
   CHECK(rejected(cat, "CREATE TABLE u (k INTEGER PRIMARY KEY DEFAULT 2147483648)").first ==
         "DEFAULT out of range for type integer");
+  {
+    // NUMERIC(p, p): a whole part of zero has no digits.
+    auto b = bind_sql(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, a NUMERIC(4, 4) DEFAULT 0.5, b NUMERIC(4, 4) DEFAULT 0, "
+                           "c NUMERIC(4, 4) DEFAULT -0.00005, d NUMERIC(4, 4) DEFAULT 00.1234)");
+    auto& s = std::get<CreateTableDdl>(std::get<Ddl>(b.stmt));
+    CHECK(s.columns[1].default_value == Datum{std::int64_t{5000}});
+    CHECK(s.columns[2].default_value == Datum{std::int64_t{0}});
+    CHECK(s.columns[3].default_value == Datum{std::int64_t{-1}});  // half away from zero
+    CHECK(s.columns[4].default_value == Datum{std::int64_t{1234}});
+  }
+  CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v NUMERIC(4, 4) DEFAULT 1)").first ==
+        "DEFAULT out of range for type numeric(4,4)");
+  CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v NUMERIC(4, 4) DEFAULT 0.99995)").first ==
+        "DEFAULT out of range for type numeric(4,4)");  // rounds to 1.0000
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v NUMERIC(3, 1) DEFAULT 100)").first ==
         "DEFAULT out of range for type numeric(3,1)");
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v VARCHAR(2) DEFAULT 'abc')").first ==

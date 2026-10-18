@@ -255,7 +255,9 @@ public:
   [[nodiscard]] auto current() const -> std::shared_ptr<const Catalog>;
 
   // A catalog version and an engine snapshot that agree: no DDL committed
-  // between them. Waits while a DDL's commit is in flight.
+  // between them. While a DDL's commit is in flight it reads the snapshot's
+  // catalog version, and waits only if the engine has published the DDL and
+  // current() not yet.
   struct Pinned {
     std::shared_ptr<const Catalog> cat;
     Snapshot snap;
@@ -290,7 +292,8 @@ private:
   mutable std::mutex mu_;  // guards current_; held only to copy or swap it
   std::shared_ptr<const Catalog> current_;
   std::mutex ddl_mu_;  // one commit at a time
-  // Odd while a DDL's commit is between the engine and publication.
+  // Odd from just before a DDL's batch reaches the engine until current_
+  // is swapped (or the commit fails).
   mutable std::atomic<std::uint64_t> gen_{0};
 };
 

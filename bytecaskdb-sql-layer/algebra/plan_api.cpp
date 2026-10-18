@@ -124,9 +124,11 @@ struct bc_ctx {
   bytecask::DB* db;
   LiveCatalog* live;
   // The catalog version this execution resolves against, pinned with the
-  // snapshot by bc_ctx_begin; cat is pinned.get().
+  // snapshot by bc_ctx_begin and dropped with it; cat is pinned.get(), or
+  // the empty catalog between executions, where every lookup fails.
   std::shared_ptr<const Catalog> pinned;
-  const Catalog* cat;
+  Catalog unpinned;
+  const Catalog* cat{&unpinned};
   std::vector<std::byte> arena;
   std::size_t arena_used{0};
   std::uint32_t epoch{1};
@@ -157,7 +159,7 @@ struct bc_ctx {
   std::int64_t affected{-1};
 
   bc_ctx(bytecask::DB* d, LiveCatalog* l, std::uint32_t arena_bytes)
-      : db{d}, live{l}, pinned{l->current()}, cat{pinned.get()}, arena(arena_bytes) {}
+      : db{d}, live{l}, arena(arena_bytes) {}
 
   auto ok() const -> bool { return error == BC_OK; }
 
@@ -306,6 +308,8 @@ struct bc_ctx {
   void drop_execution_state() {
     cursors.clear();  // iterators before the snapshot they read
     snap.reset();
+    cat = &unpinned;
+    pinned.reset();  // an idle context keeps no superseded catalog alive
     views.clear();
     keys.clear();
     rows.clear();

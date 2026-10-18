@@ -92,7 +92,9 @@ auto scaled_decimal(std::string_view text, std::uint8_t precision, std::uint8_t 
   auto frac = dot == std::string_view::npos ? std::string_view{} : text.substr(dot + 1);
   auto digits = [](std::string_view d) { return std::ranges::all_of(d, [](char ch) { return ch >= '0' && ch <= '9'; }); };
   if ((whole.empty() && frac.empty()) || !digits(whole) || !digits(frac)) return std::nullopt;
-  while (whole.size() > 1 && whole[0] == '0') whole.remove_prefix(1);
+  // Leading zeros are no digits: "0.5" has none before the point, so it fits
+  // NUMERIC(4, 4).
+  while (!whole.empty() && whole[0] == '0') whole.remove_prefix(1);
   if (whole.size() > static_cast<std::size_t>(precision - scale)) return std::nullopt;
   std::int64_t v = 0;
   for (auto ch : whole) v = v * 10 + (ch - '0');

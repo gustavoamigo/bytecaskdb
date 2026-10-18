@@ -183,9 +183,11 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos) -> CreateTable
 
 auto create_index(const PgQuery__IndexStmt* s, std::int32_t pos) -> CreateIndex {
   if (s->where_clause != nullptr || s->n_index_including_params != 0 || empty(s->idxname) || s->primary ||
-      s->isconstraint || s->concurrent || s->if_not_exists ||
+      s->isconstraint || s->concurrent || s->if_not_exists || s->nulls_not_distinct ||
       (!empty(s->access_method) && std::string_view{s->access_method} != "btree")) {
-    reject("only a named index on plain columns is supported", s->relation->location);
+    reject("only a named index on plain columns is supported (no WHERE, INCLUDE, CONCURRENTLY, IF NOT EXISTS, "
+           "NULLS NOT DISTINCT or access method)",
+           s->relation->location);
   }
   CreateIndex ix{s->idxname, relation(s->relation), {}, s->unique != 0, pos};
   for (std::size_t i = 0; i < s->n_index_params; ++i) {

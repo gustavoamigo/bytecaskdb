@@ -96,6 +96,7 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   CHECK(rejected_at("ALTER TABLE t DROP COLUMN x") == 0);
   CHECK_THROWS_AS(parse("CREATE INDEX u ON t (name NULLS LAST)"), SqlError);
   CHECK_THROWS_AS(parse("CREATE INDEX CONCURRENTLY u ON t (name)"), SqlError);
+  CHECK_THROWS_AS(parse("CREATE UNIQUE INDEX u ON t (name) NULLS NOT DISTINCT"), SqlError);
   CHECK_THROWS_AS(parse("CREATE TABLE u (k BIGINT DEFAULT now())"), SqlError);
 }
 

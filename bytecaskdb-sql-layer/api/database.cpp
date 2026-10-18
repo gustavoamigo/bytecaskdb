@@ -86,26 +86,37 @@ void Database::compile(Statement& s) {
   auto cat = live_->current();
   auto bound = bound::bind(s.ast_, *cat);
   if (std::holds_alternative<Ddl>(bound.stmt)) {
+    s.ref_ = {};
     s.plan_.reset();
     s.code_.reset();
     return;
   }
+  // Everything is built first and the statement changed only once nothing
+  // can throw: ref_ points into plan_ and the vectors, and a statement that
+  // fails to recompile keeps its old, consistent plan.
+  std::vector<std::string> columns;
   if (const auto* sel = std::get_if<bound::Select>(&bound.stmt)) {
-    s.columns_.clear();
-    for (auto id : sel->targets) s.columns_.push_back(sel->table->column(id)->name);
+    for (auto id : sel->targets) columns.push_back(sel->table->column(id)->name);
   }
-  s.plan_ = std::make_unique<GeneratedPlan>(generate_plan(bound, *cat, s.sql_));
-  s.result_codes_ = result_type_codes(s.plan_->result_types);
-  s.result_layout_ = make_result_layout(s.plan_->result_types);
-  s.code_ = TccPlan::compile(s.plan_->source);
-  const auto& p = *s.plan_;
-  s.col_refs_.clear();
-  for (const auto& c : p.columns) s.col_refs_.push_back({c.layout, c.col, c.pos, static_cast<std::uint8_t>(c.type)});
+  auto plan = std::make_unique<GeneratedPlan>(generate_plan(bound, *cat, s.sql_));
+  auto codes = result_type_codes(plan->result_types);
+  auto layout = make_result_layout(plan->result_types);
+  auto code = TccPlan::compile(plan->source);
+  std::vector<bc_col_ref> col_refs;
+  for (const auto& c : plan->columns) col_refs.push_back({c.layout, c.col, c.pos, static_cast<std::uint8_t>(c.type)});
   auto n = [](const auto& v) { return narrow<std::uint32_t>(v.size()); };
-  s.ref_ = bc_schema_ref{p.catalog_version,   p.objects_read.data(),    n(p.objects_read),
-                         p.tables_written.data(), n(p.tables_written), p.indexes_written.data(),
-                         n(p.indexes_written), s.col_refs_.data(),      n(s.col_refs_),
-                         s.result_codes_.data(),  n(s.result_codes_)};
+  const auto& p = *plan;
+  bc_schema_ref ref{p.catalog_version,       p.objects_read.data(), n(p.objects_read),   p.tables_written.data(),
+                    n(p.tables_written),     p.indexes_written.data(), n(p.indexes_written), col_refs.data(),
+                    n(col_refs),             codes.data(),          n(codes)};
+  // Moves keep every buffer ref points into.
+  if (std::holds_alternative<bound::Select>(bound.stmt)) s.columns_ = std::move(columns);
+  s.plan_ = std::move(plan);
+  s.code_ = std::move(code);
+  s.result_codes_ = std::move(codes);
+  s.result_layout_ = std::move(layout);
+  s.col_refs_ = std::move(col_refs);
+  s.ref_ = ref;
   ++compilations_;
 }
 
@@ -144,8 +155,15 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   bc_params bp{params};
   const auto& p = *stmt.plan_;
   auto r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
-  if (r == BC_CONFLICT) throw ExecError("conflict: a guard failed on every attempt", BC_CONFLICT);
-  if (r == BC_FAILED) throw ExecError(bc_error_message(cx_), bc_error(cx_));
+  if (r == BC_CONFLICT) {
+    bc_ctx_reset(cx_);
+    throw ExecError("conflict: a guard failed on every attempt", BC_CONFLICT);
+  }
+  if (r == BC_FAILED) {
+    ExecError e{bc_error_message(cx_), bc_error(cx_)};
+    bc_ctx_reset(cx_);  // the context keeps no snapshot or catalog version while idle
+    throw e;
+  }
 
   out.affected = bc_ctx_affected(cx_);
   if (p.returns_rows) {
