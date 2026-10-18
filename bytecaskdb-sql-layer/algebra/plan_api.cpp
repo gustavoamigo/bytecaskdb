@@ -10,19 +10,8 @@
 // the cursor's step count, so stepping invalidates it. Errors are sticky: the
 // first one is kept, and every later call returns its neutral value.
 
-// Standard library headers must be included BEFORE the module imports, as
-// bytecaskdb/bytecask_hpp.cpp does.
-//
-// On macOS, libc++ marks many inline/template functions with
-// _LIBCPP_HIDE_FROM_ABI, which expands to __attribute__((__abi_tag__("..."))).
-// When a module is imported, the compiler loads its BMI and resolves the
-// exported types that reference std types (bc_params holds a std::vector of
-// std::variant). On LLVM 22+ those std declarations become "known" in the
-// importing TU, and a later #include of the same header then tries to add
-// __abi_tag__ attributes to declarations that already exist, which LLVM 22
-// rejects as a hard error: "cannot add 'abi_tag' attribute in a redeclaration".
-// Including the std headers first establishes their canonical declarations in
-// this TU; the import then finds them already present and consistent.
+// Standard library headers before the module imports, for the reason
+// bytecaskdb/bytecask_hpp.cpp gives (LLVM 22's abi_tag redeclaration error).
 #include <algorithm>
 #include <chrono>
 #include <compare>

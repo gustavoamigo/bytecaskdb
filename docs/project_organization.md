@@ -73,7 +73,8 @@ bindings (#494) and a header bridge for the plugin, the counterpart of
 Its third-party dependencies are fetched at build time, not vendored:
 libpg_query (PostgreSQL licence, with its bundled protobuf-c, MIT/BSD) and
 TinyCC (LGPL-2.1). The xmake targets that use them are not built by default;
-the `sql-layer` job in `ci.yml` builds and runs `sql_layer_tests`.
+the `build-and-test` job in `ci.yml` builds and runs `sql_layer_tests` with
+the engine suite.
 
 ### GPL-2.0 — MariaDB Integration (`bytecaskdb-mariadb-plugin/`)
 
