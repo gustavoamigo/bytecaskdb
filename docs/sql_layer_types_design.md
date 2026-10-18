@@ -246,9 +246,10 @@ row key. That suffix is what `bc_scan_pk` returns and `bc_lookup` and
 `bc_key_pk` accept: `0x02 table_id(4)` plus the suffix is the row key.
 Because every part is self-delimiting, the suffix is found by skipping the
 index columns with the index's catalog layout, and `bc_key_part_*` decodes
-any part by position, index columns first. Whether the prefix is
-`0x03 index_id` or `0x03 table_id index_id` is #489's decision; the parts
-are the same either way.
+any part by position, index columns first. The prefix is `0x03 index_id`,
+not the plugin's `0x03 table_id index_id`: index ids are global, so the
+table id would add four bytes and no information
+(`docs/sql_layer_catalog_design.md`, *Secondary-key prefix*).
 
 **`bc_key_successor`** of a prefix is the smallest key above every key that
 starts with it: the last byte below `0xFF` incremented and everything after
@@ -348,7 +349,8 @@ column and the bitmap bounds the column count, so it never nears 64 KiB.
 **The format is versioned through the catalog.** A row carries no format
 version of its own: every row belongs to a table, and every table's record
 in the catalog carries the record format, which names the row format its
-positions are for. This format is record format 2. The prototype's format 1
+positions are for. This row format is the one of record formats 2 and 3
+(3 is the catalog record of #489). The prototype's format 1
 (an 8-byte header, a 16-bit length, a bitmap meaning null) is refused when
 the catalog loads, with an error that says the database is from an earlier
 build, so no row of it is ever decoded under this format.
@@ -380,10 +382,12 @@ from the plugin and includes nothing of it; the plugin links the sql-layer's
 archive through a header bridge (#488). Nothing in the plugin changes in the
 PR that lands this document.
 
-Two things the codec does not decide and the catalog must (#489): whether
-index keys are prefixed by the index id alone or by table id and index id,
-and how `DESC` parts and unique indexes are recorded. The codec takes a
-`KeyPart{type, nullable, desc}` per part and is indifferent to the prefix.
+Two things the codec does not decide, the catalog does
+(`docs/sql_layer_catalog_design.md`): index keys are prefixed by the index
+id alone, and an index records `DESC` per part and whether it is unique. A
+unique index has the same entries as any other; its check is a scan of the
+index-part prefix. The codec takes a `KeyPart{type, nullable, desc}` per
+part and is indifferent to the prefix.
 
 ## Validation
 

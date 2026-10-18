@@ -113,8 +113,8 @@ unwinds like any other failure. The runtime does not retry it. This is how
 a unique-key or not-null violation reaches the client as an error rather
 than as a conflict: the engine reports every failed precondition of a
 batch as the same conflict, so a plan that must distinguish checks the
-snapshot first (`bc_exists`), raises if the key is present, and keeps the
-guard for the race. On a retry after a genuine race the check runs again
+snapshot first (`bc_exists`, or a prefix scan for a unique index), raises
+if the key is present, and keeps the guard for the race. On a retry after a genuine race the check runs again
 on the fresh snapshot and reports the duplicate correctly.
 
 **The arena is the only memory.** Keys, rows, result rows, sorter and hash
@@ -208,14 +208,22 @@ typedef struct bc_db bc_db;
 typedef struct bc_catalog bc_catalog;
 typedef struct bc_params bc_params;
 
-/* What a plan was compiled against: the catalog version, the tables and
-   indexes it reads or writes, and the types of the rows it emits, in emit
-   order. bc_ctx_run checks the first three against the live catalog; the
-   result layout is the plan's own and is not a catalog object. */
+/* A column a plan reads or sets, as compiled: the table layout, the
+   permanent column id, its offset or slot, and its bc_type. */
+typedef struct { uint32_t layout, col, pos; uint8_t type; } bc_col_ref;
+
+/* What a plan was compiled against, and the types of the rows it emits, in
+   emit order. bc_ctx_run checks everything but the version and the result
+   types against the live catalog (docs/sql_layer_catalog_design.md,
+   *Compatibility*); the result layout is the plan's own and is not a
+   catalog object. */
 typedef struct {
-  uint64_t catalog_version;
-  const uint32_t *tables_read,  *tables_written;   uint32_t n_read, n_written;
-  const uint8_t  *result_types;                    uint32_t n_result;   /* bc_type codes */
+  uint64_t catalog_version;                                     /* for messages; not checked */
+  const uint32_t   *objects_read;    uint32_t n_read;           /* tables and indexes it reads */
+  const uint32_t   *tables_written;  uint32_t n_written;        /* tables whose rows it writes */
+  const uint32_t   *indexes_written; uint32_t n_indexes_written;/* every index of those tables it maintains */
+  const bc_col_ref *cols;            uint32_t n_cols;           /* every column it reads or sets */
+  const uint8_t    *result_types;    uint32_t n_result;         /* bc_type codes */
 } bc_schema_ref;
 
 enum bc_type { BC_T_I64 = 1, BC_T_F64 = 2, BC_T_BOOL = 3, BC_T_BYTES = 4 };
@@ -257,9 +265,9 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
 | Function | What it does |
 |---|---|
 | `bc_ctx_new` | Allocates a context bound to an open engine and a catalog, with an arena of `arena_bytes`. The arena is allocated once and reused. |
-| `bc_ctx_begin` | Takes a snapshot, binds the parameters, sets the budget. Clears the error. Must precede `bc_ctx_run`. |
-| `bc_ctx_run` | Checks that the schema version the plan was compiled against is compatible with the live catalog: every column id it reads still has its offset and type, every table and index it writes still exists with the same key. A plan that fails the check sets `BC_E_LAYOUT` and does not run; the server recompiles it from the SQL it cached. Adding a column never invalidates a plan; adding an index invalidates the write plans of that table, which must maintain it. Then calls the plan and returns when it returns. |
-| `bc_ctx_commit` | Submits the write plan with `apply_batch`. `BC_COMMITTED` on success. `BC_CONFLICT` when the engine reports a guard or write-write conflict: nothing was written. `BC_FAILED` when `bc_error` is set, including an error raised during the plan: nothing is committed. A plan with no writes and no guards commits nothing and returns `BC_COMMITTED`. |
+| `bc_ctx_begin` | Pins a catalog version and takes a snapshot that agrees with it (no DDL committed between the two), binds the parameters, sets the budget. Clears the error. Must precede `bc_ctx_run`. |
+| `bc_ctx_run` | Checks the plan's `bc_schema_ref` against the catalog version the context pinned at `bc_ctx_begin`: every table and index it reads exists; every column it reads or sets is in its table's current layout at the offset and with the type it was compiled with; every table it writes exists and has exactly the indexes the plan maintains. A plan that fails the check sets `BC_E_LAYOUT` and does not run; the server recompiles it from the SQL it cached. Adding a column never invalidates a plan; adding an index invalidates the write plans of that table, which must maintain it; a drop invalidates the plans that use what it drops. There is no version-equality check. Then calls the plan and returns when it returns. |
+| `bc_ctx_commit` | Submits the write plan with `apply_batch`, guarded by `ensure_unchanged` on the catalog record of every table whose keys it writes, so a DDL on such a table committed since the snapshot makes it a conflict. `BC_COMMITTED` on success. `BC_CONFLICT` when the engine reports a guard or write-write conflict: nothing was written. `BC_FAILED` when `bc_error` is set, including an error raised during the plan: nothing is committed. A plan with no writes and no guards commits nothing and returns `BC_COMMITTED`. |
 | `bc_ctx_next_result` | Iterates the result buffer. Rows are in the row format of the layout the plan emitted. The runtime, not a plan, sees raw pointers here; valid until `bc_ctx_reset`. |
 | `bc_ctx_reset` | Releases the snapshot, drops the write plan and result buffer, resets the arena, bumps every generation so every handle and view the plan held is invalid. |
 | `bc_error_detail`, `bc_ctx_affected` | The constraint kind and object id of a raised error; the affected-row count a write plan recorded. Both read by the runtime after the plan returns. |
@@ -390,10 +398,14 @@ A range scan on a secondary index with a fetch of each row costs one read
 per step plus one per `bc_lookup`. A covering index, where the plan reads
 the columns it needs with `bc_key_part_*` from `bc_scan_key`, costs one.
 
-A unique insert is `bc_exists` on the primary key and each unique index
-key, `bc_raise(BC_C_UNIQUE, …)` if present, then `bc_guard_absent` on the
-same keys for the race, then the puts. The check costs one record read per
-key; the guard is what the engine verifies at commit.
+A unique insert is `bc_exists` on the primary key, `bc_raise(BC_C_UNIQUE,
+…)` if present, then `bc_guard_absent` on it for the race, then the puts. A
+unique secondary index holds the primary key after its parts like any
+index, so its check is on the prefix of the index parts: a `BC_SCAN_PREFIX`
+scan whose first `bc_scan_next` raises, then `bc_guard_range` over the
+prefix for the race (`docs/sql_layer_catalog_design.md`, *Unique
+indexes*). Each check costs one record read; the guard is what the engine
+verifies at commit.
 
 ### Rows and columns
 
@@ -428,7 +440,7 @@ bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: live
 | `bc_col_i64`, `bc_col_f64`, `bc_col_bool` | Loads the 8-byte column at byte offset `off`. A null column, or one past the end of a shorter row, reads as zero; `bc_col_null` decides first and reports both as null. Little-endian in the row. |
 | `bc_col_bytes` | The variable-length column in slot `slot`, as a view with the row's lifetime. |
 | `bc_row_pk` | Encodes the row's primary key from its columns, for an `UPDATE` or `DELETE` reached through a scan or a lookup. Built in the arena. |
-| `bc_row_begin` | Starts an empty row of `layout`: every column null. |
+| `bc_row_begin` | Starts a row of `layout` with every column at its default: the catalog's default for a column that has one, null for the rest. A plan compiled before a column was added writes the column's default without naming it. |
 | `bc_row_from` | Starts a row as a copy of `old`, which must be of `layout` (`BC_E_LAYOUT` otherwise). The `UPDATE` pattern: copy, set the assigned columns, end. |
 | `bc_row_set_*`, `bc_row_set_null` | Sets column `col`. Setting twice keeps the last value. A column or type that does not match the layout is `BC_E_LAYOUT`. |
 | `bc_row_end` | Finalizes the row in the arena and returns its view. Every non-nullable column must have been set (`BC_E_LAYOUT` otherwise); a row over the engine's value limit is `BC_E_LIMIT`. |
@@ -507,7 +519,7 @@ void bc_raise(bc_ctx *, uint32_t constraint, uint32_t object_id);   /* a user er
 | `bc_del_range` | Deletes every key in `[lo, hi)` in one append. `TRUNCATE`, `DROP`, and range deletes the compiler can express as a key range. It names no table, so an empty bound is `BC_E_HANDLE` rather than an open one: the compiler builds both bounds, the table prefix and its successor for a whole table. `lo >= hi` deletes nothing. | `WritePlan::del_range` |
 | `bc_guard_unchanged` | The commit fails if `key` changed since the snapshot. Serializable plans emit one for every key they read and did not write. Keys the plan writes are checked by the engine without a guard. | `ensure_unchanged` |
 | `bc_guard_range` | The commit fails if any key in `[lo, hi)` changed. Serializable plans emit one per range scanned; it covers phantoms. Empty bounds are the start and end of `table_or_index`, as for `bc_scan_open`; `lo >= hi` guards nothing. | `ensure_range_unchanged` |
-| `bc_guard_present`, `bc_guard_absent` | Existence preconditions. `INSERT` emits `absent` on the primary key and on each unique index key, after the `bc_exists` check that turns a duplicate into a user error. | `ensure_present`, `ensure_absent` |
+| `bc_guard_present`, `bc_guard_absent` | Existence preconditions. `INSERT` emits `absent` on the primary key, after the `bc_exists` check that turns a duplicate into a user error; a unique secondary index is guarded by `bc_guard_range` over its prefix. | `ensure_present`, `ensure_absent` |
 | `bc_raise` | Sets `BC_E_CONSTRAINT` with a `bc_constraint` kind and the id of the constraint, column or index concerned, as the compiler emitted them; an unknown kind or an id of 2^24 or more is `BC_E_HANDLE`. The plan unwinds; the runtime reports it and does not retry. The only error a plan raises itself. | none: nothing reaches the engine |
 
 A plan under snapshot isolation emits no guards. The two plans for the same
@@ -723,7 +735,9 @@ merged without a job doing so.
 2. The key codec and row format, with property tests: encode, decode, and
    `memcmp` order equal to typed order, for each type, for composite keys,
    and with nulls.
-3. A catalog for the TPROC-C schema as C constants.
+3. The TPROC-C schema, created through SQL DDL by the catalog
+   (`tests/tpcc_test.cpp`); a plan's constants are what
+   `Catalog::constants` gives for its tables.
 4. Ten hand-written plans covering each API surface once: primary-key
    select; secondary range with lookup, sort and limit; a sum over a range;
    an index nested-loop join; an insert maintaining two indexes; an update
@@ -802,8 +816,6 @@ record read.
 - **Spilling sorters and hash tables.** Bounds without spill are right for
   OLTP. An analytic workload would add a spilling variant behind the same
   calls.
-- **The catalog in the database.** The first phase hard-codes it. Its
-  persistent form is rows in namespace `0x01`, as in the plugin.
 
 ## Revision history
 
@@ -865,3 +877,21 @@ and the API changed where implementing them showed a gap.
   table, so an open bound would reach the whole keyspace. `bc_del_range` and
   `bc_guard_range` treat `lo >= hi` as an empty range, as SQL does, rather
   than letting the engine refuse the commit.
+
+**Revision 4, with the catalog (#489, `docs/sql_layer_catalog_design.md`).**
+
+- `bc_schema_ref` lists what a plan depends on (objects read, tables
+  written and the indexes it maintains, columns with their positions and
+  types, as `bc_col_ref`) instead of a catalog version to match: the
+  version-equality check recompiled every plan on every DDL, and the
+  per-column rule the design always stated needs the columns.
+- `bc_ctx_begin` pins a catalog version with its snapshot, and
+  `bc_ctx_commit` guards the catalog record of every table it writes, so a
+  plan never commits rows shaped by a catalog the engine has moved past.
+- `bc_row_begin` fills the catalog's defaults, so `ADD COLUMN … DEFAULT`
+  invalidates no plan.
+- A unique secondary index is checked on its prefix (a prefix scan, then
+  `bc_guard_range`): its entries carry the primary key, so `bc_exists` and
+  `bc_guard_absent` on one key cannot see a duplicate.
+- Secondary keys stay `0x03 index_id`; the plugin's table-id prefix is not
+  adopted.
