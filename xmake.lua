@@ -234,6 +234,17 @@ local function add_release_opts(t)
     end
 end
 
+-- The same flags for a native target that an included file defines
+-- (bytecaskdb-sql-layer/xmake.lua), which cannot call this file's local
+-- functions: its targets add this rule where the targets above call them.
+rule("bytecask.native_flags")
+    on_config(function (t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
+rule_end()
+
 -- The I/O calls bytecask_tests interposes with -Wl,--wrap, and the variants
 -- of them it must not reference (other spellings of the same calls, and
 -- calls neither the engine nor the C++ standard library makes today). An
