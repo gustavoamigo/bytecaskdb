@@ -1,7 +1,9 @@
 # Plan API: a physical algebra for generated plans
 
 Status: design proposal, not implemented. Nothing in the engine changes; this
-document specifies a new component built on the public engine API.
+document specifies `bytecaskdb-sql-layer`, a new top-level component beside
+the MariaDB plugin, built on the public engine API and MIT-licensed like the
+core.
 
 ## Purpose
 
@@ -646,6 +648,13 @@ into the test binary.
    commit is what this API costs, checks included.
 8. Only then, run-time loaders for the same files (`libtcc`, MIR), then an
    interpreter for the subset.
+
+Layout: `bytecaskdb-sql-layer/algebra/` holds the header and its C++
+implementation; `catalog/` the catalog types and the TPROC-C fixture;
+`plans/` the hand-written plan files, each with its SQL in the header
+comment; `check/` the checker; `tests/` the property tests, fault tests and
+the harness. The MariaDB plugin keeps its own key and row codecs until the
+new ones are proven, then migrates to them.
 
 Questions the hand-written plans settle: whether `bc_pin` appears rarely or
 everywhere; whether the budget and ephemeral bounds a compiler would choose
