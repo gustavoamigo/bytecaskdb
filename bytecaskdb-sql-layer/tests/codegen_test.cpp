@@ -82,6 +82,9 @@ TEST_CASE("codegen: the other bound forms produce plans; no rule, no plan", "[sq
   auto gt = generate(f.cat, "SELECT qty, name FROM t WHERE name > $1").source;
   CHECK(gt.find("bc_view lo = bc_key_successor(cx, bc_key_end(cx, k0));") != std::string::npos);
   CHECK(gt.find("bc_view hi = bc_key_successor(cx, bc_key_end(cx, k1));") != std::string::npos);
+  // An upper bound alone on a nullable column starts past the null entries.
+  auto lt = generate(f.cat, "SELECT id FROM t WHERE name < $1").source;
+  CHECK(lt.find("bc_key_null(cx, k0);\n  bc_view lo = bc_key_successor(cx, bc_key_end(cx, k0));") != std::string::npos);
   auto eq = generate(f.cat, "SELECT id FROM t WHERE name = $1").source;
   CHECK(eq.find("BC_SCAN_PREFIX") != std::string::npos);
   auto partial = generate(f.cat, "INSERT INTO t (id) VALUES ($1)").source;

@@ -91,6 +91,11 @@ SQL's three-valued logic, as PostgreSQL has it:
   with `$1` null returns no rows and `UPDATE`/`DELETE` affect none. The
   compiler emits the null test before building the key, as the prototype's
   plans do.
+- **A range never includes nulls.** `NULL < x` is unknown, so a scan of a
+  nullable key column with no lower bound starts at the successor of the
+  null part, past the null entries that sort first; a lower bound excludes
+  them already through its present marker. (Under `DESC` the nulls sort
+  last and the upper end is the one bounded the same way.)
 - **Aggregates** skip nulls: `SUM`, `MIN`, `MAX`, `AVG` and `COUNT(x)`
   ignore null inputs; over no rows `COUNT` is 0 and the others are null.
   `COUNT(*)` counts rows.
@@ -339,6 +344,14 @@ engine's value limit: 256 MiB less a byte as a hard ceiling, enforced by
 `bc_row_end` as `BC_E_LIMIT`, and the configured `max_value_bytes`, enforced
 by the engine at commit. `var_table` stays u16: a fixed region is 8 bytes a
 column and the bitmap bounds the column count, so it never nears 64 KiB.
+
+**The format is versioned through the catalog.** A row carries no format
+version of its own: every row belongs to a table, and every table's record
+in the catalog carries the record format, which names the row format its
+positions are for. This format is record format 2. The prototype's format 1
+(an 8-byte header, a 16-bit length, a bitmap meaning null) is refused when
+the catalog loads, with an error that says the database is from an earlier
+build, so no row of it is ever decoded under this format.
 
 **Generations.** `layout_generation` names the offset table that decodes the
 row. A plan's constants are its own generation's; a row of another

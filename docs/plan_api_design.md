@@ -508,7 +508,7 @@ void bc_raise(bc_ctx *, uint32_t constraint, uint32_t object_id);   /* a user er
 | `bc_guard_unchanged` | The commit fails if `key` changed since the snapshot. Serializable plans emit one for every key they read and did not write. Keys the plan writes are checked by the engine without a guard. | `ensure_unchanged` |
 | `bc_guard_range` | The commit fails if any key in `[lo, hi)` changed. Serializable plans emit one per range scanned; it covers phantoms. Empty bounds are the start and end of `table_or_index`, as for `bc_scan_open`; `lo >= hi` guards nothing. | `ensure_range_unchanged` |
 | `bc_guard_present`, `bc_guard_absent` | Existence preconditions. `INSERT` emits `absent` on the primary key and on each unique index key, after the `bc_exists` check that turns a duplicate into a user error. | `ensure_present`, `ensure_absent` |
-| `bc_raise` | Sets `BC_E_CONSTRAINT` with a `bc_constraint` kind and the id of the constraint, column or index concerned, as the compiler emitted them. The plan unwinds; the runtime reports it and does not retry. The only error a plan raises itself. | none: nothing reaches the engine |
+| `bc_raise` | Sets `BC_E_CONSTRAINT` with a `bc_constraint` kind and the id of the constraint, column or index concerned, as the compiler emitted them; an unknown kind or an id of 2^24 or more is `BC_E_HANDLE`. The plan unwinds; the runtime reports it and does not retry. The only error a plan raises itself. | none: nothing reaches the engine |
 
 A plan under snapshot isolation emits no guards. The two plans for the same
 SQL differ only in guard calls, which is how isolation reads in the text.
@@ -851,7 +851,8 @@ and the API changed where implementing them showed a gap.
 - `BC_C_RANGE`: a value outside its declared type (`INTEGER`, `VARCHAR(n)`,
   `DECIMAL(p, s)`) is a constraint of its own kind, not a `CHECK`.
 - `bc_error_detail` packs the constraint kind in the high byte and the
-  object id in the low 24 bits; catalog object ids stay below 2^24.
+  object id in the low 24 bits; catalog object ids stay below 2^24, and
+  `bc_raise` with an unknown kind or a wider id is `BC_E_HANDLE`.
 - `BC_SCAN_PREFIX` keeps bit 3: revision 2 moved it to bit 1, the bit
   `LO_EXCLUSIVE` had, so a plan still passing that flag would have scanned a
   prefix silently instead of being refused.

@@ -111,6 +111,8 @@ public:
 
 private:
   auto set_word(std::uint32_t col_id, PhysType type, std::uint64_t word) -> bool;
+  // The column's index in the layout, if it has one of `type` (any type when nullopt).
+  [[nodiscard]] auto index_of(std::uint32_t col_id, std::optional<PhysType> type) const -> std::optional<std::size_t>;
 
   const RowLayout* layout_;
   std::vector<bool> present_;

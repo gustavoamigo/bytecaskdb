@@ -62,16 +62,6 @@ auto matches(const Value& v, PhysType t) -> bool {
   return false;
 }
 
-auto constraint_message(std::uint32_t detail) -> std::string {
-  auto object = std::to_string(detail & 0x00FF'FFFFu);
-  switch (detail >> 24) {
-    case BC_C_UNIQUE: return "duplicate key value violates unique constraint of object " + object;
-    case BC_C_NOT_NULL: return "null value violates not-null constraint of column " + object;
-    case BC_C_RANGE: return "value out of range for column " + object;
-    default: return "constraint violated on object " + object;
-  }
-}
-
 }  // namespace
 
 ExecError::~ExecError() = default;
@@ -126,6 +116,7 @@ void Database::compile(Statement& s) {
   s.plan_ = std::make_unique<GeneratedPlan>(generate_plan(bound, cat_, s.sql_));
   s.result_codes_.clear();
   for (auto t : s.plan_->result_types) s.result_codes_.push_back(static_cast<std::uint8_t>(t));
+  s.result_layout_ = make_result_layout(s.plan_->result_types);
   s.code_ = TccPlan::compile(s.plan_->source);
 }
 
@@ -181,10 +172,11 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   out.affected = bc_ctx_affected(cx_);
   if (p.returns_rows) {
     out.columns = stmt.columns_;
-    auto layout = make_result_layout(p.result_types);
     const std::uint8_t* row = nullptr;
     std::uint32_t len = 0;
-    while (bc_ctx_next_result(cx_, &row, &len)) out.rows.push_back(decode_row(layout, std::as_bytes(std::span{row, len})));
+    while (bc_ctx_next_result(cx_, &row, &len)) {
+      out.rows.push_back(decode_row(stmt.result_layout_, std::as_bytes(std::span{row, len})));
+    }
   }
   bc_ctx_reset(cx_);
   return out;

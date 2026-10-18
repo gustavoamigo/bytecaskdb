@@ -150,15 +150,18 @@ void RowWriter::copy_from(BytesView old) {
   }
 }
 
+auto RowWriter::index_of(std::uint32_t col_id, std::optional<PhysType> type) const -> std::optional<std::size_t> {
+  const auto* c = layout_->find(col_id);
+  if (c == nullptr || (type && c->type != *type)) return std::nullopt;
+  return static_cast<std::size_t>(c - layout_->columns.data());
+}
+
 auto RowWriter::set_word(std::uint32_t col_id, PhysType type, std::uint64_t word) -> bool {
-  for (std::size_t i = 0; i < layout_->columns.size(); ++i) {
-    if (layout_->columns[i].col_id != col_id) continue;
-    if (layout_->columns[i].type != type) return false;
-    present_[i] = true;
-    fixed_[i] = word;
-    return true;
-  }
-  return false;
+  auto i = index_of(col_id, type);
+  if (!i) return false;
+  present_[*i] = true;
+  fixed_[*i] = word;
+  return true;
 }
 
 auto RowWriter::set_i64(std::uint32_t col_id, std::int64_t v) -> bool {
@@ -174,25 +177,20 @@ auto RowWriter::set_bool(std::uint32_t col_id, bool v) -> bool {
 }
 
 auto RowWriter::set_bytes(std::uint32_t col_id, BytesView v) -> bool {
-  for (std::size_t i = 0; i < layout_->columns.size(); ++i) {
-    if (layout_->columns[i].col_id != col_id) continue;
-    if (layout_->columns[i].type != PhysType::Bytes) return false;
-    present_[i] = true;
-    var_[i].assign(v.begin(), v.end());
-    return true;
-  }
-  return false;
+  auto i = index_of(col_id, PhysType::Bytes);
+  if (!i) return false;
+  present_[*i] = true;
+  var_[*i].assign(v.begin(), v.end());
+  return true;
 }
 
 auto RowWriter::set_null(std::uint32_t col_id) -> bool {
-  for (std::size_t i = 0; i < layout_->columns.size(); ++i) {
-    if (layout_->columns[i].col_id != col_id) continue;
-    present_[i] = false;
-    fixed_[i] = 0;
-    var_[i].clear();
-    return true;
-  }
-  return false;
+  auto i = index_of(col_id, std::nullopt);
+  if (!i) return false;
+  present_[*i] = false;
+  fixed_[*i] = 0;
+  var_[*i].clear();
+  return true;
 }
 
 auto RowWriter::missing_required() const -> bool {

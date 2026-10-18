@@ -30,7 +30,10 @@ constexpr std::byte kCounterNextId{0x01};
 constexpr std::byte kCounterVersion{0x02};
 constexpr std::uint8_t kKindTable = 1;
 constexpr std::uint8_t kKindIndex = 2;
-constexpr std::uint16_t kRecordFormat = 1;
+// 2: the row format of docs/sql_layer_types_design.md (12-byte header, the
+// bitmap meaning present). Format 1 was the prototype's; its column
+// positions and rows do not decode under format 2, so it is refused.
+constexpr std::uint16_t kRecordFormat = 2;
 
 auto counter_key(std::byte id) -> Bytes { return {std::byte{kNsCatalog}, kSubCounter, id}; }
 
@@ -149,7 +152,13 @@ auto serialize(const Table& t) -> Bytes {
 
 auto deserialize(BytesView in) -> Table {
   RecordReader r{in};
-  if (r.u16() != kRecordFormat) throw std::runtime_error("unknown catalog record format");
+  if (auto format = r.u16(); format != kRecordFormat) {
+    throw std::runtime_error("catalog record format " + std::to_string(format) + " is not " +
+                             std::to_string(kRecordFormat) +
+                             (format < kRecordFormat ? ": the database was written by an earlier SQL-layer build "
+                                                       "whose row format this build does not read"
+                                                     : ": the database was written by a later SQL-layer build"));
+  }
   Table t;
   t.id = r.u32();
   t.name = r.str();

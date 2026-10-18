@@ -75,6 +75,7 @@ private:
   std::unique_ptr<TccPlan> code_;
   std::vector<std::string> columns_;
   std::vector<std::uint8_t> result_codes_;  // the plan's result_types as bc_type codes
+  RowLayout result_layout_;                 // how its result rows decode, built once per compile
 };
 
 class Database {

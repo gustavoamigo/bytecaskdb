@@ -104,6 +104,20 @@ TEST_CASE("catalog: CREATE TABLE and CREATE INDEX persist and reload", "[sql][ca
   CHECK(u.id == 4);
 }
 
+TEST_CASE("catalog: a record of the prototype's format 1 is refused, not misread", "[sql][catalog]") {
+  sql_test::TempDir dir{"catalog_format"};
+  auto db = bytecask::DB::open(dir.path());
+  // 01 02 <id:4>: a table record whose format field (u16, little-endian) is 1.
+  Bytes key{std::byte{kNsCatalog}, std::byte{0x02}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1}};
+  db.put({}, key, Bytes{std::byte{1}, std::byte{0}, std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}});
+  try {
+    (void)Catalog::load(db);
+    FAIL("a format-1 record must be refused");
+  } catch (const std::runtime_error& e) {
+    CHECK(std::string{e.what()}.find("earlier SQL-layer build") != std::string::npos);
+  }
+}
+
 TEST_CASE("catalog: the constants block a plan needs", "[sql][catalog]") {
   sql_test::TempDir dir{"catalog_consts"};
   auto db = bytecask::DB::open(dir.path());

@@ -10,6 +10,7 @@
 module;
 #include <cstdint>
 #include <span>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -53,6 +54,11 @@ export using ::bc_db;
 export using ::bc_catalog;
 export using ::bc_params;
 export using ::bc_ctx_affected;
+
+// What a BC_E_CONSTRAINT detail (bc_error_detail) means, in words: the one
+// mapping from constraint codes to text, for the plan API's error message
+// and the embedded API's exception.
+export [[nodiscard]] auto constraint_message(std::uint32_t detail) -> std::string;
 
 export struct ApiSymbol {
   const char* name;

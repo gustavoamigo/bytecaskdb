@@ -71,6 +71,11 @@ TEST_CASE("embedded API: the seven statements, then a fresh open", "[sql][api]")
     CHECK(db->execute(kById, {i(4)}).rows == Grid{{i(4), kNull}});
     CHECK(db->execute(kById, {i(9)}).rows.empty());
     CHECK(ids(db->execute(kByName, {bytes("a"), bytes("c")})) == std::vector<std::int64_t>{1, 2});
+    // An upper bound alone: NULL < x is unknown, so row 3 (name NULL) is not returned.
+    CHECK(ids(db->execute("SELECT id FROM t WHERE name < $1", {bytes("c")})) == std::vector<std::int64_t>{1, 2});
+    CHECK(ids(db->execute("SELECT id FROM t WHERE name <= $1", {bytes("cherry")})) ==
+          std::vector<std::int64_t>{1, 2, 4});
+    CHECK(ids(db->execute("SELECT id FROM t WHERE name > $1", {bytes("apple")})) == std::vector<std::int64_t>{2, 4});
 
     CHECK(db->execute(kUpdate, {i(1), i(3)}).affected == 1);
     CHECK(db->execute(kById, {i(1)}).rows == Grid{{i(1), i(7)}});
@@ -81,7 +86,7 @@ TEST_CASE("embedded API: the seven statements, then a fresh open", "[sql][api]")
     CHECK_THROWS_AS(db->execute(kById, {bytes("x")}), std::invalid_argument);
     CHECK_THROWS_AS(db->execute(kById, {}), std::invalid_argument);
     CHECK_THROWS_AS(db->prepare("SELECT id FROM t JOIN u ON t.id = u.id"), ast::SqlError);
-    CHECK(db->cached_plans() == 7);  // each text compiled once
+    CHECK(db->cached_plans() == 10);  // each text compiled once
     db->close();
   }
   // A fresh open: the catalog is reloaded from namespace 0x01 and the plans

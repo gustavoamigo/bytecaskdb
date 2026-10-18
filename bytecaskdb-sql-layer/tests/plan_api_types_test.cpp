@@ -233,6 +233,10 @@ void unique_insert(bc_ctx* cx) {
   bc_emit_count(cx, 1);
 }
 
+void raise_p(bc_ctx* cx) {
+  bc_raise(cx, static_cast<uint32_t>(bc_param_i64(cx, 0)), static_cast<uint32_t>(bc_param_i64(cx, 1)));
+}
+
 void raise_then_write(bc_ctx* cx) {
   bc_raise(cx, BC_C_NOT_NULL, 7);
   bc_key kb = bc_key_begin(cx, kTbl);
@@ -256,6 +260,18 @@ TEST_CASE("plan API: a raised constraint error is final: no retry, nothing commi
   CHECK(bc_error_detail(f.cx) == ((std::uint32_t{BC_C_UNIQUE} << 24) | kTbl));
   CHECK(std::string{bc_error_message(f.cx)}.find("unique") != std::string::npos);
   CHECK(bc_ctx_affected(f.cx) == -1);
+
+  // The detail has 8 bits for the kind and 24 for the id: wider is a plan bug.
+  CHECK(run(f, raise_p, {std::int64_t{256}, std::int64_t{1}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(run(f, raise_p, {std::int64_t{0}, std::int64_t{1}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(run(f, raise_p, {std::int64_t{BC_C_CHECK}, std::int64_t{0x0100'0000}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(run(f, raise_p, {std::int64_t{BC_C_RANGE}, std::int64_t{0x00FF'FFFF}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
+  CHECK(bc_error_detail(f.cx) == ((std::uint32_t{BC_C_RANGE} << 24) | 0x00FF'FFFFu));
+  CHECK(std::string{bc_error_message(f.cx)}.find("out of range") != std::string::npos);
 
   CHECK(run(f, raise_then_write, {}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);

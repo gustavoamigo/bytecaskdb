@@ -272,10 +272,16 @@ auto select_by_index(Writer& w, const bound::Select& s) -> void {
   return_if_null(w, params, false);
 
   auto type = t.column(col_id)->type;
-  auto key_from = [&](const std::optional<bound::Compare>& c, const std::string& name, bool successor) {
+  auto nullable = t.column(col_id)->nullable;
+  // null_part: the bound is the null part itself. A comparison with NULL is
+  // never true, so a scan with no lower bound starts past the null entries,
+  // which sort first: at the successor of the null part.
+  auto key_from = [&](const std::optional<bound::Compare>& c, const std::string& name, bool successor,
+                      bool null_part = false) {
     auto k = w.next_key();
     w.line("bc_key " + k + " = bc_key_begin(cx, " + w.idx(ix) + ");");
     if (c) w.line("bc_key_" + suffix(type) + "(cx, " + k + ", " + param(type, c->param) + ");");
+    if (null_part) w.line("bc_key_null(cx, " + k + ");");
     // A key part is self-delimiting and the primary key follows it, so an
     // exclusive bound on the part is the successor of its encoded prefix.
     auto end = "bc_key_end(cx, " + k + ")";
@@ -285,7 +291,8 @@ auto select_by_index(Writer& w, const bound::Select& s) -> void {
     key_from(eq, "lo", false);
     w.line("bc_cursor c = bc_scan_open(cx, " + w.idx(ix) + ", lo, lo, BC_SCAN_PREFIX);");
   } else {
-    key_from(lo, "lo", lo && lo->op == Op::Gt);
+    auto skip_nulls = !lo && nullable;
+    key_from(lo, "lo", skip_nulls || (lo && lo->op == Op::Gt), skip_nulls);
     key_from(hi, "hi", !hi || hi->op == Op::Le);
     w.line("bc_cursor c = bc_scan_open(cx, " + w.idx(ix) + ", lo, hi, BC_SCAN_FORWARD);");
   }

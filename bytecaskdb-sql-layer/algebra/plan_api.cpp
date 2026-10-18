@@ -116,17 +116,6 @@ auto phys_type(std::uint8_t code) -> std::optional<PhysType> {
   }
 }
 
-auto constraint_name(std::uint32_t kind) -> const char* {
-  switch (kind) {
-    case BC_C_UNIQUE: return "unique";
-    case BC_C_NOT_NULL: return "not-null";
-    case BC_C_CHECK: return "check";
-    case BC_C_FOREIGN_KEY: return "foreign-key";
-    case BC_C_RANGE: return "range";
-    default: return "unknown";
-  }
-}
-
 }  // namespace
 
 struct bc_ctx {
@@ -308,8 +297,6 @@ struct bc_ctx {
     effects.clear();
     results.clear();
     result_pos = 0;
-    result_types.clear();
-    result_layout.reset();
     emit.reset();
     emit_col = 0;
     affected = -1;
@@ -500,7 +487,6 @@ auto row_builder(bc_ctx* cx, bc_row r) -> RowBuilder* {
 }
 
 auto check_schema(bc_ctx* cx, const bc_schema_ref* ref) -> bool {
-  if (ref == nullptr) return true;
   // prototype: an exact catalog version, stricter than the design's
   // per-column compatibility check.
   if (ref->catalog_version != cx->cat->version()) {
@@ -520,15 +506,21 @@ auto check_schema(bc_ctx* cx, const bc_schema_ref* ref) -> bool {
       return false;
     }
   }
+  std::vector<PhysType> types;
   for (std::uint32_t i = 0; i < ref->n_result; ++i) {
     auto t = phys_type(ref->result_types[i]);
     if (!t) {
       cx->fail(BC_E_LAYOUT, "unknown result type code " + std::to_string(ref->result_types[i]));
       return false;
     }
-    cx->result_types.push_back(*t);
+    types.push_back(*t);
   }
-  cx->result_layout.emplace(bytecask::sql::make_result_layout(cx->result_types));
+  // Kept across executions: a retry, or the next run of the same plan, does
+  // not rebuild it.
+  if (!cx->result_layout || types != cx->result_types) {
+    cx->result_layout.emplace(bytecask::sql::make_result_layout(types));
+    cx->result_types = std::move(types);
+  }
   return true;
 }
 
@@ -610,7 +602,12 @@ void bc_ctx_run(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* compiled_again
     return;
   }
   BC_GUARD_BEGIN
-  if (!check_schema(cx, compiled_against)) return;
+  if (compiled_against == nullptr) {
+    cx->result_types.clear();
+    cx->result_layout.reset();
+  } else if (!check_schema(cx, compiled_against)) {
+    return;
+  }
   BC_GUARD_END(cx)
   if (!cx->ok()) return;
   plan(cx);
@@ -1372,9 +1369,17 @@ void bc_guard_absent(bc_ctx* cx, bc_view key) {
 
 void bc_raise(bc_ctx* cx, uint32_t constraint, uint32_t object_id) {
   if (!cx->ok()) return;
-  cx->fail(BC_E_CONSTRAINT, std::string{constraint_name(constraint)} + " constraint violated on object " +
-                                std::to_string(object_id));
-  cx->detail = ((constraint & 0xFFu) << 24) | (object_id & 0x00FF'FFFFu);
+  // The detail holds the kind in 8 bits and the id in 24: anything wider would
+  // name another constraint or object.
+  if (constraint < BC_C_UNIQUE || constraint > BC_C_RANGE || object_id > 0x00FF'FFFFu) {
+    cx->fail(BC_E_HANDLE, "bc_raise with an unknown constraint kind or an object id past 2^24");
+    return;
+  }
+  auto detail = (constraint << 24) | object_id;
+  BC_GUARD_BEGIN
+  cx->fail(BC_E_CONSTRAINT, constraint_message(detail));
+  cx->detail = detail;
+  BC_GUARD_END(cx)
 }
 
 }  // extern "C"
