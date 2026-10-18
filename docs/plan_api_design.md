@@ -146,7 +146,7 @@ enum bc_error_code {
   BC_E_LIMIT,       /* key or value over the engine's limits */
   BC_E_HANDLE,      /* stale, foreign or out-of-range handle, or a bad column offset */
   BC_E_ARITH,       /* integer overflow, division by zero, out-of-range conversion */
-  BC_E_LAYOUT,      /* plan fingerprint does not match the catalog, or a row violates its layout */
+  BC_E_LAYOUT,      /* plan incompatible with the live catalog, or a row violates its layout */
   BC_E_DEGRADED,    /* engine degraded; writes refused */
   BC_E_CLOSED,
 };
@@ -165,6 +165,13 @@ typedef struct {
   uint64_t max_reads;       /* record reads and cursor steps, together */
   uint64_t deadline_ns;     /* monotonic; 0 = none */
 } bc_budget;
+
+/* What a plan was compiled against: the catalog version, and the tables and
+   indexes it reads or writes. bc_ctx_run checks it against the live catalog. */
+typedef struct {
+  uint64_t catalog_version;
+  const uint32_t *tables_read,  *tables_written;   uint32_t n_read, n_written;
+} bc_schema_ref;
 ```
 
 Table ids, index ids, layout ids and column offsets are constants the
