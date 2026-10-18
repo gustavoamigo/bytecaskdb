@@ -1,7 +1,7 @@
 /* SELECT id FROM t WHERE name >= $1 AND name < $2
    isolation: snapshot   schema: catalog v2 */
 #include "bc_plan.h"
-enum { TBL_T = 1, IDX_T_BY_NAME = 3, T_ID_OFF = 16, LAY_RESULT = 1073741825 };
+enum { TBL_T = 1, IDX_T_BY_NAME = 3, T_ID_OFF = 20 };
 
 void plan(bc_ctx *cx) {
   if (bc_param_null(cx, 0) || bc_param_null(cx, 1)) {
@@ -18,7 +18,7 @@ void plan(bc_ctx *cx) {
     bool found = false;
     bc_view row = bc_lookup(cx, TBL_T, bc_scan_pk(cx, c), &found);
     if (found) {
-      bc_emit_begin(cx, LAY_RESULT);
+      bc_emit_begin(cx);
       bc_emit_i64(cx, bc_col_i64(cx, row, T_ID_OFF));
       bc_emit_end(cx);
     }

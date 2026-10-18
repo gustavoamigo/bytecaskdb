@@ -13,6 +13,8 @@
 #include <variant>
 #include <vector>
 
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+
 import bytecask.sql.api;
 import bytecask.sql.tests.util;
 
@@ -55,7 +57,13 @@ TEST_CASE("embedded API: the seven statements, then a fresh open", "[sql][api]")
     CHECK(db->execute(insert, {i(2), bytes("banana"), i(20)}).affected == 1);
     CHECK(db->execute(insert, {i(3), kNull, i(30)}).affected == 1);
     CHECK(db->execute(insert, {i(4), bytes("cherry"), kNull}).affected == 1);
-    CHECK_THROWS_AS(db->execute(insert, {i(1), bytes("again"), i(0)}), ExecError);
+    try {
+      (void)db->execute(insert, {i(1), bytes("again"), i(0)});
+      FAIL("a duplicate key must throw");
+    } catch (const ExecError& e) {
+      CHECK(e.code() == BC_E_CONSTRAINT);
+      CHECK(std::string{e.what()}.find("unique") != std::string::npos);
+    }
 
     auto r = db->execute(kById, {i(1)});
     CHECK(r.columns == std::vector<std::string>{"id", "qty"});

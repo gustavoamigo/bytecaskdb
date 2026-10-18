@@ -47,7 +47,6 @@ auto generate(Catalog& cat, std::string_view sql) -> GeneratedPlan {
 
 TEST_CASE("codegen: generated plans equal the hand-written ones", "[sql][codegen]") {
   sql_test::Fixture f;
-  // In the order plans_test.cpp interns the result layouts.
   const std::vector<std::pair<std::string, std::string>> cases{
       {"select_by_id", "SELECT id, qty FROM t WHERE id = $1"},
       {"select_name_range", "SELECT id FROM t WHERE name >= $1 AND name < $2"},
@@ -68,7 +67,6 @@ TEST_CASE("codegen: what the runtime needs besides the text", "[sql][codegen]") 
   auto sel = generate(f.cat, "SELECT id, qty FROM t WHERE id = $1");
   CHECK(sel.returns_rows);
   CHECK(sel.result_types == std::vector<PhysType>{PhysType::I64, PhysType::I64});
-  CHECK(sel.result_layout == Catalog::kResultLayoutBase);
   CHECK(sel.tables_read == std::vector<std::uint32_t>{1});
   CHECK(sel.tables_written.empty());
   CHECK(sel.catalog_version == 2);
@@ -89,6 +87,9 @@ TEST_CASE("codegen: the other bound forms produce plans; no rule, no plan", "[sq
   auto partial = generate(f.cat, "INSERT INTO t (id) VALUES ($1)").source;
   CHECK(partial.find("bc_row_set_null(cx, r0, T_NAME_COL);") != std::string::npos);
   CHECK(partial.find("bc_key_null(cx, k1);") != std::string::npos);
+  // A duplicate key is checked on the snapshot and raised, then guarded for the race.
+  CHECK(partial.find("if (bc_exists(cx, pk)) {\n    bc_raise(cx, BC_C_UNIQUE, TBL_T);\n    return;\n  }") != std::string::npos);
+  CHECK(partial.find("bc_guard_absent(cx, pk);") != std::string::npos);
 
   CHECK_THROWS_AS(generate(f.cat, "SELECT id FROM t WHERE qty = $1"), ast::SqlError);
   CHECK_THROWS_AS(generate(f.cat, "SELECT id FROM t WHERE id = $1 AND qty = $2"), ast::SqlError);

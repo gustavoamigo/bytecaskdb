@@ -35,11 +35,17 @@ auto decode_row(const RowLayout& layout, BytesView row) -> std::vector<Value> {
   for (const auto& c : layout.columns) {
     if (row_is_null(row, c)) {
       out.emplace_back(std::monostate{});
-    } else if (c.type == PhysType::I64) {
-      out.emplace_back(row_i64(row, c.pos).value_or(0));
-    } else {
-      auto v = row_bytes(row, c.pos).value_or(BytesView{});
-      out.emplace_back(Bytes(v.begin(), v.end()));
+      continue;
+    }
+    switch (c.type) {
+      case PhysType::I64: out.emplace_back(row_i64(row, c.pos).value_or(0)); break;
+      case PhysType::F64: out.emplace_back(row_f64(row, c.pos).value_or(0.0)); break;
+      case PhysType::Bool: out.emplace_back(row_bool(row, c.pos).value_or(false)); break;
+      case PhysType::Bytes: {
+        auto v = row_bytes(row, c.pos).value_or(BytesView{});
+        out.emplace_back(Bytes(v.begin(), v.end()));
+        break;
+      }
     }
   }
   return out;
@@ -47,7 +53,23 @@ auto decode_row(const RowLayout& layout, BytesView row) -> std::vector<Value> {
 
 auto matches(const Value& v, PhysType t) -> bool {
   if (std::holds_alternative<std::monostate>(v)) return true;
-  return t == PhysType::I64 ? std::holds_alternative<std::int64_t>(v) : std::holds_alternative<Bytes>(v);
+  switch (t) {
+    case PhysType::I64: return std::holds_alternative<std::int64_t>(v);
+    case PhysType::F64: return std::holds_alternative<double>(v);
+    case PhysType::Bool: return std::holds_alternative<bool>(v);
+    case PhysType::Bytes: return std::holds_alternative<Bytes>(v);
+  }
+  return false;
+}
+
+auto constraint_message(std::uint32_t detail) -> std::string {
+  auto object = std::to_string(detail & 0x00FF'FFFFu);
+  switch (detail >> 24) {
+    case BC_C_UNIQUE: return "duplicate key value violates unique constraint of object " + object;
+    case BC_C_NOT_NULL: return "null value violates not-null constraint of column " + object;
+    case BC_C_RANGE: return "value out of range for column " + object;
+    default: return "constraint violated on object " + object;
+  }
 }
 
 }  // namespace
@@ -102,6 +124,8 @@ void Database::compile(Statement& s) {
     for (auto id : sel->targets) s.columns_.push_back(sel->table->column(id)->name);
   }
   s.plan_ = std::make_unique<GeneratedPlan>(generate_plan(bound, cat_, s.sql_));
+  s.result_codes_.clear();
+  for (auto t : s.plan_->result_types) s.result_codes_.push_back(static_cast<std::uint8_t>(t));
   s.code_ = TccPlan::compile(s.plan_->source);
 }
 
@@ -145,18 +169,22 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   const auto& p = *stmt.plan_;
   bc_schema_ref ref{p.catalog_version, p.tables_read.data(), p.tables_written.data(),
                     static_cast<std::uint32_t>(p.tables_read.size()),
-                    static_cast<std::uint32_t>(p.tables_written.size())};
+                    static_cast<std::uint32_t>(p.tables_written.size()), stmt.result_codes_.data(),
+                    static_cast<std::uint32_t>(stmt.result_codes_.size())};
   auto r = bc_execute(cx_, stmt.code_->fn(), &ref, &bp, {}, true, kMaxRetries);
-  if (r == BC_CONFLICT) throw ExecError("conflict: a guard failed on every attempt (for INSERT, a duplicate key)", BC_CONFLICT);
+  if (r == BC_CONFLICT) throw ExecError("conflict: a guard failed on every attempt", BC_CONFLICT);
+  if (r == BC_FAILED && bc_error(cx_) == BC_E_CONSTRAINT) {
+    throw ExecError(constraint_message(bc_error_detail(cx_)), BC_E_CONSTRAINT);
+  }
   if (r == BC_FAILED) throw ExecError(bc_error_message(cx_), bc_error(cx_));
 
   out.affected = bc_ctx_affected(cx_);
   if (p.returns_rows) {
     out.columns = stmt.columns_;
-    const auto* layout = cat_.row_layout(p.result_layout);
+    auto layout = make_result_layout(p.result_types);
     const std::uint8_t* row = nullptr;
     std::uint32_t len = 0;
-    while (bc_ctx_next_result(cx_, &row, &len)) out.rows.push_back(decode_row(*layout, std::as_bytes(std::span{row, len})));
+    while (bc_ctx_next_result(cx_, &row, &len)) out.rows.push_back(decode_row(layout, std::as_bytes(std::span{row, len})));
   }
   bc_ctx_reset(cx_);
   return out;

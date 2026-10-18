@@ -28,7 +28,15 @@ using Op = ast::Compare::Op;
 
 [[noreturn]] void no_plan(const std::string& why) { throw SqlError{"no plan: " + why, -1}; }
 
-auto suffix(PhysType t) -> std::string { return t == PhysType::Bytes ? "bytes" : "i64"; }
+auto suffix(PhysType t) -> std::string {
+  switch (t) {
+    case PhysType::I64: return "i64";
+    case PhysType::F64: return "f64";
+    case PhysType::Bool: return "bool";
+    case PhysType::Bytes: return "bytes";
+  }
+  return "i64";
+}
 
 // Writes the body line by line, and records which catalog constants it used.
 class Writer {
@@ -57,17 +65,12 @@ public:
   auto col(std::uint32_t id) -> std::string { return use(up(t_.name) + "_" + up(t_.column(id)->name) + "_COL"); }
   auto pos(std::uint32_t id) -> std::string {
     const auto* c = t_.column(id);
-    return use(up(t_.name) + "_" + up(c->name) + (c->type == PhysType::Bytes ? "_SLOT" : "_OFF"));
+    return use(up(t_.name) + "_" + up(c->name) + (is_fixed(c->type) ? "_OFF" : "_SLOT"));
   }
-  auto result() -> std::string {
-    uses_result_ = true;
-    return "LAY_RESULT";
-  }
-
   auto next_key() -> std::string { return "k" + std::to_string(keys_++); }
 
-  // The constants block: the catalog's order, then the result layout.
-  auto constants(std::uint32_t result_layout) const -> std::string {
+  // The constants block, in the catalog's order.
+  auto constants() const -> std::string {
     std::string out = "enum { ";
     auto first = true;
     for (const auto& [name, value] : cat_.constants(t_)) {
@@ -75,7 +78,6 @@ public:
       out += (first ? "" : ", ") + name + " = " + std::to_string(value);
       first = false;
     }
-    if (uses_result_) out += (first ? "" : ", ") + std::string{"LAY_RESULT = "} + std::to_string(result_layout);
     return out + " };";
   }
 
@@ -97,7 +99,6 @@ private:
   std::size_t depth_{1};
   int keys_{0};
   std::set<std::string> used_;
-  bool uses_result_{false};
 };
 
 auto param(PhysType t, std::uint32_t n) -> std::string {
@@ -157,7 +158,7 @@ void found_or_return(Writer& w, bool count) {
 }
 
 void emit_columns(Writer& w, const Table& t, const std::vector<std::uint32_t>& targets, const std::string& row) {
-  w.line("bc_emit_begin(cx, " + w.result() + ");");
+  w.line("bc_emit_begin(cx);");
   for (auto id : targets) {
     const auto& c = *t.column(id);
     if (!c.nullable) {
@@ -184,6 +185,12 @@ auto insert(Writer& w, const bound::Insert& s) -> void {
   for (auto id : t.pk_col_ids) pk_ps.push_back(*value_param(id));
   auto k0 = pk_key(w, t, pk_ps);
   w.line("bc_view pk = bc_key_end(cx, " + k0 + ");");
+  // A duplicate is a constraint error, not a conflict: checked on the
+  // snapshot and raised; the guard below covers the race.
+  w.open("if (bc_exists(cx, pk))");
+  w.line("bc_raise(cx, BC_C_UNIQUE, " + w.tbl() + ");");
+  w.line("return;");
+  w.close();
   w.line("bc_row r0 = bc_row_begin(cx, " + w.lay() + ");");
   for (const auto& c : t.columns) {
     auto p = value_param(c.id);
@@ -380,7 +387,7 @@ auto del(Writer& w, const bound::Delete& s) -> void {
 
 }  // namespace
 
-auto generate_plan(const bound::Bound& b, Catalog& cat, std::string_view sql) -> GeneratedPlan {
+auto generate_plan(const bound::Bound& b, const Catalog& cat, std::string_view sql) -> GeneratedPlan {
   GeneratedPlan out;
   out.param_types = b.param_types;
   out.catalog_version = cat.version();
@@ -388,7 +395,7 @@ auto generate_plan(const bound::Bound& b, Catalog& cat, std::string_view sql) ->
     Writer w{cat, t};
     body(w);
     out.source = "/* " + std::string{sql} + "\n   isolation: snapshot   schema: catalog v" +
-                 std::to_string(cat.version()) + " */\n#include \"bc_plan.h\"\n" + w.constants(out.result_layout) +
+                 std::to_string(cat.version()) + " */\n#include \"bc_plan.h\"\n" + w.constants() +
                  "\n\nvoid plan(bc_ctx *cx) {\n" + w.body() + "}\n";
   };
   std::visit(
@@ -401,7 +408,6 @@ auto generate_plan(const bound::Bound& b, Catalog& cat, std::string_view sql) ->
           out.tables_read = {s.table->id};
           out.returns_rows = true;
           for (auto id : s.targets) out.result_types.push_back(s.table->column(id)->type);
-          out.result_layout = cat.result_layout(out.result_types);
           auto pk_ps = pk_params(*s.table, s.where);
           build(*s.table, [&](Writer& w) {
             if (pk_ps) {

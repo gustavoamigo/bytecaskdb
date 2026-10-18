@@ -7,6 +7,10 @@ void plan(bc_ctx *cx) {
   bc_key k0 = bc_key_begin(cx, TBL_T);
   bc_key_i64(cx, k0, bc_param_i64(cx, 0));
   bc_view pk = bc_key_end(cx, k0);
+  if (bc_exists(cx, pk)) {
+    bc_raise(cx, BC_C_UNIQUE, TBL_T);
+    return;
+  }
   bc_row r0 = bc_row_begin(cx, LAY_T);
   bc_row_set_i64(cx, r0, T_ID_COL, bc_param_i64(cx, 0));
   if (bc_param_null(cx, 1)) {
