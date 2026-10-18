@@ -720,10 +720,10 @@ merged without a job doing so.
    runs the SQL in each plan's header over the same rows, so result rows and
    post-write table contents can be compared. Which one is not decided and
    does not need to be yet. Candidates: an existing SQL engine loaded with
-   the same data; the Python reference implementation extended with a plan
-   interpreter and the same catalog; or hand-computed expected results for
-   the fixture, which is enough for ten plans and two procedures. The first
-   plans can be checked by hand while the choice is made.
+   the same data, or hand-computed expected results for the fixture, which
+   is enough for ten plans and two procedures. The Python reference
+   implementation is not extended to the relational layer. The first plans
+   can be checked by hand while the choice is made.
 6. Fault tests for the guarantee: each plan run with a stale view, a wrong
    column offset, an exhausted budget, an exhausted arena and an injected
    I/O error, under the sanitizers, asserting an error code and untouched
