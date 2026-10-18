@@ -941,6 +941,8 @@ bc_view bc_row_end(bc_ctx* cx, bc_row r) {
   return {};
 }
 
+bc_view bc_empty(bc_ctx*) { return {}; }
+
 bc_view bc_pin(bc_ctx* cx, bc_view) {
   cx->unimplemented("bc_pin");
   return {};

@@ -110,7 +110,8 @@ public:
   // prototype: result layouts live in memory only, interned by their types,
   // with ids from kResultLayoutBase up in order of first use. A plan's result
   // layout id is therefore stable within a process, not across processes.
-  static constexpr std::uint32_t kResultLayoutBase = 0x8000'0000u;
+  // Below 2^31: a plan's constants are an enum, whose values are ints.
+  static constexpr std::uint32_t kResultLayoutBase = 0x4000'0000u;
   auto result_layout(const std::vector<PhysType>& types) -> std::uint32_t;
   [[nodiscard]] auto result_types(std::uint32_t layout_id) const -> const std::vector<PhysType>*;
 

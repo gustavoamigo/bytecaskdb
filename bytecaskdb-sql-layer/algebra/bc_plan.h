@@ -154,6 +154,7 @@ void     bc_row_set_bytes(bc_ctx *, bc_row, uint32_t col, bc_view);
 void     bc_row_set_null(bc_ctx *, bc_row, uint32_t col);
 bc_view  bc_row_end(bc_ctx *, bc_row);
 bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: lives until reset */
+bc_view  bc_empty(bc_ctx *);                        /* prototype addition: the empty view, e.g. an index entry's value */
 
 /* Ephemeral structures */
 bc_sorter bc_sorter_open(bc_ctx *, uint32_t bytes);

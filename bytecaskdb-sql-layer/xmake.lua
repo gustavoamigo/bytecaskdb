@@ -14,7 +14,15 @@ target("sql_layer_tests")
     set_default(false)
     add_deps("sql_layer")
     add_packages("catch2")
+    set_languages("c17", "c++23")
     add_files("tests/*.cpp")
+    -- The hand-written plans, compiled by clang as C. Every plan defines
+    -- plan(); each is renamed so several link into one binary.
+    add_includedirs("algebra")
+    for _, name in ipairs({"insert", "select_by_id", "select_name_range", "update_qty", "delete_by_id"}) do
+        add_files("plans/" .. name .. ".c", {defines = "plan=plan_" .. name,
+                  cflags = "-Wno-declaration-after-statement"})
+    end
     on_config(function(t)
         t:add("syslinks", "pthread")
     end)
