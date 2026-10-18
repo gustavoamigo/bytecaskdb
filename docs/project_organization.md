@@ -36,14 +36,44 @@ own MIT-compatible terms.
 ### MIT — SQL Layer (`bytecaskdb-sql-layer/`)
 
 A SQL layer on the engine's public API (#487), MIT like the core. It links
-`libbytecask.a` through `include/bytecask.hpp`, as the tests do, and includes
-no MariaDB header: the plugin may depend on it, never the reverse. Today it
+`libbytecask.a` through `include/bytecask.hpp`, as the plugin does, and
+includes no MariaDB header: the plugin may depend on it, never the reverse,
+and CI builds it with no MariaDB development package installed. Today it
 holds the end-to-end prototype of #497; files marked `// prototype:` are
 disposable and will be replaced by the designed layers.
 
+Its C++ is organized as C++23 modules, as the engine's is: one interface unit
+per module, named `bytecask.sql.<name>`, holding the declarations and the
+definitions.
+
+| Module | File | What it is |
+|--------|------|------------|
+| `bytecask.sql.key_codec` | `codec/key_codec.cppm` | Mem-comparable key encoding |
+| `bytecask.sql.row_codec` | `codec/row_codec.cppm` | Row format |
+| `bytecask.sql.catalog` | `catalog/catalog.cppm` | Tables, permanent column ids, indexes, persisted under namespace `0x01` |
+| `bytecask.sql.runtime` | `algebra/runtime.cppm` | The C++ side of the plan API: the types `bc_plan.h` leaves opaque, and the symbol table a run-time loader links plans against |
+| `bytecask.sql.ast` | `sql/ast.cppm` | The AST the parser hands the binder |
+| `bytecask.sql.parser` | `sql/parser.cppm` | libpg_query behind `parse()`; the only unit that sees its headers |
+| `bytecask.sql.binder` | `sql/binder.cppm` | Names to ids, parameter types from use |
+| `bytecask.sql.codegen` | `plan/codegen.cppm` | Planner and code generator |
+| `bytecask.sql.tcc_loader` | `plan/tcc_loader.cppm` | TinyCC in process; the only unit that sees `libtcc.h` |
+| `bytecask.sql.api` | `api/database.cppm` | The embedded API |
+
+One header: `algebra/bc_plan.h`, the C contract, which generated plans,
+TinyCC and clang-as-C read. Its `extern "C"` definitions are
+`algebra/plan_api.cpp`, a plain translation unit that includes the header and
+imports the modules, standard headers first, for the reason
+`bytecaskdb/bytecask_hpp.cpp` gives. The hand-written plans in `plans/*.c`
+are C. The tests import the modules; the fixtures they share are modules too
+(`bytecask.sql.tests.*`, under `tests/`). Two more headers of the same kind
+are planned, each at a boundary another toolchain consumes: the C ABI for the
+bindings (#494) and a header bridge for the plugin, the counterpart of
+`include/bytecask.hpp` (#488).
+
 Its third-party dependencies are fetched at build time, not vendored:
 libpg_query (PostgreSQL licence, with its bundled protobuf-c, MIT/BSD) and
-TinyCC (LGPL-2.1). The xmake targets that use them are not built by default.
+TinyCC (LGPL-2.1). The xmake targets that use them are not built by default;
+the `sql-layer` job in `ci.yml` builds and runs `sql_layer_tests`.
 
 ### GPL-2.0 — MariaDB Integration (`bytecaskdb-mariadb-plugin/`)
 
@@ -89,12 +119,17 @@ bytecask/
 │   └── row_encoding.h/cc
 │
 ├── bytecaskdb-sql-layer/ # MIT — SQL layer on the public API (#487)
+│   ├── algebra/          # bc_plan.h (the one header), plan_api.cpp, runtime.cppm
+│   ├── codec/ catalog/ sql/ plan/ api/   # bytecask.sql.* module interface units
+│   ├── plans/            # Hand-written plans, C
+│   ├── tests/            # Catch2 tests; shared fixtures as bytecask.sql.tests.* modules
+│   └── xmake.lua         # sql_layer, sql_layer_tests; libpg_query and TinyCC package rules
 │
 ├── tests/                # MIT — engine tests (no MariaDB)
 ├── benchmarks/           # MIT — engine benchmarks
 ├── docs/                 # Documentation
 ├── scripts/              # Build and benchmark helper scripts
-└── xmake.lua             # xmake build — covers bytecaskdb/, tests/, benchmarks/ only
+└── xmake.lua             # xmake build — bytecaskdb/, tests/, benchmarks/; includes bytecaskdb-sql-layer/xmake.lua
 ```
 
 `xmake.lua` builds `bytecaskdb/bytecask_hpp.cpp` into `libbytecask.a`. The
@@ -117,6 +152,7 @@ Builds the C++23 engine. Targets:
 | `engine_bench` | binary | Engine benchmarks vs RocksDB |
 | `bytecask_bench` | binary | Map structure benchmarks |
 | `bytecask` | static lib | `libbytecask.a` — consumed by MariaDB CMake |
+| `sql_layer` | static lib | `libsql_layer.a` — the `bytecask.sql.*` modules and `plan_api.cpp`, from `bytecaskdb-sql-layer/xmake.lua` |
 | `sql_layer_tests` | binary | SQL layer tests (Catch2), from `bytecaskdb-sql-layer/xmake.lua` |
 
 The `bytecask` static target compiles `bytecaskdb/` sources plus
