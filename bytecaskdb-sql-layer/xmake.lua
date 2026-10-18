@@ -7,7 +7,7 @@ target("sql_layer")
     set_default(false)
     add_deps("bytecask")
     add_includedirs("..", {public = true})
-    add_files("codec/*.cpp", "catalog/*.cpp")
+    add_files("codec/*.cpp", "catalog/*.cpp", "algebra/*.cpp")
 
 target("sql_layer_tests")
     set_kind("binary")
