@@ -4,8 +4,7 @@
 // tcc_loader.cppm — compiles a plan file in process with TinyCC and links it
 // against the plan API by name. The plan sees only the functions in
 // plan_api_symbols(): no libc, no other symbol of the process. libtcc.h is
-// seen here, for TCCState, and in tcc_loader.cpp, which holds the
-// definitions, and nowhere else.
+// seen by tcc_loader.cpp, which holds the definitions, and nowhere else.
 //
 // prototype: the run-time tier of #493, without the checker that must run
 // before it.
@@ -16,13 +15,14 @@ module;
 
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
 
-// For TCCState, which TccPlan holds.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Weverything"
-#include <libtcc.h>
-#pragma clang diagnostic pop
-
 export module bytecask.sql.tcc_loader;
+
+// libtcc.h's opaque compiler state, which TccPlan holds. Declared in the
+// global module, as the header declares it ([basic.link]/10), so
+// tcc_loader.cpp's include of the header completes the same entity.
+extern "C" {
+struct TCCState;
+}
 
 export namespace bytecask::sql {
 

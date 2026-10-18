@@ -57,7 +57,7 @@ with the definitions, so a body edit recompiles no importer.
 | `bytecask.sql.parser` | `sql/parser.cppm` | libpg_query behind `parse()`; `parser.cpp` is the only unit that sees its headers |
 | `bytecask.sql.binder` | `sql/binder.cppm` | Names to ids, parameter types from use |
 | `bytecask.sql.codegen` | `plan/codegen.cppm` | Planner and code generator |
-| `bytecask.sql.tcc_loader` | `plan/tcc_loader.cppm` | TinyCC in process; with `tcc_loader.cpp` the only unit that sees `libtcc.h` |
+| `bytecask.sql.tcc_loader` | `plan/tcc_loader.cppm` | TinyCC in process; `tcc_loader.cpp` is the only unit that sees `libtcc.h` |
 | `bytecask.sql.api` | `api/database.cppm` | The embedded API |
 
 One header: `algebra/bc_plan.h`, the C contract, which generated plans,
