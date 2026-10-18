@@ -653,8 +653,11 @@ Layout: `bytecaskdb-sql-layer/algebra/` holds the header and its C++
 implementation; `catalog/` the catalog types and the TPROC-C fixture;
 `plans/` the hand-written plan files, each with its SQL in the header
 comment; `check/` the checker; `tests/` the property tests, fault tests and
-the harness. The MariaDB plugin keeps its own key and row codecs until the
-new ones are proven, then migrates to them.
+the harness. The catalog, transaction and codec directories are the half the
+MariaDB plugin links: the plugin depends on the sql-layer, never the
+reverse, and nothing under `bytecaskdb-sql-layer/` includes a MariaDB header.
+The plugin keeps its own key and row codecs until the shared ones are
+proven, then adopts them through its per-table format versions.
 
 Questions the hand-written plans settle: whether `bc_pin` appears rarely or
 everywhere; whether the budget and ephemeral bounds a compiler would choose
