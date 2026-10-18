@@ -827,3 +827,12 @@ TEST_CASE("plan API: a second commit and a too-wide result are plan errors, not 
   CHECK(bc_execute(f.cx, scan_all_forward, &ref, &none, {}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
 }
+
+TEST_CASE("plan API: a commit refused because the engine is a follower is BC_E_DEGRADED, not corruption", "[sql][algebra]") {
+  Fixture f;
+  f.db->set_mode(bytecask::Mode::Follower);
+  CHECK(run(f, insert_t, {std::int64_t{1}, bytes("a"), std::int64_t{5}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_DEGRADED);
+  f.db->set_mode(bytecask::Mode::Leader);
+  CHECK(run(f, insert_t, {std::int64_t{1}, bytes("a"), std::int64_t{5}}) == BC_COMMITTED);
+}
