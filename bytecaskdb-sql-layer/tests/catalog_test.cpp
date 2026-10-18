@@ -65,8 +65,8 @@ TEST_CASE("catalog: CREATE TABLE and CREATE INDEX persist and reload", "[sql][ca
 
     Bytes ik;
     key_put_prefix(ik, kNsIndex, ix.id);
-    key_put_bytes(ik, bytes("bob"), true);
-    key_put_i64(ik, 7, false);
+    key_put_bytes(ik, bytes("bob"), {PhysType::Bytes, true});
+    key_put_i64(ik, 7, {PhysType::I64});
     Bytes out;
     CHECK(db.get({}, ik, out));
 
@@ -118,11 +118,4 @@ TEST_CASE("catalog: the constants block a plan needs", "[sql][catalog]") {
   CHECK(constant(cs, "T_QTY_OFF") == t.layout.find(2)->pos);
   CHECK(constant(cs, "T_NAME_SLOT") == 0);
   CHECK(constant(cs, "T_NAME_COL") == 1);
-
-  auto two = cat.result_layout({PhysType::I64, PhysType::I64});
-  auto one = cat.result_layout({PhysType::I64});
-  CHECK(two == Catalog::kResultLayoutBase);
-  CHECK(one == Catalog::kResultLayoutBase + 1);
-  CHECK(cat.result_layout({PhysType::I64, PhysType::I64}) == two);
-  CHECK(cat.result_types(one)->size() == 1);
 }

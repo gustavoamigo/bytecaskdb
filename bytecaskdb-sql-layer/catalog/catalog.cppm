@@ -23,7 +23,6 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <map>
-#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -85,12 +84,6 @@ struct KeyLayout {
   std::size_t index_parts;     // how many of them precede the primary key
 };
 
-// A layout for result rows: the column types in emit order.
-struct ResultLayout {
-  std::vector<PhysType> types;
-  RowLayout layout;
-};
-
 class Catalog {
 public:
   // Reads every table record under namespace 0x01.
@@ -109,17 +102,13 @@ public:
   [[nodiscard]] auto table(std::uint32_t id) const -> const Table*;
   // A table or an index: both draw ids from one counter.
   [[nodiscard]] auto key_layout(std::uint32_t table_or_index) const -> const KeyLayout*;
-  // A table's row layout, or a result layout.
+  // A table's row layout.
   [[nodiscard]] auto row_layout(std::uint32_t layout_id) const -> const RowLayout*;
   [[nodiscard]] auto table_of_layout(std::uint32_t layout_id) const -> const Table*;
 
-  // prototype: result layouts live in memory only, interned by their types,
-  // with ids from kResultLayoutBase up in order of first use. A plan's result
-  // layout id is therefore stable within a process, not across processes.
-  // Below 2^31: a plan's constants are an enum, whose values are ints.
-  static constexpr std::uint32_t kResultLayoutBase = 0x4000'0000u;
-  auto result_layout(const std::vector<PhysType>& types) -> std::uint32_t;
-  [[nodiscard]] auto result_types(std::uint32_t layout_id) const -> const std::vector<PhysType>*;
+  // Object ids stay below 2^31: a plan's constants are an enum, whose values
+  // are ints.
+  static constexpr std::uint32_t kMaxObjectId = 0x7FFF'FFFFu;
 
   // The constants a plan on this table needs, in the names generated plans
   // use: TBL_, LAY_, IDX_, and per column <COL>_OFF or <COL>_SLOT and <COL>_COL.
@@ -137,7 +126,6 @@ private:
   std::map<std::string, std::uint32_t, std::less<>> names_;
   std::map<std::uint32_t, KeyLayout> key_layouts_;
   std::map<std::uint32_t, std::uint32_t> layout_tables_;  // layout id -> table id
-  std::vector<std::unique_ptr<ResultLayout>> results_;
 };
 
 // Encodes the primary key of `t` from a row: kNsRow, the table id, the parts.
