@@ -47,34 +47,33 @@ auto relation(const PgQuery__RangeVar* rv) -> std::string {
 
 auto expr(const PgQuery__Node* n) -> Expr {
   if (n == nullptr) reject("expected an expression", -1);
-  switch (n->node_case) {
-    case PG_QUERY__NODE__NODE_COLUMN_REF: {
-      const auto* c = n->column_ref;
-      if (c->n_fields != 1) reject("qualified column names are not supported", c->location);
-      if (c->fields[0]->node_case != PG_QUERY__NODE__NODE_STRING) reject("* is not supported", c->location);
-      return Expr{Expr::Kind::Column, str(c->fields[0]), 0, nullptr, nullptr, c->location};
-    }
-    case PG_QUERY__NODE__NODE_PARAM_REF: {
-      const auto* p = n->param_ref;
-      if (p->number < 1) reject("bad parameter", p->location);
-      return Expr{Expr::Kind::Param, {}, static_cast<std::uint32_t>(p->number - 1), nullptr, nullptr, p->location};
-    }
-    case PG_QUERY__NODE__NODE_A_EXPR: {
-      const auto* a = n->a_expr;
-      if (a->kind != PG_QUERY__A__EXPR__KIND__AEXPR_OP || a->n_name != 1 || str(a->name[0]) != "-" ||
-          a->lexpr == nullptr) {
-        reject("only column - expression is supported here", a->location);
-      }
-      Expr e{Expr::Kind::Sub, {}, 0, nullptr, nullptr, a->location};
-      e.lhs = std::make_unique<Expr>(expr(a->lexpr));
-      e.rhs = std::make_unique<Expr>(expr(a->rexpr));
-      return e;
-    }
-    case PG_QUERY__NODE__NODE_A_CONST:
-      reject("literals are not supported; use parameters", n->a_const->location);
-    default:
-      reject("expression not supported", -1);
+  // if-chains, not switches: libpg_query's node enum has 268 values.
+  if (n->node_case == PG_QUERY__NODE__NODE_COLUMN_REF) {
+    const auto* c = n->column_ref;
+    if (c->n_fields != 1) reject("qualified column names are not supported", c->location);
+    if (c->fields[0]->node_case != PG_QUERY__NODE__NODE_STRING) reject("* is not supported", c->location);
+    return Expr{Expr::Kind::Column, str(c->fields[0]), 0, nullptr, nullptr, c->location};
   }
+  if (n->node_case == PG_QUERY__NODE__NODE_PARAM_REF) {
+    const auto* p = n->param_ref;
+    if (p->number < 1) reject("bad parameter", p->location);
+    return Expr{Expr::Kind::Param, {}, static_cast<std::uint32_t>(p->number - 1), nullptr, nullptr, p->location};
+  }
+  if (n->node_case == PG_QUERY__NODE__NODE_A_EXPR) {
+    const auto* a = n->a_expr;
+    if (a->kind != PG_QUERY__A__EXPR__KIND__AEXPR_OP || a->n_name != 1 || str(a->name[0]) != "-" ||
+        a->lexpr == nullptr) {
+      reject("only column - expression is supported here", a->location);
+    }
+    Expr e{Expr::Kind::Sub, {}, 0, nullptr, nullptr, a->location};
+    e.lhs = std::make_unique<Expr>(expr(a->lexpr));
+    e.rhs = std::make_unique<Expr>(expr(a->rexpr));
+    return e;
+  }
+  if (n->node_case == PG_QUERY__NODE__NODE_A_CONST) {
+    reject("literals are not supported; use parameters", n->a_const->location);
+  }
+  reject("expression not supported", -1);
 }
 
 auto compare_op(const std::string& op, std::int32_t pos) -> Compare::Op {
@@ -125,11 +124,12 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos) -> CreateTable
     ColumnDefAst col{cd->colname, str(tn->names[tn->n_names - 1]), cd->is_not_null != 0, false, cd->location};
     for (std::size_t k = 0; k < cd->n_constraints; ++k) {
       const auto* c = cd->constraints[k]->constraint;
-      switch (c->contype) {
-        case PG_QUERY__CONSTR_TYPE__CONSTR_PRIMARY: col.primary_key = true; break;
-        case PG_QUERY__CONSTR_TYPE__CONSTR_NOTNULL: col.not_null = true; break;
-        case PG_QUERY__CONSTR_TYPE__CONSTR_NULL: break;
-        default: reject("column constraint not supported", c->location);
+      if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_PRIMARY) {
+        col.primary_key = true;
+      } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_NOTNULL) {
+        col.not_null = true;
+      } else if (c->contype != PG_QUERY__CONSTR_TYPE__CONSTR_NULL) {
+        reject("column constraint not supported", c->location);
       }
     }
     t.columns.push_back(std::move(col));
@@ -242,15 +242,13 @@ auto parse(std::string_view sql) -> Statement {
   const auto* raw = res.tree->stmts[0];
   const auto* n = raw->stmt;
   auto pos = raw->stmt_location;
-  switch (n->node_case) {
-    case PG_QUERY__NODE__NODE_CREATE_STMT: return create_table(n->create_stmt, pos);
-    case PG_QUERY__NODE__NODE_INDEX_STMT: return create_index(n->index_stmt, pos);
-    case PG_QUERY__NODE__NODE_INSERT_STMT: return insert(n->insert_stmt, pos);
-    case PG_QUERY__NODE__NODE_SELECT_STMT: return select(n->select_stmt, pos);
-    case PG_QUERY__NODE__NODE_UPDATE_STMT: return update(n->update_stmt, pos);
-    case PG_QUERY__NODE__NODE_DELETE_STMT: return del(n->delete_stmt, pos);
-    default: reject("statement not supported", pos);
-  }
+  if (n->node_case == PG_QUERY__NODE__NODE_CREATE_STMT) return create_table(n->create_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_INDEX_STMT) return create_index(n->index_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_INSERT_STMT) return insert(n->insert_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_SELECT_STMT) return select(n->select_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_UPDATE_STMT) return update(n->update_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_DELETE_STMT) return del(n->delete_stmt, pos);
+  reject("statement not supported", pos);
 }
 
 }  // namespace bytecask::sql::ast
