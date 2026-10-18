@@ -237,10 +237,10 @@ end
 -- The same flags for a native target that an included file defines
 -- (bytecaskdb-sql-layer/xmake.lua), which cannot call this file's local
 -- functions: its targets add this rule where the targets above call them.
--- Covers ASan, TSan and UBSan. Not MSan: that also needs the std-module
--- probe off and Catch2 compiled from source, as bytecask_tests does below,
--- and the sql-layer links libpg_query and TinyCC built uninstrumented, which
--- MSan would report as uninitialized reads.
+-- Under MSan the targets themselves add what bytecask_tests pairs with the
+-- libc++ flags (the std-module probe off, Catch2 from source); the
+-- sql-layer's libpg_query and TinyCC are built uninstrumented, so an MSan
+-- binary of it builds but reports their stores as uninitialized reads.
 rule("bytecask.native_flags")
     on_config(function (t)
         add_native_syslinks(t)

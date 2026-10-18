@@ -50,6 +50,12 @@ package("tinycc")
 package_end()
 add_requires("tinycc 2026.09.26", {optional = true})
 
+-- Under MemorySanitizer the targets below compile against the instrumented
+-- libc++ with -nostdinc++ (apply_sanitizer in the root xmake.lua), and need
+-- what bytecask_tests pairs with that: no std-module probe, and Catch2 from
+-- source. See the comments on bytecask_tests.
+local msan = (get_config("sanitizer") or ""):find("memory", 1, true)
+
 -- C++23 modules, as the engine (the root sets the modules policy for every
 -- target): one interface unit per module (bytecask.sql.<name>), public so
 -- sql_layer_tests imports them, and one implementation unit beside it with
@@ -67,6 +73,9 @@ target("sql_layer")
               {public = true})
     add_files("codec/*.cpp", "catalog/*.cpp", "algebra/*.cpp", "sql/*.cpp", "plan/*.cpp", "api/*.cpp")
     add_packages("libpg_query", "tinycc", {public = true})
+    if msan then
+        set_policy("build.c++.modules.std", false)
+    end
     add_defines("SQL_LAYER_ALGEBRA_DIR=\"" .. path.join(os.scriptdir(), "algebra") .. "\"")
     on_config(function (t)
         local tcc = t:pkg("tinycc")
@@ -80,7 +89,13 @@ target("sql_layer_tests")
     set_default(false)
     add_deps("sql_layer")
     add_rules("bytecask.native_flags")
-    add_packages("catch2")
+    if msan then
+        add_files("../third_party/catch2_amalgamated/catch_amalgamated.cpp")
+        add_includedirs("../third_party/catch2_amalgamated")
+        set_policy("build.c++.modules.std", false)
+    else
+        add_packages("catch2")
+    end
     set_languages("c17", "c++23")
     -- The tests, and the fixtures they share as modules (bytecask.sql.tests.*).
     add_files("tests/*.cpp", "tests/*.cppm")
