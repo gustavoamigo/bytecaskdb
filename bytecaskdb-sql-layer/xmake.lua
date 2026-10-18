@@ -34,7 +34,7 @@ target("sql_layer")
     set_default(false)
     add_deps("bytecask")
     add_includedirs("..", {public = true})
-    add_files("codec/*.cpp", "catalog/*.cpp", "algebra/*.cpp", "sql/*.cpp")
+    add_files("codec/*.cpp", "catalog/*.cpp", "algebra/*.cpp", "sql/*.cpp", "plan/*.cpp")
     add_packages("libpg_query", {public = true})
 
 target("sql_layer_tests")
@@ -47,6 +47,7 @@ target("sql_layer_tests")
     -- The hand-written plans, compiled by clang as C. Every plan defines
     -- plan(); each is renamed so several link into one binary.
     add_includedirs("algebra")
+    add_defines("SQL_LAYER_PLANS_DIR=\"" .. path.join(os.scriptdir(), "plans") .. "\"")
     for _, name in ipairs({"insert", "select_by_id", "select_name_range", "update_qty", "delete_by_id"}) do
         add_files("plans/" .. name .. ".c", {defines = "plan=plan_" .. name,
                   cflags = "-Wno-declaration-after-statement"})
