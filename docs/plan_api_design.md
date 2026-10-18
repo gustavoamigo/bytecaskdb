@@ -736,13 +736,17 @@ merged without a job doing so.
 8. Only then, run-time loaders for the same files (`libtcc`, MIR), then an
    interpreter for the subset.
 
-Layout: `bytecaskdb-sql-layer/algebra/` holds the header and its C++
+Layout: `bytecaskdb-sql-layer/algebra/` holds `bc_plan.h` and its C++
 implementation; `codec/` the key and row codecs; `catalog/` the catalog and
 the TPROC-C fixture; `plans/` the hand-written plan files, each with its SQL
 in the header comment; `sql/` the parser transformer and binder; `plan/` the
 planner, code generator and loader; `api/` the embedded API; `check/` the
 checker; `tests/` the property tests, fault tests and the harness. Files
-marked `// prototype:` are disposable and are replaced in place. The catalog, transaction and codec directories are the half the
+marked `// prototype:` are disposable and are replaced in place. The C++ is
+organized as C++23 modules (`bytecask.sql.*`), as the engine is; `bc_plan.h`
+is a header because C reads it, and the only other headers are the ones
+another toolchain consumes: the C ABI for the bindings and the header bridge
+for the plugin, the counterpart of `include/bytecask.hpp`. The catalog, transaction and codec directories are the half the
 MariaDB plugin links: the plugin depends on the sql-layer, never the
 reverse, and nothing under `bytecaskdb-sql-layer/` includes a MariaDB header.
 The plugin keeps its own key and row codecs until the shared ones are
