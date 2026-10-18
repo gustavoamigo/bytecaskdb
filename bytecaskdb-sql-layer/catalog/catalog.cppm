@@ -43,7 +43,8 @@ export import bytecask.sql.row_codec;
 
 export namespace bytecask::sql {
 
-// A value of one of the four physical types, or SQL NULL (monostate).
+// A value of one of the four physical types, or SQL NULL (monostate). The
+// runtime's bc_value is this type.
 using Datum = std::variant<std::monostate, std::int64_t, double, bool, Bytes>;
 
 // The stage-1 SQL types of docs/sql_layer_types_design.md. The values are
@@ -63,6 +64,9 @@ enum class SqlKind : std::uint8_t {
   Date,
   Time,
 };
+
+// DECIMAL(p, s) is a scaled i64: p of at most 18 digits fits.
+inline constexpr std::uint8_t kMaxDecimalPrecision = 18;
 
 struct SqlType {
   SqlKind kind;
@@ -230,11 +234,12 @@ private:
   friend class LiveCatalog;
 
   // The version after `ddl`, with its batch in `ops`; nullptr for a no-op.
-  // Reads the rows a backfill needs from `snap`, which must agree with this
+  // Gathers at most `backfill_limit` bytes of backfill (std::length_error
+  // past it). Reads the rows a backfill needs from `snap`, which must agree with this
   // version. Sets `backfill` if the batch rewrites or indexes rows. Throws as
   // LiveCatalog::prepare does.
   [[nodiscard]] auto next_version(const Ddl& ddl, const Snapshot& snap, std::vector<DdlOp>& ops,
-                                  bool& backfill) const -> std::shared_ptr<const Catalog>;
+                                  bool& backfill, std::size_t backfill_limit) const -> std::shared_ptr<const Catalog>;
 
   // A copy of every table, with its own lookups.
   [[nodiscard]] auto clone() const -> Catalog;
@@ -285,7 +290,7 @@ public:
   // duplicate name, an unknown column, a unique index over duplicates…) and
   // std::length_error when ids or a layout run out or a backfill passes the
   // engine's batch limit. Writes nothing.
-  [[nodiscard]] auto prepare(const Ddl& ddl) const -> Prepared;
+  [[nodiscard]] auto prepare(const Ddl& ddl) -> Prepared;
   // Commits and publishes. False, with nothing written, on a conflict: a
   // DDL or a write to a backfilled table committed since the prepare.
   [[nodiscard]] auto commit(Prepared p) -> bool;
@@ -300,15 +305,20 @@ public:
   // turns odd and before the batch reaches the engine, under the DDL lock.
   // Lets a test hold a DDL mid-commit. Not thread-safe to set while DDL runs.
   void set_commit_hook_for_testing(std::function<void()> hook) { commit_hook_ = std::move(hook); }
+  // Test seam: the bytes a backfill may gather (the engine's 1 GiB batch
+  // limit otherwise), so a test reaches the refusal with a small table.
+  void set_backfill_limit_for_testing(std::size_t bytes) { backfill_limit_ = bytes; }
+  static constexpr std::size_t kMaxBackfillBytes = std::size_t{1} << 30;
 
 private:
   DB& db_;
-  mutable std::mutex mu_;  // guards current_; held only to copy or swap it
-  std::shared_ptr<const Catalog> current_;
+  // Readers load it without a lock; a DDL stores the next version.
+  std::atomic<std::shared_ptr<const Catalog>> current_;
   [[nodiscard]] auto commit_locked(Prepared p) -> bool;
 
   std::mutex ddl_mu_;  // one DDL at a time: apply holds it from prepare to publication
   std::function<void()> commit_hook_;
+  std::size_t backfill_limit_{kMaxBackfillBytes};
   // Odd from just before a DDL's batch reaches the engine until current_
   // is swapped (or the commit fails).
   mutable std::atomic<std::uint64_t> gen_{0};

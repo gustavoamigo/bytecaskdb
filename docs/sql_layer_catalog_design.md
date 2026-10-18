@@ -20,7 +20,7 @@ GPL-2.0, and nothing of it is copied.
 | Field | Meaning |
 |---|---|
 | `id` | Permanent object id, from the one counter below. Never reused. |
-| `name` | Folded to lower case, as SQL folds an unquoted identifier; any bytes otherwise. Plans never paste a name into C: their constants are named from ids (`TBL_1`, `LAY_2`, `IDX_3`, `COL_1_2_OFF`, `COL_1_2_COL`), so a name need not be an identifier and two objects' constants cannot collide. The plan's header comment lists what each constant stands for. |
+| `name` | As the parser hands it over: an unquoted identifier folded to lower case by PostgreSQL's rules, a quoted one exactly as written, so `"Foo"` and `foo` are two tables. Plans never paste a name into C: their constants are named from ids (`TBL_1`, `LAY_2`, `IDX_3`, `COL_1_2_OFF`, `COL_1_2_COL`), so a name need not be an identifier and two objects' constants cannot collide. The plan's header comment lists what each constant stands for. |
 | `version` | Per-table counter, bumped by every DDL on the table. Not checked by plans (see *Compatibility*); kept for stage 2. |
 | `next_col_id` | The next column id. Column ids are permanent and never reused, even after a column is dropped. |
 | columns | Each: permanent `id`, `name`, SQL type (kind, `VARCHAR` length, `DECIMAL` precision and scale), nullability, default. The physical type follows from the SQL type (`docs/sql_layer_types_design.md`, *Stage-1 types*). |
@@ -166,8 +166,9 @@ reading every record under `01 02` and the counters, and by every DDL from
 the catalog before it. Lookups are `const` and allocate nothing.
 
 **Readers share it through immutable versions.** `LiveCatalog` holds the
-current version as a `shared_ptr<const Catalog>`; a DDL builds the next
-version and publishes it by swapping the pointer. A context pins one version
+current version in an `atomic<shared_ptr<const Catalog>>`; a DDL builds the
+next version and publishes it by storing the pointer, and a reader loads it
+without a lock. A context pins one version
 for an execution and drops it at reset, so an idle context holds no
 superseded version; nothing a reader holds changes under
 it, and a reader never waits for a DDL's backfill. A lock taken by every
@@ -199,13 +200,18 @@ Two rules make a pinned version agree with the engine:
 
 DDL statements are serialized by a mutex in `LiveCatalog`, held from the
 prepare to the publication, so a DDL never conflicts with another of the
-same catalog; the engine's directory lock keeps a second process out.
+same catalog; the engine's directory lock keeps a second process out. A
+second `LiveCatalog` on the same open database (only tests open one) is
+caught at its next DDL: `prepare` compares the snapshot's catalog version
+with its own and, if another catalog moved it, reloads from the snapshot
+before building, so no id is handed out twice.
 
 ## Compatibility
 
 `bc_schema_ref` lists what a plan depends on, and `bc_ctx_run` checks it
-against the pinned version. The catalog version is in the ref for messages
-only; nothing is checked by version equality. A plan is compatible when:
+against the pinned version. A plan compiled against the pinned version itself
+is compatible without more: version equality is the fast path, one compare
+per execution. Otherwise a plan is compatible when:
 
 - **every table and index it reads exists.** Ids are never reused, and a
   table's primary key and an index's parts never change, so existence is
@@ -260,8 +266,9 @@ from the snapshot and write in the same batch as the catalog record, so the
 index or column exists with all its entries or not at all, with no state in
 between for a plan to see. The range guard makes a write to the table that
 commits during the backfill a conflict; the DDL is retried up to three
-times on a fresh snapshot and then fails. A backfill past the 1 GiB limit
-is refused with an error that says so. The alternative, batches written
+times on a fresh snapshot and then fails. A backfill counts the bytes it
+gathers and is refused, with an error that says so, as soon as they pass the
+1 GiB limit, before it has read the rest of the table into memory. The alternative, batches written
 while the index is invisible to reads but maintained by writes, needs an
 index state in the record ("write-only") and plans that respect it; it is
 deferred (#505), and the schema is created before the data until then. The

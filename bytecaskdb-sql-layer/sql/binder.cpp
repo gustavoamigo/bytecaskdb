@@ -54,23 +54,25 @@ auto sql_type(const ast::ColumnDefAst& c) -> SqlType {
   if (c.type == "timestamp") return no_mods(SqlKind::Timestamp);
   if (c.type == "date") return no_mods(SqlKind::Date);
   if (c.type == "time") return no_mods(SqlKind::Time);
+  // The bounds are the catalog's (sql_type_valid); a modifier out of a
+  // field's range becomes an invalid field value for it to refuse.
+  auto field = [](std::int32_t v) -> std::uint8_t { return std::in_range<std::uint8_t>(v) ? static_cast<std::uint8_t>(v) : 0; };
   if (c.type == "varchar") {
     if (c.typmods.empty()) return SqlType{SqlKind::Text};  // VARCHAR without a length is TEXT
-    if (c.typmods.size() != 1 || c.typmods[0] < 1) throw SqlError{"VARCHAR takes one positive length", c.pos};
-    return SqlType{SqlKind::Varchar, static_cast<std::uint32_t>(c.typmods[0])};
+    SqlType t{SqlKind::Varchar, std::in_range<std::uint32_t>(c.typmods[0]) ? static_cast<std::uint32_t>(c.typmods[0]) : 0};
+    if (c.typmods.size() != 1 || !sql_type_valid(t)) throw SqlError{"VARCHAR takes one positive length", c.pos};
+    return t;
   }
   if (c.type == "numeric") {
-    if (c.typmods.empty() || c.typmods.size() > 2) {
-      throw SqlError{"NUMERIC needs a precision of at most 18 (it is stored in 64 bits)", c.pos};
-    }
+    auto limits = "precision 1 to " + std::to_string(kMaxDecimalPrecision) + " (it is stored in 64 bits), scale 0 to precision";
+    if (c.typmods.empty() || c.typmods.size() > 2) throw SqlError{"NUMERIC needs a precision: " + limits, c.pos};
     auto p = c.typmods[0];
     auto sc = c.typmods.size() == 2 ? c.typmods[1] : 0;
-    if (p < 1 || p > 18 || sc < 0 || sc > p) {
-      throw SqlError{"NUMERIC(" + std::to_string(p) + ", " + std::to_string(sc) +
-                         ") is not supported: precision 1 to 18, scale 0 to precision",
-                     c.pos};
+    SqlType t{SqlKind::Decimal, 0, field(p), field(sc)};
+    if (sc < 0 || !sql_type_valid(t)) {
+      throw SqlError{"NUMERIC(" + std::to_string(p) + ", " + std::to_string(sc) + ") is not supported: " + limits, c.pos};
     }
-    return SqlType{SqlKind::Decimal, 0, static_cast<std::uint8_t>(p), static_cast<std::uint8_t>(sc)};
+    return t;
   }
   if (c.type == "bpchar") throw SqlError{"CHAR(n) is not supported; use VARCHAR(n)", c.pos};
   throw SqlError{"type " + c.type + " is not supported", c.pos};
@@ -112,18 +114,16 @@ auto code_points(std::string_view s) -> std::size_t {
 // A DEFAULT constant folded to the column's stored value.
 auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
   using K = ast::Literal::Kind;
-  auto bad = [&]() -> Datum {
-    throw SqlError{"DEFAULT is not a constant of type " + sql_type_name(t), l.pos};
-  };
+  auto bad = [&] [[noreturn]] { throw SqlError{"DEFAULT is not a constant of type " + sql_type_name(t), l.pos}; };
   if (l.kind == K::Null) return std::monostate{};
   switch (t.kind) {
     case SqlKind::SmallInt:
     case SqlKind::Integer:
     case SqlKind::BigInt: {
       std::int64_t v = 0;
-      if (l.kind != K::Integer) return bad();
+      if (l.kind != K::Integer) bad();
       auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
-      if (ec != std::errc{} || end != l.text.data() + l.text.size()) return bad();
+      if (ec != std::errc{} || end != l.text.data() + l.text.size()) bad();
       auto lim = t.kind == SqlKind::SmallInt ? std::int64_t{1} << 15 : std::int64_t{1} << 31;
       if (t.kind != SqlKind::BigInt && (v < -lim || v >= lim)) {
         throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
@@ -131,7 +131,7 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
       return v;
     }
     case SqlKind::Decimal: {
-      if (l.kind != K::Integer && l.kind != K::Number) return bad();
+      if (l.kind != K::Integer && l.kind != K::Number) bad();
       auto v = scaled_decimal(l.text, t.precision, t.scale);
       if (!v) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
       return *v;
@@ -139,13 +139,13 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
     case SqlKind::Real:
     case SqlKind::Double: {
       double v = 0;
-      if (l.kind != K::Integer && l.kind != K::Number) return bad();
+      if (l.kind != K::Integer && l.kind != K::Number) bad();
       auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
-      if (ec != std::errc{} || end != l.text.data() + l.text.size()) return bad();
+      if (ec != std::errc{} || end != l.text.data() + l.text.size()) bad();
       return v;
     }
     case SqlKind::Boolean:
-      if (l.kind != K::Bool) return bad();
+      if (l.kind != K::Bool) bad();
       return l.b;
     case SqlKind::Varchar:
       if (l.kind == K::String && code_points(l.text) > t.length) {
@@ -154,7 +154,7 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
       [[fallthrough]];
     case SqlKind::Text:
     case SqlKind::Bytea: {
-      if (l.kind != K::String) return bad();
+      if (l.kind != K::String) bad();
       auto b = std::as_bytes(std::span{l.text.data(), l.text.size()});
       return Bytes(b.begin(), b.end());
     }
@@ -163,7 +163,7 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
     case SqlKind::Time:
       throw SqlError{"a DEFAULT for type " + sql_type_name(t) + " is not supported yet", l.pos};
   }
-  return bad();
+  bad();
 }
 
 auto column_spec(const ast::ColumnDefAst& c) -> ColumnSpec {

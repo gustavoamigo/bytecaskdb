@@ -333,7 +333,7 @@ TEST_CASE("catalog: every DDL survives a reopen", "[sql][catalog]") {
     CHECK(t.column("name")->nullable);
     CHECK(t.column("qty")->sql == SqlType{SqlKind::BigInt});
     // CREATE UNIQUE INDEX with a DESC part, backfilled from the two rows.
-    (void)live.apply(CreateIndexDdl{"t_by_name", "T", {{"name", true}}, true});
+    (void)live.apply(CreateIndexDdl{"t_by_name", "t", {{"name", true}}, true});
     CHECK(count_prefix(db, prefix_of(kNsIndex, 3)) == 2);
   });
   reopen([](DB& db, LiveCatalog& live) {
@@ -514,6 +514,12 @@ TEST_CASE("catalog: a backfill raced by a write, and two catalogs on one databas
   (void)other.apply(CreateTableDdl{"v", {col("k", SqlKind::BigInt)}, {"k"}});
   CHECK_FALSE(live.commit(std::move(r)));
   CHECK(live.current()->table("u") == nullptr);
+  // The next DDL of the first catalog builds on what the database holds, not
+  // on its stale version: it takes fresh ids and leaves v's record alone.
+  auto after = live.apply(CreateTableDdl{"u", {col("k", SqlKind::BigInt)}, {"k"}});
+  REQUIRE(after->table("v") != nullptr);
+  CHECK(after->table("u")->id > after->table("v")->layout_id);
+  { LiveCatalog reread{db}; CHECK(reread.current()->table("v") != nullptr); }
 
   // A prepare on a version another DDL of the same catalog replaced is a
   // conflict too, before the engine sees it.
@@ -522,6 +528,22 @@ TEST_CASE("catalog: a backfill raced by a write, and two catalogs on one databas
   auto s2 = fresh.prepare(CreateTableDdl{"w2", {col("k", SqlKind::BigInt)}, {"k"}});
   CHECK(fresh.commit(std::move(s1)));
   CHECK_FALSE(fresh.commit(std::move(s2)));
+}
+
+TEST_CASE("catalog: a backfill past the batch limit is refused before it gathers the table", "[sql][catalog]") {
+  sql_test::TempDir dir{"catalog_budget"};
+  auto db = DB::open(dir.path());
+  LiveCatalog live{db};
+  (void)live.apply(create_t());
+  for (std::int64_t i = 0; i < 50; ++i) put_t_row(db, *live.current(), i, "name", i);
+  live.set_backfill_limit_for_testing(512);  // about 25 index entries
+  CHECK_THROWS_AS(live.apply(CreateIndexDdl{"t_by_name", "t", {{"name"}}}), std::length_error);
+  CHECK_THROWS_AS(live.apply(AddColumnDdl{"t", col("x", SqlKind::BigInt, true, std::int64_t{1})}), std::length_error);
+  CHECK(live.current()->version() == 1);
+  CHECK(count_prefix(db, Bytes{std::byte{kNsIndex}}) == 0);
+  live.set_backfill_limit_for_testing(LiveCatalog::kMaxBackfillBytes);
+  (void)live.apply(CreateIndexDdl{"t_by_name", "t", {{"name"}}});
+  CHECK(count_prefix(db, prefix_of(kNsIndex, 3)) == 50);
 }
 
 TEST_CASE("catalog: name entries and records must agree at load", "[sql][catalog]") {

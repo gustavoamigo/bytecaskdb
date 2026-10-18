@@ -308,11 +308,11 @@ struct bc_ctx {
   void drop_execution_state() {
     cursors.clear();  // iterators before the snapshot they read
     snap.reset();
+    views.clear();
+    keys.clear();  // key and row builders point into the pinned catalog: before it
+    rows.clear();
     cat = &unpinned;
     pinned.reset();  // an idle context keeps no superseded catalog alive
-    views.clear();
-    keys.clear();
-    rows.clear();
     effects.clear();
     results.clear();
     result_pos = 0;

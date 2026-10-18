@@ -290,3 +290,28 @@ TEST_CASE("embedded API: names that are not C identifiers work end to end", "[sq
   CHECK(db->execute(R"(DELETE FROM "a-b c" WHERE "my id" = $1)", {i(2)}).affected == 1);
   (void)db->execute(R"(DROP TABLE "a-b c")");
 }
+
+TEST_CASE("embedded API: a quoted name keeps its case, and nothing in a name escapes the plan's comment",
+          "[sql][api][catalog]") {
+  sql_test::TempDir dir{"api_quoted"};
+  auto db = Database::open(dir.path());
+  (void)db->execute(R"(CREATE TABLE "Foo" (k BIGINT PRIMARY KEY, v BIGINT))");
+  (void)db->execute("CREATE TABLE foo (k BIGINT PRIMARY KEY, v BIGINT)");  // another table, as in PostgreSQL
+  (void)db->execute(R"(INSERT INTO "Foo" VALUES ($1, $2))", {i(1), i(10)});
+  (void)db->execute("INSERT INTO foo VALUES ($1, $2)", {i(1), i(20)});
+  CHECK(db->execute(R"(SELECT v FROM "Foo" WHERE k = $1)", {i(1)}).rows == Grid{{i(10)}});
+  CHECK(db->execute("SELECT v FROM FOO WHERE k = $1", {i(1)}).rows == Grid{{i(20)}});  // unquoted folds to foo
+
+  // A column whose name splices "*\<newline>/" would close the header comment
+  // and compile what follows as code; here that code would fail to compile.
+  constexpr auto kEvil = "*\\\n/\n#error injected\n/*";
+  (void)db->execute(std::string{R"(CREATE TABLE e (k BIGINT PRIMARY KEY, ")"} + kEvil + R"(" BIGINT))");
+  auto sel = std::string{R"(SELECT ")"} + kEvil + R"(" FROM e WHERE k = $1)";
+  (void)db->execute("INSERT INTO e VALUES ($1, $2)", {i(1), i(5)});
+  CHECK(db->execute(sel, {i(1)}).rows == Grid{{i(5)}});
+  const auto& src = db->prepare(sel).plan_source();
+  auto header = src.substr(0, src.find("*/"));
+  CHECK(header.find('\\') == std::string::npos);
+  CHECK(src.find("#error") != std::string::npos);  // still there, inside the comment
+  CHECK(src.find("\n#error") == std::string::npos);
+}

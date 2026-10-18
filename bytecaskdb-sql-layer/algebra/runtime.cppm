@@ -22,8 +22,9 @@ export module bytecask.sql.runtime;
 
 export import bytecask.sql.catalog;
 
-// One bound parameter: SQL NULL, an integer, a double, a boolean or bytes.
-export using bc_value = std::variant<std::monostate, std::int64_t, double, bool, bytecask::sql::Bytes>;
+// One bound parameter: SQL NULL, an integer, a double, a boolean or bytes;
+// the catalog's Datum, which defaults are stored as.
+export using bc_value = bytecask::sql::Datum;
 
 // bc_plan.h declares these in the global module. A definition in this
 // module's purview would attach them to the module, a second declaration of

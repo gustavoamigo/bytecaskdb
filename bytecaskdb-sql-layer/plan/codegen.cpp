@@ -39,11 +39,23 @@ auto suffix(PhysType t) -> std::string {
   return "i64";
 }
 
-// Text for the plan's header comment: SQL and names are the user's, and a
-// "*/" in them would end the comment.
+// Text for the plan's header comment. SQL and names are the user's, and the
+// comment must end where the plan ends it, so nothing in them may close it:
+// "*/" is broken by a space, and a backslash (a line splice before "/"),
+// "?" (the "??/" trigraph is a backslash) and "%" (the escape itself) are
+// written as %XX, as are control characters, a newline included. What is
+// left cannot end or splice the comment.
 auto comment_safe(std::string_view s) -> std::string {
+  constexpr std::string_view kHex = "0123456789ABCDEF";
   std::string out;
   for (std::size_t i = 0; i < s.size(); ++i) {
+    auto c = static_cast<unsigned char>(s[i]);
+    if (c < 0x20 || c == 0x7F || c == '\\' || c == '?' || c == '%') {
+      out += '%';
+      out += kHex[c >> 4];
+      out += kHex[c & 0x0F];
+      continue;
+    }
     out.push_back(s[i]);
     if (s[i] == '*' && i + 1 < s.size() && s[i + 1] == '/') out.push_back(' ');
   }

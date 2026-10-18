@@ -218,7 +218,7 @@ typedef struct { uint32_t layout, col, pos; uint8_t type; } bc_col_ref;
    *Compatibility*); the result layout is the plan's own and is not a
    catalog object. */
 typedef struct {
-  uint64_t catalog_version;                                     /* for messages; not checked */
+  uint64_t catalog_version;                                     /* equal to the pinned version: compatible */
   const uint32_t   *objects_read;    uint32_t n_read;           /* tables and indexes it reads */
   const uint32_t   *tables_written;  uint32_t n_written;        /* tables whose rows it writes */
   const uint32_t   *indexes_written; uint32_t n_indexes_written;/* every index of those tables it maintains */
@@ -888,7 +888,8 @@ and the API changed where implementing them showed a gap.
   written and the indexes it maintains, columns with their positions and
   types, as `bc_col_ref`) instead of a catalog version to match: the
   version-equality check recompiled every plan on every DDL, and the
-  per-column rule the design always stated needs the columns.
+  per-column rule the design always stated needs the columns. A plan
+  compiled against the pinned version itself skips the walk.
 - `bc_ctx_begin` pins a catalog version with its snapshot, and
   `bc_ctx_commit` guards the catalog record of every table it writes, so a
   plan never commits rows shaped by a catalog the engine has moved past.
