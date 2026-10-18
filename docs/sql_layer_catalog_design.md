@@ -43,12 +43,17 @@ bytes:
 ```
 u16 format                   ; kRecordFormat, 3
 u32 id, str name, u32 version, u32 next_col_id
-u16 ncols   { u16 len, u32 id, str name, u8 kind, u32 length, u8 precision, u8 scale,
+u16 ncols   { u32 len, u32 id, str name, u8 kind, u32 length, u8 precision, u8 scale,
               u8 nullable, u8 default_tag, default }
 u16 npk     { u32 col_id }
-u16 nidx    { u16 len, u32 id, str name, u8 unique, u16 nparts { u32 col_id, u8 desc } }
-u16 nlayout { u16 len, u32 layout_id, u16 generation, u16 bitmap_bytes, u16 nslots { u32 col_id, u32 pos } }
+u16 nidx    { u32 len, u32 id, str name, u8 unique, u16 nparts { u32 col_id, u8 desc } }
+u16 nlayout { u32 len, u32 layout_id, u16 generation, u16 bitmap_bytes, u16 var_table, u16 nvar,
+              u16 nslots { u32 col_id, u32 pos } }
 ```
+
+A layout records where its fixed region ends (`var_table`) and its slot
+count rather than deriving them from the positions, so a position a
+dropped column leaves at the end of a region stays reserved.
 
 `default_tag` is 0 for none, else the physical type code (`bc_type`),
 followed by 8 bytes for `i64` and `f64`, one for `bool`, a `u32` length and

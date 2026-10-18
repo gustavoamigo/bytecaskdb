@@ -56,7 +56,8 @@ auto run(Fixture& f, bc_plan_fn plan, std::vector<bc_value> p, std::span<const P
          std::uint32_t retries = 0) -> int {
   auto ps = params(std::move(p));
   auto codes = type_codes(result);
-  bc_schema_ref ref{f.cat.version(), nullptr, nullptr, 0, 0, codes.data(), static_cast<std::uint32_t>(codes.size())};
+  SchemaRef sr{{}, {}, {}, {}, std::move(codes), f.cat().version()};
+  auto ref = sr.get();  // points into sr
   return bc_execute(f.cx, plan, &ref, &ps, {}, false, retries);
 }
 
@@ -287,12 +288,13 @@ TEST_CASE("plan API: a raised constraint error is final: no retry, nothing commi
 
 namespace {
 void create_m(Fixture& f) {
-  (void)f.cat.create_table(*f.db, "m", {{"k", PhysType::I64, false}, {"x", PhysType::F64, true}, {"b", PhysType::Bool, true}},
-                           {"k"});
-  (void)f.cat.create_index(*f.db, "m_by_x", "m", {"x"});
-  REQUIRE(f.cat.table("m")->id == kM);
-  REQUIRE(f.cat.table("m")->layout.find(kXCol)->pos == kXOff);
-  REQUIRE(f.cat.table("m")->layout.find(kBCol)->pos == kBOff);
+  f.ddl(bytecask::sql::CreateTableDdl{
+      "m", {Fixture::col("k", PhysType::I64, false), Fixture::col("x", PhysType::F64, true), Fixture::col("b", PhysType::Bool, true)},
+      {"k"}});
+  f.ddl(bytecask::sql::CreateIndexDdl{"m_by_x", "m", {{"x"}}});
+  REQUIRE(f.cat().table("m")->id == kM);
+  REQUIRE(f.cat().table("m")->layout.find(kXCol)->pos == kXOff);
+  REQUIRE(f.cat().table("m")->layout.find(kBCol)->pos == kBOff);
 }
 
 // INSERT INTO m VALUES ($1, $2, $3), maintaining m_by_x.
@@ -581,7 +583,7 @@ TEST_CASE("plan API: count_range, del_range and the guards reach the engine", "[
   CHECK(run(f, del_open_hi, {}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
   CHECK(value(f, count_all, {std::int64_t{100}}) == 5);
-  REQUIRE(f.cat.table("t") != nullptr);
+  REQUIRE(f.cat().table("t") != nullptr);
   // An empty or inverted range deletes nothing and commits.
   CHECK(run(f, del_pk_range, {std::int64_t{3}, std::int64_t{3}}) == BC_COMMITTED);
   CHECK(run(f, del_pk_range, {std::int64_t{4}, std::int64_t{2}}) == BC_COMMITTED);
@@ -681,7 +683,7 @@ TEST_CASE("plan API: result rows follow the schema ref's types; limits and types
   CHECK(run(f, set_wrong_type, {}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
   const std::uint8_t bad_code[] = {9};
-  bc_schema_ref ref{f.cat.version(), nullptr, nullptr, 0, 0, bad_code, 1};
+  bc_schema_ref ref{f.cat().version(), nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, bad_code, 1};
   CHECK(bc_execute(f.cx, emit_without_types, &ref, &ps, {}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
 }
@@ -822,7 +824,8 @@ TEST_CASE("plan API: a second commit and a too-wide result are plan errors, not 
   CHECK(bc_ctx_commit(f.cx, false) == BC_COMMITTED);  // reset dropped the effects too
 
   std::vector<std::uint8_t> wide(9000, BC_T_I64);
-  bc_schema_ref ref{f.cat.version(), nullptr, nullptr, 0, 0, wide.data(), static_cast<std::uint32_t>(wide.size())};
+  bc_schema_ref ref{f.cat().version(), nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, wide.data(),
+                    static_cast<std::uint32_t>(wide.size())};
   auto none = params({});
   CHECK(bc_execute(f.cx, scan_all_forward, &ref, &none, {}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);

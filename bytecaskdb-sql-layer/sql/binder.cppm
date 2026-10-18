@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Gustavo Amigo
 //
 // binder.cppm — resolves an AST against the catalog: table and column names to
-// ids, each parameter's type from where it is used, BIGINT and BYTEA checked.
+// ids, each parameter's type from where it is used, column types and DEFAULT
+// constants folded to the catalog's.
 // What it returns names no column by name; the planner reads offsets and
 // slots from the catalog through the column ids.
 //
@@ -40,21 +41,10 @@ struct Compare {
   std::uint32_t param;
 };
 
-struct CreateTable {
-  std::string table;
-  std::vector<ColumnSpec> columns;
-  std::vector<std::string> pk;
-};
-
-struct CreateIndex {
-  std::string index;
-  std::string table;
-  std::vector<std::string> columns;
-};
-
 struct Insert {
   const Table* table;
-  // One per table column, in column order; nullopt: the column is not given (NULL).
+  // One per table column, in column order; nullopt: the column is not given
+  // and takes its default, which bc_row_begin writes.
   std::vector<std::optional<Expr>> values;
 };
 
@@ -75,7 +65,9 @@ struct Delete {
   std::vector<Compare> where;
 };
 
-using Statement = std::variant<CreateTable, CreateIndex, Insert, Select, Update, Delete>;
+// DDL binds to the catalog's statement values: names checked, types and
+// defaults folded.
+using Statement = std::variant<Ddl, Insert, Select, Update, Delete>;
 
 struct Bound {
   Statement stmt;

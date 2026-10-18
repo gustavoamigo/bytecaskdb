@@ -20,6 +20,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <new>
 #include <optional>
 #include <span>
@@ -44,6 +45,7 @@ using bytecask::sql::Catalog;
 using bytecask::sql::KeyLayout;
 using bytecask::sql::KeyPart;
 using bytecask::sql::KeyReader;
+using bytecask::sql::LiveCatalog;
 using bytecask::sql::PhysType;
 using bytecask::sql::RowLayout;
 using bytecask::sql::RowWriter;
@@ -120,6 +122,10 @@ auto phys_type(std::uint8_t code) -> std::optional<PhysType> {
 
 struct bc_ctx {
   bytecask::DB* db;
+  LiveCatalog* live;
+  // The catalog version this execution resolves against, pinned with the
+  // snapshot by bc_ctx_begin; cat is pinned.get().
+  std::shared_ptr<const Catalog> pinned;
   const Catalog* cat;
   std::vector<std::byte> arena;
   std::size_t arena_used{0};
@@ -150,8 +156,8 @@ struct bc_ctx {
   std::uint32_t emit_col{0};
   std::int64_t affected{-1};
 
-  bc_ctx(bytecask::DB* d, const Catalog* c, std::uint32_t arena_bytes)
-      : db{d}, cat{c}, arena(arena_bytes) {}
+  bc_ctx(bytecask::DB* d, LiveCatalog* l, std::uint32_t arena_bytes)
+      : db{d}, live{l}, pinned{l->current()}, cat{pinned.get()}, arena(arena_bytes) {}
 
   auto ok() const -> bool { return error == BC_OK; }
 
@@ -495,25 +501,42 @@ auto row_builder(bc_ctx* cx, bc_row r) -> RowBuilder* {
   return b;
 }
 
+// The tables whose rows or index entries the write plan touches, found from
+// the keys: a row key names its table, an index key its index.
+auto written_tables(const bc_ctx* cx) -> std::vector<std::uint32_t> {
+  std::vector<std::uint32_t> out;
+  auto note = [&](BytesView key) {
+    if (key.size() < bytecask::sql::kKeyPrefixBytes) return;
+    auto ns = std::to_integer<std::uint8_t>(key[0]);
+    if (ns != bytecask::sql::kNsRow && ns != bytecask::sql::kNsIndex) return;
+    std::uint32_t id = 0;
+    for (std::size_t i = 1; i < bytecask::sql::kKeyPrefixBytes; ++i) id = (id << 8) | std::to_integer<std::uint32_t>(key[i]);
+    const auto* kl = cx->cat->key_layout(id);
+    if (kl == nullptr) return;
+    if (std::ranges::find(out, kl->table->id) == out.end()) out.push_back(kl->table->id);
+  };
+  for (const auto& e : cx->effects) {
+    switch (e.kind) {
+      case EffectKind::Put:
+      case EffectKind::Del: note(e.a); break;
+      case EffectKind::DelRange:
+        note(e.a);
+        note(e.b);
+        break;
+      case EffectKind::GuardUnchanged:
+      case EffectKind::GuardRange:
+      case EffectKind::GuardPresent:
+      case EffectKind::GuardAbsent: break;
+    }
+  }
+  return out;
+}
+
 auto check_schema(bc_ctx* cx, const bc_schema_ref* ref) -> bool {
-  // prototype: an exact catalog version, stricter than the design's
-  // per-column compatibility check.
-  if (ref->catalog_version != cx->cat->version()) {
-    cx->fail(BC_E_LAYOUT, "plan compiled against catalog version " + std::to_string(ref->catalog_version) +
-                              ", live version is " + std::to_string(cx->cat->version()));
+  if (auto why = bytecask::sql::schema_incompatibility(*cx->cat, *ref)) {
+    cx->fail(BC_E_LAYOUT, "plan compiled against catalog v" + std::to_string(ref->catalog_version) +
+                              " is incompatible with v" + std::to_string(cx->cat->version()) + ": " + *why);
     return false;
-  }
-  for (std::uint32_t i = 0; i < ref->n_read; ++i) {
-    if (cx->cat->table(ref->tables_read[i]) == nullptr) {
-      cx->fail(BC_E_LAYOUT, "a table the plan reads no longer exists");
-      return false;
-    }
-  }
-  for (std::uint32_t i = 0; i < ref->n_written; ++i) {
-    if (cx->cat->table(ref->tables_written[i]) == nullptr) {
-      cx->fail(BC_E_LAYOUT, "a table the plan writes no longer exists");
-      return false;
-    }
   }
   std::vector<PhysType> types;
   for (std::uint32_t i = 0; i < ref->n_result; ++i) {
@@ -585,7 +608,7 @@ extern "C" {
 
 bc_ctx* bc_ctx_new(bc_db* db, const bc_catalog* cat, uint32_t arena_bytes) {
   try {
-    return new bc_ctx(db->db, cat->cat, arena_bytes);
+    return new bc_ctx(db->db, cat->live, arena_bytes);
   } catch (...) {
     return nullptr;
   }
@@ -605,7 +628,10 @@ void bc_ctx_begin(bc_ctx* cx, const bc_params* params, bc_budget budget) {
   cx->params = params;
   cx->budget = budget;
   BC_GUARD_BEGIN
-  cx->snap.emplace(cx->db->snapshot());
+  auto p = cx->live->pin();
+  cx->pinned = std::move(p.cat);
+  cx->cat = cx->pinned.get();
+  cx->snap.emplace(std::move(p.snap));
   BC_GUARD_END(cx)
 }
 
@@ -651,6 +677,10 @@ enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
         case EffectKind::GuardAbsent: plan.ensure_absent(e.a); break;
       }
     }
+    // A DDL on a table this plan writes, committed since the snapshot,
+    // changes the table's record: the commit is then a conflict, and the
+    // retry pins the new catalog version.
+    for (auto id : written_tables(cx)) plan.ensure_unchanged(bytecask::sql::table_record_key(id));
     cx->effects.clear();  // handed to the engine: a second commit has nothing to submit
     auto r = cx->db->apply_batch({.sync = sync}, std::move(plan));
     return r ? BC_COMMITTED : BC_CONFLICT;
@@ -1205,6 +1235,15 @@ bc_row bc_row_begin(bc_ctx* cx, uint32_t layout) {
   }
   BC_GUARD_BEGIN
   cx->rows.push_back(RowBuilder{&t->layout, RowWriter{t->layout}, false});
+  // Every column at its default, so a plan compiled before ADD COLUMN …
+  // DEFAULT writes the default without naming the column.
+  auto& w = cx->rows.back().writer;
+  for (const auto& c : t->columns) {
+    if (!std::holds_alternative<std::monostate>(c.default_value) && !bytecask::sql::set_datum(w, c.id, c.default_value)) {
+      cx->fail(BC_E_CORRUPT, "default of column " + c.name + " does not fit its layout");
+      return {};
+    }
+  }
   return {static_cast<std::uint32_t>(cx->rows.size() - 1), cx->epoch};
   BC_GUARD_END(cx)
   return {};

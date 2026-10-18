@@ -25,7 +25,7 @@ using namespace bytecask::sql;
 
 namespace {
 
-auto compile(Catalog& cat, std::string_view sql) -> std::unique_ptr<TccPlan> {
+auto compile(const Catalog& cat, std::string_view sql) -> std::unique_ptr<TccPlan> {
   auto plan = generate_plan(bound::bind(ast::parse(sql), cat), cat, sql);
   return TccPlan::compile(plan.source);
 }
@@ -45,10 +45,10 @@ TEST_CASE("tcc: generated plans compile in process and match the clang-linked re
   for (const auto& [name, sql] : stmts) {
     // The median of several compiles: the first pays for page faults.
     std::vector<double> us;
-    for (int i = 0; i < 9; ++i) us.push_back(compile(f.cat, sql)->compile_us());
+    for (int i = 0; i < 9; ++i) us.push_back(compile(f.cat(), sql)->compile_us());
     std::ranges::sort(us);
     std::printf("tcc compile %-18s median %7.1f us  min %7.1f us  max %7.1f us\n", name, us[4], us.front(), us.back());
-    plans.push_back(compile(f.cat, sql));
+    plans.push_back(compile(f.cat(), sql));
   }
   sql_test::run_dml_scenario(f, {plans[0]->fn(), plans[1]->fn(), plans[2]->fn(), plans[3]->fn(), plans[4]->fn()});
 }

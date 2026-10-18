@@ -1,18 +1,27 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// catalog.cpp — the catalog's definitions; see catalog.cppm.
+// catalog.cpp — the catalog's definitions; see catalog.cppm and
+// docs/sql_layer_catalog_design.md.
 
 module;
 #include <algorithm>
+#include <atomic>
+#include <bit>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "include/bytecask.hpp"
@@ -30,24 +39,11 @@ constexpr std::byte kCounterNextId{0x01};
 constexpr std::byte kCounterVersion{0x02};
 constexpr std::uint8_t kKindTable = 1;
 constexpr std::uint8_t kKindIndex = 2;
-// 2: the row format of docs/sql_layer_types_design.md (12-byte header, the
-// bitmap meaning present). Format 1 was the prototype's; its column
-// positions and rows do not decode under format 2, so it is refused.
-constexpr std::uint16_t kRecordFormat = 2;
+constexpr std::uint8_t kMaxDecimalPrecision = 18;
+
+using DdlOp = Catalog::DdlOp;
 
 auto counter_key(std::byte id) -> Bytes { return {std::byte{kNsCatalog}, kSubCounter, id}; }
-
-auto table_key(std::uint32_t id) -> Bytes {
-  Bytes k{std::byte{kNsCatalog}, kSubTable};
-  for (int shift = 24; shift >= 0; shift -= 8) k.push_back(static_cast<std::byte>((id >> shift) & 0xFF));
-  return k;
-}
-
-auto name_key(std::string_view name) -> Bytes {
-  Bytes k{std::byte{kNsCatalog}, kSubName};
-  for (auto c : name) k.push_back(static_cast<std::byte>(c));
-  return k;
-}
 
 auto be_bytes(std::uint64_t v, std::size_t width) -> Bytes {
   Bytes b;
@@ -61,7 +57,11 @@ auto be_value(BytesView b) -> std::uint64_t {
   return v;
 }
 
-// SQL folds unquoted identifiers; the prototype folds every name to lower case.
+auto has_prefix(BytesView key, BytesView prefix) -> bool {
+  return key.size() >= prefix.size() && std::ranges::equal(key.first(prefix.size()), prefix);
+}
+
+// SQL folds unquoted identifiers; the catalog folds every name to lower case.
 auto fold(std::string_view name) -> std::string {
   std::string s{name};
   for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -74,15 +74,30 @@ auto upper(std::string_view name) -> std::string {
   return s;
 }
 
-// Little-endian, append-only: a later format adds fields at the end.
+[[noreturn]] void corrupt(const std::string& what) { throw std::runtime_error("catalog: " + what); }
+
+// Little-endian, append-only: a later format adds fields at the end of the
+// record or of an entry.
 class RecordWriter {
 public:
   void u8(std::uint8_t v) { out_.push_back(std::byte{v}); }
-  void u16(std::uint32_t v) { le(v, 2); }
-  void u32(std::uint32_t v) { le(v, 4); }
+  void u16(std::uint64_t v) { le(narrow<std::uint16_t>(v), 2); }
+  void u32(std::uint64_t v) { le(narrow<std::uint32_t>(v), 4); }
+  void u64(std::uint64_t v) { le(v, 8); }
   void str(std::string_view s) {
-    u16(static_cast<std::uint32_t>(s.size()));
+    u16(s.size());
     for (auto c : s) out_.push_back(static_cast<std::byte>(c));
+  }
+  void blob(BytesView b) {
+    u32(b.size());
+    out_.insert(out_.end(), b.begin(), b.end());
+  }
+  // An entry: its u32 length, then what `fill` writes.
+  template <typename Fill>
+  void entry(Fill&& fill) {
+    RecordWriter sub;
+    fill(sub);
+    blob(sub.out_);
   }
   [[nodiscard]] auto bytes() const -> const Bytes& { return out_; }
 
@@ -99,123 +114,103 @@ public:
   auto u8() -> std::uint8_t { return static_cast<std::uint8_t>(le(1)); }
   auto u16() -> std::uint32_t { return static_cast<std::uint32_t>(le(2)); }
   auto u32() -> std::uint32_t { return static_cast<std::uint32_t>(le(4)); }
+  auto u64() -> std::uint64_t { return le(8); }
   auto str() -> std::string {
-    auto n = u16();
-    if (in_.size() - pos_ < n) throw std::runtime_error("catalog record truncated");
-    std::string s;
-    for (std::size_t i = 0; i < n; ++i) s.push_back(static_cast<char>(in_[pos_ + i]));
-    pos_ += n;
-    return s;
+    auto b = take(u16());
+    return {reinterpret_cast<const char*>(b.data()), b.size()};  // bytes to chars, as the name was written
+  }
+  auto blob() -> BytesView { return take(u32()); }
+  [[nodiscard]] auto at_end() const -> bool { return pos_ == in_.size(); }
+  void expect_end(const std::string& what) const {
+    if (!at_end()) corrupt(what + " has trailing bytes");
   }
 
 private:
+  auto take(std::size_t n) -> BytesView {
+    if (in_.size() - pos_ < n) corrupt("record truncated");
+    auto b = in_.subspan(pos_, n);
+    pos_ += n;
+    return b;
+  }
   auto le(std::size_t width) -> std::uint64_t {
-    if (in_.size() - pos_ < width) throw std::runtime_error("catalog record truncated");
+    auto b = take(width);
     std::uint64_t v = 0;
-    for (std::size_t i = 0; i < width; ++i) v |= std::to_integer<std::uint64_t>(in_[pos_ + i]) << (8 * i);
-    pos_ += width;
+    for (std::size_t i = 0; i < width; ++i) v |= std::to_integer<std::uint64_t>(b[i]) << (8 * i);
     return v;
   }
   BytesView in_;
   std::size_t pos_{0};
 };
 
-auto serialize(const Table& t) -> Bytes {
-  RecordWriter w;
-  w.u16(kRecordFormat);
-  w.u32(t.id);
-  w.str(t.name);
-  w.u32(t.version);
-  w.u32(t.layout_id);
-  w.u16(t.layout.generation);
-  w.u16(narrow<std::uint16_t>(t.layout.bitmap_bytes));
-  w.u32(t.next_col_id);
-  w.u16(static_cast<std::uint32_t>(t.columns.size()));
-  for (const auto& c : t.columns) {
-    w.u32(c.id);
-    w.str(c.name);
-    w.u8(static_cast<std::uint8_t>(c.type));
-    w.u8(c.nullable ? 1 : 0);
-    w.u32(t.layout.find(c.id)->pos);
-  }
-  w.u16(static_cast<std::uint32_t>(t.pk_col_ids.size()));
-  for (auto id : t.pk_col_ids) w.u32(id);
-  w.u16(static_cast<std::uint32_t>(t.indexes.size()));
-  for (const auto& ix : t.indexes) {
-    w.u32(ix.id);
-    w.str(ix.name);
-    w.u16(static_cast<std::uint32_t>(ix.col_ids.size()));
-    for (auto id : ix.col_ids) w.u32(id);
-  }
-  return w.bytes();
+void write_datum(RecordWriter& w, const Datum& d) {
+  std::visit(
+      [&](const auto& v) {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+          w.u8(0);
+        } else if constexpr (std::is_same_v<T, std::int64_t>) {
+          w.u8(static_cast<std::uint8_t>(PhysType::I64));
+          w.u64(static_cast<std::uint64_t>(v));
+        } else if constexpr (std::is_same_v<T, double>) {
+          w.u8(static_cast<std::uint8_t>(PhysType::F64));
+          w.u64(std::bit_cast<std::uint64_t>(v));
+        } else if constexpr (std::is_same_v<T, bool>) {
+          w.u8(static_cast<std::uint8_t>(PhysType::Bool));
+          w.u8(v ? 1 : 0);
+        } else {
+          w.u8(static_cast<std::uint8_t>(PhysType::Bytes));
+          w.blob(v);
+        }
+      },
+      d);
 }
 
-auto deserialize(BytesView in) -> Table {
-  RecordReader r{in};
-  if (auto format = r.u16(); format != kRecordFormat) {
-    throw std::runtime_error("catalog record format " + std::to_string(format) + " is not " +
-                             std::to_string(kRecordFormat) +
-                             (format < kRecordFormat ? ": the database was written by an earlier SQL-layer build "
-                                                       "whose row format this build does not read"
-                                                     : ": the database was written by a later SQL-layer build"));
-  }
-  Table t;
-  t.id = r.u32();
-  t.name = r.str();
-  t.version = r.u32();
-  t.layout_id = r.u32();
-  t.layout.generation = static_cast<std::uint16_t>(r.u16());
-  t.layout.bitmap_bytes = r.u16();
-  t.layout.fixed_start = static_cast<std::uint32_t>(kRowHeaderBytes) + t.layout.bitmap_bytes;
-  t.layout.fixed_end = t.layout.fixed_start;
-  t.next_col_id = r.u32();
-  auto ncols = r.u16();
-  for (std::uint32_t i = 0; i < ncols; ++i) {
-    Column c;
-    c.id = r.u32();
-    c.name = r.str();
-    c.type = static_cast<PhysType>(r.u8());
-    c.nullable = r.u8() != 0;
-    auto pos = r.u32();
-    t.layout.columns.push_back({c.id, c.type, c.nullable, pos});
-    if (is_fixed(c.type)) {
-      t.layout.fixed_end = std::max(t.layout.fixed_end, pos + kFixedColumnBytes);
-    } else {
-      t.layout.nvar = std::max(t.layout.nvar, pos + 1);
+auto read_datum(RecordReader& r) -> Datum {
+  switch (r.u8()) {
+    case 0: return std::monostate{};
+    case static_cast<std::uint8_t>(PhysType::I64): return static_cast<std::int64_t>(r.u64());
+    case static_cast<std::uint8_t>(PhysType::F64): return std::bit_cast<double>(r.u64());
+    case static_cast<std::uint8_t>(PhysType::Bool): {
+      auto b = r.u8();
+      if (b > 1) corrupt("boolean default is neither 0 nor 1");
+      return b == 1;
     }
-    t.columns.push_back(std::move(c));
+    case static_cast<std::uint8_t>(PhysType::Bytes): {
+      auto b = r.blob();
+      return Bytes(b.begin(), b.end());
+    }
+    default: corrupt("unknown default tag");
   }
-  if (!layout_valid(t.layout)) {
-    throw std::runtime_error("catalog record of table " + t.name + " has a malformed row layout");
-  }
-  auto npk = r.u16();
-  for (std::uint32_t i = 0; i < npk; ++i) t.pk_col_ids.push_back(r.u32());
-  auto nidx = r.u16();
-  for (std::uint32_t i = 0; i < nidx; ++i) {
-    Index ix;
-    ix.id = r.u32();
-    ix.name = r.str();
-    auto n = r.u16();
-    for (std::uint32_t j = 0; j < n; ++j) ix.col_ids.push_back(r.u32());
-    t.indexes.push_back(std::move(ix));
-  }
-  // Every key column must be a column of the table.
-  auto known = [&](std::uint32_t id) { return t.column(id) != nullptr; };
-  auto index_ok = [&](const Index& ix) { return std::ranges::all_of(ix.col_ids, known); };
-  if (t.pk_col_ids.empty() || !std::ranges::all_of(t.pk_col_ids, known) || !std::ranges::all_of(t.indexes, index_ok)) {
-    throw std::runtime_error("catalog record of table " + t.name + " names a key column it does not have");
-  }
-  return t;
 }
 
-// Appends one column of `row` as a key part. False if the row is malformed.
-auto put_part_from_row(const Table& t, std::uint32_t col_id, bool nullable, BytesView row, Bytes& out)
-    -> bool {
+auto name_value(std::uint8_t kind, std::uint32_t id) -> Bytes {
+  auto v = Bytes{std::byte{kind}};
+  auto idb = be_bytes(id, 4);
+  v.insert(v.end(), idb.begin(), idb.end());
+  return v;
+}
+
+auto row_prefix(std::uint32_t table_id) -> Bytes {
+  Bytes p;
+  key_put_prefix(p, kNsRow, table_id);
+  return p;
+}
+
+auto index_prefix(std::uint32_t index_id) -> Bytes {
+  Bytes p;
+  key_put_prefix(p, kNsIndex, index_id);
+  return p;
+}
+
+// Appends one column of `row` as a key part. False if the row is malformed
+// or a non-nullable part is null; `was_null` receives whether it was null.
+auto put_part_from_row(const Table& t, std::uint32_t col_id, KeyPart part, BytesView row, Bytes& out,
+                       bool* was_null = nullptr) -> bool {
   const auto* slot = t.layout.find(col_id);
   if (slot == nullptr) return false;
-  KeyPart part{slot->type, nullable};
   if (row_is_null(row, *slot)) {
-    if (!nullable) return false;
+    if (!part.nullable) return false;
+    if (was_null != nullptr) *was_null = true;
     key_put_null(out, part);
     return true;
   }
@@ -248,24 +243,331 @@ auto put_part_from_row(const Table& t, std::uint32_t col_id, bool nullable, Byte
   return false;
 }
 
-auto encode_index_key_from_row(const Table& t, const Index& ix, BytesView row, Bytes& out) -> bool {
-  key_put_prefix(out, kNsIndex, ix.id);
-  for (auto id : ix.col_ids) {
-    if (!put_part_from_row(t, id, t.column(id)->nullable, row, out)) return false;
+// The rows of a table in the snapshot, in primary key order.
+template <typename Visit>
+void for_each_row(const Snapshot& snap, std::uint32_t table_id, Visit&& visit) {
+  auto prefix = row_prefix(table_id);
+  for (const auto& e : snap.iter_from({}, prefix)) {
+    if (!has_prefix(e.key, prefix)) break;
+    visit(e.key, e.value);
   }
-  for (auto id : t.pk_col_ids) {
-    if (!put_part_from_row(t, id, false, row, out)) return false;
-  }
-  return true;
 }
 
-void commit_ddl(DB& db, WritePlan plan, const std::string& what) {
-  if (!db.apply_batch({}, std::move(plan))) {
-    throw std::invalid_argument(what + " already exists");
+auto put_op(std::vector<DdlOp>& ops, DdlOp::Kind kind, Bytes a, Bytes b = {}) -> void {
+  ops.push_back(DdlOp{kind, std::move(a), std::move(b)});
+}
+
+// The guard every DDL carries: no other DDL committed since the snapshot.
+// Also the bootstrap guard: the version key is absent until the first DDL.
+void guard_catalog(std::vector<DdlOp>& ops) {
+  put_op(ops, DdlOp::Kind::EnsureUnchanged, counter_key(kCounterVersion));
+}
+
+void put_counters(std::vector<DdlOp>& ops, std::uint64_t next_id, std::uint64_t version) {
+  put_op(ops, DdlOp::Kind::Put, counter_key(kCounterNextId), be_bytes(next_id, 8));
+  put_op(ops, DdlOp::Kind::Put, counter_key(kCounterVersion), be_bytes(version, 8));
+}
+
+// Every write to the table's rows since the snapshot makes the DDL a
+// conflict: a backfill must see every row.
+void guard_rows(std::vector<DdlOp>& ops, std::uint32_t table_id) {
+  auto p = row_prefix(table_id);
+  put_op(ops, DdlOp::Kind::EnsureRangeUnchanged, p, key_successor(p));
+}
+
+auto reserve_ids(std::uint64_t& next_id, std::uint32_t n) -> std::uint32_t {
+  auto first = next_id;
+  if (first + n - 1 > Catalog::kMaxObjectId) throw std::length_error("catalog object ids exhausted");
+  next_id += n;
+  return static_cast<std::uint32_t>(first);
+}
+
+void check_column_spec(const ColumnSpec& c) {
+  if (!sql_type_valid(c.sql)) throw std::invalid_argument("column " + c.name + " has an invalid type");
+  if (!datum_fits(c.default_value, phys_type(c.sql))) {
+    throw std::invalid_argument("default of column " + c.name + " is not of its type");
   }
 }
 
 }  // namespace
+
+// ------------------------------------------------------------------ types
+
+auto set_datum(RowWriter& w, std::uint32_t col_id, const Datum& d) -> bool {
+  return std::visit(
+      [&](const auto& v) -> bool {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+          return w.set_null(col_id);
+        } else if constexpr (std::is_same_v<T, std::int64_t>) {
+          return w.set_i64(col_id, v);
+        } else if constexpr (std::is_same_v<T, double>) {
+          return w.set_f64(col_id, v);
+        } else if constexpr (std::is_same_v<T, bool>) {
+          return w.set_bool(col_id, v);
+        } else {
+          return w.set_bytes(col_id, v);
+        }
+      },
+      d);
+}
+
+
+auto sql_type_valid(SqlType t) -> bool {
+  switch (t.kind) {
+    case SqlKind::Varchar: return t.length > 0 && t.precision == 0 && t.scale == 0;
+    case SqlKind::Decimal:
+      return t.length == 0 && t.precision >= 1 && t.precision <= kMaxDecimalPrecision && t.scale <= t.precision;
+    case SqlKind::SmallInt:
+    case SqlKind::Integer:
+    case SqlKind::BigInt:
+    case SqlKind::Real:
+    case SqlKind::Double:
+    case SqlKind::Boolean:
+    case SqlKind::Bytea:
+    case SqlKind::Text:
+    case SqlKind::Timestamp:
+    case SqlKind::Date:
+    case SqlKind::Time: return t.length == 0 && t.precision == 0 && t.scale == 0;
+  }
+  return false;  // a kind no build knows
+}
+
+auto phys_type(SqlType t) -> PhysType {
+  switch (t.kind) {
+    case SqlKind::SmallInt:
+    case SqlKind::Integer:
+    case SqlKind::BigInt:
+    case SqlKind::Decimal:
+    case SqlKind::Timestamp:
+    case SqlKind::Date:
+    case SqlKind::Time: return PhysType::I64;
+    case SqlKind::Real:
+    case SqlKind::Double: return PhysType::F64;
+    case SqlKind::Boolean: return PhysType::Bool;
+    case SqlKind::Bytea:
+    case SqlKind::Text:
+    case SqlKind::Varchar: return PhysType::Bytes;
+  }
+  return PhysType::Bytes;
+}
+
+auto sql_type_name(SqlType t) -> std::string {
+  switch (t.kind) {
+    case SqlKind::SmallInt: return "smallint";
+    case SqlKind::Integer: return "integer";
+    case SqlKind::BigInt: return "bigint";
+    case SqlKind::Real: return "real";
+    case SqlKind::Double: return "double precision";
+    case SqlKind::Boolean: return "boolean";
+    case SqlKind::Bytea: return "bytea";
+    case SqlKind::Text: return "text";
+    case SqlKind::Varchar: return "varchar(" + std::to_string(t.length) + ")";
+    case SqlKind::Decimal: return "numeric(" + std::to_string(t.precision) + "," + std::to_string(t.scale) + ")";
+    case SqlKind::Timestamp: return "timestamp";
+    case SqlKind::Date: return "date";
+    case SqlKind::Time: return "time";
+  }
+  return "?";
+}
+
+auto datum_fits(const Datum& d, PhysType t) -> bool {
+  switch (t) {
+    case PhysType::I64: return !std::holds_alternative<double>(d) && !std::holds_alternative<bool>(d) &&
+                               !std::holds_alternative<Bytes>(d);
+    case PhysType::F64: return std::holds_alternative<std::monostate>(d) || std::holds_alternative<double>(d);
+    case PhysType::Bool: return std::holds_alternative<std::monostate>(d) || std::holds_alternative<bool>(d);
+    case PhysType::Bytes: return std::holds_alternative<std::monostate>(d) || std::holds_alternative<Bytes>(d);
+  }
+  return false;
+}
+
+// ------------------------------------------------------------------ records
+
+auto table_record_key(std::uint32_t id) -> Bytes {
+  auto k = Bytes{std::byte{kNsCatalog}, kSubTable};
+  auto idb = be_bytes(id, 4);
+  k.insert(k.end(), idb.begin(), idb.end());
+  return k;
+}
+
+auto name_entry_key(std::string_view name) -> Bytes {
+  Bytes k{std::byte{kNsCatalog}, kSubName};
+  for (auto c : name) k.push_back(static_cast<std::byte>(c));
+  return k;
+}
+
+namespace {
+
+void write_layout(RecordWriter& w, std::uint32_t layout_id, const RowLayout& l) {
+  w.entry([&](RecordWriter& e) {
+    e.u32(layout_id);
+    e.u16(l.generation);
+    e.u16(l.bitmap_bytes);
+    e.u16(l.fixed_end);  // var_table: where this generation's fixed region ends
+    e.u16(l.nvar);
+    e.u16(l.columns.size());
+    for (const auto& s : l.columns) {
+      e.u32(s.col_id);
+      e.u32(s.pos);
+    }
+  });
+}
+
+auto read_layout(RecordReader& r, const Table& t) -> std::pair<std::uint32_t, RowLayout> {
+  RecordReader e{r.blob()};
+  auto id = e.u32();
+  RowLayout l;
+  l.generation = static_cast<std::uint16_t>(e.u16());
+  l.bitmap_bytes = e.u16();
+  l.fixed_start = static_cast<std::uint32_t>(kRowHeaderBytes) + l.bitmap_bytes;
+  l.fixed_end = e.u16();
+  l.nvar = e.u16();
+  auto n = e.u16();
+  std::set<std::uint32_t> ids, fixed, slots;
+  for (std::uint32_t i = 0; i < n; ++i) {
+    auto col_id = e.u32();
+    auto pos = e.u32();
+    const auto* c = t.column(col_id);
+    if (c == nullptr) corrupt("layout of table " + t.name + " names a column it does not have");
+    auto& used = is_fixed(c->type) ? fixed : slots;
+    if (!ids.insert(col_id).second || !used.insert(pos).second) {
+      corrupt("layout of table " + t.name + " has a column or position twice");
+    }
+    l.columns.push_back({col_id, c->type, c->nullable, pos});
+  }
+  e.expect_end("layout entry of table " + t.name);
+  if (!layout_valid(l)) corrupt("table " + t.name + " has a malformed row layout");
+  return {id, std::move(l)};
+}
+
+}  // namespace
+
+auto serialize_table(const Table& t) -> Bytes {
+  RecordWriter w;
+  w.u16(Catalog::kRecordFormat);
+  w.u32(t.id);
+  w.str(t.name);
+  w.u32(t.version);
+  w.u32(t.next_col_id);
+  w.u16(t.columns.size());
+  for (const auto& c : t.columns) {
+    w.entry([&](RecordWriter& e) {
+      e.u32(c.id);
+      e.str(c.name);
+      e.u8(static_cast<std::uint8_t>(c.sql.kind));
+      e.u32(c.sql.length);
+      e.u8(c.sql.precision);
+      e.u8(c.sql.scale);
+      e.u8(c.nullable ? 1 : 0);
+      write_datum(e, c.default_value);
+    });
+  }
+  w.u16(t.pk_col_ids.size());
+  for (auto id : t.pk_col_ids) w.u32(id);
+  w.u16(t.indexes.size());
+  for (const auto& ix : t.indexes) {
+    w.entry([&](RecordWriter& e) {
+      e.u32(ix.id);
+      e.str(ix.name);
+      e.u8(ix.unique ? 1 : 0);
+      e.u16(ix.parts.size());
+      for (const auto& p : ix.parts) {
+        e.u32(p.col_id);
+        e.u8(p.desc ? 1 : 0);
+      }
+    });
+  }
+  w.u16(t.retired_layouts.size() + 1);
+  for (const auto& [id, l] : t.retired_layouts) write_layout(w, id, l);
+  write_layout(w, t.layout_id, t.layout);
+  return w.bytes();
+}
+
+auto parse_table(BytesView in) -> Table {
+  RecordReader r{in};
+  if (auto format = r.u16(); format != Catalog::kRecordFormat) {
+    throw std::runtime_error(
+        "catalog record format " + std::to_string(format) + " is not " + std::to_string(Catalog::kRecordFormat) +
+        (format < Catalog::kRecordFormat
+             ? ": the database was written by an earlier SQL-layer build whose catalog this build does not read"
+             : ": the database was written by a later SQL-layer build"));
+  }
+  Table t;
+  t.id = r.u32();
+  t.name = r.str();
+  t.version = r.u32();
+  t.next_col_id = r.u32();
+  auto ncols = r.u16();
+  for (std::uint32_t i = 0; i < ncols; ++i) {
+    RecordReader e{r.blob()};
+    Column c;
+    c.id = e.u32();
+    c.name = e.str();
+    c.sql.kind = static_cast<SqlKind>(e.u8());
+    c.sql.length = e.u32();
+    c.sql.precision = e.u8();
+    c.sql.scale = e.u8();
+    auto nullable = e.u8();
+    c.default_value = read_datum(e);
+    e.expect_end("column entry of table " + t.name);
+    if (!sql_type_valid(c.sql)) corrupt("column " + c.name + " of table " + t.name + " has an invalid type");
+    if (nullable > 1) corrupt("column " + c.name + " of table " + t.name + " has a bad nullable flag");
+    c.type = phys_type(c.sql);
+    c.nullable = nullable == 1;
+    if (!datum_fits(c.default_value, c.type)) corrupt("default of column " + c.name + " is not of its type");
+    if (c.id >= t.next_col_id || t.column(c.id) != nullptr || t.column(c.name) != nullptr) {
+      corrupt("table " + t.name + " has a column id or name twice, or past next_col_id");
+    }
+    t.columns.push_back(std::move(c));
+  }
+  auto npk = r.u16();
+  for (std::uint32_t i = 0; i < npk; ++i) t.pk_col_ids.push_back(r.u32());
+  auto nidx = r.u16();
+  for (std::uint32_t i = 0; i < nidx; ++i) {
+    RecordReader e{r.blob()};
+    Index ix;
+    ix.id = e.u32();
+    ix.name = e.str();
+    auto unique = e.u8();
+    auto n = e.u16();
+    for (std::uint32_t j = 0; j < n; ++j) {
+      IndexPart p;
+      p.col_id = e.u32();
+      auto desc = e.u8();
+      if (desc > 1) corrupt("index " + ix.name + " has a bad direction flag");
+      p.desc = desc == 1;
+      ix.parts.push_back(p);
+    }
+    e.expect_end("index entry of table " + t.name);
+    if (unique > 1 || ix.parts.empty()) corrupt("index " + ix.name + " is malformed");
+    ix.unique = unique == 1;
+    t.indexes.push_back(std::move(ix));
+  }
+  auto nlayout = r.u16();
+  if (nlayout == 0) corrupt("table " + t.name + " has no layout");
+  for (std::uint32_t i = 0; i < nlayout; ++i) t.retired_layouts.push_back(read_layout(r, t));
+  std::tie(t.layout_id, t.layout) = std::move(t.retired_layouts.back());
+  t.retired_layouts.pop_back();
+  r.expect_end("record of table " + t.name);
+
+  // Every key column is a column of the table, and the current layout holds
+  // every column exactly once.
+  auto known = [&](std::uint32_t id) { return t.column(id) != nullptr; };
+  auto index_ok = [&](const Index& ix) {
+    return std::ranges::all_of(ix.parts, [&](const IndexPart& p) { return known(p.col_id); });
+  };
+  if (t.pk_col_ids.empty() || !std::ranges::all_of(t.pk_col_ids, known) || !std::ranges::all_of(t.indexes, index_ok)) {
+    corrupt("record of table " + t.name + " names a key column it does not have");
+  }
+  if (std::ranges::any_of(t.pk_col_ids, [&](std::uint32_t id) { return t.column(id)->nullable; })) {
+    corrupt("table " + t.name + " has a nullable primary key column");
+  }
+  if (t.layout.columns.size() != t.columns.size()) corrupt("current layout of table " + t.name + " misses a column");
+  return t;
+}
+
+// ------------------------------------------------------------------ lookups
 
 auto Table::column(std::string_view n) const -> const Column* {
   auto it = std::ranges::find(columns, fold(n), &Column::name);
@@ -282,152 +584,90 @@ auto Table::index(std::string_view n) const -> const Index* {
   return it == indexes.end() ? nullptr : &*it;
 }
 
-auto Catalog::load(DB& db) -> Catalog {
+auto Catalog::load(const Snapshot& snap) -> Catalog {
   Catalog cat;
   Bytes v;
-  if (db.get({}, counter_key(kCounterNextId), v)) cat.next_id_ = be_value(v);
-  if (db.get({}, counter_key(kCounterVersion), v)) cat.version_ = be_value(v);
-  auto snap = db.snapshot();
-  auto prefix = Bytes{std::byte{kNsCatalog}, kSubTable};
-  for (const auto& e : snap.iter_from({}, prefix)) {
-    if (e.key.size() < 2 || !std::ranges::equal(e.key.first(2), prefix)) break;
-    cat.index_table(deserialize(e.value));
+  if (snap.get({}, counter_key(kCounterNextId), v)) cat.next_id_ = be_value(v);
+  if (snap.get({}, counter_key(kCounterVersion), v)) cat.version_ = be_value(v);
+  auto tables = Bytes{std::byte{kNsCatalog}, kSubTable};
+  for (const auto& e : snap.iter_from({}, tables)) {
+    if (!has_prefix(e.key, tables)) break;
+    auto t = parse_table(e.value);
+    if (e.key.size() != tables.size() + 4 || be_value(e.key.subspan(tables.size())) != t.id) {
+      corrupt("record of table " + t.name + " is under another id's key");
+    }
+    cat.tables_.emplace(t.id, std::move(t));
   }
-  cat.rebuild_key_layouts();
+  cat.rebuild_lookups();
+
+  // Every id below the counter and used once; every name entry names its
+  // object, and every object has its entry.
+  std::set<std::uint32_t> ids;
+  auto use = [&](std::uint32_t id) {
+    if (id == 0 || id >= cat.next_id_ || !ids.insert(id).second) corrupt("object id " + std::to_string(id) + " reused");
+  };
+  std::size_t objects = 0;
+  for (const auto& [id, t] : cat.tables_) {
+    use(id);
+    use(t.layout_id);
+    for (const auto& [lid, l] : t.retired_layouts) use(lid);
+    for (const auto& ix : t.indexes) use(ix.id);
+    objects += 1 + t.indexes.size();
+  }
+  std::size_t entries = 0;
+  auto names = Bytes{std::byte{kNsCatalog}, kSubName};
+  for (const auto& e : snap.iter_from({}, names)) {
+    if (!has_prefix(e.key, names)) break;
+    std::string name{reinterpret_cast<const char*>(e.key.data()) + names.size(), e.key.size() - names.size()};
+    auto it = cat.names_.find(name);
+    auto kind = e.value.empty() ? 0 : std::to_integer<std::uint8_t>(e.value[0]);
+    if (it == cat.names_.end() || e.value.size() != 5 || be_value(e.value.subspan(1)) != it->second ||
+        kind != (cat.tables_.contains(it->second) ? kKindTable : kKindIndex)) {
+      corrupt("name entry " + name + " does not match the records");
+    }
+    ++entries;
+  }
+  if (entries != objects || cat.names_.size() != objects) corrupt("a table or index has no name entry");
   return cat;
 }
 
-auto Catalog::next_id(std::uint32_t n) -> std::uint32_t {
-  auto first = next_id_;
-  if (first + n > kMaxObjectId) throw std::length_error("catalog ids exhausted");
-  next_id_ += n;
-  return static_cast<std::uint32_t>(first);
+auto Catalog::clone() const -> Catalog {
+  Catalog c;
+  c.next_id_ = next_id_;
+  c.version_ = version_;
+  c.tables_ = tables_;
+  c.rebuild_lookups();
+  return c;
 }
 
-auto Catalog::create_table(DB& db, const std::string& raw_name, const std::vector<ColumnSpec>& cols,
-                           const std::vector<std::string>& pk) -> const Table& {
-  auto name = fold(raw_name);
-  if (names_.contains(name)) throw std::invalid_argument("relation " + name + " already exists");
-  if (cols.empty() || pk.empty()) throw std::invalid_argument("a table needs columns and a primary key");
-
-  Table t;
-  t.name = name;
-  std::vector<ColumnDef> defs;
-  for (const auto& spec : cols) {
-    auto cname = fold(spec.name);
-    if (t.column(cname) != nullptr) throw std::invalid_argument("column " + cname + " specified more than once");
-    auto pk_col = std::ranges::find(pk, cname, [](const std::string& s) { return fold(s); }) != pk.end();
-    Column c{t.next_col_id++, cname, spec.type, spec.nullable && !pk_col};
-    defs.push_back({c.id, c.type, c.nullable});
-    t.columns.push_back(std::move(c));
-  }
-  for (const auto& p : pk) {
-    const auto* c = t.column(p);
-    if (c == nullptr) throw std::invalid_argument("primary key column " + p + " does not exist");
-    t.pk_col_ids.push_back(c->id);
-  }
-  t.layout = make_layout(defs);
-
-  auto saved_next = next_id_;
-  t.id = next_id(2);
-  t.layout_id = t.id + 1;
-
-  WritePlan plan;
-  plan.ensure_absent(name_key(name));
-  plan.put(name_key(name), [&] {
-    auto v = Bytes{std::byte{kKindTable}};
-    auto id = be_bytes(t.id, 4);
-    v.insert(v.end(), id.begin(), id.end());
-    return v;
-  }());
-  plan.put(table_key(t.id), serialize(t));
-  plan.put(counter_key(kCounterNextId), be_bytes(next_id_, 8));
-  plan.put(counter_key(kCounterVersion), be_bytes(version_ + 1, 8));
-  try {
-    commit_ddl(db, std::move(plan), "relation " + name);
-  } catch (...) {
-    next_id_ = saved_next;
-    throw;
-  }
-  ++version_;
+void Catalog::put_table(Table t) {
   auto id = t.id;
-  index_table(std::move(t));
-  rebuild_key_layouts();
-  return tables_.at(id);
+  tables_.insert_or_assign(id, std::move(t));
 }
 
-auto Catalog::create_index(DB& db, const std::string& raw_name, const std::string& table_name,
-                           const std::vector<std::string>& cols) -> const Index& {
-  auto name = fold(raw_name);
-  if (names_.contains(name)) throw std::invalid_argument("relation " + name + " already exists");
-  const auto* found = table(table_name);
-  if (found == nullptr) throw std::invalid_argument("relation " + fold(table_name) + " does not exist");
-  auto t = *found;
-  Index ix;
-  ix.name = name;
-  for (const auto& c : cols) {
-    const auto* col = t.column(c);
-    if (col == nullptr) throw std::invalid_argument("column " + fold(c) + " does not exist");
-    ix.col_ids.push_back(col->id);
-  }
-  auto saved_next = next_id_;
-  ix.id = next_id(1);
-  t.indexes.push_back(ix);
-  ++t.version;
+void Catalog::erase_table(std::uint32_t id) { tables_.erase(id); }
 
-  WritePlan plan;
-  plan.ensure_absent(name_key(name));
-  auto v = Bytes{std::byte{kKindIndex}};
-  auto idb = be_bytes(ix.id, 4);
-  v.insert(v.end(), idb.begin(), idb.end());
-  plan.put(name_key(name), v);
-  plan.put(table_key(t.id), serialize(t));
-  plan.put(counter_key(kCounterNextId), be_bytes(next_id_, 8));
-  plan.put(counter_key(kCounterVersion), be_bytes(version_ + 1, 8));
-  // prototype: the backfill rides in the DDL's batch, so it is bounded by the
-  // engine's 1 GiB plan limit and is not guarded against concurrent writers.
-  {
-    auto snap = db.snapshot();
-    Bytes prefix;
-    key_put_prefix(prefix, kNsRow, t.id);
-    for (const auto& e : snap.iter_from({}, prefix)) {
-      if (e.key.size() < prefix.size() || !std::ranges::equal(e.key.first(prefix.size()), prefix)) break;
-      Bytes k;
-      if (!encode_index_key_from_row(t, ix, e.value, k)) throw std::runtime_error("malformed row in " + t.name);
-      plan.put(k, BytesView{});
-    }
-  }
-  try {
-    commit_ddl(db, std::move(plan), "relation " + name);
-  } catch (...) {
-    next_id_ = saved_next;
-    throw;
-  }
-  ++version_;
-  index_table(std::move(t));
-  rebuild_key_layouts();
-  const auto& stored = tables_.at(found->id);
-  return *stored.index(name);
-}
-
-void Catalog::index_table(Table t) {
-  names_[t.name] = t.id;
-  for (const auto& ix : t.indexes) names_[ix.name] = ix.id;
-  layout_tables_[t.layout_id] = t.id;
-  tables_[t.id] = std::move(t);
-}
-
-void Catalog::rebuild_key_layouts() {
+void Catalog::rebuild_lookups() {
+  names_.clear();
   key_layouts_.clear();
+  layout_tables_.clear();
   for (const auto& [id, t] : tables_) {
+    auto name_taken = [&](const std::string& n) {
+      if (names_.contains(n)) corrupt("name " + n + " is used twice");
+    };
+    name_taken(t.name);
+    names_[t.name] = id;
+    layout_tables_[t.layout_id] = id;
     std::vector<KeyPart> pk_parts;
     for (auto cid : t.pk_col_ids) pk_parts.push_back(KeyPart{t.column(cid)->type});
     key_layouts_[id] = KeyLayout{kNsRow, &t, nullptr, pk_parts, 0};
     for (const auto& ix : t.indexes) {
-      KeyLayout kl{kNsIndex, &t, &ix, {}, ix.col_ids.size()};
-      for (auto cid : ix.col_ids) {
-        const auto* c = t.column(cid);
-        kl.parts.push_back(KeyPart{c->type, c->nullable});
+      name_taken(ix.name);
+      names_[ix.name] = ix.id;
+      KeyLayout kl{kNsIndex, &t, &ix, {}, ix.parts.size()};
+      for (const auto& p : ix.parts) {
+        const auto* c = t.column(p.col_id);
+        kl.parts.push_back(KeyPart{c->type, c->nullable, p.desc});
       }
       kl.parts.insert(kl.parts.end(), pk_parts.begin(), pk_parts.end());
       key_layouts_[ix.id] = std::move(kl);
@@ -444,6 +684,14 @@ auto Catalog::table(std::string_view name) const -> const Table* {
 auto Catalog::table(std::uint32_t id) const -> const Table* {
   auto it = tables_.find(id);
   return it == tables_.end() ? nullptr : &it->second;
+}
+
+auto Catalog::index(std::string_view name) const -> std::pair<const Table*, const Index*> {
+  auto it = names_.find(fold(name));
+  if (it == names_.end()) return {nullptr, nullptr};
+  const auto* kl = key_layout(it->second);
+  if (kl == nullptr || kl->index == nullptr) return {nullptr, nullptr};
+  return {kl->table, kl->index};
 }
 
 auto Catalog::key_layout(std::uint32_t id) const -> const KeyLayout* {
@@ -475,10 +723,300 @@ auto Catalog::constants(const Table& t) const -> std::vector<std::pair<std::stri
   return out;
 }
 
+// --------------------------------------------------------------------- DDL
+
+auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<DdlOp>& ops, bool& backfill) const
+    -> std::shared_ptr<const Catalog> {
+  auto next = std::make_shared<Catalog>(clone());
+  next->version_ = version_ + 1;
+  auto finish = [&] {
+    guard_catalog(ops);
+    put_counters(ops, next->next_id_, next->version_);
+    next->rebuild_lookups();
+    return std::shared_ptr<const Catalog>{std::move(next)};
+  };
+  auto name_free = [&](const std::string& name) {
+    if (names_.contains(name)) throw std::invalid_argument("relation \"" + name + "\" already exists");
+  };
+  auto find_table = [&](const std::string& name) -> const Table& {
+    const auto* t = table(name);
+    if (t == nullptr) throw std::invalid_argument("relation \"" + fold(name) + "\" does not exist");
+    return *t;
+  };
+  backfill = false;
+
+  if (const auto* ct = std::get_if<CreateTableDdl>(&ddl)) {
+    auto name = fold(ct->name);
+    name_free(name);
+    if (ct->columns.empty() || ct->pk.empty()) throw std::invalid_argument("a table needs columns and a primary key");
+    Table t;
+    t.name = name;
+    std::vector<ColumnDef> defs;
+    for (const auto& spec : ct->columns) {
+      check_column_spec(spec);
+      auto cname = fold(spec.name);
+      if (t.column(cname) != nullptr) throw std::invalid_argument("column \"" + cname + "\" specified more than once");
+      auto in_pk = std::ranges::any_of(ct->pk, [&](const std::string& p) { return fold(p) == cname; });
+      Column c{t.next_col_id++, cname, spec.sql, phys_type(spec.sql), spec.nullable && !in_pk, spec.default_value};
+      defs.push_back({c.id, c.type, c.nullable});
+      t.columns.push_back(std::move(c));
+    }
+    for (const auto& p : ct->pk) {
+      const auto* c = t.column(p);
+      if (c == nullptr) throw std::invalid_argument("primary key column \"" + fold(p) + "\" does not exist");
+      if (std::ranges::find(t.pk_col_ids, c->id) != t.pk_col_ids.end()) {
+        throw std::invalid_argument("column \"" + c->name + "\" appears twice in the primary key");
+      }
+      t.pk_col_ids.push_back(c->id);
+    }
+    t.layout = make_layout(defs);
+    t.id = reserve_ids(next->next_id_, 2);
+    t.layout_id = t.id + 1;
+    put_op(ops, DdlOp::Kind::EnsureAbsent, name_entry_key(name));
+    put_op(ops, DdlOp::Kind::Put, name_entry_key(name), name_value(kKindTable, t.id));
+    put_op(ops, DdlOp::Kind::Put, table_record_key(t.id), serialize_table(t));
+    next->put_table(std::move(t));
+    return finish();
+  }
+
+  if (const auto* ci = std::get_if<CreateIndexDdl>(&ddl)) {
+    auto name = fold(ci->name);
+    name_free(name);
+    auto t = find_table(ci->table);
+    if (ci->columns.empty()) throw std::invalid_argument("an index needs columns");
+    Index ix;
+    ix.name = name;
+    ix.unique = ci->unique;
+    for (const auto& c : ci->columns) {
+      const auto* col = t.column(c.name);
+      if (col == nullptr) throw std::invalid_argument("column \"" + fold(c.name) + "\" does not exist");
+      if (std::ranges::find(ix.parts, col->id, &IndexPart::col_id) != ix.parts.end()) {
+        throw std::invalid_argument("column \"" + col->name + "\" appears twice in the index");
+      }
+      ix.parts.push_back({col->id, c.desc});
+    }
+    ix.id = reserve_ids(next->next_id_, 1);
+    t.indexes.push_back(ix);
+    ++t.version;
+    put_op(ops, DdlOp::Kind::EnsureAbsent, name_entry_key(name));
+    put_op(ops, DdlOp::Kind::Put, name_entry_key(name), name_value(kKindIndex, ix.id));
+    put_op(ops, DdlOp::Kind::Put, table_record_key(t.id), serialize_table(t));
+
+    // The entries for the rows already in the table, in the same batch.
+    backfill = true;
+    std::set<Bytes> prefixes;  // a unique index's non-null prefixes seen so far
+    for_each_row(snap, t.id, [&](BytesView, BytesView row) {
+      Bytes k;
+      std::size_t prefix_len = 0;
+      bool has_null = false;
+      if (!encode_index_key_from_row(t, ix, row, k, &prefix_len, &has_null)) {
+        throw std::runtime_error("malformed row in table " + t.name);
+      }
+      if (ix.unique && !has_null && !prefixes.emplace(k.begin(), k.begin() + static_cast<std::ptrdiff_t>(prefix_len)).second) {
+        throw std::invalid_argument("could not create unique index \"" + name + "\": table \"" + t.name +
+                                    "\" holds a duplicate key");
+      }
+      put_op(ops, DdlOp::Kind::Put, std::move(k));
+    });
+    guard_rows(ops, t.id);
+    next->put_table(std::move(t));
+    return finish();
+  }
+
+  if (const auto* dt = std::get_if<DropTableDdl>(&ddl)) {
+    const auto* found = table(dt->name);
+    if (found == nullptr) {
+      if (index(dt->name).first != nullptr) throw std::invalid_argument("\"" + fold(dt->name) + "\" is an index");
+      if (dt->if_exists) return nullptr;
+      throw std::invalid_argument("table \"" + fold(dt->name) + "\" does not exist");
+    }
+    const auto& t = *found;
+    put_op(ops, DdlOp::Kind::Del, table_record_key(t.id));
+    put_op(ops, DdlOp::Kind::Del, name_entry_key(t.name));
+    auto rows = row_prefix(t.id);
+    put_op(ops, DdlOp::Kind::DelRange, rows, key_successor(rows));
+    for (const auto& ix : t.indexes) {
+      put_op(ops, DdlOp::Kind::Del, name_entry_key(ix.name));
+      auto p = index_prefix(ix.id);
+      put_op(ops, DdlOp::Kind::DelRange, p, key_successor(p));
+    }
+    next->erase_table(t.id);
+    return finish();
+  }
+
+  if (const auto* di = std::get_if<DropIndexDdl>(&ddl)) {
+    auto [owner, found] = index(di->name);
+    if (found == nullptr) {
+      if (table(di->name) != nullptr) throw std::invalid_argument("\"" + fold(di->name) + "\" is not an index");
+      if (di->if_exists) return nullptr;
+      throw std::invalid_argument("index \"" + fold(di->name) + "\" does not exist");
+    }
+    auto t = *owner;
+    auto id = found->id;
+    std::erase_if(t.indexes, [&](const Index& ix) { return ix.id == id; });
+    ++t.version;
+    put_op(ops, DdlOp::Kind::Put, table_record_key(t.id), serialize_table(t));
+    put_op(ops, DdlOp::Kind::Del, name_entry_key(fold(di->name)));
+    auto p = index_prefix(id);
+    put_op(ops, DdlOp::Kind::DelRange, p, key_successor(p));
+    next->put_table(std::move(t));
+    return finish();
+  }
+
+  const auto& ac = std::get<AddColumnDdl>(ddl);
+  auto t = find_table(ac.table);
+  check_column_spec(ac.column);
+  auto cname = fold(ac.column.name);
+  if (t.column(cname) != nullptr) {
+    throw std::invalid_argument("column \"" + cname + "\" of relation \"" + t.name + "\" already exists");
+  }
+  auto has_default = !std::holds_alternative<std::monostate>(ac.column.default_value);
+  if (!ac.column.nullable && !has_default) {
+    throw std::invalid_argument("column \"" + cname + "\" is NOT NULL and has no default for the existing rows");
+  }
+  Column c{t.next_col_id, cname, ac.column.sql, phys_type(ac.column.sql), ac.column.nullable, ac.column.default_value};
+  auto old_layout = t.layout;
+  if (!append_columns(t.layout, std::vector<ColumnDef>{{c.id, c.type, c.nullable}})) {
+    throw std::length_error("table \"" + t.name + "\" has no room in its row layout for another column (needs REBUILD)");
+  }
+  ++t.next_col_id;
+  t.columns.push_back(c);
+  ++t.version;
+  put_op(ops, DdlOp::Kind::Put, table_record_key(t.id), serialize_table(t));
+  if (has_default) {
+    // Every existing row gets the default; the generation and every existing
+    // position are unchanged, so the rewrite is a copy and one more column.
+    backfill = true;
+    RowWriter w{t.layout};
+    for_each_row(snap, t.id, [&](BytesView key, BytesView row) {
+      if (!row_valid(row) || row_generation(row) != old_layout.generation) {
+        throw std::runtime_error("malformed row in table " + t.name);
+      }
+      w.reset();
+      w.copy_from(row);
+      Bytes out;
+      if (!set_datum(w, c.id, c.default_value) || !w.finish(out)) {
+        throw std::length_error("a row of table " + t.name + " is over the value limit with the new column");
+      }
+      put_op(ops, DdlOp::Kind::Put, Bytes(key.begin(), key.end()), std::move(out));
+    });
+    guard_rows(ops, t.id);
+  }
+  next->put_table(std::move(t));
+  return finish();
+}
+
+// ------------------------------------------------------------- LiveCatalog
+
+LiveCatalog::LiveCatalog(DB& db) : db_{db} {
+  auto snap = db_.snapshot();
+  current_ = std::make_shared<const Catalog>(Catalog::load(snap));
+}
+
+auto LiveCatalog::current() const -> std::shared_ptr<const Catalog> {
+  std::lock_guard<std::mutex> lock{mu_};
+  return current_;
+}
+
+auto LiveCatalog::pin() const -> Pinned {
+  for (;;) {
+    auto g = gen_.load();
+    if (g % 2 == 1) {
+      gen_.wait(g);
+      continue;
+    }
+    auto cat = current();
+    auto snap = db_.snapshot();
+    // A DDL that reached the engine before the snapshot made gen_ odd first.
+    if (gen_.load() == g) return Pinned{std::move(cat), std::move(snap)};
+  }
+}
+
+auto LiveCatalog::prepare(const Ddl& ddl) const -> Prepared {
+  auto [base, snap] = pin();
+  std::vector<Catalog::DdlOp> ops;
+  Prepared p{base, nullptr, nullptr, false};
+  p.next = base->next_version(ddl, snap, ops, p.backfill);
+  if (!p.next) return p;
+  try {
+    p.plan = std::make_unique<WritePlan>(std::move(snap));
+    for (const auto& op : ops) {
+      switch (op.kind) {
+        case Catalog::DdlOp::Kind::Put: p.plan->put(op.a, op.b); break;
+        case Catalog::DdlOp::Kind::Del: p.plan->del(op.a); break;
+        case Catalog::DdlOp::Kind::DelRange: p.plan->del_range(op.a, op.b); break;
+        case Catalog::DdlOp::Kind::EnsureAbsent: p.plan->ensure_absent(op.a); break;
+        case Catalog::DdlOp::Kind::EnsureUnchanged: p.plan->ensure_unchanged(op.a); break;
+        case Catalog::DdlOp::Kind::EnsureRangeUnchanged: p.plan->ensure_range_unchanged(op.a, op.b); break;
+      }
+    }
+  } catch (const std::invalid_argument& e) {
+    if (!p.backfill) throw;
+    throw std::length_error(std::string{"backfill does not fit one engine batch: "} + e.what());
+  }
+  return p;
+}
+
+auto LiveCatalog::commit(Prepared p) -> bool {
+  if (!p.next) return true;  // a no-op
+  std::lock_guard<std::mutex> lock{ddl_mu_};
+  if (current() != p.base) return false;  // another DDL published since the prepare
+  gen_.fetch_add(1);
+  auto done = [&] {
+    gen_.fetch_add(1);
+    gen_.notify_all();
+  };
+  try {
+    auto r = db_.apply_batch({.sync = true}, std::move(*p.plan));
+    if (r) {
+      std::lock_guard<std::mutex> swap{mu_};
+      current_ = std::move(p.next);
+    }
+    done();
+    return r.has_value();
+  } catch (const std::invalid_argument& e) {
+    done();
+    if (!p.backfill) throw;
+    throw std::length_error(std::string{"backfill does not fit one engine batch: "} + e.what());
+  } catch (...) {
+    done();
+    throw;
+  }
+}
+
+auto LiveCatalog::apply(const Ddl& ddl) -> std::shared_ptr<const Catalog> {
+  for (int attempt = 0; attempt < kDdlAttempts; ++attempt) {
+    auto p = prepare(ddl);
+    if (!p.next) return p.base;
+    if (commit(std::move(p))) return current();
+  }
+  throw std::runtime_error("DDL conflicted with concurrent writes on every attempt");
+}
+
+// ------------------------------------------------------------------- keys
+
 auto encode_pk_from_row(const Table& t, BytesView row, Bytes& out) -> bool {
   key_put_prefix(out, kNsRow, t.id);
   for (auto id : t.pk_col_ids) {
-    if (!put_part_from_row(t, id, false, row, out)) return false;
+    if (!put_part_from_row(t, id, KeyPart{t.column(id)->type}, row, out)) return false;
+  }
+  return true;
+}
+
+auto encode_index_key_from_row(const Table& t, const Index& ix, BytesView row, Bytes& out, std::size_t* prefix_len,
+                               bool* has_null) -> bool {
+  key_put_prefix(out, kNsIndex, ix.id);
+  bool any_null = false;
+  for (const auto& p : ix.parts) {
+    const auto* c = t.column(p.col_id);
+    bool was_null = false;
+    if (!put_part_from_row(t, p.col_id, KeyPart{c->type, c->nullable, p.desc}, row, out, &was_null)) return false;
+    any_null = any_null || was_null;
+  }
+  if (prefix_len != nullptr) *prefix_len = out.size();
+  if (has_null != nullptr) *has_null = any_null;
+  for (auto id : t.pk_col_ids) {
+    if (!put_part_from_row(t, id, KeyPart{t.column(id)->type}, row, out)) return false;
   }
   return true;
 }

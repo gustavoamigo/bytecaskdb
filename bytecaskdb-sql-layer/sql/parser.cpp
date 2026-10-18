@@ -10,6 +10,7 @@ module;
 #include <limits>
 #include <memory>
 #include <string>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -101,6 +102,66 @@ void where(const PgQuery__Node* n, std::vector<Compare>& out) {
   out.push_back(Compare{compare_op(str(a->name[0]), a->location), expr(a->lexpr), expr(a->rexpr), a->location});
 }
 
+auto literal(const PgQuery__Node* n) -> Literal {
+  if (n == nullptr || n->node_case != PG_QUERY__NODE__NODE_A_CONST) reject("DEFAULT must be a constant", -1);
+  const auto* c = n->a_const;
+  Literal l{Literal::Kind::Null, {}, false, c->location};
+  if (c->isnull) return l;
+  switch (c->val_case) {
+    case PG_QUERY__A__CONST__VAL_IVAL:
+      l.kind = Literal::Kind::Integer;
+      l.text = std::to_string(c->ival->ival);
+      return l;
+    case PG_QUERY__A__CONST__VAL_FVAL:
+      // PostgreSQL gives an integer that does not fit 32 bits as a Float too.
+      l.text = c->fval->fval;
+      l.kind = l.text.find_first_of(".eE") == std::string::npos ? Literal::Kind::Integer : Literal::Kind::Number;
+      return l;
+    case PG_QUERY__A__CONST__VAL_SVAL:
+      l.kind = Literal::Kind::String;
+      l.text = c->sval->sval;
+      return l;
+    case PG_QUERY__A__CONST__VAL_BOOLVAL:
+      l.kind = Literal::Kind::Bool;
+      l.b = c->boolval->boolval != 0;
+      return l;
+    case PG_QUERY__A__CONST__VAL_BSVAL:
+    case PG_QUERY__A__CONST__VAL__NOT_SET:
+    case _PG_QUERY__A__CONST__VAL__CASE_IS_INT_SIZE: break;
+  }
+  reject("constant not supported", c->location);
+}
+
+auto column_def(const PgQuery__ColumnDef* cd) -> ColumnDefAst {
+  const auto* tn = cd->type_name;
+  if (tn == nullptr || tn->n_names == 0 || tn->n_array_bounds != 0 || tn->setof || tn->pct_type) {
+    reject("column type not supported", cd->location);
+  }
+  ColumnDefAst col{cd->colname, str(tn->names[tn->n_names - 1]), {}, cd->is_not_null != 0, false, std::nullopt,
+                   cd->location};
+  for (std::size_t k = 0; k < tn->n_typmods; ++k) {
+    const auto* m = tn->typmods[k];
+    if (m->node_case != PG_QUERY__NODE__NODE_A_CONST || m->a_const->val_case != PG_QUERY__A__CONST__VAL_IVAL) {
+      reject("type modifier must be an integer", tn->location);
+    }
+    col.typmods.push_back(m->a_const->ival->ival);
+  }
+  if (cd->coll_clause != nullptr) reject("COLLATE is not supported", cd->location);
+  for (std::size_t k = 0; k < cd->n_constraints; ++k) {
+    const auto* c = cd->constraints[k]->constraint;
+    if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_PRIMARY) {
+      col.primary_key = true;
+    } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_NOTNULL) {
+      col.not_null = true;
+    } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_DEFAULT) {
+      col.default_value = literal(c->raw_expr);
+    } else if (c->contype != PG_QUERY__CONSTR_TYPE__CONSTR_NULL) {
+      reject("column constraint not supported", c->location);
+    }
+  }
+  return col;
+}
+
 auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos) -> CreateTable {
   if (s->n_inh_relations != 0 || s->partspec != nullptr || s->of_typename != nullptr) {
     reject("CREATE TABLE option not supported", s->relation->location);
@@ -115,39 +176,61 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos) -> CreateTable
       continue;
     }
     if (el->node_case != PG_QUERY__NODE__NODE_COLUMN_DEF) reject("table element not supported", -1);
-    const auto* cd = el->column_def;
-    const auto* tn = cd->type_name;
-    if (tn == nullptr || tn->n_names == 0 || tn->n_array_bounds != 0 || tn->n_typmods != 0) {
-      reject("column type not supported", cd->location);
-    }
-    ColumnDefAst col{cd->colname, str(tn->names[tn->n_names - 1]), cd->is_not_null != 0, false, cd->location};
-    for (std::size_t k = 0; k < cd->n_constraints; ++k) {
-      const auto* c = cd->constraints[k]->constraint;
-      if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_PRIMARY) {
-        col.primary_key = true;
-      } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_NOTNULL) {
-        col.not_null = true;
-      } else if (c->contype != PG_QUERY__CONSTR_TYPE__CONSTR_NULL) {
-        reject("column constraint not supported", c->location);
-      }
-    }
-    t.columns.push_back(std::move(col));
+    t.columns.push_back(column_def(el->column_def));
   }
   return t;
 }
 
 auto create_index(const PgQuery__IndexStmt* s, std::int32_t pos) -> CreateIndex {
-  if (s->unique || s->where_clause != nullptr || s->n_index_including_params != 0 || empty(s->idxname)) {
-    reject("only a named, non-unique index on plain columns is supported", s->relation->location);
+  if (s->where_clause != nullptr || s->n_index_including_params != 0 || empty(s->idxname) || s->primary ||
+      s->isconstraint || s->concurrent || s->if_not_exists ||
+      (!empty(s->access_method) && std::string_view{s->access_method} != "btree")) {
+    reject("only a named index on plain columns is supported", s->relation->location);
   }
-  CreateIndex ix{s->idxname, relation(s->relation), {}, pos};
+  CreateIndex ix{s->idxname, relation(s->relation), {}, s->unique != 0, pos};
   for (std::size_t i = 0; i < s->n_index_params; ++i) {
     const auto* e = s->index_params[i]->index_elem;
-    if (empty(e->name) || e->expr != nullptr) reject("index expressions are not supported", s->relation->location);
-    if (e->ordering != PG_QUERY__SORT_BY_DIR__SORTBY_DEFAULT) reject("DESC is not supported", s->relation->location);
-    ix.columns.emplace_back(e->name);
+    if (empty(e->name) || e->expr != nullptr || e->n_collation != 0 || e->n_opclass != 0) {
+      reject("index expressions, collations and operator classes are not supported", s->relation->location);
+    }
+    if (e->nulls_ordering != PG_QUERY__SORT_BY_NULLS__SORTBY_NULLS_DEFAULT) {
+      reject("NULLS FIRST and NULLS LAST are not supported: nulls sort first under ASC and last under DESC",
+             s->relation->location);
+    }
+    auto desc = e->ordering == PG_QUERY__SORT_BY_DIR__SORTBY_DESC;
+    if (!desc && e->ordering != PG_QUERY__SORT_BY_DIR__SORTBY_DEFAULT && e->ordering != PG_QUERY__SORT_BY_DIR__SORTBY_ASC) {
+      reject("index ordering not supported", s->relation->location);
+    }
+    ix.columns.push_back({e->name, desc});
   }
   return ix;
+}
+
+// DROP TABLE and DROP INDEX, one object each, RESTRICT (the default).
+auto drop(const PgQuery__DropStmt* s, std::int32_t pos) -> Statement {
+  if (s->n_objects != 1 || s->behavior == PG_QUERY__DROP_BEHAVIOR__DROP_CASCADE || s->concurrent) {
+    reject("DROP takes one object, without CASCADE or CONCURRENTLY", pos);
+  }
+  const auto* obj = s->objects[0];
+  if (obj->node_case != PG_QUERY__NODE__NODE_LIST || obj->list->n_items != 1) {
+    reject("schema-qualified names are not supported", pos);
+  }
+  auto name = str(obj->list->items[0]);
+  if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_TABLE) return DropTable{name, s->missing_ok != 0, pos};
+  if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_INDEX) return DropIndex{name, s->missing_ok != 0, pos};
+  reject("only DROP TABLE and DROP INDEX are supported", pos);
+}
+
+auto alter_table(const PgQuery__AlterTableStmt* s, std::int32_t pos) -> AddColumn {
+  if (s->objtype != PG_QUERY__OBJECT_TYPE__OBJECT_TABLE || s->n_cmds != 1 || s->missing_ok) {
+    reject("only ALTER TABLE … ADD COLUMN is supported", pos);
+  }
+  const auto* cmd = s->cmds[0]->alter_table_cmd;
+  if (cmd->subtype != PG_QUERY__ALTER_TABLE_TYPE__AT_AddColumn || cmd->missing_ok || cmd->def == nullptr ||
+      cmd->def->node_case != PG_QUERY__NODE__NODE_COLUMN_DEF) {
+    reject("only ALTER TABLE … ADD COLUMN is supported", pos);
+  }
+  return AddColumn{relation(s->relation), column_def(cmd->def->column_def), pos};
 }
 
 auto insert(const PgQuery__InsertStmt* s, std::int32_t pos) -> Insert {
@@ -243,6 +326,8 @@ auto parse(std::string_view sql) -> Statement {
   auto pos = raw->stmt_location;
   if (n->node_case == PG_QUERY__NODE__NODE_CREATE_STMT) return create_table(n->create_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_INDEX_STMT) return create_index(n->index_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_DROP_STMT) return drop(n->drop_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_ALTER_TABLE_STMT) return alter_table(n->alter_table_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_INSERT_STMT) return insert(n->insert_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_SELECT_STMT) return select(n->select_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_UPDATE_STMT) return update(n->update_stmt, pos);

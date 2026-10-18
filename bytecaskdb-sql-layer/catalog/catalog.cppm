@@ -1,31 +1,34 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// catalog.cppm — tables, their permanent column ids, primary keys and
-// secondary indexes, kept in memory and persisted under namespace 0x01.
+// catalog.cppm — tables, their permanent column ids, SQL types, defaults,
+// primary keys, secondary indexes and layout generations, persisted under
+// namespace 0x01 (docs/sql_layer_catalog_design.md).
 //
-// prototype: the minimum the end-to-end prototype needs (#497). Written from
-// scratch: the plugin's catalog is GPL-2.0 and this directory is MIT. Its key
-// space follows the plugin's where they overlap (counters under 01 01, table
-// records under 01 02); records are keyed by id, with a name entry under
-// 01 03, as #489 decided.
+// Written from scratch: the plugin's catalog is GPL-2.0 and this directory is
+// MIT.
 //
 // Key space:
 //   01 01 01        next object id (tables, indexes, layouts), u64 big-endian
 //   01 01 02        catalog version, bumped by every DDL, u64 big-endian
-//   01 02 <id:4>    table record (indexes included), append-only serialization
+//   01 02 <id:4>    table record (indexes and layouts included), append-only
 //   01 03 <name>    name entry: kind(1) id(4, big-endian)
 //
-// Not thread-safe: one Catalog per process, mutated under the caller's lock.
-// Definitions are in catalog.cpp.
+// A Catalog is immutable once built. LiveCatalog publishes a new one on each
+// DDL; readers pin one with a snapshot that agrees with it. Definitions are
+// in catalog.cpp.
 
 module;
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 // The engine through its public header, as the plugin and the bindings link
@@ -39,30 +42,81 @@ export import bytecask.sql.row_codec;
 
 export namespace bytecask::sql {
 
+// A value of one of the four physical types, or SQL NULL (monostate).
+using Datum = std::variant<std::monostate, std::int64_t, double, bool, Bytes>;
+
+// The stage-1 SQL types of docs/sql_layer_types_design.md. The values are
+// the record's; never renumber one.
+enum class SqlKind : std::uint8_t {
+  SmallInt = 1,
+  Integer,
+  BigInt,
+  Real,
+  Double,
+  Boolean,
+  Bytea,
+  Text,
+  Varchar,
+  Decimal,
+  Timestamp,
+  Date,
+  Time,
+};
+
+struct SqlType {
+  SqlKind kind;
+  std::uint32_t length{0};    // VARCHAR(n): n, in code points
+  std::uint8_t precision{0};  // DECIMAL(p, s): p, 1..18
+  std::uint8_t scale{0};      // DECIMAL(p, s): s, 0..p
+  auto operator==(const SqlType&) const -> bool = default;
+};
+
+// Whether the fields a kind does not use are zero and the ones it uses in range.
+[[nodiscard]] auto sql_type_valid(SqlType t) -> bool;
+[[nodiscard]] auto phys_type(SqlType t) -> PhysType;
+// As SQL writes it: "integer", "varchar(16)", "numeric(12,2)".
+[[nodiscard]] auto sql_type_name(SqlType t) -> std::string;
+// Whether a datum is NULL or of the physical type.
+[[nodiscard]] auto datum_fits(const Datum& d, PhysType t) -> bool;
+// Sets one column of a row writer to a datum (NULL sets it null). False for
+// a type mismatch.
+[[nodiscard]] auto set_datum(RowWriter& w, std::uint32_t col_id, const Datum& d) -> bool;
+
 struct Column {
   std::uint32_t id;  // permanent; never reused
   std::string name;
-  PhysType type;
+  SqlType sql;
+  PhysType type;  // phys_type(sql)
   bool nullable;
+  Datum default_value;  // monostate: no default (NULL)
 };
 
-// A non-unique secondary index: its columns, then the primary key's.
+struct IndexPart {
+  std::uint32_t col_id;
+  bool desc{false};
+};
+
+// A secondary index: its parts, then the primary key's. A unique index has
+// the same entries; its check is on the prefix of its parts.
 struct Index {
   std::uint32_t id;
   std::string name;
-  std::vector<std::uint32_t> col_ids;
+  bool unique{false};
+  std::vector<IndexPart> parts;
 };
 
 struct Table {
   std::uint32_t id{0};
   std::string name;
   std::uint32_t version{1};  // bumped by every DDL on this table
-  std::uint32_t layout_id{0};
   std::uint32_t next_col_id{0};
   std::vector<Column> columns;
   std::vector<std::uint32_t> pk_col_ids;
   std::vector<Index> indexes;
-  RowLayout layout;
+  std::uint32_t layout_id{0};  // the current generation's object id
+  RowLayout layout;            // the current generation
+  // Earlier generations, oldest first: empty until REBUILD (#503).
+  std::vector<std::pair<std::uint32_t, RowLayout>> retired_layouts;
 
   [[nodiscard]] auto column(std::string_view name) const -> const Column*;
   [[nodiscard]] auto column(std::uint32_t id) const -> const Column*;
@@ -71,64 +125,189 @@ struct Table {
 
 struct ColumnSpec {
   std::string name;
-  PhysType type;
-  bool nullable;
+  SqlType sql;
+  bool nullable{true};
+  Datum default_value{};
+};
+
+struct IndexColumnSpec {
+  std::string name;
+  bool desc{false};
 };
 
 // What a key builder needs for a table (its primary key) or an index.
 struct KeyLayout {
   std::uint8_t ns;
   const Table* table;
-  const Index* index;  // nullptr for a table's primary key
+  const Index* index;          // nullptr for a table's primary key
   std::vector<KeyPart> parts;  // every part: index columns, then primary key
   std::size_t index_parts;     // how many of them precede the primary key
 };
 
+// The stage-1 DDL statements, as values: what LiveCatalog prepares.
+struct CreateTableDdl {
+  std::string name;
+  std::vector<ColumnSpec> columns;
+  std::vector<std::string> pk;
+};
+struct CreateIndexDdl {
+  std::string name;
+  std::string table;
+  std::vector<IndexColumnSpec> columns;
+  bool unique{false};
+};
+struct DropTableDdl {
+  std::string name;
+  bool if_exists{false};
+};
+struct DropIndexDdl {
+  std::string name;
+  bool if_exists{false};
+};
+struct AddColumnDdl {
+  std::string table;
+  ColumnSpec column;
+};
+using Ddl = std::variant<CreateTableDdl, CreateIndexDdl, DropTableDdl, DropIndexDdl, AddColumnDdl>;
+
 class Catalog {
 public:
-  // Reads every table record under namespace 0x01.
-  [[nodiscard]] static auto load(DB& db) -> Catalog;
+  Catalog() = default;
+  // Moving keeps every pointer a KeyLayout holds (map nodes do not move); a
+  // copy would not, so there is none.
+  Catalog(Catalog&&) = default;
+  Catalog& operator=(Catalog&&) = default;
+  Catalog(const Catalog&) = delete;
+  Catalog& operator=(const Catalog&) = delete;
+  ~Catalog() = default;
 
-  // Each DDL is one atomic batch: the record, the name entry, the counters,
-  // and for CREATE INDEX the entries for rows already in the table. Throws
-  // std::invalid_argument for a duplicate name or a bad definition.
-  auto create_table(DB& db, const std::string& name, const std::vector<ColumnSpec>& cols,
-                    const std::vector<std::string>& pk) -> const Table&;
-  auto create_index(DB& db, const std::string& name, const std::string& table,
-                    const std::vector<std::string>& cols) -> const Index&;
+  // Reads every record under namespace 0x01 from the snapshot. Throws
+  // std::runtime_error for a record or name entry that does not parse.
+  [[nodiscard]] static auto load(const Snapshot& snap) -> Catalog;
 
   [[nodiscard]] auto version() const noexcept -> std::uint64_t { return version_; }
+  [[nodiscard]] auto next_object_id() const noexcept -> std::uint64_t { return next_id_; }
+  [[nodiscard]] auto tables() const -> const std::map<std::uint32_t, Table>& { return tables_; }
   [[nodiscard]] auto table(std::string_view name) const -> const Table*;
   [[nodiscard]] auto table(std::uint32_t id) const -> const Table*;
+  // An index by name, with its table.
+  [[nodiscard]] auto index(std::string_view name) const -> std::pair<const Table*, const Index*>;
   // A table or an index: both draw ids from one counter.
   [[nodiscard]] auto key_layout(std::uint32_t table_or_index) const -> const KeyLayout*;
-  // A table's row layout.
+  // The current layout of a table, by layout id; nullptr for a retired one.
   [[nodiscard]] auto row_layout(std::uint32_t layout_id) const -> const RowLayout*;
   [[nodiscard]] auto table_of_layout(std::uint32_t layout_id) const -> const Table*;
 
-  // Object ids stay below 2^24: bc_error_detail carries one in its low 24
-  // bits (and a plan's constants are an enum, whose values are ints).
+  // Object ids stay at or below 2^24 - 1: bc_error_detail carries one in its
+  // low 24 bits (and a plan's constants are an enum, whose values are ints).
   static constexpr std::uint32_t kMaxObjectId = 0x00FF'FFFFu;
+  // 3: #489's record (SQL types, defaults, unique and DESC parts, layout
+  // entries). 2 was #490's, 1 the prototype's; both are refused.
+  static constexpr std::uint16_t kRecordFormat = 3;
 
   // The constants a plan on this table needs, in the names generated plans
   // use: TBL_, LAY_, IDX_, and per column <COL>_OFF or <COL>_SLOT and <COL>_COL.
-  [[nodiscard]] auto constants(const Table& t) const
-      -> std::vector<std::pair<std::string, std::uint32_t>>;
+  [[nodiscard]] auto constants(const Table& t) const -> std::vector<std::pair<std::string, std::uint32_t>>;
+
+  // One operation of a DDL's batch, collected while the snapshot is read and
+  // handed to a WritePlan on that snapshot afterwards.
+  struct DdlOp {
+    enum class Kind { Put, Del, DelRange, EnsureAbsent, EnsureUnchanged, EnsureRangeUnchanged };
+    Kind kind;
+    Bytes a, b;
+  };
 
 private:
-  void index_table(Table t);
-  void rebuild_key_layouts();
-  auto next_id(std::uint32_t n) -> std::uint32_t;  // reserves n ids, returns the first
+  friend class LiveCatalog;
+
+  // The version after `ddl`, with its batch in `ops`; nullptr for a no-op.
+  // Reads the rows a backfill needs from `snap`, which must agree with this
+  // version. Sets `backfill` if the batch rewrites or indexes rows. Throws as
+  // LiveCatalog::prepare does.
+  [[nodiscard]] auto next_version(const Ddl& ddl, const Snapshot& snap, std::vector<DdlOp>& ops,
+                                  bool& backfill) const -> std::shared_ptr<const Catalog>;
+
+  // A copy of every table, with its own lookups.
+  [[nodiscard]] auto clone() const -> Catalog;
+  void put_table(Table t);
+  void erase_table(std::uint32_t id);
+  void rebuild_lookups();
 
   std::uint64_t next_id_{1};
   std::uint64_t version_{0};
   std::map<std::uint32_t, Table> tables_;
-  std::map<std::string, std::uint32_t, std::less<>> names_;
+  std::map<std::string, std::uint32_t, std::less<>> names_;  // table or index name -> id
   std::map<std::uint32_t, KeyLayout> key_layouts_;
-  std::map<std::uint32_t, std::uint32_t> layout_tables_;  // layout id -> table id
+  std::map<std::uint32_t, std::uint32_t> layout_tables_;  // current layout id -> table id
 };
+
+// The live catalog: the current version, published by each DDL, and the
+// DDL statements themselves. Thread-safe. Holds the DB by reference; it must
+// outlive this.
+class LiveCatalog {
+public:
+  // Loads the catalog; throws as Catalog::load does.
+  explicit LiveCatalog(DB& db);
+  LiveCatalog(const LiveCatalog&) = delete;
+  LiveCatalog& operator=(const LiveCatalog&) = delete;
+  ~LiveCatalog() = default;
+
+  [[nodiscard]] auto current() const -> std::shared_ptr<const Catalog>;
+
+  // A catalog version and an engine snapshot that agree: no DDL committed
+  // between them. Waits while a DDL's commit is in flight.
+  struct Pinned {
+    std::shared_ptr<const Catalog> cat;
+    Snapshot snap;
+  };
+  [[nodiscard]] auto pin() const -> Pinned;
+
+  // A DDL built on a snapshot, not yet committed. A no-op (a drop IF EXISTS
+  // of nothing) has no plan.
+  struct Prepared {
+    std::shared_ptr<const Catalog> base;
+    std::shared_ptr<const Catalog> next;
+    std::unique_ptr<WritePlan> plan;
+    bool backfill{false};
+  };
+  // Throws std::invalid_argument for a statement the catalog refuses (a
+  // duplicate name, an unknown column, a unique index over duplicates…) and
+  // std::length_error when ids or a layout run out or a backfill passes the
+  // engine's batch limit. Writes nothing.
+  [[nodiscard]] auto prepare(const Ddl& ddl) const -> Prepared;
+  // Commits and publishes. False, with nothing written, on a conflict: a
+  // DDL or a write to a backfilled table committed since the prepare.
+  [[nodiscard]] auto commit(Prepared p) -> bool;
+  // prepare and commit, retried on a conflict kDdlAttempts times in all.
+  // Returns the version it published; throws as prepare does, or
+  // std::runtime_error when every attempt conflicted.
+  auto apply(const Ddl& ddl) -> std::shared_ptr<const Catalog>;
+
+  static constexpr int kDdlAttempts = 3;
+
+private:
+  DB& db_;
+  mutable std::mutex mu_;  // guards current_; held only to copy or swap it
+  std::shared_ptr<const Catalog> current_;
+  std::mutex ddl_mu_;  // one commit at a time
+  // Odd while a DDL's commit is between the engine and publication.
+  mutable std::atomic<std::uint64_t> gen_{0};
+};
+
+// The catalog record's key and a table's row-key range: for tests and tools.
+[[nodiscard]] auto table_record_key(std::uint32_t table_id) -> Bytes;
+[[nodiscard]] auto name_entry_key(std::string_view name) -> Bytes;
+// Serializes a table as kRecordFormat; parses one, throwing
+// std::runtime_error if it does not parse or breaks an invariant.
+[[nodiscard]] auto serialize_table(const Table& t) -> Bytes;
+[[nodiscard]] auto parse_table(BytesView record) -> Table;
 
 // Encodes the primary key of `t` from a row: kNsRow, the table id, the parts.
 [[nodiscard]] auto encode_pk_from_row(const Table& t, BytesView row, Bytes& out) -> bool;
+// Encodes the index entry of row: kNsIndex, the index id, the parts, the
+// primary key. `prefix_len`, if given, receives the length of the index-part
+// prefix, and `has_null` whether any index part was null.
+[[nodiscard]] auto encode_index_key_from_row(const Table& t, const Index& ix, BytesView row, Bytes& out,
+                                             std::size_t* prefix_len = nullptr, bool* has_null = nullptr) -> bool;
 
 }  // namespace bytecask::sql

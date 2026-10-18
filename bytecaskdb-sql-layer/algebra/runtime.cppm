@@ -9,6 +9,7 @@
 
 module;
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <variant>
@@ -39,9 +40,10 @@ struct bc_db {
   bytecask::DB* db;
 };
 
-// The live catalog. Not owned; must outlive every context built on it.
+// The live catalog. Not owned; must outlive every context built on it. A
+// context pins one version of it per execution.
 struct bc_catalog {
-  const bytecask::sql::Catalog* cat;
+  bytecask::sql::LiveCatalog* live;
 };
 
 struct bc_params {
@@ -65,6 +67,11 @@ export namespace bytecask::sql {
 // Every column of a result row, by its layout: NULL, or the typed value. The
 // one decoder of result rows, for the embedded API and the tests.
 [[nodiscard]] auto decode_row(const RowLayout& layout, BytesView row) -> std::vector<bc_value>;
+
+// Why a plan compiled against `ref` cannot run on `cat`, or nullopt if it
+// can: docs/sql_layer_catalog_design.md, *Compatibility*. What bc_ctx_run
+// checks, and what the embedded API asks before it reuses a cached plan.
+[[nodiscard]] auto schema_incompatibility(const Catalog& cat, const bc_schema_ref& ref) -> std::optional<std::string>;
 
 // A plan's result_types as the bc_type codes a bc_schema_ref carries.
 [[nodiscard]] auto result_type_codes(std::span<const PhysType> types) -> std::vector<std::uint8_t>;

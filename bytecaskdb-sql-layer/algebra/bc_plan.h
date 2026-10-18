@@ -82,14 +82,25 @@ typedef struct bc_db bc_db;
 typedef struct bc_catalog bc_catalog;
 typedef struct bc_params bc_params;
 
-/* What a plan was compiled against: the catalog version, the tables and
-   indexes it reads or writes, and the types of the rows it emits, in emit
-   order. bc_ctx_run checks the first three against the live catalog; the
-   result layout is the plan's own and is not a catalog object. */
+/* A column a plan reads or sets, as compiled: the table layout, the
+   permanent column id, its offset or slot, and its bc_type. */
 typedef struct {
-  uint64_t catalog_version;
-  const uint32_t *tables_read,  *tables_written;   uint32_t n_read, n_written;
-  const uint8_t  *result_types;                    uint32_t n_result;   /* bc_type codes */
+  uint32_t layout, col, pos;
+  uint8_t type;
+} bc_col_ref;
+
+/* What a plan was compiled against, and the types of the rows it emits, in
+   emit order. bc_ctx_run checks everything but the version and the result
+   types against the catalog version the context pinned
+   (docs/sql_layer_catalog_design.md, *Compatibility*); the result layout is
+   the plan's own and is not a catalog object. */
+typedef struct {
+  uint64_t catalog_version;                                       /* for messages; not checked */
+  const uint32_t   *objects_read;    uint32_t n_read;             /* tables and indexes it reads */
+  const uint32_t   *tables_written;  uint32_t n_written;          /* tables whose rows it writes */
+  const uint32_t   *indexes_written; uint32_t n_indexes_written;  /* every index of those tables it maintains */
+  const bc_col_ref *cols;            uint32_t n_cols;             /* every column it reads or sets */
+  const uint8_t    *result_types;    uint32_t n_result;           /* bc_type codes */
 } bc_schema_ref;
 
 enum bc_type { BC_T_I64 = 1, BC_T_F64 = 2, BC_T_BOOL = 3, BC_T_BYTES = 4 };
