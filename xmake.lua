@@ -234,18 +234,41 @@ local function add_release_opts(t)
     end
 end
 
--- The same flags for a native target that an included file defines
--- (bytecaskdb-sql-layer/xmake.lua), which cannot call this file's local
--- functions: its targets add this rule where the targets above call them.
--- Under MSan the targets themselves add what bytecask_tests pairs with the
--- libc++ flags (the std-module probe off, Catch2 from source); the
--- sql-layer's libpg_query and TinyCC are built uninstrumented, so an MSan
--- binary of it builds but reports their stores as uninitialized reads.
+-- The flags of a native target: pthread, the sanitizer, the release options.
+-- A target adds this rule where it would call the three functions above; the
+-- targets that also call apply_coverage keep an explicit on_config. Included
+-- files (bytecaskdb-sql-layer/xmake.lua) cannot call the functions, only add
+-- the rule. Under MSan the test targets add what pairs with the libc++ flags
+-- through bytecask.catch2 below; the sql-layer's libpg_query and TinyCC are
+-- built uninstrumented, so an MSan binary of it builds but reports their
+-- stores as uninitialized reads.
 rule("bytecask.native_flags")
     on_config(function (t)
         add_native_syslinks(t)
         apply_sanitizer(t)
         add_release_opts(t)
+    end)
+rule_end()
+
+-- Catch2 for a native test target. Under MemorySanitizer the prebuilt catch2
+-- package, compiled against the system's default libstdc++, cannot link its
+-- libstdc++-mangled symbols into an MSan binary built against libc++, so
+-- Catch2 is compiled from source as ordinary translation units of the target,
+-- under the same -stdlib=libc++ invocation as everything else (see
+-- third_party/catch2_amalgamated/README.md). The std-module probe goes with
+-- it: xmake probes for a system "std"/"std.compat" module by scanning GCC's
+-- bits/std.cc against the target's own cxflags, and with -nostdinc++ in
+-- effect (apply_sanitizer) that probe cannot find GCC's headers and fatally
+-- errors instead of warning "not found"; the project never imports std.
+rule("bytecask.catch2")
+    on_load(function (t)
+        if (get_config("sanitizer") or ""):find("memory", 1, true) then
+            t:add("files", path.join(os.projectdir(), "third_party", "catch2_amalgamated", "catch_amalgamated.cpp"))
+            t:add("includedirs", path.join(os.projectdir(), "third_party", "catch2_amalgamated"))
+            t:set("policy", "build.c++.modules.std", false)
+        else
+            t:add("packages", "catch2")
+        end
     end)
 rule_end()
 
@@ -290,25 +313,7 @@ target("bytecask_tests")
     add_engine_files()
     add_includedirs("bytecaskdb", "tests")
     add_packages("crc32c", "zstd")
-    if (get_config("sanitizer") or ""):find("memory", 1, true) then
-        -- The prebuilt catch2 package is compiled against the system's
-        -- default libstdc++; linking its libstdc++-mangled symbols into an
-        -- MSan binary built against libc++ fails at link time. Compiling
-        -- Catch2 from source as ordinary translation units of this target
-        -- puts it under the same -stdlib=libc++ invocation as everything
-        -- else, so there is no ABI boundary to cross. See
-        -- third_party/catch2_amalgamated/README.md.
-        add_files("third_party/catch2_amalgamated/catch_amalgamated.cpp")
-        add_includedirs("third_party/catch2_amalgamated")
-        -- xmake probes for a system "std"/"std.compat" module by scanning
-        -- GCC's bits/std.cc against this target's own cxflags. With
-        -- -nostdinc++ in effect (see apply_sanitizer), that probe can't find
-        -- GCC's headers and fatally errors instead of just warning "not
-        -- found" — the project doesn't use `import std;` at all, so skip it.
-        set_policy("build.c++.modules.std", false)
-    else
-        add_packages("catch2")
-    end
+    add_rules("bytecask.catch2")
     add_defines("BYTECASK_TESTING")
     -- Counted fault sweep (tests/syscall_faults.cpp): each I/O call the
     -- binary's objects make goes through an interposer that can count it and
@@ -367,11 +372,7 @@ target("map_bench")
     add_cxflags("-Wno-global-constructors")
     add_packages("benchmark", "crc32c", "zstd")
     add_defines("BYTECASK_TESTING")
-    on_config(function(t)
-        add_native_syslinks(t)
-        apply_sanitizer(t)
-        add_release_opts(t)
-    end)
+    add_rules("bytecask.native_flags")
 
 target("engine_bench")
     set_kind("binary")
@@ -387,11 +388,7 @@ target("engine_bench")
     else
         add_packages("benchmark", "crc32c", "zstd", "rocksdb")
     end
-    on_config(function(t)
-        add_native_syslinks(t)
-        apply_sanitizer(t)
-        add_release_opts(t)
-    end)
+    add_rules("bytecask.native_flags")
 
 -- Serial section of the write path under many writers: throughput, batch
 -- shape and group_writer_busy_us for a TPROC-C-shaped commit
@@ -402,11 +399,7 @@ target("commit_probe")
     add_files("benchmarks/commit_probe.cpp")
     add_engine_files()
     add_packages("crc32c", "zstd")
-    on_config(function(t)
-        add_native_syslinks(t)
-        apply_sanitizer(t)
-        add_release_opts(t)
-    end)
+    add_rules("bytecask.native_flags")
 
 -- Buffer pool sweep over pool_bytes / dataset_bytes. Deliberately independent
 -- of engine_bench: no RocksDB, no Google Benchmark, since this is a parameter
@@ -417,11 +410,7 @@ target("pool_bench")
     add_files("benchmarks/pool_bench.cpp")
     add_engine_files()
     add_packages("crc32c", "zstd")
-    on_config(function(t)
-        add_native_syslinks(t)
-        apply_sanitizer(t)
-        add_release_opts(t)
-    end)
+    add_rules("bytecask.native_flags")
 
 target("memory_profile")
     set_kind("binary")
@@ -430,11 +419,7 @@ target("memory_profile")
     add_engine_files()
     add_packages("crc32c", "zstd", "jemalloc")
     add_defines("BYTECASK_TESTING")
-    on_config(function(t)
-        add_native_syslinks(t)
-        apply_sanitizer(t)
-        add_release_opts(t)
-    end)
+    add_rules("bytecask.native_flags")
 
 -- Crash-consistency harness (tests/crash/crash_consistency.cpp): SIGKILLs a
 -- writer process at random points and checks the durable prefix on reopen.
@@ -448,11 +433,7 @@ target("crash_consistency")
     add_includedirs("bytecaskdb")
     add_packages("crc32c", "zstd")
     add_defines("BYTECASK_TESTING")
-    on_config(function(t)
-        add_native_syslinks(t)
-        apply_sanitizer(t)
-        add_release_opts(t)
-    end)
+    add_rules("bytecask.native_flags")
 
 -- Chaos worker (tests/chaos/chaos_worker.cpp): runs the crash workload on a
 -- chaosfs mount under I/O faults and power loss, and checks each process
@@ -465,11 +446,7 @@ target("chaos_worker")
     add_includedirs("bytecaskdb")
     add_packages("crc32c", "zstd")
     add_defines("BYTECASK_TESTING")
-    on_config(function(t)
-        add_native_syslinks(t)
-        apply_sanitizer(t)
-        add_release_opts(t)
-    end)
+    add_rules("bytecask.native_flags")
 
 -- Isolation history generator for Elle. See docs/isolation_checking_design.md.
 -- BYTECASK_TESTING exposes the fault injector the degrade nemesis arms.
@@ -481,11 +458,7 @@ target("isolation_history")
     add_includedirs("bytecaskdb")
     add_packages("crc32c", "zstd")
     add_defines("BYTECASK_TESTING")
-    on_config(function(t)
-        add_native_syslinks(t)
-        apply_sanitizer(t)
-        add_release_opts(t)
-    end)
+    add_rules("bytecask.native_flags")
 
 -- Static library target for out-of-tree consumers (e.g. the MariaDB plugin).
 -- Compiles all C++23 module sources and exposes them via libbytecask.a.
@@ -503,10 +476,8 @@ target("bytecask")
     add_files("bytecaskdb/bytecask_hpp.cpp")
     add_engine_files()
     add_packages("crc32c", "zstd")
+    add_rules("bytecask.native_flags")
     on_config(function(t)
-        add_native_syslinks(t)
-        apply_sanitizer(t)
-        add_release_opts(t)
         -- TLS descriptors: a thread_local in a dlopen'ed object otherwise
         -- costs a call to __tls_get_addr per access (2.8% of mariadbd's CPU on
         -- sysbench oltp_read_write). An ELF option, so Linux only (Darwin's
@@ -603,11 +574,7 @@ target("bytecaskdb_python")
     if is_host("macosx") then
         add_shflags("-undefined", "dynamic_lookup", {force = true})
     end
-    on_config(function(t)
-        add_native_syslinks(t)
-        apply_sanitizer(t)
-        add_release_opts(t)
-    end)
+    add_rules("bytecask.native_flags")
 
 -- Native Node.js addon via node-addon-api (N-API). Wraps the public PIMPL
 -- header (include/bytecask.hpp) and links against the bytecask static
