@@ -23,12 +23,15 @@ export import bytecask.sql.catalog;
 // One bound parameter: SQL NULL, an integer, a double or bytes.
 export using bc_value = std::variant<std::monostate, std::int64_t, double, bytecask::sql::Bytes>;
 
-// bc_plan.h declares these in the global module. A definition in the purview
-// would attach them to this module, a second declaration of the same name
-// that the compiler rejects; a linkage specification keeps them in the
-// global module ([module.unit]/7), where plan_api.cpp defines bc_ctx and
-// bc_ctx_affected as well.
-export extern "C++" {
+// bc_plan.h declares these in the global module. A definition in this
+// module's purview would attach them to the module, a second declaration of
+// the same entity the compiler rejects; a linkage specification keeps the
+// definitions in the global module ([basic.link]/10), where plan_api.cpp
+// defines bc_ctx and bc_ctx_affected too. The definitions are not exported: a
+// redeclaration of an entity the global module introduced cannot be
+// ([module.interface]/6). The using-declarations below export the names, as
+// the standard library's module exports its header-declared names.
+extern "C++" {
 
 // The open engine a context reads through and commits to. Not owned.
 struct bc_db {
@@ -49,6 +52,11 @@ struct bc_params {
 [[nodiscard]] auto bc_ctx_affected(const bc_ctx* cx) -> std::int64_t;
 
 }  // extern "C++"
+
+export using ::bc_db;
+export using ::bc_catalog;
+export using ::bc_params;
+export using ::bc_ctx_affected;
 
 export struct ApiSymbol {
   const char* name;
