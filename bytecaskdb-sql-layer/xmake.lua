@@ -29,13 +29,41 @@ package("libpg_query")
 package_end()
 add_requires("libpg_query 6.2.5", {optional = true})
 
+-- TinyCC: compiles plans in process (the run-time tier, #493). LGPL-2.1;
+-- linked statically here, which is acceptable for a prototype that does not
+-- ship. Pinned to a mob-branch commit: the last release, 0.9.27, is from 2017.
+package("tinycc")
+    set_homepage("https://bellard.org/tcc/")
+    set_urls("https://github.com/TinyCC/tinycc.git")
+    add_versions("2026.09.26", "9db1105c32afd3dcf0c28b8186f08e63c761b2b5")
+    add_links("tcc")
+    add_syslinks("dl", "pthread")
+    on_install("linux", function (package)
+        local cc = package:build_getenv("cc") or "cc"
+        os.vrunv("./configure", {"--prefix=" .. package:installdir(), "--cc=" .. cc})
+        os.vrunv("make", {"-j4"})
+        os.vrunv("make", {"install"})
+    end)
+    on_test(function (package)
+        assert(package:has_cfuncs("tcc_new", {includes = "libtcc.h"}))
+    end)
+package_end()
+add_requires("tinycc 2026.09.26", {optional = true})
+
 target("sql_layer")
     set_kind("static")
     set_default(false)
     add_deps("bytecask")
     add_includedirs("..", {public = true})
     add_files("codec/*.cpp", "catalog/*.cpp", "algebra/*.cpp", "sql/*.cpp", "plan/*.cpp")
-    add_packages("libpg_query", {public = true})
+    add_packages("libpg_query", "tinycc", {public = true})
+    add_defines("SQL_LAYER_ALGEBRA_DIR=\"" .. path.join(os.scriptdir(), "algebra") .. "\"")
+    on_config(function (t)
+        local tcc = t:pkg("tinycc")
+        if tcc then
+            t:add("defines", "SQL_LAYER_TCC_LIB_PATH=\"" .. path.join(tcc:installdir(), "lib", "tcc") .. "\"")
+        end
+    end)
 
 target("sql_layer_tests")
     set_kind("binary")
