@@ -8,15 +8,20 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <compare>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <optional>
 #include <random>
+#include <span>
 #include <tuple>
+#include <type_traits>
+#include <vector>
 
-#include "bytecaskdb-sql-layer/codec/key_codec.hpp"
-#include "bytecaskdb-sql-layer/codec/row_codec.hpp"
+import bytecask.sql.row_codec;
 
 using namespace bytecask::sql;
 

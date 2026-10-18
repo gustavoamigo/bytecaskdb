@@ -50,13 +50,20 @@ package("tinycc")
 package_end()
 add_requires("tinycc 2026.09.26", {optional = true})
 
+-- C++23 modules, as the engine: one interface unit per module
+-- (bytecask.sql.<name>), public so sql_layer_tests imports them. The one
+-- header is algebra/bc_plan.h, the C contract; the one plain translation unit
+-- is algebra/plan_api.cpp, its extern "C" definitions.
 target("sql_layer")
     set_kind("static")
     set_default(false)
+    set_policy("build.c++.modules", true)
     add_deps("bytecask")
     add_rules("bytecask.native_flags")
     add_includedirs("..", {public = true})
-    add_files("codec/*.cpp", "catalog/*.cpp", "algebra/*.cpp", "sql/*.cpp", "plan/*.cpp", "api/*.cpp")
+    add_files("codec/*.cppm", "catalog/*.cppm", "algebra/*.cppm", "sql/*.cppm", "plan/*.cppm", "api/*.cppm",
+              {public = true})
+    add_files("algebra/plan_api.cpp")
     add_packages("libpg_query", "tinycc", {public = true})
     add_defines("SQL_LAYER_ALGEBRA_DIR=\"" .. path.join(os.scriptdir(), "algebra") .. "\"")
     on_config(function (t)
@@ -73,7 +80,8 @@ target("sql_layer_tests")
     add_rules("bytecask.native_flags")
     add_packages("catch2")
     set_languages("c17", "c++23")
-    add_files("tests/*.cpp")
+    -- The tests, and the fixtures they share as modules (bytecask.sql.tests.*).
+    add_files("tests/*.cpp", "tests/*.cppm")
     -- The hand-written plans, compiled by clang as C. Every plan defines
     -- plan(); each is renamed so several link into one binary.
     add_includedirs("algebra")

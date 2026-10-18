@@ -10,10 +10,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <string>
+#include <vector>
 
-#include "bytecaskdb-sql-layer/plan/codegen.hpp"
-#include "bytecaskdb-sql-layer/plan/tcc_loader.hpp"
-#include "fixture.hpp"
+import bytecask.sql.codegen;
+import bytecask.sql.parser;
+import bytecask.sql.tcc_loader;
+import bytecask.sql.tests.fixture;
 
 using namespace bytecask::sql;
 

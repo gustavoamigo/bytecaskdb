@@ -4,7 +4,11 @@
 // The hand-written plans in plans/, compiled by clang into this binary, run
 // through bc_execute against the prototype's catalog.
 
-#include "dml_scenario.hpp"
+#include <catch2/catch_test_macros.hpp>
+
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+
+import bytecask.sql.tests.dml_scenario;
 
 extern "C" {
 void plan_insert(bc_ctx*);

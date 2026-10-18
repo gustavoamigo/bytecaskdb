@@ -3,8 +3,16 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include "bytecaskdb-sql-layer/sql/binder.hpp"
-#include "fixture.hpp"
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <variant>
+#include <vector>
+
+import bytecask.sql.binder;
+import bytecask.sql.parser;
+import bytecask.sql.tests.fixture;
 
 using namespace bytecask::sql;
 

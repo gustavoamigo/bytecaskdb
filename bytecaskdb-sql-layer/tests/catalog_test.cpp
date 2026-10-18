@@ -4,10 +4,17 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
-#include "bytecaskdb-sql-layer/catalog/catalog.hpp"
-#include "test_util.hpp"
+#include "include/bytecask.hpp"
+
+import bytecask.sql.catalog;
+import bytecask.sql.tests.util;
 
 using namespace bytecask::sql;
 using sql_test::bytes;

@@ -7,8 +7,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include "bytecaskdb-sql-layer/api/database.hpp"
-#include "test_util.hpp"
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <variant>
+#include <vector>
+
+import bytecask.sql.api;
+import bytecask.sql.tests.util;
 
 using namespace bytecask::sql;
 using sql_test::bytes;

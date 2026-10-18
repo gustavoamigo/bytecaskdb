@@ -8,7 +8,15 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include "fixture.hpp"
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <vector>
+
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+#include "include/bytecask.hpp"
+
+import bytecask.sql.tests.fixture;
 
 using namespace sql_test;
 using bytecask::sql::Bytes;
