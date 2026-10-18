@@ -71,12 +71,6 @@ jobs:
         run: |
           xmake build bytecask_tests
           xmake build btree_tests
-          # The SQL layer (bytecaskdb-sql-layer, #487), on the engine just
-          # built. -y confirms the libpg_query and TinyCC fetches; both are
-          # built from source. This job installs no MariaDB development
-          # package, and nothing under bytecaskdb-sql-layer/ may include a
-          # MariaDB header: building it here is what keeps that true.
-          xmake build -y sql_layer_tests
           # Built here so a break shows up on the PR; they run in
           # crash-nightly.yml, isolation-nightly.yml and chaos-nightly.yml.
           xmake build crash_consistency
@@ -89,8 +83,19 @@ jobs:
           status=0
           build/linux/x86_64/release/bytecask_tests --reporter junit --out test-results/bytecask_tests.xml || status=1
           build/linux/x86_64/release/btree_tests --reporter junit --out test-results/btree_tests.xml || status=1
-          build/linux/x86_64/release/sql_layer_tests --reporter junit --out test-results/sql_layer_tests.xml || status=1
           exit "$status"
+
+      - name: Build and run sql_layer_tests
+        # The SQL layer (bytecaskdb-sql-layer, #487), on the engine built
+        # above. -y confirms the libpg_query and TinyCC fetches; both are
+        # cloned and built from source, which is why this step comes after
+        # the engine suites have run: a fetch failure here costs the
+        # sql-layer result, not theirs. This job installs no MariaDB
+        # development package, and nothing under bytecaskdb-sql-layer/ may
+        # include a MariaDB header: building it here is what keeps that true.
+        run: |
+          xmake build -y sql_layer_tests
+          build/linux/x86_64/release/sql_layer_tests --reporter junit --out test-results/sql_layer_tests.xml
 
       - name: Every mutation's Guarded-by spec selects a test
         # Catch2 reads an unescaped comma in a spec as OR (#463); see
