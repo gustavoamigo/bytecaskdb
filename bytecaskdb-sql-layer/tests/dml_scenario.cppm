@@ -11,6 +11,7 @@ module;
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <span>
 #include <string_view>
 #include <utility>
 #include <variant>
@@ -38,20 +39,17 @@ inline constexpr std::uint32_t kTbl = 1;
 struct PlanRunner {
   Fixture& f;
   PlanSet plans;
-  std::uint32_t lay_pk_result;
-  std::uint32_t lay_range_result;
+  // The result types each SELECT declares in its bc_schema_ref.
+  std::vector<PhysType> pk_result{PhysType::I64, PhysType::I64};
+  std::vector<PhysType> range_result{PhysType::I64};
 
-  PlanRunner(Fixture& fx, PlanSet ps)
-      : f{fx},
-        plans{ps},
-        // Interned in the order the code generator meets them.
-        lay_pk_result{fx.cat.result_layout({PhysType::I64, PhysType::I64})},
-        lay_range_result{fx.cat.result_layout({PhysType::I64})} {}
+  PlanRunner(Fixture& fx, PlanSet ps) : f{fx}, plans{ps} {}
 
-  auto exec(bc_plan_fn plan, std::vector<bc_value> p) -> int {
+  auto exec(bc_plan_fn plan, std::vector<bc_value> p, std::span<const PhysType> result = {}) -> int {
     auto ps = params(std::move(p));
     std::uint32_t tables[] = {kTbl};
-    bc_schema_ref ref{f.cat.version(), tables, tables, 1, 1};
+    auto codes = type_codes(result);
+    bc_schema_ref ref{f.cat.version(), tables, tables, 1, 1, codes.data(), static_cast<std::uint32_t>(codes.size())};
     return bc_execute(f.cx, plan, &ref, &ps, {}, false, 3);
   }
 
@@ -59,13 +57,13 @@ struct PlanRunner {
     return exec(plans.insert, {id, std::move(name), std::move(qty)});
   }
   auto by_id(bc_value id) -> std::vector<Row> {
-    REQUIRE(exec(plans.select_by_id, {std::move(id)}) == BC_COMMITTED);
-    return f.results(lay_pk_result);
+    REQUIRE(exec(plans.select_by_id, {std::move(id)}, pk_result) == BC_COMMITTED);
+    return f.results(pk_result);
   }
   auto ids_in(std::string_view lo, std::string_view hi) -> std::vector<std::int64_t> {
-    REQUIRE(exec(plans.select_name_range, {bytes(lo), bytes(hi)}) == BC_COMMITTED);
+    REQUIRE(exec(plans.select_name_range, {bytes(lo), bytes(hi)}, range_result) == BC_COMMITTED);
     std::vector<std::int64_t> ids;
-    for (const auto& r : f.results(lay_range_result)) ids.push_back(std::get<std::int64_t>(r[0]));
+    for (const auto& r : f.results(range_result)) ids.push_back(std::get<std::int64_t>(r[0]));
     return ids;
   }
   auto affected(bc_plan_fn plan, std::vector<bc_value> p) -> std::int64_t {
@@ -102,8 +100,12 @@ inline void run_dml_scenario(Fixture& f, PlanSet plans) {
   CHECK(count_entries(*f.db, bytecask::sql::kNsRow, 1) == 5);
   CHECK(count_entries(*f.db, bytecask::sql::kNsIndex, 3) == 5);
 
-  // A duplicate primary key fails its guard on every attempt.
-  CHECK(p.insert(1, bytes("again"), std::int64_t{0}) == BC_CONFLICT);
+  // A duplicate primary key is a unique-constraint error on the table, raised
+  // by the plan from its snapshot check and never retried.
+  CHECK(p.insert(1, bytes("again"), std::int64_t{0}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
+  CHECK(bc_error_detail(f.cx) == ((std::uint32_t{BC_C_UNIQUE} << 24) | kTbl));
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, 1) == 5);
 
   CHECK(p.by_id(std::int64_t{1}) == std::vector<Row>{{std::int64_t{1}, std::int64_t{10}}});
   CHECK(p.by_id(std::int64_t{4}) == std::vector<Row>{{std::int64_t{4}, kNull}});

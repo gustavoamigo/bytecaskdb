@@ -77,7 +77,7 @@ TEST_CASE("plan API: an error is sticky and nothing is committed", "[sql][algebr
   Bytes out;
   Bytes key;
   bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
-  bytecask::sql::key_put_i64(key, 1, false);
+  bytecask::sql::key_put_i64(key, 1, {bytecask::sql::PhysType::I64});
   CHECK_FALSE(f.db->get({}, key, out));  // the row put before the error was not committed
 
   CHECK(run(f, insert_plan_ok, {std::int64_t{1}, bytes("a"), std::int64_t{5}}) == BC_COMMITTED);
@@ -108,14 +108,13 @@ TEST_CASE("plan API: a handle from an earlier execution is stale", "[sql][algebr
 
 namespace {
 void keep_view_across_step(bc_ctx* cx) {
-  // A plan cannot make an empty view, so "the whole table" is its prefix.
   bc_view all = bc_key_end(cx, bc_key_begin(cx, kTbl));
   bc_cursor c = bc_scan_open(cx, kTbl, all, all, BC_SCAN_PREFIX);
   bool first = true;
   bc_view kept = all;
   while (bc_scan_next(cx, c)) {
     if (!first) {
-      bc_emit_count(cx, bc_col_i64(cx, kept, 16));  // the previous entry's row: stale
+      bc_emit_count(cx, bc_col_i64(cx, kept, 20));  // the previous entry's row: stale
     }
     kept = bc_scan_value(cx, c);
     first = false;
@@ -131,7 +130,7 @@ void count_rows(bc_ctx* cx) {
   bc_emit_count(cx, n);
 }
 
-void unimplemented_call(bc_ctx* cx) { bc_pin(cx, bc_param_bytes(cx, 0)); }
+void unimplemented_call(bc_ctx* cx) { bc_sorter_open(cx, 1024); }
 }  // namespace
 
 TEST_CASE("plan API: a cursor's views die when it steps", "[sql][algebra]") {
@@ -159,7 +158,7 @@ TEST_CASE("plan API: the budget ends a plan, and scans stay inside their table",
   CHECK(bc_ctx_affected(f.cx) == -1);
 }
 
-TEST_CASE("plan API: calls outside the prototype set BC_E_HANDLE", "[sql][algebra]") {
+TEST_CASE("plan API: the ephemeral structures are not implemented yet and set BC_E_HANDLE", "[sql][algebra]") {
   Fixture f;
   CHECK(run(f, unimplemented_call, {bytes("x")}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
@@ -179,9 +178,9 @@ TEST_CASE("plan API: a plan compiled against another catalog version does not ru
   Fixture f;
   auto ps = params({std::int64_t{1}, bytes("a"), std::int64_t{5}});
   std::uint32_t tables[] = {kTbl};
-  bc_schema_ref stale{f.cat.version() - 1, nullptr, tables, 0, 1};
+  bc_schema_ref stale{f.cat.version() - 1, nullptr, tables, 0, 1, nullptr, 0};
   CHECK(bc_execute(f.cx, insert_plan_ok, &stale, &ps, {}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
-  bc_schema_ref live{f.cat.version(), nullptr, tables, 0, 1};
+  bc_schema_ref live{f.cat.version(), nullptr, tables, 0, 1, nullptr, 0};
   CHECK(bc_execute(f.cx, insert_plan_ok, &live, &ps, {}, false, 0) == BC_COMMITTED);
 }

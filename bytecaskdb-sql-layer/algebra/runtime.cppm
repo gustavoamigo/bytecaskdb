@@ -20,14 +20,13 @@ export module bytecask.sql.runtime;
 
 export import bytecask.sql.catalog;
 
-// One bound parameter: SQL NULL, an integer, a double or bytes.
-export using bc_value = std::variant<std::monostate, std::int64_t, double, bytecask::sql::Bytes>;
+// One bound parameter: SQL NULL, an integer, a double, a boolean or bytes.
+export using bc_value = std::variant<std::monostate, std::int64_t, double, bool, bytecask::sql::Bytes>;
 
 // bc_plan.h declares these in the global module. A definition in the purview
 // would attach them to this module, a second declaration of the same name
 // that the compiler rejects; a linkage specification keeps them in the
-// global module ([module.unit]/7), where plan_api.cpp defines bc_ctx and
-// bc_ctx_affected as well.
+// global module ([module.unit]/7), where plan_api.cpp defines bc_ctx as well.
 export extern "C++" {
 
 // The open engine a context reads through and commits to. Not owned.
@@ -44,10 +43,6 @@ struct bc_params {
   std::vector<bc_value> values;
 };
 
-// prototype: the affected-row count bc_emit_count recorded, or -1. The plan
-// API has no runtime call that reads it back; see the write-up on #497.
-[[nodiscard]] auto bc_ctx_affected(const bc_ctx* cx) -> std::int64_t;
-
 }  // extern "C++"
 
 export struct ApiSymbol {
@@ -58,4 +53,5 @@ export struct ApiSymbol {
 // Every plan-callable function of bc_plan.h, by name, for loaders that link a
 // plan at run time (TinyCC's tcc_add_symbol). Runtime calls (bc_ctx_*,
 // bc_execute, bc_error*) are left out: a plan never calls them.
+// tests/plan_api_test.cpp checks the table against the header.
 export [[nodiscard]] auto plan_api_symbols() -> std::span<const ApiSymbol>;
