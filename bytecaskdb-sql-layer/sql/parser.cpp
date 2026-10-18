@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// parser.cpp — parse()'s definition; see parser.cppm. The only unit, with
-// the interface's own global module fragment excepted, that sees libpg_query's
-// and protobuf-c's headers.
+// parser.cpp — parse()'s definition; see parser.cppm. The only unit that
+// sees libpg_query's and protobuf-c's headers.
 
 module;
 #include <cstddef>

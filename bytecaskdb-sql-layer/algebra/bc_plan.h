@@ -5,7 +5,7 @@
    in a restricted subset of C that calls these functions and nothing else.
    Declarations are the document's, verbatim; bc_db, bc_catalog and bc_params,
    which the document uses but does not declare, are opaque here and built by
-   the runtime (runtime.hpp).
+   the runtime (algebra/runtime.cppm, module bytecask.sql.runtime).
 
    prototype (#497): the calls the seven statements of the prototype need are
    implemented; every other call sets BC_E_HANDLE and returns a neutral value. */
