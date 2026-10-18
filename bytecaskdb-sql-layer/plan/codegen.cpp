@@ -39,10 +39,21 @@ auto suffix(PhysType t) -> std::string {
   return "i64";
 }
 
+// Text for the plan's header comment: SQL and names are the user's, and a
+// "*/" in them would end the comment.
+auto comment_safe(std::string_view s) -> std::string {
+  std::string out;
+  for (std::size_t i = 0; i < s.size(); ++i) {
+    out.push_back(s[i]);
+    if (s[i] == '*' && i + 1 < s.size() && s[i + 1] == '/') out.push_back(' ');
+  }
+  return out;
+}
+
 // Writes the body line by line, and records which catalog constants it used.
 class Writer {
 public:
-  explicit Writer(const Catalog& cat, const Table& t) : cat_{cat}, t_{t} {}
+  explicit Writer(const Table& t) : t_{t} {}
 
   void line(const std::string& s) { body_ += std::string(2 * depth_, ' ') + s + "\n"; }
   void open(const std::string& s) {
@@ -59,19 +70,19 @@ public:
     ++depth_;
   }
 
-  // Constant names, recorded as used; a column's constants record the column
-  // for the plan's bc_schema_ref.
-  auto tbl() -> std::string { return use("TBL_" + up(t_.name)); }
-  auto lay() -> std::string { return use("LAY_" + up(t_.name)); }
-  auto idx(const Index& ix) -> std::string { return use("IDX_" + up(ix.name)); }
+  // Constant names (Catalog::constants: from ids, never from SQL names),
+  // recorded as used; a column's constants record the column for the plan's
+  // bc_schema_ref.
+  auto tbl() -> std::string { return use("TBL_" + std::to_string(t_.id)); }
+  auto lay() -> std::string { return use("LAY_" + std::to_string(t_.layout_id)); }
+  auto idx(const Index& ix) -> std::string { return use("IDX_" + std::to_string(ix.id)); }
   auto col(std::uint32_t id) -> std::string {
     cols_.insert(id);
-    return use(up(t_.name) + "_" + up(t_.column(id)->name) + "_COL");
+    return use(column_prefix(id) + "_COL");
   }
   auto pos(std::uint32_t id) -> std::string {
     cols_.insert(id);
-    const auto* c = t_.column(id);
-    return use(up(t_.name) + "_" + up(c->name) + (is_fixed(c->type) ? "_OFF" : "_SLOT"));
+    return use(column_prefix(id) + (is_fixed(t_.column(id)->type) ? "_OFF" : "_SLOT"));
   }
   // A table or index the plan reads.
   void reads(std::uint32_t id) { reads_.insert(id); }
@@ -92,27 +103,40 @@ public:
   auto constants() const -> std::string {
     std::string out = "enum { ";
     auto first = true;
-    for (const auto& [name, value] : cat_.constants(t_)) {
-      if (!used_.contains(name)) continue;
-      out += (first ? "" : ", ") + name + " = " + std::to_string(value);
+    for (const auto& c : Catalog::constants(t_)) {
+      if (!used_.contains(c.name)) continue;
+      out += (first ? "" : ", ") + c.name + " = " + std::to_string(c.value);
       first = false;
     }
     return out + " };";
   }
 
+  // What each constant the plan uses stands for, for the header comment:
+  // "TBL_1 t, IDX_3 t_by_name, COL_1_1 t.name". A column's _OFF/_SLOT and
+  // _COL constants share one entry.
+  auto legend() const -> std::string {
+    std::string out;
+    std::set<std::string> seen;
+    for (const auto& c : Catalog::constants(t_)) {
+      if (!used_.contains(c.name)) continue;
+      auto key = c.name.starts_with("COL_") ? c.name.substr(0, c.name.rfind('_')) : c.name;
+      if (!seen.insert(key).second) continue;
+      out += (out.empty() ? "" : ", ") + key + " " + c.object;
+    }
+    return out;
+  }
+
   [[nodiscard]] auto body() const -> const std::string& { return body_; }
 
 private:
-  static auto up(std::string s) -> std::string {
-    for (auto& ch : s) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-    return s;
+  auto column_prefix(std::uint32_t id) const -> std::string {
+    return "COL_" + std::to_string(t_.id) + "_" + std::to_string(id);
   }
   auto use(std::string name) -> std::string {
     used_.insert(name);
     return name;
   }
 
-  const Catalog& cat_;
   const Table& t_;
   std::string body_;
   std::size_t depth_{1};
@@ -527,10 +551,11 @@ auto generate_plan(const bound::Bound& b, const Catalog& cat, std::string_view s
   out.param_types = b.param_types;
   out.catalog_version = cat.version();
   auto build = [&](const Table& t, auto&& body) {
-    Writer w{cat, t};
+    Writer w{t};
     body(w);
-    out.source = "/* " + std::string{sql} + "\n   isolation: snapshot   schema: catalog v" +
-                 std::to_string(cat.version()) + " */\n#include \"bc_plan.h\"\n" + w.constants() +
+    out.source = "/* " + comment_safe(sql) + "\n   isolation: snapshot   schema: catalog v" +
+                 std::to_string(cat.version()) + "\n   objects: " + comment_safe(w.legend()) +
+                 " */\n#include \"bc_plan.h\"\n" + w.constants() +
                  "\n\nvoid plan(bc_ctx *cx) {\n" + w.body() + "}\n";
     out.objects_read = w.objects_read();
     out.columns = w.columns_used();

@@ -85,14 +85,14 @@ void check_schema(const Catalog& cat) {
   // Every table fits its layout with room to add columns.
   for (const auto& [id, t] : cat.tables()) CHECK(t.layout.id_ceiling() >= t.next_col_id + 16);
   // The constants a hand-written plan on customer names.
-  auto cs = cat.constants(c);
-  auto has = [&](std::string_view n) {
-    return std::ranges::any_of(cs, [&](const auto& kv) { return kv.first == n; });
+  auto cs = Catalog::constants(c);
+  auto has = [&](std::string_view object) {
+    return std::ranges::any_of(cs, [&](const auto& k) { return k.object == object; });
   };
-  CHECK(has("TBL_CUSTOMER"));
-  CHECK(has("IDX_CUSTOMER_I2"));
-  CHECK(has("CUSTOMER_C_BALANCE_OFF"));
-  CHECK(has("CUSTOMER_C_LAST_SLOT"));
+  CHECK(has("customer"));
+  CHECK(has("customer_i2"));
+  CHECK(has("customer.c_balance"));
+  CHECK(has("customer.c_last"));
 }
 
 auto i(std::int64_t v) -> Value { return v; }

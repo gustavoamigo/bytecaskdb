@@ -535,8 +535,9 @@ for the subset; a file it rejects never reaches a compiler. The rules are
 the language's definition, and the C compiler is a backend for programs that
 already passed them.
 
-**Structure.** One comment with the SQL text, the isolation level and the
-schema version the plan was compiled against; `#include "bc_plan.h"` and nothing else; one `enum` of
+**Structure.** One comment with the SQL text, the isolation level, the
+schema version the plan was compiled against and the objects its constants
+stand for; `#include "bc_plan.h"` and nothing else; one `enum` of
 catalog constants; one function `void plan(bc_ctx *cx)`. A plan file is its
 own compilation unit, and `plan` is the only symbol it exports; a loader
 compiles one file per plan, and a build that links several plans into one
@@ -589,34 +590,36 @@ Payment's customer lookup by last name, serializable:
 /* SELECT c_id, c_first, c_balance FROM customer
    WHERE c_w_id = $1 AND c_d_id = $2 AND c_last = $3
    ORDER BY c_first LIMIT 1 OFFSET (count / 2)
-   isolation: serializable   schema: customer v7   */
+   isolation: serializable   schema: customer v7
+   objects: TBL_7 customer, IDX_12 cust_by_name, COL_7_0 customer.c_id,
+            COL_7_3 customer.c_first, COL_7_16 customer.c_balance */
 #include "bc_plan.h"
-enum { TBL_CUSTOMER = 7, IDX_CUST_BY_NAME = 12,
-       CUST_ID_OFF = 24, CUST_BALANCE_OFF = 40, CUST_FIRST_SLOT = 1 };
+enum { TBL_7 = 7, IDX_12 = 12,
+       COL_7_0_OFF = 24, COL_7_16_OFF = 40, COL_7_3_SLOT = 1 };
 
 void plan(bc_ctx *cx) {
-  bc_key kb = bc_key_begin(cx, IDX_CUST_BY_NAME);
+  bc_key kb = bc_key_begin(cx, IDX_12);
   bc_key_i64(cx, kb, bc_param_i64(cx, 0));
   bc_key_i64(cx, kb, bc_param_i64(cx, 1));
   bc_key_bytes(cx, kb, bc_param_bytes(cx, 2));
   bc_view prefix = bc_key_end(cx, kb);
 
   bc_sorter s = bc_sorter_open(cx, 65536);
-  bc_cursor c = bc_scan_open(cx, IDX_CUST_BY_NAME, prefix, prefix, BC_SCAN_PREFIX);
+  bc_cursor c = bc_scan_open(cx, IDX_12, prefix, prefix, BC_SCAN_PREFIX);
   while (bc_scan_next(cx, c)) {                                   /* 1 read per step */
     bool found = false;
-    bc_view row = bc_lookup(cx, TBL_CUSTOMER, bc_scan_pk(cx, c), &found);   /* 1 read */
-    bc_sorter_add(cx, s, bc_col_bytes(cx, row, CUST_FIRST_SLOT), row);
+    bc_view row = bc_lookup(cx, TBL_7, bc_scan_pk(cx, c), &found);   /* 1 read */
+    bc_sorter_add(cx, s, bc_col_bytes(cx, row, COL_7_3_SLOT), row);
   }
-  bc_guard_range(cx, IDX_CUST_BY_NAME, prefix, bc_key_successor(cx, prefix));  /* serializable */
+  bc_guard_range(cx, IDX_12, prefix, bc_key_successor(cx, prefix));  /* serializable */
 
   int64_t n = bc_sorter_count(cx, s);
   if (n == 0) return;
   bc_view mid = bc_sorter_nth(cx, s, bc_div(cx, n, 2));
   bc_emit_begin(cx);
-  bc_emit_i64(cx, bc_col_i64(cx, mid, CUST_ID_OFF));
-  bc_emit_bytes(cx, bc_col_bytes(cx, mid, CUST_FIRST_SLOT));
-  bc_emit_f64(cx, bc_col_f64(cx, mid, CUST_BALANCE_OFF));
+  bc_emit_i64(cx, bc_col_i64(cx, mid, COL_7_0_OFF));
+  bc_emit_bytes(cx, bc_col_bytes(cx, mid, COL_7_3_SLOT));
+  bc_emit_f64(cx, bc_col_f64(cx, mid, COL_7_16_OFF));
   bc_emit_end(cx);
 }
 ```
@@ -896,3 +899,7 @@ and the API changed where implementing them showed a gap.
   `bc_guard_absent` on one key cannot see a duplicate.
 - Secondary keys stay `0x03 index_id`; the plugin's table-id prefix is not
   adopted.
+- A plan's constants are named from ids (`TBL_<table>`, `LAY_<layout>`,
+  `IDX_<index>`, `COL_<table>_<column>_OFF|_SLOT|_COL`), with the objects
+  they stand for listed in the header comment: a SQL name need not be a C
+  identifier, and two names cannot produce the same constant.

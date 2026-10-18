@@ -20,7 +20,7 @@ GPL-2.0, and nothing of it is copied.
 | Field | Meaning |
 |---|---|
 | `id` | Permanent object id, from the one counter below. Never reused. |
-| `name` | Folded to lower case, as SQL folds an unquoted identifier. Letters, digits and underscores, not starting with a digit: generated plans name objects by C constants built from names (`TBL_T`, `IDX_T_BY_NAME`, `T_QTY_COL`), so a DDL whose names would not make an identifier, or would give one table two equal constants (table `idx` with column `foo`, and an index `foo_col`), is refused. |
+| `name` | Folded to lower case, as SQL folds an unquoted identifier; any bytes otherwise. Plans never paste a name into C: their constants are named from ids (`TBL_1`, `LAY_2`, `IDX_3`, `COL_1_2_OFF`, `COL_1_2_COL`), so a name need not be an identifier and two objects' constants cannot collide. The plan's header comment lists what each constant stands for. |
 | `version` | Per-table counter, bumped by every DDL on the table. Not checked by plans (see *Compatibility*); kept for stage 2. |
 | `next_col_id` | The next column id. Column ids are permanent and never reused, even after a column is dropped. |
 | columns | Each: permanent `id`, `name`, SQL type (kind, `VARCHAR` length, `DECIMAL` precision and scale), nullability, default. The physical type follows from the SQL type (`docs/sql_layer_types_design.md`, *Stage-1 types*). |
@@ -197,8 +197,9 @@ Two rules make a pinned version agree with the engine:
    to be recompiled. One record read per table written, the price of never
    committing rows shaped by a catalog the engine has moved past.
 
-DDL statements are serialized by a mutex in `LiveCatalog`; the engine's
-directory lock keeps a second process out.
+DDL statements are serialized by a mutex in `LiveCatalog`, held from the
+prepare to the publication, so a DDL never conflicts with another of the
+same catalog; the engine's directory lock keeps a second process out.
 
 ## Compatibility
 
@@ -300,7 +301,8 @@ byte, with a bad type code, an unknown key column or trailing bytes, and a
 format-2 record, are refused; each DDL survives a reopen; a DDL refused by
 the engine (a follower) leaves nothing on disk or in memory; a drop leaves
 no key under the table's or index's prefix; the name entries and the
-records agree; a backfill raced by a write, and a DDL raced by another
+records agree; a reader pinned while a DDL is held mid-commit returns at once
+on the old version; concurrent DDL each get the version they published; a backfill raced by a write, and a DDL raced by another
 catalog's, are conflicts. `tests/plan_api_test.cpp`: each compatibility
 rule, and a write committed across a DDL on its table is a conflict.
 `tests/api_test.cpp`: through SQL, `ADD COLUMN` keeps every cached plan,

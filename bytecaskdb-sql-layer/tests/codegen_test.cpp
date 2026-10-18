@@ -98,11 +98,11 @@ TEST_CASE("codegen: the other bound forms produce plans; no rule, no plan", "[sq
   // A column not given keeps the default bc_row_begin wrote; its key part is
   // read back from the row.
   auto partial = generate(f.cat(), "INSERT INTO t (id) VALUES ($1)").source;
-  CHECK(partial.find("bc_row_set_null(cx, r0, T_NAME_COL);") == std::string::npos);
-  CHECK(partial.find("if (bc_col_null(cx, row, T_NAME_COL)) {\n    bc_key_null(cx, k1);\n  } else {\n    "
-                     "bc_key_bytes(cx, k1, bc_col_bytes(cx, row, T_NAME_SLOT));") != std::string::npos);
+  CHECK(partial.find("bc_row_set_null(cx, r0, COL_1_1_COL);") == std::string::npos);
+  CHECK(partial.find("if (bc_col_null(cx, row, COL_1_1_COL)) {\n    bc_key_null(cx, k1);\n  } else {\n    "
+                     "bc_key_bytes(cx, k1, bc_col_bytes(cx, row, COL_1_1_SLOT));") != std::string::npos);
   // A duplicate key is checked on the snapshot and raised, then guarded for the race.
-  CHECK(partial.find("if (bc_exists(cx, pk)) {\n    bc_raise(cx, BC_C_UNIQUE, TBL_T);\n    return;\n  }") != std::string::npos);
+  CHECK(partial.find("if (bc_exists(cx, pk)) {\n    bc_raise(cx, BC_C_UNIQUE, TBL_1);\n    return;\n  }") != std::string::npos);
   CHECK(partial.find("bc_guard_absent(cx, pk);") != std::string::npos);
 
   CHECK_THROWS_AS(generate(f.cat(), "SELECT id FROM t WHERE qty = $1"), ast::SqlError);

@@ -68,12 +68,6 @@ auto fold(std::string_view name) -> std::string {
   return s;
 }
 
-auto upper(std::string_view name) -> std::string {
-  std::string s{name};
-  for (auto& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-  return s;
-}
-
 [[noreturn]] void corrupt(const std::string& what) { throw std::runtime_error("catalog: " + what); }
 
 // Stored name bytes as the string they were written from: the one place the
@@ -284,20 +278,6 @@ auto reserve_ids(std::uint64_t& next_id, std::uint32_t n) -> std::uint32_t {
   if (first + n - 1 > Catalog::kMaxObjectId) throw std::length_error("catalog object ids exhausted");
   next_id += n;
   return static_cast<std::uint32_t>(first);
-}
-
-// A name a generated plan can paste into a C identifier (TBL_, IDX_,
-// <TABLE>_<COLUMN>_COL): what an unquoted SQL identifier folds to.
-void check_name(const std::string& n) {
-  auto ok = !n.empty() && (std::islower(static_cast<unsigned char>(n[0])) != 0 || n[0] == '_') &&
-            std::ranges::all_of(n, [](char ch) {
-              auto c = static_cast<unsigned char>(ch);
-              return std::islower(c) != 0 || std::isdigit(c) != 0 || ch == '_';
-            });
-  if (!ok) {
-    throw std::invalid_argument("name \"" + n +
-                                "\" is not supported: letters, digits and underscores, not starting with a digit");
-  }
 }
 
 void check_column_spec(const ColumnSpec& c) {
@@ -742,16 +722,17 @@ auto Catalog::table_of_layout(std::uint32_t layout_id) const -> const Table* {
   return it == layout_tables_.end() ? nullptr : table(it->second);
 }
 
-auto Catalog::constants(const Table& t) const -> std::vector<std::pair<std::string, std::uint32_t>> {
-  std::vector<std::pair<std::string, std::uint32_t>> out;
-  out.emplace_back("TBL_" + upper(t.name), t.id);
-  out.emplace_back("LAY_" + upper(t.name), t.layout_id);
-  for (const auto& ix : t.indexes) out.emplace_back("IDX_" + upper(ix.name), ix.id);
+auto Catalog::constants(const Table& t) -> std::vector<PlanConstant> {
+  std::vector<PlanConstant> out;
+  auto id = [](std::uint32_t v) { return std::to_string(v); };
+  out.push_back({"TBL_" + id(t.id), t.id, t.name});
+  out.push_back({"LAY_" + id(t.layout_id), t.layout_id, t.name + " layout"});
+  for (const auto& ix : t.indexes) out.push_back({"IDX_" + id(ix.id), ix.id, ix.name});
   for (const auto& c : t.columns) {
     const auto* slot = t.layout.find(c.id);
-    auto suffix = is_fixed(c.type) ? "_OFF" : "_SLOT";
-    out.emplace_back(upper(t.name) + "_" + upper(c.name) + suffix, slot->pos);
-    out.emplace_back(upper(t.name) + "_" + upper(c.name) + "_COL", c.id);
+    auto prefix = "COL_" + id(t.id) + "_" + id(c.id);
+    out.push_back({prefix + (is_fixed(c.type) ? "_OFF" : "_SLOT"), slot->pos, t.name + "." + c.name});
+    out.push_back({prefix + "_COL", c.id, t.name + "." + c.name});
   }
   return out;
 }
@@ -760,17 +741,6 @@ auto Catalog::constants(const Table& t) const -> std::vector<std::pair<std::stri
 
 auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<DdlOp>& ops, bool& backfill) const
     -> std::shared_ptr<const Catalog> {
-  // A plan on a table names its objects by constants built from their names:
-  // two that print the same (table idx with column foo, index foo_col) would
-  // make every plan on the table fail to compile.
-  auto check_constants = [&](const Table& t) {
-    std::vector<std::string> names;
-    for (const auto& kv : constants(t)) names.push_back(kv.first);
-    std::ranges::sort(names);
-    if (auto dup = std::ranges::adjacent_find(names); dup != names.end()) {
-      throw std::invalid_argument("names on table \"" + t.name + "\" give the plan constant " + *dup + " twice");
-    }
-  };
   auto next = std::make_shared<Catalog>(clone());
   next->version_ = version_ + 1;
   auto finish = [&] {
@@ -791,7 +761,6 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
 
   if (const auto* ct = std::get_if<CreateTableDdl>(&ddl)) {
     auto name = fold(ct->name);
-    check_name(name);
     name_free(name);
     if (ct->columns.empty() || ct->pk.empty()) throw std::invalid_argument("a table needs columns and a primary key");
     Table t;
@@ -800,7 +769,6 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     for (const auto& spec : ct->columns) {
       check_column_spec(spec);
       auto cname = fold(spec.name);
-      check_name(cname);
       if (t.column(cname) != nullptr) throw std::invalid_argument("column \"" + cname + "\" specified more than once");
       auto in_pk = std::ranges::any_of(ct->pk, [&](const std::string& p) { return fold(p) == cname; });
       Column c{t.next_col_id++, cname, spec.sql, phys_type(spec.sql), spec.nullable && !in_pk, spec.default_value};
@@ -821,14 +789,12 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     put_op(ops, DdlOp::Kind::EnsureAbsent, name_entry_key(name));
     put_op(ops, DdlOp::Kind::Put, name_entry_key(name), name_value(kKindTable, t.id));
     put_op(ops, DdlOp::Kind::Put, table_record_key(t.id), serialize_table(t));
-    check_constants(t);
     next->put_table(std::move(t));
     return finish();
   }
 
   if (const auto* ci = std::get_if<CreateIndexDdl>(&ddl)) {
     auto name = fold(ci->name);
-    check_name(name);
     name_free(name);
     auto t = find_table(ci->table);
     if (ci->columns.empty()) throw std::invalid_argument("an index needs columns");
@@ -867,7 +833,6 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       put_op(ops, DdlOp::Kind::Put, std::move(k));
     });
     guard_rows(ops, t.id);
-    check_constants(t);
     next->put_table(std::move(t));
     return finish();
   }
@@ -916,7 +881,6 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   auto t = find_table(ac.table);
   check_column_spec(ac.column);
   auto cname = fold(ac.column.name);
-  check_name(cname);
   if (t.column(cname) != nullptr) {
     throw std::invalid_argument("column \"" + cname + "\" of relation \"" + t.name + "\" already exists");
   }
@@ -952,7 +916,6 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     });
     guard_rows(ops, t.id);
   }
-  check_constants(t);
   next->put_table(std::move(t));
   return finish();
 }
@@ -1019,10 +982,15 @@ auto LiveCatalog::prepare(const Ddl& ddl) const -> Prepared {
 }
 
 auto LiveCatalog::commit(Prepared p) -> bool {
-  if (!p.next) return true;  // a no-op
   std::lock_guard<std::mutex> lock{ddl_mu_};
+  return commit_locked(std::move(p));
+}
+
+auto LiveCatalog::commit_locked(Prepared p) -> bool {
+  if (!p.next) return true;  // a no-op
   if (current() != p.base) return false;  // another DDL published since the prepare
   gen_.fetch_add(1);
+  if (commit_hook_) commit_hook_();
   auto done = [&] {
     gen_.fetch_add(1);
     gen_.notify_all();
@@ -1047,11 +1015,15 @@ auto LiveCatalog::commit(Prepared p) -> bool {
 }
 
 auto LiveCatalog::apply(const Ddl& ddl) -> std::shared_ptr<const Catalog> {
+  // One DDL at a time from prepare to publication, so a retry is only ever
+  // for a write that raced a backfill, never for another DDL of this
+  // catalog. Readers do not take this lock.
+  std::lock_guard<std::mutex> lock{ddl_mu_};
   for (int attempt = 0; attempt < kDdlAttempts; ++attempt) {
     auto p = prepare(ddl);
     if (!p.next) return p.base;
-    auto next = p.next;  // what this DDL publishes; current() may be a later DDL's by the time it returns
-    if (commit(std::move(p))) return next;
+    auto next = p.next;  // what this DDL publishes; current() may be a later DDL's once the lock is released
+    if (commit_locked(std::move(p))) return next;
   }
   throw std::runtime_error("DDL conflicted with concurrent writes on every attempt");
 }

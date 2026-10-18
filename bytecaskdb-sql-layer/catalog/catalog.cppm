@@ -22,6 +22,7 @@ module;
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -205,9 +206,17 @@ public:
   // entries). 2 was #490's, 1 the prototype's; both are refused.
   static constexpr std::uint16_t kRecordFormat = 3;
 
-  // The constants a plan on this table needs, in the names generated plans
-  // use: TBL_, LAY_, IDX_, and per column <COL>_OFF or <COL>_SLOT and <COL>_COL.
-  [[nodiscard]] auto constants(const Table& t) const -> std::vector<std::pair<std::string, std::uint32_t>>;
+  // The constants a plan on this table needs, named from ids alone so that
+  // no table, index or column name has to be a C identifier and no two can
+  // collide: TBL_<table>, LAY_<layout>, IDX_<index>, and per column
+  // COL_<table>_<column>_OFF or _SLOT, and _COL. `object` is what the name
+  // stands for, for the plan's header comment.
+  struct PlanConstant {
+    std::string name;
+    std::uint32_t value;
+    std::string object;
+  };
+  [[nodiscard]] static auto constants(const Table& t) -> std::vector<PlanConstant>;
 
   // One operation of a DDL's batch, collected while the snapshot is read and
   // handed to a WritePlan on that snapshot afterwards.
@@ -287,11 +296,19 @@ public:
 
   static constexpr int kDdlAttempts = 3;
 
+  // Test seam: called during every commit after the generation counter
+  // turns odd and before the batch reaches the engine, under the DDL lock.
+  // Lets a test hold a DDL mid-commit. Not thread-safe to set while DDL runs.
+  void set_commit_hook_for_testing(std::function<void()> hook) { commit_hook_ = std::move(hook); }
+
 private:
   DB& db_;
   mutable std::mutex mu_;  // guards current_; held only to copy or swap it
   std::shared_ptr<const Catalog> current_;
-  std::mutex ddl_mu_;  // one commit at a time
+  [[nodiscard]] auto commit_locked(Prepared p) -> bool;
+
+  std::mutex ddl_mu_;  // one DDL at a time: apply holds it from prepare to publication
+  std::function<void()> commit_hook_;
   // Odd from just before a DDL's batch reaches the engine until current_
   // is swapped (or the commit fails).
   mutable std::atomic<std::uint64_t> gen_{0};

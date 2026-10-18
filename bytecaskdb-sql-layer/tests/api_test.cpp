@@ -108,12 +108,12 @@ TEST_CASE("embedded API: a cached plan is recompiled after DDL", "[sql][api]") {
   auto db = Database::open(dir.path());
   (void)db->execute(kCreateTable);
   const auto& insert = db->prepare(kInsert);
-  CHECK(insert.plan_source().find("IDX_T_BY_NAME") == std::string::npos);
+  CHECK(insert.plan_source().find("IDX_3") == std::string::npos);
   (void)db->execute(insert, {i(1), bytes("apple"), i(10)});
   // The index is created after the plan: the INSERT must now maintain it.
   (void)db->execute(kCreateIndex);
   (void)db->execute(insert, {i(2), bytes("apple"), i(20)});
-  CHECK(insert.plan_source().find("IDX_T_BY_NAME") != std::string::npos);
+  CHECK(insert.plan_source().find("IDX_3") != std::string::npos);
   // Row 1 was backfilled by CREATE INDEX, row 2 by the recompiled INSERT.
   CHECK(ids(db->execute(kByName, {bytes("apple"), bytes("apple\x01")})) == std::vector<std::int64_t>{1, 2});
 }
@@ -156,6 +156,11 @@ TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[
   // the table's write plans.
   (void)db->execute("DROP INDEX t_by_name");
   CHECK_THROWS_AS(db->execute(by_name, {bytes("a"), bytes("b")}), ast::SqlError);
+  // A failed recompile keeps the statement's old plan whole and still
+  // incompatible: the next execute tries again and fails the same way,
+  // never running the old code (ASan checks the schema ref it reads).
+  CHECK_THROWS_AS(db->execute(by_name, {bytes("a"), bytes("b")}), ast::SqlError);
+  CHECK(by_name.plan_source().find("IDX_3") != std::string::npos);
   CHECK(db->execute(insert, {i(4), bytes("date"), i(40)}).affected == 1);
   CHECK(db->execute(by_id, {i(4)}).rows == Grid{{i(4), i(40)}});
 
@@ -264,4 +269,24 @@ TEST_CASE("embedded API: ranges on a DESC index part, nullable and not", "[sql][
   db->close();
   db = Database::open(dir.path());
   check_all();
+}
+
+TEST_CASE("embedded API: names that are not C identifiers work end to end", "[sql][api][catalog]") {
+  sql_test::TempDir dir{"api_names"};
+  auto db = Database::open(dir.path());
+  (void)db->execute(R"(CREATE TABLE "a-b c" ("my id" BIGINT PRIMARY KEY, "x*/y" BYTEA, "1st" BIGINT))");
+  (void)db->execute(R"(CREATE UNIQUE INDEX "the index" ON "a-b c" ("x*/y"))");
+  constexpr auto kIns = R"(INSERT INTO "a-b c" VALUES ($1, $2, $3))";
+  CHECK(db->execute(kIns, {i(1), bytes("p"), i(10)}).affected == 1);
+  CHECK(db->execute(kIns, {i(2), bytes("q"), i(20)}).affected == 1);
+  CHECK_THROWS_AS(db->execute(kIns, {i(3), bytes("q"), i(30)}), ExecError);
+  // The header comment names the objects, with the "*/" in a name defused.
+  const auto& ins = db->prepare(kIns);
+  CHECK(ins.plan_source().find("a-b c.x* /y") != std::string::npos);
+  CHECK(ids(db->execute(R"(SELECT "my id" FROM "a-b c" WHERE "x*/y" >= $1 AND "x*/y" < $2)", {bytes("a"), bytes("z")})) ==
+        std::vector<std::int64_t>{1, 2});
+  CHECK(db->execute(R"(UPDATE "a-b c" SET "1st" = "1st" - $2 WHERE "my id" = $1)", {i(1), i(3)}).affected == 1);
+  CHECK(db->execute(R"(SELECT "1st" FROM "a-b c" WHERE "my id" = $1)", {i(1)}).rows == Grid{{i(7)}});
+  CHECK(db->execute(R"(DELETE FROM "a-b c" WHERE "my id" = $1)", {i(2)}).affected == 1);
+  (void)db->execute(R"(DROP TABLE "a-b c")");
 }

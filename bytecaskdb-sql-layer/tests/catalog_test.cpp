@@ -9,12 +9,16 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <future>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -40,10 +44,10 @@ auto create_t() -> CreateTableDdl {
   return {"t", {col("id", SqlKind::BigInt), col("name", SqlKind::Bytea), col("qty", SqlKind::BigInt)}, {"id"}};
 }
 
-auto constant(const std::vector<std::pair<std::string, std::uint32_t>>& cs, std::string_view n) -> std::uint32_t {
-  auto it = std::ranges::find(cs, n, &std::pair<std::string, std::uint32_t>::first);
+auto constant(const std::vector<Catalog::PlanConstant>& cs, std::string_view n) -> std::uint32_t {
+  auto it = std::ranges::find(cs, n, &Catalog::PlanConstant::name);
   REQUIRE(it != cs.end());
-  return it->second;
+  return it->value;
 }
 
 // A row of t, written straight to the engine.
@@ -205,27 +209,93 @@ TEST_CASE("catalog: counters of the wrong width or past the id ceiling are refus
   }
 }
 
-TEST_CASE("catalog: names must be plan identifiers, and a table's plan constants distinct", "[sql][catalog]") {
+TEST_CASE("catalog: any name is accepted; plan constants come from ids and never collide", "[sql][catalog]") {
   sql_test::TempDir dir{"catalog_idents"};
   auto db = DB::open(dir.path());
   LiveCatalog live{db};
-  CHECK_THROWS_AS(live.apply(CreateTableDdl{"a-b", {col("k", SqlKind::BigInt)}, {"k"}}), std::invalid_argument);
-  CHECK_THROWS_AS(live.apply(CreateTableDdl{"t2", {col("my col", SqlKind::BigInt)}, {"my col"}}), std::invalid_argument);
-  CHECK_THROWS_AS(live.apply(CreateTableDdl{"1t", {col("k", SqlKind::BigInt)}, {"k"}}), std::invalid_argument);
+  (void)live.apply(CreateTableDdl{"a-b c", {col("my col", SqlKind::BigInt, false), col("x*/y", SqlKind::BigInt)},
+                                  {"my col"}});
+  // Table idx with column foo, and an index foo_col: by name both would be
+  // IDX_FOO_COL; by id they are COL_<t>_<c>_COL and IDX_<i>.
   (void)live.apply(CreateTableDdl{"idx", {col("foo", SqlKind::BigInt, false), col("v", SqlKind::BigInt)}, {"foo"}});
-  CHECK_THROWS_AS(live.apply(CreateIndexDdl{"my idx", "idx", {{"v"}}}), std::invalid_argument);
-  // Table idx's column foo is IDX_FOO_COL; so would an index named foo_col be.
-  try {
-    (void)live.apply(CreateIndexDdl{"foo_col", "idx", {{"v"}}});
-    FAIL("colliding plan constants must be refused");
-  } catch (const std::invalid_argument& e) {
-    CHECK(std::string{e.what()}.find("IDX_FOO_COL") != std::string::npos);
+  (void)live.apply(CreateIndexDdl{"foo_col", "idx", {{"v"}}});
+  auto cat = live.current();
+  for (const auto& [id, t] : cat->tables()) {
+    auto cs = Catalog::constants(t);
+    std::vector<std::string> names;
+    for (const auto& c : cs) {
+      CHECK(std::ranges::all_of(c.name, [](char ch) { return std::isupper(static_cast<unsigned char>(ch)) != 0 ||
+                                                              std::isdigit(static_cast<unsigned char>(ch)) != 0 ||
+                                                              ch == '_'; }));
+      names.push_back(c.name);
+    }
+    std::ranges::sort(names);
+    CHECK(std::ranges::adjacent_find(names) == names.end());
   }
-  CHECK_THROWS_AS(live.apply(AddColumnDdl{"idx", col("x-y", SqlKind::BigInt)}), std::invalid_argument);
-  CHECK(live.current()->table("idx")->indexes.empty());
   // apply returns the version its own DDL published.
   auto v = live.current()->version();
   CHECK(live.apply(CreateIndexDdl{"idx_v", "idx", {{"v"}}})->version() == v + 1);
+}
+
+TEST_CASE("catalog: concurrent DDL each returns the version it published", "[sql][catalog]") {
+  sql_test::TempDir dir{"catalog_concurrent"};
+  auto db = DB::open(dir.path());
+  LiveCatalog live{db};
+  constexpr int kEach = 15;
+  auto run = [&](char prefix, std::vector<std::shared_ptr<const Catalog>>& seen) {
+    for (int i = 0; i < kEach; ++i) {
+      seen.push_back(live.apply(CreateTableDdl{std::string{prefix} + std::to_string(i), {col("k", SqlKind::BigInt)}, {"k"}}));
+    }
+  };
+  std::vector<std::shared_ptr<const Catalog>> a, b;
+  {
+    std::jthread ta{[&] { run('a', a); }};
+    std::jthread tb{[&] { run('b', b); }};
+  }
+  auto check = [](char prefix, const std::vector<std::shared_ptr<const Catalog>>& seen) {
+    std::uint64_t last = 0;
+    for (std::size_t i = 0; i < seen.size(); ++i) {
+      // Its own table is in it, and the versions it saw only grow.
+      CHECK(seen[i]->table(std::string{prefix} + std::to_string(i)) != nullptr);
+      CHECK(seen[i]->version() > last);
+      last = seen[i]->version();
+    }
+  };
+  check('a', a);
+  check('b', b);
+  CHECK(live.current()->version() == 2 * kEach);
+}
+
+TEST_CASE("catalog: a reader pinned during a DDL's commit is not blocked and sees the old version", "[sql][catalog]") {
+  sql_test::TempDir dir{"catalog_pin"};
+  auto db = DB::open(dir.path());
+  LiveCatalog live{db};
+  (void)live.apply(create_t());
+  auto before = live.current();
+  // Hold the next DDL after the generation counter turns odd and before its
+  // batch reaches the engine: the window a backfill's write and sync span.
+  std::promise<void> entered, release;
+  auto released = release.get_future().share();
+  live.set_commit_hook_for_testing([&, released] {
+    entered.set_value();
+    released.wait();
+  });
+  std::jthread ddl{[&] { (void)live.apply(CreateIndexDdl{"t_by_name", "t", {{"name"}}}); }};
+  entered.get_future().wait();
+  // The pin returns without waiting for the commit, on the old version and a
+  // snapshot that agrees with it.
+  auto pinned = std::async(std::launch::async, [&] { return live.pin(); });
+  REQUIRE(pinned.wait_for(std::chrono::seconds{10}) == std::future_status::ready);
+  auto p = pinned.get();
+  CHECK(p.cat == before);
+  Bytes v;
+  REQUIRE(p.snap.get({}, Bytes{std::byte{kNsCatalog}, std::byte{0x01}, std::byte{0x02}}, v));
+  CHECK(v.back() == std::byte{1});  // catalog version 1 in the snapshot too
+  release.set_value();
+  ddl.join();
+  live.set_commit_hook_for_testing({});
+  CHECK(live.current()->version() == 2);
+  CHECK(live.pin().cat == live.current());
 }
 
 TEST_CASE("catalog: an empty database bootstraps without writing", "[sql][catalog]") {
@@ -483,12 +553,12 @@ TEST_CASE("catalog: the constants block a plan needs", "[sql][catalog]") {
   (void)live.apply(create_t());
   auto cat = live.apply(CreateIndexDdl{"t_by_name", "t", {{"name"}}});
   const auto& t = *cat->table("t");
-  auto cs = cat->constants(t);
-  CHECK(constant(cs, "TBL_T") == 1);
-  CHECK(constant(cs, "LAY_T") == 2);
-  CHECK(constant(cs, "IDX_T_BY_NAME") == 3);
-  CHECK(constant(cs, "T_ID_OFF") == t.layout.find(0)->pos);
-  CHECK(constant(cs, "T_QTY_OFF") == t.layout.find(2)->pos);
-  CHECK(constant(cs, "T_NAME_SLOT") == 0);
-  CHECK(constant(cs, "T_NAME_COL") == 1);
+  auto cs = Catalog::constants(t);
+  CHECK(constant(cs, "TBL_1") == 1);
+  CHECK(constant(cs, "LAY_2") == 2);
+  CHECK(constant(cs, "IDX_3") == 3);
+  CHECK(constant(cs, "COL_1_0_OFF") == t.layout.find(0)->pos);
+  CHECK(constant(cs, "COL_1_2_OFF") == t.layout.find(2)->pos);
+  CHECK(constant(cs, "COL_1_1_SLOT") == 0);
+  CHECK(constant(cs, "COL_1_1_COL") == 1);
 }
