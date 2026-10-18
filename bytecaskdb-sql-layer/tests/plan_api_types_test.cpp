@@ -473,6 +473,26 @@ void del_pk_range(bc_ctx* cx) {
   bc_key_i64(cx, hi, bc_param_i64(cx, 1));
   bc_del_range(cx, bc_key_end(cx, lo), bc_key_end(cx, hi));
 }
+void del_open_lo(bc_ctx* cx) {
+  bc_key hi = bc_key_begin(cx, kTbl);
+  bc_key_i64(cx, hi, 3);
+  bc_del_range(cx, bc_empty(cx), bc_key_end(cx, hi));
+}
+void del_open_hi(bc_ctx* cx) {
+  bc_key lo = bc_key_begin(cx, kTbl);
+  bc_key_i64(cx, lo, 3);
+  bc_del_range(cx, bc_key_end(cx, lo), bc_empty(cx));
+}
+void guard_empty_range(bc_ctx* cx) {
+  bc_key lo = bc_key_begin(cx, kTbl);
+  bc_key_i64(cx, lo, 3);
+  bc_view k = bc_key_end(cx, lo);
+  bc_guard_range(cx, kTbl, k, k);
+  bc_key ib = bc_key_begin(cx, kIdx);
+  bc_key_bytes(cx, ib, bc_param_bytes(cx, 0));
+  bc_key_i64(cx, ib, 80);
+  bc_put(cx, bc_key_end(cx, ib), bc_empty(cx));
+}
 void guard_present_p(bc_ctx* cx) {
   bc_key kb = bc_key_begin(cx, kTbl);
   bc_key_i64(cx, kb, bc_param_i64(cx, 0));
@@ -530,6 +550,18 @@ TEST_CASE("plan API: count_range, del_range and the guards reach the engine", "[
   CHECK(run(f, count_all, {std::int64_t{-1}}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
 
+  // An open bound is refused: nothing is deleted, the catalog included.
+  CHECK(run(f, del_open_lo, {}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(run(f, del_open_hi, {}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(value(f, count_all, {std::int64_t{100}}) == 5);
+  REQUIRE(f.cat.table("t") != nullptr);
+  // An empty or inverted range deletes nothing and commits.
+  CHECK(run(f, del_pk_range, {std::int64_t{3}, std::int64_t{3}}) == BC_COMMITTED);
+  CHECK(run(f, del_pk_range, {std::int64_t{4}, std::int64_t{2}}) == BC_COMMITTED);
+  CHECK(value(f, count_all, {std::int64_t{100}}) == 5);
+
   CHECK(run(f, del_pk_range, {std::int64_t{2}, std::int64_t{4}}) == BC_COMMITTED);
   CHECK(value(f, count_all, {std::int64_t{100}}) == 3);
   Bytes out;
@@ -542,6 +574,8 @@ TEST_CASE("plan API: count_range, del_range and the guards reach the engine", "[
   CHECK(commit_after(f, guard_unchanged_p, {std::int64_t{1}, bytes("u")}, [] {}) == BC_COMMITTED);
   CHECK(commit_after(f, guard_unchanged_p, {std::int64_t{1}, bytes("u")},
                      [&] { f.db->put({}, pk_of(1), bytes("changed")); }) == BC_CONFLICT);
+  CHECK(commit_after(f, guard_empty_range, {bytes("e")}, [&] { f.db->put({}, pk_of(3), bytes("x")); }) ==
+        BC_COMMITTED);  // an empty range guards nothing, and the engine is not asked to
   CHECK(commit_after(f, guard_whole_table, {bytes("r")}, [] {}) == BC_COMMITTED);
   CHECK(commit_after(f, guard_whole_table, {bytes("r")}, [&] { f.db->put({}, pk_of(9), bytes("new")); }) ==
         BC_CONFLICT);

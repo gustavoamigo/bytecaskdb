@@ -1307,8 +1307,18 @@ void bc_del(bc_ctx* cx, bc_view key) {
 }
 
 void bc_del_range(bc_ctx* cx, bc_view lo, bc_view hi) {
+  auto bounds = cx->resolve2(lo, hi);
+  if (!bounds) return;
+  // No table id to resolve an open bound against: an empty bound would reach
+  // past the table into the whole keyspace, the catalog included.
+  if (bounds->first.empty() || bounds->second.empty()) {
+    cx->fail(BC_E_HANDLE, "bc_del_range takes no open bound");
+    return;
+  }
+  if (std::is_gteq(bytes_cmp(bounds->first, bounds->second))) return;  // an empty range deletes nothing
   BC_GUARD_BEGIN
-  add_effect(cx, EffectKind::DelRange, lo, hi);
+  cx->effects.push_back({EffectKind::DelRange, Bytes(bounds->first.begin(), bounds->first.end()),
+                         Bytes(bounds->second.begin(), bounds->second.end())});
   BC_GUARD_END(cx)
 }
 
@@ -1322,6 +1332,7 @@ void bc_guard_range(bc_ctx* cx, uint32_t table_or_index, bc_view lo, bc_view hi)
   BC_GUARD_BEGIN
   auto range = resolve_range(cx, table_or_index, lo, hi);
   if (!range) return;
+  if (std::is_gteq(bytes_cmp(range->lo, range->hi))) return;  // an empty range cannot change
   cx->effects.push_back({EffectKind::GuardRange, std::move(range->lo), std::move(range->hi)});
   BC_GUARD_END(cx)
 }

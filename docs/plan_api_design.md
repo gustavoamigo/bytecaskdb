@@ -502,9 +502,9 @@ void bc_raise(bc_ctx *, uint32_t constraint, uint32_t object_id);   /* a user er
 |---|---|---|
 | `bc_put` | Writes `row` at `key`, overwriting. The compiler emits one per table row and one per secondary index entry the statement creates or moves; index maintenance is visible in the plan. | `WritePlan::put` |
 | `bc_del` | Deletes `key`. One per table row and per index entry removed. | `WritePlan::del` |
-| `bc_del_range` | Deletes every key in `[lo, hi)` in one append. `TRUNCATE`, `DROP`, and range deletes the compiler can express as a key range. | `WritePlan::del_range` |
+| `bc_del_range` | Deletes every key in `[lo, hi)` in one append. `TRUNCATE`, `DROP`, and range deletes the compiler can express as a key range. It names no table, so an empty bound is `BC_E_HANDLE` rather than an open one: the compiler builds both bounds, the table prefix and its successor for a whole table. `lo >= hi` deletes nothing. | `WritePlan::del_range` |
 | `bc_guard_unchanged` | The commit fails if `key` changed since the snapshot. Serializable plans emit one for every key they read and did not write. Keys the plan writes are checked by the engine without a guard. | `ensure_unchanged` |
-| `bc_guard_range` | The commit fails if any key in `[lo, hi)` changed. Serializable plans emit one per range scanned; it covers phantoms. | `ensure_range_unchanged` |
+| `bc_guard_range` | The commit fails if any key in `[lo, hi)` changed. Serializable plans emit one per range scanned; it covers phantoms. Empty bounds are the start and end of `table_or_index`, as for `bc_scan_open`; `lo >= hi` guards nothing. | `ensure_range_unchanged` |
 | `bc_guard_present`, `bc_guard_absent` | Existence preconditions. `INSERT` emits `absent` on the primary key and on each unique index key, after the `bc_exists` check that turns a duplicate into a user error. | `ensure_present`, `ensure_absent` |
 | `bc_raise` | Sets `BC_E_CONSTRAINT` with a `bc_constraint` kind and the id of the constraint, column or index concerned, as the compiler emitted them. The plan unwinds; the runtime reports it and does not retry. The only error a plan raises itself. | none: nothing reaches the engine |
 
@@ -851,3 +851,7 @@ and the API changed where implementing them showed a gap.
   object id in the low 24 bits.
 - `bc_key_part_bytes` unescapes into the arena rather than lending a
   sub-view: an escaped part is not a sub-range of the key.
+- `bc_del_range` refuses an empty bound (`BC_E_HANDLE`): it names no
+  table, so an open bound would reach the whole keyspace. `bc_del_range` and
+  `bc_guard_range` treat `lo >= hi` as an empty range, as SQL does, rather
+  than letting the engine refuse the commit.
