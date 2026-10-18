@@ -101,7 +101,8 @@ TEST_CASE("binder: anything outside the scope is rejected with a message and pos
         "could not determine data type of parameter $1");
   CHECK(rejected(cat, "UPDATE t SET name = name - $1 WHERE id = $2").first == "operator - is only defined on bigint");
   CHECK(rejected(cat, "UPDATE t SET id = $1 WHERE id = $2").second == 13);
-  CHECK(rejected(cat, "INSERT INTO t VALUES ($1, $2)").first == "INSERT has 2 values for 3 columns");
+  CHECK(rejected(cat, "INSERT INTO t VALUES ($1, $2, $3, $4)").first == "INSERT has more expressions than target columns");
+  CHECK(rejected(cat, "INSERT INTO t (id, qty) VALUES ($1)").first == "INSERT has 1 values for 2 columns");
   CHECK(rejected(cat, "CREATE TABLE u (k CHAR(5) PRIMARY KEY)") ==
         std::pair<std::string, std::int32_t>{"CHAR(n) is not supported; use VARCHAR(n)", 16});
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT)").first == "a table needs a PRIMARY KEY");

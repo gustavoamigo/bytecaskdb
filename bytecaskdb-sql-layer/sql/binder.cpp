@@ -305,7 +305,14 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           Insert out{t, std::vector<std::optional<Expr>>(t->columns.size())};
           std::vector<const Column*> targets;
           if (s.columns.empty()) {
-            for (const auto& c : t->columns) targets.push_back(&c);
+            // As PostgreSQL: the values fill the leading columns and the rest
+            // take their defaults, so a column added later changes nothing.
+            for (std::size_t i = 0; i < std::min(s.values.size(), t->columns.size()); ++i) {
+              targets.push_back(&t->columns[i]);
+            }
+            if (s.values.size() > t->columns.size()) {
+              throw SqlError{"INSERT has more expressions than target columns", s.pos};
+            }
           } else {
             for (const auto& name : s.columns) targets.push_back(Binder::column(*t, name, s.pos));
           }
