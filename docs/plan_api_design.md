@@ -627,8 +627,14 @@ into the test binary.
    delete; a range delete; a count by `bc_count_range`; one update under
    snapshot isolation and the same with a guard. Then New Order and Payment
    as whole procedures.
-5. SQLite as the oracle: the same rows loaded there, the SQL in each plan's
-   header run, result rows and post-write table contents compared.
+5. A result oracle for the hand-written plans: something independent that
+   runs the SQL in each plan's header over the same rows, so result rows and
+   post-write table contents can be compared. Which one is not decided and
+   does not need to be yet. Candidates: an existing SQL engine loaded with
+   the same data; the Python reference implementation extended with a plan
+   interpreter and the same catalog; or hand-computed expected results for
+   the fixture, which is enough for ten plans and two procedures. The first
+   plans can be checked by hand while the choice is made.
 6. Fault tests for the guarantee: each plan run with a stale view, a wrong
    column offset, an exhausted budget, an exhausted arena and an injected
    I/O error, under the sanitizers, asserting an error code and untouched
