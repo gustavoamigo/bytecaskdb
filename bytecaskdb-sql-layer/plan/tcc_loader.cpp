@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// tcc_loader.cpp — TccPlan's definitions; see tcc_loader.cppm. Includes
-// libtcc.h, as the interface does for TCCState.
+// tcc_loader.cpp — TccPlan's definitions; see tcc_loader.cppm. The only unit
+// that includes libtcc.h.
 
 module;
 #include <chrono>

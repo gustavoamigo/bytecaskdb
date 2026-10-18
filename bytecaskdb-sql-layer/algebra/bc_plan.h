@@ -4,7 +4,8 @@
    bc_plan.h — the plan API of docs/plan_api_design.md (revision 3). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
-   and bc_params are opaque here and built by the runtime (runtime.cppm).
+   and bc_params are opaque here and built by the runtime
+   (algebra/runtime.cppm, module bytecask.sql.runtime).
 
    Implemented: the runtime, parameters and results, arithmetic, keys, reads,
    rows and columns, effects. The ephemeral structures (sorters, hash tables,

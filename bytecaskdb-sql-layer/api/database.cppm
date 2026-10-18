@@ -33,7 +33,6 @@ export module bytecask.sql.api;
 export import bytecask.sql.runtime;
 export import bytecask.sql.codegen;
 export import bytecask.sql.tcc_loader;
-import bytecask.sql.parser;
 
 export namespace bytecask::sql {
 
