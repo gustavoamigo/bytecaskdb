@@ -521,6 +521,12 @@ TEST_CASE("row format: the bitmap is sized at create and has a ceiling", "[sql][
   CHECK_FALSE(append_columns(wide, std::span<const ColumnDef>{many}.subspan(8000, 1000)));
   CHECK(wide.columns.size() == 8000);
   CHECK_THROWS_AS(make_layout(many), std::length_error);
+  // An id large enough that the bitmap alone outgrows the 16-bit header
+  // fields, with only variable columns: refused at create.
+  CHECK_THROWS_AS(make_layout(std::array{ColumnDef{600'000, PhysType::Bytes, true}}), std::length_error);
+  CHECK(make_layout(std::array{ColumnDef{500'000, PhysType::Bytes, true}}).fixed_start <= 0xFFFF);
+  CHECK(narrow<std::uint16_t>(0xFFFFu) == 0xFFFF);
+  CHECK_THROWS_AS(narrow<std::uint16_t>(0x10000u), std::overflow_error);
   RowWriter ww{wide};
   for (std::uint32_t i = 0; i < 8000; ++i) REQUIRE(ww.set_i64(i, i));
   Bytes wide_row;

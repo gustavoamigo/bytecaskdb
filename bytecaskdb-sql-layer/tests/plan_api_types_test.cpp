@@ -37,6 +37,7 @@ constexpr std::uint32_t kLay = 2;
 constexpr std::uint32_t kIdx = 3;
 constexpr std::uint32_t kIdCol = 0, kNameCol = 1, kQtyCol = 2;
 constexpr std::uint32_t kIdOff = 20;
+constexpr std::uint32_t kNameSlotForTest = 0;
 
 // A second table with the other physical types: m (k BIGINT PRIMARY KEY,
 // x DOUBLE PRECISION, b BOOLEAN) with an index on x. Ids follow t's.
@@ -109,7 +110,9 @@ void scan_all_reverse(bc_ctx* cx) {
   }
 }
 
-void scan_bad_flag(bc_ctx* cx) { bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), 1u << 5); }
+void scan_flag_p(bc_ctx* cx) {
+  bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), static_cast<uint32_t>(bc_param_i64(cx, 0)));
+}
 
 // A covering read of the index: (name, id) from the key alone.
 void covering_index(bc_ctx* cx) {
@@ -178,8 +181,14 @@ TEST_CASE("plan API: empty bounds scan the whole table, forward and reverse", "[
   REQUIRE(rows.size() == 3);
   CHECK(std::get<std::int64_t>(rows[0][0]) == 3);
   CHECK(std::get<std::int64_t>(rows[2][0]) == 1);
-  CHECK(run(f, scan_bad_flag, {}) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  // Bits 1 and 2 were revision 1's LO_EXCLUSIVE and HI_INCLUSIVE: refused,
+  // not read as another flag.
+  for (std::int64_t flag : {std::int64_t{1} << 1, std::int64_t{1} << 2, std::int64_t{1} << 5}) {
+    CHECK(run(f, scan_flag_p, {flag}) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  }
+  CHECK(run(f, scan_flag_p, {std::int64_t{BC_SCAN_PREFIX}}) == BC_COMMITTED);
+  CHECK(run(f, scan_flag_p, {std::int64_t{BC_SCAN_REVERSE}}) == BC_COMMITTED);
 }
 
 TEST_CASE("plan API: key parts decode from an index scan without the row", "[sql][algebra]") {
@@ -659,4 +668,61 @@ TEST_CASE("plan API: result rows follow the schema ref's types; limits and types
   bc_schema_ref ref{f.cat.version(), nullptr, nullptr, 0, 0, bad_code, 1};
   CHECK(bc_execute(f.cx, emit_without_types, &ref, &ps, {}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+}
+
+namespace {
+// Reads row $1's qty: NULL or the value, as the generated plans do.
+void read_qty(bc_ctx* cx) {
+  bc_key kb = bc_key_begin(cx, kTbl);
+  bc_key_i64(cx, kb, bc_param_i64(cx, 0));
+  bool found = false;
+  bc_view row = bc_get(cx, bc_key_end(cx, kb), &found);
+  if (!found) {
+    return;
+  }
+  if (bc_col_null(cx, row, kQtyCol)) {
+    bc_emit_count(cx, -2);
+  } else {
+    bc_emit_count(cx, bc_col_i64(cx, row, kIdOff));
+  }
+}
+void slot_of_row(bc_ctx* cx) {
+  bc_key kb = bc_key_begin(cx, kTbl);
+  bc_key_i64(cx, kb, bc_param_i64(cx, 0));
+  bool found = false;
+  bc_view row = bc_get(cx, bc_key_end(cx, kb), &found);
+  bc_col_bytes(cx, row, kNameSlotForTest);
+}
+void null_of_empty(bc_ctx* cx) { bc_col_null(cx, bc_empty(cx), kQtyCol); }
+}  // namespace
+
+TEST_CASE("plan API: a stored row that does not parse is BC_E_CORRUPT, never NULL", "[sql][algebra]") {
+  Fixture f;
+  seed_t(f);
+  Bytes key;
+  bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
+  bytecask::sql::key_put_i64(key, 1, {PhysType::I64});
+  Bytes good;
+  REQUIRE(f.db->get({}, key, good));
+
+  CHECK(value(f, read_qty, {std::int64_t{1}}) == 1);
+  // row_bytes no longer matches the record's length.
+  auto bad = good;
+  bad.push_back(std::byte{0});
+  f.db->put({}, key, bad);
+  CHECK(run(f, read_qty, {std::int64_t{1}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CORRUPT);
+  CHECK(run(f, slot_of_row, {std::int64_t{1}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CORRUPT);
+  // A header that parses with a var_end entry past the row.
+  auto bad_var = good;
+  auto var_table = std::to_integer<std::size_t>(good[4]) | (std::to_integer<std::size_t>(good[5]) << 8);
+  bad_var[var_table] = std::byte{0xFF};
+  bad_var[var_table + 1] = std::byte{0xFF};
+  f.db->put({}, key, bad_var);
+  CHECK(run(f, slot_of_row, {std::int64_t{1}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CORRUPT);
+  // The empty view is no row: a plan bug.
+  CHECK(run(f, null_of_empty, {}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
 }

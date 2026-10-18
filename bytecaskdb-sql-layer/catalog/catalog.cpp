@@ -125,7 +125,7 @@ auto serialize(const Table& t) -> Bytes {
   w.u32(t.version);
   w.u32(t.layout_id);
   w.u16(t.layout.generation);
-  w.u16(t.layout.bitmap_bytes);
+  w.u16(narrow<std::uint16_t>(t.layout.bitmap_bytes));
   w.u32(t.next_col_id);
   w.u16(static_cast<std::uint32_t>(t.columns.size()));
   for (const auto& c : t.columns) {

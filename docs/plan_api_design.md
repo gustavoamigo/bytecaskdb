@@ -181,8 +181,10 @@ enum bc_error_code {
 enum bc_scan_flags {
   BC_SCAN_FORWARD = 0,
   BC_SCAN_REVERSE = 1u << 0,
-  BC_SCAN_PREFIX  = 1u << 1,   /* hi ignored: every key with lo as prefix */
+  BC_SCAN_PREFIX  = 1u << 3,   /* hi ignored: every key with lo as prefix */
 };
+/* Bits 1 and 2 were LO_EXCLUSIVE and HI_INCLUSIVE in revision 1; they stay
+   unassigned so a plan that still passes them is refused, not misread. */
 /* Bounds are always [lo, hi). There are no exclusive-lo or inclusive-hi
    flags: an index key carries the primary key after the bounded part, so an
    entry equal to a partial bound still sorts after it. "name > $1" is
@@ -246,7 +248,7 @@ bool    bc_ctx_next_result(bc_ctx *, const uint8_t **row, uint32_t *len);     /*
 void    bc_ctx_reset(bc_ctx *);                                               /* drops snapshot, plan, arena */
 enum bc_error_code bc_error(const bc_ctx *);
 const char *bc_error_message(const bc_ctx *);
-uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id in the low 24 bits */
+uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits */
 int64_t bc_ctx_affected(const bc_ctx *);                   /* what bc_emit_count recorded, or -1 */
 int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params *,
                    bc_budget, bool sync, uint32_t max_retries);               /* the retry loop */
@@ -698,8 +700,9 @@ and updates and vacuum rewrite rows into the current generation, so the
 slow path stays rare.
 
 The decoders check every access against `row_bytes` and the offset table,
-so a row that disagrees with its layout is null or `BC_E_HANDLE`, never a
-read past the end. Values over the engine's limit are refused at
+so a column the row predates is null, a row whose header or `var_end`
+does not parse is `BC_E_CORRUPT`, and an offset that is not a column's is
+`BC_E_HANDLE`; never a read past the end. Values over the engine's limit are refused at
 `bc_row_end` with `BC_E_LIMIT`; the engine's value ceiling applies to the
 whole row.
 
@@ -848,7 +851,13 @@ and the API changed where implementing them showed a gap.
 - `BC_C_RANGE`: a value outside its declared type (`INTEGER`, `VARCHAR(n)`,
   `DECIMAL(p, s)`) is a constraint of its own kind, not a `CHECK`.
 - `bc_error_detail` packs the constraint kind in the high byte and the
-  object id in the low 24 bits.
+  object id in the low 24 bits; catalog object ids stay below 2^24.
+- `BC_SCAN_PREFIX` keeps bit 3: revision 2 moved it to bit 1, the bit
+  `LO_EXCLUSIVE` had, so a plan still passing that flag would have scanned a
+  prefix silently instead of being refused.
+- A row a column decoder cannot parse is `BC_E_CORRUPT`, not null: before,
+  `bc_col_null` read a damaged row as null and the query returned NULL for
+  data that was there. The empty view passed as a row is `BC_E_HANDLE`.
 - `bc_key_part_bytes` unescapes into the arena rather than lending a
   sub-view: an escaped part is not a sub-range of the key.
 - `bc_del_range` refuses an empty bound (`BC_E_HANDLE`): it names no

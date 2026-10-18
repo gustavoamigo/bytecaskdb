@@ -55,8 +55,10 @@ enum bc_error_code {
 enum bc_scan_flags {
   BC_SCAN_FORWARD = 0,
   BC_SCAN_REVERSE = 1u << 0,
-  BC_SCAN_PREFIX  = 1u << 1,   /* hi ignored: every key with lo as prefix */
+  BC_SCAN_PREFIX  = 1u << 3,   /* hi ignored: every key with lo as prefix */
 };
+/* Bits 1 and 2 were LO_EXCLUSIVE and HI_INCLUSIVE in revision 1; they stay
+   unassigned so a plan that still passes them is refused, not misread. */
 /* Bounds are always [lo, hi). There are no exclusive-lo or inclusive-hi
    flags: an index key carries the primary key after the bounded part, so an
    entry equal to a partial bound still sorts after it. "name > $1" is
@@ -102,7 +104,7 @@ bool    bc_ctx_next_result(bc_ctx *, const uint8_t **row, uint32_t *len);     /*
 void    bc_ctx_reset(bc_ctx *);                                               /* drops snapshot, plan, arena */
 enum bc_error_code bc_error(const bc_ctx *);
 const char *bc_error_message(const bc_ctx *);
-uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id in the low 24 bits */
+uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits */
 int64_t bc_ctx_affected(const bc_ctx *);                   /* what bc_emit_count recorded, or -1 */
 int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params *,
                    bc_budget, bool sync, uint32_t max_retries);               /* the retry loop */

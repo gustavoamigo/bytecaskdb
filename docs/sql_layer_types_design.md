@@ -302,12 +302,15 @@ and the position argument revision 2 of the plan API added to it is not
 needed; `docs/plan_api_design.md` is updated accordingly. The decoders still
 bound every access by `var_table` and `nvar`, so a fixed column past the
 fixed region reads as zero and a variable slot past `nvar` as empty; a
-malformed row, or an offset inside the header or off a word boundary, is
-`BC_E_HANDLE`, never a read past the end.
+row whose header or `var_end` does not parse is `BC_E_CORRUPT`, never read
+as null, and an offset inside the header or off a word boundary is
+`BC_E_HANDLE`. Nothing is read past the end.
 
 **The bitmap is sized at create, with a ceiling.** `bitmap_bytes` is the
 smallest multiple of 64 bits that holds every column id of the table with at
-least 16 ids to spare, fixed when the layout generation is created. Adding
+least 16 ids to spare, fixed when the layout generation is created; a
+bitmap that would push the fixed region past the 16-bit `var_table` is
+refused at create. Adding
 a column uses the next id; when the next id has no bit, `ADD COLUMN` is
 refused until an `ALTER TABLE … REBUILD` starts a new generation with a
 larger bitmap. The size is in the row so that every structural check is

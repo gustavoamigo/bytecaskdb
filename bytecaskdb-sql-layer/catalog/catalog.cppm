@@ -106,9 +106,9 @@ public:
   [[nodiscard]] auto row_layout(std::uint32_t layout_id) const -> const RowLayout*;
   [[nodiscard]] auto table_of_layout(std::uint32_t layout_id) const -> const Table*;
 
-  // Object ids stay below 2^31: a plan's constants are an enum, whose values
-  // are ints.
-  static constexpr std::uint32_t kMaxObjectId = 0x7FFF'FFFFu;
+  // Object ids stay below 2^24: bc_error_detail carries one in its low 24
+  // bits (and a plan's constants are an enum, whose values are ints).
+  static constexpr std::uint32_t kMaxObjectId = 0x00FF'FFFFu;
 
   // The constants a plan on this table needs, in the names generated plans
   // use: TBL_, LAY_, IDX_, and per column <COL>_OFF or <COL>_SLOT and <COL>_COL.

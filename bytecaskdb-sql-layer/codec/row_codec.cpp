@@ -78,6 +78,8 @@ auto make_layout(std::span<const ColumnDef> cols, std::uint16_t generation) -> R
   for (const auto& c : cols) id_ceiling = std::max(id_ceiling, c.col_id + 1);
   l.bitmap_bytes = bitmap_bytes_for(id_ceiling);
   l.fixed_start = static_cast<std::uint32_t>(kRowHeaderBytes) + l.bitmap_bytes;
+  // bitmap_bytes and var_table (at least fixed_start) are 16-bit header fields.
+  if (l.fixed_start > kMaxVarTable) throw std::length_error("column ids too large for one row layout");
   l.fixed_end = l.fixed_start;
   // Every id is below the ceiling by construction; only the 16-bit bound on
   // the fixed region can refuse.
@@ -209,10 +211,10 @@ auto RowWriter::finish(Bytes& out, std::size_t max_bytes) const -> bool {
 
   Bytes row(total, std::byte{0});
   store_le(row, 0, l.generation, 2);
-  store_le(row, 2, l.bitmap_bytes, 2);
-  store_le(row, 4, l.fixed_end, 2);
-  store_le(row, 6, l.nvar, 2);
-  store_le(row, 8, total, 4);
+  store_le(row, 2, narrow<std::uint16_t>(l.bitmap_bytes), 2);
+  store_le(row, 4, narrow<std::uint16_t>(l.fixed_end), 2);
+  store_le(row, 6, narrow<std::uint16_t>(l.nvar), 2);
+  store_le(row, 8, narrow<std::uint32_t>(total), 4);
 
   std::vector<std::size_t> var_src(l.nvar, 0);
   for (std::size_t i = 0; i < l.columns.size(); ++i) {
@@ -249,6 +251,8 @@ auto row_valid(BytesView row) -> bool {
   }
   return true;
 }
+
+auto row_header_valid(BytesView row) -> bool { return header(row).has_value(); }
 
 auto row_generation(BytesView row) -> std::uint16_t {
   return row.size() < 2 ? 0 : static_cast<std::uint16_t>(load_u16(row, 0));

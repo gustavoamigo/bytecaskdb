@@ -26,6 +26,8 @@ module;
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
 export module bytecask.sql.row_codec;
@@ -41,6 +43,14 @@ inline constexpr std::size_t kMaxRowBytes = (std::size_t{1} << 28) - 1;
 // The bitmap is sized at create: the smallest multiple of 64 bits that holds
 // every column id with kBitmapSpareBits to spare.
 inline constexpr std::uint32_t kBitmapSpareBits = 16;
+
+// A checked narrowing conversion: throws std::overflow_error if v does not
+// fit To. For the header's and the catalog record's fixed-width fields.
+template <typename To, typename From>
+[[nodiscard]] constexpr auto narrow(From v) -> To {
+  if (!std::in_range<To>(v)) throw std::overflow_error("value does not fit its field");
+  return static_cast<To>(v);
+}
 
 struct ColumnSlot {
   std::uint32_t col_id;  // permanent; the bitmap bit
@@ -71,7 +81,7 @@ struct ColumnDef {
 
 // Assigns positions in column order: fixed columns one word each after the
 // bitmap, variable columns the next slot. Throws std::length_error if the
-// fixed region would outgrow the header's 16-bit var_table.
+// bitmap or the fixed region would outgrow the header's 16-bit fields.
 [[nodiscard]] auto make_layout(std::span<const ColumnDef> cols, std::uint16_t generation = 1)
     -> RowLayout;
 // Appends columns to a layout, keeping every existing position (ADD COLUMN).
@@ -112,6 +122,9 @@ private:
 // position is not a column position of any layout (inside the header, or not
 // a word boundary).
 [[nodiscard]] auto row_valid(BytesView row) -> bool;
+// The header alone is consistent with the row's length: what every accessor
+// checks before it reads. Constant time, unlike row_valid.
+[[nodiscard]] auto row_header_valid(BytesView row) -> bool;
 [[nodiscard]] auto row_generation(BytesView row) -> std::uint16_t;
 // The bitmap bit. Clear for a malformed row or a bit past the bitmap.
 [[nodiscard]] auto row_present_bit(BytesView row, std::uint32_t col_id) -> bool;

@@ -53,6 +53,8 @@ static_assert(static_cast<int>(PhysType::I64) == BC_T_I64);
 static_assert(static_cast<int>(PhysType::F64) == BC_T_F64);
 static_assert(static_cast<int>(PhysType::Bool) == BC_T_BOOL);
 static_assert(static_cast<int>(PhysType::Bytes) == BC_T_BYTES);
+// bc_error_detail carries an object id in its low 24 bits.
+static_assert(Catalog::kMaxObjectId <= 0x00FF'FFFFu);
 
 namespace {
 
@@ -530,6 +532,23 @@ auto check_schema(bc_ctx* cx, const bc_schema_ref* ref) -> bool {
   return true;
 }
 
+// A view a column decoder reads: a row whose header is consistent with its
+// length. The empty view is no row (a plan bug, BC_E_HANDLE); a stored row
+// that does not parse is BC_E_CORRUPT, never read as null.
+auto resolve_row(bc_ctx* cx, bc_view row) -> std::optional<BytesView> {
+  auto r = cx->resolve(row);
+  if (!r || !cx->ok()) return std::nullopt;
+  if (r->empty()) {
+    cx->fail(BC_E_HANDLE, "the empty view is not a row");
+    return std::nullopt;
+  }
+  if (!bytecask::sql::row_header_valid(*r)) {
+    cx->fail(BC_E_CORRUPT, "malformed row");
+    return std::nullopt;
+  }
+  return r;
+}
+
 // The row builder a bc_row_set_* call targets, with the layout check's message.
 template <typename Set>
 void set_column(bc_ctx* cx, bc_row r, Set&& set, const char* what) {
@@ -542,8 +561,8 @@ void set_column(bc_ctx* cx, bc_row r, Set&& set, const char* what) {
 
 template <typename Load, typename T>
 auto load_column(bc_ctx* cx, bc_view row, std::uint32_t off, Load&& load, T neutral) -> T {
-  auto r = cx->resolve(row);
-  if (!r || !cx->ok()) return neutral;
+  auto r = resolve_row(cx, row);
+  if (!r) return neutral;
   auto v = load(*r, off);
   if (!v) {
     cx->fail(BC_E_HANDLE, "column offset outside the row");
@@ -1110,8 +1129,8 @@ int64_t bc_count_range(bc_ctx* cx, uint32_t table_or_index, bc_view lo, bc_view 
 // ------------------------------------------------------------ rows, columns
 
 bool bc_col_null(bc_ctx* cx, bc_view row, uint32_t col) {
-  auto r = cx->resolve(row);
-  if (!r || !cx->ok()) return true;
+  auto r = resolve_row(cx, row);
+  if (!r) return true;
   return !bytecask::sql::row_present_bit(*r, col);
 }
 
@@ -1128,11 +1147,13 @@ bool bc_col_bool(bc_ctx* cx, bc_view row, uint32_t off) {
 }
 
 bc_view bc_col_bytes(bc_ctx* cx, bc_view row, uint32_t slot) {
-  auto r = cx->resolve(row);
-  if (!r || !cx->ok()) return {};
+  auto r = resolve_row(cx, row);
+  if (!r) return {};
   auto v = bytecask::sql::row_bytes(*r, slot);
   if (!v) {
-    cx->fail(BC_E_HANDLE, "variable slot outside the row");
+    // The header parsed and a slot past nvar reads as empty, so this is a
+    // var_end entry that runs past the row: the row is damaged.
+    cx->fail(BC_E_CORRUPT, "malformed row");
     return {};
   }
   auto [cursor, step] = cx->owner(row);
