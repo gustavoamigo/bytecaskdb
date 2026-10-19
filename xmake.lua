@@ -1011,5 +1011,15 @@ target("wasm_tests")
     end)
 
 end -- if os.getenv("EMSDK")
--- SQL layer (#487); its targets are not built by default.
-includes("bytecaskdb-sql-layer")
+-- SQL layer (#487): `xmake f --sql_layer=y` includes its targets and its
+-- packages, libpg_query and TinyCC, which are cloned and built from source.
+-- Off by default, so configuring the engine neither fetches nor builds them;
+-- sql-layer.yml turns it on.
+option("sql_layer")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Include the SQL layer (bytecaskdb-sql-layer) and its libpg_query and TinyCC packages")
+option_end()
+if has_config("sql_layer") then
+    includes("bytecaskdb-sql-layer")
+end

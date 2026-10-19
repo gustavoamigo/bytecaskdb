@@ -100,7 +100,7 @@ jobs:
           RESOURCE_DIR=$(clang --print-resource-dir)
           xmake f --toolchain=clang \
             --cxflags="-resource-dir=${RESOURCE_DIR}" \
-            -y
+            --sql_layer=y -y
 
       - name: Build and run sql_layer_tests
         run: |
@@ -151,5 +151,6 @@ jobs:
     uses: ./.github/workflows/sanitizers.yml
     with:
       target: sql_layer_tests
+      sql_layer: true
       keydirs: '["blind"]'
       sanitizers: '["address", "thread", "undefined"]'

@@ -7,18 +7,22 @@ name: CI
 
 on:
   # A change that touches only documentation runs nothing here, as a pull
-  # request or as a push to main: no job reads Markdown. A change that also
-  # touches anything else runs everything.
+  # request or as a push to main: no job reads Markdown. Nor does one confined
+  # to the SQL layer: no job here configures it (option sql_layer), and
+  # sql-layer.yml runs its tests. A change that also touches anything else
+  # runs everything.
   push:
     branches: [main]
     paths-ignore:
       - "**.md"
       - "docs/**"
+      - "bytecaskdb-sql-layer/**"
   pull_request:
     branches: [main]
     paths-ignore:
       - "**.md"
       - "docs/**"
+      - "bytecaskdb-sql-layer/**"
   workflow_dispatch:
 
 permissions:
@@ -50,30 +54,24 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # make and which: the libpg_query and TinyCC builds. Configuring
-          # resolves the SQL layer's packages (bytecaskdb-sql-layer/xmake.lua)
-          # though this job builds no layer target.
           dnf install -y \
             clang llvm llvm-devel lld \
             libcxx libcxx-devel libstdc++-static \
-            xmake make which \
+            xmake \
             python3-pip python3-devel \
             git ninja-build
           pip3 install nanobind pytest hypothesis
 
-      # The packages xmake builds from source, each a git clone and a build
-      # per run otherwise. Configuring resolves every package the build
-      # declares, the SQL layer's libpg_query and TinyCC among them
-      # (bytecaskdb-sql-layer/xmake.lua), though this job builds no layer
-      # target: its tests run in sql-layer.yml. The key carries every pinned
-      # version: a bump in either file is a new entry, and a GitHub fetch
-      # failure for one of the repositories then costs a cache miss, not the
-      # run.
+      # The packages xmake builds from source, each a fetch and a build per
+      # run otherwise. The SQL layer's are not among them: it is configured
+      # off here (option sql_layer), and its tests run in sql-layer.yml. The
+      # key carries every pinned version: a bump is a new entry, and a fetch
+      # failure then costs a cache miss, not the run.
       - name: Cache xmake packages
         uses: actions/cache@v4
         with:
           path: ~/.xmake/packages
-          key: xmake-packages-fedora43-${{ hashFiles('xmake.lua', 'bytecaskdb-sql-layer/xmake.lua') }}
+          key: xmake-packages-fedora43-${{ hashFiles('xmake.lua') }}
 
       - name: Configure xmake
         run: |

@@ -73,11 +73,11 @@ bindings (#494) and a header bridge for the plugin, the counterpart of
 
 Its third-party dependencies are fetched at build time, not vendored:
 libpg_query (PostgreSQL licence, with its bundled protobuf-c, MIT/BSD) and
-TinyCC (LGPL-2.1). The xmake targets that use them are not built by default;
-its own workflow, `.github/workflows/sql-layer.yml`, builds and runs
-`sql_layer_tests`, under the sanitizers too; the engine's workflows build none
-of the layer's targets, though configuring the build still fetches and builds
-its two packages there. Its design documents are in `bytecaskdb-sql-layer/docs/`, and
+TinyCC (LGPL-2.1). The layer is part of the build only when configured with
+`xmake f --sql_layer=y`, so configuring the engine fetches neither. Its own
+workflow, `.github/workflows/sql-layer.yml`, configures it on and builds and
+runs `sql_layer_tests`, under the sanitizers too; the engine's workflows
+configure it off and do not run on a change to the layer alone. Its design documents are in `bytecaskdb-sql-layer/docs/`, and
 what it guarantees is in `bytecaskdb-sql-layer/CONTRACT.md`, whose vocabulary
 `.github/workflows/contract.yml` checks.
 
@@ -138,7 +138,7 @@ bytecask/
 ├── benchmarks/           # MIT — engine benchmarks
 ├── docs/                 # Documentation
 ├── scripts/              # Build and benchmark helper scripts
-└── xmake.lua             # xmake build — bytecaskdb/, tests/, benchmarks/; includes bytecaskdb-sql-layer/xmake.lua
+└── xmake.lua             # xmake build — bytecaskdb/, tests/, benchmarks/; bytecaskdb-sql-layer/xmake.lua with --sql_layer=y
 ```
 
 `xmake.lua` builds `bytecaskdb/bytecask_hpp.cpp` into `libbytecask.a`. The

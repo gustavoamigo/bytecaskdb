@@ -3,8 +3,9 @@
 -- prototype: the end-to-end prototype of #497.
 
 -- Third-party dependencies, fetched by git at a pinned tag or commit and
--- built from source (neither is a known-good xmake-repo package). Optional,
--- so nothing is fetched unless a target that uses them is built.
+-- built from source (neither is a known-good xmake-repo package). The root
+-- xmake.lua includes this file only with `xmake f --sql_layer=y`, and
+-- configuring then resolves both.
 
 -- libpg_query: PostgreSQL 17's parser as a library, with its protobuf-c
 -- output and the bundled protobuf-c runtime (no system protobuf). Its own

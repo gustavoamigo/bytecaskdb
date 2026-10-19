@@ -36,6 +36,10 @@ on:
         description: "The test target to build and run"
         type: string
         default: bytecask_tests
+      sql_layer:
+        description: "Configure with the SQL layer (xmake option sql_layer), for sql_layer_tests"
+        type: boolean
+        default: false
   schedule:
     - cron: "40 2 * * *"
   workflow_dispatch:
@@ -77,8 +81,7 @@ jobs:
             git ninja-build
           # bytecaskdb_python's on_load() asks nanobind for its include dir,
           # and xmake f loads every target. make and which: the libpg_query
-          # and TinyCC builds, since configuring resolves the SQL layer's
-          # packages though no layer target is built here.
+          # and TinyCC builds, when sql-layer.yml calls this with sql_layer.
           pip3 install nanobind pytest hypothesis
 
       # build_msan_libcxx.sh picks its llvm-project release branch from the
@@ -110,6 +113,7 @@ jobs:
           xmake f --toolchain=clang \
             --cxflags="-resource-dir=${RESOURCE_DIR}" \
             --sanitizer=${{ matrix.sanitizer }} \
+            --sql_layer=${{ inputs.sql_layer && 'y' || 'n' }} \
             -m debug -y
 
       # Scheduled and dispatched runs have no inputs: bytecask_tests.
@@ -117,7 +121,7 @@ jobs:
         env:
           TARGET: ${{ inputs.target || 'bytecask_tests' }}
         run: |
-          xmake build -y "$TARGET"
+          xmake build "$TARGET"
           if [ "$TARGET" = "bytecask_tests" ] && [ "${{ matrix.sanitizer }}" = "undefined" ] && [ "${{ matrix.keydir }}" = "blind" ]; then
             xmake build btree_tests
           fi
