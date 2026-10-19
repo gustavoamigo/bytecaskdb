@@ -104,6 +104,9 @@ TEMPLATE_PARAMS = re.compile(r"\btemplate\s*<[^>]*>")
 # What precedes a brace that opens a scope of declarations rather than code.
 SCOPE = re.compile(r"\b(class|struct|union|enum|namespace)\b|\bextern\s+\"C(?:\+\+)?\"\s*$")
 ACCESS = re.compile(r"^\s*(public|private|protected)\s*$")
+EXPORT = re.compile(r"\s*export\b")
+# `export { ... }`: a block of exported declarations.
+EXPORT_BLOCK = re.compile(r"^\s*export\s*$")
 
 
 def declared_text(src: str) -> str:
@@ -119,7 +122,7 @@ def declared_text(src: str) -> str:
 
     def visible() -> bool:
         export = (exported and exported[-1]) or \
-            src[start:i].lstrip().startswith("export")
+            bool(EXPORT.match(src[start:i]))
         return export and all(a in (None, "public") for a in access)
 
     while i < len(src):
@@ -135,14 +138,14 @@ def declared_text(src: str) -> str:
         elif c == "{":
             head = src[start:i]
             scope = SCOPE.search(TEMPLATE_PARAMS.sub(" ", head))
-            if scope:
+            if scope or EXPORT_BLOCK.match(head):
                 if visible():
                     out.append(head)
-                kind = scope.group(1)
+                kind = scope.group(1) if scope else None
                 access.append("private" if kind == "class" else
                               "public" if kind in ("struct", "union") else None)
                 exported.append((bool(exported) and exported[-1]) or
-                                head.lstrip().startswith("export"))
+                                bool(EXPORT.match(head)))
                 start = i + 1
             else:
                 depth = 0
