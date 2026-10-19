@@ -35,6 +35,7 @@ using bytecask::sql::PhysType;
 using Row = std::vector<bc_value>;
 
 inline constexpr std::uint32_t kTbl = 1;
+inline constexpr std::uint32_t kIdx = 3;
 
 struct PlanRunner {
   Fixture& f;
@@ -47,10 +48,10 @@ struct PlanRunner {
 
   auto exec(bc_plan_fn plan, std::vector<bc_value> p, std::span<const PhysType> result = {}) -> int {
     auto ps = params(std::move(p));
-    std::uint32_t tables[] = {kTbl};
-    auto codes = type_codes(result);
-    bc_schema_ref ref{f.cat.version(), tables, tables, 1, 1, codes.data(), static_cast<std::uint32_t>(codes.size())};
-    return bc_execute(f.cx, plan, &ref, &ps, {}, false, 3);
+    // What every plan of the scenario reads and writes: t and t_by_name.
+    SchemaRef ref{{kTbl, kIdx}, {kTbl}, {kIdx}, {}, type_codes(result), f.cat().version()};
+    auto r = ref.get();
+    return bc_execute(f.cx, plan, &r, &ps, {}, false, 3);
   }
 
   auto insert(std::int64_t id, bc_value name, bc_value qty) -> int {

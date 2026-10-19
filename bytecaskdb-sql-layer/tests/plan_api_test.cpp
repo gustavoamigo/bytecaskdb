@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,7 @@ import bytecask.sql.tests.fixture;
 
 using namespace sql_test;
 using bytecask::sql::Bytes;
+using bytecask::sql::PhysType;
 
 namespace {
 
@@ -174,13 +176,101 @@ TEST_CASE("plan API: bc_sub reports overflow instead of wrapping", "[sql][algebr
   CHECK(bc_error(f.cx) == BC_E_ARITH);
 }
 
-TEST_CASE("plan API: a plan compiled against another catalog version does not run", "[sql][algebra]") {
+TEST_CASE("plan API: bc_ctx_run checks what a plan depends on, not a catalog version", "[sql][algebra][catalog]") {
   Fixture f;
   auto ps = params({std::int64_t{1}, bytes("a"), std::int64_t{5}});
-  std::uint32_t tables[] = {kTbl};
-  bc_schema_ref stale{f.cat.version() - 1, nullptr, tables, 0, 1, nullptr, 0};
-  CHECK(bc_execute(f.cx, insert_plan_ok, &stale, &ps, {}, false, 0) == BC_FAILED);
+  auto run_with = [&](const SchemaRef& sr) {
+    auto ref = sr.get();
+    return bc_execute(f.cx, insert_plan_ok, &ref, &ps, {}, false, 0);
+  };
+  const auto& t = *f.cat().table("t");
+  auto col = [&](std::uint32_t id) {
+    const auto* slot = t.layout.find(id);
+    return bc_col_ref{kLay, id, slot->pos, static_cast<std::uint8_t>(slot->type)};
+  };
+  SchemaRef ok{{kTbl}, {kTbl}, {kIdx}, {col(kIdCol), col(kNameCol), col(kQtyCol)}, {}, 0};
+
+  // The version in the ref is for messages: a stale one runs.
+  CHECK(run_with(ok) == BC_COMMITTED);
+  // A write plan that does not maintain an index of its table does not run.
+  auto missing_index = ok;
+  missing_index.indexes.clear();
+  CHECK(run_with(missing_index) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
-  bc_schema_ref live{f.cat.version(), nullptr, tables, 0, 1, nullptr, 0};
-  CHECK(bc_execute(f.cx, insert_plan_ok, &live, &ps, {}, false, 0) == BC_COMMITTED);
+  CHECK(std::string{bc_error_message(f.cx)}.find("does not maintain index t_by_name") != std::string::npos);
+  // A column at another position or of another type does not either.
+  auto moved = ok;
+  moved.cols[2].pos += 8;
+  CHECK(run_with(moved) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  auto retyped = ok;
+  retyped.cols[2].type = BC_T_F64;
+  CHECK(run_with(retyped) == BC_FAILED);
+  // Nor one that reads an object that is gone.
+  auto gone = ok;
+  gone.read.push_back(4242);
+  CHECK(run_with(gone) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+
+  // ADD COLUMN keeps the plan; the new column takes its default in rows the
+  // plan writes, without the plan naming it.
+  auto v = f.cat().version();
+  f.ddl(bytecask::sql::AddColumnDdl{"t", {"tag", {bytecask::sql::SqlKind::BigInt}, true, std::int64_t{7}}});
+  CHECK(f.cat().version() == v + 1);
+  ps = params({std::int64_t{2}, bytes("b"), std::int64_t{6}});
+  CHECK(run_with(ok) == BC_COMMITTED);
+  Bytes key, row;
+  bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
+  bytecask::sql::key_put_i64(key, 2, {PhysType::I64});
+  REQUIRE(f.db->get({}, key, row));
+  const auto& t2 = *f.cat().table("t");
+  CHECK(bytecask::sql::row_i64(row, t2.layout.find(t2.column("tag")->id)->pos) == 7);
+
+  // DROP INDEX: the plan maintains an index that is gone.
+  f.ddl(bytecask::sql::DropIndexDdl{"t_by_name"});
+  ps = params({std::int64_t{3}, bytes("c"), std::int64_t{7}});
+  CHECK(run_with(ok) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  auto no_index = ok;
+  no_index.indexes.clear();
+  CHECK(run_with(no_index) == BC_COMMITTED);
+}
+
+TEST_CASE("plan API: a context holds a catalog version only while it executes", "[sql][algebra][catalog]") {
+  Fixture f;
+  std::weak_ptr<const bytecask::sql::Catalog> seen = f.live->current();
+  auto ps = params({std::int64_t{1}, bytes("a"), std::int64_t{5}});
+  bc_ctx_begin(f.cx, &ps, {});
+  CHECK(seen.use_count() == 2);  // the live catalog and the context
+  bc_ctx_run(f.cx, insert_plan_ok, nullptr);
+  CHECK(bc_ctx_commit(f.cx, false) == BC_COMMITTED);
+  bc_ctx_reset(f.cx);
+  CHECK(seen.use_count() == 1);
+  f.ddl(bytecask::sql::AddColumnDdl{"t", {"x", {bytecask::sql::SqlKind::BigInt}, true, {}}});
+  CHECK(seen.expired());  // superseded, and no idle context keeps it
+}
+
+TEST_CASE("plan API: a write committed across a DDL on its table is a conflict", "[sql][algebra][catalog]") {
+  Fixture f;
+  auto ps = params({std::int64_t{1}, bytes("a"), std::int64_t{5}});
+  // Begin and run on catalog v2, then a DDL on t commits before the plan does.
+  bc_ctx_begin(f.cx, &ps, {});
+  bc_ctx_run(f.cx, insert_plan_ok, nullptr);
+  REQUIRE(bc_error(f.cx) == BC_OK);
+  f.ddl(bytecask::sql::CreateIndexDdl{"t_by_qty", "t", {{"qty"}}});
+  CHECK(bc_ctx_commit(f.cx, false) == BC_CONFLICT);
+  bc_ctx_reset(f.cx);
+  Bytes key, out;
+  bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
+  bytecask::sql::key_put_i64(key, 1, {PhysType::I64});
+  CHECK_FALSE(f.db->get({}, key, out));
+
+  // A DDL on another table does not conflict.
+  f.ddl(bytecask::sql::CreateTableDdl{"other", {Fixture::col("k", PhysType::I64, false)}, {"k"}});
+  bc_ctx_begin(f.cx, &ps, {});
+  bc_ctx_run(f.cx, insert_plan_ok, nullptr);
+  f.ddl(bytecask::sql::AddColumnDdl{"other", {"x", {bytecask::sql::SqlKind::Text}, true, {}}});
+  CHECK(bc_ctx_commit(f.cx, false) == BC_COMMITTED);
+  bc_ctx_reset(f.cx);
+  CHECK(f.db->get({}, key, out));
 }

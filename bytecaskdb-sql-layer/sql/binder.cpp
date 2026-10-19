@@ -5,10 +5,14 @@
 
 module;
 #include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -32,11 +36,140 @@ auto type_name(PhysType t) -> std::string {
   return "?";
 }
 
-// SQL type names as libpg_query canonicalises them.
-auto sql_type(const ast::ColumnDefAst& c) -> PhysType {
-  if (c.type == "int8") return PhysType::I64;
-  if (c.type == "bytea") return PhysType::Bytes;
-  throw SqlError{"type " + c.type + " is not supported (only BIGINT and BYTEA)", c.pos};
+// SQL type names as libpg_query canonicalises them, onto the stage-1 types of
+// docs/sql_layer_types_design.md.
+auto sql_type(const ast::ColumnDefAst& c) -> SqlType {
+  auto no_mods = [&](SqlKind k) {
+    if (!c.typmods.empty()) throw SqlError{"type " + c.type + " takes no modifier", c.pos};
+    return SqlType{k};
+  };
+  if (c.type == "int2") return no_mods(SqlKind::SmallInt);
+  if (c.type == "int4") return no_mods(SqlKind::Integer);
+  if (c.type == "int8") return no_mods(SqlKind::BigInt);
+  if (c.type == "float4") return no_mods(SqlKind::Real);
+  if (c.type == "float8") return no_mods(SqlKind::Double);
+  if (c.type == "bool") return no_mods(SqlKind::Boolean);
+  if (c.type == "bytea") return no_mods(SqlKind::Bytea);
+  if (c.type == "text") return no_mods(SqlKind::Text);
+  if (c.type == "timestamp") return no_mods(SqlKind::Timestamp);
+  if (c.type == "date") return no_mods(SqlKind::Date);
+  if (c.type == "time") return no_mods(SqlKind::Time);
+  // The bounds are the catalog's (sql_type_valid); a modifier out of a
+  // field's range becomes an invalid field value for it to refuse.
+  auto field = [](std::int32_t v) -> std::uint8_t { return std::in_range<std::uint8_t>(v) ? static_cast<std::uint8_t>(v) : 0; };
+  if (c.type == "varchar") {
+    if (c.typmods.empty()) return SqlType{SqlKind::Text};  // VARCHAR without a length is TEXT
+    SqlType t{SqlKind::Varchar, std::in_range<std::uint32_t>(c.typmods[0]) ? static_cast<std::uint32_t>(c.typmods[0]) : 0};
+    if (c.typmods.size() != 1 || !sql_type_valid(t)) throw SqlError{"VARCHAR takes one positive length", c.pos};
+    return t;
+  }
+  if (c.type == "numeric") {
+    auto limits = "precision 1 to " + std::to_string(kMaxDecimalPrecision) + " (it is stored in 64 bits), scale 0 to precision";
+    if (c.typmods.empty() || c.typmods.size() > 2) throw SqlError{"NUMERIC needs a precision: " + limits, c.pos};
+    auto p = c.typmods[0];
+    auto sc = c.typmods.size() == 2 ? c.typmods[1] : 0;
+    SqlType t{SqlKind::Decimal, 0, field(p), field(sc)};
+    if (sc < 0 || !sql_type_valid(t)) {
+      throw SqlError{"NUMERIC(" + std::to_string(p) + ", " + std::to_string(sc) + ") is not supported: " + limits, c.pos};
+    }
+    return t;
+  }
+  if (c.type == "bpchar") throw SqlError{"CHAR(n) is not supported; use VARCHAR(n)", c.pos};
+  throw SqlError{"type " + c.type + " is not supported", c.pos};
+}
+
+auto pow10(std::uint8_t n) -> std::int64_t {
+  std::int64_t v = 1;
+  for (std::uint8_t i = 0; i < n; ++i) v *= 10;
+  return v;
+}
+
+// A decimal literal ([-]digits[.digits]) scaled by 10^scale, rounded half
+// away from zero, with at most `precision` digits; nullopt if it is not one.
+auto scaled_decimal(std::string_view text, std::uint8_t precision, std::uint8_t scale) -> std::optional<std::int64_t> {
+  auto neg = !text.empty() && text[0] == '-';
+  if (neg) text.remove_prefix(1);
+  auto dot = text.find('.');
+  auto whole = text.substr(0, dot);
+  auto frac = dot == std::string_view::npos ? std::string_view{} : text.substr(dot + 1);
+  auto digits = [](std::string_view d) { return std::ranges::all_of(d, [](char ch) { return ch >= '0' && ch <= '9'; }); };
+  if ((whole.empty() && frac.empty()) || !digits(whole) || !digits(frac)) return std::nullopt;
+  // Leading zeros are no digits: "0.5" has none before the point, so it fits
+  // NUMERIC(4, 4).
+  while (!whole.empty() && whole[0] == '0') whole.remove_prefix(1);
+  if (whole.size() > static_cast<std::size_t>(precision - scale)) return std::nullopt;
+  std::int64_t v = 0;
+  for (auto ch : whole) v = v * 10 + (ch - '0');
+  for (std::uint8_t i = 0; i < scale; ++i) v = v * 10 + (i < frac.size() ? frac[i] - '0' : 0);
+  if (frac.size() > scale && frac[scale] >= '5') ++v;
+  if (v >= pow10(precision)) return std::nullopt;
+  return neg ? -v : v;
+}
+
+// UTF-8 code points: bytes that do not continue a sequence.
+auto code_points(std::string_view s) -> std::size_t {
+  return static_cast<std::size_t>(std::ranges::count_if(s, [](char ch) { return (static_cast<unsigned char>(ch) & 0xC0) != 0x80; }));
+}
+
+// A DEFAULT constant folded to the column's stored value.
+auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
+  using K = ast::Literal::Kind;
+  auto bad = [&] [[noreturn]] { throw SqlError{"DEFAULT is not a constant of type " + sql_type_name(t), l.pos}; };
+  if (l.kind == K::Null) return std::monostate{};
+  switch (t.kind) {
+    case SqlKind::SmallInt:
+    case SqlKind::Integer:
+    case SqlKind::BigInt: {
+      std::int64_t v = 0;
+      if (l.kind != K::Integer) bad();
+      auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
+      if (ec != std::errc{} || end != l.text.data() + l.text.size()) bad();
+      auto lim = t.kind == SqlKind::SmallInt ? std::int64_t{1} << 15 : std::int64_t{1} << 31;
+      if (t.kind != SqlKind::BigInt && (v < -lim || v >= lim)) {
+        throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
+      }
+      return v;
+    }
+    case SqlKind::Decimal: {
+      if (l.kind != K::Integer && l.kind != K::Number) bad();
+      auto v = scaled_decimal(l.text, t.precision, t.scale);
+      if (!v) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
+      return *v;
+    }
+    case SqlKind::Real:
+    case SqlKind::Double: {
+      double v = 0;
+      if (l.kind != K::Integer && l.kind != K::Number) bad();
+      auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
+      if (ec != std::errc{} || end != l.text.data() + l.text.size()) bad();
+      return v;
+    }
+    case SqlKind::Boolean:
+      if (l.kind != K::Bool) bad();
+      return l.b;
+    case SqlKind::Varchar:
+      if (l.kind == K::String && code_points(l.text) > t.length) {
+        throw SqlError{"DEFAULT too long for type " + sql_type_name(t), l.pos};
+      }
+      [[fallthrough]];
+    case SqlKind::Text:
+    case SqlKind::Bytea: {
+      if (l.kind != K::String) bad();
+      auto b = std::as_bytes(std::span{l.text.data(), l.text.size()});
+      return Bytes(b.begin(), b.end());
+    }
+    case SqlKind::Timestamp:
+    case SqlKind::Date:
+    case SqlKind::Time:
+      throw SqlError{"a DEFAULT for type " + sql_type_name(t) + " is not supported yet", l.pos};
+  }
+  bad();
+}
+
+auto column_spec(const ast::ColumnDefAst& c) -> ColumnSpec {
+  auto t = sql_type(c);
+  return ColumnSpec{c.name, t, !c.not_null && !c.primary_key,
+                    c.default_value ? fold_default(*c.default_value, t) : Datum{}};
 }
 
 class Binder {
@@ -141,23 +274,47 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
       [&](const auto& s) -> std::pair<Statement, std::int32_t> {
         using T = std::decay_t<decltype(s)>;
         if constexpr (std::is_same_v<T, ast::CreateTable>) {
-          CreateTable out{s.table, {}, s.pk};
+          CreateTableDdl out{s.table, {}, s.pk};
           for (const auto& c : s.columns) {
-            out.columns.push_back({c.name, sql_type(c), !c.not_null && !c.primary_key});
+            out.columns.push_back(column_spec(c));
             if (c.primary_key) out.pk.push_back(c.name);
           }
           if (out.pk.empty()) throw SqlError{"a table needs a PRIMARY KEY", s.pos};
-          return {out, s.pos};
+          return {Ddl{std::move(out)}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::CreateIndex>) {
           const auto* t = b.table(s.table, s.pos);
-          for (const auto& c : s.columns) (void)Binder::column(*t, c, s.pos);
-          return {CreateIndex{s.index, s.table, s.columns}, s.pos};
+          CreateIndexDdl out{s.index, s.table, {}, s.unique};
+          for (const auto& c : s.columns) {
+            (void)Binder::column(*t, c.name, s.pos);
+            out.columns.push_back({c.name, c.desc});
+          }
+          return {Ddl{std::move(out)}, s.pos};
+        } else if constexpr (std::is_same_v<T, ast::DropTable>) {
+          return {Ddl{DropTableDdl{s.table, s.if_exists}}, s.pos};
+        } else if constexpr (std::is_same_v<T, ast::DropIndex>) {
+          return {Ddl{DropIndexDdl{s.index, s.if_exists}}, s.pos};
+        } else if constexpr (std::is_same_v<T, ast::AddColumn>) {
+          (void)b.table(s.table, s.pos);
+          if (s.column.primary_key) throw SqlError{"ADD COLUMN cannot add a primary key column", s.column.pos};
+          auto spec = column_spec(s.column);
+          if (!spec.nullable && std::holds_alternative<std::monostate>(spec.default_value)) {
+            throw SqlError{"column \"" + s.column.name + "\" is NOT NULL and needs a DEFAULT for the existing rows",
+                           s.column.pos};
+          }
+          return {Ddl{AddColumnDdl{s.table, std::move(spec)}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::Insert>) {
           const auto* t = b.table(s.table, s.pos);
           Insert out{t, std::vector<std::optional<Expr>>(t->columns.size())};
           std::vector<const Column*> targets;
           if (s.columns.empty()) {
-            for (const auto& c : t->columns) targets.push_back(&c);
+            // As PostgreSQL: the values fill the leading columns and the rest
+            // take their defaults, so a column added later changes nothing.
+            for (std::size_t i = 0; i < std::min(s.values.size(), t->columns.size()); ++i) {
+              targets.push_back(&t->columns[i]);
+            }
+            if (s.values.size() > t->columns.size()) {
+              throw SqlError{"INSERT has more expressions than target columns", s.pos};
+            }
           } else {
             for (const auto& name : s.columns) targets.push_back(Binder::column(*t, name, s.pos));
           }
@@ -175,8 +332,12 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
             }
           }
           for (std::size_t i = 0; i < t->columns.size(); ++i) {
-            if (!out.values[i] && !t->columns[i].nullable) {
-              throw SqlError{"column \"" + t->columns[i].name + "\" is NOT NULL and has no value", s.pos};
+            const auto& c = t->columns[i];
+            if (!out.values[i] && std::ranges::find(t->pk_col_ids, c.id) != t->pk_col_ids.end()) {
+              throw SqlError{"primary key column \"" + c.name + "\" must be given", s.pos};
+            }
+            if (!out.values[i] && !c.nullable && std::holds_alternative<std::monostate>(c.default_value)) {
+              throw SqlError{"column \"" + c.name + "\" is NOT NULL and has no value", s.pos};
             }
           }
           return {out, s.pos};

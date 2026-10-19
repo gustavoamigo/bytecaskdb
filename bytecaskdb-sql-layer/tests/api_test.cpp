@@ -108,12 +108,233 @@ TEST_CASE("embedded API: a cached plan is recompiled after DDL", "[sql][api]") {
   auto db = Database::open(dir.path());
   (void)db->execute(kCreateTable);
   const auto& insert = db->prepare(kInsert);
-  CHECK(insert.plan_source().find("IDX_T_BY_NAME") == std::string::npos);
+  CHECK(insert.plan_source().find("IDX_3") == std::string::npos);
   (void)db->execute(insert, {i(1), bytes("apple"), i(10)});
   // The index is created after the plan: the INSERT must now maintain it.
   (void)db->execute(kCreateIndex);
   (void)db->execute(insert, {i(2), bytes("apple"), i(20)});
-  CHECK(insert.plan_source().find("IDX_T_BY_NAME") != std::string::npos);
+  CHECK(insert.plan_source().find("IDX_3") != std::string::npos);
   // Row 1 was backfilled by CREATE INDEX, row 2 by the recompiled INSERT.
   CHECK(ids(db->execute(kByName, {bytes("apple"), bytes("apple\x01")})) == std::vector<std::int64_t>{1, 2});
+}
+
+TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[sql][api][catalog]") {
+  sql_test::TempDir dir{"api_compat"};
+  auto db = Database::open(dir.path());
+  (void)db->execute(kCreateTable);
+  (void)db->execute(kCreateIndex);
+  const auto& insert = db->prepare(kInsert);
+  const auto& by_id = db->prepare(kById);
+  const auto& by_name = db->prepare(kByName);
+  (void)db->execute(insert, {i(1), bytes("apple"), i(10)});
+  (void)db->execute(by_id, {i(1)});
+  (void)db->execute(by_name, {bytes("a"), bytes("b")});
+  auto compiled = db->compilations();
+  CHECK(compiled == 3);
+
+  // ADD COLUMN invalidates nothing; rows the old INSERT writes take the default.
+  (void)db->execute("ALTER TABLE t ADD COLUMN tag BIGINT DEFAULT 5");
+  CHECK(db->execute(insert, {i(2), bytes("banana"), i(20)}).affected == 1);
+  CHECK(db->execute(by_id, {i(2)}).rows == Grid{{i(2), i(20)}});
+  CHECK(ids(db->execute(by_name, {bytes("a"), bytes("c")})) == std::vector<std::int64_t>{1, 2});
+  CHECK(db->compilations() == compiled);
+  // Row 1, written before the column, was rewritten with the default.
+  CHECK(db->execute("SELECT id, tag FROM t WHERE id = $1", {i(1)}).rows == Grid{{i(1), i(5)}});
+  CHECK(db->execute("SELECT id, tag FROM t WHERE id = $1", {i(2)}).rows == Grid{{i(2), i(5)}});
+  compiled = db->compilations();
+
+  // CREATE INDEX recompiles the table's write plans and no read plan.
+  (void)db->execute("CREATE INDEX t_by_qty ON t (qty)");
+  (void)db->execute(by_id, {i(1)});
+  (void)db->execute(by_name, {bytes("a"), bytes("b")});
+  CHECK(db->compilations() == compiled);
+  CHECK(db->execute(insert, {i(3), bytes("cherry"), i(30)}).affected == 1);
+  CHECK(db->compilations() == compiled + 1);
+  CHECK(ids(db->execute("SELECT id FROM t WHERE qty >= $1", {i(15)})) == std::vector<std::int64_t>{2, 3});
+
+  // DROP INDEX recompiles the plans that scan it, which then have no plan, and
+  // the table's write plans.
+  (void)db->execute("DROP INDEX t_by_name");
+  CHECK_THROWS_AS(db->execute(by_name, {bytes("a"), bytes("b")}), ast::SqlError);
+  // A failed recompile keeps the statement's old plan whole and still
+  // incompatible: the next execute tries again and fails the same way,
+  // never running the old code (ASan checks the schema ref it reads).
+  CHECK_THROWS_AS(db->execute(by_name, {bytes("a"), bytes("b")}), ast::SqlError);
+  CHECK(by_name.plan_source().find("IDX_3") != std::string::npos);
+  CHECK(db->execute(insert, {i(4), bytes("date"), i(40)}).affected == 1);
+  CHECK(db->execute(by_id, {i(4)}).rows == Grid{{i(4), i(40)}});
+
+  // DROP TABLE: every plan on it is refused at recompile.
+  (void)db->execute("DROP TABLE t");
+  try {
+    (void)db->execute(by_id, {i(1)});
+    FAIL("a plan on a dropped table must be refused");
+  } catch (const ast::SqlError& e) {
+    CHECK(std::string{e.what()} == "relation \"t\" does not exist");
+  }
+  CHECK_THROWS_AS(db->execute(insert, {i(5), bytes("x"), i(1)}), ast::SqlError);
+  (void)db->execute("DROP TABLE IF EXISTS t");
+  CHECK_THROWS_AS(db->execute("DROP TABLE t"), std::invalid_argument);
+}
+
+TEST_CASE("embedded API: a unique index refuses duplicates, treats nulls as distinct, and moves with UPDATE",
+          "[sql][api][catalog]") {
+  sql_test::TempDir dir{"api_unique"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE c (id BIGINT PRIMARY KEY, email BYTEA, w BIGINT)");
+  (void)db->execute("CREATE UNIQUE INDEX c_email ON c (email)");
+  auto ix_id = db->catalog()->index("c_email").second->id;
+  constexpr auto kIns = "INSERT INTO c VALUES ($1, $2, $3)";
+  constexpr auto kSetEmail = "UPDATE c SET email = $2 WHERE id = $1";
+  constexpr auto kByEmail = "SELECT id FROM c WHERE email >= $1 AND email < $2";
+  auto refused = [&](std::string_view sql, std::vector<Value> params) {
+    try {
+      (void)db->execute(sql, params);
+    } catch (const ExecError& e) {
+      CHECK(e.code() == BC_E_CONSTRAINT);
+      CHECK(std::string{e.what()}.find("unique constraint of object " + std::to_string(ix_id)) != std::string::npos);
+      return true;
+    }
+    return false;
+  };
+  CHECK(db->execute(kIns, {i(1), bytes("a"), i(0)}).affected == 1);
+  CHECK(refused(kIns, {i(2), bytes("a"), i(0)}));
+  CHECK(db->execute(kIns, {i(3), kNull, i(0)}).affected == 1);
+  CHECK(db->execute(kIns, {i(4), kNull, i(0)}).affected == 1);  // nulls are distinct
+  CHECK(db->execute("INSERT INTO c (id, w) VALUES ($1, $2)", {i(6), i(0)}).affected == 1);  // email defaults to NULL
+
+  CHECK(db->execute(kSetEmail, {i(1), bytes("b")}).affected == 1);
+  CHECK(db->execute(kIns, {i(5), bytes("a"), i(0)}).affected == 1);  // "a" is free again
+  CHECK(refused(kSetEmail, {i(5), bytes("b")}));
+  CHECK(db->execute(kSetEmail, {i(1), bytes("b")}).affected == 1);  // to its own value: no collision
+  CHECK(db->execute(kSetEmail, {i(3), bytes("c")}).affected == 1);  // from NULL
+  CHECK(db->execute(kSetEmail, {i(5), kNull}).affected == 1);       // to NULL
+  CHECK(db->execute("UPDATE c SET w = $2 WHERE id = $1", {i(1), i(9)}).affected == 1);
+  // The index holds one entry per row, at its current value.
+  CHECK(ids(db->execute(kByEmail, {bytes("a"), bytes("z")})) == std::vector<std::int64_t>{1, 3});
+  CHECK(db->execute(kIns, {i(7), bytes("a"), i(0)}).affected == 1);
+  CHECK(ids(db->execute("SELECT id FROM c WHERE email = $1", {bytes("a")})) == std::vector<std::int64_t>{7});
+
+  // A unique index over rows that already collide is refused.
+  (void)db->execute(kIns, {i(8), bytes("q"), i(1)});
+  (void)db->execute(kIns, {i(9), bytes("r"), i(1)});
+  CHECK_THROWS_AS(db->execute("CREATE UNIQUE INDEX c_w ON c (w)"), std::invalid_argument);
+  CHECK(db->catalog()->index("c_w").second == nullptr);
+  db->close();
+
+  auto again = Database::open(dir.path());
+  CHECK(again->catalog()->index("c_email").second->unique);
+  try {
+    (void)again->execute(kIns, {i(10), bytes("b"), i(0)});
+    FAIL("the unique index must survive a reopen");
+  } catch (const ExecError& e) {
+    CHECK(e.code() == BC_E_CONSTRAINT);
+  }
+}
+
+TEST_CASE("embedded API: ranges on a DESC index part, nullable and not", "[sql][api][catalog]") {
+  sql_test::TempDir dir{"api_desc"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE s (id BIGINT PRIMARY KEY, score BIGINT, rank BIGINT NOT NULL)");
+  (void)db->execute("INSERT INTO s VALUES ($1, $2, $3)", {i(1), i(10), i(1)});
+  (void)db->execute("INSERT INTO s VALUES ($1, $2, $3)", {i(2), i(20), i(2)});
+  (void)db->execute("CREATE INDEX s_score ON s (score DESC)");  // backfilled
+  (void)db->execute("CREATE INDEX s_rank ON s (rank DESC)");
+  (void)db->execute("INSERT INTO s VALUES ($1, $2, $3)", {i(3), kNull, i(3)});
+  (void)db->execute("INSERT INTO s VALUES ($1, $2, $3)", {i(4), i(30), i(4)});
+  (void)db->execute("INSERT INTO s VALUES ($1, $2, $3)", {i(5), i(20), i(5)});
+  auto q = [&](std::string_view where, std::vector<Value> p) {
+    return ids(db->execute("SELECT id FROM s WHERE " + std::string{where}, p));
+  };
+  using V = std::vector<std::int64_t>;
+  auto check_all = [&] {
+    // Index order is descending score, nulls last; no range returns the null.
+    CHECK(q("score >= $1", {i(20)}) == V{4, 2, 5});
+    CHECK(q("score > $1", {i(20)}) == V{4});
+    CHECK(q("score < $1", {i(30)}) == V{2, 5, 1});
+    CHECK(q("score <= $1", {i(20)}) == V{2, 5, 1});
+    CHECK(q("score >= $1 AND score < $2", {i(10), i(30)}) == V{2, 5, 1});
+    CHECK(q("score > $1 AND score <= $2", {i(10), i(30)}) == V{4, 2, 5});
+    CHECK(q("score = $1", {i(20)}) == V{2, 5});
+    CHECK(q("score >= $1", {i(100)}).empty());
+    CHECK(q("rank < $1", {i(3)}) == V{2, 1});
+    CHECK(q("rank >= $1", {i(4)}) == V{5, 4});
+    CHECK(q("rank > $1 AND rank <= $2", {i(1), i(3)}) == V{3, 2});
+  };
+  check_all();
+  // DELETE and UPDATE keep the DESC entries.
+  CHECK(db->execute("UPDATE s SET score = $2 WHERE id = $1", {i(1), i(25)}).affected == 1);
+  CHECK(q("score < $1", {i(30)}) == V{1, 2, 5});
+  CHECK(db->execute("UPDATE s SET score = $2 WHERE id = $1", {i(1), i(10)}).affected == 1);
+  db->close();
+  db = Database::open(dir.path());
+  check_all();
+}
+
+TEST_CASE("embedded API: names that are not C identifiers work end to end", "[sql][api][catalog]") {
+  sql_test::TempDir dir{"api_names"};
+  auto db = Database::open(dir.path());
+  (void)db->execute(R"(CREATE TABLE "a-b c" ("my id" BIGINT PRIMARY KEY, "x*/y" BYTEA, "1st" BIGINT))");
+  (void)db->execute(R"(CREATE UNIQUE INDEX "the index" ON "a-b c" ("x*/y"))");
+  constexpr auto kIns = R"(INSERT INTO "a-b c" VALUES ($1, $2, $3))";
+  CHECK(db->execute(kIns, {i(1), bytes("p"), i(10)}).affected == 1);
+  CHECK(db->execute(kIns, {i(2), bytes("q"), i(20)}).affected == 1);
+  CHECK_THROWS_AS(db->execute(kIns, {i(3), bytes("q"), i(30)}), ExecError);
+  // The header names the objects; in a // line "*/" is plain text.
+  const auto& ins = db->prepare(kIns);
+  CHECK(ins.plan_source().find("a-b c.x*/y") != std::string::npos);
+  CHECK(ids(db->execute(R"(SELECT "my id" FROM "a-b c" WHERE "x*/y" >= $1 AND "x*/y" < $2)", {bytes("a"), bytes("z")})) ==
+        std::vector<std::int64_t>{1, 2});
+  CHECK(db->execute(R"(UPDATE "a-b c" SET "1st" = "1st" - $2 WHERE "my id" = $1)", {i(1), i(3)}).affected == 1);
+  CHECK(db->execute(R"(SELECT "1st" FROM "a-b c" WHERE "my id" = $1)", {i(1)}).rows == Grid{{i(7)}});
+  CHECK(db->execute(R"(DELETE FROM "a-b c" WHERE "my id" = $1)", {i(2)}).affected == 1);
+  (void)db->execute(R"(DROP TABLE "a-b c")");
+}
+
+TEST_CASE("embedded API: a quoted name keeps its case, and nothing in a name escapes the plan's comment",
+          "[sql][api][catalog]") {
+  sql_test::TempDir dir{"api_quoted"};
+  auto db = Database::open(dir.path());
+  (void)db->execute(R"(CREATE TABLE "Foo" (k BIGINT PRIMARY KEY, v BIGINT))");
+  (void)db->execute("CREATE TABLE foo (k BIGINT PRIMARY KEY, v BIGINT)");  // another table, as in PostgreSQL
+  (void)db->execute(R"(INSERT INTO "Foo" VALUES ($1, $2))", {i(1), i(10)});
+  (void)db->execute("INSERT INTO foo VALUES ($1, $2)", {i(1), i(20)});
+  CHECK(db->execute(R"(SELECT v FROM "Foo" WHERE k = $1)", {i(1)}).rows == Grid{{i(10)}});
+  CHECK(db->execute("SELECT v FROM FOO WHERE k = $1", {i(1)}).rows == Grid{{i(20)}});  // unquoted folds to foo
+
+  // Names that would end or splice a C comment: a backslash-newline before
+  // "/", a "*/", a carriage return, "??/" (a backslash as a trigraph). Were
+  // any of them to reach the lexer as more than comment text, the "#error"
+  // line would be compiled and the plan would not build.
+  const std::vector<std::string> evils{"*\\\n/\n#error injected\n/*", "x */\n#error injected\n",
+                                       "cr\r\n#error injected", "t?" "?/\n#error injected", "back\\slash\\"};
+  for (const auto& evil : evils) {
+    INFO(evil);
+    auto quoted = "\"" + evil + "\"";
+    (void)db->execute("CREATE TABLE e (k BIGINT PRIMARY KEY, " + quoted + " BIGINT)");
+    (void)db->execute("INSERT INTO e VALUES ($1, $2)", {i(1), i(5)});
+    auto sel = "SELECT " + quoted + " FROM e WHERE k = $1";
+    CHECK(db->execute(sel, {i(1)}).rows == Grid{{i(5)}});
+    const auto& src = db->prepare(sel).plan_source();
+    // Three header lines, each a // comment with no raw backslash, "?" or
+    // carriage return: only \xNN escapes.
+    auto header = src.substr(0, src.find("#include"));
+    std::size_t lines = 0;
+    for (std::size_t at = 0; at < header.size();) {
+      auto end = header.find('\n', at);
+      auto line = header.substr(at, end - at);
+      CHECK(line.starts_with("// "));
+      for (std::size_t k = line.find('\\'); k != std::string::npos; k = line.find('\\', k + 1)) {
+        CHECK(line.compare(k, 2, "\\x") == 0);
+      }
+      CHECK(line.find('\r') == std::string::npos);
+      CHECK(line.find('?') == std::string::npos);
+      CHECK_FALSE(line.ends_with("\\"));
+      ++lines;
+      at = end + 1;
+    }
+    CHECK(lines == 3);
+    CHECK(src.find("\n#error") == std::string::npos);
+    (void)db->execute("DROP TABLE e");
+  }
 }

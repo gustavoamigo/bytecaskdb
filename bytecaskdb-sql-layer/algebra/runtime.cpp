@@ -4,7 +4,9 @@
 // runtime.cpp — the plan-API symbol table; see runtime.cppm.
 
 module;
+#include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <variant>
@@ -47,6 +49,37 @@ auto decode_row(const RowLayout& layout, BytesView row) -> std::vector<bc_value>
     }
   }
   return out;
+}
+
+auto schema_incompatibility(const Catalog& cat, const bc_schema_ref& ref) -> std::optional<std::string> {
+  auto ids = [](const std::uint32_t* p, std::uint32_t n) { return std::span{p, p == nullptr ? 0 : n}; };
+  for (auto id : ids(ref.objects_read, ref.n_read)) {
+    if (cat.key_layout(id) == nullptr) return "table or index " + std::to_string(id) + " the plan reads no longer exists";
+  }
+  auto maintained = ids(ref.indexes_written, ref.n_indexes_written);
+  for (auto id : maintained) {
+    const auto* kl = cat.key_layout(id);
+    if (kl == nullptr || kl->index == nullptr) return "index " + std::to_string(id) + " the plan maintains no longer exists";
+  }
+  for (auto id : ids(ref.tables_written, ref.n_written)) {
+    const auto* t = cat.table(id);
+    if (t == nullptr) return "table " + std::to_string(id) + " the plan writes no longer exists";
+    for (const auto& ix : t->indexes) {
+      if (std::ranges::find(maintained, ix.id) == maintained.end()) {
+        return "the plan does not maintain index " + ix.name + " of table " + t->name;
+      }
+    }
+  }
+  for (const auto& c : std::span{ref.cols, ref.cols == nullptr ? 0 : ref.n_cols}) {
+    const auto* layout = cat.row_layout(c.layout);
+    if (layout == nullptr) return "layout " + std::to_string(c.layout) + " is no longer a table's current layout";
+    const auto* slot = layout->find(c.col);
+    if (slot == nullptr || slot->pos != c.pos || static_cast<std::uint8_t>(slot->type) != c.type) {
+      return "column " + std::to_string(c.col) + " of layout " + std::to_string(c.layout) +
+             " no longer has the position and type the plan was compiled with";
+    }
+  }
+  return std::nullopt;
 }
 
 auto result_type_codes(std::span<const PhysType> types) -> std::vector<std::uint8_t> {

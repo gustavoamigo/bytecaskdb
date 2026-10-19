@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// ast.cppm — the small AST the parser hands the binder: the prototype's seven
-// statement forms and nothing else. Names are as written; positions are
-// byte offsets into the statement text, -1 where libpg_query gives none.
+// ast.cppm — the small AST the parser hands the binder: the prototype's DML
+// forms and the stage-1 DDL of docs/sql_layer_catalog_design.md. Names are as
+// written; positions are byte offsets into the statement text, -1 where
+// libpg_query gives none.
 //
 // prototype: replaced by the designed front end (#492). SqlError's
 // destructor is in ast.cpp.
@@ -11,6 +12,7 @@
 module;
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <variant>
@@ -50,11 +52,23 @@ struct Compare {
   std::int32_t pos{-1};
 };
 
+// A constant, as written: DEFAULT's operand. Numbers keep their text, so
+// the binder folds them exactly to the column's type.
+struct Literal {
+  enum class Kind { Null, Integer, Number, String, Bool };
+  Kind kind;
+  std::string text;  // Integer and Number: the digits as written; String: the bytes
+  bool b{false};     // Bool
+  std::int32_t pos{-1};
+};
+
 struct ColumnDefAst {
   std::string name;
-  std::string type;  // libpg_query's last type name: int8, bytea, …
+  std::string type;                    // libpg_query's last type name: int8, varchar, numeric, …
+  std::vector<std::int32_t> typmods;   // VARCHAR(n): {n}; NUMERIC(p, s): {p, s} or {p}
   bool not_null{false};
   bool primary_key{false};
+  std::optional<Literal> default_value;
   std::int32_t pos{-1};
 };
 
@@ -65,10 +79,35 @@ struct CreateTable {
   std::int32_t pos{-1};
 };
 
+struct IndexColumnAst {
+  std::string name;
+  bool desc{false};
+};
+
 struct CreateIndex {
   std::string index;
   std::string table;
-  std::vector<std::string> columns;
+  std::vector<IndexColumnAst> columns;
+  bool unique{false};
+  std::int32_t pos{-1};
+};
+
+struct DropTable {
+  std::string table;
+  bool if_exists{false};
+  std::int32_t pos{-1};
+};
+
+struct DropIndex {
+  std::string index;
+  bool if_exists{false};
+  std::int32_t pos{-1};
+};
+
+// ALTER TABLE … ADD COLUMN, the one ALTER TABLE form in scope.
+struct AddColumn {
+  std::string table;
+  ColumnDefAst column;
   std::int32_t pos{-1};
 };
 
@@ -105,6 +144,7 @@ struct Delete {
   std::int32_t pos{-1};
 };
 
-using Statement = std::variant<CreateTable, CreateIndex, Insert, Select, Update, Delete>;
+using Statement =
+    std::variant<CreateTable, CreateIndex, DropTable, DropIndex, AddColumn, Insert, Select, Update, Delete>;
 
 }  // namespace bytecask::sql::ast

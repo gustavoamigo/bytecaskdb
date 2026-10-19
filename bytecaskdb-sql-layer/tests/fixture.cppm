@@ -9,6 +9,8 @@
 module;
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <utility>
 #include <optional>
 #include <span>
 #include <variant>
@@ -27,7 +29,7 @@ export namespace sql_test {
 struct Fixture {
   TempDir dir{"plan"};
   std::unique_ptr<bytecask::DB> db;  // DB is not movable: open() is elided into new
-  bytecask::sql::Catalog cat;
+  std::unique_ptr<bytecask::sql::LiveCatalog> live;
   bc_db bdb{};
   bc_catalog bcat{};
   bc_ctx* cx{nullptr};
@@ -39,22 +41,40 @@ struct Fixture {
 
   void open(bool create) {
     db.reset(new bytecask::DB(bytecask::DB::open(dir.path())));
-    cat = bytecask::sql::Catalog::load(*db);
+    live = std::make_unique<bytecask::sql::LiveCatalog>(*db);
     if (create) {
       using bytecask::sql::PhysType;
-      (void)cat.create_table(*db, "t",
-                             {{"id", PhysType::I64, false}, {"name", PhysType::Bytes, true}, {"qty", PhysType::I64, true}},
-                             {"id"});
-      (void)cat.create_index(*db, "t_by_name", "t", {"name"});
+      ddl(bytecask::sql::CreateTableDdl{
+          "t", {col("id", PhysType::I64, false), col("name", PhysType::Bytes, true), col("qty", PhysType::I64, true)}, {"id"}});
+      ddl(bytecask::sql::CreateIndexDdl{"t_by_name", "t", {{"name"}}});
     }
     bdb = {db.get()};
-    bcat = {&cat};
+    bcat = {live.get()};
     cx = bc_ctx_new(&bdb, &bcat, 1u << 20);
+  }
+
+  // The live catalog's current version. The reference is valid until the
+  // next DDL publishes another.
+  [[nodiscard]] auto cat() const -> const bytecask::sql::Catalog& { return *live->current(); }
+  void ddl(const bytecask::sql::Ddl& d) { (void)live->apply(d); }
+
+  // A column of the SQL type each physical type is the widening of.
+  static auto col(std::string name, bytecask::sql::PhysType t, bool nullable) -> bytecask::sql::ColumnSpec {
+    using bytecask::sql::SqlKind;
+    auto kind = SqlKind::BigInt;
+    switch (t) {
+      case bytecask::sql::PhysType::I64: kind = SqlKind::BigInt; break;
+      case bytecask::sql::PhysType::F64: kind = SqlKind::Double; break;
+      case bytecask::sql::PhysType::Bool: kind = SqlKind::Boolean; break;
+      case bytecask::sql::PhysType::Bytes: kind = SqlKind::Bytea; break;
+    }
+    return {std::move(name), {kind}, nullable, {}};
   }
 
   void close() {
     bc_ctx_free(cx);
     cx = nullptr;
+    live.reset();
     if (db) db->close();
     db.reset();
   }
@@ -83,5 +103,19 @@ inline auto type_codes(std::span<const bytecask::sql::PhysType> types) -> std::v
 }
 
 inline auto params(std::vector<bc_value> v) -> bc_params { return bc_params{std::move(v)}; }
+
+// A bc_schema_ref and the arrays it points into.
+struct SchemaRef {
+  std::vector<std::uint32_t> read, written, indexes;
+  std::vector<bc_col_ref> cols;
+  std::vector<std::uint8_t> codes;
+  std::uint64_t version{0};
+
+  [[nodiscard]] auto get() const -> bc_schema_ref {
+    auto n = [](const auto& v) { return static_cast<std::uint32_t>(v.size()); };
+    return {version, read.data(), n(read), written.data(), n(written), indexes.data(), n(indexes),
+            cols.data(), n(cols), codes.data(), n(codes)};
+  }
+};
 
 }  // namespace sql_test

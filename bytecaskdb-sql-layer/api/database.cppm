@@ -3,8 +3,9 @@
 //
 // database.cppm — the embedded SQL API: open a directory, prepare a statement,
 // execute it with parameters, read the rows. Every DML statement is compiled
-// once to a plan, by TinyCC, and cached by its text; a plan compiled against
-// an older catalog is recompiled from that text before it runs.
+// once to a plan, by TinyCC, and cached by its text; a plan the catalog has
+// moved past (docs/sql_layer_catalog_design.md, *Compatibility*) is
+// recompiled from that text before it runs.
 //
 // Autocommit only: each execute is one plan through bc_execute, retried on a
 // conflict. One thread at a time.
@@ -76,6 +77,8 @@ private:
   std::vector<std::string> columns_;
   std::vector<std::uint8_t> result_codes_;  // the plan's result_types as bc_type codes
   RowLayout result_layout_;                 // how its result rows decode, built once per compile
+  std::vector<bc_col_ref> col_refs_;
+  bc_schema_ref ref_{};  // points into plan_ and the vectors above
 };
 
 class Database {
@@ -95,6 +98,10 @@ public:
     return execute(prepare(sql), params);
   }
   [[nodiscard]] auto cached_plans() const -> std::size_t { return cache_.size(); }
+  // How many times a DML statement was compiled, first compiles included.
+  [[nodiscard]] auto compilations() const -> std::uint64_t { return compilations_; }
+  // The live catalog: the version DDL last published.
+  [[nodiscard]] auto catalog() const -> std::shared_ptr<const Catalog> { return live_->current(); }
 
   // Closes the engine; every later call is undefined.
   void close();
@@ -104,11 +111,12 @@ private:
   void compile(Statement& s);
 
   std::unique_ptr<DB> db_;
-  Catalog cat_;
+  std::unique_ptr<LiveCatalog> live_;
   bc_db bdb_{};
   bc_catalog bcat_{};
   bc_ctx* cx_{nullptr};
   std::map<std::string, std::unique_ptr<Statement>, std::less<>> cache_;
+  std::uint64_t compilations_{0};
 };
 
 }  // namespace bytecask::sql

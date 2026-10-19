@@ -8,7 +8,7 @@
 // The planner has three rules:
 //   1. every primary key column compared for equality  -> bc_get on the row
 //   2. a range on the first column of a secondary index -> bc_scan_open on the
-//      index, bc_lookup per entry (SELECT only)
+//      index, ASC or DESC, bc_lookup per entry (SELECT only)
 //   3. anything else                                    -> rejected
 //
 // prototype: string templates, replaced by the designed planner and code
@@ -26,13 +26,22 @@ export import bytecask.sql.binder;
 
 export namespace bytecask::sql {
 
+// A column a plan reads or sets, as compiled: what bc_col_ref carries.
+struct ColumnDep {
+  std::uint32_t layout, col, pos;
+  PhysType type;
+};
+
 struct GeneratedPlan {
   std::string source;  // the plan file: #include "bc_plan.h", constants, plan()
   std::vector<PhysType> param_types;
   bool returns_rows{false};
   std::vector<PhysType> result_types;  // the plan's result layout, for its bc_schema_ref
+  // What its bc_schema_ref lists (docs/sql_layer_catalog_design.md,
+  // *Compatibility*). The embedded API skips the walk while the version is unchanged.
   std::uint64_t catalog_version{0};
-  std::vector<std::uint32_t> tables_read, tables_written;
+  std::vector<std::uint32_t> objects_read, tables_written, indexes_written;
+  std::vector<ColumnDep> columns;
 };
 
 // Plans a DML statement. Throws ast::SqlError (position -1) when no rule

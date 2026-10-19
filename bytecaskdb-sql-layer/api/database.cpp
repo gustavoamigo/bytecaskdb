@@ -58,9 +58,9 @@ auto Statement::plan_source() const -> const std::string& {
 auto Database::open(const std::filesystem::path& dir) -> std::unique_ptr<Database> {
   std::unique_ptr<Database> d{new Database};
   d->db_.reset(new DB(DB::open(dir)));
-  d->cat_ = Catalog::load(*d->db_);
+  d->live_ = std::make_unique<LiveCatalog>(*d->db_);
   d->bdb_ = {d->db_.get()};
-  d->bcat_ = {&d->cat_};
+  d->bcat_ = {d->live_.get()};
   d->cx_ = bc_ctx_new(&d->bdb_, &d->bcat_, kArenaBytes);
   if (d->cx_ == nullptr) throw std::bad_alloc();
   return d;
@@ -77,25 +77,47 @@ void Database::close() {
   cache_.clear();
   bc_ctx_free(cx_);
   cx_ = nullptr;
+  live_.reset();
   if (db_) db_->close();
   db_.reset();
 }
 
 void Database::compile(Statement& s) {
-  auto bound = bound::bind(s.ast_, cat_);
-  if (std::holds_alternative<bound::CreateTable>(bound.stmt) || std::holds_alternative<bound::CreateIndex>(bound.stmt)) {
+  auto cat = live_->current();
+  auto bound = bound::bind(s.ast_, *cat);
+  if (std::holds_alternative<Ddl>(bound.stmt)) {
+    s.ref_ = {};
     s.plan_.reset();
     s.code_.reset();
     return;
   }
+  // Everything is built first and the statement changed only once nothing
+  // can throw: ref_ points into plan_ and the vectors, and a statement that
+  // fails to recompile keeps its old, consistent plan.
+  std::vector<std::string> columns;
   if (const auto* sel = std::get_if<bound::Select>(&bound.stmt)) {
-    s.columns_.clear();
-    for (auto id : sel->targets) s.columns_.push_back(sel->table->column(id)->name);
+    for (auto id : sel->targets) columns.push_back(sel->table->column(id)->name);
   }
-  s.plan_ = std::make_unique<GeneratedPlan>(generate_plan(bound, cat_, s.sql_));
-  s.result_codes_ = result_type_codes(s.plan_->result_types);
-  s.result_layout_ = make_result_layout(s.plan_->result_types);
-  s.code_ = TccPlan::compile(s.plan_->source);
+  auto plan = std::make_unique<GeneratedPlan>(generate_plan(bound, *cat, s.sql_));
+  auto codes = result_type_codes(plan->result_types);
+  auto layout = make_result_layout(plan->result_types);
+  auto code = TccPlan::compile(plan->source);
+  std::vector<bc_col_ref> col_refs;
+  for (const auto& c : plan->columns) col_refs.push_back({c.layout, c.col, c.pos, static_cast<std::uint8_t>(c.type)});
+  auto n = [](const auto& v) { return narrow<std::uint32_t>(v.size()); };
+  const auto& p = *plan;
+  bc_schema_ref ref{p.catalog_version,       p.objects_read.data(), n(p.objects_read),   p.tables_written.data(),
+                    n(p.tables_written),     p.indexes_written.data(), n(p.indexes_written), col_refs.data(),
+                    n(col_refs),             codes.data(),          n(codes)};
+  // Moves keep every buffer ref points into.
+  if (std::holds_alternative<bound::Select>(bound.stmt)) s.columns_ = std::move(columns);
+  s.plan_ = std::move(plan);
+  s.code_ = std::move(code);
+  s.result_codes_ = std::move(codes);
+  s.result_layout_ = std::move(layout);
+  s.col_refs_ = std::move(col_refs);
+  s.ref_ = ref;
+  ++compilations_;
 }
 
 auto Database::prepare(std::string_view sql) -> const Statement& {
@@ -113,18 +135,19 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   Rows out;
   if (stmt.is_ddl()) {
     if (!params.empty()) throw std::invalid_argument("DDL takes no parameters");
-    auto bound = bound::bind(stmt.ast_, cat_);
-    if (const auto* ct = std::get_if<bound::CreateTable>(&bound.stmt)) {
-      (void)cat_.create_table(*db_, ct->table, ct->columns, ct->pk);
-    } else {
-      const auto& ci = std::get<bound::CreateIndex>(bound.stmt);
-      (void)cat_.create_index(*db_, ci.index, ci.table, ci.columns);
-    }
+    auto bound = bound::bind(stmt.ast_, *live_->current());
+    (void)live_->apply(std::get<Ddl>(bound.stmt));
     out.affected = 0;
     return out;
   }
-  // A plan compiled against an older catalog is recompiled from its text.
-  if (stmt.plan_->catalog_version != cat_.version()) compile(stmt);
+  // A plan the catalog has moved past is recompiled from its text; one a
+  // DDL left compatible keeps running.
+  // The walk runs only when the catalog has moved since the compile: an
+  // unchanged version is one compare. bc_ctx_run checks in full regardless.
+  if (auto cat = live_->current();
+      stmt.ref_.catalog_version != cat->version() && schema_incompatibility(*cat, stmt.ref_)) {
+    compile(stmt);
+  }
 
   const auto& types = stmt.plan_->param_types;
   if (params.size() != types.size()) {
@@ -136,13 +159,16 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   }
   bc_params bp{params};
   const auto& p = *stmt.plan_;
-  bc_schema_ref ref{p.catalog_version, p.tables_read.data(), p.tables_written.data(),
-                    static_cast<std::uint32_t>(p.tables_read.size()),
-                    static_cast<std::uint32_t>(p.tables_written.size()), stmt.result_codes_.data(),
-                    static_cast<std::uint32_t>(stmt.result_codes_.size())};
-  auto r = bc_execute(cx_, stmt.code_->fn(), &ref, &bp, {}, true, kMaxRetries);
-  if (r == BC_CONFLICT) throw ExecError("conflict: a guard failed on every attempt", BC_CONFLICT);
-  if (r == BC_FAILED) throw ExecError(bc_error_message(cx_), bc_error(cx_));
+  auto r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
+  if (r == BC_CONFLICT) {
+    bc_ctx_reset(cx_);
+    throw ExecError("conflict: a guard failed on every attempt", BC_CONFLICT);
+  }
+  if (r == BC_FAILED) {
+    ExecError e{bc_error_message(cx_), bc_error(cx_)};
+    bc_ctx_reset(cx_);  // the context keeps no snapshot or catalog version while idle
+    throw e;
+  }
 
   out.affected = bc_ctx_affected(cx_);
   if (p.returns_rows) {
