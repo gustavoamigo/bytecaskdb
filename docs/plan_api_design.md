@@ -220,9 +220,11 @@ enum bc_error_code {
   BC_E_MEMORY,      /* arena exhausted or an ephemeral bound exceeded */
   BC_E_BUDGET,      /* work budget or deadline exhausted */
   BC_E_LIMIT,       /* key or value over the engine's limits */
-  BC_E_HANDLE,      /* stale, foreign or out-of-range handle, or a bad column offset */
+  BC_E_HANDLE,      /* stale, foreign or out-of-range handle, or a table, index or column the plan's
+                       bc_schema_ref does not declare, or not of the type used: a plan bug */
   BC_E_ARITH,       /* integer overflow, division by zero, out-of-range conversion */
-  BC_E_CONSTRAINT,  /* raised by the plan with bc_raise: unique, not-null, check; never retried */
+  BC_E_CONSTRAINT,  /* never retried; raised by the runtime (BC_C_UNIQUE from bc_insert and bc_update,
+                       BC_C_NOT_NULL from the row builder) or by the plan with bc_raise */
   BC_E_LAYOUT,      /* plan incompatible with the live catalog, or a row violates its layout */
   BC_E_DEGRADED,    /* engine degraded; writes refused */
   BC_E_CLOSED,
@@ -350,13 +352,17 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
 **Verification is cached.** A context remembers the references it verified,
 in a hash table keyed by the reference's `id`, with the catalog version it
 verified each against and the column map it built. A run whose reference
-and pinned version match an entry skips the walk: a hash lookup and an
-integer compare. The table holds 1,024 references; past that, a miss
+and pinned version match an entry skips the walk: a hash lookup, an
+integer compare and a compare of the reference's contents. The table grows
+as plans are cached, up to 1,024 references; past that, a miss
 evicts one by CLOCK (the first entry the hand finds unused since it last
 passed), so the references in use survive a flood of others, a recompiled
-plan's dead id is dropped in time, and a context's memory stays bounded. A hit also compares the reference's
-shape, its arrays and their lengths, with the entry's, so a different
-reference that reuses an id is verified on its own. The version is the catalog's identity: a context
+plan's dead id is dropped in time, and a context's memory stays bounded. A hit also compares the
+reference's ids, columns and result types, by value, with the copies the
+entry kept, so a reference rebuilt under a kept id, even in arrays at the
+old addresses, is verified on its own. The entry keeps its objects and
+columns sorted by id, so each access a plan makes is a binary search, not
+a scan of the reference. The version is the catalog's identity: a context
 is bound to one database at `bc_ctx_new`, and within a database a catalog
 version is never reused, so no pointer is compared (a freed catalog's
 address can be reused, its version cannot). An `id` of 0 is never cached.
@@ -536,7 +542,7 @@ bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: live
 | `bc_col_bytes` | The variable-length column, as a view with the row's lifetime. |
 | `bc_row_key` | The table's full primary key (namespace, table id, parts), encoded from the row's columns: for a `bc_get`, a guard, or a scan bound reached from a row. Built in the arena. |
 | `bc_row_begin` | Starts a row of `table`'s current layout with every column at its default: the catalog's default for a column that has one, null for the rest. A plan compiled before a column was added writes the column's default without naming it. |
-| `bc_row_from` | Starts a row of `table` as a copy of `old`, a row of that table and of its current layout generation (`BC_E_LAYOUT` otherwise; a `REBUILD`, #503, widens this to any generation). The `UPDATE` pattern: copy, set the assigned columns, end. |
+| `bc_row_from` | Starts a row of `table` as a copy of `old`, a row of that table and of its current layout generation (otherwise as for the writes below: `BC_L_ROW`, `BC_L_RETIRED` or `BC_E_CORRUPT`; a `REBUILD`, #503, widens this to any generation). The `UPDATE` pattern: copy, set the assigned columns, end. |
 | `bc_row_set_*`, `bc_row_set_null` | Sets column `col`, which must be of the builder's table. Setting twice keeps the last value. A NULL for a NOT NULL column is `BC_E_CONSTRAINT` with `BC_C_NOT_NULL` and the table's id, and sets nothing, so a column's default is never cleared. |
 | `bc_row_set_param` | Sets column `col` to parameter `i`: its value, or null when it is NULL. One call where a nullable column took an `if` and two sets. A parameter whose type is not the column's is `BC_E_HANDLE`; a NULL for a NOT NULL column is `BC_C_NOT_NULL`, as above. |
 | `bc_row_end` | Finalizes the row in the arena and returns its view, a built row of the builder's table. A NOT NULL column never set and with no default is `BC_C_NOT_NULL`, as above; a row over the engine's value limit is `BC_E_LIMIT`. |
@@ -613,7 +619,7 @@ void    bc_del_range(bc_ctx *, uint32_t table, bc_view lo, bc_view hi);
 | `bc_insert` | Inserts `row`, a row of `table`'s current layout. Checks on the snapshot that its primary key is free and that, for each unique index, no entry has the row's index parts (skipped when one of them is null: nulls are distinct); a duplicate is `BC_E_CONSTRAINT` with `BC_C_UNIQUE` and the table's or the index's id. Then writes the row and one entry per index, and a range guard over each checked unique prefix for the race. | 1, plus 1 per unique index | `put` per row and entry, `ensure_range_unchanged` per unique index |
 | `bc_update` | Replaces `old`, a stored row of `table`, with `row`. Writes the row; for each index, compares the entry `old` has with the one `row` has and, only where they differ, deletes the old and writes the new. An index none of whose columns changed encoding is not encoded at all, nor is the new primary key when its columns did not change, so an update of unindexed columns builds no index key. A unique index is checked, as for `bc_insert`, only when its prefix changed, so a row never collides with itself. A changed primary key moves the row: the old key deleted, the new one checked and written, and every entry moved, since each carries the primary key. | 1 per unique index whose prefix changed, plus 1 if the primary key changed | `put`, `del` |
 | `bc_delete` | Deletes `old`, a stored row of `table`, and its entry in every index. | 0 | `del` per row and entry |
-| `bc_del_range` | Deletes the rows of `table` whose primary keys are in `[lo, hi)`, row keys or prefixes of `table` (empty: its start or its end), with their index entries. `lo >= hi` deletes nothing. A table with no secondary index takes one range delete whatever the range holds; otherwise the runtime scans the range to delete each row's entries. | 0 without secondary indexes; else 1 per row in the range | `del_range`, then `del` per entry |
+| `bc_del_range` | Deletes the rows of `table` whose primary keys are in `[lo, hi)`, row keys or prefixes of `table` (empty: its start or its end), with their index entries. `lo >= hi` deletes nothing. A table with no secondary index takes one range delete whatever the range holds; otherwise the runtime scans the range to delete each row's entries. | 0 without secondary indexes; else 1 per row in the range, plus 1 for the record that ends it, each charged before it is read | `del_range`, then `del` per entry |
 
 `old` must be a stored row, read in this execution by `bc_get` or
 `bc_scan_row`: the entries removed are derived from it, so a row the plan
@@ -622,8 +628,12 @@ ones behind. Anything else is `BC_E_HANDLE`, and so is a second write of a
 row key this plan already wrote, for the same reason. A `bc_del_range` is a
 write of every row in its range: it is refused over a row the plan already
 wrote or a range it already deleted, and a later write of a row in its range
-is refused. A row of another table, or a
-`row` of another layout generation, is `BC_E_LAYOUT`.
+is refused. A row of another table is `BC_E_LAYOUT` with `BC_L_ROW`. A row
+not of its table's current layout generation is `BC_E_LAYOUT` with
+`BC_L_RETIRED` when `REBUILD` (#503) retired that generation, and
+`BC_E_CORRUPT` when the table never had it: that row is damage, not a
+stale plan. Neither is cured by a recompile, which only `BC_L_INCOMPATIBLE`
+asks for.
 
 Every key a write touches is in the write plan, and the engine checks each
 one for a change since the snapshot, so a concurrent writer of the same

@@ -151,14 +151,13 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   auto check_params = [](const std::string& why) {
     if (!why.empty()) throw std::invalid_argument(why);
   };
-  // Parameters that do not fit a plan a DDL has made incompatible may fit
-  // its recompile: only on that path is the catalog asked, before the run.
+  // Parameters that do not fit the cached plan may fit the plan a DDL has
+  // since made of the text: they are refused only once the plan is
+  // recompiled against the current catalog. So a call with wrong parameters
+  // costs a compile; compatibility itself is decided by bc_ctx_run alone.
   if (auto why = mismatch(); !why.empty()) {
-    if (schema_incompatibility(*live_->current(), stmt.ref_)) {
-      compile(stmt);
-      why = mismatch();
-    }
-    check_params(why);
+    compile(stmt);
+    check_params(mismatch());
   }
   bc_params bp{params};
   auto r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);

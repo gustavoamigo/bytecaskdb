@@ -473,11 +473,12 @@ TEST_CASE("plan writes: the reads each read and write is charged", "[sql][algebr
   CHECK(bc_error(f.cx) == BC_E_BUDGET);
   CHECK(run(f, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{0}},
             {.max_reads = 3, .deadline_ns = 0}) == BC_COMMITTED);
-  // A range delete of a table with indexes reads each row (t holds kN + 1),
-  // of one without, nothing.
-  CHECK(run(f, del_all_t, {}, {.max_reads = kN, .deadline_ns = 0}) == BC_FAILED);
+  // A range delete of a table with indexes reads each row (t holds kN + 1)
+  // and the record past the range, w's first row: each charged before it is
+  // read. Of one without, nothing.
+  CHECK(run(f, del_all_t, {}, {.max_reads = kN + 1, .deadline_ns = 0}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_BUDGET);
-  CHECK(run(f, del_all_t, {}, {.max_reads = kN + 1, .deadline_ns = 0}) == BC_COMMITTED);
+  CHECK(run(f, del_all_t, {}, {.max_reads = kN + 2, .deadline_ns = 0}) == BC_COMMITTED);
   CHECK(count_entries(*f.db, bytecask::sql::kNsRow, 1) == 0);
   CHECK(count_entries(*f.db, bytecask::sql::kNsIndex, 3) == 0);
   f.ddl(bytecask::sql::CreateTableDdl{"plain", {Fixture::col("k", PhysType::I64, false)}, {"k"}});

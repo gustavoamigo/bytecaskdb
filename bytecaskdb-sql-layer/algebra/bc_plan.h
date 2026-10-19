@@ -44,9 +44,11 @@ enum bc_error_code {
   BC_E_MEMORY,      /* arena exhausted or an ephemeral bound exceeded */
   BC_E_BUDGET,      /* work budget or deadline exhausted */
   BC_E_LIMIT,       /* key or value over the engine's limits */
-  BC_E_HANDLE,      /* stale, foreign or out-of-range handle, or a bad column offset */
+  BC_E_HANDLE,      /* stale, foreign or out-of-range handle, or a table, index or column the plan's
+                       bc_schema_ref does not declare, or not of the type used: a plan bug */
   BC_E_ARITH,       /* integer overflow, division by zero, out-of-range conversion */
-  BC_E_CONSTRAINT,  /* raised by the plan with bc_raise: unique, not-null, check; never retried */
+  BC_E_CONSTRAINT,  /* never retried; raised by the runtime (BC_C_UNIQUE from bc_insert and bc_update,
+                       BC_C_NOT_NULL from the row builder) or by the plan with bc_raise */
   BC_E_LAYOUT,      /* plan incompatible with the live catalog, or a row violates its layout */
   BC_E_DEGRADED,    /* engine degraded; writes refused */
   BC_E_CLOSED,

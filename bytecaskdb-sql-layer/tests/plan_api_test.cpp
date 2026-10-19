@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+#include "bytecaskdb-sql-layer/algebra/bc_plan_testing.h"
 #include "include/bytecask.hpp"
 
 import bytecask.sql.tests.fixture;
@@ -264,16 +265,22 @@ TEST_CASE("plan API: a context caches a verified reference by id and catalog ver
   SchemaRef reads_index{{kIdx}, {}, {}, {}, 0};
   auto ref = reads_index.get();
   CHECK(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_COMMITTED);
-  // Whether a run was served from the cache: the reference's object list is
-  // changed in place to name an object that does not exist. Same id, same
-  // arrays and lengths: a cached entry answers and the run commits; a
-  // verification would refuse it.
+  // Whether a run was served from the cache: it commits and verifies nothing.
   auto served_from_cache = [&](const bc_schema_ref& r) {
-    reads_index.read[0] = 4242;
+    auto before = bc_ctx_verifications(f.cx);
     auto got = bc_execute(f.cx, scan_index, &r, &none, {}, false, 0);
-    reads_index.read[0] = kIdx;
-    return got == BC_COMMITTED;
+    return got == BC_COMMITTED && bc_ctx_verifications(f.cx) == before;
   };
+  CHECK(served_from_cache(ref));
+
+  // The same reference, its object list changed in place to name an object
+  // that does not exist: same id, same arrays at the same addresses, other
+  // contents. Verified on its own and refused, never served the entry.
+  reads_index.read[0] = 4242;
+  CHECK(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_FAILED);
+  CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);
+  reads_index.read[0] = kIdx;
+  CHECK(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_COMMITTED);
   CHECK(served_from_cache(ref));
 
   // A different reference that reuses the id is verified on its own, not

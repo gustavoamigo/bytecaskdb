@@ -23,6 +23,7 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <cstring>
 #include <exception>
 #include <limits>
@@ -43,6 +44,7 @@
 
 // The C contract, and the engine through its public header.
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+#include "bytecaskdb-sql-layer/algebra/bc_plan_testing.h"
 #include "include/bytecask.hpp"
 
 // bc_db, bc_catalog and bc_params, which bc_plan.h leaves opaque, and the
@@ -147,41 +149,30 @@ struct TableCols {
   std::vector<ColSlot> by_col;
 };
 
-// What a reference points at: its arrays and their lengths. Kept with a
-// verified entry and compared on every hit, so a different reference that
-// reuses an id is verified on its own rather than served another's entry.
-struct RefShape {
-  const void* read{nullptr};
-  const void* written{nullptr};
-  const void* cols{nullptr};
-  const void* result{nullptr};
-  std::uint32_t n_read{0}, n_written{0}, n_cols{0}, n_result{0};
-  auto operator==(const RefShape&) const -> bool = default;
-};
-
-auto shape_of(const bc_schema_ref& r) -> RefShape {
-  return {r.objects_read, r.tables_written, r.cols, r.result_types, r.n_read, r.n_written, r.n_cols, r.n_result};
-}
-
 // A schema reference verified against one catalog version, with what the
 // verification built: the column map and the result layout. Plain data, no
 // pointer into the catalog, so an entry outlives the version it was built
 // on. Invariants: an entry is served without verification only when it is
-// valid and its ref_id, version and shape match the reference, the version
-// being the pinned catalog's. A cached entry's ref_id is an id bc_ref_id
-// issued and the key slot_of maps to it; a reference with no issued id
-// uses the context's scratch entry and is verified on every run. A failed
-// verification leaves the entry invalid, so the next run verifies again.
+// valid, its ref_id and version match the reference and the pinned catalog,
+// and the reference's arrays hold what the entry was verified from, so a
+// reference rebuilt under a kept id is verified on its own. A cached
+// entry's ref_id is an id bc_ref_id issued and the key slot_of maps to it;
+// a reference with no issued id uses the context's scratch entry and is
+// verified on every run. A failed verification leaves the entry invalid,
+// so the next run verifies again.
 struct Verified {
   bool valid{false};
   bool referenced{false};  // CLOCK: used since the hand last passed
   std::uint64_t ref_id{0};
   std::uint64_t version{0};
-  RefShape shape;
+  // What the reference held, compared on every hit.
+  std::vector<std::uint32_t> read_ids, written_ids;
+  std::vector<bc_col_ref> col_refs;
+  // Built from it: sorted, for a binary search per access.
   std::vector<std::uint32_t> objects;  // the tables and indexes it names
   std::vector<std::uint32_t> written;  // the tables it writes
-  std::vector<TableCols> tables;
-  std::vector<std::uint8_t> result_codes;
+  std::vector<TableCols> tables;       // by table id
+  std::vector<std::uint8_t> result_codes;  // as given
   std::vector<PhysType> result_types;
   std::optional<RowLayout> result_layout;
 };
@@ -287,12 +278,13 @@ struct bc_ctx {
   // from reference id to slot, and the CLOCK hand. A context is bound to one
   // database, and a catalog version is never reused within one, so an entry
   // is matched by the reference's id and the version alone. An id of 0 is
-  // verified into `scratch` on every run. `slots` is reserved whole at
-  // construction and only use_ref reuses a slot, before it sets `current`,
-  // so `current` never dangles.
-  std::vector<Verified> slots;
+  // verified into `scratch` on every run. `slots` grows by push_back, which
+  // keeps every entry where it is, up to kMaxVerified, and only use_ref
+  // reuses a slot, before it sets `current`, so `current` never dangles.
+  std::deque<Verified> slots;
   std::unordered_map<std::uint64_t, std::uint32_t> slot_of;
   std::size_t hand{0};
+  std::uint64_t verifications{0};  // runs the cache did not answer
   Verified scratch;
   const Verified* current{nullptr};  // this execution's reference; nullptr: none
 
@@ -305,9 +297,7 @@ struct bc_ctx {
   std::int64_t affected{-1};
 
   bc_ctx(bytecask::DB* d, LiveCatalog* l, std::uint32_t arena_bytes)
-      : db{d}, live{l}, arena(arena_bytes) {
-    slots.reserve(kMaxVerified);
-  }
+      : db{d}, live{l}, arena(arena_bytes) {}
 
   auto ok() const -> bool { return error == BC_OK; }
 
@@ -466,7 +456,7 @@ struct bc_ctx {
   auto declared_object(std::uint32_t id, bool write) -> bool {
     if (current == nullptr) return true;
     const auto& list = write ? current->written : current->objects;
-    if (std::ranges::find(list, id) != list.end()) return true;
+    if (std::ranges::binary_search(list, id)) return true;
     fail(BC_E_HANDLE, std::string{write ? "table " : "table or index "} + std::to_string(id) +
                           (write ? " is not among the tables the plan's schema ref writes"
                                  : " is not declared in the plan's schema ref"));
@@ -514,6 +504,8 @@ struct bc_ctx {
     effects.clear();
     written_rows.clear();
     deleted_ranges.clear();
+    key_parts.view = {};  // view handles repeat across executions once the epoch wraps
+    key_parts.at.clear();
     results.clear();
     result_pos = 0;
     emit.reset();
@@ -778,9 +770,34 @@ auto written_tables(const bc_ctx* cx) -> std::vector<std::uint32_t> {
   return out;
 }
 
+// A reference's arrays, empty where a pointer is null.
+struct RefArrays {
+  std::span<const std::uint32_t> read, written;
+  std::span<const bc_col_ref> cols;
+};
+
+auto ref_arrays(const bc_schema_ref& r) -> RefArrays {
+  auto span = [](const auto* p, std::uint32_t n) { return std::span{p, p == nullptr ? 0 : n}; };
+  return {span(r.objects_read, r.n_read), span(r.tables_written, r.n_written), span(r.cols, r.n_cols)};
+}
+
+// Whether `ref` holds what `e` was verified from: its ids, columns and
+// result types, compared by value, never by address.
+auto same_contents(const Verified& e, const bc_schema_ref& ref) -> bool {
+  auto [read, written, cols] = ref_arrays(ref);
+  auto same_col = [](const bc_col_ref& a, const bc_col_ref& b) {
+    return a.table == b.table && a.col == b.col && a.type == b.type;
+  };
+  return std::ranges::equal(read, e.read_ids) && std::ranges::equal(written, e.written_ids) &&
+         std::ranges::equal(cols, e.col_refs, same_col) &&
+         std::ranges::equal(std::span{ref.result_types, ref.result_types == nullptr ? 0 : ref.n_result},
+                            e.result_codes);
+}
+
 // Builds `e` for `ref` on the pinned version: the compatibility check, the
 // result layout (rebuilt only when the codes change), the column map.
 [[nodiscard]] auto verify(bc_ctx* cx, const bc_schema_ref* ref, Verified& e) -> bool {
+  ++cx->verifications;
   e.valid = false;
   if (auto why = bytecask::sql::schema_incompatibility(*cx->cat, *ref)) {
     cx->fail(BC_L_INCOMPATIBLE, "plan compiled against catalog v" + std::to_string(ref->catalog_version) +
@@ -808,25 +825,30 @@ auto written_tables(const bc_ctx* cx) -> std::vector<std::uint32_t> {
     e.result_codes.assign(codes.begin(), codes.end());
     e.result_types = std::move(types);
   }
-  auto ids = [](const std::uint32_t* p, std::uint32_t n) { return std::span{p, p == nullptr ? 0 : n}; };
-  e.written.assign(ids(ref->tables_written, ref->n_written).begin(), ids(ref->tables_written, ref->n_written).end());
-  e.objects.assign(ids(ref->objects_read, ref->n_read).begin(), ids(ref->objects_read, ref->n_read).end());
+  auto [read, written, cols] = ref_arrays(*ref);
+  e.read_ids.assign(read.begin(), read.end());
+  e.written_ids.assign(written.begin(), written.end());
+  e.col_refs.assign(cols.begin(), cols.end());
+  auto sorted = [](std::vector<std::uint32_t>& v) {
+    std::ranges::sort(v);
+    v.erase(std::ranges::unique(v).begin(), v.end());
+  };
+  e.written = e.written_ids;
+  sorted(e.written);
+  e.objects = e.read_ids;
   e.objects.insert(e.objects.end(), e.written.begin(), e.written.end());
+  sorted(e.objects);
   e.tables.clear();
-  for (const auto& c : std::span{ref->cols, ref->cols == nullptr ? 0 : ref->n_cols}) {
+  for (const auto& c : cols) {
     const auto* t = cx->cat->table(c.table);  // the check above found it
     const auto* slot = t->layout.find(c.col);
-    auto it = std::ranges::find(e.tables, c.table, &TableCols::table);
-    if (it == e.tables.end()) {
-      e.tables.push_back({c.table, t->layout.generation, {}});
-      it = std::prev(e.tables.end());
-    }
+    auto it = std::ranges::lower_bound(e.tables, c.table, {}, &TableCols::table);
+    if (it == e.tables.end() || it->table != c.table) it = e.tables.insert(it, {c.table, t->layout.generation, {}});
     if (it->by_col.size() <= c.col) it->by_col.resize(c.col + 1);
     it->by_col[c.col] = {true, slot->type, slot->pos};
   }
   e.ref_id = ref->id;
   e.version = cx->cat->version();
-  e.shape = shape_of(*ref);
   e.valid = true;
   return true;
 }
@@ -876,7 +898,7 @@ auto issued_ref_ids() -> std::atomic<std::uint64_t>& {
   // An id the runtime never issued is no id: verified on every run.
   auto id = ref->id <= issued_ref_ids().load(std::memory_order_relaxed) ? ref->id : 0;
   auto& e = id == 0 ? cx->scratch : cache_slot(cx, id);
-  if (id == 0 || !e.valid || e.ref_id != id || e.version != cx->cat->version() || e.shape != shape_of(*ref)) {
+  if (id == 0 || !e.valid || e.ref_id != id || e.version != cx->cat->version() || !same_contents(e, *ref)) {
     if (!verify(cx, ref, e)) return false;
   }
   cx->current = &e;
@@ -889,18 +911,16 @@ auto declared(bc_ctx* cx, std::uint32_t table, std::uint32_t col, std::optional<
     -> std::pair<const TableCols*, const ColSlot*> {
   if (!cx->ok()) return {};
   if (cx->current != nullptr) {
-    for (const auto& tc : cx->current->tables) {
-      if (tc.table != table) continue;
-      if (col < tc.by_col.size() && tc.by_col[col].declared) {
-        const auto& s = tc.by_col[col];
-        if (type && s.type != *type) {
-          cx->fail(BC_E_HANDLE, "column " + std::to_string(col) + " of table " + std::to_string(table) + " is not " +
-                                    type_name(*type));
-          return {};
-        }
-        return {&tc, &s};
+    const auto& tables = cx->current->tables;
+    auto tc = std::ranges::lower_bound(tables, table, {}, &TableCols::table);
+    if (tc != tables.end() && tc->table == table && col < tc->by_col.size() && tc->by_col[col].declared) {
+      const auto& s = tc->by_col[col];
+      if (type && s.type != *type) {
+        cx->fail(BC_E_HANDLE, "column " + std::to_string(col) + " of table " + std::to_string(table) + " is not " +
+                                  type_name(*type));
+        return {};
       }
-      break;
+      return {&*tc, &s};
     }
   }
   cx->fail(BC_E_HANDLE, "column " + std::to_string(col) + " of table " + std::to_string(table) +
@@ -1001,15 +1021,22 @@ auto write_row(bc_ctx* cx, const Table& t, bc_view row, bool stored) -> std::opt
   return r->bytes;
 }
 
+// Whether a range this execution deleted holds key `lo` or, given `hi`,
+// meets [lo, hi). The ranges are sorted and disjoint: only the last one
+// starting at or before lo can hold lo, and only the first after it can
+// start inside [lo, hi).
+[[nodiscard]] auto meets_deleted(const bc_ctx* cx, BytesView lo, std::optional<BytesView> hi = std::nullopt) -> bool {
+  const auto& ranges = cx->deleted_ranges;
+  auto next = ranges.upper_bound(lo);
+  if (next != ranges.begin() && std::is_lt(bytes_cmp(lo, std::prev(next)->second))) return true;
+  return hi && next != ranges.end() && std::is_lt(bytes_cmp(next->first, *hi));
+}
+
 // Records a row key this execution writes; a second write of it, or a write
 // into a range this execution deleted, is a plan bug (BC_E_HANDLE). The keys
 // and the deleted ranges are sorted sets: a lookup each per write.
 [[nodiscard]] auto first_write(bc_ctx* cx, const Table& t, BytesView pk) -> bool {
-  auto deleted = [&] {  // the range starting at or before pk, if pk is below its end
-    auto it = cx->deleted_ranges.upper_bound(pk);
-    return it != cx->deleted_ranges.begin() && std::is_lt(bytes_cmp(pk, std::prev(it)->second));
-  };
-  if (cx->written_rows.contains(pk) || deleted()) {
+  if (cx->written_rows.contains(pk) || meets_deleted(cx, pk)) {
     cx->fail(BC_E_HANDLE, "a row of table " + t.name + " written twice in one plan");
     return false;
   }
@@ -1208,6 +1235,8 @@ const char* bc_error_message(const bc_ctx* cx) { return cx->message.c_str(); }
 uint32_t bc_error_detail(const bc_ctx* cx) { return cx->detail; }
 
 int64_t bc_ctx_affected(const bc_ctx* cx) { return cx->affected; }
+
+uint64_t bc_ctx_verifications(const bc_ctx* cx) { return cx->verifications; }
 
 uint64_t bc_ref_id(void) { return issued_ref_ids().fetch_add(1, std::memory_order_relaxed) + 1; }
 
@@ -2067,12 +2096,8 @@ void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
   // So would a range this plan already deleted, whose entries it would
   // delete twice.
   auto written = cx->written_rows.lower_bound(BytesView{range->lo});
-  auto overlaps = [&] {  // the ranges are disjoint: only the neighbours of lo can meet [lo, hi)
-    auto next = cx->deleted_ranges.lower_bound(BytesView{range->lo});
-    if (next != cx->deleted_ranges.end() && std::is_lt(bytes_cmp(next->first, range->hi))) return true;
-    return next != cx->deleted_ranges.begin() && std::is_lt(bytes_cmp(range->lo, std::prev(next)->second));
-  };
-  if ((written != cx->written_rows.end() && std::is_lt(bytes_cmp(*written, range->hi))) || overlaps()) {
+  if ((written != cx->written_rows.end() && std::is_lt(bytes_cmp(*written, range->hi))) ||
+      meets_deleted(cx, range->lo, BytesView{range->hi})) {
     cx->fail(BC_E_HANDLE, "bc_del_range over a row of table " + t->name + " this plan already wrote");
     return;
   }
@@ -2080,11 +2105,14 @@ void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
   if (!t->indexes.empty()) {
     // Each row in the range takes its entries with it. A row inserted into
     // the range after the snapshot makes the commit a conflict: the engine
-    // checks a planned range delete's range for changes.
-    for (auto it = cx->snap->iter_from({}, range->lo).begin(); it != std::default_sentinel; ++it) {
+    // checks a planned range delete's range for changes. Every read is
+    // charged before it is made, the one that finds the range's end too:
+    // begin() reads the first record, each ++ the next.
+    if (!cx->charge()) return;
+    auto rows = cx->snap->iter_from({}, range->lo);
+    for (auto it = rows.begin(); it != std::default_sentinel;) {
       const auto& e = *it;
       if (!std::is_lt(bytes_cmp(e.key, range->hi))) break;
-      if (!cx->charge()) return;
       if (!bytecask::sql::row_header_valid(e.value)) {
         cx->fail(BC_E_CORRUPT, "malformed row in table " + t->name);
         return;
@@ -2098,6 +2126,8 @@ void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
         if (!encode_entry(cx, *t, ix, e.value, en)) return;
         cx->push_effect(EffectKind::Del, en.key);
       }
+      if (!cx->charge()) return;
+      ++it;
     }
   }
   cx->push_effect(EffectKind::DelRange, range->lo, range->hi);
