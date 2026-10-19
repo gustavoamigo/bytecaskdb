@@ -74,8 +74,8 @@ jobs:
   sql-layer-tests:
     runs-on: ubuntu-latest
     # A deadlocked concurrency test would otherwise hold the runner for
-    # GitHub's six-hour default.
-    timeout-minutes: 30
+    # GitHub's six-hour default; sanitizers.yml's bound.
+    timeout-minutes: 60
     container:
       image: fedora:43
     permissions:

@@ -12,7 +12,12 @@ of the contract must be one of:
 
 A C++ module interface (.cppm) contributes the names it declares after
 `export module`: a class member only under public access, and no function
-body, whose code names private members. The modules it re-exports
+body, whose code names private members. Only the pair's own files are read;
+the modules they re-export are the layer's mechanism and are not followed.
+This is a guard, not a C++ parser: it reads braces, access labels and a
+constructor's initializer list, and nothing that needs the preprocessor or
+templates resolved (a macro that opens a scope, an access label spelled by a
+macro) is understood. The modules it re-exports
 are not followed: they are the layer's mechanism (the compiler, the codecs),
 not the surface the contract is written against.
 
