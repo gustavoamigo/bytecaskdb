@@ -339,10 +339,10 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
 in a hash table keyed by the reference's `id`, with the catalog version it
 verified each against and the column map it built. A run whose reference
 and pinned version match an entry skips the walk: a hash lookup and an
-integer compare. The table holds 1,024 references and is cleared when it
-would grow past that, so a workload cycling through many prepared
-statements keeps every one of them cached and a context's memory stays
-bounded. The version is the catalog's identity: a context
+integer compare. The table holds 1,024 references; past that, a miss
+forgets one entry to make room, so a workload cycling through many prepared
+statements keeps them cached, a recompiled plan's dead id is dropped in
+time, and a context's memory stays bounded. The version is the catalog's identity: a context
 is bound to one database at `bc_ctx_new`, and within a database a catalog
 version is never reused, so no pointer is compared (a freed catalog's
 address can be reused, its version cannot). An `id` of 0 is never cached.
@@ -481,7 +481,8 @@ per step plus one per `bc_scan_row`. A covering read, where the plan reads
 the columns it needs from `bc_scan_key` with `bc_emit_key_part` or
 `bc_key_part_*`, costs one. Covering or fetch is the optimizer's decision,
 and the text shows which: a plan that never calls `bc_scan_row` reads no
-row.
+row. A `DOUBLE` column is never read from a key: the encoding writes `-0.0`
+as `0.0` and every NaN as one, so only the row holds the exact value.
 
 ### Rows and columns
 
@@ -1086,4 +1087,4 @@ them.
   plan and the catalog has made it incompatible, and checks the parameters
   against the plan that runs.
 - The compiler emits covering reads: a range plan whose result columns are
-  all in the index key reads no row.
+  all in the index key, none of them `DOUBLE`, reads no row.

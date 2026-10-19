@@ -253,8 +253,10 @@ auto select_by_index(Writer& w, const bound::Select& s) -> void {
   }
   if (eq && (lo || hi)) no_plan("an equality and a range on one column are not supported");
   // Covering when the index key holds every column the result needs: its
-  // parts, then the primary key's.
+  // parts, then the primary key's. Not a DOUBLE: the key encoding writes
+  // -0.0 as 0.0 and every NaN as one, so only the row holds its exact value.
   auto in_key = [&](std::uint32_t id) {
+    if (t.column(id)->type == PhysType::F64) return false;
     return std::ranges::any_of(ix.parts, [&](const IndexPart& p) { return p.col_id == id; }) ||
            std::ranges::find(t.pk_col_ids, id) != t.pk_col_ids.end();
   };

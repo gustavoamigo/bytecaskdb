@@ -32,6 +32,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -71,8 +72,9 @@ namespace {
 
 constexpr std::uint32_t kNoCursor = UINT32_MAX;
 constexpr std::uint32_t kScanFlagMask = BC_SCAN_REVERSE | BC_SCAN_PREFIX;
-// Verified schema references a context keeps; past this it forgets them
-// all and starts again, so a context's memory stays bounded.
+// Verified schema references a context keeps; past this it forgets one to
+// make room, so a context's memory stays bounded and a workload just past
+// the bound loses one entry per miss, not all of them.
 constexpr std::size_t kMaxVerified = 1024;
 
 // What a view is, beyond its bytes: a row read from the engine (a stored
@@ -101,7 +103,8 @@ struct Cursor {
   bool positioned{false};
   std::uint64_t step{0};
   Bytes key, value;
-  Bytes row;  // on an index: the current entry's row, once bc_scan_row fetched it
+  Bytes row;      // on an index: the current entry's row, once bc_scan_row fetched it
+  Bytes row_key;  // the row's key, rebuilt in place: no allocation per entry
   std::uint64_t row_step{0};  // the step `row` was fetched at; 0: none
 };
 
@@ -227,7 +230,8 @@ struct bc_ctx {
   // within one, so an entry is matched by the reference's id and the
   // version alone. An id of 0 is verified into `scratch` on every run.
   // Elements of an unordered_map stay put as it grows, so `current` stays
-  // valid until the map is cleared, which only use_ref does.
+  // valid until its entry is erased, which only use_ref does, before it
+  // sets `current` again.
   std::unordered_map<std::uint64_t, Verified> verified;
   Verified scratch;
   const Verified* current{nullptr};  // this execution's reference; nullptr: none
@@ -555,7 +559,7 @@ auto datum_is(const Datum& d, PhysType t) -> bool {
 }
 
 // Appends parameter `i` as a key part: its value, or the null part for NULL.
-auto put_param_part(bc_ctx* cx, Bytes& buf, KeyPart part, std::uint32_t i) -> bool {
+[[nodiscard]] auto put_param_part(bc_ctx* cx, Bytes& buf, KeyPart part, std::uint32_t i) -> bool {
   const auto* d = cx->param(i);
   if (d == nullptr) return false;
   if (std::holds_alternative<std::monostate>(*d)) {
@@ -696,7 +700,7 @@ auto written_tables(const bc_ctx* cx) -> std::vector<std::uint32_t> {
 
 // Builds `e` for `ref` on the pinned version: the compatibility check, the
 // result layout (rebuilt only when the codes change), the column map.
-auto verify(bc_ctx* cx, const bc_schema_ref* ref, Verified& e) -> bool {
+[[nodiscard]] auto verify(bc_ctx* cx, const bc_schema_ref* ref, Verified& e) -> bool {
   e.valid = false;
   if (auto why = bytecask::sql::schema_incompatibility(*cx->cat, *ref)) {
     cx->fail(BC_E_LAYOUT, "plan compiled against catalog v" + std::to_string(ref->catalog_version) +
@@ -745,12 +749,16 @@ auto verify(bc_ctx* cx, const bc_schema_ref* ref, Verified& e) -> bool {
 
 // Makes `ref` the execution's reference: from the cache when this context
 // verified it against the pinned version before, verified otherwise.
-auto use_ref(bc_ctx* cx, const bc_schema_ref* ref) -> bool {
+[[nodiscard]] auto use_ref(bc_ctx* cx, const bc_schema_ref* ref) -> bool {
   if (ref == nullptr) {
     cx->current = nullptr;
     return true;
   }
-  if (ref->id != 0 && !cx->verified.contains(ref->id) && cx->verified.size() >= kMaxVerified) cx->verified.clear();
+  if (ref->id != 0 && !cx->verified.contains(ref->id) && cx->verified.size() >= kMaxVerified) {
+    // Any one entry: a recompile's dead id goes this way too. Never the
+    // current one, which only this function sets, and which it replaces.
+    cx->verified.erase(cx->verified.begin());
+  }
   auto& e = ref->id == 0 ? cx->scratch : cx->verified[ref->id];
   if (ref->id == 0 || !e.valid || e.ref_id != ref->id || e.version != cx->cat->version()) {
     if (!verify(cx, ref, e)) return false;
@@ -866,11 +874,11 @@ auto write_row(bc_ctx* cx, const Table& t, bc_view row, bool stored) -> std::opt
 
 // Records a row key this execution writes; a second write of it is a plan
 // bug (BC_E_HANDLE). Linear: a plan writes few rows.
-auto in_range(BytesView k, BytesView lo, BytesView hi) -> bool {
+[[nodiscard]] auto in_range(BytesView k, BytesView lo, BytesView hi) -> bool {
   return !std::is_lt(bytes_cmp(k, lo)) && std::is_lt(bytes_cmp(k, hi));
 }
 
-auto first_write(bc_ctx* cx, const Table& t, BytesView pk) -> bool {
+[[nodiscard]] auto first_write(bc_ctx* cx, const Table& t, BytesView pk) -> bool {
   // A range delete counts as a write of every row in its range.
   if (std::ranges::any_of(cx->written_rows, [&](const Bytes& k) { return std::ranges::equal(k, pk); }) ||
       std::ranges::any_of(cx->deleted_ranges, [&](const auto& r) { return in_range(pk, r.first, r.second); })) {
@@ -881,7 +889,7 @@ auto first_write(bc_ctx* cx, const Table& t, BytesView pk) -> bool {
   return true;
 }
 
-auto encode_pk(bc_ctx* cx, const Table& t, BytesView row, Bytes& out) -> bool {
+[[nodiscard]] auto encode_pk(bc_ctx* cx, const Table& t, BytesView row, Bytes& out) -> bool {
   if (bytecask::sql::encode_pk_from_row(t, row, out)) return true;
   cx->fail(BC_E_CORRUPT, "row does not hold table " + t.name + "'s primary key");
   return false;
@@ -896,7 +904,7 @@ struct Entry {
   [[nodiscard]] auto prefix() const -> BytesView { return BytesView{key}.first(prefix_len); }
 };
 
-auto encode_entry(bc_ctx* cx, const Table& t, const Index& ix, BytesView row, Entry& out) -> bool {
+[[nodiscard]] auto encode_entry(bc_ctx* cx, const Table& t, const Index& ix, BytesView row, Entry& out) -> bool {
   if (bytecask::sql::encode_index_key_from_row(t, ix, row, out.key, &out.prefix_len, &out.has_null)) return true;
   cx->fail(BC_E_CORRUPT, "row does not hold the parts of index " + ix.name);
   return false;
@@ -905,7 +913,7 @@ auto encode_entry(bc_ctx* cx, const Table& t, const Index& ix, BytesView row, En
 // The primary key is free on the snapshot, or BC_C_UNIQUE on the table.
 // Its race needs no guard: the key is in the write plan, and the engine
 // checks every written key for a change since the snapshot.
-auto pk_free(bc_ctx* cx, const Table& t, BytesView pk) -> bool {
+[[nodiscard]] auto pk_free(bc_ctx* cx, const Table& t, BytesView pk) -> bool {
   if (!cx->charge()) return false;
   if (!cx->snap->contains_key({}, pk)) return true;
   cx->raise(BC_C_UNIQUE, t.id);
@@ -915,7 +923,7 @@ auto pk_free(bc_ctx* cx, const Table& t, BytesView pk) -> bool {
 // No entry has this unique index prefix on the snapshot, or BC_C_UNIQUE on
 // the index; the range guard covers the race, since a duplicate is another
 // row's entry, a key this plan does not write.
-auto unique_free(bc_ctx* cx, const Index& ix, BytesView prefix) -> bool {
+[[nodiscard]] auto unique_free(bc_ctx* cx, const Index& ix, BytesView prefix) -> bool {
   if (!cx->charge()) return false;
   auto keys = cx->snap->keys_from({}, prefix);
   if (auto it = keys.begin(); it != std::default_sentinel && starts_with(*it, prefix)) {
@@ -1119,6 +1127,8 @@ void bc_emit_begin(bc_ctx* cx) {
   BC_GUARD_END(cx)
 }
 
+// C++ linkage: overloads and a template, inside the extern "C" block.
+extern "C++" {
 namespace {
 // The next result column, which must be of `type` (any, when nullopt).
 auto emit_slot(bc_ctx* cx, std::optional<PhysType> type) -> bool {
@@ -1136,7 +1146,29 @@ void emit_bytes(bc_ctx* cx, BytesView b) {
   (void)cx->emit->set_bytes(cx->emit_col++, b);
   BC_GUARD_END(cx)
 }
+
+void emit_value(bc_ctx* cx, std::int64_t v) { (void)cx->emit->set_i64(cx->emit_col++, v); }
+void emit_value(bc_ctx* cx, double v) { (void)cx->emit->set_f64(cx->emit_col++, v); }
+void emit_value(bc_ctx* cx, bool v) { (void)cx->emit->set_bool(cx->emit_col++, v); }
+void emit_value(bc_ctx* cx, BytesView v) { emit_bytes(cx, v); }
+
+// The next result column from a decoded value: BC_E_CORRUPT when the source
+// did not parse, the value when there is one, NULL otherwise. One path for
+// bc_emit_col and bc_emit_key_part, whatever the type.
+template <typename T>
+void emit_decoded(bc_ctx* cx, const std::optional<T>& v, bool corrupt, bool has_value, const char* what) {
+  if (corrupt) {
+    cx->fail(BC_E_CORRUPT, what);
+  } else if (!has_value) {
+    (void)cx->emit->set_null(cx->emit_col++);
+  } else if constexpr (std::is_same_v<T, Bytes>) {
+    emit_value(cx, BytesView{*v});
+  } else {
+    emit_value(cx, *v);
+  }
+}
 }  // namespace
+}  // extern "C++"
 
 void bc_emit_i64(bc_ctx* cx, int64_t v) {
   if (!emit_slot(cx, PhysType::I64)) return;
@@ -1168,75 +1200,31 @@ void bc_emit_null(bc_ctx* cx) {
 void bc_emit_col(bc_ctx* cx, bc_view row, uint32_t col) {
   auto rc = row_col(cx, row, col, std::nullopt);
   if (!rc || !emit_slot(cx, rc->slot->type)) return;
-  if (!bytecask::sql::row_present_bit(rc->row, col)) {
-    (void)cx->emit->set_null(cx->emit_col++);
-    return;
-  }
-  auto bad = [&] { cx->fail(BC_E_CORRUPT, "malformed row"); };
+  // A decoder's nullopt here is a malformed row: null is the bitmap's to say.
+  auto present = bytecask::sql::row_present_bit(rc->row, col);
+  auto emit = [&](auto v) { emit_decoded(cx, v, present && !v, present, "malformed row"); };
+  const auto& r = rc->row;
+  auto pos = rc->slot->pos;
   switch (rc->slot->type) {
-    case PhysType::I64: {
-      auto v = bytecask::sql::row_i64(rc->row, rc->slot->pos);
-      if (!v) return bad();
-      (void)cx->emit->set_i64(cx->emit_col++, *v);
-      return;
-    }
-    case PhysType::F64: {
-      auto v = bytecask::sql::row_f64(rc->row, rc->slot->pos);
-      if (!v) return bad();
-      (void)cx->emit->set_f64(cx->emit_col++, *v);
-      return;
-    }
-    case PhysType::Bool: {
-      auto v = bytecask::sql::row_bool(rc->row, rc->slot->pos);
-      if (!v) return bad();
-      (void)cx->emit->set_bool(cx->emit_col++, *v);
-      return;
-    }
-    case PhysType::Bytes: {
-      auto v = bytecask::sql::row_bytes(rc->row, rc->slot->pos);
-      if (!v) return bad();
-      emit_bytes(cx, *v);
-      return;
-    }
+    case PhysType::I64: return emit(bytecask::sql::row_i64(r, pos));
+    case PhysType::F64: return emit(bytecask::sql::row_f64(r, pos));
+    case PhysType::Bool: return emit(bytecask::sql::row_bool(r, pos));
+    case PhysType::Bytes: return emit(bytecask::sql::row_bytes(r, pos));
   }
 }
 
 void bc_emit_key_part(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32_t part) {
   auto at = key_part_at(cx, table_or_index, key, part, std::nullopt);
   if (!at || !emit_slot(cx, at->part.type)) return;
+  // A decoder's nullopt is a null part, or a malformed key when the reader failed.
   auto& r = at->reader;
-  auto bad = [&] { cx->fail(BC_E_CORRUPT, "unparseable key"); };
-  auto null = [&] { (void)cx->emit->set_null(cx->emit_col++); };
+  auto emit = [&](auto v) { emit_decoded(cx, v, !r.ok(), r.ok() && v.has_value(), "unparseable key"); };
   BC_GUARD_BEGIN
   switch (at->part.type) {
-    case PhysType::I64: {
-      auto v = r.read_i64(at->part);
-      if (!r.ok()) return bad();
-      if (!v) return null();
-      (void)cx->emit->set_i64(cx->emit_col++, *v);
-      return;
-    }
-    case PhysType::F64: {
-      auto v = r.read_f64(at->part);
-      if (!r.ok()) return bad();
-      if (!v) return null();
-      (void)cx->emit->set_f64(cx->emit_col++, *v);
-      return;
-    }
-    case PhysType::Bool: {
-      auto v = r.read_bool(at->part);
-      if (!r.ok()) return bad();
-      if (!v) return null();
-      (void)cx->emit->set_bool(cx->emit_col++, *v);
-      return;
-    }
-    case PhysType::Bytes: {
-      auto v = r.read_bytes(at->part);
-      if (!r.ok()) return bad();
-      if (!v) return null();
-      (void)cx->emit->set_bytes(cx->emit_col++, *v);
-      return;
-    }
+    case PhysType::I64: return emit(r.read_i64(at->part));
+    case PhysType::F64: return emit(r.read_f64(at->part));
+    case PhysType::Bool: return emit(r.read_bool(at->part));
+    case PhysType::Bytes: return emit(r.read_bytes(at->part));
   }
   BC_GUARD_END(cx)
 }
@@ -1532,7 +1520,8 @@ bc_view bc_scan_row(bc_ctx* cx, bc_cursor h) {
       return {};
     }
   }
-  Bytes key;
+  auto& key = c->row_key;
+  key.clear();
   bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, table);
   auto pk = r.rest();
   key.insert(key.end(), pk.begin(), pk.end());

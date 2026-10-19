@@ -124,6 +124,20 @@ TEST_CASE("codegen: the other bound forms produce plans; no rule, no plan", "[sq
   CHECK_THROWS_AS(generate(f.cat(), "DELETE FROM t WHERE name = $1"), ast::SqlError);
 }
 
+TEST_CASE("codegen: a DOUBLE result column is read from the row, never the index key", "[sql][codegen]") {
+  // The key encoding writes -0.0 as 0.0 and every NaN as one NaN: a covering
+  // read would return a value the row does not hold.
+  sql_test::Fixture f;
+  f.ddl(CreateTableDdl{"dd", {sql_test::Fixture::col("id", PhysType::I64, false), sql_test::Fixture::col("d", PhysType::F64, true)},
+                       {"id"}});
+  f.ddl(CreateIndexDdl{"dd_d", "dd", {{"d"}}});
+  auto by_d = generate(f.cat(), "SELECT d FROM dd WHERE d >= $1");
+  CHECK(by_d.source.find("bc_view row = bc_scan_row(cx, c);") != std::string::npos);
+  CHECK(by_d.source.find("bc_emit_key_part") == std::string::npos);
+  auto ids = generate(f.cat(), "SELECT id FROM dd WHERE d >= $1");  // the id is exact in the key
+  CHECK(ids.source.find("bc_emit_key_part") != std::string::npos);
+}
+
 TEST_CASE("codegen: a composite key from parameters out of order takes the builder", "[sql][codegen]") {
   sql_test::Fixture f;
   f.ddl(CreateTableDdl{"p", {sql_test::Fixture::col("a", PhysType::I64, false), sql_test::Fixture::col("b", PhysType::I64, false),

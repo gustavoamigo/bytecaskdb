@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -158,6 +159,17 @@ TEST_CASE("embedded API: a plan the catalog refuses is recompiled and run again"
   CHECK_THROWS_AS(db->execute(insert, {i(6), bytes("fig"), bytes("sixty")}), std::invalid_argument);
   CHECK(db->execute(insert, {i(6), bytes("fig"), i(60)}).affected == 1);
   CHECK(db->execute(by_id, {i(6)}).rows == Grid{{i(6), i(60)}});
+}
+
+TEST_CASE("embedded API: a DOUBLE read through an index keeps -0.0", "[sql][api]") {
+  sql_test::TempDir dir{"api_negzero"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE dd (id BIGINT PRIMARY KEY, d DOUBLE PRECISION)");
+  (void)db->execute("CREATE INDEX dd_d ON dd (d)");
+  (void)db->execute("INSERT INTO dd VALUES ($1, $2)", {i(1), Value{-0.0}});
+  auto rows = db->execute("SELECT d FROM dd WHERE d >= $1", {Value{-1.0}}).rows;
+  REQUIRE(rows.size() == 1);
+  CHECK(std::signbit(std::get<double>(rows[0][0])));
 }
 
 TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[sql][api][catalog]") {
