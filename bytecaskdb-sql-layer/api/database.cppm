@@ -43,6 +43,12 @@ export namespace bytecask::sql {
 
 using Value = bc_value;  // NULL, BIGINT, DOUBLE PRECISION, BOOLEAN, BYTEA
 
+// The errors the API throws that other modules declare: the catalog's
+// refusal of a DDL statement, and the engine's error for a call after
+// close().
+using bytecask::sql::DdlRefused;
+using bytecask::DbClosed;
+
 struct Rows {
   std::vector<std::string> columns;
   std::vector<SqlType> types;  // each column's SQL type, as the catalog declares it
@@ -134,7 +140,8 @@ public:
   // Throws ParamError for parameters of the wrong number or type,
   // ast::SqlError if a recompile fails, ExecError if the plan fails, and for
   // DDL, what LiveCatalog::apply throws (DdlRefused for a statement the
-  // catalog refuses).
+  // catalog refuses), but a ConstraintViolation as an ExecError: a unique
+  // index over duplicates is BC_E_CONSTRAINT, BC_C_UNIQUE and the index's id.
   auto execute(const Statement& stmt, const std::vector<Value>& params) -> Rows;
   auto execute(std::string_view sql, const std::vector<Value>& params = {}) -> Rows {
     return execute(prepare(sql), params);
@@ -298,7 +305,11 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   if (stmt.is_ddl()) {
     if (!params.empty()) throw ParamError("DDL takes no parameters");
     auto bound = bound::bind(stmt.ast_, *live_->current());
-    (void)live_->apply(std::get<Ddl>(bound.stmt));
+    try {
+      (void)live_->apply(std::get<Ddl>(bound.stmt));
+    } catch (const ConstraintViolation& e) {
+      throw ExecError(e.what(), BC_E_CONSTRAINT, e.detail().encode());
+    }
     out.affected = 0;
     return out;
   }
@@ -395,6 +406,13 @@ auto Database::table_rows(std::string_view table) const -> Rows {
   }
   for_each_row(snap, t->id, [&](BytesView, BytesView row) {
     if (!row_valid(row)) throw std::runtime_error("malformed row in table " + t->name);
+    // The slots are the current layout's: a row of another generation would
+    // decode from the wrong positions, so it is refused, as the plan
+    // runtime refuses it.
+    if (auto gen = row_generation(row); gen != t->layout.generation) {
+      throw std::runtime_error("row of layout generation " + std::to_string(gen) + " in table " + t->name +
+                               ", whose layout is generation " + std::to_string(t->layout.generation));
+    }
     out.rows.push_back(decode_row(layout, row));
   });
   return out;

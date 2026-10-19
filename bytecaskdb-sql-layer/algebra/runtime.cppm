@@ -62,26 +62,6 @@ export using ::bc_ctx_affected;
 
 export namespace bytecask::sql {
 
-// A BC_E_CONSTRAINT detail (bc_error_detail): the bc_constraint in the high
-// byte, the object id in the low 24 bits. The one encoding of the detail and
-// the one mapping from constraint codes to names and text, for the plan
-// API's error and the embedded API's exception.
-struct ConstraintDetail {
-  static constexpr std::uint32_t kMaxObjectId = 0x00FF'FFFFu;
-
-  std::uint32_t constraint;  // a bc_constraint
-  std::uint32_t object_id;
-
-  [[nodiscard]] static constexpr auto decode(std::uint32_t detail) -> ConstraintDetail {
-    return {detail >> 24, detail & kMaxObjectId};
-  }
-  [[nodiscard]] constexpr auto encode() const -> std::uint32_t { return (constraint << 24) | object_id; }
-  // "unique", "not_null", "check", "foreign_key" or "range"; empty for a
-  // code bc_plan.h does not define.
-  [[nodiscard]] auto name() const -> std::string_view;
-  [[nodiscard]] auto message() const -> std::string;
-};
-
 // Every column of a result row, by its layout: NULL, or the typed value. The
 // one decoder of result rows, for the embedded API and the tests.
 [[nodiscard]] auto decode_row(const RowLayout& layout, BytesView row) -> std::vector<bc_value>;
@@ -143,29 +123,6 @@ auto result_type_codes(std::span<const PhysType> types) -> std::vector<std::uint
   out.reserve(types.size());
   for (auto t : types) out.push_back(static_cast<std::uint8_t>(t));
   return out;
-}
-
-auto ConstraintDetail::name() const -> std::string_view {
-  switch (constraint) {
-    case BC_C_UNIQUE: return "unique";
-    case BC_C_NOT_NULL: return "not_null";
-    case BC_C_CHECK: return "check";
-    case BC_C_FOREIGN_KEY: return "foreign_key";
-    case BC_C_RANGE: return "range";
-    default: return {};
-  }
-}
-
-auto ConstraintDetail::message() const -> std::string {
-  auto object = std::to_string(object_id);
-  switch (constraint) {
-    case BC_C_UNIQUE: return "duplicate key value violates unique constraint of object " + object;
-    case BC_C_NOT_NULL: return "null value violates a not-null constraint of table " + object;
-    case BC_C_CHECK: return "check constraint " + object + " violated";
-    case BC_C_FOREIGN_KEY: return "foreign key constraint " + object + " violated";
-    case BC_C_RANGE: return "value out of range for column " + object;
-    default: return "constraint violated on object " + object;
-  }
 }
 
 }  // namespace bytecask::sql
