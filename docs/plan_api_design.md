@@ -187,12 +187,19 @@ is SQL statement semantics: a statement sees the state before it began. The
 runtime's unique checks read the snapshot too. A second write of a row the
 plan already wrote is refused (`BC_E_HANDLE`): `bc_update` and `bc_delete`
 derive the entries they remove from the snapshot's row, so a second write
-would leave the first one's entries without a row. A unique secondary key
-two of the plan's own inserts share is not caught. Both are stage-2 limits:
-the stage-1 compiler emits one write per plan, and a procedure that writes
-one row twice, or several rows sharing a unique key, waits on the
-own-writes overlay of #491 (read-your-own-writes), which lifts the refusal
-(#507).
+would leave the first one's entries without a row. Only a wrong plan
+reaches it, since one SQL statement affects each row at most once
+(PostgreSQL refuses an `ON CONFLICT DO UPDATE` that would affect a row
+twice). The exception is a `bc_insert` of a key the plan already put
+there: that is `INSERT … VALUES (1, …), (1, …)`, a duplicate key, and it
+raises `BC_C_UNIQUE` (SQLSTATE 23505, as PostgreSQL reports it), never
+retried. The tracking is per statement: every `bc_ctx_run` starts it
+afresh, with the affected-row count, so statements of one transaction
+sharing a context (#491) may each write a row once; a later statement
+reading what an earlier one wrote needs #491's own-writes overlay. A unique
+secondary key two of one statement's inserts share is not caught yet: a
+stage-2 limit, unreachable from the stage-1 compiler, which emits one write
+per plan (#507).
 Read-your-own-writes across statements in an interactive transaction is an
 overlay the cursors read through and belongs to the session layer. See
 *Deferred*.
@@ -354,7 +361,7 @@ void    bc_ctx_reset(bc_ctx *);                                               /*
 enum bc_error_code bc_error(const bc_ctx *);
 const char *bc_error_message(const bc_ctx *);
 uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits; BC_E_LAYOUT: a bc_layout_detail */
-int64_t bc_ctx_affected(const bc_ctx *);                   /* what bc_emit_count recorded, or -1 */
+int64_t bc_ctx_affected(const bc_ctx *);                   /* what the last run's bc_emit_count recorded, or -1 */
 int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params *,
                    bc_budget, bool sync, uint32_t max_retries);               /* the retry loop */
 ```
@@ -368,7 +375,7 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
 | `bc_ctx_commit` | Submits the write plan with `apply_batch`, guarded by `ensure_unchanged` on the catalog record of every table whose keys it writes, so a DDL on such a table committed since the snapshot makes it a conflict: the index entries the runtime wrote follow the pinned version's indexes, and a `CREATE INDEX` committed after the snapshot would otherwise miss the row. `BC_COMMITTED` on success. `BC_CONFLICT` when the engine reports a guard or write-write conflict: nothing was written. `BC_FAILED` when `bc_error` is set, including an error raised during the plan: nothing is committed. A plan with no writes and no guards commits nothing and returns `BC_COMMITTED`. |
 | `bc_ctx_next_result` | Iterates the result buffer. Rows are in the row format of the layout the plan emitted. The runtime, not a plan, sees raw pointers here; valid until `bc_ctx_reset`. |
 | `bc_ctx_reset` | Releases the snapshot, drops the write plan and result buffer, resets the arena, bumps every generation so every handle and view the plan held is invalid. |
-| `bc_error_detail`, `bc_ctx_affected` | The constraint kind and object id of a raised error, or for `BC_E_LAYOUT` its class: `bc_ctx_run` refusing the reference (`BC_L_INCOMPATIBLE`, the only one a recompile cures), a row used with a table or column it is not of (`BC_L_ROW`), a malformed plan or reference (`BC_L_PLAN`), or a row of a retired layout generation (`BC_L_RETIRED`). The runtime sets every `BC_E_LAYOUT` with its detail; one without cannot be compiled; the affected-row count a write plan recorded. Both read by the runtime after the plan returns. |
+| `bc_error_detail`, `bc_ctx_affected` | The constraint kind and object id of a raised error, or for `BC_E_LAYOUT` its class: `bc_ctx_run` refusing the reference (`BC_L_INCOMPATIBLE`, the only one a recompile cures), a row used with a table or column it is not of (`BC_L_ROW`), a malformed plan or reference (`BC_L_PLAN`), or a row of a retired layout generation (`BC_L_RETIRED`). The runtime sets every `BC_E_LAYOUT` with its detail; one without cannot be compiled; the affected-row count the last run recorded. Both read by the runtime after the plan returns. |
 | `bc_execute` | `begin`, `run`, `commit`; on `BC_CONFLICT`, `reset` and repeat up to `max_retries`. A `BC_E_CONSTRAINT` raised by the plan is final: no retry. Returns the commit result of the last attempt. This is the only place retry lives. |
 
 **Verification runs on every execution.** `bc_ctx_run` checks the

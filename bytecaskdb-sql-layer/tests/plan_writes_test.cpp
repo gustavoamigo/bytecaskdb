@@ -608,8 +608,14 @@ TEST_CASE("plan writes: a second write of one row in one plan is refused", "[sql
     CHECK(bc_error(f.cx) == BC_E_HANDLE);
     CHECK(std::string{bc_error_message(f.cx)}.find("written twice") != std::string::npos);
   }
-  CHECK(run(f, insert_twice, {std::int64_t{2}, std::int64_t{2}, bytes("y"), std::int64_t{0}}) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  // Inserting one key twice is INSERT … VALUES (2, …), (2, …): a duplicate
+  // key, raised as one and never retried.
+  g_runs = 0;
+  CHECK(run(f, insert_twice, {std::int64_t{2}, std::int64_t{2}, bytes("y"), std::int64_t{0}}, {}, 3) == BC_FAILED);
+  CHECK(g_runs == 2);  // insert_w twice, in the one run
+  CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
+  CHECK(bc_error_detail(f.cx) == unique_on(kW));
+  // A key the plan moved away is no duplicate, but a second write of it.
   CHECK(run(f, move_then_insert, {std::int64_t{1}, std::int64_t{5}, std::int64_t{0}}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
   // A range delete is a write of every row in its range.
@@ -790,4 +796,27 @@ TEST_CASE("plan writes: a delete racing updates of one row has one outcome", "[s
     CHECK(count_entries(*f.db, bytecask::sql::kNsIndex, 3) == 0);
   }
   for (auto* cx : cxs) bc_ctx_free(cx);
+}
+
+TEST_CASE("plan writes: the rows a statement may write once are its own, not the context's",
+          "[sql][algebra][writes]") {
+  // Two statements of one transaction share a context (#491): updating a
+  // row in one and again in the next is two statements, each writing it once.
+  Fixture f;
+  create_w(f);
+  REQUIRE(run(f, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{0}}) == BC_COMMITTED);
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+  auto ref = sr.get();
+  auto ps = params({std::int64_t{1}, std::int64_t{1}, std::int64_t{2}, bytes("y"), std::int64_t{0}});
+  // Two runs under one snapshot, as two statements: neither is a second write.
+  bc_ctx_begin(f.cx, &ps, {});
+  bc_ctx_run(f.cx, update_w, &ref);
+  REQUIRE(bc_error(f.cx) == BC_OK);
+  bc_ctx_run(f.cx, update_w, &ref);
+  CHECK(bc_error(f.cx) == BC_OK);
+  CHECK(bc_ctx_affected(f.cx) == 1);  // the second statement's count
+  bc_ctx_reset(f.cx);
+  // One run writing the row twice is still refused.
+  CHECK(run(f, update_twice, {std::int64_t{1}, std::int64_t{2}, std::int64_t{3}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
 }

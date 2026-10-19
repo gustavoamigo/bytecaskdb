@@ -32,7 +32,6 @@
 #include <stdexcept>
 #include <string>
 #include <map>
-#include <set>
 #include <system_error>
 #include <type_traits>
 #include <utility>
@@ -247,10 +246,11 @@ struct bc_ctx {
   std::vector<KeyBuilder> keys;
   std::vector<RowBuilder> rows;
   std::vector<Effect> effects;
-  // The row keys this execution's writes touched: a second write of one row
-  // would derive its index entries from the snapshot's row again, not from
-  // the first write's, and leave the first write's entries behind.
-  std::set<Bytes, BytesLess> written_rows;
+  // The row keys this statement's writes touched, and whether the row is
+  // there after the write: a second write of one row would derive its index
+  // entries from the snapshot's row again, not from the first write's, and
+  // leave the first write's entries behind. Reset by every bc_ctx_run.
+  std::map<Bytes, bool, BytesLess> written_rows;
   // Where each part of the last key a key-part decoder read starts, so the
   // next part of the same key is found without skipping the earlier ones
   // again. Keyed by the view handle, unique within an execution.
@@ -1038,15 +1038,27 @@ auto write_row(bc_ctx* cx, const Table& t, bc_view row, bool stored) -> std::opt
   return hi && next != ranges.end() && std::is_lt(bytes_cmp(next->first, *hi));
 }
 
-// Records a row key this execution writes; a second write of it, or a write
-// into a range this execution deleted, is a plan bug (BC_E_HANDLE). The keys
-// and the deleted ranges are sorted sets: a lookup each per write.
-[[nodiscard]] auto first_write(bc_ctx* cx, const Table& t, BytesView pk) -> bool {
-  if (cx->written_rows.contains(pk) || meets_deleted(cx, pk)) {
-    cx->fail(BC_E_HANDLE, "a row of table " + t.name + " written twice in one plan");
+// Records a row key this statement writes, and whether the row is there
+// after the write (`present`). One statement affects a row at most once, so
+// a second write of it, or a write into a range it deleted, is a wrong plan
+// (BC_E_HANDLE), with one exception: an insert over a row the statement
+// already put there is a duplicate key, as INSERT … VALUES (1, …), (1, …)
+// is, and raises BC_C_UNIQUE. The keys and the deleted ranges are sorted:
+// a lookup each per write.
+[[nodiscard]] auto first_write(bc_ctx* cx, const Table& t, BytesView pk, bool present, bool insert = false) -> bool {
+  if (auto it = cx->written_rows.find(pk); it != cx->written_rows.end()) {
+    if (insert && it->second) {
+      cx->raise(BC_C_UNIQUE, t.id);
+    } else {
+      cx->fail(BC_E_HANDLE, "a row of table " + t.name + " written twice in one statement");
+    }
     return false;
   }
-  cx->written_rows.emplace(pk.begin(), pk.end());
+  if (meets_deleted(cx, pk)) {
+    cx->fail(BC_E_HANDLE, "a row of table " + t.name + " written twice in one statement");
+    return false;
+  }
+  cx->written_rows.emplace(Bytes(pk.begin(), pk.end()), present);
   return true;
 }
 
@@ -1193,6 +1205,12 @@ bool bc_ctx_check(bc_ctx* cx, const bc_schema_ref* compiled_against) {
 void bc_ctx_run(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* compiled_against) {
   BC_GUARD_BEGIN
   if (!bc_ctx_check(cx, compiled_against)) return;
+  // One run is one statement: the rows it may write once, and the count it
+  // reports, are its own. The write plan and the snapshot carry over, for
+  // statements of one transaction that share a context (#491).
+  cx->written_rows.clear();
+  cx->deleted_ranges.clear();
+  cx->affected = -1;
   plan(cx);
   if (cx->ok() && cx->emit) cx->fail(BC_L_PLAN, "result row begun and not ended");
   BC_GUARD_END(cx)
@@ -2160,7 +2178,7 @@ void bc_insert(bc_ctx* cx, uint32_t table, bc_view row) {
   auto r = write_row(cx, *t, row, false);
   if (!r) return;
   Bytes pk;
-  if (!encode_pk(cx, *t, *r, pk) || !first_write(cx, *t, pk)) return;
+  if (!encode_pk(cx, *t, *r, pk) || !first_write(cx, *t, pk, true, true)) return;
   std::vector<Entry> entries(t->indexes.size());
   for (std::size_t i = 0; i < t->indexes.size(); ++i) {
     if (!encode_entry(cx, *t, t->indexes[i], *r, entries[i])) return;
@@ -2194,7 +2212,7 @@ void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {
     if (!encode_pk(cx, *t, *n, pk_new)) return;
     moved_pk = pk_old != pk_new;
   }
-  if (!first_write(cx, *t, pk_old) || (moved_pk && !first_write(cx, *t, pk_new))) return;
+  if (!first_write(cx, *t, pk_old, !moved_pk) || (moved_pk && !first_write(cx, *t, pk_new, true))) return;
   // Only the entries whose keys changed move; with the primary key, all do.
   // An index none of whose columns changed is not encoded.
   struct Move {
@@ -2237,7 +2255,7 @@ void bc_delete(bc_ctx* cx, uint32_t table, bc_view old) {
   auto o = write_row(cx, *t, old, true);
   if (!o) return;
   Bytes pk;
-  if (!encode_pk(cx, *t, *o, pk) || !first_write(cx, *t, pk)) return;
+  if (!encode_pk(cx, *t, *o, pk) || !first_write(cx, *t, pk, false)) return;
   std::vector<Entry> entries(t->indexes.size());
   for (std::size_t i = 0; i < t->indexes.size(); ++i) {
     if (!encode_entry(cx, *t, t->indexes[i], *o, entries[i])) return;
@@ -2266,7 +2284,7 @@ void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
   // So would a range this plan already deleted, whose entries it would
   // delete twice.
   auto written = cx->written_rows.lower_bound(BytesView{range->lo});
-  if ((written != cx->written_rows.end() && std::is_lt(bytes_cmp(*written, range->hi))) ||
+  if ((written != cx->written_rows.end() && std::is_lt(bytes_cmp(written->first, range->hi))) ||
       meets_deleted(cx, range->lo, BytesView{range->hi})) {
     cx->fail(BC_E_HANDLE, "bc_del_range over a row of table " + t->name + " this plan already wrote");
     return;
