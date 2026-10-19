@@ -4,7 +4,11 @@
 // runtime.cpp — the plan-API symbol table; see runtime.cppm.
 
 module;
+#include <cstdint>
 #include <span>
+#include <string>
+#include <variant>
+#include <vector>
 
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
 
@@ -21,16 +25,63 @@ auto fn_addr(F* f) -> const void* {
 
 }  // namespace
 
+namespace bytecask::sql {
+
+auto decode_row(const RowLayout& layout, BytesView row) -> std::vector<bc_value> {
+  std::vector<bc_value> out;
+  out.reserve(layout.columns.size());
+  for (const auto& c : layout.columns) {
+    if (row_is_null(row, c)) {
+      out.emplace_back(std::monostate{});
+      continue;
+    }
+    switch (c.type) {
+      case PhysType::I64: out.emplace_back(row_i64(row, c.pos).value_or(0)); break;
+      case PhysType::F64: out.emplace_back(row_f64(row, c.pos).value_or(0.0)); break;
+      case PhysType::Bool: out.emplace_back(row_bool(row, c.pos).value_or(false)); break;
+      case PhysType::Bytes: {
+        auto v = row_bytes(row, c.pos).value_or(BytesView{});
+        out.emplace_back(Bytes(v.begin(), v.end()));
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+auto result_type_codes(std::span<const PhysType> types) -> std::vector<std::uint8_t> {
+  std::vector<std::uint8_t> out;
+  out.reserve(types.size());
+  for (auto t : types) out.push_back(static_cast<std::uint8_t>(t));
+  return out;
+}
+
+}  // namespace bytecask::sql
+
+auto constraint_message(std::uint32_t detail) -> std::string {
+  auto object = std::to_string(detail & 0x00FF'FFFFu);
+  switch (detail >> 24) {
+    case BC_C_UNIQUE: return "duplicate key value violates unique constraint of object " + object;
+    case BC_C_NOT_NULL: return "null value violates not-null constraint of column " + object;
+    case BC_C_CHECK: return "check constraint " + object + " violated";
+    case BC_C_FOREIGN_KEY: return "foreign key constraint " + object + " violated";
+    case BC_C_RANGE: return "value out of range for column " + object;
+    default: return "constraint violated on object " + object;
+  }
+}
+
 auto plan_api_symbols() -> std::span<const ApiSymbol> {
   // Function-local: initialised on first use, not by a global constructor.
   static const ApiSymbol kSymbols[] = {
       {"bc_param_i64", fn_addr(bc_param_i64)},
       {"bc_param_f64", fn_addr(bc_param_f64)},
+      {"bc_param_bool", fn_addr(bc_param_bool)},
       {"bc_param_bytes", fn_addr(bc_param_bytes)},
       {"bc_param_null", fn_addr(bc_param_null)},
       {"bc_emit_begin", fn_addr(bc_emit_begin)},
       {"bc_emit_i64", fn_addr(bc_emit_i64)},
       {"bc_emit_f64", fn_addr(bc_emit_f64)},
+      {"bc_emit_bool", fn_addr(bc_emit_bool)},
       {"bc_emit_bytes", fn_addr(bc_emit_bytes)},
       {"bc_emit_null", fn_addr(bc_emit_null)},
       {"bc_emit_end", fn_addr(bc_emit_end)},
@@ -49,6 +100,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_key_begin", fn_addr(bc_key_begin)},
       {"bc_key_i64", fn_addr(bc_key_i64)},
       {"bc_key_f64", fn_addr(bc_key_f64)},
+      {"bc_key_bool", fn_addr(bc_key_bool)},
       {"bc_key_bytes", fn_addr(bc_key_bytes)},
       {"bc_key_null", fn_addr(bc_key_null)},
       {"bc_key_pk", fn_addr(bc_key_pk)},
@@ -63,22 +115,28 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_scan_value", fn_addr(bc_scan_value)},
       {"bc_scan_pk", fn_addr(bc_scan_pk)},
       {"bc_scan_close", fn_addr(bc_scan_close)},
+      {"bc_empty", fn_addr(bc_empty)},
+      {"bc_key_part_i64", fn_addr(bc_key_part_i64)},
+      {"bc_key_part_f64", fn_addr(bc_key_part_f64)},
+      {"bc_key_part_bool", fn_addr(bc_key_part_bool)},
+      {"bc_key_part_bytes", fn_addr(bc_key_part_bytes)},
+      {"bc_key_part_null", fn_addr(bc_key_part_null)},
       {"bc_count_range", fn_addr(bc_count_range)},
       {"bc_col_null", fn_addr(bc_col_null)},
       {"bc_col_i64", fn_addr(bc_col_i64)},
-      {"bc_col_i32", fn_addr(bc_col_i32)},
       {"bc_col_f64", fn_addr(bc_col_f64)},
+      {"bc_col_bool", fn_addr(bc_col_bool)},
       {"bc_col_bytes", fn_addr(bc_col_bytes)},
       {"bc_row_pk", fn_addr(bc_row_pk)},
       {"bc_row_begin", fn_addr(bc_row_begin)},
       {"bc_row_from", fn_addr(bc_row_from)},
       {"bc_row_set_i64", fn_addr(bc_row_set_i64)},
       {"bc_row_set_f64", fn_addr(bc_row_set_f64)},
+      {"bc_row_set_bool", fn_addr(bc_row_set_bool)},
       {"bc_row_set_bytes", fn_addr(bc_row_set_bytes)},
       {"bc_row_set_null", fn_addr(bc_row_set_null)},
       {"bc_row_end", fn_addr(bc_row_end)},
       {"bc_pin", fn_addr(bc_pin)},
-      {"bc_empty", fn_addr(bc_empty)},
       {"bc_sorter_open", fn_addr(bc_sorter_open)},
       {"bc_sorter_add", fn_addr(bc_sorter_add)},
       {"bc_sorter_count", fn_addr(bc_sorter_count)},
@@ -105,6 +163,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_guard_range", fn_addr(bc_guard_range)},
       {"bc_guard_present", fn_addr(bc_guard_present)},
       {"bc_guard_absent", fn_addr(bc_guard_absent)},
+      {"bc_raise", fn_addr(bc_raise)},
   };
   return kSymbols;
 }

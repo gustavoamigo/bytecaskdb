@@ -93,6 +93,7 @@ target("sql_layer_tests")
     -- plan(); each is renamed so several link into one binary.
     add_includedirs("algebra")
     add_defines("SQL_LAYER_PLANS_DIR=\"" .. path.join(os.scriptdir(), "plans") .. "\"")
+    add_defines("SQL_LAYER_ALGEBRA_DIR=\"" .. path.join(os.scriptdir(), "algebra") .. "\"")
     for _, name in ipairs({"insert", "select_by_id", "select_name_range", "update_qty", "delete_by_id"}) do
         add_files("plans/" .. name .. ".c", {defines = "plan=plan_" .. name,
                   cflags = "-Wno-declaration-after-statement"})

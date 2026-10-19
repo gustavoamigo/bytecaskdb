@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <new>
 #include <optional>
 #include <span>
@@ -33,21 +34,32 @@
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
 #include "include/bytecask.hpp"
 
-// bc_db, bc_catalog, bc_params and bc_ctx_affected, which bc_plan.h leaves
-// opaque, and the catalog and codecs through it.
+// bc_db, bc_catalog and bc_params, which bc_plan.h leaves opaque, and the
+// catalog and codecs through it.
 import bytecask.sql.runtime;
 
 using bytecask::sql::Bytes;
 using bytecask::sql::BytesView;
 using bytecask::sql::Catalog;
 using bytecask::sql::KeyLayout;
+using bytecask::sql::KeyPart;
+using bytecask::sql::KeyReader;
 using bytecask::sql::PhysType;
 using bytecask::sql::RowLayout;
 using bytecask::sql::RowWriter;
 
+// bc_type's codes are PhysType's values; a schema ref's result_types are read as such.
+static_assert(static_cast<int>(PhysType::I64) == BC_T_I64);
+static_assert(static_cast<int>(PhysType::F64) == BC_T_F64);
+static_assert(static_cast<int>(PhysType::Bool) == BC_T_BOOL);
+static_assert(static_cast<int>(PhysType::Bytes) == BC_T_BYTES);
+// bc_error_detail carries an object id in its low 24 bits.
+static_assert(Catalog::kMaxObjectId <= 0x00FF'FFFFu);
+
 namespace {
 
 constexpr std::uint32_t kNoCursor = UINT32_MAX;
+constexpr std::uint32_t kScanFlagMask = BC_SCAN_REVERSE | BC_SCAN_PREFIX;
 
 struct ViewEntry {
   const std::byte* data;
@@ -83,7 +95,7 @@ struct RowBuilder {
   bool done{false};
 };
 
-enum class EffectKind { Put, Del, DelRange, GuardAbsent };
+enum class EffectKind { Put, Del, DelRange, GuardUnchanged, GuardRange, GuardPresent, GuardAbsent };
 
 struct Effect {
   EffectKind kind;
@@ -92,6 +104,16 @@ struct Effect {
 
 auto as_u8(const std::byte* p) -> const std::uint8_t* {
   return reinterpret_cast<const std::uint8_t*>(p);  // the runtime hands raw rows to C callers
+}
+
+auto phys_type(std::uint8_t code) -> std::optional<PhysType> {
+  switch (code) {
+    case BC_T_I64: return PhysType::I64;
+    case BC_T_F64: return PhysType::F64;
+    case BC_T_BOOL: return PhysType::Bool;
+    case BC_T_BYTES: return PhysType::Bytes;
+    default: return std::nullopt;
+  }
 }
 
 }  // namespace
@@ -109,6 +131,7 @@ struct bc_ctx {
   std::optional<bytecask::Snapshot> snap;
 
   bc_error_code error{BC_OK};
+  std::uint32_t detail{0};
   std::string message;
 
   std::vector<ViewEntry> views;
@@ -117,11 +140,13 @@ struct bc_ctx {
   std::vector<RowBuilder> rows;
   std::vector<Effect> effects;
 
-  // Results: rows in the row format, each preceded by its u32 length.
+  // Results: rows in the row format of the plan's result_types, each
+  // preceded by its u32 length.
   Bytes results;
   std::size_t result_pos{0};
+  std::vector<PhysType> result_types;
+  std::optional<RowLayout> result_layout;
   std::optional<RowWriter> emit;
-  const std::vector<PhysType>* emit_types{nullptr};
   std::uint32_t emit_col{0};
   std::int64_t affected{-1};
 
@@ -144,6 +169,12 @@ struct bc_ctx {
       fail(BC_E_DEGRADED, e.what());
     } catch (const bytecask::DbClosed& e) {
       fail(BC_E_CLOSED, e.what());
+    } catch (const bytecask::DbFollowerMode& e) {
+      fail(BC_E_DEGRADED, e.what());  // writes refused: the engine is a follower
+    } catch (const std::length_error& e) {
+      fail(BC_E_LIMIT, e.what());
+    } catch (const std::overflow_error& e) {
+      fail(BC_E_LIMIT, e.what());
     } catch (const std::system_error& e) {
       fail(BC_E_IO, e.what());
     } catch (const std::invalid_argument& e) {
@@ -155,14 +186,17 @@ struct bc_ctx {
     }
   }
 
-  auto charge() -> bool {
+  auto charge(std::uint64_t units = 1) -> bool {
     if (!ok()) return false;
-    ++reads;
+    auto before = reads;
+    reads += units;
     if (budget.max_reads != 0 && reads > budget.max_reads) {
       fail(BC_E_BUDGET, "work budget exhausted");
       return false;
     }
-    if (budget.deadline_ns != 0 && (reads & 63) == 0) {
+    // Every 64 units, whatever the step: a charge of several units must not
+    // jump over the check.
+    if (budget.deadline_ns != 0 && before / 64 != reads / 64) {
       auto now = std::chrono::steady_clock::now().time_since_epoch();
       if (static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count()) >
           budget.deadline_ns) {
@@ -213,6 +247,14 @@ struct bc_ctx {
     return BytesView{e.data, e.len};
   }
 
+  // Two views at once; nullopt if either fails or the context has failed.
+  auto resolve2(bc_view a, bc_view b) -> std::optional<std::pair<BytesView, BytesView>> {
+    auto av = resolve(a);
+    auto bv = resolve(b);
+    if (!av || !bv || !ok()) return std::nullopt;
+    return std::pair{*av, *bv};
+  }
+
   // The cursor owning view v, for sub-views that share its lifetime.
   auto owner(bc_view v) const -> std::pair<std::uint32_t, std::uint64_t> {
     if (v.g == 0 || v.i >= views.size()) return {kNoCursor, 0};
@@ -238,6 +280,23 @@ struct bc_ctx {
     return &params->values[i];
   }
 
+  template <typename T>
+  auto param_as(std::uint32_t i, const char* type_name) -> const T* {
+    const auto* p = param(i);
+    if (p == nullptr) return nullptr;
+    if (const auto* v = std::get_if<T>(p)) return v;
+    fail(BC_E_HANDLE, "parameter $" + std::to_string(i + 1) + " is not " + type_name);
+    return nullptr;
+  }
+
+  // The key layout of a table or index, or nullptr and BC_E_HANDLE.
+  auto key_layout(std::uint32_t table_or_index) -> const KeyLayout* {
+    if (!ok()) return nullptr;
+    const auto* kl = cat->key_layout(table_or_index);
+    if (kl == nullptr) fail(BC_E_HANDLE, "no table or index " + std::to_string(table_or_index));
+    return kl;
+  }
+
   void drop_execution_state() {
     cursors.clear();  // iterators before the snapshot they read
     snap.reset();
@@ -248,7 +307,6 @@ struct bc_ctx {
     results.clear();
     result_pos = 0;
     emit.reset();
-    emit_types = nullptr;
     emit_col = 0;
     affected = -1;
     arena_used = 0;
@@ -257,7 +315,7 @@ struct bc_ctx {
     if (epoch == 0) epoch = 1;  // 0 is the empty view's generation
   }
 
-  void unimplemented(const char* fn) { fail(BC_E_HANDLE, std::string{fn} + " is not implemented by the prototype"); }
+  void unimplemented(const char* fn) { fail(BC_E_HANDLE, std::string{fn} + " is not implemented yet"); }
 };
 
 // Every entry point catches: an exception never crosses into a plan.
@@ -270,18 +328,20 @@ struct bc_ctx {
 
 namespace {
 
+auto bytes_cmp(BytesView a, BytesView b) -> std::strong_ordering {
+  return std::lexicographical_compare_three_way(a.begin(), a.end(), b.begin(), b.end(),
+                                                [](std::byte x, std::byte y) {
+                                                  return std::to_integer<int>(x) <=> std::to_integer<int>(y);
+                                                });
+}
+
+auto starts_with(BytesView k, BytesView prefix) -> bool {
+  return k.size() >= prefix.size() && std::ranges::equal(k.first(prefix.size()), prefix);
+}
+
 // Positions a cursor on its next entry within bounds; false at the end.
 auto cursor_advance(bc_ctx* cx, Cursor& c) -> bool {
   auto reverse = (c.flags & BC_SCAN_REVERSE) != 0;
-  auto in_prefix = [&](BytesView k) {
-    return k.size() >= c.prefix.size() && std::ranges::equal(k.first(c.prefix.size()), c.prefix);
-  };
-  auto cmp = [](BytesView a, BytesView b) {
-    return std::lexicographical_compare_three_way(a.begin(), a.end(), b.begin(), b.end(),
-                                                  [](std::byte x, std::byte y) {
-                                                    return std::to_integer<int>(x) <=> std::to_integer<int>(y);
-                                                  });
-  };
   while (true) {
     BytesView k, v;
     if (!reverse) {
@@ -308,26 +368,17 @@ auto cursor_advance(bc_ctx* cx, Cursor& c) -> bool {
       v = (**c.rev).value;
     }
     if (!cx->charge()) return false;
-    if (!in_prefix(k)) {
-      if (reverse && !c.hi.empty() && std::is_gt(cmp(k, c.prefix))) continue;  // the successor itself
+    if (!starts_with(k, c.prefix)) {
+      if (reverse && !c.hi.empty() && std::is_gt(bytes_cmp(k, c.prefix))) continue;  // the successor itself
       return false;
     }
-    auto lo_c = cmp(k, c.lo);
-    if (std::is_lt(lo_c)) {
+    if (std::is_lt(bytes_cmp(k, c.lo))) {
       if (reverse) return false;
       continue;
     }
-    if ((c.flags & BC_SCAN_LO_EXCLUSIVE) != 0 && std::is_eq(lo_c)) {
-      if (reverse) return false;
-      continue;
-    }
-    if (!c.hi.empty()) {
-      auto hi_c = cmp(k, c.hi);
-      auto past = (c.flags & BC_SCAN_HI_INCLUSIVE) != 0 ? std::is_gt(hi_c) : std::is_gteq(hi_c);
-      if (past) {
-        if (reverse) continue;
-        return false;
-      }
+    if (!c.hi.empty() && std::is_gteq(bytes_cmp(k, c.hi))) {
+      if (reverse) continue;
+      return false;
     }
     c.key.assign(k.begin(), k.end());
     c.value.assign(v.begin(), v.end());
@@ -346,6 +397,24 @@ auto read_record(bc_ctx* cx, BytesView key, bool* found) -> bc_view {
   return v;
 }
 
+// The range [lo, hi) of a table or index with empty bounds resolved: an empty
+// lo is the start of its keys, an empty hi the end.
+struct Range {
+  Bytes prefix, lo, hi;
+};
+
+auto resolve_range(bc_ctx* cx, std::uint32_t table_or_index, bc_view lo, bc_view hi) -> std::optional<Range> {
+  auto bounds = cx->resolve2(lo, hi);
+  const auto* kl = cx->key_layout(table_or_index);
+  if (!bounds || kl == nullptr) return std::nullopt;
+  Range r;
+  bytecask::sql::key_put_prefix(r.prefix, kl->ns, table_or_index);
+  r.lo = bounds->first.empty() ? r.prefix : Bytes(bounds->first.begin(), bounds->first.end());
+  r.hi = bounds->second.empty() ? bytecask::sql::key_successor(r.prefix)
+                                : Bytes(bounds->second.begin(), bounds->second.end());
+  return r;
+}
+
 auto key_builder_part(bc_ctx* cx, bc_key k, PhysType type, bool is_null) -> KeyBuilder* {
   auto* b = cx->resolve_handle(k, cx->keys, "key builder");
   if (b == nullptr) return nullptr;
@@ -362,12 +431,59 @@ auto key_builder_part(bc_ctx* cx, bc_key k, PhysType type, bool is_null) -> KeyB
   return b;
 }
 
+// The part just reserved by key_builder_part.
+auto current_part(const KeyBuilder& b) -> KeyPart { return b.layout->parts[b.next_part - 1]; }
+
+// A reader positioned on part `part` of `key`, which must be a key of
+// `table_or_index` and, when `want` is given, have a part of that type there.
+struct KeyPartAt {
+  KeyReader reader;
+  KeyPart part;
+};
+
+auto key_part_at(bc_ctx* cx, std::uint32_t table_or_index, bc_view key, std::uint32_t part,
+                 std::optional<PhysType> want) -> std::optional<KeyPartAt> {
+  auto k = cx->resolve(key);
+  const auto* kl = cx->key_layout(table_or_index);
+  if (!k || kl == nullptr) return std::nullopt;
+  if (part >= kl->parts.size()) {
+    cx->fail(BC_E_HANDLE, "no key part " + std::to_string(part));
+    return std::nullopt;
+  }
+  if (want && kl->parts[part].type != *want) {
+    cx->fail(BC_E_HANDLE, "key part of the wrong type");
+    return std::nullopt;
+  }
+  Bytes prefix;
+  bytecask::sql::key_put_prefix(prefix, kl->ns, table_or_index);
+  if (!starts_with(*k, prefix)) {
+    cx->fail(BC_E_HANDLE, "key is not of table or index " + std::to_string(table_or_index));
+    return std::nullopt;
+  }
+  KeyReader r{*k, bytecask::sql::kKeyPrefixBytes};
+  for (std::uint32_t i = 0; i < part; ++i) {
+    if (!r.skip(kl->parts[i])) {
+      cx->fail(BC_E_CORRUPT, "unparseable key");
+      return std::nullopt;
+    }
+  }
+  return KeyPartAt{r, kl->parts[part]};
+}
+
+// Unwraps a decoded part: the value, or the neutral one for a null part or an
+// unparseable key (BC_E_CORRUPT).
+template <typename T>
+auto decoded(bc_ctx* cx, const KeyReader& r, std::optional<T> v, T neutral) -> T {
+  if (v) return *v;
+  if (!r.ok()) cx->fail(BC_E_CORRUPT, "unparseable key");
+  return neutral;
+}
+
 auto add_effect(bc_ctx* cx, EffectKind kind, bc_view a, bc_view b) -> void {
-  if (!cx->ok()) return;
-  auto av = cx->resolve(a);
-  auto bv = cx->resolve(b);
-  if (!av || !bv) return;
-  cx->effects.push_back({kind, Bytes(av->begin(), av->end()), Bytes(bv->begin(), bv->end())});
+  auto views = cx->resolve2(a, b);
+  if (!views) return;
+  cx->effects.push_back(
+      {kind, Bytes(views->first.begin(), views->first.end()), Bytes(views->second.begin(), views->second.end())});
 }
 
 auto row_builder(bc_ctx* cx, bc_row r) -> RowBuilder* {
@@ -380,7 +496,6 @@ auto row_builder(bc_ctx* cx, bc_row r) -> RowBuilder* {
 }
 
 auto check_schema(bc_ctx* cx, const bc_schema_ref* ref) -> bool {
-  if (ref == nullptr) return true;
   // prototype: an exact catalog version, stricter than the design's
   // per-column compatibility check.
   if (ref->catalog_version != cx->cat->version()) {
@@ -400,12 +515,69 @@ auto check_schema(bc_ctx* cx, const bc_schema_ref* ref) -> bool {
       return false;
     }
   }
+  std::vector<PhysType> types;
+  for (std::uint32_t i = 0; i < ref->n_result; ++i) {
+    auto t = phys_type(ref->result_types[i]);
+    if (!t) {
+      cx->fail(BC_E_LAYOUT, "unknown result type code " + std::to_string(ref->result_types[i]));
+      return false;
+    }
+    types.push_back(*t);
+  }
+  // Kept across executions: a retry, or the next run of the same plan, does
+  // not rebuild it.
+  if (!cx->result_layout || types != cx->result_types) {
+    try {
+      cx->result_layout.emplace(bytecask::sql::make_result_layout(types));
+    } catch (const std::length_error&) {
+      cx->fail(BC_E_LAYOUT, "the plan's result row has too many columns for one row layout");
+      return false;
+    }
+    cx->result_types = std::move(types);
+  }
   return true;
 }
 
-}  // namespace
+// A view a column decoder reads: a row whose header is consistent with its
+// length. The empty view is no row (a plan bug, BC_E_HANDLE); a stored row
+// that does not parse is BC_E_CORRUPT, never read as null.
+auto resolve_row(bc_ctx* cx, bc_view row) -> std::optional<BytesView> {
+  auto r = cx->resolve(row);
+  if (!r || !cx->ok()) return std::nullopt;
+  if (r->empty()) {
+    cx->fail(BC_E_HANDLE, "the empty view is not a row");
+    return std::nullopt;
+  }
+  if (!bytecask::sql::row_header_valid(*r)) {
+    cx->fail(BC_E_CORRUPT, "malformed row");
+    return std::nullopt;
+  }
+  return r;
+}
 
-auto bc_ctx_affected(const bc_ctx* cx) -> std::int64_t { return cx->affected; }
+// The row builder a bc_row_set_* call targets, with the layout check's message.
+template <typename Set>
+void set_column(bc_ctx* cx, bc_row r, Set&& set, const char* what) {
+  auto* b = row_builder(cx, r);
+  if (b == nullptr) return;
+  BC_GUARD_BEGIN
+  if (!set(b->writer)) cx->fail(BC_E_LAYOUT, std::string{"column is not "} + what + " of this layout");
+  BC_GUARD_END(cx)
+}
+
+template <typename Load, typename T>
+auto load_column(bc_ctx* cx, bc_view row, std::uint32_t off, Load&& load, T neutral) -> T {
+  auto r = resolve_row(cx, row);
+  if (!r) return neutral;
+  auto v = load(*r, off);
+  if (!v) {
+    cx->fail(BC_E_HANDLE, "column offset outside the row");
+    return neutral;
+  }
+  return *v;
+}
+
+}  // namespace
 
 extern "C" {
 
@@ -428,6 +600,7 @@ void bc_ctx_free(bc_ctx* cx) {
 void bc_ctx_begin(bc_ctx* cx, const bc_params* params, bc_budget budget) {
   cx->drop_execution_state();
   cx->error = BC_OK;
+  cx->detail = 0;
   cx->message.clear();
   cx->params = params;
   cx->budget = budget;
@@ -442,7 +615,15 @@ void bc_ctx_run(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* compiled_again
     cx->fail(BC_E_HANDLE, "bc_ctx_run without bc_ctx_begin");
     return;
   }
-  if (!check_schema(cx, compiled_against)) return;
+  BC_GUARD_BEGIN
+  if (compiled_against == nullptr) {
+    cx->result_types.clear();
+    cx->result_layout.reset();
+  } else if (!check_schema(cx, compiled_against)) {
+    return;
+  }
+  BC_GUARD_END(cx)
+  if (!cx->ok()) return;
   plan(cx);
   if (cx->ok() && cx->emit) cx->fail(BC_E_LAYOUT, "result row begun and not ended");
 }
@@ -450,6 +631,11 @@ void bc_ctx_run(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* compiled_again
 enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
   if (!cx->ok()) return BC_FAILED;
   if (cx->effects.empty()) return BC_COMMITTED;
+  if (!cx->snap) {
+    // Committed already (the write plan took the snapshot), or never begun.
+    cx->fail(BC_E_HANDLE, "bc_ctx_commit without a run to commit");
+    return BC_FAILED;
+  }
   try {
     cx->cursors.clear();
     bytecask::WritePlan plan{std::move(*cx->snap)};
@@ -459,9 +645,13 @@ enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
         case EffectKind::Put: plan.put(e.a, e.b); break;
         case EffectKind::Del: plan.del(e.a); break;
         case EffectKind::DelRange: plan.del_range(e.a, e.b); break;
+        case EffectKind::GuardUnchanged: plan.ensure_unchanged(e.a); break;
+        case EffectKind::GuardRange: plan.ensure_range_unchanged(e.a, e.b); break;
+        case EffectKind::GuardPresent: plan.ensure_present(e.a); break;
         case EffectKind::GuardAbsent: plan.ensure_absent(e.a); break;
       }
     }
+    cx->effects.clear();  // handed to the engine: a second commit has nothing to submit
     auto r = cx->db->apply_batch({.sync = sync}, std::move(plan));
     return r ? BC_COMMITTED : BC_CONFLICT;
   } catch (...) {
@@ -486,8 +676,14 @@ enum bc_error_code bc_error(const bc_ctx* cx) { return cx->error; }
 
 const char* bc_error_message(const bc_ctx* cx) { return cx->message.c_str(); }
 
+uint32_t bc_error_detail(const bc_ctx* cx) { return cx->detail; }
+
+int64_t bc_ctx_affected(const bc_ctx* cx) { return cx->affected; }
+
 int bc_execute(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* ref, const bc_params* params, bc_budget budget,
                bool sync, uint32_t max_retries) {
+  // Only a conflict is retried: an error, a raised BC_E_CONSTRAINT included,
+  // is BC_FAILED and final.
   for (std::uint32_t attempt = 0;; ++attempt) {
     bc_ctx_begin(cx, params, budget);
     bc_ctx_run(cx, plan, ref);
@@ -499,24 +695,24 @@ int bc_execute(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* ref, const bc_p
 // ------------------------------------------------- parameters and results
 
 int64_t bc_param_i64(bc_ctx* cx, uint32_t i) {
-  const auto* p = cx->param(i);
-  if (p == nullptr) return 0;
-  if (const auto* v = std::get_if<std::int64_t>(p)) return *v;
-  cx->fail(BC_E_HANDLE, "parameter $" + std::to_string(i + 1) + " is not an integer");
-  return 0;
+  const auto* v = cx->param_as<std::int64_t>(i, "an integer");
+  return v == nullptr ? 0 : *v;
 }
 
-double bc_param_f64(bc_ctx* cx, uint32_t) {
-  cx->unimplemented("bc_param_f64");
-  return 0;
+double bc_param_f64(bc_ctx* cx, uint32_t i) {
+  const auto* v = cx->param_as<double>(i, "a double");
+  return v == nullptr ? 0.0 : *v;
+}
+
+bool bc_param_bool(bc_ctx* cx, uint32_t i) {
+  const auto* v = cx->param_as<bool>(i, "a boolean");
+  return v != nullptr && *v;
 }
 
 bc_view bc_param_bytes(bc_ctx* cx, uint32_t i) {
-  const auto* p = cx->param(i);
-  if (p == nullptr) return {};
-  if (const auto* v = std::get_if<Bytes>(p)) return cx->make_view(v->data(), v->size());
-  cx->fail(BC_E_HANDLE, "parameter $" + std::to_string(i + 1) + " is not bytes");
-  return {};
+  const auto* v = cx->param_as<Bytes>(i, "bytes");
+  if (v == nullptr) return {};
+  return cx->make_view(v->data(), v->size());
 }
 
 bool bc_param_null(bc_ctx* cx, uint32_t i) {
@@ -524,23 +720,27 @@ bool bc_param_null(bc_ctx* cx, uint32_t i) {
   return p != nullptr && std::holds_alternative<std::monostate>(*p);
 }
 
-void bc_emit_begin(bc_ctx* cx, uint32_t layout) {
+void bc_emit_begin(bc_ctx* cx) {
   if (!cx->ok()) return;
-  const auto* types = cx->cat->result_types(layout);
-  if (types == nullptr || cx->emit) {
-    cx->fail(BC_E_LAYOUT, "bad result layout or a row already begun");
+  if (!cx->result_layout) {
+    cx->fail(BC_E_LAYOUT, "the plan's schema ref declares no result types");
     return;
   }
-  cx->emit.emplace(*cx->cat->row_layout(layout));
-  cx->emit_types = types;
+  if (cx->emit) {
+    cx->fail(BC_E_LAYOUT, "result row already begun");
+    return;
+  }
+  BC_GUARD_BEGIN
+  cx->emit.emplace(*cx->result_layout);
   cx->emit_col = 0;
+  BC_GUARD_END(cx)
 }
 
 namespace {
 auto emit_slot(bc_ctx* cx, std::optional<PhysType> type) -> bool {
   if (!cx->ok()) return false;
-  if (!cx->emit || cx->emit_col >= cx->emit_types->size() ||
-      (type && (*cx->emit_types)[cx->emit_col] != *type)) {
+  if (!cx->emit || cx->emit_col >= cx->result_types.size() ||
+      (type && cx->result_types[cx->emit_col] != *type)) {
     cx->fail(BC_E_LAYOUT, "emitted column does not match the result layout");
     return false;
   }
@@ -553,13 +753,23 @@ void bc_emit_i64(bc_ctx* cx, int64_t v) {
   (void)cx->emit->set_i64(cx->emit_col++, v);
 }
 
-void bc_emit_f64(bc_ctx* cx, double) { cx->unimplemented("bc_emit_f64"); }
+void bc_emit_f64(bc_ctx* cx, double v) {
+  if (!emit_slot(cx, PhysType::F64)) return;
+  (void)cx->emit->set_f64(cx->emit_col++, v);
+}
+
+void bc_emit_bool(bc_ctx* cx, bool v) {
+  if (!emit_slot(cx, PhysType::Bool)) return;
+  (void)cx->emit->set_bool(cx->emit_col++, v);
+}
 
 void bc_emit_bytes(bc_ctx* cx, bc_view v) {
   if (!emit_slot(cx, PhysType::Bytes)) return;
   auto b = cx->resolve(v);
   if (!b) return;
+  BC_GUARD_BEGIN
   (void)cx->emit->set_bytes(cx->emit_col++, *b);
+  BC_GUARD_END(cx)
 }
 
 void bc_emit_null(bc_ctx* cx) {
@@ -569,22 +779,22 @@ void bc_emit_null(bc_ctx* cx) {
 
 void bc_emit_end(bc_ctx* cx) {
   if (!cx->ok()) return;
-  if (!cx->emit || cx->emit_col != cx->emit_types->size()) {
+  if (!cx->emit || cx->emit_col != cx->result_types.size()) {
     cx->fail(BC_E_LAYOUT, "result row ended with the wrong number of columns");
     return;
   }
   BC_GUARD_BEGIN
-  Bytes row;
-  if (!cx->emit->finish(row)) {
+  // prototype: the result buffer is a heap vector, not part of the arena.
+  // The row is encoded straight into it, after its length.
+  auto at = cx->results.size();
+  cx->results.resize(at + 4);
+  if (!cx->emit->finish(cx->results)) {
+    cx->results.resize(at);
     cx->fail(BC_E_LIMIT, "result row over the row format's limit");
     return;
   }
-  // prototype: the result buffer is a heap vector, not part of the arena.
-  auto n = static_cast<std::uint32_t>(row.size());
-  auto at = cx->results.size();
-  cx->results.resize(at + 4 + n);
+  auto n = static_cast<std::uint32_t>(cx->results.size() - at - 4);
   std::memcpy(cx->results.data() + at, &n, 4);
-  std::memcpy(cx->results.data() + at + 4, row.data(), n);
   cx->emit.reset();
   BC_GUARD_END(cx)
 }
@@ -600,64 +810,84 @@ void bc_emit_count(bc_ctx* cx, int64_t affected) {
 
 // ---------------------------------------------------------------- arithmetic
 
-int64_t bc_add(bc_ctx* cx, int64_t, int64_t) {
-  cx->unimplemented("bc_add");
+namespace {
+auto arith_fail(bc_ctx* cx, const char* what) -> std::int64_t {
+  cx->fail(BC_E_ARITH, what);
   return 0;
+}
+}  // namespace
+
+int64_t bc_add(bc_ctx* cx, int64_t a, int64_t b) {
+  if (!cx->ok()) return 0;
+  std::int64_t r = 0;
+  return __builtin_add_overflow(a, b, &r) ? arith_fail(cx, "integer out of range") : r;
 }
 
 int64_t bc_sub(bc_ctx* cx, int64_t a, int64_t b) {
   if (!cx->ok()) return 0;
   std::int64_t r = 0;
-  if (__builtin_sub_overflow(a, b, &r)) {
-    cx->fail(BC_E_ARITH, "integer out of range");
-    return 0;
-  }
-  return r;
+  return __builtin_sub_overflow(a, b, &r) ? arith_fail(cx, "integer out of range") : r;
 }
 
-int64_t bc_mul(bc_ctx* cx, int64_t, int64_t) {
-  cx->unimplemented("bc_mul");
-  return 0;
+int64_t bc_mul(bc_ctx* cx, int64_t a, int64_t b) {
+  if (!cx->ok()) return 0;
+  std::int64_t r = 0;
+  return __builtin_mul_overflow(a, b, &r) ? arith_fail(cx, "integer out of range") : r;
 }
-int64_t bc_div(bc_ctx* cx, int64_t, int64_t) {
-  cx->unimplemented("bc_div");
-  return 0;
+
+int64_t bc_div(bc_ctx* cx, int64_t a, int64_t b) {
+  if (!cx->ok()) return 0;
+  if (b == 0) return arith_fail(cx, "division by zero");
+  if (b == -1 && a == std::numeric_limits<std::int64_t>::min()) return arith_fail(cx, "integer out of range");
+  return a / b;
 }
-int64_t bc_mod(bc_ctx* cx, int64_t, int64_t) {
-  cx->unimplemented("bc_mod");
-  return 0;
+
+int64_t bc_mod(bc_ctx* cx, int64_t a, int64_t b) {
+  if (!cx->ok()) return 0;
+  if (b == 0) return arith_fail(cx, "division by zero");
+  if (b == -1) return 0;  // INT64_MIN % -1 is undefined in C; the remainder is 0
+  return a % b;
 }
-int64_t bc_neg(bc_ctx* cx, int64_t) {
-  cx->unimplemented("bc_neg");
-  return 0;
+
+int64_t bc_neg(bc_ctx* cx, int64_t a) {
+  if (!cx->ok()) return 0;
+  if (a == std::numeric_limits<std::int64_t>::min()) return arith_fail(cx, "integer out of range");
+  return -a;
 }
-int64_t bc_f64_to_i64(bc_ctx* cx, double) {
-  cx->unimplemented("bc_f64_to_i64");
-  return 0;
+
+int64_t bc_f64_to_i64(bc_ctx* cx, double v) {
+  if (!cx->ok()) return 0;
+  // Truncation toward zero lands in i64 exactly when v is in [-2^63, 2^63);
+  // both bounds are exact doubles.
+  if (v != v) return arith_fail(cx, "cannot convert NaN to an integer");
+  if (!(v >= -9223372036854775808.0 && v < 9223372036854775808.0)) return arith_fail(cx, "double out of integer range");
+  return static_cast<std::int64_t>(v);
 }
+
 double bc_i64_to_f64(int64_t v) { return static_cast<double>(v); }
-bool bc_bytes_eq(bc_ctx* cx, bc_view, bc_view) {
-  cx->unimplemented("bc_bytes_eq");
-  return false;
+
+bool bc_bytes_eq(bc_ctx* cx, bc_view a, bc_view b) {
+  auto v = cx->resolve2(a, b);
+  return v && std::ranges::equal(v->first, v->second);
 }
-int bc_bytes_cmp(bc_ctx* cx, bc_view, bc_view) {
-  cx->unimplemented("bc_bytes_cmp");
-  return 0;
+
+int bc_bytes_cmp(bc_ctx* cx, bc_view a, bc_view b) {
+  auto v = cx->resolve2(a, b);
+  if (!v) return 0;
+  auto o = bytes_cmp(v->first, v->second);
+  return std::is_lt(o) ? -1 : std::is_gt(o) ? 1 : 0;
 }
-bool bc_bytes_prefix(bc_ctx* cx, bc_view, bc_view) {
-  cx->unimplemented("bc_bytes_prefix");
-  return false;
+
+bool bc_bytes_prefix(bc_ctx* cx, bc_view prefix, bc_view b) {
+  auto v = cx->resolve2(prefix, b);
+  return v && starts_with(v->second, v->first);
 }
 
 // ---------------------------------------------------------------------- keys
 
 bc_key bc_key_begin(bc_ctx* cx, uint32_t table_or_index) {
-  if (!cx->ok()) return {};
-  const auto* kl = cx->cat->key_layout(table_or_index);
-  if (kl == nullptr) {
-    cx->fail(BC_E_HANDLE, "no table or index " + std::to_string(table_or_index));
-    return {};
-  }
+  const auto* kl = cx->key_layout(table_or_index);
+  if (kl == nullptr) return {};
   BC_GUARD_BEGIN
   KeyBuilder b{kl, {}, 0, false};
   bytecask::sql::key_put_prefix(b.buf, kl->ns, table_or_index);
@@ -669,21 +899,29 @@ bc_key bc_key_begin(bc_ctx* cx, uint32_t table_or_index) {
 
 void bc_key_i64(bc_ctx* cx, bc_key k, int64_t v) {
   auto* b = key_builder_part(cx, k, PhysType::I64, false);
-  if (b != nullptr) bytecask::sql::key_put_i64(b->buf, v, b->layout->parts[b->next_part - 1].nullable);
+  if (b != nullptr) bytecask::sql::key_put_i64(b->buf, v, current_part(*b));
 }
 
-void bc_key_f64(bc_ctx* cx, bc_key, double) { cx->unimplemented("bc_key_f64"); }
+void bc_key_f64(bc_ctx* cx, bc_key k, double v) {
+  auto* b = key_builder_part(cx, k, PhysType::F64, false);
+  if (b != nullptr) bytecask::sql::key_put_f64(b->buf, v, current_part(*b));
+}
+
+void bc_key_bool(bc_ctx* cx, bc_key k, bool v) {
+  auto* b = key_builder_part(cx, k, PhysType::Bool, false);
+  if (b != nullptr) bytecask::sql::key_put_bool(b->buf, v, current_part(*b));
+}
 
 void bc_key_bytes(bc_ctx* cx, bc_key k, bc_view v) {
   auto bytes = cx->resolve(v);
   if (!bytes) return;
   auto* b = key_builder_part(cx, k, PhysType::Bytes, false);
-  if (b != nullptr) bytecask::sql::key_put_bytes(b->buf, *bytes, b->layout->parts[b->next_part - 1].nullable);
+  if (b != nullptr) bytecask::sql::key_put_bytes(b->buf, *bytes, current_part(*b));
 }
 
 void bc_key_null(bc_ctx* cx, bc_key k) {
   auto* b = key_builder_part(cx, k, PhysType::I64, true);
-  if (b != nullptr) bytecask::sql::key_put_null(b->buf);
+  if (b != nullptr) bytecask::sql::key_put_null(b->buf, current_part(*b));
 }
 
 void bc_key_pk(bc_ctx* cx, bc_key k, bc_view pk) {
@@ -707,6 +945,10 @@ bc_view bc_key_end(bc_ctx* cx, bc_key k) {
     return {};
   }
   b->done = true;
+  if (b->buf.size() > bytecask::sql::kMaxKeyBytes) {
+    cx->fail(BC_E_LIMIT, "key over the engine's key limit");
+    return {};
+  }
   return cx->arena_view(b->buf);
 }
 
@@ -748,20 +990,24 @@ bc_view bc_lookup(bc_ctx* cx, uint32_t table, bc_view pk, bool* found) {
   return {};
 }
 
-bool bc_exists(bc_ctx* cx, bc_view) {
-  cx->unimplemented("bc_exists");
+bool bc_exists(bc_ctx* cx, bc_view key) {
+  auto k = cx->resolve(key);
+  if (!k || !cx->charge()) return false;
+  BC_GUARD_BEGIN
+  return cx->snap->contains_key({}, *k);
+  BC_GUARD_END(cx)
   return false;
 }
 
 bc_cursor bc_scan_open(bc_ctx* cx, uint32_t table_or_index, bc_view lo, bc_view hi, uint32_t flags) {
-  auto lo_b = cx->resolve(lo);
-  auto hi_b = cx->resolve(hi);
-  if (!lo_b || !hi_b || !cx->ok()) return {};
-  const auto* kl = cx->cat->key_layout(table_or_index);
-  if (kl == nullptr) {
-    cx->fail(BC_E_HANDLE, "no table or index " + std::to_string(table_or_index));
+  if ((flags & ~kScanFlagMask) != 0) {
+    cx->fail(BC_E_HANDLE, "unknown scan flag");
     return {};
   }
+  auto lo_b = cx->resolve(lo);
+  auto hi_b = cx->resolve(hi);
+  const auto* kl = cx->key_layout(table_or_index);
+  if (!lo_b || !hi_b || kl == nullptr) return {};
   BC_GUARD_BEGIN
   Cursor c;
   c.layout = kl;
@@ -770,7 +1016,6 @@ bc_cursor bc_scan_open(bc_ctx* cx, uint32_t table_or_index, bc_view lo, bc_view 
   c.lo = lo_b->empty() ? c.prefix : Bytes(lo_b->begin(), lo_b->end());
   if ((flags & BC_SCAN_PREFIX) != 0) {
     c.hi = bytecask::sql::key_successor(c.lo);
-    c.flags &= ~static_cast<std::uint32_t>(BC_SCAN_HI_INCLUSIVE);
   } else if (!hi_b->empty()) {
     c.hi.assign(hi_b->begin(), hi_b->end());
   }
@@ -819,7 +1064,7 @@ bc_view bc_scan_value(bc_ctx* cx, bc_cursor h) {
 bc_view bc_scan_pk(bc_ctx* cx, bc_cursor h) {
   auto* c = positioned_cursor(cx, h);
   if (c == nullptr) return {};
-  bytecask::sql::KeyReader r{c->key, bytecask::sql::kKeyPrefixBytes};
+  KeyReader r{c->key, bytecask::sql::kKeyPrefixBytes};
   for (std::size_t i = 0; i < c->layout->index_parts; ++i) {
     if (!r.skip(c->layout->parts[i])) {
       cx->fail(BC_E_CORRUPT, "unparseable index key");
@@ -839,54 +1084,115 @@ void bc_scan_close(bc_ctx* cx, bc_cursor h) {
   c->positioned = false;
 }
 
-int64_t bc_count_range(bc_ctx* cx, uint32_t, bc_view, bc_view, int64_t) {
-  cx->unimplemented("bc_count_range");
+bc_view bc_empty(bc_ctx*) { return {}; }
+
+int64_t bc_key_part_i64(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32_t part) {
+  auto at = key_part_at(cx, table_or_index, key, part, PhysType::I64);
+  if (!at) return 0;
+  return decoded<std::int64_t>(cx, at->reader, at->reader.read_i64(at->part), 0);
+}
+
+double bc_key_part_f64(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32_t part) {
+  auto at = key_part_at(cx, table_or_index, key, part, PhysType::F64);
+  if (!at) return 0.0;
+  return decoded<double>(cx, at->reader, at->reader.read_f64(at->part), 0.0);
+}
+
+bool bc_key_part_bool(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32_t part) {
+  auto at = key_part_at(cx, table_or_index, key, part, PhysType::Bool);
+  if (!at) return false;
+  return decoded<bool>(cx, at->reader, at->reader.read_bool(at->part), false);
+}
+
+bc_view bc_key_part_bytes(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32_t part) {
+  auto at = key_part_at(cx, table_or_index, key, part, PhysType::Bytes);
+  if (!at) return {};
+  BC_GUARD_BEGIN
+  auto v = at->reader.read_bytes(at->part);
+  if (!v) {
+    if (!at->reader.ok()) cx->fail(BC_E_CORRUPT, "unparseable key");
+    return {};
+  }
+  return cx->arena_view(*v);
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bool bc_key_part_null(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32_t part) {
+  auto at = key_part_at(cx, table_or_index, key, part, std::nullopt);
+  if (!at) return true;
+  if (!at->reader.skip(at->part)) {
+    cx->fail(BC_E_CORRUPT, "unparseable key");
+    return true;
+  }
+  return at->reader.last_was_null();
+}
+
+int64_t bc_count_range(bc_ctx* cx, uint32_t table_or_index, bc_view lo, bc_view hi, int64_t limit) {
+  auto range = resolve_range(cx, table_or_index, lo, hi);
+  if (!range) return 0;
+  if (limit < 0) {
+    cx->fail(BC_E_HANDLE, "negative count limit");
+    return 0;
+  }
+  if (!cx->charge(2)) return 0;  // the engine's bound: at most two record reads
+  if (std::is_gteq(bytes_cmp(range->lo, range->hi))) return 0;
+  BC_GUARD_BEGIN
+  return static_cast<std::int64_t>(cx->snap->count_keys(range->lo, range->hi, static_cast<std::size_t>(limit)));
+  BC_GUARD_END(cx)
   return 0;
 }
 
 // ------------------------------------------------------------ rows, columns
 
 bool bc_col_null(bc_ctx* cx, bc_view row, uint32_t col) {
-  auto r = cx->resolve(row);
-  if (!r || !cx->ok()) return true;
-  return bytecask::sql::row_null_bit(*r, col);
+  auto r = resolve_row(cx, row);
+  if (!r) return true;
+  return !bytecask::sql::row_present_bit(*r, col);
 }
 
 int64_t bc_col_i64(bc_ctx* cx, bc_view row, uint32_t off) {
-  auto r = cx->resolve(row);
-  if (!r || !cx->ok()) return 0;
-  auto v = bytecask::sql::row_i64(*r, off);
-  if (!v) {
-    cx->fail(BC_E_HANDLE, "column offset outside the row");
-    return 0;
-  }
-  return *v;
+  return load_column(cx, row, off, bytecask::sql::row_i64, std::int64_t{0});
 }
 
-int64_t bc_col_i32(bc_ctx* cx, bc_view, uint32_t) {
-  cx->unimplemented("bc_col_i32");
-  return 0;
+double bc_col_f64(bc_ctx* cx, bc_view row, uint32_t off) {
+  return load_column(cx, row, off, bytecask::sql::row_f64, 0.0);
 }
 
-double bc_col_f64(bc_ctx* cx, bc_view, uint32_t) {
-  cx->unimplemented("bc_col_f64");
-  return 0;
+bool bc_col_bool(bc_ctx* cx, bc_view row, uint32_t off) {
+  return load_column(cx, row, off, bytecask::sql::row_bool, false);
 }
 
 bc_view bc_col_bytes(bc_ctx* cx, bc_view row, uint32_t slot) {
-  auto r = cx->resolve(row);
-  if (!r || !cx->ok()) return {};
+  auto r = resolve_row(cx, row);
+  if (!r) return {};
   auto v = bytecask::sql::row_bytes(*r, slot);
   if (!v) {
-    cx->fail(BC_E_HANDLE, "variable slot outside the row");
+    // The header parsed and a slot past nvar reads as empty, so this is a
+    // var_end entry that runs past the row: the row is damaged.
+    cx->fail(BC_E_CORRUPT, "malformed row");
     return {};
   }
   auto [cursor, step] = cx->owner(row);
   return cx->make_view(v->data(), v->size(), cursor, step);
 }
 
-bc_view bc_row_pk(bc_ctx* cx, uint32_t, bc_view) {
-  cx->unimplemented("bc_row_pk");
+bc_view bc_row_pk(bc_ctx* cx, uint32_t table, bc_view row) {
+  auto r = resolve_row(cx, row);
+  if (!r) return {};
+  const auto* t = cx->cat->table(table);
+  if (t == nullptr) {
+    cx->fail(BC_E_HANDLE, "no table " + std::to_string(table));
+    return {};
+  }
+  BC_GUARD_BEGIN
+  Bytes key;
+  if (!bytecask::sql::encode_pk_from_row(*t, *r, key)) {
+    cx->fail(BC_E_LAYOUT, "row does not hold the table's primary key");
+    return {};
+  }
+  return cx->arena_view(key);
+  BC_GUARD_END(cx)
   return {};
 }
 
@@ -905,38 +1211,44 @@ bc_row bc_row_begin(bc_ctx* cx, uint32_t layout) {
 }
 
 bc_row bc_row_from(bc_ctx* cx, uint32_t layout, bc_view old) {
-  auto o = cx->resolve(old);
+  auto o = resolve_row(cx, old);
   if (!o) return {};
   auto r = bc_row_begin(cx, layout);
   if (!cx->ok()) return {};
-  if (!bytecask::sql::row_valid(*o) || bytecask::sql::row_generation(*o) != cx->rows[r.i].layout->generation) {
-    cx->fail(BC_E_LAYOUT, "row is not of this layout");
+  if (!bytecask::sql::row_valid(*o)) {
+    cx->fail(BC_E_CORRUPT, "malformed row");
     return {};
   }
+  if (bytecask::sql::row_generation(*o) != cx->rows[r.i].layout->generation) {
+    cx->fail(BC_E_LAYOUT, "row is not of this layout generation");
+    return {};
+  }
+  BC_GUARD_BEGIN
   cx->rows[r.i].writer.copy_from(*o);
+  BC_GUARD_END(cx)
   return r;
 }
 
 void bc_row_set_i64(bc_ctx* cx, bc_row r, uint32_t col, int64_t v) {
-  auto* b = row_builder(cx, r);
-  if (b != nullptr && !b->writer.set_i64(col, v)) cx->fail(BC_E_LAYOUT, "column is not an integer of this layout");
+  set_column(cx, r, [&](RowWriter& w) { return w.set_i64(col, v); }, "an integer");
 }
 
-void bc_row_set_f64(bc_ctx* cx, bc_row, uint32_t, double) { cx->unimplemented("bc_row_set_f64"); }
+void bc_row_set_f64(bc_ctx* cx, bc_row r, uint32_t col, double v) {
+  set_column(cx, r, [&](RowWriter& w) { return w.set_f64(col, v); }, "a double");
+}
+
+void bc_row_set_bool(bc_ctx* cx, bc_row r, uint32_t col, bool v) {
+  set_column(cx, r, [&](RowWriter& w) { return w.set_bool(col, v); }, "a boolean");
+}
 
 void bc_row_set_bytes(bc_ctx* cx, bc_row r, uint32_t col, bc_view v) {
   auto bytes = cx->resolve(v);
   if (!bytes) return;
-  auto* b = row_builder(cx, r);
-  if (b == nullptr) return;
-  BC_GUARD_BEGIN
-  if (!b->writer.set_bytes(col, *bytes)) cx->fail(BC_E_LAYOUT, "column is not bytes of this layout");
-  BC_GUARD_END(cx)
+  set_column(cx, r, [&](RowWriter& w) { return w.set_bytes(col, *bytes); }, "bytes");
 }
 
 void bc_row_set_null(bc_ctx* cx, bc_row r, uint32_t col) {
-  auto* b = row_builder(cx, r);
-  if (b != nullptr && !b->writer.set_null(col)) cx->fail(BC_E_LAYOUT, "no such column in this layout");
+  set_column(cx, r, [&](RowWriter& w) { return w.set_null(col); }, "a column");
 }
 
 bc_view bc_row_end(bc_ctx* cx, bc_row r) {
@@ -950,7 +1262,7 @@ bc_view bc_row_end(bc_ctx* cx, bc_row r) {
   BC_GUARD_BEGIN
   Bytes row;
   if (!b->writer.finish(row)) {
-    cx->fail(BC_E_LIMIT, "row over the row format's limit");
+    cx->fail(BC_E_LIMIT, "row over the engine's value limit");
     return {};
   }
   return cx->arena_view(row);
@@ -958,11 +1270,10 @@ bc_view bc_row_end(bc_ctx* cx, bc_row r) {
   return {};
 }
 
-bc_view bc_empty(bc_ctx*) { return {}; }
-
-bc_view bc_pin(bc_ctx* cx, bc_view) {
-  cx->unimplemented("bc_pin");
-  return {};
+bc_view bc_pin(bc_ctx* cx, bc_view v) {
+  auto b = cx->resolve(v);
+  if (!b || !cx->ok()) return {};
+  return cx->arena_view(*b);
 }
 
 // --------------------------------------------------- ephemeral structures
@@ -1037,14 +1348,61 @@ void bc_del(bc_ctx* cx, bc_view key) {
   BC_GUARD_END(cx)
 }
 
-void bc_del_range(bc_ctx* cx, bc_view, bc_view) { cx->unimplemented("bc_del_range"); }
-void bc_guard_unchanged(bc_ctx* cx, bc_view) { cx->unimplemented("bc_guard_unchanged"); }
-void bc_guard_range(bc_ctx* cx, uint32_t, bc_view, bc_view) { cx->unimplemented("bc_guard_range"); }
-void bc_guard_present(bc_ctx* cx, bc_view) { cx->unimplemented("bc_guard_present"); }
+void bc_del_range(bc_ctx* cx, bc_view lo, bc_view hi) {
+  auto bounds = cx->resolve2(lo, hi);
+  if (!bounds) return;
+  // No table id to resolve an open bound against: an empty bound would reach
+  // past the table into the whole keyspace, the catalog included.
+  if (bounds->first.empty() || bounds->second.empty()) {
+    cx->fail(BC_E_HANDLE, "bc_del_range takes no open bound");
+    return;
+  }
+  if (std::is_gteq(bytes_cmp(bounds->first, bounds->second))) return;  // an empty range deletes nothing
+  BC_GUARD_BEGIN
+  cx->effects.push_back({EffectKind::DelRange, Bytes(bounds->first.begin(), bounds->first.end()),
+                         Bytes(bounds->second.begin(), bounds->second.end())});
+  BC_GUARD_END(cx)
+}
+
+void bc_guard_unchanged(bc_ctx* cx, bc_view key) {
+  BC_GUARD_BEGIN
+  add_effect(cx, EffectKind::GuardUnchanged, key, {});
+  BC_GUARD_END(cx)
+}
+
+void bc_guard_range(bc_ctx* cx, uint32_t table_or_index, bc_view lo, bc_view hi) {
+  BC_GUARD_BEGIN
+  auto range = resolve_range(cx, table_or_index, lo, hi);
+  if (!range) return;
+  if (std::is_gteq(bytes_cmp(range->lo, range->hi))) return;  // an empty range cannot change
+  cx->effects.push_back({EffectKind::GuardRange, std::move(range->lo), std::move(range->hi)});
+  BC_GUARD_END(cx)
+}
+
+void bc_guard_present(bc_ctx* cx, bc_view key) {
+  BC_GUARD_BEGIN
+  add_effect(cx, EffectKind::GuardPresent, key, {});
+  BC_GUARD_END(cx)
+}
 
 void bc_guard_absent(bc_ctx* cx, bc_view key) {
   BC_GUARD_BEGIN
   add_effect(cx, EffectKind::GuardAbsent, key, {});
+  BC_GUARD_END(cx)
+}
+
+void bc_raise(bc_ctx* cx, uint32_t constraint, uint32_t object_id) {
+  if (!cx->ok()) return;
+  // The detail holds the kind in 8 bits and the id in 24: anything wider would
+  // name another constraint or object.
+  if (constraint < BC_C_UNIQUE || constraint > BC_C_RANGE || object_id > 0x00FF'FFFFu) {
+    cx->fail(BC_E_HANDLE, "bc_raise with an unknown constraint kind or an object id past 2^24");
+    return;
+  }
+  auto detail = (constraint << 24) | object_id;
+  BC_GUARD_BEGIN
+  cx->fail(BC_E_CONSTRAINT, constraint_message(detail));
+  cx->detail = detail;
   BC_GUARD_END(cx)
 }
 

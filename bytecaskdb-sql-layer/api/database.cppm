@@ -36,7 +36,7 @@ export import bytecask.sql.tcc_loader;
 
 export namespace bytecask::sql {
 
-using Value = bc_value;  // NULL, BIGINT, double (unused), BYTEA
+using Value = bc_value;  // NULL, BIGINT, DOUBLE PRECISION, BOOLEAN, BYTEA
 
 struct Rows {
   std::vector<std::string> columns;
@@ -44,9 +44,9 @@ struct Rows {
   std::int64_t affected{-1};  // INSERT, UPDATE, DELETE: rows changed
 };
 
-// A plan that ran and failed: the plan API's error code and message, or
-// BC_CONFLICT when every retry conflicted (for INSERT, usually a duplicate
-// primary key: the API cannot tell the two apart).
+// A plan that ran and failed: the plan API's error code and message (a
+// duplicate key is BC_E_CONSTRAINT, raised by the plan), or BC_CONFLICT when
+// every retry conflicted.
 class ExecError : public std::runtime_error {
 public:
   ExecError(const std::string& what, int code) : std::runtime_error{what}, code_{code} {}
@@ -74,7 +74,8 @@ private:
   std::unique_ptr<GeneratedPlan> plan_;  // null for DDL
   std::unique_ptr<TccPlan> code_;
   std::vector<std::string> columns_;
-  std::vector<std::uint32_t> tables_read_, tables_written_;
+  std::vector<std::uint8_t> result_codes_;  // the plan's result_types as bc_type codes
+  RowLayout result_layout_;                 // how its result rows decode, built once per compile
 };
 
 class Database {

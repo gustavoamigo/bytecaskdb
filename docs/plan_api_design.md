@@ -181,8 +181,10 @@ enum bc_error_code {
 enum bc_scan_flags {
   BC_SCAN_FORWARD = 0,
   BC_SCAN_REVERSE = 1u << 0,
-  BC_SCAN_PREFIX  = 1u << 1,   /* hi ignored: every key with lo as prefix */
+  BC_SCAN_PREFIX  = 1u << 3,   /* hi ignored: every key with lo as prefix */
 };
+/* Bits 1 and 2 were LO_EXCLUSIVE and HI_INCLUSIVE in revision 1; they stay
+   unassigned so a plan that still passes them is refused, not misread. */
 /* Bounds are always [lo, hi). There are no exclusive-lo or inclusive-hi
    flags: an index key carries the primary key after the bounded part, so an
    entry equal to a partial bound still sorts after it. "name > $1" is
@@ -190,6 +192,7 @@ enum bc_scan_flags {
 
 enum bc_constraint {   /* the detail of BC_E_CONSTRAINT; the compiler emits the object id with it */
   BC_C_UNIQUE = 1, BC_C_NOT_NULL, BC_C_CHECK, BC_C_FOREIGN_KEY,
+  BC_C_RANGE,          /* a value outside its declared type: INTEGER, VARCHAR(n), DECIMAL(p, s) */
 };
 
 enum bc_commit_result { BC_COMMITTED, BC_CONFLICT, BC_FAILED /* see bc_error */ };
@@ -245,7 +248,7 @@ bool    bc_ctx_next_result(bc_ctx *, const uint8_t **row, uint32_t *len);     /*
 void    bc_ctx_reset(bc_ctx *);                                               /* drops snapshot, plan, arena */
 enum bc_error_code bc_error(const bc_ctx *);
 const char *bc_error_message(const bc_ctx *);
-uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint and object id */
+uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits */
 int64_t bc_ctx_affected(const bc_ctx *);                   /* what bc_emit_count recorded, or -1 */
 int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params *,
                    bc_budget, bool sync, uint32_t max_retries);               /* the retry loop */
@@ -267,12 +270,14 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
 ```c
 int64_t  bc_param_i64(bc_ctx *, uint32_t i);
 double   bc_param_f64(bc_ctx *, uint32_t i);
+bool     bc_param_bool(bc_ctx *, uint32_t i);
 bc_view  bc_param_bytes(bc_ctx *, uint32_t i);
 bool     bc_param_null(bc_ctx *, uint32_t i);
 
 void     bc_emit_begin(bc_ctx *);                     /* a row of the plan's result layout */
 void     bc_emit_i64(bc_ctx *, int64_t);
 void     bc_emit_f64(bc_ctx *, double);
+void     bc_emit_bool(bc_ctx *, bool);
 void     bc_emit_bytes(bc_ctx *, bc_view);
 void     bc_emit_null(bc_ctx *);
 void     bc_emit_end(bc_ctx *);
@@ -321,6 +326,7 @@ below. A builder is finalized once; its view lives until reset.
 bc_key   bc_key_begin(bc_ctx *, uint32_t table_or_index);
 void     bc_key_i64(bc_ctx *, bc_key, int64_t);
 void     bc_key_f64(bc_ctx *, bc_key, double);
+void     bc_key_bool(bc_ctx *, bc_key, bool);
 void     bc_key_bytes(bc_ctx *, bc_key, bc_view);
 void     bc_key_null(bc_ctx *, bc_key);
 void     bc_key_pk(bc_ctx *, bc_key, bc_view pk);     /* appends an already-encoded primary key */
@@ -331,9 +337,9 @@ bc_view  bc_key_successor(bc_ctx *, bc_view key);     /* smallest key greater th
 | Function | What it does |
 |---|---|
 | `bc_key_begin` | Starts a key for a table (its primary key) or an index. Writes the namespace byte and the 4-byte id. Returns a builder handle. |
-| `bc_key_i64`, `bc_key_f64`, `bc_key_bytes`, `bc_key_null` | Appends one part. Nullability and direction come from the catalog entry for `table_or_index`, so the builder knows whether to write a null marker and whether to invert the bytes. A part of the wrong type, or more parts than the key has, is `BC_E_HANDLE`. |
+| `bc_key_i64`, `bc_key_f64`, `bc_key_bool`, `bc_key_bytes`, `bc_key_null` | Appends one part. Nullability and direction come from the catalog entry for `table_or_index`, so the builder knows whether to write a null marker and whether to invert the bytes. A part of the wrong type, or more parts than the key has, is `BC_E_HANDLE`. |
 | `bc_key_pk` | Appends the encoded primary-key suffix to a secondary index key, as `bc_scan_pk` or `bc_row_pk` returned it. Copied verbatim. |
-| `bc_key_end` | Finalizes and returns the key. A partial key (fewer parts than the index has) is legal and is a prefix the compiler uses as a scan bound. |
+| `bc_key_end` | Finalizes and returns the key. A partial key (fewer parts than the index has) is legal and is a prefix the compiler uses as a scan bound. A key over the engine's hard ceiling (65,535 bytes) is `BC_E_LIMIT`. |
 | `bc_key_successor` | The exclusive upper bound of the prefix `key`: its last byte incremented, carrying. Turns a prefix into a half-open range where `BC_SCAN_PREFIX` does not fit. |
 
 ### Reads
@@ -359,6 +365,7 @@ bc_view   bc_empty(bc_ctx *);                                 /* the empty view,
    from bc_scan_key without fetching the row. */
 int64_t   bc_key_part_i64(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
 double    bc_key_part_f64(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
+bool      bc_key_part_bool(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
 bc_view   bc_key_part_bytes(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
 bool      bc_key_part_null(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
 
@@ -376,7 +383,7 @@ int64_t   bc_count_range(bc_ctx *, uint32_t table_or_index, bc_view lo, bc_view 
 | `bc_scan_value` | The current entry's value: the row on a table scan, empty on a secondary index. | View valid until the cursor steps or closes. | 0 |
 | `bc_scan_pk` | On a secondary index, the encoded primary-key suffix of the current entry, parsed with the index's catalog layout. On a table scan, the primary-key part of the key. | View valid until the cursor steps or closes. | 0 |
 | `bc_empty` | The empty view. | The zero handle, valid always. | 0 |
-| `bc_key_part_*` | Decodes one part of an encoded key, by position in the key's catalog layout. On a secondary index the index columns come first, then the primary key's parts. `bc_key_part_null` reports a null part; the typed decoders return zero or empty for one. A part number or type that disagrees with the layout is `BC_E_HANDLE`. | Values; a bytes part is a sub-view with the key's lifetime. | 0 |
+| `bc_key_part_*` | Decodes one part of an encoded key, by position in the key's catalog layout. On a secondary index the index columns come first, then the primary key's parts. `bc_key_part_null` reports a null part; the typed decoders return zero or empty for one. A part number or type that disagrees with the layout is `BC_E_HANDLE`; a key that does not parse is `BC_E_CORRUPT`. | Values; a bytes part is unescaped into the arena and lives until reset. | 0 |
 | `bc_count_range` | Counts the live entries in `[lo, hi)` without walking them, stopping at `limit`. Compiles to `Snapshot::count_keys`. The planner's cardinality source and `COUNT(*)` over a key range. | `min(count, limit)`. | at most 2 record reads, whatever the range holds |
 
 A range scan on a secondary index with a fetch of each row costs one read
@@ -397,10 +404,10 @@ a violation is `BC_E_HANDLE` and a neutral value. They are inline, and the
 checks are a compare and a bounds test.
 
 ```c
-bool     bc_col_null(bc_ctx *, bc_view row, uint32_t col, uint32_t pos);   /* the bitmap bit, or past the row's end */
+bool     bc_col_null(bc_ctx *, bc_view row, uint32_t col);   /* the bitmap bit: clear means null, or a column the row predates */
 int64_t  bc_col_i64(bc_ctx *, bc_view row, uint32_t off);
-int64_t  bc_col_i32(bc_ctx *, bc_view row, uint32_t off);    /* widened: the subset has one integer type */
 double   bc_col_f64(bc_ctx *, bc_view row, uint32_t off);
+bool     bc_col_bool(bc_ctx *, bc_view row, uint32_t off);
 bc_view  bc_col_bytes(bc_ctx *, bc_view row, uint32_t slot); /* a sub-view; same lifetime as row */
 bc_view  bc_row_pk(bc_ctx *, uint32_t table, bc_view row);   /* the row's encoded primary key */
 
@@ -408,6 +415,7 @@ bc_row   bc_row_begin(bc_ctx *, uint32_t layout);
 bc_row   bc_row_from(bc_ctx *, uint32_t layout, bc_view old);  /* copy, then overwrite columns */
 void     bc_row_set_i64(bc_ctx *, bc_row, uint32_t col, int64_t);
 void     bc_row_set_f64(bc_ctx *, bc_row, uint32_t col, double);
+void     bc_row_set_bool(bc_ctx *, bc_row, uint32_t col, bool);
 void     bc_row_set_bytes(bc_ctx *, bc_row, uint32_t col, bc_view);
 void     bc_row_set_null(bc_ctx *, bc_row, uint32_t col);
 bc_view  bc_row_end(bc_ctx *, bc_row);
@@ -416,13 +424,13 @@ bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: live
 
 | Function | What it does |
 |---|---|
-| `bc_col_null` | True if column `col`'s bit is set in the null bitmap, or if the column's position `pos` (its offset for a fixed column, its slot for a variable one) lies past the end of the row, which means the row was written before the column existed. Both arguments are compile-time constants. The compiler emits it before any decoder of a nullable column, and before any column added after the table was created. |
-| `bc_col_i64`, `bc_col_i32`, `bc_col_f64` | Loads the fixed-width column at byte offset `off`. A null column, or one past the end of a shorter row, reads as zero; `bc_col_null` decides first and reports both as null. Little-endian in the row. |
+| `bc_col_null` | True if column `col`'s bit in the bitmap is clear. The bitmap says *present*: a column set null and a column the row predates both have the bit clear, so one test covers both and no position is needed (`docs/sql_layer_types_design.md`, *Row format*). The compiler emits it before any decoder of a nullable column, and before any column added after the table was created. |
+| `bc_col_i64`, `bc_col_f64`, `bc_col_bool` | Loads the 8-byte column at byte offset `off`. A null column, or one past the end of a shorter row, reads as zero; `bc_col_null` decides first and reports both as null. Little-endian in the row. |
 | `bc_col_bytes` | The variable-length column in slot `slot`, as a view with the row's lifetime. |
 | `bc_row_pk` | Encodes the row's primary key from its columns, for an `UPDATE` or `DELETE` reached through a scan or a lookup. Built in the arena. |
 | `bc_row_begin` | Starts an empty row of `layout`: every column null. |
 | `bc_row_from` | Starts a row as a copy of `old`, which must be of `layout` (`BC_E_LAYOUT` otherwise). The `UPDATE` pattern: copy, set the assigned columns, end. |
-| `bc_row_set_*`, `bc_row_set_null` | Sets column `col`. Setting twice keeps the last value. A type that does not match the layout is `BC_E_LAYOUT`. |
+| `bc_row_set_*`, `bc_row_set_null` | Sets column `col`. Setting twice keeps the last value. A column or type that does not match the layout is `BC_E_LAYOUT`. |
 | `bc_row_end` | Finalizes the row in the arena and returns its view. Every non-nullable column must have been set (`BC_E_LAYOUT` otherwise); a row over the engine's value limit is `BC_E_LIMIT`. |
 | `bc_pin` | Copies a view into the arena so it outlives its cursor. The compiler emits it where a plan keeps a cursor's bytes across a step. |
 
@@ -496,11 +504,11 @@ void bc_raise(bc_ctx *, uint32_t constraint, uint32_t object_id);   /* a user er
 |---|---|---|
 | `bc_put` | Writes `row` at `key`, overwriting. The compiler emits one per table row and one per secondary index entry the statement creates or moves; index maintenance is visible in the plan. | `WritePlan::put` |
 | `bc_del` | Deletes `key`. One per table row and per index entry removed. | `WritePlan::del` |
-| `bc_del_range` | Deletes every key in `[lo, hi)` in one append. `TRUNCATE`, `DROP`, and range deletes the compiler can express as a key range. | `WritePlan::del_range` |
+| `bc_del_range` | Deletes every key in `[lo, hi)` in one append. `TRUNCATE`, `DROP`, and range deletes the compiler can express as a key range. It names no table, so an empty bound is `BC_E_HANDLE` rather than an open one: the compiler builds both bounds, the table prefix and its successor for a whole table. `lo >= hi` deletes nothing. | `WritePlan::del_range` |
 | `bc_guard_unchanged` | The commit fails if `key` changed since the snapshot. Serializable plans emit one for every key they read and did not write. Keys the plan writes are checked by the engine without a guard. | `ensure_unchanged` |
-| `bc_guard_range` | The commit fails if any key in `[lo, hi)` changed. Serializable plans emit one per range scanned; it covers phantoms. | `ensure_range_unchanged` |
+| `bc_guard_range` | The commit fails if any key in `[lo, hi)` changed. Serializable plans emit one per range scanned; it covers phantoms. Empty bounds are the start and end of `table_or_index`, as for `bc_scan_open`; `lo >= hi` guards nothing. | `ensure_range_unchanged` |
 | `bc_guard_present`, `bc_guard_absent` | Existence preconditions. `INSERT` emits `absent` on the primary key and on each unique index key, after the `bc_exists` check that turns a duplicate into a user error. | `ensure_present`, `ensure_absent` |
-| `bc_raise` | Sets `BC_E_CONSTRAINT` with a `bc_constraint` kind and the id of the constraint, column or index concerned, as the compiler emitted them. The plan unwinds; the runtime reports it and does not retry. The only error a plan raises itself. | none: nothing reaches the engine |
+| `bc_raise` | Sets `BC_E_CONSTRAINT` with a `bc_constraint` kind and the id of the constraint, column or index concerned, as the compiler emitted them; an unknown kind or an id of 2^24 or more is `BC_E_HANDLE`. The plan unwinds; the runtime reports it and does not retry. The only error a plan raises itself. | none: nothing reaches the engine |
 
 A plan under snapshot isolation emits no guards. The two plans for the same
 SQL differ only in guard calls, which is how isolation reads in the text.
@@ -614,11 +622,11 @@ be parsed back into its parts without a length prefix.
 | Part type | Encoding |
 |---|---|
 | Nullable part | A marker byte first: `0x00` null, `0x01` present. Nulls sort first. Non-nullable parts have no marker. |
-| `i64` | 8 bytes big-endian with the sign bit flipped. |
-| `i32` and narrower | Widened to `i64`. |
-| `f64` | IEEE 754 bits, big-endian; positive values have the sign bit flipped, negative values have every bit flipped. |
+| `i64` | 8 bytes big-endian with the sign bit flipped. Narrower integers, decimals and times are `i64` by the time they reach the API. |
+| `f64` | IEEE 754 bits, big-endian; positive values have the sign bit flipped, negative values have every bit flipped. `-0.0` is encoded as `0.0` and every NaN as one canonical NaN, above `+inf`. |
+| `bool` | One byte, `0x00` or `0x01`. |
 | `bytes` | Escaped: each `0x00` becomes `0x00 0xFF`, followed by the terminator `0x00 0x00`. Self-delimiting, and a prefix of a longer string sorts first. |
-| `DESC` part | The encoded bytes above with every bit inverted. |
+| `DESC` part | The encoded bytes above, marker included, with every bit inverted. Nulls sort last. |
 
 A secondary index key is the index columns followed by the primary key's
 parts. The primary key suffix is what `bc_scan_pk` returns and `bc_lookup`
@@ -626,35 +634,41 @@ and `bc_key_pk` accept. Because every part is self-delimiting, the suffix is
 found by skipping the index columns with the index's catalog layout.
 
 Namespaces: `0x01` catalog, `0x02` table rows, `0x03` index entries, as in
-the MariaDB plugin. Text columns are not stored as text in keys: the
-compiler encodes a collation's sort key (weights) as `bytes`, as the plugin
-does, and the row carries the original value.
+the MariaDB plugin. Text columns are compared as bytes in stage 1; under a
+collation they are not stored as text in keys: the compiler encodes the
+collation's sort key (weights) as `bytes`, as the plugin does, and the row
+carries the original value. The encoding is specified in full, with the
+reasons, in `docs/sql_layer_types_design.md`.
 
 ## Row format
 
 ```
 u16   layout_generation     ; which offset table decodes this row (see below)
-u16   row_bytes             ; length of the row; columns beyond it are null
+u16   bitmap_bytes          ; size of the null bitmap; a multiple of 8
 u16   var_table             ; offset of var_end: where this row's fixed region ends
 u16   nvar                  ; entries in var_end
-u8[]  null_bitmap           ; bit set = null, indexed by permanent column id; sized at create
-      fixed columns         ; at permanent offsets, little-endian, 8-byte aligned region
+u32   row_bytes             ; length of the row; columns beyond it are null
+u8[]  null_bitmap           ; bit set = present, indexed by permanent column id; sized at create
+      fixed columns         ; 8 bytes each, at permanent offsets, little-endian
 u32[] var_end               ; nvar end offsets, relative to the start of var data
 u8[]  var data
 ```
 
-Fixed columns are `i64`, `i32`, `f64`, `bool`, and fixed-width binary. A
-variable column `k` occupies `[var_end[k-1], var_end[k])`.
+Fixed columns are `i64`, `f64` and `bool`, one 8-byte word each. A variable
+column `k` occupies `[var_end[k-1], var_end[k])`.
 
-`var_table` and `nvar` are in the header because the short-row rule below
-needs them: appending a fixed column lengthens the fixed region, so a reader
-holding an older layout's constants cannot find `var_end` from them alone.
-The row says where it is. The null bitmap is sized when the layout is
-created, with room to spare (64 bits at least), so that appending a column
-does not move the fixed offsets either; a layout whose bitmap is full needs
-a `REBUILD`. A trailer at the row's end, read backwards, carries the same
-information for the same bytes and is the alternative to weigh in the
-codec's design (#490).
+`bitmap_bytes`, `var_table` and `nvar` are in the header because the
+short-row rule below needs them: appending a fixed column lengthens the
+fixed region, so a reader holding an older layout's constants cannot find
+`var_end` from them alone. The row says where it is. The null bitmap is
+sized when the layout is created, with room to spare (64 bits at least), so
+that appending a column does not move the fixed offsets either; a layout
+whose bitmap is full needs a `REBUILD`. The bitmap's bit means *present*, so
+a column the row predates reads as null by the same test as one set null. A
+trailer at the row's end was weighed against these header fields and
+rejected; the row's length is 32 bits so that the row's ceiling is the
+engine's value limit. The format is specified in full, with the reasons, in
+`docs/sql_layer_types_design.md`, *Row format*.
 
 **Columns have permanent ids.** A column is given a small integer id when it
 is created, and the id is never reused, even after the column is dropped.
@@ -686,8 +700,9 @@ and updates and vacuum rewrite rows into the current generation, so the
 slow path stays rare.
 
 The decoders check every access against `row_bytes` and the offset table,
-so a row that disagrees with its layout is null or `BC_E_HANDLE`, never a
-read past the end. Values over the engine's limit are refused at
+so a column the row predates is null, a row whose header or `var_end`
+does not parse is `BC_E_CORRUPT`, and an offset that is not a column's is
+`BC_E_HANDLE`; never a read past the end. Values over the engine's limit are refused at
 `bc_row_end` with `BC_E_LIMIT`; the engine's value ceiling applies to the
 whole row.
 
@@ -817,3 +832,36 @@ plan the prototype's generator wrote or a test it ran.
 - Plan naming: one symbol per file, renamed per file when linked together.
 - Views copy by default, as the prototype implemented them; lending the
   engine's buffers is a later optimization behind the same calls.
+
+**Revision 3, with the types and codec design (#490,
+`docs/sql_layer_types_design.md`).** The row and key formats are complete,
+and the API changed where implementing them showed a gap.
+
+- The null bitmap's bit means *present*, so a column the row predates reads
+  as null with no further test; `bc_col_null` loses the position argument
+  revision 2 gave it, which could not tell a fixed offset from a variable
+  slot anyway.
+- Row header: `row_bytes` is 32 bits, so the row's ceiling is the engine's
+  value limit, not 64 KiB; `bitmap_bytes` is in the header, so every
+  structural check is local to the row. The header is 12 bytes.
+- `bool` had a type code and no calls: `bc_param_bool`, `bc_emit_bool`,
+  `bc_key_bool`, `bc_key_part_bool`, `bc_col_bool`, `bc_row_set_bool`.
+- `bc_col_i32` removed: every integer is widened to `i64` before it reaches
+  a row, so there is no 4-byte column to read.
+- `BC_C_RANGE`: a value outside its declared type (`INTEGER`, `VARCHAR(n)`,
+  `DECIMAL(p, s)`) is a constraint of its own kind, not a `CHECK`.
+- `bc_error_detail` packs the constraint kind in the high byte and the
+  object id in the low 24 bits; catalog object ids stay below 2^24, and
+  `bc_raise` with an unknown kind or a wider id is `BC_E_HANDLE`.
+- `BC_SCAN_PREFIX` keeps bit 3: revision 2 moved it to bit 1, the bit
+  `LO_EXCLUSIVE` had, so a plan still passing that flag would have scanned a
+  prefix silently instead of being refused.
+- A row a column decoder cannot parse is `BC_E_CORRUPT`, not null: before,
+  `bc_col_null` read a damaged row as null and the query returned NULL for
+  data that was there. The empty view passed as a row is `BC_E_HANDLE`.
+- `bc_key_part_bytes` unescapes into the arena rather than lending a
+  sub-view: an escaped part is not a sub-range of the key.
+- `bc_del_range` refuses an empty bound (`BC_E_HANDLE`): it names no
+  table, so an open bound would reach the whole keyspace. `bc_del_range` and
+  `bc_guard_range` treat `lo >= hi` as an empty range, as SQL does, rather
+  than letting the engine refuse the commit.

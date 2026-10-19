@@ -13,6 +13,8 @@
 #include <variant>
 #include <vector>
 
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+
 import bytecask.sql.api;
 import bytecask.sql.tests.util;
 
@@ -55,7 +57,13 @@ TEST_CASE("embedded API: the seven statements, then a fresh open", "[sql][api]")
     CHECK(db->execute(insert, {i(2), bytes("banana"), i(20)}).affected == 1);
     CHECK(db->execute(insert, {i(3), kNull, i(30)}).affected == 1);
     CHECK(db->execute(insert, {i(4), bytes("cherry"), kNull}).affected == 1);
-    CHECK_THROWS_AS(db->execute(insert, {i(1), bytes("again"), i(0)}), ExecError);
+    try {
+      (void)db->execute(insert, {i(1), bytes("again"), i(0)});
+      FAIL("a duplicate key must throw");
+    } catch (const ExecError& e) {
+      CHECK(e.code() == BC_E_CONSTRAINT);
+      CHECK(std::string{e.what()}.find("unique") != std::string::npos);
+    }
 
     auto r = db->execute(kById, {i(1)});
     CHECK(r.columns == std::vector<std::string>{"id", "qty"});
@@ -63,6 +71,11 @@ TEST_CASE("embedded API: the seven statements, then a fresh open", "[sql][api]")
     CHECK(db->execute(kById, {i(4)}).rows == Grid{{i(4), kNull}});
     CHECK(db->execute(kById, {i(9)}).rows.empty());
     CHECK(ids(db->execute(kByName, {bytes("a"), bytes("c")})) == std::vector<std::int64_t>{1, 2});
+    // An upper bound alone: NULL < x is unknown, so row 3 (name NULL) is not returned.
+    CHECK(ids(db->execute("SELECT id FROM t WHERE name < $1", {bytes("c")})) == std::vector<std::int64_t>{1, 2});
+    CHECK(ids(db->execute("SELECT id FROM t WHERE name <= $1", {bytes("cherry")})) ==
+          std::vector<std::int64_t>{1, 2, 4});
+    CHECK(ids(db->execute("SELECT id FROM t WHERE name > $1", {bytes("apple")})) == std::vector<std::int64_t>{2, 4});
 
     CHECK(db->execute(kUpdate, {i(1), i(3)}).affected == 1);
     CHECK(db->execute(kById, {i(1)}).rows == Grid{{i(1), i(7)}});
@@ -73,7 +86,7 @@ TEST_CASE("embedded API: the seven statements, then a fresh open", "[sql][api]")
     CHECK_THROWS_AS(db->execute(kById, {bytes("x")}), std::invalid_argument);
     CHECK_THROWS_AS(db->execute(kById, {}), std::invalid_argument);
     CHECK_THROWS_AS(db->prepare("SELECT id FROM t JOIN u ON t.id = u.id"), ast::SqlError);
-    CHECK(db->cached_plans() == 7);  // each text compiled once
+    CHECK(db->cached_plans() == 10);  // each text compiled once
     db->close();
   }
   // A fresh open: the catalog is reloaded from namespace 0x01 and the plans

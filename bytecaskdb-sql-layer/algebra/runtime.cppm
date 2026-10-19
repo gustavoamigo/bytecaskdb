@@ -10,6 +10,7 @@
 module;
 #include <cstdint>
 #include <span>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -20,14 +21,14 @@ export module bytecask.sql.runtime;
 
 export import bytecask.sql.catalog;
 
-// One bound parameter: SQL NULL, an integer, a double or bytes.
-export using bc_value = std::variant<std::monostate, std::int64_t, double, bytecask::sql::Bytes>;
+// One bound parameter: SQL NULL, an integer, a double, a boolean or bytes.
+export using bc_value = std::variant<std::monostate, std::int64_t, double, bool, bytecask::sql::Bytes>;
 
 // bc_plan.h declares these in the global module. A definition in this
 // module's purview would attach them to the module, a second declaration of
 // the same entity the compiler rejects; a linkage specification keeps the
 // definitions in the global module ([basic.link]/10), where plan_api.cpp
-// defines bc_ctx and bc_ctx_affected too. The definitions are not exported: a
+// defines bc_ctx and the extern "C" functions. The definitions are not exported: a
 // redeclaration of an entity the global module introduced cannot be
 // ([module.interface]/6). The using-declarations below export the names, as
 // the standard library's module exports its header-declared names.
@@ -47,16 +48,28 @@ struct bc_params {
   std::vector<bc_value> values;
 };
 
-// prototype: the affected-row count bc_emit_count recorded, or -1. The plan
-// API has no runtime call that reads it back; see the write-up on #497.
-[[nodiscard]] auto bc_ctx_affected(const bc_ctx* cx) -> std::int64_t;
-
 }  // extern "C++"
 
 export using ::bc_db;
 export using ::bc_catalog;
 export using ::bc_params;
 export using ::bc_ctx_affected;
+
+// What a BC_E_CONSTRAINT detail (bc_error_detail) means, in words: the one
+// mapping from constraint codes to text, for the plan API's error message
+// and the embedded API's exception.
+export [[nodiscard]] auto constraint_message(std::uint32_t detail) -> std::string;
+
+export namespace bytecask::sql {
+
+// Every column of a result row, by its layout: NULL, or the typed value. The
+// one decoder of result rows, for the embedded API and the tests.
+[[nodiscard]] auto decode_row(const RowLayout& layout, BytesView row) -> std::vector<bc_value>;
+
+// A plan's result_types as the bc_type codes a bc_schema_ref carries.
+[[nodiscard]] auto result_type_codes(std::span<const PhysType> types) -> std::vector<std::uint8_t>;
+
+}  // namespace bytecask::sql
 
 export struct ApiSymbol {
   const char* name;
@@ -66,4 +79,5 @@ export struct ApiSymbol {
 // Every plan-callable function of bc_plan.h, by name, for loaders that link a
 // plan at run time (TinyCC's tcc_add_symbol). Runtime calls (bc_ctx_*,
 // bc_execute, bc_error*) are left out: a plan never calls them.
+// tests/plan_api_test.cpp checks the table against the header.
 export [[nodiscard]] auto plan_api_symbols() -> std::span<const ApiSymbol>;

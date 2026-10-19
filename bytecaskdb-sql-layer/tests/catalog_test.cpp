@@ -65,8 +65,8 @@ TEST_CASE("catalog: CREATE TABLE and CREATE INDEX persist and reload", "[sql][ca
 
     Bytes ik;
     key_put_prefix(ik, kNsIndex, ix.id);
-    key_put_bytes(ik, bytes("bob"), true);
-    key_put_i64(ik, 7, false);
+    key_put_bytes(ik, bytes("bob"), {PhysType::Bytes, true});
+    key_put_i64(ik, 7, {PhysType::I64});
     Bytes out;
     CHECK(db.get({}, ik, out));
 
@@ -104,6 +104,42 @@ TEST_CASE("catalog: CREATE TABLE and CREATE INDEX persist and reload", "[sql][ca
   CHECK(u.id == 4);
 }
 
+TEST_CASE("catalog: a record of the prototype's format 1 is refused, not misread", "[sql][catalog]") {
+  sql_test::TempDir dir{"catalog_format"};
+  auto db = bytecask::DB::open(dir.path());
+  // 01 02 <id:4>: a table record whose format field (u16, little-endian) is 1.
+  Bytes key{std::byte{kNsCatalog}, std::byte{0x02}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1}};
+  db.put({}, key, Bytes{std::byte{1}, std::byte{0}, std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}});
+  try {
+    (void)Catalog::load(db);
+    FAIL("a format-1 record must be refused");
+  } catch (const std::runtime_error& e) {
+    CHECK(std::string{e.what()}.find("earlier SQL-layer build") != std::string::npos);
+  }
+}
+
+TEST_CASE("catalog: a record whose row layout breaks the format is refused at load", "[sql][catalog]") {
+  sql_test::TempDir dir{"catalog_layout"};
+  Bytes key;
+  {
+    auto db = bytecask::DB::open(dir.path());
+    auto cat = Catalog::load(db);
+    const auto& t = create_t(cat, db);
+    key = {std::byte{kNsCatalog}, std::byte{0x02}, std::byte{0}, std::byte{0}, std::byte{0},
+           static_cast<std::byte>(t.id)};
+    Bytes rec;
+    REQUIRE(db.get({}, key, rec));
+    // format u16, id u32, name (u16 length + "t"), version u32, layout id u32,
+    // generation u16: bitmap_bytes sits at byte 19.
+    rec[19] = std::byte{7};
+    rec[20] = std::byte{0};
+    db.put({}, key, rec);
+    db.close();
+  }
+  auto db = bytecask::DB::open(dir.path());
+  CHECK_THROWS_AS(Catalog::load(db), std::runtime_error);
+}
+
 TEST_CASE("catalog: the constants block a plan needs", "[sql][catalog]") {
   sql_test::TempDir dir{"catalog_consts"};
   auto db = bytecask::DB::open(dir.path());
@@ -118,11 +154,4 @@ TEST_CASE("catalog: the constants block a plan needs", "[sql][catalog]") {
   CHECK(constant(cs, "T_QTY_OFF") == t.layout.find(2)->pos);
   CHECK(constant(cs, "T_NAME_SLOT") == 0);
   CHECK(constant(cs, "T_NAME_COL") == 1);
-
-  auto two = cat.result_layout({PhysType::I64, PhysType::I64});
-  auto one = cat.result_layout({PhysType::I64});
-  CHECK(two == Catalog::kResultLayoutBase);
-  CHECK(one == Catalog::kResultLayoutBase + 1);
-  CHECK(cat.result_layout({PhysType::I64, PhysType::I64}) == two);
-  CHECK(cat.result_types(one)->size() == 1);
 }

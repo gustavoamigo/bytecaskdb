@@ -64,32 +64,23 @@ struct Fixture {
     open(false);
   }
 
-  // Result rows of the last execution, decoded by their result layout.
-  auto results(std::uint32_t layout) -> std::vector<std::vector<bc_value>> {
+  // Result rows of the last execution, decoded by the plan's result types.
+  auto results(std::span<const bytecask::sql::PhysType> types) -> std::vector<std::vector<bc_value>> {
     std::vector<std::vector<bc_value>> out;
-    const auto* types = cat.result_types(layout);
-    const auto* rl = cat.row_layout(layout);
+    auto rl = bytecask::sql::make_result_layout(types);
     const std::uint8_t* row = nullptr;
     std::uint32_t len = 0;
     while (bc_ctx_next_result(cx, &row, &len)) {
-      auto view = std::as_bytes(std::span{row, len});
-      std::vector<bc_value> r;
-      for (std::uint32_t i = 0; i < types->size(); ++i) {
-        const auto& slot = rl->columns[i];
-        if (bytecask::sql::row_is_null(view, slot)) {
-          r.emplace_back(std::monostate{});
-        } else if (slot.type == bytecask::sql::PhysType::I64) {
-          r.emplace_back(*bytecask::sql::row_i64(view, slot.pos));
-        } else {
-          auto b = *bytecask::sql::row_bytes(view, slot.pos);
-          r.emplace_back(bytecask::sql::Bytes(b.begin(), b.end()));
-        }
-      }
-      out.push_back(std::move(r));
+      out.push_back(bytecask::sql::decode_row(rl, std::as_bytes(std::span{row, len})));
     }
     return out;
   }
 };
+
+// A plan's result_types as the bc_type codes a bc_schema_ref carries.
+inline auto type_codes(std::span<const bytecask::sql::PhysType> types) -> std::vector<std::uint8_t> {
+  return bytecask::sql::result_type_codes(types);
+}
 
 inline auto params(std::vector<bc_value> v) -> bc_params { return bc_params{std::move(v)}; }
 

@@ -1,7 +1,7 @@
 /* UPDATE t SET qty = qty - $2 WHERE id = $1
    isolation: snapshot   schema: catalog v2 */
 #include "bc_plan.h"
-enum { TBL_T = 1, LAY_T = 2, T_QTY_OFF = 24, T_QTY_COL = 2 };
+enum { TBL_T = 1, LAY_T = 2, T_QTY_OFF = 28, T_QTY_COL = 2 };
 
 void plan(bc_ctx *cx) {
   if (bc_param_null(cx, 0)) {

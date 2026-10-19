@@ -9,7 +9,6 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <map>
-#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -31,7 +30,10 @@ constexpr std::byte kCounterNextId{0x01};
 constexpr std::byte kCounterVersion{0x02};
 constexpr std::uint8_t kKindTable = 1;
 constexpr std::uint8_t kKindIndex = 2;
-constexpr std::uint16_t kRecordFormat = 1;
+// 2: the row format of docs/sql_layer_types_design.md (12-byte header, the
+// bitmap meaning present). Format 1 was the prototype's; its column
+// positions and rows do not decode under format 2, so it is refused.
+constexpr std::uint16_t kRecordFormat = 2;
 
 auto counter_key(std::byte id) -> Bytes { return {std::byte{kNsCatalog}, kSubCounter, id}; }
 
@@ -126,7 +128,7 @@ auto serialize(const Table& t) -> Bytes {
   w.u32(t.version);
   w.u32(t.layout_id);
   w.u16(t.layout.generation);
-  w.u16(t.layout.bitmap_bytes);
+  w.u16(narrow<std::uint16_t>(t.layout.bitmap_bytes));
   w.u32(t.next_col_id);
   w.u16(static_cast<std::uint32_t>(t.columns.size()));
   for (const auto& c : t.columns) {
@@ -150,7 +152,13 @@ auto serialize(const Table& t) -> Bytes {
 
 auto deserialize(BytesView in) -> Table {
   RecordReader r{in};
-  if (r.u16() != kRecordFormat) throw std::runtime_error("unknown catalog record format");
+  if (auto format = r.u16(); format != kRecordFormat) {
+    throw std::runtime_error("catalog record format " + std::to_string(format) + " is not " +
+                             std::to_string(kRecordFormat) +
+                             (format < kRecordFormat ? ": the database was written by an earlier SQL-layer build "
+                                                       "whose row format this build does not read"
+                                                     : ": the database was written by a later SQL-layer build"));
+  }
   Table t;
   t.id = r.u32();
   t.name = r.str();
@@ -170,12 +178,15 @@ auto deserialize(BytesView in) -> Table {
     c.nullable = r.u8() != 0;
     auto pos = r.u32();
     t.layout.columns.push_back({c.id, c.type, c.nullable, pos});
-    if (c.type == PhysType::Bytes) {
-      t.layout.nvar = std::max(t.layout.nvar, pos + 1);
+    if (is_fixed(c.type)) {
+      t.layout.fixed_end = std::max(t.layout.fixed_end, pos + kFixedColumnBytes);
     } else {
-      t.layout.fixed_end = std::max(t.layout.fixed_end, pos + 8);
+      t.layout.nvar = std::max(t.layout.nvar, pos + 1);
     }
     t.columns.push_back(std::move(c));
+  }
+  if (!layout_valid(t.layout)) {
+    throw std::runtime_error("catalog record of table " + t.name + " has a malformed row layout");
   }
   auto npk = r.u16();
   for (std::uint32_t i = 0; i < npk; ++i) t.pk_col_ids.push_back(r.u32());
@@ -188,6 +199,12 @@ auto deserialize(BytesView in) -> Table {
     for (std::uint32_t j = 0; j < n; ++j) ix.col_ids.push_back(r.u32());
     t.indexes.push_back(std::move(ix));
   }
+  // Every key column must be a column of the table.
+  auto known = [&](std::uint32_t id) { return t.column(id) != nullptr; };
+  auto index_ok = [&](const Index& ix) { return std::ranges::all_of(ix.col_ids, known); };
+  if (t.pk_col_ids.empty() || !std::ranges::all_of(t.pk_col_ids, known) || !std::ranges::all_of(t.indexes, index_ok)) {
+    throw std::runtime_error("catalog record of table " + t.name + " names a key column it does not have");
+  }
   return t;
 }
 
@@ -196,21 +213,39 @@ auto put_part_from_row(const Table& t, std::uint32_t col_id, bool nullable, Byte
     -> bool {
   const auto* slot = t.layout.find(col_id);
   if (slot == nullptr) return false;
+  KeyPart part{slot->type, nullable};
   if (row_is_null(row, *slot)) {
     if (!nullable) return false;
-    key_put_null(out);
+    key_put_null(out, part);
     return true;
   }
-  if (slot->type == PhysType::I64) {
-    auto v = row_i64(row, slot->pos);
-    if (!v) return false;
-    key_put_i64(out, *v, nullable);
-    return true;
+  switch (slot->type) {
+    case PhysType::I64: {
+      auto v = row_i64(row, slot->pos);
+      if (!v) return false;
+      key_put_i64(out, *v, part);
+      return true;
+    }
+    case PhysType::F64: {
+      auto v = row_f64(row, slot->pos);
+      if (!v) return false;
+      key_put_f64(out, *v, part);
+      return true;
+    }
+    case PhysType::Bool: {
+      auto v = row_bool(row, slot->pos);
+      if (!v) return false;
+      key_put_bool(out, *v, part);
+      return true;
+    }
+    case PhysType::Bytes: {
+      auto v = row_bytes(row, slot->pos);
+      if (!v) return false;
+      key_put_bytes(out, *v, part);
+      return true;
+    }
   }
-  auto v = row_bytes(row, slot->pos);
-  if (!v) return false;
-  key_put_bytes(out, *v, nullable);
-  return true;
+  return false;
 }
 
 auto encode_index_key_from_row(const Table& t, const Index& ix, BytesView row, Bytes& out) -> bool {
@@ -264,7 +299,7 @@ auto Catalog::load(DB& db) -> Catalog {
 
 auto Catalog::next_id(std::uint32_t n) -> std::uint32_t {
   auto first = next_id_;
-  if (first + n >= kResultLayoutBase) throw std::length_error("catalog ids exhausted");
+  if (first + n > kMaxObjectId) throw std::length_error("catalog ids exhausted");
   next_id_ += n;
   return static_cast<std::uint32_t>(first);
 }
@@ -386,13 +421,13 @@ void Catalog::rebuild_key_layouts() {
   key_layouts_.clear();
   for (const auto& [id, t] : tables_) {
     std::vector<KeyPart> pk_parts;
-    for (auto cid : t.pk_col_ids) pk_parts.push_back({t.column(cid)->type, false});
+    for (auto cid : t.pk_col_ids) pk_parts.push_back(KeyPart{t.column(cid)->type});
     key_layouts_[id] = KeyLayout{kNsRow, &t, nullptr, pk_parts, 0};
     for (const auto& ix : t.indexes) {
       KeyLayout kl{kNsIndex, &t, &ix, {}, ix.col_ids.size()};
       for (auto cid : ix.col_ids) {
         const auto* c = t.column(cid);
-        kl.parts.push_back({c->type, c->nullable});
+        kl.parts.push_back(KeyPart{c->type, c->nullable});
       }
       kl.parts.insert(kl.parts.end(), pk_parts.begin(), pk_parts.end());
       key_layouts_[ix.id] = std::move(kl);
@@ -417,10 +452,6 @@ auto Catalog::key_layout(std::uint32_t id) const -> const KeyLayout* {
 }
 
 auto Catalog::row_layout(std::uint32_t layout_id) const -> const RowLayout* {
-  if (layout_id >= kResultLayoutBase) {
-    auto i = std::size_t{layout_id - kResultLayoutBase};
-    return i < results_.size() ? &results_[i]->layout : nullptr;
-  }
   const auto* t = table_of_layout(layout_id);
   return t == nullptr ? nullptr : &t->layout;
 }
@@ -430,22 +461,6 @@ auto Catalog::table_of_layout(std::uint32_t layout_id) const -> const Table* {
   return it == layout_tables_.end() ? nullptr : table(it->second);
 }
 
-auto Catalog::result_layout(const std::vector<PhysType>& types) -> std::uint32_t {
-  for (std::size_t i = 0; i < results_.size(); ++i) {
-    if (results_[i]->types == types) return kResultLayoutBase + static_cast<std::uint32_t>(i);
-  }
-  std::vector<ColumnDef> defs;
-  for (std::uint32_t i = 0; i < types.size(); ++i) defs.push_back({i, types[i], true});
-  results_.push_back(std::make_unique<ResultLayout>(ResultLayout{types, make_layout(defs)}));
-  return kResultLayoutBase + static_cast<std::uint32_t>(results_.size() - 1);
-}
-
-auto Catalog::result_types(std::uint32_t layout_id) const -> const std::vector<PhysType>* {
-  if (layout_id < kResultLayoutBase) return nullptr;
-  auto i = std::size_t{layout_id - kResultLayoutBase};
-  return i < results_.size() ? &results_[i]->types : nullptr;
-}
-
 auto Catalog::constants(const Table& t) const -> std::vector<std::pair<std::string, std::uint32_t>> {
   std::vector<std::pair<std::string, std::uint32_t>> out;
   out.emplace_back("TBL_" + upper(t.name), t.id);
@@ -453,7 +468,7 @@ auto Catalog::constants(const Table& t) const -> std::vector<std::pair<std::stri
   for (const auto& ix : t.indexes) out.emplace_back("IDX_" + upper(ix.name), ix.id);
   for (const auto& c : t.columns) {
     const auto* slot = t.layout.find(c.id);
-    auto suffix = c.type == PhysType::Bytes ? "_SLOT" : "_OFF";
+    auto suffix = is_fixed(c.type) ? "_OFF" : "_SLOT";
     out.emplace_back(upper(t.name) + "_" + upper(c.name) + suffix, slot->pos);
     out.emplace_back(upper(t.name) + "_" + upper(c.name) + "_COL", c.id);
   }

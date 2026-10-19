@@ -30,14 +30,13 @@ struct GeneratedPlan {
   std::string source;  // the plan file: #include "bc_plan.h", constants, plan()
   std::vector<PhysType> param_types;
   bool returns_rows{false};
-  std::uint32_t result_layout{0};  // when returns_rows
-  std::vector<PhysType> result_types;
+  std::vector<PhysType> result_types;  // the plan's result layout, for its bc_schema_ref
   std::uint64_t catalog_version{0};
   std::vector<std::uint32_t> tables_read, tables_written;
 };
 
 // Plans a DML statement. Throws ast::SqlError (position -1) when no rule
-// applies. Interns the result layout in `cat`.
-[[nodiscard]] auto generate_plan(const bound::Bound& b, Catalog& cat, std::string_view sql) -> GeneratedPlan;
+// applies.
+[[nodiscard]] auto generate_plan(const bound::Bound& b, const Catalog& cat, std::string_view sql) -> GeneratedPlan;
 
 }  // namespace bytecask::sql
