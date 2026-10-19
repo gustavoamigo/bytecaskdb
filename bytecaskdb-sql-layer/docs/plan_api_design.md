@@ -209,7 +209,7 @@ overlay the cursors read through and belongs to the session layer. See
 
 **A row a plan reads and then writes needs no guard.** The row's key is in
 the write set, and the engine refuses a write plan with a snapshot when
-any key it writes changed since that snapshot (`CONTRACT.md`). So
+any key it writes changed since that snapshot (the engine's `CONTRACT.md`). So
 `UPDATE … SET qty = qty - 1` is first-committer-wins: a concurrent update
 or delete of the row makes the commit a conflict, retried on a fresh
 snapshot, and no update is lost or applied to a deleted row (tests: "plan
@@ -304,7 +304,7 @@ typedef struct { uint32_t table, col; uint8_t type; } bc_col_ref;
 
 /* What a plan was compiled against, and the types of the rows it emits, in
    emit order. bc_ctx_run checks the objects and columns against the pinned
-   catalog version (docs/sql_layer_catalog_design.md, *Compatibility*) on
+   catalog version (docs/catalog_design.md, *Compatibility*) on
    every run; the result layout is the plan's own and is not a catalog
    object. */
 typedef struct {
@@ -558,7 +558,7 @@ bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: live
 
 | Function | What it does |
 |---|---|
-| `bc_col_null` | True if column `col`'s bit in the bitmap is clear. The bitmap says *present*: a column set null and a column the row predates both have the bit clear, so one test covers both (`docs/sql_layer_types_design.md`, *Row format*). The compiler emits it before any decoder of a nullable column it computes with, and before any column added after the table was created. |
+| `bc_col_null` | True if column `col`'s bit in the bitmap is clear. The bitmap says *present*: a column set null and a column the row predates both have the bit clear, so one test covers both (`docs/types_design.md`, *Row format*). The compiler emits it before any decoder of a nullable column it computes with, and before any column added after the table was created. |
 | `bc_col_i64`, `bc_col_f64`, `bc_col_bool` | Loads the 8-byte column. A null column, or one past the end of a shorter row, reads as zero; `bc_col_null` decides first and reports both as null. Little-endian in the row. |
 | `bc_col_bytes` | The variable-length column, as a view with the row's lifetime. |
 | `bc_row_key` | The table's full primary key (namespace, table id, parts), encoded from the row's columns: for a `bc_get`, a guard, or a scan bound reached from a row. Built in the arena. |
@@ -819,7 +819,7 @@ the MariaDB plugin. Text columns are compared as bytes in stage 1; under a
 collation they are not stored as text in keys: the compiler encodes the
 collation's sort key (weights) as `bytes`, as the plugin does, and the row
 carries the original value. The encoding is specified in full, with the
-reasons, in `docs/sql_layer_types_design.md`.
+reasons, in `docs/types_design.md`.
 
 ## Row format
 
@@ -849,7 +849,7 @@ a column the row predates reads as null by the same test as one set null. A
 trailer at the row's end was weighed against these header fields and
 rejected; the row's length is 32 bits so that the row's ceiling is the
 engine's value limit. The format is specified in full, with the reasons, in
-`docs/sql_layer_types_design.md`, *Row format*.
+`docs/types_design.md`, *Row format*.
 
 **Columns have permanent ids.** A column is given a small integer id when it
 is created, and the id is never reused, even after the column is dropped.
@@ -938,7 +938,7 @@ merged without a job doing so.
 
 Layout: `bytecaskdb-sql-layer/algebra/` holds `bc_plan.h` and its C++
 implementation; `codec/` the key and row codecs; `catalog/` the catalog
-(`docs/sql_layer_catalog_design.md`); `plans/` the hand-written plan files, each with its SQL
+(`docs/catalog_design.md`); `plans/` the hand-written plan files, each with its SQL
 in the header comment; `sql/` the parser transformer and binder; `plan/` the
 planner, code generator and loader; `api/` the embedded API; `check/` the
 checker; `tests/` the property tests, fault tests, the harness and the
@@ -1018,7 +1018,7 @@ plan the prototype's generator wrote or a test it ran.
   engine's buffers is a later optimization behind the same calls.
 
 **Revision 3, with the types and codec design (#490,
-`docs/sql_layer_types_design.md`).** The row and key formats are complete,
+`docs/types_design.md`).** The row and key formats are complete,
 and the API changed where implementing them showed a gap.
 
 - The null bitmap's bit means *present*, so a column the row predates reads
@@ -1050,7 +1050,7 @@ and the API changed where implementing them showed a gap.
   `bc_guard_range` treat `lo >= hi` as an empty range, as SQL does, rather
   than letting the engine refuse the commit.
 
-**Revision 4, with the catalog (#489, `docs/sql_layer_catalog_design.md`).**
+**Revision 4, with the catalog (#489, `docs/catalog_design.md`).**
 
 - `bc_schema_ref` lists what a plan depends on (objects read, tables
   written and the indexes it maintains, columns with their positions and

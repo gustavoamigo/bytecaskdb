@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// row_codec.cppm — the row format of docs/sql_layer_types_design.md, *Row
+// row_codec.cppm — the row format of docs/types_design.md, *Row
 // format*:
 //
 //   u16   layout_generation

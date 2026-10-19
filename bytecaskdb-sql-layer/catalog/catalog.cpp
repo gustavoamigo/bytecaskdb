@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Gustavo Amigo
 //
 // catalog.cpp — the catalog's definitions; see catalog.cppm and
-// docs/sql_layer_catalog_design.md.
+// docs/catalog_design.md.
 
 module;
 #include <algorithm>

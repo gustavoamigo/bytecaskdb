@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// The catalog of docs/sql_layer_catalog_design.md: the record round-trips
+// The catalog of docs/catalog_design.md: the record round-trips
 // and a damaged one is refused, every DDL is one batch that survives a
 // reopen or leaves nothing, drops leave no key behind, and DDL races with
 // writes and with other DDL are conflicts.

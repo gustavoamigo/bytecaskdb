@@ -73,9 +73,13 @@ bindings (#494) and a header bridge for the plugin, the counterpart of
 
 Its third-party dependencies are fetched at build time, not vendored:
 libpg_query (PostgreSQL licence, with its bundled protobuf-c, MIT/BSD) and
-TinyCC (LGPL-2.1). The xmake targets that use them are not built by default;
-the `build-and-test` job in `ci.yml` builds and runs `sql_layer_tests` with
-the engine suite.
+TinyCC (LGPL-2.1). The layer is part of the build only when configured with
+`xmake f --sql_layer=y`, so configuring the engine fetches neither. Its own
+workflow, `.github/workflows/sql-layer.yml`, configures it on and builds and
+runs `sql_layer_tests`, under the sanitizers too; the engine's workflows
+configure it off and do not run on a change to the layer alone. Its design documents are in `bytecaskdb-sql-layer/docs/`, and
+what it guarantees is in `bytecaskdb-sql-layer/CONTRACT.md`, whose vocabulary
+`.github/workflows/contract.yml` checks.
 
 ### GPL-2.0 — MariaDB Integration (`bytecaskdb-mariadb-plugin/`)
 
@@ -125,13 +129,16 @@ bytecask/
 │   ├── codec/ catalog/ sql/ plan/ api/   # bytecask.sql.* interface (.cppm) and implementation (.cpp) units
 │   ├── plans/            # Hand-written plans, C
 │   ├── tests/            # Catch2 tests; shared fixtures as bytecask.sql.tests.* modules
-│   └── xmake.lua         # sql_layer, sql_layer_tests; libpg_query and TinyCC package rules
+│   ├── bench/            # sql_layer_bench: the plan API's fixed costs
+│   ├── docs/             # The layer's design documents
+│   ├── CONTRACT.md       # What the layer guarantees, with the tests that prove it
+│   └── xmake.lua         # sql_layer, sql_layer_tests, sql_layer_bench; libpg_query and TinyCC package rules
 │
 ├── tests/                # MIT — engine tests (no MariaDB)
 ├── benchmarks/           # MIT — engine benchmarks
 ├── docs/                 # Documentation
 ├── scripts/              # Build and benchmark helper scripts
-└── xmake.lua             # xmake build — bytecaskdb/, tests/, benchmarks/; includes bytecaskdb-sql-layer/xmake.lua
+└── xmake.lua             # xmake build — bytecaskdb/, tests/, benchmarks/; bytecaskdb-sql-layer/xmake.lua with --sql_layer=y
 ```
 
 `xmake.lua` builds `bytecaskdb/bytecask_hpp.cpp` into `libbytecask.a`. The

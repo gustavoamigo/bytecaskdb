@@ -37,7 +37,7 @@ auto type_name(PhysType t) -> std::string {
 }
 
 // SQL type names as libpg_query canonicalises them, onto the stage-1 types of
-// docs/sql_layer_types_design.md.
+// docs/types_design.md.
 auto sql_type(const ast::ColumnDefAst& c) -> SqlType {
   auto no_mods = [&](SqlKind k) {
     if (!c.typmods.empty()) throw SqlError{"type " + c.type + " takes no modifier", c.pos};

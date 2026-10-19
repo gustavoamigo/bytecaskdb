@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Gustavo Amigo
 //
 // key_codec.cppm — the mem-comparable key encoding of
-// docs/sql_layer_types_design.md, *Key encoding*: namespace(1) id(4,
+// docs/types_design.md, *Key encoding*: namespace(1) id(4,
 // big-endian) parts…, each part encoded so that memcmp order is the typed
 // order and the key parses back without a length prefix. A nullable part has
 // a marker byte (0x00 null, 0x01 present); a DESC part is inverted bit for

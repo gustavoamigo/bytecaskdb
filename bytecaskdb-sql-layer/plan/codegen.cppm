@@ -41,7 +41,7 @@ struct GeneratedPlan {
   std::vector<PhysType> param_types;
   bool returns_rows{false};
   std::vector<PhysType> result_types;  // the plan's result layout, for its bc_schema_ref
-  // What its bc_schema_ref lists (docs/sql_layer_catalog_design.md,
+  // What its bc_schema_ref lists (docs/catalog_design.md,
   // *Compatibility*): the objects and columns it depends on.
   std::uint64_t catalog_version{0};
   std::vector<std::uint32_t> objects_read, tables_written;

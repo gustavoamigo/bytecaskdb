@@ -7,7 +7,7 @@
 //
 // Keys and secondary indexes are HammerDB's PostgreSQL schema's: the nine
 // primary keys, and the unique customer_i2 and orders_i2. Column types are
-// its MariaDB schema's, in the stage-1 types (docs/sql_layer_types_design.md):
+// its MariaDB schema's, in the stage-1 types (docs/types_design.md):
 // INT and TINYINT become INTEGER and SMALLINT where PostgreSQL's NUMERIC
 // without a precision would not fit 64 bits, DATETIME becomes TIMESTAMP, and
 // CHAR(n) becomes VARCHAR(n), stage 1 having no blank-padded comparison.

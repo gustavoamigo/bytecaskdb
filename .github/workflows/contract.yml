@@ -3,9 +3,10 @@
 # declared in include/bytecask.hpp (#399). A private name describes
 # mechanism, which changes under refactors that change no guarantee.
 #
-# Its own workflow, because ci.yml ignores Markdown: a change to the
-# contract alone must still run this, and a change to the header or the
-# script can break it too.
+# Its own workflow, because ci.yml and sql-layer.yml ignore Markdown: a
+# change to a contract alone must still run this, and a change to a header or
+# the script can break it too. The SQL layer's contract is checked here as
+# well, against bc_plan.h and the embedded API.
 
 name: Contract
 
@@ -15,12 +16,18 @@ on:
     paths:
       - CONTRACT.md
       - include/bytecask.hpp
+      - bytecaskdb-sql-layer/CONTRACT.md
+      - bytecaskdb-sql-layer/algebra/bc_plan.h
+      - bytecaskdb-sql-layer/api/database.cppm
       - scripts/check_contract_vocabulary.py
   pull_request:
-    branches: [main]
+    # No branches filter: a PR stacked on a layer PR is checked too.
     paths:
       - CONTRACT.md
       - include/bytecask.hpp
+      - bytecaskdb-sql-layer/CONTRACT.md
+      - bytecaskdb-sql-layer/algebra/bc_plan.h
+      - bytecaskdb-sql-layer/api/database.cppm
       - scripts/check_contract_vocabulary.py
   workflow_dispatch:
 
@@ -37,4 +44,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: CONTRACT.md names only public API
-        run: python3 scripts/check_contract_vocabulary.py
+        run: python3 scripts/check_contract_vocabulary.py --only engine
+      - name: The SQL layer's CONTRACT.md names only its public interface
+        run: python3 scripts/check_contract_vocabulary.py --only sql-layer

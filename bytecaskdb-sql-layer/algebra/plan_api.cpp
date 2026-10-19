@@ -812,7 +812,7 @@ auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots& {
 }
 
 // Builds `e` for `ref` on the pinned version: the compatibility check
-// (docs/sql_layer_catalog_design.md, *Compatibility*), the result layout
+// (docs/catalog_design.md, *Compatibility*), the result layout
 // (rebuilt only when the codes change), the column map, in one walk of the
 // reference: each column is looked up once, checked and mapped.
 [[nodiscard]] auto verify(bc_ctx* cx, const bc_schema_ref* ref, Verified& e) -> bool {

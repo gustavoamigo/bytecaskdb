@@ -8,7 +8,7 @@
 // column decode costs, and what bc_update costs when no indexed column
 // changes. Not part of CI. The published
 // numbers were taken in releasedbg (-O3 -march=native, no LTO):
-//   xmake f -m releasedbg && xmake build sql_layer_bench && xmake run sql_layer_bench
+//   xmake f -m releasedbg --sql_layer=y && xmake build sql_layer_bench && xmake run sql_layer_bench
 // release adds LTO, whose link fails where llvm-ar is older than clang (it
 // cannot read the newer bitcode); releasedbg avoids it.
 
