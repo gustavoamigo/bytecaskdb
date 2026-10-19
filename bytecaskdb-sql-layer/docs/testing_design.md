@@ -18,9 +18,11 @@ every rule, the invariants are checked.
 - **Outcomes agree.** Both sides accept a statement or both refuse it. A
   constraint violation must be the same one: a duplicate key is SQLSTATE
   23505 on both, a NULL in a NOT NULL column 23502, a value outside its
-  declared type 22003, or 22001 for a string too long. The layer has one
-  kind for the last two, `range`; the oracle tells them apart by the
-  message. Any other refusal counts
+  declared type 22003, 22001 for a string too long, 22008 for a date or
+  time, 22021 for text that is not UTF-8. The layer has one kind for these,
+  `range`; the oracle tells them apart by how the message starts, in one
+  table (`RANGE_SQLSTATE` in `oracle.py`), and a test produces every
+  message, so a reworded one fails there. Any other refusal counts
   as a refusal on both, whatever its message. The layer's refusals are
   `SqlError`: parse and bind errors, a DDL the catalog refuses, parameters
   of the wrong number or type. Any other exception from the layer, an engine
@@ -86,5 +88,8 @@ Found so far. The machine expects each one, so it does not fail on them.
 - **A VARCHAR(n) value whose excess is only spaces is refused.**
   PostgreSQL truncates it to n characters and stores it; the layer refuses
   it as too long (22001). The machine does not generate one.
+- **A lookup by text that is not UTF-8 finds nothing.** PostgreSQL refuses
+  the parameter (22021); the layer checks text only when it is written. The
+  machine generates only valid text.
 - **DML takes no literals:** values are parameters (`$1`). The machine's
   statements use parameters on both sides.

@@ -19,6 +19,7 @@
 
 module;
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cctype>
@@ -122,22 +123,31 @@ inline constexpr std::int64_t kMicrosPerDay = 86'400'000'000;
 inline constexpr std::int64_t kMinDate = -2'440'588;
 inline constexpr std::int64_t kEndDate = 2'145'042'906;
 inline constexpr std::int64_t kMinTimestamp = -210'866'803'200'000'000;
+// 10^0 .. 10^kMaxDecimalPrecision: DECIMAL(p, s)'s bound on its scaled value.
+inline constexpr auto kPowersOfTen = [] {
+  std::array<std::int64_t, kMaxDecimalPrecision + 1> p{};
+  p[0] = 1;
+  for (std::size_t i = 1; i < p.size(); ++i) p[i] = p[i - 1] * 10;
+  return p;
+}();
 
 // Whether the fields a kind does not use are zero and the ones it uses in range.
 [[nodiscard]] auto sql_type_valid(SqlType t) -> bool;
-[[nodiscard]] auto phys_type(SqlType t) -> PhysType;
 // As SQL writes it: "integer", "varchar(16)", "numeric(12,2)".
 [[nodiscard]] auto sql_type_name(SqlType t) -> std::string;
 // Whether a datum is NULL or of the physical type.
 [[nodiscard]] auto datum_fits(const Datum& d, PhysType t) -> bool;
-// UTF-8 code points: bytes that do not continue a sequence. VARCHAR(n)
-// counts these.
-[[nodiscard]] auto code_points(BytesView s) -> std::size_t;
+// The code points of well-formed UTF-8 with no NUL, or nullopt: a
+// truncated or overlong sequence, a surrogate, one past U+10FFFF, a stray
+// continuation byte, or a NUL, which PostgreSQL's text refuses too. One pass:
+// the check of TEXT and VARCHAR values, and VARCHAR(n)'s length.
+[[nodiscard]] auto utf8_code_points(BytesView s) -> std::optional<std::size_t>;
 // Why a value of the column's physical type is outside its declared type,
 // in PostgreSQL's words, or nullopt: a SMALLINT or INTEGER out of range, a
-// REAL that overflows or underflows float, a VARCHAR(n) of more than n code
-// points, a DECIMAL(p, s) of more than p digits, a DATE, TIMESTAMP or TIME
-// outside PostgreSQL's range for it. The one check of a declared
+// REAL that overflows or underflows float, a TEXT or VARCHAR that is not
+// UTF-8 (22021), a VARCHAR(n) of more than n code points, a DECIMAL(p, s) of
+// more than p digits, a DATE, TIMESTAMP or TIME outside PostgreSQL's range
+// for it. The one check of a declared
 // range, for a value written (BC_C_RANGE) and a DEFAULT.
 [[nodiscard]] auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string>;
 [[nodiscard]] auto out_of_range(SqlType t, double v) -> std::optional<std::string>;
@@ -755,24 +765,6 @@ auto sql_type_valid(SqlType t) -> bool {
   return false;  // a kind no build knows
 }
 
-auto phys_type(SqlType t) -> PhysType {
-  switch (t.kind) {
-    case SqlKind::SmallInt:
-    case SqlKind::Integer:
-    case SqlKind::BigInt:
-    case SqlKind::Decimal:
-    case SqlKind::Timestamp:
-    case SqlKind::Date:
-    case SqlKind::Time: return PhysType::I64;
-    case SqlKind::Real:
-    case SqlKind::Double: return PhysType::F64;
-    case SqlKind::Boolean: return PhysType::Bool;
-    case SqlKind::Bytea:
-    case SqlKind::Text:
-    case SqlKind::Varchar: return PhysType::Bytes;
-  }
-  return PhysType::Bytes;
-}
 
 auto sql_type_name(SqlType t) -> std::string {
   switch (t.kind) {
@@ -793,9 +785,38 @@ auto sql_type_name(SqlType t) -> std::string {
   return "?";
 }
 
-auto code_points(BytesView s) -> std::size_t {
-  return static_cast<std::size_t>(
-      std::ranges::count_if(s, [](std::byte b) { return (std::to_integer<unsigned>(b) & 0xC0u) != 0x80u; }));
+auto utf8_code_points(BytesView s) -> std::optional<std::size_t> {
+  std::size_t n = 0;
+  for (std::size_t i = 0; i < s.size(); ++n) {
+    auto b0 = std::to_integer<std::uint32_t>(s[i]);
+    // The sequence length and the bounds of the second byte that keep it
+    // shortest and inside U+0000..U+10FFFF, surrogates excluded (RFC 3629).
+    std::size_t len = 0;
+    std::uint32_t lo = 0x80, hi = 0xBF;
+    if (b0 == 0x00) return std::nullopt;
+    if (b0 < 0x80) {
+      len = 1;
+    } else if (b0 >= 0xC2 && b0 <= 0xDF) {
+      len = 2;
+    } else if (b0 >= 0xE0 && b0 <= 0xEF) {
+      len = 3;
+      if (b0 == 0xE0) lo = 0xA0;
+      if (b0 == 0xED) hi = 0x9F;
+    } else if (b0 >= 0xF0 && b0 <= 0xF4) {
+      len = 4;
+      if (b0 == 0xF0) lo = 0x90;
+      if (b0 == 0xF4) hi = 0x8F;
+    } else {
+      return std::nullopt;  // a continuation byte, C0, C1, or F5..FF
+    }
+    if (len > s.size() - i) return std::nullopt;
+    for (std::size_t k = 1; k < len; ++k) {
+      auto b = std::to_integer<std::uint32_t>(s[i + k]);
+      if (b < (k == 1 ? lo : 0x80u) || b > (k == 1 ? hi : 0xBFu)) return std::nullopt;
+    }
+    i += len;
+  }
+  return n;
 }
 
 auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string> {
@@ -808,8 +829,7 @@ auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string> {
       break;
     case SqlKind::Decimal: {
       // p digits: |v| < 10^p, on the scaled value.
-      std::int64_t limit = 1;
-      for (std::uint8_t i = 0; i < t.precision; ++i) limit *= 10;
+      auto limit = kPowersOfTen.at(t.precision);
       if (v <= -limit || v >= limit) return "numeric field overflow";
       break;
     }
@@ -841,13 +861,19 @@ auto out_of_range(SqlType t, double v) -> std::optional<std::string> {
   // finite double outside float's range is undefined behaviour to convert.
   constexpr auto kFloatOverflow = 0x1p128 - 0x1p103;
   if (std::isfinite(v) && std::fabs(v) >= kFloatOverflow) return "value out of range: overflow";
-  // A nonzero value that rounds to zero.
-  if (v != 0.0 && static_cast<float>(v) == 0.0f) return "value out of range: underflow";
+  // A nonzero value that rounds to zero: below half the smallest subnormal
+  // float, 2^-150, rounds to zero under ties-to-even (2^-150 itself does).
+  // Compared, not cast, so no value outside float's range is converted.
+  constexpr auto kFloatUnderflow = 0x1p-150;
+  if (v != 0.0 && std::fabs(v) <= kFloatUnderflow) return "value out of range: underflow";
   return std::nullopt;
 }
 
 auto out_of_range(SqlType t, BytesView v) -> std::optional<std::string> {
-  if (t.kind == SqlKind::Varchar && code_points(v) > t.length) {
+  if (t.kind != SqlKind::Text && t.kind != SqlKind::Varchar) return std::nullopt;
+  auto n = utf8_code_points(v);
+  if (!n) return "invalid byte sequence for encoding \"UTF8\"";
+  if (t.kind == SqlKind::Varchar && *n > t.length) {
     return "value too long for type character varying(" + std::to_string(t.length) + ")";
   }
   return std::nullopt;
@@ -931,7 +957,7 @@ auto read_layout(RecordReader& r, const Table& t) -> std::pair<std::uint32_t, Ro
     if (!ids.insert(col_id).second || !used.insert(pos).second) {
       corrupt("layout of table " + t.name + " has a column or position twice");
     }
-    l.columns.push_back({col_id, c->type, c->nullable, pos, c->sql});
+    l.columns.emplace_back(col_id, c->sql, c->nullable, pos);
   }
   e.expect_end("layout entry of table " + t.name);
   if (!layout_valid(l)) corrupt("table " + t.name + " has a malformed row layout");
@@ -1273,7 +1299,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       if (t.column(cname) != nullptr) throw DdlRefused("column \"" + cname + "\" specified more than once");
       auto in_pk = std::ranges::any_of(ct->pk, [&](const std::string& p) { return std::string{p} == cname; });
       Column c{t.next_col_id++, cname, spec.sql, phys_type(spec.sql), spec.nullable && !in_pk, spec.default_value};
-      defs.push_back({c.id, c.type, c.nullable, c.sql});
+      defs.emplace_back(c.id, c.sql, c.nullable);
       t.columns.push_back(std::move(c));
     }
     for (const auto& p : ct->pk) {
@@ -1394,7 +1420,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   }
   Column c{t.next_col_id, cname, ac.column.sql, phys_type(ac.column.sql), ac.column.nullable, ac.column.default_value};
   auto old_layout = t.layout;
-  if (!append_columns(t.layout, std::vector<ColumnDef>{{c.id, c.type, c.nullable, c.sql}})) {
+  if (!append_columns(t.layout, std::vector<ColumnDef>{{c.id, c.sql, c.nullable}})) {
     throw std::length_error("table \"" + t.name + "\" has no room in its row layout for another column (needs REBUILD)");
   }
   ++t.next_col_id;

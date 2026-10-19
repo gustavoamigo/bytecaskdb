@@ -47,7 +47,8 @@ The row builder checks every value a statement writes (`bc_row_set_*`,
 does not fit with `BC_E_CONSTRAINT`, `BC_C_RANGE` and the table's id, the
 message naming the column: outside [−2^15, 2^15) for `SMALLINT` or
 [−2^31, 2^31) for `INTEGER`, a `REAL` that overflows or underflows `float`,
-more than `n` code points for `VARCHAR(n)`, more than `p − s` integer digits
+`TEXT` or `VARCHAR` that is not well-formed UTF-8 or holds a NUL, more
+than `n` code points for `VARCHAR(n)` (counted in the same pass), more than `p − s` integer digits
 for `DECIMAL(p, s)`, a `DATE`, `TIMESTAMP` or `TIME` outside PostgreSQL's
 range for it (the table above). SQL reports it as SQLSTATE 22003, 22001 for
 a string too long, or 22008 for a date or time. `REAL` overflow is decided
@@ -59,9 +60,11 @@ PostgreSQL. `NOT NULL` is checked when the row ends, after these, so a row
 holding both reports the range, as PostgreSQL does. A `VARCHAR(n)` value
 whose excess is only spaces is refused, where PostgreSQL truncates it.
 
-**Text is valid UTF-8.** The embedded API and the server refuse a `TEXT` or
-`VARCHAR` parameter that is not well-formed UTF-8 before the plan runs; the
-compiler never emits a validity check. Comparison and ordering are bytewise,
+**Text is valid UTF-8.** The row builder refuses a `TEXT` or `VARCHAR` value
+that is not well-formed UTF-8, or holds a NUL, when it is written
+(`BC_C_RANGE`, 22021), as it refuses any value outside its type; the
+compiler never emits a validity check. A lookup key is not checked: invalid
+text finds nothing. Comparison and ordering are bytewise,
 which is code-point order for well-formed UTF-8. Collation sort keys come
 later, in the slot the MariaDB plugin uses them: the key encoder writes a
 text key part as the collation's weights, as `bytes`, and the row keeps the

@@ -84,15 +84,26 @@ struct SqlType {
   auto operator==(const SqlType&) const -> bool = default;
 };
 
+[[nodiscard]] auto phys_type(SqlType t) -> PhysType;
+// The SQL type a column of only a physical type is declared as: BIGINT,
+// DOUBLE PRECISION, BOOLEAN or BYTEA, none with a range narrower than its
+// physical type. A result row's columns, and tests', state theirs with it.
+[[nodiscard]] auto plain_sql_type(PhysType t) -> SqlType;
+
 struct ColumnSlot {
+  // The SQL type is required, and the physical type follows from it: a
+  // layout cannot hold a column without the declared type its values are
+  // checked against.
+  ColumnSlot(std::uint32_t id, SqlType declared, bool null_ok, std::uint32_t at)
+      : col_id{id}, type{phys_type(declared)}, nullable{null_ok}, pos{at}, sql{declared} {}
+
   std::uint32_t col_id;  // permanent; the bitmap bit
   PhysType type;
   bool nullable;
   std::uint32_t pos;  // fixed: byte offset in the row; variable: slot
   // The column's declared type, carried beside its slot for the runtime's
-  // check of a value written (BC_C_RANGE); the codec does not read it. A
-  // result row's columns, which no value is written to, leave it BIGINT.
-  SqlType sql{SqlKind::BigInt};
+  // check of a value written (BC_C_RANGE); the codec does not read it.
+  SqlType sql;
 };
 
 // Where each column of one layout generation lives.
@@ -110,10 +121,13 @@ struct RowLayout {
 };
 
 struct ColumnDef {
+  ColumnDef(std::uint32_t id, SqlType declared, bool null_ok)
+      : col_id{id}, type{phys_type(declared)}, nullable{null_ok}, sql{declared} {}
+
   std::uint32_t col_id;
   PhysType type;
   bool nullable;
-  SqlType sql{SqlKind::BigInt};
+  SqlType sql;
 };
 
 // Assigns positions in column order: fixed columns one word each after the
@@ -277,7 +291,7 @@ auto append_columns(RowLayout& layout, std::span<const ColumnDef> cols) -> bool 
     }
   }
   for (const auto& c : cols) {
-    ColumnSlot s{c.col_id, c.type, c.nullable, 0, c.sql};
+    ColumnSlot s{c.col_id, c.sql, c.nullable, 0};
     if (is_fixed(c.type)) {
       s.pos = layout.fixed_end;
       layout.fixed_end += kFixedColumnBytes;
@@ -289,10 +303,39 @@ auto append_columns(RowLayout& layout, std::span<const ColumnDef> cols) -> bool 
   return true;
 }
 
+auto phys_type(SqlType t) -> PhysType {
+  switch (t.kind) {
+    case SqlKind::SmallInt:
+    case SqlKind::Integer:
+    case SqlKind::BigInt:
+    case SqlKind::Decimal:
+    case SqlKind::Timestamp:
+    case SqlKind::Date:
+    case SqlKind::Time: return PhysType::I64;
+    case SqlKind::Real:
+    case SqlKind::Double: return PhysType::F64;
+    case SqlKind::Boolean: return PhysType::Bool;
+    case SqlKind::Bytea:
+    case SqlKind::Text:
+    case SqlKind::Varchar: return PhysType::Bytes;
+  }
+  return PhysType::Bytes;
+}
+
+auto plain_sql_type(PhysType t) -> SqlType {
+  switch (t) {
+    case PhysType::I64: return {SqlKind::BigInt};
+    case PhysType::F64: return {SqlKind::Double};
+    case PhysType::Bool: return {SqlKind::Boolean};
+    case PhysType::Bytes: return {SqlKind::Bytea};
+  }
+  return {SqlKind::Bytea};
+}
+
 auto make_result_layout(std::span<const PhysType> types) -> RowLayout {
   std::vector<ColumnDef> defs;
   defs.reserve(types.size());
-  for (std::uint32_t i = 0; i < types.size(); ++i) defs.push_back({i, types[i], true});
+  for (std::uint32_t i = 0; i < types.size(); ++i) defs.emplace_back(i, plain_sql_type(types[i]), true);
   return make_layout(defs);
 }
 

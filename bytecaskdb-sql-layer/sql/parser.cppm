@@ -13,7 +13,6 @@
 module;
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -149,10 +148,9 @@ auto literal(const PgQuery__Node* n) -> Literal {
   reject("constant not supported", c->location);
 }
 
-// `primary_key` is told of each PRIMARY KEY constraint on the column, so a
+// Adds each PRIMARY KEY constraint on the column to `primary_keys`, so a
 // repeated one counts twice.
-auto column_def(const PgQuery__ColumnDef* cd, const std::function<void(std::int32_t)>& primary_key = {})
-    -> ColumnDefAst {
+auto column_def(const PgQuery__ColumnDef* cd, int& primary_keys) -> ColumnDefAst {
   const auto* tn = cd->type_name;
   if (tn == nullptr || tn->n_names == 0 || tn->n_array_bounds != 0 || tn->setof || tn->pct_type) {
     reject("column type not supported", cd->location);
@@ -171,7 +169,7 @@ auto column_def(const PgQuery__ColumnDef* cd, const std::function<void(std::int3
     const auto* c = cd->constraints[k]->constraint;
     if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_PRIMARY) {
       col.primary_key = true;
-      if (primary_key) primary_key(c->location);
+      ++primary_keys;
     } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_NOTNULL) {
       col.not_null = true;
     } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_DEFAULT) {
@@ -191,20 +189,22 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos) -> CreateTable
   // One PRIMARY KEY, on a column or on the table: PostgreSQL refuses a
   // second (42P16), so two column-level ones are not a composite key.
   auto primary_keys = 0;
-  auto one_primary_key = [&](std::int32_t location) {
-    if (++primary_keys > 1) reject("multiple primary keys for table \"" + t.table + "\" are not allowed", location);
+  auto at_most_one = [&](std::int32_t location) {
+    if (primary_keys > 1) reject("multiple primary keys for table \"" + t.table + "\" are not allowed", location);
   };
   for (std::size_t i = 0; i < s->n_table_elts; ++i) {
     const auto* el = s->table_elts[i];
     if (el->node_case == PG_QUERY__NODE__NODE_CONSTRAINT) {
       const auto* c = el->constraint;
       if (c->contype != PG_QUERY__CONSTR_TYPE__CONSTR_PRIMARY) reject("table constraint not supported", c->location);
-      one_primary_key(c->location);
+      ++primary_keys;
+      at_most_one(c->location);
       for (std::size_t k = 0; k < c->n_keys; ++k) t.pk.push_back(str(c->keys[k]));
       continue;
     }
     if (el->node_case != PG_QUERY__NODE__NODE_COLUMN_DEF) reject("table element not supported", -1);
-    t.columns.push_back(column_def(el->column_def, one_primary_key));
+    t.columns.push_back(column_def(el->column_def, primary_keys));
+    at_most_one(t.columns.back().pos);
   }
   return t;
 }
@@ -260,7 +260,8 @@ auto alter_table(const PgQuery__AlterTableStmt* s, std::int32_t pos) -> AddColum
       cmd->def->node_case != PG_QUERY__NODE__NODE_COLUMN_DEF) {
     reject("only ALTER TABLE … ADD COLUMN is supported", pos);
   }
-  return AddColumn{relation(s->relation), column_def(cmd->def->column_def), pos};
+  auto primary_keys = 0;  // the binder refuses ADD COLUMN … PRIMARY KEY
+  return AddColumn{relation(s->relation), column_def(cmd->def->column_def, primary_keys), pos};
 }
 
 auto insert(const PgQuery__InsertStmt* s, std::int32_t pos) -> Insert {

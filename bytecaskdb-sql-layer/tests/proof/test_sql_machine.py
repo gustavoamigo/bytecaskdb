@@ -445,21 +445,62 @@ def test_a_conflict_on_every_retry_sets_conflict(tmp_path):
             db.execute("INSERT INTO t VALUES ($1)", (1,))
         except bytecask_sql.ExecError as e:
             assert not e.conflict and e.constraint == "unique"
+        else:
+            raise AssertionError("a duplicate key was written")
     finally:
         db.close()
 
 
-def test_text_that_is_not_utf8_raises_on_read(tmp_path):
+def test_text_that_is_not_utf8_is_refused_on_write(tmp_path):
     db = bytecask_sql.open(str(tmp_path))
     try:
         db.execute("CREATE TABLE t (k BIGINT PRIMARY KEY, s TEXT)")
-        db.execute("INSERT INTO t VALUES ($1, $2)", (1, b"\xff"))  # text is bytes to the plan
         try:
-            db.table_rows("t")
-        except UnicodeDecodeError:
-            pass
+            db.execute("INSERT INTO t VALUES ($1, $2)", (1, b"\xff"))  # text is bytes to the plan
+        except bytecask_sql.ExecError as e:
+            assert e.constraint == "range" and o.layer_sqlstate(e) == "22021"
         else:
-            raise AssertionError("bytes that are not UTF-8 read as text")
+            raise AssertionError("bytes that are not UTF-8 were written as text")
+        assert db.table_rows("t")["rows"] == []
+    finally:
+        db.close()
+
+
+def test_every_range_message_maps_to_its_sqlstate(tmp_path):
+    """Each range refusal the layer makes, and the SQLSTATE the oracle gives
+    it: every entry of RANGE_SQLSTATE is produced, so a message reworded in
+    the layer fails here."""
+    db = bytecask_sql.open(str(tmp_path))
+    try:
+        db.execute("CREATE TABLE r (k BIGINT PRIMARY KEY, s SMALLINT, i INTEGER, f REAL, d NUMERIC(4, 2), "
+                   "v VARCHAR(2), x TEXT, dt DATE, ts TIMESTAMP, tm TIME)")
+        cols = ["s", "i", "f", "d", "v", "x", "dt", "ts", "tm"]
+        cases = [
+            ("s", 2**15, "22003"),
+            ("i", 2**31, "22003"),
+            ("f", 1e39, "22003"),
+            ("f", 1e-50, "22003"),
+            ("d", 10_000, "22003"),
+            ("v", "abc", "22001"),
+            ("v", b"\xc3", "22021"),
+            ("x", b"\x00", "22021"),
+            ("dt", -2_440_589, "22008"),
+            ("ts", -210_866_803_200_000_001, "22008"),
+            ("tm", 86_400_000_001, "22008"),
+        ]
+        seen = set()
+        for col, value, state in cases:
+            params = [1] + [value if c == col else None for c in cols]
+            marks = ", ".join(f"${n + 1}" for n in range(len(params)))
+            try:
+                db.execute(f"INSERT INTO r VALUES ({marks})", tuple(params))
+            except bytecask_sql.ExecError as e:
+                assert e.constraint == "range", (col, value, str(e))
+                assert o.layer_sqlstate(e) == state, (col, value, str(e))
+                seen.update(start for start in o.RANGE_SQLSTATE if str(e).startswith(start))
+            else:
+                raise AssertionError(f"{col} = {value!r} was written")
+        assert seen == set(o.RANGE_SQLSTATE), set(o.RANGE_SQLSTATE) - seen
     finally:
         db.close()
 

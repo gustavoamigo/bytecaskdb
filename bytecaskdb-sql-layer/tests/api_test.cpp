@@ -585,6 +585,33 @@ TEST_CASE("embedded API: values outside their declared type, an omitted NOT NULL
   CHECK(tm_refusal({i(3), kNull, i(kMinDate - 1), kNull}).starts_with("date out of range"));
   CHECK(tm_refusal({i(3), kNull, i(kEndDate), kNull}).starts_with("date out of range"));
   CHECK(tm_refusal({i(3), kNull, kNull, i(kMinTs - 1)}).starts_with("timestamp out of range"));
+  // TEXT and VARCHAR are UTF-8, checked on write, and VARCHAR(n) counts code
+  // points in the same pass: invalid UTF-8 is BC_C_RANGE ("invalid byte
+  // sequence", 22021), never counted into a length.
+  (void)db->execute("CREATE TABLE tx (k BIGINT PRIMARY KEY, t TEXT, v VARCHAR(3))");
+  constexpr auto kInsTx = "INSERT INTO tx VALUES ($1, $2, $3)";
+  auto raw = [](std::string_view s) { return bytes(s); };
+  std::string continuation_run = "\xC3";
+  continuation_run.append(1000, '\x80');  // one lead byte, then stray continuations
+  for (const auto& bad : {continuation_run, std::string{"\xFF"}, std::string{"a\0b", 3}, std::string{"\xC0\x80"},
+                          std::string{"\xED\xA0\x80"}, std::string{"\xF4\x90\x80\x80"}, std::string{"\xE2\x82"}}) {
+    for (std::size_t at : {1u, 2u}) {
+      std::vector<Value> p{i(1), kNull, kNull};
+      p[at] = raw(bad);
+      try {
+        (void)db->execute(kInsTx, p);
+        FAIL("invalid UTF-8 was written");
+      } catch (const ExecError& e) {
+        REQUIRE(e.constraint());
+        CHECK(e.constraint()->constraint == BC_C_RANGE);
+        CHECK(std::string{e.what()}.starts_with("invalid byte sequence for encoding \"UTF8\""));
+      }
+    }
+  }
+  // A four-byte code point is one: three of them fit VARCHAR(3).
+  CHECK(db->execute(kInsTx, {i(1), raw("\xF0\x9F\x98\x80"), raw("\xF0\x9F\x98\x80\xC3\xA9z")}).affected == 1);
+  CHECK(db->table_rows("tx").rows.size() == 1);
+
   // UPDATE checks the value it computes, as INSERT does the one it is given.
   CHECK(refusal("UPDATE r SET n = n - $2 WHERE k = $1", {i(1), i(-1)}).second.starts_with("integer out of range"));
   CHECK(refusal("UPDATE r SET s = $2 WHERE k = $1", {i(2), i(-40000)}).first == BC_C_RANGE);

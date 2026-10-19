@@ -138,8 +138,9 @@ struct ColSlot {
   std::uint16_t generation{0};  // the layout's: the generation pos is for
   PhysType type{PhysType::I64};
   std::uint32_t pos{0};
-  // The declared type a value written to it is checked against: the pinned
-  // catalog's, which outlives the run that verified this slot.
+  // The declared type a value written to it is checked against: a view into
+  // the pinned catalog's layout. Valid while the run's pin is held:
+  // drop_execution_state clears every ColSlot before it releases the pin.
   const SqlType* sql{nullptr};
 };
 
@@ -508,6 +509,7 @@ struct bc_ctx {
     views.clear();
     keys.clear();  // key and row builders point into the pinned catalog: before it
     rows.clear();
+    verified.cols.clear();  // each ColSlot's sql points into the pinned catalog: before it
     cat = &unpinned;
     pinned.reset();  // an idle context keeps no superseded catalog alive
     effects.clear();

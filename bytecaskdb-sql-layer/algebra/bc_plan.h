@@ -68,8 +68,8 @@ enum bc_scan_flags {
 
 enum bc_constraint {   /* the detail of BC_E_CONSTRAINT; the compiler emits the object id with it */
   BC_C_UNIQUE = 1, BC_C_NOT_NULL, BC_C_CHECK, BC_C_FOREIGN_KEY,
-  BC_C_RANGE,          /* a value outside its declared type: SMALLINT, INTEGER, REAL, VARCHAR(n),
-                          DECIMAL(p, s), DATE, TIMESTAMP, TIME */
+  BC_C_RANGE,          /* a value outside its declared type: SMALLINT, INTEGER, REAL, TEXT and
+                          VARCHAR(n) (UTF-8, n code points), DECIMAL(p, s), DATE, TIMESTAMP, TIME */
 };
 
 enum bc_layout_detail {  /* the detail of BC_E_LAYOUT; every BC_E_LAYOUT carries one */

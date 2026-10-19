@@ -17,24 +17,38 @@ import re
 import bytecask_sql
 
 # The layer's constraint kinds and the SQLSTATE PostgreSQL reports for each.
-# A value outside its declared type is one kind, "range", in the layer:
-# 22001 for a string too long, 22008 for a DATE, TIMESTAMP or TIME, 22003
-# for any other (layer_sqlstate).
 SQLSTATE = {
     "unique": "23505",
     "not_null": "23502",
 }
-RANGE_STATES = ("22001", "22003", "22008")
+
+# A value outside its declared type is one kind, "range", in the layer; its
+# message, PostgreSQL's words, says which. The one mapping from those
+# messages, by how they start, to PostgreSQL's SQLSTATE.
+# test_every_range_message_maps_to_its_sqlstate produces every one, so a
+# reworded message fails there, not as a silent mismatch.
+RANGE_SQLSTATE = {
+    "smallint out of range": "22003",
+    "integer out of range": "22003",
+    "value out of range: overflow": "22003",  # REAL
+    "value out of range: underflow": "22003",  # REAL
+    "numeric field overflow": "22003",  # DECIMAL(p, s)
+    "value too long for type character varying": "22001",
+    "invalid byte sequence for encoding": "22021",  # TEXT, VARCHAR
+    "date out of range": "22008",
+    "timestamp out of range": "22008",
+    "time out of range": "22008",
+}
+RANGE_STATES = frozenset(RANGE_SQLSTATE.values())
 
 
 def layer_sqlstate(e: bytecask_sql.ExecError) -> str:
     """The SQLSTATE PostgreSQL gives the layer's refusal, or "refused"."""
     if e.constraint == "range":
         message = str(e)
-        if message.startswith("value too long"):
-            return "22001"
-        datetime = ("date out of range", "timestamp out of range", "time out of range")
-        return "22008" if message.startswith(datetime) else "22003"
+        states = [state for start, state in RANGE_SQLSTATE.items() if message.startswith(start)]
+        assert len(states) == 1, f"range refusal with no SQLSTATE in RANGE_SQLSTATE: {message}"
+        return states[0]
     return SQLSTATE.get(e.constraint, "refused")
 
 
