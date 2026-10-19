@@ -12,7 +12,7 @@ These instructions apply to every repository work request in this workspace.
 
 ## Required workflow for every implementation request
 
-1. Update `docs/bytecask_design.md` to reflect any behavior, architecture, constraints, or invariants changed by the work. If a guarantee changes, update the row in `CONTRACT.md` with the test that proves it, and name the change in the PR description: added, widened, narrowed or removed.
+1. Update `docs/bytecask_design.md` to reflect any behavior, architecture, constraints, or invariants changed by the work. If a guarantee changes, update the row in `CONTRACT.md` with the test that proves it, and name the change in the PR description: added, widened, narrowed or removed. Work on the SQL layer updates its own documents instead: `bytecaskdb-sql-layer/docs/` and `bytecaskdb-sql-layer/CONTRACT.md`, not the engine's design doc and contract.
 2. Track any follow-up work as a GitHub issue. Don't open an issue for the PR's own task — the PR is its own record; use an issue when work is being deferred, discovered mid-implementation, or otherwise won't be covered by a PR opened now.
 3. Update `README.md` to keep it in sync with the project: if a feature is added or changed, update the Features list, Quick Start examples, API Reference, and Architecture sections as needed. The README targets an external audience — avoid internal implementation details; focus on user-visible characteristics and behavior.
 4. Always validate design before moving to implementation
@@ -30,7 +30,8 @@ GitHub Issues are the repository's task tracker, for work not already captured b
 
 ## Benchmarking rules
 
-- Any change claimed to improve performance **must** include a benchmark run of `engine_bench` before and after the change. Run it with `python3 scripts/run_engine_bench.py`. Results are appended to `benchmarks/engine_bench_results.csv` (local, gitignored).
+- Any change to the engine claimed to improve performance **must** include a benchmark run of `engine_bench` before and after the change. Run it with `python3 scripts/run_engine_bench.py`. Results are appended to `benchmarks/engine_bench_results.csv` (local, gitignored).
+- A performance claim in `bytecaskdb-sql-layer` **must** include `sql_layer_bench` before and after the change (`xmake f -m releasedbg && xmake build sql_layer_bench && xmake run sql_layer_bench`); `engine_bench` does not apply to a change that leaves the engine untouched (owner decision, 2026-10-19).
 - Run `python3 scripts/run_map_bench.py` (records to `benchmarks/map_bench_results.csv`, also gitignored) only when making changes to a key directory tree: `blind_btree` or `btree`.
 - Show the before/after CSV rows to the user as evidence of improvement.
 - If benchmarks cannot be run, state why clearly and record the blocker in the PR description or a GitHub issue.
@@ -210,7 +211,7 @@ BulkBegin/BulkEnd markers must NOT be skipped by vacuum or ChangeIterator — th
 - Don't pre-empt criticisms with defensive explanations. The right data point makes the point silently.
 - Be honest about weaknesses. Acknowledging a real limitation earns more trust than hiding it.
 - Don't extrapolate benchmark results beyond what has actually been measured.
-- `CONTRACT.md` states what the engine guarantees, not how it works. A sentence that could change while every guarantee stays the same is mechanism and belongs in `docs/bytecask_design.md`. Every name in it is declared in `include/bytecask.hpp`; `scripts/check_contract_vocabulary.py` fails CI on a private name (#399). Each row names the tests that prove it, or `none`; a change to a guarantee is named in the PR that makes it.
+- `CONTRACT.md` states what the engine guarantees, not how it works. A sentence that could change while every guarantee stays the same is mechanism and belongs in `docs/bytecask_design.md`. Every name in it is declared in `include/bytecask.hpp`; `scripts/check_contract_vocabulary.py` fails CI on a private name (#399). Each row names the tests that prove it, or `none`; a change to a guarantee is named in the PR that makes it. `bytecaskdb-sql-layer/CONTRACT.md` follows the same rules for the SQL layer, against `bytecaskdb-sql-layer/algebra/bc_plan.h` and `bytecaskdb-sql-layer/api/database.cppm`, with its mechanism in `bytecaskdb-sql-layer/docs/`.
 
 ## README guidelines
 

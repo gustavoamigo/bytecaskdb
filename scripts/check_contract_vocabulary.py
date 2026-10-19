@@ -1,29 +1,33 @@
 #!/usr/bin/env python3
-"""Fails when CONTRACT.md names something the public header does not declare.
+"""Fails when a contract names something its public interface does not declare.
 
-The contract states what the engine guarantees, not how it works. A sentence
-that names a private function, field or type describes mechanism, and
-mechanism changes under refactors that change no guarantee (#399). So every
-identifier in a backticked span of CONTRACT.md must be one of:
+A contract states what is guaranteed, not how it works. A sentence that
+names a private function, field or type describes mechanism, and mechanism
+changes under refactors that change no guarantee (#399). Each contract is
+paired with its public interface, and every identifier in a backticked span
+of the contract must be one of:
 
-  - a name declared in include/bytecask.hpp, comments excluded;
-  - a C++ or standard-library name, or a platform name the contract may use
-    because a public option or a stated storage assumption selects it
-    (ALLOWED below).
+  - a name declared in the interface's files, comments excluded;
+  - a name the pair allows (ALLOWED and the pair's own words below).
+
+The pairs:
+
+  - engine: CONTRACT.md against include/bytecask.hpp;
+  - sql-layer: bytecaskdb-sql-layer/CONTRACT.md against the plan API's C
+    header and the embedded API's module interface, the two surfaces a
+    caller of the layer programs against, plus SQL's own words.
 
 Spans that are not identifiers are skipped: file names and paths, test
 tags like `[limits]`, numbers, and the placeholders of examples (`k`, `v1`,
 the `db` of `db.vacuum()`).
 
-Usage: scripts/check_contract_vocabulary.py [root]
+Usage: scripts/check_contract_vocabulary.py [--only engine|sql-layer] [root]
 """
 
 import pathlib
 import re
 import sys
 
-CONTRACT = "CONTRACT.md"
-HEADER = "include/bytecask.hpp"
 
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 SPAN = re.compile(r"`([^`]*)`")
@@ -50,21 +54,43 @@ ALLOWED = {
     "stem",
 }
 
+# The words of SQL a contract about a SQL layer uses: statements, clauses and
+# constraint names, which no C++ interface declares.
+SQL_WORDS = {
+    "SELECT", "INSERT", "UPDATE", "DELETE", "VALUES", "WHERE", "CREATE",
+    "DROP", "ALTER", "TABLE", "INDEX", "UNIQUE", "ADD", "COLUMN", "NOT",
+    "NULL", "DEFAULT", "PRIMARY", "KEY", "DESC", "ASC", "REBUILD", "SET",
+    "IF", "EXISTS",
+}
+
+# name -> (contract, interface files, extra allowed words)
+PAIRS = {
+    "engine": ("CONTRACT.md", ["include/bytecask.hpp"], set()),
+    "sql-layer": (
+        "bytecaskdb-sql-layer/CONTRACT.md",
+        ["bytecaskdb-sql-layer/algebra/bc_plan.h", "bytecaskdb-sql-layer/api/database.cppm"],
+        SQL_WORDS,
+    ),
+}
+
 
 def strip_comments(src: str) -> str:
     src = re.sub(r"/\*.*?\*/", " ", src, flags=re.S)
     return re.sub(r"//[^\n]*", " ", src)
 
 
-def public_names(root: pathlib.Path) -> set[str]:
-    return set(IDENT.findall(strip_comments((root / HEADER).read_text())))
+def public_names(root: pathlib.Path, interface: list[str]) -> set[str]:
+    names: set[str] = set()
+    for path in interface:
+        names |= set(IDENT.findall(strip_comments((root / path).read_text())))
+    return names
 
 
-def contract_names(root: pathlib.Path) -> dict[str, list[int]]:
+def contract_names(root: pathlib.Path, contract: str) -> dict[str, list[int]]:
     """Every identifier in a backticked span, with the lines it is on."""
     found: dict[str, list[int]] = {}
     in_fence = False
-    for lineno, line in enumerate((root / CONTRACT).read_text().splitlines(), 1):
+    for lineno, line in enumerate((root / contract).read_text().splitlines(), 1):
         if line.startswith("```"):
             in_fence = not in_fence
             continue
@@ -80,22 +106,37 @@ def contract_names(root: pathlib.Path) -> dict[str, list[int]]:
     return found
 
 
-def main() -> int:
-    root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
-    public = public_names(root) | ALLOWED
-    used = contract_names(root)
+def check(root: pathlib.Path, contract: str, interface: list[str], words: set[str]) -> bool:
+    public = public_names(root, interface) | ALLOWED | words
+    used = contract_names(root, contract)
 
     unknown = {n: ls for n, ls in used.items() if n not in public}
 
     for name in sorted(unknown):
         lines = ", ".join(str(l) for l in unknown[name][:5])
-        print(f"{CONTRACT}:{lines}: `{name}` is not declared in {HEADER}. "
+        print(f"{contract}:{lines}: `{name}` is not declared in {', '.join(interface)}. "
               "The contract states guarantees in public terms: say what is "
               "guaranteed without naming the mechanism, or declare the name.")
     if not unknown:
-        print(f"contract vocabulary: {len(used)} names checked")
-        return 0
-    return 1
+        print(f"{contract}: {len(used)} names checked")
+    return not unknown
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    only = None
+    if len(args) >= 2 and args[0] == "--only":
+        only = args[1]
+        args = args[2:]
+        if only not in PAIRS:
+            print(f"--only takes one of {', '.join(PAIRS)}, not {only}")
+            return 2
+    root = pathlib.Path(args[0] if args else ".")
+    ok = True
+    for name, (contract, interface, words) in PAIRS.items():
+        if only is None or only == name:
+            ok = check(root, contract, interface, words) and ok
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

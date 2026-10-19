@@ -1,0 +1,200 @@
+# SPDX-License-Identifier: MIT
+# The SQL layer (bytecaskdb-sql-layer, #487): its tests, under the
+# sanitizers too, and its contract's vocabulary. Its own workflow, apart from
+# the engine's: the engine's jobs do not build the layer.
+#
+# It runs on a pull request to any base, so a PR stacked on another layer PR
+# gets CI, and on the push to main. It is path-filtered to the layer and to
+# what the layer builds on: the engine, its public header and the build.
+#
+# Nothing here installs a MariaDB development package, and nothing under
+# bytecaskdb-sql-layer/ may include a MariaDB header: building the layer here
+# is what keeps that true (docs/project_organization.md).
+
+name: SQL layer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "bytecaskdb-sql-layer/**"
+      - "bytecaskdb/**"
+      - "include/**"
+      - "xmake.lua"
+      # Linked into sql_layer_tests: the counted allocation-failure seam.
+      - "tests/alloc_faults.cpp"
+      - "tests/alloc_faults.h"
+      - ".github/workflows/sql-layer.yml"
+      - "scripts/check_contract_vocabulary.py"
+      - "scripts/enrich_junit_sources.py"
+  pull_request:
+    # No branches filter: any base.
+    paths:
+      - "bytecaskdb-sql-layer/**"
+      - "bytecaskdb/**"
+      - "include/**"
+      - "xmake.lua"
+      # Linked into sql_layer_tests: the counted allocation-failure seam.
+      - "tests/alloc_faults.cpp"
+      - "tests/alloc_faults.h"
+      - ".github/workflows/sql-layer.yml"
+      - "scripts/check_contract_vocabulary.py"
+      - "scripts/enrich_junit_sources.py"
+  # The sanitizers' nightly run, as sanitizers.yml has for the engine.
+  schedule:
+    - cron: "50 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # bytecaskdb-sql-layer/CONTRACT.md names only what bc_plan.h and the
+  # embedded API declare.
+  contract-vocabulary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The SQL layer's CONTRACT.md names only its public interface
+        run: python3 scripts/check_contract_vocabulary.py --only sql-layer
+
+  sql-layer-tests:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+    permissions:
+      contents: read
+      checks: write
+      id-token: write
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          # make and which: the libpg_query and TinyCC builds. nanobind:
+          # xmake f loads every target, bytecaskdb_python's included.
+          dnf install -y \
+            clang llvm llvm-devel lld \
+            libcxx libcxx-devel libstdc++-static \
+            xmake make which \
+            python3-pip python3-devel \
+            git ninja-build
+          pip3 install nanobind
+
+      # libpg_query and TinyCC are cloned and built from source by xmake;
+      # the key carries every pinned version, kept apart from the engine's.
+      - name: Cache xmake packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.xmake/packages
+          key: xmake-packages-sql-layer-fedora43-${{ hashFiles('xmake.lua', 'bytecaskdb-sql-layer/xmake.lua') }}
+
+      - name: Configure xmake
+        run: |
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          xmake f --toolchain=clang \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            -y
+
+      - name: Build and run sql_layer_tests
+        run: |
+          mkdir -p test-results
+          xmake build -y sql_layer_tests
+          build/linux/x86_64/release/sql_layer_tests --reporter junit --out test-results/sql_layer_tests.xml
+
+      - name: Enrich JUnit report with source metadata
+        if: ${{ always() && !cancelled() }}
+        run: |
+          /usr/bin/python scripts/enrich_junit_sources.py \
+            --pair build/linux/x86_64/release/sql_layer_tests:test-results/sql_layer_tests.xml
+
+      - name: Publish SQL layer test results in GitHub Checks
+        if: ${{ always() && !cancelled() }}
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          files: test-results/sql_layer_tests.xml
+          check_name: SQL Layer Test Results
+          comment_mode: off
+
+      - name: Upload JUnit report artifact
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sql-layer-junit-test-results
+          path: test-results/*.xml
+
+      - name: Upload test results to Codecov
+        if: ${{ always() && !cancelled() }}
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./test-results/sql_layer_tests.xml
+          report_type: test_results
+          flags: sql-layer
+          name: sql-layer-tests
+          slug: gustavoamigo/bytecaskdb
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+          use_oidc: true
+
+  # The coverage sanitizers.yml gave the layer: ASan, TSan and UBSan, debug
+  # builds. Not under MSan: libpg_query and TinyCC are built uninstrumented
+  # by their package rules, and MSan reports their stores as uninitialized
+  # reads. The catalog does not depend on BYTECASK_KEYDIR, so the default key
+  # directory runs it.
+  sql-layer-sanitizers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: fedora:43
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+      CLANG_TARGET_TRIPLE: x86_64-redhat-linux-gnu
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread, undefined]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            clang llvm llvm-devel lld \
+            libcxx libcxx-devel libstdc++-static \
+            xmake cmake make which \
+            python3-pip python3-devel \
+            git ninja-build
+          pip3 install nanobind
+
+      - name: Cache xmake packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.xmake/packages
+          key: xmake-packages-sql-layer-fedora43-${{ hashFiles('xmake.lua', 'bytecaskdb-sql-layer/xmake.lua') }}
+
+      - name: Configure xmake
+        run: |
+          RESOURCE_DIR=$(clang --print-resource-dir)
+          xmake f --toolchain=clang \
+            --cxflags="-resource-dir=${RESOURCE_DIR}" \
+            --sanitizer=${{ matrix.sanitizer }} \
+            -m debug -y
+
+      - name: Build sql_layer_tests
+        run: xmake build -y sql_layer_tests
+
+      - name: Run sql_layer_tests under ${{ matrix.sanitizer }} sanitizer
+        env:
+          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
+          TSAN_OPTIONS: ${{ matrix.sanitizer == 'thread' && 'halt_on_error=0 history_size=4' || '' }}
+        # --durations prints each test as it finishes, so a run cut off by
+        # the timeout shows the last test that completed.
+        run: xmake run sql_layer_tests --durations yes

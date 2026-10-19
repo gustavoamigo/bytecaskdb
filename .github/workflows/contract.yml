@@ -5,7 +5,8 @@
 #
 # Its own workflow, because ci.yml ignores Markdown: a change to the
 # contract alone must still run this, and a change to the header or the
-# script can break it too.
+# script can break it too. The SQL layer's contract is checked in
+# sql-layer.yml.
 
 name: Contract
 
@@ -37,4 +38,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: CONTRACT.md names only public API
-        run: python3 scripts/check_contract_vocabulary.py
+        run: python3 scripts/check_contract_vocabulary.py --only engine
