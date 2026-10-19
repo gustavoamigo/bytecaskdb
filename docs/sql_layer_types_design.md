@@ -242,8 +242,8 @@ inversion are the plugin's, unchanged.
 **A secondary index key** is `0x03 index_id(4)` followed by the index
 columns as parts (nullable where the column is, `DESC` where the index says
 so) followed by the primary key's parts, encoded exactly as they are in the
-row key. That suffix is what `bc_scan_pk` returns and `bc_lookup` and
-`bc_key_pk` accept: `0x02 table_id(4)` plus the suffix is the row key.
+row key. `0x02 table_id(4)` plus that suffix is the row key, which is how
+`bc_scan_row` finds an entry's row.
 Because every part is self-delimiting, the suffix is found by skipping the
 index columns with the index's catalog layout, and `bc_key_part_*` decodes
 any part by position, index columns first. The prefix is `0x03 index_id`,
@@ -309,8 +309,10 @@ needed; `docs/plan_api_design.md` is updated accordingly. The decoders still
 bound every access by `var_table` and `nvar`, so a fixed column past the
 fixed region reads as zero and a variable slot past `nvar` as empty; a
 row whose header or `var_end` does not parse is `BC_E_CORRUPT`, never read
-as null, and an offset inside the header or off a word boundary is
-`BC_E_HANDLE`. Nothing is read past the end.
+as null. Plans name columns by id since plan API revision 5, and the
+runtime maps an id to its position; the codec's raw accessors still refuse
+an offset inside the header or off a word boundary. Nothing is read past
+the end.
 
 **The bitmap is sized at create, with a ceiling.** `bitmap_bytes` is the
 smallest multiple of 64 bits that holds every column id of the table with at
