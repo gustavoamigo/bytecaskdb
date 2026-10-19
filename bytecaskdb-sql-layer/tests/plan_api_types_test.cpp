@@ -319,18 +319,34 @@ void select_m(bc_ctx* cx) {
   bc_emit_end(cx);
 }
 
-// SELECT x FROM m ORDER BY x, read from the index key alone.
+// SELECT x FROM m ORDER BY x: the order from the index, x from the row,
+// since a DOUBLE key part is canonicalised.
 void x_in_index_order(bc_ctx* cx) {
   bc_cursor c = bc_scan_open(cx, kMByX, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
   while (bc_scan_next(cx, c)) {
     bc_view k = bc_scan_key(cx, c);
+    bc_view row = bc_scan_row(cx, c);
     bc_emit_begin(cx);
-    if (bc_key_part_null(cx, kMByX, k, 0)) {
+    if (bc_col_null(cx, row, kXCol)) {
       bc_emit_null(cx);
     } else {
-      bc_emit_f64(cx, bc_key_part_f64(cx, kMByX, k, 0));
+      bc_emit_f64(cx, bc_col_f64(cx, row, kXCol));
     }
     bc_emit_bool(cx, bc_key_part_i64(cx, kMByX, k, 1) > 3);
+    bc_emit_end(cx);
+  }
+}
+// x read from the key: refused, by the typed decoder and by bc_emit_key_part.
+void x_from_key(bc_ctx* cx) {
+  bc_cursor c = bc_scan_open(cx, kMByX, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  if (bc_scan_next(cx, c)) bc_emit_count(cx, static_cast<int64_t>(bc_key_part_f64(cx, kMByX, bc_scan_key(cx, c), 0)));
+}
+void x_emitted_from_key(bc_ctx* cx) {
+  bc_cursor c = bc_scan_open(cx, kMByX, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_emit_begin(cx);
+    bc_emit_key_part(cx, kMByX, bc_scan_key(cx, c), 0);
+    bc_emit_key_part(cx, kMByX, bc_scan_key(cx, c), 1);
     bc_emit_end(cx);
   }
 }
@@ -371,7 +387,8 @@ TEST_CASE("plan API: f64 and bool flow through parameters, rows, keys and result
     CHECK(nan != nan);
   }
 
-  // Index order: null, -inf, -1.5, 0 (twice: -0.0 encodes as 0.0), 2.5, NaN.
+  // Index order: null, -inf, -1.5, 0 (twice: -0.0 encodes as 0.0), 2.5, NaN;
+  // the values from the rows, so -0.0 stays -0.0.
   REQUIRE(run(f, x_in_index_order, {}, kF64BoolRow) == BC_COMMITTED);
   rows = f.results(kF64BoolRow);
   REQUIRE(rows.size() == 7);
@@ -379,7 +396,7 @@ TEST_CASE("plan API: f64 and bool flow through parameters, rows, keys and result
   CHECK(std::get<bool>(rows[0][1]) == true);  // k = 7
   CHECK(bits(std::get<double>(rows[1][0])) == bits(-kInf));
   CHECK(bits(std::get<double>(rows[2][0])) == bits(-1.5));
-  CHECK(bits(std::get<double>(rows[3][0])) == bits(0.0));
+  CHECK(bits(std::get<double>(rows[3][0])) == bits(-0.0));
   CHECK(bits(std::get<double>(rows[4][0])) == bits(0.0));
   CHECK(std::get<bool>(rows[3][1]) == false);  // k = 3 before k = 4 on the primary-key suffix
   CHECK(std::get<bool>(rows[4][1]) == true);
@@ -388,6 +405,12 @@ TEST_CASE("plan API: f64 and bool flow through parameters, rows, keys and result
   CHECK(top != top);
 
   CHECK(run(f, f64_part_on_i64_key, {}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  // A DOUBLE key part does not hold the column's value: never read from it.
+  CHECK(run(f, x_from_key, {}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(std::string{bc_error_message(f.cx)}.find("read it from the row") != std::string::npos);
+  CHECK(run(f, x_emitted_from_key, {}, std::array{PhysType::F64, PhysType::I64}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
   CHECK(run(f, bool_param_as_i64, {bc_value{true}}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);

@@ -73,9 +73,6 @@ namespace {
 
 constexpr std::uint32_t kNoCursor = UINT32_MAX;
 constexpr std::uint32_t kScanFlagMask = BC_SCAN_REVERSE | BC_SCAN_PREFIX;
-// Verified schema references a context keeps. Past this a miss evicts one
-// by CLOCK, so memory stays bounded and the references in use survive a
-// flood of others, a recompile's dead ids included.
 
 // What a view is, beyond its bytes: a row read from the engine (a stored
 // row, the only kind bc_update and bc_delete take as the old one), a row a
@@ -246,10 +243,12 @@ struct bc_ctx {
   std::vector<KeyBuilder> keys;
   std::vector<RowBuilder> rows;
   std::vector<Effect> effects;
-  // The row keys this statement's writes touched, and whether the row is
+  // The row keys this execution's writes touched, and whether the row is
   // there after the write: a second write of one row would derive its index
   // entries from the snapshot's row again, not from the first write's, and
-  // leave the first write's entries behind. Reset by every bc_ctx_run.
+  // leave the first write's entries behind. Kept across the runs of one
+  // execution, which share its snapshot and write plan; reset by
+  // bc_ctx_begin.
   std::map<Bytes, bool, BytesLess> written_rows;
   // Where each part of the last key a key-part decoder read starts, so the
   // next part of the same key is found without skipping the earlier ones
@@ -262,7 +261,7 @@ struct bc_ctx {
   std::map<Bytes, Bytes, BytesLess> deleted_ranges;  // lo -> hi of each bc_del_range, likewise; disjoint
 
   Verified verified;                 // this context's reference, rebuilt by every run
-  const Verified* current{nullptr};  // &verified once a run verified it; nullptr: none
+  bool has_ref{false};  // a run verified `verified` against the pinned version
   std::vector<KeySlots> key_slots;    // of the tables this run updated, built on the first update
 
   // Results: rows in the row format of the plan's result_types, each
@@ -447,11 +446,11 @@ struct bc_ctx {
   // a plan names, so the compatibility check covers each one. Outside a
   // run there is no reference, and nothing is declared.
   auto declared_object(std::uint32_t id, bool write) -> bool {
-    if (current == nullptr) {
+    if (!has_ref) {
       fail(BC_E_HANDLE, "no plan is running: bc_ctx_run sets the schema ref every object is checked against");
       return false;
     }
-    const auto& list = write ? current->written : current->objects;
+    const auto& list = write ? verified.written : verified.objects;
     if (std::ranges::binary_search(list, id)) return true;
     fail(BC_E_HANDLE, std::string{write ? "table " : "table or index "} + std::to_string(id) +
                           (write ? " is not among the tables the plan's schema ref writes"
@@ -504,7 +503,7 @@ struct bc_ctx {
     effects.clear();
     written_rows.clear();
     deleted_ranges.clear();
-    current = nullptr;  // set by the next run's reference
+    has_ref = false;  // set by the next run's verification
     key_slots.clear();
     key_parts.view = {};  // view handles repeat across executions once the epoch wraps
     key_parts.at.clear();
@@ -512,7 +511,6 @@ struct bc_ctx {
     result_pos = 0;
     emit.reset();
     emit_col = 0;
-    current = nullptr;
     affected = -1;
     arena_used = 0;
     reads = 0;
@@ -828,7 +826,15 @@ auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots& {
   for (auto id : read) {
     if (cat.key_layout(id) == nullptr) return incompatible("table or index " + std::to_string(id) + " the plan reads no longer exists");
   }
+  // An index where a table is required is a malformed reference, which no
+  // recompile cures; a table that is gone is a stale one.
+  auto is_index = [&](std::uint32_t id) { return cat.table(id) == nullptr && cat.key_layout(id) != nullptr; };
+  auto not_a_table = [&](std::uint32_t id) {
+    cx->fail(BC_L_PLAN, "object " + std::to_string(id) + " is an index where the plan's schema ref needs a table");
+    return false;
+  };
   for (auto id : written) {
+    if (is_index(id)) return not_a_table(id);
     if (cat.table(id) == nullptr) return incompatible("table " + std::to_string(id) + " the plan writes no longer exists");
   }
   if (!e.result_layout || !std::ranges::equal(codes, e.result_codes)) {
@@ -874,6 +880,7 @@ auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots& {
                               ", which the plan's schema ref does not name");
       return false;
     }
+    if (is_index(c.table)) return not_a_table(c.table);
     const auto* t = cat.table(c.table);
     if (t == nullptr) return incompatible("table " + std::to_string(c.table) + " no longer exists");
     const auto* slot = t->layout.find(c.col);
@@ -895,7 +902,7 @@ auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots& {
     return false;
   }
   if (!verify(cx, ref, cx->verified)) return false;
-  cx->current = &cx->verified;
+  cx->has_ref = true;
   return true;
 }
 
@@ -903,8 +910,8 @@ auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots& {
 // column the reference does not declare or not of `type`.
 auto declared(bc_ctx* cx, std::uint32_t table, std::uint32_t col, std::optional<PhysType> type) -> const ColSlot* {
   if (!cx->ok()) return nullptr;
-  if (cx->current != nullptr) {
-    const auto& cols = cx->current->cols;
+  if (cx->has_ref) {
+    const auto& cols = cx->verified.cols;
     auto it = std::ranges::lower_bound(cols, std::pair{table, col}, {},
                                        [](const ColSlot& s) { return std::pair{s.table, s.col}; });
     if (it != cols.end() && it->table == table && it->col == col) {
@@ -1154,6 +1161,13 @@ void set_column(bc_ctx* cx, bc_row r, std::uint32_t col, std::optional<PhysType>
   // writer cannot refuse it.
   if (!set(b->writer)) cx->fail(BC_L_ROW, "column " + std::to_string(col) + " is not in the row's layout");
 }
+// A DOUBLE key part is canonicalised (-0.0 is 0.0, every NaN one NaN): the
+// key does not hold the value the row does, so it is read from the row.
+void refuse_f64_part(bc_ctx* cx) {
+  cx->fail(BC_E_HANDLE, "a DOUBLE key part does not hold the column's value (-0.0 and NaN are canonicalised): read it "
+                        "from the row");
+}
+
 }  // namespace
 
 extern "C" {
@@ -1204,13 +1218,8 @@ bool bc_ctx_check(bc_ctx* cx, const bc_schema_ref* compiled_against) {
 
 void bc_ctx_run(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* compiled_against) {
   BC_GUARD_BEGIN
+  cx->affected = -1;  // the count is the run's: a failed run reports none
   if (!bc_ctx_check(cx, compiled_against)) return;
-  // One run is one statement: the rows it may write once, and the count it
-  // reports, are its own. The write plan and the snapshot carry over, for
-  // statements of one transaction that share a context (#491).
-  cx->written_rows.clear();
-  cx->deleted_ranges.clear();
-  cx->affected = -1;
   plan(cx);
   if (cx->ok() && cx->emit) cx->fail(BC_L_PLAN, "result row begun and not ended");
   BC_GUARD_END(cx)
@@ -1331,7 +1340,7 @@ bool bc_param_null(bc_ctx* cx, uint32_t i) {
 void bc_emit_begin(bc_ctx* cx) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return;
-  if (cx->current == nullptr || cx->current->result_types.empty()) {
+  if (!cx->has_ref || cx->verified.result_types.empty()) {
     cx->fail(BC_L_PLAN, "the plan's schema ref declares no result types");
     return;
   }
@@ -1339,7 +1348,7 @@ void bc_emit_begin(bc_ctx* cx) {
     cx->fail(BC_L_PLAN, "result row already begun");
     return;
   }
-  cx->emit.emplace(*cx->current->result_layout);
+  cx->emit.emplace(*cx->verified.result_layout);
   cx->emit_col = 0;
   BC_GUARD_END(cx)
 }
@@ -1350,8 +1359,8 @@ namespace {
 // The next result column, which must be of `type` (any, when nullopt).
 auto emit_slot(bc_ctx* cx, std::optional<PhysType> type) -> bool {
   if (!cx->ok()) return false;
-  if (!cx->emit || cx->emit_col >= cx->current->result_types.size() ||
-      (type && cx->current->result_types[cx->emit_col] != *type)) {
+  if (!cx->emit || cx->emit_col >= cx->verified.result_types.size() ||
+      (type && cx->verified.result_types[cx->emit_col] != *type)) {
     cx->fail(BC_L_PLAN, "emitted column does not match the result layout");
     return false;
   }
@@ -1441,7 +1450,12 @@ void bc_emit_col(bc_ctx* cx, bc_view row, uint32_t col) {
 void bc_emit_key_part(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32_t part) {
   BC_GUARD_BEGIN
   auto at = key_part_at(cx, table_or_index, key, part, std::nullopt);
-  if (!at || !emit_slot(cx, at->part.type)) return;
+  if (!at) return;
+  if (at->part.type == PhysType::F64) {
+    refuse_f64_part(cx);
+    return;
+  }
+  if (!emit_slot(cx, at->part.type)) return;
   // A decoder's nullopt is a null part, or a malformed key when the reader failed.
   auto& r = at->reader;
   auto emit = [&](auto v) { emit_decoded(cx, v, !r.ok(), r.ok() && v.has_value(), "unparseable key"); };
@@ -1457,7 +1471,7 @@ void bc_emit_key_part(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32_t
 void bc_emit_end(bc_ctx* cx) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return;
-  if (!cx->emit || cx->emit_col != cx->current->result_types.size()) {
+  if (!cx->emit || cx->emit_col != cx->verified.result_types.size()) {
     cx->fail(BC_L_PLAN, "result row ended with the wrong number of columns");
     return;
   }
@@ -1838,9 +1852,7 @@ int64_t bc_key_part_i64(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32
 
 double bc_key_part_f64(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32_t part) {
   BC_GUARD_BEGIN
-  auto at = key_part_at(cx, table_or_index, key, part, PhysType::F64);
-  if (!at) return 0.0;
-  return decoded<double>(cx, at->reader, at->reader.read_f64(at->part), 0.0);
+  if (key_part_at(cx, table_or_index, key, part, PhysType::F64)) refuse_f64_part(cx);
   BC_GUARD_END(cx)
   return {};
 }

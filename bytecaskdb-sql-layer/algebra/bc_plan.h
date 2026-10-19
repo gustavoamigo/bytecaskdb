@@ -145,7 +145,7 @@ void     bc_emit_bool(bc_ctx *, bool);
 void     bc_emit_bytes(bc_ctx *, bc_view);
 void     bc_emit_null(bc_ctx *);
 void     bc_emit_col(bc_ctx *, bc_view row, uint32_t col);                /* the column, NULL as NULL */
-void     bc_emit_key_part(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
+void     bc_emit_key_part(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);   /* not a DOUBLE part: BC_E_HANDLE */
 void     bc_emit_end(bc_ctx *);
 void     bc_emit_count(bc_ctx *, int64_t affected);   /* write statements: the row count */
 
@@ -190,7 +190,7 @@ bc_view   bc_empty(bc_ctx *);                                 /* the empty view,
    covering index read possible: the columns an index key holds are read
    from bc_scan_key without fetching the row. */
 int64_t   bc_key_part_i64(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
-double    bc_key_part_f64(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
+double    bc_key_part_f64(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);  /* always BC_E_HANDLE: a DOUBLE part is canonicalised; read the row */
 bool      bc_key_part_bool(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
 bc_view   bc_key_part_bytes(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
 bool      bc_key_part_null(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);

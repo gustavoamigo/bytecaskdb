@@ -193,10 +193,13 @@ reaches it, since one SQL statement affects each row at most once
 twice). The exception is a `bc_insert` of a key the plan already put
 there: that is `INSERT … VALUES (1, …), (1, …)`, a duplicate key, and it
 raises `BC_C_UNIQUE` (SQLSTATE 23505, as PostgreSQL reports it), never
-retried. The tracking is per statement: every `bc_ctx_run` starts it
-afresh, with the affected-row count, so statements of one transaction
-sharing a context (#491) may each write a row once; a later statement
-reading what an earlier one wrote needs #491's own-writes overlay. A unique
+retried. The tracking spans the execution, every run between
+`bc_ctx_begin` and the commit: those runs share the snapshot and the write
+plan, and each derives the entries it removes from the snapshot's row, so
+a row written by one run and again by a later one would keep both runs'
+entries. Writing a row in several statements of one transaction needs
+#491's own-writes overlay; until then the second write is refused within
+a context. The affected-row count is each run's own. A unique
 secondary key two of one statement's inserts share is not caught yet: a
 stage-2 limit, unreachable from the stage-1 compiler, which emits one write
 per plan (#507).
@@ -406,7 +409,7 @@ void     bc_emit_bool(bc_ctx *, bool);
 void     bc_emit_bytes(bc_ctx *, bc_view);
 void     bc_emit_null(bc_ctx *);
 void     bc_emit_col(bc_ctx *, bc_view row, uint32_t col);                /* the column, NULL as NULL */
-void     bc_emit_key_part(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
+void     bc_emit_key_part(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);   /* not a DOUBLE part: BC_E_HANDLE */
 void     bc_emit_end(bc_ctx *);
 void     bc_emit_count(bc_ctx *, int64_t affected);   /* write statements: the row count */
 ```
@@ -416,7 +419,7 @@ void     bc_emit_count(bc_ctx *, int64_t affected);   /* write statements: the r
 | `bc_param_*` | Reads parameter `i` as bound by `bc_ctx_begin`. A wrong index or type is `BC_E_HANDLE` and a neutral value. Parameter views live until reset. |
 | `bc_emit_begin` … `bc_emit_end` | Appends one result row, in the row format, with the types the plan's `bc_schema_ref` declares in `result_types`. Columns are emitted in that order; a count or type that does not match is `BC_E_LAYOUT`. The row is copied into the result buffer, which is part of the arena. |
 | `bc_emit_col` | Emits column `col` of a row view: its value, or NULL when the column is null or the row predates it. The type is the column's, and must be the next result column's. One call where a nullable column took an `if` and two emits. |
-| `bc_emit_key_part` | Emits part `part` of an encoded key of `table_or_index`, NULL as NULL: a covering read's column, from `bc_scan_key`, with no row read. |
+| `bc_emit_key_part` | Emits part `part` of an encoded key of `table_or_index`, NULL as NULL: a covering read's column, from `bc_scan_key`, with no row read. A `DOUBLE` part is `BC_E_HANDLE`: the key canonicalises `-0.0` and NaN, so the value comes from the row. |
 | `bc_emit_count` | Records the affected-row count a write statement reports. At most once per plan. |
 
 ### Arithmetic and conversion
@@ -493,7 +496,7 @@ bc_view   bc_empty(bc_ctx *);                                 /* the empty view,
    covering index read possible: the columns an index key holds are read
    from bc_scan_key without fetching the row. */
 int64_t   bc_key_part_i64(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
-double    bc_key_part_f64(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
+double    bc_key_part_f64(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);  /* always BC_E_HANDLE: a DOUBLE part is canonicalised; read the row */
 bool      bc_key_part_bool(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
 bc_view   bc_key_part_bytes(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
 bool      bc_key_part_null(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
@@ -510,7 +513,7 @@ int64_t   bc_count_range(bc_ctx *, uint32_t table_or_index, bc_view lo, bc_view 
 | `bc_scan_key` | The current entry's full encoded key. | View valid until the cursor steps or closes. | 0 |
 | `bc_scan_row` | The current entry's row, a stored row of the cursor's table. On a table scan it is the entry's value. On a secondary index the runtime builds the row key from the entry's primary-key suffix and reads it, once per entry however often it is asked: the fetch of a non-covering read. An index entry whose row is missing is `BC_E_CORRUPT`, never skipped: the runtime keeps every entry paired with its row, so a missing one is damage. | View valid until the cursor steps or closes. | 0 on a table, 1 record read on an index |
 | `bc_empty` | The empty view. | The zero handle, valid always. | 0 |
-| `bc_key_part_*` | Decodes one part of an encoded key, by position in the key's catalog layout. On a secondary index the index columns come first, then the primary key's parts. `bc_key_part_null` reports a null part; the typed decoders return zero or empty for one. A part number or type that disagrees with the layout is `BC_E_HANDLE`; a key that does not parse is `BC_E_CORRUPT`. | Values; a bytes part is unescaped into the arena and lives until reset. | 0 |
+| `bc_key_part_*` | Decodes one part of an encoded key, by position in the key's catalog layout. On a secondary index the index columns come first, then the primary key's parts. `bc_key_part_null` reports a null part; the typed decoders return zero or empty for one. A part number or type that disagrees with the layout is `BC_E_HANDLE`, and so is `bc_key_part_f64` on any part: the key canonicalises a `DOUBLE` (`-0.0` is `0.0`, every NaN one NaN), so it is read from the row. A key that does not parse is `BC_E_CORRUPT`. | Values; a bytes part is unescaped into the arena and lives until reset. | 0 |
 | `bc_count_range` | Counts the live entries in `[lo, hi)` without walking them, stopping at `limit`. Compiles to `Snapshot::count_keys`. The planner's cardinality source and `COUNT(*)` over a key range. | `min(count, limit)`. | at most 2 record reads, whatever the range holds |
 
 A range scan on a secondary index with a fetch of each row costs one read

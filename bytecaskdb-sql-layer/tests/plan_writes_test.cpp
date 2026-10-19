@@ -798,25 +798,43 @@ TEST_CASE("plan writes: a delete racing updates of one row has one outcome", "[s
   for (auto* cx : cxs) bc_ctx_free(cx);
 }
 
-TEST_CASE("plan writes: the rows a statement may write once are its own, not the context's",
+TEST_CASE("plan writes: a row written by one run is refused to a later run of the same execution",
           "[sql][algebra][writes]") {
-  // Two statements of one transaction share a context (#491): updating a
-  // row in one and again in the next is two statements, each writing it once.
+  // Runs between one bc_ctx_begin and its commit share the snapshot and the
+  // write plan. A second run would derive the index entries it removes from
+  // the snapshot's row, not from the first run's write, and the index would
+  // keep both: until #491's own-writes overlay, the second write is refused.
   Fixture f;
   create_w(f);
   REQUIRE(run(f, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{0}}) == BC_COMMITTED);
   SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
   auto ref = sr.get();
-  auto ps = params({std::int64_t{1}, std::int64_t{1}, std::int64_t{2}, bytes("y"), std::int64_t{0}});
-  // Two runs under one snapshot, as two statements: neither is a second write.
-  bc_ctx_begin(f.cx, &ps, {});
-  bc_ctx_run(f.cx, update_w, &ref);
+  auto a2 = params({std::int64_t{1}, std::int64_t{1}, std::int64_t{2}, bytes("x"), std::int64_t{0}});
+  bc_ctx_begin(f.cx, &a2, {});
+  bc_ctx_run(f.cx, update_w, &ref);  // a = 2, moving its w_a entry
   REQUIRE(bc_error(f.cx) == BC_OK);
-  bc_ctx_run(f.cx, update_w, &ref);
-  CHECK(bc_error(f.cx) == BC_OK);
-  CHECK(bc_ctx_affected(f.cx) == 1);  // the second statement's count
-  bc_ctx_reset(f.cx);
-  // One run writing the row twice is still refused.
-  CHECK(run(f, update_twice, {std::int64_t{1}, std::int64_t{2}, std::int64_t{3}}) == BC_FAILED);
+  CHECK(bc_ctx_affected(f.cx) == 1);
+  bc_ctx_run(f.cx, update_w, &ref);  // the same row again
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(bc_ctx_affected(f.cx) == -1);  // the failed run's count, not the first run's
+  CHECK(bc_ctx_commit(f.cx, false) == BC_FAILED);
+  bc_ctx_reset(f.cx);
+  // Nothing reached the engine: the row and every index as before.
+  check_indexes_exact(f);
+  Bytes key, row;
+  bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kW);
+  bytecask::sql::key_put_i64(key, 1, {PhysType::I64});
+  REQUIRE(f.db->get({}, key, row));
+  const auto& w = *f.cat().table("w");
+  CHECK(bytecask::sql::row_i64(row, w.layout.find(kA)->pos) == 1);
+  CHECK(count_entries(*f.db, bytecask::sql::kNsIndex, kWA) == 1);
+  // A duplicate key across two runs is still a duplicate.
+  auto dup = params({std::int64_t{2}, std::int64_t{2}, bytes("y"), std::int64_t{0}});
+  bc_ctx_begin(f.cx, &dup, {});
+  bc_ctx_run(f.cx, insert_w, &ref);
+  REQUIRE(bc_error(f.cx) == BC_OK);
+  bc_ctx_run(f.cx, insert_w, &ref);
+  CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
+  CHECK(bc_error_detail(f.cx) == unique_on(kW));
+  bc_ctx_reset(f.cx);
 }

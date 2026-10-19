@@ -330,6 +330,18 @@ TEST_CASE("plan API: a plan names only the objects its reference declares", "[sq
   auto r5 = index_and_table.get();
   CHECK(bc_execute(f.cx, rows_through_index, &r5, &none, {}, false, 0) == BC_COMMITTED);
   CHECK(bc_ctx_affected(f.cx) == 1);
+  // An index where a table is required is malformed, not stale: no
+  // recompile would cure it.
+  SchemaRef writes_index{{}, {kIdx}, {}, {}, 0};
+  auto r7 = writes_index.get();
+  CHECK(bc_execute(f.cx, scan_index, &r7, &none, {}, false, 0) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
+  SchemaRef index_col{{kIdx}, {}, {bc_col_ref{kIdx, kIdCol, BC_T_I64}}, {}, 0};
+  auto r8 = index_col.get();
+  CHECK(bc_execute(f.cx, scan_index, &r8, &none, {}, false, 0) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
   // A column of a table the reference does not name is a malformed reference.
   SchemaRef stray_col{{kIdx}, {}, {id_col}, {}, 0};
   auto r6 = stray_col.get();
