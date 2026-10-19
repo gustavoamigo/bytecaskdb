@@ -249,7 +249,7 @@ index columns with the index's catalog layout, and `bc_key_part_*` decodes
 any part by position, index columns first. The prefix is `0x03 index_id`,
 not the plugin's `0x03 table_id index_id`: index ids are global, so the
 table id would add four bytes and no information
-(`docs/sql_layer_catalog_design.md`, *Secondary-key prefix*).
+(`docs/catalog_design.md`, *Secondary-key prefix*).
 
 **`bc_key_successor`** of a prefix is the smallest key above every key that
 starts with it: the last byte below `0xFF` incremented and everything after
@@ -385,7 +385,7 @@ archive through a header bridge (#488). Nothing in the plugin changes in the
 PR that lands this document.
 
 Two things the codec does not decide, the catalog does
-(`docs/sql_layer_catalog_design.md`): index keys are prefixed by the index
+(`docs/catalog_design.md`): index keys are prefixed by the index
 id alone, and an index records `DESC` per part and whether it is unique. A
 unique index has the same entries as any other; its check is a scan of the
 index-part prefix. The codec takes a `KeyPart{type, nullable, desc}` per

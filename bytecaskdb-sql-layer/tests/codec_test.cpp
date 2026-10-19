@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Gustavo Amigo
 //
 // Property tests for the key codec and the row format
-// (docs/sql_layer_types_design.md): encode then decode gives the value back,
+// (docs/types_design.md): encode then decode gives the value back,
 // memcmp order on encoded keys is the typed order, for every part type, ASC
 // and DESC, with nulls first; and a row shorter than its layout reads the
 // columns it predates as null, in both directions.

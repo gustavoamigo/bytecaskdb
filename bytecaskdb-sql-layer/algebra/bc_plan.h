@@ -102,7 +102,7 @@ typedef struct {
 
 /* What a plan was compiled against, and the types of the rows it emits, in
    emit order. bc_ctx_run checks the objects and columns against the catalog
-   version the context pinned (docs/sql_layer_catalog_design.md,
+   version the context pinned (docs/catalog_design.md,
    *Compatibility*) on every run; the result layout is the plan's own and
    is not a catalog object. */
 typedef struct {

@@ -8,7 +8,7 @@ it is stored under namespace `0x01`, the in-memory form plans resolve
 against and how readers share it, what makes a compiled plan compatible
 with the live catalog, and how each DDL statement of stage 1 writes. It
 agrees with `docs/plan_api_design.md` (revision 5; revision 4 came with it)
-and `docs/sql_layer_types_design.md`; nothing in the engine changes.
+and `docs/types_design.md`; nothing in the engine changes.
 
 The catalog is shared with the MariaDB plugin when the plugin adopts the
 sql-layer's formats (#487, *Relationship to the MariaDB plugin*). It is
@@ -23,7 +23,7 @@ GPL-2.0, and nothing of it is copied.
 | `name` | As the parser hands it over: an unquoted identifier folded to lower case by PostgreSQL's rules, a quoted one exactly as written, so `"Foo"` and `foo` are two tables. Plans never paste a name into C: their constants are named from ids (`TBL_1`, `IDX_3`, `COL_1_2`, `PART_3_0`), so a name need not be an identifier and two objects' constants cannot collide. The plan's header lists what each constant stands for, in `//` lines whose user bytes outside printable ASCII, `\` and `?` are `\xNN` escapes. |
 | `version` | Per-table counter, bumped by every DDL on the table. Not checked by plans (see *Compatibility*); kept for stage 2. |
 | `next_col_id` | The next column id. Column ids are permanent and never reused, even after a column is dropped. |
-| columns | Each: permanent `id`, `name`, SQL type (kind, `VARCHAR` length, `DECIMAL` precision and scale), nullability, default. The physical type follows from the SQL type (`docs/sql_layer_types_design.md`, *Stage-1 types*). |
+| columns | Each: permanent `id`, `name`, SQL type (kind, `VARCHAR` length, `DECIMAL` precision and scale), nullability, default. The physical type follows from the SQL type (`docs/types_design.md`, *Stage-1 types*). |
 | primary key | Column ids, in key order. Always ascending; a primary key column is never null. |
 | indexes | Each: permanent `id`, `name`, unique or not, parts as (column id, `ASC`/`DESC`). |
 | layouts | Each layout generation: its object id, its generation number, `bitmap_bytes`, and its offset table (column id → byte offset or variable slot). The last is current. Stage 1 has one per table; `REBUILD` appends one (#503). |

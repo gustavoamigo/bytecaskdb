@@ -74,8 +74,10 @@ bindings (#494) and a header bridge for the plugin, the counterpart of
 Its third-party dependencies are fetched at build time, not vendored:
 libpg_query (PostgreSQL licence, with its bundled protobuf-c, MIT/BSD) and
 TinyCC (LGPL-2.1). The xmake targets that use them are not built by default;
-the `build-and-test` job in `ci.yml` builds and runs `sql_layer_tests` with
-the engine suite.
+its own workflow, `.github/workflows/sql-layer.yml`, builds and runs
+`sql_layer_tests`, under the sanitizers too; the engine's workflows do not
+build the layer. Its design documents are in `bytecaskdb-sql-layer/docs/`, and
+what it guarantees is in `bytecaskdb-sql-layer/CONTRACT.md`.
 
 ### GPL-2.0 — MariaDB Integration (`bytecaskdb-mariadb-plugin/`)
 
@@ -125,7 +127,10 @@ bytecask/
 │   ├── codec/ catalog/ sql/ plan/ api/   # bytecask.sql.* interface (.cppm) and implementation (.cpp) units
 │   ├── plans/            # Hand-written plans, C
 │   ├── tests/            # Catch2 tests; shared fixtures as bytecask.sql.tests.* modules
-│   └── xmake.lua         # sql_layer, sql_layer_tests; libpg_query and TinyCC package rules
+│   ├── bench/            # sql_layer_bench: the plan API's fixed costs
+│   ├── docs/             # The layer's design documents
+│   ├── CONTRACT.md       # What the layer guarantees, with the tests that prove it
+│   └── xmake.lua         # sql_layer, sql_layer_tests, sql_layer_bench; libpg_query and TinyCC package rules
 │
 ├── tests/                # MIT — engine tests (no MariaDB)
 ├── benchmarks/           # MIT — engine benchmarks

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Gustavo Amigo
 //
 // ast.cppm — the small AST the parser hands the binder: the prototype's DML
-// forms and the stage-1 DDL of docs/sql_layer_catalog_design.md. Names are as
+// forms and the stage-1 DDL of docs/catalog_design.md. Names are as
 // written; positions are byte offsets into the statement text, -1 where
 // libpg_query gives none.
 //

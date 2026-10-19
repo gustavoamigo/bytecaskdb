@@ -3,7 +3,7 @@
 //
 // catalog.cppm — tables, their permanent column ids, SQL types, defaults,
 // primary keys, secondary indexes and layout generations, persisted under
-// namespace 0x01 (docs/sql_layer_catalog_design.md).
+// namespace 0x01 (docs/catalog_design.md).
 //
 // Written from scratch: the plugin's catalog is GPL-2.0 and this directory is
 // MIT.
@@ -47,7 +47,7 @@ export namespace bytecask::sql {
 // runtime's bc_value is this type.
 using Datum = std::variant<std::monostate, std::int64_t, double, bool, Bytes>;
 
-// The stage-1 SQL types of docs/sql_layer_types_design.md. The values are
+// The stage-1 SQL types of docs/types_design.md. The values are
 // the record's; never renumber one.
 enum class SqlKind : std::uint8_t {
   SmallInt = 1,
