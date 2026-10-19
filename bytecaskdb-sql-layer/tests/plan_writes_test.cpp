@@ -443,6 +443,85 @@ void read_id(bc_ctx* cx) {
 }
 }  // namespace
 
+namespace {
+// Two writes of row $1 of w in one plan.
+void update_twice(bc_ctx* cx) {
+  bool found = false;
+  bc_view old = bc_get(cx, bc_key_params(cx, kW, 0, 1), &found);
+  bc_row r1 = bc_row_from(cx, kW, old);
+  bc_row_set_param(cx, r1, kA, 1);
+  bc_update(cx, kW, old, bc_row_end(cx, r1));
+  bc_row r2 = bc_row_from(cx, kW, old);
+  bc_row_set_param(cx, r2, kA, 2);
+  bc_update(cx, kW, old, bc_row_end(cx, r2));
+}
+void update_then_delete(bc_ctx* cx) {
+  bool found = false;
+  bc_view old = bc_get(cx, bc_key_params(cx, kW, 0, 1), &found);
+  bc_row r = bc_row_from(cx, kW, old);
+  bc_row_set_param(cx, r, kA, 1);
+  bc_update(cx, kW, old, bc_row_end(cx, r));
+  bc_delete(cx, kW, old);
+}
+void insert_twice(bc_ctx* cx) {
+  insert_w(cx);
+  insert_w(cx);
+}
+// A row's key moved away, then inserted again in the same plan.
+void move_then_insert(bc_ctx* cx) {
+  bool found = false;
+  bc_view old = bc_get(cx, bc_key_params(cx, kW, 0, 1), &found);
+  bc_row r = bc_row_from(cx, kW, old);
+  bc_row_set_param(cx, r, kId, 1);
+  bc_update(cx, kW, old, bc_row_end(cx, r));
+  bc_row n = bc_row_begin(cx, kW);
+  bc_row_set_param(cx, n, kId, 0);
+  bc_row_set_param(cx, n, kC, 2);
+  bc_insert(cx, kW, bc_row_end(cx, n));
+}
+// Reads each t_by_name entry's row twice.
+void fetch_twice(bc_ctx* cx) {
+  bc_cursor c = bc_scan_open(cx, 3, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  int64_t n = 0;
+  while (bc_scan_next(cx, c)) {
+    n = bc_add(cx, n, bc_col_i64(cx, bc_scan_row(cx, c), 0));
+    n = bc_add(cx, n, bc_col_i64(cx, bc_scan_row(cx, c), 0));
+  }
+  bc_emit_count(cx, n);
+}
+}  // namespace
+
+TEST_CASE("plan writes: a second write of one row in one plan is refused", "[sql][algebra][writes]") {
+  // Each write derives the index entries it removes from the snapshot's row,
+  // so a second write of that row would remove them again and leave the
+  // first write's entries without a row.
+  Fixture f;
+  create_w(f);
+  REQUIRE(run(f, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{0}}) == BC_COMMITTED);
+  for (auto* plan : {update_twice, update_then_delete}) {
+    CHECK(run(f, plan, {std::int64_t{1}, std::int64_t{2}, std::int64_t{3}}) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_HANDLE);
+    CHECK(std::string{bc_error_message(f.cx)}.find("written twice") != std::string::npos);
+  }
+  CHECK(run(f, insert_twice, {std::int64_t{2}, std::int64_t{2}, bytes("y"), std::int64_t{0}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(run(f, move_then_insert, {std::int64_t{1}, std::int64_t{5}, std::int64_t{0}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  // Nothing of any of them committed.
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 1);
+  check_indexes_exact(f);
+}
+
+TEST_CASE("plan writes: bc_scan_row reads an entry's row once per step", "[sql][algebra][writes]") {
+  Fixture f;
+  constexpr std::int64_t kN = 4;
+  for (std::int64_t i = 1; i <= kN; ++i) {
+    REQUIRE(run(f, insert_t, {i, bytes(std::string(1, static_cast<char>('a' + i))), i}) == BC_COMMITTED);
+  }
+  CHECK(run(f, fetch_twice, {}, {.max_reads = 2 * kN, .deadline_ns = 0}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == 2 * kN * (kN + 1) / 2);
+}
+
 TEST_CASE("plan writes: a missing row and a wrong row are errors, never skipped", "[sql][algebra][writes]") {
   Fixture f;
   for (std::int64_t i = 1; i <= 3; ++i) REQUIRE(run(f, insert_t, {i, bytes("n"), i}) == BC_COMMITTED);

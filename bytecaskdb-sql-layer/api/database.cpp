@@ -147,23 +147,31 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
     out.affected = 0;
     return out;
   }
-  const auto& types = stmt.plan_->param_types;
-  if (params.size() != types.size()) {
-    throw std::invalid_argument("statement takes " + std::to_string(types.size()) + " parameters, got " +
-                                std::to_string(params.size()));
-  }
-  for (std::size_t i = 0; i < params.size(); ++i) {
-    if (!matches(params[i], types[i])) throw std::invalid_argument("parameter $" + std::to_string(i + 1) + " has the wrong type");
-  }
+  // Throws std::invalid_argument for parameters the statement's current plan
+  // does not take: checked again after a recompile, whose plan may differ.
+  auto check_params = [&] {
+    const auto& types = stmt.plan_->param_types;
+    if (params.size() != types.size()) {
+      throw std::invalid_argument("statement takes " + std::to_string(types.size()) + " parameters, got " +
+                                  std::to_string(params.size()));
+    }
+    for (std::size_t i = 0; i < params.size(); ++i) {
+      if (!matches(params[i], types[i])) {
+        throw std::invalid_argument("parameter $" + std::to_string(i + 1) + " has the wrong type");
+      }
+    }
+  };
+  check_params();
   bc_params bp{params};
   auto r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
   // bc_ctx_run checks the plan against the catalog it pinned. A plan a DDL
-  // made incompatible is recompiled from its text and run once more; one a
-  // DDL left compatible keeps running, unchecked here. Asking the catalog
-  // only after a BC_E_LAYOUT tells the check's refusal from a row's.
-  if (r == BC_FAILED && bc_error(cx_) == BC_E_LAYOUT && schema_incompatibility(*live_->current(), stmt.ref_)) {
+  // made incompatible (BC_E_LAYOUT with BC_L_INCOMPATIBLE) is recompiled
+  // from its text and run once more; one a DDL left compatible keeps
+  // running, unchecked here.
+  if (r == BC_FAILED && bc_error(cx_) == BC_E_LAYOUT && bc_error_detail(cx_) == BC_L_INCOMPATIBLE) {
     bc_ctx_reset(cx_);
     compile(stmt);
+    check_params();
     r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
   }
   const auto& p = *stmt.plan_;

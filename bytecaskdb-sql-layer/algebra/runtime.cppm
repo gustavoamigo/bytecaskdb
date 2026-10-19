@@ -71,7 +71,7 @@ export namespace bytecask::sql {
 
 // Why a plan compiled against `ref` cannot run on `cat`, or nullopt if it
 // can: docs/sql_layer_catalog_design.md, *Compatibility*. What bc_ctx_run
-// checks, and what the embedded API asks before it reuses a cached plan.
+// checks when it verifies a reference.
 [[nodiscard]] auto schema_incompatibility(const Catalog& cat, const bc_schema_ref& ref) -> std::optional<std::string>;
 
 // A plan's result_types as the bc_type codes a bc_schema_ref carries.

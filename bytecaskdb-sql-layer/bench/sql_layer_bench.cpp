@@ -10,6 +10,7 @@
 //   xmake f -m release && xmake build sql_layer_bench && xmake run sql_layer_bench
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -217,15 +218,16 @@ int main() {
     };
     auto base = runs(nullptr);
     std::printf("bc_ctx_run of an empty plan, no schema ref: %7.1f ns\n", base);
+    std::uint64_t next_id = 1;  // each reference its own id: one shared would be served the other's entry
     for (const auto& [name, spec] : {std::pair{"point read", &point}, std::pair{"New-Order", &new_order}}) {
-      auto cached = make_ref(*cat, *spec, 1);
+      auto cached = make_ref(*cat, *spec, next_id++);
       auto uncached = make_ref(*cat, *spec, 0);  // id 0: verified on every run
       auto hit = runs(&cached->ref) - base;
       auto miss = runs(&uncached->ref) - base;
       std::printf("%-10s (%2zu cols, %2zu objects): check, cached %7.1f ns; verify and map ids %7.1f ns\n", name,
                   spec->cols.size(), spec->read.size() + spec->written.size(), hit, miss);
     }
-    auto wref = make_ref(*cat, {{"warehouse"}, {}, {{"warehouse", "w_tax"}}, {}}, 2);
+    auto wref = make_ref(*cat, {{"warehouse"}, {}, {{"warehouse", "w_tax"}}, {}}, next_id++);
     auto run = [&](bc_plan_fn plan, const bc_schema_ref* ref) {
       bc_ctx_begin(cx, &ps, {});
       bc_ctx_run(cx, plan, ref);

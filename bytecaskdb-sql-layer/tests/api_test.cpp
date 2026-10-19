@@ -120,6 +120,40 @@ TEST_CASE("embedded API: a cached write plan maintains an index created after it
   CHECK(ids(db->execute(kByName, {bytes("apple"), bytes("apple\x01")})) == std::vector<std::int64_t>{1, 2});
 }
 
+TEST_CASE("embedded API: a plan the catalog refuses is recompiled and run again", "[sql][api][catalog]") {
+  sql_test::TempDir dir{"api_recompile"};
+  auto db = Database::open(dir.path());
+  (void)db->execute(kCreateTable);
+  (void)db->execute(kCreateIndex);
+  const auto& insert = db->prepare(kInsert);
+  const auto& by_id = db->prepare(kById);
+  const auto& by_name = db->prepare(kByName);
+  (void)db->execute(insert, {i(1), bytes("apple"), i(10)});
+  CHECK(db->execute(by_id, {i(1)}).rows == Grid{{i(1), i(10)}});
+  auto compiled = db->compilations();
+
+  // The table is dropped and created again: new ids, so every cached plan is
+  // refused by bc_ctx_run, recompiled from its text, and runs on the new table.
+  (void)db->execute("DROP TABLE t");
+  (void)db->execute(kCreateTable);
+  (void)db->execute(kCreateIndex);
+  CHECK(db->execute(insert, {i(2), bytes("banana"), i(20)}).affected == 1);
+  CHECK(db->execute(by_id, {i(2)}).rows == Grid{{i(2), i(20)}});
+  CHECK(db->execute(by_id, {i(1)}).rows.empty());
+  CHECK(ids(db->execute(by_name, {bytes("a"), bytes("c")})) == std::vector<std::int64_t>{2});
+  CHECK(db->compilations() == compiled + 3);
+  // Once recompiled they run without another compile.
+  CHECK(db->execute(insert, {i(3), bytes("cherry"), i(30)}).affected == 1);
+  CHECK(db->compilations() == compiled + 3);
+
+  // The parameters are checked against the recompiled plan: qty is now
+  // bytes, so an integer for it is refused before the plan runs.
+  (void)db->execute("DROP TABLE t");
+  (void)db->execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name BYTEA, qty BYTEA)");
+  CHECK_THROWS_AS(db->execute(insert, {i(4), bytes("date"), i(40)}), std::invalid_argument);
+  CHECK(db->execute(insert, {i(4), bytes("date"), bytes("forty")}).affected == 1);
+}
+
 TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[sql][api][catalog]") {
   sql_test::TempDir dir{"api_compat"};
   auto db = Database::open(dir.path());

@@ -18,7 +18,6 @@
 // Standard library headers before the module imports, for the reason
 // bytecaskdb/bytecask_hpp.cpp gives (LLVM 22's abi_tag redeclaration error).
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <compare>
 #include <cstddef>
@@ -33,6 +32,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -71,8 +71,9 @@ namespace {
 
 constexpr std::uint32_t kNoCursor = UINT32_MAX;
 constexpr std::uint32_t kScanFlagMask = BC_SCAN_REVERSE | BC_SCAN_PREFIX;
-// Verified schema references a context keeps, direct-mapped by id.
-constexpr std::size_t kVerifiedSlots = 16;
+// Verified schema references a context keeps; past this it forgets them
+// all and starts again, so a context's memory stays bounded.
+constexpr std::size_t kMaxVerified = 1024;
 
 // What a view is, beyond its bytes: a row read from the engine (a stored
 // row, the only kind bc_update and bc_delete take as the old one), a row a
@@ -101,6 +102,7 @@ struct Cursor {
   std::uint64_t step{0};
   Bytes key, value;
   Bytes row;  // on an index: the current entry's row, once bc_scan_row fetched it
+  std::uint64_t row_step{0};  // the step `row` was fetched at; 0: none
 };
 
 struct KeyBuilder {
@@ -214,12 +216,18 @@ struct bc_ctx {
   std::vector<KeyBuilder> keys;
   std::vector<RowBuilder> rows;
   std::vector<Effect> effects;
+  // The row keys this execution's writes touched: a second write of one row
+  // would derive its index entries from the snapshot's row again, not from
+  // the first write's, and leave the first write's entries behind.
+  std::vector<Bytes> written_rows;
 
-  // References verified by bc_ctx_run, kept across executions. A context is
-  // bound to one database, and a catalog version is never reused within
-  // one, so an entry is matched by the reference's id and the version alone.
-  // An id of 0 is verified into `scratch` on every run.
-  std::array<Verified, kVerifiedSlots> verified{};
+  // References verified by bc_ctx_run, kept across executions, by id. A
+  // context is bound to one database, and a catalog version is never reused
+  // within one, so an entry is matched by the reference's id and the
+  // version alone. An id of 0 is verified into `scratch` on every run.
+  // Elements of an unordered_map stay put as it grows, so `current` stays
+  // valid until the map is cleared, which only use_ref does.
+  std::unordered_map<std::uint64_t, Verified> verified;
   Verified scratch;
   const Verified* current{nullptr};  // this execution's reference; nullptr: none
 
@@ -415,6 +423,7 @@ struct bc_ctx {
     cat = &unpinned;
     pinned.reset();  // an idle context keeps no superseded catalog alive
     effects.clear();
+    written_rows.clear();
     results.clear();
     result_pos = 0;
     emit.reset();
@@ -690,6 +699,7 @@ auto verify(bc_ctx* cx, const bc_schema_ref* ref, Verified& e) -> bool {
   if (auto why = bytecask::sql::schema_incompatibility(*cx->cat, *ref)) {
     cx->fail(BC_E_LAYOUT, "plan compiled against catalog v" + std::to_string(ref->catalog_version) +
                               " is incompatible with v" + std::to_string(cx->cat->version()) + ": " + *why);
+    cx->detail = BC_L_INCOMPATIBLE;  // the one BC_E_LAYOUT a recompile can cure
     return false;
   }
   auto codes = std::span{ref->result_types, ref->result_types == nullptr ? 0 : ref->n_result};
@@ -738,7 +748,8 @@ auto use_ref(bc_ctx* cx, const bc_schema_ref* ref) -> bool {
     cx->current = nullptr;
     return true;
   }
-  auto& e = ref->id == 0 ? cx->scratch : cx->verified[ref->id % kVerifiedSlots];
+  if (ref->id != 0 && !cx->verified.contains(ref->id) && cx->verified.size() >= kMaxVerified) cx->verified.clear();
+  auto& e = ref->id == 0 ? cx->scratch : cx->verified[ref->id];
   if (ref->id == 0 || !e.valid || e.ref_id != ref->id || e.version != cx->cat->version()) {
     if (!verify(cx, ref, e)) return false;
   }
@@ -799,6 +810,17 @@ auto resolve_row(bc_ctx* cx, bc_view row) -> std::optional<RowRef> {
   return RowRef{b, e->table, e->kind};
 }
 
+// A row of generation `gen`, not its table's current one. Only REBUILD
+// (#503) makes a second generation: a retired one is a layout refusal, and
+// one the table never had is damage.
+void fail_generation(bc_ctx* cx, const Table* t, std::uint16_t gen) {
+  auto retired = t != nullptr && std::ranges::any_of(t->retired_layouts, [&](const auto& l) {
+                   return l.second.generation == gen;
+                 });
+  cx->fail(retired ? BC_E_LAYOUT : BC_E_CORRUPT, "row of layout generation " + std::to_string(gen) +
+                                                     (retired ? ", which REBUILD retired" : ", which its table never had"));
+}
+
 // Column `col` of a row view, where a decoder reads it: the row, and the
 // column's position in the row's generation.
 struct RowCol {
@@ -813,14 +835,7 @@ auto row_col(bc_ctx* cx, bc_view row, std::uint32_t col, std::optional<PhysType>
   if (slot == nullptr) return std::nullopt;
   auto gen = bytecask::sql::row_generation(r->bytes);
   if (gen != tc->generation) {
-    // Only REBUILD (#503) makes a second generation; until it exists a row of
-    // another one is damage.
-    const auto* t = cx->cat->table(r->table);
-    auto retired = t != nullptr && std::ranges::any_of(t->retired_layouts, [&](const auto& l) {
-                     return l.second.generation == gen;
-                   });
-    cx->fail(retired ? BC_E_LAYOUT : BC_E_CORRUPT, "row of layout generation " + std::to_string(gen) +
-                                                       (retired ? ", which REBUILD retired" : ", which its table never had"));
+    fail_generation(cx, cx->cat->table(r->table), gen);
     return std::nullopt;
   }
   return RowCol{r->bytes, slot};
@@ -840,11 +855,22 @@ auto write_row(bc_ctx* cx, const Table& t, bc_view row, bool stored) -> std::opt
     cx->fail(BC_E_LAYOUT, "row of table " + std::to_string(r->table) + " written to table " + t.name);
     return std::nullopt;
   }
-  if (bytecask::sql::row_generation(r->bytes) != t.layout.generation) {
-    cx->fail(BC_E_LAYOUT, "row is not of table " + t.name + "'s current layout generation");
+  if (auto gen = bytecask::sql::row_generation(r->bytes); gen != t.layout.generation) {
+    fail_generation(cx, &t, gen);
     return std::nullopt;
   }
   return r->bytes;
+}
+
+// Records a row key this execution writes; a second write of it is a plan
+// bug (BC_E_HANDLE). Linear: a plan writes few rows.
+auto first_write(bc_ctx* cx, const Table& t, BytesView pk) -> bool {
+  if (std::ranges::any_of(cx->written_rows, [&](const Bytes& k) { return std::ranges::equal(k, pk); })) {
+    cx->fail(BC_E_HANDLE, "a row of table " + t.name + " written twice in one plan");
+    return false;
+  }
+  cx->written_rows.emplace_back(pk.begin(), pk.end());
+  return true;
 }
 
 auto encode_pk(bc_ctx* cx, const Table& t, BytesView row, Bytes& out) -> bool {
@@ -1487,6 +1513,7 @@ bc_view bc_scan_row(bc_ctx* cx, bc_cursor h) {
   if (c == nullptr) return {};
   auto table = c->layout->table->id;
   if (c->layout->index == nullptr) return cx->make_view(c->value.data(), c->value.size(), h.i, c->step, table, RowKind::Stored);
+  if (c->row_step == c->step) return cx->make_view(c->row.data(), c->row.size(), h.i, c->step, table, RowKind::Stored);
   BC_GUARD_BEGIN
   // The row key is the table's prefix and the entry's primary-key suffix,
   // found by skipping the index parts.
@@ -1507,6 +1534,7 @@ bc_view bc_scan_row(bc_ctx* cx, bc_cursor h) {
     cx->fail(BC_E_CORRUPT, "index " + c->layout->index->name + " has an entry whose row is missing");
     return {};
   }
+  c->row_step = c->step;  // fetched once per entry, however often it is asked for
   return cx->make_view(c->row.data(), c->row.size(), h.i, c->step, table, RowKind::Stored);
   BC_GUARD_END(cx)
   return {};
@@ -1795,7 +1823,7 @@ void bc_insert(bc_ctx* cx, uint32_t table, bc_view row) {
   auto r = write_row(cx, *t, row, false);
   if (!r) return;
   Bytes pk;
-  if (!encode_pk(cx, *t, *r, pk)) return;
+  if (!encode_pk(cx, *t, *r, pk) || !first_write(cx, *t, pk)) return;
   std::vector<Entry> entries(t->indexes.size());
   for (std::size_t i = 0; i < t->indexes.size(); ++i) {
     if (!encode_entry(cx, *t, t->indexes[i], *r, entries[i])) return;
@@ -1820,6 +1848,7 @@ void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {
   Bytes pk_old, pk_new;
   if (!encode_pk(cx, *t, *o, pk_old) || !encode_pk(cx, *t, *n, pk_new)) return;
   auto moved_pk = pk_old != pk_new;
+  if (!first_write(cx, *t, pk_old) || (moved_pk && !first_write(cx, *t, pk_new))) return;
   // Only the entries whose keys changed move; with the primary key, all do.
   struct Move {
     const Index* ix;
@@ -1855,7 +1884,7 @@ void bc_delete(bc_ctx* cx, uint32_t table, bc_view old) {
   auto o = write_row(cx, *t, old, true);
   if (!o) return;
   Bytes pk;
-  if (!encode_pk(cx, *t, *o, pk)) return;
+  if (!encode_pk(cx, *t, *o, pk) || !first_write(cx, *t, pk)) return;
   std::vector<Entry> entries(t->indexes.size());
   for (std::size_t i = 0; i < t->indexes.size(); ++i) {
     if (!encode_entry(cx, *t, t->indexes[i], *o, entries[i])) return;
@@ -1887,8 +1916,12 @@ void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
       const auto& e = *it;
       if (!std::is_lt(bytes_cmp(e.key, range->hi))) break;
       if (!cx->charge()) return;
-      if (!bytecask::sql::row_header_valid(e.value) || bytecask::sql::row_generation(e.value) != t->layout.generation) {
+      if (!bytecask::sql::row_header_valid(e.value)) {
         cx->fail(BC_E_CORRUPT, "malformed row in table " + t->name);
+        return;
+      }
+      if (auto gen = bytecask::sql::row_generation(e.value); gen != t->layout.generation) {
+        fail_generation(cx, t, gen);
         return;
       }
       for (const auto& ix : t->indexes) {

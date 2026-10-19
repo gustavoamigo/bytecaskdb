@@ -199,9 +199,6 @@ public:
   [[nodiscard]] auto index(std::string_view name) const -> std::pair<const Table*, const Index*>;
   // A table or an index: both draw ids from one counter.
   [[nodiscard]] auto key_layout(std::uint32_t table_or_index) const -> const KeyLayout*;
-  // The current layout of a table, by layout id; nullptr for a retired one.
-  [[nodiscard]] auto row_layout(std::uint32_t layout_id) const -> const RowLayout*;
-  [[nodiscard]] auto table_of_layout(std::uint32_t layout_id) const -> const Table*;
 
   // Object ids stay at or below 2^24 - 1: bc_error_detail carries one in its
   // low 24 bits (and a plan's constants are an enum, whose values are ints).
@@ -252,7 +249,6 @@ private:
   std::map<std::uint32_t, Table> tables_;
   std::map<std::string, std::uint32_t, std::less<>> names_;  // table or index name -> id
   std::map<std::uint32_t, KeyLayout> key_layouts_;
-  std::map<std::uint32_t, std::uint32_t> layout_tables_;  // current layout id -> table id
 };
 
 // The live catalog: the current version, published by each DDL, and the

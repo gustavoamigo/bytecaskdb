@@ -156,7 +156,7 @@ entries whose parts are null.
 
 `Catalog` is immutable: the tables by id and by name, each index's table,
 the key layout of every table and index (the parts `bc_key_*` and the scans
-read, `DESC` included), and each layout id's table. It is built at open by
+read, `DESC` included). It is built at open by
 reading every record under `01 02` and the counters, and by every DDL from
 the catalog before it. Lookups are `const` and allocate nothing.
 

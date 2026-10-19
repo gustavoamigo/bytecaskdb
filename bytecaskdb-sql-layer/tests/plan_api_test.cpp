@@ -268,10 +268,22 @@ TEST_CASE("plan API: a context caches a verified reference by id and catalog ver
   auto liar = lying.get();
   liar.id = ref.id;
   CHECK(bc_execute(f.cx, scan_index, &liar, &none, {}, false, 0) == BC_COMMITTED);
-  // An id of 0 is never cached: checked on every run.
+  // An id of 0 is never cached: checked on every run. A refusal of the
+  // reference says so in its detail: a recompile can cure it.
   liar.id = 0;
   CHECK(bc_execute(f.cx, scan_index, &liar, &none, {}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);
+
+  // Many references in turn stay cached: running 40 others between two runs
+  // of the first does not evict it, so the liar is still served its entry.
+  std::vector<SchemaRef> others(40, reads_index);
+  for (const auto& o : others) {
+    auto r = o.get();
+    REQUIRE(bc_execute(f.cx, scan_index, &r, &none, {}, false, 0) == BC_COMMITTED);
+  }
+  liar.id = ref.id;
+  CHECK(bc_execute(f.cx, scan_index, &liar, &none, {}, false, 0) == BC_COMMITTED);
 
   // A DDL between two executions moves the version, so the cached entry no
   // longer matches and the reference is checked again: a stale plan is
@@ -280,6 +292,7 @@ TEST_CASE("plan API: a context caches a verified reference by id and catalog ver
   f.ddl(bytecask::sql::DropIndexDdl{"t_by_name"});
   CHECK(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);
   CHECK(std::string{bc_error_message(f.cx)}.find("no longer exists") != std::string::npos);
   // And a DDL that leaves it compatible keeps it running, re-verified.
   SchemaRef reads_table{{kTbl}, {}, {}, {}, 0};

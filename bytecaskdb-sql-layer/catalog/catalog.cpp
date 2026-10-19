@@ -682,14 +682,12 @@ void Catalog::erase_table(std::uint32_t id) { tables_.erase(id); }
 void Catalog::rebuild_lookups() {
   names_.clear();
   key_layouts_.clear();
-  layout_tables_.clear();
   for (const auto& [id, t] : tables_) {
     auto name_taken = [&](const std::string& n) {
       if (names_.contains(n)) corrupt("name " + n + " is used twice");
     };
     name_taken(t.name);
     names_[t.name] = id;
-    layout_tables_[t.layout_id] = id;
     std::vector<KeyPart> pk_parts;
     for (auto cid : t.pk_col_ids) pk_parts.push_back(KeyPart{t.column(cid)->type});
     key_layouts_[id] = KeyLayout{kNsRow, &t, nullptr, pk_parts, 0};
@@ -729,16 +727,6 @@ auto Catalog::index(std::string_view name) const -> std::pair<const Table*, cons
 auto Catalog::key_layout(std::uint32_t id) const -> const KeyLayout* {
   auto it = key_layouts_.find(id);
   return it == key_layouts_.end() ? nullptr : &it->second;
-}
-
-auto Catalog::row_layout(std::uint32_t layout_id) const -> const RowLayout* {
-  const auto* t = table_of_layout(layout_id);
-  return t == nullptr ? nullptr : &t->layout;
-}
-
-auto Catalog::table_of_layout(std::uint32_t layout_id) const -> const Table* {
-  auto it = layout_tables_.find(layout_id);
-  return it == layout_tables_.end() ? nullptr : table(it->second);
 }
 
 auto Catalog::constants(const Table& t) -> std::vector<PlanConstant> {

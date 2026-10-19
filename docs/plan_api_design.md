@@ -177,9 +177,12 @@ blocks: reads are lock-free and the commit happens after it returns.
 
 **Within a plan, reads see the snapshot, not the plan's own writes.** This
 is SQL statement semantics: a statement sees the state before it began. The
-runtime's unique checks read the snapshot too, so two `bc_insert` calls of
-the same key in one plan are not caught; the stage-1 compiler emits one
-insert per plan, and a procedure that inserts several rows needs the
+runtime's unique checks read the snapshot too. A second write of a row the
+plan already wrote is refused (`BC_E_HANDLE`): `bc_update` and `bc_delete`
+derive the entries they remove from the snapshot's row, so a second write
+would leave the first one's entries without a row. A unique secondary key
+two of the plan's own inserts share is not caught; the stage-1 compiler
+emits one write per plan, and a procedure that writes several rows needs the
 overlay below (#507).
 Read-your-own-writes across statements in an interactive transaction is an
 overlay the cursors read through and belongs to the session layer. See
@@ -236,6 +239,11 @@ enum bc_scan_flags {
 enum bc_constraint {   /* the detail of BC_E_CONSTRAINT; the compiler emits the object id with it */
   BC_C_UNIQUE = 1, BC_C_NOT_NULL, BC_C_CHECK, BC_C_FOREIGN_KEY,
   BC_C_RANGE,          /* a value outside its declared type: INTEGER, VARCHAR(n), DECIMAL(p, s) */
+};
+
+enum bc_layout_detail {  /* the detail of BC_E_LAYOUT */
+  BC_L_ROW = 0,           /* a row or a result row that breaks its layout */
+  BC_L_INCOMPATIBLE = 1,  /* bc_ctx_run refused the plan's bc_schema_ref: recompile it */
 };
 
 enum bc_commit_result { BC_COMMITTED, BC_CONFLICT, BC_FAILED /* see bc_error */ };
@@ -310,7 +318,7 @@ bool    bc_ctx_next_result(bc_ctx *, const uint8_t **row, uint32_t *len);     /*
 void    bc_ctx_reset(bc_ctx *);                                               /* drops snapshot, plan, arena */
 enum bc_error_code bc_error(const bc_ctx *);
 const char *bc_error_message(const bc_ctx *);
-uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits */
+uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits; BC_E_LAYOUT: a bc_layout_detail */
 int64_t bc_ctx_affected(const bc_ctx *);                   /* what bc_emit_count recorded, or -1 */
 int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params *,
                    bc_budget, bool sync, uint32_t max_retries);               /* the retry loop */
@@ -324,14 +332,17 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
 | `bc_ctx_commit` | Submits the write plan with `apply_batch`, guarded by `ensure_unchanged` on the catalog record of every table whose keys it writes, so a DDL on such a table committed since the snapshot makes it a conflict: the index entries the runtime wrote follow the pinned version's indexes, and a `CREATE INDEX` committed after the snapshot would otherwise miss the row. `BC_COMMITTED` on success. `BC_CONFLICT` when the engine reports a guard or write-write conflict: nothing was written. `BC_FAILED` when `bc_error` is set, including an error raised during the plan: nothing is committed. A plan with no writes and no guards commits nothing and returns `BC_COMMITTED`. |
 | `bc_ctx_next_result` | Iterates the result buffer. Rows are in the row format of the layout the plan emitted. The runtime, not a plan, sees raw pointers here; valid until `bc_ctx_reset`. |
 | `bc_ctx_reset` | Releases the snapshot, drops the write plan and result buffer, resets the arena, bumps every generation so every handle and view the plan held is invalid. |
-| `bc_error_detail`, `bc_ctx_affected` | The constraint kind and object id of a raised error; the affected-row count a write plan recorded. Both read by the runtime after the plan returns. |
+| `bc_error_detail`, `bc_ctx_affected` | The constraint kind and object id of a raised error, or for `BC_E_LAYOUT` whether it was `bc_ctx_run` refusing the reference (`BC_L_INCOMPATIBLE`, cured by a recompile) or a row breaking its layout (`BC_L_ROW`); the affected-row count a write plan recorded. Both read by the runtime after the plan returns. |
 | `bc_execute` | `begin`, `run`, `commit`; on `BC_CONFLICT`, `reset` and repeat up to `max_retries`. A `BC_E_CONSTRAINT` raised by the plan is final: no retry. Returns the commit result of the last attempt. This is the only place retry lives. |
 
 **Verification is cached.** A context remembers the references it verified,
-in a small direct-mapped table keyed by the reference's `id`, with the
-catalog version it verified each against and the column map it built. A run
-whose reference and pinned version match an entry skips the walk: an index
-and two integer compares. The version is the catalog's identity: a context
+in a hash table keyed by the reference's `id`, with the catalog version it
+verified each against and the column map it built. A run whose reference
+and pinned version match an entry skips the walk: a hash lookup and an
+integer compare. The table holds 1,024 references and is cleared when it
+would grow past that, so a workload cycling through many prepared
+statements keeps every one of them cached and a context's memory stays
+bounded. The version is the catalog's identity: a context
 is bound to one database at `bc_ctx_new`, and within a database a catalog
 version is never reused, so no pointer is compared (a freed catalog's
 address can be reused, its version cannot). An `id` of 0 is never cached.
@@ -460,7 +471,7 @@ int64_t   bc_count_range(bc_ctx *, uint32_t table_or_index, bc_view lo, bc_view 
 | `bc_scan_open` | Opens a cursor over `[lo, hi)` on a table (primary key order) or an index, direction per `flags`. An empty `lo` (`bc_empty`) means the start of the table or index, an empty `hi` the end. With `BC_SCAN_PREFIX`, `hi` is ignored and the range is every key having `lo` as a prefix. Positioned before the first entry. | A cursor handle. Closed by `bc_ctx_reset`; `bc_scan_close` releases one early. | 0 |
 | `bc_scan_next` | Advances in the scan's direction, charging one unit of budget. Invalidates the cursor's views. | `true` while an entry is available; `false` at the end, on error, or when the budget is spent. | 1 record read (the key directory holds no key bytes, so each step reads the entry's record; on a table scan the same read yields the value) |
 | `bc_scan_key` | The current entry's full encoded key. | View valid until the cursor steps or closes. | 0 |
-| `bc_scan_row` | The current entry's row, a stored row of the cursor's table. On a table scan it is the entry's value. On a secondary index the runtime builds the row key from the entry's primary-key suffix and reads it: the fetch of a non-covering read. An index entry whose row is missing is `BC_E_CORRUPT`, never skipped: the runtime keeps every entry paired with its row, so a missing one is damage. | View valid until the cursor steps or closes. | 0 on a table, 1 record read on an index |
+| `bc_scan_row` | The current entry's row, a stored row of the cursor's table. On a table scan it is the entry's value. On a secondary index the runtime builds the row key from the entry's primary-key suffix and reads it, once per entry however often it is asked: the fetch of a non-covering read. An index entry whose row is missing is `BC_E_CORRUPT`, never skipped: the runtime keeps every entry paired with its row, so a missing one is damage. | View valid until the cursor steps or closes. | 0 on a table, 1 record read on an index |
 | `bc_empty` | The empty view. | The zero handle, valid always. | 0 |
 | `bc_key_part_*` | Decodes one part of an encoded key, by position in the key's catalog layout. On a secondary index the index columns come first, then the primary key's parts. `bc_key_part_null` reports a null part; the typed decoders return zero or empty for one. A part number or type that disagrees with the layout is `BC_E_HANDLE`; a key that does not parse is `BC_E_CORRUPT`. | Values; a bytes part is unescaped into the arena and lives until reset. | 0 |
 | `bc_count_range` | Counts the live entries in `[lo, hi)` without walking them, stopping at `limit`. Compiles to `Snapshot::count_keys`. The planner's cardinality source and `COUNT(*)` over a key range. | `min(count, limit)`. | at most 2 record reads, whatever the range holds |
@@ -593,7 +604,8 @@ void    bc_del_range(bc_ctx *, uint32_t table, bc_view lo, bc_view hi);
 `old` must be a stored row, read in this execution by `bc_get` or
 `bc_scan_row`: the entries removed are derived from it, so a row the plan
 built would remove entries the snapshot does not hold and leave its real
-ones behind. Anything else is `BC_E_HANDLE`. A row of another table, or a
+ones behind. Anything else is `BC_E_HANDLE`, and so is a second write of a
+row key this plan already wrote, for the same reason. A row of another table, or a
 `row` of another layout generation, is `BC_E_LAYOUT`.
 
 Every key a write touches is in the write plan, and the engine checks each
@@ -1064,8 +1076,10 @@ them.
   plan: the runtime maintains whatever indexes the pinned version has.
   It gains `id`, which keys a context's cache of verified references:
   verifying a reference already verified against the pinned catalog
-  version is an index and two compares instead of a walk of the catalog
-  and an allocation per run. The embedded API no longer checks a cached
-  plan itself; it recompiles when `bc_ctx_run` refuses one.
+  version is a hash lookup and a compare instead of a walk of the catalog
+  and an allocation per run. `BC_E_LAYOUT` gains a detail,
+  `BC_L_INCOMPATIBLE` for the check's refusal, so the embedded API no longer
+  checks a cached plan itself: it recompiles exactly when `bc_ctx_run`
+  refuses one, and checks the parameters again against the new plan.
 - The compiler emits covering reads: a range plan whose result columns are
   all in the index key reads no row.
