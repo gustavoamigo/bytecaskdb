@@ -123,7 +123,7 @@ auto DB::open_hint_or_rebuild(const std::shared_ptr<DataFile> &data_file,
     // way, and a rebuild that does not finish here leaves the file hint-less,
     // which the next open regenerates through the same scan.
     std::filesystem::remove(hint_path);
-    (void)flush_hints_for(data_file, hint_path.parent_path());
+    flush_hints_for(data_file, hint_path.parent_path());
     auto hint = HintFile::OpenForRead(hint_path);
     // The tail-drop recovery_prepare_files does for a hint-less file is not
     // repeated here: a file that had a hint at all was sealed, and sealing
@@ -150,15 +150,15 @@ auto DB::open_hint_or_skip(const std::shared_ptr<DataFile> &data_file,
   }
 }
 
-auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
+void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
                          const std::filesystem::path &dir,
-                         const TailCut &cut) -> std::optional<Offset> {
+                         const TailCut &cut) {
   const auto stem = file->path().stem().string();
   const auto hint_path = dir / (stem + ".hint");
   const auto tmp_path = dir / (stem + ".hint.tmp");
 
   if (std::filesystem::exists(hint_path)) {
-    return std::nullopt;
+    return;
   }
 
   auto hint = HintFile::OpenForWrite(tmp_path);
@@ -257,7 +257,6 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
   // Only restart time depends on this: a lost rename leaves the file
   // hint-less, and the next open rebuilds the hint from it.
   sync_directory(dir, "io_dir_sync_hint");
-  return it.committed_offset();
 }
 
 // Writes hint files for all sealed data files in the given state.

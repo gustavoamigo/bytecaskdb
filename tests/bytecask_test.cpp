@@ -1536,11 +1536,10 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
 }
 
 // A hint is written to .hint.tmp and renamed into place, so ".hint exists"
-// means "the hint is complete". Open writes a hint-less file's hint before it
-// trims the file's torn tail, and a hint that later fails its CRC is rebuilt
-// by a scan that does no tail handling, since a file with a hint was sealed.
-// A hint torn in place by a crash during that open would send the next one
-// to that scan over the torn tail, and it would refuse the database.
+// means "the hint is complete". Open cuts a hint-less file's torn tail, and
+// syncs the cut, before it writes the hint (#476), so a crash during the hint
+// write leaves a file already cut and no hint: the next open indexes it again
+// and finds nothing to cut.
 TEST_CASE("DB recovery: a crash while open writes a hint leaves no hint behind "
           "it, and the next open recovers",
           "[bytecask][recovery][corruption]") {
@@ -1556,6 +1555,7 @@ TEST_CASE("DB recovery: a crash while open writes a hint leaves no hint behind "
   const auto files = data_files_by_sequence(dir);
   REQUIRE(files.size() == 3);
   drop_hint(files[2]);
+  const auto committed_end = std::filesystem::file_size(files[2]) - kEntry;
   tear_last_entry(files[2]);
 
   {
@@ -1566,6 +1566,7 @@ TEST_CASE("DB recovery: a crash while open writes a hint leaves no hint behind "
   auto hint = files[2];
   hint.replace_extension(".hint");
   CHECK_FALSE(std::filesystem::exists(hint));
+  CHECK(std::filesystem::file_size(files[2]) == committed_end);
 
   auto db = bytecask::DB::open(dir, opts);
   for (int i = 0; i < 13; ++i) {

@@ -243,9 +243,9 @@ auto DB::recovery_prepare_files(EngineState &s)
       // cuts its file, so a hint over a file whose cut failed, or that a
       // crash interrupted, would keep the tail for good.
       auto cut = false;
-      (void)flush_hints_for(data_file, dir_, [&](Offset end) {
+      flush_hints_for(data_file, dir_, [&](Offset end) {
         recovery_check_tail(*data_file, end, data_paths);
-        if (end < std::filesystem::file_size(p)) {
+        if (end < data_file->size()) {
           truncate_durably(p, end);
           cut = true;
         }

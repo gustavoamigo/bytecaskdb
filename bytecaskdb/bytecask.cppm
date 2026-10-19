@@ -1347,18 +1347,18 @@ private:
   void dispatch_hint(std::shared_ptr<DataFile> file);
   // Runs after the scan and before the hint is written: rules on whether the
   // file may end at `end`, the end of its last committed record, and cuts it
-  // there. Throws to refuse it, or when the cut fails.
+  // there. Throws to refuse it, or when the cut fails. flush_hints_for reads
+  // nothing from the file after the call, which is what lets the cut shrink
+  // it under the open DataFile: under IoBackend::Mmap a read past the new end
+  // would be SIGBUS.
   using TailCut = std::function<void(Offset end)>;
   // Writes hint file via temp-then-rename. Batch-aware; idempotent if .hint
-  // exists. Returns the offset past the last committed entry, or nullopt
-  // when the hint already existed and nothing was scanned. Without a cut,
-  // an entry that fails its CRC throws. With one, the scan stops there as it
-  // does at a zeroed header, and the cut rules on what lies past it; a throw
-  // from it leaves no hint behind.
-  static auto flush_hints_for(const std::shared_ptr<DataFile> &file,
+  // exists. Without a cut, an entry that fails its CRC throws. With one, the
+  // scan stops there as it does at a zeroed header, and the cut rules on what
+  // lies past it; a throw from it leaves no hint behind.
+  static void flush_hints_for(const std::shared_ptr<DataFile> &file,
                               const std::filesystem::path &dir,
-                              const TailCut &cut = {})
-      -> std::optional<Offset>;
+                              const TailCut &cut = {});
   // recovery_prepare_files' check on a hint-less file, which is where a
   // crash can leave a torn tail. See docs/bytecask_design.md, *Recovering a
   // Hint-less File*.
