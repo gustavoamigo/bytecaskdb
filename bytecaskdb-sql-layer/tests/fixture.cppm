@@ -115,6 +115,22 @@ inline auto all_cols(const bytecask::sql::Catalog& cat) -> std::vector<bc_col_re
   return out;
 }
 
+// Every table and index, and every table: what a hand-written test plan may
+// name and write.
+inline auto all_objects(const bytecask::sql::Catalog& cat) -> std::vector<std::uint32_t> {
+  std::vector<std::uint32_t> out;
+  for (const auto& [id, t] : cat.tables()) {
+    out.push_back(id);
+    for (const auto& ix : t.indexes) out.push_back(ix.id);
+  }
+  return out;
+}
+inline auto all_tables(const bytecask::sql::Catalog& cat) -> std::vector<std::uint32_t> {
+  std::vector<std::uint32_t> out;
+  for (const auto& [id, t] : cat.tables()) out.push_back(id);
+  return out;
+}
+
 // A fresh reference id: a context caches what it verified by id, so two
 // references that differ must not share one.
 inline auto next_ref_id() -> std::uint64_t {

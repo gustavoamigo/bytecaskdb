@@ -148,11 +148,30 @@ struct TableCols {
 // verification built: the column map and the result layout. Plain data, no
 // pointer into the catalog, so an entry outlives the version it was built
 // on and is only ever matched by the version number.
+// What a reference points at: its arrays and their lengths. Kept with a
+// verified entry and compared on every hit, so a different reference that
+// reuses an id is verified on its own rather than served another's entry.
+struct RefShape {
+  const void* read{nullptr};
+  const void* written{nullptr};
+  const void* cols{nullptr};
+  const void* result{nullptr};
+  std::uint32_t n_read{0}, n_written{0}, n_cols{0}, n_result{0};
+  auto operator==(const RefShape&) const -> bool = default;
+};
+
+auto shape_of(const bc_schema_ref& r) -> RefShape {
+  return {r.objects_read, r.tables_written, r.cols, r.result_types, r.n_read, r.n_written, r.n_cols, r.n_result};
+}
+
 struct Verified {
   bool valid{false};
   bool referenced{false};  // CLOCK: used since the hand last passed
   std::uint64_t ref_id{0};
   std::uint64_t version{0};
+  RefShape shape;
+  std::vector<std::uint32_t> objects;  // the tables and indexes it names
+  std::vector<std::uint32_t> written;  // the tables it writes
   std::vector<TableCols> tables;
   std::vector<std::uint8_t> result_codes;
   std::vector<PhysType> result_types;
@@ -396,18 +415,33 @@ struct bc_ctx {
   }
 
   // The key layout of a table or index, or nullptr and BC_E_HANDLE.
+  // Whether the plan's reference names table or index `id` (and, for
+  // `write`, lists it among the tables written), as it must for every object
+  // a plan names, so the compatibility check covers each one. A run without
+  // a reference is unchecked: it can name no column, only keys.
+  auto declared_object(std::uint32_t id, bool write) -> bool {
+    if (current == nullptr) return true;
+    const auto& list = write ? current->written : current->objects;
+    if (std::ranges::find(list, id) != list.end()) return true;
+    fail(BC_E_HANDLE, std::string{write ? "table " : "table or index "} + std::to_string(id) +
+                          (write ? " is not among the tables the plan's schema ref writes"
+                                 : " is not declared in the plan's schema ref"));
+    return false;
+  }
+
   auto key_layout(std::uint32_t table_or_index) -> const KeyLayout* {
-    if (!ok()) return nullptr;
+    if (!ok() || !declared_object(table_or_index, false)) return nullptr;
     const auto* kl = cat->key_layout(table_or_index);
     if (kl == nullptr) fail(BC_E_HANDLE, "no table or index " + std::to_string(table_or_index));
     return kl;
   }
 
-  // A table of the pinned version, or nullptr and `code`.
-  auto table(std::uint32_t id, bc_error_code code = BC_E_HANDLE) -> const Table* {
-    if (!ok()) return nullptr;
+  // A table of the pinned version the plan declares (among those it writes,
+  // for `write`), or nullptr and an error.
+  auto table(std::uint32_t id, bool write = false) -> const Table* {
+    if (!ok() || !declared_object(id, write)) return nullptr;
     const auto* t = cat->table(id);
-    if (t == nullptr) fail(code, "no table " + std::to_string(id));
+    if (t == nullptr) fail(BC_E_LAYOUT, "no table " + std::to_string(id));
     return t;
   }
 
@@ -734,6 +768,10 @@ auto written_tables(const bc_ctx* cx) -> std::vector<std::uint32_t> {
     e.result_codes.assign(codes.begin(), codes.end());
     e.result_types = std::move(types);
   }
+  auto ids = [](const std::uint32_t* p, std::uint32_t n) { return std::span{p, p == nullptr ? 0 : n}; };
+  e.written.assign(ids(ref->tables_written, ref->n_written).begin(), ids(ref->tables_written, ref->n_written).end());
+  e.objects.assign(ids(ref->objects_read, ref->n_read).begin(), ids(ref->objects_read, ref->n_read).end());
+  e.objects.insert(e.objects.end(), e.written.begin(), e.written.end());
   e.tables.clear();
   for (const auto& c : std::span{ref->cols, ref->cols == nullptr ? 0 : ref->n_cols}) {
     const auto* t = cx->cat->table(c.table);  // the check above found it
@@ -748,6 +786,7 @@ auto written_tables(const bc_ctx* cx) -> std::vector<std::uint32_t> {
   }
   e.ref_id = ref->id;
   e.version = cx->cat->version();
+  e.shape = shape_of(*ref);
   e.valid = true;
   return true;
 }
@@ -788,7 +827,7 @@ auto cache_slot(bc_ctx* cx, std::uint64_t id) -> Verified& {
     return true;
   }
   auto& e = ref->id == 0 ? cx->scratch : cache_slot(cx, ref->id);
-  if (ref->id == 0 || !e.valid || e.ref_id != ref->id || e.version != cx->cat->version()) {
+  if (ref->id == 0 || !e.valid || e.ref_id != ref->id || e.version != cx->cat->version() || e.shape != shape_of(*ref)) {
     if (!verify(cx, ref, e)) return false;
   }
   cx->current = &e;
@@ -1669,7 +1708,7 @@ bc_view bc_col_bytes(bc_ctx* cx, bc_view row, uint32_t col) {
 }
 
 bc_view bc_row_key(bc_ctx* cx, uint32_t table, bc_view row) {
-  const auto* t = cx->table(table, BC_E_LAYOUT);
+  const auto* t = cx->table(table);
   if (t == nullptr) return {};
   BC_GUARD_BEGIN
   auto r = write_row(cx, *t, row, false);
@@ -1682,7 +1721,7 @@ bc_view bc_row_key(bc_ctx* cx, uint32_t table, bc_view row) {
 }
 
 bc_row bc_row_begin(bc_ctx* cx, uint32_t table) {
-  const auto* t = cx->table(table, BC_E_LAYOUT);
+  const auto* t = cx->table(table);
   if (t == nullptr) return {};
   BC_GUARD_BEGIN
   cx->rows.push_back(RowBuilder{t->id, &t->layout, RowWriter{t->layout}, false});
@@ -1701,7 +1740,7 @@ bc_row bc_row_begin(bc_ctx* cx, uint32_t table) {
 }
 
 bc_row bc_row_from(bc_ctx* cx, uint32_t table, bc_view old) {
-  const auto* t = cx->table(table, BC_E_LAYOUT);
+  const auto* t = cx->table(table);
   if (t == nullptr) return {};
   auto o = write_row(cx, *t, old, false);
   if (!o) return {};
@@ -1842,7 +1881,7 @@ double bc_agg_f64(bc_ctx* cx, bc_group, uint32_t) {
 // -------------------------------------------------------------------- writes
 
 void bc_insert(bc_ctx* cx, uint32_t table, bc_view row) {
-  const auto* t = cx->table(table, BC_E_LAYOUT);
+  const auto* t = cx->table(table, true);
   if (t == nullptr) return;
   BC_GUARD_BEGIN
   auto r = write_row(cx, *t, row, false);
@@ -1864,7 +1903,7 @@ void bc_insert(bc_ctx* cx, uint32_t table, bc_view row) {
 }
 
 void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {
-  const auto* t = cx->table(table, BC_E_LAYOUT);
+  const auto* t = cx->table(table, true);
   if (t == nullptr) return;
   BC_GUARD_BEGIN
   auto o = write_row(cx, *t, old, true);
@@ -1903,7 +1942,7 @@ void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {
 }
 
 void bc_delete(bc_ctx* cx, uint32_t table, bc_view old) {
-  const auto* t = cx->table(table, BC_E_LAYOUT);
+  const auto* t = cx->table(table, true);
   if (t == nullptr) return;
   BC_GUARD_BEGIN
   auto o = write_row(cx, *t, old, true);
@@ -1920,7 +1959,7 @@ void bc_delete(bc_ctx* cx, uint32_t table, bc_view old) {
 }
 
 void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
-  const auto* t = cx->table(table, BC_E_LAYOUT);
+  const auto* t = cx->table(table, true);
   if (t == nullptr) return;
   BC_GUARD_BEGIN
   auto range = resolve_range(cx, table, lo, hi);

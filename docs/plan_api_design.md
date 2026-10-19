@@ -294,8 +294,11 @@ None is a position in a row. The runtime maps each column id the schema
 reference declares to its offset or slot in the table's current layout,
 once per verified reference (*Runtime*), so a layout generation never
 reaches plan text. A column a plan names but its reference does not declare
-is `BC_E_HANDLE` at the access: the reference is complete by construction,
-and the compatibility check covers every column the plan touches.
+is `BC_E_HANDLE` at the access, and so is a table or index it names but does
+not declare, or a table it writes but does not list in `tables_written`: the
+reference is complete by construction, and the compatibility check covers
+every object and column the plan touches. (A run with no reference at all,
+a test harness's, can name no column and is not checked for objects.)
 
 ## Function reference
 
@@ -342,14 +345,14 @@ and pinned version match an entry skips the walk: a hash lookup and an
 integer compare. The table holds 1,024 references; past that, a miss
 evicts one by CLOCK (the first entry the hand finds unused since it last
 passed), so the references in use survive a flood of others, a recompiled
-plan's dead id is dropped in time, and a context's memory stays bounded. The version is the catalog's identity: a context
+plan's dead id is dropped in time, and a context's memory stays bounded. A hit also compares the reference's
+shape, its arrays and their lengths, with the entry's, so a different
+reference that reuses an id is verified on its own. The version is the catalog's identity: a context
 is bound to one database at `bc_ctx_new`, and within a database a catalog
 version is never reused, so no pointer is compared (a freed catalog's
 address can be reused, its version cannot). An `id` of 0 is never cached.
 The compiler gives every plan it compiles a fresh `id`, a recompile
-included; a reference is trusted to describe its plan, as it always was,
-and a caller that reuses an `id` for another reference gets the first one's
-column map, never a read outside a row. The result types are compared
+included. The result types are compared
 without allocating, and the result layout is rebuilt only when they
 change.
 

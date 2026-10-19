@@ -101,7 +101,7 @@ void delete_w(bc_ctx* cx) {
 auto run(Fixture& f, bc_plan_fn plan, std::vector<bc_value> p, bc_budget budget = {}, std::uint32_t retries = 0)
     -> int {
   auto ps = params(std::move(p));
-  SchemaRef sr{{}, {}, all_cols(f.cat()), {}, f.cat().version()};
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
   auto ref = sr.get();
   return bc_execute(f.cx, plan, &ref, &ps, budget, false, retries);
 }
@@ -278,7 +278,7 @@ TEST_CASE("plan writes: a concurrent insert of the same key conflicts with no ab
   create_w(f);
   auto pa = params({std::int64_t{1}, std::int64_t{1}, bytes("a"), std::int64_t{0}});
   auto pb = params({std::int64_t{1}, std::int64_t{2}, bytes("b"), std::int64_t{1}});
-  SchemaRef sr{{}, {}, all_cols(f.cat()), {}, f.cat().version()};
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
   auto ref = sr.get();
   auto* other = bc_ctx_new(&f.bdb, &f.bcat, 1u << 20);
   REQUIRE(other != nullptr);

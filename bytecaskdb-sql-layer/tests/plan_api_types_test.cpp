@@ -53,7 +53,7 @@ auto run(Fixture& f, bc_plan_fn plan, std::vector<bc_value> p, std::span<const P
          std::uint32_t retries = 0) -> int {
   auto ps = params(std::move(p));
   // Every column of every table declared, so the plans may name any.
-  SchemaRef sr{{}, {}, all_cols(f.cat()), type_codes(result), f.cat().version()};
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), type_codes(result), f.cat().version()};
   auto ref = sr.get();  // points into sr
   return bc_execute(f.cx, plan, &ref, &ps, {}, false, retries);
 }
@@ -508,7 +508,7 @@ auto pk_of(std::int64_t id) -> Bytes {
 // test.
 auto commit_after(Fixture& f, bc_plan_fn plan, std::vector<bc_value> p, auto&& between) -> int {
   auto ps = params(std::move(p));
-  SchemaRef sr{{}, {}, all_cols(f.cat()), {}, f.cat().version()};
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
   auto ref = sr.get();
   bc_ctx_begin(f.cx, &ps, {});
   bc_ctx_run(f.cx, plan, &ref);
@@ -785,7 +785,7 @@ TEST_CASE("plan API: a charge of several units does not step over the deadline c
 TEST_CASE("plan API: a second commit and a too-wide result are plan errors, not UB or corruption", "[sql][algebra]") {
   Fixture f;
   auto ps = params({std::int64_t{1}, bytes("a"), std::int64_t{5}});
-  SchemaRef sr{{}, {}, all_cols(f.cat()), {}, f.cat().version()};
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
   auto tref = sr.get();
   bc_ctx_begin(f.cx, &ps, {});
   bc_ctx_run(f.cx, insert_t, &tref);

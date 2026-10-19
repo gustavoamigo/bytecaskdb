@@ -55,7 +55,7 @@ void insert_plan_ok(bc_ctx* cx) {
 // A reference declaring every column, so the plans may name any.
 auto run(Fixture& f, bc_plan_fn plan, std::vector<bc_value> p, bc_budget budget = {}) -> int {
   auto ps = params(std::move(p));
-  SchemaRef sr{{}, {}, all_cols(f.cat()), {}, f.cat().version()};
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
   auto ref = sr.get();
   return bc_execute(f.cx, plan, &ref, &ps, budget, false, 0);
 }
@@ -259,49 +259,56 @@ TEST_CASE("plan API: a context caches a verified reference by id and catalog ver
   SchemaRef reads_index{{kIdx}, {}, {}, {}, 0};
   auto ref = reads_index.get();
   CHECK(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_COMMITTED);
+  // Whether a run was served from the cache: the reference's object list is
+  // changed in place to name an object that does not exist. Same id, same
+  // arrays and lengths: a cached entry answers and the run commits; a
+  // verification would refuse it.
+  auto served_from_cache = [&](const bc_schema_ref& r) {
+    reads_index.read[0] = 4242;
+    auto got = bc_execute(f.cx, scan_index, &r, &none, {}, false, 0);
+    reads_index.read[0] = kIdx;
+    return got == BC_COMMITTED;
+  };
+  CHECK(served_from_cache(ref));
 
-  // A reference that reuses that id is trusted to be the same one: the
-  // cache, not the catalog, answers while the version holds. (A caller that
-  // reuses ids for different references gets wrong answers, never a read
-  // outside a row.)
+  // A different reference that reuses the id is verified on its own, not
+  // served the other's entry: its arrays differ.
   SchemaRef lying{{4242}, {}, {}, {}, 0};
   auto liar = lying.get();
   liar.id = ref.id;
-  CHECK(bc_execute(f.cx, scan_index, &liar, &none, {}, false, 0) == BC_COMMITTED);
-
-  // A flood of 2,000 other references, twice the cache, with the first one
-  // run every 20: CLOCK keeps it, so the liar is still served its entry.
-  for (int i = 0; i < 2000; ++i) {
-    auto r = reads_index.get();
-    REQUIRE(bc_execute(f.cx, scan_index, &r, &none, {}, false, 0) == BC_COMMITTED);
-    if (i % 20 == 0) REQUIRE(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_COMMITTED);
-  }
-  CHECK(bc_execute(f.cx, scan_index, &liar, &none, {}, false, 0) == BC_COMMITTED);
-  // An id of 0 is never cached: checked on every run. A refusal of the
-  // reference says so in its detail: a recompile can cure it.
-  liar.id = 0;
   CHECK(bc_execute(f.cx, scan_index, &liar, &none, {}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
-  CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);
-
-  // Many references in turn stay cached: running 40 others between two runs
-  // of the first does not evict it, so the liar is still served its entry.
-  std::vector<SchemaRef> others(40, reads_index);
-  for (const auto& o : others) {
-    auto r = o.get();
-    REQUIRE(bc_execute(f.cx, scan_index, &r, &none, {}, false, 0) == BC_COMMITTED);
-  }
-  liar.id = ref.id;
-  CHECK(bc_execute(f.cx, scan_index, &liar, &none, {}, false, 0) == BC_COMMITTED);
+  CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);  // a recompile can cure it
+  CHECK(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_COMMITTED);  // verified again
+  // An id of 0 is never cached: checked on every run.
+  auto uncached = ref;
+  uncached.id = 0;
+  CHECK(bc_execute(f.cx, scan_index, &uncached, &none, {}, false, 0) == BC_COMMITTED);
+  CHECK_FALSE(served_from_cache(uncached));
 
   // A flood of 2,000 other references, twice the cache, with the first one
-  // run every 20: CLOCK keeps it, so the liar is still served its entry.
+  // run every 20: CLOCK keeps it.
   for (int i = 0; i < 2000; ++i) {
     auto r = reads_index.get();
     REQUIRE(bc_execute(f.cx, scan_index, &r, &none, {}, false, 0) == BC_COMMITTED);
     if (i % 20 == 0) REQUIRE(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_COMMITTED);
   }
-  CHECK(bc_execute(f.cx, scan_index, &liar, &none, {}, false, 0) == BC_COMMITTED);
+  CHECK(served_from_cache(ref));
+
+  // A cache full of dead references, as 1,024 recompiles leave it, then two
+  // live ones in turn: each keeps its entry, so neither verifies again.
+  for (int i = 0; i < 1024; ++i) {
+    auto r = reads_index.get();
+    REQUIRE(bc_execute(f.cx, scan_index, &r, &none, {}, false, 0) == BC_COMMITTED);
+  }
+  SchemaRef other_index{{kIdx}, {}, {}, {}, 0};
+  auto a = reads_index.get();
+  auto b = other_index.get();
+  for (int i = 0; i < 100; ++i) {
+    REQUIRE(bc_execute(f.cx, scan_index, &a, &none, {}, false, 0) == BC_COMMITTED);
+    REQUIRE(bc_execute(f.cx, scan_index, &b, &none, {}, false, 0) == BC_COMMITTED);
+  }
+  CHECK(served_from_cache(a));
 
   // A DDL between two executions moves the version, so the cached entry no
   // longer matches and the reference is checked again: a stale plan is
@@ -312,18 +319,52 @@ TEST_CASE("plan API: a context caches a verified reference by id and catalog ver
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
   CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);
   CHECK(std::string{bc_error_message(f.cx)}.find("no longer exists") != std::string::npos);
-  // And a DDL that leaves it compatible keeps it running, re-verified.
-  SchemaRef reads_table{{kTbl}, {}, {}, {}, 0};
-  auto tref = reads_table.get();
-  CHECK(bc_execute(f.cx, scan_index, &tref, &none, {}, false, 0) == BC_FAILED);  // scans an index it no longer has
+}
+
+namespace {
+void insert_one(bc_ctx* cx) {
+  bc_row r = bc_row_begin(cx, kTbl);
+  bc_row_set_param(cx, r, kIdCol, 0);
+  bc_insert(cx, kTbl, bc_row_end(cx, r));
+}
+}  // namespace
+
+TEST_CASE("plan API: a plan names only the objects its reference declares", "[sql][algebra][catalog]") {
+  // Every table and index a plan names must be in its reference, writes in
+  // tables_written, as every column must: then a DDL on any of them is a
+  // refusal the embedded API recompiles on, never a stray error.
+  Fixture f;
+  auto none = params({});
+  auto one = params({std::int64_t{1}});
+  auto id_col = bc_col_ref{kTbl, kIdCol, BC_T_I64};
+  SchemaRef no_index{{kTbl}, {}, {}, {}, 0};  // scans t_by_name without naming it
+  auto r1 = no_index.get();
+  CHECK(bc_execute(f.cx, scan_index, &r1, &none, {}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(std::string{bc_error_message(f.cx)}.find("not declared") != std::string::npos);
+  SchemaRef read_only{{kTbl}, {}, {id_col}, {}, 0};  // writes t, declared only as read
+  auto r2 = read_only.get();
+  CHECK(bc_execute(f.cx, insert_one, &r2, &one, {}, false, 0) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(std::string{bc_error_message(f.cx)}.find("writes") != std::string::npos);
+  SchemaRef writes{{}, {kTbl}, {id_col}, {}, 0};
+  auto r3 = writes.get();
+  CHECK(bc_execute(f.cx, insert_one, &r3, &one, {}, false, 0) == BC_COMMITTED);
+  // The table dropped and created again under its name: a new id, so the
+  // reference that declares the old one is incompatible, a recompilable
+  // refusal.
+  f.ddl(bytecask::sql::DropTableDdl{"t"});
+  f.ddl(bytecask::sql::CreateTableDdl{"t", {Fixture::col("id", PhysType::I64, false)}, {"id"}});
+  CHECK(bc_execute(f.cx, insert_one, &r3, &one, {}, false, 0) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);
 }
 
 TEST_CASE("plan API: a context holds a catalog version only while it executes", "[sql][algebra][catalog]") {
   Fixture f;
   std::weak_ptr<const bytecask::sql::Catalog> seen = f.live->current();
   auto ps = params({std::int64_t{1}, bytes("a"), std::int64_t{5}});
-  SchemaRef sr{{}, {}, all_cols(f.cat()), {}, 0};
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, 0};
   auto ref = sr.get();
   bc_ctx_begin(f.cx, &ps, {});
   CHECK(seen.use_count() == 2);  // the live catalog and the context
@@ -338,7 +379,7 @@ TEST_CASE("plan API: a context holds a catalog version only while it executes", 
 TEST_CASE("plan API: a write committed across a DDL on its table is a conflict", "[sql][algebra][catalog]") {
   Fixture f;
   auto ps = params({std::int64_t{1}, bytes("a"), std::int64_t{5}});
-  SchemaRef sr{{}, {}, all_cols(f.cat()), {}, 0};
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, 0};
   auto ref = sr.get();
   // Begin and run on catalog v2, then a DDL on t commits before the plan
   // does: the plan wrote no entry for the new index, so it must not commit.
