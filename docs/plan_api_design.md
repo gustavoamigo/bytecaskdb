@@ -601,7 +601,7 @@ one for a change since the snapshot, so a concurrent writer of the same
 row, entry or range makes the commit a conflict without a guard. That
 includes a concurrent insert of the same primary key: `bc_insert` writes no
 `ensure_absent` for it, since a key absent in the snapshot and present at
-commit is a change (test: "plan API: a concurrent insert of the same key
+commit is a change (test: "plan writes: a concurrent insert of the same key
 conflicts with no absent guard"). The unique indexes need their range
 guards, because a concurrent duplicate is another row's entry, a key this
 plan never writes.

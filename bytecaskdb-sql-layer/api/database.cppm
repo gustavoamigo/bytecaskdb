@@ -3,9 +3,9 @@
 //
 // database.cppm — the embedded SQL API: open a directory, prepare a statement,
 // execute it with parameters, read the rows. Every DML statement is compiled
-// once to a plan, by TinyCC, and cached by its text; a plan the catalog has
-// moved past (docs/sql_layer_catalog_design.md, *Compatibility*) is
-// recompiled from that text before it runs.
+// once to a plan, by TinyCC, and cached by its text; a plan the runtime
+// refuses as incompatible with the catalog (docs/sql_layer_catalog_design.md,
+// *Compatibility*) is recompiled from that text and run again.
 //
 // Autocommit only: each execute is one plan through bc_execute, retried on a
 // conflict. One thread at a time.

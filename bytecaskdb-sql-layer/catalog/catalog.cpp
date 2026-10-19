@@ -745,13 +745,26 @@ auto Catalog::constants(const Table& t) -> std::vector<PlanConstant> {
   std::vector<PlanConstant> out;
   auto id = [](std::uint32_t v) { return std::to_string(v); };
   out.push_back({"TBL_" + id(t.id), t.id, t.name});
-  out.push_back({"LAY_" + id(t.layout_id), t.layout_id, t.name + " layout"});
   for (const auto& ix : t.indexes) out.push_back({"IDX_" + id(ix.id), ix.id, ix.name});
-  for (const auto& c : t.columns) {
-    const auto* slot = t.layout.find(c.id);
-    auto prefix = "COL_" + id(t.id) + "_" + id(c.id);
-    out.push_back({prefix + (is_fixed(c.type) ? "_OFF" : "_SLOT"), slot->pos, t.name + "." + c.name});
-    out.push_back({prefix + "_COL", c.id, t.name + "." + c.name});
+  for (const auto& c : t.columns) out.push_back({"COL_" + id(t.id) + "_" + id(c.id), c.id, t.name + "." + c.name});
+  // Key parts by position: a table's primary key, then each index's parts
+  // and the primary key after them. A column an index names and its primary
+  // key suffix repeats keeps its first position.
+  auto parts = [&](std::uint32_t key_id, const std::string& key_name, const std::vector<std::uint32_t>& cols) {
+    std::vector<std::uint32_t> seen;
+    for (std::size_t i = 0; i < cols.size(); ++i) {
+      if (std::ranges::find(seen, cols[i]) != seen.end()) continue;
+      seen.push_back(cols[i]);
+      out.push_back({"PART_" + id(key_id) + "_" + id(cols[i]), static_cast<std::uint32_t>(i),
+                     key_name + "." + t.column(cols[i])->name});
+    }
+  };
+  parts(t.id, t.name, t.pk_col_ids);
+  for (const auto& ix : t.indexes) {
+    std::vector<std::uint32_t> cols;
+    for (const auto& p : ix.parts) cols.push_back(p.col_id);
+    cols.insert(cols.end(), t.pk_col_ids.begin(), t.pk_col_ids.end());
+    parts(ix.id, ix.name, cols);
   }
   return out;
 }

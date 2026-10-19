@@ -56,27 +56,16 @@ auto schema_incompatibility(const Catalog& cat, const bc_schema_ref& ref) -> std
   for (auto id : ids(ref.objects_read, ref.n_read)) {
     if (cat.key_layout(id) == nullptr) return "table or index " + std::to_string(id) + " the plan reads no longer exists";
   }
-  auto maintained = ids(ref.indexes_written, ref.n_indexes_written);
-  for (auto id : maintained) {
-    const auto* kl = cat.key_layout(id);
-    if (kl == nullptr || kl->index == nullptr) return "index " + std::to_string(id) + " the plan maintains no longer exists";
-  }
   for (auto id : ids(ref.tables_written, ref.n_written)) {
-    const auto* t = cat.table(id);
-    if (t == nullptr) return "table " + std::to_string(id) + " the plan writes no longer exists";
-    for (const auto& ix : t->indexes) {
-      if (std::ranges::find(maintained, ix.id) == maintained.end()) {
-        return "the plan does not maintain index " + ix.name + " of table " + t->name;
-      }
-    }
+    if (cat.table(id) == nullptr) return "table " + std::to_string(id) + " the plan writes no longer exists";
   }
   for (const auto& c : std::span{ref.cols, ref.cols == nullptr ? 0 : ref.n_cols}) {
-    const auto* layout = cat.row_layout(c.layout);
-    if (layout == nullptr) return "layout " + std::to_string(c.layout) + " is no longer a table's current layout";
-    const auto* slot = layout->find(c.col);
-    if (slot == nullptr || slot->pos != c.pos || static_cast<std::uint8_t>(slot->type) != c.type) {
-      return "column " + std::to_string(c.col) + " of layout " + std::to_string(c.layout) +
-             " no longer has the position and type the plan was compiled with";
+    const auto* t = cat.table(c.table);
+    if (t == nullptr) return "table " + std::to_string(c.table) + " no longer exists";
+    const auto* slot = t->layout.find(c.col);
+    if (slot == nullptr || static_cast<std::uint8_t>(slot->type) != c.type) {
+      return "column " + std::to_string(c.col) + " of table " + t->name +
+             " no longer exists with the type the plan was compiled with";
     }
   }
   return std::nullopt;
@@ -117,6 +106,8 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_emit_bool", fn_addr(bc_emit_bool)},
       {"bc_emit_bytes", fn_addr(bc_emit_bytes)},
       {"bc_emit_null", fn_addr(bc_emit_null)},
+      {"bc_emit_col", fn_addr(bc_emit_col)},
+      {"bc_emit_key_part", fn_addr(bc_emit_key_part)},
       {"bc_emit_end", fn_addr(bc_emit_end)},
       {"bc_emit_count", fn_addr(bc_emit_count)},
       {"bc_add", fn_addr(bc_add)},
@@ -136,17 +127,16 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_key_bool", fn_addr(bc_key_bool)},
       {"bc_key_bytes", fn_addr(bc_key_bytes)},
       {"bc_key_null", fn_addr(bc_key_null)},
-      {"bc_key_pk", fn_addr(bc_key_pk)},
+      {"bc_key_param", fn_addr(bc_key_param)},
       {"bc_key_end", fn_addr(bc_key_end)},
+      {"bc_key_params", fn_addr(bc_key_params)},
       {"bc_key_successor", fn_addr(bc_key_successor)},
       {"bc_get", fn_addr(bc_get)},
-      {"bc_lookup", fn_addr(bc_lookup)},
       {"bc_exists", fn_addr(bc_exists)},
       {"bc_scan_open", fn_addr(bc_scan_open)},
       {"bc_scan_next", fn_addr(bc_scan_next)},
       {"bc_scan_key", fn_addr(bc_scan_key)},
-      {"bc_scan_value", fn_addr(bc_scan_value)},
-      {"bc_scan_pk", fn_addr(bc_scan_pk)},
+      {"bc_scan_row", fn_addr(bc_scan_row)},
       {"bc_scan_close", fn_addr(bc_scan_close)},
       {"bc_empty", fn_addr(bc_empty)},
       {"bc_key_part_i64", fn_addr(bc_key_part_i64)},
@@ -160,7 +150,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_col_f64", fn_addr(bc_col_f64)},
       {"bc_col_bool", fn_addr(bc_col_bool)},
       {"bc_col_bytes", fn_addr(bc_col_bytes)},
-      {"bc_row_pk", fn_addr(bc_row_pk)},
+      {"bc_row_key", fn_addr(bc_row_key)},
       {"bc_row_begin", fn_addr(bc_row_begin)},
       {"bc_row_from", fn_addr(bc_row_from)},
       {"bc_row_set_i64", fn_addr(bc_row_set_i64)},
@@ -168,6 +158,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_row_set_bool", fn_addr(bc_row_set_bool)},
       {"bc_row_set_bytes", fn_addr(bc_row_set_bytes)},
       {"bc_row_set_null", fn_addr(bc_row_set_null)},
+      {"bc_row_set_param", fn_addr(bc_row_set_param)},
       {"bc_row_end", fn_addr(bc_row_end)},
       {"bc_pin", fn_addr(bc_pin)},
       {"bc_sorter_open", fn_addr(bc_sorter_open)},
@@ -189,8 +180,9 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_agg_next", fn_addr(bc_agg_next)},
       {"bc_agg_i64", fn_addr(bc_agg_i64)},
       {"bc_agg_f64", fn_addr(bc_agg_f64)},
-      {"bc_put", fn_addr(bc_put)},
-      {"bc_del", fn_addr(bc_del)},
+      {"bc_insert", fn_addr(bc_insert)},
+      {"bc_update", fn_addr(bc_update)},
+      {"bc_delete", fn_addr(bc_delete)},
       {"bc_del_range", fn_addr(bc_del_range)},
       {"bc_guard_unchanged", fn_addr(bc_guard_unchanged)},
       {"bc_guard_range", fn_addr(bc_guard_range)},

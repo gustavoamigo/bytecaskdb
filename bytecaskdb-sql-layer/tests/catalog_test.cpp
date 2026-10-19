@@ -217,7 +217,7 @@ TEST_CASE("catalog: any name is accepted; plan constants come from ids and never
   (void)live.apply(CreateTableDdl{"a-b c", {col("my col", SqlKind::BigInt, false), col("x*/y", SqlKind::BigInt)},
                                   {"my col"}});
   // Table idx with column foo, and an index foo_col: by name both would be
-  // IDX_FOO_COL; by id they are COL_<t>_<c>_COL and IDX_<i>.
+  // IDX_FOO_COL; by id they are COL_<t>_<c> and IDX_<i>.
   (void)live.apply(CreateTableDdl{"idx", {col("foo", SqlKind::BigInt, false), col("v", SqlKind::BigInt)}, {"foo"}});
   (void)live.apply(CreateIndexDdl{"foo_col", "idx", {{"v"}}});
   auto cat = live.current();
@@ -604,10 +604,15 @@ TEST_CASE("catalog: the constants block a plan needs", "[sql][catalog]") {
   const auto& t = *cat->table("t");
   auto cs = Catalog::constants(t);
   CHECK(constant(cs, "TBL_1") == 1);
-  CHECK(constant(cs, "LAY_2") == 2);
   CHECK(constant(cs, "IDX_3") == 3);
-  CHECK(constant(cs, "COL_1_0_OFF") == t.layout.find(0)->pos);
-  CHECK(constant(cs, "COL_1_2_OFF") == t.layout.find(2)->pos);
-  CHECK(constant(cs, "COL_1_1_SLOT") == 0);
-  CHECK(constant(cs, "COL_1_1_COL") == 1);
+  // A column is named by its permanent id: no position, so no layout
+  // generation, reaches a plan.
+  CHECK(constant(cs, "COL_1_0") == 0);
+  CHECK(constant(cs, "COL_1_1") == 1);
+  CHECK(constant(cs, "COL_1_2") == 2);
+  CHECK(std::ranges::none_of(cs, [](const auto& c) { return c.name.starts_with("LAY_"); }));
+  // Key parts by position: t's key is (id); t_by_name's is (name, id).
+  CHECK(constant(cs, "PART_1_0") == 0);
+  CHECK(constant(cs, "PART_3_1") == 0);
+  CHECK(constant(cs, "PART_3_0") == 1);
 }

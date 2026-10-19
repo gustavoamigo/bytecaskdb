@@ -98,3 +98,12 @@ target("sql_layer_tests")
         add_files("plans/" .. name .. ".c", {defines = "plan=plan_" .. name,
                   cflags = "-Wno-declaration-after-statement"})
     end
+
+-- Micro-benchmarks of the plan API's fixed costs (bench/sql_layer_bench.cpp).
+-- Not built by default and not run in CI; build in release mode.
+target("sql_layer_bench")
+    set_kind("binary")
+    set_default(false)
+    add_deps("sql_layer")
+    add_rules("bytecask.native_flags")
+    add_files("bench/*.cpp")

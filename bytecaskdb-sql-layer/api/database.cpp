@@ -103,12 +103,19 @@ void Database::compile(Statement& s) {
   auto layout = make_result_layout(plan->result_types);
   auto code = TccPlan::compile(plan->source);
   std::vector<bc_col_ref> col_refs;
-  for (const auto& c : plan->columns) col_refs.push_back({c.layout, c.col, c.pos, static_cast<std::uint8_t>(c.type)});
+  for (const auto& c : plan->columns) col_refs.push_back({c.table, c.col, static_cast<std::uint8_t>(c.type)});
   auto n = [](const auto& v) { return narrow<std::uint32_t>(v.size()); };
   const auto& p = *plan;
-  bc_schema_ref ref{p.catalog_version,       p.objects_read.data(), n(p.objects_read),   p.tables_written.data(),
-                    n(p.tables_written),     p.indexes_written.data(), n(p.indexes_written), col_refs.data(),
-                    n(col_refs),             codes.data(),          n(codes)};
+  bc_schema_ref ref{p.id,
+                    p.catalog_version,
+                    p.objects_read.data(),
+                    n(p.objects_read),
+                    p.tables_written.data(),
+                    n(p.tables_written),
+                    col_refs.data(),
+                    n(col_refs),
+                    codes.data(),
+                    n(codes)};
   // Moves keep every buffer ref points into.
   if (std::holds_alternative<bound::Select>(bound.stmt)) s.columns_ = std::move(columns);
   s.plan_ = std::move(plan);
@@ -140,15 +147,6 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
     out.affected = 0;
     return out;
   }
-  // A plan the catalog has moved past is recompiled from its text; one a
-  // DDL left compatible keeps running.
-  // The walk runs only when the catalog has moved since the compile: an
-  // unchanged version is one compare. bc_ctx_run checks in full regardless.
-  if (auto cat = live_->current();
-      stmt.ref_.catalog_version != cat->version() && schema_incompatibility(*cat, stmt.ref_)) {
-    compile(stmt);
-  }
-
   const auto& types = stmt.plan_->param_types;
   if (params.size() != types.size()) {
     throw std::invalid_argument("statement takes " + std::to_string(types.size()) + " parameters, got " +
@@ -158,8 +156,17 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
     if (!matches(params[i], types[i])) throw std::invalid_argument("parameter $" + std::to_string(i + 1) + " has the wrong type");
   }
   bc_params bp{params};
-  const auto& p = *stmt.plan_;
   auto r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
+  // bc_ctx_run checks the plan against the catalog it pinned. A plan a DDL
+  // made incompatible is recompiled from its text and run once more; one a
+  // DDL left compatible keeps running, unchecked here. Asking the catalog
+  // only after a BC_E_LAYOUT tells the check's refusal from a row's.
+  if (r == BC_FAILED && bc_error(cx_) == BC_E_LAYOUT && schema_incompatibility(*live_->current(), stmt.ref_)) {
+    bc_ctx_reset(cx_);
+    compile(stmt);
+    r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
+  }
+  const auto& p = *stmt.plan_;
   if (r == BC_CONFLICT) {
     bc_ctx_reset(cx_);
     throw ExecError("conflict: a guard failed on every attempt", BC_CONFLICT);
