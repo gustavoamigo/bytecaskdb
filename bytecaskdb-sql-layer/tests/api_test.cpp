@@ -147,11 +147,17 @@ TEST_CASE("embedded API: a plan the catalog refuses is recompiled and run again"
   CHECK(db->compilations() == compiled + 3);
 
   // The parameters are checked against the recompiled plan: qty is now
-  // bytes, so an integer for it is refused before the plan runs.
+  // bytes. Parameters of the new types are taken at once, though the stale
+  // plan would have refused them; old-typed ones are refused before the run.
   (void)db->execute("DROP TABLE t");
   (void)db->execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name BYTEA, qty BYTEA)");
-  CHECK_THROWS_AS(db->execute(insert, {i(4), bytes("date"), i(40)}), std::invalid_argument);
   CHECK(db->execute(insert, {i(4), bytes("date"), bytes("forty")}).affected == 1);
+  CHECK_THROWS_AS(db->execute(insert, {i(5), bytes("elder"), i(50)}), std::invalid_argument);
+  (void)db->execute("DROP TABLE t");
+  (void)db->execute(kCreateTable);
+  CHECK_THROWS_AS(db->execute(insert, {i(6), bytes("fig"), bytes("sixty")}), std::invalid_argument);
+  CHECK(db->execute(insert, {i(6), bytes("fig"), i(60)}).affected == 1);
+  CHECK(db->execute(by_id, {i(6)}).rows == Grid{{i(6), i(60)}});
 }
 
 TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[sql][api][catalog]") {

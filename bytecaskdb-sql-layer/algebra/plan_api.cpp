@@ -220,6 +220,7 @@ struct bc_ctx {
   // would derive its index entries from the snapshot's row again, not from
   // the first write's, and leave the first write's entries behind.
   std::vector<Bytes> written_rows;
+  std::vector<std::pair<Bytes, Bytes>> deleted_ranges;  // [lo, hi) of each bc_del_range, likewise
 
   // References verified by bc_ctx_run, kept across executions, by id. A
   // context is bound to one database, and a catalog version is never reused
@@ -424,6 +425,7 @@ struct bc_ctx {
     pinned.reset();  // an idle context keeps no superseded catalog alive
     effects.clear();
     written_rows.clear();
+    deleted_ranges.clear();
     results.clear();
     result_pos = 0;
     emit.reset();
@@ -864,8 +866,14 @@ auto write_row(bc_ctx* cx, const Table& t, bc_view row, bool stored) -> std::opt
 
 // Records a row key this execution writes; a second write of it is a plan
 // bug (BC_E_HANDLE). Linear: a plan writes few rows.
+auto in_range(BytesView k, BytesView lo, BytesView hi) -> bool {
+  return !std::is_lt(bytes_cmp(k, lo)) && std::is_lt(bytes_cmp(k, hi));
+}
+
 auto first_write(bc_ctx* cx, const Table& t, BytesView pk) -> bool {
-  if (std::ranges::any_of(cx->written_rows, [&](const Bytes& k) { return std::ranges::equal(k, pk); })) {
+  // A range delete counts as a write of every row in its range.
+  if (std::ranges::any_of(cx->written_rows, [&](const Bytes& k) { return std::ranges::equal(k, pk); }) ||
+      std::ranges::any_of(cx->deleted_ranges, [&](const auto& r) { return in_range(pk, r.first, r.second); })) {
     cx->fail(BC_E_HANDLE, "a row of table " + t.name + " written twice in one plan");
     return false;
   }
@@ -1908,6 +1916,13 @@ void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
     return;
   }
   if (std::is_gteq(bytes_cmp(range->lo, range->hi))) return;  // an empty range deletes nothing
+  // Its entries come from the snapshot's rows, so a row this plan already
+  // wrote in the range would keep its new entries; refused, as a second write.
+  if (std::ranges::any_of(cx->written_rows, [&](const Bytes& k) { return in_range(k, range->lo, range->hi); })) {
+    cx->fail(BC_E_HANDLE, "bc_del_range over a row of table " + t->name + " this plan already wrote");
+    return;
+  }
+  cx->deleted_ranges.emplace_back(range->lo, range->hi);
   if (!t->indexes.empty()) {
     // Each row in the range takes its entries with it. A row inserted into
     // the range after the snapshot makes the commit a conflict: the engine

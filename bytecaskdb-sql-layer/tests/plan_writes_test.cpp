@@ -479,6 +479,24 @@ void move_then_insert(bc_ctx* cx) {
   bc_row_set_param(cx, n, kC, 2);
   bc_insert(cx, kW, bc_row_end(cx, n));
 }
+// A range delete mixed with row writes on one table, in both orders.
+void insert_then_del_range(bc_ctx* cx) {
+  insert_w(cx);
+  bc_del_range(cx, kW, bc_empty(cx), bc_empty(cx));
+}
+void del_range_then_update(bc_ctx* cx) {
+  bool found = false;
+  bc_view old = bc_get(cx, bc_key_params(cx, kW, 0, 1), &found);
+  bc_del_range(cx, kW, bc_empty(cx), bc_empty(cx));
+  bc_row r = bc_row_from(cx, kW, old);
+  bc_row_set_param(cx, r, kA, 1);
+  bc_update(cx, kW, old, bc_row_end(cx, r));
+}
+// A range delete, then an insert outside its range: allowed.
+void del_range_then_insert_outside(bc_ctx* cx) {
+  bc_del_range(cx, kW, bc_empty(cx), bc_key_params(cx, kW, 4, 1));
+  insert_w(cx);
+}
 // Reads each t_by_name entry's row twice.
 void fetch_twice(bc_ctx* cx) {
   bc_cursor c = bc_scan_open(cx, 3, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
@@ -507,7 +525,17 @@ TEST_CASE("plan writes: a second write of one row in one plan is refused", "[sql
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
   CHECK(run(f, move_then_insert, {std::int64_t{1}, std::int64_t{5}, std::int64_t{0}}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  // A range delete is a write of every row in its range.
+  CHECK(run(f, insert_then_del_range, {std::int64_t{2}, std::int64_t{2}, bytes("y"), std::int64_t{0}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(run(f, del_range_then_update, {std::int64_t{1}, std::int64_t{7}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
   // Nothing of any of them committed.
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 1);
+  check_indexes_exact(f);
+  // Outside the range, the two mix: row 1 goes, row 9 comes, every index exact.
+  CHECK(run(f, del_range_then_insert_outside,
+            {std::int64_t{9}, std::int64_t{9}, bytes("z"), std::int64_t{0}, std::int64_t{5}}) == BC_COMMITTED);
   CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 1);
   check_indexes_exact(f);
 }

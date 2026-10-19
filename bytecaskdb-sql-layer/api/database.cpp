@@ -149,18 +149,22 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   }
   // Throws std::invalid_argument for parameters the statement's current plan
   // does not take: checked again after a recompile, whose plan may differ.
-  auto check_params = [&] {
+  auto mismatch = [&]() -> std::string {
     const auto& types = stmt.plan_->param_types;
     if (params.size() != types.size()) {
-      throw std::invalid_argument("statement takes " + std::to_string(types.size()) + " parameters, got " +
-                                  std::to_string(params.size()));
+      return "statement takes " + std::to_string(types.size()) + " parameters, got " + std::to_string(params.size());
     }
     for (std::size_t i = 0; i < params.size(); ++i) {
-      if (!matches(params[i], types[i])) {
-        throw std::invalid_argument("parameter $" + std::to_string(i + 1) + " has the wrong type");
-      }
+      if (!matches(params[i], types[i])) return "parameter $" + std::to_string(i + 1) + " has the wrong type";
     }
+    return {};
   };
+  auto check_params = [&] {
+    if (auto why = mismatch(); !why.empty()) throw std::invalid_argument(why);
+  };
+  // Parameters that do not fit a plan a DDL has made incompatible may fit
+  // its recompile: only on that path is the catalog asked, before the run.
+  if (!mismatch().empty() && schema_incompatibility(*live_->current(), stmt.ref_)) compile(stmt);
   check_params();
   bc_params bp{params};
   auto r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);

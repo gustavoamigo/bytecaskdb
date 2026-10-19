@@ -605,7 +605,9 @@ void    bc_del_range(bc_ctx *, uint32_t table, bc_view lo, bc_view hi);
 `bc_scan_row`: the entries removed are derived from it, so a row the plan
 built would remove entries the snapshot does not hold and leave its real
 ones behind. Anything else is `BC_E_HANDLE`, and so is a second write of a
-row key this plan already wrote, for the same reason. A row of another table, or a
+row key this plan already wrote, for the same reason. A `bc_del_range` is a
+write of every row in its range: it is refused over a row the plan already
+wrote, and a later write of a row in its range is refused. A row of another table, or a
 `row` of another layout generation, is `BC_E_LAYOUT`.
 
 Every key a write touches is in the write plan, and the engine checks each
@@ -1079,7 +1081,9 @@ them.
   version is a hash lookup and a compare instead of a walk of the catalog
   and an allocation per run. `BC_E_LAYOUT` gains a detail,
   `BC_L_INCOMPATIBLE` for the check's refusal, so the embedded API no longer
-  checks a cached plan itself: it recompiles exactly when `bc_ctx_run`
-  refuses one, and checks the parameters again against the new plan.
+  checks a compatible plan itself: it recompiles exactly when `bc_ctx_run`
+  refuses one, or before the run when the parameters do not fit the cached
+  plan and the catalog has made it incompatible, and checks the parameters
+  against the plan that runs.
 - The compiler emits covering reads: a range plan whose result columns are
   all in the index key reads no row.
