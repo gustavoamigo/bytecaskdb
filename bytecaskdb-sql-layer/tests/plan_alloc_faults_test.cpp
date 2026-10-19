@@ -7,7 +7,9 @@
 // context's sticky error, BC_E_MEMORY, never as an exception out of the
 // call. A real plan is TinyCC code without unwind tables, where an
 // exception terminates the process; these plans are C++, so an escape
-// shows here as a throw out of bc_ctx_run.
+// shows here as a throw out of bc_ctx_run. A commit whose allocations
+// fail never reports BC_COMMITTED with an error set, and a verification
+// that fails part-way leaves its cache entry to be rebuilt whole.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -103,10 +105,22 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
     std::vector<bc_value> params;
     std::vector<PhysType> result;
     int clean;  // the error of a run no allocation failure reached
+    // One reference for every run: a verification failed part-way leaves
+    // its cache entry, and the next run must rebuild it whole. Otherwise a
+    // fresh reference each run, so every run verifies.
+    bool reuse_ref{false};
+    std::vector<std::vector<bc_value>> rows{};  // a clean run's result rows, when checked
   };
   const std::vector<Case> cases{
       {"insert", insert_row, {std::int64_t{9}, bytes("nine"), std::int64_t{90}}, {}, BC_OK},
       {"bc_emit_col", emit_row, {std::int64_t{2}}, {PhysType::I64, PhysType::Bytes, PhysType::I64}, BC_OK},
+      {"bc_emit_col, one reference",
+       emit_row,
+       {std::int64_t{2}},
+       {PhysType::I64, PhysType::Bytes, PhysType::I64},
+       BC_OK,
+       true,
+       {{std::int64_t{2}, bytes("n2"), std::int64_t{20}}}},
       {"bc_emit_key_part", emit_names, {}, {PhysType::Bytes}, BC_OK},
       {"update", bump_qty, {std::int64_t{3}}, {}, BC_OK},
       {"bc_row_set_param NULL", null_id_param, {bc_value{}}, {}, BC_E_CONSTRAINT},
@@ -116,6 +130,9 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
   for (const auto& c : cases) {
     INFO(c.name);
     auto failed = 0;
+    SchemaRef kept{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), type_codes(c.result),
+                   f.cat().version()};
+    auto kept_ref = kept.get();
     for (long nth = 1;; ++nth) {
       REQUIRE(nth < 100000);
       // Built outside the count: a fresh reference id each time, so the run
@@ -123,7 +140,7 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
       auto ps = params(c.params);
       SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), type_codes(c.result),
                    f.cat().version()};
-      auto ref = sr.get();
+      auto ref = c.reuse_ref ? kept_ref : sr.get();
       bc_ctx_begin(f.cx, &ps, {});
       auto threw = false;
       bytecask::testing::AllocFaultReport report;
@@ -139,14 +156,62 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
       INFO("allocation " << nth);
       CHECK_FALSE(threw);
       auto error = static_cast<int>(bc_error(f.cx));
-      bc_ctx_reset(f.cx);  // nothing is committed: the engine is never asked to write
       if (!report.fired) {
         CHECK(error == c.clean);
+        if (!c.rows.empty()) CHECK(f.results(c.result) == c.rows);
+        bc_ctx_reset(f.cx);
         break;
       }
+      bc_ctx_reset(f.cx);  // nothing is committed: the engine is never asked to write
       CHECK((error == BC_E_MEMORY || error == c.clean));
       ++failed;
     }
     CHECK(failed > 0);  // the plan allocates, and each allocation was failed once
   }
+}
+
+TEST_CASE("plan API: a commit whose allocations fail is never BC_COMMITTED with an error set",
+          "[sql][algebra][alloc]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("operator new is the sanitizer's in this build");
+  Fixture f;
+  auto failed = 0;
+  for (long nth = 1;; ++nth) {
+    REQUIRE(nth < 100000);
+    auto ps = params({std::int64_t{1000} + nth, bytes("x"), std::int64_t{1}});
+    SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+    auto ref = sr.get();
+    bc_ctx_begin(f.cx, &ps, {});
+    bc_ctx_run(f.cx, insert_row, &ref);
+    REQUIRE(bc_error(f.cx) == BC_OK);
+    auto threw = false;
+    auto r = BC_FAILED;
+    bytecask::testing::AllocFaultReport report;
+    {
+      // The engine leaks a key directory node it cannot place for want of
+      // memory rather than free one still reachable (#390).
+      bytecask::testing::ExpectedLeaks leaks;
+      bytecask::testing::ScopedAllocFaults faults{nth, false};
+      try {
+        r = bc_ctx_commit(f.cx, false);
+      } catch (...) {
+        threw = true;
+      }
+      report = faults.report();
+    }
+    INFO("allocation " << nth);
+    CHECK_FALSE(threw);
+    auto error = bc_error(f.cx);
+    // The one contract: success is BC_OK and BC_COMMITTED together.
+    CHECK((r == BC_COMMITTED) == (error == BC_OK));
+    bc_ctx_reset(f.cx);
+    // A write that reached the data file before an allocation failed leaves
+    // the engine refusing writes until resume().
+    if (f.db->is_degraded()) f.db->resume();
+    if (!report.fired) {
+      CHECK(r == BC_COMMITTED);
+      break;
+    }
+    ++failed;
+  }
+  CHECK(failed > 0);
 }

@@ -153,6 +153,11 @@ TEST_CASE("embedded API: a plan the catalog refuses is recompiled and run again"
     CHECK_THROWS_AS(db->execute(insert, {i(9), bytes("x"), bytes("y")}), std::invalid_argument);
   }
   CHECK(db->compilations() == compiled + 3);
+  // A DDL that leaves the plan compatible moves the version: the runtime is
+  // asked, says the plan fits, and the parameters are refused uncompiled.
+  (void)db->execute("CREATE TABLE elsewhere (k BIGINT PRIMARY KEY)");
+  CHECK_THROWS_AS(db->execute(insert, {i(9), bytes("x"), bytes("y")}), std::invalid_argument);
+  CHECK(db->compilations() == compiled + 3);
   CHECK(db->execute(insert, {i(9), bytes("x"), i(90)}).affected == 1);
   CHECK(db->compilations() == compiled + 3);
 

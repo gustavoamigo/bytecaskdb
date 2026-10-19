@@ -372,6 +372,16 @@ void insert_one(bc_ctx* cx) {
   bc_row_set_param(cx, r, kIdCol, 0);
   bc_insert(cx, kTbl, bc_row_end(cx, r));
 }
+// Every row of t through t_by_name: an index cursor handing out table rows.
+void rows_through_index(bc_ctx* cx) {
+  bc_cursor c = bc_scan_open(cx, kIdx, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  int64_t n = 0;
+  while (bc_scan_next(cx, c)) {
+    (void)bc_scan_row(cx, c);
+    n = bc_add(cx, n, 1);
+  }
+  bc_emit_count(cx, n);
+}
 }  // namespace
 
 TEST_CASE("plan API: a plan names only the objects its reference declares", "[sql][algebra][catalog]") {
@@ -395,6 +405,22 @@ TEST_CASE("plan API: a plan names only the objects its reference declares", "[sq
   SchemaRef writes{{}, {kTbl}, {id_col}, {}, 0};
   auto r3 = writes.get();
   CHECK(bc_execute(f.cx, insert_one, &r3, &one, {}, false, 0) == BC_COMMITTED);
+  // bc_scan_row on an index cursor hands out the table's rows: a reference
+  // that declares only the index cannot read them.
+  SchemaRef index_only{{kIdx}, {}, {}, {}, 0};
+  auto r4 = index_only.get();
+  CHECK(bc_execute(f.cx, rows_through_index, &r4, &none, {}, false, 0) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  SchemaRef index_and_table{{kIdx, kTbl}, {}, {}, {}, 0};
+  auto r5 = index_and_table.get();
+  CHECK(bc_execute(f.cx, rows_through_index, &r5, &none, {}, false, 0) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == 1);
+  // A column of a table the reference does not name is a malformed reference.
+  SchemaRef stray_col{{kIdx}, {}, {id_col}, {}, 0};
+  auto r6 = stray_col.get();
+  CHECK(bc_execute(f.cx, scan_index, &r6, &none, {}, false, 0) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
   // The table dropped and created again under its name: a new id, so the
   // reference that declares the old one is incompatible, a recompilable
   // refusal.

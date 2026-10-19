@@ -253,6 +253,8 @@ TEST_CASE("plan API: a raised constraint error is final: no retry, nothing commi
   CHECK(run(f, raise_then_write, {}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
   CHECK(bc_error_detail(f.cx) == ((std::uint32_t{BC_C_NOT_NULL} << 24) | 7u));
+  // The id of a not-null violation is its table's (column ids are per table).
+  CHECK(std::string{bc_error_message(f.cx)} == "null value violates a not-null constraint of table 7");
   Bytes key, out;
   bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
   bytecask::sql::key_put_i64(key, 99, {PhysType::I64});
@@ -655,11 +657,15 @@ TEST_CASE("plan API: bc_row_key rebuilds the scan key and bc_pin outlives the st
 TEST_CASE("plan API: result rows follow the schema ref's types; limits and types are checked", "[sql][algebra]") {
   Fixture f;
   auto ps = params({});
+  // A plan runs against a reference: none at all is a plan bug.
   bc_ctx_begin(f.cx, &ps, {});
   bc_ctx_run(f.cx, emit_without_types, nullptr);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  bc_ctx_reset(f.cx);
+  // One that declares no result types: the plan emits against nothing.
+  CHECK(run(f, emit_without_types, {}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
   CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
-  bc_ctx_reset(f.cx);
   // Every result-row misuse is the plan's: BC_L_PLAN, not a row error.
   for (auto* plan : {emit_wrong_type, emit_too_few, emit_begun_twice, emit_not_ended}) {
     CHECK(run(f, plan, {}, kI64Row) == BC_FAILED);
@@ -795,7 +801,9 @@ TEST_CASE("plan API: a charge of several units does not step over the deadline c
   for (std::int64_t i = 1; i <= 30; ++i) REQUIRE(run(f, insert_t, {i, bytes("n"), i}) == BC_COMMITTED);
   auto ps = params({});
   // No read budget, and a deadline long past: the first check must fail.
-  CHECK(bc_execute(f.cx, step_by_five, nullptr, &ps, {.max_reads = 0, .deadline_ns = 1}, false, 0) == BC_FAILED);
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+  auto ref = sr.get();
+  CHECK(bc_execute(f.cx, step_by_five, &ref, &ps, {.max_reads = 0, .deadline_ns = 1}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_BUDGET);
   CHECK(std::string{bc_error_message(f.cx)}.find("deadline") != std::string::npos);
 }

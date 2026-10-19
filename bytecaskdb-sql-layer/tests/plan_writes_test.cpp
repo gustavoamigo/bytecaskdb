@@ -377,7 +377,7 @@ TEST_CASE("plan writes: an index created after the plan was compiled is maintain
   Fixture f;
   create_w(f);
   // The reference is built before the index exists, and names no index.
-  SchemaRef sr{{}, {kW}, all_cols(f.cat()), {}, f.cat().version()};
+  SchemaRef sr{{}, {kW}, table_cols(f.cat(), kW), {}, f.cat().version()};
   auto ref = sr.get();
   auto exec = [&](bc_plan_fn plan, std::vector<bc_value> p) {
     auto ps = params(std::move(p));

@@ -84,7 +84,7 @@ auto constraint_message(std::uint32_t detail) -> std::string {
   auto object = std::to_string(detail & 0x00FF'FFFFu);
   switch (detail >> 24) {
     case BC_C_UNIQUE: return "duplicate key value violates unique constraint of object " + object;
-    case BC_C_NOT_NULL: return "null value violates not-null constraint of column " + object;
+    case BC_C_NOT_NULL: return "null value violates a not-null constraint of table " + object;
     case BC_C_CHECK: return "check constraint " + object + " violated";
     case BC_C_FOREIGN_KEY: return "foreign key constraint " + object + " violated";
     case BC_C_RANGE: return "value out of range for column " + object;

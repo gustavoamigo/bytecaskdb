@@ -300,7 +300,6 @@ struct bc_ctx {
   Verified scratch;
   const Verified* current{nullptr};  // this execution's reference; nullptr: none
   const TableCols* last_table{nullptr};  // of current: the table declared() found last
-  KeySlots unreferenced_keys{};           // key_slots for a run without a reference
 
   // Results: rows in the row format of the plan's result_types, each
   // preceded by its u32 length.
@@ -335,8 +334,11 @@ struct bc_ctx {
     try {
       fail_classified();
     } catch (...) {
-      if (error == BC_OK) error = BC_E_MEMORY;
-      message.clear();
+      // An error already set keeps its message.
+      if (error == BC_OK) {
+        error = BC_E_MEMORY;
+        message.clear();
+      }
     }
   }
 
@@ -478,10 +480,13 @@ struct bc_ctx {
 
   // Whether the plan's reference names table or index `id` (and, for
   // `write`, lists it among the tables written), as it must for every object
-  // a plan names, so the compatibility check covers each one. A run without
-  // a reference is unchecked: it can name no column, only keys.
+  // a plan names, so the compatibility check covers each one. Outside a
+  // run there is no reference, and nothing is declared.
   auto declared_object(std::uint32_t id, bool write) -> bool {
-    if (current == nullptr) return true;
+    if (current == nullptr) {
+      fail(BC_E_HANDLE, "no plan is running: bc_ctx_run sets the schema ref every object is checked against");
+      return false;
+    }
     const auto& list = write ? current->written : current->objects;
     if (std::ranges::binary_search(list, id)) return true;
     fail(BC_E_HANDLE, std::string{write ? "table " : "table or index "} + std::to_string(id) +
@@ -535,6 +540,8 @@ struct bc_ctx {
     effects.clear();
     written_rows.clear();
     deleted_ranges.clear();
+    current = nullptr;  // set by the next run's reference
+    last_table = nullptr;
     key_parts.view = {};  // view handles repeat across executions once the epoch wraps
     key_parts.at.clear();
     results.clear();
@@ -815,24 +822,24 @@ auto written_tables(const bc_ctx* cx) -> std::vector<std::uint32_t> {
 struct RefArrays {
   std::span<const std::uint32_t> read, written;
   std::span<const bc_col_ref> cols;
+  std::span<const std::uint8_t> result_types;
 };
 
 auto ref_arrays(const bc_schema_ref& r) -> RefArrays {
   auto span = [](const auto* p, std::uint32_t n) { return std::span{p, p == nullptr ? 0 : n}; };
-  return {span(r.objects_read, r.n_read), span(r.tables_written, r.n_written), span(r.cols, r.n_cols)};
+  return {span(r.objects_read, r.n_read), span(r.tables_written, r.n_written), span(r.cols, r.n_cols),
+          span(r.result_types, r.n_result)};
 }
 
 // Whether `ref` holds what `e` was verified from: its ids, columns and
 // result types, compared by value, never by address.
 auto same_contents(const Verified& e, const bc_schema_ref& ref) -> bool {
-  auto [read, written, cols] = ref_arrays(ref);
+  auto [read, written, cols, codes] = ref_arrays(ref);
   auto same_col = [](const bc_col_ref& a, const bc_col_ref& b) {
     return a.table == b.table && a.col == b.col && a.type == b.type;
   };
   return std::ranges::equal(read, e.read_ids) && std::ranges::equal(written, e.written_ids) &&
-         std::ranges::equal(cols, e.col_refs, same_col) &&
-         std::ranges::equal(std::span{ref.result_types, ref.result_types == nullptr ? 0 : ref.n_result},
-                            e.result_codes);
+         std::ranges::equal(cols, e.col_refs, same_col) && std::ranges::equal(codes, e.result_codes);
 }
 
 auto key_slots_of(const Table& t) -> KeySlots {
@@ -845,16 +852,17 @@ auto key_slots_of(const Table& t) -> KeySlots {
   return k;
 }
 
-// The key slots of table `t`, which the run writes: the verified
-// reference's, or, for a run without one, built here.
-auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots& {
+// The key slots of table `t`, which the run writes, from the verified
+// reference. cx->table(id, true) found `t` among the tables written, so
+// the reference has them; nullptr and BC_E_HANDLE otherwise.
+auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots* {
   if (cx->current != nullptr) {
     const auto& all = cx->current->key_slots;
     auto it = std::ranges::lower_bound(all, t.id, {}, &KeySlots::table);
-    if (it != all.end() && it->table == t.id) return *it;
+    if (it != all.end() && it->table == t.id) return &*it;
   }
-  cx->unreferenced_keys = key_slots_of(t);
-  return cx->unreferenced_keys;
+  cx->fail(BC_E_HANDLE, "table " + t.name + " is not among the tables the plan's schema ref writes");
+  return nullptr;
 }
 
 // Builds `e` for `ref` on the pinned version: the compatibility check, the
@@ -867,8 +875,10 @@ auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots& {
                                     " is incompatible with v" + std::to_string(cx->cat->version()) + ": " + *why);
     return false;
   }
-  auto codes = std::span{ref->result_types, ref->result_types == nullptr ? 0 : ref->n_result};
+  auto [read, written, cols, codes] = ref_arrays(*ref);
   if (!e.result_layout || !std::ranges::equal(codes, e.result_codes)) {
+    // Built aside and committed by moves, which cannot throw: a failure
+    // leaves the entry's result layout, codes and types as they were.
     std::vector<PhysType> types;
     for (auto code : codes) {
       auto t = phys_type(code);
@@ -878,17 +888,19 @@ auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots& {
       }
       types.push_back(*t);
     }
+    std::optional<RowLayout> layout;
     try {
-      e.result_layout.emplace(bytecask::sql::make_result_layout(types));
+      layout.emplace(bytecask::sql::make_result_layout(types));
     } catch (const std::length_error&) {
-      e.result_layout.reset();
       cx->fail(BC_L_PLAN, "the plan's result row has too many columns for one row layout");
       return false;
     }
-    e.result_codes.assign(codes.begin(), codes.end());
+    std::vector<std::uint8_t> new_codes(codes.begin(), codes.end());
+    static_assert(std::is_nothrow_move_assignable_v<std::optional<RowLayout>>);
+    e.result_layout = std::move(layout);
+    e.result_codes = std::move(new_codes);
     e.result_types = std::move(types);
   }
-  auto [read, written, cols] = ref_arrays(*ref);
   e.read_ids.assign(read.begin(), read.end());
   e.written_ids.assign(written.begin(), written.end());
   e.col_refs.assign(cols.begin(), cols.end());
@@ -903,6 +915,13 @@ auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots& {
   sorted(e.objects);
   e.tables.clear();
   for (const auto& c : cols) {
+    // A column's table is one the reference names, so every row a plan
+    // reads or writes is of an object the compatibility check covers.
+    if (!std::ranges::binary_search(e.objects, c.table)) {
+      cx->fail(BC_L_PLAN, "column " + std::to_string(c.col) + " of table " + std::to_string(c.table) +
+                              ", which the plan's schema ref does not name");
+      return false;
+    }
     const auto* t = cx->cat->table(c.table);  // the check above found it
     const auto* slot = t->layout.find(c.col);
     auto it = std::ranges::lower_bound(e.tables, c.table, {}, &TableCols::table);
@@ -960,9 +979,8 @@ auto issued_ref_ids() -> std::atomic<std::uint64_t>& {
 // verified it against the pinned version before, verified otherwise.
 [[nodiscard]] auto use_ref(bc_ctx* cx, const bc_schema_ref* ref) -> bool {
   if (ref == nullptr) {
-    cx->current = nullptr;
-    cx->last_table = nullptr;
-    return true;
+    cx->fail(BC_E_HANDLE, "a plan runs against a bc_schema_ref: none was given");
+    return false;
   }
   // An id the runtime never issued is no id: verified on every run.
   auto id = ref->id <= issued_ref_ids().load(std::memory_order_relaxed) ? ref->id : 0;
@@ -1291,34 +1309,29 @@ enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
     cx->fail(BC_E_HANDLE, "bc_ctx_commit without a run to commit");
     return BC_FAILED;
   }
-  try {
-    cx->cursors.clear();
-    bytecask::WritePlan plan{std::move(*cx->snap)};
-    cx->snap.reset();
-    for (const auto& e : cx->effects) {
-      switch (e.kind) {
-        case EffectKind::Put: plan.put(e.a, e.b); break;
-        case EffectKind::Del: plan.del(e.a); break;
-        case EffectKind::DelRange: plan.del_range(e.a, e.b); break;
-        case EffectKind::GuardUnchanged: plan.ensure_unchanged(e.a); break;
-        case EffectKind::GuardRange: plan.ensure_range_unchanged(e.a, e.b); break;
-        case EffectKind::GuardPresent: plan.ensure_present(e.a); break;
-        case EffectKind::GuardAbsent: plan.ensure_absent(e.a); break;
-      }
+  cx->cursors.clear();
+  bytecask::WritePlan plan{std::move(*cx->snap)};
+  cx->snap.reset();
+  for (const auto& e : cx->effects) {
+    switch (e.kind) {
+      case EffectKind::Put: plan.put(e.a, e.b); break;
+      case EffectKind::Del: plan.del(e.a); break;
+      case EffectKind::DelRange: plan.del_range(e.a, e.b); break;
+      case EffectKind::GuardUnchanged: plan.ensure_unchanged(e.a); break;
+      case EffectKind::GuardRange: plan.ensure_range_unchanged(e.a, e.b); break;
+      case EffectKind::GuardPresent: plan.ensure_present(e.a); break;
+      case EffectKind::GuardAbsent: plan.ensure_absent(e.a); break;
     }
-    // A DDL on a table this plan writes, committed since the snapshot,
-    // changes the table's record: the commit is then a conflict, and the
-    // retry pins the new catalog version, whose indexes it maintains.
-    for (auto id : written_tables(cx)) plan.ensure_unchanged(bytecask::sql::table_record_key(id));
-    cx->effects.clear();  // handed to the engine: a second commit has nothing to submit
-    auto r = cx->db->apply_batch({.sync = sync}, std::move(plan));
-    return r ? BC_COMMITTED : BC_CONFLICT;
-  } catch (...) {
-    cx->fail_current_exception();
-    return BC_FAILED;
   }
+  // A DDL on a table this plan writes, committed since the snapshot,
+  // changes the table's record: the commit is then a conflict, and the
+  // retry pins the new catalog version, whose indexes it maintains.
+  for (auto id : written_tables(cx)) plan.ensure_unchanged(bytecask::sql::table_record_key(id));
+  cx->effects.clear();  // handed to the engine: a second commit has nothing to submit
+  auto r = cx->db->apply_batch({.sync = sync}, std::move(plan));
+  return r ? BC_COMMITTED : BC_CONFLICT;
   BC_GUARD_END(cx)
-  return {};
+  return BC_FAILED;  // the guard caught a throw: never BC_COMMITTED
 }
 
 bool bc_ctx_next_result(bc_ctx* cx, const uint8_t** row, uint32_t* len) {
@@ -1406,7 +1419,7 @@ bool bc_param_null(bc_ctx* cx, uint32_t i) {
 void bc_emit_begin(bc_ctx* cx) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return;
-  if (cx->current == nullptr) {
+  if (cx->current == nullptr || cx->current->result_types.empty()) {
     cx->fail(BC_L_PLAN, "the plan's schema ref declares no result types");
     return;
   }
@@ -1859,6 +1872,8 @@ bc_view bc_scan_row(bc_ctx* cx, bc_cursor h) {
   if (c == nullptr) return {};
   auto table = c->layout->table->id;
   if (c->layout->index == nullptr) return cx->make_view(c->value.data(), c->value.size(), h.i, c->step, table, RowKind::Stored);
+  // An index cursor hands out its table's rows: the table must be declared too.
+  if (!cx->declared_object(table, false)) return {};
   if (c->row_step == c->step) return cx->make_view(c->row.data(), c->row.size(), h.i, c->step, table, RowKind::Stored);
   // The row key is the table's prefix and the entry's primary-key suffix,
   // found by skipping the index parts.
@@ -2276,11 +2291,12 @@ void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {
   // A key built only from columns whose encodings are the same in both rows
   // is the same key: it is encoded once, or not at all. A malformed row
   // counts as changed, and its encoding refuses it.
-  const auto& keys = key_slots(cx, *t);
+  const auto* keys = key_slots(cx, *t);
+  if (keys == nullptr) return;
   auto same = [&](const ColumnSlot& slot) { return bytecask::sql::row_column_equal(*o, *n, slot).value_or(false); };
   Bytes pk_old, pk_new;
   if (!encode_pk(cx, *t, *o, pk_old)) return;
-  auto moved_pk = !std::ranges::all_of(keys.pk, same);
+  auto moved_pk = !std::ranges::all_of(keys->pk, same);
   if (moved_pk) {
     if (!encode_pk(cx, *t, *n, pk_new)) return;
     moved_pk = pk_old != pk_new;
@@ -2295,7 +2311,7 @@ void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {
   std::vector<Move> moves;
   for (std::size_t i = 0; i < t->indexes.size(); ++i) {
     const auto& ix = t->indexes[i];
-    if (!moved_pk && std::ranges::all_of(keys.parts[i], same)) continue;
+    if (!moved_pk && std::ranges::all_of(keys->parts[i], same)) continue;
     Move m{&ix, {}, {}};
     if (!encode_entry(cx, *t, ix, *o, m.from) || !encode_entry(cx, *t, ix, *n, m.to)) return;
     if (m.from.key != m.to.key) moves.push_back(std::move(m));

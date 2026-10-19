@@ -158,6 +158,9 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   // is recompiled only if not, and the parameters are refused against the
   // plan that will run. The runtime alone decides compatibility.
   if (auto why = mismatch(); !why.empty()) {
+    // A plan compiled against the current version is the plan of the text:
+    // a recompile would take the same parameters.
+    if (stmt.ref_.catalog_version == live_->current()->version()) throw std::invalid_argument(why);
     bc_ctx_begin(cx_, &bp, {});
     auto fits = bc_ctx_check(cx_, &stmt.ref_);
     auto stale = !fits && bc_error(cx_) == BC_E_LAYOUT && bc_error_detail(cx_) == BC_L_INCOMPATIBLE;

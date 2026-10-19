@@ -115,6 +115,13 @@ inline auto all_cols(const bytecask::sql::Catalog& cat) -> std::vector<bc_col_re
   return out;
 }
 
+// The columns of one table, as a bc_schema_ref declares them.
+inline auto table_cols(const bytecask::sql::Catalog& cat, std::uint32_t table) -> std::vector<bc_col_ref> {
+  std::vector<bc_col_ref> out;
+  for (const auto& c : cat.table(table)->columns) out.push_back({table, c.id, static_cast<std::uint8_t>(c.type)});
+  return out;
+}
+
 // Every table and index, and every table: what a hand-written test plan may
 // name and write.
 inline auto all_objects(const bytecask::sql::Catalog& cat) -> std::vector<std::uint32_t> {

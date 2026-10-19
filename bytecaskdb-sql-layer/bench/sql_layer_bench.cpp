@@ -275,8 +275,11 @@ int main() {
       bc_ctx_reset(cx);
       return t;
     };
-    auto base = runs(nullptr);
-    std::printf("bc_ctx_run of an empty plan, no schema ref: %7.1f ns\n", base);
+    // Every run has a reference: the baseline is an empty one, cached, so
+    // the lines below are what a reference's contents add.
+    auto empty = make_ref(*cat, {}, bc_ref_id());
+    auto base = runs(&empty->ref);
+    std::printf("bc_ctx_run of an empty plan, empty schema ref: %7.1f ns\n", base);
     for (const auto& [name, spec] : {std::pair{"point read", &point}, std::pair{"New-Order", &new_order}}) {
       auto cached = make_ref(*cat, *spec, bc_ref_id());
       auto uncached = make_ref(*cat, *spec, 0);  // id 0: verified on every run
