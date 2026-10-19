@@ -107,6 +107,15 @@ jobs:
         if: matrix.sanitizer == 'memory'
         run: bash scripts/build_msan_libcxx.sh
 
+      # The SQL layer's libpg_query and TinyCC are cloned and built from
+      # source: cached, a fetch failure costs a cache miss, not the run.
+      - name: Cache the SQL layer's xmake packages
+        if: inputs.sql_layer
+        uses: actions/cache@v4
+        with:
+          path: ~/.xmake/packages
+          key: xmake-packages-sql-layer-${{ matrix.sanitizer }}-fedora43-${{ hashFiles('xmake.lua', 'bytecaskdb-sql-layer/xmake.lua') }}
+
       - name: Configure xmake
         run: |
           RESOURCE_DIR=$(clang --print-resource-dir)

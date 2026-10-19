@@ -33,7 +33,7 @@ GitHub Issues are the repository's task tracker, for work not already captured b
 - Any change to the engine claimed to improve performance **must** include a benchmark run of `engine_bench` before and after the change. Run it with `python3 scripts/run_engine_bench.py`. Results are appended to `benchmarks/engine_bench_results.csv` (local, gitignored).
 - A performance claim in `bytecaskdb-sql-layer` **must** include `sql_layer_bench` before and after the change (`xmake f -m releasedbg --sql_layer=y && xmake build sql_layer_bench && xmake run sql_layer_bench`); `engine_bench` does not apply to a change that leaves the engine untouched (owner decision, 2026-10-19).
 - Run `python3 scripts/run_map_bench.py` (records to `benchmarks/map_bench_results.csv`, also gitignored) only when making changes to a key directory tree: `blind_btree` or `btree`.
-- Show the before/after CSV rows to the user as evidence of improvement.
+- Show the before/after CSV rows to the user as evidence of improvement; for `sql_layer_bench`, which writes no CSV, its before/after output.
 - If benchmarks cannot be run, state why clearly and record the blocker in the PR description or a GitHub issue.
 
 ## Testing rules

@@ -4,8 +4,9 @@
 
 -- Third-party dependencies, fetched by git at a pinned tag or commit and
 -- built from source (neither is a known-good xmake-repo package). The root
--- xmake.lua includes this file only with `xmake f --sql_layer=y`, and
--- configuring then resolves both.
+-- xmake.lua includes this file only with `xmake f --sql_layer=y`, which is
+-- what keeps them from being fetched otherwise; both are required, so a
+-- failed fetch or build fails configure at the package, not a later compile.
 
 -- libpg_query: PostgreSQL 17's parser as a library, with its protobuf-c
 -- output and the bundled protobuf-c runtime (no system protobuf). Its own
@@ -28,7 +29,7 @@ package("libpg_query")
         assert(package:has_cfuncs("pg_query_parse_protobuf", {includes = "pg_query.h"}))
     end)
 package_end()
-add_requires("libpg_query 6.2.5", {optional = true})
+add_requires("libpg_query 6.2.5")
 
 -- TinyCC: compiles plans in process (the run-time tier, #493). LGPL-2.1;
 -- linked statically here, which is acceptable for a prototype that does not
@@ -49,7 +50,7 @@ package("tinycc")
         assert(package:has_cfuncs("tcc_new", {includes = "libtcc.h"}))
     end)
 package_end()
-add_requires("tinycc 2026.09.26", {optional = true})
+add_requires("tinycc 2026.09.26")
 
 -- C++23 modules, as the engine (the root sets the modules policy for every
 -- target): one interface unit per module (bytecask.sql.<name>), public so

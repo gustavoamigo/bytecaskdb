@@ -10,9 +10,9 @@ of the contract must be one of:
   - a name declared in the interface's files, comments excluded;
   - a name the pair allows (ALLOWED and the pair's own words below).
 
-A C++ module interface (.cppm) contributes the names it declares: its text
-after `export module`, without the members under `private:` and without
-function bodies, whose code names private members. The modules it re-exports
+A C++ module interface (.cppm) contributes the names it declares after
+`export module`: a class member only under public access, and no function
+body, whose code names private members. The modules it re-exports
 are not followed: they are the layer's mechanism (the compiler, the codecs),
 not the surface the contract is written against.
 
@@ -90,31 +90,47 @@ def strip_comments(src: str) -> str:
 
 
 EXPORT_MODULE = re.compile(r"^export\s+module\s+[\w.]+\s*;", re.M)
-# A class's private members, up to its next access specifier or its closing
-# brace at column 0 (the layer's classes are not nested).
-PRIVATE = re.compile(r"\bprivate:.*?(?=\bpublic:|\bprotected:|^\};)", re.S | re.M)
 # A constructor's member initializer list, `) : base{x}, member_{y}` before
 # its body: it names private members.
 INIT_LIST = re.compile(r"\)\s*:(?!:)\s*(?:[\w:]+\s*(?:\{[^{}]*\}|\([^()]*\))\s*,?\s*)+(?=\{)")
-# What precedes a brace that opens a scope of declarations, not code.
-SCOPE = re.compile(r"\b(?:class|struct|union|enum|namespace)\b|\bextern\s+\"C(?:\+\+)?\"\s*$")
+TEMPLATE_PARAMS = re.compile(r"\btemplate\s*<[^>]*>")
+# What precedes a brace that opens a scope of declarations rather than code.
+SCOPE = re.compile(r"\b(class|struct|union|enum|namespace)\b|\bextern\s+\"C(?:\+\+)?\"\s*$")
+ACCESS = re.compile(r"^\s*(public|private|protected)\s*$")
 
 
-def drop_bodies(src: str) -> str:
-    """Drops every brace block but a class, struct, enum, namespace or
-    extern block: function bodies and brace initializers, whose code names
-    private members."""
+def declared_text(src: str) -> str:
+    """The declarations an importer can name: every scope is walked, a class
+    member counts only under public access (a class starts private, a struct
+    public), and function bodies and brace initializers are dropped, since
+    their code names private members."""
     out: list[str] = []
+    access: list[str | None] = []  # per open scope; None for a namespace or enum
     start = 0  # where the current declaration began
     i = 0
+
+    def visible() -> bool:
+        return all(a in (None, "public") for a in access)
+
     while i < len(src):
         c = src[i]
-        if c in ";}":
-            out.append(src[start:i + 1])
+        if c == ";":
+            if visible():
+                out.append(src[start:i + 1])
+            start = i + 1
+        elif c == ":" and src[i + 1:i + 2] != ":" and src[i - 1:i] != ":" \
+                and ACCESS.match(src[start:i]) and access:
+            access[-1] = ACCESS.match(src[start:i]).group(1)
             start = i + 1
         elif c == "{":
-            if SCOPE.search(src[start:i]):
-                out.append(src[start:i + 1])
+            head = src[start:i]
+            scope = SCOPE.search(TEMPLATE_PARAMS.sub(" ", head))
+            if scope:
+                if visible():
+                    out.append(head)
+                kind = scope.group(1)
+                access.append("private" if kind == "class" else
+                              "public" if kind in ("struct", "union") else None)
                 start = i + 1
             else:
                 depth = 0
@@ -122,12 +138,20 @@ def drop_bodies(src: str) -> str:
                     depth += {"{": 1, "}": -1}.get(src[j], 0)
                     if depth == 0:
                         break
-                out.append(src[start:i] + " ")
+                if visible():
+                    out.append(head + " ")
                 start = i = j + 1
                 continue
+        elif c == "}":
+            if visible():
+                out.append(src[start:i])
+            if access:
+                access.pop()
+            start = i + 1
         i += 1
-    out.append(src[start:])
-    return "".join(out)
+    if visible():
+        out.append(src[start:])
+    return " ".join(out)
 
 
 def module_text(src: str) -> str:
@@ -135,7 +159,7 @@ def module_text(src: str) -> str:
     m = EXPORT_MODULE.search(src)
     if m:
         src = src[m.end():]  # drops the global module fragment
-    return drop_bodies(INIT_LIST.sub(") ", PRIVATE.sub(" ", src)))
+    return declared_text(INIT_LIST.sub(") ", src))
 
 
 def public_names(root: pathlib.Path, interface: list[str]) -> set[str]:
