@@ -234,6 +234,43 @@ local function add_release_opts(t)
     end
 end
 
+-- The same flags for a native target that an included file defines
+-- (bytecaskdb-sql-layer/xmake.lua), which cannot call this file's local
+-- functions: its targets add this rule where the targets below call them.
+-- Moving the targets below onto the rule is #502. Under MSan the test targets
+-- add what pairs with the libc++ flags through bytecask.catch2; the
+-- sql-layer's libpg_query and TinyCC are built uninstrumented, so an MSan
+-- binary of it builds but reports their stores as uninitialized reads.
+rule("bytecask.native_flags")
+    on_config(function (t)
+        add_native_syslinks(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
+rule_end()
+
+-- Catch2 for a native test target. Under MemorySanitizer the prebuilt catch2
+-- package, compiled against the system's default libstdc++, cannot link its
+-- libstdc++-mangled symbols into an MSan binary built against libc++, so
+-- Catch2 is compiled from source as ordinary translation units of the target,
+-- under the same -stdlib=libc++ invocation as everything else (see
+-- third_party/catch2_amalgamated/README.md). The std-module probe goes with
+-- it: xmake probes for a system "std"/"std.compat" module by scanning GCC's
+-- bits/std.cc against the target's own cxflags, and with -nostdinc++ in
+-- effect (apply_sanitizer) that probe cannot find GCC's headers and fatally
+-- errors instead of warning "not found"; the project never imports std.
+rule("bytecask.catch2")
+    on_load(function (t)
+        if (get_config("sanitizer") or ""):find("memory", 1, true) then
+            t:add("files", path.join(os.projectdir(), "third_party", "catch2_amalgamated", "catch_amalgamated.cpp"))
+            t:add("includedirs", path.join(os.projectdir(), "third_party", "catch2_amalgamated"))
+            t:set("policy", "build.c++.modules.std", false)
+        else
+            t:add("packages", "catch2")
+        end
+    end)
+rule_end()
+
 -- The I/O calls bytecask_tests interposes with -Wl,--wrap, and the variants
 -- of them it must not reference (other spellings of the same calls, and
 -- calls neither the engine nor the C++ standard library makes today). An
@@ -275,25 +312,7 @@ target("bytecask_tests")
     add_engine_files()
     add_includedirs("bytecaskdb", "tests")
     add_packages("crc32c", "zstd")
-    if (get_config("sanitizer") or ""):find("memory", 1, true) then
-        -- The prebuilt catch2 package is compiled against the system's
-        -- default libstdc++; linking its libstdc++-mangled symbols into an
-        -- MSan binary built against libc++ fails at link time. Compiling
-        -- Catch2 from source as ordinary translation units of this target
-        -- puts it under the same -stdlib=libc++ invocation as everything
-        -- else, so there is no ABI boundary to cross. See
-        -- third_party/catch2_amalgamated/README.md.
-        add_files("third_party/catch2_amalgamated/catch_amalgamated.cpp")
-        add_includedirs("third_party/catch2_amalgamated")
-        -- xmake probes for a system "std"/"std.compat" module by scanning
-        -- GCC's bits/std.cc against this target's own cxflags. With
-        -- -nostdinc++ in effect (see apply_sanitizer), that probe can't find
-        -- GCC's headers and fatally errors instead of just warning "not
-        -- found" — the project doesn't use `import std;` at all, so skip it.
-        set_policy("build.c++.modules.std", false)
-    else
-        add_packages("catch2")
-    end
+    add_rules("bytecask.catch2")
     add_defines("BYTECASK_TESTING")
     -- Counted fault sweep (tests/syscall_faults.cpp): each I/O call the
     -- binary's objects make goes through an interposer that can count it and

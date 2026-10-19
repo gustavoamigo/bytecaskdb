@@ -3,7 +3,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include "bytecaskdb-sql-layer/sql/ast.hpp"
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <variant>
+#include <vector>
+
+import bytecask.sql.parser;
 
 using namespace bytecask::sql::ast;
 

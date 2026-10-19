@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
+//
+// test_util.cppm — a scratch directory and a bytes() literal for the tests.
 
-#pragma once
-
+module;
 #include <filesystem>
 #include <random>
+#include <span>
 #include <string>
 #include <string_view>
 
-#include "bytecaskdb-sql-layer/codec/key_codec.hpp"
+export module bytecask.sql.tests.util;
 
-namespace sql_test {
+export import bytecask.sql.key_codec;
+
+export namespace sql_test {
 
 // A fresh directory under the system temp dir, removed on destruction.
 class TempDir {

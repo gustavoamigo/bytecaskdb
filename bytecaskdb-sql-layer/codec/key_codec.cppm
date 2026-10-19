@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// key_codec.hpp — the mem-comparable key encoding of docs/plan_api_design.md,
+// key_codec.cppm — the mem-comparable key encoding of docs/plan_api_design.md,
 // *Key encoding*: namespace(1) id(4, big-endian) parts…, each part encoded so
 // that memcmp order is the typed order and the key parses back without a
-// length prefix. DESC parts are not implemented yet.
+// length prefix. DESC parts are not implemented yet. Definitions are in
+// key_codec.cpp.
 
-#pragma once
-
+module;
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <vector>
 
-namespace bytecask::sql {
+export module bytecask.sql.key_codec;
+
+export namespace bytecask::sql {
 
 using Bytes = std::vector<std::byte>;
 using BytesView = std::span<const std::byte>;

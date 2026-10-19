@@ -50,13 +50,28 @@ package("tinycc")
 package_end()
 add_requires("tinycc 2026.09.26", {optional = true})
 
+-- C++23 modules, as the engine (the root sets the modules policy for every
+-- target): one interface unit per module (bytecask.sql.<name>), public so
+-- sql_layer_tests imports them, and one implementation unit beside it with
+-- the definitions, laid out as add_engine_files() lays out the engine's. The
+-- one header is algebra/bc_plan.h, the C contract; algebra/plan_api.cpp, its
+-- extern "C" definitions, is a plain translation unit among the
+-- implementation units.
 target("sql_layer")
     set_kind("static")
     set_default(false)
     add_deps("bytecask")
+    add_rules("bytecask.native_flags")
     add_includedirs("..", {public = true})
+    add_files("codec/*.cppm", "catalog/*.cppm", "algebra/*.cppm", "sql/*.cppm", "plan/*.cppm", "api/*.cppm",
+              {public = true})
     add_files("codec/*.cpp", "catalog/*.cpp", "algebra/*.cpp", "sql/*.cpp", "plan/*.cpp", "api/*.cpp")
     add_packages("libpg_query", "tinycc", {public = true})
+    if (get_config("sanitizer") or ""):find("memory", 1, true) then
+        -- No std-module probe under -nostdinc++; see bytecask.catch2 in the
+        -- root xmake.lua, which does the same for the test target.
+        set_policy("build.c++.modules.std", false)
+    end
     add_defines("SQL_LAYER_ALGEBRA_DIR=\"" .. path.join(os.scriptdir(), "algebra") .. "\"")
     on_config(function (t)
         local tcc = t:pkg("tinycc")
@@ -69,9 +84,11 @@ target("sql_layer_tests")
     set_kind("binary")
     set_default(false)
     add_deps("sql_layer")
-    add_packages("catch2")
+    add_rules("bytecask.native_flags")
+    add_rules("bytecask.catch2")
     set_languages("c17", "c++23")
-    add_files("tests/*.cpp")
+    -- The tests, and the fixtures they share as modules (bytecask.sql.tests.*).
+    add_files("tests/*.cpp", "tests/*.cppm")
     -- The hand-written plans, compiled by clang as C. Every plan defines
     -- plan(); each is renamed so several link into one binary.
     add_includedirs("algebra")
@@ -80,6 +97,3 @@ target("sql_layer_tests")
         add_files("plans/" .. name .. ".c", {defines = "plan=plan_" .. name,
                   cflags = "-Wno-declaration-after-statement"})
     end
-    on_config(function(t)
-        t:add("syslinks", "pthread")
-    end)

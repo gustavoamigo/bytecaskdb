@@ -1,25 +1,28 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// binder.hpp — resolves an AST against the catalog: table and column names to
+// binder.cppm — resolves an AST against the catalog: table and column names to
 // ids, each parameter's type from where it is used, BIGINT and BYTEA checked.
 // What it returns names no column by name; the planner reads offsets and
 // slots from the catalog through the column ids.
 //
 // prototype: the seven forms only; replaced by the designed binder (#492).
+// Definitions are in binder.cpp.
 
-#pragma once
-
+module;
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
-#include "bytecaskdb-sql-layer/catalog/catalog.hpp"
-#include "bytecaskdb-sql-layer/sql/ast.hpp"
+export module bytecask.sql.binder;
 
-namespace bytecask::sql::bound {
+export import bytecask.sql.ast;
+export import bytecask.sql.catalog;
+
+export namespace bytecask::sql::bound {
 
 // A column, a parameter, or column - parameter (the only arithmetic in scope).
 struct Expr {

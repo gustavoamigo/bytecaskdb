@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// api_symbols.cpp — every function a plan may call, by name, for loaders that
-// link a plan at run time (TinyCC's tcc_add_symbol). Runtime calls
-// (bc_ctx_*, bc_execute, bc_error*) are left out: a plan never calls them.
+// runtime.cpp — the plan-API symbol table; see runtime.cppm.
 
-#include "bytecaskdb-sql-layer/algebra/api_symbols.hpp"
+module;
+#include <span>
+
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+
+module bytecask.sql.runtime;
 
 namespace {
 

@@ -1,12 +1,23 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
-// prototype: see codegen.hpp.
+//
+// codegen.cpp — the planner and code generator's definitions; see codegen.cppm.
 
-#include "bytecaskdb-sql-layer/plan/codegen.hpp"
-
+module;
 #include <algorithm>
+#include <cctype>
+#include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <set>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
+
+module bytecask.sql.codegen;
 
 namespace bytecask::sql {
 

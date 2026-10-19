@@ -1,10 +1,27 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
-// prototype: see database.hpp.
+//
+// database.cpp — the embedded API's definitions; see database.cppm.
 
-#include "bytecaskdb-sql-layer/api/database.hpp"
+module;
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <new>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <variant>
+#include <vector>
 
-#include "bytecaskdb-sql-layer/sql/binder.hpp"
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+#include "include/bytecask.hpp"
+
+module bytecask.sql.api;
+
+import bytecask.sql.parser;
 
 namespace bytecask::sql {
 

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// plan_api.cpp — the plan API of bc_plan.h on the engine's public API.
+// plan_api.cpp — the plan API of bc_plan.h on the engine's public API: the
+// extern "C" definitions, and bc_ctx itself.
 //
 // Every call resolves its handles against tables owned by the context. A
 // handle carries the context's epoch, bumped by bc_ctx_reset, so a handle
@@ -9,16 +10,32 @@
 // the cursor's step count, so stepping invalidates it. Errors are sticky: the
 // first one is kept, and every later call returns its neutral value.
 
+// Standard library headers before the module imports, for the reason
+// bytecaskdb/bytecask_hpp.cpp gives (LLVM 22's abi_tag redeclaration error).
 #include <algorithm>
 #include <chrono>
+#include <compare>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <exception>
 #include <new>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
+#include <variant>
+#include <vector>
 
-#include "bytecaskdb-sql-layer/algebra/runtime.hpp"
+// The C contract, and the engine through its public header.
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+#include "include/bytecask.hpp"
+
+// bc_db, bc_catalog, bc_params and bc_ctx_affected, which bc_plan.h leaves
+// opaque, and the catalog and codecs through it.
+import bytecask.sql.runtime;
 
 using bytecask::sql::Bytes;
 using bytecask::sql::BytesView;

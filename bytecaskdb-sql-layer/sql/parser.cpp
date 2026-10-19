@@ -1,18 +1,17 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// parser.cpp — SQL text to the prototype's AST: libpg_query parses, its
-// protobuf output is unpacked with protobuf-c, and the tree is transformed
-// into ast.hpp's types. Anything outside the seven forms is rejected with a
-// message and the position libpg_query recorded for the offending node.
-//
-// prototype: replaced by the designed front end (#492).
+// parser.cpp — parse()'s definition; see parser.cppm. The only unit that
+// sees libpg_query's and protobuf-c's headers.
 
-#include "bytecaskdb-sql-layer/sql/ast.hpp"
-
+module;
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Weverything"
@@ -20,9 +19,9 @@
 #include <protobuf/pg_query.pb-c.h>
 #pragma clang diagnostic pop
 
-namespace bytecask::sql::ast {
+module bytecask.sql.parser;
 
-SqlError::~SqlError() = default;
+namespace bytecask::sql::ast {
 
 namespace {
 

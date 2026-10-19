@@ -1,23 +1,24 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// ast.hpp — the small AST the parser hands the binder: the prototype's seven
+// ast.cppm — the small AST the parser hands the binder: the prototype's seven
 // statement forms and nothing else. Names are as written; positions are
 // byte offsets into the statement text, -1 where libpg_query gives none.
 //
-// prototype: replaced by the designed front end (#492).
+// prototype: replaced by the designed front end (#492). SqlError's
+// destructor is in ast.cpp.
 
-#pragma once
-
+module;
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <variant>
 #include <vector>
 
-namespace bytecask::sql::ast {
+export module bytecask.sql.ast;
+
+export namespace bytecask::sql::ast {
 
 // A failure to parse, or a form outside the prototype's scope.
 class SqlError : public std::runtime_error {
@@ -105,9 +106,5 @@ struct Delete {
 };
 
 using Statement = std::variant<CreateTable, CreateIndex, Insert, Select, Update, Delete>;
-
-// Parses exactly one statement. Throws SqlError for a syntax error (with
-// PostgreSQL's message and position) or a form the prototype does not take.
-[[nodiscard]] auto parse(std::string_view sql) -> Statement;
 
 }  // namespace bytecask::sql::ast

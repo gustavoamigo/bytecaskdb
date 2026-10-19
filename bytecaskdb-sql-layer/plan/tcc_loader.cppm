@@ -1,24 +1,30 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// tcc_loader.hpp — compiles a plan file in process with TinyCC and links it
+// tcc_loader.cppm — compiles a plan file in process with TinyCC and links it
 // against the plan API by name. The plan sees only the functions in
-// plan_api_symbols(): no libc, no other symbol of the process.
+// plan_api_symbols(): no libc, no other symbol of the process. libtcc.h is
+// seen by tcc_loader.cpp, which holds the definitions, and nowhere else.
 //
 // prototype: the run-time tier of #493, without the checker that must run
 // before it.
 
-#pragma once
-
+module;
 #include <memory>
-#include <string>
 #include <string_view>
 
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
 
-struct TCCState;
+export module bytecask.sql.tcc_loader;
 
-namespace bytecask::sql {
+// libtcc.h's opaque compiler state, which TccPlan holds. Declared in the
+// global module, as the header declares it ([basic.link]/10), so
+// tcc_loader.cpp's include of the header completes the same entity.
+extern "C" {
+struct TCCState;
+}
+
+export namespace bytecask::sql {
 
 class TccPlan {
 public:

@@ -1,21 +1,28 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// The prototype's schema on a fresh database, and the runtime handles a plan
-// needs:
+// fixture.cppm — the prototype's schema on a fresh database, and the runtime
+// handles a plan needs:
 //   CREATE TABLE t (id BIGINT PRIMARY KEY, name BYTEA, qty BIGINT);
 //   CREATE INDEX t_by_name ON t (name);
 
-#pragma once
-
+module;
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
+#include <variant>
 #include <vector>
 
-#include "bytecaskdb-sql-layer/algebra/runtime.hpp"
-#include "test_util.hpp"
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+#include "include/bytecask.hpp"
 
-namespace sql_test {
+export module bytecask.sql.tests.fixture;
+
+export import bytecask.sql.runtime;
+export import bytecask.sql.tests.util;
+
+export namespace sql_test {
 
 struct Fixture {
   TempDir dir{"plan"};

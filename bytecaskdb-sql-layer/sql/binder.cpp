@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
-// prototype: see binder.hpp.
+//
+// binder.cpp — the binder's definitions; see binder.cppm.
 
-#include "bytecaskdb-sql-layer/sql/binder.hpp"
-
+module;
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <string>
+#include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
+
+module bytecask.sql.binder;
 
 namespace bytecask::sql::bound {
 

@@ -4,13 +4,22 @@
 // The generated plans, compiled in process by TinyCC, give the same results
 // as the clang-linked hand-written ones; prints each plan's compile latency.
 
+#include <catch2/catch_test_macros.hpp>
+
 #include <algorithm>
 #include <cstdio>
+#include <memory>
 #include <stdexcept>
+#include <string_view>
+#include <utility>
+#include <vector>
 
-#include "bytecaskdb-sql-layer/plan/codegen.hpp"
-#include "bytecaskdb-sql-layer/plan/tcc_loader.hpp"
-#include "dml_scenario.hpp"
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+
+import bytecask.sql.codegen;
+import bytecask.sql.parser;
+import bytecask.sql.tcc_loader;
+import bytecask.sql.tests.dml_scenario;
 
 using namespace bytecask::sql;
 

@@ -1,12 +1,24 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
-// prototype: see catalog.hpp.
+//
+// catalog.cpp — the catalog's definitions; see catalog.cppm.
 
-#include "bytecaskdb-sql-layer/catalog/catalog.hpp"
-
+module;
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <memory>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "include/bytecask.hpp"
+
+module bytecask.sql.catalog;
 
 namespace bytecask::sql {
 

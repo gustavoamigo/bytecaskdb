@@ -1,19 +1,26 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
-// prototype: see tcc_loader.hpp.
+//
+// tcc_loader.cpp — TccPlan's definitions; see tcc_loader.cppm. The only unit
+// that includes libtcc.h.
 
-#include "bytecaskdb-sql-layer/plan/tcc_loader.hpp"
-
+module;
 #include <chrono>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
-#include "bytecaskdb-sql-layer/algebra/api_symbols.hpp"
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Weverything"
 #include <libtcc.h>
 #pragma clang diagnostic pop
+
+module bytecask.sql.tcc_loader;
+
+import bytecask.sql.runtime;
 
 namespace bytecask::sql {
 

@@ -50,13 +50,26 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # make and which: the libpg_query and TinyCC builds sql_layer_tests
+          # needs (bytecaskdb-sql-layer/xmake.lua).
           dnf install -y \
             clang llvm llvm-devel lld \
             libcxx libcxx-devel libstdc++-static \
-            xmake \
+            xmake make which \
             python3-pip python3-devel \
             git ninja-build
           pip3 install nanobind pytest hypothesis
+
+      # The packages xmake builds from source, libpg_query and TinyCC among
+      # them (bytecaskdb-sql-layer/xmake.lua), each a git clone and a build
+      # per run otherwise. The key carries every pinned version: a bump in
+      # either file is a new entry, and a GitHub fetch failure for one of the
+      # repositories then costs a cache miss, not the run.
+      - name: Cache xmake packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.xmake/packages
+          key: xmake-packages-fedora43-${{ hashFiles('xmake.lua', 'bytecaskdb-sql-layer/xmake.lua') }}
 
       - name: Configure xmake
         run: |
@@ -82,6 +95,18 @@ jobs:
           build/linux/x86_64/release/bytecask_tests --reporter junit --out test-results/bytecask_tests.xml || status=1
           build/linux/x86_64/release/btree_tests --reporter junit --out test-results/btree_tests.xml || status=1
           exit "$status"
+
+      - name: Build and run sql_layer_tests
+        # The SQL layer (bytecaskdb-sql-layer, #487), on the engine built
+        # above. -y confirms the libpg_query and TinyCC fetches; both are
+        # cloned and built from source, which is why this step comes after
+        # the engine suites have run: a fetch failure here costs the
+        # sql-layer result, not theirs. This job installs no MariaDB
+        # development package, and nothing under bytecaskdb-sql-layer/ may
+        # include a MariaDB header: building it here is what keeps that true.
+        run: |
+          xmake build -y sql_layer_tests
+          build/linux/x86_64/release/sql_layer_tests --reporter junit --out test-results/sql_layer_tests.xml
 
       - name: Every mutation's Guarded-by spec selects a test
         # Catch2 reads an unescaped comma in a spec as OR (#463); see
@@ -119,14 +144,25 @@ jobs:
         run: |
           /usr/bin/python scripts/enrich_junit_sources.py \
             --pair build/linux/x86_64/release/bytecask_tests:test-results/bytecask_tests.xml \
-            --pair build/linux/x86_64/release/btree_tests:test-results/btree_tests.xml
+            --pair build/linux/x86_64/release/btree_tests:test-results/btree_tests.xml \
+            --pair build/linux/x86_64/release/sql_layer_tests:test-results/sql_layer_tests.xml
 
       - name: Publish test results in GitHub Checks
         if: ${{ always() && !cancelled() }}
         uses: EnricoMi/publish-unit-test-result-action@v2
         with:
-          files: test-results/*.xml
+          files: |
+            test-results/bytecask_tests.xml
+            test-results/btree_tests.xml
           check_name: Test Results
+          comment_mode: off
+
+      - name: Publish SQL layer test results in GitHub Checks
+        if: ${{ always() && !cancelled() }}
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          files: test-results/sql_layer_tests.xml
+          check_name: SQL Layer Test Results
           comment_mode: off
 
       - name: Upload JUnit reports artifact
@@ -142,7 +178,7 @@ jobs:
         with:
           # Comma-separated: the action passes a multi-line value to the CLI
           # as one path, which it cannot find.
-          files: ./test-results/bytecask_tests.xml,./test-results/btree_tests.xml
+          files: ./test-results/bytecask_tests.xml,./test-results/btree_tests.xml,./test-results/sql_layer_tests.xml
           report_type: test_results
           flags: cpp
           name: bytecask-cpp-tests

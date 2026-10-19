@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// database.hpp — the embedded SQL API: open a directory, prepare a statement,
+// database.cppm — the embedded SQL API: open a directory, prepare a statement,
 // execute it with parameters, read the rows. Every DML statement is compiled
 // once to a plan, by TinyCC, and cached by its text; a plan compiled against
 // an older catalog is recompiled from that text before it runs.
@@ -9,25 +9,32 @@
 // Autocommit only: each execute is one plan through bc_execute, retried on a
 // conflict. One thread at a time.
 //
-// prototype: the shape of #494's embedded API, not its design.
+// prototype: the shape of #494's embedded API, not its design. Definitions
+// are in database.cpp.
 
-#pragma once
-
+module;
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
-#include "bytecaskdb-sql-layer/algebra/runtime.hpp"
-#include "bytecaskdb-sql-layer/plan/codegen.hpp"
-#include "bytecaskdb-sql-layer/plan/tcc_loader.hpp"
-#include "bytecaskdb-sql-layer/sql/ast.hpp"
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+#include "include/bytecask.hpp"
 
-namespace bytecask::sql {
+export module bytecask.sql.api;
+
+export import bytecask.sql.runtime;
+export import bytecask.sql.codegen;
+export import bytecask.sql.tcc_loader;
+
+export namespace bytecask::sql {
 
 using Value = bc_value;  // NULL, BIGINT, double (unused), BYTEA
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// catalog.hpp — tables, their permanent column ids, primary keys and
+// catalog.cppm — tables, their permanent column ids, primary keys and
 // secondary indexes, kept in memory and persisted under namespace 0x01.
 //
 // prototype: the minimum the end-to-end prototype needs (#497). Written from
@@ -17,22 +17,28 @@
 //   01 03 <name>    name entry: kind(1) id(4, big-endian)
 //
 // Not thread-safe: one Catalog per process, mutated under the caller's lock.
+// Definitions are in catalog.cpp.
 
-#pragma once
-
+module;
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
-#include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
-#include "bytecaskdb-sql-layer/codec/key_codec.hpp"
-#include "bytecaskdb-sql-layer/codec/row_codec.hpp"
+// The engine through its public header, as the plugin and the bindings link
+// it; the sql-layer imports no engine module.
 #include "include/bytecask.hpp"
 
-namespace bytecask::sql {
+export module bytecask.sql.catalog;
+
+export import bytecask.sql.key_codec;
+export import bytecask.sql.row_codec;
+
+export namespace bytecask::sql {
 
 struct Column {
   std::uint32_t id;  // permanent; never reused

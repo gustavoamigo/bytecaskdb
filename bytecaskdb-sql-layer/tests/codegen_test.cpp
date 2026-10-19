@@ -6,11 +6,18 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cctype>
+#include <cstdint>
 #include <fstream>
 #include <sstream>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
-#include "bytecaskdb-sql-layer/plan/codegen.hpp"
-#include "fixture.hpp"
+import bytecask.sql.codegen;
+import bytecask.sql.parser;
+import bytecask.sql.tests.fixture;
 
 using namespace bytecask::sql;
 

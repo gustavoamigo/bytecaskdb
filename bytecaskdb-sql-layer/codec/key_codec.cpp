@@ -1,9 +1,17 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
+//
+// key_codec.cpp — the key encoding's definitions; see key_codec.cppm.
 
-#include "bytecaskdb-sql-layer/codec/key_codec.hpp"
-
+module;
 #include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <vector>
+
+module bytecask.sql.key_codec;
 
 namespace bytecask::sql {
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// row_codec.hpp — the row format of docs/plan_api_design.md, *Row format*:
+// row_codec.cppm — the row format of docs/plan_api_design.md, *Row format*:
 //
 //   u16   layout_generation
 //   u16   row_bytes          ; the whole row
@@ -20,19 +20,20 @@
 //
 // All integers are little-endian. Every accessor is bounds-checked against the
 // row: a column past the end of a shorter row is null, a malformed row is
-// reported, never read past.
+// reported, never read past. Definitions are in row_codec.cpp.
 
-#pragma once
-
+module;
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <vector>
 
-#include "bytecaskdb-sql-layer/codec/key_codec.hpp"
+export module bytecask.sql.row_codec;
 
-namespace bytecask::sql {
+export import bytecask.sql.key_codec;
+
+export namespace bytecask::sql {
 
 inline constexpr std::size_t kRowHeaderBytes = 8;
 inline constexpr std::size_t kMaxRowBytes = 0xFFFF;

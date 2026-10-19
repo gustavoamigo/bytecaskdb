@@ -1,10 +1,18 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
+//
+// row_codec.cpp — the row format's definitions; see row_codec.cppm.
 
-#include "bytecaskdb-sql-layer/codec/row_codec.hpp"
-
+module;
 #include <algorithm>
 #include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <vector>
+
+module bytecask.sql.row_codec;
 
 namespace bytecask::sql {
 

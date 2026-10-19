@@ -1,19 +1,29 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// The five DML plans run in order against the fixture, with expected rows
-// computed by hand. Shared by every tier that runs the same plan files:
-// clang-linked (plans_test.cpp) and TinyCC (tcc_test.cpp).
+// dml_scenario.cppm — the five DML plans run in order against the fixture,
+// with expected rows computed by hand. Shared by every tier that runs the same
+// plan files: clang-linked (plans_test.cpp) and TinyCC (tcc_test.cpp).
 
-#pragma once
-
+module;
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <cstdint>
 #include <limits>
+#include <string_view>
+#include <utility>
+#include <variant>
+#include <vector>
 
-#include "fixture.hpp"
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+#include "include/bytecask.hpp"
 
-namespace sql_test {
+export module bytecask.sql.tests.dml_scenario;
+
+export import bytecask.sql.tests.fixture;
+
+export namespace sql_test {
 
 struct PlanSet {
   bc_plan_fn insert, select_by_id, select_name_range, update_qty, delete_by_id;
@@ -23,7 +33,7 @@ using bytecask::sql::PhysType;
 
 using Row = std::vector<bc_value>;
 
-constexpr std::uint32_t kTbl = 1;
+inline constexpr std::uint32_t kTbl = 1;
 
 struct PlanRunner {
   Fixture& f;
