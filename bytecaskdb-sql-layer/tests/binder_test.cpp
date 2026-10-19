@@ -184,5 +184,13 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
   CHECK(rejected(cat, "ALTER TABLE t ADD COLUMN z BIGINT NOT NULL").first.find("needs a DEFAULT") != std::string::npos);
   CHECK(rejected(cat, "ALTER TABLE nope ADD COLUMN z BIGINT").first == "relation \"nope\" does not exist");
   CHECK(rejected(cat, "CREATE INDEX i ON t (nope)").first == "column \"nope\" does not exist");
-  CHECK(rejected(cat, "INSERT INTO t (name) VALUES ($1)").first == "primary key column \"id\" must be given");
+  // A column left out is the runtime's to refuse (BC_C_NOT_NULL), a primary key column among them.
+  CHECK_NOTHROW((void)bind_sql(cat, "INSERT INTO t (name) VALUES ($1)"));
+  // One PRIMARY KEY a table: two column-level ones are not a composite key (PostgreSQL: 42P16).
+  CHECK(rejected(cat, "CREATE TABLE u (a BIGINT PRIMARY KEY, b BIGINT PRIMARY KEY)").first ==
+        "multiple primary keys for table \"u\" are not allowed");
+  CHECK(rejected(cat, "CREATE TABLE u (a BIGINT PRIMARY KEY, b BIGINT, PRIMARY KEY (b))").first ==
+        "multiple primary keys for table \"u\" are not allowed");
+  CHECK(rejected(cat, "CREATE TABLE u (a BIGINT, b BIGINT, PRIMARY KEY (a), PRIMARY KEY (b))").first ==
+        "multiple primary keys for table \"u\" are not allowed");
 }

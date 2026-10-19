@@ -17,10 +17,24 @@ import re
 import bytecask_sql
 
 # The layer's constraint kinds and the SQLSTATE PostgreSQL reports for each.
+# A value outside its declared type is one kind, "range", in the layer:
+# 22001 for a string too long, 22008 for a TIME, 22003 for any other
+# (layer_sqlstate).
 SQLSTATE = {
     "unique": "23505",
     "not_null": "23502",
 }
+RANGE_STATES = ("22001", "22003", "22008")
+
+
+def layer_sqlstate(e: bytecask_sql.ExecError) -> str:
+    """The SQLSTATE PostgreSQL gives the layer's refusal, or "refused"."""
+    if e.constraint == "range":
+        message = str(e)
+        if message.startswith("value too long"):
+            return "22001"
+        return "22008" if message.startswith("time out of range") else "22003"
+    return SQLSTATE.get(e.constraint, "refused")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -119,7 +133,7 @@ def run_layer(db, sql: str, params=()) -> Outcome:
     try:
         r = db.execute(sql, tuple(params))
     except bytecask_sql.ExecError as e:
-        return Outcome(error=SQLSTATE.get(e.constraint, "refused"), detail=str(e))
+        return Outcome(error=layer_sqlstate(e), detail=str(e))
     except bytecask_sql.SqlError as e:
         return Outcome(error="refused", detail=str(e))
     return Outcome(rows=tuple(r["rows"]), affected=r["affected"] if changes_rows(sql) else None)
@@ -136,5 +150,6 @@ def run_pg(conn, sql: str, params=()) -> Outcome:
             affected = cur.rowcount if changes_rows(sql) else None
     except psycopg.Error as e:
         state = e.sqlstate or ""
-        return Outcome(error=state if state in SQLSTATE.values() else "refused", detail=f"{state} {e}")
+        known = state in SQLSTATE.values() or state in RANGE_STATES
+        return Outcome(error=state if known else "refused", detail=f"{state} {e}")
     return Outcome(rows=tuple(tuple(from_pg(v) for v in row) for row in rows), affected=affected)

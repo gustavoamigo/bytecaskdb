@@ -60,6 +60,8 @@ using bytecask::sql::LiveCatalog;
 using bytecask::sql::PhysType;
 using bytecask::sql::RowLayout;
 using bytecask::sql::RowWriter;
+using bytecask::sql::SqlKind;
+using bytecask::sql::SqlType;
 using bytecask::sql::Table;
 
 // bc_type's codes are PhysType's values; a schema ref's result_types are read as such.
@@ -135,6 +137,7 @@ struct ColSlot {
   bool nullable{true};
   PhysType type{PhysType::I64};
   std::uint32_t pos{0};
+  SqlType sql{SqlKind::BigInt};  // the declared type a value written to it is checked against
 };
 
 // The columns of a written table's keys, as layout slots: what bc_update
@@ -889,7 +892,9 @@ auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots& {
       return incompatible("column " + std::to_string(c.col) + " of table " + t->name +
                           " no longer exists with the type the plan was compiled with");
     }
-    e.cols.push_back({c.table, c.col, t->layout.generation, slot->nullable, slot->type, slot->pos});
+    const auto* column = t->column(c.col);
+    if (column == nullptr) return incompatible("column " + std::to_string(c.col) + " of table " + t->name + " was dropped");
+    e.cols.push_back({c.table, c.col, t->layout.generation, slot->nullable, slot->type, slot->pos, column->sql});
   }
   std::ranges::sort(e.cols, {}, [](const ColSlot& s) { return std::pair{s.table, s.col}; });
   return true;
@@ -1143,20 +1148,25 @@ auto set_target(bc_ctx* cx, bc_row r, std::uint32_t col, std::optional<PhysType>
   return SetTarget{b, slot};
 }
 
-// A NULL for column `col` of a row being built: refused for a NOT NULL
-// column with BC_E_CONSTRAINT, BC_C_NOT_NULL and the table's id (column ids
-// are per table; the message names the column), and never set, so a
-// column's default survives the refusal.
-[[nodiscard]] auto null_allowed(bc_ctx* cx, const SetTarget& at, std::uint32_t col) -> bool {
-  if (at.slot->nullable) return true;
-  not_null(cx, at.builder->table, col);
+// A value for column `col` of a row being built that is outside the
+// column's declared type: refused with BC_E_CONSTRAINT, BC_C_RANGE and the
+// table's id (the message names the column), and never set.
+template <typename V>
+[[nodiscard]] auto in_range(bc_ctx* cx, const SetTarget& at, std::uint32_t col, const V& v) -> bool {
+  auto why = bytecask::sql::out_of_range(at.slot->sql, v);
+  if (!why) return true;
+  const auto* t = cx->cat->table(at.builder->table);
+  const auto* c = t == nullptr ? nullptr : t->column(col);
+  cx->raise(BC_C_RANGE, at.builder->table,
+            *why + " for column \"" + (c == nullptr ? std::to_string(col) : c->name) + "\" of table \"" +
+                (t == nullptr ? std::to_string(at.builder->table) : t->name) + "\"");
   return false;
 }
 
-template <typename Set>
-void set_column(bc_ctx* cx, bc_row r, std::uint32_t col, std::optional<PhysType> type, Set&& set) {
+template <typename V, typename Set>
+void set_column(bc_ctx* cx, bc_row r, std::uint32_t col, std::optional<PhysType> type, const V& v, Set&& set) {
   auto at = set_target(cx, r, col, type);
-  if (!at) return;
+  if (!at || !in_range(cx, *at, col, v)) return;
   auto* b = at->builder;
   // The column is declared with this type and in the current layout: the
   // writer cannot refuse it.
@@ -2010,19 +2020,19 @@ bc_row bc_row_from(bc_ctx* cx, uint32_t table, bc_view old) {
 
 void bc_row_set_i64(bc_ctx* cx, bc_row r, uint32_t col, int64_t v) {
   BC_GUARD_BEGIN
-  set_column(cx, r, col, PhysType::I64, [&](RowWriter& w) { return w.set_i64(col, v); });
+  set_column(cx, r, col, PhysType::I64, v, [&](RowWriter& w) { return w.set_i64(col, v); });
   BC_GUARD_END(cx)
 }
 
 void bc_row_set_f64(bc_ctx* cx, bc_row r, uint32_t col, double v) {
   BC_GUARD_BEGIN
-  set_column(cx, r, col, PhysType::F64, [&](RowWriter& w) { return w.set_f64(col, v); });
+  set_column(cx, r, col, PhysType::F64, v, [&](RowWriter& w) { return w.set_f64(col, v); });
   BC_GUARD_END(cx)
 }
 
 void bc_row_set_bool(bc_ctx* cx, bc_row r, uint32_t col, bool v) {
   BC_GUARD_BEGIN
-  set_column(cx, r, col, PhysType::Bool, [&](RowWriter& w) { return w.set_bool(col, v); });
+  set_column(cx, r, col, PhysType::Bool, v, [&](RowWriter& w) { return w.set_bool(col, v); });
   BC_GUARD_END(cx)
 }
 
@@ -2030,14 +2040,16 @@ void bc_row_set_bytes(bc_ctx* cx, bc_row r, uint32_t col, bc_view v) {
   BC_GUARD_BEGIN
   auto bytes = cx->resolve(v);
   if (!bytes) return;
-  set_column(cx, r, col, PhysType::Bytes, [&](RowWriter& w) { return w.set_bytes(col, *bytes); });
+  set_column(cx, r, col, PhysType::Bytes, *bytes, [&](RowWriter& w) { return w.set_bytes(col, *bytes); });
   BC_GUARD_END(cx)
 }
 
 void bc_row_set_null(bc_ctx* cx, bc_row r, uint32_t col) {
   BC_GUARD_BEGIN
+  // A NOT NULL column is refused at bc_row_end, after every value of the
+  // row is checked against its declared type, as PostgreSQL checks.
   auto at = set_target(cx, r, col, std::nullopt);
-  if (!at || !null_allowed(cx, *at, col)) return;
+  if (!at) return;
   if (!at->builder->writer.set_null(col)) cx->fail(BC_L_ROW, "column is not in the row's layout");
   BC_GUARD_END(cx)
 }
@@ -2052,7 +2064,7 @@ void bc_row_set_param(bc_ctx* cx, bc_row r, uint32_t col, uint32_t i) {
     cx->fail(BC_E_HANDLE, "parameter $" + std::to_string(i + 1) + " is not " + type_name(at->slot->type));
     return;
   }
-  if (std::holds_alternative<std::monostate>(*d) && !null_allowed(cx, *at, col)) return;
+  if (!in_range(cx, *at, col, *d)) return;
   if (!bytecask::sql::set_datum(at->builder->writer, col, *d)) cx->fail(BC_L_ROW, "column is not in the row's layout");
   BC_GUARD_END(cx)
 }
@@ -2062,7 +2074,11 @@ bc_view bc_row_end(bc_ctx* cx, bc_row r) {
   auto* b = row_builder(cx, r);
   if (b == nullptr) return {};
   b->done = true;
-  // A NOT NULL column the plan never set and that has no default.
+  // A NOT NULL column set to NULL, or never set and with no default:
+  // BC_E_CONSTRAINT, BC_C_NOT_NULL and the table's id (column ids are per
+  // table; the message names the column). Checked last, after every value
+  // the row was given passed its range check, so an out-of-range value is
+  // BC_C_RANGE whatever else the row holds, as in PostgreSQL.
   if (auto col = b->writer.missing_required()) {
     not_null(cx, b->table, *col);
     return {};

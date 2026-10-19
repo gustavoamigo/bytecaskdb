@@ -13,7 +13,8 @@
 // float, str (as UTF-8) and bytes.
 //
 // Errors: bytecask_sql.ExecError for a plan that ran and failed, with its
-// code (a bc_error_code, or BC_CONFLICT when every retry conflicted) and, for
+// code (a bc_error_code), conflict (true when every retry conflicted: code
+// is then BC_CONFLICT, the same number as BC_E_IO) and, for
 // BC_E_CONSTRAINT, the constraint kind and the object id; bytecask_sql.SqlError
 // for a statement the layer refuses before it runs (parse and bind errors,
 // a DDL the catalog refuses, parameters of the wrong number or type);
@@ -60,6 +61,7 @@ Exceptions exceptions;  // NOLINT(cppcoreguidelines-avoid-non-const-global-varia
 void raise_exec_error(const sql::ExecError& e) {
   nb::object exc = nb::borrow(exceptions.exec_error)(nb::str(e.what()));
   exc.attr("code") = e.code();
+  exc.attr("conflict") = e.conflict();
   exc.attr("constraint") = nb::none();
   exc.attr("object_id") = nb::none();
   if (auto c = e.constraint()) {

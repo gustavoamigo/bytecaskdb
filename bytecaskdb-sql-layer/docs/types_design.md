@@ -41,13 +41,20 @@ Widening is why the plan language has one integer type: a column declared
 `INTEGER` is an `i64` in the row and in every `bc_*` call, and `2147483647 + 1`
 is not an overflow but an assignment that fails its range check.
 
-**Declared widths and lengths are checked on assignment, not on read.** An
-`INSERT` or `UPDATE` into an `INTEGER`, `VARCHAR(n)` or `DECIMAL(p, s)`
-column checks the value against the declared type and raises
-`bc_raise(BC_C_RANGE, column_id)` when it does not fit: outside
-[−2^31, 2^31) for `INTEGER`, more than `n` code points, or more than `p − s`
-integer digits. Reads trust the row. A `TIME` outside its range is refused
-the same way.
+**Declared widths and lengths are checked on assignment, not on read.**
+The row builder checks every value a statement writes (`bc_row_set_*`,
+`bc_row_set_param`) against its column's declared type and refuses one that
+does not fit with `BC_E_CONSTRAINT`, `BC_C_RANGE` and the table's id, the
+message naming the column: outside [−2^15, 2^15) for `SMALLINT` or
+[−2^31, 2^31) for `INTEGER`, a `REAL` that overflows or underflows `float`,
+more than `n` code points for `VARCHAR(n)`, more than `p − s` integer digits
+for `DECIMAL(p, s)`, a `TIME` outside one day. SQL reports it as SQLSTATE
+22003, 22001 for a string too long, or 22008 for a `TIME`. A `DEFAULT` is checked the same way
+at `CREATE TABLE` and `ADD COLUMN`. Reads trust the row, and a lookup is not
+a write: a key parameter outside its column's type finds nothing, as in
+PostgreSQL. `NOT NULL` is checked when the row ends, after these, so a row
+holding both reports the range, as PostgreSQL does. A `VARCHAR(n)` value
+whose excess is only spaces is refused, where PostgreSQL truncates it.
 
 **Text is valid UTF-8.** The embedded API and the server refuse a `TEXT` or
 `VARCHAR` parameter that is not well-formed UTF-8 before the plan runs; the

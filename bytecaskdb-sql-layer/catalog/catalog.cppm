@@ -22,12 +22,14 @@ module;
 #include <atomic>
 #include <bit>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -85,6 +87,8 @@ enum class SqlKind : std::uint8_t {
 };
 
 // DECIMAL(p, s) is a scaled i64: p of at most 18 digits fits.
+// TIME is microseconds since midnight, in [0, kMicrosPerDay).
+inline constexpr std::int64_t kMicrosPerDay = 86'400'000'000;
 inline constexpr std::uint8_t kMaxDecimalPrecision = 18;
 
 struct SqlType {
@@ -102,6 +106,20 @@ struct SqlType {
 [[nodiscard]] auto sql_type_name(SqlType t) -> std::string;
 // Whether a datum is NULL or of the physical type.
 [[nodiscard]] auto datum_fits(const Datum& d, PhysType t) -> bool;
+// UTF-8 code points: bytes that do not continue a sequence. VARCHAR(n)
+// counts these.
+[[nodiscard]] auto code_points(BytesView s) -> std::size_t;
+// Why a value of the column's physical type is outside its declared type,
+// in PostgreSQL's words, or nullopt: a SMALLINT or INTEGER out of range, a
+// REAL that overflows or underflows float, a VARCHAR(n) of more than n code
+// points, a DECIMAL(p, s) of more than p digits, a TIME outside one day
+// (microseconds in [0, 86 400 000 000)). The one check of a declared
+// range, for a value written (BC_C_RANGE) and a DEFAULT.
+[[nodiscard]] auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string>;
+[[nodiscard]] auto out_of_range(SqlType t, double v) -> std::optional<std::string>;
+[[nodiscard]] auto out_of_range(SqlType t, BytesView v) -> std::optional<std::string>;
+[[nodiscard]] inline auto out_of_range(SqlType, bool) -> std::optional<std::string> { return std::nullopt; }
+[[nodiscard]] auto out_of_range(SqlType t, const Datum& d) -> std::optional<std::string>;
 // Sets one column of a row writer to a datum (NULL sets it null). False for
 // a type mismatch.
 [[nodiscard]] auto set_datum(RowWriter& w, std::uint32_t col_id, const Datum& d) -> bool;
@@ -723,6 +741,72 @@ auto sql_type_name(SqlType t) -> std::string {
     case SqlKind::Time: return "time";
   }
   return "?";
+}
+
+auto code_points(BytesView s) -> std::size_t {
+  return static_cast<std::size_t>(
+      std::ranges::count_if(s, [](std::byte b) { return (std::to_integer<unsigned>(b) & 0xC0u) != 0x80u; }));
+}
+
+auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string> {
+  switch (t.kind) {
+    case SqlKind::SmallInt:
+      if (!std::in_range<std::int16_t>(v)) return "smallint out of range";
+      break;
+    case SqlKind::Integer:
+      if (!std::in_range<std::int32_t>(v)) return "integer out of range";
+      break;
+    case SqlKind::Decimal: {
+      // p digits: |v| < 10^p, on the scaled value.
+      std::int64_t limit = 1;
+      for (std::uint8_t i = 0; i < t.precision; ++i) limit *= 10;
+      if (v <= -limit || v >= limit) return "numeric field overflow";
+      break;
+    }
+    case SqlKind::Time:
+      if (v < 0 || v >= kMicrosPerDay) return "time out of range";
+      break;
+    case SqlKind::BigInt:
+    case SqlKind::Real:
+    case SqlKind::Double:
+    case SqlKind::Boolean:
+    case SqlKind::Bytea:
+    case SqlKind::Text:
+    case SqlKind::Varchar:
+    case SqlKind::Timestamp:
+    case SqlKind::Date: break;
+  }
+  return std::nullopt;
+}
+
+auto out_of_range(SqlType t, double v) -> std::optional<std::string> {
+  if (t.kind != SqlKind::Real) return std::nullopt;
+  auto f = static_cast<float>(v);  // finite v past float's range is inf; one below its smallest is 0
+  if (std::isfinite(v) && std::isinf(f)) return "value out of range: overflow";
+  if (v != 0.0 && f == 0.0f) return "value out of range: underflow";
+  return std::nullopt;
+}
+
+auto out_of_range(SqlType t, BytesView v) -> std::optional<std::string> {
+  if (t.kind == SqlKind::Varchar && code_points(v) > t.length) {
+    return "value too long for type character varying(" + std::to_string(t.length) + ")";
+  }
+  return std::nullopt;
+}
+
+auto out_of_range(SqlType t, const Datum& d) -> std::optional<std::string> {
+  return std::visit(
+      [&](const auto& v) -> std::optional<std::string> {
+        using V = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<V, std::monostate>) {
+          return std::nullopt;
+        } else if constexpr (std::is_same_v<V, Bytes>) {
+          return out_of_range(t, BytesView{v});
+        } else {
+          return out_of_range(t, v);
+        }
+      },
+      d);
 }
 
 auto datum_fits(const Datum& d, PhysType t) -> bool {

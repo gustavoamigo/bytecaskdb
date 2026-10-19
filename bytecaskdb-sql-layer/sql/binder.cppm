@@ -171,11 +171,6 @@ auto scaled_decimal(std::string_view text, std::uint8_t precision, std::uint8_t 
   return neg ? -v : v;
 }
 
-// UTF-8 code points: bytes that do not continue a sequence.
-auto code_points(std::string_view s) -> std::size_t {
-  return static_cast<std::size_t>(std::ranges::count_if(s, [](char ch) { return (static_cast<unsigned char>(ch) & 0xC0) != 0x80; }));
-}
-
 // A DEFAULT constant folded to the column's stored value.
 auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
   using K = ast::Literal::Kind;
@@ -189,10 +184,7 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
       if (l.kind != K::Integer) bad();
       auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
       if (ec != std::errc{} || end != l.text.data() + l.text.size()) bad();
-      auto lim = t.kind == SqlKind::SmallInt ? std::int64_t{1} << 15 : std::int64_t{1} << 31;
-      if (t.kind != SqlKind::BigInt && (v < -lim || v >= lim)) {
-        throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
-      }
+      if (out_of_range(t, v)) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
       return v;
     }
     case SqlKind::Decimal: {
@@ -207,20 +199,18 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
       if (l.kind != K::Integer && l.kind != K::Number) bad();
       auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
       if (ec != std::errc{} || end != l.text.data() + l.text.size()) bad();
+      if (out_of_range(t, v)) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
       return v;
     }
     case SqlKind::Boolean:
       if (l.kind != K::Bool) bad();
       return l.b;
     case SqlKind::Varchar:
-      if (l.kind == K::String && code_points(l.text) > t.length) {
-        throw SqlError{"DEFAULT too long for type " + sql_type_name(t), l.pos};
-      }
-      [[fallthrough]];
     case SqlKind::Text:
     case SqlKind::Bytea: {
       if (l.kind != K::String) bad();
       auto b = std::as_bytes(std::span{l.text.data(), l.text.size()});
+      if (out_of_range(t, b)) throw SqlError{"DEFAULT too long for type " + sql_type_name(t), l.pos};
       return Bytes(b.begin(), b.end());
     }
     case SqlKind::Timestamp:
@@ -396,15 +386,9 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
               throw SqlError{"INSERT values must be parameters", s.values[i].pos};
             }
           }
-          for (std::size_t i = 0; i < t->columns.size(); ++i) {
-            const auto& c = t->columns[i];
-            if (!out.values[i] && std::ranges::find(t->pk_col_ids, c.id) != t->pk_col_ids.end()) {
-              throw SqlError{"primary key column \"" + c.name + "\" must be given", s.pos};
-            }
-            if (!out.values[i] && !c.nullable && std::holds_alternative<std::monostate>(c.default_value)) {
-              throw SqlError{"column \"" + c.name + "\" is NOT NULL and has no value", s.pos};
-            }
-          }
+          // A column left out takes its default. One that is NOT NULL with no
+          // default, a primary key column among them, is refused when the
+          // row is built (BC_C_NOT_NULL), as a NULL given for it is.
           return {out, s.pos};
         } else if constexpr (std::is_same_v<T, ast::Select>) {
           const auto* t = b.table(s.table, s.pos);

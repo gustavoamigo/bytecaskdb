@@ -52,16 +52,25 @@ struct Rows {
 
 // A plan that ran and failed: the plan API's error code, its detail and
 // message (a duplicate key is BC_E_CONSTRAINT with BC_C_UNIQUE in the
-// detail's high byte, raised by the plan), or BC_CONFLICT when every retry
-// conflicted.
+// detail's high byte, raised by the plan); or a conflict on every retry.
+// BC_CONFLICT and BC_E_IO are both 1, so conflict() tells them apart, not
+// code().
 class ExecError : public std::runtime_error {
 public:
   ExecError(const std::string& what, int code, std::uint32_t detail = 0)
       : std::runtime_error{what}, code_{code}, detail_{detail} {}
+  // Every attempt conflicted; code() is BC_CONFLICT.
+  [[nodiscard]] static auto conflicted(const std::string& what) -> ExecError {
+    ExecError e{what, BC_CONFLICT};
+    e.conflict_ = true;
+    return e;
+  }
   ExecError(const ExecError&) = default;
   ExecError& operator=(const ExecError&) = default;
   ~ExecError() override;  // out of line: anchors the vtable (-Wweak-vtables)
+  // A bc_error_code; BC_CONFLICT when conflict().
   [[nodiscard]] auto code() const noexcept -> int { return code_; }
+  [[nodiscard]] auto conflict() const noexcept -> bool { return conflict_; }
   // bc_error_detail: for BC_E_CONSTRAINT, the bc_constraint in the high byte
   // and the object id in the low 24 bits.
   [[nodiscard]] auto detail() const noexcept -> std::uint32_t { return detail_; }
@@ -74,6 +83,7 @@ public:
 private:
   int code_;
   std::uint32_t detail_;
+  bool conflict_{false};
 };
 
 // Parameters a statement does not take: the wrong number, or a value not of
@@ -343,7 +353,7 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   const auto& p = *stmt.plan_;
   if (r == BC_CONFLICT) {
     bc_ctx_reset(cx_);
-    throw ExecError("conflict: a guard failed on every attempt", BC_CONFLICT);
+    throw ExecError::conflicted("conflict: a guard failed on every attempt");
   }
   if (r == BC_FAILED) {
     ExecError e{bc_error_message(cx_), bc_error(cx_), bc_error_detail(cx_)};

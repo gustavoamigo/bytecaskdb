@@ -183,16 +183,24 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos) -> CreateTable
     reject("CREATE TABLE option not supported", s->relation->location);
   }
   CreateTable t{relation(s->relation), {}, {}, pos};
+  // One PRIMARY KEY, on a column or on the table: PostgreSQL refuses a
+  // second (42P16), so two column-level ones are not a composite key.
+  auto primary_keys = 0;
+  auto one_primary_key = [&](std::int32_t location) {
+    if (++primary_keys > 1) reject("multiple primary keys for table \"" + t.table + "\" are not allowed", location);
+  };
   for (std::size_t i = 0; i < s->n_table_elts; ++i) {
     const auto* el = s->table_elts[i];
     if (el->node_case == PG_QUERY__NODE__NODE_CONSTRAINT) {
       const auto* c = el->constraint;
       if (c->contype != PG_QUERY__CONSTR_TYPE__CONSTR_PRIMARY) reject("table constraint not supported", c->location);
+      one_primary_key(c->location);
       for (std::size_t k = 0; k < c->n_keys; ++k) t.pk.push_back(str(c->keys[k]));
       continue;
     }
     if (el->node_case != PG_QUERY__NODE__NODE_COLUMN_DEF) reject("table element not supported", -1);
     t.columns.push_back(column_def(el->column_def));
+    if (t.columns.back().primary_key) one_primary_key(t.columns.back().pos);
   }
   return t;
 }

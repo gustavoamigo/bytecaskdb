@@ -12,9 +12,9 @@ only the expected catalog.
 
 Increment 1: CREATE TABLE (a few types, composite primary keys, nullable
 columns, defaults, and refused variants), DROP TABLE [IF EXISTS], INSERT
-weighted towards duplicate keys and NULLs, a point lookup by the full
-primary key, and a reopen of the layer's database. Values stay inside their
-declared types (docs/testing_design.md, *Known differences*).
+weighted towards duplicate keys, NULLs, left-out NOT NULL columns and
+values outside their declared types, a point lookup by the full primary
+key, and a reopen of the layer's database (docs/testing_design.md).
 
 The fixed cases at the end call the same steps in a set order.
 """
@@ -36,6 +36,7 @@ from conftest import Oracle
 
 TYPES = [o.BIGINT, o.INTEGER, o.SMALLINT, o.DOUBLE, o.BOOLEAN, o.TEXT, o.varchar(4), o.BYTEA]
 TABLE_NAMES = ["t0", "t1", "t2", "t3"]
+BIGINT_LOW, BIGINT_HIGH = o.BIGINT.low, o.BIGINT.high
 
 
 @dataclasses.dataclass
@@ -45,8 +46,10 @@ class Column:
     nullable: bool = True
     default: object = None  # None: no DEFAULT clause
 
-    def ddl(self, pg: bool) -> str:
+    def ddl(self, pg: bool, primary_key: bool = False) -> str:
         out = f"{self.name} {self.type.pg if pg else self.type.sql}"
+        if primary_key:
+            out += " PRIMARY KEY"
         if not self.nullable:
             out += " NOT NULL"
         if self.default is not None:
@@ -59,13 +62,18 @@ class Table:
     name: str
     columns: list[Column]
     pk: list[str]
+    # Where the primary key is declared: "table", PRIMARY KEY (…); "column",
+    # on each of its columns; "both", on its first column and the table.
+    # Only "table", or "column" with one key column, declare one key.
+    pk_style: str = "table"
 
     def column(self, name: str) -> Column:
         return next(c for c in self.columns if c.name == name)
 
     def ddl(self, pg: bool) -> str:
-        parts = [c.ddl(pg) for c in self.columns]
-        if self.pk:
+        on_column = set(self.pk if self.pk_style == "column" else self.pk[:1] if self.pk_style == "both" else [])
+        parts = [c.ddl(pg, c.name in on_column) for c in self.columns]
+        if self.pk and self.pk_style != "column":
             parts.append(f"PRIMARY KEY ({', '.join(self.pk)})")
         return f"CREATE TABLE {self.name} ({', '.join(parts)})"
 
@@ -75,16 +83,24 @@ class Table:
 
 
 def values(t: o.Type) -> st.SearchStrategy:
-    """A value of the type, inside its declared range."""
+    """A value of the type's physical kind: mostly inside its declared
+    range, sometimes outside it (a BIGINT for an INTEGER, a VARCHAR(n) of
+    more than n characters), which both sides refuse."""
     if t.kind == "int":
-        return st.one_of(st.integers(-3, 3), st.integers(t.low, t.high))
+        edges = st.sampled_from([t.low, t.high, t.low - 1, t.high + 1]).filter(lambda v: BIGINT_LOW <= v <= BIGINT_HIGH)
+        return st.one_of(st.integers(-3, 3), st.integers(t.low, t.high), edges, st.integers(BIGINT_LOW, BIGINT_HIGH))
     if t.kind == "float":
         return st.floats(allow_nan=False, allow_infinity=False)
     if t.kind == "bool":
         return st.booleans()
     if t.kind == "text":
         chars = st.characters(blacklist_categories=("Cs",), blacklist_characters="\x00")
-        return st.text(chars, max_size=t.length or 6)
+        if not t.length:
+            return st.text(chars, max_size=6)
+        # PostgreSQL truncates a VARCHAR(n) whose excess is only spaces; the
+        # layer refuses it (docs/testing_design.md, *Known differences*).
+        n = t.length
+        return st.text(chars, max_size=n + 2).filter(lambda v: len(v) <= n or v[n:].strip(" "))
     return st.binary(max_size=6)
 
 
@@ -164,17 +180,6 @@ class SqlMachine(RuleBasedStateMachine):
         marks = ", ".join(f"${i + 1}" for i in range(len(cols)))
         target = "" if all_columns else f" ({', '.join(cols)})"
         sql = f"INSERT INTO {name}{target} VALUES ({marks})"
-        t = self.tables.get(name)
-        if t is not None and any(c.name not in row and (c.name in t.pk or (not c.nullable and c.default is None))
-                                 for c in t.columns):
-            # Known difference: the layer refuses an INSERT that leaves out a
-            # NOT NULL column with no default (a primary key column among them)
-            # when it binds; PostgreSQL inserts NULL and reports the NOT NULL
-            # violation.
-            layer = o.run_layer(self.db, sql, params)
-            pg = o.run_pg(self.pg.conn, sql, params)
-            assert (layer.error, pg.error) == ("refused", o.SQLSTATE["not_null"]), (sql, layer, pg)
-            return layer
         return self.both(sql, params)
 
     def lookup(self, name: str, key: tuple) -> o.Outcome:
@@ -218,8 +223,13 @@ class SqlMachine(RuleBasedStateMachine):
             if c.name in pk:
                 c.default = None
         t = Table(name, columns, list(pk))
-        variant = data.draw(st.sampled_from(["ok"] * 6 + ["duplicate column", "unknown pk column", "no pk"]))
-        if variant == "duplicate column" and n > 1:
+        variant = data.draw(st.sampled_from(["ok"] * 6 + ["duplicate column", "unknown pk column", "no pk",
+                                                          "column pk", "column and table pk"]))
+        if variant == "column pk":
+            t.pk_style = "column"  # two key columns: two PRIMARY KEYs, which both refuse
+        elif variant == "column and table pk":
+            t.pk_style = "both"
+        elif variant == "duplicate column" and n > 1:
             t.columns[-1].name = t.columns[0].name
             t.pk = [t.columns[0].name]
         elif variant == "unknown pk column":
@@ -248,10 +258,10 @@ class SqlMachine(RuleBasedStateMachine):
         row = {}
         for c in t.columns:
             # Leave out a column now and then: one with a default or nullable
-            # often, a NOT NULL one without a default rarely (both refuse it).
-            optional = c.nullable or c.default is not None
-            if not all_columns and c.name not in t.pk and data.draw(st.integers(0, 3 if optional else 11),
-                                                                     label=f"omit {c.name}") == 0:
+            # often, a NOT NULL one without a default, a key column among
+            # them, rarely (both refuse it, 23502).
+            optional = (c.nullable or c.default is not None) and c.name not in t.pk
+            if not all_columns and data.draw(st.integers(0, 3 if optional else 11), label=f"omit {c.name}") == 0:
                 continue
             if dup is not None and c.name in t.pk:
                 row[c.name] = dup[t.pk.index(c.name)]
@@ -319,9 +329,8 @@ def test_null_for_not_null_is_23502_and_defaults_fill_the_rest(dsn):
         m.create(Table("t0", cols, ["c0"]))
         assert m.insert("t0", {"c0": 1, "c1": None, "c2": True}, all_columns=False).error == "23502"
         assert m.insert("t0", {"c0": 1, "c2": False}, all_columns=False).error is None
-        # c2 left unset: the layer refuses it when it binds, PostgreSQL reports 23502
-        # (docs/testing_design.md, *Known differences*); insert() checks both.
-        assert m.insert("t0", {"c0": 2}, all_columns=False).error == "refused"
+        # c2 left unset, NOT NULL with no default: 23502 on both.
+        assert m.insert("t0", {"c0": 2}, all_columns=False).error == "23502"
         m.check()
     finally:
         m.teardown()
@@ -364,7 +373,38 @@ def test_insert_without_a_primary_key_column(dsn):
     m = fixed(dsn)
     try:
         m.create(Table("t0", [Column("c0", o.BIGINT), Column("c1", o.BIGINT)], ["c0", "c1"]))
-        m.insert("t0", {"c0": 1}, all_columns=False)
+        assert m.insert("t0", {"c0": 1}, all_columns=False).error == "23502"
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_values_outside_their_declared_type_are_22003_and_22001(dsn):
+    m = fixed(dsn)
+    try:
+        cols = [Column("c0", o.BIGINT), Column("c1", o.SMALLINT), Column("c2", o.INTEGER), Column("c3", o.varchar(4)),
+                Column("c4", o.BOOLEAN, nullable=False, default=False)]
+        m.create(Table("t0", cols, ["c0"]))
+        # A row also NULL in a NOT NULL column: the type check comes first on both.
+        assert m.insert("t0", {"c0": 1, "c1": 2**15, "c4": None}, all_columns=False).error == "22003"
+        assert m.insert("t0", {"c0": None, "c3": "abcde"}, all_columns=False).error == "22001"
+        for col, value, state in [("c1", 2**15, "22003"), ("c1", -(2**15) - 1, "22003"), ("c2", 2**31, "22003"),
+                                  ("c3", "abcde", "22001"), ("c3", "ééééé", "22001")]:
+            assert m.insert("t0", {"c0": 1, col: value}, all_columns=False).error == state, (col, value)
+        assert m.insert("t0", {"c0": 1, "c1": 2**15 - 1, "c2": -(2**31), "c3": "éééé"}, all_columns=False).error is None
+        assert m.lookup("t0", (2**40,)).rows == ()  # a lookup is not a write: no refusal
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_two_primary_keys_are_refused(dsn):
+    m = fixed(dsn)
+    try:
+        cols = [Column("c0", o.BIGINT), Column("c1", o.BIGINT)]
+        assert m.create(Table("t0", cols, ["c0", "c1"], pk_style="column")).error == "refused"
+        assert m.create(Table("t0", cols, ["c0", "c1"], pk_style="both")).error == "refused"
+        assert m.create(Table("t0", cols, ["c1"], pk_style="column")).error is None
         m.check()
     finally:
         m.teardown()
