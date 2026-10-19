@@ -218,9 +218,8 @@ int main() {
     };
     auto base = runs(nullptr);
     std::printf("bc_ctx_run of an empty plan, no schema ref: %7.1f ns\n", base);
-    std::uint64_t next_id = 1;  // each reference its own id: one shared would be served the other's entry
     for (const auto& [name, spec] : {std::pair{"point read", &point}, std::pair{"New-Order", &new_order}}) {
-      auto cached = make_ref(*cat, *spec, next_id++);
+      auto cached = make_ref(*cat, *spec, bc_ref_id());
       auto uncached = make_ref(*cat, *spec, 0);  // id 0: verified on every run
       auto hit = runs(&cached->ref) - base;
       auto miss = runs(&uncached->ref) - base;
@@ -231,7 +230,7 @@ int main() {
     // prepared statements does: each must stay cached between its runs.
     {
       std::vector<std::unique_ptr<Ref>> many;
-      for (int i = 0; i < 50; ++i) many.push_back(make_ref(*cat, new_order, next_id++));
+      for (int i = 0; i < 50; ++i) many.push_back(make_ref(*cat, new_order, bc_ref_id()));
       std::size_t at = 0;
       bc_ctx_begin(cx, &ps, {});
       for (const auto& r : many) bc_ctx_run(cx, noop, &r->ref);  // the first verification of each
@@ -250,8 +249,8 @@ int main() {
     // keeps the hot ones, one hit.
     {
       std::vector<std::unique_ptr<Ref>> hot, cold;
-      for (int i = 0; i < 20; ++i) hot.push_back(make_ref(*cat, new_order, next_id++));
-      for (int i = 0; i < 2000; ++i) cold.push_back(make_ref(*cat, new_order, next_id++));
+      for (int i = 0; i < 20; ++i) hot.push_back(make_ref(*cat, new_order, bc_ref_id()));
+      for (int i = 0; i < 2000; ++i) cold.push_back(make_ref(*cat, new_order, bc_ref_id()));
       std::size_t h = 0, c = 0;
       bc_ctx_begin(cx, &ps, {});
       auto run_one = [&](auto& v, std::size_t& at) {
@@ -271,7 +270,27 @@ int main() {
       std::printf("2,000 cold refs round robin: per run %7.1f ns; with a hot ref between, the hot one %7.1f ns\n",
                   cold_only - base, pair - cold_only - base);
     }
-    auto wref = make_ref(*cat, {{"warehouse"}, {}, {{"warehouse", "w_tax"}}, {}}, next_id++);
+    // 1,500 dead references fill the cache, as recompiles leave it, then two
+    // live ones run in turn: CLOCK evicts the dead, and both hit.
+    {
+      std::vector<std::unique_ptr<Ref>> dead;
+      for (int i = 0; i < 1500; ++i) dead.push_back(make_ref(*cat, new_order, bc_ref_id()));
+      auto a = make_ref(*cat, new_order, bc_ref_id());
+      auto b = make_ref(*cat, new_order, bc_ref_id());
+      bc_ctx_begin(cx, &ps, {});
+      for (const auto& r : dead) bc_ctx_run(cx, noop, &r->ref);
+      auto turn = false;
+      auto alternating = ns_per_iter(
+          [&] {
+            bc_ctx_run(cx, noop, turn ? &a->ref : &b->ref);
+            turn = !turn;
+          },
+          kIters);
+      if (bc_error(cx) != BC_OK) std::printf("error: %s\n", bc_error_message(cx));
+      bc_ctx_reset(cx);
+      std::printf("1,500 dead refs, then 2 live ones in turn: check per run %7.1f ns\n", alternating - base);
+    }
+    auto wref = make_ref(*cat, {{"warehouse"}, {}, {{"warehouse", "w_tax"}}, {}}, bc_ref_id());
     auto run = [&](bc_plan_fn plan, const bc_schema_ref* ref) {
       bc_ctx_begin(cx, &ps, {});
       bc_ctx_run(cx, plan, ref);

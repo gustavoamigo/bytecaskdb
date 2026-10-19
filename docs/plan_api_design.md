@@ -268,7 +268,7 @@ typedef struct { uint32_t table, col; uint8_t type; } bc_col_ref;
    catalog version (docs/sql_layer_catalog_design.md, *Compatibility*); the
    result layout is the plan's own and is not a catalog object. */
 typedef struct {
-  uint64_t id;                                                  /* nonzero, one per compiled plan; 0: checked on every run */
+  uint64_t id;                                                  /* from bc_ref_id, one per compiled plan; 0: checked on every run */
   uint64_t catalog_version;                                     /* compiled against; for messages */
   const uint32_t   *objects_read;    uint32_t n_read;           /* tables and indexes it names */
   const uint32_t   *tables_written;  uint32_t n_written;        /* tables whose rows it writes */
@@ -323,6 +323,7 @@ enum bc_error_code bc_error(const bc_ctx *);
 const char *bc_error_message(const bc_ctx *);
 uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits; BC_E_LAYOUT: a bc_layout_detail */
 int64_t bc_ctx_affected(const bc_ctx *);                   /* what bc_emit_count recorded, or -1 */
+uint64_t bc_ref_id(void);                                  /* a fresh bc_schema_ref id; an id it never issued is treated as 0 */
 int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params *,
                    bc_budget, bool sync, uint32_t max_retries);               /* the retry loop */
 ```
@@ -351,8 +352,9 @@ reference that reuses an id is verified on its own. The version is the catalog's
 is bound to one database at `bc_ctx_new`, and within a database a catalog
 version is never reused, so no pointer is compared (a freed catalog's
 address can be reused, its version cannot). An `id` of 0 is never cached.
-The compiler gives every plan it compiles a fresh `id`, a recompile
-included. The result types are compared
+The runtime issues the ids (`bc_ref_id`, a process-wide counter), and the
+compiler takes a fresh one for every plan it compiles, a recompile included;
+an id the runtime never issued is treated as 0. The result types are compared
 without allocating, and the result layout is rebuilt only when they
 change.
 
@@ -1075,13 +1077,15 @@ them.
   none. `bc_col_ref` loses `layout` and `pos` and gains `table`.
   `bc_row_begin` and `bc_row_from` take the table, not a layout id, and the
   `LAY_` constants are gone; `PART_<k>_<c>` constants name key parts.
-- A column a plan reads or sets must be declared in its reference, and a
-  row view knows its table: a decoder on another view, another table's
+- Every table, index and column a plan names must be declared in its
+  reference, a table it writes in `tables_written`, and a row view knows its
+  table: a decoder on another view, another table's
   column or another type is `BC_E_HANDLE`. A setter of another type was
   `BC_E_LAYOUT`.
 - `bc_schema_ref` loses `indexes_written`, and `CREATE INDEX` invalidates no
   plan: the runtime maintains whatever indexes the pinned version has.
-  It gains `id`, which keys a context's cache of verified references:
+  It gains `id`, issued by the runtime (`bc_ref_id`), which keys a
+  context's cache of verified references:
   verifying a reference already verified against the pinned catalog
   version is a hash lookup and a compare instead of a walk of the catalog
   and an allocation per run. `BC_E_LAYOUT` gains a detail,

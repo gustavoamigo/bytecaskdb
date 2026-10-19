@@ -100,7 +100,7 @@ typedef struct {
    *Compatibility*), and caches the result per id and catalog version; the
    result layout is the plan's own and is not a catalog object. */
 typedef struct {
-  uint64_t id;                                                    /* nonzero, one per compiled plan; 0: checked on every run */
+  uint64_t id;                                                    /* from bc_ref_id, one per compiled plan; 0: checked on every run */
   uint64_t catalog_version;                                       /* compiled against; for messages */
   const uint32_t   *objects_read;    uint32_t n_read;             /* tables and indexes it names */
   const uint32_t   *tables_written;  uint32_t n_written;          /* tables whose rows it writes */
@@ -122,6 +122,7 @@ enum bc_error_code bc_error(const bc_ctx *);
 const char *bc_error_message(const bc_ctx *);
 uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits; BC_E_LAYOUT: a bc_layout_detail */
 int64_t bc_ctx_affected(const bc_ctx *);                   /* what bc_emit_count recorded, or -1 */
+uint64_t bc_ref_id(void);                                  /* a fresh bc_schema_ref id; an id it never issued is treated as 0 */
 int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params *,
                    bc_budget, bool sync, uint32_t max_retries);               /* the retry loop */
 

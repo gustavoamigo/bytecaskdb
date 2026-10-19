@@ -131,13 +131,6 @@ inline auto all_tables(const bytecask::sql::Catalog& cat) -> std::vector<std::ui
   return out;
 }
 
-// A fresh reference id: a context caches what it verified by id, so two
-// references that differ must not share one.
-inline auto next_ref_id() -> std::uint64_t {
-  static std::uint64_t next = std::uint64_t{1} << 40;  // clear of the code generator's ids
-  return next++;
-}
-
 // A bc_schema_ref and the arrays it points into. Each get() is a new
 // reference, with a fresh id.
 struct SchemaRef {
@@ -148,7 +141,7 @@ struct SchemaRef {
 
   [[nodiscard]] auto get() const -> bc_schema_ref {
     auto n = [](const auto& v) { return static_cast<std::uint32_t>(v.size()); };
-    return {next_ref_id(), version, read.data(), n(read), written.data(), n(written),
+    return {bc_ref_id(), version, read.data(), n(read), written.data(), n(written),
             cols.data(), n(cols), codes.data(), n(codes)};
   }
 };

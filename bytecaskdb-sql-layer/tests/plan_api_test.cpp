@@ -286,6 +286,12 @@ TEST_CASE("plan API: a context caches a verified reference by id and catalog ver
   CHECK(bc_execute(f.cx, scan_index, &uncached, &none, {}, false, 0) == BC_COMMITTED);
   CHECK_FALSE(served_from_cache(uncached));
 
+  // An id the runtime never issued is no id: verified on every run.
+  auto forged = ref;
+  forged.id = std::numeric_limits<std::uint64_t>::max();
+  CHECK(bc_execute(f.cx, scan_index, &forged, &none, {}, false, 0) == BC_COMMITTED);
+  CHECK_FALSE(served_from_cache(forged));
+
   // A flood of 2,000 other references, twice the cache, with the first one
   // run every 20: CLOCK keeps it.
   for (int i = 0; i < 2000; ++i) {

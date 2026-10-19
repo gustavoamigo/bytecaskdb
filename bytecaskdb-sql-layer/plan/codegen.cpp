@@ -5,7 +5,6 @@
 
 module;
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +16,8 @@ module;
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
 
 module bytecask.sql.codegen;
 
@@ -387,10 +388,9 @@ auto generate_plan(const bound::Bound& b, const Catalog& cat, std::string_view s
   GeneratedPlan out;
   out.param_types = b.param_types;
   out.catalog_version = cat.version();
-  // A reference id per compile, process-wide, so a context's cache of
-  // verified references never mistakes a recompiled plan for the old one.
-  static std::atomic<std::uint64_t> next_id{1};
-  out.id = next_id.fetch_add(1, std::memory_order_relaxed);
+  // A reference id per compile, issued by the runtime, so a context's cache
+  // of verified references never mistakes a recompiled plan for the old one.
+  out.id = bc_ref_id();
   auto build = [&](const Table& t, auto&& body) {
     Writer w{t};
     body(w);

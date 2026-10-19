@@ -18,6 +18,7 @@
 // Standard library headers before the module imports, for the reason
 // bytecaskdb/bytecask_hpp.cpp gives (LLVM 22's abi_tag redeclaration error).
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <compare>
 #include <cstddef>
@@ -31,6 +32,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <map>
 #include <set>
 #include <system_error>
 #include <type_traits>
@@ -251,7 +253,15 @@ struct bc_ctx {
   // would derive its index entries from the snapshot's row again, not from
   // the first write's, and leave the first write's entries behind.
   std::set<Bytes, BytesLess> written_rows;
-  std::vector<std::pair<Bytes, Bytes>> deleted_ranges;  // [lo, hi) of each bc_del_range, likewise
+  // Where each part of the last key a key-part decoder read starts, so the
+  // next part of the same key is found without skipping the earlier ones
+  // again. Keyed by the view handle, unique within an execution.
+  struct {
+    bc_view view{};
+    std::uint32_t object{0};
+    std::vector<std::size_t> at;
+  } key_parts;
+  std::map<Bytes, Bytes, BytesLess> deleted_ranges;  // lo -> hi of each bc_del_range, likewise; disjoint
 
   // References verified by bc_ctx_run, kept across executions: slots, a map
   // from reference id to slot, and the CLOCK hand. A context is bound to one
@@ -682,14 +692,23 @@ auto key_part_at(bc_ctx* cx, std::uint32_t table_or_index, bc_view key, std::uin
     cx->fail(BC_E_HANDLE, "key is not of table or index " + std::to_string(table_or_index));
     return std::nullopt;
   }
-  KeyReader r{*k, bytecask::sql::kKeyPrefixBytes};
-  for (std::uint32_t i = 0; i < part; ++i) {
-    if (!r.skip(kl->parts[i])) {
-      cx->fail(BC_E_CORRUPT, "unparseable key");
-      return std::nullopt;
+  auto& kp = cx->key_parts;
+  if (kp.view.i != key.i || kp.view.g != key.g || kp.object != table_or_index) {
+    kp.view = key;
+    kp.object = table_or_index;
+    kp.at.clear();
+    KeyReader r{*k, bytecask::sql::kKeyPrefixBytes};
+    kp.at.push_back(r.pos());
+    for (const auto& p : kl->parts) {
+      if (!r.skip(p)) break;  // the parts after a malformed one have no start
+      kp.at.push_back(r.pos());
     }
   }
-  return KeyPartAt{r, kl->parts[part]};
+  if (part >= kp.at.size()) {
+    cx->fail(BC_E_CORRUPT, "unparseable key");
+    return std::nullopt;
+  }
+  return KeyPartAt{KeyReader{*k, kp.at[part]}, kl->parts[part]};
 }
 
 // Unwraps a decoded part: the value, or the neutral one for a null part or an
@@ -825,6 +844,13 @@ auto cache_slot(bc_ctx* cx, std::uint64_t id) -> Verified& {
   return e;
 }
 
+// The highest reference id the runtime has issued (bc_ref_id). Process-wide,
+// as the ids are: a reference built in one context runs in any.
+auto issued_ref_ids() -> std::atomic<std::uint64_t>& {
+  static std::atomic<std::uint64_t> issued{0};
+  return issued;
+}
+
 // Makes `ref` the execution's reference: from the cache when this context
 // verified it against the pinned version before, verified otherwise.
 [[nodiscard]] auto use_ref(bc_ctx* cx, const bc_schema_ref* ref) -> bool {
@@ -832,8 +858,10 @@ auto cache_slot(bc_ctx* cx, std::uint64_t id) -> Verified& {
     cx->current = nullptr;
     return true;
   }
-  auto& e = ref->id == 0 ? cx->scratch : cache_slot(cx, ref->id);
-  if (ref->id == 0 || !e.valid || e.ref_id != ref->id || e.version != cx->cat->version() || e.shape != shape_of(*ref)) {
+  // An id the runtime never issued is no id: verified on every run.
+  auto id = ref->id <= issued_ref_ids().load(std::memory_order_relaxed) ? ref->id : 0;
+  auto& e = id == 0 ? cx->scratch : cache_slot(cx, id);
+  if (id == 0 || !e.valid || e.ref_id != id || e.version != cx->cat->version() || e.shape != shape_of(*ref)) {
     if (!verify(cx, ref, e)) return false;
   }
   cx->current = &e;
@@ -945,16 +973,15 @@ auto write_row(bc_ctx* cx, const Table& t, bc_view row, bool stored) -> std::opt
   return r->bytes;
 }
 
-[[nodiscard]] auto in_range(BytesView k, BytesView lo, BytesView hi) -> bool {
-  return !std::is_lt(bytes_cmp(k, lo)) && std::is_lt(bytes_cmp(k, hi));
-}
-
 // Records a row key this execution writes; a second write of it, or a write
 // into a range this execution deleted, is a plan bug (BC_E_HANDLE). The keys
-// are a sorted set, a lookup per write; range deletes are few and scanned.
+// and the deleted ranges are sorted sets: a lookup each per write.
 [[nodiscard]] auto first_write(bc_ctx* cx, const Table& t, BytesView pk) -> bool {
-  if (cx->written_rows.contains(pk) ||
-      std::ranges::any_of(cx->deleted_ranges, [&](const auto& r) { return in_range(pk, r.first, r.second); })) {
+  auto deleted = [&] {  // the range starting at or before pk, if pk is below its end
+    auto it = cx->deleted_ranges.upper_bound(pk);
+    return it != cx->deleted_ranges.begin() && std::is_lt(bytes_cmp(pk, std::prev(it)->second));
+  };
+  if (cx->written_rows.contains(pk) || deleted()) {
     cx->fail(BC_E_HANDLE, "a row of table " + t.name + " written twice in one plan");
     return false;
   }
@@ -1143,6 +1170,8 @@ const char* bc_error_message(const bc_ctx* cx) { return cx->message.c_str(); }
 uint32_t bc_error_detail(const bc_ctx* cx) { return cx->detail; }
 
 int64_t bc_ctx_affected(const bc_ctx* cx) { return cx->affected; }
+
+uint64_t bc_ref_id(void) { return issued_ref_ids().fetch_add(1, std::memory_order_relaxed) + 1; }
 
 int bc_execute(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* ref, const bc_params* params, bc_budget budget,
                bool sync, uint32_t max_retries) {
@@ -1983,15 +2012,16 @@ void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
   // So would a range this plan already deleted, whose entries it would
   // delete twice.
   auto written = cx->written_rows.lower_bound(BytesView{range->lo});
-  auto overlaps = [&](const auto& r) {
-    return std::is_lt(bytes_cmp(range->lo, r.second)) && std::is_lt(bytes_cmp(r.first, range->hi));
+  auto overlaps = [&] {  // the ranges are disjoint: only the neighbours of lo can meet [lo, hi)
+    auto next = cx->deleted_ranges.lower_bound(BytesView{range->lo});
+    if (next != cx->deleted_ranges.end() && std::is_lt(bytes_cmp(next->first, range->hi))) return true;
+    return next != cx->deleted_ranges.begin() && std::is_lt(bytes_cmp(range->lo, std::prev(next)->second));
   };
-  if ((written != cx->written_rows.end() && std::is_lt(bytes_cmp(*written, range->hi))) ||
-      std::ranges::any_of(cx->deleted_ranges, overlaps)) {
+  if ((written != cx->written_rows.end() && std::is_lt(bytes_cmp(*written, range->hi))) || overlaps()) {
     cx->fail(BC_E_HANDLE, "bc_del_range over a row of table " + t->name + " this plan already wrote");
     return;
   }
-  cx->deleted_ranges.emplace_back(range->lo, range->hi);
+  cx->deleted_ranges.emplace(range->lo, range->hi);
   if (!t->indexes.empty()) {
     // Each row in the range takes its entries with it. A row inserted into
     // the range after the snapshot makes the commit a conflict: the engine
