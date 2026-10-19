@@ -75,8 +75,8 @@ enum bc_layout_detail {  /* the detail of BC_E_LAYOUT; every BC_E_LAYOUT carries
   BC_L_ROW = 0,           /* a row written to a table it is not of, or a column its layout lacks */
   BC_L_INCOMPATIBLE = 1,  /* bc_ctx_run refused the plan's bc_schema_ref: recompile it */
   BC_L_PLAN = 2,          /* the plan or its bc_schema_ref is malformed, a compiler bug: an unknown result
-                             type, a result row too wide, a table the catalog lacks, result rows emitted
-                             out of order or off their declared types */
+                             type, a result row too wide, result rows emitted out of order or off their
+                             declared types */
   BC_L_RETIRED = 3,       /* a stored row of a layout generation REBUILD retired */
 };
 

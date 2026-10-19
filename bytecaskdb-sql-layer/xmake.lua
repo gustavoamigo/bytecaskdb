@@ -89,6 +89,10 @@ target("sql_layer_tests")
     set_languages("c17", "c++23")
     -- The tests, and the fixtures they share as modules (bytecask.sql.tests.*).
     add_files("tests/*.cpp", "tests/*.cppm")
+    -- The engine's counted allocation-failure seam (tests/alloc_faults.h):
+    -- it replaces the global operator new in this binary.
+    add_files("../tests/alloc_faults.cpp", {defines = "BYTECASK_TESTING"})
+    add_includedirs("../bytecaskdb")
     -- The hand-written plans, compiled by clang as C. Every plan defines
     -- plan(); each is renamed so several link into one binary.
     add_includedirs("algebra")

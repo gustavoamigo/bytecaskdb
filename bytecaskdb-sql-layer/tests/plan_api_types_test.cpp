@@ -606,6 +606,7 @@ void row_key_wrong_table(bc_ctx* cx) {
   bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
   while (bc_scan_next(cx, c)) bc_row_key(cx, kIdx, bc_scan_row(cx, c));
 }
+void row_begin_index(bc_ctx* cx) { (void)bc_row_begin(cx, kIdx); }
 void emit_without_types(bc_ctx* cx) {
   bc_emit_begin(cx);
   bc_emit_i64(cx, 1);
@@ -643,9 +644,12 @@ TEST_CASE("plan API: bc_row_key rebuilds the scan key and bc_pin outlives the st
   Fixture f;
   seed_t(f);
   CHECK(value(f, row_key_matches_key, {}) == 3 + 1 + 2);  // three matches, then ids 1 and 2 read after the step
-  CHECK(run(f, row_key_wrong_table, {}) == BC_FAILED);  // an index is not a table
-  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
-  CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
+  // An index is not a table: naming one where a table goes is a plan bug,
+  // BC_E_HANDLE, as for any object named wrongly.
+  CHECK(run(f, row_key_wrong_table, {}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(run(f, row_begin_index, {}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
 }
 
 TEST_CASE("plan API: result rows follow the schema ref's types; limits and types are checked", "[sql][algebra]") {

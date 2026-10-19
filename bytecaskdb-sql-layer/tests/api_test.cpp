@@ -147,8 +147,11 @@ TEST_CASE("embedded API: a plan the catalog refuses is recompiled and run again"
   CHECK(db->execute(insert, {i(3), bytes("cherry"), i(30)}).affected == 1);
   CHECK(db->compilations() == compiled + 3);
   // Parameters a plan the catalog still accepts does not take are refused
-  // without a compile: the runtime says the plan fits (bc_ctx_check).
-  CHECK_THROWS_AS(db->execute(insert, {i(9), bytes("x"), bytes("y")}), std::invalid_argument);
+  // without a compile, however often they are sent: the runtime says the
+  // plan fits (bc_ctx_check).
+  for (int k = 0; k < 3; ++k) {
+    CHECK_THROWS_AS(db->execute(insert, {i(9), bytes("x"), bytes("y")}), std::invalid_argument);
+  }
   CHECK(db->compilations() == compiled + 3);
   CHECK(db->execute(insert, {i(9), bytes("x"), i(90)}).affected == 1);
   CHECK(db->compilations() == compiled + 3);

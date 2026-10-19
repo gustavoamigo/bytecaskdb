@@ -112,7 +112,12 @@ first error, and every later call returns a value that ends the plan: cursor
 steps report end of data, iterations report done, gets report not found,
 arithmetic returns zero, writes are dropped. Because every loop condition is
 an API iteration, the plan unwinds within one pass of each open loop. The
-runtime reads `bc_error` after the function returns.
+runtime reads `bc_error` after the function returns. No exception ever
+crosses into a plan: the whole body of every call is inside one handler,
+so an allocation that fails anywhere in a call, a message being built
+included, is `BC_E_MEMORY` and not an unwind through the plan's frames,
+which TinyCC compiles without unwind tables. A test fails each allocation
+of a set of plans in turn and checks this.
 
 **Handles are checked indices.** Cursors, sorters, hash tables, aggregates,
 groups, key builders, row builders and views are indices into per-context
@@ -251,8 +256,8 @@ enum bc_layout_detail {  /* the detail of BC_E_LAYOUT; every BC_E_LAYOUT carries
   BC_L_ROW = 0,           /* a row written to a table it is not of, or a column its layout lacks */
   BC_L_INCOMPATIBLE = 1,  /* bc_ctx_run refused the plan's bc_schema_ref: recompile it */
   BC_L_PLAN = 2,          /* the plan or its bc_schema_ref is malformed, a compiler bug: an unknown result
-                             type, a result row too wide, a table the catalog lacks, result rows emitted
-                             out of order or off their declared types */
+                             type, a result row too wide, result rows emitted out of order or off their
+                             declared types */
   BC_L_RETIRED = 3,       /* a stored row of a layout generation REBUILD retired */
 };
 
