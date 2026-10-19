@@ -197,6 +197,20 @@ Read-your-own-writes across statements in an interactive transaction is an
 overlay the cursors read through and belongs to the session layer. See
 *Deferred*.
 
+**A row a plan reads and then writes needs no guard.** The row's key is in
+the write set, and the engine refuses a write plan with a snapshot when
+any key it writes changed since that snapshot (`CONTRACT.md`). So
+`UPDATE … SET qty = qty - 1` is first-committer-wins: a concurrent update
+or delete of the row makes the commit a conflict, retried on a fresh
+snapshot, and no update is lost or applied to a deleted row (tests: "plan
+writes: concurrent read-then-write of one row loses no update", "… a delete
+racing updates of one row has one outcome"). A guard
+(`bc_guard_unchanged`, `bc_guard_range`) is needed only for what a plan
+reads and does *not* write: another row whose value decided the write, a
+range that decided which rows qualify, a key found absent. Without those
+guards a plan has snapshot isolation; with them, serializable conflict
+detection.
+
 ## Types and constants
 
 ```c

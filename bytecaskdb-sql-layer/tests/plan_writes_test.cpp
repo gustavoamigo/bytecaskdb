@@ -13,12 +13,14 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <optional>
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <variant>
@@ -679,4 +681,113 @@ TEST_CASE("plan writes: a missing row and a wrong row are errors, never skipped"
   CHECK(bc_error(f.cx) == BC_E_CORRUPT);
   CHECK(run(f, read_id, {std::int64_t{1}}) == BC_COMMITTED);
   CHECK(bc_ctx_affected(f.cx) == 1);
+}
+
+namespace {
+std::atomic<int> g_concurrent_runs{0};
+// UPDATE t SET qty = qty - 1 WHERE id = $1: reads row K, writes row K.
+void decrement_qty(bc_ctx* cx) {
+  g_concurrent_runs.fetch_add(1, std::memory_order_relaxed);
+  bool found = false;
+  bc_view old = bc_get(cx, bc_key_params(cx, 1, 0, 1), &found);
+  if (!found) {
+    bc_emit_count(cx, 0);
+    return;
+  }
+  bc_row r = bc_row_from(cx, 1, old);
+  bc_row_set_i64(cx, r, 2, bc_sub(cx, bc_col_i64(cx, old, 2), 1));
+  bc_update(cx, 1, old, bc_row_end(cx, r));
+  bc_emit_count(cx, 1);
+}
+// DELETE FROM t WHERE id = $1
+void delete_t(bc_ctx* cx) {
+  bool found = false;
+  bc_view old = bc_get(cx, bc_key_params(cx, 1, 0, 1), &found);
+  if (!found) {
+    bc_emit_count(cx, 0);
+    return;
+  }
+  bc_delete(cx, 1, old);
+  bc_emit_count(cx, 1);
+}
+}  // namespace
+
+// A plan that reads a row and writes it needs no guard: the row's key is in
+// its write set, and the engine refuses a write set any key of which changed
+// since the snapshot, so read-then-write is first-committer-wins and the
+// loser is retried on a fresh snapshot.
+TEST_CASE("plan writes: concurrent read-then-write of one row loses no update", "[sql][algebra][writes]") {
+  Fixture f;
+  constexpr int kThreads = 16;
+  constexpr int kEach = 40;
+  constexpr std::int64_t kInitial = 100000;
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+  auto ref = sr.get();
+  {
+    auto ps = params({std::int64_t{1}, bytes("one"), kInitial});
+    REQUIRE(bc_execute(f.cx, insert_t, &ref, &ps, {}, false, 0) == BC_COMMITTED);
+  }
+  g_concurrent_runs = 0;
+  std::atomic<int> failures{0};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&] {
+      auto* cx = bc_ctx_new(&f.bdb, &f.bcat, 1u << 16);
+      auto ps = params({std::int64_t{1}});
+      for (int i = 0; i < kEach; ++i) {
+        if (bc_execute(cx, decrement_qty, &ref, &ps, {}, false, 100000) != BC_COMMITTED) ++failures;
+      }
+      bc_ctx_free(cx);
+    });
+  }
+  for (auto& th : threads) th.join();
+  CHECK(failures == 0);
+  Bytes key, row;
+  bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, 1);
+  bytecask::sql::key_put_i64(key, 1, {PhysType::I64});
+  REQUIRE(f.db->get({}, key, row));
+  const auto& t = *f.cat().table("t");
+  CHECK(bytecask::sql::row_i64(row, t.layout.find(2)->pos) == kInitial - kThreads * kEach);  // no lost update
+  CHECK(g_concurrent_runs > kThreads * kEach);  // some executions conflicted and were retried
+}
+
+TEST_CASE("plan writes: a delete racing updates of one row has one outcome", "[sql][algebra][writes]") {
+  Fixture f;
+  constexpr int kUpdaters = 8;
+  constexpr int kRounds = 30;
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+  auto ref = sr.get();
+  std::vector<bc_ctx*> cxs;
+  for (int t = 0; t < kUpdaters + 1; ++t) cxs.push_back(bc_ctx_new(&f.bdb, &f.bcat, 1u << 16));
+  auto one = params({std::int64_t{1}});
+  for (int round = 0; round < kRounds; ++round) {
+    INFO("round " << round);
+    auto ins = params({std::int64_t{1}, bytes("one"), std::int64_t{1000}});
+    REQUIRE(bc_execute(f.cx, insert_t, &ref, &ins, {}, false, 0) == BC_COMMITTED);
+    std::atomic<int> failures{0};
+    std::atomic<int> deleted{0};
+    std::vector<std::thread> threads;
+    threads.emplace_back([&] {
+      if (bc_execute(cxs[0], delete_t, &ref, &one, {}, false, 100000) != BC_COMMITTED) ++failures;
+      deleted += static_cast<int>(bc_ctx_affected(cxs[0]));
+    });
+    for (int t = 1; t <= kUpdaters; ++t) {
+      threads.emplace_back([&, t] {
+        for (int i = 0; i < 5; ++i) {
+          if (bc_execute(cxs[static_cast<std::size_t>(t)], decrement_qty, &ref, &one, {}, false, 100000) !=
+              BC_COMMITTED) {
+            ++failures;
+          }
+        }
+      });
+    }
+    for (auto& th : threads) th.join();
+    CHECK(failures == 0);
+    CHECK(deleted == 1);
+    // The delete won once and for all: no update re-created the row after
+    // it, and no index entry outlives it.
+    CHECK(count_entries(*f.db, bytecask::sql::kNsRow, 1) == 0);
+    CHECK(count_entries(*f.db, bytecask::sql::kNsIndex, 3) == 0);
+  }
+  for (auto* cx : cxs) bc_ctx_free(cx);
 }
