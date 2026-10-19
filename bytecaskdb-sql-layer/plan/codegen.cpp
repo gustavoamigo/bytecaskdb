@@ -321,10 +321,9 @@ auto select_by_index(Writer& w, const bound::Select& s) -> void {
   w.open("while (bc_scan_next(cx, c))");
   if (covering) {
     // Every result column from the entry's key: no row read.
+    w.line("bc_view key = bc_scan_key(cx, c);");
     w.line("bc_emit_begin(cx);");
-    for (auto id : s.targets) {
-      w.line("bc_emit_key_part(cx, " + w.idx(ix) + ", bc_scan_key(cx, c), " + w.part(ix, id) + ");");
-    }
+    for (auto id : s.targets) w.line("bc_emit_key_part(cx, " + w.idx(ix) + ", key, " + w.part(ix, id) + ");");
     w.line("bc_emit_end(cx);");
   } else {
     w.line("bc_view row = bc_scan_row(cx, c);");

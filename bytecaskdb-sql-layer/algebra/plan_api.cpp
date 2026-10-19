@@ -31,6 +31,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <set>
 #include <system_error>
 #include <type_traits>
 #include <unordered_map>
@@ -178,6 +179,13 @@ struct Verified {
   std::optional<RowLayout> result_layout;
 };
 
+// Byte order, for the set of row keys an execution wrote; transparent, so a
+// view looks a key up without copying it.
+struct BytesLess {
+  using is_transparent = void;
+  auto operator()(BytesView a, BytesView b) const -> bool { return std::ranges::lexicographical_compare(a, b); }
+};
+
 auto as_u8(const std::byte* p) -> const std::uint8_t* {
   return reinterpret_cast<const std::uint8_t*>(p);  // the runtime hands raw rows to C callers
 }
@@ -242,7 +250,7 @@ struct bc_ctx {
   // The row keys this execution's writes touched: a second write of one row
   // would derive its index entries from the snapshot's row again, not from
   // the first write's, and leave the first write's entries behind.
-  std::vector<Bytes> written_rows;
+  std::set<Bytes, BytesLess> written_rows;
   std::vector<std::pair<Bytes, Bytes>> deleted_ranges;  // [lo, hi) of each bc_del_range, likewise
 
   // References verified by bc_ctx_run, kept across executions: slots, a map
@@ -670,9 +678,7 @@ auto key_part_at(bc_ctx* cx, std::uint32_t table_or_index, bc_view key, std::uin
     cx->fail(BC_E_HANDLE, "key part of the wrong type");
     return std::nullopt;
   }
-  Bytes prefix;
-  bytecask::sql::key_put_prefix(prefix, kl->ns, table_or_index);
-  if (!starts_with(*k, prefix)) {
+  if (auto obj = key_object(*k); !obj || obj->first != kl->ns || obj->second != table_or_index) {
     cx->fail(BC_E_HANDLE, "key is not of table or index " + std::to_string(table_or_index));
     return std::nullopt;
   }
@@ -939,20 +945,20 @@ auto write_row(bc_ctx* cx, const Table& t, bc_view row, bool stored) -> std::opt
   return r->bytes;
 }
 
-// Records a row key this execution writes; a second write of it is a plan
-// bug (BC_E_HANDLE). Linear: a plan writes few rows.
 [[nodiscard]] auto in_range(BytesView k, BytesView lo, BytesView hi) -> bool {
   return !std::is_lt(bytes_cmp(k, lo)) && std::is_lt(bytes_cmp(k, hi));
 }
 
+// Records a row key this execution writes; a second write of it, or a write
+// into a range this execution deleted, is a plan bug (BC_E_HANDLE). The keys
+// are a sorted set, a lookup per write; range deletes are few and scanned.
 [[nodiscard]] auto first_write(bc_ctx* cx, const Table& t, BytesView pk) -> bool {
-  // A range delete counts as a write of every row in its range.
-  if (std::ranges::any_of(cx->written_rows, [&](const Bytes& k) { return std::ranges::equal(k, pk); }) ||
+  if (cx->written_rows.contains(pk) ||
       std::ranges::any_of(cx->deleted_ranges, [&](const auto& r) { return in_range(pk, r.first, r.second); })) {
     cx->fail(BC_E_HANDLE, "a row of table " + t.name + " written twice in one plan");
     return false;
   }
-  cx->written_rows.emplace_back(pk.begin(), pk.end());
+  cx->written_rows.emplace(pk.begin(), pk.end());
   return true;
 }
 
@@ -1974,7 +1980,14 @@ void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
   if (std::is_gteq(bytes_cmp(range->lo, range->hi))) return;  // an empty range deletes nothing
   // Its entries come from the snapshot's rows, so a row this plan already
   // wrote in the range would keep its new entries; refused, as a second write.
-  if (std::ranges::any_of(cx->written_rows, [&](const Bytes& k) { return in_range(k, range->lo, range->hi); })) {
+  // So would a range this plan already deleted, whose entries it would
+  // delete twice.
+  auto written = cx->written_rows.lower_bound(BytesView{range->lo});
+  auto overlaps = [&](const auto& r) {
+    return std::is_lt(bytes_cmp(range->lo, r.second)) && std::is_lt(bytes_cmp(r.first, range->hi));
+  };
+  if ((written != cx->written_rows.end() && std::is_lt(bytes_cmp(*written, range->hi))) ||
+      std::ranges::any_of(cx->deleted_ranges, overlaps)) {
     cx->fail(BC_E_HANDLE, "bc_del_range over a row of table " + t->name + " this plan already wrote");
     return;
   }

@@ -492,6 +492,11 @@ void del_range_then_update(bc_ctx* cx) {
   bc_row_set_param(cx, r, kA, 1);
   bc_update(cx, kW, old, bc_row_end(cx, r));
 }
+// Two range deletes that overlap, and two that do not.
+void del_ranges_overlapping(bc_ctx* cx) {
+  bc_del_range(cx, kW, bc_empty(cx), bc_key_params(cx, kW, 0, 1));
+  bc_del_range(cx, kW, bc_key_params(cx, kW, 1, 1), bc_empty(cx));
+}
 // A range delete, then an insert outside its range: allowed.
 void del_range_then_insert_outside(bc_ctx* cx) {
   bc_del_range(cx, kW, bc_empty(cx), bc_key_params(cx, kW, 4, 1));
@@ -530,8 +535,16 @@ TEST_CASE("plan writes: a second write of one row in one plan is refused", "[sql
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
   CHECK(run(f, del_range_then_update, {std::int64_t{1}, std::int64_t{7}}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  // Two overlapping range deletes would delete the overlap's entries twice.
+  CHECK(run(f, del_ranges_overlapping, {std::int64_t{5}, std::int64_t{3}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
   // Nothing of any of them committed.
   CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 1);
+  // Disjoint range deletes mix: [start, 1) and [1, end) together delete row 1.
+  CHECK(run(f, del_ranges_overlapping, {std::int64_t{1}, std::int64_t{1}}) == BC_COMMITTED);
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 0);
+  check_indexes_exact(f);
+  REQUIRE(run(f, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{0}}) == BC_COMMITTED);
   check_indexes_exact(f);
   // Outside the range, the two mix: row 1 goes, row 9 comes, every index exact.
   CHECK(run(f, del_range_then_insert_outside,

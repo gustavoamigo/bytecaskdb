@@ -12,8 +12,9 @@ void plan(bc_ctx *cx) {
   bc_view hi = bc_key_params(cx, IDX_3, 1, 1);
   bc_cursor c = bc_scan_open(cx, IDX_3, lo, hi, BC_SCAN_FORWARD);
   while (bc_scan_next(cx, c)) {
+    bc_view key = bc_scan_key(cx, c);
     bc_emit_begin(cx);
-    bc_emit_key_part(cx, IDX_3, bc_scan_key(cx, c), PART_3_0);
+    bc_emit_key_part(cx, IDX_3, key, PART_3_0);
     bc_emit_end(cx);
   }
 }

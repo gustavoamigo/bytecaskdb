@@ -611,7 +611,8 @@ built would remove entries the snapshot does not hold and leave its real
 ones behind. Anything else is `BC_E_HANDLE`, and so is a second write of a
 row key this plan already wrote, for the same reason. A `bc_del_range` is a
 write of every row in its range: it is refused over a row the plan already
-wrote, and a later write of a row in its range is refused. A row of another table, or a
+wrote or a range it already deleted, and a later write of a row in its range
+is refused. A row of another table, or a
 `row` of another layout generation, is `BC_E_LAYOUT`.
 
 Every key a write touches is in the write plan, and the engine checks each
