@@ -407,3 +407,47 @@ TEST_CASE("embedded API: a quoted name keeps its case, and nothing in a name esc
     (void)db->execute("DROP TABLE e");
   }
 }
+
+TEST_CASE("embedded API: table_rows reads a table in key order; errors carry their detail and rows their types",
+          "[sql][api]") {
+  sql_test::TempDir dir{"api_table_rows"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE t (a BIGINT, b TEXT, c VARCHAR(4) NOT NULL DEFAULT 'x', PRIMARY KEY (a, b))");
+  auto table_id = db->catalog()->table("t")->id;
+  constexpr auto kIns = "INSERT INTO t (a, b) VALUES ($1, $2)";
+  CHECK(db->execute(kIns, {i(2), bytes("a")}).affected == 1);
+  CHECK(db->execute(kIns, {i(1), bytes("z")}).affected == 1);
+  CHECK(db->execute("INSERT INTO t VALUES ($1, $2, $3)", {i(1), bytes("b"), bytes("yy")}).affected == 1);
+
+  auto constraint_of = [&](std::string_view sql, std::vector<Value> params) -> std::uint32_t {
+    try {
+      (void)db->execute(sql, params);
+    } catch (const ExecError& e) {
+      CHECK(e.code() == BC_E_CONSTRAINT);
+      CHECK((e.detail() & 0x00FF'FFFFu) == table_id);
+      return e.detail() >> 24;
+    }
+    FAIL("the statement was accepted");
+    return 0;
+  };
+  CHECK(constraint_of(kIns, {i(2), bytes("a")}) == BC_C_UNIQUE);
+  CHECK(constraint_of("INSERT INTO t VALUES ($1, $2, $3)", {i(3), bytes("a"), kNull}) == BC_C_NOT_NULL);
+
+  auto check_rows = [&](Database& d) {
+    auto r = d.table_rows("t");
+    CHECK(r.columns == std::vector<std::string>{"a", "b", "c"});
+    REQUIRE(r.types.size() == 3);
+    CHECK(r.types[0].kind == SqlKind::BigInt);
+    CHECK(r.types[2] == SqlType{SqlKind::Varchar, 4});
+    // Primary-key order: (1, "b"), (1, "z"), (2, "a"); c from its default where unset.
+    CHECK(r.rows == Grid{{i(1), bytes("b"), bytes("yy")}, {i(1), bytes("z"), bytes("x")}, {i(2), bytes("a"), bytes("x")}});
+  };
+  check_rows(*db);
+  auto sel = db->execute("SELECT c, a FROM t WHERE a = $1 AND b = $2", {i(1), bytes("b")});
+  CHECK(sel.types == std::vector<SqlType>{SqlType{SqlKind::Varchar, 4}, SqlType{SqlKind::BigInt}});
+  CHECK_THROWS_AS(db->table_rows("nope"), std::invalid_argument);
+  db->close();
+
+  auto again = Database::open(dir.path());
+  check_rows(*again);
+}

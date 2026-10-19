@@ -3,7 +3,8 @@
 What the SQL layer guarantees, and what it does not yet. *Definitions* and
 *Conditions* come first, then one table per area: each row is one
 guarantee, and its second cell names what fails if the row is broken: the
-Catch2 tests of the layer, by name, or none.
+Catch2 tests of the layer, by name; the proof tests against PostgreSQL
+(`tests/proof/`, as "proof: " and the pytest name); or none.
 
 The test for every sentence here: if it could change while every guarantee
 stays the same, it is mechanism and belongs in [`docs/`](docs/), not here.
@@ -68,7 +69,7 @@ column's, a second write of one row.
 | Guarantee | Proved by |
 |---|---|
 | `BC_E_CONSTRAINT` is final: `bc_execute` does not retry it, and nothing of the execution is committed. Only `BC_CONFLICT` is retried. | "plan API: a raised constraint error is final: no retry, nothing committed", "plan writes: a duplicate is BC_E_CONSTRAINT and never retried" |
-| A duplicate primary or unique key is `BC_E_CONSTRAINT` with `BC_C_UNIQUE` and the table's or the index's id; SQL reports it as SQLSTATE 23505. Nulls are distinct: a unique index part that is NULL collides with nothing. | "plan writes: a duplicate is BC_E_CONSTRAINT and never retried", "embedded API: a unique index refuses duplicates, treats nulls as distinct, and moves with UPDATE" |
+| A duplicate primary or unique key is `BC_E_CONSTRAINT` with `BC_C_UNIQUE` and the table's or the index's id; SQL reports it as SQLSTATE 23505. Nulls are distinct: a unique index part that is NULL collides with nothing. | "plan writes: a duplicate is BC_E_CONSTRAINT and never retried", "embedded API: a unique index refuses duplicates, treats nulls as distinct, and moves with UPDATE", "proof: test_duplicate_primary_key_is_23505", "proof: test_sql_machine" |
 | A NULL for a `NOT NULL` column, given or left unset with no default, is `BC_E_CONSTRAINT` with `BC_C_NOT_NULL` and the table's id. The column keeps its default. | "plan writes: a NULL for a NOT NULL column is BC_C_NOT_NULL, never retried, and keeps the default" |
 | Every `BC_E_LAYOUT` carries a `bc_layout_detail`. `BC_L_INCOMPATIBLE` is the only one a recompile of the statement can cure. `BC_L_PLAN` is a malformed plan or `bc_schema_ref`; `BC_L_ROW` a row used with a table it is not of, or a column its layout lacks. | "plan API: bc_ctx_run checks what a plan depends on, not a catalog version", "plan API: result rows follow the schema ref's types; limits and types are checked", "plan API: a plan names only the objects its reference declares", "plan writes: a missing row and a wrong row are errors, never skipped" |
 | `BC_L_RETIRED`, a row of a layout generation `REBUILD` retired, cannot occur in stage 1, which has no `REBUILD` (#503). | none |
@@ -91,7 +92,7 @@ column's, a second write of one row.
 
 | Guarantee | Proved by |
 |---|---|
-| Each DDL statement is atomic: the catalog and the data it changes (an index's entries, a column's default, a dropped table's rows) change together or not at all, on disk and in memory, and survive a reopen. | "catalog: a DDL the engine refuses leaves nothing on disk or in memory", "catalog: refused DDL writes nothing", "catalog: every DDL survives a reopen" |
+| Each DDL statement is atomic: the catalog and the data it changes (an index's entries, a column's default, a dropped table's rows) change together or not at all, on disk and in memory, and survive a reopen. | "catalog: a DDL the engine refuses leaves nothing on disk or in memory", "catalog: refused DDL writes nothing", "catalog: every DDL survives a reopen", "proof: test_sql_machine" |
 | Concurrent DDL serialise: each publishes its own catalog version, and a write to a table racing a DDL's backfill of it is a conflict. | "catalog: concurrent DDL each returns the version it published", "catalog: a backfill raced by a write, and two catalogs on one database, conflict" |
 | Table, index and column ids are never reused, even after the object is dropped. | "catalog: two catalogs on one database interleave DDL without reusing an id", "catalog: counters of the wrong width or past the id ceiling are refused at load" |
 | A catalog the build cannot decode is refused at open; it is never read as something else. | "catalog: a damaged or foreign-format record is refused" |

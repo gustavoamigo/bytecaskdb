@@ -13,6 +13,7 @@
 // prototype: the shape of #494's embedded API, not its design.
 
 module;
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -44,23 +45,30 @@ using Value = bc_value;  // NULL, BIGINT, DOUBLE PRECISION, BOOLEAN, BYTEA
 
 struct Rows {
   std::vector<std::string> columns;
+  std::vector<SqlType> types;  // each column's SQL type, as the catalog declares it
   std::vector<std::vector<Value>> rows;
   std::int64_t affected{-1};  // INSERT, UPDATE, DELETE: rows changed
 };
 
-// A plan that ran and failed: the plan API's error code and message (a
-// duplicate key is BC_E_CONSTRAINT, raised by the plan), or BC_CONFLICT when
-// every retry conflicted.
+// A plan that ran and failed: the plan API's error code, its detail and
+// message (a duplicate key is BC_E_CONSTRAINT with BC_C_UNIQUE in the
+// detail's high byte, raised by the plan), or BC_CONFLICT when every retry
+// conflicted.
 class ExecError : public std::runtime_error {
 public:
-  ExecError(const std::string& what, int code) : std::runtime_error{what}, code_{code} {}
+  ExecError(const std::string& what, int code, std::uint32_t detail = 0)
+      : std::runtime_error{what}, code_{code}, detail_{detail} {}
   ExecError(const ExecError&) = default;
   ExecError& operator=(const ExecError&) = default;
   ~ExecError() override;  // out of line: anchors the vtable (-Wweak-vtables)
   [[nodiscard]] auto code() const noexcept -> int { return code_; }
+  // bc_error_detail: for BC_E_CONSTRAINT, the bc_constraint in the high byte
+  // and the object id in the low 24 bits.
+  [[nodiscard]] auto detail() const noexcept -> std::uint32_t { return detail_; }
 
 private:
   int code_;
+  std::uint32_t detail_;
 };
 
 class Statement {
@@ -78,6 +86,7 @@ private:
   std::unique_ptr<GeneratedPlan> plan_;  // null for DDL
   std::unique_ptr<TccPlan> code_;
   std::vector<std::string> columns_;
+  std::vector<SqlType> column_types_;
   std::vector<std::uint8_t> result_codes_;  // the plan's result_types as bc_type codes
   RowLayout result_layout_;                 // how its result rows decode, built once per compile
   std::vector<bc_col_ref> col_refs_;
@@ -105,6 +114,11 @@ public:
   [[nodiscard]] auto compilations() const -> std::uint64_t { return compilations_; }
   // The live catalog: the version DDL last published.
   [[nodiscard]] auto catalog() const -> std::shared_ptr<const Catalog> { return live_->current(); }
+  // Every row of a table, in primary-key order, read from the engine and
+  // decoded through the catalog: every column, in the table's order. For the
+  // proof tests, which compare a table with the oracle's; SQL has no full
+  // scan. Throws std::invalid_argument for a table that does not exist.
+  [[nodiscard]] auto table_rows(std::string_view table) -> Rows;
 
   // Closes the engine; every later call is undefined.
   void close();
@@ -185,8 +199,12 @@ void Database::compile(Statement& s) {
   // can throw: ref_ points into plan_ and the vectors, and a statement that
   // fails to recompile keeps its old, consistent plan.
   std::vector<std::string> columns;
+  std::vector<SqlType> column_types;
   if (const auto* sel = std::get_if<bound::Select>(&bound.stmt)) {
-    for (auto id : sel->targets) columns.push_back(sel->table->column(id)->name);
+    for (auto id : sel->targets) {
+      columns.push_back(sel->table->column(id)->name);
+      column_types.push_back(sel->table->column(id)->sql);
+    }
   }
   auto plan = std::make_unique<GeneratedPlan>(generate_plan(bound, *cat, s.sql_));
   auto codes = result_type_codes(plan->result_types);
@@ -206,7 +224,10 @@ void Database::compile(Statement& s) {
                     codes.data(),
                     n(codes)};
   // Moves keep every buffer ref points into.
-  if (std::holds_alternative<bound::Select>(bound.stmt)) s.columns_ = std::move(columns);
+  if (std::holds_alternative<bound::Select>(bound.stmt)) {
+    s.columns_ = std::move(columns);
+    s.column_types_ = std::move(column_types);
+  }
   s.plan_ = std::move(plan);
   s.code_ = std::move(code);
   s.result_codes_ = std::move(codes);
@@ -265,7 +286,7 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
     auto fits = bc_ctx_check(cx_, &stmt.ref_);
     auto stale = !fits && bc_error(cx_) == BC_E_LAYOUT && bc_error_detail(cx_) == BC_L_INCOMPATIBLE;
     if (!fits && !stale) {
-      ExecError e{bc_error_message(cx_), bc_error(cx_)};
+      ExecError e{bc_error_message(cx_), bc_error(cx_), bc_error_detail(cx_)};
       bc_ctx_reset(cx_);
       throw e;
     }
@@ -290,7 +311,7 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
     throw ExecError("conflict: a guard failed on every attempt", BC_CONFLICT);
   }
   if (r == BC_FAILED) {
-    ExecError e{bc_error_message(cx_), bc_error(cx_)};
+    ExecError e{bc_error_message(cx_), bc_error(cx_), bc_error_detail(cx_)};
     bc_ctx_reset(cx_);  // the context keeps no snapshot or catalog version while idle
     throw e;
   }
@@ -298,6 +319,7 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   out.affected = bc_ctx_affected(cx_);
   if (p.returns_rows) {
     out.columns = stmt.columns_;
+    out.types = stmt.column_types_;
     const std::uint8_t* row = nullptr;
     std::uint32_t len = 0;
     while (bc_ctx_next_result(cx_, &row, &len)) {
@@ -305,6 +327,50 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
     }
   }
   bc_ctx_reset(cx_);
+  return out;
+}
+
+auto Database::table_rows(std::string_view table) -> Rows {
+  auto [cat, snap] = live_->pin();
+  const auto* t = cat->table(table);
+  if (t == nullptr) throw std::invalid_argument("relation \"" + std::string{table} + "\" does not exist");
+  Rows out;
+  for (const auto& c : t->columns) {
+    out.columns.push_back(c.name);
+    out.types.push_back(c.sql);
+  }
+  Bytes prefix;
+  key_put_prefix(prefix, kNsRow, t->id);
+  auto malformed = [&] { return std::runtime_error("malformed row in table " + t->name); };
+  for (const auto& e : snap.iter_from({}, prefix)) {
+    if (e.key.size() < prefix.size() || !std::ranges::equal(e.key.first(prefix.size()), prefix)) break;
+    if (!row_valid(e.value)) throw malformed();
+    std::vector<Value> row;
+    for (const auto& c : t->columns) {
+      const auto* slot = t->layout.find(c.id);
+      // A column the row's layout has no present bit for reads as NULL.
+      if (slot == nullptr || !row_present_bit(e.value, c.id)) {
+        row.emplace_back(std::monostate{});
+        continue;
+      }
+      auto take = [&](auto v) {
+        if (!v) throw malformed();
+        row.emplace_back(Value{*v});
+      };
+      switch (slot->type) {
+        case PhysType::I64: take(row_i64(e.value, slot->pos)); break;
+        case PhysType::F64: take(row_f64(e.value, slot->pos)); break;
+        case PhysType::Bool: take(row_bool(e.value, slot->pos)); break;
+        case PhysType::Bytes: {
+          auto b = row_bytes(e.value, slot->pos);
+          if (!b) throw malformed();
+          row.emplace_back(Bytes{b->begin(), b->end()});
+          break;
+        }
+      }
+    }
+    out.rows.push_back(std::move(row));
+  }
   return out;
 }
 

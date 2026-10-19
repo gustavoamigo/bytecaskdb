@@ -62,6 +62,9 @@ target("sql_layer")
     set_kind("static")
     set_default(false)
     add_deps("bytecask")
+    -- Linked into the bytecask_sql Python module, a shared object, as the
+    -- engine's library is into bytecaskdb_python.
+    add_cxxflags("-fPIC", {force = true})
     add_rules("bytecask.native_flags")
     add_includedirs("..", {public = true})
     add_files("codec/*.cppm", "catalog/*.cppm", "algebra/*.cppm", "sql/*.cppm", "plan/*.cppm", "api/*.cppm",
@@ -116,3 +119,17 @@ target("sql_layer_bench")
     add_deps("sql_layer")
     add_rules("bytecask.native_flags")
     add_files("bench/*.cpp")
+
+-- The Python module the proof tests drive (tests/proof/, #515): open,
+-- execute, close, the catalog, and a table's rows. Not built by default.
+-- Build: xmake f --sql_layer=y && xmake build bytecask_sql
+-- Usage: PYTHONPATH=bytecaskdb-sql-layer/python python3 -m pytest bytecaskdb-sql-layer/tests/proof
+target("bytecask_sql")
+    set_kind("shared")
+    set_default(false)
+    add_deps("sql_layer")
+    add_rules("bytecask.native_flags")
+    add_rules("bytecask.nanobind")
+    set_values("nanobind.module", "bytecask_sql")
+    set_values("nanobind.targetdir", "bytecaskdb-sql-layer/python")
+    add_files("python/bytecask_sql_module.cpp")

@@ -543,13 +543,14 @@ target("bytecask_testing")
 -- Prerequisites: pip install nanobind
 -- Build: xmake build bytecaskdb_python
 -- Usage: PYTHONPATH=bytecaskdb-python python3 your_script.py
-target("bytecaskdb_python")
-    set_kind("shared")
-    set_default(false)
-    add_deps("bytecask")
-    add_files("bytecaskdb-python/src/bytecaskdb_module.cpp")
-    add_packages("crc32c", "zstd")
-    -- nanobind requires compiling nb_combined.cpp from the nanobind package.
+-- A nanobind extension module: Python's and nanobind's include directories,
+-- nb_combined.cpp, the interpreter's extension suffix, and the flags
+-- nanobind's headers need. A target sets the module name and its output
+-- directory as values:
+--   set_values("nanobind.module", "_bytecaskdb")
+--   set_values("nanobind.targetdir", "bytecaskdb-python/bytecaskdb")
+-- BYTECASK_PYTHON names the interpreter (default python3).
+rule("bytecask.nanobind")
     on_load(function(t)
         local python = os.getenv("BYTECASK_PYTHON") or "python3"
         -- Python include directory
@@ -569,44 +570,60 @@ target("bytecaskdb_python")
         ext = ext:trim()  -- e.g. ".cpython-314-x86_64-linux-gnu.so"
         -- Strip leading dot and .so suffix to get the tag
         local tag = ext:match("^%.(.+)%.so$") or ext:match("^%.(.+)%.pyd$") or ""
-        t:set("basename", "_bytecaskdb." .. tag)
+        t:set("basename", t:values("nanobind.module") .. "." .. tag)
         t:set("prefixname", "")  -- no "lib" prefix
         t:set("extension", ".so")
-        t:set("targetdir", path.join(os.projectdir(), "bytecaskdb-python", "bytecaskdb"))
+        t:set("targetdir", path.join(os.projectdir(), t:values("nanobind.targetdir")))
         -- Detect free-threaded Python and enable nanobind free-threading support.
         local gil_disabled = os.iorunv(python, {"-c",
             "import sysconfig; print(sysconfig.get_config_var('Py_GIL_DISABLED') or 0)"})
         if gil_disabled:trim() == "1" then
             t:add("cxxflags", "-DNB_FREE_THREADED", {force = true})
         end
+        -- Suppress warnings from nanobind headers (third-party code).
+        t:add("cxxflags", "-Wno-old-style-cast", "-Wno-extra-semi-stmt", "-Wno-shadow",
+              "-Wno-covered-switch-default", "-Wno-cast-function-type-strict",
+              "-Wno-sign-conversion", "-Wno-double-promotion", "-Wno-shadow-field",
+              "-Wno-cast-qual", "-Wno-zero-as-null-pointer-constant",
+              "-Wno-missing-field-initializers", "-Wno-float-equal",
+              "-Wno-deprecated-declarations", "-Wno-nested-anon-types",
+              "-Wno-gnu-anonymous-struct", "-Wno-unused-function",
+              "-Wno-disabled-macro-expansion",
+              {force = true})
+        t:add("cxxflags", "-fPIC", {force = true})
+        -- Resolve Python C API symbols at module load time (provided by the host
+        -- interpreter), not at link time -- this is how nanobind and pybind11
+        -- build extension modules.
+        --   - Linux: shared objects allow undefined symbols by default. Do NOT
+        --     pass `-Wl,--no-undefined` here: the Python C API symbols
+        --     (PyBytes_*, _Py_Dealloc, ...) are intentionally unresolved and
+        --     bound by the dynamic loader when the host interpreter loads the
+        --     module.
+        --   - macOS: pass `-undefined dynamic_lookup` so the linker tolerates
+        --     unresolved Py* symbols; dyld binds them when Python loads the
+        --     module. Linking against a framework Python's libpython is
+        --     unreliable across runners (the lib dir may not expose a linkable
+        --     dylib) and ties the wheel to a specific libpython location.
+        if is_host("macosx") then
+            t:add("shflags", "-undefined", "dynamic_lookup", {force = true})
+        end
     end)
-    -- Suppress warnings from nanobind headers (third-party code).
-    add_cxxflags("-Wno-old-style-cast", "-Wno-extra-semi-stmt", "-Wno-shadow",
-                 "-Wno-covered-switch-default", "-Wno-cast-function-type-strict",
-                 "-Wno-sign-conversion", "-Wno-double-promotion", "-Wno-shadow-field",
-                 "-Wno-cast-qual", "-Wno-zero-as-null-pointer-constant",
-                 "-Wno-missing-field-initializers", "-Wno-float-equal",
-                 "-Wno-deprecated-declarations", "-Wno-nested-anon-types",
-                 "-Wno-gnu-anonymous-struct", "-Wno-unused-function",
-                 "-Wno-disabled-macro-expansion",
-                 {force = true})
-    add_cxxflags("-fPIC", {force = true})
-    -- Resolve Python C API symbols at module load time (provided by the host
-    -- interpreter), not at link time -- this is how nanobind and pybind11
-    -- build extension modules.
-    --   - Linux: shared objects allow undefined symbols by default. Do NOT
-    --     pass `-Wl,--no-undefined` here: the Python C API symbols
-    --     (PyBytes_*, _Py_Dealloc, ...) are intentionally unresolved and
-    --     bound by the dynamic loader when the host interpreter loads the
-    --     module.
-    --   - macOS: pass `-undefined dynamic_lookup` so the linker tolerates
-    --     unresolved Py* symbols; dyld binds them when Python loads the
-    --     module. Linking against a framework Python's libpython is
-    --     unreliable across runners (the lib dir may not expose a linkable
-    --     dylib) and ties the wheel to a specific libpython location.
-    if is_host("macosx") then
-        add_shflags("-undefined", "dynamic_lookup", {force = true})
-    end
+rule_end()
+
+-- Python bindings via nanobind.
+-- Wraps the C++23 module interface directly.
+-- Prerequisites: pip install nanobind
+-- Build: xmake build bytecaskdb_python
+-- Usage: PYTHONPATH=bytecaskdb-python python3 your_script.py
+target("bytecaskdb_python")
+    set_kind("shared")
+    set_default(false)
+    add_deps("bytecask")
+    add_rules("bytecask.nanobind")
+    set_values("nanobind.module", "_bytecaskdb")
+    set_values("nanobind.targetdir", "bytecaskdb-python/bytecaskdb")
+    add_files("bytecaskdb-python/src/bytecaskdb_module.cpp")
+    add_packages("crc32c", "zstd")
     on_config(function(t)
         add_native_syslinks(t)
         apply_sanitizer(t)

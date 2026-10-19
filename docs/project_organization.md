@@ -131,10 +131,12 @@ bytecask/
 │   ├── codec/ catalog/ sql/ plan/ api/   # bytecask.sql.* modules, one .cppm each
 │   ├── plans/            # Hand-written plans, C
 │   ├── tests/            # Catch2 tests; shared fixtures as bytecask.sql.tests.* modules
+│   │   └── proof/        # Hypothesis state machine against PostgreSQL (docs/testing_design.md)
+│   ├── python/           # bytecask_sql: the Python module the proof tests drive
 │   ├── bench/            # sql_layer_bench: the plan API's fixed costs
 │   ├── docs/             # The layer's design documents
 │   ├── CONTRACT.md       # What the layer guarantees, with the tests that prove it
-│   └── xmake.lua         # sql_layer, sql_layer_tests, sql_layer_bench; libpg_query and TinyCC package rules
+│   └── xmake.lua         # sql_layer, sql_layer_tests, sql_layer_bench, bytecask_sql; libpg_query and TinyCC package rules
 │
 ├── tests/                # MIT — engine tests (no MariaDB)
 ├── benchmarks/           # MIT — engine benchmarks

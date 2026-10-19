@@ -78,6 +78,17 @@ jobs:
     timeout-minutes: 60
     container:
       image: fedora:43
+    # The proof tests' oracle (tests/proof/, #515), reached as host "postgres".
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     permissions:
       contents: read
       checks: write
@@ -121,6 +132,19 @@ jobs:
           xmake build -y sql_layer_tests
           build/linux/x86_64/release/sql_layer_tests --reporter junit --out test-results/sql_layer_tests.xml
 
+      # The layer against PostgreSQL 17 (docs/testing_design.md): a fixed
+      # seed and a bounded budget, the ci profile of tests/proof/conftest.py.
+      - name: Build bytecask_sql and run the proof tests
+        env:
+          BYTECASK_SQL_ORACLE: host=postgres user=postgres password=postgres dbname=postgres
+          HYPOTHESIS_PROFILE: ci
+          PYTHONPATH: bytecaskdb-sql-layer/python
+        run: |
+          xmake build -y bytecask_sql
+          pip3 install -r bytecaskdb-sql-layer/tests/proof/requirements.txt
+          python3 -m pytest bytecaskdb-sql-layer/tests/proof -v -p no:cacheprovider \
+            --junitxml=test-results/sql_layer_proof.xml
+
       - name: Enrich JUnit report with source metadata
         if: ${{ always() && !cancelled() }}
         run: |
@@ -131,7 +155,7 @@ jobs:
         if: ${{ always() && !cancelled() }}
         uses: EnricoMi/publish-unit-test-result-action@v2
         with:
-          files: test-results/sql_layer_tests.xml
+          files: test-results/*.xml
           check_name: SQL Layer Test Results
           comment_mode: off
 
@@ -146,7 +170,7 @@ jobs:
         if: ${{ always() && !cancelled() }}
         uses: codecov/codecov-action@v5
         with:
-          files: ./test-results/sql_layer_tests.xml
+          files: ./test-results/sql_layer_tests.xml,./test-results/sql_layer_proof.xml
           report_type: test_results
           flags: sql-layer
           name: sql-layer-tests
