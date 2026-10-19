@@ -10,10 +10,11 @@ of the contract must be one of:
   - a name declared in the interface's files, comments excluded;
   - a name the pair allows (ALLOWED and the pair's own words below).
 
-A C++ module interface (.cppm) contributes what an importer of it sees: its
-text after `export module`, without the members under `private:`, and the
-same of every module it re-exports with `export import`, found by name among
-the root's .cppm files.
+A C++ module interface (.cppm) contributes the names it declares: its text
+after `export module`, without the members under `private:` and without
+function bodies, whose code names private members. The modules it re-exports
+are not followed: they are the layer's mechanism (the compiler, the codecs),
+not the surface the contract is written against.
 
 The pairs:
 
@@ -88,38 +89,60 @@ def strip_comments(src: str) -> str:
     return re.sub(r"//[^\n]*", " ", src)
 
 
-EXPORT_MODULE = re.compile(r"^export\s+module\s+([\w.]+)\s*;", re.M)
-EXPORT_IMPORT = re.compile(r"^export\s+import\s+([\w.]+)\s*;", re.M)
+EXPORT_MODULE = re.compile(r"^export\s+module\s+[\w.]+\s*;", re.M)
 # A class's private members, up to its next access specifier or its closing
 # brace at column 0 (the layer's classes are not nested).
 PRIVATE = re.compile(r"\bprivate:.*?(?=\bpublic:|\bprotected:|^\};)", re.S | re.M)
+# A constructor's member initializer list, `) : base{x}, member_{y}` before
+# its body: it names private members.
+INIT_LIST = re.compile(r"\)\s*:(?!:)\s*(?:[\w:]+\s*(?:\{[^{}]*\}|\([^()]*\))\s*,?\s*)+(?=\{)")
+# What precedes a brace that opens a scope of declarations, not code.
+SCOPE = re.compile(r"\b(?:class|struct|union|enum|namespace)\b|\bextern\s+\"C(?:\+\+)?\"\s*$")
+
+
+def drop_bodies(src: str) -> str:
+    """Drops every brace block but a class, struct, enum, namespace or
+    extern block: function bodies and brace initializers, whose code names
+    private members."""
+    out: list[str] = []
+    start = 0  # where the current declaration began
+    i = 0
+    while i < len(src):
+        c = src[i]
+        if c in ";}":
+            out.append(src[start:i + 1])
+            start = i + 1
+        elif c == "{":
+            if SCOPE.search(src[start:i]):
+                out.append(src[start:i + 1])
+                start = i + 1
+            else:
+                depth = 0
+                for j in range(i, len(src)):
+                    depth += {"{": 1, "}": -1}.get(src[j], 0)
+                    if depth == 0:
+                        break
+                out.append(src[start:i] + " ")
+                start = i = j + 1
+                continue
+        i += 1
+    out.append(src[start:])
+    return "".join(out)
 
 
 def module_text(src: str) -> str:
-    """What an importer of a module interface can name."""
+    """The names a module interface declares to its importers."""
     m = EXPORT_MODULE.search(src)
     if m:
         src = src[m.end():]  # drops the global module fragment
-    return PRIVATE.sub(" ", src)
+    return drop_bodies(INIT_LIST.sub(") ", PRIVATE.sub(" ", src)))
 
 
 def public_names(root: pathlib.Path, interface: list[str]) -> set[str]:
-    modules = {}
-    for path in root.rglob("*.cppm"):
-        m = EXPORT_MODULE.search(strip_comments(path.read_text()))
-        if m:
-            modules[m.group(1)] = path
     names: set[str] = set()
-    pending = [root / path for path in interface]
-    seen: set[pathlib.Path] = set()
-    while pending:
-        path = pending.pop()
-        if path in seen:
-            continue
-        seen.add(path)
-        src = strip_comments(path.read_text())
-        if path.suffix == ".cppm":
-            pending += [modules[m] for m in EXPORT_IMPORT.findall(src) if m in modules]
+    for path in interface:
+        src = strip_comments((root / path).read_text())
+        if path.endswith(".cppm"):
             src = module_text(src)
         names |= set(IDENT.findall(src))
     return names

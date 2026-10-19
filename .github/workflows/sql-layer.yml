@@ -61,6 +61,16 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # ci.yml runs this check too, but ignores a change confined to the layer:
+  # without it here, an untagged thread_local in the layer would merge green
+  # (CLAUDE.md, Thread-local state).
+  thread-local-tags:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every thread_local is tagged
+        run: python3 scripts/check_thread_local.py
+
   sql-layer-tests:
     runs-on: ubuntu-latest
     container:
