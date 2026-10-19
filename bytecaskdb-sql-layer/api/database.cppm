@@ -56,7 +56,7 @@ public:
   ExecError(const std::string& what, int code) : std::runtime_error{what}, code_{code} {}
   ExecError(const ExecError&) = default;
   ExecError& operator=(const ExecError&) = default;
-  ~ExecError() override;
+  ~ExecError() override;  // out of line: anchors the vtable (-Wweak-vtables)
   [[nodiscard]] auto code() const noexcept -> int { return code_; }
 
 private:

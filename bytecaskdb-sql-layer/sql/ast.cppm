@@ -27,7 +27,7 @@ public:
   SqlError(const std::string& what, std::int32_t pos) : std::runtime_error{what}, pos_{pos} {}
   SqlError(const SqlError&) = default;
   SqlError& operator=(const SqlError&) = default;
-  ~SqlError() override;  // out of line: anchors the vtable
+  ~SqlError() override;  // out of line: anchors the vtable (-Wweak-vtables)
   [[nodiscard]] auto pos() const noexcept -> std::int32_t { return pos_; }
 
 private:

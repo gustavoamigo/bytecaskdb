@@ -73,11 +73,14 @@ target("sql_layer")
         -- root xmake.lua, which does the same for the test target.
         set_policy("build.c++.modules.std", false)
     end
-    add_defines("SQL_LAYER_ALGEBRA_DIR=\"" .. path.join(os.scriptdir(), "algebra") .. "\"")
+    -- Public: tcc_loader.cppm, a public interface unit, uses both, and a
+    -- dependent target may build its module file with its own flags.
+    add_defines("SQL_LAYER_ALGEBRA_DIR=\"" .. path.join(os.scriptdir(), "algebra") .. "\"", {public = true})
     on_config(function (t)
         local tcc = t:pkg("tinycc")
         if tcc then
-            t:add("defines", "SQL_LAYER_TCC_LIB_PATH=\"" .. path.join(tcc:installdir(), "lib", "tcc") .. "\"")
+            t:add("defines", "SQL_LAYER_TCC_LIB_PATH=\"" .. path.join(tcc:installdir(), "lib", "tcc") .. "\"",
+                  {public = true})
         end
     end)
 
@@ -98,7 +101,6 @@ target("sql_layer_tests")
     -- plan(); each is renamed so several link into one binary.
     add_includedirs("algebra")
     add_defines("SQL_LAYER_PLANS_DIR=\"" .. path.join(os.scriptdir(), "plans") .. "\"")
-    add_defines("SQL_LAYER_ALGEBRA_DIR=\"" .. path.join(os.scriptdir(), "algebra") .. "\"")
     for _, name in ipairs({"insert", "select_by_id", "select_name_range", "update_qty", "delete_by_id"}) do
         add_files("plans/" .. name .. ".c", {defines = "plan=plan_" .. name,
                   cflags = "-Wno-declaration-after-statement"})
