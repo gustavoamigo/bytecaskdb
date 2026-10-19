@@ -340,9 +340,9 @@ in a hash table keyed by the reference's `id`, with the catalog version it
 verified each against and the column map it built. A run whose reference
 and pinned version match an entry skips the walk: a hash lookup and an
 integer compare. The table holds 1,024 references; past that, a miss
-forgets one entry to make room, so a workload cycling through many prepared
-statements keeps them cached, a recompiled plan's dead id is dropped in
-time, and a context's memory stays bounded. The version is the catalog's identity: a context
+evicts one by CLOCK (the first entry the hand finds unused since it last
+passed), so the references in use survive a flood of others, a recompiled
+plan's dead id is dropped in time, and a context's memory stays bounded. The version is the catalog's identity: a context
 is bound to one database at `bc_ctx_new`, and within a database a catalog
 version is never reused, so no pointer is compared (a freed catalog's
 address can be reused, its version cannot). An `id` of 0 is never cached.

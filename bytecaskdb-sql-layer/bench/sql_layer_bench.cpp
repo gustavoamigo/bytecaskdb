@@ -245,6 +245,32 @@ int main() {
       bc_ctx_reset(cx);
       std::printf("50 New-Order refs in turn: check per run %7.1f ns\n", cycled - base);
     }
+    // 2,000 New-Order-sized references round robin, twice the cache, with 20
+    // hot ones run between them: each pair is one cold miss and, if CLOCK
+    // keeps the hot ones, one hit.
+    {
+      std::vector<std::unique_ptr<Ref>> hot, cold;
+      for (int i = 0; i < 20; ++i) hot.push_back(make_ref(*cat, new_order, next_id++));
+      for (int i = 0; i < 2000; ++i) cold.push_back(make_ref(*cat, new_order, next_id++));
+      std::size_t h = 0, c = 0;
+      bc_ctx_begin(cx, &ps, {});
+      auto run_one = [&](auto& v, std::size_t& at) {
+        bc_ctx_run(cx, noop, &v[at]->ref);
+        at = (at + 1) % v.size();
+      };
+      for (int i = 0; i < 4000; ++i) run_one(cold, c);  // warm: the cache full of cold
+      auto cold_only = ns_per_iter([&] { run_one(cold, c); }, 20000);
+      auto pair = ns_per_iter(
+          [&] {
+            run_one(hot, h);
+            run_one(cold, c);
+          },
+          20000);
+      if (bc_error(cx) != BC_OK) std::printf("error: %s\n", bc_error_message(cx));
+      bc_ctx_reset(cx);
+      std::printf("2,000 cold refs round robin: per run %7.1f ns; with a hot ref between, the hot one %7.1f ns\n",
+                  cold_only - base, pair - cold_only - base);
+    }
     auto wref = make_ref(*cat, {{"warehouse"}, {}, {{"warehouse", "w_tax"}}, {}}, next_id++);
     auto run = [&](bc_plan_fn plan, const bc_schema_ref* ref) {
       bc_ctx_begin(cx, &ps, {});

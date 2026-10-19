@@ -268,6 +268,15 @@ TEST_CASE("plan API: a context caches a verified reference by id and catalog ver
   auto liar = lying.get();
   liar.id = ref.id;
   CHECK(bc_execute(f.cx, scan_index, &liar, &none, {}, false, 0) == BC_COMMITTED);
+
+  // A flood of 2,000 other references, twice the cache, with the first one
+  // run every 20: CLOCK keeps it, so the liar is still served its entry.
+  for (int i = 0; i < 2000; ++i) {
+    auto r = reads_index.get();
+    REQUIRE(bc_execute(f.cx, scan_index, &r, &none, {}, false, 0) == BC_COMMITTED);
+    if (i % 20 == 0) REQUIRE(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_COMMITTED);
+  }
+  CHECK(bc_execute(f.cx, scan_index, &liar, &none, {}, false, 0) == BC_COMMITTED);
   // An id of 0 is never cached: checked on every run. A refusal of the
   // reference says so in its detail: a recompile can cure it.
   liar.id = 0;
@@ -283,6 +292,15 @@ TEST_CASE("plan API: a context caches a verified reference by id and catalog ver
     REQUIRE(bc_execute(f.cx, scan_index, &r, &none, {}, false, 0) == BC_COMMITTED);
   }
   liar.id = ref.id;
+  CHECK(bc_execute(f.cx, scan_index, &liar, &none, {}, false, 0) == BC_COMMITTED);
+
+  // A flood of 2,000 other references, twice the cache, with the first one
+  // run every 20: CLOCK keeps it, so the liar is still served its entry.
+  for (int i = 0; i < 2000; ++i) {
+    auto r = reads_index.get();
+    REQUIRE(bc_execute(f.cx, scan_index, &r, &none, {}, false, 0) == BC_COMMITTED);
+    if (i % 20 == 0) REQUIRE(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_COMMITTED);
+  }
   CHECK(bc_execute(f.cx, scan_index, &liar, &none, {}, false, 0) == BC_COMMITTED);
 
   // A DDL between two executions moves the version, so the cached entry no

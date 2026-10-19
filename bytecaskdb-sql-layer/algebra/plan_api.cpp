@@ -72,9 +72,9 @@ namespace {
 
 constexpr std::uint32_t kNoCursor = UINT32_MAX;
 constexpr std::uint32_t kScanFlagMask = BC_SCAN_REVERSE | BC_SCAN_PREFIX;
-// Verified schema references a context keeps; past this it forgets one to
-// make room, so a context's memory stays bounded and a workload just past
-// the bound loses one entry per miss, not all of them.
+// Verified schema references a context keeps. Past this a miss evicts one
+// by CLOCK, so memory stays bounded and the references in use survive a
+// flood of others, a recompile's dead ids included.
 constexpr std::size_t kMaxVerified = 1024;
 
 // What a view is, beyond its bytes: a row read from the engine (a stored
@@ -150,6 +150,7 @@ struct TableCols {
 // on and is only ever matched by the version number.
 struct Verified {
   bool valid{false};
+  bool referenced{false};  // CLOCK: used since the hand last passed
   std::uint64_t ref_id{0};
   std::uint64_t version{0};
   std::vector<TableCols> tables;
@@ -225,14 +226,16 @@ struct bc_ctx {
   std::vector<Bytes> written_rows;
   std::vector<std::pair<Bytes, Bytes>> deleted_ranges;  // [lo, hi) of each bc_del_range, likewise
 
-  // References verified by bc_ctx_run, kept across executions, by id. A
-  // context is bound to one database, and a catalog version is never reused
-  // within one, so an entry is matched by the reference's id and the
-  // version alone. An id of 0 is verified into `scratch` on every run.
-  // Elements of an unordered_map stay put as it grows, so `current` stays
-  // valid until its entry is erased, which only use_ref does, before it
-  // sets `current` again.
-  std::unordered_map<std::uint64_t, Verified> verified;
+  // References verified by bc_ctx_run, kept across executions: slots, a map
+  // from reference id to slot, and the CLOCK hand. A context is bound to one
+  // database, and a catalog version is never reused within one, so an entry
+  // is matched by the reference's id and the version alone. An id of 0 is
+  // verified into `scratch` on every run. `slots` is reserved whole at
+  // construction and only use_ref reuses a slot, before it sets `current`,
+  // so `current` never dangles.
+  std::vector<Verified> slots;
+  std::unordered_map<std::uint64_t, std::uint32_t> slot_of;
+  std::size_t hand{0};
   Verified scratch;
   const Verified* current{nullptr};  // this execution's reference; nullptr: none
 
@@ -245,7 +248,9 @@ struct bc_ctx {
   std::int64_t affected{-1};
 
   bc_ctx(bytecask::DB* d, LiveCatalog* l, std::uint32_t arena_bytes)
-      : db{d}, live{l}, arena(arena_bytes) {}
+      : db{d}, live{l}, arena(arena_bytes) {
+    slots.reserve(kMaxVerified);
+  }
 
   auto ok() const -> bool { return error == BC_OK; }
 
@@ -747,6 +752,34 @@ auto written_tables(const bc_ctx* cx) -> std::vector<std::uint32_t> {
   return true;
 }
 
+// The cache slot of reference `id`: its own, or a free one, or the one CLOCK
+// evicts: the first the hand finds unused since it last passed.
+auto cache_slot(bc_ctx* cx, std::uint64_t id) -> Verified& {
+  if (auto it = cx->slot_of.find(id); it != cx->slot_of.end()) {
+    auto& e = cx->slots[it->second];
+    e.referenced = true;
+    return e;
+  }
+  std::size_t at = cx->slots.size();
+  if (at < kMaxVerified) {
+    cx->slots.emplace_back();
+  } else {
+    while (cx->slots[cx->hand].referenced) {
+      cx->slots[cx->hand].referenced = false;
+      cx->hand = (cx->hand + 1) % kMaxVerified;
+    }
+    at = cx->hand;
+    cx->hand = (cx->hand + 1) % kMaxVerified;
+    cx->slot_of.erase(cx->slots[at].ref_id);
+  }
+  auto& e = cx->slots[at];
+  e.valid = false;
+  e.ref_id = id;
+  e.referenced = true;
+  cx->slot_of[id] = static_cast<std::uint32_t>(at);
+  return e;
+}
+
 // Makes `ref` the execution's reference: from the cache when this context
 // verified it against the pinned version before, verified otherwise.
 [[nodiscard]] auto use_ref(bc_ctx* cx, const bc_schema_ref* ref) -> bool {
@@ -754,12 +787,7 @@ auto written_tables(const bc_ctx* cx) -> std::vector<std::uint32_t> {
     cx->current = nullptr;
     return true;
   }
-  if (ref->id != 0 && !cx->verified.contains(ref->id) && cx->verified.size() >= kMaxVerified) {
-    // Any one entry: a recompile's dead id goes this way too. Never the
-    // current one, which only this function sets, and which it replaces.
-    cx->verified.erase(cx->verified.begin());
-  }
-  auto& e = ref->id == 0 ? cx->scratch : cx->verified[ref->id];
+  auto& e = ref->id == 0 ? cx->scratch : cache_slot(cx, ref->id);
   if (ref->id == 0 || !e.valid || e.ref_id != ref->id || e.version != cx->cat->version()) {
     if (!verify(cx, ref, e)) return false;
   }
