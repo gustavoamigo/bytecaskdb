@@ -5,9 +5,12 @@
 // TPROC-C schema: what bc_ctx_run's compatibility check adds to an execution
 // (a point read's reference and a New-Order-sized one), what verifying a
 // reference and mapping its column ids to positions costs when it is not
-// cached, and what one column decode costs. Not part of CI; build and run
-// with:
-//   xmake f -m release && xmake build sql_layer_bench && xmake run sql_layer_bench
+// cached, what one column decode costs, and what bc_update costs when no
+// indexed column changes. Not part of CI. The published
+// numbers were taken in releasedbg (-O3 -march=native, no LTO):
+//   xmake f -m releasedbg && xmake build sql_layer_bench && xmake run sql_layer_bench
+// release adds LTO, whose link fails where llvm-ar is older than clang (it
+// cannot read the newer bitcode); releasedbg avoids it.
 
 #include <algorithm>
 #include <array>
@@ -138,6 +141,29 @@ void decode_0(bc_ctx* cx) {
   bc_emit_count(cx, found ? 1 : 0);
 }
 
+// Payment's customer update: customer (1, 1, 1) read by primary key and its
+// c_balance set. payment_update writes it with bc_update; payment_built stops
+// at the built row, so the difference is bc_update's cost on a table whose
+// one index, customer_i2, has no column the update changes.
+std::uint32_t g_customer = 0;
+std::uint32_t g_balance = 0;
+auto payment_row(bc_ctx* cx, bc_view* old) -> bc_view {
+  bool found = false;
+  *old = bc_get(cx, bc_key_params(cx, g_customer, 0, 3), &found);
+  bc_row r = bc_row_from(cx, g_customer, *old);
+  bc_row_set_i64(cx, r, g_balance, 5);
+  return bc_row_end(cx, r);
+}
+void payment_built(bc_ctx* cx) {
+  bc_view old{};
+  (void)payment_row(cx, &old);
+}
+void payment_update(bc_ctx* cx) {
+  bc_view old{};
+  bc_view row = payment_row(cx, &old);
+  bc_update(cx, g_customer, old, row);
+}
+
 template <typename F>
 auto ns_per_iter(F&& f, int iters) -> double {
   std::vector<double> runs;
@@ -149,6 +175,24 @@ auto ns_per_iter(F&& f, int iters) -> double {
   }
   std::ranges::sort(runs);
   return runs[runs.size() / 2];
+}
+
+// What b costs over a: the median, over 31 rounds, of the difference
+// between back-to-back timings of the two, so drift between rounds cancels.
+template <typename A, typename B>
+auto ns_over(A&& a, B&& b, int iters) -> double {
+  auto time = [&](auto& f) {
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i) f();
+    return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count() / iters;
+  };
+  std::vector<double> diffs;
+  for (int r = 0; r < 31; ++r) {
+    auto ta = time(a);
+    diffs.push_back(time(b) - ta);
+  }
+  std::ranges::sort(diffs);
+  return diffs[diffs.size() / 2];
 }
 
 }  // namespace
@@ -175,6 +219,21 @@ int main() {
       Bytes row, key;
       (void)rw.finish(row);
       (void)encode_pk_from_row(w, row, key);
+      db.put({}, key, row);
+    }
+    // One customer row, likewise.
+    const auto& cust = *cat->table("customer");
+    g_customer = cust.id;
+    g_balance = cust.column("c_balance")->id;
+    {
+      RowWriter rw{cust.layout};
+      for (const auto* name : {"c_w_id", "c_d_id", "c_id"}) (void)rw.set_i64(cust.column(name)->id, 1);
+      (void)rw.set_bytes(cust.column("c_first")->id, std::as_bytes(std::span{std::string_view{"first"}}));
+      (void)rw.set_bytes(cust.column("c_last")->id, std::as_bytes(std::span{std::string_view{"BARBARBAR"}}));
+      (void)rw.set_i64(g_balance, 0);
+      Bytes row, key;
+      (void)rw.finish(row);
+      (void)encode_pk_from_row(cust, row, key);
       db.put({}, key, row);
     }
 
@@ -274,6 +333,16 @@ int main() {
     auto d0 = ns_per_iter([&] { run(decode_0, &wref->ref); }, kIters);
     auto d64 = ns_per_iter([&] { run(decode_64, &wref->ref); }, kIters);
     std::printf("bc_col_i64 + bc_add, by column id:         %8.1f ns per call\n", (d64 - d0) / 64);
+    auto pref = make_ref(*cat, {{"customer"}, {"customer"}, {{"customer", "c_balance"}}, {}}, bc_ref_id());
+    bc_params ps3{{std::int64_t{1}, std::int64_t{1}, std::int64_t{1}}};
+    auto run3 = [&](bc_plan_fn plan) {
+      bc_ctx_begin(cx, &ps3, {});
+      bc_ctx_run(cx, plan, &pref->ref);
+      if (bc_error(cx) != BC_OK) std::printf("error: %s\n", bc_error_message(cx));
+      bc_ctx_reset(cx);
+    };
+    auto update = ns_over([&] { run3(payment_built); }, [&] { run3(payment_update); }, kIters / 20);
+    std::printf("bc_update, Payment's customer (no index column changed): %7.1f ns\n", update);
     bc_ctx_free(cx);
     db.close();
   }

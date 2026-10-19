@@ -148,8 +148,10 @@ only if the harness shows the copy.
 **A constraint error is never retried.** `BC_E_CONSTRAINT`, with a detail
 code, is a sticky error of its own family: the plan unwinds like any other
 failure, and the runtime reports it and does not retry. `bc_insert` and
-`bc_update` set it for a duplicate primary or unique key; a plan sets it
-itself with `bc_raise`. This is how a duplicate reaches the client as an
+`bc_update` set it for a duplicate primary or unique key, and the row
+builder for a NULL in a NOT NULL column (`BC_C_NOT_NULL` with the table's
+id, since column ids are per table; the message names the column); a plan
+sets it itself with `bc_raise`. This is how a duplicate reaches the client as an
 error rather than as a conflict: the engine reports every failed
 precondition of a batch as the same conflict, so the runtime checks the
 snapshot first, raises if the key is taken, and keeps a guard for the race.
@@ -181,9 +183,11 @@ runtime's unique checks read the snapshot too. A second write of a row the
 plan already wrote is refused (`BC_E_HANDLE`): `bc_update` and `bc_delete`
 derive the entries they remove from the snapshot's row, so a second write
 would leave the first one's entries without a row. A unique secondary key
-two of the plan's own inserts share is not caught; the stage-1 compiler
-emits one write per plan, and a procedure that writes several rows needs the
-overlay below (#507).
+two of the plan's own inserts share is not caught. Both are stage-2 limits:
+the stage-1 compiler emits one write per plan, and a procedure that writes
+one row twice, or several rows sharing a unique key, waits on the
+own-writes overlay of #491 (read-your-own-writes), which lifts the refusal
+(#507).
 Read-your-own-writes across statements in an interactive transaction is an
 overlay the cursors read through and belongs to the session layer. See
 *Deferred*.
@@ -241,9 +245,13 @@ enum bc_constraint {   /* the detail of BC_E_CONSTRAINT; the compiler emits the 
   BC_C_RANGE,          /* a value outside its declared type: INTEGER, VARCHAR(n), DECIMAL(p, s) */
 };
 
-enum bc_layout_detail {  /* the detail of BC_E_LAYOUT */
-  BC_L_ROW = 0,           /* a row or a result row that breaks its layout */
+enum bc_layout_detail {  /* the detail of BC_E_LAYOUT; every BC_E_LAYOUT carries one */
+  BC_L_ROW = 0,           /* a row written to a table it is not of, or a column its layout lacks */
   BC_L_INCOMPATIBLE = 1,  /* bc_ctx_run refused the plan's bc_schema_ref: recompile it */
+  BC_L_PLAN = 2,          /* the plan or its bc_schema_ref is malformed, a compiler bug: an unknown result
+                             type, a result row too wide, a table the catalog lacks, result rows emitted
+                             out of order or off their declared types */
+  BC_L_RETIRED = 3,       /* a stored row of a layout generation REBUILD retired */
 };
 
 enum bc_commit_result { BC_COMMITTED, BC_CONFLICT, BC_FAILED /* see bc_error */ };
@@ -336,7 +344,7 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
 | `bc_ctx_commit` | Submits the write plan with `apply_batch`, guarded by `ensure_unchanged` on the catalog record of every table whose keys it writes, so a DDL on such a table committed since the snapshot makes it a conflict: the index entries the runtime wrote follow the pinned version's indexes, and a `CREATE INDEX` committed after the snapshot would otherwise miss the row. `BC_COMMITTED` on success. `BC_CONFLICT` when the engine reports a guard or write-write conflict: nothing was written. `BC_FAILED` when `bc_error` is set, including an error raised during the plan: nothing is committed. A plan with no writes and no guards commits nothing and returns `BC_COMMITTED`. |
 | `bc_ctx_next_result` | Iterates the result buffer. Rows are in the row format of the layout the plan emitted. The runtime, not a plan, sees raw pointers here; valid until `bc_ctx_reset`. |
 | `bc_ctx_reset` | Releases the snapshot, drops the write plan and result buffer, resets the arena, bumps every generation so every handle and view the plan held is invalid. |
-| `bc_error_detail`, `bc_ctx_affected` | The constraint kind and object id of a raised error, or for `BC_E_LAYOUT` whether it was `bc_ctx_run` refusing the reference (`BC_L_INCOMPATIBLE`, cured by a recompile) or a row breaking its layout (`BC_L_ROW`); the affected-row count a write plan recorded. Both read by the runtime after the plan returns. |
+| `bc_error_detail`, `bc_ctx_affected` | The constraint kind and object id of a raised error, or for `BC_E_LAYOUT` its class: `bc_ctx_run` refusing the reference (`BC_L_INCOMPATIBLE`, the only one a recompile cures), a row used with a table or column it is not of (`BC_L_ROW`), a malformed plan or reference (`BC_L_PLAN`), or a row of a retired layout generation (`BC_L_RETIRED`). The runtime sets every `BC_E_LAYOUT` with its detail; one without cannot be compiled; the affected-row count a write plan recorded. Both read by the runtime after the plan returns. |
 | `bc_execute` | `begin`, `run`, `commit`; on `BC_CONFLICT`, `reset` and repeat up to `max_retries`. A `BC_E_CONSTRAINT` raised by the plan is final: no retry. Returns the commit result of the last attempt. This is the only place retry lives. |
 
 **Verification is cached.** A context remembers the references it verified,
@@ -529,9 +537,9 @@ bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: live
 | `bc_row_key` | The table's full primary key (namespace, table id, parts), encoded from the row's columns: for a `bc_get`, a guard, or a scan bound reached from a row. Built in the arena. |
 | `bc_row_begin` | Starts a row of `table`'s current layout with every column at its default: the catalog's default for a column that has one, null for the rest. A plan compiled before a column was added writes the column's default without naming it. |
 | `bc_row_from` | Starts a row of `table` as a copy of `old`, a row of that table and of its current layout generation (`BC_E_LAYOUT` otherwise; a `REBUILD`, #503, widens this to any generation). The `UPDATE` pattern: copy, set the assigned columns, end. |
-| `bc_row_set_*`, `bc_row_set_null` | Sets column `col`, which must be of the builder's table. Setting twice keeps the last value. |
-| `bc_row_set_param` | Sets column `col` to parameter `i`: its value, or null when it is NULL. One call where a nullable column took an `if` and two sets. A parameter whose type is not the column's is `BC_E_HANDLE`. |
-| `bc_row_end` | Finalizes the row in the arena and returns its view, a built row of the builder's table. Every non-nullable column must have been set (`BC_E_LAYOUT` otherwise); a row over the engine's value limit is `BC_E_LIMIT`. |
+| `bc_row_set_*`, `bc_row_set_null` | Sets column `col`, which must be of the builder's table. Setting twice keeps the last value. A NULL for a NOT NULL column is `BC_E_CONSTRAINT` with `BC_C_NOT_NULL` and the table's id, and sets nothing, so a column's default is never cleared. |
+| `bc_row_set_param` | Sets column `col` to parameter `i`: its value, or null when it is NULL. One call where a nullable column took an `if` and two sets. A parameter whose type is not the column's is `BC_E_HANDLE`; a NULL for a NOT NULL column is `BC_C_NOT_NULL`, as above. |
+| `bc_row_end` | Finalizes the row in the arena and returns its view, a built row of the builder's table. A NOT NULL column never set and with no default is `BC_C_NOT_NULL`, as above; a row over the engine's value limit is `BC_E_LIMIT`. |
 | `bc_pin` | Copies a view into the arena so it outlives its cursor, keeping what it is: a pinned row is still a row of its table. The compiler emits it where a plan keeps a cursor's bytes across a step. |
 
 ### Ephemeral structures
@@ -603,7 +611,7 @@ void    bc_del_range(bc_ctx *, uint32_t table, bc_view lo, bc_view hi);
 | Function | What it does | Reads | Engine operations |
 |---|---|---|---|
 | `bc_insert` | Inserts `row`, a row of `table`'s current layout. Checks on the snapshot that its primary key is free and that, for each unique index, no entry has the row's index parts (skipped when one of them is null: nulls are distinct); a duplicate is `BC_E_CONSTRAINT` with `BC_C_UNIQUE` and the table's or the index's id. Then writes the row and one entry per index, and a range guard over each checked unique prefix for the race. | 1, plus 1 per unique index | `put` per row and entry, `ensure_range_unchanged` per unique index |
-| `bc_update` | Replaces `old`, a stored row of `table`, with `row`. Writes the row; for each index, compares the entry `old` has with the one `row` has and, only where they differ, deletes the old and writes the new. A unique index is checked, as for `bc_insert`, only when its prefix changed, so a row never collides with itself. A changed primary key moves the row: the old key deleted, the new one checked and written, and every entry moved, since each carries the primary key. | 1 per unique index whose prefix changed, plus 1 if the primary key changed | `put`, `del` |
+| `bc_update` | Replaces `old`, a stored row of `table`, with `row`. Writes the row; for each index, compares the entry `old` has with the one `row` has and, only where they differ, deletes the old and writes the new. An index none of whose columns changed encoding is not encoded at all, nor is the new primary key when its columns did not change, so an update of unindexed columns builds no index key. A unique index is checked, as for `bc_insert`, only when its prefix changed, so a row never collides with itself. A changed primary key moves the row: the old key deleted, the new one checked and written, and every entry moved, since each carries the primary key. | 1 per unique index whose prefix changed, plus 1 if the primary key changed | `put`, `del` |
 | `bc_delete` | Deletes `old`, a stored row of `table`, and its entry in every index. | 0 | `del` per row and entry |
 | `bc_del_range` | Deletes the rows of `table` whose primary keys are in `[lo, hi)`, row keys or prefixes of `table` (empty: its start or its end), with their index entries. `lo >= hi` deletes nothing. A table with no secondary index takes one range delete whatever the range holds; otherwise the runtime scans the range to delete each row's entries. | 0 without secondary indexes; else 1 per row in the range | `del_range`, then `del` per entry |
 
@@ -1050,7 +1058,8 @@ them.
 - `bc_insert`, `bc_update`, `bc_delete` and `bc_row_key`: writes are
   table-level, and the runtime writes the index entries, runs the unique
   checks (a prefix probe, `BC_C_UNIQUE`, a range guard; for the primary key,
-  existence) and moves only the entries whose keys changed. The unique
+  existence) and moves only the entries whose keys changed, encoding no
+  entry of an index whose columns did not change. The unique
   checks no longer show in the text; they are still charged to the budget.
   `bc_update` and `bc_delete` take a stored row, so the entries they remove
   are the snapshot's.
@@ -1065,6 +1074,10 @@ them.
 - `bc_insert` writes no `ensure_absent` on the primary key. The engine's
   check of the plan's own write set already makes a concurrent insert of the
   key a conflict, and a test shows it.
+- A NULL set into a NOT NULL column, or a NOT NULL column left unset with
+  no default, is `BC_E_CONSTRAINT` with `BC_C_NOT_NULL` and the table's id,
+  never retried. It was a `BC_E_LAYOUT` at `bc_row_end`, and an explicit
+  NULL cleared the column's default until then.
 - `bc_scan_row`: an index entry to its row. A missing row is `BC_E_CORRUPT`;
   the prototype's generated range plan skipped it, which hid damage.
 - `bc_key_param`, `bc_key_params`, `bc_row_set_param`, `bc_emit_col`,
@@ -1088,8 +1101,9 @@ them.
   context's cache of verified references:
   verifying a reference already verified against the pinned catalog
   version is a hash lookup and a compare instead of a walk of the catalog
-  and an allocation per run. `BC_E_LAYOUT` gains a detail,
-  `BC_L_INCOMPATIBLE` for the check's refusal, so the embedded API no longer
+  and an allocation per run. `BC_E_LAYOUT` gains a detail on every error:
+  `BC_L_INCOMPATIBLE` for the check's refusal, `BC_L_ROW`, `BC_L_PLAN` and
+  `BC_L_RETIRED` for the rest, so the embedded API no longer
   checks a compatible plan itself: it recompiles exactly when `bc_ctx_run`
   refuses one, or before the run when the parameters do not fit the cached
   plan and the catalog has made it incompatible, and checks the parameters

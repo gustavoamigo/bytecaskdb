@@ -4,8 +4,10 @@
 // The table-level writes of plan API revision 5 (docs/plan_api_design.md,
 // *Writes*): bc_insert, bc_update, bc_delete and bc_del_range keep every
 // index exact, unique, DESC and nullable parts included; a duplicate is
-// BC_E_CONSTRAINT and never retried; an index created after a plan was
-// compiled is maintained by it; bc_scan_row finds a missing row as damage;
+// BC_E_CONSTRAINT and never retried, as is a NULL for a NOT NULL column;
+// an update rewrites only the indexes whose columns changed; an index
+// created after a plan was compiled is maintained by it; bc_scan_row finds
+// a missing row as damage;
 // a covering read reads no row; and the reads each call is charged.
 
 #include <catch2/catch_test_macros.hpp>
@@ -107,6 +109,36 @@ auto run(Fixture& f, bc_plan_fn plan, std::vector<bc_value> p, bc_budget budget 
 }
 
 auto unique_on(std::uint32_t object) -> std::uint32_t { return (std::uint32_t{BC_C_UNIQUE} << 24) | object; }
+auto not_null_on(std::uint32_t table) -> std::uint32_t { return (std::uint32_t{BC_C_NOT_NULL} << 24) | table; }
+
+// INSERT INTO w (id, c) VALUES ($1, NULL)
+void insert_null_c(bc_ctx* cx) {
+  ++g_runs;
+  bc_row r = bc_row_begin(cx, kW);
+  bc_row_set_param(cx, r, kId, 0);
+  bc_row_set_null(cx, r, kC);
+  bc_insert(cx, kW, bc_row_end(cx, r));
+}
+
+// INSERT INTO w (id) VALUES ($1): c, NOT NULL with no default, never set
+void insert_without_c(bc_ctx* cx) {
+  ++g_runs;
+  bc_row r = bc_row_begin(cx, kW);
+  bc_row_set_param(cx, r, kId, 0);
+  bc_insert(cx, kW, bc_row_end(cx, r));
+}
+
+std::uint32_t g_col_d = 0;
+
+// INSERT INTO w (id, c, d) VALUES ($1, $2, $3)
+void insert_with_d(bc_ctx* cx) {
+  ++g_runs;
+  bc_row r = bc_row_begin(cx, kW);
+  bc_row_set_param(cx, r, kId, 0);
+  bc_row_set_param(cx, r, kC, 1);
+  bc_row_set_param(cx, r, g_col_d, 2);
+  bc_insert(cx, kW, bc_row_end(cx, r));
+}
 
 // Every index of every table holds exactly the entries its rows derive, and
 // no unique index holds two entries under one prefix without a null part:
@@ -204,6 +236,13 @@ TEST_CASE("plan writes: insert, update and delete keep every index exact, unique
       }
       case 2: {  // update, the primary key moved one time in four
         auto to = pick(4) == 0 ? std::int64_t{pick(20)} : id;
+        // Half the updates keep some of the row's indexed columns, so an
+        // index whose columns are all kept is skipped, not rewritten.
+        if (auto it = model.find(id); it != model.end() && pick(2) == 0) {
+          if (pick(2) == 0) r.a = it->second.a;
+          if (pick(2) == 0) r.b = it->second.b;
+          if (pick(2) == 0) r.c = it->second.c;
+        }
         auto got = run(f, update_w, {id, to, opt_i(r.a), opt_b(r.b), r.c});
         if (!model.contains(id)) {
           REQUIRE(got == BC_COMMITTED);
@@ -265,6 +304,46 @@ TEST_CASE("plan writes: a duplicate is BC_E_CONSTRAINT and never retried", "[sql
   CHECK(bc_error_detail(f.cx) == unique_on(kWCA));
   CHECK(run(f, update_w, {std::int64_t{1}, std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{0}}) ==
         BC_COMMITTED);
+  check_indexes_exact(f);
+}
+
+TEST_CASE("plan writes: a NULL for a NOT NULL column is BC_C_NOT_NULL, never retried, and keeps the default",
+          "[sql][algebra][writes]") {
+  Fixture f;
+  create_w(f);
+  REQUIRE(run(f, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{0}}) == BC_COMMITTED);
+  auto refused = [&](bc_plan_fn plan, std::vector<bc_value> p, std::uint32_t detail, const char* column) {
+    g_runs = 0;
+    CHECK(run(f, plan, std::move(p), {}, 3) == BC_FAILED);
+    CHECK(g_runs == 1);
+    CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
+    CHECK(bc_error_detail(f.cx) == detail);
+    CHECK(std::string{bc_error_message(f.cx)}.find(column) != std::string::npos);
+  };
+  // INSERT with a NULL primary key, by parameter.
+  refused(insert_w, {bc_value{}, std::int64_t{2}, bytes("y"), std::int64_t{0}}, not_null_on(kW), "\"id\"");
+  // UPDATE SET c = NULL.
+  refused(update_w, {std::int64_t{1}, std::int64_t{1}, std::int64_t{1}, bytes("x"), bc_value{}}, not_null_on(kW),
+          "\"c\"");
+  // bc_row_set_null, and a NOT NULL column with no default left unset.
+  refused(insert_null_c, {std::int64_t{3}}, not_null_on(kW), "\"c\"");
+  refused(insert_without_c, {std::int64_t{3}}, not_null_on(kW), "\"c\"");
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 1);
+
+  // NOT NULL DEFAULT 7: an explicit NULL is refused, not written over the
+  // default; a plan that does not name the column writes the default.
+  f.ddl(bytecask::sql::AddColumnDdl{"w", {"d", {bytecask::sql::SqlKind::BigInt}, false, std::int64_t{7}}});
+  g_col_d = f.cat().table("w")->column("d")->id;
+  refused(insert_with_d, {std::int64_t{4}, std::int64_t{0}, bc_value{}}, not_null_on(kW), "\"d\"");
+  REQUIRE(run(f, insert_w, {std::int64_t{5}, std::int64_t{5}, bytes("z"), std::int64_t{0}}) == BC_COMMITTED);
+  Bytes key, row;
+  bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kW);
+  bytecask::sql::key_put_i64(key, 5, {PhysType::I64});
+  REQUIRE(f.db->get({}, key, row));
+  const auto& w = *f.cat().table("w");
+  CHECK(bytecask::sql::row_i64(row, w.layout.find(g_col_d)->pos) == 7);
+  CHECK(run(f, insert_with_d, {std::int64_t{6}, std::int64_t{0}, std::int64_t{8}}) == BC_COMMITTED);
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 3);
   check_indexes_exact(f);
 }
 
@@ -587,6 +666,7 @@ TEST_CASE("plan writes: a missing row and a wrong row are errors, never skipped"
   create_w(f);
   CHECK(run(f, insert_into_other, {std::int64_t{1}}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_ROW);
   CHECK(run(f, insert_param, {row2}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
 

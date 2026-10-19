@@ -197,19 +197,23 @@ TEST_CASE("plan API: bc_ctx_run checks what a plan depends on, not a catalog ver
   retyped.cols[2].type = BC_T_F64;
   CHECK(run_with(retyped) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);
   auto unknown = ok;
   unknown.cols.push_back(col(9, BC_T_I64));
   CHECK(run_with(unknown) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);
   // Nor one that reads an object that is gone, or writes a table that is.
   auto gone = ok;
   gone.read.push_back(4242);
   CHECK(run_with(gone) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);
   auto gone_table = ok;
   gone_table.written.push_back(4242);
   CHECK(run_with(gone_table) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);
   // A column the plan names but its reference does not declare is a plan bug
   // at the call: the reference is complete, so the check covers every column.
   auto undeclared = ok;
@@ -251,6 +255,7 @@ TEST_CASE("plan API: bc_ctx_run checks what a plan depends on, not a catalog ver
   CHECK(run_with(ok) == BC_COMMITTED);
   CHECK(bc_execute(f.cx, scan_index, &scan_ref, &none, {}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);
 }
 
 TEST_CASE("plan API: a context caches a verified reference by id and catalog version", "[sql][algebra][catalog]") {

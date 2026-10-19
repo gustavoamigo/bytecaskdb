@@ -380,7 +380,7 @@ TEST_CASE("row format: every physical type round-trips, null or not", "[sql][cod
   RowWriter w{layout};
   for (int i = 0; i < 2000; ++i) {
     w.reset();
-    CHECK(w.missing_required());
+    CHECK(w.missing_required() == std::optional<std::uint32_t>{0});
     auto id = random_i64(rng);
     auto name = rng() % 3 == 0 ? std::nullopt : OptBytes{random_bytes(rng)};
     auto qty = rng() % 3 == 0 ? std::nullopt : OptI64{random_i64(rng)};
@@ -393,7 +393,7 @@ TEST_CASE("row format: every physical type round-trips, null or not", "[sql][cod
     if (score) REQUIRE(w.set_f64(3, *score));
     if (flag) REQUIRE(w.set_bool(4, *flag));
     if (blob) REQUIRE(w.set_bytes(5, *blob));
-    CHECK_FALSE(w.missing_required());
+    CHECK_FALSE(w.missing_required().has_value());
     Bytes row;
     REQUIRE(w.finish(row));
     REQUIRE(row_valid(row));

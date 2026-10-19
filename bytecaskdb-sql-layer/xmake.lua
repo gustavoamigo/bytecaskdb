@@ -100,7 +100,9 @@ target("sql_layer_tests")
     end
 
 -- Micro-benchmarks of the plan API's fixed costs (bench/sql_layer_bench.cpp).
--- Not built by default and not run in CI; build in release mode.
+-- Not built by default and not run in CI. Build in releasedbg, as the
+-- published numbers were: release's LTO link fails where llvm-ar is older
+-- than clang.
 target("sql_layer_bench")
     set_kind("binary")
     set_default(false)

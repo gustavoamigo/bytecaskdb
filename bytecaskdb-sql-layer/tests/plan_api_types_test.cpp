@@ -620,6 +620,14 @@ void emit_too_few(bc_ctx* cx) {
   bc_emit_begin(cx);
   bc_emit_end(cx);
 }
+void emit_begun_twice(bc_ctx* cx) {
+  bc_emit_begin(cx);
+  bc_emit_begin(cx);
+}
+void emit_not_ended(bc_ctx* cx) {
+  bc_emit_begin(cx);
+  bc_emit_i64(cx, 1);
+}
 void key_too_long(bc_ctx* cx) {
   bc_key ib = bc_key_begin(cx, kIdx);
   bc_key_bytes(cx, ib, bc_param_bytes(cx, 0));
@@ -637,6 +645,7 @@ TEST_CASE("plan API: bc_row_key rebuilds the scan key and bc_pin outlives the st
   CHECK(value(f, row_key_matches_key, {}) == 3 + 1 + 2);  // three matches, then ids 1 and 2 read after the step
   CHECK(run(f, row_key_wrong_table, {}) == BC_FAILED);  // an index is not a table
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
 }
 
 TEST_CASE("plan API: result rows follow the schema ref's types; limits and types are checked", "[sql][algebra]") {
@@ -645,10 +654,14 @@ TEST_CASE("plan API: result rows follow the schema ref's types; limits and types
   bc_ctx_begin(f.cx, &ps, {});
   bc_ctx_run(f.cx, emit_without_types, nullptr);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
-  CHECK(run(f, emit_wrong_type, {}, kI64Row) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
-  CHECK(run(f, emit_too_few, {}, kI64Row) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
+  bc_ctx_reset(f.cx);
+  // Every result-row misuse is the plan's: BC_L_PLAN, not a row error.
+  for (auto* plan : {emit_wrong_type, emit_too_few, emit_begun_twice, emit_not_ended}) {
+    CHECK(run(f, plan, {}, kI64Row) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+    CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
+  }
   CHECK(run(f, key_too_long, {Bytes(70000, std::byte{'k'})}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LIMIT);
   CHECK(run(f, key_too_long, {Bytes(1000, std::byte{'k'})}) == BC_COMMITTED);
@@ -658,6 +671,7 @@ TEST_CASE("plan API: result rows follow the schema ref's types; limits and types
   bc_schema_ref ref{0, f.cat().version(), nullptr, 0, nullptr, 0, nullptr, 0, bad_code, 1};
   CHECK(bc_execute(f.cx, emit_without_types, &ref, &ps, {}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
 }
 
 namespace {
@@ -805,6 +819,7 @@ TEST_CASE("plan API: a second commit and a too-wide result are plan errors, not 
   auto none = params({});
   CHECK(bc_execute(f.cx, scan_all_forward, &ref, &none, {}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
 }
 
 TEST_CASE("plan API: a commit refused because the engine is a follower is BC_E_DEGRADED, not corruption", "[sql][algebra]") {

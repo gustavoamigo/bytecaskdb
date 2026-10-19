@@ -147,10 +147,6 @@ struct TableCols {
   std::vector<ColSlot> by_col;
 };
 
-// A schema reference verified against one catalog version, with what the
-// verification built: the column map and the result layout. Plain data, no
-// pointer into the catalog, so an entry outlives the version it was built
-// on and is only ever matched by the version number.
 // What a reference points at: its arrays and their lengths. Kept with a
 // verified entry and compared on every hit, so a different reference that
 // reuses an id is verified on its own rather than served another's entry.
@@ -167,6 +163,15 @@ auto shape_of(const bc_schema_ref& r) -> RefShape {
   return {r.objects_read, r.tables_written, r.cols, r.result_types, r.n_read, r.n_written, r.n_cols, r.n_result};
 }
 
+// A schema reference verified against one catalog version, with what the
+// verification built: the column map and the result layout. Plain data, no
+// pointer into the catalog, so an entry outlives the version it was built
+// on. Invariants: an entry is served without verification only when it is
+// valid and its ref_id, version and shape match the reference, the version
+// being the pinned catalog's. A cached entry's ref_id is an id bc_ref_id
+// issued and the key slot_of maps to it; a reference with no issued id
+// uses the context's scratch entry and is verified on every run. A failed
+// verification leaves the entry invalid, so the next run verifies again.
 struct Verified {
   bool valid{false};
   bool referenced{false};  // CLOCK: used since the hand last passed
@@ -219,6 +224,21 @@ auto key_object(BytesView key) -> std::optional<std::pair<std::uint8_t, std::uin
   for (std::size_t i = 1; i < bytecask::sql::kKeyPrefixBytes; ++i) id = (id << 8) | std::to_integer<std::uint32_t>(key[i]);
   return std::pair{std::to_integer<std::uint8_t>(key[0]), id};
 }
+
+// An error code other than BC_E_LAYOUT, checked at compile time: a layout
+// error is set with its bc_layout_detail, through the other fail overload,
+// so none goes without one.
+// -Wc++20-compat: the project is C++23; consteval is what makes it a
+// compile-time check.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wc++20-compat"
+struct ErrorCode {
+  consteval ErrorCode(bc_error_code c) : code{c} {  // implicit: fail(BC_E_IO, ...)
+    if (c == BC_E_LAYOUT) throw "BC_E_LAYOUT is set with its bc_layout_detail";
+  }
+  bc_error_code code;
+};
+#pragma clang diagnostic pop
 
 }  // namespace
 
@@ -291,9 +311,16 @@ struct bc_ctx {
 
   auto ok() const -> bool { return error == BC_OK; }
 
-  void fail(bc_error_code code, std::string msg) {
+  void fail(ErrorCode code, std::string msg) {
     if (error != BC_OK) return;
-    error = code;
+    error = code.code;
+    message = std::move(msg);
+  }
+
+  void fail(bc_layout_detail why, std::string msg) {
+    if (error != BC_OK) return;
+    error = BC_E_LAYOUT;
+    detail = why;
     message = std::move(msg);
   }
 
@@ -432,7 +459,6 @@ struct bc_ctx {
     return nullptr;
   }
 
-  // The key layout of a table or index, or nullptr and BC_E_HANDLE.
   // Whether the plan's reference names table or index `id` (and, for
   // `write`, lists it among the tables written), as it must for every object
   // a plan names, so the compatibility check covers each one. A run without
@@ -447,6 +473,7 @@ struct bc_ctx {
     return false;
   }
 
+  // The key layout of a table or index, or nullptr and BC_E_HANDLE.
   auto key_layout(std::uint32_t table_or_index) -> const KeyLayout* {
     if (!ok() || !declared_object(table_or_index, false)) return nullptr;
     const auto* kl = cat->key_layout(table_or_index);
@@ -459,7 +486,7 @@ struct bc_ctx {
   auto table(std::uint32_t id, bool write = false) -> const Table* {
     if (!ok() || !declared_object(id, write)) return nullptr;
     const auto* t = cat->table(id);
-    if (t == nullptr) fail(BC_E_LAYOUT, "no table " + std::to_string(id));
+    if (t == nullptr) fail(BC_L_PLAN, "no table " + std::to_string(id));
     return t;
   }
 
@@ -469,10 +496,10 @@ struct bc_ctx {
 
   // Sets the constraint error: the kind in the detail's high byte, the
   // object id in its low 24 bits.
-  void raise(std::uint32_t constraint, std::uint32_t object_id) {
+  void raise(std::uint32_t constraint, std::uint32_t object_id, std::string msg = {}) {
     if (!ok()) return;
     auto d = (constraint << 24) | object_id;
-    fail(BC_E_CONSTRAINT, constraint_message(d));
+    fail(BC_E_CONSTRAINT, msg.empty() ? constraint_message(d) : std::move(msg));
     detail = d;
   }
 
@@ -604,17 +631,6 @@ auto resolve_range(bc_ctx* cx, std::uint32_t table_or_index, bc_view lo, bc_view
   return r;
 }
 
-// Whether a datum (a parameter) is of a physical type; NULL is of none.
-auto datum_is(const Datum& d, PhysType t) -> bool {
-  switch (t) {
-    case PhysType::I64: return std::holds_alternative<std::int64_t>(d);
-    case PhysType::F64: return std::holds_alternative<double>(d);
-    case PhysType::Bool: return std::holds_alternative<bool>(d);
-    case PhysType::Bytes: return std::holds_alternative<Bytes>(d);
-  }
-  return false;
-}
-
 // Appends parameter `i` as a key part: its value, or the null part for NULL.
 [[nodiscard]] auto put_param_part(bc_ctx* cx, Bytes& buf, KeyPart part, std::uint32_t i) -> bool {
   const auto* d = cx->param(i);
@@ -627,7 +643,7 @@ auto datum_is(const Datum& d, PhysType t) -> bool {
     bytecask::sql::key_put_null(buf, part);
     return true;
   }
-  if (!datum_is(*d, part.type)) {
+  if (!bytecask::sql::datum_fits(*d, part.type)) {
     cx->fail(BC_E_HANDLE, "parameter $" + std::to_string(i + 1) + " is not " + type_name(part.type));
     return false;
   }
@@ -767,9 +783,8 @@ auto written_tables(const bc_ctx* cx) -> std::vector<std::uint32_t> {
 [[nodiscard]] auto verify(bc_ctx* cx, const bc_schema_ref* ref, Verified& e) -> bool {
   e.valid = false;
   if (auto why = bytecask::sql::schema_incompatibility(*cx->cat, *ref)) {
-    cx->fail(BC_E_LAYOUT, "plan compiled against catalog v" + std::to_string(ref->catalog_version) +
-                              " is incompatible with v" + std::to_string(cx->cat->version()) + ": " + *why);
-    cx->detail = BC_L_INCOMPATIBLE;  // the one BC_E_LAYOUT a recompile can cure
+    cx->fail(BC_L_INCOMPATIBLE, "plan compiled against catalog v" + std::to_string(ref->catalog_version) +
+                                    " is incompatible with v" + std::to_string(cx->cat->version()) + ": " + *why);
     return false;
   }
   auto codes = std::span{ref->result_types, ref->result_types == nullptr ? 0 : ref->n_result};
@@ -778,7 +793,7 @@ auto written_tables(const bc_ctx* cx) -> std::vector<std::uint32_t> {
     for (auto code : codes) {
       auto t = phys_type(code);
       if (!t) {
-        cx->fail(BC_E_LAYOUT, "unknown result type code " + std::to_string(code));
+        cx->fail(BC_L_PLAN, "unknown result type code " + std::to_string(code));
         return false;
       }
       types.push_back(*t);
@@ -787,7 +802,7 @@ auto written_tables(const bc_ctx* cx) -> std::vector<std::uint32_t> {
       e.result_layout.emplace(bytecask::sql::make_result_layout(types));
     } catch (const std::length_error&) {
       e.result_layout.reset();
-      cx->fail(BC_E_LAYOUT, "the plan's result row has too many columns for one row layout");
+      cx->fail(BC_L_PLAN, "the plan's result row has too many columns for one row layout");
       return false;
     }
     e.result_codes.assign(codes.begin(), codes.end());
@@ -928,8 +943,21 @@ void fail_generation(bc_ctx* cx, const Table* t, std::uint16_t gen) {
   auto retired = t != nullptr && std::ranges::any_of(t->retired_layouts, [&](const auto& l) {
                    return l.second.generation == gen;
                  });
-  cx->fail(retired ? BC_E_LAYOUT : BC_E_CORRUPT, "row of layout generation " + std::to_string(gen) +
-                                                     (retired ? ", which REBUILD retired" : ", which its table never had"));
+  auto msg = "row of layout generation " + std::to_string(gen);
+  if (retired) {
+    cx->fail(BC_L_RETIRED, msg + ", which REBUILD retired");
+  } else {
+    cx->fail(BC_E_CORRUPT, msg + ", which its table never had");
+  }
+}
+
+// BC_E_CONSTRAINT with BC_C_NOT_NULL: column `col` of `table` is null.
+void not_null(bc_ctx* cx, std::uint32_t table, std::uint32_t col) {
+  const auto* t = cx->cat->table(table);
+  const auto* c = t == nullptr ? nullptr : t->column(col);
+  cx->raise(BC_C_NOT_NULL, table,
+            "null value in column \"" + (c == nullptr ? std::to_string(col) : c->name) + "\" of table \"" +
+                (t == nullptr ? std::to_string(table) : t->name) + "\" violates its not-null constraint");
 }
 
 // Column `col` of a row view, where a decoder reads it: the row, and the
@@ -963,7 +991,7 @@ auto write_row(bc_ctx* cx, const Table& t, bc_view row, bool stored) -> std::opt
     return std::nullopt;
   }
   if (r->table != t.id) {
-    cx->fail(BC_E_LAYOUT, "row of table " + std::to_string(r->table) + " written to table " + t.name);
+    cx->fail(BC_L_ROW, "row of table " + std::to_string(r->table) + " written to table " + t.name);
     return std::nullopt;
   }
   if (auto gen = bytecask::sql::row_generation(r->bytes); gen != t.layout.generation) {
@@ -1056,6 +1084,16 @@ auto set_target(bc_ctx* cx, bc_row r, std::uint32_t col, std::optional<PhysType>
   return b;
 }
 
+// A NULL for column `col` of a row being built: refused for a NOT NULL
+// column with BC_E_CONSTRAINT, BC_C_NOT_NULL and the table's id (column ids
+// are per table; the message names the column), and never set, so a
+// column's default survives the refusal.
+[[nodiscard]] auto null_allowed(bc_ctx* cx, const RowBuilder& b, std::uint32_t col) -> bool {
+  if (b.layout->find(col)->nullable) return true;
+  not_null(cx, b.table, col);
+  return false;
+}
+
 template <typename Set>
 void set_column(bc_ctx* cx, bc_row r, std::uint32_t col, std::optional<PhysType> type, Set&& set) {
   auto* b = set_target(cx, r, col, type);
@@ -1063,7 +1101,7 @@ void set_column(bc_ctx* cx, bc_row r, std::uint32_t col, std::optional<PhysType>
   BC_GUARD_BEGIN
   // The column is declared with this type and in the current layout: the
   // writer cannot refuse it.
-  if (!set(b->writer)) cx->fail(BC_E_LAYOUT, "column " + std::to_string(col) + " is not in the row's layout");
+  if (!set(b->writer)) cx->fail(BC_L_ROW, "column " + std::to_string(col) + " is not in the row's layout");
   BC_GUARD_END(cx)
 }
 }  // namespace
@@ -1112,7 +1150,7 @@ void bc_ctx_run(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* compiled_again
   BC_GUARD_END(cx)
   if (!cx->ok()) return;
   plan(cx);
-  if (cx->ok() && cx->emit) cx->fail(BC_E_LAYOUT, "result row begun and not ended");
+  if (cx->ok() && cx->emit) cx->fail(BC_L_PLAN, "result row begun and not ended");
 }
 
 enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
@@ -1216,11 +1254,11 @@ bool bc_param_null(bc_ctx* cx, uint32_t i) {
 void bc_emit_begin(bc_ctx* cx) {
   if (!cx->ok()) return;
   if (cx->current == nullptr) {
-    cx->fail(BC_E_LAYOUT, "the plan's schema ref declares no result types");
+    cx->fail(BC_L_PLAN, "the plan's schema ref declares no result types");
     return;
   }
   if (cx->emit) {
-    cx->fail(BC_E_LAYOUT, "result row already begun");
+    cx->fail(BC_L_PLAN, "result row already begun");
     return;
   }
   BC_GUARD_BEGIN
@@ -1237,7 +1275,7 @@ auto emit_slot(bc_ctx* cx, std::optional<PhysType> type) -> bool {
   if (!cx->ok()) return false;
   if (!cx->emit || cx->emit_col >= cx->current->result_types.size() ||
       (type && cx->current->result_types[cx->emit_col] != *type)) {
-    cx->fail(BC_E_LAYOUT, "emitted column does not match the result layout");
+    cx->fail(BC_L_PLAN, "emitted column does not match the result layout");
     return false;
   }
   return true;
@@ -1334,7 +1372,7 @@ void bc_emit_key_part(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32_t
 void bc_emit_end(bc_ctx* cx) {
   if (!cx->ok()) return;
   if (!cx->emit || cx->emit_col != cx->current->result_types.size()) {
-    cx->fail(BC_E_LAYOUT, "result row ended with the wrong number of columns");
+    cx->fail(BC_L_PLAN, "result row ended with the wrong number of columns");
     return;
   }
   BC_GUARD_BEGIN
@@ -1810,7 +1848,9 @@ void bc_row_set_bytes(bc_ctx* cx, bc_row r, uint32_t col, bc_view v) {
 }
 
 void bc_row_set_null(bc_ctx* cx, bc_row r, uint32_t col) {
-  set_column(cx, r, col, std::nullopt, [&](RowWriter& w) { return w.set_null(col); });
+  auto* b = set_target(cx, r, col, std::nullopt);
+  if (b == nullptr || !null_allowed(cx, *b, col)) return;
+  if (!b->writer.set_null(col)) cx->fail(BC_L_ROW, "column is not in the row's layout");
 }
 
 void bc_row_set_param(bc_ctx* cx, bc_row r, uint32_t col, uint32_t i) {
@@ -1819,12 +1859,13 @@ void bc_row_set_param(bc_ctx* cx, bc_row r, uint32_t col, uint32_t i) {
   auto* b = set_target(cx, r, col, std::nullopt);
   if (b == nullptr) return;
   const auto* slot = b->layout->find(col);
-  if (!std::holds_alternative<std::monostate>(*d) && !datum_is(*d, slot->type)) {
+  if (!bytecask::sql::datum_fits(*d, slot->type)) {
     cx->fail(BC_E_HANDLE, "parameter $" + std::to_string(i + 1) + " is not " + type_name(slot->type));
     return;
   }
+  if (std::holds_alternative<std::monostate>(*d) && !null_allowed(cx, *b, col)) return;
   BC_GUARD_BEGIN
-  if (!bytecask::sql::set_datum(b->writer, col, *d)) cx->fail(BC_E_LAYOUT, "column is not in the row's layout");
+  if (!bytecask::sql::set_datum(b->writer, col, *d)) cx->fail(BC_L_ROW, "column is not in the row's layout");
   BC_GUARD_END(cx)
 }
 
@@ -1832,8 +1873,9 @@ bc_view bc_row_end(bc_ctx* cx, bc_row r) {
   auto* b = row_builder(cx, r);
   if (b == nullptr) return {};
   b->done = true;
-  if (b->writer.missing_required()) {
-    cx->fail(BC_E_LAYOUT, "a non-nullable column was not set");
+  // A NOT NULL column the plan never set and that has no default.
+  if (auto col = b->writer.missing_required()) {
+    not_null(cx, b->table, *col);
     return {};
   }
   BC_GUARD_BEGIN
@@ -1944,17 +1986,30 @@ void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {
   auto o = write_row(cx, *t, old, true);
   auto n = write_row(cx, *t, row, false);
   if (!o || !n) return;
+  // A key built only from columns whose encodings are the same in both rows
+  // is the same key: it is encoded once, or not at all. A malformed row
+  // counts as changed, and its encoding refuses it.
+  auto same = [&](std::uint32_t col) {
+    const auto* slot = t->layout.find(col);
+    return slot != nullptr && bytecask::sql::row_column_equal(*o, *n, *slot).value_or(false);
+  };
   Bytes pk_old, pk_new;
-  if (!encode_pk(cx, *t, *o, pk_old) || !encode_pk(cx, *t, *n, pk_new)) return;
-  auto moved_pk = pk_old != pk_new;
+  if (!encode_pk(cx, *t, *o, pk_old)) return;
+  auto moved_pk = !std::ranges::all_of(t->pk_col_ids, same);
+  if (moved_pk) {
+    if (!encode_pk(cx, *t, *n, pk_new)) return;
+    moved_pk = pk_old != pk_new;
+  }
   if (!first_write(cx, *t, pk_old) || (moved_pk && !first_write(cx, *t, pk_new))) return;
   // Only the entries whose keys changed move; with the primary key, all do.
+  // An index none of whose columns changed is not encoded.
   struct Move {
     const Index* ix;
     Entry from, to;
   };
   std::vector<Move> moves;
   for (const auto& ix : t->indexes) {
+    if (!moved_pk && std::ranges::all_of(ix.parts, [&](const auto& p) { return same(p.col_id); })) continue;
     Move m{&ix, {}, {}};
     if (!encode_entry(cx, *t, ix, *o, m.from) || !encode_entry(cx, *t, ix, *n, m.to)) return;
     if (m.from.key != m.to.key) moves.push_back(std::move(m));
@@ -1968,7 +2023,7 @@ void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {
     }
   }
   if (moved_pk) cx->push_effect(EffectKind::Del, pk_old);
-  cx->push_effect(EffectKind::Put, pk_new, *n);
+  cx->push_effect(EffectKind::Put, moved_pk ? pk_new : pk_old, *n);
   for (const auto& m : moves) {
     cx->push_effect(EffectKind::Del, m.from.key);
     cx->push_effect(EffectKind::Put, m.to.key);

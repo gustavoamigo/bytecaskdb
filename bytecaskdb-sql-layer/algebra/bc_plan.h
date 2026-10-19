@@ -69,9 +69,13 @@ enum bc_constraint {   /* the detail of BC_E_CONSTRAINT; the compiler emits the 
   BC_C_RANGE,          /* a value outside its declared type: INTEGER, VARCHAR(n), DECIMAL(p, s) */
 };
 
-enum bc_layout_detail {  /* the detail of BC_E_LAYOUT */
-  BC_L_ROW = 0,           /* a row or a result row that breaks its layout */
+enum bc_layout_detail {  /* the detail of BC_E_LAYOUT; every BC_E_LAYOUT carries one */
+  BC_L_ROW = 0,           /* a row written to a table it is not of, or a column its layout lacks */
   BC_L_INCOMPATIBLE = 1,  /* bc_ctx_run refused the plan's bc_schema_ref: recompile it */
+  BC_L_PLAN = 2,          /* the plan or its bc_schema_ref is malformed, a compiler bug: an unknown result
+                             type, a result row too wide, a table the catalog lacks, result rows emitted
+                             out of order or off their declared types */
+  BC_L_RETIRED = 3,       /* a stored row of a layout generation REBUILD retired */
 };
 
 enum bc_commit_result { BC_COMMITTED, BC_CONFLICT, BC_FAILED /* see bc_error */ };

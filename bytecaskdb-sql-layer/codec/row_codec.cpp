@@ -194,11 +194,11 @@ auto RowWriter::set_null(std::uint32_t col_id) -> bool {
   return true;
 }
 
-auto RowWriter::missing_required() const -> bool {
+auto RowWriter::missing_required() const -> std::optional<std::uint32_t> {
   for (std::size_t i = 0; i < layout_->columns.size(); ++i) {
-    if (!present_[i] && !layout_->columns[i].nullable) return true;
+    if (!present_[i] && !layout_->columns[i].nullable) return layout_->columns[i].col_id;
   }
-  return false;
+  return std::nullopt;
 }
 
 auto RowWriter::finish(Bytes& out, std::size_t max_bytes) const -> bool {
@@ -331,5 +331,21 @@ auto row_bytes(BytesView row, std::uint32_t slot) -> std::optional<BytesView> {
 }
 
 auto row_is_null(BytesView row, const ColumnSlot& col) -> bool { return !row_present_bit(row, col.col_id); }
+
+auto row_column_equal(BytesView a, BytesView b, const ColumnSlot& col) -> std::optional<bool> {
+  auto null_a = row_is_null(a, col);
+  auto null_b = row_is_null(b, col);
+  if (null_a || null_b) return null_a == null_b;
+  if (col.type == PhysType::Bytes) {
+    auto x = row_bytes(a, col.pos);
+    auto y = row_bytes(b, col.pos);
+    if (!x || !y) return std::nullopt;
+    return std::ranges::equal(*x, *y);
+  }
+  auto x = row_word(a, col.pos);
+  auto y = row_word(b, col.pos);
+  if (!x || !y) return std::nullopt;
+  return *x == *y;
+}
 
 }  // namespace bytecask::sql

@@ -30,17 +30,6 @@ namespace {
 constexpr std::uint32_t kArenaBytes = 4u << 20;
 constexpr std::uint32_t kMaxRetries = 3;
 
-auto matches(const Value& v, PhysType t) -> bool {
-  if (std::holds_alternative<std::monostate>(v)) return true;
-  switch (t) {
-    case PhysType::I64: return std::holds_alternative<std::int64_t>(v);
-    case PhysType::F64: return std::holds_alternative<double>(v);
-    case PhysType::Bool: return std::holds_alternative<bool>(v);
-    case PhysType::Bytes: return std::holds_alternative<Bytes>(v);
-  }
-  return false;
-}
-
 }  // namespace
 
 ExecError::~ExecError() = default;
@@ -155,17 +144,22 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
       return "statement takes " + std::to_string(types.size()) + " parameters, got " + std::to_string(params.size());
     }
     for (std::size_t i = 0; i < params.size(); ++i) {
-      if (!matches(params[i], types[i])) return "parameter $" + std::to_string(i + 1) + " has the wrong type";
+      if (!datum_fits(params[i], types[i])) return "parameter $" + std::to_string(i + 1) + " has the wrong type";
     }
     return {};
   };
-  auto check_params = [&] {
-    if (auto why = mismatch(); !why.empty()) throw std::invalid_argument(why);
+  auto check_params = [](const std::string& why) {
+    if (!why.empty()) throw std::invalid_argument(why);
   };
   // Parameters that do not fit a plan a DDL has made incompatible may fit
   // its recompile: only on that path is the catalog asked, before the run.
-  if (!mismatch().empty() && schema_incompatibility(*live_->current(), stmt.ref_)) compile(stmt);
-  check_params();
+  if (auto why = mismatch(); !why.empty()) {
+    if (schema_incompatibility(*live_->current(), stmt.ref_)) {
+      compile(stmt);
+      why = mismatch();
+    }
+    check_params(why);
+  }
   bc_params bp{params};
   auto r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
   // bc_ctx_run checks the plan against the catalog it pinned. A plan a DDL
@@ -175,7 +169,7 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   if (r == BC_FAILED && bc_error(cx_) == BC_E_LAYOUT && bc_error_detail(cx_) == BC_L_INCOMPATIBLE) {
     bc_ctx_reset(cx_);
     compile(stmt);
-    check_params();
+    check_params(mismatch());
     r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
   }
   const auto& p = *stmt.plan_;
