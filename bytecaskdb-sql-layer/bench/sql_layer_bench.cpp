@@ -227,6 +227,24 @@ int main() {
       std::printf("%-10s (%2zu cols, %2zu objects): check, cached %7.1f ns; verify and map ids %7.1f ns\n", name,
                   spec->cols.size(), spec->read.size() + spec->written.size(), hit, miss);
     }
+    // 50 New-Order-sized references run in turn, as a workload of many
+    // prepared statements does: each must stay cached between its runs.
+    {
+      std::vector<std::unique_ptr<Ref>> many;
+      for (int i = 0; i < 50; ++i) many.push_back(make_ref(*cat, new_order, next_id++));
+      std::size_t at = 0;
+      bc_ctx_begin(cx, &ps, {});
+      for (const auto& r : many) bc_ctx_run(cx, noop, &r->ref);  // the first verification of each
+      auto cycled = ns_per_iter(
+          [&] {
+            bc_ctx_run(cx, noop, &many[at]->ref);
+            at = (at + 1) % many.size();
+          },
+          kIters);
+      if (bc_error(cx) != BC_OK) std::printf("error: %s\n", bc_error_message(cx));
+      bc_ctx_reset(cx);
+      std::printf("50 New-Order refs in turn: check per run %7.1f ns\n", cycled - base);
+    }
     auto wref = make_ref(*cat, {{"warehouse"}, {}, {{"warehouse", "w_tax"}}, {}}, next_id++);
     auto run = [&](bc_plan_fn plan, const bc_schema_ref* ref) {
       bc_ctx_begin(cx, &ps, {});
