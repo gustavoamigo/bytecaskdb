@@ -20,6 +20,7 @@ on:
       - bytecaskdb-sql-layer/algebra/bc_plan.h
       - bytecaskdb-sql-layer/api/database.cppm
       - scripts/check_contract_vocabulary.py
+      - scripts/test_check_contract_vocabulary.py
   pull_request:
     # No branches filter: a PR stacked on a layer PR is checked too.
     paths:
@@ -29,6 +30,7 @@ on:
       - bytecaskdb-sql-layer/algebra/bc_plan.h
       - bytecaskdb-sql-layer/api/database.cppm
       - scripts/check_contract_vocabulary.py
+      - scripts/test_check_contract_vocabulary.py
   workflow_dispatch:
 
 permissions:
@@ -47,3 +49,5 @@ jobs:
         run: python3 scripts/check_contract_vocabulary.py --only engine
       - name: The SQL layer's CONTRACT.md names only its public interface
         run: python3 scripts/check_contract_vocabulary.py --only sql-layer
+      - name: The vocabulary check reads module interfaces as it should
+        run: python3 scripts/test_check_contract_vocabulary.py

@@ -53,12 +53,11 @@ package_end()
 add_requires("tinycc 2026.09.26")
 
 -- C++23 modules, as the engine (the root sets the modules policy for every
--- target): one interface unit per module (bytecask.sql.<name>), public so
--- sql_layer_tests imports them, and one implementation unit beside it with
--- the definitions, laid out as add_engine_files() lays out the engine's. The
+-- target): one interface unit per module (bytecask.sql.<name>), holding its
+-- declarations and definitions, public so sql_layer_tests imports them. The
 -- one header is algebra/bc_plan.h, the C contract; algebra/plan_api.cpp, its
--- extern "C" definitions, is a plain translation unit among the
--- implementation units.
+-- extern "C" definitions and the struct bc_ctx behind them, is a plain
+-- translation unit.
 target("sql_layer")
     set_kind("static")
     set_default(false)
@@ -67,18 +66,21 @@ target("sql_layer")
     add_includedirs("..", {public = true})
     add_files("codec/*.cppm", "catalog/*.cppm", "algebra/*.cppm", "sql/*.cppm", "plan/*.cppm", "api/*.cppm",
               {public = true})
-    add_files("codec/*.cpp", "catalog/*.cpp", "algebra/*.cpp", "sql/*.cpp", "plan/*.cpp", "api/*.cpp")
+    add_files("algebra/plan_api.cpp")
     add_packages("libpg_query", "tinycc", {public = true})
     if (get_config("sanitizer") or ""):find("memory", 1, true) then
         -- No std-module probe under -nostdinc++; see bytecask.catch2 in the
         -- root xmake.lua, which does the same for the test target.
         set_policy("build.c++.modules.std", false)
     end
-    add_defines("SQL_LAYER_ALGEBRA_DIR=\"" .. path.join(os.scriptdir(), "algebra") .. "\"")
+    -- Public: tcc_loader.cppm, a public interface unit, uses both, and a
+    -- dependent target may build its module file with its own flags.
+    add_defines("SQL_LAYER_ALGEBRA_DIR=\"" .. path.join(os.scriptdir(), "algebra") .. "\"", {public = true})
     on_config(function (t)
         local tcc = t:pkg("tinycc")
         if tcc then
-            t:add("defines", "SQL_LAYER_TCC_LIB_PATH=\"" .. path.join(tcc:installdir(), "lib", "tcc") .. "\"")
+            t:add("defines", "SQL_LAYER_TCC_LIB_PATH=\"" .. path.join(tcc:installdir(), "lib", "tcc") .. "\"",
+                  {public = true})
         end
     end)
 
@@ -99,7 +101,6 @@ target("sql_layer_tests")
     -- plan(); each is renamed so several link into one binary.
     add_includedirs("algebra")
     add_defines("SQL_LAYER_PLANS_DIR=\"" .. path.join(os.scriptdir(), "plans") .. "\"")
-    add_defines("SQL_LAYER_ALGEBRA_DIR=\"" .. path.join(os.scriptdir(), "algebra") .. "\"")
     for _, name in ipairs({"insert", "select_by_id", "select_name_range", "update_qty", "delete_by_id"}) do
         add_files("plans/" .. name .. ".c", {defines = "plan=plan_" .. name,
                   cflags = "-Wno-declaration-after-statement"})

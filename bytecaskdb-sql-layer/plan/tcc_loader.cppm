@@ -4,25 +4,28 @@
 // tcc_loader.cppm — compiles a plan file in process with TinyCC and links it
 // against the plan API by name. The plan sees only the functions in
 // plan_api_symbols(): no libc, no other symbol of the process. libtcc.h is
-// seen by tcc_loader.cpp, which holds the definitions, and nowhere else.
+// in this unit's global module fragment, which no importer sees.
 //
 // prototype: the run-time tier of #493, without the checker that must run
 // before it.
 
 module;
+#include <chrono>
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Weverything"
+#include <libtcc.h>
+#pragma clang diagnostic pop
+
 export module bytecask.sql.tcc_loader;
 
-// libtcc.h's opaque compiler state, which TccPlan holds. Declared in the
-// global module, as the header declares it ([basic.link]/10), so
-// tcc_loader.cpp's include of the header completes the same entity.
-extern "C" {
-struct TCCState;
-}
+import bytecask.sql.runtime;
 
 export namespace bytecask::sql {
 
@@ -46,5 +49,52 @@ private:
   bc_plan_fn fn_{nullptr};
   double compile_us_{0};
 };
+
+}  // namespace bytecask::sql
+
+namespace bytecask::sql {
+
+namespace {
+
+void collect_error(void* opaque, const char* msg) {
+  auto& out = *static_cast<std::string*>(opaque);
+  out += msg;
+  out += '\n';
+}
+
+// A void* from tcc_get_symbol as the plan's function type; POSIX guarantees
+// the conversion, as for dlsym.
+auto as_plan_fn(void* p) -> bc_plan_fn { return reinterpret_cast<bc_plan_fn>(p); }
+
+}  // namespace
+
+TccPlan::~TccPlan() {
+  if (state_ != nullptr) tcc_delete(state_);
+}
+
+auto TccPlan::compile(std::string_view source) -> std::unique_ptr<TccPlan> {
+  auto start = std::chrono::steady_clock::now();
+  std::unique_ptr<TccPlan> plan{new TccPlan};
+  std::string errors;
+  plan->state_ = tcc_new();
+  if (plan->state_ == nullptr) throw std::runtime_error("tcc_new failed");
+  auto* s = plan->state_;
+  tcc_set_error_func(s, &errors, collect_error);
+  // TinyCC's own headers (stdbool.h, stddef.h) and the plan API's header.
+  // prototype: both are paths in the build tree, fixed at compile time.
+  tcc_set_lib_path(s, SQL_LAYER_TCC_LIB_PATH);
+  tcc_add_include_path(s, SQL_LAYER_ALGEBRA_DIR);
+  tcc_set_options(s, "-nostdlib");
+  tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
+  for (const auto& sym : plan_api_symbols()) tcc_add_symbol(s, sym.name, sym.address);
+  std::string text{source};
+  if (tcc_compile_string(s, text.c_str()) != 0) throw std::runtime_error("plan does not compile:\n" + errors);
+  if (tcc_relocate(s) < 0) throw std::runtime_error("plan does not link:\n" + errors);
+  plan->fn_ = as_plan_fn(tcc_get_symbol(s, "plan"));
+  if (plan->fn_ == nullptr) throw std::runtime_error("plan defines no plan()");
+  plan->compile_us_ =
+      std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+  return plan;
+}
 
 }  // namespace bytecask::sql

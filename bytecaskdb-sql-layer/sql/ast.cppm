@@ -6,8 +6,7 @@
 // written; positions are byte offsets into the statement text, -1 where
 // libpg_query gives none.
 //
-// prototype: replaced by the designed front end (#492). SqlError's
-// destructor is in ast.cpp.
+// prototype: replaced by the designed front end (#492).
 
 module;
 #include <cstdint>
@@ -28,7 +27,7 @@ public:
   SqlError(const std::string& what, std::int32_t pos) : std::runtime_error{what}, pos_{pos} {}
   SqlError(const SqlError&) = default;
   SqlError& operator=(const SqlError&) = default;
-  ~SqlError() override;  // out of line: anchors the vtable
+  ~SqlError() override;  // out of line: anchors the vtable (-Wweak-vtables)
   [[nodiscard]] auto pos() const noexcept -> std::int32_t { return pos_; }
 
 private:
@@ -146,5 +145,11 @@ struct Delete {
 
 using Statement =
     std::variant<CreateTable, CreateIndex, DropTable, DropIndex, AddColumn, Insert, Select, Update, Delete>;
+
+}  // namespace bytecask::sql::ast
+
+namespace bytecask::sql::ast {
+
+SqlError::~SqlError() = default;
 
 }  // namespace bytecask::sql::ast

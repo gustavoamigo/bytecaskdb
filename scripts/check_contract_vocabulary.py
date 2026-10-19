@@ -10,9 +10,11 @@ of the contract must be one of:
   - a name declared in the interface's files, comments excluded;
   - a name the pair allows (ALLOWED and the pair's own words below).
 
-A C++ module interface (.cppm) contributes the names it declares after
-`export module`: a class member only under public access, and no function
-body, whose code names private members. Only the pair's own files are read;
+A C++ module interface (.cppm) contributes the names it exports: a
+declaration inside an `export` block or one starting with `export`, a class
+member only under public access, and no function body, whose code names
+private members. A module's non-exported helpers and its out-of-line
+definitions do not count. Only the pair's own files are read;
 the modules they re-export are the layer's mechanism and are not followed.
 This is a guard, not a C++ parser: it reads braces, access labels and a
 constructor's initializer list, and nothing that needs the preprocessor or
@@ -102,20 +104,26 @@ TEMPLATE_PARAMS = re.compile(r"\btemplate\s*<[^>]*>")
 # What precedes a brace that opens a scope of declarations rather than code.
 SCOPE = re.compile(r"\b(class|struct|union|enum|namespace)\b|\bextern\s+\"C(?:\+\+)?\"\s*$")
 ACCESS = re.compile(r"^\s*(public|private|protected)\s*$")
+EXPORT = re.compile(r"\s*export\b")
+# `export { ... }`: a block of exported declarations.
+EXPORT_BLOCK = re.compile(r"^\s*export\s*$")
 
 
 def declared_text(src: str) -> str:
-    """The declarations an importer can name: every scope is walked, a class
-    member counts only under public access (a class starts private, a struct
-    public), and function bodies and brace initializers are dropped, since
-    their code names private members."""
+    """The declarations an importer can name: every scope is walked, only
+    what is exported counts, a class member only under public access (a class
+    starts private, a struct public), and function bodies and brace
+    initializers are dropped, since their code names private members."""
     out: list[str] = []
     access: list[str | None] = []  # per open scope; None for a namespace or enum
+    exported: list[bool] = []      # per open scope: inside an export
     start = 0  # where the current declaration began
     i = 0
 
     def visible() -> bool:
-        return all(a in (None, "public") for a in access)
+        export = (exported and exported[-1]) or \
+            bool(EXPORT.match(src[start:i]))
+        return export and all(a in (None, "public") for a in access)
 
     while i < len(src):
         c = src[i]
@@ -130,12 +138,14 @@ def declared_text(src: str) -> str:
         elif c == "{":
             head = src[start:i]
             scope = SCOPE.search(TEMPLATE_PARAMS.sub(" ", head))
-            if scope:
+            if scope or EXPORT_BLOCK.match(head):
                 if visible():
                     out.append(head)
-                kind = scope.group(1)
+                kind = scope.group(1) if scope else None
                 access.append("private" if kind == "class" else
                               "public" if kind in ("struct", "union") else None)
+                exported.append((bool(exported) and exported[-1]) or
+                                bool(EXPORT.match(head)))
                 start = i + 1
             else:
                 depth = 0
@@ -152,6 +162,7 @@ def declared_text(src: str) -> str:
                 out.append(src[start:i])
             if access:
                 access.pop()
+                exported.pop()
             start = i + 1
         i += 1
     if visible():
