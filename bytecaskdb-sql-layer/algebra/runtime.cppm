@@ -13,6 +13,7 @@ module;
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -59,12 +60,27 @@ export using ::bc_catalog;
 export using ::bc_params;
 export using ::bc_ctx_affected;
 
-// What a BC_E_CONSTRAINT detail (bc_error_detail) means, in words: the one
-// mapping from constraint codes to text, for the plan API's error message
-// and the embedded API's exception.
-export [[nodiscard]] auto constraint_message(std::uint32_t detail) -> std::string;
-
 export namespace bytecask::sql {
+
+// A BC_E_CONSTRAINT detail (bc_error_detail): the bc_constraint in the high
+// byte, the object id in the low 24 bits. The one encoding of the detail and
+// the one mapping from constraint codes to names and text, for the plan
+// API's error and the embedded API's exception.
+struct ConstraintDetail {
+  static constexpr std::uint32_t kMaxObjectId = 0x00FF'FFFFu;
+
+  std::uint32_t constraint;  // a bc_constraint
+  std::uint32_t object_id;
+
+  [[nodiscard]] static constexpr auto decode(std::uint32_t detail) -> ConstraintDetail {
+    return {detail >> 24, detail & kMaxObjectId};
+  }
+  [[nodiscard]] constexpr auto encode() const -> std::uint32_t { return (constraint << 24) | object_id; }
+  // "unique", "not_null", "check", "foreign_key" or "range"; empty for a
+  // code bc_plan.h does not define.
+  [[nodiscard]] auto name() const -> std::string_view;
+  [[nodiscard]] auto message() const -> std::string;
+};
 
 // Every column of a result row, by its layout: NULL, or the typed value. The
 // one decoder of result rows, for the embedded API and the tests.
@@ -129,11 +145,20 @@ auto result_type_codes(std::span<const PhysType> types) -> std::vector<std::uint
   return out;
 }
 
-}  // namespace bytecask::sql
+auto ConstraintDetail::name() const -> std::string_view {
+  switch (constraint) {
+    case BC_C_UNIQUE: return "unique";
+    case BC_C_NOT_NULL: return "not_null";
+    case BC_C_CHECK: return "check";
+    case BC_C_FOREIGN_KEY: return "foreign_key";
+    case BC_C_RANGE: return "range";
+    default: return {};
+  }
+}
 
-auto constraint_message(std::uint32_t detail) -> std::string {
-  auto object = std::to_string(detail & 0x00FF'FFFFu);
-  switch (detail >> 24) {
+auto ConstraintDetail::message() const -> std::string {
+  auto object = std::to_string(object_id);
+  switch (constraint) {
     case BC_C_UNIQUE: return "duplicate key value violates unique constraint of object " + object;
     case BC_C_NOT_NULL: return "null value violates a not-null constraint of table " + object;
     case BC_C_CHECK: return "check constraint " + object + " violated";
@@ -142,6 +167,8 @@ auto constraint_message(std::uint32_t detail) -> std::string {
     default: return "constraint violated on object " + object;
   }
 }
+
+}  // namespace bytecask::sql
 
 auto plan_api_symbols() -> std::span<const ApiSymbol> {
   // Function-local: initialised on first use, not by a global constructor.

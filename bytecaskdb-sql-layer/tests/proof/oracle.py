@@ -6,7 +6,7 @@ form, so a test compares them.
 
 PostgreSQL holds the expected data. Text compares under COLLATE "C", byte
 order, which is the order of the layer's keys. Values compare as values,
-never as printed text.
+never as printed text, and by type: True is not 1, and -0.0 is not 0.0.
 """
 
 from __future__ import annotations
@@ -58,12 +58,30 @@ class Outcome:
 
     `error` is None when it ran, a SQLSTATE for a constraint both sides
     name, or "refused" for any other error: the layer's SqlError, and any
-    other PostgreSQL error.
+    other PostgreSQL error. `affected` is the rows an INSERT, UPDATE or
+    DELETE changed, None for any other statement.
     """
 
     error: str | None = None
     rows: tuple = ()
+    affected: int | None = None
     detail: str = ""
+
+
+def strict(rows) -> tuple:
+    """Rows in a form that compares by type as well as value: each value as
+    (type name, value), a float as its exact hex, so True != 1 != 1.0 and
+    -0.0 != 0.0."""
+
+    def one(v):
+        return (type(v).__name__, v.hex() if isinstance(v, float) else v)
+
+    return tuple(tuple(one(v) for v in row) for row in rows)
+
+
+def changes_rows(sql: str) -> bool:
+    """Whether the statement reports the rows it changed."""
+    return sql.split(None, 1)[0].upper() in ("INSERT", "UPDATE", "DELETE")
 
 
 def literal(t: Type, v) -> str:
@@ -104,7 +122,7 @@ def run_layer(db, sql: str, params=()) -> Outcome:
         return Outcome(error=SQLSTATE.get(e.constraint, "refused"), detail=str(e))
     except bytecask_sql.SqlError as e:
         return Outcome(error="refused", detail=str(e))
-    return Outcome(rows=tuple(r["rows"]))
+    return Outcome(rows=tuple(r["rows"]), affected=r["affected"] if changes_rows(sql) else None)
 
 
 def run_pg(conn, sql: str, params=()) -> Outcome:
@@ -115,7 +133,8 @@ def run_pg(conn, sql: str, params=()) -> Outcome:
         with conn.cursor() as cur:
             cur.execute(text, values)
             rows = cur.fetchall() if cur.description else []
+            affected = cur.rowcount if changes_rows(sql) else None
     except psycopg.Error as e:
         state = e.sqlstate or ""
         return Outcome(error=state if state in SQLSTATE.values() else "refused", detail=f"{state} {e}")
-    return Outcome(rows=tuple(tuple(from_pg(v) for v in row) for row in rows))
+    return Outcome(rows=tuple(tuple(from_pg(v) for v in row) for row in rows), affected=affected)

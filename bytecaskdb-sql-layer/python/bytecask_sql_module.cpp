@@ -3,7 +3,8 @@
 //
 // bytecask_sql — the SQL layer's embedded API for Python, via nanobind: what
 // the proof tests (tests/proof/, #515) drive. Five calls: open, execute,
-// close, the catalog, and a table's rows.
+// close, the catalog, and a table's rows (test only: it links
+// sql_layer_testing).
 //
 // Values cross as Python values by the column's SQL type: integers as int,
 // DOUBLE PRECISION and REAL as float, BOOLEAN as bool, BYTEA as bytes, TEXT
@@ -13,10 +14,12 @@
 //
 // Errors: bytecask_sql.ExecError for a plan that ran and failed, with its
 // code (a bc_error_code, or BC_CONFLICT when every retry conflicted) and, for
-// BC_E_CONSTRAINT, the constraint kind and the object id; bytecask_sql.SqlError for
-// a statement the layer refuses before it runs (parse, bind, a DDL the
-// catalog refuses, parameters of the wrong number or type). Both derive
-// from bytecask_sql.Error.
+// BC_E_CONSTRAINT, the constraint kind and the object id; bytecask_sql.SqlError
+// for a statement the layer refuses before it runs (parse and bind errors,
+// a DDL the catalog refuses, parameters of the wrong number or type);
+// bytecask_sql.Closed, also a ValueError, for any call after close(). All
+// derive from bytecask_sql.Error. Anything else, an engine refusal at run
+// time included, is nanobind's translation of the C++ exception.
 
 #include <cstdint>
 #include <exception>
@@ -36,7 +39,8 @@
 #include <nanobind/stl/string_view.h>
 #include <nanobind/stl/unique_ptr.h>
 
-#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+#include "include/bytecask.hpp"
+
 
 import bytecask.sql.api;
 
@@ -49,29 +53,19 @@ namespace {
 // The module's exception classes, created at import and owned by the module
 // object; plain handles, so nothing runs at process exit.
 struct Exceptions {
-  nb::handle error, sql_error, exec_error;
+  nb::handle error, sql_error, exec_error, closed;
 };
 Exceptions exceptions;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables): set once at import
-
-auto constraint_name(std::uint32_t kind) -> nb::object {
-  switch (kind) {
-    case BC_C_UNIQUE: return nb::str("unique");
-    case BC_C_NOT_NULL: return nb::str("not_null");
-    case BC_C_CHECK: return nb::str("check");
-    case BC_C_FOREIGN_KEY: return nb::str("foreign_key");
-    case BC_C_RANGE: return nb::str("range");
-    default: return nb::none();
-  }
-}
 
 void raise_exec_error(const sql::ExecError& e) {
   nb::object exc = nb::borrow(exceptions.exec_error)(nb::str(e.what()));
   exc.attr("code") = e.code();
   exc.attr("constraint") = nb::none();
   exc.attr("object_id") = nb::none();
-  if (e.code() == BC_E_CONSTRAINT) {
-    exc.attr("constraint") = constraint_name(e.detail() >> 24);
-    exc.attr("object_id") = e.detail() & 0x00FF'FFFFu;
+  if (auto c = e.constraint()) {
+    auto name = c->name();
+    if (!name.empty()) exc.attr("constraint") = nb::str(name.data(), name.size());
+    exc.attr("object_id") = c->object_id;
   }
   PyErr_SetObject(exceptions.exec_error.ptr(), exc.ptr());
 }
@@ -104,7 +98,9 @@ auto to_python(const sql::Value& v, sql::SqlType t) -> nb::object {
   if (const auto* b = std::get_if<sql::Bytes>(&v)) {
     if (t.kind == sql::SqlKind::Text || t.kind == sql::SqlKind::Varchar) {
       auto s = bytes_view(*b);
-      return nb::steal(PyUnicode_DecodeUTF8(s.data(), static_cast<Py_ssize_t>(s.size()), "strict"));
+      auto* o = PyUnicode_DecodeUTF8(s.data(), static_cast<Py_ssize_t>(s.size()), "strict");
+      if (o == nullptr) throw nb::python_error();  // stored bytes that are not UTF-8: UnicodeDecodeError
+      return nb::steal(o);
     }
     return nb::bytes(bytes_view(*b).data(), b->size());
   }
@@ -173,9 +169,12 @@ NB_MODULE(bytecask_sql, m) {
   exceptions.error = PyErr_NewException("bytecask_sql.Error", PyExc_Exception, nullptr);
   exceptions.sql_error = PyErr_NewException("bytecask_sql.SqlError", exceptions.error.ptr(), nullptr);
   exceptions.exec_error = PyErr_NewException("bytecask_sql.ExecError", exceptions.error.ptr(), nullptr);
+  auto closed_bases = nb::make_tuple(exceptions.error, nb::handle(PyExc_ValueError));
+  exceptions.closed = PyErr_NewException("bytecask_sql.Closed", closed_bases.ptr(), nullptr);
   m.attr("Error") = exceptions.error;
   m.attr("SqlError") = exceptions.sql_error;
   m.attr("ExecError") = exceptions.exec_error;
+  m.attr("Closed") = exceptions.closed;
 
   nb::register_exception_translator([](const std::exception_ptr& p, void*) {
     try {
@@ -184,23 +183,23 @@ NB_MODULE(bytecask_sql, m) {
       raise_exec_error(e);
     } catch (const sql::ast::SqlError& e) {
       PyErr_SetString(exceptions.sql_error.ptr(), e.what());
-    } catch (const std::invalid_argument& e) {
-      // A statement the catalog refuses, or parameters of the wrong number or type.
+    } catch (const sql::DdlRefused& e) {
       PyErr_SetString(exceptions.sql_error.ptr(), e.what());
-    } catch (const std::length_error& e) {
-      // Ids, a layout or a backfill past their limits.
+    } catch (const sql::ParamError& e) {
       PyErr_SetString(exceptions.sql_error.ptr(), e.what());
+    } catch (const bytecask::DbClosed& e) {
+      PyErr_SetString(exceptions.closed.ptr(), e.what());
     }
   });
 
   nb::class_<sql::Database>(m, "Database")
       .def("execute", &execute, "sql"_a, "params"_a = nb::tuple(),
            "Runs one statement: a dict of columns, rows (tuples) and affected.")
-      .def("close", &sql::Database::close, "Closes the engine; no later call is allowed.")
+      .def("close", &sql::Database::close, "Closes the engine; a later call raises Closed, a second close() nothing.")
       .def("catalog", &catalog, "Every table: its id, name, columns (id, name, type, nullable, default) and primary key.")
       .def(
           "table_rows",
-          [](sql::Database& db, std::string_view table) { return to_python(db.table_rows(table)); },
+          [](const sql::Database& db, std::string_view table) { return to_python(db.table_rows(table)); },
           "table"_a,
           "Test only: every row of a table, in primary-key order, read from the engine and decoded "
           "through the catalog.");

@@ -3,7 +3,8 @@
 """The SQL layer against PostgreSQL: one Hypothesis state machine (#515).
 
 Each rule runs one statement on both sides and checks that they agree:
-both accept it, or both refuse it, a constraint violation with the same
+both accept it, changing as many rows and returning the same rows, values
+of the same types; or both refuse it, a constraint violation with the same
 SQLSTATE. After every step each table must hold the same rows on both
 sides, the layer's read from the engine (`table_rows`) and PostgreSQL's in
 primary-key order. PostgreSQL holds the expected data; the machine holds
@@ -127,7 +128,12 @@ class SqlMachine(RuleBasedStateMachine):
             f"{sql} {params!r}: the layer {layer.error or 'accepted it'} ({layer.detail}), "
             f"PostgreSQL {pg.error or 'accepted it'} ({pg.detail})"
         )
-        assert layer.rows == pg.rows, f"{sql} {params!r}: the layer returned {layer.rows}, PostgreSQL {pg.rows}"
+        assert o.strict(layer.rows) == o.strict(pg.rows), (
+            f"{sql} {params!r}: the layer returned {layer.rows}, PostgreSQL {pg.rows}"
+        )
+        assert layer.affected == pg.affected, (
+            f"{sql} {params!r}: the layer changed {layer.affected} rows, PostgreSQL {pg.affected}"
+        )
         return layer
 
     def existing_keys(self, t: Table) -> list[tuple]:
@@ -187,7 +193,9 @@ class SqlMachine(RuleBasedStateMachine):
             layer = self.db.table_rows(t.name)["rows"]
             pg = o.run_pg(self.pg.conn, f"{t.select_all} ORDER BY {', '.join(t.pk)}")
             assert pg.error is None, pg.detail
-            assert tuple(layer) == pg.rows, f"table {t.name}: the layer holds {layer}, PostgreSQL {list(pg.rows)}"
+            assert o.strict(layer) == o.strict(pg.rows), (
+                f"table {t.name}: the layer holds {layer}, PostgreSQL {list(pg.rows)}"
+            )
 
     # Rules ----------------------------------------------------------------
 
@@ -360,3 +368,42 @@ def test_insert_without_a_primary_key_column(dsn):
         m.check()
     finally:
         m.teardown()
+
+
+# The module and the comparison, without PostgreSQL. ------------------------
+
+
+def test_calls_after_close_raise_closed(tmp_path):
+    db = bytecask_sql.open(str(tmp_path))
+    db.execute("CREATE TABLE t (k BIGINT PRIMARY KEY)")
+    db.close()
+    for call in (lambda: db.execute("SELECT k FROM t WHERE k = $1", (1,)), db.catalog, lambda: db.table_rows("t")):
+        try:
+            call()
+        except bytecask_sql.Closed as e:
+            assert isinstance(e, ValueError) and isinstance(e, bytecask_sql.Error)
+        else:
+            raise AssertionError("a call after close() was allowed")
+    db.close()  # a second close does nothing
+
+
+def test_text_that_is_not_utf8_raises_on_read(tmp_path):
+    db = bytecask_sql.open(str(tmp_path))
+    try:
+        db.execute("CREATE TABLE t (k BIGINT PRIMARY KEY, s TEXT)")
+        db.execute("INSERT INTO t VALUES ($1, $2)", (1, b"\xff"))  # text is bytes to the plan
+        try:
+            db.table_rows("t")
+        except UnicodeDecodeError:
+            pass
+        else:
+            raise AssertionError("bytes that are not UTF-8 read as text")
+    finally:
+        db.close()
+
+
+def test_rows_compare_by_type():
+    assert o.strict([(True,)]) != o.strict([(1,)])
+    assert o.strict([(1,)]) != o.strict([(1.0,)])
+    assert o.strict([(-0.0,)]) != o.strict([(0.0,)])
+    assert o.strict([("a", b"a", None)]) == o.strict([("a", b"a", None)])

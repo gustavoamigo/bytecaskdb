@@ -13,7 +13,6 @@
 // prototype: the shape of #494's embedded API, not its design.
 
 module;
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -21,6 +20,7 @@ module;
 #include <map>
 #include <memory>
 #include <new>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -65,10 +65,25 @@ public:
   // bc_error_detail: for BC_E_CONSTRAINT, the bc_constraint in the high byte
   // and the object id in the low 24 bits.
   [[nodiscard]] auto detail() const noexcept -> std::uint32_t { return detail_; }
+  // The detail decoded, for BC_E_CONSTRAINT; nullopt for any other code.
+  [[nodiscard]] auto constraint() const noexcept -> std::optional<ConstraintDetail> {
+    if (code_ != BC_E_CONSTRAINT) return std::nullopt;
+    return ConstraintDetail::decode(detail_);
+  }
 
 private:
   int code_;
   std::uint32_t detail_;
+};
+
+// Parameters a statement does not take: the wrong number, or a value not of
+// its parameter's type. Thrown before the plan runs.
+class ParamError : public std::invalid_argument {
+public:
+  using std::invalid_argument::invalid_argument;
+  ParamError(const ParamError&) = default;
+  ParamError& operator=(const ParamError&) = default;
+  ~ParamError() override;  // out of line: anchors the vtable (-Wweak-vtables)
 };
 
 class Statement {
@@ -100,11 +115,16 @@ public:
   Database(const Database&) = delete;
   Database& operator=(const Database&) = delete;
 
+  // prepare, execute, catalog and table_rows throw bytecask::DbClosed once
+  // close() was called, as the engine's calls do.
+
   // Parses, binds and (for DML) plans and compiles; cached by the exact text.
   // Throws ast::SqlError. The reference is valid until close().
   auto prepare(std::string_view sql) -> const Statement&;
-  // Throws std::invalid_argument for parameters of the wrong number or type,
-  // ast::SqlError if a recompile fails, ExecError if the plan fails.
+  // Throws ParamError for parameters of the wrong number or type,
+  // ast::SqlError if a recompile fails, ExecError if the plan fails, and for
+  // DDL, what LiveCatalog::apply throws (DdlRefused for a statement the
+  // catalog refuses).
   auto execute(const Statement& stmt, const std::vector<Value>& params) -> Rows;
   auto execute(std::string_view sql, const std::vector<Value>& params = {}) -> Rows {
     return execute(prepare(sql), params);
@@ -113,18 +133,27 @@ public:
   // How many times a DML statement was compiled, first compiles included.
   [[nodiscard]] auto compilations() const -> std::uint64_t { return compilations_; }
   // The live catalog: the version DDL last published.
-  [[nodiscard]] auto catalog() const -> std::shared_ptr<const Catalog> { return live_->current(); }
-  // Every row of a table, in primary-key order, read from the engine and
-  // decoded through the catalog: every column, in the table's order. For the
-  // proof tests, which compare a table with the oracle's; SQL has no full
-  // scan. Throws std::invalid_argument for a table that does not exist.
-  [[nodiscard]] auto table_rows(std::string_view table) -> Rows;
+  [[nodiscard]] auto catalog() const -> std::shared_ptr<const Catalog> {
+    check_open();
+    return live_->current();
+  }
+#ifdef BYTECASK_SQL_TESTING
+  // Test only (sql_layer_testing): every row of a table, in primary-key
+  // order, read from the engine and decoded through the catalog: every
+  // column, in the table's order. For the proof tests, which compare a table
+  // with the oracle's; SQL has no full scan. Throws std::invalid_argument for
+  // a table that does not exist.
+  [[nodiscard]] auto table_rows(std::string_view table) const -> Rows;
+#endif
 
-  // Closes the engine; every later call is undefined.
+  // Closes the engine. A second call returns at once.
   void close();
 
 private:
   Database() = default;
+  void check_open() const {
+    if (closed_) throw DbClosed();
+  }
   void compile(Statement& s);
 
   std::unique_ptr<DB> db_;
@@ -134,6 +163,7 @@ private:
   bc_ctx* cx_{nullptr};
   std::map<std::string, std::unique_ptr<Statement>, std::less<>> cache_;
   std::uint64_t compilations_{0};
+  bool closed_{false};
 };
 
 }  // namespace bytecask::sql
@@ -148,6 +178,7 @@ constexpr std::uint32_t kMaxRetries = 3;
 }  // namespace
 
 ExecError::~ExecError() = default;
+ParamError::~ParamError() = default;
 
 auto Statement::param_types() const -> const std::vector<PhysType>& {
   static const std::vector<PhysType> kNone;
@@ -178,6 +209,8 @@ Database::~Database() {
 }
 
 void Database::close() {
+  if (closed_) return;
+  closed_ = true;
   cache_.clear();
   bc_ctx_free(cx_);
   cx_ = nullptr;
@@ -238,6 +271,7 @@ void Database::compile(Statement& s) {
 }
 
 auto Database::prepare(std::string_view sql) -> const Statement& {
+  check_open();
   if (auto it = cache_.find(sql); it != cache_.end()) return *it->second;
   auto s = std::make_unique<Statement>();
   s->sql_ = std::string{sql};
@@ -247,17 +281,18 @@ auto Database::prepare(std::string_view sql) -> const Statement& {
 }
 
 auto Database::execute(const Statement& cstmt, const std::vector<Value>& params) -> Rows {
+  check_open();
   // The cache owns every Statement; the const handle is the caller's view of it.
   auto& stmt = *cache_.at(cstmt.sql_);
   Rows out;
   if (stmt.is_ddl()) {
-    if (!params.empty()) throw std::invalid_argument("DDL takes no parameters");
+    if (!params.empty()) throw ParamError("DDL takes no parameters");
     auto bound = bound::bind(stmt.ast_, *live_->current());
     (void)live_->apply(std::get<Ddl>(bound.stmt));
     out.affected = 0;
     return out;
   }
-  // Throws std::invalid_argument for parameters the statement's current plan
+  // Throws ParamError for parameters the statement's current plan
   // does not take: checked again after a recompile, whose plan may differ.
   auto mismatch = [&]() -> std::string {
     const auto& types = stmt.plan_->param_types;
@@ -270,7 +305,7 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
     return {};
   };
   auto check_params = [](const std::string& why) {
-    if (!why.empty()) throw std::invalid_argument(why);
+    if (!why.empty()) throw ParamError(why);
   };
   bc_params bp{params};
   // Parameters that do not fit the cached plan may fit the plan a DDL has
@@ -281,7 +316,7 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   if (auto why = mismatch(); !why.empty()) {
     // A plan compiled against the current version is the plan of the text:
     // a recompile would take the same parameters.
-    if (stmt.ref_.catalog_version == live_->current()->version()) throw std::invalid_argument(why);
+    if (stmt.ref_.catalog_version == live_->current()->version()) throw ParamError(why);
     bc_ctx_begin(cx_, &bp, {});
     auto fits = bc_ctx_check(cx_, &stmt.ref_);
     auto stale = !fits && bc_error(cx_) == BC_E_LAYOUT && bc_error_detail(cx_) == BC_L_INCOMPATIBLE;
@@ -330,48 +365,30 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   return out;
 }
 
-auto Database::table_rows(std::string_view table) -> Rows {
+#ifdef BYTECASK_SQL_TESTING
+auto Database::table_rows(std::string_view table) const -> Rows {
+  check_open();
   auto [cat, snap] = live_->pin();
   const auto* t = cat->table(table);
   if (t == nullptr) throw std::invalid_argument("relation \"" + std::string{table} + "\" does not exist");
   Rows out;
+  // The table's layout with its slots in column order: decode_row reads
+  // them in that order. A column a row's bitmap has no bit for reads as NULL.
+  auto layout = t->layout;
+  layout.columns.clear();
   for (const auto& c : t->columns) {
+    const auto* slot = t->layout.find(c.id);
+    if (slot == nullptr) throw std::runtime_error("column " + c.name + " is not in the layout of table " + t->name);
+    layout.columns.push_back(*slot);
     out.columns.push_back(c.name);
     out.types.push_back(c.sql);
   }
-  Bytes prefix;
-  key_put_prefix(prefix, kNsRow, t->id);
-  auto malformed = [&] { return std::runtime_error("malformed row in table " + t->name); };
-  for (const auto& e : snap.iter_from({}, prefix)) {
-    if (e.key.size() < prefix.size() || !std::ranges::equal(e.key.first(prefix.size()), prefix)) break;
-    if (!row_valid(e.value)) throw malformed();
-    std::vector<Value> row;
-    for (const auto& c : t->columns) {
-      const auto* slot = t->layout.find(c.id);
-      // A column the row's layout has no present bit for reads as NULL.
-      if (slot == nullptr || !row_present_bit(e.value, c.id)) {
-        row.emplace_back(std::monostate{});
-        continue;
-      }
-      auto take = [&](auto v) {
-        if (!v) throw malformed();
-        row.emplace_back(Value{*v});
-      };
-      switch (slot->type) {
-        case PhysType::I64: take(row_i64(e.value, slot->pos)); break;
-        case PhysType::F64: take(row_f64(e.value, slot->pos)); break;
-        case PhysType::Bool: take(row_bool(e.value, slot->pos)); break;
-        case PhysType::Bytes: {
-          auto b = row_bytes(e.value, slot->pos);
-          if (!b) throw malformed();
-          row.emplace_back(Bytes{b->begin(), b->end()});
-          break;
-        }
-      }
-    }
-    out.rows.push_back(std::move(row));
-  }
+  for_each_row(snap, t->id, [&](BytesView, BytesView row) {
+    if (!row_valid(row)) throw std::runtime_error("malformed row in table " + t->name);
+    out.rows.push_back(decode_row(layout, row));
+  });
   return out;
 }
+#endif
 
 }  // namespace bytecask::sql

@@ -18,15 +18,23 @@ every rule, the invariants are checked.
 - **Outcomes agree.** Both sides accept a statement or both refuse it. A
   constraint violation must be the same one: a duplicate key is SQLSTATE
   23505 on both, a NULL in a NOT NULL column 23502. Any other refusal counts
-  as a refusal on both, whatever its message.
+  as a refusal on both, whatever its message. The layer's refusals are
+  `SqlError`: parse and bind errors, a DDL the catalog refuses, parameters
+  of the wrong number or type. Any other exception from the layer, an engine
+  refusal at run time included, fails the test.
+- **Counts agree.** An INSERT, UPDATE or DELETE changes as many rows on both.
 - **Rows agree.** A lookup returns the same rows. After every step, each
   table holds the same rows on both. The layer's rows are read from the
   engine by `table_rows`, since SQL has no full scan. PostgreSQL's come from
-  `SELECT … ORDER BY` the primary key.
+  `SELECT … ORDER BY` the primary key. `table_rows` is test only: it is
+  compiled into `sql_layer_testing`, the build of the library with
+  `BYTECASK_SQL_TESTING` that the tests and `bytecask_sql` link, and is not
+  in `sql_layer`.
 - **Values compare as values.** `bytecask_sql` converts each value by its
   column's SQL type, and the oracle (`tests/proof/oracle.py`) converts
-  PostgreSQL's the same way. Text columns are `COLLATE "C"` in PostgreSQL,
-  so its order is byte order, the order of the layer's keys.
+  PostgreSQL's the same way. Values compare by type too: `True` is not `1`,
+  `1` is not `1.0`, and `-0.0` is not `0.0`. Text columns are `COLLATE "C"`
+  in PostgreSQL, so its order is byte order, the order of the layer's keys.
 
 Rules in increment 1:
 - **CREATE TABLE.** Up to four columns over BIGINT, INTEGER, SMALLINT, DOUBLE

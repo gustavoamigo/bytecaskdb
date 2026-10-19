@@ -136,7 +136,7 @@ bytecask/
 │   ├── bench/            # sql_layer_bench: the plan API's fixed costs
 │   ├── docs/             # The layer's design documents
 │   ├── CONTRACT.md       # What the layer guarantees, with the tests that prove it
-│   └── xmake.lua         # sql_layer, sql_layer_tests, sql_layer_bench, bytecask_sql; libpg_query and TinyCC package rules
+│   └── xmake.lua         # sql_layer, sql_layer_testing, sql_layer_tests, sql_layer_bench, bytecask_sql; libpg_query and TinyCC package rules
 │
 ├── tests/                # MIT — engine tests (no MariaDB)
 ├── benchmarks/           # MIT — engine benchmarks
@@ -166,6 +166,7 @@ Builds the C++23 engine. Targets:
 | `bytecask_bench` | binary | Map structure benchmarks |
 | `bytecask` | static lib | `libbytecask.a` — consumed by MariaDB CMake |
 | `sql_layer` | static lib | `libsql_layer.a` — the `bytecask.sql.*` modules and `plan_api.cpp`, from `bytecaskdb-sql-layer/xmake.lua` |
+| `sql_layer_testing` | static lib | `sql_layer` with `BYTECASK_SQL_TESTING`: adds the test-only calls; linked by `sql_layer_tests` and `bytecask_sql` |
 | `sql_layer_tests` | binary | SQL layer tests (Catch2), from `bytecaskdb-sql-layer/xmake.lua` |
 
 The `bytecask` static target compiles `bytecaskdb/` sources plus

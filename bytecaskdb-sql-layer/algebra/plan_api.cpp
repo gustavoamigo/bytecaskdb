@@ -50,6 +50,7 @@ using bytecask::sql::Bytes;
 using bytecask::sql::BytesView;
 using bytecask::sql::Catalog;
 using bytecask::sql::ColumnSlot;
+using bytecask::sql::ConstraintDetail;
 using bytecask::sql::Datum;
 using bytecask::sql::Index;
 using bytecask::sql::KeyLayout;
@@ -67,7 +68,7 @@ static_assert(static_cast<int>(PhysType::F64) == BC_T_F64);
 static_assert(static_cast<int>(PhysType::Bool) == BC_T_BOOL);
 static_assert(static_cast<int>(PhysType::Bytes) == BC_T_BYTES);
 // bc_error_detail carries an object id in its low 24 bits.
-static_assert(Catalog::kMaxObjectId <= 0x00FF'FFFFu);
+static_assert(Catalog::kMaxObjectId <= ConstraintDetail::kMaxObjectId);
 
 namespace {
 
@@ -487,9 +488,9 @@ struct bc_ctx {
   // object id in its low 24 bits.
   void raise(std::uint32_t constraint, std::uint32_t object_id, std::string msg = {}) {
     if (!ok()) return;
-    auto d = (constraint << 24) | object_id;
-    fail(BC_E_CONSTRAINT, msg.empty() ? constraint_message(d) : std::move(msg));
-    detail = d;
+    ConstraintDetail d{constraint, object_id};
+    fail(BC_E_CONSTRAINT, msg.empty() ? d.message() : std::move(msg));
+    detail = d.encode();
   }
 
   void drop_execution_state() {
@@ -2361,7 +2362,7 @@ void bc_raise(bc_ctx* cx, uint32_t constraint, uint32_t object_id) {
   if (!cx->ok()) return;
   // The detail holds the kind in 8 bits and the id in 24: anything wider would
   // name another constraint or object.
-  if (constraint < BC_C_UNIQUE || constraint > BC_C_RANGE || object_id > 0x00FF'FFFFu) {
+  if (constraint < BC_C_UNIQUE || constraint > BC_C_RANGE || object_id > ConstraintDetail::kMaxObjectId) {
     cx->fail(BC_E_HANDLE, "bc_raise with an unknown constraint kind or an object id past 2^24");
     return;
   }

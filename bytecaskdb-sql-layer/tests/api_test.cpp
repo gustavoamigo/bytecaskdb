@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+#include "include/bytecask.hpp"
 
 import bytecask.sql.api;
 import bytecask.sql.tests.util;
@@ -84,8 +85,8 @@ TEST_CASE("embedded API: the seven statements, then a fresh open", "[sql][api]")
     CHECK(db->execute(kDelete, {i(2)}).affected == 0);
     CHECK(ids(db->execute(kByName, {bytes("a"), bytes("z")})) == std::vector<std::int64_t>{1, 4});
 
-    CHECK_THROWS_AS(db->execute(kById, {bytes("x")}), std::invalid_argument);
-    CHECK_THROWS_AS(db->execute(kById, {}), std::invalid_argument);
+    CHECK_THROWS_AS(db->execute(kById, {bytes("x")}), ParamError);
+    CHECK_THROWS_AS(db->execute(kById, {}), ParamError);
     CHECK_THROWS_AS(db->prepare("SELECT id FROM t JOIN u ON t.id = u.id"), ast::SqlError);
     CHECK(db->cached_plans() == 10);  // each text compiled once
     db->close();
@@ -101,7 +102,7 @@ TEST_CASE("embedded API: the seven statements, then a fresh open", "[sql][api]")
   CHECK(ids(db->execute(kByName, {bytes("b"), bytes("c")})) == std::vector<std::int64_t>{5});
   CHECK(db->execute(kUpdate, {i(5), i(8)}).affected == 1);
   CHECK(db->execute(kById, {i(5)}).rows == Grid{{i(5), i(42)}});
-  CHECK_THROWS_AS(db->execute(kCreateTable), std::invalid_argument);  // the table survived the reopen
+  CHECK_THROWS_AS(db->execute(kCreateTable), DdlRefused);  // the table survived the reopen
 }
 
 TEST_CASE("embedded API: a cached write plan maintains an index created after it", "[sql][api]") {
@@ -150,13 +151,13 @@ TEST_CASE("embedded API: a plan the catalog refuses is recompiled and run again"
   // without a compile, however often they are sent: the runtime says the
   // plan fits (bc_ctx_check).
   for (int k = 0; k < 3; ++k) {
-    CHECK_THROWS_AS(db->execute(insert, {i(9), bytes("x"), bytes("y")}), std::invalid_argument);
+    CHECK_THROWS_AS(db->execute(insert, {i(9), bytes("x"), bytes("y")}), ParamError);
   }
   CHECK(db->compilations() == compiled + 3);
   // A DDL that leaves the plan compatible moves the version: the runtime is
   // asked, says the plan fits, and the parameters are refused uncompiled.
   (void)db->execute("CREATE TABLE elsewhere (k BIGINT PRIMARY KEY)");
-  CHECK_THROWS_AS(db->execute(insert, {i(9), bytes("x"), bytes("y")}), std::invalid_argument);
+  CHECK_THROWS_AS(db->execute(insert, {i(9), bytes("x"), bytes("y")}), ParamError);
   CHECK(db->compilations() == compiled + 3);
   CHECK(db->execute(insert, {i(9), bytes("x"), i(90)}).affected == 1);
   CHECK(db->compilations() == compiled + 3);
@@ -167,10 +168,10 @@ TEST_CASE("embedded API: a plan the catalog refuses is recompiled and run again"
   (void)db->execute("DROP TABLE t");
   (void)db->execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name BYTEA, qty BYTEA)");
   CHECK(db->execute(insert, {i(4), bytes("date"), bytes("forty")}).affected == 1);
-  CHECK_THROWS_AS(db->execute(insert, {i(5), bytes("elder"), i(50)}), std::invalid_argument);
+  CHECK_THROWS_AS(db->execute(insert, {i(5), bytes("elder"), i(50)}), ParamError);
   (void)db->execute("DROP TABLE t");
   (void)db->execute(kCreateTable);
-  CHECK_THROWS_AS(db->execute(insert, {i(6), bytes("fig"), bytes("sixty")}), std::invalid_argument);
+  CHECK_THROWS_AS(db->execute(insert, {i(6), bytes("fig"), bytes("sixty")}), ParamError);
   CHECK(db->execute(insert, {i(6), bytes("fig"), i(60)}).affected == 1);
   CHECK(db->execute(by_id, {i(6)}).rows == Grid{{i(6), i(60)}});
 }
@@ -243,7 +244,7 @@ TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[
   }
   CHECK_THROWS_AS(db->execute(insert, {i(5), bytes("x"), i(1)}), ast::SqlError);
   (void)db->execute("DROP TABLE IF EXISTS t");
-  CHECK_THROWS_AS(db->execute("DROP TABLE t"), std::invalid_argument);
+  CHECK_THROWS_AS(db->execute("DROP TABLE t"), DdlRefused);
 }
 
 TEST_CASE("embedded API: a unique index refuses duplicates, treats nulls as distinct, and moves with UPDATE",
@@ -287,7 +288,7 @@ TEST_CASE("embedded API: a unique index refuses duplicates, treats nulls as dist
   // A unique index over rows that already collide is refused.
   (void)db->execute(kIns, {i(8), bytes("q"), i(1)});
   (void)db->execute(kIns, {i(9), bytes("r"), i(1)});
-  CHECK_THROWS_AS(db->execute("CREATE UNIQUE INDEX c_w ON c (w)"), std::invalid_argument);
+  CHECK_THROWS_AS(db->execute("CREATE UNIQUE INDEX c_w ON c (w)"), DdlRefused);
   CHECK(db->catalog()->index("c_w").second == nullptr);
   db->close();
 
@@ -423,9 +424,12 @@ TEST_CASE("embedded API: table_rows reads a table in key order; errors carry the
     try {
       (void)db->execute(sql, params);
     } catch (const ExecError& e) {
+      auto c = e.constraint();
+      REQUIRE(c);
       CHECK(e.code() == BC_E_CONSTRAINT);
-      CHECK((e.detail() & 0x00FF'FFFFu) == table_id);
-      return e.detail() >> 24;
+      CHECK(c->object_id == table_id);
+      CHECK(c->encode() == e.detail());
+      return c->constraint;
     }
     FAIL("the statement was accepted");
     return 0;
@@ -446,6 +450,12 @@ TEST_CASE("embedded API: table_rows reads a table in key order; errors carry the
   auto sel = db->execute("SELECT c, a FROM t WHERE a = $1 AND b = $2", {i(1), bytes("b")});
   CHECK(sel.types == std::vector<SqlType>{SqlType{SqlKind::Varchar, 4}, SqlType{SqlKind::BigInt}});
   CHECK_THROWS_AS(db->table_rows("nope"), std::invalid_argument);
+  db->close();
+  // Every call after close() is refused, as the engine's are; close() again is not.
+  CHECK_THROWS_AS(db->execute(kIns, {i(9), bytes("q")}), bytecask::DbClosed);
+  CHECK_THROWS_AS(db->prepare("SELECT a FROM t WHERE a = $1 AND b = $2"), bytecask::DbClosed);
+  CHECK_THROWS_AS(db->catalog(), bytecask::DbClosed);
+  CHECK_THROWS_AS(db->table_rows("t"), bytecask::DbClosed);
   db->close();
 
   auto again = Database::open(dir.path());

@@ -538,11 +538,6 @@ target("bytecask_testing")
         apply_sanitizer(t)
     end)
 
--- Python bindings via nanobind.
--- Wraps the C++23 module interface directly.
--- Prerequisites: pip install nanobind
--- Build: xmake build bytecaskdb_python
--- Usage: PYTHONPATH=bytecaskdb-python python3 your_script.py
 -- A nanobind extension module: Python's and nanobind's include directories,
 -- nb_combined.cpp, the interpreter's extension suffix, and the flags
 -- nanobind's headers need. A target sets the module name and its output
