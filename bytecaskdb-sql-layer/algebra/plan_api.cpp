@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <new>
@@ -135,10 +136,11 @@ struct ColSlot {
   std::uint32_t table{0};
   std::uint32_t col{0};
   std::uint16_t generation{0};  // the layout's: the generation pos is for
-  bool nullable{true};
   PhysType type{PhysType::I64};
   std::uint32_t pos{0};
-  SqlType sql{SqlKind::BigInt};  // the declared type a value written to it is checked against
+  // The declared type a value written to it is checked against: the pinned
+  // catalog's, which outlives the run that verified this slot.
+  const SqlType* sql{nullptr};
 };
 
 // The columns of a written table's keys, as layout slots: what bc_update
@@ -238,6 +240,9 @@ struct bc_ctx {
   bc_budget budget{};
   std::uint64_t reads{0};
   std::optional<bytecask::Snapshot> snap;
+#ifdef BYTECASK_SQL_TESTING
+  std::function<void()> before_commit;  // bc_ctx_before_commit_for_testing
+#endif
 
   bc_error_code error{BC_OK};
   std::uint32_t detail{0};
@@ -889,9 +894,7 @@ auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots& {
       return incompatible("column " + std::to_string(c.col) + " of table " + t->name +
                           " no longer exists with the type the plan was compiled with");
     }
-    const auto* column = t->column(c.col);
-    if (column == nullptr) return incompatible("column " + std::to_string(c.col) + " of table " + t->name + " was dropped");
-    e.cols.push_back({c.table, c.col, t->layout.generation, slot->nullable, slot->type, slot->pos, column->sql});
+    e.cols.push_back({c.table, c.col, t->layout.generation, slot->type, slot->pos, &slot->sql});
   }
   std::ranges::sort(e.cols, {}, [](const ColSlot& s) { return std::pair{s.table, s.col}; });
   return true;
@@ -1150,7 +1153,7 @@ auto set_target(bc_ctx* cx, bc_row r, std::uint32_t col, std::optional<PhysType>
 // table's id (the message names the column), and never set.
 template <typename V>
 [[nodiscard]] auto in_range(bc_ctx* cx, const SetTarget& at, std::uint32_t col, const V& v) -> bool {
-  auto why = bytecask::sql::out_of_range(at.slot->sql, v);
+  auto why = bytecask::sql::out_of_range(*at.slot->sql, v);
   if (!why) return true;
   const auto* t = cx->cat->table(at.builder->table);
   const auto* c = t == nullptr ? nullptr : t->column(col);
@@ -1261,6 +1264,9 @@ enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
   // retry pins the new catalog version, whose indexes it maintains.
   for (auto id : written_tables(cx)) plan.ensure_unchanged(bytecask::sql::table_record_key(id));
   cx->effects.clear();  // handed to the engine: a second commit has nothing to submit
+#ifdef BYTECASK_SQL_TESTING
+  if (cx->before_commit) cx->before_commit();
+#endif
   auto r = cx->db->apply_batch({.sync = sync}, std::move(plan));
   return r ? BC_COMMITTED : BC_CONFLICT;
   BC_GUARD_END(cx)
@@ -1289,6 +1295,14 @@ const char* bc_error_message(const bc_ctx* cx) { return cx->message.c_str(); }
 uint32_t bc_error_detail(const bc_ctx* cx) { return cx->detail; }
 
 int64_t bc_ctx_affected(const bc_ctx* cx) { return cx->affected; }
+
+}  // extern "C"
+
+#ifdef BYTECASK_SQL_TESTING
+void bc_ctx_before_commit_for_testing(bc_ctx* cx, std::function<void()> hook) { cx->before_commit = std::move(hook); }
+#endif
+
+extern "C" {
 
 int bc_execute(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* ref, const bc_params* params, bc_budget budget,
                bool sync, uint32_t max_retries) {

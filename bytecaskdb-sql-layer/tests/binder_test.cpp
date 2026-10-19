@@ -172,6 +172,9 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
         "DEFAULT out of range for type numeric(4,4)");  // rounds to 1.0000
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v NUMERIC(3, 1) DEFAULT 100)").first ==
         "DEFAULT out of range for type numeric(3,1)");
+  // More digits than any DECIMAL holds: refused by the one precision check, not overflowed while parsed.
+  CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v NUMERIC(18, 0) DEFAULT 12345678901234567890123)").first ==
+        "DEFAULT out of range for type numeric(18,0)");
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v VARCHAR(2) DEFAULT 'abc')").first ==
         "DEFAULT too long for type varchar(2)");
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v BIGINT DEFAULT 'x')").first ==
@@ -192,5 +195,7 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
   CHECK(rejected(cat, "CREATE TABLE u (a BIGINT PRIMARY KEY, b BIGINT, PRIMARY KEY (b))").first ==
         "multiple primary keys for table \"u\" are not allowed");
   CHECK(rejected(cat, "CREATE TABLE u (a BIGINT, b BIGINT, PRIMARY KEY (a), PRIMARY KEY (b))").first ==
+        "multiple primary keys for table \"u\" are not allowed");
+  CHECK(rejected(cat, "CREATE TABLE u (a BIGINT PRIMARY KEY PRIMARY KEY)").first ==
         "multiple primary keys for table \"u\" are not allowed");
 }

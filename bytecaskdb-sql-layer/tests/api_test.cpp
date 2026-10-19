@@ -8,6 +8,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cmath>
+#include <limits>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -548,21 +549,42 @@ TEST_CASE("embedded API: values outside their declared type, an omitted NOT NULL
             .affected == 1);  // VARCHAR(3) counts code points: "ééé" is 6 bytes
   CHECK(db->execute(kIns, {i(2), i(-32768), i(-(std::int64_t{1} << 31)), bytes("abc"), Value{0.0}, i(-9999), i(0)})
             .affected == 1);
-  (void)db->execute("CREATE TABLE tm (k BIGINT PRIMARY KEY, t TIME)");
+  // REAL overflow is PostgreSQL's: a value refused when its float rounding is
+  // infinite. 2^128 - 2^103 is the first that rounds up; the double just
+  // below it rounds to FLT_MAX.
+  constexpr auto kFirstInf = 0x1p128 - 0x1p103;
+  CHECK(refusal(kIns, with(4, Value{kFirstInf})).second.starts_with("value out of range: overflow"));
+  CHECK(refusal(kIns, with(4, Value{-kFirstInf})).first == BC_C_RANGE);
+  CHECK(db->execute(kIns, {i(5), kNull, kNull, kNull, Value{std::nextafter(kFirstInf, 0.0)}, kNull, i(0)}).affected == 1);
+
+  // DATE, TIMESTAMP and TIME: PostgreSQL's ranges, in days and microseconds
+  // from 1970. TIME includes 24:00:00.
+  (void)db->execute("CREATE TABLE tm (k BIGINT PRIMARY KEY, t TIME, d DATE, ts TIMESTAMP)");
   auto tm_id = db->catalog()->table("tm")->id;
+  constexpr auto kInsTm = "INSERT INTO tm VALUES ($1, $2, $3, $4)";
   constexpr std::int64_t kDay = 86'400'000'000;
-  CHECK(db->execute("INSERT INTO tm VALUES ($1, $2)", {i(1), i(kDay - 1)}).affected == 1);
-  for (auto t : {kDay, std::int64_t{-1}}) {
+  constexpr std::int64_t kMinDate = -2'440'588;      // 4714-11-24 BC
+  constexpr std::int64_t kEndDate = 2'145'042'906;   // 5874898-01-01, the first day past the range
+  constexpr std::int64_t kMinTs = -210'866'803'200'000'000;
+  CHECK(db->execute(kInsTm, {i(1), i(kDay), i(kMinDate), i(kMinTs)}).affected == 1);
+  CHECK(db->execute(kInsTm, {i(2), i(0), i(kEndDate - 1), i(std::numeric_limits<std::int64_t>::max())}).affected == 1);
+  auto tm_refusal = [&](std::vector<Value> p) -> std::string {
     try {
-      (void)db->execute("INSERT INTO tm VALUES ($1, $2)", {i(2), i(t)});
-      FAIL("a TIME outside one day was written");
+      (void)db->execute(kInsTm, p);
     } catch (const ExecError& e) {
       REQUIRE(e.constraint());
       CHECK(e.constraint()->constraint == BC_C_RANGE);
       CHECK(e.constraint()->object_id == tm_id);
-      CHECK(std::string{e.what()}.starts_with("time out of range"));
+      return e.what();
     }
-  }
+    FAIL("accepted");
+    return {};
+  };
+  CHECK(tm_refusal({i(3), i(kDay + 1), kNull, kNull}).starts_with("time out of range"));
+  CHECK(tm_refusal({i(3), i(-1), kNull, kNull}).starts_with("time out of range"));
+  CHECK(tm_refusal({i(3), kNull, i(kMinDate - 1), kNull}).starts_with("date out of range"));
+  CHECK(tm_refusal({i(3), kNull, i(kEndDate), kNull}).starts_with("date out of range"));
+  CHECK(tm_refusal({i(3), kNull, kNull, i(kMinTs - 1)}).starts_with("timestamp out of range"));
   // UPDATE checks the value it computes, as INSERT does the one it is given.
   CHECK(refusal("UPDATE r SET n = n - $2 WHERE k = $1", {i(1), i(-1)}).second.starts_with("integer out of range"));
   CHECK(refusal("UPDATE r SET s = $2 WHERE k = $1", {i(2), i(-40000)}).first == BC_C_RANGE);
@@ -582,7 +604,7 @@ TEST_CASE("embedded API: values outside their declared type, an omitted NOT NULL
 
   // Nothing refused was written.
   auto rows = db->table_rows("r");
-  REQUIRE(rows.rows.size() == 3);
+  REQUIRE(rows.rows.size() == 4);
   CHECK(rows.rows[0][1] == i(32767));
   CHECK(rows.rows[1][2] == i(-(std::int64_t{1} << 31)));
   CHECK(rows.rows[2][6] == i(0));
@@ -592,11 +614,23 @@ TEST_CASE("embedded API: values outside their declared type, an omitted NOT NULL
   CHECK_THROWS_AS(db->execute("CREATE TABLE two (a BIGINT PRIMARY KEY, b BIGINT, PRIMARY KEY (b))"), ast::SqlError);
   CHECK(db->catalog()->table("two") == nullptr);
 
-  // A conflict on every retry is told from an I/O error, though both codes are 1.
+  // A statement that conflicts on every retry is told from an error with the
+  // same code (BC_CONFLICT and BC_E_IO are both 1), end to end: every commit
+  // is made to conflict, and nothing is written.
   static_assert(static_cast<int>(BC_CONFLICT) == static_cast<int>(BC_E_IO));
-  auto conflicted = ExecError::conflicted("conflict");
-  CHECK(conflicted.conflict());
-  CHECK(conflicted.code() == BC_CONFLICT);
+  constexpr auto kInsK = "INSERT INTO r (k, z) VALUES ($1, $2)";
+  db->conflict_on_every_commit_for_testing(true);
+  try {
+    (void)db->execute(kInsK, {i(9), i(0)});
+    FAIL("a statement conflicting on every retry committed");
+  } catch (const ExecError& e) {
+    CHECK(e.conflict());
+    CHECK(e.code() == BC_CONFLICT);
+    CHECK_FALSE(e.constraint());
+  }
+  db->conflict_on_every_commit_for_testing(false);
+  CHECK(db->table_rows("r").rows.size() == 4);
+  CHECK(db->execute(kInsK, {i(9), i(0)}).affected == 1);
   CHECK_FALSE(ExecError("I/O", BC_E_IO).conflict());
   db->close();
 }

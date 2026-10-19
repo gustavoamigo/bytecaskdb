@@ -161,6 +161,10 @@ public:
   // with the oracle's; SQL has no full scan. Throws std::invalid_argument for
   // a table that does not exist.
   [[nodiscard]] auto table_rows(std::string_view table) const -> Rows;
+  // Test only: while on, every commit conflicts. Before each commit reaches
+  // the engine, every table's catalog record is written back unchanged,
+  // which a write plan guards, so execute exhausts its retries.
+  void conflict_on_every_commit_for_testing(bool on);
 #endif
 
   // Closes the engine. A second call returns at once.
@@ -387,6 +391,21 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
 }
 
 #ifdef BYTECASK_SQL_TESTING
+void Database::conflict_on_every_commit_for_testing(bool on) {
+  check_open();
+  if (!on) {
+    bc_ctx_before_commit_for_testing(cx_, {});
+    return;
+  }
+  bc_ctx_before_commit_for_testing(cx_, [this] {
+    for (const auto& [id, t] : live_->current()->tables()) {
+      auto key = table_record_key(id);
+      Bytes record;
+      if (db_->get({}, key, record)) (void)db_->put({}, key, record);
+    }
+  });
+}
+
 auto Database::table_rows(std::string_view table) const -> Rows {
   check_open();
   auto [cat, snap] = live_->pin();

@@ -427,6 +427,28 @@ def test_calls_after_close_raise_closed(tmp_path):
     db.close()  # a second close does nothing
 
 
+def test_a_conflict_on_every_retry_sets_conflict(tmp_path):
+    db = bytecask_sql.open(str(tmp_path))
+    try:
+        db.execute("CREATE TABLE t (k BIGINT PRIMARY KEY)")
+        db._conflict_on_every_commit(True)
+        try:
+            db.execute("INSERT INTO t VALUES ($1)", (1,))
+        except bytecask_sql.ExecError as e:
+            assert e.conflict and e.constraint is None
+        else:
+            raise AssertionError("a statement conflicting on every retry committed")
+        db._conflict_on_every_commit(False)
+        assert db.table_rows("t")["rows"] == []
+        try:
+            db.execute("INSERT INTO t VALUES ($1)", (1,))
+            db.execute("INSERT INTO t VALUES ($1)", (1,))
+        except bytecask_sql.ExecError as e:
+            assert not e.conflict and e.constraint == "unique"
+    finally:
+        db.close()
+
+
 def test_text_that_is_not_utf8_raises_on_read(tmp_path):
     db = bytecask_sql.open(str(tmp_path))
     try:

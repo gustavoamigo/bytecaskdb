@@ -55,11 +55,44 @@ template <typename To, typename From>
   return static_cast<To>(v);
 }
 
+// The stage-1 SQL types of docs/types_design.md. The values are
+// the record's; never renumber one.
+enum class SqlKind : std::uint8_t {
+  SmallInt = 1,
+  Integer,
+  BigInt,
+  Real,
+  Double,
+  Boolean,
+  Bytea,
+  Text,
+  Varchar,
+  Decimal,
+  Timestamp,
+  Date,
+  Time,
+};
+
+// DECIMAL(p, s) is a scaled i64: p of at most 18 digits fits.
+inline constexpr std::uint8_t kMaxDecimalPrecision = 18;
+
+struct SqlType {
+  SqlKind kind;
+  std::uint32_t length{0};    // VARCHAR(n): n, in code points
+  std::uint8_t precision{0};  // DECIMAL(p, s): p, 1..18
+  std::uint8_t scale{0};      // DECIMAL(p, s): s, 0..p
+  auto operator==(const SqlType&) const -> bool = default;
+};
+
 struct ColumnSlot {
   std::uint32_t col_id;  // permanent; the bitmap bit
   PhysType type;
   bool nullable;
   std::uint32_t pos;  // fixed: byte offset in the row; variable: slot
+  // The column's declared type, carried beside its slot for the runtime's
+  // check of a value written (BC_C_RANGE); the codec does not read it. A
+  // result row's columns, which no value is written to, leave it BIGINT.
+  SqlType sql{SqlKind::BigInt};
 };
 
 // Where each column of one layout generation lives.
@@ -80,6 +113,7 @@ struct ColumnDef {
   std::uint32_t col_id;
   PhysType type;
   bool nullable;
+  SqlType sql{SqlKind::BigInt};
 };
 
 // Assigns positions in column order: fixed columns one word each after the
@@ -243,7 +277,7 @@ auto append_columns(RowLayout& layout, std::span<const ColumnDef> cols) -> bool 
     }
   }
   for (const auto& c : cols) {
-    ColumnSlot s{c.col_id, c.type, c.nullable, 0};
+    ColumnSlot s{c.col_id, c.type, c.nullable, 0, c.sql};
     if (is_fixed(c.type)) {
       s.pos = layout.fixed_end;
       layout.fixed_end += kFixedColumnBytes;

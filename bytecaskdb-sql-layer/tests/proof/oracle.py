@@ -18,8 +18,8 @@ import bytecask_sql
 
 # The layer's constraint kinds and the SQLSTATE PostgreSQL reports for each.
 # A value outside its declared type is one kind, "range", in the layer:
-# 22001 for a string too long, 22008 for a TIME, 22003 for any other
-# (layer_sqlstate).
+# 22001 for a string too long, 22008 for a DATE, TIMESTAMP or TIME, 22003
+# for any other (layer_sqlstate).
 SQLSTATE = {
     "unique": "23505",
     "not_null": "23502",
@@ -33,7 +33,8 @@ def layer_sqlstate(e: bytecask_sql.ExecError) -> str:
         message = str(e)
         if message.startswith("value too long"):
             return "22001"
-        return "22008" if message.startswith("time out of range") else "22003"
+        datetime = ("date out of range", "timestamp out of range", "time out of range")
+        return "22008" if message.startswith(datetime) else "22003"
     return SQLSTATE.get(e.constraint, "refused")
 
 

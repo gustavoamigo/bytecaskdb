@@ -111,36 +111,17 @@ public:
 // runtime's bc_value is this type.
 using Datum = std::variant<std::monostate, std::int64_t, double, bool, Bytes>;
 
-// The stage-1 SQL types of docs/types_design.md. The values are
-// the record's; never renumber one.
-enum class SqlKind : std::uint8_t {
-  SmallInt = 1,
-  Integer,
-  BigInt,
-  Real,
-  Double,
-  Boolean,
-  Bytea,
-  Text,
-  Varchar,
-  Decimal,
-  Timestamp,
-  Date,
-  Time,
-};
-
-// DECIMAL(p, s) is a scaled i64: p of at most 18 digits fits.
-// TIME is microseconds since midnight, in [0, kMicrosPerDay).
+// TIME is microseconds since midnight, in [0, kMicrosPerDay]: 24:00:00 is a
+// TIME, as in PostgreSQL.
 inline constexpr std::int64_t kMicrosPerDay = 86'400'000'000;
-inline constexpr std::uint8_t kMaxDecimalPrecision = 18;
-
-struct SqlType {
-  SqlKind kind;
-  std::uint32_t length{0};    // VARCHAR(n): n, in code points
-  std::uint8_t precision{0};  // DECIMAL(p, s): p, 1..18
-  std::uint8_t scale{0};      // DECIMAL(p, s): s, 0..p
-  auto operator==(const SqlType&) const -> bool = default;
-};
+// PostgreSQL's DATE and TIMESTAMP ranges, in this layer's epoch (1970-01-01):
+// days in [kMinDate, kEndDate), from 4714-11-24 BC to 5874898-01-01; and
+// microseconds from kMinTimestamp (4714-11-24 BC 00:00). PostgreSQL's
+// TIMESTAMP ends after 294276 AD, past what an i64 from 1970 reaches, so
+// every larger value is a TIMESTAMP.
+inline constexpr std::int64_t kMinDate = -2'440'588;
+inline constexpr std::int64_t kEndDate = 2'145'042'906;
+inline constexpr std::int64_t kMinTimestamp = -210'866'803'200'000'000;
 
 // Whether the fields a kind does not use are zero and the ones it uses in range.
 [[nodiscard]] auto sql_type_valid(SqlType t) -> bool;
@@ -155,8 +136,8 @@ struct SqlType {
 // Why a value of the column's physical type is outside its declared type,
 // in PostgreSQL's words, or nullopt: a SMALLINT or INTEGER out of range, a
 // REAL that overflows or underflows float, a VARCHAR(n) of more than n code
-// points, a DECIMAL(p, s) of more than p digits, a TIME outside one day
-// (microseconds in [0, 86 400 000 000)). The one check of a declared
+// points, a DECIMAL(p, s) of more than p digits, a DATE, TIMESTAMP or TIME
+// outside PostgreSQL's range for it. The one check of a declared
 // range, for a value written (BC_C_RANGE) and a DEFAULT.
 [[nodiscard]] auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string>;
 [[nodiscard]] auto out_of_range(SqlType t, double v) -> std::optional<std::string>;
@@ -716,7 +697,7 @@ auto ConstraintDetail::message() const -> std::string {
     case BC_C_NOT_NULL: return "null value violates a not-null constraint of table " + object;
     case BC_C_CHECK: return "check constraint " + object + " violated";
     case BC_C_FOREIGN_KEY: return "foreign key constraint " + object + " violated";
-    case BC_C_RANGE: return "value out of range for column " + object;
+    case BC_C_RANGE: return "value out of range for a column of table " + object;
     default: return "constraint violated on object " + object;
   }
 }
@@ -833,7 +814,13 @@ auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string> {
       break;
     }
     case SqlKind::Time:
-      if (v < 0 || v >= kMicrosPerDay) return "time out of range";
+      if (v < 0 || v > kMicrosPerDay) return "time out of range";
+      break;
+    case SqlKind::Date:
+      if (v < kMinDate || v >= kEndDate) return "date out of range";
+      break;
+    case SqlKind::Timestamp:
+      if (v < kMinTimestamp) return "timestamp out of range";
       break;
     case SqlKind::BigInt:
     case SqlKind::Real:
@@ -841,18 +828,21 @@ auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string> {
     case SqlKind::Boolean:
     case SqlKind::Bytea:
     case SqlKind::Text:
-    case SqlKind::Varchar:
-    case SqlKind::Timestamp:
-    case SqlKind::Date: break;
+    case SqlKind::Varchar: break;
   }
   return std::nullopt;
 }
 
 auto out_of_range(SqlType t, double v) -> std::optional<std::string> {
   if (t.kind != SqlKind::Real) return std::nullopt;
-  auto f = static_cast<float>(v);  // finite v past float's range is inf; one below its smallest is 0
-  if (std::isfinite(v) && std::isinf(f)) return "value out of range: overflow";
-  if (v != 0.0 && f == 0.0f) return "value out of range: underflow";
+  // PostgreSQL refuses a finite value whose float rounding is infinite: one
+  // at or past the midpoint between FLT_MAX and 2^128, 2^128 - 2^103, which
+  // rounds up (FLT_MAX's significand is odd). Checked before the cast: a
+  // finite double outside float's range is undefined behaviour to convert.
+  constexpr auto kFloatOverflow = 0x1p128 - 0x1p103;
+  if (std::isfinite(v) && std::fabs(v) >= kFloatOverflow) return "value out of range: overflow";
+  // A nonzero value that rounds to zero.
+  if (v != 0.0 && static_cast<float>(v) == 0.0f) return "value out of range: underflow";
   return std::nullopt;
 }
 
@@ -941,7 +931,7 @@ auto read_layout(RecordReader& r, const Table& t) -> std::pair<std::uint32_t, Ro
     if (!ids.insert(col_id).second || !used.insert(pos).second) {
       corrupt("layout of table " + t.name + " has a column or position twice");
     }
-    l.columns.push_back({col_id, c->type, c->nullable, pos});
+    l.columns.push_back({col_id, c->type, c->nullable, pos, c->sql});
   }
   e.expect_end("layout entry of table " + t.name);
   if (!layout_valid(l)) corrupt("table " + t.name + " has a malformed row layout");
@@ -1283,7 +1273,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       if (t.column(cname) != nullptr) throw DdlRefused("column \"" + cname + "\" specified more than once");
       auto in_pk = std::ranges::any_of(ct->pk, [&](const std::string& p) { return std::string{p} == cname; });
       Column c{t.next_col_id++, cname, spec.sql, phys_type(spec.sql), spec.nullable && !in_pk, spec.default_value};
-      defs.push_back({c.id, c.type, c.nullable});
+      defs.push_back({c.id, c.type, c.nullable, c.sql});
       t.columns.push_back(std::move(c));
     }
     for (const auto& p : ct->pk) {
@@ -1404,7 +1394,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   }
   Column c{t.next_col_id, cname, ac.column.sql, phys_type(ac.column.sql), ac.column.nullable, ac.column.default_value};
   auto old_layout = t.layout;
-  if (!append_columns(t.layout, std::vector<ColumnDef>{{c.id, c.type, c.nullable}})) {
+  if (!append_columns(t.layout, std::vector<ColumnDef>{{c.id, c.type, c.nullable, c.sql}})) {
     throw std::length_error("table \"" + t.name + "\" has no room in its row layout for another column (needs REBUILD)");
   }
   ++t.next_col_id;

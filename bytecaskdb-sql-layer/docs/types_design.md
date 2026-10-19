@@ -26,9 +26,9 @@ bind error with the position of the type name.
 | `BYTEA` | `bytes` | The bytes. |
 | `TEXT`, `VARCHAR(n)` | `bytes` | UTF-8. Compared as bytes (binary collation). `n` counts code points and is a catalog property, checked on assignment. |
 | `DECIMAL(p, s)`, `NUMERIC(p, s)`, p ≤ 18 | `i64` | The value times 10^s, exactly. `p` and `s` are catalog properties of the column. `s` defaults to 0; `p` is required. |
-| `TIMESTAMP` | `i64` | Microseconds since 1970-01-01 00:00:00, no time zone. |
-| `DATE` | `i64` | Days since 1970-01-01. |
-| `TIME` | `i64` | Microseconds since midnight, in [0, 86 400 000 000). |
+| `TIMESTAMP` | `i64` | Microseconds since 1970-01-01 00:00:00, no time zone; from 4714-11-24 BC, PostgreSQL's first. |
+| `DATE` | `i64` | Days since 1970-01-01, in PostgreSQL's range: 4714-11-24 BC to 5874897-12-31. |
+| `TIME` | `i64` | Microseconds since midnight, in [0, 86 400 000 000]: 24:00:00 included, as in PostgreSQL. |
 
 Rejected in stage 1, each for a reason that is not "later": `NUMERIC` with
 no precision or with p > 18 (does not fit `i64`); `CHAR(n)` (its
@@ -48,8 +48,11 @@ does not fit with `BC_E_CONSTRAINT`, `BC_C_RANGE` and the table's id, the
 message naming the column: outside [−2^15, 2^15) for `SMALLINT` or
 [−2^31, 2^31) for `INTEGER`, a `REAL` that overflows or underflows `float`,
 more than `n` code points for `VARCHAR(n)`, more than `p − s` integer digits
-for `DECIMAL(p, s)`, a `TIME` outside one day. SQL reports it as SQLSTATE
-22003, 22001 for a string too long, or 22008 for a `TIME`. A `DEFAULT` is checked the same way
+for `DECIMAL(p, s)`, a `DATE`, `TIMESTAMP` or `TIME` outside PostgreSQL's
+range for it (the table above). SQL reports it as SQLSTATE 22003, 22001 for
+a string too long, or 22008 for a date or time. `REAL` overflow is decided
+as PostgreSQL decides it: by whether the value rounds to an infinite
+`float`. A `DEFAULT` is checked the same way
 at `CREATE TABLE` and `ADD COLUMN`. Reads trust the row, and a lookup is not
 a write: a key parameter outside its column's type finds nothing, as in
 PostgreSQL. `NOT NULL` is checked when the row ends, after these, so a row

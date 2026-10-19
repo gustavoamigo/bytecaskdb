@@ -14,6 +14,7 @@ module;
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -143,15 +144,11 @@ auto sql_type(const ast::ColumnDefAst& c) -> SqlType {
   throw SqlError{"type " + c.type + " is not supported", c.pos};
 }
 
-auto pow10(std::uint8_t n) -> std::int64_t {
-  std::int64_t v = 1;
-  for (std::uint8_t i = 0; i < n; ++i) v *= 10;
-  return v;
-}
-
 // A decimal literal ([-]digits[.digits]) scaled by 10^scale, rounded half
-// away from zero, with at most `precision` digits; nullopt if it is not one.
-auto scaled_decimal(std::string_view text, std::uint8_t precision, std::uint8_t scale) -> std::optional<std::int64_t> {
+// away from zero; nullopt if it is not one. One of more digits than any
+// DECIMAL holds is returned as INT64_MAX, which out_of_range refuses: the
+// precision is checked there, not here.
+auto scaled_decimal(std::string_view text, std::uint8_t scale) -> std::optional<std::int64_t> {
   auto neg = !text.empty() && text[0] == '-';
   if (neg) text.remove_prefix(1);
   auto dot = text.find('.');
@@ -162,12 +159,11 @@ auto scaled_decimal(std::string_view text, std::uint8_t precision, std::uint8_t 
   // Leading zeros are no digits: "0.5" has none before the point, so it fits
   // NUMERIC(4, 4).
   while (!whole.empty() && whole[0] == '0') whole.remove_prefix(1);
-  if (whole.size() > static_cast<std::size_t>(precision - scale)) return std::nullopt;
+  if (whole.size() + scale > kMaxDecimalPrecision) return std::numeric_limits<std::int64_t>::max();
   std::int64_t v = 0;
   for (auto ch : whole) v = v * 10 + (ch - '0');
   for (std::uint8_t i = 0; i < scale; ++i) v = v * 10 + (i < frac.size() ? frac[i] - '0' : 0);
   if (frac.size() > scale && frac[scale] >= '5') ++v;
-  if (v >= pow10(precision)) return std::nullopt;
   return neg ? -v : v;
 }
 
@@ -189,8 +185,9 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
     }
     case SqlKind::Decimal: {
       if (l.kind != K::Integer && l.kind != K::Number) bad();
-      auto v = scaled_decimal(l.text, t.precision, t.scale);
-      if (!v) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
+      auto v = scaled_decimal(l.text, t.scale);
+      if (!v) bad();
+      if (out_of_range(t, *v)) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
       return *v;
     }
     case SqlKind::Real:

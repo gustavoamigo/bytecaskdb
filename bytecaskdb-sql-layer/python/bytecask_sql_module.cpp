@@ -208,7 +208,9 @@ NB_MODULE(bytecask_sql, m) {
           [](const sql::Database& db, std::string_view table) { return to_python(db.table_rows(table)); },
           "table"_a,
           "Test only: every row of a table, in primary-key order, read from the engine and decoded "
-          "through the catalog.");
+          "through the catalog.")
+      .def("_conflict_on_every_commit", &sql::Database::conflict_on_every_commit_for_testing, "on"_a,
+           "Test only: while on, every commit conflicts, so execute raises ExecError with conflict set.");
 
   m.def(
       "open", [](const std::filesystem::path& dir) { return sql::Database::open(dir); }, "dir"_a,

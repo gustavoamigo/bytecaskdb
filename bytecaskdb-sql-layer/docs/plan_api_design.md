@@ -275,7 +275,7 @@ enum bc_scan_flags {
 enum bc_constraint {   /* the detail of BC_E_CONSTRAINT; the compiler emits the object id with it */
   BC_C_UNIQUE = 1, BC_C_NOT_NULL, BC_C_CHECK, BC_C_FOREIGN_KEY,
   BC_C_RANGE,          /* a value outside its declared type: SMALLINT, INTEGER, REAL, VARCHAR(n),
-                          DECIMAL(p, s), TIME */
+                          DECIMAL(p, s), DATE, TIMESTAMP, TIME */
 };
 
 enum bc_layout_detail {  /* the detail of BC_E_LAYOUT; every BC_E_LAYOUT carries one */
@@ -566,7 +566,7 @@ bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: live
 | `bc_row_key` | The table's full primary key (namespace, table id, parts), encoded from the row's columns: for a `bc_get`, a guard, or a scan bound reached from a row. Built in the arena. |
 | `bc_row_begin` | Starts a row of `table`'s current layout with every column at its default: the catalog's default for a column that has one, null for the rest. A plan compiled before a column was added writes the column's default without naming it. |
 | `bc_row_from` | Starts a row of `table` as a copy of `old`, a row of that table and of its current layout generation (otherwise as for the writes below: `BC_L_ROW`, `BC_L_RETIRED` or `BC_E_CORRUPT`; a `REBUILD`, #503, widens this to any generation). The `UPDATE` pattern: copy, set the assigned columns, end. |
-| `bc_row_set_*`, `bc_row_set_null` | Sets column `col`, which must be of the builder's table. Setting twice keeps the last value. A value outside the column's declared type is `BC_E_CONSTRAINT` with `BC_C_RANGE` and the table's id, and sets nothing: a SMALLINT or INTEGER out of range, a REAL past float's range, a VARCHAR(n) of more than n code points, a DECIMAL(p, s) of more than p digits. A NULL for a NOT NULL column is set, and refused by `bc_row_end`. |
+| `bc_row_set_*`, `bc_row_set_null` | Sets column `col`, which must be of the builder's table. Setting twice keeps the last value. A value outside the column's declared type is `BC_E_CONSTRAINT` with `BC_C_RANGE` and the table's id, and sets nothing: a SMALLINT or INTEGER out of range, a REAL that overflows or underflows float, a VARCHAR(n) of more than n code points, a DECIMAL(p, s) of more than p digits, a DATE, TIMESTAMP or TIME outside PostgreSQL's range for it (a TIME from 00:00 to 24:00). A NULL for a NOT NULL column is set, and refused by `bc_row_end`. |
 | `bc_row_set_param` | Sets column `col` to parameter `i`: its value, or null when it is NULL. One call where a nullable column took an `if` and two sets. A parameter whose type is not the column's is `BC_E_HANDLE`; one outside the column's declared type is `BC_C_RANGE`, as above. |
 | `bc_row_end` | Finalizes the row in the arena and returns its view, a built row of the builder's table. A NOT NULL column that is null, set so or never set and with no default, is `BC_E_CONSTRAINT` with `BC_C_NOT_NULL` and the table's id: checked here, after every value set passed its range check, so a row holding both is `BC_C_RANGE`, as PostgreSQL reports it. A row over the engine's value limit is `BC_E_LIMIT`. |
 | `bc_pin` | Copies a view into the arena so it outlives its cursor, keeping what it is: a pinned row is still a row of its table. The compiler emits it where a plan keeps a cursor's bytes across a step. |

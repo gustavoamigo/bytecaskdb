@@ -13,6 +13,7 @@
 module;
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -148,7 +149,10 @@ auto literal(const PgQuery__Node* n) -> Literal {
   reject("constant not supported", c->location);
 }
 
-auto column_def(const PgQuery__ColumnDef* cd) -> ColumnDefAst {
+// `primary_key` is told of each PRIMARY KEY constraint on the column, so a
+// repeated one counts twice.
+auto column_def(const PgQuery__ColumnDef* cd, const std::function<void(std::int32_t)>& primary_key = {})
+    -> ColumnDefAst {
   const auto* tn = cd->type_name;
   if (tn == nullptr || tn->n_names == 0 || tn->n_array_bounds != 0 || tn->setof || tn->pct_type) {
     reject("column type not supported", cd->location);
@@ -167,6 +171,7 @@ auto column_def(const PgQuery__ColumnDef* cd) -> ColumnDefAst {
     const auto* c = cd->constraints[k]->constraint;
     if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_PRIMARY) {
       col.primary_key = true;
+      if (primary_key) primary_key(c->location);
     } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_NOTNULL) {
       col.not_null = true;
     } else if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_DEFAULT) {
@@ -199,8 +204,7 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos) -> CreateTable
       continue;
     }
     if (el->node_case != PG_QUERY__NODE__NODE_COLUMN_DEF) reject("table element not supported", -1);
-    t.columns.push_back(column_def(el->column_def));
-    if (t.columns.back().primary_key) one_primary_key(t.columns.back().pos);
+    t.columns.push_back(column_def(el->column_def, one_primary_key));
   }
   return t;
 }
