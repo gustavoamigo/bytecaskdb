@@ -209,6 +209,26 @@ NB_MODULE(bytecask_sql, m) {
           "table"_a,
           "Test only: every row of a table, in primary-key order, read from the engine and decoded "
           "through the catalog.")
+      .def(
+          "_engine_rows",
+          [](sql::Database& db, std::string_view table) {
+            const auto* t = db.catalog()->table(table);
+            if (t == nullptr) throw std::invalid_argument("relation \"" + std::string{table} + "\" does not exist");
+            auto snap = db.engine_for_testing().snapshot();
+            nb::list rows;
+            sql::for_each_row(snap, t->id, [&](sql::BytesView key, sql::BytesView row) {
+              rows.append(nb::make_tuple(nb::bytes(key.data(), key.size()), nb::bytes(row.data(), row.size())));
+            });
+            return rows;
+          },
+          "table"_a, "Test only: a table's stored (key, row) pairs, as the engine holds them.")
+      .def(
+          "_engine_put",
+          [](sql::Database& db, const nb::bytes& key, const nb::bytes& value) {
+            auto view = [](const nb::bytes& b) { return std::as_bytes(std::span{b.c_str(), b.size()}); };
+            (void)db.engine_for_testing().put({}, view(key), view(value));
+          },
+          "key"_a, "value"_a, "Test only: writes a key and value straight to the engine, past the layer's checks.")
       .def("_conflict_on_every_commit", &sql::Database::conflict_on_every_commit_for_testing, "on"_a,
            "Test only: while on, every commit conflicts, so execute raises ExecError with conflict set.");
 

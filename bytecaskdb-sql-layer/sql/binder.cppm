@@ -14,7 +14,6 @@ module;
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -144,11 +143,13 @@ auto sql_type(const ast::ColumnDefAst& c) -> SqlType {
   throw SqlError{"type " + c.type + " is not supported", c.pos};
 }
 
-// A decimal literal ([-]digits[.digits]) scaled by 10^scale, rounded half
-// away from zero; nullopt if it is not one. One of more digits than any
-// DECIMAL holds is returned as INT64_MAX, which out_of_range refuses: the
-// precision is checked there, not here.
-auto scaled_decimal(std::string_view text, std::uint8_t scale) -> std::optional<std::int64_t> {
+// A decimal literal's sign, whole digits and fraction digits:
+// [-]digits[.digits]; nullopt if it is not one.
+struct DecimalLiteral {
+  bool neg;
+  std::string_view whole, frac;
+};
+auto decimal_literal(std::string_view text) -> std::optional<DecimalLiteral> {
   auto neg = !text.empty() && text[0] == '-';
   if (neg) text.remove_prefix(1);
   auto dot = text.find('.');
@@ -156,10 +157,18 @@ auto scaled_decimal(std::string_view text, std::uint8_t scale) -> std::optional<
   auto frac = dot == std::string_view::npos ? std::string_view{} : text.substr(dot + 1);
   auto digits = [](std::string_view d) { return std::ranges::all_of(d, [](char ch) { return ch >= '0' && ch <= '9'; }); };
   if ((whole.empty() && frac.empty()) || !digits(whole) || !digits(frac)) return std::nullopt;
+  return DecimalLiteral{neg, whole, frac};
+}
+
+// The literal scaled by 10^scale, rounded half away from zero; nullopt if it
+// has more digits than any DECIMAL holds, so it cannot be scaled in an i64.
+// The column's precision is checked by out_of_range, not here.
+auto scaled_decimal(DecimalLiteral d, std::uint8_t scale) -> std::optional<std::int64_t> {
+  auto [neg, whole, frac] = d;
   // Leading zeros are no digits: "0.5" has none before the point, so it fits
   // NUMERIC(4, 4).
   while (!whole.empty() && whole[0] == '0') whole.remove_prefix(1);
-  if (whole.size() + scale > kMaxDecimalPrecision) return std::numeric_limits<std::int64_t>::max();
+  if (whole.size() + scale > kMaxDecimalPrecision) return std::nullopt;
   std::int64_t v = 0;
   for (auto ch : whole) v = v * 10 + (ch - '0');
   for (std::uint8_t i = 0; i < scale; ++i) v = v * 10 + (i < frac.size() ? frac[i] - '0' : 0);
@@ -185,9 +194,10 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
     }
     case SqlKind::Decimal: {
       if (l.kind != K::Integer && l.kind != K::Number) bad();
-      auto v = scaled_decimal(l.text, t.scale);
-      if (!v) bad();
-      if (out_of_range(t, *v)) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
+      auto d = decimal_literal(l.text);
+      if (!d) bad();
+      auto v = scaled_decimal(*d, t.scale);
+      if (!v || out_of_range(t, *v)) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
       return *v;
     }
     case SqlKind::Real:
@@ -207,7 +217,9 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
     case SqlKind::Bytea: {
       if (l.kind != K::String) bad();
       auto b = std::as_bytes(std::span{l.text.data(), l.text.size()});
-      if (out_of_range(t, b)) throw SqlError{"DEFAULT too long for type " + sql_type_name(t), l.pos};
+      if (auto why = out_of_range(t, b)) {
+        throw SqlError{"DEFAULT is not a " + sql_type_name(t) + ": " + *why, l.pos};
+      }
       return Bytes(b.begin(), b.end());
     }
     case SqlKind::Timestamp:

@@ -62,15 +62,15 @@ struct Rows {
 // BC_CONFLICT and BC_E_IO are both 1, so conflict() tells them apart, not
 // code().
 class ExecError : public std::runtime_error {
+  struct Conflict {};
+
 public:
-  ExecError(const std::string& what, int code, std::uint32_t detail = 0)
+  // A failure: a bc_error_code, so a bc_commit_result such as BC_CONFLICT
+  // does not compile here. A conflict is made only by conflicted().
+  ExecError(const std::string& what, bc_error_code code, std::uint32_t detail = 0)
       : std::runtime_error{what}, code_{code}, detail_{detail} {}
   // Every attempt conflicted; code() is BC_CONFLICT.
-  [[nodiscard]] static auto conflicted(const std::string& what) -> ExecError {
-    ExecError e{what, BC_CONFLICT};
-    e.conflict_ = true;
-    return e;
-  }
+  [[nodiscard]] static auto conflicted(const std::string& what) -> ExecError { return {what, Conflict{}}; }
   ExecError(const ExecError&) = default;
   ExecError& operator=(const ExecError&) = default;
   ~ExecError() override;  // out of line: anchors the vtable (-Wweak-vtables)
@@ -87,6 +87,9 @@ public:
   }
 
 private:
+  ExecError(const std::string& what, Conflict)
+      : std::runtime_error{what}, code_{BC_CONFLICT}, detail_{0}, conflict_{true} {}
+
   int code_;
   std::uint32_t detail_;
   bool conflict_{false};
@@ -165,6 +168,12 @@ public:
   // the engine, every table's catalog record is written back unchanged,
   // which a write plan guards, so execute exhausts its retries.
   void conflict_on_every_commit_for_testing(bool on);
+  // Test only: the engine under the layer, for a test that stores what the
+  // layer would refuse, to check that a read refuses it too.
+  [[nodiscard]] auto engine_for_testing() -> DB& {
+    check_open();
+    return *db_;
+  }
 #endif
 
   // Closes the engine. A second call returns at once.
@@ -398,7 +407,8 @@ void Database::conflict_on_every_commit_for_testing(bool on) {
     return;
   }
   bc_ctx_before_commit_for_testing(cx_, [this] {
-    for (const auto& [id, t] : live_->current()->tables()) {
+    auto cat = live_->current();  // held: the loop reads its tables
+    for (const auto& [id, t] : cat->tables()) {
       auto key = table_record_key(id);
       Bytes record;
       if (db_->get({}, key, record)) (void)db_->put({}, key, record);

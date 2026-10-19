@@ -466,6 +466,27 @@ def test_text_that_is_not_utf8_is_refused_on_write(tmp_path):
         db.close()
 
 
+def test_stored_text_that_is_not_utf8_raises_on_read(tmp_path):
+    """The read path's strict decode: text the layer would refuse, stored
+    under it through the engine, raises rather than reads as text."""
+    db = bytecask_sql.open(str(tmp_path))
+    try:
+        db.execute("CREATE TABLE t (k BIGINT PRIMARY KEY, s TEXT)")
+        db.execute("INSERT INTO t VALUES ($1, $2)", (1, "a"))
+        [(key, row)] = db._engine_rows("t")
+        assert row.endswith(b"a")  # the one variable column's bytes end the row
+        db._engine_put(key, row[:-1] + b"\xff")
+        for read in (lambda: db.table_rows("t"), lambda: db.execute("SELECT s FROM t WHERE k = $1", (1,))):
+            try:
+                read()
+            except UnicodeDecodeError:
+                pass
+            else:
+                raise AssertionError("stored bytes that are not UTF-8 read as text")
+    finally:
+        db.close()
+
+
 def test_every_range_message_maps_to_its_sqlstate(tmp_path):
     """Each range refusal the layer makes, and the SQLSTATE the oracle gives
     it: every entry of RANGE_SQLSTATE is produced, so a message reworded in

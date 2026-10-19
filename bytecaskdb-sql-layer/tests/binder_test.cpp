@@ -176,7 +176,10 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v NUMERIC(18, 0) DEFAULT 12345678901234567890123)").first ==
         "DEFAULT out of range for type numeric(18,0)");
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v VARCHAR(2) DEFAULT 'abc')").first ==
-        "DEFAULT too long for type varchar(2)");
+        "DEFAULT is not a varchar(2): value too long for type character varying(2)");
+  // Not UTF-8: refused with the reason, not as too long.
+  CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v TEXT DEFAULT '\xff')").first ==
+        "DEFAULT is not a text: invalid byte sequence for encoding \"UTF8\"");
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v BIGINT DEFAULT 'x')").first ==
         "DEFAULT is not a constant of type bigint");
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v TIMESTAMP DEFAULT 0)").first ==

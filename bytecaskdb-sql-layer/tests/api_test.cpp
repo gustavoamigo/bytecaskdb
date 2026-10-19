@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -645,6 +646,9 @@ TEST_CASE("embedded API: values outside their declared type, an omitted NOT NULL
   // same code (BC_CONFLICT and BC_E_IO are both 1), end to end: every commit
   // is made to conflict, and nothing is written.
   static_assert(static_cast<int>(BC_CONFLICT) == static_cast<int>(BC_E_IO));
+  // A conflict is made only by conflicted(): BC_CONFLICT is not a bc_error_code.
+  static_assert(!std::is_constructible_v<ExecError, std::string, decltype(BC_CONFLICT)>);
+  static_assert(std::is_constructible_v<ExecError, std::string, decltype(BC_E_IO)>);
   constexpr auto kInsK = "INSERT INTO r (k, z) VALUES ($1, $2)";
   db->conflict_on_every_commit_for_testing(true);
   try {
