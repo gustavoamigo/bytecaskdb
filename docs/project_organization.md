@@ -77,7 +77,8 @@ TinyCC (LGPL-2.1). The xmake targets that use them are not built by default;
 its own workflow, `.github/workflows/sql-layer.yml`, builds and runs
 `sql_layer_tests`, under the sanitizers too; the engine's workflows do not
 build the layer. Its design documents are in `bytecaskdb-sql-layer/docs/`, and
-what it guarantees is in `bytecaskdb-sql-layer/CONTRACT.md`.
+what it guarantees is in `bytecaskdb-sql-layer/CONTRACT.md`, whose vocabulary
+`.github/workflows/contract.yml` checks.
 
 ### GPL-2.0 — MariaDB Integration (`bytecaskdb-mariadb-plugin/`)
 

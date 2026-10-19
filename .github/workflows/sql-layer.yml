@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # The SQL layer (bytecaskdb-sql-layer, #487): its tests, under the
-# sanitizers too, and its contract's vocabulary. Its own workflow, apart from
-# the engine's: the engine's jobs do not build the layer.
+# sanitizers too. Its own workflow, apart from the engine's: the engine's jobs
+# do not build the layer. Its contract's vocabulary is checked in
+# contract.yml, so a change to the layer's Markdown alone builds nothing.
 #
 # It runs on a pull request to any base, so a PR stacked on another layer PR
-# gets CI, and on the push to main. It is path-filtered to the layer and to
-# what the layer builds on: the engine, its public header and the build.
+# gets CI, and on the push to main. It is path-filtered to the layer's code and
+# to what the layer builds on: the engine, its public header and the build.
 #
 # Nothing here installs a MariaDB development package, and nothing under
 # bytecaskdb-sql-layer/ may include a MariaDB header: building the layer here
@@ -18,6 +19,7 @@ on:
     branches: [main]
     paths:
       - "bytecaskdb-sql-layer/**"
+      - "!bytecaskdb-sql-layer/**/*.md"
       - "bytecaskdb/**"
       - "include/**"
       - "xmake.lua"
@@ -25,12 +27,12 @@ on:
       - "tests/alloc_faults.cpp"
       - "tests/alloc_faults.h"
       - ".github/workflows/sql-layer.yml"
-      - "scripts/check_contract_vocabulary.py"
       - "scripts/enrich_junit_sources.py"
   pull_request:
     # No branches filter: any base.
     paths:
       - "bytecaskdb-sql-layer/**"
+      - "!bytecaskdb-sql-layer/**/*.md"
       - "bytecaskdb/**"
       - "include/**"
       - "xmake.lua"
@@ -38,7 +40,6 @@ on:
       - "tests/alloc_faults.cpp"
       - "tests/alloc_faults.h"
       - ".github/workflows/sql-layer.yml"
-      - "scripts/check_contract_vocabulary.py"
       - "scripts/enrich_junit_sources.py"
   # The sanitizers' nightly run, as sanitizers.yml has for the engine.
   schedule:
@@ -48,20 +49,14 @@ on:
 permissions:
   contents: read
 
+# Only a pull request's runs cancel each other. The nightly, a dispatch and
+# the push to main all run on refs/heads/main: sharing a cancelling group,
+# one would cancel another and leave a commit with no result for the layer.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # bytecaskdb-sql-layer/CONTRACT.md names only what bc_plan.h and the
-  # embedded API declare.
-  contract-vocabulary:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: The SQL layer's CONTRACT.md names only its public interface
-        run: python3 scripts/check_contract_vocabulary.py --only sql-layer
-
   sql-layer-tests:
     runs-on: ubuntu-latest
     container:
