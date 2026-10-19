@@ -51,6 +51,7 @@ using bytecask::sql::BytesView;
 using bytecask::sql::Catalog;
 using bytecask::sql::ColumnSlot;
 using bytecask::sql::ConstraintDetail;
+using bytecask::sql::has_prefix;
 using bytecask::sql::Datum;
 using bytecask::sql::Index;
 using bytecask::sql::KeyLayout;
@@ -549,10 +550,6 @@ auto bytes_cmp(BytesView a, BytesView b) -> std::strong_ordering {
                                                 });
 }
 
-auto starts_with(BytesView k, BytesView prefix) -> bool {
-  return k.size() >= prefix.size() && std::ranges::equal(k.first(prefix.size()), prefix);
-}
-
 // Positions a cursor on its next entry within bounds; false at the end.
 auto cursor_advance(bc_ctx* cx, Cursor& c) -> bool {
   auto reverse = (c.flags & BC_SCAN_REVERSE) != 0;
@@ -582,7 +579,7 @@ auto cursor_advance(bc_ctx* cx, Cursor& c) -> bool {
       v = (**c.rev).value;
     }
     if (!cx->charge()) return false;
-    if (!starts_with(k, c.prefix)) {
+    if (!has_prefix(k, c.prefix)) {
       if (reverse && !c.hi.empty() && std::is_gt(bytes_cmp(k, c.prefix))) continue;  // the successor itself
       return false;
     }
@@ -1107,7 +1104,7 @@ struct Entry {
 [[nodiscard]] auto unique_free(bc_ctx* cx, const Index& ix, BytesView prefix) -> bool {
   if (!cx->charge()) return false;
   auto keys = cx->snap->keys_from({}, prefix);
-  if (auto it = keys.begin(); it != std::default_sentinel && starts_with(*it, prefix)) {
+  if (auto it = keys.begin(); it != std::default_sentinel && has_prefix(*it, prefix)) {
     cx->raise(BC_C_UNIQUE, ix.id);
     return false;
   }
@@ -1602,7 +1599,7 @@ int bc_bytes_cmp(bc_ctx* cx, bc_view a, bc_view b) {
 bool bc_bytes_prefix(bc_ctx* cx, bc_view prefix, bc_view b) {
   BC_GUARD_BEGIN
   auto v = cx->resolve2(prefix, b);
-  return v && starts_with(v->second, v->first);
+  return v && has_prefix(v->second, v->first);
   BC_GUARD_END(cx)
   return {};
 }
@@ -2287,7 +2284,7 @@ void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
   // Both bounds inside the table's rows: a bound of another object would
   // reach past them into the rest of the keyspace.
   auto end = bytecask::sql::key_successor(range->prefix);
-  if (!starts_with(range->lo, range->prefix) || (!starts_with(range->hi, range->prefix) && range->hi != end)) {
+  if (!has_prefix(range->lo, range->prefix) || (!has_prefix(range->hi, range->prefix) && range->hi != end)) {
     cx->fail(BC_E_HANDLE, "bc_del_range bound is not a key of table " + t->name);
     return;
   }

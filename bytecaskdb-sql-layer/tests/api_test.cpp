@@ -285,10 +285,19 @@ TEST_CASE("embedded API: a unique index refuses duplicates, treats nulls as dist
   CHECK(db->execute(kIns, {i(7), bytes("a"), i(0)}).affected == 1);
   CHECK(ids(db->execute("SELECT id FROM c WHERE email = $1", {bytes("a")})) == std::vector<std::int64_t>{7});
 
-  // A unique index over rows that already collide is refused.
+  // A unique index over rows that already collide is refused as the
+  // duplicate it would hold: BC_C_UNIQUE with the index's id (23505).
   (void)db->execute(kIns, {i(8), bytes("q"), i(1)});
   (void)db->execute(kIns, {i(9), bytes("r"), i(1)});
-  CHECK_THROWS_AS(db->execute("CREATE UNIQUE INDEX c_w ON c (w)"), DdlRefused);
+  auto next_id = static_cast<std::uint32_t>(db->catalog()->next_object_id());
+  try {
+    (void)db->execute("CREATE UNIQUE INDEX c_w ON c (w)");
+    FAIL("a unique index over duplicates was created");
+  } catch (const ExecError& e) {
+    REQUIRE(e.constraint());
+    CHECK(e.constraint()->constraint == BC_C_UNIQUE);
+    CHECK(e.constraint()->object_id == next_id);
+  }
   CHECK(db->catalog()->index("c_w").second == nullptr);
   db->close();
 
@@ -409,7 +418,7 @@ TEST_CASE("embedded API: a quoted name keeps its case, and nothing in a name esc
   }
 }
 
-TEST_CASE("embedded API: table_rows reads a table in key order; errors carry their detail and rows their types",
+TEST_CASE("embedded API: table_rows reads a table in key order; errors carry their detail; calls after close() throw",
           "[sql][api]") {
   sql_test::TempDir dir{"api_table_rows"};
   auto db = Database::open(dir.path());
@@ -435,6 +444,11 @@ TEST_CASE("embedded API: table_rows reads a table in key order; errors carry the
     return 0;
   };
   CHECK(constraint_of(kIns, {i(2), bytes("a")}) == BC_C_UNIQUE);
+  // A field wider than its bits would name another constraint or object.
+  constexpr ConstraintDetail kWideId{BC_C_UNIQUE, ConstraintDetail::kMaxObjectId + 1};
+  constexpr ConstraintDetail kWideKind{0x100, 1};
+  CHECK_THROWS_AS((void)kWideId.encode(), std::out_of_range);
+  CHECK_THROWS_AS((void)kWideKind.encode(), std::out_of_range);
   CHECK(constraint_of("INSERT INTO t VALUES ($1, $2, $3)", {i(3), bytes("a"), kNull}) == BC_C_NOT_NULL);
 
   auto check_rows = [&](Database& d) {
@@ -460,4 +474,32 @@ TEST_CASE("embedded API: table_rows reads a table in key order; errors carry the
 
   auto again = Database::open(dir.path());
   check_rows(*again);
+  again->close();
+
+  // A stored row of another layout generation is refused, never decoded
+  // with the current layout's slots: one row's generation field (its first
+  // two bytes, little-endian) is rewritten through the engine.
+  {
+    auto engine = bytecask::DB::open(dir.path());
+    Bytes prefix;
+    key_put_prefix(prefix, kNsRow, table_id);
+    Bytes key, row;
+    for (const auto& e : engine.iter_from({}, prefix)) {
+      key.assign(e.key.begin(), e.key.end());
+      row.assign(e.value.begin(), e.value.end());
+      break;
+    }
+    REQUIRE(has_prefix(key, prefix));
+    row[0] = std::byte{2};
+    engine.put({}, key, row);
+    engine.close();
+  }
+  auto third = Database::open(dir.path());
+  try {
+    (void)third->table_rows("t");
+    FAIL("a row of another layout generation was decoded");
+  } catch (const std::runtime_error& e) {
+    CHECK(std::string{e.what()}.starts_with("row of layout generation 2"));
+  }
+  third->close();
 }

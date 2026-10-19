@@ -56,6 +56,9 @@ struct Exceptions {
   nb::handle error, sql_error, exec_error, closed;
 };
 Exceptions exceptions;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables): set once at import
+// decimal.Decimal, looked up once at import, not per value; held for the
+// process, as the exception classes are.
+nb::handle decimal_type;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables): set once at import
 
 void raise_exec_error(const sql::ExecError& e) {
   nb::object exc = nb::borrow(exceptions.exec_error)(nb::str(e.what()));
@@ -106,7 +109,7 @@ auto to_python(const sql::Value& v, sql::SqlType t) -> nb::object {
   }
   if (const auto* i = std::get_if<std::int64_t>(&v)) {
     if (t.kind == sql::SqlKind::Decimal) {
-      return nb::module_::import_("decimal").attr("Decimal")(*i).attr("scaleb")(-static_cast<int>(t.scale));
+      return nb::borrow(decimal_type)(*i).attr("scaleb")(-static_cast<int>(t.scale));
     }
     return nb::int_(*i);
   }
@@ -175,6 +178,7 @@ NB_MODULE(bytecask_sql, m) {
   m.attr("SqlError") = exceptions.sql_error;
   m.attr("ExecError") = exceptions.exec_error;
   m.attr("Closed") = exceptions.closed;
+  decimal_type = nb::object(nb::module_::import_("decimal").attr("Decimal")).release();
 
   nb::register_exception_translator([](const std::exception_ptr& p, void*) {
     try {

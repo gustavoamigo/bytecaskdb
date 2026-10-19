@@ -41,6 +41,8 @@ module;
 // The engine through its public header, as the plugin and the bindings link
 // it; the sql-layer imports no engine module.
 #include "include/bytecask.hpp"
+// The bc_constraint codes a ConstraintDetail carries.
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
 
 export module bytecask.sql.catalog;
 
@@ -49,11 +51,52 @@ export import bytecask.sql.row_codec;
 
 export namespace bytecask::sql {
 
+// A BC_E_CONSTRAINT detail (bc_error_detail): the bc_constraint in the high
+// byte, the object id in the low 24 bits. The one encoding of the detail and
+// the one mapping from constraint codes to names and text, for the plan
+// API's error and the embedded API's exception.
+struct ConstraintDetail {
+  static constexpr std::uint32_t kMaxObjectId = 0x00FF'FFFFu;
+
+  std::uint32_t constraint;  // a bc_constraint
+  std::uint32_t object_id;
+
+  [[nodiscard]] static constexpr auto decode(std::uint32_t detail) -> ConstraintDetail {
+    return {detail >> 24, detail & kMaxObjectId};
+  }
+  // Throws std::out_of_range for a kind or an id wider than its field, which
+  // would name another constraint or object (bc_raise refuses the same).
+  [[nodiscard]] constexpr auto encode() const -> std::uint32_t {
+    if (constraint > 0xFFu || object_id > kMaxObjectId) throw std::out_of_range("constraint detail field too wide");
+    return (constraint << 24) | object_id;
+  }
+  // "unique", "not_null", "check", "foreign_key" or "range"; empty for a
+  // code bc_plan.h does not define.
+  [[nodiscard]] auto name() const -> std::string_view;
+  [[nodiscard]] auto message() const -> std::string;
+};
+
+// A DDL whose existing data breaks a constraint: CREATE UNIQUE INDEX over
+// rows that hold a duplicate (BC_C_UNIQUE with the index's id). The data's
+// refusal, not the statement's (that is DdlRefused): SQL reports the
+// constraint's SQLSTATE, 23505. Nothing was written.
+class ConstraintViolation : public std::runtime_error {
+public:
+  ConstraintViolation(const std::string& what, ConstraintDetail detail) : std::runtime_error{what}, detail_{detail} {}
+  ConstraintViolation(const ConstraintViolation&) = default;
+  ConstraintViolation& operator=(const ConstraintViolation&) = default;
+  ~ConstraintViolation() override;  // out of line: anchors the vtable (-Wweak-vtables)
+  [[nodiscard]] auto detail() const noexcept -> ConstraintDetail { return detail_; }
+
+private:
+  ConstraintDetail detail_;
+};
+
 // A DDL statement the catalog refuses before it writes anything: a name
 // taken or missing, a column or key part that does not exist or repeats, a
-// default not of its column's type, a unique index over duplicates. The
-// refusals PostgreSQL makes of the statement itself; the engine's own
-// refusals stay std::invalid_argument and std::length_error.
+// default not of its column's type. The refusals PostgreSQL makes of the
+// statement itself; the engine's own refusals stay std::invalid_argument and
+// std::length_error.
 class DdlRefused : public std::invalid_argument {
 public:
   using std::invalid_argument::invalid_argument;
@@ -302,8 +345,9 @@ public:
     bool backfill{false};
   };
   // Throws DdlRefused for a statement the catalog refuses (a duplicate
-  // name, an unknown column, a unique index over duplicates…), the engine's
-  // std::invalid_argument for a key over its limit, and
+  // name, an unknown column…), ConstraintViolation for a unique index over
+  // duplicates, the engine's std::invalid_argument for a key over its
+  // limit, and
   // std::length_error when ids or a layout run out or a backfill passes the
   // engine's batch limit. Writes nothing.
   [[nodiscard]] auto prepare(const Ddl& ddl) -> Prepared;
@@ -634,6 +678,31 @@ void check_column_spec(const ColumnSpec& c) {
 }  // namespace
 
 DdlRefused::~DdlRefused() = default;
+ConstraintViolation::~ConstraintViolation() = default;
+
+auto ConstraintDetail::name() const -> std::string_view {
+  switch (constraint) {
+    case BC_C_UNIQUE: return "unique";
+    case BC_C_NOT_NULL: return "not_null";
+    case BC_C_CHECK: return "check";
+    case BC_C_FOREIGN_KEY: return "foreign_key";
+    case BC_C_RANGE: return "range";
+    default: return {};
+  }
+}
+
+auto ConstraintDetail::message() const -> std::string {
+  auto object = std::to_string(object_id);
+  switch (constraint) {
+    case BC_C_UNIQUE: return "duplicate key value violates unique constraint of object " + object;
+    case BC_C_NOT_NULL: return "null value violates a not-null constraint of table " + object;
+    case BC_C_CHECK: return "check constraint " + object + " violated";
+    case BC_C_FOREIGN_KEY: return "foreign key constraint " + object + " violated";
+    case BC_C_RANGE: return "value out of range for column " + object;
+    default: return "constraint violated on object " + object;
+  }
+}
+
 
 auto has_prefix(BytesView key, BytesView prefix) -> bool {
   return key.size() >= prefix.size() && std::ranges::equal(key.first(prefix.size()), prefix);
@@ -1186,8 +1255,9 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
         throw std::runtime_error("malformed row in table " + t.name);
       }
       if (ix.unique && !has_null && !prefixes.emplace(k.begin(), k.begin() + static_cast<std::ptrdiff_t>(prefix_len)).second) {
-        throw DdlRefused("could not create unique index \"" + name + "\": table \"" + t.name +
-                                    "\" holds a duplicate key");
+        throw ConstraintViolation("could not create unique index \"" + name + "\": table \"" + t.name +
+                                      "\" holds a duplicate key",
+                                  ConstraintDetail{BC_C_UNIQUE, ix.id});
       }
       budget.charge(k.size() + prefix_len);
       put_op(ops, DdlOp::Kind::Put, std::move(k));
