@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// The plan API calls revision 3 of docs/plan_api_design.md added or
-// completed (#490): empty scan bounds, key-part decoders, bc_raise and the
-// duplicate-key path, the f64 and bool calls, the arithmetic helpers, the
-// remaining effects, bc_row_pk and bc_pin, and the fault path of each.
+// The plan API calls revisions 3 and 5 of docs/plan_api_design.md added or
+// completed (#490, #487): empty scan bounds, key-part decoders, bc_raise and
+// the duplicate-key path, the f64 and bool calls, the arithmetic helpers,
+// the range delete and the guards, bc_row_key and bc_pin, and the fault
+// path of each.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -33,17 +34,13 @@ using bytecask::sql::PhysType;
 namespace {
 
 constexpr std::uint32_t kTbl = 1;
-constexpr std::uint32_t kLay = 2;
 constexpr std::uint32_t kIdx = 3;
 constexpr std::uint32_t kIdCol = 0, kNameCol = 1, kQtyCol = 2;
-constexpr std::uint32_t kIdOff = 20;
-constexpr std::uint32_t kNameSlotForTest = 0;
 
 // A second table with the other physical types: m (k BIGINT PRIMARY KEY,
 // x DOUBLE PRECISION, b BOOLEAN) with an index on x. Ids follow t's.
-constexpr std::uint32_t kM = 4, kMLay = 5, kMByX = 6;
+constexpr std::uint32_t kM = 4, kMByX = 6;
 constexpr std::uint32_t kKCol = 0, kXCol = 1, kBCol = 2;
-constexpr std::uint32_t kXOff = 28, kBOff = 36;
 
 constexpr auto kNaN = std::numeric_limits<double>::quiet_NaN();
 constexpr auto kInf = std::numeric_limits<double>::infinity();
@@ -55,8 +52,8 @@ constexpr std::array<PhysType, 2> kF64BoolRow{PhysType::F64, PhysType::Bool};
 auto run(Fixture& f, bc_plan_fn plan, std::vector<bc_value> p, std::span<const PhysType> result = {},
          std::uint32_t retries = 0) -> int {
   auto ps = params(std::move(p));
-  auto codes = type_codes(result);
-  SchemaRef sr{{}, {}, {}, {}, std::move(codes), f.cat().version()};
+  // Every column of every table declared, so the plans may name any.
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), type_codes(result), f.cat().version()};
   auto ref = sr.get();  // points into sr
   return bc_execute(f.cx, plan, &ref, &ps, {}, false, retries);
 }
@@ -64,10 +61,7 @@ auto run(Fixture& f, bc_plan_fn plan, std::vector<bc_value> p, std::span<const P
 auto bits(double d) -> std::uint64_t { return std::bit_cast<std::uint64_t>(d); }
 
 void insert_t(bc_ctx* cx) {
-  bc_key kb = bc_key_begin(cx, kTbl);
-  bc_key_i64(cx, kb, bc_param_i64(cx, 0));
-  bc_view pk = bc_key_end(cx, kb);
-  bc_row rb = bc_row_begin(cx, kLay);
+  bc_row rb = bc_row_begin(cx, kTbl);
   bc_row_set_i64(cx, rb, kIdCol, bc_param_i64(cx, 0));
   if (bc_param_null(cx, 1)) {
     bc_row_set_null(cx, rb, kNameCol);
@@ -75,15 +69,7 @@ void insert_t(bc_ctx* cx) {
     bc_row_set_bytes(cx, rb, kNameCol, bc_param_bytes(cx, 1));
   }
   bc_row_set_i64(cx, rb, kQtyCol, bc_param_i64(cx, 2));
-  bc_put(cx, pk, bc_row_end(cx, rb));
-  bc_key ib = bc_key_begin(cx, kIdx);
-  if (bc_param_null(cx, 1)) {
-    bc_key_null(cx, ib);
-  } else {
-    bc_key_bytes(cx, ib, bc_param_bytes(cx, 1));
-  }
-  bc_key_i64(cx, ib, bc_param_i64(cx, 0));
-  bc_put(cx, bc_key_end(cx, ib), bc_empty(cx));
+  bc_insert(cx, kTbl, bc_row_end(cx, rb));
 }
 
 void seed_t(Fixture& f) {
@@ -106,7 +92,7 @@ void scan_all_reverse(bc_ctx* cx) {
   bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_REVERSE);
   while (bc_scan_next(cx, c)) {
     bc_emit_begin(cx);
-    bc_emit_i64(cx, bc_col_i64(cx, bc_scan_value(cx, c), kIdOff));
+    bc_emit_i64(cx, bc_col_i64(cx, bc_scan_row(cx, c), kIdCol));
     bc_emit_end(cx);
   }
 }
@@ -217,20 +203,12 @@ TEST_CASE("plan API: key parts decode from an index scan without the row", "[sql
 namespace {
 int g_runs = 0;
 
-// The unique-insert pattern: check the snapshot, raise, keep the guard.
+// An insert: the runtime checks the key on the snapshot and raises.
 void unique_insert(bc_ctx* cx) {
   ++g_runs;
-  bc_key kb = bc_key_begin(cx, kTbl);
-  bc_key_i64(cx, kb, bc_param_i64(cx, 0));
-  bc_view pk = bc_key_end(cx, kb);
-  if (bc_exists(cx, pk)) {
-    bc_raise(cx, BC_C_UNIQUE, kTbl);
-    return;
-  }
-  bc_row rb = bc_row_begin(cx, kLay);
+  bc_row rb = bc_row_begin(cx, kTbl);
   bc_row_set_i64(cx, rb, kIdCol, bc_param_i64(cx, 0));
-  bc_guard_absent(cx, pk);
-  bc_put(cx, pk, bc_row_end(cx, rb));
+  bc_insert(cx, kTbl, bc_row_end(cx, rb));
   bc_emit_count(cx, 1);
 }
 
@@ -240,11 +218,9 @@ void raise_p(bc_ctx* cx) {
 
 void raise_then_write(bc_ctx* cx) {
   bc_raise(cx, BC_C_NOT_NULL, 7);
-  bc_key kb = bc_key_begin(cx, kTbl);
-  bc_key_i64(cx, kb, 99);
-  bc_row rb = bc_row_begin(cx, kLay);
+  bc_row rb = bc_row_begin(cx, kTbl);
   bc_row_set_i64(cx, rb, kIdCol, 99);
-  bc_put(cx, bc_key_end(cx, kb), bc_row_end(cx, rb));  // dropped: the error is sticky
+  bc_insert(cx, kTbl, bc_row_end(cx, rb));  // dropped: the error is sticky
   bc_emit_count(cx, 1);
 }
 }  // namespace
@@ -277,6 +253,8 @@ TEST_CASE("plan API: a raised constraint error is final: no retry, nothing commi
   CHECK(run(f, raise_then_write, {}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
   CHECK(bc_error_detail(f.cx) == ((std::uint32_t{BC_C_NOT_NULL} << 24) | 7u));
+  // The id of a not-null violation is its table's (column ids are per table).
+  CHECK(std::string{bc_error_message(f.cx)} == "null value violates a not-null constraint of table 7");
   Bytes key, out;
   bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
   bytecask::sql::key_put_i64(key, 99, {PhysType::I64});
@@ -293,39 +271,32 @@ void create_m(Fixture& f) {
       {"k"}});
   f.ddl(bytecask::sql::CreateIndexDdl{"m_by_x", "m", {{"x"}}});
   REQUIRE(f.cat().table("m")->id == kM);
-  REQUIRE(f.cat().table("m")->layout.find(kXCol)->pos == kXOff);
-  REQUIRE(f.cat().table("m")->layout.find(kBCol)->pos == kBOff);
+  REQUIRE(f.cat().index("m_by_x").second->id == kMByX);
 }
 
-// INSERT INTO m VALUES ($1, $2, $3), maintaining m_by_x.
+// INSERT INTO m VALUES ($1, $2, $3); the runtime writes the m_by_x entry.
 void insert_m(bc_ctx* cx) {
-  bc_key kb = bc_key_begin(cx, kM);
-  bc_key_i64(cx, kb, bc_param_i64(cx, 0));
-  bc_view pk = bc_key_end(cx, kb);
-  bc_row rb = bc_row_begin(cx, kMLay);
-  bc_row_set_i64(cx, rb, kKCol, bc_param_i64(cx, 0));
-  if (bc_param_null(cx, 1)) {
-    bc_row_set_null(cx, rb, kXCol);
-  } else {
-    bc_row_set_f64(cx, rb, kXCol, bc_param_f64(cx, 1));
-  }
-  if (bc_param_null(cx, 2)) {
-    bc_row_set_null(cx, rb, kBCol);
-  } else {
-    bc_row_set_bool(cx, rb, kBCol, bc_param_bool(cx, 2));
-  }
-  bc_put(cx, pk, bc_row_end(cx, rb));
-  bc_key ib = bc_key_begin(cx, kMByX);
-  if (bc_param_null(cx, 1)) {
-    bc_key_null(cx, ib);
-  } else {
-    bc_key_f64(cx, ib, bc_param_f64(cx, 1));
-  }
-  bc_key_i64(cx, ib, bc_param_i64(cx, 0));
-  bc_put(cx, bc_key_end(cx, ib), bc_empty(cx));
+  bc_row rb = bc_row_begin(cx, kM);
+  bc_row_set_param(cx, rb, kKCol, 0);
+  bc_row_set_param(cx, rb, kXCol, 1);
+  bc_row_set_param(cx, rb, kBCol, 2);
+  bc_insert(cx, kM, bc_row_end(cx, rb));
 }
 
-// SELECT x, b FROM m WHERE k = $1
+// SELECT x, b FROM m WHERE k = $1, through bc_emit_col.
+void select_m_emit_col(bc_ctx* cx) {
+  bool found = false;
+  bc_view row = bc_get(cx, bc_key_params(cx, kM, 0, 1), &found);
+  if (!found) {
+    return;
+  }
+  bc_emit_begin(cx);
+  bc_emit_col(cx, row, kXCol);
+  bc_emit_col(cx, row, kBCol);
+  bc_emit_end(cx);
+}
+
+// SELECT x, b FROM m WHERE k = $1, through the typed decoders.
 void select_m(bc_ctx* cx) {
   bc_key kb = bc_key_begin(cx, kM);
   bc_key_i64(cx, kb, bc_param_i64(cx, 0));
@@ -338,28 +309,44 @@ void select_m(bc_ctx* cx) {
   if (bc_col_null(cx, row, kXCol)) {
     bc_emit_null(cx);
   } else {
-    bc_emit_f64(cx, bc_col_f64(cx, row, kXOff));
+    bc_emit_f64(cx, bc_col_f64(cx, row, kXCol));
   }
   if (bc_col_null(cx, row, kBCol)) {
     bc_emit_null(cx);
   } else {
-    bc_emit_bool(cx, bc_col_bool(cx, row, kBOff));
+    bc_emit_bool(cx, bc_col_bool(cx, row, kBCol));
   }
   bc_emit_end(cx);
 }
 
-// SELECT x FROM m ORDER BY x, read from the index key alone.
+// SELECT x FROM m ORDER BY x: the order from the index, x from the row,
+// since a DOUBLE key part is canonicalised.
 void x_in_index_order(bc_ctx* cx) {
   bc_cursor c = bc_scan_open(cx, kMByX, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
   while (bc_scan_next(cx, c)) {
     bc_view k = bc_scan_key(cx, c);
+    bc_view row = bc_scan_row(cx, c);
     bc_emit_begin(cx);
-    if (bc_key_part_null(cx, kMByX, k, 0)) {
+    if (bc_col_null(cx, row, kXCol)) {
       bc_emit_null(cx);
     } else {
-      bc_emit_f64(cx, bc_key_part_f64(cx, kMByX, k, 0));
+      bc_emit_f64(cx, bc_col_f64(cx, row, kXCol));
     }
     bc_emit_bool(cx, bc_key_part_i64(cx, kMByX, k, 1) > 3);
+    bc_emit_end(cx);
+  }
+}
+// x read from the key: refused, by the typed decoder and by bc_emit_key_part.
+void x_from_key(bc_ctx* cx) {
+  bc_cursor c = bc_scan_open(cx, kMByX, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  if (bc_scan_next(cx, c)) bc_emit_count(cx, static_cast<int64_t>(bc_key_part_f64(cx, kMByX, bc_scan_key(cx, c), 0)));
+}
+void x_emitted_from_key(bc_ctx* cx) {
+  bc_cursor c = bc_scan_open(cx, kMByX, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_emit_begin(cx);
+    bc_emit_key_part(cx, kMByX, bc_scan_key(cx, c), 0);
+    bc_emit_key_part(cx, kMByX, bc_scan_key(cx, c), 1);
     bc_emit_end(cx);
   }
 }
@@ -380,23 +367,28 @@ TEST_CASE("plan API: f64 and bool flow through parameters, rows, keys and result
     REQUIRE(run(f, insert_m, {k, xs[static_cast<std::size_t>(k - 1)], k % 2 == 0 ? bc_value{true} : kNull}) ==
             BC_COMMITTED);
   }
-  REQUIRE(run(f, select_m, {std::int64_t{2}}, kF64BoolRow) == BC_COMMITTED);
-  auto rows = f.results(kF64BoolRow);
-  REQUIRE(rows.size() == 1);
-  CHECK(bits(std::get<double>(rows[0][0])) == bits(-1.5));
-  CHECK(std::get<bool>(rows[0][1]) == true);
-  REQUIRE(run(f, select_m, {std::int64_t{7}}, kF64BoolRow) == BC_COMMITTED);
-  rows = f.results(kF64BoolRow);
-  REQUIRE(rows.size() == 1);
-  CHECK(std::holds_alternative<std::monostate>(rows[0][0]));
-  CHECK(std::holds_alternative<std::monostate>(rows[0][1]));
-  REQUIRE(run(f, select_m, {std::int64_t{6}}, kF64BoolRow) == BC_COMMITTED);
-  rows = f.results(kF64BoolRow);
-  REQUIRE(rows.size() == 1);
-  auto nan = std::get<double>(rows[0][0]);
-  CHECK(nan != nan);
+  std::vector<std::vector<bc_value>> rows;
+  // The typed decoders and bc_emit_col read the same values, NULL included.
+  for (auto* reader : {select_m, select_m_emit_col}) {
+    REQUIRE(run(f, reader, {std::int64_t{2}}, kF64BoolRow) == BC_COMMITTED);
+    rows = f.results(kF64BoolRow);
+    REQUIRE(rows.size() == 1);
+    CHECK(bits(std::get<double>(rows[0][0])) == bits(-1.5));
+    CHECK(std::get<bool>(rows[0][1]) == true);
+    REQUIRE(run(f, reader, {std::int64_t{7}}, kF64BoolRow) == BC_COMMITTED);
+    rows = f.results(kF64BoolRow);
+    REQUIRE(rows.size() == 1);
+    CHECK(std::holds_alternative<std::monostate>(rows[0][0]));
+    CHECK(std::holds_alternative<std::monostate>(rows[0][1]));
+    REQUIRE(run(f, reader, {std::int64_t{6}}, kF64BoolRow) == BC_COMMITTED);
+    rows = f.results(kF64BoolRow);
+    REQUIRE(rows.size() == 1);
+    auto nan = std::get<double>(rows[0][0]);
+    CHECK(nan != nan);
+  }
 
-  // Index order: null, -inf, -1.5, 0 (twice: -0.0 encodes as 0.0), 2.5, NaN.
+  // Index order: null, -inf, -1.5, 0 (twice: -0.0 encodes as 0.0), 2.5, NaN;
+  // the values from the rows, so -0.0 stays -0.0.
   REQUIRE(run(f, x_in_index_order, {}, kF64BoolRow) == BC_COMMITTED);
   rows = f.results(kF64BoolRow);
   REQUIRE(rows.size() == 7);
@@ -404,7 +396,7 @@ TEST_CASE("plan API: f64 and bool flow through parameters, rows, keys and result
   CHECK(std::get<bool>(rows[0][1]) == true);  // k = 7
   CHECK(bits(std::get<double>(rows[1][0])) == bits(-kInf));
   CHECK(bits(std::get<double>(rows[2][0])) == bits(-1.5));
-  CHECK(bits(std::get<double>(rows[3][0])) == bits(0.0));
+  CHECK(bits(std::get<double>(rows[3][0])) == bits(-0.0));
   CHECK(bits(std::get<double>(rows[4][0])) == bits(0.0));
   CHECK(std::get<bool>(rows[3][1]) == false);  // k = 3 before k = 4 on the primary-key suffix
   CHECK(std::get<bool>(rows[4][1]) == true);
@@ -413,6 +405,12 @@ TEST_CASE("plan API: f64 and bool flow through parameters, rows, keys and result
   CHECK(top != top);
 
   CHECK(run(f, f64_part_on_i64_key, {}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  // A DOUBLE key part does not hold the column's value: never read from it.
+  CHECK(run(f, x_from_key, {}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(std::string{bc_error_message(f.cx)}.find("read it from the row") != std::string::npos);
+  CHECK(run(f, x_emitted_from_key, {}, std::array{PhysType::F64, PhysType::I64}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
   CHECK(run(f, bool_param_as_i64, {bc_value{true}}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
@@ -494,56 +492,34 @@ void count_pk_range(bc_ctx* cx) {
 }
 void count_all(bc_ctx* cx) { bc_emit_count(cx, bc_count_range(cx, kTbl, bc_empty(cx), bc_empty(cx), bc_param_i64(cx, 0))); }
 void del_pk_range(bc_ctx* cx) {
-  bc_key lo = bc_key_begin(cx, kTbl);
-  bc_key_i64(cx, lo, bc_param_i64(cx, 0));
-  bc_key hi = bc_key_begin(cx, kTbl);
-  bc_key_i64(cx, hi, bc_param_i64(cx, 1));
-  bc_del_range(cx, bc_key_end(cx, lo), bc_key_end(cx, hi));
+  bc_del_range(cx, kTbl, bc_key_params(cx, kTbl, 0, 1), bc_key_params(cx, kTbl, 1, 1));
 }
-void del_open_lo(bc_ctx* cx) {
-  bc_key hi = bc_key_begin(cx, kTbl);
-  bc_key_i64(cx, hi, 3);
-  bc_del_range(cx, bc_empty(cx), bc_key_end(cx, hi));
-}
-void del_open_hi(bc_ctx* cx) {
-  bc_key lo = bc_key_begin(cx, kTbl);
-  bc_key_i64(cx, lo, 3);
-  bc_del_range(cx, bc_key_end(cx, lo), bc_empty(cx));
+void del_open_lo(bc_ctx* cx) { bc_del_range(cx, kTbl, bc_empty(cx), bc_key_params(cx, kTbl, 0, 1)); }
+void del_open_hi(bc_ctx* cx) { bc_del_range(cx, kTbl, bc_key_params(cx, kTbl, 0, 1), bc_empty(cx)); }
+// A bound of another object: the index's first key.
+void del_foreign_bound(bc_ctx* cx) { bc_del_range(cx, kTbl, bc_empty(cx), bc_key_params(cx, kIdx, 0, 1)); }
+// A write for the guard plans to commit: a row with only its id, param 1.
+void insert_id(bc_ctx* cx) {
+  bc_row rb = bc_row_begin(cx, kTbl);
+  bc_row_set_param(cx, rb, kIdCol, 1);
+  bc_insert(cx, kTbl, bc_row_end(cx, rb));
 }
 void guard_empty_range(bc_ctx* cx) {
-  bc_key lo = bc_key_begin(cx, kTbl);
-  bc_key_i64(cx, lo, 3);
-  bc_view k = bc_key_end(cx, lo);
+  bc_view k = bc_key_params(cx, kTbl, 0, 1);
   bc_guard_range(cx, kTbl, k, k);
-  bc_key ib = bc_key_begin(cx, kIdx);
-  bc_key_bytes(cx, ib, bc_param_bytes(cx, 0));
-  bc_key_i64(cx, ib, 80);
-  bc_put(cx, bc_key_end(cx, ib), bc_empty(cx));
+  insert_id(cx);
 }
 void guard_present_p(bc_ctx* cx) {
-  bc_key kb = bc_key_begin(cx, kTbl);
-  bc_key_i64(cx, kb, bc_param_i64(cx, 0));
-  bc_guard_present(cx, bc_key_end(cx, kb));
-  bc_key ib = bc_key_begin(cx, kIdx);
-  bc_key_bytes(cx, ib, bc_param_bytes(cx, 1));
-  bc_key_i64(cx, ib, 77);
-  bc_put(cx, bc_key_end(cx, ib), bc_empty(cx));
+  bc_guard_present(cx, bc_key_params(cx, kTbl, 0, 1));
+  insert_id(cx);
 }
 void guard_unchanged_p(bc_ctx* cx) {
-  bc_key kb = bc_key_begin(cx, kTbl);
-  bc_key_i64(cx, kb, bc_param_i64(cx, 0));
-  bc_guard_unchanged(cx, bc_key_end(cx, kb));
-  bc_key ib = bc_key_begin(cx, kIdx);
-  bc_key_bytes(cx, ib, bc_param_bytes(cx, 1));
-  bc_key_i64(cx, ib, 78);
-  bc_put(cx, bc_key_end(cx, ib), bc_empty(cx));
+  bc_guard_unchanged(cx, bc_key_params(cx, kTbl, 0, 1));
+  insert_id(cx);
 }
 void guard_whole_table(bc_ctx* cx) {
   bc_guard_range(cx, kTbl, bc_empty(cx), bc_empty(cx));
-  bc_key ib = bc_key_begin(cx, kIdx);
-  bc_key_bytes(cx, ib, bc_param_bytes(cx, 0));
-  bc_key_i64(cx, ib, 79);
-  bc_put(cx, bc_key_end(cx, ib), bc_empty(cx));
+  insert_id(cx);
 }
 
 auto pk_of(std::int64_t id) -> Bytes {
@@ -557,8 +533,10 @@ auto pk_of(std::int64_t id) -> Bytes {
 // test.
 auto commit_after(Fixture& f, bc_plan_fn plan, std::vector<bc_value> p, auto&& between) -> int {
   auto ps = params(std::move(p));
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+  auto ref = sr.get();
   bc_ctx_begin(f.cx, &ps, {});
-  bc_ctx_run(f.cx, plan, nullptr);
+  bc_ctx_run(f.cx, plan, &ref);
   REQUIRE(bc_error(f.cx) == BC_OK);
   between();
   return bc_ctx_commit(f.cx, false);
@@ -577,63 +555,83 @@ TEST_CASE("plan API: count_range, del_range and the guards reach the engine", "[
   CHECK(run(f, count_all, {std::int64_t{-1}}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
 
-  // An open bound is refused: nothing is deleted, the catalog included.
-  CHECK(run(f, del_open_lo, {}) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_HANDLE);
-  CHECK(run(f, del_open_hi, {}) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_HANDLE);
-  CHECK(value(f, count_all, {std::int64_t{100}}) == 5);
-  REQUIRE(f.cat().table("t") != nullptr);
   // An empty or inverted range deletes nothing and commits.
   CHECK(run(f, del_pk_range, {std::int64_t{3}, std::int64_t{3}}) == BC_COMMITTED);
   CHECK(run(f, del_pk_range, {std::int64_t{4}, std::int64_t{2}}) == BC_COMMITTED);
   CHECK(value(f, count_all, {std::int64_t{100}}) == 5);
+  // A bound of another object would reach past the table: refused, and
+  // nothing is deleted, the catalog included.
+  CHECK(run(f, del_foreign_bound, {bytes("n")}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(value(f, count_all, {std::int64_t{100}}) == 5);
+  REQUIRE(f.cat().table("t") != nullptr);
 
+  // The rows go with their index entries.
   CHECK(run(f, del_pk_range, {std::int64_t{2}, std::int64_t{4}}) == BC_COMMITTED);
   CHECK(value(f, count_all, {std::int64_t{100}}) == 3);
+  CHECK(count_entries(*f.db, bytecask::sql::kNsIndex, kIdx) == 3);
   Bytes out;
   CHECK_FALSE(f.db->get({}, pk_of(2), out));
   CHECK(f.db->get({}, pk_of(4), out));
 
-  CHECK(run(f, guard_present_p, {std::int64_t{1}, bytes("p")}) == BC_COMMITTED);
-  CHECK(run(f, guard_present_p, {std::int64_t{2}, bytes("p")}) == BC_CONFLICT);
+  // Each plan guards key $1 and inserts row $2.
+  CHECK(run(f, guard_present_p, {std::int64_t{1}, std::int64_t{101}}) == BC_COMMITTED);
+  CHECK(run(f, guard_present_p, {std::int64_t{2}, std::int64_t{102}}) == BC_CONFLICT);
 
-  CHECK(commit_after(f, guard_unchanged_p, {std::int64_t{1}, bytes("u")}, [] {}) == BC_COMMITTED);
-  CHECK(commit_after(f, guard_unchanged_p, {std::int64_t{1}, bytes("u")},
+  CHECK(commit_after(f, guard_unchanged_p, {std::int64_t{1}, std::int64_t{103}}, [] {}) == BC_COMMITTED);
+  CHECK(commit_after(f, guard_unchanged_p, {std::int64_t{1}, std::int64_t{104}},
                      [&] { f.db->put({}, pk_of(1), bytes("changed")); }) == BC_CONFLICT);
-  CHECK(commit_after(f, guard_empty_range, {bytes("e")}, [&] { f.db->put({}, pk_of(3), bytes("x")); }) ==
+  CHECK(commit_after(f, guard_empty_range, {std::int64_t{3}, std::int64_t{105}},
+                     [&] { f.db->put({}, pk_of(3), bytes("x")); }) ==
         BC_COMMITTED);  // an empty range guards nothing, and the engine is not asked to
-  CHECK(commit_after(f, guard_whole_table, {bytes("r")}, [] {}) == BC_COMMITTED);
-  CHECK(commit_after(f, guard_whole_table, {bytes("r")}, [&] { f.db->put({}, pk_of(9), bytes("new")); }) ==
-        BC_CONFLICT);
+  CHECK(commit_after(f, guard_whole_table, {std::int64_t{0}, std::int64_t{106}}, [] {}) == BC_COMMITTED);
+  CHECK(commit_after(f, guard_whole_table, {std::int64_t{0}, std::int64_t{107}},
+                     [&] { f.db->put({}, pk_of(9), bytes("new")); }) == BC_CONFLICT);
   bc_ctx_reset(f.cx);
+}
+
+TEST_CASE("plan API: bc_del_range's empty bounds are its table's start and end", "[sql][algebra]") {
+  Fixture f;
+  for (std::int64_t i = 1; i <= 5; ++i) {
+    REQUIRE(run(f, insert_t, {i, bytes("n"), i}) == BC_COMMITTED);
+  }
+  CHECK(run(f, del_open_lo, {std::int64_t{3}}) == BC_COMMITTED);  // [start, 3)
+  CHECK(value(f, count_all, {std::int64_t{100}}) == 3);
+  CHECK(count_entries(*f.db, bytecask::sql::kNsIndex, kIdx) == 3);
+  CHECK(run(f, del_open_hi, {std::int64_t{4}}) == BC_COMMITTED);  // [4, end)
+  CHECK(value(f, count_all, {std::int64_t{100}}) == 1);
+  CHECK(count_entries(*f.db, bytecask::sql::kNsIndex, kIdx) == 1);
+  Bytes out;
+  CHECK(f.db->get({}, pk_of(3), out));
+  REQUIRE(f.cat().table("t") != nullptr);  // the catalog sorts before the table
 }
 
 namespace {
 // Each row's primary key, rebuilt from its columns, equals its scan key; a
 // pinned view survives the cursor's step.
-void row_pk_matches_key(bc_ctx* cx) {
+void row_key_matches_key(bc_ctx* cx) {
   bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
   bool first = true;
   bc_view previous = bc_empty(cx);
   int64_t ok = 0;
   while (bc_scan_next(cx, c)) {
-    bc_view row = bc_scan_value(cx, c);
-    if (bc_bytes_eq(cx, bc_row_pk(cx, kTbl, row), bc_scan_key(cx, c))) {
+    bc_view row = bc_scan_row(cx, c);
+    if (bc_bytes_eq(cx, bc_row_key(cx, kTbl, row), bc_scan_key(cx, c))) {
       ok = bc_add(cx, ok, 1);
     }
     if (!first) {
-      ok = bc_add(cx, ok, bc_col_i64(cx, previous, kIdOff));  // pinned: still readable
+      ok = bc_add(cx, ok, bc_col_i64(cx, previous, kIdCol));  // pinned: still readable
     }
     previous = bc_pin(cx, row);
     first = false;
   }
   bc_emit_count(cx, ok);
 }
-void row_pk_wrong_table(bc_ctx* cx) {
+void row_key_wrong_table(bc_ctx* cx) {
   bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
-  while (bc_scan_next(cx, c)) bc_row_pk(cx, kIdx, bc_scan_value(cx, c));
+  while (bc_scan_next(cx, c)) bc_row_key(cx, kIdx, bc_scan_row(cx, c));
 }
+void row_begin_index(bc_ctx* cx) { (void)bc_row_begin(cx, kIdx); }
 void emit_without_types(bc_ctx* cx) {
   bc_emit_begin(cx);
   bc_emit_i64(cx, 1);
@@ -648,44 +646,65 @@ void emit_too_few(bc_ctx* cx) {
   bc_emit_begin(cx);
   bc_emit_end(cx);
 }
+void emit_begun_twice(bc_ctx* cx) {
+  bc_emit_begin(cx);
+  bc_emit_begin(cx);
+}
+void emit_not_ended(bc_ctx* cx) {
+  bc_emit_begin(cx);
+  bc_emit_i64(cx, 1);
+}
 void key_too_long(bc_ctx* cx) {
   bc_key ib = bc_key_begin(cx, kIdx);
   bc_key_bytes(cx, ib, bc_param_bytes(cx, 0));
   bc_key_end(cx, ib);
 }
 void set_wrong_type(bc_ctx* cx) {
-  bc_row rb = bc_row_begin(cx, kLay);
+  bc_row rb = bc_row_begin(cx, kTbl);
   bc_row_set_f64(cx, rb, kIdCol, 1.0);
 }
 }  // namespace
 
-TEST_CASE("plan API: bc_row_pk rebuilds the scan key and bc_pin outlives the step", "[sql][algebra]") {
+TEST_CASE("plan API: bc_row_key rebuilds the scan key and bc_pin outlives the step", "[sql][algebra]") {
   Fixture f;
   seed_t(f);
-  CHECK(value(f, row_pk_matches_key, {}) == 3 + 1 + 2);  // three matches, then ids 1 and 2 read after the step
-  CHECK(run(f, row_pk_wrong_table, {}) == BC_FAILED);
+  CHECK(value(f, row_key_matches_key, {}) == 3 + 1 + 2);  // three matches, then ids 1 and 2 read after the step
+  // An index is not a table: naming one where a table goes is a plan bug,
+  // BC_E_HANDLE, as for any object named wrongly.
+  CHECK(run(f, row_key_wrong_table, {}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  CHECK(run(f, row_begin_index, {}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
 }
 
 TEST_CASE("plan API: result rows follow the schema ref's types; limits and types are checked", "[sql][algebra]") {
   Fixture f;
   auto ps = params({});
+  // A plan runs against a reference: none at all is a plan bug.
   bc_ctx_begin(f.cx, &ps, {});
   bc_ctx_run(f.cx, emit_without_types, nullptr);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  bc_ctx_reset(f.cx);
+  // One that declares no result types: the plan emits against nothing.
+  CHECK(run(f, emit_without_types, {}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
-  CHECK(run(f, emit_wrong_type, {}, kI64Row) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
-  CHECK(run(f, emit_too_few, {}, kI64Row) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
+  // Every result-row misuse is the plan's: BC_L_PLAN, not a row error.
+  for (auto* plan : {emit_wrong_type, emit_too_few, emit_begun_twice, emit_not_ended}) {
+    CHECK(run(f, plan, {}, kI64Row) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+    CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
+  }
   CHECK(run(f, key_too_long, {Bytes(70000, std::byte{'k'})}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LIMIT);
   CHECK(run(f, key_too_long, {Bytes(1000, std::byte{'k'})}) == BC_COMMITTED);
-  CHECK(run(f, set_wrong_type, {}) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(run(f, set_wrong_type, {}) == BC_FAILED);  // naming a column wrongly is a plan bug
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
   const std::uint8_t bad_code[] = {9};
-  bc_schema_ref ref{f.cat().version(), nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, bad_code, 1};
+  bc_schema_ref ref{f.cat().version(), nullptr, 0, nullptr, 0, nullptr, 0, bad_code, 1};
   CHECK(bc_execute(f.cx, emit_without_types, &ref, &ps, {}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
 }
 
 namespace {
@@ -701,7 +720,7 @@ void read_qty(bc_ctx* cx) {
   if (bc_col_null(cx, row, kQtyCol)) {
     bc_emit_count(cx, -2);
   } else {
-    bc_emit_count(cx, bc_col_i64(cx, row, kIdOff));
+    bc_emit_count(cx, bc_col_i64(cx, row, kIdCol));
   }
 }
 void slot_of_row(bc_ctx* cx) {
@@ -709,7 +728,7 @@ void slot_of_row(bc_ctx* cx) {
   bc_key_i64(cx, kb, bc_param_i64(cx, 0));
   bool found = false;
   bc_view row = bc_get(cx, bc_key_end(cx, kb), &found);
-  bc_col_bytes(cx, row, kNameSlotForTest);
+  bc_col_bytes(cx, row, kNameCol);
 }
 void null_of_empty(bc_ctx* cx) { bc_col_null(cx, bc_empty(cx), kQtyCol); }
 }  // namespace
@@ -746,19 +765,19 @@ TEST_CASE("plan API: a stored row that does not parse is BC_E_CORRUPT, never NUL
 }
 
 namespace {
-void row_pk_of_get(bc_ctx* cx) {
+void row_key_of_get(bc_ctx* cx) {
   bc_key kb = bc_key_begin(cx, kTbl);
   bc_key_i64(cx, kb, bc_param_i64(cx, 0));
   bool found = false;
   bc_view row = bc_get(cx, bc_key_end(cx, kb), &found);
-  bc_row_pk(cx, kTbl, row);
+  bc_row_key(cx, kTbl, row);
 }
 void row_from_get(bc_ctx* cx) {
   bc_key kb = bc_key_begin(cx, kTbl);
   bc_key_i64(cx, kb, bc_param_i64(cx, 0));
   bool found = false;
   bc_view row = bc_get(cx, bc_key_end(cx, kb), &found);
-  bc_row_from(cx, kLay, row);
+  bc_row_from(cx, kTbl, row);
 }
 // One read, then per scan step one unit and two counts of two units: the
 // total moves 1, 6, 11, ... and first lands on a multiple of 64 at 256.
@@ -775,7 +794,7 @@ void step_by_five(bc_ctx* cx) {
 }
 }  // namespace
 
-TEST_CASE("plan API: bc_row_pk and bc_row_from report a damaged row as BC_E_CORRUPT", "[sql][algebra]") {
+TEST_CASE("plan API: bc_row_key and bc_row_from report a damaged row as BC_E_CORRUPT", "[sql][algebra]") {
   Fixture f;
   seed_t(f);
   Bytes key;
@@ -786,7 +805,7 @@ TEST_CASE("plan API: bc_row_pk and bc_row_from report a damaged row as BC_E_CORR
   auto bad = good;
   bad.push_back(std::byte{0});  // row_bytes no longer matches the length
   f.db->put({}, key, bad);
-  CHECK(run(f, row_pk_of_get, {std::int64_t{1}}) == BC_FAILED);
+  CHECK(run(f, row_key_of_get, {std::int64_t{1}}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_CORRUPT);
   CHECK(run(f, row_from_get, {std::int64_t{1}}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_CORRUPT);
@@ -805,7 +824,9 @@ TEST_CASE("plan API: a charge of several units does not step over the deadline c
   for (std::int64_t i = 1; i <= 30; ++i) REQUIRE(run(f, insert_t, {i, bytes("n"), i}) == BC_COMMITTED);
   auto ps = params({});
   // No read budget, and a deadline long past: the first check must fail.
-  CHECK(bc_execute(f.cx, step_by_five, nullptr, &ps, {.max_reads = 0, .deadline_ns = 1}, false, 0) == BC_FAILED);
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+  auto ref = sr.get();
+  CHECK(bc_execute(f.cx, step_by_five, &ref, &ps, {.max_reads = 0, .deadline_ns = 1}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_BUDGET);
   CHECK(std::string{bc_error_message(f.cx)}.find("deadline") != std::string::npos);
 }
@@ -813,22 +834,27 @@ TEST_CASE("plan API: a charge of several units does not step over the deadline c
 TEST_CASE("plan API: a second commit and a too-wide result are plan errors, not UB or corruption", "[sql][algebra]") {
   Fixture f;
   auto ps = params({std::int64_t{1}, bytes("a"), std::int64_t{5}});
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+  auto tref = sr.get();
   bc_ctx_begin(f.cx, &ps, {});
-  bc_ctx_run(f.cx, insert_t, nullptr);
+  bc_ctx_run(f.cx, insert_t, &tref);
   CHECK(bc_ctx_commit(f.cx, false) == BC_COMMITTED);
   CHECK(bc_ctx_commit(f.cx, false) == BC_COMMITTED);  // nothing left to submit
   bc_ctx_reset(f.cx);
-  bc_ctx_begin(f.cx, &ps, {});
-  bc_ctx_run(f.cx, insert_t, nullptr);
+  auto ps2 = params({std::int64_t{2}, bytes("b"), std::int64_t{6}});
+  bc_ctx_begin(f.cx, &ps2, {});
+  bc_ctx_run(f.cx, insert_t, &tref);
+  REQUIRE(bc_error(f.cx) == BC_OK);
   bc_ctx_reset(f.cx);  // drops the snapshot and the write plan
   CHECK(bc_ctx_commit(f.cx, false) == BC_COMMITTED);  // reset dropped the effects too
 
   std::vector<std::uint8_t> wide(9000, BC_T_I64);
-  bc_schema_ref ref{f.cat().version(), nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, wide.data(),
+  bc_schema_ref ref{f.cat().version(), nullptr, 0, nullptr, 0, nullptr, 0, wide.data(),
                     static_cast<std::uint32_t>(wide.size())};
   auto none = params({});
   CHECK(bc_execute(f.cx, scan_all_forward, &ref, &none, {}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
 }
 
 TEST_CASE("plan API: a commit refused because the engine is a follower is BC_E_DEGRADED, not corruption", "[sql][algebra]") {

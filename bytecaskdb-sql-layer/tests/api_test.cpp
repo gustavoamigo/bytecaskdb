@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -103,19 +104,86 @@ TEST_CASE("embedded API: the seven statements, then a fresh open", "[sql][api]")
   CHECK_THROWS_AS(db->execute(kCreateTable), std::invalid_argument);  // the table survived the reopen
 }
 
-TEST_CASE("embedded API: a cached plan is recompiled after DDL", "[sql][api]") {
+TEST_CASE("embedded API: a cached write plan maintains an index created after it", "[sql][api]") {
   sql_test::TempDir dir{"api_ddl"};
   auto db = Database::open(dir.path());
   (void)db->execute(kCreateTable);
   const auto& insert = db->prepare(kInsert);
-  CHECK(insert.plan_source().find("IDX_3") == std::string::npos);
   (void)db->execute(insert, {i(1), bytes("apple"), i(10)});
-  // The index is created after the plan: the INSERT must now maintain it.
+  auto compiled = db->compilations();
+  // The index is created after the plan, which names no index: the runtime
+  // writes the entry, and the plan is not recompiled.
   (void)db->execute(kCreateIndex);
   (void)db->execute(insert, {i(2), bytes("apple"), i(20)});
-  CHECK(insert.plan_source().find("IDX_3") != std::string::npos);
-  // Row 1 was backfilled by CREATE INDEX, row 2 by the recompiled INSERT.
+  CHECK(db->compilations() == compiled);
+  CHECK(insert.plan_source().find("IDX_") == std::string::npos);
+  // Row 1 was backfilled by CREATE INDEX, row 2 by the cached INSERT.
   CHECK(ids(db->execute(kByName, {bytes("apple"), bytes("apple\x01")})) == std::vector<std::int64_t>{1, 2});
+}
+
+TEST_CASE("embedded API: a plan the catalog refuses is recompiled and run again", "[sql][api][catalog]") {
+  sql_test::TempDir dir{"api_recompile"};
+  auto db = Database::open(dir.path());
+  (void)db->execute(kCreateTable);
+  (void)db->execute(kCreateIndex);
+  const auto& insert = db->prepare(kInsert);
+  const auto& by_id = db->prepare(kById);
+  const auto& by_name = db->prepare(kByName);
+  (void)db->execute(insert, {i(1), bytes("apple"), i(10)});
+  CHECK(db->execute(by_id, {i(1)}).rows == Grid{{i(1), i(10)}});
+  auto compiled = db->compilations();
+
+  // The table is dropped and created again: new ids, so every cached plan is
+  // refused by bc_ctx_run, recompiled from its text, and runs on the new table.
+  (void)db->execute("DROP TABLE t");
+  (void)db->execute(kCreateTable);
+  (void)db->execute(kCreateIndex);
+  CHECK(db->execute(insert, {i(2), bytes("banana"), i(20)}).affected == 1);
+  CHECK(db->execute(by_id, {i(2)}).rows == Grid{{i(2), i(20)}});
+  CHECK(db->execute(by_id, {i(1)}).rows.empty());
+  CHECK(ids(db->execute(by_name, {bytes("a"), bytes("c")})) == std::vector<std::int64_t>{2});
+  CHECK(db->compilations() == compiled + 3);
+  // Once recompiled they run without another compile.
+  CHECK(db->execute(insert, {i(3), bytes("cherry"), i(30)}).affected == 1);
+  CHECK(db->compilations() == compiled + 3);
+  // Parameters a plan the catalog still accepts does not take are refused
+  // without a compile, however often they are sent: the runtime says the
+  // plan fits (bc_ctx_check).
+  for (int k = 0; k < 3; ++k) {
+    CHECK_THROWS_AS(db->execute(insert, {i(9), bytes("x"), bytes("y")}), std::invalid_argument);
+  }
+  CHECK(db->compilations() == compiled + 3);
+  // A DDL that leaves the plan compatible moves the version: the runtime is
+  // asked, says the plan fits, and the parameters are refused uncompiled.
+  (void)db->execute("CREATE TABLE elsewhere (k BIGINT PRIMARY KEY)");
+  CHECK_THROWS_AS(db->execute(insert, {i(9), bytes("x"), bytes("y")}), std::invalid_argument);
+  CHECK(db->compilations() == compiled + 3);
+  CHECK(db->execute(insert, {i(9), bytes("x"), i(90)}).affected == 1);
+  CHECK(db->compilations() == compiled + 3);
+
+  // The parameters are checked against the recompiled plan: qty is now
+  // bytes. Parameters of the new types are taken at once, though the stale
+  // plan would have refused them; old-typed ones are refused before the run.
+  (void)db->execute("DROP TABLE t");
+  (void)db->execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name BYTEA, qty BYTEA)");
+  CHECK(db->execute(insert, {i(4), bytes("date"), bytes("forty")}).affected == 1);
+  CHECK_THROWS_AS(db->execute(insert, {i(5), bytes("elder"), i(50)}), std::invalid_argument);
+  (void)db->execute("DROP TABLE t");
+  (void)db->execute(kCreateTable);
+  CHECK_THROWS_AS(db->execute(insert, {i(6), bytes("fig"), bytes("sixty")}), std::invalid_argument);
+  CHECK(db->execute(insert, {i(6), bytes("fig"), i(60)}).affected == 1);
+  CHECK(db->execute(by_id, {i(6)}).rows == Grid{{i(6), i(60)}});
+}
+
+TEST_CASE("embedded API: a DOUBLE read through an index keeps -0.0", "[sql][api]") {
+  sql_test::TempDir dir{"api_negzero"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE dd (id BIGINT PRIMARY KEY, d DOUBLE PRECISION)");
+  (void)db->execute("CREATE INDEX dd_d ON dd (d)");
+  (void)db->execute("INSERT INTO dd VALUES ($1, $2)", {i(1), Value{-0.0}});
+  auto rows = db->execute("SELECT d FROM dd WHERE d >= $1", {Value{-1.0}}).rows;
+  REQUIRE(rows.size() == 1);
+  CHECK(std::signbit(std::get<double>(rows[0][0])));
 }
 
 TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[sql][api][catalog]") {
@@ -143,17 +211,17 @@ TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[
   CHECK(db->execute("SELECT id, tag FROM t WHERE id = $1", {i(2)}).rows == Grid{{i(2), i(5)}});
   compiled = db->compilations();
 
-  // CREATE INDEX recompiles the table's write plans and no read plan.
+  // CREATE INDEX recompiles nothing: the write plans maintain it.
   (void)db->execute("CREATE INDEX t_by_qty ON t (qty)");
   (void)db->execute(by_id, {i(1)});
   (void)db->execute(by_name, {bytes("a"), bytes("b")});
-  CHECK(db->compilations() == compiled);
   CHECK(db->execute(insert, {i(3), bytes("cherry"), i(30)}).affected == 1);
-  CHECK(db->compilations() == compiled + 1);
+  CHECK(db->compilations() == compiled);
   CHECK(ids(db->execute("SELECT id FROM t WHERE qty >= $1", {i(15)})) == std::vector<std::int64_t>{2, 3});
+  compiled = db->compilations();
 
-  // DROP INDEX recompiles the plans that scan it, which then have no plan, and
-  // the table's write plans.
+  // DROP INDEX recompiles the plans that scan it, which then have no plan;
+  // the write plans keep running, uncompiled.
   (void)db->execute("DROP INDEX t_by_name");
   CHECK_THROWS_AS(db->execute(by_name, {bytes("a"), bytes("b")}), ast::SqlError);
   // A failed recompile keeps the statement's old plan whole and still
@@ -163,6 +231,7 @@ TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[
   CHECK(by_name.plan_source().find("IDX_3") != std::string::npos);
   CHECK(db->execute(insert, {i(4), bytes("date"), i(40)}).affected == 1);
   CHECK(db->execute(by_id, {i(4)}).rows == Grid{{i(4), i(40)}});
+  CHECK(db->compilations() == compiled);
 
   // DROP TABLE: every plan on it is refused at recompile.
   (void)db->execute("DROP TABLE t");

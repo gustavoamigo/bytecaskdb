@@ -110,7 +110,8 @@ public:
   [[nodiscard]] auto set_bool(std::uint32_t col_id, bool v) -> bool;
   [[nodiscard]] auto set_bytes(std::uint32_t col_id, BytesView v) -> bool;
   [[nodiscard]] auto set_null(std::uint32_t col_id) -> bool;
-  [[nodiscard]] auto missing_required() const -> bool;  // a non-nullable column is null
+  // The id of a non-nullable column that is null, if there is one.
+  [[nodiscard]] auto missing_required() const -> std::optional<std::uint32_t>;
   // Appends the row to out; false, and nothing appended, if it exceeds
   // max_bytes or the layout is not valid.
   [[nodiscard]] auto finish(Bytes& out, std::size_t max_bytes = kMaxRowBytes) const -> bool;
@@ -145,5 +146,9 @@ private:
 [[nodiscard]] auto row_bytes(BytesView row, std::uint32_t slot) -> std::optional<BytesView>;
 // Whether a column of a layout is null in `row`: its present bit is clear.
 [[nodiscard]] auto row_is_null(BytesView row, const ColumnSlot& col) -> bool;
+// Whether a column holds the same encoding in two rows of one layout: null
+// in both, or the same word or bytes. Equal values with different encodings
+// (-0.0 and 0.0) compare unequal. nullopt for a malformed row.
+[[nodiscard]] auto row_column_equal(BytesView a, BytesView b, const ColumnSlot& col) -> std::optional<bool>;
 
 }  // namespace bytecask::sql

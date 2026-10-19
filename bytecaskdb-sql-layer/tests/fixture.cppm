@@ -7,6 +7,7 @@
 //   CREATE INDEX t_by_name ON t (name);
 
 module;
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -104,18 +105,63 @@ inline auto type_codes(std::span<const bytecask::sql::PhysType> types) -> std::v
 
 inline auto params(std::vector<bc_value> v) -> bc_params { return bc_params{std::move(v)}; }
 
+// Every column of every table, as a bc_schema_ref declares them: what a
+// hand-written test plan may read or set.
+inline auto all_cols(const bytecask::sql::Catalog& cat) -> std::vector<bc_col_ref> {
+  std::vector<bc_col_ref> out;
+  for (const auto& [id, t] : cat.tables()) {
+    for (const auto& c : t.columns) out.push_back({id, c.id, static_cast<std::uint8_t>(c.type)});
+  }
+  return out;
+}
+
+// The columns of one table, as a bc_schema_ref declares them.
+inline auto table_cols(const bytecask::sql::Catalog& cat, std::uint32_t table) -> std::vector<bc_col_ref> {
+  std::vector<bc_col_ref> out;
+  for (const auto& c : cat.table(table)->columns) out.push_back({table, c.id, static_cast<std::uint8_t>(c.type)});
+  return out;
+}
+
+// Every table and index, and every table: what a hand-written test plan may
+// name and write.
+inline auto all_objects(const bytecask::sql::Catalog& cat) -> std::vector<std::uint32_t> {
+  std::vector<std::uint32_t> out;
+  for (const auto& [id, t] : cat.tables()) {
+    out.push_back(id);
+    for (const auto& ix : t.indexes) out.push_back(ix.id);
+  }
+  return out;
+}
+inline auto all_tables(const bytecask::sql::Catalog& cat) -> std::vector<std::uint32_t> {
+  std::vector<std::uint32_t> out;
+  for (const auto& [id, t] : cat.tables()) out.push_back(id);
+  return out;
+}
+
 // A bc_schema_ref and the arrays it points into.
 struct SchemaRef {
-  std::vector<std::uint32_t> read, written, indexes;
+  std::vector<std::uint32_t> read, written;
   std::vector<bc_col_ref> cols;
   std::vector<std::uint8_t> codes;
   std::uint64_t version{0};
 
   [[nodiscard]] auto get() const -> bc_schema_ref {
     auto n = [](const auto& v) { return static_cast<std::uint32_t>(v.size()); };
-    return {version, read.data(), n(read), written.data(), n(written), indexes.data(), n(indexes),
+    return {version, read.data(), n(read), written.data(), n(written),
             cols.data(), n(cols), codes.data(), n(codes)};
   }
 };
+
+// Counts the live entries of a table or an index, straight from the engine.
+inline auto count_entries(bytecask::DB& db, std::uint8_t ns, std::uint32_t id) -> int {
+  bytecask::sql::Bytes prefix;
+  bytecask::sql::key_put_prefix(prefix, ns, id);
+  auto n = 0;
+  for (const auto& k : db.keys_from({}, prefix)) {
+    if (k.size() < prefix.size() || !std::equal(prefix.begin(), prefix.end(), k.begin())) break;
+    ++n;
+  }
+  return n;
+}
 
 }  // namespace sql_test

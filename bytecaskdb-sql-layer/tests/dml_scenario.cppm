@@ -49,7 +49,7 @@ struct PlanRunner {
   auto exec(bc_plan_fn plan, std::vector<bc_value> p, std::span<const PhysType> result = {}) -> int {
     auto ps = params(std::move(p));
     // What every plan of the scenario reads and writes: t and t_by_name.
-    SchemaRef ref{{kTbl, kIdx}, {kTbl}, {kIdx}, {}, type_codes(result), f.cat().version()};
+    SchemaRef ref{{kTbl, kIdx}, {kTbl}, all_cols(f.cat()), type_codes(result), f.cat().version()};
     auto r = ref.get();
     return bc_execute(f.cx, plan, &r, &ps, {}, false, 3);
   }
@@ -74,19 +74,6 @@ struct PlanRunner {
 };
 
 inline const bc_value kNull = std::monostate{};
-
-// Counts the live entries of a table or an index, straight from the engine.
-inline auto count_entries(bytecask::DB& db, std::uint8_t ns, std::uint32_t id) -> int {
-  bytecask::sql::Bytes prefix;
-  bytecask::sql::key_put_prefix(prefix, ns, id);
-  auto n = 0;
-  for (const auto& k : db.keys_from({}, prefix)) {
-    if (k.size() < prefix.size() || !std::equal(prefix.begin(), prefix.end(), k.begin())) break;
-    ++n;
-  }
-  return n;
-}
-
 
 // Every row and count the plans produce, from an empty table t.
 inline void run_dml_scenario(Fixture& f, PlanSet plans) {

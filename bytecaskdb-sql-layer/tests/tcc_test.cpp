@@ -70,8 +70,8 @@ TEST_CASE("tcc: a unique insert raced by another commit conflicts, and its retry
   constexpr std::string_view kSql = "INSERT INTO c VALUES ($1, $2)";
   auto gen = generate_plan(bound::bind(ast::parse(kSql), f.cat()), f.cat(), kSql);
   auto code = TccPlan::compile(gen.source);
-  sql_test::SchemaRef sr{gen.objects_read, gen.tables_written, gen.indexes_written, {}, {}, gen.catalog_version};
-  for (const auto& c : gen.columns) sr.cols.push_back({c.layout, c.col, c.pos, static_cast<std::uint8_t>(c.type)});
+  sql_test::SchemaRef sr{gen.objects_read, gen.tables_written, {}, {}, gen.catalog_version};
+  for (const auto& c : gen.columns) sr.cols.push_back({c.table, c.col, static_cast<std::uint8_t>(c.type)});
   auto ref = sr.get();
 
   // A runs on a snapshot without "a"; B inserts "a" under another key and

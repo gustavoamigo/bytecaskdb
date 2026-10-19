@@ -7,7 +7,7 @@ Status: design, decided (#489); implemented in
 it is stored under namespace `0x01`, the in-memory form plans resolve
 against and how readers share it, what makes a compiled plan compatible
 with the live catalog, and how each DDL statement of stage 1 writes. It
-agrees with `docs/plan_api_design.md` (revision 4, which this work makes)
+agrees with `docs/plan_api_design.md` (revision 5; revision 4 came with it)
 and `docs/sql_layer_types_design.md`; nothing in the engine changes.
 
 The catalog is shared with the MariaDB plugin when the plugin adopts the
@@ -20,7 +20,7 @@ GPL-2.0, and nothing of it is copied.
 | Field | Meaning |
 |---|---|
 | `id` | Permanent object id, from the one counter below. Never reused. |
-| `name` | As the parser hands it over: an unquoted identifier folded to lower case by PostgreSQL's rules, a quoted one exactly as written, so `"Foo"` and `foo` are two tables. Plans never paste a name into C: their constants are named from ids (`TBL_1`, `LAY_2`, `IDX_3`, `COL_1_2_OFF`, `COL_1_2_COL`), so a name need not be an identifier and two objects' constants cannot collide. The plan's header lists what each constant stands for, in `//` lines whose user bytes outside printable ASCII, `\` and `?` are `\xNN` escapes. |
+| `name` | As the parser hands it over: an unquoted identifier folded to lower case by PostgreSQL's rules, a quoted one exactly as written, so `"Foo"` and `foo` are two tables. Plans never paste a name into C: their constants are named from ids (`TBL_1`, `IDX_3`, `COL_1_2`, `PART_3_0`), so a name need not be an identifier and two objects' constants cannot collide. The plan's header lists what each constant stands for, in `//` lines whose user bytes outside printable ASCII, `\` and `?` are `\xNN` escapes. |
 | `version` | Per-table counter, bumped by every DDL on the table. Not checked by plans (see *Compatibility*); kept for stage 2. |
 | `next_col_id` | The next column id. Column ids are permanent and never reused, even after a column is dropped. |
 | columns | Each: permanent `id`, `name`, SQL type (kind, `VARCHAR` length, `DECIMAL` precision and scale), nullability, default. The physical type follows from the SQL type (`docs/sql_layer_types_design.md`, *Stage-1 types*). |
@@ -126,34 +126,29 @@ A unique index has the same entries as any other: the index parts, then the
 primary key. Two rows with a null in a unique part therefore never collide,
 which is the null semantics the types document fixes. A duplicate is a
 second entry under the same index-part prefix, so the check is a prefix,
-not a key:
+not a key. The runtime makes it inside `bc_insert` and `bc_update`
+(`docs/plan_api_design.md`, *Writes*), in three steps:
 
-```c
-bc_key ku = bc_key_begin(cx, IDX_U);           /* the index parts only */
-...
-bc_view u = bc_key_end(cx, ku);
-bc_cursor uc = bc_scan_open(cx, IDX_U, u, u, BC_SCAN_PREFIX);
-if (bc_scan_next(cx, uc)) {                    /* one record read */
-  bc_raise(cx, BC_C_UNIQUE, IDX_U);
-  return;
-}
-bc_guard_range(cx, IDX_U, u, bc_key_successor(cx, u));   /* the race */
-```
+1. **Probe the snapshot.** The first entry at or after the new entry's
+   index-part prefix is read; if it has the prefix, the row is a duplicate.
+   One record read, charged to the plan's budget.
+2. **Raise.** A duplicate is `BC_E_CONSTRAINT` with `BC_C_UNIQUE` and the
+   index id, which the runtime never retries.
+3. **Guard the race.** Otherwise an `ensure_range_unchanged` over the prefix
+   and its successor goes into the write plan, so the engine refuses the
+   commit if any entry under the prefix changed since the snapshot.
 
-This is the plan API's `bc_exists` → `bc_raise` → `bc_guard_absent`
-pattern with the key replaced by its prefix: `bc_exists` and
-`bc_guard_absent` name one key, and an entry under the prefix has the other
-row's primary key after it, so neither could see it. The scan costs the one
-record read `bc_exists` would; the range guard makes the engine refuse the
-commit if any entry under the prefix changed since the snapshot. The plan
-skips both when any part of the new entry is null. The primary key keeps
-`bc_exists` and `bc_guard_absent`. An `UPDATE` that changes a unique
-index's columns checks the new prefix the same way, only when it differs
-from the old one, so a row never collides with itself. The plugin checks
-its unique indexes by the same prefix scan.
+Point existence and `ensure_absent` name one key, and an entry under the
+prefix has the other row's primary key after it, so neither could see it.
+The check is skipped when any part of the new entry is null. The primary
+key is checked by existence; its race needs no guard, since the key is in
+the write plan and the engine checks every written key for a change since
+the snapshot. An `UPDATE` checks a unique index only when the row's prefix
+changed, so a row never collides with itself. The plugin checks its unique
+indexes by the same prefix scan.
 
 Keeping one entry shape, rather than storing a unique index as its parts
-with the primary key in the value, keeps `bc_scan_pk`, the covering reads
+with the primary key in the value, keeps `bc_scan_row`, the covering reads
 and `DESC` the same for every index, and needs no second shape for the
 entries whose parts are null.
 
@@ -161,7 +156,7 @@ entries whose parts are null.
 
 `Catalog` is immutable: the tables by id and by name, each index's table,
 the key layout of every table and index (the parts `bc_key_*` and the scans
-read, `DESC` included), and each layout id's table. It is built at open by
+read, `DESC` included). It is built at open by
 reading every record under `01 02` and the counters, and by every DDL from
 the catalog before it. Lookups are `const` and allocate nothing.
 
@@ -194,9 +189,11 @@ Two rules make a pinned version agree with the engine:
    whose rows or index entries the write plan touches, found from the keys
    themselves. A DDL on that table committed after the plan's snapshot
    changes the record, the commit is a conflict, and `bc_execute` retries on
-   a fresh pin, where the compatibility check sends an incompatible plan back
-   to be recompiled. One record read per table written, the price of never
-   committing rows shaped by a catalog the engine has moved past.
+   a fresh pin, where the runtime writes the index entries the new version
+   has and the compatibility check sends an incompatible plan back to be
+   recompiled. One record read per table written, the price of never
+   committing rows, or index entries, shaped by a catalog the engine has
+   moved past.
 
 DDL statements are serialized by a mutex in `LiveCatalog`, held from the
 prepare to the publication, so a DDL never conflicts with another of the
@@ -208,31 +205,32 @@ never hands out an id twice.
 ## Compatibility
 
 `bc_schema_ref` lists what a plan depends on, and `bc_ctx_run` checks it
-against the pinned version, in full on every execution. (The embedded API
-asks the same question of a cached plan only when the catalog version has
-moved since it compiled it.) A plan is compatible when:
+against the pinned version on every execution (`docs/plan_api_design.md`,
+*Runtime*, states the cost). A plan is compatible when:
 
-- **every table and index it reads exists.** Ids are never reused, and a
+- **every table and index it names exists.** Ids are never reused, and a
   table's primary key and an index's parts never change, so existence is
   the same key layout;
-- **every column it reads or sets is in the current layout of its table**,
-  at the offset or slot and with the type the plan was compiled with. A
-  column's position and type never change within a generation, so this
-  fails only for a dropped column or a new generation;
-- **every table it writes exists, and the indexes it maintains are exactly
-  that table's indexes**: none dropped, none added.
+- **every column it reads or sets exists in its table, with the type the
+  plan was compiled with.** A column is named by its permanent id and the
+  runtime finds its position, so neither a new column nor a new layout
+  generation moves it; this fails only for a dropped column;
+- **every table it writes exists.** The plan does not name the table's
+  indexes: the runtime writes the entries of every index the pinned version
+  has.
 
 So adding a column invalidates nothing: no plan names the new column, and
 rows that plans compiled before it write get its default from
 `bc_row_begin`. The binder keeps that true for statement text too: an
 `INSERT` without a column list fills the leading columns and gives the rest
 their defaults, as PostgreSQL does, so the same text binds the same way
-before and after the column is added. Adding an index invalidates the write plans of its table,
-which must maintain it, and no read plan. Dropping an index invalidates the
-plans that scan it and the write plans of its table. Dropping a table
-invalidates every plan on it, and recompiling one fails at bind. An
-incompatible plan is `BC_E_LAYOUT` and does not run; the embedded API
-recompiles it from its text and runs it again.
+before and after the column is added. Adding an index invalidates nothing
+either: a write plan compiled before it maintains it, and a read plan does
+not use it until it is recompiled for another reason. Dropping an index
+invalidates the plans that scan it. Dropping a table invalidates every plan
+on it, and recompiling one fails at bind. An incompatible plan is
+`BC_E_LAYOUT` and does not run; the embedded API recompiles it from its
+text and runs it again.
 
 ## DDL
 
@@ -310,11 +308,14 @@ no key under the table's or index's prefix; the name entries and the
 records agree; a reader pinned while a DDL is held mid-commit returns at once
 on the old version; concurrent DDL each get the version they published; a backfill raced by a write, and a DDL raced by another
 catalog's, are conflicts. `tests/plan_api_test.cpp`: each compatibility
-rule, and a write committed across a DDL on its table is a conflict.
-`tests/api_test.cpp`: through SQL, `ADD COLUMN` keeps every cached plan,
-`CREATE INDEX` recompiles the write plans and no read plan, a drop
-refuses at recompile; unique indexes and ranges on `DESC` parts, nullable
-and not. `tests/tcc_test.cpp`: a unique insert raced by another commit
-conflicts, and its retry raises the duplicate. `tests/tpcc_test.cpp`: the
+rule, `bc_ctx_check`, and a write committed across a DDL
+on its table is a conflict. `tests/plan_writes_test.cpp`: `bc_insert`,
+`bc_update`, `bc_delete` and `bc_del_range` keep every index exact,
+unique, `DESC` and nullable parts included, and an index created after a
+plan was compiled is maintained by it. `tests/api_test.cpp`: through SQL,
+`ADD COLUMN` and `CREATE INDEX` keep every cached plan, a drop refuses at
+recompile; unique indexes and ranges on `DESC` parts, nullable and not.
+`tests/tcc_test.cpp`: a unique insert raced by another commit conflicts,
+and its retry raises the duplicate. `tests/tpcc_test.cpp`: the
 nine TPROC-C tables and their indexes, created by SQL DDL, reopened and
 checked.

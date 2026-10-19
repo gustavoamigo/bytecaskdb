@@ -1,14 +1,14 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 3). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 5). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
    (algebra/runtime.cppm, module bytecask.sql.runtime).
 
    Implemented: the runtime, parameters and results, arithmetic, keys, reads,
-   rows and columns, effects. The ephemeral structures (sorters, hash tables,
+   rows and columns, writes, guards. The ephemeral structures (sorters, hash tables,
    aggregates) are not implemented yet: each of their calls sets BC_E_HANDLE
    and returns a neutral value. */
 
@@ -44,9 +44,11 @@ enum bc_error_code {
   BC_E_MEMORY,      /* arena exhausted or an ephemeral bound exceeded */
   BC_E_BUDGET,      /* work budget or deadline exhausted */
   BC_E_LIMIT,       /* key or value over the engine's limits */
-  BC_E_HANDLE,      /* stale, foreign or out-of-range handle, or a bad column offset */
+  BC_E_HANDLE,      /* stale, foreign or out-of-range handle, or a table, index or column the plan's
+                       bc_schema_ref does not declare, or not of the type used: a plan bug */
   BC_E_ARITH,       /* integer overflow, division by zero, out-of-range conversion */
-  BC_E_CONSTRAINT,  /* raised by the plan with bc_raise: unique, not-null, check; never retried */
+  BC_E_CONSTRAINT,  /* never retried; raised by the runtime (BC_C_UNIQUE from bc_insert and bc_update,
+                       BC_C_NOT_NULL from the row builder) or by the plan with bc_raise */
   BC_E_LAYOUT,      /* plan incompatible with the live catalog, or a row violates its layout */
   BC_E_DEGRADED,    /* engine degraded; writes refused */
   BC_E_CLOSED,
@@ -69,6 +71,15 @@ enum bc_constraint {   /* the detail of BC_E_CONSTRAINT; the compiler emits the 
   BC_C_RANGE,          /* a value outside its declared type: INTEGER, VARCHAR(n), DECIMAL(p, s) */
 };
 
+enum bc_layout_detail {  /* the detail of BC_E_LAYOUT; every BC_E_LAYOUT carries one */
+  BC_L_ROW = 0,           /* a row written to a table it is not of, or a column its layout lacks */
+  BC_L_INCOMPATIBLE = 1,  /* bc_ctx_run refused the plan's bc_schema_ref: recompile it */
+  BC_L_PLAN = 2,          /* the plan or its bc_schema_ref is malformed, a compiler bug: an unknown result
+                             type, a result row too wide, result rows emitted out of order or off their
+                             declared types */
+  BC_L_RETIRED = 3,       /* a stored row of a layout generation REBUILD retired */
+};
+
 enum bc_commit_result { BC_COMMITTED, BC_CONFLICT, BC_FAILED /* see bc_error */ };
 
 typedef struct {
@@ -82,23 +93,22 @@ typedef struct bc_db bc_db;
 typedef struct bc_catalog bc_catalog;
 typedef struct bc_params bc_params;
 
-/* A column a plan reads or sets, as compiled: the table layout, the
-   permanent column id, its offset or slot, and its bc_type. */
+/* A column a plan reads or sets, as compiled: its table, its permanent
+   column id, and its bc_type. No position: the runtime finds that. */
 typedef struct {
-  uint32_t layout, col, pos;
+  uint32_t table, col;
   uint8_t type;
 } bc_col_ref;
 
 /* What a plan was compiled against, and the types of the rows it emits, in
-   emit order. bc_ctx_run checks everything but the version and the result
-   types against the catalog version the context pinned
-   (docs/sql_layer_catalog_design.md, *Compatibility*); the result layout is
-   the plan's own and is not a catalog object. */
+   emit order. bc_ctx_run checks the objects and columns against the catalog
+   version the context pinned (docs/sql_layer_catalog_design.md,
+   *Compatibility*) on every run; the result layout is the plan's own and
+   is not a catalog object. */
 typedef struct {
-  uint64_t catalog_version;                                       /* compiled against; a cache's cheap check */
-  const uint32_t   *objects_read;    uint32_t n_read;             /* tables and indexes it reads */
+  uint64_t catalog_version;                                       /* compiled against; for messages */
+  const uint32_t   *objects_read;    uint32_t n_read;             /* tables and indexes it names */
   const uint32_t   *tables_written;  uint32_t n_written;          /* tables whose rows it writes */
-  const uint32_t   *indexes_written; uint32_t n_indexes_written;  /* every index of those tables it maintains */
   const bc_col_ref *cols;            uint32_t n_cols;             /* every column it reads or sets */
   const uint8_t    *result_types;    uint32_t n_result;           /* bc_type codes */
 } bc_schema_ref;
@@ -110,13 +120,14 @@ bc_ctx *bc_ctx_new(bc_db *db, const bc_catalog *cat, uint32_t arena_bytes);
 void    bc_ctx_free(bc_ctx *);
 void    bc_ctx_begin(bc_ctx *, const bc_params *params, bc_budget budget);  /* takes the snapshot */
 void    bc_ctx_run(bc_ctx *, bc_plan_fn plan, const bc_schema_ref *compiled_against);
+bool    bc_ctx_check(bc_ctx *, const bc_schema_ref *compiled_against);      /* bc_ctx_run's verification alone */
 enum bc_commit_result bc_ctx_commit(bc_ctx *, bool sync);
 bool    bc_ctx_next_result(bc_ctx *, const uint8_t **row, uint32_t *len);     /* result rows, in emit order */
 void    bc_ctx_reset(bc_ctx *);                                               /* drops snapshot, plan, arena */
 enum bc_error_code bc_error(const bc_ctx *);
 const char *bc_error_message(const bc_ctx *);
-uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits */
-int64_t bc_ctx_affected(const bc_ctx *);                   /* what bc_emit_count recorded, or -1 */
+uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits; BC_E_LAYOUT: a bc_layout_detail */
+int64_t bc_ctx_affected(const bc_ctx *);                   /* what the last run's bc_emit_count recorded, or -1 */
 int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params *,
                    bc_budget, bool sync, uint32_t max_retries);               /* the retry loop */
 
@@ -133,6 +144,8 @@ void     bc_emit_f64(bc_ctx *, double);
 void     bc_emit_bool(bc_ctx *, bool);
 void     bc_emit_bytes(bc_ctx *, bc_view);
 void     bc_emit_null(bc_ctx *);
+void     bc_emit_col(bc_ctx *, bc_view row, uint32_t col);                /* the column, NULL as NULL */
+void     bc_emit_key_part(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);   /* not a DOUBLE part: BC_E_HANDLE */
 void     bc_emit_end(bc_ctx *);
 void     bc_emit_count(bc_ctx *, int64_t affected);   /* write statements: the row count */
 
@@ -156,50 +169,51 @@ void     bc_key_f64(bc_ctx *, bc_key, double);
 void     bc_key_bool(bc_ctx *, bc_key, bool);
 void     bc_key_bytes(bc_ctx *, bc_key, bc_view);
 void     bc_key_null(bc_ctx *, bc_key);
-void     bc_key_pk(bc_ctx *, bc_key, bc_view pk);     /* appends an already-encoded primary key */
+void     bc_key_param(bc_ctx *, bc_key, uint32_t i);  /* parameter i as the next part, NULL included */
 bc_view  bc_key_end(bc_ctx *, bc_key);
+bc_view  bc_key_params(bc_ctx *, uint32_t table_or_index, uint32_t first, uint32_t n);  /* parts from params first.. */
 bc_view  bc_key_successor(bc_ctx *, bc_view key);     /* smallest key greater than every key with this prefix */
 
 /* Reads */
 bc_view   bc_get(bc_ctx *, bc_view key, bool *found);
-bc_view   bc_lookup(bc_ctx *, uint32_t table, bc_view pk, bool *found);
 bool      bc_exists(bc_ctx *, bc_view key);
 
 bc_cursor bc_scan_open(bc_ctx *, uint32_t table_or_index, bc_view lo, bc_view hi, uint32_t flags);
 bool      bc_scan_next(bc_ctx *, bc_cursor);
 bc_view   bc_scan_key(bc_ctx *, bc_cursor);
-bc_view   bc_scan_value(bc_ctx *, bc_cursor);
-bc_view   bc_scan_pk(bc_ctx *, bc_cursor);
+bc_view   bc_scan_row(bc_ctx *, bc_cursor);                   /* the entry's row; on an index, fetched */
 void      bc_scan_close(bc_ctx *, bc_cursor);
-bc_view   bc_empty(bc_ctx *);                                 /* the empty view, for an open bound or an index entry's value */
+bc_view   bc_empty(bc_ctx *);                                 /* the empty view, for an open bound */
 
 /* Key-part decoders: read part `part` of an encoded key of `table_or_index`
    (index columns first, then the primary key's parts). What makes a
    covering index read possible: the columns an index key holds are read
    from bc_scan_key without fetching the row. */
 int64_t   bc_key_part_i64(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
-double    bc_key_part_f64(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
+double    bc_key_part_f64(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);  /* always BC_E_HANDLE: a DOUBLE part is canonicalised; read the row */
 bool      bc_key_part_bool(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
 bc_view   bc_key_part_bytes(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
 bool      bc_key_part_null(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);
 
 int64_t   bc_count_range(bc_ctx *, uint32_t table_or_index, bc_view lo, bc_view hi, int64_t limit);
 
-/* Rows and columns */
+/* Rows and columns. A column is named by its permanent id, and must be
+   declared in the plan's bc_schema_ref. */
 bool     bc_col_null(bc_ctx *, bc_view row, uint32_t col);   /* the bitmap bit: clear means null, or a column the row predates */
-int64_t  bc_col_i64(bc_ctx *, bc_view row, uint32_t off);
-double   bc_col_f64(bc_ctx *, bc_view row, uint32_t off);
-bool     bc_col_bool(bc_ctx *, bc_view row, uint32_t off);
-bc_view  bc_col_bytes(bc_ctx *, bc_view row, uint32_t slot); /* a sub-view; same lifetime as row */
-bc_view  bc_row_pk(bc_ctx *, uint32_t table, bc_view row);   /* the row's encoded primary key */
+int64_t  bc_col_i64(bc_ctx *, bc_view row, uint32_t col);
+double   bc_col_f64(bc_ctx *, bc_view row, uint32_t col);
+bool     bc_col_bool(bc_ctx *, bc_view row, uint32_t col);
+bc_view  bc_col_bytes(bc_ctx *, bc_view row, uint32_t col);  /* a sub-view; same lifetime as row */
+bc_view  bc_row_key(bc_ctx *, uint32_t table, bc_view row);  /* the row's primary key, from its columns */
 
-bc_row   bc_row_begin(bc_ctx *, uint32_t layout);
-bc_row   bc_row_from(bc_ctx *, uint32_t layout, bc_view old);  /* copy, then overwrite columns */
+bc_row   bc_row_begin(bc_ctx *, uint32_t table);
+bc_row   bc_row_from(bc_ctx *, uint32_t table, bc_view old);  /* copy, then overwrite columns */
 void     bc_row_set_i64(bc_ctx *, bc_row, uint32_t col, int64_t);
 void     bc_row_set_f64(bc_ctx *, bc_row, uint32_t col, double);
 void     bc_row_set_bool(bc_ctx *, bc_row, uint32_t col, bool);
 void     bc_row_set_bytes(bc_ctx *, bc_row, uint32_t col, bc_view);
 void     bc_row_set_null(bc_ctx *, bc_row, uint32_t col);
+void     bc_row_set_param(bc_ctx *, bc_row, uint32_t col, uint32_t i);   /* parameter i, NULL included */
 bc_view  bc_row_end(bc_ctx *, bc_row);
 bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: lives until reset */
 
@@ -226,10 +240,13 @@ bool      bc_agg_next(bc_ctx *, bc_agg, bc_view *group_key, bc_group *g);
 int64_t   bc_agg_i64(bc_ctx *, bc_group, uint32_t slot);
 double    bc_agg_f64(bc_ctx *, bc_group, uint32_t slot);
 
-/* Effects */
-void bc_put(bc_ctx *, bc_view key, bc_view row);
-void bc_del(bc_ctx *, bc_view key);
-void bc_del_range(bc_ctx *, bc_view lo, bc_view hi);
+/* Writes: rows, with every index entry the runtime derives from them */
+void bc_insert(bc_ctx *, uint32_t table, bc_view row);
+void bc_update(bc_ctx *, uint32_t table, bc_view old, bc_view row);
+void bc_delete(bc_ctx *, uint32_t table, bc_view old);
+void bc_del_range(bc_ctx *, uint32_t table, bc_view lo, bc_view hi);
+
+/* Guards and raised errors */
 void bc_guard_unchanged(bc_ctx *, bc_view key);
 void bc_guard_range(bc_ctx *, uint32_t table_or_index, bc_view lo, bc_view hi);
 void bc_guard_present(bc_ctx *, bc_view key);

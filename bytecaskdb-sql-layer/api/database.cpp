@@ -30,17 +30,6 @@ namespace {
 constexpr std::uint32_t kArenaBytes = 4u << 20;
 constexpr std::uint32_t kMaxRetries = 3;
 
-auto matches(const Value& v, PhysType t) -> bool {
-  if (std::holds_alternative<std::monostate>(v)) return true;
-  switch (t) {
-    case PhysType::I64: return std::holds_alternative<std::int64_t>(v);
-    case PhysType::F64: return std::holds_alternative<double>(v);
-    case PhysType::Bool: return std::holds_alternative<bool>(v);
-    case PhysType::Bytes: return std::holds_alternative<Bytes>(v);
-  }
-  return false;
-}
-
 }  // namespace
 
 ExecError::~ExecError() = default;
@@ -103,12 +92,18 @@ void Database::compile(Statement& s) {
   auto layout = make_result_layout(plan->result_types);
   auto code = TccPlan::compile(plan->source);
   std::vector<bc_col_ref> col_refs;
-  for (const auto& c : plan->columns) col_refs.push_back({c.layout, c.col, c.pos, static_cast<std::uint8_t>(c.type)});
+  for (const auto& c : plan->columns) col_refs.push_back({c.table, c.col, static_cast<std::uint8_t>(c.type)});
   auto n = [](const auto& v) { return narrow<std::uint32_t>(v.size()); };
   const auto& p = *plan;
-  bc_schema_ref ref{p.catalog_version,       p.objects_read.data(), n(p.objects_read),   p.tables_written.data(),
-                    n(p.tables_written),     p.indexes_written.data(), n(p.indexes_written), col_refs.data(),
-                    n(col_refs),             codes.data(),          n(codes)};
+  bc_schema_ref ref{p.catalog_version,
+                    p.objects_read.data(),
+                    n(p.objects_read),
+                    p.tables_written.data(),
+                    n(p.tables_written),
+                    col_refs.data(),
+                    n(col_refs),
+                    codes.data(),
+                    n(codes)};
   // Moves keep every buffer ref points into.
   if (std::holds_alternative<bound::Select>(bound.stmt)) s.columns_ = std::move(columns);
   s.plan_ = std::move(plan);
@@ -140,26 +135,55 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
     out.affected = 0;
     return out;
   }
-  // A plan the catalog has moved past is recompiled from its text; one a
-  // DDL left compatible keeps running.
-  // The walk runs only when the catalog has moved since the compile: an
-  // unchanged version is one compare. bc_ctx_run checks in full regardless.
-  if (auto cat = live_->current();
-      stmt.ref_.catalog_version != cat->version() && schema_incompatibility(*cat, stmt.ref_)) {
-    compile(stmt);
-  }
-
-  const auto& types = stmt.plan_->param_types;
-  if (params.size() != types.size()) {
-    throw std::invalid_argument("statement takes " + std::to_string(types.size()) + " parameters, got " +
-                                std::to_string(params.size()));
-  }
-  for (std::size_t i = 0; i < params.size(); ++i) {
-    if (!matches(params[i], types[i])) throw std::invalid_argument("parameter $" + std::to_string(i + 1) + " has the wrong type");
-  }
+  // Throws std::invalid_argument for parameters the statement's current plan
+  // does not take: checked again after a recompile, whose plan may differ.
+  auto mismatch = [&]() -> std::string {
+    const auto& types = stmt.plan_->param_types;
+    if (params.size() != types.size()) {
+      return "statement takes " + std::to_string(types.size()) + " parameters, got " + std::to_string(params.size());
+    }
+    for (std::size_t i = 0; i < params.size(); ++i) {
+      if (!datum_fits(params[i], types[i])) return "parameter $" + std::to_string(i + 1) + " has the wrong type";
+    }
+    return {};
+  };
+  auto check_params = [](const std::string& why) {
+    if (!why.empty()) throw std::invalid_argument(why);
+  };
   bc_params bp{params};
-  const auto& p = *stmt.plan_;
+  // Parameters that do not fit the cached plan may fit the plan a DDL has
+  // since made of the text. The runtime says whether the cached plan still
+  // fits the catalog (bc_ctx_check, the verification bc_ctx_run makes); it
+  // is recompiled only if not, and the parameters are refused against the
+  // plan that will run. The runtime alone decides compatibility.
+  if (auto why = mismatch(); !why.empty()) {
+    // A plan compiled against the current version is the plan of the text:
+    // a recompile would take the same parameters.
+    if (stmt.ref_.catalog_version == live_->current()->version()) throw std::invalid_argument(why);
+    bc_ctx_begin(cx_, &bp, {});
+    auto fits = bc_ctx_check(cx_, &stmt.ref_);
+    auto stale = !fits && bc_error(cx_) == BC_E_LAYOUT && bc_error_detail(cx_) == BC_L_INCOMPATIBLE;
+    if (!fits && !stale) {
+      ExecError e{bc_error_message(cx_), bc_error(cx_)};
+      bc_ctx_reset(cx_);
+      throw e;
+    }
+    bc_ctx_reset(cx_);
+    if (stale) compile(stmt);
+    check_params(stale ? mismatch() : why);
+  }
   auto r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
+  // bc_ctx_run checks the plan against the catalog it pinned. A plan a DDL
+  // made incompatible (BC_E_LAYOUT with BC_L_INCOMPATIBLE) is recompiled
+  // from its text and run once more; one a DDL left compatible keeps
+  // running, unchecked here.
+  if (r == BC_FAILED && bc_error(cx_) == BC_E_LAYOUT && bc_error_detail(cx_) == BC_L_INCOMPATIBLE) {
+    bc_ctx_reset(cx_);
+    compile(stmt);
+    check_params(mismatch());
+    r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
+  }
+  const auto& p = *stmt.plan_;
   if (r == BC_CONFLICT) {
     bc_ctx_reset(cx_);
     throw ExecError("conflict: a guard failed on every attempt", BC_CONFLICT);

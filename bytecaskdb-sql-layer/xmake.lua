@@ -89,6 +89,10 @@ target("sql_layer_tests")
     set_languages("c17", "c++23")
     -- The tests, and the fixtures they share as modules (bytecask.sql.tests.*).
     add_files("tests/*.cpp", "tests/*.cppm")
+    -- The engine's counted allocation-failure seam (tests/alloc_faults.h):
+    -- it replaces the global operator new in this binary.
+    add_files("../tests/alloc_faults.cpp", {defines = "BYTECASK_TESTING"})
+    add_includedirs("../bytecaskdb")
     -- The hand-written plans, compiled by clang as C. Every plan defines
     -- plan(); each is renamed so several link into one binary.
     add_includedirs("algebra")
@@ -98,3 +102,14 @@ target("sql_layer_tests")
         add_files("plans/" .. name .. ".c", {defines = "plan=plan_" .. name,
                   cflags = "-Wno-declaration-after-statement"})
     end
+
+-- Micro-benchmarks of the plan API's fixed costs (bench/sql_layer_bench.cpp).
+-- Not built by default and not run in CI. Build in releasedbg, as the
+-- published numbers were: release's LTO link fails where llvm-ar is older
+-- than clang.
+target("sql_layer_bench")
+    set_kind("binary")
+    set_default(false)
+    add_deps("sql_layer")
+    add_rules("bytecask.native_flags")
+    add_files("bench/*.cpp")
