@@ -205,10 +205,8 @@ never hands out an id twice.
 ## Compatibility
 
 `bc_schema_ref` lists what a plan depends on, and `bc_ctx_run` checks it
-against the pinned version. A context caches the result per reference and
-catalog version (`docs/plan_api_design.md`, *Runtime*), so the walk runs
-once per plan and version, not once per execution. A plan is compatible
-when:
+against the pinned version on every execution (`docs/plan_api_design.md`,
+*Runtime*, states the cost). A plan is compatible when:
 
 - **every table and index it names exists.** Ids are never reused, and a
   table's primary key and an index's parts never change, so existence is
