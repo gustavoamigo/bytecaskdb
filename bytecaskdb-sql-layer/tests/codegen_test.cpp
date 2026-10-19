@@ -75,10 +75,6 @@ TEST_CASE("codegen: what the runtime needs besides the text", "[sql][codegen]") 
   CHECK(sel.columns[0].col == 0);
   CHECK(sel.columns[1].col == 2);
   CHECK(sel.columns[1].type == PhysType::I64);
-  // Every compile is a new reference: a fresh id, even for the same text.
-  auto again = generate(f.cat(), "SELECT id, qty FROM t WHERE id = $1");
-  CHECK(sel.id != 0);
-  CHECK(again.id != sel.id);
   // A covering range reads the index alone.
   auto range = generate(f.cat(), "SELECT id FROM t WHERE name >= $1");
   CHECK(range.objects_read == std::vector<std::uint32_t>{3});

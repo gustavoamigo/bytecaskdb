@@ -18,12 +18,10 @@
 // Standard library headers before the module imports, for the reason
 // bytecaskdb/bytecask_hpp.cpp gives (LLVM 22's abi_tag redeclaration error).
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <cstring>
 #include <exception>
 #include <limits>
@@ -37,14 +35,12 @@
 #include <set>
 #include <system_error>
 #include <type_traits>
-#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
 
 // The C contract, and the engine through its public header.
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
-#include "bytecaskdb-sql-layer/algebra/bc_plan_testing.h"
 #include "include/bytecask.hpp"
 
 // bc_db, bc_catalog and bc_params, which bc_plan.h leaves opaque, and the
@@ -81,7 +77,6 @@ constexpr std::uint32_t kScanFlagMask = BC_SCAN_REVERSE | BC_SCAN_PREFIX;
 // Verified schema references a context keeps. Past this a miss evicts one
 // by CLOCK, so memory stays bounded and the references in use survive a
 // flood of others, a recompile's dead ids included.
-constexpr std::size_t kMaxVerified = 1024;
 
 // What a view is, beyond its bytes: a row read from the engine (a stored
 // row, the only kind bc_update and bc_delete take as the old one), a row a
@@ -135,55 +130,35 @@ struct Effect {
   Bytes a, b;
 };
 
-// A declared column of a verified reference: where it is in its table's
-// current layout.
+// A declared column, where it lives in its table's current layout.
 struct ColSlot {
-  bool declared{false};
+  std::uint32_t table{0};
+  std::uint32_t col{0};
+  std::uint16_t generation{0};  // the layout's: the generation pos is for
   bool nullable{true};
   PhysType type{PhysType::I64};
   std::uint32_t pos{0};
 };
 
 // The columns of a written table's keys, as layout slots: what bc_update
-// compares in its old and new rows. Built with the verified reference, so
-// the write path never searches a layout.
+// compares in its old and new rows. Built once per run and table, on the
+// first update, so the write path searches a layout once, not per row.
 struct KeySlots {
   std::uint32_t table;
   std::vector<ColumnSlot> pk;
   std::vector<std::vector<ColumnSlot>> parts;  // per index, in the table's index order
 };
 
-// The declared columns of one table, indexed by column id.
-struct TableCols {
-  std::uint32_t table;
-  std::uint16_t generation;  // the current layout's: the generation pos is for
-  std::vector<ColSlot> by_col;
-};
-
-// A schema reference verified against one catalog version, with what the
-// verification built: the column map and the result layout. Plain data, no
-// pointer into the catalog, so an entry outlives the version it was built
-// on. Invariants: an entry is served without verification only when it is
-// valid, its ref_id and version match the reference and the pinned catalog,
-// and the reference's arrays hold what the entry was verified from, so a
-// reference rebuilt under a kept id is verified on its own. A cached
-// entry's ref_id is an id bc_ref_id issued and the key slot_of maps to it;
-// a reference with no issued id uses the context's scratch entry and is
-// verified on every run. A failed verification leaves the entry invalid,
-// so the next run verifies again.
+// The plan's schema reference, verified against the pinned catalog version
+// by every bc_ctx_run, with what the verification built: the declared
+// objects, written tables and columns, sorted for a binary search per
+// access, and the result layout. One per context, its buffers kept across
+// runs so a run allocates nothing for them; the result layout is rebuilt
+// only when the result types change.
 struct Verified {
-  bool valid{false};
-  bool referenced{false};  // CLOCK: used since the hand last passed
-  std::uint64_t ref_id{0};
-  std::uint64_t version{0};
-  // What the reference held, compared on every hit.
-  std::vector<std::uint32_t> read_ids, written_ids;
-  std::vector<bc_col_ref> col_refs;
-  // Built from it: sorted, for a binary search per access.
   std::vector<std::uint32_t> objects;  // the tables and indexes it names
   std::vector<std::uint32_t> written;  // the tables it writes
-  std::vector<TableCols> tables;       // by table id
-  std::vector<KeySlots> key_slots;     // of each table written, by table id
+  std::vector<ColSlot> cols;           // by (table, col)
   std::vector<std::uint8_t> result_codes;  // as given
   std::vector<PhysType> result_types;
   std::optional<RowLayout> result_layout;
@@ -286,20 +261,9 @@ struct bc_ctx {
   } key_parts;
   std::map<Bytes, Bytes, BytesLess> deleted_ranges;  // lo -> hi of each bc_del_range, likewise; disjoint
 
-  // References verified by bc_ctx_run, kept across executions: slots, a map
-  // from reference id to slot, and the CLOCK hand. A context is bound to one
-  // database, and a catalog version is never reused within one, so an entry
-  // is matched by the reference's id and the version alone. An id of 0 is
-  // verified into `scratch` on every run. `slots` grows by push_back, which
-  // keeps every entry where it is, up to kMaxVerified, and only use_ref
-  // reuses a slot, before it sets `current`, so `current` never dangles.
-  std::deque<Verified> slots;
-  std::unordered_map<std::uint64_t, std::uint32_t> slot_of;
-  std::size_t hand{0};
-  std::uint64_t verifications{0};  // runs the cache did not answer
-  Verified scratch;
-  const Verified* current{nullptr};  // this execution's reference; nullptr: none
-  const TableCols* last_table{nullptr};  // of current: the table declared() found last
+  Verified verified;                 // this context's reference, rebuilt by every run
+  const Verified* current{nullptr};  // &verified once a run verified it; nullptr: none
+  std::vector<KeySlots> key_slots;    // of the tables this run updated, built on the first update
 
   // Results: rows in the row format of the plan's result_types, each
   // preceded by its u32 length.
@@ -541,7 +505,7 @@ struct bc_ctx {
     written_rows.clear();
     deleted_ranges.clear();
     current = nullptr;  // set by the next run's reference
-    last_table = nullptr;
+    key_slots.clear();
     key_parts.view = {};  // view handles repeat across executions once the epoch wraps
     key_parts.at.clear();
     results.clear();
@@ -831,17 +795,6 @@ auto ref_arrays(const bc_schema_ref& r) -> RefArrays {
           span(r.result_types, r.n_result)};
 }
 
-// Whether `ref` holds what `e` was verified from: its ids, columns and
-// result types, compared by value, never by address.
-auto same_contents(const Verified& e, const bc_schema_ref& ref) -> bool {
-  auto [read, written, cols, codes] = ref_arrays(ref);
-  auto same_col = [](const bc_col_ref& a, const bc_col_ref& b) {
-    return a.table == b.table && a.col == b.col && a.type == b.type;
-  };
-  return std::ranges::equal(read, e.read_ids) && std::ranges::equal(written, e.written_ids) &&
-         std::ranges::equal(cols, e.col_refs, same_col) && std::ranges::equal(codes, e.result_codes);
-}
-
 auto key_slots_of(const Table& t) -> KeySlots {
   KeySlots k{t.id, {}, {}};
   for (auto id : t.pk_col_ids) k.pk.push_back(*t.layout.find(id));
@@ -852,30 +805,32 @@ auto key_slots_of(const Table& t) -> KeySlots {
   return k;
 }
 
-// The key slots of table `t`, which the run writes, from the verified
-// reference. cx->table(id, true) found `t` among the tables written, so
-// the reference has them; nullptr and BC_E_HANDLE otherwise.
-auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots* {
-  if (cx->current != nullptr) {
-    const auto& all = cx->current->key_slots;
-    auto it = std::ranges::lower_bound(all, t.id, {}, &KeySlots::table);
-    if (it != all.end() && it->table == t.id) return &*it;
-  }
-  cx->fail(BC_E_HANDLE, "table " + t.name + " is not among the tables the plan's schema ref writes");
-  return nullptr;
+// The key slots of table `t`, which the run updates: built on its first
+// update in the run, then found. A run updates few tables.
+auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots& {
+  auto it = std::ranges::find(cx->key_slots, t.id, &KeySlots::table);
+  if (it != cx->key_slots.end()) return *it;
+  return cx->key_slots.emplace_back(key_slots_of(t));
 }
 
-// Builds `e` for `ref` on the pinned version: the compatibility check, the
-// result layout (rebuilt only when the codes change), the column map.
+// Builds `e` for `ref` on the pinned version: the compatibility check
+// (docs/sql_layer_catalog_design.md, *Compatibility*), the result layout
+// (rebuilt only when the codes change), the column map, in one walk of the
+// reference: each column is looked up once, checked and mapped.
 [[nodiscard]] auto verify(bc_ctx* cx, const bc_schema_ref* ref, Verified& e) -> bool {
-  ++cx->verifications;
-  e.valid = false;
-  if (auto why = bytecask::sql::schema_incompatibility(*cx->cat, *ref)) {
+  const auto& cat = *cx->cat;
+  auto incompatible = [&](const std::string& why) {
     cx->fail(BC_L_INCOMPATIBLE, "plan compiled against catalog v" + std::to_string(ref->catalog_version) +
-                                    " is incompatible with v" + std::to_string(cx->cat->version()) + ": " + *why);
+                                    " is incompatible with v" + std::to_string(cat.version()) + ": " + why);
     return false;
-  }
+  };
   auto [read, written, cols, codes] = ref_arrays(*ref);
+  for (auto id : read) {
+    if (cat.key_layout(id) == nullptr) return incompatible("table or index " + std::to_string(id) + " the plan reads no longer exists");
+  }
+  for (auto id : written) {
+    if (cat.table(id) == nullptr) return incompatible("table " + std::to_string(id) + " the plan writes no longer exists");
+  }
   if (!e.result_layout || !std::ranges::equal(codes, e.result_codes)) {
     // Built aside and committed by moves, which cannot throw: a failure
     // leaves the entry's result layout, codes and types as they were.
@@ -901,19 +856,16 @@ auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots* {
     e.result_codes = std::move(new_codes);
     e.result_types = std::move(types);
   }
-  e.read_ids.assign(read.begin(), read.end());
-  e.written_ids.assign(written.begin(), written.end());
-  e.col_refs.assign(cols.begin(), cols.end());
   auto sorted = [](std::vector<std::uint32_t>& v) {
     std::ranges::sort(v);
     v.erase(std::ranges::unique(v).begin(), v.end());
   };
-  e.written = e.written_ids;
+  e.written.assign(written.begin(), written.end());
   sorted(e.written);
-  e.objects = e.read_ids;
+  e.objects.assign(read.begin(), read.end());
   e.objects.insert(e.objects.end(), e.written.begin(), e.written.end());
   sorted(e.objects);
-  e.tables.clear();
+  e.cols.clear();
   for (const auto& c : cols) {
     // A column's table is one the reference names, so every row a plan
     // reads or writes is of an object the compatibility check covers.
@@ -922,105 +874,51 @@ auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots* {
                               ", which the plan's schema ref does not name");
       return false;
     }
-    const auto* t = cx->cat->table(c.table);  // the check above found it
+    const auto* t = cat.table(c.table);
+    if (t == nullptr) return incompatible("table " + std::to_string(c.table) + " no longer exists");
     const auto* slot = t->layout.find(c.col);
-    auto it = std::ranges::lower_bound(e.tables, c.table, {}, &TableCols::table);
-    if (it == e.tables.end() || it->table != c.table) it = e.tables.insert(it, {c.table, t->layout.generation, {}});
-    if (it->by_col.size() <= c.col) it->by_col.resize(c.col + 1);
-    it->by_col[c.col] = {true, slot->nullable, slot->type, slot->pos};
+    if (slot == nullptr || static_cast<std::uint8_t>(slot->type) != c.type) {
+      return incompatible("column " + std::to_string(c.col) + " of table " + t->name +
+                          " no longer exists with the type the plan was compiled with");
+    }
+    e.cols.push_back({c.table, c.col, t->layout.generation, slot->nullable, slot->type, slot->pos});
   }
-  e.key_slots.clear();
-  for (auto id : e.written) {  // sorted: so is key_slots
-    const auto* t = cx->cat->table(id);
-    e.key_slots.push_back(key_slots_of(*t));
-  }
-  e.ref_id = ref->id;
-  e.version = cx->cat->version();
-  e.valid = true;
+  std::ranges::sort(e.cols, {}, [](const ColSlot& s) { return std::pair{s.table, s.col}; });
   return true;
 }
 
-// The cache slot of reference `id`: its own, or a free one, or the one CLOCK
-// evicts: the first the hand finds unused since it last passed.
-auto cache_slot(bc_ctx* cx, std::uint64_t id) -> Verified& {
-  if (auto it = cx->slot_of.find(id); it != cx->slot_of.end()) {
-    auto& e = cx->slots[it->second];
-    e.referenced = true;
-    return e;
-  }
-  std::size_t at = cx->slots.size();
-  if (at < kMaxVerified) {
-    cx->slots.emplace_back();
-  } else {
-    while (cx->slots[cx->hand].referenced) {
-      cx->slots[cx->hand].referenced = false;
-      cx->hand = (cx->hand + 1) % kMaxVerified;
-    }
-    at = cx->hand;
-    cx->hand = (cx->hand + 1) % kMaxVerified;
-    cx->slot_of.erase(cx->slots[at].ref_id);
-  }
-  auto& e = cx->slots[at];
-  e.valid = false;
-  e.ref_id = id;
-  e.referenced = true;
-  cx->slot_of[id] = static_cast<std::uint32_t>(at);
-  return e;
-}
-
-// The highest reference id the runtime has issued (bc_ref_id). Process-wide,
-// as the ids are: a reference built in one context runs in any.
-auto issued_ref_ids() -> std::atomic<std::uint64_t>& {
-  static std::atomic<std::uint64_t> issued{0};
-  return issued;
-}
-
-// Makes `ref` the execution's reference: from the cache when this context
-// verified it against the pinned version before, verified otherwise.
+// Makes `ref` the execution's reference, verified against the pinned
+// catalog version.
 [[nodiscard]] auto use_ref(bc_ctx* cx, const bc_schema_ref* ref) -> bool {
   if (ref == nullptr) {
     cx->fail(BC_E_HANDLE, "a plan runs against a bc_schema_ref: none was given");
     return false;
   }
-  // An id the runtime never issued is no id: verified on every run.
-  auto id = ref->id <= issued_ref_ids().load(std::memory_order_relaxed) ? ref->id : 0;
-  auto& e = id == 0 ? cx->scratch : cache_slot(cx, id);
-  if (id == 0 || !e.valid || e.ref_id != id || e.version != cx->cat->version() || !same_contents(e, *ref)) {
-    if (!verify(cx, ref, e)) return false;
-  }
-  cx->current = &e;
-  cx->last_table = nullptr;
+  if (!verify(cx, ref, cx->verified)) return false;
+  cx->current = &cx->verified;
   return true;
 }
 
 // Where declared column `col` of `table` is; nullptr and BC_E_HANDLE for a
 // column the reference does not declare or not of `type`.
-auto declared(bc_ctx* cx, std::uint32_t table, std::uint32_t col, std::optional<PhysType> type)
-    -> std::pair<const TableCols*, const ColSlot*> {
-  if (!cx->ok()) return {};
+auto declared(bc_ctx* cx, std::uint32_t table, std::uint32_t col, std::optional<PhysType> type) -> const ColSlot* {
+  if (!cx->ok()) return nullptr;
   if (cx->current != nullptr) {
-    // Consecutive accesses mostly name one table: the last one found is
-    // tried before the search.
-    const auto* tc = cx->last_table;
-    if (tc == nullptr || tc->table != table) {
-      const auto& tables = cx->current->tables;
-      auto it = std::ranges::lower_bound(tables, table, {}, &TableCols::table);
-      tc = it != tables.end() && it->table == table ? &*it : nullptr;
-      cx->last_table = tc;
-    }
-    if (tc != nullptr && col < tc->by_col.size() && tc->by_col[col].declared) {
-      const auto& s = tc->by_col[col];
-      if (type && s.type != *type) {
+    const auto& cols = cx->current->cols;
+    auto it = std::ranges::lower_bound(cols, std::pair{table, col}, {},
+                                       [](const ColSlot& s) { return std::pair{s.table, s.col}; });
+    if (it != cols.end() && it->table == table && it->col == col) {
+      if (type && it->type != *type) {
         cx->fail(BC_E_HANDLE, "column " + std::to_string(col) + " of table " + std::to_string(table) + " is not " +
                                   type_name(*type));
-        return {};
+        return nullptr;
       }
-      return {tc, &s};
+      return &*it;
     }
   }
   cx->fail(BC_E_HANDLE, "column " + std::to_string(col) + " of table " + std::to_string(table) +
                             " is not declared in the plan's schema ref");
-  return {};
+  return nullptr;
 }
 
 // A row view's bytes and table. Not a row is BC_E_HANDLE; a row whose
@@ -1101,10 +999,10 @@ struct RowCol {
 auto row_col(bc_ctx* cx, bc_view row, std::uint32_t col, std::optional<PhysType> type) -> std::optional<RowCol> {
   auto r = resolve_row(cx, row);
   if (!r) return std::nullopt;
-  auto [tc, slot] = declared(cx, r->table, col, type);
+  const auto* slot = declared(cx, r->table, col, type);
   if (slot == nullptr) return std::nullopt;
   auto gen = bytecask::sql::row_generation(r->bytes);
-  if (gen != tc->generation) {
+  if (gen != slot->generation) {
     fail_generation(cx, cx->cat->table(r->table), gen);
     return std::nullopt;
   }
@@ -1220,7 +1118,7 @@ struct SetTarget {
 auto set_target(bc_ctx* cx, bc_row r, std::uint32_t col, std::optional<PhysType> type) -> std::optional<SetTarget> {
   auto* b = row_builder(cx, r);
   if (b == nullptr) return std::nullopt;
-  const auto* slot = declared(cx, b->table, col, type).second;
+  const auto* slot = declared(cx, b->table, col, type);
   if (slot == nullptr) return std::nullopt;
   return SetTarget{b, slot};
 }
@@ -1356,10 +1254,6 @@ const char* bc_error_message(const bc_ctx* cx) { return cx->message.c_str(); }
 uint32_t bc_error_detail(const bc_ctx* cx) { return cx->detail; }
 
 int64_t bc_ctx_affected(const bc_ctx* cx) { return cx->affected; }
-
-uint64_t bc_ctx_verifications(const bc_ctx* cx) { return cx->verifications; }
-
-uint64_t bc_ref_id(void) { return issued_ref_ids().fetch_add(1, std::memory_order_relaxed) + 1; }
 
 int bc_execute(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* ref, const bc_params* params, bc_budget budget,
                bool sync, uint32_t max_retries) {
@@ -2291,12 +2185,11 @@ void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {
   // A key built only from columns whose encodings are the same in both rows
   // is the same key: it is encoded once, or not at all. A malformed row
   // counts as changed, and its encoding refuses it.
-  const auto* keys = key_slots(cx, *t);
-  if (keys == nullptr) return;
+  const auto& keys = key_slots(cx, *t);
   auto same = [&](const ColumnSlot& slot) { return bytecask::sql::row_column_equal(*o, *n, slot).value_or(false); };
   Bytes pk_old, pk_new;
   if (!encode_pk(cx, *t, *o, pk_old)) return;
-  auto moved_pk = !std::ranges::all_of(keys->pk, same);
+  auto moved_pk = !std::ranges::all_of(keys.pk, same);
   if (moved_pk) {
     if (!encode_pk(cx, *t, *n, pk_new)) return;
     moved_pk = pk_old != pk_new;
@@ -2311,7 +2204,7 @@ void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {
   std::vector<Move> moves;
   for (std::size_t i = 0; i < t->indexes.size(); ++i) {
     const auto& ix = t->indexes[i];
-    if (!moved_pk && std::ranges::all_of(keys->parts[i], same)) continue;
+    if (!moved_pk && std::ranges::all_of(keys.parts[i], same)) continue;
     Move m{&ix, {}, {}};
     if (!encode_entry(cx, *t, ix, *o, m.from) || !encode_entry(cx, *t, ix, *n, m.to)) return;
     if (m.from.key != m.to.key) moves.push_back(std::move(m));

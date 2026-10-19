@@ -95,8 +95,7 @@ void Database::compile(Statement& s) {
   for (const auto& c : plan->columns) col_refs.push_back({c.table, c.col, static_cast<std::uint8_t>(c.type)});
   auto n = [](const auto& v) { return narrow<std::uint32_t>(v.size()); };
   const auto& p = *plan;
-  bc_schema_ref ref{p.id,
-                    p.catalog_version,
+  bc_schema_ref ref{p.catalog_version,
                     p.objects_read.data(),
                     n(p.objects_read),
                     p.tables_written.data(),

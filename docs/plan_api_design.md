@@ -294,15 +294,10 @@ typedef struct { uint32_t table, col; uint8_t type; } bc_col_ref;
 
 /* What a plan was compiled against, and the types of the rows it emits, in
    emit order. bc_ctx_run checks the objects and columns against the pinned
-   catalog version (docs/sql_layer_catalog_design.md, *Compatibility*); the
-   result layout is the plan's own and is not a catalog object.
-   An id names one reference, and the reference is immutable while its id
-   is in use: a new or rebuilt reference takes a fresh id from bc_ref_id.
-   The runtime enforces it: a cached verification is served only while the
-   arrays hold, by value, what it was verified from, so a reference changed
-   under a kept id is verified again, never served another's result. */
+   catalog version (docs/sql_layer_catalog_design.md, *Compatibility*) on
+   every run; the result layout is the plan's own and is not a catalog
+   object. */
 typedef struct {
-  uint64_t id;                                                  /* from bc_ref_id, one per compiled plan; 0: checked on every run */
   uint64_t catalog_version;                                     /* compiled against; for messages */
   const uint32_t   *objects_read;    uint32_t n_read;           /* tables and indexes it names */
   const uint32_t   *tables_written;  uint32_t n_written;        /* tables whose rows it writes */
@@ -326,7 +321,7 @@ a C identifier:
 
 None is a position in a row. The runtime maps each column id the schema
 reference declares to its offset or slot in the table's current layout,
-once per verified reference (*Runtime*), so a layout generation never
+when it verifies the reference (*Runtime*), so a layout generation never
 reaches plan text. A column a plan names but its reference does not declare
 is `BC_E_HANDLE` at the access, and so is a table or index it names but does
 not declare, or a table it writes but does not list in `tables_written`: the
@@ -360,7 +355,6 @@ enum bc_error_code bc_error(const bc_ctx *);
 const char *bc_error_message(const bc_ctx *);
 uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: the bc_constraint in the high byte, the object id (below 2^24) in the low 24 bits; BC_E_LAYOUT: a bc_layout_detail */
 int64_t bc_ctx_affected(const bc_ctx *);                   /* what bc_emit_count recorded, or -1 */
-uint64_t bc_ref_id(void);                                  /* a fresh bc_schema_ref id; an id it never issued is treated as 0 */
 int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params *,
                    bc_budget, bool sync, uint32_t max_retries);               /* the retry loop */
 ```
@@ -369,7 +363,7 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
 |---|---|
 | `bc_ctx_new` | Allocates a context bound to an open engine and a catalog, with an arena of `arena_bytes`. The arena is allocated once and reused. |
 | `bc_ctx_begin` | Pins a catalog version and takes a snapshot that agrees with it (no DDL committed between the two), binds the parameters, sets the budget. Clears the error. Must precede `bc_ctx_run`. |
-| `bc_ctx_check` | Verifies a `bc_schema_ref` against the pinned version as `bc_ctx_run` does, caching the result, and runs nothing. False with `BC_E_LAYOUT` where `bc_ctx_run` would refuse the plan. What a server calls to learn whether a cached plan still fits the catalog before it checks parameters against that plan. |
+| `bc_ctx_check` | Verifies a `bc_schema_ref` against the pinned version as `bc_ctx_run` does, and runs nothing. False with `BC_E_LAYOUT` where `bc_ctx_run` would refuse the plan. What a server calls to learn whether a cached plan still fits the catalog before it checks parameters against that plan. |
 | `bc_ctx_run` | Verifies the plan's `bc_schema_ref` against the catalog version the context pinned at `bc_ctx_begin`, then calls the plan and returns when it returns. Compatible means: every table and index it names exists; every column it reads or sets exists in its table with the type it was compiled with; every table it writes exists. Verifying also maps each declared column to its offset or slot in the current layout. A null reference is `BC_E_HANDLE`. A plan that fails sets `BC_E_LAYOUT` and does not run; the server recompiles it from the SQL it cached. Adding a column or an index never invalidates a plan, since the runtime maintains whatever indexes the table has; a drop invalidates the plans that name what it drops. There is no version-equality check. |
 | `bc_ctx_commit` | Submits the write plan with `apply_batch`, guarded by `ensure_unchanged` on the catalog record of every table whose keys it writes, so a DDL on such a table committed since the snapshot makes it a conflict: the index entries the runtime wrote follow the pinned version's indexes, and a `CREATE INDEX` committed after the snapshot would otherwise miss the row. `BC_COMMITTED` on success. `BC_CONFLICT` when the engine reports a guard or write-write conflict: nothing was written. `BC_FAILED` when `bc_error` is set, including an error raised during the plan: nothing is committed. A plan with no writes and no guards commits nothing and returns `BC_COMMITTED`. |
 | `bc_ctx_next_result` | Iterates the result buffer. Rows are in the row format of the layout the plan emitted. The runtime, not a plan, sees raw pointers here; valid until `bc_ctx_reset`. |
@@ -377,28 +371,17 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
 | `bc_error_detail`, `bc_ctx_affected` | The constraint kind and object id of a raised error, or for `BC_E_LAYOUT` its class: `bc_ctx_run` refusing the reference (`BC_L_INCOMPATIBLE`, the only one a recompile cures), a row used with a table or column it is not of (`BC_L_ROW`), a malformed plan or reference (`BC_L_PLAN`), or a row of a retired layout generation (`BC_L_RETIRED`). The runtime sets every `BC_E_LAYOUT` with its detail; one without cannot be compiled; the affected-row count a write plan recorded. Both read by the runtime after the plan returns. |
 | `bc_execute` | `begin`, `run`, `commit`; on `BC_CONFLICT`, `reset` and repeat up to `max_retries`. A `BC_E_CONSTRAINT` raised by the plan is final: no retry. Returns the commit result of the last attempt. This is the only place retry lives. |
 
-**Verification is cached.** A context remembers the references it verified,
-in a hash table keyed by the reference's `id`, with the catalog version it
-verified each against and the column map it built. A run whose reference
-and pinned version match an entry skips the walk: a hash lookup, an
-integer compare and a compare of the reference's contents. The table grows
-as plans are cached, up to 1,024 references; past that, a miss
-evicts one by CLOCK (the first entry the hand finds unused since it last
-passed), so the references in use survive a flood of others, a recompiled
-plan's dead id is dropped in time, and a context's memory stays bounded. A hit also compares the
-reference's ids, columns and result types, by value, with the copies the
-entry kept, so a reference rebuilt under a kept id, even in arrays at the
-old addresses, is verified on its own. The entry keeps its objects and
-columns sorted by id, so each access a plan makes is a binary search, not
-a scan of the reference. The version is the catalog's identity: a context
-is bound to one database at `bc_ctx_new`, and within a database a catalog
-version is never reused, so no pointer is compared (a freed catalog's
-address can be reused, its version cannot). An `id` of 0 is never cached.
-The runtime issues the ids (`bc_ref_id`, a process-wide counter), and the
-compiler takes a fresh one for every plan it compiles, a recompile included;
-an id the runtime never issued is treated as 0. The result types are compared
-without allocating, and the result layout is rebuilt only when they
-change.
+**Verification runs on every execution.** `bc_ctx_run` checks the
+reference against the version it pinned each time, and builds what the
+run's calls look up: the declared objects and the written tables sorted
+by id, the column map, the written tables' key slots. Each access a plan
+makes is then a binary search or an index, not a scan of the reference.
+The context keeps these buffers across runs, and rebuilds the result
+layout only when the result types change. The check is a known cost, paid
+by every execution: 42–104 ns for a point read's reference (2 columns, 1
+object) and 0.97–1.26 µs for a New-Order-sized one (36 columns, 10
+objects), measured by `sql_layer_bench`. Caching verified references is
+deferred until a workload shows the need.
 
 ### Parameters and results
 
@@ -1123,7 +1106,7 @@ them.
   plan wrote an `if` and two calls.
 - Columns are named by id, one constant per column (`COL_<t>_<c>`, the
   column id), instead of an offset or slot constant and a column constant.
-  The runtime maps ids to positions once per verified reference, so a
+  The runtime maps ids to positions when it verifies the reference, so a
   layout generation never reaches a plan, and `REBUILD` will invalidate
   none. `bc_col_ref` loses `layout` and `pos` and gains `table`.
   `bc_row_begin` and `bc_row_from` take the table, not a layout id, and the
@@ -1135,16 +1118,13 @@ them.
   `BC_E_LAYOUT`.
 - `bc_schema_ref` loses `indexes_written`, and `CREATE INDEX` invalidates no
   plan: the runtime maintains whatever indexes the pinned version has.
-  It gains `id`, issued by the runtime (`bc_ref_id`), which keys a
-  context's cache of verified references:
-  verifying a reference already verified against the pinned catalog
-  version is a hash lookup and a compare instead of a walk of the catalog
-  and an allocation per run. `BC_E_LAYOUT` gains a detail on every error:
+  Every run still verifies its reference; the cost is measured and stated
+  in *Runtime*, and caching is deferred. `BC_E_LAYOUT` gains a detail on every error:
   `BC_L_INCOMPATIBLE` for the check's refusal, `BC_L_ROW`, `BC_L_PLAN` and
   `BC_L_RETIRED` for the rest, so the embedded API no longer
   checks a compatible plan itself: it recompiles exactly when `bc_ctx_run`
-  refuses one, or before the run when the parameters do not fit the cached
-  plan and the catalog has made it incompatible, and checks the parameters
-  against the plan that runs.
+  refuses one, or, when the parameters do not fit the cached plan and the
+  catalog version has moved, when `bc_ctx_check` refuses it; it checks the
+  parameters against the plan that runs.
 - The compiler emits covering reads: a range plan whose result columns are
   all in the index key, none of them `DOUBLE`, reads no row.

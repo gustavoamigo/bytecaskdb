@@ -138,8 +138,7 @@ inline auto all_tables(const bytecask::sql::Catalog& cat) -> std::vector<std::ui
   return out;
 }
 
-// A bc_schema_ref and the arrays it points into. Each get() is a new
-// reference, with a fresh id.
+// A bc_schema_ref and the arrays it points into.
 struct SchemaRef {
   std::vector<std::uint32_t> read, written;
   std::vector<bc_col_ref> cols;
@@ -148,7 +147,7 @@ struct SchemaRef {
 
   [[nodiscard]] auto get() const -> bc_schema_ref {
     auto n = [](const auto& v) { return static_cast<std::uint32_t>(v.size()); };
-    return {bc_ref_id(), version, read.data(), n(read), written.data(), n(written),
+    return {version, read.data(), n(read), written.data(), n(written),
             cols.data(), n(cols), codes.data(), n(codes)};
   }
 };

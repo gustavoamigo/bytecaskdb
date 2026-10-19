@@ -15,7 +15,6 @@
 #include <vector>
 
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
-#include "bytecaskdb-sql-layer/algebra/bc_plan_testing.h"
 #include "include/bytecask.hpp"
 
 import bytecask.sql.tests.fixture;
@@ -268,14 +267,10 @@ TEST_CASE("plan API: bc_ctx_check verifies a reference as bc_ctx_run does, and r
   CHECK_FALSE(bc_ctx_check(f.cx, &ref));
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
   bc_ctx_begin(f.cx, &none, {});
-  auto before = bc_ctx_verifications(f.cx);
   CHECK(bc_ctx_check(f.cx, &ref));
-  CHECK(bc_ctx_verifications(f.cx) == before + 1);
   CHECK(bc_ctx_affected(f.cx) == -1);  // no plan ran
   bc_ctx_reset(f.cx);
-  // The run that follows is served the entry the check made.
   CHECK(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_COMMITTED);
-  CHECK(bc_ctx_verifications(f.cx) == before + 1);
   // A plan a DDL made incompatible: false, with the detail that asks for a
   // recompile.
   f.ddl(bytecask::sql::DropIndexDdl{"t_by_name"});
@@ -284,86 +279,6 @@ TEST_CASE("plan API: bc_ctx_check verifies a reference as bc_ctx_run does, and r
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
   CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);
   bc_ctx_reset(f.cx);
-}
-
-TEST_CASE("plan API: a context caches a verified reference by id and catalog version", "[sql][algebra][catalog]") {
-  Fixture f;
-  auto none = params({});
-  SchemaRef reads_index{{kIdx}, {}, {}, {}, 0};
-  auto ref = reads_index.get();
-  CHECK(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_COMMITTED);
-  // Whether a run was served from the cache: it commits and verifies nothing.
-  auto served_from_cache = [&](const bc_schema_ref& r) {
-    auto before = bc_ctx_verifications(f.cx);
-    auto got = bc_execute(f.cx, scan_index, &r, &none, {}, false, 0);
-    return got == BC_COMMITTED && bc_ctx_verifications(f.cx) == before;
-  };
-  CHECK(served_from_cache(ref));
-
-  // The same reference, its object list changed in place to name an object
-  // that does not exist: same id, same arrays at the same addresses, other
-  // contents. Verified on its own and refused, never served the entry.
-  reads_index.read[0] = 4242;
-  CHECK(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_FAILED);
-  CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);
-  reads_index.read[0] = kIdx;
-  CHECK(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_COMMITTED);
-  CHECK(served_from_cache(ref));
-
-  // A different reference that reuses the id is verified on its own, not
-  // served the other's entry: its arrays differ.
-  SchemaRef lying{{4242}, {}, {}, {}, 0};
-  auto liar = lying.get();
-  liar.id = ref.id;
-  CHECK(bc_execute(f.cx, scan_index, &liar, &none, {}, false, 0) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
-  CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);  // a recompile can cure it
-  CHECK(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_COMMITTED);  // verified again
-  // An id of 0 is never cached: checked on every run.
-  auto uncached = ref;
-  uncached.id = 0;
-  CHECK(bc_execute(f.cx, scan_index, &uncached, &none, {}, false, 0) == BC_COMMITTED);
-  CHECK_FALSE(served_from_cache(uncached));
-
-  // An id the runtime never issued is no id: verified on every run.
-  auto forged = ref;
-  forged.id = std::numeric_limits<std::uint64_t>::max();
-  CHECK(bc_execute(f.cx, scan_index, &forged, &none, {}, false, 0) == BC_COMMITTED);
-  CHECK_FALSE(served_from_cache(forged));
-
-  // A flood of 2,000 other references, twice the cache, with the first one
-  // run every 20: CLOCK keeps it.
-  for (int i = 0; i < 2000; ++i) {
-    auto r = reads_index.get();
-    REQUIRE(bc_execute(f.cx, scan_index, &r, &none, {}, false, 0) == BC_COMMITTED);
-    if (i % 20 == 0) REQUIRE(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_COMMITTED);
-  }
-  CHECK(served_from_cache(ref));
-
-  // A cache full of dead references, as 1,024 recompiles leave it, then two
-  // live ones in turn: each keeps its entry, so neither verifies again.
-  for (int i = 0; i < 1024; ++i) {
-    auto r = reads_index.get();
-    REQUIRE(bc_execute(f.cx, scan_index, &r, &none, {}, false, 0) == BC_COMMITTED);
-  }
-  SchemaRef other_index{{kIdx}, {}, {}, {}, 0};
-  auto a = reads_index.get();
-  auto b = other_index.get();
-  for (int i = 0; i < 100; ++i) {
-    REQUIRE(bc_execute(f.cx, scan_index, &a, &none, {}, false, 0) == BC_COMMITTED);
-    REQUIRE(bc_execute(f.cx, scan_index, &b, &none, {}, false, 0) == BC_COMMITTED);
-  }
-  CHECK(served_from_cache(a));
-
-  // A DDL between two executions moves the version, so the cached entry no
-  // longer matches and the reference is checked again: a stale plan is
-  // refused, even with an id this context verified.
-  CHECK(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_COMMITTED);
-  f.ddl(bytecask::sql::DropIndexDdl{"t_by_name"});
-  CHECK(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
-  CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);
-  CHECK(std::string{bc_error_message(f.cx)}.find("no longer exists") != std::string::npos);
 }
 
 namespace {

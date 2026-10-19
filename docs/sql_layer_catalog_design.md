@@ -310,7 +310,7 @@ no key under the table's or index's prefix; the name entries and the
 records agree; a reader pinned while a DDL is held mid-commit returns at once
 on the old version; concurrent DDL each get the version they published; a backfill raced by a write, and a DDL raced by another
 catalog's, are conflicts. `tests/plan_api_test.cpp`: each compatibility
-rule, the cache of verified references, and a write committed across a DDL
+rule, `bc_ctx_check`, and a write committed across a DDL
 on its table is a conflict. `tests/plan_writes_test.cpp`: `bc_insert`,
 `bc_update`, `bc_delete` and `bc_del_range` keep every index exact,
 unique, `DESC` and nullable parts included, and an index created after a

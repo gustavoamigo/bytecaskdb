@@ -9,7 +9,8 @@
 // exception terminates the process; these plans are C++, so an escape
 // shows here as a throw out of bc_ctx_run. A commit whose allocations
 // fail never reports BC_COMMITTED with an error set, and a verification
-// that fails part-way leaves its cache entry to be rebuilt whole.
+// that fails part-way leaves the context's verified reference to be rebuilt
+// whole by the next run, whose rows are checked.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -105,21 +106,16 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
     std::vector<bc_value> params;
     std::vector<PhysType> result;
     int clean;  // the error of a run no allocation failure reached
-    // One reference for every run: a verification failed part-way leaves
-    // its cache entry, and the next run must rebuild it whole. Otherwise a
-    // fresh reference each run, so every run verifies.
-    bool reuse_ref{false};
     std::vector<std::vector<bc_value>> rows{};  // a clean run's result rows, when checked
   };
   const std::vector<Case> cases{
       {"insert", insert_row, {std::int64_t{9}, bytes("nine"), std::int64_t{90}}, {}, BC_OK},
       {"bc_emit_col", emit_row, {std::int64_t{2}}, {PhysType::I64, PhysType::Bytes, PhysType::I64}, BC_OK},
-      {"bc_emit_col, one reference",
+      {"bc_emit_col, rows checked",
        emit_row,
        {std::int64_t{2}},
        {PhysType::I64, PhysType::Bytes, PhysType::I64},
        BC_OK,
-       true,
        {{std::int64_t{2}, bytes("n2"), std::int64_t{20}}}},
       {"bc_emit_key_part", emit_names, {}, {PhysType::Bytes}, BC_OK},
       {"update", bump_qty, {std::int64_t{3}}, {}, BC_OK},
@@ -130,17 +126,14 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
   for (const auto& c : cases) {
     INFO(c.name);
     auto failed = 0;
-    SchemaRef kept{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), type_codes(c.result),
-                   f.cat().version()};
-    auto kept_ref = kept.get();
     for (long nth = 1;; ++nth) {
       REQUIRE(nth < 100000);
-      // Built outside the count: a fresh reference id each time, so the run
-      // verifies it, and verification's allocations are failed too.
+      // Built outside the count. The run verifies it, so verification's
+      // allocations are failed too.
       auto ps = params(c.params);
       SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), type_codes(c.result),
                    f.cat().version()};
-      auto ref = c.reuse_ref ? kept_ref : sr.get();
+      auto ref = sr.get();
       bc_ctx_begin(f.cx, &ps, {});
       auto threw = false;
       bytecask::testing::AllocFaultReport report;
@@ -189,7 +182,7 @@ TEST_CASE("plan API: a commit whose allocations fail is never BC_COMMITTED with 
     {
       // The engine leaks a key directory node it cannot place for want of
       // memory rather than free one still reachable (#390).
-      bytecask::testing::ExpectedLeaks leaks;
+      [[maybe_unused]] const bytecask::testing::ExpectedLeaks leaks;
       bytecask::testing::ScopedAllocFaults faults{nth, false};
       try {
         r = bc_ctx_commit(f.cx, false);

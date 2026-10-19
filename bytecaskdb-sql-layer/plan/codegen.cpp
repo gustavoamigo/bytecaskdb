@@ -388,9 +388,6 @@ auto generate_plan(const bound::Bound& b, const Catalog& cat, std::string_view s
   GeneratedPlan out;
   out.param_types = b.param_types;
   out.catalog_version = cat.version();
-  // A reference id per compile, issued by the runtime, so a context's cache
-  // of verified references never mistakes a recompiled plan for the old one.
-  out.id = bc_ref_id();
   auto build = [&](const Table& t, auto&& body) {
     Writer w{t};
     body(w);

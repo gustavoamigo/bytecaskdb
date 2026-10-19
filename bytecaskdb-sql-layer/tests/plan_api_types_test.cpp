@@ -143,7 +143,7 @@ TEST_CASE("plan API: the symbol table names every plan-callable function of the 
     std::smatch m;
     if (!std::regex_search(line, m, decl)) continue;
     auto name = m[1].str();
-    if (name.starts_with("bc_ctx_") || name.starts_with("bc_error") || name == "bc_execute" || name == "bc_ref_id") continue;
+    if (name.starts_with("bc_ctx_") || name.starts_with("bc_error") || name == "bc_execute") continue;
     declared.insert(name);
   }
   std::set<std::string> table;
@@ -678,7 +678,7 @@ TEST_CASE("plan API: result rows follow the schema ref's types; limits and types
   CHECK(run(f, set_wrong_type, {}) == BC_FAILED);  // naming a column wrongly is a plan bug
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
   const std::uint8_t bad_code[] = {9};
-  bc_schema_ref ref{0, f.cat().version(), nullptr, 0, nullptr, 0, nullptr, 0, bad_code, 1};
+  bc_schema_ref ref{f.cat().version(), nullptr, 0, nullptr, 0, nullptr, 0, bad_code, 1};
   CHECK(bc_execute(f.cx, emit_without_types, &ref, &ps, {}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
   CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
@@ -826,7 +826,7 @@ TEST_CASE("plan API: a second commit and a too-wide result are plan errors, not 
   CHECK(bc_ctx_commit(f.cx, false) == BC_COMMITTED);  // reset dropped the effects too
 
   std::vector<std::uint8_t> wide(9000, BC_T_I64);
-  bc_schema_ref ref{0, f.cat().version(), nullptr, 0, nullptr, 0, nullptr, 0, wide.data(),
+  bc_schema_ref ref{f.cat().version(), nullptr, 0, nullptr, 0, nullptr, 0, wide.data(),
                     static_cast<std::uint32_t>(wide.size())};
   auto none = params({});
   CHECK(bc_execute(f.cx, scan_all_forward, &ref, &none, {}, false, 0) == BC_FAILED);

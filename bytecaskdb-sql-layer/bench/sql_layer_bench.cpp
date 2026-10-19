@@ -2,11 +2,11 @@
 // Copyright (c) 2026 Gustavo Amigo
 //
 // sql_layer_bench — micro-benchmarks of the plan API's fixed costs, on the
-// TPROC-C schema: what bc_ctx_run's compatibility check adds to an execution
-// (a point read's reference and a New-Order-sized one), what verifying a
-// reference and mapping its column ids to positions costs when it is not
-// cached, what one column decode costs, and what bc_update costs when no
-// indexed column changes. Not part of CI. The published
+// TPROC-C schema: what bc_ctx_run's verification of its reference, the
+// compatibility check and the map from column ids to positions, adds to an
+// execution (a point read's reference and a New-Order-sized one), what one
+// column decode costs, and what bc_update costs when no indexed column
+// changes. Not part of CI. The published
 // numbers were taken in releasedbg (-O3 -march=native, no LTO):
 //   xmake f -m releasedbg && xmake build sql_layer_bench && xmake run sql_layer_bench
 // release adds LTO, whose link fails where llvm-ar is older than clang (it
@@ -92,7 +92,7 @@ struct Ref {
 
 auto n32(std::size_t n) -> std::uint32_t { return static_cast<std::uint32_t>(n); }
 
-auto make_ref(const Catalog& cat, const RefSpec& s, std::uint64_t id) -> std::unique_ptr<Ref> {
+auto make_ref(const Catalog& cat, const RefSpec& s) -> std::unique_ptr<Ref> {
   auto r = std::make_unique<Ref>();
   for (const auto& name : s.read) r->read.push_back(cat.table(name)->id);
   for (const auto& name : s.written) r->written.push_back(cat.table(name)->id);
@@ -102,8 +102,7 @@ auto make_ref(const Catalog& cat, const RefSpec& s, std::uint64_t id) -> std::un
     r->cols.push_back({t->id, c->id, static_cast<std::uint8_t>(c->type)});
   }
   r->result = result_type_codes(s.result);
-  r->ref = {id,
-            cat.version(),
+  r->ref = {cat.version(),
             r->read.data(),
             n32(r->read.size()),
             r->written.data(),
@@ -275,58 +274,17 @@ int main() {
       bc_ctx_reset(cx);
       return t;
     };
-    // Every run has a reference: the baseline is an empty one, cached, so
-    // the lines below are what a reference's contents add.
-    auto empty = make_ref(*cat, {}, bc_ref_id());
+    // Every run has a reference and verifies it: the baseline is an empty
+    // one, so the lines below are what a reference's contents add.
+    auto empty = make_ref(*cat, {});
     auto base = runs(&empty->ref);
     std::printf("bc_ctx_run of an empty plan, empty schema ref: %7.1f ns\n", base);
     for (const auto& [name, spec] : {std::pair{"point read", &point}, std::pair{"New-Order", &new_order}}) {
-      auto cached = make_ref(*cat, *spec, bc_ref_id());
-      auto uncached = make_ref(*cat, *spec, 0);  // id 0: verified on every run
-      auto hit = runs(&cached->ref) - base;
-      auto miss = runs(&uncached->ref) - base;
-      std::printf("%-10s (%2zu cols, %2zu objects): check, cached %7.1f ns; verify and map ids %7.1f ns\n", name,
-                  spec->cols.size(), spec->read.size() + spec->written.size(), hit, miss);
+      auto ref = make_ref(*cat, *spec);
+      std::printf("%-10s (%2zu cols, %2zu objects): verify and map ids, per run %7.1f ns\n", name, spec->cols.size(),
+                  spec->read.size() + spec->written.size(), runs(&ref->ref) - base);
     }
-    // 50 New-Order-sized references run in turn, as a workload of many
-    // prepared statements does: each must stay cached between its runs.
-    {
-      std::vector<std::unique_ptr<Ref>> many;
-      for (int i = 0; i < 50; ++i) many.push_back(make_ref(*cat, new_order, bc_ref_id()));
-      std::size_t at = 0;
-      bc_ctx_begin(cx, &ps, {});
-      for (const auto& r : many) bc_ctx_run(cx, noop, &r->ref);  // the first verification of each
-      auto cycled = ns_per_iter(
-          [&] {
-            bc_ctx_run(cx, noop, &many[at]->ref);
-            at = (at + 1) % many.size();
-          },
-          kIters);
-      if (bc_error(cx) != BC_OK) std::printf("error: %s\n", bc_error_message(cx));
-      bc_ctx_reset(cx);
-      std::printf("50 New-Order refs in turn: check per run %7.1f ns\n", cycled - base);
-    }
-    // 1,500 dead references fill the cache, as recompiles leave it, then two
-    // live ones run in turn: CLOCK evicts the dead, and both hit.
-    {
-      std::vector<std::unique_ptr<Ref>> dead;
-      for (int i = 0; i < 1500; ++i) dead.push_back(make_ref(*cat, new_order, bc_ref_id()));
-      auto a = make_ref(*cat, new_order, bc_ref_id());
-      auto b = make_ref(*cat, new_order, bc_ref_id());
-      bc_ctx_begin(cx, &ps, {});
-      for (const auto& r : dead) bc_ctx_run(cx, noop, &r->ref);
-      auto turn = false;
-      auto alternating = ns_per_iter(
-          [&] {
-            bc_ctx_run(cx, noop, turn ? &a->ref : &b->ref);
-            turn = !turn;
-          },
-          kIters);
-      if (bc_error(cx) != BC_OK) std::printf("error: %s\n", bc_error_message(cx));
-      bc_ctx_reset(cx);
-      std::printf("1,500 dead refs, then 2 live ones in turn: check per run %7.1f ns\n", alternating - base);
-    }
-    auto wref = make_ref(*cat, {{"warehouse"}, {}, {{"warehouse", "w_tax"}}, {}}, bc_ref_id());
+    auto wref = make_ref(*cat, {{"warehouse"}, {}, {{"warehouse", "w_tax"}}, {}});
     auto run = [&](bc_plan_fn plan, const bc_schema_ref* ref) {
       bc_ctx_begin(cx, &ps, {});
       bc_ctx_run(cx, plan, ref);
@@ -336,7 +294,7 @@ int main() {
     auto d0 = ns_per_iter([&] { run(decode_0, &wref->ref); }, kIters);
     auto d64 = ns_per_iter([&] { run(decode_64, &wref->ref); }, kIters);
     std::printf("bc_col_i64 + bc_add, by column id:         %8.1f ns per call\n", (d64 - d0) / 64);
-    auto pref = make_ref(*cat, {{"customer"}, {"customer"}, {{"customer", "c_balance"}}, {}}, bc_ref_id());
+    auto pref = make_ref(*cat, {{"customer"}, {"customer"}, {{"customer", "c_balance"}}, {}});
     bc_params ps3{{std::int64_t{1}, std::int64_t{1}, std::int64_t{1}}};
     auto run3 = [&](bc_plan_fn plan) {
       bc_ctx_begin(cx, &ps3, {});
