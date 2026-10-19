@@ -10,6 +10,11 @@ of the contract must be one of:
   - a name declared in the interface's files, comments excluded;
   - a name the pair allows (ALLOWED and the pair's own words below).
 
+A C++ module interface (.cppm) contributes what an importer of it sees: its
+text after `export module`, without the members under `private:`, and the
+same of every module it re-exports with `export import`, found by name among
+the root's .cppm files.
+
 The pairs:
 
   - engine: CONTRACT.md against include/bytecask.hpp;
@@ -24,6 +29,7 @@ the `db` of `db.vacuum()`).
 Usage: scripts/check_contract_vocabulary.py [--only engine|sql-layer] [root]
 """
 
+import argparse
 import pathlib
 import re
 import sys
@@ -45,12 +51,15 @@ ALLOWED = {
     "while", "optional", "span", "shared_ptr", "invalid_argument",
     "runtime_error", "logic_error", "system_error", "bad_alloc",
     "milliseconds", "max", "min",
-    # The platform. A syscall may be named where a public option (io_backend)
-    # or the storage assumption under `open` selects it.
+}
+
+# The engine's own words. A syscall may be named where a public option
+# (io_backend) or the storage assumption under `open` selects it; file naming
+# is documented in docs/file_format.md.
+ENGINE_WORDS = {
     "fdatasync", "fsync", "pread", "pwritev", "writev", "mmap", "ftruncate",
     "SIGBUS", "O_EXCL", "O_DIRECT", "MAP_SHARED", "MAP_PRIVATE", "ENOENT",
     "EIO",
-    # File naming, documented in docs/file_format.md.
     "stem",
 }
 
@@ -65,7 +74,7 @@ SQL_WORDS = {
 
 # name -> (contract, interface files, extra allowed words)
 PAIRS = {
-    "engine": ("CONTRACT.md", ["include/bytecask.hpp"], set()),
+    "engine": ("CONTRACT.md", ["include/bytecask.hpp"], ENGINE_WORDS),
     "sql-layer": (
         "bytecaskdb-sql-layer/CONTRACT.md",
         ["bytecaskdb-sql-layer/algebra/bc_plan.h", "bytecaskdb-sql-layer/api/database.cppm"],
@@ -79,10 +88,40 @@ def strip_comments(src: str) -> str:
     return re.sub(r"//[^\n]*", " ", src)
 
 
+EXPORT_MODULE = re.compile(r"^export\s+module\s+([\w.]+)\s*;", re.M)
+EXPORT_IMPORT = re.compile(r"^export\s+import\s+([\w.]+)\s*;", re.M)
+# A class's private members, up to its next access specifier or its closing
+# brace at column 0 (the layer's classes are not nested).
+PRIVATE = re.compile(r"\bprivate:.*?(?=\bpublic:|\bprotected:|^\};)", re.S | re.M)
+
+
+def module_text(src: str) -> str:
+    """What an importer of a module interface can name."""
+    m = EXPORT_MODULE.search(src)
+    if m:
+        src = src[m.end():]  # drops the global module fragment
+    return PRIVATE.sub(" ", src)
+
+
 def public_names(root: pathlib.Path, interface: list[str]) -> set[str]:
+    modules = {}
+    for path in root.rglob("*.cppm"):
+        m = EXPORT_MODULE.search(strip_comments(path.read_text()))
+        if m:
+            modules[m.group(1)] = path
     names: set[str] = set()
-    for path in interface:
-        names |= set(IDENT.findall(strip_comments((root / path).read_text())))
+    pending = [root / path for path in interface]
+    seen: set[pathlib.Path] = set()
+    while pending:
+        path = pending.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        src = strip_comments(path.read_text())
+        if path.suffix == ".cppm":
+            pending += [modules[m] for m in EXPORT_IMPORT.findall(src) if m in modules]
+            src = module_text(src)
+        names |= set(IDENT.findall(src))
     return names
 
 
@@ -123,19 +162,14 @@ def check(root: pathlib.Path, contract: str, interface: list[str], words: set[st
 
 
 def main() -> int:
-    args = sys.argv[1:]
-    only = None
-    if len(args) >= 2 and args[0] == "--only":
-        only = args[1]
-        args = args[2:]
-        if only not in PAIRS:
-            print(f"--only takes one of {', '.join(PAIRS)}, not {only}")
-            return 2
-    root = pathlib.Path(args[0] if args else ".")
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--only", choices=PAIRS, help="check one pair (default: all)")
+    parser.add_argument("root", nargs="?", default=".", type=pathlib.Path)
+    args = parser.parse_args()
     ok = True
     for name, (contract, interface, words) in PAIRS.items():
-        if only is None or only == name:
-            ok = check(root, contract, interface, words) and ok
+        if args.only is None or args.only == name:
+            ok = check(args.root, contract, interface, words) and ok
     return 0 if ok else 1
 
 

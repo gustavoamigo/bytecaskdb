@@ -75,8 +75,9 @@ Its third-party dependencies are fetched at build time, not vendored:
 libpg_query (PostgreSQL licence, with its bundled protobuf-c, MIT/BSD) and
 TinyCC (LGPL-2.1). The xmake targets that use them are not built by default;
 its own workflow, `.github/workflows/sql-layer.yml`, builds and runs
-`sql_layer_tests`, under the sanitizers too; the engine's workflows do not
-build the layer. Its design documents are in `bytecaskdb-sql-layer/docs/`, and
+`sql_layer_tests`, under the sanitizers too; the engine's workflows build none
+of the layer's targets, though configuring the build still fetches and builds
+its two packages there. Its design documents are in `bytecaskdb-sql-layer/docs/`, and
 what it guarantees is in `bytecaskdb-sql-layer/CONTRACT.md`, whose vocabulary
 `.github/workflows/contract.yml` checks.
 

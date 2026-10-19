@@ -29,7 +29,8 @@ tests hand-write some.
 runs one execution, and repeats it after a conflict.
 
 **Run**: one `bc_ctx_run` of a plan within an execution. In stage 1 every
-statement is one execution of one run.
+execution of a statement is one run; a statement retried after a conflict or
+recompiled is several executions.
 
 **Statement**: one SQL statement given to `Database::execute`.
 
@@ -54,7 +55,7 @@ column's, a second write of one row.
 |---|---|
 | A plan in the subset has no undefined behaviour of its own: the arithmetic C leaves undefined is defined by the API (`bc_add` and the other helpers report overflow, division by zero and out-of-range conversion as `BC_E_ARITH`), and a stale or foreign handle or view is `BC_E_HANDLE`, never a dangling read. | "plan API: the arithmetic helpers define what C leaves undefined", "plan API: bc_sub reports overflow instead of wrapping", "plan API: a handle from an earlier execution is stale", "plan API: a cursor's views die when it steps" |
 | No plan runs unbounded: every read and cursor step is charged to the execution's `bc_budget`, and its deadline is checked as the work is charged. Exhausting either is `BC_E_BUDGET`. | "plan API: the budget ends a plan, and scans stay inside their table", "plan API: a charge of several units does not step over the deadline check", "plan writes: the reads each read and write is charged" |
-| A plan never waits: a run takes no lock another run holds, and the commit happens after the plan returns. | none |
+| A run never waits: it takes no lock another run holds, and the commit happens after the plan returns. Only `bc_ctx_begin` may wait, for a DDL of the same catalog to finish publishing. | none |
 | Errors are sticky: after the first, every call returns a neutral value, the run ends, and nothing it planned is committed. | "plan API: an error is sticky and nothing is committed" |
 | A wrong plan gets an error code, or a wrong answer from data it was entitled to read; never a crash, a corrupted database or a write outside the tables it declared. | "plan API: a plan names only the objects its reference declares", "plan API: a second commit and a too-wide result are plan errors, not UB or corruption", "plan writes: a second write of one row in one plan is refused" |
 | No exception reaches a plan. An allocation that fails in any call is `BC_E_MEMORY`, and the process continues; a commit whose allocation fails is never reported `BC_COMMITTED`. | "plan API: an allocation failure in any call is BC_E_MEMORY, never an exception into the plan", "plan API: a commit whose allocations fail is never BC_COMMITTED with an error set" |
@@ -69,7 +70,7 @@ column's, a second write of one row.
 | `BC_E_CONSTRAINT` is final: `bc_execute` does not retry it, and nothing of the execution is committed. Only `BC_CONFLICT` is retried. | "plan API: a raised constraint error is final: no retry, nothing committed", "plan writes: a duplicate is BC_E_CONSTRAINT and never retried" |
 | A duplicate primary or unique key is `BC_E_CONSTRAINT` with `BC_C_UNIQUE` and the table's or the index's id; SQL reports it as SQLSTATE 23505. Nulls are distinct: a unique index part that is NULL collides with nothing. | "plan writes: a duplicate is BC_E_CONSTRAINT and never retried", "embedded API: a unique index refuses duplicates, treats nulls as distinct, and moves with UPDATE" |
 | A NULL for a `NOT NULL` column, given or left unset with no default, is `BC_E_CONSTRAINT` with `BC_C_NOT_NULL` and the table's id. The column keeps its default. | "plan writes: a NULL for a NOT NULL column is BC_C_NOT_NULL, never retried, and keeps the default" |
-| Every `BC_E_LAYOUT` carries a `bc_layout_detail`. `BC_L_INCOMPATIBLE` is the only one a recompile of the statement can cure. `BC_L_PLAN` is a malformed plan or `bc_schema_ref`; `BC_L_ROW` a row used with a table it is not of. | "plan API: bc_ctx_run checks what a plan depends on, not a catalog version", "plan API: result rows follow the schema ref's types; limits and types are checked", "plan API: a plan names only the objects its reference declares", "plan writes: a missing row and a wrong row are errors, never skipped" |
+| Every `BC_E_LAYOUT` carries a `bc_layout_detail`. `BC_L_INCOMPATIBLE` is the only one a recompile of the statement can cure. `BC_L_PLAN` is a malformed plan or `bc_schema_ref`; `BC_L_ROW` a row used with a table it is not of, or a column its layout lacks. | "plan API: bc_ctx_run checks what a plan depends on, not a catalog version", "plan API: result rows follow the schema ref's types; limits and types are checked", "plan API: a plan names only the objects its reference declares", "plan writes: a missing row and a wrong row are errors, never skipped" |
 | `BC_L_RETIRED`, a row of a layout generation `REBUILD` retired, cannot occur in stage 1, which has no `REBUILD` (#503). | none |
 
 ---

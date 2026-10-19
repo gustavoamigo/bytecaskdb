@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Sanitizer checks: bytecask_tests under ASan, TSan, MSan and UBSan, on each
-# key directory (BYTECASK_KEYDIR).
+# key directory (BYTECASK_KEYDIR). sql-layer.yml calls it for sql_layer_tests.
 #
 # ci.yml calls this workflow and picks the matrix: ASan, TSan and UBSan on the
 # default blind tree, for a PR and for the push to main that merges it. The
@@ -32,6 +32,10 @@ on:
         description: "JSON array of sanitizers (address, thread, memory, undefined)"
         type: string
         required: true
+      target:
+        description: "The test target to build and run"
+        type: string
+        default: bytecask_tests
   schedule:
     - cron: "40 2 * * *"
   workflow_dispatch:
@@ -72,7 +76,9 @@ jobs:
             python3-pip python3-devel \
             git ninja-build
           # bytecaskdb_python's on_load() asks nanobind for its include dir,
-          # and xmake f loads every target.
+          # and xmake f loads every target. make and which: the libpg_query
+          # and TinyCC builds, since configuring resolves the SQL layer's
+          # packages though no layer target is built here.
           pip3 install nanobind pytest hypothesis
 
       # build_msan_libcxx.sh picks its llvm-project release branch from the
@@ -106,23 +112,24 @@ jobs:
             --sanitizer=${{ matrix.sanitizer }} \
             -m debug -y
 
+      # Scheduled and dispatched runs have no inputs: bytecask_tests.
       - name: Build
+        env:
+          TARGET: ${{ inputs.target || 'bytecask_tests' }}
         run: |
-          xmake build bytecask_tests
-          if [ "${{ matrix.sanitizer }}" = "undefined" ] && [ "${{ matrix.keydir }}" = "blind" ]; then
+          xmake build -y "$TARGET"
+          if [ "$TARGET" = "bytecask_tests" ] && [ "${{ matrix.sanitizer }}" = "undefined" ] && [ "${{ matrix.keydir }}" = "blind" ]; then
             xmake build btree_tests
           fi
-
-      # The SQL layer's sanitizer runs are in sql-layer.yml.
 
       # The key-directory trees' own tests, where the bit arithmetic is
       # exercised most directly. They do not depend on BYTECASK_KEYDIR, so
       # one key directory runs them.
       - name: Run tree tests under undefined sanitizer
-        if: matrix.sanitizer == 'undefined' && matrix.keydir == 'blind'
+        if: (inputs.target || 'bytecask_tests') == 'bytecask_tests' && matrix.sanitizer == 'undefined' && matrix.keydir == 'blind'
         run: xmake run btree_tests
 
-      - name: Run tests under ${{ matrix.sanitizer }} sanitizer on ${{ matrix.keydir }} key directory
+      - name: Run ${{ inputs.target || 'bytecask_tests' }} under ${{ matrix.sanitizer }} sanitizer on ${{ matrix.keydir }} key directory
         # No halt_on_error=0 for ASan/MSan: without -fsanitize-recover=<san>
         # Clang emits the noreturn report stubs (__asan_report_*, not
         # *_noabort; __msan_warning_noreturn, not __msan_warning), so the
@@ -135,4 +142,4 @@ jobs:
           TSAN_OPTIONS: ${{ matrix.sanitizer == 'thread' && 'halt_on_error=0 history_size=4' || '' }}
         # --durations prints each test as it finishes, so a run cut off by
         # the timeout shows the last test that completed.
-        run: xmake run bytecask_tests --durations yes
+        run: xmake run "${{ inputs.target || 'bytecask_tests' }}" --durations yes

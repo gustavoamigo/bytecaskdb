@@ -50,6 +50,9 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # make and which: the libpg_query and TinyCC builds. Configuring
+          # resolves the SQL layer's packages (bytecaskdb-sql-layer/xmake.lua)
+          # though this job builds no layer target.
           dnf install -y \
             clang llvm llvm-devel lld \
             libcxx libcxx-devel libstdc++-static \

@@ -27,6 +27,8 @@ on:
       - "tests/alloc_faults.cpp"
       - "tests/alloc_faults.h"
       - ".github/workflows/sql-layer.yml"
+      # Runs the sanitizer jobs.
+      - ".github/workflows/sanitizers.yml"
       - "scripts/enrich_junit_sources.py"
   pull_request:
     # No branches filter: any base.
@@ -40,6 +42,8 @@ on:
       - "tests/alloc_faults.cpp"
       - "tests/alloc_faults.h"
       - ".github/workflows/sql-layer.yml"
+      # Runs the sanitizer jobs.
+      - ".github/workflows/sanitizers.yml"
       - "scripts/enrich_junit_sources.py"
   # The sanitizers' nightly run, as sanitizers.yml has for the engine.
   schedule:
@@ -138,58 +142,14 @@ jobs:
           fail_ci_if_error: false
           use_oidc: true
 
-  # The coverage sanitizers.yml gave the layer: ASan, TSan and UBSan, debug
-  # builds. Not under MSan: libpg_query and TinyCC are built uninstrumented
-  # by their package rules, and MSan reports their stores as uninitialized
-  # reads. The catalog does not depend on BYTECASK_KEYDIR, so the default key
-  # directory runs it.
+  # ASan, TSan and UBSan, debug builds, through the engine's sanitizers.yml.
+  # Not under MSan: libpg_query and TinyCC are built uninstrumented by their
+  # package rules, and MSan reports their stores as uninitialized reads. The
+  # catalog does not depend on BYTECASK_KEYDIR, so the default key directory
+  # runs it.
   sql-layer-sanitizers:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    container:
-      image: fedora:43
-    env:
-      BYTECASK_MARCH: x86-64-v3
-      XMAKE_ROOT: "y"
-      CLANG_TARGET_TRIPLE: x86_64-redhat-linux-gnu
-    strategy:
-      fail-fast: false
-      matrix:
-        sanitizer: [address, thread, undefined]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          dnf install -y \
-            clang llvm llvm-devel lld \
-            libcxx libcxx-devel libstdc++-static \
-            xmake cmake make which \
-            python3-pip python3-devel \
-            git ninja-build
-          pip3 install nanobind
-
-      - name: Cache xmake packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.xmake/packages
-          key: xmake-packages-sql-layer-fedora43-${{ hashFiles('xmake.lua', 'bytecaskdb-sql-layer/xmake.lua') }}
-
-      - name: Configure xmake
-        run: |
-          RESOURCE_DIR=$(clang --print-resource-dir)
-          xmake f --toolchain=clang \
-            --cxflags="-resource-dir=${RESOURCE_DIR}" \
-            --sanitizer=${{ matrix.sanitizer }} \
-            -m debug -y
-
-      - name: Build sql_layer_tests
-        run: xmake build -y sql_layer_tests
-
-      - name: Run sql_layer_tests under ${{ matrix.sanitizer }} sanitizer
-        env:
-          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
-          TSAN_OPTIONS: ${{ matrix.sanitizer == 'thread' && 'halt_on_error=0 history_size=4' || '' }}
-        # --durations prints each test as it finishes, so a run cut off by
-        # the timeout shows the last test that completed.
-        run: xmake run sql_layer_tests --durations yes
+    uses: ./.github/workflows/sanitizers.yml
+    with:
+      target: sql_layer_tests
+      keydirs: '["blind"]'
+      sanitizers: '["address", "thread", "undefined"]'
