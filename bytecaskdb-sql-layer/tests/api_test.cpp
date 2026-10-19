@@ -146,13 +146,12 @@ TEST_CASE("embedded API: a plan the catalog refuses is recompiled and run again"
   // Once recompiled they run without another compile.
   CHECK(db->execute(insert, {i(3), bytes("cherry"), i(30)}).affected == 1);
   CHECK(db->compilations() == compiled + 3);
-  // Parameters no plan of the text takes are refused once it is recompiled
-  // against the current catalog, the API's only check: one compile, and
-  // the plan runs again without another.
+  // Parameters a plan the catalog still accepts does not take are refused
+  // without a compile: the runtime says the plan fits (bc_ctx_check).
   CHECK_THROWS_AS(db->execute(insert, {i(9), bytes("x"), bytes("y")}), std::invalid_argument);
-  CHECK(db->compilations() == compiled + 4);
+  CHECK(db->compilations() == compiled + 3);
   CHECK(db->execute(insert, {i(9), bytes("x"), i(90)}).affected == 1);
-  CHECK(db->compilations() == compiled + 4);
+  CHECK(db->compilations() == compiled + 3);
 
   // The parameters are checked against the recompiled plan: qty is now
   // bytes. Parameters of the new types are taken at once, though the stale

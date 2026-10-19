@@ -151,15 +151,25 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   auto check_params = [](const std::string& why) {
     if (!why.empty()) throw std::invalid_argument(why);
   };
-  // Parameters that do not fit the cached plan may fit the plan a DDL has
-  // since made of the text: they are refused only once the plan is
-  // recompiled against the current catalog. So a call with wrong parameters
-  // costs a compile; compatibility itself is decided by bc_ctx_run alone.
-  if (auto why = mismatch(); !why.empty()) {
-    compile(stmt);
-    check_params(mismatch());
-  }
   bc_params bp{params};
+  // Parameters that do not fit the cached plan may fit the plan a DDL has
+  // since made of the text. The runtime says whether the cached plan still
+  // fits the catalog (bc_ctx_check, the verification bc_ctx_run makes); it
+  // is recompiled only if not, and the parameters are refused against the
+  // plan that will run. The runtime alone decides compatibility.
+  if (auto why = mismatch(); !why.empty()) {
+    bc_ctx_begin(cx_, &bp, {});
+    auto fits = bc_ctx_check(cx_, &stmt.ref_);
+    auto stale = !fits && bc_error(cx_) == BC_E_LAYOUT && bc_error_detail(cx_) == BC_L_INCOMPATIBLE;
+    if (!fits && !stale) {
+      ExecError e{bc_error_message(cx_), bc_error(cx_)};
+      bc_ctx_reset(cx_);
+      throw e;
+    }
+    bc_ctx_reset(cx_);
+    if (stale) compile(stmt);
+    check_params(stale ? mismatch() : why);
+  }
   auto r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
   // bc_ctx_run checks the plan against the catalog it pinned. A plan a DDL
   // made incompatible (BC_E_LAYOUT with BC_L_INCOMPATIBLE) is recompiled

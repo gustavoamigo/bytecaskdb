@@ -276,7 +276,12 @@ typedef struct { uint32_t table, col; uint8_t type; } bc_col_ref;
 /* What a plan was compiled against, and the types of the rows it emits, in
    emit order. bc_ctx_run checks the objects and columns against the pinned
    catalog version (docs/sql_layer_catalog_design.md, *Compatibility*); the
-   result layout is the plan's own and is not a catalog object. */
+   result layout is the plan's own and is not a catalog object.
+   An id names one reference, and the reference is immutable while its id
+   is in use: a new or rebuilt reference takes a fresh id from bc_ref_id.
+   The runtime enforces it: a cached verification is served only while the
+   arrays hold, by value, what it was verified from, so a reference changed
+   under a kept id is verified again, never served another's result. */
 typedef struct {
   uint64_t id;                                                  /* from bc_ref_id, one per compiled plan; 0: checked on every run */
   uint64_t catalog_version;                                     /* compiled against; for messages */
@@ -326,6 +331,7 @@ bc_ctx *bc_ctx_new(bc_db *db, const bc_catalog *cat, uint32_t arena_bytes);
 void    bc_ctx_free(bc_ctx *);
 void    bc_ctx_begin(bc_ctx *, const bc_params *params, bc_budget budget);  /* takes the snapshot */
 void    bc_ctx_run(bc_ctx *, bc_plan_fn plan, const bc_schema_ref *compiled_against);
+bool    bc_ctx_check(bc_ctx *, const bc_schema_ref *compiled_against);      /* bc_ctx_run's verification alone */
 enum bc_commit_result bc_ctx_commit(bc_ctx *, bool sync);
 bool    bc_ctx_next_result(bc_ctx *, const uint8_t **row, uint32_t *len);     /* result rows, in emit order */
 void    bc_ctx_reset(bc_ctx *);                                               /* drops snapshot, plan, arena */
@@ -342,6 +348,7 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
 |---|---|
 | `bc_ctx_new` | Allocates a context bound to an open engine and a catalog, with an arena of `arena_bytes`. The arena is allocated once and reused. |
 | `bc_ctx_begin` | Pins a catalog version and takes a snapshot that agrees with it (no DDL committed between the two), binds the parameters, sets the budget. Clears the error. Must precede `bc_ctx_run`. |
+| `bc_ctx_check` | Verifies a `bc_schema_ref` against the pinned version as `bc_ctx_run` does, caching the result, and runs nothing. False with `BC_E_LAYOUT` where `bc_ctx_run` would refuse the plan. What a server calls to learn whether a cached plan still fits the catalog before it checks parameters against that plan. |
 | `bc_ctx_run` | Verifies the plan's `bc_schema_ref` against the catalog version the context pinned at `bc_ctx_begin`, then calls the plan and returns when it returns. Compatible means: every table and index it names exists; every column it reads or sets exists in its table with the type it was compiled with; every table it writes exists. Verifying also maps each declared column to its offset or slot in the current layout. A plan that fails sets `BC_E_LAYOUT` and does not run; the server recompiles it from the SQL it cached. Adding a column or an index never invalidates a plan, since the runtime maintains whatever indexes the table has; a drop invalidates the plans that name what it drops. There is no version-equality check. |
 | `bc_ctx_commit` | Submits the write plan with `apply_batch`, guarded by `ensure_unchanged` on the catalog record of every table whose keys it writes, so a DDL on such a table committed since the snapshot makes it a conflict: the index entries the runtime wrote follow the pinned version's indexes, and a `CREATE INDEX` committed after the snapshot would otherwise miss the row. `BC_COMMITTED` on success. `BC_CONFLICT` when the engine reports a guard or write-write conflict: nothing was written. `BC_FAILED` when `bc_error` is set, including an error raised during the plan: nothing is committed. A plan with no writes and no guards commits nothing and returns `BC_COMMITTED`. |
 | `bc_ctx_next_result` | Iterates the result buffer. Rows are in the row format of the layout the plan emitted. The runtime, not a plan, sees raw pointers here; valid until `bc_ctx_reset`. |

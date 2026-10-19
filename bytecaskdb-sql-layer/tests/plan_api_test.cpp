@@ -259,6 +259,33 @@ TEST_CASE("plan API: bc_ctx_run checks what a plan depends on, not a catalog ver
   CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);
 }
 
+TEST_CASE("plan API: bc_ctx_check verifies a reference as bc_ctx_run does, and runs nothing", "[sql][algebra][catalog]") {
+  Fixture f;
+  auto none = params({});
+  SchemaRef reads_index{{kIdx}, {}, {}, {}, 0};
+  auto ref = reads_index.get();
+  // Without bc_ctx_begin there is no pinned version to check against.
+  CHECK_FALSE(bc_ctx_check(f.cx, &ref));
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  bc_ctx_begin(f.cx, &none, {});
+  auto before = bc_ctx_verifications(f.cx);
+  CHECK(bc_ctx_check(f.cx, &ref));
+  CHECK(bc_ctx_verifications(f.cx) == before + 1);
+  CHECK(bc_ctx_affected(f.cx) == -1);  // no plan ran
+  bc_ctx_reset(f.cx);
+  // The run that follows is served the entry the check made.
+  CHECK(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_COMMITTED);
+  CHECK(bc_ctx_verifications(f.cx) == before + 1);
+  // A plan a DDL made incompatible: false, with the detail that asks for a
+  // recompile.
+  f.ddl(bytecask::sql::DropIndexDdl{"t_by_name"});
+  bc_ctx_begin(f.cx, &none, {});
+  CHECK_FALSE(bc_ctx_check(f.cx, &ref));
+  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);
+  bc_ctx_reset(f.cx);
+}
+
 TEST_CASE("plan API: a context caches a verified reference by id and catalog version", "[sql][algebra][catalog]") {
   Fixture f;
   auto none = params({});

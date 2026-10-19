@@ -287,6 +287,7 @@ struct bc_ctx {
   std::uint64_t verifications{0};  // runs the cache did not answer
   Verified scratch;
   const Verified* current{nullptr};  // this execution's reference; nullptr: none
+  const TableCols* last_table{nullptr};  // of current: the table declared() found last
 
   // Results: rows in the row format of the plan's result_types, each
   // preceded by its u32 length.
@@ -893,6 +894,7 @@ auto issued_ref_ids() -> std::atomic<std::uint64_t>& {
 [[nodiscard]] auto use_ref(bc_ctx* cx, const bc_schema_ref* ref) -> bool {
   if (ref == nullptr) {
     cx->current = nullptr;
+    cx->last_table = nullptr;
     return true;
   }
   // An id the runtime never issued is no id: verified on every run.
@@ -902,6 +904,7 @@ auto issued_ref_ids() -> std::atomic<std::uint64_t>& {
     if (!verify(cx, ref, e)) return false;
   }
   cx->current = &e;
+  cx->last_table = nullptr;
   return true;
 }
 
@@ -911,16 +914,23 @@ auto declared(bc_ctx* cx, std::uint32_t table, std::uint32_t col, std::optional<
     -> std::pair<const TableCols*, const ColSlot*> {
   if (!cx->ok()) return {};
   if (cx->current != nullptr) {
-    const auto& tables = cx->current->tables;
-    auto tc = std::ranges::lower_bound(tables, table, {}, &TableCols::table);
-    if (tc != tables.end() && tc->table == table && col < tc->by_col.size() && tc->by_col[col].declared) {
+    // Consecutive accesses mostly name one table: the last one found is
+    // tried before the search.
+    const auto* tc = cx->last_table;
+    if (tc == nullptr || tc->table != table) {
+      const auto& tables = cx->current->tables;
+      auto it = std::ranges::lower_bound(tables, table, {}, &TableCols::table);
+      tc = it != tables.end() && it->table == table ? &*it : nullptr;
+      cx->last_table = tc;
+    }
+    if (tc != nullptr && col < tc->by_col.size() && tc->by_col[col].declared) {
       const auto& s = tc->by_col[col];
       if (type && s.type != *type) {
         cx->fail(BC_E_HANDLE, "column " + std::to_string(col) + " of table " + std::to_string(table) + " is not " +
                                   type_name(*type));
         return {};
       }
-      return {&*tc, &s};
+      return {tc, &s};
     }
   }
   cx->fail(BC_E_HANDLE, "column " + std::to_string(col) + " of table " + std::to_string(table) +
@@ -1166,16 +1176,20 @@ void bc_ctx_begin(bc_ctx* cx, const bc_params* params, bc_budget budget) {
   BC_GUARD_END(cx)
 }
 
-void bc_ctx_run(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* compiled_against) {
-  if (!cx->ok()) return;
+bool bc_ctx_check(bc_ctx* cx, const bc_schema_ref* compiled_against) {
+  if (!cx->ok()) return false;
   if (!cx->snap) {
-    cx->fail(BC_E_HANDLE, "bc_ctx_run without bc_ctx_begin");
-    return;
+    cx->fail(BC_E_HANDLE, "bc_ctx_check or bc_ctx_run without bc_ctx_begin");
+    return false;
   }
   BC_GUARD_BEGIN
-  if (!use_ref(cx, compiled_against)) return;
+  (void)use_ref(cx, compiled_against);
   BC_GUARD_END(cx)
-  if (!cx->ok()) return;
+  return cx->ok();
+}
+
+void bc_ctx_run(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* compiled_against) {
+  if (!bc_ctx_check(cx, compiled_against)) return;
   plan(cx);
   if (cx->ok() && cx->emit) cx->fail(BC_L_PLAN, "result row begun and not ended");
 }

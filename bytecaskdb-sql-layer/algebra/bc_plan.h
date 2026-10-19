@@ -104,7 +104,12 @@ typedef struct {
    emit order. bc_ctx_run checks the objects and columns against the catalog
    version the context pinned (docs/sql_layer_catalog_design.md,
    *Compatibility*), and caches the result per id and catalog version; the
-   result layout is the plan's own and is not a catalog object. */
+   result layout is the plan's own and is not a catalog object.
+   An id names one reference, and the reference is immutable while its id
+   is in use: a new or rebuilt reference takes a fresh id from bc_ref_id.
+   The runtime enforces it: a cached verification is served only while the
+   arrays hold, by value, what it was verified from, so a reference changed
+   under a kept id is verified again, never served another's result. */
 typedef struct {
   uint64_t id;                                                    /* from bc_ref_id, one per compiled plan; 0: checked on every run */
   uint64_t catalog_version;                                       /* compiled against; for messages */
@@ -121,6 +126,7 @@ bc_ctx *bc_ctx_new(bc_db *db, const bc_catalog *cat, uint32_t arena_bytes);
 void    bc_ctx_free(bc_ctx *);
 void    bc_ctx_begin(bc_ctx *, const bc_params *params, bc_budget budget);  /* takes the snapshot */
 void    bc_ctx_run(bc_ctx *, bc_plan_fn plan, const bc_schema_ref *compiled_against);
+bool    bc_ctx_check(bc_ctx *, const bc_schema_ref *compiled_against);      /* bc_ctx_run's verification alone */
 enum bc_commit_result bc_ctx_commit(bc_ctx *, bool sync);
 bool    bc_ctx_next_result(bc_ctx *, const uint8_t **row, uint32_t *len);     /* result rows, in emit order */
 void    bc_ctx_reset(bc_ctx *);                                               /* drops snapshot, plan, arena */
