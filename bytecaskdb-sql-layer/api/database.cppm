@@ -178,6 +178,7 @@ public:
 
   // Closes the engine. A second call returns at once.
   void close();
+  [[nodiscard]] auto is_open() const noexcept -> bool { return !closed_; }
 
 private:
   Database() = default;

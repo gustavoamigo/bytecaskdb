@@ -128,17 +128,27 @@ def literal(t: Type, v) -> str:
     return "'" + v.replace("'", "''") + "'"
 
 
-PARAM = re.compile(r"\$(\d+)")
+# Outside a literal: a quoted string ('' escapes a quote), a $n
+# placeholder, a %, or any other character.
+TOKEN = re.compile(r"'(?:[^']|'')*'|\$(\d+)|%|[^'$%]+|.", re.S)
 
 
 def pg_params(sql: str, params) -> tuple[str, list | None]:
-    """$n placeholders to psycopg's %s, the parameters in their order. A
-    statement without parameters goes as written: its literals may hold "%"
-    or "$1", which are text, not placeholders."""
+    """$n placeholders to psycopg's %s, the parameters in their order. With
+    parameters, psycopg reads every % as a placeholder's, so a literal %
+    becomes %%; a $n inside a string literal is text. A statement without
+    parameters goes as written."""
     if not params:
         return sql, None
-    order = [int(n) - 1 for n in PARAM.findall(sql)]
-    return PARAM.sub("%s", sql), [params[i] for i in order]
+    out, order = [], []
+    for m in TOKEN.finditer(sql):
+        token = m.group(0)
+        if m.group(1) is not None:
+            order.append(int(m.group(1)) - 1)
+            out.append("%s")
+        else:
+            out.append(token.replace("%", "%%"))
+    return "".join(out), [params[i] for i in order]
 
 
 FLOAT4_OID = 700
@@ -181,8 +191,12 @@ def run_pg(conn, sql: str, params=()) -> Outcome:
             rows = cur.fetchall() if cur.description else []
             oids = [d.type_code for d in cur.description] if cur.description else []
             affected = cur.rowcount if changes_rows(sql) else None
+    except (psycopg.OperationalError, psycopg.InterfaceError):
+        raise  # the connection or the driver failed: not an outcome
     except psycopg.Error as e:
-        state = e.sqlstate or ""
+        if not e.sqlstate:
+            raise  # no SQLSTATE: not PostgreSQL refusing the statement
+        state = e.sqlstate
         known = state in SQLSTATE.values() or state in RANGE_STATES
         return Outcome(error=state if known else "refused", detail=f"{state} {e}")
     return Outcome(rows=tuple(tuple(from_pg(v, oid) for v, oid in zip(row, oids)) for row in rows), affected=affected)
