@@ -349,6 +349,7 @@ TEST_CASE("embedded API: an allocation failure in commit() never changes its out
           REQUIRE(b.commit() == CommitOutcome::Committed);
         }
         {
+          [[maybe_unused]] const bytecask::testing::ExpectedLeaks leaks;  // the engine's, as in plan_alloc_faults_test
           bytecask::testing::ScopedAllocFaults faults{nth, false};
           try {
             (void)a.commit();
@@ -413,6 +414,7 @@ TEST_CASE("embedded API: an allocation failure while an autocommit error is repo
       std::string outcome;
       auto fired = false;
       {
+        [[maybe_unused]] const bytecask::testing::ExpectedLeaks leaks;  // the engine's, as in plan_alloc_faults_test
         bytecask::testing::ScopedAllocFaults faults{nth, false};
         try {
           (void)db->execute(conflict ? update : insert, params);
