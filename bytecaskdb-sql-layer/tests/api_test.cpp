@@ -178,6 +178,22 @@ TEST_CASE("embedded API: a plan the catalog refuses is recompiled and run again"
   CHECK(db->execute(by_id, {i(6)}).rows == Grid{{i(6), i(60)}});
 }
 
+TEST_CASE("embedded API: parameters are checked against the plan that will run", "[sql][api][catalog]") {
+  sql_test::TempDir dir{"api_stale_params"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v BIGINT)");
+  const auto& by_k = db->prepare("SELECT v FROM t WHERE k = $1");
+  CHECK(db->execute(by_k, {i(1)}).rows.empty());
+  // The key is recreated as BIGINT: the parameter's physical type is the
+  // same, so the cached plan's types fit, but its INTEGER range is the
+  // dropped table's. The plan is verified, recompiled, and only then is
+  // the parameter checked, against BIGINT.
+  (void)db->execute("DROP TABLE t");
+  (void)db->execute("CREATE TABLE t (k BIGINT PRIMARY KEY, v BIGINT)");
+  (void)db->execute("INSERT INTO t VALUES ($1, $2)", {i(3'000'000'000), i(7)});
+  CHECK(db->execute(by_k, {i(3'000'000'000)}).rows == Grid{{i(7)}});
+}
+
 TEST_CASE("embedded API: a DOUBLE read through an index keeps -0.0", "[sql][api]") {
   sql_test::TempDir dir{"api_negzero"};
   auto db = Database::open(dir.path());

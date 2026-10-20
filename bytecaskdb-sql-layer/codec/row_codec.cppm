@@ -394,12 +394,9 @@ auto RowWriter::set_i64(std::uint32_t col_id, std::int64_t v) -> bool {
 auto RowWriter::set_f64(std::uint32_t col_id, double v) -> bool {
   // A REAL column stores its float rounding, as PostgreSQL stores a float4:
   // the one place a row's REAL value is rounded, defaults included.
-  auto i = index_of(col_id, PhysType::F64);
-  if (!i) return false;
-  if (layout_->columns[*i].sql.kind == SqlKind::Real) v = float_rounding(v);
-  present_[*i] = true;
-  fixed_[*i] = std::bit_cast<std::uint64_t>(v);
-  return true;
+  const auto* c = layout_->find(col_id);
+  if (c != nullptr && c->sql.kind == SqlKind::Real) v = float_rounding(v);
+  return set_word(col_id, PhysType::F64, std::bit_cast<std::uint64_t>(v));
 }
 
 auto RowWriter::set_bool(std::uint32_t col_id, bool v) -> bool {

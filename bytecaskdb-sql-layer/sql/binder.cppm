@@ -152,6 +152,8 @@ auto sql_type(const ast::ColumnDefAst& c) -> SqlType {
 
 // A decimal literal's sign, whole digits and fraction digits:
 // [-]digits[.digits]; nullopt if it is not one.
+// Views into the literal's text, which decimal_literal does not copy: valid
+// only while that text lives. scaled_decimal consumes it at once.
 struct DecimalLiteral {
   bool neg;
   std::string_view whole, frac;
@@ -214,7 +216,8 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
       auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
       if (ec != std::errc{} || end != l.text.data() + l.text.size()) bad();
       if (out_of_range(t, v)) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
-      return v;  // a REAL default is rounded where every REAL is: when it is written to a row
+      // The catalog holds what a row stores: a REAL default as its float.
+      return t.kind == SqlKind::Real ? float_rounding(v) : v;
     }
     case SqlKind::Boolean:
       if (l.kind != K::Bool) bad();
@@ -271,8 +274,7 @@ public:
   }
 
   // An expression whose type is fixed by its target (an assigned column).
-  auto value(const Table& t, const ast::Expr& e, const Column& target) -> Expr {
-    auto want = target.type;
+  auto value(const Table& t, const ast::Expr& e, PhysType want) -> Expr {
     switch (e.kind) {
       case ast::Expr::Kind::Param:
         use_param(e.param, want, e.pos);
@@ -407,7 +409,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           for (std::size_t i = 0; i < targets.size(); ++i) {
             auto at = static_cast<std::size_t>(targets[i] - t->columns.data());
             if (out.values[at]) throw SqlError{"column \"" + targets[i]->name + "\" specified more than once", s.pos};
-            out.values[at] = b.value(*t, s.values[i], *targets[i]);
+            out.values[at] = b.value(*t, s.values[i], targets[i]->type);
             if (out.values[at]->kind != Expr::Kind::Param) {
               throw SqlError{"INSERT values must be parameters", s.values[i].pos};
             }
@@ -432,7 +434,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
             if (std::ranges::find(t->pk_col_ids, c->id) != t->pk_col_ids.end()) {
               throw SqlError{"updating a primary key column is not supported", a.pos};
             }
-            out.set.emplace_back(c->id, b.value(*t, a.value, *c));
+            out.set.emplace_back(c->id, b.value(*t, a.value, c->type));
           }
           out.where = b.where(*t, s.where);
           return {out, s.pos};

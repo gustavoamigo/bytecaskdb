@@ -259,7 +259,17 @@ void Database::close() {
 void Database::compile(Statement& s) {
   auto cat = live_->current();
   auto bound = bound::bind(s.ast_, *cat);
-  if (std::holds_alternative<Ddl>(bound.stmt)) {
+  // Every statement but DDL reads or writes one table; DDL has no plan.
+  const auto* table = std::visit(
+      [](const auto& st) -> const Table* {
+        if constexpr (std::is_same_v<std::decay_t<decltype(st)>, Ddl>) {
+          return nullptr;
+        } else {
+          return st.table;
+        }
+      },
+      bound.stmt);
+  if (table == nullptr) {
     s.ref_ = {};
     s.plan_.reset();
     s.code_.reset();
@@ -276,15 +286,6 @@ void Database::compile(Statement& s) {
       column_types.push_back(sel->table->column(id)->sql);
     }
   }
-  auto table_id = std::visit(
-      [](const auto& st) -> std::uint32_t {
-        if constexpr (std::is_same_v<std::decay_t<decltype(st)>, Ddl>) {
-          return 0;
-        } else {
-          return st.table->id;
-        }
-      },
-      bound.stmt);
   auto plan = std::make_unique<GeneratedPlan>(generate_plan(bound, *cat, s.sql_));
   auto codes = result_type_codes(plan->result_types);
   auto layout = make_result_layout(plan->result_types);
@@ -308,7 +309,7 @@ void Database::compile(Statement& s) {
     s.column_types_ = std::move(column_types);
   }
   s.param_sql_ = std::move(bound.param_sql);
-  s.table_id_ = table_id;
+  s.table_id_ = table->id;
   s.plan_ = std::move(plan);
   s.code_ = std::move(code);
   s.result_codes_ = std::move(codes);
@@ -359,8 +360,8 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   // A value outside its parameter's SQL type is refused before the plan
   // runs, as PostgreSQL refuses a $n it cannot coerce at bind: even one a
   // plan would not read (a key whose other part is NULL).
-  auto check_params = [&](const std::string& why) {
-    if (!why.empty()) throw ParamError(why);
+  auto check_params = [&] {
+    if (auto why = mismatch(); !why.empty()) throw ParamError(why);
     for (std::size_t i = 0; i < params.size(); ++i) {
       const auto& sql = stmt.param_sql_.at(i);
       if (!sql) continue;  // assigned only: the row builder checks it, in column order
@@ -371,15 +372,13 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
     }
   };
   bc_params bp{params};
-  // Parameters that do not fit the cached plan may fit the plan a DDL has
-  // since made of the text. The runtime says whether the cached plan still
-  // fits the catalog (bc_ctx_check, the verification bc_ctx_run makes); it
-  // is recompiled only if not, and the parameters are refused against the
-  // plan that will run. The runtime alone decides compatibility.
-  if (auto why = mismatch(); !why.empty()) {
-    // A plan compiled against the current version is the plan of the text:
-    // a recompile would take the same parameters.
-    if (stmt.ref_.catalog_version == live_->current()->version()) throw ParamError(why);
+  // The parameters are checked against the plan that will run, and so
+  // against the catalog it was verified against: a DDL since the plan was
+  // compiled may have changed what they are (an INTEGER key recreated as
+  // BIGINT). The runtime says whether the cached plan still fits the catalog
+  // (bc_ctx_check, the verification bc_ctx_run makes); it is recompiled only
+  // if not. The runtime alone decides compatibility.
+  if (stmt.ref_.catalog_version != live_->current()->version()) {
     bc_ctx_begin(cx_, &bp, {});
     auto fits = bc_ctx_check(cx_, &stmt.ref_);
     auto stale = !fits && bc_error(cx_) == BC_E_LAYOUT && bc_error_detail(cx_) == BC_L_INCOMPATIBLE;
@@ -390,9 +389,8 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
     }
     bc_ctx_reset(cx_);
     if (stale) compile(stmt);
-    check_params(stale ? mismatch() : why);
   }
-  check_params({});  // the types fit: check the ranges
+  check_params();
   auto r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
   // bc_ctx_run checks the plan against the catalog it pinned. A plan a DDL
   // made incompatible (BC_E_LAYOUT with BC_L_INCOMPATIBLE) is recompiled
@@ -401,7 +399,7 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   if (r == BC_FAILED && bc_error(cx_) == BC_E_LAYOUT && bc_error_detail(cx_) == BC_L_INCOMPATIBLE) {
     bc_ctx_reset(cx_);
     compile(stmt);
-    check_params(mismatch());
+    check_params();
     r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
   }
   const auto& p = *stmt.plan_;

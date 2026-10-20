@@ -115,8 +115,8 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
   {
     auto b = bind_sql(cat,
                       "CREATE TABLE u (a SMALLINT PRIMARY KEY, b INTEGER DEFAULT -5, c NUMERIC(12, 2) DEFAULT 1.005, "
-                      "d VARCHAR(4) DEFAULT 'h\xc3\xa9ll', e TIMESTAMP, f DATE, g TIME, h REAL DEFAULT 2, "
-                      "i DOUBLE PRECISION DEFAULT 2.5, j BOOLEAN DEFAULT true, k TEXT, l BYTEA, m BIGINT DEFAULT 10000000000, "
+                      "d VARCHAR(4) DEFAULT 'h\xc3\xa9ll', e TIMESTAMP, f DATE, g TIME, h REAL DEFAULT 0.1, "
+                      "i DOUBLE PRECISION DEFAULT 0.1, j BOOLEAN DEFAULT true, k TEXT, l BYTEA, m BIGINT DEFAULT 10000000000, "
                       "n DECIMAL(4) DEFAULT 12, o VARCHAR)");
     auto& s = std::get<CreateTableDdl>(std::get<Ddl>(b.stmt));
     REQUIRE(s.columns.size() == 15);
@@ -127,8 +127,9 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
     CHECK(s.columns[2].default_value == Datum{std::int64_t{101}});  // 1.005 rounds half away from zero
     CHECK(s.columns[3].sql == SqlType{SqlKind::Varchar, 4});
     CHECK((kind(4) == SqlKind::Timestamp && kind(5) == SqlKind::Date && kind(6) == SqlKind::Time));
-    CHECK(s.columns[7].default_value == Datum{2.0});
-    CHECK(s.columns[8].default_value == Datum{2.5});
+    // The catalog holds a REAL default as a row stores it: its float.
+    CHECK(s.columns[7].default_value == Datum{static_cast<double>(0.1f)});
+    CHECK(s.columns[8].default_value == Datum{0.1});
     CHECK(s.columns[9].default_value == Datum{true});
     CHECK((kind(10) == SqlKind::Text && kind(11) == SqlKind::Bytea));
     CHECK(s.columns[12].default_value == Datum{std::int64_t{10'000'000'000}});

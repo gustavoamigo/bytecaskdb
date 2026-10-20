@@ -1135,8 +1135,10 @@ them.
   `BC_L_INCOMPATIBLE` for the check's refusal, `BC_L_ROW`, `BC_L_PLAN` and
   `BC_L_RETIRED` for the rest, so the embedded API no longer
   checks a compatible plan itself: it recompiles exactly when `bc_ctx_run`
-  refuses one, or, when the parameters do not fit the cached plan and the
-  catalog version has moved, when `bc_ctx_check` refuses it; it checks the
-  parameters against the plan that runs.
+  refuses one, or, when the catalog version has moved, when `bc_ctx_check`
+  refuses it before the run. Only then does it check the parameters, their
+  types and their ranges, so they are checked against the plan that runs
+  and the catalog it was verified against: a key recreated from INTEGER as
+  BIGINT takes a BIGINT the stale plan's types would have refused.
 - The compiler emits covering reads: a range plan whose result columns are
   all in the index key, none of them `DOUBLE`, reads no row.
