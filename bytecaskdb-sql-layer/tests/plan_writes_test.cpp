@@ -122,6 +122,17 @@ void insert_null_c(bc_ctx* cx) {
   bc_insert(cx, kW, bc_row_end(cx, r));
 }
 
+// c set NULL, then to $2: the last set is the row's, and NOT NULL is
+// checked by bc_row_end, not by the set.
+void insert_null_then_c(bc_ctx* cx) {
+  ++g_runs;
+  bc_row r = bc_row_begin(cx, kW);
+  bc_row_set_param(cx, r, kId, 0);
+  bc_row_set_null(cx, r, kC);
+  bc_row_set_param(cx, r, kC, 1);
+  bc_insert(cx, kW, bc_row_end(cx, r));
+}
+
 // INSERT INTO w (id) VALUES ($1): c, NOT NULL with no default, never set
 void insert_without_c(bc_ctx* cx) {
   ++g_runs;
@@ -309,7 +320,7 @@ TEST_CASE("plan writes: a duplicate is BC_E_CONSTRAINT and never retried", "[sql
   check_indexes_exact(f);
 }
 
-TEST_CASE("plan writes: a NULL for a NOT NULL column is BC_C_NOT_NULL, never retried, and keeps the default",
+TEST_CASE("plan writes: a NOT NULL column null at bc_row_end is BC_C_NOT_NULL, never retried; one left out takes its default",
           "[sql][algebra][writes]") {
   Fixture f;
   create_w(f);
@@ -331,9 +342,13 @@ TEST_CASE("plan writes: a NULL for a NOT NULL column is BC_C_NOT_NULL, never ret
   refused(insert_null_c, {std::int64_t{3}}, not_null_on(kW), "\"c\"");
   refused(insert_without_c, {std::int64_t{3}}, not_null_on(kW), "\"c\"");
   CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 1);
+  // NOT NULL is the row's at bc_row_end: a NULL set and then replaced is not refused.
+  REQUIRE(run(f, insert_null_then_c, {std::int64_t{7}, std::int64_t{70}}) == BC_COMMITTED);
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 2);
 
-  // NOT NULL DEFAULT 7: an explicit NULL is refused, not written over the
-  // default; a plan that does not name the column writes the default.
+  // NOT NULL DEFAULT 7: a row whose d is NULL at bc_row_end is refused, so
+  // nothing is written; a plan that does not name the column writes the
+  // default.
   f.ddl(bytecask::sql::AddColumnDdl{"w", {"d", {bytecask::sql::SqlKind::BigInt}, false, std::int64_t{7}}});
   g_col_d = f.cat().table("w")->column("d")->id;
   refused(insert_with_d, {std::int64_t{4}, std::int64_t{0}, bc_value{}}, not_null_on(kW), "\"d\"");
@@ -345,7 +360,7 @@ TEST_CASE("plan writes: a NULL for a NOT NULL column is BC_C_NOT_NULL, never ret
   const auto& w = *f.cat().table("w");
   CHECK(bytecask::sql::row_i64(row, w.layout.find(g_col_d)->pos) == 7);
   CHECK(run(f, insert_with_d, {std::int64_t{6}, std::int64_t{0}, std::int64_t{8}}) == BC_COMMITTED);
-  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 3);
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 4);
   check_indexes_exact(f);
 }
 

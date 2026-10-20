@@ -21,14 +21,14 @@ bind error with the position of the type name.
 | SQL type | Physical | Stored as |
 |---|---|---|
 | `SMALLINT`, `INTEGER`, `BIGINT` | `i64` | The value. Every width is widened: one integer type in storage, in keys and in arithmetic. The declared width is a catalog property, checked on assignment. |
-| `DOUBLE PRECISION`, `REAL` | `f64` | IEEE 754 binary64. `REAL` is widened. |
+| `DOUBLE PRECISION`, `REAL` | `f64` | IEEE 754 binary64. A `REAL` is stored as its `float` rounding, widened, as PostgreSQL stores a float4: 0.1 reads back as 0.100000001490116…, and a finite value past `FLT_MAX` that does not round to infinity as `FLT_MAX`. A `REAL` key or index part is keyed the same way, from a row or a parameter, so a lookup, a bound or an `UPDATE`/`DELETE` by key finds the row by the value it was written with, as a `$1` typed real does in PostgreSQL. The rounding happens in two places: the row writer, keyed by the column's declared type, and the key encoder, keyed by the part. A `REAL` DEFAULT is parsed straight to `float`, rounded once as PostgreSQL's `float4in` rounds, so the catalog holds the value a row stores; a literal that overflows or underflows to zero is out of range. |
 | `BOOLEAN` | `bool` | 0 or 1. |
 | `BYTEA` | `bytes` | The bytes. |
 | `TEXT`, `VARCHAR(n)` | `bytes` | UTF-8. Compared as bytes (binary collation). `n` counts code points and is a catalog property, checked on assignment. |
 | `DECIMAL(p, s)`, `NUMERIC(p, s)`, p ≤ 18 | `i64` | The value times 10^s, exactly. `p` and `s` are catalog properties of the column. `s` defaults to 0; `p` is required. |
-| `TIMESTAMP` | `i64` | Microseconds since 1970-01-01 00:00:00, no time zone. |
-| `DATE` | `i64` | Days since 1970-01-01. |
-| `TIME` | `i64` | Microseconds since midnight, in [0, 86 400 000 000). |
+| `TIMESTAMP` | `i64` | Microseconds since 1970-01-01 00:00:00, no time zone; from 4714-11-24 BC, PostgreSQL's first. |
+| `DATE` | `i64` | Days since 1970-01-01, in PostgreSQL's range: 4714-11-24 BC to 5874897-12-31. |
+| `TIME` | `i64` | Microseconds since midnight, in [0, 86 400 000 000]: 24:00:00 included, as in PostgreSQL. |
 
 Rejected in stage 1, each for a reason that is not "later": `NUMERIC` with
 no precision or with p > 18 (does not fit `i64`); `CHAR(n)` (its
@@ -41,17 +41,43 @@ Widening is why the plan language has one integer type: a column declared
 `INTEGER` is an `i64` in the row and in every `bc_*` call, and `2147483647 + 1`
 is not an overflow but an assignment that fails its range check.
 
-**Declared widths and lengths are checked on assignment, not on read.** An
-`INSERT` or `UPDATE` into an `INTEGER`, `VARCHAR(n)` or `DECIMAL(p, s)`
-column checks the value against the declared type and raises
-`bc_raise(BC_C_RANGE, column_id)` when it does not fit: outside
-[−2^31, 2^31) for `INTEGER`, more than `n` code points, or more than `p − s`
-integer digits. Reads trust the row. A `TIME` outside its range is refused
-the same way.
+**Declared widths and lengths are checked on assignment, not on read.**
+The row builder checks every value a statement writes (`bc_row_set_*`,
+`bc_row_set_param`) against its column's declared type and refuses one that
+does not fit with `BC_E_CONSTRAINT`, `BC_C_RANGE` and the table's id, the
+message naming the column: outside [−2^15, 2^15) for `SMALLINT` or
+[−2^31, 2^31) for `INTEGER`, a `REAL` that overflows or underflows `float`,
+`TEXT` or `VARCHAR` that is not well-formed UTF-8 or holds a NUL, more
+than `n` code points for `VARCHAR(n)` (counted in the same pass), more than `p − s` integer digits
+for `DECIMAL(p, s)`, a `DATE`, `TIMESTAMP` or `TIME` outside PostgreSQL's
+range for it (the table above). SQL reports it as SQLSTATE 22003, 22001 for
+a string too long, or 22008 for a date or time. `REAL` overflow is decided
+as PostgreSQL decides it: by whether the value rounds to an infinite
+`float`. A `DEFAULT` is checked the same way
+at `CREATE TABLE` and `ADD COLUMN`. Reads trust the row.
 
-**Text is valid UTF-8.** The embedded API and the server refuse a `TEXT` or
-`VARCHAR` parameter that is not well-formed UTF-8 before the plan runs; the
-compiler never emits a validity check. Comparison and ordering are bytewise,
+**A compared parameter is typed by its column, as PostgreSQL types a
+`$n`.** A parameter a `WHERE` compares with a column takes that column's
+type without its modifier: `VARCHAR(n)` as `TEXT`, `DECIMAL(p, s)`
+unbounded. It is checked against that type before the plan runs, so a
+value outside it is `BC_C_RANGE` whether or not the plan would read it (a
+key whose other part is NULL): 
+`3000000000` for an `INTEGER` key or bound, `1e39` or `1e-50` for a `REAL`,
+text that is not UTF-8. It is never wrapped, rounded to a neighbour, or
+taken to find nothing. A modifier is checked only on a write: a `VARCHAR(2)`
+key compared with `'abc'` finds nothing, as in PostgreSQL. A parameter only
+assigned (`INSERT`, `SET`) is checked by the row builder, in column order,
+as PostgreSQL's assignment checks the values a driver sends typed. The plan API
+checks a key value the same way where it is built (`bc_key_*`, against the
+column its key part is), for plans not compiled from SQL. `NOT NULL` is checked when the row ends, after these, so a row
+holding both reports the range, as PostgreSQL does. A `VARCHAR(n)` value
+whose excess is only spaces is refused, where PostgreSQL truncates it.
+
+**Text is valid UTF-8.** The row builder refuses a `TEXT` or `VARCHAR` value
+that is not well-formed UTF-8, or holds a NUL, when it is written
+(`BC_C_RANGE`, 22021), as it refuses any value outside its type; the
+compiler never emits a validity check. A key value that is not UTF-8 is
+refused the same way. Comparison and ordering are bytewise,
 which is code-point order for well-formed UTF-8. Collation sort keys come
 later, in the slot the MariaDB plugin uses them: the key encoder writes a
 text key part as the collation's weights, as `bytes`, and the row keeps the

@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <new>
@@ -61,6 +62,8 @@ using bytecask::sql::LiveCatalog;
 using bytecask::sql::PhysType;
 using bytecask::sql::RowLayout;
 using bytecask::sql::RowWriter;
+using bytecask::sql::SqlKind;
+using bytecask::sql::SqlType;
 using bytecask::sql::Table;
 
 // bc_type's codes are PhysType's values; a schema ref's result_types are read as such.
@@ -131,9 +134,12 @@ struct ColSlot {
   std::uint32_t table{0};
   std::uint32_t col{0};
   std::uint16_t generation{0};  // the layout's: the generation pos is for
-  bool nullable{true};
   PhysType type{PhysType::I64};
   std::uint32_t pos{0};
+  // The declared type a value written to it is checked against: a view into
+  // the pinned catalog's layout. Valid while the run's pin is held:
+  // drop_execution_state clears every ColSlot before it releases the pin.
+  const SqlType* sql{nullptr};
 };
 
 // The columns of a written table's keys, as layout slots: what bc_update
@@ -233,6 +239,9 @@ struct bc_ctx {
   bc_budget budget{};
   std::uint64_t reads{0};
   std::optional<bytecask::Snapshot> snap;
+#ifdef BYTECASK_SQL_TESTING
+  std::function<void()> before_commit;  // bc_ctx_before_commit_for_testing
+#endif
 
   bc_error_code error{BC_OK};
   std::uint32_t detail{0};
@@ -504,6 +513,7 @@ struct bc_ctx {
     views.clear();
     keys.clear();  // key and row builders point into the pinned catalog: before it
     rows.clear();
+    verified.cols.clear();  // each ColSlot's sql points into the pinned catalog: before it
     cat = &unpinned;
     pinned.reset();  // an idle context keeps no superseded catalog alive
     effects.clear();
@@ -636,7 +646,24 @@ auto resolve_range(bc_ctx* cx, std::uint32_t table_or_index, bc_view lo, bc_view
 }
 
 // Appends parameter `i` as a key part: its value, or the null part for NULL.
-[[nodiscard]] auto put_param_part(bc_ctx* cx, Bytes& buf, KeyPart part, std::uint32_t i) -> bool {
+// A key value outside the declared type of the column its part is: refused
+// with BC_E_CONSTRAINT, BC_C_RANGE and the table's id, as a value written
+// is, against the column's type without its modifier (param_type): a
+// lookup's or a bound's $n is typed as PostgreSQL types it, so 1e39 for a
+// REAL or 3000000000 for an INTEGER is refused, not rounded or wrapped.
+template <typename V>
+[[nodiscard]] auto key_in_range(bc_ctx* cx, const KeyLayout& kl, std::size_t p, const V& v) -> bool {
+  const auto* c = kl.columns.at(p);
+  auto why = bytecask::sql::out_of_range(bytecask::sql::param_type(c->sql), v);
+  if (!why) return true;
+  cx->raise(BC_C_RANGE, kl.table->id,
+            *why + " for key column \"" + c->name + "\" of table \"" + kl.table->name + "\"");
+  return false;
+}
+
+[[nodiscard]] auto put_param_part(bc_ctx* cx, Bytes& buf, const KeyLayout& kl, std::size_t p, std::uint32_t i)
+    -> bool {
+  auto part = kl.parts[p];
   const auto* d = cx->param(i);
   if (d == nullptr) return false;
   if (std::holds_alternative<std::monostate>(*d)) {
@@ -651,6 +678,7 @@ auto resolve_range(bc_ctx* cx, std::uint32_t table_or_index, bc_view lo, bc_view
     cx->fail(BC_E_HANDLE, "parameter $" + std::to_string(i + 1) + " is not " + type_name(part.type));
     return false;
   }
+  if (!key_in_range(cx, kl, p, *d)) return false;
   switch (part.type) {
     case PhysType::I64: bytecask::sql::key_put_i64(buf, std::get<std::int64_t>(*d), part); break;
     case PhysType::F64: bytecask::sql::key_put_f64(buf, std::get<double>(*d), part); break;
@@ -820,7 +848,7 @@ auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots& {
 [[nodiscard]] auto verify(bc_ctx* cx, const bc_schema_ref* ref, Verified& e) -> bool {
   const auto& cat = *cx->cat;
   auto incompatible = [&](const std::string& why) {
-    cx->fail(BC_L_INCOMPATIBLE, "plan compiled against catalog v" + std::to_string(ref->catalog_version) +
+    cx->fail(BC_L_INCOMPATIBLE, "plan for catalog v" + std::to_string(ref->catalog_version) +
                                     " is incompatible with v" + std::to_string(cat.version()) + ": " + why);
     return false;
   };
@@ -890,7 +918,7 @@ auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots& {
       return incompatible("column " + std::to_string(c.col) + " of table " + t->name +
                           " no longer exists with the type the plan was compiled with");
     }
-    e.cols.push_back({c.table, c.col, t->layout.generation, slot->nullable, slot->type, slot->pos});
+    e.cols.push_back({c.table, c.col, t->layout.generation, slot->type, slot->pos, &slot->sql});
   }
   std::ranges::sort(e.cols, {}, [](const ColSlot& s) { return std::pair{s.table, s.col}; });
   return true;
@@ -1144,20 +1172,25 @@ auto set_target(bc_ctx* cx, bc_row r, std::uint32_t col, std::optional<PhysType>
   return SetTarget{b, slot};
 }
 
-// A NULL for column `col` of a row being built: refused for a NOT NULL
-// column with BC_E_CONSTRAINT, BC_C_NOT_NULL and the table's id (column ids
-// are per table; the message names the column), and never set, so a
-// column's default survives the refusal.
-[[nodiscard]] auto null_allowed(bc_ctx* cx, const SetTarget& at, std::uint32_t col) -> bool {
-  if (at.slot->nullable) return true;
-  not_null(cx, at.builder->table, col);
+// A value for column `col` of a row being built that is outside the
+// column's declared type: refused with BC_E_CONSTRAINT, BC_C_RANGE and the
+// table's id (the message names the column), and never set.
+template <typename V>
+[[nodiscard]] auto in_range(bc_ctx* cx, const SetTarget& at, std::uint32_t col, const V& v) -> bool {
+  auto why = bytecask::sql::out_of_range(*at.slot->sql, v);
+  if (!why) return true;
+  const auto* t = cx->cat->table(at.builder->table);
+  const auto* c = t == nullptr ? nullptr : t->column(col);
+  cx->raise(BC_C_RANGE, at.builder->table,
+            *why + " for column \"" + (c == nullptr ? std::to_string(col) : c->name) + "\" of table \"" +
+                (t == nullptr ? std::to_string(at.builder->table) : t->name) + "\"");
   return false;
 }
 
-template <typename Set>
-void set_column(bc_ctx* cx, bc_row r, std::uint32_t col, std::optional<PhysType> type, Set&& set) {
+template <typename V, typename Set>
+void set_column(bc_ctx* cx, bc_row r, std::uint32_t col, std::optional<PhysType> type, const V& v, Set&& set) {
   auto at = set_target(cx, r, col, type);
-  if (!at) return;
+  if (!at || !in_range(cx, *at, col, v)) return;
   auto* b = at->builder;
   // The column is declared with this type and in the current layout: the
   // writer cannot refuse it.
@@ -1255,6 +1288,9 @@ enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
   // retry pins the new catalog version, whose indexes it maintains.
   for (auto id : written_tables(cx)) plan.ensure_unchanged(bytecask::sql::table_record_key(id));
   cx->effects.clear();  // handed to the engine: a second commit has nothing to submit
+#ifdef BYTECASK_SQL_TESTING
+  if (cx->before_commit) cx->before_commit();
+#endif
   auto r = cx->db->apply_batch({.sync = sync}, std::move(plan));
   return r ? BC_COMMITTED : BC_CONFLICT;
   BC_GUARD_END(cx)
@@ -1283,6 +1319,14 @@ const char* bc_error_message(const bc_ctx* cx) { return cx->message.c_str(); }
 uint32_t bc_error_detail(const bc_ctx* cx) { return cx->detail; }
 
 int64_t bc_ctx_affected(const bc_ctx* cx) { return cx->affected; }
+
+}  // extern "C"
+
+#ifdef BYTECASK_SQL_TESTING
+void bc_ctx_before_commit_for_testing(bc_ctx* cx, std::function<void()> hook) { cx->before_commit = std::move(hook); }
+#endif
+
+extern "C" {
 
 int bc_execute(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* ref, const bc_params* params, bc_budget budget,
                bool sync, uint32_t max_retries) {
@@ -1625,14 +1669,18 @@ bc_key bc_key_begin(bc_ctx* cx, uint32_t table_or_index) {
 void bc_key_i64(bc_ctx* cx, bc_key k, int64_t v) {
   BC_GUARD_BEGIN
   auto* b = key_builder_part(cx, k, PhysType::I64, false);
-  if (b != nullptr) bytecask::sql::key_put_i64(b->buf, v, current_part(*b));
+  if (b != nullptr && key_in_range(cx, *b->layout, b->next_part - 1, v)) {
+    bytecask::sql::key_put_i64(b->buf, v, current_part(*b));
+  }
   BC_GUARD_END(cx)
 }
 
 void bc_key_f64(bc_ctx* cx, bc_key k, double v) {
   BC_GUARD_BEGIN
   auto* b = key_builder_part(cx, k, PhysType::F64, false);
-  if (b != nullptr) bytecask::sql::key_put_f64(b->buf, v, current_part(*b));
+  if (b != nullptr && key_in_range(cx, *b->layout, b->next_part - 1, v)) {
+    bytecask::sql::key_put_f64(b->buf, v, current_part(*b));
+  }
   BC_GUARD_END(cx)
 }
 
@@ -1648,7 +1696,9 @@ void bc_key_bytes(bc_ctx* cx, bc_key k, bc_view v) {
   auto bytes = cx->resolve(v);
   if (!bytes) return;
   auto* b = key_builder_part(cx, k, PhysType::Bytes, false);
-  if (b != nullptr) bytecask::sql::key_put_bytes(b->buf, *bytes, current_part(*b));
+  if (b != nullptr && key_in_range(cx, *b->layout, b->next_part - 1, *bytes)) {
+    bytecask::sql::key_put_bytes(b->buf, *bytes, current_part(*b));
+  }
   BC_GUARD_END(cx)
 }
 
@@ -1664,7 +1714,7 @@ void bc_key_param(bc_ctx* cx, bc_key k, uint32_t i) {
   if (cx->param(i) == nullptr) return;
   auto* b = key_builder_part(cx, k, std::nullopt, false);
   if (b == nullptr) return;
-  (void)put_param_part(cx, b->buf, current_part(*b), i);
+  (void)put_param_part(cx, b->buf, *b->layout, b->next_part - 1, i);
   BC_GUARD_END(cx)
 }
 
@@ -1694,7 +1744,7 @@ bc_view bc_key_params(bc_ctx* cx, uint32_t table_or_index, uint32_t first, uint3
   bytecask::sql::key_put_prefix(key, kl->ns, table_or_index);
   for (std::uint32_t p = 0; p < n; ++p) {
     // first + p cannot wrap: a parameter index past the bound list fails first.
-    if (first > UINT32_MAX - p || !put_param_part(cx, key, kl->parts[p], first + p)) {
+    if (first > UINT32_MAX - p || !put_param_part(cx, key, *kl, p, first + p)) {
       cx->fail(BC_E_HANDLE, "parameter index out of range");
       return {};
     }
@@ -2011,19 +2061,19 @@ bc_row bc_row_from(bc_ctx* cx, uint32_t table, bc_view old) {
 
 void bc_row_set_i64(bc_ctx* cx, bc_row r, uint32_t col, int64_t v) {
   BC_GUARD_BEGIN
-  set_column(cx, r, col, PhysType::I64, [&](RowWriter& w) { return w.set_i64(col, v); });
+  set_column(cx, r, col, PhysType::I64, v, [&](RowWriter& w) { return w.set_i64(col, v); });
   BC_GUARD_END(cx)
 }
 
 void bc_row_set_f64(bc_ctx* cx, bc_row r, uint32_t col, double v) {
   BC_GUARD_BEGIN
-  set_column(cx, r, col, PhysType::F64, [&](RowWriter& w) { return w.set_f64(col, v); });
+  set_column(cx, r, col, PhysType::F64, v, [&](RowWriter& w) { return w.set_f64(col, v); });
   BC_GUARD_END(cx)
 }
 
 void bc_row_set_bool(bc_ctx* cx, bc_row r, uint32_t col, bool v) {
   BC_GUARD_BEGIN
-  set_column(cx, r, col, PhysType::Bool, [&](RowWriter& w) { return w.set_bool(col, v); });
+  set_column(cx, r, col, PhysType::Bool, v, [&](RowWriter& w) { return w.set_bool(col, v); });
   BC_GUARD_END(cx)
 }
 
@@ -2031,14 +2081,16 @@ void bc_row_set_bytes(bc_ctx* cx, bc_row r, uint32_t col, bc_view v) {
   BC_GUARD_BEGIN
   auto bytes = cx->resolve(v);
   if (!bytes) return;
-  set_column(cx, r, col, PhysType::Bytes, [&](RowWriter& w) { return w.set_bytes(col, *bytes); });
+  set_column(cx, r, col, PhysType::Bytes, *bytes, [&](RowWriter& w) { return w.set_bytes(col, *bytes); });
   BC_GUARD_END(cx)
 }
 
 void bc_row_set_null(bc_ctx* cx, bc_row r, uint32_t col) {
   BC_GUARD_BEGIN
+  // A NOT NULL column is refused at bc_row_end, after every value of the
+  // row is checked against its declared type, as PostgreSQL checks.
   auto at = set_target(cx, r, col, std::nullopt);
-  if (!at || !null_allowed(cx, *at, col)) return;
+  if (!at) return;
   if (!at->builder->writer.set_null(col)) cx->fail(BC_L_ROW, "column is not in the row's layout");
   BC_GUARD_END(cx)
 }
@@ -2053,7 +2105,7 @@ void bc_row_set_param(bc_ctx* cx, bc_row r, uint32_t col, uint32_t i) {
     cx->fail(BC_E_HANDLE, "parameter $" + std::to_string(i + 1) + " is not " + type_name(at->slot->type));
     return;
   }
-  if (std::holds_alternative<std::monostate>(*d) && !null_allowed(cx, *at, col)) return;
+  if (!in_range(cx, *at, col, *d)) return;
   if (!bytecask::sql::set_datum(at->builder->writer, col, *d)) cx->fail(BC_L_ROW, "column is not in the row's layout");
   BC_GUARD_END(cx)
 }
@@ -2063,7 +2115,11 @@ bc_view bc_row_end(bc_ctx* cx, bc_row r) {
   auto* b = row_builder(cx, r);
   if (b == nullptr) return {};
   b->done = true;
-  // A NOT NULL column the plan never set and that has no default.
+  // A NOT NULL column set to NULL, or never set and with no default:
+  // BC_E_CONSTRAINT, BC_C_NOT_NULL and the table's id (column ids are per
+  // table; the message names the column). Checked last, after every value
+  // the row was given passed its range check, so an out-of-range value is
+  // BC_C_RANGE whatever else the row holds, as in PostgreSQL.
   if (auto col = b->writer.missing_required()) {
     not_null(cx, b->table, *col);
     return {};

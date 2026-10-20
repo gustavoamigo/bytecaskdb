@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
+import struct
 
 import bytecask_sql
 
@@ -21,6 +22,35 @@ SQLSTATE = {
     "unique": "23505",
     "not_null": "23502",
 }
+
+# A value outside its declared type is one kind, "range", in the layer; its
+# message, PostgreSQL's words, says which. The one mapping from those
+# messages, by how they start, to PostgreSQL's SQLSTATE.
+# test_every_range_message_maps_to_its_sqlstate produces every one, so a
+# reworded message fails there, not as a silent mismatch.
+RANGE_SQLSTATE = {
+    "smallint out of range": "22003",
+    "integer out of range": "22003",
+    "value out of range: overflow": "22003",  # REAL
+    "value out of range: underflow": "22003",  # REAL
+    "numeric field overflow": "22003",  # DECIMAL(p, s)
+    "value too long for type character varying": "22001",
+    "invalid byte sequence for encoding": "22021",  # TEXT, VARCHAR
+    "date out of range": "22008",
+    "timestamp out of range": "22008",
+    "time out of range": "22008",
+}
+RANGE_STATES = frozenset(RANGE_SQLSTATE.values())
+
+
+def layer_sqlstate(e: bytecask_sql.ExecError) -> str:
+    """The SQLSTATE PostgreSQL gives the layer's refusal, or "refused"."""
+    if e.constraint == "range":
+        message = str(e)
+        states = [state for start, state in RANGE_SQLSTATE.items() if message.startswith(start)]
+        assert len(states) == 1, f"range refusal with no SQLSTATE in RANGE_SQLSTATE: {message}"
+        return states[0]
+    return SQLSTATE.get(e.constraint, "refused")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -43,6 +73,7 @@ BIGINT = Type("bigint", "int", low=-(2**63), high=2**63 - 1)
 INTEGER = Type("integer", "int", low=-(2**31), high=2**31 - 1)
 SMALLINT = Type("smallint", "int", low=-(2**15), high=2**15 - 1)
 DOUBLE = Type("double precision", "float")
+REAL = Type("real", "real")  # a float: stored as its float rounding on both sides
 BOOLEAN = Type("boolean", "bool")
 TEXT = Type("text", "text")
 BYTEA = Type("bytea", "bytes")
@@ -90,7 +121,7 @@ def literal(t: Type, v) -> str:
         return "NULL"
     if t.kind == "bool":
         return "TRUE" if v else "FALSE"
-    if t.kind in ("int", "float"):
+    if t.kind in ("int", "float", "real"):
         return repr(v)
     if t.kind == "bytes":
         v = v.decode("ascii")  # printable ASCII only: no escapes to agree on
@@ -120,9 +151,19 @@ def pg_params(sql: str, params) -> tuple[str, list | None]:
     return "".join(out), [params[i] for i in order]
 
 
-def from_pg(v):
-    """A PostgreSQL value as the layer returns it."""
-    return bytes(v) if isinstance(v, memoryview) else v
+FLOAT4_OID = 700
+
+
+def from_pg(v, type_oid: int = 0):
+    """A PostgreSQL value as the layer returns it. A real arrives as the
+    shortest text that names its float, which Python reads as the nearest
+    double: packed as a float, it is the float exactly, as the layer stores
+    it."""
+    if isinstance(v, memoryview):
+        return bytes(v)
+    if type_oid == FLOAT4_OID and isinstance(v, float):
+        return struct.unpack("f", struct.pack("f", v))[0]
+    return v
 
 
 def run_layer(db, sql: str, params=()) -> Outcome:
@@ -134,7 +175,7 @@ def run_layer(db, sql: str, params=()) -> Outcome:
         # memory, a conflict) is the layer failing: the test fails on it.
         if e.constraint is None:
             raise
-        return Outcome(error=SQLSTATE.get(e.constraint, "refused"), detail=str(e))
+        return Outcome(error=layer_sqlstate(e), detail=str(e))
     except bytecask_sql.SqlError as e:
         return Outcome(error="refused", detail=str(e))
     return Outcome(rows=tuple(r["rows"]), affected=r["affected"] if changes_rows(sql) else None)
@@ -148,6 +189,7 @@ def run_pg(conn, sql: str, params=()) -> Outcome:
         with conn.cursor() as cur:
             cur.execute(text, values)
             rows = cur.fetchall() if cur.description else []
+            oids = [d.type_code for d in cur.description] if cur.description else []
             affected = cur.rowcount if changes_rows(sql) else None
     except (psycopg.OperationalError, psycopg.InterfaceError):
         raise  # the connection or the driver failed: not an outcome
@@ -155,5 +197,6 @@ def run_pg(conn, sql: str, params=()) -> Outcome:
         if not e.sqlstate:
             raise  # no SQLSTATE: not PostgreSQL refusing the statement
         state = e.sqlstate
-        return Outcome(error=state if state in SQLSTATE.values() else "refused", detail=f"{state} {e}")
-    return Outcome(rows=tuple(tuple(from_pg(v) for v in row) for row in rows), affected=affected)
+        known = state in SQLSTATE.values() or state in RANGE_STATES
+        return Outcome(error=state if known else "refused", detail=f"{state} {e}")
+    return Outcome(rows=tuple(tuple(from_pg(v, oid) for v, oid in zip(row, oids)) for row in rows), affected=affected)

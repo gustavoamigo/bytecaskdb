@@ -14,6 +14,7 @@ module;
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <span>
 #include <string>
@@ -78,6 +79,13 @@ using Statement = std::variant<Ddl, Insert, Select, Update, Delete>;
 struct Bound {
   Statement stmt;
   std::vector<PhysType> param_types;  // $1 is [0]
+  // For each parameter compared with a column (WHERE), that column's type
+  // without its modifier (param_type), as PostgreSQL types a $n: what its
+  // value is checked against before the plan runs, so a key or bound
+  // outside it is refused whatever the plan would read. nullopt for one
+  // only assigned (INSERT, SET), which the row builder checks in column
+  // order, as PostgreSQL's assignment does.
+  std::vector<std::optional<SqlType>> param_sql;
 };
 
 // Throws ast::SqlError with a message and the position of the offending node.
@@ -143,37 +151,31 @@ auto sql_type(const ast::ColumnDefAst& c) -> SqlType {
   throw SqlError{"type " + c.type + " is not supported", c.pos};
 }
 
-auto pow10(std::uint8_t n) -> std::int64_t {
-  std::int64_t v = 1;
-  for (std::uint8_t i = 0; i < n; ++i) v *= 10;
-  return v;
-}
+// Why a literal is not a DECIMAL value: not of the form [-]digits[.digits],
+// or more digits than any DECIMAL holds, so it cannot be scaled in an i64.
+enum class DecimalRefusal { NotDecimal, TooWide };
 
-// A decimal literal ([-]digits[.digits]) scaled by 10^scale, rounded half
-// away from zero, with at most `precision` digits; nullopt if it is not one.
-auto scaled_decimal(std::string_view text, std::uint8_t precision, std::uint8_t scale) -> std::optional<std::int64_t> {
+// The literal [-]digits[.digits] scaled by 10^scale, rounded half away from
+// zero. The column's precision is checked by out_of_range, not here.
+auto scaled_decimal(std::string_view text, std::uint8_t scale) -> std::expected<std::int64_t, DecimalRefusal> {
   auto neg = !text.empty() && text[0] == '-';
   if (neg) text.remove_prefix(1);
   auto dot = text.find('.');
   auto whole = text.substr(0, dot);
   auto frac = dot == std::string_view::npos ? std::string_view{} : text.substr(dot + 1);
   auto digits = [](std::string_view d) { return std::ranges::all_of(d, [](char ch) { return ch >= '0' && ch <= '9'; }); };
-  if ((whole.empty() && frac.empty()) || !digits(whole) || !digits(frac)) return std::nullopt;
+  if ((whole.empty() && frac.empty()) || !digits(whole) || !digits(frac)) {
+    return std::unexpected(DecimalRefusal::NotDecimal);
+  }
   // Leading zeros are no digits: "0.5" has none before the point, so it fits
   // NUMERIC(4, 4).
   while (!whole.empty() && whole[0] == '0') whole.remove_prefix(1);
-  if (whole.size() > static_cast<std::size_t>(precision - scale)) return std::nullopt;
+  if (whole.size() + scale > kMaxDecimalPrecision) return std::unexpected(DecimalRefusal::TooWide);
   std::int64_t v = 0;
   for (auto ch : whole) v = v * 10 + (ch - '0');
   for (std::uint8_t i = 0; i < scale; ++i) v = v * 10 + (i < frac.size() ? frac[i] - '0' : 0);
   if (frac.size() > scale && frac[scale] >= '5') ++v;
-  if (v >= pow10(precision)) return std::nullopt;
   return neg ? -v : v;
-}
-
-// UTF-8 code points: bytes that do not continue a sequence.
-auto code_points(std::string_view s) -> std::size_t {
-  return static_cast<std::size_t>(std::ranges::count_if(s, [](char ch) { return (static_cast<unsigned char>(ch) & 0xC0) != 0x80; }));
 }
 
 // A DEFAULT constant folded to the column's stored value.
@@ -189,38 +191,50 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
       if (l.kind != K::Integer) bad();
       auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
       if (ec != std::errc{} || end != l.text.data() + l.text.size()) bad();
-      auto lim = t.kind == SqlKind::SmallInt ? std::int64_t{1} << 15 : std::int64_t{1} << 31;
-      if (t.kind != SqlKind::BigInt && (v < -lim || v >= lim)) {
-        throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
-      }
+      if (out_of_range(t, v)) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
       return v;
     }
     case SqlKind::Decimal: {
       if (l.kind != K::Integer && l.kind != K::Number) bad();
-      auto v = scaled_decimal(l.text, t.precision, t.scale);
-      if (!v) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
+      auto v = scaled_decimal(l.text, t.scale);
+      if (!v && v.error() == DecimalRefusal::NotDecimal) bad();
+      if (!v || out_of_range(t, *v)) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
       return *v;
     }
-    case SqlKind::Real:
+    case SqlKind::Real: {
+      // Parsed as a float, rounded once as PostgreSQL's float4in rounds:
+      // through a double, a literal near a float midpoint would round twice.
+      // The catalog then holds what a row stores. Overflow and underflow to
+      // zero are out of range, as there.
+      float v = 0;
+      if (l.kind != K::Integer && l.kind != K::Number) bad();
+      auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
+      if (end != l.text.data() + l.text.size()) bad();
+      if (ec == std::errc::result_out_of_range) {
+        throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
+      }
+      if (ec != std::errc{}) bad();
+      return static_cast<double>(v);
+    }
     case SqlKind::Double: {
       double v = 0;
       if (l.kind != K::Integer && l.kind != K::Number) bad();
       auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
       if (ec != std::errc{} || end != l.text.data() + l.text.size()) bad();
+      if (out_of_range(t, v)) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
       return v;
     }
     case SqlKind::Boolean:
       if (l.kind != K::Bool) bad();
       return l.b;
     case SqlKind::Varchar:
-      if (l.kind == K::String && code_points(l.text) > t.length) {
-        throw SqlError{"DEFAULT too long for type " + sql_type_name(t), l.pos};
-      }
-      [[fallthrough]];
     case SqlKind::Text:
     case SqlKind::Bytea: {
       if (l.kind != K::String) bad();
       auto b = std::as_bytes(std::span{l.text.data(), l.text.size()});
+      if (auto why = out_of_range(t, b)) {
+        throw SqlError{"DEFAULT is not a " + sql_type_name(t) + ": " + *why, l.pos};
+      }
       return Bytes(b.begin(), b.end());
     }
     case SqlKind::Timestamp:
@@ -311,6 +325,8 @@ public:
       }
       const auto* c = column(t, col->column, col->pos);
       use_param(param->param, c->type, param->pos);
+      if (sql_.size() <= param->param) sql_.resize(param->param + 1);
+      if (!sql_[param->param]) sql_[param->param] = param_type(c->sql);  // the first comparison types it
       out.push_back(Compare{op, c->id, param->param});
     }
     return out;
@@ -326,9 +342,16 @@ public:
     return out;
   }
 
+  auto param_sql() const -> std::vector<std::optional<SqlType>> {
+    auto out = sql_;
+    out.resize(types_.size());
+    return out;
+  }
+
 private:
   const Catalog& cat_;
   std::vector<std::optional<PhysType>> types_;
+  std::vector<std::optional<SqlType>> sql_;
 };
 
 }  // namespace
@@ -396,15 +419,9 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
               throw SqlError{"INSERT values must be parameters", s.values[i].pos};
             }
           }
-          for (std::size_t i = 0; i < t->columns.size(); ++i) {
-            const auto& c = t->columns[i];
-            if (!out.values[i] && std::ranges::find(t->pk_col_ids, c.id) != t->pk_col_ids.end()) {
-              throw SqlError{"primary key column \"" + c.name + "\" must be given", s.pos};
-            }
-            if (!out.values[i] && !c.nullable && std::holds_alternative<std::monostate>(c.default_value)) {
-              throw SqlError{"column \"" + c.name + "\" is NOT NULL and has no value", s.pos};
-            }
-          }
+          // A column left out takes its default. One that is NOT NULL with no
+          // default, a primary key column among them, is refused when the
+          // row is built (BC_C_NOT_NULL), as a NULL given for it is.
           return {out, s.pos};
         } else if constexpr (std::is_same_v<T, ast::Select>) {
           const auto* t = b.table(s.table, s.pos);
@@ -432,7 +449,8 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
         }
       },
       stmt);
-  return Bound{std::move(bound_stmt.first), b.param_types(bound_stmt.second)};
+  auto types = b.param_types(bound_stmt.second);
+  return Bound{std::move(bound_stmt.first), std::move(types), b.param_sql()};
 }
 
 }  // namespace bytecask::sql::bound

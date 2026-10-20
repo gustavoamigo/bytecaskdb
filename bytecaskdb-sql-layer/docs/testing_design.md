@@ -17,7 +17,12 @@ every rule, the invariants are checked.
   expected catalog: the tables it created, their columns and primary keys.
 - **Outcomes agree.** Both sides accept a statement or both refuse it. A
   constraint violation must be the same one: a duplicate key is SQLSTATE
-  23505 on both, a NULL in a NOT NULL column 23502. Any other refusal counts
+  23505 on both, a NULL in a NOT NULL column 23502, a value outside its
+  declared type 22003, 22001 for a string too long, 22008 for a date or
+  time, 22021 for text that is not UTF-8. The layer has one kind for these,
+  `range`; the oracle tells them apart by how the message starts, in one
+  table (`RANGE_SQLSTATE` in `oracle.py`), and a test produces every
+  message, so a reworded one fails there. Any other refusal counts
   as a refusal on both, whatever its message. The layer's refusals are
   `SqlError`: parse and bind errors, a DDL the catalog refuses, parameters
   of the wrong number or type. Any other exception from the layer, an engine
@@ -35,18 +40,27 @@ every rule, the invariants are checked.
   PostgreSQL's the same way. Values compare by type too: `True` is not `1`,
   `1` is not `1.0`, and `-0.0` is not `0.0`. Text columns are `COLLATE "C"`
   in PostgreSQL, so its order is byte order, the order of the layer's keys.
+  A REAL comes from PostgreSQL as the shortest text naming its float; the
+  oracle packs it back to that float, which is what the layer stores. A
+  lookup by a SMALLINT, INTEGER or REAL key casts `$n` to the column's type
+  on PostgreSQL's side: the layer types `$n` by its column, and psycopg
+  tells PostgreSQL int8 or float8.
 
 Rules in increment 1:
 - **CREATE TABLE.** Up to four columns over BIGINT, INTEGER, SMALLINT, DOUBLE
-  PRECISION, BOOLEAN, TEXT, VARCHAR(4) and BYTEA. Primary keys of one or two
+  PRECISION, REAL, BOOLEAN, TEXT, VARCHAR(4) and BYTEA. Primary keys of one or two
   columns, NOT NULL and nullable columns, and DEFAULT literals. Refused
-  variants: an existing name, a duplicate column, and a primary key naming
-  no column.
+  variants: an existing name, a duplicate column, a primary key naming no
+  column, and two primary keys (on two columns, or on a column and the
+  table).
 - **DROP TABLE**, with and without `IF EXISTS`.
-- **INSERT**, weighted towards duplicate keys and NULLs, with and without a
-  column list.
+- **INSERT**, weighted towards duplicate keys, NULLs, left-out NOT NULL
+  columns (a primary key column among them) and values outside their
+  declared types, with and without a column list.
 - **Point lookup** by the full primary key, an existing key or not, NULL
-  included.
+  and values outside the key's type included: both refuse a value outside
+  the type's range (22003, also when another key part is NULL), and find
+  nothing for one only longer than a VARCHAR(n).
 - **Reopen** of the layer's database.
 
 Fixed cases are plain pytest functions at the end of the file. They call
@@ -77,17 +91,15 @@ Found so far. The machine expects each one, so it does not fail on them.
 - **A table needs a primary key.** The layer refuses `CREATE TABLE` without
   one; PostgreSQL accepts it. The machine sends that variant to the layer
   only and expects the refusal.
-- **INSERT may not leave out a NOT NULL column that has no default.** That
-  includes a primary key column. The layer refuses the statement when it
-  binds; PostgreSQL inserts NULL and reports 23502. The machine expects
-  exactly that pair. The contract says a NULL "left unset with no default" is
-  `BC_C_NOT_NULL`, so this is reported for the owner to decide.
-- **Values stay inside their declared types.** The layer does not refuse an
-  INTEGER or SMALLINT out of range, or a VARCHAR(n) longer than n, where
-  PostgreSQL reports 22003 and 22001. This is reported; the machine's values
-  stay in range until the types increment of #515.
-- **Two column-level `PRIMARY KEY`s make a composite key in the layer.**
-  PostgreSQL refuses them with 42P16. This is reported; the machine declares
-  a primary key once, at table level.
+- **A VARCHAR(n) value whose excess is only spaces is refused.**
+  PostgreSQL truncates it to n characters and stores it; the layer refuses
+  it as too long (22001). The machine does not generate one.
+- **A DEFAULT outside its column's type is refused by the DDL.** The layer
+  refuses `CREATE TABLE` (and `ADD COLUMN`) with, say, `SMALLINT DEFAULT
+  100000`, `REAL DEFAULT 1e39` or `VARCHAR(2) DEFAULT 'abc'`. PostgreSQL
+  accepts the DDL and refuses each INSERT that takes the default (22003,
+  22001; checked on 16.15). A DEFAULT that is not UTF-8 never reaches
+  either: PostgreSQL refuses the statement's text (22021). The machine's
+  defaults stay inside their types.
 - **DML takes no literals:** values are parameters (`$1`). The machine's
   statements use parameters on both sides.

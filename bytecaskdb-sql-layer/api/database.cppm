@@ -58,16 +58,25 @@ struct Rows {
 
 // A plan that ran and failed: the plan API's error code, its detail and
 // message (a duplicate key is BC_E_CONSTRAINT with BC_C_UNIQUE in the
-// detail's high byte, raised by the plan), or BC_CONFLICT when every retry
-// conflicted.
+// detail's high byte, raised by the plan); or a conflict on every retry.
+// BC_CONFLICT and BC_E_IO are both 1, so conflict() tells them apart, not
+// code().
 class ExecError : public std::runtime_error {
+  struct Conflict {};
+
 public:
-  ExecError(const std::string& what, int code, std::uint32_t detail = 0)
+  // A failure: a bc_error_code, so a bc_commit_result such as BC_CONFLICT
+  // does not compile here. A conflict is made only by conflicted().
+  ExecError(const std::string& what, bc_error_code code, std::uint32_t detail = 0)
       : std::runtime_error{what}, code_{code}, detail_{detail} {}
+  // Every attempt conflicted; code() is BC_CONFLICT.
+  [[nodiscard]] static auto conflicted(const std::string& what) -> ExecError { return {what, Conflict{}}; }
   ExecError(const ExecError&) = default;
   ExecError& operator=(const ExecError&) = default;
   ~ExecError() override;  // out of line: anchors the vtable (-Wweak-vtables)
+  // A bc_error_code; BC_CONFLICT when conflict().
   [[nodiscard]] auto code() const noexcept -> int { return code_; }
+  [[nodiscard]] auto conflict() const noexcept -> bool { return conflict_; }
   // bc_error_detail: for BC_E_CONSTRAINT, the bc_constraint in the high byte
   // and the object id in the low 24 bits.
   [[nodiscard]] auto detail() const noexcept -> std::uint32_t { return detail_; }
@@ -78,8 +87,12 @@ public:
   }
 
 private:
+  ExecError(const std::string& what, Conflict)
+      : std::runtime_error{what}, code_{BC_CONFLICT}, detail_{0}, conflict_{true} {}
+
   int code_;
   std::uint32_t detail_;
+  bool conflict_{false};
 };
 
 // Parameters a statement does not take: the wrong number, or a value not of
@@ -108,6 +121,11 @@ private:
   std::unique_ptr<TccPlan> code_;
   std::vector<std::string> columns_;
   std::vector<SqlType> column_types_;
+  // Each compared parameter's SQL type (bound::Bound::param_sql) and the
+  // statement's table: a value outside it is BC_C_RANGE on the table,
+  // checked before the plan runs, whatever the plan would read.
+  std::vector<std::optional<SqlType>> param_sql_;
+  std::uint32_t table_id_{0};
   std::vector<std::uint8_t> result_codes_;  // the plan's result_types as bc_type codes
   RowLayout result_layout_;                 // how its result rows decode, built once per compile
   std::vector<bc_col_ref> col_refs_;
@@ -145,12 +163,26 @@ public:
     return live_->current();
   }
 #ifdef BYTECASK_SQL_TESTING
+  // Test only: how many times a cached plan was checked (bc_ctx_check)
+  // against a catalog version it was not compiled or checked against.
+  [[nodiscard]] auto plan_checks_for_testing() const -> std::uint64_t { return plan_checks_; }
   // Test only (sql_layer_testing): every row of a table, in primary-key
   // order, read from the engine and decoded through the catalog: every
   // column, in the table's order. For the proof tests, which compare a table
   // with the oracle's; SQL has no full scan. Throws ast::SqlError for a
   // table that does not exist, as a statement naming it would.
   [[nodiscard]] auto table_rows(std::string_view table) const -> Rows;
+  // Test only: while on, every commit of a plan that writes a table
+  // conflicts. Before each commit reaches the engine, every table's catalog
+  // record is written back unchanged, which such a plan guards, so execute
+  // exhausts its retries. A plan that only reads commits nothing to conflict.
+  void conflict_on_every_commit_for_testing(bool on);
+  // Test only: the engine under the layer, for a test that stores what the
+  // layer would refuse, to check that a read refuses it too.
+  [[nodiscard]] auto engine_for_testing() -> DB& {
+    check_open();
+    return *db_;
+  }
 #endif
 
   // Closes the engine. A second call returns at once.
@@ -171,6 +203,7 @@ private:
   bc_ctx* cx_{nullptr};
   std::map<std::string, std::unique_ptr<Statement>, std::less<>> cache_;
   std::uint64_t compilations_{0};
+  std::uint64_t plan_checks_{0};
   bool closed_{false};
 };
 
@@ -230,7 +263,17 @@ void Database::close() {
 void Database::compile(Statement& s) {
   auto cat = live_->current();
   auto bound = bound::bind(s.ast_, *cat);
-  if (std::holds_alternative<Ddl>(bound.stmt)) {
+  // Every statement but DDL reads or writes one table; DDL has no plan.
+  const auto* table = std::visit(
+      [](const auto& st) -> const Table* {
+        if constexpr (std::is_same_v<std::decay_t<decltype(st)>, Ddl>) {
+          return nullptr;
+        } else {
+          return st.table;
+        }
+      },
+      bound.stmt);
+  if (table == nullptr) {
     s.ref_ = {};
     s.plan_.reset();
     s.code_.reset();
@@ -269,6 +312,8 @@ void Database::compile(Statement& s) {
     s.columns_ = std::move(columns);
     s.column_types_ = std::move(column_types);
   }
+  s.param_sql_ = std::move(bound.param_sql);
+  s.table_id_ = table->id;
   s.plan_ = std::move(plan);
   s.code_ = std::move(code);
   s.result_codes_ = std::move(codes);
@@ -316,19 +361,32 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
     }
     return {};
   };
-  auto check_params = [](const std::string& why) {
-    if (!why.empty()) throw ParamError(why);
+  // A value outside its parameter's SQL type is refused before the plan
+  // runs, as PostgreSQL refuses a $n it cannot coerce at bind: even one a
+  // plan would not read (a key whose other part is NULL).
+  auto check_params = [&] {
+    if (auto why = mismatch(); !why.empty()) throw ParamError(why);
+    for (std::size_t i = 0; i < params.size(); ++i) {
+      const auto& sql = stmt.param_sql_.at(i);
+      if (!sql) continue;  // assigned only: the row builder checks it, in column order
+      if (auto range = out_of_range(*sql, params[i])) {
+        throw ExecError(*range + " for parameter $" + std::to_string(i + 1), BC_E_CONSTRAINT,
+                        ConstraintDetail{BC_C_RANGE, stmt.table_id_}.encode());
+      }
+    }
   };
   bc_params bp{params};
-  // Parameters that do not fit the cached plan may fit the plan a DDL has
-  // since made of the text. The runtime says whether the cached plan still
-  // fits the catalog (bc_ctx_check, the verification bc_ctx_run makes); it
-  // is recompiled only if not, and the parameters are refused against the
-  // plan that will run. The runtime alone decides compatibility.
-  if (auto why = mismatch(); !why.empty()) {
-    // A plan compiled against the current version is the plan of the text:
-    // a recompile would take the same parameters.
-    if (stmt.ref_.catalog_version == live_->current()->version()) throw ParamError(why);
+  // The parameters are checked against the plan that will run, and so
+  // against the catalog it was verified against: a DDL since the plan was
+  // compiled may have changed what they are (an INTEGER key recreated as
+  // BIGINT). The runtime says whether the cached plan still fits the catalog
+  // (bc_ctx_check, the verification bc_ctx_run makes); it is recompiled only
+  // if not. The runtime alone decides compatibility. A plan that fits is
+  // marked with the version it was checked against, so it is checked once
+  // per catalog version, not on every run after a DDL. The runtime pins that
+  // version or a later one: a later one is checked again next time.
+  if (auto version = live_->current()->version(); stmt.ref_.catalog_version != version) {
+    ++plan_checks_;
     bc_ctx_begin(cx_, &bp, {});
     auto fits = bc_ctx_check(cx_, &stmt.ref_);
     auto stale = !fits && bc_error(cx_) == BC_E_LAYOUT && bc_error_detail(cx_) == BC_L_INCOMPATIBLE;
@@ -338,9 +396,13 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
       throw e;
     }
     bc_ctx_reset(cx_);
-    if (stale) compile(stmt);
-    check_params(stale ? mismatch() : why);
+    if (stale) {
+      compile(stmt);
+    } else {
+      stmt.ref_.catalog_version = version;
+    }
   }
+  check_params();
   auto r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
   // bc_ctx_run checks the plan against the catalog it pinned. A plan a DDL
   // made incompatible (BC_E_LAYOUT with BC_L_INCOMPATIBLE) is recompiled
@@ -349,13 +411,13 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   if (r == BC_FAILED && bc_error(cx_) == BC_E_LAYOUT && bc_error_detail(cx_) == BC_L_INCOMPATIBLE) {
     bc_ctx_reset(cx_);
     compile(stmt);
-    check_params(mismatch());
+    check_params();
     r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
   }
   const auto& p = *stmt.plan_;
   if (r == BC_CONFLICT) {
     bc_ctx_reset(cx_);
-    throw ExecError("conflict: a guard failed on every attempt", BC_CONFLICT);
+    throw ExecError::conflicted("conflict: a guard failed on every attempt");
   }
   if (r == BC_FAILED) {
     ExecError e{bc_error_message(cx_), bc_error(cx_), bc_error_detail(cx_)};
@@ -378,6 +440,22 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
 }
 
 #ifdef BYTECASK_SQL_TESTING
+void Database::conflict_on_every_commit_for_testing(bool on) {
+  check_open();
+  if (!on) {
+    bc_ctx_before_commit_for_testing(cx_, {});
+    return;
+  }
+  bc_ctx_before_commit_for_testing(cx_, [this] {
+    auto cat = live_->current();  // held: the loop reads its tables
+    for (const auto& [id, t] : cat->tables()) {
+      auto key = table_record_key(id);
+      Bytes record;
+      if (db_->get({}, key, record)) (void)db_->put({}, key, record);
+    }
+  });
+}
+
 auto Database::table_rows(std::string_view table) const -> Rows {
   check_open();
   auto [cat, snap] = live_->pin();

@@ -12,9 +12,9 @@ only the expected catalog.
 
 Increment 1: CREATE TABLE (a few types, composite primary keys, nullable
 columns, defaults, and refused variants), DROP TABLE [IF EXISTS], INSERT
-weighted towards duplicate keys and NULLs, a point lookup by the full
-primary key, and a reopen of the layer's database. Values stay inside their
-declared types (docs/testing_design.md, *Known differences*).
+weighted towards duplicate keys, NULLs, left-out NOT NULL columns and
+values outside their declared types, a point lookup by the full primary
+key, and a reopen of the layer's database (docs/testing_design.md).
 
 The fixed cases at the end call the same steps in a set order.
 """
@@ -35,8 +35,9 @@ from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, 
 import oracle as o
 from conftest import Oracle
 
-TYPES = [o.BIGINT, o.INTEGER, o.SMALLINT, o.DOUBLE, o.BOOLEAN, o.TEXT, o.varchar(4), o.BYTEA]
+TYPES = [o.BIGINT, o.INTEGER, o.SMALLINT, o.DOUBLE, o.REAL, o.BOOLEAN, o.TEXT, o.varchar(4), o.BYTEA]
 TABLE_NAMES = ["t0", "t1", "t2", "t3"]
+BIGINT_LOW, BIGINT_HIGH = o.BIGINT.low, o.BIGINT.high
 
 
 @dataclasses.dataclass
@@ -46,8 +47,10 @@ class Column:
     nullable: bool = True
     default: object = None  # None: no DEFAULT clause
 
-    def ddl(self, pg: bool) -> str:
+    def ddl(self, pg: bool, primary_key: bool = False) -> str:
         out = f"{self.name} {self.type.pg if pg else self.type.sql}"
+        if primary_key:
+            out += " PRIMARY KEY"
         if not self.nullable:
             out += " NOT NULL"
         if self.default is not None:
@@ -60,13 +63,18 @@ class Table:
     name: str
     columns: list[Column]
     pk: list[str]
+    # Where the primary key is declared: "table", PRIMARY KEY (…); "column",
+    # on each of its columns; "both", on its first column and the table.
+    # Only "table", or "column" with one key column, declare one key.
+    pk_style: str = "table"
 
     def column(self, name: str) -> Column:
         return next(c for c in self.columns if c.name == name)
 
     def ddl(self, pg: bool) -> str:
-        parts = [c.ddl(pg) for c in self.columns]
-        if self.pk:
+        on_column = set(self.pk if self.pk_style == "column" else self.pk[:1] if self.pk_style == "both" else [])
+        parts = [c.ddl(pg, c.name in on_column) for c in self.columns]
+        if self.pk and self.pk_style != "column":
             parts.append(f"PRIMARY KEY ({', '.join(self.pk)})")
         return f"CREATE TABLE {self.name} ({', '.join(parts)})"
 
@@ -76,16 +84,32 @@ class Table:
 
 
 def values(t: o.Type) -> st.SearchStrategy:
-    """A value of the type, inside its declared range."""
+    """A value of the type's physical kind: mostly inside its declared
+    range, sometimes outside it (a BIGINT for an INTEGER, a REAL past
+    float's range, a VARCHAR(n) of more than n characters). Written, both
+    sides refuse it; as a lookup key, both refuse a value outside the type's
+    range and find nothing for one longer than a VARCHAR(n)."""
     if t.kind == "int":
-        return st.one_of(st.integers(-3, 3), st.integers(t.low, t.high))
+        edges = st.sampled_from([t.low, t.high, t.low - 1, t.high + 1]).filter(lambda v: BIGINT_LOW <= v <= BIGINT_HIGH)
+        return st.one_of(st.integers(-3, 3), st.integers(t.low, t.high), edges, st.integers(BIGINT_LOW, BIGINT_HIGH))
     if t.kind == "float":
         return st.floats(allow_nan=False, allow_infinity=False)
+    if t.kind == "real":
+        # Floats, doubles that round to one, and doubles past float's range
+        # at either end (22003 on both).
+        inside = st.one_of(st.floats(width=32, allow_nan=False, allow_infinity=False),
+                           st.floats(-1e38, 1e38).filter(lambda v: v == 0 or abs(v) > 1e-37))
+        return st.one_of(inside, st.sampled_from([1e39, -1e39, 1e-50, -1e-50]))
     if t.kind == "bool":
         return st.booleans()
     if t.kind == "text":
         chars = st.characters(blacklist_categories=("Cs",), blacklist_characters="\x00")
-        return st.text(chars, max_size=t.length or 6)
+        if not t.length:
+            return st.text(chars, max_size=6)
+        # PostgreSQL truncates a VARCHAR(n) whose excess is only spaces; the
+        # layer refuses it (docs/testing_design.md, *Known differences*).
+        n = t.length
+        return st.text(chars, max_size=n + 2).filter(lambda v: len(v) <= n or v[n:].strip(" "))
     return st.binary(max_size=6)
 
 
@@ -93,8 +117,8 @@ def default_values(t: o.Type) -> st.SearchStrategy:
     """A DEFAULT both sides read the same way from its literal."""
     if t.kind == "int":
         return st.integers(-3, 3)
-    if t.kind == "float":
-        return st.sampled_from([0.0, 1.5, -2.25])
+    if t.kind in ("float", "real"):
+        return st.sampled_from([0.0, 1.5, -2.25])  # exact in a float too
     if t.kind == "bool":
         return st.booleans()
     printable = st.characters(min_codepoint=0x20, max_codepoint=0x7E, blacklist_characters="\\")
@@ -182,23 +206,21 @@ class SqlMachine(RuleBasedStateMachine):
         marks = ", ".join(f"${i + 1}" for i in range(len(cols)))
         target = "" if all_columns else f" ({', '.join(cols)})"
         sql = f"INSERT INTO {name}{target} VALUES ({marks})"
-        t = self.tables.get(name)
-        if t is not None and any(c.name not in row and (c.name in t.pk or (not c.nullable and c.default is None))
-                                 for c in t.columns):
-            # Known difference: the layer refuses an INSERT that leaves out a
-            # NOT NULL column with no default (a primary key column among them)
-            # when it binds; PostgreSQL inserts NULL and reports the NOT NULL
-            # violation.
-            layer = o.run_layer(self.db, sql, params)
-            pg = o.run_pg(self.pg.conn, sql, params)
-            assert (layer.error, pg.error) == ("refused", o.SQLSTATE["not_null"]), (sql, layer, pg)
-            return layer
         return self.both(sql, params)
 
     def lookup(self, name: str, key: tuple) -> o.Outcome:
         t = self.tables[name]
         where = " AND ".join(f"{c} = ${i + 1}" for i, c in enumerate(t.pk))
-        return self.both(f"{t.select_all} WHERE {where}", key)
+        # The layer types $n by its column, as PostgreSQL types a $n it is
+        # not told the type of; psycopg tells it int8 or float8, so a
+        # SMALLINT, INTEGER or REAL key casts to its column's type, which
+        # also refuses one outside it (22003).
+        def typed(c: str, n: int) -> str:
+            ty = t.column(c).type
+            return f"${n}::{ty.sql}" if ty.sql in ("smallint", "integer", "real") else f"${n}"
+
+        pg_where = " AND ".join(f"{c} = {typed(c, i + 1)}" for i, c in enumerate(t.pk))
+        return self.both(f"{t.select_all} WHERE {where}", key, pg_sql=f"{t.select_all} WHERE {pg_where}")
 
     def reopen(self) -> None:
         self.db.close()
@@ -236,8 +258,13 @@ class SqlMachine(RuleBasedStateMachine):
             if c.name in pk:
                 c.default = None
         t = Table(name, columns, list(pk))
-        variant = data.draw(st.sampled_from(["ok"] * 6 + ["duplicate column", "unknown pk column", "no pk"]))
-        if variant == "duplicate column" and n > 1:
+        variant = data.draw(st.sampled_from(["ok"] * 6 + ["duplicate column", "unknown pk column", "no pk",
+                                                          "column pk", "column and table pk"]))
+        if variant == "column pk":
+            t.pk_style = "column"  # two key columns: two PRIMARY KEYs, which both refuse
+        elif variant == "column and table pk":
+            t.pk_style = "both"
+        elif variant == "duplicate column" and n > 1:
             t.columns[-1].name = t.columns[0].name
             t.pk = [t.columns[0].name]
         elif variant == "unknown pk column":
@@ -266,10 +293,10 @@ class SqlMachine(RuleBasedStateMachine):
         row = {}
         for c in t.columns:
             # Leave out a column now and then: one with a default or nullable
-            # often, a NOT NULL one without a default rarely (both refuse it).
-            optional = c.nullable or c.default is not None
-            if not all_columns and c.name not in t.pk and data.draw(st.integers(0, 3 if optional else 11),
-                                                                     label=f"omit {c.name}") == 0:
+            # often, a NOT NULL one without a default, a key column among
+            # them, rarely (both refuse it, 23502).
+            optional = (c.nullable or c.default is not None) and c.name not in t.pk
+            if not all_columns and data.draw(st.integers(0, 3 if optional else 11), label=f"omit {c.name}") == 0:
                 continue
             if dup is not None and c.name in t.pk:
                 row[c.name] = dup[t.pk.index(c.name)]
@@ -337,9 +364,8 @@ def test_null_for_not_null_is_23502_and_defaults_fill_the_rest(dsn):
         m.create(Table("t0", cols, ["c0"]))
         assert m.insert("t0", {"c0": 1, "c1": None, "c2": True}, all_columns=False).error == "23502"
         assert m.insert("t0", {"c0": 1, "c2": False}, all_columns=False).error is None
-        # c2 left unset: the layer refuses it when it binds, PostgreSQL reports 23502
-        # (docs/testing_design.md, *Known differences*); insert() checks both.
-        assert m.insert("t0", {"c0": 2}, all_columns=False).error == "refused"
+        # c2 left unset, NOT NULL with no default: 23502 on both.
+        assert m.insert("t0", {"c0": 2}, all_columns=False).error == "23502"
         m.check()
     finally:
         m.teardown()
@@ -382,7 +408,66 @@ def test_insert_without_a_primary_key_column(dsn):
     m = fixed(dsn)
     try:
         m.create(Table("t0", [Column("c0", o.BIGINT), Column("c1", o.BIGINT)], ["c0", "c1"]))
-        m.insert("t0", {"c0": 1}, all_columns=False)
+        assert m.insert("t0", {"c0": 1}, all_columns=False).error == "23502"
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_values_outside_their_declared_type_are_22003_and_22001(dsn):
+    m = fixed(dsn)
+    try:
+        cols = [Column("c0", o.BIGINT), Column("c1", o.SMALLINT), Column("c2", o.INTEGER), Column("c3", o.varchar(4)),
+                Column("c4", o.BOOLEAN, nullable=False, default=False)]
+        m.create(Table("t0", cols, ["c0"]))
+        # A row also NULL in a NOT NULL column: the type check comes first on both.
+        assert m.insert("t0", {"c0": 1, "c1": 2**15, "c4": None}, all_columns=False).error == "22003"
+        assert m.insert("t0", {"c0": None, "c3": "abcde"}, all_columns=False).error == "22001"
+        for col, value, state in [("c1", 2**15, "22003"), ("c1", -(2**15) - 1, "22003"), ("c2", 2**31, "22003"),
+                                  ("c3", "abcde", "22001"), ("c3", "ééééé", "22001")]:
+            assert m.insert("t0", {"c0": 1, col: value}, all_columns=False).error == state, (col, value)
+        assert m.insert("t0", {"c0": 1, "c1": 2**15 - 1, "c2": -(2**31), "c3": "éééé"}, all_columns=False).error is None
+        assert m.lookup("t0", (2**40,)).rows == ()  # a BIGINT key: inside its type, found or not
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_real_is_stored_and_keyed_as_its_float(dsn):
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.REAL), Column("c1", o.REAL)], ["c0"]))
+        assert m.insert("t0", {"c0": 0.1, "c1": 0.1}, all_columns=False).error is None
+        assert m.insert("t0", {"c0": float(0.1), "c1": 1e39}, all_columns=False).error == "22003"
+        assert len(m.lookup("t0", (0.1,)).rows) == 1  # found by the value it was written with
+        assert m.insert("t0", {"c0": 0.1}, all_columns=False).error == "23505"
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_a_key_outside_its_type_is_refused(dsn):
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER), Column("c1", o.varchar(2))], ["c0", "c1"]))
+        assert m.insert("t0", {"c0": 1, "c1": "ab"}, all_columns=False).error is None
+        assert m.lookup("t0", (2**31, "ab")).error == "22003"  # not an INTEGER: refused, not "no row"
+        assert m.lookup("t0", (1, "abc")).rows == ()  # longer than VARCHAR(2): a modifier, so no row
+        m.create(Table("t1", [Column("c0", o.REAL)], ["c0"]))
+        assert m.insert("t1", {"c0": 0.0}, all_columns=False).error is None
+        assert m.lookup("t1", (1e-50,)).error == "22003"  # would round to the 0.0 row
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_two_primary_keys_are_refused(dsn):
+    m = fixed(dsn)
+    try:
+        cols = [Column("c0", o.BIGINT), Column("c1", o.BIGINT)]
+        assert m.create(Table("t0", cols, ["c0", "c1"], pk_style="column")).error == "refused"
+        assert m.create(Table("t0", cols, ["c0", "c1"], pk_style="both")).error == "refused"
+        assert m.create(Table("t0", cols, ["c1"], pk_style="column")).error is None
         m.check()
     finally:
         m.teardown()
@@ -405,17 +490,101 @@ def test_calls_after_close_raise_closed(tmp_path):
     db.close()  # a second close does nothing
 
 
-def test_text_that_is_not_utf8_raises_on_read(tmp_path):
+def test_a_conflict_on_every_retry_sets_conflict(tmp_path):
+    db = bytecask_sql.open(str(tmp_path))
+    try:
+        db.execute("CREATE TABLE t (k BIGINT PRIMARY KEY)")
+        db._conflict_on_every_commit(True)
+        try:
+            db.execute("INSERT INTO t VALUES ($1)", (1,))
+        except bytecask_sql.ExecError as e:
+            assert e.conflict and e.constraint is None
+        else:
+            raise AssertionError("a statement conflicting on every retry committed")
+        db._conflict_on_every_commit(False)
+        assert db.table_rows("t")["rows"] == []
+        try:
+            db.execute("INSERT INTO t VALUES ($1)", (1,))
+            db.execute("INSERT INTO t VALUES ($1)", (1,))
+        except bytecask_sql.ExecError as e:
+            assert not e.conflict and e.constraint == "unique"
+        else:
+            raise AssertionError("a duplicate key was written")
+    finally:
+        db.close()
+
+
+def test_text_that_is_not_utf8_is_refused_on_write(tmp_path):
     db = bytecask_sql.open(str(tmp_path))
     try:
         db.execute("CREATE TABLE t (k BIGINT PRIMARY KEY, s TEXT)")
-        db.execute("INSERT INTO t VALUES ($1, $2)", (1, b"\xff"))  # text is bytes to the plan
         try:
-            db.table_rows("t")
-        except UnicodeDecodeError:
-            pass
+            db.execute("INSERT INTO t VALUES ($1, $2)", (1, b"\xff"))  # text is bytes to the plan
+        except bytecask_sql.ExecError as e:
+            assert e.constraint == "range" and o.layer_sqlstate(e) == "22021"
         else:
-            raise AssertionError("bytes that are not UTF-8 read as text")
+            raise AssertionError("bytes that are not UTF-8 were written as text")
+        assert db.table_rows("t")["rows"] == []
+    finally:
+        db.close()
+
+
+def test_stored_text_that_is_not_utf8_raises_on_read(tmp_path):
+    """The read path's strict decode: text the layer would refuse, stored
+    under it through the engine, raises rather than reads as text."""
+    db = bytecask_sql.open(str(tmp_path))
+    try:
+        db.execute("CREATE TABLE t (k BIGINT PRIMARY KEY, s TEXT)")
+        db.execute("INSERT INTO t VALUES ($1, $2)", (1, "a"))
+        [(key, row)] = db._engine_rows("t")
+        assert row.endswith(b"a")  # the one variable column's bytes end the row
+        db._engine_put(key, row[:-1] + b"\xff")
+        for read in (lambda: db.table_rows("t"), lambda: db.execute("SELECT s FROM t WHERE k = $1", (1,))):
+            try:
+                read()
+            except UnicodeDecodeError:
+                pass
+            else:
+                raise AssertionError("stored bytes that are not UTF-8 read as text")
+    finally:
+        db.close()
+
+
+def test_every_range_message_maps_to_its_sqlstate(tmp_path):
+    """Each range refusal the layer makes, and the SQLSTATE the oracle gives
+    it: every entry of RANGE_SQLSTATE is produced, so a message reworded in
+    the layer fails here."""
+    db = bytecask_sql.open(str(tmp_path))
+    try:
+        db.execute("CREATE TABLE r (k BIGINT PRIMARY KEY, s SMALLINT, i INTEGER, f REAL, d NUMERIC(4, 2), "
+                   "v VARCHAR(2), x TEXT, dt DATE, ts TIMESTAMP, tm TIME)")
+        cols = ["s", "i", "f", "d", "v", "x", "dt", "ts", "tm"]
+        cases = [
+            ("s", 2**15, "22003"),
+            ("i", 2**31, "22003"),
+            ("f", 1e39, "22003"),
+            ("f", 1e-50, "22003"),
+            ("d", 10_000, "22003"),
+            ("v", "abc", "22001"),
+            ("v", b"\xc3", "22021"),
+            ("x", b"\x00", "22021"),
+            ("dt", -2_440_589, "22008"),
+            ("ts", -210_866_803_200_000_001, "22008"),
+            ("tm", 86_400_000_001, "22008"),
+        ]
+        seen = set()
+        for col, value, state in cases:
+            params = [1] + [value if c == col else None for c in cols]
+            marks = ", ".join(f"${n + 1}" for n in range(len(params)))
+            try:
+                db.execute(f"INSERT INTO r VALUES ({marks})", tuple(params))
+            except bytecask_sql.ExecError as e:
+                assert e.constraint == "range", (col, value, str(e))
+                assert o.layer_sqlstate(e) == state, (col, value, str(e))
+                seen.update(start for start in o.RANGE_SQLSTATE if str(e).startswith(start))
+            else:
+                raise AssertionError(f"{col} = {value!r} was written")
+        assert seen == set(o.RANGE_SQLSTATE), set(o.RANGE_SQLSTATE) - seen
     finally:
         db.close()
 

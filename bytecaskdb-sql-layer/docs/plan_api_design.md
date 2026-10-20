@@ -154,8 +154,9 @@ only if the harness shows the copy.
 code, is a sticky error of its own family: the plan unwinds like any other
 failure, and the runtime reports it and does not retry. `bc_insert` and
 `bc_update` set it for a duplicate primary or unique key, and the row
-builder for a NULL in a NOT NULL column (`BC_C_NOT_NULL` with the table's
-id, since column ids are per table; the message names the column); a plan
+builder for a value outside its column's declared type (`BC_C_RANGE`) and
+for a NULL in a NOT NULL column (`BC_C_NOT_NULL`), both with the table's
+id, since column ids are per table; the message names the column. A plan
 sets it itself with `bc_raise`. This is how a duplicate reaches the client as an
 error rather than as a conflict: the engine reports every failed
 precondition of a batch as the same conflict, so the runtime checks the
@@ -253,7 +254,7 @@ enum bc_error_code {
                        bc_schema_ref does not declare, or not of the type used: a plan bug */
   BC_E_ARITH,       /* integer overflow, division by zero, out-of-range conversion */
   BC_E_CONSTRAINT,  /* never retried; raised by the runtime (BC_C_UNIQUE from bc_insert and bc_update,
-                       BC_C_NOT_NULL from the row builder) or by the plan with bc_raise */
+                       BC_C_RANGE and BC_C_NOT_NULL from the row builder) or by the plan with bc_raise */
   BC_E_LAYOUT,      /* plan incompatible with the live catalog, or a row violates its layout */
   BC_E_DEGRADED,    /* engine degraded; writes refused */
   BC_E_CLOSED,
@@ -273,7 +274,8 @@ enum bc_scan_flags {
 
 enum bc_constraint {   /* the detail of BC_E_CONSTRAINT; the compiler emits the object id with it */
   BC_C_UNIQUE = 1, BC_C_NOT_NULL, BC_C_CHECK, BC_C_FOREIGN_KEY,
-  BC_C_RANGE,          /* a value outside its declared type: INTEGER, VARCHAR(n), DECIMAL(p, s) */
+  BC_C_RANGE,          /* a value outside its declared type: SMALLINT, INTEGER, REAL, TEXT and
+                          VARCHAR(n) (UTF-8, n code points), DECIMAL(p, s), DATE, TIMESTAMP, TIME */
 };
 
 enum bc_layout_detail {  /* the detail of BC_E_LAYOUT; every BC_E_LAYOUT carries one */
@@ -308,7 +310,7 @@ typedef struct { uint32_t table, col; uint8_t type; } bc_col_ref;
    every run; the result layout is the plan's own and is not a catalog
    object. */
 typedef struct {
-  uint64_t catalog_version;                                     /* compiled against; for messages */
+  uint64_t catalog_version;                                     /* compiled or last checked against; for messages */
   const uint32_t   *objects_read;    uint32_t n_read;           /* tables and indexes it names */
   const uint32_t   *tables_written;  uint32_t n_written;        /* tables whose rows it writes */
   const bc_col_ref *cols;            uint32_t n_cols;           /* every column it reads or sets */
@@ -471,7 +473,7 @@ bc_view  bc_key_successor(bc_ctx *, bc_view key);     /* smallest key greater th
 |---|---|
 | `bc_key_begin` | Starts a key for a table (its primary key) or an index. Writes the namespace byte and the 4-byte id. Returns a builder handle. |
 | `bc_key_i64`, `bc_key_f64`, `bc_key_bool`, `bc_key_bytes`, `bc_key_null` | Appends one part. Nullability and direction come from the catalog entry for `table_or_index`, so the builder knows whether to write a null marker and whether to invert the bytes. A part of the wrong type, or more parts than the key has, is `BC_E_HANDLE`. |
-| `bc_key_param` | Appends parameter `i` as the next part: its value, or the null part when it is NULL. A type that is not the part's, or a NULL for a part that is not nullable, is `BC_E_HANDLE`. |
+| `bc_key_param` | Appends parameter `i` as the next part: its value, or the null part when it is NULL. A type that is not the part's, or a NULL for a part that is not nullable, is `BC_E_HANDLE`. A value outside the type of the part's column, without its modifier, is `BC_C_RANGE` with the table's id, as for `bc_key_i64`, `bc_key_f64` and `bc_key_bytes` and each part of `bc_key_params`: a lookup or bound is refused, never wrapped or rounded to a neighbour. A `REAL` part is keyed as its float rounding. |
 | `bc_key_end` | Finalizes and returns the key. A partial key (fewer parts than the index has) is legal and is a prefix the compiler uses as a scan bound. A key over the engine's hard ceiling (65,535 bytes) is `BC_E_LIMIT`. |
 | `bc_key_params` | The key, or prefix, of `table_or_index` whose first `n` parts are parameters `first` to `first + n - 1`, each as `bc_key_param` appends it: `bc_key_begin`, `n` parts and `bc_key_end` in one call. `(cx, TBL_9, 0, 3)` is a composite primary key `(w_id, d_id, c_id)`. The builder remains for keys whose parts come from anywhere else. |
 | `bc_key_successor` | The exclusive upper bound of the prefix `key`: its last byte incremented, carrying. Turns a prefix into a half-open range where `BC_SCAN_PREFIX` does not fit. |
@@ -564,9 +566,9 @@ bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: live
 | `bc_row_key` | The table's full primary key (namespace, table id, parts), encoded from the row's columns: for a `bc_get`, a guard, or a scan bound reached from a row. Built in the arena. |
 | `bc_row_begin` | Starts a row of `table`'s current layout with every column at its default: the catalog's default for a column that has one, null for the rest. A plan compiled before a column was added writes the column's default without naming it. |
 | `bc_row_from` | Starts a row of `table` as a copy of `old`, a row of that table and of its current layout generation (otherwise as for the writes below: `BC_L_ROW`, `BC_L_RETIRED` or `BC_E_CORRUPT`; a `REBUILD`, #503, widens this to any generation). The `UPDATE` pattern: copy, set the assigned columns, end. |
-| `bc_row_set_*`, `bc_row_set_null` | Sets column `col`, which must be of the builder's table. Setting twice keeps the last value. A NULL for a NOT NULL column is `BC_E_CONSTRAINT` with `BC_C_NOT_NULL` and the table's id, and sets nothing, so a column's default is never cleared. |
-| `bc_row_set_param` | Sets column `col` to parameter `i`: its value, or null when it is NULL. One call where a nullable column took an `if` and two sets. A parameter whose type is not the column's is `BC_E_HANDLE`; a NULL for a NOT NULL column is `BC_C_NOT_NULL`, as above. |
-| `bc_row_end` | Finalizes the row in the arena and returns its view, a built row of the builder's table. A NOT NULL column never set and with no default is `BC_C_NOT_NULL`, as above; a row over the engine's value limit is `BC_E_LIMIT`. |
+| `bc_row_set_*`, `bc_row_set_null` | Sets column `col`, which must be of the builder's table. Setting twice keeps the last value. A value outside the column's declared type is `BC_E_CONSTRAINT` with `BC_C_RANGE` and the table's id, and sets nothing: a SMALLINT or INTEGER out of range, a REAL that overflows or underflows float, a TEXT or VARCHAR that is not UTF-8 or holds a NUL, a VARCHAR(n) of more than n code points, a DECIMAL(p, s) of more than p digits, a DATE, TIMESTAMP or TIME outside PostgreSQL's range for it (a TIME from 00:00 to 24:00). A NULL for a NOT NULL column is set, and refused by `bc_row_end`. |
+| `bc_row_set_param` | Sets column `col` to parameter `i`: its value, or null when it is NULL. One call where a nullable column took an `if` and two sets. A parameter whose type is not the column's is `BC_E_HANDLE`; one outside the column's declared type is `BC_C_RANGE`, as above. |
+| `bc_row_end` | Finalizes the row in the arena and returns its view, a built row of the builder's table. A NOT NULL column that is null, set so or never set and with no default, is `BC_E_CONSTRAINT` with `BC_C_NOT_NULL` and the table's id: checked here, after every value set passed its range check, so a row holding both is `BC_C_RANGE`, as PostgreSQL reports it. A row over the engine's value limit is `BC_E_LIMIT`. |
 | `bc_pin` | Copies a view into the arena so it outlives its cursor, keeping what it is: a pinned row is still a row of its table. The compiler emits it where a plan keeps a cursor's bytes across a step. |
 
 ### Ephemeral structures
@@ -1133,8 +1135,12 @@ them.
   `BC_L_INCOMPATIBLE` for the check's refusal, `BC_L_ROW`, `BC_L_PLAN` and
   `BC_L_RETIRED` for the rest, so the embedded API no longer
   checks a compatible plan itself: it recompiles exactly when `bc_ctx_run`
-  refuses one, or, when the parameters do not fit the cached plan and the
-  catalog version has moved, when `bc_ctx_check` refuses it; it checks the
-  parameters against the plan that runs.
+  refuses one, or, when the catalog version has moved, when `bc_ctx_check`
+  refuses it before the run. Only then does it check the parameters, their
+  types and their ranges, so they are checked against the plan that runs
+  and the catalog it was verified against: a key recreated from INTEGER as
+  BIGINT takes a BIGINT the stale plan's types would have refused. A plan
+  that still fits is marked with the version it was checked against, so it
+  is checked once per catalog version, not on every run after a DDL.
 - The compiler emits covering reads: a range plan whose result columns are
   all in the index key, none of them `DOUBLE`, reads no row.

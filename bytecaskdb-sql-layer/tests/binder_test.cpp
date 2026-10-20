@@ -115,8 +115,8 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
   {
     auto b = bind_sql(cat,
                       "CREATE TABLE u (a SMALLINT PRIMARY KEY, b INTEGER DEFAULT -5, c NUMERIC(12, 2) DEFAULT 1.005, "
-                      "d VARCHAR(4) DEFAULT 'h\xc3\xa9ll', e TIMESTAMP, f DATE, g TIME, h REAL DEFAULT 2, "
-                      "i DOUBLE PRECISION DEFAULT 2.5, j BOOLEAN DEFAULT true, k TEXT, l BYTEA, m BIGINT DEFAULT 10000000000, "
+                      "d VARCHAR(4) DEFAULT 'h\xc3\xa9ll', e TIMESTAMP, f DATE, g TIME, h REAL DEFAULT 0.1, "
+                      "i DOUBLE PRECISION DEFAULT 0.1, j BOOLEAN DEFAULT true, k TEXT, l BYTEA, m BIGINT DEFAULT 10000000000, "
                       "n DECIMAL(4) DEFAULT 12, o VARCHAR)");
     auto& s = std::get<CreateTableDdl>(std::get<Ddl>(b.stmt));
     REQUIRE(s.columns.size() == 15);
@@ -127,14 +127,28 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
     CHECK(s.columns[2].default_value == Datum{std::int64_t{101}});  // 1.005 rounds half away from zero
     CHECK(s.columns[3].sql == SqlType{SqlKind::Varchar, 4});
     CHECK((kind(4) == SqlKind::Timestamp && kind(5) == SqlKind::Date && kind(6) == SqlKind::Time));
-    CHECK(s.columns[7].default_value == Datum{2.0});
-    CHECK(s.columns[8].default_value == Datum{2.5});
+    // The catalog holds a REAL default as a row stores it: its float.
+    CHECK(s.columns[7].default_value == Datum{static_cast<double>(0.1f)});
+    CHECK(s.columns[8].default_value == Datum{0.1});
     CHECK(s.columns[9].default_value == Datum{true});
     CHECK((kind(10) == SqlKind::Text && kind(11) == SqlKind::Bytea));
     CHECK(s.columns[12].default_value == Datum{std::int64_t{10'000'000'000}});
     CHECK(s.columns[13].sql == SqlType{SqlKind::Decimal, 0, 4, 0});
     CHECK(s.columns[13].default_value == Datum{std::int64_t{12}});
     CHECK(kind(14) == SqlKind::Text);  // VARCHAR without a length
+  }
+  {
+    // A REAL DEFAULT is rounded once, to float, as PostgreSQL's float4in
+    // rounds. This literal is just above the midpoint between 1 and the next
+    // float, 1 + 2^-23; through a double it would round to the midpoint
+    // itself, then to 1 by ties-to-even.
+    auto b = bind_sql(cat, "CREATE TABLE r (k BIGINT PRIMARY KEY, a REAL DEFAULT 1.00000005960464477539062500000001)");
+    auto& s = std::get<CreateTableDdl>(std::get<Ddl>(b.stmt));
+    CHECK(s.columns[1].default_value == Datum{1.0 + 0x1p-23});
+    CHECK(rejected(cat, "CREATE TABLE r (k BIGINT PRIMARY KEY, a REAL DEFAULT 1e39)").first ==
+          "DEFAULT out of range for type real");
+    CHECK(rejected(cat, "CREATE TABLE r (k BIGINT PRIMARY KEY, a REAL DEFAULT 1e-50)").first ==
+          "DEFAULT out of range for type real");
   }
   {
     auto b = bind_sql(cat, "CREATE UNIQUE INDEX u1 ON t (qty DESC, name)");
@@ -172,8 +186,14 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
         "DEFAULT out of range for type numeric(4,4)");  // rounds to 1.0000
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v NUMERIC(3, 1) DEFAULT 100)").first ==
         "DEFAULT out of range for type numeric(3,1)");
+  // More digits than any DECIMAL holds: refused by the one precision check, not overflowed while parsed.
+  CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v NUMERIC(18, 0) DEFAULT 12345678901234567890123)").first ==
+        "DEFAULT out of range for type numeric(18,0)");
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v VARCHAR(2) DEFAULT 'abc')").first ==
-        "DEFAULT too long for type varchar(2)");
+        "DEFAULT is not a varchar(2): value too long for type character varying(2)");
+  // Not UTF-8: refused with the reason, not as too long.
+  CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v TEXT DEFAULT '\xff')").first ==
+        "DEFAULT is not a text: invalid byte sequence for encoding \"UTF8\"");
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v BIGINT DEFAULT 'x')").first ==
         "DEFAULT is not a constant of type bigint");
   CHECK(rejected(cat, "CREATE TABLE u (k BIGINT PRIMARY KEY, v TIMESTAMP DEFAULT 0)").first ==
@@ -184,5 +204,15 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
   CHECK(rejected(cat, "ALTER TABLE t ADD COLUMN z BIGINT NOT NULL").first.find("needs a DEFAULT") != std::string::npos);
   CHECK(rejected(cat, "ALTER TABLE nope ADD COLUMN z BIGINT").first == "relation \"nope\" does not exist");
   CHECK(rejected(cat, "CREATE INDEX i ON t (nope)").first == "column \"nope\" does not exist");
-  CHECK(rejected(cat, "INSERT INTO t (name) VALUES ($1)").first == "primary key column \"id\" must be given");
+  // A column left out is the runtime's to refuse (BC_C_NOT_NULL), a primary key column among them.
+  CHECK_NOTHROW((void)bind_sql(cat, "INSERT INTO t (name) VALUES ($1)"));
+  // One PRIMARY KEY a table: two column-level ones are not a composite key (PostgreSQL: 42P16).
+  CHECK(rejected(cat, "CREATE TABLE u (a BIGINT PRIMARY KEY, b BIGINT PRIMARY KEY)").first ==
+        "multiple primary keys for table \"u\" are not allowed");
+  CHECK(rejected(cat, "CREATE TABLE u (a BIGINT PRIMARY KEY, b BIGINT, PRIMARY KEY (b))").first ==
+        "multiple primary keys for table \"u\" are not allowed");
+  CHECK(rejected(cat, "CREATE TABLE u (a BIGINT, b BIGINT, PRIMARY KEY (a), PRIMARY KEY (b))").first ==
+        "multiple primary keys for table \"u\" are not allowed");
+  CHECK(rejected(cat, "CREATE TABLE u (a BIGINT PRIMARY KEY PRIMARY KEY)").first ==
+        "multiple primary keys for table \"u\" are not allowed");
 }

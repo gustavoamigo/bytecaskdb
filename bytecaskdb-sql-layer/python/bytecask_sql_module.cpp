@@ -13,7 +13,8 @@
 // float, str (as UTF-8) and bytes.
 //
 // Errors: bytecask_sql.ExecError for a plan that ran and failed, with its
-// code (a bc_error_code, or BC_CONFLICT when every retry conflicted) and, for
+// code (a bc_error_code), conflict (true when every retry conflicted: code
+// is then BC_CONFLICT, the same number as BC_E_IO) and, for
 // BC_E_CONSTRAINT, the constraint kind and the object id; bytecask_sql.SqlError
 // for a statement the layer refuses before it runs (parse and bind errors,
 // a DDL the catalog refuses, parameters of the wrong number or type);
@@ -64,6 +65,7 @@ nb::handle decimal_type;  // NOLINT(cppcoreguidelines-avoid-non-const-global-var
 void raise_exec_error(const sql::ExecError& e) {
   nb::object exc = nb::borrow(exceptions.exec_error)(nb::str(e.what()));
   exc.attr("code") = e.code();
+  exc.attr("conflict") = e.conflict();
   exc.attr("constraint") = nb::none();
   exc.attr("object_id") = nb::none();
   // Both or neither: an object id without a known constraint kind is
@@ -242,7 +244,30 @@ NB_MODULE(bytecask_sql, m) {
           [](const sql::Database& db, std::string_view table) { return to_python(db.table_rows(table)); },
           "table"_a,
           "Test only: every row of a table, in primary-key order, read from the engine and decoded "
-          "through the catalog.");
+          "through the catalog.")
+      .def(
+          "_engine_rows",
+          [](sql::Database& db, std::string_view table) {
+            auto cat = db.catalog();  // held: t points into it
+            const auto* t = cat->table(table);
+            if (t == nullptr) throw std::invalid_argument("relation \"" + std::string{table} + "\" does not exist");
+            auto snap = db.engine_for_testing().snapshot();
+            nb::list rows;
+            sql::for_each_row(snap, t->id, [&](sql::BytesView key, sql::BytesView row) {
+              rows.append(nb::make_tuple(nb::bytes(key.data(), key.size()), nb::bytes(row.data(), row.size())));
+            });
+            return rows;
+          },
+          "table"_a, "Test only: a table's stored (key, row) pairs, as the engine holds them.")
+      .def(
+          "_engine_put",
+          [](sql::Database& db, const nb::bytes& key, const nb::bytes& value) {
+            auto view = [](const nb::bytes& b) { return std::as_bytes(std::span{b.c_str(), b.size()}); };
+            (void)db.engine_for_testing().put({}, view(key), view(value));
+          },
+          "key"_a, "value"_a, "Test only: writes a key and value straight to the engine, past the layer's checks.")
+      .def("_conflict_on_every_commit", &sql::Database::conflict_on_every_commit_for_testing, "on"_a,
+           "Test only: while on, every commit conflicts, so execute raises ExecError with conflict set.");
 
   m.def(
       "open", [](const std::filesystem::path& dir) { return sql::Database::open(dir); }, "dir"_a,

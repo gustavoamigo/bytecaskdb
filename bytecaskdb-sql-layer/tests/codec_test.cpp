@@ -361,12 +361,12 @@ TEST_CASE("key codec: malformed keys are reported, not over-read", "[sql][codec]
 
 TEST_CASE("row format: every physical type round-trips, null or not", "[sql][codec]") {
   const std::array<ColumnDef, 6> defs{{
-      {0, PhysType::I64, false},
-      {1, PhysType::Bytes, true},
-      {2, PhysType::I64, true},
-      {3, PhysType::F64, true},
-      {4, PhysType::Bool, true},
-      {5, PhysType::Bytes, true},
+      {0, plain_sql_type(PhysType::I64), false},
+      {1, plain_sql_type(PhysType::Bytes), true},
+      {2, plain_sql_type(PhysType::I64), true},
+      {3, plain_sql_type(PhysType::F64), true},
+      {4, plain_sql_type(PhysType::Bool), true},
+      {5, plain_sql_type(PhysType::Bytes), true},
   }};
   auto layout = make_layout(defs);
   CHECK(layout.bitmap_bytes == 8);
@@ -438,7 +438,7 @@ TEST_CASE("row format: every physical type round-trips, null or not", "[sql][cod
 }
 
 TEST_CASE("row format: a row shorter than the layout reads as null, in both directions", "[sql][codec]") {
-  const std::array<ColumnDef, 2> old_defs{{{0, PhysType::I64, false}, {1, PhysType::Bytes, true}}};
+  const std::array<ColumnDef, 2> old_defs{{{0, plain_sql_type(PhysType::I64), false}, {1, plain_sql_type(PhysType::Bytes), true}}};
   auto old_layout = make_layout(old_defs);
   RowWriter w{old_layout};
   REQUIRE(w.set_i64(0, 5));
@@ -450,7 +450,7 @@ TEST_CASE("row format: a row shorter than the layout reads as null, in both dire
   // after the row was written. Existing positions do not move.
   auto new_layout = old_layout;
   const std::array<ColumnDef, 3> added{
-      {{2, PhysType::I64, true}, {3, PhysType::Bytes, true}, {4, PhysType::Bool, true}}};
+      {{2, plain_sql_type(PhysType::I64), true}, {3, plain_sql_type(PhysType::Bytes), true}, {4, plain_sql_type(PhysType::Bool), true}}};
   REQUIRE(append_columns(new_layout, added));
   CHECK(new_layout.find(0)->pos == old_layout.find(0)->pos);
   CHECK(new_layout.find(1)->pos == old_layout.find(1)->pos);
@@ -496,25 +496,25 @@ TEST_CASE("row format: a row shorter than the layout reads as null, in both dire
 
 TEST_CASE("row format: the bitmap is sized at create and has a ceiling", "[sql][codec]") {
   std::vector<ColumnDef> defs;
-  for (std::uint32_t i = 0; i < 48; ++i) defs.push_back({i, PhysType::I64, true});
+  for (std::uint32_t i = 0; i < 48; ++i) defs.emplace_back(i, plain_sql_type(PhysType::I64), true);
   auto layout = make_layout(defs);
   CHECK(layout.bitmap_bytes == 8);  // 48 ids and 16 to spare fit 64 bits
   CHECK(layout.id_ceiling() == 64);
-  REQUIRE(append_columns(layout, std::array{ColumnDef{63, PhysType::Bool, true}}));
+  REQUIRE(append_columns(layout, std::array{ColumnDef{63, plain_sql_type(PhysType::Bool), true}}));
   // Past the ceiling: refused, and nothing appended.
   auto before = layout.columns.size();
-  CHECK_FALSE(append_columns(layout, std::array{ColumnDef{64, PhysType::I64, true}}));
-  CHECK_FALSE(append_columns(layout, std::array{ColumnDef{50, PhysType::I64, true}, ColumnDef{64, PhysType::I64, true}}));
+  CHECK_FALSE(append_columns(layout, std::array{ColumnDef{64, plain_sql_type(PhysType::I64), true}}));
+  CHECK_FALSE(append_columns(layout, std::array{ColumnDef{50, plain_sql_type(PhysType::I64), true}, ColumnDef{64, plain_sql_type(PhysType::I64), true}}));
   CHECK(layout.columns.size() == before);
   CHECK(layout.find(50) == nullptr);
 
-  defs.push_back({48, PhysType::I64, true});
+  defs.emplace_back(48, plain_sql_type(PhysType::I64), true);
   CHECK(make_layout(defs).bitmap_bytes == 16);
   CHECK(make_layout(std::span<const ColumnDef>{}).bitmap_bytes == 8);
 
   // The fixed region ends where the header's 16-bit var_table does.
   std::vector<ColumnDef> many;
-  for (std::uint32_t i = 0; i < 9000; ++i) many.push_back({i, PhysType::I64, true});
+  for (std::uint32_t i = 0; i < 9000; ++i) many.emplace_back(i, plain_sql_type(PhysType::I64), true);
   auto wide = make_layout(std::span<const ColumnDef>{many}.first(8000));
   CHECK(wide.fixed_end <= 0xFFFF);
   CHECK(wide.columns.size() == 8000);
@@ -523,8 +523,8 @@ TEST_CASE("row format: the bitmap is sized at create and has a ceiling", "[sql][
   CHECK_THROWS_AS(make_layout(many), std::length_error);
   // An id large enough that the bitmap alone outgrows the 16-bit header
   // fields, with only variable columns: refused at create.
-  CHECK_THROWS_AS(make_layout(std::array{ColumnDef{600'000, PhysType::Bytes, true}}), std::length_error);
-  CHECK(make_layout(std::array{ColumnDef{500'000, PhysType::Bytes, true}}).fixed_start <= 0xFFFF);
+  CHECK_THROWS_AS(make_layout(std::array{ColumnDef{600'000, plain_sql_type(PhysType::Bytes), true}}), std::length_error);
+  CHECK(make_layout(std::array{ColumnDef{500'000, plain_sql_type(PhysType::Bytes), true}}).fixed_start <= 0xFFFF);
   CHECK(narrow<std::uint16_t>(0xFFFFu) == 0xFFFF);
   CHECK_THROWS_AS(narrow<std::uint16_t>(0x10000u), std::overflow_error);
   RowWriter ww{wide};
@@ -546,7 +546,7 @@ TEST_CASE("row format: the bitmap is sized at create and has a ceiling", "[sql][
 }
 
 TEST_CASE("row format: layout_valid holds the format's invariants, and finish refuses a broken layout", "[sql][codec]") {
-  const std::array<ColumnDef, 2> defs{{{0, PhysType::I64, false}, {1, PhysType::Bytes, true}}};
+  const std::array<ColumnDef, 2> defs{{{0, plain_sql_type(PhysType::I64), false}, {1, plain_sql_type(PhysType::Bytes), true}}};
   auto good = make_layout(defs);
   CHECK(layout_valid(good));
   auto past_ceiling = good;
@@ -585,7 +585,7 @@ TEST_CASE("row format: result layouts come from the plan's types", "[sql][codec]
 }
 
 TEST_CASE("row format: malformed rows are rejected, not over-read, and the limit holds", "[sql][codec]") {
-  const std::array<ColumnDef, 2> defs{{{0, PhysType::I64, false}, {1, PhysType::Bytes, true}}};
+  const std::array<ColumnDef, 2> defs{{{0, plain_sql_type(PhysType::I64), false}, {1, plain_sql_type(PhysType::Bytes), true}}};
   auto layout = make_layout(defs);
   RowWriter w{layout};
   REQUIRE(w.set_i64(0, 1));

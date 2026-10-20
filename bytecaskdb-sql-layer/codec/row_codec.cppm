@@ -55,11 +55,55 @@ template <typename To, typename From>
   return static_cast<To>(v);
 }
 
+// The stage-1 SQL types of docs/types_design.md. The values are
+// the record's; never renumber one.
+enum class SqlKind : std::uint8_t {
+  SmallInt = 1,
+  Integer,
+  BigInt,
+  Real,
+  Double,
+  Boolean,
+  Bytea,
+  Text,
+  Varchar,
+  Decimal,
+  Timestamp,
+  Date,
+  Time,
+};
+
+// DECIMAL(p, s) is a scaled i64: p of at most 18 digits fits.
+inline constexpr std::uint8_t kMaxDecimalPrecision = 18;
+
+struct SqlType {
+  SqlKind kind;
+  std::uint32_t length{0};    // VARCHAR(n): n, in code points
+  std::uint8_t precision{0};  // DECIMAL(p, s): p, 1..18
+  std::uint8_t scale{0};      // DECIMAL(p, s): s, 0..p
+  auto operator==(const SqlType&) const -> bool = default;
+};
+
+[[nodiscard]] auto phys_type(SqlType t) -> PhysType;
+// The SQL type a column of only a physical type is declared as: BIGINT,
+// DOUBLE PRECISION, BOOLEAN or BYTEA, none with a range narrower than its
+// physical type. A result row's columns, and tests', state theirs with it.
+[[nodiscard]] auto plain_sql_type(PhysType t) -> SqlType;
+
 struct ColumnSlot {
+  // The SQL type is required, and the physical type follows from it: a
+  // layout cannot hold a column without the declared type its values are
+  // checked against.
+  ColumnSlot(std::uint32_t id, SqlType declared, bool null_ok, std::uint32_t at)
+      : col_id{id}, type{phys_type(declared)}, nullable{null_ok}, pos{at}, sql{declared} {}
+
   std::uint32_t col_id;  // permanent; the bitmap bit
   PhysType type;
   bool nullable;
   std::uint32_t pos;  // fixed: byte offset in the row; variable: slot
+  // The column's declared type, carried beside its slot: the runtime checks
+  // a value written against it (BC_C_RANGE), and set_f64 rounds a REAL by it.
+  SqlType sql;
 };
 
 // Where each column of one layout generation lives.
@@ -77,9 +121,13 @@ struct RowLayout {
 };
 
 struct ColumnDef {
+  ColumnDef(std::uint32_t id, SqlType declared, bool null_ok)
+      : col_id{id}, type{phys_type(declared)}, nullable{null_ok}, sql{declared} {}
+
   std::uint32_t col_id;
   PhysType type;
   bool nullable;
+  SqlType sql;
 };
 
 // Assigns positions in column order: fixed columns one word each after the
@@ -121,6 +169,9 @@ public:
 
 private:
   auto set_word(std::uint32_t col_id, PhysType type, std::uint64_t word) -> bool;
+  // Sets the fixed column at layout index i to word: the store set_word and
+  // set_f64 share once each has found the column.
+  void put_word(std::size_t i, std::uint64_t word);
   // The column's index in the layout, if it has one of `type` (any type when nullopt).
   [[nodiscard]] auto index_of(std::uint32_t col_id, std::optional<PhysType> type) const -> std::optional<std::size_t>;
 
@@ -248,7 +299,7 @@ auto append_columns(RowLayout& layout, std::span<const ColumnDef> cols) -> bool 
     }
   }
   for (const auto& c : cols) {
-    ColumnSlot s{c.col_id, c.type, c.nullable, 0};
+    ColumnSlot s{c.col_id, c.sql, c.nullable, 0};
     if (is_fixed(c.type)) {
       s.pos = layout.fixed_end;
       layout.fixed_end += kFixedColumnBytes;
@@ -260,10 +311,39 @@ auto append_columns(RowLayout& layout, std::span<const ColumnDef> cols) -> bool 
   return true;
 }
 
+auto phys_type(SqlType t) -> PhysType {
+  switch (t.kind) {
+    case SqlKind::SmallInt:
+    case SqlKind::Integer:
+    case SqlKind::BigInt:
+    case SqlKind::Decimal:
+    case SqlKind::Timestamp:
+    case SqlKind::Date:
+    case SqlKind::Time: return PhysType::I64;
+    case SqlKind::Real:
+    case SqlKind::Double: return PhysType::F64;
+    case SqlKind::Boolean: return PhysType::Bool;
+    case SqlKind::Bytea:
+    case SqlKind::Text:
+    case SqlKind::Varchar: return PhysType::Bytes;
+  }
+  return PhysType::Bytes;
+}
+
+auto plain_sql_type(PhysType t) -> SqlType {
+  switch (t) {
+    case PhysType::I64: return {SqlKind::BigInt};
+    case PhysType::F64: return {SqlKind::Double};
+    case PhysType::Bool: return {SqlKind::Boolean};
+    case PhysType::Bytes: return {SqlKind::Bytea};
+  }
+  return {SqlKind::Bytea};
+}
+
 auto make_result_layout(std::span<const PhysType> types) -> RowLayout {
   std::vector<ColumnDef> defs;
   defs.reserve(types.size());
-  for (std::uint32_t i = 0; i < types.size(); ++i) defs.push_back({i, types[i], true});
+  for (std::uint32_t i = 0; i < types.size(); ++i) defs.emplace_back(i, plain_sql_type(types[i]), true);
   return make_layout(defs);
 }
 
@@ -302,11 +382,15 @@ auto RowWriter::index_of(std::uint32_t col_id, std::optional<PhysType> type) con
   return static_cast<std::size_t>(c - layout_->columns.data());
 }
 
+void RowWriter::put_word(std::size_t i, std::uint64_t word) {
+  present_[i] = true;
+  fixed_[i] = word;
+}
+
 auto RowWriter::set_word(std::uint32_t col_id, PhysType type, std::uint64_t word) -> bool {
   auto i = index_of(col_id, type);
   if (!i) return false;
-  present_[*i] = true;
-  fixed_[*i] = word;
+  put_word(*i, word);
   return true;
 }
 
@@ -315,7 +399,14 @@ auto RowWriter::set_i64(std::uint32_t col_id, std::int64_t v) -> bool {
 }
 
 auto RowWriter::set_f64(std::uint32_t col_id, double v) -> bool {
-  return set_word(col_id, PhysType::F64, std::bit_cast<std::uint64_t>(v));
+  // A REAL column stores its float rounding, as PostgreSQL stores a float4.
+  // The one place a row's REAL value is rounded: a DEFAULT is parsed as a
+  // float, so the catalog holds it already rounded, and this leaves it as is.
+  auto i = index_of(col_id, PhysType::F64);
+  if (!i) return false;
+  if (layout_->columns[*i].sql.kind == SqlKind::Real) v = float_rounding(v);
+  put_word(*i, std::bit_cast<std::uint64_t>(v));
+  return true;
 }
 
 auto RowWriter::set_bool(std::uint32_t col_id, bool v) -> bool {

@@ -10,8 +10,10 @@
 
 module;
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
 #include <vector>
@@ -42,7 +44,14 @@ struct KeyPart {
   PhysType type;
   bool nullable{false};
   bool desc{false};
+  bool real{false};  // a REAL column: a double is keyed as its float rounding, as the row stores it
 };
+
+// A double as a float holds it, widened back: PostgreSQL's float8 to
+// float4. Infinite at or past 2^128 - 2^103, the first value that rounds
+// up; FLT_MAX between that and FLT_MAX; NaN and the infinities as given.
+// Never an out-of-range conversion. What a REAL stores and is keyed by.
+[[nodiscard]] auto float_rounding(double v) -> double;
 
 void key_put_prefix(Bytes& out, std::uint8_t ns, std::uint32_t id);
 // The typed writers use part.nullable and part.desc; the type is the caller's
@@ -147,7 +156,17 @@ void key_put_i64(Bytes& out, std::int64_t v, KeyPart part) {
   if (part.desc) invert_from(out, start);
 }
 
+auto float_rounding(double v) -> double {
+  if (!std::isfinite(v)) return v;
+  constexpr auto kFloatMax = static_cast<double>(std::numeric_limits<float>::max());
+  constexpr auto kFirstInfinite = 0x1p128 - 0x1p103;
+  if (std::fabs(v) >= kFirstInfinite) return std::copysign(std::numeric_limits<double>::infinity(), v);
+  if (std::fabs(v) > kFloatMax) return std::copysign(kFloatMax, v);
+  return static_cast<double>(static_cast<float>(v));
+}
+
 void key_put_f64(Bytes& out, double v, KeyPart part) {
+  if (part.real) v = float_rounding(v);
   auto start = out.size();
   put_marker(out, part);
   put_be(out, f64_to_ordered(v), 8);

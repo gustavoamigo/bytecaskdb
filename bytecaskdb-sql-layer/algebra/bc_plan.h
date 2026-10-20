@@ -48,7 +48,7 @@ enum bc_error_code {
                        bc_schema_ref does not declare, or not of the type used: a plan bug */
   BC_E_ARITH,       /* integer overflow, division by zero, out-of-range conversion */
   BC_E_CONSTRAINT,  /* never retried; raised by the runtime (BC_C_UNIQUE from bc_insert and bc_update,
-                       BC_C_NOT_NULL from the row builder) or by the plan with bc_raise */
+                       BC_C_RANGE and BC_C_NOT_NULL from the row builder) or by the plan with bc_raise */
   BC_E_LAYOUT,      /* plan incompatible with the live catalog, or a row violates its layout */
   BC_E_DEGRADED,    /* engine degraded; writes refused */
   BC_E_CLOSED,
@@ -68,7 +68,8 @@ enum bc_scan_flags {
 
 enum bc_constraint {   /* the detail of BC_E_CONSTRAINT; the compiler emits the object id with it */
   BC_C_UNIQUE = 1, BC_C_NOT_NULL, BC_C_CHECK, BC_C_FOREIGN_KEY,
-  BC_C_RANGE,          /* a value outside its declared type: INTEGER, VARCHAR(n), DECIMAL(p, s) */
+  BC_C_RANGE,          /* a value outside its declared type: SMALLINT, INTEGER, REAL, TEXT and
+                          VARCHAR(n) (UTF-8, n code points), DECIMAL(p, s), DATE, TIMESTAMP, TIME */
 };
 
 enum bc_layout_detail {  /* the detail of BC_E_LAYOUT; every BC_E_LAYOUT carries one */
@@ -106,7 +107,7 @@ typedef struct {
    *Compatibility*) on every run; the result layout is the plan's own and
    is not a catalog object. */
 typedef struct {
-  uint64_t catalog_version;                                       /* compiled against; for messages */
+  uint64_t catalog_version;                                       /* compiled or last checked against; for messages */
   const uint32_t   *objects_read;    uint32_t n_read;             /* tables and indexes it names */
   const uint32_t   *tables_written;  uint32_t n_written;          /* tables whose rows it writes */
   const bc_col_ref *cols;            uint32_t n_cols;             /* every column it reads or sets */

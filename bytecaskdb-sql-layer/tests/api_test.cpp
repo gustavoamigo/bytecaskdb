@@ -8,9 +8,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cmath>
+#include <limits>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -174,6 +176,43 @@ TEST_CASE("embedded API: a plan the catalog refuses is recompiled and run again"
   CHECK_THROWS_AS(db->execute(insert, {i(6), bytes("fig"), bytes("sixty")}), ParamError);
   CHECK(db->execute(insert, {i(6), bytes("fig"), i(60)}).affected == 1);
   CHECK(db->execute(by_id, {i(6)}).rows == Grid{{i(6), i(60)}});
+}
+
+TEST_CASE("embedded API: parameters are checked against the plan that will run", "[sql][api][catalog]") {
+  sql_test::TempDir dir{"api_stale_params"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v BIGINT)");
+  const auto& by_k = db->prepare("SELECT v FROM t WHERE k = $1");
+  CHECK(db->execute(by_k, {i(1)}).rows.empty());
+  // The key is recreated as BIGINT: the parameter's physical type is the
+  // same, so the cached plan's types fit, but its INTEGER range is the
+  // dropped table's. The plan is verified, recompiled, and only then is
+  // the parameter checked, against BIGINT.
+  (void)db->execute("DROP TABLE t");
+  (void)db->execute("CREATE TABLE t (k BIGINT PRIMARY KEY, v BIGINT)");
+  (void)db->execute("INSERT INTO t VALUES ($1, $2)", {i(3'000'000'000), i(7)});
+  CHECK(db->execute(by_k, {i(3'000'000'000)}).rows == Grid{{i(7)}});
+}
+
+TEST_CASE("embedded API: a cached plan is checked once per catalog version", "[sql][api][catalog]") {
+  sql_test::TempDir dir{"api_plan_checks"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE t (k BIGINT PRIMARY KEY, v BIGINT)");
+  const auto& by_k = db->prepare("SELECT v FROM t WHERE k = $1");
+  (void)db->execute(by_k, {i(1)});
+  CHECK(db->plan_checks_for_testing() == 0);  // compiled against the current version
+  // A DDL on another table moves the version: the plan is checked once, still
+  // fits, and is marked with that version; later runs are not checked.
+  (void)db->execute("CREATE TABLE elsewhere (k BIGINT PRIMARY KEY)");
+  auto compiled = db->compilations();
+  for (int k = 0; k < 3; ++k) (void)db->execute(by_k, {i(1)});
+  CHECK(db->plan_checks_for_testing() == 1);
+  CHECK(db->compilations() == compiled);
+  // Another DDL: one more check.
+  (void)db->execute("DROP TABLE elsewhere");
+  for (int k = 0; k < 3; ++k) (void)db->execute(by_k, {i(1)});
+  CHECK(db->plan_checks_for_testing() == 2);
+  CHECK(db->compilations() == compiled);
 }
 
 TEST_CASE("embedded API: a DOUBLE read through an index keeps -0.0", "[sql][api]") {
@@ -538,4 +577,242 @@ TEST_CASE("embedded API: table_rows reads a table in key order; errors carry the
     CHECK(e.code() == BC_E_CORRUPT);
   }
   fourth->close();
+}
+
+TEST_CASE("embedded API: values outside their declared type, an omitted NOT NULL column, one PRIMARY KEY",
+          "[sql][api]") {
+  sql_test::TempDir dir{"api_ranges"};
+  auto db = Database::open(dir.path());
+  (void)db->execute(
+      "CREATE TABLE r (k BIGINT PRIMARY KEY, s SMALLINT, n INTEGER, v VARCHAR(3), f REAL, d NUMERIC(4, 2), "
+      "m BIGINT NOT NULL DEFAULT 0, z BIGINT NOT NULL)");
+  auto table_id = db->catalog()->table("r")->id;
+  constexpr auto kIns = "INSERT INTO r (k, s, n, v, f, d, z) VALUES ($1, $2, $3, $4, $5, $6, $7)";
+  auto row = [&](std::int64_t k) { return std::vector<Value>{i(k), kNull, kNull, kNull, kNull, kNull, i(0)}; };
+  auto refusal = [&](std::string_view sql, const std::vector<Value>& params) -> std::pair<std::uint32_t, std::string> {
+    try {
+      (void)db->execute(sql, params);
+    } catch (const ExecError& e) {
+      auto c = e.constraint();
+      REQUIRE(c);
+      CHECK(c->object_id == table_id);
+      CHECK_FALSE(e.conflict());
+      return {c->constraint, e.what()};
+    }
+    FAIL("accepted: " << sql);
+    return {};
+  };
+  auto with = [&](std::size_t at, Value v) {
+    auto p = row(1);
+    p[at] = std::move(v);
+    return p;
+  };
+
+  // Each declared range, at its edge: the edge is written, one past it refused with BC_C_RANGE.
+  CHECK(refusal(kIns, with(1, i(32768))) == std::pair<std::uint32_t, std::string>{BC_C_RANGE,
+        "smallint out of range for column \"s\" of table \"r\""});
+  CHECK(refusal(kIns, with(1, i(-32769))).first == BC_C_RANGE);
+  CHECK(refusal(kIns, with(2, i(std::int64_t{1} << 31))).second.starts_with("integer out of range"));
+  CHECK(refusal(kIns, with(3, bytes("abcd"))).second.starts_with("value too long for type character varying(3)"));
+  CHECK(refusal(kIns, with(4, Value{1e39})).second.starts_with("value out of range: overflow"));
+  CHECK(refusal(kIns, with(4, Value{1e-50})).second.starts_with("value out of range: underflow"));
+  CHECK(refusal(kIns, with(5, i(10000))).second.starts_with("numeric field overflow"));  // 100.00 in NUMERIC(4, 2)
+  CHECK(refusal(kIns, with(5, i(-10000))).first == BC_C_RANGE);
+  CHECK(db->execute(kIns, {i(1), i(32767), i((std::int64_t{1} << 31) - 1), bytes("\xC3\xA9\xC3\xA9\xC3\xA9"),
+                           Value{3.0e38}, i(9999), i(0)})
+            .affected == 1);  // VARCHAR(3) counts code points: "ééé" is 6 bytes
+  CHECK(db->execute(kIns, {i(2), i(-32768), i(-(std::int64_t{1} << 31)), bytes("abc"), Value{0.0}, i(-9999), i(0)})
+            .affected == 1);
+  // REAL overflow is PostgreSQL's: a value refused when its float rounding is
+  // infinite. 2^128 - 2^103 is the first that rounds up; the double just
+  // below it rounds to FLT_MAX.
+  constexpr auto kFirstInf = 0x1p128 - 0x1p103;
+  CHECK(refusal(kIns, with(4, Value{kFirstInf})).second.starts_with("value out of range: overflow"));
+  CHECK(refusal(kIns, with(4, Value{-kFirstInf})).first == BC_C_RANGE);
+  CHECK(db->execute(kIns, {i(5), kNull, kNull, kNull, Value{std::nextafter(kFirstInf, 0.0)}, kNull, i(0)}).affected == 1);
+  // A REAL is stored as its float rounding, as PostgreSQL stores a float4:
+  // the double below 2^128 - 2^103 as FLT_MAX, and 0.1 as 0.100000001490116…
+  CHECK(db->execute(kIns, {i(6), kNull, kNull, kNull, Value{0.1}, kNull, i(0)}).affected == 1);
+  CHECK(db->execute(kIns, {i(7), kNull, kNull, kNull, Value{-std::nextafter(kFirstInf, 0.0)}, kNull, i(0)}).affected == 1);
+  auto real_of = [&](std::int64_t k) {
+    auto r = db->execute("SELECT f FROM r WHERE k = $1", {i(k)});
+    REQUIRE(r.rows.size() == 1);
+    return std::get<double>(r.rows[0][0]);
+  };
+  CHECK(real_of(5) == static_cast<double>(std::numeric_limits<float>::max()));
+  CHECK(real_of(7) == -static_cast<double>(std::numeric_limits<float>::max()));
+  CHECK(real_of(6) == static_cast<double>(0.1f));
+  CHECK(real_of(6) != 0.1);
+  // A REAL key or index part is found by the value it was written with: a
+  // lookup, a bound, and an UPDATE or DELETE by key round a REAL as the row
+  // does, as PostgreSQL rounds a $1 typed real.
+  (void)db->execute("CREATE TABLE rk (r REAL PRIMARY KEY, x REAL, n BIGINT)");
+  (void)db->execute("CREATE INDEX rk_x ON rk (x)");
+  CHECK(db->execute("INSERT INTO rk VALUES ($1, $2, $3)", {Value{0.1}, Value{0.1}, i(1)}).affected == 1);
+  CHECK(db->execute("INSERT INTO rk VALUES ($1, $2, $3)", {Value{0.5}, Value{0.5}, i(2)}).affected == 1);
+  CHECK(db->execute("SELECT n FROM rk WHERE r = $1", {Value{0.1}}).rows == Grid{{i(1)}});
+  CHECK(db->execute("UPDATE rk SET n = $2 WHERE r = $1", {Value{0.1}, i(10)}).affected == 1);
+  CHECK(db->execute("SELECT n FROM rk WHERE x <= $1", {Value{0.1}}).rows == Grid{{i(10)}});  // 0.1 rounded: included
+  CHECK(db->execute("SELECT n FROM rk WHERE x > $1", {Value{0.1}}).rows == Grid{{i(2)}});    // and excluded here
+  // The same REAL again is a duplicate key, whichever double rounds to it.
+  for (auto again : {0.1, static_cast<double>(0.1f)}) {
+    try {
+      (void)db->execute("INSERT INTO rk VALUES ($1, $2, $3)", {Value{again}, kNull, i(3)});
+      FAIL("a duplicate REAL key was inserted");
+    } catch (const ExecError& e) {
+      REQUIRE(e.constraint());
+      CHECK(e.constraint()->constraint == BC_C_UNIQUE);
+    }
+  }
+  CHECK(db->execute("DELETE FROM rk WHERE r = $1", {Value{0.1}}).affected == 1);
+  CHECK(db->table_rows("rk").rows.size() == 1);
+
+  // A key value, a lookup's or a bound's, is checked against its column's
+  // type as PostgreSQL checks a typed $n: outside it is BC_C_RANGE, never
+  // rounded to a neighbour or wrapped. 1e-50 would round to the 0.0 row and
+  // 1e39 to the infinite one.
+  CHECK(db->execute("INSERT INTO rk VALUES ($1, $2, $3)", {Value{0.0}, Value{0.0}, i(4)}).affected == 1);
+  constexpr auto kInf = std::numeric_limits<double>::infinity();
+  CHECK(db->execute("INSERT INTO rk VALUES ($1, $2, $3)", {Value{kInf}, Value{kInf}, i(5)}).affected == 1);
+  auto key_refusal = [&](std::string_view sql, const std::vector<Value>& params) -> std::string {
+    try {
+      (void)db->execute(sql, params);
+    } catch (const ExecError& e) {
+      REQUIRE(e.constraint());
+      CHECK(e.constraint()->constraint == BC_C_RANGE);
+      return e.what();
+    }
+    FAIL("accepted: " << sql);
+    return {};
+  };
+  CHECK(key_refusal("SELECT n FROM rk WHERE r = $1", {Value{1e-50}}).starts_with("value out of range: underflow"));
+  CHECK(key_refusal("SELECT n FROM rk WHERE r = $1", {Value{1e39}}).starts_with("value out of range: overflow"));
+  CHECK(key_refusal("SELECT n FROM rk WHERE x < $1", {Value{1e-50}}).starts_with("value out of range: underflow"));
+  CHECK(key_refusal("DELETE FROM rk WHERE r = $1", {Value{-1e39}}).starts_with("value out of range: overflow"));
+  CHECK(db->execute("SELECT n FROM rk WHERE r = $1", {Value{kInf}}).rows == Grid{{i(5)}});
+  CHECK(db->execute("SELECT n FROM rk WHERE x < $1", {Value{0.25}}).rows == Grid{{i(4)}});
+  // An INTEGER key and bound: 3000000000 is not an INTEGER (22003), not "no row".
+  (void)db->execute("CREATE TABLE ik (k INTEGER PRIMARY KEY, n INTEGER, v VARCHAR(2))");
+  (void)db->execute("CREATE INDEX ik_n ON ik (n)");
+  (void)db->execute("CREATE INDEX ik_v ON ik (v)");
+  CHECK(db->execute("INSERT INTO ik VALUES ($1, $2, $3)", {i(1), i(1), bytes("ab")}).affected == 1);
+  CHECK(key_refusal("SELECT k FROM ik WHERE n < $1", {i(3'000'000'000)}).starts_with("integer out of range"));
+  CHECK(key_refusal("SELECT n FROM ik WHERE k = $1", {i(-3'000'000'000)}).starts_with("integer out of range"));
+  // A modifier is not a type's range: a VARCHAR(2) key compared with a longer
+  // value finds nothing, as a $n typed varchar does; text that is not UTF-8
+  // is refused (22021).
+  CHECK(db->execute("SELECT k FROM ik WHERE v = $1", {bytes("abc")}).rows.empty());
+  CHECK(key_refusal("SELECT k FROM ik WHERE v = $1", {bytes("\xFF")}).starts_with("invalid byte sequence"));
+
+  // A REAL DEFAULT is stored the same way.
+  (void)db->execute("CREATE TABLE rd (k BIGINT PRIMARY KEY, f REAL DEFAULT 0.1)");
+  CHECK(db->execute("INSERT INTO rd (k) VALUES ($1)", {i(1)}).affected == 1);
+  CHECK(db->table_rows("rd").rows.at(0).at(1) == Value{static_cast<double>(0.1f)});
+
+  // DATE, TIMESTAMP and TIME: PostgreSQL's ranges, in days and microseconds
+  // from 1970. TIME includes 24:00:00.
+  (void)db->execute("CREATE TABLE tm (k BIGINT PRIMARY KEY, t TIME, d DATE, ts TIMESTAMP)");
+  auto tm_id = db->catalog()->table("tm")->id;
+  constexpr auto kInsTm = "INSERT INTO tm VALUES ($1, $2, $3, $4)";
+  constexpr std::int64_t kDay = 86'400'000'000;
+  constexpr std::int64_t kMinDate = -2'440'588;      // 4714-11-24 BC
+  constexpr std::int64_t kEndDate = 2'145'042'906;   // 5874898-01-01, the first day past the range
+  constexpr std::int64_t kMinTs = -210'866'803'200'000'000;
+  CHECK(db->execute(kInsTm, {i(1), i(kDay), i(kMinDate), i(kMinTs)}).affected == 1);
+  CHECK(db->execute(kInsTm, {i(2), i(0), i(kEndDate - 1), i(std::numeric_limits<std::int64_t>::max())}).affected == 1);
+  auto tm_refusal = [&](std::vector<Value> p) -> std::string {
+    try {
+      (void)db->execute(kInsTm, p);
+    } catch (const ExecError& e) {
+      REQUIRE(e.constraint());
+      CHECK(e.constraint()->constraint == BC_C_RANGE);
+      CHECK(e.constraint()->object_id == tm_id);
+      return e.what();
+    }
+    FAIL("accepted");
+    return {};
+  };
+  CHECK(tm_refusal({i(3), i(kDay + 1), kNull, kNull}).starts_with("time out of range"));
+  CHECK(tm_refusal({i(3), i(-1), kNull, kNull}).starts_with("time out of range"));
+  CHECK(tm_refusal({i(3), kNull, i(kMinDate - 1), kNull}).starts_with("date out of range"));
+  CHECK(tm_refusal({i(3), kNull, i(kEndDate), kNull}).starts_with("date out of range"));
+  CHECK(tm_refusal({i(3), kNull, kNull, i(kMinTs - 1)}).starts_with("timestamp out of range"));
+  // TEXT and VARCHAR are UTF-8, checked on write, and VARCHAR(n) counts code
+  // points in the same pass: invalid UTF-8 is BC_C_RANGE ("invalid byte
+  // sequence", 22021), never counted into a length.
+  (void)db->execute("CREATE TABLE tx (k BIGINT PRIMARY KEY, t TEXT, v VARCHAR(3))");
+  constexpr auto kInsTx = "INSERT INTO tx VALUES ($1, $2, $3)";
+  auto raw = [](std::string_view s) { return bytes(s); };
+  std::string continuation_run = "\xC3";
+  continuation_run.append(1000, '\x80');  // one lead byte, then stray continuations
+  for (const auto& bad : {continuation_run, std::string{"\xFF"}, std::string{"a\0b", 3}, std::string{"\xC0\x80"},
+                          std::string{"\xED\xA0\x80"}, std::string{"\xF4\x90\x80\x80"}, std::string{"\xE2\x82"}}) {
+    for (std::size_t at : {1u, 2u}) {
+      std::vector<Value> p{i(1), kNull, kNull};
+      p[at] = raw(bad);
+      try {
+        (void)db->execute(kInsTx, p);
+        FAIL("invalid UTF-8 was written");
+      } catch (const ExecError& e) {
+        REQUIRE(e.constraint());
+        CHECK(e.constraint()->constraint == BC_C_RANGE);
+        CHECK(std::string{e.what()}.starts_with("invalid byte sequence for encoding \"UTF8\""));
+      }
+    }
+  }
+  // A four-byte code point is one: three of them fit VARCHAR(3).
+  CHECK(db->execute(kInsTx, {i(1), raw("\xF0\x9F\x98\x80"), raw("\xF0\x9F\x98\x80\xC3\xA9z")}).affected == 1);
+  CHECK(db->table_rows("tx").rows.size() == 1);
+
+  // UPDATE checks the value it computes, as INSERT does the one it is given.
+  CHECK(refusal("UPDATE r SET n = n - $2 WHERE k = $1", {i(1), i(-1)}).second.starts_with("integer out of range"));
+  CHECK(refusal("UPDATE r SET s = $2 WHERE k = $1", {i(2), i(-40000)}).first == BC_C_RANGE);
+
+  // A NOT NULL column left out with no default is refused when the row is
+  // built, as a NULL given for it is: a primary key column among them.
+  CHECK(refusal("INSERT INTO r (k) VALUES ($1)", {i(3)}) ==
+        std::pair<std::uint32_t, std::string>{BC_C_NOT_NULL,
+                                              "null value in column \"z\" of table \"r\" violates its not-null "
+                                              "constraint"});
+  CHECK(refusal("INSERT INTO r (z) VALUES ($1)", {i(3)}).second.starts_with("null value in column \"k\""));
+  CHECK(db->execute("INSERT INTO r (k, z) VALUES ($1, $2)", {i(3), i(7)}).affected == 1);  // m takes its default
+  // A row with both is BC_C_RANGE, as in PostgreSQL, whose type checks come
+  // first: NOT NULL is checked when the row ends.
+  CHECK(refusal(kIns, {i(4), kNull, i(std::int64_t{1} << 40), kNull, kNull, kNull, kNull}).first == BC_C_RANGE);
+  CHECK(refusal(kIns, {kNull, i(1), i(1), bytes("abcd"), kNull, kNull, i(0)}).first == BC_C_RANGE);
+
+  // Nothing refused was written.
+  auto rows = db->table_rows("r");
+  REQUIRE(rows.rows.size() == 6);
+  CHECK(rows.rows[0][1] == i(32767));
+  CHECK(rows.rows[1][2] == i(-(std::int64_t{1} << 31)));
+  CHECK(rows.rows[2][6] == i(0));
+
+  // One PRIMARY KEY a table; two are refused, not merged into a composite key.
+  CHECK_THROWS_AS(db->execute("CREATE TABLE two (a BIGINT PRIMARY KEY, b BIGINT PRIMARY KEY)"), ast::SqlError);
+  CHECK_THROWS_AS(db->execute("CREATE TABLE two (a BIGINT PRIMARY KEY, b BIGINT, PRIMARY KEY (b))"), ast::SqlError);
+  CHECK(db->catalog()->table("two") == nullptr);
+
+  // A statement that conflicts on every retry is told from an error with the
+  // same code (BC_CONFLICT and BC_E_IO are both 1), end to end: every commit
+  // is made to conflict, and nothing is written.
+  static_assert(static_cast<int>(BC_CONFLICT) == static_cast<int>(BC_E_IO));
+  // A conflict is made only by conflicted(): BC_CONFLICT is not a bc_error_code.
+  static_assert(!std::is_constructible_v<ExecError, std::string, decltype(BC_CONFLICT)>);
+  static_assert(std::is_constructible_v<ExecError, std::string, decltype(BC_E_IO)>);
+  constexpr auto kInsK = "INSERT INTO r (k, z) VALUES ($1, $2)";
+  db->conflict_on_every_commit_for_testing(true);
+  try {
+    (void)db->execute(kInsK, {i(9), i(0)});
+    FAIL("a statement conflicting on every retry committed");
+  } catch (const ExecError& e) {
+    CHECK(e.conflict());
+    CHECK(e.code() == BC_CONFLICT);
+    CHECK_FALSE(e.constraint());
+  }
+  db->conflict_on_every_commit_for_testing(false);
+  CHECK(db->table_rows("r").rows.size() == 6);
+  CHECK(db->execute(kInsK, {i(9), i(0)}).affected == 1);
+  CHECK_FALSE(ExecError("I/O", BC_E_IO).conflict());
+  db->close();
 }

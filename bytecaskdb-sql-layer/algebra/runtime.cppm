@@ -10,6 +10,7 @@
 module;
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -53,12 +54,22 @@ struct bc_params {
   std::vector<bc_value> values;
 };
 
+#ifdef BYTECASK_SQL_TESTING
+// Test only (sql_layer_testing): runs `hook` in every bc_ctx_commit of the
+// context, after the plan ran and before its batch reaches the engine, so a
+// test can make the commit conflict. An empty function removes it.
+void bc_ctx_before_commit_for_testing(bc_ctx* cx, std::function<void()> hook);
+#endif
+
 }  // extern "C++"
 
 export using ::bc_db;
 export using ::bc_catalog;
 export using ::bc_params;
 export using ::bc_ctx_affected;
+#ifdef BYTECASK_SQL_TESTING
+export using ::bc_ctx_before_commit_for_testing;
+#endif
 
 export namespace bytecask::sql {
 

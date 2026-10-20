@@ -91,7 +91,7 @@ auto rich_table() -> Table {
   std::vector<ColumnDef> defs;
   auto add = [&](std::string name, SqlType sql, bool nullable, Datum def) {
     Column c{t.next_col_id++, std::move(name), sql, phys_type(sql), nullable, std::move(def)};
-    defs.push_back({c.id, c.type, c.nullable});
+    defs.emplace_back(c.id, c.sql, c.nullable);
     t.columns.push_back(std::move(c));
   };
   add("a", {SqlKind::Integer}, false, std::int64_t{-3});

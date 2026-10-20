@@ -19,15 +19,19 @@
 
 module;
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -113,42 +117,53 @@ public:
 // runtime's bc_value is this type.
 using Datum = std::variant<std::monostate, std::int64_t, double, bool, Bytes>;
 
-// The stage-1 SQL types of docs/types_design.md. The values are
-// the record's; never renumber one.
-enum class SqlKind : std::uint8_t {
-  SmallInt = 1,
-  Integer,
-  BigInt,
-  Real,
-  Double,
-  Boolean,
-  Bytea,
-  Text,
-  Varchar,
-  Decimal,
-  Timestamp,
-  Date,
-  Time,
-};
-
-// DECIMAL(p, s) is a scaled i64: p of at most 18 digits fits.
-inline constexpr std::uint8_t kMaxDecimalPrecision = 18;
-
-struct SqlType {
-  SqlKind kind;
-  std::uint32_t length{0};    // VARCHAR(n): n, in code points
-  std::uint8_t precision{0};  // DECIMAL(p, s): p, 1..18
-  std::uint8_t scale{0};      // DECIMAL(p, s): s, 0..p
-  auto operator==(const SqlType&) const -> bool = default;
-};
+// TIME is microseconds since midnight, in [0, kMicrosPerDay]: 24:00:00 is a
+// TIME, as in PostgreSQL.
+inline constexpr std::int64_t kMicrosPerDay = 86'400'000'000;
+// PostgreSQL's DATE and TIMESTAMP ranges, in this layer's epoch (1970-01-01):
+// days in [kMinDate, kEndDate), from 4714-11-24 BC to 5874898-01-01; and
+// microseconds from kMinTimestamp (4714-11-24 BC 00:00). PostgreSQL's
+// TIMESTAMP ends after 294276 AD, past what an i64 from 1970 reaches, so
+// every larger value is a TIMESTAMP.
+inline constexpr std::int64_t kMinDate = -2'440'588;
+inline constexpr std::int64_t kEndDate = 2'145'042'906;
+inline constexpr std::int64_t kMinTimestamp = -210'866'803'200'000'000;
+// 10^0 .. 10^kMaxDecimalPrecision: DECIMAL(p, s)'s bound on its scaled value.
+inline constexpr auto kPowersOfTen = [] {
+  std::array<std::int64_t, kMaxDecimalPrecision + 1> p{};
+  p[0] = 1;
+  for (std::size_t i = 1; i < p.size(); ++i) p[i] = p[i - 1] * 10;
+  return p;
+}();
 
 // Whether the fields a kind does not use are zero and the ones it uses in range.
 [[nodiscard]] auto sql_type_valid(SqlType t) -> bool;
-[[nodiscard]] auto phys_type(SqlType t) -> PhysType;
 // As SQL writes it: "integer", "varchar(16)", "numeric(12,2)".
 [[nodiscard]] auto sql_type_name(SqlType t) -> std::string;
 // Whether a datum is NULL or of the physical type.
 [[nodiscard]] auto datum_fits(const Datum& d, PhysType t) -> bool;
+// The code points of well-formed UTF-8 with no NUL, or nullopt: a
+// truncated or overlong sequence, a surrogate, one past U+10FFFF, a stray
+// continuation byte, or a NUL, which PostgreSQL's text refuses too. One pass:
+// the check of TEXT and VARCHAR values, and VARCHAR(n)'s length.
+[[nodiscard]] auto utf8_code_points(BytesView s) -> std::optional<std::size_t>;
+// The type a parameter compared with a column of type t has: t without its
+// modifier (VARCHAR(n) as TEXT, DECIMAL(p, s) as an unbounded integer), as
+// PostgreSQL types a $n by its column. A key value, a lookup's or a
+// bound's, is checked against it: the type's range, not the modifier's.
+[[nodiscard]] auto param_type(SqlType t) -> SqlType;
+// Why a value of the column's physical type is outside its declared type,
+// in PostgreSQL's words, or nullopt: a SMALLINT or INTEGER out of range, a
+// REAL that overflows or underflows float, a TEXT or VARCHAR that is not
+// UTF-8 (22021), a VARCHAR(n) of more than n code points, a DECIMAL(p, s) of
+// more than p digits, a DATE, TIMESTAMP or TIME outside PostgreSQL's range
+// for it. The one check of a declared
+// range, for a value written (BC_C_RANGE) and a DEFAULT.
+[[nodiscard]] auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string>;
+[[nodiscard]] auto out_of_range(SqlType t, double v) -> std::optional<std::string>;
+[[nodiscard]] auto out_of_range(SqlType t, BytesView v) -> std::optional<std::string>;
+[[nodiscard]] inline auto out_of_range(SqlType, bool) -> std::optional<std::string> { return std::nullopt; }
+[[nodiscard]] auto out_of_range(SqlType t, const Datum& d) -> std::optional<std::string>;
 // Sets one column of a row writer to a datum (NULL sets it null). False for
 // a type mismatch.
 [[nodiscard]] auto set_datum(RowWriter& w, std::uint32_t col_id, const Datum& d) -> bool;
@@ -213,6 +228,9 @@ struct KeyLayout {
   const Index* index;          // nullptr for a table's primary key
   std::vector<KeyPart> parts;  // every part: index columns, then primary key
   std::size_t index_parts;     // how many of them precede the primary key
+  // Each part's column, in parts' order: its declared type is what a key
+  // value is checked against. Points into `table`, which outlives the layout.
+  std::vector<const Column*> columns;
 };
 
 // The stage-1 DDL statements, as values: what LiveCatalog prepares.
@@ -575,6 +593,12 @@ auto index_prefix(std::uint32_t index_id) -> Bytes {
   return p;
 }
 
+// Column c's key part: its physical type, nullable and direction as given,
+// and whether it is a REAL, whose doubles are keyed as their float rounding.
+auto key_part(const Column& c, bool nullable = false, bool desc = false) -> KeyPart {
+  return {c.type, nullable, desc, c.sql.kind == SqlKind::Real};
+}
+
 // Appends one column of `row` as a key part. False if the row is malformed
 // or a non-nullable part is null; `was_null` receives whether it was null.
 auto put_part_from_row(const Table& t, std::uint32_t col_id, KeyPart part, BytesView row, Bytes& out,
@@ -702,7 +726,7 @@ auto ConstraintDetail::message() const -> std::string {
     case BC_C_NOT_NULL: return "null value violates a not-null constraint of table " + object;
     case BC_C_CHECK: return "check constraint " + object + " violated";
     case BC_C_FOREIGN_KEY: return "foreign key constraint " + object + " violated";
-    case BC_C_RANGE: return "value out of range for column " + object;
+    case BC_C_RANGE: return "value out of range for a column of table " + object;
     default: return "constraint violated on object " + object;
   }
 }
@@ -760,24 +784,6 @@ auto sql_type_valid(SqlType t) -> bool {
   return false;  // a kind no build knows
 }
 
-auto phys_type(SqlType t) -> PhysType {
-  switch (t.kind) {
-    case SqlKind::SmallInt:
-    case SqlKind::Integer:
-    case SqlKind::BigInt:
-    case SqlKind::Decimal:
-    case SqlKind::Timestamp:
-    case SqlKind::Date:
-    case SqlKind::Time: return PhysType::I64;
-    case SqlKind::Real:
-    case SqlKind::Double: return PhysType::F64;
-    case SqlKind::Boolean: return PhysType::Bool;
-    case SqlKind::Bytea:
-    case SqlKind::Text:
-    case SqlKind::Varchar: return PhysType::Bytes;
-  }
-  return PhysType::Bytes;
-}
 
 auto sql_type_name(SqlType t) -> std::string {
   switch (t.kind) {
@@ -796,6 +802,130 @@ auto sql_type_name(SqlType t) -> std::string {
     case SqlKind::Time: return "time";
   }
   return "?";
+}
+
+auto utf8_code_points(BytesView s) -> std::optional<std::size_t> {
+  auto n = std::size_t{0};
+  for (std::size_t i = 0; i < s.size(); ++n) {
+    auto b0 = std::to_integer<std::uint32_t>(s[i]);
+    // The sequence length and the bounds of the second byte that keep it
+    // shortest and inside U+0000..U+10FFFF, surrogates excluded (RFC 3629).
+    auto len = std::size_t{0};
+    auto lo = 0x80u;
+    auto hi = 0xBFu;
+    if (b0 == 0x00) return std::nullopt;
+    if (b0 < 0x80) {
+      len = 1;
+    } else if (b0 >= 0xC2 && b0 <= 0xDF) {
+      len = 2;
+    } else if (b0 >= 0xE0 && b0 <= 0xEF) {
+      len = 3;
+      if (b0 == 0xE0) lo = 0xA0;
+      if (b0 == 0xED) hi = 0x9F;
+    } else if (b0 >= 0xF0 && b0 <= 0xF4) {
+      len = 4;
+      if (b0 == 0xF0) lo = 0x90;
+      if (b0 == 0xF4) hi = 0x8F;
+    } else {
+      return std::nullopt;  // a continuation byte, C0, C1, or F5..FF
+    }
+    if (len > s.size() - i) return std::nullopt;
+    for (std::size_t k = 1; k < len; ++k) {
+      auto b = std::to_integer<std::uint32_t>(s[i + k]);
+      if (b < (k == 1 ? lo : 0x80u) || b > (k == 1 ? hi : 0xBFu)) return std::nullopt;
+    }
+    i += len;
+  }
+  return n;
+}
+
+auto param_type(SqlType t) -> SqlType {
+  switch (t.kind) {
+    case SqlKind::Varchar: return {SqlKind::Text};
+    case SqlKind::Decimal: return {SqlKind::BigInt};
+    case SqlKind::SmallInt:
+    case SqlKind::Integer:
+    case SqlKind::BigInt:
+    case SqlKind::Real:
+    case SqlKind::Double:
+    case SqlKind::Boolean:
+    case SqlKind::Bytea:
+    case SqlKind::Text:
+    case SqlKind::Timestamp:
+    case SqlKind::Date:
+    case SqlKind::Time: return t;
+  }
+  return t;
+}
+
+auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string> {
+  switch (t.kind) {
+    case SqlKind::SmallInt:
+      if (!std::in_range<std::int16_t>(v)) return "smallint out of range";
+      break;
+    case SqlKind::Integer:
+      if (!std::in_range<std::int32_t>(v)) return "integer out of range";
+      break;
+    case SqlKind::Decimal: {
+      // p digits: |v| < 10^p, on the scaled value.
+      auto limit = kPowersOfTen.at(t.precision);
+      if (v <= -limit || v >= limit) return "numeric field overflow";
+      break;
+    }
+    case SqlKind::Time:
+      if (v < 0 || v > kMicrosPerDay) return "time out of range";
+      break;
+    case SqlKind::Date:
+      if (v < kMinDate || v >= kEndDate) return "date out of range";
+      break;
+    case SqlKind::Timestamp:
+      if (v < kMinTimestamp) return "timestamp out of range";
+      break;
+    case SqlKind::BigInt:
+    case SqlKind::Real:
+    case SqlKind::Double:
+    case SqlKind::Boolean:
+    case SqlKind::Bytea:
+    case SqlKind::Text:
+    case SqlKind::Varchar: break;
+  }
+  return std::nullopt;
+}
+
+auto out_of_range(SqlType t, double v) -> std::optional<std::string> {
+  if (t.kind != SqlKind::Real) return std::nullopt;
+  // As PostgreSQL's float8 to float4: a finite value whose float rounding is
+  // infinite overflows, a nonzero one whose rounding is zero underflows.
+  // float_rounding holds the thresholds, and never converts out of range.
+  auto r = float_rounding(v);
+  if (std::isinf(r) && std::isfinite(v)) return "value out of range: overflow";
+  if (r == 0.0 && v != 0.0) return "value out of range: underflow";
+  return std::nullopt;
+}
+
+auto out_of_range(SqlType t, BytesView v) -> std::optional<std::string> {
+  if (t.kind != SqlKind::Text && t.kind != SqlKind::Varchar) return std::nullopt;
+  auto n = utf8_code_points(v);
+  if (!n) return "invalid byte sequence for encoding \"UTF8\"";
+  if (t.kind == SqlKind::Varchar && *n > t.length) {
+    return "value too long for type character varying(" + std::to_string(t.length) + ")";
+  }
+  return std::nullopt;
+}
+
+auto out_of_range(SqlType t, const Datum& d) -> std::optional<std::string> {
+  return std::visit(
+      [&](const auto& v) -> std::optional<std::string> {
+        using V = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<V, std::monostate>) {
+          return std::nullopt;
+        } else if constexpr (std::is_same_v<V, Bytes>) {
+          return out_of_range(t, BytesView{v});
+        } else {
+          return out_of_range(t, v);
+        }
+      },
+      d);
 }
 
 auto datum_fits(const Datum& d, PhysType t) -> bool {
@@ -861,7 +991,7 @@ auto read_layout(RecordReader& r, const Table& t) -> std::pair<std::uint32_t, Ro
     if (!ids.insert(col_id).second || !used.insert(pos).second) {
       corrupt("layout of table " + t.name + " has a column or position twice");
     }
-    l.columns.push_back({col_id, c->type, c->nullable, pos});
+    l.columns.emplace_back(col_id, c->sql, c->nullable, pos);
   }
   e.expect_end("layout entry of table " + t.name);
   if (!layout_valid(l)) corrupt("table " + t.name + " has a malformed row layout");
@@ -1099,17 +1229,23 @@ void Catalog::rebuild_lookups() {
     name_taken(t.name);
     names_[t.name] = id;
     std::vector<KeyPart> pk_parts;
-    for (auto cid : t.pk_col_ids) pk_parts.push_back(KeyPart{t.column(cid)->type});
-    key_layouts_[id] = KeyLayout{kNsRow, &t, nullptr, pk_parts, 0};
+    std::vector<const Column*> pk_columns;
+    for (auto cid : t.pk_col_ids) {
+      pk_columns.push_back(t.column(cid));
+      pk_parts.push_back(key_part(*pk_columns.back()));
+    }
+    key_layouts_[id] = KeyLayout{kNsRow, &t, nullptr, pk_parts, 0, pk_columns};
     for (const auto& ix : t.indexes) {
       name_taken(ix.name);
       names_[ix.name] = ix.id;
-      KeyLayout kl{kNsIndex, &t, &ix, {}, ix.parts.size()};
+      KeyLayout kl{kNsIndex, &t, &ix, {}, ix.parts.size(), {}};
       for (const auto& p : ix.parts) {
         const auto* c = t.column(p.col_id);
-        kl.parts.push_back(KeyPart{c->type, c->nullable, p.desc});
+        kl.parts.push_back(key_part(*c, c->nullable, p.desc));
+        kl.columns.push_back(c);
       }
       kl.parts.insert(kl.parts.end(), pk_parts.begin(), pk_parts.end());
+      kl.columns.insert(kl.columns.end(), pk_columns.begin(), pk_columns.end());
       key_layouts_[ix.id] = std::move(kl);
     }
   }
@@ -1203,7 +1339,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       if (t.column(cname) != nullptr) throw DdlRefused("column \"" + cname + "\" specified more than once");
       auto in_pk = std::ranges::any_of(ct->pk, [&](const std::string& p) { return std::string{p} == cname; });
       Column c{t.next_col_id++, cname, spec.sql, phys_type(spec.sql), spec.nullable && !in_pk, spec.default_value};
-      defs.push_back({c.id, c.type, c.nullable});
+      defs.emplace_back(c.id, c.sql, c.nullable);
       t.columns.push_back(std::move(c));
     }
     for (const auto& p : ct->pk) {
@@ -1324,7 +1460,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   }
   Column c{t.next_col_id, cname, ac.column.sql, phys_type(ac.column.sql), ac.column.nullable, ac.column.default_value};
   auto old_layout = t.layout;
-  if (!append_columns(t.layout, std::vector<ColumnDef>{{c.id, c.type, c.nullable}})) {
+  if (!append_columns(t.layout, std::vector<ColumnDef>{{c.id, c.sql, c.nullable}})) {
     throw std::length_error("table \"" + t.name + "\" has no room in its row layout for another column (needs REBUILD)");
   }
   ++t.next_col_id;
@@ -1472,7 +1608,7 @@ auto LiveCatalog::apply(const Ddl& ddl) -> std::shared_ptr<const Catalog> {
 auto encode_pk_from_row(const Table& t, BytesView row, Bytes& out) -> bool {
   key_put_prefix(out, kNsRow, t.id);
   for (auto id : t.pk_col_ids) {
-    if (!put_part_from_row(t, id, KeyPart{t.column(id)->type}, row, out)) return false;
+    if (!put_part_from_row(t, id, key_part(*t.column(id)), row, out)) return false;
   }
   return true;
 }
@@ -1484,13 +1620,13 @@ auto encode_index_key_from_row(const Table& t, const Index& ix, BytesView row, B
   for (const auto& p : ix.parts) {
     const auto* c = t.column(p.col_id);
     bool was_null = false;
-    if (!put_part_from_row(t, p.col_id, KeyPart{c->type, c->nullable, p.desc}, row, out, &was_null)) return false;
+    if (!put_part_from_row(t, p.col_id, key_part(*c, c->nullable, p.desc), row, out, &was_null)) return false;
     any_null = any_null || was_null;
   }
   if (prefix_len != nullptr) *prefix_len = out.size();
   if (has_null != nullptr) *has_null = any_null;
   for (auto id : t.pk_col_ids) {
-    if (!put_part_from_row(t, id, KeyPart{t.column(id)->type}, row, out)) return false;
+    if (!put_part_from_row(t, id, key_part(*t.column(id)), row, out)) return false;
   }
   return true;
 }
