@@ -106,9 +106,16 @@ class SqlMachine(RuleBasedStateMachine):
 
     def __init__(self):
         super().__init__()
-        self.dir = tempfile.mkdtemp(prefix="bytecask_sql_proof_")
-        self.db = bytecask_sql.open(self.dir)
+        # PostgreSQL first: if it cannot connect, nothing else is open yet.
         self.pg = Oracle(self.dsn)
+        try:
+            self.dir = tempfile.mkdtemp(prefix="bytecask_sql_proof_")
+            self.db = bytecask_sql.open(self.dir)
+        except BaseException:
+            self.pg.close()
+            if hasattr(self, "dir"):
+                shutil.rmtree(self.dir, ignore_errors=True)
+            raise
         self.tables: dict[str, Table] = {}
 
     def teardown(self):
@@ -142,7 +149,9 @@ class SqlMachine(RuleBasedStateMachine):
         return layer
 
     def existing_keys(self, t: Table) -> list[tuple]:
-        return [r for r in o.run_pg(self.pg.conn, f"SELECT {', '.join(t.pk)} FROM {t.name}").rows]
+        out = o.run_pg(self.pg.conn, f"SELECT {', '.join(t.pk)} FROM {t.name}")
+        assert out.error is None, out.detail
+        return list(out.rows)
 
     # The steps, callable in a set order by the fixed cases ------------------
 

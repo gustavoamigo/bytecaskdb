@@ -268,7 +268,7 @@ public:
 
   // Object ids stay at or below 2^24 - 1: bc_error_detail carries one in its
   // low 24 bits (and a plan's constants are an enum, whose values are ints).
-  static constexpr std::uint32_t kMaxObjectId = 0x00FF'FFFFu;
+  static constexpr std::uint32_t kMaxObjectId = ConstraintDetail::kMaxObjectId;
   // 3: #489's record (SQL types, defaults, unique and DESC parts, layout
   // entries). 2 was #490's, 1 the prototype's; both are refused.
   static constexpr std::uint16_t kRecordFormat = 3;

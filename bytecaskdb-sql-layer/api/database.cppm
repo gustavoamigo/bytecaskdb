@@ -131,7 +131,7 @@ public:
   // ast::SqlError if a recompile fails, ExecError if the plan fails, and for
   // DDL, what LiveCatalog::apply throws (DdlRefused for a statement the
   // catalog refuses), but a ConstraintViolation as an ExecError: a unique
-  // index over duplicates is BC_E_CONSTRAINT, BC_C_UNIQUE and the index's id.
+  // index over duplicates is BC_E_CONSTRAINT, BC_C_UNIQUE and the table's id.
   auto execute(const Statement& stmt, const std::vector<Value>& params) -> Rows;
   auto execute(std::string_view sql, const std::vector<Value>& params = {}) -> Rows {
     return execute(prepare(sql), params);
@@ -383,8 +383,8 @@ auto Database::table_rows(std::string_view table) const -> Rows {
   const auto* t = cat->table(table);
   if (t == nullptr) throw ast::SqlError("relation \"" + std::string{table} + "\" does not exist", -1);
   Rows out;
-  // The table's layout with its slots in column order: decode_row reads
-  // them in that order. A column a row's bitmap has no bit for reads as NULL.
+  // The table's layout with its slots in column order, the order the rows
+  // are read in. A column a row's bitmap has no bit for reads as NULL.
   auto layout = t->layout;
   layout.columns.clear();
   for (const auto& c : t->columns) {
@@ -394,16 +394,44 @@ auto Database::table_rows(std::string_view table) const -> Rows {
     out.columns.push_back(c.name);
     out.types.push_back(c.sql);
   }
+  // Damage is BC_E_CORRUPT, never a plausible value: this is the oracle's
+  // reader, so unlike decode_row (result rows the runtime built) every
+  // present field must decode.
+  auto corrupt = [&](const std::string& what) { return ExecError(what + " in table " + t->name, BC_E_CORRUPT); };
   for_each_row(snap, t->id, [&](BytesView, BytesView row) {
-    if (!row_valid(row)) throw std::runtime_error("malformed row in table " + t->name);
+    if (!row_valid(row)) throw corrupt("malformed row");
     // The slots are the current layout's: a row of another generation would
     // decode from the wrong positions, so it is refused, as the plan
     // runtime refuses it.
     if (auto gen = row_generation(row); gen != t->layout.generation) {
-      throw std::runtime_error("row of layout generation " + std::to_string(gen) + " in table " + t->name +
-                               ", whose layout is generation " + std::to_string(t->layout.generation));
+      throw corrupt("row of layout generation " + std::to_string(gen) + ", whose layout is generation " +
+                    std::to_string(t->layout.generation));
     }
-    out.rows.push_back(decode_row(layout, row));
+    std::vector<Value> values;
+    for (const auto& c : layout.columns) {
+      if (row_is_null(row, c)) {
+        values.emplace_back(std::monostate{});
+        continue;
+      }
+      // Present, so the row must hold it: outside its regions it would read as 0 or empty.
+      if (!row_holds(row, c)) throw corrupt("a present column " + std::to_string(c.col_id) + " outside its row");
+      auto take = [&](auto v) {
+        if (!v) throw corrupt("column " + std::to_string(c.col_id) + " does not decode");
+        values.emplace_back(Value{*v});
+      };
+      switch (c.type) {
+        case PhysType::I64: take(row_i64(row, c.pos)); break;
+        case PhysType::F64: take(row_f64(row, c.pos)); break;
+        case PhysType::Bool: take(row_bool(row, c.pos)); break;
+        case PhysType::Bytes: {
+          auto b = row_bytes(row, c.pos);
+          if (!b) throw corrupt("column " + std::to_string(c.col_id) + " does not decode");
+          values.emplace_back(Bytes{b->begin(), b->end()});
+          break;
+        }
+      }
+    }
+    out.rows.push_back(std::move(values));
   });
   return out;
 }
