@@ -239,18 +239,25 @@ auto DB::recovery_prepare_files(EngineState &s)
       // recovery_check_tail has ruled that it may: the preallocated tail a
       // crash leaves, or a torn write. That makes its physical size its
       // logical size, as for every other sealed file — file_size below is
-      // what seeds total_bytes for vacuum.
-      const auto end = flush_hints_for(data_file, dir_, [&](Offset e) {
-        recovery_check_tail(*data_file, e, data_paths);
+      // what seeds total_bytes for vacuum. The cut is made and synced before
+      // the hint is written (#476): every later open trusts a hint and never
+      // cuts its file, so a hint over a file whose cut failed, or that a
+      // crash interrupted, would keep the tail for good.
+      auto cut = false;
+      flush_hints_for(data_file, dir_, [&](Offset end) {
+        recovery_check_tail(*data_file, end, data_paths);
+        if (end < data_file->size()) {
+          // Closed across the cut, so no mapping or open file spans the
+          // bytes that go.
+          data_file.reset();
+          truncate_durably(p, end);
+          cut = true;
+        }
       });
-      // The file had no hint, so flush_hints_for wrote one and returns the
-      // end of what it indexed.
-      if (end.value() < std::filesystem::file_size(p)) {
-        data_file.reset();
-        truncate_durably(p, *end);
+      if (cut) {
         // Same file_id as the open above, deliberately. Under the buffer
         // pool that open's hint scan may have admitted frames under this id,
-        // but the truncate only drops a tail: every byte below *end is
+        // but the truncate only drops a tail: every byte below the end is
         // unchanged, and no reader addresses anything above it. Frames past
         // the new end are orphans CLOCK reclaims.
         data_file = openDataFileForRead(p, io_backend_, pool_, file_id);

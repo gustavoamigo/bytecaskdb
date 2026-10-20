@@ -265,7 +265,7 @@ fixes:
 | `close_swallows_error`: `close()` drops its final `fdatasync`'s error | #260 (#257) | caught in 0.5–3 min, every run (every life a clean close) |
 | `hint_read_error_kills_process`: a hint read error kills the process | #255 (#237) | caught in 2–5 min, every run |
 | `vacuum_drops_before_durable`: vacuum drops records superseded by non-durable writes | #261 (#245) | caught in 2 of 5 runs of 10 min: rare |
-| `hint_written_in_place`: hints written in place, not renamed | — | caught twice in ~45 min: rare |
+| `hint_written_in_place`: hints written in place, not renamed | — | caught twice in ~45 min before #476, in 6 min after: rare |
 | `no_sync_before_degrade`: a failed append degrades without syncing | — | not caught: #240's rewrite in `resume()` covers it |
 | `truncate_lowers_end_after`: the logical end drops after `ftruncate`, not before | #248 (#236) | not caught: the stale end lasts one `resume()` retry; #248's `prove_resume` cell guards it |
 

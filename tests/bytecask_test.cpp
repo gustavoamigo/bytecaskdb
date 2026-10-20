@@ -1536,11 +1536,10 @@ TEST_CASE("DB recovery: a hint-less file's tail is truncated only in the "
 }
 
 // A hint is written to .hint.tmp and renamed into place, so ".hint exists"
-// means "the hint is complete". Open writes a hint-less file's hint before it
-// trims the file's torn tail, and a hint that later fails its CRC is rebuilt
-// by a scan that does no tail handling, since a file with a hint was sealed.
-// A hint torn in place by a crash during that open would send the next one
-// to that scan over the torn tail, and it would refuse the database.
+// means "the hint is complete". Open cuts a hint-less file's torn tail, and
+// syncs the cut, before it writes the hint (#476), so a crash during the hint
+// write leaves a file already cut and no hint: the next open indexes it again
+// and finds nothing to cut.
 TEST_CASE("DB recovery: a crash while open writes a hint leaves no hint behind "
           "it, and the next open recovers",
           "[bytecask][recovery][corruption]") {
@@ -1556,6 +1555,7 @@ TEST_CASE("DB recovery: a crash while open writes a hint leaves no hint behind "
   const auto files = data_files_by_sequence(dir);
   REQUIRE(files.size() == 3);
   drop_hint(files[2]);
+  const auto committed_end = std::filesystem::file_size(files[2]) - kEntry;
   tear_last_entry(files[2]);
 
   {
@@ -1566,6 +1566,7 @@ TEST_CASE("DB recovery: a crash while open writes a hint leaves no hint behind "
   auto hint = files[2];
   hint.replace_extension(".hint");
   CHECK_FALSE(std::filesystem::exists(hint));
+  CHECK(std::filesystem::file_size(files[2]) == committed_end);
 
   auto db = bytecask::DB::open(dir, opts);
   for (int i = 0; i < 13; ++i) {
@@ -1575,14 +1576,28 @@ TEST_CASE("DB recovery: a crash while open writes a hint leaves no hint behind "
 }
 
 // Open cuts a torn tail with truncate_durably, whose fdatasync persists the
-// new length. The first io_rewrite_sync is the hint-less file's rewrite, the
-// second the cut's; failing the second fails the open only while it is made.
+// new length, and only then writes the file's hint (#476): a hint written
+// first would outlive a failed cut, and every later open, trusting it, would
+// keep the tail. io_truncate fails the cut before the ftruncate, so the file
+// is left uncut; the second io_rewrite_sync is the cut's sync (the first is
+// the hint-less file's rewrite), so the file is cut but the open fails. The
+// file is closed before it is cut, on every back-end.
 TEST_CASE("DB recovery: open fails when the cut of a torn tail cannot be "
-          "synced, and the next open recovers",
+          "made or synced, and the next open recovers",
           "[bytecask][recovery][corruption]") {
+  const auto io_backend =
+      GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::Mmap,
+               bytecask::IoBackend::BufferPool);
+  CAPTURE(static_cast<int>(io_backend));
+#ifdef __EMSCRIPTEN__
+  if (io_backend == bytecask::IoBackend::Mmap)
+    SKIP("DB::open rejects Mmap on WASM");
+#endif
   TempDir td;
   const auto dir = td.path / "db";
-  const bytecask::Options opts{.max_file_bytes = 100};
+  bytecask::Options opts{.max_file_bytes = 100, .io_backend = io_backend};
+  if (io_backend == bytecask::IoBackend::BufferPool)
+    opts.buffer_pool.capacity_bytes = 1024 * 1024;
   {
     auto db = bytecask::DB::open(dir, opts);
     for (int i = 0; i < 14; ++i)
@@ -1592,15 +1607,27 @@ TEST_CASE("DB recovery: open fails when the cut of a torn tail cannot be "
   const auto files = data_files_by_sequence(dir);
   REQUIRE(files.size() == 3);
   drop_hint(files[2]);
+  const auto committed_end = std::filesystem::file_size(files[2]) - kEntry;
   tear_last_entry(files[2]);
+  const auto torn_size = std::filesystem::file_size(files[2]);
+  auto hint = files[2];
+  hint.replace_extension(".hint");
 
-  {
+  SECTION("the cut fails") {
+    bytecask::testing::ScopedFaultInjector fi{"io_truncate"};
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, opts), std::system_error);
+    CHECK(std::filesystem::file_size(files[2]) == torn_size);
+  }
+  SECTION("the cut's sync fails") {
     bytecask::testing::ScopedFaultInjector fi{"io_rewrite_sync"};
     fi.inj.fail_on_nth_match = 2;
     REQUIRE_THROWS_AS(bytecask::DB::open(dir, opts), std::system_error);
   }
+  CHECK_FALSE(std::filesystem::exists(hint));
 
   auto db = bytecask::DB::open(dir, opts);
+  CHECK(std::filesystem::exists(hint));
+  CHECK(std::filesystem::file_size(files[2]) == committed_end);
   for (int i = 0; i < 13; ++i) {
     INFO("key " << i);
     CHECK(db.contains_key({}, to_bytes(std::format("k{:x}", i))));

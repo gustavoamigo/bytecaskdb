@@ -7,7 +7,7 @@ Expected: caught.
 Guarded-by: "open makes a hint-less file durable before it indexes it: a process killed before its sync"
 
 diff --git a/bytecaskdb/db_recovery.cpp b/bytecaskdb/db_recovery.cpp
-index ec428ae..424c1dd 100644
+index 3bffc36..7e88f7b 100644
 --- a/bytecaskdb/db_recovery.cpp
 +++ b/bytecaskdb/db_recovery.cpp
 @@ -229,7 +229,6 @@ auto DB::recovery_prepare_files(EngineState &s)
@@ -18,12 +18,12 @@ index ec428ae..424c1dd 100644
      auto data_file =
          openDataFileForRead(p, io_backend_, pool_, file_id);
  
-@@ -246,7 +245,7 @@ auto DB::recovery_prepare_files(EngineState &s)
-       // end of what it indexed.
-       if (end.value() < std::filesystem::file_size(p)) {
-         data_file.reset();
--        truncate_durably(p, *end);
-+        std::filesystem::resize_file(p, *end);
-         // Same file_id as the open above, deliberately. Under the buffer
-         // pool that open's hint scan may have admitted frames under this id,
-         // but the truncate only drops a tail: every byte below *end is
+@@ -249,7 +248,7 @@ auto DB::recovery_prepare_files(EngineState &s)
+           // Closed across the cut, so no mapping or open file spans the
+           // bytes that go.
+           data_file.reset();
+-          truncate_durably(p, end);
++          std::filesystem::resize_file(p, end);
+           cut = true;
+         }
+       });

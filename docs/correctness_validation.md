@@ -2537,7 +2537,7 @@ focuses the run with `Disable:`.
 | `close_swallows_error`: `close()` drops its final `fdatasync`'s error | #260 (#257) | caught in 0.5–3 min, every run (every life a clean close) |
 | `hint_read_error_kills_process`: a hint read error kills the process | #255 (#237) | caught in 2–5 min, every run |
 | `vacuum_drops_before_durable`: vacuum drops records superseded by non-durable writes | #261 (#245) | caught in 2 of 5 runs of 10 min: rare |
-| `hint_written_in_place`: hints written in place, not renamed | — | caught twice in ~45 min: rare |
+| `hint_written_in_place`: hints written in place, not renamed | — | caught twice in ~45 min before #476, in 6 min after: rare |
 | `no_sync_before_degrade`: a failed append degrades without syncing | — | not caught: #240's rewrite in `resume()` covers it |
 | `truncate_lowers_end_after`: the logical end drops after `ftruncate`, not before | #248 (#236) | not caught: the stale end lasts one `resume()` retry; #248's `prove_resume` cell guards it |
 
@@ -2684,7 +2684,8 @@ A site whose break nothing has to catch says why instead.
 | `recovery_check_tail`: a tail is cut only in the newest file | `DB recovery: a hint-less file's tail is truncated only in the newest file` | `tail_cut_in_any_file` | #206 (#138) |
 | `recovery_check_tail`: a first header with an unknown type and only zeros after its sequence field has no sequence, so a first write that landed only part of its sequence is cut, while an unknown type before intact records is still refused | `DB recovery: a hint-less file's tail is truncated only in the newest file` | `torn_first_sequence_trusted` (chaos) | #471 |
 | `recovery_check_tail`: a tail is cut in one file per open | `DB recovery: a hint-less file's tail is truncated only in the newest file` | `two_torn_files_both_cut` | #303 |
-| `truncate_durably`: the cut's new length is synced | `DB recovery: open fails when the cut of a torn tail cannot be synced, …` | `open_truncate_not_synced` | — |
+| `truncate_durably`: the cut's new length is synced | `DB recovery: open fails when the cut of a torn tail cannot be made or synced, …` | `open_truncate_not_synced` | — |
+| `recovery_prepare_files`: a hint-less file is cut, and the cut synced, before its hint is written | `DB recovery: open fails when the cut of a torn tail cannot be made or synced, …` | `hint_written_before_tail_cut` (chaos) | #476 |
 | `DataFileIterator`: an entry whose size runs past the file ends the sweep | `resume() does not trust an entry size that runs past the file` | `scan_trusts_entry_size` | #36, ed3ad5df |
 | `recovery_undo_interrupted_vacuum`: only a compacted copy of the other file is removed | `recovery refuses two different writes under one sequence` | `interrupted_vacuum_any_pair` | #137 |
 | recovery workers hand their errors to the open instead of terminating | `DB parallel recovery: an unrebuildable hint throws instead of …` | `recovery_worker_error_terminates` | BC-157 |
@@ -2721,7 +2722,7 @@ A site whose break nothing has to catch says why instead.
 - **The commit `fdatasync` had no test of its own.** Removing it failed other tests only because their first sync write was lost with it.
 - **`vacuum preserves BulkBegin/BulkEnd markers` never compacted the batch.** Its batch file held only live entries, which vacuum does not touch. A later write now kills one of them.
 - **Three syncs had no test that could see them.** The hint's `fdatasync`, `resume()`'s sync after its truncate, and open's sync of a cut tail: the page cache model covers data file pages, not hint files or file lengths. Each is guarded the way the directory syncs are, by failing its fault point, which a mutation that removes the sync removes too. The hint's fault point moved into the call (`sync_hint`) for that.
-- **The `hint_written_in_place` mutation had no test of its own;** the rig caught it twice in about 45 minutes. A test now fails the hint write between its frames and its trailer.
+- **The `hint_written_in_place` mutation had no test of its own;** the rig caught it twice in about 45 minutes. A test now fails the hint write between its frames and its trailer. Since #476 the tail is cut before the hint is written, but the rig still catches the mutation: the hint file is created before the scan that finds the tail, so in place it exists while the file is uncut.
 
 - **A failed `fstat` sealed a file as empty.** No checkpoint named the call; the counted fault sweep reached it (*Counted fault sweep*, #317).
 
