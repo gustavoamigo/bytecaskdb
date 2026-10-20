@@ -614,13 +614,14 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   // monotonic), so skip the dup check there. For PK tables, eager dup check
   // unless deferred (buffer-only probe catches same-statement duplicates).
   if (!no_pk) {
-    const int dup = defer_dup
-                        ? (txn->buffered_key_present(key.data(), key.size()) ? 1 : 0)
-                        : txn->exists(key.data(), key.size());
+    const Probe dup = defer_dup
+                          ? (txn->buffered_key_present(key.data(), key.size())
+                                 ? Probe::Present : Probe::Absent)
+                          : txn->exists(key.data(), key.size());
     // A failed read is an engine error, never "absent": the row would be
     // overwritten (#524).
-    if (dup < 0) { return HA_ERR_INTERNAL_ERROR; }
-    if (dup > 0) {
+    if (dup == Probe::Failed) { return HA_ERR_GENERIC; }
+    if (dup == Probe::Present) {
       errkey = saved_errkey_ = table->s->primary_key;
       return HA_ERR_FOUND_DUPP_KEY;
     }
@@ -651,12 +652,11 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
                                     index.index_id, index.index_id);
 
         auto upper = index_id_upper_bound(table_id_, index.index_id);
-        auto iter = txn->iter_index_prefix(unique_prefix.data(), unique_prefix.size(),
-                                           upper.data(), upper.size(),
-                                           table_id_, index.index_id);
-        if (iter && iter->valid() &&
-            iter->key_len() >= unique_prefix.size() &&
-            std::memcmp(iter->key_data(), unique_prefix.data(), unique_prefix.size()) == 0) {
+        const Probe dup = txn->index_prefix_exists(
+            unique_prefix.data(), unique_prefix.size(), upper.data(), upper.size(),
+            table_id_, index.index_id, unique_hit_key_);
+        if (dup == Probe::Failed) { return HA_ERR_GENERIC; }  // never "absent" (#524)
+        if (dup == Probe::Present) {
           errkey = saved_errkey_ = static_cast<uint>(index.index_id);
           return HA_ERR_FOUND_DUPP_KEY;
         }
@@ -726,9 +726,9 @@ int ha_bytecaskdb::bulk_copy_write_row(const uchar *buf) {
   encode_row_into(val, codec_.row, buf, schema_version_);
 
   if (!no_pk) {
-    const int dup = txn->bulk_pk_exists(key.data(), key.size());
-    if (dup < 0) { return HA_ERR_INTERNAL_ERROR; }  // never "absent" (#524)
-    if (dup > 0) {
+    const Probe dup = txn->bulk_pk_exists(key.data(), key.size());
+    if (dup == Probe::Failed) { return HA_ERR_GENERIC; }  // never "absent" (#524)
+    if (dup == Probe::Present) {
       errkey = saved_errkey_ = table->s->primary_key;
       return HA_ERR_FOUND_DUPP_KEY;
     }
@@ -748,10 +748,10 @@ int ha_bytecaskdb::bulk_copy_write_row(const uchar *buf) {
       auto &unique_prefix = encode_unique_sec_key_buf_;
       encode_unique_sec_key_into(unique_prefix, table, codec_, buf, table_id_,
                                  index.index_id, index.index_id);
-      const int dup = txn->bulk_unique_prefix_exists(unique_prefix.data(),
-                                                     unique_prefix.size());
-      if (dup < 0) { return HA_ERR_INTERNAL_ERROR; }  // never "absent" (#524)
-      if (dup > 0) {
+      const Probe dup = txn->bulk_unique_prefix_exists(unique_prefix.data(),
+                                                       unique_prefix.size());
+      if (dup == Probe::Failed) { return HA_ERR_GENERIC; }  // never "absent" (#524)
+      if (dup == Probe::Present) {
         errkey = saved_errkey_ = static_cast<uint>(index.index_id);
         return HA_ERR_FOUND_DUPP_KEY;
       }
@@ -903,14 +903,13 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
             encode_unique_sec_key_into(unique_prefix, table, codec_, new_data, table_id_,
                                         index.index_id, index.index_id);
             auto uhi = index_id_upper_bound(table_id_, index.index_id);
-            auto uiter = txn->iter_index_prefix(unique_prefix.data(), unique_prefix.size(),
-                                                uhi.data(), uhi.size(),
-                                                table_id_, index.index_id);
-            if (uiter && uiter->valid() &&
-                uiter->key_len() >= unique_prefix.size() &&
-                std::memcmp(uiter->key_data(), unique_prefix.data(), unique_prefix.size()) == 0) {
-              const uint8_t *uk = uiter->key_data();
-              size_t uklen = uiter->key_len();
+            const Probe dup = txn->index_prefix_exists(
+                unique_prefix.data(), unique_prefix.size(), uhi.data(), uhi.size(),
+                table_id_, index.index_id, unique_hit_key_);
+            if (dup == Probe::Failed) { return HA_ERR_GENERIC; }  // never "absent" (#524)
+            if (dup == Probe::Present) {
+              const uint8_t *uk = unique_hit_key_.data();
+              size_t uklen = unique_hit_key_.size();
               bool is_self = (uklen >= 7 + sec_key_field_len + pk_bytes_len &&
                               std::memcmp(uk + 7 + sec_key_field_len,
                                           pk_bytes, pk_bytes_len) == 0);
@@ -936,9 +935,9 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
                     new_val.data(), new_val.size());
   } else {
     // PK changed — dup check new pk, delete old, insert new.
-    const int dup = txn->exists(new_pk.data(), new_pk.size());
-    if (dup < 0) { return HA_ERR_INTERNAL_ERROR; }  // never "absent" (#524)
-    if (dup > 0) {
+    const Probe dup = txn->exists(new_pk.data(), new_pk.size());
+    if (dup == Probe::Failed) { return HA_ERR_GENERIC; }  // never "absent" (#524)
+    if (dup == Probe::Present) {
       return HA_ERR_FOUND_DUPP_KEY;
     }
     txn->buffer_del(old_pk.data(), old_pk.size());
@@ -1064,7 +1063,7 @@ int ha_bytecaskdb::check(THD * /*thd*/, HA_CHECK_OPT * /*check_opt*/) {
       auto sec_key = encode_sec_key(table, codec_, buf, table_id_,
                                      index.index_id, index.index_id, rowid);
       // Missing or unreadable: either is damage CHECK TABLE reports.
-      if (txn->exists(sec_key.data(), sec_key.size()) != 1) {
+      if (txn->exists(sec_key.data(), sec_key.size()) != Probe::Present) {
         corrupt = true;
         break;
       }
@@ -1475,9 +1474,10 @@ int ha_bytecaskdb::index_read_current(uchar *buf) {
 
     int rc = txn->get(sec_row_key_buf_.data(), sec_row_key_buf_.size(),
                       row_value_buf_);
-    if (rc != 1) {
-      return HA_ERR_KEY_NOT_FOUND;
-    }
+    // A row the index names but that cannot be read is an engine error: an
+    // UPDATE or DELETE must not skip it as missing (#524).
+    if (rc < 0) { return HA_ERR_GENERIC; }
+    if (rc == 0) { return HA_ERR_KEY_NOT_FOUND; }
 
     decode_row(codec_.row,
                reinterpret_cast<const uint8_t *>(row_value_buf_.data()),

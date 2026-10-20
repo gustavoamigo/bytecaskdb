@@ -223,6 +223,19 @@ and handles all of this:
   instead.
 - **Write buffer** — `write_row`, `update_row`, `delete_row` all call
   `buffer_put` / `buffer_del` rather than writing directly to the DB.
+- **Duplicate probes** — `exists`, `index_prefix_exists` and the bulk-copy
+  probes return a `Probe`: `Present`, `Absent`, or `Failed` when the read
+  throws (an I/O or CRC error, an allocation). A failed probe is never
+  taken as absent, which would let the INSERT, UPDATE or bulk copy write
+  over the row it could not read: the statement fails with
+  `HA_ERR_GENERIC`, as a failed point read in `index_read` and `rnd_pos`
+  does, and the probe logs
+  the engine's message with `sql_print_error`. Probes verify checksums
+  whatever `bytecaskdb_verify_checksums` says, since with it off a record
+  whose key bytes are damaged compares unequal and reads as absent. A row
+  that a secondary index names but that cannot be read is `HA_ERR_GENERIC`
+  too, not `HA_ERR_KEY_NOT_FOUND`, so an UPDATE or DELETE does not skip it.
+  CHECK TABLE reports an index entry it cannot read as corruption (#524).
 - **Read-your-own-writes** — `get()` checks the buffer first, then the
   snapshot. `MergeIterator` merge-walks buffer + snapshot so scans also
   see buffered writes.
@@ -266,7 +279,8 @@ INDEX statement), the txn enters **bulk-copy mode**:
   reset. `end_bulk_insert` does the final flush with `sync=true`.
 - Duplicate probes (`bulk_pk_exists`, `bulk_unique_prefix_exists`) check the
   current unflushed batch (`bulk_seen_`) plus the DB directly — the stale
-  pre-ALTER snapshot would miss rows flushed by earlier batches.
+  pre-ALTER snapshot would miss rows flushed by earlier batches. A probe
+  that fails to read fails the copy, as any duplicate probe does.
 
 Peak plugin memory during a copy-ALTER is therefore ~2× the flush threshold,
 independent of table size. There is no separate "activation" step: the existing

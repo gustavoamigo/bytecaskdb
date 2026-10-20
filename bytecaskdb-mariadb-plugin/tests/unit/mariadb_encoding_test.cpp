@@ -990,6 +990,7 @@ struct OneKeyTable {
     share.keys = 1;
     part.field = &field;
     part.fieldnr = 1;
+    part.offset = 1;
     part.length = length;
     part.store_length = length + (nullable ? 1 : 0);
     part.null_bit = nullable ? 1 : 0;
@@ -1252,6 +1253,7 @@ TEST_CASE("DESC key parts are stored in descending order",
     KEY_PART_INFO parts[2] = {t.part, t.part};
     parts[0].key_part_flag = HA_REVERSE_SORT;
     parts[1].field = &g;
+    parts[1].offset = 5;
     g.ptr = t.record + 5;
     t.key.key_part = parts;
     t.key.user_defined_key_parts = 2;
@@ -1777,7 +1779,7 @@ size_t wide_strnxfrmlen(const CHARSET_INFO *, size_t len) { return 2 * len; }
 CHARSET_INFO wide_ci{9, 0, 1, 1, nullptr, 1, wide_strnxfrm, wide_strnxfrmlen};
 
 // (c CHAR(4) PRIMARY KEY, s CHAR(4), KEY (s)), both under wide_ci, laid out
-// as the stub key_copy() reads it: each column's bytes at its field's ptr.
+// as the stub key_copy() reads it: each column's bytes at its part's offset.
 struct WeightsTable {
   uchar record[16]{};
   TABLE_SHARE share{};
@@ -1797,6 +1799,7 @@ struct WeightsTable {
       fields[i] = f[i];
       parts[i].field = f[i];
       parts[i].fieldnr = static_cast<uint16_t>(i + 1);
+      parts[i].offset = 1 + 4 * i;
       parts[i].length = parts[i].store_length = 4;
       keys[i].key_length = 4;
       keys[i].user_defined_key_parts = 1;

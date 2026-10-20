@@ -36,6 +36,12 @@ struct handlerton;
 
 namespace bytecaskdb {
 
+// The outcome of a duplicate probe. A probe whose read fails (an I/O or CRC
+// error, an allocation) is Failed, never Absent: a duplicate check that took
+// it as absent would write over the row it could not read (#524). The
+// caller reports Failed as an engine error.
+enum class [[nodiscard]] Probe { Absent, Present, Failed };
+
 class ha_bytecaskdb;
 
 class MariaDBTxn {
@@ -233,10 +239,21 @@ public:
   // Returns 1 if found (writes to out), 0 if not found, -1 on error.
   int get(const uint8_t *key, size_t klen, bytecask::Bytes &out);
 
-  // Whether key exists, in the buffer or the snapshot: 1 if it does, 0 if
-  // not, -1 if the read failed (an I/O or CRC error). A failed read is never
-  // taken as absent: a duplicate check would then overwrite the row (#524).
-  int exists(const uint8_t *key, size_t klen);
+  // Duplicate probes. Each reads with checksum verification on, whatever
+  // bytecaskdb_verify_checksums says: with it off, a record whose key bytes
+  // are damaged compares unequal and reads as absent. A failed read is
+  // logged once, here, and returned as Probe::Failed.
+
+  // Whether key exists, in the buffer or the snapshot.
+  Probe exists(const uint8_t *key, size_t klen);
+
+  // Whether secondary index index_id holds a key in [prefix, hi) that starts
+  // with prefix, in the buffer or the snapshot; if so, the first one is
+  // copied to first.
+  Probe index_prefix_exists(const uint8_t *prefix, size_t plen,
+                            const uint8_t *hi, size_t hi_len,
+                            uint32_t table_id, uint16_t index_id,
+                            std::vector<uint8_t> &first);
 
   // Keys in [lo, hi) this transaction sees — its snapshot plus its own
   // buffered writes — counted no further than `limit`. The snapshot's count
@@ -324,10 +341,9 @@ public:
 
   // Duplicate probes for bulk mode: check the current unflushed batch, then
   // the DB directly (already-flushed batches). No snapshot — the #sql-xxx
-  // keyspace is exclusive for the duration of the ALTER. 1 if present, 0 if
-  // not, -1 if the read failed, as exists().
-  int bulk_pk_exists(const uint8_t *key, std::size_t klen);
-  int bulk_unique_prefix_exists(const uint8_t *prefix, std::size_t plen);
+  // keyspace is exclusive for the duration of the ALTER. Read as exists().
+  Probe bulk_pk_exists(const uint8_t *key, std::size_t klen);
+  Probe bulk_unique_prefix_exists(const uint8_t *prefix, std::size_t plen);
 
 private:
   void ensure_snapshot();
@@ -387,8 +403,13 @@ private:
   // Reports a deferred-INSERT commit conflict as a duplicate primary key:
   // finds the first guarded key that now exists, and raises ER_DUP_ENTRY
   // through the registered handler (with the key value) or, without one,
-  // with an empty value.
-  void report_deferred_dup_key();
+  // with an empty value. Returns HA_ERR_FOUND_DUPP_KEY, or HA_ERR_GENERIC
+  // when no guarded key is found present and a probe failed: the duplicate
+  // may be the key that could not be read, so no key is named.
+  int report_deferred_dup_key();
+
+  // Runs a probe's read; a throw is logged and becomes Probe::Failed.
+  template <typename Read> static Probe probe(const char *what, Read &&read) noexcept;
 
   // Bulk-copy mode state (see begin_bulk_copy). Isolated from ops_/lookup_.
   bool bulk_copy_mode_{false};

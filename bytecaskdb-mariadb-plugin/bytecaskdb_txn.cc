@@ -13,12 +13,35 @@
 #include "mysql/plugin.h"
 #include "sql_priv.h"
 #include "mysqld_error.h"
+#include "log.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <exception>
 
 namespace bytecaskdb {
+
+namespace {
+
+// Probes verify checksums whatever bytecaskdb_verify_checksums says (#524).
+bytecask::ReadOptions probe_read_options() {
+  return bytecask::ReadOptions{.verify_checksums = true};
+}
+
+}  // namespace
+
+template <typename Read>
+Probe MariaDBTxn::probe(const char *what, Read &&read) noexcept {
+  try {
+    return read() ? Probe::Present : Probe::Absent;
+  } catch (const std::exception &e) {
+    sql_print_error("ByteCaskDB: %s read failed: %s", what, e.what());
+  } catch (...) {
+    sql_print_error("ByteCaskDB: %s read failed", what);
+  }
+  return Probe::Failed;
+}
 
 // ---------------------------------------------------------------------------
 // MariaDBTxn lifecycle
@@ -126,24 +149,37 @@ int MariaDBTxn::get(const uint8_t *key, size_t klen, bytecask::Bytes &out) {
   }
 }
 
-int MariaDBTxn::exists(const uint8_t *key, size_t klen) {
-  if (!lookup_.empty()) {
-    std::vector<uint8_t> k(key, key + klen);
-    auto it = lookup_.find(k);
-    if (it != lookup_.end()) {
-      return it->second.has_value() ? 1 : 0;
+Probe MariaDBTxn::exists(const uint8_t *key, size_t klen) {
+  return probe("duplicate check", [&] {
+    if (!lookup_.empty()) {
+      auto it = lookup_.find(std::vector<uint8_t>(key, key + klen));
+      if (it != lookup_.end()) {
+        return it->second.has_value();
+      }
     }
-  }
-
-  ensure_snapshot();
-  try {
+    ensure_snapshot();
     if (snap_) {
-      return snap_->contains_key(plugin_read_options(), as_view(key, klen)) ? 1 : 0;
+      return snap_->contains_key(probe_read_options(), as_view(key, klen));
     }
-    return db_->contains_key(plugin_read_options(), as_view(key, klen)) ? 1 : 0;
-  } catch (...) {
-    return -1;
-  }
+    return db_->contains_key(probe_read_options(), as_view(key, klen));
+  });
+}
+
+Probe MariaDBTxn::index_prefix_exists(const uint8_t *prefix, size_t plen,
+                                      const uint8_t *hi, size_t hi_len,
+                                      uint32_t table_id, uint16_t index_id,
+                                      std::vector<uint8_t> &first) {
+  return probe("unique index check", [&] {
+    // keys_from reads each key's record checksum-verified: its ReadOptions
+    // only govern value reads, and it reads no values.
+    auto it = iter_index_prefix(prefix, plen, hi, hi_len, table_id, index_id);
+    if (!it->valid() || it->key_len() < plen ||
+        std::memcmp(it->key_data(), prefix, plen) != 0) {
+      return false;
+    }
+    first.assign(it->key_data(), it->key_data() + it->key_len());
+    return true;
+  });
 }
 
 std::size_t MariaDBTxn::count_range(const uint8_t *lo, size_t lo_len,
@@ -342,10 +378,10 @@ int MariaDBTxn::commit(THD * /*thd*/, bool all) {
       if (deferred) {
         // Snapshot-less plan: the only precondition is ensure_absent, so a
         // conflict is a duplicate primary key.
-        report_deferred_dup_key();
+        const int rc = report_deferred_dup_key();
         revert_row_count_deltas();
         reset();
-        return HA_ERR_FOUND_DUPP_KEY;
+        return rc;
       }
       revert_row_count_deltas();
       reset();
@@ -413,22 +449,23 @@ void MariaDBTxn::restore_row_count_deltas(const RowCountDeltas &saved) {
   row_count_deltas_ = saved;
 }
 
-void MariaDBTxn::report_deferred_dup_key() {
+int MariaDBTxn::report_deferred_dup_key() {
   // ops_ is still intact here; the first guarded key that exists in the
   // live DB is the one the ensure_absent guard rejected.
   const Op *dup = nullptr;
+  bool failed = false;
   for (const auto &op : ops_) {
     if (op.kind != Op::Put || !op.guard_absent) { continue; }
-    bool present = false;
-    try {
-      present = db_->contains_key(plugin_read_options(), as_view(op.key));
-    } catch (...) {
-      present = false;
-    }
-    if (present) { dup = &op; break; }
+    const Probe p = probe("duplicate key report", [&] {
+      return db_->contains_key(probe_read_options(), as_view(op.key));
+    });
+    if (p == Probe::Present) { dup = &op; break; }
+    if (p == Probe::Failed) { failed = true; }
   }
+  // The rejected key may be one that could not be read: name none.
+  if (!dup && failed) { return HA_ERR_GENERIC; }
   if (deferred_reporter_ && dup && deferred_reporter_(dup->key, dup->val)) {
-    return;
+    return HA_ERR_FOUND_DUPP_KEY;
   }
   // No handler (or no identifiable key): same error code the server uses,
   // with the WITH_KEY_NAME wording and no rendered value. The format is a
@@ -439,6 +476,7 @@ void MariaDBTxn::report_deferred_dup_key() {
   // paired with a key name.
   my_printf_error(ER_DUP_ENTRY, "Duplicate entry '%-.192s' for key '%-.192s'",
                   MYF(0), "", "PRIMARY");
+  return HA_ERR_FOUND_DUPP_KEY;
 }
 
 void MariaDBTxn::reset() {
@@ -536,31 +574,24 @@ int MariaDBTxn::bulk_flush(bool sync) {
   }
 }
 
-int MariaDBTxn::bulk_pk_exists(const uint8_t *key, std::size_t klen) {
-  if (bulk_seen_.find(std::vector<uint8_t>(key, key + klen)) != bulk_seen_.end()) {
-    return 1;
-  }
-  try {
-    return db_->contains_key(plugin_read_options(), as_view(key, klen)) ? 1 : 0;
-  } catch (...) {
-    return -1;
-  }
+Probe MariaDBTxn::bulk_pk_exists(const uint8_t *key, std::size_t klen) {
+  return probe("bulk copy duplicate check", [&] {
+    return bulk_seen_.contains(std::vector<uint8_t>(key, key + klen)) ||
+           db_->contains_key(probe_read_options(), as_view(key, klen));
+  });
 }
 
-int MariaDBTxn::bulk_unique_prefix_exists(const uint8_t *prefix,
-                                         std::size_t plen) {
-  if (bulk_seen_.find(std::vector<uint8_t>(prefix, prefix + plen)) !=
-      bulk_seen_.end()) {
-    return 1;
-  }
-  try {
-    for (auto &k : db_->keys_from(plugin_read_options(), as_view(prefix, plen))) {
-      return k.size() >= plen && std::memcmp(u8_data(k), prefix, plen) == 0 ? 1 : 0;
+Probe MariaDBTxn::bulk_unique_prefix_exists(const uint8_t *prefix,
+                                            std::size_t plen) {
+  return probe("bulk copy unique index check", [&] {
+    if (bulk_seen_.contains(std::vector<uint8_t>(prefix, prefix + plen))) {
+      return true;
     }
-  } catch (...) {
-    return -1;
-  }
-  return 0;
+    for (auto &k : db_->keys_from(probe_read_options(), as_view(prefix, plen))) {
+      return k.size() >= plen && std::memcmp(u8_data(k), prefix, plen) == 0;
+    }
+    return false;
+  });
 }
 
 // ---------------------------------------------------------------------------

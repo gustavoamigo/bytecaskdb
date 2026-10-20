@@ -171,6 +171,7 @@ struct KEY_PART_INFO {
   uint      key_part_flag{0};  // HA_BLOB_PART etc.
   uint      store_length{0};
   uint      length{0};
+  uint      offset{0};         // the part's position in a record, as key_copy reads it
 };
 
 struct KEY {
@@ -400,7 +401,9 @@ inline void my_printf_error(int error, const char * /*format*/,
 
 // Stubs for key_copy / key_restore — these are MariaDB server functions.
 // For proof tests, key_copy must actually copy field data into the key buffer
-// so that distinct PK values produce distinct encoded keys.
+// so that distinct PK values produce distinct encoded keys. Like the server's,
+// it reads each part from the record it is given, at the part's offset: an
+// UPDATE encodes the old and the new row, and only one is record[0].
 inline void key_copy(uchar *dst, const uchar *src,
                      KEY *key_info, uint key_length) {
   uint offset = 0;
@@ -408,8 +411,8 @@ inline void key_copy(uchar *dst, const uchar *src,
     auto &kp = key_info->key_part[i];
     uint len = kp.length;
     if (len > key_length - offset) len = key_length - offset;
-    if (kp.field && kp.field->ptr) {
-      std::memcpy(dst + offset, kp.field->ptr, len);
+    if (kp.field) {
+      std::memcpy(dst + offset, src + kp.offset, len);
     }
     offset += kp.store_length;
   }
