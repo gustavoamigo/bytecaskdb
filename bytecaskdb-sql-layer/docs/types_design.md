@@ -54,17 +54,30 @@ range for it (the table above). SQL reports it as SQLSTATE 22003, 22001 for
 a string too long, or 22008 for a date or time. `REAL` overflow is decided
 as PostgreSQL decides it: by whether the value rounds to an infinite
 `float`. A `DEFAULT` is checked the same way
-at `CREATE TABLE` and `ADD COLUMN`. Reads trust the row, and a lookup is not
-a write: a key parameter outside its column's type finds nothing, as in
-PostgreSQL. `NOT NULL` is checked when the row ends, after these, so a row
+at `CREATE TABLE` and `ADD COLUMN`. Reads trust the row.
+
+**A compared parameter is typed by its column, as PostgreSQL types a
+`$n`.** A parameter a `WHERE` compares with a column takes that column's
+type without its modifier: `VARCHAR(n)` as `TEXT`, `DECIMAL(p, s)`
+unbounded. It is checked against that type before the plan runs, so a
+value outside it is `BC_C_RANGE` whether or not the plan would read it (a
+key whose other part is NULL): 
+`3000000000` for an `INTEGER` key or bound, `1e39` or `1e-50` for a `REAL`,
+text that is not UTF-8. It is never wrapped, rounded to a neighbour, or
+taken to find nothing. A modifier is checked only on a write: a `VARCHAR(2)`
+key compared with `'abc'` finds nothing, as in PostgreSQL. A parameter only
+assigned (`INSERT`, `SET`) is checked by the row builder, in column order,
+as PostgreSQL's assignment checks the values a driver sends typed. The plan API
+checks a key value the same way where it is built (`bc_key_*`, against the
+column its key part is), for plans not compiled from SQL. `NOT NULL` is checked when the row ends, after these, so a row
 holding both reports the range, as PostgreSQL does. A `VARCHAR(n)` value
 whose excess is only spaces is refused, where PostgreSQL truncates it.
 
 **Text is valid UTF-8.** The row builder refuses a `TEXT` or `VARCHAR` value
 that is not well-formed UTF-8, or holds a NUL, when it is written
 (`BC_C_RANGE`, 22021), as it refuses any value outside its type; the
-compiler never emits a validity check. A lookup key is not checked: invalid
-text finds nothing. Comparison and ordering are bytewise,
+compiler never emits a validity check. A key value that is not UTF-8 is
+refused the same way. Comparison and ordering are bytewise,
 which is code-point order for well-formed UTF-8. Collation sort keys come
 later, in the slot the MariaDB plugin uses them: the key encoder writes a
 text key part as the collation's weights, as `bytes`, and the row keeps the

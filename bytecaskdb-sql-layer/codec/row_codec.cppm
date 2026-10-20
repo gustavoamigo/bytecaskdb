@@ -101,8 +101,8 @@ struct ColumnSlot {
   PhysType type;
   bool nullable;
   std::uint32_t pos;  // fixed: byte offset in the row; variable: slot
-  // The column's declared type, carried beside its slot for the runtime's
-  // check of a value written (BC_C_RANGE); the codec does not read it.
+  // The column's declared type, carried beside its slot: the runtime checks
+  // a value written against it (BC_C_RANGE), and set_f64 rounds a REAL by it.
   SqlType sql;
 };
 
@@ -395,8 +395,11 @@ auto RowWriter::set_f64(std::uint32_t col_id, double v) -> bool {
   // A REAL column stores its float rounding, as PostgreSQL stores a float4:
   // the one place a row's REAL value is rounded, defaults included.
   auto i = index_of(col_id, PhysType::F64);
-  if (i && layout_->columns[*i].sql.kind == SqlKind::Real) v = float_rounding(v);
-  return set_word(col_id, PhysType::F64, std::bit_cast<std::uint64_t>(v));
+  if (!i) return false;
+  if (layout_->columns[*i].sql.kind == SqlKind::Real) v = float_rounding(v);
+  present_[*i] = true;
+  fixed_[*i] = std::bit_cast<std::uint64_t>(v);
+  return true;
 }
 
 auto RowWriter::set_bool(std::uint32_t col_id, bool v) -> bool {

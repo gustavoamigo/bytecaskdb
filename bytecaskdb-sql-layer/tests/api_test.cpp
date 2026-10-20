@@ -629,6 +629,43 @@ TEST_CASE("embedded API: values outside their declared type, an omitted NOT NULL
   CHECK(db->execute("DELETE FROM rk WHERE r = $1", {Value{0.1}}).affected == 1);
   CHECK(db->table_rows("rk").rows.size() == 1);
 
+  // A key value, a lookup's or a bound's, is checked against its column's
+  // type as PostgreSQL checks a typed $n: outside it is BC_C_RANGE, never
+  // rounded to a neighbour or wrapped. 1e-50 would round to the 0.0 row and
+  // 1e39 to the infinite one.
+  CHECK(db->execute("INSERT INTO rk VALUES ($1, $2, $3)", {Value{0.0}, Value{0.0}, i(4)}).affected == 1);
+  constexpr auto kInf = std::numeric_limits<double>::infinity();
+  CHECK(db->execute("INSERT INTO rk VALUES ($1, $2, $3)", {Value{kInf}, Value{kInf}, i(5)}).affected == 1);
+  auto key_refusal = [&](std::string_view sql, const std::vector<Value>& params) -> std::string {
+    try {
+      (void)db->execute(sql, params);
+    } catch (const ExecError& e) {
+      REQUIRE(e.constraint());
+      CHECK(e.constraint()->constraint == BC_C_RANGE);
+      return e.what();
+    }
+    FAIL("accepted: " << sql);
+    return {};
+  };
+  CHECK(key_refusal("SELECT n FROM rk WHERE r = $1", {Value{1e-50}}).starts_with("value out of range: underflow"));
+  CHECK(key_refusal("SELECT n FROM rk WHERE r = $1", {Value{1e39}}).starts_with("value out of range: overflow"));
+  CHECK(key_refusal("SELECT n FROM rk WHERE x < $1", {Value{1e-50}}).starts_with("value out of range: underflow"));
+  CHECK(key_refusal("DELETE FROM rk WHERE r = $1", {Value{-1e39}}).starts_with("value out of range: overflow"));
+  CHECK(db->execute("SELECT n FROM rk WHERE r = $1", {Value{kInf}}).rows == Grid{{i(5)}});
+  CHECK(db->execute("SELECT n FROM rk WHERE x < $1", {Value{0.25}}).rows == Grid{{i(4)}});
+  // An INTEGER key and bound: 3000000000 is not an INTEGER (22003), not "no row".
+  (void)db->execute("CREATE TABLE ik (k INTEGER PRIMARY KEY, n INTEGER, v VARCHAR(2))");
+  (void)db->execute("CREATE INDEX ik_n ON ik (n)");
+  (void)db->execute("CREATE INDEX ik_v ON ik (v)");
+  CHECK(db->execute("INSERT INTO ik VALUES ($1, $2, $3)", {i(1), i(1), bytes("ab")}).affected == 1);
+  CHECK(key_refusal("SELECT k FROM ik WHERE n < $1", {i(3'000'000'000)}).starts_with("integer out of range"));
+  CHECK(key_refusal("SELECT n FROM ik WHERE k = $1", {i(-3'000'000'000)}).starts_with("integer out of range"));
+  // A modifier is not a type's range: a VARCHAR(2) key compared with a longer
+  // value finds nothing, as a $n typed varchar does; text that is not UTF-8
+  // is refused (22021).
+  CHECK(db->execute("SELECT k FROM ik WHERE v = $1", {bytes("abc")}).rows.empty());
+  CHECK(key_refusal("SELECT k FROM ik WHERE v = $1", {bytes("\xFF")}).starts_with("invalid byte sequence"));
+
   // A REAL DEFAULT is stored the same way.
   (void)db->execute("CREATE TABLE rd (k BIGINT PRIMARY KEY, f REAL DEFAULT 0.1)");
   CHECK(db->execute("INSERT INTO rd (k) VALUES ($1)", {i(1)}).affected == 1);

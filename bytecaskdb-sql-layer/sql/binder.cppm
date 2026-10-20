@@ -78,6 +78,13 @@ using Statement = std::variant<Ddl, Insert, Select, Update, Delete>;
 struct Bound {
   Statement stmt;
   std::vector<PhysType> param_types;  // $1 is [0]
+  // For each parameter compared with a column (WHERE), that column's type
+  // without its modifier (param_type), as PostgreSQL types a $n: what its
+  // value is checked against before the plan runs, so a key or bound
+  // outside it is refused whatever the plan would read. nullopt for one
+  // only assigned (INSERT, SET), which the row builder checks in column
+  // order, as PostgreSQL's assignment does.
+  std::vector<std::optional<SqlType>> param_sql;
 };
 
 // Throws ast::SqlError with a message and the position of the offending node.
@@ -264,7 +271,8 @@ public:
   }
 
   // An expression whose type is fixed by its target (an assigned column).
-  auto value(const Table& t, const ast::Expr& e, PhysType want) -> Expr {
+  auto value(const Table& t, const ast::Expr& e, const Column& target) -> Expr {
+    auto want = target.type;
     switch (e.kind) {
       case ast::Expr::Kind::Param:
         use_param(e.param, want, e.pos);
@@ -310,6 +318,8 @@ public:
       }
       const auto* c = column(t, col->column, col->pos);
       use_param(param->param, c->type, param->pos);
+      if (sql_.size() <= param->param) sql_.resize(param->param + 1);
+      if (!sql_[param->param]) sql_[param->param] = param_type(c->sql);  // the first comparison types it
       out.push_back(Compare{op, c->id, param->param});
     }
     return out;
@@ -325,9 +335,16 @@ public:
     return out;
   }
 
+  auto param_sql() const -> std::vector<std::optional<SqlType>> {
+    auto out = sql_;
+    out.resize(types_.size());
+    return out;
+  }
+
 private:
   const Catalog& cat_;
   std::vector<std::optional<PhysType>> types_;
+  std::vector<std::optional<SqlType>> sql_;
 };
 
 }  // namespace
@@ -390,7 +407,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           for (std::size_t i = 0; i < targets.size(); ++i) {
             auto at = static_cast<std::size_t>(targets[i] - t->columns.data());
             if (out.values[at]) throw SqlError{"column \"" + targets[i]->name + "\" specified more than once", s.pos};
-            out.values[at] = b.value(*t, s.values[i], targets[i]->type);
+            out.values[at] = b.value(*t, s.values[i], *targets[i]);
             if (out.values[at]->kind != Expr::Kind::Param) {
               throw SqlError{"INSERT values must be parameters", s.values[i].pos};
             }
@@ -415,7 +432,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
             if (std::ranges::find(t->pk_col_ids, c->id) != t->pk_col_ids.end()) {
               throw SqlError{"updating a primary key column is not supported", a.pos};
             }
-            out.set.emplace_back(c->id, b.value(*t, a.value, c->type));
+            out.set.emplace_back(c->id, b.value(*t, a.value, *c));
           }
           out.where = b.where(*t, s.where);
           return {out, s.pos};
@@ -425,7 +442,8 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
         }
       },
       stmt);
-  return Bound{std::move(bound_stmt.first), b.param_types(bound_stmt.second)};
+  auto types = b.param_types(bound_stmt.second);
+  return Bound{std::move(bound_stmt.first), std::move(types), b.param_sql()};
 }
 
 }  // namespace bytecask::sql::bound

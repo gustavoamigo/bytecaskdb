@@ -646,7 +646,24 @@ auto resolve_range(bc_ctx* cx, std::uint32_t table_or_index, bc_view lo, bc_view
 }
 
 // Appends parameter `i` as a key part: its value, or the null part for NULL.
-[[nodiscard]] auto put_param_part(bc_ctx* cx, Bytes& buf, KeyPart part, std::uint32_t i) -> bool {
+// A key value outside the declared type of the column its part is: refused
+// with BC_E_CONSTRAINT, BC_C_RANGE and the table's id, as a value written
+// is, against the column's type without its modifier (param_type): a
+// lookup's or a bound's $n is typed as PostgreSQL types it, so 1e39 for a
+// REAL or 3000000000 for an INTEGER is refused, not rounded or wrapped.
+template <typename V>
+[[nodiscard]] auto key_in_range(bc_ctx* cx, const KeyLayout& kl, std::size_t p, const V& v) -> bool {
+  const auto* c = kl.columns.at(p);
+  auto why = bytecask::sql::out_of_range(bytecask::sql::param_type(c->sql), v);
+  if (!why) return true;
+  cx->raise(BC_C_RANGE, kl.table->id,
+            *why + " for key column \"" + c->name + "\" of table \"" + kl.table->name + "\"");
+  return false;
+}
+
+[[nodiscard]] auto put_param_part(bc_ctx* cx, Bytes& buf, const KeyLayout& kl, std::size_t p, std::uint32_t i)
+    -> bool {
+  auto part = kl.parts[p];
   const auto* d = cx->param(i);
   if (d == nullptr) return false;
   if (std::holds_alternative<std::monostate>(*d)) {
@@ -661,6 +678,7 @@ auto resolve_range(bc_ctx* cx, std::uint32_t table_or_index, bc_view lo, bc_view
     cx->fail(BC_E_HANDLE, "parameter $" + std::to_string(i + 1) + " is not " + type_name(part.type));
     return false;
   }
+  if (!key_in_range(cx, kl, p, *d)) return false;
   switch (part.type) {
     case PhysType::I64: bytecask::sql::key_put_i64(buf, std::get<std::int64_t>(*d), part); break;
     case PhysType::F64: bytecask::sql::key_put_f64(buf, std::get<double>(*d), part); break;
@@ -1651,14 +1669,18 @@ bc_key bc_key_begin(bc_ctx* cx, uint32_t table_or_index) {
 void bc_key_i64(bc_ctx* cx, bc_key k, int64_t v) {
   BC_GUARD_BEGIN
   auto* b = key_builder_part(cx, k, PhysType::I64, false);
-  if (b != nullptr) bytecask::sql::key_put_i64(b->buf, v, current_part(*b));
+  if (b != nullptr && key_in_range(cx, *b->layout, b->next_part - 1, v)) {
+    bytecask::sql::key_put_i64(b->buf, v, current_part(*b));
+  }
   BC_GUARD_END(cx)
 }
 
 void bc_key_f64(bc_ctx* cx, bc_key k, double v) {
   BC_GUARD_BEGIN
   auto* b = key_builder_part(cx, k, PhysType::F64, false);
-  if (b != nullptr) bytecask::sql::key_put_f64(b->buf, v, current_part(*b));
+  if (b != nullptr && key_in_range(cx, *b->layout, b->next_part - 1, v)) {
+    bytecask::sql::key_put_f64(b->buf, v, current_part(*b));
+  }
   BC_GUARD_END(cx)
 }
 
@@ -1674,7 +1696,9 @@ void bc_key_bytes(bc_ctx* cx, bc_key k, bc_view v) {
   auto bytes = cx->resolve(v);
   if (!bytes) return;
   auto* b = key_builder_part(cx, k, PhysType::Bytes, false);
-  if (b != nullptr) bytecask::sql::key_put_bytes(b->buf, *bytes, current_part(*b));
+  if (b != nullptr && key_in_range(cx, *b->layout, b->next_part - 1, *bytes)) {
+    bytecask::sql::key_put_bytes(b->buf, *bytes, current_part(*b));
+  }
   BC_GUARD_END(cx)
 }
 
@@ -1690,7 +1714,7 @@ void bc_key_param(bc_ctx* cx, bc_key k, uint32_t i) {
   if (cx->param(i) == nullptr) return;
   auto* b = key_builder_part(cx, k, std::nullopt, false);
   if (b == nullptr) return;
-  (void)put_param_part(cx, b->buf, current_part(*b), i);
+  (void)put_param_part(cx, b->buf, *b->layout, b->next_part - 1, i);
   BC_GUARD_END(cx)
 }
 
@@ -1720,7 +1744,7 @@ bc_view bc_key_params(bc_ctx* cx, uint32_t table_or_index, uint32_t first, uint3
   bytecask::sql::key_put_prefix(key, kl->ns, table_or_index);
   for (std::uint32_t p = 0; p < n; ++p) {
     // first + p cannot wrap: a parameter index past the bound list fails first.
-    if (first > UINT32_MAX - p || !put_param_part(cx, key, kl->parts[p], first + p)) {
+    if (first > UINT32_MAX - p || !put_param_part(cx, key, *kl, p, first + p)) {
       cx->fail(BC_E_HANDLE, "parameter index out of range");
       return {};
     }

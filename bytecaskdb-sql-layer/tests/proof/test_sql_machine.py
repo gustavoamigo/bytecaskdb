@@ -82,23 +82,23 @@ class Table:
         return f"SELECT {', '.join(c.name for c in self.columns)} FROM {self.name}"
 
 
-def values(t: o.Type, lookup: bool = False) -> st.SearchStrategy:
+def values(t: o.Type) -> st.SearchStrategy:
     """A value of the type's physical kind: mostly inside its declared
-    range, sometimes outside it (a BIGINT for an INTEGER, a VARCHAR(n) of
-    more than n characters), which both sides refuse. A lookup's REAL stays
-    inside float's range: PostgreSQL refuses $n::real out of it, where a
-    lookup in the layer finds nothing."""
+    range, sometimes outside it (a BIGINT for an INTEGER, a REAL past
+    float's range, a VARCHAR(n) of more than n characters). Written, both
+    sides refuse it; as a lookup key, both refuse a value outside the type's
+    range and find nothing for one longer than a VARCHAR(n)."""
     if t.kind == "int":
         edges = st.sampled_from([t.low, t.high, t.low - 1, t.high + 1]).filter(lambda v: BIGINT_LOW <= v <= BIGINT_HIGH)
         return st.one_of(st.integers(-3, 3), st.integers(t.low, t.high), edges, st.integers(BIGINT_LOW, BIGINT_HIGH))
     if t.kind == "float":
         return st.floats(allow_nan=False, allow_infinity=False)
     if t.kind == "real":
-        # Floats, doubles that round to one, and, for writes, doubles past
-        # float's range at either end (22003 on both).
+        # Floats, doubles that round to one, and doubles past float's range
+        # at either end (22003 on both).
         inside = st.one_of(st.floats(width=32, allow_nan=False, allow_infinity=False),
                            st.floats(-1e38, 1e38).filter(lambda v: v == 0 or abs(v) > 1e-37))
-        return inside if lookup else st.one_of(inside, st.sampled_from([1e39, -1e39, 1e-50, -1e-50]))
+        return st.one_of(inside, st.sampled_from([1e39, -1e39, 1e-50, -1e-50]))
     if t.kind == "bool":
         return st.booleans()
     if t.kind == "text":
@@ -207,10 +207,15 @@ class SqlMachine(RuleBasedStateMachine):
     def lookup(self, name: str, key: tuple) -> o.Outcome:
         t = self.tables[name]
         where = " AND ".join(f"{c} = ${i + 1}" for i, c in enumerate(t.pk))
-        # The layer types $n by its column, so a REAL key is a real; psycopg
-        # sends a float as double precision, so PostgreSQL is told.
-        pg_where = " AND ".join(f"{c} = ${i + 1}" + ("::real" if t.column(c).type.kind == "real" else "")
-                                for i, c in enumerate(t.pk))
+        # The layer types $n by its column, as PostgreSQL types a $n it is
+        # not told the type of; psycopg tells it int8 or float8, so a
+        # SMALLINT, INTEGER or REAL key casts to its column's type, which
+        # also refuses one outside it (22003).
+        def typed(c: str, n: int) -> str:
+            ty = t.column(c).type
+            return f"${n}::{ty.sql}" if ty.sql in ("smallint", "integer", "real") else f"${n}"
+
+        pg_where = " AND ".join(f"{c} = {typed(c, i + 1)}" for i, c in enumerate(t.pk))
         return self.both(f"{t.select_all} WHERE {where}", key, pg_sql=f"{t.select_all} WHERE {pg_where}")
 
     def reopen(self) -> None:
@@ -309,7 +314,7 @@ class SqlMachine(RuleBasedStateMachine):
         if keys and data.draw(st.booleans(), label="existing key"):
             key = data.draw(st.sampled_from(keys), label="key")
         else:
-            key = tuple(data.draw(st.none() | values(t.column(c).type, lookup=True), label=c) for c in t.pk)
+            key = tuple(data.draw(st.none() | values(t.column(c).type), label=c) for c in t.pk)
         self.lookup(t.name, key)
 
     @rule()
@@ -418,7 +423,7 @@ def test_values_outside_their_declared_type_are_22003_and_22001(dsn):
                                   ("c3", "abcde", "22001"), ("c3", "ééééé", "22001")]:
             assert m.insert("t0", {"c0": 1, col: value}, all_columns=False).error == state, (col, value)
         assert m.insert("t0", {"c0": 1, "c1": 2**15 - 1, "c2": -(2**31), "c3": "éééé"}, all_columns=False).error is None
-        assert m.lookup("t0", (2**40,)).rows == ()  # a lookup is not a write: no refusal
+        assert m.lookup("t0", (2**40,)).rows == ()  # a BIGINT key: inside its type, found or not
         m.check()
     finally:
         m.teardown()
@@ -432,6 +437,21 @@ def test_real_is_stored_and_keyed_as_its_float(dsn):
         assert m.insert("t0", {"c0": float(0.1), "c1": 1e39}, all_columns=False).error == "22003"
         assert len(m.lookup("t0", (0.1,)).rows) == 1  # found by the value it was written with
         assert m.insert("t0", {"c0": 0.1}, all_columns=False).error == "23505"
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_a_key_outside_its_type_is_refused(dsn):
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER), Column("c1", o.varchar(2))], ["c0", "c1"]))
+        assert m.insert("t0", {"c0": 1, "c1": "ab"}, all_columns=False).error is None
+        assert m.lookup("t0", (2**31, "ab")).error == "22003"  # not an INTEGER: refused, not "no row"
+        assert m.lookup("t0", (1, "abc")).rows == ()  # longer than VARCHAR(2): a modifier, so no row
+        m.create(Table("t1", [Column("c0", o.REAL)], ["c0"]))
+        assert m.insert("t1", {"c0": 0.0}, all_columns=False).error is None
+        assert m.lookup("t1", (1e-50,)).error == "22003"  # would round to the 0.0 row
         m.check()
     finally:
         m.teardown()

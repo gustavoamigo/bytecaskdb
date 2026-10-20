@@ -42,8 +42,9 @@ every rule, the invariants are checked.
   in PostgreSQL, so its order is byte order, the order of the layer's keys.
   A REAL comes from PostgreSQL as the shortest text naming its float; the
   oracle packs it back to that float, which is what the layer stores. A
-  lookup by a REAL key casts `$n::real` on PostgreSQL's side, as the layer
-  types `$n` by its column.
+  lookup by a SMALLINT, INTEGER or REAL key casts `$n` to the column's type
+  on PostgreSQL's side: the layer types `$n` by its column, and psycopg
+  tells PostgreSQL int8 or float8.
 
 Rules in increment 1:
 - **CREATE TABLE.** Up to four columns over BIGINT, INTEGER, SMALLINT, DOUBLE
@@ -57,8 +58,9 @@ Rules in increment 1:
   columns (a primary key column among them) and values outside their
   declared types, with and without a column list.
 - **Point lookup** by the full primary key, an existing key or not, NULL
-  and values outside the key's type included: a lookup is not a write, so
-  both find nothing rather than refuse it.
+  and values outside the key's type included: both refuse a value outside
+  the type's range (22003, also when another key part is NULL), and find
+  nothing for one only longer than a VARCHAR(n).
 - **Reopen** of the layer's database.
 
 Fixed cases are plain pytest functions at the end of the file. They call
@@ -99,8 +101,5 @@ Found so far. The machine expects each one, so it does not fail on them.
   22001; checked on 16.15). A DEFAULT that is not UTF-8 never reaches
   either: PostgreSQL refuses the statement's text (22021). The machine's
   defaults stay inside their types.
-- **A lookup by text that is not UTF-8 finds nothing.** PostgreSQL refuses
-  the parameter (22021); the layer checks text only when it is written. The
-  machine generates only valid text.
 - **DML takes no literals:** values are parameters (`$1`). The machine's
   statements use parameters on both sides.

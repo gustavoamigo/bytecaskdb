@@ -147,6 +147,11 @@ inline constexpr auto kPowersOfTen = [] {
 // continuation byte, or a NUL, which PostgreSQL's text refuses too. One pass:
 // the check of TEXT and VARCHAR values, and VARCHAR(n)'s length.
 [[nodiscard]] auto utf8_code_points(BytesView s) -> std::optional<std::size_t>;
+// The type a parameter compared with a column of type t has: t without its
+// modifier (VARCHAR(n) as TEXT, DECIMAL(p, s) as an unbounded integer), as
+// PostgreSQL types a $n by its column. A key value, a lookup's or a
+// bound's, is checked against it: the type's range, not the modifier's.
+[[nodiscard]] auto param_type(SqlType t) -> SqlType;
 // Why a value of the column's physical type is outside its declared type,
 // in PostgreSQL's words, or nullopt: a SMALLINT or INTEGER out of range, a
 // REAL that overflows or underflows float, a TEXT or VARCHAR that is not
@@ -223,6 +228,9 @@ struct KeyLayout {
   const Index* index;          // nullptr for a table's primary key
   std::vector<KeyPart> parts;  // every part: index columns, then primary key
   std::size_t index_parts;     // how many of them precede the primary key
+  // Each part's column, in parts' order: its declared type is what a key
+  // value is checked against. Points into `table`, which outlives the layout.
+  std::vector<const Column*> columns;
 };
 
 // The stage-1 DDL statements, as values: what LiveCatalog prepares.
@@ -831,6 +839,25 @@ auto utf8_code_points(BytesView s) -> std::optional<std::size_t> {
   return n;
 }
 
+auto param_type(SqlType t) -> SqlType {
+  switch (t.kind) {
+    case SqlKind::Varchar: return {SqlKind::Text};
+    case SqlKind::Decimal: return {SqlKind::BigInt};
+    case SqlKind::SmallInt:
+    case SqlKind::Integer:
+    case SqlKind::BigInt:
+    case SqlKind::Real:
+    case SqlKind::Double:
+    case SqlKind::Boolean:
+    case SqlKind::Bytea:
+    case SqlKind::Text:
+    case SqlKind::Timestamp:
+    case SqlKind::Date:
+    case SqlKind::Time: return t;
+  }
+  return t;
+}
+
 auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string> {
   switch (t.kind) {
     case SqlKind::SmallInt:
@@ -867,18 +894,12 @@ auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string> {
 
 auto out_of_range(SqlType t, double v) -> std::optional<std::string> {
   if (t.kind != SqlKind::Real) return std::nullopt;
-  // PostgreSQL refuses a finite value whose float rounding is infinite: one
-  // at or past the midpoint between FLT_MAX and 2^128, 2^128 - 2^103, which
-  // rounds up (FLT_MAX's significand is odd). Decided by comparison: a
-  // finite double outside float's range is undefined behaviour to convert,
-  // and float_rounding converts only what is inside it.
-  constexpr auto kFloatOverflow = 0x1p128 - 0x1p103;
-  if (std::isfinite(v) && std::fabs(v) >= kFloatOverflow) return "value out of range: overflow";
-  // A nonzero value that rounds to zero: below half the smallest subnormal
-  // float, 2^-150, rounds to zero under ties-to-even (2^-150 itself does).
-  // Compared, not cast, so no value outside float's range is converted.
-  constexpr auto kFloatUnderflow = 0x1p-150;
-  if (v != 0.0 && std::fabs(v) <= kFloatUnderflow) return "value out of range: underflow";
+  // As PostgreSQL's float8 to float4: a finite value whose float rounding is
+  // infinite overflows, a nonzero one whose rounding is zero underflows.
+  // float_rounding holds the thresholds, and never converts out of range.
+  auto r = float_rounding(v);
+  if (std::isinf(r) && std::isfinite(v)) return "value out of range: overflow";
+  if (r == 0.0 && v != 0.0) return "value out of range: underflow";
   return std::nullopt;
 }
 
@@ -1208,17 +1229,23 @@ void Catalog::rebuild_lookups() {
     name_taken(t.name);
     names_[t.name] = id;
     std::vector<KeyPart> pk_parts;
-    for (auto cid : t.pk_col_ids) pk_parts.push_back(key_part(*t.column(cid)));
-    key_layouts_[id] = KeyLayout{kNsRow, &t, nullptr, pk_parts, 0};
+    std::vector<const Column*> pk_columns;
+    for (auto cid : t.pk_col_ids) {
+      pk_columns.push_back(t.column(cid));
+      pk_parts.push_back(key_part(*pk_columns.back()));
+    }
+    key_layouts_[id] = KeyLayout{kNsRow, &t, nullptr, pk_parts, 0, pk_columns};
     for (const auto& ix : t.indexes) {
       name_taken(ix.name);
       names_[ix.name] = ix.id;
-      KeyLayout kl{kNsIndex, &t, &ix, {}, ix.parts.size()};
+      KeyLayout kl{kNsIndex, &t, &ix, {}, ix.parts.size(), {}};
       for (const auto& p : ix.parts) {
         const auto* c = t.column(p.col_id);
         kl.parts.push_back(key_part(*c, c->nullable, p.desc));
+        kl.columns.push_back(c);
       }
       kl.parts.insert(kl.parts.end(), pk_parts.begin(), pk_parts.end());
+      kl.columns.insert(kl.columns.end(), pk_columns.begin(), pk_columns.end());
       key_layouts_[ix.id] = std::move(kl);
     }
   }

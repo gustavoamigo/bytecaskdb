@@ -121,6 +121,11 @@ private:
   std::unique_ptr<TccPlan> code_;
   std::vector<std::string> columns_;
   std::vector<SqlType> column_types_;
+  // Each compared parameter's SQL type (bound::Bound::param_sql) and the
+  // statement's table: a value outside it is BC_C_RANGE on the table,
+  // checked before the plan runs, whatever the plan would read.
+  std::vector<std::optional<SqlType>> param_sql_;
+  std::uint32_t table_id_{0};
   std::vector<std::uint8_t> result_codes_;  // the plan's result_types as bc_type codes
   RowLayout result_layout_;                 // how its result rows decode, built once per compile
   std::vector<bc_col_ref> col_refs_;
@@ -164,9 +169,10 @@ public:
   // with the oracle's; SQL has no full scan. Throws ast::SqlError for a
   // table that does not exist, as a statement naming it would.
   [[nodiscard]] auto table_rows(std::string_view table) const -> Rows;
-  // Test only: while on, every commit conflicts. Before each commit reaches
-  // the engine, every table's catalog record is written back unchanged,
-  // which a write plan guards, so execute exhausts its retries.
+  // Test only: while on, every commit of a plan that writes a table
+  // conflicts. Before each commit reaches the engine, every table's catalog
+  // record is written back unchanged, which such a plan guards, so execute
+  // exhausts its retries. A plan that only reads commits nothing to conflict.
   void conflict_on_every_commit_for_testing(bool on);
   // Test only: the engine under the layer, for a test that stores what the
   // layer would refuse, to check that a read refuses it too.
@@ -270,6 +276,15 @@ void Database::compile(Statement& s) {
       column_types.push_back(sel->table->column(id)->sql);
     }
   }
+  auto table_id = std::visit(
+      [](const auto& st) -> std::uint32_t {
+        if constexpr (std::is_same_v<std::decay_t<decltype(st)>, Ddl>) {
+          return 0;
+        } else {
+          return st.table->id;
+        }
+      },
+      bound.stmt);
   auto plan = std::make_unique<GeneratedPlan>(generate_plan(bound, *cat, s.sql_));
   auto codes = result_type_codes(plan->result_types);
   auto layout = make_result_layout(plan->result_types);
@@ -292,6 +307,8 @@ void Database::compile(Statement& s) {
     s.columns_ = std::move(columns);
     s.column_types_ = std::move(column_types);
   }
+  s.param_sql_ = std::move(bound.param_sql);
+  s.table_id_ = table_id;
   s.plan_ = std::move(plan);
   s.code_ = std::move(code);
   s.result_codes_ = std::move(codes);
@@ -339,8 +356,19 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
     }
     return {};
   };
-  auto check_params = [](const std::string& why) {
+  // A value outside its parameter's SQL type is refused before the plan
+  // runs, as PostgreSQL refuses a $n it cannot coerce at bind: even one a
+  // plan would not read (a key whose other part is NULL).
+  auto check_params = [&](const std::string& why) {
     if (!why.empty()) throw ParamError(why);
+    for (std::size_t i = 0; i < params.size(); ++i) {
+      const auto& sql = stmt.param_sql_.at(i);
+      if (!sql) continue;  // assigned only: the row builder checks it, in column order
+      if (auto range = out_of_range(*sql, params[i])) {
+        throw ExecError(*range + " for parameter $" + std::to_string(i + 1), BC_E_CONSTRAINT,
+                        ConstraintDetail{BC_C_RANGE, stmt.table_id_}.encode());
+      }
+    }
   };
   bc_params bp{params};
   // Parameters that do not fit the cached plan may fit the plan a DDL has
@@ -364,6 +392,7 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
     if (stale) compile(stmt);
     check_params(stale ? mismatch() : why);
   }
+  check_params({});  // the types fit: check the ranges
   auto r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
   // bc_ctx_run checks the plan against the catalog it pinned. A plan a DDL
   // made incompatible (BC_E_LAYOUT with BC_L_INCOMPATIBLE) is recompiled
