@@ -420,7 +420,7 @@ void     bc_emit_count(bc_ctx *, int64_t affected);   /* write statements: the r
 |---|---|
 | `bc_param_*` | Reads parameter `i` as bound by `bc_ctx_begin`. A wrong index or type is `BC_E_HANDLE` and a neutral value. Parameter views live until reset. |
 | `bc_emit_begin` … `bc_emit_end` | Appends one result row, in the row format, with the types the plan's `bc_schema_ref` declares in `result_types`. Columns are emitted in that order; a count or type that does not match is `BC_E_LAYOUT`. The row is copied into the result buffer, which is part of the arena. |
-| `bc_emit_col` | Emits column `col` of a row view: its value, or NULL when the column is null or the row predates it. The type is the column's, and must be the next result column's. One call where a nullable column took an `if` and two emits. |
+| `bc_emit_col` | Emits column `col` of a row view: its value, or NULL when the column is null or the row predates it; `BC_E_CORRUPT` for a column marked present that the row does not hold. The type is the column's, and must be the next result column's. One call where a nullable column took an `if` and two emits. |
 | `bc_emit_key_part` | Emits part `part` of an encoded key of `table_or_index`, NULL as NULL: a covering read's column, from `bc_scan_key`, with no row read. A `DOUBLE` part is `BC_E_HANDLE`: the key canonicalises `-0.0` and NaN, so the value comes from the row. |
 | `bc_emit_count` | Records the affected-row count a write statement reports. At most once per plan. |
 
@@ -539,7 +539,8 @@ is `BC_E_HANDLE` and a neutral value; a row that does not parse is
 `BC_E_CORRUPT`.
 
 ```c
-bool     bc_col_null(bc_ctx *, bc_view row, uint32_t col);   /* the bitmap bit: clear means null, or a column the row predates */
+bool     bc_col_null(bc_ctx *, bc_view row, uint32_t col);   /* the bitmap bit: clear means null, or a column the row predates;
+                                                                set for a column the row does not hold, BC_E_CORRUPT */
 int64_t  bc_col_i64(bc_ctx *, bc_view row, uint32_t col);
 double   bc_col_f64(bc_ctx *, bc_view row, uint32_t col);
 bool     bc_col_bool(bc_ctx *, bc_view row, uint32_t col);
@@ -560,9 +561,9 @@ bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: live
 
 | Function | What it does |
 |---|---|
-| `bc_col_null` | True if column `col`'s bit in the bitmap is clear. The bitmap says *present*: a column set null and a column the row predates both have the bit clear, so one test covers both (`docs/types_design.md`, *Row format*). The compiler emits it before any decoder of a nullable column it computes with, and before any column added after the table was created. |
-| `bc_col_i64`, `bc_col_f64`, `bc_col_bool` | Loads the 8-byte column. A null column, or one past the end of a shorter row, reads as zero; `bc_col_null` decides first and reports both as null. Little-endian in the row. |
-| `bc_col_bytes` | The variable-length column, as a view with the row's lifetime. |
+| `bc_col_null` | True if column `col`'s bit in the bitmap is clear. The bitmap says *present*: a column set null and a column the row predates both have the bit clear, so one test covers both (`docs/types_design.md`, *Row format*). A set bit for a column the row does not hold is `BC_E_CORRUPT`, as every column reader reports it. The compiler emits it before any decoder of a nullable column it computes with, and before any column added after the table was created. |
+| `bc_col_i64`, `bc_col_f64`, `bc_col_bool` | Loads the 8-byte column. A null column, or one a shorter row predates, reads as zero; `bc_col_null` decides first and reports both as null. A column marked present that the row does not hold is `BC_E_CORRUPT`. Little-endian in the row. |
+| `bc_col_bytes` | The variable-length column, as a view with the row's lifetime. A column marked present whose slot the row does not hold, or whose `var_end` runs past the row, is `BC_E_CORRUPT`. |
 | `bc_row_key` | The table's full primary key (namespace, table id, parts), encoded from the row's columns: for a `bc_get`, a guard, or a scan bound reached from a row. Built in the arena. |
 | `bc_row_begin` | Starts a row of `table`'s current layout with every column at its default: the catalog's default for a column that has one, null for the rest. A plan compiled before a column was added writes the column's default without naming it. |
 | `bc_row_from` | Starts a row of `table` as a copy of `old`, a row of that table and of its current layout generation (otherwise as for the writes below: `BC_L_ROW`, `BC_L_RETIRED` or `BC_E_CORRUPT`; a `REBUILD`, #503, widens this to any generation). The `UPDATE` pattern: copy, set the assigned columns, end. |
@@ -863,8 +864,10 @@ versions of one table be served at once (see *Deferred*).
 generation, a column's byte offset or variable slot is assigned when the
 column is created and never changes. New columns append; a dropped column
 leaves its offset or slot reserved. A row may be shorter than the current
-layout: a fixed column whose offset is at or past `row_bytes`, or a variable
-slot past the end of `var_end`, reads as null. So a plan compiled against an
+layout: a column the row predates, a fixed column past its fixed region or
+a variable slot past the end of `var_end`, has its bit clear and reads as
+null; with its bit set the row is damaged, and reading the column is
+`BC_E_CORRUPT`. So a plan compiled against an
 older version of the table decodes rows written by a newer one, ignoring
 the bytes it does not know, and a plan compiled against a newer version
 decodes older rows, seeing null where the column did not yet exist. Both
@@ -885,10 +888,13 @@ table in the catalog. Rebuilds are rare and explicit,
 and updates and vacuum rewrite rows into the current generation, so the
 slow path stays rare.
 
-The decoders check every access against `row_bytes` and the offset table,
-so a column the row predates is null, a row whose header or `var_end`
-does not parse is `BC_E_CORRUPT`, and a column the plan's reference does not
-declare is `BC_E_HANDLE`; never a read past the end. Values over the engine's limit are refused at
+One decoder, `row_column`, reads every column and checks every access
+against `row_bytes` and the offset table: a column whose bit is clear is
+null, a row whose header does not parse and a present column the row does
+not hold (outside its regions, or a `var_end` past the row) are
+`BC_E_CORRUPT` on every path, and a column the plan's reference does not
+declare is `BC_E_HANDLE`; never a read past the end, and never 0, empty or
+null for damage. Values over the engine's limit are refused at
 `bc_row_end` with `BC_E_LIMIT`; the engine's value ceiling applies to the
 whole row.
 

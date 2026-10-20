@@ -385,8 +385,8 @@ TEST_CASE("catalog: every DDL survives a reopen", "[sql][catalog]") {
     key_put_prefix(pk, kNsRow, 1);
     key_put_i64(pk, 2, {PhysType::I64});
     REQUIRE(db.get({}, pk, row));
-    CHECK(row_i64(row, t.layout.find(3)->pos) == 7);
-    CHECK(row_i64(row, t.layout.find(2)->pos) == 20);
+    CHECK(row_column(row, *t.layout.find(3)).i64() == 7);
+    CHECK(row_column(row, *t.layout.find(2)).i64() == 20);
     (void)live.apply(DropIndexDdl{"t_by_name"});
     CHECK(count_prefix(db, prefix_of(kNsIndex, 3)) == 0);
     CHECK_FALSE(db.contains_key({}, name_entry_key("t_by_name")));

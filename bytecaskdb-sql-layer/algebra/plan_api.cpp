@@ -1145,17 +1145,35 @@ struct Entry {
 }
 
 
-// Loads a fixed column; a malformed row is BC_E_CORRUPT and the neutral value.
-template <typename Load, typename T>
-auto load_column(bc_ctx* cx, bc_view row, std::uint32_t col, PhysType type, Load&& load, T neutral) -> T {
+// Column `col` of a row view, read by row_column: nullopt, with the error
+// set, for a bad handle or a malformed column (BC_E_CORRUPT). An absent
+// column (NULL) reads with its word 0 and its bytes empty.
+// Out of line: the message is built only on damage, off the read path.
+[[gnu::cold, gnu::noinline]] void fail_malformed(bc_ctx* cx, std::uint32_t col) {
+  cx->fail(BC_E_CORRUPT, "malformed row: column " + std::to_string(col) + " does not decode");
+}
+
+auto read_column(bc_ctx* cx, const RowCol& rc) -> std::optional<bytecask::sql::ColumnRead> {
+  auto v = bytecask::sql::row_column(rc.row, rc.slot->col, rc.slot->type, rc.slot->pos);
+  if (v.state == bytecask::sql::ColumnState::Malformed) {
+    fail_malformed(cx, rc.slot->col);
+    return std::nullopt;
+  }
+  return v;
+}
+
+// Loads a fixed column: its value, or the neutral value for NULL and on an error.
+template <typename Get, typename T>
+auto load_column(bc_ctx* cx, bc_view row, std::uint32_t col, PhysType type, Get&& get, T neutral) -> T {
   auto rc = row_col(cx, row, col, type);
   if (!rc) return neutral;
-  auto v = load(rc->row, rc->slot->pos);
-  if (!v) {
-    cx->fail(BC_E_CORRUPT, "malformed row");
-    return neutral;
+  auto v = bytecask::sql::row_column(rc->row, col, type, rc->slot->pos);
+  switch (v.state) {
+    case bytecask::sql::ColumnState::Value: return get(v);
+    case bytecask::sql::ColumnState::Absent: return neutral;
+    case bytecask::sql::ColumnState::Malformed: fail_malformed(cx, col); return neutral;
   }
-  return *v;
+  return neutral;
 }
 
 // The builder a setter targets, and the declared column it sets.
@@ -1420,9 +1438,9 @@ void emit_value(bc_ctx* cx, double v) { (void)cx->emit->set_f64(cx->emit_col++, 
 void emit_value(bc_ctx* cx, bool v) { (void)cx->emit->set_bool(cx->emit_col++, v); }
 void emit_value(bc_ctx* cx, BytesView v) { emit_bytes(cx, v); }
 
-// The next result column from a decoded value: BC_E_CORRUPT when the source
-// did not parse, the value when there is one, NULL otherwise. One path for
-// bc_emit_col and bc_emit_key_part, whatever the type.
+// The next result column from a decoded key part: BC_E_CORRUPT when the key
+// did not parse, the value when there is one, NULL otherwise, whatever the
+// type.
 template <typename T>
 void emit_decoded(bc_ctx* cx, const std::optional<T>& v, bool corrupt, bool has_value, const char* what) {
   if (corrupt) {
@@ -1479,16 +1497,17 @@ void bc_emit_col(bc_ctx* cx, bc_view row, uint32_t col) {
   BC_GUARD_BEGIN
   auto rc = row_col(cx, row, col, std::nullopt);
   if (!rc || !emit_slot(cx, rc->slot->type)) return;
-  // A decoder's nullopt here is a malformed row: null is the bitmap's to say.
-  auto present = bytecask::sql::row_present_bit(rc->row, col);
-  auto emit = [&](auto v) { emit_decoded(cx, v, present && !v, present, "malformed row"); };
-  const auto& r = rc->row;
-  auto pos = rc->slot->pos;
+  auto v = read_column(cx, *rc);
+  if (!v) return;
+  if (v->state == bytecask::sql::ColumnState::Absent) {
+    (void)cx->emit->set_null(cx->emit_col++);
+    return;
+  }
   switch (rc->slot->type) {
-    case PhysType::I64: return emit(bytecask::sql::row_i64(r, pos));
-    case PhysType::F64: return emit(bytecask::sql::row_f64(r, pos));
-    case PhysType::Bool: return emit(bytecask::sql::row_bool(r, pos));
-    case PhysType::Bytes: return emit(bytecask::sql::row_bytes(r, pos));
+    case PhysType::I64: return emit_value(cx, v->i64());
+    case PhysType::F64: return emit_value(cx, v->f64());
+    case PhysType::Bool: return emit_value(cx, v->boolean());
+    case PhysType::Bytes: return emit_value(cx, v->bytes);
   }
   BC_GUARD_END(cx)
 }
@@ -1966,28 +1985,29 @@ bool bc_col_null(bc_ctx* cx, bc_view row, uint32_t col) {
   BC_GUARD_BEGIN
   auto rc = row_col(cx, row, col, std::nullopt);
   if (!rc) return true;
-  return !bytecask::sql::row_present_bit(rc->row, col);
+  auto v = read_column(cx, *rc);
+  return !v || v->state == bytecask::sql::ColumnState::Absent;
   BC_GUARD_END(cx)
   return true;
 }
 
 int64_t bc_col_i64(bc_ctx* cx, bc_view row, uint32_t col) {
   BC_GUARD_BEGIN
-  return load_column(cx, row, col, PhysType::I64, bytecask::sql::row_i64, std::int64_t{0});
+  return load_column(cx, row, col, PhysType::I64, [](const auto& v) { return v.i64(); }, std::int64_t{0});
   BC_GUARD_END(cx)
   return {};
 }
 
 double bc_col_f64(bc_ctx* cx, bc_view row, uint32_t col) {
   BC_GUARD_BEGIN
-  return load_column(cx, row, col, PhysType::F64, bytecask::sql::row_f64, 0.0);
+  return load_column(cx, row, col, PhysType::F64, [](const auto& v) { return v.f64(); }, 0.0);
   BC_GUARD_END(cx)
   return {};
 }
 
 bool bc_col_bool(bc_ctx* cx, bc_view row, uint32_t col) {
   BC_GUARD_BEGIN
-  return load_column(cx, row, col, PhysType::Bool, bytecask::sql::row_bool, false);
+  return load_column(cx, row, col, PhysType::Bool, [](const auto& v) { return v.boolean(); }, false);
   BC_GUARD_END(cx)
   return {};
 }
@@ -1996,15 +2016,10 @@ bc_view bc_col_bytes(bc_ctx* cx, bc_view row, uint32_t col) {
   BC_GUARD_BEGIN
   auto rc = row_col(cx, row, col, PhysType::Bytes);
   if (!rc) return {};
-  auto v = bytecask::sql::row_bytes(rc->row, rc->slot->pos);
-  if (!v) {
-    // The header parsed and a slot past nvar reads as empty, so this is a
-    // var_end entry that runs past the row: the row is damaged.
-    cx->fail(BC_E_CORRUPT, "malformed row");
-    return {};
-  }
+  auto v = read_column(cx, *rc);
+  if (!v) return {};
   auto [cursor, step] = cx->owner(row);
-  return cx->make_view(v->data(), v->size(), cursor, step);
+  return cx->make_view(v->bytes.data(), v->bytes.size(), cursor, step);
   BC_GUARD_END(cx)
   return {};
 }
@@ -2053,7 +2068,10 @@ bc_row bc_row_from(bc_ctx* cx, uint32_t table, bc_view old) {
   }
   auto r = bc_row_begin(cx, table);
   if (!cx->ok()) return {};
-  cx->rows[r.i].writer.copy_from(*o);
+  if (!cx->rows[r.i].writer.copy_from(*o)) {
+    cx->fail(BC_E_CORRUPT, "malformed row: a column does not decode");
+    return {};
+  }
   return r;
   BC_GUARD_END(cx)
   return {};

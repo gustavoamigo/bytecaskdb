@@ -358,7 +358,7 @@ TEST_CASE("plan writes: a NOT NULL column null at bc_row_end is BC_C_NOT_NULL, n
   bytecask::sql::key_put_i64(key, 5, {PhysType::I64});
   REQUIRE(f.db->get({}, key, row));
   const auto& w = *f.cat().table("w");
-  CHECK(bytecask::sql::row_i64(row, w.layout.find(g_col_d)->pos) == 7);
+  CHECK(bytecask::sql::row_column(row, *w.layout.find(g_col_d)).i64() == 7);
   CHECK(run(f, insert_with_d, {std::int64_t{6}, std::int64_t{0}, std::int64_t{8}}) == BC_COMMITTED);
   CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 4);
   check_indexes_exact(f);
@@ -768,7 +768,7 @@ TEST_CASE("plan writes: concurrent read-then-write of one row loses no update", 
   bytecask::sql::key_put_i64(key, 1, {PhysType::I64});
   REQUIRE(f.db->get({}, key, row));
   const auto& t = *f.cat().table("t");
-  CHECK(bytecask::sql::row_i64(row, t.layout.find(2)->pos) == kInitial - kThreads * kEach);  // no lost update
+  CHECK(bytecask::sql::row_column(row, *t.layout.find(2)).i64() == kInitial - kThreads * kEach);  // no lost update
   CHECK(g_concurrent_runs > kThreads * kEach);  // some executions conflicted and were retried
 }
 
@@ -841,7 +841,7 @@ TEST_CASE("plan writes: a row written by one run is refused to a later run of th
   bytecask::sql::key_put_i64(key, 1, {PhysType::I64});
   REQUIRE(f.db->get({}, key, row));
   const auto& w = *f.cat().table("w");
-  CHECK(bytecask::sql::row_i64(row, w.layout.find(kA)->pos) == 1);
+  CHECK(bytecask::sql::row_column(row, *w.layout.find(kA)).i64() == 1);
   CHECK(count_entries(*f.db, bytecask::sql::kNsIndex, kWA) == 1);
   // A duplicate key across two runs is still a duplicate.
   auto dup = params({std::int64_t{2}, std::int64_t{2}, bytes("y"), std::int64_t{0}});

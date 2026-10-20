@@ -10,6 +10,7 @@ module;
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <optional>
@@ -92,7 +93,9 @@ struct Fixture {
     const std::uint8_t* row = nullptr;
     std::uint32_t len = 0;
     while (bc_ctx_next_result(cx, &row, &len)) {
-      out.push_back(bytecask::sql::decode_row(rl, std::as_bytes(std::span{row, len})));
+      auto r = bytecask::sql::decode_row(rl, std::as_bytes(std::span{row, len}));
+      if (!r) throw std::runtime_error("malformed result row");
+      out.push_back(std::move(*r));
     }
     return out;
   }

@@ -605,37 +605,21 @@ auto put_part_from_row(const Table& t, std::uint32_t col_id, KeyPart part, Bytes
                        bool* was_null = nullptr) -> bool {
   const auto* slot = t.layout.find(col_id);
   if (slot == nullptr) return false;
-  if (row_is_null(row, *slot)) {
-    if (!part.nullable) return false;
-    if (was_null != nullptr) *was_null = true;
-    key_put_null(out, part);
-    return true;
+  auto v = row_column(row, *slot);
+  switch (v.state) {
+    case ColumnState::Malformed: return false;
+    case ColumnState::Absent:
+      if (!part.nullable) return false;
+      if (was_null != nullptr) *was_null = true;
+      key_put_null(out, part);
+      return true;
+    case ColumnState::Value: break;
   }
   switch (slot->type) {
-    case PhysType::I64: {
-      auto v = row_i64(row, slot->pos);
-      if (!v) return false;
-      key_put_i64(out, *v, part);
-      return true;
-    }
-    case PhysType::F64: {
-      auto v = row_f64(row, slot->pos);
-      if (!v) return false;
-      key_put_f64(out, *v, part);
-      return true;
-    }
-    case PhysType::Bool: {
-      auto v = row_bool(row, slot->pos);
-      if (!v) return false;
-      key_put_bool(out, *v, part);
-      return true;
-    }
-    case PhysType::Bytes: {
-      auto v = row_bytes(row, slot->pos);
-      if (!v) return false;
-      key_put_bytes(out, *v, part);
-      return true;
-    }
+    case PhysType::I64: key_put_i64(out, v.i64(), part); return true;
+    case PhysType::F64: key_put_f64(out, v.f64(), part); return true;
+    case PhysType::Bool: key_put_bool(out, v.boolean(), part); return true;
+    case PhysType::Bytes: key_put_bytes(out, v.bytes, part); return true;
   }
   return false;
 }
@@ -1478,7 +1462,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
         throw std::runtime_error("malformed row in table " + t.name);
       }
       w.reset();
-      w.copy_from(row);
+      if (!w.copy_from(row)) throw std::runtime_error("malformed row in table " + t.name);
       Bytes out;
       if (!set_datum(w, c.id, c.default_value) || !w.finish(out)) {
         throw std::length_error("a row of table " + t.name + " is over the value limit with the new column");

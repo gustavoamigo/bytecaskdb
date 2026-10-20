@@ -331,13 +331,17 @@ null or did not know the column. That second case is what makes short rows
 work: a row written before a column was added has the column's bit clear
 and reads as null with no further test. `bc_col_null(row, col)` is the bit,
 and the position argument revision 2 of the plan API added to it is not
-needed; `docs/plan_api_design.md` is updated accordingly. The decoders still
-bound every access by `var_table` and `nvar`, so a fixed column past the
-fixed region reads as zero and a variable slot past `nvar` as empty; a
-row whose header or `var_end` does not parse is `BC_E_CORRUPT`, never read
-as null. Plans name columns by id since plan API revision 5, and the
-runtime maps an id to its position; the codec's raw accessors still refuse
-an offset inside the header or off a word boundary. Nothing is read past
+needed; `docs/plan_api_design.md` is updated accordingly. One decoder,
+`row_column`, reads every column of a stored row, and says it is absent, a
+value, or malformed. Absent is a clear bit, or no bit: NULL. Malformed is a
+header that does not parse, or a set bit for a column the row does not
+hold: a fixed column past the fixed region, a variable slot past `nvar`, or
+a `var_end` that runs past the row. Malformed is `BC_E_CORRUPT` on every
+path that reads a column (`bc_col_*`, `bc_emit_col`, `bc_row_from`, a
+key built from a row, SQL results, `Database::table_rows`), never read as 0,
+empty or NULL (#520). Plans name columns by id since plan API revision 5,
+and the runtime maps an id to its position; the decoder still refuses an
+offset inside the header or off a word boundary. Nothing is read past
 the end.
 
 **The bitmap is sized at create, with a ceiling.** `bitmap_bytes` is the

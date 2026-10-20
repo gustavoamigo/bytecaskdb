@@ -200,7 +200,8 @@ int64_t   bc_count_range(bc_ctx *, uint32_t table_or_index, bc_view lo, bc_view 
 
 /* Rows and columns. A column is named by its permanent id, and must be
    declared in the plan's bc_schema_ref. */
-bool     bc_col_null(bc_ctx *, bc_view row, uint32_t col);   /* the bitmap bit: clear means null, or a column the row predates */
+bool     bc_col_null(bc_ctx *, bc_view row, uint32_t col);   /* the bitmap bit: clear means null, or a column the row predates;
+                                                                set for a column the row does not hold, BC_E_CORRUPT */
 int64_t  bc_col_i64(bc_ctx *, bc_view row, uint32_t col);
 double   bc_col_f64(bc_ctx *, bc_view row, uint32_t col);
 bool     bc_col_bool(bc_ctx *, bc_view row, uint32_t col);

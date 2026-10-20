@@ -436,7 +436,12 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
     const std::uint8_t* row = nullptr;
     std::uint32_t len = 0;
     while (bc_ctx_next_result(cx_, &row, &len)) {
-      out.rows.push_back(decode_row(stmt.result_layout_, std::as_bytes(std::span{row, len})));
+      auto values = decode_row(stmt.result_layout_, std::as_bytes(std::span{row, len}));
+      if (!values) {
+        bc_ctx_reset(cx_);
+        throw ExecError("malformed result row", BC_E_CORRUPT);
+      }
+      out.rows.push_back(std::move(*values));
     }
   }
   bc_ctx_reset(cx_);
@@ -478,8 +483,9 @@ auto Database::table_rows(std::string_view table) const -> Rows {
     out.types.push_back(c.sql);
   }
   // Damage is BC_E_CORRUPT, never a plausible value: this is the oracle's
-  // reader, so unlike decode_row (result rows the runtime built) every
-  // present field must decode.
+  // reader. decode_row reads each column through row_column, as the
+  // runtime's readers do, so a present column the row does not hold is
+  // refused here exactly where a plan refuses it.
   auto corrupt = [&](const std::string& what) { return ExecError(what + " in table " + t->name, BC_E_CORRUPT); };
   for_each_row(snap, t->id, [&](BytesView, BytesView row) {
     if (!row_valid(row)) throw corrupt("malformed row");
@@ -490,31 +496,9 @@ auto Database::table_rows(std::string_view table) const -> Rows {
       throw corrupt("row of layout generation " + std::to_string(gen) + ", whose layout is generation " +
                     std::to_string(t->layout.generation));
     }
-    std::vector<Value> values;
-    for (const auto& c : layout.columns) {
-      if (row_is_null(row, c)) {
-        values.emplace_back(std::monostate{});
-        continue;
-      }
-      // Present, so the row must hold it: outside its regions it would read as 0 or empty.
-      if (!row_holds(row, c)) throw corrupt("a present column " + std::to_string(c.col_id) + " outside its row");
-      auto take = [&](auto v) {
-        if (!v) throw corrupt("column " + std::to_string(c.col_id) + " does not decode");
-        values.emplace_back(Value{*v});
-      };
-      switch (c.type) {
-        case PhysType::I64: take(row_i64(row, c.pos)); break;
-        case PhysType::F64: take(row_f64(row, c.pos)); break;
-        case PhysType::Bool: take(row_bool(row, c.pos)); break;
-        case PhysType::Bytes: {
-          auto b = row_bytes(row, c.pos);
-          if (!b) throw corrupt("column " + std::to_string(c.col_id) + " does not decode");
-          values.emplace_back(Bytes{b->begin(), b->end()});
-          break;
-        }
-      }
-    }
-    out.rows.push_back(std::move(values));
+    auto values = decode_row(layout, row);
+    if (!values) throw corrupt("a present column that does not decode");
+    out.rows.push_back(std::move(*values));
   });
   return out;
 }
