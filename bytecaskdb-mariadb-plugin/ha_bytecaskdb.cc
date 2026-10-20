@@ -652,8 +652,8 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
                                            upper.data(), upper.size(),
                                            table_id_, index.index_id);
         if (iter && iter->valid() &&
-            iter->key_len() >= unique_prefix.size() &&
-            std::memcmp(iter->key_data(), unique_prefix.data(), unique_prefix.size()) == 0) {
+            iter->key().size() >= unique_prefix.size() &&
+            std::memcmp(iter->key().data(), unique_prefix.data(), unique_prefix.size()) == 0) {
           errkey = saved_errkey_ = static_cast<uint>(index.index_id);
           return HA_ERR_FOUND_DUPP_KEY;
         }
@@ -898,10 +898,10 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
                                                 uhi.data(), uhi.size(),
                                                 table_id_, index.index_id);
             if (uiter && uiter->valid() &&
-                uiter->key_len() >= unique_prefix.size() &&
-                std::memcmp(uiter->key_data(), unique_prefix.data(), unique_prefix.size()) == 0) {
-              const uint8_t *uk = uiter->key_data();
-              size_t uklen = uiter->key_len();
+                uiter->key().size() >= unique_prefix.size() &&
+                std::memcmp(uiter->key().data(), unique_prefix.data(), unique_prefix.size()) == 0) {
+              const uint8_t *uk = uiter->key().data();
+              size_t uklen = uiter->key().size();
               bool is_self = (uklen >= 7 + sec_key_field_len + pk_bytes_len &&
                               std::memcmp(uk + 7 + sec_key_field_len,
                                           pk_bytes, pk_bytes_len) == 0);
@@ -1164,8 +1164,8 @@ SeekMode seek_mode_for(enum ha_rkey_function f) {
 
 bool key_has_prefix(const MariaDBTxn::MergeIterator &it,
                     const std::vector<uint8_t> &prefix) {
-  return it.key_len() >= prefix.size() &&
-         std::memcmp(it.key_data(), prefix.data(), prefix.size()) == 0;
+  return it.key().size() >= prefix.size() &&
+         std::memcmp(it.key().data(), prefix.data(), prefix.size()) == 0;
 }
 
 }  // namespace
@@ -1426,7 +1426,7 @@ int ha_bytecaskdb::index_read_current(uchar *buf) {
     const uint sec_key_len = codec_.keys[active_index].stored_length;
     std::size_t pk_len = 0;
     const uint8_t *pk_ptr = extract_pk_from_sec_key(
-        merge_index_->key_data(), merge_index_->key_len(),
+        merge_index_->key().data(), merge_index_->key().size(),
         sec_key_len, &pk_len);
     if (!pk_ptr) {
       return HA_ERR_KEY_NOT_FOUND;
@@ -1438,8 +1438,8 @@ int ha_bytecaskdb::index_read_current(uchar *buf) {
     // is of a type the decoder does not handle (VARCHAR, BLOB, nullable).
     if (keyread_only_ &&
         decode_sec_key_into_record(codec_.keys[active_index],
-                                    merge_index_->key_data(),
-                                    merge_index_->key_len(),
+                                    merge_index_->key().data(),
+                                    merge_index_->key().size(),
                                     buf)) {
       // Save the synthesized PK so position()/rnd_pos() still work if the
       // optimizer later switches keyread off mid-scan.

@@ -108,7 +108,7 @@ imports the C++23 `bytecask` module and must be built with the same toolchain
 that produced the BMIs). The file is MIT-licensed — it contains no MariaDB
 headers.
 
-The plugin's transaction is the SQL layer's: `MariaDBTxn` derives from
+The plugin's transaction is the SQL layer's: `MariaDBTxn` derives privately from
 `bytecask::sql::Transaction` (`bytecaskdb-sql-layer/txn/`), and the plugin's
 CMake compiles `txn/transaction.cpp` into `ha_bytecaskdb.so`. Those files stay
 MIT; as with `bytecask_hpp.cpp`, the GPL obligation of the shared object

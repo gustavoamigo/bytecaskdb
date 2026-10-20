@@ -14,7 +14,6 @@ namespace bytecaskdb {
 
 using bytecask::sql::as_view;
 using bytecask::sql::assign_bytes;
-using bytecask::sql::to_uint8;
 using bytecask::sql::u8_data;
 
 // The key and value limits the plugin opens the DB with. A WritePlan built

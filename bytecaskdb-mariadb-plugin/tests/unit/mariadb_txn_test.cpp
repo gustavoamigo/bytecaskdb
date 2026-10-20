@@ -32,6 +32,7 @@
 
 namespace bytecaskdb {
 int64_t catalog_row_count(uint32_t table_id);
+std::atomic<int64_t> *catalog_row_count_ptr(uint32_t table_id);
 }  // namespace bytecaskdb
 
 using namespace bytecaskdb;
@@ -241,18 +242,21 @@ TEST_CASE_METHOD(MariaDBTxnFixture,
   auto k2 = make_key("r:2");
   auto v = make_value("x");
   THD thd{};
-  std::atomic<int64_t> rows{0};
+  // The table's catalog counter, as a handler passes it.
+  constexpr uint32_t kTid = 9002;
+  catalog_row_count_ptr(kTid)->store(0);
+  std::atomic<int64_t> &rows = *catalog_row_count_ptr(kTid);
   uint32_t sp1 = 0, sp2 = 0;
 
   auto txn = create_txn();
   txn->savepoint_set(&sp1);
   txn->buffer_put(k1.data(), k1.size(), v.data(), v.size());
-  txn->track_row_count_delta(1, &rows, 1);
+  txn->track_row_count_delta(kTid, &rows, 1);
 
   txn->savepoint_set(&sp2);
   REQUIRE(sp2 != sp1);
   txn->buffer_put(k2.data(), k2.size(), v.data(), v.size());
-  txn->track_row_count_delta(1, &rows, 1);
+  txn->track_row_count_delta(kTid, &rows, 1);
   REQUIRE(rows.load() == 2);
 
   SECTION("rollback to the inner savepoint") {
@@ -326,7 +330,7 @@ std::vector<uint8_t> index_key(uint32_t tid, uint16_t iid, uint8_t c) {
 std::vector<uint8_t> collect_keys(MariaDBTxn::MergeIterator &it) {
   std::vector<uint8_t> out;
   for (; it.valid(); it.next()) {
-    out.push_back(it.key_data()[it.key_len() - 1]);
+    out.push_back(it.key().data()[it.key().size() - 1]);
   }
   return out;
 }

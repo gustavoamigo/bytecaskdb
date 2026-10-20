@@ -6,12 +6,13 @@
 #include "bytecaskdb-sql-layer/txn/transaction.h"
 
 #include <algorithm>
-#include <cstring>
+#include <compare>
 #include <utility>
 
 namespace bytecask::sql {
 
 namespace {
+
 auto outcome(CommitOutcome::Status status, std::exception_ptr error = {})
     -> CommitOutcome {
   CommitOutcome out;
@@ -19,6 +20,21 @@ auto outcome(CommitOutcome::Status status, std::exception_ptr error = {})
   out.error = std::move(error);
   return out;
 }
+
+auto view(ByteSpan s) -> bytecask::BytesView { return std::as_bytes(s); }
+
+auto to_vector(ByteSpan s) -> std::vector<std::uint8_t> {
+  return {s.begin(), s.end()};
+}
+
+// Lexicographic byte compare; a proper prefix sorts first.
+auto lex_compare(ByteSpan a, ByteSpan b) -> int {
+  const auto c = std::lexicographical_compare_three_way(a.begin(), a.end(),
+                                                        b.begin(), b.end());
+  if (std::is_lt(c)) { return -1; }
+  return std::is_gt(c) ? 1 : 0;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -62,16 +78,11 @@ void Transaction::ensure_snapshot() {
   }
 }
 
-void Transaction::buffer_put(const uint8_t *key, size_t klen,
-                             const uint8_t *val, size_t vlen,
-                             bool guard_absent) {
+void Transaction::buffer_put(ByteSpan key, ByteSpan val, bool guard_absent) {
   ensure_snapshot();
 
-  std::vector<uint8_t> k(key, key + klen);
-  std::vector<uint8_t> v;
-  if (val && vlen > 0) {
-    v.assign(val, val + vlen);
-  }
+  auto k = to_vector(key);
+  auto v = to_vector(val);
 
   // Update RYOW overlay.
   lookup_[k] = v;
@@ -80,10 +91,10 @@ void Transaction::buffer_put(const uint8_t *key, size_t klen,
   ops_.push_back(Op{Op::Put, std::move(k), std::move(v), guard_absent});
 }
 
-void Transaction::buffer_del(const uint8_t *key, size_t klen) {
+void Transaction::buffer_del(ByteSpan key) {
   ensure_snapshot();
 
-  std::vector<uint8_t> k(key, key + klen);
+  auto k = to_vector(key);
 
   // Update RYOW overlay: tombstone.
   lookup_[k] = std::nullopt;
@@ -92,9 +103,9 @@ void Transaction::buffer_del(const uint8_t *key, size_t klen) {
   ops_.push_back(Op{Op::Del, std::move(k), {}, false});
 }
 
-bool Transaction::buffered_key_present(const uint8_t *key, size_t klen) {
+bool Transaction::buffered_key_present(ByteSpan key) const {
   if (lookup_.empty()) { return false; }
-  auto it = lookup_.find(std::vector<uint8_t>(key, key + klen));
+  auto it = lookup_.find(to_vector(key));
   return it != lookup_.end() && it->second.has_value();
 }
 
@@ -102,10 +113,9 @@ bool Transaction::buffered_key_present(const uint8_t *key, size_t klen) {
 // RYOW reads
 // ---------------------------------------------------------------------------
 
-int Transaction::get(const uint8_t *key, size_t klen, bytecask::Bytes &out) {
+int Transaction::get(ByteSpan key, bytecask::Bytes &out) {
   if (!lookup_.empty()) {
-    std::vector<uint8_t> k(key, key + klen);
-    auto it = lookup_.find(k);
+    auto it = lookup_.find(to_vector(key));
     if (it != lookup_.end()) {
       if (!it->second.has_value()) {
         return 0;
@@ -118,18 +128,17 @@ int Transaction::get(const uint8_t *key, size_t klen, bytecask::Bytes &out) {
   ensure_snapshot();
   try {
     if (snap_) {
-      return snap_->get(read_options(), as_view(key, klen), out) ? 1 : 0;
+      return snap_->get(read_options(), view(key), out) ? 1 : 0;
     }
-    return db_->get(read_options(), as_view(key, klen), out) ? 1 : 0;
+    return db_->get(read_options(), view(key), out) ? 1 : 0;
   } catch (...) {
     return -1;
   }
 }
 
-bool Transaction::exists(const uint8_t *key, size_t klen) {
+bool Transaction::exists(ByteSpan key) {
   if (!lookup_.empty()) {
-    std::vector<uint8_t> k(key, key + klen);
-    auto it = lookup_.find(k);
+    auto it = lookup_.find(to_vector(key));
     if (it != lookup_.end()) {
       return it->second.has_value();
     }
@@ -138,37 +147,36 @@ bool Transaction::exists(const uint8_t *key, size_t klen) {
   ensure_snapshot();
   try {
     if (snap_) {
-      return snap_->contains_key(read_options(), as_view(key, klen));
+      return snap_->contains_key(read_options(), view(key));
     }
-    return db_->contains_key(read_options(), as_view(key, klen));
+    return db_->contains_key(read_options(), view(key));
   } catch (...) {
     return false;
   }
 }
 
-std::size_t Transaction::count_range(const uint8_t *lo, size_t lo_len,
-                                     const uint8_t *hi, size_t hi_len,
+std::size_t Transaction::count_range(ByteSpan lo, ByteSpan hi,
                                      std::size_t limit) {
   // Contradictory predicates (a > 5 AND a < 3) give lo >= hi: a range that
   // holds no rows. count_keys refuses one, so it is answered here.
-  if (!std::lexicographical_compare(lo, lo + lo_len, hi, hi + hi_len)) {
+  if (!std::lexicographical_compare(lo.begin(), lo.end(), hi.begin(), hi.end())) {
     return 0;
   }
   if (!snap_) {
     snap_.emplace(db_->snapshot());
   }
-  auto n = snap_->count_keys(as_view(lo, lo_len), as_view(hi, hi_len), limit);
+  auto n = snap_->count_keys(view(lo), view(hi), limit);
   if (n >= limit) {
     return limit;
   }
   // A buffered put of a key the snapshot lacks adds one; a buffered delete
   // of a key it holds takes one away (that key is among the n counted).
-  const std::vector<uint8_t> lo_vec(lo, lo + lo_len);
-  const std::vector<uint8_t> hi_vec(hi, hi + hi_len);
+  const auto lo_vec = to_vector(lo);
+  const auto hi_vec = to_vector(hi);
   for (auto it = lookup_.lower_bound(lo_vec);
        it != lookup_.end() && it->first < hi_vec; ++it) {
-    const bool in_snap = snap_->contains_key(
-        read_options(), as_view(it->first.data(), it->first.size()));
+    const bool in_snap =
+        snap_->contains_key(read_options(), view(it->first));
     if (it->second && !in_snap) {
       if (++n >= limit) {
         return limit;
@@ -184,101 +192,83 @@ std::size_t Transaction::count_range(const uint8_t *lo, size_t lo_len,
 // subrange<It, default_sentinel_t>.
 
 std::unique_ptr<Transaction::MergeIterator> Transaction::iter_entries(
-    const uint8_t *lo, size_t lo_len,
-    const uint8_t *hi, size_t hi_len,
-    std::vector<uint8_t> ns) {
+    ByteSpan lo, ByteSpan hi, std::vector<std::uint8_t> ns) {
   if (!snap_) {
     snap_.emplace(db_->snapshot());
   }
 
   std::optional<bytecask::EntryIterator> snap_it;
   if (snap_) {
-    auto range = snap_->iter_from(read_options(), as_view(lo, lo_len));
+    auto range = snap_->iter_from(read_options(), view(lo));
     snap_it.emplace(range.begin());
   }
 
-  std::vector<uint8_t> lo_vec(lo, lo + lo_len);
-  std::vector<uint8_t> hi_vec(hi, hi + hi_len);
-  auto buf_it = lookup_.lower_bound(lo_vec);
+  auto buf_it = lookup_.lower_bound(to_vector(lo));
 
   return std::make_unique<MergeIterator>(
-      std::move(snap_it), buf_it, lookup_.end(), std::move(hi_vec),
-      std::move(ns));
+      std::move(snap_it), buf_it, lookup_.end(), to_vector(hi), std::move(ns));
 }
 
 std::unique_ptr<Transaction::MergeIterator> Transaction::iter_keys(
-    const uint8_t *lo, size_t lo_len,
-    const uint8_t *hi, size_t hi_len,
-    std::vector<uint8_t> ns) {
+    ByteSpan lo, ByteSpan hi, std::vector<std::uint8_t> ns) {
   if (!snap_) {
     snap_.emplace(db_->snapshot());
   }
 
   std::optional<bytecask::KeyIterator> snap_it;
   if (snap_) {
-    auto range = snap_->keys_from(read_options(), as_view(lo, lo_len));
+    auto range = snap_->keys_from(read_options(), view(lo));
     snap_it.emplace(range.begin());
   }
 
-  std::vector<uint8_t> lo_vec(lo, lo + lo_len);
-  std::vector<uint8_t> hi_vec(hi, hi + hi_len);
-  auto buf_it = lookup_.lower_bound(lo_vec);
+  auto buf_it = lookup_.lower_bound(to_vector(lo));
 
   return std::make_unique<MergeIterator>(
-      std::move(snap_it), buf_it, lookup_.end(), std::move(hi_vec),
-      std::move(ns));
+      std::move(snap_it), buf_it, lookup_.end(), to_vector(hi), std::move(ns));
 }
 
 std::unique_ptr<Transaction::MergeIterator> Transaction::riter_keys(
-    const uint8_t *hi, size_t hi_len,
-    const uint8_t *lo, size_t lo_len,
-    std::vector<uint8_t> ns) {
+    ByteSpan hi, ByteSpan lo, std::vector<std::uint8_t> ns) {
   if (!snap_) {
     snap_.emplace(db_->snapshot());
   }
 
   std::optional<bytecask::ReverseKeyIterator> snap_it;
   if (snap_) {
-    auto range = snap_->rkeys_from(read_options(), as_view(hi, hi_len));
+    auto range = snap_->rkeys_from(read_options(), view(hi));
     snap_it.emplace(range.begin());
   }
 
-  std::vector<uint8_t> lo_vec(lo, lo + lo_len);
-  std::vector<uint8_t> hi_vec(hi, hi + hi_len);
-  auto buf_it = reverse_buffer_start(hi_vec);
+  auto buf_it = reverse_buffer_start(to_vector(hi));
 
   return std::make_unique<MergeIterator>(
       std::move(snap_it), buf_it, lookup_.begin(), lookup_.end(),
-      std::move(lo_vec), std::move(ns));
+      to_vector(lo), std::move(ns));
 }
 
 std::unique_ptr<Transaction::MergeIterator> Transaction::riter_entries(
-    const uint8_t *hi, size_t hi_len,
-    const uint8_t *lo, size_t lo_len,
-    std::vector<uint8_t> ns) {
+    ByteSpan hi, ByteSpan lo, std::vector<std::uint8_t> ns) {
   if (!snap_) {
     snap_.emplace(db_->snapshot());
   }
 
   std::optional<bytecask::ReverseEntryIterator> snap_it;
   if (snap_) {
-    auto range = snap_->riter_from(read_options(), as_view(hi, hi_len));
+    auto range = snap_->riter_from(read_options(), view(hi));
     snap_it.emplace(range.begin());
   }
 
-  std::vector<uint8_t> lo_vec(lo, lo + lo_len);
-  std::vector<uint8_t> hi_vec(hi, hi + hi_len);
-  auto buf_it = reverse_buffer_start(hi_vec);
+  auto buf_it = reverse_buffer_start(to_vector(hi));
 
   return std::make_unique<MergeIterator>(
       std::move(snap_it), buf_it, lookup_.begin(), lookup_.end(),
-      std::move(lo_vec), std::move(ns));
+      to_vector(lo), std::move(ns));
 }
 
 // Largest buffered key <= hi, or end() when every buffered key is above hi.
 // Mirrors rkeys_from(hi) on the snapshot side.
 Transaction::LookupMap::const_iterator
-Transaction::reverse_buffer_start(const std::vector<uint8_t> &hi) const {
+Transaction::reverse_buffer_start(const std::vector<std::uint8_t> &hi) const {
   auto it = lookup_.upper_bound(hi);
   if (it == lookup_.begin()) { return lookup_.end(); }
   return --it;
@@ -298,8 +288,8 @@ CommitOutcome Transaction::commit(bool all, bool sync) {
   using Status = CommitOutcome::Status;
   if (bulk_copy_mode_ && (all || !in_txn_)) {
     // Flush any tail rows the copy loop left buffered, then fall through.
-    // end_bulk_insert normally does this already; this covers paths that
-    // reach commit without it (e.g. an ALTER with zero source rows).
+    // The copy normally does this already when it ends; this covers paths
+    // that reach commit without it (e.g. a copy of zero rows).
     auto flushed = bulk_flush(true);
     bulk_reset();
     if (flushed.status != Status::Committed) {
@@ -331,12 +321,12 @@ CommitOutcome Transaction::commit(bool all, bool sync) {
       switch (op.kind) {
       case Op::Put:
         if (op.guard_absent) {
-          plan.ensure_absent(as_view(op.key));
+          plan.ensure_absent(view(op.key));
         }
-        plan.put(as_view(op.key), as_view(op.val));
+        plan.put(view(op.key), view(op.val));
         break;
       case Op::Del:
-        plan.del(as_view(op.key));
+        plan.del(view(op.key));
         break;
       }
     }
@@ -360,9 +350,8 @@ CommitOutcome Transaction::commit(bool all, bool sync) {
 }
 
 void Transaction::rollback(bool all) {
-  // Discard any pending bulk-copy batch. Rows already flushed to the
-  // #sql-xxx keyspace are reclaimed when MariaDB drops the temp table
-  // (delete_table → del_range), on this path or via ddl_log after a crash.
+  // Discard any pending bulk-copy batch. Rows already flushed stay, for the
+  // caller to reclaim with the copy's keyspace.
   bulk_reset();
 
   if (!all && in_txn_) {
@@ -370,7 +359,7 @@ void Transaction::rollback(bool all) {
     // statement. Earlier statements stay buffered for the session commit.
     restore_row_count_deltas(stmt_row_count_deltas_);
     truncate_ops(stmt_ops_mark_);
-    deferred_insert_ = false;
+    end_deferred_insert();
     in_stmt_ = false;
     return;
   }
@@ -391,14 +380,14 @@ void Transaction::truncate_ops(std::size_t mark) {
 }
 
 void Transaction::restore_row_count_deltas(const RowCountDeltas &saved) {
-  for (auto &[table_id, entry] : row_count_deltas_) {
-    int64_t saved_delta = 0;
+  for (const auto &[table_id, delta] : row_count_deltas_) {
+    std::int64_t saved_delta = 0;
     if (auto it = saved.find(table_id); it != saved.end()) {
-      saved_delta = it->second.delta;
+      saved_delta = it->second;
     }
-    const int64_t undo = entry.delta - saved_delta;
+    const std::int64_t undo = delta - saved_delta;
     if (undo == 0) { continue; }
-    entry.counter->fetch_add(-undo);
+    row_count_add_(table_id, -undo);
   }
   row_count_deltas_ = saved;
 }
@@ -411,7 +400,7 @@ CommitOutcome Transaction::deferred_dup_key() const {
     if (op.kind != Op::Put || !op.guard_absent) { continue; }
     bool present = false;
     try {
-      present = db_->contains_key(read_options(), as_view(op.key));
+      present = db_->contains_key(read_options(), view(op.key));
     } catch (...) {
       present = false;
     }
@@ -420,7 +409,17 @@ CommitOutcome Transaction::deferred_dup_key() const {
       break;
     }
   }
+  if (deferred_reporter_ && out.duplicate) {
+    out.duplicate_reported =
+        deferred_reporter_(out.duplicate->key, out.duplicate->row);
+  }
   return out;
+}
+
+void Transaction::end_deferred_insert() {
+  deferred_insert_ = false;
+  deferred_owner_ = nullptr;
+  deferred_reporter_ = nullptr;
 }
 
 void Transaction::reset() {
@@ -431,22 +430,21 @@ void Transaction::reset() {
   stmt_ops_mark_ = 0;
   stmt_row_count_deltas_.clear();
   savepoints_.clear();
-  deferred_insert_ = false;
+  end_deferred_insert();
   in_stmt_ = false;
   in_txn_ = false;
   bulk_reset();
 }
 
-void Transaction::track_row_count_delta(uint32_t table_id,
-                                        std::atomic<int64_t> &row_count,
-                                        int64_t delta) {
-  row_count.fetch_add(delta);
-
-  auto &entry = row_count_deltas_[table_id];
-  entry.delta += delta;
-  if (!entry.counter) {
-    entry.counter = &row_count;
+void Transaction::track_row_count_delta(std::uint32_t table_id,
+                                        std::int64_t delta,
+                                        std::atomic<std::int64_t> *row_count) {
+  if (row_count) {
+    row_count->fetch_add(delta);
+  } else {
+    row_count_add_(table_id, delta);
   }
+  row_count_deltas_[table_id] += delta;
 }
 
 void Transaction::revert_row_count_deltas() {
@@ -473,17 +471,15 @@ void Transaction::bulk_reset() {
   bulk_seen_.clear();
 }
 
-void Transaction::bulk_buffer_put(const uint8_t *key, std::size_t klen,
-                                  const uint8_t *val, std::size_t vlen) {
-  static constexpr uint8_t kEmpty[1] = {0};
-  const uint8_t *vp = (val && vlen > 0) ? val : kEmpty;
-  const std::size_t vl = (val && vlen > 0) ? vlen : 0;
-  bulk_plan_.put(as_view(key, klen), as_view(vp, vl));
-  bulk_bytes_ += klen + vlen;
+void Transaction::bulk_buffer_put(ByteSpan key, ByteSpan val) {
+  static constexpr std::uint8_t kEmpty[1] = {0};
+  const ByteSpan v = val.empty() ? ByteSpan{kEmpty, 0} : val;
+  bulk_plan_.put(view(key), view(v));
+  bulk_bytes_ += key.size() + val.size();
 }
 
-void Transaction::bulk_note_key(const uint8_t *key, std::size_t klen) {
-  bulk_seen_.emplace(key, key + klen);
+void Transaction::bulk_note_key(ByteSpan key) {
+  bulk_seen_.emplace(key.begin(), key.end());
 }
 
 CommitOutcome Transaction::bulk_flush(bool sync) {
@@ -491,6 +487,11 @@ CommitOutcome Transaction::bulk_flush(bool sync) {
   if (bulk_bytes_ == 0 && bulk_seen_.empty()) {
     return {};
   }
+  auto failed = [](std::exception_ptr error) {
+    auto out = outcome(Status::EngineError, std::move(error));
+    out.in_bulk_flush = true;
+    return out;
+  };
   try {
     bool committed =
         db_->apply_batch(bytecask::WriteOptions{.sync = sync},
@@ -500,41 +501,40 @@ CommitOutcome Transaction::bulk_flush(bool sync) {
     bulk_seen_.clear();
     if (!committed) {
       // A snapshot-less plan cannot conflict; a false here is an engine fault.
-      return outcome(Status::EngineError);
+      return failed({});
     }
     return {};
   } catch (const std::exception &) {
     bulk_plan_ = bytecask::WritePlan{limits_};
     bulk_bytes_ = 0;
     bulk_seen_.clear();
-    return outcome(Status::EngineError, std::current_exception());
+    return failed(std::current_exception());
   }
 }
 
-bool Transaction::bulk_pk_exists(const uint8_t *key, std::size_t klen) {
-  if (bulk_seen_.find(std::vector<uint8_t>(key, key + klen)) != bulk_seen_.end()) {
+bool Transaction::bulk_pk_exists(ByteSpan key) {
+  if (bulk_seen_.find(to_vector(key)) != bulk_seen_.end()) {
     return true;
   }
   try {
-    return db_->contains_key(read_options(), as_view(key, klen));
+    return db_->contains_key(read_options(), view(key));
   } catch (...) {
     return false;
   }
 }
 
-bool Transaction::bulk_unique_prefix_exists(const uint8_t *prefix,
-                                            std::size_t plen) {
-  if (bulk_seen_.find(std::vector<uint8_t>(prefix, prefix + plen)) !=
-      bulk_seen_.end()) {
+bool Transaction::bulk_unique_prefix_exists(ByteSpan prefix) {
+  if (bulk_seen_.find(to_vector(prefix)) != bulk_seen_.end()) {
     return true;
   }
   try {
     // The first key at or after the prefix is the only candidate.
-    auto keys = db_->keys_from(read_options(), as_view(prefix, plen));
+    auto keys = db_->keys_from(read_options(), view(prefix));
     auto it = keys.begin();
     if (it == std::default_sentinel) { return false; }
     const auto &k = *it;
-    return k.size() >= plen && std::memcmp(u8_data(k), prefix, plen) == 0;
+    return k.size() >= prefix.size() &&
+           std::equal(prefix.begin(), prefix.end(), u8_data(k));
   } catch (...) {
     return false;
   }
@@ -565,15 +565,6 @@ void Transaction::savepoint_release(std::uint32_t savepoint) {
   if (savepoint < savepoints_.size()) { savepoints_.resize(savepoint); }
 }
 
-namespace {
-// Lexicographic byte compare; a proper prefix sorts first.
-int lex_compare(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
-  const int c = std::memcmp(a, b, std::min(alen, blen));
-  if (c != 0) return c;
-  return (alen < blen) ? -1 : (alen > blen) ? 1 : 0;
-}
-}  // namespace
-
 // ---------------------------------------------------------------------------
 // MergeIterator
 //
@@ -586,8 +577,8 @@ Transaction::MergeIterator::MergeIterator(
     std::optional<bytecask::EntryIterator> snap_it,
     LookupMap::const_iterator buf_it,
     LookupMap::const_iterator buf_end,
-    std::vector<uint8_t> hi,
-    std::vector<uint8_t> ns)
+    std::vector<std::uint8_t> hi,
+    std::vector<std::uint8_t> ns)
     : snap_fwd_(std::move(snap_it)),
       reverse_(false),
       buf_it_(buf_it),
@@ -603,8 +594,8 @@ Transaction::MergeIterator::MergeIterator(
     std::optional<bytecask::KeyIterator> snap_it,
     LookupMap::const_iterator buf_it,
     LookupMap::const_iterator buf_end,
-    std::vector<uint8_t> hi,
-    std::vector<uint8_t> ns)
+    std::vector<std::uint8_t> hi,
+    std::vector<std::uint8_t> ns)
     : snap_key_fwd_(std::move(snap_it)),
       reverse_(false),
       buf_it_(buf_it),
@@ -621,8 +612,8 @@ Transaction::MergeIterator::MergeIterator(
     LookupMap::const_iterator buf_it,
     LookupMap::const_iterator buf_begin,
     LookupMap::const_iterator buf_end,
-    std::vector<uint8_t> lo,
-    std::vector<uint8_t> ns)
+    std::vector<std::uint8_t> lo,
+    std::vector<std::uint8_t> ns)
     : snap_rev_(std::move(snap_it)),
       reverse_(true),
       buf_it_(buf_it),
@@ -639,8 +630,8 @@ Transaction::MergeIterator::MergeIterator(
     LookupMap::const_iterator buf_it,
     LookupMap::const_iterator buf_begin,
     LookupMap::const_iterator buf_end,
-    std::vector<uint8_t> lo,
-    std::vector<uint8_t> ns)
+    std::vector<std::uint8_t> lo,
+    std::vector<std::uint8_t> ns)
     : snap_key_rev_(std::move(snap_it)),
       reverse_(true),
       buf_it_(buf_it),
@@ -656,10 +647,9 @@ void Transaction::MergeIterator::next() {
   advance();
 }
 
-bool Transaction::MergeIterator::in_namespace(const uint8_t *key,
-                                              size_t len) const {
-  return len >= ns_.size() &&
-         std::equal(ns_.begin(), ns_.end(), key);
+bool Transaction::MergeIterator::in_namespace(ByteSpan key) const {
+  return key.size() >= ns_.size() &&
+         std::equal(ns_.begin(), ns_.end(), key.begin());
 }
 
 bool Transaction::MergeIterator::snap_at_end() const {
@@ -688,52 +678,45 @@ void Transaction::MergeIterator::load_snap_current() {
 
   if (snap_at_end()) return;
 
-  const uint8_t *kp = nullptr;
-  size_t klen = 0;
+  auto u8 = [](bytecask::BytesView b) { return ByteSpan{u8_data(b), b.size()}; };
+  ByteSpan k;
+  bool have = false;
 
   if (!reverse_) {
     if (snap_fwd_) {
       const auto &entry = **snap_fwd_;
-      kp = u8_data(entry.key);
-      klen = entry.key.size();
-      snap_val_ptr_ = u8_data(entry.value);
-      snap_val_len_ = entry.value.size();
+      k = u8(entry.key);
+      snap_val_ = u8(entry.value);
+      have = true;
     } else if (snap_key_fwd_) {
-      const auto &key_bytes = **snap_key_fwd_;
-      kp = u8_data(key_bytes);
-      klen = key_bytes.size();
-      snap_val_ptr_ = nullptr;
-      snap_val_len_ = 0;
+      k = u8(**snap_key_fwd_);
+      snap_val_ = {};
+      have = true;
     }
   } else {
     if (snap_rev_) {
       const auto &entry = **snap_rev_;
-      kp = u8_data(entry.key);
-      klen = entry.key.size();
-      snap_val_ptr_ = u8_data(entry.value);
-      snap_val_len_ = entry.value.size();
+      k = u8(entry.key);
+      snap_val_ = u8(entry.value);
+      have = true;
     } else if (snap_key_rev_) {
-      const auto &key_bytes = **snap_key_rev_;
-      kp = u8_data(key_bytes);
-      klen = key_bytes.size();
-      snap_val_ptr_ = nullptr;
-      snap_val_len_ = 0;
+      k = u8(**snap_key_rev_);
+      snap_val_ = {};
+      have = true;
     }
   }
 
-  if (!kp) return;
+  if (!have) return;
 
-  if (!in_namespace(kp, klen)) {
+  if (!in_namespace(k)) {
     return;
   }
 
-  if (!reverse_ && !bound_.empty() &&
-      lex_compare(kp, klen, bound_.data(), bound_.size()) >= 0) {
+  if (!reverse_ && !bound_.empty() && lex_compare(k, bound_) >= 0) {
     return;
   }
 
-  snap_key_ptr_ = kp;
-  snap_key_len_ = klen;
+  snap_key_ = k;
   snap_valid_ = true;
 }
 
@@ -752,11 +735,10 @@ void Transaction::MergeIterator::buf_step() {
 bool Transaction::MergeIterator::buf_candidate_valid() const {
   if (buf_it_ == buf_end_) return false;
   const auto &bk = buf_it_->first;
-  if (!reverse_ && !bound_.empty() &&
-      lex_compare(bk.data(), bk.size(), bound_.data(), bound_.size()) >= 0) {
+  if (!reverse_ && !bound_.empty() && lex_compare(bk, bound_) >= 0) {
     return false;
   }
-  return in_namespace(bk.data(), bk.size());
+  return in_namespace(bk);
 }
 
 void Transaction::MergeIterator::emit_buf() {
@@ -767,8 +749,8 @@ void Transaction::MergeIterator::emit_buf() {
 }
 
 void Transaction::MergeIterator::emit_snap() {
-  cur_key_.assign(snap_key_ptr_, snap_key_ptr_ + snap_key_len_);
-  assign_bytes(cur_val_, snap_val_ptr_, snap_val_len_);
+  cur_key_.assign(snap_key_.begin(), snap_key_.end());
+  assign_bytes(cur_val_, snap_val_.data(), snap_val_.size());
   snap_step();
   load_snap_current();
   valid_ = true;
@@ -797,7 +779,7 @@ void Transaction::MergeIterator::advance() {
 
     // Both sides have a candidate.
     const auto &bk = buf_it_->first;
-    const int cmp = lex_compare(bk.data(), bk.size(), snap_key_ptr_, snap_key_len_);
+    const int cmp = lex_compare(bk, snap_key_);
 
     if (cmp == 0) {
       // Same key on both sides: the buffer's version wins; a tombstone

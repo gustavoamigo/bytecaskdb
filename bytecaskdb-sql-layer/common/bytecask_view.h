@@ -4,10 +4,10 @@
 // bytecask_view.h — small adapters between the `uint8_t* + size_t`
 // convention and bytecask's `BytesView` (std::span<const std::byte>).
 //
-// They let a caller that holds raw byte pointers (as the MariaDB handler API
-// hands out) talk to the strongly typed bytecask::DB / Snapshot / WritePlan
-// surface in include/bytecask.hpp. A plain header: the MariaDB plugin, built
-// by CMake with another toolchain, includes it.
+// They let a caller that holds raw byte pointers talk to the strongly typed
+// bytecask::DB / Snapshot / WritePlan surface in include/bytecask.hpp. A
+// plain C++20 header, so a caller built with another toolchain can include
+// it.
 
 #pragma once
 
@@ -26,15 +26,6 @@ inline bytecask::BytesView as_view(const uint8_t *p, std::size_t n) {
 
 inline bytecask::BytesView as_view(const std::vector<uint8_t> &v) {
   return std::as_bytes(std::span{v.data(), v.size()});
-}
-
-// Copy a Bytes (std::vector<std::byte>) into a std::vector<uint8_t>.
-inline std::vector<uint8_t> to_uint8(const bytecask::Bytes &src) {
-  std::vector<uint8_t> out(src.size());
-  for (std::size_t i = 0; i < src.size(); ++i) {
-    out[i] = std::to_integer<uint8_t>(src[i]);
-  }
-  return out;
 }
 
 inline const uint8_t *u8_data(const bytecask::Bytes &b) {

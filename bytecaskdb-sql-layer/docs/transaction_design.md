@@ -2,9 +2,8 @@
 
 Status: implemented in `bytecaskdb-sql-layer/txn/` (#488), moved from the
 MariaDB plugin, where it was `MariaDBTxn`. Tests in
-`tests/transaction_test.cpp`. The plugin derives its per-session adapter
-from it; nothing in the layer uses it yet. Wiring it into `bc_ctx`, and
-`BEGIN`/`COMMIT` in SQL, are #491's.
+`tests/transaction_test.cpp`. Nothing in the layer uses it yet; wiring it
+into `bc_ctx`, and `BEGIN`/`COMMIT` in SQL, are #491's.
 
 `bytecask::sql::Transaction` buffers a session's writes and reads from an
 engine snapshot. It gives statement atomicity, multi-statement transactions
@@ -14,12 +13,13 @@ conflict detection at commit. It is built on the engine's public API alone:
 
 ## Header, not module
 
-The layer is C++23 modules, but the plugin is built by CMake with MariaDB's
-toolchain, and a module unit's compiled interface does not cross
-toolchains. `txn/transaction.h`, `txn/transaction.cpp` and
-`common/bytecask_view.h` are therefore plain C++20 on `include/bytecask.hpp`:
-the plugin's CMake compiles `transaction.cpp` from here, and xmake compiles it
-into `sql_layer`. They include no MariaDB header and import no module.
+The layer is C++23 modules, but a module unit's compiled interface does not
+cross toolchains, and a caller built with another one (the MariaDB plugin,
+built by CMake with MariaDB's) compiles the transaction itself.
+`txn/transaction.h`, `txn/transaction.cpp` and `common/bytecask_view.h` are
+therefore plain C++20 on `include/bytecask.hpp`, and import no module; xmake
+compiles `transaction.cpp` into `sql_layer`. Keys and values cross the API as
+`std::span<const std::uint8_t>` (`ByteSpan`).
 
 ## State
 
@@ -37,9 +37,12 @@ into `sql_layer`. They include no MariaDB header and import no module.
   entries or keys only. On a tie the buffer wins, and a tombstone hides the
   snapshot's key. Each takes a namespace prefix, and emits only keys that
   start with it: the plugin passes a table's or an index's prefix.
-- **Row counters.** `track_row_count_delta` applies a delta to a caller's
-  counter and records it, so a rollback, a failed commit, a statement
-  rollback or a savepoint rollback can undo it.
+- **Row counters.** `track_row_count_delta` applies a delta to a table's
+  counter and records it by table id, so a rollback, a failed commit, a
+  statement rollback or a savepoint rollback can undo it. The undo goes
+  through the caller's `RowCountAddFn` by table id: no pointer to a counter
+  outlives the call that passed it, so a counter dropped in the meantime is
+  never reached.
 
 ## Lifecycle
 
@@ -53,14 +56,11 @@ transaction coordinator registers each.
 |---|---|---|
 | `Committed` | The plan applied, or there was nothing to apply, or a statement commit inside a transaction kept the buffer | — |
 | `Conflict` | The snapshot's write-write check or a guard refused the plan | Nothing written |
-| `DuplicateKey` | A deferred insert's `ensure_absent` guard refused it | Nothing written; `duplicate` names the first guarded key that exists and its row |
-| `EngineError` | The engine threw (`error` holds the exception), or refused a plan that cannot conflict | Nothing of the buffer written |
+| `DuplicateKey` | A deferred insert's `ensure_absent` guard refused it | Nothing written; `duplicate` names the first guarded key that exists and its row, and `duplicate_reported` says whether the reporter reported it |
+| `EngineError` | The engine threw (`error` holds the exception), or refused a plan that cannot conflict | Nothing of the buffer written; `in_bulk_flush` says the error came from flushing the bulk-copy batch |
 
 On every status but `Committed` the row-count deltas are reverted and the
-transaction is reset. The caller maps the status to its own error: the
-plugin maps them to `HA_ERR_LOCK_DEADLOCK`, `HA_ERR_FOUND_DUPP_KEY` (with the
-server's duplicate-key message, rendered from `duplicate`) and
-`HA_ERR_INTERNAL_ERROR`, and aborts the server when the engine is degraded.
+transaction is reset. The caller maps the status to its own errors.
 
 `rollback(all)` discards the transaction, or, for a statement inside a
 transaction, truncates `ops_` to the mark taken when the statement began,
@@ -75,16 +75,20 @@ A savepoint is an index into a stack of (log mark, row counters).
 
 A plain autocommit insert whose only unique constraint is the primary key
 need not read the snapshot to check for a duplicate.
-`begin_deferred_insert()` puts the statement in a mode that takes no
-snapshot: each put carries `guard_absent`, which commit turns into
+`begin_deferred_insert(owner, reporter)` puts the statement in a mode that
+takes no snapshot: each put carries `guard_absent`, which commit turns into
 `ensure_absent` on a snapshot-less plan, and a duplicate within the
 statement is caught by `buffered_key_present`. A conflict on such a plan can
-only be a guard, so it is `DuplicateKey`.
+only be a guard, so it is `DuplicateKey`, and commit hands the duplicate to
+the reporter before it resets. The reporter is the transaction's state, so
+it ends with the mode: at the commit, at a rollback, at a statement
+rollback. `forget_deferred_reporter(owner)` drops it sooner, when its owner
+goes away.
 
 ## Bulk copy
 
-A copy into a table no other transaction can see yet (MariaDB's
-`ALTER TABLE ... ALGORITHM=COPY` target) does not go through the buffer.
+A copy into a keyspace no other transaction can see until it is published
+(a DDL copy path) does not go through the buffer.
 `begin_bulk_copy` sends puts to a separate snapshot-less plan, flushed with
 `bulk_flush` whenever it passes a byte threshold, so memory stays bounded by
 the threshold. The buffer, the snapshot and any merge iterator open over

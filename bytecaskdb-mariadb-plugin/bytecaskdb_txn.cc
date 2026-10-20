@@ -22,23 +22,9 @@ namespace bytecaskdb {
 
 using Status = bytecask::sql::CommitOutcome::Status;
 
-namespace {
-
-// Logs an engine error the transaction caught, as the plugin always has.
-void log_engine_error(const char *what, const std::exception_ptr &error) {
-  if (!error) { return; }
-  try {
-    std::rethrow_exception(error);
-  } catch (const std::exception &e) {
-    fprintf(stderr, "[bytecaskdb] %s failed: %s\n", what, e.what());
-  } catch (...) {
-  }
-}
-
-}  // namespace
-
 MariaDBTxn::MariaDBTxn(bytecask::DB *db)
-    : Transaction(db, kPluginSizeLimits, &plugin_read_options) {}
+    : Transaction(db, kPluginSizeLimits, &catalog_row_count_add,
+                  &plugin_read_options) {}
 
 void MariaDBTxn::begin_if_needed(THD *thd, handlerton *hton) {
   const bool multi = thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
@@ -55,99 +41,84 @@ std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::iter_prefix(
     const uint8_t *lo, size_t lo_len,
     const uint8_t *hi, size_t hi_len,
     uint32_t table_id) {
-  return iter_entries(lo, lo_len, hi, hi_len, table_id_prefix(table_id));
+  return iter_entries({lo, lo_len}, {hi, hi_len}, table_id_prefix(table_id));
 }
 
 std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_prefix(
     const uint8_t *hi, size_t hi_len,
     const uint8_t *lo, size_t lo_len,
     uint32_t table_id) {
-  return riter_entries(hi, hi_len, lo, lo_len, table_id_prefix(table_id));
+  return riter_entries({hi, hi_len}, {lo, lo_len}, table_id_prefix(table_id));
 }
 
 std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::iter_index_prefix(
     const uint8_t *lo, size_t lo_len,
     const uint8_t *hi, size_t hi_len,
     uint32_t table_id, uint16_t index_id) {
-  return iter_keys(lo, lo_len, hi, hi_len, index_id_prefix(table_id, index_id));
+  return iter_keys({lo, lo_len}, {hi, hi_len},
+                   index_id_prefix(table_id, index_id));
 }
 
 std::unique_ptr<MariaDBTxn::MergeIterator> MariaDBTxn::riter_index_prefix(
     const uint8_t *hi, size_t hi_len,
     const uint8_t *lo, size_t lo_len,
     uint32_t table_id, uint16_t index_id) {
-  return riter_keys(hi, hi_len, lo, lo_len, index_id_prefix(table_id, index_id));
+  return riter_keys({hi, hi_len}, {lo, lo_len},
+                    index_id_prefix(table_id, index_id));
+}
+
+int MariaDBTxn::engine_error(const bytecask::sql::CommitOutcome &out) {
+  // A refusal that threw nothing is reported as it always was: the error
+  // code alone.
+  if (out.error) {
+    const char *what = out.in_bulk_flush ? "bulk flush" : "commit";
+    abort_if_degraded(db(), what);
+    try {
+      std::rethrow_exception(out.error);
+    } catch (const std::exception &e) {
+      fprintf(stderr, "[bytecaskdb] %s failed: %s\n", what, e.what());
+    } catch (...) {
+    }
+  }
+  return HA_ERR_INTERNAL_ERROR;
 }
 
 int MariaDBTxn::commit(THD * /*thd*/, bool all) {
   const auto out = Transaction::commit(all, plugin_sync_at_commit());
-  int rc = 0;
   switch (out.status) {
   case Status::Committed:
-    break;
+    return 0;
   case Status::Conflict:
     my_error(ER_LOCK_DEADLOCK, MYF(0));
-    rc = HA_ERR_LOCK_DEADLOCK;
-    break;
+    return HA_ERR_LOCK_DEADLOCK;
   case Status::DuplicateKey:
-    report_deferred_dup_key(out);
-    rc = HA_ERR_FOUND_DUPP_KEY;
-    break;
+    if (!out.duplicate_reported) {
+      // No handler (or no identifiable key): same error code the server
+      // uses, with the WITH_KEY_NAME wording and no rendered value. The
+      // format is a literal on purpose: the server's message table is
+      // reached through THD members, and this plugin's view of THD
+      // (sql_class.h without WITH_WSREP) does not match the server's
+      // layout, so only exported functions may take a THD. ER_DUP_ENTRY's
+      // own format takes a key *index*, so it cannot be paired with a key
+      // name.
+      my_printf_error(ER_DUP_ENTRY,
+                      "Duplicate entry '%-.192s' for key '%-.192s'", MYF(0),
+                      "", "PRIMARY");
+    }
+    return HA_ERR_FOUND_DUPP_KEY;
   case Status::EngineError:
-    abort_if_degraded(db(), "commit");
-    log_engine_error("commit", out.error);
-    rc = HA_ERR_INTERNAL_ERROR;
-    break;
+    return engine_error(out);
   }
-  sync_deferred_handler();
-  return rc;
+  return HA_ERR_INTERNAL_ERROR;
 }
 
 void MariaDBTxn::rollback(THD * /*thd*/, bool all) {
   Transaction::rollback(all);
-  sync_deferred_handler();
-}
-
-void MariaDBTxn::sync_deferred_handler() {
-  if (!in_deferred_insert()) {
-    deferred_handler_ = nullptr;
-    deferred_reporter_ = nullptr;
-  }
-}
-
-void MariaDBTxn::report_deferred_dup_key(
-    const bytecask::sql::CommitOutcome &out) {
-  if (deferred_reporter_ && out.duplicate &&
-      deferred_reporter_(out.duplicate->key, out.duplicate->row)) {
-    return;
-  }
-  // No handler (or no identifiable key): same error code the server uses,
-  // with the WITH_KEY_NAME wording and no rendered value. The format is a
-  // literal on purpose: the server's message table is reached through THD
-  // members, and this plugin's view of THD (sql_class.h without WITH_WSREP)
-  // does not match the server's layout, so only exported functions may take
-  // a THD. ER_DUP_ENTRY's own format takes a key *index*, so it cannot be
-  // paired with a key name.
-  my_printf_error(ER_DUP_ENTRY, "Duplicate entry '%-.192s' for key '%-.192s'",
-                  MYF(0), "", "PRIMARY");
-}
-
-void MariaDBTxn::track_row_count_delta(uint32_t table_id,
-                                       std::atomic<int64_t> *row_count,
-                                       int64_t delta) {
-  Transaction::track_row_count_delta(
-      table_id, row_count ? *row_count : *catalog_row_count_ptr(table_id),
-      delta);
 }
 
 int MariaDBTxn::bulk_flush(bool sync) {
   const auto out = Transaction::bulk_flush(sync);
-  if (out.status == Status::Committed) { return 0; }
-  if (out.error) {
-    abort_if_degraded(db(), "bulk flush");
-    log_engine_error("bulk flush", out.error);
-  }
-  return HA_ERR_INTERNAL_ERROR;
+  return out.status == Status::Committed ? 0 : engine_error(out);
 }
 
 void MariaDBTxn::savepoint_set(void *sv) {

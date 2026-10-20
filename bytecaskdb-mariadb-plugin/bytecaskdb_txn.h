@@ -10,6 +10,9 @@
 // server's slots, and names tables and indexes by id in the plugin's key
 // layout. Buffering, RYOW reads, the merge iterators, OCC commit, savepoints,
 // deferred-insert guards and bulk-copy mode are the base class's.
+//
+// The base is private, so every call goes through this adapter: a
+// MariaDBTxn does not convert to a Transaction outside it.
 
 #pragma once
 
@@ -20,7 +23,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <vector>
 
@@ -32,13 +34,27 @@ namespace bytecaskdb {
 
 class ha_bytecaskdb;
 
-class MariaDBTxn : public bytecask::sql::Transaction {
+class MariaDBTxn : private bytecask::sql::Transaction {
 public:
+  using Transaction::MergeIterator;
+
   explicit MariaDBTxn(bytecask::DB *db);
 
   // Acquires snapshot if not held, registers with MariaDB's transaction
   // coordinator via trans_register_ha.
   void begin_if_needed(THD *thd, handlerton *hton);
+
+  using Transaction::is_active;
+  using Transaction::has_state;
+
+  void buffer_put(const uint8_t *key, size_t klen,
+                  const uint8_t *val, size_t vlen,
+                  bool guard_absent = false) {
+    Transaction::buffer_put({key, klen}, {val, vlen}, guard_absent);
+  }
+  void buffer_del(const uint8_t *key, size_t klen) {
+    Transaction::buffer_del({key, klen});
+  }
 
   // Enter deferred-dup-check mode for a plain autocommit INSERT (see
   // Transaction::begin_deferred_insert). A commit conflict on such a plan is
@@ -47,23 +63,31 @@ public:
   // needs. The handler stays registered for the rest of the statement:
   // commit runs before the statement's tables are unlocked, and the handler
   // deregisters itself on unlock/close in case that order is ever different.
-  // Cleared when the transaction leaves deferred mode.
-  // Returns true if it reported the error; false to fall back to the
-  // generic report (the key belongs to a table the reporter does not own).
-  // Given the duplicate key and the row the INSERT tried to write with it.
-  using DupKeyReporter = std::function<bool(const std::vector<uint8_t> &pk,
-                                            const std::vector<uint8_t> &row)>;
+  // The reporter returns true if it reported the error; false to fall back
+  // to the generic report (the key belongs to a table it does not own).
+  using DupKeyReporter = DuplicateReporter;
+  using Transaction::in_deferred_insert;
   void begin_deferred_insert(const ha_bytecaskdb *handler,
                              DupKeyReporter reporter) {
-    Transaction::begin_deferred_insert();
-    deferred_handler_ = handler;
-    deferred_reporter_ = std::move(reporter);
+    Transaction::begin_deferred_insert(handler, std::move(reporter));
   }
   void forget_deferred_handler(const ha_bytecaskdb *handler) {
-    if (deferred_handler_ == handler) {
-      deferred_handler_ = nullptr;
-      deferred_reporter_ = nullptr;
-    }
+    forget_deferred_reporter(handler);
+  }
+  bool buffered_key_present(const uint8_t *key, size_t klen) const {
+    return Transaction::buffered_key_present({key, klen});
+  }
+
+  // Returns 1 if found (writes to out), 0 if not found, -1 on error.
+  int get(const uint8_t *key, size_t klen, bytecask::Bytes &out) {
+    return Transaction::get({key, klen}, out);
+  }
+  bool exists(const uint8_t *key, size_t klen) {
+    return Transaction::exists({key, klen});
+  }
+  std::size_t count_range(const uint8_t *lo, size_t lo_len,
+                          const uint8_t *hi, size_t hi_len, std::size_t limit) {
+    return Transaction::count_range({lo, lo_len}, {hi, hi_len}, limit);
   }
 
   // Merge iterators over [lo, hi) of a table's rows or one of its
@@ -100,26 +124,41 @@ public:
   void savepoint_rollback(void *sv);
   void savepoint_release(void *sv);
 
-  // A null `row_count` names the table's catalog counter.
+  // `row_count` is the table's catalog counter, or null to look it up.
   void track_row_count_delta(uint32_t table_id,
                              std::atomic<int64_t> *row_count,
-                             int64_t delta);
+                             int64_t delta) {
+    Transaction::track_row_count_delta(table_id, delta, row_count);
+  }
+
+  using Transaction::begin_bulk_copy;
+  using Transaction::in_bulk_copy;
+  using Transaction::end_bulk_copy;
+  using Transaction::abort_bulk_copy;
+  using Transaction::bulk_should_flush;
+
+  void bulk_buffer_put(const uint8_t *key, std::size_t klen,
+                       const uint8_t *val, std::size_t vlen) {
+    Transaction::bulk_buffer_put({key, klen}, {val, vlen});
+  }
+  void bulk_note_key(const uint8_t *key, std::size_t klen) {
+    Transaction::bulk_note_key({key, klen});
+  }
+  bool bulk_pk_exists(const uint8_t *key, std::size_t klen) {
+    return Transaction::bulk_pk_exists({key, klen});
+  }
+  bool bulk_unique_prefix_exists(const uint8_t *prefix, std::size_t plen) {
+    return Transaction::bulk_unique_prefix_exists({prefix, plen});
+  }
 
   // Commits the pending bulk-copy batch. Returns 0, or HA_ERR_INTERNAL_ERROR
   // on engine failure.
   int bulk_flush(bool sync);
 
 private:
-  // Clears the handler once the base class has left deferred mode.
-  void sync_deferred_handler();
-
-  // Raises ER_DUP_ENTRY for a deferred insert's duplicate through the
-  // registered handler (with the key value) or, without one, with an empty
-  // value.
-  void report_deferred_dup_key(const bytecask::sql::CommitOutcome &out);
-
-  const ha_bytecaskdb *deferred_handler_{nullptr};  // identity only
-  DupKeyReporter deferred_reporter_;
+  // Logs an engine error and aborts if it left the engine degraded, as the
+  // plugin does for every engine write; returns HA_ERR_INTERNAL_ERROR.
+  int engine_error(const bytecask::sql::CommitOutcome &out);
 };
 
 } // namespace bytecaskdb

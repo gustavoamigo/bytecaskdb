@@ -217,9 +217,9 @@ MariaDB calls `external_lock(F_WRLCK)` when a statement begins and
 `COMMIT` / `ROLLBACK` come through `hton->commit` / `hton->rollback`.
 
 `MariaDBTxn` sits in the per-THD slot (`thd_get_ha_data` / `thd_set_ha_data`)
-and handles all of this. It derives from the SQL layer's
+and handles all of this. It derives privately from the SQL layer's
 `bytecask::sql::Transaction` (`bytecaskdb-sql-layer/txn/`), which holds every
-mechanism below; `MariaDBTxn` adds the registration with the server's
+mechanism below, so every call goes through the adapter; `MariaDBTxn` adds the registration with the server's
 coordinator, the mapping of a commit outcome to an `HA_ERR_*` code and the
 server's error, the savepoint slots, and table and index ids in the plugin's
 key layout.
