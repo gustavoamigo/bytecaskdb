@@ -148,8 +148,8 @@ public:
   // Test only (sql_layer_testing): every row of a table, in primary-key
   // order, read from the engine and decoded through the catalog: every
   // column, in the table's order. For the proof tests, which compare a table
-  // with the oracle's; SQL has no full scan. Throws std::invalid_argument for
-  // a table that does not exist.
+  // with the oracle's; SQL has no full scan. Throws ast::SqlError for a
+  // table that does not exist, as a statement naming it would.
   [[nodiscard]] auto table_rows(std::string_view table) const -> Rows;
 #endif
 
@@ -381,7 +381,7 @@ auto Database::table_rows(std::string_view table) const -> Rows {
   check_open();
   auto [cat, snap] = live_->pin();
   const auto* t = cat->table(table);
-  if (t == nullptr) throw std::invalid_argument("relation \"" + std::string{table} + "\" does not exist");
+  if (t == nullptr) throw ast::SqlError("relation \"" + std::string{table} + "\" does not exist", -1);
   Rows out;
   // The table's layout with its slots in column order: decode_row reads
   // them in that order. A column a row's bitmap has no bit for reads as NULL.

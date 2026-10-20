@@ -289,14 +289,14 @@ TEST_CASE("embedded API: a unique index refuses duplicates, treats nulls as dist
   // duplicate it would hold: BC_C_UNIQUE with the index's id (23505).
   (void)db->execute(kIns, {i(8), bytes("q"), i(1)});
   (void)db->execute(kIns, {i(9), bytes("r"), i(1)});
-  auto next_id = static_cast<std::uint32_t>(db->catalog()->next_object_id());
+  auto table_id = db->catalog()->table("c")->id;
   try {
     (void)db->execute("CREATE UNIQUE INDEX c_w ON c (w)");
     FAIL("a unique index over duplicates was created");
   } catch (const ExecError& e) {
     REQUIRE(e.constraint());
     CHECK(e.constraint()->constraint == BC_C_UNIQUE);
-    CHECK(e.constraint()->object_id == next_id);
+    CHECK(e.constraint()->object_id == table_id);  // the index never existed: its id is the next DDL's
   }
   CHECK(db->catalog()->index("c_w").second == nullptr);
   db->close();
@@ -463,7 +463,7 @@ TEST_CASE("embedded API: table_rows reads a table in key order; errors carry the
   check_rows(*db);
   auto sel = db->execute("SELECT c, a FROM t WHERE a = $1 AND b = $2", {i(1), bytes("b")});
   CHECK(sel.types == std::vector<SqlType>{SqlType{SqlKind::Varchar, 4}, SqlType{SqlKind::BigInt}});
-  CHECK_THROWS_AS(db->table_rows("nope"), std::invalid_argument);
+  CHECK_THROWS_AS(db->table_rows("nope"), ast::SqlError);
   db->close();
   // Every call after close() is refused, as the engine's are; close() again is not.
   CHECK_THROWS_AS(db->execute(kIns, {i(9), bytes("q")}), bytecask::DbClosed);
@@ -481,8 +481,7 @@ TEST_CASE("embedded API: table_rows reads a table in key order; errors carry the
   // two bytes, little-endian) is rewritten through the engine.
   {
     auto engine = bytecask::DB::open(dir.path());
-    Bytes prefix;
-    key_put_prefix(prefix, kNsRow, table_id);
+    auto prefix = row_prefix(table_id);
     Bytes key, row;
     for (const auto& e : engine.iter_from({}, prefix)) {
       key.assign(e.key.begin(), e.key.end());

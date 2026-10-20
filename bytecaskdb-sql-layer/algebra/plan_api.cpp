@@ -490,8 +490,9 @@ struct bc_ctx {
   void raise(std::uint32_t constraint, std::uint32_t object_id, std::string msg = {}) {
     if (!ok()) return;
     ConstraintDetail d{constraint, object_id};
+    auto encoded = d.encode();  // may throw: before the error is set
     fail(BC_E_CONSTRAINT, msg.empty() ? d.message() : std::move(msg));
-    detail = d.encode();
+    detail = encoded;
   }
 
   void drop_execution_state() {
@@ -2359,7 +2360,7 @@ void bc_raise(bc_ctx* cx, uint32_t constraint, uint32_t object_id) {
   if (!cx->ok()) return;
   // The detail holds the kind in 8 bits and the id in 24: anything wider would
   // name another constraint or object.
-  if (constraint < BC_C_UNIQUE || constraint > BC_C_RANGE || object_id > ConstraintDetail::kMaxObjectId) {
+  if (!ConstraintDetail{constraint, object_id}.valid()) {
     cx->fail(BC_E_HANDLE, "bc_raise with an unknown constraint kind or an object id past 2^24");
     return;
   }
