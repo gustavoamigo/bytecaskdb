@@ -1981,9 +1981,8 @@ bool bc_col_null(bc_ctx* cx, bc_view row, uint32_t col) {
   BC_GUARD_BEGIN
   auto rc = row_col(cx, row, col, std::nullopt);
   if (!rc) return true;
-  // The bit and whether the row holds the column, not its value: a plan
-  // tests null before a typed read, which decodes it (and reports a
-  // var_end past the row), so the value is not decoded twice.
+  // Classified as row_column classifies it, damage included, without
+  // copying the value: a plan tests null before a typed read.
   switch (bytecask::sql::row_column_state(rc->row, col, rc->slot->type, rc->slot->pos)) {
     case bytecask::sql::ColumnState::Absent: return true;
     case bytecask::sql::ColumnState::Value: return false;
@@ -2042,13 +2041,29 @@ bc_view bc_row_key(bc_ctx* cx, uint32_t table, bc_view row) {
 
 namespace {
 // A builder of table t's current layout with every column null, pushed on
-// the run's rows; its writer is filled by the caller, which pops it again
-// if filling it fails, so a refused bc_row names no half-built row.
-auto push_builder(bc_ctx* cx, const Table& t) -> RowWriter& {
-  cx->rows.push_back(RowBuilder{t.id, &t.layout, RowWriter{t.layout}, false});
-  return cx->rows.back().writer;
-}
-auto last_row(bc_ctx* cx) -> bc_row { return {static_cast<std::uint32_t>(cx->rows.size() - 1), cx->epoch}; }
+// the run's rows for the caller to fill. It is popped again unless the
+// caller keeps it: a refusal, or an exception while filling it (bad_alloc
+// in set_datum or copy_from), leaves no half-built row behind.
+class PushedBuilder {
+public:
+  PushedBuilder(bc_ctx* cx, const Table& t) : cx_{cx} {
+    cx_->rows.push_back(RowBuilder{t.id, &t.layout, RowWriter{t.layout}, false});
+  }
+  PushedBuilder(const PushedBuilder&) = delete;
+  auto operator=(const PushedBuilder&) -> PushedBuilder& = delete;
+  ~PushedBuilder() {
+    if (!kept_) cx_->rows.pop_back();
+  }
+  auto writer() -> RowWriter& { return cx_->rows.back().writer; }
+  auto keep() -> bc_row {
+    kept_ = true;
+    return {static_cast<std::uint32_t>(cx_->rows.size() - 1), cx_->epoch};
+  }
+
+private:
+  bc_ctx* cx_;
+  bool kept_{false};
+};
 }  // namespace
 
 bc_row bc_row_begin(bc_ctx* cx, uint32_t table) {
@@ -2057,15 +2072,15 @@ bc_row bc_row_begin(bc_ctx* cx, uint32_t table) {
   if (t == nullptr) return {};
   // Every column at its default, so a plan compiled before ADD COLUMN …
   // DEFAULT writes the default without naming the column.
-  auto& w = push_builder(cx, *t);
+  PushedBuilder b{cx, *t};
   for (const auto& c : t->columns) {
-    if (!std::holds_alternative<std::monostate>(c.default_value) && !bytecask::sql::set_datum(w, c.id, c.default_value)) {
-      cx->rows.pop_back();
+    if (!std::holds_alternative<std::monostate>(c.default_value) &&
+        !bytecask::sql::set_datum(b.writer(), c.id, c.default_value)) {
       cx->fail(BC_E_CORRUPT, "default of column " + c.name + " does not fit its layout");
       return {};
     }
   }
-  return last_row(cx);
+  return b.keep();
   BC_GUARD_END(cx)
   return {};
 }
@@ -2081,12 +2096,12 @@ bc_row bc_row_from(bc_ctx* cx, uint32_t table, bc_view old) {
     return {};
   }
   // No defaults: the copy sets every column of the layout, present or not.
-  if (!push_builder(cx, *t).copy_from(*o)) {
-    cx->rows.pop_back();
+  PushedBuilder b{cx, *t};
+  if (!b.writer().copy_from(*o)) {
     cx->fail(BC_E_CORRUPT, "malformed row: a column does not decode");
     return {};
   }
-  return last_row(cx);
+  return b.keep();
   BC_GUARD_END(cx)
   return {};
 }

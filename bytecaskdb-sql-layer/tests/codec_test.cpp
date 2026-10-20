@@ -437,6 +437,16 @@ TEST_CASE("row format: every physical type round-trips, null or not", "[sql][cod
   CHECK_FALSE(w.set_null(9));
 }
 
+namespace {
+// The little-endian word at `at`, read from the row's bytes directly: what
+// finish stored, whatever the bitmap says.
+auto load_le_test(const Bytes& row, std::size_t at) -> std::uint64_t {
+  std::uint64_t v = 0;
+  for (std::size_t i = 0; i < 8; ++i) v |= std::uint64_t{std::to_integer<std::uint8_t>(row[at + i])} << (8 * i);
+  return v;
+}
+}  // namespace
+
 TEST_CASE("row format: a row shorter than the layout reads as null, in both directions", "[sql][codec]") {
   const std::array<ColumnDef, 2> old_defs{{{0, plain_sql_type(PhysType::I64), false}, {1, plain_sql_type(PhysType::Bytes), true}}};
   auto old_layout = make_layout(old_defs);
@@ -517,6 +527,39 @@ TEST_CASE("row format: a row shorter than the layout reads as null, in both dire
   REQUIRE(prefilled.finish(from_prefilled));
   CHECK(from_prefilled == copied);
   CHECK(from_prefilled.size() < 1000);
+
+  // A value set and then set null, as bc_row_begin's DEFAULT then
+  // bc_row_set_null: the row carries neither its bytes nor its word.
+  RowWriter nulled{new_layout};
+  REQUIRE(nulled.set_i64(0, 5));
+  REQUIRE(nulled.set_bytes(3, Bytes(1000, std::byte{'d'})));
+  REQUIRE(nulled.set_i64(2, 77));
+  REQUIRE(nulled.set_null(3));
+  REQUIRE(nulled.set_null(2));
+  Bytes nulled_row;
+  REQUIRE(nulled.finish(nulled_row));
+  CHECK(nulled_row.size() < 1000);
+  CHECK(row_column(nulled_row, *new_layout.find(3)).state == ColumnState::Absent);
+  CHECK(load_le_test(nulled_row, new_layout.find(2)->pos) == 0);
+
+  // One writer, two rows: the second lacks a column the first had, and
+  // carries none of it.
+  RowWriter reused{new_layout};
+  RowWriter full{new_layout};
+  REQUIRE(full.set_i64(0, 1));
+  REQUIRE(full.set_bytes(1, Bytes{std::byte{'a'}}));
+  REQUIRE(full.set_i64(2, 2));
+  REQUIRE(full.set_bytes(3, Bytes(1000, std::byte{'z'})));
+  Bytes full_row;
+  REQUIRE(full.finish(full_row));
+  REQUIRE(reused.copy_from(full_row));
+  Bytes first;
+  REQUIRE(reused.finish(first));
+  CHECK(first == full_row);
+  REQUIRE(reused.copy_from(old_row));
+  Bytes second;
+  REQUIRE(reused.finish(second));
+  CHECK(second == copied);
 }
 
 TEST_CASE("row format: the bitmap is sized at create and has a ceiling", "[sql][codec]") {

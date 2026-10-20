@@ -540,9 +540,8 @@ is `BC_E_HANDLE` and a neutral value; a row that does not parse is
 
 ```c
 bool     bc_col_null(bc_ctx *, bc_view row, uint32_t col);   /* the bitmap bit: clear means null, or a column the row predates;
-                                                                set for a column the row does not hold, BC_E_CORRUPT. It
-                                                                does not read the value: a value running past the row is
-                                                                BC_E_CORRUPT from the read that follows, not from here */
+                                                                set for a column the row does not hold, or whose value
+                                                                runs past the row, BC_E_CORRUPT */
 int64_t  bc_col_i64(bc_ctx *, bc_view row, uint32_t col);
 double   bc_col_f64(bc_ctx *, bc_view row, uint32_t col);
 bool     bc_col_bool(bc_ctx *, bc_view row, uint32_t col);
@@ -563,7 +562,7 @@ bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: live
 
 | Function | What it does |
 |---|---|
-| `bc_col_null` | True if column `col`'s bit in the bitmap is clear. The bitmap says *present*: a column set null and a column the row predates both have the bit clear, so one test covers both (`docs/types_design.md`, *Row format*). A set bit for a column the row does not hold is `BC_E_CORRUPT`, as every column reader reports it. It reads the header, the bit and whether the row's regions hold the column, not the column's `var_end` entries, and a row fetched by `bc_get` or a scan has had only its header checked. So a present variable column whose `var_end` runs past the row, or out of order, is reported not null here, and `BC_E_CORRUPT` by the typed read that follows, which decodes it; a nullable column is not decoded twice. The compiler emits a null test only before a read of the same column (and in `UPDATE`, after `bc_row_from` has checked every `var_end` entry of the row). The compiler emits it before any decoder of a nullable column it computes with, and before any column added after the table was created. |
+| `bc_col_null` | True if column `col`'s bit in the bitmap is clear. The bitmap says *present*: a column set null and a column the row predates both have the bit clear, so one test covers both (`docs/types_design.md`, *Row format*). A set bit for a column the row does not hold, or a variable column whose two `var_end` words are out of order or past the row, is `BC_E_CORRUPT`, as every column reader reports it; the value itself is not copied, so a null test before a read does not decode the column twice. The compiler emits it in one place: an `UPDATE` that assigns from a nullable column (`SET c = src`, `SET c = src - $n`), before it reads `src`. |
 | `bc_col_i64`, `bc_col_f64`, `bc_col_bool` | Loads the 8-byte column. A null column, or one a shorter row predates, reads as zero; `bc_col_null` decides first and reports both as null. A column marked present that the row does not hold is `BC_E_CORRUPT`. Little-endian in the row. |
 | `bc_col_bytes` | The variable-length column, as a view with the row's lifetime. A column marked present whose slot the row does not hold, or whose `var_end` runs past the row, is `BC_E_CORRUPT`. |
 | `bc_row_key` | The table's full primary key (namespace, table id, parts), encoded from the row's columns: for a `bc_get`, a guard, or a scan bound reached from a row. Built in the arena. |
