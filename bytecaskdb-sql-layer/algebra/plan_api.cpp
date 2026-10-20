@@ -1238,23 +1238,23 @@ void bc_ctx_begin(bc_ctx* cx, const bc_params* params, bc_budget budget) {
   BC_GUARD_END(cx)
 }
 
-bool bc_ctx_check(bc_ctx* cx, const bc_schema_ref* compiled_against) {
+bool bc_ctx_check(bc_ctx* cx, const bc_schema_ref* checked_against) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return false;
   if (!cx->snap) {
     cx->fail(BC_E_HANDLE, "bc_ctx_check or bc_ctx_run without bc_ctx_begin");
     return false;
   }
-  (void)use_ref(cx, compiled_against);
+  (void)use_ref(cx, checked_against);
   return cx->ok();
   BC_GUARD_END(cx)
   return {};
 }
 
-void bc_ctx_run(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* compiled_against) {
+void bc_ctx_run(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* checked_against) {
   BC_GUARD_BEGIN
   cx->affected = -1;  // the count is the run's: a failed run reports none
-  if (!bc_ctx_check(cx, compiled_against)) return;
+  if (!bc_ctx_check(cx, checked_against)) return;
   plan(cx);
   if (cx->ok() && cx->emit) cx->fail(BC_L_PLAN, "result row begun and not ended");
   BC_GUARD_END(cx)

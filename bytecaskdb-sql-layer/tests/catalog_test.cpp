@@ -328,7 +328,8 @@ TEST_CASE("catalog: every DDL survives a reopen", "[sql][catalog]") {
     put_t_row(db, *live.current(), 2, "amy", 20);
   });
   reopen([](DB& db, LiveCatalog& live) {
-    const auto& t = *live.current()->table("t");
+    auto cat = live.current();  // held: t points into it, across the DDL below
+    const auto& t = *cat->table("t");
     CHECK(t.id == 1);
     CHECK(t.layout_id == 2);
     CHECK_FALSE(t.column("id")->nullable);  // a primary key column is never null
@@ -366,12 +367,14 @@ TEST_CASE("catalog: every DDL survives a reopen", "[sql][catalog]") {
     // ADD COLUMN with a default rewrites the rows; positions do not move.
     auto qty_pos = t.layout.find(t.column("qty")->id)->pos;
     (void)live.apply(AddColumnDdl{"t", col("tag", SqlKind::Integer, false, std::int64_t{7})});
-    const auto& t2 = *live.current()->table("t");
+    auto cat2 = live.current();  // held: t2 points into it
+    const auto& t2 = *cat2->table("t");
     CHECK(t2.layout.find(t2.column("qty")->id)->pos == qty_pos);
     CHECK(t2.layout_id == t.layout_id);
   });
   reopen([](DB& db, LiveCatalog& live) {
-    const auto& t = *live.current()->table("t");
+    auto cat = live.current();  // held: t points into it
+    const auto& t = *cat->table("t");
     REQUIRE(t.column("tag") != nullptr);
     CHECK(t.column("tag")->id == 3);
     CHECK(t.next_col_id == 4);

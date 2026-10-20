@@ -178,6 +178,26 @@ auto scaled_decimal(std::string_view text, std::uint8_t scale) -> std::expected<
   return neg ? -v : v;
 }
 
+// A REAL or DOUBLE PRECISION DEFAULT parsed as its own type, so it is
+// rounded once, as PostgreSQL's float4in and float8in round: a REAL parsed
+// through a double would round twice near a float midpoint. So the catalog
+// holds what a row stores. A literal that overflows, or underflows to zero,
+// is out of range, as there; one that rounds to a denormal is kept.
+template <typename T>
+auto parse_number(const ast::Literal& l, SqlType t) -> double {
+  using K = ast::Literal::Kind;
+  if (l.kind != K::Integer && l.kind != K::Number) {
+    throw SqlError{"DEFAULT is not a constant of type " + sql_type_name(t), l.pos};
+  }
+  T v = 0;
+  auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
+  if (end != l.text.data() + l.text.size() || (ec != std::errc{} && ec != std::errc::result_out_of_range)) {
+    throw SqlError{"DEFAULT is not a constant of type " + sql_type_name(t), l.pos};
+  }
+  if (ec == std::errc::result_out_of_range) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
+  return static_cast<double>(v);
+}
+
 // A DEFAULT constant folded to the column's stored value.
 auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
   using K = ast::Literal::Kind;
@@ -201,29 +221,8 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
       if (!v || out_of_range(t, *v)) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
       return *v;
     }
-    case SqlKind::Real: {
-      // Parsed as a float, rounded once as PostgreSQL's float4in rounds:
-      // through a double, a literal near a float midpoint would round twice.
-      // The catalog then holds what a row stores. Overflow and underflow to
-      // zero are out of range, as there.
-      float v = 0;
-      if (l.kind != K::Integer && l.kind != K::Number) bad();
-      auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
-      if (end != l.text.data() + l.text.size()) bad();
-      if (ec == std::errc::result_out_of_range) {
-        throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
-      }
-      if (ec != std::errc{}) bad();
-      return static_cast<double>(v);
-    }
-    case SqlKind::Double: {
-      double v = 0;
-      if (l.kind != K::Integer && l.kind != K::Number) bad();
-      auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
-      if (ec != std::errc{} || end != l.text.data() + l.text.size()) bad();
-      if (out_of_range(t, v)) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
-      return v;
-    }
+    case SqlKind::Real: return parse_number<float>(l, t);
+    case SqlKind::Double: return parse_number<double>(l, t);
     case SqlKind::Boolean:
       if (l.kind != K::Bool) bad();
       return l.b;

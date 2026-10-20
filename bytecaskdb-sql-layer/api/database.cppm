@@ -203,7 +203,9 @@ private:
   bc_ctx* cx_{nullptr};
   std::map<std::string, std::unique_ptr<Statement>, std::less<>> cache_;
   std::uint64_t compilations_{0};
+#ifdef BYTECASK_SQL_TESTING
   std::uint64_t plan_checks_{0};
+#endif
   bool closed_{false};
 };
 
@@ -386,7 +388,9 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   // per catalog version, not on every run after a DDL. The runtime pins that
   // version or a later one: a later one is checked again next time.
   if (auto version = live_->current()->version(); stmt.ref_.catalog_version != version) {
+#ifdef BYTECASK_SQL_TESTING
     ++plan_checks_;
+#endif
     bc_ctx_begin(cx_, &bp, {});
     auto fits = bc_ctx_check(cx_, &stmt.ref_);
     auto stale = !fits && bc_error(cx_) == BC_E_LAYOUT && bc_error_detail(cx_) == BC_L_INCOMPATIBLE;

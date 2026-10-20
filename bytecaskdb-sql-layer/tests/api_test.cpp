@@ -213,6 +213,16 @@ TEST_CASE("embedded API: a cached plan is checked once per catalog version", "[s
   for (int k = 0; k < 3; ++k) (void)db->execute(by_k, {i(1)});
   CHECK(db->plan_checks_for_testing() == 2);
   CHECK(db->compilations() == compiled);
+  // A plan marked as fitting is checked again after a DDL that breaks it,
+  // recompiled, and runs on the new table.
+  (void)db->execute("DROP TABLE t");
+  (void)db->execute("CREATE TABLE t (k BIGINT PRIMARY KEY, v BIGINT)");
+  (void)db->execute("INSERT INTO t VALUES ($1, $2)", {i(1), i(9)});
+  CHECK(db->execute(by_k, {i(1)}).rows == Grid{{i(9)}});
+  CHECK(db->plan_checks_for_testing() == 3);
+  CHECK(db->compilations() == compiled + 2);  // the INSERT's first compile, and by_k's recompile
+  CHECK(db->execute(by_k, {i(1)}).rows == Grid{{i(9)}});
+  CHECK(db->plan_checks_for_testing() == 3);
 }
 
 TEST_CASE("embedded API: a DOUBLE read through an index keeps -0.0", "[sql][api]") {

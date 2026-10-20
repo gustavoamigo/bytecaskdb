@@ -9,15 +9,20 @@
 // Values cross as Python values by the column's SQL type: integers as int,
 // DOUBLE PRECISION and REAL as float, BOOLEAN as bool, BYTEA as bytes, TEXT
 // and VARCHAR as str, DECIMAL as decimal.Decimal; the date and time types
-// as their stored integer. Parameters go by Python type: None, bool, int,
-// float, str (as UTF-8) and bytes.
+// as their stored integer. Parameters are a list or a tuple, and go by
+// Python type: None, bool, int (within BIGINT), float, str (as UTF-8, so
+// not one with a lone surrogate) and bytes. Any other params object, a str,
+// a buffer (bytes, bytearray, memoryview), a dict or a set among them, is
+// refused: its items are not the placeholders' values in order.
 //
 // Errors: bytecask_sql.ExecError for a plan that ran and failed, with its
 // code (a bc_error_code), conflict (true when every retry conflicted: code
-// is then BC_CONFLICT, the same number as BC_E_IO) and, for
-// BC_E_CONSTRAINT, the constraint kind and the object id; bytecask_sql.SqlError
-// for a statement the layer refuses before it runs (parse and bind errors,
-// a DDL the catalog refuses, parameters of the wrong number or type);
+// is then BC_CONFLICT, the same number as BC_E_IO), and constraint and
+// object_id: for BC_E_CONSTRAINT with a known kind, the kind's name
+// ("unique", "not_null", ...) and the table's or index's id; otherwise both
+// None. bytecask_sql.SqlError for a statement the layer refuses before it
+// runs (parse and bind errors, a DDL the catalog refuses, parameters of the
+// wrong number or type, a params object that is not a list or tuple);
 // bytecask_sql.Closed, also a ValueError, for any call after close(). All
 // derive from bytecask_sql.Error. Anything else, an engine refusal at run
 // time included, is nanobind's translation of the C++ exception.
@@ -70,12 +75,10 @@ void raise_exec_error(const sql::ExecError& e) {
   exc.attr("object_id") = nb::none();
   // Both or neither: an object id without a known constraint kind is
   // nothing a caller can read.
-  if (auto c = e.constraint()) {
+  if (auto c = e.constraint(); c && c->valid()) {
     auto name = c->name();
-    if (!name.empty()) {
-      exc.attr("constraint") = nb::str(name.data(), name.size());
-      exc.attr("object_id") = c->object_id;
-    }
+    exc.attr("constraint") = nb::str(name.data(), name.size());
+    exc.attr("object_id") = c->object_id;
   }
   PyErr_SetObject(exceptions.exec_error.ptr(), exc.ptr());
 }
@@ -190,12 +193,11 @@ auto catalog(const sql::Database& db) -> nb::list {
 auto execute(sql::Database& db, std::string_view text, const nb::object& params) -> nb::dict {
   // A closed database is Closed whatever the parameters are.
   if (!db.is_open()) throw bytecask::DbClosed();
-  // A str, or a buffer (bytes, bytearray, memoryview), is a sequence of
-  // characters or ints: never parameters. A dict or set is not a sequence:
-  // its order is not the placeholders'.
-  if (nb::isinstance<nb::str>(params) || PyObject_CheckBuffer(params.ptr()) != 0 ||
-      PySequence_Check(params.ptr()) == 0) {
-    throw sql::ParamError("params is a sequence of parameters, such as a tuple or list");
+  // Only a list or a tuple: a str, a buffer, a UserString or an
+  // array.array is a sequence of characters or ints, never parameters, and
+  // a dict or set has no placeholder order.
+  if (!nb::isinstance<nb::list>(params) && !nb::isinstance<nb::tuple>(params)) {
+    throw sql::ParamError("params is a list or tuple of parameters");
   }
   std::vector<sql::Value> values;
   for (auto p : params) values.push_back(to_datum(p, values.size()));

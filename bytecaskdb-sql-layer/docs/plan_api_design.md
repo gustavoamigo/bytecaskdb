@@ -304,11 +304,11 @@ typedef struct bc_params bc_params;
    column id, and its bc_type. No position: the runtime finds that. */
 typedef struct { uint32_t table, col; uint8_t type; } bc_col_ref;
 
-/* What a plan was compiled against, and the types of the rows it emits, in
-   emit order. bc_ctx_run checks the objects and columns against the pinned
-   catalog version (docs/catalog_design.md, *Compatibility*) on
-   every run; the result layout is the plan's own and is not a catalog
-   object. */
+/* What a plan was compiled or last checked against, and the types of the
+   rows it emits, in emit order. bc_ctx_run checks the objects and columns
+   against the pinned catalog version (docs/catalog_design.md,
+   *Compatibility*) on every run; the result layout is the plan's own and
+   is not a catalog object. */
 typedef struct {
   uint64_t catalog_version;                                     /* compiled or last checked against; for messages */
   const uint32_t   *objects_read;    uint32_t n_read;           /* tables and indexes it names */
@@ -358,8 +358,8 @@ Called by the server, never by a plan.
 bc_ctx *bc_ctx_new(bc_db *db, const bc_catalog *cat, uint32_t arena_bytes);
 void    bc_ctx_free(bc_ctx *);
 void    bc_ctx_begin(bc_ctx *, const bc_params *params, bc_budget budget);  /* takes the snapshot */
-void    bc_ctx_run(bc_ctx *, bc_plan_fn plan, const bc_schema_ref *compiled_against);
-bool    bc_ctx_check(bc_ctx *, const bc_schema_ref *compiled_against);      /* bc_ctx_run's verification alone */
+void    bc_ctx_run(bc_ctx *, bc_plan_fn plan, const bc_schema_ref *checked_against);
+bool    bc_ctx_check(bc_ctx *, const bc_schema_ref *checked_against);      /* bc_ctx_run's verification alone */
 enum bc_commit_result bc_ctx_commit(bc_ctx *, bool sync);
 bool    bc_ctx_next_result(bc_ctx *, const uint8_t **row, uint32_t *len);     /* result rows, in emit order */
 void    bc_ctx_reset(bc_ctx *);                                               /* drops snapshot, plan, arena */

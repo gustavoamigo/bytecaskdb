@@ -400,8 +400,8 @@ auto RowWriter::set_i64(std::uint32_t col_id, std::int64_t v) -> bool {
 
 auto RowWriter::set_f64(std::uint32_t col_id, double v) -> bool {
   // A REAL column stores its float rounding, as PostgreSQL stores a float4.
-  // The one place a row's REAL value is rounded: a DEFAULT is parsed as a
-  // float, so the catalog holds it already rounded, and this leaves it as is.
+  // Every value written to a REAL column passes here. A DEFAULT, parsed as
+  // a float by the binder, is already its own rounding and passes unchanged.
   auto i = index_of(col_id, PhysType::F64);
   if (!i) return false;
   if (layout_->columns[*i].sql.kind == SqlKind::Real) v = float_rounding(v);
