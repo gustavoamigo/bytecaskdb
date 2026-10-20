@@ -64,10 +64,10 @@ struct ConstraintDetail {
   [[nodiscard]] static constexpr auto decode(std::uint32_t detail) -> ConstraintDetail {
     return {detail >> 24, detail & kMaxObjectId};
   }
-  // Throws std::out_of_range for a kind or an id wider than its field, which
-  // would name another constraint or object (bc_raise refuses the same).
-  [[nodiscard]] constexpr auto encode() const -> std::uint32_t {
-    if (constraint > 0xFFu || object_id > kMaxObjectId) throw std::out_of_range("constraint detail field too wide");
+  // Throws std::out_of_range for a detail that is not valid(): a kind
+  // bc_plan.h does not define, or an id wider than its 24 bits.
+  [[nodiscard]] auto encode() const -> std::uint32_t {
+    if (!valid()) throw std::out_of_range("constraint kind unknown or object id past 2^24");
     return (constraint << 24) | object_id;
   }
   // "unique", "not_null", "check", "foreign_key" or "range"; empty for a

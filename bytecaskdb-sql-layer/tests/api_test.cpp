@@ -447,6 +447,8 @@ TEST_CASE("embedded API: table_rows reads a table in key order; errors carry the
   // A field wider than its bits would name another constraint or object.
   constexpr ConstraintDetail kWideId{BC_C_UNIQUE, ConstraintDetail::kMaxObjectId + 1};
   constexpr ConstraintDetail kWideKind{0x100, 1};
+  constexpr ConstraintDetail kUnknownKind{99, 1};  // fits the byte, but bc_plan.h defines no such kind
+  CHECK_THROWS_AS((void)kUnknownKind.encode(), std::out_of_range);
   CHECK_THROWS_AS((void)kWideId.encode(), std::out_of_range);
   CHECK_THROWS_AS((void)kWideKind.encode(), std::out_of_range);
   CHECK(constraint_of("INSERT INTO t VALUES ($1, $2, $3)", {i(3), bytes("a"), kNull}) == BC_C_NOT_NULL);

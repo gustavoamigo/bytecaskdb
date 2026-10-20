@@ -168,6 +168,12 @@ auto catalog(const sql::Database& db) -> nb::list {
 }
 
 auto execute(sql::Database& db, std::string_view text, const nb::sequence& params) -> nb::dict {
+  // A closed database is Closed whatever the parameters are.
+  if (!db.is_open()) throw bytecask::DbClosed();
+  // A str or bytes is a sequence, of characters or ints: never parameters.
+  if (nb::isinstance<nb::str>(params) || nb::isinstance<nb::bytes>(params)) {
+    throw sql::ParamError("params is a sequence of parameters, not a str or bytes");
+  }
   std::vector<sql::Value> values;
   for (auto p : params) values.push_back(to_datum(p, values.size()));
   return to_python(db.execute(text, values));

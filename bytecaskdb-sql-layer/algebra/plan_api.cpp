@@ -488,9 +488,14 @@ struct bc_ctx {
   void raise(std::uint32_t constraint, std::uint32_t object_id, std::string msg = {}) {
     if (!ok()) return;
     ConstraintDetail d{constraint, object_id};
-    auto encoded = d.encode();  // may throw: before the error is set
+    // A kind or id the detail cannot hold is a caller's bug, as in bc_raise:
+    // BC_E_HANDLE, not a constraint and not corruption.
+    if (!d.valid()) {
+      fail(BC_E_HANDLE, "a constraint with an unknown kind or an object id past 2^24");
+      return;
+    }
     fail(BC_E_CONSTRAINT, msg.empty() ? d.message() : std::move(msg));
-    detail = encoded;
+    detail = d.encode();
   }
 
   void drop_execution_state() {

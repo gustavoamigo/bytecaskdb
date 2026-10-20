@@ -441,6 +441,32 @@ def test_parameters_and_tables_the_layer_refuses_are_sql_errors(tmp_path):
         db.close()
 
 
+def test_closed_and_misused_params(tmp_path):
+    db = bytecask_sql.open(str(tmp_path))
+    db.execute("CREATE TABLE t (k BIGINT PRIMARY KEY)")
+    for params in ("1", b"\x01"):  # a str or bytes is not a sequence of parameters
+        try:
+            db.execute("INSERT INTO t VALUES ($1)", params)
+        except bytecask_sql.SqlError:
+            pass
+        else:
+            raise AssertionError(f"{params!r} was taken as parameters")
+    db.close()
+    try:
+        db.execute("INSERT INTO t VALUES ($1)", (object(),))  # closed comes first
+    except bytecask_sql.Closed:
+        pass
+    else:
+        raise AssertionError("a closed database converted parameters")
+
+
+def test_placeholders_to_psycopg():
+    assert o.pg_params("SELECT 1", ()) == ("SELECT 1", None)
+    assert o.pg_params("SELECT $2, $1", ("a", "b")) == ("SELECT %s, %s", ["b", "a"])
+    # A % is escaped, and a $n inside a string literal is text.
+    assert o.pg_params("SELECT '50%', '$1 it''s', $1", (7,)) == ("SELECT '50%%', '$1 it''s', %s", [7])
+
+
 def test_rows_compare_by_type():
     assert o.strict([(True,)]) != o.strict([(1,)])
     assert o.strict([(1,)]) != o.strict([(1.0,)])
