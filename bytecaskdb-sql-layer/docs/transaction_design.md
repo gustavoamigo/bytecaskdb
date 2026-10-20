@@ -1,10 +1,18 @@
 # Transactions in the SQL layer
 
-Status: **design, for review (#491).** Nothing here is built. It decides how
-the layer runs several statements as one transaction, which the MVP needs:
-TPROC-C's New-Order is about thirty statements that read their own writes
-(#487, *MVP*). Each decision is marked **MVP** or **later**. Open questions
-are listed at the end, each with a recommendation.
+Status: **design, approved by the owner (2026-10-20, #491).** Nothing
+here is built yet. It decides how the layer runs several statements as one
+transaction, which the MVP needs: TPROC-C's New-Order is about thirty
+statements that read their own writes (#487, *MVP*). Each decision is
+marked **MVP** or **later**.
+
+## Two standing rules
+
+1. **Do what PostgreSQL does** whenever a behaviour has to be chosen.
+2. **Never wait.** The layer never blocks on another transaction, a lock or
+   a DDL. Where PostgreSQL's choice relies on waiting, the layer takes the
+   closest outcome that needs none, and the difference is listed under
+   *Known differences from PostgreSQL*.
 
 The layer gets a transaction engine of its own, built on the engine's
 primitives (`Snapshot`, `WritePlan`, `apply_batch`; the engine's
@@ -62,14 +70,25 @@ auto Database::begin(TransactionOptions = {}) -> Transaction;
 - **`Database::execute` stays autocommit,** a one-statement transaction
   retried as today.
 - **The snapshot is taken at the first statement,** not at `begin()`, as
-  `MariaDBTxn` did. An idle handle then pins nothing. The catalog version is
-  pinned with it (see *DDL*).
+  PostgreSQL's REPEATABLE READ takes it: "a query in a repeatable read
+  transaction sees a snapshot as of the start of the first
+  non-transaction-control statement in the transaction" (PostgreSQL 17
+  documentation, *Transaction Isolation*). An idle handle then pins
+  nothing. The catalog version is pinned with it (see *DDL*).
 - **`commit()` returns or throws.** A transaction with no writes and no
   guards commits nothing and returns.
+- **After a failed statement the transaction is aborted,** as in
+  PostgreSQL: every later `execute()` and `commit()` is refused with SQLSTATE
+  25P02 ("current transaction is aborted, commands ignored until end of
+  transaction block"), and only `rollback()` is accepted.
 - **After `commit()`, `rollback()` or a serialization failure,** the handle
   is closed; any further call throws.
 
 **Later:**
+- `BEGIN` / `COMMIT` / `ROLLBACK` as SQL text. The MVP has the handle
+  only, and `Database::execute("BEGIN")` is refused (0A000). Statement text
+  that opens a transaction needs per-session state, which principle 3 keeps
+  off the server, so it comes with the server;
 - the server's token form, where `BEGIN` returns a token naming a
   snapshot and a pending log held with a TTL, and statements carry it
   across requests on any thread (#494);
@@ -144,12 +163,13 @@ works as today: `BC_E_HANDLE`, or `BC_C_UNIQUE` for a second insert of one
 key. A later statement may write a row an earlier one wrote, and the
 cross-statement refusal that `docs/plan_api_design.md` describes is removed.
 
-**Statement atomicity: a savepoint per statement.** A statement that fails
-— a constraint, the budget, `BC_E_LIMIT`, a read error — discards its
-pending effects; the overlay and the log are untouched. The transaction
-continues, and the caller decides whether to go on or roll back.
-PostgreSQL's default is different: a failed statement aborts the whole
-transaction (25P02 until `ROLLBACK`). See open question 2.
+**A failed statement aborts the transaction, as in PostgreSQL.** A
+statement that fails — a constraint, the budget, `BC_E_LIMIT`, a read error
+— discards its pending effects, so the overlay and the log are untouched:
+each statement is its own savepoint. Then the handle refuses everything but
+`rollback()`. Every later `execute()` and `commit()` is SQLSTATE 25P02
+until it. The statement's own error is what `execute()` raises; 25P02 is
+for the calls after it.
 
 User `SAVEPOINT` / `ROLLBACK TO` are **later**: TPROC-C doesn't use them.
 When they come they are a mark in the log plus a copy of the overlay's
@@ -157,12 +177,15 @@ state at the mark, as `MariaDBTxn` keeps them; nothing here blocks that.
 
 ## Commit and conflicts — MVP
 
-**Commit replays the log into one `WritePlan` built on the transaction's
-snapshot.** The log holds every put, delete, range delete and guard, in the
-order the statements made them. The engine applies a plan's operations in
-order (engine `CONTRACT.md`, *Ordered*), so a range delete followed by a put
-inside it keeps the put. The commit also adds the catalog-record guard of
-every table the transaction wrote, as `bc_ctx_commit` does today.
+**Mechanism: commit replays the log into one `WritePlan` built on the
+transaction's snapshot.** The log holds every put, delete, range delete and
+guard, in the order the statements made them. The engine applies a plan's
+operations in order (engine `CONTRACT.md`, *Ordered*), so a range delete
+followed by a put inside it keeps the put. The commit also adds the
+catalog-record guard of every table the transaction wrote, as
+`bc_ctx_commit` does today. Emitting each key's final state instead is an
+optimisation behind the same commit, with nothing visible changed, taken
+only if a benchmark shows the log's cost.
 
 The engine checks every written key against the snapshot, so the whole
 transaction is first-committer-wins. A row read and then written, in any
@@ -171,13 +194,54 @@ statements, needs no guard.
 | Outcome | Autocommit (`Database::execute`) | Transaction (`commit()`) |
 |---|---|---|
 | Committed | Rows returned | Returns |
-| Conflict | Retried on a fresh snapshot, up to three times, as today; then `ExecError` with `conflict()` | `SerializationFailure`, SQLSTATE **40001**. Nothing written; the handle is closed. The caller reruns the transaction. The layer never retries it: it can't rerun the caller's logic. |
-| Constraint or other error | `ExecError`, never retried | Raised by `execute()` for the failing statement; `commit()` itself can only conflict or fail with an engine error |
+| Conflict on a key the transaction inserted, now taken (below) | The retry's own unique check reports it: `ExecError`, `BC_C_UNIQUE`, **23505** | `ExecError`, `BC_C_UNIQUE`, SQLSTATE **23505**. Nothing written; the handle is closed. |
+| Any other conflict | Retried on a fresh snapshot, up to three times, as today; then `ExecError` with `conflict()` | `SerializationFailure`, SQLSTATE **40001**. Nothing written; the handle is closed. The caller reruns the transaction. The layer never retries it: it can't rerun the caller's logic. |
+| Constraint or other error in a statement | `ExecError`, never retried | Raised by `execute()` for the failing statement; the transaction is then aborted (25P02) |
 
 Conflicts are detected only at commit. A statement never waits and never
-fails because another transaction holds a row, which differs from
-PostgreSQL's REPEATABLE READ, where the second updater waits and then gets
-40001.
+fails because another transaction holds a row (see *Known differences*).
+
+**A duplicate from a concurrent transaction is 23505, not 40001.**
+PostgreSQL makes the second inserter of a unique key wait for the first and
+then reports 23505. The closest outcome without waiting: when a commit
+conflicts and a key the transaction inserted is now taken, report the
+duplicate.
+- **What is recorded.** As each statement runs, the transaction records
+  its *insert claims*, in log order. A claim is a primary key `bc_insert`
+  wrote, or a unique-index prefix it or `bc_update` checked, that the
+  transaction's snapshot itself held free, with the table's or the index's
+  id. A key free only because an earlier statement deleted it is not a
+  claim: there the conflict is with the row the transaction deleted, which
+  PostgreSQL reports as 40001 too.
+- **How the commit decides.** On `BC_CONFLICT`, take a fresh snapshot, the
+  latest committed state, and check the claims in log order:
+  `contains_key` for a primary key, the first key at or after a prefix for
+  a unique prefix. The first claim that is taken is the error: `BC_C_UNIQUE`
+  with that claim's table or index id, SQLSTATE 23505. If none is taken, the
+  conflict is 40001.
+- **What it costs.** Nothing on a commit that succeeds. On a conflict, one
+  record read per claim: at most one per inserted row plus one per unique
+  index it maintains. These reads come after every statement has run, so
+  they aren't charged to a statement's budget; they are bounded by the
+  transaction's own inserts.
+- **Autocommit agrees.** Its retry runs the statement again on a fresh
+  snapshot, and the insert's own unique check reports the duplicate from
+  the same latest state. When the last retry still conflicts, the same
+  claim check runs before reporting a conflict. So both report 23505
+  exactly when an inserted key is taken in the latest committed state.
+- **Tests:**
+  - two transactions insert one primary key and commit in turn: the second
+    gets 23505 naming the table;
+  - the same for one unique-index value, naming the index;
+  - a conflict on a row the transaction updated, not inserted, is 40001;
+  - deleting and reinserting a row that a concurrent transaction updates is
+    40001;
+  - the autocommit race test ("tcc: a unique insert raced by another commit
+    conflicts, and its retry reports the duplicate") and its transaction
+    twin report the same code for the same interleaving.
+
+  The interleavings are forced with the commit hook
+  (`bc_ctx_before_commit_for_testing`).
 
 The commit outcome's shape is the one #522 drafted: a status of
 committed, conflict or engine error, with the caught exception kept apart
@@ -211,8 +275,9 @@ guards are the only text that differs between levels.
 
 ## DDL during an open transaction — MVP
 
-**Recommendation: the transaction keeps its catalog pin and conflicts at
-commit. DDL is not refused.**
+**DDL never waits.** It commits at once, whatever transactions are open.
+The transaction keeps its pinned catalog and conflicts at commit if it
+wrote a table the DDL changed.
 
 - The catalog version is pinned with the snapshot at the transaction's
   first statement. Every statement of the transaction is verified against
@@ -230,10 +295,8 @@ commit. DDL is not refused.**
   0A000) in the MVP. DDL stays its own atomic operation. Transactional DDL
   is later.
 
-Refusing DDL while any transaction is open is the alternative. It needs
-global tracking of open transactions, and it lets one idle handle hold off
-every DDL indefinitely. Conflicting at commit uses the guard that already
-exists.
+PostgreSQL makes the DDL wait for the open transaction's locks; see *Known
+differences*.
 
 ## Limits — MVP
 
@@ -241,7 +304,8 @@ exists.
   `TransactionOptions::max_bytes`, default 64 MiB, well below the engine's
   1 GiB plan limit. A statement that would take the transaction past it
   fails with `BC_E_LIMIT` (SQLSTATE 54000). Its effects are discarded by
-  the statement savepoint, and the transaction continues. The bound counts
+  the statement savepoint, and the transaction is aborted like any failed
+  statement's. The bound counts
   key and value bytes plus a fixed cost per entry, so a transaction of
   small writes can't exhaust memory through overhead.
 - **Memory.** The overlay allocates from the heap. A failed allocation is
@@ -296,11 +360,15 @@ for their shape.
   - a statement doesn't see its own writes;
   - a later statement updates and deletes a row an earlier one wrote, and
     every index stays exact;
-  - a failed statement rolls back alone.
+  - a failed statement writes nothing, and every later `execute()` and
+    `commit()` is 25P02 until `rollback()`;
+  - the snapshot is taken at the first statement, not at `begin()`.
 - **Commit:**
   - first-committer-wins across transactions (lost-update, delete against
     update);
   - a conflict is 40001 with nothing written;
+  - a duplicate from a concurrent transaction is 23505 (the tests under
+    *Commit and conflicts*);
   - `FOR UPDATE` conflicts on a changed row;
   - a DDL racing a writing transaction conflicts;
   - rollback and the destructor write nothing.
@@ -310,7 +378,8 @@ for their shape.
   - `BC_E_LIMIT` at the buffer bound.
 - **Against PostgreSQL:** the proof machine (`docs/testing_design.md`) gains
   `BEGIN` / statements / `COMMIT` / `ROLLBACK` rules, compared with
-  PostgreSQL's REPEATABLE READ on one connection, where the two agree.
+  PostgreSQL's REPEATABLE READ on one connection, aborted transactions and
+  25P02 included.
 - **Concurrency:** Elle through SQL, at the MVP gate (#487, 2.6): the
   harness's transactions as histories, checked as snapshot isolation, and
   as serializable where `FOR UPDATE` guards the reads that decide a write.
@@ -324,12 +393,14 @@ PR.
 | Guarantee | Proved by |
 |---|---|
 | A transaction from `Database::begin()` commits all its statements' writes atomically, or none: `commit()` returns, or throws having written nothing. Rollback, and destroying an open handle, write nothing. | to add |
-| A statement in a transaction reads the snapshot taken at the transaction's first statement plus the writes of its earlier statements, never its own: point reads, existence, counts, scans in both directions over tables and indexes, and the unique checks. | to add |
-| A statement that fails inside a transaction writes nothing, and the transaction continues with its earlier statements' writes. | to add |
+| A statement in a transaction reads the snapshot taken at the start of the transaction's first statement, not at `begin()`, plus the writes of its earlier statements, never its own: point reads, existence, counts, scans in both directions over tables and indexes, and the unique checks. | to add |
+| A statement that fails inside a transaction writes nothing, and aborts the transaction: every later `execute()` and `commit()` is SQLSTATE 25P02 until `rollback()`. | to add |
 | A later statement may update or delete a row an earlier statement wrote; every index stays exact. | to add |
 | A transaction that conflicts at commit with a concurrent commit (a written key changed since its snapshot, a `FOR UPDATE` row changed, a written table's DDL) is a serialization failure, SQLSTATE 40001, with nothing written. The layer does not retry it. | to add |
+| A commit that conflicts because a key it inserted (a primary key, or a unique index value) was taken by a concurrent commit is `BC_C_UNIQUE`, SQLSTATE 23505, naming the table or index, with nothing written; an autocommit statement reports the same for the same race. | to add |
+| No statement, commit or DDL waits for another transaction: a conflict is reported at commit, and a DDL commits whatever transactions are open. | to add |
 | A read that fails with I/O, CRC or memory errors fails the statement; it is never taken as absent. | to add |
-| A statement that takes the transaction past its buffer bound is `BC_E_LIMIT`, and the transaction continues. | to add |
+| A statement that takes the transaction past its buffer bound (`TransactionOptions`, 64 MiB by default) is `BC_E_LIMIT`, SQLSTATE 54000, and aborts the transaction. | to add |
 
 **Widened:**
 - "Autocommit only" becomes: autocommit through `Database::execute`, and
@@ -344,39 +415,22 @@ PR.
 - The exclusion "Multi-statement transactions, and a statement reading what
   an earlier statement of its transaction wrote" (#491).
 
-## Open questions, each with a recommendation
+## Known differences from PostgreSQL
 
-1. **SQL `BEGIN` / `COMMIT` text, or the handle only?** *Recommend:* the
-   handle only in the MVP. `Database::execute("BEGIN")` is refused (0A000).
-   Statement text that opens a transaction needs per-session state that
-   principle 3 keeps off the server, so it comes with the token form.
-2. **A failed statement: continue, or abort the transaction as PostgreSQL
-   does (25P02)?** *Recommend:* continue. It's what the statement savepoint
-   gives for free and what TPROC-C's harness wants: New-Order's rollback
-   on an invalid item is the caller's choice. If PostgreSQL's behaviour is
-   wanted, it's a flag on the handle that closes it on the first error, and
-   the proof machine compares under that flag.
-3. **When is the snapshot taken: at `begin()` or at the first statement?**
-   *Recommend:* the first statement, as `MariaDBTxn` does. An idle handle
-   then pins nothing, and the two can't be told apart by any statement's
-   result.
-4. **DDL during a transaction.** *Recommend:* keep the pin and conflict at
-   commit, as in *DDL* above. The alternative is refusing DDL while
-   transactions are open.
-5. **Buffer bound: what default, and per transaction or per database?**
-   *Recommend:* 64 MiB per transaction, set in `TransactionOptions`. A
-   database-wide memory bound across all open transactions comes with the
-   server.
-6. **Commit: replay the log, or emit each key's final state?** *Recommend:*
-   replay the log. It's the order the engine already guarantees, it handles
-   range deletes without extra rules, and TPROC-C's transactions write each
-   key once or twice. Collapsing to final states is an optimisation behind
-   the same commit, taken if a benchmark shows the log's cost.
+Each comes from the rule *never wait*.
+
+| PostgreSQL (REPEATABLE READ) | This layer | Why |
+|---|---|---|
+| A second updater of a row waits for the first transaction, then gets 40001 at its statement if the first committed. | Both update. The second to commit gets 40001 at `commit()`. | No row locks: conflicts are found at commit. |
+| A second inserter of a unique key waits, then gets 23505 at its `INSERT`. | Both insert. The second to commit gets 23505 at `commit()` (*Commit and conflicts*). | The same outcome, reported at commit instead of after a wait. |
+| `SELECT … FOR UPDATE` locks the rows: other writers wait. | It guards them: the guarding transaction gets 40001 at commit if a writer of those rows committed first. A writer is never held back. | A guard, not a lock. |
+| DDL waits for the locks of open transactions on its table. | DDL commits at once. An open transaction that wrote the table gets 40001 at commit. | DDL never waits. |
 
 ## Later, and why none of it blocks the MVP
 
 | Later | Why the MVP doesn't block it |
 |---|---|
+| `BEGIN` / `COMMIT` text (with the server) | The handle is what it opens; the text is the server's spelling of `begin()`. |
 | Token transactions across requests (#494) | The handle is the token's in-process half; a token names a handle held with a TTL. |
 | Procedures retried in the runtime (#495) | A procedure is a transaction whose statements are all the runtime's, so its retry is a loop around `begin` … `commit`. |
 | Serializable and read committed | Guards are emitted per isolation level by the compiler, and the log already carries guards. |
