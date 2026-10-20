@@ -34,7 +34,7 @@ from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, 
 import oracle as o
 from conftest import Oracle
 
-TYPES = [o.BIGINT, o.INTEGER, o.SMALLINT, o.DOUBLE, o.BOOLEAN, o.TEXT, o.varchar(4), o.BYTEA]
+TYPES = [o.BIGINT, o.INTEGER, o.SMALLINT, o.DOUBLE, o.REAL, o.BOOLEAN, o.TEXT, o.varchar(4), o.BYTEA]
 TABLE_NAMES = ["t0", "t1", "t2", "t3"]
 BIGINT_LOW, BIGINT_HIGH = o.BIGINT.low, o.BIGINT.high
 
@@ -82,15 +82,23 @@ class Table:
         return f"SELECT {', '.join(c.name for c in self.columns)} FROM {self.name}"
 
 
-def values(t: o.Type) -> st.SearchStrategy:
+def values(t: o.Type, lookup: bool = False) -> st.SearchStrategy:
     """A value of the type's physical kind: mostly inside its declared
     range, sometimes outside it (a BIGINT for an INTEGER, a VARCHAR(n) of
-    more than n characters), which both sides refuse."""
+    more than n characters), which both sides refuse. A lookup's REAL stays
+    inside float's range: PostgreSQL refuses $n::real out of it, where a
+    lookup in the layer finds nothing."""
     if t.kind == "int":
         edges = st.sampled_from([t.low, t.high, t.low - 1, t.high + 1]).filter(lambda v: BIGINT_LOW <= v <= BIGINT_HIGH)
         return st.one_of(st.integers(-3, 3), st.integers(t.low, t.high), edges, st.integers(BIGINT_LOW, BIGINT_HIGH))
     if t.kind == "float":
         return st.floats(allow_nan=False, allow_infinity=False)
+    if t.kind == "real":
+        # Floats, doubles that round to one, and, for writes, doubles past
+        # float's range at either end (22003 on both).
+        inside = st.one_of(st.floats(width=32, allow_nan=False, allow_infinity=False),
+                           st.floats(-1e38, 1e38).filter(lambda v: v == 0 or abs(v) > 1e-37))
+        return inside if lookup else st.one_of(inside, st.sampled_from([1e39, -1e39, 1e-50, -1e-50]))
     if t.kind == "bool":
         return st.booleans()
     if t.kind == "text":
@@ -108,8 +116,8 @@ def default_values(t: o.Type) -> st.SearchStrategy:
     """A DEFAULT both sides read the same way from its literal."""
     if t.kind == "int":
         return st.integers(-3, 3)
-    if t.kind == "float":
-        return st.sampled_from([0.0, 1.5, -2.25])
+    if t.kind in ("float", "real"):
+        return st.sampled_from([0.0, 1.5, -2.25])  # exact in a float too
     if t.kind == "bool":
         return st.booleans()
     printable = st.characters(min_codepoint=0x20, max_codepoint=0x7E, blacklist_characters="\\")
@@ -199,7 +207,11 @@ class SqlMachine(RuleBasedStateMachine):
     def lookup(self, name: str, key: tuple) -> o.Outcome:
         t = self.tables[name]
         where = " AND ".join(f"{c} = ${i + 1}" for i, c in enumerate(t.pk))
-        return self.both(f"{t.select_all} WHERE {where}", key)
+        # The layer types $n by its column, so a REAL key is a real; psycopg
+        # sends a float as double precision, so PostgreSQL is told.
+        pg_where = " AND ".join(f"{c} = ${i + 1}" + ("::real" if t.column(c).type.kind == "real" else "")
+                                for i, c in enumerate(t.pk))
+        return self.both(f"{t.select_all} WHERE {where}", key, pg_sql=f"{t.select_all} WHERE {pg_where}")
 
     def reopen(self) -> None:
         self.db.close()
@@ -297,7 +309,7 @@ class SqlMachine(RuleBasedStateMachine):
         if keys and data.draw(st.booleans(), label="existing key"):
             key = data.draw(st.sampled_from(keys), label="key")
         else:
-            key = tuple(data.draw(st.none() | values(t.column(c).type), label=c) for c in t.pk)
+            key = tuple(data.draw(st.none() | values(t.column(c).type, lookup=True), label=c) for c in t.pk)
         self.lookup(t.name, key)
 
     @rule()
@@ -407,6 +419,19 @@ def test_values_outside_their_declared_type_are_22003_and_22001(dsn):
             assert m.insert("t0", {"c0": 1, col: value}, all_columns=False).error == state, (col, value)
         assert m.insert("t0", {"c0": 1, "c1": 2**15 - 1, "c2": -(2**31), "c3": "éééé"}, all_columns=False).error is None
         assert m.lookup("t0", (2**40,)).rows == ()  # a lookup is not a write: no refusal
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_real_is_stored_and_keyed_as_its_float(dsn):
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.REAL), Column("c1", o.REAL)], ["c0"]))
+        assert m.insert("t0", {"c0": 0.1, "c1": 0.1}, all_columns=False).error is None
+        assert m.insert("t0", {"c0": float(0.1), "c1": 1e39}, all_columns=False).error == "22003"
+        assert len(m.lookup("t0", (0.1,)).rows) == 1  # found by the value it was written with
+        assert m.insert("t0", {"c0": 0.1}, all_columns=False).error == "23505"
         m.check()
     finally:
         m.teardown()

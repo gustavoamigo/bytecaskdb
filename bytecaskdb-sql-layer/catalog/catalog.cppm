@@ -159,12 +159,6 @@ inline constexpr auto kPowersOfTen = [] {
 [[nodiscard]] auto out_of_range(SqlType t, BytesView v) -> std::optional<std::string>;
 [[nodiscard]] inline auto out_of_range(SqlType, bool) -> std::optional<std::string> { return std::nullopt; }
 [[nodiscard]] auto out_of_range(SqlType t, const Datum& d) -> std::optional<std::string>;
-// The double a value of type t is stored as: a REAL's float rounding, as
-// PostgreSQL stores a float4 (0.1 reads back as 0.100000001490116…), a
-// finite one past FLT_MAX that out_of_range accepted as ±FLT_MAX; any other
-// type's value, and a REAL's infinities and NaN, as given. For a value
-// out_of_range accepted; no value outside float's range is cast.
-[[nodiscard]] auto stored_f64(SqlType t, double v) -> double;
 // Sets one column of a row writer to a datum (NULL sets it null). False for
 // a type mismatch.
 [[nodiscard]] auto set_datum(RowWriter& w, std::uint32_t col_id, const Datum& d) -> bool;
@@ -591,6 +585,12 @@ auto index_prefix(std::uint32_t index_id) -> Bytes {
   return p;
 }
 
+// Column c's key part: its physical type, nullable and direction as given,
+// and whether it is a REAL, whose doubles are keyed as their float rounding.
+auto key_part(const Column& c, bool nullable = false, bool desc = false) -> KeyPart {
+  return {c.type, nullable, desc, c.sql.kind == SqlKind::Real};
+}
+
 // Appends one column of `row` as a key part. False if the row is malformed
 // or a non-nullable part is null; `was_null` receives whether it was null.
 auto put_part_from_row(const Table& t, std::uint32_t col_id, KeyPart part, BytesView row, Bytes& out,
@@ -797,13 +797,14 @@ auto sql_type_name(SqlType t) -> std::string {
 }
 
 auto utf8_code_points(BytesView s) -> std::optional<std::size_t> {
-  std::size_t n = 0;
+  auto n = std::size_t{0};
   for (std::size_t i = 0; i < s.size(); ++n) {
     auto b0 = std::to_integer<std::uint32_t>(s[i]);
     // The sequence length and the bounds of the second byte that keep it
     // shortest and inside U+0000..U+10FFFF, surrogates excluded (RFC 3629).
-    std::size_t len = 0;
-    std::uint32_t lo = 0x80, hi = 0xBF;
+    auto len = std::size_t{0};
+    auto lo = 0x80u;
+    auto hi = 0xBFu;
     if (b0 == 0x00) return std::nullopt;
     if (b0 < 0x80) {
       len = 1;
@@ -870,7 +871,7 @@ auto out_of_range(SqlType t, double v) -> std::optional<std::string> {
   // at or past the midpoint between FLT_MAX and 2^128, 2^128 - 2^103, which
   // rounds up (FLT_MAX's significand is odd). Decided by comparison: a
   // finite double outside float's range is undefined behaviour to convert,
-  // and stored_f64 converts only what is inside it.
+  // and float_rounding converts only what is inside it.
   constexpr auto kFloatOverflow = 0x1p128 - 0x1p103;
   if (std::isfinite(v) && std::fabs(v) >= kFloatOverflow) return "value out of range: overflow";
   // A nonzero value that rounds to zero: below half the smallest subnormal
@@ -889,13 +890,6 @@ auto out_of_range(SqlType t, BytesView v) -> std::optional<std::string> {
     return "value too long for type character varying(" + std::to_string(t.length) + ")";
   }
   return std::nullopt;
-}
-
-auto stored_f64(SqlType t, double v) -> double {
-  if (t.kind != SqlKind::Real || !std::isfinite(v)) return v;
-  constexpr auto kFloatMax = static_cast<double>(std::numeric_limits<float>::max());
-  if (std::fabs(v) > kFloatMax) return std::copysign(kFloatMax, v);  // below 2^128 - 2^103: rounds to FLT_MAX
-  return static_cast<double>(static_cast<float>(v));
 }
 
 auto out_of_range(SqlType t, const Datum& d) -> std::optional<std::string> {
@@ -1214,7 +1208,7 @@ void Catalog::rebuild_lookups() {
     name_taken(t.name);
     names_[t.name] = id;
     std::vector<KeyPart> pk_parts;
-    for (auto cid : t.pk_col_ids) pk_parts.push_back(KeyPart{t.column(cid)->type});
+    for (auto cid : t.pk_col_ids) pk_parts.push_back(key_part(*t.column(cid)));
     key_layouts_[id] = KeyLayout{kNsRow, &t, nullptr, pk_parts, 0};
     for (const auto& ix : t.indexes) {
       name_taken(ix.name);
@@ -1222,7 +1216,7 @@ void Catalog::rebuild_lookups() {
       KeyLayout kl{kNsIndex, &t, &ix, {}, ix.parts.size()};
       for (const auto& p : ix.parts) {
         const auto* c = t.column(p.col_id);
-        kl.parts.push_back(KeyPart{c->type, c->nullable, p.desc});
+        kl.parts.push_back(key_part(*c, c->nullable, p.desc));
       }
       kl.parts.insert(kl.parts.end(), pk_parts.begin(), pk_parts.end());
       key_layouts_[ix.id] = std::move(kl);
@@ -1587,7 +1581,7 @@ auto LiveCatalog::apply(const Ddl& ddl) -> std::shared_ptr<const Catalog> {
 auto encode_pk_from_row(const Table& t, BytesView row, Bytes& out) -> bool {
   key_put_prefix(out, kNsRow, t.id);
   for (auto id : t.pk_col_ids) {
-    if (!put_part_from_row(t, id, KeyPart{t.column(id)->type}, row, out)) return false;
+    if (!put_part_from_row(t, id, key_part(*t.column(id)), row, out)) return false;
   }
   return true;
 }
@@ -1599,13 +1593,13 @@ auto encode_index_key_from_row(const Table& t, const Index& ix, BytesView row, B
   for (const auto& p : ix.parts) {
     const auto* c = t.column(p.col_id);
     bool was_null = false;
-    if (!put_part_from_row(t, p.col_id, KeyPart{c->type, c->nullable, p.desc}, row, out, &was_null)) return false;
+    if (!put_part_from_row(t, p.col_id, key_part(*c, c->nullable, p.desc), row, out, &was_null)) return false;
     any_null = any_null || was_null;
   }
   if (prefix_len != nullptr) *prefix_len = out.size();
   if (has_null != nullptr) *has_null = any_null;
   for (auto id : t.pk_col_ids) {
-    if (!put_part_from_row(t, id, KeyPart{t.column(id)->type}, row, out)) return false;
+    if (!put_part_from_row(t, id, key_part(*t.column(id)), row, out)) return false;
   }
   return true;
 }

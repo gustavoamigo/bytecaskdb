@@ -40,10 +40,14 @@ every rule, the invariants are checked.
   PostgreSQL's the same way. Values compare by type too: `True` is not `1`,
   `1` is not `1.0`, and `-0.0` is not `0.0`. Text columns are `COLLATE "C"`
   in PostgreSQL, so its order is byte order, the order of the layer's keys.
+  A REAL comes from PostgreSQL as the shortest text naming its float; the
+  oracle packs it back to that float, which is what the layer stores. A
+  lookup by a REAL key casts `$n::real` on PostgreSQL's side, as the layer
+  types `$n` by its column.
 
 Rules in increment 1:
 - **CREATE TABLE.** Up to four columns over BIGINT, INTEGER, SMALLINT, DOUBLE
-  PRECISION, BOOLEAN, TEXT, VARCHAR(4) and BYTEA. Primary keys of one or two
+  PRECISION, REAL, BOOLEAN, TEXT, VARCHAR(4) and BYTEA. Primary keys of one or two
   columns, NOT NULL and nullable columns, and DEFAULT literals. Refused
   variants: an existing name, a duplicate column, a primary key naming no
   column, and two primary keys (on two columns, or on a column and the
@@ -88,6 +92,13 @@ Found so far. The machine expects each one, so it does not fail on them.
 - **A VARCHAR(n) value whose excess is only spaces is refused.**
   PostgreSQL truncates it to n characters and stores it; the layer refuses
   it as too long (22001). The machine does not generate one.
+- **A DEFAULT outside its column's type is refused by the DDL.** The layer
+  refuses `CREATE TABLE` (and `ADD COLUMN`) with, say, `SMALLINT DEFAULT
+  100000`, `REAL DEFAULT 1e39` or `VARCHAR(2) DEFAULT 'abc'`. PostgreSQL
+  accepts the DDL and refuses each INSERT that takes the default (22003,
+  22001; checked on 16.15). A DEFAULT that is not UTF-8 never reaches
+  either: PostgreSQL refuses the statement's text (22021). The machine's
+  defaults stay inside their types.
 - **A lookup by text that is not UTF-8 finds nothing.** PostgreSQL refuses
   the parameter (22021); the layer checks text only when it is written. The
   machine generates only valid text.

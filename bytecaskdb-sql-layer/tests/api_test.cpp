@@ -603,6 +603,30 @@ TEST_CASE("embedded API: values outside their declared type, an omitted NOT NULL
   CHECK(real_of(7) == -static_cast<double>(std::numeric_limits<float>::max()));
   CHECK(real_of(6) == static_cast<double>(0.1f));
   CHECK(real_of(6) != 0.1);
+  // A REAL key or index part is found by the value it was written with: a
+  // lookup, a bound, and an UPDATE or DELETE by key round a REAL as the row
+  // does, as PostgreSQL rounds a $1 typed real.
+  (void)db->execute("CREATE TABLE rk (r REAL PRIMARY KEY, x REAL, n BIGINT)");
+  (void)db->execute("CREATE INDEX rk_x ON rk (x)");
+  CHECK(db->execute("INSERT INTO rk VALUES ($1, $2, $3)", {Value{0.1}, Value{0.1}, i(1)}).affected == 1);
+  CHECK(db->execute("INSERT INTO rk VALUES ($1, $2, $3)", {Value{0.5}, Value{0.5}, i(2)}).affected == 1);
+  CHECK(db->execute("SELECT n FROM rk WHERE r = $1", {Value{0.1}}).rows == Grid{{i(1)}});
+  CHECK(db->execute("UPDATE rk SET n = $2 WHERE r = $1", {Value{0.1}, i(10)}).affected == 1);
+  CHECK(db->execute("SELECT n FROM rk WHERE x <= $1", {Value{0.1}}).rows == Grid{{i(10)}});  // 0.1 rounded: included
+  CHECK(db->execute("SELECT n FROM rk WHERE x > $1", {Value{0.1}}).rows == Grid{{i(2)}});    // and excluded here
+  // The same REAL again is a duplicate key, whichever double rounds to it.
+  for (auto again : {0.1, static_cast<double>(0.1f)}) {
+    try {
+      (void)db->execute("INSERT INTO rk VALUES ($1, $2, $3)", {Value{again}, kNull, i(3)});
+      FAIL("a duplicate REAL key was inserted");
+    } catch (const ExecError& e) {
+      REQUIRE(e.constraint());
+      CHECK(e.constraint()->constraint == BC_C_UNIQUE);
+    }
+  }
+  CHECK(db->execute("DELETE FROM rk WHERE r = $1", {Value{0.1}}).affected == 1);
+  CHECK(db->table_rows("rk").rows.size() == 1);
+
   // A REAL DEFAULT is stored the same way.
   (void)db->execute("CREATE TABLE rd (k BIGINT PRIMARY KEY, f REAL DEFAULT 0.1)");
   CHECK(db->execute("INSERT INTO rd (k) VALUES ($1)", {i(1)}).affected == 1);
