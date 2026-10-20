@@ -3,14 +3,14 @@ the markers' sequences and reuses them. Reverts 362cc590.
 Guarded-by: "a write after a restart does not reuse a batch marker's sequence"
 
 diff --git a/bytecaskdb/db_rotation.cpp b/bytecaskdb/db_rotation.cpp
-index 79e54d3..5614aa9 100644
+index 55bffc1..4e9d414 100644
 --- a/bytecaskdb/db_rotation.cpp
 +++ b/bytecaskdb/db_rotation.cpp
-@@ -193,7 +193,6 @@ auto DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
-         entry.entry_type == EntryType::BulkEnd) {
+@@ -172,7 +172,6 @@ auto DB::stage_hint(const DataFile &file, OnDamage on_damage) -> HintStage {
+     case EntryType::BulkEnd:
        // Structural markers carry no key; recovery ignores them. They stay in
        // scan order ahead of the sorted run.
--      hint.append(entry.sequence, entry.entry_type, entry_off, {}, 0);
-       continue;
-     }
-     if (entry.entry_type == EntryType::ChangeMarker) {
+-      stage.markers.push_back({entry.sequence, entry_off, entry.entry_type});
+       break;
+     case EntryType::ChangeMarker:
+       // Recovery rebuilds the marker list from hints alone, so the id goes

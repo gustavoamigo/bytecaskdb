@@ -116,7 +116,7 @@ def gen_test(
     p.append("")
     if delta.open_throws:
         p.append("  // A hint cannot be regenerated. recovery_prepare_files calls")
-        p.append("  // flush_hints_for without a catch, so open fails.")
+        p.append("  // stage_hint and write_hint without a catch, so open fails.")
         p.append("  {")
         p.append(f'    bytecask::testing::ScopedFaultInjector fi{{"{fault}"}};')
         p.append(f"    REQUIRE_THROWS(bytecask::DB::open(dir, {opts}));")

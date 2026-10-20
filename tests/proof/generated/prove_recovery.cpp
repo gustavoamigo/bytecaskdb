@@ -184,7 +184,7 @@ TEST_CASE("prove_recovery__crash_hintless__hint_write_fails__t1", "[prove_recove
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
@@ -252,7 +252,7 @@ TEST_CASE("prove_recovery__crash_hintless__hint_write_fails__t4", "[prove_recove
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));
@@ -320,7 +320,7 @@ TEST_CASE("prove_recovery__crash_hintless__hint_sync_fails__t1", "[prove_recover
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
@@ -388,7 +388,7 @@ TEST_CASE("prove_recovery__crash_hintless__hint_sync_fails__t4", "[prove_recover
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));
@@ -456,7 +456,7 @@ TEST_CASE("prove_recovery__crash_hintless__hint_rename_fails__t1", "[prove_recov
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
@@ -524,7 +524,7 @@ TEST_CASE("prove_recovery__crash_hintless__hint_rename_fails__t4", "[prove_recov
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));
@@ -710,7 +710,7 @@ TEST_CASE("prove_recovery__multi_file_hintless__hint_write_fails__t1", "[prove_r
   REQUIRE(drop_all_hints(dir) > 0);
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}));
@@ -778,7 +778,7 @@ TEST_CASE("prove_recovery__multi_file_hintless__hint_write_fails__t4", "[prove_r
   REQUIRE(drop_all_hints(dir) > 0);
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}));
@@ -846,7 +846,7 @@ TEST_CASE("prove_recovery__multi_file_hintless__hint_sync_fails__t1", "[prove_re
   REQUIRE(drop_all_hints(dir) > 0);
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}));
@@ -914,7 +914,7 @@ TEST_CASE("prove_recovery__multi_file_hintless__hint_sync_fails__t4", "[prove_re
   REQUIRE(drop_all_hints(dir) > 0);
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}));
@@ -982,7 +982,7 @@ TEST_CASE("prove_recovery__multi_file_hintless__hint_rename_fails__t1", "[prove_
   REQUIRE(drop_all_hints(dir) > 0);
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}));
@@ -1050,7 +1050,7 @@ TEST_CASE("prove_recovery__multi_file_hintless__hint_rename_fails__t4", "[prove_
   REQUIRE(drop_all_hints(dir) > 0);
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}));
@@ -1236,7 +1236,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_write_fails__t1", "[prove_recovery
   REQUIRE(corrupt_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}));
@@ -1304,7 +1304,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_write_fails__t4", "[prove_recovery
   REQUIRE(corrupt_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}));
@@ -1372,7 +1372,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_sync_fails__t1", "[prove_recovery]
   REQUIRE(corrupt_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}));
@@ -1440,7 +1440,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_sync_fails__t4", "[prove_recovery]
   REQUIRE(corrupt_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}));
@@ -1508,7 +1508,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_rename_fails__t1", "[prove_recover
   REQUIRE(corrupt_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}));
@@ -1576,7 +1576,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_rename_fails__t4", "[prove_recover
   REQUIRE(corrupt_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}));
@@ -1783,7 +1783,7 @@ TEST_CASE("prove_recovery__hintless_batched__hint_write_fails__t1", "[prove_reco
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
@@ -1858,7 +1858,7 @@ TEST_CASE("prove_recovery__hintless_batched__hint_write_fails__t4", "[prove_reco
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));
@@ -1933,7 +1933,7 @@ TEST_CASE("prove_recovery__hintless_batched__hint_sync_fails__t1", "[prove_recov
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
@@ -2008,7 +2008,7 @@ TEST_CASE("prove_recovery__hintless_batched__hint_sync_fails__t4", "[prove_recov
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));
@@ -2083,7 +2083,7 @@ TEST_CASE("prove_recovery__hintless_batched__hint_rename_fails__t1", "[prove_rec
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
@@ -2158,7 +2158,7 @@ TEST_CASE("prove_recovery__hintless_batched__hint_rename_fails__t4", "[prove_rec
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));
@@ -2333,7 +2333,7 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_write_fails__t1", "[prove_re
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
@@ -2394,7 +2394,7 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_write_fails__t4", "[prove_re
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));
@@ -2455,7 +2455,7 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_sync_fails__t1", "[prove_rec
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
@@ -2516,7 +2516,7 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_sync_fails__t4", "[prove_rec
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));
@@ -2577,7 +2577,7 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_rename_fails__t1", "[prove_r
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
@@ -2638,7 +2638,7 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_rename_fails__t4", "[prove_r
   REQUIRE(drop_newest_hint(dir));
 
   // A hint cannot be regenerated. recovery_prepare_files calls
-  // flush_hints_for without a catch, so open fails.
+  // stage_hint and write_hint without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
     REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));

@@ -1,30 +1,31 @@
 Hint files are written in place instead of to a temporary file renamed into
 place. The rename is what makes "a hint exists" mean "the hint is complete":
 a hint that fails its CRC is rebuilt by a scan that skips the tail handling,
-since a file with a hint was sealed. Recovery cuts a hint-less file's tail
-before it writes the hint (#476), but the hint file is created before the
-scan that finds the tail, so in place it exists, holding only its header,
-while the file is still uncut. A crash then sends the next open to that
-scan over an untrimmed tail, and DB::open refuses the database. (The design
-first expected this to survive.) It takes a crash inside the few
-milliseconds of an open's scan or hint write. Unfocused runs caught it twice
-in about 45 minutes before #476 and in 6 minutes after it (seed 1, a
-SIGKILL: a 16-byte hint over an uncut file); focusing on power cuts without
-the latency and stalls that slow opens down caught it less, so it runs
-unfocused and is not held to a budget.
-Expected: caught (rare).
+since a file with a hint was sealed. Before #476, recovery created the hint
+file before it cut a hint-less file's torn tail, so a crash left a partial
+hint over an uncut tail and the next open refused the database: unfocused
+runs caught it twice in about 45 minutes, and in 6 minutes once #476 cut
+before writing but still created the hint file before the scan. Since the
+hint file is created only after the cut, a hint torn in place sits over a
+file already cut, and the rebuild reads it: a 15-minute run of seed 1
+survived. One 20-minute run reported a worker that exited on its own (code
+2) at 546 s; it did not recur and its log was not kept, so it is not
+counted as a catch. The unit test below fails the hint write between its
+frames and its trailer and sees the torn hint.
+Expected: NOT caught: since #476 a torn hint lies over a cut file; the
+Guarded-by test covers it.
 Guarded-by: "DB recovery: a crash while open writes a hint leaves no hint behind it\, and the next open recovers"
 
 diff --git a/bytecaskdb/db_rotation.cpp b/bytecaskdb/db_rotation.cpp
-index 7853278..26a8759 100644
+index e0fa44a..7de7e55 100644
 --- a/bytecaskdb/db_rotation.cpp
 +++ b/bytecaskdb/db_rotation.cpp
-@@ -155,7 +155,7 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
-                          const TailCut &cut) {
-   const auto stem = file->path().stem().string();
+@@ -212,7 +212,7 @@ auto DB::stage_hint(const DataFile &file, OnDamage on_damage) -> HintStage {
+ void DB::write_hint(HintStage stage, const std::filesystem::path &dir,
+                     const std::string &stem) {
    const auto hint_path = dir / (stem + ".hint");
 -  const auto tmp_path = dir / (stem + ".hint.tmp");
 +  const auto tmp_path = hint_path;
- 
-   if (std::filesystem::exists(hint_path)) {
-     return;
+   const auto bytes = [&](std::uint32_t off, std::uint32_t len) {
+     return std::span<const std::byte>{stage.arena.data() + off, len};
+   };

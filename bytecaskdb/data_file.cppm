@@ -1878,6 +1878,9 @@ export void rewrite_durably(const std::filesystem::path &path, Offset end) {
 // to persist.
 export void truncate_durably(const std::filesystem::path &path, Offset size) {
   const RewriteFd f{path};
+#ifdef BYTECASK_TESTING
+  FAULT_INJECTION(io_truncate);
+#endif
   if (::ftruncate(f.fd(), narrow<off_t>(size)) != 0) {
     throw std::system_error{
         errno, std::generic_category(),

@@ -1345,20 +1345,54 @@ private:
   void wait_for_hint_backlog();
   // Queues hint generation for a sealed file on the background worker.
   void dispatch_hint(std::shared_ptr<DataFile> file);
-  // Runs after the scan and before the hint is written: rules on whether the
-  // file may end at `end`, the end of its last committed record, and cuts it
-  // there. Throws to refuse it, or when the cut fails. flush_hints_for reads
-  // nothing from the file after the call, which is what lets the cut shrink
-  // it under the open DataFile: under IoBackend::Mmap a read past the new end
-  // would be SIGBUS.
-  using TailCut = std::function<void(Offset end)>;
-  // Writes hint file via temp-then-rename. Batch-aware; idempotent if .hint
-  // exists. Without a cut, an entry that fails its CRC throws. With one, the
-  // scan stops there as it does at a zeroed header, and the cut rules on what
-  // lies past it; a throw from it leaves no hint behind.
+  // A data file's hint, scanned and not yet written. It holds no reference
+  // to the file, so the file can be cut and reopened before the hint is
+  // written (#476).
+  struct HintStage {
+    // A batch marker carries nothing but where it is and which one it is.
+    struct Marker {
+      std::uint64_t seq;
+      std::uint64_t file_off;
+      EntryType type;
+    };
+    struct Entry {
+      std::uint64_t seq;
+      std::uint64_t file_off;
+      // Put and Delete: the record's value size. RangeDel and ChangeMarker:
+      // the length of the value kept in the arena after the key, the range's
+      // end or the marker's id.
+      std::uint32_t val_size;
+      std::uint32_t key_off;
+      std::uint32_t key_len;
+      EntryType type;
+    };
+    // One staged entry per record of the file: its size bounds the memory a
+    // hint build takes.
+    static_assert(sizeof(Entry) == 32);
+    // BulkBegin and BulkEnd, in scan order.
+    std::vector<Marker> markers;
+    // Change markers and range tombstones, in scan order.
+    std::vector<Entry> keyless;
+    // Puts and deletes, sorted by write_hint.
+    std::vector<Entry> keyed;
+    // Keys and the values kept with them: the scanner's spans die on the
+    // next advance, and a vector per entry would cost an allocation per key.
+    std::vector<std::byte> arena;
+    // The end of the last committed record.
+    Offset end{0};
+  };
+  // Batch-aware: a batch without its BulkEnd is left out. With
+  // OnDamage::Throw an entry that fails its CRC throws; with Stop the scan
+  // ends there, as at a zeroed header, and `end` says where.
+  static auto stage_hint(const DataFile &file, OnDamage on_damage)
+      -> HintStage;
+  // Writes the hint of the data file named stem via temp-then-rename.
+  static void write_hint(HintStage stage, const std::filesystem::path &dir,
+                         const std::string &stem);
+  // stage_hint then write_hint, for a sealed file; idempotent if .hint
+  // exists. An entry that fails its CRC throws.
   static void flush_hints_for(const std::shared_ptr<DataFile> &file,
-                              const std::filesystem::path &dir,
-                              const TailCut &cut = {});
+                              const std::filesystem::path &dir);
   // recovery_prepare_files' check on a hint-less file, which is where a
   // crash can leave a torn tail. See docs/bytecask_design.md, *Recovering a
   // Hint-less File*.

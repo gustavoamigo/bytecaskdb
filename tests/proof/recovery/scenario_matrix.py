@@ -14,7 +14,7 @@
 # generating one may cost recovery time and must not cost keys. So each cell
 # asks the same question of a different shape — does every key survive?
 #
-# Scope: the four synchronous flush_hints_for call sites are reachable, since
+# Scope: the four synchronous call sites that write a hint are reachable, since
 # the fault is armed on the thread that calls DB::open. The two post-rotation
 # worker_.dispatch sites are not — active_injector is thread_local and the
 # background worker has its own. That is recorded in the docs rather than

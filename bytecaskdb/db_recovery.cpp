@@ -242,23 +242,20 @@ auto DB::recovery_prepare_files(EngineState &s)
       // the hint is written (#476): every later open trusts a hint and never
       // cuts its file, so a hint over a file whose cut failed, or that a
       // crash interrupted, would keep the tail for good.
-      auto cut = false;
-      flush_hints_for(data_file, dir_, [&](Offset end) {
-        recovery_check_tail(*data_file, end, data_paths);
-        if (end < data_file->size()) {
-          truncate_durably(p, end);
-          cut = true;
-        }
-      });
-      if (cut) {
-        // Same file_id as the open above, deliberately. Under the buffer
-        // pool that open's hint scan may have admitted frames under this id,
-        // but the truncate only drops a tail: every byte below the end is
-        // unchanged, and no reader addresses anything above it. Frames past
-        // the new end are orphans CLOCK reclaims.
+      auto stage = stage_hint(*data_file, OnDamage::Stop);
+      recovery_check_tail(*data_file, stage.end, data_paths);
+      if (stage.end < data_file->size()) {
+        // The file is closed before it is cut, so no mapping or open file
+        // spans the bytes that go. Same file_id on the reopen, deliberately.
+        // Under the buffer pool the scan may have admitted frames under this
+        // id, but the truncate only drops a tail: every byte below the end
+        // is unchanged, and no reader addresses anything above it. Frames
+        // past the new end are orphans CLOCK reclaims.
         data_file.reset();
+        truncate_durably(p, stage.end);
         data_file = openDataFileForRead(p, io_backend_, pool_, file_id);
       }
+      write_hint(std::move(stage), dir_, p.stem().string());
     }
     files_t.set(file_id, data_file);
 

@@ -1576,16 +1576,28 @@ TEST_CASE("DB recovery: a crash while open writes a hint leaves no hint behind "
 }
 
 // Open cuts a torn tail with truncate_durably, whose fdatasync persists the
-// new length. The first io_rewrite_sync is the hint-less file's rewrite, the
-// second the cut's; failing the second fails the open only while it is made.
-// The cut comes before the hint (#476): a hint written first would outlive a
-// failed cut, and every later open, trusting it, would keep the tail.
+// new length, and only then writes the file's hint (#476): a hint written
+// first would outlive a failed cut, and every later open, trusting it, would
+// keep the tail. io_truncate fails the cut before the ftruncate, so the file
+// is left uncut; the second io_rewrite_sync is the cut's sync (the first is
+// the hint-less file's rewrite), so the file is cut but the open fails. The
+// file is closed before it is cut, on every back-end.
 TEST_CASE("DB recovery: open fails when the cut of a torn tail cannot be "
-          "synced, and the next open recovers",
+          "made or synced, and the next open recovers",
           "[bytecask][recovery][corruption]") {
+  const auto io_backend =
+      GENERATE(bytecask::IoBackend::Pread, bytecask::IoBackend::Mmap,
+               bytecask::IoBackend::BufferPool);
+  CAPTURE(static_cast<int>(io_backend));
+#ifdef __EMSCRIPTEN__
+  if (io_backend == bytecask::IoBackend::Mmap)
+    SKIP("DB::open rejects Mmap on WASM");
+#endif
   TempDir td;
   const auto dir = td.path / "db";
-  const bytecask::Options opts{.max_file_bytes = 100};
+  bytecask::Options opts{.max_file_bytes = 100, .io_backend = io_backend};
+  if (io_backend == bytecask::IoBackend::BufferPool)
+    opts.buffer_pool.capacity_bytes = 1024 * 1024;
   {
     auto db = bytecask::DB::open(dir, opts);
     for (int i = 0; i < 14; ++i)
@@ -1597,14 +1609,25 @@ TEST_CASE("DB recovery: open fails when the cut of a torn tail cannot be "
   drop_hint(files[2]);
   const auto committed_end = std::filesystem::file_size(files[2]) - kEntry;
   tear_last_entry(files[2]);
+  const auto torn_size = std::filesystem::file_size(files[2]);
   auto hint = files[2];
   hint.replace_extension(".hint");
+  auto hint_tmp = hint;
+  hint_tmp += ".tmp";
 
-  {
+  SECTION("the cut fails") {
+    bytecask::testing::ScopedFaultInjector fi{"io_truncate"};
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, opts), std::system_error);
+    CHECK(std::filesystem::file_size(files[2]) == torn_size);
+  }
+  SECTION("the cut's sync fails") {
     bytecask::testing::ScopedFaultInjector fi{"io_rewrite_sync"};
     fi.inj.fail_on_nth_match = 2;
     REQUIRE_THROWS_AS(bytecask::DB::open(dir, opts), std::system_error);
   }
+  // The hint is staged in memory, so a failed cut leaves no temporary hint
+  // for the next open to remove.
+  CHECK_FALSE(std::filesystem::exists(hint_tmp));
   CHECK_FALSE(std::filesystem::exists(hint));
 
   auto db = bytecask::DB::open(dir, opts);

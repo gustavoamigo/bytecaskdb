@@ -7,7 +7,7 @@ Expected: caught.
 Guarded-by: "open makes a hint-less file durable before it indexes it: a process killed before its sync"
 
 diff --git a/bytecaskdb/db_recovery.cpp b/bytecaskdb/db_recovery.cpp
-index 87382b4..7767f59 100644
+index 5016722..cdebb40 100644
 --- a/bytecaskdb/db_recovery.cpp
 +++ b/bytecaskdb/db_recovery.cpp
 @@ -229,7 +229,6 @@ auto DB::recovery_prepare_files(EngineState &s)
@@ -18,12 +18,12 @@ index 87382b4..7767f59 100644
      auto data_file =
          openDataFileForRead(p, io_backend_, pool_, file_id);
  
-@@ -246,7 +245,7 @@ auto DB::recovery_prepare_files(EngineState &s)
-       flush_hints_for(data_file, dir_, [&](Offset end) {
-         recovery_check_tail(*data_file, end, data_paths);
-         if (end < data_file->size()) {
--          truncate_durably(p, end);
-+          std::filesystem::resize_file(p, end);
-           cut = true;
-         }
-       });
+@@ -252,7 +251,7 @@ auto DB::recovery_prepare_files(EngineState &s)
+         // is unchanged, and no reader addresses anything above it. Frames
+         // past the new end are orphans CLOCK reclaims.
+         data_file.reset();
+-        truncate_durably(p, stage.end);
++        std::filesystem::resize_file(p, stage.end);
+         data_file = openDataFileForRead(p, io_backend_, pool_, file_id);
+       }
+       write_hint(std::move(stage), dir_, p.stem().string());

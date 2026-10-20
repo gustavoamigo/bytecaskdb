@@ -14,6 +14,7 @@ module;
 #include <exception>
 #include <filesystem>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -94,11 +95,6 @@ void DB::dispatch_hint(std::shared_ptr<DataFile> file) {
 #endif
 }
 
-// Writes the hint file for a single data file using the temp-then-rename
-// protocol. Batch-aware: entries between BulkBegin and BulkEnd are buffered
-// and written only when BulkEnd is seen; an incomplete batch (crash
-// mid-write) is silently discarded. Idempotent: skips files whose .hint
-// already exists.
 // True when the error says a file's bytes are bad or cannot be delivered — a
 // CRC or parse failure, EIO, a short read — which a rebuild answers for a
 // hint and a skip for a data file. False for an error of the process or the
@@ -150,95 +146,114 @@ auto DB::open_hint_or_skip(const std::shared_ptr<DataFile> &data_file,
   }
 }
 
-void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
-                         const std::filesystem::path &dir,
-                         const TailCut &cut) {
-  const auto stem = file->path().stem().string();
-  const auto hint_path = dir / (stem + ".hint");
-  const auto tmp_path = dir / (stem + ".hint.tmp");
-
-  if (std::filesystem::exists(hint_path)) {
-    return;
-  }
-
-  auto hint = HintFile::OpenForWrite(tmp_path);
-
+auto DB::stage_hint(const DataFile &file, OnDamage on_damage) -> HintStage {
   // Put and Delete entries go out sorted by key, restoring what BC-088
   // introduced and 45d0e90 traded away for O(1) working memory. Sorting costs
   // one buffer per data file — bounded by max_file_bytes, not by the database
   // — and lets recovery bulk-load a B+ tree instead of inserting key by key.
   // Every reader resolves entries by sequence rather than by position, so the
   // order is free to serve the key directory being built.
-  //
-  // They are staged here first. Keys live in one arena: the scanner's key
-  // span dies on the next advance, and a vector per entry would cost an
-  // allocation per key.
-  struct Staged {
-    std::uint64_t seq;
-    std::uint64_t file_off;
-    std::uint32_t val_size;
-    std::uint32_t key_off;
-    std::uint32_t key_len;
-    EntryType type;
+  HintStage stage;
+  const auto keep = [&](std::span<const std::byte> bytes) {
+    stage.arena.insert(stage.arena.end(), bytes.begin(), bytes.end());
   };
-  std::vector<Staged> staged;
-  std::vector<std::byte> key_arena;
-
-  auto committed =
-      scan_committed(*file, 0, cut ? OnDamage::Stop : OnDamage::Throw);
+  auto committed = scan_committed(file, 0, on_damage);
   auto it = committed.begin();
   for (; it != std::default_sentinel; ++it) {
     const auto &[entry, entry_off] = *it;
-    if (entry.entry_type == EntryType::BulkBegin ||
-        entry.entry_type == EntryType::BulkEnd) {
+    HintStage::Entry e{.seq = entry.sequence,
+                       .file_off = entry_off,
+                       .val_size = 0,
+                       .key_off = narrow<std::uint32_t>(stage.arena.size()),
+                       .key_len = 0,
+                       .type = entry.entry_type};
+    switch (entry.entry_type) {
+    case EntryType::BulkBegin:
+    case EntryType::BulkEnd:
       // Structural markers carry no key; recovery ignores them. They stay in
       // scan order ahead of the sorted run.
-      hint.append(entry.sequence, entry.entry_type, entry_off, {}, 0);
-      continue;
-    }
-    if (entry.entry_type == EntryType::ChangeMarker) {
+      stage.markers.push_back({entry.sequence, entry_off, entry.entry_type});
+      break;
+    case EntryType::ChangeMarker:
       // Recovery rebuilds the marker list from hints alone, so the id goes
       // with the entry. Keyless, like the batch markers, ahead of the run.
-      hint.append_change_marker(entry.sequence, entry_off,
-                                decode_marker_id(entry.value));
-      continue;
-    }
-    if (entry.entry_type == EntryType::RangeDel) {
+      e.val_size = narrow<std::uint32_t>(entry.value.size());
+      keep(entry.value);
+      stage.keyless.push_back(e);
+      break;
+    case EntryType::RangeDel:
       // A range tombstone's key is a range bound, not a key of the file, so
       // it must not join the sorted run — deduplicating by key would let it
       // collide with a real key. Recovery's tombstone handling is order
       // independent, so writing these first is safe.
-      hint.append_range_del(entry.sequence, entry_off, entry.key,
-                            entry.value);
-    } else {
-      staged.push_back({entry.sequence, entry_off,
-                        narrow<std::uint32_t>(entry.value.size()),
-                        narrow<std::uint32_t>(key_arena.size()),
-                        narrow<std::uint32_t>(entry.key.size()),
-                        entry.entry_type});
-      key_arena.insert(key_arena.end(), entry.key.begin(), entry.key.end());
+      e.key_len = narrow<std::uint32_t>(entry.key.size());
+      e.val_size = narrow<std::uint32_t>(entry.value.size());
+      keep(entry.key);
+      keep(entry.value);
+      stage.keyless.push_back(e);
+      break;
+    case EntryType::Put:
+    case EntryType::Delete:
+      e.key_len = narrow<std::uint32_t>(entry.key.size());
+      e.val_size = narrow<std::uint32_t>(entry.value.size());
+      keep(entry.key);
+      stage.keyed.push_back(e);
+      break;
     }
   }
+  stage.end = it.committed_offset();
+  return stage;
+}
 
-  if (cut) {
-    try {
-      cut(it.committed_offset());
-    } catch (...) {
-      std::error_code ec;
-      std::filesystem::remove(tmp_path, ec);
-      throw;
-    }
-  }
-
-  auto key_of = [&](const Staged &e) {
-    return std::span<const std::byte>{key_arena.data() + e.key_off, e.key_len};
+void DB::write_hint(HintStage stage, const std::filesystem::path &dir,
+                    const std::string &stem) {
+  const auto hint_path = dir / (stem + ".hint");
+  const auto tmp_path = dir / (stem + ".hint.tmp");
+  const auto bytes = [&](std::uint32_t off, std::uint32_t len) {
+    return std::span<const std::byte>{stage.arena.data() + off, len};
+  };
+  const auto key_of = [&](const HintStage::Entry &e) {
+    return bytes(e.key_off, e.key_len);
   };
   // Key ascending, and within a key sequence descending, so the first entry
   // for each key is the authoritative one.
-  std::ranges::sort(staged, [&](const Staged &a, const Staged &b) {
+  std::ranges::sort(stage.keyed, [&](const auto &a, const auto &b) {
     const auto c = recovery_key_cmp(key_of(a), key_of(b));
     return c < 0 || (c == 0 && a.seq > b.seq);
   });
+
+  const auto value_of = [&](const HintStage::Entry &e) {
+    return bytes(e.key_off + e.key_len, e.val_size);
+  };
+
+  auto hint = HintFile::OpenForWrite(tmp_path);
+  // The keyless entries go first in scan order: the batch markers and the
+  // rest, merged back by their offsets in the file.
+  auto marker = stage.markers.begin();
+  const auto put_markers_before = [&](std::uint64_t file_off) {
+    for (; marker != stage.markers.end() && marker->file_off < file_off;
+         ++marker)
+      hint.append(marker->seq, marker->type, marker->file_off, {}, 0);
+  };
+  for (const auto &e : stage.keyless) {
+    put_markers_before(e.file_off);
+    switch (e.type) {
+    case EntryType::ChangeMarker:
+      hint.append_change_marker(e.seq, e.file_off,
+                                decode_marker_id(value_of(e)));
+      break;
+    case EntryType::RangeDel:
+      hint.append_range_del(e.seq, e.file_off, key_of(e), value_of(e));
+      break;
+    case EntryType::Put:
+    case EntryType::Delete:
+    case EntryType::BulkBegin:
+    case EntryType::BulkEnd:
+      panic("write_hint: stage_hint keeps keyed entries and batch markers "
+            "out of the keyless ones");
+    }
+  }
+  put_markers_before(std::numeric_limits<std::uint64_t>::max());
   // BC-088 also deduplicated, keeping the highest-sequence entry per key.
   // That is not done here: file_stats.min_sequence and max_sequence are
   // rebuilt at recovery from the entries the hint file still holds, and
@@ -246,7 +261,7 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
   // raise min_sequence above a sequence the data file really contains, and
   // replication would then skip the file. Recovering it needs the bounds in
   // the hint header, which is a format change.
-  for (const auto &e : staged)
+  for (const auto &e : stage.keyed)
     hint.append(e.seq, e.type, e.file_off, key_of(e), e.val_size);
 
   hint.close();
@@ -257,6 +272,13 @@ void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
   // Only restart time depends on this: a lost rename leaves the file
   // hint-less, and the next open rebuilds the hint from it.
   sync_directory(dir, "io_dir_sync_hint");
+}
+
+void DB::flush_hints_for(const std::shared_ptr<DataFile> &file,
+                         const std::filesystem::path &dir) {
+  const auto stem = file->path().stem().string();
+  if (std::filesystem::exists(dir / (stem + ".hint"))) return;
+  write_hint(stage_hint(*file, OnDamage::Throw), dir, stem);
 }
 
 // Writes hint files for all sealed data files in the given state.
