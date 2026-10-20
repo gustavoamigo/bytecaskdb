@@ -1,0 +1,474 @@
+# SQL front end for the MVP: dialect subset and statement IR
+
+Status: **design, for review (#492).** Nothing here is built. It decides
+the SQL the MVP accepts, the intermediate form the code generator prints
+plans from, and the planner's choices, all scoped by TPROC-C (#487, *MVP*).
+The rest of #492 (rewrites, hash joins, `EXPLAIN`, the plan cache's design)
+comes after the MVP and is listed under *Later*.
+
+## Standing rules
+
+- **Do what PostgreSQL does.** Every accepted construct has PostgreSQL 17's
+  semantics, and the proof machine compares it with PostgreSQL.
+- **Never wait.** Nothing here blocks. `FOR UPDATE` is a guard, checked at
+  commit (`docs/transaction_design.md`).
+- **Only the compiler's plans are supported.** The IR and the code
+  generator are the only source of plan text.
+- **Refuse rather than guess.** A statement outside the subset is refused at
+  parse or bind with a message and a position, before anything runs.
+
+## Where the statements come from
+
+HammerDB's PostgreSQL TPROC-C runs each transaction as one PL/pgSQL
+procedure. Those procedures are set-oriented: `UNNEST` over arrays,
+`array_agg`, DML inside CTEs, `UPDATE … FROM`, `RETURNING … INTO`. The MVP
+has no procedures (#495) and none of those forms.
+
+HammerDB's MySQL driver also has a client-side mode
+(`mysql_no_stored_procs`, `src/mysql/mysqloltp.tcl`). The driver sends
+each statement itself and keeps the procedure's logic (the random choices,
+`s_quantity`'s wrap, `ol_amount`, the new `c_data`) in the client. These are
+the per-row statements of the TPC-C specification's transaction profiles,
+the ones HammerDB's MySQL procedures run against InnoDB, the MVP's baseline.
+
+**The MVP harness sends those statements**, in PostgreSQL's dialect, with
+`$n` parameters where HammerDB splices values into the text. The client
+logic stays in the harness. Three are rewritten to mean in PostgreSQL what
+they mean in HammerDB (*Open questions*, 1 and 3):
+- Delivery's `LIMIT 1` without `ORDER BY` relies on InnoDB returning the
+  primary key's order; it becomes `ORDER BY no_o_id LIMIT 1`, the
+  specification's "lowest `no_o_id`".
+- Order-Status's derived table, `SELECT … FROM (SELECT … ORDER BY o_id
+  DESC) AS sb LIMIT 1`, is flattened to `… ORDER BY o_id DESC LIMIT 1`.
+- `history` has no key in HammerDB. The schema fixture
+  (`tests/tpcc_schema.cppm`) gives it `h_id`, supplied by the harness until
+  sequences exist.
+
+## The statements
+
+Columns: the statement as the harness sends it; whether the layer runs it
+today; what it lacks. Each runs inside a `Transaction`
+(`docs/transaction_design.md`), which none can do today.
+
+**Payment** (43% of the mix):
+
+| # | Statement | Today | Missing |
+|---|---|---|---|
+| P1 | `UPDATE warehouse SET w_ytd = w_ytd + $1 WHERE w_id = $2` | no | `col + $n` (today only `col - $n`) |
+| P2 | `SELECT w_street_1, w_street_2, w_city, w_state, w_zip, w_name FROM warehouse WHERE w_id = $1` | yes | |
+| P3 | `UPDATE district SET d_ytd = d_ytd + $1 WHERE d_w_id = $2 AND d_id = $3` | no | `col + $n` |
+| P4 | `SELECT d_street_1, …, d_name FROM district WHERE d_w_id = $1 AND d_id = $2` | yes | |
+| P5 | `SELECT count(c_id) FROM customer WHERE c_last = $1 AND c_d_id = $2 AND c_w_id = $3` | no | `COUNT`; an equality prefix of `customer_i2` |
+| P6 | `SELECT c_first, c_middle, c_id, c_street_1, …, c_balance, c_since FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_last = $3 ORDER BY c_first` | no | an equality prefix; `ORDER BY` from the index |
+| P7 | `SELECT c_first, c_middle, c_last, …, c_since FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3` | yes | |
+| P8 | `SELECT c_data FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3` | yes | |
+| P9 | `UPDATE customer SET c_balance = $1, c_data = $2 WHERE c_w_id = $3 AND c_d_id = $4 AND c_id = $5` | yes | |
+| P10 | `UPDATE customer SET c_balance = $1 WHERE c_w_id = $2 AND c_d_id = $3 AND c_id = $4` | yes | |
+| P11 | `INSERT INTO history (h_id, h_c_d_id, h_c_w_id, h_c_id, h_d_id, h_w_id, h_date, h_amount, h_data) VALUES ($1, …, $9)` | yes | |
+
+**Order-Status** (4%):
+
+| # | Statement | Today | Missing |
+|---|---|---|---|
+| O1 | `SELECT count(c_id) FROM customer WHERE c_last = $1 AND c_d_id = $2 AND c_w_id = $3` | no | as P5 |
+| O2 | `SELECT c_balance, c_first, c_middle, c_id FROM customer WHERE c_last = $1 AND c_d_id = $2 AND c_w_id = $3 ORDER BY c_first` | no | as P6 |
+| O3 | `SELECT c_balance, c_first, c_middle, c_last FROM customer WHERE c_id = $1 AND c_d_id = $2 AND c_w_id = $3` | yes | |
+| O4 | `SELECT o_id, o_carrier_id, o_entry_d FROM orders WHERE o_d_id = $1 AND o_w_id = $2 AND o_c_id = $3 ORDER BY o_id DESC LIMIT 1` | no | a prefix of `orders_i2`, scanned in reverse; `LIMIT` |
+| O5 | `SELECT ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_delivery_d FROM order_line WHERE ol_o_id = $1 AND ol_d_id = $2 AND ol_w_id = $3` | no | an equality prefix of the primary key |
+
+**New-Order** (45%; N4 to N7 once per order line, 5 to 15 times):
+
+| # | Statement | Today | Missing |
+|---|---|---|---|
+| N1 | `SELECT c_discount, c_last, c_credit, w_tax FROM customer, warehouse WHERE w_id = $1 AND c_w_id = $1 AND c_d_id = $2 AND c_id = $3` | no | a join of two point lookups |
+| N2 | `SELECT d_next_o_id, d_tax FROM district WHERE d_id = $1 AND d_w_id = $2 FOR UPDATE` | no | `FOR UPDATE` |
+| N3 | `UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_id = $1 AND d_w_id = $2` | no | an integer literal; `col + constant` |
+| N4 | `SELECT i_price, i_name, i_data FROM item WHERE i_id = $1` | yes | (no row: the harness rolls back, 1% of orders) |
+| N5 | `SELECT s_quantity, s_data, s_dist_01, …, s_dist_10 FROM stock WHERE s_i_id = $1 AND s_w_id = $2` | yes | |
+| N6 | `UPDATE stock SET s_quantity = $1 WHERE s_i_id = $2 AND s_w_id = $3` | yes | |
+| N7 | `INSERT INTO order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_dist_info) VALUES ($1, …, $9)` | yes | |
+| N8 | `INSERT INTO orders (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_ol_cnt, o_all_local) VALUES ($1, …, $7)` | yes | |
+| N9 | `INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES ($1, $2, $3)` | yes | |
+
+**Delivery** (4%; once per district, ten times):
+
+| # | Statement | Today | Missing |
+|---|---|---|---|
+| D1 | `SELECT no_o_id FROM new_order WHERE no_w_id = $1 AND no_d_id = $2 ORDER BY no_o_id LIMIT 1` | no | a primary-key prefix, covering; `ORDER BY` / `LIMIT` |
+| D2 | `DELETE FROM new_order WHERE no_w_id = $1 AND no_d_id = $2 AND no_o_id = $3` | yes | |
+| D3 | `SELECT o_c_id FROM orders WHERE o_id = $1 AND o_d_id = $2 AND o_w_id = $3` | yes | |
+| D4 | `UPDATE orders SET o_carrier_id = $1 WHERE o_id = $2 AND o_d_id = $3 AND o_w_id = $4` | yes | |
+| D5 | `UPDATE order_line SET ol_delivery_d = $1 WHERE ol_o_id = $2 AND ol_d_id = $3 AND ol_w_id = $4` | no | an UPDATE of every row under a key prefix |
+| D6 | `SELECT SUM(ol_amount) FROM order_line WHERE ol_o_id = $1 AND ol_d_id = $2 AND ol_w_id = $3` | no | `SUM` |
+| D7 | `UPDATE customer SET c_balance = c_balance + $1 WHERE c_id = $2 AND c_d_id = $3 AND c_w_id = $4` | no | `col + $n` |
+
+HammerDB's PostgreSQL procedure finds D1's order with `min(no_o_id)`. `MIN`
+is in the subset too (#487 lists it), planned as D1's scan.
+
+**Stock-Level** (4%):
+
+| # | Statement | Today | Missing |
+|---|---|---|---|
+| S1 | `SELECT d_next_o_id FROM district WHERE d_w_id = $1 AND d_id = $2` | yes | |
+| S2 | `SELECT COUNT(DISTINCT s_i_id) FROM order_line, stock WHERE ol_w_id = $1 AND ol_d_id = $2 AND ol_o_id < $3 AND ol_o_id >= $3 - 20 AND s_w_id = $1 AND s_i_id = ol_i_id AND s_quantity < $4` | no | a join on a column of the outer row; a range after an equality prefix; a computed bound; a residual filter; `COUNT(DISTINCT)` |
+
+**The load.** HammerDB loads with multi-row `INSERT … VALUES` built as
+text. The MVP's loader inserts one row per prepared statement, `INSERT INTO
+t (…) VALUES ($1, …)`, which runs today, many rows to a transaction. A
+multi-row `VALUES` is later.
+
+## The dialect subset
+
+The parser stays libpg_query 17, transformed into the layer's AST
+(#492, *Decided*). The binder resolves names against the pinned catalog and
+types every expression, as PostgreSQL does. What the MVP adds:
+
+**Statements.**
+- `SELECT` targets: columns, `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT
+  col)`, `SUM(col)`, `MIN(col)`. No `GROUP BY`; an aggregate makes the query
+  ungrouped and returns exactly one row. A query mixing aggregates and bare
+  columns is refused (42803), as in PostgreSQL.
+- `FROM`: one table, or two joined by a comma or `[INNER] JOIN … ON`.
+  Columns may be qualified by the table's name; table aliases are later.
+- `UPDATE` and `DELETE` whose `WHERE` names any number of rows, not only
+  one primary key.
+- `ORDER BY`, `LIMIT`, and `FOR UPDATE`, below.
+
+**Literals and expressions.**
+- Integer literals, typed as PostgreSQL types them: `integer` if they fit,
+  else `bigint`, else refused. Other literals stay refused: values travel as
+  parameters (`docs/testing_design.md`).
+- `+` and `-` on integers and on `DECIMAL`, with PostgreSQL's result type:
+  `smallint + smallint` is `smallint`, `integer + bigint` is `bigint`, and
+  so on. `DECIMAL ± DECIMAL` keeps the larger scale; the MVP needs only
+  equal scales, and refuses the rest. The result is checked against its
+  type at the operation, as PostgreSQL's operators check it:
+  `integer out of range`, `smallint out of range`, `numeric field
+  overflow`, SQLSTATE 22003. An expression involving NULL is NULL.
+- `*`, `/`, string concatenation and functions are not in the MVP:
+  TPROC-C's arithmetic on values (`ol_amount`, the new `c_data`) is the
+  client's, in HammerDB's driver as in the harness.
+- Where expressions may appear: `SET col = expr`, a comparison's operand
+  (`ol_o_id >= $3 - 20`), and `VALUES`.
+
+**`WHERE`.** A conjunction (`AND`) of comparisons (`=`, `<`, `<=`, `>`,
+`>=`) between expressions, in any order, on any columns. No `OR`, `NOT`,
+`IN`, `BETWEEN`, `IS NULL` or subqueries in the MVP. A comparison with NULL
+is not true, so it rejects the row, as in SQL's three-valued logic.
+Comparing two columns of different SQL types is refused (see *Known
+differences*).
+
+**`ORDER BY` and `LIMIT`.** `ORDER BY` a list of columns, each `ASC` or
+`DESC`; ties come back in any order, as PostgreSQL allows. `LIMIT` takes an
+integer literal or a parameter; `LIMIT NULL` is no limit, and a negative
+limit is refused (2201W), as in PostgreSQL. `OFFSET` is not in the MVP.
+
+**Aggregates**, with PostgreSQL's results:
+- `COUNT(*)` counts rows, `COUNT(col)` non-NULL values, `COUNT(DISTINCT
+  col)` distinct non-NULL values. All three are `bigint`, and 0 over no
+  rows.
+- `SUM` over `SMALLINT` or `INTEGER` is `bigint`, over `BIGINT` or
+  `DECIMAL` is `numeric`, kept at the input's scale. NULL over no rows.
+- `MIN` is of the column's type, and NULL over no rows.
+
+**`FOR UPDATE`**, on a single-table `SELECT`, inside a transaction:
+- every row returned is guarded with `bc_guard_unchanged`, and the commit
+  fails with 40001 if another transaction committed a change to one first;
+- refused with an aggregate (0A000, "FOR UPDATE is not allowed with
+  aggregate functions"), as PostgreSQL refuses it;
+- on a join, later.
+
+**Parameters** are typed by use, as PostgreSQL types `$n`:
+- compared with a column, or combined with one in arithmetic: the column's
+  type, the rule #523 set;
+- assigned to a column: the column's type;
+- combined only with an integer literal (`$3 - 20` where `$3` has no other
+  use): `integer`;
+- otherwise: "could not determine data type of parameter $n" (42P18).
+
+**Refused**, with a message and the node's position: everything not above.
+That includes `OR`, subqueries, derived tables, `GROUP BY`, `HAVING`,
+`DISTINCT` on the select list, outer joins, three or more tables, table
+aliases, `OFFSET`, `RETURNING`, set operations, functions, and literals
+other than integers.
+
+## The statement IR
+
+Today's code generator prints C from string templates, one per statement
+form, and its seven forms already strain them (#492, *Decided*). The
+planner builds a small tree instead, and the code generator prints each
+node with one fixed pattern. A plan's text is a pure function of the IR,
+so golden plans pin the planner's choices and the printing together.
+
+```cpp
+namespace bytecask::sql::ir {
+
+// A value in scope: a parameter, a constant, or a column or key part of a
+// row an outer loop holds. Typed: its SqlType decides its decoder, its
+// NULL handling and its arithmetic.
+struct Expr {
+  enum class Kind { Param, Const, Column, KeyPart, Add, Sub } kind;
+  SqlType type;
+  std::uint32_t param{0}, loop{0}, col{0};  // Param; Column and KeyPart: which loop, which column
+  std::int64_t constant{0};                 // Const
+  std::unique_ptr<Expr> lhs, rhs;           // Add, Sub
+};
+
+struct Compare { ast::Compare::Op op; Expr lhs, rhs; };
+
+// How one table is reached: a point lookup, or a scan of a key range.
+struct Access {
+  std::uint32_t table;
+  std::uint32_t object;              // the table (its primary key) or one of its indexes
+  std::vector<Expr> eq;              // leading key parts, by equality
+  std::optional<Expr> lo, hi;        // one range part after them; inclusive or not, below
+  bool lo_inclusive{true}, hi_inclusive{false};
+  bool point{false};                 // eq covers the whole primary key
+  bool reverse{false};
+  bool covering{false};              // every column used comes from the key
+  std::vector<Compare> residual;     // the conjuncts the key does not express, in WHERE order
+};
+
+struct Aggregate { enum class Fn { CountStar, Count, CountDistinct, Sum, Min } fn; Expr arg; };
+
+struct Select {
+  std::vector<Access> loops;         // outer first; an inner key may name outer columns
+  std::vector<Expr> targets;         // or
+  std::optional<Aggregate> aggregate;
+  bool count_from_keys{false};       // COUNT answered by bc_count_range
+  bool min_from_first_key{false};    // MIN answered by the first entry
+  std::optional<Expr> limit;
+  bool for_update{false};
+};
+
+struct Insert { std::uint32_t table; std::vector<std::optional<Expr>> values; };  // per column; nullopt: default
+struct Update { Access rows; std::vector<std::pair<std::uint32_t, Expr>> set; };
+struct Delete { Access rows; };
+
+using Statement = std::variant<Select, Insert, Update, Delete>;
+
+}  // namespace bytecask::sql::ir
+```
+
+**How each construct maps to the plan API.** No new loop or structure is
+needed; every pattern below uses calls `bc_plan.h` declares.
+
+| Construct | IR | Plan text |
+|---|---|---|
+| A whole primary key by equality | `Access{point}` | `bc_key_params` (consecutive parameters) or `bc_key_begin` / `bc_key_*` / `bc_key_end`; `bc_get` |
+| An equality prefix | `Access{eq}` | `bc_scan_open(lo = hi = prefix, BC_SCAN_PREFIX)` |
+| A prefix and a range | `Access{eq, lo, hi}` | bounds from `bc_key_*`; an exclusive `lo` or an inclusive `hi` through `bc_key_successor` (`bc_plan.h`, *bounds*) |
+| `DESC` order | `reverse` | `BC_SCAN_REVERSE` |
+| A covering read | `covering` | `bc_key_part_*` on `bc_scan_key`; otherwise `bc_scan_row` |
+| A residual filter | `residual` | `bc_col_*` or `bc_key_part_*`, compared in an `if` that `continue`s; a NULL operand rejects the row |
+| `+` / `-` | `Expr{Add, Sub}` | `bc_add` / `bc_sub`, then the range check of its type (*Additions*) |
+| `SET col = col + $1` | `Update{set}` | `bc_row_from`, `bc_row_set_*` with the sum, `bc_update` |
+| UPDATE or DELETE of many rows | `Update{rows}`, `Delete{rows}` | the scan, with `bc_update` / `bc_delete` per row; `bc_emit_count` with the rows written |
+| `ORDER BY` | the access path's order | none: the planner picks a path in that order |
+| `LIMIT` | `limit` | an `int64_t` counter; `break` at the limit |
+| `COUNT(*)`, `COUNT(col NOT NULL)`, no residual | `count_from_keys` | `bc_count_range` over the access path's range |
+| `COUNT`, `SUM` otherwise | `aggregate` | an accumulator local, `bc_add`; a "seen" `bool` for SUM's NULL |
+| `MIN(col)`, `col` the part after the equality prefix | `min_from_first_key` | the first entry of a forward scan, then `break` |
+| `COUNT(DISTINCT col)` | `aggregate` | `bc_agg_group` keyed by the column, then a count of `bc_agg_next` |
+| A join | `loops[1]` | the inner key built from the outer row: `bc_key_*` of `bc_col_*`; nested in the outer loop |
+| `FOR UPDATE` | `for_update` | `bc_guard_unchanged` on each returned row's key: the point key, or `bc_row_key` |
+| Targets | `targets` | `bc_emit_col`, `bc_emit_key_part`, `bc_emit_i64` / `bc_emit_null` for an aggregate |
+
+A NULL parameter that a key needs ends the plan early, as today: no row
+equals NULL.
+
+**Additions to the plan API.** One is needed; the implementation PR designs
+it.
+- **A range check for computed integers and decimals.** `ol_o_id >= $3 - 20`
+  computes an `integer` that never reaches a row builder, and PostgreSQL
+  raises 22003 when such an operation leaves its type. Today
+  `bc_add` / `bc_sub` check only `int64_t`, and the row builder checks only
+  what it stores. The call takes the value and the SQL type the compiler
+  resolved, and sets `BC_C_RANGE` when the value is outside it.
+  - *The rule:* which type an operation is in is a decision, the
+    compiler's operator resolution, so it shows in the plan text as one
+    call. What the type's bounds are is mechanics, in the runtime with the
+    row builder's.
+  - Assignments need no call: the row builder checks the stored value
+    already (`CONTRACT.md`, the row on values outside their declared type).
+
+`COUNT(DISTINCT)` uses the aggregate structure `bc_plan.h` already
+declares: its calls exist but set `BC_E_HANDLE` today, so Stock-Level's
+slice implements them.
+
+## The planner's choices for the MVP
+
+All deliberately naive: rules, no cost model, chosen so every TPROC-C
+statement gets the plan a person would write.
+
+**Access path, per table.**
+1. Every primary-key column compared for equality: a point lookup.
+2. Otherwise, of the primary key and each index, the one with the longest
+   leading run of equality-compared parts, then optionally one part with a
+   range. Ties go to the one whose order serves `ORDER BY`, then to the
+   primary key, then to the covering one, then to the lower id.
+3. No usable leading part: refused, "no plan: a full scan of t" (see *Open
+   questions*, 5).
+
+`bc_count_range` cardinalities are not consulted. With TPROC-C's schema
+every statement has a full key or a selective prefix, so a cost model
+changes no plan.
+
+**Where filters run.** Each conjunct the key expresses becomes a bound.
+Every other conjunct is a residual, run on the row as soon as its loop
+reaches it, before anything is counted, emitted, guarded or written: S2's
+`s_quantity < $4` runs on each `stock` row the join fetches. Of two bounds
+on one side, the first in `WHERE` order is the key bound and the other a
+residual.
+
+**`ORDER BY`** is served only by the access path's order, forward or
+reverse; a query whose order no path gives is refused in the MVP. A sorter
+(`bc_sorter_*`) comes with the first statement that needs one.
+
+**Joins.** Index nested loop only, two tables only.
+- The outer table is the one reachable from parameters alone, a point
+  lookup over a scan. The inner one must be reachable from the outer row's
+  columns and parameters, by a point lookup or a prefix; otherwise the join
+  is refused.
+- N1: both are point lookups; the order is the `FROM` order.
+- S2: `order_line` is outer (a prefix and a range from parameters), and
+  `stock` is a point lookup by `(ol_i_id, $1)`.
+- Hash joins wait for a statement that needs one.
+
+**Writes inside a statement.** An `UPDATE` or `DELETE` of many rows writes
+each row as its scan reaches it. The statement reads the transaction's view
+as it stood at the statement's start (`docs/transaction_design.md`,
+*Statements inside a transaction*), so its own writes never feed back into
+its scan.
+
+## Tests
+
+**Golden plans.** Every TPROC-C statement above is compiled against the
+schema fixture, and its plan text is checked in, as
+`tests/golden/<statement>.sql` and `.c`. A test recompiles each and fails on
+any difference. A change to the code generator regenerates them with a
+flag, and the PR shows the diff. They are the MVP's TPROC-C plans: the
+hand-written ones of the validation phase are dropped (#487).
+
+**The proof machine against PostgreSQL** (`docs/testing_design.md`). Each
+slice adds the rules for what it brings:
+- tables with secondary indexes, unique or not (testing increment 2 folds
+  in here);
+- `SELECT` by a key prefix or a range, with residual filters, `ORDER BY`
+  each way and `LIMIT`. Rows are compared in `ORDER BY` order, and as a
+  multiset within each run of equal sort keys;
+- `UPDATE … SET col = col ± expr` and `UPDATE` / `DELETE` of many rows,
+  with their counts;
+- each aggregate, over empty and NULL inputs;
+- two-table joins;
+- arithmetic at the edges of `SMALLINT`, `INTEGER` and `DECIMAL`: both
+  sides refuse with 22003, or both run;
+- `FOR UPDATE`: on one connection the same rows as without it; refused with
+  an aggregate on both sides.
+
+Refusals of what the subset leaves out are tested with their message and
+position, as `binder_test` tests today's.
+
+**Each transaction against PostgreSQL.** Each slice adds a test that runs
+its TPROC-C transaction through SQL: a small fixture (one warehouse, scaled
+down), a fixed seed, one thread. It sends the same statements and
+parameters to PostgreSQL through psycopg, and compares every table after N
+transactions. Concurrency is the MVP gate's: the harness at 1, 16 and 48
+threads and Elle through SQL (#487, 2.6).
+
+No micro-benchmarks: this is correctness work. `sql_layer_bench` runs only
+for a speedup claim.
+
+## Slices
+
+Each slice is one vertical PR: the parser, the binder, the IR and the code
+generator for what it adds, its proof-machine rules, its golden plans and
+its transaction test.
+
+0. **The IR, for today's forms only.** The planner builds the IR and the code
+   generator prints from it; no new SQL. Golden plans for today's forms
+   land here, and their diff against today's plans is reviewed. (*Open
+   questions*, 2.)
+1. **Payment and Order-Status:** `col + $n` on `DECIMAL`, equality
+   prefixes on the primary key and on an index, `ORDER BY` from the index,
+   reverse scans, `LIMIT`, `COUNT` from `bc_count_range`. Run statement by
+   statement until #491's `Transaction` lands.
+2. **Multi-statement transactions** (#491, another session): the
+   statements of slice 1 run in a `Transaction`.
+3. **New-Order:** the two-point join, `FOR UPDATE`, integer literals,
+   `col + 1`.
+4. **Delivery:** the covering prefix scan with `LIMIT 1`, `MIN`, `UPDATE`
+   of many rows, `SUM`.
+5. **Stock-Level:** the join on an outer column, a range after a prefix,
+   residual filters, a computed bound with its range check (the addition
+   above), `COUNT(DISTINCT)` and the aggregate calls.
+
+Then the MVP gate.
+
+## Known differences from PostgreSQL
+
+| PostgreSQL | This layer | Why |
+|---|---|---|
+| `SUM` over `DECIMAL` is unbounded `numeric`. | Past 18 digits it is 22003. | `DECIMAL` is a scaled `int64_t` (`docs/types_design.md`). No TPROC-C sum comes near. |
+| Comparing columns of different types casts one to the other's. | Refused, in a `WHERE` and a join. | One key encoding per comparison. TPROC-C compares columns of one type only. |
+
+Both are also refusals rather than different answers. Everything else in
+the subset matches PostgreSQL, and the proof machine checks that it does.
+
+## Proposed `CONTRACT.md` changes
+
+Not yet in `bytecaskdb-sql-layer/CONTRACT.md`. Each goes in with the slice
+that builds it, named in its PR.
+
+**Added (SQL):**
+| Guarantee | Proved by |
+|---|---|
+| A statement outside the supported subset is refused with a SQL error naming the construct and its position, before anything runs or is written. | to add |
+| `ORDER BY` returns rows in that order, ties in any order, and `LIMIT n` returns the first `n`. | to add |
+| An aggregate query returns one row: `COUNT` 0 and `SUM` and `MIN` NULL over no rows. | to add |
+| An `UPDATE` or `DELETE` affects exactly the rows that matched when it began, and reports how many. | to add |
+| Arithmetic whose result leaves its type is SQLSTATE 22003, and the statement writes nothing. | to add |
+| A comparison with NULL rejects the row. | to add |
+
+**Widened:** lookups by the whole primary key become lookups by any key
+prefix or range, joins of two tables, and `UPDATE` and `DELETE` of many
+rows.
+
+## Open questions for the owner
+
+1. **Which statements the MVP runs.** *Recommendation:* the per-row
+   statements of HammerDB's MySQL client-side driver, in PostgreSQL's
+   dialect with parameters, as listed above. HammerDB's PostgreSQL
+   procedures would add `UNNEST`, arrays, `array_agg`, DML in CTEs,
+   `UPDATE … FROM` and `RETURNING`, none of which TPROC-C's work needs, and
+   procedures are deferred (#495).
+2. **A slice 0 that moves today's forms onto the IR first.**
+   *Recommendation:* yes. Its diff is the code generator alone, reviewed
+   against golden plans, and slice 1 then only adds.
+3. **Delivery's and Order-Status's rewrites** (*Where the statements come
+   from*). *Recommendation:* rewrite them, since each keeps HammerDB's
+   meaning; derived tables wait for a statement that needs one.
+4. **Range checks on computed values.** *Recommendation:* add the one call
+   above. TPROC-C's values never overflow, but PostgreSQL's operators
+   raise 22003, and a key built from an unchecked value would otherwise
+   search for a number the column cannot hold.
+5. **Full scans and sorts no index provides.** *Recommendation:* refuse
+   them in the MVP ("no plan: …"). PostgreSQL runs them; none of TPROC-C
+   needs one, and each would add a structure (`bc_sorter_*`) or an
+   unbounded read to build and test before the MVP.
+6. **No cost model.** *Recommendation:* rule-based paths for the MVP;
+   `bc_count_range` cardinalities enter with the first workload whose plans
+   a rule gets wrong.
+
+## Later
+
+- `OR`, `IN`, `IS NULL`, subqueries, derived tables, `GROUP BY`, outer
+  joins, three or more tables, `OFFSET`, `RETURNING`, multi-row `VALUES`,
+  string and function expressions, `*` and `/`.
+- Sorters and hash joins, with the bounds `bc_plan.h` gives them.
+- A cost model from `bc_count_range`.
+- `FOR UPDATE` on joins, and the serializable guards
+  (`docs/transaction_design.md`, *Isolation*).
+- `EXPLAIN` as the plan text, and the plan cache's design (#492).
+- The set-oriented PostgreSQL forms of HammerDB's procedures, with
+  procedures (#495).
