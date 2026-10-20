@@ -377,9 +377,8 @@ TEST_CASE("row format: every physical type round-trips, null or not", "[sql][cod
   CHECK(layout.find(5)->pos == 1);
 
   std::mt19937_64 rng{11};
-  RowWriter w{layout};
   for (int i = 0; i < 2000; ++i) {
-    w.reset();
+    RowWriter w{layout};
     CHECK(w.missing_required() == std::optional<std::uint32_t>{0});
     auto id = random_i64(rng);
     auto name = rng() % 3 == 0 ? std::nullopt : OptBytes{random_bytes(rng)};
@@ -429,6 +428,7 @@ TEST_CASE("row format: every physical type round-trips, null or not", "[sql][cod
     CHECK(again == row);
   }
   // The type is checked on set.
+  RowWriter w{layout};
   CHECK_FALSE(w.set_f64(0, 1.0));
   CHECK_FALSE(w.set_bytes(2, Bytes{}));
   CHECK_FALSE(w.set_i64(1, 1));

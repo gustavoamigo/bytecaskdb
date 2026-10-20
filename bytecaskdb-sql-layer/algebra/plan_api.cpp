@@ -2040,21 +2040,32 @@ bc_view bc_row_key(bc_ctx* cx, uint32_t table, bc_view row) {
   return {};
 }
 
+namespace {
+// A builder of table t's current layout with every column null, pushed on
+// the run's rows; its writer is filled by the caller, which pops it again
+// if filling it fails, so a refused bc_row names no half-built row.
+auto push_builder(bc_ctx* cx, const Table& t) -> RowWriter& {
+  cx->rows.push_back(RowBuilder{t.id, &t.layout, RowWriter{t.layout}, false});
+  return cx->rows.back().writer;
+}
+auto last_row(bc_ctx* cx) -> bc_row { return {static_cast<std::uint32_t>(cx->rows.size() - 1), cx->epoch}; }
+}  // namespace
+
 bc_row bc_row_begin(bc_ctx* cx, uint32_t table) {
   BC_GUARD_BEGIN
   const auto* t = cx->table(table);
   if (t == nullptr) return {};
-  cx->rows.push_back(RowBuilder{t->id, &t->layout, RowWriter{t->layout}, false});
   // Every column at its default, so a plan compiled before ADD COLUMN …
   // DEFAULT writes the default without naming the column.
-  auto& w = cx->rows.back().writer;
+  auto& w = push_builder(cx, *t);
   for (const auto& c : t->columns) {
     if (!std::holds_alternative<std::monostate>(c.default_value) && !bytecask::sql::set_datum(w, c.id, c.default_value)) {
+      cx->rows.pop_back();
       cx->fail(BC_E_CORRUPT, "default of column " + c.name + " does not fit its layout");
       return {};
     }
   }
-  return {static_cast<std::uint32_t>(cx->rows.size() - 1), cx->epoch};
+  return last_row(cx);
   BC_GUARD_END(cx)
   return {};
 }
@@ -2069,14 +2080,13 @@ bc_row bc_row_from(bc_ctx* cx, uint32_t table, bc_view old) {
     cx->fail(BC_E_CORRUPT, "malformed row");
     return {};
   }
-  auto r = bc_row_begin(cx, table);
-  if (!cx->ok()) return {};
-  if (!cx->rows[r.i].writer.copy_from(*o)) {
-    cx->rows.pop_back();  // the half-copied builder r names: begun just above, so last
+  // No defaults: the copy sets every column of the layout, present or not.
+  if (!push_builder(cx, *t).copy_from(*o)) {
+    cx->rows.pop_back();
     cx->fail(BC_E_CORRUPT, "malformed row: a column does not decode");
     return {};
   }
-  return r;
+  return last_row(cx);
   BC_GUARD_END(cx)
   return {};
 }

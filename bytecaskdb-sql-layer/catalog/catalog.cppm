@@ -1461,7 +1461,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       if (!row_valid(row) || row_generation(row) != old_layout.generation) {
         throw std::runtime_error("malformed row in table " + t.name);
       }
-      w.reset();
+      // copy_from sets every column of the layout, so the writer needs no reset.
       if (!w.copy_from(row)) throw std::runtime_error("malformed row in table " + t.name);
       Bytes out;
       if (!set_datum(w, c.id, c.default_value) || !w.finish(out)) {
