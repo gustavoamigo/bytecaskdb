@@ -345,7 +345,7 @@ Three more instrument the hint write, mirroring the data file's:
 10. `io_hint_write` — before the CRC trailer `write()` in `HintFile::close()`
 11. `io_hint_sync` — before the `fdatasync()` in `HintFile::close()`
 12. `io_hint_rename` — before `std::filesystem::rename()` in
-    `write_hint()`
+    `flush_hints_for()`
 
 And one for the window a completed rename opens:
 
@@ -1111,8 +1111,8 @@ the data file already has: `io_hint_write`, `io_hint_sync`,
 What makes the matrix cheap to assert is that the expected delta is the
 same in every cell: **a hint file is a rebuildable index, not the record**,
 so a failure generating one may cost recovery time and must not cost keys.
-`recovery_prepare_files` calls `stage_hint` and `write_hint` without a
-catch, so the failure propagates out of `DB::open`; each cell then reopens with the
+`recovery_prepare_files` calls `flush_hints_for` without a catch, so the
+failure propagates out of `DB::open`; each cell then reopens with the
 fault cleared and checks every key back, by value.
 
 #### State shapes
@@ -1130,10 +1130,9 @@ tests were built around, so every shape is recovered both ways.
 
 #### What is out of reach, and why it is not worked around
 
-Six call sites write a hint. Four are synchronous —
-`recovery_prepare_files`, which calls `stage_hint` and `write_hint`, and
-`open_hint_or_rebuild`, `flush_hints` at close and `vacuum_compact_file`,
-which call `flush_hints_for` — and a fault armed on the thread calling
+Six call sites reach `flush_hints_for`. Four are synchronous —
+`recovery_prepare_files`, `open_hint_or_rebuild`, `flush_hints` at close,
+and `vacuum_compact_file` — and a fault armed on the thread calling
 `DB::open` reaches them. The two post-rotation `worker_.dispatch` sites do
 not: `active_injector` is thread-local and the background worker has its
 own. Propagating one into the worker would need it to outlive the stack
@@ -2538,7 +2537,7 @@ focuses the run with `Disable:`.
 | `close_swallows_error`: `close()` drops its final `fdatasync`'s error | #260 (#257) | caught in 0.5–3 min, every run (every life a clean close) |
 | `hint_read_error_kills_process`: a hint read error kills the process | #255 (#237) | caught in 2–5 min, every run |
 | `vacuum_drops_before_durable`: vacuum drops records superseded by non-durable writes | #261 (#245) | caught in 2 of 5 runs of 10 min: rare |
-| `hint_written_in_place`: hints written in place, not renamed | — | not caught since #476: the hint file is created after the cut, so a torn hint lies over a cut file; the `io_hint_write` unit test guards it (before #476, caught twice in ~45 min: rare) |
+| `hint_written_in_place`: hints written in place, not renamed | — | caught twice in ~45 min before #476, in 6 min after: rare |
 | `no_sync_before_degrade`: a failed append degrades without syncing | — | not caught: #240's rewrite in `resume()` covers it |
 | `truncate_lowers_end_after`: the logical end drops after `ftruncate`, not before | #248 (#236) | not caught: the stale end lasts one `resume()` retry; #248's `prove_resume` cell guards it |
 
@@ -2642,10 +2641,10 @@ A site whose break nothing has to catch says why instead.
 
 | Site | Guarded by | Mutation | Origin |
 |---|---|---|---|
-| `write_hint`: written to `.hint.tmp` and renamed into place | `DB recovery: a crash while open writes a hint leaves no hint behind it, …` | `hint_written_in_place` (chaos) | — |
+| `flush_hints_for`: written to `.hint.tmp` and renamed into place | `DB recovery: a crash while open writes a hint leaves no hint behind it, …` | `hint_written_in_place` (chaos) | — |
 | `HintFile::close`: the hint's `fdatasync` before the rename | `*hint_sync_fails*` (`prove_recovery`) | `hint_skips_fdatasync` | — |
-| `write_hint`: the directory sync after the rename | not needed: a lost rename leaves the file hint-less, and the next open rebuilds the hint (`directory sync: a hint rebuilt at open is synced` checks the call is made) | — | #199 |
-| `stage_hint`: batch markers are kept, so a restart's `next_seq` covers them | `a write after a restart does not reuse a batch marker's sequence` | `hint_skips_batch_markers` | 362cc590 |
+| `flush_hints_for`: the directory sync after the rename | not needed: a lost rename leaves the file hint-less, and the next open rebuilds the hint (`directory sync: a hint rebuilt at open is synced` checks the call is made) | — | #199 |
+| `flush_hints_for`: batch markers are kept, so a restart's `next_seq` covers them | `a write after a restart does not reuse a batch marker's sequence` | `hint_skips_batch_markers` | 362cc590 |
 | `open_hint_or_rebuild`: a hint that fails its CRC is rebuilt, not skipped | `DB recovery: a corrupt hint is rebuilt from its data file` | `corrupt_hint_not_rebuilt` | #123 |
 | `open_hint_or_rebuild`: a hint a read fails on is rebuilt | `DB::open rebuilds a hint file a read fails on` | `hint_read_error_kills_process` (chaos) | #255 (#237) |
 | `open_hint_or_rebuild`: an error that says nothing about the bytes leaves the hint alone | `DB::open leaves a hint alone on an error that says nothing about …` | `hint_rebuilt_on_any_error` | #270 (#262) |
@@ -2686,7 +2685,7 @@ A site whose break nothing has to catch says why instead.
 | `recovery_check_tail`: a first header with an unknown type and only zeros after its sequence field has no sequence, so a first write that landed only part of its sequence is cut, while an unknown type before intact records is still refused | `DB recovery: a hint-less file's tail is truncated only in the newest file` | `torn_first_sequence_trusted` (chaos) | #471 |
 | `recovery_check_tail`: a tail is cut in one file per open | `DB recovery: a hint-less file's tail is truncated only in the newest file` | `two_torn_files_both_cut` | #303 |
 | `truncate_durably`: the cut's new length is synced | `DB recovery: open fails when the cut of a torn tail cannot be made or synced, …` | `open_truncate_not_synced` | — |
-| `recovery_prepare_files`: a hint-less file is cut, and the cut synced, before its hint is written | `DB recovery: open fails when the cut of a torn tail cannot be made or synced, …` | `hint_written_before_tail_cut` | #476 |
+| `recovery_prepare_files`: a hint-less file is cut, and the cut synced, before its hint is written | `DB recovery: open fails when the cut of a torn tail cannot be made or synced, …` | `hint_written_before_tail_cut` (chaos) | #476 |
 | `DataFileIterator`: an entry whose size runs past the file ends the sweep | `resume() does not trust an entry size that runs past the file` | `scan_trusts_entry_size` | #36, ed3ad5df |
 | `recovery_undo_interrupted_vacuum`: only a compacted copy of the other file is removed | `recovery refuses two different writes under one sequence` | `interrupted_vacuum_any_pair` | #137 |
 | recovery workers hand their errors to the open instead of terminating | `DB parallel recovery: an unrebuildable hint throws instead of …` | `recovery_worker_error_terminates` | BC-157 |
@@ -2723,7 +2722,7 @@ A site whose break nothing has to catch says why instead.
 - **The commit `fdatasync` had no test of its own.** Removing it failed other tests only because their first sync write was lost with it.
 - **`vacuum preserves BulkBegin/BulkEnd markers` never compacted the batch.** Its batch file held only live entries, which vacuum does not touch. A later write now kills one of them.
 - **Three syncs had no test that could see them.** The hint's `fdatasync`, `resume()`'s sync after its truncate, and open's sync of a cut tail: the page cache model covers data file pages, not hint files or file lengths. Each is guarded the way the directory syncs are, by failing its fault point, which a mutation that removes the sync removes too. The hint's fault point moved into the call (`sync_hint`) for that.
-- **The `hint_written_in_place` mutation had no test of its own;** the rig caught it twice in about 45 minutes. A test now fails the hint write between its frames and its trailer. Since #476 the hint file is created only after the tail is cut, so a hint torn in place lies over a cut file and the rebuild reads it: the rig no longer catches the mutation, and that test is its guard.
+- **The `hint_written_in_place` mutation had no test of its own;** the rig caught it twice in about 45 minutes. A test now fails the hint write between its frames and its trailer. Since #476 the tail is cut before the hint is written, but the rig still catches the mutation: the hint file is created before the scan that finds the tail, so in place it exists while the file is uncut.
 
 - **A failed `fstat` sealed a file as empty.** No checkpoint named the call; the counted fault sweep reached it (*Counted fault sweep*, #317).
 

@@ -1612,8 +1612,6 @@ TEST_CASE("DB recovery: open fails when the cut of a torn tail cannot be "
   const auto torn_size = std::filesystem::file_size(files[2]);
   auto hint = files[2];
   hint.replace_extension(".hint");
-  auto hint_tmp = hint;
-  hint_tmp += ".tmp";
 
   SECTION("the cut fails") {
     bytecask::testing::ScopedFaultInjector fi{"io_truncate"};
@@ -1625,9 +1623,6 @@ TEST_CASE("DB recovery: open fails when the cut of a torn tail cannot be "
     fi.inj.fail_on_nth_match = 2;
     REQUIRE_THROWS_AS(bytecask::DB::open(dir, opts), std::system_error);
   }
-  // The hint is staged in memory, so a failed cut leaves no temporary hint
-  // for the next open to remove.
-  CHECK_FALSE(std::filesystem::exists(hint_tmp));
   CHECK_FALSE(std::filesystem::exists(hint));
 
   auto db = bytecask::DB::open(dir, opts);
