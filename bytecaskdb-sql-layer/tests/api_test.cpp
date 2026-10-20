@@ -225,6 +225,24 @@ TEST_CASE("embedded API: a cached plan is checked once per catalog version", "[s
   CHECK(db->plan_checks_for_testing() == 3);
 }
 
+TEST_CASE("embedded API: a parameter compared with DECIMALs of two scales is refused", "[sql][api]") {
+  sql_test::TempDir dir{"api_decimal_scales"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE d (a NUMERIC(10, 2), b NUMERIC(10, 4), n NUMERIC(10, 0), j BIGINT, "
+                    "PRIMARY KEY (a, b, n, j))");
+  // One scaled integer would be 1.00 for a and 0.0100 for b: refused before
+  // it runs, whatever its value, a SQL error and not a range refusal.
+  CHECK_THROWS_AS(db->execute("SELECT a FROM d WHERE a = $1 AND b = $1 AND n = $2 AND j = $3", {i(100), i(1), i(1)}),
+                  ast::SqlError);
+  // So is a DECIMAL of scale 2 and an integer.
+  CHECK_THROWS_AS(db->execute("SELECT a FROM d WHERE a = $1 AND b = $2 AND n = $3 AND j = $1", {i(100), i(1), i(1)}),
+                  ast::SqlError);
+  // At scale 0 a DECIMAL's integer is the number: NUMERIC(10, 0) and BIGINT share one.
+  CHECK(db->execute("INSERT INTO d VALUES ($1, $2, $3, $4)", {i(100), i(10000), i(7), i(7)}).affected == 1);
+  CHECK(db->execute("SELECT a FROM d WHERE a = $1 AND b = $2 AND n = $3 AND j = $3", {i(100), i(10000), i(7)})
+            .rows.size() == 1);
+}
+
 TEST_CASE("embedded API: a DOUBLE read through an index keeps -0.0", "[sql][api]") {
   sql_test::TempDir dir{"api_negzero"};
   auto db = Database::open(dir.path());
