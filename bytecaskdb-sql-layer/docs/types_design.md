@@ -62,7 +62,9 @@ type without its modifier: `VARCHAR(n)` as `TEXT`, `DECIMAL(p, s)`
 unbounded. It has one such type: a parameter compared with columns of two
 (`DOUBLE PRECISION` and `REAL`, `INTEGER` and `BIGINT`, `DECIMAL`s of two
 scales, whose one scaled integer would be two numbers) is refused at bind,
-where PostgreSQL runs it, since one value could be keyed as two. It is checked against that type before the plan runs, so a
+where PostgreSQL runs it, since one value could be keyed as two. A
+`DECIMAL` of scale 0 counts as a `BIGINT` here: its integer is the number
+itself, so the two share a `$n`. It is checked against that type before the plan runs, so a
 value outside it is `BC_C_RANGE` whether or not the plan would read it (a
 key whose other part is NULL): 
 `3000000000` for an `INTEGER` key or bound, `1e39` or `1e-50` for a `REAL`,

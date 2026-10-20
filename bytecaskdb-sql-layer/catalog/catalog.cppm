@@ -147,11 +147,20 @@ inline constexpr auto kPowersOfTen = [] {
 // continuation byte, or a NUL, which PostgreSQL's text refuses too. One pass:
 // the check of TEXT and VARCHAR values, and VARCHAR(n)'s length.
 [[nodiscard]] auto utf8_code_points(BytesView s) -> std::optional<std::size_t>;
-// The type a parameter compared with a column of type t has: t without its
-// modifier (VARCHAR(n) as TEXT, DECIMAL(p, s) as an unbounded integer), as
-// PostgreSQL types a $n by its column. A key value, a lookup's or a
-// bound's, is checked against it: the type's range, not the modifier's.
-[[nodiscard]] auto param_type(SqlType t) -> SqlType;
+// What a parameter compared with a column of type t is, in two parts from
+// one place so they cannot drift apart:
+// - range: t without its modifier (VARCHAR(n) as TEXT, DECIMAL(p, s) as an
+//   unbounded integer), as PostgreSQL types a $n by its column. A key
+//   value, a lookup's or a bound's, is checked against it before the plan
+//   runs: the type's range, not the modifier's.
+// - identity: what two comparisons of one $n must share. range, except that
+//   a DECIMAL keeps its scale, which says what number one scaled integer
+//   is; at scale 0 it is that integer, a BIGINT.
+struct ComparedType {
+  SqlType identity;
+  SqlType range;
+};
+[[nodiscard]] auto compared_type(SqlType t) -> ComparedType;
 // Why a value of the column's physical type is outside its declared type,
 // in PostgreSQL's words, or nullopt: a SMALLINT or INTEGER out of range, a
 // REAL that overflows or underflows float, a TEXT or VARCHAR that is not
@@ -820,10 +829,13 @@ auto utf8_code_points(BytesView s) -> std::optional<std::size_t> {
   return n;
 }
 
-auto param_type(SqlType t) -> SqlType {
+auto compared_type(SqlType t) -> ComparedType {
+  auto same = [](SqlType u) { return ComparedType{u, u}; };
   switch (t.kind) {
-    case SqlKind::Varchar: return {SqlKind::Text};
-    case SqlKind::Decimal: return {SqlKind::BigInt};
+    case SqlKind::Varchar: return same({SqlKind::Text});
+    case SqlKind::Decimal:
+      if (t.scale == 0) return same({SqlKind::BigInt});
+      return {{SqlKind::Decimal, 0, 0, t.scale}, {SqlKind::BigInt}};
     case SqlKind::SmallInt:
     case SqlKind::Integer:
     case SqlKind::BigInt:
@@ -834,9 +846,9 @@ auto param_type(SqlType t) -> SqlType {
     case SqlKind::Text:
     case SqlKind::Timestamp:
     case SqlKind::Date:
-    case SqlKind::Time: return t;
+    case SqlKind::Time: return same(t);
   }
-  return t;
+  return same(t);
 }
 
 auto out_of_range(SqlType t, std::int64_t v) -> std::optional<std::string> {

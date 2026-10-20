@@ -80,7 +80,7 @@ struct Bound {
   Statement stmt;
   std::vector<PhysType> param_types;  // $1 is [0]
   // For each parameter compared with a column (WHERE), that column's type
-  // without its modifier (param_type), as PostgreSQL types a $n: what its
+  // without its modifier (compared_type's range), as PostgreSQL types a $n: what its
   // value is checked against before the plan runs, so a key or bound
   // outside it is refused whatever the plan would read. nullopt for one
   // only assigned (INSERT, SET), which the row builder checks in column
@@ -266,20 +266,14 @@ public:
     return c;
   }
 
-  // What a compared parameter is compared as: its column's type without
-  // its modifier, except that a DECIMAL keeps its scale, which says what
-  // number one scaled i64 is.
-  static auto compared_as(SqlType t) -> SqlType {
-    return t.kind == SqlKind::Decimal ? SqlType{SqlKind::Decimal, 0, 0, t.scale} : param_type(t);
-  }
-
   // Gives parameter $n+1 a type, physical and, when a WHERE compares it with
   // `compared`, SQL; a second use must agree with the first. A compared $n
   // has one SQL type, what the pre-plan range check checks: compared with
   // columns of two types that share a physical type (DOUBLE PRECISION and
   // REAL, INTEGER and BIGINT, DECIMALs of two scales), one value could be
   // keyed as two numbers. Refused, where PostgreSQL runs it
-  // (docs/testing_design.md, *Known differences*).
+  // (docs/testing_design.md, *Known differences*). A DECIMAL of scale 0 is
+  // compared as a BIGINT (compared_type): its integer is the number itself.
   void use_param(std::uint32_t n, PhysType t, std::int32_t pos, const Column* compared = nullptr) {
     if (params_.size() <= n) params_.resize(n + 1);
     auto& p = params_[n];
@@ -290,7 +284,7 @@ public:
     }
     p.phys = t;
     if (compared == nullptr) return;
-    if (p.compared != nullptr && compared_as(p.compared->sql) != compared_as(compared->sql)) {
+    if (p.compared != nullptr && compared_type(p.compared->sql).identity != compared_type(compared->sql).identity) {
       auto named = [](const Column& c) { return c.name + " (" + sql_type_name(c.sql) + ")"; };
       throw SqlError{"parameter $" + std::to_string(n + 1) + " is compared with " + named(*p.compared) + " and " +
                          named(*compared),
@@ -362,11 +356,12 @@ public:
   }
 
   // For each parameter a WHERE compares, its column's type without the
-  // modifier (param_type): what the pre-plan range check checks it against.
+  // modifier (compared_type's range): what the pre-plan range check checks
+  // it against.
   auto param_sql() const -> std::vector<std::optional<SqlType>> {
     std::vector<std::optional<SqlType>> out;
     for (const auto& p : params_) {
-      out.push_back(p.compared == nullptr ? std::nullopt : std::optional{param_type(p.compared->sql)});
+      out.push_back(p.compared == nullptr ? std::nullopt : std::optional{compared_type(p.compared->sql).range});
     }
     return out;
   }
