@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
+#include <iterator>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -80,17 +81,25 @@ auto to_bytes(std::string_view s) -> sql::Bytes {
   return {b.begin(), b.end()};
 }
 
-auto to_datum(nb::handle v) -> sql::Value {
+// Parameter `i` (0-based) as a datum. One the layer has no type for, an int
+// outside BIGINT among them, is a ParamError: SqlError, as a parameter of
+// the wrong type is.
+auto to_datum(nb::handle v, std::size_t i) -> sql::Value {
+  auto param = "parameter $" + std::to_string(i + 1);
   if (v.is_none()) return std::monostate{};
   if (nb::isinstance<nb::bool_>(v)) return nb::cast<bool>(v);
-  if (nb::isinstance<nb::int_>(v)) return nb::cast<std::int64_t>(v);
+  if (nb::isinstance<nb::int_>(v)) {
+    std::int64_t i64 = 0;
+    if (!nb::try_cast(v, i64)) throw sql::ParamError(param + " is an integer outside BIGINT's range");
+    return i64;
+  }
   if (nb::isinstance<nb::float_>(v)) return nb::cast<double>(v);
   if (nb::isinstance<nb::str>(v)) return to_bytes(nb::cast<std::string_view>(v));
   if (nb::isinstance<nb::bytes>(v)) {
     auto b = nb::cast<nb::bytes>(v);
     return to_bytes({b.c_str(), b.size()});
   }
-  throw nb::type_error("a parameter is None, bool, int, float, str or bytes");
+  throw sql::ParamError(param + " is not None, bool, int, float, str or bytes");
 }
 
 auto bytes_view(const sql::Bytes& b) -> std::string_view {
@@ -103,7 +112,7 @@ auto to_python(const sql::Value& v, sql::SqlType t) -> nb::object {
   if (const auto* b = std::get_if<sql::Bytes>(&v)) {
     if (t.kind == sql::SqlKind::Text || t.kind == sql::SqlKind::Varchar) {
       auto s = bytes_view(*b);
-      auto* o = PyUnicode_DecodeUTF8(s.data(), static_cast<Py_ssize_t>(s.size()), "strict");
+      auto* o = PyUnicode_DecodeUTF8(s.data(), std::ssize(s), "strict");
       if (o == nullptr) throw nb::python_error();  // stored bytes that are not UTF-8: UnicodeDecodeError
       return nb::steal(o);
     }
@@ -162,7 +171,7 @@ auto catalog(const sql::Database& db) -> nb::list {
 
 auto execute(sql::Database& db, std::string_view text, const nb::sequence& params) -> nb::dict {
   std::vector<sql::Value> values;
-  for (auto p : params) values.push_back(to_datum(p));
+  for (auto p : params) values.push_back(to_datum(p, values.size()));
   return to_python(db.execute(text, values));
 }
 

@@ -128,9 +128,14 @@ class SqlMachine(RuleBasedStateMachine):
         self.tables: dict[str, Table] = {}
 
     def teardown(self):
-        self.db.close()
-        self.pg.close()
-        shutil.rmtree(self.dir, ignore_errors=True)
+        # Every step runs, whichever fails, and the first failure is the one raised.
+        try:
+            self.db.close()
+        finally:
+            try:
+                self.pg.close()
+            finally:
+                shutil.rmtree(self.dir, ignore_errors=True)
 
     # The two sides --------------------------------------------------------
 
@@ -522,6 +527,31 @@ def test_every_range_message_maps_to_its_sqlstate(tmp_path):
             else:
                 raise AssertionError(f"{col} = {value!r} was written")
         assert seen == set(o.RANGE_SQLSTATE), set(o.RANGE_SQLSTATE) - seen
+    finally:
+        db.close()
+
+
+def test_parameters_and_tables_the_layer_refuses_are_sql_errors(tmp_path):
+    """Refusals before a plan runs are bytecask_sql.SqlError, never a
+    ValueError or TypeError: an int outside BIGINT, a parameter of a type the
+    layer has none for, a table_rows of a table that does not exist."""
+    db = bytecask_sql.open(str(tmp_path))
+    try:
+        db.execute("CREATE TABLE t (k BIGINT PRIMARY KEY)")
+        for params in ((2**63,), (-(2**63) - 1,), ([1],)):
+            try:
+                db.execute("INSERT INTO t VALUES ($1)", params)
+            except bytecask_sql.SqlError as e:
+                assert "parameter $1" in str(e) and not isinstance(e, (ValueError, TypeError))
+            else:
+                raise AssertionError(f"{params!r} was taken")
+        try:
+            db.table_rows("nope")
+        except bytecask_sql.SqlError as e:
+            assert not isinstance(e, ValueError)
+        else:
+            raise AssertionError("table_rows of a missing table returned")
+        assert db.table_rows("t")["rows"] == []
     finally:
         db.close()
 

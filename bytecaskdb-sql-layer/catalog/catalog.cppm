@@ -74,13 +74,17 @@ struct ConstraintDetail {
     return (constraint << 24) | object_id;
   }
   // "unique", "not_null", "check", "foreign_key" or "range"; empty for a
-  // code bc_plan.h does not define.
+  // code bc_plan.h does not define. The one list of known kinds.
   [[nodiscard]] auto name() const -> std::string_view;
+  // A kind bc_plan.h defines, and an id that fits its 24 bits: what
+  // encode() takes and bc_raise accepts.
+  [[nodiscard]] auto valid() const -> bool { return !name().empty() && object_id <= kMaxObjectId; }
   [[nodiscard]] auto message() const -> std::string;
 };
 
 // A DDL whose existing data breaks a constraint: CREATE UNIQUE INDEX over
-// rows that hold a duplicate (BC_C_UNIQUE with the index's id). The data's
+// rows that hold a duplicate (BC_C_UNIQUE with the table's id: the index's
+// id was never published, and the next DDL takes it). The data's
 // refusal, not the statement's (that is DdlRefused): SQL reports the
 // constraint's SQLSTATE, 23505. Nothing was written.
 class ConstraintViolation : public std::runtime_error {
@@ -1357,7 +1361,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       if (ix.unique && !has_null && !prefixes.emplace(k.begin(), k.begin() + static_cast<std::ptrdiff_t>(prefix_len)).second) {
         throw ConstraintViolation("could not create unique index \"" + name + "\": table \"" + t.name +
                                       "\" holds a duplicate key",
-                                  ConstraintDetail{BC_C_UNIQUE, ix.id});
+                                  ConstraintDetail{BC_C_UNIQUE, t.id});
       }
       budget.charge(k.size() + prefix_len);
       put_op(ops, DdlOp::Kind::Put, std::move(k));

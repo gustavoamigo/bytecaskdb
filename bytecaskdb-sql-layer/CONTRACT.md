@@ -95,7 +95,7 @@ column's, a second write of one row.
 | Guarantee | Proved by |
 |---|---|
 | Errors before a plan runs have their own types: parameters of the wrong number or type are `ParamError`, and a DDL statement the catalog refuses (a name taken or missing, a column or key part that does not exist or repeats) is `DdlRefused`. Neither writes anything. Both are `std::invalid_argument`. | "embedded API: the seven statements, then a fresh open", "embedded API: a plan the catalog refuses is recompiled and run again", "embedded API: compatibility decides which cached plans recompile" |
-| `CREATE UNIQUE INDEX` over rows that hold a duplicate is an `ExecError` with `BC_E_CONSTRAINT`, `BC_C_UNIQUE` and the index's id, as a duplicate written later is; SQL reports it as SQLSTATE 23505. Nothing is written. | "embedded API: a unique index refuses duplicates, treats nulls as distinct, and moves with UPDATE", "catalog: refused DDL writes nothing" |
+| `CREATE UNIQUE INDEX` over rows that hold a duplicate is an `ExecError` with `BC_E_CONSTRAINT`, `BC_C_UNIQUE` and the table's id, as a duplicate written later is; SQL reports it as SQLSTATE 23505. Nothing is written. | "embedded API: a unique index refuses duplicates, treats nulls as distinct, and moves with UPDATE", "catalog: refused DDL writes nothing" |
 | After `close()`, `prepare`, `execute`, `catalog` and `table_rows` throw `DbClosed`; a second `close()` returns at once. | "embedded API: table_rows reads a table in key order; errors carry their detail; calls after close() throw" |
 
 ---
