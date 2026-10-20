@@ -528,7 +528,8 @@ TEST_CASE("embedded API: table_rows reads a table in key order; errors carry the
   (void)third->execute("CREATE TABLE p (k BIGINT PRIMARY KEY, a BIGINT)");
   CHECK(third->execute("INSERT INTO p VALUES ($1, $2)", {i(1), i(5)}).affected == 1);
   (void)third->execute("ALTER TABLE p ADD COLUMN c BIGINT");
-  const auto* p_table = third->catalog()->table("p");
+  auto third_cat = third->catalog();  // held: p_table points into it
+  const auto* p_table = third_cat->table("p");
   auto p_id = p_table->id;
   auto c_id = p_table->column("c")->id;
   CHECK(third->table_rows("p").rows == Grid{{i(1), i(5), kNull}});

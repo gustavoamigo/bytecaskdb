@@ -68,9 +68,6 @@ local function sql_layer_library(name, testing)
         set_kind("static")
         set_default(false)
         add_deps("bytecask")
-        -- Linked into the bytecask_sql Python module, a shared object, as the
-        -- engine's library is into bytecaskdb_python.
-        add_cxxflags("-fPIC", {force = true})
         add_rules("bytecask.native_flags")
         add_includedirs("..", {public = true})
         add_files("codec/*.cppm", "catalog/*.cppm", "algebra/*.cppm", "sql/*.cppm", "plan/*.cppm", "api/*.cppm",
@@ -80,6 +77,10 @@ local function sql_layer_library(name, testing)
         if testing then
             -- Public: a dependent target may build the module files with its own flags.
             add_defines("BYTECASK_SQL_TESTING", {public = true})
+            -- Linked into the bytecask_sql Python module, a shared object, as the
+            -- engine's library is into bytecaskdb_python. The production build
+            -- links into no shared object.
+            add_cxxflags("-fPIC", {force = true})
         end
         if (get_config("sanitizer") or ""):find("memory", 1, true) then
             -- No std-module probe under -nostdinc++; see bytecask.catch2 in the
