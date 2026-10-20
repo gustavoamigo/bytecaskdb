@@ -2035,13 +2035,9 @@ public:
       return;
     }
     // Filling the builder pushed a row after it: a runtime bug. No row that
-    // is not the builder's is removed; the run is refused instead. The
-    // message may not allocate, during unwinding above all.
-    try {
-      cx_->fail(BC_E_HANDLE, "a row builder is not the last row");
-    } catch (...) {
-      if (cx_->error == BC_OK) cx_->error = BC_E_HANDLE;
-    }
+    // is not the builder's is removed; the run is refused instead, with the
+    // sticky code alone: a message could fail to allocate while unwinding.
+    if (cx_->error == BC_OK) cx_->error = BC_E_HANDLE;
   }
   auto writer() -> RowWriter& { return cx_->rows[i_].writer; }
   auto keep() -> bc_row {
