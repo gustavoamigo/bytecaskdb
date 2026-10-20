@@ -221,7 +221,8 @@ NB_MODULE(bytecask_sql, m) {
       .def(
           "_engine_rows",
           [](sql::Database& db, std::string_view table) {
-            const auto* t = db.catalog()->table(table);
+            auto cat = db.catalog();  // held: t points into it
+            const auto* t = cat->table(table);
             if (t == nullptr) throw std::invalid_argument("relation \"" + std::string{table} + "\" does not exist");
             auto snap = db.engine_for_testing().snapshot();
             nb::list rows;

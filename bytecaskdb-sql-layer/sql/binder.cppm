@@ -207,7 +207,7 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
       auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
       if (ec != std::errc{} || end != l.text.data() + l.text.size()) bad();
       if (out_of_range(t, v)) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
-      return v;
+      return stored_f64(t, v);  // a REAL default as a REAL value is stored
     }
     case SqlKind::Boolean:
       if (l.kind != K::Bool) bad();

@@ -1173,7 +1173,7 @@ void set_column(bc_ctx* cx, bc_row r, std::uint32_t col, std::optional<PhysType>
   auto* b = at->builder;
   // The column is declared with this type and in the current layout: the
   // writer cannot refuse it.
-  if (!set(b->writer)) cx->fail(BC_L_ROW, "column " + std::to_string(col) + " is not in the row's layout");
+  if (!set(b->writer, *at->slot->sql)) cx->fail(BC_L_ROW, "column " + std::to_string(col) + " is not in the row's layout");
 }
 // A DOUBLE key part is canonicalised (-0.0 is 0.0, every NaN one NaN): the
 // key does not hold the value the row does, so it is read from the row.
@@ -2034,19 +2034,21 @@ bc_row bc_row_from(bc_ctx* cx, uint32_t table, bc_view old) {
 
 void bc_row_set_i64(bc_ctx* cx, bc_row r, uint32_t col, int64_t v) {
   BC_GUARD_BEGIN
-  set_column(cx, r, col, PhysType::I64, v, [&](RowWriter& w) { return w.set_i64(col, v); });
+  set_column(cx, r, col, PhysType::I64, v, [&](RowWriter& w, SqlType) { return w.set_i64(col, v); });
   BC_GUARD_END(cx)
 }
 
 void bc_row_set_f64(bc_ctx* cx, bc_row r, uint32_t col, double v) {
   BC_GUARD_BEGIN
-  set_column(cx, r, col, PhysType::F64, v, [&](RowWriter& w) { return w.set_f64(col, v); });
+  set_column(cx, r, col, PhysType::F64, v, [&](RowWriter& w, SqlType t) {
+    return w.set_f64(col, bytecask::sql::stored_f64(t, v));  // a REAL as its float rounding
+  });
   BC_GUARD_END(cx)
 }
 
 void bc_row_set_bool(bc_ctx* cx, bc_row r, uint32_t col, bool v) {
   BC_GUARD_BEGIN
-  set_column(cx, r, col, PhysType::Bool, v, [&](RowWriter& w) { return w.set_bool(col, v); });
+  set_column(cx, r, col, PhysType::Bool, v, [&](RowWriter& w, SqlType) { return w.set_bool(col, v); });
   BC_GUARD_END(cx)
 }
 
@@ -2054,7 +2056,7 @@ void bc_row_set_bytes(bc_ctx* cx, bc_row r, uint32_t col, bc_view v) {
   BC_GUARD_BEGIN
   auto bytes = cx->resolve(v);
   if (!bytes) return;
-  set_column(cx, r, col, PhysType::Bytes, *bytes, [&](RowWriter& w) { return w.set_bytes(col, *bytes); });
+  set_column(cx, r, col, PhysType::Bytes, *bytes, [&](RowWriter& w, SqlType) { return w.set_bytes(col, *bytes); });
   BC_GUARD_END(cx)
 }
 
@@ -2079,7 +2081,12 @@ void bc_row_set_param(bc_ctx* cx, bc_row r, uint32_t col, uint32_t i) {
     return;
   }
   if (!in_range(cx, *at, col, *d)) return;
-  if (!bytecask::sql::set_datum(at->builder->writer, col, *d)) cx->fail(BC_L_ROW, "column is not in the row's layout");
+  // A REAL is stored as its float rounding; any other value as given.
+  auto& w = at->builder->writer;
+  const auto* f = std::get_if<double>(d);
+  auto set = f != nullptr ? w.set_f64(col, bytecask::sql::stored_f64(*at->slot->sql, *f))
+                          : bytecask::sql::set_datum(w, col, *d);
+  if (!set) cx->fail(BC_L_ROW, "column is not in the row's layout");
   BC_GUARD_END(cx)
 }
 

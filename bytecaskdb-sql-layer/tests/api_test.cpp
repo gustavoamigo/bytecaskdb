@@ -556,6 +556,23 @@ TEST_CASE("embedded API: values outside their declared type, an omitted NOT NULL
   CHECK(refusal(kIns, with(4, Value{kFirstInf})).second.starts_with("value out of range: overflow"));
   CHECK(refusal(kIns, with(4, Value{-kFirstInf})).first == BC_C_RANGE);
   CHECK(db->execute(kIns, {i(5), kNull, kNull, kNull, Value{std::nextafter(kFirstInf, 0.0)}, kNull, i(0)}).affected == 1);
+  // A REAL is stored as its float rounding, as PostgreSQL stores a float4:
+  // the double below 2^128 - 2^103 as FLT_MAX, and 0.1 as 0.100000001490116…
+  CHECK(db->execute(kIns, {i(6), kNull, kNull, kNull, Value{0.1}, kNull, i(0)}).affected == 1);
+  CHECK(db->execute(kIns, {i(7), kNull, kNull, kNull, Value{-std::nextafter(kFirstInf, 0.0)}, kNull, i(0)}).affected == 1);
+  auto real_of = [&](std::int64_t k) {
+    auto r = db->execute("SELECT f FROM r WHERE k = $1", {i(k)});
+    REQUIRE(r.rows.size() == 1);
+    return std::get<double>(r.rows[0][0]);
+  };
+  CHECK(real_of(5) == static_cast<double>(std::numeric_limits<float>::max()));
+  CHECK(real_of(7) == -static_cast<double>(std::numeric_limits<float>::max()));
+  CHECK(real_of(6) == static_cast<double>(0.1f));
+  CHECK(real_of(6) != 0.1);
+  // A REAL DEFAULT is stored the same way.
+  (void)db->execute("CREATE TABLE rd (k BIGINT PRIMARY KEY, f REAL DEFAULT 0.1)");
+  CHECK(db->execute("INSERT INTO rd (k) VALUES ($1)", {i(1)}).affected == 1);
+  CHECK(db->table_rows("rd").rows.at(0).at(1) == Value{static_cast<double>(0.1f)});
 
   // DATE, TIMESTAMP and TIME: PostgreSQL's ranges, in days and microseconds
   // from 1970. TIME includes 24:00:00.
@@ -631,7 +648,7 @@ TEST_CASE("embedded API: values outside their declared type, an omitted NOT NULL
 
   // Nothing refused was written.
   auto rows = db->table_rows("r");
-  REQUIRE(rows.rows.size() == 4);
+  REQUIRE(rows.rows.size() == 6);
   CHECK(rows.rows[0][1] == i(32767));
   CHECK(rows.rows[1][2] == i(-(std::int64_t{1} << 31)));
   CHECK(rows.rows[2][6] == i(0));
@@ -659,7 +676,7 @@ TEST_CASE("embedded API: values outside their declared type, an omitted NOT NULL
     CHECK_FALSE(e.constraint());
   }
   db->conflict_on_every_commit_for_testing(false);
-  CHECK(db->table_rows("r").rows.size() == 4);
+  CHECK(db->table_rows("r").rows.size() == 6);
   CHECK(db->execute(kInsK, {i(9), i(0)}).affected == 1);
   CHECK_FALSE(ExecError("I/O", BC_E_IO).conflict());
   db->close();

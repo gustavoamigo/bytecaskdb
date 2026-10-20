@@ -27,6 +27,7 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -158,6 +159,12 @@ inline constexpr auto kPowersOfTen = [] {
 [[nodiscard]] auto out_of_range(SqlType t, BytesView v) -> std::optional<std::string>;
 [[nodiscard]] inline auto out_of_range(SqlType, bool) -> std::optional<std::string> { return std::nullopt; }
 [[nodiscard]] auto out_of_range(SqlType t, const Datum& d) -> std::optional<std::string>;
+// The double a value of type t is stored as: a REAL's float rounding, as
+// PostgreSQL stores a float4 (0.1 reads back as 0.100000001490116…), a
+// finite one past FLT_MAX that out_of_range accepted as ±FLT_MAX; any other
+// type's value, and a REAL's infinities and NaN, as given. For a value
+// out_of_range accepted; no value outside float's range is cast.
+[[nodiscard]] auto stored_f64(SqlType t, double v) -> double;
 // Sets one column of a row writer to a datum (NULL sets it null). False for
 // a type mismatch.
 [[nodiscard]] auto set_datum(RowWriter& w, std::uint32_t col_id, const Datum& d) -> bool;
@@ -861,8 +868,9 @@ auto out_of_range(SqlType t, double v) -> std::optional<std::string> {
   if (t.kind != SqlKind::Real) return std::nullopt;
   // PostgreSQL refuses a finite value whose float rounding is infinite: one
   // at or past the midpoint between FLT_MAX and 2^128, 2^128 - 2^103, which
-  // rounds up (FLT_MAX's significand is odd). Checked before the cast: a
-  // finite double outside float's range is undefined behaviour to convert.
+  // rounds up (FLT_MAX's significand is odd). Decided by comparison: a
+  // finite double outside float's range is undefined behaviour to convert,
+  // and stored_f64 converts only what is inside it.
   constexpr auto kFloatOverflow = 0x1p128 - 0x1p103;
   if (std::isfinite(v) && std::fabs(v) >= kFloatOverflow) return "value out of range: overflow";
   // A nonzero value that rounds to zero: below half the smallest subnormal
@@ -881,6 +889,13 @@ auto out_of_range(SqlType t, BytesView v) -> std::optional<std::string> {
     return "value too long for type character varying(" + std::to_string(t.length) + ")";
   }
   return std::nullopt;
+}
+
+auto stored_f64(SqlType t, double v) -> double {
+  if (t.kind != SqlKind::Real || !std::isfinite(v)) return v;
+  constexpr auto kFloatMax = static_cast<double>(std::numeric_limits<float>::max());
+  if (std::fabs(v) > kFloatMax) return std::copysign(kFloatMax, v);  // below 2^128 - 2^103: rounds to FLT_MAX
+  return static_cast<double>(static_cast<float>(v));
 }
 
 auto out_of_range(SqlType t, const Datum& d) -> std::optional<std::string> {

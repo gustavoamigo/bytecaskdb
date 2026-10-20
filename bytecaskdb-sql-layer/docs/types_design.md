@@ -21,7 +21,7 @@ bind error with the position of the type name.
 | SQL type | Physical | Stored as |
 |---|---|---|
 | `SMALLINT`, `INTEGER`, `BIGINT` | `i64` | The value. Every width is widened: one integer type in storage, in keys and in arithmetic. The declared width is a catalog property, checked on assignment. |
-| `DOUBLE PRECISION`, `REAL` | `f64` | IEEE 754 binary64. `REAL` is widened. |
+| `DOUBLE PRECISION`, `REAL` | `f64` | IEEE 754 binary64. A `REAL` is stored as its `float` rounding, widened, as PostgreSQL stores a float4: 0.1 reads back as 0.100000001490116…, and a finite value past `FLT_MAX` that does not round to infinity as `FLT_MAX`. |
 | `BOOLEAN` | `bool` | 0 or 1. |
 | `BYTEA` | `bytes` | The bytes. |
 | `TEXT`, `VARCHAR(n)` | `bytes` | UTF-8. Compared as bytes (binary collation). `n` counts code points and is a catalog property, checked on assignment. |
