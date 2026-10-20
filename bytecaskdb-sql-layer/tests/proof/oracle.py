@@ -148,6 +148,11 @@ def run_layer(db, sql: str, params=()) -> Outcome:
     try:
         r = db.execute(sql, tuple(params))
     except bytecask_sql.ExecError as e:
+        # A constraint violation is an outcome to compare. Any other failure
+        # of a plan that ran (corrupt, I/O, a handle, a layout, a limit,
+        # memory, a conflict) is the layer failing: the test fails on it.
+        if e.constraint is None:
+            raise
         return Outcome(error=layer_sqlstate(e), detail=str(e))
     except bytecask_sql.SqlError as e:
         return Outcome(error="refused", detail=str(e))

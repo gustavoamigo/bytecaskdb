@@ -288,7 +288,7 @@ TEST_CASE("embedded API: a unique index refuses duplicates, treats nulls as dist
   CHECK(ids(db->execute("SELECT id FROM c WHERE email = $1", {bytes("a")})) == std::vector<std::int64_t>{7});
 
   // A unique index over rows that already collide is refused as the
-  // duplicate it would hold: BC_C_UNIQUE with the index's id (23505).
+  // duplicate it would hold: BC_C_UNIQUE with the table's id (23505).
   (void)db->execute(kIns, {i(8), bytes("q"), i(1)});
   (void)db->execute(kIns, {i(9), bytes("r"), i(1)});
   auto table_id = db->catalog()->table("c")->id;
@@ -499,10 +499,44 @@ TEST_CASE("embedded API: table_rows reads a table in key order; errors carry the
   try {
     (void)third->table_rows("t");
     FAIL("a row of another layout generation was decoded");
-  } catch (const std::runtime_error& e) {
+  } catch (const ExecError& e) {
+    CHECK(e.code() == BC_E_CORRUPT);
     CHECK(std::string{e.what()}.starts_with("row of layout generation 2"));
   }
+
+  // A present bit for a column the row predates (ADD COLUMN after it was
+  // written) points outside the row, where the column would read as 0: a
+  // damaged row, refused, never read as a value.
+  (void)third->execute("CREATE TABLE p (k BIGINT PRIMARY KEY, a BIGINT)");
+  CHECK(third->execute("INSERT INTO p VALUES ($1, $2)", {i(1), i(5)}).affected == 1);
+  (void)third->execute("ALTER TABLE p ADD COLUMN c BIGINT");
+  const auto* p_table = third->catalog()->table("p");
+  auto p_id = p_table->id;
+  auto c_id = p_table->column("c")->id;
+  CHECK(third->table_rows("p").rows == Grid{{i(1), i(5), kNull}});
   third->close();
+  {
+    auto engine = bytecask::DB::open(dir.path());
+    auto prefix = row_prefix(p_id);
+    Bytes key, row;
+    for (const auto& e : engine.iter_from({}, prefix)) {
+      key.assign(e.key.begin(), e.key.end());
+      row.assign(e.value.begin(), e.value.end());
+      break;
+    }
+    REQUIRE(has_prefix(key, prefix));
+    row[kRowHeaderBytes + c_id / 8] |= std::byte{1} << (c_id % 8);  // c's present bit
+    engine.put({}, key, row);
+    engine.close();
+  }
+  auto fourth = Database::open(dir.path());
+  try {
+    (void)fourth->table_rows("p");
+    FAIL("a present column outside its row was read");
+  } catch (const ExecError& e) {
+    CHECK(e.code() == BC_E_CORRUPT);
+  }
+  fourth->close();
 }
 
 TEST_CASE("embedded API: values outside their declared type, an omitted NOT NULL column, one PRIMARY KEY",

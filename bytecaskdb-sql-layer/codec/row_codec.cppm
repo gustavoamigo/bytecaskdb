@@ -195,6 +195,11 @@ private:
 [[nodiscard]] auto row_bool(BytesView row, std::uint32_t off) -> std::optional<bool>;  // any non-zero word is true
 // Variable slot; empty if past the row's var_end table.
 [[nodiscard]] auto row_bytes(BytesView row, std::uint32_t slot) -> std::optional<BytesView>;
+// Whether `row`'s regions hold a column's slot: its fixed word before the
+// var_end table, or its variable slot below nvar. A column the row predates
+// is outside them and reads as 0 or empty; with its present bit set, the row
+// is damaged.
+[[nodiscard]] auto row_holds(BytesView row, const ColumnSlot& col) -> bool;
 // Whether a column of a layout is null in `row`: its present bit is clear.
 [[nodiscard]] auto row_is_null(BytesView row, const ColumnSlot& col) -> bool;
 // Whether a column holds the same encoding in two rows of one layout: null
@@ -545,6 +550,13 @@ auto row_bytes(BytesView row, std::uint32_t slot) -> std::optional<BytesView> {
   auto end = load_u32(row, h->var_table + 4 * std::size_t{slot});
   if (end < begin || data + end > h->row_bytes) return std::nullopt;
   return row.subspan(data + begin, end - begin);
+}
+
+auto row_holds(BytesView row, const ColumnSlot& col) -> bool {
+  auto h = header(row);
+  if (!h) return false;
+  if (col.type == PhysType::Bytes) return col.pos < h->nvar;
+  return col.pos >= h->fixed_start() && std::size_t{col.pos} + kFixedColumnBytes <= h->var_table;
 }
 
 auto row_is_null(BytesView row, const ColumnSlot& col) -> bool { return !row_present_bit(row, col.col_id); }

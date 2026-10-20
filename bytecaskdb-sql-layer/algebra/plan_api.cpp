@@ -71,8 +71,6 @@ static_assert(static_cast<int>(PhysType::I64) == BC_T_I64);
 static_assert(static_cast<int>(PhysType::F64) == BC_T_F64);
 static_assert(static_cast<int>(PhysType::Bool) == BC_T_BOOL);
 static_assert(static_cast<int>(PhysType::Bytes) == BC_T_BYTES);
-// bc_error_detail carries an object id in its low 24 bits.
-static_assert(Catalog::kMaxObjectId <= ConstraintDetail::kMaxObjectId);
 
 namespace {
 
