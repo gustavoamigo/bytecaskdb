@@ -50,7 +50,7 @@ public:
   void buffer_put(const uint8_t *key, size_t klen,
                   const uint8_t *val, size_t vlen,
                   bool guard_absent = false) {
-    Transaction::buffer_put({key, klen}, {val, vlen}, guard_absent);
+    Transaction::buffer_put({key, klen}, value_span(val, vlen), guard_absent);
   }
   void buffer_del(const uint8_t *key, size_t klen) {
     Transaction::buffer_del({key, klen});
@@ -139,7 +139,7 @@ public:
 
   void bulk_buffer_put(const uint8_t *key, std::size_t klen,
                        const uint8_t *val, std::size_t vlen) {
-    Transaction::bulk_buffer_put({key, klen}, {val, vlen});
+    Transaction::bulk_buffer_put({key, klen}, value_span(val, vlen));
   }
   void bulk_note_key(const uint8_t *key, std::size_t klen) {
     Transaction::bulk_note_key({key, klen});
@@ -156,6 +156,13 @@ public:
   int bulk_flush(bool sync);
 
 private:
+  // A value as the handler passes it: null or zero-length is the empty
+  // value.
+  static bytecask::sql::ByteSpan value_span(const uint8_t *val, size_t vlen) {
+    return (val && vlen > 0) ? bytecask::sql::ByteSpan{val, vlen}
+                             : bytecask::sql::ByteSpan{};
+  }
+
   // Logs an engine error and aborts if it left the engine degraded, as the
   // plugin does for every engine write; returns HA_ERR_INTERNAL_ERROR.
   int engine_error(const bytecask::sql::CommitOutcome &out);

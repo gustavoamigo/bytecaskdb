@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -452,21 +453,33 @@ TEST_CASE_METHOD(TxnFixture, "Transaction releases the deferred reporter at rese
   }
 }
 
-TEST_CASE_METHOD(TxnFixture, "Transaction reverts row counts by table id", "[txn][rollback]") {
-  // The counter handed to track_row_count_delta applies the delta now; the
-  // revert goes through the RowCountAddFn by table id, never through a
-  // pointer kept from the call.
-  std::atomic<int64_t> cached{0};
+TEST_CASE_METHOD(TxnFixture, "Transaction reverts a row count where it applied it",
+                 "[txn][rollback]") {
   auto txn = create_txn();
   auto k = make_key("r:1");
   auto v = make_value("v");
   txn->buffer_put(k, v);
-  txn->track_row_count_delta(3, 1, &cached);
-  REQUIRE(cached.load() == 1);
-  REQUIRE(g_rows.at(3).load() == 0);
-  txn->rollback(true);
-  REQUIRE(cached.load() == 1);
-  REQUIRE(g_rows.at(3).load() == -1);
+
+  SECTION("a counter given is reverted through, not the table's by id") {
+    std::atomic<int64_t> counter{0};
+    txn->track_row_count_delta(3, 1, &counter);
+    txn->track_row_count_delta(3, 1, &counter);
+    REQUIRE(counter.load() == 2);
+    txn->rollback(true);
+    REQUIRE(counter.load() == 0);
+    REQUIRE(g_rows.at(3).load() == 0);
+  }
+
+  SECTION("without one, the table's counter is found by id both ways") {
+    txn->track_row_count_delta(3, 1);
+    REQUIRE(g_rows.at(3).load() == 1);
+    txn->rollback(true);
+    REQUIRE(g_rows.at(3).load() == 0);
+  }
+}
+
+TEST_CASE_METHOD(TxnFixture, "Transaction requires a row-count function", "[txn][lifecycle]") {
+  REQUIRE_THROWS_AS(Transaction(db(), kLimits, nullptr), std::invalid_argument);
 }
 
 // =========================================================================

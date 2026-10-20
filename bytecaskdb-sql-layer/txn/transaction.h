@@ -98,9 +98,8 @@ public:
   // takes effect at once. Null reads with the engine's defaults.
   using ReadOptionsFn = bytecask::ReadOptions (*)();
 
-  // Adds `delta` to table `table_id`'s row counter. Called to revert the
-  // deltas a transaction tracked, by table id, so a counter dropped in the
-  // meantime is never reached through a stale pointer.
+  // Adds `delta` to table `table_id`'s row counter, found by id: the
+  // counter of a row-count delta tracked without one (track_row_count_delta).
   using RowCountAddFn = void (*)(std::uint32_t table_id, std::int64_t delta);
 
   // Reports a deferred insert's duplicate (begin_deferred_insert), given its
@@ -165,7 +164,7 @@ public:
 
     // Views of internally owned buffers; valid until next().
     ByteSpan key() const { return cur_key_; }
-    ByteSpan value() const { return {u8_data(cur_val_), cur_val_.size()}; }
+    ByteSpan value() const { return as_u8(cur_val_); }
 
     // Swap buffers with caller — preserves capacity across rows, avoiding
     // per-row heap allocations in steady state.
@@ -223,12 +222,11 @@ public:
   // `limits` bound every snapshot-less WritePlan this transaction builds (a
   // deferred insert's commit and each bulk-copy batch); the plan checks
   // them, the engine's defaults if none are given, so they should be the
-  // limits the DB was opened with.
+  // limits the DB was opened with. `row_count_add` is required: a null one
+  // throws std::invalid_argument.
   Transaction(bytecask::DB *db, bytecask::SizeLimits limits,
               RowCountAddFn row_count_add,
-              ReadOptionsFn read_options = nullptr)
-      : db_(db), limits_(limits), row_count_add_(row_count_add),
-        read_options_(read_options), bulk_plan_{limits} {}
+              ReadOptionsFn read_options = nullptr);
   ~Transaction() = default;  // optional<Snapshot> handles cleanup
 
   Transaction(const Transaction &) = delete;
@@ -332,9 +330,11 @@ public:
   void savepoint_release(std::uint32_t savepoint);
 
   // Row count tracking — called by each row write to record the delta so
-  // it can be reverted on rollback or commit failure. Applies
-  // `delta` now, through `row_count` when given (the table's counter, used
-  // for this call only) or else through the RowCountAddFn.
+  // it can be reverted on rollback or commit failure. Applies `delta` now
+  // through `row_count`, the table's counter, which must outlive the
+  // transaction's revert of it; or, when null, through the RowCountAddFn
+  // by table id, which the revert then uses too. A table keeps the first
+  // counter it was tracked with.
   void track_row_count_delta(std::uint32_t table_id, std::int64_t delta,
                              std::atomic<std::int64_t> *row_count = nullptr);
 
@@ -397,8 +397,13 @@ private:
   // resets the transaction.
   CommitOutcome fail(CommitOutcome outcome);
 
-  // Per-table delta since the transaction (or a checkpoint) began.
-  using RowCountDeltas = std::map<std::uint32_t, std::int64_t>;
+  // Per-table delta since the transaction (or a checkpoint) began, and the
+  // counter it applies to: null names the table's counter by id.
+  struct RowCountDelta {
+    std::int64_t delta{0};
+    std::atomic<std::int64_t> *counter{nullptr};
+  };
+  using RowCountDeltas = std::map<std::uint32_t, RowCountDelta>;
 
   // Rewinds the write buffer to its first `mark` ops and rebuilds the RYOW
   // overlay from what remains. Shared by statement rollback and savepoints.

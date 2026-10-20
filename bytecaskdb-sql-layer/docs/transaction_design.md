@@ -38,11 +38,10 @@ compiles `transaction.cpp` into `sql_layer`. Keys and values cross the API as
   snapshot's key. Each takes a namespace prefix, and emits only keys that
   start with it: the plugin passes a table's or an index's prefix.
 - **Row counters.** `track_row_count_delta` applies a delta to a table's
-  counter and records it by table id, so a rollback, a failed commit, a
-  statement rollback or a savepoint rollback can undo it. The undo goes
-  through the caller's `RowCountAddFn` by table id: no pointer to a counter
-  outlives the call that passed it, so a counter dropped in the meantime is
-  never reached.
+  counter and records it, so a rollback, a failed commit, a statement
+  rollback or a savepoint rollback can undo it on the same counter: through
+  the counter the caller passed, which must outlive the undo, or, when it
+  passed none, through the required `RowCountAddFn` by table id.
 
 ## Lifecycle
 

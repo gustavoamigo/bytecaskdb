@@ -6,7 +6,8 @@
 #include "bytecaskdb-sql-layer/txn/transaction.h"
 
 #include <algorithm>
-#include <compare>
+#include <cstring>
+#include <stdexcept>
 #include <utility>
 
 namespace bytecask::sql {
@@ -21,18 +22,15 @@ auto outcome(CommitOutcome::Status status, std::exception_ptr error = {})
   return out;
 }
 
-auto view(ByteSpan s) -> bytecask::BytesView { return std::as_bytes(s); }
-
 auto to_vector(ByteSpan s) -> std::vector<std::uint8_t> {
   return {s.begin(), s.end()};
 }
 
 // Lexicographic byte compare; a proper prefix sorts first.
 auto lex_compare(ByteSpan a, ByteSpan b) -> int {
-  const auto c = std::lexicographical_compare_three_way(a.begin(), a.end(),
-                                                        b.begin(), b.end());
-  if (std::is_lt(c)) { return -1; }
-  return std::is_gt(c) ? 1 : 0;
+  const int c = std::memcmp(a.data(), b.data(), std::min(a.size(), b.size()));
+  if (c != 0) return c;
+  return (a.size() < b.size()) ? -1 : (a.size() > b.size()) ? 1 : 0;
 }
 
 }  // namespace
@@ -40,6 +38,16 @@ auto lex_compare(ByteSpan a, ByteSpan b) -> int {
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
+
+Transaction::Transaction(bytecask::DB *db, bytecask::SizeLimits limits,
+                         RowCountAddFn row_count_add,
+                         ReadOptionsFn read_options)
+    : db_(db), limits_(limits), row_count_add_(row_count_add),
+      read_options_(read_options), bulk_plan_{limits} {
+  if (!row_count_add_) {
+    throw std::invalid_argument("Transaction: row_count_add is required");
+  }
+}
 
 Transaction::Begun Transaction::begin_if_needed(bool multi) {
   Begun begun;
@@ -128,9 +136,9 @@ int Transaction::get(ByteSpan key, bytecask::Bytes &out) {
   ensure_snapshot();
   try {
     if (snap_) {
-      return snap_->get(read_options(), view(key), out) ? 1 : 0;
+      return snap_->get(read_options(), as_view(key), out) ? 1 : 0;
     }
-    return db_->get(read_options(), view(key), out) ? 1 : 0;
+    return db_->get(read_options(), as_view(key), out) ? 1 : 0;
   } catch (...) {
     return -1;
   }
@@ -147,9 +155,9 @@ bool Transaction::exists(ByteSpan key) {
   ensure_snapshot();
   try {
     if (snap_) {
-      return snap_->contains_key(read_options(), view(key));
+      return snap_->contains_key(read_options(), as_view(key));
     }
-    return db_->contains_key(read_options(), view(key));
+    return db_->contains_key(read_options(), as_view(key));
   } catch (...) {
     return false;
   }
@@ -165,7 +173,7 @@ std::size_t Transaction::count_range(ByteSpan lo, ByteSpan hi,
   if (!snap_) {
     snap_.emplace(db_->snapshot());
   }
-  auto n = snap_->count_keys(view(lo), view(hi), limit);
+  auto n = snap_->count_keys(as_view(lo), as_view(hi), limit);
   if (n >= limit) {
     return limit;
   }
@@ -176,7 +184,7 @@ std::size_t Transaction::count_range(ByteSpan lo, ByteSpan hi,
   for (auto it = lookup_.lower_bound(lo_vec);
        it != lookup_.end() && it->first < hi_vec; ++it) {
     const bool in_snap =
-        snap_->contains_key(read_options(), view(it->first));
+        snap_->contains_key(read_options(), as_view(it->first));
     if (it->second && !in_snap) {
       if (++n >= limit) {
         return limit;
@@ -199,7 +207,7 @@ std::unique_ptr<Transaction::MergeIterator> Transaction::iter_entries(
 
   std::optional<bytecask::EntryIterator> snap_it;
   if (snap_) {
-    auto range = snap_->iter_from(read_options(), view(lo));
+    auto range = snap_->iter_from(read_options(), as_view(lo));
     snap_it.emplace(range.begin());
   }
 
@@ -217,7 +225,7 @@ std::unique_ptr<Transaction::MergeIterator> Transaction::iter_keys(
 
   std::optional<bytecask::KeyIterator> snap_it;
   if (snap_) {
-    auto range = snap_->keys_from(read_options(), view(lo));
+    auto range = snap_->keys_from(read_options(), as_view(lo));
     snap_it.emplace(range.begin());
   }
 
@@ -235,7 +243,7 @@ std::unique_ptr<Transaction::MergeIterator> Transaction::riter_keys(
 
   std::optional<bytecask::ReverseKeyIterator> snap_it;
   if (snap_) {
-    auto range = snap_->rkeys_from(read_options(), view(hi));
+    auto range = snap_->rkeys_from(read_options(), as_view(hi));
     snap_it.emplace(range.begin());
   }
 
@@ -254,7 +262,7 @@ std::unique_ptr<Transaction::MergeIterator> Transaction::riter_entries(
 
   std::optional<bytecask::ReverseEntryIterator> snap_it;
   if (snap_) {
-    auto range = snap_->riter_from(read_options(), view(hi));
+    auto range = snap_->riter_from(read_options(), as_view(hi));
     snap_it.emplace(range.begin());
   }
 
@@ -321,12 +329,12 @@ CommitOutcome Transaction::commit(bool all, bool sync) {
       switch (op.kind) {
       case Op::Put:
         if (op.guard_absent) {
-          plan.ensure_absent(view(op.key));
+          plan.ensure_absent(as_view(op.key));
         }
-        plan.put(view(op.key), view(op.val));
+        plan.put(as_view(op.key), as_view(op.val));
         break;
       case Op::Del:
-        plan.del(view(op.key));
+        plan.del(as_view(op.key));
         break;
       }
     }
@@ -380,14 +388,18 @@ void Transaction::truncate_ops(std::size_t mark) {
 }
 
 void Transaction::restore_row_count_deltas(const RowCountDeltas &saved) {
-  for (const auto &[table_id, delta] : row_count_deltas_) {
+  for (const auto &[table_id, entry] : row_count_deltas_) {
     std::int64_t saved_delta = 0;
     if (auto it = saved.find(table_id); it != saved.end()) {
-      saved_delta = it->second;
+      saved_delta = it->second.delta;
     }
-    const std::int64_t undo = delta - saved_delta;
+    const std::int64_t undo = entry.delta - saved_delta;
     if (undo == 0) { continue; }
-    row_count_add_(table_id, -undo);
+    if (entry.counter) {
+      entry.counter->fetch_add(-undo);
+    } else {
+      row_count_add_(table_id, -undo);
+    }
   }
   row_count_deltas_ = saved;
 }
@@ -400,7 +412,7 @@ CommitOutcome Transaction::deferred_dup_key() const {
     if (op.kind != Op::Put || !op.guard_absent) { continue; }
     bool present = false;
     try {
-      present = db_->contains_key(read_options(), view(op.key));
+      present = db_->contains_key(read_options(), as_view(op.key));
     } catch (...) {
       present = false;
     }
@@ -444,7 +456,12 @@ void Transaction::track_row_count_delta(std::uint32_t table_id,
   } else {
     row_count_add_(table_id, delta);
   }
-  row_count_deltas_[table_id] += delta;
+
+  auto &entry = row_count_deltas_[table_id];
+  entry.delta += delta;
+  if (!entry.counter) {
+    entry.counter = row_count;
+  }
 }
 
 void Transaction::revert_row_count_deltas() {
@@ -474,7 +491,7 @@ void Transaction::bulk_reset() {
 void Transaction::bulk_buffer_put(ByteSpan key, ByteSpan val) {
   static constexpr std::uint8_t kEmpty[1] = {0};
   const ByteSpan v = val.empty() ? ByteSpan{kEmpty, 0} : val;
-  bulk_plan_.put(view(key), view(v));
+  bulk_plan_.put(as_view(key), as_view(v));
   bulk_bytes_ += key.size() + val.size();
 }
 
@@ -517,7 +534,7 @@ bool Transaction::bulk_pk_exists(ByteSpan key) {
     return true;
   }
   try {
-    return db_->contains_key(read_options(), view(key));
+    return db_->contains_key(read_options(), as_view(key));
   } catch (...) {
     return false;
   }
@@ -529,12 +546,12 @@ bool Transaction::bulk_unique_prefix_exists(ByteSpan prefix) {
   }
   try {
     // The first key at or after the prefix is the only candidate.
-    auto keys = db_->keys_from(read_options(), view(prefix));
+    auto keys = db_->keys_from(read_options(), as_view(prefix));
     auto it = keys.begin();
     if (it == std::default_sentinel) { return false; }
     const auto &k = *it;
     return k.size() >= prefix.size() &&
-           std::equal(prefix.begin(), prefix.end(), u8_data(k));
+           std::memcmp(u8_data(k), prefix.data(), prefix.size()) == 0;
   } catch (...) {
     return false;
   }
@@ -649,7 +666,7 @@ void Transaction::MergeIterator::next() {
 
 bool Transaction::MergeIterator::in_namespace(ByteSpan key) const {
   return key.size() >= ns_.size() &&
-         std::equal(ns_.begin(), ns_.end(), key.begin());
+         (ns_.empty() || std::memcmp(key.data(), ns_.data(), ns_.size()) == 0);
 }
 
 bool Transaction::MergeIterator::snap_at_end() const {
@@ -678,29 +695,28 @@ void Transaction::MergeIterator::load_snap_current() {
 
   if (snap_at_end()) return;
 
-  auto u8 = [](bytecask::BytesView b) { return ByteSpan{u8_data(b), b.size()}; };
   ByteSpan k;
   bool have = false;
 
   if (!reverse_) {
     if (snap_fwd_) {
       const auto &entry = **snap_fwd_;
-      k = u8(entry.key);
-      snap_val_ = u8(entry.value);
+      k = as_u8(entry.key);
+      snap_val_ = as_u8(entry.value);
       have = true;
     } else if (snap_key_fwd_) {
-      k = u8(**snap_key_fwd_);
+      k = as_u8(**snap_key_fwd_);
       snap_val_ = {};
       have = true;
     }
   } else {
     if (snap_rev_) {
       const auto &entry = **snap_rev_;
-      k = u8(entry.key);
-      snap_val_ = u8(entry.value);
+      k = as_u8(entry.key);
+      snap_val_ = as_u8(entry.value);
       have = true;
     } else if (snap_key_rev_) {
-      k = u8(**snap_key_rev_);
+      k = as_u8(**snap_key_rev_);
       snap_val_ = {};
       have = true;
     }

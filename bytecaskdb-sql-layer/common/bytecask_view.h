@@ -36,6 +36,14 @@ inline const uint8_t *u8_data(bytecask::BytesView v) {
   return reinterpret_cast<const uint8_t *>(v.data());
 }
 
+inline bytecask::BytesView as_view(std::span<const uint8_t> s) {
+  return std::as_bytes(s);
+}
+
+inline std::span<const uint8_t> as_u8(bytecask::BytesView v) {
+  return {u8_data(v), v.size()};
+}
+
 inline void assign_bytes(bytecask::Bytes &dst, const uint8_t *p, std::size_t n) {
   dst.assign(reinterpret_cast<const std::byte *>(p),
              reinterpret_cast<const std::byte *>(p + n));
