@@ -8,6 +8,15 @@ implements it, except the ephemeral structures; the revisions that the
 prototype (#497, merged as #498) and the layers after it forced are listed
 under *Revision history*.
 
+**Plans are only ever ours** (owner decision, 2026-10-20; #487, *MVP*).
+The layer runs only plans its own compiler generates. Nothing is designed
+for plan text from anywhere else: the checker for the subset and an
+interpreter tier for hand-written or user-supplied plans, which this
+document describes, are not planned. The guarantees below still hold for
+the compiler's plans, and the runtime's checks (handles, the budget, sticky
+errors, the arithmetic helpers, `BC_E_CORRUPT`) stay, as a guard against
+the compiler's own bugs and against damaged data.
+
 ## Purpose
 
 A SQL compiler turns a statement into a physical plan: every access path,
@@ -28,8 +37,9 @@ The API is the only boundary between the two halves of a SQL engine:
 
 The subset compiles with any C compiler, so the first execution tier is
 clang linking plans into the test binary. Later tiers load the same text at
-run time: an embedded C compiler, or an interpreter for hand-written and
-untrusted plans. The API and the guarantees are the same in every tier.
+run time: an embedded C compiler (and, in the original design, an
+interpreter for hand-written plans, not planned: only the compiler's plans
+are supported). The API and the guarantees are the same in every tier.
 
 What it is not: a general C API for the engine, a wire protocol, or a place
 for SQL semantics. Collations, decimals and dates are the compiler's problem;
@@ -37,8 +47,8 @@ here every value is a 64-bit integer, a double, a boolean or bytes.
 
 ## The guarantee
 
-A plan that passes the checker (*The language*, below) has these
-properties in every tier, whatever its logic does:
+A plan in the subset (*The language*, below), as the compiler generates
+it, has these properties in every tier, whatever its logic does:
 
 - **Memory safe.** It cannot read or write memory outside buffers the API
   manages, and it cannot read a buffer after its owner has released it.
@@ -473,7 +483,7 @@ bc_view  bc_key_successor(bc_ctx *, bc_view key);     /* smallest key greater th
 |---|---|
 | `bc_key_begin` | Starts a key for a table (its primary key) or an index. Writes the namespace byte and the 4-byte id. Returns a builder handle. |
 | `bc_key_i64`, `bc_key_f64`, `bc_key_bool`, `bc_key_bytes`, `bc_key_null` | Appends one part. Nullability and direction come from the catalog entry for `table_or_index`, so the builder knows whether to write a null marker and whether to invert the bytes. A part of the wrong type, or more parts than the key has, is `BC_E_HANDLE`. |
-| `bc_key_param` | Appends parameter `i` as the next part: its value, or the null part when it is NULL. A type that is not the part's, or a NULL for a part that is not nullable, is `BC_E_HANDLE`. A value outside the type of the part's column, without its modifier, is `BC_C_RANGE` with the table's id, as for `bc_key_i64`, `bc_key_f64` and `bc_key_bytes` and each part of `bc_key_params`: a lookup or bound is refused, never wrapped or rounded to a neighbour. A `REAL` part is keyed as its float rounding. |
+| `bc_key_param` | Appends parameter `i` as the next part: its value, or the null part when it is NULL. A type that is not the part's, or a NULL for a part that is not nullable, is `BC_E_HANDLE`. A `REAL` part is keyed as its float rounding. Whether the value is inside the column's type is checked before the plan runs, by the embedded API (`docs/types_design.md`). |
 | `bc_key_end` | Finalizes and returns the key. A partial key (fewer parts than the index has) is legal and is a prefix the compiler uses as a scan bound. A key over the engine's hard ceiling (65,535 bytes) is `BC_E_LIMIT`. |
 | `bc_key_params` | The key, or prefix, of `table_or_index` whose first `n` parts are parameters `first` to `first + n - 1`, each as `bc_key_param` appends it: `bc_key_begin`, `n` parts and `bc_key_end` in one call. `(cx, TBL_9, 0, 3)` is a composite primary key `(w_id, d_id, c_id)`. The builder remains for keys whose parts come from anywhere else. |
 | `bc_key_successor` | The exclusive upper bound of the prefix `key`: its last byte incremented, carrying. Turns a prefix into a half-open range where `BC_SCAN_PREFIX` does not fit. |
@@ -562,7 +572,7 @@ bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: live
 
 | Function | What it does |
 |---|---|
-| `bc_col_null` | True if column `col`'s bit in the bitmap is clear. The bitmap says *present*: a column set null and a column the row predates both have the bit clear, so one test covers both (`docs/types_design.md`, *Row format*). A set bit for a column the row does not hold, or a variable column whose two `var_end` words are out of order or past the row, is `BC_E_CORRUPT`, as every column reader reports it; the value itself is not copied, so a null test before a read does not decode the column twice. The compiler emits it in one place: an `UPDATE` that assigns from a nullable column (`SET c = src`, `SET c = src - $n`), before it reads `src`. |
+| `bc_col_null` | True if column `col`'s bit in the bitmap is clear. The bitmap says *present*: a column set null and a column the row predates both have the bit clear, so one test covers both (`docs/types_design.md`, *Row format*). A set bit for a column the row does not hold, or a variable column whose two `var_end` words are out of order or past the row, is `BC_E_CORRUPT`: it reads the column through the one decoder every reader uses, so it never disagrees with them. A variable column's bytes are viewed, not copied. The compiler emits it in one place: an `UPDATE` that assigns from a nullable column (`SET c = src`, `SET c = src - $n`), before it reads `src`. |
 | `bc_col_i64`, `bc_col_f64`, `bc_col_bool` | Loads the 8-byte column. A null column, or one a shorter row predates, reads as zero; `bc_col_null` decides first and reports both as null. A column marked present that the row does not hold is `BC_E_CORRUPT`. Little-endian in the row. |
 | `bc_col_bytes` | The variable-length column, as a view with the row's lifetime. A column marked present whose slot the row does not hold, or whose `var_end` runs past the row, is `BC_E_CORRUPT`. |
 | `bc_row_key` | The table's full primary key (namespace, table id, parts), encoded from the row's columns: for a `bc_get`, a guard, or a scan bound reached from a row. Built in the arena. |
@@ -702,11 +712,11 @@ The write plan is bounded by the engine's 1 GiB plan limit; exceeding it is
 
 ## The language
 
-A plan file is a program in a subset of C defined by a checker that every
-tier runs before compiling or interpreting it. The checker is a type checker
-for the subset; a file it rejects never reaches a compiler. The rules are
-the language's definition, and the C compiler is a backend for programs that
-already passed them.
+A plan file is a program in a subset of C. The rules below are the
+language's definition, and the compiler generates only plans inside it; the
+C compiler is a backend for those plans. The checker this design proposed,
+a type checker that would refuse other text before any tier compiled it, is
+not planned: only the compiler's plans are supported.
 
 **Structure.** Three `//` comment lines: the SQL text, the isolation level
 and schema version the plan was compiled against, and the objects its
@@ -750,11 +760,10 @@ locals, no nested assignment, no `++`: no uninitialized read and no
 unsequenced modification. Handles in distinct struct types: the C compiler
 itself rejects a handle of the wrong kind.
 
-**Tiers.** Compiled tiers run checked plans produced by the SQL compiler;
-the C compiler is trusted as the engine's own compiler is. The interpreter
-runs any checked plan, including hand-written and user-supplied ones, and
-adds a fuel counter on loop back-edges so a plan is bounded even if an API
-call were to misreport.
+**Tiers.** Compiled tiers run plans produced by the SQL compiler; the C
+compiler is trusted as the engine's own compiler is. The interpreter this
+design proposed, for hand-written and user-supplied plans, with a fuel
+counter on loop back-edges, is not planned.
 
 ### Example
 
@@ -912,7 +921,8 @@ the test binary. CI must build and run `sql_layer_tests`; the prototype
 merged without a job doing so.
 
 1. The checker for the subset, with a corpus of rejected files: one per
-   rule, each a plan that would be undefined or unbounded without it.
+   rule, each a plan that would be undefined or unbounded without it. Not
+   planned: only the compiler's plans are supported.
 2. The key codec and row format, with property tests: encode, decode, and
    `memcmp` order equal to typed order, for each type, for composite keys,
    and with nulls.
@@ -949,8 +959,7 @@ Layout: `bytecaskdb-sql-layer/algebra/` holds `bc_plan.h` and its C++
 implementation; `codec/` the key and row codecs; `catalog/` the catalog
 (`docs/catalog_design.md`); `plans/` the hand-written plan files, each with its SQL
 in the header comment; `sql/` the parser transformer and binder; `plan/` the
-planner, code generator and loader; `api/` the embedded API; `check/` the
-checker; `tests/` the property tests, fault tests, the harness and the
+planner, code generator and loader; `api/` the embedded API; `tests/` the property tests, fault tests, the harness and the
 TPROC-C schema fixture (`tests/tpcc_schema.cppm`). Files
 marked `// prototype:` are disposable and are replaced in place. The C++ is
 organized as C++23 modules (`bytecask.sql.*`), as the engine is; `bc_plan.h`

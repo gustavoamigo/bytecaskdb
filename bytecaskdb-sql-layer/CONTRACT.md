@@ -45,7 +45,7 @@ column's, a second write of one row.
 
 | Condition | What is required | If it does not hold | Proved by |
 |---|---|---|---|
-| **Plans stay in the subset** | A plan calls only the plan API, and loops only on its iterations. The compiler's plans do; the checker that will refuse other text (#493) is not built. | A plan outside the subset can do anything C can: the plan-safety rows below assume this condition. A plan that names a function outside the API does not link. | "tcc: a plan reaching outside the plan API does not link" |
+| **Plans stay in the subset** | A plan calls only the plan API, and loops only on its iterations. Only plans the layer's compiler generates are supported, and they do. | A plan outside the subset can do anything C can: the plan-safety rows below assume this condition. A plan that names a function outside the API does not link. | "tcc: a plan reaching outside the plan API does not link" |
 | **One context, one thread** | A context is used by one thread at a time. Contexts run concurrently. | Undefined. | none |
 
 ---
@@ -153,4 +153,4 @@ What the layer does not guarantee yet.
 |---|---|
 | A unique secondary key shared by two inserts of one statement is not caught. The compiler emits one write per plan, so no generated statement reaches it. | #507 |
 | Multi-statement transactions, and a statement reading what an earlier statement of its transaction wrote. | #491 |
-| Plans not produced by the compiler are not checked against the subset. | #493 |
+| Plans not produced by the layer's compiler are not supported. | none |

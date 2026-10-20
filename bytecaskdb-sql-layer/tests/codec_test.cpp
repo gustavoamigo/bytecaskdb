@@ -437,16 +437,6 @@ TEST_CASE("row format: every physical type round-trips, null or not", "[sql][cod
   CHECK_FALSE(w.set_null(9));
 }
 
-namespace {
-// The little-endian word at `at`, read from the row's bytes directly: what
-// finish stored, whatever the bitmap says.
-auto load_le_test(const Bytes& row, std::size_t at) -> std::uint64_t {
-  std::uint64_t v = 0;
-  for (std::size_t i = 0; i < 8; ++i) v |= std::uint64_t{std::to_integer<std::uint8_t>(row[at + i])} << (8 * i);
-  return v;
-}
-}  // namespace
-
 TEST_CASE("row format: a row shorter than the layout reads as null, in both directions", "[sql][codec]") {
   const std::array<ColumnDef, 2> old_defs{{{0, plain_sql_type(PhysType::I64), false}, {1, plain_sql_type(PhysType::Bytes), true}}};
   auto old_layout = make_layout(old_defs);
@@ -538,9 +528,12 @@ TEST_CASE("row format: a row shorter than the layout reads as null, in both dire
   REQUIRE(nulled.set_null(2));
   Bytes nulled_row;
   REQUIRE(nulled.finish(nulled_row));
-  CHECK(nulled_row.size() < 1000);
-  CHECK(row_column(nulled_row, *new_layout.find(3)).state == ColumnState::Absent);
-  CHECK(load_le_test(nulled_row, new_layout.find(2)->pos) == 0);
+  // The same bytes as a row that never set them.
+  RowWriter reference{new_layout};
+  REQUIRE(reference.set_i64(0, 5));
+  Bytes reference_row;
+  REQUIRE(reference.finish(reference_row));
+  CHECK(nulled_row == reference_row);
 
   // One writer, two rows: the second lacks a column the first had, and
   // carries none of it.

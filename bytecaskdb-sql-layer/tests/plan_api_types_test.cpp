@@ -893,6 +893,50 @@ TEST_CASE("plan API: a present column the row does not hold is BC_E_CORRUPT, nev
   expect_corrupt(slot_of_row);
 }
 
+namespace {
+// A table of two variable columns, so the second's slot has a begin: its
+// ids, set by the test that creates it.
+std::uint32_t g_two = 0, g_two_b = 0;
+auto get_two(bc_ctx* cx) -> bc_view {
+  bool found = false;
+  return bc_get(cx, bc_key_params(cx, g_two, 0, 1), &found);
+}
+void two_b_null(bc_ctx* cx) { bc_emit_count(cx, bc_col_null(cx, get_two(cx), g_two_b) ? 1 : 0); }
+void two_b_bytes(bc_ctx* cx) { bc_col_bytes(cx, get_two(cx), g_two_b); }
+}  // namespace
+
+TEST_CASE("plan API: a variable column whose var_end words are out of order is BC_E_CORRUPT", "[sql][algebra]") {
+  Fixture f;
+  f.ddl(bytecask::sql::CreateTableDdl{
+      "two", {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::Bytes, true),
+              Fixture::col("b", PhysType::Bytes, true)},
+      {"k"}});
+  auto cat = f.live->current();  // held: two points into it
+  const auto& two = *cat->table("two");
+  g_two = two.id;
+  g_two_b = two.column("b")->id;
+  bytecask::sql::RowWriter w{two.layout};
+  REQUIRE(w.set_i64(two.column("k")->id, 1));
+  REQUIRE(w.set_bytes(two.column("a")->id, bytes("aaaa")));
+  REQUIRE(w.set_bytes(g_two_b, bytes("bb")));
+  Bytes row, key;
+  REQUIRE(w.finish(row));
+  REQUIRE(bytecask::sql::encode_pk_from_row(two, row, key));
+  f.db->put({}, key, row);
+  CHECK(value(f, two_b_null, {std::int64_t{1}}) == 0);
+
+  // b's end below a's: both words inside the row, out of order.
+  REQUIRE(two.layout.find(g_two_b)->pos == 1);
+  auto var_table = std::to_integer<std::size_t>(row[4]) | (std::to_integer<std::size_t>(row[5]) << 8);
+  row[var_table + 4] = std::byte{1};
+  for (std::size_t i = 1; i < 4; ++i) row[var_table + 4 + i] = std::byte{0};
+  f.db->put({}, key, row);
+  for (auto plan : {two_b_null, two_b_bytes}) {
+    CHECK(run(f, plan, {std::int64_t{1}}) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_CORRUPT);
+  }
+}
+
 TEST_CASE("plan API: a charge of several units does not step over the deadline check", "[sql][algebra]") {
   Fixture f;
   for (std::int64_t i = 1; i <= 30; ++i) REQUIRE(run(f, insert_t, {i, bytes("n"), i}) == BC_COMMITTED);
