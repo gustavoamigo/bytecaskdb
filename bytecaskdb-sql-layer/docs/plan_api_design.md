@@ -999,6 +999,7 @@ record read.
   through an overlay of the earlier writes. The overlay is the session
   layer's and sits under `bc_get`, `bc_scan_row` and the cursors without
   changing their signatures.
+  Designed in `docs/transaction_design.md` (#491).
 - **Sequence allocation.** Auto-increment is a runtime service invoked at
   commit, outside the plan, so the plan stays pure. Until then ids come from
   rows the plan reads and guards.
