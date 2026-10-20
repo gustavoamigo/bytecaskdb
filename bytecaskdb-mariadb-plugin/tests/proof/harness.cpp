@@ -110,6 +110,7 @@ void PluginTestHarness::build_table_structures(const TableSpec &spec) {
     key_parts_[kp_offset].field_index = 0;
     key_parts_[kp_offset].length = 4;
     key_parts_[kp_offset].store_length = 4;
+    key_parts_[kp_offset].offset = null_bytes;
     ++kp_offset;
   }
 
@@ -127,6 +128,7 @@ void PluginTestHarness::build_table_structures(const TableSpec &spec) {
       key_parts_[kp_offset + p].field_index = static_cast<uint16_t>(col);
       key_parts_[kp_offset + p].length = 4;
       key_parts_[kp_offset + p].store_length = 4;
+      key_parts_[kp_offset + p].offset = null_bytes + col * 4;
     }
     kp_offset += idx_spec.key_parts;
   }
@@ -264,18 +266,28 @@ void PluginTestHarness::begin_stmt() {
   txn_ = static_cast<MariaDBTxn *>(thd_get_ha_data(&thd_, &hton_));
 }
 
+std::vector<uchar> PluginTestHarness::pk_key(
+    const std::vector<int32_t> &column_values) {
+  std::vector<uchar> buf(share_.reclength, 0);
+  fill_record(buf.data(), column_values);
+  auto key = encode_pk(&table_, make_table_codec(&table_, kKeyFormatCurrent),
+                       buf.data(), table_id_);
+  // fill_record pointed the fields at buf; point them back.
+  for (uint i = 0; i < fields_.size(); ++i) {
+    fields_[i]->ptr = record_buf_.data() + share_.null_bytes + i * 4;
+  }
+  return {key.begin(), key.end()};
+}
+
 void PluginTestHarness::inject_concurrent_write(
     const std::vector<int32_t> &column_values) {
-  // Fill a temporary record buffer with the given values.
+  auto key = pk_key(column_values);
+  // The value is the raw record, as the harness has always written it.
   std::vector<uchar> buf(share_.reclength, 0);
   for (uint i = 0; i < column_values.size() && i < share_.fields; ++i) {
     int32_t v = column_values[i];
     std::memcpy(buf.data() + share_.null_bytes + i * 4, &v, sizeof(v));
-    fields_[i]->ptr = buf.data() + share_.null_bytes + i * 4;
   }
-
-  // Encode the PK for this row.
-  auto key = encode_pk(&table_, make_table_codec(&table_, kKeyFormatCurrent), buf.data(), table_id_);
 
   // Write directly to the DB, bypassing the transaction — this creates
   // a concurrent modification that the harness's snapshot won't see.
@@ -284,11 +296,6 @@ void PluginTestHarness::inject_concurrent_write(
   auto val_view = bytecask::BytesView{
       reinterpret_cast<const std::byte *>(buf.data()), buf.size()};
   holder_->db.put(bytecask::WriteOptions{.sync = true}, key_view, val_view);
-
-  // Restore field pointers to the main record buffer.
-  for (uint i = 0; i < fields_.size(); ++i) {
-    fields_[i]->ptr = record_buf_.data() + share_.null_bytes + i * 4;
-  }
 }
 
 int64_t PluginTestHarness::row_counter() const {

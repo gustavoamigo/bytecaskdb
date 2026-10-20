@@ -99,7 +99,7 @@ plugin invariants below as follows:
 | Catalog writes outside the txn fence | P-INV-7 (catalog atomicity, plugin side) |
 
 The remaining invariants (P-INV-4 RYOW, P-INV-5 savepoints, P-INV-6
-OCC error mapping) are not gap-mode coverage — they are plugin-internal
+OCC error mapping, P-INV-8 read failures) are not gap-mode coverage — they are plugin-internal
 correctness properties that the engine has no opinion on. The four gap
 modes are necessary but not sufficient.
 
@@ -337,6 +337,36 @@ After any DDL path returns to MariaDB:
 The frm half — whether MariaDB's view of the schema after restart
 agrees with the plugin's catalog — is out of scope for this framework.
 That requires server-kill testing (see MTR notes below).
+
+### P-INV-8 — A failed read is never absent
+
+A duplicate probe or row fetch whose read fails (an I/O or CRC error) is
+an engine error, `HA_ERR_GENERIC`, never "absent" or "not found" (#524).
+Taken as absent, a duplicate check lets the statement write over the row
+it could not read; taken as not found, a row fetch lets an UPDATE or
+DELETE skip the row. Probes verify checksums whatever
+`bytecaskdb_verify_checksums` says.
+
+`tests/proof/prove_read_errors.cpp` damages one committed record's CRC
+(P-READ-8 a key byte) on disk, runs the statement, checks it fails, and
+that the commit after it writes nothing:
+
+| Proof | Read that fails |
+|---|---|
+| P-READ-1 | INSERT's primary-key duplicate check |
+| P-READ-2 | ALTER bulk copy's primary-key duplicate check |
+| P-READ-3 | UPDATE's duplicate check on a changed primary key |
+| P-READ-4 | INSERT's unique secondary-index check |
+| P-READ-5 | UPDATE's unique secondary-index check |
+| P-READ-6 | ALTER bulk copy's unique secondary-index check |
+| P-READ-7 | the row fetch behind a secondary-index read |
+| P-READ-8 | a duplicate check with `bytecaskdb_verify_checksums` off, on a damaged key |
+| P-READ-9 | CHECK TABLE's probe of an index entry (reported as corruption) |
+
+The deferred-INSERT path's commit-time report of which key was duplicated
+(`report_deferred_dup_key`) names no key, and returns `HA_ERR_GENERIC`,
+when no guarded key reads as present and a probe failed. No proof covers it: under `PLUGIN_TESTING` an INSERT is
+never deferred (`stmt_allows_deferred_dupcheck`).
 
 ---
 

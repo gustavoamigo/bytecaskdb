@@ -141,11 +141,11 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn write buffering", "[txn][buffer]
   SECTION("buffer_del creates tombstone") {
     // First put a value
     txn->buffer_put(key1.data(), key1.size(), val1.data(), val1.size());
-    REQUIRE(txn->exists(key1.data(), key1.size()));
+    REQUIRE(txn->exists(key1.data(), key1.size()) == Probe::Present);
 
     // Then delete it
     txn->buffer_del(key1.data(), key1.size());
-    REQUIRE_FALSE(txn->exists(key1.data(), key1.size()));
+    REQUIRE(txn->exists(key1.data(), key1.size()) == Probe::Absent);
 
     // get() should return not found
     bytecask::Bytes out_val;
@@ -157,8 +157,8 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn write buffering", "[txn][buffer]
     txn->buffer_put(key1.data(), key1.size(), val1.data(), val1.size());
     txn->buffer_put(key2.data(), key2.size(), val2.data(), val2.size());
 
-    REQUIRE(txn->exists(key1.data(), key1.size()));
-    REQUIRE(txn->exists(key2.data(), key2.size()));
+    REQUIRE(txn->exists(key1.data(), key1.size()) == Probe::Present);
+    REQUIRE(txn->exists(key2.data(), key2.size()) == Probe::Present);
 
     // Overwrite key1 with new value
     auto val1_new = make_value("alice_updated");
@@ -185,7 +185,7 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn RYOW semantics", "[txn][ryow]") 
   auto val = make_value("active");
 
   SECTION("exists() returns false for non-existent key") {
-    REQUIRE_FALSE(txn->exists(key.data(), key.size()));
+    REQUIRE(txn->exists(key.data(), key.size()) == Probe::Absent);
   }
 
   SECTION("exists() returns true after buffer_put - CRITICAL TEST") {
@@ -193,7 +193,7 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn RYOW semantics", "[txn][ryow]") 
     txn->buffer_put(key.data(), key.size(), val.data(), val.size());
 
     // This MUST return true - if it returns false, it's the duplicate insert bug
-    bool key_exists = txn->exists(key.data(), key.size());
+    bool key_exists = txn->exists(key.data(), key.size()) == Probe::Present;
     REQUIRE(key_exists);
   }
 
@@ -211,10 +211,10 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn RYOW semantics", "[txn][ryow]") 
   SECTION("exists() returns false after buffer_del") {
     // Put then delete
     txn->buffer_put(key.data(), key.size(), val.data(), val.size());
-    REQUIRE(txn->exists(key.data(), key.size()));
+    REQUIRE(txn->exists(key.data(), key.size()) == Probe::Present);
 
     txn->buffer_del(key.data(), key.size());
-    REQUIRE_FALSE(txn->exists(key.data(), key.size()));
+    REQUIRE(txn->exists(key.data(), key.size()) == Probe::Absent);
   }
 }
 
@@ -233,10 +233,10 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn isolation between transactions",
   SECTION("transactions don't see each other's buffered writes") {
     // txn1 buffers a write
     txn1->buffer_put(key.data(), key.size(), val1.data(), val1.size());
-    REQUIRE(txn1->exists(key.data(), key.size()));
+    REQUIRE(txn1->exists(key.data(), key.size()) == Probe::Present);
 
     // txn2 should not see it
-    REQUIRE_FALSE(txn2->exists(key.data(), key.size()));
+    REQUIRE(txn2->exists(key.data(), key.size()) == Probe::Absent);
 
     bytecask::Bytes out_val;
     int result = txn2->get(key.data(), key.size(), out_val);
@@ -271,16 +271,16 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn isolation between transactions",
     // First write_row call - uses txn1
     txn1->buffer_put(duplicate_key.data(), duplicate_key.size(),
                     row_value.data(), row_value.size());
-    REQUIRE(txn1->exists(duplicate_key.data(), duplicate_key.size()));
+    REQUIRE(txn1->exists(duplicate_key.data(), duplicate_key.size()) == Probe::Present);
 
     // Second write_row call - uses txn2 (different transaction object)
     // The exists() check should NOT see txn1's buffered write
-    REQUIRE_FALSE(txn2->exists(duplicate_key.data(), duplicate_key.size()));
+    REQUIRE(txn2->exists(duplicate_key.data(), duplicate_key.size()) == Probe::Absent);
 
     // This would allow the duplicate to be buffered (which is the bug)
     txn2->buffer_put(duplicate_key.data(), duplicate_key.size(),
                     row_value.data(), row_value.size());
-    REQUIRE(txn2->exists(duplicate_key.data(), duplicate_key.size()));
+    REQUIRE(txn2->exists(duplicate_key.data(), duplicate_key.size()) == Probe::Present);
 
     // Both transactions now have the same key buffered independently
     // When both commit, we get duplicate rows in the database
@@ -301,11 +301,11 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn commit rollback", "[txn][commit]
     THD thd{};
 
     txn->buffer_put(key.data(), key.size(), val.data(), val.size());
-    REQUIRE(txn->exists(key.data(), key.size()));
+    REQUIRE(txn->exists(key.data(), key.size()) == Probe::Present);
 
     txn->rollback(&thd, true);  // all=true for full rollback
 
-    REQUIRE_FALSE(txn->exists(key.data(), key.size()));
+    REQUIRE(txn->exists(key.data(), key.size()) == Probe::Absent);
   }
 }
 
@@ -347,7 +347,7 @@ TEST_CASE_METHOD(MariaDBTxnFixture,
   }
 
   SECTION("exists() then concurrent commit then write conflicts") {
-    REQUIRE(a->exists(key.data(), key.size()));
+    REQUIRE(a->exists(key.data(), key.size()) == Probe::Present);
     REQUIRE(a->is_active());
 
     b->buffer_put(key.data(), key.size(), v1.data(), v1.size());
@@ -426,7 +426,7 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn edge cases", "[txn][edge]") {
 
   SECTION("exists on empty key") {
     std::vector<uint8_t> empty_key;
-    REQUIRE_FALSE(txn->exists(empty_key.data(), empty_key.size()));
+    REQUIRE(txn->exists(empty_key.data(), empty_key.size()) == Probe::Absent);
   }
 
   SECTION("buffer operations with empty values") {
@@ -434,7 +434,7 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn edge cases", "[txn][edge]") {
 
     // Put empty value
     txn->buffer_put(key.data(), key.size(), nullptr, 0);
-    REQUIRE(txn->exists(key.data(), key.size()));
+    REQUIRE(txn->exists(key.data(), key.size()) == Probe::Present);
 
     // Should be able to retrieve empty value
     bytecask::Bytes out_val;
@@ -522,10 +522,10 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn bulk copy mode", "[txn][bulk]") 
     auto skey    = make_key("uk:\x01""alice\x01pk42");
     auto pk      = make_key("pk:42");
 
-    REQUIRE_FALSE(txn->bulk_unique_prefix_exists(uprefix.data(), uprefix.size()));
+    REQUIRE(txn->bulk_unique_prefix_exists(uprefix.data(), uprefix.size()) == Probe::Absent);
     txn->bulk_note_key(uprefix.data(), uprefix.size());
     // Same value again in the same unflushed batch -> caught.
-    REQUIRE(txn->bulk_unique_prefix_exists(uprefix.data(), uprefix.size()));
+    REQUIRE(txn->bulk_unique_prefix_exists(uprefix.data(), uprefix.size()) == Probe::Present);
 
     txn->bulk_buffer_put(pk.data(), pk.size(), nullptr, 0);
     txn->bulk_note_key(pk.data(), pk.size());
@@ -533,11 +533,11 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn bulk copy mode", "[txn][bulk]") 
     REQUIRE(txn->bulk_flush(true) == 0);
 
     // After the flush, bulk_seen_ is cleared but the DB probe still catches it.
-    REQUIRE(txn->bulk_pk_exists(pk.data(), pk.size()));
+    REQUIRE(txn->bulk_pk_exists(pk.data(), pk.size()) == Probe::Present);
     auto prefix = make_key("uk:\x01""ali");
-    REQUIRE(txn->bulk_unique_prefix_exists(prefix.data(), prefix.size()));
+    REQUIRE(txn->bulk_unique_prefix_exists(prefix.data(), prefix.size()) == Probe::Present);
     auto absent = make_key("uk:\x01""zzz");
-    REQUIRE_FALSE(txn->bulk_unique_prefix_exists(absent.data(), absent.size()));
+    REQUIRE(txn->bulk_unique_prefix_exists(absent.data(), absent.size()) == Probe::Absent);
   }
 
   SECTION("empty flush is a no-op") {
@@ -624,18 +624,18 @@ TEST_CASE_METHOD(MariaDBTxnFixture,
   txn->rollback(&thd, false);
 
   SECTION("only the failed statement's work is undone") {
-    REQUIRE(txn->exists(k1.data(), k1.size()));
-    REQUIRE(txn->exists(k2.data(), k2.size()));
-    REQUIRE_FALSE(txn->exists(k3.data(), k3.size()));
+    REQUIRE(txn->exists(k1.data(), k1.size()) == Probe::Present);
+    REQUIRE(txn->exists(k2.data(), k2.size()) == Probe::Present);
+    REQUIRE(txn->exists(k3.data(), k3.size()) == Probe::Absent);
     REQUIRE(rows.load() == 2);
   }
 
   SECTION("session commit persists statements 1 and 2") {
     REQUIRE(txn->commit(&thd, true) == 0);
     auto probe = create_txn();
-    REQUIRE(probe->exists(k1.data(), k1.size()));
-    REQUIRE(probe->exists(k2.data(), k2.size()));
-    REQUIRE_FALSE(probe->exists(k3.data(), k3.size()));
+    REQUIRE(probe->exists(k1.data(), k1.size()) == Probe::Present);
+    REQUIRE(probe->exists(k2.data(), k2.size()) == Probe::Present);
+    REQUIRE(probe->exists(k3.data(), k3.size()) == Probe::Absent);
     REQUIRE(rows.load() == 2);
   }
 
@@ -643,7 +643,7 @@ TEST_CASE_METHOD(MariaDBTxnFixture,
     txn->rollback(&thd, true);
     REQUIRE(rows.load() == 0);
     auto probe = create_txn();
-    REQUIRE_FALSE(probe->exists(k1.data(), k1.size()));
+    REQUIRE(probe->exists(k1.data(), k1.size()) == Probe::Absent);
   }
 
   g_stub_thd_options = 0;
@@ -764,14 +764,14 @@ TEST_CASE_METHOD(MariaDBTxnFixture,
   SECTION("rollback to the inner savepoint") {
     txn->savepoint_rollback(&sp2);
     REQUIRE(rows.load() == 2);
-    REQUIRE(txn->exists(k2.data(), k2.size()));
-    REQUIRE_FALSE(txn->exists(k3.data(), k3.size()));
+    REQUIRE(txn->exists(k2.data(), k2.size()) == Probe::Present);
+    REQUIRE(txn->exists(k3.data(), k3.size()) == Probe::Absent);
   }
 
   SECTION("rollback to the outer savepoint, then keep working") {
     txn->savepoint_rollback(&sp1);
     REQUIRE(rows.load() == 1);
-    REQUIRE_FALSE(txn->exists(k2.data(), k2.size()));
+    REQUIRE(txn->exists(k2.data(), k2.size()) == Probe::Absent);
 
     txn->buffer_put(k3.data(), k3.size(), v.data(), v.size());
     txn->track_row_count_delta(1, &rows, 1);
@@ -780,7 +780,7 @@ TEST_CASE_METHOD(MariaDBTxnFixture,
     // The savepoint survives ROLLBACK TO and can be rolled back to again.
     txn->savepoint_rollback(&sp1);
     REQUIRE(rows.load() == 1);
-    REQUIRE_FALSE(txn->exists(k3.data(), k3.size()));
+    REQUIRE(txn->exists(k3.data(), k3.size()) == Probe::Absent);
   }
 
   SECTION("release keeps the work and the counters") {

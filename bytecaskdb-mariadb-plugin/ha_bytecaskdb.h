@@ -295,6 +295,7 @@ private:
   std::vector<uint8_t> encode_row_buf_;
   std::vector<uint8_t> encode_sec_key_buf_;         // write_row
   std::vector<uint8_t> encode_unique_sec_key_buf_;  // write_row + update_row
+  std::vector<uint8_t> unique_hit_key_;  // first key a unique-index probe finds
   std::vector<uint8_t> encode_old_sec_key_buf_;     // update_row
   std::vector<uint8_t> encode_new_sec_key_buf_;     // update_row
 

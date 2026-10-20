@@ -74,6 +74,9 @@ public:
   ha_bytecaskdb &handler() { return *handler_; }
   MariaDBTxn &txn() { return *txn_; }
   uint32_t table_id() const { return table_id_; }
+  const std::filesystem::path &path() const { return path_; }
+  // The encoded primary key of the row with these column values.
+  std::vector<uchar> pk_key(const std::vector<int32_t> &column_values);
 
 private:
   void build_table_structures(const TableSpec &spec);
