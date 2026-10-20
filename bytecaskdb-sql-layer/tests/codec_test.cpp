@@ -377,9 +377,8 @@ TEST_CASE("row format: every physical type round-trips, null or not", "[sql][cod
   CHECK(layout.find(5)->pos == 1);
 
   std::mt19937_64 rng{11};
-  RowWriter w{layout};
   for (int i = 0; i < 2000; ++i) {
-    w.reset();
+    RowWriter w{layout};
     CHECK(w.missing_required() == std::optional<std::uint32_t>{0});
     auto id = random_i64(rng);
     auto name = rng() % 3 == 0 ? std::nullopt : OptBytes{random_bytes(rng)};
@@ -399,36 +398,37 @@ TEST_CASE("row format: every physical type round-trips, null or not", "[sql][cod
     REQUIRE(row_valid(row));
     CHECK(row_generation(row) == 1);
 
-    CHECK_FALSE(row_is_null(row, *layout.find(0)));
-    CHECK(row_i64(row, layout.find(0)->pos) == id);
-    CHECK(row_is_null(row, *layout.find(1)) == !name);
+    CHECK_FALSE((row_column(row, *layout.find(0)).state == ColumnState::Absent));
+    CHECK(row_column(row, *layout.find(0)).i64() == id);
+    CHECK((row_column(row, *layout.find(1)).state == ColumnState::Absent) == !name);
     if (name) {
-      auto v = row_bytes(row, layout.find(1)->pos);
-      REQUIRE(v);
-      CHECK(Bytes(v->begin(), v->end()) == *name);
+      auto v = row_column(row, *layout.find(1));
+      REQUIRE(v.state == ColumnState::Value);
+      CHECK(Bytes(v.bytes.begin(), v.bytes.end()) == *name);
     }
-    CHECK(row_is_null(row, *layout.find(2)) == !qty);
-    CHECK(row_i64(row, layout.find(2)->pos) == qty.value_or(0));  // a null fixed column reads as zero
-    CHECK(row_is_null(row, *layout.find(3)) == !score);
-    auto got_score = row_f64(row, layout.find(3)->pos);
-    REQUIRE(got_score);
-    CHECK(std::bit_cast<std::uint64_t>(*got_score) == std::bit_cast<std::uint64_t>(score.value_or(0.0)));
-    CHECK(row_is_null(row, *layout.find(4)) == !flag);
-    CHECK(row_bool(row, layout.find(4)->pos) == flag.value_or(false));
-    CHECK(row_is_null(row, *layout.find(5)) == !blob);
+    CHECK((row_column(row, *layout.find(2)).state == ColumnState::Absent) == !qty);
+    CHECK(row_column(row, *layout.find(2)).i64() == qty.value_or(0));  // an absent fixed column reads as zero
+    CHECK((row_column(row, *layout.find(3)).state == ColumnState::Absent) == !score);
+    auto got_score = row_column(row, *layout.find(3));
+    REQUIRE(got_score.state != ColumnState::Malformed);
+    CHECK(std::bit_cast<std::uint64_t>(got_score.f64()) == std::bit_cast<std::uint64_t>(score.value_or(0.0)));
+    CHECK((row_column(row, *layout.find(4)).state == ColumnState::Absent) == !flag);
+    CHECK(row_column(row, *layout.find(4)).boolean() == flag.value_or(false));
+    CHECK((row_column(row, *layout.find(5)).state == ColumnState::Absent) == !blob);
     if (blob) {
-      auto v = row_bytes(row, layout.find(5)->pos);
-      REQUIRE(v);
-      CHECK(Bytes(v->begin(), v->end()) == *blob);
+      auto v = row_column(row, *layout.find(5));
+      REQUIRE(v.state == ColumnState::Value);
+      CHECK(Bytes(v.bytes.begin(), v.bytes.end()) == *blob);
     }
 
     RowWriter copy{layout};
-    copy.copy_from(row);
+    REQUIRE(copy.copy_from(row));
     Bytes again;
     REQUIRE(copy.finish(again));
     CHECK(again == row);
   }
   // The type is checked on set.
+  RowWriter w{layout};
   CHECK_FALSE(w.set_f64(0, 1.0));
   CHECK_FALSE(w.set_bytes(2, Bytes{}));
   CHECK_FALSE(w.set_i64(1, 1));
@@ -436,6 +436,16 @@ TEST_CASE("row format: every physical type round-trips, null or not", "[sql][cod
   CHECK_FALSE(w.set_i64(9, 1));
   CHECK_FALSE(w.set_null(9));
 }
+
+namespace {
+// The little-endian word at `at`, read from the row's bytes directly: what
+// finish stored, whatever the bitmap says.
+auto load_le_test(const Bytes& row, std::size_t at) -> std::uint64_t {
+  std::uint64_t v = 0;
+  for (std::size_t i = 0; i < 8; ++i) v |= std::uint64_t{std::to_integer<std::uint8_t>(row[at + i])} << (8 * i);
+  return v;
+}
+}  // namespace
 
 TEST_CASE("row format: a row shorter than the layout reads as null, in both directions", "[sql][codec]") {
   const std::array<ColumnDef, 2> old_defs{{{0, plain_sql_type(PhysType::I64), false}, {1, plain_sql_type(PhysType::Bytes), true}}};
@@ -459,14 +469,26 @@ TEST_CASE("row format: a row shorter than the layout reads as null, in both dire
   CHECK(new_layout.find(4)->pos == old_layout.fixed_end + kFixedColumnBytes);
 
   // The newer layout reads the old row: the known columns, null for the rest.
-  CHECK(row_i64(old_row, new_layout.find(0)->pos) == 5);
-  CHECK_FALSE(row_is_null(old_row, *new_layout.find(1)));
-  CHECK(row_is_null(old_row, *new_layout.find(2)));
-  CHECK(row_i64(old_row, new_layout.find(2)->pos) == 0);
-  CHECK(row_is_null(old_row, *new_layout.find(3)));
-  CHECK(row_bytes(old_row, new_layout.find(3)->pos)->empty());
-  CHECK(row_is_null(old_row, *new_layout.find(4)));
-  CHECK(row_bool(old_row, new_layout.find(4)->pos) == false);
+  CHECK(row_column(old_row, *new_layout.find(0)).i64() == 5);
+  CHECK_FALSE((row_column(old_row, *new_layout.find(1)).state == ColumnState::Absent));
+  CHECK((row_column(old_row, *new_layout.find(2)).state == ColumnState::Absent));
+  CHECK(row_column(old_row, *new_layout.find(2)).i64() == 0);
+  CHECK((row_column(old_row, *new_layout.find(3)).state == ColumnState::Absent));
+  CHECK(row_column(old_row, *new_layout.find(3)).bytes.empty());
+  CHECK((row_column(old_row, *new_layout.find(4)).state == ColumnState::Absent));
+  CHECK(row_column(old_row, *new_layout.find(4)).boolean() == false);
+
+  // The old row with a present bit for a column it predates is damaged: the
+  // column lies outside the row, so it is Malformed, never 0 or empty, and
+  // a copy of the row is refused.
+  for (std::uint32_t id : {2u, 3u}) {
+    auto damaged = old_row;
+    damaged[kRowHeaderBytes + id / 8] |= std::byte{1} << (id % 8);
+    CHECK(row_column(damaged, *new_layout.find(id)).state == ColumnState::Malformed);
+    CHECK(row_column(damaged, *new_layout.find(0)).i64() == 5);  // the others still read
+    RowWriter cw{new_layout};
+    CHECK_FALSE(cw.copy_from(damaged));
+  }
 
   // And the reverse: an old reader ignores what a new row added, and finds
   // its variable column though the fixed region grew.
@@ -478,20 +500,66 @@ TEST_CASE("row format: a row shorter than the layout reads as null, in both dire
   REQUIRE(nw.set_bool(4, true));
   Bytes new_row;
   REQUIRE(nw.finish(new_row));
-  CHECK(row_i64(new_row, old_layout.find(0)->pos) == 9);
-  CHECK_FALSE(row_is_null(new_row, *old_layout.find(1)));
-  auto v = row_bytes(new_row, old_layout.find(1)->pos);
-  REQUIRE(v);
-  CHECK(Bytes(v->begin(), v->end()) == Bytes{std::byte{'b'}});
+  CHECK(row_column(new_row, *old_layout.find(0)).i64() == 9);
+  CHECK_FALSE((row_column(new_row, *old_layout.find(1)).state == ColumnState::Absent));
+  auto v = row_column(new_row, *old_layout.find(1));
+  REQUIRE(v.state == ColumnState::Value);
+  CHECK(Bytes(v.bytes.begin(), v.bytes.end()) == Bytes{std::byte{'b'}});
 
   // A new-layout copy of the old row carries the old values and nulls.
   RowWriter copy{new_layout};
-  copy.copy_from(old_row);
+  REQUIRE(copy.copy_from(old_row));
   Bytes copied;
   REQUIRE(copy.finish(copied));
-  CHECK(row_i64(copied, new_layout.find(0)->pos) == 5);
-  CHECK(row_is_null(copied, *new_layout.find(2)));
-  CHECK(row_is_null(copied, *new_layout.find(4)));
+  CHECK(row_column(copied, *new_layout.find(0)).i64() == 5);
+  CHECK((row_column(copied, *new_layout.find(2)).state == ColumnState::Absent));
+  CHECK((row_column(copied, *new_layout.find(4)).state == ColumnState::Absent));
+
+  // A writer that already holds values, as bc_row_begin's defaults, keeps
+  // none of them for a column the copied row lacks: the row it finishes is
+  // the same, byte for byte, with no default's bytes under a clear bit.
+  RowWriter prefilled{new_layout};
+  REQUIRE(prefilled.set_i64(2, 77));
+  REQUIRE(prefilled.set_bytes(3, Bytes(1000, std::byte{'d'})));
+  REQUIRE(prefilled.set_bool(4, true));
+  REQUIRE(prefilled.copy_from(old_row));
+  Bytes from_prefilled;
+  REQUIRE(prefilled.finish(from_prefilled));
+  CHECK(from_prefilled == copied);
+  CHECK(from_prefilled.size() < 1000);
+
+  // A value set and then set null, as bc_row_begin's DEFAULT then
+  // bc_row_set_null: the row carries neither its bytes nor its word.
+  RowWriter nulled{new_layout};
+  REQUIRE(nulled.set_i64(0, 5));
+  REQUIRE(nulled.set_bytes(3, Bytes(1000, std::byte{'d'})));
+  REQUIRE(nulled.set_i64(2, 77));
+  REQUIRE(nulled.set_null(3));
+  REQUIRE(nulled.set_null(2));
+  Bytes nulled_row;
+  REQUIRE(nulled.finish(nulled_row));
+  CHECK(nulled_row.size() < 1000);
+  CHECK(row_column(nulled_row, *new_layout.find(3)).state == ColumnState::Absent);
+  CHECK(load_le_test(nulled_row, new_layout.find(2)->pos) == 0);
+
+  // One writer, two rows: the second lacks a column the first had, and
+  // carries none of it.
+  RowWriter reused{new_layout};
+  RowWriter full{new_layout};
+  REQUIRE(full.set_i64(0, 1));
+  REQUIRE(full.set_bytes(1, Bytes{std::byte{'a'}}));
+  REQUIRE(full.set_i64(2, 2));
+  REQUIRE(full.set_bytes(3, Bytes(1000, std::byte{'z'})));
+  Bytes full_row;
+  REQUIRE(full.finish(full_row));
+  REQUIRE(reused.copy_from(full_row));
+  Bytes first;
+  REQUIRE(reused.finish(first));
+  CHECK(first == full_row);
+  REQUIRE(reused.copy_from(old_row));
+  Bytes second;
+  REQUIRE(reused.finish(second));
+  CHECK(second == copied);
 }
 
 TEST_CASE("row format: the bitmap is sized at create and has a ceiling", "[sql][codec]") {
@@ -532,7 +600,7 @@ TEST_CASE("row format: the bitmap is sized at create and has a ceiling", "[sql][
   Bytes wide_row;
   REQUIRE(ww.finish(wide_row));
   CHECK(row_valid(wide_row));
-  CHECK(row_i64(wide_row, wide.find(7999)->pos) == 7999);
+  CHECK(row_column(wide_row, *wide.find(7999)).i64() == 7999);
 
   // The row carries the size, and a bit past the bitmap is clear.
   RowWriter w{layout};
@@ -540,9 +608,10 @@ TEST_CASE("row format: the bitmap is sized at create and has a ceiling", "[sql][
   REQUIRE(w.set_bool(63, true));
   Bytes row;
   REQUIRE(w.finish(row));
-  CHECK(row_present_bit(row, 63));
-  CHECK_FALSE(row_present_bit(row, 64));
-  CHECK_FALSE(row_present_bit(row, 1000));
+  auto bit = [&](std::uint32_t id) { return row_column(row, id, PhysType::Bool, layout.fixed_start).state; };
+  CHECK(bit(63) != ColumnState::Absent);
+  CHECK(bit(64) == ColumnState::Absent);
+  CHECK(bit(1000) == ColumnState::Absent);
 }
 
 TEST_CASE("row format: layout_valid holds the format's invariants, and finish refuses a broken layout", "[sql][codec]") {
@@ -595,18 +664,18 @@ TEST_CASE("row format: malformed rows are rejected, not over-read, and the limit
   for (std::size_t n = 0; n < row.size(); ++n) {
     auto cut = BytesView{row}.first(n);
     CHECK_FALSE(row_valid(cut));
-    CHECK_FALSE(row_i64(cut, layout.find(0)->pos).has_value());
-    CHECK_FALSE(row_bytes(cut, layout.find(1)->pos).has_value());
-    CHECK(row_is_null(cut, *layout.find(1)));
+    // A truncated row is malformed, never NULL: no column of it reads.
+    CHECK(row_column(cut, *layout.find(0)).state == ColumnState::Malformed);
+    CHECK(row_column(cut, *layout.find(1)).state == ColumnState::Malformed);
   }
   // An offset inside the header or off a word boundary is not a column.
-  CHECK_FALSE(row_word(row, 0).has_value());
-  CHECK_FALSE(row_word(row, layout.fixed_start + 1).has_value());
+  CHECK(row_column(row, 0, PhysType::I64, 0).state == ColumnState::Malformed);
+  CHECK(row_column(row, 0, PhysType::I64, layout.fixed_start + 1).state == ColumnState::Malformed);
   // A var_end that runs past the row is a malformed row.
   auto bad = row;
   bad[layout.fixed_end] = std::byte{0xFF};
   CHECK_FALSE(row_valid(bad));
-  CHECK_FALSE(row_bytes(bad, 0).has_value());
+  CHECK(row_column(bad, *layout.find(1)).state == ColumnState::Malformed);
 
   // The limit is checked before anything is appended.
   Bytes out;

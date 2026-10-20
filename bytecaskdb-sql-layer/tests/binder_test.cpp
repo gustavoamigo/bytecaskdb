@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -145,8 +146,37 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
     auto b = bind_sql(cat, "CREATE TABLE r (k BIGINT PRIMARY KEY, a REAL DEFAULT 1.00000005960464477539062500000001)");
     auto& s = std::get<CreateTableDdl>(std::get<Ddl>(b.stmt));
     CHECK(s.columns[1].default_value == Datum{1.0 + 0x1p-23});
+    auto real_default = [&](std::string_view literal) {
+      auto sql = "CREATE TABLE r (k BIGINT PRIMARY KEY, a REAL DEFAULT " + std::string(literal) + ")";
+      return std::get<CreateTableDdl>(std::get<Ddl>(bind_sql(cat, sql).stmt)).columns[1].default_value;
+    };
+    // A denormal float is kept, not refused as underflow.
+    CHECK(real_default("1e-40") == Datum{static_cast<double>(1e-40f)});
+    CHECK(std::get<double>(real_default("1e-40")) != 0.0);
+    // FLT_MAX, and a literal above it that still rounds to it: below the
+    // midpoint between FLT_MAX and 2^128, 3.40282356779...e38. Just above
+    // that midpoint, 3.40282357e38 rounds to infinity: out of range.
+    constexpr auto kFloatMax = static_cast<double>(std::numeric_limits<float>::max());
+    CHECK(real_default("3.4028235e38") == Datum{kFloatMax});
+    CHECK(real_default("3.40282356e38") == Datum{kFloatMax});
+    CHECK(rejected(cat, "CREATE TABLE r (k BIGINT PRIMARY KEY, a REAL DEFAULT 3.40282357e38)").first ==
+          "DEFAULT out of range for type real");
     CHECK(rejected(cat, "CREATE TABLE r (k BIGINT PRIMARY KEY, a REAL DEFAULT 1e39)").first ==
           "DEFAULT out of range for type real");
+    // DOUBLE PRECISION, as PostgreSQL 16 takes it: 0.1 and a denormal kept;
+    // overflow and underflow to zero out of range (before parse_number,
+    // 1e400 was refused as "not a constant").
+    auto double_default = [&](std::string_view literal) {
+      auto sql = "CREATE TABLE r (k BIGINT PRIMARY KEY, a DOUBLE PRECISION DEFAULT " + std::string(literal) + ")";
+      return std::get<CreateTableDdl>(std::get<Ddl>(bind_sql(cat, sql).stmt)).columns[1].default_value;
+    };
+    CHECK(double_default("0.1") == Datum{0.1});
+    CHECK(double_default("1e-310") == Datum{1e-310});
+    CHECK(std::get<double>(double_default("1e-310")) != 0.0);
+    CHECK(rejected(cat, "CREATE TABLE r (k BIGINT PRIMARY KEY, a DOUBLE PRECISION DEFAULT 1e400)").first ==
+          "DEFAULT out of range for type double precision");
+    CHECK(rejected(cat, "CREATE TABLE r (k BIGINT PRIMARY KEY, a DOUBLE PRECISION DEFAULT 1e-400)").first ==
+          "DEFAULT out of range for type double precision");
     CHECK(rejected(cat, "CREATE TABLE r (k BIGINT PRIMARY KEY, a REAL DEFAULT 1e-50)").first ==
           "DEFAULT out of range for type real");
   }

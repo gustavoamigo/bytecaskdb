@@ -819,6 +819,80 @@ TEST_CASE("plan API: bc_row_key and bc_row_from report a damaged row as BC_E_COR
   CHECK(bc_error(f.cx) == BC_E_CORRUPT);
 }
 
+namespace {
+// Columns ADD COLUMN gives t after seed_t's rows: x BIGINT and y TEXT.
+constexpr std::uint32_t kXAdded = 3, kYAdded = 4;
+auto get_t(bc_ctx* cx) -> bc_view {
+  bc_key kb = bc_key_begin(cx, kTbl);
+  bc_key_i64(cx, kb, bc_param_i64(cx, 0));
+  bool found = false;
+  return bc_get(cx, bc_key_end(cx, kb), &found);
+}
+void x_null(bc_ctx* cx) { bc_emit_count(cx, bc_col_null(cx, get_t(cx), kXAdded) ? 1 : 0); }
+void x_value(bc_ctx* cx) { bc_emit_count(cx, bc_col_i64(cx, get_t(cx), kXAdded)); }
+void y_bytes(bc_ctx* cx) { bc_col_bytes(cx, get_t(cx), kYAdded); }
+void name_null(bc_ctx* cx) { bc_emit_count(cx, bc_col_null(cx, get_t(cx), kNameCol) ? 1 : 0); }
+void emit_x(bc_ctx* cx) {
+  bc_view row = get_t(cx);
+  bc_emit_begin(cx);
+  bc_emit_col(cx, row, kXAdded);
+  bc_emit_end(cx);
+}
+void emit_name(bc_ctx* cx) {
+  bc_view row = get_t(cx);
+  bc_emit_begin(cx);
+  bc_emit_col(cx, row, kNameCol);
+  bc_emit_end(cx);
+}
+}  // namespace
+
+TEST_CASE("plan API: a present column the row does not hold is BC_E_CORRUPT, never 0, empty or NULL",
+          "[sql][algebra]") {
+  Fixture f;
+  seed_t(f);
+  f.ddl(bytecask::sql::AddColumnDdl{"t", {"x", {bytecask::sql::SqlKind::BigInt}, true, {}}});
+  f.ddl(bytecask::sql::AddColumnDdl{"t", {"y", {bytecask::sql::SqlKind::Text}, true, {}}});
+  REQUIRE(f.cat().table(kTbl)->column("x")->id == kXAdded);
+  REQUIRE(f.cat().table(kTbl)->column("y")->id == kYAdded);
+  // Row 1 predates x and y: both read as NULL.
+  CHECK(value(f, x_null, {std::int64_t{1}}) == 1);
+  CHECK(value(f, x_value, {std::int64_t{1}}) == 0);
+  CHECK(run(f, emit_x, {std::int64_t{1}}, kI64Row) == BC_COMMITTED);
+  CHECK(f.results(kI64Row) == std::vector<std::vector<bc_value>>{{kNull}});
+
+  Bytes key;
+  bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
+  bytecask::sql::key_put_i64(key, 1, {PhysType::I64});
+  Bytes good;
+  REQUIRE(f.db->get({}, key, good));
+  auto expect_corrupt = [&](bc_plan_fn plan, std::span<const PhysType> result = {}) {
+    CHECK(run(f, plan, {std::int64_t{1}}, result) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_CORRUPT);
+  };
+  // x's present bit set: the row predates x, so it lies past the fixed region.
+  auto bad = good;
+  bad[bytecask::sql::kRowHeaderBytes + kXAdded / 8] |= std::byte{1} << (kXAdded % 8);
+  f.db->put({}, key, bad);
+  expect_corrupt(x_null);
+  expect_corrupt(x_value);
+  expect_corrupt(emit_x, kI64Row);
+  expect_corrupt(row_from_get);
+  // y's present bit set: its slot is past the row's var_end table.
+  bad = good;
+  bad[bytecask::sql::kRowHeaderBytes + kYAdded / 8] |= std::byte{1} << (kYAdded % 8);
+  f.db->put({}, key, bad);
+  expect_corrupt(y_bytes);
+  // A present variable column whose var_end runs past the row.
+  bad = good;
+  auto var_table = std::to_integer<std::size_t>(good[4]) | (std::to_integer<std::size_t>(good[5]) << 8);
+  bad[var_table] = std::byte{0xFF};
+  bad[var_table + 1] = std::byte{0xFF};
+  f.db->put({}, key, bad);
+  expect_corrupt(name_null);
+  expect_corrupt(emit_name, std::array{PhysType::Bytes});
+  expect_corrupt(slot_of_row);
+}
+
 TEST_CASE("plan API: a charge of several units does not step over the deadline check", "[sql][algebra]") {
   Fixture f;
   for (std::int64_t i = 1; i <= 30; ++i) REQUIRE(run(f, insert_t, {i, bytes("n"), i}) == BC_COMMITTED);

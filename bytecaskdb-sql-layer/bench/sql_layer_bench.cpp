@@ -5,8 +5,8 @@
 // TPROC-C schema: what bc_ctx_run's verification of its reference, the
 // compatibility check and the map from column ids to positions, adds to an
 // execution (a point read's reference and a New-Order-sized one), what one
-// column decode costs, and what bc_update costs when no indexed column
-// changes. Not part of CI. The published
+// column decode costs, what a nullable text column's null test and read
+// cost, and what bc_update costs when no indexed column changes. Not part of CI. The published
 // numbers were taken in releasedbg (-O3 -march=native, no LTO):
 //   xmake f -m releasedbg --sql_layer=y && xmake build sql_layer_bench && xmake run sql_layer_bench
 // release adds LTO, whose link fails where llvm-ar is older than clang (it
@@ -163,6 +163,27 @@ void payment_update(bc_ctx* cx) {
   bc_update(cx, g_customer, old, row);
 }
 
+// Reads customer (1, 1, 1) and, 64 times, tests one of its nullable VARCHAR
+// columns for null and reads its bytes when present, as generated plans do:
+// c_first and c_last are set, c_middle and c_street_1 are NULL. The
+// per-column cost of a nullable text column's null test and read.
+std::array<std::uint32_t, 4> g_texts{};
+void text_64(bc_ctx* cx) {
+  bool found = false;
+  bc_view row = bc_get(cx, bc_key_params(cx, g_customer, 0, 3), &found);
+  for (int i = 0; i < 64; ++i) {
+    auto col = g_texts[static_cast<std::size_t>(i) % g_texts.size()];
+    if (!bc_col_null(cx, row, col)) (void)bc_col_bytes(cx, row, col);
+  }
+  bc_emit_count(cx, found ? 1 : 0);
+}
+void text_0(bc_ctx* cx) {
+  bool found = false;
+  bc_view row = bc_get(cx, bc_key_params(cx, g_customer, 0, 3), &found);
+  (void)row;
+  bc_emit_count(cx, found ? 1 : 0);
+}
+
 template <typename F>
 auto ns_per_iter(F&& f, int iters) -> double {
   std::vector<double> runs;
@@ -224,6 +245,8 @@ int main() {
     const auto& cust = *cat->table("customer");
     g_customer = cust.id;
     g_balance = cust.column("c_balance")->id;
+    g_texts = {cust.column("c_first")->id, cust.column("c_middle")->id, cust.column("c_last")->id,
+               cust.column("c_street_1")->id};
     {
       RowWriter rw{cust.layout};
       for (const auto* name : {"c_w_id", "c_d_id", "c_id"}) (void)rw.set_i64(cust.column(name)->id, 1);
@@ -285,17 +308,28 @@ int main() {
                   spec->read.size() + spec->written.size(), runs(&ref->ref) - base);
     }
     auto wref = make_ref(*cat, {{"warehouse"}, {}, {{"warehouse", "w_tax"}}, {}});
-    auto run = [&](bc_plan_fn plan, const bc_schema_ref* ref) {
-      bc_ctx_begin(cx, &ps, {});
+    auto run_with = [&](const bc_params& p, bc_plan_fn plan, const bc_schema_ref* ref) {
+      bc_ctx_begin(cx, &p, {});
       bc_ctx_run(cx, plan, ref);
       if (bc_error(cx) != BC_OK) std::printf("error: %s\n", bc_error_message(cx));
       bc_ctx_reset(cx);
     };
+    auto run = [&](bc_plan_fn plan, const bc_schema_ref* ref) { run_with(ps, plan, ref); };
     auto d0 = ns_per_iter([&] { run(decode_0, &wref->ref); }, kIters);
     auto d64 = ns_per_iter([&] { run(decode_64, &wref->ref); }, kIters);
     std::printf("bc_col_i64 + bc_add, by column id:         %8.1f ns per call\n", (d64 - d0) / 64);
-    auto pref = make_ref(*cat, {{"customer"}, {"customer"}, {{"customer", "c_balance"}}, {}});
+    auto tref = make_ref(*cat, {{"customer"},
+                                {},
+                                {{"customer", "c_first"},
+                                 {"customer", "c_middle"},
+                                 {"customer", "c_last"},
+                                 {"customer", "c_street_1"}},
+                                {}});
     bc_params ps3{{std::int64_t{1}, std::int64_t{1}, std::int64_t{1}}};
+    auto t0 = ns_per_iter([&] { run_with(ps3, text_0, &tref->ref); }, kIters);
+    auto t64 = ns_per_iter([&] { run_with(ps3, text_64, &tref->ref); }, kIters);
+    std::printf("bc_col_null + bc_col_bytes, nullable VARCHAR:  %8.1f ns per column\n", (t64 - t0) / 64);
+    auto pref = make_ref(*cat, {{"customer"}, {"customer"}, {{"customer", "c_balance"}}, {}});
     auto run3 = [&](bc_plan_fn plan) {
       bc_ctx_begin(cx, &ps3, {});
       bc_ctx_run(cx, plan, &pref->ref);

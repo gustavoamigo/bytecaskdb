@@ -16,10 +16,11 @@
 //
 // The bitmap says present: a column set null and a column the row predates
 // both have the bit clear. The sizes in the header let a reader with an older
-// layout's constants find every region. All integers are little-endian. Every
-// accessor is bounds-checked against the row: a column past the end of a
-// shorter row reads as zero or empty, a malformed row is reported, never read
-// past.
+// layout's constants find every region. All integers are little-endian. One
+// decoder, row_column, reads every column, bounds-checked against the row: a
+// clear bit is absent (NULL), and a set bit for a column the row does not
+// hold, or a header that does not parse, is malformed, never read as 0 or
+// empty and never read past.
 
 module;
 #include <algorithm>
@@ -27,6 +28,7 @@ module;
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -153,8 +155,10 @@ class RowWriter {
 public:
   explicit RowWriter(const RowLayout& layout);
 
-  void reset();
-  void copy_from(BytesView old);  // every column of old that this layout knows
+  // Every column of old that this layout knows. False if one is malformed
+  // (row_column): the writer is then partly copied, to be dropped or copied
+  // into again.
+  [[nodiscard]] auto copy_from(BytesView old) -> bool;
   // false if col_id is not in the layout or has another type.
   [[nodiscard]] auto set_i64(std::uint32_t col_id, std::int64_t v) -> bool;
   [[nodiscard]] auto set_f64(std::uint32_t col_id, double v) -> bool;
@@ -189,22 +193,37 @@ private:
 // checks before it reads. Constant time, unlike row_valid.
 [[nodiscard]] auto row_header_valid(BytesView row) -> bool;
 [[nodiscard]] auto row_generation(BytesView row) -> std::uint16_t;
-// The bitmap bit. Clear for a malformed row or a bit past the bitmap.
-[[nodiscard]] auto row_present_bit(BytesView row, std::uint32_t col_id) -> bool;
-// The word at `off`; 0 if past the row's fixed region (the row predates the column).
-[[nodiscard]] auto row_word(BytesView row, std::uint32_t off) -> std::optional<std::uint64_t>;
-[[nodiscard]] auto row_i64(BytesView row, std::uint32_t off) -> std::optional<std::int64_t>;
-[[nodiscard]] auto row_f64(BytesView row, std::uint32_t off) -> std::optional<double>;
-[[nodiscard]] auto row_bool(BytesView row, std::uint32_t off) -> std::optional<bool>;  // any non-zero word is true
-// Variable slot; empty if past the row's var_end table.
-[[nodiscard]] auto row_bytes(BytesView row, std::uint32_t slot) -> std::optional<BytesView>;
-// Whether `row`'s regions hold a column's slot: its fixed word before the
-// var_end table, or its variable slot below nvar. A column the row predates
-// is outside them and reads as 0 or empty; with its present bit set, the row
-// is damaged.
-[[nodiscard]] auto row_holds(BytesView row, const ColumnSlot& col) -> bool;
-// Whether a column of a layout is null in `row`: its present bit is clear.
-[[nodiscard]] auto row_is_null(BytesView row, const ColumnSlot& col) -> bool;
+// What a stored row holds for one column of its layout.
+enum class ColumnState : std::uint8_t {
+  Absent,     // its present bit is clear or past the bitmap: NULL, or a column the row predates
+  Value,      // present, and inside the row
+  Malformed,  // the header does not parse, or the bit is set and the column lies outside the
+              // row's regions or its bytes run past the row
+};
+struct ColumnRead {
+  ColumnState state{ColumnState::Malformed};
+  std::uint64_t word{0};  // a fixed column's word, when Value
+  BytesView bytes;        // a variable column's bytes, when Value: a view into the row
+
+  [[nodiscard]] auto i64() const -> std::int64_t { return std::bit_cast<std::int64_t>(word); }
+  [[nodiscard]] auto f64() const -> double { return std::bit_cast<double>(word); }
+  [[nodiscard]] auto boolean() const -> bool { return word != 0; }  // any non-zero word is true
+};
+// The one reader of a stored row's columns, named by id (the bitmap bit),
+// physical type and position in the row's layout generation. Every reader
+// of a column goes through it, so a present column the row does not hold is
+// Malformed everywhere, never read as 0, empty or NULL. The bytes are a view
+// into `row`: valid while the row is.
+[[nodiscard]] auto row_column(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t pos) -> ColumnRead;
+// row_column's classification without the value, for a null test: the
+// header, the bit, whether the row's regions hold the column and, for a
+// variable column, its own two var_end words (in order, inside the row). It
+// agrees with row_column on every row, and copies nothing.
+[[nodiscard]] auto row_column_state(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t pos)
+    -> ColumnState;
+[[nodiscard]] inline auto row_column(BytesView row, const ColumnSlot& col) -> ColumnRead {
+  return row_column(row, col.col_id, col.type, col.pos);
+}
 // Whether a column holds the same encoding in two rows of one layout: null
 // in both, or the same word or bytes. Equal values with different encodings
 // (-0.0 and 0.0) compare unequal. nullopt for a malformed row.
@@ -353,27 +372,28 @@ RowWriter::RowWriter(const RowLayout& layout)
       fixed_(layout.columns.size(), 0),
       var_(layout.columns.size()) {}
 
-void RowWriter::reset() {
-  std::ranges::fill(present_, false);
-  std::ranges::fill(fixed_, 0);
-  for (auto& v : var_) v.clear();
-}
 
-void RowWriter::copy_from(BytesView old) {
+auto RowWriter::copy_from(BytesView old) -> bool {
   for (std::size_t i = 0; i < layout_->columns.size(); ++i) {
     const auto& c = layout_->columns[i];
-    if (row_is_null(old, c)) {
-      present_[i] = false;
-      continue;
-    }
-    present_[i] = true;
-    if (is_fixed(c.type)) {
-      fixed_[i] = row_word(old, c.pos).value_or(0);
-    } else {
-      auto v = row_bytes(old, c.pos).value_or(BytesView{});
-      var_[i].assign(v.begin(), v.end());
+    auto v = row_column(old, c);
+    switch (v.state) {
+      case ColumnState::Malformed: return false;
+      case ColumnState::Absent:
+        present_[i] = false;  // finish writes nothing for it
+        var_[i].clear();      // nor keeps its bytes, in a writer that is reused
+        break;
+      case ColumnState::Value:
+        present_[i] = true;
+        if (is_fixed(c.type)) {
+          fixed_[i] = v.word;
+        } else {
+          var_[i].assign(v.bytes.begin(), v.bytes.end());
+        }
+        break;
     }
   }
+  return true;
 }
 
 auto RowWriter::index_of(std::uint32_t col_id, std::optional<PhysType> type) const -> std::optional<std::size_t> {
@@ -400,8 +420,8 @@ auto RowWriter::set_i64(std::uint32_t col_id, std::int64_t v) -> bool {
 
 auto RowWriter::set_f64(std::uint32_t col_id, double v) -> bool {
   // A REAL column stores its float rounding, as PostgreSQL stores a float4.
-  // The one place a row's REAL value is rounded: a DEFAULT is parsed as a
-  // float, so the catalog holds it already rounded, and this leaves it as is.
+  // Every value written to a REAL column passes here. A DEFAULT, parsed as
+  // a float by the binder, is already its own rounding and passes unchanged.
   auto i = index_of(col_id, PhysType::F64);
   if (!i) return false;
   if (layout_->columns[*i].sql.kind == SqlKind::Real) v = float_rounding(v);
@@ -424,9 +444,8 @@ auto RowWriter::set_bytes(std::uint32_t col_id, BytesView v) -> bool {
 auto RowWriter::set_null(std::uint32_t col_id) -> bool {
   auto i = index_of(col_id, std::nullopt);
   if (!i) return false;
-  present_[*i] = false;
-  fixed_[*i] = 0;
-  var_[*i].clear();
+  present_[*i] = false;  // finish writes nothing for it
+  var_[*i].clear();      // nor keeps its bytes, in a writer that is reused
   return true;
 }
 
@@ -439,8 +458,13 @@ auto RowWriter::missing_required() const -> std::optional<std::uint32_t> {
 
 auto RowWriter::finish(Bytes& out, std::size_t max_bytes) const -> bool {
   const auto& l = *layout_;
+  // Only present columns are written: a column the writer holds a value for
+  // but marks absent (a DEFAULT bc_row_begin set, then bc_row_set_null)
+  // leaves its word zero and its slot empty.
   auto var_bytes = std::size_t{0};
-  for (const auto& v : var_) var_bytes += v.size();
+  for (std::size_t i = 0; i < var_.size(); ++i) {
+    if (present_[i]) var_bytes += var_[i].size();
+  }
   auto total = std::size_t{l.fixed_end} + 4 * std::size_t{l.nvar} + var_bytes;
   if (total > max_bytes || total > kMaxRowBytes) return false;
 
@@ -460,7 +484,8 @@ auto RowWriter::finish(Bytes& out, std::size_t max_bytes) const -> bool {
   auto data = at + std::size_t{l.fixed_end} + 4 * std::size_t{l.nvar};
   for (std::size_t i = 0; i < l.columns.size(); ++i) {
     const auto& c = l.columns[i];
-    if (present_[i]) out[at + kRowHeaderBytes + c.col_id / 8] |= static_cast<std::byte>(1u << (c.col_id % 8));
+    if (!present_[i]) continue;
+    out[at + kRowHeaderBytes + c.col_id / 8] |= static_cast<std::byte>(1u << (c.col_id % 8));
     if (is_fixed(c.type)) store_le(out, at + c.pos, fixed_[i], kFixedColumnBytes);
   }
   // Variable data in slot order; a slot no column holds (a dropped column) is empty.
@@ -469,8 +494,10 @@ auto RowWriter::finish(Bytes& out, std::size_t max_bytes) const -> bool {
     for (std::size_t i = 0; i < l.columns.size(); ++i) {
       const auto& c = l.columns[i];
       if (is_fixed(c.type) || c.pos != s) continue;
-      std::ranges::copy(var_[i], out.begin() + static_cast<std::ptrdiff_t>(data + end));
-      end += var_[i].size();
+      if (present_[i]) {
+        std::ranges::copy(var_[i], out.begin() + static_cast<std::ptrdiff_t>(data + end));
+        end += var_[i].size();
+      }
       break;
     }
     store_le(out, at + l.fixed_end + 4 * std::size_t{s}, end, 4);
@@ -523,72 +550,65 @@ auto row_generation(BytesView row) -> std::uint16_t {
   return row.size() < 2 ? 0 : static_cast<std::uint16_t>(load_u16(row, 0));
 }
 
-auto row_present_bit(BytesView row, std::uint32_t col_id) -> bool {
+namespace {
+// The header, if the row's regions hold a present column; otherwise why
+// not, Absent or Malformed. What row_column and row_column_state share.
+auto locate(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t pos)
+    -> std::expected<Header, ColumnState> {
   auto h = header(row);
-  if (!h || col_id / 8 >= h->bitmap_bytes) return false;
-  auto byte = kRowHeaderBytes + col_id / 8;
-  return (std::to_integer<unsigned>(row[byte]) >> (col_id % 8) & 1u) != 0;
+  if (!h) return std::unexpected(ColumnState::Malformed);
+  if (col_id / 8 >= h->bitmap_bytes) return std::unexpected(ColumnState::Absent);  // the row predates the column
+  auto bit = std::to_integer<unsigned>(row[kRowHeaderBytes + col_id / 8]) >> (col_id % 8) & 1u;
+  if (bit == 0) return std::unexpected(ColumnState::Absent);
+  // Present: the row must hold it. Outside its regions (a row that predates
+  // the column, with the bit set) it is damaged.
+  auto held = type == PhysType::Bytes
+                  ? pos < h->nvar
+                  : pos >= h->fixed_start() && (pos - h->fixed_start()) % kFixedColumnBytes == 0 &&
+                        std::size_t{pos} + kFixedColumnBytes <= h->var_table;
+  if (!held) return std::unexpected(ColumnState::Malformed);
+  return *h;
+}
+}  // namespace
+
+namespace {
+// A held variable column's bytes, as offsets into the row: its two var_end
+// words, in order and inside the row; nullopt otherwise (Malformed).
+auto var_bounds(BytesView row, const Header& h, std::uint32_t pos) -> std::optional<std::pair<std::size_t, std::size_t>> {
+  auto data = h.var_data();
+  auto begin = pos == 0 ? 0u : load_u32(row, h.var_table + 4 * std::size_t{pos - 1});
+  auto end = load_u32(row, h.var_table + 4 * std::size_t{pos});
+  if (end < begin || data + end > h.row_bytes) return std::nullopt;
+  return std::pair{data + begin, data + end};
+}
+}  // namespace
+
+auto row_column_state(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t pos) -> ColumnState {
+  auto h = locate(row, col_id, type, pos);
+  if (!h) return h.error();
+  if (type == PhysType::Bytes && !var_bounds(row, *h, pos)) return ColumnState::Malformed;
+  return ColumnState::Value;
 }
 
-auto row_word(BytesView row, std::uint32_t off) -> std::optional<std::uint64_t> {
-  auto h = header(row);
-  if (!h || off < h->fixed_start() || (off - h->fixed_start()) % kFixedColumnBytes != 0) return std::nullopt;
-  if (std::size_t{off} + kFixedColumnBytes > h->var_table) return 0;  // the row predates the column
-  return load_le(row, off, kFixedColumnBytes);
+auto row_column(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t pos) -> ColumnRead {
+  auto h = locate(row, col_id, type, pos);
+  if (!h) return {.state = h.error(), .word = 0, .bytes = {}};
+  if (type != PhysType::Bytes) {
+    return {.state = ColumnState::Value, .word = load_le(row, pos, kFixedColumnBytes), .bytes = {}};
+  }
+  auto b = var_bounds(row, *h, pos);
+  if (!b) return {};
+  return {.state = ColumnState::Value, .word = 0, .bytes = row.subspan(b->first, b->second - b->first)};
 }
-
-auto row_i64(BytesView row, std::uint32_t off) -> std::optional<std::int64_t> {
-  auto w = row_word(row, off);
-  if (!w) return std::nullopt;
-  return std::bit_cast<std::int64_t>(*w);
-}
-
-auto row_f64(BytesView row, std::uint32_t off) -> std::optional<double> {
-  auto w = row_word(row, off);
-  if (!w) return std::nullopt;
-  return std::bit_cast<double>(*w);
-}
-
-auto row_bool(BytesView row, std::uint32_t off) -> std::optional<bool> {
-  auto w = row_word(row, off);
-  if (!w) return std::nullopt;
-  return *w != 0;
-}
-
-auto row_bytes(BytesView row, std::uint32_t slot) -> std::optional<BytesView> {
-  auto h = header(row);
-  if (!h) return std::nullopt;
-  if (slot >= h->nvar) return BytesView{};  // the row predates the column
-  auto data = h->var_data();
-  auto begin = slot == 0 ? 0u : load_u32(row, h->var_table + 4 * std::size_t{slot - 1});
-  auto end = load_u32(row, h->var_table + 4 * std::size_t{slot});
-  if (end < begin || data + end > h->row_bytes) return std::nullopt;
-  return row.subspan(data + begin, end - begin);
-}
-
-auto row_holds(BytesView row, const ColumnSlot& col) -> bool {
-  auto h = header(row);
-  if (!h) return false;
-  if (col.type == PhysType::Bytes) return col.pos < h->nvar;
-  return col.pos >= h->fixed_start() && std::size_t{col.pos} + kFixedColumnBytes <= h->var_table;
-}
-
-auto row_is_null(BytesView row, const ColumnSlot& col) -> bool { return !row_present_bit(row, col.col_id); }
 
 auto row_column_equal(BytesView a, BytesView b, const ColumnSlot& col) -> std::optional<bool> {
-  auto null_a = row_is_null(a, col);
-  auto null_b = row_is_null(b, col);
-  if (null_a || null_b) return null_a == null_b;
-  if (col.type == PhysType::Bytes) {
-    auto x = row_bytes(a, col.pos);
-    auto y = row_bytes(b, col.pos);
-    if (!x || !y) return std::nullopt;
-    return std::ranges::equal(*x, *y);
-  }
-  auto x = row_word(a, col.pos);
-  auto y = row_word(b, col.pos);
-  if (!x || !y) return std::nullopt;
-  return *x == *y;
+  auto x = row_column(a, col);
+  auto y = row_column(b, col);
+  if (x.state == ColumnState::Malformed || y.state == ColumnState::Malformed) return std::nullopt;
+  if (x.state != y.state) return false;
+  if (x.state == ColumnState::Absent) return true;
+  if (col.type == PhysType::Bytes) return std::ranges::equal(x.bytes, y.bytes);
+  return x.word == y.word;
 }
 
 }  // namespace bytecask::sql

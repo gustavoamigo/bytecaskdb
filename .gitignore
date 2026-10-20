@@ -15,9 +15,6 @@ bytecaskdb-node/native/bytecask_testing.node
 
 # Editor / LSP caches
 .cache/
-
-# Hypothesis example database (the proof tests' dev profile)
-.hypothesis/
 .vscode/
 compile_commands.json
 
@@ -90,3 +87,6 @@ bytecaskdb-mariadb-plugin/benchmarks/sysbench_longrun_results.csv
 
 # Local tools (e.g. nektos/act)
 bin/
+
+# Hypothesis example database (the proof tests' dev profile)
+.hypothesis/

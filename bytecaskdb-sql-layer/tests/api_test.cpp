@@ -213,6 +213,16 @@ TEST_CASE("embedded API: a cached plan is checked once per catalog version", "[s
   for (int k = 0; k < 3; ++k) (void)db->execute(by_k, {i(1)});
   CHECK(db->plan_checks_for_testing() == 2);
   CHECK(db->compilations() == compiled);
+  // A plan marked as fitting is checked again after a DDL that breaks it,
+  // recompiled, and runs on the new table.
+  (void)db->execute("DROP TABLE t");
+  (void)db->execute("CREATE TABLE t (k BIGINT PRIMARY KEY, v BIGINT)");
+  (void)db->execute("INSERT INTO t VALUES ($1, $2)", {i(1), i(9)});
+  CHECK(db->execute(by_k, {i(1)}).rows == Grid{{i(9)}});
+  CHECK(db->plan_checks_for_testing() == 3);
+  CHECK(db->compilations() == compiled + 2);  // the INSERT's first compile, and by_k's recompile
+  CHECK(db->execute(by_k, {i(1)}).rows == Grid{{i(9)}});
+  CHECK(db->plan_checks_for_testing() == 3);
 }
 
 TEST_CASE("embedded API: a DOUBLE read through an index keeps -0.0", "[sql][api]") {
@@ -577,6 +587,79 @@ TEST_CASE("embedded API: table_rows reads a table in key order; errors carry the
     CHECK(e.code() == BC_E_CORRUPT);
   }
   fourth->close();
+}
+
+TEST_CASE("embedded API: a stored column that does not decode is BC_E_CORRUPT, never 0, empty or NULL",
+          "[sql][api]") {
+  sql_test::TempDir dir{"api_strict_rows"};
+  std::uint32_t p_id = 0, c_id = 0, d_id = 0;
+  {
+    auto db = Database::open(dir.path());
+    (void)db->execute("CREATE TABLE p (k BIGINT PRIMARY KEY, a BIGINT, s TEXT)");
+    for (std::int64_t k = 1; k <= 3; ++k) {
+      CHECK(db->execute("INSERT INTO p VALUES ($1, $2, $3)", {i(k), i(5), bytes("abc")}).affected == 1);
+    }
+    // Rows 1 to 3 predate c and d: they read them as NULL.
+    (void)db->execute("ALTER TABLE p ADD COLUMN c BIGINT");
+    (void)db->execute("ALTER TABLE p ADD COLUMN d TEXT");
+    auto cat = db->catalog();  // held: p points into it
+    const auto* p = cat->table("p");
+    p_id = p->id;
+    c_id = p->column("c")->id;
+    d_id = p->column("d")->id;
+    CHECK(db->execute("SELECT c, d FROM p WHERE k = $1", {i(1)}).rows == Grid{{kNull, kNull}});
+    db->close();
+  }
+  // Damage three rows through the engine: row 1 gets c's present bit, row
+  // 2 d's, and row 3's var_end for s runs past the row.
+  {
+    auto engine = bytecask::DB::open(dir.path());
+    auto rewrite = [&](std::int64_t k, auto&& damage) {
+      Bytes key = row_prefix(p_id);
+      key_put_i64(key, k, {PhysType::I64});
+      Bytes row;
+      REQUIRE(engine.get({}, key, row));
+      damage(row);
+      engine.put({}, key, row);
+    };
+    rewrite(1, [&](Bytes& row) { row[kRowHeaderBytes + c_id / 8] |= std::byte{1} << (c_id % 8); });
+    rewrite(2, [&](Bytes& row) { row[kRowHeaderBytes + d_id / 8] |= std::byte{1} << (d_id % 8); });
+    rewrite(3, [&](Bytes& row) {
+      // The var_end table starts at the header's var_table (bytes 4 and 5);
+      // s is the row's only variable slot.
+      auto var_table = std::to_integer<std::size_t>(row[4]) | (std::to_integer<std::size_t>(row[5]) << 8);
+      row[var_table] = std::byte{0xFF};
+      row[var_table + 1] = std::byte{0xFF};
+    });
+    engine.close();
+  }
+  auto db = Database::open(dir.path());
+  auto corrupt = [&](std::string_view sql, std::int64_t k, std::vector<Value> more = {}) {
+    std::vector<Value> params{i(k)};
+    params.insert(params.end(), more.begin(), more.end());
+    try {
+      (void)db->execute(sql, params);
+      FAIL(sql << " read a column that does not decode, at row " << k);
+    } catch (const ExecError& e) {
+      CHECK(e.code() == BC_E_CORRUPT);
+    }
+  };
+  corrupt("SELECT c FROM p WHERE k = $1", 1);  // a present fixed column the row predates
+  corrupt("SELECT d FROM p WHERE k = $1", 2);  // a present variable column the row predates
+  corrupt("SELECT s FROM p WHERE k = $1", 3);  // a variable column that runs past the row
+  // An UPDATE copies the old row: the damage is refused there too.
+  corrupt("UPDATE p SET a = $2 WHERE k = $1", 1, {i(6)});
+  // A column the damage does not touch still reads.
+  CHECK(db->execute("SELECT a FROM p WHERE k = $1", {i(1)}).rows == Grid{{i(5)}});
+  try {
+    (void)db->table_rows("p");
+    FAIL("table_rows read a column that does not decode");
+  } catch (const ExecError& e) {
+    CHECK(e.code() == BC_E_CORRUPT);
+    // Row 1, the first in key order, names its damaged column.
+    CHECK(std::string{e.what()}.starts_with("column " + std::to_string(c_id) + " does not decode"));
+  }
+  db->close();
 }
 
 TEST_CASE("embedded API: values outside their declared type, an omitted NOT NULL column, one PRIMARY KEY",

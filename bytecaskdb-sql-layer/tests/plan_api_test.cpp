@@ -234,7 +234,7 @@ TEST_CASE("plan API: bc_ctx_run checks what a plan depends on, not a catalog ver
   bytecask::sql::key_put_i64(key, 2, {PhysType::I64});
   REQUIRE(f.db->get({}, key, row));
   const auto& t2 = *f.cat().table("t");
-  CHECK(bytecask::sql::row_i64(row, t2.layout.find(t2.column("tag")->id)->pos) == 7);
+  CHECK(bytecask::sql::row_column(row, *t2.layout.find(t2.column("tag")->id)).i64() == 7);
 
   // CREATE INDEX keeps the write plan, which maintains the new index.
   f.ddl(bytecask::sql::CreateIndexDdl{"t_by_qty", "t", {{"qty"}}});
