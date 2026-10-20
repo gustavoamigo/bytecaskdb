@@ -7,8 +7,11 @@
 // refuses as incompatible with the catalog (docs/catalog_design.md,
 // *Compatibility*) is recompiled from that text and run again.
 //
-// Autocommit only: each execute is one plan through bc_execute, retried on a
-// conflict. One thread at a time.
+// Database::execute is autocommit: each statement is one plan through
+// bc_execute, retried on a conflict. Database::begin opens a transaction
+// (docs/transaction_design.md), whose statements run on its own context, so
+// transactions on different threads run concurrently; everything else on a
+// Database is one thread at a time.
 //
 // prototype: the shape of #494's embedded API, not its design.
 
@@ -19,8 +22,11 @@ module;
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <optional>
+#include <set>
+#include <shared_mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -95,6 +101,27 @@ private:
   bool conflict_{false};
 };
 
+// A transaction's commit conflicted with a concurrent commit: SQLSTATE 40001.
+// Nothing was written, and the transaction has ended; rerun it.
+class SerializationFailure : public ExecError {
+public:
+  explicit SerializationFailure(const std::string& what) : ExecError{conflicted(what)} {}
+  SerializationFailure(const SerializationFailure&) = default;
+  SerializationFailure& operator=(const SerializationFailure&) = default;
+  ~SerializationFailure() override;  // out of line: anchors the vtable (-Wweak-vtables)
+};
+
+// A call on a transaction a statement failed in, other than rollback():
+// SQLSTATE 25P02, as PostgreSQL refuses every command until the
+// transaction block ends.
+class TransactionAborted : public std::runtime_error {
+public:
+  TransactionAborted() : std::runtime_error{"current transaction is aborted, commands ignored until end of transaction block"} {}
+  TransactionAborted(const TransactionAborted&) = default;
+  TransactionAborted& operator=(const TransactionAborted&) = default;
+  ~TransactionAborted() override;  // out of line: anchors the vtable (-Wweak-vtables)
+};
+
 // Parameters a statement does not take: the wrong number, or a value not of
 // its parameter's type. Thrown before the plan runs.
 class ParamError : public std::invalid_argument {
@@ -132,6 +159,59 @@ private:
   bc_schema_ref ref_{};  // points into plan_ and the vectors above
 };
 
+struct TransactionOptions {
+  // The most a transaction's writes may hold, keys and values plus a fixed
+  // cost per write. A statement that would pass it is BC_E_LIMIT (SQLSTATE
+  // 54000), and aborts the transaction.
+  std::uint64_t max_bytes{64u << 20};
+};
+
+class Database;
+
+// A transaction from Database::begin(): its statements read the snapshot
+// taken at its first statement plus their earlier statements' writes, never
+// their own, and commit() writes them all as one batch, or nothing. A
+// statement that fails aborts it: every later execute() and commit() throws
+// TransactionAborted (25P02) until rollback(). After commit() or rollback()
+// it has ended, and every call but rollback() throws std::logic_error.
+// Destroying an open one rolls it back. Move-only; one thread at a time, and
+// ended before the Database closes it.
+class Transaction {
+public:
+  Transaction(Transaction&& other) noexcept;
+  Transaction& operator=(Transaction&& other) noexcept;
+  Transaction(const Transaction&) = delete;
+  Transaction& operator=(const Transaction&) = delete;
+  ~Transaction();
+
+  // Runs one statement in the transaction. Throws what Database::execute
+  // throws for a statement that fails, and the transaction is then aborted;
+  // TransactionAborted if it already is. A DDL statement is refused.
+  auto execute(const Statement& stmt, const std::vector<Value>& params) -> Rows;
+  auto execute(std::string_view sql, const std::vector<Value>& params = {}) -> Rows;
+  // Writes every statement's writes as one batch. Throws
+  // SerializationFailure on a conflict, ExecError on an engine error, and
+  // TransactionAborted after a failed statement; in every case but the last
+  // the transaction has ended with nothing written.
+  void commit();
+  // Ends the transaction; nothing it wrote is kept. Once ended, does nothing.
+  void rollback() noexcept;
+  [[nodiscard]] auto is_open() const noexcept -> bool { return state_ != State::Ended; }
+  [[nodiscard]] auto is_aborted() const noexcept -> bool { return state_ == State::Aborted; }
+
+private:
+  friend class Database;
+  enum class State : std::uint8_t { Open, Aborted, Ended };
+  Transaction(Database& db, TransactionOptions opts);
+  void end() noexcept;  // frees the context and the transaction
+  void check_open() const;
+
+  Database* db_{nullptr};
+  bc_ctx* cx_{nullptr};
+  bc_txn* txn_{nullptr};
+  State state_{State::Ended};
+};
+
 class Database {
 public:
   [[nodiscard]] static auto open(const std::filesystem::path& dir) -> std::unique_ptr<Database>;
@@ -154,6 +234,8 @@ public:
   auto execute(std::string_view sql, const std::vector<Value>& params = {}) -> Rows {
     return execute(prepare(sql), params);
   }
+  // Opens a transaction. Its snapshot is taken at its first statement.
+  [[nodiscard]] auto begin(TransactionOptions opts = {}) -> Transaction;
   [[nodiscard]] auto cached_plans() const -> std::size_t { return cache_.size(); }
   // How many times a DML statement was compiled, first compiles included.
   [[nodiscard]] auto compilations() const -> std::uint64_t { return compilations_; }
@@ -190,17 +272,32 @@ public:
   [[nodiscard]] auto is_open() const noexcept -> bool { return !closed_; }
 
 private:
+  friend class Transaction;
   Database() = default;
   void check_open() const {
     if (closed_) throw DbClosed();
   }
   void compile(Statement& s);
+  // Runs a DML statement on `cx`: autocommit, retried on a conflict, when
+  // `txn` is null; else as a statement of `txn`, its writes added to it.
+  // Brings a DML statement's plan up to the live catalog. Under the unique lock.
+  void refresh(Statement& stmt, const std::vector<Value>& params);
+  [[nodiscard]] auto checked_for_live(const Statement& stmt) const -> bool {
+    return stmt.ref_.catalog_version == live_->current()->version();
+  }
+  auto run(bc_ctx* cx, Statement& stmt, const std::vector<Value>& params, bc_txn* txn) -> Rows;
+  static auto results(bc_ctx* cx, const Statement& stmt, Rows out) -> Rows;
 
   std::unique_ptr<DB> db_;
   std::unique_ptr<LiveCatalog> live_;
   bc_db bdb_{};
   bc_catalog bcat_{};
   bc_ctx* cx_{nullptr};
+  // Exclusive for whatever changes the statement cache or a statement (prepare,
+  // autocommit execute, which may recompile, close); shared for a
+  // transaction's statements, which only read a prepared statement.
+  mutable std::shared_mutex mu_;
+  std::set<Transaction*> open_;  // the transactions close() ends; under mu_
   std::map<std::string, std::unique_ptr<Statement>, std::less<>> cache_;
   std::uint64_t compilations_{0};
 #ifdef BYTECASK_SQL_TESTING
@@ -221,6 +318,8 @@ constexpr std::uint32_t kMaxRetries = 3;
 }  // namespace
 
 ExecError::~ExecError() = default;
+SerializationFailure::~SerializationFailure() = default;
+TransactionAborted::~TransactionAborted() = default;
 ParamError::~ParamError() = default;
 
 auto Statement::param_types() const -> const std::vector<PhysType>& {
@@ -252,8 +351,13 @@ Database::~Database() {
 }
 
 void Database::close() {
+  std::unique_lock<std::shared_mutex> lock{mu_};
   if (closed_) return;
   closed_ = true;
+  // A transaction still open holds the engine's snapshot: ended first, with
+  // nothing written, and every later call on it throws.
+  for (auto* t : open_) t->end();
+  open_.clear();
   cache_.clear();
   bc_ctx_free(cx_);
   cx_ = nullptr;
@@ -326,6 +430,7 @@ void Database::compile(Statement& s) {
 }
 
 auto Database::prepare(std::string_view sql) -> const Statement& {
+  std::unique_lock<std::shared_mutex> lock{mu_};
   check_open();
   if (auto it = cache_.find(sql); it != cache_.end()) return *it->second;
   auto s = std::make_unique<Statement>();
@@ -336,6 +441,7 @@ auto Database::prepare(std::string_view sql) -> const Statement& {
 }
 
 auto Database::execute(const Statement& cstmt, const std::vector<Value>& params) -> Rows {
+  std::unique_lock<std::shared_mutex> lock{mu_};
   check_open();
   // The cache owns every Statement; the const handle is the caller's view of it.
   auto& stmt = *cache_.at(cstmt.sql_);
@@ -351,6 +457,41 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
     out.affected = 0;
     return out;
   }
+  refresh(stmt, params);
+  return run(cx_, stmt, params, nullptr);
+}
+
+void Database::refresh(Statement& stmt, const std::vector<Value>& params) {
+  // The runtime says whether the cached plan still fits the catalog
+  // (bc_ctx_check, the verification bc_ctx_run makes); it is recompiled only
+  // if not. The runtime alone decides compatibility. A plan that fits is
+  // marked with the version it was checked against, so it is checked once
+  // per catalog version, not on every run after a DDL. The runtime pins that
+  // version or a later one: a later one is checked again next time.
+  if (checked_for_live(stmt)) return;
+  auto version = live_->current()->version();
+#ifdef BYTECASK_SQL_TESTING
+  ++plan_checks_;
+#endif
+  bc_params bp{params};
+  bc_ctx_begin(cx_, &bp, {});
+  auto fits = bc_ctx_check(cx_, &stmt.ref_);
+  auto stale = !fits && bc_error(cx_) == BC_E_LAYOUT && bc_error_detail(cx_) == BC_L_INCOMPATIBLE;
+  if (!fits && !stale) {
+    ExecError e{bc_error_message(cx_), bc_error(cx_), bc_error_detail(cx_)};
+    bc_ctx_reset(cx_);
+    throw e;
+  }
+  bc_ctx_reset(cx_);
+  if (stale) {
+    compile(stmt);
+  } else {
+    stmt.ref_.catalog_version = version;
+  }
+}
+
+auto Database::run(bc_ctx* cx, Statement& stmt, const std::vector<Value>& params, bc_txn* txn) -> Rows {
+  Rows out;
   // Throws ParamError for parameters the statement's current plan
   // does not take: checked again after a recompile, whose plan may differ.
   auto mismatch = [&]() -> std::string {
@@ -379,76 +520,211 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   };
   bc_params bp{params};
   // The parameters are checked against the plan that will run, and so
-  // against the catalog it was verified against: a DDL since the plan was
-  // compiled may have changed what they are (an INTEGER key recreated as
-  // BIGINT). The runtime says whether the cached plan still fits the catalog
-  // (bc_ctx_check, the verification bc_ctx_run makes); it is recompiled only
-  // if not. The runtime alone decides compatibility. A plan that fits is
-  // marked with the version it was checked against, so it is checked once
-  // per catalog version, not on every run after a DDL. The runtime pins that
-  // version or a later one: a later one is checked again next time.
-  if (auto version = live_->current()->version(); stmt.ref_.catalog_version != version) {
-#ifdef BYTECASK_SQL_TESTING
-    ++plan_checks_;
-#endif
-    bc_ctx_begin(cx_, &bp, {});
-    auto fits = bc_ctx_check(cx_, &stmt.ref_);
-    auto stale = !fits && bc_error(cx_) == BC_E_LAYOUT && bc_error_detail(cx_) == BC_L_INCOMPATIBLE;
-    if (!fits && !stale) {
-      ExecError e{bc_error_message(cx_), bc_error(cx_), bc_error_detail(cx_)};
-      bc_ctx_reset(cx_);
+  // against the catalog it was verified against (refresh): a DDL since the
+  // plan was compiled may have changed what they are (an INTEGER key
+  // recreated as BIGINT). In a transaction the plan runs against the catalog
+  // version its first statement pinned, and bc_ctx_run verifies it there: a
+  // plan that does not fit fails the statement, and the transaction.
+  check_params();
+  if (txn != nullptr) {
+    // The statement's writes join the transaction, or it aborts.
+    bc_ctx_begin_txn(cx, txn, &bp, {});
+    bc_ctx_run(cx, stmt.code_->fn(), &stmt.ref_);
+    if (!bc_txn_add(cx)) {
+      ExecError e{bc_error_message(cx), bc_error(cx), bc_error_detail(cx)};
+      bc_ctx_reset(cx);
       throw e;
     }
-    bc_ctx_reset(cx_);
-    if (stale) {
-      compile(stmt);
-    } else {
-      stmt.ref_.catalog_version = version;
-    }
+    return results(cx, stmt, std::move(out));
   }
-  check_params();
-  auto r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
+  auto r = bc_execute(cx, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
   // bc_ctx_run checks the plan against the catalog it pinned. A plan a DDL
   // made incompatible (BC_E_LAYOUT with BC_L_INCOMPATIBLE) is recompiled
   // from its text and run once more; one a DDL left compatible keeps
   // running, unchecked here.
-  if (r == BC_FAILED && bc_error(cx_) == BC_E_LAYOUT && bc_error_detail(cx_) == BC_L_INCOMPATIBLE) {
-    bc_ctx_reset(cx_);
+  if (r == BC_FAILED && bc_error(cx) == BC_E_LAYOUT && bc_error_detail(cx) == BC_L_INCOMPATIBLE) {
+    bc_ctx_reset(cx);
     compile(stmt);
     check_params();
-    r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
+    r = bc_execute(cx, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);
   }
-  const auto& p = *stmt.plan_;
   if (r == BC_CONFLICT) {
-    bc_ctx_reset(cx_);
+    bc_ctx_reset(cx);
     throw ExecError::conflicted("conflict: a guard failed on every attempt");
   }
   if (r == BC_FAILED) {
-    ExecError e{bc_error_message(cx_), bc_error(cx_), bc_error_detail(cx_)};
-    bc_ctx_reset(cx_);  // the context keeps no snapshot or catalog version while idle
+    ExecError e{bc_error_message(cx), bc_error(cx), bc_error_detail(cx)};
+    bc_ctx_reset(cx);  // the context keeps no snapshot or catalog version while idle
     throw e;
   }
 
-  out.affected = bc_ctx_affected(cx_);
+  return results(cx, stmt, std::move(out));
+}
+
+// The rows and count the statement the context ran left, decoded; the
+// context is reset either way.
+auto Database::results(bc_ctx* cx, const Statement& stmt, Rows out) -> Rows {
+  const auto& p = *stmt.plan_;
+  out.affected = bc_ctx_affected(cx);
   if (p.returns_rows) {
     out.columns = stmt.columns_;
     out.types = stmt.column_types_;
     const std::uint8_t* row = nullptr;
     std::uint32_t len = 0;
-    while (bc_ctx_next_result(cx_, &row, &len)) {
+    while (bc_ctx_next_result(cx, &row, &len)) {
       // Result rows are decoded after the commit. That is safe while the
       // compiled write plans emit no rows (only bc_emit_count): a RETURNING
       // will have to decode its rows before it commits.
       auto values = decode_row(stmt.result_layout_, std::as_bytes(std::span{row, len}));
       if (!values) {
-        bc_ctx_reset(cx_);
+        bc_ctx_reset(cx);
         throw ExecError("malformed result row: column " + std::to_string(values.error()), BC_E_CORRUPT);
       }
       out.rows.push_back(std::move(*values));
     }
   }
-  bc_ctx_reset(cx_);
+  bc_ctx_reset(cx);
   return out;
+}
+
+auto Database::begin(TransactionOptions opts) -> Transaction {
+  std::unique_lock<std::shared_mutex> lock{mu_};
+  check_open();
+  return Transaction{*this, opts};
+}
+
+Transaction::Transaction(Database& db, TransactionOptions opts) : db_{&db} {
+  cx_ = bc_ctx_new(&db.bdb_, &db.bcat_, kArenaBytes);
+  txn_ = cx_ == nullptr ? nullptr : bc_txn_new(&db.bdb_, &db.bcat_, opts.max_bytes);
+  if (txn_ == nullptr) {
+    bc_ctx_free(cx_);
+    throw std::bad_alloc();
+  }
+  try {
+    db.open_.insert(this);  // under the lock begin() holds
+  } catch (...) {
+    end();
+    throw;
+  }
+  state_ = State::Open;
+}
+
+Transaction::Transaction(Transaction&& other) noexcept { *this = std::move(other); }
+
+Transaction& Transaction::operator=(Transaction&& other) noexcept {
+  if (this == &other) return *this;
+  rollback();
+  if (other.state_ != State::Ended) {
+    std::unique_lock<std::shared_mutex> lock{other.db_->mu_};
+    // The node is reused, not reallocated: nothing here can throw.
+    auto node = other.db_->open_.extract(&other);
+    node.value() = this;
+    other.db_->open_.insert(std::move(node));
+  }
+  db_ = std::exchange(other.db_, nullptr);
+  cx_ = std::exchange(other.cx_, nullptr);
+  txn_ = std::exchange(other.txn_, nullptr);
+  state_ = std::exchange(other.state_, State::Ended);
+  return *this;
+}
+
+Transaction::~Transaction() { rollback(); }
+
+void Transaction::end() noexcept {
+  bc_txn_free(txn_);  // a transaction not committed writes nothing
+  bc_ctx_free(cx_);
+  txn_ = nullptr;
+  cx_ = nullptr;
+  state_ = State::Ended;
+}
+
+void Transaction::rollback() noexcept {
+  if (state_ == State::Ended) return;
+  std::unique_lock<std::shared_mutex> lock{db_->mu_};
+  if (state_ == State::Ended) return;  // the database closed it meanwhile
+  db_->open_.erase(this);
+  end();
+}
+
+void Transaction::check_open() const {
+  if (state_ == State::Ended) throw std::logic_error("the transaction has ended");
+  if (state_ == State::Aborted) throw TransactionAborted();
+}
+
+auto Transaction::execute(const Statement& cstmt, const std::vector<Value>& params) -> Rows {
+  std::shared_lock<std::shared_mutex> lock{db_->mu_};
+  if (db_->closed_) throw DbClosed();
+  check_open();
+  try {
+    auto& stmt = *db_->cache_.at(cstmt.sql());
+    // DDL is its own atomic operation, never part of a transaction.
+    if (stmt.is_ddl()) throw std::logic_error("DDL inside a transaction is not supported");
+    if (!db_->checked_for_live(stmt)) {
+      // A recompile changes the statement other transactions may be running:
+      // under the unique lock. A DDL between it and the run fails the
+      // statement in bc_ctx_run.
+      lock.unlock();
+      {
+        std::unique_lock<std::shared_mutex> unique{db_->mu_};
+        if (db_->closed_) throw DbClosed();
+        db_->refresh(stmt, params);
+      }
+      lock.lock();
+      if (db_->closed_) throw DbClosed();
+      if (state_ == State::Ended) throw std::logic_error("the transaction has ended");
+    }
+    return db_->run(cx_, stmt, params, txn_);
+  } catch (...) {
+    // Every error aborts the transaction, as in PostgreSQL: a statement
+    // refused before it ran too.
+    state_ = State::Aborted;
+    throw;
+  }
+}
+
+auto Transaction::execute(std::string_view sql, const std::vector<Value>& params) -> Rows {
+  {
+    std::shared_lock<std::shared_mutex> lock{db_->mu_};
+    if (db_->closed_) throw DbClosed();
+    if (state_ == State::Aborted && !db_->cache_.contains(sql)) {
+      // As in PostgreSQL, a statement that does not parse reports that, not
+      // 25P02: the text is parsed before the transaction's state is checked.
+      (void)ast::parse(sql);
+    }
+    check_open();
+  }
+  const Statement* stmt = nullptr;
+  try {
+    stmt = &db_->prepare(sql);
+  } catch (const DbClosed&) {
+    throw;
+  } catch (...) {
+    state_ = State::Aborted;  // a statement that does not parse or bind aborts it too
+    throw;
+  }
+  return execute(*stmt, params);
+}
+
+void Transaction::commit() {
+  {
+    std::shared_lock<std::shared_mutex> lock{db_->mu_};
+    if (db_->closed_) throw DbClosed();
+    check_open();
+  }
+  // Shared: commits on different transactions run together, and share the
+  // engine's group commit. The commit ends the transaction, whatever the
+  // outcome.
+  auto r = BC_FAILED;
+  std::optional<ExecError> failed;
+  {
+    std::shared_lock<std::shared_mutex> lock{db_->mu_};
+    if (db_->closed_) throw DbClosed();
+    r = bc_txn_commit(cx_, txn_, true);
+    if (r == BC_FAILED) failed.emplace(bc_error_message(cx_), bc_error(cx_), bc_error_detail(cx_));
+  }
+  rollback();  // frees what is left; nothing more is written
+  if (r == BC_CONFLICT) throw SerializationFailure("could not serialize access due to concurrent update");
+  if (failed) throw *failed;
 }
 
 #ifdef BYTECASK_SQL_TESTING

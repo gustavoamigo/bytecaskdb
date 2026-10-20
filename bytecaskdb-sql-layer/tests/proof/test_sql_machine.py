@@ -16,6 +16,13 @@ weighted towards duplicate keys, NULLs, left-out NOT NULL columns and
 values outside their declared types, a point lookup by the full primary
 key, and a reopen of the layer's database (docs/testing_design.md).
 
+Transactions (#491): BEGIN, the same inserts and lookups in it, which read
+its own writes, then COMMIT or ROLLBACK; PostgreSQL runs it in a real
+REPEATABLE READ transaction on its connection. A statement that fails
+aborts both, and every statement after it is 25P02 until the rollback. The
+tables are compared while no transaction is open; DDL and the reopen run
+only then.
+
 The fixed cases at the end call the same steps in a set order.
 """
 
@@ -144,10 +151,14 @@ class SqlMachine(RuleBasedStateMachine):
                 shutil.rmtree(self.dir, ignore_errors=True)
             raise
         self.tables: dict[str, Table] = {}
+        self.txn = None  # the layer's open transaction, if any
 
     def teardown(self):
         # Every step runs, whichever fails, and the first failure is the one raised.
         try:
+            if self.txn is not None:
+                self.txn.rollback()
+                o.run_pg(self.pg.conn, "ROLLBACK")
             self.db.close()
         finally:
             try:
@@ -159,7 +170,7 @@ class SqlMachine(RuleBasedStateMachine):
 
     def both(self, sql: str, params=(), pg_sql: str | None = None) -> o.Outcome:
         """Runs a statement on both sides; they must agree. Returns the layer's outcome."""
-        layer = o.run_layer(self.db, sql, params)
+        layer = o.run_layer(self.db if self.txn is None else self.txn, sql, params)
         pg = o.run_pg(self.pg.conn, pg_sql or sql, params)
         if currently_in_test_context():  # the fixed cases call the steps outside Hypothesis
             note(f"{sql} {params!r} -> layer {layer.error or 'ok'}, postgres {pg.error or 'ok'}")
@@ -173,10 +184,23 @@ class SqlMachine(RuleBasedStateMachine):
         assert layer.affected == pg.affected, (
             f"{sql} {params!r}: the layer changed {layer.affected} rows, PostgreSQL {pg.affected}"
         )
+        if self.txn is not None:
+            assert self.txn.is_aborted == self.pg_aborted(), (
+                f"{sql} {params!r}: the layer's transaction is {'' if self.txn.is_aborted else 'not '}aborted, "
+                f"PostgreSQL's {'' if self.pg_aborted() else 'not '}"
+            )
         return layer
 
+    def pg_aborted(self) -> bool:
+        import psycopg
+
+        return self.pg.conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR
+
     def existing_keys(self, t: Table) -> list[tuple]:
-        # Ordered, so a draw from it is reproducible from its seed.
+        if self.txn is not None and self.txn.is_aborted:
+            return []  # PostgreSQL answers nothing until the rollback
+        # Ordered, so a draw from it is reproducible from its seed; in a
+        # transaction, the keys it sees.
         out = o.run_pg(
             self.pg.conn, f"SELECT {', '.join(t.pk)} FROM {t.name} ORDER BY {', '.join(t.pk)}"
         )
@@ -224,6 +248,34 @@ class SqlMachine(RuleBasedStateMachine):
         pg_where = " AND ".join(f"{c} = {typed(c, i + 1)}" for i, c in enumerate(t.pk))
         return self.both(f"{t.select_all} WHERE {where}", key, pg_sql=f"{t.select_all} WHERE {pg_where}")
 
+    def begin(self) -> None:
+        # PostgreSQL's REPEATABLE READ, like the layer's, takes its snapshot
+        # at the first statement, not at BEGIN.
+        self.txn = self.db.begin()
+        assert o.run_pg(self.pg.conn, "BEGIN ISOLATION LEVEL REPEATABLE READ").error is None
+
+    def commit(self) -> None:
+        # One connection: nothing commits in between, so nothing conflicts.
+        self.txn.commit()
+        self.txn = None
+        out = o.run_pg(self.pg.conn, "COMMIT")
+        assert out.error is None, out.detail
+
+    def rollback(self) -> None:
+        if self.txn.is_aborted:
+            # Known difference: PostgreSQL takes COMMIT in an aborted
+            # transaction as ROLLBACK; the layer refuses it with 25P02 and
+            # leaves the transaction to its rollback().
+            try:
+                self.txn.commit()
+                raise AssertionError("commit() of an aborted transaction did not raise")
+            except bytecask_sql.TransactionAborted:
+                pass
+            assert self.txn.is_open
+        self.txn.rollback()
+        self.txn = None
+        assert o.run_pg(self.pg.conn, "ROLLBACK").error is None
+
     def reopen(self) -> None:
         self.db.close()
         self.db = bytecask_sql.open(self.dir)
@@ -241,6 +293,7 @@ class SqlMachine(RuleBasedStateMachine):
 
     # Rules ----------------------------------------------------------------
 
+    @precondition(lambda self: self.txn is None)
     @rule(data=st.data())
     def create_table(self, data):
         free = [n for n in TABLE_NAMES if n not in self.tables]
@@ -277,6 +330,7 @@ class SqlMachine(RuleBasedStateMachine):
             return
         self.create(t)
 
+    @precondition(lambda self: self.txn is None)
     @rule(data=st.data())
     def drop_table(self, data):
         self.drop(data.draw(st.sampled_from(TABLE_NAMES), label="name"), data.draw(st.booleans(), label="if exists"))
@@ -323,13 +377,30 @@ class SqlMachine(RuleBasedStateMachine):
             key = tuple(data.draw(st.none() | values(t.column(c).type), label=c) for c in t.pk)
         self.lookup(t.name, key)
 
+    @precondition(lambda self: self.txn is None)
     @rule()
     def reopen_layer(self):
         self.reopen()
 
+    @precondition(lambda self: self.tables and self.txn is None)
+    @rule()
+    def begin_transaction(self):
+        self.begin()
+
+    @precondition(lambda self: self.txn is not None and not self.txn.is_aborted)
+    @rule()
+    def commit_transaction(self):
+        self.commit()
+
+    @precondition(lambda self: self.txn is not None)
+    @rule()
+    def rollback_transaction(self):
+        self.rollback()
+
     @invariant()
     def tables_agree(self):
-        self.check()
+        if self.txn is None:  # a transaction's writes are its own until it commits
+            self.check()
 
 
 def machine(dsn: str) -> type[SqlMachine]:
@@ -384,6 +455,48 @@ def test_composite_key_lookup_and_reopen(dsn):
         assert m.lookup("t1", (None, "é")).rows == ()
         m.reopen()
         m.check()
+    finally:
+        m.teardown()
+
+
+def test_a_transaction_reads_its_writes_and_commits_them(dsn):
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT), Column("c1", o.TEXT)], ["c0"]))
+        m.insert("t0", {"c0": 1, "c1": "a"}, all_columns=False)
+        m.begin()
+        assert m.insert("t0", {"c0": 2, "c1": "b"}, all_columns=False).error is None
+        assert m.lookup("t0", (2,)).rows == ((2, "b"),)
+        assert m.insert("t0", {"c0": 2, "c1": "c"}, all_columns=False).error == "23505"
+        m.rollback()
+        m.check()
+        assert m.lookup("t0", (2,)).rows == ()
+        m.begin()
+        m.insert("t0", {"c0": 3, "c1": "c"}, all_columns=False)
+        m.insert("t0", {"c0": 4, "c1": None}, all_columns=False)
+        m.commit()
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_every_statement_after_a_failed_one_is_25P02(dsn):
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT), Column("c1", o.BIGINT, nullable=False)], ["c0"]))
+        m.begin()
+        m.insert("t0", {"c0": 1, "c1": 1}, all_columns=False)
+        assert m.insert("t0", {"c0": 2}, all_columns=False).error == "23502"
+        assert m.lookup("t0", (1,)).error == "25P02"
+        assert m.insert("t0", {"c0": 3, "c1": 3}, all_columns=False).error == "25P02"
+        assert m.insert("t9", {"c0": 3}, all_columns=False).error == "25P02"  # refused or not, it is not run
+        m.rollback()
+        m.check()
+        # A statement refused before it runs aborts a transaction too.
+        m.begin()
+        assert m.insert("t9", {"c0": 3}, all_columns=False).error == "refused"
+        assert m.lookup("t0", (1,)).error == "25P02"
+        m.rollback()
     finally:
         m.teardown()
 

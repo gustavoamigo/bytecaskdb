@@ -33,7 +33,11 @@ runs one execution, and repeats it after a conflict.
 execution of a statement is one run; a statement retried after a conflict or
 recompiled is several executions.
 
-**Statement**: one SQL statement given to `Database::execute`.
+**Statement**: one SQL statement given to `Database::execute`, or to a
+`Transaction`'s `execute`.
+
+**Transaction**: the statements run through one `Transaction` from
+`Database::begin()`, from the first to `commit()` or `rollback()`.
 
 **Wrong plan**: a plan that calls the API in a way its contract does not
 allow: a stale handle, an undeclared object, a type that is not the
@@ -82,9 +86,9 @@ column's, a second write of one row.
 
 | Guarantee | Proved by |
 |---|---|
-| One statement is one atomic batch: all its writes commit, or none do. | "plan API: an error is sticky and nothing is committed", "plan API: a raised constraint error is final: no retry, nothing committed" |
-| A row a statement reads and then writes needs no guard: a concurrent write of that row makes the commit a conflict, retried on a fresh snapshot. No update is lost, and none is applied to a row deleted concurrently. | "plan writes: concurrent read-then-write of one row loses no update", "plan writes: a delete racing updates of one row has one outcome" |
-| A second write of one row within an execution is refused with `BC_E_HANDLE`, except an insert of a key the execution already inserted, which is `BC_C_UNIQUE`. A range deleted by `bc_del_range` counts as written. | "plan writes: a second write of one row in one plan is refused", "plan writes: a row written by one run is refused to a later run of the same execution" |
+| One autocommit statement is one atomic batch: all its writes commit, or none do. A statement in a transaction commits with its transaction (*Transactions*). | "plan API: an error is sticky and nothing is committed", "plan API: a raised constraint error is final: no retry, nothing committed" |
+| A row a statement reads and then writes needs no guard: a concurrent write of that row makes the commit a conflict, retried on a fresh snapshot, or in a transaction a serialization failure. No update is lost, and none is applied to a row deleted concurrently. | "plan writes: concurrent read-then-write of one row loses no update", "plan writes: a delete racing updates of one row has one outcome", "embedded API: transactions on different threads run concurrently and lose no update" |
+| A second write of one row within an execution, or within one statement of a transaction, is refused with `BC_E_HANDLE`, except an insert of a key the execution already inserted, which is `BC_C_UNIQUE`. A range deleted by `bc_del_range` counts as written. | "plan writes: a second write of one row in one plan is refused", "plan writes: a row written by one run is refused to a later run of the same execution", "transactions: the second-write rule is per statement" |
 | `bc_insert`, `bc_update`, `bc_delete` and `bc_del_range` keep every index of the table exact: one entry per row and index, unique, `DESC` and nullable parts included, for every index the table has when the statement runs. | "plan writes: insert, update and delete keep every index exact, unique, DESC and nullable included", "plan writes: an index created after the plan was compiled is maintained by it", "embedded API: a cached write plan maintains an index created after it" |
 | A row an index entry points to is never silently missing: `bc_scan_row` reports it as `BC_E_CORRUPT`. | "plan writes: a missing row and a wrong row are errors, never skipped" |
 
@@ -96,7 +100,21 @@ column's, a second write of one row.
 |---|---|
 | Errors before a plan runs have their own types: parameters of the wrong number or type are `ParamError`, and a DDL statement the catalog refuses (a name taken or missing, a column or key part that does not exist or repeats) is `DdlRefused`. Neither writes anything. Both are `std::invalid_argument`. | "embedded API: the seven statements, then a fresh open", "embedded API: a plan the catalog refuses is recompiled and run again", "embedded API: compatibility decides which cached plans recompile" |
 | `CREATE UNIQUE INDEX` over rows that hold a duplicate is an `ExecError` with `BC_E_CONSTRAINT`, `BC_C_UNIQUE` and the table's id, as a duplicate written later is; SQL reports it as SQLSTATE 23505. Nothing is written. | "embedded API: a unique index refuses duplicates, treats nulls as distinct, and moves with UPDATE", "catalog: refused DDL writes nothing" |
-| After `close()`, `prepare`, `execute`, `catalog` and `table_rows` throw `DbClosed`; a second `close()` returns at once. | "embedded API: table_rows reads a table in key order; errors carry their detail; calls after close() throw" |
+| After `close()`, `prepare`, `execute`, `begin`, `catalog` and `table_rows` throw `DbClosed`; a second `close()` returns at once. `close()` rolls back every open transaction: its `execute` and `commit` throw `DbClosed`. | "embedded API: table_rows reads a table in key order; errors carry their detail; calls after close() throw", "embedded API: destroying an open transaction rolls it back; close() ends the open ones" |
+
+---
+
+## Transactions
+
+| Guarantee | Proved by |
+|---|---|
+| A transaction from `Database::begin()` commits all its statements' writes atomically, or none: `commit()` returns, or throws having written nothing. `rollback()`, and destroying an open `Transaction`, write nothing. | "embedded API: a transaction reads its own writes and commits them as one batch", "embedded API: destroying an open transaction rolls it back; close() ends the open ones", "transactions: a conflict at commit writes nothing", "transactions: an allocation failure in a statement or the commit is BC_E_MEMORY, and nothing half-done commits", "proof: test_a_transaction_reads_its_writes_and_commits_them", "proof: test_sql_machine" |
+| A statement in a transaction reads the snapshot taken at the start of the transaction's first statement, not at `begin()`, plus the writes of its earlier statements, never its own: point reads, existence, counts, scans in both directions over tables and indexes, and the unique checks. | "transactions: statements read their transaction's earlier writes through every read path, and every index stays exact", "transactions: a statement does not see its own writes; the next one does", "transactions: the snapshot is taken at the first statement, not when the transaction is made", "proof: test_sql_machine" |
+| A later statement may update or delete a row an earlier statement of its transaction wrote; every index stays exact. | "transactions: statements read their transaction's earlier writes through every read path, and every index stays exact", "transactions: the second-write rule is per statement" |
+| A statement that fails inside a transaction writes nothing, and aborts the transaction: every later `execute()` and `commit()` throws `TransactionAborted`, SQLSTATE 25P02, until `rollback()`. A statement that does not parse is still reported as the syntax error it is. | "transactions: a failed statement writes nothing and aborts the transaction", "embedded API: a failed statement aborts the transaction: 25P02 until rollback, nothing written", "embedded API: in an aborted transaction a statement that does not parse is a syntax error, not 25P02", "proof: test_every_statement_after_a_failed_one_is_25P02", "proof: test_sql_machine" |
+| A transaction whose commit finds a key it updated or deleted changed by a concurrent commit since its snapshot throws `SerializationFailure`, SQLSTATE 40001, with nothing written. The layer does not retry it. | "embedded API: a conflict at commit is a serialization failure, and nothing is written", "transactions: a conflict at commit writes nothing" |
+| A read that fails with an I/O, CRC or memory error fails the statement, and so aborts the transaction; it is never taken as absent. | "transactions: a read that fails is the statement's error, never absent", "transactions: an allocation failure in a statement or the commit is BC_E_MEMORY, and nothing half-done commits" |
+| A statement that takes the transaction past its buffer bound (`TransactionOptions::max_bytes`, 64 MiB by default) is `BC_E_LIMIT`, SQLSTATE 54000, and aborts the transaction. | "transactions: a statement past the buffer bound is BC_E_LIMIT and aborts the transaction", "embedded API: a transaction past its buffer bound is BC_E_LIMIT and aborted" |
 
 ---
 
@@ -128,8 +146,8 @@ column's, a second write of one row.
 
 | Guarantee | Proved by |
 |---|---|
-| Autocommit only: `Database::execute` runs each statement as its own transaction. | none |
-| Statements the compiler generates run under snapshot isolation: each reads one snapshot, and a write-write conflict with a concurrent commit is caught and retried. | "plan writes: concurrent read-then-write of one row loses no update", "plan writes: a concurrent insert of the same key conflicts with no absent guard" |
+| `Database::execute` runs each statement as its own transaction; `Database::begin()` runs several as one. | "embedded API: a transaction reads its own writes and commits them as one batch" |
+| Statements the compiler generates run under snapshot isolation: each autocommit statement, and each transaction, reads one snapshot, and a write-write conflict with a concurrent commit is caught: retried for an autocommit statement, a serialization failure for a transaction. | "plan writes: concurrent read-then-write of one row loses no update", "plan writes: a concurrent insert of the same key conflicts with no absent guard" |
 | Serializable conflict detection only with hand-written guards (`bc_guard_unchanged`, `bc_guard_range`) over what a plan reads and does not write; generated statements emit none beyond the unique checks'. | none |
 | A unique index is enforced by a check of its prefix on the snapshot and a range guard over it, so a concurrent insert of the same key is a conflict, and its retry reports the duplicate. | "tcc: a unique insert raced by another commit conflicts, and its retry reports the duplicate" |
 | `BC_CONFLICT` is retried automatically, for autocommit statements only, a bounded number of times. | "tcc: a unique insert raced by another commit conflicts, and its retry reports the duplicate" |
@@ -152,5 +170,5 @@ What the layer does not guarantee yet.
 | Not guaranteed | Tracked in |
 |---|---|
 | A unique secondary key shared by two inserts of one statement is not caught. The compiler emits one write per plan, so no generated statement reaches it. | #507 |
-| Multi-statement transactions, and a statement reading what an earlier statement of its transaction wrote. | #491 |
+| In a transaction: a commit that conflicts on a key the transaction inserted is reported as a serialization failure, not yet as the duplicate (23505); DDL inside a transaction is refused, and DDL by another session during an open transaction is not yet defined; locking reads (SELECT … FOR UPDATE) are not supported. | #491 |
 | Plans not produced by the layer's compiler are not supported. | none |

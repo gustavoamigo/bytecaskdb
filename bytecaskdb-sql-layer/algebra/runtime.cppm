@@ -94,7 +94,7 @@ export struct ApiSymbol {
 
 // Every plan-callable function of bc_plan.h, by name, for loaders that link a
 // plan at run time (TinyCC's tcc_add_symbol). Runtime calls (bc_ctx_*,
-// bc_execute, bc_error*) are left out: a plan never calls them.
+// bc_txn_*, bc_execute, bc_error*) are left out: a plan never calls them.
 // tests/plan_api_test.cpp checks the table against the header.
 export [[nodiscard]] auto plan_api_symbols() -> std::span<const ApiSymbol>;
 

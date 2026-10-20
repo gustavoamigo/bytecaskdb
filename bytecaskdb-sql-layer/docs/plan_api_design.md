@@ -195,7 +195,9 @@ Contexts run concurrently on different threads; reads scale as the engine's
 reads scale, and commits go through the engine's group commit. A plan never
 blocks: reads are lock-free and the commit happens after it returns.
 
-**Within a plan, reads see the snapshot, not the plan's own writes.** This
+**Within a plan, reads see the snapshot, not the plan's own writes.** In a
+transaction, "the snapshot" is the transaction's view: its snapshot plus
+the writes of its earlier statements (`docs/transaction_design.md`). This
 is SQL statement semantics: a statement sees the state before it began. The
 runtime's unique checks read the snapshot too. A second write of a row the
 plan already wrote is refused (`BC_E_HANDLE`): `bc_update` and `bc_delete`
@@ -210,15 +212,15 @@ retried. The tracking spans the execution, every run between
 `bc_ctx_begin` and the commit: those runs share the snapshot and the write
 plan, and each derives the entries it removes from the snapshot's row, so
 a row written by one run and again by a later one would keep both runs'
-entries. Writing a row in several statements of one transaction needs
-#491's own-writes overlay; until then the second write is refused within
-a context. The affected-row count is each run's own. A unique
+entries. In a transaction the tracking spans one statement: a later
+statement reads the earlier one's row through the transaction's view and
+derives its entries from that. The affected-row count is each run's own. A unique
 secondary key two of one statement's inserts share is not caught yet: a
 stage-2 limit, unreachable from the stage-1 compiler, which emits one write
 per plan (#507).
 Read-your-own-writes across statements in an interactive transaction is an
-overlay the cursors read through and belongs to the session layer. See
-*Deferred*.
+overlay the reads and cursors read through: `docs/transaction_design.md`,
+*The transaction's view*.
 
 **A row a plan reads and then writes needs no guard.** The row's key is in
 the write set, and the engine refuses a write plan with a snapshot when
@@ -994,12 +996,6 @@ record read.
   layout generation; the catalog records which versions are still served so
   an old one can be retired. Nothing is migrated for a client to keep
   working.
-- **Read-your-own-writes across statements.** An interactive transaction is
-  a snapshot and an accumulating write plan; later statements' cursors read
-  through an overlay of the earlier writes. The overlay is the session
-  layer's and sits under `bc_get`, `bc_scan_row` and the cursors without
-  changing their signatures.
-  Designed in `docs/transaction_design.md` (#491).
 - **Sequence allocation.** Auto-increment is a runtime service invoked at
   commit, outside the plan, so the plan stays pure. Until then ids come from
   rows the plan reads and guards.

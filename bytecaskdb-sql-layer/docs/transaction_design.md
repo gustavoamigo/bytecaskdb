@@ -1,7 +1,10 @@
 # Transactions in the SQL layer
 
-Status: **design, approved by the owner (2026-10-20, #491).** Nothing
-here is built yet. It decides how the layer runs several statements as one
+Status: **design, approved by the owner (2026-10-20, #491).** Built: the
+transaction's view, statements inside a transaction, and commit with
+40001 on any conflict (slice A). Not yet built: insert claims (23505 at
+commit), DDL during an open transaction, and `FOR UPDATE` (slice B). It
+decides how the layer runs several statements as one
 transaction, which the MVP needs: TPROC-C's New-Order is about thirty
 statements that read their own writes (#487, *MVP*). Each decision is
 marked **MVP** or **later**.

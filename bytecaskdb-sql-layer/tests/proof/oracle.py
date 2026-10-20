@@ -42,6 +42,9 @@ RANGE_SQLSTATE = {
 }
 RANGE_STATES = frozenset(RANGE_SQLSTATE.values())
 
+# A statement in a transaction an earlier statement failed in.
+ABORTED = "25P02"
+
 
 def layer_sqlstate(e: bytecask_sql.ExecError) -> str:
     """The SQLSTATE PostgreSQL gives the layer's refusal, or "refused"."""
@@ -167,8 +170,11 @@ def from_pg(v, type_oid: int = 0):
 
 
 def run_layer(db, sql: str, params=()) -> Outcome:
+    """Runs a statement on a Database, or on a Transaction in its place."""
     try:
         r = db.execute(sql, tuple(params))
+    except bytecask_sql.TransactionAborted as e:
+        return Outcome(error=ABORTED, detail=str(e))
     except bytecask_sql.ExecError as e:
         # A constraint violation is an outcome to compare. Any other failure
         # of a plan that ran (corrupt, I/O, a handle, a layout, a limit,
@@ -197,6 +203,6 @@ def run_pg(conn, sql: str, params=()) -> Outcome:
         if not e.sqlstate:
             raise  # no SQLSTATE: not PostgreSQL refusing the statement
         state = e.sqlstate
-        known = state in SQLSTATE.values() or state in RANGE_STATES
+        known = state in SQLSTATE.values() or state in RANGE_STATES or state == ABORTED
         return Outcome(error=state if known else "refused", detail=f"{state} {e}")
     return Outcome(rows=tuple(tuple(from_pg(v, oid) for v, oid in zip(row, oids)) for row in rows), affected=affected)
