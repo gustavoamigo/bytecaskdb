@@ -486,6 +486,50 @@ TEST_CASE("transactions: a read stays in its bounds and passes a deleted range i
         BC_E_BUDGET);
 }
 
+TEST_CASE("transactions: a reverse scan charges the record at its bound it steps past", "[sql][txn]") {
+  Fixture f;
+  create_w(f);
+  for (std::int64_t id = 0; id <= 10; ++id) {
+    REQUIRE(autocommit(f, insert_w, {id, bc_value{}, bc_value{}, id}) == BC_COMMITTED);
+  }
+  // The least budget a reverse scan of id < 10 succeeds with.
+  auto cost = [&] {
+    for (std::uint64_t budget = 1;; ++budget) {
+      REQUIRE(budget < 1000);
+      TxnPtr txn{f};
+      auto r = stmt(f, txn.p, scan_w_range, {std::int64_t{0}, std::int64_t{10}, std::int64_t{1}}, id_c(), {budget, 0});
+      if (r.error == BC_OK) {
+        CHECK(r.rows.size() == 10);
+        return budget;
+      }
+      REQUIRE(r.error == BC_E_BUDGET);
+    }
+  };
+  auto with_row_10 = cost();
+  REQUIRE(autocommit(f, delete_w, {std::int64_t{10}}) == BC_COMMITTED);
+  // The seek lands on row 10, the scan's bound, reads it and steps past:
+  // one read more than when it is absent.
+  CHECK(with_row_10 == cost() + 1);
+}
+
+TEST_CASE("transactions: a transaction no statement was added to can be pinned again", "[sql][txn]") {
+  Fixture f;
+  create_w(f);
+  TxnPtr txn{f};
+  auto none = params({});
+  bc_ctx_begin_txn(f.cx, txn.p, &none, {});
+  auto v = bc_txn_catalog_version(txn.p);
+  CHECK(v == f.cat().version());
+  bc_ctx_reset(f.cx);  // the statement did not run: nothing was added
+  f.ddl(bytecask::sql::CreateIndexDdl{"w_c", "w", {{"c"}}});
+  CHECK(bc_txn_repin(txn.p));
+  REQUIRE(stmt(f, txn.p, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("a"), std::int64_t{1}}).error == BC_OK);
+  CHECK(bc_txn_catalog_version(txn.p) == v + 1);  // the live catalog, with w_c
+  CHECK_FALSE(bc_txn_repin(txn.p));                // a statement is in
+  CHECK(commit(f, txn.p) == BC_COMMITTED);
+  check_indexes_exact(f);
+}
+
 TEST_CASE("transactions: a statement does not see its own writes; the next one does", "[sql][txn]") {
   Fixture f;
   create_w(f);
@@ -567,7 +611,7 @@ TEST_CASE("transactions: a statement past the buffer bound is BC_E_LIMIT and abo
           "[sql][txn]") {
   Fixture f;
   create_w(f);
-  TxnPtr txn{f, 1024};
+  TxnPtr txn{f, 8192};
   auto n = 0;
   Ran r{};
   do {
@@ -709,18 +753,23 @@ TEST_CASE("transactions: an allocation failure in a statement or the commit is B
       break;
     }
     ++failed;
-    CHECK((error == BC_E_MEMORY || error == BC_OK));
-    // Success is BC_COMMITTED and no error together; anything else wrote
-    // nothing.
+    CHECK((error == BC_E_MEMORY || error == BC_E_UNKNOWN || error == BC_OK));
     CHECK((r == BC_COMMITTED) == (error == BC_OK));
     // A batch that reached the data file before an allocation failed leaves
-    // the engine refusing writes until resume(); otherwise a failed attempt
-    // wrote nothing.
+    // the engine refusing writes until resume(): exactly then the commit's
+    // outcome is unknown, never "nothing written". Any other failure wrote
+    // nothing. A commit can also survive a failure the engine absorbed; each
+    // attempt's row is its own, so the sweep goes on either way.
     auto degraded = f.db->is_degraded();
+    CHECK(degraded == (error == BC_E_UNKNOWN));
     if (degraded) f.db->resume();
-    // A commit can survive a failure the engine absorbed; each attempt's row
-    // is its own, so the sweep goes on either way.
-    if (r != BC_COMMITTED && !degraded) CHECK(stored(f).size() == before.size());
+    if (error == BC_E_MEMORY) CHECK(stored(f).size() == before.size());
+    if (error == BC_E_UNKNOWN) {
+      // Whichever way it went, it went whole: the row and the update together.
+      auto after = stored(f);
+      if (after.contains(100 + nth)) CHECK(after.at(1).c == 10);
+      check_indexes_exact(f);
+    }
   }
   CHECK(failed > 0);
   auto got = stored(f);

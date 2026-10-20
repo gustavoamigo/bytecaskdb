@@ -52,6 +52,8 @@ enum bc_error_code {
   BC_E_LAYOUT,      /* plan incompatible with the live catalog, or a row violates its layout */
   BC_E_DEGRADED,    /* engine degraded; writes refused */
   BC_E_CLOSED,
+  BC_E_UNKNOWN,     /* a commit failed and degraded the engine: its batch may have reached the data
+                       file, so its outcome is unknown, never "nothing written" (SQLSTATE 08007) */
 };
 
 enum bc_scan_flags {
@@ -146,6 +148,8 @@ void    bc_txn_free(bc_txn *);                                                /*
 void    bc_ctx_begin_txn(bc_ctx *, bc_txn *, const bc_params *params, bc_budget budget);
 bool    bc_txn_add(bc_ctx *);                     /* ends the statement: its writes join, or the transaction aborts */
 uint64_t bc_txn_catalog_version(const bc_txn *);  /* the catalog version pinned at the first statement; 0 before it */
+bool    bc_txn_repin(bc_txn *);                   /* before any statement was added: drops the pin, so the next
+                                                     statement pins the live catalog and a new snapshot */
 enum bc_commit_result bc_txn_commit(bc_ctx *, bc_txn *, bool sync);
 
 /* Parameters and results */

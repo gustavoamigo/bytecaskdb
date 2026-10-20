@@ -75,10 +75,17 @@ static_assert(static_cast<int>(PhysType::Bytes) == BC_T_BYTES);
 namespace {
 
 constexpr std::uint32_t kNoCursor = UINT32_MAX;
-// What a node of a transaction's overlay, or a guard it keeps, costs beyond
-// the bytes it holds: the allocation's own bookkeeping and the node's links.
-// Counted so a transaction of many small writes reaches its bound too.
-constexpr std::uint64_t kNodeBytes = 64;
+// What a transaction's bound counts for what it holds: a conservative bound,
+// never less than the memory used. Each heap block costs its capacity plus
+// the allocator's header and rounding (kAllocBytes, an over-estimate); a map
+// node its links and colour, its key and value objects, and its own block.
+// So a transaction of many small writes reaches its bound too.
+constexpr std::uint64_t kAllocBytes = 4 * sizeof(void*);
+constexpr std::uint64_t kNodeBytes =
+    4 * sizeof(void*) + sizeof(std::pair<const Bytes, std::optional<Bytes>>) + kAllocBytes;
+[[nodiscard]] constexpr auto held(std::size_t capacity) -> std::uint64_t {
+  return capacity == 0 ? 0 : capacity + kAllocBytes;
+}
 constexpr std::uint32_t kScanFlagMask = BC_SCAN_REVERSE | BC_SCAN_PREFIX;
 
 // What a view is, beyond its bytes: a row read from the engine (a stored
@@ -174,7 +181,7 @@ auto as_u8(const std::byte* p) -> const std::uint8_t* {
 struct Overlay {
   std::map<Bytes, std::optional<Bytes>, BytesLess> points;
   std::map<Bytes, Bytes, BytesLess> ranges;  // lo -> hi: disjoint, none empty
-  std::uint64_t bytes{0};                    // all it holds: keys, values and nodes
+  std::uint64_t bytes{0};                    // a conservative bound on all it holds: keys, values and nodes
 
   [[nodiscard]] auto empty() const -> bool { return points.empty() && ranges.empty(); }
 
@@ -213,7 +220,7 @@ struct Overlay {
   // the points inside it.
   void del_range(Bytes lo, Bytes hi) {
     for (auto it = points.lower_bound(BytesView{lo}); it != points.end() && std::ranges::lexicographical_compare(it->first, hi);) {
-      bytes -= cost(it->first, it->second ? it->second->capacity() : 0);
+      bytes -= cost(it->first, it->second ? held(it->second->capacity()) : 0);
       it = points.erase(it);
     }
     auto it = ranges.upper_bound(BytesView{lo});
@@ -221,23 +228,23 @@ struct Overlay {
     while (it != ranges.end() && !std::ranges::lexicographical_compare(hi, it->first)) {
       if (std::ranges::lexicographical_compare(it->first, lo)) lo = it->first;
       if (std::ranges::lexicographical_compare(hi, it->second)) hi = it->second;
-      bytes -= cost(it->first, it->second.capacity());
+      bytes -= cost(it->first, held(it->second.capacity()));
       it = ranges.erase(it);
     }
-    auto add = cost(lo, hi.capacity());
+    auto add = cost(lo, held(hi.capacity()));
     ranges.emplace(std::move(lo), std::move(hi));
     bytes += add;
   }
 
 private:
-  static auto cost(const Bytes& key, std::size_t value_capacity) -> std::uint64_t {
-    return key.capacity() + value_capacity + kNodeBytes;
+  static auto cost(const Bytes& key, std::uint64_t value_bytes) -> std::uint64_t {
+    return held(key.capacity()) + value_bytes + kNodeBytes;
   }
 
   void set(Bytes key, std::optional<Bytes> value) {
-    auto value_bytes = value ? value->capacity() : 0;
+    auto value_bytes = value ? held(value->capacity()) : 0;
     if (auto it = points.find(BytesView{key}); it != points.end()) {
-      bytes -= it->second ? it->second->capacity() : 0;
+      bytes -= it->second ? held(it->second->capacity()) : 0;
       it->second = std::move(value);
       bytes += value_bytes;
       return;
@@ -274,7 +281,7 @@ private:
   using Point = std::map<Bytes, std::optional<Bytes>, BytesLess>::const_iterator;
 
   [[nodiscard]] auto snap_step(bc_ctx* cx) -> bool;
-  void snap_seek(BytesView at);
+  [[nodiscard]] auto snap_seek(bc_ctx* cx, BytesView at) -> bool;
   [[nodiscard]] auto point_step(bc_ctx* cx) -> bool;
   [[nodiscard]] auto snap_key() const -> BytesView { return reverse_ ? (**rev_).key : (**fwd_).key; }
   [[nodiscard]] auto snap_value() const -> BytesView { return reverse_ ? (**rev_).value : (**fwd_).value; }
@@ -701,8 +708,9 @@ struct bc_txn {
   // since every point in it is newer than any range over it.
   Overlay overlay;
   std::vector<Effect> guards;          // the statements' guards, in their order
-  std::uint64_t guard_bytes{0};        // what `guards` holds
+  std::uint64_t guard_bytes{0};        // what the guards' keys hold
   std::vector<std::uint32_t> written;  // the tables the writes are in
+  std::uint64_t statements{0};         // statements wholly added
   // A statement failed: nothing but bc_txn_free is left. Set before any
   // part of a failing statement could reach the overlay or the guards, so
   // an aborted transaction is never committed half-applied.
@@ -733,19 +741,24 @@ auto bytes_cmp(BytesView a, BytesView b) -> std::strong_ordering {
 }
 
 // Positions the snapshot's iterator on the first key >= at (forward) or the
-// last key < at (reverse).
-void ViewEntries::snap_seek(BytesView at) {
+// last key < at (reverse). A reverse seek lands on the last key <= at: a
+// record at `at` itself is read, charged, and stepped past.
+auto ViewEntries::snap_seek(bc_ctx* cx, BytesView at) -> bool {
   if (!reverse_) {
     fwd_.emplace(snap_->iter_from({}, at).begin());
-    return;
+    return true;
   }
   rev_.emplace(snap_->riter_from({}, at).begin());
-  if (*rev_ != std::default_sentinel && std::is_eq(bytes_cmp((**rev_).key, at))) ++*rev_;
+  if (*rev_ != std::default_sentinel && std::is_eq(bytes_cmp((**rev_).key, at))) {
+    if (!cx->charge()) return false;
+    ++*rev_;
+  }
+  return true;
 }
 
 auto ViewEntries::snap_step(bc_ctx* cx) -> bool {
   if (!reverse_ ? !fwd_ : !rev_) {
-    snap_seek(!reverse_ ? BytesView{lo_} : BytesView{hi_});
+    if (!snap_seek(cx, !reverse_ ? BytesView{lo_} : BytesView{hi_})) return false;
   } else if (!reverse_) {
     ++*fwd_;
   } else {
@@ -762,7 +775,7 @@ auto ViewEntries::snap_step(bc_ctx* cx) -> bool {
     }
     const auto* range = overlay_ != nullptr ? overlay_->range_at(k) : nullptr;
     if (range == nullptr) return true;
-    snap_seek(!reverse_ ? BytesView{range->second} : BytesView{range->first});
+    if (!snap_seek(cx, !reverse_ ? BytesView{range->second} : BytesView{range->first})) return false;
   }
 }
 
@@ -1080,6 +1093,21 @@ auto written_tables(const Catalog& cat, const std::vector<Effect>& effects) -> s
     }
   }
   return out;
+}
+
+// Submits a commit's batch. A failure that leaves the engine degraded, when
+// it was not before, may have come after the batch reached the data file:
+// its outcome is unknown (BC_E_UNKNOWN), never "nothing written". Any other
+// failure wrote nothing.
+auto submit(bc_ctx* cx, bytecask::DB& db, bytecask::WritePlan plan, bool sync) -> bc_commit_result {
+  auto was_degraded = db.is_degraded();
+  try {
+    return db.apply_batch({.sync = sync}, std::move(plan)) ? BC_COMMITTED : BC_CONFLICT;
+  } catch (...) {
+    cx->fail_current_exception();
+    if (!was_degraded && db.is_degraded()) cx->error = BC_E_UNKNOWN;
+    return BC_FAILED;
+  }
 }
 
 // A reference's arrays, empty where a pointer is null.
@@ -1622,8 +1650,7 @@ enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
 #ifdef BYTECASK_SQL_TESTING
   if (cx->before_commit) cx->before_commit();
 #endif
-  auto r = cx->db->apply_batch({.sync = sync}, std::move(plan));
-  return r ? BC_COMMITTED : BC_CONFLICT;
+  return submit(cx, *cx->db, std::move(plan), sync);
   BC_GUARD_END(cx)
   return BC_FAILED;  // the guard caught a throw: never BC_COMMITTED
 }
@@ -1673,6 +1700,29 @@ void bc_txn_free(bc_txn* txn) { delete txn; }
 
 uint64_t bc_txn_catalog_version(const bc_txn* txn) { return txn->pinned ? txn->pinned->version() : 0; }
 
+bool bc_txn_repin(bc_txn* txn) {
+  if (txn->statements != 0 || txn->aborted || txn->done) return false;
+  txn->snap.reset();
+  txn->pinned.reset();
+  return true;
+}
+
+namespace {
+
+// A conservative bound on what the transaction holds, and on what it would
+// hold with the statement's effects in it, without merging them: a vector
+// grows at most to twice what it holds, each effect adds at most one node,
+// and an effect that replaces or erases others only frees.
+auto txn_holds(const bc_txn& t, std::size_t more_guards, std::size_t more_written) -> std::uint64_t {
+  auto vec = [](std::size_t cap, std::size_t size, std::size_t more, std::size_t elem) -> std::uint64_t {
+    return held(std::max(cap, 2 * (size + more)) * elem);
+  };
+  return t.overlay.bytes + t.guard_bytes + vec(t.guards.capacity(), t.guards.size(), more_guards, sizeof(Effect)) +
+         vec(t.written.capacity(), t.written.size(), more_written, sizeof(std::uint32_t));
+}
+
+}  // namespace
+
 bool bc_txn_add(bc_ctx* cx) {
   bc_txn* txn = nullptr;
   BC_GUARD_BEGIN
@@ -1687,10 +1737,39 @@ bool bc_txn_add(bc_ctx* cx) {
     txn->aborted = true;
     return false;
   }
+  // The bound is checked before anything is merged, from the statement's
+  // own effects: a statement that would pass it is refused without the
+  // transaction allocating for it.
+  std::uint64_t pending = 0;
+  std::size_t guards = 0;
+  for (const auto& e : cx->effects) {
+    pending += held(e.a.capacity()) + held(e.b.capacity()) + kNodeBytes;
+    switch (e.kind) {
+      case EffectKind::Put:
+      case EffectKind::Del:
+      case EffectKind::DelRange: break;
+      case EffectKind::GuardUnchanged:
+      case EffectKind::GuardRange:
+      case EffectKind::GuardPresent:
+      case EffectKind::GuardAbsent: ++guards; break;
+    }
+  }
+  auto tables = written_tables(*txn->pinned, cx->effects);
+  if (txn_holds(*txn, guards, tables.size()) + pending > txn->max_bytes) {
+    // What it holds is freed now: an aborted transaction keeps nothing.
+    txn->aborted = true;
+    txn->overlay = {};
+    txn->guards = {};
+    txn->guard_bytes = 0;
+    txn->written = {};
+    cx->fail(BC_E_LIMIT, "the transaction's writes would pass its bound of " + std::to_string(txn->max_bytes) +
+                             " bytes");
+    return false;
+  }
   // Aborted until the statement is wholly in: a failure part-way through
   // leaves an overlay no commit may use.
   txn->aborted = true;
-  for (auto id : written_tables(*txn->pinned, cx->effects)) {
+  for (auto id : tables) {
     if (std::ranges::find(txn->written, id) == txn->written.end()) txn->written.push_back(id);
   }
   for (auto& e : cx->effects) {
@@ -1702,21 +1781,13 @@ bool bc_txn_add(bc_ctx* cx) {
       case EffectKind::GuardRange:
       case EffectKind::GuardPresent:
       case EffectKind::GuardAbsent:
-        txn->guard_bytes += e.a.capacity() + e.b.capacity() + kNodeBytes;
+        txn->guard_bytes += held(e.a.capacity()) + held(e.b.capacity());
         txn->guards.push_back(std::move(e));
         break;
     }
   }
   cx->effects.clear();
-  if (txn->overlay.bytes + txn->guard_bytes > txn->max_bytes) {
-    // What it holds is freed now: an aborted transaction keeps nothing.
-    txn->overlay = {};
-    txn->guards = {};
-    txn->guard_bytes = 0;
-    cx->fail(BC_E_LIMIT, "the transaction's writes would pass its bound of " + std::to_string(txn->max_bytes) +
-                             " bytes");
-    return false;
-  }
+  ++txn->statements;
   txn->aborted = false;
   return true;
   BC_GUARD_END(cx)
@@ -1769,8 +1840,7 @@ enum bc_commit_result bc_txn_commit(bc_ctx* cx, bc_txn* txn, bool sync) {
 #ifdef BYTECASK_SQL_TESTING
   if (cx->before_commit) cx->before_commit();
 #endif
-  auto r = txn->db->apply_batch({.sync = sync}, std::move(plan));
-  return r ? BC_COMMITTED : BC_CONFLICT;
+  return submit(cx, *txn->db, std::move(plan), sync);
   BC_GUARD_END(cx)
   return BC_FAILED;  // the guard caught a throw: never BC_COMMITTED
 }

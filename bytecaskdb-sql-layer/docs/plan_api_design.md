@@ -272,6 +272,8 @@ enum bc_error_code {
   BC_E_LAYOUT,      /* plan incompatible with the live catalog, or a row violates its layout */
   BC_E_DEGRADED,    /* engine degraded; writes refused */
   BC_E_CLOSED,
+  BC_E_UNKNOWN,     /* a commit failed and degraded the engine: its batch may have reached the data
+                       file, so its outcome is unknown, never "nothing written" (SQLSTATE 08007) */
 };
 
 enum bc_scan_flags {

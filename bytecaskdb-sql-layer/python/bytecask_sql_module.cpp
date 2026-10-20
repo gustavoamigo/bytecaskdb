@@ -26,8 +26,9 @@
 // wrong number or type, a params object that is not a list or tuple);
 // bytecask_sql.Closed, also a ValueError, for any call after close();
 // bytecask_sql.TransactionAborted (SQLSTATE 25P02) for a statement on a
-// transaction a statement failed in. A transaction
-// whose commit conflicts raises ExecError with conflict set (40001). All
+// transaction a statement failed in; bytecask_sql.TransactionResolutionUnknown
+// (08007) for a commit whose outcome is unknown. A transaction whose commit
+// conflicts raises ExecError with conflict set (40001). All
 // derive from bytecask_sql.Error. Anything else, an engine refusal at run
 // time included, is nanobind's translation of the C++ exception.
 
@@ -64,7 +65,7 @@ namespace {
 // The module's exception classes, created at import and owned by the module
 // object; plain handles, so nothing runs at process exit.
 struct Exceptions {
-  nb::handle error, sql_error, exec_error, closed, aborted;
+  nb::handle error, sql_error, exec_error, closed, aborted, unknown;
 };
 Exceptions exceptions;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables): set once at import
 // decimal.Decimal, looked up once at import, not per value; held for the
@@ -235,6 +236,9 @@ NB_MODULE(bytecask_sql, m) {
   m.attr("Closed") = exceptions.closed;
   exceptions.aborted = PyErr_NewException("bytecask_sql.TransactionAborted", exceptions.error.ptr(), nullptr);
   m.attr("TransactionAborted") = exceptions.aborted;
+  exceptions.unknown =
+      PyErr_NewException("bytecask_sql.TransactionResolutionUnknown", exceptions.error.ptr(), nullptr);
+  m.attr("TransactionResolutionUnknown") = exceptions.unknown;
   decimal_type = nb::object(nb::module_::import_("decimal").attr("Decimal")).release();
 
   nb::register_exception_translator([](const std::exception_ptr& p, void*) {
@@ -252,6 +256,8 @@ NB_MODULE(bytecask_sql, m) {
       PyErr_SetString(exceptions.closed.ptr(), e.what());
     } catch (const sql::TransactionAborted& e) {
       PyErr_SetString(exceptions.aborted.ptr(), e.what());
+    } catch (const sql::TransactionResolutionUnknown& e) {
+      PyErr_SetString(exceptions.unknown.ptr(), e.what());
     }
   });
 

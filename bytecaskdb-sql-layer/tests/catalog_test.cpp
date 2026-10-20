@@ -244,9 +244,17 @@ TEST_CASE("catalog: concurrent DDL each returns the version it published", "[sql
   auto db = DB::open(dir.path());
   LiveCatalog live{db};
   constexpr int kEach = 15;
+  // A DDL that finds the other in progress fails at once and is retried,
+  // as a client retries a 40001.
   auto run = [&](char prefix, std::vector<std::shared_ptr<const Catalog>>& seen) {
-    for (int i = 0; i < kEach; ++i) {
-      seen.push_back(live.apply(CreateTableDdl{std::string{prefix} + std::to_string(i), {col("k", SqlKind::BigInt)}, {"k"}}));
+    for (int i = 0; i < kEach;) {
+      try {
+        seen.push_back(
+            live.apply(CreateTableDdl{std::string{prefix} + std::to_string(i), {col("k", SqlKind::BigInt)}, {"k"}}));
+        ++i;
+      } catch (const DdlInProgress&) {
+        std::this_thread::yield();
+      }
     }
   };
   std::vector<std::shared_ptr<const Catalog>> a, b;
@@ -266,6 +274,39 @@ TEST_CASE("catalog: concurrent DDL each returns the version it published", "[sql
   check('a', a);
   check('b', b);
   CHECK(live.current()->version() == 2 * kEach);
+}
+
+TEST_CASE("catalog: a DDL that finds another in progress fails at once and writes nothing", "[sql][catalog]") {
+  sql_test::TempDir dir{"catalog_ddl_busy"};
+  auto db = DB::open(dir.path());
+  LiveCatalog live{db};
+  (void)live.apply(create_t());
+  std::promise<void> entered, release;
+  auto released = release.get_future().share();
+  live.set_commit_hook_for_testing([&, released] {
+    entered.set_value();
+    released.wait();
+  });
+  std::jthread first{[&] { (void)live.apply(CreateIndexDdl{"t_by_name", "t", {{"name"}}}); }};
+  entered.get_future().wait();
+  // Held mid-commit: the second DDL returns at once, whatever the first
+  // takes, and writes nothing.
+  auto second = std::async(std::launch::async, [&] {
+    try {
+      (void)live.apply(CreateTableDdl{"u", {col("k", SqlKind::BigInt)}, {"k"}});
+      return false;
+    } catch (const DdlInProgress&) {
+      return true;
+    }
+  });
+  REQUIRE(second.wait_for(std::chrono::seconds{10}) == std::future_status::ready);
+  CHECK(second.get());
+  release.set_value();
+  first.join();
+  live.set_commit_hook_for_testing({});
+  CHECK(live.current()->version() == 2);
+  CHECK(live.current()->table("u") == nullptr);
+  CHECK(live.current()->index("t_by_name").second != nullptr);
 }
 
 TEST_CASE("catalog: a reader pinned during a DDL's commit is not blocked and sees the old version", "[sql][catalog]") {

@@ -113,6 +113,16 @@ public:
   ~DdlRefused() override;  // out of line: anchors the vtable (-Wweak-vtables)
 };
 
+// A DDL that found another DDL of the same catalog in progress, and so did
+// nothing rather than wait for it: retryable, SQLSTATE 40001 at the API.
+class DdlInProgress : public std::runtime_error {
+public:
+  DdlInProgress() : std::runtime_error{"could not serialize access: another DDL is in progress"} {}
+  DdlInProgress(const DdlInProgress&) = default;
+  DdlInProgress& operator=(const DdlInProgress&) = default;
+  ~DdlInProgress() override;  // out of line: anchors the vtable (-Wweak-vtables)
+};
+
 // A value of one of the four physical types, or SQL NULL (monostate). The
 // runtime's bc_value is this type.
 using Datum = std::variant<std::monostate, std::int64_t, double, bool, Bytes>;
@@ -381,10 +391,12 @@ public:
   [[nodiscard]] auto prepare(const Ddl& ddl) -> Prepared;
   // Commits and publishes. False, with nothing written, on a conflict: a
   // DDL or a write to a backfilled table committed since the prepare.
+  // Throws DdlInProgress, having done nothing, if another DDL of this
+  // catalog is in progress: a DDL never waits for another.
   [[nodiscard]] auto commit(Prepared p) -> bool;
   // prepare and commit, retried on a conflict kDdlAttempts times in all.
-  // Returns the version it published; throws as prepare does, or
-  // std::runtime_error when every attempt conflicted.
+  // Returns the version it published; throws as prepare does, DdlInProgress
+  // as commit does, or std::runtime_error when every attempt conflicted.
   auto apply(const Ddl& ddl) -> std::shared_ptr<const Catalog>;
 
   static constexpr int kDdlAttempts = 3;
@@ -404,7 +416,9 @@ private:
   mutable std::atomic<std::shared_ptr<const Catalog>> current_;  // pin() may catch up with another catalog
   [[nodiscard]] auto commit_locked(Prepared p) -> bool;
 
-  std::mutex ddl_mu_;  // one DDL at a time: apply holds it from prepare to publication
+  // One DDL at a time: apply holds it from prepare to publication. Only
+  // ever try-locked: a DDL that finds it held throws DdlInProgress.
+  std::mutex ddl_mu_;
   std::function<void()> commit_hook_;
   std::size_t backfill_limit_{kMaxBackfillBytes};
   // Odd from just before a DDL's batch reaches the engine until current_
@@ -696,6 +710,7 @@ void check_column_spec(const ColumnSpec& c) {
 }  // namespace
 
 DdlRefused::~DdlRefused() = default;
+DdlInProgress::~DdlInProgress() = default;
 ConstraintViolation::~ConstraintViolation() = default;
 
 auto ConstraintDetail::name() const -> std::string_view {
@@ -1547,7 +1562,8 @@ auto LiveCatalog::prepare(const Ddl& ddl) -> Prepared {
 }
 
 auto LiveCatalog::commit(Prepared p) -> bool {
-  std::lock_guard<std::mutex> lock{ddl_mu_};
+  std::unique_lock<std::mutex> lock{ddl_mu_, std::try_to_lock};
+  if (!lock.owns_lock()) throw DdlInProgress();
   return commit_locked(std::move(p));
 }
 
@@ -1579,8 +1595,10 @@ auto LiveCatalog::commit_locked(Prepared p) -> bool {
 auto LiveCatalog::apply(const Ddl& ddl) -> std::shared_ptr<const Catalog> {
   // One DDL at a time from prepare to publication, so a retry is only ever
   // for a write that raced a backfill, never for another DDL of this
-  // catalog. Readers do not take this lock.
-  std::lock_guard<std::mutex> lock{ddl_mu_};
+  // catalog. A second DDL does not wait for the first: it fails at once.
+  // Readers do not take this lock.
+  std::unique_lock<std::mutex> lock{ddl_mu_, std::try_to_lock};
+  if (!lock.owns_lock()) throw DdlInProgress();
   for (int attempt = 0; attempt < kDdlAttempts; ++attempt) {
     auto p = prepare(ddl);
     if (!p.next) return p.base;

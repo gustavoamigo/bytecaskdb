@@ -13,7 +13,9 @@
 // Every call runs concurrently with every other but close(): no lock is
 // held across engine I/O but the shared one close() waits on (DatabaseLife),
 // and a compiled plan is never changed while a run uses it (a recompile
-// swaps in a new one).
+// swaps in a new one). A DDL that finds another in progress fails at once
+// with SerializationFailure; a statement's pin waits only for the instant
+// a DDL publishes its catalog.
 //
 // prototype: the shape of #494's embedded API, not its design.
 
@@ -114,9 +116,21 @@ public:
   ~SerializationFailure() override;  // out of line: anchors the vtable (-Wweak-vtables)
 };
 
-// A call on a transaction a statement failed in, other than rollback():
-// SQLSTATE 25P02, as PostgreSQL refuses every command until the
-// transaction block ends.
+// A commit whose outcome is unknown: it failed and left the engine
+// degraded, after its batch may have reached the data file. SQLSTATE 08007,
+// as PostgreSQL reports a commit it cannot resolve. Never "nothing
+// written": a reopen may find the writes.
+class TransactionResolutionUnknown : public std::runtime_error {
+public:
+  explicit TransactionResolutionUnknown(const std::string& what) : std::runtime_error{what} {}
+  TransactionResolutionUnknown(const TransactionResolutionUnknown&) = default;
+  TransactionResolutionUnknown& operator=(const TransactionResolutionUnknown&) = default;
+  ~TransactionResolutionUnknown() override;  // out of line: anchors the vtable (-Wweak-vtables)
+};
+
+// A statement given to a transaction a statement failed in: SQLSTATE 25P02,
+// as PostgreSQL refuses every command until the transaction block ends.
+// commit() then rolls back instead, as PostgreSQL's COMMIT does.
 class TransactionAborted : public std::runtime_error {
 public:
   TransactionAborted() : std::runtime_error{"current transaction is aborted, commands ignored until end of transaction block"} {}
@@ -134,6 +148,8 @@ public:
   ParamError& operator=(const ParamError&) = default;
   ~ParamError() override;  // out of line: anchors the vtable (-Wweak-vtables)
 };
+
+class Database;
 
 class Statement {
 public:
@@ -164,8 +180,9 @@ private:
     RowLayout result_layout;                 // how its result rows decode
     std::vector<bc_col_ref> col_refs;
     bc_schema_ref ref{};  // points into the members above; catalog_version: the one compiled against
-    // The latest catalog version the plan was checked to fit, which the
-    // runtime then does not check again.
+    // The catalog version the plan was compiled for or last checked to fit
+    // (bc_ctx_check). At that version the API makes no check of its own
+    // before a run; the runtime verifies the plan on every run regardless.
     mutable std::atomic<std::uint64_t> checked{0};
 
     [[nodiscard]] auto run_ref() const -> bc_schema_ref {
@@ -186,6 +203,7 @@ private:
   std::string sql_;
   ast::Statement ast_;
   bool ddl_{false};
+  const Database* owner_{nullptr};  // the Database that prepared it, the only one it runs on
   mutable std::mutex mu_;                             // held only to copy or swap compiled_
   mutable std::shared_ptr<const Compiled> compiled_;  // null for DDL
 };
@@ -257,7 +275,9 @@ public:
   // Writes every statement's writes as one batch: Committed. After a failed
   // statement it writes nothing and returns RolledBack. Throws
   // SerializationFailure on a conflict and ExecError on an engine error,
-  // with nothing written. The transaction has ended in every case.
+  // with nothing written; TransactionResolutionUnknown when the commit
+  // failed after its batch may have reached the engine. The transaction has
+  // ended in every case.
   [[nodiscard]] auto commit() -> CommitOutcome;
   // Ends the transaction; nothing it wrote is kept. Once ended, does nothing.
   void rollback() noexcept;
@@ -280,7 +300,10 @@ private:
 
 // Every call may be made from any thread, concurrently with any other but
 // close(). None waits on another's engine I/O: a commit, a statement or a
-// prepare never waits for another transaction's commit or sync.
+// prepare never waits for another transaction's commit or sync, and a DDL
+// that finds another DDL in progress throws SerializationFailure rather
+// than wait. The one wait left: a statement's pin waits for the instant
+// between a DDL's batch reaching the engine and its catalog taking effect.
 class Database {
 public:
   [[nodiscard]] static auto open(const std::filesystem::path& dir) -> std::unique_ptr<Database>;
@@ -295,10 +318,13 @@ public:
   // Throws ast::SqlError. The reference is valid until close().
   auto prepare(std::string_view sql) -> const Statement&;
   // Throws ParamError for parameters of the wrong number or type,
-  // ast::SqlError if a recompile fails, ExecError if the plan fails, and for
+  // ast::SqlError if a recompile fails, ExecError if the plan fails,
+  // TransactionResolutionUnknown if its commit's outcome is unknown,
+  // std::logic_error for a statement another Database prepared, and for
   // DDL, what LiveCatalog::apply throws (DdlRefused for a statement the
-  // catalog refuses), but a ConstraintViolation as an ExecError: a unique
-  // index over duplicates is BC_E_CONSTRAINT, BC_C_UNIQUE and the table's id.
+  // catalog refuses), but a ConstraintViolation as an ExecError (a unique
+  // index over duplicates is BC_E_CONSTRAINT, BC_C_UNIQUE and the table's
+  // id) and another DDL in progress as SerializationFailure.
   auto execute(const Statement& stmt, const std::vector<Value>& params) -> Rows;
   auto execute(std::string_view sql, const std::vector<Value>& params = {}) -> Rows;
   // Opens a transaction. Its snapshot is taken at its first statement.
@@ -326,8 +352,14 @@ public:
   // record is written back unchanged, which such a plan guards, so execute
   // exhausts its retries. A plan that only reads commits nothing to conflict.
   void conflict_on_every_commit_for_testing(bool on);
+  // Test only: called in each transaction statement right after the
+  // transaction's catalog is pinned, before the plan is checked against it.
+  // Set it while no transaction runs.
+  void after_txn_pin_for_testing(std::function<void()> hook) { after_txn_pin_ = std::move(hook); }
   // Test only: the engine under the layer, for a test that stores what the
   // layer would refuse, to check that a read refuses it too.
+  // Test only: the live catalog, for a test that holds a DDL mid-commit.
+  [[nodiscard]] auto live_catalog_for_testing() -> LiveCatalog& { return *live_; }
   [[nodiscard]] auto engine_for_testing() -> DB& {
     if (life_->closing.load()) throw DbClosed();
     return *db_;
@@ -380,6 +412,7 @@ private:
 #ifdef BYTECASK_SQL_TESTING
   std::atomic<std::uint64_t> plan_checks_{0};
   std::atomic<bool> conflict_every_commit_{false};
+  std::function<void()> after_txn_pin_;
 #endif
 };
 
@@ -397,28 +430,58 @@ constexpr std::uint32_t kMaxRetries = 3;
 ExecError::~ExecError() = default;
 SerializationFailure::~SerializationFailure() = default;
 TransactionAborted::~TransactionAborted() = default;
+TransactionResolutionUnknown::~TransactionResolutionUnknown() = default;
 ParamError::~ParamError() = default;
 
 namespace {
 
-// Throws E built with `what`, or, if the message cannot be allocated, with
-// none: the outcome an exception reports never turns into std::bad_alloc.
-// (An empty message allocates nothing, and copying the exception to throw
-// it shares its message.)
-template <class E, class... Args>
-[[noreturn]] void throw_keeping_outcome(std::string_view what, Args... args) {
+// Throws make(what), or make("") if the message cannot be allocated: the
+// outcome an exception reports never turns into std::bad_alloc. (An empty
+// message allocates nothing, and the copy thrown shares the message.)
+template <class Make>
+[[noreturn]] void throw_keeping_outcome(std::string_view what, Make make) {
+  using E = decltype(make(std::string{}));
   std::optional<E> e;
   try {
-    e.emplace(std::string{what}, args...);
+    e.emplace(make(std::string{what}));
   } catch (const std::bad_alloc&) {
-    e.emplace(std::string{}, args...);
+    e.emplace(make(std::string{}));
   }
   throw E{*e};
+}
+
+[[noreturn]] void throw_serialization_failure(std::string_view what) {
+  throw_keeping_outcome(what, [](const std::string& m) { return SerializationFailure{m}; });
+}
+
+// A failure the runtime reported, as the API's exception for it.
+[[noreturn]] void throw_error(bc_error_code code, std::uint32_t detail, std::string_view message) {
+  if (code == BC_E_UNKNOWN) {
+    throw_keeping_outcome(message, [](const std::string& m) { return TransactionResolutionUnknown{m}; });
+  }
+  throw_keeping_outcome(message, [&](const std::string& m) { return ExecError{m, code, detail}; });
+}
+
+// The context's error, thrown once the context is reset.
+[[noreturn]] void throw_context_error(bc_ctx* cx) {
+  auto code = bc_error(cx);
+  auto detail = bc_error_detail(cx);
+  std::string message;
+  try {
+    message = bc_error_message(cx);
+  } catch (const std::bad_alloc&) {  // NOLINT(bugprone-empty-catch): the message is dropped, not the outcome
+  }
+  bc_ctx_reset(cx);  // the context keeps no snapshot or catalog version while idle
+  throw_error(code, detail, message);
 }
 
 constexpr std::string_view kConflict = "could not serialize access due to concurrent update";
 constexpr std::string_view kCatalogChanged =
     "could not serialize access: the catalog changed since the transaction's first statement";
+constexpr std::string_view kDdlInProgress = "could not serialize access: another DDL is in progress";
+// A transaction's statement re-pins or recompiles at most this many times
+// before it gives up with 40001: each is for a DDL racing it.
+constexpr int kTxnPlanAttempts = 3;
 
 }  // namespace
 
@@ -607,6 +670,7 @@ auto Database::prepare_locked(std::string_view sql) -> const Statement& {
   s->ast_ = ast::parse(sql);
   s->compiled_ = build(*s);
   s->ddl_ = s->compiled_ == nullptr;
+  s->owner_ = this;
   std::unique_lock<std::shared_mutex> lock{cache_mu_};
   return *cache_.try_emplace(s->sql_, std::move(s)).first->second;
 }
@@ -617,6 +681,7 @@ auto Database::execute(std::string_view sql, const std::vector<Value>& params) -
 
 auto Database::execute(const Statement& stmt, const std::vector<Value>& params) -> Rows {
   auto lock = enter();
+  if (stmt.owner_ != this) throw std::logic_error("the statement was prepared on another database");
   if (stmt.is_ddl()) {
     if (!params.empty()) throw ParamError("DDL takes no parameters");
     auto bound = bound::bind(stmt.ast_, *live_->current());
@@ -624,6 +689,8 @@ auto Database::execute(const Statement& stmt, const std::vector<Value>& params) 
       (void)live_->apply(std::get<Ddl>(bound.stmt));
     } catch (const ConstraintViolation& e) {
       throw ExecError(e.what(), BC_E_CONSTRAINT, e.detail().encode());
+    } catch (const DdlInProgress&) {
+      throw_serialization_failure(kDdlInProgress);  // a DDL never waits for another
     }
     Rows out;
     out.affected = 0;
@@ -700,31 +767,41 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
     }
   };
   bc_params bp{params};
-  auto failed = [&] {
-    ExecError e{bc_error_message(cx), bc_error(cx), bc_error_detail(cx)};
-    bc_ctx_reset(cx);  // the context keeps no snapshot or catalog version while idle
-    return e;
-  };
   if (txn != nullptr) {
     // The plan must fit the catalog the transaction pinned at its first
-    // statement. One that does not, because it is older than the live
-    // catalog the transaction pinned, is recompiled for it; any other is a
-    // DDL since the transaction began: 40001, as a commit after it would be.
+    // statement. One that does not is recompiled when the pin is the live
+    // catalog (the cached plan is merely behind it); is pinned again when
+    // this is the first statement, which has read nothing (PostgreSQL takes
+    // the snapshot as the first statement starts); and is otherwise a DDL
+    // since the transaction began: 40001, as a commit after it would be.
     for (auto attempt = 0;; ++attempt) {
-      auto c = stmt.compiled();
       bc_ctx_begin_txn(cx, txn, &bp, {});
+      auto pinned = bc_txn_catalog_version(txn);
+#ifdef BYTECASK_SQL_TESTING
+      if (after_txn_pin_) after_txn_pin_();
+#endif
+      auto c = stmt.compiled();  // taken after the pin: the plan of a DDL that raced it, if one did
       auto ref = c->run_ref();
-      if (!bc_ctx_check(cx, &ref)) {
-        if (bc_error(cx) != BC_E_LAYOUT || bc_error_detail(cx) != BC_L_INCOMPATIBLE) {
-          (void)bc_txn_add(cx);  // the statement failed: the transaction aborts
-          throw failed();
+      // A plan checked at the pinned version is not checked here again:
+      // bc_ctx_run verifies it as it runs.
+      if (ref.catalog_version != pinned) {
+        if (!bc_ctx_check(cx, &ref)) {
+          if (bc_error(cx) != BC_E_LAYOUT || bc_error_detail(cx) != BC_L_INCOMPATIBLE) {
+            (void)bc_txn_add(cx);  // the statement failed: the transaction aborts
+            throw_context_error(cx);
+          }
+          bc_ctx_reset(cx);  // nothing ran: the transaction is as it was
+          if (attempt < kTxnPlanAttempts) {
+            if (pinned == live_->current()->version()) {
+              (void)recompile(stmt);
+              continue;
+            }
+            if (bc_txn_repin(txn)) continue;
+          }
+          throw_serialization_failure(kCatalogChanged);
         }
-        bc_ctx_reset(cx);  // nothing ran: the transaction is as it was
-        if (attempt == 0 && bc_txn_catalog_version(txn) == live_->current()->version()) {
-          (void)recompile(stmt);
-          continue;
-        }
-        throw_keeping_outcome<SerializationFailure>(kCatalogChanged);
+        c->checked.store(pinned);
+        ref.catalog_version = pinned;
       }
       try {
         check_params(*c);
@@ -734,7 +811,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
       }
       bc_ctx_run(cx, c->code->fn(), &ref);
       // The statement's writes join the transaction, or it aborts.
-      if (!bc_txn_add(cx)) throw failed();
+      if (!bc_txn_add(cx)) throw_context_error(cx);
       return results(cx, *c, Rows{});
     }
   }
@@ -755,9 +832,10 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
   }
   if (r == BC_CONFLICT) {
     bc_ctx_reset(cx);
-    throw ExecError::conflicted("conflict: a guard failed on every attempt");
+    throw_keeping_outcome("conflict: a guard failed on every attempt",
+                          [](const std::string& m) { return ExecError::conflicted(m); });
   }
-  if (r == BC_FAILED) throw failed();
+  if (r == BC_FAILED) throw_context_error(cx);
   return results(cx, *c, Rows{});
 }
 
@@ -870,6 +948,8 @@ auto Transaction::execute(const Statement& stmt, const std::vector<Value>& param
   if (!h_) throw std::logic_error("the transaction has ended");
   std::shared_lock<std::shared_mutex> lock{life_->mu};
   check_usable();
+  // A misuse of the handle, not a failed statement: the transaction stays as it was.
+  if (stmt.owner_ != db_) throw std::logic_error("the statement was prepared on another database");
   return run_locked(stmt, params);
 }
 
@@ -918,8 +998,8 @@ auto Transaction::commit() -> CommitOutcome {
   }
   end_locked();
   lock.unlock();
-  if (r == BC_CONFLICT) throw_keeping_outcome<SerializationFailure>(kConflict);
-  if (r == BC_FAILED) throw_keeping_outcome<ExecError>(message, code, detail);
+  if (r == BC_CONFLICT) throw_serialization_failure(kConflict);
+  if (r == BC_FAILED) throw_error(code, detail, message);
   return CommitOutcome::Committed;
 }
 

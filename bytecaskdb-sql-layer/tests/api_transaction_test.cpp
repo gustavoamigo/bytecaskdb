@@ -328,37 +328,185 @@ TEST_CASE("embedded API: transactions commit concurrently while other threads pr
 
 TEST_CASE("embedded API: an allocation failure in commit() never changes its outcome", "[sql][api][txn][alloc]") {
   if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
-  for (long nth = 1;; ++nth) {
-    sql_test::TempDir dir{"api_txn"};
-    auto db = open_db(dir);
-    db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{100}});
-    auto a = db->begin();
-    auto b = db->begin();
-    a.execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{90}});
-    b.execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{50}});
-    REQUIRE(b.commit() == CommitOutcome::Committed);
-    std::string outcome;
-    auto fired = false;
-    {
-      bytecask::testing::ScopedAllocFaults faults{nth, false};
-      try {
-        (void)a.commit();
-        outcome = "committed";
-      } catch (const SerializationFailure&) {
-        outcome = "conflict";
-      } catch (const ExecError& e) {
-        outcome = e.code() == BC_E_MEMORY ? "memory" : "error";
-      } catch (const std::bad_alloc&) {
-        outcome = "bad_alloc";
+  // A conflicting commit, then one that would succeed: each allocation of the
+  // commit failed in turn.
+  for (auto conflicting : {true, false}) {
+    INFO((conflicting ? "conflicting" : "succeeding") << " commit");
+    auto unknowns = 0;
+    for (long nth = 1;; ++nth) {
+      sql_test::TempDir dir{"api_txn"};
+      std::optional<std::int64_t> stored;
+      std::string outcome;
+      auto fired = false;
+      {
+        auto db = open_db(dir);
+        db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{100}});
+        auto a = db->begin();
+        a.execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{90}});
+        if (conflicting) {
+          auto b = db->begin();
+          b.execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{50}});
+          REQUIRE(b.commit() == CommitOutcome::Committed);
+        }
+        {
+          bytecask::testing::ScopedAllocFaults faults{nth, false};
+          try {
+            (void)a.commit();
+            outcome = "committed";
+          } catch (const SerializationFailure&) {
+            outcome = "conflict";
+          } catch (const TransactionResolutionUnknown&) {
+            outcome = "unknown";
+          } catch (const ExecError& e) {
+            outcome = e.code() == BC_E_MEMORY ? "memory" : "error";
+          } catch (const std::bad_alloc&) {
+            outcome = "bad_alloc";
+          }
+          fired = faults.report().fired;
+        }
+        INFO("allocation " << nth << ": " << outcome);
+        CHECK_FALSE(a.is_open());
+        // Unknown exactly when the failure degraded the engine: the batch
+        // may be in the data file.
+        CHECK(db->engine_for_testing().is_degraded() == (outcome == "unknown"));
+        if (outcome == "unknown") {
+          CHECK_FALSE(conflicting);  // a conflict is found before anything is written
+        } else {
+          CHECK((outcome == (conflicting ? "conflict" : "committed") || outcome == "memory"));
+          stored = balance(*db, 1);
+        }
       }
-      fired = faults.report().fired;
+      if (outcome == "unknown") {
+        // Whichever way it went, it went whole, as a reopen finds it.
+        auto db = Database::open(dir.path());
+        auto bal = balance(*db, 1);
+        CHECK((bal == 100 || bal == 90));
+        ++unknowns;
+      } else {
+        CHECK(stored == (outcome == "committed" ? 90 : conflicting ? 50 : 100));
+      }
+      if (!fired) break;
     }
-    INFO("allocation " << nth << ": " << outcome);
-    // A failure before the outcome is known is BC_E_MEMORY; after it, the
-    // conflict is still the conflict.
-    CHECK((outcome == "conflict" || outcome == "memory"));
-    CHECK_FALSE(a.is_open());
-    if (!db->engine_for_testing().is_degraded()) CHECK(balance(*db, 1) == 50);
-    if (!fired) break;
+    // The sweep reaches failures after the batch is in the data file.
+    if (!conflicting) CHECK(unknowns > 0);
   }
+}
+
+TEST_CASE("embedded API: an allocation failure while an autocommit error is reported never changes it",
+          "[sql][api][alloc]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
+  sql_test::TempDir dir{"api_txn"};
+  auto db = open_db(dir);
+  db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{100}});
+  const auto& insert = db->prepare("INSERT INTO acct VALUES ($1, $2)");
+  const auto& update = db->prepare("UPDATE acct SET bal = $2 WHERE id = $1");
+  // A duplicate key, and a conflict on every retry: every allocation of the
+  // call failed in turn. The error is the call's own, or BC_E_MEMORY, and
+  // nothing is written. std::bad_alloc only from the call's first
+  // allocations, the parameters' copy, before anything runs: never once the
+  // plan has run, when it would hide the outcome.
+  const std::vector<Value> params{std::int64_t{1}, std::int64_t{7}};  // built before the faults are armed
+  for (auto conflict : {false, true}) {
+    db->conflict_on_every_commit_for_testing(conflict);
+    auto ran = false;
+    for (long nth = 1;; ++nth) {
+      std::string outcome;
+      auto fired = false;
+      {
+        bytecask::testing::ScopedAllocFaults faults{nth, false};
+        try {
+          (void)db->execute(conflict ? update : insert, params);
+          outcome = "ran";
+        } catch (const ExecError& e) {
+          outcome = e.conflict() ? "conflict" : e.code() == BC_E_MEMORY ? "memory" : e.code() == BC_E_CONSTRAINT ? "duplicate" : "error";
+        } catch (const std::bad_alloc&) {
+          outcome = "bad_alloc";
+        }
+        fired = faults.report().fired;
+      }
+      INFO((conflict ? "conflict" : "duplicate") << ", allocation " << nth << ": " << outcome);
+      if (db->engine_for_testing().is_degraded()) {
+        // The test's own conflict hook writes; a failed allocation in that
+        // write degrades the engine, which is not the call under test.
+        db->engine_for_testing().resume();
+        if (!fired) break;
+        continue;
+      }
+      if (outcome == "bad_alloc") {
+        CHECK_FALSE(ran);
+      } else {
+        ran = true;
+        CHECK((outcome == (conflict ? "conflict" : "duplicate") || outcome == "memory"));
+      }
+      if (!fired) break;
+    }
+  }
+  db->conflict_on_every_commit_for_testing(false);
+  CHECK(balance(*db, 1) == 100);
+}
+
+TEST_CASE("embedded API: a statement runs only on the database that prepared it", "[sql][api][txn]") {
+  sql_test::TempDir d1{"api_txn"}, d2{"api_txn"};
+  auto db1 = open_db(d1);
+  auto db2 = open_db(d2);
+  const auto& stmt = db1->prepare("SELECT bal FROM acct WHERE id = $1");
+  auto cached = db2->cached_plans();
+  CHECK_THROWS_AS(db2->execute(stmt, {std::int64_t{1}}), std::logic_error);
+  auto t = db2->begin();
+  CHECK_THROWS_AS(t.execute(stmt, {std::int64_t{1}}), std::logic_error);
+  CHECK(t.is_open());
+  CHECK_FALSE(t.is_aborted());  // a misuse of the handle, not a failed statement
+  CHECK(db2->cached_plans() == cached);
+  CHECK(t.commit() == CommitOutcome::Committed);
+}
+
+TEST_CASE("embedded API: a DDL that finds another in progress is 40001 at once", "[sql][api]") {
+  sql_test::TempDir dir{"api_txn"};
+  auto db = open_db(dir);
+  std::string second;
+  // The first DDL is held mid-commit while a second runs on another thread.
+  db->live_catalog_for_testing().set_commit_hook_for_testing([&] {
+    std::thread other{[&] {
+      try {
+        db->execute("CREATE TABLE other (id BIGINT PRIMARY KEY)");
+        second = "ran";
+      } catch (const SerializationFailure&) {
+        second = "40001";
+      }
+    }};
+    other.join();
+  });
+  db->execute("CREATE INDEX acct_bal ON acct (bal)");
+  db->live_catalog_for_testing().set_commit_hook_for_testing({});
+  CHECK(second == "40001");
+  CHECK(db->catalog()->table("other") == nullptr);
+  db->execute("CREATE TABLE other (id BIGINT PRIMARY KEY)");  // retried, it runs
+  CHECK(db->catalog()->table("other") != nullptr);
+}
+
+TEST_CASE("embedded API: a DDL racing a transaction's first statement re-pins it, not 40001", "[sql][api][txn]") {
+  sql_test::TempDir dir{"api_txn"};
+  auto db = open_db(dir);
+  db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{100}});
+  CHECK(balance(*db, 1) == 100);
+  // Right after the first statement pins the catalog, a DDL replaces the
+  // table and the shared statement is recompiled for it: the pin is older
+  // than the plan, and the statement has read nothing.
+  auto raced = false;
+  db->after_txn_pin_for_testing([&] {
+    if (raced) return;
+    raced = true;
+    std::thread other{[&] {
+      db->execute("DROP TABLE acct");
+      db->execute("CREATE TABLE acct (id BIGINT PRIMARY KEY, bal BIGINT NOT NULL)");
+      db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{7}});
+      CHECK(balance(*db, 1) == 7);
+    }};
+    other.join();
+  });
+  auto t = db->begin();
+  CHECK(txn_balance(t, 1) == 7);  // pinned again, on the live catalog and a new snapshot
+  db->after_txn_pin_for_testing({});
+  CHECK(raced);
+  CHECK(t.commit() == CommitOutcome::Committed);
 }

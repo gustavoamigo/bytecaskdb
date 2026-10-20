@@ -1,9 +1,10 @@
 # Transactions in the SQL layer
 
-Status: **design, approved by the owner (2026-10-20, #491).** Built: the
-transaction's view, statements inside a transaction, and commit with
-40001 on any conflict (slice A). Not yet built: insert claims (23505 at
-commit), DDL during an open transaction, and `FOR UPDATE` (slice B). It
+Status: **design, approved by the owner (2026-10-20, #491).** Built
+(slice A): the transaction's view, statements inside a transaction, commit
+with 40001 on any conflict and 08007 when its outcome is unknown, and DDL
+during an open transaction. Not yet built (slice B): insert claims (23505
+at commit), 0A000 for DDL given to a transaction, and `FOR UPDATE`. It
 decides how the layer runs several statements as one
 transaction, which the MVP needs: TPROC-C's New-Order is about thirty
 statements that read their own writes (#487, *MVP*). Each decision is
@@ -57,9 +58,11 @@ An in-process transaction handle on the embedded API:
 ```cpp
 class Transaction {                    // from Database::begin(); move-only
 public:
-  auto execute(const Statement&, std::span<const Value> params) -> Rows;
-  void commit();                       // throws SerializationFailure (40001)
-  void rollback();
+  auto execute(const Statement&, const std::vector<Value>& params) -> Rows;
+  auto commit() -> CommitOutcome;      // Committed, or RolledBack after a failed statement;
+                                       // throws SerializationFailure (40001), or
+                                       // TransactionResolutionUnknown (08007)
+  void rollback() noexcept;
   ~Transaction();                      // rolls back if still open
 };
 auto Database::begin(TransactionOptions = {}) -> Transaction;
@@ -91,9 +94,11 @@ auto Database::begin(TransactionOptions = {}) -> Transaction;
 - **After `commit()`, `rollback()` or a serialization failure,** the handle
   is closed; any further call throws. So does a moved-from handle.
 - **Threads.** Handles run on different threads at once, alongside
-  prepares and autocommit statements. No call waits on another's engine
-  I/O: the only lock any call holds across I/O is shared, and only
-  `close()` takes it exclusively, to wait for the calls in flight. A
+  prepares and autocommit statements. No statement, commit or prepare waits
+  on another's engine I/O: the only lock any call holds across I/O is
+  shared, and only `close()` takes it exclusively, to wait for the calls in
+  flight. A DDL that finds another in progress fails at once (*DDL*), and a
+  statement's pin may wait only for the instant a DDL publishes. A
   compiled plan is never changed while a statement runs it; a recompile
   swaps in a new one. `close()` ends every open handle, and a handle may
   outlive its `Database`: it then touches nothing of it.
@@ -211,6 +216,7 @@ statements, needs no guard.
 | Conflict on a key the transaction inserted, now taken (below) | The retry's own unique check reports it: `ExecError`, `BC_C_UNIQUE`, **23505** | `ExecError`, `BC_C_UNIQUE`, SQLSTATE **23505**. Nothing written; the handle is closed. |
 | Any other conflict | Retried on a fresh snapshot, up to three times, as today; then `ExecError` with `conflict()` | `SerializationFailure`, SQLSTATE **40001**. Nothing written; the handle is closed. The caller reruns the transaction. The layer never retries it: it can't rerun the caller's logic. |
 | Constraint or other error in a statement | `ExecError`, never retried | Raised by `execute()` for the failing statement; the transaction is then aborted (25P02) |
+| The commit failed and degraded the engine: its batch may have reached the data file | `TransactionResolutionUnknown`, SQLSTATE **08007**, never retried | The same, and the handle is closed. Never "nothing written": a reopen finds the writes whole or not at all. |
 
 Conflicts are detected only at commit. A statement never waits and never
 fails because another transaction holds a row (see *Known differences*).
@@ -304,7 +310,15 @@ wrote a table the DDL changed.
   against a newer catalog, naming a column the pin lacks) fails with 40001
   and closes the transaction, rather than recompiling against a catalog
   older than the cache. This is rare and loses nothing a retry wouldn't
-  recover.
+  recover. On the transaction's first statement, which has read nothing
+  yet, a DDL that raced the pin is not a failure: the transaction is
+  pinned again, to the live catalog and a new snapshot, as PostgreSQL takes
+  the snapshot when the first statement starts.
+- **A DDL never waits for another DDL either.** One that finds another DDL
+  of its catalog in progress fails at once, writing nothing, with 40001,
+  and may be retried. The one wait left is a statement's pin: it waits for
+  the instant between a DDL's batch reaching the engine and the new catalog
+  taking effect, never while the DDL writes or syncs.
 - A DDL statement given to `Transaction::execute` is refused (SQLSTATE
   0A000) in the MVP. DDL stays its own atomic operation. Transactional DDL
   is later.
@@ -316,11 +330,15 @@ differences*.
 
 - **Buffer size.** What a transaction holds, its overlay and its guards,
   is bounded by `TransactionOptions::max_bytes`, default 64 MiB, well below
-  the engine's 1 GiB plan limit. A statement that takes the transaction
-  past it fails with `BC_E_LIMIT` (SQLSTATE 54000), the transaction is
+  the engine's 1 GiB plan limit. The bound is checked before a statement's
+  writes are taken in, from the statement's own pending effects: one that
+  would take the transaction past it fails with `BC_E_LIMIT` (SQLSTATE
+  54000) without the transaction allocating for it, the transaction is
   aborted like any failed statement's, and what it held is freed at once.
-  The bound counts every buffer's capacity plus a fixed cost per map node
-  and guard, so a transaction of small writes can't exhaust memory through
+  The count is a conservative bound, never less than the memory held: each
+  buffer's capacity plus an allocator overhead, each map node's full size,
+  and the guards' and written tables' vectors at the size they could grow
+  to. So a transaction of small writes can't exhaust memory through
   overhead.
 - **Memory.** The overlay allocates from the heap. A failed allocation is
   `BC_E_MEMORY` for the statement, never an abort and never an exception
