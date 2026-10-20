@@ -436,10 +436,13 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
     const std::uint8_t* row = nullptr;
     std::uint32_t len = 0;
     while (bc_ctx_next_result(cx_, &row, &len)) {
+      // Result rows are decoded after the commit. That is safe while the
+      // compiled write plans emit no rows (only bc_emit_count): a RETURNING
+      // will have to decode its rows before it commits.
       auto values = decode_row(stmt.result_layout_, std::as_bytes(std::span{row, len}));
       if (!values) {
         bc_ctx_reset(cx_);
-        throw ExecError("malformed result row", BC_E_CORRUPT);
+        throw ExecError("malformed result row: column " + std::to_string(values.error()), BC_E_CORRUPT);
       }
       out.rows.push_back(std::move(*values));
     }
@@ -497,7 +500,7 @@ auto Database::table_rows(std::string_view table) const -> Rows {
                     std::to_string(t->layout.generation));
     }
     auto values = decode_row(layout, row);
-    if (!values) throw corrupt("a present column that does not decode");
+    if (!values) throw corrupt("column " + std::to_string(values.error()) + " does not decode");
     out.rows.push_back(std::move(*values));
   });
   return out;

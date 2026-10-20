@@ -214,6 +214,13 @@ struct ColumnRead {
 // Malformed everywhere, never read as 0, empty or NULL. The bytes are a view
 // into `row`: valid while the row is.
 [[nodiscard]] auto row_column(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t pos) -> ColumnRead;
+// row_column's classification without the value: the header, the bit and
+// whether the row's regions hold the column, but no var_end entries. So a
+// variable column whose var_end runs past the row is Value here and
+// Malformed to row_column. For a null test before a typed read, which
+// decodes the value and reports that damage.
+[[nodiscard]] auto row_column_state(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t pos)
+    -> ColumnState;
 [[nodiscard]] inline auto row_column(BytesView row, const ColumnSlot& col) -> ColumnRead {
   return row_column(row, col.col_id, col.type, col.pos);
 }
@@ -377,7 +384,12 @@ auto RowWriter::copy_from(BytesView old) -> bool {
     auto v = row_column(old, c);
     switch (v.state) {
       case ColumnState::Malformed: return false;
-      case ColumnState::Absent: present_[i] = false; break;
+      case ColumnState::Absent:
+        // As set_null: no value left behind for finish to write.
+        present_[i] = false;
+        fixed_[i] = 0;
+        var_[i].clear();
+        break;
       case ColumnState::Value:
         present_[i] = true;
         if (is_fixed(c.type)) {
@@ -538,27 +550,53 @@ auto row_generation(BytesView row) -> std::uint16_t {
   return row.size() < 2 ? 0 : static_cast<std::uint16_t>(load_u16(row, 0));
 }
 
-auto row_column(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t pos) -> ColumnRead {
+namespace {
+// The header, if the row's regions hold a present column: what row_column
+// and row_column_state share. Absent and Malformed are returned through
+// `state`; a header comes back only for a present column the row holds.
+auto locate(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t pos, ColumnState& state)
+    -> std::optional<Header> {
+  state = ColumnState::Malformed;
   auto h = header(row);
-  if (!h) return {};
-  if (col_id / 8 >= h->bitmap_bytes) return {.state = ColumnState::Absent};  // the row predates the column
+  if (!h) return std::nullopt;
+  if (col_id / 8 >= h->bitmap_bytes) {  // the row predates the column
+    state = ColumnState::Absent;
+    return std::nullopt;
+  }
   auto bit = std::to_integer<unsigned>(row[kRowHeaderBytes + col_id / 8]) >> (col_id % 8) & 1u;
-  if (bit == 0) return {.state = ColumnState::Absent};
+  if (bit == 0) {
+    state = ColumnState::Absent;
+    return std::nullopt;
+  }
   // Present: the row must hold it. Outside its regions (a row that predates
-  // the column, with the bit set) or running past the row, it is damaged.
-  if (type == PhysType::Bytes) {
-    if (pos >= h->nvar) return {};
-    auto data = h->var_data();
-    auto begin = pos == 0 ? 0u : load_u32(row, h->var_table + 4 * std::size_t{pos - 1});
-    auto end = load_u32(row, h->var_table + 4 * std::size_t{pos});
-    if (end < begin || data + end > h->row_bytes) return {};
-    return {.state = ColumnState::Value, .bytes = row.subspan(data + begin, end - begin)};
-  }
-  if (pos < h->fixed_start() || (pos - h->fixed_start()) % kFixedColumnBytes != 0 ||
-      std::size_t{pos} + kFixedColumnBytes > h->var_table) {
-    return {};
-  }
-  return {.state = ColumnState::Value, .word = load_le(row, pos, kFixedColumnBytes)};
+  // the column, with the bit set) it is damaged.
+  auto held = type == PhysType::Bytes
+                  ? pos < h->nvar
+                  : pos >= h->fixed_start() && (pos - h->fixed_start()) % kFixedColumnBytes == 0 &&
+                        std::size_t{pos} + kFixedColumnBytes <= h->var_table;
+  if (!held) return std::nullopt;
+  state = ColumnState::Value;
+  return h;
+}
+}  // namespace
+
+auto row_column_state(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t pos) -> ColumnState {
+  auto state = ColumnState::Malformed;
+  (void)locate(row, col_id, type, pos, state);
+  return state;
+}
+
+auto row_column(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t pos) -> ColumnRead {
+  auto state = ColumnState::Malformed;
+  auto h = locate(row, col_id, type, pos, state);
+  if (!h) return {.state = state};
+  if (type != PhysType::Bytes) return {.state = ColumnState::Value, .word = load_le(row, pos, kFixedColumnBytes)};
+  // A variable column's bytes must lie inside the row.
+  auto data = h->var_data();
+  auto begin = pos == 0 ? 0u : load_u32(row, h->var_table + 4 * std::size_t{pos - 1});
+  auto end = load_u32(row, h->var_table + 4 * std::size_t{pos});
+  if (end < begin || data + end > h->row_bytes) return {};
+  return {.state = ColumnState::Value, .bytes = row.subspan(data + begin, end - begin)};
 }
 
 auto row_column_equal(BytesView a, BytesView b, const ColumnSlot& col) -> std::optional<bool> {

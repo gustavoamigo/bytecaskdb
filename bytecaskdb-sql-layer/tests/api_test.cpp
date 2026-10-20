@@ -656,6 +656,8 @@ TEST_CASE("embedded API: a stored column that does not decode is BC_E_CORRUPT, n
     FAIL("table_rows read a column that does not decode");
   } catch (const ExecError& e) {
     CHECK(e.code() == BC_E_CORRUPT);
+    // Row 1, the first in key order, names its damaged column.
+    CHECK(std::string{e.what()}.starts_with("column " + std::to_string(c_id) + " does not decode"));
   }
   db->close();
 }

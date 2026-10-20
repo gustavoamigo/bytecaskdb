@@ -888,7 +888,9 @@ TEST_CASE("plan API: a present column the row does not hold is BC_E_CORRUPT, nev
   bad[var_table] = std::byte{0xFF};
   bad[var_table + 1] = std::byte{0xFF};
   f.db->put({}, key, bad);
-  expect_corrupt(name_null);
+  // bc_col_null reads the bit and the row's regions, not var_end: the slot
+  // is in the row, so not null. The read that follows reports the damage.
+  CHECK(value(f, name_null, {std::int64_t{1}}) == 0);
   expect_corrupt(emit_name, std::array{PhysType::Bytes});
   expect_corrupt(slot_of_row);
 }

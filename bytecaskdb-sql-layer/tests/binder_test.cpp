@@ -163,6 +163,20 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
           "DEFAULT out of range for type real");
     CHECK(rejected(cat, "CREATE TABLE r (k BIGINT PRIMARY KEY, a REAL DEFAULT 1e39)").first ==
           "DEFAULT out of range for type real");
+    // DOUBLE PRECISION, as PostgreSQL 16 takes it: 0.1 and a denormal kept;
+    // overflow and underflow to zero out of range (before parse_number,
+    // 1e400 was refused as "not a constant").
+    auto double_default = [&](std::string_view literal) {
+      auto sql = "CREATE TABLE r (k BIGINT PRIMARY KEY, a DOUBLE PRECISION DEFAULT " + std::string(literal) + ")";
+      return std::get<CreateTableDdl>(std::get<Ddl>(bind_sql(cat, sql).stmt)).columns[1].default_value;
+    };
+    CHECK(double_default("0.1") == Datum{0.1});
+    CHECK(double_default("1e-310") == Datum{1e-310});
+    CHECK(std::get<double>(double_default("1e-310")) != 0.0);
+    CHECK(rejected(cat, "CREATE TABLE r (k BIGINT PRIMARY KEY, a DOUBLE PRECISION DEFAULT 1e400)").first ==
+          "DEFAULT out of range for type double precision");
+    CHECK(rejected(cat, "CREATE TABLE r (k BIGINT PRIMARY KEY, a DOUBLE PRECISION DEFAULT 1e-400)").first ==
+          "DEFAULT out of range for type double precision");
     CHECK(rejected(cat, "CREATE TABLE r (k BIGINT PRIMARY KEY, a REAL DEFAULT 1e-50)").first ==
           "DEFAULT out of range for type real");
   }

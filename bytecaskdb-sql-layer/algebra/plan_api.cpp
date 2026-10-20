@@ -1167,13 +1167,9 @@ template <typename Get, typename T>
 auto load_column(bc_ctx* cx, bc_view row, std::uint32_t col, PhysType type, Get&& get, T neutral) -> T {
   auto rc = row_col(cx, row, col, type);
   if (!rc) return neutral;
-  auto v = bytecask::sql::row_column(rc->row, col, type, rc->slot->pos);
-  switch (v.state) {
-    case bytecask::sql::ColumnState::Value: return get(v);
-    case bytecask::sql::ColumnState::Absent: return neutral;
-    case bytecask::sql::ColumnState::Malformed: fail_malformed(cx, col); return neutral;
-  }
-  return neutral;
+  auto v = read_column(cx, *rc);
+  if (!v || v->state == bytecask::sql::ColumnState::Absent) return neutral;
+  return get(*v);
 }
 
 // The builder a setter targets, and the declared column it sets.
@@ -1985,8 +1981,15 @@ bool bc_col_null(bc_ctx* cx, bc_view row, uint32_t col) {
   BC_GUARD_BEGIN
   auto rc = row_col(cx, row, col, std::nullopt);
   if (!rc) return true;
-  auto v = read_column(cx, *rc);
-  return !v || v->state == bytecask::sql::ColumnState::Absent;
+  // The bit and whether the row holds the column, not its value: a plan
+  // tests null before a typed read, which decodes it (and reports a
+  // var_end past the row), so the value is not decoded twice.
+  switch (bytecask::sql::row_column_state(rc->row, col, rc->slot->type, rc->slot->pos)) {
+    case bytecask::sql::ColumnState::Absent: return true;
+    case bytecask::sql::ColumnState::Value: return false;
+    case bytecask::sql::ColumnState::Malformed: fail_malformed(cx, col); return true;
+  }
+  return true;
   BC_GUARD_END(cx)
   return true;
 }
@@ -2069,6 +2072,7 @@ bc_row bc_row_from(bc_ctx* cx, uint32_t table, bc_view old) {
   auto r = bc_row_begin(cx, table);
   if (!cx->ok()) return {};
   if (!cx->rows[r.i].writer.copy_from(*o)) {
+    cx->rows.pop_back();  // the half-copied builder r names: begun just above, so last
     cx->fail(BC_E_CORRUPT, "malformed row: a column does not decode");
     return {};
   }

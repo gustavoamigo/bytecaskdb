@@ -10,6 +10,7 @@
 module;
 #include <algorithm>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <optional>
 #include <span>
@@ -73,11 +74,12 @@ export using ::bc_ctx_before_commit_for_testing;
 
 export namespace bytecask::sql {
 
-// Every column of a row, by its layout: NULL, or the typed value; nullopt
-// if a column is malformed (row_column), never a plausible value. The one
+// Every column of a row, by its layout: NULL, or the typed value; the id of
+// the first malformed column (row_column), never a plausible value. The one
 // decoder of whole rows: result rows for the embedded API and the tests,
 // stored rows for Database::table_rows.
-[[nodiscard]] auto decode_row(const RowLayout& layout, BytesView row) -> std::optional<std::vector<bc_value>>;
+[[nodiscard]] auto decode_row(const RowLayout& layout, BytesView row)
+    -> std::expected<std::vector<bc_value>, std::uint32_t>;
 
 
 // A plan's result_types as the bc_type codes a bc_schema_ref carries.
@@ -109,13 +111,13 @@ auto fn_addr(F* f) -> const void* {
 
 namespace bytecask::sql {
 
-auto decode_row(const RowLayout& layout, BytesView row) -> std::optional<std::vector<bc_value>> {
+auto decode_row(const RowLayout& layout, BytesView row) -> std::expected<std::vector<bc_value>, std::uint32_t> {
   std::vector<bc_value> out;
   out.reserve(layout.columns.size());
   for (const auto& c : layout.columns) {
     auto v = row_column(row, c);
     switch (v.state) {
-      case ColumnState::Malformed: return std::nullopt;
+      case ColumnState::Malformed: return std::unexpected(c.col_id);
       case ColumnState::Absent: out.emplace_back(std::monostate{}); continue;
       case ColumnState::Value: break;
     }

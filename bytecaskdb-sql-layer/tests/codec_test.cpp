@@ -423,7 +423,7 @@ TEST_CASE("row format: every physical type round-trips, null or not", "[sql][cod
     }
 
     RowWriter copy{layout};
-    copy.copy_from(row);
+    REQUIRE(copy.copy_from(row));
     Bytes again;
     REQUIRE(copy.finish(again));
     CHECK(again == row);
@@ -504,6 +504,19 @@ TEST_CASE("row format: a row shorter than the layout reads as null, in both dire
   CHECK(row_column(copied, *new_layout.find(0)).i64() == 5);
   CHECK((row_column(copied, *new_layout.find(2)).state == ColumnState::Absent));
   CHECK((row_column(copied, *new_layout.find(4)).state == ColumnState::Absent));
+
+  // A writer that already holds values, as bc_row_begin's defaults, keeps
+  // none of them for a column the copied row lacks: the row it finishes is
+  // the same, byte for byte, with no default's bytes under a clear bit.
+  RowWriter prefilled{new_layout};
+  REQUIRE(prefilled.set_i64(2, 77));
+  REQUIRE(prefilled.set_bytes(3, Bytes(1000, std::byte{'d'})));
+  REQUIRE(prefilled.set_bool(4, true));
+  REQUIRE(prefilled.copy_from(old_row));
+  Bytes from_prefilled;
+  REQUIRE(prefilled.finish(from_prefilled));
+  CHECK(from_prefilled == copied);
+  CHECK(from_prefilled.size() < 1000);
 }
 
 TEST_CASE("row format: the bitmap is sized at create and has a ceiling", "[sql][codec]") {

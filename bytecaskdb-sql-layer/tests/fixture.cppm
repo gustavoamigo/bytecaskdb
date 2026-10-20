@@ -94,7 +94,7 @@ struct Fixture {
     std::uint32_t len = 0;
     while (bc_ctx_next_result(cx, &row, &len)) {
       auto r = bytecask::sql::decode_row(rl, std::as_bytes(std::span{row, len}));
-      if (!r) throw std::runtime_error("malformed result row");
+      if (!r) throw std::runtime_error("malformed result row: column " + std::to_string(r.error()));
       out.push_back(std::move(*r));
     }
     return out;
