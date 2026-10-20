@@ -14,6 +14,7 @@ module;
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <span>
 #include <string>
@@ -150,34 +151,26 @@ auto sql_type(const ast::ColumnDefAst& c) -> SqlType {
   throw SqlError{"type " + c.type + " is not supported", c.pos};
 }
 
-// A decimal literal's sign, whole digits and fraction digits:
-// [-]digits[.digits]; nullopt if it is not one.
-// Views into the literal's text, which decimal_literal does not copy: valid
-// only while that text lives. scaled_decimal consumes it at once.
-struct DecimalLiteral {
-  bool neg;
-  std::string_view whole, frac;
-};
-auto decimal_literal(std::string_view text) -> std::optional<DecimalLiteral> {
+// Why a literal is not a DECIMAL value: not of the form [-]digits[.digits],
+// or more digits than any DECIMAL holds, so it cannot be scaled in an i64.
+enum class DecimalRefusal { NotDecimal, TooWide };
+
+// The literal [-]digits[.digits] scaled by 10^scale, rounded half away from
+// zero. The column's precision is checked by out_of_range, not here.
+auto scaled_decimal(std::string_view text, std::uint8_t scale) -> std::expected<std::int64_t, DecimalRefusal> {
   auto neg = !text.empty() && text[0] == '-';
   if (neg) text.remove_prefix(1);
   auto dot = text.find('.');
   auto whole = text.substr(0, dot);
   auto frac = dot == std::string_view::npos ? std::string_view{} : text.substr(dot + 1);
   auto digits = [](std::string_view d) { return std::ranges::all_of(d, [](char ch) { return ch >= '0' && ch <= '9'; }); };
-  if ((whole.empty() && frac.empty()) || !digits(whole) || !digits(frac)) return std::nullopt;
-  return DecimalLiteral{neg, whole, frac};
-}
-
-// The literal scaled by 10^scale, rounded half away from zero; nullopt if it
-// has more digits than any DECIMAL holds, so it cannot be scaled in an i64.
-// The column's precision is checked by out_of_range, not here.
-auto scaled_decimal(DecimalLiteral d, std::uint8_t scale) -> std::optional<std::int64_t> {
-  auto [neg, whole, frac] = d;
+  if ((whole.empty() && frac.empty()) || !digits(whole) || !digits(frac)) {
+    return std::unexpected(DecimalRefusal::NotDecimal);
+  }
   // Leading zeros are no digits: "0.5" has none before the point, so it fits
   // NUMERIC(4, 4).
   while (!whole.empty() && whole[0] == '0') whole.remove_prefix(1);
-  if (whole.size() + scale > kMaxDecimalPrecision) return std::nullopt;
+  if (whole.size() + scale > kMaxDecimalPrecision) return std::unexpected(DecimalRefusal::TooWide);
   std::int64_t v = 0;
   for (auto ch : whole) v = v * 10 + (ch - '0');
   for (std::uint8_t i = 0; i < scale; ++i) v = v * 10 + (i < frac.size() ? frac[i] - '0' : 0);
@@ -203,21 +196,33 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
     }
     case SqlKind::Decimal: {
       if (l.kind != K::Integer && l.kind != K::Number) bad();
-      auto d = decimal_literal(l.text);
-      if (!d) bad();
-      auto v = scaled_decimal(*d, t.scale);
+      auto v = scaled_decimal(l.text, t.scale);
+      if (!v && v.error() == DecimalRefusal::NotDecimal) bad();
       if (!v || out_of_range(t, *v)) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
       return *v;
     }
-    case SqlKind::Real:
+    case SqlKind::Real: {
+      // Parsed as a float, rounded once as PostgreSQL's float4in rounds:
+      // through a double, a literal near a float midpoint would round twice.
+      // The catalog then holds what a row stores. Overflow and underflow to
+      // zero are out of range, as there.
+      float v = 0;
+      if (l.kind != K::Integer && l.kind != K::Number) bad();
+      auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
+      if (end != l.text.data() + l.text.size()) bad();
+      if (ec == std::errc::result_out_of_range) {
+        throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
+      }
+      if (ec != std::errc{}) bad();
+      return static_cast<double>(v);
+    }
     case SqlKind::Double: {
       double v = 0;
       if (l.kind != K::Integer && l.kind != K::Number) bad();
       auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
       if (ec != std::errc{} || end != l.text.data() + l.text.size()) bad();
       if (out_of_range(t, v)) throw SqlError{"DEFAULT out of range for type " + sql_type_name(t), l.pos};
-      // The catalog holds what a row stores: a REAL default as its float.
-      return t.kind == SqlKind::Real ? float_rounding(v) : v;
+      return v;
     }
     case SqlKind::Boolean:
       if (l.kind != K::Bool) bad();

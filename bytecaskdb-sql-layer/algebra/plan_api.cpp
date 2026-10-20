@@ -848,7 +848,7 @@ auto key_slots(bc_ctx* cx, const Table& t) -> const KeySlots& {
 [[nodiscard]] auto verify(bc_ctx* cx, const bc_schema_ref* ref, Verified& e) -> bool {
   const auto& cat = *cx->cat;
   auto incompatible = [&](const std::string& why) {
-    cx->fail(BC_L_INCOMPATIBLE, "plan compiled against catalog v" + std::to_string(ref->catalog_version) +
+    cx->fail(BC_L_INCOMPATIBLE, "plan for catalog v" + std::to_string(ref->catalog_version) +
                                     " is incompatible with v" + std::to_string(cat.version()) + ": " + why);
     return false;
   };

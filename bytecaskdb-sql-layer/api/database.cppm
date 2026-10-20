@@ -163,6 +163,9 @@ public:
     return live_->current();
   }
 #ifdef BYTECASK_SQL_TESTING
+  // Test only: how many times a cached plan was checked (bc_ctx_check)
+  // against a catalog version it was not compiled or checked against.
+  [[nodiscard]] auto plan_checks_for_testing() const -> std::uint64_t { return plan_checks_; }
   // Test only (sql_layer_testing): every row of a table, in primary-key
   // order, read from the engine and decoded through the catalog: every
   // column, in the table's order. For the proof tests, which compare a table
@@ -200,6 +203,7 @@ private:
   bc_ctx* cx_{nullptr};
   std::map<std::string, std::unique_ptr<Statement>, std::less<>> cache_;
   std::uint64_t compilations_{0};
+  std::uint64_t plan_checks_{0};
   bool closed_{false};
 };
 
@@ -377,8 +381,12 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
   // compiled may have changed what they are (an INTEGER key recreated as
   // BIGINT). The runtime says whether the cached plan still fits the catalog
   // (bc_ctx_check, the verification bc_ctx_run makes); it is recompiled only
-  // if not. The runtime alone decides compatibility.
-  if (stmt.ref_.catalog_version != live_->current()->version()) {
+  // if not. The runtime alone decides compatibility. A plan that fits is
+  // marked with the version it was checked against, so it is checked once
+  // per catalog version, not on every run after a DDL. The runtime pins that
+  // version or a later one: a later one is checked again next time.
+  if (auto version = live_->current()->version(); stmt.ref_.catalog_version != version) {
+    ++plan_checks_;
     bc_ctx_begin(cx_, &bp, {});
     auto fits = bc_ctx_check(cx_, &stmt.ref_);
     auto stale = !fits && bc_error(cx_) == BC_E_LAYOUT && bc_error_detail(cx_) == BC_L_INCOMPATIBLE;
@@ -388,7 +396,11 @@ auto Database::execute(const Statement& cstmt, const std::vector<Value>& params)
       throw e;
     }
     bc_ctx_reset(cx_);
-    if (stale) compile(stmt);
+    if (stale) {
+      compile(stmt);
+    } else {
+      stmt.ref_.catalog_version = version;
+    }
   }
   check_params();
   auto r = bc_execute(cx_, stmt.code_->fn(), &stmt.ref_, &bp, {}, true, kMaxRetries);

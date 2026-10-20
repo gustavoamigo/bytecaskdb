@@ -107,7 +107,7 @@ typedef struct {
    *Compatibility*) on every run; the result layout is the plan's own and
    is not a catalog object. */
 typedef struct {
-  uint64_t catalog_version;                                       /* compiled against; for messages */
+  uint64_t catalog_version;                                       /* compiled or last checked against; for messages */
   const uint32_t   *objects_read;    uint32_t n_read;             /* tables and indexes it names */
   const uint32_t   *tables_written;  uint32_t n_written;          /* tables whose rows it writes */
   const bc_col_ref *cols;            uint32_t n_cols;             /* every column it reads or sets */

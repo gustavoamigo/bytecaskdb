@@ -138,6 +138,19 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
     CHECK(kind(14) == SqlKind::Text);  // VARCHAR without a length
   }
   {
+    // A REAL DEFAULT is rounded once, to float, as PostgreSQL's float4in
+    // rounds. This literal is just above the midpoint between 1 and the next
+    // float, 1 + 2^-23; through a double it would round to the midpoint
+    // itself, then to 1 by ties-to-even.
+    auto b = bind_sql(cat, "CREATE TABLE r (k BIGINT PRIMARY KEY, a REAL DEFAULT 1.00000005960464477539062500000001)");
+    auto& s = std::get<CreateTableDdl>(std::get<Ddl>(b.stmt));
+    CHECK(s.columns[1].default_value == Datum{1.0 + 0x1p-23});
+    CHECK(rejected(cat, "CREATE TABLE r (k BIGINT PRIMARY KEY, a REAL DEFAULT 1e39)").first ==
+          "DEFAULT out of range for type real");
+    CHECK(rejected(cat, "CREATE TABLE r (k BIGINT PRIMARY KEY, a REAL DEFAULT 1e-50)").first ==
+          "DEFAULT out of range for type real");
+  }
+  {
     auto b = bind_sql(cat, "CREATE UNIQUE INDEX u1 ON t (qty DESC, name)");
     auto& s = std::get<CreateIndexDdl>(std::get<Ddl>(b.stmt));
     CHECK(s.unique);

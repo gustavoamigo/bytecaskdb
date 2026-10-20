@@ -169,6 +169,9 @@ public:
 
 private:
   auto set_word(std::uint32_t col_id, PhysType type, std::uint64_t word) -> bool;
+  // Sets the fixed column at layout index i to word: the store set_word and
+  // set_f64 share once each has found the column.
+  void put_word(std::size_t i, std::uint64_t word);
   // The column's index in the layout, if it has one of `type` (any type when nullopt).
   [[nodiscard]] auto index_of(std::uint32_t col_id, std::optional<PhysType> type) const -> std::optional<std::size_t>;
 
@@ -379,11 +382,15 @@ auto RowWriter::index_of(std::uint32_t col_id, std::optional<PhysType> type) con
   return static_cast<std::size_t>(c - layout_->columns.data());
 }
 
+void RowWriter::put_word(std::size_t i, std::uint64_t word) {
+  present_[i] = true;
+  fixed_[i] = word;
+}
+
 auto RowWriter::set_word(std::uint32_t col_id, PhysType type, std::uint64_t word) -> bool {
   auto i = index_of(col_id, type);
   if (!i) return false;
-  present_[*i] = true;
-  fixed_[*i] = word;
+  put_word(*i, word);
   return true;
 }
 
@@ -392,11 +399,14 @@ auto RowWriter::set_i64(std::uint32_t col_id, std::int64_t v) -> bool {
 }
 
 auto RowWriter::set_f64(std::uint32_t col_id, double v) -> bool {
-  // A REAL column stores its float rounding, as PostgreSQL stores a float4:
-  // the one place a row's REAL value is rounded, defaults included.
-  const auto* c = layout_->find(col_id);
-  if (c != nullptr && c->sql.kind == SqlKind::Real) v = float_rounding(v);
-  return set_word(col_id, PhysType::F64, std::bit_cast<std::uint64_t>(v));
+  // A REAL column stores its float rounding, as PostgreSQL stores a float4.
+  // The one place a row's REAL value is rounded: a DEFAULT is parsed as a
+  // float, so the catalog holds it already rounded, and this leaves it as is.
+  auto i = index_of(col_id, PhysType::F64);
+  if (!i) return false;
+  if (layout_->columns[*i].sql.kind == SqlKind::Real) v = float_rounding(v);
+  put_word(*i, std::bit_cast<std::uint64_t>(v));
+  return true;
 }
 
 auto RowWriter::set_bool(std::uint32_t col_id, bool v) -> bool {

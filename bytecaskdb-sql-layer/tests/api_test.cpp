@@ -194,6 +194,27 @@ TEST_CASE("embedded API: parameters are checked against the plan that will run",
   CHECK(db->execute(by_k, {i(3'000'000'000)}).rows == Grid{{i(7)}});
 }
 
+TEST_CASE("embedded API: a cached plan is checked once per catalog version", "[sql][api][catalog]") {
+  sql_test::TempDir dir{"api_plan_checks"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE t (k BIGINT PRIMARY KEY, v BIGINT)");
+  const auto& by_k = db->prepare("SELECT v FROM t WHERE k = $1");
+  (void)db->execute(by_k, {i(1)});
+  CHECK(db->plan_checks_for_testing() == 0);  // compiled against the current version
+  // A DDL on another table moves the version: the plan is checked once, still
+  // fits, and is marked with that version; later runs are not checked.
+  (void)db->execute("CREATE TABLE elsewhere (k BIGINT PRIMARY KEY)");
+  auto compiled = db->compilations();
+  for (int k = 0; k < 3; ++k) (void)db->execute(by_k, {i(1)});
+  CHECK(db->plan_checks_for_testing() == 1);
+  CHECK(db->compilations() == compiled);
+  // Another DDL: one more check.
+  (void)db->execute("DROP TABLE elsewhere");
+  for (int k = 0; k < 3; ++k) (void)db->execute(by_k, {i(1)});
+  CHECK(db->plan_checks_for_testing() == 2);
+  CHECK(db->compilations() == compiled);
+}
+
 TEST_CASE("embedded API: a DOUBLE read through an index keeps -0.0", "[sql][api]") {
   sql_test::TempDir dir{"api_negzero"};
   auto db = Database::open(dir.path());
