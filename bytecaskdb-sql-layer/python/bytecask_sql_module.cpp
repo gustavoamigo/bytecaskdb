@@ -66,10 +66,14 @@ void raise_exec_error(const sql::ExecError& e) {
   exc.attr("code") = e.code();
   exc.attr("constraint") = nb::none();
   exc.attr("object_id") = nb::none();
+  // Both or neither: an object id without a known constraint kind is
+  // nothing a caller can read.
   if (auto c = e.constraint()) {
     auto name = c->name();
-    if (!name.empty()) exc.attr("constraint") = nb::str(name.data(), name.size());
-    exc.attr("object_id") = c->object_id;
+    if (!name.empty()) {
+      exc.attr("constraint") = nb::str(name.data(), name.size());
+      exc.attr("object_id") = c->object_id;
+    }
   }
   PyErr_SetObject(exceptions.exec_error.ptr(), exc.ptr());
 }
@@ -157,7 +161,8 @@ auto to_python(const sql::Rows& r) -> nb::dict {
 
 auto catalog(const sql::Database& db) -> nb::list {
   nb::list tables;
-  for (const auto& [id, t] : db.catalog()->tables()) {
+  auto cat = db.catalog();  // held: tables() is a view into it
+  for (const auto& [id, t] : cat->tables()) {
     nb::list columns;
     for (const auto& c : t.columns) {
       nb::dict col;
@@ -183,9 +188,10 @@ auto catalog(const sql::Database& db) -> nb::list {
 auto execute(sql::Database& db, std::string_view text, const nb::object& params) -> nb::dict {
   // A closed database is Closed whatever the parameters are.
   if (!db.is_open()) throw bytecask::DbClosed();
-  // A str or bytes is a sequence, of characters or ints: never parameters.
-  // A dict or set is not a sequence: its order is not the placeholders'.
-  if (nb::isinstance<nb::str>(params) || nb::isinstance<nb::bytes>(params) ||
+  // A str, or a buffer (bytes, bytearray, memoryview), is a sequence of
+  // characters or ints: never parameters. A dict or set is not a sequence:
+  // its order is not the placeholders'.
+  if (nb::isinstance<nb::str>(params) || PyObject_CheckBuffer(params.ptr()) != 0 ||
       PySequence_Check(params.ptr()) == 0) {
     throw sql::ParamError("params is a sequence of parameters, such as a tuple or list");
   }

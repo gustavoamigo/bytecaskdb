@@ -448,9 +448,9 @@ def test_parameters_and_tables_the_layer_refuses_are_sql_errors(tmp_path):
 def test_closed_and_misused_params(tmp_path):
     db = bytecask_sql.open(str(tmp_path))
     db.execute("CREATE TABLE t (k BIGINT PRIMARY KEY)")
-    # A str or bytes is not a sequence of parameters; a dict or set is not a
-    # sequence; a str with a lone surrogate has no UTF-8.
-    for params in ("1", b"\x01", {1: 1}, {1}, ("\ud800",)):
+    # A str or a buffer is not a sequence of parameters; a dict or set is not
+    # a sequence; a str with a lone surrogate has no UTF-8.
+    for params in ("1", b"\x01", bytearray(b"\x01"), memoryview(b"\x01"), {1: 1}, {1}, ("\ud800",)):
         try:
             db.execute("INSERT INTO t VALUES ($1)", params)
         except bytecask_sql.SqlError:
