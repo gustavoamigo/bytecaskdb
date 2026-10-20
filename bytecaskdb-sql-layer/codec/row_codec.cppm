@@ -215,12 +215,6 @@ struct ColumnRead {
 // Malformed everywhere, never read as 0, empty or NULL. The bytes are a view
 // into `row`: valid while the row is.
 [[nodiscard]] auto row_column(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t pos) -> ColumnRead;
-// row_column's classification without the value, for a null test: the
-// header, the bit, whether the row's regions hold the column and, for a
-// variable column, its own two var_end words (in order, inside the row). It
-// agrees with row_column on every row, and copies nothing.
-[[nodiscard]] auto row_column_state(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t pos)
-    -> ColumnState;
 [[nodiscard]] inline auto row_column(BytesView row, const ColumnSlot& col) -> ColumnRead {
   return row_column(row, col.col_id, col.type, col.pos);
 }
@@ -551,8 +545,9 @@ auto row_generation(BytesView row) -> std::uint16_t {
 }
 
 namespace {
-// The header, if the row's regions hold a present column; otherwise why
-// not, Absent or Malformed. What row_column and row_column_state share.
+// row_column's two checks before it reads a value. The header, if the
+// row's regions hold a present column; otherwise why not, Absent or
+// Malformed.
 auto locate(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t pos)
     -> std::expected<Header, ColumnState> {
   auto h = header(row);
@@ -569,12 +564,11 @@ auto locate(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t po
   if (!held) return std::unexpected(ColumnState::Malformed);
   return *h;
 }
-}  // namespace
 
-namespace {
 // A held variable column's bytes, as offsets into the row: its two var_end
 // words, in order and inside the row; nullopt otherwise (Malformed).
-auto var_bounds(BytesView row, const Header& h, std::uint32_t pos) -> std::optional<std::pair<std::size_t, std::size_t>> {
+auto var_bounds(BytesView row, const Header& h, std::uint32_t pos)
+    -> std::optional<std::pair<std::size_t, std::size_t>> {
   auto data = h.var_data();
   auto begin = pos == 0 ? 0u : load_u32(row, h.var_table + 4 * std::size_t{pos - 1});
   auto end = load_u32(row, h.var_table + 4 * std::size_t{pos});
@@ -582,13 +576,6 @@ auto var_bounds(BytesView row, const Header& h, std::uint32_t pos) -> std::optio
   return std::pair{data + begin, data + end};
 }
 }  // namespace
-
-auto row_column_state(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t pos) -> ColumnState {
-  auto h = locate(row, col_id, type, pos);
-  if (!h) return h.error();
-  if (type == PhysType::Bytes && !var_bounds(row, *h, pos)) return ColumnState::Malformed;
-  return ColumnState::Value;
-}
 
 auto row_column(BytesView row, std::uint32_t col_id, PhysType type, std::uint32_t pos) -> ColumnRead {
   auto h = locate(row, col_id, type, pos);

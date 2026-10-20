@@ -6,8 +6,8 @@
 // plan_api_symbols(): no libc, no other symbol of the process. libtcc.h is
 // in this unit's global module fragment, which no importer sees.
 //
-// prototype: the run-time tier of #493, without the checker that must run
-// before it.
+// prototype: the run-time tier of #493. It loads only the compiler's plans
+// (the only plans supported), so no checker runs before it.
 
 module;
 #include <chrono>

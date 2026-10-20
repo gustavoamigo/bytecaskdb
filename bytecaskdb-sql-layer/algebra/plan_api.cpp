@@ -646,21 +646,6 @@ auto resolve_range(bc_ctx* cx, std::uint32_t table_or_index, bc_view lo, bc_view
 }
 
 // Appends parameter `i` as a key part: its value, or the null part for NULL.
-// A key value outside the declared type of the column its part is: refused
-// with BC_E_CONSTRAINT, BC_C_RANGE and the table's id, as a value written
-// is, against the column's type without its modifier (param_type): a
-// lookup's or a bound's $n is typed as PostgreSQL types it, so 1e39 for a
-// REAL or 3000000000 for an INTEGER is refused, not rounded or wrapped.
-template <typename V>
-[[nodiscard]] auto key_in_range(bc_ctx* cx, const KeyLayout& kl, std::size_t p, const V& v) -> bool {
-  const auto* c = kl.columns.at(p);
-  auto why = bytecask::sql::out_of_range(bytecask::sql::param_type(c->sql), v);
-  if (!why) return true;
-  cx->raise(BC_C_RANGE, kl.table->id,
-            *why + " for key column \"" + c->name + "\" of table \"" + kl.table->name + "\"");
-  return false;
-}
-
 [[nodiscard]] auto put_param_part(bc_ctx* cx, Bytes& buf, const KeyLayout& kl, std::size_t p, std::uint32_t i)
     -> bool {
   auto part = kl.parts[p];
@@ -678,7 +663,6 @@ template <typename V>
     cx->fail(BC_E_HANDLE, "parameter $" + std::to_string(i + 1) + " is not " + type_name(part.type));
     return false;
   }
-  if (!key_in_range(cx, kl, p, *d)) return false;
   switch (part.type) {
     case PhysType::I64: bytecask::sql::key_put_i64(buf, std::get<std::int64_t>(*d), part); break;
     case PhysType::F64: bytecask::sql::key_put_f64(buf, std::get<double>(*d), part); break;
@@ -1684,18 +1668,14 @@ bc_key bc_key_begin(bc_ctx* cx, uint32_t table_or_index) {
 void bc_key_i64(bc_ctx* cx, bc_key k, int64_t v) {
   BC_GUARD_BEGIN
   auto* b = key_builder_part(cx, k, PhysType::I64, false);
-  if (b != nullptr && key_in_range(cx, *b->layout, b->next_part - 1, v)) {
-    bytecask::sql::key_put_i64(b->buf, v, current_part(*b));
-  }
+  if (b != nullptr) bytecask::sql::key_put_i64(b->buf, v, current_part(*b));
   BC_GUARD_END(cx)
 }
 
 void bc_key_f64(bc_ctx* cx, bc_key k, double v) {
   BC_GUARD_BEGIN
   auto* b = key_builder_part(cx, k, PhysType::F64, false);
-  if (b != nullptr && key_in_range(cx, *b->layout, b->next_part - 1, v)) {
-    bytecask::sql::key_put_f64(b->buf, v, current_part(*b));
-  }
+  if (b != nullptr) bytecask::sql::key_put_f64(b->buf, v, current_part(*b));
   BC_GUARD_END(cx)
 }
 
@@ -1711,9 +1691,7 @@ void bc_key_bytes(bc_ctx* cx, bc_key k, bc_view v) {
   auto bytes = cx->resolve(v);
   if (!bytes) return;
   auto* b = key_builder_part(cx, k, PhysType::Bytes, false);
-  if (b != nullptr && key_in_range(cx, *b->layout, b->next_part - 1, *bytes)) {
-    bytecask::sql::key_put_bytes(b->buf, *bytes, current_part(*b));
-  }
+  if (b != nullptr) bytecask::sql::key_put_bytes(b->buf, *bytes, current_part(*b));
   BC_GUARD_END(cx)
 }
 
@@ -1981,9 +1959,8 @@ bool bc_col_null(bc_ctx* cx, bc_view row, uint32_t col) {
   BC_GUARD_BEGIN
   auto rc = row_col(cx, row, col, std::nullopt);
   if (!rc) return true;
-  // Classified as row_column classifies it, damage included, without
-  // copying the value: a plan tests null before a typed read.
-  switch (bytecask::sql::row_column_state(rc->row, col, rc->slot->type, rc->slot->pos)) {
+  // The one decoder's verdict, damage included: the value is a view, not a copy.
+  switch (bytecask::sql::row_column(rc->row, col, rc->slot->type, rc->slot->pos).state) {
     case bytecask::sql::ColumnState::Absent: return true;
     case bytecask::sql::ColumnState::Value: return false;
     case bytecask::sql::ColumnState::Malformed: fail_malformed(cx, col); return true;
@@ -2046,22 +2023,31 @@ namespace {
 // in set_datum or copy_from), leaves no half-built row behind.
 class PushedBuilder {
 public:
-  PushedBuilder(bc_ctx* cx, const Table& t) : cx_{cx} {
+  PushedBuilder(bc_ctx* cx, const Table& t) : cx_{cx}, i_{cx->rows.size()} {
     cx_->rows.push_back(RowBuilder{t.id, &t.layout, RowWriter{t.layout}, false});
   }
   PushedBuilder(const PushedBuilder&) = delete;
   auto operator=(const PushedBuilder&) -> PushedBuilder& = delete;
   ~PushedBuilder() {
-    if (!kept_) cx_->rows.pop_back();
+    if (kept_) return;
+    if (cx_->rows.size() == i_ + 1) {
+      cx_->rows.pop_back();
+      return;
+    }
+    // Filling the builder pushed a row after it: a runtime bug. No row that
+    // is not the builder's is removed; the run is refused instead, with the
+    // sticky code alone: a message could fail to allocate while unwinding.
+    if (cx_->error == BC_OK) cx_->error = BC_E_HANDLE;
   }
-  auto writer() -> RowWriter& { return cx_->rows.back().writer; }
+  auto writer() -> RowWriter& { return cx_->rows[i_].writer; }
   auto keep() -> bc_row {
     kept_ = true;
-    return {static_cast<std::uint32_t>(cx_->rows.size() - 1), cx_->epoch};
+    return {static_cast<std::uint32_t>(i_), cx_->epoch};
   }
 
 private:
   bc_ctx* cx_;
+  std::size_t i_;  // the builder's index in cx->rows
   bool kept_{false};
 };
 }  // namespace

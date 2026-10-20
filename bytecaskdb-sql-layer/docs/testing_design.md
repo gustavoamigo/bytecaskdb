@@ -101,5 +101,15 @@ Found so far. The machine expects each one, so it does not fail on them.
   22001; checked on 16.15). A DEFAULT that is not UTF-8 never reaches
   either: PostgreSQL refuses the statement's text (22021). The machine's
   defaults stay inside their types.
+- **A parameter compared with columns of two SQL types is refused.**
+  `WHERE a = $1 AND b = $1`, with `a DOUBLE PRECISION` and `b REAL`,
+  `INTEGER` and `BIGINT`, or `DECIMAL`s of two scales, is refused at bind:
+  a compared parameter has one SQL type, checked before the plan runs.
+  PostgreSQL runs it, comparing each column with the parameter's value
+  in a common type. A range check per comparison would not close the
+  difference: with `$1 = 0.1`, PostgreSQL compares `real::float8 = 0.1`,
+  false, where a `REAL` key part keyed as the float of 0.1 matches. The
+  machine gives each compared column its own parameter
+  (`test_a_parameter_compared_with_two_types_is_refused`).
 - **DML takes no literals:** values are parameters (`$1`). The machine's
   statements use parameters on both sides.

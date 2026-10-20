@@ -266,15 +266,37 @@ public:
     return c;
   }
 
-  // Gives parameter $n+1 a type; a second use must agree with the first.
-  void use_param(std::uint32_t n, PhysType t, std::int32_t pos) {
-    if (types_.size() <= n) types_.resize(n + 1);
-    if (types_[n] && *types_[n] != t) {
-      throw SqlError{"parameter $" + std::to_string(n + 1) + " used as both " + type_name(*types_[n]) + " and " +
+  // What a compared parameter is compared as: its column's type without
+  // its modifier, except that a DECIMAL keeps its scale, which says what
+  // number one scaled i64 is.
+  static auto compared_as(SqlType t) -> SqlType {
+    return t.kind == SqlKind::Decimal ? SqlType{SqlKind::Decimal, 0, 0, t.scale} : param_type(t);
+  }
+
+  // Gives parameter $n+1 a type, physical and, when a WHERE compares it with
+  // `compared`, SQL; a second use must agree with the first. A compared $n
+  // has one SQL type, what the pre-plan range check checks: compared with
+  // columns of two types that share a physical type (DOUBLE PRECISION and
+  // REAL, INTEGER and BIGINT, DECIMALs of two scales), one value could be
+  // keyed as two numbers. Refused, where PostgreSQL runs it
+  // (docs/testing_design.md, *Known differences*).
+  void use_param(std::uint32_t n, PhysType t, std::int32_t pos, const Column* compared = nullptr) {
+    if (params_.size() <= n) params_.resize(n + 1);
+    auto& p = params_[n];
+    if (p.phys && *p.phys != t) {
+      throw SqlError{"parameter $" + std::to_string(n + 1) + " used as both " + type_name(*p.phys) + " and " +
                          type_name(t),
                      pos};
     }
-    types_[n] = t;
+    p.phys = t;
+    if (compared == nullptr) return;
+    if (p.compared != nullptr && compared_as(p.compared->sql) != compared_as(compared->sql)) {
+      auto named = [](const Column& c) { return c.name + " (" + sql_type_name(c.sql) + ")"; };
+      throw SqlError{"parameter $" + std::to_string(n + 1) + " is compared with " + named(*p.compared) + " and " +
+                         named(*compared),
+                     pos};
+    }
+    if (p.compared == nullptr) p.compared = compared;
   }
 
   // An expression whose type is fixed by its target (an assigned column).
@@ -323,9 +345,7 @@ public:
         throw SqlError{"WHERE must compare a column with a parameter", w.pos};
       }
       const auto* c = column(t, col->column, col->pos);
-      use_param(param->param, c->type, param->pos);
-      if (sql_.size() <= param->param) sql_.resize(param->param + 1);
-      if (!sql_[param->param]) sql_[param->param] = param_type(c->sql);  // the first comparison types it
+      use_param(param->param, c->type, param->pos, c);
       out.push_back(Compare{op, c->id, param->param});
     }
     return out;
@@ -334,23 +354,32 @@ public:
   // Every parameter from $1 to the highest used must have a type.
   auto param_types(std::int32_t pos) const -> std::vector<PhysType> {
     std::vector<PhysType> out;
-    for (std::size_t i = 0; i < types_.size(); ++i) {
-      if (!types_[i]) throw SqlError{"could not determine data type of parameter $" + std::to_string(i + 1), pos};
-      out.push_back(*types_[i]);
+    for (std::size_t i = 0; i < params_.size(); ++i) {
+      if (!params_[i].phys) throw SqlError{"could not determine data type of parameter $" + std::to_string(i + 1), pos};
+      out.push_back(*params_[i].phys);
     }
     return out;
   }
 
+  // For each parameter a WHERE compares, its column's type without the
+  // modifier (param_type): what the pre-plan range check checks it against.
   auto param_sql() const -> std::vector<std::optional<SqlType>> {
-    auto out = sql_;
-    out.resize(types_.size());
+    std::vector<std::optional<SqlType>> out;
+    for (const auto& p : params_) {
+      out.push_back(p.compared == nullptr ? std::nullopt : std::optional{param_type(p.compared->sql)});
+    }
     return out;
   }
 
 private:
+  // A parameter's type from its uses: physical from every use, and the
+  // first column a WHERE compares it with.
+  struct ParamUse {
+    std::optional<PhysType> phys;
+    const Column* compared{nullptr};
+  };
   const Catalog& cat_;
-  std::vector<std::optional<PhysType>> types_;
-  std::vector<std::optional<SqlType>> sql_;
+  std::vector<ParamUse> params_;
 };
 
 }  // namespace

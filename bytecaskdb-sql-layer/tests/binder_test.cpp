@@ -98,6 +98,31 @@ TEST_CASE("binder: anything outside the scope is rejected with a message and pos
   CHECK(rejected(cat, "SELECT nope FROM t WHERE id = $1") == std::pair<std::string, std::int32_t>{
                                                                    "column \"nope\" does not exist", 7});
   CHECK(rejected(cat, "SELECT id FROM t WHERE name = $1 AND qty = $1").second == 43);  // $1 bytea, then bigint
+  {
+    // One $n compared with two columns of one physical type but two SQL
+    // types: refused, so its pre-plan range check covers every key it builds.
+    sql_test::Fixture c2;
+    c2.ddl(std::get<Ddl>(bind_sql(c2.cat(), "CREATE TABLE dr (a DOUBLE PRECISION, b REAL, i INTEGER, j BIGINT, "
+                                            "v VARCHAR(4), w TEXT, d2 NUMERIC(10, 2), d4 NUMERIC(10, 4), "
+                                            "e2 NUMERIC(12, 2), PRIMARY KEY (a, b))")
+                             .stmt));
+    auto refusal = [&](std::string_view where) {
+      return rejected(c2.cat(), "SELECT a FROM dr WHERE " + std::string(where)).first;
+    };
+    CHECK(refusal("a = $1 AND b = $1") == "parameter $1 is compared with a (double precision) and b (real)");
+    CHECK(refusal("a = $1 AND b = $2 AND i = $3 AND j = $3") ==
+          "parameter $3 is compared with i (integer) and j (bigint)");
+    // A DECIMAL's scale says what number its i64 is: two scales, or a
+    // DECIMAL and an integer, are two types.
+    CHECK(refusal("a = $1 AND b = $2 AND d2 = $3 AND d4 = $3") ==
+          "parameter $3 is compared with d2 (numeric(10,2)) and d4 (numeric(10,4))");
+    CHECK(refusal("a = $1 AND b = $2 AND d2 = $3 AND j = $3") ==
+          "parameter $3 is compared with d2 (numeric(10,2)) and j (bigint)");
+    // A modifier is no other type: VARCHAR(4) and TEXT, or DECIMAL(10, 2)
+    // and DECIMAL(12, 2), compare one $n.
+    CHECK_NOTHROW(bind_sql(c2.cat(), "SELECT a FROM dr WHERE a = $1 AND b = $2 AND d2 = $3 AND e2 = $3"));
+    CHECK_NOTHROW(bind_sql(c2.cat(), "SELECT a FROM dr WHERE a = $1 AND b = $2 AND v = $3 AND w = $3"));
+  }
   CHECK(rejected(cat, "SELECT id FROM t WHERE id = $2").first ==
         "could not determine data type of parameter $1");
   CHECK(rejected(cat, "UPDATE t SET name = name - $1 WHERE id = $2").first == "operator - is only defined on bigint");

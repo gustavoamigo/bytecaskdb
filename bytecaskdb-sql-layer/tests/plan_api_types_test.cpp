@@ -60,6 +60,17 @@ auto run(Fixture& f, bc_plan_fn plan, std::vector<bc_value> p, std::span<const P
 
 auto bits(double d) -> std::uint64_t { return std::bit_cast<std::uint64_t>(d); }
 
+// Where a row's var_end table starts: the header's var_table, bytes 4 and 5.
+auto var_table_of(const Bytes& row) -> std::size_t {
+  return std::to_integer<std::size_t>(row[4]) | (std::to_integer<std::size_t>(row[5]) << 8);
+}
+
+// Runs `plan` with $1 = 1 and expects it to fail on damaged data.
+void expect_corrupt(Fixture& f, bc_plan_fn plan, std::span<const PhysType> result = {}) {
+  CHECK(run(f, plan, {std::int64_t{1}}, result) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CORRUPT);
+}
+
 void insert_t(bc_ctx* cx) {
   bc_row rb = bc_row_begin(cx, kTbl);
   bc_row_set_i64(cx, rb, kIdCol, bc_param_i64(cx, 0));
@@ -747,18 +758,15 @@ TEST_CASE("plan API: a stored row that does not parse is BC_E_CORRUPT, never NUL
   auto bad = good;
   bad.push_back(std::byte{0});
   f.db->put({}, key, bad);
-  CHECK(run(f, read_qty, {std::int64_t{1}}) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_CORRUPT);
-  CHECK(run(f, slot_of_row, {std::int64_t{1}}) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_CORRUPT);
+  expect_corrupt(f, read_qty);
+  expect_corrupt(f, slot_of_row);
   // A header that parses with a var_end entry past the row.
   auto bad_var = good;
-  auto var_table = std::to_integer<std::size_t>(good[4]) | (std::to_integer<std::size_t>(good[5]) << 8);
+  auto var_table = var_table_of(good);
   bad_var[var_table] = std::byte{0xFF};
   bad_var[var_table + 1] = std::byte{0xFF};
   f.db->put({}, key, bad_var);
-  CHECK(run(f, slot_of_row, {std::int64_t{1}}) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_CORRUPT);
+  expect_corrupt(f, slot_of_row);
   // The empty view is no row: a plan bug.
   CHECK(run(f, null_of_empty, {}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
@@ -805,18 +813,15 @@ TEST_CASE("plan API: bc_row_key and bc_row_from report a damaged row as BC_E_COR
   auto bad = good;
   bad.push_back(std::byte{0});  // row_bytes no longer matches the length
   f.db->put({}, key, bad);
-  CHECK(run(f, row_key_of_get, {std::int64_t{1}}) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_CORRUPT);
-  CHECK(run(f, row_from_get, {std::int64_t{1}}) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_CORRUPT);
+  expect_corrupt(f, row_key_of_get);
+  expect_corrupt(f, row_from_get);
   // A header that parses with a var_end past the row: row_from's full check.
   auto bad_var = good;
-  auto var_table = std::to_integer<std::size_t>(good[4]) | (std::to_integer<std::size_t>(good[5]) << 8);
+  auto var_table = var_table_of(good);
   bad_var[var_table] = std::byte{0xFF};
   bad_var[var_table + 1] = std::byte{0xFF};
   f.db->put({}, key, bad_var);
-  CHECK(run(f, row_from_get, {std::int64_t{1}}) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_CORRUPT);
+  expect_corrupt(f, row_from_get);
 }
 
 namespace {
@@ -865,32 +870,70 @@ TEST_CASE("plan API: a present column the row does not hold is BC_E_CORRUPT, nev
   bytecask::sql::key_put_i64(key, 1, {PhysType::I64});
   Bytes good;
   REQUIRE(f.db->get({}, key, good));
-  auto expect_corrupt = [&](bc_plan_fn plan, std::span<const PhysType> result = {}) {
-    CHECK(run(f, plan, {std::int64_t{1}}, result) == BC_FAILED);
-    CHECK(bc_error(f.cx) == BC_E_CORRUPT);
-  };
   // x's present bit set: the row predates x, so it lies past the fixed region.
   auto bad = good;
   bad[bytecask::sql::kRowHeaderBytes + kXAdded / 8] |= std::byte{1} << (kXAdded % 8);
   f.db->put({}, key, bad);
-  expect_corrupt(x_null);
-  expect_corrupt(x_value);
-  expect_corrupt(emit_x, kI64Row);
-  expect_corrupt(row_from_get);
+  expect_corrupt(f, x_null);
+  expect_corrupt(f, x_value);
+  expect_corrupt(f, emit_x, kI64Row);
+  expect_corrupt(f, row_from_get);
   // y's present bit set: its slot is past the row's var_end table.
   bad = good;
   bad[bytecask::sql::kRowHeaderBytes + kYAdded / 8] |= std::byte{1} << (kYAdded % 8);
   f.db->put({}, key, bad);
-  expect_corrupt(y_bytes);
+  expect_corrupt(f, y_bytes);
   // A present variable column whose var_end runs past the row.
   bad = good;
-  auto var_table = std::to_integer<std::size_t>(good[4]) | (std::to_integer<std::size_t>(good[5]) << 8);
+  auto var_table = var_table_of(good);
   bad[var_table] = std::byte{0xFF};
   bad[var_table + 1] = std::byte{0xFF};
   f.db->put({}, key, bad);
-  expect_corrupt(name_null);
-  expect_corrupt(emit_name, std::array{PhysType::Bytes});
-  expect_corrupt(slot_of_row);
+  expect_corrupt(f, name_null);
+  expect_corrupt(f, emit_name, std::array{PhysType::Bytes});
+  expect_corrupt(f, slot_of_row);
+}
+
+namespace {
+// A table of two variable columns, so the second's slot has a begin: its
+// ids, set by the test that creates it.
+std::uint32_t g_two = 0, g_two_b = 0;
+auto get_two(bc_ctx* cx) -> bc_view {
+  bool found = false;
+  return bc_get(cx, bc_key_params(cx, g_two, 0, 1), &found);
+}
+void two_b_null(bc_ctx* cx) { bc_emit_count(cx, bc_col_null(cx, get_two(cx), g_two_b) ? 1 : 0); }
+void two_b_bytes(bc_ctx* cx) { bc_col_bytes(cx, get_two(cx), g_two_b); }
+}  // namespace
+
+TEST_CASE("plan API: a variable column whose var_end words are out of order is BC_E_CORRUPT", "[sql][algebra]") {
+  Fixture f;
+  f.ddl(bytecask::sql::CreateTableDdl{
+      "two", {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::Bytes, true),
+              Fixture::col("b", PhysType::Bytes, true)},
+      {"k"}});
+  auto cat = f.live->current();  // held: two points into it
+  const auto& two = *cat->table("two");
+  g_two = two.id;
+  g_two_b = two.column("b")->id;
+  bytecask::sql::RowWriter w{two.layout};
+  REQUIRE(w.set_i64(two.column("k")->id, 1));
+  REQUIRE(w.set_bytes(two.column("a")->id, bytes("aaaa")));
+  REQUIRE(w.set_bytes(g_two_b, bytes("bb")));
+  Bytes row, key;
+  REQUIRE(w.finish(row));
+  REQUIRE(bytecask::sql::encode_pk_from_row(two, row, key));
+  f.db->put({}, key, row);
+  CHECK(value(f, two_b_null, {std::int64_t{1}}) == 0);
+
+  // b's end below a's: both words inside the row, out of order.
+  REQUIRE(two.layout.find(g_two_b)->pos == 1);
+  auto var_table = var_table_of(row);
+  row[var_table + 4] = std::byte{1};
+  for (std::size_t i = 1; i < 4; ++i) row[var_table + 4 + i] = std::byte{0};
+  f.db->put({}, key, row);
+  expect_corrupt(f, two_b_null);
+  expect_corrupt(f, two_b_bytes);
 }
 
 TEST_CASE("plan API: a charge of several units does not step over the deadline check", "[sql][algebra]") {

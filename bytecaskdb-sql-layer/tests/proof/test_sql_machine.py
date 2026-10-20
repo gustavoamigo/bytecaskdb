@@ -463,6 +463,23 @@ def test_a_key_outside_its_type_is_refused(dsn):
         m.teardown()
 
 
+def test_a_parameter_compared_with_two_types_is_refused(dsn):
+    # Known difference. PostgreSQL gets the value as two float8 parameters
+    # (pg_params gives each $1 its own %s) and returns no row; the layer
+    # refuses a $n compared with columns of two SQL types, where it would
+    # have keyed 1e39 for the REAL column as infinity and returned the inf row.
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.DOUBLE), Column("c1", o.REAL)], ["c0", "c1"]))
+        assert m.insert("t0", {"c0": 1e39, "c1": float("inf")}, all_columns=False).error is None
+        sql = "SELECT c0 FROM t0 WHERE c0 = $1 AND c1 = $1"
+        assert o.run_pg(m.pg.conn, sql, (1e39,)).rows == ()
+        assert o.run_layer(m.db, sql, (1e39,)).error == "refused"
+        m.check()
+    finally:
+        m.teardown()
+
+
 def test_two_primary_keys_are_refused(dsn):
     m = fixed(dsn)
     try:

@@ -228,9 +228,6 @@ struct KeyLayout {
   const Index* index;          // nullptr for a table's primary key
   std::vector<KeyPart> parts;  // every part: index columns, then primary key
   std::size_t index_parts;     // how many of them precede the primary key
-  // Each part's column, in parts' order: its declared type is what a key
-  // value is checked against. Points into `table`, which outlives the layout.
-  std::vector<const Column*> columns;
 };
 
 // The stage-1 DDL statements, as values: what LiveCatalog prepares.
@@ -1213,23 +1210,17 @@ void Catalog::rebuild_lookups() {
     name_taken(t.name);
     names_[t.name] = id;
     std::vector<KeyPart> pk_parts;
-    std::vector<const Column*> pk_columns;
-    for (auto cid : t.pk_col_ids) {
-      pk_columns.push_back(t.column(cid));
-      pk_parts.push_back(key_part(*pk_columns.back()));
-    }
-    key_layouts_[id] = KeyLayout{kNsRow, &t, nullptr, pk_parts, 0, pk_columns};
+    for (auto cid : t.pk_col_ids) pk_parts.push_back(key_part(*t.column(cid)));
+    key_layouts_[id] = KeyLayout{kNsRow, &t, nullptr, pk_parts, 0};
     for (const auto& ix : t.indexes) {
       name_taken(ix.name);
       names_[ix.name] = ix.id;
-      KeyLayout kl{kNsIndex, &t, &ix, {}, ix.parts.size(), {}};
+      KeyLayout kl{kNsIndex, &t, &ix, {}, ix.parts.size()};
       for (const auto& p : ix.parts) {
         const auto* c = t.column(p.col_id);
         kl.parts.push_back(key_part(*c, c->nullable, p.desc));
-        kl.columns.push_back(c);
       }
       kl.parts.insert(kl.parts.end(), pk_parts.begin(), pk_parts.end());
-      kl.columns.insert(kl.columns.end(), pk_columns.begin(), pk_columns.end());
       key_layouts_[ix.id] = std::move(kl);
     }
   }

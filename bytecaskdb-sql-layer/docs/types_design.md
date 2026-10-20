@@ -59,7 +59,10 @@ at `CREATE TABLE` and `ADD COLUMN`. Reads trust the row.
 **A compared parameter is typed by its column, as PostgreSQL types a
 `$n`.** A parameter a `WHERE` compares with a column takes that column's
 type without its modifier: `VARCHAR(n)` as `TEXT`, `DECIMAL(p, s)`
-unbounded. It is checked against that type before the plan runs, so a
+unbounded. It has one such type: a parameter compared with columns of two
+(`DOUBLE PRECISION` and `REAL`, `INTEGER` and `BIGINT`, `DECIMAL`s of two
+scales, whose one scaled integer would be two numbers) is refused at bind,
+where PostgreSQL runs it, since one value could be keyed as two. It is checked against that type before the plan runs, so a
 value outside it is `BC_C_RANGE` whether or not the plan would read it (a
 key whose other part is NULL): 
 `3000000000` for an `INTEGER` key or bound, `1e39` or `1e-50` for a `REAL`,
@@ -67,9 +70,9 @@ text that is not UTF-8. It is never wrapped, rounded to a neighbour, or
 taken to find nothing. A modifier is checked only on a write: a `VARCHAR(2)`
 key compared with `'abc'` finds nothing, as in PostgreSQL. A parameter only
 assigned (`INSERT`, `SET`) is checked by the row builder, in column order,
-as PostgreSQL's assignment checks the values a driver sends typed. The plan API
-checks a key value the same way where it is built (`bc_key_*`, against the
-column its key part is), for plans not compiled from SQL. `NOT NULL` is checked when the row ends, after these, so a row
+as PostgreSQL's assignment checks the values a driver sends typed. Only the
+compiler's plans run, so the plan API does not check a key value again where
+it is built (`bc_key_*`). `NOT NULL` is checked when the row ends, after these, so a row
 holding both reports the range, as PostgreSQL does. A `VARCHAR(n)` value
 whose excess is only spaces is refused, where PostgreSQL truncates it.
 
@@ -329,9 +332,9 @@ new column.
 position; a column whose bit is clear is null, whether the writer set it
 null or did not know the column. That second case is what makes short rows
 work: a row written before a column was added has the column's bit clear
-and reads as null with no further test. `bc_col_null(row, col)` is the bit,
-and the position argument revision 2 of the plan API added to it is not
-needed; `docs/plan_api_design.md` is updated accordingly. One decoder,
+and reads as null with no further test. `bc_col_null(row, col)` answers from
+the bit, once the column is known not to be damaged (below), and the
+position argument revision 2 of the plan API added to it is not needed; `docs/plan_api_design.md` is updated accordingly. One decoder,
 `row_column`, reads every column of a stored row, and says it is absent, a
 value, or malformed. Absent is a clear bit, or no bit: NULL. Malformed is a
 header that does not parse, or a set bit for a column the row does not
