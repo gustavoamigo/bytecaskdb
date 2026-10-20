@@ -264,6 +264,19 @@ void PluginTestHarness::begin_stmt() {
   txn_ = static_cast<MariaDBTxn *>(thd_get_ha_data(&thd_, &hton_));
 }
 
+std::vector<uchar> PluginTestHarness::pk_key(
+    const std::vector<int32_t> &column_values) {
+  std::vector<uchar> buf(share_.reclength, 0);
+  fill_record(buf.data(), column_values);
+  auto key = encode_pk(&table_, make_table_codec(&table_, kKeyFormatCurrent),
+                       buf.data(), table_id_);
+  // fill_record pointed the fields at buf; point them back.
+  for (uint i = 0; i < fields_.size(); ++i) {
+    fields_[i]->ptr = record_buf_.data() + share_.null_bytes + i * 4;
+  }
+  return {key.begin(), key.end()};
+}
+
 void PluginTestHarness::inject_concurrent_write(
     const std::vector<int32_t> &column_values) {
   // Fill a temporary record buffer with the given values.

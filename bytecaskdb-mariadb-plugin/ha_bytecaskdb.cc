@@ -614,10 +614,13 @@ int ha_bytecaskdb::write_row(const uchar *buf) {
   // monotonic), so skip the dup check there. For PK tables, eager dup check
   // unless deferred (buffer-only probe catches same-statement duplicates).
   if (!no_pk) {
-    const bool dup = defer_dup
-                         ? txn->buffered_key_present(key.data(), key.size())
-                         : txn->exists(key.data(), key.size());
-    if (dup) {
+    const int dup = defer_dup
+                        ? (txn->buffered_key_present(key.data(), key.size()) ? 1 : 0)
+                        : txn->exists(key.data(), key.size());
+    // A failed read is an engine error, never "absent": the row would be
+    // overwritten (#524).
+    if (dup < 0) { return HA_ERR_INTERNAL_ERROR; }
+    if (dup > 0) {
       errkey = saved_errkey_ = table->s->primary_key;
       return HA_ERR_FOUND_DUPP_KEY;
     }
@@ -722,9 +725,13 @@ int ha_bytecaskdb::bulk_copy_write_row(const uchar *buf) {
   auto &val = encode_row_buf_;
   encode_row_into(val, codec_.row, buf, schema_version_);
 
-  if (!no_pk && txn->bulk_pk_exists(key.data(), key.size())) {
-    errkey = saved_errkey_ = table->s->primary_key;
-    return HA_ERR_FOUND_DUPP_KEY;
+  if (!no_pk) {
+    const int dup = txn->bulk_pk_exists(key.data(), key.size());
+    if (dup < 0) { return HA_ERR_INTERNAL_ERROR; }  // never "absent" (#524)
+    if (dup > 0) {
+      errkey = saved_errkey_ = table->s->primary_key;
+      return HA_ERR_FOUND_DUPP_KEY;
+    }
   }
 
   if (!indexes_.empty()) {
@@ -741,8 +748,10 @@ int ha_bytecaskdb::bulk_copy_write_row(const uchar *buf) {
       auto &unique_prefix = encode_unique_sec_key_buf_;
       encode_unique_sec_key_into(unique_prefix, table, codec_, buf, table_id_,
                                  index.index_id, index.index_id);
-      if (txn->bulk_unique_prefix_exists(unique_prefix.data(),
-                                         unique_prefix.size())) {
+      const int dup = txn->bulk_unique_prefix_exists(unique_prefix.data(),
+                                                     unique_prefix.size());
+      if (dup < 0) { return HA_ERR_INTERNAL_ERROR; }  // never "absent" (#524)
+      if (dup > 0) {
         errkey = saved_errkey_ = static_cast<uint>(index.index_id);
         return HA_ERR_FOUND_DUPP_KEY;
       }
@@ -927,7 +936,9 @@ int ha_bytecaskdb::update_row(const uchar *old_data, const uchar *new_data) {
                     new_val.data(), new_val.size());
   } else {
     // PK changed — dup check new pk, delete old, insert new.
-    if (txn->exists(new_pk.data(), new_pk.size())) {
+    const int dup = txn->exists(new_pk.data(), new_pk.size());
+    if (dup < 0) { return HA_ERR_INTERNAL_ERROR; }  // never "absent" (#524)
+    if (dup > 0) {
       return HA_ERR_FOUND_DUPP_KEY;
     }
     txn->buffer_del(old_pk.data(), old_pk.size());
@@ -1052,7 +1063,8 @@ int ha_bytecaskdb::check(THD * /*thd*/, HA_CHECK_OPT * /*check_opt*/) {
       }
       auto sec_key = encode_sec_key(table, codec_, buf, table_id_,
                                      index.index_id, index.index_id, rowid);
-      if (!txn->exists(sec_key.data(), sec_key.size())) {
+      // Missing or unreadable: either is damage CHECK TABLE reports.
+      if (txn->exists(sec_key.data(), sec_key.size()) != 1) {
         corrupt = true;
         break;
       }

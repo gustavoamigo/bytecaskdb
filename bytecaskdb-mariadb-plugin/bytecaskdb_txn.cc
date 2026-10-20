@@ -126,23 +126,23 @@ int MariaDBTxn::get(const uint8_t *key, size_t klen, bytecask::Bytes &out) {
   }
 }
 
-bool MariaDBTxn::exists(const uint8_t *key, size_t klen) {
+int MariaDBTxn::exists(const uint8_t *key, size_t klen) {
   if (!lookup_.empty()) {
     std::vector<uint8_t> k(key, key + klen);
     auto it = lookup_.find(k);
     if (it != lookup_.end()) {
-      return it->second.has_value();
+      return it->second.has_value() ? 1 : 0;
     }
   }
 
   ensure_snapshot();
   try {
     if (snap_) {
-      return snap_->contains_key(plugin_read_options(), as_view(key, klen));
+      return snap_->contains_key(plugin_read_options(), as_view(key, klen)) ? 1 : 0;
     }
-    return db_->contains_key(plugin_read_options(), as_view(key, klen));
+    return db_->contains_key(plugin_read_options(), as_view(key, klen)) ? 1 : 0;
   } catch (...) {
-    return false;
+    return -1;
   }
 }
 
@@ -536,32 +536,31 @@ int MariaDBTxn::bulk_flush(bool sync) {
   }
 }
 
-bool MariaDBTxn::bulk_pk_exists(const uint8_t *key, std::size_t klen) {
+int MariaDBTxn::bulk_pk_exists(const uint8_t *key, std::size_t klen) {
   if (bulk_seen_.find(std::vector<uint8_t>(key, key + klen)) != bulk_seen_.end()) {
-    return true;
+    return 1;
   }
   try {
-    return db_->contains_key(plugin_read_options(), as_view(key, klen));
+    return db_->contains_key(plugin_read_options(), as_view(key, klen)) ? 1 : 0;
   } catch (...) {
-    return false;
+    return -1;
   }
 }
 
-bool MariaDBTxn::bulk_unique_prefix_exists(const uint8_t *prefix,
-                                          std::size_t plen) {
+int MariaDBTxn::bulk_unique_prefix_exists(const uint8_t *prefix,
+                                         std::size_t plen) {
   if (bulk_seen_.find(std::vector<uint8_t>(prefix, prefix + plen)) !=
       bulk_seen_.end()) {
-    return true;
+    return 1;
   }
   try {
     for (auto &k : db_->keys_from(plugin_read_options(), as_view(prefix, plen))) {
-      return k.size() >= plen &&
-             std::memcmp(u8_data(k), prefix, plen) == 0;
+      return k.size() >= plen && std::memcmp(u8_data(k), prefix, plen) == 0 ? 1 : 0;
     }
   } catch (...) {
-    return false;
+    return -1;
   }
-  return false;
+  return 0;
 }
 
 // ---------------------------------------------------------------------------

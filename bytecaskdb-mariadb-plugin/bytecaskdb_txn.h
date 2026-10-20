@@ -233,8 +233,10 @@ public:
   // Returns 1 if found (writes to out), 0 if not found, -1 on error.
   int get(const uint8_t *key, size_t klen, bytecask::Bytes &out);
 
-  // Returns true if key exists (in buffer or snapshot).
-  bool exists(const uint8_t *key, size_t klen);
+  // Whether key exists, in the buffer or the snapshot: 1 if it does, 0 if
+  // not, -1 if the read failed (an I/O or CRC error). A failed read is never
+  // taken as absent: a duplicate check would then overwrite the row (#524).
+  int exists(const uint8_t *key, size_t klen);
 
   // Keys in [lo, hi) this transaction sees — its snapshot plus its own
   // buffered writes — counted no further than `limit`. The snapshot's count
@@ -322,9 +324,10 @@ public:
 
   // Duplicate probes for bulk mode: check the current unflushed batch, then
   // the DB directly (already-flushed batches). No snapshot — the #sql-xxx
-  // keyspace is exclusive for the duration of the ALTER.
-  bool bulk_pk_exists(const uint8_t *key, std::size_t klen);
-  bool bulk_unique_prefix_exists(const uint8_t *prefix, std::size_t plen);
+  // keyspace is exclusive for the duration of the ALTER. 1 if present, 0 if
+  // not, -1 if the read failed, as exists().
+  int bulk_pk_exists(const uint8_t *key, std::size_t klen);
+  int bulk_unique_prefix_exists(const uint8_t *prefix, std::size_t plen);
 
 private:
   void ensure_snapshot();
