@@ -59,7 +59,10 @@ at `CREATE TABLE` and `ADD COLUMN`. Reads trust the row.
 **A compared parameter is typed by its column, as PostgreSQL types a
 `$n`.** A parameter a `WHERE` compares with a column takes that column's
 type without its modifier: `VARCHAR(n)` as `TEXT`, `DECIMAL(p, s)`
-unbounded. It is checked against that type before the plan runs, so a
+unbounded. It has one such type: a parameter compared with columns of two
+(`DOUBLE PRECISION` and `REAL`, `INTEGER` and `BIGINT`) is refused at bind,
+where PostgreSQL compares in the parameter's type, since a value inside
+one could be keyed outside the other. It is checked against that type before the plan runs, so a
 value outside it is `BC_C_RANGE` whether or not the plan would read it (a
 key whose other part is NULL): 
 `3000000000` for an `INTEGER` key or bound, `1e39` or `1e-50` for a `REAL`,

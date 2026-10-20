@@ -18,7 +18,6 @@
 // Standard library headers before the module imports, for the reason
 // bytecaskdb/bytecask_hpp.cpp gives (LLVM 22's abi_tag redeclaration error).
 #include <algorithm>
-#include <cassert>
 #include <chrono>
 #include <compare>
 #include <cstddef>
@@ -2031,9 +2030,18 @@ public:
   auto operator=(const PushedBuilder&) -> PushedBuilder& = delete;
   ~PushedBuilder() {
     if (kept_) return;
-    // Filling the builder pushes no other row, so it is still the last.
-    assert(cx_->rows.size() == i_ + 1);
-    cx_->rows.erase(cx_->rows.begin() + static_cast<std::ptrdiff_t>(i_), cx_->rows.end());
+    if (cx_->rows.size() == i_ + 1) {
+      cx_->rows.pop_back();
+      return;
+    }
+    // Filling the builder pushed a row after it: a runtime bug. No row that
+    // is not the builder's is removed; the run is refused instead. The
+    // message may not allocate, during unwinding above all.
+    try {
+      cx_->fail(BC_E_HANDLE, "a row builder is not the last row");
+    } catch (...) {
+      if (cx_->error == BC_OK) cx_->error = BC_E_HANDLE;
+    }
   }
   auto writer() -> RowWriter& { return cx_->rows[i_].writer; }
   auto keep() -> bc_row {

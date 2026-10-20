@@ -98,6 +98,20 @@ TEST_CASE("binder: anything outside the scope is rejected with a message and pos
   CHECK(rejected(cat, "SELECT nope FROM t WHERE id = $1") == std::pair<std::string, std::int32_t>{
                                                                    "column \"nope\" does not exist", 7});
   CHECK(rejected(cat, "SELECT id FROM t WHERE name = $1 AND qty = $1").second == 43);  // $1 bytea, then bigint
+  {
+    // One $n compared with two columns of one physical type but two SQL
+    // types: refused, so its pre-plan range check covers every key it builds.
+    sql_test::Fixture c2;
+    c2.ddl(std::get<Ddl>(bind_sql(c2.cat(), "CREATE TABLE dr (a DOUBLE PRECISION, b REAL, i INTEGER, j BIGINT, "
+                                            "v VARCHAR(4), w TEXT, PRIMARY KEY (a, b))")
+                             .stmt));
+    CHECK(rejected(c2.cat(), "SELECT a FROM dr WHERE a = $1 AND b = $1").first ==
+          "parameter $1 is compared with both double precision and real");
+    CHECK(rejected(c2.cat(), "SELECT a FROM dr WHERE a = $1 AND b = $2 AND i = $3 AND j = $3").first ==
+          "parameter $3 is compared with both integer and bigint");
+    // A modifier is no other type: VARCHAR(4) and TEXT compare one $n.
+    CHECK_NOTHROW(bind_sql(c2.cat(), "SELECT a FROM dr WHERE a = $1 AND b = $2 AND v = $3 AND w = $3"));
+  }
   CHECK(rejected(cat, "SELECT id FROM t WHERE id = $2").first ==
         "could not determine data type of parameter $1");
   CHECK(rejected(cat, "UPDATE t SET name = name - $1 WHERE id = $2").first == "operator - is only defined on bigint");

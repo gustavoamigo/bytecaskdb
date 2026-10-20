@@ -10,9 +10,11 @@ under *Revision history*.
 
 **Plans are only ever ours** (owner decision, 2026-10-20; #487, *MVP*).
 The layer runs only plans its own compiler generates. Nothing is designed
-for plan text from anywhere else: the checker for the subset and an
-interpreter tier for hand-written or user-supplied plans, which this
-document describes, are not planned. The guarantees below still hold for
+for plan text from anywhere else: the checker for the subset, which this
+document describes, is not planned, and no tier will run hand-written or
+user-supplied plans. An interpreter for the compiler's own plans stays
+possible, for a target the embedded C compiler lacks (TinyCC has no WASM
+backend). The guarantees below still hold for
 the compiler's plans, and the runtime's checks (handles, the budget, sticky
 errors, the arithmetic helpers, `BC_E_CORRUPT`) stay, as a guard against
 the compiler's own bugs and against damaged data.
@@ -37,9 +39,9 @@ The API is the only boundary between the two halves of a SQL engine:
 
 The subset compiles with any C compiler, so the first execution tier is
 clang linking plans into the test binary. Later tiers load the same text at
-run time: an embedded C compiler (and, in the original design, an
-interpreter for hand-written plans, not planned: only the compiler's plans
-are supported). The API and the guarantees are the same in every tier.
+run time: an embedded C compiler, or, should a target need one (a WASM
+build), an interpreter. Every tier runs only the compiler's plans. The API
+and the guarantees are the same in every tier.
 
 What it is not: a general C API for the engine, a wire protocol, or a place
 for SQL semantics. Collations, decimals and dates are the compiler's problem;
@@ -185,8 +187,8 @@ and cursor steps and a deadline. Every read and every step charges the
 budget, and the API checks the deadline periodically. Exhausting either sets
 `BC_E_BUDGET` and the plan unwinds. Compute between API calls is
 straight-line and finite, so the budget bounds the whole execution without
-help from the compiler. The interpreter adds a fuel counter on backward
-branches, which compiled plans do not need.
+help from the compiler. An interpreter, if a target ever needs one, would
+add a fuel counter on backward branches, which compiled plans do not need.
 
 **One context, one thread.** A context is used by one thread at a time.
 Contexts run concurrently on different threads; reads scale as the engine's
@@ -483,7 +485,7 @@ bc_view  bc_key_successor(bc_ctx *, bc_view key);     /* smallest key greater th
 |---|---|
 | `bc_key_begin` | Starts a key for a table (its primary key) or an index. Writes the namespace byte and the 4-byte id. Returns a builder handle. |
 | `bc_key_i64`, `bc_key_f64`, `bc_key_bool`, `bc_key_bytes`, `bc_key_null` | Appends one part. Nullability and direction come from the catalog entry for `table_or_index`, so the builder knows whether to write a null marker and whether to invert the bytes. A part of the wrong type, or more parts than the key has, is `BC_E_HANDLE`. |
-| `bc_key_param` | Appends parameter `i` as the next part: its value, or the null part when it is NULL. A type that is not the part's, or a NULL for a part that is not nullable, is `BC_E_HANDLE`. A `REAL` part is keyed as its float rounding. Whether the value is inside the column's type is checked before the plan runs, by the embedded API (`docs/types_design.md`). |
+| `bc_key_param` | Appends parameter `i` as the next part: its value, or the null part when it is NULL. A type that is not the part's, or a NULL for a part that is not nullable, is `BC_E_HANDLE`. A `REAL` part is keyed as its float rounding. Whether the value is inside the column's type is checked before the plan runs, by the embedded API: every compared parameter has one SQL type, and a parameter compared with columns of two is refused at bind (`docs/types_design.md`). |
 | `bc_key_end` | Finalizes and returns the key. A partial key (fewer parts than the index has) is legal and is a prefix the compiler uses as a scan bound. A key over the engine's hard ceiling (65,535 bytes) is `BC_E_LIMIT`. |
 | `bc_key_params` | The key, or prefix, of `table_or_index` whose first `n` parts are parameters `first` to `first + n - 1`, each as `bc_key_param` appends it: `bc_key_begin`, `n` parts and `bc_key_end` in one call. `(cx, TBL_9, 0, 3)` is a composite primary key `(w_id, d_id, c_id)`. The builder remains for keys whose parts come from anywhere else. |
 | `bc_key_successor` | The exclusive upper bound of the prefix `key`: its last byte incremented, carrying. Turns a prefix into a half-open range where `BC_SCAN_PREFIX` does not fit. |
@@ -760,10 +762,11 @@ locals, no nested assignment, no `++`: no uninitialized read and no
 unsequenced modification. Handles in distinct struct types: the C compiler
 itself rejects a handle of the wrong kind.
 
-**Tiers.** Compiled tiers run plans produced by the SQL compiler; the C
-compiler is trusted as the engine's own compiler is. The interpreter this
-design proposed, for hand-written and user-supplied plans, with a fuel
-counter on loop back-edges, is not planned.
+**Tiers.** Every tier runs plans produced by the SQL compiler; the C
+compiler is trusted as the engine's own compiler is. No tier runs
+hand-written or user-supplied plans. An interpreter for the compiler's
+plans, with a fuel counter on loop back-edges, stays possible for a target
+the C compiler lacks (WASM), and is not built.
 
 ### Example
 
@@ -952,8 +955,8 @@ merged without a job doing so.
    from the engine's counters, and commits per second at 1, 16 and 48
    threads. The remainder after subtracting the engine's own reads and
    commit is what this API costs, checks included.
-8. Only then, run-time loaders for the same files (`libtcc`, MIR), then an
-   interpreter for the subset.
+8. Only then, run-time loaders for the same files (`libtcc`, MIR). An
+   interpreter for the compiler's plans only if a target needs one (WASM).
 
 Layout: `bytecaskdb-sql-layer/algebra/` holds `bc_plan.h` and its C++
 implementation; `codec/` the key and row codecs; `catalog/` the catalog

@@ -324,8 +324,20 @@ public:
       }
       const auto* c = column(t, col->column, col->pos);
       use_param(param->param, c->type, param->pos);
+      // A compared $n has one SQL type, what the pre-plan range check
+      // checks: compared with columns of two types that share a physical
+      // type (DOUBLE PRECISION and REAL, INTEGER and BIGINT), a value inside
+      // one could be keyed outside the other, rounded or wrapped. Refused,
+      // where PostgreSQL compares in the parameter's type.
       if (sql_.size() <= param->param) sql_.resize(param->param + 1);
-      if (!sql_[param->param]) sql_[param->param] = param_type(c->sql);  // the first comparison types it
+      auto& sql = sql_[param->param];
+      auto typed = param_type(c->sql);
+      if (sql && *sql != typed) {
+        throw SqlError{"parameter $" + std::to_string(param->param + 1) + " is compared with both " +
+                           sql_type_name(*sql) + " and " + sql_type_name(typed),
+                       param->pos};
+      }
+      sql = typed;
       out.push_back(Compare{op, c->id, param->param});
     }
     return out;
