@@ -67,8 +67,8 @@ bytecask/
 │   ├── row_encoding.cc
 │   ├── key_encoding.h          # PK + secondary index key encoding
 │   ├── key_encoding.cc
-│   ├── bytecaskdb_txn.h        # L2 Transaction (internal to plugin)
-│   └── bytecaskdb_txn.cc
+│   ├── bytecaskdb_txn.h        # L2 Transaction: MariaDB adapter over the SQL layer's
+│   └── bytecaskdb_txn.cc       #   (bytecaskdb-sql-layer/txn/, #488)
 ├── docs/
 │   └── mariadb_engine_design.md  # this file
 └── ...
@@ -242,6 +242,8 @@ What ByteCaskDB currently has vs. what the MariaDB integration needs:
 ## L2 Transaction Design (MariaDB-Internal)
 
 The MariaDB L2 Transaction is a thin adapter between MariaDB's `handler` lifecycle and ByteCaskDB's Layer 1 primitives.
+
+The transaction type itself now lives in the SQL layer, MIT, as `bytecask::sql::Transaction` (`bytecaskdb-sql-layer/txn/`, described in `bytecaskdb-sql-layer/docs/transaction_design.md`), and `MariaDBTxn` derives from it (#488). `MariaDBTxn` keeps what needs the server: `trans_register_ha` for the statement and the transaction, the mapping of a commit outcome to `HA_ERR_*` and `my_error`, the savepoint slots, the duplicate-key report through the handler, and table and index ids in the plugin's key layout. The sketch below is the original design.
 
 ### `MariaDBTxn` Class
 

@@ -74,6 +74,14 @@ endif()
 # Include directory for include/bytecask.hpp.
 set(BYTECASK_INCLUDE_DIR "${BYTECASK_ROOT}/include")
 
+# The SQL layer's transaction (bytecaskdb-sql-layer/txn/, MIT), which
+# MariaDBTxn derives from. A plain header and .cpp on the engine's public
+# header, compiled here from its own location rather than linked from the
+# layer's xmake archive, whose module units this toolchain cannot read. Its
+# includes are relative to the repository root.
+set(SQL_LAYER_TXN_SOURCES
+    "${BYTECASK_ROOT}/bytecaskdb-sql-layer/txn/transaction.cpp")
+
 # Location of the testing archive (with BYTECASK_TESTING defined).
 set(BYTECASK_TESTING_LIB
     "${BYTECASK_ROOT}/build/linux/${BYTECASK_ARCH}/release/libbytecask_testing.a")
@@ -259,6 +267,7 @@ add_library(ha_bytecaskdb MODULE
   ha_bytecaskdb.cc
   bytecaskdb_plugin.cc
   bytecaskdb_txn.cc
+  ${SQL_LAYER_TXN_SOURCES}
   catalog.cc
   key_encoding.cc
   row_encoding.cc
@@ -296,6 +305,7 @@ endif()
 target_include_directories(ha_bytecaskdb PRIVATE
   ${MARIADB_SERVER_INCLUDE_DIRS}
   "${BYTECASK_INCLUDE_DIR}"
+  "${BYTECASK_ROOT}"
   "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
@@ -412,6 +422,7 @@ target_link_libraries(mariadb_plugin_tests PRIVATE Catch2::Catch2WithMain)
 add_executable(mariadb_txn_tests
   tests/unit/mariadb_txn_test.cpp
   bytecaskdb_txn.cc
+  ${SQL_LAYER_TXN_SOURCES}
   bytecaskdb_plugin.cc
   catalog.cc
   key_encoding.cc
@@ -422,6 +433,7 @@ target_include_directories(mariadb_txn_tests PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit"
   "${CMAKE_CURRENT_SOURCE_DIR}"
   "${BYTECASK_INCLUDE_DIR}"
+  "${BYTECASK_ROOT}"
 )
 
 target_compile_options(mariadb_txn_tests PRIVATE
@@ -454,6 +466,7 @@ add_executable(mariadb_proof_tests
   ha_bytecaskdb.cc
   bytecaskdb_plugin.cc
   bytecaskdb_txn.cc
+  ${SQL_LAYER_TXN_SOURCES}
   catalog.cc
   key_encoding.cc
   row_encoding.cc
@@ -464,6 +477,7 @@ target_include_directories(mariadb_proof_tests PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/tests/proof"
   "${CMAKE_CURRENT_SOURCE_DIR}"
   "${BYTECASK_INCLUDE_DIR}"
+  "${BYTECASK_ROOT}"
   "${BYTECASK_ROOT}/bytecaskdb"
 )
 

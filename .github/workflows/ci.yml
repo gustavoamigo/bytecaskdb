@@ -9,20 +9,28 @@ on:
   # A change that touches only documentation runs nothing here, as a pull
   # request or as a push to main: no job reads Markdown. Nor does one confined
   # to the SQL layer: no job here configures it (option sql_layer), and
-  # sql-layer.yml runs its tests. A change that also touches anything else
-  # runs everything.
+  # sql-layer.yml runs its tests. The exception is the layer's transaction
+  # (txn/, common/), which the mariadb-plugin job compiles into the plugin.
+  # A change that also touches anything else runs everything. The last
+  # matching pattern decides.
   push:
     branches: [main]
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "bytecaskdb-sql-layer/**"
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!bytecaskdb-sql-layer/**"
+      - "bytecaskdb-sql-layer/txn/**"
+      - "bytecaskdb-sql-layer/common/**"
+      - "!**.md"
   pull_request:
     branches: [main]
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "bytecaskdb-sql-layer/**"
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!bytecaskdb-sql-layer/**"
+      - "bytecaskdb-sql-layer/txn/**"
+      - "bytecaskdb-sql-layer/common/**"
+      - "!**.md"
   workflow_dispatch:
 
 permissions:

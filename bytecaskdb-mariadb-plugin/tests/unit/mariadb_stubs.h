@@ -365,9 +365,14 @@ inline uint64_t thd_test_options(THD * /*thd*/, uint64_t options) {
   return g_stub_thd_options & options;
 }
 
-// Stub: trans_register_ha — no-op in tests.
-inline void trans_register_ha(THD * /*thd*/, bool /*all*/,
-                              handlerton * /*hton*/, int /*trx_id*/) {}
+// Stub: trans_register_ha — counts the registrations, transaction (all)
+// and statement, so tests can check what an engine registered.
+inline int g_stub_trans_registered_all = 0;
+inline int g_stub_trans_registered_stmt = 0;
+inline void trans_register_ha(THD * /*thd*/, bool all,
+                              handlerton * /*hton*/, int /*trx_id*/) {
+  ++(all ? g_stub_trans_registered_all : g_stub_trans_registered_stmt);
+}
 
 // Stub: thd_get_ha_data / thd_set_ha_data — use THD::ha_data[slot].
 inline void *thd_get_ha_data(THD *thd, handlerton *hton) {

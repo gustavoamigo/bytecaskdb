@@ -36,9 +36,12 @@ bytecaskdb-mariadb-plugin/
 ├── ha_bytecaskdb.h        Handler class declaration + global extern
 │   ha_bytecaskdb.cc       declarations. Contains the full handler class.
 │
-├── bytecaskdb_txn.h       Per-connection transaction state (MariaDBTxn).
-│   bytecaskdb_txn.cc      Buffers writes, holds a snapshot, commits via
-│                          WritePlan, implements read-your-own-writes.
+├── bytecaskdb_txn.h       Per-connection transaction state (MariaDBTxn): the
+│   bytecaskdb_txn.cc      SQL layer's transaction (bytecaskdb-sql-layer/txn/,
+│                          MIT), which buffers writes, holds a snapshot,
+│                          commits via WritePlan and implements
+│                          read-your-own-writes, registered with MariaDB's
+│                          coordinator and its outcomes mapped to HA_ERR_*.
 │
 ├── catalog.h              Key-space encoding for the persistent catalog:
 │   catalog.cc             key builders, TableMeta serialization,
@@ -52,15 +55,18 @@ bytecaskdb-mariadb-plugin/
 │   row_encoding.cc        Adds a 3-byte versioned envelope (format + schema
 │                          version). Handles BLOB data encoding/decoding.
 │
-├── bytecask_view.h        Inline adapters between MariaDB's uint8_t*+size_t
-│                          and bytecask's BytesView (std::span<const std::byte>).
+├── bytecask_view.h        The SQL layer's adapters between uint8_t*+size_t and
+│                          bytecask's BytesView (bytecaskdb-sql-layer/common/),
+│                          and the size limits the plugin opens the DB with.
 │
 ├── degraded.h             abort_if_degraded(): what every engine write does
 │                          when its failure left the engine degraded.
 │
 ├── tests/
 │   ├── unit/              Catch2 unit tests for pure helpers (key
-│   │                      encoding, row encoding, catalog, txn buffer).
+│   │                      encoding, row encoding, catalog) and MariaDBTxn's
+│   │                      adapter; the transaction's own tests are the SQL
+│   │                      layer's (tests/transaction_test.cpp).
 │   ├── functional/        Python-based integration tests against a live
 │   │   ├── cases/*.yaml   MariaDB instance. YAML-driven test cases.
 │   │   ├── conftest.py    Pytest fixtures (DB connection, server).
@@ -211,7 +217,12 @@ MariaDB calls `external_lock(F_WRLCK)` when a statement begins and
 `COMMIT` / `ROLLBACK` come through `hton->commit` / `hton->rollback`.
 
 `MariaDBTxn` sits in the per-THD slot (`thd_get_ha_data` / `thd_set_ha_data`)
-and handles all of this:
+and handles all of this. It derives from the SQL layer's
+`bytecask::sql::Transaction` (`bytecaskdb-sql-layer/txn/`), which holds every
+mechanism below; `MariaDBTxn` adds the registration with the server's
+coordinator, the mapping of a commit outcome to an `HA_ERR_*` code and the
+server's error, the savepoint slots, and table and index ids in the plugin's
+key layout.
 
 - **Snapshot** — taken at the first read or write of the statement (or at
   `begin_if_needed()` for an explicit transaction) and held to its end.
@@ -240,7 +251,7 @@ and handles all of this:
   savepoint slot holds the stack index. `ROLLBACK TO` restores both.
 
 The dual-structure buffer (`ops_` ordered log + `lookup_` sorted map) is
-the core of `bytecaskdb_txn.h`. `ops_` preserves causality for commit;
+the core of `transaction.h`. `ops_` preserves causality for commit;
 `lookup_` gives O(log n) RYOW lookups.
 
 #### Bulk-copy mode (large ALTER / CREATE INDEX)

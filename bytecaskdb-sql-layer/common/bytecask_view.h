@@ -1,0 +1,58 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Gustavo Amigo
+//
+// bytecask_view.h — small adapters between the `uint8_t* + size_t`
+// convention and bytecask's `BytesView` (std::span<const std::byte>).
+//
+// They let a caller that holds raw byte pointers (as the MariaDB handler API
+// hands out) talk to the strongly typed bytecask::DB / Snapshot / WritePlan
+// surface in include/bytecask.hpp. A plain header: the MariaDB plugin, built
+// by CMake with another toolchain, includes it.
+
+#pragma once
+
+#include "include/bytecask.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <vector>
+
+namespace bytecask::sql {
+
+inline bytecask::BytesView as_view(const uint8_t *p, std::size_t n) {
+  return std::as_bytes(std::span{p, n});
+}
+
+inline bytecask::BytesView as_view(const std::vector<uint8_t> &v) {
+  return std::as_bytes(std::span{v.data(), v.size()});
+}
+
+// Copy a Bytes (std::vector<std::byte>) into a std::vector<uint8_t>.
+inline std::vector<uint8_t> to_uint8(const bytecask::Bytes &src) {
+  std::vector<uint8_t> out(src.size());
+  for (std::size_t i = 0; i < src.size(); ++i) {
+    out[i] = std::to_integer<uint8_t>(src[i]);
+  }
+  return out;
+}
+
+inline const uint8_t *u8_data(const bytecask::Bytes &b) {
+  return reinterpret_cast<const uint8_t *>(b.data());
+}
+
+inline const uint8_t *u8_data(bytecask::BytesView v) {
+  return reinterpret_cast<const uint8_t *>(v.data());
+}
+
+inline void assign_bytes(bytecask::Bytes &dst, const uint8_t *p, std::size_t n) {
+  dst.assign(reinterpret_cast<const std::byte *>(p),
+             reinterpret_cast<const std::byte *>(p + n));
+}
+
+inline void assign_bytes(bytecask::Bytes &dst, const std::vector<uint8_t> &src) {
+  dst.assign(reinterpret_cast<const std::byte *>(src.data()),
+             reinterpret_cast<const std::byte *>(src.data() + src.size()));
+}
+
+}  // namespace bytecask::sql

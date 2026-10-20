@@ -62,16 +62,19 @@ translation unit.
 | `bytecask.sql.tcc_loader` | `plan/tcc_loader.cppm` | TinyCC in process; no importer sees `libtcc.h` |
 | `bytecask.sql.api` | `api/database.cppm` | The embedded API |
 
-One header: `algebra/bc_plan.h`, the C contract, which generated plans,
-TinyCC and clang-as-C read. Its `extern "C"` definitions are
-`algebra/plan_api.cpp`, a plain translation unit that includes the header and
-imports the modules, standard headers first, for the reason
-`bytecaskdb/bytecask_hpp.cpp` gives. The hand-written plans in `plans/*.c`
-are C. The tests import the modules; the fixtures they share are modules too
-(`bytecask.sql.tests.*`, under `tests/`). Two more headers of the same kind
-are planned, each at a boundary another toolchain consumes: the C ABI for the
-bindings (#494) and a header bridge for the plugin, the counterpart of
-`include/bytecask.hpp` (#488).
+Headers are where another toolchain consumes the layer, and only there.
+`algebra/bc_plan.h` is the C contract, which generated plans, TinyCC and
+clang-as-C read. Its `extern "C"` definitions are `algebra/plan_api.cpp`, a
+plain translation unit that includes the header and imports the modules,
+standard headers first, for the reason `bytecaskdb/bytecask_hpp.cpp` gives.
+`txn/transaction.h` is the transaction the MariaDB plugin derives from
+(#488): `txn/transaction.cpp` and `common/bytecask_view.h` include only the
+standard library and `include/bytecask.hpp`, import no module, and are C++20,
+so the plugin's CMake build compiles them from here with MariaDB's toolchain.
+The hand-written plans in `plans/*.c` are C. The tests import the modules;
+the fixtures they share are modules too (`bytecask.sql.tests.*`, under
+`tests/`). One more header of the same kind is planned: the C ABI for the
+bindings (#494).
 
 Its third-party dependencies are fetched at build time, not vendored:
 libpg_query (PostgreSQL licence, with its bundled protobuf-c, MIT/BSD) and
@@ -95,6 +98,7 @@ plugin API.
 | `bytecaskdb-mariadb-plugin/ha_bytecaskdb.h` | Storage engine handler (MariaDB C++ API) |
 | `bytecaskdb-mariadb-plugin/ha_bytecaskdb.cc` | Handler implementation |
 | `bytecaskdb-mariadb-plugin/bytecaskdb_plugin.cc` | Plugin declaration (`maria_declare_plugin`) |
+| `bytecaskdb-mariadb-plugin/bytecaskdb_txn.{h,cc}` | `MariaDBTxn`: the SQL layer's transaction registered with MariaDB's coordinator, its outcomes mapped to `HA_ERR_*` |
 | `bytecaskdb-mariadb-plugin/key_encoding.{h,cc}` | MariaDB key → bytecask key encoding |
 | `bytecaskdb-mariadb-plugin/row_encoding.{h,cc}` | MariaDB row → bytecask value encoding |
 | `bytecaskdb-mariadb-plugin/CMakeLists.txt` | CMake build for the plugin |
@@ -103,6 +107,13 @@ plugin API.
 imports the C++23 `bytecask` module and must be built with the same toolchain
 that produced the BMIs). The file is MIT-licensed — it contains no MariaDB
 headers.
+
+The plugin's transaction is the SQL layer's: `MariaDBTxn` derives from
+`bytecask::sql::Transaction` (`bytecaskdb-sql-layer/txn/`), and the plugin's
+CMake compiles `txn/transaction.cpp` into `ha_bytecaskdb.so`. Those files stay
+MIT; as with `bytecask_hpp.cpp`, the GPL obligation of the shared object
+comes from the plugin's own files, and the dependency runs one way: nothing
+under `bytecaskdb-sql-layer/` knows the plugin exists.
 
 ---
 
@@ -127,7 +138,9 @@ bytecask/
 │   └── row_encoding.h/cc
 │
 ├── bytecaskdb-sql-layer/ # MIT — SQL layer on the public API (#487)
-│   ├── algebra/          # bc_plan.h (the one header), plan_api.cpp, runtime.cppm
+│   ├── algebra/          # bc_plan.h (the C contract), plan_api.cpp, runtime.cppm
+│   ├── txn/              # transaction.h/.cpp: the transaction the plugin derives from (plain C++20)
+│   ├── common/           # bytecask_view.h: raw-byte views onto BytesView
 │   ├── codec/ catalog/ sql/ plan/ api/   # bytecask.sql.* modules, one .cppm each
 │   ├── plans/            # Hand-written plans, C
 │   ├── tests/            # Catch2 tests; shared fixtures as bytecask.sql.tests.* modules
@@ -147,7 +160,7 @@ bytecask/
 
 `xmake.lua` builds `bytecaskdb/bytecask_hpp.cpp` into `libbytecask.a`. The
 plugin is built independently with CMake, which consumes `libbytecask.a`
-produced by xmake.
+produced by xmake and compiles `bytecaskdb-sql-layer/txn/transaction.cpp`.
 
 ---
 
@@ -165,7 +178,7 @@ Builds the C++23 engine. Targets:
 | `engine_bench` | binary | Engine benchmarks vs RocksDB |
 | `bytecask_bench` | binary | Map structure benchmarks |
 | `bytecask` | static lib | `libbytecask.a` — consumed by MariaDB CMake |
-| `sql_layer` | static lib | `libsql_layer.a` — the `bytecask.sql.*` modules and `plan_api.cpp`, from `bytecaskdb-sql-layer/xmake.lua` |
+| `sql_layer` | static lib | `libsql_layer.a` — the `bytecask.sql.*` modules, `plan_api.cpp` and `transaction.cpp`, from `bytecaskdb-sql-layer/xmake.lua` |
 | `sql_layer_testing` | static lib | `sql_layer` with `BYTECASK_SQL_TESTING`: adds the test-only calls; linked by `sql_layer_tests` and `bytecask_sql` |
 | `sql_layer_tests` | binary | SQL layer tests (Catch2), from `bytecaskdb-sql-layer/xmake.lua` |
 
@@ -182,7 +195,8 @@ xmake build bytecask          # produces libbytecask.a
 ### CMake — MariaDB Plugin
 
 Builds the GPL storage engine plugin. Consumes `libbytecask.a` and
-`include/bytecask.hpp`.
+`include/bytecask.hpp`, and compiles the SQL layer's transaction
+(`bytecaskdb-sql-layer/txn/transaction.cpp`) from its own location.
 
 ```sh
 xmake build bytecask          # prerequisite: build the static lib first

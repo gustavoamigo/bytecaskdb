@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (c) 2026 Gustavo Amigo
 //
-// mariadb_txn_test.cpp — Unit tests for MariaDBTxn transaction management.
+// mariadb_txn_test.cpp — Unit tests for MariaDBTxn, the plugin's adapter over
+// the SQL layer's transaction, against a real bytecask::DB and the MariaDB
+// stubs.
 //
-// Tests the transaction buffer, RYOW semantics, commit/rollback behavior,
-// and MergeIterator functionality without requiring a full MariaDB server.
-//
-// NOTE: This file is not currently built by CMakeLists.txt. It exercises
-// the real MariaDBTxn class and therefore requires a real bytecask::DB
-// (opened in a temp directory) when wired in. The opaque pointer below
-// is a placeholder that mirrors the constructor's signature; do not enable
-// this target without supplying a real DB instance.
+// The transaction itself — buffering, RYOW, OCC commit, statement rollback,
+// savepoints, bulk copy, the merge iterators — is tested in the SQL layer
+// (bytecaskdb-sql-layer/tests/transaction_test.cpp). What is tested here is
+// what the adapter adds: registration with the server's coordinator, the
+// HA_ERR_* codes and server errors a commit outcome maps to, the deferred
+// insert's duplicate report, savepoint slots, the catalog row counter, and
+// the plugin's table and index namespaces.
 
 #include "mariadb_stubs.h"     // MariaDB type stubs
 #include "bytecask.hpp"
@@ -28,6 +29,10 @@
 #include <system_error>
 #include <vector>
 #include <unistd.h>
+
+namespace bytecaskdb {
+int64_t catalog_row_count(uint32_t table_id);
+}  // namespace bytecaskdb
 
 using namespace bytecaskdb;
 
@@ -78,7 +83,6 @@ public:
     return std::make_unique<MariaDBTxn>(temp_db_.db());
   }
 
-  // Helper to create test key-value pairs
   std::vector<uint8_t> make_key(const char* s) {
     return std::vector<uint8_t>(s, s + strlen(s));
   }
@@ -92,277 +96,77 @@ protected:
 };
 
 // =========================================================================
-// Basic Transaction Lifecycle
+// Registration with the server's transaction coordinator
 // =========================================================================
 
-TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn basic lifecycle", "[txn][lifecycle]") {
+TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn registers with the coordinator",
+                 "[txn][lifecycle]") {
   auto txn = create_txn();
+  THD thd{};
+  handlerton hton{};
+  g_stub_trans_registered_all = 0;
+  g_stub_trans_registered_stmt = 0;
 
   SECTION("initial state") {
     REQUIRE_FALSE(txn->is_active());
   }
 
-  SECTION("becomes active after begin_if_needed") {
+  SECTION("multi-statement: the transaction and each statement, once") {
     // Simulate multi-statement mode (BEGIN or non-autocommit).
     g_stub_thd_options = OPTION_BEGIN;
-    THD thd{};
-    handlerton hton{};
 
     txn->begin_if_needed(&thd, &hton);
     REQUIRE(txn->is_active());
+    txn->begin_if_needed(&thd, &hton);  // a second handler in the statement
+    REQUIRE(g_stub_trans_registered_all == 1);
+    REQUIRE(g_stub_trans_registered_stmt == 1);
+
+    REQUIRE(txn->commit(&thd, false) == 0);
+    txn->begin_if_needed(&thd, &hton);
+    REQUIRE(g_stub_trans_registered_all == 1);
+    REQUIRE(g_stub_trans_registered_stmt == 2);
     g_stub_thd_options = 0;
   }
-}
 
-// =========================================================================
-// Write Buffering
-// =========================================================================
-
-TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn write buffering", "[txn][buffer]") {
-  auto txn = create_txn();
-
-  auto key1 = make_key("user:1");
-  auto val1 = make_value("alice");
-  auto key2 = make_key("user:2");
-  auto val2 = make_value("bob");
-
-  SECTION("buffer_put stores operation") {
-    txn->buffer_put(key1.data(), key1.size(), val1.data(), val1.size());
-
-    // Should be able to read back the value
-    bytecask::Bytes out_val;
-    int result = txn->get(key1.data(), key1.size(), out_val);
-
-    REQUIRE(result == 1);  // Found
-    REQUIRE(out_val.size() == val1.size());
-    REQUIRE(std::memcmp(out_val.data(), val1.data(), val1.size()) == 0);
-  }
-
-  SECTION("buffer_del creates tombstone") {
-    // First put a value
-    txn->buffer_put(key1.data(), key1.size(), val1.data(), val1.size());
-    REQUIRE(txn->exists(key1.data(), key1.size()));
-
-    // Then delete it
-    txn->buffer_del(key1.data(), key1.size());
-    REQUIRE_FALSE(txn->exists(key1.data(), key1.size()));
-
-    // get() should return not found
-    bytecask::Bytes out_val;
-    int result = txn->get(key1.data(), key1.size(), out_val);
-    REQUIRE(result == 0);  // Not found
-  }
-
-  SECTION("multiple operations in order") {
-    txn->buffer_put(key1.data(), key1.size(), val1.data(), val1.size());
-    txn->buffer_put(key2.data(), key2.size(), val2.data(), val2.size());
-
-    REQUIRE(txn->exists(key1.data(), key1.size()));
-    REQUIRE(txn->exists(key2.data(), key2.size()));
-
-    // Overwrite key1 with new value
-    auto val1_new = make_value("alice_updated");
-    txn->buffer_put(key1.data(), key1.size(), val1_new.data(), val1_new.size());
-
-    // Should see the new value
-    bytecask::Bytes out_val;
-    int result = txn->get(key1.data(), key1.size(), out_val);
-
-    REQUIRE(result == 1);
-    REQUIRE(out_val.size() == val1_new.size());
-    REQUIRE(std::memcmp(out_val.data(), val1_new.data(), val1_new.size()) == 0);
+  SECTION("autocommit: the statement only, and no snapshot") {
+    txn->begin_if_needed(&thd, &hton);
+    REQUIRE_FALSE(txn->is_active());
+    REQUIRE(g_stub_trans_registered_all == 0);
+    REQUIRE(g_stub_trans_registered_stmt == 1);
   }
 }
 
 // =========================================================================
-// Read-Your-Own-Writes (RYOW) Semantics - THE CRITICAL TEST
+// Commit outcomes as HA_ERR_* codes and server errors
 // =========================================================================
 
-TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn RYOW semantics", "[txn][ryow]") {
-  auto txn = create_txn();
-
-  auto key = make_key("session:abc123");
-  auto val = make_value("active");
-
-  SECTION("exists() returns false for non-existent key") {
-    REQUIRE_FALSE(txn->exists(key.data(), key.size()));
-  }
-
-  SECTION("exists() returns true after buffer_put - CRITICAL TEST") {
-    // This is the exact scenario that's failing in the actual bug
-    txn->buffer_put(key.data(), key.size(), val.data(), val.size());
-
-    // This MUST return true - if it returns false, it's the duplicate insert bug
-    bool key_exists = txn->exists(key.data(), key.size());
-    REQUIRE(key_exists);
-  }
-
-  SECTION("get() returns buffered value") {
-    txn->buffer_put(key.data(), key.size(), val.data(), val.size());
-
-    bytecask::Bytes out_val;
-    int result = txn->get(key.data(), key.size(), out_val);
-
-    REQUIRE(result == 1);  // Found
-    REQUIRE(out_val.size() == val.size());
-    REQUIRE(std::memcmp(out_val.data(), val.data(), val.size()) == 0);
-  }
-
-  SECTION("exists() returns false after buffer_del") {
-    // Put then delete
-    txn->buffer_put(key.data(), key.size(), val.data(), val.size());
-    REQUIRE(txn->exists(key.data(), key.size()));
-
-    txn->buffer_del(key.data(), key.size());
-    REQUIRE_FALSE(txn->exists(key.data(), key.size()));
-  }
-}
-
-// =========================================================================
-// Transaction Isolation - CRITICAL FOR BUG PREVENTION
-// =========================================================================
-
-TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn isolation between transactions", "[txn][isolation]") {
-  auto txn1 = create_txn();
-  auto txn2 = create_txn();
-
-  auto key = make_key("shared:key");
-  auto val1 = make_value("txn1_value");
-  auto val2 = make_value("txn2_value");
-
-  SECTION("transactions don't see each other's buffered writes") {
-    // txn1 buffers a write
-    txn1->buffer_put(key.data(), key.size(), val1.data(), val1.size());
-    REQUIRE(txn1->exists(key.data(), key.size()));
-
-    // txn2 should not see it
-    REQUIRE_FALSE(txn2->exists(key.data(), key.size()));
-
-    bytecask::Bytes out_val;
-    int result = txn2->get(key.data(), key.size(), out_val);
-    REQUIRE(result == 0);  // Not found in txn2
-  }
-
-  SECTION("transactions can buffer same key independently") {
-    // Both transactions buffer the same key with different values
-    txn1->buffer_put(key.data(), key.size(), val1.data(), val1.size());
-    txn2->buffer_put(key.data(), key.size(), val2.data(), val2.size());
-
-    // Each should see their own value
-    bytecask::Bytes out_val1;
-    int result1 = txn1->get(key.data(), key.size(), out_val1);
-
-    bytecask::Bytes out_val2;
-    int result2 = txn2->get(key.data(), key.size(), out_val2);
-
-    REQUIRE(result1 == 1);
-    REQUIRE(result2 == 1);
-    REQUIRE(std::memcmp(out_val1.data(), val1.data(), val1.size()) == 0);
-    REQUIRE(std::memcmp(out_val2.data(), val2.data(), val2.size()) == 0);
-  }
-
-  SECTION("REGRESSION TEST: simulate multiple write_row calls") {
-    // This simulates the exact bug scenario:
-    // Two separate MariaDBTxn objects trying to write the same key
-
-    auto duplicate_key = make_key("table:1:pk:42");  // Same primary key
-    auto row_value = make_value("user_data");
-
-    // First write_row call - uses txn1
-    txn1->buffer_put(duplicate_key.data(), duplicate_key.size(),
-                    row_value.data(), row_value.size());
-    REQUIRE(txn1->exists(duplicate_key.data(), duplicate_key.size()));
-
-    // Second write_row call - uses txn2 (different transaction object)
-    // The exists() check should NOT see txn1's buffered write
-    REQUIRE_FALSE(txn2->exists(duplicate_key.data(), duplicate_key.size()));
-
-    // This would allow the duplicate to be buffered (which is the bug)
-    txn2->buffer_put(duplicate_key.data(), duplicate_key.size(),
-                    row_value.data(), row_value.size());
-    REQUIRE(txn2->exists(duplicate_key.data(), duplicate_key.size()));
-
-    // Both transactions now have the same key buffered independently
-    // When both commit, we get duplicate rows in the database
-  }
-}
-
-// =========================================================================
-// Commit/Rollback Behavior
-// =========================================================================
-
-TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn commit rollback", "[txn][commit]") {
-  auto txn = create_txn();
-
-  auto key = make_key("counter:visits");
-  auto val = make_value("42");
-
-  SECTION("rollback clears buffer") {
-    THD thd{};
-
-    txn->buffer_put(key.data(), key.size(), val.data(), val.size());
-    REQUIRE(txn->exists(key.data(), key.size()));
-
-    txn->rollback(&thd, true);  // all=true for full rollback
-
-    REQUIRE_FALSE(txn->exists(key.data(), key.size()));
-  }
-}
-
-// =========================================================================
-// Autocommit read-modify-write: the snapshot must predate the read
-// =========================================================================
-
-TEST_CASE_METHOD(MariaDBTxnFixture,
-                 "MariaDBTxn autocommit read pins the OCC snapshot",
+TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn commit conflict is a deadlock",
                  "[txn][occ][autocommit]") {
   auto key = make_key("counter:1");
   auto v0 = make_value("0");
   auto v1 = make_value("1");
   THD thd{};
 
-  // Seed the row.
   {
     auto seed = create_txn();
     seed->buffer_put(key.data(), key.size(), v0.data(), v0.size());
     REQUIRE(seed->commit(&thd, true) == 0);
   }
 
-  // No begin_if_needed: this is autocommit, where the handler's first call
-  // on the statement is the point read (index_read_map -> get).
   auto a = create_txn();
   auto b = create_txn();
+  g_stub_last_my_error_code = 0;
 
-  SECTION("get() then concurrent commit then write conflicts") {
-    bytecask::Bytes out;
-    REQUIRE(a->get(key.data(), key.size(), out) == 1);
-    REQUIRE(a->is_active());  // snapshot taken by the read, not the write
+  bytecask::Bytes out;
+  REQUIRE(a->get(key.data(), key.size(), out) == 1);
 
-    b->buffer_put(key.data(), key.size(), v1.data(), v1.size());
-    REQUIRE(b->commit(&thd, true) == 0);
+  b->buffer_put(key.data(), key.size(), v1.data(), v1.size());
+  REQUIRE(b->commit(&thd, true) == 0);
+  REQUIRE(g_stub_last_my_error_code == 0);
 
-    // A computes its new value from the stale read and writes it back.
-    a->buffer_put(key.data(), key.size(), v1.data(), v1.size());
-    REQUIRE(a->commit(&thd, true) == HA_ERR_LOCK_DEADLOCK);
-  }
-
-  SECTION("exists() then concurrent commit then write conflicts") {
-    REQUIRE(a->exists(key.data(), key.size()));
-    REQUIRE(a->is_active());
-
-    b->buffer_put(key.data(), key.size(), v1.data(), v1.size());
-    REQUIRE(b->commit(&thd, true) == 0);
-
-    a->buffer_put(key.data(), key.size(), v1.data(), v1.size());
-    REQUIRE(a->commit(&thd, true) == HA_ERR_LOCK_DEADLOCK);
-  }
-
-  SECTION("read-only statement releases the snapshot at commit") {
-    bytecask::Bytes out;
-    REQUIRE(a->get(key.data(), key.size(), out) == 1);
-    REQUIRE(a->commit(&thd, true) == 0);
-    REQUIRE_FALSE(a->is_active());
-  }
+  a->buffer_put(key.data(), key.size(), v1.data(), v1.size());
+  REQUIRE(a->commit(&thd, true) == HA_ERR_LOCK_DEADLOCK);
+  REQUIRE(g_stub_last_my_error_code == ER_LOCK_DEADLOCK);
 }
 
 // =========================================================================
@@ -385,13 +189,12 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn deferred insert dup check",
     REQUIRE(seed->commit(&thd, true) == 0);
   }
 
+  auto txn = create_txn();
+  THD thd{};
+  g_stub_last_my_error_code = 0;
+
   SECTION("commit-time conflict returns HA_ERR_FOUND_DUPP_KEY and raises "
           "ER_DUP_ENTRY (1062), the code clients check for") {
-    auto txn = create_txn();
-    THD thd{};
-
-    g_stub_last_my_error_code = 0;
-
     txn->begin_deferred_insert(nullptr, nullptr);
     txn->buffer_put(pk.data(), pk.size(), val2.data(), val2.size(),
                     /*guard_absent=*/true);
@@ -405,252 +208,103 @@ TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn deferred insert dup check",
     // a key-name string is UB: its second placeholder is an integer.)
     REQUIRE(g_stub_last_my_error_code == ER_DUP_ENTRY);
   }
-}
 
-// =========================================================================
-// Edge Cases and Error Handling
-// =========================================================================
+  SECTION("the reporter is given the duplicate key and the row") {
+    std::vector<uint8_t> got_pk;
+    std::vector<uint8_t> got_row;
+    txn->begin_deferred_insert(
+        nullptr, [&](const std::vector<uint8_t> &k,
+                     const std::vector<uint8_t> &row) {
+          got_pk = k;
+          got_row = row;
+          return true;  // reported
+        });
+    txn->buffer_put(pk.data(), pk.size(), val2.data(), val2.size(),
+                    /*guard_absent=*/true);
 
-TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn edge cases", "[txn][edge]") {
-  auto txn = create_txn();
-
-  SECTION("get on non-existent key returns 0") {
-    auto key = make_key("nonexistent");
-
-    bytecask::Bytes out_val;
-    int result = txn->get(key.data(), key.size(), out_val);
-
-    REQUIRE(result == 0);  // Not found
-    REQUIRE(out_val.size() == 0);
-  }
-
-  SECTION("exists on empty key") {
-    std::vector<uint8_t> empty_key;
-    REQUIRE_FALSE(txn->exists(empty_key.data(), empty_key.size()));
-  }
-
-  SECTION("buffer operations with empty values") {
-    auto key = make_key("empty_value_key");
-
-    // Put empty value
-    txn->buffer_put(key.data(), key.size(), nullptr, 0);
-    REQUIRE(txn->exists(key.data(), key.size()));
-
-    // Should be able to retrieve empty value
-    bytecask::Bytes out_val;
-    int result = txn->get(key.data(), key.size(), out_val);
-
-    REQUIRE(result == 1);  // Found
-    REQUIRE(out_val.size() == 0);
-
-    (void)out_val;
-  }
-
-  SECTION("overwrite same key multiple times") {
-    auto key = make_key("overwrite_test");
-    auto val1 = make_value("first");
-    auto val2 = make_value("second");
-    auto val3 = make_value("third");
-
-    txn->buffer_put(key.data(), key.size(), val1.data(), val1.size());
-    txn->buffer_put(key.data(), key.size(), val2.data(), val2.size());
-    txn->buffer_put(key.data(), key.size(), val3.data(), val3.size());
-
-    // Should see the last value
-    bytecask::Bytes out_val;
-    int result = txn->get(key.data(), key.size(), out_val);
-
-    REQUIRE(result == 1);
-    REQUIRE(out_val.size() == val3.size());
-    REQUIRE(std::memcmp(out_val.data(), val3.data(), val3.size()) == 0);
-  }
-}
-// =========================================================================
-// Bulk-copy mode — batched writes for ALTER TABLE ... ALGORITHM=COPY
-// =========================================================================
-
-TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn bulk copy mode", "[txn][bulk]") {
-  auto txn = create_txn();
-  THD thd{};
-
-  auto db_has = [&](const std::vector<uint8_t> &k) {
-    auto snap = temp_db_.db()->snapshot();
-    return snap.contains_key({}, as_view(k.data(), k.size()));
-  };
-  auto db_key_count = [&]() {
-    size_t n = 0;
-    for (auto &k : temp_db_.db()->keys_from({})) { (void)k; ++n; }
-    return n;
-  };
-
-  SECTION("flush persists to DB before any commit; buffer stays bounded") {
-    txn->begin_bulk_copy(256);
-    REQUIRE(txn->in_bulk_copy());
-
-    // First key: below threshold, not flushed yet.
-    auto k0 = make_key("row:0000");
-    auto v0 = make_value(std::string(64, 'a').c_str());
-    txn->bulk_buffer_put(k0.data(), k0.size(), v0.data(), v0.size());
-    txn->bulk_note_key(k0.data(), k0.size());
-    REQUIRE_FALSE(txn->bulk_should_flush());
-    REQUIRE_FALSE(db_has(k0));
-
-    // Pile on until the byte threshold trips, then flush.
-    for (int i = 1; i < 8; ++i) {
-      auto k = make_key(("row:000" + std::to_string(i)).c_str());
-      txn->bulk_buffer_put(k.data(), k.size(), v0.data(), v0.size());
-      txn->bulk_note_key(k.data(), k.size());
-    }
-    REQUIRE(txn->bulk_should_flush());
-    REQUIRE(txn->bulk_flush(false) == 0);
-
-    // Flushed rows are durable in the DB even though nothing committed.
-    REQUIRE(db_has(k0));
-    REQUIRE(db_key_count() == 8);
-    // Threshold counter reset; snapshot/ops untouched (txn still "inactive").
-    REQUIRE_FALSE(txn->bulk_should_flush());
-    REQUIRE_FALSE(txn->is_active());
-    REQUIRE(txn->in_bulk_copy());
-  }
-
-  SECTION("duplicate detection within a batch and across a flush") {
-    txn->begin_bulk_copy(1 << 20);  // large — no auto-flush
-
-    // Unique-index probe key is the value prefix; the stored secondary key
-    // has the PK appended. Mirror that: note the prefix, store prefix+pk.
-    auto uprefix = make_key("uk:\x01""alice");
-    auto skey    = make_key("uk:\x01""alice\x01pk42");
-    auto pk      = make_key("pk:42");
-
-    REQUIRE_FALSE(txn->bulk_unique_prefix_exists(uprefix.data(), uprefix.size()));
-    txn->bulk_note_key(uprefix.data(), uprefix.size());
-    // Same value again in the same unflushed batch -> caught.
-    REQUIRE(txn->bulk_unique_prefix_exists(uprefix.data(), uprefix.size()));
-
-    txn->bulk_buffer_put(pk.data(), pk.size(), nullptr, 0);
-    txn->bulk_note_key(pk.data(), pk.size());
-    txn->bulk_buffer_put(skey.data(), skey.size(), nullptr, 0);
-    REQUIRE(txn->bulk_flush(true) == 0);
-
-    // After the flush, bulk_seen_ is cleared but the DB probe still catches it.
-    REQUIRE(txn->bulk_pk_exists(pk.data(), pk.size()));
-    auto prefix = make_key("uk:\x01""ali");
-    REQUIRE(txn->bulk_unique_prefix_exists(prefix.data(), prefix.size()));
-    auto absent = make_key("uk:\x01""zzz");
-    REQUIRE_FALSE(txn->bulk_unique_prefix_exists(absent.data(), absent.size()));
-  }
-
-  SECTION("empty flush is a no-op") {
-    txn->begin_bulk_copy(256);
-    REQUIRE(txn->bulk_flush(true) == 0);
-    REQUIRE(db_key_count() == 0);
-  }
-
-  SECTION("rollback drops the pending batch and leaves bulk mode") {
-    txn->begin_bulk_copy(1 << 20);
-    auto k = make_key("row:pending");
-    txn->bulk_buffer_put(k.data(), k.size(), nullptr, 0);
-    txn->rollback(&thd, true);
-    REQUIRE_FALSE(txn->in_bulk_copy());
-    REQUIRE_FALSE(db_has(k));  // never flushed
-  }
-
-  SECTION("abort_bulk_copy discards batch; mode can be re-entered") {
-    txn->begin_bulk_copy(1 << 20);
-    auto k = make_key("row:aborted");
-    txn->bulk_buffer_put(k.data(), k.size(), nullptr, 0);
-    txn->abort_bulk_copy();
-    REQUIRE_FALSE(txn->in_bulk_copy());
-
-    txn->begin_bulk_copy(256);
-    auto k2 = make_key("row:after");
-    txn->bulk_buffer_put(k2.data(), k2.size(), nullptr, 0);
-    REQUIRE(txn->bulk_flush(true) == 0);
-    REQUIRE(db_has(k2));
-    REQUIRE_FALSE(db_has(k));
-  }
-
-  SECTION("commit flushes the tail of the batch") {
-    txn->begin_bulk_copy(1 << 20);  // no auto-flush; all rows are "tail"
-    for (int i = 0; i < 5; ++i) {
-      auto k = make_key(("tail:" + std::to_string(i)).c_str());
-      txn->bulk_buffer_put(k.data(), k.size(), nullptr, 0);
-      txn->bulk_note_key(k.data(), k.size());
-    }
-    REQUIRE(db_key_count() == 0);
-    REQUIRE(txn->commit(&thd, true) == 0);
-    REQUIRE(db_key_count() == 5);
-    REQUIRE_FALSE(txn->in_bulk_copy());
+    REQUIRE(txn->commit(&thd, true) == HA_ERR_FOUND_DUPP_KEY);
+    REQUIRE(got_pk == pk);
+    REQUIRE(got_row == val2);
+    REQUIRE(g_stub_last_my_error_code == 0);  // the reporter raised it
+    REQUIRE_FALSE(txn->in_deferred_insert());
   }
 }
 
 // =========================================================================
-// Statement rollback inside a multi-statement transaction (BC-249)
+// Savepoints in the server's slots
 // =========================================================================
 
 TEST_CASE_METHOD(MariaDBTxnFixture,
-                 "MariaDBTxn statement rollback keeps earlier statements",
-                 "[txn][rollback][statement]") {
-  auto k1 = make_key("row:1");
-  auto k2 = make_key("row:2");
-  auto k3 = make_key("row:3");
+                 "MariaDBTxn savepoint rollback restores row counts",
+                 "[txn][savepoint]") {
+  auto k1 = make_key("r:1");
+  auto k2 = make_key("r:2");
   auto v = make_value("x");
   THD thd{};
-  handlerton hton{};
   std::atomic<int64_t> rows{0};
+  uint32_t sp1 = 0, sp2 = 0;
 
-  g_stub_thd_options = OPTION_BEGIN;
   auto txn = create_txn();
-
-  // Statement 1: insert row:1.
-  txn->begin_if_needed(&thd, &hton);
+  txn->savepoint_set(&sp1);
   txn->buffer_put(k1.data(), k1.size(), v.data(), v.size());
-  txn->track_row_count_delta(7, &rows, 1);
-  REQUIRE(txn->commit(&thd, false) == 0);
+  txn->track_row_count_delta(1, &rows, 1);
 
-  // Statement 2: insert row:2.
-  txn->begin_if_needed(&thd, &hton);
+  txn->savepoint_set(&sp2);
+  REQUIRE(sp2 != sp1);
   txn->buffer_put(k2.data(), k2.size(), v.data(), v.size());
-  txn->track_row_count_delta(7, &rows, 1);
-  REQUIRE(txn->commit(&thd, false) == 0);
-
-  // Statement 3: buffers row:3 and a delete of row:1, then fails.
-  txn->begin_if_needed(&thd, &hton);
-  txn->buffer_put(k3.data(), k3.size(), v.data(), v.size());
-  txn->track_row_count_delta(7, &rows, 1);
-  txn->buffer_del(k1.data(), k1.size());
-  txn->track_row_count_delta(7, &rows, -1);
+  txn->track_row_count_delta(1, &rows, 1);
   REQUIRE(rows.load() == 2);
-  txn->rollback(&thd, false);
 
-  SECTION("only the failed statement's work is undone") {
+  SECTION("rollback to the inner savepoint") {
+    txn->savepoint_rollback(&sp2);
+    REQUIRE(rows.load() == 1);
     REQUIRE(txn->exists(k1.data(), k1.size()));
-    REQUIRE(txn->exists(k2.data(), k2.size()));
-    REQUIRE_FALSE(txn->exists(k3.data(), k3.size()));
-    REQUIRE(rows.load() == 2);
+    REQUIRE_FALSE(txn->exists(k2.data(), k2.size()));
   }
 
-  SECTION("session commit persists statements 1 and 2") {
+  SECTION("release keeps the work") {
+    txn->savepoint_release(&sp1);
     REQUIRE(txn->commit(&thd, true) == 0);
-    auto probe = create_txn();
-    REQUIRE(probe->exists(k1.data(), k1.size()));
-    REQUIRE(probe->exists(k2.data(), k2.size()));
-    REQUIRE_FALSE(probe->exists(k3.data(), k3.size()));
     REQUIRE(rows.load() == 2);
   }
-
-  SECTION("session rollback after a statement rollback reverts everything") {
-    txn->rollback(&thd, true);
-    REQUIRE(rows.load() == 0);
-    auto probe = create_txn();
-    REQUIRE_FALSE(probe->exists(k1.data(), k1.size()));
-  }
-
-  g_stub_thd_options = 0;
 }
 
 // =========================================================================
-// MergeIterator direction (BC-250): buffered writes merged in scan order
+// Row counters: a null counter is the table's catalog counter
+// =========================================================================
+
+TEST_CASE_METHOD(MariaDBTxnFixture,
+                 "MariaDBTxn null row counter is the catalog's",
+                 "[txn][rollback]") {
+  constexpr uint32_t kTid = 9001;
+  auto k = make_key("r:1");
+  auto v = make_value("x");
+  THD thd{};
+  const auto before = catalog_row_count(kTid);
+
+  auto txn = create_txn();
+  txn->buffer_put(k.data(), k.size(), v.data(), v.size());
+  txn->track_row_count_delta(kTid, nullptr, 1);
+  REQUIRE(catalog_row_count(kTid) == before + 1);
+  txn->rollback(&thd, true);
+  REQUIRE(catalog_row_count(kTid) == before);
+}
+
+// =========================================================================
+// Bulk flush as an HA_ERR_* code
+// =========================================================================
+
+TEST_CASE_METHOD(MariaDBTxnFixture, "MariaDBTxn bulk flush", "[txn][bulk]") {
+  auto txn = create_txn();
+  txn->begin_bulk_copy(1 << 20);
+  auto k = make_key("row:1");
+  txn->bulk_buffer_put(k.data(), k.size(), nullptr, 0);
+  REQUIRE(txn->bulk_flush(true) == 0);
+  REQUIRE(temp_db_.db()->contains_key({}, as_view(k)));
+}
+
+// =========================================================================
+// MergeIterator over the plugin's table and index namespaces
 // =========================================================================
 
 namespace {
@@ -658,6 +312,13 @@ namespace {
 // Row key for table `tid` with a one-byte suffix: [0x02 | tid BE4 | c].
 std::vector<uint8_t> row_key(uint32_t tid, uint8_t c) {
   auto k = table_id_prefix(tid);
+  k.push_back(c);
+  return k;
+}
+
+// Index key for (tid, iid) with a one-byte suffix.
+std::vector<uint8_t> index_key(uint32_t tid, uint16_t iid, uint8_t c) {
+  auto k = index_id_prefix(tid, iid);
   k.push_back(c);
   return k;
 }
@@ -673,126 +334,53 @@ std::vector<uint8_t> collect_keys(MariaDBTxn::MergeIterator &it) {
 }  // namespace
 
 TEST_CASE_METHOD(MariaDBTxnFixture,
-                 "MariaDBTxn MergeIterator honours scan direction",
+                 "MariaDBTxn MergeIterator scans one table or index",
                  "[txn][merge][reverse]") {
   constexpr uint32_t kTid = 42;
+  constexpr uint16_t kIid = 1;
   auto v = make_value("v");
   THD thd{};
 
-  // Committed rows: 1, 3, 5, 7. Another table's row must never appear.
+  // Committed: rows 1 and 3, index entries 1 and 3. Rows of the next table
+  // and entries of the next index must never appear.
   {
     auto seed = create_txn();
-    for (uint8_t c : {1, 3, 5, 7}) {
-      auto k = row_key(kTid, c);
-      seed->buffer_put(k.data(), k.size(), v.data(), v.size());
+    for (uint8_t c : {1, 3}) {
+      auto r = row_key(kTid, c);
+      seed->buffer_put(r.data(), r.size(), v.data(), v.size());
+      auto i = index_key(kTid, kIid, c);
+      seed->buffer_put(i.data(), i.size(), nullptr, 0);
     }
-    auto other = row_key(kTid + 1, 0);
-    seed->buffer_put(other.data(), other.size(), v.data(), v.size());
+    auto other_row = row_key(kTid + 1, 0);
+    seed->buffer_put(other_row.data(), other_row.size(), v.data(), v.size());
+    auto other_idx = index_key(kTid, kIid + 1, 0);
+    seed->buffer_put(other_idx.data(), other_idx.size(), nullptr, 0);
     REQUIRE(seed->commit(&thd, true) == 0);
   }
 
   auto txn = create_txn();
-  // Buffered: insert 2 and 8, delete 5, overwrite 3.
-  for (uint8_t c : {2, 8, 3}) {
-    auto k = row_key(kTid, c);
-    txn->buffer_put(k.data(), k.size(), v.data(), v.size());
-  }
-  {
-    auto k = row_key(kTid, 5);
-    txn->buffer_del(k.data(), k.size());
-  }
+  auto r2 = row_key(kTid, 2);
+  txn->buffer_put(r2.data(), r2.size(), v.data(), v.size());
+  auto i2 = index_key(kTid, kIid, 2);
+  txn->buffer_put(i2.data(), i2.size(), nullptr, 0);
 
-  auto lo = table_id_prefix(kTid);
-  auto hi = table_id_upper_bound(kTid);
-
-  SECTION("forward scan is ascending with buffer merged") {
-    auto it = txn->iter_prefix(lo.data(), lo.size(), hi.data(), hi.size(), kTid);
-    REQUIRE(collect_keys(*it) == std::vector<uint8_t>{1, 2, 3, 7, 8});
+  SECTION("table, both directions") {
+    auto lo = table_id_prefix(kTid);
+    auto hi = table_id_upper_bound(kTid);
+    auto fwd = txn->iter_prefix(lo.data(), lo.size(), hi.data(), hi.size(), kTid);
+    REQUIRE(collect_keys(*fwd) == std::vector<uint8_t>{1, 2, 3});
+    auto rev = txn->riter_prefix(hi.data(), hi.size(), lo.data(), lo.size(), kTid);
+    REQUIRE(collect_keys(*rev) == std::vector<uint8_t>{3, 2, 1});
   }
 
-  SECTION("reverse scan is descending with buffer merged") {
-    auto it = txn->riter_prefix(hi.data(), hi.size(), lo.data(), lo.size(), kTid);
-    REQUIRE(collect_keys(*it) == std::vector<uint8_t>{8, 7, 3, 2, 1});
-  }
-
-  SECTION("reverse scan from a mid-range bound") {
-    auto mid = row_key(kTid, 4);
-    auto it = txn->riter_prefix(mid.data(), mid.size(), lo.data(), lo.size(), kTid);
-    REQUIRE(collect_keys(*it) == std::vector<uint8_t>{3, 2, 1});
-  }
-
-  SECTION("reverse scan when every buffered key is above the bound") {
-    // Only buffered keys 2, 3, 8 exist for this table; bound below all of
-    // them must not surface any of them.
-    auto txn2 = create_txn();
-    auto k = row_key(kTid, 9);
-    txn2->buffer_put(k.data(), k.size(), v.data(), v.size());
-    auto bound = row_key(kTid, 4);
-    auto it = txn2->riter_prefix(bound.data(), bound.size(), lo.data(), lo.size(), kTid);
-    REQUIRE(collect_keys(*it) == std::vector<uint8_t>{3, 1});
-  }
-}
-
-// =========================================================================
-// Savepoints restore the row counters, not only the op log
-// =========================================================================
-
-TEST_CASE_METHOD(MariaDBTxnFixture,
-                 "MariaDBTxn savepoint rollback restores row counts",
-                 "[txn][savepoint]") {
-  auto k1 = make_key("r:1");
-  auto k2 = make_key("r:2");
-  auto k3 = make_key("r:3");
-  auto v = make_value("x");
-  THD thd{};
-  std::atomic<int64_t> rows{0};
-  uint32_t sp1 = 0, sp2 = 0;
-
-  auto txn = create_txn();
-  txn->buffer_put(k1.data(), k1.size(), v.data(), v.size());
-  txn->track_row_count_delta(1, &rows, 1);
-
-  txn->savepoint_set(&sp1);
-  txn->buffer_put(k2.data(), k2.size(), v.data(), v.size());
-  txn->track_row_count_delta(1, &rows, 1);
-
-  txn->savepoint_set(&sp2);
-  txn->buffer_put(k3.data(), k3.size(), v.data(), v.size());
-  txn->track_row_count_delta(1, &rows, 1);
-  REQUIRE(rows.load() == 3);
-
-  SECTION("rollback to the inner savepoint") {
-    txn->savepoint_rollback(&sp2);
-    REQUIRE(rows.load() == 2);
-    REQUIRE(txn->exists(k2.data(), k2.size()));
-    REQUIRE_FALSE(txn->exists(k3.data(), k3.size()));
-  }
-
-  SECTION("rollback to the outer savepoint, then keep working") {
-    txn->savepoint_rollback(&sp1);
-    REQUIRE(rows.load() == 1);
-    REQUIRE_FALSE(txn->exists(k2.data(), k2.size()));
-
-    txn->buffer_put(k3.data(), k3.size(), v.data(), v.size());
-    txn->track_row_count_delta(1, &rows, 1);
-    REQUIRE(rows.load() == 2);
-
-    // The savepoint survives ROLLBACK TO and can be rolled back to again.
-    txn->savepoint_rollback(&sp1);
-    REQUIRE(rows.load() == 1);
-    REQUIRE_FALSE(txn->exists(k3.data(), k3.size()));
-  }
-
-  SECTION("release keeps the work and the counters") {
-    txn->savepoint_release(&sp1);
-    REQUIRE(rows.load() == 3);
-    REQUIRE(txn->commit(&thd, true) == 0);
-    REQUIRE(rows.load() == 3);
-  }
-
-  SECTION("full rollback after a savepoint rollback reverts everything") {
-    txn->savepoint_rollback(&sp2);
-    txn->rollback(&thd, true);
-    REQUIRE(rows.load() == 0);
+  SECTION("index, both directions") {
+    auto lo = index_id_prefix(kTid, kIid);
+    auto hi = index_id_upper_bound(kTid, kIid);
+    auto fwd = txn->iter_index_prefix(lo.data(), lo.size(), hi.data(), hi.size(),
+                                      kTid, kIid);
+    REQUIRE(collect_keys(*fwd) == std::vector<uint8_t>{1, 2, 3});
+    auto rev = txn->riter_index_prefix(hi.data(), hi.size(), lo.data(), lo.size(),
+                                       kTid, kIid);
+    REQUIRE(collect_keys(*rev) == std::vector<uint8_t>{3, 2, 1});
   }
 }

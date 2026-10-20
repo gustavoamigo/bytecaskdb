@@ -55,9 +55,11 @@ add_requires("tinycc 2026.09.26")
 -- C++23 modules, as the engine (the root sets the modules policy for every
 -- target): one interface unit per module (bytecask.sql.<name>), holding its
 -- declarations and definitions, public so sql_layer_tests imports them. The
--- one header is algebra/bc_plan.h, the C contract; algebra/plan_api.cpp, its
--- extern "C" definitions and the struct bc_ctx behind them, is a plain
--- translation unit.
+-- headers are where another toolchain consumes the layer: algebra/bc_plan.h,
+-- the C contract, whose extern "C" definitions and the struct bc_ctx behind
+-- them are algebra/plan_api.cpp, and txn/transaction.h with
+-- common/bytecask_view.h, which the MariaDB plugin's CMake build compiles
+-- (txn/transaction.cpp). Both .cpp files are plain translation units.
 --
 -- Built twice, as the engine is (bytecask, bytecask_testing): sql_layer, and
 -- sql_layer_testing with BYTECASK_SQL_TESTING, which adds the test-only calls
@@ -72,7 +74,7 @@ local function sql_layer_library(name, testing)
         add_includedirs("..", {public = true})
         add_files("codec/*.cppm", "catalog/*.cppm", "algebra/*.cppm", "sql/*.cppm", "plan/*.cppm", "api/*.cppm",
                   {public = true})
-        add_files("algebra/plan_api.cpp")
+        add_files("algebra/plan_api.cpp", "txn/transaction.cpp")
         add_packages("libpg_query", "tinycc", {public = true})
         if testing then
             -- Public: a dependent target may build the module files with its own flags.

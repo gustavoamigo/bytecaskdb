@@ -1,23 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (c) 2026 Gustavo Amigo
 //
-// bytecask_view.h — small adapters between MariaDB's `uint8_t* + size_t`
-// convention and bytecask's `BytesView` (std::span<const std::byte>).
-//
-// These exist so the plugin can keep using raw byte pointers (which is
-// what the MariaDB handler API hands out) while talking to the strongly
-// typed bytecask::DB / Snapshot / WritePlan surface in include/bytecask.hpp.
+// bytecask_view.h — the SQL layer's byte-view adapters
+// (bytecaskdb-sql-layer/common/bytecask_view.h), under the plugin's
+// namespace, and the size limits the plugin opens the DB with.
 
 #pragma once
 
 #include "bytecask.hpp"
-
-#include <cstddef>
-#include <cstdint>
-#include <span>
-#include <vector>
+#include "bytecaskdb-sql-layer/common/bytecask_view.h"
 
 namespace bytecaskdb {
+
+using bytecask::sql::as_view;
+using bytecask::sql::assign_bytes;
+using bytecask::sql::to_uint8;
+using bytecask::sql::u8_data;
 
 // The key and value limits the plugin opens the DB with. A WritePlan built
 // without a snapshot checks the limits it is given, the engine's defaults
@@ -25,40 +23,5 @@ namespace bytecaskdb {
 inline constexpr bytecask::SizeLimits kPluginSizeLimits{
     65535,              // the engine's hard ceiling: collation weights need it
     16 * 1024 * 1024};  // MEDIUMBLOB (16 MiB)
-
-inline bytecask::BytesView as_view(const uint8_t *p, std::size_t n) {
-  return std::as_bytes(std::span{p, n});
-}
-
-inline bytecask::BytesView as_view(const std::vector<uint8_t> &v) {
-  return std::as_bytes(std::span{v.data(), v.size()});
-}
-
-// Copy a Bytes (std::vector<std::byte>) into a std::vector<uint8_t>.
-inline std::vector<uint8_t> to_uint8(const bytecask::Bytes &src) {
-  std::vector<uint8_t> out(src.size());
-  for (std::size_t i = 0; i < src.size(); ++i) {
-    out[i] = std::to_integer<uint8_t>(src[i]);
-  }
-  return out;
-}
-
-inline const uint8_t *u8_data(const bytecask::Bytes &b) {
-  return reinterpret_cast<const uint8_t *>(b.data());
-}
-
-inline const uint8_t *u8_data(bytecask::BytesView v) {
-  return reinterpret_cast<const uint8_t *>(v.data());
-}
-
-inline void assign_bytes(bytecask::Bytes &dst, const uint8_t *p, std::size_t n) {
-  dst.assign(reinterpret_cast<const std::byte *>(p),
-             reinterpret_cast<const std::byte *>(p + n));
-}
-
-inline void assign_bytes(bytecask::Bytes &dst, const std::vector<uint8_t> &src) {
-  dst.assign(reinterpret_cast<const std::byte *>(src.data()),
-             reinterpret_cast<const std::byte *>(src.data() + src.size()));
-}
 
 }  // namespace bytecaskdb
