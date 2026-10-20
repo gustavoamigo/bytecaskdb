@@ -75,10 +75,10 @@ static_assert(static_cast<int>(PhysType::Bytes) == BC_T_BYTES);
 namespace {
 
 constexpr std::uint32_t kNoCursor = UINT32_MAX;
-// What one effect costs a transaction's buffer beyond its key and value
-// bytes: its log entry and its overlay node. Counted so a transaction of
-// many small writes reaches its bound too.
-constexpr std::uint64_t kEffectBytes = 64;
+// What a node of a transaction's overlay, or a guard it keeps, costs beyond
+// the bytes it holds: the allocation's own bookkeeping and the node's links.
+// Counted so a transaction of many small writes reaches its bound too.
+constexpr std::uint64_t kNodeBytes = 64;
 constexpr std::uint32_t kScanFlagMask = BC_SCAN_REVERSE | BC_SCAN_PREFIX;
 
 // What a view is, beyond its bytes: a row read from the engine (a stored
@@ -174,15 +174,18 @@ auto as_u8(const std::byte* p) -> const std::uint8_t* {
 struct Overlay {
   std::map<Bytes, std::optional<Bytes>, BytesLess> points;
   std::map<Bytes, Bytes, BytesLess> ranges;  // lo -> hi: disjoint, none empty
+  std::uint64_t bytes{0};                    // all it holds: keys, values and nodes
 
   [[nodiscard]] auto empty() const -> bool { return points.empty() && ranges.empty(); }
 
-  [[nodiscard]] auto covered(BytesView key) const -> bool {
+  // The deleted range holding `key`, or null.
+  [[nodiscard]] auto range_at(BytesView key) const -> const std::pair<const Bytes, Bytes>* {
     auto it = ranges.upper_bound(key);
-    if (it == ranges.begin()) return false;
+    if (it == ranges.begin()) return nullptr;
     --it;
-    return std::ranges::lexicographical_compare(key, it->second);
+    return std::ranges::lexicographical_compare(key, it->second) ? &*it : nullptr;
   }
+  [[nodiscard]] auto covered(BytesView key) const -> bool { return range_at(key) != nullptr; }
 
   // Whether the overlay decides `key`: nullopt if the snapshot does; else
   // the value, or nullptr for a key the transaction deleted.
@@ -203,40 +206,64 @@ struct Overlay {
     return r != ranges.end() && std::ranges::lexicographical_compare(r->first, hi);
   }
 
-  void put(Bytes key, Bytes value) { points.insert_or_assign(std::move(key), std::optional<Bytes>{std::move(value)}); }
-  void del(Bytes key) { points.insert_or_assign(std::move(key), std::nullopt); }
+  void put(Bytes key, Bytes value) { set(std::move(key), std::move(value)); }
+  void del(Bytes key) { set(std::move(key), std::nullopt); }
 
   // Records a deleted range, merged with every range it meets, and drops
   // the points inside it.
   void del_range(Bytes lo, Bytes hi) {
-    points.erase(points.lower_bound(BytesView{lo}), points.lower_bound(BytesView{hi}));
+    for (auto it = points.lower_bound(BytesView{lo}); it != points.end() && std::ranges::lexicographical_compare(it->first, hi);) {
+      bytes -= cost(it->first, it->second ? it->second->capacity() : 0);
+      it = points.erase(it);
+    }
     auto it = ranges.upper_bound(BytesView{lo});
     if (it != ranges.begin() && !std::ranges::lexicographical_compare(std::prev(it)->second, lo)) --it;
     while (it != ranges.end() && !std::ranges::lexicographical_compare(hi, it->first)) {
       if (std::ranges::lexicographical_compare(it->first, lo)) lo = it->first;
       if (std::ranges::lexicographical_compare(hi, it->second)) hi = it->second;
+      bytes -= cost(it->first, it->second.capacity());
       it = ranges.erase(it);
     }
+    auto add = cost(lo, hi.capacity());
     ranges.emplace(std::move(lo), std::move(hi));
+    bytes += add;
+  }
+
+private:
+  static auto cost(const Bytes& key, std::size_t value_capacity) -> std::uint64_t {
+    return key.capacity() + value_capacity + kNodeBytes;
+  }
+
+  void set(Bytes key, std::optional<Bytes> value) {
+    auto value_bytes = value ? value->capacity() : 0;
+    if (auto it = points.find(BytesView{key}); it != points.end()) {
+      bytes -= it->second ? it->second->capacity() : 0;
+      it->second = std::move(value);
+      bytes += value_bytes;
+      return;
+    }
+    auto add = cost(key, value_bytes);
+    points.emplace(std::move(key), std::move(value));
+    bytes += add;
   }
 };
 
-// The entries a read sees through the view, in key order or its reverse:
-// the snapshot's from `from` on (forward: the first key >= from; reverse:
-// the last key <= from), with the overlay over them. On a key both hold the
-// overlay wins, and its tombstone hides the snapshot's entry; a snapshot
-// entry inside a deleted range is skipped. With `charge`, each record read
-// is charged as it is made, and so is each overlay entry stepped onto, so a
-// read the overlay answers costs what a record read does. key() and value()
-// stay valid until the next call to next().
+// The entries a read sees through the view in [lo, hi), in key order or its
+// reverse: the snapshot's, with the overlay over them. On a key both hold the
+// overlay wins, and its tombstone hides the snapshot's entry. The snapshot's
+// entries inside a deleted range are passed over by seeking past the range,
+// not read one by one. Each record read is charged as it is made, the one
+// that finds the end of [lo, hi) too, and so is each overlay entry stepped
+// onto, so a read the overlay answers costs what a record read does. key()
+// and value() stay valid until the next call to next().
 class ViewEntries {
 public:
-  ViewEntries(const bytecask::Snapshot& snap, const Overlay* overlay, BytesView from, bool reverse, bool charge)
+  ViewEntries(const bytecask::Snapshot& snap, const Overlay* overlay, BytesView lo, BytesView hi, bool reverse)
       : snap_{&snap},
         overlay_{overlay != nullptr && !overlay->empty() ? overlay : nullptr},
-        from_(from.begin(), from.end()),
-        reverse_{reverse},
-        charge_{charge} {}
+        lo_(lo.begin(), lo.end()),
+        hi_(hi.begin(), hi.end()),
+        reverse_{reverse} {}
 
   // The next entry; false at the end, or with the context's error set.
   [[nodiscard]] auto next(bc_ctx* cx) -> bool;
@@ -247,15 +274,15 @@ private:
   using Point = std::map<Bytes, std::optional<Bytes>, BytesLess>::const_iterator;
 
   [[nodiscard]] auto snap_step(bc_ctx* cx) -> bool;
+  void snap_seek(BytesView at);
   [[nodiscard]] auto point_step(bc_ctx* cx) -> bool;
   [[nodiscard]] auto snap_key() const -> BytesView { return reverse_ ? (**rev_).key : (**fwd_).key; }
   [[nodiscard]] auto snap_value() const -> BytesView { return reverse_ ? (**rev_).value : (**fwd_).value; }
 
   const bytecask::Snapshot* snap_;
   const Overlay* overlay_;  // null when there is none to merge
-  Bytes from_;
+  Bytes lo_, hi_;
   bool reverse_;
-  bool charge_;
   std::optional<bytecask::EntryIterator> fwd_;
   std::optional<bytecask::ReverseEntryIterator> rev_;
   Point point_{};
@@ -670,17 +697,17 @@ struct bc_txn {
 
   std::shared_ptr<const Catalog> pinned;
   std::optional<bytecask::Snapshot> snap;  // engaged from the first statement to the commit
-  std::vector<Effect> log;
+  // The writes: the commit is built from the overlay, its ranges first,
+  // since every point in it is newer than any range over it.
   Overlay overlay;
-  std::uint64_t bytes{0};  // what the log and the overlay hold, against max_bytes
+  std::vector<Effect> guards;          // the statements' guards, in their order
+  std::uint64_t guard_bytes{0};        // what `guards` holds
+  std::vector<std::uint32_t> written;  // the tables the writes are in
   // A statement failed: nothing but bc_txn_free is left. Set before any
-  // part of a failing statement could reach the log or the overlay, so an
-  // aborted transaction is never committed half-applied.
+  // part of a failing statement could reach the overlay or the guards, so
+  // an aborted transaction is never committed half-applied.
   bool aborted{false};
   bool done{false};  // committed, or its commit was attempted
-
-  bc_error_code error{BC_OK};  // of bc_txn_commit
-  std::string message;
 
   bc_txn(bytecask::DB* d, LiveCatalog* l, std::uint64_t max) : db{d}, live{l}, max_bytes{max} {}
 };
@@ -705,26 +732,37 @@ auto bytes_cmp(BytesView a, BytesView b) -> std::strong_ordering {
                                                 });
 }
 
+// Positions the snapshot's iterator on the first key >= at (forward) or the
+// last key < at (reverse).
+void ViewEntries::snap_seek(BytesView at) {
+  if (!reverse_) {
+    fwd_.emplace(snap_->iter_from({}, at).begin());
+    return;
+  }
+  rev_.emplace(snap_->riter_from({}, at).begin());
+  if (*rev_ != std::default_sentinel && std::is_eq(bytes_cmp((**rev_).key, at))) ++*rev_;
+}
+
 auto ViewEntries::snap_step(bc_ctx* cx) -> bool {
+  if (!reverse_ ? !fwd_ : !rev_) {
+    snap_seek(!reverse_ ? BytesView{lo_} : BytesView{hi_});
+  } else if (!reverse_) {
+    ++*fwd_;
+  } else {
+    ++*rev_;
+  }
   for (;;) {
-    if (!reverse_) {
-      if (!fwd_) {
-        fwd_.emplace(snap_->iter_from({}, from_).begin());
-      } else {
-        ++*fwd_;
-      }
-      snap_live_ = *fwd_ != std::default_sentinel;
-    } else {
-      if (!rev_) {
-        rev_.emplace(snap_->riter_from({}, from_).begin());
-      } else {
-        ++*rev_;
-      }
-      snap_live_ = *rev_ != std::default_sentinel;
-    }
+    snap_live_ = !reverse_ ? *fwd_ != std::default_sentinel : *rev_ != std::default_sentinel;
     if (!snap_live_) return true;
-    if (charge_ && !cx->charge()) return false;
-    if (overlay_ == nullptr || !overlay_->covered(snap_key())) return true;
+    if (!cx->charge()) return false;
+    auto k = snap_key();
+    if (!reverse_ ? !std::is_lt(bytes_cmp(k, hi_)) : std::is_lt(bytes_cmp(k, lo_))) {
+      snap_live_ = false;
+      return true;
+    }
+    const auto* range = overlay_ != nullptr ? overlay_->range_at(k) : nullptr;
+    if (range == nullptr) return true;
+    snap_seek(!reverse_ ? BytesView{range->second} : BytesView{range->first});
   }
 }
 
@@ -732,10 +770,10 @@ auto ViewEntries::point_step(bc_ctx* cx) -> bool {
   const auto& points = overlay_->points;
   if (!started_) {
     if (!reverse_) {
-      point_ = points.lower_bound(BytesView{from_});
+      point_ = points.lower_bound(BytesView{lo_});
       point_live_ = point_ != points.end();
     } else {
-      point_ = points.upper_bound(BytesView{from_});
+      point_ = points.lower_bound(BytesView{hi_});
       point_live_ = point_ != points.begin();
       if (point_live_) --point_;
     }
@@ -746,7 +784,10 @@ auto ViewEntries::point_step(bc_ctx* cx) -> bool {
     point_live_ = point_ != points.begin();
     if (point_live_) --point_;
   }
-  return !point_live_ || !charge_ || cx->charge();
+  if (point_live_) {
+    point_live_ = !reverse_ ? std::is_lt(bytes_cmp(point_->first, hi_)) : !std::is_lt(bytes_cmp(point_->first, lo_));
+  }
+  return !point_live_ || cx->charge();
 }
 
 auto ViewEntries::next(bc_ctx* cx) -> bool {
@@ -842,32 +883,19 @@ auto view_count(bc_ctx* cx, BytesView lo, BytesView hi, std::size_t limit) -> st
 // Positions a cursor on its next entry within bounds; false at the end.
 // Every entry is read through the view, and charged as it is read.
 auto cursor_advance(bc_ctx* cx, Cursor& c) -> bool {
-  auto reverse = (c.flags & BC_SCAN_REVERSE) != 0;
   if (!c.entries) {
-    // A reverse scan starts at the last key <= its upper bound.
-    auto from = !reverse ? c.lo : c.hi.empty() ? bytecask::sql::key_successor(c.prefix) : c.hi;
-    c.entries.emplace(*cx->base, cx->overlay, from, reverse, true);
+    // The scan's bounds, inside its table's or index's keys.
+    auto end = bytecask::sql::key_successor(c.prefix);
+    BytesView lo = std::is_lt(bytes_cmp(c.lo, c.prefix)) ? BytesView{c.prefix} : BytesView{c.lo};
+    BytesView hi = !c.hi.empty() && std::is_lt(bytes_cmp(c.hi, end)) ? BytesView{c.hi} : BytesView{end};
+    c.entries.emplace(*cx->base, cx->overlay, lo, hi, (c.flags & BC_SCAN_REVERSE) != 0);
   }
-  while (true) {
-    if (!c.entries->next(cx)) return false;
-    auto k = c.entries->key();
-    auto v = c.entries->value();
-    if (!has_prefix(k, c.prefix)) {
-      if (reverse && !c.hi.empty() && std::is_gt(bytes_cmp(k, c.prefix))) continue;  // the successor itself
-      return false;
-    }
-    if (std::is_lt(bytes_cmp(k, c.lo))) {
-      if (reverse) return false;
-      continue;
-    }
-    if (!c.hi.empty() && std::is_gteq(bytes_cmp(k, c.hi))) {
-      if (reverse) continue;
-      return false;
-    }
-    c.key.assign(k.begin(), k.end());
-    c.value.assign(v.begin(), v.end());
-    return true;
-  }
+  if (!c.entries->next(cx)) return false;
+  auto k = c.entries->key();
+  auto v = c.entries->value();
+  c.key.assign(k.begin(), k.end());
+  c.value.assign(v.begin(), v.end());
+  return true;
 }
 
 // Reads one record through the view into the arena. A record at a row key
@@ -1383,8 +1411,8 @@ struct Entry {
   if (cx->overlay != nullptr && cx->overlay->meets(prefix, bytecask::sql::key_successor(prefix))) {
     // The overlay holds entries with this prefix, or deleted some: the
     // first entry the view holds at or after it decides, each read charged.
-    ViewEntries entries{*cx->base, cx->overlay, prefix, false, true};
-    taken = entries.next(cx) && has_prefix(entries.key(), prefix);
+    ViewEntries entries{*cx->base, cx->overlay, prefix, bytecask::sql::key_successor(prefix), false};
+    taken = entries.next(cx);
     if (!cx->ok()) return false;
   } else {
     auto keys = cx->base->keys_from({}, prefix);
@@ -1643,6 +1671,8 @@ bc_txn* bc_txn_new(bc_db* db, const bc_catalog* cat, uint64_t max_bytes) {
 
 void bc_txn_free(bc_txn* txn) { delete txn; }
 
+uint64_t bc_txn_catalog_version(const bc_txn* txn) { return txn->pinned ? txn->pinned->version() : 0; }
+
 bool bc_txn_add(bc_ctx* cx) {
   bc_txn* txn = nullptr;
   BC_GUARD_BEGIN
@@ -1657,32 +1687,36 @@ bool bc_txn_add(bc_ctx* cx) {
     txn->aborted = true;
     return false;
   }
-  std::uint64_t add = 0;
-  for (const auto& e : cx->effects) add += e.a.size() + e.b.size() + kEffectBytes;
-  if (add > txn->max_bytes - std::min(txn->bytes, txn->max_bytes)) {
-    cx->fail(BC_E_LIMIT, "the transaction's writes would pass its bound of " + std::to_string(txn->max_bytes) +
-                             " bytes");
-    txn->aborted = true;
-    return false;
-  }
   // Aborted until the statement is wholly in: a failure part-way through
-  // leaves a log and an overlay no commit may use.
+  // leaves an overlay no commit may use.
   txn->aborted = true;
-  txn->log.reserve(txn->log.size() + cx->effects.size());
+  for (auto id : written_tables(*txn->pinned, cx->effects)) {
+    if (std::ranges::find(txn->written, id) == txn->written.end()) txn->written.push_back(id);
+  }
   for (auto& e : cx->effects) {
     switch (e.kind) {
-      case EffectKind::Put: txn->overlay.put(e.a, e.b); break;
-      case EffectKind::Del: txn->overlay.del(e.a); break;
-      case EffectKind::DelRange: txn->overlay.del_range(e.a, e.b); break;
+      case EffectKind::Put: txn->overlay.put(std::move(e.a), std::move(e.b)); break;
+      case EffectKind::Del: txn->overlay.del(std::move(e.a)); break;
+      case EffectKind::DelRange: txn->overlay.del_range(std::move(e.a), std::move(e.b)); break;
       case EffectKind::GuardUnchanged:
       case EffectKind::GuardRange:
       case EffectKind::GuardPresent:
-      case EffectKind::GuardAbsent: break;
+      case EffectKind::GuardAbsent:
+        txn->guard_bytes += e.a.capacity() + e.b.capacity() + kNodeBytes;
+        txn->guards.push_back(std::move(e));
+        break;
     }
-    txn->log.push_back(std::move(e));
   }
   cx->effects.clear();
-  txn->bytes += add;
+  if (txn->overlay.bytes + txn->guard_bytes > txn->max_bytes) {
+    // What it holds is freed now: an aborted transaction keeps nothing.
+    txn->overlay = {};
+    txn->guards = {};
+    txn->guard_bytes = 0;
+    cx->fail(BC_E_LIMIT, "the transaction's writes would pass its bound of " + std::to_string(txn->max_bytes) +
+                             " bytes");
+    return false;
+  }
   txn->aborted = false;
   return true;
   BC_GUARD_END(cx)
@@ -1701,28 +1735,37 @@ enum bc_commit_result bc_txn_commit(bc_ctx* cx, bc_txn* txn, bool sync) {
     return BC_FAILED;
   }
   txn->done = true;
-  if (txn->log.empty()) {
+  const auto& ov = txn->overlay;
+  if (ov.empty() && txn->guards.empty()) {
     txn->snap.reset();
     return BC_COMMITTED;
   }
-  // The log in the order the statements made it: the engine applies a
-  // plan's operations in order, so a put after a range delete over it stays.
+  // The ranges before the points: a point is newer than any range over it,
+  // and the engine applies a plan's operations in order.
   bytecask::WritePlan plan{std::move(*txn->snap)};
   txn->snap.reset();
-  for (const auto& e : txn->log) {
+  for (const auto& [lo, hi] : ov.ranges) plan.del_range(lo, hi);
+  for (const auto& [key, value] : ov.points) {
+    if (value) {
+      plan.put(key, *value);
+    } else {
+      plan.del(key);
+    }
+  }
+  for (const auto& e : txn->guards) {
     switch (e.kind) {
-      case EffectKind::Put: plan.put(e.a, e.b); break;
-      case EffectKind::Del: plan.del(e.a); break;
-      case EffectKind::DelRange: plan.del_range(e.a, e.b); break;
       case EffectKind::GuardUnchanged: plan.ensure_unchanged(e.a); break;
       case EffectKind::GuardRange: plan.ensure_range_unchanged(e.a, e.b); break;
       case EffectKind::GuardPresent: plan.ensure_present(e.a); break;
       case EffectKind::GuardAbsent: plan.ensure_absent(e.a); break;
+      case EffectKind::Put:
+      case EffectKind::Del:
+      case EffectKind::DelRange: break;  // never kept as guards
     }
   }
   // As bc_ctx_commit: a DDL on a table the transaction wrote, committed
   // since its snapshot, makes the commit a conflict.
-  for (auto id : written_tables(*txn->pinned, txn->log)) plan.ensure_unchanged(bytecask::sql::table_record_key(id));
+  for (auto id : txn->written) plan.ensure_unchanged(bytecask::sql::table_record_key(id));
 #ifdef BYTECASK_SQL_TESTING
   if (cx->before_commit) cx->before_commit();
 #endif
@@ -2805,22 +2848,18 @@ void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
   if (!t->indexes.empty()) {
     // Each row in the range takes its entries with it. A row inserted into
     // the range after the snapshot makes the commit a conflict: the engine
-    // checks a planned range delete's range for changes. Every read is
-    // charged before it is made, the one that finds the range's end too:
-    // begin() reads the first record, each ++ the next.
+    // checks a planned range delete's range for changes. Every record read
+    // is charged, the one that finds the range's end too (ViewEntries).
     // The rows are the view's: in a transaction, an earlier statement's
     // row takes the entries that statement wrote.
-    if (!cx->charge()) return;
-    ViewEntries rows{*cx->base, cx->overlay, range->lo, false, false};
+    ViewEntries rows{*cx->base, cx->overlay, range->lo, range->hi, false};
     while (rows.next(cx)) {
-      if (!std::is_lt(bytes_cmp(rows.key(), range->hi))) break;
       if (!current_row(cx, *t, rows.value())) return;
       for (const auto& ix : t->indexes) {
         Entry en;
         if (!encode_entry(cx, *t, ix, rows.value(), en)) return;
         cx->push_effect(EffectKind::Del, std::move(en.key));
       }
-      if (!cx->charge()) return;
     }
     if (!cx->ok()) return;
   }

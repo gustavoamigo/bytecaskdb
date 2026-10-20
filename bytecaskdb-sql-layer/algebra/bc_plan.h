@@ -136,14 +136,16 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
    run in a context, begun with bc_ctx_begin_txn and ended with bc_txn_add:
    they read its snapshot, pinned at the first statement with its catalog
    version, through the overlay of the earlier statements' writes. A statement
-   that fails, or whose writes pass max_bytes (BC_E_LIMIT), aborts the
-   transaction, which is then only freed. bc_txn_commit submits the
-   statements' writes as one batch; its errors are the context's. */
+   that fails, or that takes what the transaction holds past max_bytes
+   (BC_E_LIMIT), aborts the transaction, which is then only freed.
+   bc_txn_commit submits the statements' writes as one batch; its errors
+   are the context's. */
 typedef struct bc_txn bc_txn;
 bc_txn *bc_txn_new(bc_db *db, const bc_catalog *cat, uint64_t max_bytes);
 void    bc_txn_free(bc_txn *);                                                /* a transaction not committed writes nothing */
 void    bc_ctx_begin_txn(bc_ctx *, bc_txn *, const bc_params *params, bc_budget budget);
 bool    bc_txn_add(bc_ctx *);                     /* ends the statement: its writes join, or the transaction aborts */
+uint64_t bc_txn_catalog_version(const bc_txn *);  /* the catalog version pinned at the first statement; 0 before it */
 enum bc_commit_result bc_txn_commit(bc_ctx *, bc_txn *, bool sync);
 
 /* Parameters and results */

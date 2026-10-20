@@ -147,6 +147,21 @@ void insert_then_read(bc_ctx* cx) {
   bc_emit_count(cx, bc_exists(cx, bc_key_params(cx, kW, 0, 1)) ? 1 : 0);
 }
 
+// SELECT id, c FROM w WHERE id >= $1 AND id < $2, forward or, with $3 = 1,
+// in reverse
+void scan_w_range(bc_ctx* cx) {
+  auto flags = bc_param_i64(cx, 2) != 0 ? BC_SCAN_REVERSE : BC_SCAN_FORWARD;
+  bc_cursor c = bc_scan_open(cx, kW, bc_key_params(cx, kW, 0, 1), bc_key_params(cx, kW, 1, 1),
+                             static_cast<std::uint32_t>(flags));
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    bc_emit_begin(cx);
+    bc_emit_col(cx, row, kId);
+    bc_emit_col(cx, row, kC);
+    bc_emit_end(cx);
+  }
+}
+
 auto id_c() -> std::vector<PhysType> { return {PhysType::I64, PhysType::I64}; }
 
 struct Ran {
@@ -157,11 +172,11 @@ struct Ran {
 
 // One statement of `txn`: begun, run and ended on the fixture's context.
 auto stmt(Fixture& f, bc_txn* txn, bc_plan_fn plan, std::vector<bc_value> p,
-          const std::vector<PhysType>& result = {}) -> Ran {
+          const std::vector<PhysType>& result = {}, bc_budget budget = {}) -> Ran {
   auto ps = params(std::move(p));
   SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), type_codes(result), f.cat().version()};
   auto ref = sr.get();
-  bc_ctx_begin_txn(f.cx, txn, &ps, {});
+  bc_ctx_begin_txn(f.cx, txn, &ps, budget);
   bc_ctx_run(f.cx, plan, &ref);
   auto added = bc_txn_add(f.cx);
   Ran out{static_cast<int>(bc_error(f.cx)), bc_ctx_affected(f.cx), {}};
@@ -430,6 +445,45 @@ TEST_CASE("transactions: statements read their transaction's earlier writes thro
   CHECK(rolled_back > 5);
   CHECK(aborted > 5);
   CHECK(ranges > 20);
+}
+
+TEST_CASE("transactions: a read stays in its bounds and passes a deleted range in one seek, every read charged",
+          "[sql][txn]") {
+  Fixture f;
+  create_w(f);
+  constexpr std::int64_t kRows = 400;
+  for (std::int64_t id = 0; id < kRows; ++id) {
+    REQUIRE(autocommit(f, insert_w, {id, bc_value{}, bc_value{}, id}) == BC_COMMITTED);
+  }
+  TxnPtr txn{f};
+  // Rows 10..389 deleted as one range, and 390..399 one by one: tombstones
+  // past the end of a scan of [0, 10).
+  REQUIRE(stmt(f, txn.p, del_range_w, {std::int64_t{10}, std::int64_t{390}}).error == BC_OK);
+  for (std::int64_t id = 390; id < kRows; ++id) REQUIRE(stmt(f, txn.p, delete_w, {id}).error == BC_OK);
+  auto ids = [](const Ran& r) {
+    std::vector<std::int64_t> out;
+    for (const auto& row : r.rows) out.push_back(std::get<std::int64_t>(row[0]));
+    return out;
+  };
+  // A budget far below the 390 entries the range and the tombstones hold:
+  // the scans read their ten rows, a seek past the range and the record
+  // that ends them, and none of the tombstones beyond.
+  bc_budget tight{40, 0};
+  for (std::int64_t reverse : {0, 1}) {
+    auto in_range = stmt(f, txn.p, scan_w_range, {std::int64_t{0}, std::int64_t{10}, reverse}, id_c(), tight);
+    REQUIRE(in_range.error == BC_OK);
+    CHECK(in_range.rows.size() == 10);
+    // Across the deleted range: the rows on both sides of it, nothing inside.
+    auto across = stmt(f, txn.p, scan_w_range, {std::int64_t{5}, kRows, reverse}, id_c(), tight);
+    REQUIRE(across.error == BC_OK);
+    auto expected = std::vector<std::int64_t>{5, 6, 7, 8, 9};
+    if (reverse != 0) std::ranges::reverse(expected);
+    CHECK(ids(across) == expected);
+  }
+  // A budget too small for the rows themselves still ends the scan: the
+  // reads it makes are charged.
+  CHECK(stmt(f, txn.p, scan_w_range, {std::int64_t{0}, std::int64_t{10}, std::int64_t{0}}, id_c(), {5, 0}).error ==
+        BC_E_BUDGET);
 }
 
 TEST_CASE("transactions: a statement does not see its own writes; the next one does", "[sql][txn]") {

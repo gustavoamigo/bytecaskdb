@@ -12,7 +12,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -21,6 +23,7 @@
 
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
 #include "include/bytecask.hpp"
+#include "tests/alloc_faults.h"
 
 import bytecask.sql.api;
 import bytecask.sql.tests.util;
@@ -212,4 +215,150 @@ TEST_CASE("embedded API: transactions on different threads run concurrently and 
   CHECK(balance(*db, 0) == kThreads * kEach);
   for (std::int64_t i = 1; i <= kThreads; ++i) CHECK(balance(*db, i) == kEach);
   INFO("conflicts " << conflicts.load());
+}
+
+TEST_CASE("embedded API: a moved-from transaction has ended", "[sql][api][txn]") {
+  sql_test::TempDir dir{"api_txn"};
+  auto db = open_db(dir);
+  auto t = db->begin();
+  auto u = std::move(t);
+  CHECK_FALSE(t.is_open());  // NOLINT(bugprone-use-after-move): what a moved-from handle does is the test
+  CHECK_FALSE(t.is_aborted());
+  CHECK_THROWS_AS(t.execute("SELECT bal FROM acct WHERE id = $1", {std::int64_t{1}}), std::logic_error);
+  CHECK_THROWS_AS((void)t.commit(), std::logic_error);
+  t.rollback();
+  u.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{1}});
+  t = std::move(u);  // u is moved from now, t the open one
+  CHECK(t.commit() == CommitOutcome::Committed);
+  CHECK(balance(*db, 1) == 1);
+}
+
+TEST_CASE("embedded API: a transaction may outlive its database, and close() racing it ends it", "[sql][api][txn]") {
+  sql_test::TempDir dir{"api_txn"};
+  std::optional<Transaction> t;
+  {
+    auto db = open_db(dir);
+    t.emplace(db->begin());
+    t->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{1}});
+  }  // the database is destroyed, and closed, with the transaction open
+  CHECK_FALSE(t->is_open());
+  CHECK_THROWS_AS(t->execute("SELECT bal FROM acct WHERE id = $1", {std::int64_t{1}}), DbClosed);
+  t->rollback();
+  t.reset();
+  auto db = Database::open(dir.path());
+  CHECK(balance(*db, 1) == std::nullopt);
+  // close() from another thread while a transaction runs statements: each
+  // statement either runs or is refused, and the transaction ends, never
+  // left looking open.
+  auto u = db->begin();
+  std::atomic<bool> started{false};
+  std::thread worker{[&] {
+    for (std::int64_t i = 0;; ++i) {
+      try {
+        (void)u.execute("SELECT bal FROM acct WHERE id = $1", {i});
+        started = true;
+      } catch (const DbClosed&) {
+        return;
+      } catch (const std::logic_error&) {
+        return;
+      }
+    }
+  }};
+  while (!started) std::this_thread::yield();
+  db->close();
+  worker.join();
+  CHECK_FALSE(u.is_open());
+}
+
+TEST_CASE("embedded API: a statement that no longer fits the catalog a transaction pinned is 40001",
+          "[sql][api][txn]") {
+  sql_test::TempDir dir{"api_txn"};
+  auto db = open_db(dir);
+  db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{100}});
+  auto t = db->begin();
+  CHECK(txn_balance(t, 1) == 100);  // the first statement pins the catalog
+  db->execute("DROP TABLE acct");
+  db->execute("CREATE TABLE acct (id BIGINT PRIMARY KEY, bal BIGINT NOT NULL)");
+  db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{7}});
+  CHECK(balance(*db, 1) == 7);  // the shared statement, recompiled for the live catalog
+  // The pinned catalog is older than the statement's plan: the transaction
+  // fails as its commit would, and ends; the statement is not recompiled
+  // back for it.
+  CHECK_THROWS_AS(t.execute("SELECT bal FROM acct WHERE id = $1", {std::int64_t{1}}), SerializationFailure);
+  CHECK_FALSE(t.is_open());
+  auto compiled = db->compilations();
+  auto u = db->begin();
+  CHECK(txn_balance(u, 1) == 7);
+  CHECK(u.commit() == CommitOutcome::Committed);
+  CHECK(db->compilations() == compiled);
+}
+
+TEST_CASE("embedded API: transactions commit concurrently while other threads prepare and run autocommit statements",
+          "[sql][api][txn]") {
+  sql_test::TempDir dir{"api_txn"};
+  auto db = open_db(dir);
+  constexpr int kCommitters = 4, kEach = 30, kPrepares = 40;
+  for (std::int64_t i = 0; i < kCommitters; ++i) db->execute("INSERT INTO acct VALUES ($1, $2)", {i, std::int64_t{0}});
+  std::atomic<int> done{0};
+  std::vector<std::thread> threads;
+  for (std::int64_t n = 0; n < kCommitters; ++n) {
+    threads.emplace_back([&, n] {
+      for (int i = 0; i < kEach; ++i) {
+        auto t = db->begin();
+        auto bal = txn_balance(t, n).value();
+        t.execute("UPDATE acct SET bal = $2 WHERE id = $1", {n, bal + 1});
+        // Each writes its own row: none conflicts.
+        CHECK(t.commit() == CommitOutcome::Committed);
+      }
+      ++done;
+    });
+  }
+  threads.emplace_back([&] {
+    // Distinct texts: each prepare is a cache miss and a compile.
+    for (int i = 0; i < kPrepares; ++i) {
+      (void)db->prepare("SELECT bal FROM acct WHERE id = $1" + std::string(static_cast<std::size_t>(i) + 1, ' '));
+    }
+  });
+  threads.emplace_back([&] {
+    while (done.load() < kCommitters) (void)balance(*db, 0);
+  });
+  for (auto& th : threads) th.join();
+  for (std::int64_t i = 0; i < kCommitters; ++i) CHECK(balance(*db, i) == kEach);
+}
+
+TEST_CASE("embedded API: an allocation failure in commit() never changes its outcome", "[sql][api][txn][alloc]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
+  for (long nth = 1;; ++nth) {
+    sql_test::TempDir dir{"api_txn"};
+    auto db = open_db(dir);
+    db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{100}});
+    auto a = db->begin();
+    auto b = db->begin();
+    a.execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{90}});
+    b.execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{50}});
+    REQUIRE(b.commit() == CommitOutcome::Committed);
+    std::string outcome;
+    auto fired = false;
+    {
+      bytecask::testing::ScopedAllocFaults faults{nth, false};
+      try {
+        (void)a.commit();
+        outcome = "committed";
+      } catch (const SerializationFailure&) {
+        outcome = "conflict";
+      } catch (const ExecError& e) {
+        outcome = e.code() == BC_E_MEMORY ? "memory" : "error";
+      } catch (const std::bad_alloc&) {
+        outcome = "bad_alloc";
+      }
+      fired = faults.report().fired;
+    }
+    INFO("allocation " << nth << ": " << outcome);
+    // A failure before the outcome is known is BC_E_MEMORY; after it, the
+    // conflict is still the conflict.
+    CHECK((outcome == "conflict" || outcome == "memory"));
+    CHECK_FALSE(a.is_open());
+    if (!db->engine_for_testing().is_degraded()) CHECK(balance(*db, 1) == 50);
+    if (!fired) break;
+  }
 }
