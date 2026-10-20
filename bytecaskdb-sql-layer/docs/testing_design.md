@@ -104,7 +104,8 @@ Found so far. The machine expects each one, so it does not fail on them.
 - **A parameter compared with columns of two SQL types is refused.**
   `WHERE a = $1 AND b = $1`, with `a DOUBLE PRECISION` and `b REAL`,
   `INTEGER` and `BIGINT`, or `DECIMAL`s of two scales, is refused at bind:
-  a compared parameter has one SQL type, checked before the plan runs.
+  a compared parameter has one SQL type, checked before the plan runs. A
+  `DECIMAL` of scale 0 counts as a `BIGINT`, so that pair is not refused.
   PostgreSQL runs it. The oracle sends it two `float8` parameters, one per
   `$1` (`pg_params`), and with `$1 = 0.1` PostgreSQL compares
   `real::float8 = 0.1`, false, where a `REAL` key part keyed as the float

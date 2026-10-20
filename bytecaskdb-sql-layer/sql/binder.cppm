@@ -272,7 +272,8 @@ public:
   // columns of two types that share a physical type (DOUBLE PRECISION and
   // REAL, INTEGER and BIGINT, DECIMALs of two scales), one value could be
   // keyed as two numbers. Refused, where PostgreSQL runs it
-  // (docs/testing_design.md, *Known differences*).
+  // (docs/testing_design.md, *Known differences*). A DECIMAL of scale 0 is
+  // compared as a BIGINT (compared_type): its integer is the number itself.
   void use_param(std::uint32_t n, PhysType t, std::int32_t pos, const Column* compared = nullptr) {
     if (params_.size() <= n) params_.resize(n + 1);
     auto& p = params_[n];

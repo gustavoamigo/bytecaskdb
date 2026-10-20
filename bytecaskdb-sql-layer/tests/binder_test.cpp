@@ -104,7 +104,7 @@ TEST_CASE("binder: anything outside the scope is rejected with a message and pos
     sql_test::Fixture c2;
     c2.ddl(std::get<Ddl>(bind_sql(c2.cat(), "CREATE TABLE dr (a DOUBLE PRECISION, b REAL, i INTEGER, j BIGINT, "
                                             "v VARCHAR(4), w TEXT, d2 NUMERIC(10, 2), d4 NUMERIC(10, 4), "
-                                            "e2 NUMERIC(12, 2), n0 NUMERIC(10, 0), PRIMARY KEY (a, b))")
+                                            "e2 NUMERIC(12, 2), n0 NUMERIC(10, 0), s SMALLINT, PRIMARY KEY (a, b))")
                              .stmt));
     auto refusal = [&](std::string_view where) {
       return rejected(c2.cat(), "SELECT a FROM dr WHERE " + std::string(where)).first;
@@ -123,6 +123,13 @@ TEST_CASE("binder: anything outside the scope is rejected with a message and pos
     CHECK_NOTHROW(bind_sql(c2.cat(), "SELECT a FROM dr WHERE a = $1 AND b = $2 AND d2 = $3 AND e2 = $3"));
     // At scale 0 a DECIMAL's integer is the number itself: a BIGINT.
     CHECK_NOTHROW(bind_sql(c2.cat(), "SELECT a FROM dr WHERE a = $1 AND b = $2 AND n0 = $3 AND j = $3"));
+    // Only a BIGINT's: not an INTEGER's, a SMALLINT's or a scale 2 DECIMAL's.
+    CHECK(refusal("a = $1 AND b = $2 AND n0 = $3 AND i = $3") ==
+          "parameter $3 is compared with n0 (numeric(10,0)) and i (integer)");
+    CHECK(refusal("a = $1 AND b = $2 AND n0 = $3 AND s = $3") ==
+          "parameter $3 is compared with n0 (numeric(10,0)) and s (smallint)");
+    CHECK(refusal("a = $1 AND b = $2 AND n0 = $3 AND d2 = $3") ==
+          "parameter $3 is compared with n0 (numeric(10,0)) and d2 (numeric(10,2))");
     CHECK_NOTHROW(bind_sql(c2.cat(), "SELECT a FROM dr WHERE a = $1 AND b = $2 AND v = $3 AND w = $3"));
   }
   CHECK(rejected(cat, "SELECT id FROM t WHERE id = $2").first ==
