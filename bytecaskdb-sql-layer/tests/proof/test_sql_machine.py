@@ -22,6 +22,7 @@ The fixed cases at the end call the same steps in a set order.
 from __future__ import annotations
 
 import dataclasses
+import decimal
 import shutil
 import tempfile
 
@@ -173,7 +174,10 @@ class SqlMachine(RuleBasedStateMachine):
         return layer
 
     def existing_keys(self, t: Table) -> list[tuple]:
-        out = o.run_pg(self.pg.conn, f"SELECT {', '.join(t.pk)} FROM {t.name}")
+        # Ordered, so a draw from it is reproducible from its seed.
+        out = o.run_pg(
+            self.pg.conn, f"SELECT {', '.join(t.pk)} FROM {t.name} ORDER BY {', '.join(t.pk)}"
+        )
         assert out.error is None, out.detail
         return list(out.rows)
 
@@ -613,7 +617,9 @@ def test_parameters_and_tables_the_layer_refuses_are_sql_errors(tmp_path):
 def test_closed_and_misused_params(tmp_path):
     db = bytecask_sql.open(str(tmp_path))
     db.execute("CREATE TABLE t (k BIGINT PRIMARY KEY)")
-    for params in ("1", b"\x01"):  # a str or bytes is not a sequence of parameters
+    # A str or bytes is not a sequence of parameters; a dict or set is not a
+    # sequence; a str with a lone surrogate has no UTF-8.
+    for params in ("1", b"\x01", {1: 1}, {1}, ("\ud800",)):
         try:
             db.execute("INSERT INTO t VALUES ($1)", params)
         except bytecask_sql.SqlError:
@@ -627,6 +633,25 @@ def test_closed_and_misused_params(tmp_path):
         pass
     else:
         raise AssertionError("a closed database converted parameters")
+
+
+def test_decimal_is_exact_under_any_context(tmp_path):
+    db = bytecask_sql.open(str(tmp_path))
+    try:
+        # DML takes no literals, so the values come from DEFAULTs.
+        db.execute("CREATE TABLE t (k BIGINT PRIMARY KEY, d DECIMAL(18, 4) DEFAULT 12345678901234.5678)")
+        db.execute("CREATE TABLE u (k BIGINT PRIMARY KEY, d DECIMAL(18, 4) DEFAULT -0.0001)")
+        for t in ("t", "u"):
+            db.execute(f"INSERT INTO {t} (k) VALUES ($1)", (1,))
+        with decimal.localcontext() as ctx:
+            ctx.prec = 2
+            ctx.traps[decimal.Inexact] = True
+            ctx.traps[decimal.Rounded] = True
+            rows = [db.execute(f"SELECT d FROM {t} WHERE k = $1", (1,))["rows"][0] for t in ("t", "u")]
+        assert rows == [(decimal.Decimal("12345678901234.5678"),), (decimal.Decimal("-0.0001"),)]
+        assert rows[0][0].as_tuple().exponent == -4
+    finally:
+        db.close()
 
 
 def test_placeholders_to_psycopg():

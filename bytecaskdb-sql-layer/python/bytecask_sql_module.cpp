@@ -94,7 +94,15 @@ auto to_datum(nb::handle v, std::size_t i) -> sql::Value {
     return i64;
   }
   if (nb::isinstance<nb::float_>(v)) return nb::cast<double>(v);
-  if (nb::isinstance<nb::str>(v)) return to_bytes(nb::cast<std::string_view>(v));
+  if (nb::isinstance<nb::str>(v)) {
+    Py_ssize_t size = 0;
+    const char* utf8 = PyUnicode_AsUTF8AndSize(v.ptr(), &size);
+    if (utf8 == nullptr) {  // a lone surrogate has no UTF-8
+      PyErr_Clear();
+      throw sql::ParamError(param + " is a str that is not valid Unicode");
+    }
+    return to_bytes({utf8, static_cast<std::size_t>(size)});
+  }
   if (nb::isinstance<nb::bytes>(v)) {
     auto b = nb::cast<nb::bytes>(v);
     return to_bytes({b.c_str(), b.size()});
@@ -120,7 +128,12 @@ auto to_python(const sql::Value& v, sql::SqlType t) -> nb::object {
   }
   if (const auto* i = std::get_if<std::int64_t>(&v)) {
     if (t.kind == sql::SqlKind::Decimal) {
-      return nb::borrow(decimal_type)(*i).attr("scaleb")(-static_cast<int>(t.scale));
+      // Built from its digits, so no decimal context can round it or raise.
+      auto magnitude = *i < 0 ? 0 - static_cast<std::uint64_t>(*i) : static_cast<std::uint64_t>(*i);
+      nb::list digits;
+      for (auto c : std::to_string(magnitude)) digits.append(c - '0');
+      return nb::borrow(decimal_type)(
+          nb::make_tuple(*i < 0 ? 1 : 0, nb::tuple(digits), -static_cast<int>(t.scale)));
     }
     return nb::int_(*i);
   }
@@ -169,12 +182,14 @@ auto catalog(const sql::Database& db) -> nb::list {
   return tables;
 }
 
-auto execute(sql::Database& db, std::string_view text, const nb::sequence& params) -> nb::dict {
+auto execute(sql::Database& db, std::string_view text, const nb::object& params) -> nb::dict {
   // A closed database is Closed whatever the parameters are.
   if (!db.is_open()) throw bytecask::DbClosed();
   // A str or bytes is a sequence, of characters or ints: never parameters.
-  if (nb::isinstance<nb::str>(params) || nb::isinstance<nb::bytes>(params)) {
-    throw sql::ParamError("params is a sequence of parameters, not a str or bytes");
+  // A dict or set is not a sequence: its order is not the placeholders'.
+  if (nb::isinstance<nb::str>(params) || nb::isinstance<nb::bytes>(params) ||
+      PySequence_Check(params.ptr()) == 0) {
+    throw sql::ParamError("params is a sequence of parameters, such as a tuple or list");
   }
   std::vector<sql::Value> values;
   for (auto p : params) values.push_back(to_datum(p, values.size()));
