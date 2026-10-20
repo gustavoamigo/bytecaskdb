@@ -361,6 +361,9 @@ struct ErrorCode {
 
 }  // namespace
 
+// A context leaves the transaction it was begun on; defined with bc_txn.
+void txn_detach(bc_txn* txn, bc_ctx* cx) noexcept;
+
 struct bc_ctx {
   bytecask::DB* db;
   LiveCatalog* live;
@@ -654,6 +657,7 @@ struct bc_ctx {
 
   void drop_execution_state() {
     cursors.clear();  // iterators before the snapshot and the overlay they read
+    if (txn != nullptr) txn_detach(txn, this);
     base = nullptr;
     overlay = nullptr;
     txn = nullptr;
@@ -716,9 +720,33 @@ struct bc_txn {
   // an aborted transaction is never committed half-applied.
   bool aborted{false};
   bool done{false};  // committed, or its commit was attempted
+  // The contexts begun on it and not yet reset: they point into its
+  // snapshot and overlay. Re-pinning refuses while one is, and freeing it
+  // detaches them.
+  std::vector<bc_ctx*> attached;
 
   bc_txn(bytecask::DB* d, LiveCatalog* l, std::uint64_t max) : db{d}, live{l}, max_bytes{max} {}
 };
+
+void txn_detach(bc_txn* txn, bc_ctx* cx) noexcept { std::erase(txn->attached, cx); }
+
+namespace {
+
+// Aborts the transaction: a failed statement leaves only bc_txn_free, so
+// what it holds goes now, the snapshot that holds vacuum back first. The
+// contexts begun on it are detached; each keeps its error.
+void txn_abort(bc_txn* txn) noexcept {
+  txn->aborted = true;
+  while (!txn->attached.empty()) txn->attached.back()->drop_execution_state();
+  txn->snap.reset();
+  txn->pinned.reset();
+  txn->overlay = {};
+  txn->guards = {};
+  txn->guard_bytes = 0;
+  txn->written = {};
+}
+
+}  // namespace
 
 // The whole body of every extern "C" entry point a plan or the server calls
 // is one guard: an exception, an allocation failure included, never crosses
@@ -1570,6 +1598,7 @@ void bc_ctx_begin_txn(bc_ctx* cx, bc_txn* txn, const bc_params* params, bc_budge
   // First, before anything that can fail: a statement that fails while it
   // begins must still abort its transaction at bc_txn_add.
   cx->txn = txn;
+  txn->attached.push_back(cx);
   cx->error = BC_OK;
   cx->detail = 0;
   cx->message.clear();
@@ -1696,12 +1725,16 @@ bc_txn* bc_txn_new(bc_db* db, const bc_catalog* cat, uint64_t max_bytes) {
   }
 }
 
-void bc_txn_free(bc_txn* txn) { delete txn; }
+void bc_txn_free(bc_txn* txn) {
+  if (txn == nullptr) return;
+  while (!txn->attached.empty()) txn->attached.back()->drop_execution_state();
+  delete txn;
+}
 
 uint64_t bc_txn_catalog_version(const bc_txn* txn) { return txn->pinned ? txn->pinned->version() : 0; }
 
 bool bc_txn_repin(bc_txn* txn) {
-  if (txn->statements != 0 || txn->aborted || txn->done) return false;
+  if (txn->statements != 0 || txn->aborted || txn->done || !txn->attached.empty()) return false;
   txn->snap.reset();
   txn->pinned.reset();
   return true;
@@ -1734,7 +1767,7 @@ bool bc_txn_add(bc_ctx* cx) {
   // The statement's cursors read the overlay this changes.
   cx->cursors.clear();
   if (!cx->ok()) {
-    txn->aborted = true;
+    txn_abort(txn);
     return false;
   }
   // The bound is checked before anything is merged, from the statement's
@@ -1756,14 +1789,9 @@ bool bc_txn_add(bc_ctx* cx) {
   }
   auto tables = written_tables(*txn->pinned, cx->effects);
   if (txn_holds(*txn, guards, tables.size()) + pending > txn->max_bytes) {
-    // What it holds is freed now: an aborted transaction keeps nothing.
-    txn->aborted = true;
-    txn->overlay = {};
-    txn->guards = {};
-    txn->guard_bytes = 0;
-    txn->written = {};
     cx->fail(BC_E_LIMIT, "the transaction's writes would pass its bound of " + std::to_string(txn->max_bytes) +
                              " bytes");
+    txn_abort(txn);
     return false;
   }
   // Aborted until the statement is wholly in: a failure part-way through
@@ -1791,7 +1819,7 @@ bool bc_txn_add(bc_ctx* cx) {
   txn->aborted = false;
   return true;
   BC_GUARD_END(cx)
-  if (txn != nullptr) txn->aborted = true;
+  if (txn != nullptr) txn_abort(txn);
   return false;
 }
 

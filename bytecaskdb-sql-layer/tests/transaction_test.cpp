@@ -520,6 +520,7 @@ TEST_CASE("transactions: a transaction no statement was added to can be pinned a
   bc_ctx_begin_txn(f.cx, txn.p, &none, {});
   auto v = bc_txn_catalog_version(txn.p);
   CHECK(v == f.cat().version());
+  CHECK_FALSE(bc_txn_repin(txn.p));  // the context still reads its snapshot
   bc_ctx_reset(f.cx);  // the statement did not run: nothing was added
   f.ddl(bytecask::sql::CreateIndexDdl{"w_c", "w", {{"c"}}});
   CHECK(bc_txn_repin(txn.p));
@@ -528,6 +529,30 @@ TEST_CASE("transactions: a transaction no statement was added to can be pinned a
   CHECK_FALSE(bc_txn_repin(txn.p));                // a statement is in
   CHECK(commit(f, txn.p) == BC_COMMITTED);
   check_indexes_exact(f);
+}
+
+TEST_CASE("transactions: an aborted transaction lets go of its snapshot; a freed one detaches its contexts",
+          "[sql][txn]") {
+  Fixture f;
+  create_w(f);
+  {
+    TxnPtr txn{f};
+    REQUIRE(stmt(f, txn.p, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("a"), std::int64_t{1}}).error == BC_OK);
+    CHECK(bc_txn_catalog_version(txn.p) != 0);
+    CHECK(stmt(f, txn.p, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("b"), std::int64_t{1}}).error ==
+          BC_E_CONSTRAINT);
+    CHECK(bc_txn_catalog_version(txn.p) == 0);  // the pin and the snapshot went with the abort
+    CHECK(commit(f, txn.p) == BC_FAILED);
+  }
+  // A transaction freed while a context still reads it: the context is
+  // detached, and resetting it later touches nothing freed.
+  auto* txn = bc_txn_new(&f.bdb, &f.bcat, std::uint64_t{1} << 20);
+  REQUIRE(txn != nullptr);
+  auto none = params({});
+  bc_ctx_begin_txn(f.cx, txn, &none, {});
+  bc_txn_free(txn);
+  bc_ctx_reset(f.cx);
+  CHECK(autocommit(f, insert_w, {std::int64_t{2}, std::int64_t{2}, bytes("c"), std::int64_t{2}}) == BC_COMMITTED);
 }
 
 TEST_CASE("transactions: a statement does not see its own writes; the next one does", "[sql][txn]") {
@@ -728,7 +753,6 @@ TEST_CASE("transactions: an allocation failure in a statement or the commit is B
     auto r = BC_FAILED;
     bytecask::testing::AllocFaultReport report;
     {
-      [[maybe_unused]] const bytecask::testing::ExpectedLeaks leaks;  // the engine's, as in plan_alloc_faults_test
       bytecask::testing::ScopedAllocFaults faults{nth, false};
       try {
         for (std::size_t i = 0; i < steps.size() && error == BC_OK; ++i) {

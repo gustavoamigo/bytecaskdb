@@ -86,8 +86,9 @@ auto Database::begin(TransactionOptions = {}) -> Transaction;
   reports COMMIT or ROLLBACK, so a caller never takes a rollback for a
   commit. A transaction with no writes and no guards commits nothing and
   returns `Committed`.
-- **After a failed statement the transaction is aborted,** as in
-  PostgreSQL: every later `execute()` is refused with SQLSTATE 25P02
+- **After a failed statement the transaction is aborted,** and lets go at
+  once of its snapshot, its pinned catalog and its writes: an aborted handle
+  holds back no vacuum, and keeps only its state. As in PostgreSQL: every later `execute()` is refused with SQLSTATE 25P02
   ("current transaction is aborted, commands ignored until end of
   transaction block"), and `commit()` rolls it back without an error, as
   PostgreSQL's COMMIT does (owner's decision, 2026-10-20).
@@ -218,6 +219,12 @@ statements, needs no guard.
 | Constraint or other error in a statement | `ExecError`, never retried | Raised by `execute()` for the failing statement; the transaction is then aborted (25P02) |
 | The commit failed and degraded the engine: its batch may have reached the data file | `TransactionResolutionUnknown`, SQLSTATE **08007**, never retried | The same, and the handle is closed. Never "nothing written": a reopen finds the writes whole or not at all. |
 
+A DDL statement's commit follows the same rule. The rule is decided by
+whether the engine was degraded before the commit and is after: another
+writer's failure in between makes a commit that wrote nothing report 08007,
+the safe direction. Reporting it exactly needs the engine to say whether
+this batch was appended (#531).
+
 Conflicts are detected only at commit. A statement never waits and never
 fails because another transaction holds a row (see *Known differences*).
 
@@ -334,7 +341,8 @@ differences*.
   writes are taken in, from the statement's own pending effects: one that
   would take the transaction past it fails with `BC_E_LIMIT` (SQLSTATE
   54000) without the transaction allocating for it, the transaction is
-  aborted like any failed statement's, and what it held is freed at once.
+  aborted like any failed statement's, and what it held is freed with the
+  abort.
   The count is a conservative bound, never less than the memory held: each
   buffer's capacity plus an allocator overhead, each map node's full size,
   and the guards' and written tables' vectors at the size they could grow

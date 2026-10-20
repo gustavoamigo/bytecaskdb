@@ -349,7 +349,6 @@ TEST_CASE("embedded API: an allocation failure in commit() never changes its out
           REQUIRE(b.commit() == CommitOutcome::Committed);
         }
         {
-          [[maybe_unused]] const bytecask::testing::ExpectedLeaks leaks;  // the engine's, as in plan_alloc_faults_test
           bytecask::testing::ScopedAllocFaults faults{nth, false};
           try {
             (void)a.commit();
@@ -393,7 +392,7 @@ TEST_CASE("embedded API: an allocation failure in commit() never changes its out
   }
 }
 
-TEST_CASE("embedded API: an allocation failure while an autocommit error is reported never changes it",
+TEST_CASE("embedded API: an allocation failure in an autocommit statement never changes its outcome",
           "[sql][api][alloc]") {
   if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
   sql_test::TempDir dir{"api_txn"};
@@ -401,50 +400,115 @@ TEST_CASE("embedded API: an allocation failure while an autocommit error is repo
   db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{100}});
   const auto& insert = db->prepare("INSERT INTO acct VALUES ($1, $2)");
   const auto& update = db->prepare("UPDATE acct SET bal = $2 WHERE id = $1");
-  // A duplicate key, and a conflict on every retry: every allocation of the
-  // call failed in turn. The error is the call's own, or BC_E_MEMORY, and
-  // nothing is written. std::bad_alloc only from the call's first
-  // allocations, the parameters' copy, before anything runs: never once the
-  // plan has run, when it would hide the outcome.
-  const std::vector<Value> params{std::int64_t{1}, std::int64_t{7}};  // built before the faults are armed
-  for (auto conflict : {false, true}) {
-    db->conflict_on_every_commit_for_testing(conflict);
+  // A duplicate key, a conflict on every retry, and a new row: every
+  // allocation of the call failed in turn. The outcome is the call's own,
+  // BC_E_MEMORY with nothing written, or, exactly when the failure left the
+  // engine degraded after the batch may have reached it, 08007.
+  // std::bad_alloc only from the call's first allocations, the parameters'
+  // copy, before anything runs: never once the plan has run, when it would
+  // hide the outcome.
+  enum class Case { Duplicate, Conflict, Insert };
+  for (auto which : {Case::Duplicate, Case::Conflict, Case::Insert}) {
+    db->conflict_on_every_commit_for_testing(which == Case::Conflict);
     auto ran = false;
+    auto unknowns = 0;
     for (long nth = 1;; ++nth) {
+      // Built before the faults are armed; each insert's row its own.
+      const std::vector<Value> params{which == Case::Insert ? std::int64_t{1000} + nth : std::int64_t{1},
+                                      std::int64_t{7}};
       std::string outcome;
       auto fired = false;
       {
-        [[maybe_unused]] const bytecask::testing::ExpectedLeaks leaks;  // the engine's, as in plan_alloc_faults_test
         bytecask::testing::ScopedAllocFaults faults{nth, false};
         try {
-          (void)db->execute(conflict ? update : insert, params);
+          (void)db->execute(which == Case::Conflict ? update : insert, params);
           outcome = "ran";
+        } catch (const TransactionResolutionUnknown&) {
+          outcome = "unknown";
         } catch (const ExecError& e) {
-          outcome = e.conflict() ? "conflict" : e.code() == BC_E_MEMORY ? "memory" : e.code() == BC_E_CONSTRAINT ? "duplicate" : "error";
+          outcome = e.conflict()                     ? "conflict"
+                    : e.code() == BC_E_MEMORY        ? "memory"
+                    : e.code() == BC_E_CONSTRAINT    ? "duplicate"
+                    : e.code() == BC_E_DEGRADED      ? "degraded"
+                                                     : "error";
         } catch (const std::bad_alloc&) {
           outcome = "bad_alloc";
         }
         fired = faults.report().fired;
       }
-      INFO((conflict ? "conflict" : "duplicate") << ", allocation " << nth << ": " << outcome);
-      if (db->engine_for_testing().is_degraded()) {
-        // The test's own conflict hook writes; a failed allocation in that
-        // write degrades the engine, which is not the call under test.
-        db->engine_for_testing().resume();
-        if (!fired) break;
-        continue;
-      }
+      INFO("case " << static_cast<int>(which) << ", allocation " << nth << ": " << outcome);
+      auto degraded = db->engine_for_testing().is_degraded();
       if (outcome == "bad_alloc") {
         CHECK_FALSE(ran);
       } else {
         ran = true;
-        CHECK((outcome == (conflict ? "conflict" : "duplicate") || outcome == "memory"));
+        switch (which) {
+          case Case::Duplicate:
+            CHECK((outcome == "duplicate" || outcome == "memory"));
+            CHECK_FALSE(degraded);
+            break;
+          case Case::Conflict:
+            // The test's own conflict hook writes before the commit: a
+            // failed allocation there can degrade the engine, and the
+            // commit is then refused, with nothing written; never unknown.
+            CHECK((outcome == "conflict" || outcome == "memory" || (degraded && outcome == "degraded")));
+            break;
+          case Case::Insert:
+            CHECK((outcome == "ran" || outcome == "memory" || outcome == "unknown"));
+            CHECK(degraded == (outcome == "unknown"));
+            if (outcome == "memory") CHECK(balance(*db, std::int64_t{1000} + nth) == std::nullopt);
+            if (outcome == "unknown") ++unknowns;
+            break;
+        }
       }
+      if (degraded) db->engine_for_testing().resume();
       if (!fired) break;
     }
+    if (which == Case::Insert) CHECK(unknowns > 0);  // the sweep reaches failures after the append
   }
   db->conflict_on_every_commit_for_testing(false);
   CHECK(balance(*db, 1) == 100);
+}
+
+TEST_CASE("embedded API: a DDL whose commit may have reached the engine is 08007", "[sql][api][alloc]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
+  auto unknowns = 0;
+  for (long nth = 1;; ++nth) {
+    sql_test::TempDir dir{"api_ddl_unknown"};
+    std::string outcome;
+    auto fired = false;
+    {
+      auto db = open_db(dir);
+      for (std::int64_t i = 0; i < 8; ++i) db->execute("INSERT INTO acct VALUES ($1, $2)", {i, i});
+      const auto& ddl = db->prepare("CREATE INDEX acct_bal ON acct (bal)");
+      {
+        bytecask::testing::ScopedAllocFaults faults{nth, false};
+        try {
+          (void)db->execute(ddl, {});
+          outcome = "ran";
+        } catch (const TransactionResolutionUnknown&) {
+          outcome = "unknown";
+        } catch (const std::bad_alloc&) {
+          outcome = "failed";
+        } catch (const std::exception&) {
+          outcome = "failed";
+        }
+        fired = faults.report().fired;
+      }
+      INFO("allocation " << nth << ": " << outcome);
+      CHECK(db->engine_for_testing().is_degraded() == (outcome == "unknown"));
+      if (outcome == "unknown") ++unknowns;
+    }
+    // Whichever way it went, it went whole: the index is there or not, the
+    // rows as they were. A failure that was not 08007 wrote nothing.
+    auto db = Database::open(dir.path());
+    auto has_index = db->catalog()->index("acct_bal").second != nullptr;
+    if (outcome == "ran") CHECK(has_index);
+    if (outcome == "failed") CHECK_FALSE(has_index);
+    for (std::int64_t i = 0; i < 8; ++i) CHECK(balance(*db, i) == i);
+    if (!fired) break;
+  }
+  CHECK(unknowns > 0);
 }
 
 TEST_CASE("embedded API: a statement runs only on the database that prepared it", "[sql][api][txn]") {

@@ -180,16 +180,12 @@ private:
     RowLayout result_layout;                 // how its result rows decode
     std::vector<bc_col_ref> col_refs;
     bc_schema_ref ref{};  // points into the members above; catalog_version: the one compiled against
-    // The catalog version the plan was compiled for or last checked to fit
-    // (bc_ctx_check). At that version the API makes no check of its own
-    // before a run; the runtime verifies the plan on every run regardless.
+    // Autocommit only: the catalog version the plan was compiled for, or
+    // was verified to fit by bc_ctx_check. At that version autocommit makes
+    // no check of its own before a run, which checks the parameters against
+    // the plan that will run; the runtime verifies the plan on every run
+    // regardless. A transaction's statements do not use it.
     mutable std::atomic<std::uint64_t> checked{0};
-
-    [[nodiscard]] auto run_ref() const -> bc_schema_ref {
-      auto r = ref;
-      r.catalog_version = checked.load(std::memory_order_acquire);
-      return r;
-    }
   };
   [[nodiscard]] auto compiled() const -> std::shared_ptr<const Compiled> {
     std::lock_guard<std::mutex> lock{mu_};
@@ -228,9 +224,22 @@ enum class TxnState : std::uint8_t { Open, Aborted, Ended };
 // A transaction's resources, on the heap so that a moved Transaction keeps
 // them where the Database's list of open transactions finds them.
 struct TxnHandle {
-  bc_ctx* cx{nullptr};
+  bc_ctx* cx{nullptr};    // null once ended or aborted: an aborted transaction keeps no snapshot
   bc_txn* txn{nullptr};
   std::atomic<TxnState> state{TxnState::Ended};  // close() ends it from another thread
+
+  void release() noexcept {
+    bc_ctx_free(cx);
+    bc_txn_free(txn);  // a transaction not committed writes nothing
+    cx = nullptr;
+    txn = nullptr;
+  }
+  // Aborted: what it held is freed now, the snapshot that holds vacuum back
+  // first. Only the state is left, for rollback() or commit() to end.
+  void abort() noexcept {
+    release();
+    state.store(TxnState::Aborted);
+  }
 };
 
 // What a Database shares with its transactions, and what outlives it while
@@ -356,10 +365,13 @@ public:
   // transaction's catalog is pinned, before the plan is checked against it.
   // Set it while no transaction runs.
   void after_txn_pin_for_testing(std::function<void()> hook) { after_txn_pin_ = std::move(hook); }
+  // Test only: the live catalog, for a test that holds a DDL mid-commit.
+  [[nodiscard]] auto live_catalog_for_testing() -> LiveCatalog& {
+    if (life_->closing.load()) throw DbClosed();
+    return *live_;
+  }
   // Test only: the engine under the layer, for a test that stores what the
   // layer would refuse, to check that a read refuses it too.
-  // Test only: the live catalog, for a test that holds a DDL mid-commit.
-  [[nodiscard]] auto live_catalog_for_testing() -> LiveCatalog& { return *live_; }
   [[nodiscard]] auto engine_for_testing() -> DB& {
     if (life_->closing.load()) throw DbClosed();
     return *db_;
@@ -532,10 +544,7 @@ void Database::close() {
   {
     std::lock_guard<std::mutex> open{life_->open_mu};
     for (auto* h : life_->open) {
-      bc_txn_free(h->txn);
-      bc_ctx_free(h->cx);
-      h->txn = nullptr;
-      h->cx = nullptr;
+      h->release();
       h->state.store(TxnState::Ended);
     }
     life_->open.clear();
@@ -691,6 +700,8 @@ auto Database::execute(const Statement& stmt, const std::vector<Value>& params) 
       throw ExecError(e.what(), BC_E_CONSTRAINT, e.detail().encode());
     } catch (const DdlInProgress&) {
       throw_serialization_failure(kDdlInProgress);  // a DDL never waits for another
+    } catch (const DdlOutcomeUnknown& e) {
+      throw_keeping_outcome(e.what(), [](const std::string& m) { return TransactionResolutionUnknown{m}; });
     }
     Rows out;
     out.affected = 0;
@@ -723,17 +734,14 @@ auto Database::fitting_plan(bc_ctx* cx, const Statement& stmt, const std::vector
 #endif
   bc_params bp{params};
   bc_ctx_begin(cx, &bp, {});
-  auto ref = c->run_ref();
-  auto fits = bc_ctx_check(cx, &ref);
+  auto fits = bc_ctx_check(cx, &c->ref);
   auto stale = !fits && bc_error(cx) == BC_E_LAYOUT && bc_error_detail(cx) == BC_L_INCOMPATIBLE;
-  if (!fits && !stale) {
-    ExecError e{bc_error_message(cx), bc_error(cx), bc_error_detail(cx)};
-    bc_ctx_reset(cx);
-    throw e;
-  }
+  if (!fits && !stale) throw_context_error(cx);
   bc_ctx_reset(cx);
   if (stale) return recompile(stmt);
-  c->checked.store(version);
+  // Marked with the version it was verified against: the context pinned it
+  // between the two reads, so only when no DDL moved the version meanwhile.
+  if (live_->current()->version() == version) c->checked.store(version);
   return c;
 }
 
@@ -781,35 +789,38 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
       if (after_txn_pin_) after_txn_pin_();
 #endif
       auto c = stmt.compiled();  // taken after the pin: the plan of a DDL that raced it, if one did
-      auto ref = c->run_ref();
-      // A plan checked at the pinned version is not checked here again:
-      // bc_ctx_run verifies it as it runs.
-      if (ref.catalog_version != pinned) {
-        if (!bc_ctx_check(cx, &ref)) {
-          if (bc_error(cx) != BC_E_LAYOUT || bc_error_detail(cx) != BC_L_INCOMPATIBLE) {
-            (void)bc_txn_add(cx);  // the statement failed: the transaction aborts
-            throw_context_error(cx);
+      // A plan that does not fit the pin has run nothing: bc_ctx_run
+      // verifies it before the plan's body. Recompiled, pinned again, or
+      // 40001.
+      auto stale = [&] {
+        bc_ctx_reset(cx);
+        if (attempt < kTxnPlanAttempts) {
+          if (pinned == live_->current()->version()) {
+            (void)recompile(stmt);
+            return;
           }
-          bc_ctx_reset(cx);  // nothing ran: the transaction is as it was
-          if (attempt < kTxnPlanAttempts) {
-            if (pinned == live_->current()->version()) {
-              (void)recompile(stmt);
-              continue;
-            }
-            if (bc_txn_repin(txn)) continue;
-          }
-          throw_serialization_failure(kCatalogChanged);
+          if (bc_txn_repin(txn)) return;
         }
-        c->checked.store(pinned);
-        ref.catalog_version = pinned;
-      }
+        throw_serialization_failure(kCatalogChanged);
+      };
+      auto incompatible = [&] { return bc_error(cx) == BC_E_LAYOUT && bc_error_detail(cx) == BC_L_INCOMPATIBLE; };
       try {
         check_params(*c);
       } catch (...) {
+        // Parameters a stale plan refuses may fit the plan it recompiles
+        // to: only then is it checked before running.
+        if (!bc_ctx_check(cx, &c->ref) && incompatible()) {
+          stale();
+          continue;
+        }
         bc_ctx_reset(cx);
         throw;
       }
-      bc_ctx_run(cx, c->code->fn(), &ref);
+      bc_ctx_run(cx, c->code->fn(), &c->ref);
+      if (incompatible()) {
+        stale();
+        continue;
+      }
       // The statement's writes join the transaction, or it aborts.
       if (!bc_txn_add(cx)) throw_context_error(cx);
       return results(cx, *c, Rows{});
@@ -817,8 +828,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
   }
   auto c = fitting_plan(cx, stmt, params);
   check_params(*c);
-  auto ref = c->run_ref();
-  auto r = bc_execute(cx, c->code->fn(), &ref, &bp, {}, true, kMaxRetries);
+  auto r = bc_execute(cx, c->code->fn(), &c->ref, &bp, {}, true, kMaxRetries);
   // bc_ctx_run checks the plan against the catalog it pinned. A plan a DDL
   // made incompatible (BC_E_LAYOUT with BC_L_INCOMPATIBLE) is recompiled
   // from its text and run once more; one a DDL left compatible keeps
@@ -827,8 +837,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
     bc_ctx_reset(cx);
     c = recompile(stmt);
     check_params(*c);
-    ref = c->run_ref();
-    r = bc_execute(cx, c->code->fn(), &ref, &bp, {}, true, kMaxRetries);
+    r = bc_execute(cx, c->code->fn(), &c->ref, &bp, {}, true, kMaxRetries);
   }
   if (r == BC_CONFLICT) {
     bc_ctx_reset(cx);
@@ -907,10 +916,7 @@ void Transaction::end_locked() noexcept {
     std::lock_guard<std::mutex> lock{life_->open_mu};
     life_->open.erase(h_.get());
   }
-  bc_txn_free(h_->txn);  // a transaction not committed writes nothing
-  bc_ctx_free(h_->cx);
-  h_->txn = nullptr;
-  h_->cx = nullptr;
+  h_->release();
   h_->state.store(TxnState::Ended);
 }
 
@@ -939,7 +945,7 @@ auto Transaction::run_locked(const Statement& stmt, const std::vector<Value>& pa
   } catch (...) {
     // Every other error aborts the transaction, as in PostgreSQL: a
     // statement refused before it ran too.
-    h_->state.store(TxnState::Aborted);
+    h_->abort();
     throw;
   }
 }
@@ -966,7 +972,7 @@ auto Transaction::execute(std::string_view sql, const std::vector<Value>& params
   try {
     stmt = &db_->prepare_locked(sql);
   } catch (...) {
-    h_->state.store(TxnState::Aborted);  // a statement that does not parse or bind aborts it too
+    h_->abort();  // a statement that does not parse or bind aborts it too
     throw;
   }
   return run_locked(*stmt, params);
