@@ -58,36 +58,55 @@ add_requires("tinycc 2026.09.26")
 -- one header is algebra/bc_plan.h, the C contract; algebra/plan_api.cpp, its
 -- extern "C" definitions and the struct bc_ctx behind them, is a plain
 -- translation unit.
-target("sql_layer")
-    set_kind("static")
-    set_default(false)
-    add_deps("bytecask")
-    add_rules("bytecask.native_flags")
-    add_includedirs("..", {public = true})
-    add_files("codec/*.cppm", "catalog/*.cppm", "algebra/*.cppm", "sql/*.cppm", "plan/*.cppm", "api/*.cppm",
-              {public = true})
-    add_files("algebra/plan_api.cpp")
-    add_packages("libpg_query", "tinycc", {public = true})
-    if (get_config("sanitizer") or ""):find("memory", 1, true) then
-        -- No std-module probe under -nostdinc++; see bytecask.catch2 in the
-        -- root xmake.lua, which does the same for the test target.
-        set_policy("build.c++.modules.std", false)
-    end
-    -- Public: tcc_loader.cppm, a public interface unit, uses both, and a
-    -- dependent target may build its module file with its own flags.
-    add_defines("SQL_LAYER_ALGEBRA_DIR=\"" .. path.join(os.scriptdir(), "algebra") .. "\"", {public = true})
-    on_config(function (t)
-        local tcc = t:pkg("tinycc")
-        if tcc then
-            t:add("defines", "SQL_LAYER_TCC_LIB_PATH=\"" .. path.join(tcc:installdir(), "lib", "tcc") .. "\"",
+--
+-- Built twice, as the engine is (bytecask, bytecask_testing): sql_layer, and
+-- sql_layer_testing with BYTECASK_SQL_TESTING, which adds the test-only calls
+-- of the embedded API (Database::table_rows). The tests and the bytecask_sql
+-- module link the testing build; nothing else does.
+local function sql_layer_library(name, testing)
+    target(name)
+        set_kind("static")
+        set_default(false)
+        add_deps("bytecask")
+        add_rules("bytecask.native_flags")
+        add_includedirs("..", {public = true})
+        add_files("codec/*.cppm", "catalog/*.cppm", "algebra/*.cppm", "sql/*.cppm", "plan/*.cppm", "api/*.cppm",
                   {public = true})
+        add_files("algebra/plan_api.cpp")
+        add_packages("libpg_query", "tinycc", {public = true})
+        if testing then
+            -- Public: a dependent target may build the module files with its own flags.
+            add_defines("BYTECASK_SQL_TESTING", {public = true})
+            -- Linked into the bytecask_sql Python module, a shared object, as the
+            -- engine's library is into bytecaskdb_python. The production build
+            -- links into no shared object.
+            add_cxxflags("-fPIC", {force = true})
         end
-    end)
+        if (get_config("sanitizer") or ""):find("memory", 1, true) then
+            -- No std-module probe under -nostdinc++; see bytecask.catch2 in the
+            -- root xmake.lua, which does the same for the test target.
+            set_policy("build.c++.modules.std", false)
+        end
+        -- Public: tcc_loader.cppm, a public interface unit, uses both, and a
+        -- dependent target may build its module file with its own flags.
+        add_defines("SQL_LAYER_ALGEBRA_DIR=\"" .. path.join(os.scriptdir(), "algebra") .. "\"", {public = true})
+        on_config(function (t)
+            local tcc = t:pkg("tinycc")
+            if tcc then
+                t:add("defines", "SQL_LAYER_TCC_LIB_PATH=\"" .. path.join(tcc:installdir(), "lib", "tcc") .. "\"",
+                      {public = true})
+            end
+        end)
+    target_end()
+end
+
+sql_layer_library("sql_layer", false)
+sql_layer_library("sql_layer_testing", true)
 
 target("sql_layer_tests")
     set_kind("binary")
     set_default(false)
-    add_deps("sql_layer")
+    add_deps("sql_layer_testing")
     add_rules("bytecask.native_flags")
     add_rules("bytecask.catch2")
     set_languages("c17", "c++23")
@@ -116,3 +135,17 @@ target("sql_layer_bench")
     add_deps("sql_layer")
     add_rules("bytecask.native_flags")
     add_files("bench/*.cpp")
+
+-- The Python module the proof tests drive (tests/proof/, #515): open,
+-- execute, close, the catalog, and a table's rows. Not built by default.
+-- Build: xmake f --sql_layer=y && xmake build bytecask_sql
+-- Usage: PYTHONPATH=bytecaskdb-sql-layer/python python3 -m pytest bytecaskdb-sql-layer/tests/proof
+target("bytecask_sql")
+    set_kind("shared")
+    set_default(false)
+    add_deps("sql_layer_testing")
+    add_rules("bytecask.native_flags")
+    add_rules("bytecask.nanobind")
+    set_values("nanobind.module", "bytecask_sql")
+    set_values("nanobind.targetdir", "bytecaskdb-sql-layer/python")
+    add_files("python/bytecask_sql_module.cpp")

@@ -50,6 +50,8 @@ using bytecask::sql::Bytes;
 using bytecask::sql::BytesView;
 using bytecask::sql::Catalog;
 using bytecask::sql::ColumnSlot;
+using bytecask::sql::ConstraintDetail;
+using bytecask::sql::has_prefix;
 using bytecask::sql::Datum;
 using bytecask::sql::Index;
 using bytecask::sql::KeyLayout;
@@ -66,8 +68,6 @@ static_assert(static_cast<int>(PhysType::I64) == BC_T_I64);
 static_assert(static_cast<int>(PhysType::F64) == BC_T_F64);
 static_assert(static_cast<int>(PhysType::Bool) == BC_T_BOOL);
 static_assert(static_cast<int>(PhysType::Bytes) == BC_T_BYTES);
-// bc_error_detail carries an object id in its low 24 bits.
-static_assert(Catalog::kMaxObjectId <= 0x00FF'FFFFu);
 
 namespace {
 
@@ -487,9 +487,15 @@ struct bc_ctx {
   // object id in its low 24 bits.
   void raise(std::uint32_t constraint, std::uint32_t object_id, std::string msg = {}) {
     if (!ok()) return;
-    auto d = (constraint << 24) | object_id;
-    fail(BC_E_CONSTRAINT, msg.empty() ? constraint_message(d) : std::move(msg));
-    detail = d;
+    ConstraintDetail d{constraint, object_id};
+    // A kind or id the detail cannot hold is a caller's bug, as in bc_raise:
+    // BC_E_HANDLE, not a constraint and not corruption.
+    if (!d.valid()) {
+      fail(BC_E_HANDLE, "a constraint with an unknown kind or an object id past 2^24");
+      return;
+    }
+    fail(BC_E_CONSTRAINT, msg.empty() ? d.message() : std::move(msg));
+    detail = d.encode();
   }
 
   void drop_execution_state() {
@@ -548,10 +554,6 @@ auto bytes_cmp(BytesView a, BytesView b) -> std::strong_ordering {
                                                 });
 }
 
-auto starts_with(BytesView k, BytesView prefix) -> bool {
-  return k.size() >= prefix.size() && std::ranges::equal(k.first(prefix.size()), prefix);
-}
-
 // Positions a cursor on its next entry within bounds; false at the end.
 auto cursor_advance(bc_ctx* cx, Cursor& c) -> bool {
   auto reverse = (c.flags & BC_SCAN_REVERSE) != 0;
@@ -581,7 +583,7 @@ auto cursor_advance(bc_ctx* cx, Cursor& c) -> bool {
       v = (**c.rev).value;
     }
     if (!cx->charge()) return false;
-    if (!starts_with(k, c.prefix)) {
+    if (!has_prefix(k, c.prefix)) {
       if (reverse && !c.hi.empty() && std::is_gt(bytes_cmp(k, c.prefix))) continue;  // the successor itself
       return false;
     }
@@ -1106,7 +1108,7 @@ struct Entry {
 [[nodiscard]] auto unique_free(bc_ctx* cx, const Index& ix, BytesView prefix) -> bool {
   if (!cx->charge()) return false;
   auto keys = cx->snap->keys_from({}, prefix);
-  if (auto it = keys.begin(); it != std::default_sentinel && starts_with(*it, prefix)) {
+  if (auto it = keys.begin(); it != std::default_sentinel && has_prefix(*it, prefix)) {
     cx->raise(BC_C_UNIQUE, ix.id);
     return false;
   }
@@ -1601,7 +1603,7 @@ int bc_bytes_cmp(bc_ctx* cx, bc_view a, bc_view b) {
 bool bc_bytes_prefix(bc_ctx* cx, bc_view prefix, bc_view b) {
   BC_GUARD_BEGIN
   auto v = cx->resolve2(prefix, b);
-  return v && starts_with(v->second, v->first);
+  return v && has_prefix(v->second, v->first);
   BC_GUARD_END(cx)
   return {};
 }
@@ -2286,7 +2288,7 @@ void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
   // Both bounds inside the table's rows: a bound of another object would
   // reach past them into the rest of the keyspace.
   auto end = bytecask::sql::key_successor(range->prefix);
-  if (!starts_with(range->lo, range->prefix) || (!starts_with(range->hi, range->prefix) && range->hi != end)) {
+  if (!has_prefix(range->lo, range->prefix) || (!has_prefix(range->hi, range->prefix) && range->hi != end)) {
     cx->fail(BC_E_HANDLE, "bc_del_range bound is not a key of table " + t->name);
     return;
   }
@@ -2361,7 +2363,7 @@ void bc_raise(bc_ctx* cx, uint32_t constraint, uint32_t object_id) {
   if (!cx->ok()) return;
   // The detail holds the kind in 8 bits and the id in 24: anything wider would
   // name another constraint or object.
-  if (constraint < BC_C_UNIQUE || constraint > BC_C_RANGE || object_id > 0x00FF'FFFFu) {
+  if (!ConstraintDetail{constraint, object_id}.valid()) {
     cx->fail(BC_E_HANDLE, "bc_raise with an unknown constraint kind or an object id past 2^24");
     return;
   }

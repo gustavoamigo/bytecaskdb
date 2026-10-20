@@ -3,7 +3,8 @@
 What the SQL layer guarantees, and what it does not yet. *Definitions* and
 *Conditions* come first, then one table per area: each row is one
 guarantee, and its second cell names what fails if the row is broken: the
-Catch2 tests of the layer, by name, or none.
+Catch2 tests of the layer, by name; the proof tests against PostgreSQL
+(`tests/proof/`, as "proof: " and the pytest name); or none.
 
 The test for every sentence here: if it could change while every guarantee
 stays the same, it is mechanism and belongs in [`docs/`](docs/), not here.
@@ -68,7 +69,7 @@ column's, a second write of one row.
 | Guarantee | Proved by |
 |---|---|
 | `BC_E_CONSTRAINT` is final: `bc_execute` does not retry it, and nothing of the execution is committed. Only `BC_CONFLICT` is retried. | "plan API: a raised constraint error is final: no retry, nothing committed", "plan writes: a duplicate is BC_E_CONSTRAINT and never retried" |
-| A duplicate primary or unique key is `BC_E_CONSTRAINT` with `BC_C_UNIQUE` and the table's or the index's id; SQL reports it as SQLSTATE 23505. Nulls are distinct: a unique index part that is NULL collides with nothing. | "plan writes: a duplicate is BC_E_CONSTRAINT and never retried", "embedded API: a unique index refuses duplicates, treats nulls as distinct, and moves with UPDATE" |
+| A duplicate primary or unique key is `BC_E_CONSTRAINT` with `BC_C_UNIQUE` and the table's or the index's id; SQL reports it as SQLSTATE 23505. Nulls are distinct: a unique index part that is NULL collides with nothing. | "plan writes: a duplicate is BC_E_CONSTRAINT and never retried", "embedded API: a unique index refuses duplicates, treats nulls as distinct, and moves with UPDATE", "proof: test_duplicate_primary_key_is_23505", "proof: test_sql_machine" |
 | A NULL for a `NOT NULL` column, given or left unset with no default, is `BC_E_CONSTRAINT` with `BC_C_NOT_NULL` and the table's id. The column keeps its default. | "plan writes: a NULL for a NOT NULL column is BC_C_NOT_NULL, never retried, and keeps the default" |
 | Every `BC_E_LAYOUT` carries a `bc_layout_detail`. `BC_L_INCOMPATIBLE` is the only one a recompile of the statement can cure. `BC_L_PLAN` is a malformed plan or `bc_schema_ref`; `BC_L_ROW` a row used with a table it is not of, or a column its layout lacks. | "plan API: bc_ctx_run checks what a plan depends on, not a catalog version", "plan API: result rows follow the schema ref's types; limits and types are checked", "plan API: a plan names only the objects its reference declares", "plan writes: a missing row and a wrong row are errors, never skipped" |
 | `BC_L_RETIRED`, a row of a layout generation `REBUILD` retired, cannot occur in stage 1, which has no `REBUILD` (#503). | none |
@@ -84,6 +85,16 @@ column's, a second write of one row.
 | A second write of one row within an execution is refused with `BC_E_HANDLE`, except an insert of a key the execution already inserted, which is `BC_C_UNIQUE`. A range deleted by `bc_del_range` counts as written. | "plan writes: a second write of one row in one plan is refused", "plan writes: a row written by one run is refused to a later run of the same execution" |
 | `bc_insert`, `bc_update`, `bc_delete` and `bc_del_range` keep every index of the table exact: one entry per row and index, unique, `DESC` and nullable parts included, for every index the table has when the statement runs. | "plan writes: insert, update and delete keep every index exact, unique, DESC and nullable included", "plan writes: an index created after the plan was compiled is maintained by it", "embedded API: a cached write plan maintains an index created after it" |
 | A row an index entry points to is never silently missing: `bc_scan_row` reports it as `BC_E_CORRUPT`. | "plan writes: a missing row and a wrong row are errors, never skipped" |
+
+---
+
+## Embedded API
+
+| Guarantee | Proved by |
+|---|---|
+| Errors before a plan runs have their own types: parameters of the wrong number or type are `ParamError`, and a DDL statement the catalog refuses (a name taken or missing, a column or key part that does not exist or repeats) is `DdlRefused`. Neither writes anything. Both are `std::invalid_argument`. | "embedded API: the seven statements, then a fresh open", "embedded API: a plan the catalog refuses is recompiled and run again", "embedded API: compatibility decides which cached plans recompile" |
+| `CREATE UNIQUE INDEX` over rows that hold a duplicate is an `ExecError` with `BC_E_CONSTRAINT`, `BC_C_UNIQUE` and the table's id, as a duplicate written later is; SQL reports it as SQLSTATE 23505. Nothing is written. | "embedded API: a unique index refuses duplicates, treats nulls as distinct, and moves with UPDATE", "catalog: refused DDL writes nothing" |
+| After `close()`, `prepare`, `execute`, `catalog` and `table_rows` throw `DbClosed`; a second `close()` returns at once. | "embedded API: table_rows reads a table in key order; errors carry their detail; calls after close() throw" |
 
 ---
 

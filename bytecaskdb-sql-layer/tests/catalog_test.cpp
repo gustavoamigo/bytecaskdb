@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "include/bytecask.hpp"
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
 
 import bytecask.sql.catalog;
 import bytecask.sql.tests.util;
@@ -434,8 +435,9 @@ TEST_CASE("catalog: refused DDL writes nothing", "[sql][catalog]") {
   try {
     (void)live.apply(CreateIndexDdl{"t_u", "t", {{"name"}}, true});
     FAIL("a unique index over duplicates must be refused");
-  } catch (const std::invalid_argument& e) {
+  } catch (const ConstraintViolation& e) {
     CHECK(std::string{e.what()}.find("duplicate key") != std::string::npos);
+    CHECK(e.detail().constraint == BC_C_UNIQUE);
   }
   // IF EXISTS on nothing is a no-op.
   CHECK(live.apply(DropTableDdl{"nope", true}) == before);

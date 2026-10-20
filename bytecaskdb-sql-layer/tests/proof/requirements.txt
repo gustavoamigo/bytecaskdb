@@ -1,0 +1,4 @@
+# The proof tests' Python dependencies (tests/proof/, #515).
+pytest>=8
+hypothesis>=6.100
+psycopg[binary]>=3.1

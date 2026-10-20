@@ -13,6 +13,7 @@ module;
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -58,11 +59,6 @@ export using ::bc_db;
 export using ::bc_catalog;
 export using ::bc_params;
 export using ::bc_ctx_affected;
-
-// What a BC_E_CONSTRAINT detail (bc_error_detail) means, in words: the one
-// mapping from constraint codes to text, for the plan API's error message
-// and the embedded API's exception.
-export [[nodiscard]] auto constraint_message(std::uint32_t detail) -> std::string;
 
 export namespace bytecask::sql {
 
@@ -130,18 +126,6 @@ auto result_type_codes(std::span<const PhysType> types) -> std::vector<std::uint
 }
 
 }  // namespace bytecask::sql
-
-auto constraint_message(std::uint32_t detail) -> std::string {
-  auto object = std::to_string(detail & 0x00FF'FFFFu);
-  switch (detail >> 24) {
-    case BC_C_UNIQUE: return "duplicate key value violates unique constraint of object " + object;
-    case BC_C_NOT_NULL: return "null value violates a not-null constraint of table " + object;
-    case BC_C_CHECK: return "check constraint " + object + " violated";
-    case BC_C_FOREIGN_KEY: return "foreign key constraint " + object + " violated";
-    case BC_C_RANGE: return "value out of range for column " + object;
-    default: return "constraint violated on object " + object;
-  }
-}
 
 auto plan_api_symbols() -> std::span<const ApiSymbol> {
   // Function-local: initialised on first use, not by a global constructor.

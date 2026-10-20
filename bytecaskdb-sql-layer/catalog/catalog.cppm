@@ -41,6 +41,8 @@ module;
 // The engine through its public header, as the plugin and the bindings link
 // it; the sql-layer imports no engine module.
 #include "include/bytecask.hpp"
+// The bc_constraint codes a ConstraintDetail carries.
+#include "bytecaskdb-sql-layer/algebra/bc_plan.h"
 
 export module bytecask.sql.catalog;
 
@@ -48,6 +50,64 @@ export import bytecask.sql.key_codec;
 export import bytecask.sql.row_codec;
 
 export namespace bytecask::sql {
+
+// A BC_E_CONSTRAINT detail (bc_error_detail): the bc_constraint in the high
+// byte, the object id in the low 24 bits. The one encoding of the detail and
+// the one mapping from constraint codes to names and text, for the plan
+// API's error and the embedded API's exception.
+struct ConstraintDetail {
+  static constexpr std::uint32_t kMaxObjectId = 0x00FF'FFFFu;
+
+  std::uint32_t constraint;  // a bc_constraint
+  std::uint32_t object_id;
+
+  [[nodiscard]] static constexpr auto decode(std::uint32_t detail) -> ConstraintDetail {
+    return {detail >> 24, detail & kMaxObjectId};
+  }
+  // Throws std::out_of_range for a detail that is not valid(): a kind
+  // bc_plan.h does not define, or an id wider than its 24 bits.
+  [[nodiscard]] auto encode() const -> std::uint32_t {
+    if (!valid()) throw std::out_of_range("constraint kind unknown or object id past 2^24");
+    return (constraint << 24) | object_id;
+  }
+  // "unique", "not_null", "check", "foreign_key" or "range"; empty for a
+  // code bc_plan.h does not define. The one list of known kinds.
+  [[nodiscard]] auto name() const -> std::string_view;
+  // A kind bc_plan.h defines, and an id that fits its 24 bits: what
+  // encode() takes and bc_raise accepts.
+  [[nodiscard]] auto valid() const -> bool { return !name().empty() && object_id <= kMaxObjectId; }
+  [[nodiscard]] auto message() const -> std::string;
+};
+
+// A DDL whose existing data breaks a constraint: CREATE UNIQUE INDEX over
+// rows that hold a duplicate (BC_C_UNIQUE with the table's id: the index's
+// id was never published, and the next DDL takes it). The data's
+// refusal, not the statement's (that is DdlRefused): SQL reports the
+// constraint's SQLSTATE, 23505. Nothing was written.
+class ConstraintViolation : public std::runtime_error {
+public:
+  ConstraintViolation(const std::string& what, ConstraintDetail detail) : std::runtime_error{what}, detail_{detail} {}
+  ConstraintViolation(const ConstraintViolation&) = default;
+  ConstraintViolation& operator=(const ConstraintViolation&) = default;
+  ~ConstraintViolation() override;  // out of line: anchors the vtable (-Wweak-vtables)
+  [[nodiscard]] auto detail() const noexcept -> ConstraintDetail { return detail_; }
+
+private:
+  ConstraintDetail detail_;
+};
+
+// A DDL statement the catalog refuses before it writes anything: a name
+// taken or missing, a column or key part that does not exist or repeats, a
+// default not of its column's type. The refusals PostgreSQL makes of the
+// statement itself; the engine's own refusals stay std::invalid_argument and
+// std::length_error.
+class DdlRefused : public std::invalid_argument {
+public:
+  using std::invalid_argument::invalid_argument;
+  DdlRefused(const DdlRefused&) = default;
+  DdlRefused& operator=(const DdlRefused&) = default;
+  ~DdlRefused() override;  // out of line: anchors the vtable (-Wweak-vtables)
+};
 
 // A value of one of the four physical types, or SQL NULL (monostate). The
 // runtime's bc_value is this type.
@@ -208,7 +268,7 @@ public:
 
   // Object ids stay at or below 2^24 - 1: bc_error_detail carries one in its
   // low 24 bits (and a plan's constants are an enum, whose values are ints).
-  static constexpr std::uint32_t kMaxObjectId = 0x00FF'FFFFu;
+  static constexpr std::uint32_t kMaxObjectId = ConstraintDetail::kMaxObjectId;
   // 3: #489's record (SQL types, defaults, unique and DESC parts, layout
   // entries). 2 was #490's, 1 the prototype's; both are refused.
   static constexpr std::uint16_t kRecordFormat = 3;
@@ -288,8 +348,10 @@ public:
     std::unique_ptr<WritePlan> plan;
     bool backfill{false};
   };
-  // Throws std::invalid_argument for a statement the catalog refuses (a
-  // duplicate name, an unknown column, a unique index over duplicates…) and
+  // Throws DdlRefused for a statement the catalog refuses (a duplicate
+  // name, an unknown column…), ConstraintViolation for a unique index over
+  // duplicates, the engine's std::invalid_argument for a key over its
+  // limit, and
   // std::length_error when ids or a layout run out or a backfill passes the
   // engine's batch limit. Writes nothing.
   [[nodiscard]] auto prepare(const Ddl& ddl) -> Prepared;
@@ -329,6 +391,20 @@ private:
 // The catalog record's key and a table's row-key range: for tests and tools.
 [[nodiscard]] auto table_record_key(std::uint32_t table_id) -> Bytes;
 [[nodiscard]] auto name_entry_key(std::string_view name) -> Bytes;
+// Every row key of a table starts with its row prefix: kNsRow, the table id.
+[[nodiscard]] auto row_prefix(std::uint32_t table_id) -> Bytes;
+[[nodiscard]] auto has_prefix(BytesView key, BytesView prefix) -> bool;
+
+// The rows of a table in the snapshot, in primary key order: visit(key, row)
+// for each. The one scan of a table's row range.
+template <typename Visit>
+void for_each_row(const Snapshot& snap, std::uint32_t table_id, Visit&& visit) {
+  auto prefix = row_prefix(table_id);
+  for (const auto& e : snap.iter_from({}, prefix)) {
+    if (!has_prefix(e.key, prefix)) break;
+    visit(e.key, e.value);
+  }
+}
 // Serializes a table as kRecordFormat; parses one, throwing
 // std::runtime_error if it does not parse or breaks an invariant.
 [[nodiscard]] auto serialize_table(const Table& t) -> Bytes;
@@ -370,10 +446,6 @@ auto be_value(BytesView b) -> std::uint64_t {
   std::uint64_t v = 0;
   for (auto x : b) v = (v << 8) | std::to_integer<std::uint64_t>(x);
   return v;
-}
-
-auto has_prefix(BytesView key, BytesView prefix) -> bool {
-  return key.size() >= prefix.size() && std::ranges::equal(key.first(prefix.size()), prefix);
 }
 
 [[noreturn]] void corrupt(const std::string& what) { throw std::runtime_error("catalog: " + what); }
@@ -496,11 +568,6 @@ auto name_value(std::uint8_t kind, std::uint32_t id) -> Bytes {
   return v;
 }
 
-auto row_prefix(std::uint32_t table_id) -> Bytes {
-  Bytes p;
-  key_put_prefix(p, kNsRow, table_id);
-  return p;
-}
 
 auto index_prefix(std::uint32_t index_id) -> Bytes {
   Bytes p;
@@ -547,16 +614,6 @@ auto put_part_from_row(const Table& t, std::uint32_t col_id, KeyPart part, Bytes
     }
   }
   return false;
-}
-
-// The rows of a table in the snapshot, in primary key order.
-template <typename Visit>
-void for_each_row(const Snapshot& snap, std::uint32_t table_id, Visit&& visit) {
-  auto prefix = row_prefix(table_id);
-  for (const auto& e : snap.iter_from({}, prefix)) {
-    if (!has_prefix(e.key, prefix)) break;
-    visit(e.key, e.value);
-  }
 }
 
 auto put_op(std::vector<DdlOp>& ops, DdlOp::Kind kind, Bytes a, Bytes b = {}) -> void {
@@ -616,13 +673,50 @@ auto reserve_ids(std::uint64_t& next_id, std::uint32_t n) -> std::uint32_t {
 }
 
 void check_column_spec(const ColumnSpec& c) {
-  if (!sql_type_valid(c.sql)) throw std::invalid_argument("column " + c.name + " has an invalid type");
+  if (!sql_type_valid(c.sql)) throw DdlRefused("column " + c.name + " has an invalid type");
   if (!datum_fits(c.default_value, phys_type(c.sql))) {
-    throw std::invalid_argument("default of column " + c.name + " is not of its type");
+    throw DdlRefused("default of column " + c.name + " is not of its type");
   }
 }
 
 }  // namespace
+
+DdlRefused::~DdlRefused() = default;
+ConstraintViolation::~ConstraintViolation() = default;
+
+auto ConstraintDetail::name() const -> std::string_view {
+  switch (constraint) {
+    case BC_C_UNIQUE: return "unique";
+    case BC_C_NOT_NULL: return "not_null";
+    case BC_C_CHECK: return "check";
+    case BC_C_FOREIGN_KEY: return "foreign_key";
+    case BC_C_RANGE: return "range";
+    default: return {};
+  }
+}
+
+auto ConstraintDetail::message() const -> std::string {
+  auto object = std::to_string(object_id);
+  switch (constraint) {
+    case BC_C_UNIQUE: return "duplicate key value violates unique constraint of object " + object;
+    case BC_C_NOT_NULL: return "null value violates a not-null constraint of table " + object;
+    case BC_C_CHECK: return "check constraint " + object + " violated";
+    case BC_C_FOREIGN_KEY: return "foreign key constraint " + object + " violated";
+    case BC_C_RANGE: return "value out of range for column " + object;
+    default: return "constraint violated on object " + object;
+  }
+}
+
+
+auto has_prefix(BytesView key, BytesView prefix) -> bool {
+  return key.size() >= prefix.size() && std::ranges::equal(key.first(prefix.size()), prefix);
+}
+
+auto row_prefix(std::uint32_t table_id) -> Bytes {
+  Bytes p;
+  key_put_prefix(p, kNsRow, table_id);
+  return p;
+}
 
 // ------------------------------------------------------------------ types
 
@@ -1087,11 +1181,11 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     return std::shared_ptr<const Catalog>{std::move(next)};
   };
   auto name_free = [&](const std::string& name) {
-    if (names_.contains(name)) throw std::invalid_argument("relation \"" + name + "\" already exists");
+    if (names_.contains(name)) throw DdlRefused("relation \"" + name + "\" already exists");
   };
   auto find_table = [&](const std::string& name) -> const Table& {
     const auto* t = table(name);
-    if (t == nullptr) throw std::invalid_argument("relation \"" + std::string{name} + "\" does not exist");
+    if (t == nullptr) throw DdlRefused("relation \"" + std::string{name} + "\" does not exist");
     return *t;
   };
   backfill = false;
@@ -1099,14 +1193,14 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   if (const auto* ct = std::get_if<CreateTableDdl>(&ddl)) {
     auto name = std::string{ct->name};
     name_free(name);
-    if (ct->columns.empty() || ct->pk.empty()) throw std::invalid_argument("a table needs columns and a primary key");
+    if (ct->columns.empty() || ct->pk.empty()) throw DdlRefused("a table needs columns and a primary key");
     Table t;
     t.name = name;
     std::vector<ColumnDef> defs;
     for (const auto& spec : ct->columns) {
       check_column_spec(spec);
       auto cname = std::string{spec.name};
-      if (t.column(cname) != nullptr) throw std::invalid_argument("column \"" + cname + "\" specified more than once");
+      if (t.column(cname) != nullptr) throw DdlRefused("column \"" + cname + "\" specified more than once");
       auto in_pk = std::ranges::any_of(ct->pk, [&](const std::string& p) { return std::string{p} == cname; });
       Column c{t.next_col_id++, cname, spec.sql, phys_type(spec.sql), spec.nullable && !in_pk, spec.default_value};
       defs.push_back({c.id, c.type, c.nullable});
@@ -1114,9 +1208,9 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     }
     for (const auto& p : ct->pk) {
       const auto* c = t.column(p);
-      if (c == nullptr) throw std::invalid_argument("primary key column \"" + std::string{p} + "\" does not exist");
+      if (c == nullptr) throw DdlRefused("primary key column \"" + std::string{p} + "\" does not exist");
       if (std::ranges::find(t.pk_col_ids, c->id) != t.pk_col_ids.end()) {
-        throw std::invalid_argument("column \"" + c->name + "\" appears twice in the primary key");
+        throw DdlRefused("column \"" + c->name + "\" appears twice in the primary key");
       }
       t.pk_col_ids.push_back(c->id);
     }
@@ -1134,15 +1228,15 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     auto name = std::string{ci->name};
     name_free(name);
     auto t = find_table(ci->table);
-    if (ci->columns.empty()) throw std::invalid_argument("an index needs columns");
+    if (ci->columns.empty()) throw DdlRefused("an index needs columns");
     Index ix;
     ix.name = name;
     ix.unique = ci->unique;
     for (const auto& c : ci->columns) {
       const auto* col = t.column(c.name);
-      if (col == nullptr) throw std::invalid_argument("column \"" + std::string{c.name} + "\" does not exist");
+      if (col == nullptr) throw DdlRefused("column \"" + std::string{c.name} + "\" does not exist");
       if (std::ranges::find(ix.parts, col->id, &IndexPart::col_id) != ix.parts.end()) {
-        throw std::invalid_argument("column \"" + col->name + "\" appears twice in the index");
+        throw DdlRefused("column \"" + col->name + "\" appears twice in the index");
       }
       ix.parts.push_back({col->id, c.desc});
     }
@@ -1165,8 +1259,9 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
         throw std::runtime_error("malformed row in table " + t.name);
       }
       if (ix.unique && !has_null && !prefixes.emplace(k.begin(), k.begin() + static_cast<std::ptrdiff_t>(prefix_len)).second) {
-        throw std::invalid_argument("could not create unique index \"" + name + "\": table \"" + t.name +
-                                    "\" holds a duplicate key");
+        throw ConstraintViolation("could not create unique index \"" + name + "\": table \"" + t.name +
+                                      "\" holds a duplicate key",
+                                  ConstraintDetail{BC_C_UNIQUE, t.id});
       }
       budget.charge(k.size() + prefix_len);
       put_op(ops, DdlOp::Kind::Put, std::move(k));
@@ -1179,9 +1274,9 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   if (const auto* dt = std::get_if<DropTableDdl>(&ddl)) {
     const auto* found = table(dt->name);
     if (found == nullptr) {
-      if (index(dt->name).first != nullptr) throw std::invalid_argument("\"" + std::string{dt->name} + "\" is an index");
+      if (index(dt->name).first != nullptr) throw DdlRefused("\"" + std::string{dt->name} + "\" is an index");
       if (dt->if_exists) return nullptr;
-      throw std::invalid_argument("table \"" + std::string{dt->name} + "\" does not exist");
+      throw DdlRefused("table \"" + std::string{dt->name} + "\" does not exist");
     }
     const auto& t = *found;
     put_op(ops, DdlOp::Kind::Del, table_record_key(t.id));
@@ -1200,9 +1295,9 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   if (const auto* di = std::get_if<DropIndexDdl>(&ddl)) {
     auto [owner, found] = index(di->name);
     if (found == nullptr) {
-      if (table(di->name) != nullptr) throw std::invalid_argument("\"" + std::string{di->name} + "\" is not an index");
+      if (table(di->name) != nullptr) throw DdlRefused("\"" + std::string{di->name} + "\" is not an index");
       if (di->if_exists) return nullptr;
-      throw std::invalid_argument("index \"" + std::string{di->name} + "\" does not exist");
+      throw DdlRefused("index \"" + std::string{di->name} + "\" does not exist");
     }
     auto t = *owner;
     auto id = found->id;
@@ -1221,11 +1316,11 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   check_column_spec(ac.column);
   auto cname = std::string{ac.column.name};
   if (t.column(cname) != nullptr) {
-    throw std::invalid_argument("column \"" + cname + "\" of relation \"" + t.name + "\" already exists");
+    throw DdlRefused("column \"" + cname + "\" of relation \"" + t.name + "\" already exists");
   }
   auto has_default = !std::holds_alternative<std::monostate>(ac.column.default_value);
   if (!ac.column.nullable && !has_default) {
-    throw std::invalid_argument("column \"" + cname + "\" is NOT NULL and has no default for the existing rows");
+    throw DdlRefused("column \"" + cname + "\" is NOT NULL and has no default for the existing rows");
   }
   Column c{t.next_col_id, cname, ac.column.sql, phys_type(ac.column.sql), ac.column.nullable, ac.column.default_value};
   auto old_layout = t.layout;

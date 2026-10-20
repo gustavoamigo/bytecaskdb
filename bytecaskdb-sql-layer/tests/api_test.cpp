@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
+#include "include/bytecask.hpp"
 
 import bytecask.sql.api;
 import bytecask.sql.tests.util;
@@ -84,8 +85,8 @@ TEST_CASE("embedded API: the seven statements, then a fresh open", "[sql][api]")
     CHECK(db->execute(kDelete, {i(2)}).affected == 0);
     CHECK(ids(db->execute(kByName, {bytes("a"), bytes("z")})) == std::vector<std::int64_t>{1, 4});
 
-    CHECK_THROWS_AS(db->execute(kById, {bytes("x")}), std::invalid_argument);
-    CHECK_THROWS_AS(db->execute(kById, {}), std::invalid_argument);
+    CHECK_THROWS_AS(db->execute(kById, {bytes("x")}), ParamError);
+    CHECK_THROWS_AS(db->execute(kById, {}), ParamError);
     CHECK_THROWS_AS(db->prepare("SELECT id FROM t JOIN u ON t.id = u.id"), ast::SqlError);
     CHECK(db->cached_plans() == 10);  // each text compiled once
     db->close();
@@ -101,7 +102,7 @@ TEST_CASE("embedded API: the seven statements, then a fresh open", "[sql][api]")
   CHECK(ids(db->execute(kByName, {bytes("b"), bytes("c")})) == std::vector<std::int64_t>{5});
   CHECK(db->execute(kUpdate, {i(5), i(8)}).affected == 1);
   CHECK(db->execute(kById, {i(5)}).rows == Grid{{i(5), i(42)}});
-  CHECK_THROWS_AS(db->execute(kCreateTable), std::invalid_argument);  // the table survived the reopen
+  CHECK_THROWS_AS(db->execute(kCreateTable), DdlRefused);  // the table survived the reopen
 }
 
 TEST_CASE("embedded API: a cached write plan maintains an index created after it", "[sql][api]") {
@@ -150,13 +151,13 @@ TEST_CASE("embedded API: a plan the catalog refuses is recompiled and run again"
   // without a compile, however often they are sent: the runtime says the
   // plan fits (bc_ctx_check).
   for (int k = 0; k < 3; ++k) {
-    CHECK_THROWS_AS(db->execute(insert, {i(9), bytes("x"), bytes("y")}), std::invalid_argument);
+    CHECK_THROWS_AS(db->execute(insert, {i(9), bytes("x"), bytes("y")}), ParamError);
   }
   CHECK(db->compilations() == compiled + 3);
   // A DDL that leaves the plan compatible moves the version: the runtime is
   // asked, says the plan fits, and the parameters are refused uncompiled.
   (void)db->execute("CREATE TABLE elsewhere (k BIGINT PRIMARY KEY)");
-  CHECK_THROWS_AS(db->execute(insert, {i(9), bytes("x"), bytes("y")}), std::invalid_argument);
+  CHECK_THROWS_AS(db->execute(insert, {i(9), bytes("x"), bytes("y")}), ParamError);
   CHECK(db->compilations() == compiled + 3);
   CHECK(db->execute(insert, {i(9), bytes("x"), i(90)}).affected == 1);
   CHECK(db->compilations() == compiled + 3);
@@ -167,10 +168,10 @@ TEST_CASE("embedded API: a plan the catalog refuses is recompiled and run again"
   (void)db->execute("DROP TABLE t");
   (void)db->execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name BYTEA, qty BYTEA)");
   CHECK(db->execute(insert, {i(4), bytes("date"), bytes("forty")}).affected == 1);
-  CHECK_THROWS_AS(db->execute(insert, {i(5), bytes("elder"), i(50)}), std::invalid_argument);
+  CHECK_THROWS_AS(db->execute(insert, {i(5), bytes("elder"), i(50)}), ParamError);
   (void)db->execute("DROP TABLE t");
   (void)db->execute(kCreateTable);
-  CHECK_THROWS_AS(db->execute(insert, {i(6), bytes("fig"), bytes("sixty")}), std::invalid_argument);
+  CHECK_THROWS_AS(db->execute(insert, {i(6), bytes("fig"), bytes("sixty")}), ParamError);
   CHECK(db->execute(insert, {i(6), bytes("fig"), i(60)}).affected == 1);
   CHECK(db->execute(by_id, {i(6)}).rows == Grid{{i(6), i(60)}});
 }
@@ -243,7 +244,7 @@ TEST_CASE("embedded API: compatibility decides which cached plans recompile", "[
   }
   CHECK_THROWS_AS(db->execute(insert, {i(5), bytes("x"), i(1)}), ast::SqlError);
   (void)db->execute("DROP TABLE IF EXISTS t");
-  CHECK_THROWS_AS(db->execute("DROP TABLE t"), std::invalid_argument);
+  CHECK_THROWS_AS(db->execute("DROP TABLE t"), DdlRefused);
 }
 
 TEST_CASE("embedded API: a unique index refuses duplicates, treats nulls as distinct, and moves with UPDATE",
@@ -284,10 +285,19 @@ TEST_CASE("embedded API: a unique index refuses duplicates, treats nulls as dist
   CHECK(db->execute(kIns, {i(7), bytes("a"), i(0)}).affected == 1);
   CHECK(ids(db->execute("SELECT id FROM c WHERE email = $1", {bytes("a")})) == std::vector<std::int64_t>{7});
 
-  // A unique index over rows that already collide is refused.
+  // A unique index over rows that already collide is refused as the
+  // duplicate it would hold: BC_C_UNIQUE with the table's id (23505).
   (void)db->execute(kIns, {i(8), bytes("q"), i(1)});
   (void)db->execute(kIns, {i(9), bytes("r"), i(1)});
-  CHECK_THROWS_AS(db->execute("CREATE UNIQUE INDEX c_w ON c (w)"), std::invalid_argument);
+  auto table_id = db->catalog()->table("c")->id;
+  try {
+    (void)db->execute("CREATE UNIQUE INDEX c_w ON c (w)");
+    FAIL("a unique index over duplicates was created");
+  } catch (const ExecError& e) {
+    REQUIRE(e.constraint());
+    CHECK(e.constraint()->constraint == BC_C_UNIQUE);
+    CHECK(e.constraint()->object_id == table_id);  // the index never existed: its id is the next DDL's
+  }
   CHECK(db->catalog()->index("c_w").second == nullptr);
   db->close();
 
@@ -406,4 +416,126 @@ TEST_CASE("embedded API: a quoted name keeps its case, and nothing in a name esc
     CHECK(src.find("\n#error") == std::string::npos);
     (void)db->execute("DROP TABLE e");
   }
+}
+
+TEST_CASE("embedded API: table_rows reads a table in key order; errors carry their detail; calls after close() throw",
+          "[sql][api]") {
+  sql_test::TempDir dir{"api_table_rows"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE t (a BIGINT, b TEXT, c VARCHAR(4) NOT NULL DEFAULT 'x', PRIMARY KEY (a, b))");
+  auto table_id = db->catalog()->table("t")->id;
+  constexpr auto kIns = "INSERT INTO t (a, b) VALUES ($1, $2)";
+  CHECK(db->execute(kIns, {i(2), bytes("a")}).affected == 1);
+  CHECK(db->execute(kIns, {i(1), bytes("z")}).affected == 1);
+  CHECK(db->execute("INSERT INTO t VALUES ($1, $2, $3)", {i(1), bytes("b"), bytes("yy")}).affected == 1);
+
+  auto constraint_of = [&](std::string_view sql, std::vector<Value> params) -> std::uint32_t {
+    try {
+      (void)db->execute(sql, params);
+    } catch (const ExecError& e) {
+      auto c = e.constraint();
+      REQUIRE(c);
+      CHECK(e.code() == BC_E_CONSTRAINT);
+      CHECK(c->object_id == table_id);
+      CHECK(c->encode() == e.detail());
+      return c->constraint;
+    }
+    FAIL("the statement was accepted");
+    return 0;
+  };
+  CHECK(constraint_of(kIns, {i(2), bytes("a")}) == BC_C_UNIQUE);
+  // A field wider than its bits would name another constraint or object.
+  constexpr ConstraintDetail kWideId{BC_C_UNIQUE, ConstraintDetail::kMaxObjectId + 1};
+  constexpr ConstraintDetail kWideKind{0x100, 1};
+  constexpr ConstraintDetail kUnknownKind{99, 1};  // fits the byte, but bc_plan.h defines no such kind
+  CHECK_THROWS_AS((void)kUnknownKind.encode(), std::out_of_range);
+  CHECK_THROWS_AS((void)kWideId.encode(), std::out_of_range);
+  CHECK_THROWS_AS((void)kWideKind.encode(), std::out_of_range);
+  CHECK(constraint_of("INSERT INTO t VALUES ($1, $2, $3)", {i(3), bytes("a"), kNull}) == BC_C_NOT_NULL);
+
+  auto check_rows = [&](Database& d) {
+    auto r = d.table_rows("t");
+    CHECK(r.columns == std::vector<std::string>{"a", "b", "c"});
+    REQUIRE(r.types.size() == 3);
+    CHECK(r.types[0].kind == SqlKind::BigInt);
+    CHECK(r.types[2] == SqlType{SqlKind::Varchar, 4});
+    // Primary-key order: (1, "b"), (1, "z"), (2, "a"); c from its default where unset.
+    CHECK(r.rows == Grid{{i(1), bytes("b"), bytes("yy")}, {i(1), bytes("z"), bytes("x")}, {i(2), bytes("a"), bytes("x")}});
+  };
+  check_rows(*db);
+  auto sel = db->execute("SELECT c, a FROM t WHERE a = $1 AND b = $2", {i(1), bytes("b")});
+  CHECK(sel.types == std::vector<SqlType>{SqlType{SqlKind::Varchar, 4}, SqlType{SqlKind::BigInt}});
+  CHECK_THROWS_AS(db->table_rows("nope"), ast::SqlError);
+  db->close();
+  // Every call after close() is refused, as the engine's are; close() again is not.
+  CHECK_THROWS_AS(db->execute(kIns, {i(9), bytes("q")}), bytecask::DbClosed);
+  CHECK_THROWS_AS(db->prepare("SELECT a FROM t WHERE a = $1 AND b = $2"), bytecask::DbClosed);
+  CHECK_THROWS_AS(db->catalog(), bytecask::DbClosed);
+  CHECK_THROWS_AS(db->table_rows("t"), bytecask::DbClosed);
+  db->close();
+
+  auto again = Database::open(dir.path());
+  check_rows(*again);
+  again->close();
+
+  // A stored row of another layout generation is refused, never decoded
+  // with the current layout's slots: one row's generation field (its first
+  // two bytes, little-endian) is rewritten through the engine.
+  {
+    auto engine = bytecask::DB::open(dir.path());
+    auto prefix = row_prefix(table_id);
+    Bytes key, row;
+    for (const auto& e : engine.iter_from({}, prefix)) {
+      key.assign(e.key.begin(), e.key.end());
+      row.assign(e.value.begin(), e.value.end());
+      break;
+    }
+    REQUIRE(has_prefix(key, prefix));
+    row[0] = std::byte{2};
+    engine.put({}, key, row);
+    engine.close();
+  }
+  auto third = Database::open(dir.path());
+  try {
+    (void)third->table_rows("t");
+    FAIL("a row of another layout generation was decoded");
+  } catch (const ExecError& e) {
+    CHECK(e.code() == BC_E_CORRUPT);
+    CHECK(std::string{e.what()}.starts_with("row of layout generation 2"));
+  }
+
+  // A present bit for a column the row predates (ADD COLUMN after it was
+  // written) points outside the row, where the column would read as 0: a
+  // damaged row, refused, never read as a value.
+  (void)third->execute("CREATE TABLE p (k BIGINT PRIMARY KEY, a BIGINT)");
+  CHECK(third->execute("INSERT INTO p VALUES ($1, $2)", {i(1), i(5)}).affected == 1);
+  (void)third->execute("ALTER TABLE p ADD COLUMN c BIGINT");
+  auto third_cat = third->catalog();  // held: p_table points into it
+  const auto* p_table = third_cat->table("p");
+  auto p_id = p_table->id;
+  auto c_id = p_table->column("c")->id;
+  CHECK(third->table_rows("p").rows == Grid{{i(1), i(5), kNull}});
+  third->close();
+  {
+    auto engine = bytecask::DB::open(dir.path());
+    auto prefix = row_prefix(p_id);
+    Bytes key, row;
+    for (const auto& e : engine.iter_from({}, prefix)) {
+      key.assign(e.key.begin(), e.key.end());
+      row.assign(e.value.begin(), e.value.end());
+      break;
+    }
+    REQUIRE(has_prefix(key, prefix));
+    row[kRowHeaderBytes + c_id / 8] |= std::byte{1} << (c_id % 8);  // c's present bit
+    engine.put({}, key, row);
+    engine.close();
+  }
+  auto fourth = Database::open(dir.path());
+  try {
+    (void)fourth->table_rows("p");
+    FAIL("a present column outside its row was read");
+  } catch (const ExecError& e) {
+    CHECK(e.code() == BC_E_CORRUPT);
+  }
+  fourth->close();
 }
