@@ -25,8 +25,8 @@
 // runs (parse and bind errors, a DDL the catalog refuses, parameters of the
 // wrong number or type, a params object that is not a list or tuple);
 // bytecask_sql.Closed, also a ValueError, for any call after close();
-// bytecask_sql.TransactionAborted (SQLSTATE 25P02) for a call on a
-// transaction a statement failed in, other than rollback(). A transaction
+// bytecask_sql.TransactionAborted (SQLSTATE 25P02) for a statement on a
+// transaction a statement failed in. A transaction
 // whose commit conflicts raises ExecError with conflict set (40001). All
 // derive from bytecask_sql.Error. Anything else, an engine refusal at run
 // time included, is nanobind's translation of the C++ exception.
@@ -258,7 +258,13 @@ NB_MODULE(bytecask_sql, m) {
   nb::class_<sql::Transaction>(m, "Transaction")
       .def("execute", &txn_execute, "sql"_a, "params"_a = nb::tuple(),
            "Runs one statement in the transaction; a failure aborts it.")
-      .def("commit", &sql::Transaction::commit, "Writes every statement's writes as one batch, or raises.")
+      .def(
+          "commit",
+          [](sql::Transaction& t) {
+            return t.commit() == sql::CommitOutcome::Committed ? "COMMIT" : "ROLLBACK";
+          },
+          "Writes every statement's writes as one batch: 'COMMIT'. After a failed statement writes nothing "
+          "and returns 'ROLLBACK', PostgreSQL's command tag. Raises on a conflict.")
       .def("rollback", &sql::Transaction::rollback, "Ends the transaction; nothing it wrote is kept.")
       .def_prop_ro("is_open", &sql::Transaction::is_open)
       .def_prop_ro("is_aborted", &sql::Transaction::is_aborted);

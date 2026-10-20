@@ -78,12 +78,16 @@ auto Database::begin(TransactionOptions = {}) -> Transaction;
   non-transaction-control statement in the transaction" (PostgreSQL 17
   documentation, *Transaction Isolation*). An idle handle then pins
   nothing. The catalog version is pinned with it (see *DDL*).
-- **`commit()` returns or throws.** A transaction with no writes and no
-  guards commits nothing and returns.
+- **`commit()` returns its outcome or throws.** It returns `Committed`, or
+  `RolledBack` for an aborted transaction, as PostgreSQL's command tag
+  reports COMMIT or ROLLBACK, so a caller never takes a rollback for a
+  commit. A transaction with no writes and no guards commits nothing and
+  returns `Committed`.
 - **After a failed statement the transaction is aborted,** as in
-  PostgreSQL: every later `execute()` and `commit()` is refused with SQLSTATE
-  25P02 ("current transaction is aborted, commands ignored until end of
-  transaction block"), and only `rollback()` is accepted.
+  PostgreSQL: every later `execute()` is refused with SQLSTATE 25P02
+  ("current transaction is aborted, commands ignored until end of
+  transaction block"), and `commit()` rolls it back without an error, as
+  PostgreSQL's COMMIT does (owner's decision, 2026-10-20).
 - **After `commit()`, `rollback()` or a serialization failure,** the handle
   is closed; any further call throws.
 
@@ -169,10 +173,10 @@ cross-statement refusal that `docs/plan_api_design.md` describes is removed.
 **A failed statement aborts the transaction, as in PostgreSQL.** A
 statement that fails — a constraint, the budget, `BC_E_LIMIT`, a read error
 — discards its pending effects, so the overlay and the log are untouched:
-each statement is its own savepoint. Then the handle refuses everything but
-`rollback()`. Every later `execute()` and `commit()` is SQLSTATE 25P02
-until it. The statement's own error is what `execute()` raises; 25P02 is
-for the calls after it.
+each statement is its own savepoint. Then every later `execute()` is
+SQLSTATE 25P02 until the transaction ends: `rollback()`, or `commit()`,
+which rolls back and returns `RolledBack`. The statement's own error is
+what `execute()` raises; 25P02 is for the statements after it.
 
 User `SAVEPOINT` / `ROLLBACK TO` are **later**: TPROC-C doesn't use them.
 When they come they are a mark in the log plus a copy of the overlay's
@@ -363,8 +367,8 @@ for their shape.
   - a statement doesn't see its own writes;
   - a later statement updates and deletes a row an earlier one wrote, and
     every index stays exact;
-  - a failed statement writes nothing, and every later `execute()` and
-    `commit()` is 25P02 until `rollback()`;
+  - a failed statement writes nothing, every later `execute()` is 25P02,
+    and `commit()` rolls back;
   - the snapshot is taken at the first statement, not at `begin()`.
 - **Commit:**
   - first-committer-wins across transactions (lost-update, delete against
@@ -397,7 +401,7 @@ PR.
 |---|---|
 | A transaction from `Database::begin()` commits all its statements' writes atomically, or none: `commit()` returns, or throws having written nothing. Rollback, and destroying an open handle, write nothing. | to add |
 | A statement in a transaction reads the snapshot taken at the start of the transaction's first statement, not at `begin()`, plus the writes of its earlier statements, never its own: point reads, existence, counts, scans in both directions over tables and indexes, and the unique checks. | to add |
-| A statement that fails inside a transaction writes nothing, and aborts the transaction: every later `execute()` and `commit()` is SQLSTATE 25P02 until `rollback()`. | to add |
+| A statement that fails inside a transaction writes nothing, and aborts the transaction: every later `execute()` is SQLSTATE 25P02, and `commit()` rolls back. | to add |
 | A later statement may update or delete a row an earlier statement wrote; every index stays exact. | to add |
 | A transaction that conflicts at commit with a concurrent commit (a written key changed since its snapshot, a `FOR UPDATE` row changed, a written table's DDL) is a serialization failure, SQLSTATE 40001, with nothing written. The layer does not retry it. | to add |
 | A commit that conflicts because a key it inserted (a primary key, or a unique index value) was taken by a concurrent commit is `BC_C_UNIQUE`, SQLSTATE 23505, naming the table or index, with nothing written; an autocommit statement reports the same for the same race. | to add |

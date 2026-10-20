@@ -19,7 +19,7 @@ key, and a reopen of the layer's database (docs/testing_design.md).
 Transactions (#491): BEGIN, the same inserts and lookups in it, which read
 its own writes, then COMMIT or ROLLBACK; PostgreSQL runs it in a real
 REPEATABLE READ transaction on its connection. A statement that fails
-aborts both, and every statement after it is 25P02 until the rollback. The
+aborts both: every statement after it is 25P02, and COMMIT rolls back. The
 tables are compared while no transaction is open; DDL and the reopen run
 only then.
 
@@ -254,24 +254,21 @@ class SqlMachine(RuleBasedStateMachine):
         self.txn = self.db.begin()
         assert o.run_pg(self.pg.conn, "BEGIN ISOLATION LEVEL REPEATABLE READ").error is None
 
-    def commit(self) -> None:
-        # One connection: nothing commits in between, so nothing conflicts.
-        self.txn.commit()
+    def commit(self) -> str:
+        """COMMIT on both; returns the outcome, as PostgreSQL's command tag says it.
+
+        In an aborted transaction both roll back, without an error. One
+        connection: nothing commits in between, so nothing conflicts.
+        """
+        layer = self.txn.commit()
         self.txn = None
-        out = o.run_pg(self.pg.conn, "COMMIT")
-        assert out.error is None, out.detail
+        with self.pg.conn.cursor() as cur:
+            cur.execute("COMMIT")
+            pg = cur.statusmessage
+        assert layer == pg, f"COMMIT: the layer {layer}, PostgreSQL {pg}"
+        return layer
 
     def rollback(self) -> None:
-        if self.txn.is_aborted:
-            # Known difference: PostgreSQL takes COMMIT in an aborted
-            # transaction as ROLLBACK; the layer refuses it with 25P02 and
-            # leaves the transaction to its rollback().
-            try:
-                self.txn.commit()
-                raise AssertionError("commit() of an aborted transaction did not raise")
-            except bytecask_sql.TransactionAborted:
-                pass
-            assert self.txn.is_open
         self.txn.rollback()
         self.txn = None
         assert o.run_pg(self.pg.conn, "ROLLBACK").error is None
@@ -387,7 +384,7 @@ class SqlMachine(RuleBasedStateMachine):
     def begin_transaction(self):
         self.begin()
 
-    @precondition(lambda self: self.txn is not None and not self.txn.is_aborted)
+    @precondition(lambda self: self.txn is not None)
     @rule()
     def commit_transaction(self):
         self.commit()
@@ -474,7 +471,7 @@ def test_a_transaction_reads_its_writes_and_commits_them(dsn):
         m.begin()
         m.insert("t0", {"c0": 3, "c1": "c"}, all_columns=False)
         m.insert("t0", {"c0": 4, "c1": None}, all_columns=False)
-        m.commit()
+        assert m.commit() == "COMMIT"
         m.check()
     finally:
         m.teardown()
@@ -490,7 +487,7 @@ def test_every_statement_after_a_failed_one_is_25P02(dsn):
         assert m.lookup("t0", (1,)).error == "25P02"
         assert m.insert("t0", {"c0": 3, "c1": 3}, all_columns=False).error == "25P02"
         assert m.insert("t9", {"c0": 3}, all_columns=False).error == "25P02"  # refused or not, it is not run
-        m.rollback()
+        assert m.commit() == "ROLLBACK"  # as PostgreSQL's COMMIT of an aborted transaction
         m.check()
         # A statement refused before it runs aborts a transaction too.
         m.begin()

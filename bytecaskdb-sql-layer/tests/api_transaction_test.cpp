@@ -62,14 +62,14 @@ TEST_CASE("embedded API: a transaction reads its own writes and commits them as 
   // Nothing is visible outside before the commit.
   CHECK(balance(*db, 1) == 100);
   CHECK(balance(*db, 2) == std::nullopt);
-  t.commit();
+  CHECK(t.commit() == CommitOutcome::Committed);
   CHECK_FALSE(t.is_open());
   CHECK(balance(*db, 1) == 60);
   CHECK(balance(*db, 2) == 40);
   CHECK_THROWS_AS(t.execute("SELECT bal FROM acct WHERE id = $1", {std::int64_t{1}}), std::logic_error);
 }
 
-TEST_CASE("embedded API: a failed statement aborts the transaction: 25P02 until rollback, nothing written",
+TEST_CASE("embedded API: a failed statement aborts the transaction: 25P02 until it ends, nothing written",
           "[sql][api][txn]") {
   sql_test::TempDir dir{"api_txn"};
   auto db = open_db(dir);
@@ -78,15 +78,16 @@ TEST_CASE("embedded API: a failed statement aborts the transaction: 25P02 until 
   CHECK_THROWS_AS(t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{2}}), ExecError);
   CHECK(t.is_aborted());
   CHECK_THROWS_AS(t.execute("SELECT bal FROM acct WHERE id = $1", {std::int64_t{1}}), TransactionAborted);
-  CHECK_THROWS_AS(t.commit(), TransactionAborted);
-  CHECK(t.is_open());
-  t.rollback();
+  // commit() rolls it back, as PostgreSQL's COMMIT does, and says so.
+  CHECK(t.commit() == CommitOutcome::RolledBack);
   CHECK_FALSE(t.is_open());
   CHECK(balance(*db, 1) == std::nullopt);
   // A statement refused before it ran aborts it too.
   auto u = db->begin();
   CHECK_THROWS_AS(u.execute("SELECT bal FROM acct WHERE id = $1", std::vector<Value>{sql_test::bytes("x")}), ParamError);
   CHECK_THROWS_AS(u.execute("SELECT bal FROM acct WHERE id = $1", {std::int64_t{1}}), TransactionAborted);
+  u.rollback();
+  CHECK_FALSE(u.is_open());
 }
 
 TEST_CASE("embedded API: a statement cached before a DDL is recompiled for a transaction", "[sql][api][txn]") {
@@ -99,7 +100,7 @@ TEST_CASE("embedded API: a statement cached before a DDL is recompiled for a tra
   auto t = db->begin();
   t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{7}});
   CHECK(txn_balance(t, 1) == 7);
-  t.commit();
+  CHECK(t.commit() == CommitOutcome::Committed);
   CHECK(balance(*db, 1) == 7);
 }
 
@@ -124,9 +125,9 @@ TEST_CASE("embedded API: a conflict at commit is a serialization failure, and no
   a.execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{90}});
   a.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{2}, std::int64_t{10}});
   b.execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{50}});
-  b.commit();
+  CHECK(b.commit() == CommitOutcome::Committed);
   try {
-    a.commit();
+    (void)a.commit();
     FAIL("the second commit did not conflict");
   } catch (const SerializationFailure& e) {
     CHECK(e.conflict());
@@ -171,7 +172,7 @@ TEST_CASE("embedded API: destroying an open transaction rolls it back; close() e
   CHECK(moved.is_open());
   db->close();
   CHECK_FALSE(moved.is_open());
-  CHECK_THROWS_AS(moved.commit(), DbClosed);
+  CHECK_THROWS_AS((void)moved.commit(), DbClosed);
   CHECK_THROWS_AS(db->begin(), DbClosed);
   moved.rollback();  // ended already: nothing to do
   auto again = Database::open(dir.path());
@@ -200,8 +201,7 @@ TEST_CASE("embedded API: transactions on different threads run concurrently and 
         t.execute(write, {std::int64_t{0}, shared + 1});
         t.execute(write, {std::int64_t{n}, own + 1});
         try {
-          t.commit();
-          ++done;
+          if (t.commit() == CommitOutcome::Committed) ++done;
         } catch (const SerializationFailure&) {
           ++conflicts;
         }

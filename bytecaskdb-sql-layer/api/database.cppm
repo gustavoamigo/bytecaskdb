@@ -168,11 +168,18 @@ struct TransactionOptions {
 
 class Database;
 
+// What commit() did, as PostgreSQL's COMMIT reports it in its command tag.
+enum class CommitOutcome {
+  Committed,
+  RolledBack,  // the transaction was aborted: nothing was written
+};
+
 // A transaction from Database::begin(): its statements read the snapshot
 // taken at its first statement plus their earlier statements' writes, never
 // their own, and commit() writes them all as one batch, or nothing. A
-// statement that fails aborts it: every later execute() and commit() throws
-// TransactionAborted (25P02) until rollback(). After commit() or rollback()
+// statement that fails aborts it: every later execute() throws
+// TransactionAborted (25P02), and commit() rolls it back, as PostgreSQL's
+// COMMIT does in an aborted transaction. After commit() or rollback()
 // it has ended, and every call but rollback() throws std::logic_error.
 // Destroying an open one rolls it back. Move-only; one thread at a time, and
 // ended before the Database closes it.
@@ -189,11 +196,11 @@ public:
   // TransactionAborted if it already is. A DDL statement is refused.
   auto execute(const Statement& stmt, const std::vector<Value>& params) -> Rows;
   auto execute(std::string_view sql, const std::vector<Value>& params = {}) -> Rows;
-  // Writes every statement's writes as one batch. Throws
-  // SerializationFailure on a conflict, ExecError on an engine error, and
-  // TransactionAborted after a failed statement; in every case but the last
-  // the transaction has ended with nothing written.
-  void commit();
+  // Writes every statement's writes as one batch: Committed. After a failed
+  // statement it writes nothing and returns RolledBack. Throws
+  // SerializationFailure on a conflict and ExecError on an engine error,
+  // with nothing written. The transaction has ended in every case.
+  [[nodiscard]] auto commit() -> CommitOutcome;
   // Ends the transaction; nothing it wrote is kept. Once ended, does nothing.
   void rollback() noexcept;
   [[nodiscard]] auto is_open() const noexcept -> bool { return state_ != State::Ended; }
@@ -705,12 +712,7 @@ auto Transaction::execute(std::string_view sql, const std::vector<Value>& params
   return execute(*stmt, params);
 }
 
-void Transaction::commit() {
-  {
-    std::shared_lock<std::shared_mutex> lock{db_->mu_};
-    if (db_->closed_) throw DbClosed();
-    check_open();
-  }
+auto Transaction::commit() -> CommitOutcome {
   // Shared: commits on different transactions run together, and share the
   // engine's group commit. The commit ends the transaction, whatever the
   // outcome.
@@ -719,12 +721,18 @@ void Transaction::commit() {
   {
     std::shared_lock<std::shared_mutex> lock{db_->mu_};
     if (db_->closed_) throw DbClosed();
-    r = bc_txn_commit(cx_, txn_, true);
-    if (r == BC_FAILED) failed.emplace(bc_error_message(cx_), bc_error(cx_), bc_error_detail(cx_));
+    if (state_ == State::Ended) throw std::logic_error("the transaction has ended");
+    if (state_ == State::Open) {
+      r = bc_txn_commit(cx_, txn_, true);
+      if (r == BC_FAILED) failed.emplace(bc_error_message(cx_), bc_error(cx_), bc_error_detail(cx_));
+    }
   }
+  auto aborted = state_ == State::Aborted;
   rollback();  // frees what is left; nothing more is written
+  if (aborted) return CommitOutcome::RolledBack;
   if (r == BC_CONFLICT) throw SerializationFailure("could not serialize access due to concurrent update");
   if (failed) throw *failed;
+  return CommitOutcome::Committed;
 }
 
 #ifdef BYTECASK_SQL_TESTING

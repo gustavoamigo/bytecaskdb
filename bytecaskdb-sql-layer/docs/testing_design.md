@@ -68,10 +68,11 @@ Rules for transactions (#491):
   which read its own writes. PostgreSQL runs a real `REPEATABLE READ`
   transaction on its connection, which also takes its snapshot at the
   first statement.
-- **COMMIT** of a transaction no statement failed in, and **ROLLBACK** of
-  any. After a failed statement both sides answer every statement with
-  25P02, except one that does not parse, which both report as the syntax
-  error. After each statement the two must agree on whether the
+- **COMMIT** and **ROLLBACK** of any transaction. After a failed
+  statement both sides answer every statement with 25P02, except one that
+  does not parse, which both report as the syntax error, and COMMIT rolls
+  back on both: the layer's `commit()` and PostgreSQL's command tag both
+  say ROLLBACK. After each statement the two must agree on whether the
   transaction is aborted.
 - The tables are compared while no transaction is open; CREATE, DROP and
   the reopen run only then. One connection on each side: nothing commits
@@ -101,11 +102,6 @@ PYTHONPATH=bytecaskdb-sql-layer/python \
 ## Known differences
 
 Found so far. The machine expects each one, so it does not fail on them.
-
-- **COMMIT in an aborted transaction.** PostgreSQL takes it as ROLLBACK
-  and reports no error; the layer's `commit()` throws 25P02 and leaves the
-  transaction for `rollback()`. The machine expects the layer's 25P02,
-  then rolls both back.
 
 - **A table needs a primary key.** The layer refuses `CREATE TABLE` without
   one; PostgreSQL accepts it. The machine sends that variant to the layer
