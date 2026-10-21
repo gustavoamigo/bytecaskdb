@@ -56,9 +56,10 @@ PostgreSQL what they mean in HammerDB, and one table gains a key
     start, outside the measured transactions, the harness runs `UPDATE
     harness_run SET last_run = last_run + 1 WHERE id = 1` and reads the row
     back in the same transaction.
-  - The load uses run 0.
-  - This gives 2^15 runs, 256 threads and 2^40 rows per thread per run;
-    the harness refuses to start past any of them.
+  - The load inserts the row `(1, 0)` and uses run 0.
+  - This gives 2^15 runs, the load's included, 256 threads and 2^40 rows
+    per thread per run. The harness refuses to start past the last run or
+    with more threads, and a thread refuses a row past its 2^40th.
 
 ## The statements
 
@@ -203,12 +204,11 @@ limit is refused (2201W), as in PostgreSQL. `OFFSET` is not in the MVP.
 - otherwise: "could not determine data type of parameter $n" (42P18).
 
 **Refused**, with a message and the node's position: everything not above.
-A statement inside the subset can still be refused by the planner (*What
-the planner refuses*).
 That includes `OR`, subqueries, derived tables, `GROUP BY`, `HAVING`,
 `DISTINCT` on the select list, outer joins, three or more tables, table
 aliases, `OFFSET`, `RETURNING`, set operations, functions, and literals
-other than integers.
+other than integers. A statement inside the subset can still be refused by
+the planner (*What the planner refuses*).
 
 ## The statement IR
 
@@ -356,6 +356,10 @@ reverse. Sorters (`bc_sorter_*`) are #533.
 - The outer table is the one reachable from parameters alone, a point
   lookup over a scan. The inner one must be reachable from the outer row's
   columns and parameters, by a point lookup or a prefix.
+- An `ORDER BY` on a join may name only the outer table's columns, and the
+  outer path must serve it: the nested loop keeps the outer order. Any
+  other order is refused (*What the planner refuses*). No TPROC-C join
+  has an `ORDER BY`.
 - N1: both are point lookups; the order is the `FROM` order.
 - S2: `order_line` is outer (a prefix and a range from parameters), and
   `stock` is a point lookup by `(ol_i_id, $1)`.
@@ -375,7 +379,7 @@ serves it (*Decisions*, 5; the gap is #533):
 | Refused | Message |
 |---|---|
 | A table, read, updated or deleted from, with no usable path | `no plan: a full scan of <table>` |
-| An `ORDER BY` that no usable path serves | `no plan: no index of <table> gives ORDER BY <columns>` |
+| An `ORDER BY` that no usable path serves, or one on a join that names an inner table's column | `no plan: no index of <table> gives ORDER BY <columns>` |
 | A join whose inner table no key reaches from the outer row and the parameters | `no plan: no index of <table> joins on <columns>` |
 
 The refusal is a SQL error raised after binding and before anything runs.
@@ -462,8 +466,9 @@ include that difference:
   MySQL client connections, and MariaDB runs each procedure's statements
   inside the server.
 
-No normalisation is applied. How the comparison is run is for the owner to
-decide.
+No normalisation is applied. How the comparison is run is not settled by
+this design: it is being raised with the owner under #487, and is not one
+of the *Decisions*.
 
 ## Known differences from PostgreSQL
 
