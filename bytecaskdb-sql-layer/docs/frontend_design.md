@@ -1,7 +1,7 @@
 # SQL front end for the MVP: dialect subset and statement IR
 
-Status: **design, for review (#492); its open questions were decided by
-the owner on 2026-10-21 (*Decisions*).** Nothing here is built. It decides
+Status: **design, approved (owner, 2026-10-21; #492).** Its open
+questions are recorded under *Decisions*. Nothing here is built. It decides
 the SQL the MVP accepts, the intermediate form the code generator prints
 plans from, and the planner's choices, all scoped by TPROC-C (#487, *MVP*).
 The rest of #492 (rewrites, hash joins, `EXPLAIN`, the plan cache's design)
@@ -16,10 +16,9 @@ comes after the MVP and is listed under *Later*.
 - **Only the compiler's plans are supported.** The IR and the code
   generator are the only source of plan text.
 - **Refuse rather than guess.** A statement outside the subset is refused at
-  parse or bind with a message and a position, before anything runs. A
-  statement in the subset that no index serves is refused by the planner,
-  also before anything runs, with "no plan: …" and no position
-  (*Decisions*, 5).
+  parse or bind, with a message and a position. One inside it that no index
+  serves is refused by the planner (*What the planner refuses*). Either
+  way, nothing has run.
 
 ## Where the statements come from
 
@@ -50,7 +49,16 @@ PostgreSQL what they mean in HammerDB, and one table gains a key
   DESC) AS sb LIMIT 1`, is flattened to `… ORDER BY o_id DESC LIMIT 1`.
 - `history` has no key in HammerDB. The schema fixture
   (`tests/tpcc_schema.cppm`) gives it `h_id`, supplied by the harness until
-  sequences exist.
+  sequences exist. Each `h_id` is unique across threads and runs:
+  `(run << 48) | (thread << 40) | n`, with `n` counted per thread from 0.
+  - `run` comes from a one-row table of the harness's own,
+    `harness_run (id INTEGER PRIMARY KEY, last_run BIGINT NOT NULL)`. At
+    start, outside the measured transactions, the harness runs `UPDATE
+    harness_run SET last_run = last_run + 1 WHERE id = 1` and reads the row
+    back in the same transaction.
+  - The load uses run 0.
+  - This gives 2^15 runs, 256 threads and 2^40 rows per thread per run;
+    the harness refuses to start past any of them.
 
 ## The statements
 
@@ -195,6 +203,8 @@ limit is refused (2201W), as in PostgreSQL. `OFFSET` is not in the MVP.
 - otherwise: "could not determine data type of parameter $n" (42P18).
 
 **Refused**, with a message and the node's position: everything not above.
+A statement inside the subset can still be refused by the planner (*What
+the planner refuses*).
 That includes `OR`, subqueries, derived tables, `GROUP BY`, `HAVING`,
 `DISTINCT` on the select list, outer joins, three or more tables, table
 aliases, `OFFSET`, `RETURNING`, set operations, functions, and literals
@@ -309,14 +319,24 @@ slice implements them.
 All deliberately naive: rules, no cost model, chosen so every TPROC-C
 statement gets the plan a person would write.
 
-**Access path, per table.**
+**Access path, per table.** A path is the primary key or one of the
+table's indexes. It is *usable* when its first part is compared for
+equality or bounded by a range. It *serves* an `ORDER BY` when the ordered
+columns are its parts after its equality-compared ones, in its order, all
+`ASC` (a forward scan) or all `DESC` (a reverse one); ordered columns that
+are compared for equality may be left out.
 1. Every primary-key column compared for equality: a point lookup.
-2. Otherwise, of the primary key and each index, the one with the longest
-   leading run of equality-compared parts, then optionally one part with a
-   range. Ties go to the one whose order serves `ORDER BY`, then to the
-   primary key, then to the covering one, then to the lower id.
-3. No usable leading part: refused, "no plan: a full scan of t"
-   (*Decisions*, 5).
+2. Otherwise, with an `ORDER BY`, only the usable paths that serve it
+   remain.
+3. Of those, the one with the longest leading run of equality-compared
+   parts, then optionally one part with a range. Ties go to the primary
+   key, then to the covering path, then to the lower id.
+4. No path remains: refused (*What the planner refuses*).
+
+So `WHERE a = $1 AND b = $2 ORDER BY d`, on a primary key `(a, b, c)` and
+an index `(a, d)`, takes the index: one equality part and `b = $2` as a
+residual, rather than the longer primary-key prefix, which can't give the
+order.
 
 `bc_count_range` cardinalities are not consulted. With TPROC-C's schema
 every statement has a full key or a selective prefix, so a cost model
@@ -330,14 +350,12 @@ on one side, the first in `WHERE` order is the key bound and the other a
 residual.
 
 **`ORDER BY`** is served only by the access path's order, forward or
-reverse; a query whose order no path gives is refused in the MVP. A sorter
-(`bc_sorter_*`) comes with the first statement that needs one.
+reverse. Sorters (`bc_sorter_*`) are #533.
 
 **Joins.** Index nested loop only, two tables only.
 - The outer table is the one reachable from parameters alone, a point
   lookup over a scan. The inner one must be reachable from the outer row's
-  columns and parameters, by a point lookup or a prefix; otherwise the join
-  is refused.
+  columns and parameters, by a point lookup or a prefix.
 - N1: both are point lookups; the order is the `FROM` order.
 - S2: `order_line` is outer (a prefix and a range from parameters), and
   `stock` is a point lookup by `(ol_i_id, $1)`.
@@ -348,6 +366,22 @@ each row as its scan reaches it. The statement reads the transaction's view
 as it stood at the statement's start (`docs/transaction_design.md`,
 *Statements inside a transaction*), so its own writes never feed back into
 its scan.
+
+### What the planner refuses
+
+In the MVP the planner refuses a statement inside the subset when no index
+serves it (*Decisions*, 5; the gap is #533):
+
+| Refused | Message |
+|---|---|
+| A table, read, updated or deleted from, with no usable path | `no plan: a full scan of <table>` |
+| An `ORDER BY` that no usable path serves | `no plan: no index of <table> gives ORDER BY <columns>` |
+| A join whose inner table no key reaches from the outer row and the parameters | `no plan: no index of <table> joins on <columns>` |
+
+The refusal is a SQL error raised after binding and before anything runs.
+It carries no position: the planner works on the bound statement, which
+keeps none. PostgreSQL runs each of these; it is the one entry of *Known
+differences* that is a feature gap.
 
 ## Tests
 
@@ -375,10 +409,10 @@ slice adds the rules for what it brings:
   an aggregate on both sides.
 
 Refusals of what the subset leaves out are tested with their message and
-position, as `binder_test` tests today's. The planner's "no plan: …"
-refusals, of a full scan and of an order no path gives, are tested with
-their message; the proof machine generates only statements a path serves,
-so it never counts one against PostgreSQL.
+position, as `binder_test` tests today's. Each row of *What the planner
+refuses* is tested with its message. The proof machine generates only
+statements the planner serves, so it never compares a planner refusal with
+PostgreSQL (`docs/testing_design.md`).
 
 **Each transaction against PostgreSQL.** Each slice adds a test that runs
 its TPROC-C transaction through SQL: a small fixture (one warehouse, scaled
@@ -416,13 +450,28 @@ its transaction test.
 
 Then the MVP gate.
 
+**The MVP gate** runs the five transactions through SQL at 1, 16 and 48
+threads, beside `commit_probe`, with Elle through SQL (#487, 2.6), and
+compares with InnoDB. The two sides are driven differently, and the numbers
+include that difference:
+- **This layer:** the harness calls the embedded API in its own process.
+  It runs one `Transaction` per TPROC-C transaction, with the client logic
+  in C++. There is no network, no wire protocol and no SQL text per call:
+  statements are prepared once.
+- **InnoDB:** HammerDB's Tcl virtual users call its stored procedures over
+  MySQL client connections, and MariaDB runs each procedure's statements
+  inside the server.
+
+No normalisation is applied. How the comparison is run is for the owner to
+decide.
+
 ## Known differences from PostgreSQL
 
 | PostgreSQL | This layer | Why |
 |---|---|---|
 | `SUM` over `DECIMAL` is unbounded `numeric`. | Past 18 digits it is 22003. | `DECIMAL` is a scaled `int64_t` (`docs/types_design.md`). No TPROC-C sum comes near. |
 | Comparing columns of different types casts one to the other's. | Refused, in a `WHERE` and a join. | One key encoding per comparison. TPROC-C compares columns of one type only. |
-| A query no index serves runs: a full scan, or a sort of the rows read. | Refused: "no plan: …". | Each would add a sorter (`bc_sorter_*`) or an unbounded read to build and test before the MVP (*Decisions*, 5). No TPROC-C statement needs one. |
+| A statement no index serves runs: a full scan, or a sort of the rows read. | Refused (*What the planner refuses*). | Each would add a sorter (`bc_sorter_*`) or an unbounded read to build and test before the MVP (*Decisions*, 5; #533). No TPROC-C statement needs one. |
 
 All three are refusals rather than different answers. Everything else in
 the subset matches PostgreSQL, and the proof machine checks that it does.
@@ -435,13 +484,13 @@ that builds it, named in its PR.
 **Added (SQL):**
 | Guarantee | Proved by |
 |---|---|
-| A statement outside the supported subset is refused with a SQL error naming the construct and its position, before anything runs or is written. | to add |
+| A statement outside the supported subset is refused at parse or bind, with a SQL error naming the construct and its position, before anything runs or is written. | to add |
 | `ORDER BY` returns rows in that order, ties in any order, and `LIMIT n` returns the first `n`. | to add |
 | An aggregate query returns one row: `COUNT` 0 and `SUM` and `MIN` NULL over no rows. | to add |
 | An `UPDATE` or `DELETE` affects exactly the rows that matched when it began, and reports how many. | to add |
 | Arithmetic whose result leaves its type is SQLSTATE 22003, and the statement writes nothing. | to add |
 | A comparison with NULL rejects the row. | to add |
-| A statement no index serves is refused with "no plan: …", before anything runs or is written. | to add |
+| In the MVP, a statement inside the supported subset that no index serves (a full scan, an `ORDER BY` no index gives, a join no index reaches) is refused with a "no plan" SQL error, without a position, before anything runs or is written. | to add |
 
 **Widened:** lookups by the whole primary key become lookups by any key
 prefix or range, joins of two tables, and `UPDATE` and `DELETE` of many
@@ -463,14 +512,17 @@ The owner's answers to this design's open questions (2026-10-21):
 4. **The range check on computed values** is added to the plan API,
    raising 22003 as PostgreSQL's operators do, so no key is built from a
    value its column cannot hold.
-5. **Full scans and sorts no index provides are refused** in the MVP, as a
-   feature gap stated under *Known differences*. The owner's condition: it
-   must not block the TPROC-C run. No statement above needs one, and the
-   golden plans fail if one is refused.
+5. **Full scans and sorts no index provides are refused** in the MVP
+   (*What the planner refuses*), a feature gap stated under *Known
+   differences* and tracked in #533. The owner's condition: it must not
+   block the TPROC-C run. No statement above needs one, and the golden
+   plans fail if one is refused.
 6. **No cost model.** Rule-based paths; `bc_count_range` cardinalities
-   enter with the first workload whose plans a rule gets wrong.
+   enter with the first workload whose plans a rule gets wrong (#534).
 
 ## Later
+
+Tracked in #534, except full scans and sorts, which are #533.
 
 - `OR`, `IN`, `IS NULL`, subqueries, derived tables, `GROUP BY`, outer
   joins, three or more tables, `OFFSET`, `RETURNING`, multi-row `VALUES`,

@@ -25,8 +25,15 @@ every rule, the invariants are checked.
   message, so a reworded one fails there. Any other refusal counts
   as a refusal on both, whatever its message. The layer's refusals are
   `SqlError`: parse and bind errors, a DDL the catalog refuses, parameters
-  of the wrong number or type. Any other exception from the layer, an engine
-  refusal at run time included, fails the test.
+  of the wrong number or type, and the planner's "no plan" refusal of a
+  statement no index serves (`docs/frontend_design.md`, *What the planner
+  refuses*). Any other exception from the layer, an engine refusal at run
+  time included, fails the test.
+- **Statements the planner serves.** PostgreSQL runs every statement the
+  planner refuses, so a refusal would never agree. The machine generates
+  only statements a usable path serves, and a "no plan" refusal of one it
+  generates fails the test. The planner's refusals are tested by their
+  messages in `sql_layer_tests`.
 - **Counts agree.** An INSERT, UPDATE or DELETE changes as many rows on both.
 - **Rows agree.** A lookup returns the same rows. After every step, each
   table holds the same rows on both. The layer's rows are read from the
