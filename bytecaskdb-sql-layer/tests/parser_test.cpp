@@ -86,7 +86,8 @@ TEST_CASE("parser: the seven statements of the prototype", "[sql][parser]") {
 TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql][parser]") {
   //                    0         1         2         3
   //                    0123456789012345678901234567890123456789
-  CHECK(rejected_at("SELECT id FROM t JOIN u ON t.id = u.id") == 22);
+  CHECK(rejected_at("SELECT id FROM t LEFT JOIN u ON t.id = u.id") == 27);
+  CHECK(rejected_at("SELECT id FROM t, u, v WHERE id = $1") >= 0);
   CHECK(rejected_at("SELECT id FROM t WHERE id = 1") == 28);   // a literal
   CHECK(rejected_at("SELECT id FROM t WHERE id = $1 OR id = $2") >= 0);
   CHECK(rejected_at("SELEC id FROM t") == 0);                   // PostgreSQL's own syntax error
@@ -174,3 +175,33 @@ TEST_CASE("parser: SELECT … FOR UPDATE, and no other locking clause", "[sql][p
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 FOR UPDATE OF t"), SqlError);
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 FOR UPDATE FOR UPDATE"), SqlError);
 }
+
+TEST_CASE("parser: two tables, qualified columns and integer literals", "[sql][parser]") {
+  auto j = std::get<Select>(parse("SELECT t.id, qty FROM t, u WHERE t.id = $1 AND k = $2"));
+  CHECK(j.table == "t");
+  CHECK(j.join == "u");
+  CHECK(j.targets[0].table == "t");
+  CHECK(j.targets[1].table.empty());
+  REQUIRE(j.where.size() == 2);
+  CHECK(j.where[0].lhs.table == "t");
+  // JOIN … ON: the ON conjuncts come first, then the WHERE's.
+  auto on = std::get<Select>(parse("SELECT id FROM t JOIN u ON k = $1 WHERE id = $2"));
+  CHECK(on.join == "u");
+  REQUIRE(on.where.size() == 2);
+  CHECK(on.where[0].lhs.column == "k");
+  auto u = std::get<Update>(parse("UPDATE t SET qty = qty + 1 WHERE id = $1"));
+  CHECK(u.set[0].value.rhs->kind == Expr::Kind::Const);
+  CHECK(u.set[0].value.rhs->constant == 1);
+  CHECK(std::get<Update>(parse("UPDATE t SET qty = qty - 10000000000 WHERE id = $1")).set[0].value.rhs->constant ==
+        10000000000);
+  CHECK_THROWS_AS(parse("UPDATE t SET qty = qty + 1.5 WHERE id = $1"), SqlError);
+  CHECK_THROWS_AS(parse("UPDATE t SET qty = qty + 99999999999999999999 WHERE id = $1"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = 1"), SqlError);
+  try {
+    (void)parse("SELECT id FROM t JOIN u ON id = $1 OR k = $2");
+    FAIL("accepted");
+  } catch (const SqlError& e) {
+    CHECK(std::string{e.what()} == "only AND is supported in ON");
+  }
+}
+

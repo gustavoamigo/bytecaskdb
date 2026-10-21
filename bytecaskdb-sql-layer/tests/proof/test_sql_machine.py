@@ -25,7 +25,8 @@ only then.
 
 Slice 1 of the front end (#492): NUMERIC columns, CREATE INDEX, SELECT by
 an equality prefix and a range of any key, with ORDER BY and LIMIT, COUNT,
-and SET col = col ± $n. A model of the planner's rules (`served`) keeps the
+and SET col = col ± $n. Slice 3: SET col = col ± an integer literal, and a
+join of two tables, each by its whole primary key. A model of the planner's rules (`served`) keeps the
 machine to statements the layer plans; the rest must be refused with "no
 plan".
 
@@ -408,15 +409,45 @@ class SqlMachine(RuleBasedStateMachine):
         why = o.same_rows(layer.rows, full.rows, key, limit)
         assert why is None, f"{sql} {params!r}: {why}: the layer returned {layer.rows}, PostgreSQL {full.rows}"
 
-    def add(self, name: str, col: str, op: str, operand, key: tuple) -> o.Outcome:
-        """UPDATE … SET col = col op $1 WHERE the primary key."""
+    def add(self, name: str, col: str, op: str, operand, key: tuple, literal: bool = False) -> o.Outcome:
+        """UPDATE … SET col = col op $1 WHERE the primary key; with `literal`,
+        the operand is an integer literal in the text, typed by both sides
+        as PostgreSQL types it."""
         t = self.tables[name]
-        where = " AND ".join(f"{c} = ${i + 2}" for i, c in enumerate(t.pk))
-        pg_where = " AND ".join(f"{c} = {typed(t, c, i + 2)}" for i, c in enumerate(t.pk))
+        first = 1 if literal else 2
+        where = " AND ".join(f"{c} = ${i + first}" for i, c in enumerate(t.pk))
+        pg_where = " AND ".join(f"{c} = {typed(t, c, i + first)}" for i, c in enumerate(t.pk))
+        key_types = [t.column(c).type for c in t.pk]
+        if literal:
+            return self.both(f"UPDATE {name} SET {col} = {col} {op} {operand} WHERE {where}", key,
+                             pg_sql=f"UPDATE {name} SET {col} = {col} {op} {operand} WHERE {pg_where}", types=key_types)
         cast = ARITHMETIC[t.column(col).type.sql]
         return self.both(f"UPDATE {name} SET {col} = {col} {op} $1 WHERE {where}", (operand, *key),
                          pg_sql=f"UPDATE {name} SET {col} = {col} {op} $1::{cast} WHERE {pg_where}",
-                         types=[t.column(col).type] + [t.column(c).type for c in t.pk])
+                         types=[t.column(col).type] + key_types)
+
+    def join(self, names: tuple[str, str], targets: list[tuple[str, str]], keys: tuple[tuple, tuple],
+             on: bool = False) -> o.Outcome:
+        """SELECT targets (table, column) FROM two tables, each named by its
+        whole primary key: FROM a, b WHERE …, or FROM a JOIN b ON (b's key)
+        WHERE (a's key)."""
+        a, b = (self.tables[n] for n in names)
+        conds = [[], []]
+        pg_conds = [[], []]
+        n = 0
+        for side, t in enumerate((a, b)):
+            for c in t.pk:
+                n += 1
+                conds[side].append(f"{t.name}.{c} = ${n}")
+                pg_conds[side].append(f"{t.name}.{c} = {typed(t, c, n)}")
+        select = ", ".join(f"{t}.{c}" for t, c in targets)
+        def text(cs):
+            if on:
+                return f"SELECT {select} FROM {a.name} JOIN {b.name} ON {' AND '.join(cs[1])} WHERE {' AND '.join(cs[0])}"
+            return f"SELECT {select} FROM {a.name}, {b.name} WHERE {' AND '.join(cs[0] + cs[1])}"
+        params = [*keys[0], *keys[1]]
+        return self.both(text(conds), params, pg_sql=text(pg_conds),
+                         types=[a.column(c).type for c in a.pk] + [b.column(c).type for c in b.pk])
 
     def begin(self) -> None:
         # PostgreSQL's REPEATABLE READ, like the layer's, takes its snapshot
@@ -636,6 +667,44 @@ class SqlMachine(RuleBasedStateMachine):
         small = st.integers(-5, 5).map(lambda n: decimal.Decimal(n) if ty.kind == "decimal" else n)
         operand = data.draw(st.none() | small | values(ty), label="operand")
         self.add(name, col, data.draw(st.sampled_from(["+", "-"]), label="op"), operand, key)
+
+    @precondition(lambda self: any(c.type.sql in ARITHMETIC and c.name not in t.pk
+                                   for t in self.tables.values() for c in t.columns))
+    @rule(data=st.data())
+    def add_a_literal(self, data):
+        choices = [(t.name, c.name) for t in self.tables.values() for c in t.columns
+                   if c.type.sql in ARITHMETIC and c.name not in t.pk]
+        name, col = data.draw(st.sampled_from(sorted(choices)), label="column")
+        t = self.tables[name]
+        keys = self.existing_keys(t)
+        if keys and data.draw(st.integers(0, 4), label="existing key?"):
+            key = data.draw(st.sampled_from(keys), label="key")
+        else:
+            key = tuple(data.draw(st.none() | values(t.column(c).type), label=c) for c in t.pk)
+        # Integer literals, typed integer or, past it, bigint: small ones, and
+        # ones at and past SMALLINT's and INTEGER's edges.
+        literal = data.draw(st.one_of(st.integers(-5, 5), st.sampled_from([32767, 32768, -32768, 2**31 - 1, 2**31,
+                                                                           2**40])), label="literal")
+        self.add(name, col, data.draw(st.sampled_from(["+", "-"]), label="op"), literal, key, literal=True)
+
+    @precondition(lambda self: len(self.tables) >= 2)
+    @rule(data=st.data())
+    def join_by_keys(self, data):
+        # Two tables that hold rows, when there are two, so the pair exists.
+        filled = [n for n in sorted(self.tables) if self.existing_keys(self.tables[n])]
+        pool = filled if len(filled) >= 2 and data.draw(st.integers(0, 3), label="filled tables?") else sorted(self.tables)
+        names = tuple(data.draw(st.permutations(pool), label="tables")[:2])
+        sides = [self.tables[n] for n in names]
+        keys = []
+        for t in sides:
+            existing = self.existing_keys(t)
+            if existing and data.draw(st.integers(0, 4), label=f"{t.name} existing key?"):
+                keys.append(data.draw(st.sampled_from(existing), label=f"{t.name} key"))
+            else:
+                keys.append(tuple(data.draw(st.none() | values(t.column(c).type), label=c) for c in t.pk))
+        columns = [(t.name, c.name) for t in sides for c in t.columns]
+        targets = data.draw(st.lists(st.sampled_from(columns), min_size=1, max_size=4, unique=True), label="targets")
+        self.join(names, targets, (keys[0], keys[1]), on=data.draw(st.booleans(), label="JOIN ON"))
 
     @precondition(lambda self: self.txn is None)
     @rule()
@@ -1162,4 +1231,66 @@ def test_a_parameter_used_with_two_types_is_refused(dsn):
         m.check()
     finally:
         m.teardown()
+
+
+def test_a_join_of_two_point_lookups(dsn):
+    """FROM a, b and a JOIN b ON …, each table by its whole primary key: the
+    row pair, or none when either row is missing or a key is NULL."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.TEXT)], ["c0"]))
+        m.create(Table("t1", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.BIGINT, nullable=False),
+                              Column("c2", o.numeric(6, 2))], ["c0", "c1"]))
+        m.insert("t0", {"c0": 1, "c1": "a"}, all_columns=True)
+        m.insert("t1", {"c0": 1, "c1": 2, "c2": decimal.Decimal("1.50")}, all_columns=True)
+        targets = [("t1", "c2"), ("t0", "c1"), ("t1", "c0")]
+        for keys in (((1,), (1, 2)), ((2,), (1, 2)), ((1,), (1, 3)), ((None,), (1, 2)), ((1,), (None, 2))):
+            for on in (False, True):
+                out = m.join(("t0", "t1"), targets, keys, on=on)
+                assert len(out.rows) == (1 if keys == ((1,), (1, 2)) else 0)
+    finally:
+        m.teardown()
+
+
+def test_column_plus_an_integer_literal(dsn):
+    """SET col = col ± n, n an integer literal: PostgreSQL types it integer,
+    or bigint past integer; the stored value is checked as the column's
+    type, 22003 on both sides when it leaves it."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.SMALLINT), Column("c2", o.INTEGER),
+                              Column("c3", o.numeric(6, 2))], ["c0"]))
+        m.insert("t0", {"c0": 1, "c1": 32760, "c2": 0, "c3": decimal.Decimal("9990.25")}, all_columns=True)
+        m.insert("t0", {"c0": 2, "c1": None, "c2": None, "c3": None}, all_columns=True)
+        for key in (1, 2):
+            assert m.add("t0", "c1", "+", 7, (key,), literal=True).error is None
+            assert m.add("t0", "c1", "+", 1, (key,), literal=True).error == ("22003" if key == 1 else None)
+            assert m.add("t0", "c2", "-", 2**31 + 1, (key,), literal=True).error == ("22003" if key == 1 else None)
+            assert m.add("t0", "c3", "+", 9, (key,), literal=True).error is None
+            assert m.add("t0", "c3", "+", 1, (key,), literal=True).error == ("22003" if key == 1 else None)
+            # Past BIGINT's half: the sum leaves the column, never int64.
+            assert m.add("t0", "c1", "+", 2**63 - 1, (key,), literal=True).error == ("22003" if key == 1 else None)
+            assert m.add("t0", "c2", "-", 2**63 - 1, (key,), literal=True).error == ("22003" if key == 1 else None)
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_a_range_refusal_on_a_join_names_its_columns_table(tmp_path):
+    """A parameter outside its column's type is refused before the plan runs,
+    naming the table of the column it is compared with: on a join, the
+    second table's for its key."""
+    db = bytecask_sql.open(str(tmp_path))
+    try:
+        db.execute("CREATE TABLE a (k BIGINT PRIMARY KEY, v BIGINT)")
+        db.execute("CREATE TABLE b (k SMALLINT PRIMARY KEY, w BIGINT)")
+        ids = {t["name"]: t["id"] for t in db.catalog()}
+        try:
+            db.execute("SELECT v, w FROM a, b WHERE a.k = $1 AND b.k = $2", (1, 40000))
+        except bytecask_sql.ExecError as e:
+            assert (e.constraint, e.object_id) == ("range", ids["b"])
+        else:
+            raise AssertionError("a SMALLINT key of 40000 was accepted")
+    finally:
+        db.close()
 

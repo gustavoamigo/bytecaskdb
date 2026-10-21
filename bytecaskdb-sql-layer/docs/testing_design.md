@@ -111,13 +111,23 @@ Rules for slice 1 of the front end (#492, `docs/frontend_design.md`):
   PostgreSQL's side `$n` is cast to the column's type, as PostgreSQL
   types it. BIGINT is left out until its overflow is 22003 (#540).
 
-`test_tpcc.py` runs TPROC-C's Payment and Order-Status through SQL against
-PostgreSQL: a small fixture (one warehouse, two districts, thirty customers
-each, some with a NULL `c_first`), then sixty transactions from a fixed
-seed, one thread, each statement in a `Transaction` and in a PostgreSQL
-REPEATABLE READ transaction, with the client's logic between them. Every
-statement's result and every table after the run must agree. The schema is
-read from `tests/tpcc_schema.cppm`, its one definition.
+Rules for slice 3 (#492):
+- **SET col = col ± n**, n an integer literal, on the same columns: small
+  ones, ones at and past SMALLINT's and INTEGER's edges, and ones past
+  INTEGER, which PostgreSQL types bigint.
+- **A join of two tables**, each by its whole primary key, existing keys
+  mostly, as `FROM a, b WHERE …` or `a JOIN b ON … WHERE …`, columns
+  qualified by their table.
+
+`test_tpcc.py` runs TPROC-C's Payment, Order-Status and New-Order through
+SQL against PostgreSQL: a small fixture (one warehouse, two districts,
+thirty customers each, some with a NULL `c_first`, fifty items and their
+stock), then ninety transactions from a fixed seed, one thread, in
+roughly TPROC-C's mix, each statement in a `Transaction` and in a
+PostgreSQL REPEATABLE READ transaction, with the client's logic between
+them. One New-Order in twenty names an item that does not exist and rolls
+back. Every statement's result and every table after the run must agree.
+The schema is read from `tests/tpcc_schema.cppm`, its one definition.
 
 Fixed cases are plain pytest functions at the end of the file. They call
 the machine's steps in a set order. Every failure Hypothesis finds is
@@ -360,5 +370,10 @@ Found so far. The machine expects each one, so it does not fail on them.
   digits at the column's scale before the plan runs, even when the column
   is NULL; PostgreSQL's unconstrained `numeric` may still complete (NULL
   plus anything is NULL). The machine's operands stay inside 18 digits.
-- **DML takes no literals:** values are parameters (`$1`). The machine's
+- **A DECIMAL literal operand of `col ± n` past 18 digits once scaled is
+  refused at bind** ("numeric field overflow"), whatever the column holds;
+  PostgreSQL computes the sum and fails only when it does not fit the
+  column. The machine's literals stay inside 18 digits.
+- **DML takes no literals but an integer after `+` or `-` in `SET`:** other
+  values are parameters (`$1`). The machine's
   statements use parameters on both sides.

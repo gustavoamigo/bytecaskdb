@@ -330,3 +330,47 @@ TEST_CASE("binder: COUNT, ORDER BY and column + parameter", "[sql][binder]") {
   CHECK(rejected(cat, "SELECT count(*) FROM t WHERE id = $1 FOR UPDATE").first ==
         "FOR UPDATE is not allowed with aggregate functions");
 }
+
+TEST_CASE("binder: a join of two tables, qualified columns and integer literals", "[sql][binder]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE u (k BIGINT PRIMARY KEY, qty BIGINT, d NUMERIC(10, 2))").stmt));
+  const auto& cat = f.cat();
+  {
+    auto j = std::get<bound::Join>(bind_sql(cat, "SELECT name, u.qty FROM t, u WHERE id = $1 AND k = $2").stmt);
+    CHECK(j.table->name == "t");
+    CHECK(j.second->name == "u");
+    REQUIRE(j.targets.size() == 2);
+    CHECK(j.targets[1].side == 1);
+    CHECK(j.where[0].size() == 1);
+    CHECK(j.where[1].size() == 1);
+  }
+  {
+    // A literal is in its column's representation: a DECIMAL's scaled.
+    auto up = std::get<bound::Update>(bind_sql(cat, "UPDATE u SET d = d + 1, qty = qty - 2 WHERE k = $1").stmt);
+    CHECK(up.set[0].second.constant == 100);
+    CHECK(up.set[1].second.constant == 2);
+  }
+  //                       0         1         2         3         4
+  //                       01234567890123456789012345678901234567890123456789
+  CHECK(rejected(cat, "SELECT qty FROM t, u WHERE id = $1 AND k = $2") ==
+        std::pair<std::string, std::int32_t>{"column reference \"qty\" is ambiguous", 7});
+  CHECK(rejected(cat, "SELECT v.qty FROM t, u WHERE id = $1").first == "missing FROM-clause entry for table \"v\"");
+  CHECK(rejected(cat, "SELECT v.qty FROM t WHERE id = $1").first == "missing FROM-clause entry for table \"v\"");
+  CHECK(rejected(cat, "SELECT id FROM t, t WHERE id = $1").first == "a table joined with itself is not supported");
+  CHECK(rejected(cat, "SELECT id FROM t, u WHERE id = $1 AND k = $2 FOR UPDATE").first ==
+        "FOR UPDATE on a join is not supported yet");
+  CHECK(rejected(cat, "SELECT count(*) FROM t, u WHERE id = $1 AND k = $2").first ==
+        "an aggregate on a join is not supported yet");
+  CHECK(rejected(cat, "SELECT id FROM t, u WHERE id = k").first == "WHERE must compare a column with a parameter");
+  CHECK(rejected(cat, "SELECT id FROM t JOIN u ON id = k WHERE k = $1").first == "ON must compare a column with a parameter");
+  {
+    // A range refusal names the table of the column the parameter is compared with.
+    auto b = bind_sql(cat, "SELECT name FROM t, u WHERE id = $1 AND k = $2");
+    CHECK(b.param_table == std::vector<std::uint32_t>{cat.table("t")->id, cat.table("u")->id});
+  }
+  //                       0         1         2
+  //                       0123456789012345678901234567890
+  CHECK(rejected(cat, "SELECT id FROM t, nope WHERE id = $1").second == 18);
+  CHECK(rejected(cat, "UPDATE u SET d = d + 100000000000000000 WHERE k = $1").first == "numeric field overflow");
+}
+
