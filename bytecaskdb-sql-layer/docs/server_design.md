@@ -5,8 +5,7 @@ Status: design, for review (#494's first slice).
 The MVP gate is HammerDB's TPROC-C driving the layer over PostgreSQL's
 wire protocol (`frontend_design.md`, *The MVP gate*). This slice is the
 server that HammerDB connects to and the HammerDB driver script that sends
-our statements. The harness of `testing_design.md` (*The MVP gate harness*)
-stays: it checks the consistency conditions, runs Elle and the CI smoke
+our statements. The harness of `testing_design.md` (*The TPC-C harness*) stays: it checks the consistency conditions, runs Elle and the CI smoke
 test, and gives the no-network baseline. It is not the gate.
 
 #494 planned a gRPC server first, with the PostgreSQL protocol as a shim in
@@ -274,13 +273,16 @@ server sends `ReadyForQuery`.
 - **An error.** It gets `ErrorResponse`. The server then reads and discards
   messages until `Sync`, which gets `ReadyForQuery`.
 
-One difference from PostgreSQL: outside `BEGIN`, PostgreSQL runs every
-`Execute` before a `Sync` as one implicit transaction. Here each one
-commits alone. libpq sends one `Execute` per `Sync`, so libpq cannot see
-the difference. A pipelining client can: psycopg's pipeline mode, or
-JDBC's batches. It is listed in *Known differences*. Following PostgreSQL
-would mean opening a `Transaction` at the first `Execute` and committing it
-at `Sync`.
+**Several `Execute`s before one `Sync`, outside `BEGIN`.** PostgreSQL
+runs them as one implicit transaction, committed at `Sync`. Here the
+first `Execute` after a `Sync` commits alone, as libpq's one statement per
+`Sync` needs. A second one before the next `Sync` is `0A000`, and the
+messages after it are discarded up to `Sync`, as after any error. Where we
+don't match PostgreSQL we refuse, rather than answer with other semantics.
+A pipelining client (psycopg's pipeline mode, JDBC's batches) gets that
+refusal. The first statement has committed by then, as it would have
+alone. Inside `BEGIN` any number of `Execute`s per `Sync` run in the
+transaction, as in PostgreSQL.
 
 ## Types and text
 
@@ -497,7 +499,8 @@ only makes it possible.
 
 `bytecaskdb-sql-layer/hammerdb/run-gate.sh --warehouses=W --vus=1,16,48
 [--rampup=2] [--duration=5] [--mix=full] [--hammerdb-home=PATH]
-[--data-root=PATH]`. It follows `run-hammerdb.sh` in the MariaDB plugin.
+[--data-root=PATH] [--smoke]`. It follows `run-hammerdb.sh` in the MariaDB
+plugin. `--smoke` is the short run of *Tests*.
 
 1. **Build.** It builds `sql_layer_tpcc` and `sql_layer_server` in
    `releasedbg`; a debug engine walks the key directory on every commit.
@@ -542,23 +545,26 @@ only makes it possible.
   - protocol 3.2 negotiated down;
   - each startup refusal;
   - an error in an extended sequence discarding to `Sync`;
+  - a second `Execute` before `Sync`, outside `BEGIN`, refused;
   - `Terminate` and a dropped connection rolling back an open
     transaction;
   - `COMMIT` of an aborted transaction tagged `ROLLBACK`;
   - the warnings;
   - `--max-connections`.
-- **HammerDB smoke, in CI.** One warehouse, two users, no ramp-up and a
-  one-minute window, against the server and against PostgreSQL 17, then
-  `sql_layer_tpcc check` and the same conditions on PostgreSQL. It needs
-  HammerDB's Linux release in the job, a cached download.
+- **HammerDB smoke, manual or nightly, not per PR.** It runs
+  `run-gate.sh --smoke`: one warehouse, two users, no ramp-up and a
+  one-minute window, against the server and against PostgreSQL 17. It then
+  runs `sql_layer_tpcc check` and the same conditions on PostgreSQL. It
+  needs HammerDB's Linux release. Per PR, CI runs the wire proof target and
+  `test_wire.py`.
 - **`scripts/check_driver_statements.py`** in CI.
 
 No microbenchmarks: the gate's numbers are HammerDB's.
 
 ## Known differences from PostgreSQL
 
-- Each `Execute` outside `BEGIN` commits alone, rather than all of them up
-  to `Sync` together.
+- Outside `BEGIN`, a second `Execute` before `Sync` is `0A000` rather than
+  part of an implicit transaction.
 - Parameter OIDs from the client are not used.
 - A compared `DECIMAL` parameter finer than its column's scale, and `NaN`,
   are `22P02`.
@@ -596,5 +602,7 @@ test.
 5. NOPM from the `d_next_o_id` sum, and TPM from client-side counts.
 6. One SQLSTATE mapping, in the API, shared by the server and the oracle.
 7. The four API additions.
-8. Each `Execute` commits alone outside `BEGIN` (rather than PostgreSQL's
-   implicit transaction up to `Sync`).
+8. Outside `BEGIN`, one `Execute` per `Sync`: a second is `0A000`, not an
+   implicit transaction (coordinator review: refuse where we don't match).
+9. The HammerDB smoke runs manually or nightly, not per PR (pending the
+   owner).
