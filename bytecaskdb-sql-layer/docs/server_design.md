@@ -217,8 +217,10 @@ The extended protocol accepts these words too: `Parse` of `BEGIN` makes a
 statement the session runs at `Execute`.
 
 **Every other statement** goes to `Database::prepare`.
-- Inside a transaction it runs with `Transaction::execute`, and outside
-  one with `Database::execute`, which commits it alone.
+- Inside a transaction it runs with `Transaction::execute`. Outside one,
+  a `Query` runs it with `Database::execute`, which commits it alone. An
+  `Execute` runs it in the block's implicit transaction (*Extended
+  query*).
 - DDL inside a transaction is the layer's `0A000`.
 - Results: `RowDescription` (for a row-returning statement), one `DataRow`
   per row, then `CommandComplete`. The tag comes from the statement's
@@ -273,16 +275,34 @@ server sends `ReadyForQuery`.
 - **An error.** It gets `ErrorResponse`. The server then reads and discards
   messages until `Sync`, which gets `ReadyForQuery`.
 
-**Several `Execute`s before one `Sync`, outside `BEGIN`.** PostgreSQL
-runs them as one implicit transaction, committed at `Sync`. Here the
-first `Execute` after a `Sync` commits alone, as libpq's one statement per
-`Sync` needs. A second one before the next `Sync` is `0A000`, and the
-messages after it are discarded up to `Sync`, as after any error. Where we
-don't match PostgreSQL we refuse, rather than answer with other semantics.
-A pipelining client (psycopg's pipeline mode, JDBC's batches) gets that
-refusal. The first statement has committed by then, as it would have
-alone. Inside `BEGIN` any number of `Execute`s per `Sync` run in the
-transaction, as in PostgreSQL.
+**The implicit transaction, outside `BEGIN`.** This follows PostgreSQL:
+- The first `Execute` after a `Sync` opens a `Transaction`.
+- Every `Execute` up to the next `Sync` runs in it.
+- `Sync` commits it. A commit error (`40001`, `08007`) is reported there,
+  before `ReadyForQuery`.
+- An error aborts it, and the messages after it are discarded up to
+  `Sync`, as now. Nothing in the block is committed.
+
+libpq sends one statement per `Sync`, so for libpq this is the statement
+committing alone. A pipelining client (psycopg's pipeline mode, JDBC's
+batches) gets PostgreSQL's semantics.
+
+A `BEGIN` inside the block makes it explicit, as PostgreSQL does: the open
+`Transaction` carries on past `Sync` until `COMMIT` or `ROLLBACK`.
+
+DDL is its own atomic operation in the layer and cannot run in a
+`Transaction`.
+- A DDL `Execute` that is the block's only one runs at `Sync`, alone. It
+  returns no rows, so its `CommandComplete` is sent there, before
+  `ReadyForQuery`.
+- A DDL with any other `Execute` in the same block is `0A000`, and nothing
+  in the block runs or commits.
+- A `Flush` does not run a pending DDL. A pipelining client that waits on
+  `Flush` for a DDL's result gets it at `Sync`.
+
+The simple-query path keeps `Database::execute`: one `Query` is one
+statement, committed alone, which is PostgreSQL's implicit transaction for a
+single statement.
 
 ## Types and text
 
@@ -545,7 +565,11 @@ plugin. `--smoke` is the short run of *Tests*.
   - protocol 3.2 negotiated down;
   - each startup refusal;
   - an error in an extended sequence discarding to `Sync`;
-  - a second `Execute` before `Sync`, outside `BEGIN`, refused;
+  - two `Execute`s before `Sync` outside `BEGIN`, the second failing:
+    neither is committed;
+  - two that succeed, committed together at `Sync`;
+  - a lone DDL `Execute` run at `Sync`, and one beside a DML `Execute`
+    refused with nothing run;
   - `Terminate` and a dropped connection rolling back an open
     transaction;
   - `COMMIT` of an aborted transaction tagged `ROLLBACK`;
@@ -563,8 +587,8 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 
 ## Known differences from PostgreSQL
 
-- Outside `BEGIN`, a second `Execute` before `Sync` is `0A000` rather than
-  part of an implicit transaction.
+- A DDL in an extended-query block with other statements is `0A000`, and
+  a lone one runs at `Sync`, not at `Execute`.
 - Parameter OIDs from the client are not used.
 - A compared `DECIMAL` parameter finer than its column's scale, and `NaN`,
   are `22P02`.
@@ -602,7 +626,9 @@ test.
 5. NOPM from the `d_next_o_id` sum, and TPM from client-side counts.
 6. One SQLSTATE mapping, in the API, shared by the server and the oracle.
 7. The four API additions.
-8. Outside `BEGIN`, one `Execute` per `Sync`: a second is `0A000`, not an
-   implicit transaction (coordinator review: refuse where we don't match).
+8. Outside `BEGIN`, the `Execute`s up to `Sync` are one implicit
+   `Transaction`, committed at `Sync`, as in PostgreSQL (coordinator
+   review). A DDL runs alone at `Sync`, or is `0A000` beside other
+   statements.
 9. The HammerDB smoke runs manually or nightly, not per PR (pending the
    owner).
