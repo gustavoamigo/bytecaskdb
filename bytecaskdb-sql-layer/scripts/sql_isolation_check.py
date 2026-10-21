@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Gustavo Amigo
-"""Elle through SQL (docs/testing_design.md, *The MVP gate harness*).
+"""Elle through SQL (docs/testing_design.md, *The TPC-C harness*).
 
 Records list-append histories through the SQL layer with `sql_layer_tpcc
 elle`, and checks them with the engine's tooling: run_elle and cross_check

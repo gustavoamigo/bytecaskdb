@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// tpcc.cppm — the MVP gate harness (docs/testing_design.md, *The MVP gate
+// tpcc.cppm — the TPC-C harness (docs/testing_design.md, *The TPC-C
 // harness*): TPC-C's initial population, TPROC-C's transactions with the
 // statements of docs/frontend_design.md, a closed-loop driver and its
 // report, TPC-C's consistency conditions, and a list-append history through

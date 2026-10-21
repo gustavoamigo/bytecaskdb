@@ -167,12 +167,14 @@ LSAN_OPTIONS=suppressions=$PWD/bytecaskdb-sql-layer/tests/lsan_alloc_sweeps.supp
   build/linux/x86_64/debug/sql_layer_tests "[alloc]"
 ```
 
-## The MVP gate harness
+## The TPC-C harness
 
-Status: **design, approved (owner, 2026-10-21).** The MVP gate (#487, *MVP*;
-`docs/frontend_design.md`, *The MVP gate* and Decision 7) runs TPROC-C's
-transaction mix through SQL at 1, 16 and 48 threads and reports the
-layer's own numbers. This section is what the harness does; the
+Status: **design, approved (owner, 2026-10-21).** The harness runs
+TPROC-C's transaction mix through the embedded API: it checks TPC-C's
+consistency conditions, runs Elle through SQL and the CI smoke test, and
+gives the layer's numbers with no network. It is not the MVP gate, which is
+HammerDB over the wire (`docs/frontend_design.md`, *The MVP gate* and
+Decision 7). This section is what the harness does; the
 statements it sends and the `h_id` scheme are `frontend_design.md`'s
 (*Where the statements come from*, *The statements*), and are not
 repeated here.

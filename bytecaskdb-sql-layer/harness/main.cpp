@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// sql_layer_tpcc — the MVP gate harness (docs/testing_design.md, *The MVP
-// gate harness*).
+// sql_layer_tpcc — the TPC-C harness (docs/testing_design.md, *The TPC-C
+// harness*).
 //
 //   sql_layer_tpcc load --dir D [--warehouses W] [--seed N]
 //   sql_layer_tpcc run  --dir D [--threads 1,16,48] [--warmup S] [--duration S] [--seed N] [--json FILE]

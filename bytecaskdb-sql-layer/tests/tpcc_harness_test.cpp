@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// The MVP gate harness's smoke test (docs/testing_design.md, *The MVP gate
+// The TPC-C harness's smoke test (docs/testing_design.md, *The TPC-C
 // harness*): a short mixed run at a tiny scale keeps TPC-C's consistency
 // conditions. The full runs are manual.
 
