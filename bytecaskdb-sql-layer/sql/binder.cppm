@@ -59,9 +59,12 @@ struct Insert {
   std::vector<std::optional<Expr>> values;
 };
 
-// COUNT(*), or COUNT(column): the rows, or the column's non-NULL values.
-struct Count {
-  std::optional<std::uint32_t> col_id;
+// COUNT(*), COUNT(column), SUM(column) or MIN(column), over the rows the
+// WHERE matches. SUM takes an integer or DECIMAL column, MIN those and a
+// DATE, TIMESTAMP or TIME column: values the plan holds as int64_t.
+struct Aggregate {
+  ast::Expr::Fn fn{ast::Expr::Fn::Count};
+  std::optional<std::uint32_t> col_id;  // none for COUNT(*)
 };
 
 struct OrderItem {
@@ -71,8 +74,8 @@ struct OrderItem {
 
 struct Select {
   const Table* table;
-  std::vector<std::uint32_t> targets;  // column ids, in select-list order; empty with count
-  std::optional<Count> count;          // the one aggregate, alone in the select list
+  std::vector<std::uint32_t> targets;  // column ids, in select-list order; empty with an aggregate
+  std::optional<Aggregate> aggregate;  // the one aggregate, alone in the select list
   std::vector<Compare> where;
   std::vector<OrderItem> order_by;
   std::optional<std::int64_t> limit;   // nullopt: no limit
@@ -118,9 +121,10 @@ struct Bound {
   // col = col ± $n), its SQL type without the modifier (compared_type's
   // range; a DECIMAL operand's, 18 digits at its scale): what its value is
   // checked against before the plan runs, so a key, bound or operand
-  // outside it is refused whatever the plan would read. nullopt for one
-  // only assigned (INSERT, SET), which the row builder checks in column
-  // order, as PostgreSQL's assignment does.
+  // outside it is refused whatever the plan would read. One an UPDATE
+  // assigns (SET col = $n) is checked against the column's whole type.
+  // nullopt for one only an INSERT assigns, which the row builder checks in
+  // column order, as PostgreSQL's assignment does.
   std::vector<std::optional<SqlType>> param_sql;
   // For each parameter param_sql checks, the table of the column it is
   // checked as: the object a BC_C_RANGE refusal names.
@@ -283,6 +287,26 @@ auto fold_default(const ast::Literal& l, SqlType t) -> Datum {
   bad();
 }
 
+// An integer or DECIMAL column: one whose arithmetic is exact in int64_t.
+auto exact_number(const Column& c) -> bool {
+  switch (c.sql.kind) {
+    case SqlKind::SmallInt:
+    case SqlKind::Integer:
+    case SqlKind::BigInt:
+    case SqlKind::Decimal: return true;
+    case SqlKind::Real:
+    case SqlKind::Double:
+    case SqlKind::Boolean:
+    case SqlKind::Bytea:
+    case SqlKind::Text:
+    case SqlKind::Varchar:
+    case SqlKind::Timestamp:
+    case SqlKind::Date:
+    case SqlKind::Time: return false;
+  }
+  return false;
+}
+
 auto column_spec(const ast::ColumnDefAst& c) -> ColumnSpec {
   auto t = sql_type(c);
   return ColumnSpec{c.name, t, !c.not_null && !c.primary_key,
@@ -392,6 +416,37 @@ public:
     }
   }
 
+  // UPDATE's SET col = $n: $n is also checked before the plan runs, against
+  // col's whole type, as PostgreSQL coerces it at bind and so refuses one
+  // outside the type even when no row matches. An INSERT writes its row
+  // whatever its parameters, and the row builder checks them in column
+  // order, as PostgreSQL does.
+  void check_assigned(std::uint32_t n, const Column& col, std::uint32_t table) {
+    auto& p = params_[n];
+    if (p.range) return;
+    p.range = col.sql;
+    p.table = table;
+  }
+
+  // An aggregate of a one-table SELECT. SUM and MIN take a column whose
+  // values the plan holds as int64_t: SUM an integer or DECIMAL one, as
+  // PostgreSQL sums them exactly; MIN those and the date and time types.
+  // MIN of a REAL or DOUBLE PRECISION column is later, and of a string or
+  // bytes column outside the MVP (docs/frontend_design.md, *Aggregates*).
+  static auto aggregate(const Table& t, const ast::Expr& e) -> Aggregate {
+    using Fn = ast::Expr::Fn;
+    if (e.column.empty()) return Aggregate{e.fn, std::nullopt};
+    const auto* c = column(t, e);
+    auto temporal = c->sql.kind == SqlKind::Date || c->sql.kind == SqlKind::Timestamp || c->sql.kind == SqlKind::Time;
+    if (e.fn == Fn::Sum && !exact_number(*c)) {
+      throw SqlError{"SUM of a " + sql_type_name(c->sql) + " column is not supported", e.pos};
+    }
+    if (e.fn == Fn::Min && !exact_number(*c) && !temporal) {
+      throw SqlError{"MIN of a " + sql_type_name(c->sql) + " column is not supported", e.pos};
+    }
+    return Aggregate{e.fn, c->id};
+  }
+
   // An integer literal added to or subtracted from `c`, in c's
   // representation: a DECIMAL's scaled by 10^scale, within its 18 digits.
   // PostgreSQL types it integer, or bigint past integer, and the sum as the
@@ -441,25 +496,7 @@ public:
         // operator's result type is then the column's, and the row
         // builder's range check on the stored value is the one PostgreSQL's
         // operator makes (22003).
-        auto numeric = [](const Column& col) {
-          switch (col.sql.kind) {
-            case SqlKind::SmallInt:
-            case SqlKind::Integer:
-            case SqlKind::BigInt:
-            case SqlKind::Decimal: return true;
-            case SqlKind::Real:
-            case SqlKind::Double:
-            case SqlKind::Boolean:
-            case SqlKind::Bytea:
-            case SqlKind::Text:
-            case SqlKind::Varchar:
-            case SqlKind::Timestamp:
-            case SqlKind::Date:
-            case SqlKind::Time: return false;
-          }
-          return false;
-        };
-        if (!numeric(*c) || !numeric(target) || compared_type(c->sql).identity != compared_type(target.sql).identity) {
+        if (!exact_number(*c) || !exact_number(target) || compared_type(c->sql).identity != compared_type(target.sql).identity) {
           throw SqlError{std::string{"operator "} + op + " is only supported on an integer or DECIMAL column of the "
                                                          "assigned column's type",
                          e.pos};
@@ -470,7 +507,7 @@ public:
                   e.kind == ast::Expr::Kind::Add ? Use::Added : Use::Subtracted);
         return Expr{kind, c->id, e.rhs->param, PhysType::I64, std::nullopt};
       }
-      case ast::Expr::Kind::Count: throw SqlError{"aggregate functions are not allowed here", e.pos};
+      case ast::Expr::Kind::Aggregate: throw SqlError{"aggregate functions are not allowed here", e.pos};
       case ast::Expr::Kind::Const: throw SqlError{"an integer literal is supported only after + or - yet", e.pos};
     }
     throw SqlError{"expression not supported", e.pos};
@@ -535,8 +572,8 @@ public:
     const Table* sides[2]{out.table, out.second};
     where(sides, s.where, out.where);
     for (const auto& e : s.targets) {
-      if (e.kind == ast::Expr::Kind::Count) throw SqlError{"an aggregate on a join is not supported yet", e.pos};
-      if (e.kind != ast::Expr::Kind::Column) throw SqlError{"only columns and COUNT can be selected", e.pos};
+      if (e.kind == ast::Expr::Kind::Aggregate) throw SqlError{"an aggregate on a join is not supported yet", e.pos};
+      if (e.kind != ast::Expr::Kind::Column) throw SqlError{"only columns and aggregates can be selected", e.pos};
       auto [side, c] = column(sides, e);
       out.targets.push_back({side, c->id});
     }
@@ -658,12 +695,12 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           Select out{t, {}, std::nullopt, b.where(*t, s.where), {}, s.limit, s.for_update};
           const ast::Expr* bare = nullptr;  // a column beside an aggregate: 42803
           for (const auto& e : s.targets) {
-            if (e.kind == ast::Expr::Kind::Count) {
-              if (out.count) throw SqlError{"only one aggregate per SELECT is supported", e.pos};
-              out.count = Count{e.column.empty() ? std::nullopt : std::optional{Binder::column(*t, e)->id}};
+            if (e.kind == ast::Expr::Kind::Aggregate) {
+              if (out.aggregate) throw SqlError{"only one aggregate per SELECT is supported", e.pos};
+              out.aggregate = Binder::aggregate(*t, e);
               continue;
             }
-            if (e.kind != ast::Expr::Kind::Column) throw SqlError{"only columns and COUNT can be selected", e.pos};
+            if (e.kind != ast::Expr::Kind::Column) throw SqlError{"only columns and aggregates can be selected", e.pos};
             out.targets.push_back(Binder::column(*t, e)->id);
             bare = &e;
           }
@@ -673,12 +710,12 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
                                "\" must appear in the GROUP BY clause or be used in an aggregate function",
                            pos};
           };
-          if (out.count && bare != nullptr) ungrouped(bare->column, bare->pos);
+          if (out.aggregate && bare != nullptr) ungrouped(bare->column, bare->pos);
           // 0A000, as PostgreSQL refuses it.
-          if (out.count && s.for_update) throw SqlError{"FOR UPDATE is not allowed with aggregate functions", s.pos};
+          if (out.aggregate && s.for_update) throw SqlError{"FOR UPDATE is not allowed with aggregate functions", s.pos};
           for (const auto& o : s.order_by) {
             const auto* c = Binder::column(*t, Binder::column_ref(o));
-            if (out.count) ungrouped(c->name, o.pos);
+            if (out.aggregate) ungrouped(c->name, o.pos);
             out.order_by.push_back({c->id, o.desc});
           }
           return {out, s.pos};
@@ -691,6 +728,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
               throw SqlError{"updating a primary key column is not supported", a.pos};
             }
             out.set.emplace_back(c->id, b.value(*t, a.value, *c));
+            if (const auto& v = out.set.back().second; v.kind == Expr::Kind::Param) b.check_assigned(v.param, *c, t->id);
           }
           out.where = b.where(*t, s.where);
           return {out, s.pos};

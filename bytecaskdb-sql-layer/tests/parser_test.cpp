@@ -103,7 +103,9 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   //                    01234567890123456789012345678901234567890123456789
   CHECK(rejected_at("SELECT id FROM t WHERE id = $1 LIMIT -1") == 37);
   CHECK(rejected_at("SELECT id FROM t WHERE id = $1 LIMIT 1.5") == 37);
-  CHECK(rejected_at("SELECT sum(qty) FROM t WHERE id = $1") == 7);
+  CHECK(rejected_at("SELECT max(qty) FROM t WHERE id = $1") == 7);
+  CHECK(rejected_at("SELECT sum(*) FROM t WHERE id = $1") == 7);
+  CHECK(rejected_at("SELECT min(qty + $2) FROM t WHERE id = $1") == 7);
   CHECK(rejected_at("SELECT count(DISTINCT qty) FROM t WHERE id = $1") == 7);
   CHECK(rejected_at("SELECT id FROM t WHERE id = $1 ORDER BY id NULLS FIRST") == 40);
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 LIMIT $2"), SqlError);
@@ -114,9 +116,16 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
 TEST_CASE("parser: COUNT, ORDER BY, LIMIT and column + parameter", "[sql][parser]") {
   auto s = std::get<Select>(parse("SELECT count(*), count(qty) FROM t WHERE name = $1 ORDER BY name DESC, id LIMIT 3"));
   REQUIRE(s.targets.size() == 2);
-  CHECK(s.targets[0].kind == Expr::Kind::Count);
+  CHECK(s.targets[0].kind == Expr::Kind::Aggregate);
+  CHECK(s.targets[0].fn == Expr::Fn::Count);
   CHECK(s.targets[0].column.empty());
   CHECK(s.targets[1].column == "qty");
+  auto sum_min = std::get<Select>(parse("SELECT sum(qty), pg_catalog.min(t.qty) FROM t WHERE name = $1"));
+  REQUIRE(sum_min.targets.size() == 2);
+  CHECK(sum_min.targets[0].fn == Expr::Fn::Sum);
+  CHECK(sum_min.targets[0].column == "qty");
+  CHECK(sum_min.targets[1].fn == Expr::Fn::Min);
+  CHECK(sum_min.targets[1].table == "t");
   REQUIRE(s.order_by.size() == 2);
   CHECK(s.order_by[0].column == "name");
   CHECK(s.order_by[0].desc);

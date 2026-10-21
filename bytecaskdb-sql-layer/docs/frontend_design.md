@@ -1,7 +1,7 @@
 # SQL front end for the MVP: dialect subset and statement IR
 
 Status: **design (#492), approved (owner, 2026-10-21): the *Decisions*;
-the rest reviewed with the coordinator.** Slices 0 to 3 are built
+the rest reviewed with the coordinator.** Slices 0 to 4 are built
 (*Slices*); the rest is design. It decides
 the SQL the MVP accepts, the intermediate form the code generator prints
 plans from, and the planner's choices, all scoped by TPROC-C (#487, *MVP*).
@@ -616,7 +616,37 @@ its transaction test.
      cannot overflow `int64_t` (BIGINT's overflow is #540).
    - `FOR UPDATE` is #538's (#491, slice B).
 4. **Delivery:** the covering prefix scan with `LIMIT 1`, `MIN`, `UPDATE`
-   of many rows, `SUM`.
+   of many rows, `SUM`. As built, with these differences from the design
+   above:
+   - D1's covering prefix scan with `ORDER BY no_o_id LIMIT 1` needed
+     nothing new: slice 1's scan prints it.
+   - An `UPDATE` or `DELETE` takes its rows as a `SELECT` without `ORDER BY`
+     takes them: a point lookup, or a scan of a key prefix or range, by the
+     same rules and refusals. A scan reads each row whole and writes it with
+     `bc_update` or `bc_delete` before stepping; the count is the rows
+     written. The IR's `Update` and `Delete` hold a `PointGet` or a `Scan`,
+     not a `Loop`, until slice 5 brings residuals.
+   - `SUM` and `MIN` take a column whose values the plan holds as an
+     `int64_t`: `SUM` a `SMALLINT`, `INTEGER`, `BIGINT` or `DECIMAL` one,
+     `MIN` those and a `DATE`, `TIMESTAMP` or `TIME` one. `MIN` of a `REAL`
+     or `DOUBLE PRECISION` column is refused, as of a string or bytes one:
+     PostgreSQL's `MIN` keeps whichever of `-0.0` and `0.0` it meets last,
+     so its answer depends on the order it reads the rows (*Later*).
+   - `SUM` adds with `bc_add`. A running total that leaves `int64_t` (a
+     `DECIMAL`'s scaled integer) is `BC_E_ARITH`, where PostgreSQL's
+     `numeric` holds it; below that, the sum is PostgreSQL's exactly, past
+     18 digits included (*Known differences*). The range check on computed
+     values is slice 5's.
+   - The IR has one `Aggregate` (`COUNT`, `SUM` or `MIN`, its argument, and
+     `from_keys`), not the design's separate shapes: `from_keys` is
+     `CountFromKeys` for `COUNT` and `MinFromFirstKey` for `MIN`. `MIN`
+     reads the first entry when its column is the `ASC` part after the
+     scan's equality prefix, the scan starting past that part's NULLs; it
+     emits the entry's key part when the scan covers. Otherwise a loop
+     keeps the least non-NULL value.
+   - An aggregate over a point lookup is the row's value, NULL as NULL;
+     over no row, `COUNT` 0 and `SUM` and `MIN` NULL. Under `LIMIT 0` the
+     plan reads nothing.
 5. **Stock-Level:** the join on an outer column, a range after a prefix,
    residual filters, a computed bound with its range check (the addition
    above), `COUNT(DISTINCT)` and the aggregate calls.
@@ -635,11 +665,11 @@ comparison for now (*Decisions*, 7).
 
 | PostgreSQL | This layer | Why |
 |---|---|---|
-| `SUM` over `DECIMAL` is unbounded `numeric`. | Past 18 digits it is 22003. | `DECIMAL` is a scaled `int64_t` (`docs/types_design.md`). No TPROC-C sum comes near. |
+| `SUM` over `BIGINT` or `DECIMAL` is unbounded `numeric`. | A running total past `int64_t`, a `DECIMAL`'s in its scaled integer, fails the statement (`BC_E_ARITH`). | `DECIMAL` is a scaled `int64_t` (`docs/types_design.md`). No TPROC-C sum comes near. |
 | Comparing columns of different types casts one to the other's. | Refused, in a `WHERE` and a join. | One key encoding per comparison. TPROC-C compares columns of one type only. |
 | A statement no index scan answers in its order runs: a full scan, a sort of the rows read, an `ORDER BY` on a join, or one whose NULLs the chosen index can't place as PostgreSQL does (*NULLs in an ordered part*). | Refused (*What the planner refuses*). | Each would add a sorter (`bc_sorter_*`) or an unbounded read to build and test before the MVP (*Decisions*, 5; #533). No TPROC-C statement needs one. |
 
-All three are refusals rather than different answers. Everything else in
+All three are refusals or errors rather than different answers. Everything else in
 the subset matches PostgreSQL, and the proof machine checks that it does.
 
 ## Proposed `CONTRACT.md` changes
@@ -698,7 +728,7 @@ Tracked in #534, except full scans and sorts, which are #533.
 - `OR`, `IN`, `IS NULL`, subqueries, derived tables, `GROUP BY`, outer
   joins, three or more tables, `OFFSET`, `RETURNING`, multi-row `VALUES`,
   string and function expressions, `*` and `/`, `MIN` of a text or bytes
-  column.
+  column, `MIN` of a `REAL` or `DOUBLE PRECISION` column.
 - Sorters and hash joins, with the bounds `bc_plan.h` gives them.
 - A cost model from `bc_count_range`.
 - `FOR UPDATE` on joins, and the serializable guards

@@ -117,7 +117,59 @@ TEST_CASE("codegen: the other bound forms produce plans; no rule, no plan", "[sq
 
   CHECK_THROWS_AS(generate(f.cat(), "SELECT id FROM t WHERE qty = $1"), ast::SqlError);
   CHECK_THROWS_AS(generate(f.cat(), "SELECT id FROM t WHERE id = $1 AND qty = $2"), ast::SqlError);
-  CHECK_THROWS_AS(generate(f.cat(), "DELETE FROM t WHERE name = $1"), ast::SqlError);
+  CHECK_THROWS_AS(generate(f.cat(), "DELETE FROM t WHERE qty = $1"), ast::SqlError);
+}
+
+TEST_CASE("codegen: UPDATE and DELETE write each row their key reaches, and count them", "[sql][codegen]") {
+  sql_test::Fixture f;
+  // By the index: each row read whole, written, counted; a NULL key writes none.
+  auto up = generate(f.cat(), "UPDATE t SET qty = $2 WHERE name = $1");
+  CHECK(up.objects_read == std::vector<std::uint32_t>{1, 3});
+  CHECK(up.tables_written == std::vector<std::uint32_t>{1});
+  CHECK(up.source.find("bc_emit_count(cx, 0);\n    return;") != std::string::npos);
+  CHECK(up.source.find("while (bc_scan_next(cx, c)) {\n    bc_view old = bc_scan_row(cx, c);") != std::string::npos);
+  CHECK(up.source.find("bc_update(cx, TBL_1, old, bc_row_end(cx, r));\n    ++n;\n  }\n  bc_emit_count(cx, n);") !=
+        std::string::npos);
+  auto del = generate(f.cat(), "DELETE FROM t WHERE id >= $1 AND id < $2");
+  CHECK(del.source.find("bc_scan_open(cx, TBL_1, lo, hi, BC_SCAN_FORWARD)") != std::string::npos);
+  CHECK(del.source.find("bc_delete(cx, TBL_1, old);\n    ++n;") != std::string::npos);
+  // One row by the whole primary key, as before.
+  CHECK(generate(f.cat(), "DELETE FROM t WHERE id = $1").source.find("bc_get(") != std::string::npos);
+  auto refusal = [&](std::string_view sql) -> std::string {
+    try {
+      (void)generate(f.cat(), sql);
+    } catch (const ast::SqlError& e) {
+      return e.what();
+    }
+    return "accepted";
+  };
+  CHECK(refusal("UPDATE t SET qty = $1 WHERE qty = $2") == "no plan: a full scan of t");
+  CHECK(refusal("DELETE FROM t WHERE name = $1 AND qty = $2") ==
+        "no plan: a filter on column \"qty\" that the key does not express is not supported yet");
+}
+
+TEST_CASE("codegen: MIN from the first entry past the NULLs, or a loop; SUM by a loop", "[sql][codegen]") {
+  sql_test::Fixture f;
+  f.ddl(CreateTableDdl{"m",
+                       {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("g", PhysType::I64, false),
+                        sql_test::Fixture::col("x", PhysType::I64, true)},
+                       {"k"}});
+  f.ddl(CreateIndexDdl{"m_gx", "m", {{"g"}, {"x"}}});
+  // x is the ASC part after the prefix: the scan starts past its NULLs, and
+  // its first entry is the least value.
+  auto first = generate(f.cat(), "SELECT min(x) FROM m WHERE g = $1").source;
+  CHECK(first.find("bc_key_null(cx, k0);\n  bc_view lo = bc_key_successor(cx, bc_key_end(cx, k0));") !=
+        std::string::npos);
+  CHECK(first.find("if (bc_scan_next(cx, c)) {") != std::string::npos);
+  CHECK(first.find("bc_emit_key_part(cx, IDX_6, bc_scan_key(cx, c), PART_6_2);") != std::string::npos);
+  CHECK(first.find("while") == std::string::npos);
+  // k is not after the prefix: every entry is read.
+  auto loop = generate(f.cat(), "SELECT min(k) FROM m WHERE g = $1").source;
+  CHECK(loop.find("if (!seen || v < m) m = v;") != std::string::npos);
+  auto sum = generate(f.cat(), "SELECT sum(x) FROM m WHERE g = $1");
+  CHECK(sum.result_names == std::vector<std::string>{"sum"});
+  CHECK(sum.source.find("sum = bc_add(cx, sum, bc_key_part_i64(cx, IDX_6, key, PART_6_2));") != std::string::npos);
+  CHECK(generate(f.cat(), "SELECT min(x) FROM m WHERE g = $1").result_names == std::vector<std::string>{"min"});
 }
 
 TEST_CASE("codegen: a DOUBLE result column is read from the row, never the index key", "[sql][codegen]") {

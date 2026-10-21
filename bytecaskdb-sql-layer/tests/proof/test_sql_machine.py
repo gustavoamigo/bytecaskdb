@@ -26,9 +26,10 @@ only then.
 Slice 1 of the front end (#492): NUMERIC columns, CREATE INDEX, SELECT by
 an equality prefix and a range of any key, with ORDER BY and LIMIT, COUNT,
 and SET col = col ± $n. Slice 3: SET col = col ± an integer literal, and a
-join of two tables, each by its whole primary key. A model of the planner's rules (`served`) keeps the
-machine to statements the layer plans; the rest must be refused with "no
-plan".
+join of two tables, each by its whole primary key. Slice 4: SUM and MIN by
+a key, and UPDATE and DELETE of every row a key's prefix or range reaches.
+A model of the planner's rules (`served`) keeps the machine to statements
+the layer plans; the rest must be refused with "no plan".
 
 The fixed cases at the end call the same steps in a set order.
 """
@@ -55,6 +56,11 @@ TYPES = [o.BIGINT, o.INTEGER, o.SMALLINT, o.DOUBLE, o.REAL, o.numeric(6, 2), o.B
 # Types a column + parameter is supported on, and how PostgreSQL types that
 # parameter: as the column's type (numeric without the modifier).
 ARITHMETIC = {"smallint": "smallint", "integer": "integer", "numeric(6,2)": "numeric"}
+# The columns SUM and MIN are generated over: the types the layer takes, but
+# BIGINT for SUM, whose sum leaves int64 (docs/testing_design.md, *Known
+# differences*).
+SUMMED = ("smallint", "integer", "numeric(6,2)")
+MINIMISED = SUMMED + ("bigint",)
 TABLE_NAMES = ["t0", "t1", "t2", "t3"]
 BIGINT_LOW, BIGINT_HIGH = o.BIGINT.low, o.BIGINT.high
 
@@ -368,16 +374,30 @@ class SqlMachine(RuleBasedStateMachine):
             self.tables[name].indexes.append(ix)
         return out
 
+    def no_plan(self, name: str, sql: str, params: list, types: list) -> None:
+        """The layer must refuse the statement with no plan; PostgreSQL is not
+        asked."""
+        out = o.run_layer(self.db if self.txn is None else self.txn, sql, [o.to_layer(v, ty) for v, ty in zip(params, types)])
+        if out.error == o.ABORTED:
+            return  # the transaction was aborted before: nothing was planned
+        assert out.error == "refused" and out.detail.startswith("no plan:"), f"{sql}: planned, expected no plan ({out})"
+        if self.txn is not None and not self.pg_aborted():
+            # A refused statement aborts the transaction on both sides, as
+            # any statement PostgreSQL refuses does.
+            assert self.txn.is_aborted
+            assert o.run_pg(self.pg.conn, "SELECT no_such_column FROM " + name).error == "refused"
+
     def select(self, name: str, targets: list[str], where: list[tuple[str, str, object]],
-               order: list[tuple[str, bool]] = (), limit: int | None = None, count: str | None = None) -> None:
-        """SELECT targets (or COUNT(count), "*" for COUNT(*)) WHERE each
-        (column, operator, value) ... ORDER BY ... LIMIT ...: on both sides
-        when the planner serves it, else the layer must refuse it with no
-        plan."""
+               order: list[tuple[str, bool]] = (), limit: int | None = None, count: str | None = None,
+               fn: str = "count") -> None:
+        """SELECT targets (or the aggregate fn(count), "*" for COUNT(*))
+        WHERE each (column, operator, value) ... ORDER BY ... LIMIT ...: on
+        both sides when the planner serves it, else the layer must refuse it
+        with no plan."""
         t = self.tables[name]
         cols = [c for c, _, _ in where]
         used = targets + ([count] if count not in (None, "*") else [])
-        select = f"count({count})" if count else ", ".join(targets)
+        select = f"{fn}({count})" if count else ", ".join(targets)
         conds = [f"{c} {op} ${i + 1}" for i, (c, op, _) in enumerate(where)]
         pg_conds = [f"{c} {op} {typed(t, c, i + 1)}" for i, (c, op, _) in enumerate(where)]
         tail = (" ORDER BY " + ", ".join(c + (" DESC" if d else "") for c, d in order) if order else "") + (
@@ -386,15 +406,7 @@ class SqlMachine(RuleBasedStateMachine):
         params = [v for _, _, v in where]
         types = [t.column(c).type for c in cols]
         if not served(t, [(c, op) for c, op, _ in where], list(order), used):
-            out = o.run_layer(self.db if self.txn is None else self.txn, sql, [o.to_layer(v, ty) for v, ty in zip(params, types)])
-            if out.error == o.ABORTED:
-                return  # the transaction was aborted before: nothing was planned
-            assert out.error == "refused" and out.detail.startswith("no plan:"), f"{sql}: planned, expected no plan ({out})"
-            if self.txn is not None and not self.pg_aborted():
-                # A refused statement aborts the transaction on both sides, as
-                # any statement PostgreSQL refuses does.
-                assert self.txn.is_aborted
-                assert o.run_pg(self.pg.conn, "SELECT no_such_column FROM " + name).error == "refused"
+            self.no_plan(name, sql, params, types)
             return
         pg_sql = f"SELECT {select} FROM {name} WHERE {' AND '.join(pg_conds)}{tail}"
         if count:
@@ -408,6 +420,37 @@ class SqlMachine(RuleBasedStateMachine):
         key = (lambda r: tuple(r[targets.index(c)] for c, _ in order)) if order else None
         why = o.same_rows(layer.rows, full.rows, key, limit)
         assert why is None, f"{sql} {params!r}: {why}: the layer returned {layer.rows}, PostgreSQL {full.rows}"
+
+    def write(self, name: str, where: list[tuple[str, str, object]], set_to: tuple[str, str, object] | None = None
+              ) -> o.Outcome | None:
+        """UPDATE name SET col = $n (op "=") or col = col op $n WHERE each
+        (column, operator, value), with set_to = (col, op, value); DELETE
+        FROM name WHERE … without. Every row the WHERE matches, on both
+        sides when the planner serves it, else the layer must refuse it with
+        no plan."""
+        t = self.tables[name]
+        conds = [f"{c} {op} ${i + 1}" for i, (c, op, _) in enumerate(where)]
+        pg_conds = [f"{c} {op} {typed(t, c, i + 1)}" for i, (c, op, _) in enumerate(where)]
+        params = [v for _, _, v in where]
+        types = [t.column(c).type for c, _, _ in where]
+        if set_to is None:
+            head = pg_head = f"DELETE FROM {name}"
+        else:
+            col, op, value = set_to
+            n = len(where) + 1
+            if op == "=":
+                # Assigned, as INSERT assigns: PostgreSQL casts $n to the column.
+                head = pg_head = f"UPDATE {name} SET {col} = ${n}"
+            else:
+                head = f"UPDATE {name} SET {col} = {col} {op} ${n}"
+                pg_head = f"UPDATE {name} SET {col} = {col} {op} ${n}::{ARITHMETIC[t.column(col).type.sql]}"
+            params.append(value)
+            types.append(t.column(col).type)
+        sql = f"{head} WHERE {' AND '.join(conds)}"
+        if not served(t, [(c, op) for c, op, _ in where], [], []):
+            self.no_plan(name, sql, params, types)
+            return None
+        return self.both(sql, params, pg_sql=f"{pg_head} WHERE {' AND '.join(pg_conds)}", types=types)
 
     def add(self, name: str, col: str, op: str, operand, key: tuple, literal: bool = False) -> o.Outcome:
         """UPDATE … SET col = col op $1 WHERE the primary key; with `literal`,
@@ -649,6 +692,50 @@ class SqlMachine(RuleBasedStateMachine):
         arg = data.draw(st.sampled_from(["*"] + [c.name for c in t.columns]), label="count of")
         limit = data.draw(st.none() | st.sampled_from([0, 1]), label="limit")
         self.select(t.name, [], where, limit=limit, count=arg)
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def sum_or_min_by_key(self, data):
+        t = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
+        fn = data.draw(st.sampled_from(["sum", "min"]), label="fn")
+        cols = [c.name for c in t.columns if c.type.sql in (SUMMED if fn == "sum" else MINIMISED)]
+        if not cols:
+            return
+        where, _, _ = self.where_on_a_path(data, t)
+        if not where:
+            return
+        arg = data.draw(st.sampled_from(cols), label=f"{fn} of")
+        limit = data.draw(st.none() | st.sampled_from([0, 1]), label="limit")
+        self.select(t.name, [], where, limit=limit, count=arg, fn=fn)
+
+    @precondition(lambda self: any(c.name not in t.pk for t in self.tables.values() for c in t.columns))
+    @rule(data=st.data())
+    def update_by_key(self, data):
+        t = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
+        cols = [c for c in t.columns if c.name not in t.pk]
+        if not cols:
+            return
+        where, _, _ = self.where_on_a_path(data, t)
+        if not where:
+            return
+        col = data.draw(st.sampled_from(cols), label="set")
+        # col ± $n on a column no unique index holds: one that moves a unique
+        # value from row to row is a known difference.
+        unique = any(ix.unique and col.name in [c for c, _ in ix.columns] for ix in t.indexes)
+        op = "="
+        if col.type.sql in ARITHMETIC and not unique:
+            op = data.draw(st.sampled_from(["=", "+", "-"]), label="op")
+        small = st.integers(-5, 5).map(lambda n: decimal.Decimal(n) if col.type.kind == "decimal" else n)
+        value = data.draw(st.none() | (small if op != "=" else st.nothing()) | values(col.type), label="value")
+        self.write(t.name, where, (col.name, op, value))
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def delete_by_key(self, data):
+        t = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
+        where, _, _ = self.where_on_a_path(data, t)
+        if where:
+            self.write(t.name, where)
 
     @precondition(lambda self: any(c.type.sql in ARITHMETIC and c.name not in t.pk
                                    for t in self.tables.values() for c in t.columns))
@@ -1293,4 +1380,90 @@ def test_a_range_refusal_on_a_join_names_its_columns_table(tmp_path):
             raise AssertionError("a SMALLINT key of 40000 was accepted")
     finally:
         db.close()
+
+
+
+def test_sum_and_min_over_rows_nulls_and_none(dsn):
+    """SUM and MIN by a primary-key prefix and by an index: the value over
+    the non-NULL ones, NULL over none or all NULL, and none under LIMIT 0.
+    SUM of SMALLINT and INTEGER is a bigint, of NUMERIC a numeric at its
+    scale; MIN is of the column's type."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER, nullable=False),
+                              Column("c2", o.SMALLINT), Column("c3", o.numeric(6, 2)), Column("c4", o.BIGINT)],
+                       ["c0", "c1"]))
+        m.create_index("t0", Index("t0_ix0", [("c0", False), ("c4", False)]))
+        rows = [(0, 1, 7, "1.25", 9), (0, 2, None, "-3.50", None), (0, 3, -2, None, -4), (1, 4, None, None, None),
+                (1, 5, 32767, "9999.99", 2**62)]
+        for c0, c1, c2, c3, c4 in rows:
+            m.insert("t0", {"c0": c0, "c1": c1, "c2": c2, "c3": None if c3 is None else decimal.Decimal(c3), "c4": c4},
+                     all_columns=True)
+        m.insert("t0", {"c0": 1, "c1": 6, "c2": 32767, "c3": decimal.Decimal("9999.99"), "c4": 2**62},
+                 all_columns=True)
+        for fn, arg in (("sum", "c2"), ("sum", "c3"), ("min", "c2"), ("min", "c3"), ("min", "c4"), ("min", "c1")):
+            for key in (0, 1, 2, None):
+                m.select("t0", [], [("c0", "=", key)], count=arg, fn=fn)
+            m.select("t0", [], [("c0", "=", 0), ("c1", ">", 1)], count=arg, fn=fn)
+            m.select("t0", [], [("c0", "=", 0), ("c1", "=", 3)], count=arg, fn=fn)
+            m.select("t0", [], [("c0", "=", 0)], count=arg, fn=fn, limit=0)
+        # MIN of c4 from t0_ix0's first entry past its NULLs; of c1, a loop.
+        for key in (0, 1, 2):
+            m.select("t0", [], [("c0", "=", key), ("c4", "<", 10)], count="c4", fn="min")
+    finally:
+        m.teardown()
+
+
+def test_sum_past_int64_is_an_error(tmp_path):
+    """A SUM whose running total leaves int64 fails the statement, where
+    PostgreSQL's numeric would hold it (docs/testing_design.md, *Known
+    differences*)."""
+    db = bytecask_sql.open(str(tmp_path))
+    try:
+        db.execute("CREATE TABLE t (k BIGINT, n BIGINT NOT NULL, v BIGINT, PRIMARY KEY (k, n))")
+        for n, v in enumerate((2**62, 2**62 - 1, 2**62)):
+            db.execute("INSERT INTO t VALUES ($1, $2, $3)", (1, n, v))
+        assert db.execute("SELECT sum(v) FROM t WHERE k = $1 AND n < $2", (1, 2))["rows"] == [(decimal.Decimal(2**63 - 1),)]
+        try:
+            db.execute("SELECT sum(v) FROM t WHERE k = $1", (1,))
+        except bytecask_sql.ExecError as e:
+            assert e.constraint is None and "out of range" in str(e), e
+        else:
+            raise AssertionError("a sum past int64 was returned")
+    finally:
+        db.close()
+
+
+def test_update_and_delete_every_row_a_key_reaches(dsn):
+    """UPDATE and DELETE by a primary-key prefix, an index and a range: each
+    row matched is written once, the count is the rows matched, and a NULL
+    key matches none. In a transaction a later statement sees the earlier
+    one's writes."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER, nullable=False),
+                              Column("c2", o.SMALLINT), Column("c3", o.TEXT)], ["c0", "c1"]))
+        m.create_index("t0", Index("t0_ix0", [("c2", True)]))
+        for c1 in range(6):
+            m.insert("t0", {"c0": c1 % 2, "c1": c1, "c2": c1 * 10 if c1 != 3 else None, "c3": f"r{c1}"},
+                     all_columns=True)
+        assert m.write("t0", [("c0", "=", 0)], ("c3", "=", "even")).affected == 3
+        assert m.write("t0", [("c0", "=", None)], ("c3", "=", "none")).affected == 0
+        # A SET parameter outside its column's type is refused before any row
+        # is read, as PostgreSQL coerces it at bind.
+        assert m.write("t0", [("c0", "=", None)], ("c2", "=", 40000)).error == "22003"
+        assert m.write("t0", [("c2", ">=", 20)], ("c2", "+", 5)).affected == 3
+        assert m.write("t0", [("c2", "<", 30)], ("c2", "-", 1)).affected == 3
+        assert m.write("t0", [("c2", ">", 0)], ("c2", "+", 32767)).error == "22003"  # nothing written
+        m.check()
+        m.begin()
+        assert m.write("t0", [("c0", "=", 1), ("c1", ">", 1)], ("c3", "=", "odd")).affected == 2
+        m.select("t0", ["c1", "c3"], [("c0", "=", 1)])
+        assert m.write("t0", [("c0", "=", 1), ("c1", "<=", 3)]).affected == 2
+        m.select("t0", ["c1", "c3"], [("c0", "=", 1)])
+        m.commit()
+        assert m.write("t0", [("c2", "<", 100)]).affected == 4
+        m.check()
+    finally:
+        m.teardown()
 

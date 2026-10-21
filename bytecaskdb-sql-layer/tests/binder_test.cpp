@@ -288,10 +288,10 @@ TEST_CASE("binder: COUNT, ORDER BY and column + parameter", "[sql][binder]") {
   {
     auto s = std::get<bound::Select>(bind_sql(cat, "SELECT count(qty) FROM t WHERE name = $1").stmt);
     CHECK(s.targets.empty());
-    REQUIRE(s.count);
-    CHECK(s.count->col_id == 2u);
+    REQUIRE(s.aggregate);
+    CHECK(s.aggregate->col_id == 2u);
     auto star = std::get<bound::Select>(bind_sql(cat, "SELECT count(*) FROM t WHERE name = $1").stmt);
-    CHECK_FALSE(star.count->col_id);
+    CHECK_FALSE(star.aggregate->col_id);
   }
   {
     auto s = std::get<bound::Select>(bind_sql(cat, "SELECT id FROM t WHERE name = $1 ORDER BY qty DESC LIMIT 2").stmt);
@@ -305,6 +305,10 @@ TEST_CASE("binder: COUNT, ORDER BY and column + parameter", "[sql][binder]") {
     auto b = bind_sql(cat, "UPDATE t SET qty = qty + $2 WHERE id = $1");
     CHECK(std::get<bound::Update>(b.stmt).set[0].second.kind == bound::Expr::Kind::Add);
     CHECK(b.param_sql[1].has_value());
+    // An UPDATE's assigned $n is checked against the column's whole type,
+    // an INSERT's by the row builder.
+    CHECK(bind_sql(cat, "UPDATE t SET qty = $2 WHERE name = $1").param_sql[1].has_value());
+    CHECK_FALSE(bind_sql(cat, "INSERT INTO t (id, qty) VALUES ($1, $2)").param_sql[1].has_value());
   }
   //                       0         1         2         3         4
   //                       01234567890123456789012345678901234567890123456789
@@ -317,6 +321,16 @@ TEST_CASE("binder: COUNT, ORDER BY and column + parameter", "[sql][binder]") {
         std::pair<std::string, std::int32_t>{"only one aggregate per SELECT is supported", 17});
   CHECK(rejected(cat, "SELECT id FROM t WHERE id = $1 ORDER BY nope").first == "column \"nope\" does not exist");
   CHECK(rejected(cat, "UPDATE t SET qty = count(*) WHERE id = $1").first == "aggregate functions are not allowed here");
+  // SUM and MIN take a column held as an int64_t; SUM an exact number.
+  CHECK(std::get<bound::Select>(bind_sql(cat, "SELECT sum(qty) FROM t WHERE name = $1").stmt).aggregate->fn ==
+        ast::Expr::Fn::Sum);
+  CHECK(rejected(cat, "SELECT sum(name) FROM t WHERE id = $1") ==
+        std::pair<std::string, std::int32_t>{"SUM of a bytea column is not supported", 7});
+  CHECK(rejected(cat, "SELECT min(name) FROM t WHERE id = $1").first == "MIN of a bytea column is not supported");
+  CHECK(rejected(cat, "SELECT min(qty), id FROM t WHERE id = $1").first ==
+        "column \"t.id\" must appear in the GROUP BY clause or be used in an aggregate function");
+  CHECK(rejected(cat, "SELECT sum(qty) FROM t WHERE id = $1 FOR UPDATE").first ==
+        "FOR UPDATE is not allowed with aggregate functions");
   // One SQL type per parameter, whichever use comes first.
   sql_test::Fixture g;
   g.ddl(std::get<Ddl>(bind_sql(g.cat(), "CREATE TABLE s (k BIGINT PRIMARY KEY, b BIGINT, a SMALLINT)").stmt));
