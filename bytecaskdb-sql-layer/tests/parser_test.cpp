@@ -98,6 +98,34 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   CHECK_THROWS_AS(parse("CREATE INDEX CONCURRENTLY u ON t (name)"), SqlError);
   CHECK_THROWS_AS(parse("CREATE UNIQUE INDEX u ON t (name) NULLS NOT DISTINCT"), SqlError);
   CHECK_THROWS_AS(parse("CREATE TABLE u (k BIGINT DEFAULT now())"), SqlError);
+  //                    0         1         2         3         4
+  //                    01234567890123456789012345678901234567890123456789
+  CHECK(rejected_at("SELECT id FROM t WHERE id = $1 LIMIT -1") == 37);
+  CHECK(rejected_at("SELECT id FROM t WHERE id = $1 LIMIT 1.5") == 37);
+  CHECK(rejected_at("SELECT sum(qty) FROM t WHERE id = $1") == 7);
+  CHECK(rejected_at("SELECT count(DISTINCT qty) FROM t WHERE id = $1") == 7);
+  CHECK(rejected_at("SELECT id FROM t WHERE id = $1 ORDER BY id NULLS FIRST") == 40);
+  CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 LIMIT $2"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 OFFSET 1"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 ORDER BY qty + $2"), SqlError);
+}
+
+TEST_CASE("parser: COUNT, ORDER BY, LIMIT and column + parameter", "[sql][parser]") {
+  auto s = std::get<Select>(parse("SELECT count(*), count(qty) FROM t WHERE name = $1 ORDER BY name DESC, id LIMIT 3"));
+  REQUIRE(s.targets.size() == 2);
+  CHECK(s.targets[0].kind == Expr::Kind::Count);
+  CHECK(s.targets[0].column.empty());
+  CHECK(s.targets[1].column == "qty");
+  REQUIRE(s.order_by.size() == 2);
+  CHECK(s.order_by[0].column == "name");
+  CHECK(s.order_by[0].desc);
+  CHECK_FALSE(s.order_by[1].desc);
+  CHECK(s.limit == 3);
+  CHECK_FALSE(std::get<Select>(parse("SELECT id FROM t WHERE id = $1 LIMIT ALL")).limit);
+  CHECK_FALSE(std::get<Select>(parse("SELECT id FROM t WHERE id = $1 LIMIT NULL")).limit);
+  CHECK(std::get<Select>(parse("SELECT id FROM t WHERE id = $1 LIMIT 10000000000")).limit == 10000000000);
+  auto u = std::get<Update>(parse("UPDATE t SET qty = qty + $2 WHERE id = $1"));
+  CHECK(u.set[0].value.kind == Expr::Kind::Add);
 }
 
 TEST_CASE("parser: the stage-1 DDL forms", "[sql][parser][catalog]") {

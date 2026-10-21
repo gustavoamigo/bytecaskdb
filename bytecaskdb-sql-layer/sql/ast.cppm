@@ -34,12 +34,14 @@ private:
   std::int32_t pos_;
 };
 
+// A select-list or SET operand: a column, a parameter, a sum or difference
+// of two, or COUNT(*) / COUNT(column).
 struct Expr {
-  enum class Kind { Column, Param, Sub };
+  enum class Kind { Column, Param, Add, Sub, Count };
   Kind kind;
-  std::string column;       // Column
+  std::string column;       // Column; Count's argument, "" for COUNT(*)
   std::uint32_t param{0};   // Param: zero-based ($1 is 0)
-  std::unique_ptr<Expr> lhs, rhs;  // Sub
+  std::unique_ptr<Expr> lhs, rhs;  // Add, Sub
   std::int32_t pos{-1};
 };
 
@@ -117,10 +119,18 @@ struct Insert {
   std::int32_t pos{-1};
 };
 
+struct OrderItem {
+  std::string column;
+  bool desc{false};
+  std::int32_t pos{-1};
+};
+
 struct Select {
   std::vector<Expr> targets;
   std::string table;
   std::vector<Compare> where;
+  std::vector<OrderItem> order_by;
+  std::optional<std::int64_t> limit;  // nullopt: none, LIMIT ALL or LIMIT NULL
   std::int32_t pos{-1};
 };
 

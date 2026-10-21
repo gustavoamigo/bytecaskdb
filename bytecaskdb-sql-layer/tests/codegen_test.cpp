@@ -146,3 +146,33 @@ TEST_CASE("codegen: a composite key from parameters out of order takes the build
         std::string::npos);
   CHECK(swapped.find("bc_get(cx, bc_key_end(cx, k0), &found);") != std::string::npos);
 }
+
+TEST_CASE("codegen: what the planner refuses, with its message", "[sql][codegen]") {
+  sql_test::Fixture f;
+  // o: an index whose second part is a nullable DESC part.
+  f.ddl(CreateTableDdl{"o",
+                       {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("a", PhysType::I64, false),
+                        sql_test::Fixture::col("b", PhysType::I64, true), sql_test::Fixture::col("c", PhysType::I64, true)},
+                       {"k"}});
+  f.ddl(CreateIndexDdl{"o_ab", "o", {{"a"}, {"b", true}, {"c"}}});
+  auto refusal = [&](std::string_view sql) -> std::string {
+    try {
+      (void)generate(f.cat(), sql);
+    } catch (const ast::SqlError& e) {
+      return e.what();
+    }
+    return "accepted";
+  };
+  CHECK(refusal("SELECT id FROM t WHERE qty = $1") == "no plan: a full scan of t");
+  CHECK(refusal("SELECT id FROM t WHERE name = $1 ORDER BY qty") == "no plan: no index of t gives ORDER BY qty");
+  CHECK(refusal("SELECT k FROM o WHERE a = $1 ORDER BY b DESC") == "no plan: ORDER BY b would need its NULLs reordered");
+  // c is nullable, and its NULLs would fall within each value of b.
+  CHECK(refusal("SELECT k FROM o WHERE a = $1 AND b = $2 ORDER BY c, k") == "accepted");
+  CHECK(refusal("SELECT k FROM o WHERE a = $1 ORDER BY b DESC, c") ==
+        "no plan: ORDER BY b would need its NULLs reordered");
+  CHECK(refusal("SELECT id FROM t WHERE id = $1 AND qty = $2") ==
+        "no plan: a filter on column \"qty\" that the key does not express is not supported yet");
+  CHECK(refusal("SELECT id FROM t WHERE name > $1 AND name > $2") ==
+        "no plan: a filter on column \"name\" that the key does not express is not supported yet");
+}
+

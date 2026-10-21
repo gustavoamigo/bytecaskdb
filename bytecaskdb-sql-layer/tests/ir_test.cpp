@@ -22,6 +22,12 @@ auto plan(ir::Statement s, std::size_t params = 2) -> ir::Plan {
   return ir::Plan{1, {{"TBL_1", 1, "t"}}, 1, std::vector<PhysType>(params, PhysType::I64), std::move(s)};
 }
 
+// A forward scan of index 3.
+auto scan(std::vector<std::uint32_t> prefix, std::variant<std::monostate, ir::Range> rest,
+          std::vector<std::uint32_t> null_checks, bool covering = false) -> ir::Scan {
+  return {3, std::move(prefix), rest, false, std::move(null_checks), covering};
+}
+
 const ir::Column kId{0, PhysType::I64, false};
 const ir::Column kD{1, PhysType::F64, true};
 
@@ -50,27 +56,19 @@ TEST_CASE("ir: check refuses what the printer can't print", "[sql][ir]") {
   refused(plan(ir::Select{ir::PointGet{{2}}, {kId}}), "past the statement's");
   CHECK_NOTHROW(ir::check(plan(ir::Select{ir::PointGet{{0}}, {}})));
 
-  ir::Scan neither{3, {}, {}, {}, false};
-  refused(plan(ir::Select{neither, {kId}}), "an equality prefix or a range");
-  ir::Scan both{3, {0}, ir::Range{}, {0}, false};
-  refused(plan(ir::Select{both, {kId}}), "an equality prefix or a range");
-  ir::Scan two_parts{3, {0, 1}, {}, {0, 1}, false};
-  refused(plan(ir::Select{two_parts, {kId}}), "more than one part");
-  ir::Scan eq_unchecked{3, {0}, {}, {}, false};
-  refused(plan(ir::Select{eq_unchecked, {kId}}), "does not check for NULL");
+  refused(plan(ir::Select{scan({}, {}, {}), {kId}}), "an equality prefix or a range");
+  refused(plan(ir::Select{scan({0}, {}, {}), {kId}}), "does not check for NULL");
 
   const ir::KeyBound p0{ir::KeyBound::Kind::Param, 0, false};
+  const ir::KeyBound p1{ir::KeyBound::Kind::Param, 1, false};
   const ir::KeyBound p2{ir::KeyBound::Kind::Param, 2, false};
-  ir::Scan range{3, {}, ir::Range{p0, {}}, {0}, false};
-  CHECK_NOTHROW(ir::check(plan(ir::Select{range, {kId}})));
-  ir::Scan range_past{3, {}, ir::Range{{}, p2}, {}, false};
-  refused(plan(ir::Select{range_past, {kId}}), "past the statement's");
-  ir::Scan range_unchecked{3, {}, ir::Range{p0, {}}, {}, false};
-  refused(plan(ir::Select{range_unchecked, {kId}}), "does not check for NULL");
-  ir::Scan null_check_past{3, {}, ir::Range{p0, {}}, {0, 2}, false};
-  refused(plan(ir::Select{null_check_past, {kId}}), "past the statement's");
+  CHECK_NOTHROW(ir::check(plan(ir::Select{scan({}, ir::Range{p0, {}}, {0}), {kId}})));
+  CHECK_NOTHROW(ir::check(plan(ir::Select{scan({0}, ir::Range{p1, {}}, {0, 1}), {kId}})));
+  refused(plan(ir::Select{scan({}, ir::Range{{}, p2}, {}), {kId}}), "past the statement's");
+  refused(plan(ir::Select{scan({}, ir::Range{p0, {}}, {}), {kId}}), "does not check for NULL");
+  refused(plan(ir::Select{scan({}, ir::Range{p0, {}}, {0, 2}), {kId}}), "past the statement's");
 
-  ir::Scan covering{3, {0}, {}, {0}, true};
+  auto covering = scan({0}, {}, {0}, true);
   CHECK_NOTHROW(ir::check(plan(ir::Select{covering, {kId}})));
   refused(plan(ir::Select{covering, {kD}}), "DOUBLE target");
 

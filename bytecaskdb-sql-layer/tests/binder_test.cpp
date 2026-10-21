@@ -134,7 +134,8 @@ TEST_CASE("binder: anything outside the scope is rejected with a message and pos
   }
   CHECK(rejected(cat, "SELECT id FROM t WHERE id = $2").first ==
         "could not determine data type of parameter $1");
-  CHECK(rejected(cat, "UPDATE t SET name = name - $1 WHERE id = $2").first == "operator - is only defined on bigint");
+  CHECK(rejected(cat, "UPDATE t SET name = name - $1 WHERE id = $2").first ==
+        "operator - is only supported on an integer or DECIMAL column of the assigned column's type");
   CHECK(rejected(cat, "UPDATE t SET id = $1 WHERE id = $2").second == 13);
   CHECK(rejected(cat, "INSERT INTO t VALUES ($1, $2, $3, $4)").first == "INSERT has more expressions than target columns");
   CHECK(rejected(cat, "INSERT INTO t (id, qty) VALUES ($1)").first == "INSERT has 1 values for 2 columns");
@@ -279,4 +280,41 @@ TEST_CASE("binder: DDL types, defaults and the drop and alter forms", "[sql][bin
         "multiple primary keys for table \"u\" are not allowed");
   CHECK(rejected(cat, "CREATE TABLE u (a BIGINT PRIMARY KEY PRIMARY KEY)").first ==
         "multiple primary keys for table \"u\" are not allowed");
+}
+
+TEST_CASE("binder: COUNT, ORDER BY and column + parameter", "[sql][binder]") {
+  sql_test::Fixture f;
+  const auto& cat = f.cat();
+  {
+    auto s = std::get<bound::Select>(bind_sql(cat, "SELECT count(qty) FROM t WHERE name = $1").stmt);
+    CHECK(s.targets.empty());
+    REQUIRE(s.count);
+    CHECK(s.count->col_id == 2u);
+    auto star = std::get<bound::Select>(bind_sql(cat, "SELECT count(*) FROM t WHERE name = $1").stmt);
+    CHECK_FALSE(star.count->col_id);
+  }
+  {
+    auto s = std::get<bound::Select>(bind_sql(cat, "SELECT id FROM t WHERE name = $1 ORDER BY qty DESC LIMIT 2").stmt);
+    REQUIRE(s.order_by.size() == 1);
+    CHECK(s.order_by[0].col_id == 2u);
+    CHECK(s.order_by[0].desc);
+    CHECK(s.limit == 2);
+  }
+  {
+    // The operand is typed and range-checked as the column it is added to.
+    auto b = bind_sql(cat, "UPDATE t SET qty = qty + $2 WHERE id = $1");
+    CHECK(std::get<bound::Update>(b.stmt).set[0].second.kind == bound::Expr::Kind::Add);
+    CHECK(b.param_sql[1].has_value());
+  }
+  //                       0         1         2         3         4
+  //                       01234567890123456789012345678901234567890123456789
+  CHECK(rejected(cat, "SELECT count(*), id FROM t WHERE id = $1") ==
+        std::pair<std::string, std::int32_t>{
+            "column \"t.id\" must appear in the GROUP BY clause or be used in an aggregate function", 17});
+  CHECK(rejected(cat, "SELECT count(*) FROM t WHERE id = $1 ORDER BY id").first ==
+        "column \"t.id\" must appear in the GROUP BY clause or be used in an aggregate function");
+  CHECK(rejected(cat, "SELECT count(*), count(id) FROM t WHERE id = $1") ==
+        std::pair<std::string, std::int32_t>{"only one aggregate per SELECT is supported", 17});
+  CHECK(rejected(cat, "SELECT id FROM t WHERE id = $1 ORDER BY nope").first == "column \"nope\" does not exist");
+  CHECK(rejected(cat, "UPDATE t SET qty = count(*) WHERE id = $1").first == "aggregate functions are not allowed here");
 }

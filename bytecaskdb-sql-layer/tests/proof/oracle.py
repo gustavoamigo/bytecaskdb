@@ -11,7 +11,9 @@ never as printed text, and by type: True is not 1, and -0.0 is not 0.0.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
+import decimal
 import re
 import struct
 
@@ -61,10 +63,11 @@ class Type:
     """A column type, as both sides spell it."""
 
     sql: str  # the layer's spelling: "bigint", "varchar(4)", ...
-    kind: str  # "int", "float", "bool", "text", "bytes"
+    kind: str  # "int", "float", "real", "decimal", "bool", "text", "bytes"
     length: int = 0  # VARCHAR(n)
     low: int = 0  # integers: the declared range
     high: int = 0
+    scale: int = 0  # NUMERIC(p, s): s; its range is in low and high, scaled
 
     @property
     def pg(self) -> str:
@@ -84,6 +87,21 @@ BYTEA = Type("bytea", "bytes")
 
 def varchar(n: int) -> Type:
     return Type(f"varchar({n})", "text", length=n)
+
+
+def numeric(p: int, s: int) -> Type:
+    """NUMERIC(p, s): decimal.Decimal on both sides; the layer takes a
+    parameter as its integer scaled by 10^s (to_layer)."""
+    return Type(f"numeric({p},{s})", "decimal", low=-(10**p - 1), high=10**p - 1, scale=s)
+
+
+def to_layer(v, t: Type | None):
+    """A parameter as the layer takes it: a DECIMAL as its scaled integer,
+    anything else as it is. Only Decimals with at most s fractional digits
+    are given, so the scaling is exact."""
+    if t is not None and t.kind == "decimal" and isinstance(v, decimal.Decimal):
+        return int(v.scaleb(t.scale))
+    return v
 
 
 @dataclasses.dataclass(frozen=True)
@@ -113,6 +131,37 @@ def strict(rows) -> tuple:
     return tuple(tuple(one(v) for v in row) for row in rows)
 
 
+def same_rows(layer: tuple, full: tuple, key, limit: int | None) -> str | None:
+    """Whether the layer's rows are a correct answer, given PostgreSQL's
+    rows without the LIMIT: in order of `key` (None: no ORDER BY), each run
+    of equal keys the same multiset, and the run LIMIT cuts drawn from
+    PostgreSQL's. A reason when they are not."""
+    want = len(full) if limit is None else min(limit, len(full))
+    if len(layer) != want:
+        return f"{len(layer)} rows, expected {want}"
+    def bag(rows):
+        return collections.Counter(strict(rows))
+    if key is None:
+        if limit is None:
+            return None if bag(layer) == bag(full) else "different rows"
+        return None if not bag(layer) - bag(full) else "rows PostgreSQL does not hold"
+    if [key(r) for r in layer] != [key(r) for r in full[:want]]:
+        return "a different order"
+    i = 0
+    while i < want:
+        j = i
+        while j < want and key(layer[j]) == key(layer[i]):
+            j += 1
+        whole = [r for r in full if key(r) == key(layer[i])]
+        if j < want or len(whole) == j - i:  # a run the LIMIT did not cut
+            if bag(layer[i:j]) != bag(whole):
+                return "different rows in a run of equal keys"
+        elif bag(layer[i:j]) - bag(whole):
+            return "rows PostgreSQL does not hold"
+        i = j
+    return None
+
+
 def changes_rows(sql: str) -> bool:
     """Whether the statement reports the rows it changed."""
     return sql.split(None, 1)[0].upper() in ("INSERT", "UPDATE", "DELETE")
@@ -126,6 +175,8 @@ def literal(t: Type, v) -> str:
         return "TRUE" if v else "FALSE"
     if t.kind in ("int", "float", "real"):
         return repr(v)
+    if t.kind == "decimal":
+        return str(v)
     if t.kind == "bytes":
         v = v.decode("ascii")  # printable ASCII only: no escapes to agree on
     return "'" + v.replace("'", "''") + "'"

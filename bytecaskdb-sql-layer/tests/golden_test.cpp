@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Gustavo Amigo
 //
 // Golden plans (docs/frontend_design.md, *Tests*): each tests/golden/<name>.sql
-// is compiled against the fixture's schema plus tests/golden/schema.sql, and
+// is compiled against the fixture's schema plus tests/golden/schema.sql, each
+// tests/golden/tpcc/<name>.sql against the fixture's plus TPROC-C's, and
 // its plan text must equal tests/golden/<name>.c byte for byte and compile
 // with TinyCC. A change to the code generator regenerates them with
 // SQL_LAYER_REGEN_GOLDEN=1, and the PR shows the diff.
@@ -23,6 +24,7 @@ import bytecask.sql.codegen;
 import bytecask.sql.parser;
 import bytecask.sql.tcc_loader;
 import bytecask.sql.tests.fixture;
+import bytecask.sql.tests.tpcc;
 
 using namespace bytecask::sql;
 
@@ -45,17 +47,11 @@ auto statement(const std::filesystem::path& p) -> std::string {
 
 auto bind_sql(const Catalog& cat, std::string_view sql) -> bound::Bound { return bound::bind(ast::parse(sql), cat); }
 
-}  // namespace
-
-TEST_CASE("golden: every plan the compiler generates equals its golden file", "[sql][codegen][golden]") {
-  const std::filesystem::path dir{SQL_LAYER_GOLDEN_DIR};
+// Every <name>.sql in `dir` against the fixture plus `schema`, one DDL
+// statement each.
+void check_dir(const std::filesystem::path& dir, const std::vector<std::string>& schema) {
   sql_test::Fixture f;
-  std::istringstream schema{read_file(dir / "schema.sql")};
-  for (std::string line; std::getline(schema, line);) {
-    while (!line.empty() && line.back() == ';') line.pop_back();
-    if (line.empty()) continue;
-    f.ddl(std::get<Ddl>(bind_sql(f.cat(), line).stmt));
-  }
+  for (const auto& ddl : schema) f.ddl(std::get<Ddl>(bind_sql(f.cat(), ddl).stmt));
 
   std::vector<std::filesystem::path> cases;
   for (const auto& e : std::filesystem::directory_iterator(dir)) {
@@ -84,4 +80,19 @@ TEST_CASE("golden: every plan the compiler generates equals its golden file", "[
     REQUIRE(std::filesystem::exists(golden));
     CHECK(source == read_file(golden));
   }
+}
+
+}  // namespace
+
+TEST_CASE("golden: every plan the compiler generates equals its golden file", "[sql][codegen][golden]") {
+  const std::filesystem::path dir{SQL_LAYER_GOLDEN_DIR};
+  std::vector<std::string> schema;
+  std::istringstream text{read_file(dir / "schema.sql")};
+  for (std::string line; std::getline(text, line);) {
+    while (!line.empty() && line.back() == ';') line.pop_back();
+    if (!line.empty()) schema.push_back(line);
+  }
+  check_dir(dir, schema);
+  // TPROC-C's statements, against its schema (tpcc_schema.cppm).
+  check_dir(dir / "tpcc", {sql_test::kTpccSchema.begin(), sql_test::kTpccSchema.end()});
 }

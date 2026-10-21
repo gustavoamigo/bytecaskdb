@@ -23,6 +23,12 @@ aborts both: every statement after it is 25P02, and COMMIT rolls back. The
 tables are compared while no transaction is open; DDL and the reopen run
 only then.
 
+Slice 1 of the front end (#492): NUMERIC columns, CREATE INDEX, SELECT by
+an equality prefix and a range of any key, with ORDER BY and LIMIT, COUNT,
+and SET col = col ± $n. A model of the planner's rules (`served`) keeps the
+machine to statements the layer plans; the rest must be refused with "no
+plan".
+
 The fixed cases at the end call the same steps in a set order.
 """
 
@@ -44,7 +50,10 @@ from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, 
 import oracle as o
 from conftest import Oracle
 
-TYPES = [o.BIGINT, o.INTEGER, o.SMALLINT, o.DOUBLE, o.REAL, o.BOOLEAN, o.TEXT, o.varchar(4), o.BYTEA]
+TYPES = [o.BIGINT, o.INTEGER, o.SMALLINT, o.DOUBLE, o.REAL, o.numeric(6, 2), o.BOOLEAN, o.TEXT, o.varchar(4), o.BYTEA]
+# Types a column + parameter is supported on, and how PostgreSQL types that
+# parameter: as the column's type (numeric without the modifier).
+ARITHMETIC = {"smallint": "smallint", "integer": "integer", "numeric(6,2)": "numeric"}
 TABLE_NAMES = ["t0", "t1", "t2", "t3"]
 BIGINT_LOW, BIGINT_HIGH = o.BIGINT.low, o.BIGINT.high
 
@@ -68,6 +77,17 @@ class Column:
 
 
 @dataclasses.dataclass
+class Index:
+    name: str
+    columns: list[tuple[str, bool]]  # (column, DESC)
+    unique: bool = False
+
+    def ddl(self, table: str) -> str:
+        cols = ", ".join(c + (" DESC" if desc else "") for c, desc in self.columns)
+        return f"CREATE {'UNIQUE ' if self.unique else ''}INDEX {self.name} ON {table} ({cols})"
+
+
+@dataclasses.dataclass
 class Table:
     name: str
     columns: list[Column]
@@ -76,9 +96,13 @@ class Table:
     # on each of its columns; "both", on its first column and the table.
     # Only "table", or "column" with one key column, declare one key.
     pk_style: str = "table"
+    indexes: list[Index] = dataclasses.field(default_factory=list)  # in creation order
 
     def column(self, name: str) -> Column:
         return next(c for c in self.columns if c.name == name)
+
+    def nullable(self, name: str) -> bool:
+        return self.column(name).nullable and name not in self.pk
 
     def ddl(self, pg: bool) -> str:
         on_column = set(self.pk if self.pk_style == "column" else self.pk[:1] if self.pk_style == "both" else [])
@@ -90,6 +114,16 @@ class Table:
     @property
     def select_all(self) -> str:
         return f"SELECT {', '.join(c.name for c in self.columns)} FROM {self.name}"
+
+
+def typed(t: Table, c: str, n: int) -> str:
+    """$n compared with column c, as PostgreSQL's side spells it. The layer
+    types $n by its column, as PostgreSQL types a $n it is not told the type
+    of; psycopg tells it int8 or float8, so one compared with a SMALLINT,
+    INTEGER or REAL casts to the column's type, which also refuses one
+    outside it (22003)."""
+    ty = t.column(c).type
+    return f"${n}::{ty.sql}" if ty.sql in ("smallint", "integer", "real") else f"${n}"
 
 
 def values(t: o.Type) -> st.SearchStrategy:
@@ -109,6 +143,12 @@ def values(t: o.Type) -> st.SearchStrategy:
         inside = st.one_of(st.floats(width=32, allow_nan=False, allow_infinity=False),
                            st.floats(-1e38, 1e38).filter(lambda v: v == 0 or abs(v) > 1e-37))
         return st.one_of(inside, st.sampled_from([1e39, -1e39, 1e-50, -1e-50]))
+    if t.kind == "decimal":
+        # At its scale, so both sides hold it exactly; past its precision now
+        # and then (22003 on both).
+        scaled = st.one_of(st.integers(-300, 300), st.integers(t.low, t.high),
+                           st.sampled_from([t.low, t.high, t.low - 1, t.high + 1]))
+        return scaled.map(lambda n: decimal.Decimal(n).scaleb(-t.scale))
     if t.kind == "bool":
         return st.booleans()
     if t.kind == "text":
@@ -128,11 +168,75 @@ def default_values(t: o.Type) -> st.SearchStrategy:
         return st.integers(-3, 3)
     if t.kind in ("float", "real"):
         return st.sampled_from([0.0, 1.5, -2.25])  # exact in a float too
+    if t.kind == "decimal":
+        return st.sampled_from([decimal.Decimal("0.00"), decimal.Decimal("1.25"), decimal.Decimal("-2.50")])
     if t.kind == "bool":
         return st.booleans()
     printable = st.characters(min_codepoint=0x20, max_codepoint=0x7E, blacklist_characters="\\")
     text = st.text(printable, max_size=t.length or 4)
     return text.map(str.encode) if t.kind == "bytes" else text
+
+
+# What the planner serves (docs/frontend_design.md, *The planner's choices*,
+# as slice 1 builds it), so the machine generates only statements it plans,
+# and checks that the layer refuses the rest with "no plan". -------------
+
+
+def key_paths(t: Table) -> list[tuple[bool, list[tuple[str, bool]]]]:
+    """The primary key, then each index in creation order (so in object id
+    order): whether it is the primary key, and its key's parts (an index's,
+    then every part of the primary key, one the index names among them)."""
+    out = [(True, [(c, False) for c in t.pk])]
+    for ix in t.indexes:
+        out.append((False, list(ix.columns) + [(c, False) for c in t.pk]))
+    return out
+
+
+def served(t: Table, conjuncts: list[tuple[str, str]], order: list[tuple[str, bool]], used: list[str]) -> bool:
+    """Whether the planner plans a SELECT with these WHERE conjuncts
+    (column, operator), ORDER BY items (column, DESC) and columns read."""
+    eq = {c for c, op in conjuncts if op == "="}
+    if all(c in eq for c in t.pk):  # a point lookup: any other conjunct is a residual
+        return all(op == "=" and c in t.pk for c, op in conjuncts)
+    ordered: list[tuple[str, bool]] = []
+    for c, desc in order:
+        if c not in eq and c not in [q for q, _ in ordered]:
+            ordered.append((c, desc))
+    candidates = []
+    for oid, (is_pk, parts) in enumerate(key_paths(t)):
+        run = 0
+        while run < len(parts) and parts[run][0] in eq:
+            run += 1
+        ranged = run < len(parts) and any(c == parts[run][0] and op != "=" for c, op in conjuncts)
+        if run == 0 and not ranged:
+            continue
+        serves, reverse = run + len(ordered) <= len(parts), False
+        for i, (c, desc) in enumerate(ordered if serves else []):
+            pc, pdesc = parts[run + i]
+            rev = desc != pdesc
+            if pc != c or (i > 0 and rev != reverse):
+                serves = False
+                break
+            reverse = rev
+        in_key = {c for c, _ in parts}
+        covering = all(c in in_key and t.column(c).type.kind not in ("float", "real") for c in used)
+        candidates.append(((run, ranged, is_pk, covering, -oid), serves, run, parts))
+    candidates = [c for c in candidates if c[1]]
+    if not candidates:
+        return False
+    _, _, run, parts = max(candidates, key=lambda c: c[0])
+    run_cols = {c for c, _ in parts[:run]}
+    for c, op in conjuncts:
+        if op == "=" and c not in run_cols:
+            return False  # a residual
+        if op != "=" and (run == len(parts) or c != parts[run][0]):
+            return False
+    for i, (c, _) in enumerate(ordered):
+        if not t.nullable(c) or any(q == c for q, _ in conjuncts):
+            continue
+        later = any(t.nullable(q) for q, _ in ordered[i + 1:])
+        return i == 0 and not parts[run][1] and not later  # the two-range scan, or a refusal
+    return True
 
 
 class SqlMachine(RuleBasedStateMachine):
@@ -168,9 +272,12 @@ class SqlMachine(RuleBasedStateMachine):
 
     # The two sides --------------------------------------------------------
 
-    def both(self, sql: str, params=(), pg_sql: str | None = None) -> o.Outcome:
-        """Runs a statement on both sides; they must agree. Returns the layer's outcome."""
-        layer = o.run_layer(self.db if self.txn is None else self.txn, sql, params)
+    def both(self, sql: str, params=(), pg_sql: str | None = None, types=None) -> o.Outcome:
+        """Runs a statement on both sides; they must agree. Returns the layer's
+        outcome. `types`: each parameter's column type, for the DECIMALs the
+        layer takes scaled (o.to_layer)."""
+        layer_params = [o.to_layer(v, t) for v, t in zip(params, types)] if types else params
+        layer = o.run_layer(self.db if self.txn is None else self.txn, sql, layer_params)
         pg = o.run_pg(self.pg.conn, pg_sql or sql, params)
         if currently_in_test_context():  # the fixed cases call the steps outside Hypothesis
             note(f"{sql} {params!r} -> layer {layer.error or 'ok'}, postgres {pg.error or 'ok'}")
@@ -207,6 +314,14 @@ class SqlMachine(RuleBasedStateMachine):
         assert out.error is None, out.detail
         return list(out.rows)
 
+    def existing_rows(self, t: Table) -> list[tuple]:
+        """Every row, in select_all's column order, as the transaction sees it."""
+        if self.txn is not None and self.txn.is_aborted:
+            return []
+        out = o.run_pg(self.pg.conn, f"{t.select_all} ORDER BY {', '.join(t.pk)}")
+        assert out.error is None, out.detail
+        return list(out.rows)
+
     # The steps, callable in a set order by the fixed cases ------------------
 
     def create(self, t: Table) -> o.Outcome:
@@ -232,21 +347,73 @@ class SqlMachine(RuleBasedStateMachine):
         marks = ", ".join(f"${i + 1}" for i in range(len(cols)))
         target = "" if all_columns else f" ({', '.join(cols)})"
         sql = f"INSERT INTO {name}{target} VALUES ({marks})"
-        return self.both(sql, params)
+        t = self.tables.get(name)
+        types = [t.column(c).type for c in cols] if t is not None else None
+        return self.both(sql, params, types=types)
 
     def lookup(self, name: str, key: tuple) -> o.Outcome:
         t = self.tables[name]
         where = " AND ".join(f"{c} = ${i + 1}" for i, c in enumerate(t.pk))
-        # The layer types $n by its column, as PostgreSQL types a $n it is
-        # not told the type of; psycopg tells it int8 or float8, so a
-        # SMALLINT, INTEGER or REAL key casts to its column's type, which
-        # also refuses one outside it (22003).
-        def typed(c: str, n: int) -> str:
-            ty = t.column(c).type
-            return f"${n}::{ty.sql}" if ty.sql in ("smallint", "integer", "real") else f"${n}"
+        pg_where = " AND ".join(f"{c} = {typed(t, c, i + 1)}" for i, c in enumerate(t.pk))
+        return self.both(f"{t.select_all} WHERE {where}", key, pg_sql=f"{t.select_all} WHERE {pg_where}",
+                         types=[t.column(c).type for c in t.pk])
 
-        pg_where = " AND ".join(f"{c} = {typed(c, i + 1)}" for i, c in enumerate(t.pk))
-        return self.both(f"{t.select_all} WHERE {where}", key, pg_sql=f"{t.select_all} WHERE {pg_where}")
+    def create_index(self, name: str, ix: Index) -> o.Outcome:
+        out = self.both(ix.ddl(name))
+        if out.error is None:
+            self.tables[name].indexes.append(ix)
+        return out
+
+    def select(self, name: str, targets: list[str], where: list[tuple[str, str, object]],
+               order: list[tuple[str, bool]] = (), limit: int | None = None, count: str | None = None) -> None:
+        """SELECT targets (or COUNT(count), "*" for COUNT(*)) WHERE each
+        (column, operator, value) ... ORDER BY ... LIMIT ...: on both sides
+        when the planner serves it, else the layer must refuse it with no
+        plan."""
+        t = self.tables[name]
+        cols = [c for c, _, _ in where]
+        used = targets + ([count] if count not in (None, "*") else [])
+        select = f"count({count})" if count else ", ".join(targets)
+        conds = [f"{c} {op} ${i + 1}" for i, (c, op, _) in enumerate(where)]
+        pg_conds = [f"{c} {op} {typed(t, c, i + 1)}" for i, (c, op, _) in enumerate(where)]
+        tail = (" ORDER BY " + ", ".join(c + (" DESC" if d else "") for c, d in order) if order else "") + (
+            f" LIMIT {limit}" if limit is not None else "")
+        sql = f"SELECT {select} FROM {name} WHERE {' AND '.join(conds)}{tail}"
+        params = [v for _, _, v in where]
+        types = [t.column(c).type for c in cols]
+        if not served(t, [(c, op) for c, op, _ in where], list(order), used):
+            out = o.run_layer(self.db if self.txn is None else self.txn, sql, [o.to_layer(v, ty) for v, ty in zip(params, types)])
+            if out.error == o.ABORTED:
+                return  # the transaction was aborted before: nothing was planned
+            assert out.error == "refused" and out.detail.startswith("no plan:"), f"{sql}: planned, expected no plan ({out})"
+            if self.txn is not None and not self.pg_aborted():
+                # A refused statement aborts the transaction on both sides, as
+                # any statement PostgreSQL refuses does.
+                assert self.txn.is_aborted
+                assert o.run_pg(self.pg.conn, "SELECT no_such_column FROM " + name).error == "refused"
+            return
+        pg_sql = f"SELECT {select} FROM {name} WHERE {' AND '.join(pg_conds)}{tail}"
+        if count:
+            self.both(sql, params, pg_sql=pg_sql, types=types)  # one row, or none under LIMIT 0
+            return
+        layer = o.run_layer(self.db if self.txn is None else self.txn, sql, [o.to_layer(v, ty) for v, ty in zip(params, types)])
+        full = o.run_pg(self.pg.conn, pg_sql.removesuffix(f" LIMIT {limit}" if limit is not None else ""), params)
+        assert layer.error == full.error, f"{sql} {params!r}: the layer {layer.error or 'ran it'} ({layer.detail}), PostgreSQL {full.error or 'ran it'} ({full.detail})"
+        if layer.error is not None:
+            return
+        key = (lambda r: tuple(r[targets.index(c)] for c, _ in order)) if order else None
+        why = o.same_rows(layer.rows, full.rows, key, limit)
+        assert why is None, f"{sql} {params!r}: {why}: the layer returned {layer.rows}, PostgreSQL {full.rows}"
+
+    def add(self, name: str, col: str, op: str, operand, key: tuple) -> o.Outcome:
+        """UPDATE … SET col = col op $1 WHERE the primary key."""
+        t = self.tables[name]
+        where = " AND ".join(f"{c} = ${i + 2}" for i, c in enumerate(t.pk))
+        pg_where = " AND ".join(f"{c} = {typed(t, c, i + 2)}" for i, c in enumerate(t.pk))
+        cast = ARITHMETIC[t.column(col).type.sql]
+        return self.both(f"UPDATE {name} SET {col} = {col} {op} $1 WHERE {where}", (operand, *key),
+                         pg_sql=f"UPDATE {name} SET {col} = {col} {op} $1::{cast} WHERE {pg_where}",
+                         types=[t.column(col).type] + [t.column(c).type for c in t.pk])
 
     def begin(self) -> None:
         # PostgreSQL's REPEATABLE READ, like the layer's, takes its snapshot
@@ -359,9 +526,11 @@ class SqlMachine(RuleBasedStateMachine):
                 row[c.name] = data.draw(values(c.type), label=c.name)
         self.insert(name, row, all_columns)
 
-    # Inserts are twice as likely as any other step: two rules run them.
+    # Inserts are three times as likely as any other step: three rules run
+    # them, so the reads find rows.
     insert_one = precondition(lambda self: self.tables)(rule(data=st.data())(insert_row))
     insert_another = precondition(lambda self: self.tables)(rule(data=st.data())(insert_row))
+    insert_a_third = precondition(lambda self: self.tables)(rule(data=st.data())(insert_row))
 
     @precondition(lambda self: self.tables)
     @rule(data=st.data())
@@ -373,6 +542,97 @@ class SqlMachine(RuleBasedStateMachine):
         else:
             key = tuple(data.draw(st.none() | values(t.column(c).type), label=c) for c in t.pk)
         self.lookup(t.name, key)
+
+    @precondition(lambda self: self.tables and self.txn is None)
+    @rule(data=st.data())
+    def create_index_rule(self, data):
+        t = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
+        n = data.draw(st.integers(1, min(2, len(t.columns))), label="index columns")
+        cols = data.draw(st.permutations([c.name for c in t.columns]), label="index order")[:n]
+        ix = Index(f"{t.name}_ix{len(t.indexes)}", [(c, data.draw(st.booleans(), label=f"{c} desc")) for c in cols],
+                   unique=data.draw(st.integers(0, 3), label="unique?") == 0)
+        self.create_index(t.name, ix)
+
+    def where_on_a_path(self, data, t: Table) -> tuple[list[tuple[str, str, object]], list[tuple[str, bool]], int]:
+        """Conjuncts a key path expresses: an equality prefix of one of the
+        table's keys and a range on the part after it, mostly from an
+        existing row, in shuffled order. Returns them, the path's parts and
+        the prefix's length."""
+        is_pk, parts = data.draw(st.sampled_from(key_paths(t)), label="path")
+        rows = self.existing_rows(t)
+        row = data.draw(st.sampled_from(rows), label="row") if rows and data.draw(st.integers(0, 3), label="from a row?") else None
+        names = [c.name for c in t.columns]
+        def value(c: str):
+            if row is not None and data.draw(st.integers(0, 4), label=f"{c} from the row?"):
+                return row[names.index(c)]
+            return data.draw(st.none() | values(t.column(c).type), label=c)
+        run = data.draw(st.integers(0, len(parts)), label="prefix")
+        where = []
+        for c, _ in parts[:run]:
+            if c not in [q for q, _, _ in where]:  # a key repeats a primary key column its index names
+                where.append((c, "=", value(c)))
+        if run < len(parts) and parts[run][0] in [c for c, _, _ in where]:
+            pass  # a column the prefix compares, repeated in the key: no range on it
+        elif run < len(parts) and (run == 0 or data.draw(st.booleans(), label="range?")):
+            c = parts[run][0]
+            bounds = data.draw(st.sampled_from([(">",), (">=",), ("<",), ("<=",), (">", "<"), (">=", "<="), (">=", "<")]),
+                               label="bounds")
+            where += [(c, op, value(c)) for op in bounds]
+        return data.draw(st.permutations(where), label="where order"), parts, run
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def select_by_key(self, data):
+        t = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
+        where, parts, run = self.where_on_a_path(data, t)
+        if not where:
+            return
+        order: list[tuple[str, bool]] = []
+        if data.draw(st.booleans(), label="order?"):
+            # The parts after the prefix, each with or against its direction;
+            # an equality-compared column now and then, which orders nothing.
+            reverse = data.draw(st.booleans(), label="reverse")
+            m = data.draw(st.integers(min(1, len(parts) - run), len(parts) - run), label="ordered parts")
+            order = [(c, desc != reverse) for c, desc in parts[run:run + m]]
+            if run and data.draw(st.integers(0, 3), label="an equal column?") == 0:
+                order.insert(data.draw(st.integers(0, len(order)), label="at"), (parts[0][0], data.draw(st.booleans())))
+            if order and data.draw(st.integers(0, 3), label="flip one?") == 0:
+                i = data.draw(st.integers(0, len(order) - 1), label="flipped")
+                order[i] = (order[i][0], not order[i][1])  # mostly unserved: the layer refuses it
+        names = [c.name for c in t.columns]
+        targets = data.draw(st.lists(st.sampled_from(names), min_size=1, max_size=3, unique=True), label="targets")
+        targets += [c for c, _ in order if c not in targets]
+        limit = data.draw(st.none() | st.sampled_from([0, 1, 2, 5]), label="limit")
+        self.select(t.name, targets, where, order, limit)
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def count_by_key(self, data):
+        t = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
+        where, _, _ = self.where_on_a_path(data, t)
+        if not where:
+            return
+        arg = data.draw(st.sampled_from(["*"] + [c.name for c in t.columns]), label="count of")
+        limit = data.draw(st.none() | st.sampled_from([0, 1]), label="limit")
+        self.select(t.name, [], where, limit=limit, count=arg)
+
+    @precondition(lambda self: any(c.type.sql in ARITHMETIC and c.name not in t.pk
+                                   for t in self.tables.values() for c in t.columns))
+    @rule(data=st.data())
+    def add_to_column(self, data):
+        choices = [(t.name, c.name) for t in self.tables.values() for c in t.columns
+                   if c.type.sql in ARITHMETIC and c.name not in t.pk]
+        name, col = data.draw(st.sampled_from(sorted(choices)), label="column")
+        t = self.tables[name]
+        keys = self.existing_keys(t)
+        if keys and data.draw(st.integers(0, 4), label="existing key?"):
+            key = data.draw(st.sampled_from(keys), label="key")
+        else:
+            key = tuple(data.draw(st.none() | values(t.column(c).type), label=c) for c in t.pk)
+        ty = t.column(col).type
+        small = st.integers(-5, 5).map(lambda n: decimal.Decimal(n) if ty.kind == "decimal" else n)
+        operand = data.draw(st.none() | small | values(ty), label="operand")
+        self.add(name, col, data.draw(st.sampled_from(["+", "-"]), label="op"), operand, key)
 
     @precondition(lambda self: self.txn is None)
     @rule()
@@ -806,3 +1066,71 @@ def test_rows_compare_by_type():
     assert o.strict([(1,)]) != o.strict([(1.0,)])
     assert o.strict([(-0.0,)]) != o.strict([(0.0,)])
     assert o.strict([("a", b"a", None)]) == o.strict([("a", b"a", None)])
+
+
+def test_order_by_places_nulls_as_postgresql(dsn):
+    """A nullable ordered column after an equality prefix: the two ranges
+    put its NULLs last under ASC and first under DESC, one LIMIT across
+    both. A nullable DESC index part is refused (no plan)."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.TEXT), Column("c2", o.BIGINT)],
+                       ["c0"]))
+        m.create_index("t0", Index("t0_ix0", [("c2", False), ("c1", False)]))
+        m.create_index("t0", Index("t0_ix1", [("c1", True)]))
+        for k, (c1, c2) in enumerate([("b", 1), (None, 1), ("a", 1), (None, 1), ("c", 2), ("a", 1)]):
+            m.insert("t0", {"c0": k, "c1": c1, "c2": c2}, all_columns=True)
+        for desc in (False, True):
+            for limit in (None, 1, 3, 5):
+                m.select("t0", ["c1", "c0"], [("c2", "=", 1)], [("c1", desc)], limit)
+                m.select("t0", ["c1", "c0"], [("c2", "=", 1)], [("c1", desc), ("c0", desc)], limit)
+        # Only t0_ix1 leads with c1; its part is DESC.
+        m.select("t0", ["c1"], [("c1", ">", "a")], [("c1", False)])
+        assert not served(m.tables["t0"], [("c0", ">")], [("c1", False)], ["c1"])
+        out = o.run_layer(m.db, "SELECT c1 FROM t0 WHERE c0 > $1 ORDER BY c1", (0,))
+        assert out.error == "refused" and out.detail.startswith("no plan:"), out
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_count_from_the_keys_and_by_row(dsn):
+    """COUNT(*) and COUNT of a NOT NULL column count the key range; COUNT of
+    a nullable column counts its values. 0 over no rows, and a NULL
+    parameter matches none."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER, nullable=False),
+                              Column("c2", o.TEXT)], ["c0", "c1"]))
+        for k, c2 in enumerate(["x", None, "y", None]):
+            m.insert("t0", {"c0": k % 2, "c1": k, "c2": c2}, all_columns=True)
+        for arg in ("*", "c1", "c2"):
+            for key in (0, 1, 7, None):
+                m.select("t0", [], [("c0", "=", key)], count=arg)
+            m.select("t0", [], [("c0", "=", 0), ("c1", ">=", 1)], count=arg)
+            m.select("t0", [], [("c0", "=", 1), ("c1", "=", 1)], count=arg, limit=0)
+    finally:
+        m.teardown()
+
+
+def test_column_plus_parameter_at_the_edges(dsn):
+    """SET col = col ± $1 on SMALLINT, INTEGER and NUMERIC(6, 2): a result
+    outside the column's type is 22003 on both sides, NULL stays NULL."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.SMALLINT), Column("c2", o.INTEGER),
+                              Column("c3", o.numeric(6, 2))], ["c0"]))
+        m.insert("t0", {"c0": 1, "c1": 32760, "c2": -2147483640, "c3": decimal.Decimal("9999.00")}, all_columns=True)
+        m.insert("t0", {"c0": 2, "c1": None, "c2": None, "c3": None}, all_columns=True)
+        for key in (1, 2, 3):
+            assert m.add("t0", "c1", "+", 7, (key,)).error is None
+            assert m.add("t0", "c1", "+", 1, (key,)).error == ("22003" if key == 1 else None)
+            assert m.add("t0", "c2", "-", 9, (key,)).error == ("22003" if key == 1 else None)
+            assert m.add("t0", "c3", "+", decimal.Decimal("0.99"), (key,)).error is None
+            assert m.add("t0", "c3", "+", decimal.Decimal("0.01"), (key,)).error == ("22003" if key == 1 else None)
+            assert m.add("t0", "c3", "-", None, (key,)).error is None
+        assert m.add("t0", "c2", "+", 2**31, (2,)).error == "22003"  # the operand is an INTEGER, on both
+        m.check()
+    finally:
+        m.teardown()
+

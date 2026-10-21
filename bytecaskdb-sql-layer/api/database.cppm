@@ -624,13 +624,9 @@ auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
       bound.stmt);
   if (table == nullptr) return nullptr;
   auto c = std::make_shared<Compiled>();
-  if (const auto* sel = std::get_if<bound::Select>(&bound.stmt)) {
-    for (auto id : sel->targets) {
-      c->columns.push_back(sel->table->column(id)->name);
-      c->column_types.push_back(sel->table->column(id)->sql);
-    }
-  }
   c->plan = std::make_unique<GeneratedPlan>(generate_plan(bound, *cat, s.sql_));
+  c->columns = c->plan->result_names;
+  c->column_types = c->plan->result_sql;
   c->result_codes = result_type_codes(c->plan->result_types);
   c->result_layout = make_result_layout(c->plan->result_types);
   {
