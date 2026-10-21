@@ -52,6 +52,8 @@ enum bc_error_code {
   BC_E_LAYOUT,      /* plan incompatible with the live catalog, or a row violates its layout */
   BC_E_DEGRADED,    /* engine degraded; writes refused */
   BC_E_CLOSED,
+  BC_E_UNKNOWN,     /* a commit failed and degraded the engine: its batch may have reached the data
+                       file, so its outcome is unknown, never "nothing written" (SQLSTATE 08007) */
 };
 
 enum bc_scan_flags {
@@ -131,6 +133,43 @@ uint32_t bc_error_detail(const bc_ctx *);                  /* BC_E_CONSTRAINT: t
 int64_t bc_ctx_affected(const bc_ctx *);                   /* what the last run's bc_emit_count recorded, or -1 */
 int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params *,
                    bc_budget, bool sync, uint32_t max_retries);               /* the retry loop */
+
+/* Transactions (docs/transaction_design.md). Internal: the embedded API's
+   Transaction is their only caller, and plans never call them. A
+   transaction's statements read its snapshot, pinned at the first statement
+   with its catalog version, through the overlay of the earlier statements'
+   writes; bc_txn_commit submits their writes as one batch.
+
+   Preconditions, which the caller keeps and the runtime does not defend
+   (use out of this order is unsupported):
+   - one context per transaction, running one statement at a time;
+   - each statement is bc_ctx_begin_txn, bc_ctx_run, bc_txn_add, then
+     bc_ctx_reset. A statement refused before it ran with BC_E_LAYOUT and
+     BC_L_INCOMPATIBLE did nothing, and may instead be reset and begun again;
+   - after any other failed statement, the transaction is only freed;
+   - bc_txn_commit with no statement open, once.
+
+   A statement that fails, or that takes what the transaction holds past
+   max_bytes (BC_E_LIMIT), aborts the transaction at bc_txn_add: it releases
+   its snapshot and pin at once (bc_txn_catalog_version is then 0). An abort
+   and bc_txn_free detach the context, which keeps its error and its
+   finished statement's results. bc_txn_commit touches no context and
+   reports through the transaction (bc_txn_error, BC_E_UNKNOWN when the
+   outcome is unknown). */
+typedef struct bc_txn bc_txn;
+bc_txn *bc_txn_new(bc_db *db, const bc_catalog *cat, uint64_t max_bytes);
+void    bc_txn_free(bc_txn *);                                                /* a transaction not committed writes nothing */
+void    bc_ctx_begin_txn(bc_ctx *, bc_txn *, const bc_params *params, bc_budget budget);
+bool    bc_txn_add(bc_ctx *);                     /* ends the statement: its writes join, or the transaction aborts */
+uint64_t bc_txn_catalog_version(const bc_txn *);  /* the catalog version pinned at the first statement; 0 before
+                                                     it and after an abort */
+bool    bc_txn_repin(bc_txn *);                   /* before any statement was added, with no context attached:
+                                                     drops the pin, so the next statement pins the live catalog
+                                                     and a new snapshot; false, changing nothing, otherwise */
+enum bc_commit_result bc_txn_commit(bc_txn *, bool sync);
+enum bc_error_code bc_txn_error(const bc_txn *);  /* of the last bc_txn_commit */
+const char *bc_txn_error_message(const bc_txn *);
+uint32_t bc_txn_error_detail(const bc_txn *);
 
 /* Parameters and results */
 int64_t  bc_param_i64(bc_ctx *, uint32_t i);

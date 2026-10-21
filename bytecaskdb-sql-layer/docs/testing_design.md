@@ -70,6 +70,21 @@ Rules in increment 1:
   nothing for one only longer than a VARCHAR(n).
 - **Reopen** of the layer's database.
 
+Rules for transactions (#491):
+- **BEGIN**, then the inserts and lookups above inside the transaction,
+  which read its own writes. PostgreSQL runs a real `REPEATABLE READ`
+  transaction on its connection, which also takes its snapshot at the
+  first statement.
+- **COMMIT** and **ROLLBACK** of any transaction. After a failed
+  statement both sides answer every statement with 25P02, except one that
+  does not parse, which both report as the syntax error, and COMMIT rolls
+  back on both: the layer's `commit()` and PostgreSQL's command tag both
+  say ROLLBACK. After each statement the two must agree on whether the
+  transaction is aborted.
+- The tables are compared while no transaction is open; CREATE, DROP and
+  the reopen run only then. One connection on each side: nothing commits
+  during a transaction, so no commit conflicts.
+
 Fixed cases are plain pytest functions at the end of the file. They call
 the machine's steps in a set order. Every failure Hypothesis finds is
 committed as one.
@@ -90,6 +105,23 @@ PYTHONPATH=bytecaskdb-sql-layer/python \
   bounded budget. `sql-layer.yml` runs it on every pull request, against a
   PostgreSQL 17 service container.
 - **The default profile, `dev`,** explores.
+
+## Sanitizers
+
+`sql-layer.yml` runs `sql_layer_tests` under ASan, TSan and UBSan through
+the engine's `sanitizers.yml`. Under ASan the allocation-failure sweeps,
+the `[alloc]` tests, run in an invocation of their own (TSan and MSan
+replace `operator new`, so the sweeps skip there). Under a failed allocation the
+engine's key directory leaks a node rather than free it while still
+reachable (#390), and only that invocation tells LeakSanitizer so, with
+`tests/lsan_alloc_sweeps.supp`. Every other test runs with no suppression.
+Locally, with an ASan build:
+
+```sh
+build/linux/x86_64/debug/sql_layer_tests "~[alloc]"
+LSAN_OPTIONS=suppressions=$PWD/bytecaskdb-sql-layer/tests/lsan_alloc_sweeps.supp \
+  build/linux/x86_64/debug/sql_layer_tests "[alloc]"
+```
 
 ## Known differences
 

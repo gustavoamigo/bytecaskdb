@@ -154,7 +154,10 @@ TEST_CASE("plan API: the symbol table names every plan-callable function of the 
     std::smatch m;
     if (!std::regex_search(line, m, decl)) continue;
     auto name = m[1].str();
-    if (name.starts_with("bc_ctx_") || name.starts_with("bc_error") || name == "bc_execute") continue;
+    if (name.starts_with("bc_ctx_") || name.starts_with("bc_txn_") || name.starts_with("bc_error") ||
+        name == "bc_execute") {
+      continue;
+    }
     declared.insert(name);
   }
   std::set<std::string> table;

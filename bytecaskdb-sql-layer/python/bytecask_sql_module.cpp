@@ -4,7 +4,8 @@
 // bytecask_sql — the SQL layer's embedded API for Python, via nanobind: what
 // the proof tests (tests/proof/, #515) drive. Five calls: open, execute,
 // close, the catalog, and a table's rows (test only: it links
-// sql_layer_testing).
+// sql_layer_testing); and begin(), a transaction with execute, commit and
+// rollback.
 //
 // Values cross as Python values by the column's SQL type: integers as int,
 // DOUBLE PRECISION and REAL as float, BOOLEAN as bool, BYTEA as bytes, TEXT
@@ -23,7 +24,11 @@
 // None. bytecask_sql.SqlError for a statement the layer refuses before it
 // runs (parse and bind errors, a DDL the catalog refuses, parameters of the
 // wrong number or type, a params object that is not a list or tuple);
-// bytecask_sql.Closed, also a ValueError, for any call after close(). All
+// bytecask_sql.Closed, also a ValueError, for any call after close();
+// bytecask_sql.TransactionAborted (SQLSTATE 25P02) for a statement on a
+// transaction a statement failed in; bytecask_sql.TransactionResolutionUnknown
+// (08007) for a commit whose outcome is unknown. A transaction whose commit
+// conflicts raises ExecError with conflict set (40001). All
 // derive from bytecask_sql.Error. Anything else, an engine refusal at run
 // time included, is nanobind's translation of the C++ exception.
 
@@ -60,7 +65,7 @@ namespace {
 // The module's exception classes, created at import and owned by the module
 // object; plain handles, so nothing runs at process exit.
 struct Exceptions {
-  nb::handle error, sql_error, exec_error, closed;
+  nb::handle error, sql_error, exec_error, closed, aborted, unknown;
 };
 Exceptions exceptions;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables): set once at import
 // decimal.Decimal, looked up once at import, not per value; held for the
@@ -190,9 +195,7 @@ auto catalog(const sql::Database& db) -> nb::list {
   return tables;
 }
 
-auto execute(sql::Database& db, std::string_view text, const nb::object& params) -> nb::dict {
-  // A closed database is Closed whatever the parameters are.
-  if (!db.is_open()) throw bytecask::DbClosed();
+auto to_values(const nb::object& params) -> std::vector<sql::Value> {
   // Only a list or a tuple: a str, a buffer, a UserString or an
   // array.array is a sequence of characters or ints, never parameters, and
   // a dict or set has no placeholder order.
@@ -201,7 +204,20 @@ auto execute(sql::Database& db, std::string_view text, const nb::object& params)
   }
   std::vector<sql::Value> values;
   for (auto p : params) values.push_back(to_datum(p, values.size()));
-  return to_python(db.execute(text, values));
+  return values;
+}
+
+auto execute(sql::Database& db, std::string_view text, const nb::object& params) -> nb::dict {
+  // A closed database is Closed whatever the parameters are.
+  if (!db.is_open()) throw bytecask::DbClosed();
+  return to_python(db.execute(text, to_values(params)));
+}
+
+// A statement of a transaction. A params object that is not parameters is
+// refused before the statement reaches the transaction, as a client library
+// refuses it before PostgreSQL sees it, and does not abort it.
+auto txn_execute(sql::Transaction& t, std::string_view text, const nb::object& params) -> nb::dict {
+  return to_python(t.execute(text, to_values(params)));
 }
 
 }  // namespace
@@ -218,6 +234,11 @@ NB_MODULE(bytecask_sql, m) {
   m.attr("SqlError") = exceptions.sql_error;
   m.attr("ExecError") = exceptions.exec_error;
   m.attr("Closed") = exceptions.closed;
+  exceptions.aborted = PyErr_NewException("bytecask_sql.TransactionAborted", exceptions.error.ptr(), nullptr);
+  m.attr("TransactionAborted") = exceptions.aborted;
+  exceptions.unknown =
+      PyErr_NewException("bytecask_sql.TransactionResolutionUnknown", exceptions.error.ptr(), nullptr);
+  m.attr("TransactionResolutionUnknown") = exceptions.unknown;
   decimal_type = nb::object(nb::module_::import_("decimal").attr("Decimal")).release();
 
   nb::register_exception_translator([](const std::exception_ptr& p, void*) {
@@ -233,10 +254,33 @@ NB_MODULE(bytecask_sql, m) {
       PyErr_SetString(exceptions.sql_error.ptr(), e.what());
     } catch (const bytecask::DbClosed& e) {
       PyErr_SetString(exceptions.closed.ptr(), e.what());
+    } catch (const sql::TransactionAborted& e) {
+      PyErr_SetString(exceptions.aborted.ptr(), e.what());
+    } catch (const sql::TransactionResolutionUnknown& e) {
+      PyErr_SetString(exceptions.unknown.ptr(), e.what());
     }
   });
 
+  nb::class_<sql::Transaction>(m, "Transaction")
+      .def("execute", &txn_execute, "sql"_a, "params"_a = nb::tuple(),
+           "Runs one statement in the transaction; a failure aborts it.")
+      .def(
+          "commit",
+          [](sql::Transaction& t) {
+            return t.commit() == sql::CommitOutcome::Committed ? "COMMIT" : "ROLLBACK";
+          },
+          "Writes every statement's writes as one batch: 'COMMIT'. After a failed statement writes nothing "
+          "and returns 'ROLLBACK', PostgreSQL's command tag. Raises on a conflict.")
+      .def("rollback", &sql::Transaction::rollback, "Ends the transaction; nothing it wrote is kept.")
+      .def_prop_ro("is_open", &sql::Transaction::is_open)
+      .def_prop_ro("is_aborted", &sql::Transaction::is_aborted);
+
   nb::class_<sql::Database>(m, "Database")
+      .def(
+          "begin",
+          [](sql::Database& db, std::uint64_t max_bytes) { return db.begin({.max_bytes = max_bytes}); },
+          "max_bytes"_a = sql::TransactionOptions{}.max_bytes, nb::keep_alive<0, 1>(),
+          "Opens a transaction; its snapshot is taken at its first statement.")
       .def("execute", &execute, "sql"_a, "params"_a = nb::tuple(),
            "Runs one statement: a dict of columns, rows (tuples) and affected.")
       .def("close", &sql::Database::close, "Closes the engine; a later call raises Closed, a second close() nothing.")

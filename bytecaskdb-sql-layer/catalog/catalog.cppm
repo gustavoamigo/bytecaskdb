@@ -31,6 +31,7 @@ module;
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -112,6 +113,43 @@ public:
   DdlRefused& operator=(const DdlRefused&) = default;
   ~DdlRefused() override;  // out of line: anchors the vtable (-Wweak-vtables)
 };
+
+// A DDL that found another DDL of the same catalog in progress, and so did
+// nothing rather than wait for it: retryable, SQLSTATE 40001 at the API.
+class DdlInProgress : public std::runtime_error {
+public:
+  DdlInProgress() : std::runtime_error{"could not serialize access: another DDL is in progress"} {}
+  DdlInProgress(const DdlInProgress&) = default;
+  DdlInProgress& operator=(const DdlInProgress&) = default;
+  ~DdlInProgress() override;  // out of line: anchors the vtable (-Wweak-vtables)
+};
+
+// A commit whose batch failed and left the engine degraded, after the batch
+// may have reached the data file: whether it took effect is unknown, never
+// "nothing written". SQLSTATE 08007 at the API.
+// It holds nothing allocated, and its message is a static string: neither
+// making nor throwing it can fail for want of memory, so the outcome cannot
+// be lost to a second failure.
+class CommitOutcomeUnknown : public std::exception {
+public:
+  CommitOutcomeUnknown() = default;
+  CommitOutcomeUnknown(const CommitOutcomeUnknown&) = default;
+  CommitOutcomeUnknown& operator=(const CommitOutcomeUnknown&) = default;
+  ~CommitOutcomeUnknown() override;  // out of line: anchors the vtable (-Wweak-vtables)
+  [[nodiscard]] auto what() const noexcept -> const char* override;
+};
+
+// Every commit of the layer, DDL, autocommit and transactions alike, goes
+// through this one rule: the batch is applied, and a failure after which the
+// engine is degraded, when it was not before, may have come after the batch
+// reached the data file, so it is thrown as CommitOutcomeUnknown, which
+// allocates nothing. Any other failure is rethrown as it is, having written
+// nothing. Another writer's failure in between also reads as unknown: the
+// safe direction. A resume() between the two checks, by an embedder holding
+// the DB (this layer never calls it), reads an unknown outcome as an
+// ordinary failure: the unsafe one. Exact reporting, which closes both,
+// needs the engine to say whether this batch was appended (#531).
+[[nodiscard]] auto apply_batch_or_unknown(DB& db, WriteOptions opts, WritePlan plan) -> std::optional<CommitResult>;
 
 // A value of one of the four physical types, or SQL NULL (monostate). The
 // runtime's bc_value is this type.
@@ -381,10 +419,14 @@ public:
   [[nodiscard]] auto prepare(const Ddl& ddl) -> Prepared;
   // Commits and publishes. False, with nothing written, on a conflict: a
   // DDL or a write to a backfilled table committed since the prepare.
+  // Throws DdlInProgress, having done nothing, if another DDL of this
+  // catalog is in progress: a DDL never waits for another;
+  // CommitOutcomeUnknown as apply_batch_or_unknown throws it (the next pin
+  // catches up with whatever the data file holds).
   [[nodiscard]] auto commit(Prepared p) -> bool;
   // prepare and commit, retried on a conflict kDdlAttempts times in all.
-  // Returns the version it published; throws as prepare does, or
-  // std::runtime_error when every attempt conflicted.
+  // Returns the version it published; throws as prepare does, DdlInProgress
+  // as commit does, or std::runtime_error when every attempt conflicted.
   auto apply(const Ddl& ddl) -> std::shared_ptr<const Catalog>;
 
   static constexpr int kDdlAttempts = 3;
@@ -404,7 +446,9 @@ private:
   mutable std::atomic<std::shared_ptr<const Catalog>> current_;  // pin() may catch up with another catalog
   [[nodiscard]] auto commit_locked(Prepared p) -> bool;
 
-  std::mutex ddl_mu_;  // one DDL at a time: apply holds it from prepare to publication
+  // One DDL at a time: apply holds it from prepare to publication. Only
+  // ever try-locked: a DDL that finds it held throws DdlInProgress.
+  std::mutex ddl_mu_;
   std::function<void()> commit_hook_;
   std::size_t backfill_limit_{kMaxBackfillBytes};
   // Odd from just before a DDL's batch reaches the engine until current_
@@ -696,6 +740,21 @@ void check_column_spec(const ColumnSpec& c) {
 }  // namespace
 
 DdlRefused::~DdlRefused() = default;
+DdlInProgress::~DdlInProgress() = default;
+CommitOutcomeUnknown::~CommitOutcomeUnknown() = default;
+auto CommitOutcomeUnknown::what() const noexcept -> const char* {
+  return "the commit's outcome is unknown: it failed after its batch may have reached the data file";
+}
+
+auto apply_batch_or_unknown(DB& db, WriteOptions opts, WritePlan plan) -> std::optional<CommitResult> {
+  auto was_degraded = db.is_degraded();
+  try {
+    return db.apply_batch(opts, std::move(plan));
+  } catch (...) {
+    if (was_degraded || !db.is_degraded()) throw;
+    throw CommitOutcomeUnknown{};
+  }
+}
 ConstraintViolation::~ConstraintViolation() = default;
 
 auto ConstraintDetail::name() const -> std::string_view {
@@ -1547,7 +1606,8 @@ auto LiveCatalog::prepare(const Ddl& ddl) -> Prepared {
 }
 
 auto LiveCatalog::commit(Prepared p) -> bool {
-  std::lock_guard<std::mutex> lock{ddl_mu_};
+  std::unique_lock<std::mutex> lock{ddl_mu_, std::try_to_lock};
+  if (!lock.owns_lock()) throw DdlInProgress();
   return commit_locked(std::move(p));
 }
 
@@ -1561,7 +1621,7 @@ auto LiveCatalog::commit_locked(Prepared p) -> bool {
     gen_.notify_all();
   };
   try {
-    auto r = db_.apply_batch({.sync = true}, std::move(*p.plan));
+    auto r = apply_batch_or_unknown(db_, {.sync = true}, std::move(*p.plan));
     if (r) current_.store(std::move(p.next));
     done();
     return r.has_value();
@@ -1579,8 +1639,10 @@ auto LiveCatalog::commit_locked(Prepared p) -> bool {
 auto LiveCatalog::apply(const Ddl& ddl) -> std::shared_ptr<const Catalog> {
   // One DDL at a time from prepare to publication, so a retry is only ever
   // for a write that raced a backfill, never for another DDL of this
-  // catalog. Readers do not take this lock.
-  std::lock_guard<std::mutex> lock{ddl_mu_};
+  // catalog. A second DDL does not wait for the first: it fails at once.
+  // Readers do not take this lock.
+  std::unique_lock<std::mutex> lock{ddl_mu_, std::try_to_lock};
+  if (!lock.owns_lock()) throw DdlInProgress();
   for (int attempt = 0; attempt < kDdlAttempts; ++attempt) {
     auto p = prepare(ddl);
     if (!p.next) return p.base;

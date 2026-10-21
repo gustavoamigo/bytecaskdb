@@ -1,7 +1,11 @@
 # Transactions in the SQL layer
 
-Status: **design, approved by the owner (2026-10-20, #491).** Nothing
-here is built yet. It decides how the layer runs several statements as one
+Status: **design, approved by the owner (2026-10-20, #491).** Built
+(slice A): the transaction's view, statements inside a transaction, commit
+with 40001 on any conflict and 08007 when its outcome is unknown, and DDL
+during an open transaction. Not yet built (slice B): insert claims (23505
+at commit), 0A000 for DDL given to a transaction, and `FOR UPDATE`. It
+decides how the layer runs several statements as one
 transaction, which the MVP needs: TPROC-C's New-Order is about thirty
 statements that read their own writes (#487, *MVP*). Each decision is
 marked **MVP** or **later**.
@@ -54,9 +58,11 @@ An in-process transaction handle on the embedded API:
 ```cpp
 class Transaction {                    // from Database::begin(); move-only
 public:
-  auto execute(const Statement&, std::span<const Value> params) -> Rows;
-  void commit();                       // throws SerializationFailure (40001)
-  void rollback();
+  auto execute(const Statement&, const std::vector<Value>& params) -> Rows;
+  auto commit() -> CommitOutcome;      // Committed, or RolledBack after a failed statement;
+                                       // throws SerializationFailure (40001), or
+                                       // TransactionResolutionUnknown (08007)
+  void rollback() noexcept;
   ~Transaction();                      // rolls back if still open
 };
 auto Database::begin(TransactionOptions = {}) -> Transaction;
@@ -75,14 +81,28 @@ auto Database::begin(TransactionOptions = {}) -> Transaction;
   non-transaction-control statement in the transaction" (PostgreSQL 17
   documentation, *Transaction Isolation*). An idle handle then pins
   nothing. The catalog version is pinned with it (see *DDL*).
-- **`commit()` returns or throws.** A transaction with no writes and no
-  guards commits nothing and returns.
-- **After a failed statement the transaction is aborted,** as in
-  PostgreSQL: every later `execute()` and `commit()` is refused with SQLSTATE
-  25P02 ("current transaction is aborted, commands ignored until end of
-  transaction block"), and only `rollback()` is accepted.
+- **`commit()` returns its outcome or throws.** It returns `Committed`, or
+  `RolledBack` for an aborted transaction, as PostgreSQL's command tag
+  reports COMMIT or ROLLBACK, so a caller never takes a rollback for a
+  commit. A transaction with no writes and no guards commits nothing and
+  returns `Committed`.
+- **After a failed statement the transaction is aborted,** and lets go at
+  once of its snapshot, its pinned catalog and its writes: an aborted handle
+  holds back no vacuum, and keeps only its state. As in PostgreSQL: every later `execute()` is refused with SQLSTATE 25P02
+  ("current transaction is aborted, commands ignored until end of
+  transaction block"), and `commit()` rolls it back without an error, as
+  PostgreSQL's COMMIT does (owner's decision, 2026-10-20).
 - **After `commit()`, `rollback()` or a serialization failure,** the handle
-  is closed; any further call throws.
+  is closed; any further call throws. So does a moved-from handle.
+- **Threads.** Handles run on different threads at once, alongside
+  prepares and autocommit statements. No statement, commit or prepare waits
+  on another's engine I/O: the only lock any call holds across I/O is
+  shared, and only `close()` takes it exclusively, to wait for the calls in
+  flight. A DDL that finds another in progress fails at once (*DDL*), and a
+  statement's pin may wait only for the instant a DDL publishes. A
+  compiled plan is never changed while a statement runs it; a recompile
+  swaps in a new one. `close()` ends every open handle, and a handle may
+  outlive its `Database`: it then touches nothing of it.
 
 **Later:**
 - `BEGIN` / `COMMIT` / `ROLLBACK` as SQL text. The MVP has the handle
@@ -118,14 +138,15 @@ answer is:
 | Call | Through the view |
 |---|---|
 | `bc_get`, `bc_exists` | The point entry, else the range tombstone, else the snapshot. |
-| `bc_scan_open` / `bc_scan_next`, forward and reverse, tables and indexes | A two-pointer merge of the snapshot cursor and the overlay, in the scan's direction. On a tie the overlay wins and a tombstone hides the snapshot's key. Snapshot keys inside a range tombstone are skipped. `MariaDBTxn::MergeIterator`'s algorithm, with ranges added. |
+| `bc_scan_open` / `bc_scan_next`, forward and reverse, tables and indexes | A two-pointer merge of the snapshot cursor and the overlay, in the scan's direction and inside the scan's bounds. On a tie the overlay wins and a tombstone hides the snapshot's key. Snapshot keys inside a range tombstone are passed over by one seek past the range, so a scan after `DELETE FROM t` costs what the rows left cost, not what was deleted. `MariaDBTxn::MergeIterator`'s algorithm, with ranges added. `bc_del_range`'s walk of its rows and the unique checks read the same way. |
 | `bc_scan_row` on an index | The row is fetched through the view, so an index entry an earlier statement wrote finds the row it wrote. |
 | `bc_count_range` | The snapshot's `count_keys`, then corrected: one for each overlay point entry in range whose presence differs from the snapshot's, and minus `count_keys` over each range tombstone's part of the range. Still bounded, at two record reads plus one existence check per overlay entry in range, all charged. |
 | Unique checks in `bc_insert` and `bc_update` | Against the view: a key or prefix an earlier statement freed is free, and one it took is taken. The range guard over the prefix stays, for concurrent transactions. |
 
 - **Budget.** A read the overlay answers is charged as if it had read a
   record, so a plan's budget doesn't depend on what the transaction has
-  buffered.
+  buffered. Every record read is charged, the one that finds the end of a
+  range too, and nothing past a read's bounds is read.
 - **Lifetime.** The overlay lives in the transaction, outside the context's
   arena, which is still reset after every statement.
 - **Errors propagate. No read error is ever taken as "absent".** An I/O,
@@ -165,11 +186,11 @@ cross-statement refusal that `docs/plan_api_design.md` describes is removed.
 
 **A failed statement aborts the transaction, as in PostgreSQL.** A
 statement that fails — a constraint, the budget, `BC_E_LIMIT`, a read error
-— discards its pending effects, so the overlay and the log are untouched:
-each statement is its own savepoint. Then the handle refuses everything but
-`rollback()`. Every later `execute()` and `commit()` is SQLSTATE 25P02
-until it. The statement's own error is what `execute()` raises; 25P02 is
-for the calls after it.
+— discards its pending effects, so the overlay and the guards are untouched:
+each statement is its own savepoint. Then every later `execute()` is
+SQLSTATE 25P02 until the transaction ends: `rollback()`, or `commit()`,
+which rolls back and returns `RolledBack`. The statement's own error is
+what `execute()` raises; 25P02 is for the statements after it.
 
 User `SAVEPOINT` / `ROLLBACK TO` are **later**: TPROC-C doesn't use them.
 When they come they are a mark in the log plus a copy of the overlay's
@@ -177,15 +198,14 @@ state at the mark, as `MariaDBTxn` keeps them; nothing here blocks that.
 
 ## Commit and conflicts — MVP
 
-**Mechanism: commit replays the log into one `WritePlan` built on the
-transaction's snapshot.** The log holds every put, delete, range delete and
-guard, in the order the statements made them. The engine applies a plan's
-operations in order (engine `CONTRACT.md`, *Ordered*), so a range delete
-followed by a put inside it keeps the put. The commit also adds the
-catalog-record guard of every table the transaction wrote, as
-`bc_ctx_commit` does today. Emitting each key's final state instead is an
-optimisation behind the same commit, with nothing visible changed, taken
-only if a benchmark shows the log's cost.
+**Mechanism: commit builds one `WritePlan` on the transaction's snapshot
+from the overlay.** The overlay's range tombstones go first, then each
+key's final state, then the statements' guards. The engine applies a
+plan's operations in order (engine `CONTRACT.md`, *Ordered*), and every
+point entry is newer than any range over it, so a range delete followed by
+a put inside it keeps the put. The writes are held once, in the overlay:
+there is no separate log. The commit also adds the catalog-record guard of
+every table the transaction wrote, as `bc_ctx_commit` does.
 
 The engine checks every written key against the snapshot, so the whole
 transaction is first-committer-wins. A row read and then written, in any
@@ -197,6 +217,13 @@ statements, needs no guard.
 | Conflict on a key the transaction inserted, now taken (below) | The retry's own unique check reports it: `ExecError`, `BC_C_UNIQUE`, **23505** | `ExecError`, `BC_C_UNIQUE`, SQLSTATE **23505**. Nothing written; the handle is closed. |
 | Any other conflict | Retried on a fresh snapshot, up to three times, as today; then `ExecError` with `conflict()` | `SerializationFailure`, SQLSTATE **40001**. Nothing written; the handle is closed. The caller reruns the transaction. The layer never retries it: it can't rerun the caller's logic. |
 | Constraint or other error in a statement | `ExecError`, never retried | Raised by `execute()` for the failing statement; the transaction is then aborted (25P02) |
+| The commit failed and degraded the engine: its batch may have reached the data file | `TransactionResolutionUnknown`, SQLSTATE **08007**, never retried | The same, and the handle is closed. Never "nothing written": a reopen finds the writes whole or not at all. |
+
+A DDL statement's commit follows the same rule. The rule is decided by
+whether the engine was degraded before the commit and is after: another
+writer's failure in between makes a commit that wrote nothing report 08007,
+the safe direction. Reporting it exactly needs the engine to say whether
+this batch was appended (#531).
 
 Conflicts are detected only at commit. A statement never waits and never
 fails because another transaction holds a row (see *Known differences*).
@@ -257,7 +284,7 @@ before its cleanup.
 - **Snapshot isolation by default.** One snapshot per transaction. Writes
   are checked by the engine, and no guard is emitted for reads.
 - **`SELECT … FOR UPDATE`** emits `bc_guard_unchanged` on every row key it
-  returns, entered in the log like any effect. The commit fails if one of
+  returns, kept with the transaction's guards. The commit fails if one of
   those rows changed since the snapshot. This is how TPROC-C's
   read-then-decide steps avoid write skew where they need to. A row the
   transaction also writes is already covered, and the extra guard is
@@ -290,7 +317,15 @@ wrote a table the DDL changed.
   against a newer catalog, naming a column the pin lacks) fails with 40001
   and closes the transaction, rather than recompiling against a catalog
   older than the cache. This is rare and loses nothing a retry wouldn't
-  recover.
+  recover. On the transaction's first statement, which has read nothing
+  yet, a DDL that raced the pin is not a failure: the transaction is
+  pinned again, to the live catalog and a new snapshot, as PostgreSQL takes
+  the snapshot when the first statement starts.
+- **A DDL never waits for another DDL either.** One that finds another DDL
+  of its catalog in progress fails at once, writing nothing, with 40001,
+  and may be retried. The one wait left is a statement's pin: it waits for
+  the instant between a DDL's batch reaching the engine and the new catalog
+  taking effect, never while the DDL writes or syncs.
 - A DDL statement given to `Transaction::execute` is refused (SQLSTATE
   0A000) in the MVP. DDL stays its own atomic operation. Transactional DDL
   is later.
@@ -300,14 +335,19 @@ differences*.
 
 ## Limits — MVP
 
-- **Buffer size.** A transaction's log and overlay are bounded by
-  `TransactionOptions::max_bytes`, default 64 MiB, well below the engine's
-  1 GiB plan limit. A statement that would take the transaction past it
-  fails with `BC_E_LIMIT` (SQLSTATE 54000). Its effects are discarded by
-  the statement savepoint, and the transaction is aborted like any failed
-  statement's. The bound counts
-  key and value bytes plus a fixed cost per entry, so a transaction of
-  small writes can't exhaust memory through overhead.
+- **Buffer size.** What a transaction holds, its overlay and its guards,
+  is bounded by `TransactionOptions::max_bytes`, default 64 MiB, well below
+  the engine's 1 GiB plan limit. The bound is checked before a statement's
+  writes are taken in, from the statement's own pending effects: one that
+  would take the transaction past it fails with `BC_E_LIMIT` (SQLSTATE
+  54000) without the transaction allocating for it, the transaction is
+  aborted like any failed statement's, and what it held is freed with the
+  abort.
+  The count is a conservative bound, never less than the memory held: each
+  buffer's capacity plus an allocator overhead, each map node's full size,
+  and the guards' and written tables' vectors at the size they could grow
+  to. So a transaction of small writes can't exhaust memory through
+  overhead.
 - **Memory.** The overlay allocates from the heap. A failed allocation is
   `BC_E_MEMORY` for the statement, never an abort and never an exception
   into a plan (`CONTRACT.md`, *Plan safety*). An allocation-failure sweep
@@ -329,11 +369,25 @@ differences*.
   *Model* section's "a pure function of its parameters and one snapshot"
   becomes "… and the transaction's view".
 - **Runtime calls, called by the embedded API and never by a plan:**
-  - a transaction object holding the snapshot, the pinned catalog, the log
-    and the overlay;
+  - a transaction object holding the snapshot, the pinned catalog, the
+    overlay and the guards;
   - `bc_ctx_begin` given a transaction instead of taking its own snapshot;
   - `bc_ctx_commit` split into appending a statement's effects to the
     transaction and committing the transaction.
+  - `bc_txn_commit(bc_txn*, sync)` takes no context and reports through
+    the transaction (`bc_txn_error`); an abort and a free detach the
+    context, keeping its finished statement's results readable.
+
+  These calls are internal: the embedded API's `Transaction` is their only
+  caller, and it keeps their protocol by construction. One context per
+  transaction; each statement is `bc_ctx_begin_txn`, `bc_ctx_run`,
+  `bc_txn_add`, then `bc_ctx_reset`, except that a statement refused with
+  `BC_L_INCOMPATIBLE` before it ran may be reset and begun again; after
+  any other failed statement the transaction is only freed; and one
+  `bc_txn_commit`, with no statement open. The runtime does not defend
+  against use out of this order, and the contract does not cover it. The
+  checks it does make (a second context or a commit with a statement open
+  refused as `BC_E_HANDLE`) are a debugging aid, not a guarantee.
 
   Their exact C names are settled in the implementation PR, with
   `bc_plan.h`'s runtime section. `bc_execute` keeps its signature for
@@ -360,8 +414,8 @@ for their shape.
   - a statement doesn't see its own writes;
   - a later statement updates and deletes a row an earlier one wrote, and
     every index stays exact;
-  - a failed statement writes nothing, and every later `execute()` and
-    `commit()` is 25P02 until `rollback()`;
+  - a failed statement writes nothing, every later `execute()` is 25P02,
+    and `commit()` rolls back;
   - the snapshot is taken at the first statement, not at `begin()`.
 - **Commit:**
   - first-committer-wins across transactions (lost-update, delete against
@@ -394,7 +448,7 @@ PR.
 |---|---|
 | A transaction from `Database::begin()` commits all its statements' writes atomically, or none: `commit()` returns, or throws having written nothing. Rollback, and destroying an open handle, write nothing. | to add |
 | A statement in a transaction reads the snapshot taken at the start of the transaction's first statement, not at `begin()`, plus the writes of its earlier statements, never its own: point reads, existence, counts, scans in both directions over tables and indexes, and the unique checks. | to add |
-| A statement that fails inside a transaction writes nothing, and aborts the transaction: every later `execute()` and `commit()` is SQLSTATE 25P02 until `rollback()`. | to add |
+| A statement that fails inside a transaction writes nothing, and aborts the transaction: every later `execute()` is SQLSTATE 25P02, and `commit()` rolls back. | to add |
 | A later statement may update or delete a row an earlier statement wrote; every index stays exact. | to add |
 | A transaction that conflicts at commit with a concurrent commit (a written key changed since its snapshot, a `FOR UPDATE` row changed, a written table's DDL) is a serialization failure, SQLSTATE 40001, with nothing written. The layer does not retry it. | to add |
 | A commit that conflicts because a key it inserted (a primary key, or a unique index value) was taken by a concurrent commit is `BC_C_UNIQUE`, SQLSTATE 23505, naming the table or index, with nothing written; an autocommit statement reports the same for the same race. | to add |
@@ -433,7 +487,7 @@ Each comes from the rule *never wait*.
 | `BEGIN` / `COMMIT` text (with the server) | The handle is what it opens; the text is the server's spelling of `begin()`. |
 | Token transactions across requests (#494) | The handle is the token's in-process half; a token names a handle held with a TTL. |
 | Procedures retried in the runtime (#495) | A procedure is a transaction whose statements are all the runtime's, so its retry is a loop around `begin` … `commit`. |
-| Serializable and read committed | Guards are emitted per isolation level by the compiler, and the log already carries guards. |
+| Serializable and read committed | Guards are emitted per isolation level by the compiler, and the transaction already keeps guards. |
 | User `SAVEPOINT` / `ROLLBACK TO` | A log mark and an overlay copy, as statement rollback already is. |
 | Sequences and auto-increment | A runtime service at commit, outside the plan (`docs/plan_api_design.md`, *Deferred*). TPROC-C's ids come from rows it reads and updates. |
 | Deadlines turned into budgets | The budget is per statement already; a transaction deadline divides into it. |

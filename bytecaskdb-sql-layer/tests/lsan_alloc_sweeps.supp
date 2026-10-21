@@ -1,0 +1,6 @@
+# LeakSanitizer suppressions for the allocation-failure sweeps only (the
+# [alloc] tests of sql_layer_tests, run apart: docs/testing_design.md,
+# *Sanitizers*). The engine's key directory leaks a node a failed allocation
+# leaves unplaced rather than free it while still reachable (#390). Every
+# other test runs with no suppression.
+leak:btree_detail::NodePool
