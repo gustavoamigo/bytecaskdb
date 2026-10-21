@@ -120,5 +120,27 @@ class LostByPromotionTest(unittest.TestCase):
         self.assertEqual(history[13]["type"], "ok")
 
 
+
+def sql_history(final: list[int]) -> list[dict]:
+    """Two appends to key 1 committed in the order 20, then 10, as a history
+    through SQL records them: with no commit sequence. Then a final read."""
+    ops = []
+    for i, e in enumerate((20, 10)):
+        ops += [{"index": 2 * i, "process": i, "type": "invoke", "value": [["append", 1, e]]},
+                {"index": 2 * i + 1, "process": i, "type": "ok", "value": [["append", 1, e]]}]
+    ops += [{"index": 4, "process": 9, "type": "invoke", "value": [["r", 1, None]]},
+            {"index": 5, "process": 9, "type": "ok", "value": [["r", 1, final]]}]
+    return ops
+
+
+class NoSequenceTest(unittest.TestCase):
+    def test_commit_order_is_not_inferred_from_elements(self):
+        self.assertEqual(ric.cross_check(sql_history([20, 10])), [])
+
+    def test_a_missing_append_is_still_found(self):
+        problems = ric.cross_check(sql_history([20]))
+        self.assertTrue(any("missing from final read" in p for p in problems), problems)
+
+
 if __name__ == "__main__":
     unittest.main()

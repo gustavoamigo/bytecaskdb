@@ -126,7 +126,9 @@ def cross_check(history: list[dict]) -> list[str]:
             invoked.update(m[2] for m in appends)
             invoke_index[op["process"]] = op["index"]
         elif op["type"] == "ok":
-            seq = op.get("sequence", 0)
+            # None for a history through SQL, whose commit reports no
+            # sequence: the commit-order rule below skips it.
+            seq = op.get("sequence")
             for pos, m in enumerate(appends):
                 ok_appends[m[1]].append((seq, pos, m[2]))
                 acked[m[1]].append((op["index"], m[2]))
@@ -154,13 +156,13 @@ def cross_check(history: list[dict]) -> list[str]:
                 problems.append(f"key {key}: element {e} of a failed txn read")
             elif e not in invoked:
                 problems.append(f"key {key}: element {e} was never appended")
-        committed = sorted(ok_appends[key])
+        committed = sorted(ok_appends[key], key=lambda a: (a[0] or 0, a[1], a[2]))
         missing = [e for _, _, e in committed if e not in where]
         if missing:
             problems.append(
                 f"key {key}: committed appends {missing[:8]} missing from "
                 f"final read ({len(missing)} total)")
-        present = [e for _, _, e in committed if e in where]
+        present = [e for seq, _, e in committed if e in where and seq is not None]
         positions = [where[e] for e in present]
         if positions != sorted(positions):
             problems.append(

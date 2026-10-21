@@ -167,15 +167,17 @@ statements it sends and the `h_id` scheme are `frontend_design.md`'s
 (*Where the statements come from*, *The statements*), and are not
 repeated here.
 
-**One binary, two modes.** `bench/tpcc.cpp`, xmake target `sql_layer_tpcc`
-(not built by default, as `sql_layer_bench`). `sql_layer_tpcc load`,
-`sql_layer_tpcc run` and `sql_layer_tpcc elle`. The loader, the
-transactions and the checks are one module, `bytecask.sql.tpcc`, which
-the smoke test in `sql_layer_tests` uses too. Everything goes through the
+**One binary, three commands.** `harness/main.cpp`, xmake target
+`sql_layer_tpcc` (not built by default, as `sql_layer_bench`):
+`sql_layer_tpcc load`, `sql_layer_tpcc run` and `sql_layer_tpcc elle`. The
+loader, the transactions and the checks are one module,
+`bytecask.sql.tpcc` (`harness/tpcc.cppm`), which the smoke test in
+`sql_layer_tests` uses too. Run it from a `releasedbg` build: a debug
+engine walks every key-directory entry on each commit it publishes, so at
+TPC-C's scale a commit takes hundreds of milliseconds. Everything goes through the
 embedded API (`Database`, `Transaction`, `Statement`), in the harness's
 own process. It links the testing build of the layer, as `bytecask_sql`
-does, for the two reads the API keeps there: `Database::table_rows` for
-the consistency check and the engine's `stats()`. Every statement is prepared once, before the threads start,
+does, for the engine's `stats()`, which the embedded API keeps there. Every statement is prepared once, before the threads start,
 and shared by them.
 
 **The loader.**
@@ -188,8 +190,13 @@ and shared by them.
   says.
 - One prepared `INSERT` per table, many rows per `Transaction`: as many as
   fit well inside its 64 MiB bound.
-- The loader inserts `harness_run`'s row `(1, 0)` and uses run 0 for its
-  `h_id`s.
+- The loader creates `harness_run`, inserts its row `(1, 0)` and uses run
+  0 for its `h_id`s. A run bumps it with `last_run = last_run + $1`, `$1`
+  being 1, until integer literals arrive with New-Order (slice 3).
+- `w_ytd` and `d_ytd` start at what the history rows sum to: 300,000.00
+  and 30,000.00 at the specification's scale, as clause 4.3.3.1 says, and
+  proportionally less at a smaller one, so the consistency conditions hold
+  at any scale.
 - The cardinalities are parameters with the specification's values as
   defaults. Only the smoke test shrinks them.
 
@@ -241,7 +248,8 @@ numbers the harness produces; there are no micro-benchmarks.
 
 **Consistency after a run.** After the last phase, the harness checks
 TPC-C's consistency conditions (clause 3.3.2) for the transactions in the
-mix, reading every table through `Database::table_rows`:
+mix, through SQL: `warehouse` and `district` by a key range, and `history`
+in pages of 10,000 rows in `h_id` order, so no run holds it all:
 - with Payment: condition 1 (`w_ytd` is the sum of its districts'
   `d_ytd`), and conditions 8 and 9 (`w_ytd` and `d_ytd` are each the sum of
   their `history` rows' `h_amount`);
@@ -275,14 +283,16 @@ and `scripts/sql_isolation_check.py` checks it with the engine's tooling:
   least once over the run.
 - `blind`: every statement in autocommit, with no `Transaction`. It must
   be invalid, which shows the check can see a lost update.
-- A completed `commit()` is `:ok`. A `SerializationFailure` is `:fail`.
-  `TransactionResolutionUnknown` is `:info`. An error in a statement
-  aborts the transaction, which is `:fail`.
+- A completed `commit()` is `:ok`, a `SerializationFailure` `:fail`, and
+  `TransactionResolutionUnknown` `:info`. In `blind`, a statement that
+  conflicted on every retry is `:info`: the statements before it committed.
+  Any other error stops the run.
 - **The one difference from the engine's check:** `commit()` returns no
   commit sequence, so the cross-check's rule that a key's final list
-  follows commit-sequence order cannot apply. Every other rule does:
-  reads are prefixes, nothing failed is visible, every `:ok` append is
-  there, and real-time visibility.
+  follows commit-sequence order cannot apply: `cross_check` skips an
+  operation with no `sequence` there (owner decision, 2026-10-21). Every
+  other rule does apply: reads are prefixes, nothing failed is visible,
+  every `:ok` append is there, and real-time visibility.
 
 Commands:
 
@@ -291,7 +301,7 @@ xmake f -m releasedbg --sql_layer=y && xmake build sql_layer_tpcc
 sql_layer_tpcc load --dir /tmp/tpcc --warehouses 48
 sql_layer_tpcc run --dir /tmp/tpcc --threads 1,16,48 --duration 300 --warmup 60
 python3 bytecaskdb-sql-layer/scripts/sql_isolation_check.py \
-  --binary build/linux/x86_64/releasedbg/sql_layer_tpcc --elle-jar elle-cli.jar
+  --binary build/linux/x86_64/releasedbg/sql_layer_tpcc --elle-jar elle-cli.jar --rounds 4
 ```
 
 ## Known differences
