@@ -11,9 +11,11 @@
 // indexes (docs/plan_api_design.md, *Decisions, not mechanics*).
 
 module;
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -115,13 +117,16 @@ public:
   // Constant names (Catalog::constants: from ids, never from SQL names),
   // recorded as used; a column's constants record the column for the plan's
   // bc_schema_ref.
-  auto tbl() -> std::string { return use(Catalog::table_constant(p_.table)); }
-  auto idx(std::uint32_t id) -> std::string { return use(Catalog::index_constant(id)); }
+  auto tbl() -> std::string { return use("TBL_" + std::to_string(p_.table)); }
+  auto idx(std::uint32_t id) -> std::string { return use("IDX_" + std::to_string(id)); }
   auto col(const ir::Column& c) -> std::string {
     cols_.emplace(c.id, c.type);
-    return use(Catalog::column_constant(p_.table, c.id));
+    return use("COL_" + std::to_string(p_.table) + "_" + std::to_string(c.id));
   }
-  auto part(std::uint32_t index, const ir::Column& c) -> std::string { return use(Catalog::part_constant(index, c.id)); }
+  // The position of a column in an index's key, for the key-part decoders.
+  auto part(std::uint32_t index, const ir::Column& c) -> std::string {
+    return use("PART_" + std::to_string(index) + "_" + std::to_string(c.id));
+  }
   // A table or index the plan reads.
   void reads(std::uint32_t id) { reads_.insert(id); }
   [[nodiscard]] auto objects_read() const -> std::vector<std::uint32_t> { return {reads_.begin(), reads_.end()}; }
@@ -159,8 +164,12 @@ public:
   [[nodiscard]] auto p() const -> const ir::Plan& { return p_; }
 
 private:
-  // ir::check has checked that the table has every name used.
+  // A name the plan's constants lack would fail at TinyCC: a compiler bug,
+  // refused here instead.
   auto use(std::string name) -> std::string {
+    if (std::ranges::none_of(p_.constants, [&](const auto& c) { return c.name == name; })) {
+      throw std::logic_error{"statement IR: a constant the table does not have: " + name};
+    }
     used_.insert(name);
     return name;
   }

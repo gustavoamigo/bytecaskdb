@@ -308,15 +308,6 @@ public:
     std::string object;
   };
   [[nodiscard]] static auto constants(const Table& t) -> std::vector<PlanConstant>;
-  // The names constants() gives; the code generator prints them.
-  [[nodiscard]] static auto table_constant(std::uint32_t table) -> std::string { return "TBL_" + std::to_string(table); }
-  [[nodiscard]] static auto index_constant(std::uint32_t index) -> std::string { return "IDX_" + std::to_string(index); }
-  [[nodiscard]] static auto column_constant(std::uint32_t table, std::uint32_t col) -> std::string {
-    return "COL_" + std::to_string(table) + "_" + std::to_string(col);
-  }
-  [[nodiscard]] static auto part_constant(std::uint32_t key, std::uint32_t col) -> std::string {
-    return "PART_" + std::to_string(key) + "_" + std::to_string(col);
-  }
 
   // One operation of a DDL's batch, collected while the snapshot is read and
   // handed to a WritePlan on that snapshot afterwards.
@@ -1273,9 +1264,10 @@ auto Catalog::key_layout(std::uint32_t id) const -> const KeyLayout* {
 
 auto Catalog::constants(const Table& t) -> std::vector<PlanConstant> {
   std::vector<PlanConstant> out;
-  out.push_back({table_constant(t.id), t.id, t.name});
-  for (const auto& ix : t.indexes) out.push_back({index_constant(ix.id), ix.id, ix.name});
-  for (const auto& c : t.columns) out.push_back({column_constant(t.id, c.id), c.id, t.name + "." + c.name});
+  auto id = [](std::uint32_t v) { return std::to_string(v); };
+  out.push_back({"TBL_" + id(t.id), t.id, t.name});
+  for (const auto& ix : t.indexes) out.push_back({"IDX_" + id(ix.id), ix.id, ix.name});
+  for (const auto& c : t.columns) out.push_back({"COL_" + id(t.id) + "_" + id(c.id), c.id, t.name + "." + c.name});
   // Key parts by position: a table's primary key, then each index's parts
   // and the primary key after them. A column an index names and its primary
   // key suffix repeats keeps its first position.
@@ -1284,7 +1276,7 @@ auto Catalog::constants(const Table& t) -> std::vector<PlanConstant> {
     for (std::size_t i = 0; i < cols.size(); ++i) {
       if (std::ranges::find(seen, cols[i]) != seen.end()) continue;
       seen.push_back(cols[i]);
-      out.push_back({part_constant(key_id, cols[i]), static_cast<std::uint32_t>(i),
+      out.push_back({"PART_" + id(key_id) + "_" + id(cols[i]), static_cast<std::uint32_t>(i),
                      key_name + "." + t.column(cols[i])->name});
     }
   };

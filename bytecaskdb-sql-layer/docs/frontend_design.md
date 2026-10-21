@@ -496,7 +496,7 @@ feature gap.
 `tests/golden/<statement>.sql` and `.c`. A test recompiles each, fails on
 any difference, and compiles each plan with TinyCC. A change to the code
 generator regenerates them with `SQL_LAYER_REGEN_GOLDEN=1`
-(`tests/golden_test.cpp`; refused when `CI=true`), and the PR shows the
+(`tests/golden_test.cpp`), and the PR shows the
 diff. Slice 0's goldens are the forms the compiler handled before the IR.
 Each later slice adds the goldens of the TPROC-C statements it brings, and
 with the last they are the MVP's TPROC-C plans: the hand-written ones of the

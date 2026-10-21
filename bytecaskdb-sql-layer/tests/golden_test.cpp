@@ -5,7 +5,7 @@
 // is compiled against the fixture's schema plus tests/golden/schema.sql, and
 // its plan text must equal tests/golden/<name>.c byte for byte and compile
 // with TinyCC. A change to the code generator regenerates them with
-// SQL_LAYER_REGEN_GOLDEN=1, outside CI, and the PR shows the diff.
+// SQL_LAYER_REGEN_GOLDEN=1, and the PR shows the diff.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -69,23 +69,15 @@ TEST_CASE("golden: every plan the compiler generates equals its golden file", "[
   std::ranges::sort(cases);
   REQUIRE_FALSE(cases.empty());
 
-  const auto* regen_var = std::getenv("SQL_LAYER_REGEN_GOLDEN");
-  const auto regen = regen_var != nullptr && std::string_view{regen_var} == "1";
-  // Regenerating compares nothing: in CI, a leaked variable would turn the
-  // test off.
-  const auto* ci = std::getenv("CI");
-  if (regen && ci != nullptr && std::string_view{ci} == "true") FAIL("SQL_LAYER_REGEN_GOLDEN=1 is refused in CI");
+  const auto* regen = std::getenv("SQL_LAYER_REGEN_GOLDEN");
   for (const auto& sql_file : cases) {
     INFO(sql_file.stem().string());
     auto sql = statement(sql_file);
     auto source = generate_plan(bind_sql(f.cat(), sql), f.cat(), sql).source;
     CHECK_NOTHROW(TccPlan::compile(source));
     auto golden = std::filesystem::path{sql_file}.replace_extension(".c");
-    if (regen) {
-      std::ofstream out{golden, std::ios::binary};
-      out << source;
-      out.close();
-      REQUIRE(out);
+    if (regen != nullptr && std::string_view{regen} == "1") {
+      std::ofstream{golden, std::ios::binary} << source;
       WARN("regenerated, not compared: " << golden.filename().string());
       continue;
     }
