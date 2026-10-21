@@ -124,16 +124,26 @@ public:
   ~DdlInProgress() override;  // out of line: anchors the vtable (-Wweak-vtables)
 };
 
-// A DDL whose commit failed and left the engine degraded, after its batch
+// A commit whose batch failed and left the engine degraded, after the batch
 // may have reached the data file: whether it took effect is unknown, never
 // "nothing written". SQLSTATE 08007 at the API.
-class DdlOutcomeUnknown : public std::runtime_error {
+class CommitOutcomeUnknown : public std::runtime_error {
 public:
-  explicit DdlOutcomeUnknown(const char* what) : std::runtime_error{what} {}
-  DdlOutcomeUnknown(const DdlOutcomeUnknown&) = default;
-  DdlOutcomeUnknown& operator=(const DdlOutcomeUnknown&) = default;
-  ~DdlOutcomeUnknown() override;  // out of line: anchors the vtable (-Wweak-vtables)
+  explicit CommitOutcomeUnknown(const char* what) : std::runtime_error{what} {}
+  CommitOutcomeUnknown(const CommitOutcomeUnknown&) = default;
+  CommitOutcomeUnknown& operator=(const CommitOutcomeUnknown&) = default;
+  ~CommitOutcomeUnknown() override;  // out of line: anchors the vtable (-Wweak-vtables)
 };
+
+// Every commit of the layer, DDL, autocommit and transactions alike, goes
+// through this one rule: the batch is applied, and a failure after which the
+// engine is degraded, when it was not before, may have come after the batch
+// reached the data file, so it is thrown as CommitOutcomeUnknown (its
+// message dropped, never the outcome, if it cannot be allocated). Any other
+// failure is rethrown as it is, having written nothing. Another writer's
+// failure in between also reads as unknown: the safe direction; exact
+// reporting needs the engine to say whether this batch was appended (#531).
+[[nodiscard]] auto apply_batch_or_unknown(DB& db, WriteOptions opts, WritePlan plan) -> std::optional<CommitResult>;
 
 // A value of one of the four physical types, or SQL NULL (monostate). The
 // runtime's bc_value is this type.
@@ -404,9 +414,9 @@ public:
   // Commits and publishes. False, with nothing written, on a conflict: a
   // DDL or a write to a backfilled table committed since the prepare.
   // Throws DdlInProgress, having done nothing, if another DDL of this
-  // catalog is in progress: a DDL never waits for another; DdlOutcomeUnknown
-  // if the batch failed and left the engine degraded, when it may have
-  // reached the data file (the next pin catches up with whatever it holds).
+  // catalog is in progress: a DDL never waits for another;
+  // CommitOutcomeUnknown as apply_batch_or_unknown throws it (the next pin
+  // catches up with whatever the data file holds).
   [[nodiscard]] auto commit(Prepared p) -> bool;
   // prepare and commit, retried on a conflict kDdlAttempts times in all.
   // Returns the version it published; throws as prepare does, DdlInProgress
@@ -725,7 +735,23 @@ void check_column_spec(const ColumnSpec& c) {
 
 DdlRefused::~DdlRefused() = default;
 DdlInProgress::~DdlInProgress() = default;
-DdlOutcomeUnknown::~DdlOutcomeUnknown() = default;
+CommitOutcomeUnknown::~CommitOutcomeUnknown() = default;
+
+auto apply_batch_or_unknown(DB& db, WriteOptions opts, WritePlan plan) -> std::optional<CommitResult> {
+  auto was_degraded = db.is_degraded();
+  try {
+    return db.apply_batch(opts, std::move(plan));
+  } catch (...) {
+    if (was_degraded || !db.is_degraded()) throw;
+    std::optional<CommitOutcomeUnknown> e;
+    try {
+      e.emplace("the commit's outcome is unknown: it failed after its batch may have reached the data file");
+    } catch (const std::bad_alloc&) {
+      e.emplace("");
+    }
+    throw CommitOutcomeUnknown{*e};
+  }
+}
 ConstraintViolation::~ConstraintViolation() = default;
 
 auto ConstraintDetail::name() const -> std::string_view {
@@ -1591,9 +1617,8 @@ auto LiveCatalog::commit_locked(Prepared p) -> bool {
     gen_.fetch_add(1);
     gen_.notify_all();
   };
-  auto was_degraded = db_.is_degraded();
   try {
-    auto r = db_.apply_batch({.sync = true}, std::move(*p.plan));
+    auto r = apply_batch_or_unknown(db_, {.sync = true}, std::move(*p.plan));
     if (r) current_.store(std::move(p.next));
     done();
     return r.has_value();
@@ -1604,16 +1629,6 @@ auto LiveCatalog::commit_locked(Prepared p) -> bool {
                             e.what());
   } catch (...) {
     done();
-    if (!was_degraded && db_.is_degraded()) {
-      // A message that cannot be allocated is dropped, never the outcome.
-      std::optional<DdlOutcomeUnknown> e;
-      try {
-        e.emplace("the DDL's outcome is unknown: its commit failed after its batch may have reached the data file");
-      } catch (const std::bad_alloc&) {
-        e.emplace("");
-      }
-      throw DdlOutcomeUnknown{*e};
-    }
     throw;
   }
 }

@@ -137,19 +137,26 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
 /* Transactions (docs/transaction_design.md). A transaction's statements each
    run in a context, begun with bc_ctx_begin_txn and ended with bc_txn_add:
    they read its snapshot, pinned at the first statement with its catalog
-   version, through the overlay of the earlier statements' writes. A statement
-   that fails, or that takes what the transaction holds past max_bytes
-   (BC_E_LIMIT), aborts the transaction, which is then only freed.
-   bc_txn_commit submits the statements' writes as one batch; its errors
-   are the context's. */
+   version, through the overlay of the earlier statements' writes. One
+   context at a time: from bc_ctx_begin_txn until it is reset, a context is
+   attached to the transaction, and bc_ctx_begin_txn on another context is
+   BC_E_HANDLE. A statement that fails, or that takes what the transaction
+   holds past max_bytes (BC_E_LIMIT), aborts the transaction: it releases its
+   snapshot and pin at once (bc_txn_catalog_version is then 0) and is then
+   only freed. bc_txn_commit submits the statements' writes as one batch; its
+   errors are the context's, BC_E_UNKNOWN when the outcome is unknown.
+   Commit, abort and bc_txn_free detach the attached context, which reads
+   nothing of the transaction after and keeps its error. */
 typedef struct bc_txn bc_txn;
 bc_txn *bc_txn_new(bc_db *db, const bc_catalog *cat, uint64_t max_bytes);
 void    bc_txn_free(bc_txn *);                                                /* a transaction not committed writes nothing */
 void    bc_ctx_begin_txn(bc_ctx *, bc_txn *, const bc_params *params, bc_budget budget);
 bool    bc_txn_add(bc_ctx *);                     /* ends the statement: its writes join, or the transaction aborts */
-uint64_t bc_txn_catalog_version(const bc_txn *);  /* the catalog version pinned at the first statement; 0 before it */
-bool    bc_txn_repin(bc_txn *);                   /* before any statement was added: drops the pin, so the next
-                                                     statement pins the live catalog and a new snapshot */
+uint64_t bc_txn_catalog_version(const bc_txn *);  /* the catalog version pinned at the first statement; 0 before
+                                                     it and after an abort */
+bool    bc_txn_repin(bc_txn *);                   /* before any statement was added, with no context attached:
+                                                     drops the pin, so the next statement pins the live catalog
+                                                     and a new snapshot; false, changing nothing, otherwise */
 enum bc_commit_result bc_txn_commit(bc_ctx *, bc_txn *, bool sync);
 
 /* Parameters and results */

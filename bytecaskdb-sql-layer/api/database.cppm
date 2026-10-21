@@ -700,7 +700,7 @@ auto Database::execute(const Statement& stmt, const std::vector<Value>& params) 
       throw ExecError(e.what(), BC_E_CONSTRAINT, e.detail().encode());
     } catch (const DdlInProgress&) {
       throw_serialization_failure(kDdlInProgress);  // a DDL never waits for another
-    } catch (const DdlOutcomeUnknown& e) {
+    } catch (const CommitOutcomeUnknown& e) {
       throw_keeping_outcome(e.what(), [](const std::string& m) { return TransactionResolutionUnknown{m}; });
     }
     Rows out;
@@ -884,15 +884,14 @@ Transaction::Transaction(Database& db, TransactionOptions opts)
   h_->cx = bc_ctx_new(&db.bdb_, &db.bcat_, kArenaBytes);
   h_->txn = h_->cx == nullptr ? nullptr : bc_txn_new(&db.bdb_, &db.bcat_, opts.max_bytes);
   if (h_->txn == nullptr) {
-    bc_ctx_free(h_->cx);
+    h_->release();
     throw std::bad_alloc();
   }
   try {
     std::lock_guard<std::mutex> lock{life_->open_mu};
     life_->open.insert(h_.get());
   } catch (...) {
-    bc_txn_free(h_->txn);
-    bc_ctx_free(h_->cx);
+    h_->release();
     throw;
   }
   h_->state.store(TxnState::Open);

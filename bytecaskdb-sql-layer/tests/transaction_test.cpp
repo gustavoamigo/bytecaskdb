@@ -555,6 +555,57 @@ TEST_CASE("transactions: an aborted transaction lets go of its snapshot; a freed
   CHECK(autocommit(f, insert_w, {std::int64_t{2}, std::int64_t{2}, bytes("c"), std::int64_t{2}}) == BC_COMMITTED);
 }
 
+TEST_CASE("transactions: one context at a time; commit detaches it; a failed begin leaves nothing dangling",
+          "[sql][txn]") {
+  Fixture f;
+  create_w(f);
+  auto* other = bc_ctx_new(&f.bdb, &f.bcat, 1u << 20);
+  REQUIRE(other != nullptr);
+  {
+    TxnPtr txn{f};
+    auto none = params({});
+    bc_ctx_begin_txn(f.cx, txn.p, &none, {});
+    REQUIRE(bc_error(f.cx) == BC_OK);
+    // A second context is refused while the first is attached.
+    bc_ctx_begin_txn(other, txn.p, &none, {});
+    CHECK(bc_error(other) == BC_E_HANDLE);
+    bc_ctx_reset(other);
+    bc_ctx_reset(f.cx);
+    // Once the first is reset, another may run the transaction's statement.
+    REQUIRE(stmt(f, txn.p, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("a"), std::int64_t{1}}).error == BC_OK);
+    bc_ctx_begin_txn(other, txn.p, &none, {});
+    REQUIRE(bc_error(other) == BC_OK);
+    // The commit, on another context, detaches it: the snapshot it read moves
+    // into the batch, and the context reads nothing of it after.
+    CHECK(commit(f, txn.p) == BC_COMMITTED);
+    bc_ctx_reset(other);
+  }
+  // Every allocation of a begin failed in turn: the context is left attached
+  // or not, never half, and resetting it and freeing the transaction touch
+  // nothing freed.
+  if constexpr (bytecask::testing::kAllocFaultsAvailable) {
+    for (long nth = 1;; ++nth) {
+      REQUIRE(nth < 1000);
+      auto* txn = bc_txn_new(&f.bdb, &f.bcat, std::uint64_t{1} << 20);
+      REQUIRE(txn != nullptr);
+      auto none = params({});
+      auto fired = false;
+      {
+        bytecask::testing::ScopedAllocFaults faults{nth, false};
+        bc_ctx_begin_txn(other, txn, &none, {});
+        fired = faults.report().fired;
+      }
+      CHECK((bc_error(other) == BC_OK || bc_error(other) == BC_E_MEMORY));
+      if (bc_error(other) == BC_E_MEMORY) CHECK_FALSE(bc_txn_add(other));  // the failed begin aborts it
+      bc_ctx_reset(other);
+      bc_txn_free(txn);
+      if (!fired) break;
+    }
+  }
+  bc_ctx_free(other);
+  CHECK(stored(f).size() == 1);
+}
+
 TEST_CASE("transactions: a statement does not see its own writes; the next one does", "[sql][txn]") {
   Fixture f;
   create_w(f);

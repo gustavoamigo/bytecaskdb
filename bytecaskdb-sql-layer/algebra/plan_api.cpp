@@ -720,24 +720,32 @@ struct bc_txn {
   // an aborted transaction is never committed half-applied.
   bool aborted{false};
   bool done{false};  // committed, or its commit was attempted
-  // The contexts begun on it and not yet reset: they point into its
-  // snapshot and overlay. Re-pinning refuses while one is, and freeing it
-  // detaches them.
-  std::vector<bc_ctx*> attached;
+  // The one context begun on it and not yet reset, which points into its
+  // snapshot and overlay; null when none is. A second is refused.
+  // Re-pinning refuses while one is; commit, abort and free detach it.
+  bc_ctx* attached{nullptr};
 
   bc_txn(bytecask::DB* d, LiveCatalog* l, std::uint64_t max) : db{d}, live{l}, max_bytes{max} {}
 };
 
-void txn_detach(bc_txn* txn, bc_ctx* cx) noexcept { std::erase(txn->attached, cx); }
+void txn_detach(bc_txn* txn, bc_ctx* cx) noexcept {
+  if (txn->attached == cx) txn->attached = nullptr;
+}
 
 namespace {
+
+// Drops the attached context's statement, if one is: it reads nothing of
+// the transaction after. The context keeps its error.
+void txn_drop_context(bc_txn* txn) noexcept {
+  if (txn->attached != nullptr) txn->attached->drop_execution_state();
+}
 
 // Aborts the transaction: a failed statement leaves only bc_txn_free, so
 // what it holds goes now, the snapshot that holds vacuum back first. The
 // contexts begun on it are detached; each keeps its error.
 void txn_abort(bc_txn* txn) noexcept {
   txn->aborted = true;
-  while (!txn->attached.empty()) txn->attached.back()->drop_execution_state();
+  txn_drop_context(txn);
   txn->snap.reset();
   txn->pinned.reset();
   txn->overlay = {};
@@ -1123,17 +1131,24 @@ auto written_tables(const Catalog& cat, const std::vector<Effect>& effects) -> s
   return out;
 }
 
-// Submits a commit's batch. A failure that leaves the engine degraded, when
-// it was not before, may have come after the batch reached the data file:
-// its outcome is unknown (BC_E_UNKNOWN), never "nothing written". Any other
-// failure wrote nothing.
+// Submits a commit's batch, under apply_batch_or_unknown's rule: an
+// unknown outcome is BC_E_UNKNOWN, never "nothing written"; any other
+// failure wrote nothing. The code is set before the message, which is
+// dropped if it cannot be allocated.
 auto submit(bc_ctx* cx, bytecask::DB& db, bytecask::WritePlan plan, bool sync) -> bc_commit_result {
-  auto was_degraded = db.is_degraded();
   try {
-    return db.apply_batch({.sync = sync}, std::move(plan)) ? BC_COMMITTED : BC_CONFLICT;
+    return bytecask::sql::apply_batch_or_unknown(db, {.sync = sync}, std::move(plan)) ? BC_COMMITTED : BC_CONFLICT;
+  } catch (const bytecask::sql::CommitOutcomeUnknown& e) {
+    cx->error = BC_E_UNKNOWN;
+    cx->detail = 0;
+    try {
+      cx->message = e.what();
+    } catch (...) {
+      cx->message.clear();
+    }
+    return BC_FAILED;
   } catch (...) {
     cx->fail_current_exception();
-    if (!was_degraded && db.is_degraded()) cx->error = BC_E_UNKNOWN;
     return BC_FAILED;
   }
 }
@@ -1595,15 +1610,21 @@ void bc_ctx_begin(bc_ctx* cx, const bc_params* params, bc_budget budget) {
 void bc_ctx_begin_txn(bc_ctx* cx, bc_txn* txn, const bc_params* params, bc_budget budget) {
   BC_GUARD_BEGIN
   cx->drop_execution_state();
-  // First, before anything that can fail: a statement that fails while it
-  // begins must still abort its transaction at bc_txn_add.
-  cx->txn = txn;
-  txn->attached.push_back(cx);
   cx->error = BC_OK;
   cx->detail = 0;
   cx->message.clear();
   cx->params = params;
   cx->budget = budget;
+  // One context per transaction: another one's statement is still open.
+  if (txn->attached != nullptr) {
+    cx->fail(BC_E_HANDLE, "another context is running a statement of this transaction");
+    return;
+  }
+  // Attached first, before anything that can fail, and with nothing that
+  // can: a statement that fails while it begins must still abort its
+  // transaction at bc_txn_add.
+  cx->txn = txn;
+  txn->attached = cx;
   if (txn->aborted || txn->done) {
     cx->fail(BC_E_HANDLE, txn->done ? "the transaction has ended" : "the transaction is aborted");
     return;
@@ -1727,14 +1748,14 @@ bc_txn* bc_txn_new(bc_db* db, const bc_catalog* cat, uint64_t max_bytes) {
 
 void bc_txn_free(bc_txn* txn) {
   if (txn == nullptr) return;
-  while (!txn->attached.empty()) txn->attached.back()->drop_execution_state();
+  txn_drop_context(txn);
   delete txn;
 }
 
 uint64_t bc_txn_catalog_version(const bc_txn* txn) { return txn->pinned ? txn->pinned->version() : 0; }
 
 bool bc_txn_repin(bc_txn* txn) {
-  if (txn->statements != 0 || txn->aborted || txn->done || !txn->attached.empty()) return false;
+  if (txn->statements != 0 || txn->aborted || txn->done || txn->attached != nullptr) return false;
   txn->snap.reset();
   txn->pinned.reset();
   return true;
@@ -1826,6 +1847,7 @@ bool bc_txn_add(bc_ctx* cx) {
 enum bc_commit_result bc_txn_commit(bc_ctx* cx, bc_txn* txn, bool sync) {
   BC_GUARD_BEGIN
   cx->drop_execution_state();  // the context holds nothing of a statement while the transaction commits
+  txn_drop_context(txn);       // nor does one still attached: the snapshot moves into the plan
   cx->error = BC_OK;
   cx->detail = 0;
   cx->message.clear();

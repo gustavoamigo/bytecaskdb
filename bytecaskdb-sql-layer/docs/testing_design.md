@@ -99,6 +99,22 @@ PYTHONPATH=bytecaskdb-sql-layer/python \
   PostgreSQL 17 service container.
 - **The default profile, `dev`,** explores.
 
+## Sanitizers
+
+`sql-layer.yml` runs `sql_layer_tests` under ASan, TSan and UBSan through
+the engine's `sanitizers.yml`. The allocation-failure sweeps, the `[alloc]`
+tests, run in an invocation of their own. Under a failed allocation the
+engine's key directory leaks a node rather than free it while still
+reachable (#390), and only that invocation tells LeakSanitizer so, with
+`tests/lsan_alloc_sweeps.supp`. Every other test runs with no suppression.
+Locally, with an ASan build:
+
+```sh
+build/linux/x86_64/debug/sql_layer_tests "~[alloc]"
+LSAN_OPTIONS=suppressions=$PWD/bytecaskdb-sql-layer/tests/lsan_alloc_sweeps.supp \
+  build/linux/x86_64/debug/sql_layer_tests "[alloc]"
+```
+
 ## Known differences
 
 Found so far. The machine expects each one, so it does not fail on them.
