@@ -145,12 +145,16 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
    transaction: it releases its snapshot and pin at once (bc_txn_catalog_version
    is then 0) and is then only freed. An abort and bc_txn_free detach the
    attached context, which reads nothing of the transaction after and keeps
-   its error and its finished statement's results.
+   its error and its finished statement's results. A statement left without
+   bc_txn_add (a reset, or a new statement begun) that failed or holds
+   writes aborts the transaction; one refused as incompatible before it ran
+   (BC_E_LAYOUT, BC_L_INCOMPATIBLE) did nothing and does not.
    bc_txn_commit submits the statements' writes as one batch. It touches no
    context and reports through the transaction (bc_txn_error, BC_E_UNKNOWN
-   when the outcome is unknown). An aborted or ended transaction is
-   BC_E_HANDLE; so is one with a context still attached, which changes
-   nothing: reset the context and commit again. */
+   when the outcome is unknown). An ended transaction keeps the error its
+   ending commit recorded, or is BC_E_HANDLE; an aborted one is BC_E_HANDLE;
+   so is one with a context still attached, which changes nothing: add or
+   reset the context's statement and commit again. */
 typedef struct bc_txn bc_txn;
 bc_txn *bc_txn_new(bc_db *db, const bc_catalog *cat, uint64_t max_bytes);
 void    bc_txn_free(bc_txn *);                                                /* a transaction not committed writes nothing */

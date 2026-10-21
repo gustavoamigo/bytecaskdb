@@ -598,6 +598,42 @@ TEST_CASE("transactions: one context at a time; a commit with a statement open i
   CHECK(stored(f).size() == 1);
 }
 
+TEST_CASE("transactions: a statement left without bc_txn_add aborts the transaction if it failed or wrote",
+          "[sql][txn]") {
+  Fixture f;
+  create_w(f);
+  REQUIRE(autocommit(f, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("a"), std::int64_t{1}}) == BC_COMMITTED);
+  auto left = [&](bc_plan_fn plan, std::vector<bc_value> p, const std::vector<PhysType>& result) {
+    TxnPtr txn{f};
+    REQUIRE(stmt(f, txn.p, insert_w, {std::int64_t{2}, std::int64_t{2}, bytes("b"), std::int64_t{2}}).error == BC_OK);
+    auto ps = params(std::move(p));
+    SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), type_codes(result), f.cat().version()};
+    auto ref = sr.get();
+    bc_ctx_begin_txn(f.cx, txn.p, &ps, {});
+    bc_ctx_run(f.cx, plan, &ref);
+    auto error = bc_error(f.cx);
+    bc_ctx_reset(f.cx);  // never added
+    auto r = commit(f, txn.p);
+    return std::pair{error, r};
+  };
+  // A statement that failed (a duplicate key): the transaction aborted, and
+  // its earlier insert is not committed.
+  auto [failed, r1] = left(insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{1}}, {});
+  CHECK(failed == BC_E_CONSTRAINT);
+  CHECK(r1 == BC_FAILED);
+  CHECK_FALSE(stored(f).contains(2));
+  // A statement with writes pending: aborted too.
+  auto [wrote, r2] = left(insert_w, {std::int64_t{3}, std::int64_t{3}, bytes("c"), std::int64_t{3}}, {});
+  CHECK(wrote == BC_OK);
+  CHECK(r2 == BC_FAILED);
+  CHECK_FALSE(stored(f).contains(3));
+  // A SELECT that succeeded and was reset: harmless, the transaction commits.
+  auto [read, r3] = left(scan_w, {}, id_c());
+  CHECK(read == BC_OK);
+  CHECK(r3 == BC_COMMITTED);
+  CHECK(stored(f).contains(2));
+}
+
 TEST_CASE("transactions: a statement's results stay readable after the free that detaches it", "[sql][txn]") {
   Fixture f;
   create_w(f);
@@ -878,6 +914,9 @@ TEST_CASE("transactions: an allocation failure in a statement or the commit is B
     if (degraded) f.db->resume();
     if (error == BC_E_MEMORY) CHECK(stored(f).size() == before.size());
     if (error == BC_E_UNKNOWN) {
+      // A second commit keeps the first one's outcome.
+      CHECK(bc_txn_commit(txn.p, false) == BC_FAILED);
+      CHECK(bc_txn_error(txn.p) == BC_E_UNKNOWN);
       // Whichever way it went, it went whole: the row and the update together.
       auto after = stored(f);
       if (after.contains(100 + nth)) CHECK(after.at(1).c == 10);

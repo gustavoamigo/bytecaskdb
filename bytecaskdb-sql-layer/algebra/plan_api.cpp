@@ -360,20 +360,36 @@ struct ErrorCode {
 #pragma clang diagnostic pop
 
 // Where an error is recorded: a context's for its runs, a transaction's for
-// its commit. The first error set is kept.
+// its commit. fail() keeps the first error set; unknown() overrides.
 struct ErrorSink {
   bc_error_code& error;
   std::uint32_t& detail;
   std::string& message;
 
-  void fail(ErrorCode code, std::string msg) {
+  void clear() noexcept {
+    error = BC_OK;
+    detail = 0;
+    message.clear();
+  }
+
+  void fail(ErrorCode code, std::string msg, std::uint32_t with_detail = 0) {
     if (error != BC_OK) return;
     error = code.code;
+    detail = with_detail;
     message = std::move(msg);
   }
 
-  // A commit whose outcome is unknown: the code first, so a message that
-  // cannot be allocated is dropped, never the outcome.
+  void fail(bc_layout_detail why, std::string msg) {
+    if (error != BC_OK) return;
+    error = BC_E_LAYOUT;
+    detail = why;
+    message = std::move(msg);
+  }
+
+  // A commit whose outcome is unknown. It overrides whatever was recorded:
+  // the batch may be in the data file, and no earlier error may stand for
+  // "nothing written". The code first, so a message that cannot be
+  // allocated is dropped, never the outcome.
   void unknown(const char* what) noexcept {
     error = BC_E_UNKNOWN;
     detail = 0;
@@ -429,8 +445,10 @@ struct ErrorSink {
 
 }  // namespace
 
-// A context leaves the transaction it was begun on; defined with bc_txn.
-void txn_detach(bc_txn* txn, bc_ctx* cx) noexcept;
+// A context leaves the transaction it was begun on, with its statement not
+// added: when that statement failed or holds writes, the transaction
+// aborts. Defined with bc_txn.
+void txn_detach(bc_txn* txn, bc_ctx* cx, bool abandoned) noexcept;
 
 struct bc_ctx {
   bytecask::DB* db;
@@ -506,12 +524,7 @@ struct bc_ctx {
 
   void fail(ErrorCode code, std::string msg) { sink().fail(code, std::move(msg)); }
 
-  void fail(bc_layout_detail why, std::string msg) {
-    if (error != BC_OK) return;
-    error = BC_E_LAYOUT;
-    detail = why;
-    message = std::move(msg);
-  }
+  void fail(bc_layout_detail why, std::string msg) { sink().fail(why, std::move(msg)); }
 
   void fail_current_exception() noexcept { sink().fail_current_exception(); }
 
@@ -678,20 +691,25 @@ struct bc_ctx {
       fail(BC_E_HANDLE, "a constraint with an unknown kind or an object id past 2^24");
       return;
     }
-    fail(BC_E_CONSTRAINT, msg.empty() ? d.message() : std::move(msg));
-    detail = d.encode();
+    sink().fail(BC_E_CONSTRAINT, msg.empty() ? d.message() : std::move(msg), d.encode());
   }
 
   // Leaves the transaction: drops all that points into it (its snapshot and
   // overlay, the cursors over them, the statement's pending writes) and
   // keeps the rest, a finished statement's results and count readable.
-  // Idempotent, and the first step of drop_execution_state.
+  // Idempotent, and the first step of drop_execution_state. A statement
+  // of a transaction left without bc_txn_add (a reset, or a new statement
+  // begun) that failed or holds writes aborts its transaction: it is never
+  // dropped without a trace. A plan refused as incompatible before it ran
+  // did nothing, and may be recompiled and run again: that is not a failure.
   void detach_from_txn() noexcept {
+    auto refused_before_run = error == BC_E_LAYOUT && detail == BC_L_INCOMPATIBLE;
+    auto abandoned = txn != nullptr && ((!ok() && !refused_before_run) || !effects.empty());
     cursors.clear();  // iterators before the snapshot and the overlay they read
     effects.clear();
     base = nullptr;
     overlay = nullptr;
-    if (txn != nullptr) txn_detach(txn, this);
+    if (txn != nullptr) txn_detach(txn, this, abandoned);
     txn = nullptr;
   }
 
@@ -755,11 +773,14 @@ struct bc_txn {
   // an aborted transaction is never committed half-applied.
   bool aborted{false};
   bool done{false};  // committed, or its commit was attempted
-  // The last bc_txn_commit's error.
+  // The last bc_txn_commit's error. The commit that ends the transaction
+  // records its outcome here, and a later call on the ended transaction
+  // leaves it as it is.
   bc_error_code error{BC_OK};
   std::uint32_t detail{0};
   std::string message;
   [[nodiscard]] auto sink() -> ErrorSink { return {error, detail, message}; }
+  void fail_current_exception() noexcept { sink().fail_current_exception(); }
   // The one context begun on it and not yet reset, which points into its
   // snapshot and overlay; null when none is. A second is refused, and so
   // are a re-pin and a commit while one is. An abort and a free detach it.
@@ -768,8 +789,14 @@ struct bc_txn {
   bc_txn(bytecask::DB* d, LiveCatalog* l, std::uint64_t max) : db{d}, live{l}, max_bytes{max} {}
 };
 
-void txn_detach(bc_txn* txn, bc_ctx* cx) noexcept {
-  if (txn->attached == cx) txn->attached = nullptr;
+namespace {
+void txn_abort(bc_txn* txn) noexcept;
+}  // namespace
+
+void txn_detach(bc_txn* txn, bc_ctx* cx, bool abandoned) noexcept {
+  if (txn->attached != cx) return;
+  txn->attached = nullptr;  // first: the abort below detaches nothing more
+  if (abandoned && !txn->aborted && !txn->done) txn_abort(txn);
 }
 
 namespace {
@@ -1628,9 +1655,7 @@ void bc_ctx_free(bc_ctx* cx) {
 void bc_ctx_begin(bc_ctx* cx, const bc_params* params, bc_budget budget) {
   BC_GUARD_BEGIN
   cx->drop_execution_state();
-  cx->error = BC_OK;
-  cx->detail = 0;
-  cx->message.clear();
+  cx->sink().clear();
   cx->params = params;
   cx->budget = budget;
   auto p = cx->live->pin();
@@ -1644,9 +1669,7 @@ void bc_ctx_begin(bc_ctx* cx, const bc_params* params, bc_budget budget) {
 void bc_ctx_begin_txn(bc_ctx* cx, bc_txn* txn, const bc_params* params, bc_budget budget) {
   BC_GUARD_BEGIN
   cx->drop_execution_state();
-  cx->error = BC_OK;
-  cx->detail = 0;
-  cx->message.clear();
+  cx->sink().clear();
   cx->params = params;
   cx->budget = budget;
   if (txn->aborted || txn->done) {
@@ -1880,58 +1903,59 @@ bool bc_txn_add(bc_ctx* cx) {
 
 enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
   // It touches no context, and reports through the transaction.
-  txn->error = BC_OK;
-  txn->detail = 0;
-  txn->message.clear();
+  BC_GUARD_BEGIN
   auto out = txn->sink();
-  try {
-    if (txn->aborted || txn->done) {
-      out.fail(BC_E_HANDLE, txn->done ? "the transaction has ended" : "the transaction is aborted: roll it back");
-      return BC_FAILED;
-    }
-    // A statement still open reads the snapshot the commit would move: the
-    // commit is refused, and the transaction is as it was.
-    if (txn->attached != nullptr) {
-      out.fail(BC_E_HANDLE, "a statement of this transaction is still open on a context: reset it first");
-      return BC_FAILED;
-    }
-    txn->done = true;
-    const auto& ov = txn->overlay;
-    if (ov.empty() && txn->guards.empty()) {
-      txn->snap.reset();
-      return BC_COMMITTED;
-    }
-    // The ranges before the points: a point is newer than any range over it,
-    // and the engine applies a plan's operations in order.
-    bytecask::WritePlan plan{std::move(*txn->snap)};
-    txn->snap.reset();
-    for (const auto& [lo, hi] : ov.ranges) plan.del_range(lo, hi);
-    for (const auto& [key, value] : ov.points) {
-      if (value) {
-        plan.put(key, *value);
-      } else {
-        plan.del(key);
-      }
-    }
-    for (const auto& e : txn->guards) {
-      switch (e.kind) {
-        case EffectKind::GuardUnchanged: plan.ensure_unchanged(e.a); break;
-        case EffectKind::GuardRange: plan.ensure_range_unchanged(e.a, e.b); break;
-        case EffectKind::GuardPresent: plan.ensure_present(e.a); break;
-        case EffectKind::GuardAbsent: plan.ensure_absent(e.a); break;
-        case EffectKind::Put:
-        case EffectKind::Del:
-        case EffectKind::DelRange: break;  // never kept as guards
-      }
-    }
-    // As bc_ctx_commit: a DDL on a table the transaction wrote, committed
-    // since its snapshot, makes the commit a conflict.
-    for (auto id : txn->written) plan.ensure_unchanged(bytecask::sql::table_record_key(id));
-    return submit(out, *txn->db, std::move(plan), sync);
-  } catch (...) {
-    out.fail_current_exception();
-    return BC_FAILED;  // never BC_COMMITTED
+  if (txn->done) {
+    // The commit that ended it keeps its outcome: a BC_E_UNKNOWN stays one.
+    if (txn->error == BC_OK) out.fail(BC_E_HANDLE, "the transaction has ended");
+    return BC_FAILED;
   }
+  out.clear();
+  if (txn->aborted) {
+    out.fail(BC_E_HANDLE, "the transaction is aborted: roll it back");
+    return BC_FAILED;
+  }
+  // A statement still open reads the snapshot the commit would move: the
+  // commit is refused, and the transaction is as it was.
+  if (txn->attached != nullptr) {
+    out.fail(BC_E_HANDLE, "a statement of this transaction is still open on a context: reset it first");
+    return BC_FAILED;
+  }
+  txn->done = true;
+  const auto& ov = txn->overlay;
+  if (ov.empty() && txn->guards.empty()) {
+    txn->snap.reset();
+    return BC_COMMITTED;
+  }
+  // The ranges before the points: a point is newer than any range over it,
+  // and the engine applies a plan's operations in order.
+  bytecask::WritePlan plan{std::move(*txn->snap)};
+  txn->snap.reset();
+  for (const auto& [lo, hi] : ov.ranges) plan.del_range(lo, hi);
+  for (const auto& [key, value] : ov.points) {
+    if (value) {
+      plan.put(key, *value);
+    } else {
+      plan.del(key);
+    }
+  }
+  for (const auto& e : txn->guards) {
+    switch (e.kind) {
+      case EffectKind::GuardUnchanged: plan.ensure_unchanged(e.a); break;
+      case EffectKind::GuardRange: plan.ensure_range_unchanged(e.a, e.b); break;
+      case EffectKind::GuardPresent: plan.ensure_present(e.a); break;
+      case EffectKind::GuardAbsent: plan.ensure_absent(e.a); break;
+      case EffectKind::Put:
+      case EffectKind::Del:
+      case EffectKind::DelRange: break;  // never kept as guards
+    }
+  }
+  // As bc_ctx_commit: a DDL on a table the transaction wrote, committed
+  // since its snapshot, makes the commit a conflict.
+  for (auto id : txn->written) plan.ensure_unchanged(bytecask::sql::table_record_key(id));
+  return submit(out, *txn->db, std::move(plan), sync);
+  BC_GUARD_END(txn)
+  return BC_FAILED;  // the guard caught a throw: never BC_COMMITTED
 }
 
 enum bc_error_code bc_txn_error(const bc_txn* txn) { return txn->error; }

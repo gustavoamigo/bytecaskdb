@@ -379,7 +379,10 @@ differences*.
     statement's results readable;
   - `bc_txn_commit(bc_txn*, sync)` takes no context and reports through
     the transaction (`bc_txn_error`); with a statement still open on a
-    context it is refused, changing nothing, until the context is reset.
+    context it is refused, changing nothing, and a later call on an ended
+    transaction keeps the outcome its commit recorded;
+  - a statement left without `bc_txn_add` that failed or holds writes
+    aborts the transaction, so none is dropped without a trace.
 
   Their exact C names are settled in the implementation PR, with
   `bc_plan.h`'s runtime section. `bc_execute` keeps its signature for
