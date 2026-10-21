@@ -123,6 +123,143 @@ LSAN_OPTIONS=suppressions=$PWD/bytecaskdb-sql-layer/tests/lsan_alloc_sweeps.supp
   build/linux/x86_64/debug/sql_layer_tests "[alloc]"
 ```
 
+## The MVP gate harness
+
+Status: **design, for review.** The MVP gate (#487, *MVP*;
+`docs/frontend_design.md`, *The MVP gate* and Decision 7) runs TPROC-C's
+transaction mix through SQL at 1, 16 and 48 threads and reports the
+layer's own numbers. This section is what the harness does; the
+statements it sends and the `h_id` scheme are `frontend_design.md`'s
+(*Where the statements come from*, *The statements*), and are not
+repeated here.
+
+**One binary, two modes.** `bench/tpcc.cpp`, xmake target `sql_layer_tpcc`
+(not built by default, as `sql_layer_bench`). `sql_layer_tpcc load`,
+`sql_layer_tpcc run` and `sql_layer_tpcc elle`. The loader, the
+transactions and the checks are one module, `bytecask.sql.tpcc`, which
+the smoke test in `sql_layer_tests` uses too. Everything goes through the
+embedded API (`Database`, `Transaction`, `Statement`), in the harness's
+own process. It links the testing build of the layer, as `bytecask_sql`
+does, for the two reads the API keeps there: `Database::table_rows` for
+the consistency check and the engine's `stats()`. Every statement is prepared once, before the threads start,
+and shared by them.
+
+**The loader.**
+- `load --dir D --warehouses W`: the schema fixture (`tests/tpcc_schema.cppm`),
+  then TPC-C's initial population (clause 4.3.3): 100,000 items; per
+  warehouse 100,000 stock rows and 10 districts; per district 3,000
+  customers with one history row each, 3,000 orders with their lines, and
+  the last 900 orders in `new_order`. Random strings, `c_last` from the
+  syllables, `NURand` with its constants, 10% `BC` credit, as the clause
+  says.
+- One prepared `INSERT` per table, many rows per `Transaction`: as many as
+  fit well inside its 64 MiB bound.
+- The loader inserts `harness_run`'s row `(1, 0)` and uses run 0 for its
+  `h_id`s.
+- The cardinalities are parameters with the specification's values as
+  defaults. Only the smoke test shrinks them.
+
+**The driver.**
+- `run --dir D --threads 1,16,48 --duration S --warmup S --seed N`. Each
+  thread count is one phase on the same database, run in order. Each phase
+  bumps `harness_run` for its own run, so a phase's thread indices never
+  reuse another phase's `h_id`s.
+- Closed loop, no keying or think time, as HammerDB's default. Thread `t`
+  has home warehouse `t mod W + 1`, and a per-thread generator seeded from
+  `--seed` and `t`.
+- The mix is the specification's deck (New-Order 45, Payment 43, and
+  Order-Status, Delivery and Stock-Level 4 each), drawn per transaction.
+  It is restricted to the transactions built so far and renormalised.
+  Payment and Order-Status come first, with #542; each later front-end
+  slice adds its transaction to the deck and to the inputs below.
+- Inputs follow the profiles (clauses 2.4 to 2.8): customers by last name
+  60% of the time and by `NURand` id otherwise; a remote warehouse for 15%
+  of Payments when `W > 1`; `h_amount` from 1.00 to 5,000.00; a `BC`
+  customer's new `c_data`. The client logic is the harness's, as in
+  HammerDB's client-side driver.
+- One `Transaction` per TPROC-C transaction, committed with `commit()`.
+
+**Errors and retries.**
+- `SerializationFailure` (40001) reruns the transaction with the same
+  inputs in a new `Transaction`, up to 10 attempts. Retries are counted
+  per transaction type. A transaction still failing after its tenth
+  attempt is counted as abandoned and the thread moves on.
+- New-Order's 1% of orders naming an unused item roll back, as the
+  specification requires, and count as completed.
+- Any other error stops the run with a non-zero exit: 23505,
+  `TransactionResolutionUnknown`, a constraint, an I/O error. In TPROC-C
+  none is expected, so each one is a bug to look at, not a number.
+
+**What it reports.** Per phase:
+- per transaction type, completed, retries and abandoned, and latency
+  p50, p95, p99 and max, from the first attempt's start to the commit that
+  completed it;
+- TPM, completed transactions of every type per minute, and NOPM, completed
+  New-Orders per minute (`n/a` until New-Order is in the mix);
+- the engine's `fsyncs` and `group_writer_batches` over the phase, read
+  from `stats()`, to set beside `commit_probe`.
+
+Latencies go into a fixed log-bucket histogram per thread, from 1 µs to
+10 s, merged at the end, so a long run holds no per-transaction list. The
+report is printed as a table. With `--json FILE`, one JSON object per
+phase is appended to FILE as well. These runs are the only performance
+numbers the harness produces; there are no micro-benchmarks.
+
+**Consistency after a run.** After the last phase, the harness checks
+TPC-C's consistency conditions (clause 3.3.2) for the transactions in the
+mix, reading every table through `Database::table_rows`:
+- with Payment: condition 1 (`w_ytd` is the sum of its districts'
+  `d_ytd`), and conditions 8 and 9 (`w_ytd` and `d_ytd` are each the sum of
+  their `history` rows' `h_amount`);
+- New-Order and Delivery add conditions 2 to 4 and 5 to 7 when they land.
+
+A failed condition exits non-zero.
+
+**The smoke test.** `tpcc: a short mixed run keeps TPC-C's consistency
+conditions` is a Catch2 test in `sql_layer_tests`. It loads two warehouses
+at a tiny scale, then runs four threads for a few hundred transactions. It
+requires that every type in the mix completed at least once, that no
+error other than 40001 occurred, and that the consistency conditions hold.
+It is the only part CI runs: full runs and Elle are manual.
+
+**Elle through SQL.** `elle` records a list-append history through SQL, in
+the engine harness's history format (`docs/isolation_checking_design.md`),
+and `scripts/sql_isolation_check.py` checks it with the engine's tooling:
+`run_elle` and `cross_check` from `scripts/run_isolation_check.py`.
+- One table, `elle (k BIGINT PRIMARY KEY, v VARCHAR(2048))`. Each key holds
+  its list as decimals separated by commas. Every key's row exists before
+  the clients start, empty, so every read returns a row.
+- Keys rotate as in the engine harness: 8 active keys, retired after 64
+  appends.
+- A transaction is 1 to 4 micro-operations in one `Transaction`. A read is
+  `SELECT v FROM elle WHERE k = $1`; an append reads the same way, then
+  `UPDATE elle SET v = $2 WHERE k = $1`.
+- `guarded`: the reads of keys the transaction does not append use
+  `FOR UPDATE`. It must be valid under `strict-serializable`.
+- `unguarded`: plain reads. It must be valid under `snapshot-isolation`,
+  and under `strict-serializable` report only write skew (`G2-item`), at
+  least once over the run.
+- `blind`: every statement in autocommit, with no `Transaction`. It must
+  be invalid, which shows the check can see a lost update.
+- A completed `commit()` is `:ok`. A `SerializationFailure` is `:fail`.
+  `TransactionResolutionUnknown` is `:info`. An error in a statement
+  aborts the transaction, which is `:fail`.
+- **The one difference from the engine's check:** `commit()` returns no
+  commit sequence, so the cross-check's rule that a key's final list
+  follows commit-sequence order cannot apply. Every other rule does:
+  reads are prefixes, nothing failed is visible, every `:ok` append is
+  there, and real-time visibility.
+
+Commands:
+
+```sh
+xmake f -m releasedbg --sql_layer=y && xmake build sql_layer_tpcc
+sql_layer_tpcc load --dir /tmp/tpcc --warehouses 48
+sql_layer_tpcc run --dir /tmp/tpcc --threads 1,16,48 --duration 300 --warmup 60
+python3 bytecaskdb-sql-layer/scripts/sql_isolation_check.py \
+  --binary build/linux/x86_64/releasedbg/sql_layer_tpcc --elle-jar elle-cli.jar
+```
+
 ## Known differences
 
 Found so far. The machine expects each one, so it does not fail on them.
