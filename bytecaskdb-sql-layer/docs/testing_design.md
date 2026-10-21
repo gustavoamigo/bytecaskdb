@@ -188,5 +188,16 @@ Found so far. The machine expects each one, so it does not fail on them.
   compared column its own parameter
   (`test_a_parameter_compared_with_two_types_is_refused`; the DECIMAL
   scales, which the oracle does not model, in the embedded API's test).
+- **A parameter used with columns of two SQL types is refused,** in any
+  use: compared with, assigned to, or added to or subtracted from them
+  (`SET b = $1, a = a + $1` with `b BIGINT` and `a SMALLINT`).
+  PostgreSQL infers one type for a `$n` from its use and runs it. The
+  machine gives each column its own parameter
+  (`test_a_parameter_used_with_two_types_is_refused`).
+- **A DECIMAL operand of `col ± $n` past 18 digits is 22003.** The layer's
+  DECIMAL is a scaled 64-bit integer, so the operand is checked against 18
+  digits at the column's scale before the plan runs, even when the column
+  is NULL; PostgreSQL's unconstrained `numeric` may still complete (NULL
+  plus anything is NULL). The machine's operands stay inside 18 digits.
 - **DML takes no literals:** values are parameters (`$1`). The machine's
   statements use parameters on both sides.

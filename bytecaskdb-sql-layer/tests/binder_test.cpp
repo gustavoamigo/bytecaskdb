@@ -317,6 +317,16 @@ TEST_CASE("binder: COUNT, ORDER BY and column + parameter", "[sql][binder]") {
         std::pair<std::string, std::int32_t>{"only one aggregate per SELECT is supported", 17});
   CHECK(rejected(cat, "SELECT id FROM t WHERE id = $1 ORDER BY nope").first == "column \"nope\" does not exist");
   CHECK(rejected(cat, "UPDATE t SET qty = count(*) WHERE id = $1").first == "aggregate functions are not allowed here");
+  // One SQL type per parameter, whichever use comes first.
+  sql_test::Fixture g;
+  g.ddl(std::get<Ddl>(bind_sql(g.cat(), "CREATE TABLE s (k BIGINT PRIMARY KEY, b BIGINT, a SMALLINT)").stmt));
+  CHECK(rejected(g.cat(), "UPDATE s SET b = $1, a = a + $1 WHERE k = $2").first ==
+        "parameter $1 is assigned to b (bigint) and added to a (smallint)");
+  CHECK(rejected(g.cat(), "UPDATE s SET a = a - $1, b = $1 WHERE k = $2").first ==
+        "parameter $1 is subtracted from a (smallint) and assigned to b (bigint)");
+  CHECK(rejected(g.cat(), "UPDATE s SET b = $1 WHERE a = $1").first ==
+        "parameter $1 is assigned to b (bigint) and compared with a (smallint)");
+  CHECK_NOTHROW(bind_sql(g.cat(), "UPDATE s SET b = b + $1 WHERE k = $1"));
   CHECK(rejected(cat, "SELECT count(*) FROM t WHERE id = $1 FOR UPDATE").first ==
         "FOR UPDATE is not allowed with aggregate functions");
 }

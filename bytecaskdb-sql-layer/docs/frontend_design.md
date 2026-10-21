@@ -572,11 +572,12 @@ its transaction test.
      `bc_count_range`. On a point lookup, `COUNT` is 0 or 1. One aggregate
      per `SELECT`.
    - `col + $n` and `col - $n` take a column of the assigned column's type,
-     on integers and `DECIMAL` only. The operand `$n` is not re-typed when an
-     earlier use typed it, as PostgreSQL types a `$n` by its first use; used
-     first here, it is range-checked as the column, a `DECIMAL` operand against 18 digits at the column's scale,
-     so the sum stays inside `int64` and the row builder's check of it is
-     22003. A BIGINT overflow is still `BC_E_ARITH`, not 22003 (#540).
+     on integers and `DECIMAL` only. A `$n` has one SQL type across every
+     use, as before; one used with two is refused, where PostgreSQL infers
+     one (*Known differences* in `docs/testing_design.md`). The operand is
+     range-checked as the column, a `DECIMAL` operand against 18 digits at
+     the column's scale, so the sum stays inside `int64` and the row
+     builder's check of it is 22003. A BIGINT overflow is still `BC_E_ARITH`, not 22003 (#540).
    - `FOR UPDATE` (#491, slice B) works with every scan here, `ORDER BY`
      and `LIMIT` included: each row returned is guarded, read from the
      row, never covering. With `COUNT` it is refused, as PostgreSQL

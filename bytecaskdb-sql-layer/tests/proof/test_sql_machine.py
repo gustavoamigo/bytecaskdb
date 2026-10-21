@@ -1143,18 +1143,22 @@ def test_column_plus_parameter_at_the_edges(dsn):
         m.teardown()
 
 
-def test_a_parameter_is_typed_by_its_first_use(dsn):
-    """SET c1 = $1, c2 = c2 + $1: $1 is c1's BIGINT, as PostgreSQL types it,
-    so 40000 is no SMALLINT operand out of range; the sum is checked as
-    c2's SMALLINT when it is stored."""
+def test_a_parameter_used_with_two_types_is_refused(dsn):
+    """SET c1 = $1, c2 = c2 + $1, with c1 BIGINT and c2 SMALLINT: the layer
+    refuses a $n used with two SQL types, in either order (docs/testing_design.md,
+    *Known differences*); PostgreSQL infers one and runs it. One parameter per
+    column runs on both."""
     m = fixed(dsn)
     try:
         m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.BIGINT), Column("c2", o.SMALLINT)],
                        ["c0"]))
         m.insert("t0", {"c0": 1, "c1": 0, "c2": -30000}, all_columns=True)
-        sql = "UPDATE t0 SET c1 = $1, c2 = c2 + $1 WHERE c0 = $2"
-        assert m.both(sql, (40000, 1)).affected == 1
-        assert m.both(sql, (40000, 1)).error == "22003"  # 10000 + 40000 leaves SMALLINT
+        for sql in ("UPDATE t0 SET c1 = $1, c2 = c2 + $1 WHERE c0 = $2", "UPDATE t0 SET c2 = c2 + $1, c1 = $1 WHERE c0 = $2"):
+            out = o.run_layer(m.db, sql, (40000, 1))
+            assert out.error == "refused" and "parameter $1 is" in out.detail, out
+        sql = "UPDATE t0 SET c1 = $1, c2 = c2 + $2 WHERE c0 = $3"
+        assert m.both(sql, (40000, 32000, 1)).affected == 1
+        assert m.both(sql, (40000, 32000, 1)).error == "22003"  # 2000 + 32000 leaves SMALLINT
         m.check()
     finally:
         m.teardown()

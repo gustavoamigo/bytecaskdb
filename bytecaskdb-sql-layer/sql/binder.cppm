@@ -95,8 +95,8 @@ struct Bound {
   Statement stmt;
   std::vector<PhysType> param_types;  // $1 is [0]
   // For each parameter compared with a column (WHERE) or added to one (SET
-  // col = col ± $n), that column's type without its modifier
-  // (compared_type's range), as PostgreSQL types a $n: what its value is
+  // col = col ± $n), its SQL type without the modifier (compared_type's
+  // range; a DECIMAL operand's, 18 digits at its scale): what its value is
   // checked against before the plan runs, so a key, bound or operand
   // outside it is refused whatever the plan would read. nullopt for one
   // only assigned (INSERT, SET), which the row builder checks in column
@@ -282,41 +282,55 @@ public:
     return c;
   }
 
-  // Gives parameter $n+1 a type, physical and, when a WHERE compares it with
-  // `compared` or a SET adds it to `compared`, SQL: `range`, or the
-  // column's type without its modifier. A second use must agree with the
-  // first physically. An `operand` of col ± $n does not re-type a $n an
-  // earlier use typed: as PostgreSQL types a $n, its first use decides
-  // (`SET b = $1, a = a + $1` types $1 as b's). A WHERE comparison does:
-  // its range check is what keeps a key outside the column's type from
-  // being keyed as another value. A compared $n
-  // has one SQL type, what the pre-plan range check checks: compared with
-  // columns of two types that share a physical type (DOUBLE PRECISION and
-  // REAL, INTEGER and BIGINT, DECIMALs of two scales), one value could be
-  // keyed as two numbers. Refused, where PostgreSQL runs it
-  // (docs/testing_design.md, *Known differences*). A DECIMAL of scale 0 is
-  // compared as a BIGINT (compared_type): its integer is the number itself.
-  void use_param(std::uint32_t n, PhysType t, std::int32_t pos, const Column* compared = nullptr,
-                 std::optional<SqlType> range = std::nullopt, bool operand = false) {
+  // How a statement uses a parameter: compared with a column (WHERE),
+  // assigned to one (INSERT, SET), or the operand of col + $n or col - $n.
+  enum class Use { Compared, Assigned, Added, Subtracted };
+
+  // Gives parameter $n+1 a type from one use with `col`, which sets its
+  // physical type and its SQL type. Every use must agree on both, whatever
+  // their order: a $n used with two SQL types that share a physical type
+  // (DOUBLE PRECISION and REAL, INTEGER and BIGINT, DECIMALs of two scales)
+  // would be read as two values. Refused, where PostgreSQL infers one type
+  // from its first use (docs/testing_design.md, *Known differences*). A
+  // DECIMAL of scale 0 is a BIGINT here (compared_type): its integer is the
+  // number itself. A compared or operand $n is range-checked before the plan
+  // runs (param_sql): against its column's type without the modifier, and a
+  // DECIMAL operand against 18 digits at its scale, so a sum stays inside
+  // int64; one only assigned is checked by the row builder.
+  void use_param(std::uint32_t n, PhysType t, std::int32_t pos, const Column& col, Use use) {
     if (params_.size() <= n) params_.resize(n + 1);
     auto& p = params_[n];
-    auto typed = p.phys.has_value();
     if (p.phys && *p.phys != t) {
       throw SqlError{"parameter $" + std::to_string(n + 1) + " used as both " + type_name(*p.phys) + " and " +
                          type_name(t),
                      pos};
     }
     p.phys = t;
-    if (compared == nullptr || (operand && typed)) return;
-    if (p.compared != nullptr && compared_type(p.compared->sql).identity != compared_type(compared->sql).identity) {
+    if (p.first != nullptr && compared_type(p.first->sql).identity != compared_type(col.sql).identity) {
+      auto verb = [](Use u) {
+        switch (u) {
+          case Use::Compared: return "compared with ";
+          case Use::Assigned: return "assigned to ";
+          case Use::Added: return "added to ";
+          case Use::Subtracted: return "subtracted from ";
+        }
+        return "";
+      };
       auto named = [](const Column& c) { return c.name + " (" + sql_type_name(c.sql) + ")"; };
-      throw SqlError{"parameter $" + std::to_string(n + 1) + " is compared with " + named(*p.compared) + " and " +
-                         named(*compared),
+      auto second = use == p.first_use ? named(col) : verb(use) + named(col);
+      throw SqlError{"parameter $" + std::to_string(n + 1) + " is " + verb(p.first_use) + named(*p.first) + " and " +
+                         second,
                      pos};
     }
-    if (p.compared == nullptr) {
-      p.compared = compared;
-      p.range = range.value_or(compared_type(compared->sql).range);
+    if (p.first == nullptr) {
+      p.first = &col;
+      p.first_use = use;
+    }
+    if (use == Use::Assigned) return;
+    if (use != Use::Compared && col.sql.kind == SqlKind::Decimal) {
+      p.range = SqlType{SqlKind::Decimal, 0, static_cast<std::uint8_t>(kMaxDecimalPrecision), col.sql.scale};
+    } else if (!p.range) {
+      p.range = compared_type(col.sql).range;
     }
   }
 
@@ -325,7 +339,7 @@ public:
     auto want = target.type;
     switch (e.kind) {
       case ast::Expr::Kind::Param:
-        use_param(e.param, want, e.pos);
+        use_param(e.param, want, e.pos, target, Use::Assigned);
         return Expr{Expr::Kind::Param, 0, e.param, want};
       case ast::Expr::Kind::Column: {
         const auto* c = column(t, e.column, e.pos);
@@ -366,14 +380,8 @@ public:
                                                          "assigned column's type",
                          e.pos};
         }
-        // A DECIMAL operand is checked against DECIMAL's 18 digits, the
-        // layer's bound on any DECIMAL: so the sum stays inside int64, and
-        // the row builder's check of it is 22003, as PostgreSQL's
-        // assignment is. An integer's is its column's type.
-        auto range = c->sql.kind == SqlKind::Decimal
-                         ? std::optional{SqlType{SqlKind::Decimal, 0, static_cast<std::uint8_t>(kMaxDecimalPrecision), c->sql.scale}}
-                         : std::nullopt;
-        use_param(e.rhs->param, PhysType::I64, e.rhs->pos, c, range, true);
+        use_param(e.rhs->param, PhysType::I64, e.rhs->pos, *c,
+                  e.kind == ast::Expr::Kind::Add ? Use::Added : Use::Subtracted);
         return Expr{e.kind == ast::Expr::Kind::Add ? Expr::Kind::Add : Expr::Kind::Sub, c->id, e.rhs->param,
                     PhysType::I64};
       }
@@ -402,7 +410,7 @@ public:
         throw SqlError{"WHERE must compare a column with a parameter", w.pos};
       }
       const auto* c = column(t, col->column, col->pos);
-      use_param(param->param, c->type, param->pos, c);
+      use_param(param->param, c->type, param->pos, *c, Use::Compared);
       out.push_back(Compare{op, c->id, param->param});
     }
     return out;
@@ -418,24 +426,23 @@ public:
     return out;
   }
 
-  // For each parameter compared with or added to a column, that column's
-  // type without the modifier (compared_type's range): what the pre-plan
-  // range check checks it against.
+  // For each parameter compared with or added to a column, what the
+  // pre-plan range check checks it against (use_param).
   auto param_sql() const -> std::vector<std::optional<SqlType>> {
     std::vector<std::optional<SqlType>> out;
     for (const auto& p : params_) {
-      out.push_back(p.compared == nullptr ? std::nullopt : std::optional{p.range});
+      out.push_back(p.range);
     }
     return out;
   }
 
 private:
-  // A parameter's type from its uses: physical from every use, and the
-  // first column it is compared with or added to.
+  // A parameter's type from its uses, which all agree.
   struct ParamUse {
     std::optional<PhysType> phys;
-    const Column* compared{nullptr};
-    SqlType range{};  // what the pre-plan range check checks, when compared
+    const Column* first{nullptr};  // the column of its first use, for the SQL type
+    Use first_use{Use::Assigned};
+    std::optional<SqlType> range;  // what the pre-plan range check checks: none if only assigned
   };
   const Catalog& cat_;
   std::vector<ParamUse> params_;
