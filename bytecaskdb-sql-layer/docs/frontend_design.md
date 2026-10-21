@@ -37,10 +37,12 @@ the ones HammerDB's MySQL procedures run against InnoDB.
 
 **The MVP runs a statement set of its own, written from those
 statements:** in PostgreSQL's dialect, with `$n` parameters where HammerDB
-splices values into the text, and no stored procedures. The layer's harness
-sends them through the embedded API, with the client logic in the harness,
-and the proof suite checks them against PostgreSQL 17. HammerDB's
-PostgreSQL driver is not used. Two statements are rewritten to mean in
+splices values into the text, and no stored procedures. The gate's HammerDB
+driver script sends them over the wire, and the layer's harness through the
+embedded API, each with the client logic in itself; the proof suite checks
+them against PostgreSQL 17. HammerDB's PostgreSQL driver is not used: it
+calls PL/pgSQL procedures (`docs/server_design.md`, *The HammerDB
+driver*). Two statements are rewritten to mean in
 PostgreSQL what they mean in HammerDB, and one table gains a key
 (*Decisions*, 1 and 3):
 - Delivery's `LIMIT 1` without `ORDER BY` relies on InnoDB returning the
@@ -623,13 +625,19 @@ its transaction test.
 
 Then the MVP gate.
 
-**The MVP gate** runs TPROC-C's transaction mix, with the statements above
-(*Where the statements come from*), through our harness at 1, 16 and 48
-threads, beside
-`commit_probe` and with Elle through SQL (#487, 2.6). The harness calls the
-embedded API in its own process, one `Transaction` per TPROC-C
-transaction. It reports the layer's own numbers; there is no InnoDB
-comparison for now (*Decisions*, 7).
+**The MVP gate** is HammerDB's TPROC-C at 1, 16 and 48 virtual users,
+driving the layer over PostgreSQL's wire protocol through
+`sql_layer_server` (`docs/server_design.md`). HammerDB runs a driver script
+of our own, a pgtcl port of its MySQL client-side TPROC-C logic, which
+sends the statements above (*Where the statements come from*): one
+`Transaction` per TPROC-C transaction, `BEGIN` to `COMMIT`. The gate's
+numbers are HammerDB's NOPM and TPM, and each run ends with TPC-C's
+consistency conditions checked on what it left. The harness
+(`docs/testing_design.md`, *The MVP gate harness*) stays, but it is not the
+gate. It checks the consistency conditions, runs Elle through SQL (#487,
+2.6) and the CI smoke test, and gives the embedded API's numbers with no
+network, beside `commit_probe`. There is no InnoDB comparison for now
+(*Decisions*, 7).
 
 ## Known differences from PostgreSQL
 
@@ -687,9 +695,14 @@ The owner's answers to this design's open questions (2026-10-21):
    plans fail if one is refused.
 6. **No cost model.** Rule-based paths; `bc_count_range` cardinalities
    enter with the first workload whose plans a rule gets wrong (#534).
-7. **No InnoDB comparison for now.** The MVP gate runs TPROC-C's
-   transaction mix, with this design's statements, through our harness at
-   1, 16 and 48 threads and reports the layer's own numbers.
+7. **The gate is HammerDB over the wire; no InnoDB comparison for now.**
+   The MVP gate runs HammerDB's TPROC-C, with this design's statements,
+   through the PostgreSQL wire-protocol server at 1, 16 and 48 virtual
+   users, and reports the layer's own numbers (owner, 2026-10-21, replacing
+   the harness as the gate). The driver script runs unchanged on
+   PostgreSQL 17; whether the gate reports PostgreSQL's numbers beside ours
+   is open (`docs/server_design.md`, *The same script against PostgreSQL
+   17*).
 
 ## Later
 
