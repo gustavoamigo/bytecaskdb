@@ -408,11 +408,10 @@ public:
       p.first_use = use;
     }
     if (use == Use::Assigned) return;
-    if (!p.range) p.table = table;
     if (use != Use::Compared && col.sql.kind == SqlKind::Decimal) {
-      p.range = SqlType{SqlKind::Decimal, 0, static_cast<std::uint8_t>(kMaxDecimalPrecision), col.sql.scale};
-    } else if (!p.range) {
-      p.range = compared_type(col.sql).range;
+      narrow(p, SqlType{SqlKind::Decimal, 0, static_cast<std::uint8_t>(kMaxDecimalPrecision), col.sql.scale}, table);
+    } else {
+      narrow(p, compared_type(col.sql).range, table);
     }
   }
 
@@ -421,12 +420,7 @@ public:
   // outside the type even when no row matches. An INSERT writes its row
   // whatever its parameters, and the row builder checks them in column
   // order, as PostgreSQL does.
-  void check_assigned(std::uint32_t n, const Column& col, std::uint32_t table) {
-    auto& p = params_[n];
-    if (p.range) return;
-    p.range = col.sql;
-    p.table = table;
-  }
+  void check_assigned(std::uint32_t n, const Column& col, std::uint32_t table) { narrow(params_[n], col.sql, table); }
 
   // An aggregate of a one-table SELECT. SUM and MIN take a column whose
   // values the plan holds as int64_t: SUM an integer or DECIMAL one, as
@@ -613,9 +607,28 @@ private:
     std::optional<PhysType> phys;
     const Column* first{nullptr};  // the column of its first use, for the SQL type
     Use first_use{Use::Assigned};
-    std::optional<SqlType> range;  // what the pre-plan range check checks: none if only assigned
+    std::optional<SqlType> range;  // what the pre-plan range check checks: none if only an INSERT assigns it
     std::uint32_t table{0};        // the table of the column `range` comes from
   };
+
+  // Whether every value inside range a is inside range b, two ranges of one
+  // parameter: of one SQL type, so they differ only by a modifier, or one is
+  // a DECIMAL's and the other the BIGINT range its comparison takes.
+  static auto within(SqlType a, SqlType b) -> bool {
+    if (a.kind == SqlKind::Decimal) return b.kind != SqlKind::Decimal || a.precision <= b.precision;
+    if (a.kind == SqlKind::Varchar) return b.kind != SqlKind::Varchar || a.length <= b.length;
+    return b.kind != SqlKind::Decimal && b.kind != SqlKind::Varchar;
+  }
+
+  // The parameter's range becomes `r` where r is narrower: it is checked
+  // against the narrowest of its uses, in whatever order they come, and a
+  // refusal names that use's table.
+  static void narrow(ParamUse& p, SqlType r, std::uint32_t table) {
+    if (p.range && (!within(r, *p.range) || within(*p.range, r))) return;
+    p.range = r;
+    p.table = table;
+  }
+
   const Catalog& cat_;
   std::vector<ParamUse> params_;
 };

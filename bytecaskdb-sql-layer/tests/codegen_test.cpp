@@ -168,6 +168,12 @@ TEST_CASE("codegen: MIN from the first entry past the NULLs, or a loop; SUM by a
   CHECK(loop.find("if (!seen || v < m) m = v;") != std::string::npos);
   auto sum = generate(f.cat(), "SELECT sum(x) FROM m WHERE g = $1");
   CHECK(sum.result_names == std::vector<std::string>{"sum"});
+  // A BIGINT's SUM is numeric with no declared precision: the total may take
+  // 19 digits.
+  REQUIRE(sum.result_sql.size() == 1);
+  CHECK(sum.result_sql[0].kind == SqlKind::Decimal);
+  CHECK(sum.result_sql[0].precision == 0);
+  CHECK(sql_type_name(sum.result_sql[0]) == "numeric");
   CHECK(sum.source.find("sum = bc_add(cx, sum, bc_key_part_i64(cx, IDX_6, key, PART_6_2));") != std::string::npos);
   CHECK(generate(f.cat(), "SELECT min(x) FROM m WHERE g = $1").result_names == std::vector<std::string>{"min"});
 }

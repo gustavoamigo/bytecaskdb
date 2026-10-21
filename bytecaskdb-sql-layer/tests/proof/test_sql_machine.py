@@ -1485,3 +1485,22 @@ def test_one_unique_value_given_to_two_rows_is_23505(dsn):
         m.check()
     finally:
         m.teardown()
+
+
+def test_an_update_parameter_is_checked_against_its_narrowest_use(dsn):
+    """$1 added to a NUMERIC(10, 2) and assigned to a NUMERIC(4, 2): a value
+    only the wider holds is 22003 on both sides, in either order, even when
+    no row matches; one both hold runs."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.numeric(4, 2)),
+                              Column("c2", o.numeric(10, 2))], ["c0"]))
+        m.insert("t0", {"c0": 1, "c1": decimal.Decimal("1.00"), "c2": decimal.Decimal("1.00")}, all_columns=True)
+        types = [o.numeric(4, 2), o.BIGINT]
+        for sql in ("UPDATE t0 SET c2 = c2 + $1, c1 = $1 WHERE c0 = $2", "UPDATE t0 SET c1 = $1, c2 = c2 + $1 WHERE c0 = $2"):
+            for key in (1, 2):
+                assert m.both(sql, (decimal.Decimal("123.45"), key), types=types).error == "22003"
+            assert m.both(sql, (decimal.Decimal("12.34"), 1), types=types).affected == 1
+        m.check()
+    finally:
+        m.teardown()

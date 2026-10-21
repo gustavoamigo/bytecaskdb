@@ -663,7 +663,8 @@ void print(Writer& w, const ir::Delete& s) {
 
 // An aggregate's result column as PostgreSQL names and types it: COUNT a
 // bigint; SUM of a SMALLINT or INTEGER a bigint, of a BIGINT or DECIMAL a
-// numeric at its scale; MIN of the column's type.
+// numeric of no declared precision (the total may take 19 digits), held at
+// the column's scale; MIN of the column's type.
 auto aggregate_result(const bound::Aggregate& a, const Table& t) -> std::pair<std::string, SqlType> {
   using Fn = ast::Expr::Fn;
   switch (a.fn) {
@@ -671,7 +672,7 @@ auto aggregate_result(const bound::Aggregate& a, const Table& t) -> std::pair<st
     case Fn::Sum: {
       const auto& sql = t.column(*a.col_id)->sql;
       if (sql.kind == SqlKind::SmallInt || sql.kind == SqlKind::Integer) return {"sum", SqlType{SqlKind::BigInt}};
-      return {"sum", SqlType{SqlKind::Decimal, 0, static_cast<std::uint8_t>(kMaxDecimalPrecision), sql.scale}};
+      return {"sum", SqlType{SqlKind::Decimal, 0, 0, sql.scale}};
     }
     case Fn::Min: return {"min", t.column(*a.col_id)->sql};
   }

@@ -309,6 +309,17 @@ TEST_CASE("binder: COUNT, ORDER BY and column + parameter", "[sql][binder]") {
     // an INSERT's by the row builder.
     CHECK(bind_sql(cat, "UPDATE t SET qty = $2 WHERE name = $1").param_sql[1].has_value());
     CHECK_FALSE(bind_sql(cat, "INSERT INTO t (id, qty) VALUES ($1, $2)").param_sql[1].has_value());
+    // The narrowest of a $n's uses is what it is checked against, in either
+    // order: here d's DECIMAL(4, 2), not the operand's 18 digits.
+    sql_test::Fixture h;
+    h.ddl(std::get<Ddl>(bind_sql(h.cat(), "CREATE TABLE m (k BIGINT PRIMARY KEY, d NUMERIC(4, 2), e NUMERIC(10, 2))").stmt));
+    for (const auto* sql : {"UPDATE m SET e = e + $1, d = $1 WHERE k = $2", "UPDATE m SET d = $1, e = e + $1 WHERE k = $2"}) {
+      INFO(sql);
+      auto range = bind_sql(h.cat(), sql).param_sql[0];
+      REQUIRE(range);
+      CHECK(range->kind == SqlKind::Decimal);
+      CHECK(range->precision == 4);
+    }
   }
   //                       0         1         2         3         4
   //                       01234567890123456789012345678901234567890123456789

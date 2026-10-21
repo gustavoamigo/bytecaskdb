@@ -115,6 +115,11 @@ struct RowBuilder {
   const RowLayout* layout;
   RowWriter writer;
   bool done{false};
+  // The finished row bc_row_end's view reads, held here rather than in the
+  // arena: a statement that writes many rows builds one per row, and the
+  // arena is only reset when the statement ends. A builder lives until
+  // reset, and moving one keeps this buffer where it is.
+  Bytes built;
 };
 
 enum class EffectKind { Put, Del, DelRange, GuardUnchanged, GuardRange, GuardPresent, GuardAbsent };
@@ -2811,7 +2816,7 @@ namespace {
 class PushedBuilder {
 public:
   PushedBuilder(bc_ctx* cx, const Table& t) : cx_{cx}, i_{cx->rows.size()} {
-    cx_->rows.push_back(RowBuilder{t.id, &t.layout, RowWriter{t.layout}, false});
+    cx_->rows.push_back(RowBuilder{t.id, &t.layout, RowWriter{t.layout}, false, {}});
   }
   PushedBuilder(const PushedBuilder&) = delete;
   auto operator=(const PushedBuilder&) -> PushedBuilder& = delete;
@@ -2944,12 +2949,11 @@ bc_view bc_row_end(bc_ctx* cx, bc_row r) {
     not_null(cx, b->table, *col);
     return {};
   }
-  Bytes row;
-  if (!b->writer.finish(row)) {
+  if (!b->writer.finish(b->built)) {
     cx->fail(BC_E_LIMIT, "row over the engine's value limit");
     return {};
   }
-  return cx->arena_view(row, b->table, RowKind::Built);
+  return cx->make_view(b->built.data(), b->built.size(), kNoCursor, 0, b->table, RowKind::Built);
   BC_GUARD_END(cx)
   return {};
 }
