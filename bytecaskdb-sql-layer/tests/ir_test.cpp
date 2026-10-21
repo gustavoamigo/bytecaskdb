@@ -73,6 +73,9 @@ TEST_CASE("ir: check refuses what the printer can't print", "[sql][ir]") {
   ir::Scan covering{3, {0}, {}, {0}, true};
   CHECK_NOTHROW(ir::check(plan(ir::Select{covering, {kId}})));
   refused(plan(ir::Select{covering, {kD}}), "DOUBLE target");
+  refused(plan(ir::Select{covering, {kId}, true}), "FOR UPDATE scan that covers");
+  ir::Scan fetching{3, {0}, {}, {0}, false};
+  CHECK_NOTHROW(ir::check(plan(ir::Select{fetching, {kId}, true})));
 
   refused(plan(ir::Insert{}), "sets no column");
   refused(plan(ir::Update{ir::PointGet{{0}}, {}}), "sets no column");

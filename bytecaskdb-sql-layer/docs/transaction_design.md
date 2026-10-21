@@ -1,10 +1,10 @@
 # Transactions in the SQL layer
 
-Status: **design, approved by the owner (2026-10-20, #491).** Built
-(slice A): the transaction's view, statements inside a transaction, commit
-with 40001 on any conflict and 08007 when its outcome is unknown, and DDL
-during an open transaction. Not yet built (slice B): insert claims (23505
-at commit), 0A000 for DDL given to a transaction, and `FOR UPDATE`. It
+Status: **design, approved by the owner (2026-10-20, #491); built.**
+Slice A built the transaction's view, statements inside a transaction,
+commit with 40001 on a conflict and 08007 when its outcome is unknown, and
+DDL during an open transaction. Slice B built insert claims (23505 at
+commit), 0A000 for DDL given to a transaction, and `FOR UPDATE`. It
 decides how the layer runs several statements as one
 transaction, which the MVP needs: TPROC-C's New-Order is about thirty
 statements that read their own writes (#487, *MVP*). Each decision is
@@ -245,8 +245,20 @@ duplicate.
   `contains_key` for a primary key, the first key at or after a prefix for
   a unique prefix. The first claim that is taken is the error: `BC_C_UNIQUE`
   with that claim's table or index id, SQLSTATE 23505. If none is taken, the
-  conflict is 40001.
-- **What it costs.** Nothing on a commit that succeeds. On a conflict, one
+  conflict is 40001, and so it is when the check cannot read: the conflict
+  is the fact, and the claim check only names it.
+- **Where claims are kept.** A statement's claims are its own until
+  `bc_txn_add`, which appends them to the transaction's with its writes, so
+  a failed statement leaves none. They count towards the transaction's
+  buffer bound. At the check, a claim counts only while the transaction's
+  final writes still put its key or its index entry: a value a later
+  statement moved or deleted away claims nothing. An index claim is taken
+  only by another row's entry: two updates of one row to one value conflict
+  on the row, 40001, as in PostgreSQL. (That statement's unique
+  check still guards the value it moved away, so such a commit can
+  conflict where PostgreSQL's would not: #537.)
+- **What it costs.** No read on a commit that succeeds: each claim is a
+  copy of its key, kept until the commit. On a conflict, one
   record read per claim: at most one per inserted row plus one per unique
   index it maintains. These reads come after every statement has run, so
   they aren't charged to a statement's budget; they are bounded by the
@@ -284,8 +296,17 @@ before its cleanup.
 - **Snapshot isolation by default.** One snapshot per transaction. Writes
   are checked by the engine, and no guard is emitted for reads.
 - **`SELECT … FOR UPDATE`** emits `bc_guard_unchanged` on every row key it
-  returns, kept with the transaction's guards. The commit fails if one of
-  those rows changed since the snapshot. This is how TPROC-C's
+  returns, through `bc_guard_row`, which encodes the row's key into the
+  guard without the arena, kept with the transaction's guards. The
+  commit fails if one of those rows changed since the snapshot, in a
+  transaction that wrote nothing too: the engine checks a guard-only plan
+  and writes nothing. An autocommit execution that writes nothing commits
+  nothing, guards and all: what its one statement read is its snapshot's
+  either way, so the engine, which may be refusing writes, is not asked. A
+  range an index would cover reads each row instead, for its key. Only
+  `FOR UPDATE` itself is accepted: `FOR SHARE` and `FOR NO KEY UPDATE`,
+  `NOWAIT` and `SKIP LOCKED`, which only mean something to a locker, and
+  `FOR UPDATE OF` are refused at parse. This is how TPROC-C's
   read-then-decide steps avoid write skew where they need to. A row the
   transaction also writes is already covered, and the extra guard is
   harmless.
@@ -312,7 +333,10 @@ wrote a table the DDL changed.
 - A DDL that commits meanwhile changes the catalog records of the tables it
   touches. A transaction that wrote one of those tables conflicts at commit
   through the existing catalog-record guard, and gets 40001. A transaction
-  that only read them was consistent with its pin and commits.
+  that only read them was consistent with its pin and commits, unless it
+  took `FOR UPDATE` rows the DDL rewrote (an `ADD COLUMN … DEFAULT`): its
+  guards see the change, and it gets 40001. PostgreSQL would make the DDL
+  wait for those row locks; never waiting, the reader fails instead.
 - A statement whose plan doesn't verify against the pinned version (cached
   against a newer catalog, naming a column the pin lacks) fails with 40001
   and closes the transaction, rather than recompiling against a catalog
@@ -326,8 +350,11 @@ wrote a table the DDL changed.
   and may be retried. The one wait left is a statement's pin: it waits for
   the instant between a DDL's batch reaching the engine and the new catalog
   taking effect, never while the DDL writes or syncs.
-- A DDL statement given to `Transaction::execute` is refused (SQLSTATE
-  0A000) in the MVP. DDL stays its own atomic operation. Transactional DDL
+- A DDL statement given to `Transaction::execute` is refused with
+  `FeatureNotSupported` (SQLSTATE 0A000; Python's
+  `bytecask_sql.FeatureNotSupported`, a `SqlError`) in the MVP, before
+  anything runs, and the transaction aborts, as any error aborts one in
+  PostgreSQL. DDL stays its own atomic operation. Transactional DDL
   is later.
 
 PostgreSQL makes the DDL wait for the open transaction's locks; see *Known
@@ -440,8 +467,8 @@ for their shape.
 
 ## Proposed `CONTRACT.md` changes
 
-Not yet in `CONTRACT.md`. They go in with the implementation, named in its
-PR.
+In `CONTRACT.md` since slices A and B, as their PRs named them; kept here
+as the design's record.
 
 **Added (Transactions):**
 | Guarantee | Proved by |
@@ -479,6 +506,7 @@ Each comes from the rule *never wait*.
 | A second inserter of a unique key waits, then gets 23505 at its `INSERT`. | Both insert. The second to commit gets 23505 at `commit()` (*Commit and conflicts*). | The same outcome, reported at commit instead of after a wait. |
 | `SELECT … FOR UPDATE` locks the rows: other writers wait. | It guards them: the guarding transaction gets 40001 at commit if a writer of those rows committed first. A writer is never held back. | A guard, not a lock. |
 | DDL waits for the locks of open transactions on its table. | DDL commits at once. An open transaction that wrote the table gets 40001 at commit. | DDL never waits. |
+| On a standby, `SELECT … FOR UPDATE` is refused at the statement (25006). | On a follower it runs, and a transaction that used it fails at commit with the engine's refusal of writes, as its writes would; in autocommit it reads as the `SELECT` does. | Its guards are checked by the engine at commit, which a follower refuses. |
 
 ## Later, and why none of it blocks the MVP
 

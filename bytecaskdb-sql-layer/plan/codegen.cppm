@@ -251,9 +251,17 @@ void print(Writer& w, const ir::Insert& s) {
   w.line("bc_emit_count(cx, 1);");
 }
 
+// FOR UPDATE: the row's key is guarded unchanged, so the commit conflicts
+// if a concurrent commit changed the row (docs/transaction_design.md,
+// *Isolation*).
+void guard_row(Writer& w, const ir::Select& s, const std::string& row) {
+  if (s.for_update) w.line("bc_guard_row(cx, " + w.tbl() + ", " + row + ");");
+}
+
 void print_point_select(Writer& w, const ir::Select& s, const ir::PointGet& g) {
   w.reads(w.p().table);
   fetch_row(w, g, "row", false);
+  guard_row(w, s, "row");
   emit_columns(w, s.targets, "row");
 }
 
@@ -302,6 +310,7 @@ void print_scan_select(Writer& w, const ir::Select& s, const ir::Scan& sc) {
     w.line("bc_emit_end(cx);");
   } else {
     w.line("bc_view row = bc_scan_row(cx, c);");
+    guard_row(w, s, "row");
     emit_columns(w, s.targets, "row");
   }
   w.close();

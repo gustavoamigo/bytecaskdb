@@ -27,7 +27,8 @@
 // bytecask_sql.Closed, also a ValueError, for any call after close();
 // bytecask_sql.TransactionAborted (SQLSTATE 25P02) for a statement on a
 // transaction a statement failed in; bytecask_sql.TransactionResolutionUnknown
-// (08007) for a commit whose outcome is unknown. A transaction whose commit
+// (08007) for a commit whose outcome is unknown; bytecask_sql.FeatureNotSupported
+// (0A000), a SqlError, for a DDL statement given to a transaction. A transaction whose commit
 // conflicts raises ExecError with conflict set (40001). All
 // derive from bytecask_sql.Error. Anything else, an engine refusal at run
 // time included, is nanobind's translation of the C++ exception.
@@ -65,7 +66,7 @@ namespace {
 // The module's exception classes, created at import and owned by the module
 // object; plain handles, so nothing runs at process exit.
 struct Exceptions {
-  nb::handle error, sql_error, exec_error, closed, aborted, unknown;
+  nb::handle error, sql_error, exec_error, closed, aborted, unknown, not_supported;
 };
 Exceptions exceptions;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables): set once at import
 // decimal.Decimal, looked up once at import, not per value; held for the
@@ -239,6 +240,9 @@ NB_MODULE(bytecask_sql, m) {
   exceptions.unknown =
       PyErr_NewException("bytecask_sql.TransactionResolutionUnknown", exceptions.error.ptr(), nullptr);
   m.attr("TransactionResolutionUnknown") = exceptions.unknown;
+  exceptions.not_supported =
+      PyErr_NewException("bytecask_sql.FeatureNotSupported", exceptions.sql_error.ptr(), nullptr);
+  m.attr("FeatureNotSupported") = exceptions.not_supported;
   decimal_type = nb::object(nb::module_::import_("decimal").attr("Decimal")).release();
 
   nb::register_exception_translator([](const std::exception_ptr& p, void*) {
@@ -256,6 +260,8 @@ NB_MODULE(bytecask_sql, m) {
       PyErr_SetString(exceptions.closed.ptr(), e.what());
     } catch (const sql::TransactionAborted& e) {
       PyErr_SetString(exceptions.aborted.ptr(), e.what());
+    } catch (const sql::FeatureNotSupported& e) {
+      PyErr_SetString(exceptions.not_supported.ptr(), e.what());
     } catch (const sql::TransactionResolutionUnknown& e) {
       PyErr_SetString(exceptions.unknown.ptr(), e.what());
     }

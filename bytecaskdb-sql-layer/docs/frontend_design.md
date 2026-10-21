@@ -337,7 +337,7 @@ needed; every pattern below uses calls `bc_plan.h` declares.
 | `MIN(col)`, `col` an `ASC` part directly after the equality prefix, no residual | `MinFromFirstKey`, its `Scan` forward with `rest` = `PresentOnly` when `col` is nullable | the first entry of the scan, which starts past the NULL part when it is `PresentOnly`, then `break`. A `DESC` part (its first entry is the maximum) takes the `Aggregate` row |
 | `COUNT(DISTINCT col)` | `Aggregate` | `bc_agg_group` keyed by the column, then a count of `bc_agg_next` |
 | A join | `from` = outer, inner `Loop`s | the inner key built from the outer row: `bc_key_*` of `bc_col_*`; nested in the outer loop |
-| `FOR UPDATE` | `Rows::for_update` | `bc_guard_unchanged` on each returned row's key: the point key, or `bc_row_key` |
+| `FOR UPDATE` | `Rows::for_update` | `bc_guard_row` on each returned row: `bc_guard_unchanged` on its primary key |
 | Targets | `Rows::targets`, or `out` | `bc_emit_col`, `bc_emit_key_part`; for an aggregate, `bc_emit_i64` (`COUNT`, `SUM`, and `MIN` of an integer, `DECIMAL`, `DATE`, `TIMESTAMP` or `TIME`), `bc_emit_f64` (`MIN` of a `REAL` or `DOUBLE PRECISION`), and `bc_emit_null` over no rows |
 
 A NULL that a key needs means no row can match, since `=` and the range

@@ -234,7 +234,7 @@ class SqlMachine(RuleBasedStateMachine):
         sql = f"INSERT INTO {name}{target} VALUES ({marks})"
         return self.both(sql, params)
 
-    def lookup(self, name: str, key: tuple) -> o.Outcome:
+    def lookup(self, name: str, key: tuple, for_update: bool = False) -> o.Outcome:
         t = self.tables[name]
         where = " AND ".join(f"{c} = ${i + 1}" for i, c in enumerate(t.pk))
         # The layer types $n by its column, as PostgreSQL types a $n it is
@@ -246,7 +246,10 @@ class SqlMachine(RuleBasedStateMachine):
             return f"${n}::{ty.sql}" if ty.sql in ("smallint", "integer", "real") else f"${n}"
 
         pg_where = " AND ".join(f"{c} = {typed(c, i + 1)}" for i, c in enumerate(t.pk))
-        return self.both(f"{t.select_all} WHERE {where}", key, pg_sql=f"{t.select_all} WHERE {pg_where}")
+        # FOR UPDATE returns what the plain SELECT does: on one connection
+        # nothing changes a row it guards (the layer) or locks (PostgreSQL).
+        lock = " FOR UPDATE" if for_update else ""
+        return self.both(f"{t.select_all} WHERE {where}{lock}", key, pg_sql=f"{t.select_all} WHERE {pg_where}{lock}")
 
     def begin(self) -> None:
         # PostgreSQL's REPEATABLE READ, like the layer's, takes its snapshot
@@ -372,7 +375,7 @@ class SqlMachine(RuleBasedStateMachine):
             key = data.draw(st.sampled_from(keys), label="key")
         else:
             key = tuple(data.draw(st.none() | values(t.column(c).type), label=c) for c in t.pk)
-        self.lookup(t.name, key)
+        self.lookup(t.name, key, for_update=data.draw(st.booleans(), label="FOR UPDATE"))
 
     @precondition(lambda self: self.txn is None)
     @rule()

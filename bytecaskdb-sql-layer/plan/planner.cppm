@@ -95,7 +95,8 @@ auto scan(const Table& t, const bound::Select& s) -> ir::Scan {
     return std::ranges::any_of(ix.parts, [&](const IndexPart& p) { return p.col_id == id; }) ||
            std::ranges::find(t.pk_col_ids, id) != t.pk_col_ids.end();
   };
-  out.covering = std::ranges::all_of(s.targets, in_key);
+  // FOR UPDATE reads each row, whose key it guards.
+  out.covering = !s.for_update && std::ranges::all_of(s.targets, in_key);
   if (eq) {
     out.eq_params = {eq->param};
     return out;
@@ -161,6 +162,7 @@ auto plan_statement(const bound::Bound& b, const Catalog& cat) -> ir::Plan {
             sel.from = scan(t, s);
           }
           for (auto id : s.targets) sel.targets.push_back(column(t, id));
+          sel.for_update = s.for_update;
           return sel;
         } else if constexpr (std::is_same_v<T, bound::Update>) {
           const auto& t = *s.table;
