@@ -125,7 +125,7 @@ LSAN_OPTIONS=suppressions=$PWD/bytecaskdb-sql-layer/tests/lsan_alloc_sweeps.supp
 
 ## The MVP gate harness
 
-Status: **design, for review.** The MVP gate (#487, *MVP*;
+Status: **design, approved (owner, 2026-10-21).** The MVP gate (#487, *MVP*;
 `docs/frontend_design.md`, *The MVP gate* and Decision 7) runs TPROC-C's
 transaction mix through SQL at 1, 16 and 48 threads and reports the
 layer's own numbers. This section is what the harness does; the
