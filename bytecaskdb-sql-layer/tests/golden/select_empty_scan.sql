@@ -1,0 +1,1 @@
+SELECT FROM r WHERE s = $1
