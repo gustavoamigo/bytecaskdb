@@ -34,15 +34,17 @@ private:
   std::int32_t pos_;
 };
 
-// A select-list or SET operand: a column, a parameter, a sum or difference
-// of two, or COUNT(*) / COUNT(column).
+// A select-list or SET operand: a column, a parameter, an integer
+// literal, a sum or difference of two, or COUNT(*) / COUNT(column).
 struct Expr {
-  enum class Kind { Column, Param, Add, Sub, Count };
+  enum class Kind { Column, Param, Const, Add, Sub, Count };
   Kind kind;
   std::string column;       // Column; Count's argument, "" for COUNT(*)
   std::uint32_t param{0};   // Param: zero-based ($1 is 0)
   std::unique_ptr<Expr> lhs, rhs;  // Add, Sub
   std::int32_t pos{-1};
+  std::string table;          // Column, Count: the table it is qualified by, "" for none
+  std::int64_t constant{0};   // Const: an integer literal (Add and Sub's right operand only)
 };
 
 // One conjunct of a WHERE clause: a column compared with an expression.
@@ -51,6 +53,7 @@ struct Compare {
   Op op;
   Expr lhs, rhs;
   std::int32_t pos{-1};
+  bool on{false};  // a JOIN's ON conjunct, not the WHERE's
 };
 
 // A constant, as written: DEFAULT's operand. Numbers keep their text, so
@@ -123,16 +126,19 @@ struct OrderItem {
   std::string column;
   bool desc{false};
   std::int32_t pos{-1};
+  std::string table;  // the table it is qualified by, "" for none
 };
 
 struct Select {
   std::vector<Expr> targets;
   std::string table;
+  std::string join;  // a second table, "" for none: FROM a, b or a [INNER] JOIN b ON …
   std::vector<Compare> where;
   std::vector<OrderItem> order_by;
   std::optional<std::int64_t> limit;  // nullopt: none, LIMIT ALL or LIMIT NULL
   std::int32_t pos{-1};
   bool for_update{false};  // FOR UPDATE: a guard on each row returned, never a lock
+  std::int32_t table_pos{-1}, join_pos{-1};  // where table and join are named
 };
 
 struct Assignment {

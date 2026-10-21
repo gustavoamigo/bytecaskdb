@@ -32,15 +32,17 @@ struct Column {
   std::uint32_t id{0};
   PhysType type{PhysType::I64};
   bool nullable{false};
+  std::uint32_t table{0};  // the plan's table, or a join's other one
 };
 
 // A value set into a row: a parameter, a column of the row in hand, or a
-// column plus or minus a parameter.
+// column plus or minus a parameter or a constant.
 struct Expr {
   enum class Kind { Param, Column, Add, Sub };
   Kind kind{Kind::Param};
   std::uint32_t param{0};  // Param, and Add's and Sub's right operand
   Column col{};            // Column, and Add's and Sub's left operand
+  std::optional<std::int64_t> constant;  // Add's and Sub's right operand instead of the parameter
 };
 
 // The whole primary key by equality: the parameter of each part, in key
@@ -84,6 +86,13 @@ struct NullSplitScan {
   Scan present;
 };
 
+// Two tables, each named by its whole primary key: the row pair, if both
+// rows exist. `tables[0]` is the first table in FROM, the plan's table.
+struct PointJoin {
+  std::uint32_t tables[2]{};
+  PointGet rows[2];
+};
+
 // COUNT(*), or COUNT(arg): its non-NULL values. from_keys: bc_count_range
 // over a Scan's range, which counts its entries (COUNT(*), or an arg no
 // matching row holds NULL in).
@@ -95,7 +104,7 @@ struct Count {
 // The result: the targets of each row, or one COUNT row. No target is a
 // row of no columns, as PostgreSQL's `SELECT FROM`.
 struct Select {
-  std::variant<PointGet, Scan, NullSplitScan> from;
+  std::variant<PointGet, Scan, NullSplitScan, PointJoin> from;
   std::vector<Column> targets;  // from the row, or from the entry's key when the scan covers
   std::optional<Count> count;   // instead of targets
   std::optional<std::int64_t> limit;
@@ -120,8 +129,8 @@ struct Delete {
 using Statement = std::variant<Select, Insert, Update, Delete>;
 
 struct Plan {
-  std::uint32_t table{0};                         // the one table the plan reads or writes
-  std::vector<Catalog::PlanConstant> constants;   // the table's, in the catalog's order
+  std::uint32_t table{0};                         // the table the plan reads or writes; a join's first
+  std::vector<Catalog::PlanConstant> constants;   // its tables', in the catalog's order
   std::uint64_t catalog_version{0};
   std::vector<PhysType> param_types;
   Statement stmt;
@@ -183,6 +192,10 @@ void check(const Plan& p, const Scan& s) {
 
 void check(const Plan& p, const NullSplitScan& s) { check(p, s.present); }
 
+void check(const Plan& p, const PointJoin& j) {
+  for (const auto& g : j.rows) check(p, g);
+}
+
 void check(const Plan& p, const Select& s) {
   const auto* scan = scan_of(s);
   std::visit([&](const auto& path) { check(p, path); }, s.from);
@@ -203,7 +216,7 @@ void check(const Plan& p, const Update& s) {
   check(p, s.row);
   if (s.set.empty()) broken("an update that sets no column");
   for (const auto& [col, e] : s.set) {
-    if (e.kind != Expr::Kind::Column) check_params(p, {e.param});
+    if (e.kind != Expr::Kind::Column && !e.constant) check_params(p, {e.param});
     if (e.kind == Expr::Kind::Column && e.col.type != col.type) broken("a column set from a column of another type");
     if ((e.kind == Expr::Kind::Add || e.kind == Expr::Kind::Sub) &&
         (e.col.type != PhysType::I64 || col.type != PhysType::I64)) {

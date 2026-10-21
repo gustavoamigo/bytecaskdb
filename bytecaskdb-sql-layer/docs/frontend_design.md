@@ -1,7 +1,7 @@
 # SQL front end for the MVP: dialect subset and statement IR
 
 Status: **design (#492), approved (owner, 2026-10-21): the *Decisions*;
-the rest reviewed with the coordinator.** Slices 0 and 1 are built
+the rest reviewed with the coordinator.** Slices 0 to 3 are built
 (*Slices*); the rest is design. It decides
 the SQL the MVP accepts, the intermediate form the code generator prints
 plans from, and the planner's choices, all scoped by TPROC-C (#487, *MVP*).
@@ -590,9 +590,31 @@ its transaction test.
    - The refusals carry no SQLSTATE: `SqlError` has none yet (#541). Their
      messages are the table's.
 2. **Multi-statement transactions** (#491, another session): the
-   statements of slice 1 run in a `Transaction`.
+   statements of slice 1 run in a `Transaction`. As built: #491's slices A
+   and B, and `tests/proof/test_tpcc.py` runs the TPROC-C transactions
+   through `Transaction` against PostgreSQL.
 3. **New-Order:** the two-point join, `FOR UPDATE`, integer literals,
-   `col + 1`.
+   `col + 1`. As built, with these differences from the design above:
+   - A join is of two tables, each named by its whole primary key from
+     parameters, read in `FROM` order: `FROM a, b` or `a [INNER] JOIN b ON
+     …`, whose `ON` conjuncts join the `WHERE`'s. Its IR is a `PointJoin`
+     of two `PointGet`s, not two `Loop`s: the join on a column of the
+     outer row is slice 5's, and brings the `Loop`. Any other join is
+     refused with `no plan:`, as is one with `ORDER BY` (*What the planner
+     refuses*, row 1). An aggregate or `FOR UPDATE` on a join is refused at
+     bind. A table joined with itself is refused (no aliases).
+   - Columns may be qualified by their table's name; an unqualified name
+     both tables have is refused, as PostgreSQL refuses it (42702).
+   - An integer literal is taken only as the right operand of `col + n`
+     and `col - n` in `SET`, within BIGINT; elsewhere it is still refused.
+     It is in the column's representation: a `DECIMAL`'s scaled by
+     10^scale, refused past 18 digits. The sum is computed in `int64_t`
+     and checked as the column's type when stored, the check PostgreSQL's
+     assignment makes, whether PostgreSQL typed the literal integer or
+     bigint. On a SMALLINT or INTEGER column a literal of 2^32 or more in
+     magnitude is held as 2^32: the sum leaves the column either way, and
+     cannot overflow `int64_t` (BIGINT's overflow is #540).
+   - `FOR UPDATE` is #538's (#491, slice B).
 4. **Delivery:** the covering prefix scan with `LIMIT 1`, `MIN`, `UPDATE`
    of many rows, `SUM`.
 5. **Stock-Level:** the join on an outer column, a range after a prefix,

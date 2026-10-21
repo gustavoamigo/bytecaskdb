@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Gustavo Amigo
-"""TPROC-C's Payment and Order-Status through SQL, against PostgreSQL
-(docs/frontend_design.md, *Tests*, slice 1).
+"""TPROC-C's Payment, Order-Status and New-Order through SQL, against
+PostgreSQL (docs/frontend_design.md, *Tests*, slices 1 and 3).
 
 A small fixture (one warehouse, two districts, thirty customers each, a few
 orders per customer) is loaded on both sides. Then a fixed seed runs a mix
@@ -9,7 +9,10 @@ of the two transactions on one thread: each statement of
 docs/frontend_design.md's P1-P11 and O1-O5 goes to the layer in a
 `Transaction` and to PostgreSQL in a REPEATABLE READ transaction, with the
 client's logic (the customer by last name, the new balance and c_data)
-between them, as HammerDB's driver keeps it. Every statement's result must
+between them, as HammerDB's driver keeps it. New-Order's N1-N9 run
+the same way, one order in twenty naming an item that does not exist
+(TPC-C's one in a hundred would rarely come up in this short run), which
+the client rolls back on both sides. Every statement's result must
 agree, and so must every table after the run.
 
 The layer takes a DECIMAL parameter as its scaled integer and a TIMESTAMP
@@ -141,7 +144,7 @@ def stamp(rng: random.Random) -> datetime.datetime:
     return datetime.datetime(2026, 1, 1) + datetime.timedelta(seconds=rng.randint(0, 10**7))
 
 
-DISTRICTS, CUSTOMERS = 2, 30
+DISTRICTS, CUSTOMERS, ITEMS = 2, 30, 50
 
 
 def load(p: Pair, rng: random.Random) -> dict:
@@ -193,6 +196,16 @@ def load(p: Pair, rng: random.Random) -> dict:
                           (INT, INT, INT, INT, INT, INT, INT, DEC2, TS, TEXT))
                 o_id += 1
         next_o_id[d] = o_id
+        p.run("UPDATE district SET d_next_o_id = $1 WHERE d_w_id = $2 AND d_id = $3", (o_id, 1, d), (INT, INT, INT))
+    for i in range(1, ITEMS + 1):
+        p.run("INSERT INTO item (i_id, i_im_id, i_name, i_price, i_data) VALUES ($1, $2, $3, $4, $5)",
+              (i, rng.randint(1, 10000), letters(rng, 14, 24), money(rng, 1, 100), letters(rng, 26, 50)),
+              (INT, INT, TEXT, DEC2, TEXT))
+        p.run("INSERT INTO stock (s_i_id, s_w_id, s_quantity, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, "
+              "s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10, s_ytd, s_order_cnt, s_remote_cnt, s_data) "
+              "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+              (i, 1, rng.randint(10, 100), *(letters(rng, 24, 24) for _ in range(10)), 0, 0, 0, letters(rng, 26, 50)),
+              (INT, INT, INT, *([TEXT] * 10), INT, INT, INT, TEXT))
     p.commit()
     return next_o_id
 
@@ -284,6 +297,41 @@ def order_status(p: Pair, rng: random.Random) -> None:
     p.commit()
 
 
+def new_order(p: Pair, rng: random.Random) -> None:
+    d = rng.randint(1, DISTRICTS)
+    c_id = rng.randint(1, CUSTOMERS)
+    items = [rng.randint(1, ITEMS) for _ in range(rng.randint(2, 8))]
+    if rng.random() < 0.05:
+        items[-1] = ITEMS + 1  # no such item: the client rolls back
+    p.begin()
+    p.run("SELECT c_discount, c_last, c_credit, w_tax FROM customer, warehouse "
+          "WHERE w_id = $1 AND c_w_id = $1 AND c_d_id = $2 AND c_id = $3", (1, d, c_id), (INT, INT, INT))
+    [(o_id, _)] = p.run("SELECT d_next_o_id, d_tax FROM district WHERE d_id = $1 AND d_w_id = $2 FOR UPDATE",
+                        (d, 1), (INT, INT))
+    p.run("UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_id = $1 AND d_w_id = $2", (d, 1), (INT, INT))
+    p.run("INSERT INTO orders (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_ol_cnt, o_all_local) "
+          "VALUES ($1, $2, $3, $4, $5, $6, $7)", (o_id, d, 1, c_id, stamp(rng), len(items), 1),
+          (INT, INT, INT, INT, TS, INT, INT))
+    p.run("INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES ($1, $2, $3)", (o_id, d, 1), (INT, INT, INT))
+    for number, i_id in enumerate(items, start=1):
+        item = p.run("SELECT i_price, i_name, i_data FROM item WHERE i_id = $1", (i_id,), (INT,))
+        if not item:
+            rollback(p)
+            return
+        [(price, _, _)] = item
+        [(quantity, _, *dists)] = p.run(
+            "SELECT s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, "
+            "s_dist_08, s_dist_09, s_dist_10 FROM stock WHERE s_i_id = $1 AND s_w_id = $2", (i_id, 1), (INT, INT))
+        ordered = rng.randint(1, 10)
+        quantity = quantity - ordered if quantity - ordered >= 10 else quantity - ordered + 91
+        p.run("UPDATE stock SET s_quantity = $1 WHERE s_i_id = $2 AND s_w_id = $3", (quantity, i_id, 1), (INT, INT, INT))
+        p.run("INSERT INTO order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, ol_quantity, "
+              "ol_amount, ol_dist_info) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+              (o_id, d, 1, number, i_id, 1, ordered, price * ordered, dists[d - 1]),
+              (INT, INT, INT, INT, INT, INT, INT, DEC2, TEXT))
+    p.commit()
+
+
 def tables_agree(p: Pair) -> None:
     for t in p.db.catalog():
         cols = ", ".join(c["name"] for c in t["columns"])
@@ -293,17 +341,20 @@ def tables_agree(p: Pair) -> None:
         assert o.strict(layer) == o.strict(pg_rows), f"table {t['name']}: the layer and PostgreSQL differ"
 
 
-def test_payment_and_order_status_agree_with_postgresql(dsn):
+def test_payment_order_status_and_new_order_agree_with_postgresql(dsn):
     p = Pair(dsn)
     try:
         rng = random.Random(487)
         load(p, rng)
-        for h_id in range(60):
-            if rng.random() < 0.5:
+        for h_id in range(90):
+            pick = rng.random()
+            if pick < 0.45:
+                new_order(p, rng)
+            elif pick < 0.88:
                 payment(p, rng, h_id)
             else:
                 order_status(p, rng)
         tables_agree(p)
-        assert p.statements > 400
+        assert p.statements > 1000
     finally:
         p.close()

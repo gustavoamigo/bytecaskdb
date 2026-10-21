@@ -51,7 +51,7 @@ using Op = ast::Compare::Op;
 
 auto column(const Table& t, std::uint32_t id) -> ir::Column {
   const auto& c = *t.column(id);
-  return {c.id, c.type, c.nullable};
+  return {c.id, c.type, c.nullable, t.id};
 }
 
 [[noreturn]] void residual(const Table& t, const bound::Compare& c) {
@@ -272,7 +272,7 @@ auto select_from(const Table& t, const bound::Select& s) -> std::variant<ir::Poi
 
 auto select(const Table& t, const bound::Select& s) -> ir::Select {
   ir::Select sel;
-  sel.from = select_from(t, s);
+  std::visit([&](auto&& from) { sel.from = std::move(from); }, select_from(t, s));
   sel.limit = s.limit;
   sel.for_update = s.for_update;
   const auto* scan = ir::scan_of(sel);
@@ -289,6 +289,24 @@ auto select(const Table& t, const bound::Select& s) -> ir::Select {
                      std::ranges::none_of(s.where, [&](const auto& w) { return w.col_id == count.arg->id; });
   count.from_keys = scan != nullptr && !may_be_null;
   sel.count = count;
+  return sel;
+}
+
+// Two tables, each by a point lookup, in FROM order: the two-point join
+// (docs/frontend_design.md, *Joins*; the join on a column is slice 5).
+auto join(const bound::Join& s) -> ir::Select {
+  if (s.ordered) no_plan("ORDER BY on a join");
+  const Table* sides[2]{s.table, s.second};
+  ir::PointJoin j{{s.table->id, s.second->id}, {}};
+  for (std::size_t i = 0; i < 2; ++i) {
+    auto g = point_get(*sides[i], s.where[i]);
+    if (!g) no_plan("a join must name the row of each table by its whole primary key yet");
+    j.rows[i] = *g;
+  }
+  ir::Select sel;
+  sel.from = j;
+  sel.limit = s.limit;
+  for (const auto& c : s.targets) sel.targets.push_back(column(*sides[c.side], c.col_id));
   return sel;
 }
 
@@ -316,6 +334,11 @@ auto plan_statement(const bound::Bound& b, const Catalog& cat) -> ir::Plan {
         } else if constexpr (std::is_same_v<T, bound::Select>) {
           table(*s.table);
           return select(*s.table, s);
+        } else if constexpr (std::is_same_v<T, bound::Join>) {
+          table(*s.table);
+          auto second = Catalog::constants(*s.second);
+          out.constants.insert(out.constants.end(), second.begin(), second.end());
+          return join(s);
         } else if constexpr (std::is_same_v<T, bound::Update>) {
           const auto& t = *s.table;
           table(t);
@@ -325,8 +348,8 @@ auto plan_statement(const bound::Bound& b, const Catalog& cat) -> ir::Plan {
             switch (e.kind) {
               case bound::Expr::Kind::Param: v = {ir::Expr::Kind::Param, e.param, {}}; break;
               case bound::Expr::Kind::Column: v = {ir::Expr::Kind::Column, 0, column(t, e.col_id)}; break;
-              case bound::Expr::Kind::Add: v = {ir::Expr::Kind::Add, e.param, column(t, e.col_id)}; break;
-              case bound::Expr::Kind::Sub: v = {ir::Expr::Kind::Sub, e.param, column(t, e.col_id)}; break;
+              case bound::Expr::Kind::Add: v = {ir::Expr::Kind::Add, e.param, column(t, e.col_id), e.constant}; break;
+              case bound::Expr::Kind::Sub: v = {ir::Expr::Kind::Sub, e.param, column(t, e.col_id), e.constant}; break;
             }
             up.set.emplace_back(column(t, id), v);
           }
