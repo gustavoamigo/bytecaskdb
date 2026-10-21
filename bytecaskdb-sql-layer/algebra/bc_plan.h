@@ -140,18 +140,17 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
    version, through the overlay of the earlier statements' writes. One
    context at a time: from bc_ctx_begin_txn until it is reset, a context is
    attached to the transaction, and bc_ctx_begin_txn on another context is
-   BC_E_HANDLE, changing nothing. bc_txn_commit needs every statement reset:
-   with a context attached to the transaction, or called through a context
-   attached to any, it is BC_E_HANDLE and commits nothing (a statement the
-   context it was called through was running then fails, and aborts its
-   transaction). An aborted or ended transaction is reported first. A statement that fails, or that takes what the transaction
-   holds past max_bytes (BC_E_LIMIT), aborts the transaction: it releases its
-   snapshot and pin at once (bc_txn_catalog_version is then 0) and is then
-   only freed. bc_txn_commit submits the statements' writes as one batch; its
-   errors are the context's, BC_E_UNKNOWN when the outcome is unknown.
-   An abort and bc_txn_free detach the attached context, which reads nothing
-   of the transaction after and keeps its error and its finished
-   statement's results. */
+   BC_E_HANDLE, changing nothing. A statement that fails, or that takes what
+   the transaction holds past max_bytes (BC_E_LIMIT), aborts the
+   transaction: it releases its snapshot and pin at once (bc_txn_catalog_version
+   is then 0) and is then only freed. An abort and bc_txn_free detach the
+   attached context, which reads nothing of the transaction after and keeps
+   its error and its finished statement's results.
+   bc_txn_commit submits the statements' writes as one batch. It touches no
+   context and reports through the transaction (bc_txn_error, BC_E_UNKNOWN
+   when the outcome is unknown). An aborted or ended transaction is
+   BC_E_HANDLE; so is one with a context still attached, which changes
+   nothing: reset the context and commit again. */
 typedef struct bc_txn bc_txn;
 bc_txn *bc_txn_new(bc_db *db, const bc_catalog *cat, uint64_t max_bytes);
 void    bc_txn_free(bc_txn *);                                                /* a transaction not committed writes nothing */
@@ -162,7 +161,10 @@ uint64_t bc_txn_catalog_version(const bc_txn *);  /* the catalog version pinned 
 bool    bc_txn_repin(bc_txn *);                   /* before any statement was added, with no context attached:
                                                      drops the pin, so the next statement pins the live catalog
                                                      and a new snapshot; false, changing nothing, otherwise */
-enum bc_commit_result bc_txn_commit(bc_ctx *, bc_txn *, bool sync);
+enum bc_commit_result bc_txn_commit(bc_txn *, bool sync);
+enum bc_error_code bc_txn_error(const bc_txn *);  /* of the last bc_txn_commit */
+const char *bc_txn_error_message(const bc_txn *);
+uint32_t bc_txn_error_detail(const bc_txn *);
 
 /* Parameters and results */
 int64_t  bc_param_i64(bc_ctx *, uint32_t i);

@@ -197,9 +197,8 @@ auto autocommit(Fixture& f, bc_plan_fn plan, std::vector<bc_value> p) -> int {
 }
 
 auto commit(Fixture& f, bc_txn* txn) -> int {
-  auto r = bc_txn_commit(f.cx, txn, false);
-  bc_ctx_reset(f.cx);
-  return r;
+  bc_ctx_reset(f.cx);  // a commit needs every statement reset
+  return bc_txn_commit(txn, false);
 }
 
 struct TxnPtr {
@@ -555,7 +554,8 @@ TEST_CASE("transactions: an aborted transaction lets go of its snapshot; a freed
   CHECK(autocommit(f, insert_w, {std::int64_t{2}, std::int64_t{2}, bytes("c"), std::int64_t{2}}) == BC_COMMITTED);
 }
 
-TEST_CASE("transactions: one context at a time; a commit needs every statement reset", "[sql][txn]") {
+TEST_CASE("transactions: one context at a time; a commit with a statement open is refused, changing nothing",
+          "[sql][txn]") {
   Fixture f;
   create_w(f);
   auto* other = bc_ctx_new(&f.bdb, &f.bcat, 1u << 20);
@@ -571,53 +571,28 @@ TEST_CASE("transactions: one context at a time; a commit needs every statement r
     bc_ctx_reset(other);
     bc_ctx_reset(f.cx);
     REQUIRE(stmt(f, txn.p, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("a"), std::int64_t{1}}).error == BC_OK);
-    // A statement begun on `other` and not reset: a commit is refused,
-    // through `other` or through f.cx, and the transaction is as it was.
+    // A statement begun and not reset: the commit is refused on the
+    // transaction, which stays open, and no context is touched.
     bc_ctx_begin_txn(other, txn.p, &none, {});
     REQUIRE(bc_error(other) == BC_OK);
-    CHECK(bc_txn_commit(f.cx, txn.p, false) == BC_FAILED);
-    CHECK(bc_error(f.cx) == BC_E_HANDLE);
-    bc_ctx_reset(f.cx);
+    CHECK(bc_txn_commit(txn.p, false) == BC_FAILED);
+    CHECK(bc_txn_error(txn.p) == BC_E_HANDLE);
+    CHECK(bc_error(other) == BC_OK);
     CHECK(stored(f).empty());
-    // Through the context running the statement, the refusal fails that
-    // statement, and it aborts the transaction at bc_txn_add: wrong, but safe.
-    CHECK(bc_txn_commit(other, txn.p, false) == BC_FAILED);
-    CHECK(bc_error(other) == BC_E_HANDLE);
-    CHECK_FALSE(bc_txn_add(other));
+    // Once the context is reset, the same transaction commits.
     bc_ctx_reset(other);
-    CHECK(commit(f, txn.p) == BC_FAILED);  // aborted
-    CHECK(stored(f).empty());
+    CHECK(bc_txn_commit(txn.p, false) == BC_COMMITTED);
+    CHECK(bc_txn_error(txn.p) == BC_OK);
   }
   {
-    // Committing txn1 through a context attached to txn2: refused, txn1 as it
-    // was; txn2's statement then fails, and txn2 aborts. txn1 commits once
-    // committed through a reset context.
-    TxnPtr txn1{f}, txn2{f};
-    REQUIRE(stmt(f, txn1.p, insert_w, {std::int64_t{2}, std::int64_t{2}, bytes("b"), std::int64_t{2}}).error == BC_OK);
-    bc_ctx_begin_txn(other, txn2.p, &none, {});
-    REQUIRE(bc_error(other) == BC_OK);
-    CHECK(bc_txn_commit(other, txn1.p, false) == BC_FAILED);
-    CHECK(bc_error(other) == BC_E_HANDLE);
-    CHECK_FALSE(bc_txn_add(other));
-    bc_ctx_reset(other);
-    CHECK(bc_txn_catalog_version(txn2.p) == 0);  // aborted: its pin let go
-    CHECK(commit(f, txn1.p) == BC_COMMITTED);
-  }
-  {
-    // An aborted or ended transaction says so first, whatever the contexts.
+    // An ended transaction says so, first, and stays ended.
     TxnPtr txn{f};
     CHECK(commit(f, txn.p) == BC_COMMITTED);
     bc_ctx_begin_txn(other, txn.p, &none, {});
     CHECK(std::string{bc_error_message(other)} == "the transaction has ended");
     bc_ctx_reset(other);
-    // Committed through a context running another transaction's statement:
-    // the ended transaction is reported, not the context.
-    TxnPtr busy{f};
-    bc_ctx_begin_txn(f.cx, busy.p, &none, {});
-    REQUIRE(bc_error(f.cx) == BC_OK);
-    CHECK(bc_txn_commit(f.cx, txn.p, false) == BC_FAILED);
-    CHECK(std::string{bc_error_message(f.cx)} == "the transaction has ended");
-    bc_ctx_reset(f.cx);
+    CHECK(bc_txn_commit(txn.p, false) == BC_FAILED);
+    CHECK(std::string{bc_txn_error_message(txn.p)} == "the transaction has ended");
   }
   bc_ctx_free(other);
   CHECK(stored(f).size() == 1);
@@ -874,10 +849,10 @@ TEST_CASE("transactions: an allocation failure in a statement or the commit is B
           bc_ctx_run(f.cx, steps[i].plan, &ref);
           (void)bc_txn_add(f.cx);
           error = bc_error(f.cx);
-          bc_ctx_reset(f.cx);  // a commit needs every statement reset
+          bc_ctx_reset(f.cx);
         }
-        r = bc_txn_commit(f.cx, txn.p, false);
-        if (error == BC_OK) error = bc_error(f.cx);
+        r = bc_txn_commit(txn.p, false);
+        if (error == BC_OK) error = bc_txn_error(txn.p);
       } catch (...) {
         threw = true;
       }

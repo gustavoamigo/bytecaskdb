@@ -998,13 +998,13 @@ auto Transaction::commit() -> CommitOutcome {
     end_locked();
     return CommitOutcome::RolledBack;
   }
-  auto r = bc_txn_commit(h_->cx, h_->txn, true);
-  auto code = bc_error(h_->cx);
-  auto detail = bc_error_detail(h_->cx);
+  auto r = bc_txn_commit(h_->txn, true);
+  auto code = bc_txn_error(h_->txn);
+  auto detail = bc_txn_error_detail(h_->txn);
   std::string message;
   if (r == BC_FAILED && code != BC_E_UNKNOWN) {  // its exception's message is static
     try {
-      message = bc_error_message(h_->cx);
+      message = bc_txn_error_message(h_->txn);
     } catch (const std::bad_alloc&) {  // NOLINT(bugprone-empty-catch): the message is dropped, not the outcome
     }
   }
