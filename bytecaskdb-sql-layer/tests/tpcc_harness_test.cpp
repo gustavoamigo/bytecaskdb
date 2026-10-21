@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 import bytecask.sql.api;
 import bytecask.sql.tpcc;
@@ -29,7 +30,8 @@ TEST_CASE("tpcc: a short mixed run keeps TPC-C's consistency conditions", "[sql]
   opts.threads = {4};
   opts.seed = 11;
   opts.txns_per_thread = 100;
-  auto reports = tpcc::run(*db, opts);
+  std::vector<tpcc::PhaseReport> reports;
+  tpcc::run(*db, opts, [&](const tpcc::PhaseReport& r) { reports.push_back(r); });
   REQUIRE(reports.size() == 1);
   const auto& r = reports[0];
   INFO(tpcc::format_report(r));

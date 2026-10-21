@@ -19,6 +19,7 @@ module;
 #include <cstdint>
 #include <exception>
 #include <format>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -116,9 +117,11 @@ inline constexpr int kMaxAttempts = 10;
 // The transactions in the mix today. Each later front-end slice adds its own.
 [[nodiscard]] auto mix() -> std::vector<Kind>;
 
-// Runs each phase on the loaded database at `dir`'s Database. Throws on any
-// error but a SerializationFailure, which is retried and counted.
-[[nodiscard]] auto run(Database& db, const RunOptions& opts) -> std::vector<PhaseReport>;
+// Runs each phase on the loaded database, handing each report to
+// `on_phase` as the phase ends. Throws on any error but a
+// SerializationFailure, which is retried and counted; the phase with the
+// error ends at once.
+void run(Database& db, const RunOptions& opts, const std::function<void(const PhaseReport&)>& on_phase);
 
 // TPC-C's consistency conditions (clause 3.3.2) for the transactions in the
 // mix: the conditions that do not hold, each described; empty when all do.
@@ -473,10 +476,14 @@ auto money_text(std::int64_t cents_value) -> std::string {
   return std::format("{}.{:02}", cents_value / 100, cents_value % 100);
 }
 
-// Payment (clause 2.5.2), as HammerDB's client-side driver runs it. True
-// if it committed; false if a reduced scale left the name without a
-// customer and it rolled back.
-auto payment(const Statements& s, Transaction& t, const PaymentInput& in) -> bool {
+// The customer a last name selects must exist: the load gives every name
+// it draws from a customer (names()).
+[[noreturn]] void no_customer(const std::string& last) {
+  throw std::runtime_error("no customer has the last name " + last);
+}
+
+// Payment (clause 2.5.2), as HammerDB's client-side driver runs it.
+void payment(const Statements& s, Transaction& t, const PaymentInput& in) {
   (void)t.execute(s.p1, {cents(in.amount), in.w});
   auto w_name = str(t.execute(s.p2, {in.w}).rows.at(0).at(5));
   (void)t.execute(s.p3, {cents(in.amount), in.w, in.d});
@@ -487,10 +494,7 @@ auto payment(const Statements& s, Transaction& t, const PaymentInput& in) -> boo
     (void)t.execute(s.p5, {text(*in.c.last), in.c.d, in.c.w});
     auto rows = t.execute(s.p6, {in.c.w, in.c.d, text(*in.c.last)});
     auto picked = middle(rows, 2);
-    if (!picked) {
-      t.rollback();
-      return false;
-    }
+    if (!picked) no_customer(*in.c.last);
     const auto& row = rows.rows[(rows.rows.size() + 1) / 2 - 1];
     c_id = *picked;
     credit = row.at(9);
@@ -512,23 +516,22 @@ auto payment(const Statements& s, Transaction& t, const PaymentInput& in) -> boo
   }
   (void)t.execute(s.p11, {in.h_id, in.c.d, in.c.w, c_id, in.d, in.w, in.date, cents(in.amount),
                           text(w_name + "    " + d_name)});
-  return t.commit() == CommitOutcome::Committed;
+  (void)t.commit();
 }
 
 // Order-Status (clause 2.6.2): reads only.
-auto order_status(const Statements& s, Transaction& t, const OrderStatusInput& in) -> bool {
+void order_status(const Statements& s, Transaction& t, const OrderStatusInput& in) {
   std::optional<std::int64_t> c_id = in.c.id;
   if (in.c.last) {
     (void)t.execute(s.o1, {text(*in.c.last), in.c.d, in.c.w});
     c_id = middle(t.execute(s.o2, {text(*in.c.last), in.c.d, in.c.w}), 3);
+    if (!c_id) no_customer(*in.c.last);
   } else {
     (void)t.execute(s.o3, {*c_id, in.c.d, in.c.w});
   }
-  if (c_id) {
-    auto order = t.execute(s.o4, {in.c.d, in.c.w, *c_id});
-    if (!order.rows.empty()) (void)t.execute(s.o5, {order.rows[0].at(0), in.c.d, in.c.w});
-  }
-  return t.commit() == CommitOutcome::Committed;
+  auto order = t.execute(s.o4, {in.c.d, in.c.w, *c_id});
+  if (!order.rows.empty()) (void)t.execute(s.o5, {order.rows[0].at(0), in.c.d, in.c.w});
+  (void)t.commit();
 }
 
 // Bumps harness_run for a new run and returns it (docs/frontend_design.md).
@@ -583,8 +586,9 @@ struct Worker {
   }
 
   // One TPROC-C transaction of kind k, retried on 40001 with its inputs.
-  // Returns whether it is counted (measured).
-  void one(Database& db, Kind k, std::int64_t home, bool measured) {
+  // It is counted, with its retries, when it starts at or after `from` and
+  // ends before `until`: the measured window.
+  void one(Database& db, Kind k, std::int64_t home, Clock::time_point from, Clock::time_point until) {
     PaymentInput pay;
     OrderStatusInput os;
     const auto d = uniform(rng, 1, kDistricts);
@@ -611,28 +615,32 @@ struct Worker {
     }
     auto& st = stats[static_cast<std::size_t>(k)];
     const auto start = Clock::now();
-    for (int attempt = 1;; ++attempt) {
+    std::uint64_t retries = 0;
+    auto completed = false;
+    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
       try {
         auto t = db.begin();
         switch (k) {
-          case Kind::Payment: (void)payment(s, t, pay); break;
-          case Kind::OrderStatus: (void)order_status(s, t, os); break;
+          case Kind::Payment: payment(s, t, pay); break;
+          case Kind::OrderStatus: order_status(s, t, os); break;
           case Kind::NewOrder:
           case Kind::Delivery:
           case Kind::StockLevel: break;
         }
-        if (measured) {
-          ++st.completed;
-          st.latency.add(Clock::now() - start);
-        }
-        return;
+        completed = true;
+        break;
       } catch (const SerializationFailure&) {
-        if (attempt == kMaxAttempts) {
-          if (measured) ++st.abandoned;
-          return;
-        }
-        if (measured) ++st.retries;
+        if (attempt < kMaxAttempts) ++retries;
       }
+    }
+    const auto end = Clock::now();
+    if (start < from || end >= until) return;
+    st.retries += retries;
+    if (completed) {
+      ++st.completed;
+      st.latency.add(end - start);
+    } else {
+      ++st.abandoned;
     }
   }
 };
@@ -645,7 +653,10 @@ auto engine_counter(Database& db, const char* name) -> std::int64_t {
 
 }  // namespace
 
-auto run(Database& db, const RunOptions& opts) -> std::vector<PhaseReport> {
+void run(Database& db, const RunOptions& opts, const std::function<void(const PhaseReport&)>& on_phase) {
+  for (auto threads : opts.threads) {
+    if (threads == 0 || threads > kMaxThreads) throw std::invalid_argument("threads must be 1 to 256");
+  }
   const Statements s{db};
   // The warehouses and the scale, from what the load wrote.
   auto count = [&](std::string_view sql, std::vector<Value> p) { return i64(db.execute(sql, p).rows.at(0).at(0)); };
@@ -656,17 +667,18 @@ auto run(Database& db, const RunOptions& opts) -> std::vector<PhaseReport> {
   scale.customers = count("SELECT count(c_id) FROM customer WHERE c_w_id = $1 AND c_d_id = $2",
                           {std::int64_t{1}, std::int64_t{1}});
   const auto kinds = mix();
-  std::vector<PhaseReport> out;
   for (auto threads : opts.threads) {
-    if (threads == 0 || threads > kMaxThreads) throw std::invalid_argument("threads must be 1 to 256");
     PhaseReport r;
     r.threads = threads;
     r.run = next_run(db);
     const auto fsyncs = engine_counter(db, "bytecask.fsyncs");
     const auto batches = engine_counter(db, "bytecask.group_writer_batches");
     const auto begin = Clock::now();
-    const auto measure_from = begin + opts.warmup;
-    const auto until = measure_from + opts.duration;
+    // Counting a number of transactions measures them all.
+    const auto counting = opts.txns_per_thread != 0;
+    const auto measure_from = counting ? begin : begin + opts.warmup;
+    const auto until = counting ? Clock::time_point::max() : measure_from + opts.duration;
+    std::atomic<bool> failed{false};
     std::vector<Worker> workers;
     workers.reserve(threads);
     for (std::size_t t = 0; t < threads; ++t) {
@@ -679,13 +691,13 @@ auto run(Database& db, const RunOptions& opts) -> std::vector<PhaseReport> {
         try {
           auto& w = workers[t];
           const auto home = static_cast<std::int64_t>(t % static_cast<std::size_t>(warehouses)) + 1;
-          for (std::uint64_t n = 0; opts.txns_per_thread == 0 || n < opts.txns_per_thread; ++n) {
-            const auto now = Clock::now();
-            if (opts.txns_per_thread == 0 && now >= until) break;
-            w.one(db, w.draw(kinds), home, opts.txns_per_thread != 0 || now >= measure_from);
+          for (std::uint64_t n = 0; !counting || n < opts.txns_per_thread; ++n) {
+            if (failed.load() || Clock::now() >= until) break;
+            w.one(db, w.draw(kinds), home, measure_from, until);
           }
         } catch (...) {
           errors[t] = std::current_exception();
+          failed.store(true);
         }
       });
     }
@@ -693,11 +705,8 @@ auto run(Database& db, const RunOptions& opts) -> std::vector<PhaseReport> {
     for (const auto& e : errors) {
       if (e) std::rethrow_exception(e);
     }
-    const auto measured_end = Clock::now();
-    const auto from = opts.txns_per_thread != 0 ? begin : measure_from;
-    r.seconds = std::chrono::duration<double>(std::min(measured_end, opts.txns_per_thread != 0 ? measured_end : until) -
-                                              from)
-                    .count();
+    // The window: a transaction counts if it ran inside it.
+    r.seconds = std::chrono::duration<double>(counting ? Clock::now() - begin : until - measure_from).count();
     for (const auto& w : workers) {
       for (std::size_t k = 0; k < kKinds; ++k) {
         r.kinds[k].completed += w.stats[k].completed;
@@ -708,9 +717,8 @@ auto run(Database& db, const RunOptions& opts) -> std::vector<PhaseReport> {
     }
     r.fsyncs = engine_counter(db, "bytecask.fsyncs") - fsyncs;
     r.group_writer_batches = engine_counter(db, "bytecask.group_writer_batches") - batches;
-    out.push_back(r);
+    on_phase(r);
   }
-  return out;
 }
 
 auto consistency(Database& db) -> std::vector<std::string> {

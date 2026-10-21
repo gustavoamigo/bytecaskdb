@@ -42,6 +42,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 import run_isolation_check as ric  # noqa: E402
 
 
+def lost_appends(problems: list[str]) -> list[str]:
+    """The cross-check's findings that show a lost append: missing from the
+    final read, or a read the final value does not extend."""
+    return [p for p in problems if "missing from final read" in p or "is not a prefix" in p]
+
+
 def check_round(args: argparse.Namespace, seed: int, round_dir: Path) -> bool:
     """Returns whether the unguarded history showed write skew."""
     skew = False
@@ -76,11 +82,14 @@ def check_round(args: argparse.Namespace, seed: int, round_dir: Path) -> bool:
                 if found - ric.WRITE_SKEW:
                     raise ric.CheckFailed(f"unguarded: anomalies beyond write skew: {sorted(found - ric.WRITE_SKEW)}")
                 skew |= bool(found & ric.WRITE_SKEW)
-            else:
+            elif not lost_appends(problems):
+                # Only when the cross-check found nothing: a blind history is
+                # large and invalid, and Elle's search and plots of it are
+                # slow, so the cross-check's finding stands on its own.
                 a = ric.run_elle(args.elle_jar, history_path, "strict-serializable", round_dir / "elle-blind")
                 print(f"  blind: strict-serializable {ric.describe(a)}")
                 elle_found = a.get("valid?") is False
-        if config == "blind" and not problems and not elle_found:
+        if config == "blind" and not lost_appends(problems) and not elle_found:
             raise ric.CheckFailed("blind: neither check found an anomaly; the check is not sensitive to lost updates")
     return skew
 

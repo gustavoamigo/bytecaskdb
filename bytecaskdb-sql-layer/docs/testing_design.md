@@ -240,10 +240,14 @@ and shared by them.
 - the engine's `fsyncs` and `group_writer_batches` over the phase, read
   from `stats()`, to set beside `commit_probe`.
 
-Latencies go into a fixed log-bucket histogram per thread, from 1 µs to
-10 s, merged at the end, so a long run holds no per-transaction list. The
-report is printed as a table. With `--json FILE`, one JSON object per
-phase is appended to FILE as well. These runs are the only performance
+A transaction counts, with its retries, when it starts and ends inside
+the phase's measured window, after the warm-up; the rates divide by the
+window's length. Latencies go into a fixed log-bucket histogram per
+thread, from 1 µs to 10 s, merged at the end, so a long run holds no
+per-transaction list. Each phase's report is printed as a table as the
+phase ends, so a later phase's failure loses none of the earlier ones.
+With `--json FILE`, one JSON object per phase is appended to FILE as well.
+An error in any thread ends its phase at once. These runs are the only performance
 numbers the harness produces; there are no micro-benchmarks.
 
 **Consistency after a run.** After the last phase, the harness checks
@@ -282,7 +286,9 @@ and `scripts/sql_isolation_check.py` checks it with the engine's tooling:
   and under `strict-serializable` report only write skew (`G2-item`), at
   least once over the run.
 - `blind`: every statement in autocommit, with no `Transaction`. It must
-  be invalid, which shows the check can see a lost update.
+  be invalid, which shows the check can see a lost update. Elle runs on it
+  only when the cross-check found nothing: the history is large and
+  invalid, and Elle's search and plots of it take tens of minutes.
 - A completed `commit()` is `:ok`, a `SerializationFailure` `:fail`, and
   `TransactionResolutionUnknown` `:info`. In `blind`, a statement that
   conflicted on every retry is `:info`: the statements before it committed.
