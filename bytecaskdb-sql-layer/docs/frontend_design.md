@@ -1,6 +1,7 @@
 # SQL front end for the MVP: dialect subset and statement IR
 
-Status: **design, for review (#492).** Nothing here is built. It decides
+Status: **design, for review (#492); its open questions were decided by
+the owner on 2026-10-21 (*Decisions*).** Nothing here is built. It decides
 the SQL the MVP accepts, the intermediate form the code generator prints
 plans from, and the planner's choices, all scoped by TPROC-C (#487, *MVP*).
 The rest of #492 (rewrites, hash joins, `EXPLAIN`, the plan cache's design)
@@ -15,7 +16,10 @@ comes after the MVP and is listed under *Later*.
 - **Only the compiler's plans are supported.** The IR and the code
   generator are the only source of plan text.
 - **Refuse rather than guess.** A statement outside the subset is refused at
-  parse or bind with a message and a position, before anything runs.
+  parse or bind with a message and a position, before anything runs. A
+  statement in the subset that no index serves is refused by the planner,
+  also before anything runs, with "no plan: …" and no position
+  (*Decisions*, 5).
 
 ## Where the statements come from
 
@@ -31,10 +35,14 @@ each statement itself and keeps the procedure's logic (the random choices,
 the per-row statements of the TPC-C specification's transaction profiles,
 the ones HammerDB's MySQL procedures run against InnoDB, the MVP's baseline.
 
-**The MVP harness sends those statements**, in PostgreSQL's dialect, with
-`$n` parameters where HammerDB splices values into the text. The client
-logic stays in the harness. Three are rewritten to mean in PostgreSQL what
-they mean in HammerDB (*Open questions*, 1 and 3):
+**The MVP runs a statement set of its own, written from those
+statements:** in PostgreSQL's dialect, with `$n` parameters where HammerDB
+splices values into the text, and no stored procedures. The layer's harness
+sends them through the embedded API, with the client logic in the harness,
+and the proof suite checks them against PostgreSQL 17. HammerDB's
+PostgreSQL driver is not used. Two statements are rewritten to mean in
+PostgreSQL what they mean in HammerDB, and one table gains a key
+(*Decisions*, 1 and 3):
 - Delivery's `LIMIT 1` without `ORDER BY` relies on InnoDB returning the
   primary key's order; it becomes `ORDER BY no_o_id LIMIT 1`, the
   specification's "lowest `no_o_id`".
@@ -307,8 +315,8 @@ statement gets the plan a person would write.
    leading run of equality-compared parts, then optionally one part with a
    range. Ties go to the one whose order serves `ORDER BY`, then to the
    primary key, then to the covering one, then to the lower id.
-3. No usable leading part: refused, "no plan: a full scan of t" (see *Open
-   questions*, 5).
+3. No usable leading part: refused, "no plan: a full scan of t"
+   (*Decisions*, 5).
 
 `bc_count_range` cardinalities are not consulted. With TPROC-C's schema
 every statement has a full key or a selective prefix, so a cost model
@@ -367,7 +375,10 @@ slice adds the rules for what it brings:
   an aggregate on both sides.
 
 Refusals of what the subset leaves out are tested with their message and
-position, as `binder_test` tests today's.
+position, as `binder_test` tests today's. The planner's "no plan: …"
+refusals, of a full scan and of an order no path gives, are tested with
+their message; the proof machine generates only statements a path serves,
+so it never counts one against PostgreSQL.
 
 **Each transaction against PostgreSQL.** Each slice adds a test that runs
 its TPROC-C transaction through SQL: a small fixture (one warehouse, scaled
@@ -387,8 +398,8 @@ its transaction test.
 
 0. **The IR, for today's forms only.** The planner builds the IR and the code
    generator prints from it; no new SQL. Golden plans for today's forms
-   land here, and their diff against today's plans is reviewed. (*Open
-   questions*, 2.)
+   land here, and their diff against today's plans is reviewed
+   (*Decisions*, 2).
 1. **Payment and Order-Status:** `col + $n` on `DECIMAL`, equality
    prefixes on the primary key and on an index, `ORDER BY` from the index,
    reverse scans, `LIMIT`, `COUNT` from `bc_count_range`. Run statement by
@@ -411,8 +422,9 @@ Then the MVP gate.
 |---|---|---|
 | `SUM` over `DECIMAL` is unbounded `numeric`. | Past 18 digits it is 22003. | `DECIMAL` is a scaled `int64_t` (`docs/types_design.md`). No TPROC-C sum comes near. |
 | Comparing columns of different types casts one to the other's. | Refused, in a `WHERE` and a join. | One key encoding per comparison. TPROC-C compares columns of one type only. |
+| A query no index serves runs: a full scan, or a sort of the rows read. | Refused: "no plan: …". | Each would add a sorter (`bc_sorter_*`) or an unbounded read to build and test before the MVP (*Decisions*, 5). No TPROC-C statement needs one. |
 
-Both are also refusals rather than different answers. Everything else in
+All three are refusals rather than different answers. Everything else in
 the subset matches PostgreSQL, and the proof machine checks that it does.
 
 ## Proposed `CONTRACT.md` changes
@@ -429,36 +441,34 @@ that builds it, named in its PR.
 | An `UPDATE` or `DELETE` affects exactly the rows that matched when it began, and reports how many. | to add |
 | Arithmetic whose result leaves its type is SQLSTATE 22003, and the statement writes nothing. | to add |
 | A comparison with NULL rejects the row. | to add |
+| A statement no index serves is refused with "no plan: …", before anything runs or is written. | to add |
 
 **Widened:** lookups by the whole primary key become lookups by any key
 prefix or range, joins of two tables, and `UPDATE` and `DELETE` of many
 rows.
 
-## Open questions for the owner
+## Decisions
 
-1. **Which statements the MVP runs.** *Recommendation:* the per-row
-   statements of HammerDB's MySQL client-side driver, in PostgreSQL's
-   dialect with parameters, as listed above. HammerDB's PostgreSQL
-   procedures would add `UNNEST`, arrays, `array_agg`, DML in CTEs,
-   `UPDATE … FROM` and `RETURNING`, none of which TPROC-C's work needs, and
-   procedures are deferred (#495).
-2. **A slice 0 that moves today's forms onto the IR first.**
-   *Recommendation:* yes. Its diff is the code generator alone, reviewed
-   against golden plans, and slice 1 then only adds.
-3. **Delivery's and Order-Status's rewrites** (*Where the statements come
-   from*). *Recommendation:* rewrite them, since each keeps HammerDB's
-   meaning; derived tables wait for a statement that needs one.
-4. **Range checks on computed values.** *Recommendation:* add the one call
-   above. TPROC-C's values never overflow, but PostgreSQL's operators
-   raise 22003, and a key built from an unchecked value would otherwise
-   search for a number the column cannot hold.
-5. **Full scans and sorts no index provides.** *Recommendation:* refuse
-   them in the MVP ("no plan: …"). PostgreSQL runs them; none of TPROC-C
-   needs one, and each would add a structure (`bc_sorter_*`) or an
-   unbounded read to build and test before the MVP.
-6. **No cost model.** *Recommendation:* rule-based paths for the MVP;
-   `bc_count_range` cardinalities enter with the first workload whose plans
-   a rule gets wrong.
+The owner's answers to this design's open questions (2026-10-21):
+
+1. **The statements.** We write our own PostgreSQL-dialect, procedure-free
+   version of the per-row statements of HammerDB's MySQL client-side
+   driver (*Where the statements come from*). HammerDB's PostgreSQL driver
+   is not used: its set-oriented forms wait for procedures (#495).
+2. **Slice 0 first.** Today's forms move onto the IR before any new SQL,
+   reviewed against golden plans.
+3. **The two rewrites and `history`'s key:** Delivery's `ORDER BY
+   no_o_id`, Order-Status's flattened derived table, and `history.h_id`
+   supplied by the harness.
+4. **The range check on computed values** is added to the plan API,
+   raising 22003 as PostgreSQL's operators do, so no key is built from a
+   value its column cannot hold.
+5. **Full scans and sorts no index provides are refused** in the MVP, as a
+   feature gap stated under *Known differences*. The owner's condition: it
+   must not block the TPROC-C run. No statement above needs one, and the
+   golden plans fail if one is refused.
+6. **No cost model.** Rule-based paths; `bc_count_range` cardinalities
+   enter with the first workload whose plans a rule gets wrong.
 
 ## Later
 
