@@ -25,7 +25,9 @@ every rule, the invariants are checked.
   message, so a reworded one fails there. Any other refusal counts
   as a refusal on both, whatever its message. The layer's refusals are
   `SqlError`: parse and bind errors, a DDL the catalog refuses, parameters
-  of the wrong number or type. Any other exception from the layer, an
+  of the wrong number or type; the planner's "no plan" refusal is one
+  too, and follows the next rule instead. Any other exception from the
+  layer, an
   engine refusal at run time included, fails the test.
 - **Statements the planner serves.** The machine generates only statements
   the planner serves, and a "no plan" refusal

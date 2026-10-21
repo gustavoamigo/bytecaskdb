@@ -57,8 +57,9 @@ PostgreSQL what they mean in HammerDB, and one table gains a key
     harness_run SET last_run = last_run + 1 WHERE id = 1` and reads the row
     back in the same transaction.
   - One harness runs against a database at a time. A start whose bump
-    fails, a 40001 included, stops with an error: it is never retried,
-    so no run number is used twice.
+    fails stops with an error and is never retried: a 40001 there means a
+    second harness is bumping the same row, and two harnesses at once would
+    break the uniqueness of `h_id` whatever run numbers they got.
   - The load inserts the row `(1, 0)` and uses run 0.
   - This gives 2^15 runs, the load's included, 256 threads and 2^40 rows
     per thread per run. The harness refuses to start past the last run or
@@ -288,8 +289,8 @@ needed; every pattern below uses calls `bc_plan.h` declares.
 | `ORDER BY` | the access path's order | none: the planner picks a path in that order |
 | `LIMIT` | `limit` | an `int64_t` counter; `break` at the limit |
 | `COUNT(*)`, `COUNT(col NOT NULL)`, no residual | `count_from_keys` | `bc_count_range` over the access path's range |
-| `COUNT`, `SUM` otherwise | `aggregate` | an accumulator local, `bc_add`; a "seen" `bool` for SUM's NULL |
-| `MIN(col)`, `col` `NOT NULL` and the part after the equality prefix | `min_from_first_key` | the first entry of a forward scan, then `break` |
+| `COUNT`, `SUM`, `MIN` otherwise | `aggregate` | an accumulator local, `bc_add` (for `MIN`, the least non-NULL value); a "seen" `bool` for SUM's and MIN's NULL |
+| `MIN(col)`, `col` `NOT NULL` and the part after the equality prefix, no residual | `min_from_first_key` | the first entry of a forward scan, then `break` |
 | `COUNT(DISTINCT col)` | `aggregate` | `bc_agg_group` keyed by the column, then a count of `bc_agg_next` |
 | A join | `loops[1]` | the inner key built from the outer row: `bc_key_*` of `bc_col_*`; nested in the outer loop |
 | `FOR UPDATE` | `for_update` | `bc_guard_unchanged` on each returned row's key: the point key, or `bc_row_key` |
@@ -354,8 +355,8 @@ TPROC-C's ordered columns are `c_first` (P6, O2), `o_id` (O4) and `no_o_id`
 (D1). `o_id` and `no_o_id` are `NOT NULL` in the schema fixture; `c_first`
 is not, so slice 1 declares it `NOT NULL`, as HammerDB's PostgreSQL schema
 and the TPC-C specification have it. `MIN` taken from the first entry
-(*The statement IR*) has the same condition: the column is `NOT NULL`, or
-the scan reads past the NULLs and a local takes the minimum.
+(*The statement IR*) has the same condition, and no residual: otherwise
+the scan runs to its end and a local takes the minimum, as for `SUM`.
 
 `bc_count_range` cardinalities are not consulted. With TPROC-C's schema
 every statement has a full key or a selective prefix, so a cost model
@@ -389,9 +390,10 @@ its scan.
 
 ### What the planner refuses
 
-In the MVP the planner refuses a statement inside the subset when no index
-serves it (*Decisions*, 5; the gap is #533). It checks in this order, and
-the first refusal is the statement's only one:
+In the MVP the planner refuses a statement inside the subset that it can't
+answer from an index scan in PostgreSQL's order (*Decisions*, 5; the gap
+is #533). It checks in this order, and the first refusal is the
+statement's only one:
 
 | # | Refused | Message |
 |---|---|---|
@@ -399,7 +401,8 @@ the first refusal is the statement's only one:
 | 2 | A join where neither table is reachable from parameters alone | `no plan: a full scan of <first table in FROM>` |
 | 3 | A join whose inner table no key reaches from the outer row and the parameters | `no plan: no index of <inner table> joins on <columns>` |
 | 4 | A single table with no usable path | `no plan: a full scan of <table>` |
-| 5 | A single table whose usable paths don't serve its `ORDER BY` (a point lookup on the whole primary key always does) | `no plan: no index of <table> gives ORDER BY <columns>` |
+| 5 | A single table with a nullable ordered column, unless a point lookup on the whole primary key serves it | `no plan: ORDER BY on nullable column <column>` |
+| 6 | A single table whose usable paths don't give its `ORDER BY` (a point lookup on the whole primary key always does) | `no plan: no index of <table> gives ORDER BY <columns>` |
 
 The refusal is a SQL error with SQLSTATE 0A000 (`feature_not_supported`),
 raised after binding and before anything runs. It carries no position: the
@@ -476,8 +479,9 @@ its transaction test.
 
 Then the MVP gate.
 
-**The MVP gate** runs TPROC-C's transaction mix and statements, as HammerDB
-issues them, through our harness at 1, 16 and 48 threads, beside
+**The MVP gate** runs TPROC-C's transaction mix, with the statements above
+(*Where the statements come from*), through our harness at 1, 16 and 48
+threads, beside
 `commit_probe` and with Elle through SQL (#487, 2.6). The harness calls the
 embedded API in its own process, one `Transaction` per TPROC-C
 transaction. It reports the layer's own numbers; there is no InnoDB
@@ -489,7 +493,7 @@ comparison for now (*Decisions*, 7).
 |---|---|---|
 | `SUM` over `DECIMAL` is unbounded `numeric`. | Past 18 digits it is 22003. | `DECIMAL` is a scaled `int64_t` (`docs/types_design.md`). No TPROC-C sum comes near. |
 | Comparing columns of different types casts one to the other's. | Refused, in a `WHERE` and a join. | One key encoding per comparison. TPROC-C compares columns of one type only. |
-| A statement no index serves runs: a full scan, or a sort of the rows read. | Refused (*What the planner refuses*). | Each would add a sorter (`bc_sorter_*`) or an unbounded read to build and test before the MVP (*Decisions*, 5; #533). No TPROC-C statement needs one. |
+| A statement no index scan answers in its order runs: a full scan, a sort of the rows read, an `ORDER BY` on a join or on a nullable column. | Refused (*What the planner refuses*). | Each would add a sorter (`bc_sorter_*`) or an unbounded read to build and test before the MVP (*Decisions*, 5; #533). No TPROC-C statement needs one. |
 
 All three are refusals rather than different answers. Everything else in
 the subset matches PostgreSQL, and the proof machine checks that it does.
@@ -503,12 +507,12 @@ that builds it, named in its PR.
 | Guarantee | Proved by |
 |---|---|
 | A statement outside the supported subset is refused with a SQL error naming the construct, before anything runs or is written. | to add |
-| `ORDER BY` returns rows in that order, NULLs last ascending and first descending, ties in any order; `LIMIT n` returns the first `n`. | to add |
+| `ORDER BY` returns rows in that order, ties in any order; `LIMIT n` returns the first `n`. | to add |
 | An aggregate query returns one row: `COUNT` 0 and `SUM` and `MIN` NULL over no rows. | to add |
 | An `UPDATE` or `DELETE` affects exactly the rows that matched when it began, and reports how many. | to add |
 | Arithmetic whose result leaves its type is SQLSTATE 22003, and the statement writes nothing. | to add |
 | A comparison with NULL rejects the row. | to add |
-| In the MVP, a statement inside the supported subset that no index serves (a full scan, an `ORDER BY` no index gives or on a join, a join no index reaches) is refused with a SQL error, SQLSTATE 0A000, before anything runs or is written. | to add |
+| In the MVP, a statement inside the supported subset that no index scan answers in its order (a full scan, an `ORDER BY` no index gives, on a join or on a nullable column, a join no index reaches) is refused with a SQL error, SQLSTATE 0A000, before anything runs or is written. | to add |
 
 **Widened:** lookups by the whole primary key become lookups by any key
 prefix or range, joins of two tables, and `UPDATE` and `DELETE` of many
@@ -538,8 +542,8 @@ The owner's answers to this design's open questions (2026-10-21):
 6. **No cost model.** Rule-based paths; `bc_count_range` cardinalities
    enter with the first workload whose plans a rule gets wrong (#534).
 7. **No InnoDB comparison for now.** The MVP gate runs TPROC-C's
-   HammerDB transaction mix and statements through our harness at 1, 16
-   and 48 threads and reports the layer's own numbers.
+   transaction mix, with this design's statements, through our harness at
+   1, 16 and 48 threads and reports the layer's own numbers.
 
 ## Later
 
