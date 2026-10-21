@@ -274,9 +274,17 @@ auto insert(Writer& w, const bound::Insert& s) -> void {
   w.line("bc_emit_count(cx, 1);");
 }
 
+// FOR UPDATE: the row's key is guarded unchanged, so the commit conflicts
+// if a concurrent commit changed the row (docs/transaction_design.md,
+// *Isolation*).
+void guard_row(Writer& w, const bound::Select& s, const std::string& row) {
+  if (s.for_update) w.line("bc_guard_row(cx, " + w.tbl() + ", " + row + ");");
+}
+
 auto select_by_pk(Writer& w, const bound::Select& s, const std::vector<std::uint32_t>& pk_ps) -> void {
   w.reads(s.table->id);
   fetch_row(w, pk_ps, "row", false);
+  guard_row(w, s, "row");
   emit_columns(w, s.targets, "row");
 }
 
@@ -304,7 +312,8 @@ auto select_by_index(Writer& w, const bound::Select& s) -> void {
     return std::ranges::any_of(ix.parts, [&](const IndexPart& p) { return p.col_id == id; }) ||
            std::ranges::find(t.pk_col_ids, id) != t.pk_col_ids.end();
   };
-  auto covering = std::ranges::all_of(s.targets, in_key);
+  // FOR UPDATE reads each row, whose key it guards.
+  auto covering = !s.for_update && std::ranges::all_of(s.targets, in_key);
   w.reads(ix.id);
   if (!covering) w.reads(t.id);
 
@@ -371,6 +380,7 @@ auto select_by_index(Writer& w, const bound::Select& s) -> void {
     w.line("bc_emit_end(cx);");
   } else {
     w.line("bc_view row = bc_scan_row(cx, c);");
+    guard_row(w, s, "row");
     emit_columns(w, s.targets, "row");
   }
   w.close();

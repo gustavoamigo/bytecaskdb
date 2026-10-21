@@ -59,6 +59,7 @@ struct Select {
   const Table* table;
   std::vector<std::uint32_t> targets;  // column ids, in select-list order
   std::vector<Compare> where;
+  bool for_update{false};
 };
 
 struct Update {
@@ -448,7 +449,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           return {out, s.pos};
         } else if constexpr (std::is_same_v<T, ast::Select>) {
           const auto* t = b.table(s.table, s.pos);
-          Select out{t, {}, b.where(*t, s.where)};
+          Select out{t, {}, b.where(*t, s.where), s.for_update};
           for (const auto& e : s.targets) {
             if (e.kind != ast::Expr::Kind::Column) throw SqlError{"only columns can be selected", e.pos};
             out.targets.push_back(Binder::column(*t, e.column, e.pos)->id);

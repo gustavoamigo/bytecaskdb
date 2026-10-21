@@ -290,6 +290,7 @@ void bc_del_range(bc_ctx *, uint32_t table, bc_view lo, bc_view hi);
 
 /* Guards and raised errors */
 void bc_guard_unchanged(bc_ctx *, bc_view key);
+void bc_guard_row(bc_ctx *, uint32_t table, bc_view row);           /* bc_guard_unchanged on the row's primary key */
 void bc_guard_range(bc_ctx *, uint32_t table_or_index, bc_view lo, bc_view hi);
 void bc_guard_present(bc_ctx *, bc_view key);
 void bc_guard_absent(bc_ctx *, bc_view key);

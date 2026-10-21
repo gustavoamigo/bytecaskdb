@@ -122,6 +122,7 @@ struct Select {
   std::string table;
   std::vector<Compare> where;
   std::int32_t pos{-1};
+  bool for_update{false};  // FOR UPDATE: a guard on each row returned, never a lock
 };
 
 struct Assignment {

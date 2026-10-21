@@ -233,6 +233,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_delete", fn_addr(bc_delete)},
       {"bc_del_range", fn_addr(bc_del_range)},
       {"bc_guard_unchanged", fn_addr(bc_guard_unchanged)},
+      {"bc_guard_row", fn_addr(bc_guard_row)},
       {"bc_guard_range", fn_addr(bc_guard_range)},
       {"bc_guard_present", fn_addr(bc_guard_present)},
       {"bc_guard_absent", fn_addr(bc_guard_absent)},
