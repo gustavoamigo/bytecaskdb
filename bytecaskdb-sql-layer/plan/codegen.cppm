@@ -43,6 +43,10 @@ struct GeneratedPlan {
   std::vector<PhysType> param_types;
   bool returns_rows{false};
   std::vector<PhysType> result_types;  // the plan's result layout, for its bc_schema_ref
+  // Each result column's name and SQL type, as PostgreSQL names and types
+  // it: a column's own, or "count", a bigint.
+  std::vector<std::string> result_names;
+  std::vector<SqlType> result_sql;
   // What its bc_schema_ref lists (docs/catalog_design.md,
   // *Compatibility*): the objects and columns it depends on.
   std::uint64_t catalog_version{0};
@@ -101,7 +105,7 @@ public:
 
   void line(const std::string& s) { body_ += std::string(2 * depth_, ' ') + s + "\n"; }
   void open(const std::string& s) {
-    line(s + " {");
+    line(s.empty() ? "{" : s + " {");
     ++depth_;
   }
   void close() {
@@ -119,6 +123,8 @@ public:
   // bc_schema_ref.
   auto tbl() -> std::string { return use("TBL_" + std::to_string(p_.table)); }
   auto idx(std::uint32_t id) -> std::string { return use("IDX_" + std::to_string(id)); }
+  // A scan's object: the table (its primary key) or an index.
+  auto obj(std::uint32_t id) -> std::string { return id == p_.table ? tbl() : idx(id); }
   auto col(const ir::Column& c) -> std::string {
     cols_.emplace(c.id, c.type);
     return use("COL_" + std::to_string(p_.table) + "_" + std::to_string(c.id));
@@ -198,36 +204,49 @@ auto col_null(Writer& w, const ir::Column& c, const std::string& row) -> std::st
 }
 
 // `if (any parameter is NULL) { <then> return; }`: a comparison with NULL is
-// never true.
-void return_if_null(Writer& w, const std::vector<std::uint32_t>& params, bool count) {
+// never true, so the statement matches no row; `then` reports that.
+void return_if_null(Writer& w, const std::vector<std::uint32_t>& params, const std::vector<std::string>& then = {}) {
   std::string cond;
   for (auto p : params) cond += (cond.empty() ? "" : " || ") + param_null(p);
   w.open("if (" + cond + ")");
-  if (count) w.line("bc_emit_count(cx, 0);");
+  for (const auto& line : then) w.line(line);
   w.line("return;");
   w.close();
 }
 
-// The primary key from parameters, as an expression: one bc_key_params when
-// they are consecutive, a builder otherwise.
-auto pk_key(Writer& w, const std::vector<std::uint32_t>& params) -> std::string {
-  auto consecutive = true;
-  for (std::size_t i = 1; i < params.size(); ++i) consecutive = consecutive && params[i] == params[0] + i;
+
+// A key of `object` from its leading parts, as an expression: each a
+// parameter or NULL (nullopt). One bc_key_params when they are consecutive
+// parameters, a builder otherwise.
+auto key(Writer& w, std::uint32_t object, const std::vector<std::optional<std::uint32_t>>& parts) -> std::string {
+  auto consecutive = !parts.empty() && parts[0].has_value();
+  for (std::size_t i = 1; consecutive && i < parts.size(); ++i) {
+    consecutive = parts[i].has_value() && *parts[i] == *parts[0] + i;
+  }
   if (consecutive) {
-    return "bc_key_params(cx, " + w.tbl() + ", " + std::to_string(params[0]) + ", " + std::to_string(params.size()) + ")";
+    return "bc_key_params(cx, " + w.obj(object) + ", " + std::to_string(*parts[0]) + ", " +
+           std::to_string(parts.size()) + ")";
   }
   auto k = w.next_key();
-  w.line("bc_key " + k + " = bc_key_begin(cx, " + w.tbl() + ");");
-  for (auto p : params) w.line("bc_key_param(cx, " + k + ", " + std::to_string(p) + ");");
+  w.line("bc_key " + k + " = bc_key_begin(cx, " + w.obj(object) + ");");
+  for (const auto& p : parts) {
+    w.line(p ? "bc_key_param(cx, " + k + ", " + std::to_string(*p) + ");" : "bc_key_null(cx, " + k + ");");
+  }
   return "bc_key_end(cx, " + k + ")";
 }
+
+auto key(Writer& w, std::uint32_t object, const std::vector<std::uint32_t>& params) -> std::string {
+  return key(w, object, std::vector<std::optional<std::uint32_t>>(params.begin(), params.end()));
+}
+
+auto successor(const std::string& key) -> std::string { return "bc_key_successor(cx, " + key + ")"; }
 
 // Reads the row a point lookup names into `name`, returning when a
 // parameter is NULL or there is no such row.
 void fetch_row(Writer& w, const ir::PointGet& g, const std::string& name, bool count) {
-  return_if_null(w, g.key_params, count);
+  return_if_null(w, g.key_params, count ? std::vector<std::string>{"bc_emit_count(cx, 0);"} : std::vector<std::string>{});
   w.line("bool found = false;");
-  w.line("bc_view " + name + " = bc_get(cx, " + pk_key(w, g.key_params) + ", &found);");
+  w.line("bc_view " + name + " = bc_get(cx, " + key(w, w.p().table, g.key_params) + ", &found);");
   w.open("if (!found)");
   if (count) w.line("bc_emit_count(cx, 0);");
   w.line("return;");
@@ -238,6 +257,14 @@ void emit_columns(Writer& w, const std::vector<ir::Column>& targets, const std::
   w.line("bc_emit_begin(cx);");
   for (const auto& t : targets) w.line("bc_emit_col(cx, " + row + ", " + w.col(t) + ");");
   w.line("bc_emit_end(cx);");
+}
+
+auto count_row(const std::string& n) -> std::vector<std::string> {
+  return {"bc_emit_begin(cx);", "bc_emit_i64(cx, " + n + ");", "bc_emit_end(cx);"};
+}
+
+void emit_count(Writer& w, const std::string& n) {
+  for (const auto& line : count_row(n)) w.line(line);
 }
 
 void print(Writer& w, const ir::Insert& s) {
@@ -258,71 +285,175 @@ void guard_row(Writer& w, const ir::Select& s, const std::string& row) {
   if (s.for_update) w.line("bc_guard_row(cx, " + w.tbl() + ", " + row + ");");
 }
 
+// Whether the statement emits its rows: LIMIT 0 emits none.
+auto emits(const ir::Select& s) -> bool { return !s.limit || *s.limit > 0; }
+
+// A COUNT over no rows, when a parameter the WHERE compares is NULL.
+void return_count_if_null(Writer& w, const ir::Select& s, const std::vector<std::uint32_t>& params) {
+  return_if_null(w, params, emits(s) ? count_row("0") : std::vector<std::string>{});
+}
+
 void print_point_select(Writer& w, const ir::Select& s, const ir::PointGet& g) {
   w.reads(w.p().table);
+  if (s.count) {
+    return_count_if_null(w, s, g.key_params);
+    auto k = key(w, w.p().table, g.key_params);
+    w.line("int64_t n = 0;");
+    if (!s.count->arg) {
+      w.line("if (bc_exists(cx, " + k + ")) n = 1;");
+    } else {
+      w.line("bool found = false;");
+      w.line("bc_view row = bc_get(cx, " + k + ", &found);");
+      w.line("if (found && !" + col_null(w, *s.count->arg, "row") + ") n = 1;");
+    }
+    if (emits(s)) emit_count(w, "n");
+    return;
+  }
   fetch_row(w, g, "row", false);
-  guard_row(w, s, "row");
-  emit_columns(w, s.targets, "row");
+  if (emits(s)) {
+    guard_row(w, s, "row");
+    emit_columns(w, s.targets, "row");
+  }
 }
 
-// One end of a scan as `bc_view <name> = ...;`.
-void key_bound(Writer& w, std::uint32_t index, const ir::KeyBound& b, const std::string& name) {
-  std::string key;
+// One end of a scan, in key order, as an expression.
+auto bound(Writer& w, const ir::Scan& sc, const ir::KeyBound& b, bool is_lo) -> std::string {
+  std::vector<std::optional<std::uint32_t>> parts(sc.prefix.begin(), sc.prefix.end());
+  std::string k;
   switch (b.kind) {
     case ir::KeyBound::Kind::Open:
-      w.line("bc_view " + name + " = bc_empty(cx);");
-      return;
-    case ir::KeyBound::Kind::Param:
-      key = "bc_key_params(cx, " + w.idx(index) + ", " + std::to_string(b.param) + ", 1)";
-      break;
-    case ir::KeyBound::Kind::NullPart: {
-      auto k = w.next_key();
-      w.line("bc_key " + k + " = bc_key_begin(cx, " + w.idx(index) + ");");
-      w.line("bc_key_null(cx, " + k + ");");
-      key = "bc_key_end(cx, " + k + ")";
-      break;
-    }
+      // The prefix's first entry, or past its last; with no prefix, the
+      // object's.
+      if (parts.empty()) return "bc_empty(cx)";
+      return is_lo ? key(w, sc.object, parts) : successor(key(w, sc.object, parts));
+    case ir::KeyBound::Kind::Param: parts.emplace_back(b.param); break;
+    case ir::KeyBound::Kind::NullPart: parts.emplace_back(std::nullopt); break;
   }
-  w.line("bc_view " + name + " = " + (b.successor ? "bc_key_successor(cx, " + key + ")" : key) + ";");
+  k = key(w, sc.object, parts);
+  return b.successor ? successor(k) : k;
 }
 
-void print_scan_select(Writer& w, const ir::Select& s, const ir::Scan& sc) {
-  w.reads(sc.index);
-  if (!sc.covering) w.reads(w.p().table);
-  return_if_null(w, sc.null_checks, false);
+// `bc_view lo` and `bc_view hi` of a scan's range.
+void print_range(Writer& w, const ir::Scan& sc, const ir::Range& r) {
+  w.line("bc_view lo = " + bound(w, sc, r.lo, true) + ";");
+  w.line("bc_view hi = " + bound(w, sc, r.hi, false) + ";");
+}
+
+// `bc_cursor c` over every entry under the key `lo` holds.
+void open_prefix(Writer& w, const ir::Scan& sc) {
+  w.line("bc_cursor c = bc_scan_open(cx, " + w.obj(sc.object) + ", lo, lo, BC_SCAN_PREFIX" +
+         (sc.reverse ? " | BC_SCAN_REVERSE" : "") + ");");
+}
+
+// `bc_view lo`, `bc_view hi` and `bc_cursor c` of the scan.
+void open_scan(Writer& w, const ir::Scan& sc) {
+  w.reads(sc.object);
   if (const auto* r = std::get_if<ir::Range>(&sc.rest)) {
-    key_bound(w, sc.index, r->lo, "lo");
-    key_bound(w, sc.index, r->hi, "hi");
-    w.line("bc_cursor c = bc_scan_open(cx, " + w.idx(sc.index) + ", lo, hi, BC_SCAN_FORWARD);");
-  } else {
-    w.line("bc_view lo = bc_key_params(cx, " + w.idx(sc.index) + ", " + std::to_string(sc.eq_params[0]) + ", " +
-           std::to_string(sc.eq_params.size()) + ");");
-    w.line("bc_cursor c = bc_scan_open(cx, " + w.idx(sc.index) + ", lo, lo, BC_SCAN_PREFIX);");
+    print_range(w, sc, *r);
+    w.line("bc_cursor c = bc_scan_open(cx, " + w.obj(sc.object) + ", lo, hi, " +
+           (sc.reverse ? "BC_SCAN_REVERSE" : "BC_SCAN_FORWARD") + ");");
+    return;
   }
-  w.open("while (bc_scan_next(cx, c))");
-  if (sc.covering) {
+  w.line("bc_view lo = " + key(w, sc.object, sc.prefix) + ";");
+  open_prefix(w, sc);
+}
+
+// The NULL part of a NullSplitScan: every entry under the prefix and NULL.
+void open_null_part(Writer& w, const ir::Scan& sc) {
+  std::vector<std::optional<std::uint32_t>> parts(sc.prefix.begin(), sc.prefix.end());
+  parts.emplace_back(std::nullopt);
+  w.line("bc_view lo = " + key(w, sc.object, parts) + ";");
+  open_prefix(w, sc);
+}
+
+// The loop over the open cursor `c`: each entry's row emitted, or counted.
+void scan_loop(Writer& w, const ir::Select& s, const ir::Scan& sc) {
+  auto limited = s.limit.has_value() && !s.count;
+  w.open(std::string{"while ("} + (limited ? "n < " + std::to_string(*s.limit) + " && " : "") + "bc_scan_next(cx, c))");
+  if (s.count) {
+    const auto& arg = *s.count->arg;  // a COUNT the keys can't answer has an argument that may be NULL
+    if (sc.covering) {
+      w.line("bc_view key = bc_scan_key(cx, c);");
+      w.line("if (!bc_key_part_null(cx, " + w.obj(sc.object) + ", key, " + w.part(sc.object, arg) + ")) ++n;");
+    } else {
+      w.reads(w.p().table);
+      w.line("bc_view row = bc_scan_row(cx, c);");
+      w.line("if (!" + col_null(w, arg, "row") + ") ++n;");
+    }
+  } else if (sc.covering) {
     // Every result column from the entry's key: no row read.
     if (!s.targets.empty()) w.line("bc_view key = bc_scan_key(cx, c);");
     w.line("bc_emit_begin(cx);");
     for (const auto& t : s.targets) {
-      w.line("bc_emit_key_part(cx, " + w.idx(sc.index) + ", key, " + w.part(sc.index, t) + ");");
+      w.line("bc_emit_key_part(cx, " + w.obj(sc.object) + ", key, " + w.part(sc.object, t) + ");");
     }
     w.line("bc_emit_end(cx);");
   } else {
+    w.reads(w.p().table);
     w.line("bc_view row = bc_scan_row(cx, c);");
     guard_row(w, s, "row");
     emit_columns(w, s.targets, "row");
   }
+  if (limited) w.line("++n;");
   w.close();
+}
+
+void print_scan_select(Writer& w, const ir::Select& s, const ir::Scan& sc) {
+  if (!s.count) {
+    return_if_null(w, sc.null_checks);
+    if (s.limit) w.line("int64_t n = 0;");
+    open_scan(w, sc);
+    scan_loop(w, s, sc);
+    return;
+  }
+  return_count_if_null(w, s, sc.null_checks);
+  if (s.count->from_keys) {
+    // Every entry of the range is one row to count.
+    w.reads(sc.object);
+    if (const auto* r = std::get_if<ir::Range>(&sc.rest)) {
+      print_range(w, sc, *r);
+    } else {
+      w.line("bc_view lo = " + key(w, sc.object, sc.prefix) + ";");
+      w.line("bc_view hi = bc_key_successor(cx, lo);");
+    }
+    w.line("int64_t n = bc_count_range(cx, " + w.obj(sc.object) + ", lo, hi, INT64_MAX);");
+  } else {
+    w.line("int64_t n = 0;");
+    open_scan(w, sc);
+    scan_loop(w, s, sc);
+  }
+  if (emits(s)) emit_count(w, "n");
+}
+
+// The present values and the NULL part, each in its own block, in
+// PostgreSQL's order; one LIMIT counter across both.
+void print_split_select(Writer& w, const ir::Select& s, const ir::NullSplitScan& split) {
+  const auto& sc = split.present;
+  return_if_null(w, sc.null_checks);
+  if (s.limit) w.line("int64_t n = 0;");
+  for (auto nulls : sc.reverse ? std::vector<bool>{true, false} : std::vector<bool>{false, true}) {
+    w.open("");
+    if (nulls) {
+      w.reads(sc.object);
+      open_null_part(w, sc);
+    } else {
+      open_scan(w, sc);
+    }
+    scan_loop(w, s, sc);
+    w.close();
+  }
 }
 
 void print(Writer& w, const ir::Select& s) {
   std::visit(
       [&](const auto& from) {
-        if constexpr (std::is_same_v<std::decay_t<decltype(from)>, ir::PointGet>) {
+        using T = std::decay_t<decltype(from)>;
+        if constexpr (std::is_same_v<T, ir::PointGet>) {
           print_point_select(w, s, from);
-        } else {
+        } else if constexpr (std::is_same_v<T, ir::Scan>) {
           print_scan_select(w, s, from);
+        } else {
+          print_split_select(w, s, from);
         }
       },
       s.from);
@@ -344,7 +475,8 @@ void print(Writer& w, const ir::Update& s) {
       value = read_col(w, e.col, "old");
       null_if = null_src;
     } else {
-      value = "bc_sub(cx, " + read_col(w, e.col, "old") + ", " + param(PhysType::I64, e.param) + ")";
+      auto fn = e.kind == ir::Expr::Kind::Add ? "bc_add" : "bc_sub";
+      value = std::string{fn} + "(cx, " + read_col(w, e.col, "old") + ", " + param(PhysType::I64, e.param) + ")";
       null_if = (null_src.empty() ? "" : null_src + " || ") + param_null(e.param);
     }
     if (null_if.empty()) {
@@ -384,6 +516,7 @@ auto generate_plan(const bound::Bound& b, const Catalog& cat, std::string_view s
         if constexpr (std::is_same_v<T, ir::Select>) {
           out.returns_rows = true;
           for (const auto& t : s.targets) out.result_types.push_back(t.type);
+          if (s.count) out.result_types.push_back(PhysType::I64);
         } else {
           // The runtime maintains the table's indexes: a write plan names none.
           out.tables_written = {p.table};
@@ -395,6 +528,16 @@ auto generate_plan(const bound::Bound& b, const Catalog& cat, std::string_view s
                comment_line("isolation: snapshot   schema: catalog v" + std::to_string(p.catalog_version)) +
                comment_line("objects: " + w.legend()) + "#include \"bc_plan.h\"\n" + w.constants() +
                "\n\nvoid plan(bc_ctx *cx) {\n" + w.body() + "}\n";
+  if (const auto* sel = std::get_if<bound::Select>(&b.stmt)) {
+    for (auto id : sel->targets) {
+      out.result_names.push_back(sel->table->column(id)->name);
+      out.result_sql.push_back(sel->table->column(id)->sql);
+    }
+    if (sel->count) {
+      out.result_names.emplace_back("count");
+      out.result_sql.push_back(SqlType{SqlKind::BigInt});
+    }
+  }
   out.objects_read = w.objects_read();
   out.columns = w.columns_used();
   return out;
