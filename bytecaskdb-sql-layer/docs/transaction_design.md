@@ -374,8 +374,9 @@ differences*.
   - `bc_ctx_begin` given a transaction instead of taking its own snapshot;
   - `bc_ctx_commit` split into appending a statement's effects to the
     transaction and committing the transaction.
-  - one context at a time per transaction: a second, or a commit through
-    another, is refused; commit, abort and free detach the attached one,
+  - one context at a time per transaction, and a commit only with every
+    statement reset: a second context, or a commit with a statement still
+    open, is refused; an abort and a free detach the attached context,
     keeping its finished statement's results readable.
 
   Their exact C names are settled in the implementation PR, with

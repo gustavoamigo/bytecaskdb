@@ -142,13 +142,13 @@ public:
 // Every commit of the layer, DDL, autocommit and transactions alike, goes
 // through this one rule: the batch is applied, and a failure after which the
 // engine is degraded, when it was not before, may have come after the batch
-// reached the data file, so it is thrown as CommitOutcomeUnknown (its
-// message dropped, never the outcome, if it cannot be allocated). Any other
-// failure is rethrown as it is, having written nothing. Another writer's
-// failure in between also reads as unknown: the safe direction; so does a
-// resume() by an embedder holding the DB, racing the two checks, which this
-// layer never calls. Exact reporting needs the engine to say whether this
-// batch was appended (#531).
+// reached the data file, so it is thrown as CommitOutcomeUnknown, which
+// allocates nothing. Any other failure is rethrown as it is, having written
+// nothing. Another writer's failure in between also reads as unknown: the
+// safe direction. A resume() between the two checks, by an embedder holding
+// the DB (this layer never calls it), reads an unknown outcome as an
+// ordinary failure: the unsafe one. Exact reporting, which closes both,
+// needs the engine to say whether this batch was appended (#531).
 [[nodiscard]] auto apply_batch_or_unknown(DB& db, WriteOptions opts, WritePlan plan) -> std::optional<CommitResult>;
 
 // A value of one of the four physical types, or SQL NULL (monostate). The

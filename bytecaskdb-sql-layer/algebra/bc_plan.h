@@ -139,14 +139,18 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
    they read its snapshot, pinned at the first statement with its catalog
    version, through the overlay of the earlier statements' writes. One
    context at a time: from bc_ctx_begin_txn until it is reset, a context is
-   attached to the transaction, and bc_ctx_begin_txn or bc_txn_commit on
-   another context is BC_E_HANDLE, changing nothing. A statement that fails, or that takes what the transaction
+   attached to the transaction, and bc_ctx_begin_txn on another context is
+   BC_E_HANDLE, changing nothing. bc_txn_commit needs every statement reset:
+   with a context attached to the transaction, or called through a context
+   attached to any, it is BC_E_HANDLE and commits nothing (a statement the
+   context it was called through was running then fails, and aborts its
+   transaction). An aborted or ended transaction is reported first. A statement that fails, or that takes what the transaction
    holds past max_bytes (BC_E_LIMIT), aborts the transaction: it releases its
    snapshot and pin at once (bc_txn_catalog_version is then 0) and is then
    only freed. bc_txn_commit submits the statements' writes as one batch; its
    errors are the context's, BC_E_UNKNOWN when the outcome is unknown.
-   Commit, abort and bc_txn_free detach the attached context, which reads
-   nothing of the transaction after and keeps its error and its finished
+   An abort and bc_txn_free detach the attached context, which reads nothing
+   of the transaction after and keeps its error and its finished
    statement's results. */
 typedef struct bc_txn bc_txn;
 bc_txn *bc_txn_new(bc_db *db, const bc_catalog *cat, uint64_t max_bytes);

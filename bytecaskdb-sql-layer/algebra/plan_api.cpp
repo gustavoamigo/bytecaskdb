@@ -669,11 +669,10 @@ struct bc_ctx {
   }
 
   void drop_execution_state() {
-    cursors.clear();  // iterators before the snapshot and the overlay they read
-    if (txn != nullptr) txn_detach(txn, this);
+    detach_from_txn();  // the transaction's first, in the one leave order
+    cursors.clear();    // iterators before the snapshot they read
     base = nullptr;
     overlay = nullptr;
-    txn = nullptr;
     snap.reset();
     views.clear();
     keys.clear();  // key and row builders point into the pinned catalog: before it
@@ -1859,23 +1858,28 @@ bool bc_txn_add(bc_ctx* cx) {
 
 enum bc_commit_result bc_txn_commit(bc_ctx* cx, bc_txn* txn, bool sync) {
   BC_GUARD_BEGIN
-  // Through the attached context, or with none attached: another context's
-  // statement is still open.
-  if ((txn->attached != nullptr && txn->attached != cx) || (cx->txn != nullptr && cx->txn != txn)) {
+  // A commit needs no context attached to the transaction, and `cx`
+  // attached to none: every statement reset, as the embedded API always
+  // does. A refusal sets the error on `cx`; when `cx` is itself running a
+  // statement, that statement then fails, and its transaction aborts at
+  // bc_txn_add: wrong, but safe.
+  auto refuse = [&](const char* why) {
     cx->error = BC_OK;
-    cx->fail(BC_E_HANDLE, "another context is running a statement of this transaction");
+    cx->fail(BC_E_HANDLE, why);
     return BC_FAILED;
+  };
+  if (txn->aborted || txn->done) {
+    if (cx->txn == nullptr) cx->drop_execution_state();
+    return refuse(txn->done ? "the transaction has ended" : "the transaction is aborted: roll it back");
   }
-  // The snapshot moves into the plan: the context lets go of it, and keeps
-  // its last statement's results readable.
-  cx->detach_from_txn();
+  if (cx->txn != nullptr) return refuse("bc_txn_commit on a context still running a statement: reset it first");
+  if (txn->attached != nullptr) {
+    return refuse("a statement of this transaction is still open on a context: reset it first");
+  }
+  cx->drop_execution_state();  // the context holds nothing of a statement while the transaction commits
   cx->error = BC_OK;
   cx->detail = 0;
   cx->message.clear();
-  if (txn->aborted || txn->done) {
-    cx->fail(BC_E_HANDLE, txn->done ? "the transaction has ended" : "the transaction is aborted: roll it back");
-    return BC_FAILED;
-  }
   txn->done = true;
   const auto& ov = txn->overlay;
   if (ov.empty() && txn->guards.empty()) {

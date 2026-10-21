@@ -484,9 +484,11 @@ template <class Make>
   auto code = bc_error(cx);
   auto detail = bc_error_detail(cx);
   std::string message;
-  try {
-    message = bc_error_message(cx);
-  } catch (const std::bad_alloc&) {  // NOLINT(bugprone-empty-catch): the message is dropped, not the outcome
+  if (code != BC_E_UNKNOWN) {  // its exception's message is static
+    try {
+      message = bc_error_message(cx);
+    } catch (const std::bad_alloc&) {  // NOLINT(bugprone-empty-catch): the message is dropped, not the outcome
+    }
   }
   bc_ctx_reset(cx);  // the context keeps no snapshot or catalog version while idle
   throw_error(code, detail, message);
@@ -1000,7 +1002,7 @@ auto Transaction::commit() -> CommitOutcome {
   auto code = bc_error(h_->cx);
   auto detail = bc_error_detail(h_->cx);
   std::string message;
-  if (r == BC_FAILED) {
+  if (r == BC_FAILED && code != BC_E_UNKNOWN) {  // its exception's message is static
     try {
       message = bc_error_message(h_->cx);
     } catch (const std::bad_alloc&) {  // NOLINT(bugprone-empty-catch): the message is dropped, not the outcome
