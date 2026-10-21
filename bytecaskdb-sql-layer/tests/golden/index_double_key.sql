@@ -1,0 +1,1 @@
+SELECT id FROM r WHERE d >= $1

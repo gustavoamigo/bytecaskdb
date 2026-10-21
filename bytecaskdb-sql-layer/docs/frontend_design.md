@@ -494,8 +494,9 @@ feature gap.
 **Golden plans.** Every TPROC-C statement above is compiled against the
 schema fixture, and its plan text is checked in, as
 `tests/golden/<statement>.sql` and `.c`. A test recompiles each and fails on
-any difference. A change to the code generator regenerates them with a
-flag, and the PR shows the diff. They are the MVP's TPROC-C plans: the
+any difference. A change to the code generator regenerates them with
+`SQL_LAYER_REGEN_GOLDEN=1` (`tests/golden_test.cpp`), and the PR shows the
+diff. They are the MVP's TPROC-C plans: the
 hand-written ones of the validation phase are dropped (#487).
 
 **The proof machine against PostgreSQL** (`docs/testing_design.md`). Each
@@ -540,7 +541,11 @@ its transaction test.
 0. **The IR, for today's forms only.** The planner builds the IR and the code
    generator prints from it; no new SQL. Golden plans for today's forms
    land here, and their diff against today's plans is reviewed
-   (*Decisions*, 2).
+   (*Decisions*, 2). As built: `plan/ir.cppm` (the IR and `ir::check`),
+   `plan/planner.cppm` (bound statement to IR) and `plan/codegen.cppm`
+   (IR to text), with today's plans unchanged byte for byte. The IR holds
+   only today's shapes, and a range's bounds are in key order: the planner
+   resolves a `DESC` part and the NULL edge, so the printer needs neither.
 1. **Payment and Order-Status:** `col + $n` on `DECIMAL`, equality
    prefixes on the primary key and on an index, `ORDER BY` from the index,
    reverse scans, the two-range scan of a nullable ordered column, `LIMIT`,
