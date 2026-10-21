@@ -189,7 +189,11 @@ limit is refused (2201W), as in PostgreSQL. `OFFSET` is not in the MVP.
   rows.
 - `SUM` over `SMALLINT` or `INTEGER` is `bigint`, over `BIGINT` or
   `DECIMAL` is `numeric`, kept at the input's scale. NULL over no rows.
-- `MIN` is of the column's type, and NULL over no rows.
+- `MIN` is of the column's type, and NULL over no rows. In the MVP it takes
+  a numeric or temporal column; `MIN` of a `TEXT`, `VARCHAR` or `BYTEA`
+  column is outside the subset (#534), since keeping the least value seen
+  needs a buffer the plan API doesn't have, and `bc_pin` would copy every
+  new minimum into the arena.
 
 **`FOR UPDATE`**, on a single-table `SELECT`, inside a transaction:
 - every row returned is guarded with `bc_guard_unchanged`, and the commit
@@ -209,7 +213,8 @@ limit is refused (2201W), as in PostgreSQL. `OFFSET` is not in the MVP.
 **Refused**, with a message and the node's position: everything not above.
 That includes `OR`, subqueries, derived tables, `GROUP BY`, `HAVING`,
 `DISTINCT` on the select list, outer joins, three or more tables, table
-aliases, `OFFSET`, `RETURNING`, set operations, functions, and literals
+aliases, `OFFSET`, `RETURNING`, set operations, functions, `MIN` of a text
+or bytes column, and literals
 other than integers. A statement inside the subset can still be refused by
 the planner (*What the planner refuses*).
 
@@ -246,7 +251,7 @@ struct Access {
   bool lo_inclusive{true}, hi_inclusive{false};
   bool point{false};                 // eq covers the whole primary key
   bool reverse{false};
-  bool nulls_apart{false};           // the last ordered part is nullable: present values and NULLs as two ranges
+  bool nulls_apart{false};           // the ordered part after the equality prefix is nullable and not compared: present values and NULLs as two ranges
   bool covering{false};              // every column used comes from the key
   std::vector<Compare> residual;     // the conjuncts the key does not express, in WHERE order
 };
@@ -281,7 +286,7 @@ needed; every pattern below uses calls `bc_plan.h` declares.
 | An equality prefix | `Access{eq}` | `bc_scan_open(lo = hi = prefix, BC_SCAN_PREFIX)` |
 | A prefix and a range | `Access{eq, lo, hi}` | bounds from `bc_key_*`; an exclusive `lo` or an inclusive `hi` through `bc_key_successor` (`bc_plan.h`, *bounds*) |
 | `DESC` order | `reverse` | `BC_SCAN_REVERSE` |
-| A nullable last ordered part | `nulls_apart` | two `bc_scan_open`s in PostgreSQL's NULL placement: the present values, bounded at the NULL part built with `bc_key_null` (and `bc_key_successor`, on the side where an `ASC` index part keeps its NULLs), and the NULL part as `BC_SCAN_PREFIX`; one loop body, one `LIMIT` counter |
+| A nullable ordered part after the equality prefix | `nulls_apart` | two `bc_scan_open`s in PostgreSQL's NULL placement: the present values, bounded at the NULL part built with `bc_key_null` (and `bc_key_successor`, on the side where an `ASC` index part keeps its NULLs), and the NULL part as `BC_SCAN_PREFIX`; one loop body, one `LIMIT` counter |
 | A covering read | `covering` | `bc_key_part_*` on `bc_scan_key`; otherwise `bc_scan_row` |
 | A residual filter | `residual` | `bc_col_*` or `bc_key_part_*`, compared in an `if` that `continue`s; a NULL operand rejects the row |
 | `+` / `-` | `Expr{Add, Sub}` | `bc_add` / `bc_sub`, then the range check of its type (*Additions*) |
@@ -291,12 +296,12 @@ needed; every pattern below uses calls `bc_plan.h` declares.
 | `LIMIT` | `limit` | an `int64_t` counter; `break` at the limit |
 | `COUNT(*)`, `COUNT(col NOT NULL)`, no residual | `count_from_keys` | `bc_count_range` over the access path's range |
 | `COUNT`, `SUM` otherwise | `aggregate` | an accumulator local, `bc_add`; a "seen" `bool` for SUM's NULL |
-| `MIN` otherwise | `aggregate` | a local holding the least non-NULL value, kept by comparison: `<` on integers and doubles, `bc_bytes_cmp` on bytes; a `bytes` value is kept with `bc_pin`, since a `bc_col_bytes` view lives only as long as its row; a "seen" `bool` for the NULL |
+| `MIN` otherwise | `aggregate` | a local holding the least non-NULL value, kept by comparison: `<` on integers, on doubles `<` with NaN taken as greater than every other value (`docs/types_design.md`, *Double arithmetic*); a "seen" `bool` for the NULL. Never a bytes column (*The dialect subset*) |
 | `MIN(col)`, `col` the part after the equality prefix, no residual | `min_from_first_key` | the first entry of a forward scan of the present values, past the NULL part (*The planner's choices*), then `break` |
 | `COUNT(DISTINCT col)` | `aggregate` | `bc_agg_group` keyed by the column, then a count of `bc_agg_next` |
 | A join | `loops[1]` | the inner key built from the outer row: `bc_key_*` of `bc_col_*`; nested in the outer loop |
 | `FOR UPDATE` | `for_update` | `bc_guard_unchanged` on each returned row's key: the point key, or `bc_row_key` |
-| Targets | `targets` | `bc_emit_col`, `bc_emit_key_part`; for an aggregate, `bc_emit_i64` (`COUNT`, `SUM`, and `MIN` of an integer, `DECIMAL`, `DATE`, `TIMESTAMP` or `TIME`), `bc_emit_f64` (`MIN` of a `REAL` or `DOUBLE PRECISION`), `bc_emit_bytes` (`MIN` of a `TEXT`, `VARCHAR` or `BYTEA`), and `bc_emit_null` over no rows |
+| Targets | `targets` | `bc_emit_col`, `bc_emit_key_part`; for an aggregate, `bc_emit_i64` (`COUNT`, `SUM`, and `MIN` of an integer, `DECIMAL`, `DATE`, `TIMESTAMP` or `TIME`), `bc_emit_f64` (`MIN` of a `REAL` or `DOUBLE PRECISION`), and `bc_emit_null` over no rows |
 
 A NULL that a key needs means no row can match, since `=` and the range
 operators reject NULL:
@@ -339,8 +344,9 @@ out.
 doesn't: the key codec sorts the NULL marker first (`docs/types_design.md`),
 so a scan gives `NULLS FIRST` for `ASC` and `NULLS LAST` for `DESC`, and
 PostgreSQL's defaults are the reverse. When the last ordered part is
-nullable, the plan scans it as two bounded ranges, in the order PostgreSQL
-returns them:
+nullable, directly follows the equality-compared parts and the `WHERE`
+doesn't compare it, the plan scans it as two bounded ranges, in the order
+PostgreSQL returns them:
 - `ASC`: the present values first, from the successor of the NULL part
   (*A range never includes nulls* in `docs/types_design.md`), then the NULL
   part, a prefix scan of the equality prefix followed by the NULL marker;
@@ -348,9 +354,10 @@ returns them:
 
 `LIMIT` counts across both ranges. A part the `WHERE` compares, by
 equality or a range, holds no NULLs in the rows it can match, so it needs
-one range. Only the last ordered part may be nullable; an earlier nullable
-ordered part would need a range per combination of NULLs, and is refused
-(*What the planner refuses*). TPROC-C's ordered columns are `c_first` (P6,
+one range. Any other nullable ordered part is refused (*What the planner
+refuses*): an earlier one would need a range per combination of NULLs, and
+a last one after another ordered part would need its NULLs placed within
+each value of that part, which two ranges over the whole prefix don't do. TPROC-C's ordered columns are `c_first` (P6,
 O2), `o_id` (O4) and `no_o_id` (D1). `o_id` and `no_o_id` are `NOT NULL` in
 the schema fixture. `c_first` is nullable there, as in HammerDB's MySQL
 schema, so P6's and O2's golden plans show the two-range form. HammerDB's
@@ -421,7 +428,7 @@ statement's only one:
 | 2 | A join where neither table is reachable from parameters alone | `no plan: a full scan of <first table in FROM>` |
 | 3 | A join whose inner table no key reaches from the outer row and the parameters | `no plan: no index of <inner table> joins on <columns>` |
 | 4 | A single table with no usable path | `no plan: a full scan of <table>` |
-| 5 | A single table whose `ORDER BY` has a nullable column before its last that the `WHERE` doesn't compare, unless a point lookup on the whole primary key serves it | `no plan: ORDER BY on nullable column <column> before the last` |
+| 5 | A single table whose `ORDER BY` has a nullable column the `WHERE` doesn't compare, other than one that is the only ordered part after the equality-compared ones, unless a point lookup on the whole primary key serves it | `no plan: ORDER BY on nullable column <column>` |
 | 6 | A single table whose usable paths don't give its `ORDER BY` (a point lookup on the whole primary key always does) | `no plan: no index of <table> gives ORDER BY <columns>` |
 
 The refusal is a SQL error with SQLSTATE 0A000 (`feature_not_supported`),
@@ -513,7 +520,7 @@ comparison for now (*Decisions*, 7).
 |---|---|---|
 | `SUM` over `DECIMAL` is unbounded `numeric`. | Past 18 digits it is 22003. | `DECIMAL` is a scaled `int64_t` (`docs/types_design.md`). No TPROC-C sum comes near. |
 | Comparing columns of different types casts one to the other's. | Refused, in a `WHERE` and a join. | One key encoding per comparison. TPROC-C compares columns of one type only. |
-| A statement no index scan answers in its order runs: a full scan, a sort of the rows read, an `ORDER BY` on a join or with a nullable column before its last. | Refused (*What the planner refuses*). | Each would add a sorter (`bc_sorter_*`) or an unbounded read to build and test before the MVP (*Decisions*, 5; #533). No TPROC-C statement needs one. |
+| A statement no index scan answers in its order runs: a full scan, a sort of the rows read, an `ORDER BY` on a join or with a nullable column other than the only one after the equality prefix. | Refused (*What the planner refuses*). | Each would add a sorter (`bc_sorter_*`) or an unbounded read to build and test before the MVP (*Decisions*, 5; #533). No TPROC-C statement needs one. |
 
 All three are refusals rather than different answers. Everything else in
 the subset matches PostgreSQL, and the proof machine checks that it does.
@@ -532,7 +539,7 @@ that builds it, named in its PR.
 | An `UPDATE` or `DELETE` affects exactly the rows that matched when it began, and reports how many. | to add |
 | Arithmetic whose result leaves its type is SQLSTATE 22003, and the statement writes nothing. | to add |
 | A comparison with NULL rejects the row. | to add |
-| In the MVP, a statement inside the supported subset that no index scan answers in its order (a full scan, an `ORDER BY` no index gives, on a join or with a nullable column before its last, a join no index reaches) is refused with a SQL error, SQLSTATE 0A000, before anything runs or is written. | to add |
+| In the MVP, a statement inside the supported subset that no index scan answers in its order (a full scan, an `ORDER BY` no index gives, on a join or with a nullable column other than the only one after the equality prefix, a join no index reaches) is refused with a SQL error, SQLSTATE 0A000, before anything runs or is written. | to add |
 
 **Widened:** lookups by the whole primary key become lookups by any key
 prefix or range, joins of two tables, and `UPDATE` and `DELETE` of many
@@ -571,7 +578,8 @@ Tracked in #534, except full scans and sorts, which are #533.
 
 - `OR`, `IN`, `IS NULL`, subqueries, derived tables, `GROUP BY`, outer
   joins, three or more tables, `OFFSET`, `RETURNING`, multi-row `VALUES`,
-  string and function expressions, `*` and `/`.
+  string and function expressions, `*` and `/`, `MIN` of a text or bytes
+  column.
 - Sorters and hash joins, with the bounds `bc_plan.h` gives them.
 - A cost model from `bc_count_range`.
 - `FOR UPDATE` on joins, and the serializable guards
