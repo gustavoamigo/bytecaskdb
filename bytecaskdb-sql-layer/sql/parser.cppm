@@ -325,11 +325,22 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   }
   if (from->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) reject("SELECT reads exactly one table", pos);
   if (s->n_distinct_clause != 0 || s->n_group_clause != 0 || s->having_clause != nullptr ||
-      s->limit_offset != nullptr || s->n_locking_clause != 0 || s->with_clause != nullptr ||
+      s->limit_offset != nullptr || s->n_locking_clause > 1 || s->with_clause != nullptr ||
       s->n_window_clause != 0 || s->into_clause != nullptr) {
     reject("SELECT clause not supported", pos);
   }
-  Select sel{{}, relation(from->range_var), {}, {}, limit(s), pos};
+  Select sel{{}, relation(from->range_var), {}, {}, limit(s), pos, false};
+  if (s->n_locking_clause == 1) {
+    // FOR UPDATE alone: never NOWAIT or SKIP LOCKED, which only mean
+    // something to a locker, nor a weaker lock or OF a table list.
+    const auto* lc = s->locking_clause[0]->locking_clause;
+    if (lc->strength != PG_QUERY__LOCK_CLAUSE_STRENGTH__LCS_FORUPDATE) reject("only FOR UPDATE is supported", pos);
+    if (lc->wait_policy != PG_QUERY__LOCK_WAIT_POLICY__LockWaitBlock) {
+      reject("NOWAIT and SKIP LOCKED are not supported", pos);
+    }
+    if (lc->n_locked_rels != 0) reject("FOR UPDATE OF is not supported", pos);
+    sel.for_update = true;
+  }
   for (std::size_t i = 0; i < s->n_sort_clause; ++i) {
     const auto* sb = s->sort_clause[i]->sort_by;
     // libpg_query records no position for a SortBy: report its column's.

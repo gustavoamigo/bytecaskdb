@@ -576,3 +576,226 @@ TEST_CASE("embedded API: a DDL racing a transaction's first statement re-pins it
   CHECK(raced);
   CHECK(t.commit() == CommitOutcome::Committed);
 }
+
+TEST_CASE("embedded API: a key a transaction inserted that a concurrent commit took is 23505 at commit",
+          "[sql][api][txn]") {
+  sql_test::TempDir dir{"api_txn"};
+  auto db = open_db(dir);
+  db->execute("CREATE TABLE person (id BIGINT PRIMARY KEY, email VARCHAR(32))");
+  db->execute("CREATE UNIQUE INDEX person_email ON person (email)");
+  auto cat = db->catalog();
+  auto acct_id = cat->table("acct")->id;
+  auto email_id = cat->index("person_email").second->id;
+  auto duplicate = [](Transaction& t) -> std::optional<ConstraintDetail> {
+    try {
+      (void)t.commit();
+    } catch (const SerializationFailure&) {
+      return std::nullopt;
+    } catch (const ExecError& e) {
+      CHECK_FALSE(e.conflict());
+      CHECK(e.code() == BC_E_CONSTRAINT);
+      CHECK_FALSE(t.is_open());
+      return e.constraint();
+    }
+    FAIL("the second commit did not fail");
+    return std::nullopt;
+  };
+  SECTION("a primary key: the error names the table") {
+    auto a = db->begin();
+    auto b = db->begin();
+    a.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{10}});
+    b.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{20}});
+    CHECK(b.commit() == CommitOutcome::Committed);
+    auto d = duplicate(a);
+    REQUIRE(d);
+    CHECK(d->constraint == BC_C_UNIQUE);
+    CHECK(d->object_id == acct_id);
+    CHECK(balance(*db, 1) == 20);
+  }
+  SECTION("a unique index value, under another key: the error names the index") {
+    auto a = db->begin();
+    auto b = db->begin();
+    a.execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{1}, sql_test::bytes("x@y")});
+    b.execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{2}, sql_test::bytes("x@y")});
+    CHECK(b.commit() == CommitOutcome::Committed);
+    auto d = duplicate(a);
+    REQUIRE(d);
+    CHECK(d->constraint == BC_C_UNIQUE);
+    CHECK(d->object_id == email_id);
+    CHECK(db->table_rows("person").rows.size() == 1);
+  }
+  SECTION("an autocommit insert raced the same way reports the same") {
+    auto b = db->begin();
+    b.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{20}});
+    CHECK(b.commit() == CommitOutcome::Committed);
+    try {
+      (void)db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{10}});
+      FAIL("the duplicate committed");
+    } catch (const ExecError& e) {
+      REQUIRE(e.constraint());
+      CHECK(e.constraint()->constraint == BC_C_UNIQUE);
+      CHECK(e.constraint()->object_id == acct_id);
+    }
+  }
+  SECTION("a conflict on a row the transaction updated, not inserted, is 40001") {
+    db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{10}});
+    auto a = db->begin();
+    a.execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{11}});
+    a.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{2}, std::int64_t{0}});
+    db->execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{12}});
+    CHECK_FALSE(duplicate(a));
+    CHECK(balance(*db, 2) == std::nullopt);
+  }
+  SECTION("a unique value a later statement moved away claims nothing: not 23505") {
+    auto a = db->begin();
+    a.execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{1}, sql_test::bytes("x@y")});
+    a.execute("UPDATE person SET email = $2 WHERE id = $1", {std::int64_t{1}, sql_test::bytes("z@w")});
+    db->execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{2}, sql_test::bytes("x@y")});
+    // The first statement's check of "x@y" still guards it, so the commit
+    // conflicts (#537); what it is not is a duplicate.
+    CHECK_FALSE(duplicate(a));
+  }
+  SECTION("two updates of one row to one unique value: the conflict on the row, 40001") {
+    db->execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{1}, sql_test::bytes("a@b")});
+    auto a = db->begin();
+    a.execute("UPDATE person SET email = $2 WHERE id = $1", {std::int64_t{1}, sql_test::bytes("x@y")});
+    db->execute("UPDATE person SET email = $2 WHERE id = $1", {std::int64_t{1}, sql_test::bytes("x@y")});
+    // The entry that took "x@y" is the row's own: not a duplicate.
+    CHECK_FALSE(duplicate(a));
+  }
+  SECTION("deleting and reinserting a row a concurrent commit updates is 40001") {
+    db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{10}});
+    auto a = db->begin();
+    a.execute("DELETE FROM acct WHERE id = $1", {std::int64_t{1}});
+    a.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{99}});
+    db->execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{12}});
+    CHECK_FALSE(duplicate(a));
+    CHECK(balance(*db, 1) == 12);
+  }
+}
+
+TEST_CASE("embedded API: DDL given to a transaction is 0A000 and aborts it", "[sql][api][txn]") {
+  sql_test::TempDir dir{"api_txn"};
+  auto db = open_db(dir);
+  auto t = db->begin();
+  t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{10}});
+  CHECK_THROWS_AS(t.execute("CREATE INDEX acct_bal ON acct (bal)"), FeatureNotSupported);
+  CHECK(t.is_aborted());
+  CHECK(db->catalog()->index("acct_bal").second == nullptr);
+  CHECK(t.commit() == CommitOutcome::RolledBack);
+  CHECK(balance(*db, 1) == std::nullopt);
+}
+
+TEST_CASE("embedded API: a DDL on a table an open transaction wrote makes its commit 40001; one it read does not",
+          "[sql][api][txn]") {
+  sql_test::TempDir dir{"api_txn"};
+  auto db = open_db(dir);
+  db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{10}});
+  db->execute("CREATE TABLE other (id BIGINT PRIMARY KEY)");
+  auto wrote = db->begin();
+  auto read = db->begin();
+  wrote.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{2}, std::int64_t{20}});
+  CHECK(txn_balance(read, 1) == 10);
+  read.execute("INSERT INTO other VALUES ($1)", {std::int64_t{1}});
+  // The DDL commits at once, with both transactions open.
+  db->execute("CREATE INDEX acct_bal ON acct (bal)");
+  CHECK_THROWS_AS(wrote.commit(), SerializationFailure);
+  CHECK(read.commit() == CommitOutcome::Committed);
+  // A reader that took FOR UPDATE rows a DDL then rewrote conflicts:
+  // PostgreSQL would make the DDL wait for its row locks; never waiting, the
+  // reader gets 40001 instead.
+  auto locked = db->begin();
+  CHECK(locked.execute("SELECT bal FROM acct WHERE id = $1 FOR UPDATE", {std::int64_t{1}}).rows.size() == 1);
+  db->execute("ALTER TABLE acct ADD COLUMN tag BIGINT DEFAULT 5");
+  CHECK_THROWS_AS(locked.commit(), SerializationFailure);
+  CHECK(balance(*db, 2) == std::nullopt);
+  CHECK(db->table_rows("other").rows.size() == 1);
+  // The index holds every row: the one the conflicting transaction wrote
+  // never reached the table without its entry.
+  CHECK(db->execute("SELECT id FROM acct WHERE bal = $1", {std::int64_t{10}}).rows.size() == 1);
+}
+
+TEST_CASE("embedded API: SELECT … FOR UPDATE makes the commit 40001 if a row it returned changed", "[sql][api][txn]") {
+  sql_test::TempDir dir{"api_txn"};
+  auto db = open_db(dir);
+  db->execute("CREATE INDEX acct_bal ON acct (bal)");
+  db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{10}});
+  db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{2}, std::int64_t{20}});
+  constexpr auto kLock = "SELECT bal FROM acct WHERE id = $1 FOR UPDATE";
+  // Write skew: each reads a row the other writes. Without FOR UPDATE both commit.
+  SECTION("without FOR UPDATE, a read row changed by another commit is not a conflict") {
+    auto t = db->begin();
+    CHECK(txn_balance(t, 1) == 10);
+    t.execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{2}, std::int64_t{21}});
+    db->execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{11}});
+    CHECK(t.commit() == CommitOutcome::Committed);
+    CHECK(balance(*db, 2) == 21);
+  }
+  SECTION("with FOR UPDATE on the primary key, it is") {
+    auto t = db->begin();
+    CHECK(t.execute(kLock, {std::int64_t{1}}).rows.size() == 1);
+    t.execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{2}, std::int64_t{21}});
+    db->execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{11}});
+    CHECK_THROWS_AS(t.commit(), SerializationFailure);
+    CHECK(balance(*db, 2) == 20);
+  }
+  SECTION("with FOR UPDATE over an index range, a deleted row is a change too") {
+    auto t = db->begin();
+    CHECK(t.execute("SELECT id FROM acct WHERE bal >= $1 FOR UPDATE", {std::int64_t{15}}).rows.size() == 1);
+    t.execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{11}});
+    db->execute("DELETE FROM acct WHERE id = $1", {std::int64_t{2}});
+    CHECK_THROWS_AS(t.commit(), SerializationFailure);
+    CHECK(balance(*db, 1) == 10);
+  }
+  SECTION("a transaction that only read FOR UPDATE still conflicts on a row it returned") {
+    // In PostgreSQL the other writer would wait for this one; never waiting,
+    // the writer commits and this transaction gets the conflict.
+    auto t = db->begin();
+    CHECK(t.execute(kLock, {std::int64_t{1}}).rows.size() == 1);
+    db->execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{11}});
+    CHECK_THROWS_AS(t.commit(), SerializationFailure);
+    // A transaction that read the row unchanged commits, writing nothing.
+    auto u = db->begin();
+    CHECK(u.execute(kLock, {std::int64_t{1}}).rows.size() == 1);
+    CHECK(u.commit() == CommitOutcome::Committed);
+    CHECK(balance(*db, 1) == 11);
+  }
+  SECTION("on a follower: an autocommit FOR UPDATE reads, a transaction that used one fails at commit") {
+    db->engine_for_testing().set_mode(bytecask::Mode::Follower);
+    // Autocommit: the statement's commit writes nothing and is not asked of
+    // the engine.
+    auto r = db->execute(kLock, {std::int64_t{2}});
+    REQUIRE(r.rows.size() == 1);
+    CHECK(std::get<std::int64_t>(r.rows[0][0]) == 20);
+    // A read-only transaction without FOR UPDATE commits.
+    auto plain = db->begin();
+    CHECK(txn_balance(plain, 1) == 10);
+    CHECK(plain.commit() == CommitOutcome::Committed);
+    // With it, its guards need the engine's check, which a follower refuses,
+    // as it refuses a write: nothing is written.
+    auto t = db->begin();
+    CHECK(t.execute(kLock, {std::int64_t{1}}).rows.size() == 1);
+    try {
+      (void)t.commit();
+      FAIL("a follower committed a guarded transaction");
+    } catch (const ExecError& e) {
+      CHECK_FALSE(e.conflict());
+      CHECK(e.code() == BC_E_DEGRADED);
+    }
+    db->engine_for_testing().set_mode(bytecask::Mode::Leader);
+  }
+  SECTION("a row FOR UPDATE returned that no one changed commits, and the guard blocks no writer") {
+    auto t = db->begin();
+    CHECK(t.execute(kLock, {std::int64_t{1}}).rows.size() == 1);
+    db->execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{2}, std::int64_t{22}});
+    t.execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{12}});
+    CHECK(t.commit() == CommitOutcome::Committed);
+    CHECK(balance(*db, 1) == 12);
+    CHECK(balance(*db, 2) == 22);
+  }
+  SECTION("an autocommit SELECT … FOR UPDATE returns its rows") {
+    auto r = db->execute(kLock, {std::int64_t{2}});
+    REQUIRE(r.rows.size() == 1);
+    CHECK(std::get<std::int64_t>(r.rows[0][0]) == 20);
+  }
+}

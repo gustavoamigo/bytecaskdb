@@ -162,3 +162,15 @@ TEST_CASE("parser: the stage-1 DDL forms", "[sql][parser][catalog]") {
   CHECK(a.column.default_value->kind == Literal::Kind::Integer);  // past 32 bits: PostgreSQL's Float node
   CHECK(a.column.default_value->text == "10000000000");
 }
+
+TEST_CASE("parser: SELECT … FOR UPDATE, and no other locking clause", "[sql][parser][txn]") {
+  auto sel = std::get<Select>(parse("SELECT id FROM t WHERE id = $1 FOR UPDATE"));
+  CHECK(sel.for_update);
+  CHECK_FALSE(std::get<Select>(parse("SELECT id FROM t WHERE id = $1")).for_update);
+  CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 FOR SHARE"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 FOR NO KEY UPDATE"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 FOR UPDATE NOWAIT"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 FOR UPDATE SKIP LOCKED"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 FOR UPDATE OF t"), SqlError);
+  CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 FOR UPDATE FOR UPDATE"), SqlError);
+}

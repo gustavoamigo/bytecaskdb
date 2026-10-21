@@ -6,6 +6,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -71,6 +72,8 @@ TEST_CASE("ir: check refuses what the printer can't print", "[sql][ir]") {
   auto covering = scan({0}, {}, {0}, true);
   CHECK_NOTHROW(ir::check(plan(ir::Select{covering, {kId}})));
   refused(plan(ir::Select{covering, {kD}}), "DOUBLE target");
+  refused(plan(ir::Select{covering, {kId}, std::nullopt, std::nullopt, true}), "FOR UPDATE scan that covers");
+  CHECK_NOTHROW(ir::check(plan(ir::Select{scan({0}, {}, {0}), {kId}, std::nullopt, std::nullopt, true})));
 
   refused(plan(ir::Insert{}), "sets no column");
   refused(plan(ir::Update{ir::PointGet{{0}}, {}}), "sets no column");

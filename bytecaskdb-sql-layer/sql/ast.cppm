@@ -132,6 +132,7 @@ struct Select {
   std::vector<OrderItem> order_by;
   std::optional<std::int64_t> limit;  // nullopt: none, LIMIT ALL or LIMIT NULL
   std::int32_t pos{-1};
+  bool for_update{false};  // FOR UPDATE: a guard on each row returned, never a lock
 };
 
 struct Assignment {

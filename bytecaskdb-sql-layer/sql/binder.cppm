@@ -73,6 +73,7 @@ struct Select {
   std::vector<Compare> where;
   std::vector<OrderItem> order_by;
   std::optional<std::int64_t> limit;   // nullopt: no limit
+  bool for_update{false};
 };
 
 struct Update {
@@ -282,31 +283,41 @@ public:
   }
 
   // Gives parameter $n+1 a type, physical and, when a WHERE compares it with
-  // `compared` or a SET adds it to `compared`, SQL; a second use must agree
-  // with the first. A compared $n
+  // `compared` or a SET adds it to `compared`, SQL: `range`, or the
+  // column's type without its modifier. A second use must agree with the
+  // first physically. An `operand` of col ± $n does not re-type a $n an
+  // earlier use typed: as PostgreSQL types a $n, its first use decides
+  // (`SET b = $1, a = a + $1` types $1 as b's). A WHERE comparison does:
+  // its range check is what keeps a key outside the column's type from
+  // being keyed as another value. A compared $n
   // has one SQL type, what the pre-plan range check checks: compared with
   // columns of two types that share a physical type (DOUBLE PRECISION and
   // REAL, INTEGER and BIGINT, DECIMALs of two scales), one value could be
   // keyed as two numbers. Refused, where PostgreSQL runs it
   // (docs/testing_design.md, *Known differences*). A DECIMAL of scale 0 is
   // compared as a BIGINT (compared_type): its integer is the number itself.
-  void use_param(std::uint32_t n, PhysType t, std::int32_t pos, const Column* compared = nullptr) {
+  void use_param(std::uint32_t n, PhysType t, std::int32_t pos, const Column* compared = nullptr,
+                 std::optional<SqlType> range = std::nullopt, bool operand = false) {
     if (params_.size() <= n) params_.resize(n + 1);
     auto& p = params_[n];
+    auto typed = p.phys.has_value();
     if (p.phys && *p.phys != t) {
       throw SqlError{"parameter $" + std::to_string(n + 1) + " used as both " + type_name(*p.phys) + " and " +
                          type_name(t),
                      pos};
     }
     p.phys = t;
-    if (compared == nullptr) return;
+    if (compared == nullptr || (operand && typed)) return;
     if (p.compared != nullptr && compared_type(p.compared->sql).identity != compared_type(compared->sql).identity) {
       auto named = [](const Column& c) { return c.name + " (" + sql_type_name(c.sql) + ")"; };
       throw SqlError{"parameter $" + std::to_string(n + 1) + " is compared with " + named(*p.compared) + " and " +
                          named(*compared),
                      pos};
     }
-    if (p.compared == nullptr) p.compared = compared;
+    if (p.compared == nullptr) {
+      p.compared = compared;
+      p.range = range.value_or(compared_type(compared->sql).range);
+    }
   }
 
   // An expression whose type is fixed by its target (an assigned column).
@@ -355,7 +366,14 @@ public:
                                                          "assigned column's type",
                          e.pos};
         }
-        use_param(e.rhs->param, PhysType::I64, e.rhs->pos, c);
+        // A DECIMAL operand is checked against DECIMAL's 18 digits, the
+        // layer's bound on any DECIMAL: so the sum stays inside int64, and
+        // the row builder's check of it is 22003, as PostgreSQL's
+        // assignment is. An integer's is its column's type.
+        auto range = c->sql.kind == SqlKind::Decimal
+                         ? std::optional{SqlType{SqlKind::Decimal, 0, static_cast<std::uint8_t>(kMaxDecimalPrecision), c->sql.scale}}
+                         : std::nullopt;
+        use_param(e.rhs->param, PhysType::I64, e.rhs->pos, c, range, true);
         return Expr{e.kind == ast::Expr::Kind::Add ? Expr::Kind::Add : Expr::Kind::Sub, c->id, e.rhs->param,
                     PhysType::I64};
       }
@@ -406,7 +424,7 @@ public:
   auto param_sql() const -> std::vector<std::optional<SqlType>> {
     std::vector<std::optional<SqlType>> out;
     for (const auto& p : params_) {
-      out.push_back(p.compared == nullptr ? std::nullopt : std::optional{compared_type(p.compared->sql).range});
+      out.push_back(p.compared == nullptr ? std::nullopt : std::optional{p.range});
     }
     return out;
   }
@@ -417,6 +435,7 @@ private:
   struct ParamUse {
     std::optional<PhysType> phys;
     const Column* compared{nullptr};
+    SqlType range{};  // what the pre-plan range check checks, when compared
   };
   const Catalog& cat_;
   std::vector<ParamUse> params_;
@@ -493,7 +512,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           return {out, s.pos};
         } else if constexpr (std::is_same_v<T, ast::Select>) {
           const auto* t = b.table(s.table, s.pos);
-          Select out{t, {}, std::nullopt, b.where(*t, s.where), {}, s.limit};
+          Select out{t, {}, std::nullopt, b.where(*t, s.where), {}, s.limit, s.for_update};
           const ast::Expr* bare = nullptr;  // a column beside an aggregate: 42803
           for (const auto& e : s.targets) {
             if (e.kind == ast::Expr::Kind::Count) {
@@ -513,6 +532,8 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
                            pos};
           };
           if (out.count && bare != nullptr) ungrouped(bare->column, bare->pos);
+          // 0A000, as PostgreSQL refuses it.
+          if (out.count && s.for_update) throw SqlError{"FOR UPDATE is not allowed with aggregate functions", s.pos};
           for (const auto& o : s.order_by) {
             const auto* c = Binder::column(*t, o.column, o.pos);
             if (out.count) ungrouped(c->name, o.pos);

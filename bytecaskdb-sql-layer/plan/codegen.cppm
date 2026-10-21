@@ -214,7 +214,6 @@ void return_if_null(Writer& w, const std::vector<std::uint32_t>& params, const s
   w.close();
 }
 
-const std::vector<std::string> kNoRowWritten{"bc_emit_count(cx, 0);"};
 
 // A key of `object` from its leading parts, as an expression: each a
 // parameter or NULL (nullopt). One bc_key_params when they are consecutive
@@ -245,7 +244,7 @@ auto successor(const std::string& key) -> std::string { return "bc_key_successor
 // Reads the row a point lookup names into `name`, returning when a
 // parameter is NULL or there is no such row.
 void fetch_row(Writer& w, const ir::PointGet& g, const std::string& name, bool count) {
-  return_if_null(w, g.key_params, count ? kNoRowWritten : std::vector<std::string>{});
+  return_if_null(w, g.key_params, count ? std::vector<std::string>{"bc_emit_count(cx, 0);"} : std::vector<std::string>{});
   w.line("bool found = false;");
   w.line("bc_view " + name + " = bc_get(cx, " + key(w, w.p().table, g.key_params) + ", &found);");
   w.open("if (!found)");
@@ -279,6 +278,13 @@ void print(Writer& w, const ir::Insert& s) {
   w.line("bc_emit_count(cx, 1);");
 }
 
+// FOR UPDATE: the row's key is guarded unchanged, so the commit conflicts
+// if a concurrent commit changed the row (docs/transaction_design.md,
+// *Isolation*).
+void guard_row(Writer& w, const ir::Select& s, const std::string& row) {
+  if (s.for_update) w.line("bc_guard_row(cx, " + w.tbl() + ", " + row + ");");
+}
+
 // Whether the statement emits its rows: LIMIT 0 emits none.
 auto emits(const ir::Select& s) -> bool { return !s.limit || *s.limit > 0; }
 
@@ -304,7 +310,10 @@ void print_point_select(Writer& w, const ir::Select& s, const ir::PointGet& g) {
     return;
   }
   fetch_row(w, g, "row", false);
-  if (emits(s)) emit_columns(w, s.targets, "row");
+  if (emits(s)) {
+    guard_row(w, s, "row");
+    emit_columns(w, s.targets, "row");
+  }
 }
 
 // One end of a scan, in key order, as an expression.
@@ -382,6 +391,7 @@ void scan_loop(Writer& w, const ir::Select& s, const ir::Scan& sc) {
   } else {
     w.reads(w.p().table);
     w.line("bc_view row = bc_scan_row(cx, c);");
+    guard_row(w, s, "row");
     emit_columns(w, s.targets, "row");
   }
   if (limited) w.line("++n;");

@@ -142,6 +142,18 @@ public:
   ~TransactionAborted() override;  // out of line: anchors the vtable (-Wweak-vtables)
 };
 
+// A statement the layer does not support where it was given: SQLSTATE
+// 0A000. A DDL statement given to a transaction is one: DDL is its own
+// atomic operation. Thrown before anything runs; in a transaction it aborts
+// the transaction, as every error does in PostgreSQL.
+class FeatureNotSupported : public std::logic_error {
+public:
+  using std::logic_error::logic_error;
+  FeatureNotSupported(const FeatureNotSupported&) = default;
+  FeatureNotSupported& operator=(const FeatureNotSupported&) = default;
+  ~FeatureNotSupported() override;  // out of line: anchors the vtable (-Wweak-vtables)
+};
+
 // Parameters a statement does not take: the wrong number, or a value not of
 // its parameter's type. Thrown before the plan runs.
 class ParamError : public std::invalid_argument {
@@ -445,6 +457,7 @@ constexpr std::uint32_t kMaxRetries = 3;
 ExecError::~ExecError() = default;
 SerializationFailure::~SerializationFailure() = default;
 TransactionAborted::~TransactionAborted() = default;
+FeatureNotSupported::~FeatureNotSupported() = default;
 TransactionResolutionUnknown::~TransactionResolutionUnknown() = default;
 auto TransactionResolutionUnknown::what() const noexcept -> const char* {
   return "the transaction's outcome is unknown: its commit failed after its batch may have reached the data file "
@@ -939,7 +952,7 @@ void Transaction::check_usable() const {
 auto Transaction::run_locked(const Statement& stmt, const std::vector<Value>& params) -> Rows {
   try {
     // DDL is its own atomic operation, never part of a transaction.
-    if (stmt.is_ddl()) throw std::logic_error("DDL inside a transaction is not supported");
+    if (stmt.is_ddl()) throw FeatureNotSupported("DDL inside a transaction is not supported: run it outside one");
     return db_->run(h_->cx, stmt, params, h_->txn);
   } catch (const SerializationFailure&) {
     end_locked();

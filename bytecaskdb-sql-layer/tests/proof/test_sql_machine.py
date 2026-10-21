@@ -351,11 +351,14 @@ class SqlMachine(RuleBasedStateMachine):
         types = [t.column(c).type for c in cols] if t is not None else None
         return self.both(sql, params, types=types)
 
-    def lookup(self, name: str, key: tuple) -> o.Outcome:
+    def lookup(self, name: str, key: tuple, for_update: bool = False) -> o.Outcome:
         t = self.tables[name]
         where = " AND ".join(f"{c} = ${i + 1}" for i, c in enumerate(t.pk))
         pg_where = " AND ".join(f"{c} = {typed(t, c, i + 1)}" for i, c in enumerate(t.pk))
-        return self.both(f"{t.select_all} WHERE {where}", key, pg_sql=f"{t.select_all} WHERE {pg_where}",
+        # FOR UPDATE returns what the plain SELECT does: on one connection
+        # nothing changes a row it guards (the layer) or locks (PostgreSQL).
+        lock = " FOR UPDATE" if for_update else ""
+        return self.both(f"{t.select_all} WHERE {where}{lock}", key, pg_sql=f"{t.select_all} WHERE {pg_where}{lock}",
                          types=[t.column(c).type for c in t.pk])
 
     def create_index(self, name: str, ix: Index) -> o.Outcome:
@@ -541,7 +544,7 @@ class SqlMachine(RuleBasedStateMachine):
             key = data.draw(st.sampled_from(keys), label="key")
         else:
             key = tuple(data.draw(st.none() | values(t.column(c).type), label=c) for c in t.pk)
-        self.lookup(t.name, key)
+        self.lookup(t.name, key, for_update=data.draw(st.booleans(), label="FOR UPDATE"))
 
     @precondition(lambda self: self.tables and self.txn is None)
     @rule(data=st.data())
@@ -1130,6 +1133,28 @@ def test_column_plus_parameter_at_the_edges(dsn):
             assert m.add("t0", "c3", "+", decimal.Decimal("0.01"), (key,)).error == ("22003" if key == 1 else None)
             assert m.add("t0", "c3", "-", None, (key,)).error is None
         assert m.add("t0", "c2", "+", 2**31, (2,)).error == "22003"  # the operand is an INTEGER, on both
+        # An operand of 18 digits or more is 22003 on the layer's side, before
+        # the plan runs; PostgreSQL's NUMERIC takes it, and the sum overflows
+        # NUMERIC(6, 2).
+        m.insert("t0", {"c0": 4, "c1": 0, "c2": 0, "c3": decimal.Decimal("1.00")}, all_columns=True)
+        assert m.add("t0", "c3", "+", decimal.Decimal(10**16), (4,)).error == "22003"
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_a_parameter_is_typed_by_its_first_use(dsn):
+    """SET c1 = $1, c2 = c2 + $1: $1 is c1's BIGINT, as PostgreSQL types it,
+    so 40000 is no SMALLINT operand out of range; the sum is checked as
+    c2's SMALLINT when it is stored."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.BIGINT), Column("c2", o.SMALLINT)],
+                       ["c0"]))
+        m.insert("t0", {"c0": 1, "c1": 0, "c2": -30000}, all_columns=True)
+        sql = "UPDATE t0 SET c1 = $1, c2 = c2 + $1 WHERE c0 = $2"
+        assert m.both(sql, (40000, 1)).affected == 1
+        assert m.both(sql, (40000, 1)).error == "22003"  # 10000 + 40000 leaves SMALLINT
         m.check()
     finally:
         m.teardown()

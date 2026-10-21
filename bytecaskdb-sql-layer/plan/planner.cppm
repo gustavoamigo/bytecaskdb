@@ -194,7 +194,8 @@ auto select_from(const Table& t, const bound::Select& s) -> std::variant<ir::Poi
   for (const auto& p : all) {
     auto c = choose(p, s.where, ordered);
     if (c.eq.empty() && c.lo == nullptr && c.hi == nullptr) continue;
-    c.covering = std::ranges::all_of(used_cols, [&](std::uint32_t col) { return in_key(t, p, col); });
+    // FOR UPDATE reads each row, whose key it guards.
+    c.covering = !s.for_update && std::ranges::all_of(used_cols, [&](std::uint32_t col) { return in_key(t, p, col); });
     usable.push_back(c);
   }
   if (usable.empty()) no_plan("a full scan of " + t.name);
@@ -273,6 +274,7 @@ auto select(const Table& t, const bound::Select& s) -> ir::Select {
   ir::Select sel;
   sel.from = select_from(t, s);
   sel.limit = s.limit;
+  sel.for_update = s.for_update;
   const auto* scan = ir::scan_of(sel);
   if (!s.count) {
     for (auto id : s.targets) sel.targets.push_back(column(t, id));

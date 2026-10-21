@@ -77,7 +77,8 @@ SQL_WORDS = {
     "SELECT", "INSERT", "UPDATE", "DELETE", "VALUES", "WHERE", "CREATE",
     "DROP", "ALTER", "TABLE", "INDEX", "UNIQUE", "ADD", "COLUMN", "NOT",
     "NULL", "DEFAULT", "PRIMARY", "KEY", "DESC", "ASC", "REBUILD", "SET",
-    "IF", "EXISTS", "ORDER", "BY", "LIMIT", "COUNT",
+    "IF", "EXISTS", "ORDER", "BY", "LIMIT", "COUNT", "FOR", "SHARE", "NO", "NOWAIT", "SKIP",
+    "LOCKED", "OF",
 }
 
 # name -> (contract, interface files, extra allowed words)

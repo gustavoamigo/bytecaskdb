@@ -317,4 +317,6 @@ TEST_CASE("binder: COUNT, ORDER BY and column + parameter", "[sql][binder]") {
         std::pair<std::string, std::int32_t>{"only one aggregate per SELECT is supported", 17});
   CHECK(rejected(cat, "SELECT id FROM t WHERE id = $1 ORDER BY nope").first == "column \"nope\" does not exist");
   CHECK(rejected(cat, "UPDATE t SET qty = count(*) WHERE id = $1").first == "aggregate functions are not allowed here");
+  CHECK(rejected(cat, "SELECT count(*) FROM t WHERE id = $1 FOR UPDATE").first ==
+        "FOR UPDATE is not allowed with aggregate functions");
 }

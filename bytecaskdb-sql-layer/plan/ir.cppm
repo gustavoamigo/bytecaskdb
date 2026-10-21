@@ -99,6 +99,7 @@ struct Select {
   std::vector<Column> targets;  // from the row, or from the entry's key when the scan covers
   std::optional<Count> count;   // instead of targets
   std::optional<std::int64_t> limit;
+  bool for_update{false};       // each row returned is guarded unchanged: never a covering scan
 };
 
 // The columns given, in table order, each from a parameter; the rest keep
@@ -185,6 +186,8 @@ void check(const Plan& p, const NullSplitScan& s) { check(p, s.present); }
 void check(const Plan& p, const Select& s) {
   const auto* scan = scan_of(s);
   std::visit([&](const auto& path) { check(p, path); }, s.from);
+  // FOR UPDATE guards each row by its key, read from the row.
+  if (scan != nullptr && scan->covering && s.for_update) broken("a FOR UPDATE scan that covers");
   for (const auto& t : s.targets) {
     // The key encoding writes -0.0 as 0.0 and every NaN as one NaN.
     if (scan != nullptr && scan->covering && t.type == PhysType::F64) broken("a DOUBLE target read from a key");

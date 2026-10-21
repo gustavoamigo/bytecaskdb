@@ -176,3 +176,15 @@ TEST_CASE("codegen: what the planner refuses, with its message", "[sql][codegen]
         "no plan: a filter on column \"name\" that the key does not express is not supported yet");
 }
 
+TEST_CASE("codegen: FOR UPDATE guards the key of every row it returns, read from the row", "[sql][codegen][txn]") {
+  sql_test::Fixture f;
+  auto by_pk = generate(f.cat(), "SELECT id, qty FROM t WHERE id = $1 FOR UPDATE");
+  CHECK(by_pk.source.find("bc_guard_row(cx, TBL_1, row);") != std::string::npos);
+  CHECK(generate(f.cat(), "SELECT id, qty FROM t WHERE id = $1").source.find("bc_guard") == std::string::npos);
+  // A range the index would cover reads each row instead: its key is guarded.
+  auto range = generate(f.cat(), "SELECT id FROM t WHERE name >= $1 FOR UPDATE");
+  CHECK(range.objects_read == std::vector<std::uint32_t>{1, 3});
+  CHECK(range.source.find("bc_view row = bc_scan_row(cx, c);") != std::string::npos);
+  CHECK(range.source.find("bc_guard_row(cx, TBL_1, row);") != std::string::npos);
+  CHECK(range.tables_written.empty());
+}

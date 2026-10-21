@@ -123,6 +123,32 @@ struct Effect {
   Bytes a, b;
 };
 
+[[nodiscard]] auto is_write(const Effect& e) -> bool {
+  switch (e.kind) {
+    case EffectKind::Put:
+    case EffectKind::Del:
+    case EffectKind::DelRange: return true;
+    case EffectKind::GuardUnchanged:
+    case EffectKind::GuardRange:
+    case EffectKind::GuardPresent:
+    case EffectKind::GuardAbsent: return false;
+  }
+  return false;
+}
+
+// An insert claim (docs/transaction_design.md, *Commit and conflicts*): a
+// primary key a write put into a key its snapshot held free, or a unique
+// index prefix a write checked free there, with the table's or index's id.
+// A commit that conflicts reports the first claim the latest committed
+// state has taken as the duplicate it is, BC_C_UNIQUE, not a conflict.
+struct Claim {
+  std::uint32_t object;
+  Bytes key;  // the primary key, or the index entry the write puts
+  // An index entry's: taken by another row's entry with these first bytes,
+  // never by this row's own entry, which a racing update of it also writes.
+  std::optional<std::size_t> prefix_len;
+};
+
 // A declared column, where it lives in its table's current layout.
 struct ColSlot {
   std::uint32_t table{0};
@@ -193,6 +219,12 @@ struct Overlay {
     return std::ranges::lexicographical_compare(key, it->second) ? &*it : nullptr;
   }
   [[nodiscard]] auto covered(BytesView key) const -> bool { return range_at(key) != nullptr; }
+
+  // Whether the overlay puts `key`.
+  [[nodiscard]] auto puts(BytesView key) const -> bool {
+    auto it = points.find(key);
+    return it != points.end() && it->second;
+  }
 
   // Whether the overlay decides `key`: nullopt if the snapshot does; else
   // the value, or nullptr for a key the transaction deleted.
@@ -386,6 +418,19 @@ struct ErrorSink {
     message = std::move(msg);
   }
 
+  // A constraint the runtime found, not a plan: the code first, so a message
+  // that cannot be allocated is dropped, never the constraint.
+  void constraint(ConstraintDetail d) noexcept {
+    if (error != BC_OK) return;
+    error = BC_E_CONSTRAINT;
+    detail = d.encode();
+    try {
+      message = d.message();
+    } catch (...) {
+      message.clear();
+    }
+  }
+
   // A commit whose outcome is unknown. It overrides whatever was recorded:
   // the batch may be in the data file, and no earlier error may stand for
   // "nothing written". The code first, so a message that cannot be
@@ -486,6 +531,7 @@ struct bc_ctx {
   std::vector<KeyBuilder> keys;
   std::vector<RowBuilder> rows;
   std::vector<Effect> effects;
+  std::vector<Claim> claims;  // this statement's or execution's, in the order its writes made them
   // The row keys this execution's writes touched, and whether the row is
   // there after the write: a second write of one row would derive its index
   // entries from the snapshot's row again, not from the first write's, and
@@ -691,7 +737,11 @@ struct bc_ctx {
       fail(BC_E_HANDLE, "a constraint with an unknown kind or an object id past 2^24");
       return;
     }
-    sink().fail(BC_E_CONSTRAINT, msg.empty() ? d.message() : std::move(msg), d.encode());
+    if (msg.empty()) {
+      sink().constraint(d);
+    } else {
+      sink().fail(BC_E_CONSTRAINT, std::move(msg), d.encode());
+    }
   }
 
   // Leaves the transaction: drops all that points into it (its snapshot and
@@ -725,6 +775,7 @@ struct bc_ctx {
     pinned.reset();  // an idle context keeps no superseded catalog alive
     written_rows.clear();
     deleted_ranges.clear();
+    claims.clear();
     has_ref = false;  // set by the next run's verification
     key_slots.clear();
     key_parts.view = {};  // view handles repeat across executions once the epoch wraps
@@ -767,6 +818,8 @@ struct bc_txn {
   Overlay overlay;
   std::vector<Effect> guards;          // the statements' guards, in their order
   std::uint64_t guard_bytes{0};        // what the guards' keys hold
+  std::vector<Claim> claims;           // the statements' insert claims, in their order
+  std::uint64_t claim_bytes{0};        // what the claims' keys hold
   std::vector<std::uint32_t> written;  // the tables the writes are in
   std::uint64_t statements{0};         // statements wholly added
   // A statement failed: nothing but bc_txn_free is left. Set before any
@@ -819,6 +872,8 @@ void txn_abort(bc_txn* txn) noexcept {
   txn->overlay = {};
   txn->guards = {};
   txn->guard_bytes = 0;
+  txn->claims = {};
+  txn->claim_bytes = 0;
   txn->written = {};
 }
 
@@ -1199,6 +1254,46 @@ auto written_tables(const Catalog& cat, const std::vector<Effect>& effects) -> s
   return out;
 }
 
+// Whether `snap` holds a key that starts with `prefix`, other than `except`
+// when one is given: a unique prefix holds at most one, and a row's own
+// entry next to it, so the walk reads at most two keys.
+[[nodiscard]] auto holds_prefix(const bytecask::Snapshot& snap, BytesView prefix, std::optional<BytesView> except = std::nullopt)
+    -> bool {
+  for (const auto& key : snap.keys_from({}, prefix)) {
+    if (!has_prefix(key, prefix)) return false;
+    if (!except || !std::ranges::equal(key, *except)) return true;
+  }
+  return false;
+}
+
+// A commit that conflicted: the duplicate it is when the latest committed
+// state has taken one of its claims, the first in their order (BC_FAILED,
+// BC_C_UNIQUE on the claim's table or index), else the conflict. Nothing was
+// written either way; a check that cannot read reports the conflict.
+// A transaction's claim counts while its writes still put the key: one a
+// later statement moved or deleted away claims nothing (`overlay`, null for
+// an execution, whose one statement writes a row once). An index claim is
+// taken only by another row's entry: a concurrent update of the same row to
+// the same value is the conflict on that row, 40001.
+[[nodiscard]] auto conflict_or_duplicate(ErrorSink out, bytecask::DB& db, std::span<const Claim> claims, const Overlay* overlay)
+    -> bc_commit_result {
+  if (claims.empty()) return BC_CONFLICT;
+  try {
+    auto latest = db.snapshot();
+    for (const auto& c : claims) {
+      if (overlay != nullptr && !overlay->puts(c.key)) continue;
+      auto taken = c.prefix_len ? holds_prefix(latest, BytesView{c.key}.first(*c.prefix_len), BytesView{c.key})
+                                : latest.contains_key({}, c.key);
+      if (taken) {
+        out.constraint({BC_C_UNIQUE, c.object});
+        return BC_FAILED;
+      }
+    }
+  } catch (...) {  // NOLINT(bugprone-empty-catch): the conflict stands, unclassified
+  }
+  return BC_CONFLICT;
+}
+
 // Submits a commit's batch, under apply_batch_or_unknown's rule: an
 // unknown outcome is BC_E_UNKNOWN, never "nothing written"; any other
 // failure wrote nothing. The code is set before the message, which is
@@ -1528,35 +1623,51 @@ struct Entry {
 // The primary key is free in the view, or BC_C_UNIQUE on the table. Its
 // race needs no guard: the key is in the write plan, and the engine checks
 // every written key for a change since the snapshot.
+// A key free in the view is a claim when the snapshot holds it free too: one
+// free only because an earlier statement deleted it conflicts with the row
+// deleted, a 40001 in PostgreSQL as here.
 [[nodiscard]] auto pk_free(bc_ctx* cx, const Table& t, BytesView pk) -> bool {
   if (!cx->charge()) return false;
-  if (!view_contains(cx, pk)) return true;
-  cx->raise(BC_C_UNIQUE, t.id);
-  return false;
+  if (view_contains(cx, pk)) {
+    cx->raise(BC_C_UNIQUE, t.id);
+    return false;
+  }
+  // Free in the view; when the overlay decided it, ask the snapshot.
+  if (cx->overlay != nullptr && cx->overlay->find(pk)) {
+    if (!cx->charge()) return false;
+    if (cx->base->contains_key({}, pk)) return true;
+  }
+  cx->claims.push_back({t.id, Bytes(pk.begin(), pk.end()), std::nullopt});
+  return true;
 }
 
 // No entry has this unique index prefix in the view, or BC_C_UNIQUE on
 // the index; the range guard covers the race, since a duplicate is another
 // row's entry, a key this plan does not write.
-[[nodiscard]] auto unique_free(bc_ctx* cx, const Index& ix, BytesView prefix) -> bool {
+[[nodiscard]] auto unique_free(bc_ctx* cx, const Index& ix, const Entry& entry) -> bool {
+  auto prefix = entry.prefix();
   if (!cx->charge()) return false;
-  auto taken = false;
+  auto in_snapshot = [&] { return holds_prefix(*cx->base, prefix); };
+  // As pk_free: a claim when the snapshot holds the prefix free too.
+  auto claim = true;
   if (cx->overlay != nullptr && cx->overlay->meets(prefix, bytecask::sql::key_successor(prefix))) {
     // The overlay holds entries with this prefix, or deleted some: the
     // first entry the view holds at or after it decides, each read charged.
     ViewEntries entries{*cx->base, cx->overlay, prefix, bytecask::sql::key_successor(prefix), false};
-    taken = entries.next(cx);
+    auto taken = entries.next(cx);
     if (!cx->ok()) return false;
-  } else {
-    auto keys = cx->base->keys_from({}, prefix);
-    auto it = keys.begin();
-    taken = it != std::default_sentinel && has_prefix(*it, prefix);
-  }
-  if (taken) {
+    if (taken) {
+      cx->raise(BC_C_UNIQUE, ix.id);
+      return false;
+    }
+    if (!cx->charge()) return false;
+    claim = !in_snapshot();
+  } else if (in_snapshot()) {
     cx->raise(BC_C_UNIQUE, ix.id);
     return false;
   }
   cx->push_effect(EffectKind::GuardRange, prefix, bytecask::sql::key_successor(prefix));
+  if (claim) cx->claims.push_back({ix.id, entry.key, entry.prefix_len});
   return true;
 }
 
@@ -1730,7 +1841,15 @@ enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
     cx->fail(BC_E_HANDLE, "a statement of a transaction ends with bc_txn_add, not bc_ctx_commit");
     return BC_FAILED;
   }
-  if (cx->effects.empty()) return BC_COMMITTED;
+  // An execution that writes nothing commits nothing: its guards protect
+  // writes, and what its one statement read is fixed by its snapshot (a
+  // SELECT … FOR UPDATE in autocommit). The engine, which may be refusing
+  // writes, is not asked. A transaction checks a guard-only commit instead:
+  // its later statements may have acted on what it read.
+  if (std::ranges::none_of(cx->effects, is_write)) {
+    cx->effects.clear();
+    return BC_COMMITTED;
+  }
   if (!cx->snap) {
     // Committed already (the write plan took the snapshot), or never begun.
     cx->fail(BC_E_HANDLE, "bc_ctx_commit without a run to commit");
@@ -1825,11 +1944,14 @@ namespace {
 // hold with the statement's effects in it, without merging them: a vector
 // grows at most to twice what it holds, each effect adds at most one node,
 // and an effect that replaces or erases others only frees.
-auto txn_holds(const bc_txn& t, std::size_t more_guards, std::size_t more_written) -> std::uint64_t {
+auto txn_holds(const bc_txn& t, std::size_t more_guards, std::size_t more_claims, std::size_t more_written)
+    -> std::uint64_t {
   auto vec = [](std::size_t cap, std::size_t size, std::size_t more, std::size_t elem) -> std::uint64_t {
     return held(std::max(cap, 2 * (size + more)) * elem);
   };
-  return t.overlay.bytes + t.guard_bytes + vec(t.guards.capacity(), t.guards.size(), more_guards, sizeof(Effect)) +
+  return t.overlay.bytes + t.guard_bytes + t.claim_bytes +
+         vec(t.guards.capacity(), t.guards.size(), more_guards, sizeof(Effect)) +
+         vec(t.claims.capacity(), t.claims.size(), more_claims, sizeof(Claim)) +
          vec(t.written.capacity(), t.written.size(), more_written, sizeof(std::uint32_t));
 }
 
@@ -1856,18 +1978,11 @@ bool bc_txn_add(bc_ctx* cx) {
   std::size_t guards = 0;
   for (const auto& e : cx->effects) {
     pending += held(e.a.capacity()) + held(e.b.capacity()) + kNodeBytes;
-    switch (e.kind) {
-      case EffectKind::Put:
-      case EffectKind::Del:
-      case EffectKind::DelRange: break;
-      case EffectKind::GuardUnchanged:
-      case EffectKind::GuardRange:
-      case EffectKind::GuardPresent:
-      case EffectKind::GuardAbsent: ++guards; break;
-    }
+    if (!is_write(e)) ++guards;
   }
+  for (const auto& c : cx->claims) pending += held(c.key.capacity());
   auto tables = written_tables(*txn->pinned, cx->effects);
-  if (txn_holds(*txn, guards, tables.size()) + pending > txn->max_bytes) {
+  if (txn_holds(*txn, guards, cx->claims.size(), tables.size()) + pending > txn->max_bytes) {
     cx->fail(BC_E_LIMIT, "the transaction's writes would pass its bound of " + std::to_string(txn->max_bytes) +
                              " bytes");
     txn_abort(txn);
@@ -1894,6 +2009,11 @@ bool bc_txn_add(bc_ctx* cx) {
     }
   }
   cx->effects.clear();
+  for (auto& c : cx->claims) {
+    txn->claim_bytes += held(c.key.capacity());
+    txn->claims.push_back(std::move(c));
+  }
+  cx->claims.clear();
   ++txn->statements;
   txn->aborted = false;
   return true;
@@ -1924,6 +2044,10 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
   }
   txn->done = true;
   const auto& ov = txn->overlay;
+  // A transaction that neither writes nor guards commits nothing. One that
+  // only guarded (SELECT … FOR UPDATE) is still checked: a guarded row a
+  // concurrent commit changed is its conflict. The engine checks a
+  // guard-only plan and writes nothing.
   if (ov.empty() && txn->guards.empty()) {
     txn->snap.reset();
     return BC_COMMITTED;
@@ -1954,7 +2078,8 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
   // As bc_ctx_commit: a DDL on a table the transaction wrote, committed
   // since its snapshot, makes the commit a conflict.
   for (auto id : txn->written) plan.ensure_unchanged(bytecask::sql::table_record_key(id));
-  return submit(out, *txn->db, std::move(plan), sync);
+  auto r = submit(out, *txn->db, std::move(plan), sync);
+  return r == BC_CONFLICT ? conflict_or_duplicate(out, *txn->db, txn->claims, &txn->overlay) : r;
   BC_GUARD_END(txn)
   return BC_FAILED;  // the guard caught a throw: never BC_COMMITTED
 }
@@ -1973,7 +2098,10 @@ int bc_execute(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* ref, const bc_p
     bc_ctx_begin(cx, params, budget);
     bc_ctx_run(cx, plan, ref);
     auto r = bc_ctx_commit(cx, sync);
-    if (r != BC_CONFLICT || attempt >= max_retries) return r;
+    if (r != BC_CONFLICT) return r;
+    // A retry's own checks see what the conflict was; the last is told the
+    // way a transaction's commit is.
+    if (attempt >= max_retries) return conflict_or_duplicate(cx->sink(), *cx->db, cx->claims, nullptr);
   }
 }
 
@@ -2645,14 +2773,20 @@ bc_view bc_col_bytes(bc_ctx* cx, bc_view row, uint32_t col) {
   return {};
 }
 
+namespace {
+// The primary key of a row of `table`, from its columns.
+[[nodiscard]] auto row_pk(bc_ctx* cx, std::uint32_t table, bc_view row, Bytes& key) -> bool {
+  const auto* t = cx->table(table);
+  if (t == nullptr) return false;
+  auto r = write_row(cx, *t, row, false);
+  return r && encode_pk(cx, *t, *r, key);
+}
+}  // namespace
+
 bc_view bc_row_key(bc_ctx* cx, uint32_t table, bc_view row) {
   BC_GUARD_BEGIN
-  const auto* t = cx->table(table);
-  if (t == nullptr) return {};
-  auto r = write_row(cx, *t, row, false);
-  if (!r) return {};
   Bytes key;
-  if (!encode_pk(cx, *t, *r, key)) return {};
+  if (!row_pk(cx, table, row, key)) return {};
   return cx->arena_view(key);
   BC_GUARD_END(cx)
   return {};
@@ -2931,7 +3065,7 @@ void bc_insert(bc_ctx* cx, uint32_t table, bc_view row) {
   if (!pk_free(cx, *t, pk)) return;
   for (std::size_t i = 0; i < t->indexes.size(); ++i) {
     // Nulls are distinct: an entry with a null part collides with nothing.
-    if (t->indexes[i].unique && !entries[i].has_null && !unique_free(cx, t->indexes[i], entries[i].prefix())) return;
+    if (t->indexes[i].unique && !entries[i].has_null && !unique_free(cx, t->indexes[i], entries[i])) return;
   }
   cx->push_effect(EffectKind::Put, std::move(pk), *r);
   for (auto& e : entries) cx->push_effect(EffectKind::Put, std::move(e.key));
@@ -2976,7 +3110,7 @@ void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {
   for (const auto& m : moves) {
     // A row never collides with itself: checked only when the prefix changed.
     if (m.ix->unique && !m.to.has_null && !std::ranges::equal(m.from.prefix(), m.to.prefix()) &&
-        !unique_free(cx, *m.ix, m.to.prefix())) {
+        !unique_free(cx, *m.ix, m.to)) {
       return;
     }
   }
@@ -3062,6 +3196,16 @@ void bc_del_range(bc_ctx* cx, uint32_t table, bc_view lo, bc_view hi) {
 void bc_guard_unchanged(bc_ctx* cx, bc_view key) {
   BC_GUARD_BEGIN
   add_effect(cx, EffectKind::GuardUnchanged, key, {});
+  BC_GUARD_END(cx)
+}
+
+void bc_guard_row(bc_ctx* cx, uint32_t table, bc_view row) {
+  BC_GUARD_BEGIN
+  // The key goes straight into the guard, not through the arena: a FOR
+  // UPDATE scan guards every row it returns.
+  Bytes key;
+  if (!row_pk(cx, table, row, key)) return;
+  cx->push_effect(EffectKind::GuardUnchanged, std::move(key));
   BC_GUARD_END(cx)
 }
 
