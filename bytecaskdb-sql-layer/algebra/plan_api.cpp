@@ -123,7 +123,7 @@ struct Effect {
   Bytes a, b;
 };
 
-auto is_write(const Effect& e) -> bool {
+[[nodiscard]] auto is_write(const Effect& e) -> bool {
   switch (e.kind) {
     case EffectKind::Put:
     case EffectKind::Del:
@@ -1257,7 +1257,7 @@ auto written_tables(const Catalog& cat, const std::vector<Effect>& effects) -> s
 // Whether `snap` holds a key that starts with `prefix`, other than `except`
 // when one is given: a unique prefix holds at most one, and a row's own
 // entry next to it, so the walk reads at most two keys.
-auto holds_prefix(const bytecask::Snapshot& snap, BytesView prefix, std::optional<BytesView> except = std::nullopt)
+[[nodiscard]] auto holds_prefix(const bytecask::Snapshot& snap, BytesView prefix, std::optional<BytesView> except = std::nullopt)
     -> bool {
   for (const auto& key : snap.keys_from({}, prefix)) {
     if (!has_prefix(key, prefix)) return false;
@@ -1275,7 +1275,7 @@ auto holds_prefix(const bytecask::Snapshot& snap, BytesView prefix, std::optiona
 // an execution, whose one statement writes a row once). An index claim is
 // taken only by another row's entry: a concurrent update of the same row to
 // the same value is the conflict on that row, 40001.
-auto conflict_or_duplicate(ErrorSink out, bytecask::DB& db, std::span<const Claim> claims, const Overlay* overlay)
+[[nodiscard]] auto conflict_or_duplicate(ErrorSink out, bytecask::DB& db, std::span<const Claim> claims, const Overlay* overlay)
     -> bc_commit_result {
   if (claims.empty()) return BC_CONFLICT;
   try {
@@ -1628,12 +1628,12 @@ struct Entry {
 // deleted, a 40001 in PostgreSQL as here.
 [[nodiscard]] auto pk_free(bc_ctx* cx, const Table& t, BytesView pk) -> bool {
   if (!cx->charge()) return false;
-  auto decided = cx->overlay != nullptr ? cx->overlay->find(pk) : std::nullopt;
-  if (decided ? *decided != nullptr : cx->base->contains_key({}, pk)) {
+  if (view_contains(cx, pk)) {
     cx->raise(BC_C_UNIQUE, t.id);
     return false;
   }
-  if (decided) {
+  // Free in the view; when the overlay decided it, ask the snapshot.
+  if (cx->overlay != nullptr && cx->overlay->find(pk)) {
     if (!cx->charge()) return false;
     if (cx->base->contains_key({}, pk)) return true;
   }
@@ -1842,8 +1842,10 @@ enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
     return BC_FAILED;
   }
   // An execution that writes nothing commits nothing: its guards protect
-  // writes, and what it read is fixed by its snapshot (a SELECT … FOR UPDATE
-  // in autocommit). The engine, which may be refusing writes, is not asked.
+  // writes, and what its one statement read is fixed by its snapshot (a
+  // SELECT … FOR UPDATE in autocommit). The engine, which may be refusing
+  // writes, is not asked. A transaction checks a guard-only commit instead:
+  // its later statements may have acted on what it read.
   if (std::ranges::none_of(cx->effects, is_write)) {
     cx->effects.clear();
     return BC_COMMITTED;
@@ -2042,9 +2044,11 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
   }
   txn->done = true;
   const auto& ov = txn->overlay;
-  // As an execution: a transaction that writes nothing commits nothing,
-  // whatever it guarded.
-  if (ov.empty()) {
+  // A transaction that neither writes nor guards commits nothing. One that
+  // only guarded (SELECT … FOR UPDATE) is still checked: a guarded row a
+  // concurrent commit changed is its conflict. The engine checks a
+  // guard-only plan and writes nothing.
+  if (ov.empty() && txn->guards.empty()) {
     txn->snap.reset();
     return BC_COMMITTED;
   }

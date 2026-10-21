@@ -740,21 +740,41 @@ TEST_CASE("embedded API: SELECT … FOR UPDATE makes the commit 40001 if a row i
     CHECK_THROWS_AS(t.commit(), SerializationFailure);
     CHECK(balance(*db, 1) == 10);
   }
-  SECTION("a transaction that writes nothing commits nothing, whatever FOR UPDATE returned") {
-    // What it read is its snapshot's either way, as in PostgreSQL.
+  SECTION("a transaction that only read FOR UPDATE still conflicts on a row it returned") {
+    // In PostgreSQL the other writer would wait for this one; never waiting,
+    // the writer commits and this transaction gets the conflict.
     auto t = db->begin();
     CHECK(t.execute(kLock, {std::int64_t{1}}).rows.size() == 1);
     db->execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{11}});
-    CHECK(t.commit() == CommitOutcome::Committed);
+    CHECK_THROWS_AS(t.commit(), SerializationFailure);
+    // Unchanged, the same transaction commits, writing nothing.
+    auto u = db->begin();
+    CHECK(u.execute(kLock, {std::int64_t{1}}).rows.size() == 1);
+    CHECK(u.commit() == CommitOutcome::Committed);
+    CHECK(balance(*db, 1) == 11);
   }
-  SECTION("a read-only FOR UPDATE never asks the engine to write: it runs on a follower") {
+  SECTION("on a follower: an autocommit FOR UPDATE reads, a transaction that used one fails at commit") {
     db->engine_for_testing().set_mode(bytecask::Mode::Follower);
+    // Autocommit: the statement's commit writes nothing and is not asked of
+    // the engine.
     auto r = db->execute(kLock, {std::int64_t{2}});
     REQUIRE(r.rows.size() == 1);
     CHECK(std::get<std::int64_t>(r.rows[0][0]) == 20);
+    // A read-only transaction without FOR UPDATE commits.
+    auto plain = db->begin();
+    CHECK(txn_balance(plain, 1) == 10);
+    CHECK(plain.commit() == CommitOutcome::Committed);
+    // With it, its guards need the engine's check, which a follower refuses,
+    // as it refuses a write: nothing is written.
     auto t = db->begin();
     CHECK(t.execute(kLock, {std::int64_t{1}}).rows.size() == 1);
-    CHECK(t.commit() == CommitOutcome::Committed);
+    try {
+      (void)t.commit();
+      FAIL("a follower committed a guarded transaction");
+    } catch (const ExecError& e) {
+      CHECK_FALSE(e.conflict());
+      CHECK(e.code() == BC_E_DEGRADED);
+    }
     db->engine_for_testing().set_mode(bytecask::Mode::Leader);
   }
   SECTION("a row FOR UPDATE returned that no one changed commits, and the guard blocks no writer") {

@@ -298,11 +298,12 @@ before its cleanup.
 - **`SELECT … FOR UPDATE`** emits `bc_guard_unchanged` on every row key it
   returns, through `bc_guard_row`, which encodes the row's key into the
   guard without the arena, kept with the transaction's guards. The
-  commit fails if one of those rows changed since the snapshot. A
-  transaction or an execution that writes nothing commits nothing, guards
-  and all: what it read is its snapshot's either way, so the engine, which
-  may be refusing writes, is not asked. A range an index would cover reads
-  each row instead, for its key. Only
+  commit fails if one of those rows changed since the snapshot, in a
+  transaction that wrote nothing too: the engine checks a guard-only plan
+  and writes nothing. An autocommit execution that writes nothing commits
+  nothing, guards and all: what its one statement read is its snapshot's
+  either way, so the engine, which may be refusing writes, is not asked. A
+  range an index would cover reads each row instead, for its key. Only
   `FOR UPDATE` itself is accepted: `FOR SHARE` and `FOR NO KEY UPDATE`,
   `NOWAIT` and `SKIP LOCKED`, which only mean something to a locker, and
   `FOR UPDATE OF` are refused at parse. This is how TPROC-C's
@@ -502,6 +503,7 @@ Each comes from the rule *never wait*.
 | A second inserter of a unique key waits, then gets 23505 at its `INSERT`. | Both insert. The second to commit gets 23505 at `commit()` (*Commit and conflicts*). | The same outcome, reported at commit instead of after a wait. |
 | `SELECT … FOR UPDATE` locks the rows: other writers wait. | It guards them: the guarding transaction gets 40001 at commit if a writer of those rows committed first. A writer is never held back. | A guard, not a lock. |
 | DDL waits for the locks of open transactions on its table. | DDL commits at once. An open transaction that wrote the table gets 40001 at commit. | DDL never waits. |
+| On a standby, `SELECT … FOR UPDATE` is refused at the statement (25006). | On a follower it runs, and a transaction that used it fails at commit with the engine's refusal of writes, as its writes would; in autocommit it reads as the `SELECT` does. | Its guards are checked by the engine at commit, which a follower refuses. |
 
 ## Later, and why none of it blocks the MVP
 
