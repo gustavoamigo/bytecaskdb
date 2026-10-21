@@ -333,7 +333,10 @@ wrote a table the DDL changed.
 - A DDL that commits meanwhile changes the catalog records of the tables it
   touches. A transaction that wrote one of those tables conflicts at commit
   through the existing catalog-record guard, and gets 40001. A transaction
-  that only read them was consistent with its pin and commits.
+  that only read them was consistent with its pin and commits, unless it
+  took `FOR UPDATE` rows the DDL rewrote (an `ADD COLUMN … DEFAULT`): its
+  guards see the change, and it gets 40001. PostgreSQL would make the DDL
+  wait for those row locks; never waiting, the reader fails instead.
 - A statement whose plan doesn't verify against the pinned version (cached
   against a newer catalog, naming a column the pin lacks) fails with 40001
   and closes the transaction, rather than recompiling against a catalog

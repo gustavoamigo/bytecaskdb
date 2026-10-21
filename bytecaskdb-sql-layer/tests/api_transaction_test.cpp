@@ -701,6 +701,13 @@ TEST_CASE("embedded API: a DDL on a table an open transaction wrote makes its co
   db->execute("CREATE INDEX acct_bal ON acct (bal)");
   CHECK_THROWS_AS(wrote.commit(), SerializationFailure);
   CHECK(read.commit() == CommitOutcome::Committed);
+  // A reader that took FOR UPDATE rows a DDL then rewrote conflicts:
+  // PostgreSQL would make the DDL wait for its row locks; never waiting, the
+  // reader gets 40001 instead.
+  auto locked = db->begin();
+  CHECK(locked.execute("SELECT bal FROM acct WHERE id = $1 FOR UPDATE", {std::int64_t{1}}).rows.size() == 1);
+  db->execute("ALTER TABLE acct ADD COLUMN tag BIGINT DEFAULT 5");
+  CHECK_THROWS_AS(locked.commit(), SerializationFailure);
   CHECK(balance(*db, 2) == std::nullopt);
   CHECK(db->table_rows("other").rows.size() == 1);
   // The index holds every row: the one the conflicting transaction wrote
@@ -747,7 +754,7 @@ TEST_CASE("embedded API: SELECT … FOR UPDATE makes the commit 40001 if a row i
     CHECK(t.execute(kLock, {std::int64_t{1}}).rows.size() == 1);
     db->execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{11}});
     CHECK_THROWS_AS(t.commit(), SerializationFailure);
-    // Unchanged, the same transaction commits, writing nothing.
+    // A transaction that read the row unchanged commits, writing nothing.
     auto u = db->begin();
     CHECK(u.execute(kLock, {std::int64_t{1}}).rows.size() == 1);
     CHECK(u.commit() == CommitOutcome::Committed);
