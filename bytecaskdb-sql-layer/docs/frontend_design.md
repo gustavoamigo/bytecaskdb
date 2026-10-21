@@ -611,7 +611,9 @@ its transaction test.
      10^scale, refused past 18 digits. The sum is computed in `int64_t`
      and checked as the column's type when stored, the check PostgreSQL's
      assignment makes, whether PostgreSQL typed the literal integer or
-     bigint.
+     bigint. On a SMALLINT or INTEGER column a literal of 2^32 or more in
+     magnitude is held as 2^32: the sum leaves the column either way, and
+     cannot overflow `int64_t` (BIGINT's overflow is #540).
    - `FOR UPDATE` is #538's (#491, slice B).
 4. **Delivery:** the covering prefix scan with `LIMIT 1`, `MIN`, `UPDATE`
    of many rows, `SUM`.

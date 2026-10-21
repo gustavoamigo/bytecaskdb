@@ -122,6 +122,9 @@ struct Bound {
   // only assigned (INSERT, SET), which the row builder checks in column
   // order, as PostgreSQL's assignment does.
   std::vector<std::optional<SqlType>> param_sql;
+  // For each parameter param_sql checks, the table of the column it is
+  // checked as: the object a BC_C_RANGE refusal names.
+  std::vector<std::uint32_t> param_table;
 };
 
 // Throws ast::SqlError with a message and the position of the offending node.
@@ -351,7 +354,7 @@ public:
   // runs (param_sql): against its column's type without the modifier, and a
   // DECIMAL operand against 18 digits at its scale, so a sum stays inside
   // int64; one only assigned is checked by the row builder.
-  void use_param(std::uint32_t n, PhysType t, std::int32_t pos, const Column& col, Use use) {
+  void use_param(std::uint32_t n, PhysType t, std::int32_t pos, const Column& col, std::uint32_t table, Use use) {
     if (params_.size() <= n) params_.resize(n + 1);
     auto& p = params_[n];
     if (p.phys && *p.phys != t) {
@@ -381,6 +384,7 @@ public:
       p.first_use = use;
     }
     if (use == Use::Assigned) return;
+    if (!p.range) p.table = table;
     if (use != Use::Compared && col.sql.kind == SqlKind::Decimal) {
       p.range = SqlType{SqlKind::Decimal, 0, static_cast<std::uint8_t>(kMaxDecimalPrecision), col.sql.scale};
     } else if (!p.range) {
@@ -394,6 +398,14 @@ public:
   // column's type or wider; the row builder's check of the stored value is
   // the one PostgreSQL's assignment makes.
   static auto literal(const Column& c, const ast::Expr& e) -> std::int64_t {
+    if (c.sql.kind == SqlKind::SmallInt || c.sql.kind == SqlKind::Integer) {
+      // A SMALLINT or INTEGER holds less than 2^31 in magnitude, so a literal
+      // of 2^32 or more leaves the column's range whatever it is added to,
+      // as PostgreSQL's sum does: held as 2^32, the sum cannot overflow
+      // int64 and the row builder refuses it (22003), or NULL stays NULL.
+      constexpr std::int64_t kBeyond = std::int64_t{1} << 32;
+      return std::clamp(e.constant, -kBeyond, kBeyond);
+    }
     if (c.sql.kind != SqlKind::Decimal) return e.constant;
     std::int64_t v = e.constant;
     for (std::uint8_t i = 0; i < c.sql.scale; ++i) {
@@ -410,7 +422,7 @@ public:
     auto want = target.type;
     switch (e.kind) {
       case ast::Expr::Kind::Param:
-        use_param(e.param, want, e.pos, target, Use::Assigned);
+        use_param(e.param, want, e.pos, target, t.id, Use::Assigned);
         return Expr{Expr::Kind::Param, 0, e.param, want};
       case ast::Expr::Kind::Column: {
         const auto* c = column(t, e);
@@ -454,7 +466,7 @@ public:
         }
         auto kind = e.kind == ast::Expr::Kind::Add ? Expr::Kind::Add : Expr::Kind::Sub;
         if (e.rhs->kind == ast::Expr::Kind::Const) return Expr{kind, c->id, 0, PhysType::I64, literal(*c, *e.rhs)};
-        use_param(e.rhs->param, PhysType::I64, e.rhs->pos, *c,
+        use_param(e.rhs->param, PhysType::I64, e.rhs->pos, *c, t.id,
                   e.kind == ast::Expr::Kind::Add ? Use::Added : Use::Subtracted);
         return Expr{kind, c->id, e.rhs->param, PhysType::I64, std::nullopt};
       }
@@ -466,7 +478,7 @@ public:
 
   auto where(const Table& t, const std::vector<ast::Compare>& in) -> std::vector<Compare> {
     std::vector<Compare> out;
-    for (const auto& w : in) out.push_back(compare(w, [&](const ast::Expr& e) { return column(t, e); }));
+    for (const auto& w : in) out.push_back(compare(w, [&](const ast::Expr& e) { return std::pair{t.id, column(t, e)}; }));
     return out;
   }
 
@@ -481,10 +493,10 @@ public:
       op = mirrored(op);
     }
     if (col->kind != ast::Expr::Kind::Column || param->kind != ast::Expr::Kind::Param) {
-      throw SqlError{"WHERE must compare a column with a parameter", w.pos};
+      throw SqlError{std::string{w.on ? "ON" : "WHERE"} + " must compare a column with a parameter", w.pos};
     }
-    const Column* c = resolve(*col);
-    use_param(param->param, c->type, param->pos, *c, Use::Compared);
+    auto [table, c] = resolve(*col);
+    use_param(param->param, c->type, param->pos, *c, table, Use::Compared);
     return Compare{op, c->id, param->param};
   }
 
@@ -508,7 +520,7 @@ public:
       auto c = compare(w, [&](const ast::Expr& e) {
         auto [s, col] = column(sides, e);
         side = s;
-        return col;
+        return std::pair{sides[s]->id, col};
       });
       out[side].push_back(c);
     }
@@ -552,6 +564,12 @@ public:
     return out;
   }
 
+  auto param_table() const -> std::vector<std::uint32_t> {
+    std::vector<std::uint32_t> out;
+    for (const auto& p : params_) out.push_back(p.table);
+    return out;
+  }
+
 private:
   // A parameter's type from its uses, which all agree.
   struct ParamUse {
@@ -559,6 +577,7 @@ private:
     const Column* first{nullptr};  // the column of its first use, for the SQL type
     Use first_use{Use::Assigned};
     std::optional<SqlType> range;  // what the pre-plan range check checks: none if only assigned
+    std::uint32_t table{0};        // the table of the column `range` comes from
   };
   const Catalog& cat_;
   std::vector<ParamUse> params_;
@@ -682,7 +701,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
       },
       stmt);
   auto types = b.param_types(bound_stmt.second);
-  return Bound{std::move(bound_stmt.first), std::move(types), b.param_sql()};
+  return Bound{std::move(bound_stmt.first), std::move(types), b.param_sql(), b.param_table()};
 }
 
 }  // namespace bytecask::sql::bound

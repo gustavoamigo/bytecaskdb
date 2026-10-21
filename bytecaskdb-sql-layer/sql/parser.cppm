@@ -157,7 +157,8 @@ void where(const PgQuery__Node* n, std::vector<Compare>& out, const std::string&
   if (a->kind != PG_QUERY__A__EXPR__KIND__AEXPR_OP || a->n_name != 1) {
     reject(clause + " must compare a column", a->location);
   }
-  out.push_back(Compare{compare_op(str(a->name[0]), a->location), expr(a->lexpr), expr(a->rexpr), a->location});
+  out.push_back(Compare{compare_op(str(a->name[0]), a->location), expr(a->lexpr), expr(a->rexpr), a->location,
+                        clause == "ON"});
 }
 
 auto literal(const PgQuery__Node* n) -> Literal {

@@ -129,8 +129,8 @@ struct Delete {
 using Statement = std::variant<Select, Insert, Update, Delete>;
 
 struct Plan {
-  std::uint32_t table{0};                         // the one table the plan reads or writes
-  std::vector<Catalog::PlanConstant> constants;   // the table's, in the catalog's order
+  std::uint32_t table{0};                         // the table the plan reads or writes; a join's first
+  std::vector<Catalog::PlanConstant> constants;   // its tables', in the catalog's order
   std::uint64_t catalog_version{0};
   std::vector<PhysType> param_types;
   Statement stmt;

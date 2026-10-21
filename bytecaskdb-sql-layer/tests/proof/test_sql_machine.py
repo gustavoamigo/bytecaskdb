@@ -1268,7 +1268,29 @@ def test_column_plus_an_integer_literal(dsn):
             assert m.add("t0", "c2", "-", 2**31 + 1, (key,), literal=True).error == ("22003" if key == 1 else None)
             assert m.add("t0", "c3", "+", 9, (key,), literal=True).error is None
             assert m.add("t0", "c3", "+", 1, (key,), literal=True).error == ("22003" if key == 1 else None)
+            # Past BIGINT's half: the sum leaves the column, never int64.
+            assert m.add("t0", "c1", "+", 2**63 - 1, (key,), literal=True).error == ("22003" if key == 1 else None)
+            assert m.add("t0", "c2", "-", 2**63 - 1, (key,), literal=True).error == ("22003" if key == 1 else None)
         m.check()
     finally:
         m.teardown()
+
+
+def test_a_range_refusal_on_a_join_names_its_columns_table(tmp_path):
+    """A parameter outside its column's type is refused before the plan runs,
+    naming the table of the column it is compared with: on a join, the
+    second table's for its key."""
+    db = bytecask_sql.open(str(tmp_path))
+    try:
+        db.execute("CREATE TABLE a (k BIGINT PRIMARY KEY, v BIGINT)")
+        db.execute("CREATE TABLE b (k SMALLINT PRIMARY KEY, w BIGINT)")
+        ids = {t["name"]: t["id"] for t in db.catalog()}
+        try:
+            db.execute("SELECT v, w FROM a, b WHERE a.k = $1 AND b.k = $2", (1, 40000))
+        except bytecask_sql.ExecError as e:
+            assert (e.constraint, e.object_id) == ("range", ids["b"])
+        else:
+            raise AssertionError("a SMALLINT key of 40000 was accepted")
+    finally:
+        db.close()
 

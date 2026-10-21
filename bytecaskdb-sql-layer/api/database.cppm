@@ -186,11 +186,11 @@ private:
     std::unique_ptr<TccPlan> code;
     std::vector<std::string> columns;
     std::vector<SqlType> column_types;
-    // Each compared parameter's SQL type (bound::Bound::param_sql) and the
-    // statement's table: a value outside it is BC_C_RANGE on the table,
+    // Each compared parameter's SQL type (bound::Bound::param_sql) and its
+    // column's table: a value outside it is BC_C_RANGE on that table,
     // checked before the plan runs, whatever the plan would read.
     std::vector<std::optional<SqlType>> param_sql;
-    std::uint32_t table_id{0};
+    std::vector<std::uint32_t> param_table;
     std::vector<std::uint8_t> result_codes;  // the plan's result_types as bc_type codes
     RowLayout result_layout;                 // how its result rows decode
     std::vector<bc_col_ref> col_refs;
@@ -625,7 +625,8 @@ auto Database::catalog() const -> std::shared_ptr<const Catalog> {
 auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
   auto cat = live_->current();
   auto bound = bound::bind(s.ast_, *cat);
-  // Every statement but DDL reads or writes one table; DDL has no plan.
+  // Every statement but DDL reads or writes a table, a join two; DDL has no
+  // plan.
   const auto* table = std::visit(
       [](const auto& st) -> const Table* {
         if constexpr (std::is_same_v<std::decay_t<decltype(st)>, Ddl>) {
@@ -650,7 +651,7 @@ auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
     c->col_refs.push_back({col.table, col.col, static_cast<std::uint8_t>(col.type)});
   }
   c->param_sql = std::move(bound.param_sql);
-  c->table_id = table->id;
+  c->param_table = std::move(bound.param_table);
   auto n = [](const auto& v) { return narrow<std::uint32_t>(v.size()); };
   const auto& p = *c->plan;
   c->ref = {p.catalog_version,
@@ -786,7 +787,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
       if (!sql) continue;  // assigned only: the row builder checks it, in column order
       if (auto range = out_of_range(*sql, params[i])) {
         throw ExecError(*range + " for parameter $" + std::to_string(i + 1), BC_E_CONSTRAINT,
-                        ConstraintDetail{BC_C_RANGE, c.table_id}.encode());
+                        ConstraintDetail{BC_C_RANGE, c.param_table.at(i)}.encode());
       }
     }
   };

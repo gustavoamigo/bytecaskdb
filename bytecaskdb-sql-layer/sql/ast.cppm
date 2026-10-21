@@ -53,6 +53,7 @@ struct Compare {
   Op op;
   Expr lhs, rhs;
   std::int32_t pos{-1};
+  bool on{false};  // a JOIN's ON conjunct, not the WHERE's
 };
 
 // A constant, as written: DEFAULT's operand. Numbers keep their text, so

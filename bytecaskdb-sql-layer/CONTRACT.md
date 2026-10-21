@@ -192,4 +192,5 @@ What the layer does not guarantee yet.
 | A unique secondary key shared by two inserts of one statement is not caught. The compiler emits one write per plan, so no generated statement reaches it. | #507 |
 | Plans not produced by the layer's compiler are not supported. | none |
 | Overflow in `SET col = col + $n` or `col - $n` on a BIGINT, or a DECIMAL of scale 0 (a BIGINT here), is `BC_E_ARITH`, not yet `BC_C_RANGE` (SQLSTATE 22003). | #540 |
+| A DECIMAL literal operand of `SET col = col + n` or `col - n` past 18 digits once scaled is refused at bind ("numeric field overflow"), whatever the column holds; PostgreSQL fails only when the sum does not fit the column. | none |
 | The planner's refusals carry no SQLSTATE yet (PostgreSQL would run each statement; the design gives 0A000). | #541 |

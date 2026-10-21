@@ -362,6 +362,12 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
   CHECK(rejected(cat, "SELECT count(*) FROM t, u WHERE id = $1 AND k = $2").first ==
         "an aggregate on a join is not supported yet");
   CHECK(rejected(cat, "SELECT id FROM t, u WHERE id = k").first == "WHERE must compare a column with a parameter");
+  CHECK(rejected(cat, "SELECT id FROM t JOIN u ON id = k WHERE k = $1").first == "ON must compare a column with a parameter");
+  {
+    // A range refusal names the table of the column the parameter is compared with.
+    auto b = bind_sql(cat, "SELECT name FROM t, u WHERE id = $1 AND k = $2");
+    CHECK(b.param_table == std::vector<std::uint32_t>{cat.table("t")->id, cat.table("u")->id});
+  }
   //                       0         1         2
   //                       0123456789012345678901234567890
   CHECK(rejected(cat, "SELECT id FROM t, nope WHERE id = $1").second == 18);
