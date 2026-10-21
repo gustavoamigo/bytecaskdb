@@ -491,13 +491,16 @@ feature gap.
 
 ## Tests
 
-**Golden plans.** Every TPROC-C statement above is compiled against the
-schema fixture, and its plan text is checked in, as
-`tests/golden/<statement>.sql` and `.c`. A test recompiles each and fails on
-any difference. A change to the code generator regenerates them with
-`SQL_LAYER_REGEN_GOLDEN=1` (`tests/golden_test.cpp`), and the PR shows the
-diff. They are the MVP's TPROC-C plans: the
-hand-written ones of the validation phase are dropped (#487).
+**Golden plans.** Statements are compiled against the schema fixture plus
+`tests/golden/schema.sql`, and their plan text is checked in, as
+`tests/golden/<statement>.sql` and `.c`. A test recompiles each, fails on
+any difference, and compiles each plan with TinyCC. A change to the code
+generator regenerates them with `SQL_LAYER_REGEN_GOLDEN=1`
+(`tests/golden_test.cpp`; refused when `CI=true`), and the PR shows the
+diff. Slice 0's goldens are the forms the compiler handled before the IR.
+Each later slice adds the goldens of the TPROC-C statements it brings, and
+with the last they are the MVP's TPROC-C plans: the hand-written ones of the
+validation phase are dropped (#487).
 
 **The proof machine against PostgreSQL** (`docs/testing_design.md`). Each
 slice adds the rules for what it brings:

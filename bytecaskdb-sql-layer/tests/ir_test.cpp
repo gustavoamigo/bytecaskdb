@@ -18,8 +18,11 @@ using namespace bytecask::sql;
 
 namespace {
 
+// Table 1 with columns 0 and 1, and index 3 over column 0.
 auto plan(ir::Statement s, std::size_t params = 2) -> ir::Plan {
-  return ir::Plan{1, {{"TBL_1", 1, "t"}}, 1, std::vector<PhysType>(params, PhysType::I64), std::move(s)};
+  std::vector<Catalog::PlanConstant> constants{
+      {"TBL_1", 1, "t"}, {"IDX_3", 3, "t_i"}, {"COL_1_0", 0, "t.id"}, {"COL_1_1", 1, "t.d"}, {"PART_3_0", 0, "t_i.id"}};
+  return ir::Plan{1, std::move(constants), 1, std::vector<PhysType>(params, PhysType::I64), std::move(s)};
 }
 
 const ir::Column kId{0, PhysType::I64, false};
@@ -48,7 +51,8 @@ TEST_CASE("ir: check refuses what the printer can't print", "[sql][ir]") {
 
   refused(plan(ir::Select{ir::PointGet{{}}, {kId}}), "no key part");
   refused(plan(ir::Select{ir::PointGet{{2}}, {kId}}), "past the statement's");
-  refused(plan(ir::Select{ir::PointGet{{0}}, {}}), "no target");
+  CHECK_NOTHROW(ir::check(plan(ir::Select{ir::PointGet{{0}}, {}})));
+  refused(plan(ir::Select{ir::PointGet{{0}}, {ir::Column{7, PhysType::I64, false}}}), "does not have: COL_1_7");
 
   ir::Scan neither{3, {}, {}, {}, false};
   refused(plan(ir::Select{neither, {kId}}), "an equality prefix or a range");
@@ -69,10 +73,17 @@ TEST_CASE("ir: check refuses what the printer can't print", "[sql][ir]") {
   refused(plan(ir::Select{range_unchecked, {kId}}), "does not check for NULL");
   ir::Scan null_check_past{3, {}, ir::Range{p0, {}}, {0, 2}, false};
   refused(plan(ir::Select{null_check_past, {kId}}), "past the statement's");
+  const ir::KeyBound null_part{ir::KeyBound::Kind::NullPart, 0, true};
+  ir::Scan no_param{3, {}, ir::Range{null_part, {}}, {}, false};
+  refused(plan(ir::Select{no_param, {kId}}), "compares no parameter");
+  ir::Scan other_index{4, {0}, {}, {0}, false};
+  refused(plan(ir::Select{other_index, {kId}}), "does not have: IDX_4");
 
   ir::Scan covering{3, {0}, {}, {0}, true};
   CHECK_NOTHROW(ir::check(plan(ir::Select{covering, {kId}})));
   refused(plan(ir::Select{covering, {kD}}), "DOUBLE target");
+  // Column 1 is not in index 3's key: no part to read it from.
+  refused(plan(ir::Select{covering, {ir::Column{1, PhysType::I64, false}}}), "does not have: PART_3_1");
 
   refused(plan(ir::Insert{}), "sets no column");
   refused(plan(ir::Update{ir::PointGet{{0}}, {}}), "sets no column");

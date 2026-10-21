@@ -69,6 +69,7 @@ struct Scan {
   bool covering{false};                      // every target comes from the entry's key
 };
 
+// No target is a row of no columns, as PostgreSQL's `SELECT FROM`.
 struct Select {
   std::variant<PointGet, Scan> from;
   std::vector<Column> targets;  // from the row, or from the entry's key when the scan covers
@@ -99,8 +100,9 @@ struct Plan {
   Statement stmt;
 };
 
-// Checks what the types can't express. Throws std::logic_error naming the
-// broken rule: a compiler bug, never a refusal of the statement.
+// Checks what the types can't express, and that every constant the printer
+// will name is the table's. Throws std::logic_error naming the broken rule:
+// a compiler bug, never a refusal of the statement.
 void check(const Plan& p);
 
 }  // namespace bytecask::sql::ir
@@ -110,6 +112,14 @@ namespace bytecask::sql::ir {
 namespace {
 
 [[noreturn]] void broken(const std::string& rule) { throw std::logic_error{"statement IR: " + rule}; }
+
+void check_constant(const Plan& p, const std::string& name) {
+  if (std::ranges::none_of(p.constants, [&](const auto& c) { return c.name == name; })) {
+    broken("a constant the table does not have: " + name);
+  }
+}
+
+void check_column(const Plan& p, const Column& c) { check_constant(p, Catalog::column_constant(p.table, c.id)); }
 
 void check_params(const Plan& p, const std::vector<std::uint32_t>& params) {
   for (auto n : params) {
@@ -134,6 +144,7 @@ void check(const Plan& p, const Scan& s) {
   if (s.eq_params.empty() == std::holds_alternative<std::monostate>(s.rest)) {
     broken("a scan needs an equality prefix or a range, and has one of them today");
   }
+  check_constant(p, Catalog::index_constant(s.index));
   // The printer encodes the prefix as one part; slice 1 takes longer ones,
   // with the index's part count to bound them.
   if (s.eq_params.size() > 1) broken("an equality prefix of more than one part");
@@ -147,27 +158,38 @@ void check(const Plan& p, const Scan& s) {
       check_null_checked(s, b.param);
     }
   }
+  // Every scan today compares a parameter, so it has a NULL check to print.
+  if (s.null_checks.empty()) broken("a scan that compares no parameter");
 }
 
 void check(const Plan& p, const Select& s) {
-  if (s.targets.empty()) broken("a select with no target");
   const auto* scan = std::get_if<Scan>(&s.from);
   std::visit([&](const auto& path) { check(p, path); }, s.from);
   for (const auto& t : s.targets) {
+    if (scan == nullptr || !scan->covering) {
+      check_column(p, t);
+      continue;
+    }
     // The key encoding writes -0.0 as 0.0 and every NaN as one NaN.
-    if (scan != nullptr && scan->covering && t.type == PhysType::F64) broken("a DOUBLE target read from a key");
+    if (t.type == PhysType::F64) broken("a DOUBLE target read from a key");
+    check_constant(p, Catalog::part_constant(scan->index, t.id));
   }
 }
 
 void check(const Plan& p, const Insert& s) {
   if (s.values.empty()) broken("an insert that sets no column");
-  for (const auto& [col, param] : s.values) check_params(p, {param});
+  for (const auto& [col, param] : s.values) {
+    check_column(p, col);
+    check_params(p, {param});
+  }
 }
 
 void check(const Plan& p, const Update& s) {
   check(p, s.row);
   if (s.set.empty()) broken("an update that sets no column");
   for (const auto& [col, e] : s.set) {
+    check_column(p, col);
+    if (e.kind != Expr::Kind::Param) check_column(p, e.col);
     if (e.kind != Expr::Kind::Column) check_params(p, {e.param});
     if (e.kind == Expr::Kind::Column && e.col.type != col.type) broken("a column set from a column of another type");
     if (e.kind == Expr::Kind::Sub && (e.col.type != PhysType::I64 || col.type != PhysType::I64)) {
@@ -182,6 +204,7 @@ void check(const Plan& p, const Delete& s) { check(p, s.row); }
 
 void check(const Plan& p) {
   if (p.constants.empty()) broken("a plan with no constants");
+  check_constant(p, Catalog::table_constant(p.table));
   std::visit([&](const auto& s) { check(p, s); }, p.stmt);
 }
 
