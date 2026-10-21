@@ -9,20 +9,30 @@ on:
   # A change that touches only documentation runs nothing here, as a pull
   # request or as a push to main: no job reads Markdown. Nor does one confined
   # to the SQL layer: no job here configures it (option sql_layer), and
-  # sql-layer.yml runs its tests. A change that also touches anything else
-  # runs everything.
+  # sql-layer.yml runs its tests. Nor does one to the files only other
+  # workflows read: the contract vocabulary check (contract.yml) and the SQL
+  # layer's and contract's own workflows. A change that also touches anything
+  # else runs everything.
   push:
     branches: [main]
     paths-ignore:
       - "**.md"
       - "docs/**"
       - "bytecaskdb-sql-layer/**"
+      - "scripts/check_contract_vocabulary.py"
+      - "scripts/test_check_contract_vocabulary.py"
+      - ".github/workflows/contract.yml"
+      - ".github/workflows/sql-layer.yml"
   pull_request:
     branches: [main]
     paths-ignore:
       - "**.md"
       - "docs/**"
       - "bytecaskdb-sql-layer/**"
+      - "scripts/check_contract_vocabulary.py"
+      - "scripts/test_check_contract_vocabulary.py"
+      - ".github/workflows/contract.yml"
+      - ".github/workflows/sql-layer.yml"
   workflow_dispatch:
 
 permissions:
