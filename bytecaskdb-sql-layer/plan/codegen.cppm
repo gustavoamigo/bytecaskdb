@@ -14,10 +14,12 @@ module;
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -121,13 +123,17 @@ public:
   // Constant names (Catalog::constants: from ids, never from SQL names),
   // recorded as used; a column's constants record the column for the plan's
   // bc_schema_ref.
-  auto tbl() -> std::string { return use("TBL_" + std::to_string(p_.table)); }
+  auto tbl() -> std::string { return tbl(p_.table); }
+  auto tbl(std::uint32_t id) -> std::string { return use("TBL_" + std::to_string(id)); }
   auto idx(std::uint32_t id) -> std::string { return use("IDX_" + std::to_string(id)); }
-  // A scan's object: the table (its primary key) or an index.
-  auto obj(std::uint32_t id) -> std::string { return id == p_.table ? tbl() : idx(id); }
+  // A scan's or a key's object: a table (its primary key) or an index.
+  auto obj(std::uint32_t id) -> std::string {
+    auto table = std::ranges::any_of(p_.constants, [&](const auto& c) { return c.name == "TBL_" + std::to_string(id); });
+    return table ? tbl(id) : idx(id);
+  }
   auto col(const ir::Column& c) -> std::string {
-    cols_.emplace(c.id, c.type);
-    return use("COL_" + std::to_string(p_.table) + "_" + std::to_string(c.id));
+    cols_.emplace(c.table, c.id, c.type);
+    return use("COL_" + std::to_string(c.table) + "_" + std::to_string(c.id));
   }
   // The position of a column in an index's key, for the key-part decoders.
   auto part(std::uint32_t index, const ir::Column& c) -> std::string {
@@ -139,7 +145,7 @@ public:
   // Every column the plan reads or sets, with its type.
   [[nodiscard]] auto columns_used() const -> std::vector<ColumnDep> {
     std::vector<ColumnDep> out;
-    for (const auto& [id, type] : cols_) out.push_back({p_.table, id, type});
+    for (const auto& [table, id, type] : cols_) out.push_back({table, id, type});
     return out;
   }
   auto next_key() -> std::string { return "k" + std::to_string(keys_++); }
@@ -185,12 +191,18 @@ private:
   std::size_t depth_{1};
   int keys_{0};
   std::set<std::string> used_;
-  std::set<std::pair<std::uint32_t, PhysType>> cols_;
+  std::set<std::tuple<std::uint32_t, std::uint32_t, PhysType>> cols_;
   std::set<std::uint32_t> reads_;
 };
 
 auto param(PhysType t, std::uint32_t n) -> std::string {
   return "bc_param_" + suffix(t) + "(cx, " + std::to_string(n) + ")";
+}
+
+// An int64_t constant as C text: INT64_MIN has no literal.
+auto constant(std::int64_t v) -> std::string {
+  if (v == std::numeric_limits<std::int64_t>::min()) return "INT64_MIN";
+  return "INT64_C(" + std::to_string(v) + ")";
 }
 
 auto param_null(std::uint32_t n) -> std::string { return "bc_param_null(cx, " + std::to_string(n) + ")"; }
@@ -444,6 +456,31 @@ void print_split_select(Writer& w, const ir::Select& s, const ir::NullSplitScan&
   }
 }
 
+// The two rows, then each target from its own.
+void print_join_select(Writer& w, const ir::Select& s, const ir::PointJoin& j) {
+  const std::string rows[2]{"row", "row1"};
+  auto params = j.rows[0].key_params;
+  for (auto p : j.rows[1].key_params) {
+    if (std::ranges::find(params, p) == params.end()) params.push_back(p);
+  }
+  return_if_null(w, params);
+  for (std::size_t i = 0; i < 2; ++i) {
+    w.reads(j.tables[i]);
+    auto found = std::string{i == 0 ? "found" : "found1"};
+    w.line("bool " + found + " = false;");
+    w.line("bc_view " + rows[i] + " = bc_get(cx, " + key(w, j.tables[i], j.rows[i].key_params) + ", &" + found + ");");
+    w.open("if (!" + found + ")");
+    w.line("return;");
+    w.close();
+  }
+  if (!emits(s)) return;
+  w.line("bc_emit_begin(cx);");
+  for (const auto& t : s.targets) {
+    w.line("bc_emit_col(cx, " + rows[t.table == j.tables[0] ? 0 : 1] + ", " + w.col(t) + ");");
+  }
+  w.line("bc_emit_end(cx);");
+}
+
 void print(Writer& w, const ir::Select& s) {
   std::visit(
       [&](const auto& from) {
@@ -452,8 +489,10 @@ void print(Writer& w, const ir::Select& s) {
           print_point_select(w, s, from);
         } else if constexpr (std::is_same_v<T, ir::Scan>) {
           print_scan_select(w, s, from);
-        } else {
+        } else if constexpr (std::is_same_v<T, ir::NullSplitScan>) {
           print_split_select(w, s, from);
+        } else {
+          print_join_select(w, s, from);
         }
       },
       s.from);
@@ -476,8 +515,10 @@ void print(Writer& w, const ir::Update& s) {
       null_if = null_src;
     } else {
       auto fn = e.kind == ir::Expr::Kind::Add ? "bc_add" : "bc_sub";
-      value = std::string{fn} + "(cx, " + read_col(w, e.col, "old") + ", " + param(PhysType::I64, e.param) + ")";
-      null_if = (null_src.empty() ? "" : null_src + " || ") + param_null(e.param);
+      value = std::string{fn} + "(cx, " + read_col(w, e.col, "old") + ", " +
+              (e.constant ? constant(*e.constant) : param(PhysType::I64, e.param)) + ")";
+      if (!e.constant) null_if = (null_src.empty() ? "" : null_src + " || ") + param_null(e.param);
+      else null_if = null_src;
     }
     if (null_if.empty()) {
       w.line(set + value + ");");
@@ -536,6 +577,13 @@ auto generate_plan(const bound::Bound& b, const Catalog& cat, std::string_view s
     if (sel->count) {
       out.result_names.emplace_back("count");
       out.result_sql.push_back(SqlType{SqlKind::BigInt});
+    }
+  }
+  if (const auto* j = std::get_if<bound::Join>(&b.stmt)) {
+    for (const auto& t : j->targets) {
+      const auto* c = (t.side == 0 ? j->table : j->second)->column(t.col_id);
+      out.result_names.push_back(c->name);
+      out.result_sql.push_back(c->sql);
     }
   }
   out.objects_read = w.objects_read();

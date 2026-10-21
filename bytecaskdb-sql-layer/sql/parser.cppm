@@ -63,14 +63,35 @@ auto relation(const PgQuery__RangeVar* rv) -> std::string {
   return rv->relname;
 }
 
+auto expr(const PgQuery__Node* n) -> Expr;
+auto literal(const PgQuery__Node* n) -> Literal;
+
+// An operand of + or -: an expression, or an integer literal, which must
+// fit BIGINT (PostgreSQL types a larger one as numeric).
+auto operand(const PgQuery__Node* n) -> Expr {
+  if (n == nullptr || n->node_case != PG_QUERY__NODE__NODE_A_CONST) return expr(n);
+  auto l = literal(n);
+  std::int64_t v = 0;
+  auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
+  if (l.kind != Literal::Kind::Integer || ec != std::errc{} || end != l.text.data() + l.text.size()) {
+    reject("only integer literals within BIGINT are supported", l.pos);
+  }
+  Expr e{Expr::Kind::Const, {}, 0, nullptr, nullptr, l.pos};
+  e.constant = v;
+  return e;
+}
+
 auto expr(const PgQuery__Node* n) -> Expr {
   if (n == nullptr) reject("expected an expression", -1);
   // if-chains, not switches: libpg_query's node enum has 268 values.
   if (n->node_case == PG_QUERY__NODE__NODE_COLUMN_REF) {
     const auto* c = n->column_ref;
-    if (c->n_fields != 1) reject("qualified column names are not supported", c->location);
-    if (c->fields[0]->node_case != PG_QUERY__NODE__NODE_STRING) reject("* is not supported", c->location);
-    return Expr{Expr::Kind::Column, str(c->fields[0]), 0, nullptr, nullptr, c->location};
+    if (c->n_fields != 1 && c->n_fields != 2) reject("column names take at most a table's name", c->location);
+    const auto* last = c->fields[c->n_fields - 1];
+    if (last->node_case != PG_QUERY__NODE__NODE_STRING) reject("* is not supported", c->location);
+    Expr e{Expr::Kind::Column, str(last), 0, nullptr, nullptr, c->location};
+    if (c->n_fields == 2) e.table = str(c->fields[0]);
+    return e;
   }
   if (n->node_case == PG_QUERY__NODE__NODE_PARAM_REF) {
     const auto* p = n->param_ref;
@@ -82,8 +103,8 @@ auto expr(const PgQuery__Node* n) -> Expr {
     auto op = a->kind == PG_QUERY__A__EXPR__KIND__AEXPR_OP && a->n_name == 1 ? str(a->name[0]) : "";
     if ((op != "+" && op != "-") || a->lexpr == nullptr) reject("only + and - are supported here", a->location);
     Expr e{op == "+" ? Expr::Kind::Add : Expr::Kind::Sub, {}, 0, nullptr, nullptr, a->location};
-    e.lhs = std::make_unique<Expr>(expr(a->lexpr));
-    e.rhs = std::make_unique<Expr>(expr(a->rexpr));
+    e.lhs = std::make_unique<Expr>(operand(a->lexpr));
+    e.rhs = std::make_unique<Expr>(operand(a->rexpr));
     return e;
   }
   if (n->node_case == PG_QUERY__NODE__NODE_FUNC_CALL) {
@@ -101,7 +122,9 @@ auto expr(const PgQuery__Node* n) -> Expr {
     if (f->n_args != 1 || f->args[0]->node_case != PG_QUERY__NODE__NODE_COLUMN_REF) {
       reject("only COUNT(*) and COUNT(column) are supported", f->location);
     }
-    e.column = expr(f->args[0]).column;
+    auto arg = expr(f->args[0]);
+    e.column = arg.column;
+    e.table = arg.table;
     return e;
   }
   if (n->node_case == PG_QUERY__NODE__NODE_A_CONST) {
@@ -120,18 +143,19 @@ auto compare_op(const std::string& op, std::int32_t pos) -> Compare::Op {
 }
 
 // A WHERE clause as a list of conjuncts, each a comparison.
-void where(const PgQuery__Node* n, std::vector<Compare>& out) {
+void where(const PgQuery__Node* n, std::vector<Compare>& out, const std::string& clause = "WHERE",
+           std::int32_t pos = -1) {
   if (n == nullptr) return;
   if (n->node_case == PG_QUERY__NODE__NODE_BOOL_EXPR) {
     const auto* b = n->bool_expr;
-    if (b->boolop != PG_QUERY__BOOL_EXPR_TYPE__AND_EXPR) reject("only AND is supported in WHERE", b->location);
-    for (std::size_t i = 0; i < b->n_args; ++i) where(b->args[i], out);
+    if (b->boolop != PG_QUERY__BOOL_EXPR_TYPE__AND_EXPR) reject("only AND is supported in " + clause, b->location);
+    for (std::size_t i = 0; i < b->n_args; ++i) where(b->args[i], out, clause, pos);
     return;
   }
-  if (n->node_case != PG_QUERY__NODE__NODE_A_EXPR) reject("WHERE must compare a column", -1);
+  if (n->node_case != PG_QUERY__NODE__NODE_A_EXPR) reject(clause + " must compare a column", pos);
   const auto* a = n->a_expr;
   if (a->kind != PG_QUERY__A__EXPR__KIND__AEXPR_OP || a->n_name != 1) {
-    reject("WHERE must compare a column", a->location);
+    reject(clause + " must compare a column", a->location);
   }
   out.push_back(Compare{compare_op(str(a->name[0]), a->location), expr(a->lexpr), expr(a->rexpr), a->location});
 }
@@ -315,21 +339,38 @@ auto limit(const PgQuery__SelectStmt* s) -> std::optional<std::int64_t> {
 
 auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   if (s->op != PG_QUERY__SET_OPERATION__SETOP_NONE) reject("set operations are not supported", pos);
-  if (s->n_from_clause != 1) reject("SELECT reads exactly one table", pos);
-  const auto* from = s->from_clause[0];
-  if (from->node_case == PG_QUERY__NODE__NODE_JOIN_EXPR) {
-    // The join has no position of its own; report the table it joins.
-    const auto* r = from->join_expr->rarg;
-    auto at = r != nullptr && r->node_case == PG_QUERY__NODE__NODE_RANGE_VAR ? r->range_var->location : pos;
-    reject("JOIN is not supported", at);
+  // One table, or two: FROM a, b, or a [INNER] JOIN b ON …, whose ON
+  // conjuncts join the WHERE's.
+  if (s->n_from_clause != 1 && s->n_from_clause != 2) reject("SELECT reads one or two tables", pos);
+  std::vector<const PgQuery__RangeVar*> tables;
+  const PgQuery__Node* on = nullptr;
+  for (std::size_t i = 0; i < s->n_from_clause; ++i) {
+    const auto* from = s->from_clause[i];
+    if (from->node_case == PG_QUERY__NODE__NODE_JOIN_EXPR) {
+      const auto* j = from->join_expr;
+      // The join has no position of its own; report the table it joins.
+      const auto* r = j->rarg;
+      auto at = r != nullptr && r->node_case == PG_QUERY__NODE__NODE_RANGE_VAR ? r->range_var->location : pos;
+      if (s->n_from_clause != 1 || j->jointype != PG_QUERY__JOIN_TYPE__JOIN_INNER || j->is_natural ||
+          j->n_using_clause != 0 || j->alias != nullptr || j->larg == nullptr || r == nullptr ||
+          j->larg->node_case != PG_QUERY__NODE__NODE_RANGE_VAR || r->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) {
+        reject("only an inner join of two tables, by ON, is supported", at);
+      }
+      tables = {j->larg->range_var, r->range_var};
+      on = j->quals;
+      continue;
+    }
+    if (from->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) reject("SELECT reads one or two tables", pos);
+    tables.push_back(from->range_var);
   }
-  if (from->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) reject("SELECT reads exactly one table", pos);
   if (s->n_distinct_clause != 0 || s->n_group_clause != 0 || s->having_clause != nullptr ||
       s->limit_offset != nullptr || s->n_locking_clause > 1 || s->with_clause != nullptr ||
       s->n_window_clause != 0 || s->into_clause != nullptr) {
     reject("SELECT clause not supported", pos);
   }
-  Select sel{{}, relation(from->range_var), {}, {}, limit(s), pos, false};
+  Select sel{{}, relation(tables[0]), tables.size() == 2 ? relation(tables[1]) : "", {}, {}, limit(s), pos, false};
+  sel.table_pos = tables[0]->location;
+  if (tables.size() == 2) sel.join_pos = tables[1]->location;
   if (s->n_locking_clause == 1) {
     // FOR UPDATE alone: never NOWAIT or SKIP LOCKED, which only mean
     // something to a locker, nor a weaker lock or OF a table list.
@@ -352,13 +393,14 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
       reject("NULLS FIRST and NULLS LAST are not supported", col.pos);
     }
     if (sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_USING) reject("ORDER BY ... USING is not supported", col.pos);
-    sel.order_by.push_back({col.column, sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_DESC, col.pos});
+    sel.order_by.push_back({col.column, sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_DESC, col.pos, col.table});
   }
   for (std::size_t i = 0; i < s->n_target_list; ++i) {
     const auto* rt = s->target_list[i]->res_target;
     if (!empty(rt->name)) reject("column aliases are not supported", rt->location);
     sel.targets.push_back(expr(rt->val));
   }
+  where(on, sel.where, "ON", sel.join_pos);
   where(s->where_clause, sel.where);
   return sel;
 }

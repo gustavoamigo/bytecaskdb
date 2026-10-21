@@ -188,3 +188,25 @@ TEST_CASE("codegen: FOR UPDATE guards the key of every row it returns, read from
   CHECK(range.source.find("bc_guard_row(cx, TBL_1, row);") != std::string::npos);
   CHECK(range.tables_written.empty());
 }
+
+TEST_CASE("codegen: a join is of two point lookups, in FROM order", "[sql][codegen]") {
+  sql_test::Fixture f;
+  f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
+                       {"k"}});
+  auto j = generate(f.cat(), "SELECT v, qty FROM u JOIN t ON id = $2 WHERE k = $1");
+  CHECK(j.objects_read == std::vector<std::uint32_t>{1, 4});
+  CHECK(j.source.find("bc_view row = bc_get(cx, bc_key_params(cx, TBL_4, 0, 1), &found);") != std::string::npos);
+  CHECK(j.source.find("bc_view row1 = bc_get(cx, bc_key_params(cx, TBL_1, 1, 1), &found1);") != std::string::npos);
+  auto refusal = [&](std::string_view sql) -> std::string {
+    try {
+      (void)generate(f.cat(), sql);
+    } catch (const ast::SqlError& e) {
+      return e.what();
+    }
+    return "accepted";
+  };
+  CHECK(refusal("SELECT v FROM u, t WHERE k = $1 AND id = $2 ORDER BY v") == "no plan: ORDER BY on a join");
+  CHECK(refusal("SELECT v FROM u, t WHERE k = $1 AND name = $2") ==
+        "no plan: a join must name the row of each table by its whole primary key yet");
+}
+
