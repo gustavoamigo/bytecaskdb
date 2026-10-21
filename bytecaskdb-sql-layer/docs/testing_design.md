@@ -102,8 +102,9 @@ PYTHONPATH=bytecaskdb-sql-layer/python \
 ## Sanitizers
 
 `sql-layer.yml` runs `sql_layer_tests` under ASan, TSan and UBSan through
-the engine's `sanitizers.yml`. The allocation-failure sweeps, the `[alloc]`
-tests, run in an invocation of their own. Under a failed allocation the
+the engine's `sanitizers.yml`. Under ASan the allocation-failure sweeps,
+the `[alloc]` tests, run in an invocation of their own (TSan and MSan
+replace `operator new`, so the sweeps skip there). Under a failed allocation the
 engine's key directory leaks a node rather than free it while still
 reachable (#390), and only that invocation tells LeakSanitizer so, with
 `tests/lsan_alloc_sweeps.supp`. Every other test runs with no suppression.

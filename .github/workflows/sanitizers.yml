@@ -157,10 +157,12 @@ jobs:
         # the timeout shows the last test that completed.
         run: |
           target="${{ inputs.target || 'bytecask_tests' }}"
-          if [ "$target" = "sql_layer_tests" ]; then
+          if [ "$target" = "sql_layer_tests" ] && [ "${{ matrix.sanitizer }}" = "address" ]; then
             # The SQL layer's allocation-failure sweeps run apart, with
             # LeakSanitizer told of the one leak the engine makes under a
             # failed allocation (#390); everything else with no suppression.
+            # Only ASan checks leaks; elsewhere the sweeps skip, and a run of
+            # only skipped tests would fail.
             xmake run "$target" "~[alloc]" --durations yes
             LSAN_OPTIONS="suppressions=$PWD/bytecaskdb-sql-layer/tests/lsan_alloc_sweeps.supp" \
               xmake run "$target" "[alloc]" --durations yes
