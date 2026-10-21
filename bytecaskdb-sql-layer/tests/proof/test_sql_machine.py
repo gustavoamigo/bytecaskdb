@@ -1467,3 +1467,21 @@ def test_update_and_delete_every_row_a_key_reaches(dsn):
     finally:
         m.teardown()
 
+
+
+def test_one_unique_value_given_to_two_rows_is_23505(dsn):
+    """An UPDATE that gives two rows one value of a unique index is refused
+    (23505) on both sides, and writes nothing (#507)."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER, nullable=False),
+                              Column("c2", o.INTEGER)], ["c0", "c1"]))
+        m.create_index("t0", Index("t0_ix0", [("c2", False)], unique=True))
+        for c1, c2 in ((1, 1), (2, 2), (3, None)):
+            m.insert("t0", {"c0": 0, "c1": c1, "c2": c2}, all_columns=True)
+        assert m.write("t0", [("c0", "=", 0), ("c1", ">=", 2)], ("c2", "=", 7)).error == "23505"
+        assert m.write("t0", [("c0", "=", 0), ("c1", ">=", 2)], ("c2", "=", None)).affected == 2
+        assert m.write("t0", [("c0", "=", 0)], ("c2", "=", 1)).error == "23505"
+        m.check()
+    finally:
+        m.teardown()

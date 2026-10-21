@@ -227,6 +227,14 @@ Found so far. The machine expects each one, so it does not fail on them.
   refused at bind** ("numeric field overflow"), whatever the column holds;
   PostgreSQL computes the sum and fails only when it does not fit the
   column. The machine's literals stay inside 18 digits.
+- **A unique value an UPDATE moves from one row to another is a
+  duplicate.** With a unique index on `u`, rows holding 1 and 2, `SET u =
+  u + 1` over both is refused (23505) here, whatever order the rows are
+  written in: each row's new value is checked against the snapshot, where
+  the other row still holds it. PostgreSQL checks each row as it writes
+  it, so its outcome depends on the order it visits them. Two rows given
+  one value are 23505 on both (`test_one_unique_value_given_to_two_rows_is_23505`).
+  The machine adds to no column a unique index holds.
 - **A SUM whose running total leaves `int64_t` fails.** The layer adds in
   64 bits, a DECIMAL's scaled integer included, and an overflow fails the
   statement; PostgreSQL's `SUM` of a BIGINT or NUMERIC is an unbounded

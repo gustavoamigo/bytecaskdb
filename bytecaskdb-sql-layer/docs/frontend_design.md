@@ -626,6 +626,12 @@ its transaction test.
      `bc_update` or `bc_delete` before stepping; the count is the rows
      written. The IR's `Update` and `Delete` hold a `PointGet` or a `Scan`,
      not a `Loop`, until slice 5 brings residuals.
+   - Writing several rows made #507 reachable: two rows given one value of
+     a unique index. The runtime's unique check now also refuses a prefix
+     the execution already gave a row, so a statement that moves a unique
+     value from one row to another is refused whatever its order, where
+     PostgreSQL's outcome depends on it. No TPROC-C statement writes a
+     unique index's column over several rows: D5's `order_line` has none.
    - `SUM` and `MIN` take a column whose values the plan holds as an
      `int64_t`: `SUM` a `SMALLINT`, `INTEGER`, `BIGINT` or `DECIMAL` one,
      `MIN` those and a `DATE`, `TIMESTAMP` or `TIME` one. `MIN` of a `REAL`

@@ -33,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <map>
+#include <set>
 #include <system_error>
 #include <type_traits>
 #include <utility>
@@ -539,6 +540,10 @@ struct bc_ctx {
   // execution, which share its snapshot and write plan; reset by
   // bc_ctx_begin.
   std::map<Bytes, bool, BytesLess> written_rows;
+  // The unique index prefixes this execution's writes gave a row, by index
+  // id: the snapshot does not hold them, so without this two rows of one
+  // statement could share one (#507). Kept and reset as written_rows.
+  std::set<std::pair<std::uint32_t, Bytes>> unique_written;
   // Where each part of the last key a key-part decoder read starts, so the
   // next part of the same key is found without skipping the earlier ones
   // again. Keyed by the view handle, unique within an execution.
@@ -774,6 +779,7 @@ struct bc_ctx {
     cat = &unpinned;
     pinned.reset();  // an idle context keeps no superseded catalog alive
     written_rows.clear();
+    unique_written.clear();
     deleted_ranges.clear();
     claims.clear();
     has_ref = false;  // set by the next run's verification
@@ -1641,12 +1647,17 @@ struct Entry {
   return true;
 }
 
-// No entry has this unique index prefix in the view, or BC_C_UNIQUE on
-// the index; the range guard covers the race, since a duplicate is another
+// No entry has this unique index prefix in the view, and no earlier write
+// of this execution gave a row it, or BC_C_UNIQUE on the index; the range guard covers the race, since a duplicate is another
 // row's entry, a key this plan does not write.
 [[nodiscard]] auto unique_free(bc_ctx* cx, const Index& ix, const Entry& entry) -> bool {
   auto prefix = entry.prefix();
   if (!cx->charge()) return false;
+  // One this execution already gave a row: the view cannot see it.
+  if (!cx->unique_written.emplace(ix.id, Bytes(prefix.begin(), prefix.end())).second) {
+    cx->raise(BC_C_UNIQUE, ix.id);
+    return false;
+  }
   auto in_snapshot = [&] { return holds_prefix(*cx->base, prefix); };
   // As pk_free: a claim when the snapshot holds the prefix free too.
   auto claim = true;
