@@ -695,13 +695,14 @@ struct bc_ctx {
   }
 
   // Leaves the transaction: drops all that points into it (its snapshot and
-  // overlay, the cursors over them, the statement's pending writes) and
+  // overlay, the cursors over them, the statement's pending effects) and
   // keeps the rest, a finished statement's results and count readable.
-  // Idempotent, and the first step of drop_execution_state. A statement
-  // of a transaction left without bc_txn_add (a reset, or a new statement
-  // begun) that failed or holds writes aborts its transaction: it is never
-  // dropped without a trace. A plan refused as incompatible before it ran
-  // did nothing, and may be recompiled and run again: that is not a failure.
+  // Idempotent, and the first step of drop_execution_state. The protocol
+  // (bc_plan.h) adds every statement before its reset, but one reset
+  // without it that failed or holds writes or guards aborts its
+  // transaction rather than vanish. A plan refused as incompatible before
+  // it ran did nothing, and may be recompiled and run again: the API's
+  // one reset without bc_txn_add.
   void detach_from_txn() noexcept {
     auto refused_before_run = error == BC_E_LAYOUT && detail == BC_L_INCOMPATIBLE;
     auto abandoned = txn != nullptr && ((!ok() && !refused_before_run) || !effects.empty());

@@ -374,15 +374,20 @@ differences*.
   - `bc_ctx_begin` given a transaction instead of taking its own snapshot;
   - `bc_ctx_commit` split into appending a statement's effects to the
     transaction and committing the transaction.
-  - one context at a time per transaction: a second is refused, and an
-    abort and a free detach the attached one, keeping its finished
-    statement's results readable;
   - `bc_txn_commit(bc_txn*, sync)` takes no context and reports through
-    the transaction (`bc_txn_error`); with a statement still open on a
-    context it is refused, changing nothing, and a later call on an ended
-    transaction keeps the outcome its commit recorded;
-  - a statement left without `bc_txn_add` that failed or holds writes
-    aborts the transaction, so none is dropped without a trace.
+    the transaction (`bc_txn_error`); an abort and a free detach the
+    context, keeping its finished statement's results readable.
+
+  These calls are internal: the embedded API's `Transaction` is their only
+  caller, and it keeps their protocol by construction. One context per
+  transaction; each statement is `bc_ctx_begin_txn`, `bc_ctx_run`,
+  `bc_txn_add`, then `bc_ctx_reset`, except that a statement refused with
+  `BC_L_INCOMPATIBLE` before it ran may be reset and begun again; after
+  any other failed statement the transaction is only freed; and one
+  `bc_txn_commit`, with no statement open. The runtime does not defend
+  against use out of this order, and the contract does not cover it. The
+  checks it does make (a second context or a commit with a statement open
+  refused as `BC_E_HANDLE`) are a debugging aid, not a guarantee.
 
   Their exact C names are settled in the implementation PR, with
   `bc_plan.h`'s runtime section. `bc_execute` keeps its signature for
