@@ -116,8 +116,11 @@ SQL's three-valued logic, as PostgreSQL has it:
   present value's `0x01`. Under `DESC` the whole part is inverted and nulls
   sort last. So an `ORDER BY` on an index gives `NULLS FIRST` for `ASC` and
   `NULLS LAST` for `DESC`, as MariaDB and SQLite do; PostgreSQL's default is
-  the reverse. A query that asks for the other placement is not served from
-  the index in stage 1.
+  the reverse. The MVP's plans give PostgreSQL's placement for one nullable
+  ordered `ASC` index part directly after the equality prefix, by scanning
+  its present values and its NULL part as two ranges
+  (`docs/frontend_design.md`, *NULLs in an ordered part*); other nullable
+  orders are refused (#533).
 - **A null parameter in a key lookup matches nothing**: `WHERE id = $1`
   with `$1` null returns no rows and `UPDATE`/`DELETE` affect none. The
   compiler emits the null test before building the key, as the prototype's
