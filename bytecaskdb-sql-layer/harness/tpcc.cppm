@@ -671,20 +671,43 @@ void run(Database& db, const RunOptions& opts, const std::function<void(const Ph
     PhaseReport r;
     r.threads = threads;
     r.run = next_run(db);
-    const auto fsyncs = engine_counter(db, "bytecask.fsyncs");
-    const auto batches = engine_counter(db, "bytecask.group_writer_batches");
     const auto begin = Clock::now();
     // Counting a number of transactions measures them all.
     const auto counting = opts.txns_per_thread != 0;
     const auto measure_from = counting ? begin : begin + opts.warmup;
     const auto until = counting ? Clock::time_point::max() : measure_from + opts.duration;
     std::atomic<bool> failed{false};
+    // The engine's counters over the measured window, as TPM is, so fsyncs
+    // per transaction lines up with commit_probe: sampled at its start and
+    // end by a thread of their own.
+    struct Sample {
+      std::int64_t fsyncs, batches;
+    };
+    auto sample = [&] {
+      return Sample{engine_counter(db, "bytecask.fsyncs"), engine_counter(db, "bytecask.group_writer_batches")};
+    };
+    Sample at_start{}, at_end{};
+    auto wait_until = [&](Clock::time_point t) {
+      while (!failed.load() && Clock::now() < t) {
+        std::this_thread::sleep_for(std::min<Clock::duration>(t - Clock::now(), std::chrono::milliseconds{20}));
+      }
+    };
     std::vector<Worker> workers;
     workers.reserve(threads);
     for (std::size_t t = 0; t < threads; ++t) {
       workers.push_back(Worker{s, warehouses, scale, r.run, t, Rng{opts.seed * 1'000'003 + t}, 0, {}});
     }
     std::vector<std::exception_ptr> errors(threads);
+    if (counting) at_start = sample();
+    std::jthread sampler;
+    if (!counting) {
+      sampler = std::jthread{[&] {
+        wait_until(measure_from);
+        at_start = sample();
+        wait_until(until);
+        at_end = sample();
+      }};
+    }
     std::vector<std::jthread> pool;
     for (std::size_t t = 0; t < threads; ++t) {
       pool.emplace_back([&, t] {
@@ -702,6 +725,8 @@ void run(Database& db, const RunOptions& opts, const std::function<void(const Ph
       });
     }
     pool.clear();
+    if (sampler.joinable()) sampler.join();
+    if (counting) at_end = sample();
     for (const auto& e : errors) {
       if (e) std::rethrow_exception(e);
     }
@@ -715,8 +740,8 @@ void run(Database& db, const RunOptions& opts, const std::function<void(const Ph
         r.kinds[k].latency.merge(w.stats[k].latency);
       }
     }
-    r.fsyncs = engine_counter(db, "bytecask.fsyncs") - fsyncs;
-    r.group_writer_batches = engine_counter(db, "bytecask.group_writer_batches") - batches;
+    r.fsyncs = at_end.fsyncs - at_start.fsyncs;
+    r.group_writer_batches = at_end.batches - at_start.batches;
     on_phase(r);
   }
 }

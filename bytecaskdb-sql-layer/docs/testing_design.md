@@ -218,6 +218,9 @@ and shared by them.
   of Payments when `W > 1`; `h_amount` from 1.00 to 5,000.00; a `BC`
   customer's new `c_data`. The client logic is the harness's, as in
   HammerDB's client-side driver.
+- One difference from TPC-C, as in HammerDB: Payment does not update
+  `c_ytd_payment` or `c_payment_cnt`, since it runs HammerDB's statements
+  (P9, P10) by decision.
 - One `Transaction` per TPROC-C transaction, committed with `commit()`.
 
 **Errors and retries.**
@@ -237,8 +240,9 @@ and shared by them.
   completed it;
 - TPM, completed transactions of every type per minute, and NOPM, completed
   New-Orders per minute (`n/a` until New-Order is in the mix);
-- the engine's `fsyncs` and `group_writer_batches` over the phase, read
-  from `stats()`, to set beside `commit_probe`.
+- the engine's `fsyncs` and `group_writer_batches` over the measured
+  window, read from `stats()` at its start and end, to set beside
+  `commit_probe`.
 
 A transaction counts, with its retries, when it starts and ends inside
 the phase's measured window, after the warm-up; the rates divide by the
@@ -286,17 +290,21 @@ and `scripts/sql_isolation_check.py` checks it with the engine's tooling:
   and under `strict-serializable` report only write skew (`G2-item`), at
   least once over the run.
 - `blind`: every statement in autocommit, with no `Transaction`. It must
-  be invalid, which shows the check can see a lost update. Elle runs on it
-  only when the cross-check found nothing: the history is large and
-  invalid, and Elle's search and plots of it take tens of minutes.
+  show a lost append, which shows the check can see a lost update: found
+  by the cross-check (an `:ok` append missing from the final read, or a
+  read the final value does not extend), or else by Elle. Elle runs on it
+  only when the cross-check found none: the history is large and invalid,
+  and Elle's search and plots of it take tens of minutes.
 - A completed `commit()` is `:ok`, a `SerializationFailure` `:fail`, and
   `TransactionResolutionUnknown` `:info`. In `blind`, a statement that
   conflicted on every retry is `:info`: the statements before it committed.
   Any other error stops the run.
 - **The one difference from the engine's check:** `commit()` returns no
   commit sequence, so the cross-check's rule that a key's final list
-  follows commit-sequence order cannot apply: `cross_check` skips an
-  operation with no `sequence` there (owner decision, 2026-10-21). Every
+  follows commit-sequence order cannot apply. `cross_check` takes
+  `require_sequence=False` for it (owner decision, 2026-10-21): the rule
+  skips an operation with no `sequence`. Every other caller keeps the
+  default, under which an `:ok` append without one is a violation. Every
   other rule does apply: reads are prefixes, nothing failed is visible,
   every `:ok` append is there, and real-time visibility.
 

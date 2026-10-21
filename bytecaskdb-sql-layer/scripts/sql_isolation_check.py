@@ -58,7 +58,7 @@ def check_round(args: argparse.Namespace, seed: int, round_dir: Path) -> bool:
                         str(args.threads), "--txns", str(args.txns), "--seed", str(seed), "--out",
                         str(history_path)], check=True)
         shutil.rmtree(db, ignore_errors=True)
-        problems = ric.cross_check(json.loads(history_path.read_text()))
+        problems = ric.cross_check(json.loads(history_path.read_text()), require_sequence=False)
         print(f"  {config}: cross-check {'clean' if not problems else f'{len(problems)} violations'}")
         for p in problems[:3 if config == "blind" else 10]:
             print(f"    {p}")

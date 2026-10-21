@@ -134,11 +134,15 @@ def sql_history(final: list[int]) -> list[dict]:
 
 
 class NoSequenceTest(unittest.TestCase):
-    def test_commit_order_is_not_inferred_from_elements(self):
-        self.assertEqual(ric.cross_check(sql_history([20, 10])), [])
+    def test_a_missing_sequence_fails_by_default(self):
+        problems = ric.cross_check(sql_history([20, 10]))
+        self.assertTrue(any("carry no commit sequence" in p for p in problems), problems)
 
-    def test_a_missing_append_is_still_found(self):
-        problems = ric.cross_check(sql_history([20]))
+    def test_commit_order_is_not_inferred_from_elements_when_opted_out(self):
+        self.assertEqual(ric.cross_check(sql_history([20, 10]), require_sequence=False), [])
+
+    def test_a_missing_append_is_still_found_when_opted_out(self):
+        problems = ric.cross_check(sql_history([20]), require_sequence=False)
         self.assertTrue(any("missing from final read" in p for p in problems), problems)
 
 
