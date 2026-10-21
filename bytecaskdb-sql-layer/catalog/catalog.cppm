@@ -127,12 +127,16 @@ public:
 // A commit whose batch failed and left the engine degraded, after the batch
 // may have reached the data file: whether it took effect is unknown, never
 // "nothing written". SQLSTATE 08007 at the API.
-class CommitOutcomeUnknown : public std::runtime_error {
+// It holds nothing allocated, and its message is a static string: neither
+// making nor throwing it can fail for want of memory, so the outcome cannot
+// be lost to a second failure.
+class CommitOutcomeUnknown : public std::exception {
 public:
-  explicit CommitOutcomeUnknown(const char* what) : std::runtime_error{what} {}
+  CommitOutcomeUnknown() = default;
   CommitOutcomeUnknown(const CommitOutcomeUnknown&) = default;
   CommitOutcomeUnknown& operator=(const CommitOutcomeUnknown&) = default;
   ~CommitOutcomeUnknown() override;  // out of line: anchors the vtable (-Wweak-vtables)
+  [[nodiscard]] auto what() const noexcept -> const char* override;
 };
 
 // Every commit of the layer, DDL, autocommit and transactions alike, goes
@@ -141,8 +145,10 @@ public:
 // reached the data file, so it is thrown as CommitOutcomeUnknown (its
 // message dropped, never the outcome, if it cannot be allocated). Any other
 // failure is rethrown as it is, having written nothing. Another writer's
-// failure in between also reads as unknown: the safe direction; exact
-// reporting needs the engine to say whether this batch was appended (#531).
+// failure in between also reads as unknown: the safe direction; so does a
+// resume() by an embedder holding the DB, racing the two checks, which this
+// layer never calls. Exact reporting needs the engine to say whether this
+// batch was appended (#531).
 [[nodiscard]] auto apply_batch_or_unknown(DB& db, WriteOptions opts, WritePlan plan) -> std::optional<CommitResult>;
 
 // A value of one of the four physical types, or SQL NULL (monostate). The
@@ -736,6 +742,9 @@ void check_column_spec(const ColumnSpec& c) {
 DdlRefused::~DdlRefused() = default;
 DdlInProgress::~DdlInProgress() = default;
 CommitOutcomeUnknown::~CommitOutcomeUnknown() = default;
+auto CommitOutcomeUnknown::what() const noexcept -> const char* {
+  return "the commit's outcome is unknown: it failed after its batch may have reached the data file";
+}
 
 auto apply_batch_or_unknown(DB& db, WriteOptions opts, WritePlan plan) -> std::optional<CommitResult> {
   auto was_degraded = db.is_degraded();
@@ -743,13 +752,7 @@ auto apply_batch_or_unknown(DB& db, WriteOptions opts, WritePlan plan) -> std::o
     return db.apply_batch(opts, std::move(plan));
   } catch (...) {
     if (was_degraded || !db.is_degraded()) throw;
-    std::optional<CommitOutcomeUnknown> e;
-    try {
-      e.emplace("the commit's outcome is unknown: it failed after its batch may have reached the data file");
-    } catch (const std::bad_alloc&) {
-      e.emplace("");
-    }
-    throw CommitOutcomeUnknown{*e};
+    throw CommitOutcomeUnknown{};
   }
 }
 ConstraintViolation::~ConstraintViolation() = default;

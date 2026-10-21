@@ -531,7 +531,7 @@ TEST_CASE("transactions: a transaction no statement was added to can be pinned a
   check_indexes_exact(f);
 }
 
-TEST_CASE("transactions: an aborted transaction lets go of its snapshot; a freed one detaches its contexts",
+TEST_CASE("transactions: an aborted transaction lets go of its snapshot; a freed one detaches its context",
           "[sql][txn]") {
   Fixture f;
   create_w(f);
@@ -555,8 +555,7 @@ TEST_CASE("transactions: an aborted transaction lets go of its snapshot; a freed
   CHECK(autocommit(f, insert_w, {std::int64_t{2}, std::int64_t{2}, bytes("c"), std::int64_t{2}}) == BC_COMMITTED);
 }
 
-TEST_CASE("transactions: one context at a time; commit detaches it; a failed begin leaves nothing dangling",
-          "[sql][txn]") {
+TEST_CASE("transactions: one context at a time; a commit through another is refused", "[sql][txn]") {
   Fixture f;
   create_w(f);
   auto* other = bc_ctx_new(&f.bdb, &f.bcat, 1u << 20);
@@ -571,39 +570,84 @@ TEST_CASE("transactions: one context at a time; commit detaches it; a failed beg
     CHECK(bc_error(other) == BC_E_HANDLE);
     bc_ctx_reset(other);
     bc_ctx_reset(f.cx);
-    // Once the first is reset, another may run the transaction's statement.
     REQUIRE(stmt(f, txn.p, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("a"), std::int64_t{1}}).error == BC_OK);
+    // A statement begun on `other` and not added: a commit through another
+    // context is refused, and the transaction is as it was.
     bc_ctx_begin_txn(other, txn.p, &none, {});
     REQUIRE(bc_error(other) == BC_OK);
-    // The commit, on another context, detaches it: the snapshot it read moves
-    // into the batch, and the context reads nothing of it after.
-    CHECK(commit(f, txn.p) == BC_COMMITTED);
+    CHECK(bc_txn_commit(f.cx, txn.p, false) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_HANDLE);
+    bc_ctx_reset(f.cx);
+    CHECK(stored(f).empty());
+    // Through the attached context it commits.
+    CHECK(bc_txn_commit(other, txn.p, false) == BC_COMMITTED);
     bc_ctx_reset(other);
   }
-  // Every allocation of a begin failed in turn: the context is left attached
-  // or not, never half, and resetting it and freeing the transaction touch
-  // nothing freed.
-  if constexpr (bytecask::testing::kAllocFaultsAvailable) {
-    for (long nth = 1;; ++nth) {
-      REQUIRE(nth < 1000);
-      auto* txn = bc_txn_new(&f.bdb, &f.bcat, std::uint64_t{1} << 20);
-      REQUIRE(txn != nullptr);
-      auto none = params({});
-      auto fired = false;
-      {
-        bytecask::testing::ScopedAllocFaults faults{nth, false};
-        bc_ctx_begin_txn(other, txn, &none, {});
-        fired = faults.report().fired;
-      }
-      CHECK((bc_error(other) == BC_OK || bc_error(other) == BC_E_MEMORY));
-      if (bc_error(other) == BC_E_MEMORY) CHECK_FALSE(bc_txn_add(other));  // the failed begin aborts it
-      bc_ctx_reset(other);
-      bc_txn_free(txn);
-      if (!fired) break;
-    }
+  // An aborted or ended transaction says so before anything about contexts.
+  {
+    TxnPtr txn{f};
+    auto none = params({});
+    CHECK(commit(f, txn.p) == BC_COMMITTED);
+    bc_ctx_begin_txn(other, txn.p, &none, {});
+    CHECK(std::string{bc_error_message(other)} == "the transaction has ended");
+    bc_ctx_reset(other);
   }
   bc_ctx_free(other);
   CHECK(stored(f).size() == 1);
+}
+
+TEST_CASE("transactions: a statement's results stay readable after the commit or the free that detaches it",
+          "[sql][txn]") {
+  Fixture f;
+  create_w(f);
+  REQUIRE(autocommit(f, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("a"), std::int64_t{10}}) == BC_COMMITTED);
+  for (auto free_it : {false, true}) {
+    INFO((free_it ? "freed" : "committed"));
+    auto* txn = bc_txn_new(&f.bdb, &f.bcat, std::uint64_t{1} << 20);
+    REQUIRE(txn != nullptr);
+    auto none = params({});
+    SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), type_codes(id_c()), f.cat().version()};
+    auto ref = sr.get();
+    // A SELECT, its rows not yet read when the transaction ends.
+    bc_ctx_begin_txn(f.cx, txn, &none, {});
+    bc_ctx_run(f.cx, scan_w, &ref);
+    REQUIRE(bc_txn_add(f.cx));
+    if (free_it) {
+      bc_txn_free(txn);
+    } else {
+      REQUIRE(bc_txn_commit(f.cx, txn, false) == BC_COMMITTED);
+      bc_txn_free(txn);
+    }
+    auto rows = f.results(id_c());
+    REQUIRE(rows.size() == 1);
+    CHECK(std::get<std::int64_t>(rows[0][1]) == 10);
+    bc_ctx_reset(f.cx);
+  }
+}
+
+TEST_CASE("transactions: every allocation of a statement's begin failed in turn leaves nothing dangling",
+          "[sql][txn][alloc]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("operator new is the sanitizer's in this build");
+  Fixture f;
+  create_w(f);
+  for (long nth = 1;; ++nth) {
+    REQUIRE(nth < 1000);
+    auto* txn = bc_txn_new(&f.bdb, &f.bcat, std::uint64_t{1} << 20);
+    REQUIRE(txn != nullptr);
+    auto none = params({});
+    auto fired = false;
+    {
+      bytecask::testing::ScopedAllocFaults faults{nth, false};
+      bc_ctx_begin_txn(f.cx, txn, &none, {});
+      fired = faults.report().fired;
+    }
+    INFO("allocation " << nth);
+    CHECK((bc_error(f.cx) == BC_OK || bc_error(f.cx) == BC_E_MEMORY));
+    if (bc_error(f.cx) == BC_E_MEMORY) CHECK_FALSE(bc_txn_add(f.cx));  // the failed begin aborts it
+    bc_ctx_reset(f.cx);
+    bc_txn_free(txn);
+    if (!fired) break;
+  }
 }
 
 TEST_CASE("transactions: a statement does not see its own writes; the next one does", "[sql][txn]") {

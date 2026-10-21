@@ -655,6 +655,19 @@ struct bc_ctx {
     detail = d.encode();
   }
 
+  // Leaves the transaction: drops all that points into it (its snapshot and
+  // overlay, the cursors over them, the statement's pending writes) and
+  // keeps the rest, a finished statement's results and count readable.
+  void detach_from_txn() noexcept {
+    if (txn == nullptr) return;
+    cursors.clear();  // iterators before the snapshot and the overlay they read
+    effects.clear();
+    base = nullptr;
+    overlay = nullptr;
+    txn_detach(txn, this);
+    txn = nullptr;
+  }
+
   void drop_execution_state() {
     cursors.clear();  // iterators before the snapshot and the overlay they read
     if (txn != nullptr) txn_detach(txn, this);
@@ -734,10 +747,10 @@ void txn_detach(bc_txn* txn, bc_ctx* cx) noexcept {
 
 namespace {
 
-// Drops the attached context's statement, if one is: it reads nothing of
-// the transaction after. The context keeps its error.
+// Detaches the attached context, if one is: it reads nothing of the
+// transaction after, and keeps its error and a finished statement's results.
 void txn_drop_context(bc_txn* txn) noexcept {
-  if (txn->attached != nullptr) txn->attached->drop_execution_state();
+  if (txn->attached != nullptr) txn->attached->detach_from_txn();
 }
 
 // Aborts the transaction: a failed statement leaves only bc_txn_free, so
@@ -1139,7 +1152,7 @@ auto submit(bc_ctx* cx, bytecask::DB& db, bytecask::WritePlan plan, bool sync) -
   try {
     return bytecask::sql::apply_batch_or_unknown(db, {.sync = sync}, std::move(plan)) ? BC_COMMITTED : BC_CONFLICT;
   } catch (const bytecask::sql::CommitOutcomeUnknown& e) {
-    cx->error = BC_E_UNKNOWN;
+    cx->error = BC_E_UNKNOWN;  // first: the message below may not be allocated
     cx->detail = 0;
     try {
       cx->message = e.what();
@@ -1615,20 +1628,20 @@ void bc_ctx_begin_txn(bc_ctx* cx, bc_txn* txn, const bc_params* params, bc_budge
   cx->message.clear();
   cx->params = params;
   cx->budget = budget;
+  if (txn->aborted || txn->done) {
+    cx->fail(BC_E_HANDLE, txn->done ? "the transaction has ended" : "the transaction is aborted");
+    return;
+  }
   // One context per transaction: another one's statement is still open.
   if (txn->attached != nullptr) {
     cx->fail(BC_E_HANDLE, "another context is running a statement of this transaction");
     return;
   }
-  // Attached first, before anything that can fail, and with nothing that
-  // can: a statement that fails while it begins must still abort its
-  // transaction at bc_txn_add.
+  // Attached before anything that can fail, and with nothing that can: a
+  // statement that fails while it begins must still abort its transaction
+  // at bc_txn_add.
   cx->txn = txn;
   txn->attached = cx;
-  if (txn->aborted || txn->done) {
-    cx->fail(BC_E_HANDLE, txn->done ? "the transaction has ended" : "the transaction is aborted");
-    return;
-  }
   // The snapshot and its catalog version are the first statement's: pinned
   // together, as an execution pins them.
   if (!txn->snap) {
@@ -1846,8 +1859,16 @@ bool bc_txn_add(bc_ctx* cx) {
 
 enum bc_commit_result bc_txn_commit(bc_ctx* cx, bc_txn* txn, bool sync) {
   BC_GUARD_BEGIN
-  cx->drop_execution_state();  // the context holds nothing of a statement while the transaction commits
-  txn_drop_context(txn);       // nor does one still attached: the snapshot moves into the plan
+  // Through the attached context, or with none attached: another context's
+  // statement is still open.
+  if ((txn->attached != nullptr && txn->attached != cx) || (cx->txn != nullptr && cx->txn != txn)) {
+    cx->error = BC_OK;
+    cx->fail(BC_E_HANDLE, "another context is running a statement of this transaction");
+    return BC_FAILED;
+  }
+  // The snapshot moves into the plan: the context lets go of it, and keeps
+  // its last statement's results readable.
+  cx->detach_from_txn();
   cx->error = BC_OK;
   cx->detail = 0;
   cx->message.clear();

@@ -120,12 +120,15 @@ public:
 // degraded, after its batch may have reached the data file. SQLSTATE 08007,
 // as PostgreSQL reports a commit it cannot resolve. Never "nothing
 // written": a reopen may find the writes.
-class TransactionResolutionUnknown : public std::runtime_error {
+// It holds nothing allocated and its message is static, so an allocation
+// failure can never turn it into another error.
+class TransactionResolutionUnknown : public std::exception {
 public:
-  explicit TransactionResolutionUnknown(const std::string& what) : std::runtime_error{what} {}
+  TransactionResolutionUnknown() = default;
   TransactionResolutionUnknown(const TransactionResolutionUnknown&) = default;
   TransactionResolutionUnknown& operator=(const TransactionResolutionUnknown&) = default;
   ~TransactionResolutionUnknown() override;  // out of line: anchors the vtable (-Wweak-vtables)
+  [[nodiscard]] auto what() const noexcept -> const char* override;
 };
 
 // A statement given to a transaction a statement failed in: SQLSTATE 25P02,
@@ -443,6 +446,10 @@ ExecError::~ExecError() = default;
 SerializationFailure::~SerializationFailure() = default;
 TransactionAborted::~TransactionAborted() = default;
 TransactionResolutionUnknown::~TransactionResolutionUnknown() = default;
+auto TransactionResolutionUnknown::what() const noexcept -> const char* {
+  return "the transaction's outcome is unknown: its commit failed after its batch may have reached the data file "
+         "(SQLSTATE 08007)";
+}
 ParamError::~ParamError() = default;
 
 namespace {
@@ -468,9 +475,7 @@ template <class Make>
 
 // A failure the runtime reported, as the API's exception for it.
 [[noreturn]] void throw_error(bc_error_code code, std::uint32_t detail, std::string_view message) {
-  if (code == BC_E_UNKNOWN) {
-    throw_keeping_outcome(message, [](const std::string& m) { return TransactionResolutionUnknown{m}; });
-  }
+  if (code == BC_E_UNKNOWN) throw TransactionResolutionUnknown{};
   throw_keeping_outcome(message, [&](const std::string& m) { return ExecError{m, code, detail}; });
 }
 
@@ -700,8 +705,8 @@ auto Database::execute(const Statement& stmt, const std::vector<Value>& params) 
       throw ExecError(e.what(), BC_E_CONSTRAINT, e.detail().encode());
     } catch (const DdlInProgress&) {
       throw_serialization_failure(kDdlInProgress);  // a DDL never waits for another
-    } catch (const CommitOutcomeUnknown& e) {
-      throw_keeping_outcome(e.what(), [](const std::string& m) { return TransactionResolutionUnknown{m}; });
+    } catch (const CommitOutcomeUnknown&) {
+      throw TransactionResolutionUnknown{};
     }
     Rows out;
     out.affected = 0;

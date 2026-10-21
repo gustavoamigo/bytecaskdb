@@ -374,6 +374,9 @@ differences*.
   - `bc_ctx_begin` given a transaction instead of taking its own snapshot;
   - `bc_ctx_commit` split into appending a statement's effects to the
     transaction and committing the transaction.
+  - one context at a time per transaction: a second, or a commit through
+    another, is refused; commit, abort and free detach the attached one,
+    keeping its finished statement's results readable.
 
   Their exact C names are settled in the implementation PR, with
   `bc_plan.h`'s runtime section. `bc_execute` keeps its signature for
