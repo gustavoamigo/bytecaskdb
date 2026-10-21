@@ -85,6 +85,40 @@ Rules for transactions (#491):
   the reopen run only then. One connection on each side: nothing commits
   during a transaction, so no commit conflicts.
 
+Rules for slice 1 of the front end (#492, `docs/frontend_design.md`):
+- **NUMERIC(6, 2)** joins the column types. The layer takes a DECIMAL
+  parameter as its integer scaled by 10^2 (`oracle.to_layer`); values are
+  drawn at that scale, so both sides hold them exactly.
+- **CREATE INDEX** of one or two columns, each `ASC` or `DESC`, unique or
+  not; a unique one over duplicates is 23505 on both.
+- **SELECT by a key**: an equality prefix of the primary key or of an
+  index (its key: its parts, then every primary-key part), then maybe a
+  range on the next part, values mostly from an existing row, NULLs and
+  values outside the type included, the conjuncts shuffled; maybe an
+  `ORDER BY` of the parts after the prefix, in the key's direction or
+  against it, an equality-compared column now and then, one item flipped
+  now and then; maybe a `LIMIT`. A model of the planner's rules
+  (`served`) says whether the layer plans it: if not, the layer must
+  refuse it with `no plan:`, and PostgreSQL is not asked. If it does, the
+  rows are compared in `ORDER BY` order, as a multiset within each run of
+  equal sort keys, and a run the `LIMIT` cuts must be drawn from
+  PostgreSQL's (`oracle.same_rows`, against PostgreSQL's rows without the
+  `LIMIT`).
+- **COUNT** of `*` or of a column over the same `WHERE`, with `LIMIT 0`
+  or 1 now and then.
+- **SET col = col ± $n** on SMALLINT, INTEGER and NUMERIC(6, 2) columns by
+  the primary key, operands at and past the type's edges and NULL; on
+  PostgreSQL's side `$n` is cast to the column's type, as PostgreSQL
+  types it. BIGINT is left out until its overflow is 22003 (#540).
+
+`test_tpcc.py` runs TPROC-C's Payment and Order-Status through SQL against
+PostgreSQL: a small fixture (one warehouse, two districts, thirty customers
+each, some with a NULL `c_first`), then sixty transactions from a fixed
+seed, one thread, each statement in a `Transaction` and in a PostgreSQL
+REPEATABLE READ transaction, with the client's logic between them. Every
+statement's result and every table after the run must agree. The schema is
+read from `tests/tpcc_schema.cppm`, its one definition.
+
 Fixed cases are plain pytest functions at the end of the file. They call
 the machine's steps in a set order. Every failure Hypothesis finds is
 committed as one.
@@ -291,5 +325,16 @@ Found so far. The machine expects each one, so it does not fail on them.
   compared column its own parameter
   (`test_a_parameter_compared_with_two_types_is_refused`; the DECIMAL
   scales, which the oracle does not model, in the embedded API's test).
+- **A parameter used with columns of two SQL types is refused,** in any
+  use: compared with, assigned to, or added to or subtracted from them
+  (`SET b = $1, a = a + $1` with `b BIGINT` and `a SMALLINT`).
+  PostgreSQL infers one type for a `$n` from its use and runs it. The
+  machine gives each column its own parameter
+  (`test_a_parameter_used_with_two_types_is_refused`).
+- **A DECIMAL operand of `col ± $n` past 18 digits is 22003.** The layer's
+  DECIMAL is a scaled 64-bit integer, so the operand is checked against 18
+  digits at the column's scale before the plan runs, even when the column
+  is NULL; PostgreSQL's unconstrained `numeric` may still complete (NULL
+  plus anything is NULL). The machine's operands stay inside 18 digits.
 - **DML takes no literals:** values are parameters (`$1`). The machine's
   statements use parameters on both sides.

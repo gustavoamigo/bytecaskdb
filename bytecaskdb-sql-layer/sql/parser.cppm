@@ -11,6 +11,7 @@
 // prototype: replaced by the designed front end (#492).
 
 module;
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -18,6 +19,7 @@ module;
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #pragma clang diagnostic push
@@ -77,13 +79,29 @@ auto expr(const PgQuery__Node* n) -> Expr {
   }
   if (n->node_case == PG_QUERY__NODE__NODE_A_EXPR) {
     const auto* a = n->a_expr;
-    if (a->kind != PG_QUERY__A__EXPR__KIND__AEXPR_OP || a->n_name != 1 || str(a->name[0]) != "-" ||
-        a->lexpr == nullptr) {
-      reject("only column - expression is supported here", a->location);
-    }
-    Expr e{Expr::Kind::Sub, {}, 0, nullptr, nullptr, a->location};
+    auto op = a->kind == PG_QUERY__A__EXPR__KIND__AEXPR_OP && a->n_name == 1 ? str(a->name[0]) : "";
+    if ((op != "+" && op != "-") || a->lexpr == nullptr) reject("only + and - are supported here", a->location);
+    Expr e{op == "+" ? Expr::Kind::Add : Expr::Kind::Sub, {}, 0, nullptr, nullptr, a->location};
     e.lhs = std::make_unique<Expr>(expr(a->lexpr));
     e.rhs = std::make_unique<Expr>(expr(a->rexpr));
+    return e;
+  }
+  if (n->node_case == PG_QUERY__NODE__NODE_FUNC_CALL) {
+    const auto* f = n->func_call;
+    auto name = str(f->funcname[f->n_funcname - 1]);
+    if (name != "count" || (f->n_funcname == 2 && str(f->funcname[0]) != "pg_catalog") || f->n_funcname > 2) {
+      reject("function " + name + " is not supported", f->location);
+    }
+    if (f->agg_distinct || f->n_agg_order != 0 || f->agg_filter != nullptr || f->over != nullptr ||
+        f->agg_within_group || f->func_variadic) {
+      reject("only COUNT(*) and COUNT(column) are supported", f->location);
+    }
+    Expr e{Expr::Kind::Count, {}, 0, nullptr, nullptr, f->location};
+    if (f->agg_star) return e;
+    if (f->n_args != 1 || f->args[0]->node_case != PG_QUERY__NODE__NODE_COLUMN_REF) {
+      reject("only COUNT(*) and COUNT(column) are supported", f->location);
+    }
+    e.column = expr(f->args[0]).column;
     return e;
   }
   if (n->node_case == PG_QUERY__NODE__NODE_A_CONST) {
@@ -277,6 +295,24 @@ auto insert(const PgQuery__InsertStmt* s, std::int32_t pos) -> Insert {
   return ins;
 }
 
+// LIMIT: an integer constant, or ALL or NULL (no limit). A negative one is
+// refused, as PostgreSQL refuses it (2201W).
+auto limit(const PgQuery__SelectStmt* s) -> std::optional<std::int64_t> {
+  if (s->limit_option == PG_QUERY__LIMIT_OPTION__LIMIT_OPTION_WITH_TIES) reject("FETCH … WITH TIES is not supported", -1);
+  const auto* n = s->limit_count;
+  if (n == nullptr) return std::nullopt;
+  if (n->node_case != PG_QUERY__NODE__NODE_A_CONST) reject("LIMIT takes an integer constant", -1);
+  auto l = literal(n);
+  if (l.kind == Literal::Kind::Null) return std::nullopt;
+  std::int64_t v = 0;
+  auto [end, ec] = std::from_chars(l.text.data(), l.text.data() + l.text.size(), v);
+  if (l.kind != Literal::Kind::Integer || ec != std::errc{} || end != l.text.data() + l.text.size()) {
+    reject("LIMIT takes an integer constant", l.pos);
+  }
+  if (v < 0) reject("LIMIT must not be negative", l.pos);
+  return v;
+}
+
 auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   if (s->op != PG_QUERY__SET_OPERATION__SETOP_NONE) reject("set operations are not supported", pos);
   if (s->n_from_clause != 1) reject("SELECT reads exactly one table", pos);
@@ -288,12 +324,12 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
     reject("JOIN is not supported", at);
   }
   if (from->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) reject("SELECT reads exactly one table", pos);
-  if (s->n_distinct_clause != 0 || s->n_group_clause != 0 || s->having_clause != nullptr || s->n_sort_clause != 0 ||
-      s->limit_count != nullptr || s->limit_offset != nullptr || s->n_locking_clause > 1 || s->with_clause != nullptr ||
+  if (s->n_distinct_clause != 0 || s->n_group_clause != 0 || s->having_clause != nullptr ||
+      s->limit_offset != nullptr || s->n_locking_clause > 1 || s->with_clause != nullptr ||
       s->n_window_clause != 0 || s->into_clause != nullptr) {
     reject("SELECT clause not supported", pos);
   }
-  Select sel{{}, relation(from->range_var), {}, pos, false};
+  Select sel{{}, relation(from->range_var), {}, {}, limit(s), pos, false};
   if (s->n_locking_clause == 1) {
     // FOR UPDATE alone: never NOWAIT or SKIP LOCKED, which only mean
     // something to a locker, nor a weaker lock or OF a table list.
@@ -304,6 +340,19 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
     }
     if (lc->n_locked_rels != 0) reject("FOR UPDATE OF is not supported", pos);
     sel.for_update = true;
+  }
+  for (std::size_t i = 0; i < s->n_sort_clause; ++i) {
+    const auto* sb = s->sort_clause[i]->sort_by;
+    // libpg_query records no position for a SortBy: report its column's.
+    if (sb->node == nullptr || sb->node->node_case != PG_QUERY__NODE__NODE_COLUMN_REF) {
+      reject("ORDER BY takes columns", pos);
+    }
+    auto col = expr(sb->node);
+    if (sb->sortby_nulls != PG_QUERY__SORT_BY_NULLS__SORTBY_NULLS_DEFAULT) {
+      reject("NULLS FIRST and NULLS LAST are not supported", col.pos);
+    }
+    if (sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_USING) reject("ORDER BY ... USING is not supported", col.pos);
+    sel.order_by.push_back({col.column, sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_DESC, col.pos});
   }
   for (std::size_t i = 0; i < s->n_target_list; ++i) {
     const auto* rt = s->target_list[i]->res_target;

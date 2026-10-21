@@ -1,7 +1,8 @@
 # SQL front end for the MVP: dialect subset and statement IR
 
 Status: **design (#492), approved (owner, 2026-10-21): the *Decisions*;
-the rest reviewed with the coordinator.** Nothing here is built. It decides
+the rest reviewed with the coordinator.** Slices 0 and 1 are built
+(*Slices*); the rest is design. It decides
 the SQL the MVP accepts, the intermediate form the code generator prints
 plans from, and the planner's choices, all scoped by TPROC-C (#487, *MVP*).
 The rest of #492 (rewrites, hash joins, `EXPLAIN`, the plan cache's design)
@@ -553,7 +554,41 @@ its transaction test.
    prefixes on the primary key and on an index, `ORDER BY` from the index,
    reverse scans, the two-range scan of a nullable ordered column, `LIMIT`,
    `COUNT` from `bc_count_range`. Run statement by
-   statement until #491's `Transaction` lands.
+   statement until #491's `Transaction` lands. As built, through
+   `Transaction` (#491 landed first), with these differences from the
+   design above:
+   - `LIMIT` takes an integer constant, `ALL` or `NULL`; `LIMIT $n` is
+     refused. No TPROC-C statement needs it, and a negative parameter
+     would need a run-time error the plan API can't raise yet.
+   - A comparison the chosen key does not express (a residual filter) is
+     refused with `no plan:`, until slice 5 brings residuals. So is a
+     second bound on one side of the ranged part, and an `UPDATE` or
+     `DELETE` that does not name one row by the whole primary key.
+   - A range after an equality prefix is built: it is the same bounds with
+     the prefix's parts in front.
+   - `COUNT(col)` on a column a matching row may hold NULL in counts by a
+     loop over the scan, reading the key part when the key holds the
+     column; `COUNT(*)` and a `NOT NULL` or compared column take
+     `bc_count_range`. On a point lookup, `COUNT` is 0 or 1. One aggregate
+     per `SELECT`.
+   - `col + $n` and `col - $n` take a column of the assigned column's type,
+     on integers and `DECIMAL` only. A `$n` has one SQL type across every
+     use, as before; one used with two is refused, where PostgreSQL infers
+     one (*Known differences* in `docs/testing_design.md`). The operand is
+     range-checked as the column, a `DECIMAL` operand against 18 digits at
+     the column's scale, so the sum stays inside `int64` and the row
+     builder's check of it is 22003. A BIGINT overflow is still `BC_E_ARITH`, not 22003 (#540).
+   - `FOR UPDATE` (#491, slice B) works with every scan here, `ORDER BY`
+     and `LIMIT` included: each row returned is guarded, read from the
+     row, never covering. With `COUNT` it is refused, as PostgreSQL
+     refuses it with an aggregate.
+   - A key path's parts are its key layout's: an index's parts, then every
+     part of the primary key, one the index names among them; an equality
+     prefix covers a repeated part with the same parameter.
+   - The two-range scan prints its two cursors in two blocks, one `LIMIT`
+     counter across both.
+   - The refusals carry no SQLSTATE: `SqlError` has none yet (#541). Their
+     messages are the table's.
 2. **Multi-statement transactions** (#491, another session): the
    statements of slice 1 run in a `Transaction`.
 3. **New-Order:** the two-point join, `FOR UPDATE`, integer literals,
@@ -587,8 +622,10 @@ the subset matches PostgreSQL, and the proof machine checks that it does.
 
 ## Proposed `CONTRACT.md` changes
 
-Not yet in `bytecaskdb-sql-layer/CONTRACT.md`. Each goes in with the slice
-that builds it, named in its PR.
+Each goes in with the slice that builds it, named in its PR. Slice 1 added
+the rows on refusals, on `ORDER BY` and `LIMIT`, on `COUNT`, on `col ±
+$n`'s range and on comparisons with NULL, each scoped to what it builds;
+the planner's row names the `no plan:` message, not 0A000 (#541).
 
 **Added (SQL):**
 | Guarantee | Proved by |

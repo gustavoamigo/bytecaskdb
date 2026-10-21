@@ -32,12 +32,13 @@ export import bytecask.sql.catalog;
 
 export namespace bytecask::sql::bound {
 
-// A column, a parameter, or column - parameter (the only arithmetic in scope).
+// A column, a parameter, or column ± parameter (the only arithmetic in
+// scope: on integers and DECIMAL, of the column's type).
 struct Expr {
-  enum class Kind { Column, Param, Sub };
+  enum class Kind { Column, Param, Add, Sub };
   Kind kind;
-  std::uint32_t col_id{0};  // Column, and the left of Sub
-  std::uint32_t param{0};   // Param, and the right of Sub
+  std::uint32_t col_id{0};  // Column, and the left of Add and Sub
+  std::uint32_t param{0};   // Param, and the right of Add and Sub
   PhysType type;
 };
 
@@ -55,10 +56,23 @@ struct Insert {
   std::vector<std::optional<Expr>> values;
 };
 
+// COUNT(*), or COUNT(column): the rows, or the column's non-NULL values.
+struct Count {
+  std::optional<std::uint32_t> col_id;
+};
+
+struct OrderItem {
+  std::uint32_t col_id;
+  bool desc{false};
+};
+
 struct Select {
   const Table* table;
-  std::vector<std::uint32_t> targets;  // column ids, in select-list order
+  std::vector<std::uint32_t> targets;  // column ids, in select-list order; empty with count
+  std::optional<Count> count;          // the one aggregate, alone in the select list
   std::vector<Compare> where;
+  std::vector<OrderItem> order_by;
+  std::optional<std::int64_t> limit;   // nullopt: no limit
   bool for_update{false};
 };
 
@@ -80,9 +94,10 @@ using Statement = std::variant<Ddl, Insert, Select, Update, Delete>;
 struct Bound {
   Statement stmt;
   std::vector<PhysType> param_types;  // $1 is [0]
-  // For each parameter compared with a column (WHERE), that column's type
-  // without its modifier (compared_type's range), as PostgreSQL types a $n: what its
-  // value is checked against before the plan runs, so a key or bound
+  // For each parameter compared with a column (WHERE) or added to one (SET
+  // col = col ± $n), its SQL type without the modifier (compared_type's
+  // range; a DECIMAL operand's, 18 digits at its scale): what its value is
+  // checked against before the plan runs, so a key, bound or operand
   // outside it is refused whatever the plan would read. nullopt for one
   // only assigned (INSERT, SET), which the row builder checks in column
   // order, as PostgreSQL's assignment does.
@@ -267,15 +282,22 @@ public:
     return c;
   }
 
-  // Gives parameter $n+1 a type, physical and, when a WHERE compares it with
-  // `compared`, SQL; a second use must agree with the first. A compared $n
-  // has one SQL type, what the pre-plan range check checks: compared with
-  // columns of two types that share a physical type (DOUBLE PRECISION and
-  // REAL, INTEGER and BIGINT, DECIMALs of two scales), one value could be
-  // keyed as two numbers. Refused, where PostgreSQL runs it
-  // (docs/testing_design.md, *Known differences*). A DECIMAL of scale 0 is
-  // compared as a BIGINT (compared_type): its integer is the number itself.
-  void use_param(std::uint32_t n, PhysType t, std::int32_t pos, const Column* compared = nullptr) {
+  // How a statement uses a parameter: compared with a column (WHERE),
+  // assigned to one (INSERT, SET), or the operand of col + $n or col - $n.
+  enum class Use { Compared, Assigned, Added, Subtracted };
+
+  // Gives parameter $n+1 a type from one use with `col`, which sets its
+  // physical type and its SQL type. Every use must agree on both, whatever
+  // their order: a $n used with two SQL types that share a physical type
+  // (DOUBLE PRECISION and REAL, INTEGER and BIGINT, DECIMALs of two scales)
+  // would be read as two values. Refused, where PostgreSQL infers one type
+  // from its first use (docs/testing_design.md, *Known differences*). A
+  // DECIMAL of scale 0 is a BIGINT here (compared_type): its integer is the
+  // number itself. A compared or operand $n is range-checked before the plan
+  // runs (param_sql): against its column's type without the modifier, and a
+  // DECIMAL operand against 18 digits at its scale, so a sum stays inside
+  // int64; one only assigned is checked by the row builder.
+  void use_param(std::uint32_t n, PhysType t, std::int32_t pos, const Column& col, Use use) {
     if (params_.size() <= n) params_.resize(n + 1);
     auto& p = params_[n];
     if (p.phys && *p.phys != t) {
@@ -284,38 +306,86 @@ public:
                      pos};
     }
     p.phys = t;
-    if (compared == nullptr) return;
-    if (p.compared != nullptr && compared_type(p.compared->sql).identity != compared_type(compared->sql).identity) {
+    if (p.first != nullptr && compared_type(p.first->sql).identity != compared_type(col.sql).identity) {
+      auto verb = [](Use u) {
+        switch (u) {
+          case Use::Compared: return "compared with ";
+          case Use::Assigned: return "assigned to ";
+          case Use::Added: return "added to ";
+          case Use::Subtracted: return "subtracted from ";
+        }
+        return "";
+      };
       auto named = [](const Column& c) { return c.name + " (" + sql_type_name(c.sql) + ")"; };
-      throw SqlError{"parameter $" + std::to_string(n + 1) + " is compared with " + named(*p.compared) + " and " +
-                         named(*compared),
+      auto second = use == p.first_use ? named(col) : verb(use) + named(col);
+      throw SqlError{"parameter $" + std::to_string(n + 1) + " is " + verb(p.first_use) + named(*p.first) + " and " +
+                         second,
                      pos};
     }
-    if (p.compared == nullptr) p.compared = compared;
+    if (p.first == nullptr) {
+      p.first = &col;
+      p.first_use = use;
+    }
+    if (use == Use::Assigned) return;
+    if (use != Use::Compared && col.sql.kind == SqlKind::Decimal) {
+      p.range = SqlType{SqlKind::Decimal, 0, static_cast<std::uint8_t>(kMaxDecimalPrecision), col.sql.scale};
+    } else if (!p.range) {
+      p.range = compared_type(col.sql).range;
+    }
   }
 
   // An expression whose type is fixed by its target (an assigned column).
-  auto value(const Table& t, const ast::Expr& e, PhysType want) -> Expr {
+  auto value(const Table& t, const ast::Expr& e, const Column& target) -> Expr {
+    auto want = target.type;
     switch (e.kind) {
       case ast::Expr::Kind::Param:
-        use_param(e.param, want, e.pos);
+        use_param(e.param, want, e.pos, target, Use::Assigned);
         return Expr{Expr::Kind::Param, 0, e.param, want};
       case ast::Expr::Kind::Column: {
         const auto* c = column(t, e.column, e.pos);
         if (c->type != want) throw SqlError{"column \"" + c->name + "\" is " + type_name(c->type), e.pos};
         return Expr{Expr::Kind::Column, c->id, 0, want};
       }
+      case ast::Expr::Kind::Add:
       case ast::Expr::Kind::Sub: {
+        auto op = e.kind == ast::Expr::Kind::Add ? "+" : "-";
         if (e.lhs->kind != ast::Expr::Kind::Column || e.rhs->kind != ast::Expr::Kind::Param) {
-          throw SqlError{"only column - parameter is supported", e.pos};
+          throw SqlError{std::string{"only column "} + op + " parameter is supported", e.pos};
         }
         const auto* c = column(t, e.lhs->column, e.lhs->pos);
-        if (c->type != PhysType::I64 || want != PhysType::I64) {
-          throw SqlError{"operator - is only defined on bigint", e.pos};
+        // On integers and DECIMAL, of the assigned column's type: the
+        // operator's result type is then the column's, and the row
+        // builder's range check on the stored value is the one PostgreSQL's
+        // operator makes (22003).
+        auto numeric = [](const Column& col) {
+          switch (col.sql.kind) {
+            case SqlKind::SmallInt:
+            case SqlKind::Integer:
+            case SqlKind::BigInt:
+            case SqlKind::Decimal: return true;
+            case SqlKind::Real:
+            case SqlKind::Double:
+            case SqlKind::Boolean:
+            case SqlKind::Bytea:
+            case SqlKind::Text:
+            case SqlKind::Varchar:
+            case SqlKind::Timestamp:
+            case SqlKind::Date:
+            case SqlKind::Time: return false;
+          }
+          return false;
+        };
+        if (!numeric(*c) || !numeric(target) || compared_type(c->sql).identity != compared_type(target.sql).identity) {
+          throw SqlError{std::string{"operator "} + op + " is only supported on an integer or DECIMAL column of the "
+                                                         "assigned column's type",
+                         e.pos};
         }
-        use_param(e.rhs->param, PhysType::I64, e.rhs->pos);
-        return Expr{Expr::Kind::Sub, c->id, e.rhs->param, PhysType::I64};
+        use_param(e.rhs->param, PhysType::I64, e.rhs->pos, *c,
+                  e.kind == ast::Expr::Kind::Add ? Use::Added : Use::Subtracted);
+        return Expr{e.kind == ast::Expr::Kind::Add ? Expr::Kind::Add : Expr::Kind::Sub, c->id, e.rhs->param,
+                    PhysType::I64};
       }
+      case ast::Expr::Kind::Count: throw SqlError{"aggregate functions are not allowed here", e.pos};
     }
     throw SqlError{"expression not supported", e.pos};
   }
@@ -340,7 +410,7 @@ public:
         throw SqlError{"WHERE must compare a column with a parameter", w.pos};
       }
       const auto* c = column(t, col->column, col->pos);
-      use_param(param->param, c->type, param->pos, c);
+      use_param(param->param, c->type, param->pos, *c, Use::Compared);
       out.push_back(Compare{op, c->id, param->param});
     }
     return out;
@@ -356,23 +426,23 @@ public:
     return out;
   }
 
-  // For each parameter a WHERE compares, its column's type without the
-  // modifier (compared_type's range): what the pre-plan range check checks
-  // it against.
+  // For each parameter compared with or added to a column, what the
+  // pre-plan range check checks it against (use_param).
   auto param_sql() const -> std::vector<std::optional<SqlType>> {
     std::vector<std::optional<SqlType>> out;
     for (const auto& p : params_) {
-      out.push_back(p.compared == nullptr ? std::nullopt : std::optional{compared_type(p.compared->sql).range});
+      out.push_back(p.range);
     }
     return out;
   }
 
 private:
-  // A parameter's type from its uses: physical from every use, and the
-  // first column a WHERE compares it with.
+  // A parameter's type from its uses, which all agree.
   struct ParamUse {
     std::optional<PhysType> phys;
-    const Column* compared{nullptr};
+    const Column* first{nullptr};  // the column of its first use, for the SQL type
+    Use first_use{Use::Assigned};
+    std::optional<SqlType> range;  // what the pre-plan range check checks: none if only assigned
   };
   const Catalog& cat_;
   std::vector<ParamUse> params_;
@@ -438,7 +508,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           for (std::size_t i = 0; i < targets.size(); ++i) {
             auto at = static_cast<std::size_t>(targets[i] - t->columns.data());
             if (out.values[at]) throw SqlError{"column \"" + targets[i]->name + "\" specified more than once", s.pos};
-            out.values[at] = b.value(*t, s.values[i], targets[i]->type);
+            out.values[at] = b.value(*t, s.values[i], *targets[i]);
             if (out.values[at]->kind != Expr::Kind::Param) {
               throw SqlError{"INSERT values must be parameters", s.values[i].pos};
             }
@@ -449,10 +519,32 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           return {out, s.pos};
         } else if constexpr (std::is_same_v<T, ast::Select>) {
           const auto* t = b.table(s.table, s.pos);
-          Select out{t, {}, b.where(*t, s.where), s.for_update};
+          Select out{t, {}, std::nullopt, b.where(*t, s.where), {}, s.limit, s.for_update};
+          const ast::Expr* bare = nullptr;  // a column beside an aggregate: 42803
           for (const auto& e : s.targets) {
-            if (e.kind != ast::Expr::Kind::Column) throw SqlError{"only columns can be selected", e.pos};
+            if (e.kind == ast::Expr::Kind::Count) {
+              if (out.count) throw SqlError{"only one aggregate per SELECT is supported", e.pos};
+              out.count = Count{e.column.empty() ? std::nullopt
+                                                 : std::optional{Binder::column(*t, e.column, e.pos)->id}};
+              continue;
+            }
+            if (e.kind != ast::Expr::Kind::Column) throw SqlError{"only columns and COUNT can be selected", e.pos};
             out.targets.push_back(Binder::column(*t, e.column, e.pos)->id);
+            bare = &e;
+          }
+          // 42803, in PostgreSQL's words.
+          auto ungrouped = [&] [[noreturn]] (const std::string& col, std::int32_t pos) {
+            throw SqlError{"column \"" + t->name + "." + col +
+                               "\" must appear in the GROUP BY clause or be used in an aggregate function",
+                           pos};
+          };
+          if (out.count && bare != nullptr) ungrouped(bare->column, bare->pos);
+          // 0A000, as PostgreSQL refuses it.
+          if (out.count && s.for_update) throw SqlError{"FOR UPDATE is not allowed with aggregate functions", s.pos};
+          for (const auto& o : s.order_by) {
+            const auto* c = Binder::column(*t, o.column, o.pos);
+            if (out.count) ungrouped(c->name, o.pos);
+            out.order_by.push_back({c->id, o.desc});
           }
           return {out, s.pos};
         } else if constexpr (std::is_same_v<T, ast::Update>) {
@@ -463,7 +555,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
             if (std::ranges::find(t->pk_col_ids, c->id) != t->pk_col_ids.end()) {
               throw SqlError{"updating a primary key column is not supported", a.pos};
             }
-            out.set.emplace_back(c->id, b.value(*t, a.value, c->type));
+            out.set.emplace_back(c->id, b.value(*t, a.value, *c));
           }
           out.where = b.where(*t, s.where);
           return {out, s.pos};
