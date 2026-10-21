@@ -1,0 +1,1 @@
+SELECT d FROM r WHERE d >= $1
