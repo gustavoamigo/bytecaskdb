@@ -15,9 +15,11 @@ protocol comes first, as a thin stateful front over the embedded API. gRPC
 stays in #494, after this slice.
 
 Names: the benchmark is HammerDB's TPROC-C, and this design uses that name
-for the layer's files and binaries. The harness is `sql_layer_tpcc` and
-`harness/tpcc.cppm` on main today. They become `sql_layer_tprocc` and
-`harness/tprocc.cppm` in one rename PR, and this design uses the new names.
+for the layer's files and binaries. The harness lands as `sql_layer_tpcc`
+and `harness/tpcc.cppm` with #543, which this PR follows. Then one rename PR
+makes them `sql_layer_tprocc` and `harness/tprocc.cppm`, and retitles
+`testing_design.md`'s section *The TPROC-C harness*. This design uses those
+names, and builds after both.
 HammerDB's own identifiers, `dbset bm TPC-C` and `diset tpcc …`, are the
 tool's and stay.
 
@@ -137,10 +139,13 @@ A message longer than 64 MiB is `FATAL 08P01` and closes the connection.
 That bound sits well above the engine's 4 MiB default value limit plus a
 statement's text.
 
-**Shutdown.** `SIGINT` or `SIGTERM` closes the listener. Each connection
-then gets `FATAL 57P01` (`admin_shutdown`) between messages: a statement in
-flight finishes first, and an open transaction is rolled back. When every
-thread has joined, the server calls `Database::close()`.
+**Shutdown.** `SIGINT` or `SIGTERM` closes the listener. The server then
+calls `shutdown(fd, SHUT_RD)` on every registered connection, so a thread
+blocked in `read` wakes at once, idle or not. A statement in flight finishes
+first: its reply still goes out, since the write side stays open. The
+thread then sends `FATAL 57P01` (`admin_shutdown`), rolls back an open
+transaction and exits. When every thread has joined, the server calls
+`Database::close()`.
 
 ## Startup
 
@@ -243,7 +248,8 @@ statement the session runs at `Execute`.
 A `Query` holds one statement, with a trailing `;` and white space
 allowed. An empty one gets `EmptyQueryResponse`. Several statements are
 `0A000`; no client the gate uses sends them. A `$n` in a `Query` is
-`08P01`, as PostgreSQL's "there is no parameter $1" is reported here. A
+`42P02` (`undefined_parameter`), PostgreSQL's "there is no parameter
+$1". A
 failed statement gets `ErrorResponse`; then, as after every `Query`, the
 server sends `ReadyForQuery`.
 
@@ -329,15 +335,23 @@ Each `SqlType` has an OID, a length and a modifier, as `pg_type` and
 | `TEXT` | 25 | -1 | -1 |
 | `VARCHAR(n)` | 1043 | -1 | n + 4 |
 | `DECIMAL(p, s)` | 1700 | -1 | ((p << 16) \| s) + 4 |
+| `numeric`, unconstrained (a `SUM`) | 1700 | -1 | -1 |
 | `TIMESTAMP` | 1114 | 8 | -1 |
 | `DATE` | 1082 | 4 | -1 |
 | `TIME` | 1083 | 8 | -1 |
 
-A result column the catalog does not declare (an aggregate, `COUNT`) has
-its `plain_sql_type`: `BIGINT`, `DOUBLE PRECISION`, `BOOLEAN` or `BYTEA`.
-PostgreSQL reports `COUNT` as `bigint` too, and `SUM` of a `DECIMAL` as
-`numeric`. The front end's result types already follow PostgreSQL's, and
-the server only reports them.
+A result column's type is the one the compiler gives it
+(`Compiled::column_types`), so the server only reports it:
+- a column, its declared type;
+- `COUNT`, `BIGINT`;
+- `SUM` of a `SMALLINT` or `INTEGER`, `BIGINT`;
+- `SUM` of a `BIGINT` or `DECIMAL`, PostgreSQL's unconstrained `numeric`,
+  at the input's scale (`frontend_design.md`, *The dialect subset*).
+
+Unconstrained `numeric` is OID 1700 with modifier -1, and its text has the
+input's scale: `123.45` for a sum of `DECIMAL(6, 2)`. `SqlType` writes it
+as a `DECIMAL` of precision 0 at that scale. Slice 4, which adds `SUM`,
+gives the compiler that type.
 
 **Output** is PostgreSQL's text form, with the `ParameterStatus` settings
 above:
@@ -361,14 +375,18 @@ are:
   here (*Known differences*). Out of range is `22003`, from the layer's
   range check, as for any parameter.
 - `DECIMAL`: decimal with an optional exponent.
-  - An assigned or added parameter with more fraction digits than s is
-    rounded half away from zero, as PostgreSQL rounds on assignment. For an
-    added one, `w_ytd + $1`, rounding the operand gives what PostgreSQL
-    gets by rounding the sum, since the column's value is exact at s.
-  - A compared parameter with more fraction digits than s is `22P02`.
-    PostgreSQL compares the unrounded value, which a scaled `i64` cannot
-    hold, so the server refuses it rather than round to a value that could
-    compare equal.
+  - An assigned parameter with more fraction digits than s is rounded
+    half away from zero, as PostgreSQL rounds on assignment.
+  - A compared or added parameter (`w_ytd + $1`) with more fraction digits
+    than s is `22P02`.
+    - Compared: PostgreSQL compares the unrounded value, which a scaled
+      `i64` cannot hold.
+    - Added: PostgreSQL rounds the sum, and half away from zero depends on
+      the sum's sign, so rounding the operand first can differ. For
+      example, -1.00 + 0.995 rounds to -0.01, but -1.00 + 1.00 is 0.00.
+
+    The server refuses rather than give either value. `ParamInfo` says
+    which use a parameter has (*API changes*, 1).
   - `NaN` is `22P02`.
 - floats: what `strtod` reads, plus `NaN`, `Infinity`, `-Infinity`
   (`inf` too), any case. Rounding a `REAL` is the layer's.
@@ -408,7 +426,7 @@ PostgreSQL also checks the server's mapping. The mapping:
 | `BC_C_NOT_NULL` | `23502` |
 | `BC_C_RANGE`, by the check that failed | `22003` (`smallint`/`integer`/`numeric field overflow`/`REAL`), `22001` (`VARCHAR` too long), `22021` (encoding), `22008` (datetime) |
 | `BC_E_LIMIT` | `54000` |
-| `BC_E_ARITH` | `22003` |
+| `BC_E_ARITH` | `22003`. The subset has no division; adding one adds `22012` for division by zero |
 | `SerializationFailure`, a conflict on every retry, `DdlInProgress` | `40001` |
 | `TransactionResolutionUnknown` | `08007` |
 | `TransactionAborted` | `25P02` |
@@ -431,11 +449,15 @@ driver sends no statement that fails to bind.
 The server needs four things that `api/database.cppm` does not expose. All
 are read from what the binder and compiler already keep:
 1. `Statement::params() -> std::vector<ParamInfo>`, with `ParamInfo
-   {SqlType type; bool compared;}`. `type` is the declared type of the
-   column of the parameter's first use, which the binder keeps
-   (`ParamUse::first`). `compared` is true when one of its uses is a
-   comparison. The server needs it for `ParameterDescription` and for text
-   input. `param_types()`, the physical types, stays for its callers.
+   {SqlType type; bool assigned_only;}`.
+   - `type` is the declared type of the column of the parameter's first
+     use, which the binder keeps (`ParamUse::first`).
+   - `assigned_only` is true when every use is an assignment, which is the
+     binder's `param_sql` being empty. A compared or added parameter is not
+     assigned-only.
+
+   The server needs it for `ParameterDescription` and for text input.
+   `param_types()`, the physical types, stays for its callers.
 2. `Statement::columns() -> std::vector<std::pair<std::string, SqlType>>`,
    from `Compiled::columns` and `column_types`. These are of the plan the
    statement runs now, as `param_types()` is. The server needs it for
@@ -469,10 +491,12 @@ procedures (or functions) through SQL `PREPARE`. Its monitor also reads
 `pg_stat_database`.
 
 **A virtual user** connects as above.
-- **Its run.** At start it runs the `harness_run` bump in its own
-  transaction (`testing_design.md`), so its `h_id`s are `(run << 48) | n`.
-  Each virtual user takes a run of its own, which spends 49 of the 2^15
-  runs per 48-user cell; the harness's limits otherwise hold.
+- **Its run.** The run script takes one run per cell before the server
+  starts: `sql_layer_tprocc next-run --dir` makes the `harness_run` bump
+  offline and prints the run. It writes the run into the script's header.
+  A virtual user's `h_id`s are `(run << 48) | (position << 40) | n`, the
+  harness's scheme with the position as the thread, so users never race on
+  `harness_run`. The harness's limits hold: 2^15 runs, 256 positions.
 - **Its warehouse.** Its home warehouse is fixed by position:
   `((position - 2) mod W) + 1`, position 1 being the monitor. HammerDB's
   default, a random home warehouse, draws correlated numbers across
@@ -485,8 +509,13 @@ procedures (or functions) through SQL `PREPARE`. Its monitor also reads
   SQLSTATE, and moves on; it does not retry, as HammerDB's drivers do not.
   A `40001` costs the throughput it costs. With `raiseerror` set, the user
   stops instead.
-- **Its counts.** It adds each commit, rollback and failure to `tsv`
-  counters, which `Com_commit` and `Com_rollback` stand in for.
+- **Its counts.** Each transaction adds exactly one outcome to a `tsv`
+  counter:
+  - committed;
+  - rolled back, for New-Order's 1%;
+  - failed, for an error, whose `ROLLBACK` is not counted again.
+
+  These stand in for `Com_commit` and `Com_rollback`.
 
 **The monitor**, position 1, is HammerDB's timed monitor.
 1. It waits out the ramp-up.
@@ -498,7 +527,7 @@ procedures (or functions) through SQL `PREPARE`. Its monitor also reads
 4. It prints `testresult $nopm $tpm` with HammerDB's own procedure:
    - NOPM is the `d_next_o_id` delta per minute, the benchmark specification's definition and
      HammerDB's;
-   - TPM is commits plus rollbacks plus failures per minute, which
+   - TPM is transactions per minute, one per outcome, which
      `xact_commit + xact_rollback` would count.
 5. It sets HammerDB's `abort` flag, and the users stop.
 
@@ -517,7 +546,16 @@ layer runs, and the gate is the full mix.
 
 **The same script against PostgreSQL 17.** The statements are
 PostgreSQL's, so the script runs unchanged on PostgreSQL loaded with the
-same schema. That is how the driver itself is checked: the smoke test runs
+same population.
+- `sql_layer_tprocc load --sql-out FILE` writes that population, from the
+  same seed, as a `psql` script:
+  - the schema fixture's DDL, which is PostgreSQL's dialect;
+  - `harness_run (1, 0)`;
+  - one `COPY … FROM STDIN` per table.
+- `psql` loads it.
+- `hammerdb/pg_consistency.sql` holds conditions 1, 8 and 9 as the harness
+  runs them. `scripts/check_driver_statements.py` checks it against the
+  harness's too. That is how the driver itself is checked: the smoke test runs
 it against PostgreSQL as well, and the consistency conditions must hold
 there too. The gate reports only ByteCaskDB's numbers
 (`frontend_design.md`, *Decisions*, 7): PostgreSQL's throughput from these
@@ -556,8 +594,12 @@ plugin. `--smoke` is the short run of *Tests*.
    duration, NOPM, TPM, errors by SQLSTATE, and the check's result, all
    of our server; the report prints the same. No PostgreSQL row is written.
 
-`sql_layer_tprocc check` is a new command over the harness's existing
-`consistency()`.
+The harness gains three commands for this:
+- `check`, over its existing `consistency()`;
+- `next-run`, the `harness_run` bump it already makes per phase;
+- `load --sql-out`, the loader writing to a file instead of the layer.
+
+The run script requires W ≥ the user count; the monitor is not a user.
 
 ## Tests
 
@@ -585,10 +627,10 @@ plugin. `--smoke` is the short run of *Tests*.
   - the warnings;
   - `--max-connections`.
 - **HammerDB smoke, nightly.** A scheduled workflow,
-  `.github/workflows/sql-layer-hammerdb-nightly.yml`, runs `run-gate.sh --smoke`: one warehouse, two
+  `.github/workflows/sql-layer-hammerdb-nightly.yml`, runs `run-gate.sh --smoke`: two warehouses, two
   users, no ramp-up and a one-minute window, against the server and against
-  PostgreSQL 17. It then runs `sql_layer_tprocc check` and the same
-  conditions on PostgreSQL. It needs HammerDB's Linux release, cached
+  PostgreSQL 17. It then runs `sql_layer_tprocc check`, and
+  `pg_consistency.sql` on PostgreSQL. It needs HammerDB's Linux release, cached
   between runs. It can also be started by hand (`workflow_dispatch`).
   The workflow file has to live in `.github/workflows/`, outside the layer.
   It goes in `ci.yml`'s `paths-ignore` lists, for push and for pull
