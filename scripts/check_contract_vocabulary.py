@@ -79,6 +79,9 @@ SQL_WORDS = {
     "NULL", "DEFAULT", "PRIMARY", "KEY", "DESC", "ASC", "REBUILD", "SET",
     "IF", "EXISTS", "ORDER", "BY", "LIMIT", "COUNT", "DISTINCT", "SUM", "MIN", "FOR", "SHARE",
     "NO", "NOWAIT", "SKIP", "LOCKED", "OF",
+    # Transaction control and the session statements the PostgreSQL server
+    # names (docs/server_design.md).
+    "BEGIN", "COMMIT", "ROLLBACK", "SHOW", "PREPARE",
 }
 
 # name -> (contract, interface files, extra allowed words)

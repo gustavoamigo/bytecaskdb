@@ -1,3 +1,0 @@
-date,commit,warehouses,users,rampup_min,duration_min,nopm,tpm,errors,check
-2026-10-22T08:51:20Z,80ce680,2,2,0,1,17122,38117,"none",ok
-2026-10-22T08:54:33Z,80ce680,2,2,0,1,16835,37404,"none",ok

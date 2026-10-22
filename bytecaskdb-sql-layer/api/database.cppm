@@ -164,14 +164,49 @@ public:
   ~ParamError() override;  // out of line: anchors the vtable (-Wweak-vtables)
 };
 
+// The SQLSTATE PostgreSQL reports for the error, for each exception the API
+// throws, and XX000 (internal_error) for anything else. The one mapping:
+// the PostgreSQL server reports it, and the proof oracle compares it with
+// PostgreSQL's.
+[[nodiscard]] auto sqlstate(const std::exception& e) noexcept -> std::string_view;
+
 class Database;
+
+// What a statement does, as PostgreSQL's command tag names it.
+enum class Command {
+  Select,
+  Insert,
+  Update,
+  Delete,
+  CreateTable,
+  CreateIndex,
+  DropTable,
+  DropIndex,
+  AlterTable,
+};
+
+// A result column: its name and SQL type, as a client is told them before
+// the statement runs.
+struct ResultColumn {
+  std::string name;
+  SqlType type;
+};
+
+using bound::ParamInfo;
 
 class Statement {
 public:
   [[nodiscard]] auto sql() const -> const std::string& { return sql_; }
   [[nodiscard]] auto is_ddl() const -> bool { return ddl_; }
+  [[nodiscard]] auto command() const -> Command;
   // Of the plan the statement runs now: a DDL may make it recompile.
   [[nodiscard]] auto param_types() const -> std::vector<PhysType>;
+  // Each parameter's SQL type and use, and the result's columns (none for
+  // a statement that returns no rows), of the plan the statement runs now:
+  // Database::refit first to describe it against the live catalog. Empty
+  // for DDL.
+  [[nodiscard]] auto params() const -> std::vector<ParamInfo>;
+  [[nodiscard]] auto columns() const -> std::vector<ResultColumn>;
   // The plan file, as EXPLAIN would print it; empty for DDL.
   [[nodiscard]] auto plan_source() const -> std::string;
 
@@ -191,6 +226,7 @@ private:
     // checked before the plan runs, whatever the plan would read.
     std::vector<std::optional<SqlType>> param_sql;
     std::vector<std::uint32_t> param_table;
+    std::vector<ParamInfo> params;
     std::vector<std::uint8_t> result_codes;  // the plan's result_types as bc_type codes
     RowLayout result_layout;                 // how its result rows decode
     std::vector<bc_col_ref> col_refs;
@@ -353,6 +389,10 @@ public:
   auto execute(std::string_view sql, const std::vector<Value>& params = {}) -> Rows;
   // Opens a transaction. Its snapshot is taken at its first statement.
   [[nodiscard]] auto begin(TransactionOptions opts = {}) -> Transaction;
+  // Recompiles the statement's plan if the live catalog no longer fits it,
+  // as its next run would, so params() and columns() describe what that run
+  // takes and returns. Runs nothing. Throws what a recompile throws.
+  void refit(const Statement& stmt);
   [[nodiscard]] auto cached_plans() const -> std::size_t {
     std::shared_lock<std::shared_mutex> lock{cache_mu_};
     return cache_.size();
@@ -517,6 +557,57 @@ constexpr int kTxnPlanAttempts = 3;
 
 }  // namespace
 
+namespace {
+
+auto constraint_sqlstate(const ExecError& e) noexcept -> std::string_view {
+  auto c = ConstraintDetail::decode(e.detail());
+  switch (c.constraint) {
+    case BC_C_UNIQUE: return "23505";
+    case BC_C_NOT_NULL: return "23502";
+    case BC_C_CHECK: return "23514";
+    case BC_C_FOREIGN_KEY: return "23503";
+    case BC_C_RANGE: {
+      auto state = range_sqlstate(e.what());
+      return state.empty() ? "22000" : state;  // data_exception: a range message out_of_range did not write
+    }
+    default: return "23000";  // integrity_constraint_violation
+  }
+}
+
+auto exec_sqlstate(const ExecError& e) noexcept -> std::string_view {
+  if (e.conflict()) return "40001";
+  switch (e.code()) {
+    case BC_E_CONSTRAINT: return constraint_sqlstate(e);
+    case BC_E_LIMIT: return "54000";      // program_limit_exceeded
+    case BC_E_ARITH: return "22003";      // numeric_value_out_of_range: the subset has no division
+    case BC_E_BUDGET: return "57014";     // query_canceled
+    case BC_E_MEMORY: return "53200";     // out_of_memory
+    case BC_E_CLOSED: return "57P01";     // admin_shutdown
+    case BC_E_IO:
+    case BC_E_CORRUPT:
+    case BC_E_DEGRADED: return "58030";   // io_error
+    default: return "XX000";
+  }
+}
+
+}  // namespace
+
+auto sqlstate(const std::exception& e) noexcept -> std::string_view {
+  // Most derived first: SerializationFailure is an ExecError.
+  if (dynamic_cast<const SerializationFailure*>(&e) != nullptr) return "40001";
+  if (const auto* x = dynamic_cast<const ExecError*>(&e)) return exec_sqlstate(*x);
+  if (dynamic_cast<const TransactionResolutionUnknown*>(&e) != nullptr) return "08007";
+  if (dynamic_cast<const TransactionAborted*>(&e) != nullptr) return "25P02";
+  if (dynamic_cast<const FeatureNotSupported*>(&e) != nullptr) return "0A000";
+  if (dynamic_cast<const ParamError*>(&e) != nullptr) return "08P01";
+  if (const auto* x = dynamic_cast<const DdlRefused*>(&e)) return x->sqlstate();
+  if (dynamic_cast<const ast::SqlError*>(&e) != nullptr) return "42601";
+  if (dynamic_cast<const DdlInProgress*>(&e) != nullptr) return "40001";
+  if (dynamic_cast<const DbClosed*>(&e) != nullptr) return "57P01";
+  if (dynamic_cast<const std::bad_alloc*>(&e) != nullptr) return "53200";
+  return "XX000";
+}
+
 auto Statement::param_types() const -> std::vector<PhysType> {
   auto c = compiled();
   return c ? c->plan->param_types : std::vector<PhysType>{};
@@ -525,6 +616,47 @@ auto Statement::param_types() const -> std::vector<PhysType> {
 auto Statement::plan_source() const -> std::string {
   auto c = compiled();
   return c ? c->plan->source : std::string{};
+}
+
+auto Statement::params() const -> std::vector<ParamInfo> {
+  auto c = compiled();
+  return c ? c->params : std::vector<ParamInfo>{};
+}
+
+auto Statement::columns() const -> std::vector<ResultColumn> {
+  auto c = compiled();
+  std::vector<ResultColumn> out;
+  if (!c || !c->plan->returns_rows) return out;
+  for (std::size_t i = 0; i < c->columns.size(); ++i) out.push_back({c->columns[i], c->column_types.at(i)});
+  return out;
+}
+
+auto Statement::command() const -> Command {
+  return std::visit(
+      [](const auto& st) {
+        using T = std::decay_t<decltype(st)>;
+        if constexpr (std::is_same_v<T, ast::Select>) {
+          return Command::Select;
+        } else if constexpr (std::is_same_v<T, ast::Insert>) {
+          return Command::Insert;
+        } else if constexpr (std::is_same_v<T, ast::Update>) {
+          return Command::Update;
+        } else if constexpr (std::is_same_v<T, ast::Delete>) {
+          return Command::Delete;
+        } else if constexpr (std::is_same_v<T, ast::CreateTable>) {
+          return Command::CreateTable;
+        } else if constexpr (std::is_same_v<T, ast::CreateIndex>) {
+          return Command::CreateIndex;
+        } else if constexpr (std::is_same_v<T, ast::DropTable>) {
+          return Command::DropTable;
+        } else if constexpr (std::is_same_v<T, ast::DropIndex>) {
+          return Command::DropIndex;
+        } else {
+          static_assert(std::is_same_v<T, ast::AddColumn>);
+          return Command::AlterTable;
+        }
+      },
+      ast_);
 }
 
 auto Database::open(const std::filesystem::path& dir) -> std::unique_ptr<Database> {
@@ -652,6 +784,7 @@ auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
   }
   c->param_sql = std::move(bound.param_sql);
   c->param_table = std::move(bound.param_table);
+  c->params = std::move(bound.params);
   auto n = [](const auto& v) { return narrow<std::uint32_t>(v.size()); };
   const auto& p = *c->plan;
   c->ref = {p.catalog_version,
@@ -889,6 +1022,20 @@ auto Database::results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows {
   }
   bc_ctx_reset(cx);
   return out;
+}
+
+void Database::refit(const Statement& stmt) {
+  auto lock = enter();
+  if (stmt.owner_ != this) throw std::logic_error("the statement was prepared on another database");
+  if (stmt.is_ddl()) return;
+  auto* cx = acquire_context();
+  try {
+    (void)fitting_plan(cx, stmt, {});
+    release_context(cx);
+  } catch (...) {
+    release_context(cx);
+    throw;
+  }
 }
 
 auto Database::begin(TransactionOptions opts) -> Transaction {

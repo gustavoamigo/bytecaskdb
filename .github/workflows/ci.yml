@@ -23,6 +23,7 @@ on:
       - "scripts/test_check_contract_vocabulary.py"
       - ".github/workflows/contract.yml"
       - ".github/workflows/sql-layer.yml"
+      - ".github/workflows/sql-layer-hammerdb-nightly.yml"
   pull_request:
     branches: [main]
     paths-ignore:
@@ -33,6 +34,7 @@ on:
       - "scripts/test_check_contract_vocabulary.py"
       - ".github/workflows/contract.yml"
       - ".github/workflows/sql-layer.yml"
+      - ".github/workflows/sql-layer-hammerdb-nightly.yml"
   workflow_dispatch:
 
 permissions:

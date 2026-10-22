@@ -1,0 +1,2 @@
+# The gate's results (hammerdb/run-gate.sh): local, as benchmarks/*.csv are at the root.
+benchmarks/hammerdb_results.csv

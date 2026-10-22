@@ -26,23 +26,11 @@ SQLSTATE = {
 }
 
 # A value outside its declared type is one kind, "range", in the layer; its
-# message, PostgreSQL's words, says which. The one mapping from those
-# messages, by how they start, to PostgreSQL's SQLSTATE.
-# test_every_range_message_maps_to_its_sqlstate produces every one, so a
-# reworded message fails there, not as a silent mismatch.
-RANGE_SQLSTATE = {
-    "smallint out of range": "22003",
-    "integer out of range": "22003",
-    "value out of range: overflow": "22003",  # REAL
-    "value out of range: underflow": "22003",  # REAL
-    "numeric field overflow": "22003",  # DECIMAL(p, s)
-    "value too long for type character varying": "22001",
-    "invalid byte sequence for encoding": "22021",  # TEXT, VARCHAR
-    "date out of range": "22008",
-    "timestamp out of range": "22008",
-    "time out of range": "22008",
-}
-RANGE_STATES = frozenset(RANGE_SQLSTATE.values())
+# message, PostgreSQL's words, says which SQLSTATE, and the layer reports it
+# (the API's sqlstate(), as `sqlstate` on each exception). These are every
+# such SQLSTATE: test_every_range_message_maps_to_its_sqlstate produces each
+# message the layer maps.
+RANGE_STATES = frozenset(state for _, state in bytecask_sql._range_messages())
 
 # A statement in a transaction an earlier statement failed in.
 ABORTED = "25P02"
@@ -51,10 +39,8 @@ ABORTED = "25P02"
 def layer_sqlstate(e: bytecask_sql.ExecError) -> str:
     """The SQLSTATE PostgreSQL gives the layer's refusal, or "refused"."""
     if e.constraint == "range":
-        message = str(e)
-        states = [state for start, state in RANGE_SQLSTATE.items() if message.startswith(start)]
-        assert len(states) == 1, f"range refusal with no SQLSTATE in RANGE_SQLSTATE: {message}"
-        return states[0]
+        assert e.sqlstate in RANGE_STATES, f"range refusal with SQLSTATE {e.sqlstate}: {e}"
+        return e.sqlstate
     return SQLSTATE.get(e.constraint, "refused")
 
 
@@ -118,6 +104,12 @@ class Outcome:
     rows: tuple = ()
     affected: int | None = None
     detail: str = ""
+    # The exact SQLSTATE of a refusal, where the side reports one: the
+    # layer's (the API's sqlstate()), the server's and PostgreSQL's.
+    sqlstate: str | None = None
+    # The rows as their text format's bytes, with each column's type OID:
+    # what PostgreSQL and the server send. Empty from the embedded layer.
+    text: tuple = ()
 
 
 def strict(rows) -> tuple:
@@ -187,11 +179,11 @@ def literal(t: Type, v) -> str:
 TOKEN = re.compile(r"'(?:[^']|'')*'|\$(\d+)|%|[^'$%]+|.", re.S)
 
 
-def pg_params(sql: str, params) -> tuple[str, list | None]:
-    """$n placeholders to psycopg's %s, the parameters in their order. With
-    parameters, psycopg reads every % as a placeholder's, so a literal %
-    becomes %%; a $n inside a string literal is text. A statement without
-    parameters goes as written."""
+def pg_params(sql: str, params, placeholder: str = "%s") -> tuple[str, list | None]:
+    """$n placeholders to psycopg's (%s, or %t for text format), the
+    parameters in their order. With parameters, psycopg reads every % as a
+    placeholder's, so a literal % becomes %%; a $n inside a string literal
+    is text. A statement without parameters goes as written."""
     if not params:
         return sql, None
     out, order = [], []
@@ -199,7 +191,7 @@ def pg_params(sql: str, params) -> tuple[str, list | None]:
         token = m.group(0)
         if m.group(1) is not None:
             order.append(int(m.group(1)) - 1)
-            out.append("%s")
+            out.append(placeholder)
         else:
             out.append(token.replace("%", "%%"))
     return "".join(out), [params[i] for i in order]
@@ -225,35 +217,60 @@ def run_layer(db, sql: str, params=()) -> Outcome:
     try:
         r = db.execute(sql, tuple(params))
     except bytecask_sql.TransactionAborted as e:
-        return Outcome(error=ABORTED, detail=str(e))
+        return Outcome(error=ABORTED, detail=str(e), sqlstate=e.sqlstate)
     except bytecask_sql.ExecError as e:
         # A constraint violation is an outcome to compare. Any other failure
         # of a plan that ran (corrupt, I/O, a handle, a layout, a limit,
         # memory, a conflict) is the layer failing: the test fails on it.
         if e.constraint is None:
             raise
-        return Outcome(error=layer_sqlstate(e), detail=str(e))
+        return Outcome(error=layer_sqlstate(e), detail=str(e), sqlstate=e.sqlstate)
     except bytecask_sql.SqlError as e:
-        return Outcome(error="refused", detail=str(e))
+        return Outcome(error="refused", detail=str(e), sqlstate=e.sqlstate)
     return Outcome(rows=tuple(r["rows"]), affected=r["affected"] if changes_rows(sql) else None)
 
 
-def run_pg(conn, sql: str, params=()) -> Outcome:
+def raw_text(cur) -> tuple:
+    """The rows a cursor holds, as the bytes of their text format, and each
+    column's type OID."""
+    res = cur.pgresult
+    if res is None or not cur.description:
+        return ()
+    oids = tuple(res.ftype(c) for c in range(res.nfields))
+    return (oids, tuple(tuple(res.get_value(r, c) for c in range(res.nfields)) for r in range(res.ntuples)))
+
+
+def run_psycopg(conn, text: str, values, sql: str) -> Outcome:
+    """A statement through psycopg: on PostgreSQL, or on the server."""
     import psycopg
 
-    text, values = pg_params(sql, params)
     try:
         with conn.cursor() as cur:
             cur.execute(text, values)
             rows = cur.fetchall() if cur.description else []
             oids = [d.type_code for d in cur.description] if cur.description else []
             affected = cur.rowcount if changes_rows(sql) else None
+            raw = raw_text(cur)
     except (psycopg.OperationalError, psycopg.InterfaceError):
         raise  # the connection or the driver failed: not an outcome
     except psycopg.Error as e:
         if not e.sqlstate:
-            raise  # no SQLSTATE: not PostgreSQL refusing the statement
+            raise  # no SQLSTATE: not the server refusing the statement
         state = e.sqlstate
         known = state in SQLSTATE.values() or state in RANGE_STATES or state == ABORTED
-        return Outcome(error=state if known else "refused", detail=f"{state} {e}")
-    return Outcome(rows=tuple(tuple(from_pg(v, oid) for v, oid in zip(row, oids)) for row in rows), affected=affected)
+        return Outcome(error=state if known else "refused", detail=f"{state} {e}", sqlstate=state)
+    return Outcome(rows=tuple(tuple(from_pg(v, oid) for v, oid in zip(row, oids)) for row in rows), affected=affected,
+                   text=raw)
+
+
+def run_pg(conn, sql: str, params=()) -> Outcome:
+    text, values = pg_params(sql, params)
+    return run_psycopg(conn, text, values, sql)
+
+
+def run_wire(conn, sql: str, params=()) -> Outcome:
+    """A statement on sql_layer_server, as the layer's text with its $n: each
+    parameter goes as text (%t), so the server reads it as the type it
+    inferred, as it reads HammerDB's."""
+    text, values = pg_params(sql, params, "%t")
+    return run_psycopg(conn, text, values, sql)

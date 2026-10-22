@@ -31,6 +31,13 @@ a key, and UPDATE and DELETE of every row a key's prefix or range reaches.
 Slice 5: filters on the columns a key does not take, bounds of $n ± k on
 INTEGER columns, COUNT(DISTINCT), and the join of a table reached by its
 parameters to one read by its primary key from the first one's columns.
+
+The wire target (docs/server_design.md, *Tests*): with BYTECASK_SQL_SERVER
+set, every statement the layer runs also goes, as the same text with its
+$n, to sql_layer_server on a database of its own, through psycopg with
+text-format parameters. The server must agree with the layer exactly
+(the same SQLSTATE, rows, count and block status), and its rows' text must
+be PostgreSQL's, byte for byte, with the same type OIDs.
 A model of the planner's rules (`served`) keeps the machine to statements
 the layer plans; the rest must be refused with "no plan".
 
@@ -43,7 +50,9 @@ import array
 import collections
 import dataclasses
 import decimal
+import os
 import shutil
+import sys
 import tempfile
 
 import bytecask_sql
@@ -54,6 +63,9 @@ from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, 
 
 import oracle as o
 from conftest import Oracle
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
+from pgserver import Server, server_binary  # noqa: E402
 
 TYPES = [o.BIGINT, o.INTEGER, o.SMALLINT, o.DOUBLE, o.REAL, o.numeric(6, 2), o.BOOLEAN, o.TEXT, o.varchar(4), o.BYTEA]
 # Types a column + parameter is supported on, and how PostgreSQL types that
@@ -335,6 +347,26 @@ class SqlMachine(RuleBasedStateMachine):
             raise
         self.tables: dict[str, Table] = {}
         self.txn = None  # the layer's open transaction, if any
+        self.wire = None  # the server's connection, when the wire target runs
+        if server_binary():
+            try:
+                self.wire_dir = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+                self.connect_wire(Server(self.wire_dir))
+            except BaseException:
+                self.teardown()
+                raise
+
+    def connect_wire(self, server: Server) -> None:
+        import psycopg
+
+        self.wire_server = server
+        self.wire = psycopg.connect(server.dsn(), autocommit=True, prepare_threshold=None)
+
+    def stop_wire(self) -> None:
+        if self.wire is not None:
+            self.wire.close()
+            self.wire = None
+            assert self.wire_server.stop() == 0, "".join(self.wire_server.output)
 
     def teardown(self):
         # Every step runs, whichever fails, and the first failure is the one raised.
@@ -347,17 +379,48 @@ class SqlMachine(RuleBasedStateMachine):
             try:
                 self.pg.close()
             finally:
-                shutil.rmtree(self.dir, ignore_errors=True)
+                try:
+                    self.stop_wire()
+                finally:
+                    shutil.rmtree(self.dir, ignore_errors=True)
+                    if hasattr(self, "wire_dir"):
+                        shutil.rmtree(self.wire_dir, ignore_errors=True)
 
     # The two sides --------------------------------------------------------
+
+    def wire_aborted(self) -> bool:
+        import psycopg
+
+        return self.wire.info.transaction_status == psycopg.pq.TransactionStatus.INERROR
+
+    def layer(self, sql: str, params=(), types=None) -> o.Outcome:
+        """Runs a statement on the layer, and on the server when the wire
+        target runs, which must agree with it exactly. The layer's outcome,
+        with the server's text. `types`: each parameter's column type, for
+        the DECIMALs the layer takes scaled (o.to_layer)."""
+        layer_params = [o.to_layer(v, t) for v, t in zip(params, types)] if types else params
+        out = o.run_layer(self.db if self.txn is None else self.txn, sql, layer_params)
+        if self.wire is None:
+            return out
+        wire = o.run_wire(self.wire, sql, params)
+        what = f"{sql} {params!r} on the wire"
+        assert wire.sqlstate == out.sqlstate, (
+            f"{what}: the server {wire.sqlstate or 'ran it'} ({wire.detail}), the layer {out.sqlstate or 'ran it'} "
+            f"({out.detail})")
+        assert o.strict(wire.rows) == o.strict(out.rows), f"{what}: the server returned {wire.rows}, the layer {out.rows}"
+        assert wire.affected == out.affected, f"{what}: the server changed {wire.affected} rows, the layer {out.affected}"
+        if self.txn is not None:
+            assert self.wire_aborted() == self.txn.is_aborted, f"{what}: the server's block status differs"
+        return dataclasses.replace(out, text=wire.text)
 
     def both(self, sql: str, params=(), pg_sql: str | None = None, types=None) -> o.Outcome:
         """Runs a statement on both sides; they must agree. Returns the layer's
         outcome. `types`: each parameter's column type, for the DECIMALs the
         layer takes scaled (o.to_layer)."""
-        layer_params = [o.to_layer(v, t) for v, t in zip(params, types)] if types else params
-        layer = o.run_layer(self.db if self.txn is None else self.txn, sql, layer_params)
+        layer = self.layer(sql, params, types)
         pg = o.run_pg(self.pg.conn, pg_sql or sql, params)
+        if layer.text and pg.text:
+            assert layer.text == pg.text, f"{sql} {params!r}: the server sent {layer.text}, PostgreSQL {pg.text}"
         if currently_in_test_context():  # the fixed cases call the steps outside Hypothesis
             note(f"{sql} {params!r} -> layer {layer.error or 'ok'}, postgres {pg.error or 'ok'}")
         assert layer.error == pg.error, (
@@ -411,7 +474,7 @@ class SqlMachine(RuleBasedStateMachine):
 
     def create_without_pk(self, t: Table) -> None:
         # Known difference: the layer needs a primary key; PostgreSQL does not.
-        out = o.run_layer(self.db, t.ddl(pg=False))
+        out = self.layer(t.ddl(pg=False))
         assert out.error == "refused", f"{t.ddl(pg=False)}: a table without a primary key was accepted"
 
     def drop(self, name: str, if_exists: bool) -> o.Outcome:
@@ -449,7 +512,7 @@ class SqlMachine(RuleBasedStateMachine):
     def no_plan(self, name: str, sql: str, params: list, types: list) -> None:
         """The layer must refuse the statement with no plan; PostgreSQL is not
         asked."""
-        out = o.run_layer(self.db if self.txn is None else self.txn, sql, [o.to_layer(v, ty) for v, ty in zip(params, types)])
+        out = self.layer(sql, params, types)
         if out.error == o.ABORTED:
             return  # the transaction was aborted before: nothing was planned
         assert out.error == "refused" and out.detail.startswith("no plan:"), f"{sql}: planned, expected no plan ({out})"
@@ -484,7 +547,7 @@ class SqlMachine(RuleBasedStateMachine):
         if count:
             self.both(sql, params, pg_sql=pg_sql, types=types)  # one row, or none under LIMIT 0
             return
-        layer = o.run_layer(self.db if self.txn is None else self.txn, sql, [o.to_layer(v, ty) for v, ty in zip(params, types)])
+        layer = self.layer(sql, params, types)
         full = o.run_pg(self.pg.conn, pg_sql.removesuffix(f" LIMIT {limit}" if limit is not None else ""), params)
         assert layer.error == full.error, f"{sql} {params!r}: the layer {layer.error or 'ran it'} ({layer.detail}), PostgreSQL {full.error or 'ran it'} ({full.detail})"
         if layer.error is not None:
@@ -616,6 +679,8 @@ class SqlMachine(RuleBasedStateMachine):
         # at the first statement, not at BEGIN.
         self.txn = self.db.begin()
         assert o.run_pg(self.pg.conn, "BEGIN ISOLATION LEVEL REPEATABLE READ").error is None
+        if self.wire is not None:
+            assert o.run_wire(self.wire, "BEGIN").error is None
 
     def commit(self) -> str:
         """COMMIT on both; returns the outcome, as PostgreSQL's command tag says it.
@@ -629,16 +694,25 @@ class SqlMachine(RuleBasedStateMachine):
             cur.execute("COMMIT")
             pg = cur.statusmessage
         assert layer == pg, f"COMMIT: the layer {layer}, PostgreSQL {pg}"
+        if self.wire is not None:
+            with self.wire.cursor() as cur:
+                cur.execute("COMMIT")
+                assert cur.statusmessage == layer, f"COMMIT: the server {cur.statusmessage}, the layer {layer}"
         return layer
 
     def rollback(self) -> None:
         self.txn.rollback()
         self.txn = None
         assert o.run_pg(self.pg.conn, "ROLLBACK").error is None
+        if self.wire is not None:
+            assert o.run_wire(self.wire, "ROLLBACK").error is None
 
     def reopen(self) -> None:
         self.db.close()
         self.db = bytecask_sql.open(self.dir)
+        if self.wire is not None:  # the server stopped by SIGTERM and started again, on its data
+            self.stop_wire()
+            self.connect_wire(Server(self.wire_dir))
 
     def check(self) -> None:
         names = sorted(t["name"] for t in self.db.catalog())
@@ -1265,9 +1339,9 @@ def test_stored_text_that_is_not_utf8_raises_on_read(tmp_path):
 
 
 def test_every_range_message_maps_to_its_sqlstate(tmp_path):
-    """Each range refusal the layer makes, and the SQLSTATE the oracle gives
-    it: every entry of RANGE_SQLSTATE is produced, so a message reworded in
-    the layer fails here."""
+    """Each range refusal the layer makes, and the SQLSTATE it reports: every
+    message start the layer maps (bytecask_sql._range_messages) is produced,
+    so a message reworded in the layer fails here."""
     db = bytecask_sql.open(str(tmp_path))
     try:
         db.execute("CREATE TABLE r (k BIGINT PRIMARY KEY, s SMALLINT, i INTEGER, f REAL, d NUMERIC(4, 2), "
@@ -1286,6 +1360,7 @@ def test_every_range_message_maps_to_its_sqlstate(tmp_path):
             ("ts", -210_866_803_200_000_001, "22008"),
             ("tm", 86_400_000_001, "22008"),
         ]
+        messages = bytecask_sql._range_messages()
         seen = set()
         for col, value, state in cases:
             params = [1] + [value if c == col else None for c in cols]
@@ -1295,10 +1370,10 @@ def test_every_range_message_maps_to_its_sqlstate(tmp_path):
             except bytecask_sql.ExecError as e:
                 assert e.constraint == "range", (col, value, str(e))
                 assert o.layer_sqlstate(e) == state, (col, value, str(e))
-                seen.update(start for start in o.RANGE_SQLSTATE if str(e).startswith(start))
+                seen.update(start for start, _ in messages if str(e).startswith(start))
             else:
                 raise AssertionError(f"{col} = {value!r} was written")
-        assert seen == set(o.RANGE_SQLSTATE), set(o.RANGE_SQLSTATE) - seen
+        assert seen == {start for start, _ in messages}, {start for start, _ in messages} - seen
     finally:
         db.close()
 
