@@ -10,7 +10,7 @@
 #
 # Usage:
 #   bytecaskdb-sql-layer/hammerdb/run-gate.sh [--warehouses=W] [--vus=1,16,48]
-#       [--rampup=MIN] [--duration=MIN] [--mix="neword payment ostat delivery"]
+#       [--rampup=MIN] [--duration=MIN] [--mix="neword payment ostat delivery slev"]
 #       [--hammerdb-home=PATH] [--data-root=PATH] [--smoke --pg="libpq conninfo"]
 #
 #   --warehouses: warehouses loaded (default 48). Every user count must be at
@@ -18,8 +18,7 @@
 #   --vus:        comma-separated user counts (default 1,16,48).
 #   --rampup:     unmeasured minutes before the window (default 2).
 #   --duration:   measured minutes (default 5).
-#   --mix:        the transaction types the driver runs (default every type
-#                 the layer plans: Stock-Level waits on front-end slice 5).
+#   --mix:        the transaction types the driver runs (default all five).
 #   --hammerdb-home: where hammerdbcli is (default $HAMMERDB_HOME, ~/HammerDB-*,
 #                 or PATH). HammerDB 5.0's Linux release bundles Tcl and pgtcl.
 #   --data-root:  where the load and each cell's copy live (default a temporary
@@ -45,7 +44,7 @@ WAREHOUSES=48
 VUS=1,16,48
 RAMPUP=2
 DURATION=5
-MIX="neword payment ostat delivery"
+MIX="neword payment ostat delivery slev"
 HAMMERDB_HOME="${HAMMERDB_HOME:-}"
 DATA_ROOT=""
 SMOKE=0

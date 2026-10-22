@@ -4,11 +4,13 @@
 // ir.cppm — the statement IR (docs/frontend_design.md, *The statement IR*):
 // what the planner decided, in the form the code generator prints. Every
 // id, type and constant name the printer needs is here, so it never reads
-// the catalog. Slices 0 to 4: point lookups, scans of a key prefix or a
+// the catalog. Slices 0 to 5: point lookups, scans of a key prefix or a
 // range in either direction, the two-range scan of a nullable ordered part,
-// LIMIT, COUNT, SUM and MIN, the join of two point lookups, and UPDATE and
-// DELETE of the rows a point lookup or a scan reaches. Later slices add the
-// design's other shapes; a type admits only what its printer prints.
+// filters on what the key does not express, LIMIT, COUNT, COUNT(DISTINCT),
+// SUM and MIN, the join of two point lookups and the join of a scan to a
+// point lookup by its row's columns, and UPDATE and DELETE of the rows a
+// point lookup or a scan reaches. A type admits only what its printer
+// prints.
 
 module;
 #include <algorithm>
@@ -23,9 +25,12 @@ module;
 
 export module bytecask.sql.ir;
 
+export import bytecask.sql.ast;
 export import bytecask.sql.catalog;
 
 export namespace bytecask::sql::ir {
+
+using Op = ast::Compare::Op;
 
 // A column of the plan's table, as the printer names and decodes it.
 struct Column {
@@ -51,14 +56,40 @@ struct PointGet {
   std::vector<std::uint32_t> key_params;
 };
 
-// One end of a scan, in key order, on the part after the prefix: open (the
-// prefix's first or last entry), a parameter's key part, or the key part
-// that holds NULL; as is, or its successor.
-struct KeyBound {
-  enum class Kind { Open, Param, NullPart };
-  Kind kind{Kind::Open};
+// $param + offset as an INTEGER, computed once before anything is read:
+// BC_C_RANGE on `table` when it leaves INTEGER, as PostgreSQL's operator
+// raises 22003. Named by its index in Plan::computed.
+struct Computed {
   std::uint32_t param{0};
+  std::int64_t offset{0};
+  std::uint32_t table{0};
+};
+
+// One end of a scan, in key order, on the part after the prefix: open (the
+// prefix's first or last entry), a parameter's key part, a computed value's,
+// or the key part that holds NULL; as is, or its successor.
+struct KeyBound {
+  enum class Kind { Open, Param, NullPart, Computed };
+  Kind kind{Kind::Open};
+  std::uint32_t param{0};  // Param: the parameter; Computed: its index
   bool successor{false};
+};
+
+// What a filter compares its column with: a parameter, a computed value, or
+// a column of the join's other row.
+struct Operand {
+  std::uint32_t param{0};
+  std::optional<std::uint32_t> computed;
+  std::optional<Column> column;
+};
+
+// A conjunct the key does not express, run on each row as soon as the row is
+// read, before it is counted, emitted or written. NULL on either side
+// rejects the row. Never on a DOUBLE or REAL column.
+struct Filter {
+  Column col;
+  Op op{Op::Eq};
+  Operand rhs;
 };
 
 struct Range {
@@ -93,8 +124,26 @@ struct PointJoin {
   PointGet rows[2];
 };
 
-// COUNT(*), or COUNT, SUM or MIN of arg over its non-NULL values, each held
-// as an int64_t. Otherwise a loop over the rows; from_keys on a Scan:
+// One part of the inner key of a LoopJoin: a parameter, or a column of the
+// outer row.
+struct KeyPart {
+  std::uint32_t param{0};
+  std::optional<Column> column;
+};
+
+// The outer table scanned, the inner one read by its whole primary key, its
+// parts from parameters and the outer row's columns: an outer row whose
+// column is NULL, or with no inner row, joins nothing. `tables` are the outer
+// table and the inner one, whichever FROM names first.
+struct LoopJoin {
+  std::uint32_t tables[2]{};
+  Scan outer;
+  std::vector<KeyPart> inner_key;  // in the inner primary key's order
+};
+
+// COUNT(*), or COUNT, COUNT(DISTINCT), SUM or MIN of arg over its non-NULL
+// values, each held as an int64_t. Otherwise a loop over the rows; from_keys
+// on a Scan:
 // - COUNT: bc_count_range over its range, which counts its entries
 //   (COUNT(*), or an arg no matching row holds NULL in);
 // - MIN: its first entry, arg being the ASC part after its prefix, and its
@@ -104,16 +153,18 @@ struct Aggregate {
   Fn fn{Fn::Count};
   std::optional<Column> arg;
   bool from_keys{false};
+  bool distinct{false};  // COUNT(DISTINCT arg): its keys grouped, then counted
 };
 
 // The result: the targets of each row, or one aggregate row. No target is a
 // row of no columns, as PostgreSQL's `SELECT FROM`.
 struct Select {
-  std::variant<PointGet, Scan, NullSplitScan, PointJoin> from;
+  std::variant<PointGet, Scan, NullSplitScan, PointJoin, LoopJoin> from;
   std::vector<Column> targets;         // from the row, or from the entry's key when the scan covers
   std::optional<Aggregate> aggregate;  // instead of targets
   std::optional<std::int64_t> limit;
   bool for_update{false};       // each row returned is guarded unchanged: never a covering scan
+  std::vector<Filter> filters;  // in WHERE order; a scan with one never covers
 };
 
 // The columns given, in table order, each from a parameter; the rest keep
@@ -127,10 +178,12 @@ struct Insert {
 struct Update {
   std::variant<PointGet, Scan> rows;
   std::vector<std::pair<Column, Expr>> set;
+  std::vector<Filter> filters;
 };
 
 struct Delete {
   std::variant<PointGet, Scan> rows;
+  std::vector<Filter> filters;
 };
 
 using Statement = std::variant<Select, Insert, Update, Delete>;
@@ -141,6 +194,7 @@ struct Plan {
   std::uint64_t catalog_version{0};
   std::vector<PhysType> param_types;
   Statement stmt;
+  std::vector<Computed> computed;  // what the statement's $n ± k evaluate to
 };
 
 // The scan a SELECT reads by, a NullSplitScan's present values for it; null
@@ -190,6 +244,7 @@ void check(const Plan& p, const Scan& s) {
   for (auto n : s.prefix) check_null_checked(s, n);
   if (const auto* r = std::get_if<Range>(&s.rest)) {
     for (const auto& b : {r->lo, r->hi}) {
+      if (b.kind == KeyBound::Kind::Computed && b.param >= p.computed.size()) broken("a computed bound past the plan's");
       if (b.kind != KeyBound::Kind::Param) continue;
       check_params(p, {b.param});
       check_null_checked(s, b.param);
@@ -202,6 +257,8 @@ void check(const Plan& p, const NullSplitScan& s) { check(p, s.present); }
 void check(const Plan& p, const PointJoin& j) {
   for (const auto& g : j.rows) check(p, g);
 }
+
+void check(const Plan& p, const LoopJoin& j) { check(p, j.outer); }
 
 void check(const Plan& p, const Select& s) {
   const auto* scan = scan_of(s);

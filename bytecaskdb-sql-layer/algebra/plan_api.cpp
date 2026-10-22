@@ -76,6 +76,10 @@ static_assert(static_cast<int>(PhysType::Bytes) == BC_T_BYTES);
 namespace {
 
 constexpr std::uint32_t kNoCursor = UINT32_MAX;
+// What an aggregate group holds besides its key's bytes, counted against the
+// aggregate's bound: a map node (tree links, the key's header, the index),
+// the allocator's headers for it and the key, and the order entry.
+constexpr std::uint64_t kGroupOverhead = 112;
 // What a transaction's bound counts for what it holds: a conservative bound,
 // never less than the memory used. Each heap block costs its capacity plus
 // the allocator's header and rounding (kAllocBytes, an over-estimate); a map
@@ -153,7 +157,30 @@ struct Claim {
   // An index entry's: taken by another row's entry with these first bytes,
   // never by this row's own entry, which a racing update of it also writes.
   std::optional<std::size_t> prefix_len;
+  // How many of the transaction's locks came from statements up to and
+  // including this claim's: one of them a concurrent commit changed is the
+  // conflict PostgreSQL reports first, at the row, before the duplicate (an
+  // UPDATE locks its old row before it checks the value it moves to).
+  std::size_t locks_through{0};
 };
+
+// A row a statement locked (FOR UPDATE) or wrote (UPDATE, DELETE), as the
+// transaction's snapshot held it: a fingerprint of its stored bytes, so a
+// conflicting commit can tell whether a concurrent commit changed it.
+struct Lock {
+  Bytes key;
+  std::uint64_t fingerprint;
+};
+
+// FNV-1a: stable, and only ever compared within one process.
+[[nodiscard]] auto row_fingerprint(BytesView row) -> std::uint64_t {
+  std::uint64_t h = 14'695'981'039'346'656'037ULL;
+  for (auto b : row) {
+    h ^= std::to_integer<std::uint64_t>(b);
+    h *= 1'099'511'628'211ULL;
+  }
+  return h;
+}
 
 // A declared column, where it lives in its table's current layout.
 struct ColSlot {
@@ -350,6 +377,7 @@ struct Cursor {
   Bytes row;      // on an index: the current entry's row, once bc_scan_row fetched it
   Bytes row_key;  // the row's key, rebuilt in place: no allocation per entry
   std::uint64_t row_step{0};  // the step `row` was fetched at; 0: none
+  std::vector<Bytes> col_keys;  // bc_col_key's keys of the current entry, dropped when it moves
 };
 
 
@@ -538,6 +566,7 @@ struct bc_ctx {
   std::vector<RowBuilder> rows;
   std::vector<Effect> effects;
   std::vector<Claim> claims;  // this statement's or execution's, in the order its writes made them
+  std::vector<Lock> locks;    // a transaction statement's rows locked or written, read from the snapshot
   // The row keys this execution's writes touched, and whether the row is
   // there after the write: a second write of one row would derive its index
   // entries from the snapshot's row again, not from the first write's, and
@@ -549,6 +578,19 @@ struct bc_ctx {
   // id: the snapshot does not hold them, so without this two rows of one
   // statement could share one (#507). Kept and reset as written_rows.
   std::set<std::pair<std::uint32_t, Bytes>> unique_written;
+  // The aggregates bc_agg_open made: their groups' keys, in first-appearance
+  // order. Kept until reset; a group key's view reads its Bytes, which a
+  // move of the vector keeps where it is.
+  // Each group's key is held once, in `index`; `order` points at it, in
+  // first-appearance order (a map node never moves).
+  struct Agg {
+    std::uint64_t bound;  // the bytes its groups may hold, kGroupOverhead each included
+    std::uint64_t used{0};
+    std::map<Bytes, std::uint32_t, BytesLess> index;
+    std::vector<const Bytes*> order;
+    std::size_t next{0};
+  };
+  std::vector<Agg> aggs;
   // Where each part of the last key a key-part decoder read starts, so the
   // next part of the same key is found without skipping the earlier ones
   // again. Keyed by the view handle, unique within an execution.
@@ -785,8 +827,10 @@ struct bc_ctx {
     pinned.reset();  // an idle context keeps no superseded catalog alive
     written_rows.clear();
     unique_written.clear();
+    aggs.clear();
     deleted_ranges.clear();
     claims.clear();
+    locks.clear();
     has_ref = false;  // set by the next run's verification
     key_slots.clear();
     key_parts.view = {};  // view handles repeat across executions once the epoch wraps
@@ -831,6 +875,8 @@ struct bc_txn {
   std::uint64_t guard_bytes{0};        // what the guards' keys hold
   std::vector<Claim> claims;           // the statements' insert claims, in their order
   std::uint64_t claim_bytes{0};        // what the claims' keys hold
+  std::vector<Lock> locks;             // the statements' rows locked or written, in their order
+  std::uint64_t lock_bytes{0};         // what the locks' keys hold
   std::vector<std::uint32_t> written;  // the tables the writes are in
   std::uint64_t statements{0};         // statements wholly added
   // A statement failed: nothing but bc_txn_free is left. Set before any
@@ -885,6 +931,8 @@ void txn_abort(bc_txn* txn) noexcept {
   txn->guard_bytes = 0;
   txn->claims = {};
   txn->claim_bytes = 0;
+  txn->locks = {};
+  txn->lock_bytes = 0;
   txn->written = {};
 }
 
@@ -1281,18 +1329,29 @@ auto written_tables(const Catalog& cat, const std::vector<Effect>& effects) -> s
 // state has taken one of its claims, the first in their order (BC_FAILED,
 // BC_C_UNIQUE on the claim's table or index), else the conflict. Nothing was
 // written either way; a check that cannot read reports the conflict.
+// The first conflict in statement order decides, as in PostgreSQL, where an
+// earlier statement's lock or write of a row a concurrent commit changed
+// fails at that statement: before each claim, the locks of the statements
+// up to its own are checked, and one whose row changed is the conflict. A
+// row changed back to the same bytes counts as unchanged.
 // A transaction's claim counts while its writes still put the key: one a
 // later statement moved or deleted away claims nothing (`overlay`, null for
 // an execution, whose one statement writes a row once). An index claim is
 // taken only by another row's entry: a concurrent update of the same row to
 // the same value is the conflict on that row, 40001.
-[[nodiscard]] auto conflict_or_duplicate(ErrorSink out, bytecask::DB& db, std::span<const Claim> claims, const Overlay* overlay)
-    -> bc_commit_result {
+[[nodiscard]] auto conflict_or_duplicate(ErrorSink out, bytecask::DB& db, std::span<const Claim> claims,
+                                         std::span<const Lock> locks, const Overlay* overlay) -> bc_commit_result {
   if (claims.empty()) return BC_CONFLICT;
   try {
     auto latest = db.snapshot();
+    Bytes now;
+    std::size_t checked = 0;
     for (const auto& c : claims) {
       if (overlay != nullptr && !overlay->puts(c.key)) continue;
+      for (; checked < c.locks_through; ++checked) {
+        const auto& l = locks[checked];
+        if (!latest.get({}, l.key, now) || row_fingerprint(now) != l.fingerprint) return BC_CONFLICT;
+      }
       auto taken = c.prefix_len ? holds_prefix(latest, BytesView{c.key}.first(*c.prefix_len), BytesView{c.key})
                                 : latest.contains_key({}, c.key);
       if (taken) {
@@ -1652,6 +1711,15 @@ struct Entry {
   return true;
 }
 
+// A row a transaction's statement locks or writes, kept for the commit's
+// conflict order. One the overlay holds was an earlier statement's write,
+// recorded then, or its insert, a claim; an execution's one statement has
+// no statements before it.
+void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
+  if (cx->txn == nullptr || (cx->overlay != nullptr && cx->overlay->find(pk))) return;
+  cx->locks.push_back({Bytes(pk.begin(), pk.end()), row_fingerprint(row)});
+}
+
 // No entry has this unique index prefix in the view, and no earlier write
 // of this execution gave a row it, or BC_C_UNIQUE on the index; the range guard covers the race, since a duplicate is another
 // row's entry, a key this plan does not write.
@@ -1960,14 +2028,15 @@ namespace {
 // hold with the statement's effects in it, without merging them: a vector
 // grows at most to twice what it holds, each effect adds at most one node,
 // and an effect that replaces or erases others only frees.
-auto txn_holds(const bc_txn& t, std::size_t more_guards, std::size_t more_claims, std::size_t more_written)
-    -> std::uint64_t {
+auto txn_holds(const bc_txn& t, std::size_t more_guards, std::size_t more_claims, std::size_t more_locks,
+               std::size_t more_written) -> std::uint64_t {
   auto vec = [](std::size_t cap, std::size_t size, std::size_t more, std::size_t elem) -> std::uint64_t {
     return held(std::max(cap, 2 * (size + more)) * elem);
   };
-  return t.overlay.bytes + t.guard_bytes + t.claim_bytes +
+  return t.overlay.bytes + t.guard_bytes + t.claim_bytes + t.lock_bytes +
          vec(t.guards.capacity(), t.guards.size(), more_guards, sizeof(Effect)) +
          vec(t.claims.capacity(), t.claims.size(), more_claims, sizeof(Claim)) +
+         vec(t.locks.capacity(), t.locks.size(), more_locks, sizeof(Lock)) +
          vec(t.written.capacity(), t.written.size(), more_written, sizeof(std::uint32_t));
 }
 
@@ -1997,8 +2066,9 @@ bool bc_txn_add(bc_ctx* cx) {
     if (!is_write(e)) ++guards;
   }
   for (const auto& c : cx->claims) pending += held(c.key.capacity());
+  for (const auto& l : cx->locks) pending += held(l.key.capacity());
   auto tables = written_tables(*txn->pinned, cx->effects);
-  if (txn_holds(*txn, guards, cx->claims.size(), tables.size()) + pending > txn->max_bytes) {
+  if (txn_holds(*txn, guards, cx->claims.size(), cx->locks.size(), tables.size()) + pending > txn->max_bytes) {
     cx->fail(BC_E_LIMIT, "the transaction's writes would pass its bound of " + std::to_string(txn->max_bytes) +
                              " bytes");
     txn_abort(txn);
@@ -2025,11 +2095,20 @@ bool bc_txn_add(bc_ctx* cx) {
     }
   }
   cx->effects.clear();
+  // This statement's claims come after its own locks too: its old rows are
+  // locked before the values it puts are checked.
+  const auto locks_through = txn->locks.size() + cx->locks.size();
   for (auto& c : cx->claims) {
+    c.locks_through = locks_through;
     txn->claim_bytes += held(c.key.capacity());
     txn->claims.push_back(std::move(c));
   }
   cx->claims.clear();
+  for (auto& l : cx->locks) {
+    txn->lock_bytes += held(l.key.capacity());
+    txn->locks.push_back(std::move(l));
+  }
+  cx->locks.clear();
   ++txn->statements;
   txn->aborted = false;
   return true;
@@ -2095,7 +2174,7 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
   // since its snapshot, makes the commit a conflict.
   for (auto id : txn->written) plan.ensure_unchanged(bytecask::sql::table_record_key(id));
   auto r = submit(out, *txn->db, std::move(plan), sync);
-  return r == BC_CONFLICT ? conflict_or_duplicate(out, *txn->db, txn->claims, &txn->overlay) : r;
+  return r == BC_CONFLICT ? conflict_or_duplicate(out, *txn->db, txn->claims, txn->locks, &txn->overlay) : r;
   BC_GUARD_END(txn)
   return BC_FAILED;  // the guard caught a throw: never BC_COMMITTED
 }
@@ -2117,7 +2196,7 @@ int bc_execute(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* ref, const bc_p
     if (r != BC_CONFLICT) return r;
     // A retry's own checks see what the conflict was; the last is told the
     // way a transaction's commit is.
-    if (attempt >= max_retries) return conflict_or_duplicate(cx->sink(), *cx->db, cx->claims, nullptr);
+    if (attempt >= max_retries) return conflict_or_duplicate(cx->sink(), *cx->db, cx->claims, {}, nullptr);
   }
 }
 
@@ -2508,6 +2587,14 @@ bc_view bc_key_end(bc_ctx* cx, bc_key k) {
   return {};
 }
 
+bool bc_key_fits(bc_ctx* cx, bc_key k) {
+  BC_GUARD_BEGIN
+  const auto* b = cx->resolve_handle(k, cx->keys, "key builder");
+  return b != nullptr && b->buf.size() <= bytecask::sql::kMaxKeyBytes;
+  BC_GUARD_END(cx)
+  return false;
+}
+
 bc_view bc_key_params(bc_ctx* cx, uint32_t table_or_index, uint32_t first, uint32_t n) {
   BC_GUARD_BEGIN
   const auto* kl = cx->key_layout(table_or_index);
@@ -2592,6 +2679,7 @@ bool bc_scan_next(bc_ctx* cx, bc_cursor h) {
   c = cx->resolve_handle(h, cx->cursors, "cursor");
   if (c == nullptr || c->done) return false;
   ++c->step;  // every view of the previous entry is now stale
+  c->col_keys.clear();
   c->positioned = cursor_advance(cx, *c);
   if (!c->positioned) c->done = true;
   return c->positioned && cx->ok();
@@ -2660,6 +2748,7 @@ void bc_scan_close(bc_ctx* cx, bc_cursor h) {
   auto* c = cx->resolve_handle(h, cx->cursors, "cursor");
   if (c == nullptr) return;
   ++c->step;
+  c->col_keys.clear();
   c->entries.reset();
   c->done = true;
   c->positioned = false;
@@ -2789,13 +2878,65 @@ bc_view bc_col_bytes(bc_ctx* cx, bc_view row, uint32_t col) {
   return {};
 }
 
+bc_view bc_col_key(bc_ctx* cx, bc_view row, uint32_t col) {
+  BC_GUARD_BEGIN
+  auto rc = row_col(cx, row, col, std::nullopt);
+  if (!rc) return {};
+  auto v = read_column(cx, *rc);
+  if (!v) return {};
+  // Nullable and ascending: NULL is the marker alone. A DOUBLE's -0.0 and
+  // 0.0 encode alike, and every NaN as one, so equal values group as
+  // PostgreSQL groups them.
+  bytecask::sql::KeyPart part{rc->slot->type, true, false, false};
+  Bytes key;
+  if (v->state == bytecask::sql::ColumnState::Absent) {
+    bytecask::sql::key_put_null(key, part);
+  } else {
+    switch (rc->slot->type) {
+      case PhysType::I64: bytecask::sql::key_put_i64(key, v->i64(), part); break;
+      case PhysType::F64: bytecask::sql::key_put_f64(key, v->f64(), part); break;
+      case PhysType::Bool: bytecask::sql::key_put_bool(key, v->boolean(), part); break;
+      case PhysType::Bytes: bytecask::sql::key_put_bytes(key, v->bytes, part); break;
+    }
+  }
+  // A group key, not an engine key: no key ceiling. A cursor's row keeps
+  // its keys until the cursor moves, so a scan holds one entry's at a time;
+  // any other row's go in the arena with it.
+  auto [cursor, step] = cx->owner(row);
+  if (cursor == kNoCursor) return cx->arena_view(key);
+  auto& held = cx->cursors[cursor].col_keys;
+  held.push_back(std::move(key));
+  return cx->make_view(held.back().data(), held.back().size(), cursor, step);
+  BC_GUARD_END(cx)
+  return {};
+}
+
+int64_t bc_check_int(bc_ctx* cx, int64_t v, uint32_t int_type, uint32_t object_id) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return 0;
+  switch (int_type) {
+    case BC_SMALLINT:
+      if (v >= INT16_MIN && v <= INT16_MAX) return v;
+      cx->raise(BC_C_RANGE, object_id, "smallint out of range");
+      return 0;
+    case BC_INTEGER:
+      if (v >= INT32_MIN && v <= INT32_MAX) return v;
+      cx->raise(BC_C_RANGE, object_id, "integer out of range");
+      return 0;
+    default: cx->fail(BC_E_HANDLE, "bc_check_int: an unknown integer type"); return 0;
+  }
+  BC_GUARD_END(cx)
+  return {};
+}
+
 namespace {
-// The primary key of a row of `table`, from its columns.
-[[nodiscard]] auto row_pk(bc_ctx* cx, std::uint32_t table, bc_view row, Bytes& key) -> bool {
+// The row's primary key into `key`, and the row's bytes; nullopt on an error.
+[[nodiscard]] auto row_pk(bc_ctx* cx, std::uint32_t table, bc_view row, Bytes& key) -> std::optional<BytesView> {
   const auto* t = cx->table(table);
-  if (t == nullptr) return false;
+  if (t == nullptr) return std::nullopt;
   auto r = write_row(cx, *t, row, false);
-  return r && encode_pk(cx, *t, *r, key);
+  if (!r || !encode_pk(cx, *t, *r, key)) return std::nullopt;
+  return r;
 }
 }  // namespace
 
@@ -3022,17 +3163,37 @@ bool bc_hash_next(bc_ctx* cx, bc_hash_iter, bc_view*) {
   BC_GUARD_END(cx)
   return {};
 }
-bc_agg bc_agg_open(bc_ctx* cx, uint32_t, uint32_t) {
+// Groups only: the slot calls are not implemented yet, so slots must be 0.
+// A group's handle names its index in the aggregate.
+bc_agg bc_agg_open(bc_ctx* cx, uint32_t bytes, uint32_t slots) {
   BC_GUARD_BEGIN
-  cx->unimplemented("bc_agg_open");
-  return {};
+  if (!cx->ok()) return {};
+  if (slots != 0) {
+    cx->unimplemented("bc_agg_open with slots");
+    return {};
+  }
+  cx->aggs.push_back(bc_ctx::Agg{bytes});
+  return {static_cast<std::uint32_t>(cx->aggs.size() - 1), cx->epoch};
   BC_GUARD_END(cx)
   return {};
 }
-bc_group bc_agg_group(bc_ctx* cx, bc_agg, bc_view) {
+bc_group bc_agg_group(bc_ctx* cx, bc_agg a, bc_view group_key) {
   BC_GUARD_BEGIN
-  cx->unimplemented("bc_agg_group");
-  return {};
+  auto* agg = cx->resolve_handle(a, cx->aggs, "aggregate");
+  if (agg == nullptr) return {};
+  auto key = cx->resolve(group_key);
+  if (!key || !cx->ok()) return {};
+  if (auto it = agg->index.find(*key); it != agg->index.end()) return {it->second, cx->epoch};
+  const auto cost = key->size() + kGroupOverhead;
+  if (agg->used + cost > agg->bound) {
+    cx->fail(BC_E_MEMORY, "aggregate over its bound of " + std::to_string(agg->bound) + " bytes");
+    return {};
+  }
+  auto i = static_cast<std::uint32_t>(agg->order.size());
+  auto it = agg->index.emplace(Bytes(key->begin(), key->end()), i).first;
+  agg->order.push_back(&it->first);
+  agg->used += cost;
+  return {i, cx->epoch};
   BC_GUARD_END(cx)
   return {};
 }
@@ -3041,10 +3202,16 @@ void bc_agg_add_f64(bc_ctx* cx, bc_group, uint32_t, double) { cx->unimplemented(
 void bc_agg_min_i64(bc_ctx* cx, bc_group, uint32_t, int64_t) { cx->unimplemented("bc_agg_min_i64"); }
 void bc_agg_max_i64(bc_ctx* cx, bc_group, uint32_t, int64_t) { cx->unimplemented("bc_agg_max_i64"); }
 void bc_agg_count(bc_ctx* cx, bc_group, uint32_t) { cx->unimplemented("bc_agg_count"); }
-bool bc_agg_next(bc_ctx* cx, bc_agg, bc_view*, bc_group*) {
+bool bc_agg_next(bc_ctx* cx, bc_agg a, bc_view* group_key, bc_group* g) {
   BC_GUARD_BEGIN
-  cx->unimplemented("bc_agg_next");
-  return false;
+  auto* agg = cx->resolve_handle(a, cx->aggs, "aggregate");
+  if (agg == nullptr || agg->next >= agg->order.size()) return false;
+  if (!cx->charge()) return false;
+  auto i = agg->next++;
+  const auto& k = *agg->order[i];
+  if (group_key != nullptr) *group_key = cx->make_view(k.data(), k.size());
+  if (g != nullptr) *g = {static_cast<std::uint32_t>(i), cx->epoch};
+  return true;
   BC_GUARD_END(cx)
   return {};
 }
@@ -3129,6 +3296,7 @@ void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {
       return;
     }
   }
+  lock_row(cx, pk_old, *o);
   if (moved_pk) {
     cx->push_effect(EffectKind::Del, std::move(pk_old));
     cx->push_effect(EffectKind::Put, std::move(pk_new), *n);
@@ -3154,6 +3322,7 @@ void bc_delete(bc_ctx* cx, uint32_t table, bc_view old) {
   for (std::size_t i = 0; i < t->indexes.size(); ++i) {
     if (!encode_entry(cx, *t, t->indexes[i], *o, entries[i])) return;
   }
+  lock_row(cx, pk, *o);
   cx->push_effect(EffectKind::Del, std::move(pk));
   for (auto& e : entries) cx->push_effect(EffectKind::Del, std::move(e.key));
   BC_GUARD_END(cx)
@@ -3219,7 +3388,9 @@ void bc_guard_row(bc_ctx* cx, uint32_t table, bc_view row) {
   // The key goes straight into the guard, not through the arena: a FOR
   // UPDATE scan guards every row it returns.
   Bytes key;
-  if (!row_pk(cx, table, row, key)) return;
+  auto r = row_pk(cx, table, row, key);
+  if (!r) return;
+  lock_row(cx, key, *r);
   cx->push_effect(EffectKind::GuardUnchanged, std::move(key));
   BC_GUARD_END(cx)
 }

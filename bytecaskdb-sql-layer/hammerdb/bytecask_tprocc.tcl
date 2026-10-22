@@ -24,7 +24,7 @@ set user "tprocc" ;# Any name: trust authentication
 set db "tprocc" ;# The database name the server serves
 set warehouses 1 ;# Warehouses loaded
 set run 1 ;# The harness_run the run script took for this cell: the h_ids' top bits
-set mix {neword payment ostat delivery} ;# Transaction types to run; slev once front-end slice 5 lands
+set mix {neword payment ostat delivery slev} ;# Transaction types to run
 set engine "ByteCaskDB" ;# The name HammerDB's result line gives the system
 #OPTIONS
 
@@ -290,8 +290,9 @@ proc transactions_so_far {} {
     return $total
 }
 
-# HammerDB's timed monitor, with NOPM from d_next_o_id and TPM from the
-# users' own counts.
+# HammerDB's timed monitor. NOPM is HammerDB's: the change in d_next_o_id,
+# committed New-Orders only, as sql_layer_tprocc counts it too. TPM is
+# every transaction the users ended, committed or rolled back.
 proc monitor { host port user db rampup duration warehouses totalvirtualusers engine } {
         set conn [ connect $host $port $user $db ]
         puts "Beginning rampup time of $rampup minutes"

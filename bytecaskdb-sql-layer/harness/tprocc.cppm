@@ -20,6 +20,7 @@ module;
 #include <exception>
 #include <format>
 #include <functional>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -91,6 +92,10 @@ struct KindStats {
   std::uint64_t completed{0};
   std::uint64_t retries{0};    // attempts that ended in SerializationFailure and were rerun
   std::uint64_t abandoned{0};  // still SerializationFailure on the last attempt
+  // Completed by the client's own rollback: New-Order's 1% on an unused
+  // item. In TPM, as HammerDB counts a rollback; not in NOPM, which is
+  // HammerDB's committed New-Orders, the change in d_next_o_id.
+  std::uint64_t rolled_back{0};
   Histogram latency;           // first attempt's start to the completing commit
 };
 
@@ -102,7 +107,8 @@ struct PhaseReport {
   std::int64_t fsyncs{0};
   std::int64_t group_writer_batches{0};
   [[nodiscard]] auto tpm() const -> double;
-  [[nodiscard]] auto nopm() const -> std::optional<double>;  // nullopt while New-Order is not in the mix
+  // Committed New-Orders per minute; nullopt while New-Order is not in the mix.
+  [[nodiscard]] auto nopm() const -> std::optional<double>;
 };
 
 struct RunOptions {
@@ -117,7 +123,7 @@ struct RunOptions {
 
 inline constexpr int kMaxAttempts = 10;
 
-// The transactions in the mix today. Each later front-end slice adds its own.
+// The transactions in the mix today: all but Stock-Level, which comes next.
 [[nodiscard]] auto mix() -> std::vector<Kind>;
 
 // Runs each phase on the loaded database, handing each report to
@@ -192,6 +198,7 @@ auto nurand(Rng& rng, std::int64_t a, std::int64_t x, std::int64_t y, std::int64
 constexpr std::int64_t kCLastLoad = 157;
 constexpr std::int64_t kCLastRun = 223;
 constexpr std::int64_t kCId = 259;
+constexpr std::int64_t kOlIId = 7'911;
 
 constexpr std::array<std::string_view, 10> kSyllables{"BAR", "OUGHT", "ABLE", "PRI", "PRES",
                                                       "ESE", "ANTI",  "CALLY", "ATION", "EING"};
@@ -413,11 +420,11 @@ auto PhaseReport::tpm() const -> double {
 auto PhaseReport::nopm() const -> std::optional<double> {
   const auto in_mix = mix();
   if (std::ranges::find(in_mix, Kind::NewOrder) == in_mix.end()) return std::nullopt;
-  return seconds > 0 ? static_cast<double>(kinds[static_cast<std::size_t>(Kind::NewOrder)].completed) * 60.0 / seconds
-                     : 0.0;
+  const auto& n = kinds[static_cast<std::size_t>(Kind::NewOrder)];
+  return seconds > 0 ? static_cast<double>(n.completed - n.rolled_back) * 60.0 / seconds : 0.0;
 }
 
-auto mix() -> std::vector<Kind> { return {Kind::Payment, Kind::OrderStatus}; }
+auto mix() -> std::vector<Kind> { return {Kind::NewOrder, Kind::Payment, Kind::OrderStatus, Kind::Delivery}; }
 
 namespace {
 
@@ -454,9 +461,36 @@ struct Statements {
         o4{db.prepare("SELECT o_id, o_carrier_id, o_entry_d FROM orders WHERE o_d_id = $1 AND o_w_id = $2 "
                       "AND o_c_id = $3 ORDER BY o_id DESC LIMIT 1")},
         o5{db.prepare("SELECT ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_delivery_d FROM order_line "
-                      "WHERE ol_o_id = $1 AND ol_d_id = $2 AND ol_w_id = $3")} {}
+                      "WHERE ol_o_id = $1 AND ol_d_id = $2 AND ol_w_id = $3")},
+        n1{db.prepare("SELECT c_discount, c_last, c_credit, w_tax FROM customer, warehouse WHERE w_id = $1 "
+                      "AND c_w_id = $1 AND c_d_id = $2 AND c_id = $3")},
+        n2{db.prepare("SELECT d_next_o_id, d_tax FROM district WHERE d_id = $1 AND d_w_id = $2 FOR UPDATE")},
+        n3{db.prepare("UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_id = $1 AND d_w_id = $2")},
+        n4{db.prepare("SELECT i_price, i_name, i_data FROM item WHERE i_id = $1")},
+        n5{db.prepare("SELECT s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, "
+                      "s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10 FROM stock WHERE s_i_id = $1 "
+                      "AND s_w_id = $2")},
+        n6{db.prepare("UPDATE stock SET s_quantity = $1 WHERE s_i_id = $2 AND s_w_id = $3")},
+        n7{db.prepare("INSERT INTO order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, "
+                      "ol_quantity, ol_amount, ol_dist_info) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)")},
+        n8{db.prepare("INSERT INTO orders (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_ol_cnt, o_all_local) "
+                      "VALUES ($1, $2, $3, $4, $5, $6, $7)")},
+        n9{db.prepare("INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES ($1, $2, $3)")},
+        d1{db.prepare("SELECT no_o_id FROM new_order WHERE no_w_id = $1 AND no_d_id = $2 ORDER BY no_o_id "
+                      "LIMIT 1")},
+        d2{db.prepare("DELETE FROM new_order WHERE no_w_id = $1 AND no_d_id = $2 AND no_o_id = $3")},
+        d3{db.prepare("SELECT o_c_id FROM orders WHERE o_id = $1 AND o_d_id = $2 AND o_w_id = $3")},
+        d4{db.prepare("UPDATE orders SET o_carrier_id = $1 WHERE o_id = $2 AND o_d_id = $3 AND o_w_id = $4")},
+        d5{db.prepare("UPDATE order_line SET ol_delivery_d = $1 WHERE ol_o_id = $2 AND ol_d_id = $3 "
+                      "AND ol_w_id = $4")},
+        d6{db.prepare("SELECT SUM(ol_amount) FROM order_line WHERE ol_o_id = $1 AND ol_d_id = $2 "
+                      "AND ol_w_id = $3")},
+        d7{db.prepare("UPDATE customer SET c_balance = c_balance + $1 WHERE c_id = $2 AND c_d_id = $3 "
+                      "AND c_w_id = $4")} {}
   const Statement &p1, &p2, &p3, &p4, &p5, &p6, &p7, &p8, &p9, &p10, &p11;
   const Statement &o1, &o2, &o3, &o4, &o5;
+  const Statement &n1, &n2, &n3, &n4, &n5, &n6, &n7, &n8, &n9;
+  const Statement &d1, &d2, &d3, &d4, &d5, &d6, &d7;
 };
 
 // A customer: by last name, or by id.
@@ -476,6 +510,21 @@ struct PaymentInput {
 
 struct OrderStatusInput {
   Customer c;
+};
+
+struct OrderLineInput {
+  std::int64_t i_id{0}, supply_w{0}, quantity{0};
+};
+
+struct NewOrderInput {
+  std::int64_t w{0}, d{0}, c_id{0};
+  std::vector<OrderLineInput> lines;
+  bool all_local{true};
+  std::int64_t date{0};
+};
+
+struct DeliveryInput {
+  std::int64_t w{0}, carrier{0}, date{0};
 };
 
 // The customer a last name selects: the one at position ceil(n / 2) by
@@ -548,6 +597,57 @@ void order_status(const Statements& s, Transaction& t, const OrderStatusInput& i
   (void)t.commit();
 }
 
+// New-Order (clause 2.4.2), as HammerDB's client-side driver runs it. An
+// unused item id on the last line, 1% of them, makes the client roll back
+// (clause 2.4.2.3): false. As in HammerDB, a line's amount carries the
+// taxes and the discount, which the specification applies to the order's
+// total only.
+auto new_order(const Statements& s, Transaction& t, const NewOrderInput& in) -> bool {
+  auto customer = t.execute(s.n1, {in.w, in.d, in.c_id}).rows.at(0);
+  auto district = t.execute(s.n2, {in.d, in.w}).rows.at(0);
+  const auto o_id = i64(district.at(0));
+  (void)t.execute(s.n3, {in.d, in.w});
+  (void)t.execute(s.n8, {o_id, in.d, in.w, in.c_id, in.date, std::ssize(in.lines),
+                         std::int64_t{in.all_local ? 1 : 0}});
+  (void)t.execute(s.n9, {o_id, in.d, in.w});
+  // The taxes and the discount are NUMERIC(4, 4): ten-thousandths.
+  const auto tax = 10'000 + i64(customer.at(3)) + i64(district.at(1));
+  const auto discount = i64(customer.at(0));
+  for (std::int64_t number = 1; const auto& line : in.lines) {
+    auto item = t.execute(s.n4, {line.i_id});
+    if (item.rows.empty()) {
+      t.rollback();
+      return false;
+    }
+    const auto price = i64(item.rows[0].at(0));
+    auto stock = t.execute(s.n5, {line.i_id, line.supply_w}).rows.at(0);
+    auto quantity = i64(stock.at(0)) - line.quantity;
+    if (quantity < 10) quantity += 91;  // restocked (clause 2.4.2.2)
+    (void)t.execute(s.n6, {quantity, line.i_id, line.supply_w});
+    const auto amount = (line.quantity * price * tax * (10'000 - discount) + 50'000'000) / 100'000'000;
+    (void)t.execute(s.n7, {o_id, in.d, in.w, number++, line.i_id, line.supply_w, line.quantity, cents(amount),
+                           stock.at(static_cast<std::size_t>(in.d + 1))});
+  }
+  (void)t.commit();
+  return true;
+}
+
+// Delivery (clause 2.7.4): each district's oldest undelivered order, in one
+// transaction.
+void delivery(const Statements& s, Transaction& t, const DeliveryInput& in) {
+  for (std::int64_t d = 1; d <= kDistricts; ++d) {
+    auto oldest = t.execute(s.d1, {in.w, d});
+    if (oldest.rows.empty()) continue;  // the district has no undelivered order
+    const auto o_id = oldest.rows[0].at(0);
+    (void)t.execute(s.d2, {in.w, d, o_id});
+    const auto c_id = t.execute(s.d3, {o_id, d, in.w}).rows.at(0).at(0);
+    (void)t.execute(s.d4, {in.carrier, o_id, d, in.w});
+    (void)t.execute(s.d5, {in.date, o_id, d, in.w});
+    auto total = t.execute(s.d6, {o_id, d, in.w}).rows.at(0).at(0);
+    (void)t.execute(s.d7, {std::move(total), c_id, d, in.w});
+  }
+  (void)t.commit();
+}
 
 struct Worker {
   const Statements& s;
@@ -586,8 +686,29 @@ struct Worker {
   void one(Database& db, Kind k, std::int64_t home, Clock::time_point from, Clock::time_point until) {
     PaymentInput pay;
     OrderStatusInput os;
+    NewOrderInput no;
+    DeliveryInput del;
     const auto d = uniform(rng, 1, kDistricts);
     switch (k) {
+      case Kind::NewOrder: {
+        no.w = home;
+        no.d = d;
+        no.c_id = nurand(rng, 1023, 1, scale.customers, kCId);
+        const auto rollback = uniform(rng, 1, 100) == 1;
+        const auto count = uniform(rng, 5, 15);
+        for (std::int64_t n = 1; n <= count; ++n) {
+          OrderLineInput line{nurand(rng, 8191, 1, scale.items, kOlIId), home, uniform(rng, 1, 10)};
+          if (rollback && n == count) line.i_id = scale.items + 1;
+          if (warehouses > 1 && uniform(rng, 1, 100) == 1) {
+            line.supply_w = uniform(rng, 1, warehouses - 1);
+            if (line.supply_w >= home) ++line.supply_w;
+            no.all_local = false;
+          }
+          no.lines.push_back(line);
+        }
+        no.date = now_us();
+        break;
+      }
       case Kind::Payment: {
         pay.w = home;
         pay.d = d;
@@ -604,22 +725,22 @@ struct Worker {
         break;
       }
       case Kind::OrderStatus: os.c = customer(home, d); break;
-      case Kind::NewOrder:
-      case Kind::Delivery:
+      case Kind::Delivery: del = {home, uniform(rng, 1, 10), now_us()}; break;
       case Kind::StockLevel: throw std::logic_error("not in the mix yet");
     }
     auto& st = stats[static_cast<std::size_t>(k)];
     const auto start = Clock::now();
     std::uint64_t retries = 0;
     auto completed = false;
+    auto rolled_back = false;
     for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
       try {
         auto t = db.begin();
         switch (k) {
           case Kind::Payment: payment(s, t, pay); break;
           case Kind::OrderStatus: order_status(s, t, os); break;
-          case Kind::NewOrder:
-          case Kind::Delivery:
+          case Kind::NewOrder: rolled_back = !new_order(s, t, no); break;
+          case Kind::Delivery: delivery(s, t, del); break;
           case Kind::StockLevel: break;
         }
         completed = true;
@@ -633,6 +754,7 @@ struct Worker {
     st.retries += retries;
     if (completed) {
       ++st.completed;
+      if (rolled_back) ++st.rolled_back;
       st.latency.add(end - start);
     } else {
       ++st.abandoned;
@@ -751,6 +873,7 @@ void run(Database& db, const RunOptions& opts, const std::function<void(const Ph
         r.kinds[k].completed += w.stats[k].completed;
         r.kinds[k].retries += w.stats[k].retries;
         r.kinds[k].abandoned += w.stats[k].abandoned;
+        r.kinds[k].rolled_back += w.stats[k].rolled_back;
         r.kinds[k].latency.merge(w.stats[k].latency);
       }
     }
@@ -760,16 +883,96 @@ void run(Database& db, const RunOptions& opts, const std::function<void(const Ph
   }
 }
 
+namespace {
+
+constexpr std::int64_t kOrdersPerPage = 1'000;
+
+// Conditions 2 to 7 for one district, which New-Order and Delivery keep: its
+// orders in pages of o_id, each page's lines and new_order rows by the same
+// o_id range, the last page's range open, so no row of the district is missed.
+void orders_agree(Database& db, std::int64_t w, std::int64_t d, std::int64_t d_next_o_id,
+                  std::vector<std::string>& bad) {
+  const auto& orders = db.prepare(std::format(
+      "SELECT o_id, o_carrier_id, o_ol_cnt FROM orders WHERE o_w_id = $1 AND o_d_id = $2 AND o_id >= $3 "
+      "ORDER BY o_id LIMIT {}",
+      kOrdersPerPage));
+  const auto& lines = db.prepare(
+      "SELECT ol_o_id, ol_delivery_d FROM order_line WHERE ol_w_id = $1 AND ol_d_id = $2 AND ol_o_id >= $3 "
+      "AND ol_o_id <= $4");
+  const auto& news = db.prepare(
+      "SELECT no_o_id FROM new_order WHERE no_w_id = $1 AND no_d_id = $2 AND no_o_id >= $3 AND no_o_id <= $4");
+  const auto where = std::format("district {} of warehouse {}", d, w);
+  std::int64_t max_o = 0, ol_cnt_sum = 0, line_count = 0, no_count = 0;
+  std::optional<std::int64_t> min_no, max_no;
+  for (std::int64_t from = 0;;) {
+    auto page = db.execute(orders, {w, d, from}).rows;
+    const auto last = std::ssize(page) < kOrdersPerPage;
+    const auto to = last ? std::int64_t{std::numeric_limits<std::int32_t>::max()} : i64(page.back().at(0));
+    // Per order: its line count, and its lines delivered.
+    std::map<std::int64_t, std::pair<std::int64_t, std::int64_t>> by_order;
+    for (const auto& r : db.execute(lines, {w, d, from, to}).rows) {
+      auto& [n, delivered] = by_order[i64(r.at(0))];
+      ++n;
+      if (!std::holds_alternative<std::monostate>(r.at(1))) ++delivered;
+      ++line_count;
+    }
+    std::map<std::int64_t, bool> undelivered;
+    for (const auto& r : db.execute(news, {w, d, from, to}).rows) {
+      const auto o = i64(r.at(0));
+      undelivered[o] = true;
+      min_no = std::min(min_no.value_or(o), o);
+      max_no = std::max(max_no.value_or(o), o);
+      ++no_count;
+    }
+    for (const auto& r : page) {
+      const auto o = i64(r.at(0));
+      const auto carried = !std::holds_alternative<std::monostate>(r.at(1));
+      const auto ol_cnt = i64(r.at(2));
+      const auto [n, delivered] = by_order[o];
+      max_o = std::max(max_o, o);
+      ol_cnt_sum += ol_cnt;
+      if (carried == undelivered[o]) {
+        bad.push_back(std::format("condition 5: order {} of {} has {} carrier and {} new_order row", o, where,
+                                  carried ? "a" : "no", undelivered[o] ? "a" : "no"));
+      }
+      if (ol_cnt != n) {
+        bad.push_back(std::format("condition 6: order {} of {} has o_ol_cnt {} and {} lines", o, where, ol_cnt, n));
+      }
+      if (delivered != (carried ? n : 0)) {
+        bad.push_back(std::format("condition 7: order {} of {} has {} carrier and {} of its {} lines delivered", o,
+                                  where, carried ? "a" : "no", delivered, n));
+      }
+    }
+    if (last) break;
+    from = to + 1;
+  }
+  if (d_next_o_id - 1 != max_o || (max_no && *max_no != max_o)) {
+    bad.push_back(std::format("condition 2: {} has d_next_o_id {}, max(o_id) {} and max(no_o_id) {}", where,
+                              d_next_o_id, max_o, max_no ? std::to_string(*max_no) : "none"));
+  }
+  if (max_no && *max_no - *min_no + 1 != no_count) {
+    bad.push_back(std::format("condition 3: {} has new_order from {} to {} in {} rows", where, *min_no, *max_no,
+                              no_count));
+  }
+  if (ol_cnt_sum != line_count) {
+    bad.push_back(std::format("condition 4: {} has o_ol_cnt summing to {} and {} order lines", where, ol_cnt_sum,
+                              line_count));
+  }
+}
+
+}  // namespace
+
 auto consistency(Database& db) -> std::vector<std::string> {
   std::vector<std::string> bad;
   std::map<std::int64_t, std::int64_t> w_ytd, d_sum, h_by_w;
-  std::map<std::pair<std::int64_t, std::int64_t>, std::int64_t> d_ytd, h_by_d;
+  std::map<std::pair<std::int64_t, std::int64_t>, std::int64_t> d_ytd, h_by_d, d_next;
   for (const auto& r : db.execute("SELECT w_id, w_ytd FROM warehouse WHERE w_id >= $1", {std::int64_t{1}}).rows) {
     w_ytd[i64(r.at(0))] = i64(r.at(1));
   }
   for (const auto& r :
-       db.execute("SELECT d_w_id, d_id, d_ytd FROM district WHERE d_w_id >= $1", {std::int64_t{1}}).rows) {
+       db.execute("SELECT d_w_id, d_id, d_ytd, d_next_o_id FROM district WHERE d_w_id >= $1", {std::int64_t{1}}).rows) {
     d_ytd[{i64(r.at(0)), i64(r.at(1))}] = i64(r.at(2));
+    d_next[{i64(r.at(0)), i64(r.at(1))}] = i64(r.at(3));
     d_sum[i64(r.at(0))] += i64(r.at(2));
   }
   // history in pages, in h_id order, so no run holds it all in memory.
@@ -800,18 +1003,20 @@ auto consistency(Database& db) -> std::vector<std::string> {
                                 wd.second, wd.first, money_text(ytd), money_text(h_by_d[wd])));
     }
   }
+  for (const auto& [wd, next] : d_next) orders_agree(db, wd.first, wd.second, next, bad);
   return bad;
 }
 
 auto format_report(const PhaseReport& r) -> std::string {
   auto out = std::format("threads {}  run {}  {:.1f} s  TPM {:.0f}  NOPM {}\n", r.threads, r.run, r.seconds, r.tpm(),
                          r.nopm() ? std::format("{:.0f}", *r.nopm()) : std::string{"n/a"});
-  out += std::format("  {:<13}{:>10}{:>9}{:>10}{:>10}{:>10}{:>10}{:>10}\n", "transaction", "completed", "retries",
-                     "abandoned", "p50 us", "p95 us", "p99 us", "max us");
+  out += std::format("  {:<13}{:>10}{:>12}{:>9}{:>10}{:>10}{:>10}{:>10}{:>10}\n", "transaction", "completed",
+                     "rolled back", "retries", "abandoned", "p50 us", "p95 us", "p99 us", "max us");
   for (auto k : mix()) {
     const auto& s = r.kinds[static_cast<std::size_t>(k)];
-    out += std::format("  {:<13}{:>10}{:>9}{:>10}{:>10}{:>10}{:>10}{:>10}\n", kind_name(k), s.completed, s.retries,
-                       s.abandoned, s.latency.quantile(0.50).count(), s.latency.quantile(0.95).count(),
+    out += std::format("  {:<13}{:>10}{:>12}{:>9}{:>10}{:>10}{:>10}{:>10}{:>10}\n", kind_name(k), s.completed,
+                       s.rolled_back, s.retries, s.abandoned, s.latency.quantile(0.50).count(),
+                       s.latency.quantile(0.95).count(),
                        s.latency.quantile(0.99).count(), s.latency.max().count());
   }
   out += std::format("  engine: {} fsyncs, {} group-commit batches\n", r.fsyncs, r.group_writer_batches);
@@ -826,9 +1031,9 @@ auto json_report(const PhaseReport& r) -> std::string {
   auto first = true;
   for (auto k : mix()) {
     const auto& s = r.kinds[static_cast<std::size_t>(k)];
-    out += std::format(R"({}"{}":{{"completed":{},"retries":{},"abandoned":{},"p50_us":{},"p95_us":{},)"
-                       R"("p99_us":{},"max_us":{}}})",
-                       first ? "" : ",", kind_name(k), s.completed, s.retries, s.abandoned,
+    out += std::format(R"({}"{}":{{"completed":{},"rolled_back":{},"retries":{},"abandoned":{},"p50_us":{},)"
+                       R"("p95_us":{},"p99_us":{},"max_us":{}}})",
+                       first ? "" : ",", kind_name(k), s.completed, s.rolled_back, s.retries, s.abandoned,
                        s.latency.quantile(0.50).count(), s.latency.quantile(0.95).count(),
                        s.latency.quantile(0.99).count(), s.latency.max().count());
     first = false;

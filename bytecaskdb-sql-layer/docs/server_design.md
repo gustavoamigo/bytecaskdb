@@ -594,7 +594,7 @@ procedures (or functions) through SQL `PREPARE`. Its monitor also reads
 3. It sleeps for the duration, then reads both again.
 4. It prints `testresult $nopm $tpm` with HammerDB's own procedure:
    - NOPM is the `d_next_o_id` delta per minute, the benchmark specification's definition and
-     HammerDB's;
+     HammerDB's: committed New-Orders only, as `sql_layer_tprocc` counts them;
    - TPM is transactions per minute, one per outcome, which
      `xact_commit + xact_rollback` would count.
 5. It sets HammerDB's `abort` flag, and the users stop.
@@ -607,10 +607,8 @@ them. `sql_layer_tprocc statements` prints the harness's, and
 `scripts/check_driver_statements.py` (in the layer) fails CI if the
 script's set differs.
 
-The script runs every transaction type. Stock-Level waits on the front
-end's slice 5 (`frontend_design.md`, *Slices*). Until
-it lands, the run script's `--mix` limits the script to the types the
-layer runs, and the gate is the full mix.
+The script runs all five transaction types; the run script's `--mix` can
+limit it to some. The gate is the full mix.
 
 **The same script against PostgreSQL 17.** The statements are
 PostgreSQL's, so the script runs unchanged on PostgreSQL loaded with the

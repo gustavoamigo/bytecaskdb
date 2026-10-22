@@ -401,3 +401,90 @@ TEST_CASE("plan API: a write committed across a DDL on its table is a conflict",
   bc_ctx_reset(f.cx);
   CHECK(f.db->get({}, key, out));
 }
+
+namespace {
+// COUNT(DISTINCT qty) over t: each non-NULL qty's key grouped, then the
+// groups counted. Param 0 is the aggregate's bound in bytes.
+void count_distinct_qty(bc_ctx* cx) {
+  bc_view all = bc_key_end(cx, bc_key_begin(cx, kTbl));
+  bc_cursor c = bc_scan_open(cx, kTbl, all, all, BC_SCAN_PREFIX);
+  bc_agg a = bc_agg_open(cx, static_cast<uint32_t>(bc_param_i64(cx, 0)), 0);
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    if (bc_col_null(cx, row, kQtyCol)) continue;
+    (void)bc_agg_group(cx, a, bc_col_key(cx, row, kQtyCol));
+  }
+  int64_t n = 0;
+  bc_view key;
+  bc_group g;
+  while (bc_agg_next(cx, a, &key, &g)) ++n;
+  bc_emit_count(cx, n);
+}
+
+// Table w (id, b), with no index: inserts (id, b) from params 0 and 1.
+constexpr std::uint32_t kWide = 4;
+void insert_wide(bc_ctx* cx) {
+  bc_row r = bc_row_begin(cx, kWide);
+  bc_row_set_param(cx, r, 0, 0);
+  bc_row_set_param(cx, r, 1, 1);
+  bc_insert(cx, kWide, bc_row_end(cx, r));
+  bc_emit_count(cx, 1);
+}
+
+// COUNT(DISTINCT b) over w.
+void count_distinct_wide(bc_ctx* cx) {
+  bc_view all = bc_key_end(cx, bc_key_begin(cx, kWide));
+  bc_cursor c = bc_scan_open(cx, kWide, all, all, BC_SCAN_PREFIX);
+  bc_agg a = bc_agg_open(cx, 1u << 20, 0);
+  while (bc_scan_next(cx, c)) (void)bc_agg_group(cx, a, bc_col_key(cx, bc_scan_row(cx, c), 1));
+  int64_t n = 0;
+  while (bc_agg_next(cx, a, nullptr, nullptr)) ++n;
+  bc_emit_count(cx, n);
+}
+
+// A group key read after its cursor moved on.
+void stale_col_key(bc_ctx* cx) {
+  bc_view all = bc_key_end(cx, bc_key_begin(cx, kTbl));
+  bc_cursor c = bc_scan_open(cx, kTbl, all, all, BC_SCAN_PREFIX);
+  (void)bc_scan_next(cx, c);
+  bc_view k = bc_col_key(cx, bc_scan_row(cx, c), kQtyCol);
+  (void)bc_scan_next(cx, c);
+  bc_agg a = bc_agg_open(cx, 1u << 20, 0);
+  (void)bc_agg_group(cx, a, k);
+  bc_emit_count(cx, 1);
+}
+
+// bc_check_int of param 0 as an INTEGER, on t.
+void check_integer(bc_ctx* cx) { bc_emit_count(cx, bc_check_int(cx, bc_param_i64(cx, 0), BC_INTEGER, kTbl)); }
+}  // namespace
+
+TEST_CASE("plan API: an aggregate's groups, keyed by a column, and the range check of a computed integer",
+          "[sql][algebra]") {
+  Fixture f;
+  for (std::int64_t id = 1; id <= 6; ++id) {
+    bc_value qty = id == 6 ? bc_value{} : bc_value{std::int64_t{id % 3}};  // 1, 2, 0, 1, 2, NULL
+    REQUIRE(run(f, insert_plan_ok, {id, bytes("n"), qty}) == BC_COMMITTED);
+  }
+  // Equal values give equal keys: three groups, the NULL skipped.
+  CHECK(run(f, count_distinct_qty, {std::int64_t{1} << 20}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == 3);
+  // A bound the keys outgrow is BC_E_MEMORY, never a wrong count.
+  CHECK(run(f, count_distinct_qty, {std::int64_t{8}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_MEMORY);
+  // A scan's group key lives as long as its entry, outside the arena.
+  CHECK(run(f, stale_col_key, {}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  // A group key is not an engine key: a value past the key ceiling groups.
+  f.ddl(bytecask::sql::CreateTableDdl{"w", {Fixture::col("id", PhysType::I64, false), Fixture::col("b", PhysType::Bytes, true)}, {"id"}});
+  const std::string wide(70000, 'x');
+  for (std::int64_t id = 1; id <= 3; ++id) REQUIRE(run(f, insert_wide, {id, bytes(wide)}) == BC_COMMITTED);
+  CHECK(run(f, count_distinct_wide, {}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == 1);
+
+  CHECK(run(f, check_integer, {std::int64_t{2147483647}}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == 2147483647);
+  CHECK(run(f, check_integer, {std::int64_t{-2147483649}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
+  CHECK(bc_error_detail(f.cx) == ((std::uint32_t{BC_C_RANGE} << 24) | kTbl));
+  CHECK(std::string{bc_error_message(f.cx)}.starts_with("integer out of range"));
+}

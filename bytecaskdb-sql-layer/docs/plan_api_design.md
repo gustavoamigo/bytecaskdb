@@ -454,6 +454,8 @@ int64_t bc_div(bc_ctx *, int64_t, int64_t);     /* zero divisor, INT64_MIN / -1 
 int64_t bc_mod(bc_ctx *, int64_t, int64_t);
 int64_t bc_neg(bc_ctx *, int64_t);              /* INT64_MIN → error */
 int64_t bc_f64_to_i64(bc_ctx *, double);        /* NaN or out of range → error; truncates */
+enum bc_int_type { BC_SMALLINT = 2, BC_INTEGER = 4 };
+int64_t bc_check_int(bc_ctx *, int64_t v, uint32_t int_type, uint32_t object_id);  /* outside the type: BC_C_RANGE */
 double  bc_i64_to_f64(int64_t);                 /* always defined */
 bool    bc_bytes_eq(bc_ctx *, bc_view, bc_view);
 int     bc_bytes_cmp(bc_ctx *, bc_view, bc_view);       /* memcmp order */
@@ -465,7 +467,16 @@ builtins where available and on a portable compare otherwise, so a plan file
 never depends on a C23 compiler. Double arithmetic stays plain: it is
 defined for every input, and NaN and infinities propagate as SQL expects the
 compiler to handle. Byte comparisons are for encoded or binary columns; the
-compiler emits comparisons on sort keys it built, never on raw text.
+compiler emits comparisons on sort keys it built, never on raw text, and on
+TEXT and VARCHAR columns compared under `COLLATE "C"`, byte order.
+
+`bc_check_int` is the range check of a computed integer (added in the
+front end's slice 5): it returns `v` when it is inside the SQL type the
+compiler resolved, `BC_SMALLINT` or `BC_INTEGER`, and otherwise sets
+`BC_E_CONSTRAINT` with `BC_C_RANGE` on `object_id` and PostgreSQL's words
+("integer out of range"), SQLSTATE 22003. Which type an operation is in is
+the compiler's decision, so it shows in the plan text; the bounds are the
+runtime's.
 
 ### Keys
 
@@ -481,6 +492,7 @@ void     bc_key_bytes(bc_ctx *, bc_key, bc_view);
 void     bc_key_null(bc_ctx *, bc_key);
 void     bc_key_param(bc_ctx *, bc_key, uint32_t i);  /* parameter i as the next part, NULL included */
 bc_view  bc_key_end(bc_ctx *, bc_key);
+bool     bc_key_fits(bc_ctx *, bc_key);
 bc_view  bc_key_params(bc_ctx *, uint32_t table_or_index, uint32_t first, uint32_t n);  /* parts from params first.. */
 bc_view  bc_key_successor(bc_ctx *, bc_view key);     /* smallest key greater than every key with this prefix */
 ```
@@ -491,6 +503,7 @@ bc_view  bc_key_successor(bc_ctx *, bc_view key);     /* smallest key greater th
 | `bc_key_i64`, `bc_key_f64`, `bc_key_bool`, `bc_key_bytes`, `bc_key_null` | Appends one part. Nullability and direction come from the catalog entry for `table_or_index`, so the builder knows whether to write a null marker and whether to invert the bytes. A part of the wrong type, or more parts than the key has, is `BC_E_HANDLE`. |
 | `bc_key_param` | Appends parameter `i` as the next part: its value, or the null part when it is NULL. A type that is not the part's, or a NULL for a part that is not nullable, is `BC_E_HANDLE`. A `REAL` part is keyed as its float rounding. Whether the value is inside the column's type is checked before the plan runs, by the embedded API: every compared parameter has one SQL type, and a parameter compared with columns of two is refused at bind (`docs/types_design.md`). |
 | `bc_key_end` | Finalizes and returns the key. A partial key (fewer parts than the index has) is legal and is a prefix the compiler uses as a scan bound. A key over the engine's hard ceiling (65,535 bytes) is `BC_E_LIMIT`. |
+| `bc_key_fits` | Whether the key built so far is within the engine's key ceiling. A key past it names no row, so a join asks before `bc_key_end` and skips an outer row whose long value would make the inner key one: PostgreSQL finds no inner row there, where `bc_key_end` would fail the statement (front end slice 5). |
 | `bc_key_params` | The key, or prefix, of `table_or_index` whose first `n` parts are parameters `first` to `first + n - 1`, each as `bc_key_param` appends it: `bc_key_begin`, `n` parts and `bc_key_end` in one call. `(cx, TBL_9, 0, 3)` is a composite primary key `(w_id, d_id, c_id)`. The builder remains for keys whose parts come from anywhere else. |
 | `bc_key_successor` | The exclusive upper bound of the prefix `key`: its last byte incremented, carrying. Turns a prefix into a half-open range where `BC_SCAN_PREFIX` does not fit. |
 
@@ -562,6 +575,7 @@ int64_t  bc_col_i64(bc_ctx *, bc_view row, uint32_t col);
 double   bc_col_f64(bc_ctx *, bc_view row, uint32_t col);
 bool     bc_col_bool(bc_ctx *, bc_view row, uint32_t col);
 bc_view  bc_col_bytes(bc_ctx *, bc_view row, uint32_t col); /* a sub-view; same lifetime as row */
+bc_view  bc_col_key(bc_ctx *, bc_view row, uint32_t col);   /* the value as a mem-comparable key part */
 bc_view  bc_row_key(bc_ctx *, uint32_t table, bc_view row);  /* the row's primary key, from its columns */
 
 bc_row   bc_row_begin(bc_ctx *, uint32_t table);
@@ -581,6 +595,7 @@ bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: live
 | `bc_col_null` | True if column `col`'s bit in the bitmap is clear. The bitmap says *present*: a column set null and a column the row predates both have the bit clear, so one test covers both (`docs/types_design.md`, *Row format*). A set bit for a column the row does not hold, or a variable column whose two `var_end` words are out of order or past the row, is `BC_E_CORRUPT`: it reads the column through the one decoder every reader uses, so it never disagrees with them. A variable column's bytes are viewed, not copied. The compiler emits it in one place: an `UPDATE` that assigns from a nullable column (`SET c = src`, `SET c = src - $n`), before it reads `src`. |
 | `bc_col_i64`, `bc_col_f64`, `bc_col_bool` | Loads the 8-byte column. A null column, or one a shorter row predates, reads as zero; `bc_col_null` decides first and reports both as null. A column marked present that the row does not hold is `BC_E_CORRUPT`. Little-endian in the row. |
 | `bc_col_bytes` | The variable-length column, as a view with the row's lifetime. A column marked present whose slot the row does not hold, or whose `var_end` runs past the row, is `BC_E_CORRUPT`. |
+| `bc_col_key` | The column's value, NULL included, encoded as an ascending nullable key part of its type: equal values give equal bytes, a DOUBLE's `-0.0` and `0.0` and every NaN alike. A group key for `bc_agg_group` (front end slice 5), so it has no key ceiling. It lives as long as the row: a cursor's row holds its keys until the cursor moves, so a scan holds one entry's at a time, and any other row's go in the arena. |
 | `bc_row_key` | The table's full primary key (namespace, table id, parts), encoded from the row's columns: for a `bc_get`, a guard, or a scan bound reached from a row. Built in the arena. |
 | `bc_row_begin` | Starts a row of `table`'s current layout with every column at its default: the catalog's default for a column that has one, null for the rest. A plan compiled before a column was added writes the column's default without naming it. |
 | `bc_row_from` | Starts a row of `table` as a copy of `old`, a row of that table and of its current layout generation (otherwise as for the writes below: `BC_L_ROW`, `BC_L_RETIRED` or `BC_E_CORRUPT`; a `REBUILD`, #503, widens this to any generation). The `UPDATE` pattern: copy, set the assigned columns, end. |
@@ -629,7 +644,7 @@ double    bc_agg_f64(bc_ctx *, bc_group, uint32_t slot);
 | `bc_sorter_next` | Streams payloads in sort order. Each call charges one unit of budget. |
 | `bc_hash_open`, `bc_hash_put` | A multimap for the build side of a hash join. Duplicate keys are kept. |
 | `bc_hash_find`, `bc_hash_next` | Probes: an iterator over every payload stored under `key`, in insertion order. Each `next` charges one unit. |
-| `bc_agg_open` | Grouped accumulators with `slots` numeric slots per group, for `GROUP BY` the plan cannot get from index order. Ungrouped aggregates use one group with an empty key. |
+| `bc_agg_open` | Grouped accumulators with `slots` numeric slots per group, for `GROUP BY` the plan cannot get from index order. Ungrouped aggregates use one group with an empty key. Implemented with no slots only, for `COUNT(DISTINCT)`: each group's key is held once, and the groups may take `bytes`, each counted as its key's bytes plus a fixed overhead (112 bytes: the index node, the allocator's headers and the first-appearance order entry), so the bound is close to the memory held; past it, `BC_E_MEMORY`. The slot calls are not implemented yet (`BC_E_HANDLE`). |
 | `bc_agg_group` | Finds or creates the group for `group_key`, a mem-comparable byte string. Slots start at zero and null. |
 | `bc_agg_add_*`, `bc_agg_min_*`, `bc_agg_max_*`, `bc_agg_count` | Folds a value into a slot. `SUM`, `MIN`, `MAX`, `COUNT`; `AVG` is a sum slot and a count slot divided at emit. Integer sums are checked. |
 | `bc_agg_next` | Iterates groups in first-appearance order, one unit each. |

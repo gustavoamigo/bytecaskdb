@@ -1,7 +1,7 @@
 # SQL front end for the MVP: dialect subset and statement IR
 
 Status: **design (#492), approved (owner, 2026-10-21): the *Decisions*;
-the rest reviewed with the coordinator.** Slices 0 to 4 are built
+the rest reviewed with the coordinator.** Slices 0 to 5 are built
 (*Slices*); the rest is design. It decides
 the SQL the MVP accepts, the intermediate form the code generator prints
 plans from, and the planner's choices, all scoped by TPROC-C (#487, *MVP*).
@@ -658,7 +658,52 @@ its transaction test.
      plan reads nothing.
 5. **Stock-Level:** the join on an outer column, a range after a prefix,
    residual filters, a computed bound with its range check (the addition
-   above), `COUNT(DISTINCT)` and the aggregate calls.
+   above), `COUNT(DISTINCT)` and the aggregate calls. As built, with these
+   differences from the design above:
+   - A join on a column scans the outer table, reached from its parameters
+     alone (one row by its whole primary key is a scan of that key's
+     prefix), and reads the inner one by its whole primary key, each part
+     from a parameter or an outer column: `FROM` order first, then the
+     other, also when the first leaves a filter it refuses (on a DOUBLE or
+     REAL); if both refuse, the first one's refusal stands. An inner table reached by a prefix is refused with `no plan:`
+     (row 3). Its IR is a `LoopJoin` of a `Scan` and the inner key's parts,
+     not two `Loop`s. Two columns are compared only by `=`, one of each
+     table, of one SQL type; any other comparison of two columns is refused
+     at bind.
+   - Filters are the statement's, `Select::filters` (and `Update`'s and
+     `Delete`'s), each run as soon as its row is read: on a point lookup, a
+     scan, either row of a join, and the rows an `UPDATE` or `DELETE`
+     writes. A scan with one reads the row, never covers, and no aggregate
+     takes the keys' answer. A filter on a `DOUBLE` or `REAL` column is
+     refused with `no plan:`: its comparison needs PostgreSQL's NaN and
+     `-0.0` rules, which only its key encoding has.
+   - The computed operand is `$n + k` or `$n - k`, k an integer literal
+     within `INTEGER`, compared with an `INTEGER` column; `$n` and the sum
+     are `INTEGER`s, as PostgreSQL types an unknown `$n` beside an integer
+     literal. Other columns and wider literals are refused at bind. Each is
+     computed once, before anything is read, by `bc_check_int` (the
+     addition above: the value, `BC_SMALLINT` or `BC_INTEGER`, and the
+     table a refusal names), so a sum outside `INTEGER` is 22003 whatever
+     else the statement would read, as PostgreSQL folds it when it binds;
+     a NULL `$n` gives NULL. It bounds a range like a parameter; compared
+     by `=` it is a filter, never a key part.
+   - `COUNT(DISTINCT col)` groups each non-NULL value in `bc_agg_open`'s
+     groups, keyed by `bc_col_key`, a second addition: the column's value
+     as a mem-comparable key part, so equal values group as PostgreSQL
+     groups them (`-0.0` with `0.0`). It is a group key, so it has no key
+     ceiling, and a scan's row holds it only until the cursor moves. The
+     groups' bound is 16 MiB, each group counted as its key's bytes plus
+     112 for what holds it; past it the statement fails with
+     `BC_E_MEMORY`. Only `bc_agg_open` with no
+     slots, `bc_agg_group` and `bc_agg_next` are implemented.
+   - Aggregates are allowed on joins, over the pairs.
+   - A join reads each inner row, and builds its key and a `COUNT(DISTINCT)`
+     group key, in the statement's arena, which is reset only when the
+     statement ends. A join over enough outer rows to fill it fails with
+     `BC_E_MEMORY`; S2 reads about two hundred (#551).
+   - An inner key past the engine's key ceiling, built from a long outer
+     value, names no row: `bc_key_fits`, a third addition, is asked before
+     `bc_key_end`, and the outer row joins nothing, as in PostgreSQL.
 
 Then the MVP gate.
 

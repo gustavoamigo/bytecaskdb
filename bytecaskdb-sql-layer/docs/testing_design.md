@@ -130,17 +130,32 @@ Rules for slice 4 (#492):
   no unique index holds. `served` decides whether the layer plans it, as
   for a `SELECT` without `ORDER BY`; the counts must agree.
 
-`test_tprocc.py` runs TPROC-C's Payment, Order-Status, New-Order and Delivery
-through SQL against PostgreSQL: a small fixture (one warehouse, two
+Rules for slice 5 (#492):
+- **Filters**: zero to two conjuncts on any column, by any operator, beside
+  the key's, in `SELECT`, `UPDATE` and `DELETE`. `served` refuses one on a
+  DOUBLE or REAL column.
+- **$n ± k**: now and then an INTEGER conjunct's operand is `$n + k`, k
+  from -30 to 30, mostly the same value; PostgreSQL's side writes
+  `$n::integer + k`. Compared by `=`, it is a filter.
+- **COUNT(DISTINCT col)** beside `COUNT`.
+- **A join on a column**: two tables, each of the second's key parts equal
+  to a column of the first of its type or to a parameter, the first's
+  conjuncts from a key path, maybe a filter on the second; targets with a
+  `LIMIT`, or `COUNT(DISTINCT)` of either table's column. `join_served`
+  models the planner's choice of outer table.
+
+`test_tprocc.py` runs TPROC-C's five transactions through SQL against
+PostgreSQL: a small fixture (one warehouse, two
 districts, thirty customers each, some with a NULL `c_first`, fifty items
 and their stock, the orders without a carrier undelivered in `new_order`),
 then a hundred transactions from a fixed seed, one thread, each statement
 in a `Transaction` and in a PostgreSQL REPEATABLE READ transaction, with
 the client's logic between them. Every tenth is a Delivery, of each
-district's oldest undelivered order; the rest are in roughly TPROC-C's mix
-of the other three. One New-Order in twenty names an item that does not
-exist and rolls back. Every statement's result and every table after the
-run must agree.
+district's oldest undelivered order, and every tenth another a
+Stock-Level, with a threshold wider than the specification's so its counts
+are not all 0; the rest are in roughly TPROC-C's mix of the other three.
+One New-Order in twenty names an item that does not exist and rolls back.
+Every statement's result and every table after the run must agree.
 The schema is read from `tests/tprocc_schema.cppm`, its one definition.
 
 Fixed cases are plain pytest functions at the end of the file. They call
@@ -240,17 +255,27 @@ and shared by them.
   `--seed` and `t`.
 - The mix is the specification's deck (New-Order 45, Payment 43, and
   Order-Status, Delivery and Stock-Level 4 each), drawn per transaction.
-  It is restricted to the transactions built so far and renormalised.
-  Payment and Order-Status come first, with #542; each later front-end
-  slice adds its transaction to the deck and to the inputs below.
+  It is restricted to the transactions built so far and renormalised:
+  New-Order, Payment, Order-Status and Delivery today. Stock-Level, which
+  the front end's slice 5 now plans, is the next to join.
 - Inputs follow the profiles (clauses 2.4 to 2.8): customers by last name
   60% of the time and by `NURand` id otherwise; a remote warehouse for 15%
   of Payments when `W > 1`; `h_amount` from 1.00 to 5,000.00; a `BC`
-  customer's new `c_data`. The client logic is the harness's, as in
-  HammerDB's client-side driver.
+  customer's new `c_data`; New-Order's 5 to 15 lines, each item by
+  `NURand`, 1% of lines from a remote warehouse when `W > 1`, and 1% of
+  orders ending on an unused item; Delivery's carrier from 1 to 10. The
+  client logic is the harness's, as in HammerDB's client-side driver.
 - One difference from the specification, as in HammerDB: Payment does not update
   `c_ytd_payment` or `c_payment_cnt`, since it runs HammerDB's statements
-  (P9, P10) by decision.
+  (P9, P10) by decision; nor does New-Order update `s_ytd`, `s_order_cnt`
+  or `s_remote_cnt` (N6), or Delivery `c_delivery_cnt` (D7).
+- `ol_amount` is HammerDB's: quantity × price × (1 + `w_tax` + `d_tax`) ×
+  (1 − `c_discount`), which its New-Order computes client-side and in its
+  stored procedures alike. The specification's is quantity × price, with
+  the taxes and the discount applied to the order's total (clause
+  2.4.2.2).
+- Delivery runs as one transaction over the warehouse's ten districts, as
+  HammerDB runs it, not deferred (clause 2.7.2).
 - One `Transaction` per TPROC-C transaction, committed with `commit()`.
 
 **Errors and retries.**
@@ -259,7 +284,8 @@ and shared by them.
   per transaction type. A transaction still failing after its tenth
   attempt is counted as abandoned and the thread moves on.
 - New-Order's 1% of orders naming an unused item roll back, as the
-  specification requires, and count as completed.
+  specification requires. They count as completed, and so in TPM, as
+  HammerDB counts a rollback, but not in NOPM.
 - Any other error stops the run with a non-zero exit: 23505,
   `TransactionResolutionUnknown`, a constraint, an I/O error. In TPROC-C
   none is expected, so each one is a bug to look at, not a number.
@@ -268,8 +294,10 @@ and shared by them.
 - per transaction type, completed, retries and abandoned, and latency
   p50, p95, p99 and max, from the first attempt's start to the commit that
   completed it;
-- TPM, completed transactions of every type per minute, and NOPM, completed
-  New-Orders per minute (`n/a` until New-Order is in the mix);
+- TPM, completed transactions of every type per minute, rollbacks
+  included, and NOPM, committed New-Orders per minute: HammerDB's
+  definitions, its NOPM being the change in `d_next_o_id`, so the harness's
+  numbers mean what the gate's do;
 - the engine's `fsyncs` and `group_writer_batches` over the measured
   window, read from `stats()` at its start and end, to set beside
   `commit_probe`.
@@ -291,7 +319,13 @@ in pages of 10,000 rows in `h_id` order, so no run holds it all:
 - with Payment: condition 1 (`w_ytd` is the sum of its districts'
   `d_ytd`), and conditions 8 and 9 (`w_ytd` and `d_ytd` are each the sum of
   their `history` rows' `h_amount`);
-- New-Order and Delivery add conditions 2 to 4 and 5 to 7 when they land.
+- with New-Order and Delivery: conditions 2 to 7, per district, its
+  orders in pages of 1,000 `o_id`s with each page's `order_line` and
+  `new_order` rows read by the same `o_id` range: `d_next_o_id - 1` is
+  `max(o_id)` and `max(no_o_id)` (2); `new_order`'s ids are contiguous (3);
+  `o_ol_cnt` sums to the district's line count (4); an order has a carrier
+  exactly when it has no `new_order` row (5); its `o_ol_cnt` is its line
+  count (6), and its lines are delivered exactly when it has a carrier (7).
 
 A failed condition exits non-zero.
 

@@ -115,14 +115,15 @@ auto expr(const PgQuery__Node* n) -> Expr {
       reject("function " + name + " is not supported", f->location);
     }
     auto refuse = [&] [[noreturn]] {
-      reject("only COUNT(*), COUNT(column), SUM(column) and MIN(column) are supported", f->location);
+      reject("only COUNT(*), COUNT([DISTINCT] column), SUM(column) and MIN(column) are supported", f->location);
     };
-    if (f->agg_distinct || f->n_agg_order != 0 || f->agg_filter != nullptr || f->over != nullptr ||
-        f->agg_within_group || f->func_variadic) {
+    if ((f->agg_distinct && name != "count") || f->n_agg_order != 0 || f->agg_filter != nullptr ||
+        f->over != nullptr || f->agg_within_group || f->func_variadic) {
       refuse();
     }
     Expr e{Expr::Kind::Aggregate, {}, 0, nullptr, nullptr, f->location};
     e.fn = name == "count" ? Expr::Fn::Count : name == "sum" ? Expr::Fn::Sum : Expr::Fn::Min;
+    e.distinct = f->agg_distinct;
     if (f->agg_star && e.fn == Expr::Fn::Count) return e;
     if (f->agg_star || f->n_args != 1 || f->args[0]->node_case != PG_QUERY__NODE__NODE_COLUMN_REF) refuse();
     auto arg = expr(f->args[0]);

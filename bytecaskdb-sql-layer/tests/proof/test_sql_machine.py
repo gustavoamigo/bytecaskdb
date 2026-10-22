@@ -28,6 +28,9 @@ an equality prefix and a range of any key, with ORDER BY and LIMIT, COUNT,
 and SET col = col ± $n. Slice 3: SET col = col ± an integer literal, and a
 join of two tables, each by its whole primary key. Slice 4: SUM and MIN by
 a key, and UPDATE and DELETE of every row a key's prefix or range reaches.
+Slice 5: filters on the columns a key does not take, bounds of $n ± k on
+INTEGER columns, COUNT(DISTINCT), and the join of a table reached by its
+parameters to one read by its primary key from the first one's columns.
 
 The wire target (docs/server_design.md, *Tests*): with BYTECASK_SQL_SERVER
 set, every statement the layer runs also goes, as the same text with its
@@ -135,6 +138,37 @@ class Table:
         return f"SELECT {', '.join(c.name for c in self.columns)} FROM {self.name}"
 
 
+def reachable(t: Table, conj: list[tuple]) -> bool:
+    """Whether some key of t is reached from its parameters alone: its first
+    part compared for equality (not with $n ± k) or bounded."""
+    conj = [(c[0], c[1], len(c) > 2 and c[2]) for c in conj]
+    firsts = {parts[0][0] for _, parts in key_paths(t)}
+    return any(c in firsts and (op != "=" or not calc) for c, op, calc in conj)
+
+
+def join_served(a: Table, conj_a: list[tuple], b: Table, conj_b: list[tuple], on: list[tuple[str, str]]) -> bool:
+    """Whether the planner plans a join of a and b on `on` (a's column, b's)
+    with these conjuncts: FROM order first, then the other; the outer table
+    reached by its parameters, the inner one by its whole primary key from
+    parameters and outer columns; every other conjunct a filter, none on a
+    DOUBLE or REAL."""
+    sides = [(a, conj_a, [x for x, _ in on]), (b, conj_b, [y for _, y in on])]
+    for o in (0, 1):
+        (ot, oconj, _), (it, iconj, icols) = sides[o], sides[1 - o]
+        if not reachable(ot, oconj):
+            continue
+        norm = [(c[0], c[1], len(c) > 2 and c[2]) for c in iconj]
+        keyed_by_param = [next((i for i, (q, op, calc) in enumerate(norm) if q == k and op == "=" and not calc), None)
+                          for k in it.pk]
+        if any(i is None and k not in icols for i, k in zip(keyed_by_param, it.pk)):
+            continue
+        inner_filters = [c for i, (c, _, _) in enumerate(norm) if i not in keyed_by_param]
+        unused_on = [ic for ic in icols if ic not in [k for i, k in zip(keyed_by_param, it.pk) if i is None]]
+        if served(ot, oconj, [], []) and not any(is_float(it, c) for c in inner_filters + unused_on):
+            return True
+    return False
+
+
 def typed(t: Table, c: str, n: int) -> str:
     """$n compared with column c, as PostgreSQL's side spells it. The layer
     types $n by its column, as PostgreSQL types a $n it is not told the type
@@ -211,12 +245,51 @@ def key_paths(t: Table) -> list[tuple[bool, list[tuple[str, bool]]]]:
     return out
 
 
-def served(t: Table, conjuncts: list[tuple[str, str]], order: list[tuple[str, bool]], used: list[str]) -> bool:
+@dataclasses.dataclass(frozen=True)
+class Calc:
+    """$n + k as a comparison's operand, on an INTEGER column: the
+    parameter's value and k."""
+
+    value: object
+    k: int
+
+
+def param_value(v):
+    return v.value if isinstance(v, Calc) else v
+
+
+def compared(t: Table, c: str, op: str, v, n: int, pg: bool, qualified: bool = False) -> str:
+    """One conjunct's text: column op $n, or op $n ± k for a Calc, which
+    PostgreSQL's side types integer, as it types an unknown $n beside an
+    integer literal."""
+    col = f"{t.name}.{c}" if qualified else c
+    if isinstance(v, Calc):
+        return f"{col} {op} ${n}{'::integer' if pg else ''} {'+' if v.k >= 0 else '-'} {abs(v.k)}"
+    return f"{col} {op} {typed(t, c, n) if pg else f'${n}'}"
+
+
+def is_float(t: Table, c: str) -> bool:
+    return t.column(c).type.kind in ("float", "real")
+
+
+def conjuncts(where) -> list[tuple[str, str, bool]]:
+    """(column, operator, computed) of each WHERE conjunct."""
+    return [(c, op, isinstance(v, Calc)) for c, op, v in where]
+
+
+def served(t: Table, conj: list[tuple], order: list[tuple[str, bool]], used: list[str]) -> bool:
     """Whether the planner plans a SELECT with these WHERE conjuncts
-    (column, operator), ORDER BY items (column, DESC) and columns read."""
-    eq = {c for c, op in conjuncts if op == "="}
-    if all(c in eq for c in t.pk):  # a point lookup: any other conjunct is a residual
-        return all(op == "=" and c in t.pk for c, op in conjuncts)
+    (column, operator[, computed]), ORDER BY items (column, DESC) and columns
+    read. A conjunct the key does not take is a filter, refused on a DOUBLE
+    or REAL column; an equality with $n ± k is always one."""
+    conj = [(c[0], c[1], len(c) > 2 and c[2]) for c in conj]
+    eq = {c for c, op, calc in conj if op == "=" and not calc}
+    def no_float_filter(keyed: list[int]) -> bool:
+        return not any(is_float(t, c) for i, (c, _, _) in enumerate(conj) if i not in keyed)
+    def first(c, ops):
+        return next((i for i, (q, op, calc) in enumerate(conj) if q == c and op in ops and (ops != ("=",) or not calc)), None)
+    if all(c in eq for c in t.pk):  # a point lookup: every other conjunct a filter
+        return no_float_filter([first(c, ("=",)) for c in t.pk])
     ordered: list[tuple[str, bool]] = []
     for c, desc in order:
         if c not in eq and c not in [q for q, _ in ordered]:
@@ -226,7 +299,7 @@ def served(t: Table, conjuncts: list[tuple[str, str]], order: list[tuple[str, bo
         run = 0
         while run < len(parts) and parts[run][0] in eq:
             run += 1
-        ranged = run < len(parts) and any(c == parts[run][0] and op != "=" for c, op in conjuncts)
+        ranged = run < len(parts) and any(c == parts[run][0] and op != "=" for c, op, _ in conj)
         if run == 0 and not ranged:
             continue
         serves, reverse = run + len(ordered) <= len(parts), False
@@ -244,14 +317,13 @@ def served(t: Table, conjuncts: list[tuple[str, str]], order: list[tuple[str, bo
     if not candidates:
         return False
     _, _, run, parts = max(candidates, key=lambda c: c[0])
-    run_cols = {c for c, _ in parts[:run]}
-    for c, op in conjuncts:
-        if op == "=" and c not in run_cols:
-            return False  # a residual
-        if op != "=" and (run == len(parts) or c != parts[run][0]):
-            return False
+    keyed = [first(c, ("=",)) for c, _ in parts[:run]]
+    if run < len(parts):
+        keyed += [first(parts[run][0], (">", ">=")), first(parts[run][0], ("<", "<="))]
+    if not no_float_filter(keyed):
+        return False
     for i, (c, _) in enumerate(ordered):
-        if not t.nullable(c) or any(q == c for q, _ in conjuncts):
+        if not t.nullable(c) or any(q == c for q, _, _ in conj):
             continue
         later = any(t.nullable(q) for q, _ in ordered[i + 1:])
         return i == 0 and not parts[run][1] and not later  # the two-range scan, or a refusal
@@ -452,7 +524,7 @@ class SqlMachine(RuleBasedStateMachine):
 
     def select(self, name: str, targets: list[str], where: list[tuple[str, str, object]],
                order: list[tuple[str, bool]] = (), limit: int | None = None, count: str | None = None,
-               fn: str = "count") -> None:
+               fn: str = "count", distinct: bool = False) -> None:
         """SELECT targets (or the aggregate fn(count), "*" for COUNT(*))
         WHERE each (column, operator, value) ... ORDER BY ... LIMIT ...: on
         both sides when the planner serves it, else the layer must refuse it
@@ -460,15 +532,15 @@ class SqlMachine(RuleBasedStateMachine):
         t = self.tables[name]
         cols = [c for c, _, _ in where]
         used = targets + ([count] if count not in (None, "*") else [])
-        select = f"{fn}({count})" if count else ", ".join(targets)
-        conds = [f"{c} {op} ${i + 1}" for i, (c, op, _) in enumerate(where)]
-        pg_conds = [f"{c} {op} {typed(t, c, i + 1)}" for i, (c, op, _) in enumerate(where)]
+        select = f"{fn}({'DISTINCT ' if distinct else ''}{count})" if count else ", ".join(targets)
+        conds = [compared(t, c, op, v, i + 1, False) for i, (c, op, v) in enumerate(where)]
+        pg_conds = [compared(t, c, op, v, i + 1, True) for i, (c, op, v) in enumerate(where)]
         tail = (" ORDER BY " + ", ".join(c + (" DESC" if d else "") for c, d in order) if order else "") + (
             f" LIMIT {limit}" if limit is not None else "")
         sql = f"SELECT {select} FROM {name} WHERE {' AND '.join(conds)}{tail}"
-        params = [v for _, _, v in where]
+        params = [param_value(v) for _, _, v in where]
         types = [t.column(c).type for c in cols]
-        if not served(t, [(c, op) for c, op, _ in where], list(order), used):
+        if not served(t, conjuncts(where), list(order), used):
             self.no_plan(name, sql, params, types)
             return
         pg_sql = f"SELECT {select} FROM {name} WHERE {' AND '.join(pg_conds)}{tail}"
@@ -492,9 +564,9 @@ class SqlMachine(RuleBasedStateMachine):
         sides when the planner serves it, else the layer must refuse it with
         no plan."""
         t = self.tables[name]
-        conds = [f"{c} {op} ${i + 1}" for i, (c, op, _) in enumerate(where)]
-        pg_conds = [f"{c} {op} {typed(t, c, i + 1)}" for i, (c, op, _) in enumerate(where)]
-        params = [v for _, _, v in where]
+        conds = [compared(t, c, op, v, i + 1, False) for i, (c, op, v) in enumerate(where)]
+        pg_conds = [compared(t, c, op, v, i + 1, True) for i, (c, op, v) in enumerate(where)]
+        params = [param_value(v) for _, _, v in where]
         types = [t.column(c).type for c, _, _ in where]
         if set_to is None:
             head = pg_head = f"DELETE FROM {name}"
@@ -510,7 +582,7 @@ class SqlMachine(RuleBasedStateMachine):
             params.append(value)
             types.append(t.column(col).type)
         sql = f"{head} WHERE {' AND '.join(conds)}"
-        if not served(t, [(c, op) for c, op, _ in where], [], []):
+        if not served(t, conjuncts(where), [], []):
             self.no_plan(name, sql, params, types)
             return None
         return self.both(sql, params, pg_sql=f"{pg_head} WHERE {' AND '.join(pg_conds)}", types=types)
@@ -554,6 +626,53 @@ class SqlMachine(RuleBasedStateMachine):
         params = [*keys[0], *keys[1]]
         return self.both(text(conds), params, pg_sql=text(pg_conds),
                          types=[a.column(c).type for c in a.pk] + [b.column(c).type for c in b.pk])
+
+    def join_on(self, a_name: str, b_name: str, where_a: list[tuple[str, str, object]],
+                keys_b: list[tuple[str, tuple[str, object]]], filters_b: list[tuple[str, str, object]],
+                targets: list[tuple[str, str]], limit: int | None = None, distinct: tuple[str, str] | None = None) -> None:
+        """SELECT targets (or COUNT(DISTINCT table.col)) FROM a, b WHERE a's
+        conjuncts, each of b's key parts equal to a column of a ("col", name)
+        or to a parameter ("param", value), and b's filters: on both sides
+        when the planner serves it, else the layer must refuse it with no
+        plan."""
+        a, b = self.tables[a_name], self.tables[b_name]
+        conds, pg_conds, params, types = [], [], [], []
+        def add(t, c, op, v):
+            n = len(params) + 1
+            conds.append(compared(t, c, op, v, n, False, True))
+            pg_conds.append(compared(t, c, op, v, n, True, True))
+            params.append(param_value(v))
+            types.append(t.column(c).type)
+        for c, op, v in where_a:
+            add(a, c, op, v)
+        on = []
+        for c, (kind, v) in keys_b:
+            if kind == "col":
+                conds.append(f"{b_name}.{c} = {a_name}.{v}")
+                pg_conds.append(conds[-1])
+                on.append((v, c))
+            else:
+                add(b, c, "=", v)
+        for c, op, v in filters_b:
+            add(b, c, op, v)
+        select = f"count(DISTINCT {distinct[0]}.{distinct[1]})" if distinct else ", ".join(f"{t}.{c}" for t, c in targets)
+        tail = f" LIMIT {limit}" if limit is not None else ""
+        sql = f"SELECT {select} FROM {a_name}, {b_name} WHERE {' AND '.join(conds)}{tail}"
+        pg_sql = f"SELECT {select} FROM {a_name}, {b_name} WHERE {' AND '.join(pg_conds)}"
+        conj_b = [(c, "=", False) for c, (kind, _) in keys_b if kind == "param"] + conjuncts(filters_b)
+        if not join_served(a, conjuncts(where_a), b, conj_b, on):
+            self.no_plan(a_name, sql, params, types)
+            return
+        if distinct:
+            self.both(sql, params, pg_sql=pg_sql + tail, types=types)
+            return
+        layer = o.run_layer(self.db if self.txn is None else self.txn, sql, [o.to_layer(v, ty) for v, ty in zip(params, types)])
+        full = o.run_pg(self.pg.conn, pg_sql, params)
+        assert layer.error == full.error, f"{sql} {params!r}: the layer {layer.error or 'ran it'} ({layer.detail}), PostgreSQL {full.error or 'ran it'} ({full.detail})"
+        if layer.error is not None:
+            return
+        why = o.same_rows(layer.rows, full.rows, None, limit)
+        assert why is None, f"{sql} {params!r}: {why}: the layer returned {layer.rows}, PostgreSQL {full.rows}"
 
     def begin(self) -> None:
         # PostgreSQL's REPEATABLE READ, like the layer's, takes its snapshot
@@ -729,6 +848,16 @@ class SqlMachine(RuleBasedStateMachine):
             bounds = data.draw(st.sampled_from([(">",), (">=",), ("<",), ("<=",), (">", "<"), (">=", "<="), (">=", "<")]),
                                label="bounds")
             where += [(c, op, value(c)) for op in bounds]
+        # Now and then an INTEGER conjunct's operand is $n + k, mostly the
+        # same value; and a filter or two on any column.
+        for i, (c, op, v) in enumerate(where):
+            if t.column(c).type.sql == "integer" and isinstance(v, int) and data.draw(st.integers(0, 5), label=f"{c} $n + k?") == 0:
+                k = data.draw(st.integers(-30, 30), label="k")
+                where[i] = (c, op, Calc(v - k if data.draw(st.integers(0, 3), label="same value?") else v, k))
+        for i in range(data.draw(st.integers(0, 2), label="filters")):
+            c = data.draw(st.sampled_from(names), label=f"filter {i}")
+            op = data.draw(st.sampled_from(["=", "<", "<=", ">", ">="]), label=f"filter {i} op")
+            where.append((c, op, value(c)))
         return data.draw(st.permutations(where), label="where order"), parts, run
 
     @precondition(lambda self: self.tables)
@@ -764,8 +893,9 @@ class SqlMachine(RuleBasedStateMachine):
         if not where:
             return
         arg = data.draw(st.sampled_from(["*"] + [c.name for c in t.columns]), label="count of")
+        distinct = arg != "*" and data.draw(st.booleans(), label="DISTINCT")
         limit = data.draw(st.none() | st.sampled_from([0, 1]), label="limit")
-        self.select(t.name, [], where, limit=limit, count=arg)
+        self.select(t.name, [], where, limit=limit, count=arg, distinct=distinct)
 
     @precondition(lambda self: self.tables)
     @rule(data=st.data())
@@ -866,6 +996,42 @@ class SqlMachine(RuleBasedStateMachine):
         columns = [(t.name, c.name) for t in sides for c in t.columns]
         targets = data.draw(st.lists(st.sampled_from(columns), min_size=1, max_size=4, unique=True), label="targets")
         self.join(names, targets, (keys[0], keys[1]), on=data.draw(st.booleans(), label="JOIN ON"))
+
+    @precondition(lambda self: len(self.tables) >= 2)
+    @rule(data=st.data())
+    def join_on_a_column(self, data):
+        # b's key parts each from a column of a of its type, or a parameter.
+        a_name, b_name = data.draw(st.permutations(sorted(self.tables)), label="tables")[:2]
+        a, b = self.tables[a_name], self.tables[b_name]
+        rows_b = self.existing_rows(b)
+        row_b = data.draw(st.sampled_from(rows_b), label="b row") if rows_b and data.draw(st.booleans(), label="b row?") else None
+        keys_b = []
+        for c in b.pk:
+            same = [x.name for x in a.columns if x.type.sql == b.column(c).type.sql]
+            if same and data.draw(st.integers(0, 3), label=f"{c} joined?"):
+                keys_b.append((c, ("col", data.draw(st.sampled_from(same), label=f"{c} on"))))
+            else:
+                v = row_b[[x.name for x in b.columns].index(c)] if row_b is not None else data.draw(values(b.column(c).type), label=c)
+                keys_b.append((c, ("param", v)))
+        if not any(kind == "col" for _, (kind, _) in keys_b):
+            return
+        where_a, _, _ = self.where_on_a_path(data, a)
+        if not where_a:
+            return
+        filters_b = []
+        if data.draw(st.integers(0, 2), label="b filter?") == 0:
+            c = data.draw(st.sampled_from([x.name for x in b.columns]), label="b filter")
+            filters_b.append((c, data.draw(st.sampled_from(["=", "<", ">="]), label="b op"),
+                              data.draw(st.none() | values(b.column(c).type), label="b value")))
+        if data.draw(st.integers(0, 3), label="COUNT(DISTINCT)?") == 0:
+            t = data.draw(st.sampled_from([a, b]), label="distinct of")
+            self.join_on(a_name, b_name, where_a, keys_b, filters_b, [],
+                         distinct=(t.name, data.draw(st.sampled_from([x.name for x in t.columns]), label="column")))
+            return
+        columns = [(t.name, x.name) for t in (a, b) for x in t.columns]
+        targets = data.draw(st.lists(st.sampled_from(columns), min_size=1, max_size=3, unique=True), label="targets")
+        self.join_on(a_name, b_name, where_a, keys_b, filters_b, targets,
+                     limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"))
 
     @precondition(lambda self: self.txn is None)
     @rule()
@@ -1577,5 +1743,109 @@ def test_an_update_parameter_is_checked_against_its_narrowest_use(dsn):
                 assert m.both(sql, (decimal.Decimal("123.45"), key), types=types).error == "22003"
             assert m.both(sql, (decimal.Decimal("12.34"), 1), types=types).affected == 1
         m.check()
+    finally:
+        m.teardown()
+
+
+def test_filters_on_what_the_key_does_not_take(dsn):
+    """A conjunct the key does not take filters each row: on a point lookup,
+    a scan, an UPDATE and a DELETE, by every operator, NULL on either side
+    rejecting the row. One on a DOUBLE column is refused with no plan."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER, nullable=False),
+                              Column("c2", o.SMALLINT), Column("c3", o.TEXT), Column("c4", o.DOUBLE)], ["c0", "c1"]))
+        for c1, c2, c3 in ((1, 5, "b"), (2, None, "a"), (3, 7, None), (4, 5, "c"), (5, 9, "ab")):
+            m.insert("t0", {"c0": 0, "c1": c1, "c2": c2, "c3": c3, "c4": 1.5}, all_columns=True)
+        for op in ("=", "<", "<=", ">", ">="):
+            for v in (5, None):
+                m.select("t0", ["c1", "c2"], [("c0", "=", 0), ("c2", op, v)])
+                m.select("t0", ["c1"], [("c0", "=", 0), ("c1", "=", 4), ("c2", op, v)])
+            m.select("t0", ["c1", "c3"], [("c0", "=", 0), ("c1", ">", 1), ("c3", op, "ab")], limit=2)
+            m.select("t0", [], [("c0", "=", 0), ("c3", op, "b")], count="*")
+        m.select("t0", ["c1"], [("c0", "=", 0), ("c4", "=", 1.5)])  # refused: a DOUBLE filter
+        assert m.write("t0", [("c0", "=", 0), ("c2", "=", 5)], ("c3", "=", "five")).affected == 2
+        assert m.write("t0", [("c0", "=", 0), ("c1", "=", 3), ("c2", ">", 8)], ("c3", "=", "x")).affected == 0
+        assert m.write("t0", [("c0", "=", 0), ("c3", "<", "b")]).affected == 2
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_a_bound_of_a_parameter_plus_an_integer(dsn):
+    """col op $n ± k on an INTEGER column: a range bound, or a filter for =;
+    a NULL $n matches nothing, and a sum outside INTEGER is 22003 on both
+    sides, before any row is read."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER, nullable=False),
+                              Column("c2", o.INTEGER)], ["c0", "c1"]))
+        for c1 in range(10):
+            m.insert("t0", {"c0": 1, "c1": c1 * 10, "c2": c1}, all_columns=True)
+        for k in (-20, 0, 5):
+            m.select("t0", ["c1"], [("c0", "=", 1), ("c1", "<", 60), ("c1", ">=", Calc(60, k))])
+            m.select("t0", ["c1"], [("c0", "=", 1), ("c1", "=", Calc(30 - k, k))])
+            m.select("t0", ["c1"], [("c0", "=", 1), ("c2", "<", Calc(5 - k, k))])
+        m.select("t0", ["c1"], [("c0", "=", 1), ("c1", ">=", Calc(None, -20))])
+        m.select("t0", ["c1"], [("c0", "=", None), ("c1", ">=", Calc(-2**31, -20))])  # 22003, the key NULL
+        m.select("t0", ["c1"], [("c0", "=", 1), ("c1", "<", Calc(2**31 - 1, 1))])  # 22003
+        assert m.write("t0", [("c0", "=", 1), ("c1", ">", Calc(70, 10))]).affected == 1
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_a_join_on_a_column(dsn):
+    """FROM a, b with each of b's key parts equal to a column of a or to a
+    parameter: a scanned, b read by its key from each a row. A NULL join
+    column or a missing b row joins nothing; filters on either side; LIMIT
+    and COUNT(DISTINCT) over the pairs."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER, nullable=False),
+                              Column("c2", o.INTEGER)], ["c0", "c1"]))
+        m.create(Table("t1", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER, nullable=False),
+                              Column("c2", o.SMALLINT)], ["c0", "c1"]))
+        for c1, c2 in ((1, 10), (2, 20), (3, None), (4, 30), (5, 10), (6, 40)):
+            m.insert("t0", {"c0": 1, "c1": c1, "c2": c2}, all_columns=True)
+        for c0, q in ((10, 5), (20, 50), (30, 7)):
+            m.insert("t1", {"c0": c0, "c1": 1, "c2": q}, all_columns=True)
+        keys = [("c0", ("col", "c2")), ("c1", ("param", 1))]
+        for where in ([("c0", "=", 1)], [("c0", "=", 1), ("c1", "<", 6), ("c1", ">=", Calc(6, -4))],
+                      [("c0", "=", 1), ("c1", "=", 1)], [("c0", "=", None)]):
+            for filters in ([], [("c2", "<", 10)], [("c2", "<", None)]):
+                m.join_on("t0", "t1", where, keys, filters, [("t0", "c1"), ("t1", "c2")])
+                m.join_on("t0", "t1", where, keys, filters, [], distinct=("t1", "c0"))
+            m.join_on("t0", "t1", where, keys, [], [("t1", "c0")], limit=2)
+        # t0 is not reached from its parameters, nor t1 from its: no plan.
+        m.join_on("t0", "t1", [("c2", "=", 1)], [("c0", ("col", "c2")), ("c1", ("col", "c1"))], [], [("t0", "c1")])
+        # An outer value too long for any key joins nothing, as in PostgreSQL;
+        # it still counts as a distinct value.
+        m.create(Table("t2", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.TEXT)], ["c0"]))
+        m.create(Table("t3", [Column("c0", o.TEXT, nullable=False), Column("c1", o.INTEGER)], ["c0"]))
+        for c0, c1 in ((1, "a"), (2, "x" * 70000), (3, "b"), (4, "x" * 70000)):
+            m.insert("t2", {"c0": c0, "c1": c1}, all_columns=True)
+        for c0, c1 in (("a", 1), ("b", 2)):
+            m.insert("t3", {"c0": c0, "c1": c1}, all_columns=True)
+        m.join_on("t2", "t3", [("c0", ">=", 1)], [("c0", ("col", "c1"))], [], [("t2", "c0"), ("t3", "c1")])
+        m.select("t2", [], [("c0", ">=", 1)], count="c1", distinct=True)
+    finally:
+        m.teardown()
+
+
+def test_count_distinct(dsn):
+    """COUNT(DISTINCT col) counts distinct non-NULL values, -0.0 and 0.0 as
+    one; 0 over no rows, and none under LIMIT 0."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER, nullable=False),
+                              Column("c2", o.TEXT), Column("c3", o.DOUBLE)], ["c0", "c1"]))
+        for c1, c2, c3 in ((1, "a", 0.0), (2, "b", -0.0), (3, None, 1.5), (4, "a", None), (5, "b", 1.5)):
+            m.insert("t0", {"c0": 1, "c1": c1, "c2": c2, "c3": c3}, all_columns=True)
+        for arg in ("c1", "c2", "c3"):
+            for key in (1, 2, None):
+                m.select("t0", [], [("c0", "=", key)], count=arg, distinct=True)
+            m.select("t0", [], [("c0", "=", 1), ("c1", "=", 3)], count=arg, distinct=True)
+            m.select("t0", [], [("c0", "=", 1)], count=arg, distinct=True, limit=0)
     finally:
         m.teardown()

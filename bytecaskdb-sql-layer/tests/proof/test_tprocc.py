@@ -1,21 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Gustavo Amigo
-"""TPROC-C's Payment, Order-Status, New-Order and Delivery through SQL,
-against PostgreSQL (docs/frontend_design.md, *Tests*, slices 1, 3 and 4).
+"""TPROC-C's five transactions through SQL, against PostgreSQL
+(docs/frontend_design.md, *Tests*, slices 1 and 3 to 5).
 
 A small fixture (one warehouse, two districts, thirty customers each, a few
 orders per customer) is loaded on both sides. Then a fixed seed runs a mix
-of the two transactions on one thread: each statement of
+of the transactions on one thread: each statement of
 docs/frontend_design.md's P1-P11 and O1-O5 goes to the layer in a
 `Transaction` and to PostgreSQL in a REPEATABLE READ transaction, with the
 client's logic (the customer by last name, the new balance and c_data)
 between them, as HammerDB's driver keeps it. New-Order's N1-N9 run
 the same way, one order in twenty naming an item that does not exist
-(the specification's one in a hundred would rarely come up in this short run), which
-the client rolls back on both sides. Delivery's D1-D7 deliver the oldest
-undelivered order of each district: the load leaves the orders without a
-carrier undelivered, in new_order. Every statement's result must agree,
-and so must every table after the run.
+(the specification's one in a hundred would rarely come up in this short
+run), which the client rolls back on both sides. Delivery's D1-D7 deliver
+the oldest undelivered order of each district: the load leaves the orders
+without a carrier undelivered, in new_order. Stock-Level's S1 and S2 count
+the low-stock items of a district's last twenty orders. Every statement's
+result must agree, and so must every table after the run.
 
 The layer takes a DECIMAL parameter as its scaled integer and a TIMESTAMP
 as microseconds since 1970; PostgreSQL takes decimal.Decimal and datetime.
@@ -366,6 +367,20 @@ def delivery(p: Pair, rng: random.Random) -> None:
     p.commit()
 
 
+def stock_level(p: Pair, rng: random.Random) -> None:
+    """The distinct items of the district's last twenty orders whose stock is
+    under a threshold. The threshold is drawn wider than the specification's
+    10 to 20, so this short run's counts are not all 0."""
+    d = rng.randint(1, DISTRICTS)
+    threshold = rng.randint(10, 60)
+    p.begin()
+    [(next_o_id,)] = p.run("SELECT d_next_o_id FROM district WHERE d_w_id = $1 AND d_id = $2", (1, d), (INT, INT))
+    p.run("SELECT COUNT(DISTINCT s_i_id) FROM order_line, stock WHERE ol_w_id = $1 AND ol_d_id = $2 "
+          "AND ol_o_id < $3 AND ol_o_id >= $3 - 20 AND s_w_id = $1 AND s_i_id = ol_i_id AND s_quantity < $4",
+          (1, d, next_o_id, threshold), (INT, INT, INT, INT))
+    p.commit()
+
+
 def tables_agree(p: Pair) -> None:
     for t in p.db.catalog():
         cols = ", ".join(c["name"] for c in t["columns"])
@@ -375,7 +390,7 @@ def tables_agree(p: Pair) -> None:
         assert o.strict(layer) == o.strict(pg_rows), f"table {t['name']}: the layer and PostgreSQL differ"
 
 
-def test_payment_order_status_new_order_and_delivery_agree_with_postgresql(dsn):
+def test_the_five_transactions_agree_with_postgresql(dsn):
     p = Pair(dsn)
     try:
         rng = random.Random(487)
@@ -384,6 +399,8 @@ def test_payment_order_status_new_order_and_delivery_agree_with_postgresql(dsn):
             pick = rng.random()
             if h_id % 10 == 9:  # the specification's 4% would leave this run one or two
                 delivery(p, rng)
+            elif h_id % 10 == 4:  # likewise
+                stock_level(p, rng)
             elif pick < 0.45:
                 new_order(p, rng)
             elif pick < 0.88:
