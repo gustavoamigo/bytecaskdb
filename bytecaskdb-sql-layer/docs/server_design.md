@@ -5,13 +5,21 @@ Status: design, for review (#494's first slice).
 The MVP gate is HammerDB's TPROC-C driving the layer over PostgreSQL's
 wire protocol (`frontend_design.md`, *The MVP gate*). This slice is the
 server that HammerDB connects to and the HammerDB driver script that sends
-our statements. The harness of `testing_design.md` (*The TPC-C harness*) stays: it checks the consistency conditions, runs Elle and the CI smoke
-test, and gives the no-network baseline. It is not the gate.
+our statements. The harness of `testing_design.md` (*The TPROC-C
+harness*) stays: it checks the consistency conditions, runs Elle and the
+CI smoke test, and gives the no-network baseline. It is not the gate.
 
 #494 planned a gRPC server first, with the PostgreSQL protocol as a shim in
 front of it. The gate needs the PostgreSQL protocol and nothing else, so the
 protocol comes first, as a thin stateful front over the embedded API. gRPC
 stays in #494, after this slice.
+
+Names: the benchmark is HammerDB's TPROC-C, and this design uses that name
+for the layer's files and binaries. The harness is `sql_layer_tpcc` and
+`harness/tpcc.cppm` on main today. They become `sql_layer_tprocc` and
+`harness/tprocc.cppm` in one rename PR, and this design uses the new names.
+HammerDB's own identifiers, `dbset bm TPC-C` and `diset tpcc …`, are the
+tool's and stay.
 
 ## Scope
 
@@ -488,7 +496,7 @@ procedures (or functions) through SQL `PREPARE`. Its monitor also reads
    is one snapshot; the layer has no full-table `SUM`.
 3. It sleeps for the duration, then reads both again.
 4. It prints `testresult $nopm $tpm` with HammerDB's own procedure:
-   - NOPM is the `d_next_o_id` delta per minute, TPC-C's definition and
+   - NOPM is the `d_next_o_id` delta per minute, the benchmark specification's definition and
      HammerDB's;
    - TPM is commits plus rollbacks plus failures per minute, which
      `xact_commit + xact_rollback` would count.
@@ -496,9 +504,9 @@ procedures (or functions) through SQL `PREPARE`. Its monitor also reads
 
 The output is HammerDB's line, `System achieved N NOPM from M … TPM`.
 
-**The statements.** They are those of `harness/tpcc.cppm`, which the proof
+**The statements.** They are those of `harness/tprocc.cppm`, which the proof
 suite checks against PostgreSQL 17, and the script must not drift from
-them. `sql_layer_tpcc statements` prints the harness's, and
+them. `sql_layer_tprocc statements` prints the harness's, and
 `scripts/check_driver_statements.py` (in the layer) fails CI if the
 script's set differs.
 
@@ -522,9 +530,9 @@ only makes it possible.
 [--data-root=PATH] [--smoke]`. It follows `run-hammerdb.sh` in the MariaDB
 plugin. `--smoke` is the short run of *Tests*.
 
-1. **Build.** It builds `sql_layer_tpcc` and `sql_layer_server` in
+1. **Build.** It builds `sql_layer_tprocc` and `sql_layer_server` in
    `releasedbg`; a debug engine walks the key directory on every commit.
-2. **Load.** It loads W warehouses once with `sql_layer_tpcc load`, not
+2. **Load.** It loads W warehouses once with `sql_layer_tprocc load`, not
    HammerDB's `buildschema`, and keeps the directory as the pristine copy.
 3. **Per user count:**
    - restore the copy (a reflink where the filesystem has them);
@@ -538,7 +546,7 @@ plugin. `--smoke` is the short run of *Tests*.
      `vudestroy`;
    - parse the result line;
    - stop the server with `SIGTERM`;
-   - run `sql_layer_tpcc check --dir`, conditions 1, 8 and 9, on what the
+   - run `sql_layer_tprocc check --dir`, conditions 1, 8 and 9, on what the
      run left.
 
    A cell whose check fails is reported as failed, whatever its NOPM.
@@ -547,7 +555,7 @@ plugin. `--smoke` is the short run of *Tests*.
    layer's `.gitignore` ignores: date, commit, W, users, ramp-up,
    duration, NOPM, TPM, errors by SQLSTATE, and the check's result.
 
-`sql_layer_tpcc check` is a new command over the harness's existing
+`sql_layer_tprocc check` is a new command over the harness's existing
 `consistency()`.
 
 ## Tests
@@ -578,7 +586,7 @@ plugin. `--smoke` is the short run of *Tests*.
 - **HammerDB smoke, manual or nightly, not per PR.** It runs
   `run-gate.sh --smoke`: one warehouse, two users, no ramp-up and a
   one-minute window, against the server and against PostgreSQL 17. It then
-  runs `sql_layer_tpcc check` and the same conditions on PostgreSQL. It
+  runs `sql_layer_tprocc check` and the same conditions on PostgreSQL. It
   needs HammerDB's Linux release. Per PR, CI runs the wire proof target and
   `test_wire.py`.
 - **`scripts/check_driver_statements.py`** in CI.

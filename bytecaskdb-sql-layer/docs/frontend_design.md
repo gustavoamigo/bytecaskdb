@@ -631,9 +631,9 @@ driving the layer over PostgreSQL's wire protocol through
 of our own, a pgtcl port of its MySQL client-side TPROC-C logic, which
 sends the statements above (*Where the statements come from*): one
 `Transaction` per TPROC-C transaction, `BEGIN` to `COMMIT`. The gate's
-numbers are HammerDB's NOPM and TPM, and each run ends with TPC-C's
+numbers are HammerDB's NOPM and TPM, and each run ends with the benchmark's
 consistency conditions checked on what it left. The harness
-(`docs/testing_design.md`, *The TPC-C harness*) stays, but it is not the
+(`docs/testing_design.md`, *The TPROC-C harness*) stays, but it is not the
 gate. It checks the consistency conditions, runs Elle through SQL (#487,
 2.6) and the CI smoke test, and gives the embedded API's numbers with no
 network, beside `commit_probe`. There is no InnoDB comparison for now
