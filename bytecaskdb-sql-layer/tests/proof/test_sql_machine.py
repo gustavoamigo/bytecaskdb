@@ -1744,6 +1744,16 @@ def test_a_join_on_a_column(dsn):
             m.join_on("t0", "t1", where, keys, [], [("t1", "c0")], limit=2)
         # t0 is not reached from its parameters, nor t1 from its: no plan.
         m.join_on("t0", "t1", [("c2", "=", 1)], [("c0", ("col", "c2")), ("c1", ("col", "c1"))], [], [("t0", "c1")])
+        # An outer value too long for any key joins nothing, as in PostgreSQL;
+        # it still counts as a distinct value.
+        m.create(Table("t2", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.TEXT)], ["c0"]))
+        m.create(Table("t3", [Column("c0", o.TEXT, nullable=False), Column("c1", o.INTEGER)], ["c0"]))
+        for c0, c1 in ((1, "a"), (2, "x" * 70000), (3, "b"), (4, "x" * 70000)):
+            m.insert("t2", {"c0": c0, "c1": c1}, all_columns=True)
+        for c0, c1 in (("a", 1), ("b", 2)):
+            m.insert("t3", {"c0": c0, "c1": c1}, all_columns=True)
+        m.join_on("t2", "t3", [("c0", ">=", 1)], [("c0", ("col", "c1"))], [], [("t2", "c0"), ("t3", "c1")])
+        m.select("t2", [], [("c0", ">=", 1)], count="c1", distinct=True)
     finally:
         m.teardown()
 

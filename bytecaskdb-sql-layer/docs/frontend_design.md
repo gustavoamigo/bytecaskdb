@@ -689,14 +689,18 @@ its transaction test.
      as a mem-comparable key part, so equal values group as PostgreSQL
      groups them (`-0.0` with `0.0`). It is a group key, so it has no key
      ceiling, and a scan's row holds it only until the cursor moves. The
-     groups' bound is 16 MiB; past it
-     the statement fails with `BC_E_MEMORY`. Only `bc_agg_open` with no
+     groups' bound is 16 MiB, each group counted as its key's bytes plus
+     112 for what holds it; past it the statement fails with
+     `BC_E_MEMORY`. Only `bc_agg_open` with no
      slots, `bc_agg_group` and `bc_agg_next` are implemented.
    - Aggregates are allowed on joins, over the pairs.
    - A join reads each inner row, and builds its key and a `COUNT(DISTINCT)`
      group key, in the statement's arena, which is reset only when the
      statement ends. A join over enough outer rows to fill it fails with
-     `BC_E_MEMORY`; S2 reads about two hundred.
+     `BC_E_MEMORY`; S2 reads about two hundred (#551).
+   - An inner key past the engine's key ceiling, built from a long outer
+     value, names no row: `bc_key_fits`, a third addition, is asked before
+     `bc_key_end`, and the outer row joins nothing, as in PostgreSQL.
 
 Then the MVP gate.
 

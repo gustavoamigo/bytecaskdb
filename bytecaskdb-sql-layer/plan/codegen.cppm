@@ -239,7 +239,10 @@ struct KeySrc {
 
 // A key of `object` from its leading parts, as an expression. One
 // bc_key_params when they are consecutive parameters, a builder otherwise.
-auto key(Writer& w, std::uint32_t object, const std::vector<KeySrc>& parts) -> std::string {
+// In a loop, `miss_if_long` skips to the next iteration when a byte string
+// read from a row makes the key too long for any row to have.
+auto key(Writer& w, std::uint32_t object, const std::vector<KeySrc>& parts, bool miss_if_long = false)
+    -> std::string {
   auto consecutive = !parts.empty() && parts[0].param.has_value();
   for (std::size_t i = 1; consecutive && i < parts.size(); ++i) {
     consecutive = parts[i].param.has_value() && *parts[i].param == *parts[0].param + i;
@@ -259,6 +262,9 @@ auto key(Writer& w, std::uint32_t object, const std::vector<KeySrc>& parts) -> s
       w.line("bc_key_" + suffix(p.type) + "(cx, " + k + ", " + p.value + ");");
     }
   }
+  auto long_value =
+      std::ranges::any_of(parts, [](const KeySrc& p) { return !p.value.empty() && p.type == PhysType::Bytes; });
+  if (miss_if_long && long_value) w.line("if (!bc_key_fits(cx, " + k + ")) continue;");
   return "bc_key_end(cx, " + k + ")";
 }
 
@@ -762,7 +768,8 @@ void print_loop_join(Writer& w, const ir::Select& s, const ir::LoopJoin& j) {
   }
   w.reads(inner);
   w.line("bool found1 = false;");
-  w.line("bc_view row1 = bc_get(cx, " + key(w, inner, parts) + ", &found1);");
+  auto inner_key = key(w, inner, parts, true);  // a long outer value names no inner row
+  w.line("bc_view row1 = bc_get(cx, " + inner_key + ", &found1);");
   w.line("if (!found1) continue;");
   skip_failing(w, s.filters, row_of, [&](const ir::Filter& f) { return f.col.table == inner; });
   if (s.aggregate && !s.aggregate->arg) {

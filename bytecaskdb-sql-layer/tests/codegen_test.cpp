@@ -303,5 +303,14 @@ TEST_CASE("codegen: a join is of two point lookups, in FROM order", "[sql][codeg
   // Both orders refused: the first one's refusal stands.
   CHECK(refusal("SELECT c FROM x, y WHERE c = $1 AND yk = $2 AND f = yf AND yf = $3") ==
         "no plan: a filter on column \"yf\", a REAL or DOUBLE PRECISION, is not supported yet");
+  // A long outer value makes an inner key no row has: that outer row joins nothing.
+  f.ddl(CreateTableDdl{"s", {Fixture::col("sk", PhysType::Bytes, false)}, {"sk"}});
+  auto by_bytes = generate(f.cat(), "SELECT id FROM t, s WHERE name >= $1 AND sk = name");
+  auto fits = by_bytes.source.find("if (!bc_key_fits(cx, k0)) continue;");
+  auto get = by_bytes.source.find("bc_view row1 = bc_get(cx, bc_key_end(cx, k0), &found1);");
+  REQUIRE(fits != std::string::npos);
+  REQUIRE(get != std::string::npos);
+  CHECK(fits < get);
+  CHECK(loop.source.find("bc_key_fits") == std::string::npos);  // an integer key always fits
 }
 

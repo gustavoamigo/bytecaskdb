@@ -76,6 +76,10 @@ static_assert(static_cast<int>(PhysType::Bytes) == BC_T_BYTES);
 namespace {
 
 constexpr std::uint32_t kNoCursor = UINT32_MAX;
+// What an aggregate group holds besides its key's bytes, counted against the
+// aggregate's bound: a map node (tree links, the key's header, the index),
+// the allocator's headers for it and the key, and the order entry.
+constexpr std::uint64_t kGroupOverhead = 112;
 // What a transaction's bound counts for what it holds: a conservative bound,
 // never less than the memory used. Each heap block costs its capacity plus
 // the allocator's header and rounding (kAllocBytes, an over-estimate); a map
@@ -553,11 +557,13 @@ struct bc_ctx {
   // The aggregates bc_agg_open made: their groups' keys, in first-appearance
   // order. Kept until reset; a group key's view reads its Bytes, which a
   // move of the vector keeps where it is.
+  // Each group's key is held once, in `index`; `order` points at it, in
+  // first-appearance order (a map node never moves).
   struct Agg {
-    std::uint64_t bound;  // the bytes its keys may hold
+    std::uint64_t bound;  // the bytes its groups may hold, kGroupOverhead each included
     std::uint64_t used{0};
-    std::vector<Bytes> keys;
     std::map<Bytes, std::uint32_t, BytesLess> index;
+    std::vector<const Bytes*> order;
     std::size_t next{0};
   };
   std::vector<Agg> aggs;
@@ -2521,6 +2527,14 @@ bc_view bc_key_end(bc_ctx* cx, bc_key k) {
   return {};
 }
 
+bool bc_key_fits(bc_ctx* cx, bc_key k) {
+  BC_GUARD_BEGIN
+  const auto* b = cx->resolve_handle(k, cx->keys, "key builder");
+  return b != nullptr && b->buf.size() <= bytecask::sql::kMaxKeyBytes;
+  BC_GUARD_END(cx)
+  return false;
+}
+
 bc_view bc_key_params(bc_ctx* cx, uint32_t table_or_index, uint32_t first, uint32_t n) {
   BC_GUARD_BEGIN
   const auto* kl = cx->key_layout(table_or_index);
@@ -3108,17 +3122,16 @@ bc_group bc_agg_group(bc_ctx* cx, bc_agg a, bc_view group_key) {
   if (agg == nullptr) return {};
   auto key = cx->resolve(group_key);
   if (!key || !cx->ok()) return {};
-  Bytes k(key->begin(), key->end());
-  if (auto it = agg->index.find(k); it != agg->index.end()) return {it->second, cx->epoch};
-  // A key held twice, in the list and the index, and counted so.
-  if (agg->used + 2 * k.size() > agg->bound) {
+  if (auto it = agg->index.find(*key); it != agg->index.end()) return {it->second, cx->epoch};
+  const auto cost = key->size() + kGroupOverhead;
+  if (agg->used + cost > agg->bound) {
     cx->fail(BC_E_MEMORY, "aggregate over its bound of " + std::to_string(agg->bound) + " bytes");
     return {};
   }
-  auto i = static_cast<std::uint32_t>(agg->keys.size());
-  agg->keys.push_back(k);
-  agg->index.emplace(std::move(k), i);
-  agg->used += 2 * agg->keys.back().size();
+  auto i = static_cast<std::uint32_t>(agg->order.size());
+  auto it = agg->index.emplace(Bytes(key->begin(), key->end()), i).first;
+  agg->order.push_back(&it->first);
+  agg->used += cost;
   return {i, cx->epoch};
   BC_GUARD_END(cx)
   return {};
@@ -3131,10 +3144,10 @@ void bc_agg_count(bc_ctx* cx, bc_group, uint32_t) { cx->unimplemented("bc_agg_co
 bool bc_agg_next(bc_ctx* cx, bc_agg a, bc_view* group_key, bc_group* g) {
   BC_GUARD_BEGIN
   auto* agg = cx->resolve_handle(a, cx->aggs, "aggregate");
-  if (agg == nullptr || agg->next >= agg->keys.size()) return false;
+  if (agg == nullptr || agg->next >= agg->order.size()) return false;
   if (!cx->charge()) return false;
   auto i = agg->next++;
-  const auto& k = agg->keys[i];
+  const auto& k = *agg->order[i];
   if (group_key != nullptr) *group_key = cx->make_view(k.data(), k.size());
   if (g != nullptr) *g = {static_cast<std::uint32_t>(i), cx->epoch};
   return true;

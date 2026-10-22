@@ -178,6 +178,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_key_null", fn_addr(bc_key_null)},
       {"bc_key_param", fn_addr(bc_key_param)},
       {"bc_key_end", fn_addr(bc_key_end)},
+      {"bc_key_fits", fn_addr(bc_key_fits)},
       {"bc_key_params", fn_addr(bc_key_params)},
       {"bc_key_successor", fn_addr(bc_key_successor)},
       {"bc_get", fn_addr(bc_get)},

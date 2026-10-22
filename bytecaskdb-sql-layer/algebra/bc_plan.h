@@ -215,6 +215,7 @@ void     bc_key_bytes(bc_ctx *, bc_key, bc_view);
 void     bc_key_null(bc_ctx *, bc_key);
 void     bc_key_param(bc_ctx *, bc_key, uint32_t i);  /* parameter i as the next part, NULL included */
 bc_view  bc_key_end(bc_ctx *, bc_key);
+bool     bc_key_fits(bc_ctx *, bc_key);  /* the key so far is within the engine's key ceiling: past it, no row has it */
 bc_view  bc_key_params(bc_ctx *, uint32_t table_or_index, uint32_t first, uint32_t n);  /* parts from params first.. */
 bc_view  bc_key_successor(bc_ctx *, bc_view key);     /* smallest key greater than every key with this prefix */
 

@@ -492,6 +492,7 @@ void     bc_key_bytes(bc_ctx *, bc_key, bc_view);
 void     bc_key_null(bc_ctx *, bc_key);
 void     bc_key_param(bc_ctx *, bc_key, uint32_t i);  /* parameter i as the next part, NULL included */
 bc_view  bc_key_end(bc_ctx *, bc_key);
+bool     bc_key_fits(bc_ctx *, bc_key);
 bc_view  bc_key_params(bc_ctx *, uint32_t table_or_index, uint32_t first, uint32_t n);  /* parts from params first.. */
 bc_view  bc_key_successor(bc_ctx *, bc_view key);     /* smallest key greater than every key with this prefix */
 ```
@@ -502,6 +503,7 @@ bc_view  bc_key_successor(bc_ctx *, bc_view key);     /* smallest key greater th
 | `bc_key_i64`, `bc_key_f64`, `bc_key_bool`, `bc_key_bytes`, `bc_key_null` | Appends one part. Nullability and direction come from the catalog entry for `table_or_index`, so the builder knows whether to write a null marker and whether to invert the bytes. A part of the wrong type, or more parts than the key has, is `BC_E_HANDLE`. |
 | `bc_key_param` | Appends parameter `i` as the next part: its value, or the null part when it is NULL. A type that is not the part's, or a NULL for a part that is not nullable, is `BC_E_HANDLE`. A `REAL` part is keyed as its float rounding. Whether the value is inside the column's type is checked before the plan runs, by the embedded API: every compared parameter has one SQL type, and a parameter compared with columns of two is refused at bind (`docs/types_design.md`). |
 | `bc_key_end` | Finalizes and returns the key. A partial key (fewer parts than the index has) is legal and is a prefix the compiler uses as a scan bound. A key over the engine's hard ceiling (65,535 bytes) is `BC_E_LIMIT`. |
+| `bc_key_fits` | Whether the key built so far is within the engine's key ceiling. A key past it names no row, so a join asks before `bc_key_end` and skips an outer row whose long value would make the inner key one: PostgreSQL finds no inner row there, where `bc_key_end` would fail the statement (front end slice 5). |
 | `bc_key_params` | The key, or prefix, of `table_or_index` whose first `n` parts are parameters `first` to `first + n - 1`, each as `bc_key_param` appends it: `bc_key_begin`, `n` parts and `bc_key_end` in one call. `(cx, TBL_9, 0, 3)` is a composite primary key `(w_id, d_id, c_id)`. The builder remains for keys whose parts come from anywhere else. |
 | `bc_key_successor` | The exclusive upper bound of the prefix `key`: its last byte incremented, carrying. Turns a prefix into a half-open range where `BC_SCAN_PREFIX` does not fit. |
 
@@ -642,7 +644,7 @@ double    bc_agg_f64(bc_ctx *, bc_group, uint32_t slot);
 | `bc_sorter_next` | Streams payloads in sort order. Each call charges one unit of budget. |
 | `bc_hash_open`, `bc_hash_put` | A multimap for the build side of a hash join. Duplicate keys are kept. |
 | `bc_hash_find`, `bc_hash_next` | Probes: an iterator over every payload stored under `key`, in insertion order. Each `next` charges one unit. |
-| `bc_agg_open` | Grouped accumulators with `slots` numeric slots per group, for `GROUP BY` the plan cannot get from index order. Ungrouped aggregates use one group with an empty key. Implemented with no slots only, for `COUNT(DISTINCT)`: its groups' keys, held twice (in first-appearance order and in an index), may take `bytes`; past that, `BC_E_MEMORY`. The slot calls are not implemented yet (`BC_E_HANDLE`). |
+| `bc_agg_open` | Grouped accumulators with `slots` numeric slots per group, for `GROUP BY` the plan cannot get from index order. Ungrouped aggregates use one group with an empty key. Implemented with no slots only, for `COUNT(DISTINCT)`: each group's key is held once, and the groups may take `bytes`, each counted as its key's bytes plus a fixed overhead (112 bytes: the index node, the allocator's headers and the first-appearance order entry), so the bound is close to the memory held; past it, `BC_E_MEMORY`. The slot calls are not implemented yet (`BC_E_HANDLE`). |
 | `bc_agg_group` | Finds or creates the group for `group_key`, a mem-comparable byte string. Slots start at zero and null. |
 | `bc_agg_add_*`, `bc_agg_min_*`, `bc_agg_max_*`, `bc_agg_count` | Folds a value into a slot. `SUM`, `MIN`, `MAX`, `COUNT`; `AVG` is a sum slot and a count slot divided at emit. Integer sums are checked. |
 | `bc_agg_next` | Iterates groups in first-appearance order, one unit each. |
