@@ -1,6 +1,6 @@
 # The PostgreSQL wire-protocol server: slice 1, for the MVP gate
 
-Status: design, for review (#494's first slice).
+Status: design, approved (owner, 2026-10-22). #494's first slice.
 
 The MVP gate is HammerDB's TPROC-C driving the layer over PostgreSQL's
 wire protocol (`frontend_design.md`, *The MVP gate*). This slice is the
