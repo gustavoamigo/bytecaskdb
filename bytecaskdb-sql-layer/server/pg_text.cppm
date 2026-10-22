@@ -308,11 +308,11 @@ auto integer_from(std::string_view text, std::string_view type) -> std::int64_t 
   return v;
 }
 
-// A float's text, as PostgreSQL's float8in and float4in read it: what
-// strtod reads, NaN and Infinity in any case. A REAL is read as a float, as
-// float4in reads it, so its rounding is PostgreSQL's.
-auto float_from(std::string_view text, bool real) -> double {
-  auto type = real ? std::string_view{"real"} : std::string_view{"double precision"};
+// A float's text, as PostgreSQL's float8in reads it: what strtod reads,
+// NaN and Infinity in any case. A REAL is read as a double too: the layer
+// rounds it and checks its range, in column order, as it does every REAL it
+// is given, so a REAL behaves as over the embedded API.
+auto float_from(std::string_view text) -> double {
   auto s = trim(text);
   auto negative = false;
   auto body = s;
@@ -325,20 +325,12 @@ auto float_from(std::string_view text, bool real) -> double {
     return negative ? -std::numeric_limits<double>::infinity() : std::numeric_limits<double>::infinity();
   }
   if (!s.empty() && s.front() == '+') s.remove_prefix(1);
-  auto out_of_range = [&] {
-    throw TextError("\"" + std::string{text} + "\" is out of range for type " + std::string{type}, "22003");
-  };
-  if (real) {
-    float f = 0;
-    auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), f);
-    if (s.empty() || end != s.data() + s.size()) bad_text(type, text);
-    if (ec == std::errc::result_out_of_range) out_of_range();
-    return static_cast<double>(f);
-  }
   double d = 0;
   auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), d);
-  if (s.empty() || end != s.data() + s.size()) bad_text(type, text);
-  if (ec == std::errc::result_out_of_range) out_of_range();
+  if (s.empty() || end != s.data() + s.size()) bad_text("double precision", text);
+  if (ec == std::errc::result_out_of_range) {
+    throw TextError("\"" + std::string{text} + "\" is out of range for type double precision", "22003");
+  }
   return d;
 }
 
@@ -612,8 +604,8 @@ auto from_text(std::string_view text, const ParamInfo& p) -> Value {
     case SqlKind::SmallInt: return integer_from(text, "smallint");
     case SqlKind::Integer: return integer_from(text, "integer");
     case SqlKind::BigInt: return integer_from(text, "bigint");
-    case SqlKind::Real: return float_from(text, true);
-    case SqlKind::Double: return float_from(text, false);
+    case SqlKind::Real:
+    case SqlKind::Double: return float_from(text);
     case SqlKind::Boolean: return bool_from(text);
     case SqlKind::Bytea: return bytea_from(text);
     case SqlKind::Text:

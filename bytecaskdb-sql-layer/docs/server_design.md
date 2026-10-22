@@ -211,7 +211,9 @@ The rules:
 - Any `ErrorResponse` inside an explicit block makes it `E`, whatever
   raised it. The server rolls back the `Transaction` if it is still open.
 - In `E`, every statement but `COMMIT` and `ROLLBACK` is `25P02`, checked
-  by the session before anything reaches the layer.
+  by the session before anything reaches the layer. As in PostgreSQL, a
+  statement that does not parse reports its syntax error instead: it is
+  parsed first, and refused before it is bound.
 - `COMMIT` in `E` answers `ROLLBACK`. `ROLLBACK` ends the block in any
   state. Either way the status is `I`.
 - `COMMIT` in `T` that fails (`40001`, `08007`) has ended the block: `I`.
@@ -462,12 +464,12 @@ PostgreSQL also checks the server's mapping. The mapping:
 
 The binder's errors are all `ast::SqlError` today, so an unknown table or
 column is `42601` rather than PostgreSQL's `42P01` or `42703`. Splitting
-them needs a code on `SqlError`, and is a follow-up issue. HammerDB's
+them needs a code on `SqlError` (#548). HammerDB's
 driver sends no statement that fails to bind.
 
 ## API changes
 
-The server needs four things that `api/database.cppm` does not expose. All
+The server needs five things that `api/database.cppm` did not expose. All
 are read from what the binder and compiler already keep:
 1. `Statement::params() -> std::vector<ParamInfo>`, with `ParamInfo
    {SqlType type; bool assigned_only;}`.
@@ -495,7 +497,16 @@ are read from what the binder and compiler already keep:
    for it. `test_every_range_message_maps_to_its_sqlstate` keeps proving
    that every message maps.
 
-`DdlRefused` gains a kind for (4).
+5. `Database::refit(stmt)`: recompiles a cached plan that the live catalog
+   no longer fits, as its next run would, and runs nothing. A statement
+   prepared before a `DROP TABLE` and `CREATE TABLE` of other types still
+   describes its old plan until it runs. The server refits at `Parse`,
+   `Bind` and `Describe`, so `ParameterDescription`, the parameters' text
+   and `RowDescription` follow the catalog. A DDL between `Bind` and
+   `Execute` is caught by the run, which recompiles and checks the
+   parameters against the new plan.
+
+`DdlRefused` carries the SQLSTATE PostgreSQL gives the same refusal, for (4).
 
 ## The HammerDB driver
 
@@ -688,7 +699,7 @@ No microbenchmarks: the gate's numbers are HammerDB's.
   "results stream as `bc_emit` produces them").
 - `Database::prepare`'s cache keeps every distinct text until close, so a
   client sending ever-new literal text grows it. The driver sends a fixed
-  set. This is a follow-up issue.
+  set (#549).
 
 ## `CONTRACT.md` changes
 
@@ -712,7 +723,7 @@ test.
    SQL `PREPARE`.
 5. NOPM from the `d_next_o_id` sum, and TPM from client-side counts.
 6. One SQLSTATE mapping, in the API, shared by the server and the oracle.
-7. The four API additions.
+7. The five API additions.
 8. Outside `BEGIN`, a block of one `Execute` autocommits through
    `Database::execute`, with its retry. A block of two or more is one
    implicit `Transaction`, committed at `Sync`, as in PostgreSQL. A DDL

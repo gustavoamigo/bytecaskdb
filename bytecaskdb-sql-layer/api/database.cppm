@@ -202,8 +202,9 @@ public:
   // Of the plan the statement runs now: a DDL may make it recompile.
   [[nodiscard]] auto param_types() const -> std::vector<PhysType>;
   // Each parameter's SQL type and use, and the result's columns (none for
-  // a statement that returns no rows), of the plan the statement runs now.
-  // Empty for DDL.
+  // a statement that returns no rows), of the plan the statement runs now:
+  // Database::refit first to describe it against the live catalog. Empty
+  // for DDL.
   [[nodiscard]] auto params() const -> std::vector<ParamInfo>;
   [[nodiscard]] auto columns() const -> std::vector<ResultColumn>;
   // The plan file, as EXPLAIN would print it; empty for DDL.
@@ -388,6 +389,10 @@ public:
   auto execute(std::string_view sql, const std::vector<Value>& params = {}) -> Rows;
   // Opens a transaction. Its snapshot is taken at its first statement.
   [[nodiscard]] auto begin(TransactionOptions opts = {}) -> Transaction;
+  // Recompiles the statement's plan if the live catalog no longer fits it,
+  // as its next run would, so params() and columns() describe what that run
+  // takes and returns. Runs nothing. Throws what a recompile throws.
+  void refit(const Statement& stmt);
   [[nodiscard]] auto cached_plans() const -> std::size_t {
     std::shared_lock<std::shared_mutex> lock{cache_mu_};
     return cache_.size();
@@ -1017,6 +1022,20 @@ auto Database::results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows {
   }
   bc_ctx_reset(cx);
   return out;
+}
+
+void Database::refit(const Statement& stmt) {
+  auto lock = enter();
+  if (stmt.owner_ != this) throw std::logic_error("the statement was prepared on another database");
+  if (stmt.is_ddl()) return;
+  auto* cx = acquire_context();
+  try {
+    (void)fitting_plan(cx, stmt, {});
+    release_context(cx);
+  } catch (...) {
+    release_context(cx);
+    throw;
+  }
 }
 
 auto Database::begin(TransactionOptions opts) -> Transaction {

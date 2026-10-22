@@ -1039,3 +1039,18 @@ TEST_CASE("embedded API: sqlstate reports PostgreSQL's SQLSTATE for each error",
   CHECK(sqlstate(bytecask::DbClosed{}) == "57P01");
   CHECK(sqlstate(std::runtime_error{"x"}) == "XX000");
 }
+
+TEST_CASE("embedded API: refit describes a cached statement against the live catalog", "[sql][api][server]") {
+  sql_test::TempDir dir{"api_refit"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE r (k BIGINT PRIMARY KEY, v BIGINT)");
+  const auto& select = db->prepare("SELECT v FROM r WHERE k = $1");
+  CHECK(select.params().at(0).type == SqlType{SqlKind::BigInt});
+  (void)db->execute("DROP TABLE r");
+  (void)db->execute("CREATE TABLE r (k DOUBLE PRECISION PRIMARY KEY, v TEXT)");
+  CHECK(select.params().at(0).type == SqlType{SqlKind::BigInt});  // the plan it would have run
+  db->refit(select);
+  CHECK(select.params().at(0).type == SqlType{SqlKind::Double});
+  CHECK(select.columns().at(0).type == SqlType{SqlKind::Text});
+  CHECK(db->execute(select, {2.5}).rows.empty());
+}

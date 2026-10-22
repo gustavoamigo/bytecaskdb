@@ -134,15 +134,20 @@ jobs:
 
       # The layer against PostgreSQL 17 (docs/testing_design.md): a fixed
       # seed and a bounded budget, the ci profile of tests/proof/conftest.py.
-      - name: Build bytecask_sql and run the proof tests
+      # With sql_layer_server built, the proof machine also runs its wire
+      # target, and tests/server runs the server's protocol tests
+      # (docs/server_design.md, *Tests*).
+      - name: Build bytecask_sql and sql_layer_server, and run the proof and wire tests
         env:
           BYTECASK_SQL_ORACLE: host=postgres user=postgres password=postgres dbname=postgres
+          BYTECASK_SQL_SERVER: build/linux/x86_64/release/sql_layer_server
           HYPOTHESIS_PROFILE: ci
           PYTHONPATH: bytecaskdb-sql-layer/python
         run: |
           xmake build -y bytecask_sql
+          xmake build -y sql_layer_server
           pip3 install -r bytecaskdb-sql-layer/tests/proof/requirements.txt
-          python3 -m pytest bytecaskdb-sql-layer/tests/proof -v -p no:cacheprovider \
+          python3 -m pytest bytecaskdb-sql-layer/tests/proof bytecaskdb-sql-layer/tests/server -v -p no:cacheprovider \
             --junitxml=test-results/sql_layer_proof.xml
 
       - name: Enrich JUnit report with source metadata

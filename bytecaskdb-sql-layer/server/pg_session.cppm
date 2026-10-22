@@ -30,6 +30,7 @@ module;
 export module bytecask.sql.pg_session;
 
 import bytecask.sql.api;
+import bytecask.sql.parser;
 import bytecask.sql.pg_wire;
 import bytecask.sql.pg_text;
 
@@ -563,6 +564,13 @@ private:
     }
   }
 
+  // As PostgreSQL: in a failed block a statement that does not parse reports
+  // that, and one that does is 25P02, before it is bound.
+  void refuse_sql_if_failed(const std::string& sql) const {
+    if (in_block_ && failed_) (void)ast::parse(sql);
+    refuse_if_failed();
+  }
+
   // BEGIN, COMMIT or ROLLBACK; returns the command tag.
   auto run_control(Control c) -> std::string {
     switch (c) {
@@ -671,8 +679,8 @@ private:
         case Classified::Kind::Empty: simple_reply('I'); break;
         case Classified::Kind::Control: complete(run_control(c.control)); break;
         case Classified::Kind::Sql: {
-          refuse_if_failed();
           last_text_ = c.sql;
+          refuse_sql_if_failed(c.sql);
           const auto& stmt = db_.prepare(c.sql);
           if (!stmt.params().empty()) throw SessionError("there is no parameter $1", "42P02");
           auto rows = in_block_ ? txn_->execute(stmt, {}) : db_.execute(stmt, {});
@@ -734,9 +742,10 @@ private:
     auto c = classify(text, "42601", "cannot insert multiple commands into a prepared statement");
     Prepared p{c.kind, c.control, nullptr};
     if (c.kind == Classified::Kind::Sql) {
-      refuse_if_failed();
       last_text_ = c.sql;
+      refuse_sql_if_failed(c.sql);
       p.stmt = &db_.prepare(c.sql);
+      db_.refit(*p.stmt);  // a cached plan a DDL since made stale describes the old types
     }
     statements_[name] = p;
     simple_reply('1');
@@ -762,6 +771,7 @@ private:
     for (std::int16_t i = 0; i < formats; ++i) {
       if (body.i16() != 0) throw SessionError("binary format is not supported", "0A000");
     }
+    if (p.stmt != nullptr) db_.refit(*p.stmt);  // a DDL since Parse
     auto infos = p.stmt != nullptr ? p.stmt->params() : std::vector<ParamInfo>{};
     auto n = body.i16();
     if (n < 0 || static_cast<std::size_t>(n) != infos.size()) {
@@ -803,6 +813,7 @@ private:
     auto name = std::string{body.cstr()};
     if (what == 'S') {
       const auto& p = find_statement(name);
+      if (p.stmt != nullptr) db_.refit(*p.stmt);
       auto infos = p.stmt != nullptr ? p.stmt->params() : std::vector<ParamInfo>{};
       out_.begin('t');
       out_.i16(static_cast<std::int16_t>(infos.size()));
