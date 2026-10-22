@@ -151,6 +151,18 @@ target("sql_layer_tpcc")
     add_rules("bytecask.native_flags")
     add_files("harness/*.cpp", "harness/*.cppm", "tests/tpcc_schema.cppm")
 
+-- The PostgreSQL wire-protocol server (docs/server_design.md): the layer for
+-- HammerDB and any libpq client. Not built by default. Linked against the
+-- production build. The wire tests (tests/server/) and the proof tests'
+-- wire target start it.
+-- Build: xmake f --sql_layer=y && xmake build sql_layer_server
+target("sql_layer_server")
+    set_kind("binary")
+    set_default(false)
+    add_deps("sql_layer")
+    add_rules("bytecask.native_flags")
+    add_files("server/*.cpp", "server/*.cppm")
+
 -- The Python module the proof tests drive (tests/proof/, #515): open,
 -- execute, close, the catalog, and a table's rows. Not built by default.
 -- Build: xmake f --sql_layer=y && xmake build bytecask_sql
