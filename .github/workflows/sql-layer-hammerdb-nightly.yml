@@ -13,6 +13,8 @@ on:
   schedule:
     - cron: "20 3 * * *"
   workflow_dispatch:
+  # TEMPORARY: one run on #545 to prove the workflow before it merges.
+  pull_request:
 
 permissions:
   contents: read
