@@ -583,12 +583,14 @@ plugin. `--smoke` is the short run of *Tests*.
   - `COMMIT` of an aborted transaction tagged `ROLLBACK`;
   - the warnings;
   - `--max-connections`.
-- **HammerDB smoke, manual or nightly, not per PR.** It runs
-  `run-gate.sh --smoke`: one warehouse, two users, no ramp-up and a
-  one-minute window, against the server and against PostgreSQL 17. It then
-  runs `sql_layer_tprocc check` and the same conditions on PostgreSQL. It
-  needs HammerDB's Linux release. Per PR, CI runs the wire proof target and
-  `test_wire.py`.
+- **HammerDB smoke, nightly.** A scheduled workflow,
+  `.github/workflows/sql-layer-hammerdb-nightly.yml` (a workflow must live
+  there, outside the layer), runs `run-gate.sh --smoke`: one warehouse, two
+  users, no ramp-up and a one-minute window, against the server and against
+  PostgreSQL 17. It then runs `sql_layer_tprocc check` and the same
+  conditions on PostgreSQL. It needs HammerDB's Linux release, cached
+  between runs. It can also be started by hand (`workflow_dispatch`). Per
+  PR, CI runs the wire proof target and `test_wire.py`.
 - **`scripts/check_driver_statements.py`** in CI.
 
 No microbenchmarks: the gate's numbers are HammerDB's.
@@ -638,5 +640,5 @@ test.
    `Transaction`, committed at `Sync`, as in PostgreSQL (coordinator
    review). A DDL runs alone at `Sync`, or is `0A000` beside other
    statements.
-9. The HammerDB smoke runs manually or nightly, not per PR (pending the
-   owner).
+9. The HammerDB smoke runs nightly, as a scheduled workflow, not per PR
+   (owner, 2026-10-22).
