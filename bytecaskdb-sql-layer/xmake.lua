@@ -112,6 +112,8 @@ target("sql_layer_tests")
     set_languages("c17", "c++23")
     -- The tests, and the fixtures they share as modules (bytecask.sql.tests.*).
     add_files("tests/*.cpp", "tests/*.cppm")
+    -- The TPC-C harness's module, for its smoke test.
+    add_files("harness/tpcc.cppm")
     -- The engine's counted allocation-failure seam (tests/alloc_faults.h):
     -- it replaces the global operator new in this binary.
     add_files("../tests/alloc_faults.cpp", {defines = "BYTECASK_TESTING"})
@@ -136,6 +138,18 @@ target("sql_layer_bench")
     add_deps("sql_layer")
     add_rules("bytecask.native_flags")
     add_files("bench/*.cpp")
+
+-- The TPC-C harness (docs/testing_design.md, *The TPC-C harness*):
+-- TPROC-C through the embedded API, and Elle histories through SQL. Not
+-- built by default and not run in CI; its smoke test is in sql_layer_tests.
+-- Linked against the testing build for the engine's stats().
+-- Build: xmake f -m releasedbg --sql_layer=y && xmake build sql_layer_tpcc
+target("sql_layer_tpcc")
+    set_kind("binary")
+    set_default(false)
+    add_deps("sql_layer_testing")
+    add_rules("bytecask.native_flags")
+    add_files("harness/*.cpp", "harness/*.cppm", "tests/tpcc_schema.cppm")
 
 -- The Python module the proof tests drive (tests/proof/, #515): open,
 -- execute, close, the catalog, and a table's rows. Not built by default.
