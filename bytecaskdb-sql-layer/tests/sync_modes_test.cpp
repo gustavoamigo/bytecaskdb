@@ -14,6 +14,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "include/bytecask.hpp"
+
 import bytecask.sql.api;
 import bytecask.sql.tests.util;
 
@@ -108,4 +110,20 @@ TEST_CASE("sync modes: an interval outside 1 to 60000 is refused", "[sql][api][s
   CHECK_THROWS_AS(Database::open(dir.path(), {.sync_interval_ms = 0}), std::invalid_argument);
   CHECK_THROWS_AS(Database::open(dir.path(), {.sync_interval_ms = 60'001}), std::invalid_argument);
   CHECK(Database::open(dir.path(), {.sync_interval_ms = 60'000}) != nullptr);
+}
+
+TEST_CASE("io backend: a buffer pool serves reads after a reopen, and one too small is refused", "[sql][api][io]") {
+  sql_test::TempDir dir{"io_backend"};
+  constexpr std::size_t kPool = std::size_t{256} << 20;
+  {
+    auto db = Database::open(dir.path(), {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = kPool}});
+    db->execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)");
+    write_rows(*db, 1);
+  }
+  auto again = Database::open(dir.path(), {.io_backend = bytecask::IoBackend::BufferPool,
+                                          .buffer_pool = {.capacity_bytes = kPool, .direct_io = false}});
+  CHECK(row_count(*again) == 3);
+  again->close();
+  CHECK_THROWS_AS(Database::open(dir.path(), {.io_backend = bytecask::IoBackend::BufferPool, .buffer_pool = {.capacity_bytes = 1}}),
+                  std::invalid_argument);
 }

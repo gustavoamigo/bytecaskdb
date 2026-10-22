@@ -699,6 +699,8 @@ def test_a_compared_decimal_finer_than_its_scale_and_nan_are_refused(server):
     ["--sync", "AT_EVERY_COMMIT"],
     ["--sync", "at_interval", "--sync-interval-ms", "50"],
     ["--sync", "AT_FILE_ROTATION"],
+    ["--io-backend", "buffer_pool", "--buffer-pool-size", str(256 << 20), "--buffer-pool-direct-io", "on"],
+    ["--io-backend", "MMAP"],
 ])
 def test_sync_modes_start_and_stop_cleanly(flags):
     """--sync names the plugin's bytecaskdb_sync modes (docs/server_design.md,
@@ -718,6 +720,9 @@ def test_sync_modes_start_and_stop_cleanly(flags):
     ["--sync-interval-ms", "0"],
     ["--sync-interval-ms", "60001"],
     ["--sync-interval-ms", "soon"],
+    ["--io-backend", "tape"],
+    ["--buffer-pool-size", "big"],
+    ["--buffer-pool-direct-io", "maybe"],
 ])
 def test_sync_flags_are_validated(flags):
     binary = server_binary()
@@ -727,6 +732,6 @@ def test_sync_flags_are_validated(flags):
     try:
         r = subprocess.run([binary, "--dir", directory, *flags], capture_output=True, text=True, timeout=60)
         assert r.returncode != 0
-        assert "--sync" in r.stderr
+        assert flags[0] in r.stderr
     finally:
         shutil.rmtree(directory, ignore_errors=True)

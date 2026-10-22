@@ -6,6 +6,7 @@
 //
 //   sql_layer_server --dir D [--listen 127.0.0.1:5432] [--database NAME] [--max-connections 100]
 //                     [--sync AT_EVERY_COMMIT|AT_INTERVAL|AT_FILE_ROTATION] [--sync-interval-ms 1000]
+//                     [--io-backend pread|mmap|buffer_pool] [--buffer-pool-size BYTES] [--buffer-pool-direct-io on|off]
 //
 // Serves one database directory under one name, by default the directory's
 // last component. Trust authentication only: anyone who reaches the port is
@@ -44,6 +45,8 @@
 #include <thread>
 #include <utility>
 
+#include "include/bytecask.hpp"
+
 import bytecask.sql.api;
 import bytecask.sql.pg_session;
 
@@ -61,7 +64,8 @@ auto flags(int argc, char** argv) -> std::map<std::string, std::string> {
   }
   for (const auto& [k, v] : out) {
     if (k != "dir" && k != "listen" && k != "database" && k != "max-connections" && k != "sync" &&
-        k != "sync-interval-ms") {
+        k != "sync-interval-ms" &&
+        k != "io-backend" && k != "buffer-pool-size" && k != "buffer-pool-direct-io") {
       throw std::invalid_argument("unknown flag --" + k);
     }
   }
@@ -77,6 +81,26 @@ auto sync_mode(const std::string& name) -> bytecask::sql::SyncMode {
   if (upper == "AT_INTERVAL") return SyncMode::AtInterval;
   if (upper == "AT_FILE_ROTATION") return SyncMode::AtFileRotation;
   throw std::invalid_argument("--sync takes AT_EVERY_COMMIT, AT_INTERVAL or AT_FILE_ROTATION");
+}
+
+auto lower(std::string v) -> std::string {
+  for (auto& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return v;
+}
+
+auto io_backend(const std::string& name) -> bytecask::IoBackend {
+  auto v = lower(name);
+  if (v == "pread") return bytecask::IoBackend::Pread;
+  if (v == "mmap") return bytecask::IoBackend::Mmap;
+  if (v == "buffer_pool") return bytecask::IoBackend::BufferPool;
+  throw std::invalid_argument("--io-backend takes pread, mmap or buffer_pool");
+}
+
+auto on_off(const std::string& flag, const std::string& value) -> bool {
+  auto v = lower(value);
+  if (v == "on") return true;
+  if (v == "off") return false;
+  throw std::invalid_argument("--" + flag + " takes on or off");
 }
 
 auto system_error(const char* what) -> std::system_error { return {errno, std::generic_category(), what}; }
@@ -150,6 +174,18 @@ int main(int argc, char** argv) {
           db_opts.sync_interval_ms > 60'000) {
         throw std::invalid_argument("--sync-interval-ms takes a number from 1 to 60000");
       }
+    }
+
+    if (f.contains("io-backend")) db_opts.io_backend = io_backend(f["io-backend"]);
+    if (f.contains("buffer-pool-size")) {
+      const auto& v = f["buffer-pool-size"];
+      auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), db_opts.buffer_pool.capacity_bytes);
+      if (ec != std::errc{} || end != v.data() + v.size()) {
+        throw std::invalid_argument("--buffer-pool-size takes a number of bytes");
+      }
+    }
+    if (f.contains("buffer-pool-direct-io")) {
+      db_opts.buffer_pool.direct_io = on_off("buffer-pool-direct-io", f["buffer-pool-direct-io"]);
     }
 
     // SIGINT and SIGTERM go to one thread, which wakes the accept loop

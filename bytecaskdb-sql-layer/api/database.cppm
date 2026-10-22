@@ -375,6 +375,13 @@ enum class SyncMode {
 struct DatabaseOptions {
   SyncMode sync{SyncMode::AtEveryCommit};
   std::uint32_t sync_interval_ms{1000};  // 1 to 60,000, as the plugin's; open refuses another
+  // How sealed data files are read, as the plugin's bytecaskdb_io_backend,
+  // bytecaskdb_buffer_pool_size and bytecaskdb_buffer_pool_direct_io. The
+  // pool's capacity is its whole footprint and is read only for BufferPool;
+  // open refuses one under twice the engine's file size, with the engine's
+  // std::invalid_argument.
+  IoBackend io_backend{IoBackend::Pread};
+  BufferPoolOptions buffer_pool{};
 };
 
 // Every call may be made from any thread, concurrently with any other but
@@ -695,7 +702,10 @@ auto Database::open(const std::filesystem::path& dir, DatabaseOptions opts) -> s
   std::unique_ptr<Database> d{new Database};
   d->sync_commits_ = opts.sync == SyncMode::AtEveryCommit;
   d->life_ = std::make_shared<DatabaseLife>();
-  d->db_.reset(new DB(DB::open(dir)));
+  bytecask::Options engine;
+  engine.io_backend = opts.io_backend;
+  engine.buffer_pool = opts.buffer_pool;
+  d->db_.reset(new DB(DB::open(dir, engine)));
   d->live_ = std::make_unique<LiveCatalog>(*d->db_);
   d->bdb_ = {d->db_.get()};
   d->bcat_ = {d->live_.get()};

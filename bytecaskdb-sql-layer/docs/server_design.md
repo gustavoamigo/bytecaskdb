@@ -94,7 +94,9 @@ costs one lookup in `Database::prepare`'s cache, keyed by the exact text.
 
 **Binary and modules.** `sql_layer_server --dir DIR [--listen
 127.0.0.1:5432] [--database NAME] [--max-connections 100]
-[--sync AT_EVERY_COMMIT|AT_INTERVAL|AT_FILE_ROTATION] [--sync-interval-ms 1000]` serves one
+[--sync AT_EVERY_COMMIT|AT_INTERVAL|AT_FILE_ROTATION] [--sync-interval-ms 1000]
+[--io-backend pread|mmap|buffer_pool] [--buffer-pool-size BYTES]
+[--buffer-pool-direct-io on|off]` serves one
 database directory under one database name, by default the directory's
 last component. It opens the directory with `Database::open`, so it holds
 the engine's directory lock. The code is in `bytecaskdb-sql-layer/server/`:
@@ -133,6 +135,16 @@ decides only whether it waits for `fdatasync`:
 
 DDL always passes `sync = true`, as the plugin's does. The engine counter
 `bytecask.fsyncs` shows the difference.
+
+**Reads.** `--io-backend`, `--buffer-pool-size` and `--buffer-pool-direct-io`
+are `DatabaseOptions::io_backend` and `buffer_pool`, with the names, values
+and defaults of the plugin's `bytecaskdb_io_backend`,
+`bytecaskdb_buffer_pool_size` and `bytecaskdb_buffer_pool_direct_io`: `pread`
+by default, and a pool of `--buffer-pool-size` bytes, total footprint, filled
+with `O_DIRECT` unless `--buffer-pool-direct-io off`. They change where
+sealed-file reads are served from, not what is read
+(`docs/buffer_pool_design.md`). The pool must hold at least twice the
+engine's file size (default 64 MiB); a smaller one is refused at startup.
 
 **Threading.** One thread per connection, and an acceptor thread. A
 connection's thread reads a message, runs it on the embedded API, which
@@ -747,8 +759,8 @@ The run script requires W ≥ the user count; the monitor is not a user.
   - after an error in an implicit block, `Sync` reports `I`;
   - the warnings;
   - `--max-connections`;
-  - `--sync` and `--sync-interval-ms`: each mode starts and stops cleanly, and
-    a bad value exits before the server listens.
+  - `--sync`, `--sync-interval-ms` and the I/O flags: each mode starts and
+    stops cleanly, and a bad value exits before the server listens.
 - **HammerDB smoke, nightly.** A scheduled workflow,
   `.github/workflows/sql-layer-hammerdb-nightly.yml`, runs `run-gate.sh --smoke`: two warehouses, two
   users, no ramp-up and a one-minute window, against the server and against
@@ -788,6 +800,8 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 **Added (SQL):**
 - `DatabaseOptions` and the three sync modes: when a commit reaches the
   disk, `AtEveryCommit` as before and the default;
+- `DatabaseOptions`' I/O backend and buffer pool, `Pread` as before and the
+  default;
 - the server's startup: what it accepts and what it refuses, with trust
   only;
 - the SQLSTATE each error is reported with, over the wire and through
