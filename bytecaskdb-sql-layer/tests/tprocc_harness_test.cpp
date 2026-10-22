@@ -43,7 +43,8 @@ TEST_CASE("tprocc: a short mixed run keeps the specification's consistency condi
     done += s.completed + s.abandoned;
   }
   CHECK(done == 4 * 100);
-  CHECK_FALSE(r.nopm());  // New-Order is not in the mix yet
+  REQUIRE(r.nopm());
+  CHECK(*r.nopm() > 0);
   for (const auto& bad : tprocc::consistency(*db)) FAIL_CHECK(bad);
   db->close();
 }

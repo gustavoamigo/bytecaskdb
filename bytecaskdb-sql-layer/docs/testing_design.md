@@ -251,17 +251,22 @@ and shared by them.
   `--seed` and `t`.
 - The mix is the specification's deck (New-Order 45, Payment 43, and
   Order-Status, Delivery and Stock-Level 4 each), drawn per transaction.
-  It is restricted to the transactions built so far and renormalised.
-  Payment and Order-Status come first, with #542; each later front-end
-  slice adds its transaction to the deck and to the inputs below.
+  It is restricted to the transactions built so far and renormalised:
+  New-Order, Payment, Order-Status and Delivery today. Stock-Level joins
+  with the front end's slice 5.
 - Inputs follow the profiles (clauses 2.4 to 2.8): customers by last name
   60% of the time and by `NURand` id otherwise; a remote warehouse for 15%
   of Payments when `W > 1`; `h_amount` from 1.00 to 5,000.00; a `BC`
-  customer's new `c_data`. The client logic is the harness's, as in
-  HammerDB's client-side driver.
+  customer's new `c_data`; New-Order's 5 to 15 lines, each item by
+  `NURand`, 1% of lines from a remote warehouse when `W > 1`, and 1% of
+  orders ending on an unused item; Delivery's carrier from 1 to 10. The
+  client logic is the harness's, as in HammerDB's client-side driver.
 - One difference from the specification, as in HammerDB: Payment does not update
   `c_ytd_payment` or `c_payment_cnt`, since it runs HammerDB's statements
-  (P9, P10) by decision.
+  (P9, P10) by decision; nor does New-Order update `s_ytd`, `s_order_cnt`
+  or `s_remote_cnt` (N6), or Delivery `c_delivery_cnt` (D7).
+- Delivery runs as one transaction over the warehouse's ten districts, as
+  HammerDB runs it, not deferred (clause 2.7.2).
 - One `Transaction` per TPROC-C transaction, committed with `commit()`.
 
 **Errors and retries.**
@@ -280,7 +285,7 @@ and shared by them.
   p50, p95, p99 and max, from the first attempt's start to the commit that
   completed it;
 - TPM, completed transactions of every type per minute, and NOPM, completed
-  New-Orders per minute (`n/a` until New-Order is in the mix);
+  New-Orders per minute, the rolled-back ones included;
 - the engine's `fsyncs` and `group_writer_batches` over the measured
   window, read from `stats()` at its start and end, to set beside
   `commit_probe`.
@@ -302,7 +307,13 @@ in pages of 10,000 rows in `h_id` order, so no run holds it all:
 - with Payment: condition 1 (`w_ytd` is the sum of its districts'
   `d_ytd`), and conditions 8 and 9 (`w_ytd` and `d_ytd` are each the sum of
   their `history` rows' `h_amount`);
-- New-Order and Delivery add conditions 2 to 4 and 5 to 7 when they land.
+- with New-Order and Delivery: conditions 2 to 7, per district, its
+  orders in pages of 1,000 `o_id`s with each page's `order_line` and
+  `new_order` rows read by the same `o_id` range: `d_next_o_id - 1` is
+  `max(o_id)` and `max(no_o_id)` (2); `new_order`'s ids are contiguous (3);
+  `o_ol_cnt` sums to the district's line count (4); an order has a carrier
+  exactly when it has no `new_order` row (5); its `o_ol_cnt` is its line
+  count (6), and its lines are delivered exactly when it has a carrier (7).
 
 A failed condition exits non-zero.
 
