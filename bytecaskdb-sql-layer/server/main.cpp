@@ -5,6 +5,7 @@
 // (docs/server_design.md).
 //
 //   sql_layer_server --dir D [--listen 127.0.0.1:5432] [--database NAME] [--max-connections 100]
+//                     [--sync AT_EVERY_COMMIT|AT_INTERVAL|AT_FILE_ROTATION] [--sync-interval-ms 1000]
 //
 // Serves one database directory under one name, by default the directory's
 // last component. Trust authentication only: anyone who reaches the port is
@@ -24,6 +25,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cctype>
 #include <charconv>
 #include <condition_variable>
 #include <cstdint>
@@ -58,11 +60,23 @@ auto flags(int argc, char** argv) -> std::map<std::string, std::string> {
     out[std::string{k.substr(2)}] = argv[i + 1];
   }
   for (const auto& [k, v] : out) {
-    if (k != "dir" && k != "listen" && k != "database" && k != "max-connections") {
+    if (k != "dir" && k != "listen" && k != "database" && k != "max-connections" && k != "sync" &&
+        k != "sync-interval-ms") {
       throw std::invalid_argument("unknown flag --" + k);
     }
   }
   return out;
+}
+
+// --sync takes the MariaDB plugin's bytecaskdb_sync names, in any case.
+auto sync_mode(const std::string& name) -> bytecask::sql::SyncMode {
+  using bytecask::sql::SyncMode;
+  std::string upper{name};
+  for (auto& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  if (upper == "AT_EVERY_COMMIT") return SyncMode::AtEveryCommit;
+  if (upper == "AT_INTERVAL") return SyncMode::AtInterval;
+  if (upper == "AT_FILE_ROTATION") return SyncMode::AtFileRotation;
+  throw std::invalid_argument("--sync takes AT_EVERY_COMMIT, AT_INTERVAL or AT_FILE_ROTATION");
 }
 
 auto system_error(const char* what) -> std::system_error { return {errno, std::generic_category(), what}; }
@@ -127,6 +141,17 @@ int main(int argc, char** argv) {
       }
     }
 
+    bytecask::sql::DatabaseOptions db_opts;
+    if (f.contains("sync")) db_opts.sync = sync_mode(f["sync"]);
+    if (f.contains("sync-interval-ms")) {
+      const auto& v = f["sync-interval-ms"];
+      auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), db_opts.sync_interval_ms);
+      if (ec != std::errc{} || end != v.data() + v.size() || db_opts.sync_interval_ms < 1 ||
+          db_opts.sync_interval_ms > 60'000) {
+        throw std::invalid_argument("--sync-interval-ms takes a number from 1 to 60000");
+      }
+    }
+
     // SIGINT and SIGTERM go to one thread, which wakes the accept loop
     // through a pipe; every other thread blocks them.
     sigset_t stop_signals;
@@ -138,7 +163,7 @@ int main(int argc, char** argv) {
     int wake[2];
     if (::pipe2(wake, O_CLOEXEC) != 0) throw system_error("pipe");
 
-    auto db = bytecask::sql::Database::open(dir);
+    auto db = bytecask::sql::Database::open(dir, db_opts);
     auto listener = listen_on(host, port);
     if (!loopback(host)) {
       std::fprintf(stderr,

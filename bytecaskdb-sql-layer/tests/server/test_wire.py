@@ -16,6 +16,7 @@ import shutil
 import socket
 import struct
 import signal
+import subprocess
 import tempfile
 import time
 
@@ -692,3 +693,40 @@ def test_a_compared_decimal_finer_than_its_scale_and_nan_are_refused(server):
         with pytest.raises(psycopg.Error) as e:
             c.execute("INSERT INTO m VALUES (%t, %t)", ("2.00", "NaN"))
         assert e.value.sqlstate == "22P02"
+
+
+@pytest.mark.parametrize("flags", [
+    ["--sync", "AT_EVERY_COMMIT"],
+    ["--sync", "at_interval", "--sync-interval-ms", "50"],
+    ["--sync", "AT_FILE_ROTATION"],
+])
+def test_sync_modes_start_and_stop_cleanly(flags):
+    """--sync names the plugin's bytecaskdb_sync modes (docs/server_design.md,
+    *Durability*); each starts, and SIGTERM closes the database."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_sync_")
+    s = Server(directory, extra_args=flags)
+    try:
+        assert s.stop() == 0
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+@pytest.mark.parametrize("flags", [
+    ["--sync", "SOMETIMES"],
+    ["--sync-interval-ms", "0"],
+    ["--sync-interval-ms", "60001"],
+    ["--sync-interval-ms", "soon"],
+])
+def test_sync_flags_are_validated(flags):
+    binary = server_binary()
+    if not binary:
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_sync_")
+    try:
+        r = subprocess.run([binary, "--dir", directory, *flags], capture_output=True, text=True, timeout=60)
+        assert r.returncode != 0
+        assert "--sync" in r.stderr
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)

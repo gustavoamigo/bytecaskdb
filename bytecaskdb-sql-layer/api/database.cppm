@@ -21,8 +21,11 @@
 
 module;
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -36,6 +39,7 @@ module;
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -358,6 +362,21 @@ private:
   std::unique_ptr<TxnHandle> h_;  // null once moved from
 };
 
+// When a committed write reaches the disk, as the MariaDB plugin's
+// bytecaskdb_sync. A commit is written to the data file before it returns in
+// every mode, so a process crash loses nothing; the modes differ in what an
+// OS crash or power loss loses. DDL is synced in every mode.
+enum class SyncMode {
+  AtEveryCommit,   // before the commit returns; concurrent commits share one fdatasync
+  AtInterval,      // by a background thread every sync_interval_ms: at most one interval is lost
+  AtFileRotation,  // when the active data file fills, and at close: up to one data file is lost
+};
+
+struct DatabaseOptions {
+  SyncMode sync{SyncMode::AtEveryCommit};
+  std::uint32_t sync_interval_ms{1000};  // 1 to 60,000, as the plugin's; open refuses another
+};
+
 // Every call may be made from any thread, concurrently with any other but
 // close(). None waits on another's engine I/O: a commit, a statement or a
 // prepare never waits for another transaction's commit or sync, and a DDL
@@ -366,7 +385,9 @@ private:
 // between a DDL's batch reaching the engine and its catalog taking effect.
 class Database {
 public:
-  [[nodiscard]] static auto open(const std::filesystem::path& dir) -> std::unique_ptr<Database>;
+  // Throws std::invalid_argument for a sync_interval_ms outside 1 to 60,000.
+  [[nodiscard]] static auto open(const std::filesystem::path& dir, DatabaseOptions opts = {})
+      -> std::unique_ptr<Database>;
   ~Database();
   Database(const Database&) = delete;
   Database& operator=(const Database&) = delete;
@@ -442,6 +463,9 @@ private:
   friend class Transaction;
   using Compiled = Statement::Compiled;
   Database() = default;
+  // The AtInterval flusher: an empty synced write returns once every earlier
+  // write is durable, and costs no fdatasync when none is waiting.
+  void sync_loop(std::chrono::milliseconds interval);
   // Takes life_->mu shared for a call, or throws DbClosed.
   [[nodiscard]] auto enter() const -> std::shared_lock<std::shared_mutex>;
   // The same calls, under the lock enter() took.
@@ -463,6 +487,11 @@ private:
   [[nodiscard]] auto acquire_context() -> bc_ctx*;
   void release_context(bc_ctx* cx) noexcept;
 
+  bool sync_commits_{true};  // set by open(); whether a commit waits for fdatasync
+  std::mutex flush_mu_;
+  std::condition_variable flush_cv_;
+  bool flush_stop_{false};  // under flush_mu_
+  std::thread flusher_;      // AtInterval only; joined by close() before the engine closes
   std::unique_ptr<DB> db_;
   std::unique_ptr<LiveCatalog> live_;
   bc_db bdb_{};
@@ -659,8 +688,12 @@ auto Statement::command() const -> Command {
       ast_);
 }
 
-auto Database::open(const std::filesystem::path& dir) -> std::unique_ptr<Database> {
+auto Database::open(const std::filesystem::path& dir, DatabaseOptions opts) -> std::unique_ptr<Database> {
+  if (opts.sync_interval_ms < 1 || opts.sync_interval_ms > 60'000) {
+    throw std::invalid_argument("sync_interval_ms is 1 to 60000");
+  }
   std::unique_ptr<Database> d{new Database};
+  d->sync_commits_ = opts.sync == SyncMode::AtEveryCommit;
   d->life_ = std::make_shared<DatabaseLife>();
   d->db_.reset(new DB(DB::open(dir)));
   d->live_ = std::make_unique<LiveCatalog>(*d->db_);
@@ -668,7 +701,28 @@ auto Database::open(const std::filesystem::path& dir) -> std::unique_ptr<Databas
   d->bcat_ = {d->live_.get()};
   d->release_context(d->acquire_context());  // the first, made now: open fails, not the first call
   if (d->idle_.empty()) throw std::bad_alloc();
+  // Last, so nothing that can still fail leaves a thread running.
+  if (opts.sync == SyncMode::AtInterval) {
+    d->flusher_ = std::thread{[db = d.get(), ms = std::chrono::milliseconds{opts.sync_interval_ms}] { db->sync_loop(ms); }};
+  }
   return d;
+}
+
+void Database::sync_loop(std::chrono::milliseconds interval) {
+  std::unique_lock<std::mutex> lock{flush_mu_};
+  auto failing = false;  // a failure is logged once, not once per interval
+  while (!flush_cv_.wait_for(lock, interval, [this] { return flush_stop_; })) {
+    lock.unlock();
+    try {
+      (void)db_->apply_batch(WriteOptions{.sync = true}, WritePlan{});
+      failing = false;
+    } catch (const std::exception& e) {
+      // The engine degrades on a failed sync: later writes throw DbDegraded.
+      if (!failing) std::fprintf(stderr, "bytecask sql: background sync failed: %s\n", e.what());
+      failing = true;
+    }
+    lock.lock();
+  }
 }
 
 Database::~Database() {
@@ -690,6 +744,14 @@ void Database::close() {
   std::unique_lock<std::shared_mutex> lock{life_->mu};
   if (life_->closed) return;
   life_->closed = true;
+  if (flusher_.joinable()) {  // before the engine closes; it takes no lock close() holds
+    {
+      std::lock_guard<std::mutex> stop{flush_mu_};
+      flush_stop_ = true;
+    }
+    flush_cv_.notify_one();
+    flusher_.join();
+  }
   // A transaction still open holds the engine's snapshot: ended first, with
   // nothing written, and every later call on it throws. No call is in
   // flight: each holds the lock shared.
@@ -978,7 +1040,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
   }
   auto c = fitting_plan(cx, stmt, params);
   check_params(*c);
-  auto r = bc_execute(cx, c->code->fn(), &c->ref, &bp, {}, true, kMaxRetries);
+  auto r = bc_execute(cx, c->code->fn(), &c->ref, &bp, {}, sync_commits_, kMaxRetries);
   // bc_ctx_run checks the plan against the catalog it pinned. A plan a DDL
   // made incompatible (BC_E_LAYOUT with BC_L_INCOMPATIBLE) is recompiled
   // from its text and run once more; one a DDL left compatible keeps
@@ -987,7 +1049,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
     bc_ctx_reset(cx);
     c = recompile(stmt);
     check_params(*c);
-    r = bc_execute(cx, c->code->fn(), &c->ref, &bp, {}, true, kMaxRetries);
+    r = bc_execute(cx, c->code->fn(), &c->ref, &bp, {}, sync_commits_, kMaxRetries);
   }
   if (r == BC_CONFLICT) {
     bc_ctx_reset(cx);
@@ -1155,7 +1217,7 @@ auto Transaction::commit() -> CommitOutcome {
     end_locked();
     return CommitOutcome::RolledBack;
   }
-  auto r = bc_txn_commit(h_->txn, true);
+  auto r = bc_txn_commit(h_->txn, db_->sync_commits_);
   auto code = bc_txn_error(h_->txn);
   auto detail = bc_txn_error_detail(h_->txn);
   std::string message;
