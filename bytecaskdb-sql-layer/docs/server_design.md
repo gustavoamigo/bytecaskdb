@@ -620,8 +620,7 @@ same population.
   - one `COPY … FROM STDIN` per table.
 - `psql` loads it.
 - `hammerdb/pg_consistency.sql` holds the nine conditions as the harness
-  runs them. `scripts/check_driver_statements.py` checks it against the
-  harness's too. That is how the driver itself is checked: the smoke test runs
+  runs them. That is how the driver itself is checked: the smoke test runs
 it against PostgreSQL as well, and the consistency conditions must hold
 there too. The gate reports only ByteCaskDB's numbers
 (`frontend_design.md`, *Decisions*, 7): PostgreSQL's throughput from these
@@ -630,7 +629,7 @@ runs is not part of its output.
 ## Running the gate
 
 `bytecaskdb-sql-layer/hammerdb/run-gate.sh [--warehouses=48] [--vus=1,16,48]
-[--rampup=2] [--duration=5] [--mix="neword payment ostat delivery"]
+[--rampup=2] [--duration=5] [--mix="neword payment ostat delivery slev"]
 [--hammerdb-home=PATH] [--data-root=PATH] [--smoke --pg=CONNINFO]`. It
 follows `run-hammerdb.sh` in the MariaDB plugin. `--smoke` is the short run
 of *Tests*, and `--pg` names the PostgreSQL it checks the driver on (its

@@ -274,6 +274,9 @@ and shared by them.
   stored procedures alike. The specification's is quantity × price, with
   the taxes and the discount applied to the order's total (clause
   2.4.2.2).
+- Stock-Level's district is drawn at random once per thread, as HammerDB
+  draws it once per virtual user, so two threads can share one. The
+  specification gives each terminal its own (clause 2.8.1.2).
 - Delivery runs as one transaction over the warehouse's ten districts, as
   HammerDB runs it, not deferred (clause 2.7.2).
 - One `Transaction` per TPROC-C transaction, committed with `commit()`.

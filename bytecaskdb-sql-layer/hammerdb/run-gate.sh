@@ -223,7 +223,7 @@ if ((SMOKE)); then
     echo "consistency on PostgreSQL: $broken" >&2
     FAILED=1
   else
-    echo "   on PostgreSQL: errors ${errors:-unknown}, conditions 1, 8 and 9 hold"
+    echo "   on PostgreSQL: errors ${errors:-unknown}, the nine conditions hold"
   fi
 fi
 

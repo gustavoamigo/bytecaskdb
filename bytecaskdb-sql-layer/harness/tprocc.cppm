@@ -677,8 +677,9 @@ struct Worker {
   Rng rng;
   std::uint64_t history_n{0};
   std::array<KindStats, kKinds> stats{};
-  // Stock-Level's district, fixed per thread as the driver fixes it per
-  // virtual user (clause 2.8.1.2); drawn 1..10 when the worker is made.
+  // Stock-Level's district, drawn 1..10 when the worker is made and fixed
+  // for its life, as HammerDB fixes it per virtual user. Two threads can draw
+  // the same one (docs/testing_design.md, *The TPROC-C harness*).
   std::int64_t stock_level_d{0};
 
   auto customer(std::int64_t w, std::int64_t d) -> Customer {
