@@ -13,8 +13,10 @@
 //      run, then the primary key, then the covering path, then the lower id
 //   3. its NULLs placed as PostgreSQL places them, or refused
 // UPDATE and DELETE take their rows by the same rules, without an order. A
-// conjunct the chosen key does not express (a residual filter) is refused
-// until slice 5 brings residuals.
+// conjunct the chosen key does not express is a filter on each row it
+// reads; an equality with $n ± k is always one, never a key part. A join of
+// two tables reads them in FROM order by two point lookups, or scans one and
+// reads the other by its whole primary key from the scanned row's columns.
 
 module;
 #include <algorithm>
@@ -54,25 +56,54 @@ auto column(const Table& t, std::uint32_t id) -> ir::Column {
   return {c.id, c.type, c.nullable, t.id};
 }
 
-[[noreturn]] void residual(const Table& t, const bound::Compare& c) {
-  no_plan("a filter on column \"" + t.column(c.col_id)->name + "\" that the key does not express is not supported yet");
+// An equality the key can take: with a parameter, not a computed value.
+auto key_eq(const bound::Compare& c) -> bool { return c.op == Op::Eq && !c.offset; }
+
+// $param + offset's index in the plan's computed values, added if new.
+auto computed(std::vector<ir::Computed>& comp, const bound::Compare& c, std::uint32_t table) -> std::uint32_t {
+  auto it = std::ranges::find_if(
+      comp, [&](const ir::Computed& v) { return v.param == c.param && v.offset == *c.offset && v.table == table; });
+  if (it != comp.end()) return static_cast<std::uint32_t>(it - comp.begin());
+  comp.push_back({c.param, *c.offset, table});
+  return static_cast<std::uint32_t>(comp.size() - 1);
 }
+
+// The conjuncts of `where` not in `used`, as filters. A DOUBLE or REAL
+// column has none yet: its comparisons need PostgreSQL's NaN and -0.0
+// rules, which only its key encoding has.
+auto filters(const Table& t, const std::vector<bound::Compare>& where, const std::vector<const bound::Compare*>& used,
+             std::vector<ir::Computed>& comp) -> std::vector<ir::Filter> {
+  std::vector<ir::Filter> out;
+  for (const auto& c : where) {
+    if (std::ranges::find(used, &c) != used.end()) continue;
+    auto col = column(t, c.col_id);
+    if (col.type == PhysType::F64) {
+      no_plan("a filter on column \"" + t.column(c.col_id)->name + "\", a REAL or DOUBLE PRECISION, is not supported yet");
+    }
+    ir::Operand rhs{c.param, std::nullopt, std::nullopt};
+    if (c.offset) rhs.computed = computed(comp, c, t.id);
+    out.push_back({col, c.op, rhs});
+  }
+  return out;
+}
+
+// The whole primary key by equality: the lookup and the conjuncts it uses.
+struct Keyed {
+  ir::PointGet get;
+  std::vector<const bound::Compare*> used;
+};
 
 // The parameter each primary key column is compared equal to, or nullopt
 // if rule 1 does not apply.
-auto point_get(const Table& t, const std::vector<bound::Compare>& where) -> std::optional<ir::PointGet> {
-  ir::PointGet g;
-  std::vector<const bound::Compare*> used;
+auto point_get(const Table& t, const std::vector<bound::Compare>& where) -> std::optional<Keyed> {
+  Keyed k;
   for (auto id : t.pk_col_ids) {
-    auto it = std::ranges::find_if(where, [&](const auto& c) { return c.col_id == id && c.op == Op::Eq; });
+    auto it = std::ranges::find_if(where, [&](const auto& c) { return c.col_id == id && key_eq(c); });
     if (it == where.end()) return std::nullopt;
-    g.key_params.push_back(it->param);
-    used.push_back(&*it);
+    k.get.key_params.push_back(it->param);
+    k.used.push_back(&*it);
   }
-  for (const auto& c : where) {
-    if (std::ranges::find(used, &c) == used.end()) residual(t, c);
-  }
-  return g;
+  return k;
 }
 
 struct Part {
@@ -124,9 +155,9 @@ auto choose(const Path& p, const std::vector<bound::Compare>& where, const std::
     return it == where.end() ? nullptr : &*it;
   };
   for (const auto& part : p.parts) {
-    const auto* e = first(part.col, [](Op op) { return op == Op::Eq; });
-    if (e == nullptr) break;
-    c.eq.push_back(e);
+    auto it = std::ranges::find_if(where, [&](const bound::Compare& w) { return w.col_id == part.col && key_eq(w); });
+    if (it == where.end()) break;
+    c.eq.push_back(&*it);
   }
   auto run = c.eq.size();
   if (run < p.parts.size()) {
@@ -164,19 +195,25 @@ auto names(const Table& t, const std::vector<bound::OrderItem>& items) -> std::s
   return out;
 }
 
-auto param_bound(const bound::Compare* c, bool successor) -> ir::KeyBound {
-  if (c == nullptr) return {};
-  return {ir::KeyBound::Kind::Param, c->param, successor};
-}
+// The rows of a table the WHERE matches, by the path chosen, and the
+// conjuncts that path does not express.
+struct Rows {
+  std::variant<ir::PointGet, ir::Scan, ir::NullSplitScan> path;
+  std::vector<ir::Filter> filters;
+};
 
 // The rows of `t` the WHERE matches, in the ORDER BY's order. `used_cols`
 // are the columns read from each; with `may_cover`, the scan reads them
-// from the entry's key when it holds them all.
+// from the entry's key when it holds them all, unless a filter reads the row.
 auto rows_of(const Table& t, const std::vector<bound::Compare>& where, const std::vector<bound::OrderItem>& order_by,
-             const std::vector<std::uint32_t>& used_cols, bool may_cover)
-    -> std::variant<ir::PointGet, ir::Scan, ir::NullSplitScan> {
+             const std::vector<std::uint32_t>& used_cols, bool may_cover, std::vector<ir::Computed>& comp) -> Rows {
+  auto param_bound = [&](const bound::Compare* c, bool successor) -> ir::KeyBound {
+    if (c == nullptr) return {};
+    if (c->offset) return {ir::KeyBound::Kind::Computed, computed(comp, *c, t.id), successor};
+    return {ir::KeyBound::Kind::Param, c->param, successor};
+  };
   // A point lookup returns at most one row: it gives any ORDER BY.
-  if (auto g = point_get(t, where)) return *g;
+  if (auto k = point_get(t, where)) return {k->get, filters(t, where, k->used, comp)};
 
   // An ordered column compared for equality is constant in the result.
   std::vector<bound::OrderItem> ordered;
@@ -205,9 +242,11 @@ auto rows_of(const Table& t, const std::vector<bound::Compare>& where, const std
     return a.path->object < b.path->object;
   });
 
-  for (const auto& w : where) {
-    if (std::ranges::find(best.eq, &w) == best.eq.end() && &w != best.lo && &w != best.hi) residual(t, w);
+  std::vector<const bound::Compare*> used = best.eq;
+  for (const auto* b : {best.lo, best.hi}) {
+    if (b != nullptr) used.push_back(b);
   }
+  auto residual = filters(t, where, used, comp);
 
   ir::Scan out;
   out.object = best.path->object;
@@ -216,7 +255,7 @@ auto rows_of(const Table& t, const std::vector<bound::Compare>& where, const std
     if (std::ranges::find(out.null_checks, w.param) == out.null_checks.end()) out.null_checks.push_back(w.param);
   }
   out.reverse = best.reverse;
-  out.covering = best.covering;
+  out.covering = best.covering && residual.empty();
   const auto run = best.eq.size();
 
   // NULLs in the ordered parts: a part the WHERE compares holds none in the
@@ -233,10 +272,10 @@ auto rows_of(const Table& t, const std::vector<bound::Compare>& where, const std
       no_plan("ORDER BY " + col->name + " would need its NULLs reordered");
     }
     out.rest = ir::Range{{ir::KeyBound::Kind::NullPart, 0, true}, {}};
-    return ir::NullSplitScan{out};
+    return {ir::NullSplitScan{out}, residual};
   }
 
-  if (best.lo == nullptr && best.hi == nullptr) return out;
+  if (best.lo == nullptr && best.hi == nullptr) return {out, residual};
   // A key bound: the compared value's key part, or the part that holds NULL,
   // or open; as is or its successor. A key part is self-delimiting and the
   // rest of the key follows it, so a bound that must pass every entry with
@@ -263,7 +302,7 @@ auto rows_of(const Table& t, const std::vector<bound::Compare>& where, const std
                                      : param_bound(lo, lo != nullptr && lo->op == Op::Ge);
   }
   out.rest = r;
-  return out;
+  return {out, residual};
 }
 
 // MIN(arg) from the scan's first entry: arg is the ASC part after its
@@ -281,28 +320,41 @@ auto min_from_first_entry(const Table& t, ir::Scan& sc, const ir::Column& arg) -
   return true;
 }
 
-auto select(const Table& t, const bound::Select& s) -> ir::Select {
-  std::vector<std::uint32_t> used_cols = s.targets;
-  if (s.aggregate && s.aggregate->col_id) used_cols.push_back(*s.aggregate->col_id);
-  ir::Select sel;
-  // FOR UPDATE reads each row, whose key it guards.
-  std::visit([&](auto&& from) { sel.from = std::move(from); }, rows_of(t, s.where, s.order_by, used_cols, !s.for_update));
-  sel.limit = s.limit;
-  sel.for_update = s.for_update;
-  auto* scan = std::get_if<ir::Scan>(&sel.from);
-  if (!s.aggregate) {
-    for (auto id : s.targets) sel.targets.push_back(column(t, id));
-    return sel;
-  }
+auto aggregate(const bound::Aggregate& a, const Table& t) -> ir::Aggregate {
   using Fn = ast::Expr::Fn;
   ir::Aggregate agg;
-  switch (s.aggregate->fn) {
+  switch (a.fn) {
     case Fn::Count: agg.fn = ir::Aggregate::Fn::Count; break;
     case Fn::Sum: agg.fn = ir::Aggregate::Fn::Sum; break;
     case Fn::Min: agg.fn = ir::Aggregate::Fn::Min; break;
   }
-  if (s.aggregate->col_id) agg.arg = column(t, *s.aggregate->col_id);
-  if (agg.fn == ir::Aggregate::Fn::Count) {
+  if (a.col_id) agg.arg = column(t, *a.col_id);
+  agg.distinct = a.distinct;
+  return agg;
+}
+
+auto select(const Table& t, const bound::Select& s, std::vector<ir::Computed>& comp) -> ir::Select {
+  std::vector<std::uint32_t> used_cols = s.targets;
+  if (s.aggregate && s.aggregate->col_id) used_cols.push_back(*s.aggregate->col_id);
+  ir::Select sel;
+  // FOR UPDATE reads each row, whose key it guards; COUNT(DISTINCT) keys
+  // each value from its row.
+  auto distinct = s.aggregate && s.aggregate->distinct;
+  auto rows = rows_of(t, s.where, s.order_by, used_cols, !s.for_update && !distinct, comp);
+  std::visit([&](auto&& from) { sel.from = std::move(from); }, std::move(rows.path));
+  sel.filters = std::move(rows.filters);
+  sel.limit = s.limit;
+  sel.for_update = s.for_update;
+  // The keys answer an aggregate only when no filter drops a row.
+  auto* scan = sel.filters.empty() ? std::get_if<ir::Scan>(&sel.from) : nullptr;
+  if (!s.aggregate) {
+    for (auto id : s.targets) sel.targets.push_back(column(t, id));
+    return sel;
+  }
+  auto agg = aggregate(*s.aggregate, t);
+  if (agg.distinct) {
+    // Its values grouped and counted, in a loop.
+  } else if (agg.fn == ir::Aggregate::Fn::Count) {
     // Every entry of the range is a row to count, unless the argument can be
     // NULL in one: the WHERE compares every column it names, so those hold
     // none.
@@ -317,29 +369,133 @@ auto select(const Table& t, const bound::Select& s) -> ir::Select {
 }
 
 // The rows an UPDATE or DELETE writes: by a point lookup, or a scan, which
-// reads each row whole.
-auto write_rows(const Table& t, const std::vector<bound::Compare>& where) -> std::variant<ir::PointGet, ir::Scan> {
-  auto rows = rows_of(t, where, {}, {}, false);
-  if (auto* g = std::get_if<ir::PointGet>(&rows)) return *g;
-  return std::get<ir::Scan>(rows);  // no ORDER BY, so never split
+// reads each row whole; and the filters on them.
+auto write_rows(const Table& t, const std::vector<bound::Compare>& where, std::vector<ir::Computed>& comp)
+    -> std::pair<std::variant<ir::PointGet, ir::Scan>, std::vector<ir::Filter>> {
+  auto rows = rows_of(t, where, {}, {}, false, comp);
+  if (auto* g = std::get_if<ir::PointGet>(&rows.path)) return {*g, std::move(rows.filters)};
+  return {std::get<ir::Scan>(rows.path), std::move(rows.filters)};  // no ORDER BY, so never split
 }
 
-// Two tables, each by a point lookup, in FROM order: the two-point join
-// (docs/frontend_design.md, *Joins*; the join on a column is slice 5).
-auto join(const bound::Join& s) -> ir::Select {
-  if (s.ordered) no_plan("ORDER BY on a join");
-  const Table* sides[2]{s.table, s.second};
-  ir::PointJoin j{{s.table->id, s.second->id}, {}};
-  for (std::size_t i = 0; i < 2; ++i) {
-    auto g = point_get(*sides[i], s.where[i]);
-    if (!g) no_plan("a join must name the row of each table by its whole primary key yet");
-    j.rows[i] = *g;
+// Whether some key of `t` is reachable from its parameters alone: a path
+// whose first part is compared for equality or bounded.
+auto reachable(const Table& t, const std::vector<bound::Compare>& where) -> bool {
+  const auto all = paths(t);
+  return std::ranges::any_of(all, [&](const Path& p) {
+    auto c = choose(p, where, {});
+    return !c.eq.empty() || c.lo != nullptr || c.hi != nullptr;
+  });
+}
+
+// The inner table's whole primary key, each part from a parameter it is
+// compared equal to or an outer column it is joined on; and what that takes.
+struct InnerKey {
+  std::vector<ir::KeyPart> parts;
+  std::vector<const bound::Compare*> used;
+  std::vector<const bound::JoinOn*> on;
+};
+
+auto inner_key(const Table* const (&sides)[2], const bound::Join& s, std::uint32_t inner) -> std::optional<InnerKey> {
+  const auto outer = 1 - inner;
+  InnerKey k;
+  for (auto id : sides[inner]->pk_col_ids) {
+    const auto& where = s.where[inner];
+    auto it = std::ranges::find_if(where, [&](const auto& c) { return c.col_id == id && key_eq(c); });
+    if (it != where.end()) {
+      k.parts.push_back({it->param, std::nullopt});
+      k.used.push_back(&*it);
+      continue;
+    }
+    auto jt = std::ranges::find_if(s.on, [&](const bound::JoinOn& j) { return j.col[inner] == id; });
+    if (jt == s.on.end()) return std::nullopt;
+    k.parts.push_back({0, column(*sides[outer], jt->col[outer])});
+    k.on.push_back(&*jt);
   }
+  return k;
+}
+
+// Two tables (docs/frontend_design.md, *Joins*). With no column of one equal
+// to one of the other, each by its whole primary key, in FROM order. With
+// one, an index nested loop: the outer table reached from its parameters
+// alone, the inner one read by its whole primary key from parameters and the
+// outer row's columns; FROM order first, then the other, also when the
+// first has a filter it cannot serve. Every other conjunct is a filter on the
+// row it names.
+auto join(const bound::Join& s, std::vector<ir::Computed>& comp) -> ir::Select {
+  if (s.ordered) no_plan("ORDER BY on a join");
+  const Table* const sides[2]{s.table, s.second};
   ir::Select sel;
-  sel.from = j;
   sel.limit = s.limit;
   for (const auto& c : s.targets) sel.targets.push_back(column(*sides[c.side], c.col_id));
-  return sel;
+  if (s.aggregate) sel.aggregate = aggregate(*s.aggregate, *sides[s.aggregate->side]);
+  if (s.on.empty()) {
+    ir::PointJoin j{{s.table->id, s.second->id}, {}};
+    for (std::size_t i = 0; i < 2; ++i) {
+      auto k = point_get(*sides[i], s.where[i]);
+      if (!k) no_plan("a join must name the row of each table by its whole primary key yet");
+      j.rows[i] = k->get;
+      auto f = filters(*sides[i], s.where[i], k->used, comp);
+      sel.filters.insert(sel.filters.end(), f.begin(), f.end());
+    }
+    sel.from = j;
+    return sel;
+  }
+  // One orientation; a filter it cannot serve refuses it, and the other is
+  // tried before the refusal stands.
+  auto loop_join = [&](std::uint32_t outer, InnerKey k, std::vector<ir::Computed>& into) {
+    const auto inner = 1 - outer;
+    auto rows = rows_of(*sides[outer], s.where[outer], {}, {}, false, into);
+    ir::Scan scan;
+    if (const auto* g = std::get_if<ir::PointGet>(&rows.path)) {
+      // One outer row: a scan of its whole key's prefix, so one loop serves.
+      scan.object = sides[outer]->id;
+      scan.prefix = g->key_params;
+    } else {
+      scan = std::get<ir::Scan>(rows.path);  // no ORDER BY, so never split
+    }
+    // A NULL parameter on either side matches no pair.
+    for (const auto& where : s.where) {
+      for (const auto& c : where) {
+        if (std::ranges::find(scan.null_checks, c.param) == scan.null_checks.end()) scan.null_checks.push_back(c.param);
+      }
+    }
+    sel.filters = std::move(rows.filters);
+    auto f = filters(*sides[inner], s.where[inner], k.used, into);
+    sel.filters.insert(sel.filters.end(), f.begin(), f.end());
+    for (const auto& j : s.on) {
+      if (std::ranges::find(k.on, &j) != k.on.end()) continue;
+      auto col = column(*sides[inner], j.col[inner]);
+      if (col.type == PhysType::F64) {
+        no_plan("a filter on column \"" + sides[inner]->column(j.col[inner])->name +
+                "\", a REAL or DOUBLE PRECISION, is not supported yet");
+      }
+      sel.filters.push_back({col, Op::Eq, {0, std::nullopt, column(*sides[outer], j.col[outer])}});
+    }
+    sel.from = ir::LoopJoin{{sides[outer]->id, sides[inner]->id}, std::move(scan), std::move(k.parts)};
+  };
+  std::optional<SqlError> refused;
+  for (std::uint32_t outer : {0u, 1u}) {
+    if (!reachable(*sides[outer], s.where[outer])) continue;
+    auto k = inner_key(sides, s, 1 - outer);
+    if (!k) continue;
+    auto tried = comp;
+    try {
+      loop_join(outer, std::move(*k), tried);
+    } catch (const SqlError& e) {
+      if (!refused) refused = e;
+      sel.filters.clear();
+      continue;
+    }
+    comp = std::move(tried);
+    return sel;
+  }
+  if (refused) throw *refused;
+  auto outer = reachable(*sides[0], s.where[0]) ? 0u : reachable(*sides[1], s.where[1]) ? 1u : 2u;
+  if (outer == 2) no_plan("a full scan of " + s.table->name);
+  const auto* inner = sides[1 - outer];
+  std::string cols;
+  for (const auto& j : s.on) cols += (cols.empty() ? "" : ", ") + inner->column(j.col[1 - outer])->name;
+  no_plan("no index of " + inner->name + " joins on " + cols);
 }
 
 }  // namespace
@@ -365,16 +521,17 @@ auto plan_statement(const bound::Bound& b, const Catalog& cat) -> ir::Plan {
           return ins;
         } else if constexpr (std::is_same_v<T, bound::Select>) {
           table(*s.table);
-          return select(*s.table, s);
+          return select(*s.table, s, out.computed);
         } else if constexpr (std::is_same_v<T, bound::Join>) {
           table(*s.table);
           auto second = Catalog::constants(*s.second);
           out.constants.insert(out.constants.end(), second.begin(), second.end());
-          return join(s);
+          return join(s, out.computed);
         } else if constexpr (std::is_same_v<T, bound::Update>) {
           const auto& t = *s.table;
           table(t);
-          ir::Update up{write_rows(t, s.where), {}};
+          auto [rows, f] = write_rows(t, s.where, out.computed);
+          ir::Update up{rows, {}, std::move(f)};
           for (const auto& [id, e] : s.set) {
             ir::Expr v;
             switch (e.kind) {
@@ -389,7 +546,8 @@ auto plan_statement(const bound::Bound& b, const Catalog& cat) -> ir::Plan {
         } else if constexpr (std::is_same_v<T, bound::Delete>) {
           const auto& t = *s.table;
           table(t);
-          return ir::Delete{write_rows(t, s.where)};
+          auto [rows, f] = write_rows(t, s.where, out.computed);
+          return ir::Delete{rows, std::move(f)};
         } else {
           throw SqlError{"DDL has no plan", -1};
         }

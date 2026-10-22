@@ -116,7 +116,14 @@ TEST_CASE("codegen: the other bound forms produce plans; no rule, no plan", "[sq
         std::string::npos);
 
   CHECK_THROWS_AS(generate(f.cat(), "SELECT id FROM t WHERE qty = $1"), ast::SqlError);
-  CHECK_THROWS_AS(generate(f.cat(), "SELECT id FROM t WHERE id = $1 AND qty = $2"), ast::SqlError);
+  // A conjunct the key does not express filters each row: NULL on either side
+  // rejects it.
+  auto point = generate(f.cat(), "SELECT id FROM t WHERE id = $1 AND qty = $2").source;
+  CHECK(point.find("if (bc_col_null(cx, row, COL_1_2) || bc_param_null(cx, 1) || !(bc_col_i64(cx, row, COL_1_2) == "
+                   "bc_param_i64(cx, 1))) {\n    return;") != std::string::npos);
+  auto range = generate(f.cat(), "SELECT id FROM t WHERE name > $1 AND name > $2").source;
+  CHECK(range.find("|| !(bc_bytes_cmp(cx, bc_col_bytes(cx, row, COL_1_1), bc_param_bytes(cx, 1)) > 0)) continue;") !=
+        std::string::npos);
   CHECK_THROWS_AS(generate(f.cat(), "DELETE FROM t WHERE qty = $1"), ast::SqlError);
 }
 
@@ -144,8 +151,8 @@ TEST_CASE("codegen: UPDATE and DELETE write each row their key reaches, and coun
     return "accepted";
   };
   CHECK(refusal("UPDATE t SET qty = $1 WHERE qty = $2") == "no plan: a full scan of t");
-  CHECK(refusal("DELETE FROM t WHERE name = $1 AND qty = $2") ==
-        "no plan: a filter on column \"qty\" that the key does not express is not supported yet");
+  auto filtered = generate(f.cat(), "DELETE FROM t WHERE name = $1 AND qty = $2").source;
+  CHECK(filtered.find("bc_view old = bc_scan_row(cx, c);\n    if (bc_col_null(cx, old, COL_1_2)") != std::string::npos);
 }
 
 TEST_CASE("codegen: MIN from the first entry past the NULLs, or a loop; SUM by a loop", "[sql][codegen]") {
@@ -228,10 +235,15 @@ TEST_CASE("codegen: what the planner refuses, with its message", "[sql][codegen]
   CHECK(refusal("SELECT k FROM o WHERE a = $1 AND b = $2 ORDER BY c, k") == "accepted");
   CHECK(refusal("SELECT k FROM o WHERE a = $1 ORDER BY b DESC, c") ==
         "no plan: ORDER BY b would need its NULLs reordered");
-  CHECK(refusal("SELECT id FROM t WHERE id = $1 AND qty = $2") ==
-        "no plan: a filter on column \"qty\" that the key does not express is not supported yet");
-  CHECK(refusal("SELECT id FROM t WHERE name > $1 AND name > $2") ==
-        "no plan: a filter on column \"name\" that the key does not express is not supported yet");
+  // A DOUBLE or REAL column takes no filter yet.
+  f.ddl(CreateTableDdl{"fd", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("d", PhysType::F64, true)},
+                       {"k"}});
+  CHECK(refusal("SELECT k FROM fd WHERE k = $1 AND d < $2") ==
+        "no plan: a filter on column \"d\", a REAL or DOUBLE PRECISION, is not supported yet");
+  // $n + k bounds a range on a key, but compared by = it is a filter: it names no key.
+  f.ddl(CreateTableDdl{"ik", {{"k", {SqlKind::Integer}, false, {}}}, {"k"}});
+  CHECK(refusal("SELECT k FROM ik WHERE k >= $1 + 1") == "accepted");
+  CHECK(refusal("SELECT k FROM ik WHERE k = $1 + 1") == "no plan: a full scan of ik");
 }
 
 TEST_CASE("codegen: FOR UPDATE guards the key of every row it returns, read from the row", "[sql][codegen][txn]") {
@@ -255,6 +267,9 @@ TEST_CASE("codegen: a join is of two point lookups, in FROM order", "[sql][codeg
   CHECK(j.objects_read == std::vector<std::uint32_t>{1, 4});
   CHECK(j.source.find("bc_view row = bc_get(cx, bc_key_params(cx, TBL_4, 0, 1), &found);") != std::string::npos);
   CHECK(j.source.find("bc_view row1 = bc_get(cx, bc_key_params(cx, TBL_1, 1, 1), &found1);") != std::string::npos);
+  // An aggregate over the pair reads the second row only if the first is there.
+  auto agg = generate(f.cat(), "SELECT count(*) FROM u JOIN t ON id = $2 WHERE k = $1");
+  CHECK(agg.source.find("if (found) row1 = bc_get(cx, bc_key_params(cx, TBL_1, 1, 1), &found1);") != std::string::npos);
   auto refusal = [&](std::string_view sql) -> std::string {
     try {
       (void)generate(f.cat(), sql);
@@ -266,5 +281,36 @@ TEST_CASE("codegen: a join is of two point lookups, in FROM order", "[sql][codeg
   CHECK(refusal("SELECT v FROM u, t WHERE k = $1 AND id = $2 ORDER BY v") == "no plan: ORDER BY on a join");
   CHECK(refusal("SELECT v FROM u, t WHERE k = $1 AND name = $2") ==
         "no plan: a join must name the row of each table by its whole primary key yet");
+  // A join on a column: the outer table reached from its parameters, the
+  // inner one read by its whole primary key from the outer row.
+  auto loop = generate(f.cat(), "SELECT v FROM t, u WHERE name >= $1 AND k = qty");
+  CHECK(loop.objects_read == std::vector<std::uint32_t>{1, 3, 4});
+  CHECK(loop.source.find("bc_key_i64(cx, k0, bc_col_i64(cx, row, COL_1_2));") != std::string::npos);
+  CHECK(loop.source.find("if (!found1) continue;") != std::string::npos);
+  // FROM order first, then the other: u is the one its parameters reach.
+  CHECK(refusal("SELECT v FROM t, u WHERE k = $1 AND id = v") == "accepted");
+  CHECK(refusal("SELECT v FROM t, u WHERE qty = $1 AND k = qty") == "no plan: a full scan of t");
+  CHECK(refusal("SELECT v FROM t, u WHERE id = $1 AND v = qty") == "no plan: no index of u joins on v");
+  // FROM order would leave x.f = y.f a filter on a DOUBLE PRECISION; the
+  // other order keys x by it.
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"x", {Fixture::col("f", PhysType::F64, false), Fixture::col("c", PhysType::I64, true)}, {"f"}});
+  f.ddl(CreateIndexDdl{"x_by_c", "x", {{"c"}}});
+  f.ddl(CreateTableDdl{"y", {Fixture::col("yk", PhysType::I64, false), Fixture::col("yf", PhysType::F64, true)}, {"yk"}});
+  auto other = generate(f.cat(), "SELECT c FROM x, y WHERE c = $1 AND yk = $2 AND f = yf");
+  CHECK(other.source.find("bc_scan_open(cx, TBL_9, lo, lo, BC_SCAN_PREFIX);") != std::string::npos);
+  CHECK(other.source.find("bc_key_f64(cx, k0, bc_col_f64(cx, row, COL_9_1));") != std::string::npos);
+  // Both orders refused: the first one's refusal stands.
+  CHECK(refusal("SELECT c FROM x, y WHERE c = $1 AND yk = $2 AND f = yf AND yf = $3") ==
+        "no plan: a filter on column \"yf\", a REAL or DOUBLE PRECISION, is not supported yet");
+  // A long outer value makes an inner key no row has: that outer row joins nothing.
+  f.ddl(CreateTableDdl{"s", {Fixture::col("sk", PhysType::Bytes, false)}, {"sk"}});
+  auto by_bytes = generate(f.cat(), "SELECT id FROM t, s WHERE name >= $1 AND sk = name");
+  auto fits = by_bytes.source.find("if (!bc_key_fits(cx, k0)) continue;");
+  auto get = by_bytes.source.find("bc_view row1 = bc_get(cx, bc_key_end(cx, k0), &found1);");
+  REQUIRE(fits != std::string::npos);
+  REQUIRE(get != std::string::npos);
+  CHECK(fits < get);
+  CHECK(loop.source.find("bc_key_fits") == std::string::npos);  // an integer key always fits
 }
 

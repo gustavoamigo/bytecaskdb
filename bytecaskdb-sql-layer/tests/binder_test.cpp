@@ -370,6 +370,21 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
     CHECK(j.where[1].size() == 1);
   }
   {
+    // $n ± k compared with an INTEGER column: $n is an INTEGER, the literal
+    // added as the offset.
+    sql_test::Fixture g;
+    g.ddl(std::get<Ddl>(bind_sql(g.cat(), "CREATE TABLE ol (w INTEGER, o INTEGER, s SMALLINT, PRIMARY KEY (w, o))").stmt));
+    auto b = bind_sql(g.cat(), "SELECT o FROM ol WHERE w = $1 AND o < $2 AND o >= $2 - 20");
+    const auto& sel = std::get<bound::Select>(b.stmt);
+    CHECK(sel.where[2].param == 1u);
+    CHECK(sel.where[2].offset == -20);
+    CHECK_FALSE(sel.where[1].offset);
+    CHECK(rejected(g.cat(), "SELECT o FROM ol WHERE w = $1 AND s < $2 + 1").first ==
+          "$n + n and $n - n are supported only compared with an INTEGER column yet");
+    CHECK(rejected(g.cat(), "SELECT o FROM ol WHERE w = $1 AND o < $2 + 2147483648").first ==
+          "an integer literal past INTEGER is not supported here yet");
+  }
+  {
     // A literal is in its column's representation: a DECIMAL's scaled.
     auto up = std::get<bound::Update>(bind_sql(cat, "UPDATE u SET d = d + 1, qty = qty - 2 WHERE k = $1").stmt);
     CHECK(up.set[0].second.constant == 100);
@@ -384,10 +399,28 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
   CHECK(rejected(cat, "SELECT id FROM t, t WHERE id = $1").first == "a table joined with itself is not supported");
   CHECK(rejected(cat, "SELECT id FROM t, u WHERE id = $1 AND k = $2 FOR UPDATE").first ==
         "FOR UPDATE on a join is not supported yet");
-  CHECK(rejected(cat, "SELECT count(*) FROM t, u WHERE id = $1 AND k = $2").first ==
-        "an aggregate on a join is not supported yet");
-  CHECK(rejected(cat, "SELECT id FROM t, u WHERE id = k").first == "WHERE must compare a column with a parameter");
-  CHECK(rejected(cat, "SELECT id FROM t JOIN u ON id = k WHERE k = $1").first == "ON must compare a column with a parameter");
+  {
+    // A column of one table equal to one of the other joins them; an
+    // aggregate on a join takes either table's column.
+    auto j = std::get<bound::Join>(bind_sql(cat, "SELECT count(DISTINCT u.qty) FROM t JOIN u ON u.qty = id WHERE id >= $1").stmt);
+    REQUIRE(j.on.size() == 1);
+    CHECK(j.on[0].col[0] == 0u);  // t.id
+    CHECK(j.on[0].col[1] == 1u);  // u.qty
+    REQUIRE(j.aggregate);
+    CHECK(j.aggregate->distinct);
+    CHECK(j.aggregate->side == 1);
+  }
+  CHECK(rejected(cat, "SELECT id FROM t, u WHERE id = k AND qty = id").first ==
+        "column reference \"qty\" is ambiguous");
+  CHECK(rejected(cat, "SELECT id FROM t, u WHERE t.id = t.qty").first ==
+        "comparing two columns of one table is not supported yet");
+  CHECK(rejected(cat, "SELECT id FROM t, u WHERE id < k").first == "a join compares two columns with = only yet");
+  CHECK(rejected(cat, "SELECT id FROM t, u WHERE name = k").first ==
+        "comparing name (bytea) with k (bigint) is not supported: a join compares columns of one type");
+  CHECK(rejected(cat, "SELECT u.qty, count(*) FROM t, u WHERE id = k").first ==
+        "column \"u.qty\" must appear in the GROUP BY clause or be used in an aggregate function");
+  CHECK(rejected(cat, "SELECT id FROM t JOIN u ON id = $1 + k WHERE k = $2").first ==
+        "ON must compare a column with a parameter");
   {
     // A range refusal names the table of the column the parameter is compared with.
     auto b = bind_sql(cat, "SELECT name FROM t, u WHERE id = $1 AND k = $2");
