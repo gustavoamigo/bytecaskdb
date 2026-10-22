@@ -34,15 +34,28 @@ add_requires("libpg_query 6.2.5")
 -- TinyCC: compiles plans in process (the run-time tier, #493). LGPL-2.1;
 -- linked statically here, which is acceptable for a prototype that does not
 -- ship. Pinned to a mob-branch commit: the last release, 0.9.27, is from 2017.
+--
+-- It maps a plan's code writable, then mprotects it executable, which SELinux
+-- in enforcing mode refuses ("mprotect failed"). Built with --with-selinux it
+-- maps the code through a file instead, which works in every mode. That is
+-- chosen here whenever SELinux is enabled on the build machine, as a package
+-- config so that xmake rebuilds the package when that changes.
+local function selinux_enabled()
+    return os.exists("/sys/fs/selinux/enforce")
+end
+
 package("tinycc")
     set_homepage("https://bellard.org/tcc/")
     set_urls("https://github.com/TinyCC/tinycc.git")
     add_versions("2026.09.26", "9db1105c32afd3dcf0c28b8186f08e63c761b2b5")
     add_links("tcc")
     add_syslinks("dl", "pthread")
+    add_configs("selinux", {description = "Map plan code through a file, for SELinux enforcing.", default = false, type = "boolean"})
     on_install("linux", function (package)
         local cc = package:build_getenv("cc") or "cc"
-        os.vrunv("./configure", {"--prefix=" .. package:installdir(), "--cc=" .. cc})
+        local args = {"--prefix=" .. package:installdir(), "--cc=" .. cc}
+        if package:config("selinux") then table.insert(args, "--with-selinux") end
+        os.vrunv("./configure", args)
         os.vrunv("make", {"-j4"})
         os.vrunv("make", {"install"})
     end)
@@ -50,7 +63,7 @@ package("tinycc")
         assert(package:has_cfuncs("tcc_new", {includes = "libtcc.h"}))
     end)
 package_end()
-add_requires("tinycc 2026.09.26")
+add_requires("tinycc 2026.09.26", {configs = {selinux = selinux_enabled()}})
 
 -- C++23 modules, as the engine (the root sets the modules policy for every
 -- target): one interface unit per module (bytecask.sql.<name>), holding its

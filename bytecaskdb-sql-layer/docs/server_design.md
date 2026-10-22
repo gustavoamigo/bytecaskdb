@@ -656,11 +656,17 @@ runs is not part of its output.
 
 `bytecaskdb-sql-layer/hammerdb/run-gate.sh [--warehouses=48] [--vus=1,16,48]
 [--rampup=2] [--duration=5] [--mix="neword payment ostat delivery slev"]
-[--hammerdb-home=PATH] [--data-root=PATH] [--smoke --pg=CONNINFO]`. It
+[--hammerdb-home=PATH] [--data-root=PATH] [--server-flags="--sync AT_INTERVAL"]
+[--smoke --pg=CONNINFO]`. `--server-flags` goes to the server in every cell. It
 follows `run-hammerdb.sh` in the MariaDB plugin. `--smoke` is the short run
 of *Tests*, and `--pg` names the PostgreSQL it checks the driver on (its
 password in `PGPASSWORD`). `XMAKE_FLAGS` adds `xmake f` flags, as CI sets
 its toolchain.
+
+TinyCC is built with `--with-selinux` whenever SELinux is enabled on the
+build machine (`xmake.lua`): in enforcing mode its default way of making
+plan code executable, `mprotect`, is refused, and no plan links. It maps
+the code through a file instead, which works in every mode.
 
 1. **Build.** It builds `sql_layer_tprocc` and `sql_layer_server` in
    `releasedbg`; a debug engine walks the key directory on every commit.
