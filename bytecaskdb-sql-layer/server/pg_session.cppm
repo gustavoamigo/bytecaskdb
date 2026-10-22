@@ -14,6 +14,7 @@ module;
 
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -43,9 +44,15 @@ struct SessionConfig {
 
 // Serves one connection until the client terminates or drops it, or until
 // `stopping` is set and the read side of `fd` has been shut down, which wakes
-// a read: the connection is then sent FATAL 57P01. An open transaction is
-// rolled back either way. Does not close `fd`.
+// a read: the connection is then sent FATAL 57P01. A send checks `stopping`
+// at least once a second. An open transaction is rolled back either way.
+// Does not close `fd`.
 void serve(Database& db, int fd, const SessionConfig& cfg, const std::atomic<bool>& stopping);
+
+// Once a stop has begun, how long a send waits on a client that takes no
+// bytes before the connection is dropped. A client still reading gets its
+// reply and the 57P01, however long its result takes.
+inline constexpr std::chrono::seconds kStopSendTimeout{10};
 
 // The FATAL 53300 a connection past the limit gets before it is closed.
 [[nodiscard]] auto too_many_connections() -> std::string;
@@ -375,14 +382,25 @@ private:
     if (stopping_.load() && !fatal_sent_) fatal("57P01", "terminating connection due to administrator command");
   }
 
+  // Writes the buffer. It waits for a client as long as it reads, and,
+  // once a stop has begun, kStopSendTimeout for one that takes nothing: a
+  // send blocked in the kernel would not see the stop, so it never blocks.
   void flush() {
     auto data = out_.data();
     std::size_t done = 0;
+    auto progress = std::chrono::steady_clock::now();
     while (done < data.size()) {
-      auto n = ::send(fd_, data.data() + done, data.size() - done, MSG_NOSIGNAL);
+      auto n = ::send(fd_, data.data() + done, data.size() - done, MSG_NOSIGNAL | MSG_DONTWAIT);
+      if (n > 0) {
+        done += static_cast<std::size_t>(n);
+        progress = std::chrono::steady_clock::now();
+        continue;
+      }
       if (n < 0 && errno == EINTR) continue;
-      if (n <= 0) throw ConnectionGone{};
-      done += static_cast<std::size_t>(n);
+      if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) throw ConnectionGone{};
+      if (stopping_.load() && std::chrono::steady_clock::now() - progress > kStopSendTimeout) throw ConnectionGone{};
+      pollfd p{fd_, POLLOUT, 0};
+      (void)::poll(&p, 1, 1'000);
     }
     out_.clear();
   }

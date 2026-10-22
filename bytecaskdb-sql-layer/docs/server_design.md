@@ -147,11 +147,14 @@ calls `shutdown(fd, SHUT_RD)` on every registered connection, so a thread
 blocked in `read` wakes at once, idle or not. A statement in flight finishes
 first: its reply still goes out, since the write side stays open. The
 thread then sends `FATAL 57P01` (`admin_shutdown`), rolls back an open
-transaction and exits. A connection still open after one second is one
-whose client stopped reading: its thread is blocked in `send`, which only
-`shutdown(fd, SHUT_RDWR)` wakes, so the server shuts both sides of every
-connection left. Those threads end without the `57P01`. When every thread
-has ended, the server calls `Database::close()`.
+transaction and exits. A send never blocks in the kernel: it waits in
+`poll` a second at a time, so it sees the stop. A client that has stopped
+reading takes no bytes; once the stop has begun, a send that makes no
+progress for ten seconds drops the connection without the `57P01`. One that
+is still reading, however slowly and however large its result, gets its
+reply and then the `57P01`, so it learns whether its last statement
+committed. When every thread has ended, the server calls
+`Database::close()`.
 
 **After a `FATAL`** the session ends: it reads no more messages and runs
 nothing more. After startup, an invalid message length or type is `FATAL`.

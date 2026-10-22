@@ -10,8 +10,8 @@
 // last component. Trust authentication only: anyone who reaches the port is
 // in, so it listens on loopback unless told otherwise. One thread per
 // connection. SIGINT or SIGTERM stops it: each connection is sent FATAL
-// 57P01 between messages, or dropped if its client takes no replies within a
-// second, open transactions roll back, and the database is closed. Prints "ready on HOST:PORT" once it accepts connections.
+// 57P01 between messages, or dropped if its client takes no reply bytes for
+// ten seconds, open transactions roll back, and the database is closed. Prints "ready on HOST:PORT" once it accepts connections.
 
 #include <fcntl.h>
 #include <netdb.h>
@@ -25,7 +25,6 @@
 
 #include <atomic>
 #include <charconv>
-#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -89,9 +88,6 @@ auto listen_on(const std::string& host, const std::string& port) -> int {
   }
   throw system_error(("cannot listen on " + host + ":" + port).c_str());
 }
-
-// How long a stop waits for each connection to take its replies and 57P01.
-constexpr std::chrono::seconds kShutdownGrace{1};
 
 auto loopback(const std::string& host) -> bool {
   return host == "127.0.0.1" || host == "::1" || host == "localhost" || host.starts_with("127.");
@@ -200,17 +196,13 @@ int main(int argc, char** argv) {
     }
 
     // Stopping: no new connections; each one's read wakes, it finishes what
-    // it is running, says 57P01 and ends. One still sending after a grace
-    // period has a client that stopped reading, and a blocked send wakes
-    // only when the write side is shut down too: it is dropped.
+    // it is running, says 57P01 and ends. A send stops waiting on a client
+    // that takes nothing for a while (pg::kStopSendTimeout): it is dropped.
     ::close(listener);
     {
       std::unique_lock<std::mutex> lock{conns.mu};
       for (auto fd : conns.fds) (void)::shutdown(fd, SHUT_RD);
-      if (!conns.none_left.wait_for(lock, kShutdownGrace, [&] { return conns.fds.empty(); })) {
-        for (auto fd : conns.fds) (void)::shutdown(fd, SHUT_RDWR);
-        conns.none_left.wait(lock, [&] { return conns.fds.empty(); });
-      }
+      conns.none_left.wait(lock, [&] { return conns.fds.empty(); });
     }
     db->close();
     return 0;

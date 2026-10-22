@@ -15,6 +15,7 @@ import os
 import shutil
 import socket
 import struct
+import signal
 import tempfile
 import time
 
@@ -548,33 +549,71 @@ def test_shutdown_sends_57p01_to_an_idle_connection():
         shutil.rmtree(directory, ignore_errors=True)
 
 
+BIG_ROWS = 20_000
+
+
+def big_table(c: Client) -> None:
+    """40 MB: more than both sockets' buffers hold."""
+    c.send(query("CREATE TABLE big (k INTEGER PRIMARY KEY, v VARCHAR(2000))"))
+    assert states(c.until_ready()) == []
+    value = "x" * 2000
+    for batch in range(BIG_ROWS // 2000):
+        rows = range(batch * 2000, (batch + 1) * 2000)
+        c.send(query("BEGIN"), parse("INSERT INTO big VALUES ($1, $2)"),
+               *[m for k in rows for m in (bind([str(k), value]), execute())], SYNC, query("COMMIT"))
+        for _ in range(3):
+            assert states(c.until_ready()) == []
+
+
 def test_a_stop_drops_a_client_that_stopped_reading():
-    """Its send blocks on a full socket; the stop still ends and closes the database."""
+    """Its send waits on a full socket; the stop still ends and closes the database."""
     if not server_binary():
         pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
     directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
     s = Server(directory)
     try:
         c = connect(s)
-        c.send(query("CREATE TABLE big (k INTEGER PRIMARY KEY, v VARCHAR(2000))"))
-        assert states(c.until_ready()) == []
-        value = "x" * 2000
-        for batch in range(10):  # 40 MB: more than both sockets' buffers hold
-            rows = range(batch * 2000, (batch + 1) * 2000)
-            c.send(query("BEGIN"), parse("INSERT INTO big VALUES ($1, $2)"),
-                   *[m for k in rows for m in (bind([str(k), value]), execute())], SYNC, query("COMMIT"))
-            for _ in range(3):
-                assert states(c.until_ready()) == []
+        big_table(c)
         c.send(parse("SELECT k, v FROM big WHERE k >= $1"), bind(["0"]), execute(), SYNC)  # and never read
         time.sleep(1)
         started = time.monotonic()
         assert s.stop() == 0
-        assert time.monotonic() - started < 15
+        assert time.monotonic() - started < 30  # ten seconds without progress, then dropped
         again = Server(directory)
         try:
             assert data(run(connect(again), "SELECT k FROM big WHERE k = $1", ["19999"])) == [["19999"]]
         finally:
             again.stop()
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_a_stop_lets_a_client_still_reading_take_its_whole_reply():
+    """A result that takes seconds to read, begun before the stop: the client
+    gets every row, CommandComplete and ReadyForQuery, then 57P01."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory)
+    try:
+        c = connect(s)
+        big_table(c)
+        c.send(parse("SELECT k, v FROM big WHERE k >= $1"), bind(["0"]), execute(), SYNC)
+        assert c.message()[0] == b"1"
+        started = time.monotonic()
+        s.proc.send_signal(signal.SIGTERM)
+        out = []
+        while not out or out[-1][0] != b"Z":
+            out.append(c.message())
+            if len(out) % 200 == 0:
+                time.sleep(0.03)  # a slow reader: the reply takes seconds
+        assert time.monotonic() - started > 2
+        assert kinds(out).count(b"D") == BIG_ROWS
+        assert [b for k, b in out if k == b"C"] == [f"SELECT {BIG_ROWS}\0".encode()]
+        kind, body = c.message()
+        assert kind == b"E" and fields(body)["C"] == "57P01"
+        assert s.stop() == 0
     finally:
         s.stop()
         shutil.rmtree(directory, ignore_errors=True)
