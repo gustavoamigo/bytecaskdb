@@ -96,8 +96,14 @@ HAMMERDB_HOME="$(find_hammerdb)" || {
 # XMAKE_FLAGS: more `xmake f` flags, as CI configures its toolchain.
 echo "== building sql_layer_tprocc and sql_layer_server (releasedbg)"
 read -r -a xmake_flags <<<"${XMAKE_FLAGS:-}"
-(cd "$ROOT" && xmake f -m releasedbg --sql_layer=y "${xmake_flags[@]}" -y >/dev/null &&
-  xmake build -y sql_layer_tprocc sql_layer_server >/dev/null)
+build_log="$(mktemp -t bytecask_gate_build_XXXXXX)"
+if ! (cd "$ROOT" && xmake f -m releasedbg --sql_layer=y "${xmake_flags[@]}" -y &&
+      xmake build -y sql_layer_tprocc && xmake build -y sql_layer_server) >"$build_log" 2>&1; then
+  tail -80 "$build_log" >&2
+  echo "run-gate.sh: the build failed" >&2
+  exit 1
+fi
+rm -f "$build_log"
 BIN="$ROOT/build/linux/$(uname -m)/releasedbg"
 TPROCC="$BIN/sql_layer_tprocc"
 SERVER="$BIN/sql_layer_server"
