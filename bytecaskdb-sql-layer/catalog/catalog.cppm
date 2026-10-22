@@ -845,7 +845,9 @@ auto sql_type_name(SqlType t) -> std::string {
     case SqlKind::Bytea: return "bytea";
     case SqlKind::Text: return "text";
     case SqlKind::Varchar: return "varchar(" + std::to_string(t.length) + ")";
-    case SqlKind::Decimal: return "numeric(" + std::to_string(t.precision) + "," + std::to_string(t.scale) + ")";
+    case SqlKind::Decimal:
+      if (t.precision == 0) return "numeric";  // no declared precision: a SUM's result
+      return "numeric(" + std::to_string(t.precision) + "," + std::to_string(t.scale) + ")";
     case SqlKind::Timestamp: return "timestamp";
     case SqlKind::Date: return "date";
     case SqlKind::Time: return "time";

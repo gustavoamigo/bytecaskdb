@@ -119,14 +119,28 @@ Rules for slice 3 (#492):
   mostly, as `FROM a, b WHERE …` or `a JOIN b ON … WHERE …`, columns
   qualified by their table.
 
-`test_tpcc.py` runs TPROC-C's Payment, Order-Status and New-Order through
-SQL against PostgreSQL: a small fixture (one warehouse, two districts,
-thirty customers each, some with a NULL `c_first`, fifty items and their
-stock), then ninety transactions from a fixed seed, one thread, in
-roughly TPROC-C's mix, each statement in a `Transaction` and in a
-PostgreSQL REPEATABLE READ transaction, with the client's logic between
-them. One New-Order in twenty names an item that does not exist and rolls
-back. Every statement's result and every table after the run must agree.
+Rules for slice 4 (#492):
+- **SUM and MIN** over the same `WHERE` as `COUNT`, with `LIMIT 0` or 1
+  now and then: `SUM` of SMALLINT, INTEGER and NUMERIC(6, 2) columns, `MIN`
+  of those and BIGINT ones. `SUM` of BIGINT is left out: its running total
+  leaves `int64_t` (*Known differences*).
+- **UPDATE and DELETE by a key**: the same `WHERE` as `SELECT`, every row
+  it matches; the `UPDATE` sets a non-key column to a parameter, or adds
+  one to or subtracts one from a SMALLINT, INTEGER or NUMERIC(6, 2) column
+  no unique index holds. `served` decides whether the layer plans it, as
+  for a `SELECT` without `ORDER BY`; the counts must agree.
+
+`test_tpcc.py` runs TPROC-C's Payment, Order-Status, New-Order and Delivery
+through SQL against PostgreSQL: a small fixture (one warehouse, two
+districts, thirty customers each, some with a NULL `c_first`, fifty items
+and their stock, the orders without a carrier undelivered in `new_order`),
+then a hundred transactions from a fixed seed, one thread, each statement
+in a `Transaction` and in a PostgreSQL REPEATABLE READ transaction, with
+the client's logic between them. Every tenth is a Delivery, of each
+district's oldest undelivered order; the rest are in roughly TPROC-C's mix
+of the other three. One New-Order in twenty names an item that does not
+exist and rolls back. Every statement's result and every table after the
+run must agree.
 The schema is read from `tests/tpcc_schema.cppm`, its one definition.
 
 Fixed cases are plain pytest functions at the end of the file. They call
@@ -165,6 +179,169 @@ Locally, with an ASan build:
 build/linux/x86_64/debug/sql_layer_tests "~[alloc]"
 LSAN_OPTIONS=suppressions=$PWD/bytecaskdb-sql-layer/tests/lsan_alloc_sweeps.supp \
   build/linux/x86_64/debug/sql_layer_tests "[alloc]"
+```
+
+## The TPC-C harness
+
+Status: **design, approved (owner, 2026-10-21).** The harness runs
+TPROC-C's transaction mix through the embedded API: it checks TPC-C's
+consistency conditions, runs Elle through SQL and the CI smoke test, and
+gives the layer's numbers with no network. It is not the MVP gate, which is
+HammerDB over the wire (`docs/frontend_design.md`, *The MVP gate* and
+Decision 7). This section is what the harness does; the
+statements it sends and the `h_id` scheme are `frontend_design.md`'s
+(*Where the statements come from*, *The statements*), and are not
+repeated here.
+
+**One binary, three commands.** `harness/main.cpp`, xmake target
+`sql_layer_tpcc` (not built by default, as `sql_layer_bench`):
+`sql_layer_tpcc load`, `sql_layer_tpcc run` and `sql_layer_tpcc elle`. The
+loader, the transactions and the checks are one module,
+`bytecask.sql.tpcc` (`harness/tpcc.cppm`), which the smoke test in
+`sql_layer_tests` uses too. Run it from a `releasedbg` build: a debug
+engine walks every key-directory entry on each commit it publishes, so at
+TPC-C's scale a commit takes hundreds of milliseconds. Everything goes through the
+embedded API (`Database`, `Transaction`, `Statement`), in the harness's
+own process. It links the testing build of the layer, as `bytecask_sql`
+does, for the engine's `stats()`, which the embedded API keeps there. Every statement is prepared once, before the threads start,
+and shared by them.
+
+**The loader.**
+- `load --dir D --warehouses W`: the schema fixture (`tests/tpcc_schema.cppm`),
+  then TPC-C's initial population (clause 4.3.3): 100,000 items; per
+  warehouse 100,000 stock rows and 10 districts; per district 3,000
+  customers with one history row each, 3,000 orders with their lines, and
+  the last 900 orders in `new_order`. Random strings, `c_last` from the
+  syllables, `NURand` with its constants, 10% `BC` credit, as the clause
+  says.
+- One prepared `INSERT` per table, many rows per `Transaction`: as many as
+  fit well inside its 64 MiB bound.
+- The loader creates `harness_run`, inserts its row `(1, 0)` and uses run
+  0 for its `h_id`s. A run bumps it with `last_run = last_run + $1`, `$1`
+  being 1, until integer literals arrive with New-Order (slice 3).
+- `w_ytd` and `d_ytd` start at what the history rows sum to: 300,000.00
+  and 30,000.00 at the specification's scale, as clause 4.3.3.1 says, and
+  proportionally less at a smaller one, so the consistency conditions hold
+  at any scale.
+- The cardinalities are parameters with the specification's values as
+  defaults. Only the smoke test shrinks them.
+
+**The driver.**
+- `run --dir D --threads 1,16,48 --duration S --warmup S --seed N`. Each
+  thread count is one phase on the same database, run in order. Each phase
+  bumps `harness_run` for its own run, so a phase's thread indices never
+  reuse another phase's `h_id`s.
+- Closed loop, no keying or think time, as HammerDB's default. Thread `t`
+  has home warehouse `t mod W + 1`, and a per-thread generator seeded from
+  `--seed` and `t`.
+- The mix is the specification's deck (New-Order 45, Payment 43, and
+  Order-Status, Delivery and Stock-Level 4 each), drawn per transaction.
+  It is restricted to the transactions built so far and renormalised.
+  Payment and Order-Status come first, with #542; each later front-end
+  slice adds its transaction to the deck and to the inputs below.
+- Inputs follow the profiles (clauses 2.4 to 2.8): customers by last name
+  60% of the time and by `NURand` id otherwise; a remote warehouse for 15%
+  of Payments when `W > 1`; `h_amount` from 1.00 to 5,000.00; a `BC`
+  customer's new `c_data`. The client logic is the harness's, as in
+  HammerDB's client-side driver.
+- One difference from TPC-C, as in HammerDB: Payment does not update
+  `c_ytd_payment` or `c_payment_cnt`, since it runs HammerDB's statements
+  (P9, P10) by decision.
+- One `Transaction` per TPROC-C transaction, committed with `commit()`.
+
+**Errors and retries.**
+- `SerializationFailure` (40001) reruns the transaction with the same
+  inputs in a new `Transaction`, up to 10 attempts. Retries are counted
+  per transaction type. A transaction still failing after its tenth
+  attempt is counted as abandoned and the thread moves on.
+- New-Order's 1% of orders naming an unused item roll back, as the
+  specification requires, and count as completed.
+- Any other error stops the run with a non-zero exit: 23505,
+  `TransactionResolutionUnknown`, a constraint, an I/O error. In TPROC-C
+  none is expected, so each one is a bug to look at, not a number.
+
+**What it reports.** Per phase:
+- per transaction type, completed, retries and abandoned, and latency
+  p50, p95, p99 and max, from the first attempt's start to the commit that
+  completed it;
+- TPM, completed transactions of every type per minute, and NOPM, completed
+  New-Orders per minute (`n/a` until New-Order is in the mix);
+- the engine's `fsyncs` and `group_writer_batches` over the measured
+  window, read from `stats()` at its start and end, to set beside
+  `commit_probe`.
+
+A transaction counts, with its retries, when it starts and ends inside
+the phase's measured window, after the warm-up; the rates divide by the
+window's length. Latencies go into a fixed log-bucket histogram per
+thread, from 1 µs to 10 s, merged at the end, so a long run holds no
+per-transaction list. Each phase's report is printed as a table as the
+phase ends, so a later phase's failure loses none of the earlier ones.
+With `--json FILE`, one JSON object per phase is appended to FILE as well.
+An error in any thread ends its phase at once. These runs are the only performance
+numbers the harness produces; there are no micro-benchmarks.
+
+**Consistency after a run.** After the last phase, the harness checks
+TPC-C's consistency conditions (clause 3.3.2) for the transactions in the
+mix, through SQL: `warehouse` and `district` by a key range, and `history`
+in pages of 10,000 rows in `h_id` order, so no run holds it all:
+- with Payment: condition 1 (`w_ytd` is the sum of its districts'
+  `d_ytd`), and conditions 8 and 9 (`w_ytd` and `d_ytd` are each the sum of
+  their `history` rows' `h_amount`);
+- New-Order and Delivery add conditions 2 to 4 and 5 to 7 when they land.
+
+A failed condition exits non-zero.
+
+**The smoke test.** `tpcc: a short mixed run keeps TPC-C's consistency
+conditions` is a Catch2 test in `sql_layer_tests`. It loads two warehouses
+at a tiny scale, then runs four threads for a few hundred transactions. It
+requires that every type in the mix completed at least once, that no
+error other than 40001 occurred, and that the consistency conditions hold.
+It is the only part CI runs: full runs and Elle are manual.
+
+**Elle through SQL.** `elle` records a list-append history through SQL, in
+the engine harness's history format (`docs/isolation_checking_design.md`),
+and `scripts/sql_isolation_check.py` checks it with the engine's tooling:
+`run_elle` and `cross_check` from `scripts/run_isolation_check.py`.
+- One table, `elle (k BIGINT PRIMARY KEY, v VARCHAR(2048))`. Each key holds
+  its list as decimals separated by commas. Every key's row exists before
+  the clients start, empty, so every read returns a row.
+- Keys rotate as in the engine harness: 8 active keys, retired after 64
+  appends.
+- A transaction is 1 to 4 micro-operations in one `Transaction`. A read is
+  `SELECT v FROM elle WHERE k = $1`; an append reads the same way, then
+  `UPDATE elle SET v = $2 WHERE k = $1`.
+- `guarded`: the reads of keys the transaction does not append use
+  `FOR UPDATE`. It must be valid under `strict-serializable`.
+- `unguarded`: plain reads. It must be valid under `snapshot-isolation`,
+  and under `strict-serializable` report only write skew (`G2-item`), at
+  least once over the run.
+- `blind`: every statement in autocommit, with no `Transaction`. It must
+  show a lost append, which shows the check can see a lost update: found
+  by the cross-check (an `:ok` append missing from the final read, or a
+  read the final value does not extend), or else by Elle. Elle runs on it
+  only when the cross-check found none: the history is large and invalid,
+  and Elle's search and plots of it take tens of minutes.
+- A completed `commit()` is `:ok`, a `SerializationFailure` `:fail`, and
+  `TransactionResolutionUnknown` `:info`. In `blind`, a statement that
+  conflicted on every retry is `:info`: the statements before it committed.
+  Any other error stops the run.
+- **The one difference from the engine's check:** `commit()` returns no
+  commit sequence, so the cross-check's rule that a key's final list
+  follows commit-sequence order cannot apply. `cross_check` takes
+  `require_sequence=False` for it (owner decision, 2026-10-21): the rule
+  skips an operation with no `sequence`. Every other caller keeps the
+  default, under which an `:ok` append without one is a violation. Every
+  other rule does apply: reads are prefixes, nothing failed is visible,
+  every `:ok` append is there, and real-time visibility.
+
+Commands:
+
+```sh
+xmake f -m releasedbg --sql_layer=y && xmake build sql_layer_tpcc
+sql_layer_tpcc load --dir /tmp/tpcc --warehouses 48
+sql_layer_tpcc run --dir /tmp/tpcc --threads 1,16,48 --duration 300 --warmup 60
+python3 bytecaskdb-sql-layer/scripts/sql_isolation_check.py \
+  --binary build/linux/x86_64/releasedbg/sql_layer_tpcc --elle-jar elle-cli.jar --rounds 4
 ```
 
 ## Known differences
@@ -213,6 +390,22 @@ Found so far. The machine expects each one, so it does not fail on them.
   refused at bind** ("numeric field overflow"), whatever the column holds;
   PostgreSQL computes the sum and fails only when it does not fit the
   column. The machine's literals stay inside 18 digits.
+- **A unique value an UPDATE moves from one row to another is a
+  duplicate.** With a unique index on `u`, rows holding 1 and 2, `SET u =
+  u + 1` over both is refused (23505) here, whatever order the rows are
+  written in: each row's new value is checked against the snapshot, where
+  the other row still holds it. PostgreSQL checks each row as it writes
+  it, so its outcome depends on the order it visits them. Two rows given
+  one value are 23505 on both (`test_one_unique_value_given_to_two_rows_is_23505`).
+  The machine adds to no column a unique index holds.
+- **A SUM whose running total leaves `int64_t` fails.** The layer adds in
+  64 bits, a DECIMAL's scaled integer included, and an overflow fails the
+  statement; PostgreSQL's `SUM` of a BIGINT or NUMERIC is an unbounded
+  `numeric`. Below that the sums agree exactly
+  (`test_sum_past_int64_is_an_error`). The machine sums no BIGINT column.
+- **MIN of a REAL or DOUBLE PRECISION column is refused.** PostgreSQL's
+  `MIN` keeps the last of `-0.0` and `0.0` it meets, so its answer depends
+  on the order it reads the rows. The machine takes no `MIN` of a float.
 - **DML takes no literals but an integer after `+` or `-` in `SET`:** other
   values are parameters (`$1`). The machine's
   statements use parameters on both sides.

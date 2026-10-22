@@ -100,8 +100,13 @@ class CheckFailed(Exception):
     pass
 
 
-def cross_check(history: list[dict]) -> list[str]:
+def cross_check(history: list[dict], require_sequence: bool = True) -> list[str]:
     """Checks the history against the commit order the engine reported.
+
+    Every :ok transaction with appends must carry its commit sequence.
+    require_sequence=False is for a history through SQL, whose commit reports
+    none: the commit-order rule then skips those transactions, and every
+    other rule still applies.
 
     Returns a list of violations (empty when the history is clean). Relies on
     the generator's final read of every key after all clients finish, so the
@@ -119,6 +124,7 @@ def cross_check(history: list[dict]) -> list[str]:
     timed_reads: dict[int, list[tuple[int, list[int]]]] = defaultdict(list)
     acked: dict[int, list[tuple[int, int]]] = defaultdict(list)
     invoke_index: dict[int, int] = {}
+    missing_sequence: list[int] = []
 
     for op in history:
         appends = [m for m in op["value"] if m[0] == "append"]
@@ -126,7 +132,9 @@ def cross_check(history: list[dict]) -> list[str]:
             invoked.update(m[2] for m in appends)
             invoke_index[op["process"]] = op["index"]
         elif op["type"] == "ok":
-            seq = op.get("sequence", 0)
+            seq = op.get("sequence")
+            if seq is None and appends and require_sequence:
+                missing_sequence.append(op["index"])
             for pos, m in enumerate(appends):
                 ok_appends[m[1]].append((seq, pos, m[2]))
                 acked[m[1]].append((op["index"], m[2]))
@@ -139,6 +147,9 @@ def cross_check(history: list[dict]) -> list[str]:
             failed.update(m[2] for m in appends)
 
     problems: list[str] = []
+    if missing_sequence:
+        problems.append(f"{len(missing_sequence)} :ok appending transactions carry no commit sequence, "
+                        f"first at index {missing_sequence[0]}")
     for key in sorted(set(reads) | set(ok_appends)):
         final = max(reads[key], key=len, default=[])
         where = {e: i for i, e in enumerate(final)}
@@ -154,13 +165,13 @@ def cross_check(history: list[dict]) -> list[str]:
                 problems.append(f"key {key}: element {e} of a failed txn read")
             elif e not in invoked:
                 problems.append(f"key {key}: element {e} was never appended")
-        committed = sorted(ok_appends[key])
+        committed = sorted(ok_appends[key], key=lambda a: (a[0] or 0, a[1], a[2]))
         missing = [e for _, _, e in committed if e not in where]
         if missing:
             problems.append(
                 f"key {key}: committed appends {missing[:8]} missing from "
                 f"final read ({len(missing)} total)")
-        present = [e for _, _, e in committed if e in where]
+        present = [e for seq, _, e in committed if e in where and seq is not None]
         positions = [where[e] for e in present]
         if positions != sorted(positions):
             problems.append(

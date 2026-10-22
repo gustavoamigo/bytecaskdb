@@ -941,3 +941,25 @@ TEST_CASE("embedded API: values outside their declared type, an omitted NOT NULL
   CHECK_FALSE(ExecError("I/O", BC_E_IO).conflict());
   db->close();
 }
+
+TEST_CASE("embedded API: an UPDATE of rows past the plan arena's size writes them all", "[sql][api]") {
+  // Each new row is built into memory of its own, not the 4 MiB arena a
+  // statement's views share, so a statement may write more rows than fit
+  // there.
+  sql_test::TempDir dir{"api_many_rows"};
+  auto db = Database::open(dir.path());
+  db->execute("CREATE TABLE w (g BIGINT, n BIGINT, v BYTEA, PRIMARY KEY (g, n))");
+  constexpr std::int64_t kRows = 5000;  // ~1 KiB each: over 4 MiB in all
+  auto old = bytes(std::string(1000, 'a'));
+  {
+    auto t = db->begin();
+    for (std::int64_t n = 0; n < kRows; ++n) t.execute("INSERT INTO w VALUES ($1, $2, $3)", {i(1), i(n), old});
+    t.commit();
+  }
+  auto updated = bytes(std::string(1000, 'b'));
+  CHECK(db->execute("UPDATE w SET v = $2 WHERE g = $1", {i(1), updated}).affected == kRows);
+  CHECK(db->execute("SELECT count(*) FROM w WHERE g = $1", {i(1)}).rows == Grid{{i(kRows)}});
+  CHECK(db->execute("SELECT v FROM w WHERE g = $1 AND n = $2", {i(1), i(kRows - 1)}).rows == Grid{{updated}});
+  CHECK(db->execute("DELETE FROM w WHERE g = $1", {i(1)}).affected == kRows);
+  CHECK(db->execute("SELECT count(*) FROM w WHERE g = $1", {i(1)}).rows == Grid{{i(0)}});
+}

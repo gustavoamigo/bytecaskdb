@@ -35,16 +35,19 @@ private:
 };
 
 // A select-list or SET operand: a column, a parameter, an integer
-// literal, a sum or difference of two, or COUNT(*) / COUNT(column).
+// literal, a sum or difference of two, or an aggregate: COUNT(*),
+// COUNT(column), SUM(column) or MIN(column).
 struct Expr {
-  enum class Kind { Column, Param, Const, Add, Sub, Count };
+  enum class Kind { Column, Param, Const, Add, Sub, Aggregate };
+  enum class Fn { Count, Sum, Min };
   Kind kind;
-  std::string column;       // Column; Count's argument, "" for COUNT(*)
+  std::string column;       // Column; Aggregate's argument, "" for COUNT(*)
   std::uint32_t param{0};   // Param: zero-based ($1 is 0)
   std::unique_ptr<Expr> lhs, rhs;  // Add, Sub
   std::int32_t pos{-1};
-  std::string table;          // Column, Count: the table it is qualified by, "" for none
+  std::string table;          // Column, Aggregate: the table it is qualified by, "" for none
   std::int64_t constant{0};   // Const: an integer literal (Add and Sub's right operand only)
+  Fn fn{Fn::Count};           // Aggregate
 };
 
 // One conjunct of a WHERE clause: a column compared with an expression.

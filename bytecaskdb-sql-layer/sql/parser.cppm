@@ -110,18 +110,21 @@ auto expr(const PgQuery__Node* n) -> Expr {
   if (n->node_case == PG_QUERY__NODE__NODE_FUNC_CALL) {
     const auto* f = n->func_call;
     auto name = str(f->funcname[f->n_funcname - 1]);
-    if (name != "count" || (f->n_funcname == 2 && str(f->funcname[0]) != "pg_catalog") || f->n_funcname > 2) {
+    auto known = name == "count" || name == "sum" || name == "min";
+    if (!known || (f->n_funcname == 2 && str(f->funcname[0]) != "pg_catalog") || f->n_funcname > 2) {
       reject("function " + name + " is not supported", f->location);
     }
+    auto refuse = [&] [[noreturn]] {
+      reject("only COUNT(*), COUNT(column), SUM(column) and MIN(column) are supported", f->location);
+    };
     if (f->agg_distinct || f->n_agg_order != 0 || f->agg_filter != nullptr || f->over != nullptr ||
         f->agg_within_group || f->func_variadic) {
-      reject("only COUNT(*) and COUNT(column) are supported", f->location);
+      refuse();
     }
-    Expr e{Expr::Kind::Count, {}, 0, nullptr, nullptr, f->location};
-    if (f->agg_star) return e;
-    if (f->n_args != 1 || f->args[0]->node_case != PG_QUERY__NODE__NODE_COLUMN_REF) {
-      reject("only COUNT(*) and COUNT(column) are supported", f->location);
-    }
+    Expr e{Expr::Kind::Aggregate, {}, 0, nullptr, nullptr, f->location};
+    e.fn = name == "count" ? Expr::Fn::Count : name == "sum" ? Expr::Fn::Sum : Expr::Fn::Min;
+    if (f->agg_star && e.fn == Expr::Fn::Count) return e;
+    if (f->agg_star || f->n_args != 1 || f->args[0]->node_case != PG_QUERY__NODE__NODE_COLUMN_REF) refuse();
     auto arg = expr(f->args[0]);
     e.column = arg.column;
     e.table = arg.table;

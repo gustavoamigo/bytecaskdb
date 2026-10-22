@@ -1,0 +1,1 @@
+DELETE FROM p WHERE a = $1

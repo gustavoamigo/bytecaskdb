@@ -4,11 +4,11 @@
 // ir.cppm — the statement IR (docs/frontend_design.md, *The statement IR*):
 // what the planner decided, in the form the code generator prints. Every
 // id, type and constant name the printer needs is here, so it never reads
-// the catalog. Slices 0 and 1: point lookups, scans of a key prefix or a
+// the catalog. Slices 0 to 4: point lookups, scans of a key prefix or a
 // range in either direction, the two-range scan of a nullable ordered part,
-// LIMIT and COUNT. Later slices add the design's other shapes; a type admits
-// only what its printer prints, so an UPDATE names its row by a point lookup
-// until one may scan.
+// LIMIT, COUNT, SUM and MIN, the join of two point lookups, and UPDATE and
+// DELETE of the rows a point lookup or a scan reaches. Later slices add the
+// design's other shapes; a type admits only what its printer prints.
 
 module;
 #include <algorithm>
@@ -93,20 +93,25 @@ struct PointJoin {
   PointGet rows[2];
 };
 
-// COUNT(*), or COUNT(arg): its non-NULL values. from_keys: bc_count_range
-// over a Scan's range, which counts its entries (COUNT(*), or an arg no
-// matching row holds NULL in).
-struct Count {
+// COUNT(*), or COUNT, SUM or MIN of arg over its non-NULL values, each held
+// as an int64_t. Otherwise a loop over the rows; from_keys on a Scan:
+// - COUNT: bc_count_range over its range, which counts its entries
+//   (COUNT(*), or an arg no matching row holds NULL in);
+// - MIN: its first entry, arg being the ASC part after its prefix, and its
+//   range starting past that part's NULLs.
+struct Aggregate {
+  enum class Fn { Count, Sum, Min };
+  Fn fn{Fn::Count};
   std::optional<Column> arg;
   bool from_keys{false};
 };
 
-// The result: the targets of each row, or one COUNT row. No target is a
+// The result: the targets of each row, or one aggregate row. No target is a
 // row of no columns, as PostgreSQL's `SELECT FROM`.
 struct Select {
   std::variant<PointGet, Scan, NullSplitScan, PointJoin> from;
-  std::vector<Column> targets;  // from the row, or from the entry's key when the scan covers
-  std::optional<Count> count;   // instead of targets
+  std::vector<Column> targets;         // from the row, or from the entry's key when the scan covers
+  std::optional<Aggregate> aggregate;  // instead of targets
   std::optional<std::int64_t> limit;
   bool for_update{false};       // each row returned is guarded unchanged: never a covering scan
 };
@@ -117,13 +122,15 @@ struct Insert {
   std::vector<std::pair<Column, std::uint32_t>> values;
 };
 
+// UPDATE and DELETE write each row the point lookup or the scan reaches,
+// read from the snapshot the statement began on.
 struct Update {
-  PointGet row;
+  std::variant<PointGet, Scan> rows;
   std::vector<std::pair<Column, Expr>> set;
 };
 
 struct Delete {
-  PointGet row;
+  std::variant<PointGet, Scan> rows;
 };
 
 using Statement = std::variant<Select, Insert, Update, Delete>;
@@ -213,7 +220,7 @@ void check(const Plan& p, const Insert& s) {
 }
 
 void check(const Plan& p, const Update& s) {
-  check(p, s.row);
+  std::visit([&](const auto& path) { check(p, path); }, s.rows);
   if (s.set.empty()) broken("an update that sets no column");
   for (const auto& [col, e] : s.set) {
     if (e.kind != Expr::Kind::Column && !e.constant) check_params(p, {e.param});
@@ -225,7 +232,9 @@ void check(const Plan& p, const Update& s) {
   }
 }
 
-void check(const Plan& p, const Delete& s) { check(p, s.row); }
+void check(const Plan& p, const Delete& s) {
+  std::visit([&](const auto& path) { check(p, path); }, s.rows);
+}
 
 }  // namespace
 
