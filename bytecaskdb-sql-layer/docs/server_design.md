@@ -584,13 +584,16 @@ plugin. `--smoke` is the short run of *Tests*.
   - the warnings;
   - `--max-connections`.
 - **HammerDB smoke, nightly.** A scheduled workflow,
-  `.github/workflows/sql-layer-hammerdb-nightly.yml` (a workflow must live
-  there, outside the layer), runs `run-gate.sh --smoke`: one warehouse, two
+  `.github/workflows/sql-layer-hammerdb-nightly.yml`, runs `run-gate.sh --smoke`: one warehouse, two
   users, no ramp-up and a one-minute window, against the server and against
   PostgreSQL 17. It then runs `sql_layer_tprocc check` and the same
   conditions on PostgreSQL. It needs HammerDB's Linux release, cached
-  between runs. It can also be started by hand (`workflow_dispatch`). Per
-  PR, CI runs the wire proof target and `test_wire.py`.
+  between runs. It can also be started by hand (`workflow_dispatch`).
+  The workflow file has to live in `.github/workflows/`, outside the layer.
+  It goes in `ci.yml`'s `paths-ignore` lists, for push and for pull
+  request, next to `sql-layer.yml`, so a change to it does not run the
+  engine pipeline. Per PR, CI runs the wire proof target and
+  `test_wire.py`.
 - **`scripts/check_driver_statements.py`** in CI.
 
 No microbenchmarks: the gate's numbers are HammerDB's.
