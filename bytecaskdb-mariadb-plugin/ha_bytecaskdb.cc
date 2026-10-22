@@ -1549,7 +1549,7 @@ int ha_bytecaskdb::info(uint flag) {
 // snapshot plus its own buffered writes), up to kRangeCountCap keys. The
 // snapshot's count comes from the key directory's leaf sizes, not from
 // walking keys: under the blind-leaf key directory walking reads every key's
-// record, which made these estimates most of a TPC-C run's record reads.
+// record, which made these estimates most of a TPROC-C run's record reads.
 // Above the cap the estimate falls back to a fixed fraction of the table,
 // which is all the optimizer needs to rank a wide range against a narrow
 // one. Never returns 0: the server treats 0 as an exact "empty" answer and

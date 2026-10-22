@@ -936,7 +936,7 @@ merged without a job doing so.
    `memcmp` order equal to typed order, for each type, for composite keys,
    and with nulls.
 3. The TPROC-C schema, created through SQL DDL by the catalog
-   (`tests/tpcc_test.cpp`); a plan's constants are what
+   (`tests/tprocc_test.cpp`); a plan's constants are what
    `Catalog::constants` gives for its tables.
 4. Ten hand-written plans covering each API surface once: primary-key
    select; secondary range with lookup, sort and limit; a sum over a range;
@@ -969,7 +969,7 @@ implementation; `codec/` the key and row codecs; `catalog/` the catalog
 (`docs/catalog_design.md`); `plans/` the hand-written plan files, each with its SQL
 in the header comment; `sql/` the parser transformer and binder; `plan/` the
 planner, code generator and loader; `api/` the embedded API; `tests/` the property tests, fault tests, the harness and the
-TPROC-C schema fixture (`tests/tpcc_schema.cppm`). Files
+TPROC-C schema fixture (`tests/tprocc_schema.cppm`). Files
 marked `// prototype:` are disposable and are replaced in place. The C++ is
 organized as C++23 modules (`bytecask.sql.*`), as the engine is; `bc_plan.h`
 is a header because C reads it, and the only other headers are the ones

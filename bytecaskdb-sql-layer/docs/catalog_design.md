@@ -3,7 +3,7 @@
 Status: design, decided (#489); implemented in
 `bytecaskdb-sql-layer/catalog/`, with the tests in
 `bytecaskdb-sql-layer/tests/catalog_test.cpp` and the TPROC-C schema in
-`tests/tpcc_test.cpp`. This document decides what the catalog records, how
+`tests/tprocc_test.cpp`. This document decides what the catalog records, how
 it is stored under namespace `0x01`, the in-memory form plans resolve
 against and how readers share it, what makes a compiled plan compatible
 with the live catalog, and how each DDL statement of stage 1 writes. It
@@ -316,6 +316,6 @@ plan was compiled is maintained by it. `tests/api_test.cpp`: through SQL,
 `ADD COLUMN` and `CREATE INDEX` keep every cached plan, a drop refuses at
 recompile; unique indexes and ranges on `DESC` parts, nullable and not.
 `tests/tcc_test.cpp`: a unique insert raced by another commit conflicts,
-and its retry raises the duplicate. `tests/tpcc_test.cpp`: the
+and its retry raises the duplicate. `tests/tprocc_test.cpp`: the
 nine TPROC-C tables and their indexes, created by SQL DDL, reopened and
 checked.

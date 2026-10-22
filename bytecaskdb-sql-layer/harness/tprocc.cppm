@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// tpcc.cppm — the TPC-C harness (docs/testing_design.md, *The TPC-C
-// harness*): TPC-C's initial population, TPROC-C's transactions with the
+// tprocc.cppm — the TPROC-C harness (docs/testing_design.md, *The TPROC-C
+// harness*): the benchmark specification's initial population, TPROC-C's transactions with the
 // statements of docs/frontend_design.md, a closed-loop driver and its
-// report, TPC-C's consistency conditions, and a list-append history through
+// report, its consistency conditions, and a list-append history through
 // SQL for Elle. Everything goes through the embedded API. Shared by the
-// sql_layer_tpcc binary and the smoke test in sql_layer_tests.
+// sql_layer_tprocc binary and the smoke test in sql_layer_tests.
 
 module;
 #include <algorithm>
@@ -33,12 +33,12 @@ module;
 #include <variant>
 #include <vector>
 
-export module bytecask.sql.tpcc;
+export module bytecask.sql.tprocc;
 
 import bytecask.sql.api;
-import bytecask.sql.tests.tpcc;
+import bytecask.sql.tests.tprocc;
 
-export namespace bytecask::sql::tpcc {
+export namespace bytecask::sql::tprocc {
 
 // The population's sizes per warehouse and district. The defaults are the
 // specification's (clause 4.3.3); only the smoke test shrinks them.
@@ -58,7 +58,7 @@ struct LoadOptions {
   std::size_t rows_per_txn{2'000};  // statements per loading Transaction
 };
 
-// Creates the schema and harness_run, and loads TPC-C's initial population.
+// Creates the schema and harness_run, and loads the specification's initial population.
 // Throws on any error.
 void load(Database& db, const LoadOptions& opts);
 
@@ -123,7 +123,7 @@ inline constexpr int kMaxAttempts = 10;
 // error ends at once.
 void run(Database& db, const RunOptions& opts, const std::function<void(const PhaseReport&)>& on_phase);
 
-// TPC-C's consistency conditions (clause 3.3.2) for the transactions in the
+// The specification's consistency conditions (clause 3.3.2) for the transactions in the
 // mix: the conditions that do not hold, each described; empty when all do.
 [[nodiscard]] auto consistency(Database& db) -> std::vector<std::string>;
 
@@ -141,9 +141,9 @@ struct ElleOptions {
 };
 [[nodiscard]] auto elle_history(Database& db, const ElleOptions& opts) -> std::string;
 
-}  // namespace bytecask::sql::tpcc
+}  // namespace bytecask::sql::tprocc
 
-namespace bytecask::sql::tpcc {
+namespace bytecask::sql::tprocc {
 
 namespace {
 
@@ -257,7 +257,7 @@ private:
 }  // namespace
 
 void load(Database& db, const LoadOptions& opts) {
-  for (auto ddl : sql_test::kTpccSchema) (void)db.execute(ddl);
+  for (auto ddl : sql_test::kTproccSchema) (void)db.execute(ddl);
   (void)db.execute("CREATE TABLE harness_run (id INTEGER PRIMARY KEY, last_run BIGINT NOT NULL)");
   (void)db.execute("INSERT INTO harness_run (id, last_run) VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{0}});
 
@@ -1010,4 +1010,4 @@ auto elle_history(Database& db, const ElleOptions& opts) -> std::string {
   return out + "]\n";
 }
 
-}  // namespace bytecask::sql::tpcc
+}  // namespace bytecask::sql::tprocc

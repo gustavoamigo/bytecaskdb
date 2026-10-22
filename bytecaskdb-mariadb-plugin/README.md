@@ -242,7 +242,7 @@ are listed in.
 
 ## HammerDB TPROC-C
 
-`run-hammerdb.sh` runs HammerDB's TPROC-C workload (TPC-C derived, stored
+`run-hammerdb.sh` runs HammerDB's TPROC-C workload (stored
 procedures) against ByteCaskDB and InnoDB, using the same `bytecaskdb.cnf` and
 `innodb.cnf` as the sysbench runs. It builds the schema once per engine, keeps
 a copy of the data directory, and restores that copy before every

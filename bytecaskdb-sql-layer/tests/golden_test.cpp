@@ -3,7 +3,7 @@
 //
 // Golden plans (docs/frontend_design.md, *Tests*): each tests/golden/<name>.sql
 // is compiled against the fixture's schema plus tests/golden/schema.sql, each
-// tests/golden/tpcc/<name>.sql against the fixture's plus TPROC-C's, and
+// tests/golden/tprocc/<name>.sql against the fixture's plus TPROC-C's, and
 // its plan text must equal tests/golden/<name>.c byte for byte and compile
 // with TinyCC. A change to the code generator regenerates them with
 // SQL_LAYER_REGEN_GOLDEN=1, and the PR shows the diff.
@@ -24,7 +24,7 @@ import bytecask.sql.codegen;
 import bytecask.sql.parser;
 import bytecask.sql.tcc_loader;
 import bytecask.sql.tests.fixture;
-import bytecask.sql.tests.tpcc;
+import bytecask.sql.tests.tprocc;
 
 using namespace bytecask::sql;
 
@@ -93,6 +93,6 @@ TEST_CASE("golden: every plan the compiler generates equals its golden file", "[
     if (!line.empty()) schema.push_back(line);
   }
   check_dir(dir, schema);
-  // TPROC-C's statements, against its schema (tpcc_schema.cppm).
-  check_dir(dir / "tpcc", {sql_test::kTpccSchema.begin(), sql_test::kTpccSchema.end()});
+  // TPROC-C's statements, against its schema (tprocc_schema.cppm).
+  check_dir(dir / "tprocc", {sql_test::kTproccSchema.begin(), sql_test::kTproccSchema.end()});
 }
