@@ -716,10 +716,11 @@ test.
 5. NOPM from the `d_next_o_id` sum, and TPM from client-side counts.
 6. One SQLSTATE mapping, in the API, shared by the server and the oracle.
 7. The four API additions.
-8. Outside `BEGIN`, the `Execute`s up to `Sync` are one implicit
-   `Transaction`, committed at `Sync`, as in PostgreSQL (coordinator
-   review). A DDL runs alone at `Sync`, or is `0A000` beside other
-   statements.
+8. Outside `BEGIN`, a block of one `Execute` autocommits through
+   `Database::execute`, with its retry. A block of two or more is one
+   implicit `Transaction`, committed at `Sync`, as in PostgreSQL. A DDL
+   runs alone at `Sync`, or is `0A000` beside other statements. The
+   session owns the block status (coordinator review).
 9. The HammerDB smoke runs nightly, as a scheduled workflow, not per PR
    (owner, 2026-10-22).
 10. The gate reports ByteCaskDB's NOPM and TPM only. PostgreSQL 17 runs the
