@@ -2,7 +2,7 @@
 # HammerDB TPROC-C comparison: ByteCaskDB vs InnoDB
 #
 # Spawns an ephemeral local mariadbd per engine, builds the HammerDB TPROC-C
-# schema (TPC-C derived: 9 tables, stored procedures) into it, then runs the
+# schema (9 tables, stored procedures) into it, then runs the
 # timed driver at each virtual-user count and reports NOPM/TPM side by side.
 #
 # Prerequisites:

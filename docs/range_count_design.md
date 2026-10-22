@@ -30,7 +30,7 @@ Ryzen 7 3700X:
 | Query execution in the handler (`index_read_map`, `write_row`, `update_row`, commit) | under 10% combined |
 
 Most record reads are the optimizer counting rows, not queries fetching them.
-Ranges of TPC-C size make this expensive: Delivery looks for the oldest of
+Ranges of TPROC-C's size make this expensive: Delivery looks for the oldest of
 the ~900 `new_order` rows in each district, so each estimate walks up to
 the cap.
 
@@ -109,7 +109,7 @@ buffered writes in the range, which the current walk merges in:
   `[lo, hi)`: a buffered put of a key the snapshot does not hold adds one; a
   buffered delete of a key it does hold subtracts one. Each check is one
   `contains_key` on the snapshot — the overlay holds a transaction's own
-  writes, a handful in TPC-C.
+  writes, a handful in TPROC-C.
 - The adjustment is bounded by the same cap. If the snapshot's count
   already reached it, the range counts as capped and the buffered writes are
   not checked; otherwise the adjustment stops once the running count reaches
@@ -273,5 +273,5 @@ estimated.
   plugin, a ~20,000-row range estimated in proportion rather than as a
   tenth of the table.
 - HammerDB's ranges are all under the limit, so this changes plan quality
-  for workloads with wide ranges, not TPC-C throughput.
+  for workloads with wide ranges, not TPROC-C throughput.
 

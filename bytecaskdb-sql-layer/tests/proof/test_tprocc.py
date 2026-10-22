@@ -11,7 +11,7 @@ docs/frontend_design.md's P1-P11 and O1-O5 goes to the layer in a
 client's logic (the customer by last name, the new balance and c_data)
 between them, as HammerDB's driver keeps it. New-Order's N1-N9 run
 the same way, one order in twenty naming an item that does not exist
-(TPC-C's one in a hundred would rarely come up in this short run), which
+(the specification's one in a hundred would rarely come up in this short run), which
 the client rolls back on both sides. Delivery's D1-D7 deliver the oldest
 undelivered order of each district: the load leaves the orders without a
 carrier undelivered, in new_order. Every statement's result must agree,
@@ -37,14 +37,14 @@ import oracle as o
 from conftest import Oracle
 
 EPOCH = datetime.datetime(1970, 1, 1)
-SCHEMA_SOURCE = pathlib.Path(__file__).resolve().parents[1] / "tpcc_schema.cppm"
+SCHEMA_SOURCE = pathlib.Path(__file__).resolve().parents[1] / "tprocc_schema.cppm"
 
 
 def schema() -> list[str]:
-    """The fixture's DDL, read from tests/tpcc_schema.cppm, the one
-    definition of it: each element of kTpccSchema, its adjacent string
+    """The fixture's DDL, read from tests/tprocc_schema.cppm, the one
+    definition of it: each element of kTproccSchema, its adjacent string
     literals joined."""
-    body = SCHEMA_SOURCE.read_text().split("kTpccSchema{", 1)[1].split("};", 1)[0]
+    body = SCHEMA_SOURCE.read_text().split("kTproccSchema{", 1)[1].split("};", 1)[0]
     out, current = [], ""
     for literal, comma in re.findall(r'"((?:[^"\\]|\\.)*)"|(,)\s*\n', body):
         if comma:
@@ -88,7 +88,7 @@ class Pair:
 
     def __init__(self, dsn: str):
         self.pg = Oracle(dsn)
-        self.dir = tempfile.mkdtemp(prefix="bytecask_tpcc_")
+        self.dir = tempfile.mkdtemp(prefix="bytecask_tprocc_")
         self.db = bytecask_sql.open(self.dir)
         self.txn = None
         self.statements = 0
@@ -221,7 +221,7 @@ COUNT_BY_NAME = "SELECT count(c_id) FROM customer WHERE c_last = $1 AND c_d_id =
 
 def customer_by_name(p: Pair, sql: str, params: tuple, kinds: tuple, first: int, c_last: str, d: int) -> tuple | None:
     """The customer a last name selects: the middle of those it names, by
-    c_first (ceil(n / 2), 1-based), as TPC-C's profile has it. Customers
+    c_first (ceil(n / 2), 1-based), as the specification's profile has it. Customers
     with one c_first tie: the layer's row is the one taken, and PostgreSQL's
     run of ties must hold the same rows. `first`: c_first's position in the
     rows."""
@@ -382,7 +382,7 @@ def test_payment_order_status_new_order_and_delivery_agree_with_postgresql(dsn):
         load(p, rng)
         for h_id in range(100):
             pick = rng.random()
-            if h_id % 10 == 9:  # TPC-C's 4% would leave this run one or two
+            if h_id % 10 == 9:  # the specification's 4% would leave this run one or two
                 delivery(p, rng)
             elif pick < 0.45:
                 new_order(p, rng)
