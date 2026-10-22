@@ -25,6 +25,7 @@ set db "tprocc" ;# The database name the server serves
 set warehouses 1 ;# Warehouses loaded
 set run 1 ;# The harness_run the run script took for this cell: the h_ids' top bits
 set mix {neword payment ostat delivery} ;# Transaction types to run; slev once front-end slice 5 lands
+set engine "ByteCaskDB" ;# The name HammerDB's result line gives the system
 #OPTIONS
 
 #LOAD LIBRARIES AND MODULES
@@ -291,7 +292,7 @@ proc transactions_so_far {} {
 
 # HammerDB's timed monitor, with NOPM from d_next_o_id and TPM from the
 # users' own counts.
-proc monitor { host port user db rampup duration warehouses totalvirtualusers } {
+proc monitor { host port user db rampup duration warehouses totalvirtualusers engine } {
         set conn [ connect $host $port $user $db ]
         puts "Beginning rampup time of $rampup minutes"
         set ramptime 0
@@ -321,7 +322,7 @@ proc monitor { host port user db rampup duration warehouses totalvirtualusers } 
         set tpm [ expr { ($end_trans - $start_trans) / $durmin } ]
         set nopm [ expr { ($end_nopm - $start_nopm) / $durmin } ]
         puts "[ expr { $totalvirtualusers - 1 } ] Active Virtual Users configured"
-        puts [ testresult $nopm $tpm ByteCaskDB ]
+        puts [ testresult $nopm $tpm $engine ]
         set errors {}
         if { "errors" in [ tsv::names ] } {
             foreach state [ lsort [ tsv::array names errors ] ] { lappend errors "$state=[ tsv::get errors $state ]" }
@@ -333,7 +334,7 @@ proc monitor { host port user db rampup duration warehouses totalvirtualusers } 
 
 set rema [ lassign [ findvuposition ] myposition totalvirtualusers ]
 switch $myposition {
-    1 { monitor $host $port $user $db $rampup $duration $warehouses $totalvirtualusers }
+    1 { monitor $host $port $user $db $rampup $duration $warehouses $totalvirtualusers $engine }
     default {
         set conn [ connect $host $port $user $db ]
         # A home warehouse fixed by position (docs/server_design.md): HammerDB's

@@ -4,9 +4,16 @@
 // sql_layer_tprocc — the TPROC-C harness (docs/testing_design.md, *The TPROC-C
 // harness*).
 //
-//   sql_layer_tprocc load --dir D [--warehouses W] [--seed N]
+//   sql_layer_tprocc load --dir D [--warehouses W] [--seed N] [--sql-out FILE]
 //   sql_layer_tprocc run  --dir D [--threads 1,16,48] [--warmup S] [--duration S] [--seed N] [--json FILE]
 //   sql_layer_tprocc elle --dir D --config guarded|unguarded|blind [--threads N] [--txns N] [--seed N] --out FILE
+//   sql_layer_tprocc check --dir D
+//   sql_layer_tprocc next-run --dir D
+//
+// load --sql-out also writes what it loaded as a psql script, for the same
+// population on PostgreSQL. check runs the consistency conditions alone, on
+// what a run left (hammerdb/run-gate.sh, after the server stops). next-run
+// bumps harness_run and prints the run, for the HammerDB driver's h_ids.
 //
 // run checks the benchmark specification's consistency conditions after its last phase. Any error
 // but a retried 40001, and any failed condition, exits non-zero.
@@ -80,7 +87,7 @@ auto list(const std::string& s) -> std::vector<std::size_t> {
 
 auto run_main(int argc, char** argv) -> int {
   if (argc < 2) {
-    std::fputs("usage: sql_layer_tprocc load|run|elle --dir D [...]\n", stderr);
+    std::fputs("usage: sql_layer_tprocc load|run|elle|check|next-run --dir D [...]\n", stderr);
     return 2;
   }
   const std::string_view cmd{argv[1]};
@@ -90,12 +97,15 @@ auto run_main(int argc, char** argv) -> int {
     if (std::filesystem::exists(dir) && !std::filesystem::is_empty(dir)) {
       throw std::invalid_argument(dir.string() + " is not empty: load needs a new database");
     }
+    std::optional<std::ofstream> sql;
+    if (f.contains("sql-out")) sql = output(f.at("sql-out"), std::ios::trunc);
     auto db = bytecask::sql::Database::open(dir);
     const auto start = std::chrono::steady_clock::now();
     tprocc::load(*db, {.warehouses = number<std::int64_t>(f, "warehouses", "1"),
                      .scale = {},
                      .seed = number<std::uint64_t>(f, "seed", "1"),
                      .rows_per_txn = 2'000});
+    if (sql) tprocc::dump_sql(*db, *sql);
     db->close();
     std::printf("loaded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
     return 0;
@@ -124,6 +134,22 @@ auto run_main(int argc, char** argv) -> int {
     for (const auto& b : bad) std::fprintf(stderr, "consistency: %s\n", b.c_str());
     if (!bad.empty()) return 1;
     std::puts("consistency conditions hold");
+    return 0;
+  }
+  if (cmd == "check") {
+    auto db = bytecask::sql::Database::open(dir);
+    auto bad = tprocc::consistency(*db);
+    db->close();
+    for (const auto& b : bad) std::fprintf(stderr, "consistency: %s\n", b.c_str());
+    if (!bad.empty()) return 1;
+    std::puts("consistency conditions hold");
+    return 0;
+  }
+  if (cmd == "next-run") {
+    auto db = bytecask::sql::Database::open(dir);
+    auto run = tprocc::next_run(*db);
+    db->close();
+    std::printf("%llu\n", static_cast<unsigned long long>(run));
     return 0;
   }
   if (cmd == "elle") {

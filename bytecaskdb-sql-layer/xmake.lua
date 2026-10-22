@@ -113,7 +113,7 @@ target("sql_layer_tests")
     -- The tests, and the fixtures they share as modules (bytecask.sql.tests.*).
     add_files("tests/*.cpp", "tests/*.cppm")
     -- The TPROC-C harness's module, for its smoke test.
-    add_files("harness/tprocc.cppm")
+    add_files("harness/tprocc.cppm", "server/pg_text.cppm")
     -- The engine's counted allocation-failure seam (tests/alloc_faults.h):
     -- it replaces the global operator new in this binary.
     add_files("../tests/alloc_faults.cpp", {defines = "BYTECASK_TESTING"})
@@ -149,7 +149,8 @@ target("sql_layer_tprocc")
     set_default(false)
     add_deps("sql_layer_testing")
     add_rules("bytecask.native_flags")
-    add_files("harness/*.cpp", "harness/*.cppm", "tests/tprocc_schema.cppm")
+    -- pg_text: load --sql-out writes values in PostgreSQL's text format.
+    add_files("harness/*.cpp", "harness/*.cppm", "tests/tprocc_schema.cppm", "server/pg_text.cppm")
 
 -- The PostgreSQL wire-protocol server (docs/server_design.md): the layer for
 -- HammerDB and any libpq client. Not built by default. Linked against the

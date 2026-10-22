@@ -23,7 +23,9 @@ module;
 #include <map>
 #include <mutex>
 #include <optional>
+#include <ostream>
 #include <random>
+#include <regex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -36,6 +38,7 @@ module;
 export module bytecask.sql.tprocc;
 
 import bytecask.sql.api;
+import bytecask.sql.pg_text;
 import bytecask.sql.tests.tprocc;
 
 export namespace bytecask::sql::tprocc {
@@ -122,6 +125,17 @@ inline constexpr int kMaxAttempts = 10;
 // SerializationFailure, which is retried and counted; the phase with the
 // error ends at once.
 void run(Database& db, const RunOptions& opts, const std::function<void(const PhaseReport&)>& on_phase);
+
+// Bumps harness_run and returns the run it gives: the top bits of every
+// h_id the run writes. A bump that conflicts is retried, up to
+// kMaxAttempts times. Throws if the load has not run or the runs are spent.
+[[nodiscard]] auto next_run(Database& db) -> std::uint64_t;
+
+// The loaded tables as a psql script for PostgreSQL: the schema's DDL, its
+// VARCHARs compared as bytes (COLLATE "C") as the layer compares them, then
+// one COPY per table of every row, in PostgreSQL's text format. The same
+// rows the layer holds, so the driver runs on both against one population.
+void dump_sql(Database& db, std::ostream& out);
 
 // The specification's consistency conditions (clause 3.3.2) for the transactions in the
 // mix: the conditions that do not hold, each described; empty when all do.
@@ -534,25 +548,6 @@ void order_status(const Statements& s, Transaction& t, const OrderStatusInput& i
   (void)t.commit();
 }
 
-// Bumps harness_run for a new run and returns it (docs/frontend_design.md).
-auto next_run(Database& db) -> std::uint64_t {
-  const auto& bump = db.prepare("UPDATE harness_run SET last_run = last_run + $1 WHERE id = $2");
-  const auto& read = db.prepare("SELECT last_run FROM harness_run WHERE id = $1");
-  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-    try {
-      auto t = db.begin();
-      if (t.execute(bump, {std::int64_t{1}, std::int64_t{1}}).affected != 1) {
-        throw std::runtime_error("harness_run has no row: load the database first");
-      }
-      auto run = static_cast<std::uint64_t>(i64(t.execute(read, {std::int64_t{1}}).rows.at(0).at(0)));
-      if (t.commit() != CommitOutcome::Committed) continue;
-      if (run > kMaxRun) throw std::runtime_error("harness_run is past its last run");
-      return run;
-    } catch (const SerializationFailure&) {
-    }
-  }
-  throw std::runtime_error("harness_run: every attempt to bump it conflicted");
-}
 
 struct Worker {
   const Statements& s;
@@ -652,6 +647,25 @@ auto engine_counter(Database& db, const char* name) -> std::int64_t {
 }
 
 }  // namespace
+
+auto next_run(Database& db) -> std::uint64_t {
+  const auto& bump = db.prepare("UPDATE harness_run SET last_run = last_run + $1 WHERE id = $2");
+  const auto& read = db.prepare("SELECT last_run FROM harness_run WHERE id = $1");
+  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+    try {
+      auto t = db.begin();
+      if (t.execute(bump, {std::int64_t{1}, std::int64_t{1}}).affected != 1) {
+        throw std::runtime_error("harness_run has no row: load the database first");
+      }
+      auto run = static_cast<std::uint64_t>(i64(t.execute(read, {std::int64_t{1}}).rows.at(0).at(0)));
+      if (t.commit() != CommitOutcome::Committed) continue;
+      if (run > kMaxRun) throw std::runtime_error("harness_run is past its last run");
+      return run;
+    } catch (const SerializationFailure&) {
+    }
+  }
+  throw std::runtime_error("harness_run: every attempt to bump it conflicted");
+}
 
 void run(Database& db, const RunOptions& opts, const std::function<void(const PhaseReport&)>& on_phase) {
   for (auto threads : opts.threads) {
@@ -1008,6 +1022,60 @@ auto elle_history(Database& db, const ElleOptions& opts) -> std::string {
                        i + 1 == all.size() ? "\n" : ",\n");
   }
   return out + "]\n";
+}
+
+void dump_sql(Database& db, std::ostream& out) {
+  // COPY's text format: a backslash, a tab and a newline escaped, NULL as \N.
+  auto field = [](std::string_view v, std::string& line) {
+    for (auto c : v) {
+      if (c == '\\') {
+        line += "\\\\";
+      } else if (c == '\t') {
+        line += "\\t";
+      } else if (c == '\n') {
+        line += "\\n";
+      } else {
+        line.push_back(c);
+      }
+    }
+  };
+  std::vector<std::string> tables;
+  out << "BEGIN;\n";
+  auto ddl = [&](std::string_view statement) {
+    const std::regex varchar{R"((VARCHAR\(\d+\)))"};
+    out << std::regex_replace(std::string{statement}, varchar, "$1 COLLATE \"C\"") << ";\n";
+  };
+  for (auto statement : sql_test::kTproccSchema) {
+    ddl(statement);
+    if (statement.starts_with("CREATE TABLE ")) {
+      auto name = statement.substr(13);
+      tables.emplace_back(name.substr(0, name.find(' ')));
+    }
+  }
+  ddl("CREATE TABLE harness_run (id INTEGER PRIMARY KEY, last_run BIGINT NOT NULL)");
+  tables.emplace_back("harness_run");
+  for (const auto& t : tables) {
+    auto rows = db.table_rows(t);
+    out << "COPY " << t << " (";
+    for (std::size_t i = 0; i < rows.columns.size(); ++i) out << (i ? ", " : "") << rows.columns[i];
+    out << ") FROM STDIN;\n";
+    std::string line;
+    for (const auto& row : rows.rows) {
+      line.clear();
+      for (std::size_t i = 0; i < row.size(); ++i) {
+        if (i) line.push_back('\t');
+        if (std::holds_alternative<std::monostate>(row[i])) {
+          line += "\\N";
+        } else {
+          field(pg::to_text(row[i], rows.types.at(i)), line);
+        }
+      }
+      out << line << "\n";
+    }
+    out << "\\.\n";
+  }
+  out << "COMMIT;\n";
+  if (!out) throw std::runtime_error("cannot write the SQL dump");
 }
 
 }  // namespace bytecask::sql::tprocc
