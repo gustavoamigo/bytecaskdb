@@ -167,7 +167,9 @@ result() {  # log -> "NOPM TPM" or nothing
 CSV="$LAYER/benchmarks/hammerdb_results.csv"
 mkdir -p "$(dirname "$CSV")"
 [[ -f "$CSV" ]] || echo "date,commit,warehouses,users,rampup_min,duration_min,nopm,tpm,errors,check" >"$CSV"
-COMMIT="$(git -C "$ROOT" rev-parse --short HEAD)"
+# A checkout without .git (CI's, when git was not installed first) has
+# GITHUB_SHA instead.
+COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo "${GITHUB_SHA:0:7}")"
 FAILED=0
 
 for vu in "${VU_LIST[@]}"; do
