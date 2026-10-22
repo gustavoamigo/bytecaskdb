@@ -35,6 +35,7 @@ module;
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <span>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -105,13 +106,20 @@ private:
 // taken or missing, a column or key part that does not exist or repeats, a
 // default not of its column's type. The refusals PostgreSQL makes of the
 // statement itself; the engine's own refusals stay std::invalid_argument and
-// std::length_error.
+// std::length_error. Each carries the SQLSTATE PostgreSQL gives the same
+// refusal; the API's sqlstate() reports it.
 class DdlRefused : public std::invalid_argument {
 public:
-  using std::invalid_argument::invalid_argument;
+  // `sqlstate` is a literal: five characters, kept for the exception's life.
+  explicit DdlRefused(const std::string& what, const char* sqlstate = "42601")
+      : std::invalid_argument{what}, sqlstate_{sqlstate} {}
   DdlRefused(const DdlRefused&) = default;
   DdlRefused& operator=(const DdlRefused&) = default;
   ~DdlRefused() override;  // out of line: anchors the vtable (-Wweak-vtables)
+  [[nodiscard]] auto sqlstate() const noexcept -> std::string_view { return sqlstate_; }
+
+private:
+  const char* sqlstate_;
 };
 
 // A DDL that found another DDL of the same catalog in progress, and so did
@@ -211,6 +219,17 @@ struct ComparedType {
 [[nodiscard]] auto out_of_range(SqlType t, BytesView v) -> std::optional<std::string>;
 [[nodiscard]] inline auto out_of_range(SqlType, bool) -> std::optional<std::string> { return std::nullopt; }
 [[nodiscard]] auto out_of_range(SqlType t, const Datum& d) -> std::optional<std::string>;
+// The SQLSTATE PostgreSQL reports for an out_of_range message, found by how
+// it starts (a message may go on: "… for parameter $2"): 22003, 22001,
+// 22021 or 22008. Empty for a message out_of_range never writes.
+[[nodiscard]] auto range_sqlstate(std::string_view message) noexcept -> std::string_view;
+// Every message start range_sqlstate knows, with its SQLSTATE: a test makes
+// out_of_range write each one.
+struct RangeMessage {
+  std::string_view start;
+  std::string_view sqlstate;
+};
+[[nodiscard]] auto range_messages() noexcept -> std::span<const RangeMessage>;
 // Sets one column of a row writer to a datum (NULL sets it null). False for
 // a type mismatch.
 [[nodiscard]] auto set_datum(RowWriter& w, std::uint32_t col_id, const Datum& d) -> bool;
@@ -733,7 +752,7 @@ auto reserve_ids(std::uint64_t& next_id, std::uint32_t n) -> std::uint32_t {
 void check_column_spec(const ColumnSpec& c) {
   if (!sql_type_valid(c.sql)) throw DdlRefused("column " + c.name + " has an invalid type");
   if (!datum_fits(c.default_value, phys_type(c.sql))) {
-    throw DdlRefused("default of column " + c.name + " is not of its type");
+    throw DdlRefused("default of column " + c.name + " is not of its type", "42804");
   }
 }
 
@@ -966,6 +985,32 @@ auto out_of_range(SqlType t, BytesView v) -> std::optional<std::string> {
   }
   return std::nullopt;
 }
+
+namespace {
+
+constexpr RangeMessage kRangeMessages[] = {
+    {"smallint out of range", "22003"},
+    {"integer out of range", "22003"},
+    {"value out of range: overflow", "22003"},   // REAL
+    {"value out of range: underflow", "22003"},  // REAL
+    {"numeric field overflow", "22003"},         // DECIMAL(p, s)
+    {"value too long for type character varying", "22001"},
+    {"invalid byte sequence for encoding", "22021"},  // TEXT, VARCHAR
+    {"date out of range", "22008"},
+    {"timestamp out of range", "22008"},
+    {"time out of range", "22008"},
+};
+
+}  // namespace
+
+auto range_sqlstate(std::string_view message) noexcept -> std::string_view {
+  for (const auto& m : kRangeMessages) {
+    if (message.starts_with(m.start)) return m.sqlstate;
+  }
+  return {};
+}
+
+auto range_messages() noexcept -> std::span<const RangeMessage> { return kRangeMessages; }
 
 auto out_of_range(SqlType t, const Datum& d) -> std::optional<std::string> {
   return std::visit(
@@ -1365,11 +1410,11 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     return std::shared_ptr<const Catalog>{std::move(next)};
   };
   auto name_free = [&](const std::string& name) {
-    if (names_.contains(name)) throw DdlRefused("relation \"" + name + "\" already exists");
+    if (names_.contains(name)) throw DdlRefused("relation \"" + name + "\" already exists", "42P07");
   };
   auto find_table = [&](const std::string& name) -> const Table& {
     const auto* t = table(name);
-    if (t == nullptr) throw DdlRefused("relation \"" + std::string{name} + "\" does not exist");
+    if (t == nullptr) throw DdlRefused("relation \"" + std::string{name} + "\" does not exist", "42P01");
     return *t;
   };
   backfill = false;
@@ -1377,14 +1422,14 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   if (const auto* ct = std::get_if<CreateTableDdl>(&ddl)) {
     auto name = std::string{ct->name};
     name_free(name);
-    if (ct->columns.empty() || ct->pk.empty()) throw DdlRefused("a table needs columns and a primary key");
+    if (ct->columns.empty() || ct->pk.empty()) throw DdlRefused("a table needs columns and a primary key", "0A000");
     Table t;
     t.name = name;
     std::vector<ColumnDef> defs;
     for (const auto& spec : ct->columns) {
       check_column_spec(spec);
       auto cname = std::string{spec.name};
-      if (t.column(cname) != nullptr) throw DdlRefused("column \"" + cname + "\" specified more than once");
+      if (t.column(cname) != nullptr) throw DdlRefused("column \"" + cname + "\" specified more than once", "42701");
       auto in_pk = std::ranges::any_of(ct->pk, [&](const std::string& p) { return std::string{p} == cname; });
       Column c{t.next_col_id++, cname, spec.sql, phys_type(spec.sql), spec.nullable && !in_pk, spec.default_value};
       defs.emplace_back(c.id, c.sql, c.nullable);
@@ -1392,9 +1437,9 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     }
     for (const auto& p : ct->pk) {
       const auto* c = t.column(p);
-      if (c == nullptr) throw DdlRefused("primary key column \"" + std::string{p} + "\" does not exist");
+      if (c == nullptr) throw DdlRefused("primary key column \"" + std::string{p} + "\" does not exist", "42703");
       if (std::ranges::find(t.pk_col_ids, c->id) != t.pk_col_ids.end()) {
-        throw DdlRefused("column \"" + c->name + "\" appears twice in the primary key");
+        throw DdlRefused("column \"" + c->name + "\" appears twice in the primary key", "42701");
       }
       t.pk_col_ids.push_back(c->id);
     }
@@ -1418,9 +1463,9 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     ix.unique = ci->unique;
     for (const auto& c : ci->columns) {
       const auto* col = t.column(c.name);
-      if (col == nullptr) throw DdlRefused("column \"" + std::string{c.name} + "\" does not exist");
+      if (col == nullptr) throw DdlRefused("column \"" + std::string{c.name} + "\" does not exist", "42703");
       if (std::ranges::find(ix.parts, col->id, &IndexPart::col_id) != ix.parts.end()) {
-        throw DdlRefused("column \"" + col->name + "\" appears twice in the index");
+        throw DdlRefused("column \"" + col->name + "\" appears twice in the index", "42701");
       }
       ix.parts.push_back({col->id, c.desc});
     }
@@ -1458,9 +1503,9 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   if (const auto* dt = std::get_if<DropTableDdl>(&ddl)) {
     const auto* found = table(dt->name);
     if (found == nullptr) {
-      if (index(dt->name).first != nullptr) throw DdlRefused("\"" + std::string{dt->name} + "\" is an index");
+      if (index(dt->name).first != nullptr) throw DdlRefused("\"" + std::string{dt->name} + "\" is an index", "42809");
       if (dt->if_exists) return nullptr;
-      throw DdlRefused("table \"" + std::string{dt->name} + "\" does not exist");
+      throw DdlRefused("table \"" + std::string{dt->name} + "\" does not exist", "42P01");
     }
     const auto& t = *found;
     put_op(ops, DdlOp::Kind::Del, table_record_key(t.id));
@@ -1479,9 +1524,9 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   if (const auto* di = std::get_if<DropIndexDdl>(&ddl)) {
     auto [owner, found] = index(di->name);
     if (found == nullptr) {
-      if (table(di->name) != nullptr) throw DdlRefused("\"" + std::string{di->name} + "\" is not an index");
+      if (table(di->name) != nullptr) throw DdlRefused("\"" + std::string{di->name} + "\" is not an index", "42809");
       if (di->if_exists) return nullptr;
-      throw DdlRefused("index \"" + std::string{di->name} + "\" does not exist");
+      throw DdlRefused("index \"" + std::string{di->name} + "\" does not exist", "42704");
     }
     auto t = *owner;
     auto id = found->id;
@@ -1500,11 +1545,11 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
   check_column_spec(ac.column);
   auto cname = std::string{ac.column.name};
   if (t.column(cname) != nullptr) {
-    throw DdlRefused("column \"" + cname + "\" of relation \"" + t.name + "\" already exists");
+    throw DdlRefused("column \"" + cname + "\" of relation \"" + t.name + "\" already exists", "42701");
   }
   auto has_default = !std::holds_alternative<std::monostate>(ac.column.default_value);
   if (!ac.column.nullable && !has_default) {
-    throw DdlRefused("column \"" + cname + "\" is NOT NULL and has no default for the existing rows");
+    throw DdlRefused("column \"" + cname + "\" is NOT NULL and has no default for the existing rows", "23502");
   }
   Column c{t.next_col_id, cname, ac.column.sql, phys_type(ac.column.sql), ac.column.nullable, ac.column.default_value};
   auto old_layout = t.layout;

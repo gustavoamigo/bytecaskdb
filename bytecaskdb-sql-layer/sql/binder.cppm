@@ -114,6 +114,15 @@ struct Join {
 // defaults folded.
 using Statement = std::variant<Ddl, Insert, Select, Join, Update, Delete>;
 
+// A parameter as a client sees it: the declared type of the column of its
+// first use, and whether every use assigns it (INSERT's VALUES, UPDATE's SET
+// col = $n), so a value finer than a DECIMAL's scale may be rounded as
+// PostgreSQL rounds on assignment. A compared or added parameter is not.
+struct ParamInfo {
+  SqlType type;
+  bool assigned_only{true};
+};
+
 struct Bound {
   Statement stmt;
   std::vector<PhysType> param_types;  // $1 is [0]
@@ -129,6 +138,7 @@ struct Bound {
   // For each parameter param_sql checks, the table of the column it is
   // checked as: the object a BC_C_RANGE refusal names.
   std::vector<std::uint32_t> param_table;
+  std::vector<ParamInfo> params;  // $1 is [0]
 };
 
 // Throws ast::SqlError with a message and the position of the offending node.
@@ -408,6 +418,7 @@ public:
       p.first_use = use;
     }
     if (use == Use::Assigned) return;
+    p.assigned_only = false;
     if (use != Use::Compared && col.sql.kind == SqlKind::Decimal) {
       narrow(p, SqlType{SqlKind::Decimal, 0, static_cast<std::uint8_t>(kMaxDecimalPrecision), col.sql.scale}, table);
     } else {
@@ -595,6 +606,13 @@ public:
     return out;
   }
 
+  // Every parameter has a first use once param_types() has passed.
+  auto param_info() const -> std::vector<ParamInfo> {
+    std::vector<ParamInfo> out;
+    for (const auto& p : params_) out.push_back({p.first->sql, p.assigned_only});
+    return out;
+  }
+
   auto param_table() const -> std::vector<std::uint32_t> {
     std::vector<std::uint32_t> out;
     for (const auto& p : params_) out.push_back(p.table);
@@ -609,6 +627,7 @@ private:
     Use first_use{Use::Assigned};
     std::optional<SqlType> range;  // what the pre-plan range check checks: none if only an INSERT assigns it
     std::uint32_t table{0};        // the table of the column `range` comes from
+    bool assigned_only{true};      // every use an assignment
   };
 
   // Whether every value inside range a is inside range b, two ranges of one
@@ -752,7 +771,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
       },
       stmt);
   auto types = b.param_types(bound_stmt.second);
-  return Bound{std::move(bound_stmt.first), std::move(types), b.param_sql(), b.param_table()};
+  return Bound{std::move(bound_stmt.first), std::move(types), b.param_sql(), b.param_table(), b.param_info()};
 }
 
 }  // namespace bytecask::sql::bound

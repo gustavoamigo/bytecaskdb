@@ -963,3 +963,79 @@ TEST_CASE("embedded API: an UPDATE of rows past the plan arena's size writes the
   CHECK(db->execute("DELETE FROM w WHERE g = $1", {i(1)}).affected == kRows);
   CHECK(db->execute("SELECT count(*) FROM w WHERE g = $1", {i(1)}).rows == Grid{{i(0)}});
 }
+
+TEST_CASE("embedded API: a statement describes its parameters, result and command before it runs",
+          "[sql][api][server]") {
+  sql_test::TempDir dir{"api_describe"};
+  auto db = Database::open(dir.path());
+  CHECK(db->prepare("CREATE TABLE a (k INTEGER PRIMARY KEY, amt NUMERIC(6, 2), note VARCHAR(8))").command() ==
+        Command::CreateTable);
+  (void)db->execute("CREATE TABLE a (k INTEGER PRIMARY KEY, amt NUMERIC(6, 2), note VARCHAR(8))");
+  const SqlType integer{SqlKind::Integer};
+  const SqlType amount{SqlKind::Decimal, 0, 6, 2};
+  const SqlType note{SqlKind::Varchar, 8};
+
+  const auto& insert = db->prepare("INSERT INTO a VALUES ($1, $2, $3)");
+  CHECK(insert.command() == Command::Insert);
+  REQUIRE(insert.params().size() == 3);
+  CHECK(insert.params()[1].type == amount);
+  CHECK(insert.params()[1].assigned_only);
+  CHECK(insert.columns().empty());
+
+  // Compared or added: not assigned only. SET col = $n assigns.
+  const auto& add = db->prepare("UPDATE a SET amt = amt + $1 WHERE k = $2");
+  CHECK(add.command() == Command::Update);
+  REQUIRE(add.params().size() == 2);
+  CHECK(!add.params()[0].assigned_only);
+  CHECK(add.params()[1].type == integer);
+  CHECK(!add.params()[1].assigned_only);
+  const auto& set = db->prepare("UPDATE a SET note = $1 WHERE k = $2");
+  CHECK(set.params()[0].type == note);
+  CHECK(set.params()[0].assigned_only);
+
+  const auto& select = db->prepare("SELECT amt, note FROM a WHERE k = $1");
+  CHECK(select.command() == Command::Select);
+  REQUIRE(select.columns().size() == 2);
+  CHECK(select.columns()[0].name == "amt");
+  CHECK(select.columns()[0].type == amount);
+  CHECK(select.columns()[1].type == note);
+  const auto& count = db->prepare("SELECT count(*) FROM a WHERE k = $1");
+  REQUIRE(count.columns().size() == 1);
+  CHECK(count.columns()[0].type == SqlType{SqlKind::BigInt});
+
+  CHECK(db->prepare("DELETE FROM a WHERE k = $1").command() == Command::Delete);
+  CHECK(db->prepare("CREATE INDEX a_note ON a (note)").command() == Command::CreateIndex);
+  CHECK(db->prepare("DROP TABLE a").command() == Command::DropTable);
+}
+
+TEST_CASE("embedded API: sqlstate reports PostgreSQL's SQLSTATE for each error", "[sql][api][server]") {
+  sql_test::TempDir dir{"api_sqlstate"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE s (k BIGINT PRIMARY KEY, n SMALLINT NOT NULL)");
+  (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(1), i(1)});
+  auto state = [&](auto&& run) -> std::string {
+    try {
+      run();
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  CHECK(state([&] { (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(1), i(2)}); }) == "23505");
+  CHECK(state([&] { (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(2), kNull}); }) == "23502");
+  CHECK(state([&] { (void)db->execute("INSERT INTO s VALUES ($1, $2)", {i(3), i(1 << 16)}); }) == "22003");
+  CHECK(state([&] { (void)db->execute("SELEC 1"); }) == "42601");
+  CHECK(state([&] { (void)db->execute("CREATE TABLE s (k BIGINT PRIMARY KEY)"); }) == "42P07");
+  CHECK(state([&] { (void)db->execute("DROP TABLE nope"); }) == "42P01");
+  CHECK(state([&] { (void)db->execute("SELECT n FROM s WHERE k = $1", {}); }) == "08P01");
+  auto txn = db->begin();
+  CHECK(state([&] { (void)txn.execute("CREATE TABLE u (k BIGINT PRIMARY KEY)"); }) == "0A000");
+  CHECK(state([&] { (void)txn.execute("SELECT n FROM s WHERE k = $1", {i(1)}); }) == "25P02");
+  CHECK(sqlstate(SerializationFailure{"x"}) == "40001");
+  CHECK(sqlstate(ExecError::conflicted("x")) == "40001");
+  CHECK(sqlstate(TransactionResolutionUnknown{}) == "08007");
+  CHECK(sqlstate(ExecError{"x", BC_E_LIMIT}) == "54000");
+  CHECK(sqlstate(ExecError{"x", BC_E_IO}) == "58030");
+  CHECK(sqlstate(bytecask::DbClosed{}) == "57P01");
+  CHECK(sqlstate(std::runtime_error{"x"}) == "XX000");
+}

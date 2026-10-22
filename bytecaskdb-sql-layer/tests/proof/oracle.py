@@ -26,23 +26,11 @@ SQLSTATE = {
 }
 
 # A value outside its declared type is one kind, "range", in the layer; its
-# message, PostgreSQL's words, says which. The one mapping from those
-# messages, by how they start, to PostgreSQL's SQLSTATE.
-# test_every_range_message_maps_to_its_sqlstate produces every one, so a
-# reworded message fails there, not as a silent mismatch.
-RANGE_SQLSTATE = {
-    "smallint out of range": "22003",
-    "integer out of range": "22003",
-    "value out of range: overflow": "22003",  # REAL
-    "value out of range: underflow": "22003",  # REAL
-    "numeric field overflow": "22003",  # DECIMAL(p, s)
-    "value too long for type character varying": "22001",
-    "invalid byte sequence for encoding": "22021",  # TEXT, VARCHAR
-    "date out of range": "22008",
-    "timestamp out of range": "22008",
-    "time out of range": "22008",
-}
-RANGE_STATES = frozenset(RANGE_SQLSTATE.values())
+# message, PostgreSQL's words, says which SQLSTATE, and the layer reports it
+# (the API's sqlstate(), as `sqlstate` on each exception). These are every
+# such SQLSTATE: test_every_range_message_maps_to_its_sqlstate produces each
+# message the layer maps.
+RANGE_STATES = frozenset(state for _, state in bytecask_sql._range_messages())
 
 # A statement in a transaction an earlier statement failed in.
 ABORTED = "25P02"
@@ -51,10 +39,8 @@ ABORTED = "25P02"
 def layer_sqlstate(e: bytecask_sql.ExecError) -> str:
     """The SQLSTATE PostgreSQL gives the layer's refusal, or "refused"."""
     if e.constraint == "range":
-        message = str(e)
-        states = [state for start, state in RANGE_SQLSTATE.items() if message.startswith(start)]
-        assert len(states) == 1, f"range refusal with no SQLSTATE in RANGE_SQLSTATE: {message}"
-        return states[0]
+        assert e.sqlstate in RANGE_STATES, f"range refusal with SQLSTATE {e.sqlstate}: {e}"
+        return e.sqlstate
     return SQLSTATE.get(e.constraint, "refused")
 
 

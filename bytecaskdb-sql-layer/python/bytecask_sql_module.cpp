@@ -73,8 +73,21 @@ Exceptions exceptions;  // NOLINT(cppcoreguidelines-avoid-non-const-global-varia
 // process, as the exception classes are.
 nb::handle decimal_type;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables): set once at import
 
+// An exception of class `type` with e's message and, as `sqlstate`, the
+// SQLSTATE the API reports for it (sql::sqlstate).
+auto make_exception(nb::handle type, const std::exception& e) -> nb::object {
+  nb::object exc = nb::borrow(type)(nb::str(e.what()));
+  auto state = sql::sqlstate(e);
+  exc.attr("sqlstate") = nb::str(state.data(), state.size());
+  return exc;
+}
+
+void raise_as(nb::handle type, const std::exception& e) {
+  PyErr_SetObject(type.ptr(), make_exception(type, e).ptr());
+}
+
 void raise_exec_error(const sql::ExecError& e) {
-  nb::object exc = nb::borrow(exceptions.exec_error)(nb::str(e.what()));
+  nb::object exc = make_exception(exceptions.exec_error, e);
   exc.attr("code") = e.code();
   exc.attr("conflict") = e.conflict();
   exc.attr("constraint") = nb::none();
@@ -251,21 +264,33 @@ NB_MODULE(bytecask_sql, m) {
     } catch (const sql::ExecError& e) {
       raise_exec_error(e);
     } catch (const sql::ast::SqlError& e) {
-      PyErr_SetString(exceptions.sql_error.ptr(), e.what());
+      raise_as(exceptions.sql_error, e);
     } catch (const sql::DdlRefused& e) {
-      PyErr_SetString(exceptions.sql_error.ptr(), e.what());
+      raise_as(exceptions.sql_error, e);
     } catch (const sql::ParamError& e) {
-      PyErr_SetString(exceptions.sql_error.ptr(), e.what());
+      raise_as(exceptions.sql_error, e);
     } catch (const bytecask::DbClosed& e) {
-      PyErr_SetString(exceptions.closed.ptr(), e.what());
+      raise_as(exceptions.closed, e);
     } catch (const sql::TransactionAborted& e) {
-      PyErr_SetString(exceptions.aborted.ptr(), e.what());
+      raise_as(exceptions.aborted, e);
     } catch (const sql::FeatureNotSupported& e) {
-      PyErr_SetString(exceptions.not_supported.ptr(), e.what());
+      raise_as(exceptions.not_supported, e);
     } catch (const sql::TransactionResolutionUnknown& e) {
-      PyErr_SetString(exceptions.unknown.ptr(), e.what());
+      raise_as(exceptions.unknown, e);
     }
   });
+
+  m.def(
+      "_range_messages",
+      [] {
+        nb::list out;
+        for (const auto& r : sql::range_messages()) {
+          out.append(
+              nb::make_tuple(nb::str(r.start.data(), r.start.size()), nb::str(r.sqlstate.data(), r.sqlstate.size())));
+        }
+        return out;
+      },
+      "Each range message start the layer writes, with its SQLSTATE: what sqlstate maps.");
 
   nb::class_<sql::Transaction>(m, "Transaction")
       .def("execute", &txn_execute, "sql"_a, "params"_a = nb::tuple(),

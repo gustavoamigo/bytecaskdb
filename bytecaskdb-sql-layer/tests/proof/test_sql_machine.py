@@ -1099,9 +1099,9 @@ def test_stored_text_that_is_not_utf8_raises_on_read(tmp_path):
 
 
 def test_every_range_message_maps_to_its_sqlstate(tmp_path):
-    """Each range refusal the layer makes, and the SQLSTATE the oracle gives
-    it: every entry of RANGE_SQLSTATE is produced, so a message reworded in
-    the layer fails here."""
+    """Each range refusal the layer makes, and the SQLSTATE it reports: every
+    message start the layer maps (bytecask_sql._range_messages) is produced,
+    so a message reworded in the layer fails here."""
     db = bytecask_sql.open(str(tmp_path))
     try:
         db.execute("CREATE TABLE r (k BIGINT PRIMARY KEY, s SMALLINT, i INTEGER, f REAL, d NUMERIC(4, 2), "
@@ -1120,6 +1120,7 @@ def test_every_range_message_maps_to_its_sqlstate(tmp_path):
             ("ts", -210_866_803_200_000_001, "22008"),
             ("tm", 86_400_000_001, "22008"),
         ]
+        messages = bytecask_sql._range_messages()
         seen = set()
         for col, value, state in cases:
             params = [1] + [value if c == col else None for c in cols]
@@ -1129,10 +1130,10 @@ def test_every_range_message_maps_to_its_sqlstate(tmp_path):
             except bytecask_sql.ExecError as e:
                 assert e.constraint == "range", (col, value, str(e))
                 assert o.layer_sqlstate(e) == state, (col, value, str(e))
-                seen.update(start for start in o.RANGE_SQLSTATE if str(e).startswith(start))
+                seen.update(start for start, _ in messages if str(e).startswith(start))
             else:
                 raise AssertionError(f"{col} = {value!r} was written")
-        assert seen == set(o.RANGE_SQLSTATE), set(o.RANGE_SQLSTATE) - seen
+        assert seen == {start for start, _ in messages}, {start for start, _ in messages} - seen
     finally:
         db.close()
 
