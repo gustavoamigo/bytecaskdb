@@ -329,13 +329,11 @@ A `BEGIN` inside the block makes it explicit, as PostgreSQL does: the open
 
 DDL is its own atomic operation in the layer and cannot run in a
 `Transaction`.
-- A DDL `Execute` that is the block's only one runs at `Sync`, alone. It
-  returns no rows, so its `CommandComplete` is sent there, before
-  `ReadyForQuery`.
-- A DDL with any other `Execute` in the same block is `0A000`, and nothing
-  in the block runs or commits.
-- A `Flush` does not run a pending DDL. A pipelining client that waits on
-  `Flush` for a DDL's result gets it at `Sync`.
+- A DDL that is its block's only statement (the next message is `Sync`)
+  runs alone through `Database::execute`, as a simple `Query` does.
+- A DDL in a block of two or more is `0A000`. If it opens the block,
+  nothing has run. If it comes later, the block's implicit `Transaction`
+  aborts. Either way nothing in the block commits.
 
 The simple-query path keeps `Database::execute`: one `Query` is one
 statement, committed alone, which is PostgreSQL's implicit transaction for a
@@ -648,8 +646,8 @@ The run script requires W ≥ the user count; the monitor is not a user.
   - two `Execute`s before `Sync` outside `BEGIN`, the second failing:
     neither is committed;
   - two that succeed, committed together at `Sync`;
-  - a lone DDL `Execute` run at `Sync`, and one beside a DML `Execute`
-    refused with nothing run;
+  - a lone DDL `Execute` run, and one beside a DML `Execute` refused with
+    nothing committed;
   - `Terminate` and a dropped connection rolling back an open
     transaction;
   - `COMMIT` of an aborted transaction tagged `ROLLBACK`;
@@ -676,8 +674,7 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 
 ## Known differences from PostgreSQL
 
-- A DDL in an extended-query block with other statements is `0A000`, and
-  a lone one runs at `Sync`, not at `Execute`.
+- A DDL in an extended-query block with other statements is `0A000`.
 - Parameter OIDs from the client are not used.
 - Binary format, for parameters and results, is `0A000`.
 - A compared or added `DECIMAL` parameter finer than its column's scale, and `NaN`,
@@ -719,7 +716,7 @@ test.
 8. Outside `BEGIN`, a block of one `Execute` autocommits through
    `Database::execute`, with its retry. A block of two or more is one
    implicit `Transaction`, committed at `Sync`, as in PostgreSQL. A DDL
-   runs alone at `Sync`, or is `0A000` beside other statements. The
+   runs only as a block's one statement, and is `0A000` beside others. The
    session owns the block status (coordinator review).
 9. The HammerDB smoke runs nightly, as a scheduled workflow, not per PR
    (owner, 2026-10-22).
