@@ -38,7 +38,8 @@ In:
 
 Out, each refused with a stated error rather than half-supported: SSL and
 GSSAPI encryption, every authentication method but trust, binary format,
-`COPY`, the function-call protocol, `CancelRequest`, `SET` and `SHOW`, SQL
+`COPY`, the function-call protocol, `CancelRequest`, `SET` (but `SET
+client_encoding` to UTF8) and `SHOW`, SQL
 `PREPARE`/`EXECUTE`/`DEALLOCATE`, `Execute` with a row limit, several
 statements in one `Query`, and the system catalogs (`pg_catalog`,
 `information_schema`).
@@ -46,7 +47,7 @@ statements in one `Query`, and the system catalogs (`pg_catalog`,
 ## What the client sends
 
 The gate's client is HammerDB running our driver script. The script calls
-pgtcl, HammerDB's bundled Pgtcl (2.2.x), which calls libpq. Its sources
+pgtcl, HammerDB's bundled Pgtcl (2.1.1 in HammerDB 5.0), which calls libpq. Its sources
 (Pgtcl `generic/pgtclCmds.c`, libpq `fe-connect.c`/`fe-exec.c`, REL_17)
 give the messages.
 
@@ -63,6 +64,10 @@ gssencmode disable user … dbname …}` is `PQconnectdb`.
 - libpq accepts `AuthenticationOk`, then any `ParameterStatus`,
   `BackendKeyData` and `NoticeResponse`, up to `ReadyForQuery`.
   `BackendKeyData` is optional; libpq needs it only to cancel.
+- Then pgtcl's `pg_connect` calls `PQsetClientEncoding`, which sends `set
+  client_encoding to 'UTF8'` as a `Query`. Found running the driver under
+  HammerDB 5.0, not in the sources read first. The server takes that one
+  `SET` (*Transaction control*).
 
 **Per statement.** The driver uses two calls.
 - `pg_exec $conn "BEGIN"`, with no parameters, is `PQexec`: one `Query`
@@ -240,6 +245,11 @@ exposes as calls, not as statements.
   status*). With no transaction open, `COMMIT` is `WARNING 25P01` and the tag `COMMIT`.
 - **`ROLLBACK`** calls `rollback()`; the tag is `ROLLBACK`. With no
   transaction open it is `WARNING 25P01`.
+
+- **`SET [SESSION] client_encoding {TO | =} 'UTF8'`**, any spelling of
+  UTF8, is the one `SET` taken: the tag is `SET`, with a `ParameterStatus`
+  for `client_encoding`. Another encoding is `22023`, and every other `SET`
+  is `0A000`.
 
 The extended protocol accepts these words too: `Parse` of `BEGIN` makes a
 statement the session runs at `Execute`.

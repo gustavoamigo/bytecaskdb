@@ -4,7 +4,7 @@
 """Fails when the HammerDB driver sends a statement the proof suite does not
 check against PostgreSQL (docs/server_design.md, *The HammerDB driver*).
 
-The driver's statements are the `set SQL(name) {...}` lines of
+The driver's statements are the `set ::SQL(name) {...}` lines of
 hammerdb/bytecask_tprocc.tcl. Each must be one tests/proof/test_tpcc.py
 runs against PostgreSQL 17, or one in PENDING: Stock-Level's, which the
 proof gains with the front end's slice 5. A PENDING statement the proof
@@ -30,7 +30,7 @@ PENDING = {
 }
 
 STATEMENT = re.compile(r"^(SELECT|INSERT|UPDATE|DELETE)\b")
-DRIVER_LINE = re.compile(r"^set SQL\((\w+)\) \{(.*)\}\s*$")
+DRIVER_LINE = re.compile(r"^set ::SQL\((\w+)\) \{(.*)\}\s*$")
 
 
 def driver_statements(path: pathlib.Path) -> dict[str, str]:
@@ -56,7 +56,7 @@ def main() -> int:
     proved = proved_statements(root / "tests" / "proof" / "test_tpcc.py")
     failures = []
     if not driver:
-        failures.append("no `set SQL(name) {...}` statements found in hammerdb/bytecask_tprocc.tcl")
+        failures.append("no `set ::SQL(name) {...}` statements found in hammerdb/bytecask_tprocc.tcl")
     for name, sql in sorted(driver.items()):
         if sql not in proved and sql not in PENDING:
             failures.append(f"{name}: not a statement tests/proof/test_tpcc.py checks against PostgreSQL: {sql}")

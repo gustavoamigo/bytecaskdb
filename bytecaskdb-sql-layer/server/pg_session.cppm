@@ -79,7 +79,9 @@ struct Message {
   std::string body;
 };
 
-enum class Control { Begin, Commit, Rollback };
+// SetEncoding is SET client_encoding to UTF8, the one SET taken: libpq's
+// PQsetClientEncoding sends it, and pgtcl's pg_connect calls that.
+enum class Control { Begin, Commit, Rollback, SetEncoding };
 
 // A statement's text as the session takes it: nothing, a transaction
 // control word, or a statement for the layer.
@@ -194,6 +196,30 @@ auto classify(std::string_view text, const char* several_state, std::string_view
   if (w == "ROLLBACK" || w == "ABORT") {
     only(1);
     return {Classified::Kind::Control, Control::Rollback, {}};
+  }
+  if (w == "SET") {
+    // SET [SESSION] client_encoding {TO | =} 'UTF8': the server speaks UTF8
+    // and nothing else, so only that value is taken.
+    std::string spaced;
+    for (auto ch : sql) {
+      if (ch == '=') {
+        spaced += " = ";
+      } else if (ch != '\'' && ch != '"') {
+        spaced.push_back(ch);
+      }
+    }
+    auto set = upper_words(spaced);
+    std::size_t at = set.size() > 1 && set[1] == "SESSION" ? 2 : 1;
+    if (set.size() == at + 3 && set[at] == "CLIENT_ENCODING" && (set[at + 1] == "TO" || set[at + 1] == "=")) {
+      std::string norm;
+      for (auto ch : set[at + 2]) {
+        if (ch != '-' && ch != '_') norm.push_back(ch);
+      }
+      if (norm != "UTF8") {
+        throw SessionError("client_encoding \"" + set[at + 2] + "\" is not supported: the server speaks UTF8", "22023");
+      }
+      return {Classified::Kind::Control, Control::SetEncoding, {}};
+    }
   }
   for (const auto* word : {"SET", "SHOW", "RESET", "PREPARE", "EXECUTE", "DEALLOCATE", "SAVEPOINT", "RELEASE", "COPY",
                            "DISCARD", "LISTEN", "UNLISTEN", "NOTIFY", "LOCK"}) {
@@ -608,6 +634,13 @@ private:
         }
         return t->commit() == CommitOutcome::Committed ? "COMMIT" : "ROLLBACK";
       }
+      case Control::SetEncoding:
+        refuse_if_failed();
+        out_.begin('S');
+        out_.cstr("client_encoding");
+        out_.cstr("UTF8");
+        out_.end();
+        return "SET";
       case Control::Rollback:
         if (in_block_) {
           if (txn_) txn_->rollback();

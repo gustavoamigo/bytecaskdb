@@ -35,40 +35,41 @@ if { [ chk_thread ] eq "FALSE" } {
     error "The TPROC-C timed script must run in a thread-enabled interpreter"
 }
 
-# The statements, one per line: check_driver_statements.py reads them here.
-set SQL(P1) {UPDATE warehouse SET w_ytd = w_ytd + $1 WHERE w_id = $2}
-set SQL(P2) {SELECT w_street_1, w_street_2, w_city, w_state, w_zip, w_name FROM warehouse WHERE w_id = $1}
-set SQL(P3) {UPDATE district SET d_ytd = d_ytd + $1 WHERE d_w_id = $2 AND d_id = $3}
-set SQL(P4) {SELECT d_street_1, d_street_2, d_city, d_state, d_zip, d_name FROM district WHERE d_w_id = $1 AND d_id = $2}
-set SQL(P5) {SELECT count(c_id) FROM customer WHERE c_last = $1 AND c_d_id = $2 AND c_w_id = $3}
-set SQL(P6) {SELECT c_first, c_middle, c_id, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_credit, c_credit_lim, c_discount, c_balance, c_since FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_last = $3 ORDER BY c_first}
-set SQL(P7) {SELECT c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_credit, c_credit_lim, c_discount, c_balance, c_since FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3}
-set SQL(P8) {SELECT c_data FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3}
-set SQL(P9) {UPDATE customer SET c_balance = $1, c_data = $2 WHERE c_w_id = $3 AND c_d_id = $4 AND c_id = $5}
-set SQL(P10) {UPDATE customer SET c_balance = $1 WHERE c_w_id = $2 AND c_d_id = $3 AND c_id = $4}
-set SQL(P11) {INSERT INTO history (h_id, h_c_d_id, h_c_w_id, h_c_id, h_d_id, h_w_id, h_date, h_amount, h_data) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)}
-set SQL(O2) {SELECT c_balance, c_first, c_middle, c_id FROM customer WHERE c_last = $1 AND c_d_id = $2 AND c_w_id = $3 ORDER BY c_first}
-set SQL(O3) {SELECT c_balance, c_first, c_middle, c_last FROM customer WHERE c_id = $1 AND c_d_id = $2 AND c_w_id = $3}
-set SQL(O4) {SELECT o_id, o_carrier_id, o_entry_d FROM orders WHERE o_d_id = $1 AND o_w_id = $2 AND o_c_id = $3 ORDER BY o_id DESC LIMIT 1}
-set SQL(O5) {SELECT ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_delivery_d FROM order_line WHERE ol_o_id = $1 AND ol_d_id = $2 AND ol_w_id = $3}
-set SQL(N1) {SELECT c_discount, c_last, c_credit, w_tax FROM customer, warehouse WHERE w_id = $1 AND c_w_id = $1 AND c_d_id = $2 AND c_id = $3}
-set SQL(N2) {SELECT d_next_o_id, d_tax FROM district WHERE d_id = $1 AND d_w_id = $2 FOR UPDATE}
-set SQL(N3) {UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_id = $1 AND d_w_id = $2}
-set SQL(N4) {SELECT i_price, i_name, i_data FROM item WHERE i_id = $1}
-set SQL(N5) {SELECT s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10 FROM stock WHERE s_i_id = $1 AND s_w_id = $2}
-set SQL(N6) {UPDATE stock SET s_quantity = $1 WHERE s_i_id = $2 AND s_w_id = $3}
-set SQL(N7) {INSERT INTO order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_dist_info) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)}
-set SQL(N8) {INSERT INTO orders (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_ol_cnt, o_all_local) VALUES ($1, $2, $3, $4, $5, $6, $7)}
-set SQL(N9) {INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES ($1, $2, $3)}
-set SQL(D1) {SELECT no_o_id FROM new_order WHERE no_w_id = $1 AND no_d_id = $2 ORDER BY no_o_id LIMIT 1}
-set SQL(D2) {DELETE FROM new_order WHERE no_w_id = $1 AND no_d_id = $2 AND no_o_id = $3}
-set SQL(D3) {SELECT o_c_id FROM orders WHERE o_id = $1 AND o_d_id = $2 AND o_w_id = $3}
-set SQL(D4) {UPDATE orders SET o_carrier_id = $1 WHERE o_id = $2 AND o_d_id = $3 AND o_w_id = $4}
-set SQL(D5) {UPDATE order_line SET ol_delivery_d = $1 WHERE ol_o_id = $2 AND ol_d_id = $3 AND ol_w_id = $4}
-set SQL(D6) {SELECT SUM(ol_amount) FROM order_line WHERE ol_o_id = $1 AND ol_d_id = $2 AND ol_w_id = $3}
-set SQL(D7) {UPDATE customer SET c_balance = c_balance + $1 WHERE c_id = $2 AND c_d_id = $3 AND c_w_id = $4}
-set SQL(S1) {SELECT d_next_o_id FROM district WHERE d_w_id = $1 AND d_id = $2}
-set SQL(S2) {SELECT COUNT(DISTINCT s_i_id) FROM order_line, stock WHERE ol_w_id = $1 AND ol_d_id = $2 AND ol_o_id < $3 AND ol_o_id >= $3 - 20 AND s_w_id = $1 AND s_i_id = ol_i_id AND s_quantity < $4}
+# The statements, one per line, global: a virtual user's top level may not
+# be. check_driver_statements.py reads them here.
+set ::SQL(P1) {UPDATE warehouse SET w_ytd = w_ytd + $1 WHERE w_id = $2}
+set ::SQL(P2) {SELECT w_street_1, w_street_2, w_city, w_state, w_zip, w_name FROM warehouse WHERE w_id = $1}
+set ::SQL(P3) {UPDATE district SET d_ytd = d_ytd + $1 WHERE d_w_id = $2 AND d_id = $3}
+set ::SQL(P4) {SELECT d_street_1, d_street_2, d_city, d_state, d_zip, d_name FROM district WHERE d_w_id = $1 AND d_id = $2}
+set ::SQL(P5) {SELECT count(c_id) FROM customer WHERE c_last = $1 AND c_d_id = $2 AND c_w_id = $3}
+set ::SQL(P6) {SELECT c_first, c_middle, c_id, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_credit, c_credit_lim, c_discount, c_balance, c_since FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_last = $3 ORDER BY c_first}
+set ::SQL(P7) {SELECT c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_credit, c_credit_lim, c_discount, c_balance, c_since FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3}
+set ::SQL(P8) {SELECT c_data FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3}
+set ::SQL(P9) {UPDATE customer SET c_balance = $1, c_data = $2 WHERE c_w_id = $3 AND c_d_id = $4 AND c_id = $5}
+set ::SQL(P10) {UPDATE customer SET c_balance = $1 WHERE c_w_id = $2 AND c_d_id = $3 AND c_id = $4}
+set ::SQL(P11) {INSERT INTO history (h_id, h_c_d_id, h_c_w_id, h_c_id, h_d_id, h_w_id, h_date, h_amount, h_data) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)}
+set ::SQL(O2) {SELECT c_balance, c_first, c_middle, c_id FROM customer WHERE c_last = $1 AND c_d_id = $2 AND c_w_id = $3 ORDER BY c_first}
+set ::SQL(O3) {SELECT c_balance, c_first, c_middle, c_last FROM customer WHERE c_id = $1 AND c_d_id = $2 AND c_w_id = $3}
+set ::SQL(O4) {SELECT o_id, o_carrier_id, o_entry_d FROM orders WHERE o_d_id = $1 AND o_w_id = $2 AND o_c_id = $3 ORDER BY o_id DESC LIMIT 1}
+set ::SQL(O5) {SELECT ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_delivery_d FROM order_line WHERE ol_o_id = $1 AND ol_d_id = $2 AND ol_w_id = $3}
+set ::SQL(N1) {SELECT c_discount, c_last, c_credit, w_tax FROM customer, warehouse WHERE w_id = $1 AND c_w_id = $1 AND c_d_id = $2 AND c_id = $3}
+set ::SQL(N2) {SELECT d_next_o_id, d_tax FROM district WHERE d_id = $1 AND d_w_id = $2 FOR UPDATE}
+set ::SQL(N3) {UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_id = $1 AND d_w_id = $2}
+set ::SQL(N4) {SELECT i_price, i_name, i_data FROM item WHERE i_id = $1}
+set ::SQL(N5) {SELECT s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10 FROM stock WHERE s_i_id = $1 AND s_w_id = $2}
+set ::SQL(N6) {UPDATE stock SET s_quantity = $1 WHERE s_i_id = $2 AND s_w_id = $3}
+set ::SQL(N7) {INSERT INTO order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_dist_info) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)}
+set ::SQL(N8) {INSERT INTO orders (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_ol_cnt, o_all_local) VALUES ($1, $2, $3, $4, $5, $6, $7)}
+set ::SQL(N9) {INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES ($1, $2, $3)}
+set ::SQL(D1) {SELECT no_o_id FROM new_order WHERE no_w_id = $1 AND no_d_id = $2 ORDER BY no_o_id LIMIT 1}
+set ::SQL(D2) {DELETE FROM new_order WHERE no_w_id = $1 AND no_d_id = $2 AND no_o_id = $3}
+set ::SQL(D3) {SELECT o_c_id FROM orders WHERE o_id = $1 AND o_d_id = $2 AND o_w_id = $3}
+set ::SQL(D4) {UPDATE orders SET o_carrier_id = $1 WHERE o_id = $2 AND o_d_id = $3 AND o_w_id = $4}
+set ::SQL(D5) {UPDATE order_line SET ol_delivery_d = $1 WHERE ol_o_id = $2 AND ol_d_id = $3 AND ol_w_id = $4}
+set ::SQL(D6) {SELECT SUM(ol_amount) FROM order_line WHERE ol_o_id = $1 AND ol_d_id = $2 AND ol_w_id = $3}
+set ::SQL(D7) {UPDATE customer SET c_balance = c_balance + $1 WHERE c_id = $2 AND c_d_id = $3 AND c_w_id = $4}
+set ::SQL(S1) {SELECT d_next_o_id FROM district WHERE d_w_id = $1 AND d_id = $2}
+set ::SQL(S2) {SELECT COUNT(DISTINCT s_i_id) FROM order_line, stock WHERE ol_w_id = $1 AND ol_d_id = $2 AND ol_o_id < $3 AND ol_o_id >= $3 - 20 AND s_w_id = $1 AND s_i_id = ol_i_id AND s_quantity < $4}
 
 proc connect { host port user db } {
     return [ pg_connect -conninfo "host=$host port=$port user=$user dbname=$db sslmode=disable gssencmode=disable" ]
@@ -78,8 +79,7 @@ proc connect { host port user db } {
 # without: its rows as a list of lists. A refusal is a Tcl error whose
 # errorCode is {PG sqlstate}.
 proc q { conn name args } {
-    global SQL
-    set r [ pg_exec $conn $SQL($name) {*}$args ]
+    set r [ pg_exec $conn $::SQL($name) {*}$args ]
     if { [ pg_result $r -status ] eq "PGRES_FATAL_ERROR" } {
         set state [ pg_result $r -error sqlstate ]
         set message [ pg_result $r -error ]

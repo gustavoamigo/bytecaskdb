@@ -284,6 +284,20 @@ def test_simple_query_refusals_and_the_empty_query(server):
     assert [b for k, b in c.until_ready() if k == b"C"] == [b"DROP TABLE\0"]
 
 
+def test_set_client_encoding_to_utf8_is_the_one_set_taken(server):
+    """pgtcl's pg_connect calls PQsetClientEncoding, which sends it."""
+    c = connect(server)
+    for sql in ("set client_encoding to 'UTF8'", "SET client_encoding = 'utf-8'", "SET SESSION client_encoding TO UTF8"):
+        c.send(query(sql))
+        out = c.until_ready()
+        assert [b for k, b in out if k == b"C"] == [b"SET\0"], (sql, out)
+        assert (b"S", b"client_encoding\0UTF8\0") in out
+    c.send(query("SET client_encoding TO 'LATIN1'"))
+    assert states(c.until_ready()) == ["22023"]
+    c.send(query("SET datestyle TO 'ISO'"))
+    assert states(c.until_ready()) == ["0A000"]
+
+
 def test_a_syntax_error_carries_its_position_in_characters(server):
     c = connect(server)
     c.send(query("SELECT é FROM"))
