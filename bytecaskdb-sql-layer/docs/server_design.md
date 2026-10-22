@@ -74,8 +74,9 @@ gssencmode disable user … dbname …}` is `PQconnectdb`.
   `ParseComplete`, `BindComplete`, `RowDescription` or `NoData`, the
   `DataRow`s, `CommandComplete` and `ReadyForQuery`.
 - The driver reads each result with `pg_result -status`, `-numTuples`,
-  `-getTuple` and `-cmdTuples`, and each error with `pg_result -error C`
-  (the SQLSTATE) and `-error` (the message).
+  `-getTuple` and `-cmdTuples`, and each error with `pg_result -error sqlstate`
+  (the SQLSTATE; pgtcl matches the suboption exactly, in lower case) and
+  `-error` (the message).
 
 A Payment is 13 round trips: `BEGIN`, its 11 statements and `COMMIT`.
 HammerDB's MySQL client-side mode (`mysql_no_stored_procs`) has the same
@@ -187,6 +188,7 @@ transaction and exits. When every thread has joined, the server calls
 ## A session
 
 A session holds:
+- the block status (*The block status*, below);
 - the open `Transaction`, if any;
 - the named statements, each a `const Statement&` from `Database::prepare`,
   which is valid until close;
@@ -196,14 +198,25 @@ A session holds:
 Closing the connection, with `Terminate` or without, rolls back an open
 transaction.
 
-**The transaction status** in `ReadyForQuery` comes from the
-`Transaction`:
-- `I` when there is none, or it has ended;
-- `T` when it is open;
-- `E` when it is aborted (`is_aborted()`).
+**The block status** is the session's own: `I`, `T` or `E`. It drives
+`ReadyForQuery`, `25P02` and `COMMIT`'s answer. It is not read off the
+`Transaction`, because errors the layer never sees, or sees differently,
+must still change it:
+- an error in `prepare` or in a parameter's text (`42601`, `22P02`,
+  `22003`, `08P01`) leaves the `Transaction` open and not aborted;
+- a `40001` from a catalog race ends the `Transaction` outright.
 
-The layer aborts a transaction when one of its statements fails, as
-PostgreSQL does, so the server keeps no status of its own.
+The rules:
+- `BEGIN` makes the block explicit: `T`.
+- Any `ErrorResponse` inside an explicit block makes it `E`, whatever
+  raised it. The server rolls back the `Transaction` if it is still open.
+- In `E`, every statement but `COMMIT` and `ROLLBACK` is `25P02`, checked
+  by the session before anything reaches the layer.
+- `COMMIT` in `E` answers `ROLLBACK`. `ROLLBACK` ends the block in any
+  state. Either way the status is `I`.
+- `COMMIT` in `T` that fails (`40001`, `08007`) has ended the block: `I`.
+- Outside `BEGIN`, `Sync` always returns the status to `I`, after an error
+  too.
 
 **Transaction control** is recognised before the layer's parser. The
 recognised words are `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`,
@@ -221,8 +234,8 @@ exposes as calls, not as statements.
   - `SerializationFailure` is `40001`;
   - `TransactionResolutionUnknown` is `08007`.
 
-  Either way the transaction has ended, and the status is `I`. With no
-  transaction open, `COMMIT` is `WARNING 25P01` and the tag `COMMIT`.
+  Either way the block has ended, and the status is `I` (*The block
+  status*). With no transaction open, `COMMIT` is `WARNING 25P01` and the tag `COMMIT`.
 - **`ROLLBACK`** calls `rollback()`; the tag is `ROLLBACK`. With no
   transaction open it is `WARNING 25P01`.
 
@@ -289,17 +302,27 @@ server sends `ReadyForQuery`.
 - **An error.** It gets `ErrorResponse`. The server then reads and discards
   messages until `Sync`, which gets `ReadyForQuery`.
 
-**The implicit transaction, outside `BEGIN`.** This follows PostgreSQL:
-- The first `Execute` after a `Sync` opens a `Transaction`.
-- Every `Execute` up to the next `Sync` runs in it.
-- `Sync` commits it. A commit error (`40001`, `08007`) is reported there,
-  before `ReadyForQuery`.
-- An error aborts it, and the messages after it are discarded up to
-  `Sync`, as now. Nothing in the block is committed.
+**The implicit transaction, outside `BEGIN`.** This follows PostgreSQL.
+Before it runs an `Execute` outside `BEGIN`, the session reads the next
+message.
+- **The next message is `Sync`.** The block is a single statement, which is
+  what `PQexecParams` sends. It runs through `Database::execute`'s
+  autocommit path, with its conflict retry, exactly as a simple `Query`
+  does and as `CONTRACT.md` states.
+- **Anything else.** The block has two or more statements, and it runs as
+  PostgreSQL's implicit transaction:
+  - this `Execute` opens a `Transaction`, and every `Execute` up to `Sync`
+    runs in it;
+  - `Sync` commits it, and a commit error (`40001`, `08007`) is reported
+    there, before `ReadyForQuery`;
+  - an error aborts it, and the messages after it are discarded up to
+    `Sync`, as now. Nothing in the block is committed.
 
-libpq sends one statement per `Sync`, so for libpq this is the statement
-committing alone. A pipelining client (psycopg's pipeline mode, JDBC's
-batches) gets PostgreSQL's semantics.
+Reading ahead never waits on a client that keeps to the protocol: a client
+only expects output after a `Sync` or a `Flush`, so it has sent one. A
+`Flush` counts as "anything else". libpq's one statement per `Sync` gets
+autocommit's retry, and a pipelining client (psycopg's pipeline mode,
+JDBC's batches) gets PostgreSQL's semantics.
 
 A `BEGIN` inside the block makes it explicit, as PostgreSQL does: the open
 `Transaction` carries on past `Sync` until `COMMIT` or `ROLLBACK`.
@@ -606,7 +629,13 @@ The run script requires W ≥ the user count; the monitor is not a user.
 - **The proof machine over the wire.** `tests/proof/`'s state machine gains
   a third target. It already checks the embedded layer against PostgreSQL
   17; now every statement also goes through the server with psycopg, with
-  every OID loaded as `str`. The wire results must match PostgreSQL's text,
+  every OID loaded as `str`. psycopg is set to send only what the server
+  takes:
+  - text placeholders (`%t`), so parameters go in text format; psycopg's
+    default dumpers are binary for several types, which would be `0A000`;
+  - `prepare_threshold=None`, so it never prepares server-side or sends
+    `DEALLOCATE ALL`;
+  - no `SET` of any kind, `search_path` included. The wire results must match PostgreSQL's text,
   byte for byte, and its SQLSTATEs. That proves `pg_text` (output and
   input), the tags, the status letters and the error mapping, on the
   statements and values the machine generates.
@@ -624,6 +653,10 @@ The run script requires W ≥ the user count; the monitor is not a user.
   - `Terminate` and a dropped connection rolling back an open
     transaction;
   - `COMMIT` of an aborted transaction tagged `ROLLBACK`;
+  - the block status: inside `BEGIN`, a statement that fails to bind, or a
+    parameter that fails to parse, makes the block `E`; later statements
+    are `25P02`; `COMMIT` answers `ROLLBACK`, and nothing is committed;
+  - after an error in an implicit block, `Sync` reports `I`;
   - the warnings;
   - `--max-connections`.
 - **HammerDB smoke, nightly.** A scheduled workflow,
@@ -646,6 +679,7 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 - A DDL in an extended-query block with other statements is `0A000`, and
   a lone one runs at `Sync`, not at `Execute`.
 - Parameter OIDs from the client are not used.
+- Binary format, for parameters and results, is `0A000`.
 - A compared or added `DECIMAL` parameter finer than its column's scale, and `NaN`,
   are `22P02`.
 - The integer and datetime input forms listed above only.

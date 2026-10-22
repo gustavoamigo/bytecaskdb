@@ -532,8 +532,9 @@ PostgreSQL (`docs/testing_design.md`).
 its TPROC-C transaction through SQL: a small fixture (one warehouse, scaled
 down), a fixed seed, one thread. It sends the same statements and
 parameters to PostgreSQL through psycopg, and compares every table after N
-transactions. Concurrency is the MVP gate's: the harness at 1, 16 and 48
-threads and Elle through SQL (#487, 2.6).
+transactions. Concurrency is the MVP gate's: HammerDB at 1, 16 and 48
+virtual users through the server (*The MVP gate*), with Elle through SQL in
+the harness (#487, 2.6).
 
 No micro-benchmarks: this is correctness work. `sql_layer_bench` runs only
 for a speedup claim.
