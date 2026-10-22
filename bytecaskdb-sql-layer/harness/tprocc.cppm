@@ -115,7 +115,7 @@ struct RunOptions {
 
 inline constexpr int kMaxAttempts = 10;
 
-// The transactions in the mix today. Each later front-end slice adds its own.
+// The transactions in the mix today: all but Stock-Level, which comes next.
 [[nodiscard]] auto mix() -> std::vector<Kind>;
 
 // Runs each phase on the loaded database, handing each report to

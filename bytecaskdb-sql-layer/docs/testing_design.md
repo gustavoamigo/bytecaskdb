@@ -252,8 +252,8 @@ and shared by them.
 - The mix is the specification's deck (New-Order 45, Payment 43, and
   Order-Status, Delivery and Stock-Level 4 each), drawn per transaction.
   It is restricted to the transactions built so far and renormalised:
-  New-Order, Payment, Order-Status and Delivery today. Stock-Level joins
-  with the front end's slice 5.
+  New-Order, Payment, Order-Status and Delivery today. Stock-Level, which
+  the front end's slice 5 now plans, is the next to join.
 - Inputs follow the profiles (clauses 2.4 to 2.8): customers by last name
   60% of the time and by `NURand` id otherwise; a remote warehouse for 15%
   of Payments when `W > 1`; `h_amount` from 1.00 to 5,000.00; a `BC`
