@@ -254,16 +254,16 @@ and shared by them.
   has home warehouse `t mod W + 1`, and a per-thread generator seeded from
   `--seed` and `t`.
 - The mix is the specification's deck (New-Order 45, Payment 43, and
-  Order-Status, Delivery and Stock-Level 4 each), drawn per transaction.
-  It is restricted to the transactions built so far and renormalised:
-  New-Order, Payment, Order-Status and Delivery today. Stock-Level, which
-  the front end's slice 5 now plans, is the next to join.
+  Order-Status, Delivery and Stock-Level 4 each), drawn per transaction,
+  with all five transactions in it.
 - Inputs follow the profiles (clauses 2.4 to 2.8): customers by last name
   60% of the time and by `NURand` id otherwise; a remote warehouse for 15%
   of Payments when `W > 1`; `h_amount` from 1.00 to 5,000.00; a `BC`
   customer's new `c_data`; New-Order's 5 to 15 lines, each item by
   `NURand`, 1% of lines from a remote warehouse when `W > 1`, and 1% of
-  orders ending on an unused item; Delivery's carrier from 1 to 10. The
+  orders ending on an unused item; Delivery's carrier from 1 to 10;
+  Stock-Level's threshold from 10 to 20, on a district drawn once per
+  thread, as the driver draws it once per virtual user. The
   client logic is the harness's, as in HammerDB's client-side driver.
 - One difference from the specification, as in HammerDB: Payment does not update
   `c_ytd_payment` or `c_payment_cnt`, since it runs HammerDB's statements
@@ -274,6 +274,9 @@ and shared by them.
   stored procedures alike. The specification's is quantity × price, with
   the taxes and the discount applied to the order's total (clause
   2.4.2.2).
+- Stock-Level's district is drawn at random once per thread, as HammerDB
+  draws it once per virtual user, so two threads can share one. The
+  specification gives each terminal its own (clause 2.8.1.2).
 - Delivery runs as one transaction over the warehouse's ten districts, as
   HammerDB runs it, not deferred (clause 2.7.2).
 - One `Transaction` per TPROC-C transaction, committed with `commit()`.
