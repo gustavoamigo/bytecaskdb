@@ -646,7 +646,7 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 - A DDL in an extended-query block with other statements is `0A000`, and
   a lone one runs at `Sync`, not at `Execute`.
 - Parameter OIDs from the client are not used.
-- A compared `DECIMAL` parameter finer than its column's scale, and `NaN`,
+- A compared or added `DECIMAL` parameter finer than its column's scale, and `NaN`,
   are `22P02`.
 - The integer and datetime input forms listed above only.
 - Binder errors are `42601`.
