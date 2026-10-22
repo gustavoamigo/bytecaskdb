@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Gustavo Amigo
-"""TPROC-C's Payment, Order-Status and New-Order through SQL, against
-PostgreSQL (docs/frontend_design.md, *Tests*, slices 1 and 3).
+"""TPROC-C's Payment, Order-Status, New-Order and Delivery through SQL,
+against PostgreSQL (docs/frontend_design.md, *Tests*, slices 1, 3 and 4).
 
 A small fixture (one warehouse, two districts, thirty customers each, a few
 orders per customer) is loaded on both sides. Then a fixed seed runs a mix
@@ -12,8 +12,10 @@ client's logic (the customer by last name, the new balance and c_data)
 between them, as HammerDB's driver keeps it. New-Order's N1-N9 run
 the same way, one order in twenty naming an item that does not exist
 (TPC-C's one in a hundred would rarely come up in this short run), which
-the client rolls back on both sides. Every statement's result must
-agree, and so must every table after the run.
+the client rolls back on both sides. Delivery's D1-D7 deliver the oldest
+undelivered order of each district: the load leaves the orders without a
+carrier undelivered, in new_order. Every statement's result must agree,
+and so must every table after the run.
 
 The layer takes a DECIMAL parameter as its scaled integer and a TIMESTAMP
 as microseconds since 1970; PostgreSQL takes decimal.Decimal and datetime.
@@ -183,16 +185,20 @@ def load(p: Pair, rng: random.Random) -> dict:
         for c in range(1, CUSTOMERS + 1):
             for _ in range(rng.randint(0, 2)):
                 lines = rng.randint(1, 4)
+                carrier = rng.choice([None, rng.randint(1, 10)])
                 p.run("INSERT INTO orders (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_carrier_id, o_ol_cnt, o_all_local) "
                       "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                      (o_id, d, 1, c, stamp(rng), rng.choice([None, rng.randint(1, 10)]), lines, 1),
+                      (o_id, d, 1, c, stamp(rng), carrier, lines, 1),
                       (INT, INT, INT, INT, TS, INT, INT, INT))
+                if carrier is None:  # undelivered: Delivery's to take
+                    p.run("INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES ($1, $2, $3)", (o_id, d, 1),
+                          (INT, INT, INT))
                 for n in range(1, lines + 1):
                     p.run("INSERT INTO order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, "
                           "ol_quantity, ol_amount, ol_delivery_d, ol_dist_info) "
                           "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                           (o_id, d, 1, n, rng.randint(1, 1000), 1, 5, money(rng, 0, 9999),
-                           rng.choice([None, stamp(rng)]), letters(rng, 24, 24)),
+                           None if carrier is None else stamp(rng), letters(rng, 24, 24)),
                           (INT, INT, INT, INT, INT, INT, INT, DEC2, TS, TEXT))
                 o_id += 1
         next_o_id[d] = o_id
@@ -332,6 +338,34 @@ def new_order(p: Pair, rng: random.Random) -> None:
     p.commit()
 
 
+def delivery(p: Pair, rng: random.Random) -> None:
+    """Each district's oldest undelivered order: taken off new_order, given a
+    carrier, its lines a delivery date, and its amount added to the
+    customer's balance."""
+    carrier = rng.randint(1, 10)
+    when = stamp(rng)
+    p.begin()
+    for d in range(1, DISTRICTS + 1):
+        oldest = p.run("SELECT no_o_id FROM new_order WHERE no_w_id = $1 AND no_d_id = $2 ORDER BY no_o_id LIMIT 1",
+                       (1, d), (INT, INT))
+        if not oldest:
+            continue
+        [(o_id,)] = oldest
+        p.run("DELETE FROM new_order WHERE no_w_id = $1 AND no_d_id = $2 AND no_o_id = $3", (1, d, o_id),
+              (INT, INT, INT))
+        [(c_id,)] = p.run("SELECT o_c_id FROM orders WHERE o_id = $1 AND o_d_id = $2 AND o_w_id = $3", (o_id, d, 1),
+                          (INT, INT, INT))
+        p.run("UPDATE orders SET o_carrier_id = $1 WHERE o_id = $2 AND o_d_id = $3 AND o_w_id = $4",
+              (carrier, o_id, d, 1), (INT, INT, INT, INT))
+        p.run("UPDATE order_line SET ol_delivery_d = $1 WHERE ol_o_id = $2 AND ol_d_id = $3 AND ol_w_id = $4",
+              (when, o_id, d, 1), (TS, INT, INT, INT))
+        [(amount,)] = p.run("SELECT SUM(ol_amount) FROM order_line WHERE ol_o_id = $1 AND ol_d_id = $2 "
+                            "AND ol_w_id = $3", (o_id, d, 1), (INT, INT, INT))
+        p.run("UPDATE customer SET c_balance = c_balance + $1 WHERE c_id = $2 AND c_d_id = $3 AND c_w_id = $4",
+              (amount, c_id, d, 1), (DEC2, INT, INT, INT))
+    p.commit()
+
+
 def tables_agree(p: Pair) -> None:
     for t in p.db.catalog():
         cols = ", ".join(c["name"] for c in t["columns"])
@@ -341,14 +375,16 @@ def tables_agree(p: Pair) -> None:
         assert o.strict(layer) == o.strict(pg_rows), f"table {t['name']}: the layer and PostgreSQL differ"
 
 
-def test_payment_order_status_and_new_order_agree_with_postgresql(dsn):
+def test_payment_order_status_new_order_and_delivery_agree_with_postgresql(dsn):
     p = Pair(dsn)
     try:
         rng = random.Random(487)
         load(p, rng)
-        for h_id in range(90):
+        for h_id in range(100):
             pick = rng.random()
-            if pick < 0.45:
+            if h_id % 10 == 9:  # TPC-C's 4% would leave this run one or two
+                delivery(p, rng)
+            elif pick < 0.45:
                 new_order(p, rng)
             elif pick < 0.88:
                 payment(p, rng, h_id)

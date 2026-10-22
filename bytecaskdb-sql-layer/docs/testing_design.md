@@ -119,14 +119,28 @@ Rules for slice 3 (#492):
   mostly, as `FROM a, b WHERE …` or `a JOIN b ON … WHERE …`, columns
   qualified by their table.
 
-`test_tpcc.py` runs TPROC-C's Payment, Order-Status and New-Order through
-SQL against PostgreSQL: a small fixture (one warehouse, two districts,
-thirty customers each, some with a NULL `c_first`, fifty items and their
-stock), then ninety transactions from a fixed seed, one thread, in
-roughly TPROC-C's mix, each statement in a `Transaction` and in a
-PostgreSQL REPEATABLE READ transaction, with the client's logic between
-them. One New-Order in twenty names an item that does not exist and rolls
-back. Every statement's result and every table after the run must agree.
+Rules for slice 4 (#492):
+- **SUM and MIN** over the same `WHERE` as `COUNT`, with `LIMIT 0` or 1
+  now and then: `SUM` of SMALLINT, INTEGER and NUMERIC(6, 2) columns, `MIN`
+  of those and BIGINT ones. `SUM` of BIGINT is left out: its running total
+  leaves `int64_t` (*Known differences*).
+- **UPDATE and DELETE by a key**: the same `WHERE` as `SELECT`, every row
+  it matches; the `UPDATE` sets a non-key column to a parameter, or adds
+  one to or subtracts one from a SMALLINT, INTEGER or NUMERIC(6, 2) column
+  no unique index holds. `served` decides whether the layer plans it, as
+  for a `SELECT` without `ORDER BY`; the counts must agree.
+
+`test_tpcc.py` runs TPROC-C's Payment, Order-Status, New-Order and Delivery
+through SQL against PostgreSQL: a small fixture (one warehouse, two
+districts, thirty customers each, some with a NULL `c_first`, fifty items
+and their stock, the orders without a carrier undelivered in `new_order`),
+then a hundred transactions from a fixed seed, one thread, each statement
+in a `Transaction` and in a PostgreSQL REPEATABLE READ transaction, with
+the client's logic between them. Every tenth is a Delivery, of each
+district's oldest undelivered order; the rest are in roughly TPROC-C's mix
+of the other three. One New-Order in twenty names an item that does not
+exist and rolls back. Every statement's result and every table after the
+run must agree.
 The schema is read from `tests/tpcc_schema.cppm`, its one definition.
 
 Fixed cases are plain pytest functions at the end of the file. They call
@@ -376,6 +390,22 @@ Found so far. The machine expects each one, so it does not fail on them.
   refused at bind** ("numeric field overflow"), whatever the column holds;
   PostgreSQL computes the sum and fails only when it does not fit the
   column. The machine's literals stay inside 18 digits.
+- **A unique value an UPDATE moves from one row to another is a
+  duplicate.** With a unique index on `u`, rows holding 1 and 2, `SET u =
+  u + 1` over both is refused (23505) here, whatever order the rows are
+  written in: each row's new value is checked against the snapshot, where
+  the other row still holds it. PostgreSQL checks each row as it writes
+  it, so its outcome depends on the order it visits them. Two rows given
+  one value are 23505 on both (`test_one_unique_value_given_to_two_rows_is_23505`).
+  The machine adds to no column a unique index holds.
+- **A SUM whose running total leaves `int64_t` fails.** The layer adds in
+  64 bits, a DECIMAL's scaled integer included, and an overflow fails the
+  statement; PostgreSQL's `SUM` of a BIGINT or NUMERIC is an unbounded
+  `numeric`. Below that the sums agree exactly
+  (`test_sum_past_int64_is_an_error`). The machine sums no BIGINT column.
+- **MIN of a REAL or DOUBLE PRECISION column is refused.** PostgreSQL's
+  `MIN` keeps the last of `-0.0` and `0.0` it meets, so its answer depends
+  on the order it reads the rows. The machine takes no `MIN` of a float.
 - **DML takes no literals but an integer after `+` or `-` in `SET`:** other
   values are parameters (`$1`). The machine's
   statements use parameters on both sides.

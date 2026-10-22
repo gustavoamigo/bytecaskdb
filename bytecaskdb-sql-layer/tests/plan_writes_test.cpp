@@ -564,6 +564,27 @@ void insert_twice(bc_ctx* cx) {
   insert_w(cx);
   insert_w(cx);
 }
+// INSERT INTO w VALUES ($1, NULL, $2, $3), ($4, NULL, $2, $5): two rows,
+// one unique b.
+void insert_two_sharing_b(bc_ctx* cx) {
+  for (std::uint32_t id : {0u, 3u}) {
+    bc_row r = bc_row_begin(cx, kW);
+    bc_row_set_param(cx, r, kId, id);
+    bc_row_set_param(cx, r, kB, 1);
+    bc_row_set_param(cx, r, kC, id == 0 ? 2 : 4);
+    bc_insert(cx, kW, bc_row_end(cx, r));
+  }
+}
+// UPDATE w SET b = $3 WHERE id = $1 or id = $2: two rows given one unique b.
+void update_two_to_one_b(bc_ctx* cx) {
+  for (std::uint32_t id : {0u, 1u}) {
+    bool found = false;
+    bc_view old = bc_get(cx, bc_key_params(cx, kW, id, 1), &found);
+    bc_row r = bc_row_from(cx, kW, old);
+    bc_row_set_param(cx, r, kB, 2);
+    bc_update(cx, kW, old, bc_row_end(cx, r));
+  }
+}
 // A row's key moved away, then inserted again in the same plan.
 void move_then_insert(bc_ctx* cx) {
   bool found = false;
@@ -653,6 +674,28 @@ TEST_CASE("plan writes: a second write of one row in one plan is refused", "[sql
   CHECK(run(f, del_range_then_insert_outside,
             {std::int64_t{9}, std::int64_t{9}, bytes("z"), std::int64_t{0}, std::int64_t{5}}) == BC_COMMITTED);
   CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 1);
+  check_indexes_exact(f);
+}
+
+TEST_CASE("plan writes: two rows one plan gives one unique value are a duplicate", "[sql][algebra][writes]") {
+  // The snapshot holds neither row's new entry: the execution's own earlier
+  // write is what the second collides with (#507).
+  Fixture f;
+  create_w(f);
+  g_runs = 0;
+  CHECK(run(f, insert_two_sharing_b, {std::int64_t{1}, bytes("x"), std::int64_t{1}, std::int64_t{2}, std::int64_t{2}},
+            {}, 3) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
+  CHECK(bc_error_detail(f.cx) == unique_on(kWB));
+  REQUIRE(run(f, insert_w, {std::int64_t{1}, bc_value{}, bytes("x"), std::int64_t{1}}) == BC_COMMITTED);
+  REQUIRE(run(f, insert_w, {std::int64_t{2}, bc_value{}, bytes("y"), std::int64_t{2}}) == BC_COMMITTED);
+  CHECK(run(f, update_two_to_one_b, {std::int64_t{1}, std::int64_t{2}, bytes("z")}, {}, 3) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
+  CHECK(bc_error_detail(f.cx) == unique_on(kWB));
+  // Nothing of either committed, and each execution starts with none
+  // written: a retry or the next execution is not refused by the last one's.
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 2);
+  CHECK(run(f, update_w, {std::int64_t{1}, std::int64_t{1}, bc_value{}, bytes("z"), std::int64_t{1}}) == BC_COMMITTED);
   check_indexes_exact(f);
 }
 

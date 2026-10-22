@@ -12,9 +12,9 @@
 //      longest run of equality-compared parts wins, then a range after the
 //      run, then the primary key, then the covering path, then the lower id
 //   3. its NULLs placed as PostgreSQL places them, or refused
-// A conjunct the chosen key does not express (a residual filter) is refused
-// until slice 5 brings residuals. UPDATE and DELETE name one row by the
-// whole primary key until slice 4.
+// UPDATE and DELETE take their rows by the same rules, without an order. A
+// conjunct the chosen key does not express (a residual filter) is refused
+// until slice 5 brings residuals.
 
 module;
 #include <algorithm>
@@ -73,12 +73,6 @@ auto point_get(const Table& t, const std::vector<bound::Compare>& where) -> std:
     if (std::ranges::find(used, &c) == used.end()) residual(t, c);
   }
   return g;
-}
-
-auto point_or_refuse(const Table& t, const std::vector<bound::Compare>& where, const char* stmt) -> ir::PointGet {
-  auto g = point_get(t, where);
-  if (!g) no_plan(std::string{stmt} + " must name its row by the full primary key");
-  return *g;
 }
 
 struct Part {
@@ -175,32 +169,34 @@ auto param_bound(const bound::Compare* c, bool successor) -> ir::KeyBound {
   return {ir::KeyBound::Kind::Param, c->param, successor};
 }
 
-auto select_from(const Table& t, const bound::Select& s) -> std::variant<ir::PointGet, ir::Scan, ir::NullSplitScan> {
+// The rows of `t` the WHERE matches, in the ORDER BY's order. `used_cols`
+// are the columns read from each; with `may_cover`, the scan reads them
+// from the entry's key when it holds them all.
+auto rows_of(const Table& t, const std::vector<bound::Compare>& where, const std::vector<bound::OrderItem>& order_by,
+             const std::vector<std::uint32_t>& used_cols, bool may_cover)
+    -> std::variant<ir::PointGet, ir::Scan, ir::NullSplitScan> {
   // A point lookup returns at most one row: it gives any ORDER BY.
-  if (auto g = point_get(t, s.where)) return *g;
+  if (auto g = point_get(t, where)) return *g;
 
   // An ordered column compared for equality is constant in the result.
   std::vector<bound::OrderItem> ordered;
-  for (const auto& o : s.order_by) {
-    auto constant = std::ranges::any_of(s.where, [&](const auto& w) { return w.col_id == o.col_id && w.op == Op::Eq; });
+  for (const auto& o : order_by) {
+    auto constant = std::ranges::any_of(where, [&](const auto& w) { return w.col_id == o.col_id && w.op == Op::Eq; });
     auto repeated = std::ranges::any_of(ordered, [&](const auto& q) { return q.col_id == o.col_id; });
     if (!constant && !repeated) ordered.push_back(o);
   }
-  std::vector<std::uint32_t> used_cols = s.targets;
-  if (s.count && s.count->col_id) used_cols.push_back(*s.count->col_id);
 
   auto all = paths(t);
   std::vector<Choice> usable;
   for (const auto& p : all) {
-    auto c = choose(p, s.where, ordered);
+    auto c = choose(p, where, ordered);
     if (c.eq.empty() && c.lo == nullptr && c.hi == nullptr) continue;
-    // FOR UPDATE reads each row, whose key it guards.
-    c.covering = !s.for_update && std::ranges::all_of(used_cols, [&](std::uint32_t col) { return in_key(t, p, col); });
+    c.covering = may_cover && std::ranges::all_of(used_cols, [&](std::uint32_t col) { return in_key(t, p, col); });
     usable.push_back(c);
   }
   if (usable.empty()) no_plan("a full scan of " + t.name);
   std::erase_if(usable, [](const Choice& c) { return !c.serves; });
-  if (usable.empty()) no_plan("no index of " + t.name + " gives ORDER BY " + names(t, s.order_by));
+  if (usable.empty()) no_plan("no index of " + t.name + " gives ORDER BY " + names(t, order_by));
   auto rank = [](const Choice& c) {
     return std::tuple{c.eq.size(), c.lo != nullptr || c.hi != nullptr, c.path->is_pk, c.covering};
   };
@@ -209,14 +205,14 @@ auto select_from(const Table& t, const bound::Select& s) -> std::variant<ir::Poi
     return a.path->object < b.path->object;
   });
 
-  for (const auto& w : s.where) {
+  for (const auto& w : where) {
     if (std::ranges::find(best.eq, &w) == best.eq.end() && &w != best.lo && &w != best.hi) residual(t, w);
   }
 
   ir::Scan out;
   out.object = best.path->object;
   for (const auto* e : best.eq) out.prefix.push_back(e->param);
-  for (const auto& w : s.where) {
+  for (const auto& w : where) {
     if (std::ranges::find(out.null_checks, w.param) == out.null_checks.end()) out.null_checks.push_back(w.param);
   }
   out.reverse = best.reverse;
@@ -229,7 +225,7 @@ auto select_from(const Table& t, const bound::Select& s) -> std::variant<ir::Poi
   // a nullable ASC part first after the run is served: by two ranges.
   for (std::size_t i = 0; i < ordered.size(); ++i) {
     const auto* col = t.column(ordered[i].col_id);
-    auto compared = std::ranges::any_of(s.where, [&](const auto& w) { return w.col_id == col->id; });
+    auto compared = std::ranges::any_of(where, [&](const auto& w) { return w.col_id == col->id; });
     if (!col->nullable || compared) continue;
     auto later_nullable = std::ranges::any_of(ordered.begin() + static_cast<std::ptrdiff_t>(i) + 1, ordered.end(),
                                               [&](const auto& o) { return t.column(o.col_id)->nullable; });
@@ -270,26 +266,62 @@ auto select_from(const Table& t, const bound::Select& s) -> std::variant<ir::Poi
   return out;
 }
 
+// MIN(arg) from the scan's first entry: arg is the ASC part after its
+// prefix, so the first entry past that part's NULLs holds the least value.
+// A scan with no range on the part is given one from past its NULLs.
+auto min_from_first_entry(const Table& t, ir::Scan& sc, const ir::Column& arg) -> bool {
+  const auto all = paths(t);
+  const auto& path = *std::ranges::find_if(all, [&](const Path& p) { return p.object == sc.object; });
+  if (sc.prefix.size() >= path.parts.size()) return false;
+  const auto& part = path.parts[sc.prefix.size()];
+  if (part.col != arg.id || part.desc) return false;
+  if (arg.nullable && std::holds_alternative<std::monostate>(sc.rest)) {
+    sc.rest = ir::Range{{ir::KeyBound::Kind::NullPart, 0, true}, {}};
+  }
+  return true;
+}
+
 auto select(const Table& t, const bound::Select& s) -> ir::Select {
+  std::vector<std::uint32_t> used_cols = s.targets;
+  if (s.aggregate && s.aggregate->col_id) used_cols.push_back(*s.aggregate->col_id);
   ir::Select sel;
-  std::visit([&](auto&& from) { sel.from = std::move(from); }, select_from(t, s));
+  // FOR UPDATE reads each row, whose key it guards.
+  std::visit([&](auto&& from) { sel.from = std::move(from); }, rows_of(t, s.where, s.order_by, used_cols, !s.for_update));
   sel.limit = s.limit;
   sel.for_update = s.for_update;
-  const auto* scan = ir::scan_of(sel);
-  if (!s.count) {
+  auto* scan = std::get_if<ir::Scan>(&sel.from);
+  if (!s.aggregate) {
     for (auto id : s.targets) sel.targets.push_back(column(t, id));
     return sel;
   }
-  ir::Count count;
-  if (s.count->col_id) count.arg = column(t, *s.count->col_id);
-  // Every entry of the range is a row to count, unless the argument can be
-  // NULL in one: the WHERE compares every column it names, so those hold
-  // none.
-  auto may_be_null = count.arg && count.arg->nullable &&
-                     std::ranges::none_of(s.where, [&](const auto& w) { return w.col_id == count.arg->id; });
-  count.from_keys = scan != nullptr && !may_be_null;
-  sel.count = count;
+  using Fn = ast::Expr::Fn;
+  ir::Aggregate agg;
+  switch (s.aggregate->fn) {
+    case Fn::Count: agg.fn = ir::Aggregate::Fn::Count; break;
+    case Fn::Sum: agg.fn = ir::Aggregate::Fn::Sum; break;
+    case Fn::Min: agg.fn = ir::Aggregate::Fn::Min; break;
+  }
+  if (s.aggregate->col_id) agg.arg = column(t, *s.aggregate->col_id);
+  if (agg.fn == ir::Aggregate::Fn::Count) {
+    // Every entry of the range is a row to count, unless the argument can be
+    // NULL in one: the WHERE compares every column it names, so those hold
+    // none.
+    auto may_be_null = agg.arg && agg.arg->nullable &&
+                       std::ranges::none_of(s.where, [&](const auto& w) { return w.col_id == agg.arg->id; });
+    agg.from_keys = scan != nullptr && !may_be_null;
+  } else if (agg.fn == ir::Aggregate::Fn::Min && scan != nullptr) {
+    agg.from_keys = min_from_first_entry(t, *scan, *agg.arg);
+  }
+  sel.aggregate = agg;
   return sel;
+}
+
+// The rows an UPDATE or DELETE writes: by a point lookup, or a scan, which
+// reads each row whole.
+auto write_rows(const Table& t, const std::vector<bound::Compare>& where) -> std::variant<ir::PointGet, ir::Scan> {
+  auto rows = rows_of(t, where, {}, {}, false);
+  if (auto* g = std::get_if<ir::PointGet>(&rows)) return *g;
+  return std::get<ir::Scan>(rows);  // no ORDER BY, so never split
 }
 
 // Two tables, each by a point lookup, in FROM order: the two-point join
@@ -342,7 +374,7 @@ auto plan_statement(const bound::Bound& b, const Catalog& cat) -> ir::Plan {
         } else if constexpr (std::is_same_v<T, bound::Update>) {
           const auto& t = *s.table;
           table(t);
-          ir::Update up{point_or_refuse(t, s.where, "UPDATE"), {}};
+          ir::Update up{write_rows(t, s.where), {}};
           for (const auto& [id, e] : s.set) {
             ir::Expr v;
             switch (e.kind) {
@@ -357,7 +389,7 @@ auto plan_statement(const bound::Bound& b, const Catalog& cat) -> ir::Plan {
         } else if constexpr (std::is_same_v<T, bound::Delete>) {
           const auto& t = *s.table;
           table(t);
-          return ir::Delete{point_or_refuse(t, s.where, "DELETE")};
+          return ir::Delete{write_rows(t, s.where)};
         } else {
           throw SqlError{"DDL has no plan", -1};
         }
