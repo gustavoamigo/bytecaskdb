@@ -602,18 +602,24 @@ runs is not part of its output.
 
 ## Running the gate
 
-`bytecaskdb-sql-layer/hammerdb/run-gate.sh --warehouses=W --vus=1,16,48
-[--rampup=2] [--duration=5] [--mix=full] [--hammerdb-home=PATH]
-[--data-root=PATH] [--smoke]`. It follows `run-hammerdb.sh` in the MariaDB
-plugin. `--smoke` is the short run of *Tests*.
+`bytecaskdb-sql-layer/hammerdb/run-gate.sh [--warehouses=48] [--vus=1,16,48]
+[--rampup=2] [--duration=5] [--mix="neword payment ostat delivery"]
+[--hammerdb-home=PATH] [--data-root=PATH] [--smoke --pg=CONNINFO]`. It
+follows `run-hammerdb.sh` in the MariaDB plugin. `--smoke` is the short run
+of *Tests*, and `--pg` names the PostgreSQL it checks the driver on (its
+password in `PGPASSWORD`). `XMAKE_FLAGS` adds `xmake f` flags, as CI sets
+its toolchain.
 
 1. **Build.** It builds `sql_layer_tprocc` and `sql_layer_server` in
    `releasedbg`; a debug engine walks the key directory on every commit.
 2. **Load.** It loads W warehouses once with `sql_layer_tprocc load`, not
    HammerDB's `buildschema`, and keeps the directory as the pristine copy.
+   With `--smoke`, `--sql-out` also writes the population for PostgreSQL.
 3. **Per user count:**
    - restore the copy (a reflink where the filesystem has them);
-   - start the server, and wait for its `ready` line;
+   - take a run with `sql_layer_tprocc next-run`, written into the driver's
+     header;
+   - start the server on a free port, and wait for its `ready` line;
    - run `hammerdbcli auto` on a generated file, which sets
      `dbset db pg`, `dbset bm TPC-C`, `diset connection pg_host`,
      `pg_port` and `pg_sslmode disable`, `diset tpcc pg_user` and
@@ -626,8 +632,13 @@ plugin. `--smoke` is the short run of *Tests*.
    - run `sql_layer_tprocc check --dir`, conditions 1, 8 and 9, on what the
      run left.
 
-   A cell whose check fails is reported as failed, whatever its NOPM.
-4. **Results.** One row per cell goes to
+   A cell whose check fails, or whose run printed no result, fails the
+   script, whatever its NOPM.
+4. **With `--smoke`, PostgreSQL.** A database of its own, the population
+   loaded with `psql`, the same driver with its engine named PostgreSQL,
+   then `pg_consistency.sql`: the conditions must hold there too. Its
+   numbers are printed by HammerDB and not recorded.
+5. **Results.** One row per cell goes to
    `bytecaskdb-sql-layer/benchmarks/hammerdb_results.csv`, which the
    layer's `.gitignore` ignores: date, commit, W, users, ramp-up,
    duration, NOPM, TPM, errors by SQLSTATE, and the check's result, all
@@ -636,7 +647,10 @@ plugin. `--smoke` is the short run of *Tests*.
 The harness gains three commands for this:
 - `check`, over its existing `consistency()`;
 - `next-run`, the `harness_run` bump it already makes per phase;
-- `load --sql-out`, the loader writing to a file instead of the layer.
+- `load --sql-out FILE`: after the load, what was loaded as a psql script
+  (the schema's DDL with `COLLATE "C"` on each `VARCHAR`, then one `COPY`
+  per table, values written by `pg_text`), so PostgreSQL holds exactly the
+  layer's rows.
 
 The run script requires W ≥ the user count; the monitor is not a user.
 

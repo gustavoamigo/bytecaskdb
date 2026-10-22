@@ -193,9 +193,13 @@ statements it sends and the `h_id` scheme are `frontend_design.md`'s
 (*Where the statements come from*, *The statements*), and are not
 repeated here.
 
-**One binary, three commands.** `harness/main.cpp`, xmake target
+**One binary, five commands.** `harness/main.cpp`, xmake target
 `sql_layer_tprocc` (not built by default, as `sql_layer_bench`):
-`sql_layer_tprocc load`, `sql_layer_tprocc run` and `sql_layer_tprocc elle`. The
+`sql_layer_tprocc load`, `sql_layer_tprocc run` and `sql_layer_tprocc elle`,
+and for the HammerDB gate (`docs/server_design.md`, *Running the gate*)
+`check` (the consistency conditions alone, on what a run left), `next-run`
+(a `harness_run` for the driver's `h_id`s) and `load --sql-out` (the
+population as a psql script, for PostgreSQL). The
 loader, the transactions and the checks are one module,
 `bytecask.sql.tprocc` (`harness/tprocc.cppm`), which the smoke test in
 `sql_layer_tests` uses too. Run it from a `releasedbg` build: a debug

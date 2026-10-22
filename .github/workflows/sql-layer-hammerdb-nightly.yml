@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: MIT
+# The SQL layer's HammerDB smoke (bytecaskdb-sql-layer/docs/server_design.md,
+# *Tests*): nightly, and on demand, never per pull request (owner,
+# 2026-10-22). hammerdb/run-gate.sh --smoke runs HammerDB's TPROC-C through
+# the layer's driver script against sql_layer_server, two warehouses, two
+# users, one minute, and checks the consistency conditions on what it left;
+# then the same driver on PostgreSQL 17, which checks the driver itself.
+# Per pull request, sql-layer.yml runs the server's wire tests instead.
+
+name: SQL layer HammerDB nightly
+
+on:
+  schedule:
+    - cron: "20 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  HAMMERDB_VERSION: "5.0"
+
+jobs:
+  hammerdb-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: fedora:43
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      BYTECASK_MARCH: x86-64-v3
+      XMAKE_ROOT: "y"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          # As sql-layer.yml, and libpq and psql: HammerDB's pgtcl loads
+          # libpq, and the smoke loads PostgreSQL with psql.
+          dnf install -y \
+            clang llvm llvm-devel lld \
+            libcxx libcxx-devel libstdc++-static \
+            xmake make which \
+            python3-pip python3-devel \
+            git ninja-build \
+            libpq postgresql
+          pip3 install nanobind
+
+      - name: Cache xmake packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.xmake/packages
+          key: xmake-packages-sql-layer-fedora43-${{ hashFiles('xmake.lua', 'bytecaskdb-sql-layer/xmake.lua') }}
+
+      - name: Cache HammerDB
+        id: hammerdb
+        uses: actions/cache@v4
+        with:
+          path: ~/HammerDB-${{ env.HAMMERDB_VERSION }}
+          key: hammerdb-${{ env.HAMMERDB_VERSION }}-lin-ubu22
+
+      - name: Download HammerDB
+        if: steps.hammerdb.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o /tmp/hammerdb.tgz \
+            "https://github.com/TPC-Council/HammerDB/releases/download/v${HAMMERDB_VERSION}/HammerDB-${HAMMERDB_VERSION}-Prod-Lin-UBU22.tar.gz"
+          tar xzf /tmp/hammerdb.tgz -C ~
+
+      - name: The HammerDB smoke
+        env:
+          PGPASSWORD: postgres
+        run: |
+          export XMAKE_FLAGS="--toolchain=clang --cxflags=-resource-dir=$(clang --print-resource-dir)"
+          bytecaskdb-sql-layer/hammerdb/run-gate.sh --smoke \
+            --pg="host=postgres user=postgres dbname=postgres" \
+            --hammerdb-home="$HOME/HammerDB-${HAMMERDB_VERSION}"
