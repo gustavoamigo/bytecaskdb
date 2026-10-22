@@ -26,6 +26,15 @@ TEST_CASE("tprocc: a short mixed run keeps the specification's consistency condi
                    .seed = 7,
                    .rows_per_txn = 500});
   REQUIRE(tprocc::consistency(*db).empty());
+  // HammerDB's NOPM is the change in d_next_o_id: every committed New-Order's.
+  auto next_order_ids = [&] {
+    std::int64_t sum = 0;
+    for (const auto& row : db->execute("SELECT d_next_o_id FROM district WHERE d_w_id >= $1", {std::int64_t{1}}).rows) {
+      sum += std::get<std::int64_t>(row.at(0));
+    }
+    return sum;
+  };
+  const auto ids_before = next_order_ids();
   tprocc::RunOptions opts;
   opts.threads = {4};
   opts.seed = 11;
@@ -45,6 +54,11 @@ TEST_CASE("tprocc: a short mixed run keeps the specification's consistency condi
   CHECK(done == 4 * 100);
   REQUIRE(r.nopm());
   CHECK(*r.nopm() > 0);
+  // Counting a number of transactions measures them all: the committed
+  // ones are the ids New-Order took, its rollbacks none.
+  const auto& n = r.kinds[static_cast<std::size_t>(tprocc::Kind::NewOrder)];
+  CHECK(n.rolled_back <= n.completed);
+  CHECK(static_cast<std::int64_t>(n.completed - n.rolled_back) == next_order_ids() - ids_before);
   for (const auto& bad : tprocc::consistency(*db)) FAIL_CHECK(bad);
   db->close();
 }

@@ -89,6 +89,10 @@ struct KindStats {
   std::uint64_t completed{0};
   std::uint64_t retries{0};    // attempts that ended in SerializationFailure and were rerun
   std::uint64_t abandoned{0};  // still SerializationFailure on the last attempt
+  // Completed by the client's own rollback: New-Order's 1% on an unused
+  // item. In TPM, as HammerDB counts a rollback; not in NOPM, which is
+  // HammerDB's committed New-Orders, the change in d_next_o_id.
+  std::uint64_t rolled_back{0};
   Histogram latency;           // first attempt's start to the completing commit
 };
 
@@ -100,7 +104,8 @@ struct PhaseReport {
   std::int64_t fsyncs{0};
   std::int64_t group_writer_batches{0};
   [[nodiscard]] auto tpm() const -> double;
-  [[nodiscard]] auto nopm() const -> std::optional<double>;  // nullopt while New-Order is not in the mix
+  // Committed New-Orders per minute; nullopt while New-Order is not in the mix.
+  [[nodiscard]] auto nopm() const -> std::optional<double>;
 };
 
 struct RunOptions {
@@ -401,8 +406,8 @@ auto PhaseReport::tpm() const -> double {
 auto PhaseReport::nopm() const -> std::optional<double> {
   const auto in_mix = mix();
   if (std::ranges::find(in_mix, Kind::NewOrder) == in_mix.end()) return std::nullopt;
-  return seconds > 0 ? static_cast<double>(kinds[static_cast<std::size_t>(Kind::NewOrder)].completed) * 60.0 / seconds
-                     : 0.0;
+  const auto& n = kinds[static_cast<std::size_t>(Kind::NewOrder)];
+  return seconds > 0 ? static_cast<double>(n.completed - n.rolled_back) * 60.0 / seconds : 0.0;
 }
 
 auto mix() -> std::vector<Kind> { return {Kind::NewOrder, Kind::Payment, Kind::OrderStatus, Kind::Delivery}; }
@@ -580,8 +585,10 @@ void order_status(const Statements& s, Transaction& t, const OrderStatusInput& i
 
 // New-Order (clause 2.4.2), as HammerDB's client-side driver runs it. An
 // unused item id on the last line, 1% of them, makes the client roll back
-// (clause 2.4.2.3), and that is a completed New-Order.
-void new_order(const Statements& s, Transaction& t, const NewOrderInput& in) {
+// (clause 2.4.2.3): false. As in HammerDB, a line's amount carries the
+// taxes and the discount, which the specification applies to the order's
+// total only.
+auto new_order(const Statements& s, Transaction& t, const NewOrderInput& in) -> bool {
   auto customer = t.execute(s.n1, {in.w, in.d, in.c_id}).rows.at(0);
   auto district = t.execute(s.n2, {in.d, in.w}).rows.at(0);
   const auto o_id = i64(district.at(0));
@@ -596,7 +603,7 @@ void new_order(const Statements& s, Transaction& t, const NewOrderInput& in) {
     auto item = t.execute(s.n4, {line.i_id});
     if (item.rows.empty()) {
       t.rollback();
-      return;
+      return false;
     }
     const auto price = i64(item.rows[0].at(0));
     auto stock = t.execute(s.n5, {line.i_id, line.supply_w}).rows.at(0);
@@ -608,6 +615,7 @@ void new_order(const Statements& s, Transaction& t, const NewOrderInput& in) {
                            stock.at(static_cast<std::size_t>(in.d + 1))});
   }
   (void)t.commit();
+  return true;
 }
 
 // Delivery (clause 2.7.4): each district's oldest undelivered order, in one
@@ -730,13 +738,14 @@ struct Worker {
     const auto start = Clock::now();
     std::uint64_t retries = 0;
     auto completed = false;
+    auto rolled_back = false;
     for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
       try {
         auto t = db.begin();
         switch (k) {
           case Kind::Payment: payment(s, t, pay); break;
           case Kind::OrderStatus: order_status(s, t, os); break;
-          case Kind::NewOrder: new_order(s, t, no); break;
+          case Kind::NewOrder: rolled_back = !new_order(s, t, no); break;
           case Kind::Delivery: delivery(s, t, del); break;
           case Kind::StockLevel: break;
         }
@@ -751,6 +760,7 @@ struct Worker {
     st.retries += retries;
     if (completed) {
       ++st.completed;
+      if (rolled_back) ++st.rolled_back;
       st.latency.add(end - start);
     } else {
       ++st.abandoned;
@@ -850,6 +860,7 @@ void run(Database& db, const RunOptions& opts, const std::function<void(const Ph
         r.kinds[k].completed += w.stats[k].completed;
         r.kinds[k].retries += w.stats[k].retries;
         r.kinds[k].abandoned += w.stats[k].abandoned;
+        r.kinds[k].rolled_back += w.stats[k].rolled_back;
         r.kinds[k].latency.merge(w.stats[k].latency);
       }
     }
@@ -986,12 +997,13 @@ auto consistency(Database& db) -> std::vector<std::string> {
 auto format_report(const PhaseReport& r) -> std::string {
   auto out = std::format("threads {}  run {}  {:.1f} s  TPM {:.0f}  NOPM {}\n", r.threads, r.run, r.seconds, r.tpm(),
                          r.nopm() ? std::format("{:.0f}", *r.nopm()) : std::string{"n/a"});
-  out += std::format("  {:<13}{:>10}{:>9}{:>10}{:>10}{:>10}{:>10}{:>10}\n", "transaction", "completed", "retries",
-                     "abandoned", "p50 us", "p95 us", "p99 us", "max us");
+  out += std::format("  {:<13}{:>10}{:>12}{:>9}{:>10}{:>10}{:>10}{:>10}{:>10}\n", "transaction", "completed",
+                     "rolled back", "retries", "abandoned", "p50 us", "p95 us", "p99 us", "max us");
   for (auto k : mix()) {
     const auto& s = r.kinds[static_cast<std::size_t>(k)];
-    out += std::format("  {:<13}{:>10}{:>9}{:>10}{:>10}{:>10}{:>10}{:>10}\n", kind_name(k), s.completed, s.retries,
-                       s.abandoned, s.latency.quantile(0.50).count(), s.latency.quantile(0.95).count(),
+    out += std::format("  {:<13}{:>10}{:>12}{:>9}{:>10}{:>10}{:>10}{:>10}{:>10}\n", kind_name(k), s.completed,
+                       s.rolled_back, s.retries, s.abandoned, s.latency.quantile(0.50).count(),
+                       s.latency.quantile(0.95).count(),
                        s.latency.quantile(0.99).count(), s.latency.max().count());
   }
   out += std::format("  engine: {} fsyncs, {} group-commit batches\n", r.fsyncs, r.group_writer_batches);
@@ -1006,9 +1018,9 @@ auto json_report(const PhaseReport& r) -> std::string {
   auto first = true;
   for (auto k : mix()) {
     const auto& s = r.kinds[static_cast<std::size_t>(k)];
-    out += std::format(R"({}"{}":{{"completed":{},"retries":{},"abandoned":{},"p50_us":{},"p95_us":{},)"
-                       R"("p99_us":{},"max_us":{}}})",
-                       first ? "" : ",", kind_name(k), s.completed, s.retries, s.abandoned,
+    out += std::format(R"({}"{}":{{"completed":{},"rolled_back":{},"retries":{},"abandoned":{},"p50_us":{},)"
+                       R"("p95_us":{},"p99_us":{},"max_us":{}}})",
+                       first ? "" : ",", kind_name(k), s.completed, s.rolled_back, s.retries, s.abandoned,
                        s.latency.quantile(0.50).count(), s.latency.quantile(0.95).count(),
                        s.latency.quantile(0.99).count(), s.latency.max().count());
     first = false;

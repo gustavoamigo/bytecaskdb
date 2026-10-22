@@ -265,6 +265,11 @@ and shared by them.
   `c_ytd_payment` or `c_payment_cnt`, since it runs HammerDB's statements
   (P9, P10) by decision; nor does New-Order update `s_ytd`, `s_order_cnt`
   or `s_remote_cnt` (N6), or Delivery `c_delivery_cnt` (D7).
+- `ol_amount` is HammerDB's: quantity × price × (1 + `w_tax` + `d_tax`) ×
+  (1 − `c_discount`), which its New-Order computes client-side and in its
+  stored procedures alike. The specification's is quantity × price, with
+  the taxes and the discount applied to the order's total (clause
+  2.4.2.2).
 - Delivery runs as one transaction over the warehouse's ten districts, as
   HammerDB runs it, not deferred (clause 2.7.2).
 - One `Transaction` per TPROC-C transaction, committed with `commit()`.
@@ -275,7 +280,8 @@ and shared by them.
   per transaction type. A transaction still failing after its tenth
   attempt is counted as abandoned and the thread moves on.
 - New-Order's 1% of orders naming an unused item roll back, as the
-  specification requires, and count as completed.
+  specification requires. They count as completed, and so in TPM, as
+  HammerDB counts a rollback, but not in NOPM.
 - Any other error stops the run with a non-zero exit: 23505,
   `TransactionResolutionUnknown`, a constraint, an I/O error. In TPROC-C
   none is expected, so each one is a bug to look at, not a number.
@@ -284,8 +290,10 @@ and shared by them.
 - per transaction type, completed, retries and abandoned, and latency
   p50, p95, p99 and max, from the first attempt's start to the commit that
   completed it;
-- TPM, completed transactions of every type per minute, and NOPM, completed
-  New-Orders per minute, the rolled-back ones included;
+- TPM, completed transactions of every type per minute, rollbacks
+  included, and NOPM, committed New-Orders per minute: HammerDB's
+  definitions, its NOPM being the change in `d_next_o_id`, so the harness's
+  numbers mean what the gate's do;
 - the engine's `fsyncs` and `group_writer_batches` over the measured
   window, read from `stats()` at its start and end, to set beside
   `commit_probe`.
