@@ -8,6 +8,7 @@
 // wait for another caller.
 
 module;
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -79,7 +80,7 @@ struct Message {
   std::string body;
 };
 
-// SetEncoding is SET client_encoding to UTF8, the one SET taken: libpq's
+// SetEncoding is SET client_encoding, the one SET taken: libpq's
 // PQsetClientEncoding sends it, and pgtcl's pg_connect calls that.
 enum class Control { Begin, Commit, Rollback, SetEncoding };
 
@@ -88,7 +89,8 @@ enum class Control { Begin, Commit, Rollback, SetEncoding };
 struct Classified {
   enum class Kind { Empty, Control, Sql } kind{Kind::Empty};
   Control control{Control::Begin};
-  std::string sql;  // Sql: the one statement, without its trailing ';'
+  std::string sql;       // Sql: the one statement, without its trailing ';'
+  std::string encoding;  // SetEncoding: PostgreSQL's name for it
 };
 
 auto upper_words(std::string_view s) -> std::vector<std::string> {
@@ -164,6 +166,26 @@ auto first_statement(std::string_view s, bool& rest_blank) -> std::size_t {
   return end;
 }
 
+// The client encodings taken, by PostgreSQL's name for them: UTF8, with its
+// alias UNICODE, and SQL_ASCII, which PostgreSQL converts nothing for.
+// Matched as PostgreSQL matches a name: any case, punctuation ignored.
+auto client_encoding(std::string_view value) -> std::optional<std::string_view> {
+  std::string norm;
+  for (auto c : value) {
+    if (std::isalnum(static_cast<unsigned char>(c)) != 0) {
+      norm.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+  }
+  if (norm == "utf8" || norm == "unicode") return "UTF8";
+  if (norm == "sqlascii") return "SQL_ASCII";
+  return std::nullopt;
+}
+
+[[noreturn]] void unsupported_encoding(std::string_view value) {
+  throw SessionError("client_encoding \"" + std::string{value} + "\" is not supported: the server speaks UTF8",
+                     "22023");
+}
+
 auto classify(std::string_view text, const char* several_state, std::string_view several_message) -> Classified {
   auto rest_blank = true;
   auto end = first_statement(text, rest_blank);
@@ -198,8 +220,8 @@ auto classify(std::string_view text, const char* several_state, std::string_view
     return {Classified::Kind::Control, Control::Rollback, {}};
   }
   if (w == "SET") {
-    // SET [SESSION] client_encoding {TO | =} 'UTF8': the server speaks UTF8
-    // and nothing else, so only that value is taken.
+    // SET [SESSION] client_encoding {TO | =} 'UTF8': the server speaks UTF8,
+    // so only the encodings client_encoding() takes are.
     std::string spaced;
     for (auto ch : sql) {
       if (ch == '=') {
@@ -211,14 +233,9 @@ auto classify(std::string_view text, const char* several_state, std::string_view
     auto set = upper_words(spaced);
     std::size_t at = set.size() > 1 && set[1] == "SESSION" ? 2 : 1;
     if (set.size() == at + 3 && set[at] == "CLIENT_ENCODING" && (set[at + 1] == "TO" || set[at + 1] == "=")) {
-      std::string norm;
-      for (auto ch : set[at + 2]) {
-        if (ch != '-' && ch != '_') norm.push_back(ch);
-      }
-      if (norm != "UTF8") {
-        throw SessionError("client_encoding \"" + set[at + 2] + "\" is not supported: the server speaks UTF8", "22023");
-      }
-      return {Classified::Kind::Control, Control::SetEncoding, {}};
+      auto encoding = client_encoding(set[at + 2]);
+      if (!encoding) unsupported_encoding(set[at + 2]);
+      return {Classified::Kind::Control, Control::SetEncoding, {}, std::string{*encoding}};
     }
   }
   for (const auto* word : {"SET", "SHOW", "RESET", "PREPARE", "EXECUTE", "DEALLOCATE", "SAVEPOINT", "RELEASE", "COPY",
@@ -258,6 +275,7 @@ auto char_position(std::string_view text, std::int32_t byte) -> std::int32_t {
 struct Prepared {
   Classified::Kind kind{Classified::Kind::Empty};
   Control control{Control::Begin};
+  std::string encoding;            // SetEncoding
   const Statement* stmt{nullptr};  // Sql: from Database::prepare, valid until close
 };
 
@@ -322,15 +340,19 @@ private:
   }
 
   // The next message, from the one held by peek_type() first; nullopt at the
-  // end of the stream.
+  // end of the stream, and from then on: after a FATAL the bytes left are
+  // never read as messages.
   auto next() -> std::optional<Message> {
     if (pending_) return std::exchange(pending_, std::nullopt);
+    if (ended_) return std::nullopt;
     std::string type;
-    if (!read_exact(1, type)) return std::nullopt;
     std::uint32_t len = 0;
-    if (!read_length(len)) return std::nullopt;
-    Message m{type[0], {}};
-    if (!read_exact(len - 4, m.body)) return std::nullopt;
+    Message m{'\0', {}};
+    if (!read_exact(1, type) || !read_length(len) || !read_exact(len - 4, m.body)) {
+      ended_ = true;
+      return std::nullopt;
+    }
+    m.type = type[0];
     return m;
   }
 
@@ -339,6 +361,18 @@ private:
   auto peek_type() -> char {
     if (!pending_) pending_ = next();
     return pending_ ? pending_->type : '\0';
+  }
+
+  // Whether the next message's first byte is here, without waiting for it.
+  auto arrived() -> bool {
+    if (in_.size() > pos_) return true;
+    pollfd p{fd_, POLLIN, 0};
+    return ::poll(&p, 1, 0) > 0;  // readable or at its end: next() tells which
+  }
+
+  // The stream ended: a stop says 57P01, unless a FATAL was already sent.
+  void stream_ended() {
+    if (stopping_.load() && !fatal_sent_) fatal("57P01", "terminating connection due to administrator command");
   }
 
   void flush() {
@@ -379,7 +413,10 @@ private:
   }
   void warning(std::string_view state, std::string_view message) { send_fields('N', "WARNING", state, message, 0); }
 
+  // The session ends after it: nothing more is read or run.
   void fatal(std::string_view state, std::string_view message) {
+    fatal_sent_ = true;
+    ended_ = true;
     send_fields('E', "FATAL", state, message, 0);
     flush();
   }
@@ -505,14 +542,12 @@ private:
       } else if (name == "application_name") {
         application_name_ = std::string{value};
       } else if (name == "client_encoding") {
-        std::string norm;
-        for (auto c : value) {
-          if (c != '-' && c != '_') norm.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-        }
-        if (norm != "utf8") {
+        auto encoding = client_encoding(value);
+        if (!encoding) {
           fatal("22023", "client_encoding \"" + std::string{value} + "\" is not supported: the server speaks UTF8");
           return false;
         }
+        encoding_ = std::string{*encoding};
       } else if (name == "options") {
         if (!value.empty()) {
           fatal("0A000", "startup options are not supported");
@@ -552,7 +587,7 @@ private:
     };
     status("server_version", "17.0");
     status("server_encoding", "UTF8");
-    status("client_encoding", "UTF8");
+    status("client_encoding", encoding_);
     status("DateStyle", "ISO, MDY");
     status("IntervalStyle", "postgres");
     status("TimeZone", "UTC");
@@ -597,8 +632,12 @@ private:
     refuse_if_failed();
   }
 
-  // BEGIN, COMMIT or ROLLBACK; returns the command tag.
-  auto run_control(Control c) -> std::string {
+  // A transaction ended: its portals go with it, as in PostgreSQL.
+  void end_transaction() noexcept { portals_.clear(); }
+
+  // BEGIN, COMMIT, ROLLBACK or SET client_encoding; returns the command tag.
+  // Ending a block drops every portal: a caller holds none across it.
+  auto run_control(Control c, const std::string& encoding) -> std::string {
     switch (c) {
       case Control::Begin:
         if (in_block_) {
@@ -616,6 +655,7 @@ private:
         failed_ = false;
         return "BEGIN";
       case Control::Commit: {
+        end_transaction();
         std::optional<Transaction> t;
         if (in_block_) {
           in_block_ = false;
@@ -636,12 +676,14 @@ private:
       }
       case Control::SetEncoding:
         refuse_if_failed();
+        encoding_ = encoding;
         out_.begin('S');
         out_.cstr("client_encoding");
-        out_.cstr("UTF8");
+        out_.cstr(encoding_);
         out_.end();
         return "SET";
       case Control::Rollback:
+        end_transaction();
         if (in_block_) {
           if (txn_) txn_->rollback();
           txn_.reset();
@@ -664,7 +706,7 @@ private:
     for (;;) {
       auto m = next();
       if (!m) {
-        if (stopping_.load()) fatal("57P01", "terminating connection due to administrator command");
+        stream_ended();
         return;
       }
       if (m->type == 'X') return;
@@ -700,23 +742,25 @@ private:
     }
   }
 
+  // A Query inside an extended block, before its Sync, joins the block's
+  // implicit transaction, which commits when the Query ends, as in
+  // PostgreSQL.
   void simple(Body& body) {
     auto text = std::string{body.cstr()};
-    if (implicit_) {  // a Query inside an extended block, before its Sync
-      implicit_->rollback();
-      implicit_.reset();
-    }
     try {
       auto c = classify(text, "0A000", "several statements in one query are not supported");
       switch (c.kind) {
         case Classified::Kind::Empty: simple_reply('I'); break;
-        case Classified::Kind::Control: complete(run_control(c.control)); break;
+        case Classified::Kind::Control: complete(run_control(c.control, c.encoding)); break;
         case Classified::Kind::Sql: {
           last_text_ = c.sql;
           refuse_sql_if_failed(c.sql);
           const auto& stmt = db_.prepare(c.sql);
           if (!stmt.params().empty()) throw SessionError("there is no parameter $1", "42P02");
-          auto rows = in_block_ ? txn_->execute(stmt, {}) : db_.execute(stmt, {});
+          if (implicit_ && stmt.is_ddl()) refuse_ddl_beside_others();
+          auto rows = in_block_   ? txn_->execute(stmt, {})
+                      : implicit_ ? implicit_->execute(stmt, {})
+                                  : db_.execute(stmt, {});
           if (stmt.command() == Command::Select) {
             std::vector<ResultColumn> cols;
             for (std::size_t i = 0; i < rows.columns.size(); ++i) cols.push_back({rows.columns[i], rows.types.at(i)});
@@ -727,12 +771,18 @@ private:
           break;
         }
       }
+      if (implicit_) {
+        auto t = std::move(*implicit_);
+        implicit_.reset();
+        (void)t.commit();
+      }
     } catch (const ConnectionGone&) {
       throw;
     } catch (...) {
       report(last_text_);
       fail_block();
     }
+    if (!in_block_) end_transaction();
     last_text_.clear();
     ready();
   }
@@ -749,6 +799,7 @@ private:
         report({});
       }
     }
+    if (!in_block_) end_transaction();  // outside BEGIN, Sync ends the block's transaction
     ready();
   }
 
@@ -773,7 +824,7 @@ private:
     }
     last_text_ = text;
     auto c = classify(text, "42601", "cannot insert multiple commands into a prepared statement");
-    Prepared p{c.kind, c.control, nullptr};
+    Prepared p{c.kind, c.control, c.encoding, nullptr};
     if (c.kind == Classified::Kind::Sql) {
       last_text_ = c.sql;
       refuse_sql_if_failed(c.sql);
@@ -870,7 +921,8 @@ private:
       return;
     }
     if (p.kind == Classified::Kind::Control) {
-      complete(run_control(p.control));
+      auto [control, encoding] = std::pair{p.control, p.encoding};  // run_control may drop the portal
+      complete(run_control(control, encoding));
       return;
     }
     last_text_ = p.stmt->sql();
@@ -880,20 +932,51 @@ private:
       rows = txn_->execute(*p.stmt, portal.params);
     } else if (implicit_) {
       rows = implicit_->execute(*p.stmt, portal.params);
-    } else if (peek_type() == 'S') {
+    } else if (auto flush_after = false; next_is_sync(flush_after)) {
       // The block's one statement, as PQexecParams sends it: autocommit,
       // with its conflict retry, as a simple Query runs it.
       rows = db_.execute(*p.stmt, portal.params);
     } else {
       // Two or more: PostgreSQL's implicit transaction, committed at Sync.
-      if (p.stmt->is_ddl()) {
-        throw SessionError("DDL in a block of several statements is not supported: send it alone", "0A000");
-      }
+      if (p.stmt->is_ddl()) refuse_ddl_beside_others();
       implicit_.emplace(db_.begin());
       rows = implicit_->execute(*p.stmt, portal.params);
+      reply(*p.stmt, rows);
+      if (flush_after) flush();
+      return;
     }
+    reply(*p.stmt, rows);
+  }
+
+  void reply(const Statement& stmt, const Rows& rows) {
     data_rows(rows);
-    complete(command_tag(p.stmt->command(), rows));
+    complete(command_tag(stmt.command(), rows));
+  }
+
+  [[noreturn]] static void refuse_ddl_beside_others() {
+    throw SessionError("DDL in a block of several statements is not supported: send it alone", "0A000");
+  }
+
+  // Whether the message after this Execute, past any Flush, is Sync. A Flush
+  // is looked past only when the message after it is already here: a client
+  // that sent Flush may be waiting for this Execute's reply, which is then
+  // sent at once (`flush_after`), and the statement runs in the implicit
+  // transaction. The stream's end runs nothing: no Sync would commit it.
+  auto next_is_sync(bool& flush_after) -> bool {
+    for (;;) {
+      auto t = peek_type();
+      if (t == '\0') {
+        stream_ended();
+        throw ConnectionGone{};
+      }
+      if (t != 'H') return t == 'S';
+      if (!arrived()) {
+        flush_after = true;
+        return false;
+      }
+      pending_.reset();  // this Flush: Sync, or the flush after the reply, covers it
+      flush_after = true;
+    }
   }
 
   void close(Body& body) {
@@ -918,6 +1001,7 @@ private:
   std::optional<Message> pending_;
   Out out_;
   std::string application_name_;
+  std::string encoding_{"UTF8"};  // client_encoding, as ParameterStatus reports it
   std::string last_text_;  // the statement an error's position is into
   std::map<std::string, Prepared> statements_;
   std::map<std::string, Portal> portals_;
@@ -926,6 +1010,8 @@ private:
   bool in_block_{false};                 // inside BEGIN
   bool failed_{false};                   // the explicit block failed: E until COMMIT or ROLLBACK
   bool skip_to_sync_{false};
+  bool ended_{false};       // the stream ended, or a FATAL was sent: nothing more is read
+  bool fatal_sent_{false};
 };
 
 }  // namespace

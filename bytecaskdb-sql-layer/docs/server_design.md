@@ -147,8 +147,14 @@ calls `shutdown(fd, SHUT_RD)` on every registered connection, so a thread
 blocked in `read` wakes at once, idle or not. A statement in flight finishes
 first: its reply still goes out, since the write side stays open. The
 thread then sends `FATAL 57P01` (`admin_shutdown`), rolls back an open
-transaction and exits. When every thread has joined, the server calls
-`Database::close()`.
+transaction and exits. A connection still open after one second is one
+whose client stopped reading: its thread is blocked in `send`, which only
+`shutdown(fd, SHUT_RDWR)` wakes, so the server shuts both sides of every
+connection left. Those threads end without the `57P01`. When every thread
+has ended, the server calls `Database::close()`.
+
+**After a `FATAL`** the session ends: it reads no more messages and runs
+nothing more. After startup, an invalid message length or type is `FATAL`.
 
 ## Startup
 
@@ -166,8 +172,10 @@ transaction and exits. When every thread has joined, the server calls
    - `database` must be the served name, else `FATAL 3D000`
      (`invalid_catalog_name`).
    - `application_name` is kept and reported back.
-   - `client_encoding` must be `UTF8` (any case, `-` or `_` allowed), else
-     `FATAL 22023`. There is no conversion.
+   - `client_encoding` must be `UTF8`, its alias `UNICODE`, or `SQL_ASCII`,
+     matched as PostgreSQL matches a name (any case, punctuation ignored),
+     else `FATAL 22023`. There is no conversion: PostgreSQL converts
+     nothing for `SQL_ASCII` either.
    - `options` must be empty.
    - Any other parameter is `FATAL 42704` (`undefined_object`), as
      PostgreSQL refuses an unknown setting.
@@ -180,7 +188,8 @@ transaction and exits. When every thread has joined, the server calls
 4. **`ParameterStatus`**:
    - `server_version` `17.0`: the dialect the statements are proven
      against, which libpq and psycopg parse;
-   - `server_encoding` and `client_encoding` `UTF8`;
+   - `server_encoding` `UTF8`, and `client_encoding` the encoding asked
+     for (`UTF8` for `UNICODE`), `UTF8` when none was;
    - `DateStyle` `ISO, MDY`, `IntervalStyle` `postgres`, `TimeZone` `UTC`;
    - `integer_datetimes` `on`, `standard_conforming_strings` `on`;
    - `is_superuser` `off`, `session_authorization` the user;
@@ -196,6 +205,11 @@ A session holds:
   which is valid until close;
 - the named portals;
 - the unnamed statement and the unnamed portal.
+
+A portal lasts until its transaction ends, as in PostgreSQL: at `COMMIT` or
+`ROLLBACK` inside `BEGIN`, and at `Sync` or the end of a `Query` outside it.
+An `Execute` of a portal that ended is `34000`, and its name can be bound
+again.
 
 Closing the connection, with `Terminate` or without, rolls back an open
 transaction.
@@ -243,10 +257,10 @@ exposes as calls, not as statements.
 - **`ROLLBACK`** calls `rollback()`; the tag is `ROLLBACK`. With no
   transaction open it is `WARNING 25P01`.
 
-- **`SET [SESSION] client_encoding {TO | =} 'UTF8'`**, any spelling of
-  UTF8, is the one `SET` taken: the tag is `SET`, with a `ParameterStatus`
-  for `client_encoding`. Another encoding is `22023`, and every other `SET`
-  is `0A000`.
+- **`SET [SESSION] client_encoding {TO | =} 'UTF8'`**, or another encoding
+  startup takes, is the one `SET` taken: the tag is `SET`, with a
+  `ParameterStatus` for `client_encoding`. Another encoding is `22023`, and
+  every other `SET` is `0A000`.
 
 The extended protocol accepts these words too: `Parse` of `BEGIN` makes a
 statement the session runs at `Execute`.
@@ -274,6 +288,12 @@ allowed. An empty one gets `EmptyQueryResponse`. Several statements are
 $1". A
 failed statement gets `ErrorResponse`; then, as after every `Query`, the
 server sends `ReadyForQuery`.
+
+A `Query` that arrives after `Execute`s outside `BEGIN`, before their
+`Sync`, joins their implicit transaction, as in PostgreSQL: it runs in it,
+and the transaction commits when the `Query` ends. An error in the `Query`
+rolls the whole block back. A DDL `Query` there is `0A000`, as a DDL beside
+other statements is.
 
 ## Extended query
 
@@ -328,10 +348,16 @@ message.
     `Sync`, as now. Nothing in the block is committed.
 
 Reading ahead never waits on a client that keeps to the protocol: a client
-only expects output after a `Sync` or a `Flush`, so it has sent one. A
-`Flush` counts as "anything else". libpq's one statement per `Sync` gets
-autocommit's retry, and a pipelining client (psycopg's pipeline mode,
-JDBC's batches) gets PostgreSQL's semantics.
+only expects output after a `Sync` or a `Flush`, so it has sent one. The
+server looks past a `Flush` when the message after it has already arrived:
+`Execute`, `Flush`, `Sync` sent together is one statement. When nothing
+follows the `Flush` yet, the client may be waiting for this `Execute`'s
+reply, so the server cannot wait to see whether `Sync` comes next: the
+statement runs in the implicit transaction and its reply is sent at once.
+libpq's one statement per `Sync` gets autocommit's retry, and a pipelining
+client (psycopg's pipeline mode, JDBC's batches) gets PostgreSQL's
+semantics. If the stream ends instead, the statement does not run: no
+`Sync` would have committed it.
 
 A `BEGIN` inside the block makes it explicit, as PostgreSQL does: the open
 `Transaction` carries on past `Sync` until `COMMIT` or `ROLLBACK`.
@@ -706,7 +732,8 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 
 ## Known differences from PostgreSQL
 
-- A DDL in an extended-query block with other statements is `0A000`.
+- A DDL in an extended-query block with other statements is `0A000`, and
+  so is one followed by a `Flush` with nothing after it yet.
 - Parameter OIDs from the client are not used.
 - Binary format, for parameters and results, is `0A000`.
 - A compared or added `DECIMAL` parameter finer than its column's scale, and `NaN`,

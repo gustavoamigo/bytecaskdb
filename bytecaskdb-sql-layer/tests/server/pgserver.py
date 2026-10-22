@@ -31,13 +31,16 @@ def free_port() -> int:
 class Server:
     """A server on a directory of its own, on a free loopback port."""
 
-    def __init__(self, directory: str, database: str = "proof", max_connections: int | None = None):
+    def __init__(self, directory: str, database: str | None = "proof", max_connections: int | None = None):
+        """`database` None leaves the name to the server's default."""
         binary = server_binary()
         assert binary, f"{SERVER_ENV} is not set"
         self.directory = directory
         self.database = database
         self.port = free_port()
-        args = [binary, "--dir", directory, "--listen", f"127.0.0.1:{self.port}", "--database", database]
+        args = [binary, "--dir", directory, "--listen", f"127.0.0.1:{self.port}"]
+        if database is not None:
+            args += ["--database", database]
         if max_connections is not None:
             args += ["--max-connections", str(max_connections)]
         self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)

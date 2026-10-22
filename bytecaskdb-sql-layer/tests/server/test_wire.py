@@ -16,6 +16,7 @@ import shutil
 import socket
 import struct
 import tempfile
+import time
 
 import pytest
 
@@ -78,6 +79,7 @@ def execute(portal: str = "", max_rows: int = 0) -> bytes:
 
 
 SYNC = message(b"S")
+FLUSH = message(b"H")
 TERMINATE = message(b"X")
 
 
@@ -248,6 +250,27 @@ def test_startup_refusals_are_fatal(server, packet, state):
     assert c.closed()
 
 
+@pytest.mark.parametrize("encoding, name", [("UTF8", "UTF8"), ("utf-8", "UTF8"), ("UNICODE", "UTF8"),
+                                            ("SQL_ASCII", "SQL_ASCII"), ("sql-ascii", "SQL_ASCII")])
+def test_utf8_its_alias_and_sql_ascii_are_the_client_encodings_taken(server, encoding, name):
+    """psql in a C locale asks for SQL_ASCII, which PostgreSQL converts nothing for."""
+    out = Client(server).start(client_encoding=encoding)
+    assert status(out) == "I"
+    assert (b"S", b"client_encoding\0" + name.encode() + b"\0") in out
+
+
+def test_the_default_database_name_is_the_directory_s_last_component():
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory + "/", database=None)
+    try:
+        assert status(Client(s).start(database=os.path.basename(directory))) == "I"
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 def test_the_connection_past_the_limit_is_refused_53300():
     if not server_binary():
         pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
@@ -284,14 +307,16 @@ def test_simple_query_refusals_and_the_empty_query(server):
     assert [b for k, b in c.until_ready() if k == b"C"] == [b"DROP TABLE\0"]
 
 
-def test_set_client_encoding_to_utf8_is_the_one_set_taken(server):
+def test_set_client_encoding_is_the_one_set_taken(server):
     """pgtcl's pg_connect calls PQsetClientEncoding, which sends it."""
     c = connect(server)
-    for sql in ("set client_encoding to 'UTF8'", "SET client_encoding = 'utf-8'", "SET SESSION client_encoding TO UTF8"):
+    for sql, name in (("set client_encoding to 'UTF8'", "UTF8"), ("SET client_encoding = 'utf-8'", "UTF8"),
+                      ("SET SESSION client_encoding TO UTF8", "UTF8"), ("SET client_encoding TO UNICODE", "UTF8"),
+                      ("SET client_encoding TO 'SQL_ASCII'", "SQL_ASCII")):
         c.send(query(sql))
         out = c.until_ready()
         assert [b for k, b in out if k == b"C"] == [b"SET\0"], (sql, out)
-        assert (b"S", b"client_encoding\0UTF8\0") in out
+        assert (b"S", b"client_encoding\0" + name.encode() + b"\0") in out
     c.send(query("SET client_encoding TO 'LATIN1'"))
     assert states(c.until_ready()) == ["22023"]
     c.send(query("SET datestyle TO 'ISO'"))
@@ -420,6 +445,75 @@ def test_executes_before_one_sync_are_one_implicit_transaction(server):
     assert keys(c) == ["1", "2"]
 
 
+def test_a_query_inside_an_extended_block_joins_its_transaction_and_commits_it(server):
+    c = connect(server)
+    table(c)
+    insert = "INSERT INTO t VALUES ($1, $2)"
+    # A Query takes no parameters, so the layer runs none but DDL and the
+    # control words in one; an empty one ends the block the same way.
+    c.send(parse(insert), bind(["1", "1"]), execute(), query(""))
+    out = c.until_ready()
+    assert states(out) == [] and status(out) == "I"
+    assert kinds(out) == b"12CIZ"
+    c.send(SYNC)
+    assert status(c.until_ready()) == "I"
+    assert keys(c) == ["1"]
+    # The Query fails: the Execute before it is rolled back with it.
+    for failing, state in (("SELECT k FROM t WHERE k = 1", "42601"), ("CREATE TABLE w (k BIGINT PRIMARY KEY)", "0A000")):
+        c.send(parse(insert), bind(["2", "2"]), execute(), query(failing))
+        out = c.until_ready()
+        assert states(out) == [state] and status(out) == "I", failing
+        c.send(SYNC)
+        c.until_ready()
+        assert keys(c) == ["1"]
+
+
+def test_execute_flush_sync_is_one_statement(server):
+    c = connect(server)
+    c.send(parse("CREATE TABLE u (k BIGINT PRIMARY KEY)"), bind([]), execute(), FLUSH, SYNC)
+    out = c.until_ready()
+    assert states(out) == [] and [b for k, b in out if k == b"C"] == [b"CREATE TABLE\0"]
+    # A client that waits after Flush gets the reply before it sends Sync.
+    c.send(parse("INSERT INTO u VALUES ($1)"), bind(["1"]), execute(), FLUSH)
+    assert kinds([c.message() for _ in range(3)]) == b"12C"
+    c.send(SYNC)
+    assert status(c.until_ready()) == "I"
+    assert data(run(c, "SELECT k FROM u WHERE k = $1", ["1"])) == [["1"]]
+
+
+def test_portals_end_with_their_transaction(server):
+    c = connect(server)
+    table(c)
+    c.send(query("BEGIN"))
+    c.until_ready()
+    c.send(parse("SELECT k FROM t WHERE k = $1", "s"), bind(["1"], "s", "p"), SYNC)
+    c.until_ready()
+    c.send(execute("p"), SYNC)  # inside BEGIN a portal outlives Sync
+    assert states(c.until_ready()) == []
+    c.send(query("COMMIT"))
+    c.until_ready()
+    c.send(execute("p"), SYNC)
+    assert states(c.until_ready()) == ["34000"]
+    c.send(bind(["1"], "s", "p"), execute("p"), SYNC)  # the name binds again in a new transaction
+    assert states(c.until_ready()) == []
+    c.send(execute("p"), SYNC)  # outside BEGIN, the Sync ended its transaction
+    assert states(c.until_ready()) == ["34000"]
+
+
+def test_a_bad_message_length_is_fatal_and_nothing_after_it_runs(server):
+    c = connect(server)
+    table(c)
+    c.send(parse("INSERT INTO t VALUES ($1, $2)"), bind(["1", "1"]), execute(),
+           b"Q" + struct.pack("!i", 2), query("INSERT INTO t VALUES (2, 2)"), SYNC)
+    out = []
+    while not out or out[-1][0] != b"E":
+        out.append(c.message())
+    f = fields(out[-1][1])
+    assert (f["S"], f["C"]) == ("FATAL", "08P01")
+    assert c.closed()
+    assert keys(connect(server)) == []
+
+
 def test_ddl_runs_alone_and_is_refused_beside_another_statement(server):
     c = connect(server)
     table(c)
@@ -449,6 +543,38 @@ def test_shutdown_sends_57p01_to_an_idle_connection():
         assert s.stop() == 0
         kind, body = c.message()
         assert kind == b"E" and fields(body)["C"] == "57P01"
+    finally:
+        s.stop()
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_a_stop_drops_a_client_that_stopped_reading():
+    """Its send blocks on a full socket; the stop still ends and closes the database."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_wire_")
+    s = Server(directory)
+    try:
+        c = connect(s)
+        c.send(query("CREATE TABLE big (k INTEGER PRIMARY KEY, v VARCHAR(2000))"))
+        assert states(c.until_ready()) == []
+        value = "x" * 2000
+        for batch in range(10):  # 40 MB: more than both sockets' buffers hold
+            rows = range(batch * 2000, (batch + 1) * 2000)
+            c.send(query("BEGIN"), parse("INSERT INTO big VALUES ($1, $2)"),
+                   *[m for k in rows for m in (bind([str(k), value]), execute())], SYNC, query("COMMIT"))
+            for _ in range(3):
+                assert states(c.until_ready()) == []
+        c.send(parse("SELECT k, v FROM big WHERE k >= $1"), bind(["0"]), execute(), SYNC)  # and never read
+        time.sleep(1)
+        started = time.monotonic()
+        assert s.stop() == 0
+        assert time.monotonic() - started < 15
+        again = Server(directory)
+        try:
+            assert data(run(connect(again), "SELECT k FROM big WHERE k = $1", ["19999"])) == [["19999"]]
+        finally:
+            again.stop()
     finally:
         s.stop()
         shutil.rmtree(directory, ignore_errors=True)
