@@ -15,11 +15,11 @@ protocol comes first, as a thin stateful front over the embedded API. gRPC
 stays in #494, after this slice.
 
 Names: the benchmark is HammerDB's TPROC-C, and this design uses that name
-for the layer's files and binaries. The harness lands as `sql_layer_tpcc`
-and `harness/tpcc.cppm` with #543, which this PR follows. Then one rename PR
+for the layer's files and binaries. The harness is on main as
+`sql_layer_tpcc` and `harness/tpcc.cppm` (#543). A rename PR in progress
 makes them `sql_layer_tprocc` and `harness/tprocc.cppm`, and retitles
 `testing_design.md`'s section *The TPROC-C harness*. This design uses those
-names, and builds after both.
+names, and builds after the rename.
 HammerDB's own identifiers, `dbset bm TPC-C` and `diset tpcc …`, are the
 tool's and stay.
 
@@ -350,8 +350,8 @@ A result column's type is the one the compiler gives it
 
 Unconstrained `numeric` is OID 1700 with modifier -1, and its text has the
 input's scale: `123.45` for a sum of `DECIMAL(6, 2)`. `SqlType` writes it
-as a `DECIMAL` of precision 0 at that scale. Slice 4, which adds `SUM`,
-gives the compiler that type.
+as a `DECIMAL` of precision 0 at that scale, the type slice 4's compiler
+gives `SUM`.
 
 **Output** is PostgreSQL's text form, with the `ParameterStatus` settings
 above:
@@ -539,9 +539,9 @@ them. `sql_layer_tprocc statements` prints the harness's, and
 `scripts/check_driver_statements.py` (in the layer) fails CI if the
 script's set differs.
 
-The script runs every transaction type. Delivery and Stock-Level wait on
-the front end's slices 4 and 5 (`frontend_design.md`, *Slices*). Until
-they land, the run script's `--mix` limits the script to the types the
+The script runs every transaction type. Stock-Level waits on the front
+end's slice 5 (`frontend_design.md`, *Slices*). Until
+it lands, the run script's `--mix` limits the script to the types the
 layer runs, and the gate is the full mix.
 
 **The same script against PostgreSQL 17.** The statements are
