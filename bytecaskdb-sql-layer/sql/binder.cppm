@@ -45,11 +45,14 @@ struct Expr {
   std::optional<std::int64_t> constant;
 };
 
-// column <op> parameter, normalised so the column is on the left.
+// column <op> parameter, normalised so the column is on the left; or
+// column <op> parameter + offset, a computed operand: an INTEGER, as
+// PostgreSQL types $n ± an integer literal, compared with an INTEGER column.
 struct Compare {
   ast::Compare::Op op;
   std::uint32_t col_id;
   std::uint32_t param;
+  std::optional<std::int64_t> offset;  // the literal added, negated for -
 };
 
 struct Insert {
@@ -65,6 +68,8 @@ struct Insert {
 struct Aggregate {
   ast::Expr::Fn fn{ast::Expr::Fn::Count};
   std::optional<std::uint32_t> col_id;  // none for COUNT(*)
+  bool distinct{false};                 // COUNT(DISTINCT column)
+  std::uint32_t side{0};                // a join's: the table col_id is of
 };
 
 struct OrderItem {
@@ -99,8 +104,14 @@ struct JoinColumn {
   std::uint32_t col_id;
 };
 
+// A column of the first table equal to one of the second: the join's
+// condition. Both of one SQL type.
+struct JoinOn {
+  std::uint32_t col[2];  // by side
+};
+
 // A SELECT of two tables. Each WHERE conjunct compares a column of one of
-// them with a parameter; none joins a column to a column yet.
+// them with a parameter, or a column of each by equality.
 struct Join {
   const Table* table;   // the first table in FROM
   const Table* second;
@@ -108,6 +119,8 @@ struct Join {
   std::vector<Compare> where[2];  // each side's conjuncts, in WHERE order
   bool ordered{false};            // has an ORDER BY, which no join plan gives yet
   std::optional<std::int64_t> limit;
+  std::vector<JoinOn> on;
+  std::optional<Aggregate> aggregate;  // the one aggregate, alone in the select list
 };
 
 // DDL binds to the catalog's statement values: names checked, types and
@@ -428,9 +441,13 @@ public:
   // MIN of a REAL or DOUBLE PRECISION column is later, and of a string or
   // bytes column outside the MVP (docs/frontend_design.md, *Aggregates*).
   static auto aggregate(const Table& t, const ast::Expr& e) -> Aggregate {
+    if (e.column.empty()) return Aggregate{e.fn, std::nullopt, false, 0};
+    return aggregate(*column(t, e), e);
+  }
+
+  static auto aggregate(const Column& col, const ast::Expr& e) -> Aggregate {
     using Fn = ast::Expr::Fn;
-    if (e.column.empty()) return Aggregate{e.fn, std::nullopt};
-    const auto* c = column(t, e);
+    const auto* c = &col;
     auto temporal = c->sql.kind == SqlKind::Date || c->sql.kind == SqlKind::Timestamp || c->sql.kind == SqlKind::Time;
     if (e.fn == Fn::Sum && !exact_number(*c)) {
       throw SqlError{"SUM of a " + sql_type_name(c->sql) + " column is not supported", e.pos};
@@ -438,7 +455,7 @@ public:
     if (e.fn == Fn::Min && !exact_number(*c) && !temporal) {
       throw SqlError{"MIN of a " + sql_type_name(c->sql) + " column is not supported", e.pos};
     }
-    return Aggregate{e.fn, c->id};
+    return Aggregate{e.fn, c->id, e.distinct, 0};
   }
 
   // An integer literal added to or subtracted from `c`, in c's
@@ -513,22 +530,43 @@ public:
     return out;
   }
 
-  // One WHERE conjunct as column <op> parameter, the column resolved by
-  // `resolve`.
+  // A comparison's operand other than a column: a parameter, or $n ± an
+  // integer literal.
+  static auto operand(const ast::Expr& e) -> bool {
+    using K = ast::Expr::Kind;
+    if (e.kind == K::Param) return true;
+    return (e.kind == K::Add || e.kind == K::Sub) && e.lhs->kind == K::Param && e.rhs->kind == K::Const;
+  }
+
+  // One WHERE conjunct as column <op> operand, the column resolved by
+  // `resolve`. In $n ± k, $n and the sum are INTEGERs, as PostgreSQL types
+  // an unknown $n beside an integer literal; the column compared with them
+  // is an INTEGER, so the sum is compared as one, and k must fit one.
   auto compare(const ast::Compare& w, const auto& resolve) -> Compare {
     const auto* col = &w.lhs;
-    const auto* param = &w.rhs;
+    const auto* rhs = &w.rhs;
     auto op = w.op;
-    if (col->kind == ast::Expr::Kind::Param && param->kind == ast::Expr::Kind::Column) {
-      std::swap(col, param);
+    if (operand(*col) && rhs->kind == ast::Expr::Kind::Column) {
+      std::swap(col, rhs);
       op = mirrored(op);
     }
-    if (col->kind != ast::Expr::Kind::Column || param->kind != ast::Expr::Kind::Param) {
+    if (col->kind != ast::Expr::Kind::Column || !operand(*rhs)) {
       throw SqlError{std::string{w.on ? "ON" : "WHERE"} + " must compare a column with a parameter", w.pos};
     }
     auto [table, c] = resolve(*col);
-    use_param(param->param, c->type, param->pos, *c, table, Use::Compared);
-    return Compare{op, c->id, param->param};
+    if (rhs->kind == ast::Expr::Kind::Param) {
+      use_param(rhs->param, c->type, rhs->pos, *c, table, Use::Compared);
+      return Compare{op, c->id, rhs->param, std::nullopt};
+    }
+    if (c->sql.kind != SqlKind::Integer) {
+      throw SqlError{"$n + n and $n - n are supported only compared with an INTEGER column yet", rhs->pos};
+    }
+    auto k = rhs->rhs->constant;
+    if (!std::in_range<std::int32_t>(k)) {
+      throw SqlError{"an integer literal past INTEGER is not supported here yet", rhs->rhs->pos};
+    }
+    use_param(rhs->lhs->param, c->type, rhs->lhs->pos, *c, table, Use::Compared);
+    return Compare{op, c->id, rhs->lhs->param, rhs->kind == ast::Expr::Kind::Add ? k : -k};
   }
 
   // $1 < x is x > $1.
@@ -543,10 +581,15 @@ public:
     return op;
   }
 
-  // A join's WHERE, split by the side each conjunct's column is of. A
-  // comparison of two columns, the join on a column, is slice 5's.
-  void where(const Table* (&sides)[2], const std::vector<ast::Compare>& in, std::vector<Compare> (&out)[2]) {
+  // A join's WHERE, split by the side each conjunct's column is of; a
+  // comparison of two columns, one of each table, goes to `on`.
+  void where(const Table* (&sides)[2], const std::vector<ast::Compare>& in, std::vector<Compare> (&out)[2],
+             std::vector<JoinOn>& on) {
     for (const auto& w : in) {
+      if (w.lhs.kind == ast::Expr::Kind::Column && w.rhs.kind == ast::Expr::Kind::Column) {
+        on.push_back(join_on(sides, w));
+        continue;
+      }
       std::uint32_t side = 0;
       auto c = compare(w, [&](const ast::Expr& e) {
         auto [s, col] = column(sides, e);
@@ -557,22 +600,61 @@ public:
     }
   }
 
-  // A SELECT of two tables. No aggregate and no FOR UPDATE on one yet; its
-  // ORDER BY is the planner's to refuse.
+  // A column of one table equal to a column of the other, of one SQL type.
+  static auto join_on(const Table* (&sides)[2], const ast::Compare& w) -> JoinOn {
+    auto [ls, lc] = column(sides, w.lhs);
+    auto [rs, rc] = column(sides, w.rhs);
+    if (ls == rs) throw SqlError{"comparing two columns of one table is not supported yet", w.pos};
+    if (w.op != ast::Compare::Op::Eq) throw SqlError{"a join compares two columns with = only yet", w.pos};
+    if (compared_type(lc->sql).identity != compared_type(rc->sql).identity) {
+      throw SqlError{"comparing " + lc->name + " (" + sql_type_name(lc->sql) + ") with " + rc->name + " (" +
+                         sql_type_name(rc->sql) + ") is not supported: a join compares columns of one type",
+                     w.pos};
+    }
+    JoinOn j{};
+    j.col[ls] = lc->id;
+    j.col[rs] = rc->id;
+    return j;
+  }
+
+  // A SELECT of two tables. No FOR UPDATE on one yet; its ORDER BY is the
+  // planner's to refuse, unless an aggregate makes it 42803.
   auto join(const ast::Select& s) -> Join {
-    Join out{table(s.table, s.table_pos), table(s.join, s.join_pos), {}, {}, !s.order_by.empty(), s.limit};
+    Join out{table(s.table, s.table_pos), table(s.join, s.join_pos), {}, {}, !s.order_by.empty(), s.limit, {}, {}};
     if (out.table == out.second) throw SqlError{"a table joined with itself is not supported", s.pos};
     if (s.for_update) throw SqlError{"FOR UPDATE on a join is not supported yet", s.pos};
     const Table* sides[2]{out.table, out.second};
-    where(sides, s.where, out.where);
+    where(sides, s.where, out.where, out.on);
+    std::optional<std::pair<const Table*, const ast::Expr*>> bare;  // a column beside an aggregate: 42803
     for (const auto& e : s.targets) {
-      if (e.kind == ast::Expr::Kind::Aggregate) throw SqlError{"an aggregate on a join is not supported yet", e.pos};
+      if (e.kind == ast::Expr::Kind::Aggregate) {
+        if (out.aggregate) throw SqlError{"only one aggregate per SELECT is supported", e.pos};
+        if (e.column.empty()) {
+          out.aggregate = Aggregate{e.fn, std::nullopt, false, 0};
+          continue;
+        }
+        auto [side, c] = column(sides, e);
+        out.aggregate = aggregate(*c, e);
+        out.aggregate->side = side;
+        continue;
+      }
       if (e.kind != ast::Expr::Kind::Column) throw SqlError{"only columns and aggregates can be selected", e.pos};
       auto [side, c] = column(sides, e);
       out.targets.push_back({side, c->id});
+      bare = {sides[side], &e};
     }
-    for (const auto& o : s.order_by) (void)column(sides, column_ref(o));
+    if (out.aggregate && bare) ungrouped(*bare->first, bare->second->column, bare->second->pos);
+    for (const auto& o : s.order_by) {
+      auto [side, c] = column(sides, column_ref(o));
+      if (out.aggregate) ungrouped(*sides[side], c->name, o.pos);
+    }
     return out;
+  }
+
+  // 42803, in PostgreSQL's words.
+  [[noreturn]] static void ungrouped(const Table& t, const std::string& col, std::int32_t pos) {
+    throw SqlError{"column \"" + t.name + "." + col + "\" must appear in the GROUP BY clause or be used in an aggregate function",
+                   pos};
   }
 
   // Every parameter from $1 to the highest used must have a type.
@@ -717,18 +799,12 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
             out.targets.push_back(Binder::column(*t, e)->id);
             bare = &e;
           }
-          // 42803, in PostgreSQL's words.
-          auto ungrouped = [&] [[noreturn]] (const std::string& col, std::int32_t pos) {
-            throw SqlError{"column \"" + t->name + "." + col +
-                               "\" must appear in the GROUP BY clause or be used in an aggregate function",
-                           pos};
-          };
-          if (out.aggregate && bare != nullptr) ungrouped(bare->column, bare->pos);
+          if (out.aggregate && bare != nullptr) Binder::ungrouped(*t, bare->column, bare->pos);
           // 0A000, as PostgreSQL refuses it.
           if (out.aggregate && s.for_update) throw SqlError{"FOR UPDATE is not allowed with aggregate functions", s.pos};
           for (const auto& o : s.order_by) {
             const auto* c = Binder::column(*t, Binder::column_ref(o));
-            if (out.aggregate) ungrouped(c->name, o.pos);
+            if (out.aggregate) Binder::ungrouped(*t, c->name, o.pos);
             out.order_by.push_back({c->id, o.desc});
           }
           return {out, s.pos};

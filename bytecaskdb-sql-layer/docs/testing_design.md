@@ -130,17 +130,32 @@ Rules for slice 4 (#492):
   no unique index holds. `served` decides whether the layer plans it, as
   for a `SELECT` without `ORDER BY`; the counts must agree.
 
-`test_tprocc.py` runs TPROC-C's Payment, Order-Status, New-Order and Delivery
-through SQL against PostgreSQL: a small fixture (one warehouse, two
+Rules for slice 5 (#492):
+- **Filters**: zero to two conjuncts on any column, by any operator, beside
+  the key's, in `SELECT`, `UPDATE` and `DELETE`. `served` refuses one on a
+  DOUBLE or REAL column.
+- **$n ± k**: now and then an INTEGER conjunct's operand is `$n + k`, k
+  from -30 to 30, mostly the same value; PostgreSQL's side writes
+  `$n::integer + k`. Compared by `=`, it is a filter.
+- **COUNT(DISTINCT col)** beside `COUNT`.
+- **A join on a column**: two tables, each of the second's key parts equal
+  to a column of the first of its type or to a parameter, the first's
+  conjuncts from a key path, maybe a filter on the second; targets with a
+  `LIMIT`, or `COUNT(DISTINCT)` of either table's column. `join_served`
+  models the planner's choice of outer table.
+
+`test_tprocc.py` runs TPROC-C's five transactions through SQL against
+PostgreSQL: a small fixture (one warehouse, two
 districts, thirty customers each, some with a NULL `c_first`, fifty items
 and their stock, the orders without a carrier undelivered in `new_order`),
 then a hundred transactions from a fixed seed, one thread, each statement
 in a `Transaction` and in a PostgreSQL REPEATABLE READ transaction, with
 the client's logic between them. Every tenth is a Delivery, of each
-district's oldest undelivered order; the rest are in roughly TPROC-C's mix
-of the other three. One New-Order in twenty names an item that does not
-exist and rolls back. Every statement's result and every table after the
-run must agree.
+district's oldest undelivered order, and every tenth another a
+Stock-Level, with a threshold wider than the specification's so its counts
+are not all 0; the rest are in roughly TPROC-C's mix of the other three.
+One New-Order in twenty names an item that does not exist and rolls back.
+Every statement's result and every table after the run must agree.
 The schema is read from `tests/tprocc_schema.cppm`, its one definition.
 
 Fixed cases are plain pytest functions at the end of the file. They call

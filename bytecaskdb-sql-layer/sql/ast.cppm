@@ -34,9 +34,9 @@ private:
   std::int32_t pos_;
 };
 
-// A select-list or SET operand: a column, a parameter, an integer
-// literal, a sum or difference of two, or an aggregate: COUNT(*),
-// COUNT(column), SUM(column) or MIN(column).
+// A select-list, SET or comparison operand: a column, a parameter, an
+// integer literal, a sum or difference of two, or an aggregate: COUNT(*),
+// COUNT([DISTINCT] column), SUM(column) or MIN(column).
 struct Expr {
   enum class Kind { Column, Param, Const, Add, Sub, Aggregate };
   enum class Fn { Count, Sum, Min };
@@ -48,9 +48,10 @@ struct Expr {
   std::string table;          // Column, Aggregate: the table it is qualified by, "" for none
   std::int64_t constant{0};   // Const: an integer literal (Add and Sub's right operand only)
   Fn fn{Fn::Count};           // Aggregate
+  bool distinct{false};       // Aggregate: COUNT(DISTINCT column)
 };
 
-// One conjunct of a WHERE clause: a column compared with an expression.
+// One conjunct of a WHERE clause: two expressions compared.
 struct Compare {
   enum class Op { Eq, Lt, Le, Gt, Ge };
   Op op;

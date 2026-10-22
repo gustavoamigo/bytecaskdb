@@ -229,29 +229,110 @@ void return_if_null(Writer& w, const std::vector<std::uint32_t>& params, const s
 }
 
 
-// A key of `object` from its leading parts, as an expression: each a
-// parameter or NULL (nullopt). One bc_key_params when they are consecutive
-// parameters, a builder otherwise.
-auto key(Writer& w, std::uint32_t object, const std::vector<std::optional<std::uint32_t>>& parts) -> std::string {
-  auto consecutive = !parts.empty() && parts[0].has_value();
+// One part of a key being built: a parameter; or a value the plan holds,
+// an expression of `type`; or, with neither, NULL.
+struct KeySrc {
+  std::optional<std::uint32_t> param;
+  std::string value;
+  PhysType type{PhysType::I64};
+};
+
+// A key of `object` from its leading parts, as an expression. One
+// bc_key_params when they are consecutive parameters, a builder otherwise.
+auto key(Writer& w, std::uint32_t object, const std::vector<KeySrc>& parts) -> std::string {
+  auto consecutive = !parts.empty() && parts[0].param.has_value();
   for (std::size_t i = 1; consecutive && i < parts.size(); ++i) {
-    consecutive = parts[i].has_value() && *parts[i] == *parts[0] + i;
+    consecutive = parts[i].param.has_value() && *parts[i].param == *parts[0].param + i;
   }
   if (consecutive) {
-    return "bc_key_params(cx, " + w.obj(object) + ", " + std::to_string(*parts[0]) + ", " +
+    return "bc_key_params(cx, " + w.obj(object) + ", " + std::to_string(*parts[0].param) + ", " +
            std::to_string(parts.size()) + ")";
   }
   auto k = w.next_key();
   w.line("bc_key " + k + " = bc_key_begin(cx, " + w.obj(object) + ");");
   for (const auto& p : parts) {
-    w.line(p ? "bc_key_param(cx, " + k + ", " + std::to_string(*p) + ");" : "bc_key_null(cx, " + k + ");");
+    if (p.param) {
+      w.line("bc_key_param(cx, " + k + ", " + std::to_string(*p.param) + ");");
+    } else if (p.value.empty()) {
+      w.line("bc_key_null(cx, " + k + ");");
+    } else {
+      w.line("bc_key_" + suffix(p.type) + "(cx, " + k + ", " + p.value + ");");
+    }
   }
   return "bc_key_end(cx, " + k + ")";
 }
 
 auto key(Writer& w, std::uint32_t object, const std::vector<std::uint32_t>& params) -> std::string {
-  return key(w, object, std::vector<std::optional<std::uint32_t>>(params.begin(), params.end()));
+  std::vector<KeySrc> parts;
+  for (auto p : params) parts.push_back({p, {}, PhysType::I64});
+  return key(w, object, parts);
 }
+
+// The C name of a computed value (ir::Computed), printed before anything
+// else.
+auto computed(std::uint32_t i) -> std::string { return "v" + std::to_string(i); }
+
+// Each computed value, once, before anything is read: as PostgreSQL folds
+// $n ± k when it binds, one that leaves INTEGER fails the statement whatever
+// the other parameters are; a NULL $n gives NULL, never an error.
+void print_computed(Writer& w) {
+  const auto& comp = w.p().computed;
+  for (std::size_t i = 0; i < comp.size(); ++i) {
+    const auto& v = comp[i];
+    auto name = computed(static_cast<std::uint32_t>(i));
+    auto sum = std::string{v.offset < 0 ? "bc_sub" : "bc_add"} + "(cx, " + param(PhysType::I64, v.param) + ", " +
+               constant(v.offset < 0 ? -v.offset : v.offset) + ")";
+    w.line("int64_t " + name + " = 0;");
+    w.line("if (!" + param_null(v.param) + ") " + name + " = bc_check_int(cx, " + sum + ", BC_INTEGER, " + w.tbl(v.table) +
+           ");");
+  }
+}
+
+auto op_text(ir::Op op) -> std::string {
+  switch (op) {
+    case ir::Op::Eq: return "==";
+    case ir::Op::Lt: return "<";
+    case ir::Op::Le: return "<=";
+    case ir::Op::Gt: return ">";
+    case ir::Op::Ge: return ">=";
+  }
+  return "==";
+}
+
+// Whether the row fails the filter, as a C expression: NULL on either side,
+// or the comparison false. `row_of` names the row a column is read from.
+auto fails(Writer& w, const ir::Filter& f, const auto& row_of) -> std::string {
+  auto out = col_null(w, f.col, row_of(f.col));
+  std::string rhs;
+  if (f.rhs.column) {
+    out += " || " + col_null(w, *f.rhs.column, row_of(*f.rhs.column));
+    rhs = read_col(w, *f.rhs.column, row_of(*f.rhs.column));
+  } else {
+    out += " || " + param_null(f.rhs.param);
+    rhs = f.rhs.computed ? computed(*f.rhs.computed) : param(f.col.type, f.rhs.param);
+  }
+  auto lhs = read_col(w, f.col, row_of(f.col));
+  // Text and bytes compare as bytes: COLLATE "C".
+  auto cmp = f.col.type == PhysType::Bytes ? "bc_bytes_cmp(cx, " + lhs + ", " + rhs + ") " + op_text(f.op) + " 0"
+                                           : lhs + " " + op_text(f.op) + " " + rhs;
+  return out + " || !(" + cmp + ")";
+}
+
+// `if (fails) continue;` for each filter `pick` takes, in a loop.
+void skip_failing(Writer& w, const std::vector<ir::Filter>& filters, const auto& row_of, const auto& pick) {
+  for (const auto& f : filters) {
+    if (pick(f)) w.line("if (" + fails(w, f, row_of) + ") continue;");
+  }
+}
+
+// The single row's condition: `found`, and every filter passing.
+auto hit(Writer& w, const std::string& found, const std::vector<ir::Filter>& filters, const auto& row_of) -> std::string {
+  auto out = found;
+  for (const auto& f : filters) out += " && !(" + fails(w, f, row_of) + ")";
+  return out;
+}
+
+auto one_row(const ir::Column&) -> std::string { return "row"; }
 
 auto successor(const std::string& key) -> std::string { return "bc_key_successor(cx, " + key + ")"; }
 
@@ -324,38 +405,50 @@ void return_empty_if_null(Writer& w, const ir::Select& s, const std::vector<std:
   return_if_null(w, params, emits(s) ? empty_row(*s.aggregate) : std::vector<std::string>{});
 }
 
+// An aggregate over at most one row, read: its value when `hit` holds,
+// NULL as NULL (COUNT: 1, or 0 for a NULL argument); over none, COUNT 0 and
+// SUM and MIN NULL. `row` holds the argument's column.
+void emit_one_row_aggregate(Writer& w, const ir::Aggregate& a, const std::string& hit, const std::string& row) {
+  if (a.fn != ir::Aggregate::Fn::Count) {
+    w.line("bc_emit_begin(cx);");
+    w.open("if (" + hit + ")");
+    w.line("bc_emit_col(cx, " + row + ", " + w.col(*a.arg) + ");");
+    w.otherwise();
+    w.line("bc_emit_null(cx);");
+    w.close();
+    w.line("bc_emit_end(cx);");
+    return;
+  }
+  w.line("int64_t n = 0;");
+  w.line("if (" + hit + (a.arg ? " && !" + col_null(w, *a.arg, row) : "") + ") n = 1;");
+  emit_count(w, "n");
+}
+
 void print_point_select(Writer& w, const ir::Select& s, const ir::PointGet& g) {
   w.reads(w.p().table);
   if (s.aggregate) {
     const auto& a = *s.aggregate;
     return_empty_if_null(w, s, g.key_params);
     auto k = key(w, w.p().table, g.key_params);
-    if (a.fn != ir::Aggregate::Fn::Count) {
-      // SUM or MIN of one row: its value, NULL as NULL; no row is NULL.
-      if (!emits(s)) return;
-      w.line("bool found = false;");
-      w.line("bc_view row = bc_get(cx, " + k + ", &found);");
-      w.line("bc_emit_begin(cx);");
-      w.open("if (found)");
-      w.line("bc_emit_col(cx, row, " + w.col(*a.arg) + ");");
-      w.otherwise();
-      w.line("bc_emit_null(cx);");
-      w.close();
-      w.line("bc_emit_end(cx);");
+    if (a.fn == ir::Aggregate::Fn::Count && !a.arg && s.filters.empty()) {
+      w.line("int64_t n = 0;");
+      w.line("if (bc_exists(cx, " + k + ")) n = 1;");
+      if (emits(s)) emit_count(w, "n");
       return;
     }
-    w.line("int64_t n = 0;");
-    if (!a.arg) {
-      w.line("if (bc_exists(cx, " + k + ")) n = 1;");
-    } else {
-      w.line("bool found = false;");
-      w.line("bc_view row = bc_get(cx, " + k + ", &found);");
-      w.line("if (found && !" + col_null(w, *a.arg, "row") + ") n = 1;");
-    }
-    if (emits(s)) emit_count(w, "n");
+    // An aggregate of at most one row, the row its filters keep.
+    if (!emits(s)) return;
+    w.line("bool found = false;");
+    w.line("bc_view row = bc_get(cx, " + k + ", &found);");
+    emit_one_row_aggregate(w, a, hit(w, "found", s.filters, one_row), "row");
     return;
   }
   fetch_row(w, g, "row", false);
+  for (const auto& f : s.filters) {
+    w.open("if (" + fails(w, f, one_row) + ")");
+    w.line("return;");
+    w.close();
+  }
   if (emits(s)) {
     guard_row(w, s, "row");
     emit_columns(w, s.targets, "row");
@@ -364,7 +457,8 @@ void print_point_select(Writer& w, const ir::Select& s, const ir::PointGet& g) {
 
 // One end of a scan, in key order, as an expression.
 auto bound(Writer& w, const ir::Scan& sc, const ir::KeyBound& b, bool is_lo) -> std::string {
-  std::vector<std::optional<std::uint32_t>> parts(sc.prefix.begin(), sc.prefix.end());
+  std::vector<KeySrc> parts;
+  for (auto p : sc.prefix) parts.push_back({p, {}, PhysType::I64});
   std::string k;
   switch (b.kind) {
     case ir::KeyBound::Kind::Open:
@@ -372,8 +466,9 @@ auto bound(Writer& w, const ir::Scan& sc, const ir::KeyBound& b, bool is_lo) -> 
       // object's.
       if (parts.empty()) return "bc_empty(cx)";
       return is_lo ? key(w, sc.object, parts) : successor(key(w, sc.object, parts));
-    case ir::KeyBound::Kind::Param: parts.emplace_back(b.param); break;
-    case ir::KeyBound::Kind::NullPart: parts.emplace_back(std::nullopt); break;
+    case ir::KeyBound::Kind::Param: parts.push_back({b.param, {}, PhysType::I64}); break;
+    case ir::KeyBound::Kind::NullPart: parts.push_back({}); break;
+    case ir::KeyBound::Kind::Computed: parts.push_back({std::nullopt, computed(b.param), PhysType::I64}); break;
   }
   k = key(w, sc.object, parts);
   return b.successor ? successor(k) : k;
@@ -406,30 +501,68 @@ void open_scan(Writer& w, const ir::Scan& sc) {
 
 // The NULL part of a NullSplitScan: every entry under the prefix and NULL.
 void open_null_part(Writer& w, const ir::Scan& sc) {
-  std::vector<std::optional<std::uint32_t>> parts(sc.prefix.begin(), sc.prefix.end());
-  parts.emplace_back(std::nullopt);
+  std::vector<KeySrc> parts;
+  for (auto p : sc.prefix) parts.push_back({p, {}, PhysType::I64});
+  parts.push_back({});
   w.line("bc_view lo = " + key(w, sc.object, parts) + ";");
   open_prefix(w, sc);
 }
 
+// What a COUNT(DISTINCT) groups its values in: ample for any key set a
+// statement of the MVP reads; past it the statement fails (BC_E_MEMORY).
+constexpr std::uint32_t kGroupBytes = 16u << 20;
+
 // The aggregate's argument in the entry the cursor `c` is on: its NULL test
-// and its value, from the entry's key when the scan covers, else its row.
+// and its value, from the entry's key when the scan covers, else from `row`,
+// which the loop has read.
 auto arg_of_entry(Writer& w, const ir::Scan& sc, const ir::Column& arg) -> std::pair<std::string, std::string> {
   if (sc.covering) {
     w.line("bc_view key = bc_scan_key(cx, c);");
     auto at = w.obj(sc.object) + ", key, " + w.part(sc.object, arg) + ")";
     return {"bc_key_part_null(cx, " + at, "bc_key_part_i64(cx, " + at};
   }
-  w.reads(w.p().table);
-  w.line("bc_view row = bc_scan_row(cx, c);");
   return {col_null(w, arg, "row"), read_col(w, arg, "row")};
 }
 
-// One entry folded into the aggregate the loop keeps: n for COUNT, sum or m
-// and whether a value was seen for SUM and MIN. NULLs are skipped.
-void fold_entry(Writer& w, const ir::Aggregate& a, const ir::Scan& sc) {
+// The accumulators an aggregate's loop keeps: n for COUNT, sum or m and
+// whether a value was seen for SUM and MIN, groups for COUNT(DISTINCT).
+void open_aggregate(Writer& w, const ir::Aggregate& a) {
+  if (a.distinct) {
+    w.line("bc_agg groups = bc_agg_open(cx, " + std::to_string(kGroupBytes) + "u, 0);");
+    return;
+  }
+  switch (a.fn) {
+    case ir::Aggregate::Fn::Count: w.line("int64_t n = 0;"); break;
+    case ir::Aggregate::Fn::Sum: w.line("int64_t sum = 0;"); break;
+    case ir::Aggregate::Fn::Min: w.line("int64_t m = 0;"); break;
+  }
+  if (a.fn != ir::Aggregate::Fn::Count) w.line("bool seen = false;");
+}
+
+// The aggregate's row, after its loop: COUNT(DISTINCT) counts its groups.
+void emit_aggregate(Writer& w, const ir::Aggregate& a) {
+  if (a.distinct) {
+    w.line("int64_t n = 0;");
+    w.line("while (bc_agg_next(cx, groups, 0, 0)) ++n;");
+    emit_count(w, "n");
+    return;
+  }
+  switch (a.fn) {
+    case ir::Aggregate::Fn::Count: emit_count(w, "n"); break;
+    case ir::Aggregate::Fn::Sum: emit_value_or_null(w, "sum"); break;
+    case ir::Aggregate::Fn::Min: emit_value_or_null(w, "m"); break;
+  }
+}
+
+// One value folded into the aggregate the loop keeps. NULLs are skipped.
+// COUNT(DISTINCT) groups the value's key, from `row`.
+void fold(Writer& w, const ir::Aggregate& a, const std::string& is_null, const std::string& value, const std::string& row) {
   const auto& arg = *a.arg;  // an aggregate the keys can't answer has an argument
-  auto [is_null, value] = arg_of_entry(w, sc, arg);
+  if (a.distinct) {
+    auto group = "bc_agg_group(cx, groups, bc_col_key(cx, " + row + ", " + w.col(arg) + "));";
+    w.line(arg.nullable ? "if (!" + is_null + ") " + group : group);
+    return;
+  }
   switch (a.fn) {
     case ir::Aggregate::Fn::Count: w.line("if (!" + is_null + ") ++n;"); return;
     case ir::Aggregate::Fn::Sum:
@@ -448,13 +581,21 @@ void fold_entry(Writer& w, const ir::Aggregate& a, const ir::Scan& sc) {
   }
 }
 
-// The loop over the open cursor `c`: each entry's row emitted, or folded
-// into the aggregate.
+// The loop over the open cursor `c`: each entry's row read unless the scan
+// covers, its filters run, then emitted or folded into the aggregate.
 void scan_loop(Writer& w, const ir::Select& s, const ir::Scan& sc) {
   auto limited = s.limit.has_value() && !s.aggregate;
   w.open(std::string{"while ("} + (limited ? "n < " + std::to_string(*s.limit) + " && " : "") + "bc_scan_next(cx, c))");
-  if (s.aggregate) {
-    fold_entry(w, *s.aggregate, sc);
+  if (!sc.covering) {
+    w.reads(w.p().table);
+    w.line("bc_view row = bc_scan_row(cx, c);");
+    skip_failing(w, s.filters, one_row, [](const ir::Filter&) { return true; });
+  }
+  if (s.aggregate && !s.aggregate->arg) {
+    w.line("++n;");  // COUNT(*) of the rows the filters keep
+  } else if (s.aggregate) {
+    auto [is_null, value] = arg_of_entry(w, sc, *s.aggregate->arg);
+    fold(w, *s.aggregate, is_null, value, "row");
   } else if (sc.covering) {
     // Every result column from the entry's key: no row read.
     if (!s.targets.empty()) w.line("bc_view key = bc_scan_key(cx, c);");
@@ -464,8 +605,6 @@ void scan_loop(Writer& w, const ir::Select& s, const ir::Scan& sc) {
     }
     w.line("bc_emit_end(cx);");
   } else {
-    w.reads(w.p().table);
-    w.line("bc_view row = bc_scan_row(cx, c);");
     guard_row(w, s, "row");
     emit_columns(w, s.targets, "row");
   }
@@ -519,19 +658,10 @@ void print_scan_select(Writer& w, const ir::Select& s, const ir::Scan& sc) {
     print_min_first_entry(w, s, sc);
     return;
   }
-  switch (a.fn) {
-    case ir::Aggregate::Fn::Count: w.line("int64_t n = 0;"); break;
-    case ir::Aggregate::Fn::Sum: w.line("int64_t sum = 0;"); break;
-    case ir::Aggregate::Fn::Min: w.line("int64_t m = 0;"); break;
-  }
-  if (a.fn != ir::Aggregate::Fn::Count) w.line("bool seen = false;");
+  open_aggregate(w, a);
   open_scan(w, sc);
   scan_loop(w, s, sc);
-  switch (a.fn) {
-    case ir::Aggregate::Fn::Count: emit_count(w, "n"); break;
-    case ir::Aggregate::Fn::Sum: emit_value_or_null(w, "sum"); break;
-    case ir::Aggregate::Fn::Min: emit_value_or_null(w, "m"); break;
-  }
+  emit_aggregate(w, a);
 }
 
 // The present values and the NULL part, each in its own block, in
@@ -553,29 +683,102 @@ void print_split_select(Writer& w, const ir::Select& s, const ir::NullSplitScan&
   }
 }
 
-// The two rows, then each target from its own.
+// The two rows, then each target from its own; an aggregate over the pair.
 void print_join_select(Writer& w, const ir::Select& s, const ir::PointJoin& j) {
   const std::string rows[2]{"row", "row1"};
+  auto row_of = [&](const ir::Column& c) { return rows[c.table == j.tables[0] ? 0 : 1]; };
   auto params = j.rows[0].key_params;
   for (auto p : j.rows[1].key_params) {
     if (std::ranges::find(params, p) == params.end()) params.push_back(p);
   }
-  return_if_null(w, params);
+  if (s.aggregate) {
+    return_empty_if_null(w, s, params);
+    if (!emits(s)) return;
+  } else {
+    return_if_null(w, params);
+  }
   for (std::size_t i = 0; i < 2; ++i) {
     w.reads(j.tables[i]);
     auto found = std::string{i == 0 ? "found" : "found1"};
     w.line("bool " + found + " = false;");
-    w.line("bc_view " + rows[i] + " = bc_get(cx, " + key(w, j.tables[i], j.rows[i].key_params) + ", &" + found + ");");
+    auto get = "bc_get(cx, " + key(w, j.tables[i], j.rows[i].key_params) + ", &" + found + ");";
+    if (s.aggregate && i == 1) {
+      // No pair without the first row: the second is not read.
+      w.line("bc_view " + rows[i] + " = bc_empty(cx);");
+      w.line("if (found) " + rows[i] + " = " + get);
+      continue;
+    }
+    w.line("bc_view " + rows[i] + " = " + get);
+    if (s.aggregate) continue;
     w.open("if (!" + found + ")");
+    w.line("return;");
+    w.close();
+  }
+  if (s.aggregate) {
+    const auto& a = *s.aggregate;
+    emit_one_row_aggregate(w, a, hit(w, "found && found1", s.filters, row_of), a.arg ? row_of(*a.arg) : "row");
+    return;
+  }
+  for (const auto& f : s.filters) {
+    w.open("if (" + fails(w, f, row_of) + ")");
     w.line("return;");
     w.close();
   }
   if (!emits(s)) return;
   w.line("bc_emit_begin(cx);");
-  for (const auto& t : s.targets) {
-    w.line("bc_emit_col(cx, " + rows[t.table == j.tables[0] ? 0 : 1] + ", " + w.col(t) + ");");
-  }
+  for (const auto& t : s.targets) w.line("bc_emit_col(cx, " + row_of(t) + ", " + w.col(t) + ");");
   w.line("bc_emit_end(cx);");
+}
+
+// The outer scan, and for each of its rows the inner row its key names:
+// each pair filtered, then emitted or folded into the aggregate. An outer
+// row whose join column is NULL, or with no inner row, joins nothing.
+void print_loop_join(Writer& w, const ir::Select& s, const ir::LoopJoin& j) {
+  const auto inner = j.tables[1];
+  auto row_of = [&](const ir::Column& c) { return std::string{c.table == inner ? "row1" : "row"}; };
+  const auto& sc = j.outer;
+  if (s.aggregate) {
+    return_empty_if_null(w, s, sc.null_checks);
+    if (!emits(s)) return;
+    open_aggregate(w, *s.aggregate);
+  } else {
+    return_if_null(w, sc.null_checks);
+    if (s.limit) w.line("int64_t n = 0;");
+  }
+  open_scan(w, sc);
+  auto limited = s.limit.has_value() && !s.aggregate;
+  w.open(std::string{"while ("} + (limited ? "n < " + std::to_string(*s.limit) + " && " : "") + "bc_scan_next(cx, c))");
+  w.reads(j.tables[0]);
+  w.line("bc_view row = bc_scan_row(cx, c);");
+  skip_failing(w, s.filters, row_of, [&](const ir::Filter& f) { return f.col.table != inner; });
+  std::vector<KeySrc> parts;
+  for (const auto& p : j.inner_key) {
+    if (!p.column) {
+      parts.push_back({p.param, {}, PhysType::I64});
+      continue;
+    }
+    if (p.column->nullable) w.line("if (" + col_null(w, *p.column, "row") + ") continue;");
+    parts.push_back({std::nullopt, read_col(w, *p.column, "row"), p.column->type});
+  }
+  w.reads(inner);
+  w.line("bool found1 = false;");
+  w.line("bc_view row1 = bc_get(cx, " + key(w, inner, parts) + ", &found1);");
+  w.line("if (!found1) continue;");
+  skip_failing(w, s.filters, row_of, [&](const ir::Filter& f) { return f.col.table == inner; });
+  if (s.aggregate && !s.aggregate->arg) {
+    w.line("++n;");  // COUNT(*): the pairs
+  } else if (s.aggregate) {
+    const auto& arg = *s.aggregate->arg;
+    auto row = row_of(arg);
+    fold(w, *s.aggregate, col_null(w, arg, row), read_col(w, arg, row), row);
+  } else {
+    w.line("bc_emit_begin(cx);");
+    for (const auto& t : s.targets) w.line("bc_emit_col(cx, " + row_of(t) + ", " + w.col(t) + ");");
+    w.line("bc_emit_end(cx);");
+    if (limited) w.line("++n;");
+  }
+  w.close();
+  if (s.aggregate) emit_aggregate(w, *s.aggregate);
 }
 
 void print(Writer& w, const ir::Select& s) {
@@ -588,19 +791,29 @@ void print(Writer& w, const ir::Select& s) {
           print_scan_select(w, s, from);
         } else if constexpr (std::is_same_v<T, ir::NullSplitScan>) {
           print_split_select(w, s, from);
-        } else {
+        } else if constexpr (std::is_same_v<T, ir::PointJoin>) {
           print_join_select(w, s, from);
+        } else {
+          print_loop_join(w, s, from);
         }
       },
       s.from);
 }
 
-// Each row of an UPDATE or DELETE as `old`, `write` printing what is done
-// with it; then the count of rows written.
-void for_each_row(Writer& w, const std::variant<ir::PointGet, ir::Scan>& rows, const auto& write) {
+// Each row of an UPDATE or DELETE as `old` that its filters keep, `write`
+// printing what is done with it; then the count of rows written.
+void for_each_row(Writer& w, const std::variant<ir::PointGet, ir::Scan>& rows, const std::vector<ir::Filter>& filters,
+                  const auto& write) {
+  auto old = [](const ir::Column&) { return std::string{"old"}; };
   w.reads(w.p().table);
   if (const auto* g = std::get_if<ir::PointGet>(&rows)) {
     fetch_row(w, *g, "old", true);
+    for (const auto& f : filters) {
+      w.open("if (" + fails(w, f, old) + ")");
+      w.line("bc_emit_count(cx, 0);");
+      w.line("return;");
+      w.close();
+    }
     write();
     w.line("bc_emit_count(cx, 1);");
     return;
@@ -613,6 +826,7 @@ void for_each_row(Writer& w, const std::variant<ir::PointGet, ir::Scan>& rows, c
   open_scan(w, sc);
   w.open("while (bc_scan_next(cx, c))");
   w.line("bc_view old = bc_scan_row(cx, c);");
+  skip_failing(w, filters, old, [](const ir::Filter&) { return true; });
   write();
   w.line("++n;");
   w.close();
@@ -654,11 +868,11 @@ void print_set(Writer& w, const ir::Update& s) {
 }
 
 void print(Writer& w, const ir::Update& s) {
-  for_each_row(w, s.rows, [&] { print_set(w, s); });
+  for_each_row(w, s.rows, s.filters, [&] { print_set(w, s); });
 }
 
 void print(Writer& w, const ir::Delete& s) {
-  for_each_row(w, s.rows, [&] { w.line("bc_delete(cx, " + w.tbl() + ", old);"); });
+  for_each_row(w, s.rows, s.filters, [&] { w.line("bc_delete(cx, " + w.tbl() + ", old);"); });
 }
 
 // An aggregate's result column as PostgreSQL names and types it: COUNT a
@@ -688,6 +902,7 @@ auto generate_plan(const bound::Bound& b, const Catalog& cat, std::string_view s
   out.param_types = p.param_types;
   out.catalog_version = p.catalog_version;
   Writer w{p};
+  print_computed(w);
   std::visit(
       [&](const auto& s) {
         using T = std::decay_t<decltype(s)>;
@@ -722,6 +937,11 @@ auto generate_plan(const bound::Bound& b, const Catalog& cat, std::string_view s
       const auto* c = (t.side == 0 ? j->table : j->second)->column(t.col_id);
       out.result_names.push_back(c->name);
       out.result_sql.push_back(c->sql);
+    }
+    if (const auto& a = j->aggregate) {
+      auto [name, type] = aggregate_result(*a, a->side == 0 ? *j->table : *j->second);
+      out.result_names.push_back(name);
+      out.result_sql.push_back(type);
     }
   }
   out.objects_read = w.objects_read();

@@ -106,7 +106,7 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   CHECK(rejected_at("SELECT max(qty) FROM t WHERE id = $1") == 7);
   CHECK(rejected_at("SELECT sum(*) FROM t WHERE id = $1") == 7);
   CHECK(rejected_at("SELECT min(qty + $2) FROM t WHERE id = $1") == 7);
-  CHECK(rejected_at("SELECT count(DISTINCT qty) FROM t WHERE id = $1") == 7);
+  CHECK(rejected_at("SELECT sum(DISTINCT qty) FROM t WHERE id = $1") == 7);
   CHECK(rejected_at("SELECT id FROM t WHERE id = $1 ORDER BY id NULLS FIRST") == 40);
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 LIMIT $2"), SqlError);
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 OFFSET 1"), SqlError);
@@ -126,6 +126,10 @@ TEST_CASE("parser: COUNT, ORDER BY, LIMIT and column + parameter", "[sql][parser
   CHECK(sum_min.targets[0].column == "qty");
   CHECK(sum_min.targets[1].fn == Expr::Fn::Min);
   CHECK(sum_min.targets[1].table == "t");
+  auto distinct = std::get<Select>(parse("SELECT count(DISTINCT qty) FROM t WHERE name = $1"));
+  CHECK(distinct.targets[0].fn == Expr::Fn::Count);
+  CHECK(distinct.targets[0].distinct);
+  CHECK_FALSE(sum_min.targets[0].distinct);
   REQUIRE(s.order_by.size() == 2);
   CHECK(s.order_by[0].column == "name");
   CHECK(s.order_by[0].desc);

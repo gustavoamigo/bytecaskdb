@@ -8,9 +8,10 @@
    (algebra/runtime.cppm, module bytecask.sql.runtime).
 
    Implemented: the runtime, parameters and results, arithmetic, keys, reads,
-   rows and columns, writes, guards. The ephemeral structures (sorters, hash tables,
-   aggregates) are not implemented yet: each of their calls sets BC_E_HANDLE
-   and returns a neutral value. */
+   rows and columns, writes, guards, and the aggregates' groups (bc_agg_open
+   with no slots, bc_agg_group, bc_agg_next). The other ephemeral structures
+   (sorters, hash tables) and the aggregates' slots are not implemented yet:
+   each of their calls sets BC_E_HANDLE and returns a neutral value. */
 
 #ifndef BC_PLAN_H
 #define BC_PLAN_H
@@ -197,6 +198,9 @@ int64_t bc_div(bc_ctx *, int64_t, int64_t);     /* zero divisor, INT64_MIN / -1 
 int64_t bc_mod(bc_ctx *, int64_t, int64_t);
 int64_t bc_neg(bc_ctx *, int64_t);              /* INT64_MIN → error */
 int64_t bc_f64_to_i64(bc_ctx *, double);        /* NaN or out of range → error; truncates */
+enum bc_int_type { BC_SMALLINT = 2, BC_INTEGER = 4 };
+int64_t bc_check_int(bc_ctx *, int64_t v, uint32_t int_type, uint32_t object_id);  /* v outside the type:
+                                                   BC_E_CONSTRAINT, BC_C_RANGE on object_id; else v */
 double  bc_i64_to_f64(int64_t);                 /* always defined */
 bool    bc_bytes_eq(bc_ctx *, bc_view, bc_view);
 int     bc_bytes_cmp(bc_ctx *, bc_view, bc_view);       /* memcmp order */
@@ -246,6 +250,10 @@ int64_t  bc_col_i64(bc_ctx *, bc_view row, uint32_t col);
 double   bc_col_f64(bc_ctx *, bc_view row, uint32_t col);
 bool     bc_col_bool(bc_ctx *, bc_view row, uint32_t col);
 bc_view  bc_col_bytes(bc_ctx *, bc_view row, uint32_t col);  /* a sub-view; same lifetime as row */
+bc_view  bc_col_key(bc_ctx *, bc_view row, uint32_t col);    /* the value as a mem-comparable key part, NULL
+                                                                included: equal values give equal bytes. A
+                                                                group key, with no key ceiling; same lifetime
+                                                                as row */
 bc_view  bc_row_key(bc_ctx *, uint32_t table, bc_view row);  /* the row's primary key, from its columns */
 
 bc_row   bc_row_begin(bc_ctx *, uint32_t table);
