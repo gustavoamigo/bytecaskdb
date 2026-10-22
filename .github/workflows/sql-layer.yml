@@ -111,6 +111,11 @@ jobs:
             git ninja-build
           pip3 install nanobind
 
+      # The HammerDB driver sends only statements the proof suite checks
+      # against PostgreSQL (docs/server_design.md, *The HammerDB driver*).
+      - name: The driver's statements are the proved ones
+        run: python3 bytecaskdb-sql-layer/scripts/check_driver_statements.py
+
       # libpg_query and TinyCC are cloned and built from source by xmake;
       # the key carries every pinned version, kept apart from the engine's.
       - name: Cache xmake packages
