@@ -153,10 +153,11 @@ struct Claim {
   // An index entry's: taken by another row's entry with these first bytes,
   // never by this row's own entry, which a racing update of it also writes.
   std::optional<std::size_t> prefix_len;
-  // How many of the transaction's locks came from earlier statements: one
-  // of them a concurrent commit changed is the conflict PostgreSQL reports
-  // first, before this claim's statement would have run.
-  std::size_t locks_before{0};
+  // How many of the transaction's locks came from statements up to and
+  // including this claim's: one of them a concurrent commit changed is the
+  // conflict PostgreSQL reports first, at the row, before the duplicate (an
+  // UPDATE locks its old row before it checks the value it moves to).
+  std::size_t locks_through{0};
 };
 
 // A row a statement locked (FOR UPDATE) or wrote (UPDATE, DELETE), as the
@@ -1312,8 +1313,8 @@ auto written_tables(const Catalog& cat, const std::vector<Effect>& effects) -> s
 // The first conflict in statement order decides, as in PostgreSQL, where an
 // earlier statement's lock or write of a row a concurrent commit changed
 // fails at that statement: before each claim, the locks of the statements
-// before it are checked, and one whose row changed is the conflict. A row
-// changed back to the same bytes counts as unchanged.
+// up to its own are checked, and one whose row changed is the conflict. A
+// row changed back to the same bytes counts as unchanged.
 // A transaction's claim counts while its writes still put the key: one a
 // later statement moved or deleted away claims nothing (`overlay`, null for
 // an execution, whose one statement writes a row once). An index claim is
@@ -1328,7 +1329,7 @@ auto written_tables(const Catalog& cat, const std::vector<Effect>& effects) -> s
     std::size_t checked = 0;
     for (const auto& c : claims) {
       if (overlay != nullptr && !overlay->puts(c.key)) continue;
-      for (; checked < c.locks_before; ++checked) {
+      for (; checked < c.locks_through; ++checked) {
         const auto& l = locks[checked];
         if (!latest.get({}, l.key, now) || row_fingerprint(now) != l.fingerprint) return BC_CONFLICT;
       }
@@ -2075,11 +2076,11 @@ bool bc_txn_add(bc_ctx* cx) {
     }
   }
   cx->effects.clear();
-  // This statement's claims come after the locks of the statements before
-  // it, not after its own.
-  const auto earlier_locks = txn->locks.size();
+  // This statement's claims come after its own locks too: its old rows are
+  // locked before the values it puts are checked.
+  const auto locks_through = txn->locks.size() + cx->locks.size();
   for (auto& c : cx->claims) {
-    c.locks_before = earlier_locks;
+    c.locks_through = locks_through;
     txn->claim_bytes += held(c.key.capacity());
     txn->claims.push_back(std::move(c));
   }
@@ -2849,7 +2850,6 @@ bc_view bc_col_bytes(bc_ctx* cx, bc_view row, uint32_t col) {
 }
 
 namespace {
-// The primary key of a row of `table`, from its columns.
 // The row's primary key into `key`, and the row's bytes; nullopt on an error.
 [[nodiscard]] auto row_pk(bc_ctx* cx, std::uint32_t table, bc_view row, Bytes& key) -> std::optional<BytesView> {
   const auto* t = cx->table(table);

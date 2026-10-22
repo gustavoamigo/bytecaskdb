@@ -259,11 +259,13 @@ duplicate.
   bytes, taken from the row the statement already read. Rows the overlay
   holds are not recorded: they are an earlier statement's write, already
   recorded, or its insert, a claim. Each claim notes how many locks came
-  from statements before its own. Before a claim is checked, those locks
-  are read in the latest state, in order, and one whose row is gone or
-  whose fingerprint differs makes the conflict 40001. A row a statement
-  locks and a key it inserts are the same statement's, and the claim
-  decides, as in PostgreSQL, where an `INSERT` locks nothing first.
+  from statements up to and including its own. Before a claim is checked,
+  those locks are read in the latest state, in order, and one whose row is
+  gone or whose fingerprint differs makes the conflict 40001. The claim's
+  own statement counts because an `UPDATE` that moves a row to a unique
+  value locks the old row first: PostgreSQL fails it there with 40001 when
+  a concurrent commit changed the row. An `INSERT` locks nothing, so its
+  claim decides.
   Comparing bytes, not versions, a row a concurrent commit changed and
   another changed back counts as unchanged, and the commit reports the
   duplicate; the engine gives a snapshot no per-key version to compare.
@@ -281,7 +283,7 @@ duplicate.
   copy of its key, kept until the commit, and each lock a copy of its key
   and a fingerprint, computed from bytes the statement already holds. On a
   conflict, one record read per claim, at most one per inserted row plus
-  one per unique index it maintains, and one per lock of a statement before
+  one per unique index it maintains, and one per lock of a statement up to
   the last claim checked. These reads come after every statement has run, so
   they aren't charged to a statement's budget; they are bounded by the
   transaction's own inserts.
@@ -297,8 +299,11 @@ duplicate.
   - a conflict on a row the transaction updated, not inserted, is 40001;
   - New-Order's race: a row an earlier statement locked with `FOR UPDATE`,
     or updated, changed by the commit that took the inserted key, is 40001;
-    an earlier locked row nobody changed leaves it 23505, and so does an
-    insert that comes before the changed row's statement;
+    an earlier locked row nobody changed leaves it 23505, and so does one
+    rewritten with the same bytes, and an insert that comes before the
+    changed row's statement;
+  - an `UPDATE` moving a row to a unique value, raced by a commit that
+    changed the row and took the value: 40001;
   - deleting and reinserting a row that a concurrent transaction updates is
     40001;
   - the autocommit race test ("tcc: a unique insert raced by another commit

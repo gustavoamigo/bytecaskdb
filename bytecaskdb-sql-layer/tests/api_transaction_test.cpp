@@ -677,6 +677,29 @@ TEST_CASE("embedded API: a key a transaction inserted that a concurrent commit t
     REQUIRE(d);
     CHECK(d->object_id == acct_id);
   }
+  SECTION("an earlier locked row rewritten with the same bytes counts as unchanged: 23505") {
+    db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{10}});
+    auto a = db->begin();
+    (void)a.execute("SELECT bal FROM acct WHERE id = $1 FOR UPDATE", {std::int64_t{1}});
+    a.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{2}, std::int64_t{0}});
+    auto b = db->begin();
+    b.execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{10}});
+    b.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{2}, std::int64_t{5}});
+    CHECK(b.commit() == CommitOutcome::Committed);
+    auto d = duplicate(a);
+    REQUIRE(d);
+    CHECK(d->object_id == acct_id);
+  }
+  SECTION("an UPDATE moving a row to a unique value a commit took while changing the row: 40001") {
+    db->execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{1}, sql_test::bytes("a@b")});
+    auto a = db->begin();
+    a.execute("UPDATE person SET email = $2 WHERE id = $1", {std::int64_t{1}, sql_test::bytes("v@w")});
+    auto b = db->begin();
+    b.execute("UPDATE person SET email = $2 WHERE id = $1", {std::int64_t{1}, sql_test::bytes("c@d")});
+    b.execute("INSERT INTO person VALUES ($1, $2)", {std::int64_t{2}, sql_test::bytes("v@w")});
+    CHECK(b.commit() == CommitOutcome::Committed);
+    CHECK_FALSE(duplicate(a));
+  }
   SECTION("an insert before the changed row: the duplicate comes first, 23505") {
     db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{10}});
     auto a = db->begin();
