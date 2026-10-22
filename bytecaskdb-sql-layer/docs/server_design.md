@@ -519,9 +519,9 @@ layer runs, and the gate is the full mix.
 PostgreSQL's, so the script runs unchanged on PostgreSQL loaded with the
 same schema. That is how the driver itself is checked: the smoke test runs
 it against PostgreSQL as well, and the consistency conditions must hold
-there too. Whether the gate also reports PostgreSQL's numbers is a
-decision for the owner (`frontend_design.md`, *Decisions*, 7); this slice
-only makes it possible.
+there too. The gate reports only ByteCaskDB's numbers
+(`frontend_design.md`, *Decisions*, 7): PostgreSQL's throughput from these
+runs is not part of its output.
 
 ## Running the gate
 
@@ -553,7 +553,8 @@ plugin. `--smoke` is the short run of *Tests*.
 4. **Results.** One row per cell goes to
    `bytecaskdb-sql-layer/benchmarks/hammerdb_results.csv`, which the
    layer's `.gitignore` ignores: date, commit, W, users, ramp-up,
-   duration, NOPM, TPM, errors by SQLSTATE, and the check's result.
+   duration, NOPM, TPM, errors by SQLSTATE, and the check's result, all
+   of our server; the report prints the same. No PostgreSQL row is written.
 
 `sql_layer_tprocc check` is a new command over the harness's existing
 `consistency()`.
@@ -629,7 +630,7 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 Each row names its tests: the wire proof, `test_wire.py` and the smoke
 test.
 
-## Decisions for review
+## Decisions
 
 1. The PostgreSQL protocol before gRPC, as a front over the embedded API.
 2. One thread per connection, no pool.
@@ -645,3 +646,6 @@ test.
    statements.
 9. The HammerDB smoke runs nightly, as a scheduled workflow, not per PR
    (owner, 2026-10-22).
+10. The gate reports ByteCaskDB's NOPM and TPM only. PostgreSQL 17 runs the
+    driver to check it (the nightly smoke), and its throughput is not
+    reported (owner, 2026-10-22; `frontend_design.md`, *Decisions*, 7).

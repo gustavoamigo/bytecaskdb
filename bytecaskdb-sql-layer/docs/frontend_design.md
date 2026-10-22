@@ -699,10 +699,11 @@ The owner's answers to this design's open questions (2026-10-21):
    The MVP gate runs HammerDB's TPROC-C, with this design's statements,
    through the PostgreSQL wire-protocol server at 1, 16 and 48 virtual
    users, and reports the layer's own numbers (owner, 2026-10-21, replacing
-   the harness as the gate). The driver script runs unchanged on
-   PostgreSQL 17; whether the gate reports PostgreSQL's numbers beside ours
-   is open (`docs/server_design.md`, *The same script against PostgreSQL
-   17*).
+   the harness as the gate). The gate reports ByteCaskDB's numbers only
+   (owner, 2026-10-22). The driver script runs unchanged on PostgreSQL 17,
+   which checks the driver in the nightly smoke. PostgreSQL's throughput
+   is not part of the gate's output (`docs/server_design.md`, *The same
+   script against PostgreSQL 17*).
 
 ## Later
 
