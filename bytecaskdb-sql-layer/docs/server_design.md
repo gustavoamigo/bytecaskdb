@@ -619,7 +619,7 @@ same population.
   - `harness_run (1, 0)`;
   - one `COPY … FROM STDIN` per table.
 - `psql` loads it.
-- `hammerdb/pg_consistency.sql` holds conditions 1, 8 and 9 as the harness
+- `hammerdb/pg_consistency.sql` holds the nine conditions as the harness
   runs them. `scripts/check_driver_statements.py` checks it against the
   harness's too. That is how the driver itself is checked: the smoke test runs
 it against PostgreSQL as well, and the consistency conditions must hold
@@ -656,7 +656,7 @@ its toolchain.
      `vudestroy`;
    - parse the result line;
    - stop the server with `SIGTERM`;
-   - run `sql_layer_tprocc check --dir`, conditions 1, 8 and 9, on what the
+   - run `sql_layer_tprocc check --dir`, the nine conditions, on what the
      run left.
 
    A cell whose check fails, or whose run printed no result, fails the

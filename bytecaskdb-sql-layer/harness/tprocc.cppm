@@ -123,7 +123,7 @@ struct RunOptions {
 
 inline constexpr int kMaxAttempts = 10;
 
-// The transactions in the mix today: all but Stock-Level, which comes next.
+// The transactions in the mix: all five.
 [[nodiscard]] auto mix() -> std::vector<Kind>;
 
 // Runs each phase on the loaded database, handing each report to
@@ -424,7 +424,9 @@ auto PhaseReport::nopm() const -> std::optional<double> {
   return seconds > 0 ? static_cast<double>(n.completed - n.rolled_back) * 60.0 / seconds : 0.0;
 }
 
-auto mix() -> std::vector<Kind> { return {Kind::NewOrder, Kind::Payment, Kind::OrderStatus, Kind::Delivery}; }
+auto mix() -> std::vector<Kind> {
+  return {Kind::NewOrder, Kind::Payment, Kind::OrderStatus, Kind::Delivery, Kind::StockLevel};
+}
 
 namespace {
 
@@ -486,11 +488,16 @@ struct Statements {
         d6{db.prepare("SELECT SUM(ol_amount) FROM order_line WHERE ol_o_id = $1 AND ol_d_id = $2 "
                       "AND ol_w_id = $3")},
         d7{db.prepare("UPDATE customer SET c_balance = c_balance + $1 WHERE c_id = $2 AND c_d_id = $3 "
-                      "AND c_w_id = $4")} {}
+                      "AND c_w_id = $4")},
+        s1{db.prepare("SELECT d_next_o_id FROM district WHERE d_w_id = $1 AND d_id = $2")},
+        s2{db.prepare("SELECT COUNT(DISTINCT s_i_id) FROM order_line, stock WHERE ol_w_id = $1 AND ol_d_id = $2 "
+                      "AND ol_o_id < $3 AND ol_o_id >= $3 - 20 AND s_w_id = $1 AND s_i_id = ol_i_id "
+                      "AND s_quantity < $4")} {}
   const Statement &p1, &p2, &p3, &p4, &p5, &p6, &p7, &p8, &p9, &p10, &p11;
   const Statement &o1, &o2, &o3, &o4, &o5;
   const Statement &n1, &n2, &n3, &n4, &n5, &n6, &n7, &n8, &n9;
   const Statement &d1, &d2, &d3, &d4, &d5, &d6, &d7;
+  const Statement &s1, &s2;
 };
 
 // A customer: by last name, or by id.
@@ -525,6 +532,10 @@ struct NewOrderInput {
 
 struct DeliveryInput {
   std::int64_t w{0}, carrier{0}, date{0};
+};
+
+struct StockLevelInput {
+  std::int64_t w{0}, d{0}, threshold{0};
 };
 
 // The customer a last name selects: the one at position ceil(n / 2) by
@@ -649,6 +660,14 @@ void delivery(const Statements& s, Transaction& t, const DeliveryInput& in) {
   (void)t.commit();
 }
 
+// Stock-Level (clause 2.8.2): reads only. The distinct items, among the
+// district's last 20 orders' lines, whose stock is below the threshold.
+void stock_level(const Statements& s, Transaction& t, const StockLevelInput& in) {
+  const auto next_o_id = t.execute(s.s1, {in.w, in.d}).rows.at(0).at(0);
+  (void)t.execute(s.s2, {in.w, in.d, next_o_id, in.threshold});
+  (void)t.commit();
+}
+
 struct Worker {
   const Statements& s;
   std::int64_t warehouses;
@@ -658,6 +677,9 @@ struct Worker {
   Rng rng;
   std::uint64_t history_n{0};
   std::array<KindStats, kKinds> stats{};
+  // Stock-Level's district, fixed per thread as the driver fixes it per
+  // virtual user (clause 2.8.1.2); drawn 1..10 when the worker is made.
+  std::int64_t stock_level_d{0};
 
   auto customer(std::int64_t w, std::int64_t d) -> Customer {
     Customer c{w, d, std::nullopt, 0};
@@ -688,6 +710,7 @@ struct Worker {
     OrderStatusInput os;
     NewOrderInput no;
     DeliveryInput del;
+    StockLevelInput sl;
     const auto d = uniform(rng, 1, kDistricts);
     switch (k) {
       case Kind::NewOrder: {
@@ -726,7 +749,7 @@ struct Worker {
       }
       case Kind::OrderStatus: os.c = customer(home, d); break;
       case Kind::Delivery: del = {home, uniform(rng, 1, 10), now_us()}; break;
-      case Kind::StockLevel: throw std::logic_error("not in the mix yet");
+      case Kind::StockLevel: sl = {home, stock_level_d, uniform(rng, 10, 20)}; break;
     }
     auto& st = stats[static_cast<std::size_t>(k)];
     const auto start = Clock::now();
@@ -741,7 +764,7 @@ struct Worker {
           case Kind::OrderStatus: order_status(s, t, os); break;
           case Kind::NewOrder: rolled_back = !new_order(s, t, no); break;
           case Kind::Delivery: delivery(s, t, del); break;
-          case Kind::StockLevel: break;
+          case Kind::StockLevel: stock_level(s, t, sl); break;
         }
         completed = true;
         break;
@@ -831,7 +854,8 @@ void run(Database& db, const RunOptions& opts, const std::function<void(const Ph
     std::vector<Worker> workers;
     workers.reserve(threads);
     for (std::size_t t = 0; t < threads; ++t) {
-      workers.push_back(Worker{s, warehouses, scale, r.run, t, Rng{opts.seed * 1'000'003 + t}, 0, {}});
+      workers.push_back(Worker{s, warehouses, scale, r.run, t, Rng{opts.seed * 1'000'003 + t}, 0, {}, 0});
+      workers.back().stock_level_d = uniform(workers.back().rng, 1, kDistricts);
     }
     std::vector<std::exception_ptr> errors(threads);
     if (counting) at_start = sample();
