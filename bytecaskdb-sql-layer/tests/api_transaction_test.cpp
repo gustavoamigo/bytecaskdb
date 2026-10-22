@@ -577,7 +577,7 @@ TEST_CASE("embedded API: a DDL racing a transaction's first statement re-pins it
   CHECK(t.commit() == CommitOutcome::Committed);
 }
 
-TEST_CASE("embedded API: a key a transaction inserted that a concurrent commit took is 23505 at commit",
+TEST_CASE("embedded API: a key a transaction inserted that a concurrent commit took is 23505 at commit unless an earlier statement's row changed",
           "[sql][api][txn]") {
   sql_test::TempDir dir{"api_txn"};
   auto db = open_db(dir);
@@ -645,6 +645,49 @@ TEST_CASE("embedded API: a key a transaction inserted that a concurrent commit t
     db->execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{12}});
     CHECK_FALSE(duplicate(a));
     CHECK(balance(*db, 2) == std::nullopt);
+  }
+  // New-Order's race (#552): PostgreSQL's second transaction stops at the
+  // row the first changed, before its INSERT, and never reports 23505.
+  auto take = [&](Transaction& t, std::int64_t key, bool for_update) {
+    if (for_update) (void)t.execute("SELECT bal FROM acct WHERE id = $1 FOR UPDATE", {std::int64_t{1}});
+    t.execute("UPDATE acct SET bal = bal + $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{1}});
+    t.execute("INSERT INTO acct VALUES ($1, $2)", {key, std::int64_t{0}});
+  };
+  SECTION("a row an earlier statement locked or wrote, changed by the commit that took the key: 40001") {
+    for (auto for_update : {true, false}) {
+      db->execute("DELETE FROM acct WHERE id = $1", {std::int64_t{2}});
+      db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{10}});
+      auto a = db->begin();
+      auto b = db->begin();
+      take(a, 2, for_update);
+      take(b, 2, for_update);
+      CHECK(b.commit() == CommitOutcome::Committed);
+      CHECK_FALSE(duplicate(a));
+      CHECK(balance(*db, 1) == 11);
+      db->execute("DELETE FROM acct WHERE id = $1", {std::int64_t{1}});
+    }
+  }
+  SECTION("an earlier locked row a concurrent commit left alone: still 23505") {
+    db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{10}});
+    auto a = db->begin();
+    (void)a.execute("SELECT bal FROM acct WHERE id = $1 FOR UPDATE", {std::int64_t{1}});
+    a.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{2}, std::int64_t{0}});
+    db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{2}, std::int64_t{5}});
+    auto d = duplicate(a);
+    REQUIRE(d);
+    CHECK(d->object_id == acct_id);
+  }
+  SECTION("an insert before the changed row: the duplicate comes first, 23505") {
+    db->execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1}, std::int64_t{10}});
+    auto a = db->begin();
+    a.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{2}, std::int64_t{0}});
+    a.execute("UPDATE acct SET bal = $2 WHERE id = $1", {std::int64_t{1}, std::int64_t{11}});
+    auto b = db->begin();
+    take(b, 2, false);
+    CHECK(b.commit() == CommitOutcome::Committed);
+    auto d = duplicate(a);
+    REQUIRE(d);
+    CHECK(d->object_id == acct_id);
   }
   SECTION("a unique value a later statement moved away claims nothing: not 23505") {
     auto a = db->begin();
