@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// tpcc_schema.cppm — the TPROC-C schema HammerDB builds, as the SQL DDL the
+// tprocc_schema.cppm — the TPROC-C schema HammerDB builds, as the SQL DDL the
 // catalog runs: the fixture the validation phase's hand-written plans are
 // written against (#487, *Order*).
 //
@@ -18,11 +18,11 @@ module;
 #include <array>
 #include <string_view>
 
-export module bytecask.sql.tests.tpcc;
+export module bytecask.sql.tests.tprocc;
 
 export namespace sql_test {
 
-inline constexpr std::array<std::string_view, 11> kTpccSchema{
+inline constexpr std::array<std::string_view, 11> kTproccSchema{
     "CREATE TABLE warehouse (w_id INTEGER NOT NULL, w_ytd NUMERIC(12, 2), w_tax NUMERIC(4, 4), "
     "w_name VARCHAR(10), w_street_1 VARCHAR(20), w_street_2 VARCHAR(20), w_city VARCHAR(20), "
     "w_state VARCHAR(2), w_zip VARCHAR(9), PRIMARY KEY (w_id))",

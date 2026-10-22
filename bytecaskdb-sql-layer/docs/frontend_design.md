@@ -32,7 +32,7 @@ HammerDB's MySQL driver also has a client-side mode
 (`mysql_no_stored_procs`, `src/mysql/mysqloltp.tcl`). The driver sends
 each statement itself and keeps the procedure's logic (the random choices,
 `s_quantity`'s wrap, `ol_amount`, the new `c_data`) in the client. These are
-the per-row statements of the TPC-C specification's transaction profiles,
+the per-row statements of the benchmark specification's transaction profiles,
 the ones HammerDB's MySQL procedures run against InnoDB.
 
 **The MVP runs a statement set of its own, written from those
@@ -49,7 +49,7 @@ PostgreSQL what they mean in HammerDB, and one table gains a key
 - Order-Status's derived table, `SELECT … FROM (SELECT … ORDER BY o_id
   DESC) AS sb LIMIT 1`, is flattened to `… ORDER BY o_id DESC LIMIT 1`.
 - `history` has no key in HammerDB. The schema fixture
-  (`tests/tpcc_schema.cppm`) gives it `h_id`, supplied by the harness until
+  (`tests/tprocc_schema.cppm`) gives it `h_id`, supplied by the harness until
   sequences exist. Each `h_id` is unique across threads and runs:
   `(run << 48) | (thread << 40) | n`, with `n` counted per thread from 0.
   - `run` comes from a one-row table of the harness's own,
@@ -591,7 +591,7 @@ its transaction test.
      messages are the table's.
 2. **Multi-statement transactions** (#491, another session): the
    statements of slice 1 run in a `Transaction`. As built: #491's slices A
-   and B, and `tests/proof/test_tpcc.py` runs the TPROC-C transactions
+   and B, and `tests/proof/test_tprocc.py` runs the TPROC-C transactions
    through `Transaction` against PostgreSQL.
 3. **New-Order:** the two-point join, `FOR UPDATE`, integer literals,
    `col + 1`. As built, with these differences from the design above:

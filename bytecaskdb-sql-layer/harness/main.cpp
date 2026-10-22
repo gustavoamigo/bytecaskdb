@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Gustavo Amigo
 //
-// sql_layer_tpcc — the TPC-C harness (docs/testing_design.md, *The TPC-C
+// sql_layer_tprocc — the TPROC-C harness (docs/testing_design.md, *The TPROC-C
 // harness*).
 //
-//   sql_layer_tpcc load --dir D [--warehouses W] [--seed N]
-//   sql_layer_tpcc run  --dir D [--threads 1,16,48] [--warmup S] [--duration S] [--seed N] [--json FILE]
-//   sql_layer_tpcc elle --dir D --config guarded|unguarded|blind [--threads N] [--txns N] [--seed N] --out FILE
+//   sql_layer_tprocc load --dir D [--warehouses W] [--seed N]
+//   sql_layer_tprocc run  --dir D [--threads 1,16,48] [--warmup S] [--duration S] [--seed N] [--json FILE]
+//   sql_layer_tprocc elle --dir D --config guarded|unguarded|blind [--threads N] [--txns N] [--seed N] --out FILE
 //
-// run checks TPC-C's consistency conditions after its last phase. Any error
+// run checks the benchmark specification's consistency conditions after its last phase. Any error
 // but a retried 40001, and any failed condition, exits non-zero.
 
 #include <chrono>
@@ -26,9 +26,9 @@
 #include <vector>
 
 import bytecask.sql.api;
-import bytecask.sql.tpcc;
+import bytecask.sql.tprocc;
 
-namespace tpcc = bytecask::sql::tpcc;
+namespace tprocc = bytecask::sql::tprocc;
 
 namespace {
 
@@ -80,7 +80,7 @@ auto list(const std::string& s) -> std::vector<std::size_t> {
 
 auto run_main(int argc, char** argv) -> int {
   if (argc < 2) {
-    std::fputs("usage: sql_layer_tpcc load|run|elle --dir D [...]\n", stderr);
+    std::fputs("usage: sql_layer_tprocc load|run|elle --dir D [...]\n", stderr);
     return 2;
   }
   const std::string_view cmd{argv[1]};
@@ -92,7 +92,7 @@ auto run_main(int argc, char** argv) -> int {
     }
     auto db = bytecask::sql::Database::open(dir);
     const auto start = std::chrono::steady_clock::now();
-    tpcc::load(*db, {.warehouses = number<std::int64_t>(f, "warehouses", "1"),
+    tprocc::load(*db, {.warehouses = number<std::int64_t>(f, "warehouses", "1"),
                      .scale = {},
                      .seed = number<std::uint64_t>(f, "seed", "1"),
                      .rows_per_txn = 2'000});
@@ -101,7 +101,7 @@ auto run_main(int argc, char** argv) -> int {
     return 0;
   }
   if (cmd == "run") {
-    tpcc::RunOptions opts;
+    tprocc::RunOptions opts;
     opts.threads = list(get(f, "threads", "1,16,48"));
     opts.warmup = std::chrono::seconds{number<std::int64_t>(f, "warmup", "10")};
     opts.duration = std::chrono::seconds{number<std::int64_t>(f, "duration", "60")};
@@ -111,15 +111,15 @@ auto run_main(int argc, char** argv) -> int {
     auto db = bytecask::sql::Database::open(dir);
     // Each phase is reported as it ends, so a later phase's failure loses
     // none of the earlier ones.
-    tpcc::run(*db, opts, [&](const tpcc::PhaseReport& r) {
-      std::fputs(tpcc::format_report(r).c_str(), stdout);
+    tprocc::run(*db, opts, [&](const tprocc::PhaseReport& r) {
+      std::fputs(tprocc::format_report(r).c_str(), stdout);
       std::fflush(stdout);
       if (json) {
-        *json << tpcc::json_report(r) << "\n" << std::flush;
+        *json << tprocc::json_report(r) << "\n" << std::flush;
         if (!*json) throw std::runtime_error("cannot write " + f.at("json"));
       }
     });
-    auto bad = tpcc::consistency(*db);
+    auto bad = tprocc::consistency(*db);
     db->close();
     for (const auto& b : bad) std::fprintf(stderr, "consistency: %s\n", b.c_str());
     if (!bad.empty()) return 1;
@@ -128,17 +128,17 @@ auto run_main(int argc, char** argv) -> int {
   }
   if (cmd == "elle") {
     const auto config = get(f, "config", "");
-    tpcc::ElleOptions opts;
-    opts.config = config == "guarded"     ? tpcc::ElleConfig::Guarded
-                  : config == "unguarded" ? tpcc::ElleConfig::Unguarded
-                  : config == "blind"     ? tpcc::ElleConfig::Blind
+    tprocc::ElleOptions opts;
+    opts.config = config == "guarded"     ? tprocc::ElleConfig::Guarded
+                  : config == "unguarded" ? tprocc::ElleConfig::Unguarded
+                  : config == "blind"     ? tprocc::ElleConfig::Blind
                                           : throw std::invalid_argument("--config is guarded, unguarded or blind");
     opts.threads = number<std::size_t>(f, "threads", "8");
     opts.txns = number<std::uint64_t>(f, "txns", "2000");
     opts.seed = number<std::uint64_t>(f, "seed", "1");
     auto out = output(get(f, "out", ""), std::ios::trunc);
     auto db = bytecask::sql::Database::open(dir);
-    auto history = tpcc::elle_history(*db, opts);
+    auto history = tprocc::elle_history(*db, opts);
     db->close();
     out << history << std::flush;
     if (!out) throw std::runtime_error("cannot write " + f.at("out"));
@@ -154,7 +154,7 @@ auto main(int argc, char** argv) -> int {
   try {
     return run_main(argc, argv);
   } catch (const std::exception& e) {
-    std::fprintf(stderr, "sql_layer_tpcc: %s\n", e.what());
+    std::fprintf(stderr, "sql_layer_tprocc: %s\n", e.what());
     return 1;
   }
 }

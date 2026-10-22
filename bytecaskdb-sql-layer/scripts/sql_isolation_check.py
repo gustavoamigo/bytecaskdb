@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Gustavo Amigo
-"""Elle through SQL (docs/testing_design.md, *The TPC-C harness*).
+"""Elle through SQL (docs/testing_design.md, *The TPROC-C harness*).
 
-Records list-append histories through the SQL layer with `sql_layer_tpcc
+Records list-append histories through the SQL layer with `sql_layer_tprocc
 elle`, and checks them with the engine's tooling: run_elle and cross_check
 from scripts/run_isolation_check.py, the same rules as the engine's check
 (docs/isolation_checking_design.md) but the commit-order one, which needs a
@@ -21,7 +21,7 @@ Each round runs the three configurations from one seed:
 
 Usage:
     python3 bytecaskdb-sql-layer/scripts/sql_isolation_check.py \\
-        --binary build/linux/x86_64/releasedbg/sql_layer_tpcc [--elle-jar elle-cli.jar] \\
+        --binary build/linux/x86_64/releasedbg/sql_layer_tprocc [--elle-jar elle-cli.jar] \\
         [--rounds N] [--txns N] [--threads N] [--seed S] [--out DIR]
 
 Without --elle-jar only the cross-check runs.

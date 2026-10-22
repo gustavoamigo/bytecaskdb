@@ -130,7 +130,7 @@ Rules for slice 4 (#492):
   no unique index holds. `served` decides whether the layer plans it, as
   for a `SELECT` without `ORDER BY`; the counts must agree.
 
-`test_tpcc.py` runs TPROC-C's Payment, Order-Status, New-Order and Delivery
+`test_tprocc.py` runs TPROC-C's Payment, Order-Status, New-Order and Delivery
 through SQL against PostgreSQL: a small fixture (one warehouse, two
 districts, thirty customers each, some with a NULL `c_first`, fifty items
 and their stock, the orders without a carrier undelivered in `new_order`),
@@ -141,7 +141,7 @@ district's oldest undelivered order; the rest are in roughly TPROC-C's mix
 of the other three. One New-Order in twenty names an item that does not
 exist and rolls back. Every statement's result and every table after the
 run must agree.
-The schema is read from `tests/tpcc_schema.cppm`, its one definition.
+The schema is read from `tests/tprocc_schema.cppm`, its one definition.
 
 Fixed cases are plain pytest functions at the end of the file. They call
 the machine's steps in a set order. Every failure Hypothesis finds is
@@ -181,11 +181,11 @@ LSAN_OPTIONS=suppressions=$PWD/bytecaskdb-sql-layer/tests/lsan_alloc_sweeps.supp
   build/linux/x86_64/debug/sql_layer_tests "[alloc]"
 ```
 
-## The TPC-C harness
+## The TPROC-C harness
 
 Status: **design, approved (owner, 2026-10-21).** The harness runs
-TPROC-C's transaction mix through the embedded API: it checks TPC-C's
-consistency conditions, runs Elle through SQL and the CI smoke test, and
+TPROC-C's transaction mix through the embedded API: it checks the benchmark
+specification's consistency conditions, runs Elle through SQL and the CI smoke test, and
 gives the layer's numbers with no network. It is not the MVP gate, which is
 HammerDB over the wire (`docs/frontend_design.md`, *The MVP gate* and
 Decision 7). This section is what the harness does; the
@@ -194,21 +194,21 @@ statements it sends and the `h_id` scheme are `frontend_design.md`'s
 repeated here.
 
 **One binary, three commands.** `harness/main.cpp`, xmake target
-`sql_layer_tpcc` (not built by default, as `sql_layer_bench`):
-`sql_layer_tpcc load`, `sql_layer_tpcc run` and `sql_layer_tpcc elle`. The
+`sql_layer_tprocc` (not built by default, as `sql_layer_bench`):
+`sql_layer_tprocc load`, `sql_layer_tprocc run` and `sql_layer_tprocc elle`. The
 loader, the transactions and the checks are one module,
-`bytecask.sql.tpcc` (`harness/tpcc.cppm`), which the smoke test in
+`bytecask.sql.tprocc` (`harness/tprocc.cppm`), which the smoke test in
 `sql_layer_tests` uses too. Run it from a `releasedbg` build: a debug
 engine walks every key-directory entry on each commit it publishes, so at
-TPC-C's scale a commit takes hundreds of milliseconds. Everything goes through the
+the specification's scale a commit takes hundreds of milliseconds. Everything goes through the
 embedded API (`Database`, `Transaction`, `Statement`), in the harness's
 own process. It links the testing build of the layer, as `bytecask_sql`
 does, for the engine's `stats()`, which the embedded API keeps there. Every statement is prepared once, before the threads start,
 and shared by them.
 
 **The loader.**
-- `load --dir D --warehouses W`: the schema fixture (`tests/tpcc_schema.cppm`),
-  then TPC-C's initial population (clause 4.3.3): 100,000 items; per
+- `load --dir D --warehouses W`: the schema fixture (`tests/tprocc_schema.cppm`),
+  then the specification's initial population (clause 4.3.3): 100,000 items; per
   warehouse 100,000 stock rows and 10 districts; per district 3,000
   customers with one history row each, 3,000 orders with their lines, and
   the last 900 orders in `new_order`. Random strings, `c_last` from the
@@ -244,7 +244,7 @@ and shared by them.
   of Payments when `W > 1`; `h_amount` from 1.00 to 5,000.00; a `BC`
   customer's new `c_data`. The client logic is the harness's, as in
   HammerDB's client-side driver.
-- One difference from TPC-C, as in HammerDB: Payment does not update
+- One difference from the specification, as in HammerDB: Payment does not update
   `c_ytd_payment` or `c_payment_cnt`, since it runs HammerDB's statements
   (P9, P10) by decision.
 - One `Transaction` per TPROC-C transaction, committed with `commit()`.
@@ -281,7 +281,7 @@ An error in any thread ends its phase at once. These runs are the only performan
 numbers the harness produces; there are no micro-benchmarks.
 
 **Consistency after a run.** After the last phase, the harness checks
-TPC-C's consistency conditions (clause 3.3.2) for the transactions in the
+the specification's consistency conditions (clause 3.3.2) for the transactions in the
 mix, through SQL: `warehouse` and `district` by a key range, and `history`
 in pages of 10,000 rows in `h_id` order, so no run holds it all:
 - with Payment: condition 1 (`w_ytd` is the sum of its districts'
@@ -291,8 +291,8 @@ in pages of 10,000 rows in `h_id` order, so no run holds it all:
 
 A failed condition exits non-zero.
 
-**The smoke test.** `tpcc: a short mixed run keeps TPC-C's consistency
-conditions` is a Catch2 test in `sql_layer_tests`. It loads two warehouses
+**The smoke test.** `tprocc: a short mixed run keeps the specification's
+consistency conditions` is a Catch2 test in `sql_layer_tests`. It loads two warehouses
 at a tiny scale, then runs four threads for a few hundred transactions. It
 requires that every type in the mix completed at least once, that no
 error other than 40001 occurred, and that the consistency conditions hold.
@@ -337,11 +337,11 @@ and `scripts/sql_isolation_check.py` checks it with the engine's tooling:
 Commands:
 
 ```sh
-xmake f -m releasedbg --sql_layer=y && xmake build sql_layer_tpcc
-sql_layer_tpcc load --dir /tmp/tpcc --warehouses 48
-sql_layer_tpcc run --dir /tmp/tpcc --threads 1,16,48 --duration 300 --warmup 60
+xmake f -m releasedbg --sql_layer=y && xmake build sql_layer_tprocc
+sql_layer_tprocc load --dir /tmp/tprocc --warehouses 48
+sql_layer_tprocc run --dir /tmp/tprocc --threads 1,16,48 --duration 300 --warmup 60
 python3 bytecaskdb-sql-layer/scripts/sql_isolation_check.py \
-  --binary build/linux/x86_64/releasedbg/sql_layer_tpcc --elle-jar elle-cli.jar --rounds 4
+  --binary build/linux/x86_64/releasedbg/sql_layer_tprocc --elle-jar elle-cli.jar --rounds 4
 ```
 
 ## Known differences

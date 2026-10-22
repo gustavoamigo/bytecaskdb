@@ -18,7 +18,7 @@
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
 
 import bytecask.sql.api;
-import bytecask.sql.tests.tpcc;
+import bytecask.sql.tests.tprocc;
 import bytecask.sql.tests.util;
 
 using namespace bytecask::sql;
@@ -99,22 +99,22 @@ auto i(std::int64_t v) -> Value { return v; }
 
 }  // namespace
 
-TEST_CASE("TPROC-C: the schema is created by SQL DDL, persists and reopens", "[sql][catalog][tpcc]") {
-  sql_test::TempDir dir{"tpcc"};
+TEST_CASE("TPROC-C: the schema is created by SQL DDL, persists and reopens", "[sql][catalog][tprocc]") {
+  sql_test::TempDir dir{"tprocc"};
   {
     auto db = Database::open(dir.path());
-    for (auto ddl : sql_test::kTpccSchema) {
+    for (auto ddl : sql_test::kTproccSchema) {
       INFO(ddl);
       CHECK(db->execute(ddl).affected == 0);
     }
     check_schema(*db->catalog());
-    CHECK(db->catalog()->version() == sql_test::kTpccSchema.size());
+    CHECK(db->catalog()->version() == sql_test::kTproccSchema.size());
     db->close();
   }
   auto db = Database::open(dir.path());
   auto cat = db->catalog();
   check_schema(*cat);
-  CHECK(cat->version() == sql_test::kTpccSchema.size());
+  CHECK(cat->version() == sql_test::kTproccSchema.size());
 
   // Writes and reads through generated plans, on the reopened catalog.
   constexpr auto kCustIns = "INSERT INTO customer (c_w_id, c_d_id, c_id, c_first, c_last, c_balance) "

@@ -607,7 +607,7 @@ python ./scripts/run_engine_bench.py
 ./bytecaskdb-mariadb-plugin/benchmarks/run-sysbench.sh \
   --engines=bytecaskdb,innodb --workloads=oltp_insert --threads=1,16
 
-# TPROC-C (TPC-C derived) through HammerDB, ByteCaskDB vs InnoDB.
+# HammerDB's TPROC-C, ByteCaskDB vs InnoDB.
 ./bytecaskdb-mariadb-plugin/benchmarks/run-hammerdb.sh --warehouses=20 --vus=8,16
 
 # The same, across builds: each branch or commit in a worktree of its own,
