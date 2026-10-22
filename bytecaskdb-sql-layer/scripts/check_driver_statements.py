@@ -5,7 +5,7 @@
 check against PostgreSQL (docs/server_design.md, *The HammerDB driver*).
 
 The driver's statements are the `set ::SQL(name) {...}` lines of
-hammerdb/bytecask_tprocc.tcl. Each must be one tests/proof/test_tpcc.py
+hammerdb/bytecask_tprocc.tcl. Each must be one tests/proof/test_tprocc.py
 runs against PostgreSQL 17, or one in PENDING: Stock-Level's, which the
 proof gains with the front end's slice 5. A PENDING statement the proof
 already runs is stale and fails too, so the list empties as slices land.
@@ -53,13 +53,13 @@ def proved_statements(path: pathlib.Path) -> set[str]:
 def main() -> int:
     root = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__).resolve().parents[1]
     driver = driver_statements(root / "hammerdb" / "bytecask_tprocc.tcl")
-    proved = proved_statements(root / "tests" / "proof" / "test_tpcc.py")
+    proved = proved_statements(root / "tests" / "proof" / "test_tprocc.py")
     failures = []
     if not driver:
         failures.append("no `set ::SQL(name) {...}` statements found in hammerdb/bytecask_tprocc.tcl")
     for name, sql in sorted(driver.items()):
         if sql not in proved and sql not in PENDING:
-            failures.append(f"{name}: not a statement tests/proof/test_tpcc.py checks against PostgreSQL: {sql}")
+            failures.append(f"{name}: not a statement tests/proof/test_tprocc.py checks against PostgreSQL: {sql}")
     for sql in sorted(PENDING & proved):
         failures.append(f"PENDING holds a statement the proof now runs; remove it: {sql}")
     for f in failures:

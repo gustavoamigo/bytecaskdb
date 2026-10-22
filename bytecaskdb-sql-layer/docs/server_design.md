@@ -14,12 +14,9 @@ front of it. The gate needs the PostgreSQL protocol and nothing else, so the
 protocol comes first, as a thin stateful front over the embedded API. gRPC
 stays in #494, after this slice.
 
-Names: the benchmark is HammerDB's TPROC-C, and this design uses that name
-for the layer's files and binaries. The harness is on main as
-`sql_layer_tpcc` and `harness/tpcc.cppm` (#543). A rename PR in progress
-makes them `sql_layer_tprocc` and `harness/tprocc.cppm`, and retitles
-`testing_design.md`'s section *The TPROC-C harness*. This design uses those
-names, and builds after the rename.
+Names: the benchmark is HammerDB's TPROC-C, and the layer's files and
+binaries use that name (the harness is `sql_layer_tprocc`,
+`harness/tprocc.cppm`, since #547).
 HammerDB's own identifiers, `dbset bm TPC-C` and `diset tpcc …`, are the
 tool's and stay.
 

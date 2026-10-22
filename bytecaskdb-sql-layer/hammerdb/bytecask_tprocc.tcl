@@ -6,7 +6,7 @@
 # (docs/server_design.md, *The HammerDB driver*): a port of the client-side
 # logic of HammerDB's MySQL driver (src/mysql/mysqloltp.tcl, its
 # mysql_no_stored_procs procedures and timed monitor) to pgtcl, sending the
-# statements of docs/frontend_design.md, which tests/proof/test_tpcc.py
+# statements of docs/frontend_design.md, which tests/proof/test_tprocc.py
 # checks against PostgreSQL 17. scripts/check_driver_statements.py fails
 # CI if a statement here is not one of those.
 #
@@ -29,7 +29,7 @@ set mix {neword payment ostat delivery} ;# Transaction types to run; slev once f
 
 #LOAD LIBRARIES AND MODULES
 if [catch {package require Pgtcl} message] { error "Failed to load Pgtcl - $message" }
-if [catch {package require tpcccommon} ] { error "Failed to load tpcc common functions" } else { namespace import tpcccommon::* }
+if [catch {package require tpcccommon} ] { error "Failed to load HammerDB's tpcccommon functions" } else { namespace import tpcccommon::* }
 
 if { [ chk_thread ] eq "FALSE" } {
     error "The TPROC-C timed script must run in a thread-enabled interpreter"
