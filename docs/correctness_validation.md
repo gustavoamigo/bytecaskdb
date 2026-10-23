@@ -2066,8 +2066,9 @@ or load patterns.
 
 TSan needs ASLR control: on a runner whose `vm.mmap_rnd_bits` is too high for
 its memory layout it re-execs itself with `personality(ADDR_NO_RANDOMIZE)`.
-Docker's default seccomp profile refuses that call, so the CI thread leg runs
-its `fedora:43` container with `--security-opt seccomp=unconfined` (the other
+Docker's default seccomp profile refuses that call, so the CI thread legs (Sanitizers
+and the nightly soak) run
+their `fedora:43` container with `--security-opt seccomp=unconfined` (the other
 legs keep the default profile). Without it the binary exits at startup and no
 test runs (#558).
 
