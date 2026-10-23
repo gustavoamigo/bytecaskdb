@@ -685,11 +685,6 @@ of *Tests*, and `--pg` names the PostgreSQL it checks the driver on (its
 password in `PGPASSWORD`). `XMAKE_FLAGS` adds `xmake f` flags, as CI sets
 its toolchain.
 
-TinyCC is built with `--with-selinux` whenever SELinux is enabled on the
-build machine (`xmake.lua`): in enforcing mode its default way of making
-plan code executable, `mprotect`, is refused, and no plan links. It maps
-the code through a file instead, which works in every mode.
-
 1. **Build.** It builds `sql_layer_tprocc` and `sql_layer_server` in
    `releasedbg`; a debug engine walks the key directory on every commit.
 2. **Load.** It loads W warehouses once with `sql_layer_tprocc load`, not
