@@ -131,6 +131,9 @@ enum class EffectKind { Put, Del, DelRange, GuardUnchanged, GuardRange, GuardPre
 struct Effect {
   EffectKind kind;
   Bytes a, b;
+  // A unique check's range guard: the index entry the statement put. The
+  // guard counts at commit only while the final writes still put it.
+  Bytes unique_entry{};
 };
 
 [[nodiscard]] auto is_write(const Effect& e) -> bool {
@@ -1750,7 +1753,8 @@ void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
     cx->raise(BC_C_UNIQUE, ix.id);
     return false;
   }
-  cx->push_effect(EffectKind::GuardRange, prefix, bytecask::sql::key_successor(prefix));
+  auto hi = bytecask::sql::key_successor(prefix);
+  cx->effects.push_back({EffectKind::GuardRange, Bytes(prefix.begin(), prefix.end()), Bytes(hi.begin(), hi.end()), entry.key});
   if (claim) cx->claims.push_back({ix.id, entry.key, entry.prefix_len});
   return true;
 }
@@ -2089,7 +2093,7 @@ bool bc_txn_add(bc_ctx* cx) {
       case EffectKind::GuardRange:
       case EffectKind::GuardPresent:
       case EffectKind::GuardAbsent:
-        txn->guard_bytes += held(e.a.capacity()) + held(e.b.capacity());
+        txn->guard_bytes += held(e.a.capacity()) + held(e.b.capacity()) + held(e.unique_entry.capacity());
         txn->guards.push_back(std::move(e));
         break;
     }
@@ -2160,6 +2164,9 @@ enum bc_commit_result bc_txn_commit(bc_txn* txn, bool sync) {
     }
   }
   for (const auto& e : txn->guards) {
+    // A unique check a later statement made stale guards nothing: the final
+    // writes hold no such entry, as conflict_or_duplicate decides for claims.
+    if (!e.unique_entry.empty() && !ov.puts(e.unique_entry)) continue;
     switch (e.kind) {
       case EffectKind::GuardUnchanged: plan.ensure_unchanged(e.a); break;
       case EffectKind::GuardRange: plan.ensure_range_unchanged(e.a, e.b); break;
