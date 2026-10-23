@@ -2435,6 +2435,30 @@ int64_t bc_sub(bc_ctx* cx, int64_t a, int64_t b) {
   return {};
 }
 
+// An int64 overflow is a BIGINT leaving its type, as in PostgreSQL: the same
+// range error the row builder and bc_check_int raise for the narrower types.
+int64_t bc_add_bigint(bc_ctx* cx, int64_t a, int64_t b, uint32_t object_id) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return 0;
+  std::int64_t r = 0;
+  if (!__builtin_add_overflow(a, b, &r)) return r;
+  cx->raise(BC_C_RANGE, object_id, "bigint out of range");
+  return 0;
+  BC_GUARD_END(cx)
+  return {};
+}
+
+int64_t bc_sub_bigint(bc_ctx* cx, int64_t a, int64_t b, uint32_t object_id) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return 0;
+  std::int64_t r = 0;
+  if (!__builtin_sub_overflow(a, b, &r)) return r;
+  cx->raise(BC_C_RANGE, object_id, "bigint out of range");
+  return 0;
+  BC_GUARD_END(cx)
+  return {};
+}
+
 int64_t bc_mul(bc_ctx* cx, int64_t a, int64_t b) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return 0;

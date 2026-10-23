@@ -854,9 +854,10 @@ void print_set(Writer& w, const ir::Update& s) {
       value = read_col(w, e.col, "old");
       null_if = null_src;
     } else {
-      auto fn = e.kind == ir::Expr::Kind::Add ? "bc_add" : "bc_sub";
-      value = std::string{fn} + "(cx, " + read_col(w, e.col, "old") + ", " +
-              (e.constant ? constant(*e.constant) : param(PhysType::I64, e.param)) + ")";
+      auto fn = std::string{e.kind == ir::Expr::Kind::Add ? "bc_add" : "bc_sub"} + (e.col.bigint ? "_bigint" : "");
+      value = fn + "(cx, " + read_col(w, e.col, "old") + ", " +
+              (e.constant ? constant(*e.constant) : param(PhysType::I64, e.param)) +
+              (e.col.bigint ? ", " + w.tbl() : "") + ")";
       if (!e.constant) null_if = (null_src.empty() ? "" : null_src + " || ") + param_null(e.param);
       else null_if = null_src;
     }

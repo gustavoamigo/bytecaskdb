@@ -53,7 +53,7 @@ using Op = ast::Compare::Op;
 
 auto column(const Table& t, std::uint32_t id) -> ir::Column {
   const auto& c = *t.column(id);
-  return {c.id, c.type, c.nullable, t.id};
+  return {c.id, c.type, c.nullable, t.id, c.sql.kind == SqlKind::BigInt};
 }
 
 // An equality the key can take: with a parameter, not a computed value.

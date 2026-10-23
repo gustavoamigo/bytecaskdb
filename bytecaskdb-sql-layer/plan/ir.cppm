@@ -38,6 +38,7 @@ struct Column {
   PhysType type{PhysType::I64};
   bool nullable{false};
   std::uint32_t table{0};  // the plan's table, or a join's other one
+  bool bigint{false};      // SQL BIGINT, the one integer type whose + and - can leave int64
 };
 
 // A value set into a row: a parameter, a column of the row in hand, or a

@@ -990,6 +990,7 @@ namespace {
 
 constexpr RangeMessage kRangeMessages[] = {
     {"smallint out of range", "22003"},
+    {"bigint out of range", "22003"},
     {"integer out of range", "22003"},
     {"value out of range: overflow", "22003"},   // REAL
     {"value out of range: underflow", "22003"},  // REAL

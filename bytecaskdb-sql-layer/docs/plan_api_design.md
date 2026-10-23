@@ -449,6 +449,8 @@ return zero.
 ```c
 int64_t bc_add(bc_ctx *, int64_t, int64_t);     /* overflow → error */
 int64_t bc_sub(bc_ctx *, int64_t, int64_t);
+int64_t bc_add_bigint(bc_ctx *, int64_t, int64_t, uint32_t object_id);  /* overflow: BC_C_RANGE on object_id */
+int64_t bc_sub_bigint(bc_ctx *, int64_t, int64_t, uint32_t object_id);
 int64_t bc_mul(bc_ctx *, int64_t, int64_t);
 int64_t bc_div(bc_ctx *, int64_t, int64_t);     /* zero divisor, INT64_MIN / -1 → error */
 int64_t bc_mod(bc_ctx *, int64_t, int64_t);
@@ -469,6 +471,13 @@ defined for every input, and NaN and infinities propagate as SQL expects the
 compiler to handle. Byte comparisons are for encoded or binary columns; the
 compiler emits comparisons on sort keys it built, never on raw text, and on
 TEXT and VARCHAR columns compared under `COLLATE "C"`, byte order.
+
+`bc_add_bigint` and `bc_sub_bigint` are `bc_add` and `bc_sub` for a value
+that is stored in a BIGINT column (`SET col = col ± $n`): the only integer
+type whose sum can leave `int64`. An overflow is the same range error
+`bc_check_int` raises, on `object_id`, with PostgreSQL's words ("bigint out of
+range", SQLSTATE 22003, #540), where `bc_add` stays `BC_E_ARITH` for
+aggregates and intermediates.
 
 `bc_check_int` is the range check of a computed integer (added in the
 front end's slice 5): it returns `v` when it is inside the SQL type the

@@ -329,7 +329,7 @@ needed; every pattern below uses calls `bc_plan.h` declares.
 | A nullable ordered part, its NULLs placed as PostgreSQL places them | `NullSplitScan` | two `bc_scan_open`s. Present values: `bc_scan_open(lo = bc_key_successor(prefix + NULL), hi = bc_key_successor(prefix))`, no `BC_SCAN_PREFIX`. NULL part: `bc_scan_open(prefix + NULL, prefix + NULL, BC_SCAN_PREFIX)`, where `prefix + NULL` is the prefix's key with `bc_key_null` appended. `ASC`: present values forward, then the NULL part; `DESC`: the NULL part reversed, then the present values reversed. One loop body, one `LIMIT` counter |
 | A covering read | `Scan::covering` | `bc_key_part_*` on `bc_scan_key`; otherwise `bc_scan_row` |
 | A residual filter | `Loop::residual` | `bc_col_*` or `bc_key_part_*`, compared in an `if` that `continue`s; a NULL operand rejects the row |
-| `+` / `-` | `Expr{Add, Sub}` | `bc_add` / `bc_sub`, then the range check of its type (*Additions*) |
+| `+` / `-` | `Expr{Add, Sub}` | `bc_add` / `bc_sub`, then the range check of its type (*Additions*); in a `SET` of a BIGINT column, `bc_add_bigint` / `bc_sub_bigint` |
 | `SET col = col + $1` | `Update{set}` | `bc_row_from`, `bc_row_set_*` with the sum, `bc_update` |
 | UPDATE or DELETE of many rows | `Update{rows}`, `Delete{rows}` with a `Scan` | the scan, with `bc_update` / `bc_delete` per row; `bc_emit_count` with the rows written |
 | `ORDER BY` | the access path's order | none: the planner picks a path in that order |
@@ -580,7 +580,9 @@ its transaction test.
      one (*Known differences* in `docs/testing_design.md`). The operand is
      range-checked as the column, a `DECIMAL` operand against 18 digits at
      the column's scale, so the sum stays inside `int64` and the row
-     builder's check of it is 22003. A BIGINT overflow is still `BC_E_ARITH`, not 22003 (#540).
+     builder's check of it is 22003. A BIGINT's sum can leave `int64`, so the
+     plan adds with `bc_add_bigint` / `bc_sub_bigint`, which raise
+     `BC_C_RANGE`, "bigint out of range" (#540).
    - `FOR UPDATE` (#491, slice B) works with every scan here, `ORDER BY`
      and `LIMIT` included: each row returned is guarded, read from the
      row, never covering. With `COUNT` it is refused, as PostgreSQL
@@ -616,7 +618,7 @@ its transaction test.
      assignment makes, whether PostgreSQL typed the literal integer or
      bigint. On a SMALLINT or INTEGER column a literal of 2^32 or more in
      magnitude is held as 2^32: the sum leaves the column either way, and
-     cannot overflow `int64_t` (BIGINT's overflow is #540).
+     cannot overflow `int64_t`; a BIGINT column's can, and is 22003 as above (#540).
    - `FOR UPDATE` is #538's (#491, slice B).
 4. **Delivery:** the covering prefix scan with `LIMIT 1`, `MIN`, `UPDATE`
    of many rows, `SUM`. As built, with these differences from the design
