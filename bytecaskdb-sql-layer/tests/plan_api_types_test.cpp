@@ -691,6 +691,26 @@ TEST_CASE("plan API: bc_row_key rebuilds the scan key and bc_pin outlives the st
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
 }
 
+namespace {
+// One row with no columns per row of t: SELECT FROM t.
+void emit_empty_rows(bc_ctx* cx) {
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_emit_begin(cx);
+    bc_emit_end(cx);
+  }
+}
+}  // namespace
+
+TEST_CASE("plan API: a ref that declares no result types allows rows of no columns", "[sql][algebra]") {
+  Fixture f;
+  CHECK(run(f, emit_empty_rows, {}) == BC_COMMITTED);
+  CHECK(f.results({}).empty());
+  seed_t(f);
+  CHECK(run(f, emit_empty_rows, {}) == BC_COMMITTED);
+  CHECK(f.results({}) == std::vector<std::vector<bc_value>>(3));
+}
+
 TEST_CASE("plan API: result rows follow the schema ref's types; limits and types are checked", "[sql][algebra]") {
   Fixture f;
   auto ps = params({});

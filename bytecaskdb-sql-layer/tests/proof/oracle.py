@@ -247,8 +247,9 @@ def run_psycopg(conn, text: str, values, sql: str) -> Outcome:
     try:
         with conn.cursor() as cur:
             cur.execute(text, values)
-            rows = cur.fetchall() if cur.description else []
-            oids = [d.type_code for d in cur.description] if cur.description else []
+            # A statement with no columns has an empty description, not None.
+            rows = cur.fetchall() if cur.description is not None else []
+            oids = [d.type_code for d in cur.description] if cur.description is not None else []
             affected = cur.rowcount if changes_rows(sql) else None
             raw = raw_text(cur)
     except (psycopg.OperationalError, psycopg.InterfaceError):

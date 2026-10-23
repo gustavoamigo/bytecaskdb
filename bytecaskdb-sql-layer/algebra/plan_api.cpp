@@ -2246,8 +2246,8 @@ bool bc_param_null(bc_ctx* cx, uint32_t i) {
 void bc_emit_begin(bc_ctx* cx) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return;
-  if (!cx->has_ref || cx->verified.result_types.empty()) {
-    cx->fail(BC_L_PLAN, "the plan's schema ref declares no result types");
+  if (!cx->has_ref) {
+    cx->fail(BC_L_PLAN, "the plan declares no schema ref, so no result layout");
     return;
   }
   if (cx->emit) {

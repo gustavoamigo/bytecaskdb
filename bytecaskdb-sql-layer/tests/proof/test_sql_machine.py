@@ -1833,6 +1833,24 @@ def test_a_join_on_a_column(dsn):
         m.teardown()
 
 
+def test_an_empty_select_list_returns_a_row_of_no_columns_per_match(dsn):
+    """SELECT FROM t WHERE …: one empty row per match, none for no match, and
+    one per row of a range."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER, nullable=False),
+                              Column("c2", o.TEXT)], ["c0", "c1"]))
+        for c1 in (1, 2, 3):
+            m.insert("t0", {"c0": 1, "c1": c1, "c2": "a"}, all_columns=True)
+        m.insert("t0", {"c0": 2, "c1": 1, "c2": None}, all_columns=True)
+        for where in ([("c0", "=", 1), ("c1", "=", 2)], [("c0", "=", 1), ("c1", "=", 9)], [("c0", "=", 9)],
+                      [("c0", "=", None)], [("c0", "=", 1)], [("c0", ">=", 1)]):
+            m.select("t0", [], where)
+        m.select("t0", [], [("c0", "=", 1)], limit=2)
+    finally:
+        m.teardown()
+
+
 def test_count_distinct(dsn):
     """COUNT(DISTINCT col) counts distinct non-NULL values, -0.0 and 0.0 as
     one; 0 over no rows, and none under LIMIT 0."""
