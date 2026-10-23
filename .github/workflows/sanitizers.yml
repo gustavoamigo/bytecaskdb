@@ -57,6 +57,11 @@ jobs:
     timeout-minutes: ${{ matrix.sanitizer == 'memory' && 120 || 60 }}
     container:
       image: fedora:43
+      # TSan re-execs itself with personality(ADDR_NO_RANDOMIZE) when the
+      # runner's vm.mmap_rnd_bits is too high for its memory layout. Docker's
+      # default seccomp profile refuses that personality, and the binary dies
+      # at startup with no test run (#558). Only the TSan leg loosens it.
+      options: ${{ matrix.sanitizer == 'thread' && '--security-opt seccomp=unconfined' || '' }}
     env:
       BYTECASK_MARCH: x86-64-v3
       XMAKE_ROOT: "y"
