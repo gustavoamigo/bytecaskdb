@@ -392,7 +392,8 @@ struct DatabaseOptions {
 // between a DDL's batch reaching the engine and its catalog taking effect.
 class Database {
 public:
-  // Throws std::invalid_argument for a sync_interval_ms outside 1 to 60,000.
+  // Throws std::invalid_argument for a sync that is not a SyncMode, or a
+  // sync_interval_ms outside 1 to 60,000.
   [[nodiscard]] static auto open(const std::filesystem::path& dir, DatabaseOptions opts = {})
       -> std::unique_ptr<Database>;
   ~Database();
@@ -473,6 +474,9 @@ private:
   // The AtInterval flusher: an empty synced write returns once every earlier
   // write is durable, and costs no fdatasync when none is waiting.
   void sync_loop(std::chrono::milliseconds interval);
+  // Stops and joins the flusher, if one runs. A concurrent call waits for the
+  // join, so no caller goes on to close the engine under a running flusher.
+  void stop_flusher();
   // Takes life_->mu shared for a call, or throws DbClosed.
   [[nodiscard]] auto enter() const -> std::shared_lock<std::shared_mutex>;
   // The same calls, under the lock enter() took.
@@ -498,7 +502,8 @@ private:
   std::mutex flush_mu_;
   std::condition_variable flush_cv_;
   bool flush_stop_{false};  // under flush_mu_
-  std::thread flusher_;      // AtInterval only; joined by close() before the engine closes
+  std::mutex flusher_stop_mu_;  // held across the join by stop_flusher()
+  std::thread flusher_;         // AtInterval only; joined before the engine closes
   std::unique_ptr<DB> db_;
   std::unique_ptr<LiveCatalog> live_;
   bc_db bdb_{};
@@ -696,6 +701,10 @@ auto Statement::command() const -> Command {
 }
 
 auto Database::open(const std::filesystem::path& dir, DatabaseOptions opts) -> std::unique_ptr<Database> {
+  if (opts.sync != SyncMode::AtEveryCommit && opts.sync != SyncMode::AtInterval &&
+      opts.sync != SyncMode::AtFileRotation) {
+    throw std::invalid_argument("sync is not a SyncMode");  // a cast integer: refused, not a silent mode
+  }
   if (opts.sync_interval_ms < 1 || opts.sync_interval_ms > 60'000) {
     throw std::invalid_argument("sync_interval_ms is 1 to 60000");
   }
@@ -727,9 +736,15 @@ void Database::sync_loop(std::chrono::milliseconds interval) {
       (void)db_->apply_batch(WriteOptions{.sync = true}, WritePlan{});
       failing = false;
     } catch (const std::exception& e) {
-      // The engine degrades on a failed sync: later writes throw DbDegraded.
       if (!failing) std::fprintf(stderr, "bytecask sql: background sync failed: %s\n", e.what());
       failing = true;
+      // A failed fdatasync degrades the engine: every later write fails, and
+      // close() throws, naming the commits that are not durable. No sync can
+      // succeed after it, so the flusher stops. Anything else is retried.
+      if (db_->is_degraded()) {
+        std::fprintf(stderr, "bytecask sql: the engine is degraded; background syncs stop\n");
+        return;
+      }
     }
     lock.lock();
   }
@@ -751,17 +766,12 @@ auto Database::enter() const -> std::shared_lock<std::shared_mutex> {
 void Database::close() {
   if (!life_) return;  // open() failed before it was made
   life_->closing.store(true);
+  // Before the exclusive lock: a last sync in flight holds up no other call.
+  // The flusher takes no lock a call holds.
+  stop_flusher();
   std::unique_lock<std::shared_mutex> lock{life_->mu};
   if (life_->closed) return;
   life_->closed = true;
-  if (flusher_.joinable()) {  // before the engine closes; it takes no lock close() holds
-    {
-      std::lock_guard<std::mutex> stop{flush_mu_};
-      flush_stop_ = true;
-    }
-    flush_cv_.notify_one();
-    flusher_.join();
-  }
   // A transaction still open holds the engine's snapshot: ended first, with
   // nothing written, and every later call on it throws. No call is in
   // flight: each holds the lock shared.
@@ -782,6 +792,16 @@ void Database::close() {
   live_.reset();
   if (db_) db_->close();
   db_.reset();
+}
+
+void Database::stop_flusher() {
+  std::lock_guard<std::mutex> once{flusher_stop_mu_};
+  {
+    std::lock_guard<std::mutex> stop{flush_mu_};
+    flush_stop_ = true;
+  }
+  flush_cv_.notify_one();
+  if (flusher_.joinable()) flusher_.join();
 }
 
 auto Database::acquire_context() -> bc_ctx* {

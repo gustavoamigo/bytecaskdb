@@ -124,12 +124,22 @@ decides only whether it waits for `fdatasync`:
   pass `sync = true` to the engine, and concurrent commits share one
   `fdatasync` through its group commit.
 - `AT_INTERVAL`: they pass `sync = false`. A flusher thread, started by
-  `Database::open` and joined by `close()` before the engine closes, runs
-  `apply_batch({.sync = true}, WritePlan{})` every `sync_interval_ms`. The
-  engine returns from that empty synced plan once every earlier write is
-  durable, and does no `fdatasync` when none is waiting. A failed sync is
-  logged once to stderr; the engine degrades, and later writes throw
-  `DbDegraded`.
+  `Database::open`, waits `sync_interval_ms`, runs
+  `apply_batch({.sync = true}, WritePlan{})`, and repeats: a commit is
+  durable once the next sync ends, up to an interval plus a sync's own time
+  after it returns.
+  The engine returns from that empty synced plan once every earlier write is
+  durable, and does no `fdatasync` when none is waiting. `close()` stops and
+  joins the flusher before it takes the exclusive lock, so a last sync in
+  flight holds up no other call, and a concurrent `close()` waits for the
+  join before it closes the engine.
+
+  A failed sync is logged to stderr. A failed `fdatasync` degrades the
+  engine: every later write fails, and `close()` throws `DbDegraded`, naming
+  the commits that are not durable (the server then exits non-zero). No sync
+  can succeed after that, so the flusher stops. Any other failure is logged
+  once and retried at the next interval. No test of the layer reaches this
+  path: its tests have no way to fail an `fdatasync`.
 - `AT_FILE_ROTATION`: they pass `sync = false` and no flusher runs. Data
   reaches the disk when the active file rotates, and at `close()`.
 

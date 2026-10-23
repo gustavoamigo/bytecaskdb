@@ -182,7 +182,7 @@ for vu in "${VU_LIST[@]}"; do
   cp -a --reflink=auto "$PRISTINE" "$cell"
   run="$("$TPROCC" next-run --dir "$cell")"
   port="$(free_port)"
-  "$SERVER" --dir "$cell" --listen "127.0.0.1:$port" --database tprocc "${SERVER_FLAGS[@]}" >"$DATA_ROOT/server.log" 2>&1 &
+  "$SERVER" --dir "$cell" --listen "127.0.0.1:$port" --database tprocc ${SERVER_FLAGS[@]+"${SERVER_FLAGS[@]}"} >"$DATA_ROOT/server.log" 2>&1 &
   server=$!
   for _ in $(seq 100); do grep -q "ready on" "$DATA_ROOT/server.log" && break; sleep 0.1; done
   grep -q "ready on" "$DATA_ROOT/server.log" || { cat "$DATA_ROOT/server.log" >&2; exit 1; }

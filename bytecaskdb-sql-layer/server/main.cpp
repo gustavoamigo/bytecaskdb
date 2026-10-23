@@ -170,10 +170,10 @@ int main(int argc, char** argv) {
     if (f.contains("sync-interval-ms")) {
       const auto& v = f["sync-interval-ms"];
       auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), db_opts.sync_interval_ms);
-      if (ec != std::errc{} || end != v.data() + v.size() || db_opts.sync_interval_ms < 1 ||
-          db_opts.sync_interval_ms > 60'000) {
-        throw std::invalid_argument("--sync-interval-ms takes a number from 1 to 60000");
+      if (ec != std::errc{} || end != v.data() + v.size()) {
+        throw std::invalid_argument("--sync-interval-ms takes a number");
       }
+      // Its range is Database::open's to check, which refuses it before the server listens.
     }
 
     if (f.contains("io-backend")) db_opts.io_backend = io_backend(f["io-backend"]);
