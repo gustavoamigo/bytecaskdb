@@ -6,7 +6,9 @@ the rest reviewed with the coordinator.** Slices 0 to 5 are built
 the SQL the MVP accepts, the intermediate form the code generator prints
 plans from, and the planner's choices, all scoped by TPROC-C (#487, *MVP*).
 The rest of #492 (rewrites, hash joins, `EXPLAIN`, the plan cache's design)
-comes after the MVP and is listed under *Later*.
+comes after the MVP and is listed under *Later*. `planner_design.md`
+replaces *The statement IR* and *The planner's choices* once its first
+slice lands; the dialect subset and the statements stay here.
 
 ## Standing rules
 
