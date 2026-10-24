@@ -78,6 +78,30 @@ void pin_many(bc_ctx* cx) {
   bc_view row = bc_get(cx, bc_key_params(cx, kTbl, 0, 1), &found);
   for (int i = 0; found && i < 3000; ++i) (void)bc_pin(cx, row);
 }
+// A join of t to itself with COUNT(DISTINCT qty): each outer step builds a
+// key, reads a row, runs an inner scan, pins and groups, and the next step
+// releases all but the pin and the group; the groups are then iterated, a
+// loop of its own. Every step, release and pin is an allocation site.
+void join_steps(bc_ctx* cx) {
+  bc_agg groups = bc_agg_open(cx, 0);
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_key k = bc_key_begin(cx, kTbl);
+    bc_key_i64(cx, k, bc_col_i64(cx, bc_scan_row(cx, c), kIdCol));
+    bool found = false;
+    bc_view inner = bc_get(cx, bc_key_end(cx, k), &found);
+    if (!found) continue;
+    bc_cursor ic = bc_scan_open(cx, kIdx, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+    while (bc_scan_next(cx, ic)) (void)bc_pin(cx, bc_scan_key(cx, ic));
+    (void)bc_agg_group(cx, groups, bc_col_key(cx, inner, kQtyCol));
+  }
+  int64_t n = 0;
+  bc_view key = bc_empty(cx);
+  while (bc_agg_next(cx, groups, &key, nullptr)) n = bc_add(cx, n, bc_bytes_eq(cx, bc_pin(cx, key), key) ? 1 : 0);
+  bc_emit_begin(cx);
+  bc_emit_i64(cx, n);
+  bc_emit_end(cx);
+}
 // NULL for the NOT NULL id: by parameter, by bc_row_set_null, left unset.
 void null_id_param(bc_ctx* cx) {
   bc_row r = bc_row_begin(cx, kTbl);
@@ -126,6 +150,7 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
       {"bc_emit_key_part", emit_names, {}, {PhysType::Bytes}, BC_OK},
       {"update", bump_qty, {std::int64_t{3}}, {}, BC_OK},
       {"bc_pin, past one arena chunk", pin_many, {std::int64_t{1}}, {}, BC_OK},
+      {"loop steps released, a join", join_steps, {}, {PhysType::I64}, BC_OK, {{std::int64_t{3}}}},
       {"bc_row_set_param NULL", null_id_param, {bc_value{}}, {}, BC_E_CONSTRAINT},
       {"bc_row_set_null", null_id_set, {}, {}, BC_E_CONSTRAINT},
       {"bc_row_end, a column unset", id_unset, {}, {}, BC_E_CONSTRAINT},

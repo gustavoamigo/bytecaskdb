@@ -94,7 +94,7 @@ costs one lookup in `Database::prepare`'s cache, keyed by the exact text.
 127.0.0.1:5432] [--database NAME] [--max-connections 100]
 [--sync AT_EVERY_COMMIT|AT_INTERVAL|AT_FILE_ROTATION] [--sync-interval-ms 1000]
 [--io-backend pread|mmap|buffer_pool] [--buffer-pool-size BYTES]
-[--buffer-pool-direct-io on|off]` serves one
+[--buffer-pool-direct-io on|off] [--statement-memory-bytes 67108864]` serves one
 database directory under one database name, by default the directory's
 last component. It opens the directory with `Database::open`, so it holds
 the engine's directory lock. The code is in `bytecaskdb-sql-layer/server/`:
@@ -153,6 +153,11 @@ with `O_DIRECT` unless `--buffer-pool-direct-io off`. They change where
 sealed-file reads are served from, not what is read
 (`docs/buffer_pool_design.md`). The pool must hold at least twice the
 engine's file size (default 64 MiB); a smaller one is refused at startup.
+
+**Memory.** `--statement-memory-bytes` is `DatabaseOptions::
+statement_memory_bytes`: the memory budget of every statement the server
+runs, 64 MiB by default (`plan_api_design.md`, *Memory*). A statement past
+it fails with 54000. 0 is refused at startup.
 
 **Threading.** One thread per connection, and an acceptor thread. A
 connection's thread reads a message, runs it on the embedded API, which

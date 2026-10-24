@@ -60,6 +60,11 @@ struct bc_params {
 // context, after the plan ran and before its batch reaches the engine, so a
 // test can make the commit conflict. An empty function removes it.
 void bc_ctx_before_commit_for_testing(bc_ctx* cx, std::function<void()> hook);
+// Test only: the bytes the context's statement is charged now.
+std::uint64_t bc_ctx_held_for_testing(const bc_ctx* cx);
+// Test only: what the context's autocommit executions hold their write set
+// to, in place of the engine's 1 GiB batch limit, from now on.
+void bc_ctx_write_bound_for_testing(bc_ctx* cx, std::uint64_t bytes);
 #endif
 
 }  // extern "C++"
@@ -70,9 +75,23 @@ export using ::bc_params;
 export using ::bc_ctx_affected;
 #ifdef BYTECASK_SQL_TESTING
 export using ::bc_ctx_before_commit_for_testing;
+export using ::bc_ctx_held_for_testing;
+export using ::bc_ctx_write_bound_for_testing;
 #endif
 
 export namespace bytecask::sql {
+
+// What the plan API charges a statement's memory budget for an entry of its
+// own, beside the bytes the entry holds (docs/plan_api_design.md, *Memory*):
+// each handle a plan is given (a view, a pin, a key or row builder, a
+// cursor), and each aggregate group's node. Fixed numbers, so a statement
+// is charged the same on every run and every build; plan_api.cpp checks
+// that each is no less than what it stands for.
+inline constexpr std::uint64_t kViewEntryBytes = 40;
+inline constexpr std::uint64_t kKeyEntryBytes = 64;
+inline constexpr std::uint64_t kRowEntryBytes = 152;
+inline constexpr std::uint64_t kCursorEntryBytes = 408;
+inline constexpr std::uint64_t kGroupEntryBytes = 136;
 
 // Every column of a row, by its layout: NULL, or the typed value; the id of
 // the first malformed column (row_column), never a plausible value. The one

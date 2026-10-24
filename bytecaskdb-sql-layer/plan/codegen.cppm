@@ -542,7 +542,10 @@ private:
   }
 
   // The loop over the open cursor `c`: each entry's row read unless the scan
-  // covers, then k. A LIMIT's counter stops it before the next step.
+  // covers, then k. A LIMIT's counter stops it before the next step, so the
+  // loop can end on an entry: the cursor is closed right after it, which
+  // ends that step (docs/plan_api_design.md, *A loop's step owns what it
+  // allocates*).
   void scan_loop(const physical::Scan& sc, const Consume& k) {
     w_.open("while (" + guard_ + "bc_scan_next(cx, c))");
     if (!sc.covering) {
@@ -556,6 +559,7 @@ private:
     loop_ = outer;
     rows_.pop_back();
     w_.close();
+    if (!guard_.empty()) w_.line("bc_scan_close(cx, c);");
   }
 
   void produce(const physical::Scan& sc, const Consume& k) {
@@ -595,6 +599,7 @@ private:
   }
 
   // MIN from the scan's first entry, past the part's NULLs; none is NULL.
+  // One step, never the scan's end: the cursor is closed after it.
   void produce(const physical::MinFirstEntry& m, const Consume&) {
     if (!m.emits) return;
     const auto& sc = m.scan;
@@ -611,6 +616,7 @@ private:
     w_.otherwise();
     for (const auto& line : no_rows_) w_.line(line);
     w_.close();
+    w_.line("bc_scan_close(cx, c);");
   }
 
   // For each outer row, the inner row its key names. Of an outer column, a
