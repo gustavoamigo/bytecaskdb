@@ -432,3 +432,39 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
   CHECK(rejected(cat, "UPDATE u SET d = d + 100000000000000000 WHERE k = $1").first == "numeric field overflow");
 }
 
+
+TEST_CASE("binder: each refusal carries PostgreSQL's SQLSTATE", "[sql][binder][sqlstate]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE u (k BIGINT PRIMARY KEY, qty BIGINT, d NUMERIC(10, 2))").stmt));
+  const auto& cat = f.cat();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return "bound";
+  };
+  CHECK(state("SELECT id FROM nope WHERE id = $1") == "42P01");
+  CHECK(state("SELECT id FROM t, nope WHERE id = $1") == "42P01");
+  CHECK(state("SELECT x.id FROM t WHERE id = $1") == "42P01");  // missing FROM-clause entry
+  CHECK(state("SELECT nope FROM t WHERE id = $1") == "42703");
+  CHECK(state("SELECT id FROM t, u WHERE nope = $1") == "42703");
+  CHECK(state("CREATE INDEX i ON t (nope)") == "42703");
+  CHECK(state("UPDATE t SET name = qty WHERE id = $1") == "42804");
+  CHECK(state("SELECT id FROM t WHERE name = $1 AND qty = $1") == "42883");
+  CHECK(state("UPDATE t SET name = $1, qty = $1 WHERE id = $2") == "42804");
+  CHECK(state("SELECT id FROM t WHERE id = $2") == "42P18");
+  CHECK(state("SELECT qty FROM t, u WHERE id = $1 AND k = $2") == "42702");
+  CHECK(state("INSERT INTO t (id, id) VALUES ($1, $2)") == "42701");
+  CHECK(state("SELECT sum(name) FROM t WHERE id = $1") == "42883");
+  CHECK(state("SELECT min(name) FROM t WHERE id = $1") == "42883");
+  CHECK(state("SELECT count(*), id FROM t WHERE id = $1") == "42803");
+  CHECK(state("UPDATE t SET qty = count(*) WHERE id = $1") == "42803");
+  CHECK(state("SELECT sum(qty) FROM t WHERE id = $1 FOR UPDATE") == "0A000");
+  CHECK(state("UPDATE u SET d = d + 100000000000000000 WHERE k = $1") == "22003");
+  // Syntax errors, and forms the layer does not support yet, stay 42601.
+  CHECK(state("SELEC 1") == "42601");
+  CHECK(state("SELECT id FROM t WHERE id = qty") == "42601");
+  CHECK(state("CREATE TABLE u2 (k BIGINT PRIMARY KEY, v TIMESTAMPTZ)") == "42601");
+}

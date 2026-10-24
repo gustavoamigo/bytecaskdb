@@ -520,7 +520,7 @@ class SqlMachine(RuleBasedStateMachine):
             # A refused statement aborts the transaction on both sides, as
             # any statement PostgreSQL refuses does.
             assert self.txn.is_aborted
-            assert o.run_pg(self.pg.conn, "SELECT no_such_column FROM " + name).error == "refused"
+            assert o.run_pg(self.pg.conn, "SELECT no_such_column FROM " + name).error == "42703"
 
     def select(self, name: str, targets: list[str], where: list[tuple[str, str, object]],
                order: list[tuple[str, bool]] = (), limit: int | None = None, count: str | None = None,
@@ -1150,7 +1150,7 @@ def test_every_statement_after_a_failed_one_is_25P02(dsn):
         m.check()
         # A statement refused before it runs aborts a transaction too.
         m.begin()
-        assert m.insert("t9", {"c0": 3}, all_columns=False).error == "refused"
+        assert m.insert("t9", {"c0": 3}, all_columns=False).error == "42P01"
         assert m.lookup("t0", (1,)).error == "25P02"
         m.rollback()
     finally:
@@ -1162,14 +1162,14 @@ def test_create_and_drop_refusals(dsn):
     try:
         t = Table("t0", [Column("c0", o.SMALLINT)], ["c0"])
         assert m.create(t).error is None
-        assert m.create(t).error == "refused"  # already exists
-        assert m.create(Table("t1", [Column("c0", o.BIGINT), Column("c0", o.TEXT)], ["c0"])).error == "refused"
-        assert m.create(Table("t1", [Column("c0", o.BIGINT)], ["zz"])).error == "refused"
+        assert m.create(t).error == "42P07"  # already exists
+        assert m.create(Table("t1", [Column("c0", o.BIGINT), Column("c0", o.TEXT)], ["c0"])).error == "42701"
+        assert m.create(Table("t1", [Column("c0", o.BIGINT)], ["zz"])).error == "42703"
         m.create_without_pk(Table("t1", [Column("c0", o.BIGINT)], []))
-        assert m.drop("t2", if_exists=False).error == "refused"
+        assert m.drop("t2", if_exists=False).error == "42P01"
         assert m.drop("t2", if_exists=True).error is None
         assert m.drop("t0", if_exists=False).error is None
-        assert m.insert("t0", {"c0": 1}, all_columns=False).error == "refused"
+        assert m.insert("t0", {"c0": 1}, all_columns=False).error == "42P01"
         m.check()
     finally:
         m.teardown()
@@ -1535,6 +1535,34 @@ def test_column_plus_parameter_at_the_edges(dsn):
         # NUMERIC(6, 2).
         m.insert("t0", {"c0": 4, "c1": 0, "c2": 0, "c3": decimal.Decimal("1.00")}, all_columns=True)
         assert m.add("t0", "c3", "+", decimal.Decimal(10**16), (4,)).error == "22003"
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_binder_refusals_carry_postgresqls_sqlstate(dsn):
+    """A statement the binder refuses for a fault PostgreSQL also names gets
+    PostgreSQL's SQLSTATE (#548). 42P18 needs a protocol-level parameter, so
+    the unit and wire tests cover it."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.TEXT)], ["c0"]))
+        m.create(Table("t1", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.TEXT)], ["c0"]))
+        for sql, state in (
+            ("SELECT c0 FROM nope WHERE c0 = $1", "42P01"),
+            ("SELECT c0 FROM t0 WHERE t9.c0 = $1", "42P01"),
+            ("SELECT zz FROM t0 WHERE c0 = $1", "42703"),
+            ("UPDATE t0 SET zz = $1 WHERE c0 = $2", "42703"),
+            ("SELECT c1 FROM t0, t1 WHERE t0.c0 = $1 AND t1.c0 = $2", "42702"),
+            ("INSERT INTO t0 (c0, c0) VALUES ($1, $2)", "42701"),
+            ("SELECT sum(c1) FROM t0 WHERE c0 = $1", "42883"),
+            ("SELECT c1, count(*) FROM t0 WHERE c0 = $1", "42803"),
+            ("UPDATE t0 SET c1 = count(*) WHERE c0 = $1", "42803"),
+        ):
+            params = (1, 2) if "$2" in sql else (1,)
+            layer = o.run_layer(m.db, sql, params)
+            pg = o.run_pg(m.pg.conn, sql, params)
+            assert layer.error == pg.error == state, (sql, layer, pg)
         m.check()
     finally:
         m.teardown()

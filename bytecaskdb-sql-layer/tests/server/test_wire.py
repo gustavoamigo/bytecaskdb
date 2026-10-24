@@ -332,6 +332,21 @@ def test_a_syntax_error_carries_its_position_in_characters(server):
     assert f["C"] == "42601" and int(f["P"]) > 0
 
 
+def test_a_binder_error_carries_its_sqlstate_on_the_wire(server):
+    c = connect(server)
+    c.send(query("CREATE TABLE bound_err (k BIGINT PRIMARY KEY)"))
+    c.until_ready()
+    for sql, state in (
+        ("SELECT k FROM no_such_table WHERE k = $1", "42P01"),
+        ("SELECT no_such_column FROM bound_err WHERE k = $1", "42703"),
+        ("SELECT k FROM bound_err WHERE k = $2", "42P18"),
+    ):
+        c.send(query(sql))
+        out = c.until_ready()
+        f = fields(out[0][1])
+        assert f["C"] == state and int(f["P"]) > 0, (sql, f)
+
+
 # ---------------------------------------------------------------- extended query
 
 

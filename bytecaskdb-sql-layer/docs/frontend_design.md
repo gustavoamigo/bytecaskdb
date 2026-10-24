@@ -590,8 +590,8 @@ its transaction test.
      prefix covers a repeated part with the same parameter.
    - The two-range scan prints its two cursors in two blocks, one `LIMIT`
      counter across both.
-   - The refusals carry no SQLSTATE: `SqlError` has none yet (#541). Their
-     messages are the table's.
+   - The refusals carry the default SQLSTATE, 42601: the planner gives none
+     of its own yet (#541). Their messages are the table's.
 2. **Multi-statement transactions** (#491, another session): the
    statements of slice 1 run in a `Transaction`. As built: #491's slices A
    and B, and `tests/proof/test_tprocc.py` runs the TPROC-C transactions

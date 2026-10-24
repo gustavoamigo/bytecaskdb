@@ -1421,7 +1421,6 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
 
   if (const auto* ct = std::get_if<CreateTableDdl>(&ddl)) {
     auto name = std::string{ct->name};
-    name_free(name);
     if (ct->columns.empty() || ct->pk.empty()) throw DdlRefused("a table needs columns and a primary key", "0A000");
     Table t;
     t.name = name;
@@ -1443,6 +1442,9 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
       }
       t.pk_col_ids.push_back(c->id);
     }
+    // After the statement's own columns, as PostgreSQL: a duplicate column is
+    // 42701 even in a statement that names an existing relation.
+    name_free(name);
     t.layout = make_layout(defs);
     t.id = reserve_ids(next->next_id_, 2);
     t.layout_id = t.id + 1;

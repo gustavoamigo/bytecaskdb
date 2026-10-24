@@ -22,7 +22,11 @@ every rule, the invariants are checked.
   time, 22021 for text that is not UTF-8. The layer has one kind for these,
   `range`; the oracle tells them apart by how the message starts, in one
   table (`RANGE_SQLSTATE` in `oracle.py`), and a test produces every
-  message, so a reworded one fails there. Any other refusal counts
+  message, so a reworded one fails there. A binder or catalog refusal
+  carries its own SQLSTATE (`SqlError.sqlstate`, `DdlRefused`), and those
+  PostgreSQL gives the same statement (`BINDER_STATES` in `oracle.py`: 42P01,
+  42703, 42804, 42P18, 42883, 42702, 42701, 42803, and the catalog's 42P07,
+  42704, 42809) must agree with PostgreSQL's. Any other refusal counts
   as a refusal on both, whatever its message. The layer's refusals are
   `SqlError`: parse and bind errors, a DDL the catalog refuses, parameters
   of the wrong number or type; the planner's "no plan" refusal is one

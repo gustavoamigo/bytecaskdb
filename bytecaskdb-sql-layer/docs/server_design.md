@@ -491,17 +491,33 @@ PostgreSQL also checks the server's mapping. The mapping:
 | `TransactionAborted` | `25P02` |
 | `FeatureNotSupported` | `0A000` |
 | `ParamError` | `08P01` (the server's own count check makes this unreachable over the wire) |
-| `ast::SqlError` | `42601` |
-| `DdlRefused` | `42P07` for an existing name, `42P01` for a missing table, `42601` otherwise, by its kind |
+| `ast::SqlError`, `DdlRefused` | the code it carries, PostgreSQL's for the same fault; `42601` by default (below) |
 | `BC_E_IO`, `BC_E_CORRUPT`, `BC_E_DEGRADED` | `58030` |
 | `BC_E_MEMORY`, `std::bad_alloc` | `53200` |
 | `DbClosed` | `57P01` |
 | anything else | `XX000` |
 
-The binder's errors are all `ast::SqlError` today, so an unknown table or
-column is `42601` rather than PostgreSQL's `42P01` or `42703`. Splitting
-them needs a code on `SqlError` (#548). HammerDB's
-driver sends no statement that fails to bind.
+`SqlError` carries its SQLSTATE the way `DdlRefused` does, set where it is
+thrown. The binder gives PostgreSQL's code for what PostgreSQL also refuses:
+
+| Fault | SQLSTATE |
+|---|---|
+| unknown table, or a qualifier naming no table of the statement | `42P01` |
+| unknown column | `42703` |
+| a column assigned from a column of another type; a `$n` assigned to a column after it was typed by another type | `42804` |
+| a `$n` compared with or added to a column after it was typed by another type; `SUM` or `MIN` of a type PostgreSQL has no such aggregate for | `42883` |
+| a `$n` no use gives a type | `42P18` |
+| a column reference both joined tables have | `42702` |
+| a column listed twice in an `INSERT` | `42701` |
+| an aggregate beside a bare column or in `ORDER BY`, or in an `UPDATE` | `42803` |
+| `FOR UPDATE` with an aggregate | `0A000` |
+| an operand that overflows a `DECIMAL` | `22003` |
+
+Every other `SqlError` is `42601`: a syntax error, and a form the layer
+does not support where PostgreSQL would run the statement (a `$n` used
+with two SQL types of one physical type, a join on columns of two types, an
+unsupported `DEFAULT` or type). The planner's "no plan" refusals are among
+them (#541). HammerDB's driver sends no statement that fails to bind.
 
 ## API changes
 
@@ -739,7 +755,7 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 - A compared or added `DECIMAL` parameter finer than its column's scale, and `NaN`,
   are `22P02`.
 - The integer and datetime input forms listed above only.
-- Binder errors are `42601`.
+- A form the layer does not support is `42601`, not PostgreSQL's code for running it.
 - `Execute` with a row limit, several statements in one `Query`, SQL
   `PREPARE`, `SET`, `SHOW`, `COPY` and cancel are refused.
 - A result is built whole by the embedded API before its first `DataRow`

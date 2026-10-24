@@ -1027,6 +1027,9 @@ TEST_CASE("embedded API: sqlstate reports PostgreSQL's SQLSTATE for each error",
   CHECK(state([&] { (void)db->execute("SELEC 1"); }) == "42601");
   CHECK(state([&] { (void)db->execute("CREATE TABLE s (k BIGINT PRIMARY KEY)"); }) == "42P07");
   CHECK(state([&] { (void)db->execute("DROP TABLE nope"); }) == "42P01");
+  CHECK(state([&] { (void)db->execute("SELECT n FROM nope WHERE k = $1", {i(1)}); }) == "42P01");
+  CHECK(state([&] { (void)db->execute("SELECT nope FROM s WHERE k = $1", {i(1)}); }) == "42703");
+  CHECK(state([&] { (void)db->execute("SELECT n FROM s WHERE k = $2", {i(1), i(1)}); }) == "42P18");
   CHECK(state([&] { (void)db->execute("SELECT n FROM s WHERE k = $1", {}); }) == "08P01");
   auto txn = db->begin();
   CHECK(state([&] { (void)txn.execute("CREATE TABLE u (k BIGINT PRIMARY KEY)"); }) == "0A000");
