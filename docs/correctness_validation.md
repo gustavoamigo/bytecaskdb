@@ -1146,16 +1146,19 @@ no units (an empty hint scans none), and the fault goes one read past them.
 Opening is twice when recovery first replaces the hint: a damaged one is
 read whole to find it damaged, and a missing one is generated from its data
 file. Those replacements are read off a copy of the directory that recovery
-has run over once, since the cell may have damaged every hint itself.
+has run over once, since the cell may have damaged every hint itself. The
+copy is opened with the same `opts` the open under test uses — strict where
+the cell is strict, lenient where it is lenient — so the probe and the open
+under test agree on where a scan begins. The probe runs before the cell's
+fault injector is armed, and a throw in the probe open fails the test instead
+of unwinding past that injector.
 
-Then the cell says why its read is a scan read. A wrong target cannot pass
-silently on a hint recovery replaces: the pass that verifies the rebuilt hint
-throws like a scan does in the default mode. So the same read is failed again
-with `fail_recovery_on_crc_errors = false`, where a failure in one of the
-opens above the scan lets `open` return without that file's keys, while one
-in the scan fails the open in every mode — an open that throws there was
-reading the hint's entries, not opening the hint. If the count and the open
-ever disagree about where a scan begins, one of the two runs fails there.
+The cell also says why its read is a scan read: a failure in one of the
+opens above the scan lets `open` return without that file's keys in lenient
+mode (`fail_recovery_on_crc_errors = false`), while one in the scan fails the
+open in every mode — an open that throws in lenient mode was reading the hint's
+entries, not opening the hint. If the count and the open ever disagree about
+where a scan begins, the lenient open fails there.
 
 #### State shapes
 

@@ -12,14 +12,16 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "fault_injector.h"
-#include <algorithm>
+#include "invariants.h"
+#include <chrono>
 #include <filesystem>
 #include <format>
 #include <limits>
 #include <optional>
+#include <cstring>
+#include <cerrno>
 #include <string>
 #include <sys/stat.h>
-#include <vector>
 
 namespace bytecask::testing {
 
@@ -29,7 +31,8 @@ namespace bytecask::testing {
 // before it is found damaged — which is what lets it be discarded with
 // nothing to undo — so its reads are pass reads too. A missing file costs
 // none and is not verified. Counts are taken with an injector that fails no
-// read.
+// read; the probe runs the same open it is counting, so its injector must not
+// fail a read either.
 struct HintReads {
   int open_pass;
   bool scans;    // whether the scan of the file reads at least one unit
@@ -73,11 +76,8 @@ inline auto hint_reads(const std::filesystem::path &hint) -> HintReads {
 // adds an active file, and with it one more name to sort.
 inline auto first_hint_of(const std::filesystem::path &dir)
     -> std::filesystem::path {
-  std::vector<std::filesystem::path> data;
-  for (const auto &e : std::filesystem::directory_iterator{dir})
-    if (e.path().extension() == ".data") data.push_back(e.path());
+  auto data = sorted_paths(dir, ".data");
   REQUIRE_FALSE(data.empty());
-  std::ranges::sort(data);
   auto hint = data.front();
   hint.replace_extension(".hint");
   return hint;
@@ -90,10 +90,18 @@ inline auto first_hint_of(const std::filesystem::path &dir)
 // and a create near a remove can take the inode the remove just freed (ext4
 // does), leaving the same number to a different file. A rebuild then changes
 // nothing a stat of the inode sees; the write time is what says the file was
-// made again.
+// made again. "<absent>" is only for a file that is gone — any other
+// failure to stat it is a bug in the test environment, not a missing hint, so
+// it is a failure rather than a comparison of "<absent>" against a real
+// identity.
 inline auto hint_identity(const std::filesystem::path &hint) -> std::string {
   struct stat st{};
-  if (::stat(hint.c_str(), &st) != 0) return "<absent>";
+  if (::stat(hint.c_str(), &st) != 0) {
+    if (errno != ENOENT)
+      FAIL("stat failed on " << hint.string() << ": " <<
+           std::strerror(errno));
+    return "<absent>";
+  }
   return std::format("{}-{}.{:09}-{}",
                      static_cast<std::uint64_t>(st.st_ino),
                      static_cast<std::int64_t>(st.st_mtim.tv_sec),
@@ -101,15 +109,21 @@ inline auto hint_identity(const std::filesystem::path &hint) -> std::string {
                      static_cast<std::uint64_t>(st.st_size));
 }
 
-// A sibling directory of a database, for a probe run of it. Removed when it
-// goes out of scope, however the caller leaves.
+// A sibling directory of a database, for a probe run of it. The name carries
+// a timestamp so two probes in one run never collide, and the name is unique
+// enough that a stale probe from a killed run cannot be reused by accident.
+// Removed when it goes out of scope, however the caller leaves; a probe left
+// on disk by a killed run stays (a unique name is the price of not touching
+// anything that might be in use).
 class ProbeDir {
 public:
   explicit ProbeDir(const std::filesystem::path &base) {
     auto norm = base.lexically_normal();
     if (norm.filename().empty()) norm = norm.parent_path();  // trailing '/'
-    path_ = norm.parent_path() / (norm.filename().string() + ".probe");
-    std::filesystem::remove_all(path_);
+    auto ts = std::chrono::system_clock::now().time_since_epoch().count();
+    path_ = norm.parent_path() /
+            (norm.filename().string() + ".probe_" +
+             std::to_string(ts));
   }
   ~ProbeDir() { std::filesystem::remove_all(path_); }
   ProbeDir(const ProbeDir &) = delete;
@@ -140,27 +154,29 @@ private:
 // and the test fails — the phases answer a failed read differently.
 inline auto first_hint_scan_read(const std::filesystem::path &dir,
                                  const Options &opts) -> int {
-  std::vector<std::filesystem::path> hints;
-  for (const auto &e : std::filesystem::directory_iterator{dir})
-    if (e.path().extension() == ".data") {
-      auto hint = e.path();
-      hint.replace_extension(".hint");
-      hints.push_back(std::move(hint));
-    }
-  REQUIRE_FALSE(hints.empty());
-  std::ranges::sort(hints);
-
+  const auto data = sorted_paths(dir, ".data");
+  REQUIRE_FALSE(data.empty());
+  auto hints = data;
+  for (auto &hint : hints) hint.replace_extension(".hint");
   ProbeDir probe{dir};
   auto replaced = [&](const std::filesystem::path &hint) -> HintReads {
-    if (!std::filesystem::exists(probe.path())) {
-      std::filesystem::copy(dir, probe.path(),
-                            std::filesystem::copy_options::recursive);
-      const auto db = DB::open(probe.path(), opts);
-    }
-    // The hint recovery opens after it has replaced the one the open under
-    // test replaces: the copy's, looked up by the stem of the file under
-    // test — never the copy's own active file, which takes a name of its own.
-    const auto grows = hint_reads(probe.path() / hint.filename());
+    // The probe open runs the same open the scan cell is counting, with the
+    // same opts. It runs before the caller installs the cell's fault injector
+    // (which fails an io_hint_read), so it is not under the injector — that
+    // is a property of the call order, not of this function. If the probe
+    // open throws, REQUIRE_NOTHROW fails the test instead of unwinding past
+    // an armed injector. The probe is lenient where the cell is lenient
+    // (lenient cells pass .fail_recovery_on_crc_errors = false), and strict
+    // otherwise, so it matches the open under test.
+    HintReads grows{};
+    REQUIRE_NOTHROW([&] () -> void {
+      if (!std::filesystem::exists(probe.path())) {
+        std::filesystem::copy(dir, probe.path(),
+                              std::filesystem::copy_options::recursive);
+        (void)DB::open(probe.path(), opts);
+      }
+      grows = hint_reads(probe.path() / hint.filename());
+    }());
     REQUIRE(grows.verified);
     return grows;
   };
