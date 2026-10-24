@@ -322,7 +322,7 @@ statement the session runs at `Execute`.
 - DDL inside a transaction is the layer's `0A000`.
 - Results: `RowDescription` (for a row-returning statement), one `DataRow`
   per row, then `CommandComplete`. The tag comes from the statement's
-  command (*API changes*, 3):
+  command (*What it uses from the embedded API*, 3):
   - `SELECT n`, where n is the row count;
   - `INSERT 0 n`, `UPDATE n` and `DELETE n`, where n is `Rows::affected`;
   - for DDL, its command words: `CREATE TABLE`, `CREATE INDEX`,
@@ -371,7 +371,7 @@ other statements is.
   - the type's OID, length and modifier;
   - format 0.
 
-  The column types are known before the statement runs (*API changes*, 2).
+  The column types are known before the statement runs (*What it uses from the embedded API*, 2).
 - **`Execute`** runs the portal and sends its rows and `CommandComplete`. A
   row limit above 0 is `0A000`; libpq sends 0.
 - **`Sync`** replies with `ReadyForQuery`.
@@ -491,7 +491,7 @@ are:
       example, -1.00 + 0.995 rounds to -0.01, but -1.00 + 1.00 is 0.00.
 
     The server refuses rather than give either value. `ParamInfo` says
-    which use a parameter has (*API changes*, 1).
+    which use a parameter has (*What it uses from the embedded API*, 1).
   - `NaN` is `22P02`.
 - floats: what `strtod` reads, plus `NaN`, `Infinity`, `-Infinity`
   (`inf` too), any case. Rounding a `REAL` is the layer's.
@@ -521,7 +521,7 @@ difference: the driver writes ISO.
 Warnings are `NoticeResponse` with `S` `WARNING`.
 
 The SQLSTATE comes from one function in the API, `sqlstate(const
-std::exception&)` (*API changes*, 4). The server, the Python binding and
+std::exception&)` (*What it uses from the embedded API*, 4). The server, the Python binding and
 the proof oracle all use it, so the oracle's check of SQLSTATEs against
 PostgreSQL also checks the server's mapping. The mapping:
 

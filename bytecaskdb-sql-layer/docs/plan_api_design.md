@@ -72,8 +72,8 @@ it, has these properties in every tier, whatever its logic does:
   row, whatever the plan does.
 
 A wrong plan can therefore do two things: return an error code, or return
-or write a wrong answer. The second is what the oracle tests in *Validation* exist to
-catch. Neither crashes the server, corrupts the engine, or holds a snapshot
+or write a wrong answer. The second is what the proof machine's comparison
+with PostgreSQL exists to catch (`testing_design.md`). Neither crashes the server, corrupts the engine, or holds a snapshot
 past the budget. The only code that can still fault is the API's own
 implementation, which is ordinary C++ under the engine's sanitizer and test
 regime, and a plan cannot steer it except through checked arguments.
@@ -478,8 +478,8 @@ runtime's.
 
 ### Keys
 
-Keys are built in the arena in the mem-comparable encoding of *Key encoding*
-below. A builder is finalized once; its view lives until reset.
+Keys are built in the arena in the mem-comparable encoding of *Keys and
+rows* below. A builder is finalized once; its view lives until reset.
 
 ```c
 bc_key   bc_key_begin(bc_ctx *, uint32_t table_or_index);
@@ -555,7 +555,7 @@ as `0.0` and every NaN as one, so only the row holds the exact value.
 
 ### Rows and columns
 
-Rows use the format in *Row format*. A plan names a column by its permanent
+Rows use the format in *Keys and rows*. A plan names a column by its permanent
 id (`COL_<t>_<c>`), and only the columns its `bc_schema_ref` declares; the
 runtime maps the id to the offset or slot in the row's layout generation,
 from the map it built when it verified the reference. A decoder resolves the
