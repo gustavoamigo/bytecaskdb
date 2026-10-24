@@ -472,6 +472,23 @@ target("isolation_history")
         add_release_opts(t)
     end)
 
+-- Transition-table checks of the commit path's two coordination protocols
+-- (verify/transition/): the write group's slot hand-over and the flush role.
+-- Models the protocols and checks their invariants over every interleaving,
+-- then requires the check to fail on each of #589's mutants. Standalone and
+-- single-threaded — no engine, no test framework, its own main — which is why
+-- it is not in tests/*.cpp: that directory is globbed into bytecask_tests, and
+-- a standalone main there breaks the build. ci.yml runs it.
+target("transition_check")
+    set_kind("binary")
+    set_default(false)
+    add_files("verify/transition/*.cpp")
+    add_includedirs("verify/transition")
+    on_config(function(t)
+        apply_sanitizer(t)
+        add_release_opts(t)
+    end)
+
 -- Static library target for out-of-tree consumers (e.g. the MariaDB plugin).
 -- Compiles all C++23 module sources and exposes them via libbytecask.a.
 -- Note: C++23 module BMIs are not portable across translation units that
