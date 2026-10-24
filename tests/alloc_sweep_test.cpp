@@ -510,6 +510,11 @@ TEST_CASE("alloc sweep: apply_batch", "[alloc_sweep]") {
   alloc_sweep(apply_batch_operation());
 }
 
+TEST_CASE("alloc sweep: apply_batch that splits what it changed",
+          "[alloc_sweep]") {
+  alloc_sweep(splitting_batch_operation());
+}
+
 TEST_CASE("alloc sweep: write across a rotation", "[alloc_sweep]") {
   alloc_sweep(rotation_operation());
 }
@@ -599,6 +604,67 @@ TEST_CASE("alloc sweep: a transient tree is freed when nothing can be "
       every_allocation_fails.emplace(1, true);
     }  // tr frees its nodes here
   }));
+}
+
+// A write that fails partway leaves the transient's root on nodes that are
+// all alive, and dropping the transient frees each of them once. Each
+// allocation of a run of inserts into an empty tree is failed in turn, once
+// and from there on. Neighbouring keys share 103 bytes and a node's keys
+// far fewer, so separators are long and inner nodes few to a page: the run
+// splits its root leaf, then inner nodes and the inner root, and shrinks
+// inner prefixes, all on nodes it created. A split frees the node it
+// replaces; it used to do so before the root, or a rebuilt node's parent,
+// reached the replacement, and a failure in between left the root on a
+// freed node, which the drop walked and freed again (heap-use-after-free
+// under ASan). Under ASan the node pool is off, so every node allocation is
+// failed; elsewhere pooled nodes go uncounted (#583).
+TEST_CASE("alloc sweep: a transient whose write fails partway is freed once",
+          "[alloc_sweep]") {
+  // A node a failed write had not yet placed is leaked (#390).
+  const ExpectedLeaks leaks;
+  constexpr int kInserts = 1'000;
+  KeyStore res;
+  struct Insert {
+    std::string key;
+    bytecask::BlindRef ref;
+  };
+  std::vector<Insert> run;
+  for (int i = 0; i < kInserts; ++i) {
+    const auto j = i * 7 % kInserts;
+    auto k = std::format("{:03}{}{:03}", j % 40, std::string(100, 'q'), j / 40);
+    const auto ref = res.ref(k);
+    run.push_back({std::move(k), ref});
+  }
+  for (const bool cascade : {false, true}) {
+    for (long n = 1;; ++n) {
+      REQUIRE(n <= kMaxAllocations);
+      INFO("allocation " << n << (cascade ? " and every one after it" : "")
+                         << " failed");
+      auto tr = Tree{}.transient();
+      bool threw = false;
+      bool fired = false;
+      {
+        ScopedAllocFaults faults{n, cascade};
+        try {
+          for (const auto &ins : run)
+            tr.set(to_bytes(ins.key), ins.ref, res);
+        } catch (const std::bad_alloc &) {
+          threw = true;
+        }
+        fired = faults.report().fired;
+      }
+      if (!fired) {
+        // Without ASan, a node freed twice is handed out twice by the pool.
+        const auto t = std::move(tr).persistent();
+        (void)t.validate(res);
+        CHECK(t.size() == kInserts);
+        break;
+      }
+      if (threw)
+        CHECK_THROWS_AS(tr.set(to_bytes("again"), res.ref("again"), res),
+                        std::logic_error);
+    }  // tr is dropped at the end of each run, after the failure
+  }
 }
 
 // A version whose publication fails leaves its base as it was, so the base

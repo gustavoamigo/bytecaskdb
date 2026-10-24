@@ -673,10 +673,12 @@ auto find_ptr(const Node<V> *cur, Bytes key) noexcept -> const V * {
 //
 // Owns the tag that marks the nodes it creates and the list of base nodes it
 // retires. A node the session owns (tag == tag_) is edited in place and
-// freed at once when replaced; a foreign node is copied and the original
-// retired. The three places a node becomes garbage — superseded by a copy,
-// replaced by a rebuild or split, or never published — all go through
-// discard(). Used by one thread at a time.
+// freed when the write that replaced it has installed its result; a foreign
+// node is copied and the original retired. The three places a node becomes
+// garbage — superseded by a copy, replaced by a rebuild or split, or never
+// published — all go through discard(). Every write goes through write(),
+// which alone moves the root and frees what a write replaced. Used by one
+// thread at a time.
 // ---------------------------------------------------------------------------
 export template <typename V> class BuildSession {
 public:
@@ -695,15 +697,23 @@ public:
   auto operator=(const BuildSession &) -> BuildSession & = delete;
   BuildSession(BuildSession &&other) noexcept
       : tag_{std::exchange(other.tag_, 0)}, retired_{std::move(other.retired_)},
+        replaced_{std::move(other.replaced_)},
+        interrupted_{std::exchange(other.interrupted_, false)},
         sep_{std::move(other.sep_)}, displaced_{std::move(other.displaced_)} {
     other.retired_.clear();
+    other.replaced_.clear();
   }
+  // The target must have been discarded or finished: its replaced nodes are
+  // not freed here, since only its root says which are still reached.
   auto operator=(BuildSession &&other) noexcept -> BuildSession & {
     if (this != &other) {
       forget_retired();
       tag_ = std::exchange(other.tag_, 0);
       retired_ = std::move(other.retired_);
       other.retired_.clear();
+      replaced_ = std::move(other.replaced_);
+      other.replaced_.clear();
+      interrupted_ = std::exchange(other.interrupted_, false);
       sep_ = std::move(other.sep_);
       displaced_ = std::move(other.displaced_);
     }
@@ -712,6 +722,11 @@ public:
   ~BuildSession() { forget_retired(); }
 
   [[nodiscard]] auto tag() const noexcept -> std::uint64_t { return tag_; }
+  // False once finished or discarded, and after a write that threw partway:
+  // its tree may lack what the write was moving, so it can only be dropped.
+  [[nodiscard]] auto usable() const noexcept -> bool {
+    return tag_ != 0 && !interrupted_;
+  }
   [[nodiscard]] auto owns(const N *n) const noexcept -> bool {
     return n->tag == tag_;
   }
@@ -726,59 +741,129 @@ public:
   // Ends the session after publishing: the nodes it created belong to the
   // version now, and the retired list to the chain.
   void finish() noexcept {
+    assert(replaced_.empty() && !interrupted_);
     tag_ = 0;
     retired_.clear();
   }
 
-  // For a session dropped without publishing: frees every node it created
-  // that is reachable from `root` and forgets the retired list. The base is
-  // intact, so nothing retired is garbage.
+  // For a session dropped without publishing, after a failed write too:
+  // frees every node it created that `root` reaches, and each node a write
+  // replaced, once. The base is intact, so nothing retired is garbage.
   void discard_all(N *root) noexcept {
-    const auto tag = tag_;
-    if (tag != 0)
-      free_node_subtree_if<ChainTraits<V>>(root,
-                                      [tag](N *n) { return n->tag == tag; });
+    if (tag_ != 0) {
+      // A write interrupted before it installed its result can leave nodes
+      // it replaced under root: the walk passes through them to the nodes
+      // below, and the release frees them.
+      for (auto *n : replaced_)
+        n->tag = kReplacedTag;
+      const auto tag = tag_;
+      free_node_subtree_if<ChainTraits<V>>(
+          root, [tag](N *n) { return n->tag == tag; },
+          [](N *n) { return n->tag == kReplacedTag; });
+    }
+    release_replaced();
     forget_retired();
     tag_ = 0;
+    interrupted_ = false;
   }
 
-  // The one place a node becomes garbage.
+  // The one place a node becomes garbage. An owned node is freed by write()
+  // once the root no longer reaches it; a foreign one is retired.
   void discard(N *n) {
     if (owns(n)) {
-      N::destroy(n);
+      replaced_.push_back(n);
       return;
     }
     retired_.push_back(n);
     account_retired<V>(1);
   }
 
-  // Insert or replace. `should_replace(existing, incoming)` is asked on an
-  // existing key; a refused replacement changes nothing. The displaced
-  // value, if any, is kept for take_displaced().
+  // Insert or replace into the tree under `root`. `should_replace(existing,
+  // incoming)` is asked on an existing key; a refused replacement changes
+  // nothing. The displaced value, if any, is kept for take_displaced().
   template <typename Pred>
-  auto upsert(N *root, Bytes key, const V &val, Pred &&should_replace)
+  auto upsert(N *&root, Bytes key, const V &val, Pred &&should_replace)
       -> Result {
-    displaced_.reset();
-    if (!root) {
-      auto *leaf = pack(
-          true, 1,
-          [&](std::uint32_t) {
-            return Item{KeyParts{key, {}}, payload_bytes_of(val)};
-          },
-          0);
-      return {leaf, nullptr, true, true};
-    }
-    auto leaf_step = [&](N *leaf) {
-      return upsert_leaf(leaf, key, val, should_replace);
-    };
-    return descend_upsert(root, key, leaf_step);
+    return write(root, [&]() -> Result {
+      displaced_.reset();
+      if (!root) {
+        auto *leaf = pack(
+            true, 1,
+            [&](std::uint32_t) {
+              return Item{KeyParts{key, {}}, payload_bytes_of(val)};
+            },
+            0);
+        return {leaf, nullptr, true, true};
+      }
+      auto leaf_step = [&](N *leaf) {
+        return upsert_leaf(leaf, key, val, should_replace);
+      };
+      return descend_upsert(root, key, leaf_step);
+    });
   }
 
-  auto erase(N *root, Bytes key) -> Result {
-    if (!root)
-      return {nullptr, nullptr, false, false};
-    auto leaf_step = [&](N *leaf) { return erase_leaf(leaf, key); };
-    return descend_erase(root, key, leaf_step);
+  auto erase(N *&root, Bytes key) -> Result {
+    return write(root, [&]() -> Result {
+      if (!root)
+        return {nullptr, nullptr, false, false};
+      auto leaf_step = [&](N *leaf) { return erase_leaf(leaf, key); };
+      return descend_erase(root, key, leaf_step);
+    });
+  }
+
+  // Everything below is shared with trees whose leaves have another layout
+  // (blind_btree.cppm): they route through the same inner nodes and supply
+  // their own leaf step to the descent.
+protected:
+  // Marks a replaced node during discard_all(). Session tags start at 1.
+  static constexpr std::uint64_t kReplacedTag = 0;
+
+  std::uint64_t tag_;
+  std::vector<N *> retired_;
+  // Owned nodes the current write replaced. A node is replaced before the
+  // root reaches its replacement — a split root before make_root, a rebuilt
+  // node before its parent relinks — so freeing it there left the root on a
+  // freed node when an allocation in between failed.
+  std::vector<N *> replaced_;
+  bool interrupted_{false}; // a write threw before installing its result
+  std::vector<std::byte> sep_; // separator handed up by the last split
+  std::optional<V> displaced_;
+
+  // Runs one write, `descend()`, against the tree under `root` and installs
+  // its result: the new root, then the release of what the write replaced.
+  // Nothing is freed before `root` holds the result, so a write that throws
+  // leaves every node `root` reaches alive. Its tree may still lack what the
+  // write was moving, so the session takes no write after it.
+  template <typename Descend>
+  auto write(N *&root, Descend &&descend) -> Result {
+    if (interrupted_)
+      throw std::logic_error{"BuildSession: an earlier write failed partway"};
+    interrupted_ = true;
+    const auto r = descend();
+    if (r.changed) {
+      root = r.right ? make_root(r.node, r.right) : r.node;
+      // An erase can leave an inner root with a single child.
+      while (root && !root->is_leaf && root->count == 0) {
+        discard(root);
+        root = root->first_child;
+      }
+      release_replaced();
+    }
+    interrupted_ = false;
+    return r;
+  }
+
+  void release_replaced() noexcept {
+    for (auto *n : replaced_)
+      N::destroy(n);
+    replaced_.clear();
+  }
+
+  void forget_retired() noexcept {
+    if (!retired_.empty()) {
+      account_retired<V>(-static_cast<std::int64_t>(retired_.size()));
+      retired_.clear();
+    }
   }
 
   // A fresh root over two halves of a split root.
@@ -791,22 +876,6 @@ public:
         0);
     root->first_child = left;
     return root;
-  }
-
-  // Everything below is shared with trees whose leaves have another layout
-  // (blind_btree.cppm): they route through the same inner nodes and supply
-  // their own leaf step to the descent.
-protected:
-  std::uint64_t tag_;
-  std::vector<N *> retired_;
-  std::vector<std::byte> sep_; // separator handed up by the last split
-  std::optional<V> displaced_;
-
-  void forget_retired() noexcept {
-    if (!retired_.empty()) {
-      account_retired<V>(-static_cast<std::int64_t>(retired_.size()));
-      retired_.clear();
-    }
   }
 
   // One logical entry for pack(): its full key and where its payload is.
@@ -2259,7 +2328,6 @@ public:
     if (!r.changed)
       return std::nullopt;
     changed_ = true;
-    root_ = r.right ? session_.make_root(r.node, r.right) : r.node;
     if (r.inserted)
       ++size_;
     return session_.take_displaced();
@@ -2271,13 +2339,6 @@ public:
     if (!r.changed)
       return false;
     changed_ = true;
-    root_ = r.node;
-    // Collapse a root left with a single child.
-    while (root_ && !root_->is_leaf && root_->count == 0) {
-      auto *old = root_;
-      root_ = old->first_child;
-      session_.discard(old);
-    }
     --size_;
     return true;
   }
@@ -2322,8 +2383,9 @@ private:
       : base_{base}, root_{base.root_}, size_{base.size_} {}
 
   void ensure_active() const {
-    if (session_.tag() == 0) [[unlikely]]
-      throw std::logic_error{"TransientBTree already consumed"};
+    if (!session_.usable()) [[unlikely]]
+      throw std::logic_error{
+          "TransientBTree already consumed, or a write to it failed"};
   }
 
   void discard() noexcept {

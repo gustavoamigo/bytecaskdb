@@ -43,23 +43,35 @@ export inline auto new_version_tag() noexcept -> std::uint64_t {
 //   static void account_retired(std::int64_t) noexcept;    // test accounting
 //
 // Walks the subtree under `root`, descending through every node for which
-// `is_garbage(node)` holds and freeing it. The predicate must be monotone
-// along a path — once it is false for a node it is false for everything
-// below it — which holds for both predicates used here, because a node's
-// children are never newer than the node itself: a session links new
-// children only into nodes it owns. Recursive: the depth is the tree's
-// height, logarithmic in its size. It runs in noexcept destructors, often
-// because memory ran out, so freeing must not need memory: a work list on
-// the heap would, and the allocation failing there ends the process.
+// `is_garbage(node)` or `pass_through(node)` holds and freeing those that
+// are garbage; a node passed through is the caller's to free. The
+// predicates must be monotone along a path — once neither holds for a node,
+// neither holds for anything below it — which holds for every caller here,
+// because a node's children are never newer than the node itself: a session
+// links new children only into nodes it owns. Recursive: the depth is the
+// tree's height, logarithmic in its size. It runs in noexcept destructors,
+// often because memory ran out, so freeing must not need memory: a work
+// list on the heap would, and the allocation failing there ends the process.
+export template <typename Traits, typename Pred, typename Pass>
+void free_node_subtree_if(typename Traits::Node *root, const Pred &is_garbage,
+                          const Pass &pass_through) noexcept {
+  if (!root)
+    return;
+  const bool garbage = is_garbage(root);
+  if (!garbage && !pass_through(root))
+    return;
+  Traits::for_each_child(root, [&](typename Traits::Node *child) {
+    free_node_subtree_if<Traits>(child, is_garbage, pass_through);
+  });
+  if (garbage)
+    Traits::destroy(root);
+}
+
 export template <typename Traits, typename Pred>
 void free_node_subtree_if(typename Traits::Node *root,
                           const Pred &is_garbage) noexcept {
-  if (!root || !is_garbage(root))
-    return;
-  Traits::for_each_child(root, [&](typename Traits::Node *child) {
-    free_node_subtree_if<Traits>(child, is_garbage);
-  });
-  Traits::destroy(root);
+  free_node_subtree_if<Traits>(root, is_garbage,
+                               [](typename Traits::Node *) { return false; });
 }
 
 // ---------------------------------------------------------------------------
