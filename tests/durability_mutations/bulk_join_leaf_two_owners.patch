@@ -1,0 +1,37 @@
+A join of bulk-built ranges adds each run's leaves to the joining loader
+one at a time, growing its level as it goes, and clears the run only after
+its last leaf: an allocation failing in between leaves the leaves already
+moved owned by the run and the loader, and both free them. Caught under
+ASan (heap-use-after-free in LeafRun::free_leaves).
+Guarded-by: "alloc sweep: a bulk build that fails partway frees each node once"
+
+diff --git a/bytecaskdb/btree.cppm b/bytecaskdb/btree.cppm
+index 81244aa..64bcae9 100644
+--- a/bytecaskdb/btree.cppm
++++ b/bytecaskdb/btree.cppm
+@@ -1478,8 +1478,23 @@ protected:
+       prev_last = &runs[r].last_key_;
+       leaves += runs[r].leaves_.size();
+     }
+-    out.reserve_children(0, leaves);
+-    return adopt_runs(out, runs, boundary);
++    (void)leaves;
++    auto publish_tag = out.session_.tag();
++    for (std::size_t r = 0; r < runs.size(); ++r) {
++      auto &run = runs[r];
++      if (run.leaves_.empty())
++        continue;
++      publish_tag = std::max(publish_tag, run.tag_);
++      for (std::size_t i = 0; i < run.leaves_.size(); ++i) {
++        out.reserve_children(0, 1);
++        out.adopt_child(0, run.leaves_[i],
++                        i > 0 ? std::move(run.seps_[i - 1])
++                              : std::move(boundary[r]));
++      }
++      run.leaves_.clear();
++      out.size_ += run.size_;
++    }
++    return publish_tag;
+   }
+ 
+   // The commit half of concat_into: moves what it prepared. noexcept, so a

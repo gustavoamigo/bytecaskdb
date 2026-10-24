@@ -1,0 +1,21 @@
+Recovery lists its directory with std::filesystem::directory_iterator
+again, which allocates inside a noexcept function: a failed allocation there
+ends DB::open in std::terminate, and under GCC 15's runtime in a
+segmentation fault (#598). The open sweep counts a termination as a failure.
+Guarded-by: "alloc sweep: open"
+
+diff --git a/bytecaskdb/db_recovery.cpp b/bytecaskdb/db_recovery.cpp
+index 46d1b24..2c6b643 100644
+--- a/bytecaskdb/db_recovery.cpp
++++ b/bytecaskdb/db_recovery.cpp
+@@ -193,7 +193,9 @@ auto DB::recovery_prepare_files(EngineState &s)
+   // Not std::filesystem::directory_iterator: an allocation failing inside
+   // it ends the process (list_directory). A removed .tmp is not .data, so
+   // one listing serves both passes.
+-  auto entries = list_directory(dir_);
++  std::vector<std::filesystem::path> entries;
++  for (const auto &e : std::filesystem::directory_iterator{dir_})
++    entries.push_back(e.path());
+   for (const auto &p : entries) {
+     if (p.extension() == ".tmp" &&
+         (p.stem().extension() == ".hint" || p.stem().extension() == ".data")) {

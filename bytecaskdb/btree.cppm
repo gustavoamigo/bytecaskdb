@@ -17,6 +17,8 @@ module;
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iterator>
@@ -101,6 +103,34 @@ template <typename V> void account_retired(std::int64_t) noexcept {}
 // sequential-ascending, sequential-descending, balanced).
 export inline std::atomic<std::uint64_t> split_rule_counts[5]{};
 
+// Test-only: the structural changes a write can make to a tree, and how
+// many times writes began each. A fault sweep over a tree reads them to
+// show that an allocation failed inside every one, not only in what its
+// seed happens to reach (#588).
+export enum class Transition : std::uint8_t {
+  kLeafSplit,
+  kInnerSplit,
+  kRootGrowth,     // a split root gets a new root over its halves
+  kPrefixRebuild,  // a node rebuilt for a shorter prefix
+  kCompaction,     // a node rebuilt to reclaim dead bytes
+  kLeafEmptied,
+  kInnerEmptied,
+  kRootCollapse,   // an inner root left with one child gives way to it
+  kRunJoin,        // a bulk loader takes over the leaves of sealed runs
+  kLevelBuild,     // a bulk loader builds the inner nodes over a level
+  kCount,          // not a transition: the number of them; keep it last
+};
+export inline constexpr std::size_t kTransitionCount =
+    static_cast<std::size_t>(Transition::kCount);
+export inline std::atomic<std::uint64_t> transition_counts[kTransitionCount]{};
+
+export inline void note_transition([[maybe_unused]] Transition t) noexcept {
+#ifdef BYTECASK_TESTING
+  transition_counts[static_cast<std::size_t>(t)].fetch_add(
+      1, std::memory_order_relaxed);
+#endif
+}
+
 constexpr auto align_up(std::size_t n, std::size_t a) noexcept -> std::size_t {
   return (n + a - 1) / a * a;
 }
@@ -119,6 +149,10 @@ export inline constexpr bool kNodePoolEnabled = true;
 #else
 export inline constexpr bool kNodePoolEnabled = true;
 #endif
+
+// How a test build ends when it finds a key directory node used after it was
+// freed (Node::expect_live).
+export inline constexpr int kFreedNodeExitCode = 70;
 
 // NodePool: recycles node memory, whichever thread frees it.
 //
@@ -154,6 +188,10 @@ public:
     return ::operator new(bytes);
   }
 
+  // What test builds write over the first bytes of a node the pool keeps
+  // (Node::expect_live). Session tags count up from 1 and never reach it.
+  static constexpr std::uint64_t kFreedStamp = 0xF4EEDF4EEDF4EEDFull;
+
   static void give(void *p, std::size_t bytes) noexcept {
     if (pooled(bytes)) {
       auto &s = shared();
@@ -161,6 +199,12 @@ public:
       if (s.free.size() < kMaxPooledNodes) {
         try {
           s.free.push_back(p);
+#ifdef BYTECASK_TESTING
+          // Only a node the pool keeps: its memory stays mapped, so a
+          // later check reads bytes the pool holds. One freed to operator
+          // delete is not stamped, and goes unchecked.
+          std::memcpy(p, &kFreedStamp, sizeof kFreedStamp);
+#endif
           return;
         } catch (...) {  // the list could not grow: free the node instead
         }
@@ -367,6 +411,10 @@ inline auto common_prefix_length(const KeyParts &x,
 // whose tag they carry writes to them.
 // ---------------------------------------------------------------------------
 export template <typename V> struct Node {
+  // What expect_live() finds in the tag, the node's first bytes, of a node
+  // the pool holds.
+  static constexpr std::uint64_t kFreedTag = NodePool::kFreedStamp;
+
   std::uint64_t tag{0};        // creating session: ownership and reclamation
   Node *first_child{nullptr};  // inner only: child left of every separator
   std::uint32_t capacity{0};   // bytes allocated
@@ -435,9 +483,32 @@ export template <typename V> struct Node {
     return n;
   }
 
+  // Test builds with the pool on stamp a node the pool keeps when it is
+  // freed (NodePool::give), and end the process with kFreedNodeExitCode on
+  // a stamped node freed, walked or asked for its owner: there ASan is off
+  // and a node freed twice is handed out twice, silently. Not an abort, so
+  // a sweep tells it from a std::terminate it tolerates. A node the pool
+  // has handed out again, or freed to operator delete instead of keeping,
+  // goes unchecked. A no-op elsewhere; under ASan the sanitizer reports
+  // the same.
+  static void expect_live([[maybe_unused]] const Node *n) noexcept {
+#ifdef BYTECASK_TESTING
+    if constexpr (kNodePoolEnabled) {
+      std::uint64_t tag = 0;
+      std::memcpy(&tag, static_cast<const void *>(n), sizeof tag);
+      if (tag == kFreedTag) [[unlikely]] {
+        std::fputs("bytecask: key directory node used after it was freed\n",
+                   stderr);
+        std::_Exit(kFreedNodeExitCode);
+      }
+    }
+#endif
+  }
+
   // Frees one node and, for a leaf, the values it holds. Children are not
   // touched: their lifetime is the chain's business.
   static void destroy(Node *n) noexcept {
+    expect_live(n);
     if constexpr (!std::is_trivially_destructible_v<V>) {
       if (n->is_leaf) {
         for (std::uint32_t i = 0; i < n->count; ++i)
@@ -632,6 +703,7 @@ export template <typename V> struct Node {
   }
 
   template <typename F> void for_each_child(F &&f) const {
+    expect_live(this);
     if (is_leaf)
       return;
     f(first_child);
@@ -645,7 +717,10 @@ export template <typename V> class LeafRun;
 
 export template <typename V> struct ChainTraits {
   using Node = btree_detail::Node<V>;
-  static auto tag(const Node *n) noexcept -> std::uint64_t { return n->tag; }
+  static auto tag(const Node *n) noexcept -> std::uint64_t {
+    Node::expect_live(n);
+    return n->tag;
+  }
   template <typename F> static void for_each_child(Node *n, F &&f) {
     n->for_each_child(std::forward<F>(f));
   }
@@ -729,6 +804,7 @@ public:
     return tag_ != 0 && !interrupted_;
   }
   [[nodiscard]] auto owns(const N *n) const noexcept -> bool {
+    N::expect_live(n);
     return n->tag == tag_;
   }
   [[nodiscard]] auto retired_list() noexcept -> std::vector<N *> & {
@@ -843,10 +919,16 @@ protected:
       throw std::logic_error{"BuildSession: an earlier write failed partway"};
     interrupted_ = true;
     const auto r = descend();
+    // A write that changed nothing replaced nothing: discard() runs only on
+    // the way to a changed result, so nothing is left to release.
+    assert(r.changed || (r.node == root && replaced_.empty()));
     if (r.changed) {
+      if (r.right)
+        note_transition(Transition::kRootGrowth);
       root = r.right ? make_root(r.node, r.right) : r.node;
       // An erase can leave an inner root with a single child.
       while (root && !root->is_leaf && root->count == 0) {
+        note_transition(Transition::kRootCollapse);
         discard(root);
         root = root->first_child;
       }
@@ -1012,8 +1094,10 @@ protected:
   auto place(N *node, std::uint32_t pos, Bytes key, const P &payload)
       -> Result {
     const auto cpl = common_prefix_length(node->prefix(), key);
-    if (cpl < node->prefix_len)
+    if (cpl < node->prefix_len) {
+      note_transition(Transition::kPrefixRebuild);
       node = rebuild(node, cpl);
+    }
     const auto suf = key.subspan(node->prefix_len);
     const bool leaf = node->is_leaf != 0;
     const auto need = N::entry_size(leaf, suf.size()) + N::kSlotBytes;
@@ -1030,6 +1114,7 @@ protected:
       }
     }
     if (node->packed_bytes(node->prefix_len) + need <= kBTreeNodeBytes) {
+      note_transition(Transition::kCompaction);
       node = rebuild(node, node->prefix_len);
       node->insert_entry(pos, suf, payload);
       return {node, nullptr, true, true};
@@ -1061,6 +1146,7 @@ protected:
   auto split(N *node, std::uint32_t pos, Bytes key, const P &payload)
       -> Result {
     const bool leaf = node->is_leaf != 0;
+    note_transition(leaf ? Transition::kLeafSplit : Transition::kInnerSplit);
     const auto total = static_cast<std::uint32_t>(node->count + 1);
     const auto *payload_bytes = payload_bytes_of(payload);
     auto item = [&](std::uint32_t i) -> Item {
@@ -1201,6 +1287,7 @@ protected:
     // The child emptied: drop it and the separator next to it.
     if (idx == 0) {
       if (n->count == 0) {
+        note_transition(Transition::kInnerEmptied);
         discard(n);
         return {nullptr, nullptr, true, false};
       }
@@ -1238,6 +1325,7 @@ private:
     auto *n = own(node);
     n->remove_entry(p.idx);
     if (n->count == 0) {
+      note_transition(Transition::kLeafEmptied);
       discard(n);
       return {nullptr, nullptr, true, false};
     }
@@ -1325,10 +1413,12 @@ public:
   auto operator=(const BulkLoader &) -> BulkLoader & = delete;
   // A loader dropped before finish() or seal() — abandoned, or unwound by an
   // append that threw — frees the nodes it sealed: no version holds them.
+  // A child a parent already adopted is freed through that parent.
   ~BulkLoader() {
     for (auto &level : levels_)
-      for (auto *n : level.children)
-        free_node_subtree_if<ChainTraits<V>>(n, [](N *) { return true; });
+      for (auto i = level.adopted; i < level.children.size(); ++i)
+        free_node_subtree_if<ChainTraits<V>>(level.children[i],
+                                             [](N *) { return true; });
   }
 
   void append(Bytes key, const V &value) {
@@ -1387,25 +1477,44 @@ public:
 protected:
   // Adds the runs' leaves to `out`'s leaf level in order, with the
   // separators between runs, and returns the tag to publish under: at or
-  // above every node's.
+  // above every node's. Everything that allocates comes first; the leaves
+  // then move from the runs to `out` without a throw, so no leaf is ever
+  // owned by both — a run and `out` both freeing one was a double free when
+  // an allocation failed partway (#588).
   static auto concat_into(BulkLoader &out, std::vector<LeafRun<V>> &runs)
       -> std::uint64_t {
+    note_transition(Transition::kRunJoin);
+    std::size_t leaves = 0;
+    std::vector<std::vector<std::byte>> boundary(runs.size());
+    const std::vector<std::byte> *prev_last = nullptr;
+    for (std::size_t r = 0; r < runs.size(); ++r) {
+      if (runs[r].leaves_.empty())
+        continue;
+      if (prev_last)
+        boundary[r] = separator(Bytes{*prev_last}, Bytes{runs[r].first_key_});
+      prev_last = &runs[r].last_key_;
+      leaves += runs[r].leaves_.size();
+    }
+    out.reserve_children(0, leaves);
+    return adopt_runs(out, runs, boundary);
+  }
+
+  // The commit half of concat_into: moves what it prepared. noexcept, so a
+  // throw here ends the process rather than leaving a leaf with two owners.
+  static auto adopt_runs(BulkLoader &out, std::vector<LeafRun<V>> &runs,
+                         std::vector<std::vector<std::byte>> &boundary) noexcept
+      -> std::uint64_t {
     auto publish_tag = out.session_.tag();
-    std::vector<std::byte> prev_last;
-    for (auto &run : runs) {
+    for (std::size_t r = 0; r < runs.size(); ++r) {
+      auto &run = runs[r];
       if (run.leaves_.empty())
         continue;
       publish_tag = std::max(publish_tag, run.tag_);
-      for (std::size_t i = 0; i < run.leaves_.size(); ++i) {
-        auto sep = i > 0 ? std::move(run.seps_[i - 1])
-                         : out.first_leaf()
-                               ? std::vector<std::byte>{}
-                               : separator(Bytes{prev_last},
-                                           Bytes{run.first_key_});
-        out.add_child(0, run.leaves_[i], sep);
-      }
-      run.leaves_.clear();  // ownership moved to `out`
-      prev_last = std::move(run.last_key_);
+      for (std::size_t i = 0; i < run.leaves_.size(); ++i)
+        out.adopt_child(0, run.leaves_[i],
+                        i > 0 ? std::move(run.seps_[i - 1])
+                              : std::move(boundary[r]));
+      run.leaves_.clear();
       out.size_ += run.size_;
     }
     return publish_tag;
@@ -1417,6 +1526,9 @@ protected:
   struct Level {
     std::vector<N *> children;
     std::vector<std::vector<std::byte>> seps;
+    // children[0, adopted) are owned by inner nodes of the level above, built
+    // so far by build_parent; the rest by the loader.
+    std::size_t adopted{0};
   };
 
   BuildSession<V> session_;
@@ -1438,9 +1550,9 @@ protected:
   }
 
   // True while no leaf has been added yet — the first one needs no separator.
-  // A level exists only once a child was added to it.
+  // A level can exist with no child: reserve_children makes it.
   [[nodiscard]] auto first_leaf() const noexcept -> bool {
-    return levels_.empty();
+    return levels_.empty() || levels_[0].children.empty();
   }
 
   // Builds the levels above the sealed leaves and publishes the version.
@@ -1513,11 +1625,14 @@ protected:
           KeyParts{key_at(i), {}},
           BuildSession<V>::payload_bytes_of(leaf_vals_[i])};
     };
-    auto *leaf = session_.pack(
-        true, static_cast<std::uint32_t>(leaf_lens_.size()), item, leaf_prefix_);
+    // Everything that allocates before the leaf exists, so a throw leaves
+    // no node outside the loader's levels.
     const auto last = key_at(leaf_lens_.size() - 1);
     std::vector<std::byte> last_copy{last.begin(), last.end()};
-    add_child(0, leaf, pending_sep_);
+    reserve_children(0, 1);
+    auto *leaf = session_.pack(
+        true, static_cast<std::uint32_t>(leaf_lens_.size()), item, leaf_prefix_);
+    adopt_child(0, leaf, std::move(pending_sep_));
     prev_last_ = std::move(last_copy);
     leaf_arena_.clear();
     leaf_spans_.clear();
@@ -1528,13 +1643,29 @@ protected:
     pending_sep_.clear();
   }
 
-  void add_child(std::size_t lvl, N *child, const std::vector<std::byte> &sep) {
-    if (levels_.size() <= lvl)
+  // A node joins a level in two steps, so it never sits outside one while
+  // something can still throw: reserve_children makes room for `n` more
+  // children of level `lvl`, and adopt_child, which cannot throw, puts one
+  // there with the separator before it (dropped for the level's first).
+  void reserve_children(std::size_t lvl, std::size_t n) {
+    while (levels_.size() <= lvl)
       levels_.emplace_back();
-    auto &L = levels_[lvl];
-    if (!L.children.empty())
-      L.seps.push_back(sep);
-    L.children.push_back(child);
+    auto &l = levels_[lvl];
+    auto grow = [n](auto &v) {
+      if (v.capacity() - v.size() < n)
+        v.reserve(std::max(v.size() + n, 2 * v.capacity()));
+    };
+    grow(l.children);
+    grow(l.seps);
+  }
+  void adopt_child(std::size_t lvl, N *child,
+                   std::vector<std::byte> &&sep) noexcept {
+    auto &l = levels_[lvl];
+    assert(l.children.size() < l.children.capacity() &&
+           l.seps.size() < l.seps.capacity());
+    if (!l.children.empty())
+      l.seps.push_back(std::move(sep));
+    l.children.push_back(child);
   }
 
   // The shortest key that sorts above `prev` and at or below `next`.
@@ -1547,13 +1678,15 @@ protected:
   // Packs level `lvl`'s children into inner nodes one level up. Each inner
   // node takes a child as first_child, then (separator, child) entries until
   // full; the separator that would have started the next node is pushed up.
+  //
+  // Level `lvl` keeps owning its children until the inner node over them has
+  // joined level lvl + 1 (Level::adopted), so a throw partway leaves every
+  // node owned exactly once: moving the level out first leaked it whole.
   void build_parent(std::size_t lvl) {
-    auto src = std::move(levels_[lvl]);
-    if (levels_.size() <= lvl + 1)
-      levels_.emplace_back();
+    note_transition(Transition::kLevelBuild);
     std::size_t i = 0;
-    while (i < src.children.size()) {
-      const auto up_sep = i == 0 ? std::vector<std::byte>{} : src.seps[i - 1];
+    while (i < levels_[lvl].children.size()) {
+      auto &src = levels_[lvl];
       auto *first = src.children[i];
       std::vector<Bytes> keys;
       std::vector<N *> kids;
@@ -1585,10 +1718,16 @@ protected:
         return typename BuildSession<V>::Item{
             KeyParts{keys[k], {}}, BuildSession<V>::payload_bytes_of(kids[k])};
       };
+      // Adding level lvl + 1 moves the Level objects, so `src` is not used
+      // past this point; keys and kids view buffers that do not move.
+      reserve_children(lvl + 1, 1);
       auto *inner = session_.pack(
           false, static_cast<std::uint32_t>(keys.size()), item, prefix);
       inner->first_child = first;
-      add_child(lvl + 1, inner, up_sep);
+      auto &from = levels_[lvl];
+      adopt_child(lvl + 1, inner,
+                  i == 0 ? std::vector<std::byte>{} : std::move(from.seps[i - 1]));
+      from.adopted = j;
       i = j;
     }
     levels_[lvl] = Level{};

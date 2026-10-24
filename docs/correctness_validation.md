@@ -2064,7 +2064,15 @@ which the hint paths already handle. Key directory nodes come from
 `operator new`, so outside ASan and MSan, where the pool is off, which of
 a write's node allocations are counted depends on what earlier tests left
 in the pool. Emptying it before each run is #583: it exposes a durable
-write lost after `resume()` and a reopen.
+write lost after `resume()` and a reopen. The tree-level sweeps below empty
+it before each run already; their reach check is required only under ASan.
+Where the pool is on, test builds stamp a node the pool keeps when it is
+freed, and end the process with their own exit code on freeing, walking or
+asking the owner of a stamped node, so a node freed twice fails the run
+there too (`alloc sweep: a key directory node freed twice ends the test
+build`). A node the pool has handed out again, or freed to `operator
+delete` (an oversized node, or a full pool) instead of keeping, goes
+unchecked.
 
 **Passes.** *one* fails only the n-th allocation, a transient spike;
 *every one from N on* fails it and every allocation after it until the
@@ -2083,7 +2091,8 @@ the operation, then the checks, and reports one line on a pipe:
 | threw, unchanged | it threw and published nothing |
 | threw, applied | it threw after publishing its whole transition |
 | degraded | the engine refused writes; `resume()`, with memory back, recovered it |
-| terminated | the process died |
+| terminated | `std::terminate` was called; the child's handler ends it with its own exit code |
+| crashed | it was killed by a signal (an assertion's or a panic's abort, a segmentation fault) or found a key directory node used after it was freed: a failure |
 | hung | no result after 20 s: a waiter whose wake-up the failure lost |
 
 After the fault, with memory back, the child checks that the state is the
@@ -2091,8 +2100,12 @@ baseline or the whole transition, that it passes `consistency_errors`, that
 a degraded engine resumes, that a write afterwards lands, and that a clean
 reopen recovers the same state serially and in parallel. A terminated
 run's directory is reopened by the parent as after a SIGKILL and must hold
-the baseline or the whole transition. A failed check and a hang fail the
-test. A termination is counted and reported, and fails the test only with
+the baseline or the whole transition. A failed check, a crash and a hang
+fail the test. A child goes back to the fatal-signal handlers the process
+started with, a sanitizer's where one is linked, so the sanitizer still
+reports: Catch2's, inherited through `fork`, would report the death as the
+test's own and write a second report from the child, appended to the
+parent's `--out` file. A termination is counted and reported, and fails the test only with
 `BYTECASK_ALLOC_SWEEP_STRICT=1`: whether the engine may end the process
 for lack of memory is not settled, and the sweep is how it will be.
 
@@ -2109,8 +2122,42 @@ for lack of memory is not settled, and the sweep is how it will be.
 | `ingest` | 27 | 23 threw unchanged, 3 degraded (both) |
 | `resume()`, unsynced entry | 162 | 90 / 113 degraded, 71 / 48 returned |
 | `resume()`, torn entry | 156 | 86 / 111 degraded, 69 / 44 returned |
+| `DB::open` of two or more data files and their hints, 1,350 keys, 1 recovery thread | 301 | 298 / 300 threw, 3 / 1 opened |
+| the same, 4 recovery threads | 354 | 351 / 353 threw, 3 / 1 opened |
 
-No run terminates or hangs. The whole sweep takes about 25 s. It runs on
+No run terminates or hangs. An `open` that opens holds every key, and one
+that throws throws `std::bad_alloc` and leaves the directory to reopen to
+every key, serially and in parallel. The `open` sweep fails on a
+termination without `BYTECASK_ALLOC_SWEEP_STRICT`: the contract says an
+`open` that cannot allocate ends nothing else. The operations' sweep takes about 25 s and the `open` sweep about
+16 s.
+
+**Tree-level sweeps.** The engine's sweep reaches a tree only through the
+writes its operations make, which its seed decides (#588). The key
+directory's trees are also swept on their own, in process, each allocation
+failed in turn, once and from there on, and each run's tree dropped after
+the failure:
+
+| Test | Workload |
+|---|---|
+| `alloc sweep: a transient whose write fails partway is freed once` (blind), `alloc sweep: a keyed transient whose write fails partway is freed once` | one transient over a published base: a long ascending family that splits the root into halves of its own, keys that sort before it and shrink their prefixes, erases that leave dead bytes and inserts that compact them, then erases of everything written; it must refuse a write after the failure |
+| `alloc sweep: an erase from a published tree that fails partway frees each node once` | a base three levels deep thinned to a few keys a leaf, then each erase in its own transient over the version the last published, as the engine's batches are, down to one key; both trees |
+| `alloc sweep: a bulk build that fails partway frees each node once` | four bulk loaders over ascending quarters, sealed and joined as parallel recovery joins its ranges, then one loader over every key; both trees, three levels deep. Its reach is the join of sealed runs and the build of an inner level |
+
+A sweep proves only what its workload reaches, so each counts the
+structural transitions its writes make (`btree_detail::Transition`: leaf
+and inner split, root growth, prefix rebuild, compaction, leaf and inner
+node emptied, root collapse, and a bulk loader's join of sealed runs and
+build of an inner level) and requires two things. A clean run
+must make every transition the test names, so a workload that stops
+reaching one fails rather than passes. And, under ASan, where every node
+allocation is counted, each of them must have been made by a write that a
+failed allocation then ended. The second requirement found that inside one
+transient no allocation follows an erase that empties a node, since the
+path is already owned: the window that #580 opened for a split is shut
+there by construction, and the published-tree sweep, whose erases each copy
+a foreign path, reaches the emptied and collapse transitions with failures
+after them. It runs on
 the default I/O back-end; `BYTECASK_ALLOC_SWEEP_STRIDE`,
 `BYTECASK_ALLOC_SWEEP_N` and `BYTECASK_ALLOC_SWEEP_PASS` narrow it, and
 `BYTECASK_ALLOC_SWEEP_TRACE=1` prints each run's outcome and the stack of
@@ -2167,6 +2214,30 @@ enough to split nodes, found what the engine's missed:
   the inner root under each failed allocation, reach it; `alloc sweep: a
   keyed transient whose write fails partway is freed once` runs the same
   sweep on the keyed tree.
+
+Then the review of that bug (#588), which looked for the same order
+elsewhere and swept what no operation had reached:
+
+- *A join of bulk-built ranges freed leaves twice.* Parallel recovery builds
+  each key range with its own loader and joins the sealed leaves with
+  `concat`, which added a run's leaves to the joining loader one by one and
+  cleared the run only after its last. An allocation failing in between —
+  a separator, the level's vector growing — left the leaves already moved
+  owned by both, and each freed them: heap-use-after-free under ASan. No
+  sweep opened a database with a fault armed. `alloc sweep: a bulk build
+  that fails partway frees each node once` and `alloc sweep: open` reach it.
+- *Opening a database ended the process when an allocation failed while
+  recovery listed the directory.* libstdc++'s `directory_iterator`
+  allocates each entry's path inside `_Dir::advance`, which is `noexcept`:
+  `std::terminate` under GCC 13's runtime, and a segmentation fault inside
+  `__cxa_call_terminate` under GCC 15's (#598). Recovery lists the
+  directory with `list_directory` instead, over `opendir` and `readdir`,
+  so a failed allocation there throws `std::bad_alloc`.
+- *Building the inner levels leaked a level on a failure.* `build_parent`
+  moved a level's children out before building the nodes above them, so a
+  failure partway left the children not yet under a parent owned by
+  nothing. The level now keeps them until their parent has joined the level
+  above.
 
 The fixes are in `bytecask_design.md`, *A failure after the append that no
 handler degrades for*. Each has a deterministic test, driven by a test hook
@@ -2766,6 +2837,10 @@ A site whose break nothing has to catch says why instead.
 | Key directory: `publish` reserves its record before it links the base | `alloc sweep: a failed publication leaves the base derivable` | `publish_links_before_reserving` | #364 |
 | Key directory: releasing a version never throws for want of memory | `alloc sweep: a version is released when nothing can be allocated` | `release_queue_allocates` | #390 |
 | Key directory: a write frees the nodes it replaced only after the root reaches their replacement | `alloc sweep: a transient whose write fails partway is freed once`, under ASan: elsewhere the node pool takes a double free without a report (#583) | `replaced_node_freed_at_once` | #585 |
+| Key directory: a join of bulk-built ranges hands each leaf over without a throw in between | `alloc sweep: a bulk build that fails partway frees each node once`, under ASan | `bulk_join_leaf_two_owners` | #588 |
+| Key directory: a level keeps its children until the node above them has joined the next level | `alloc sweep: a bulk build that fails partway frees each node once`, under ASan | `bulk_level_child_two_owners` | #588 |
+| Key directory, test builds with the node pool on: a node freed twice ends the process | `alloc sweep: a key directory node freed twice ends the test build`, where the pool is on (it skips under ASan, which reports a double free itself) | `freed_node_not_stamped` | #588 |
+| Recovery lists its directory without `std::filesystem::directory_iterator`, which ends the process when an allocation inside it fails | `alloc sweep: open` | `recovery_lists_with_directory_iterator` | #598 |
 
 ### Rotation and new files
 

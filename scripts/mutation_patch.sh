@@ -16,9 +16,11 @@
 #   check   apply, then revert; the tree is left as it was.
 #
 # The merge needs the blob each patch was made against (its `index` line), so
-# run it in a clone with history (actions/checkout: fetch-depth: 0). It
-# stages what it applies and unstages it on revert; run it on a tree whose
-# files the patch touches are clean, since a restore discards their changes.
+# run it in a clone with history (actions/checkout: fetch-depth: 0); in a
+# shallow clone it says which blobs are missing rather than calling the patch
+# stale. It stages what it applies and unstages it on revert; run it on a
+# tree whose files the patch touches are clean, since a restore discards
+# their changes.
 # `git apply --check --3way` cannot stand in for `check`: it exits 0 on a
 # conflict.
 
@@ -37,9 +39,26 @@ restore() {
   git checkout -q HEAD -- "${files[@]}"
 }
 
+# The pre-image blobs of the patch's `index` lines this clone lacks. In a
+# shallow clone the merge fails for want of them, not because the code moved.
+# A file the patch creates has an all-zero pre-image, which no clone holds.
+missing_blobs() {
+  sed -n 's/^index \([0-9a-f]*\)\.\..*/\1/p' "$patch" | while read -r blob; do
+    [ -n "${blob//0/}" ] || continue
+    git cat-file -e "$blob" 2>/dev/null || echo "$blob"
+  done
+}
+
 apply() {
   if ! git apply --3way "$patch" >/dev/null 2>&1; then
     restore
+    local missing
+    missing=$(missing_blobs)
+    if [ -n "$missing" ]; then
+      echo "mutation_patch: $patch needs blob(s) $(echo $missing) that this clone" \
+        "does not have; fetch the history (git fetch --unshallow) and retry" >&2
+      return 1
+    fi
     echo "mutation_patch: $patch conflicts with the current code; regenerate it" >&2
     return 1
   fi

@@ -632,6 +632,7 @@ private:
     auto *n = own_leaf(leaf);
     L::remove_at(n, idx);
     if (n->count == 0) {
+      btree_detail::note_transition(btree_detail::Transition::kLeafEmptied);
       discard(n);
       return {nullptr, nullptr, true, false};
     }
@@ -682,6 +683,7 @@ private:
   template <BlindKeyResolver R>
   auto split_leaf(N *leaf, const typename L::Pos &p, Bytes key,
                   std::uint32_t fpq, BlindRef ref, R &res) -> Result {
+    btree_detail::note_transition(btree_detail::Transition::kLeafSplit);
     constexpr auto kCap = static_cast<std::uint32_t>(L::kCap);
     std::uint32_t meta[kCap + 1];
     std::uint64_t loc[kCap + 1];
@@ -1465,7 +1467,8 @@ private:
     if (!leaf_)
       return;
     L::build_index(leaf_);
-    this->add_child(0, leaf_, sep_);
+    this->reserve_children(0, 1);
+    this->adopt_child(0, leaf_, std::move(sep_));
     leaf_ = nullptr;
     sep_.clear();
   }

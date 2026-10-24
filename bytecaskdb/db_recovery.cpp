@@ -190,8 +190,11 @@ void DB::recovery_undo_interrupted_vacuum(const std::filesystem::path &a,
 // generate missing hint files. Returns the RecoveredFile list.
 auto DB::recovery_prepare_files(EngineState &s)
     -> std::vector<RecoveredFile> {
-  for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
-    const auto &p = dir_entry.path();
+  // Not std::filesystem::directory_iterator: an allocation failing inside
+  // it ends the process (list_directory). A removed .tmp is not .data, so
+  // one listing serves both passes.
+  auto entries = list_directory(dir_);
+  for (const auto &p : entries) {
     if (p.extension() == ".tmp" &&
         (p.stem().extension() == ".hint" || p.stem().extension() == ".data")) {
       std::filesystem::remove(p);
@@ -201,9 +204,9 @@ auto DB::recovery_prepare_files(EngineState &s)
   // Name order, so file ids are a function of the directory's contents and
   // not of the order the filesystem lists it in.
   std::vector<std::filesystem::path> data_paths;
-  for (const auto &dir_entry : std::filesystem::directory_iterator{dir_}) {
-    if (dir_entry.path().extension() == ".data") {
-      data_paths.push_back(dir_entry.path());
+  for (auto &p : entries) {
+    if (p.extension() == ".data") {
+      data_paths.push_back(std::move(p));
     }
   }
   std::ranges::sort(data_paths);

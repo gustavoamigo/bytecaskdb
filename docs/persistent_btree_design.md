@@ -398,6 +398,21 @@ publishes under the highest tag among them (the chain frees a dead
 version by tag interval, so a node tagged above the published version
 would be taken for a later version's garbage).
 
+Each sealed node has one owner at every instant, a failure partway
+included: a run, a loader's level, or the inner node above it. A loader
+destroyed on an error frees the children its levels own, and an inner
+node frees its subtree. So a node joins a level in two steps:
+`reserve_children` makes room, which may throw, and `adopt_child`, which
+cannot, puts it there. `concat` computes every separator and reserves the
+joined level before it moves a single leaf, then moves them all in
+`adopt_runs`, which is `noexcept`. It used to add a run's leaves one at a
+time and clear the run after its last, so a failed allocation in between
+left those leaves owned by the run and the joining loader, and both freed
+them. `build_parent` leaves a level's children in the level, and counts
+those an inner node of the next level has adopted (`Level::adopted`); it
+used to move the level out first, and a failure partway leaked every child
+not yet under a parent.
+
 This is deliberately *not* shared with the radix tree. A trie is
 canonical: two radix trees agree on the shape of any subtree whose key
 set they agree on, so their merge adopts whole subtrees by pointer and
