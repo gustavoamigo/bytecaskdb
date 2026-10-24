@@ -110,19 +110,23 @@ auto expr(const PgQuery__Node* n) -> Expr {
   if (n->node_case == PG_QUERY__NODE__NODE_FUNC_CALL) {
     const auto* f = n->func_call;
     auto name = str(f->funcname[f->n_funcname - 1]);
-    auto known = name == "count" || name == "sum" || name == "min";
+    auto known = name == "count" || name == "sum" || name == "min" || name == "max" || name == "avg";
     if (!known || (f->n_funcname == 2 && str(f->funcname[0]) != "pg_catalog") || f->n_funcname > 2) {
       reject("function " + name + " is not supported", f->location);
     }
     auto refuse = [&] [[noreturn]] {
-      reject("only COUNT(*), COUNT([DISTINCT] column), SUM(column) and MIN(column) are supported", f->location);
+      reject("only COUNT(*), COUNT([DISTINCT] column), and SUM, MIN, MAX and AVG of a column are supported", f->location);
     };
     if ((f->agg_distinct && name != "count") || f->n_agg_order != 0 || f->agg_filter != nullptr ||
         f->over != nullptr || f->agg_within_group || f->func_variadic) {
       refuse();
     }
     Expr e{Expr::Kind::Aggregate, {}, 0, nullptr, nullptr, f->location};
-    e.fn = name == "count" ? Expr::Fn::Count : name == "sum" ? Expr::Fn::Sum : Expr::Fn::Min;
+    e.fn = name == "count" ? Expr::Fn::Count
+           : name == "sum" ? Expr::Fn::Sum
+           : name == "min" ? Expr::Fn::Min
+           : name == "max" ? Expr::Fn::Max
+                           : Expr::Fn::Avg;
     e.distinct = f->agg_distinct;
     if (f->agg_star && e.fn == Expr::Fn::Count) return e;
     if (f->agg_star || f->n_args != 1 || f->args[0]->node_case != PG_QUERY__NODE__NODE_COLUMN_REF) refuse();
@@ -368,8 +372,7 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
     if (from->node_case != PG_QUERY__NODE__NODE_RANGE_VAR) reject("SELECT reads one or two tables", pos);
     tables.push_back(from->range_var);
   }
-  if (s->n_distinct_clause != 0 || s->n_group_clause != 0 || s->having_clause != nullptr ||
-      s->limit_offset != nullptr || s->n_locking_clause > 1 || s->with_clause != nullptr ||
+  if (s->n_distinct_clause != 0 || s->group_distinct || s->limit_offset != nullptr || s->n_locking_clause > 1 || s->with_clause != nullptr ||
       s->n_window_clause != 0 || s->into_clause != nullptr) {
     reject("SELECT clause not supported", pos);
   }
@@ -408,6 +411,13 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
   }
   where(on, sel.where, "ON", sel.join_pos);
   where(s->where_clause, sel.where);
+  // GROUP BY of columns: no expressions, grouping sets, ROLLUP or CUBE.
+  for (std::size_t i = 0; i < s->n_group_clause; ++i) {
+    const auto* g = s->group_clause[i];
+    if (g->node_case != PG_QUERY__NODE__NODE_COLUMN_REF) reject("GROUP BY takes columns", pos);
+    sel.group_by.push_back(expr(g));
+  }
+  where(s->having_clause, sel.having, "HAVING", pos);
   return sel;
 }
 

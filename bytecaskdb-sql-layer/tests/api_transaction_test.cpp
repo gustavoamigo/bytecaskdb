@@ -1262,3 +1262,103 @@ TEST_CASE("embedded API: SELECT … FOR UPDATE makes the commit 40001 if a row i
     CHECK(std::get<std::int64_t>(r.rows[0][0]) == 20);
   }
 }
+
+namespace {
+
+auto text_of(const Value& v) -> std::string {
+  const auto& b = std::get<std::vector<std::byte>>(v);
+  return {reinterpret_cast<const char*>(b.data()), b.size()};  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+}
+
+}  // namespace
+
+TEST_CASE("embedded API: AVG is PostgreSQL's numeric quotient, at the scale its division takes", "[sql][api][group]") {
+  // numeric_div's scale: 16 significant digits at least, more for a quotient
+  // under 1, the argument's scale at least; rounded half away from zero.
+  // Each as PostgreSQL 16 prints it.
+  CHECK(average_text(3, 2, 0) == "1.5000000000000000");
+  CHECK(average_text(4, 3, 0) == "1.3333333333333333");
+  CHECK(average_text(5, 3, 0) == "1.6666666666666667");
+  CHECK(average_text(1, 2, 0) == "0.50000000000000000000");
+  CHECK(average_text(0, 2, 0) == "0.00000000000000000000");
+  CHECK(average_text(-3, 2, 0) == "-1.5000000000000000");
+  CHECK(average_text(-1, 3, 0) == "-0.33333333333333333333");
+  CHECK(average_text(200000, 2, 0) == "100000.000000000000");
+  CHECK(average_text(125, 1, 2) == "1.25000000000000000000");
+  CHECK(average_text(-310, 4, 2) == "-0.77500000000000000000");
+  CHECK(average_text(INT64_MIN, 1, 0) == "-9223372036854775808");
+  CHECK(average_text(INT64_MAX, 3, 0) == "3074457345618258602");
+
+  sql_test::TempDir dir{"api_group"};
+  auto db = open_db(dir);
+  db->execute("CREATE TABLE g (k BIGINT PRIMARY KEY, a BIGINT, d NUMERIC(6,2))");
+  for (std::int64_t k = 1; k <= 7; ++k) {
+    db->execute("INSERT INTO g VALUES ($1, $2, $3)", {k, k % 3 == 0 ? Value{} : Value{k % 2}, Value{k * 125}});
+  }
+  auto r = db->execute("SELECT a, count(*), avg(k), avg(d) FROM g WHERE k >= $1 GROUP BY a ORDER BY a NULLS FIRST",
+                       {std::int64_t{1}});
+  REQUIRE(r.rows.size() == 3);
+  CHECK(std::holds_alternative<std::monostate>(r.rows[0][0]));  // k = 3, 6
+  CHECK(text_of(r.rows[0][2]) == "4.5000000000000000");
+  CHECK(text_of(r.rows[0][3]) == "5.6250000000000000");
+  CHECK(std::get<std::int64_t>(r.rows[1][0]) == 0);  // k = 2, 4
+  CHECK(text_of(r.rows[1][2]) == "3.0000000000000000");
+  CHECK(std::get<std::int64_t>(r.rows[2][1]) == 3);  // k = 1, 5, 7
+  CHECK(r.types[2].kind == SqlKind::Decimal);
+  // No rows: no groups; without GROUP BY, one row, COUNT 0 and AVG NULL.
+  CHECK(db->execute("SELECT a, avg(k) FROM g WHERE k > $1 GROUP BY a", {std::int64_t{7}}).rows.empty());
+  auto none = db->execute("SELECT count(*), avg(k) FROM g WHERE k > $1", {std::int64_t{7}});
+  REQUIRE(none.rows.size() == 1);
+  CHECK(std::get<std::int64_t>(none.rows[0][0]) == 0);
+  CHECK(std::holds_alternative<std::monostate>(none.rows[0][1]));
+  // A NULL WHERE parameter matches no row, so the one row still comes, if
+  // its HAVING holds of it.
+  CHECK(db->execute("SELECT count(*) FROM g WHERE k > $1 HAVING count(*) < $2", {Value{}, std::int64_t{1}}).rows.size() == 1);
+  CHECK(db->execute("SELECT count(*) FROM g WHERE k > $1 HAVING count(*) > $2", {Value{}, std::int64_t{1}}).rows.empty());
+}
+
+TEST_CASE("embedded API: a structure of groups compiled while its table was small streams by the count as it runs",
+          "[sql][api][group][memory]") {
+  sql_test::TempDir dir{"api_group_budget"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  db->execute("CREATE TABLE g (k BIGINT PRIMARY KEY, a BIGINT, v BIGINT)");
+  db->execute("CREATE INDEX g_a ON g (a)");
+  for (std::int64_t k = 1; k <= 10; ++k) db->execute("INSERT INTO g VALUES ($1, $2, $3)", {k, k, k});
+  // Compiled at 10 rows: the structure, below a count of k's range at which
+  // its groups would pass 64 KiB; from it, g_a's order, streamed.
+  const auto& by_a = db->prepare("SELECT a, count(*) FROM g WHERE k >= $1 GROUP BY a HAVING count(*) > $2");
+  CHECK(by_a.plan_source().find("bc_count_range") != std::string::npos);
+  CHECK(db->execute(by_a, {std::int64_t{1}, std::int64_t{0}}).rows.size() == 10);
+  for (std::int64_t k = 11; k <= 2000; ++k) db->execute("INSERT INTO g VALUES ($1, $2, $3)", {k, k, k});
+  // 2,000 groups would hold more than 64 KiB: the count takes the stream.
+  CHECK(db->execute(by_a, {std::int64_t{1}, std::int64_t{1}}).rows.empty());
+  // Grouped by v, which no index orders, the structure runs, and past the
+  // budget is 54000.
+  try {
+    (void)db->execute("SELECT v, count(*) FROM g WHERE k >= $1 GROUP BY v HAVING count(*) > $2",
+                      {std::int64_t{1}, std::int64_t{1}});
+    FAIL("ran past the budget");
+  } catch (const std::exception& e) {
+    CHECK(sqlstate(e) == "54000");
+  }
+}
+
+TEST_CASE("embedded API: an allocation failure in a grouped plan is BC_E_MEMORY or its rows", "[sql][api][alloc][group]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
+  sql_test::TempDir dir{"api_group_faults"};
+  auto db = open_owners(dir);
+  // In a structure: a nullable key, a key read from a held row, with
+  // COUNT(DISTINCT), HAVING, a sort of the groups and a LIMIT, over a hash
+  // join; and streamed.
+  sweep_plan_allocations(*db, "SELECT acct, count(*), sum(id), avg(id), max(id) FROM owner WHERE id > $1 GROUP BY acct",
+                         "bc_agg_open");
+  sweep_plan_allocations(*db,
+                         "SELECT name, count(DISTINCT acct) FROM owner WHERE id >= $1 GROUP BY name HAVING count(*) > $1 "
+                         "ORDER BY name LIMIT 2",
+                         "bc_hash_open");
+  sweep_plan_allocations(*db,
+                         "SELECT acct.bal, count(*) FROM owner, acct WHERE owner.id > $1 AND acct.bal = owner.acct "
+                         "GROUP BY acct.bal",
+                         "bc_agg_open");
+  sweep_plan_allocations(*db, "SELECT id, max(bal), count(DISTINCT bal) FROM acct WHERE id >= $1 GROUP BY id", "bool st0");
+}

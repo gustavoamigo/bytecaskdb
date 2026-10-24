@@ -52,7 +52,7 @@ auto count_star(logical::NodePtr in) -> logical::NodePtr {
   agg.fn = Expr::Fn::Count;
   std::vector<logical::Output> outs;
   outs.push_back({std::move(agg), "count"});
-  return logical::node(logical::Aggregate{std::move(in), std::move(outs)});
+  return logical::node(logical::Aggregate{std::move(in), std::move(outs), {}, false});
 }
 
 auto decimal(std::int64_t v, std::uint8_t scale) -> Expr {
@@ -981,4 +981,98 @@ TEST_CASE("search: crossing() takes no threshold where two costs cross more than
   // Where it ends below the first, or starts above it: none either.
   CHECK(crossing(first, [](double) { return 0.5; }, 1000) == std::nullopt);
   CHECK(crossing(first, [](double x) { return 2 * x; }, 1000) == std::nullopt);
+}
+
+TEST_CASE("search: GROUP BY streams groups in an index's order, or holds them in a structure, by their costs",
+          "[sql][search][cost][group]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"g", {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+                             Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateIndexDdl{"g_a", "g", {{"a"}}});
+  const auto& cat = f.cat();
+  // 1,000 rows. g_a's full scan gives a's groups, covering: 1,000 entries,
+  // each group given as the next starts, in locals. The structure over the
+  // same scan costs 1,000, each row held at 1 + 0.3, and a step per group,
+  // 100 of them at 1/10 per key.
+  auto streamed = plan_sql(cat, "SELECT a, count(*) FROM g GROUP BY a", {{"g", 1000}});
+  CHECK(has(streamed, "bool st0 = false;"));
+  CHECK(has(streamed, "bc_key_part_i64"));
+  CHECK_FALSE(has(streamed, "bc_agg_open"));
+  CHECK(streamed.cost == Catch::Approx(1000));
+  // k < $1 keeps a third of the rows, by the primary key; g_a's order would
+  // fetch every row for the filter, 2 x 1,000. The structure costs less.
+  auto held = plan_sql(cat, "SELECT a, count(*) FROM g WHERE k < $1 GROUP BY a", {{"g", 1000}});
+  CHECK(has(held, "bc_agg a0 = bc_agg_open(cx, 2);"));
+  CHECK(has(held, "while (bc_agg_next(cx, a0, &gk0, 0)) {"));
+  CHECK_FALSE(has(held, "bool st0"));
+  CHECK(held.cost == Catch::Approx(1000.0 / 3 + 1000.0 / 3 * (1 + kHashWeight) + 1000.0 / 30));
+  // ORDER BY a: the stream's order gives it; ORDER BY a DESC too, read in
+  // reverse, its NULLs first. ORDER BY count(*) is not in the dialect.
+  CHECK_FALSE(has(plan_sql(cat, "SELECT a, count(*) FROM g GROUP BY a ORDER BY a NULLS FIRST", {{"g", 1000}}), "bc_sorter"));
+  auto desc = plan_sql(cat, "SELECT a, count(*) FROM g GROUP BY a ORDER BY a DESC", {{"g", 1000}});
+  CHECK(has(desc, "BC_SCAN_REVERSE"));
+  CHECK_FALSE(has(desc, "bc_sorter"));
+  // The structure's groups come in the order of their first rows, so a sort
+  // of them where the plan's order is not the ORDER BY's, and a LIMIT that
+  // counts the sorted groups. Under LIMIT 2 the stream in g_a's reverse
+  // order stops after 2 of its 100 groups, and costs less; under LIMIT 50,
+  // 1,000, more than the structure and its sort.
+  CHECK(has(plan_sql(cat, "SELECT a, count(*) FROM g WHERE k < $1 GROUP BY a ORDER BY a DESC LIMIT 2", {{"g", 1000}}),
+            "bool st0 = false;"));
+  auto sorted = plan_sql(cat, "SELECT a, count(*) FROM g WHERE k < $1 GROUP BY a ORDER BY a DESC LIMIT 50", {{"g", 1000}});
+  CHECK(has(sorted, "bc_sorter s0 = bc_sorter_open(cx, 50);"));
+  CHECK(has(sorted, "bc_sorter_add(cx, s0, bc_sort_key_end(cx, sk), gk0);"));
+  CHECK(has(sorted, "while (n < 50 && bc_sorter_next(cx, s0, &p0)) {"));
+  CHECK(sorted.cost == Catch::Approx(800 + 1000.0 / 30 * (1 + kSortWeight)));
+  CHECK(has(sorted, "bc_group g0 = bc_agg_group(cx, a0, p0);"));
+  // A key a WHERE equality makes constant leaves the rest to group by: a
+  // prefix of the primary key streams by the part after it.
+  auto prefix = plan_sql(cat, "SELECT k, a, count(*) FROM g WHERE a = $1 GROUP BY k, a", {{"g", 1000}});
+  CHECK(has(prefix, "bool st0 = false;"));
+  // With no GROUP BY, one group, given over no rows too.
+  auto one = plan_sql(cat, "SELECT count(*), max(v) FROM g WHERE k < $1", {{"g", 1000}});
+  CHECK_FALSE(has(one, "bc_agg_open"));
+  CHECK(has(one, "if (!xs0_1) {"));
+}
+
+TEST_CASE("search: a structure of groups that may pass the memory budget is a choice point, or left out",
+          "[sql][search][cost][group][memory][choice]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"g", {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+                             Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateIndexDdl{"g_a", "g", {{"a"}}});
+  const auto& cat = f.cat();
+  const std::string sql = "SELECT a, count(*) FROM g WHERE k < $1 GROUP BY a";
+  RowCounts counts = [](const Table&) -> std::optional<std::uint64_t> { return 1000; };
+  auto plan = [&](std::uint64_t budget) {
+    return generate_plan(bound::bind(ast::parse(sql), cat), cat, sql, counts, budget);
+  };
+  // An aggregate of n groups of 2 slots holds at least 320 + 2 + n x (136 +
+  // 2 x 48) bytes: past 10,000 from 42 groups. No more groups than the rows
+  // k's range holds, counted when the plan runs: below 42 the structure,
+  // from it the stream in g_a's order, which holds nothing.
+  auto choice = plan(10'000);
+  CHECK(threshold(choice) == 42);
+  CHECK(has(choice, ", lo0, hi0, 42);"));
+  const auto other = choice.source.find("} else {");
+  REQUIRE(other != std::string::npos);
+  CHECK(choice.source.find("bc_agg_open") < other);
+  CHECK(choice.source.find("bool st1 = false;", other) != std::string::npos);
+  CHECK(choice.cost == Catch::Approx(1000.0 / 3 + 1000.0 / 3 * (1 + kHashWeight) + 1000.0 / 30 + 2));
+  // Under the empty aggregate's bytes nothing fits: the stream.
+  auto avoided = plan(300);
+  CHECK_FALSE(has(avoided, "bc_agg_open"));
+  CHECK(has(avoided, "bool st0 = false;"));
+  // With no budget, the structure alone.
+  auto unbounded = plan(0);
+  CHECK(has(unbounded, "bc_agg_open"));
+  CHECK_FALSE(has(unbounded, "bc_count_range"));
+  // Where no plan streams, the structure runs, and past the budget fails
+  // with 54000: grouped by v, which no index orders.
+  const std::string by_v = "SELECT v, count(*) FROM g WHERE k < $1 GROUP BY v";
+  auto alone = generate_plan(bound::bind(ast::parse(by_v), cat), cat, by_v, counts, 10'000);
+  CHECK(has(alone, "bc_agg_open"));
+  CHECK_FALSE(has(alone, "bc_count_range"));
 }

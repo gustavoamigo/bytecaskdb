@@ -342,7 +342,9 @@ auto prune(Node& n, std::vector<ColumnRef> needed) -> bool {
         } else if constexpr (std::is_same_v<T, Aggregate>) {
           std::vector<ColumnRef> cols;
           for (const auto& o : op.aggs) columns_of(o.expr, cols);
-          changed = prune(*op.input, below(cols, false)) || changed;
+          for (const auto& g : op.group_by) columns_of(g, cols);
+          // A HAVING above reads aggregates' arguments the select list may not.
+          changed = prune(*op.input, below(cols, true)) || changed;
         } else if constexpr (std::is_same_v<T, Sort>) {
           std::vector<ColumnRef> cols;
           for (const auto& k : op.keys) columns_of(k.expr, cols);

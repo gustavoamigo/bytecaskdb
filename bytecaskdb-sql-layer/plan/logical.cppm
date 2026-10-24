@@ -49,7 +49,7 @@ struct ColumnRef {
 // rules: a comparison's is BOOLEAN, an aggregate's PostgreSQL's result type.
 struct Expr {
   enum class Kind { Column, Param, Const, Add, Sub, Compare, Aggregate };
-  enum class Fn { Count, Sum, Min };
+  enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind{Kind::Param};
   SqlType type{};
   ColumnRef col{};              // Column
@@ -159,10 +159,15 @@ struct Join {
   std::vector<Expr> predicate;
 };
 
-// No GROUP BY: one row over all the input's rows, of aggregate calls.
+// One row per group of the input's rows whose `group_by` columns are equal,
+// NULL equal to NULL, of `aggs`: aggregate calls and grouped columns, in the
+// select list's order. Not `grouped` (no GROUP BY): one row over all the
+// input's rows, none of `aggs` a column. A HAVING is a Filter above it.
 struct Aggregate {
   NodePtr input;
   std::vector<Output> aggs;
+  std::vector<Expr> group_by;  // columns, each once
+  bool grouped{false};
 };
 
 // A key, its direction and where its NULLs go: as NULLS FIRST or NULLS

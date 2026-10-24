@@ -310,3 +310,41 @@ TEST_CASE("physical: a hash join holds the row of its build side's one loop, key
           "counts another range than its build side's");
   refused(plan(choice(scan({p(0)}, {}), node(scan({p(0)}, {})))), "whose other plan reads other tables");
 }
+
+TEST_CASE("physical: check refuses a grouped aggregate codegen can't print", "[sql][physical][group]") {
+  const logical::ColumnRef name{1, 2, PhysType::Bytes, true};
+  auto count = logical::expr(logical::Expr::Kind::Aggregate, SqlType{SqlKind::BigInt});
+  auto rows = [] { return node(scan({p(0)}, std::monostate{})); };
+  auto grouped = [&](std::vector<logical::ColumnRef> keys, bool streamed, std::vector<logical::Expr> outputs) {
+    auto g = node(physical::GroupAggregate{rows(), std::move(keys), {count}, streamed});
+    return plan(node(physical::GroupEmit{std::move(g), std::move(outputs)}), {0});
+  };
+  auto key = logical::column(kId, SqlType{SqlKind::BigInt});
+  CHECK(refusal(grouped({kId}, true, {key, count})).empty());
+  CHECK(refusal(grouped({kId}, false, {key, count})).empty());
+  CHECK(refusal(grouped({}, true, {count})).empty());
+  refused(grouped({}, false, {count}), "a structure of groups with no key");
+  refused(grouped({name}, true, {count}), "a streamed GROUP BY key held in no local");
+  refused(grouped({kId}, true, {logical::column(name, SqlType{SqlKind::Bytea})}), "no key or aggregate of its groups");
+  // A key not an I64 is read from the row its group holds: never a covering
+  // scan's entry.
+  auto covered = node(physical::GroupAggregate{node(scan({p(0)}, std::monostate{}, true)), {name}, {count}, false});
+  refused(plan(node(physical::GroupEmit{std::move(covered), {count}}), {0}), "holds a covering scan's entry");
+  // A HAVING compares a key or an aggregate of the groups with a parameter.
+  auto having = [&](logical::Expr lhs) {
+    auto g = node(physical::GroupAggregate{rows(), {kId}, {count}, false});
+    auto f = node(physical::Filter{std::move(g), {logical::compare(ast::Compare::Op::Gt, std::move(lhs), p(1))}});
+    return plan(node(physical::GroupEmit{std::move(f), {count}}), {0});
+  };
+  CHECK(refusal(having(count)).empty());
+  refused(having(logical::column(name, SqlType{SqlKind::Bytea})), "compares no key or aggregate");
+  // A sort holds a structure's groups, by its keys.
+  auto sorted = [&](bool streamed, logical::ColumnRef by) {
+    auto g = node(physical::GroupAggregate{rows(), {kId}, {count}, streamed});
+    auto s = node(physical::Sort{std::move(g), {{by, false, false}}, 0, 0, true});
+    return plan(node(physical::GroupEmit{std::move(s), {count}}), {0});
+  };
+  CHECK(refusal(sorted(false, kId)).empty());
+  refused(sorted(true, kId), "a sort of groups not over a structure of them");
+  refused(sorted(false, name), "a sort of groups by a column not a key");
+}

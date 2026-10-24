@@ -14,6 +14,7 @@ module;
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <expected>
 #include <optional>
 #include <span>
@@ -393,9 +394,9 @@ public:
 
   // Whether the layer takes `fn` of `c`, and if not the SQLSTATE of the
   // refusal: 42883 where PostgreSQL has no such aggregate either, 42601 where
-  // it has and the layer does not yet (SUM of a REAL, DOUBLE PRECISION or
-  // TIME column, which PostgreSQL sums as an interval; MIN of a REAL, DOUBLE
-  // PRECISION or string column).
+  // it has and the layer does not yet (SUM or AVG of a REAL, DOUBLE PRECISION
+  // or TIME column, which PostgreSQL takes as an interval; MIN or MAX of a
+  // REAL, DOUBLE PRECISION or string column).
   struct AggregateSupport {
     bool supported;
     SqlState sqlstate;
@@ -403,7 +404,7 @@ public:
   static auto aggregate_support(ast::Expr::Fn fn, const Column& c) -> AggregateSupport {
     using Fn = ast::Expr::Fn;
     if (fn == Fn::Count) return {true, kSyntaxError};
-    auto sum = fn == Fn::Sum;
+    auto sum = fn == Fn::Sum || fn == Fn::Avg;
     switch (c.sql.kind) {
       case SqlKind::SmallInt:
       case SqlKind::Integer:
@@ -427,21 +428,25 @@ public:
       case ast::Expr::Fn::Count: return "COUNT";
       case ast::Expr::Fn::Sum: return "SUM";
       case ast::Expr::Fn::Min: return "MIN";
+      case ast::Expr::Fn::Max: return "MAX";
+      case ast::Expr::Fn::Avg: return "AVG";
     }
     std::unreachable();
   }
 
-  // An aggregate call, of column c of `table`, or COUNT(*) with none. SUM
-  // and MIN take a column whose values the plan holds as int64_t: SUM an
-  // integer or DECIMAL one, as PostgreSQL sums them exactly; MIN those and
-  // the date and time types. MIN of a REAL or DOUBLE PRECISION column is
-  // later, and of a string or bytes column outside the MVP
-  // (docs/frontend_design.md, *Aggregates*).
+  // An aggregate call, of column c of `table`, or COUNT(*) with none. SUM,
+  // MIN, MAX and AVG take a column whose values the plan holds as int64_t:
+  // SUM and AVG an integer or DECIMAL one, as PostgreSQL sums them exactly;
+  // MIN and MAX those and the date and time types. Of a REAL or DOUBLE
+  // PRECISION column they are later, and MIN and MAX of a string or bytes
+  // column outside the MVP (docs/frontend_design.md, *Aggregates*).
   //
   // Its result as PostgreSQL names and types it: COUNT a bigint; SUM of a
   // SMALLINT or INTEGER a bigint, of a BIGINT or DECIMAL a numeric of no
   // declared precision (the total may take 19 digits), held at the column's
-  // scale; MIN of the column's type.
+  // scale; MIN and MAX of the column's type; AVG a numeric of no declared
+  // precision, its scale PostgreSQL's division's (the API computes it from
+  // the plan's sum and count, docs/planner_design.md, *GROUP BY as built*).
   static auto aggregate(const Column* c, std::uint32_t table, const ast::Expr& e) -> logical::Output {
     using Fn = ast::Expr::Fn;
     auto agg = logical::expr(logical::Expr::Kind::Aggregate, SqlType{SqlKind::BigInt});
@@ -450,6 +455,8 @@ public:
       case Fn::Count: agg.fn = logical::Expr::Fn::Count; break;
       case Fn::Sum: agg.fn = logical::Expr::Fn::Sum; break;
       case Fn::Min: agg.fn = logical::Expr::Fn::Min; break;
+      case Fn::Max: agg.fn = logical::Expr::Fn::Max; break;
+      case Fn::Avg: agg.fn = logical::Expr::Fn::Avg; break;
     }
     if (c == nullptr) return {std::move(agg), "count"};
     if (auto s = aggregate_support(e.fn, *c); !s.supported) {
@@ -466,6 +473,8 @@ public:
         }
         return {std::move(agg), "sum"};
       case Fn::Min: agg.type = c->sql; return {std::move(agg), "min"};
+      case Fn::Max: agg.type = c->sql; return {std::move(agg), "max"};
+      case Fn::Avg: agg.type = SqlType{SqlKind::Decimal, 0, 0, c->sql.scale}; return {std::move(agg), "avg"};
     }
     return {std::move(agg), ""};
   }
@@ -633,11 +642,17 @@ public:
                             logical::column_of(sides[rs]->id, *rc));
   }
 
-  // A SELECT of one table, or of two joined: Limit? -> Project | Aggregate
-  // -> Sort? -> Filter? -> Get, or a Join of two Gets. The WHERE's conjuncts,
-  // a join's ON among them, sit in one Filter above the tables; predicate
-  // pushdown moves each down. No FOR UPDATE on a join yet. An ORDER BY
-  // beside an aggregate is 42803.
+  // A SELECT of one table, or of two joined: Limit? -> Project -> Sort? ->
+  // Filter? -> Get, or a Join of two Gets; aggregated, Limit? -> Sort? ->
+  // Filter? -> Aggregate -> Filter? -> the tables, the Filter above the
+  // Aggregate its HAVING. The WHERE's conjuncts, a join's ON among them, sit
+  // in one Filter above the tables; predicate pushdown moves each down. No
+  // FOR UPDATE on a join yet.
+  //
+  // A query is aggregated by a GROUP BY, a HAVING or an aggregate call. Then
+  // a column it selects, orders by or compares in HAVING must be grouped,
+  // or of a table whose primary key is (42803): PostgreSQL's functional
+  // dependency, so it is grouped by too, which makes the same groups.
   auto select(const ast::Select& s) -> logical::NodePtr {
     auto joined = !s.join.empty();
     const Table* sides[2]{table(s.table, joined ? s.table_pos : s.pos), nullptr};
@@ -656,51 +671,114 @@ public:
       auto [side, c] = column(sides, e);
       return {sides[side], c};
     };
+    auto aggregated = !s.group_by.empty() || !s.having.empty() ||
+                      std::ranges::any_of(s.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Aggregate; });
+    std::vector<logical::Expr> group_by;
+    for (const auto& e : s.group_by) {
+      auto [t, c] = resolve(e);
+      auto g = logical::column_of(t->id, *c);
+      if (std::ranges::find(group_by, g) == group_by.end()) group_by.push_back(std::move(g));
+    }
+    // A column of an aggregated query: grouped, or grouped by now as its
+    // table's primary key determines it; else 42803.
+    auto grouped = [&](const Table& t, const Column& c, std::int32_t pos) -> logical::Expr {
+      auto g = logical::column_of(t.id, c);
+      if (std::ranges::find(group_by, g) != group_by.end()) return g;
+      auto by_key = !s.group_by.empty() && std::ranges::all_of(t.pk_col_ids, [&](std::uint32_t id) {
+        return std::ranges::find(group_by, logical::column_of(t.id, *t.column(id))) != group_by.end();
+      });
+      if (!by_key) ungrouped(t, c.name, pos);
+      group_by.push_back(g);
+      return g;
+    };
     std::vector<logical::Output> targets;
-    std::optional<logical::Output> agg;
-    const ast::Expr* bare = nullptr;  // a column beside an aggregate: 42803
-    const Table* bare_table = nullptr;
     for (const auto& e : s.targets) {
       if (e.kind == ast::Expr::Kind::Aggregate) {
-        if (agg) throw SqlError{"only one aggregate per SELECT is supported", e.pos};
         if (e.column.empty()) {
-          agg = aggregate(nullptr, 0, e);
+          targets.push_back(aggregate(nullptr, 0, e));
         } else {
           auto [t, c] = resolve(e);
-          agg = aggregate(c, t->id, e);
+          targets.push_back(aggregate(c, t->id, e));
         }
         continue;
       }
       if (e.kind != ast::Expr::Kind::Column) throw SqlError{"only columns and aggregates can be selected", e.pos};
       auto [t, c] = resolve(e);
-      targets.push_back({logical::column_of(t->id, *c), c->name});
-      bare = &e;
-      bare_table = t;
+      targets.push_back({aggregated ? grouped(*t, *c, e.pos) : logical::column_of(t->id, *c), c->name});
     }
-    if (agg && bare != nullptr) ungrouped(*bare_table, bare->column, bare->pos);
-    // 0A000, as PostgreSQL refuses it.
-    if (agg && s.for_update) throw SqlError{"FOR UPDATE is not allowed with aggregate functions", s.pos, kFeatureNotSupported};
+    std::vector<logical::Expr> having;
+    for (const auto& h : s.having) having.push_back(having_conjunct(h, resolve, grouped));
+    // 0A000, as PostgreSQL refuses it, and in its order of checks.
+    if (aggregated && s.for_update) {
+      auto what = !s.group_by.empty() ? "GROUP BY clause" : !s.having.empty() ? "HAVING clause" : "aggregate functions";
+      throw SqlError{std::string{"FOR UPDATE is not allowed with "} + what, s.pos, kFeatureNotSupported};
+    }
     std::vector<logical::SortKey> keys;
     for (const auto& o : s.order_by) {
       auto [t, c] = resolve(column_ref(o));
-      if (agg) ungrouped(*t, c->name, o.pos);
-      keys.push_back({logical::column_of(t->id, *c), o.desc, o.nulls_first.value_or(o.desc)});
+      auto key = aggregated ? grouped(*t, *c, o.pos) : logical::column_of(t->id, *c);
+      keys.push_back({std::move(key), o.desc, o.nulls_first.value_or(o.desc)});
     }
 
     auto rows = joined ? logical::node(logical::Join{logical::node(logical::Get{sides[0], false}),
                                                      logical::node(logical::Get{sides[1], false}), {}})
                        : logical::node(logical::Get{sides[0], s.for_update});
     if (!conjuncts.empty()) rows = logical::node(logical::Filter{std::move(rows), std::move(conjuncts)});
-    if (!keys.empty()) rows = logical::node(logical::Sort{std::move(rows), std::move(keys)});
-    if (agg) {
-      std::vector<logical::Output> aggs;
-      aggs.push_back(std::move(*agg));
-      rows = logical::node(logical::Aggregate{std::move(rows), std::move(aggs)});
+    if (aggregated) {
+      rows = logical::node(logical::Aggregate{std::move(rows), std::move(targets), std::move(group_by), !s.group_by.empty()});
+      if (!having.empty()) rows = logical::node(logical::Filter{std::move(rows), std::move(having)});
+      if (!keys.empty()) rows = logical::node(logical::Sort{std::move(rows), std::move(keys)});
     } else {
+      if (!keys.empty()) rows = logical::node(logical::Sort{std::move(rows), std::move(keys)});
       rows = logical::node(logical::Project{std::move(rows), std::move(targets)});
     }
     if (s.limit) rows = logical::node(logical::Limit{std::move(rows), *s.limit});
     return rows;
+  }
+
+  // One HAVING conjunct: a grouped column or an aggregate call compared with
+  // a parameter, in either order. The parameter takes the column's type, or
+  // the aggregate's: COUNT's and SUM's of a SMALLINT or INTEGER a BIGINT,
+  // SUM's of a BIGINT or DECIMAL the numeric at its scale, checked as a
+  // BIGINT is (compared_type), MIN's and MAX's their column's. HAVING on AVG
+  // is not supported: its quotient is no type the plan holds.
+  auto having_conjunct(const ast::Compare& w, const auto& resolve, const auto& grouped) -> logical::Expr {
+    const auto* lhs = &w.lhs;
+    const auto* rhs = &w.rhs;
+    auto op = w.op;
+    if (lhs->kind == ast::Expr::Kind::Param) {
+      std::swap(lhs, rhs);
+      op = mirrored(op);
+    }
+    if ((lhs->kind != ast::Expr::Kind::Column && lhs->kind != ast::Expr::Kind::Aggregate) ||
+        rhs->kind != ast::Expr::Kind::Param) {
+      throw SqlError{"HAVING must compare a grouped column or an aggregate with a parameter", w.pos};
+    }
+    if (lhs->kind == ast::Expr::Kind::Column) {
+      auto [t, c] = resolve(*lhs);
+      auto g = grouped(*t, *c, lhs->pos);
+      use_param(rhs->param, c->type, rhs->pos, *c, t->id, Use::Compared);
+      return logical::compare(op, std::move(g), logical::param(rhs->param, c->sql));
+    }
+    logical::Output agg;
+    const Column* arg = nullptr;
+    std::uint32_t table_id = 0;
+    if (lhs->column.empty()) {
+      agg = aggregate(nullptr, 0, *lhs);
+    } else {
+      auto [t, c] = resolve(*lhs);
+      arg = c;
+      table_id = t->id;
+      agg = aggregate(c, t->id, *lhs);
+    }
+    if (agg.expr.fn == logical::Expr::Fn::Avg) throw SqlError{"HAVING on AVG is not supported yet", lhs->pos};
+    const Column* as = arg;
+    if (agg.expr.fn == logical::Expr::Fn::Count || agg.expr.fn == logical::Expr::Fn::Sum) {
+      synthetic_.push_back(Column{0, agg.name, agg.expr.type, PhysType::I64, true, {}});
+      as = &synthetic_.back();
+    }
+    use_param(rhs->param, PhysType::I64, rhs->pos, *as, table_id, Use::Compared);
+    return logical::compare(op, std::move(agg.expr), logical::param(rhs->param, as->sql));
   }
 
   // The rows an UPDATE or DELETE writes: its table's, by its WHERE.
@@ -785,6 +863,9 @@ private:
 
   const Catalog& cat_;
   std::vector<ParamUse> params_;
+  // What a HAVING parameter compared with COUNT or SUM is typed by: no
+  // column of a table, kept where a parameter's first use points.
+  std::deque<Column> synthetic_;
 };
 
 }  // namespace

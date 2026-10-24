@@ -55,10 +55,10 @@ public:
 
 // A select-list, SET or comparison operand: a column, a parameter, an
 // integer literal, a sum or difference of two, or an aggregate: COUNT(*),
-// COUNT([DISTINCT] column), SUM(column) or MIN(column).
+// COUNT([DISTINCT] column), SUM, MIN, MAX or AVG of a column.
 struct Expr {
   enum class Kind { Column, Param, Const, Add, Sub, Aggregate };
-  enum class Fn { Count, Sum, Min };
+  enum class Fn { Count, Sum, Min, Max, Avg };
   Kind kind;
   std::string column;       // Column; Aggregate's argument, "" for COUNT(*)
   std::uint32_t param{0};   // Param: zero-based ($1 is 0)
@@ -165,6 +165,8 @@ struct Select {
   std::int32_t pos{-1};
   bool for_update{false};  // FOR UPDATE: a guard on each row returned, never a lock
   std::int32_t table_pos{-1}, join_pos{-1};  // where table and join are named
+  std::vector<Expr> group_by;  // GROUP BY's columns, as written
+  std::vector<Compare> having;  // HAVING's conjuncts
 };
 
 struct Assignment {

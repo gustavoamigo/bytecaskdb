@@ -57,6 +57,9 @@ struct GeneratedPlan {
   // it: a column's own, or "count", a bigint.
   std::vector<std::string> result_names;
   std::vector<SqlType> result_sql;
+  // Per result column: an AVG, two of result_types (its sum and its count)
+  // that the API divides as PostgreSQL's numeric division does.
+  std::vector<bool> result_quotient;
   // What its bc_schema_ref lists (docs/catalog_design.md,
   // *Compatibility*): the objects and columns it depends on.
   std::uint64_t catalog_version{0};
@@ -380,6 +383,8 @@ private:
             return op.emits ? empty_row(Expr::Fn::Count) : std::vector<std::string>{};
           } else if constexpr (std::is_same_v<T, physical::MinFirstEntry>) {
             return op.emits ? empty_row(Expr::Fn::Min) : std::vector<std::string>{};
+          } else if constexpr (std::is_same_v<T, physical::GroupEmit>) {
+            return empty_group(op);
           } else {
             return {};
           }
@@ -395,6 +400,9 @@ private:
           if constexpr (std::is_same_v<T, physical::Scan> || std::is_same_v<T, physical::NullSplitScan> ||
                         std::is_same_v<T, physical::Sort>) {
             return true;
+          } else if constexpr (std::is_same_v<T, physical::GroupAggregate>) {
+            // A structure's groups are a loop; streamed, the input's.
+            return !op.streamed || loops(*op.input);
           } else if constexpr (std::is_same_v<T, physical::IndexJoin>) {
             return loops(*op.outer);
           } else if constexpr (std::is_same_v<T, physical::NestedLoop> || std::is_same_v<T, physical::HashJoin> ||
@@ -643,6 +651,7 @@ private:
     if (const auto* f = std::get_if<physical::Filter>(&n.op)) return plain_scan(*f->input);
     if (const auto* o = std::get_if<physical::Sort>(&n.op)) return plain_scan(*o->input);
     if (const auto* h = std::get_if<physical::HashJoin>(&n.op)) return plain_scan(*h->build);
+    if (const auto* g = std::get_if<physical::GroupAggregate>(&n.op)) return plain_scan(*g->input);
     return nullptr;
   }
 
@@ -802,6 +811,10 @@ private:
   // order, which binds the row it held. The rows read once before the
   // input's loop stay in hand; a LIMIT's counter is the sorter loop's.
   void produce(const physical::Sort& s, const Consume& k) {
+    if (s.groups) {
+      sort_groups(s, k);
+      return;
+    }
     const auto i = std::to_string(sorts_++);
     const auto sorter = "s" + i;
     const auto held = "p" + i;
@@ -836,6 +849,18 @@ private:
   }
 
   void produce(const physical::Filter& f, const Consume& k) {
+    if (group_below(*f.input)) {
+      // A HAVING: the group's consumer runs only for a group that passes,
+      // in a block, since a streamed group is given inside its input's loop.
+      produce(*f.input, [&] {
+        std::string cond;
+        for (const auto& c : f.conjuncts) cond += (cond.empty() ? "" : " || ") + group_fails(c);
+        w_.open("if (!(" + cond + "))");
+        k();
+        w_.close();
+      });
+      return;
+    }
     produce(*f.input, [&] {
       for (const auto& c : f.conjuncts) {
         if (hit_) {
@@ -932,6 +957,8 @@ private:
       case Expr::Fn::Count: w_.line("int64_t n = 0;"); break;
       case Expr::Fn::Sum: w_.line("int64_t sum = 0;"); break;
       case Expr::Fn::Min: w_.line("int64_t m = 0;"); break;
+      case Expr::Fn::Max:
+      case Expr::Fn::Avg: break;  // a GroupAggregate's
     }
     if (a.fn != Expr::Fn::Count) w_.line("bool seen = false;");
   }
@@ -948,6 +975,8 @@ private:
       case Expr::Fn::Count: emit_count("n"); break;
       case Expr::Fn::Sum: emit_value_or_null("sum"); break;
       case Expr::Fn::Min: emit_value_or_null("m"); break;
+      case Expr::Fn::Max:
+      case Expr::Fn::Avg: break;  // a GroupAggregate's
     }
   }
 
@@ -980,6 +1009,8 @@ private:
         w_.line("seen = true;");
         if (arg.nullable) w_.close();
         return;
+      case Expr::Fn::Max:
+      case Expr::Fn::Avg: return;  // a GroupAggregate's
     }
   }
 
@@ -1030,6 +1061,496 @@ private:
     open_aggregate(a.agg);
     produce(*a.input, [&] { fold(a.agg); });
     emit_aggregate(a.agg);
+  }
+
+  // ------------------------------------------------------------- GROUP BY
+
+  // The group in hand (docs/planner_design.md, *GROUP BY as built*): in a
+  // structure, its handle g<i> and the row each held table's hash table holds
+  // for it, fr<i>_<j>; streamed, the locals kv<i>_<j> (a key's value) and
+  // kn<i>_<j> (its NULL), x<i>_<j> (an aggregate's value), xs<i>_<j> (whether
+  // a SUM, MIN or MAX saw one) and xc<i>_<j> (an AVG's count).
+  struct Group {
+    const physical::GroupAggregate* op{nullptr};
+    physical::GroupLayout layout;
+    std::string i;
+    std::string handle;  // g<i>, in a structure
+  };
+
+  // The GroupAggregate whose groups a node gives, or null.
+  static auto group_below(const physical::Node& n) -> const physical::GroupAggregate* {
+    if (const auto* g = std::get_if<physical::GroupAggregate>(&n.op)) return g;
+    if (const auto* f = std::get_if<physical::Filter>(&n.op)) return group_below(*f->input);
+    if (const auto* o = std::get_if<physical::Sort>(&n.op); o != nullptr && o->groups) return group_below(*o->input);
+    return nullptr;
+  }
+
+  auto key_index(const Group& g, const ColumnRef& c) const -> std::size_t {
+    return static_cast<std::size_t>(std::ranges::find(g.op->keys, c) - g.op->keys.begin());
+  }
+  auto agg_index(const Group& g, const Expr& a) const -> std::size_t {
+    return static_cast<std::size_t>(std::ranges::find(g.op->aggs, a) - g.op->aggs.begin());
+  }
+  static auto local(const std::string& kind, const Group& g, std::size_t j) -> std::string {
+    return kind + g.i + "_" + std::to_string(j);
+  }
+
+  // A key read from the row its group holds: a structure's key that is not
+  // an I64.
+  auto held_row(const Group& g, const ColumnRef& c) const -> std::optional<std::string> {
+    if (g.op->streamed || g.layout.key_slot[key_index(g, c)]) return std::nullopt;
+    auto j = static_cast<std::size_t>(std::ranges::find(g.layout.held, c.table) - g.layout.held.begin());
+    return local("fr", g, j);
+  }
+
+  // A key or an aggregate of the group in hand, not an AVG: whether it is
+  // NULL, as C ("" if never), and its value.
+  auto group_value(const Expr& e) -> std::pair<std::string, std::string> {
+    const auto& g = *group_;
+    if (e.kind == Expr::Kind::Column) {
+      const auto& c = e.col;
+      auto j = key_index(g, c);
+      if (auto row = held_row(g, c)) {
+        return {"bc_col_null(cx, " + *row + ", " + w_.col(c) + ")",
+                "bc_col_" + suffix(c.type) + "(cx, " + *row + ", " + w_.col(c) + ")"};
+      }
+      if (g.op->streamed) return {c.nullable ? local("kn", g, j) : "", local("kv", g, j)};
+      auto slot = std::to_string(*g.layout.key_slot[j]);
+      return {c.nullable ? "bc_agg_null(cx, " + g.handle + ", " + slot + ")" : "",
+              "bc_agg_i64(cx, " + g.handle + ", " + slot + ")"};
+    }
+    auto j = agg_index(g, e);
+    auto count = e.fn == Expr::Fn::Count;
+    if (g.op->streamed) return {count ? "" : "!" + local("xs", g, j), local("x", g, j)};
+    auto slot = std::to_string(g.layout.agg_slot[j]);
+    return {count ? "" : "bc_agg_null(cx, " + g.handle + ", " + slot + ")", "bc_agg_i64(cx, " + g.handle + ", " + slot + ")"};
+  }
+
+  // Whether the group fails a HAVING conjunct, as C: NULL on either side, or
+  // the comparison false.
+  auto group_fails(const Expr& c) -> std::string {
+    const auto& lhs = c.args[0];
+    const auto& rhs = c.args[1];
+    auto [is_null, value] = group_value(lhs);
+    auto type = lhs.kind == Expr::Kind::Column ? lhs.col.type : PhysType::I64;
+    auto out = (is_null.empty() ? "" : is_null + " || ") + param_null(rhs.param);
+    auto p = param(type, rhs.param);
+    auto cmp = type == PhysType::Bytes ? "bc_bytes_cmp(cx, " + value + ", " + p + ") " + op_text(c.op) + " 0"
+                                       : value + " " + op_text(c.op) + " " + p;
+    return out + " || !(" + cmp + ")";
+  }
+
+  // One output of the group in hand: a key, an aggregate, or an AVG's sum
+  // and count, NULL as NULL.
+  void emit_group(const Expr& e) {
+    const auto& g = *group_;
+    if (e.kind == Expr::Kind::Column) {
+      if (auto row = held_row(g, e.col)) {
+        w_.line("bc_emit_col(cx, " + *row + ", " + w_.col(e.col) + ");");
+        return;
+      }
+    }
+    if (e.kind == Expr::Kind::Aggregate && e.fn == Expr::Fn::Avg) {
+      auto j = agg_index(g, e);
+      std::string is_null, sum, count;
+      if (g.op->streamed) {
+        is_null = "!" + local("xs", g, j);
+        sum = local("x", g, j);
+        count = local("xc", g, j);
+      } else {
+        auto slot = g.layout.agg_slot[j];
+        is_null = "bc_agg_null(cx, " + g.handle + ", " + std::to_string(slot) + ")";
+        sum = "bc_agg_i64(cx, " + g.handle + ", " + std::to_string(slot) + ")";
+        count = "bc_agg_i64(cx, " + g.handle + ", " + std::to_string(slot + 1) + ")";
+      }
+      w_.open("if (" + is_null + ")");
+      w_.line("bc_emit_null(cx);");
+      w_.line("bc_emit_null(cx);");
+      w_.otherwise();
+      w_.line("bc_emit_i64(cx, " + sum + ");");
+      w_.line("bc_emit_i64(cx, " + count + ");");
+      w_.close();
+      return;
+    }
+    auto [is_null, value] = group_value(e);
+    auto type = e.kind == Expr::Kind::Column ? e.col.type : PhysType::I64;
+    auto emit = "bc_emit_" + suffix(type) + "(cx, " + value + ");";
+    if (is_null.empty()) {
+      w_.line(emit);
+      return;
+    }
+    w_.open("if (" + is_null + ")");
+    w_.line("bc_emit_null(cx);");
+    w_.otherwise();
+    w_.line(emit);
+    w_.close();
+  }
+
+  // The part of sort key `k` a column of the row in hand gives, ascending,
+  // NULL first: a group key's, or a distinct value's. From a covering scan's
+  // entry, its key part, an I64.
+  void sort_key_part(const std::string& k, const ColumnRef& c) {
+    const auto& b = binding(c.table);
+    if (!b.covering) {
+      w_.line("bc_sort_key_col(cx, " + k + ", " + b.row + ", " + w_.col(c) + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);");
+      return;
+    }
+    auto value = "bc_sort_key_" + suffix(c.type) + "(cx, " + k + ", " + read_col(c) + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);";
+    if (!c.nullable) {
+      w_.line(value);
+      return;
+    }
+    w_.open("if (" + col_null(c) + ")");
+    w_.line("bc_sort_key_null(cx, " + k + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);");
+    w_.otherwise();
+    w_.line(value);
+    w_.close();
+  }
+
+  // The part of sort key `sk` a key of the group in hand gives, in its
+  // ORDER BY direction and NULL placement.
+  void group_sort_part(const physical::SortPart& part) {
+    auto dir = std::string{part.desc ? "BC_SORT_DESC" : "BC_SORT_ASC"} + ", " +
+               (part.nulls_first ? "BC_SORT_NULLS_FIRST" : "BC_SORT_NULLS_LAST");
+    if (auto row = held_row(*group_, part.col)) {
+      w_.line("bc_sort_key_col(cx, sk, " + *row + ", " + w_.col(part.col) + ", " + dir + ");");
+      return;
+    }
+    auto [is_null, value] = group_value(Expr{logical::column(part.col, {})});
+    auto put = "bc_sort_key_" + suffix(part.col.type) + "(cx, sk, " + value + ", " + dir + ");";
+    if (is_null.empty()) {
+      w_.line(put);
+      return;
+    }
+    w_.open("if (" + is_null + ")");
+    w_.line("bc_sort_key_null(cx, sk, " + dir + ");");
+    w_.otherwise();
+    w_.line(put);
+    w_.close();
+  }
+
+  // The group whose key is `key`, found in its structure, and the rows its
+  // held tables hold for it, each in a loop of its own that runs once; then
+  // k with it in hand.
+  void in_group(Group g, const std::string& key, const Consume& k) {
+    g.handle = "g" + g.i;
+    w_.line("bc_group " + g.handle + " = bc_agg_group(cx, a" + g.i + ", " + key + ");");
+    for (std::size_t j = 0; j < g.layout.held.size(); ++j) {
+      w_.line("bc_hash_iter " + local("fq", g, j) + " = bc_hash_find(cx, " + local("f", g, j) + ", " + key + ");");
+      w_.line("bc_view " + local("fr", g, j) + " = bc_empty(cx);");
+      w_.open("while (bc_hash_next(cx, " + local("fq", g, j) + ", &" + local("fr", g, j) + "))");
+    }
+    auto outer = std::exchange(group_, &g);
+    auto was_loop = std::exchange(loop_, true);
+    k();
+    loop_ = was_loop;
+    group_ = outer;
+    for (std::size_t j = 0; j < g.layout.held.size(); ++j) w_.close();
+  }
+
+  // The row in hand folded into the group the structure holds for its key,
+  // gg<i>: on the group's first row, the held rows and the keys' values.
+  void fold_into_structure(const Group& g) {
+    const auto& op = *g.op;
+    const auto gb = "gb" + g.i;
+    const auto gr = "gr" + g.i;
+    const auto gg = "gg" + g.i;
+    w_.line("bc_sort_key " + gb + " = bc_sort_key_begin(cx);");
+    for (const auto& k : op.keys) sort_key_part(gb, k);
+    w_.line("bc_view " + gr + " = bc_sort_key_end(cx, " + gb + ");");
+    w_.line("bc_group " + gg + " = bc_agg_group(cx, a" + g.i + ", " + gr + ");");
+    auto keyed = std::ranges::any_of(g.layout.key_slot, [](const auto& s) { return s.has_value(); });
+    if (!g.layout.held.empty() || keyed) {
+      w_.open("if (bc_agg_null(cx, " + gg + ", 0))");
+      for (std::size_t j = 0; j < g.layout.held.size(); ++j) {
+        w_.line("bc_hash_put(cx, " + local("f", g, j) + ", " + gr + ", " + binding(g.layout.held[j]).row + ");");
+      }
+      for (std::size_t j = 0; j < op.keys.size(); ++j) {
+        const auto& slot = g.layout.key_slot[j];
+        if (!slot) continue;
+        auto put = "bc_agg_min_i64(cx, " + gg + ", " + std::to_string(*slot) + ", " + read_col(op.keys[j]) + ");";
+        w_.line(op.keys[j].nullable ? "if (!" + col_null(op.keys[j]) + ") " + put : put);
+      }
+      w_.close();
+    }
+    w_.line("bc_agg_count(cx, " + gg + ", 0);");
+    for (std::size_t j = 0; j < op.aggs.size(); ++j) {
+      const auto& a = op.aggs[j];
+      if (a.args.empty()) continue;  // COUNT(*): slot 0
+      const auto& arg = a.args[0].col;
+      const auto slot = std::to_string(g.layout.agg_slot[j]);
+      if (arg.nullable) w_.open("if (!" + col_null(arg) + ")");
+      if (a.distinct) {
+        distinct_value(g, arg, gr, "bc_agg_count(cx, " + gg + ", " + slot + ");");
+      } else {
+        switch (a.fn) {
+          case Expr::Fn::Count: w_.line("bc_agg_count(cx, " + gg + ", " + slot + ");"); break;
+          case Expr::Fn::Sum: w_.line("bc_agg_add_i64(cx, " + gg + ", " + slot + ", " + read_col(arg) + ");"); break;
+          case Expr::Fn::Min: w_.line("bc_agg_min_i64(cx, " + gg + ", " + slot + ", " + read_col(arg) + ");"); break;
+          case Expr::Fn::Max: w_.line("bc_agg_max_i64(cx, " + gg + ", " + slot + ", " + read_col(arg) + ");"); break;
+          case Expr::Fn::Avg:
+            w_.line("bc_agg_add_i64(cx, " + gg + ", " + slot + ", " + read_col(arg) + ");");
+            w_.line("bc_agg_count(cx, " + gg + ", " + std::to_string(g.layout.agg_slot[j] + 1) + ");");
+            break;
+        }
+      }
+      if (arg.nullable) w_.close();
+    }
+  }
+
+  // A COUNT(DISTINCT) of `arg` in the group in hand: its value's pair with
+  // the group, keyed in the argument's structure d<i>_<m> after the group's
+  // key `group_key` (a key built for it, or "" to build the keys' parts from
+  // the row); `counted` runs when the pair is new.
+  void distinct_value(const Group& g, const ColumnRef& arg, const std::string& group_key, const std::string& counted) {
+    auto m = static_cast<std::size_t>(std::ranges::find(g.layout.distinct, arg) - g.layout.distinct.begin());
+    const auto dk = local("dk", g, m);
+    const auto dg = local("dg", g, m);
+    w_.line("bc_sort_key " + dk + " = bc_sort_key_begin(cx);");
+    if (!group_key.empty()) {
+      w_.line("bc_sort_key_bytes(cx, " + dk + ", " + group_key + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);");
+    } else {
+      for (const auto& k : g.op->keys) sort_key_part(dk, k);
+    }
+    sort_key_part(dk, arg);
+    w_.line("bc_group " + dg + " = bc_agg_group(cx, " + local("d", g, m) + ", bc_sort_key_end(cx, " + dk + "));");
+    w_.open("if (bc_agg_null(cx, " + dg + ", 0))");
+    w_.line("bc_agg_count(cx, " + dg + ", 0);");
+    w_.line(counted);
+    w_.close();
+  }
+
+  // The structures a GroupAggregate opens: its distinct values', and, in a
+  // structure, the groups' and the held rows' hash tables.
+  void open_structures(const Group& g) {
+    if (!g.op->streamed) {
+      w_.line("bc_agg a" + g.i + " = bc_agg_open(cx, " + std::to_string(g.layout.slots) + ");");
+      for (std::size_t j = 0; j < g.layout.held.size(); ++j) {
+        w_.line("bc_hash " + local("f", g, j) + " = bc_hash_open(cx);  // each group's first row of " +
+                w_.tbl(g.layout.held[j]));
+      }
+    }
+    for (std::size_t m = 0; m < g.layout.distinct.size(); ++m) {
+      w_.line("bc_agg " + local("d", g, m) + " = bc_agg_open(cx, 1);  // COUNT(DISTINCT) values seen per group");
+    }
+  }
+
+  // A pipeline breaker (docs/planner_design.md, *The physical plan and
+  // codegen*): every input row folded into its group in structure a<i>,
+  // the input's loop in a block of its own; then a loop over the groups in
+  // the order they first appeared, each found by its key, gk<i>. A LIMIT's
+  // counter is that loop's, never the input's. Streamed, the groups are
+  // given one at a time (stream).
+  void produce(const physical::GroupAggregate& op, const Consume& k) {
+    Group g{&op, physical::group_layout(op.keys, op.aggs), std::to_string(groups_++), {}};
+    open_structures(g);
+    if (op.streamed) {
+      stream(g, k);
+      return;
+    }
+    auto guard = std::exchange(guard_, "");
+    if (!std::holds_alternative<physical::Empty>(op.input->op)) {
+      w_.open("");
+      produce(*op.input, [&] { fold_into_structure(g); });
+      w_.close();
+    }
+    guard_ = guard;
+    const auto gk = "gk" + g.i;
+    w_.line("bc_view " + gk + " = bc_empty(cx);");
+    w_.open("while (" + guard_ + "bc_agg_next(cx, a" + g.i + ", &" + gk + ", 0))");
+    in_group(g, gk, k);
+    w_.close();
+  }
+
+  // The groups streamed: the input's rows come with each group's together,
+  // so the group is kept in locals, given (k) inside the input's loop when a
+  // row of another group starts the next, and after it for the last. With
+  // no key, one group, given after the input, over no rows too. A LIMIT's
+  // counter is the input loop's, and the last group's.
+  void stream(const Group& g, const Consume& k) {
+    const auto& op = *g.op;
+    const auto st = "st" + g.i;
+    if (!op.keys.empty()) w_.line("bool " + st + " = false;");
+    for (std::size_t j = 0; j < op.keys.size(); ++j) {
+      const auto& c = op.keys[j];
+      w_.line(c.type == PhysType::Bool ? "bool " + local("kv", g, j) + " = false;" : "int64_t " + local("kv", g, j) + " = 0;");
+      if (c.nullable) w_.line("bool " + local("kn", g, j) + " = false;");
+    }
+    auto reset = [&](bool declare) {
+      for (std::size_t j = 0; j < op.aggs.size(); ++j) {
+        const auto& a = op.aggs[j];
+        w_.line((declare ? "int64_t " : "") + local("x", g, j) + " = 0;");
+        if (a.fn != Expr::Fn::Count) w_.line((declare ? "bool " : "") + local("xs", g, j) + " = false;");
+        if (a.fn == Expr::Fn::Avg) w_.line((declare ? "int64_t " : "") + local("xc", g, j) + " = 0;");
+      }
+    };
+    reset(true);
+    Group in = g;
+    auto give = [&] {
+      auto outer = std::exchange(group_, &in);
+      k();
+      group_ = outer;
+    };
+    if (!std::holds_alternative<physical::Empty>(op.input->op)) {
+      produce(*op.input, [&] {
+        if (!op.keys.empty()) {
+          // The row's keys, then whether they start another group.
+          std::string changed;
+          for (std::size_t j = 0; j < op.keys.size(); ++j) {
+            const auto& c = op.keys[j];
+            const auto rk = local("rk", g, j);
+            const auto rn = local("rn", g, j);
+            const auto kv = local("kv", g, j);
+            const auto kn = local("kn", g, j);
+            auto type = c.type == PhysType::Bool ? std::string{"bool "} : std::string{"int64_t "};
+            if (c.nullable) {
+              w_.line("bool " + rn + " = " + col_null(c) + ";");
+              w_.line(type + rk + " = " + (c.type == PhysType::Bool ? "false" : "0") + ";");
+              w_.line("if (!" + rn + ") " + rk + " = " + read_col(c) + ";");
+            } else {
+              w_.line(type + rk + " = " + read_col(c) + ";");
+            }
+            auto differs = c.type == PhysType::Bool ? "(" + rk + " && !" + kv + ") || (" + kv + " && !" + rk + ")"
+                                                    : rk + " != " + kv;
+            changed += (changed.empty() ? "" : " || ") + differs;
+            if (c.nullable) changed += " || (" + rn + " && !" + kn + ") || (" + kn + " && !" + rn + ")";
+          }
+          w_.open("if (" + st + " && (" + changed + "))");
+          give();
+          reset(false);
+          w_.close();
+          for (std::size_t j = 0; j < op.keys.size(); ++j) {
+            w_.line(local("kv", g, j) + " = " + local("rk", g, j) + ";");
+            if (op.keys[j].nullable) w_.line(local("kn", g, j) + " = " + local("rn", g, j) + ";");
+          }
+          w_.line(st + " = true;");
+        }
+        fold_into_locals(g);
+      });
+    }
+    // The last group, or the one group of no key.
+    auto limit = guard_.empty() ? std::string{} : guard_.substr(0, guard_.size() - 4);
+    std::string cond = op.keys.empty() ? limit : (limit.empty() ? st : limit + " && " + st);
+    if (cond.empty()) {
+      give();
+      return;
+    }
+    w_.open("if (" + cond + ")");
+    give();
+    w_.close();
+  }
+
+  // The row in hand folded into the streamed group's locals. NULLs are
+  // skipped.
+  void fold_into_locals(const Group& g) {
+    const auto& op = *g.op;
+    for (std::size_t j = 0; j < op.aggs.size(); ++j) {
+      const auto& a = op.aggs[j];
+      const auto x = local("x", g, j);
+      const auto xs = local("xs", g, j);
+      if (a.args.empty()) {
+        w_.line("++" + x + ";");  // COUNT(*)
+        continue;
+      }
+      const auto& arg = a.args[0].col;
+      if (arg.nullable) w_.open("if (!" + col_null(arg) + ")");
+      if (a.distinct) {
+        distinct_value(g, arg, "", "++" + x + ";");
+      } else {
+        switch (a.fn) {
+          case Expr::Fn::Count: w_.line("++" + x + ";"); break;
+          case Expr::Fn::Sum:
+            w_.line(x + " = bc_add(cx, " + x + ", " + read_col(arg) + ");");
+            w_.line(xs + " = true;");
+            break;
+          case Expr::Fn::Min:
+          case Expr::Fn::Max: {
+            const auto v = local("v", g, j);
+            w_.line("int64_t " + v + " = " + read_col(arg) + ";");
+            w_.line("if (!" + xs + " || " + v + (a.fn == Expr::Fn::Min ? " < " : " > ") + x + ") " + x + " = " + v + ";");
+            w_.line(xs + " = true;");
+            break;
+          }
+          case Expr::Fn::Avg:
+            w_.line(x + " = bc_add(cx, " + x + ", " + read_col(arg) + ");");
+            w_.line(xs + " = true;");
+            w_.line("++" + local("xc", g, j) + ";");
+            break;
+        }
+      }
+      if (arg.nullable) w_.close();
+    }
+  }
+
+  // A sort of a structure's groups: each group that passes its HAVING added
+  // to sorter s<i> by its keys, holding the group's key; then a loop over
+  // the sorter, each group found again by the key held, p<i>. A LIMIT's
+  // counter is the sorter loop's.
+  void sort_groups(const physical::Sort& s, const Consume& k) {
+    const auto i = std::to_string(sorts_++);
+    const auto sorter = "s" + i;
+    const auto held = "p" + i;
+    w_.line("bc_sorter " + sorter + " = bc_sorter_open(cx, " + std::to_string(s.keep) + ");");
+    auto guard = std::exchange(guard_, "");
+    std::optional<Group> sorted;
+    produce(*s.input, [&] {
+      w_.line("bc_sort_key sk = bc_sort_key_begin(cx);");
+      for (const auto& part : s.keys) group_sort_part(part);
+      w_.line("bc_sorter_add(cx, " + sorter + ", bc_sort_key_end(cx, sk), gk" + group_->i + ");");
+      sorted = *group_;
+    });
+    guard_ = guard;
+    w_.line("bc_view " + held + " = bc_empty(cx);");
+    w_.open("while (" + guard_ + "bc_sorter_next(cx, " + sorter + ", &" + held + "))");
+    in_group(*sorted, held, k);
+    w_.close();
+  }
+
+  // The rows of the groups: each output, from the group in hand.
+  void produce(const physical::GroupEmit& e, const Consume&) {
+    produce(*e.input, [&] {
+      w_.line("bc_emit_begin(cx);");
+      for (const auto& o : e.outputs) emit_group(o);
+      w_.line("bc_emit_end(cx);");
+    });
+  }
+
+  // What a GroupEmit gives for no rows: no group with a key; with none, the
+  // one group's row over no rows (COUNT 0, every other aggregate NULL)
+  // where its HAVING holds of it and its LIMIT is not 0.
+  static auto empty_group(const physical::GroupEmit& e) -> std::vector<std::string> {
+    const auto* n = e.input.get();
+    if (const auto* l = std::get_if<physical::Limit>(&n->op)) {
+      if (l->n == 0) return {};
+      n = l->input.get();
+    }
+    const auto* g = group_below(*n);
+    if (g == nullptr || !g->keys.empty()) return {};
+    std::string cond;
+    if (const auto* f = std::get_if<physical::Filter>(&n->op)) {
+      for (const auto& c : f->conjuncts) {
+        // Only a COUNT is not NULL over no rows.
+        if (c.args[0].fn != Expr::Fn::Count) return {};
+        const auto p = c.args[1].param;
+        cond += (cond.empty() ? "" : " && ") + std::string{"!"} + param_null(p) + " && INT64_C(0) " + op_text(c.op) + " " +
+                param(PhysType::I64, p);
+      }
+    }
+    std::vector<std::string> row{"bc_emit_begin(cx);"};
+    for (const auto& o : e.outputs) {
+      if (o.fn == Expr::Fn::Count) {
+        row.emplace_back("bc_emit_i64(cx, 0);");
+      } else {
+        row.emplace_back("bc_emit_null(cx);");
+        if (o.fn == Expr::Fn::Avg) row.emplace_back("bc_emit_null(cx);");
+      }
+    }
+    row.emplace_back("bc_emit_end(cx);");
+    if (cond.empty()) return row;
+    std::vector<std::string> out{"if (" + cond + ") {"};
+    for (const auto& r : row) out.push_back("  " + r);
+    out.emplace_back("}");
+    return out;
   }
 
   void produce(const physical::Insert& s, const Consume&) {
@@ -1126,6 +1647,8 @@ private:
   int choices_{0};               // the choice points printed: each counts into count<i>, over lo<i> and hi<i>
   int sorts_{0};                 // the sorts printed: each into sorter s<i>, its row p<i>
   int hashes_{0};                // the hash joins printed: each into table h<i>, its row b<i>
+  int groups_{0};                // the grouped aggregates printed: each into a<i>, its group g<i>
+  const Group* group_{nullptr};  // the group in hand, for a grouped aggregate's consumer
   std::string cursor_{"c"};      // the cursor a scan opens
   // Each choice point's first plan's scan, and the counted range, lo<i> and
   // hi<i>, it opens on.
@@ -1155,8 +1678,10 @@ auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std
       p.root->op);
   for (const auto& r : p.result) {
     out.result_types.push_back(r.type);
+    if (r.quotient) out.result_types.push_back(PhysType::I64);
     out.result_names.push_back(r.name);
     out.result_sql.push_back(r.sql);
+    out.result_quotient.push_back(r.quotient);
   }
   out.source = comment_line(sql) +
                comment_line("isolation: snapshot   schema: catalog v" + std::to_string(p.catalog_version)) +

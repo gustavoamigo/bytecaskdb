@@ -9,8 +9,9 @@
 //
 // The operators are Empty, the access paths, the joins (an index nested
 // loop, a nested loop and a hash join), the choice points, Filter, Sort,
-// Limit, Aggregate and the sinks: Emit for result rows, Insert, Update,
-// Delete. check() enforces what the types can't express.
+// Limit, Aggregate, GroupAggregate and the sinks: Emit for result rows,
+// GroupEmit for a GroupAggregate's, Insert, Update, Delete. check()
+// enforces what the types can't express.
 
 module;
 #include <algorithm>
@@ -50,6 +51,8 @@ struct Range {
   KeyBound lo, hi;
 };
 
+using ScanRest = std::variant<std::monostate, Range>;
+
 // No rows, and nothing read: the input a conjunct always false leaves.
 struct Empty {};
 
@@ -68,7 +71,7 @@ struct Scan {
   std::uint32_t table{0};
   std::uint32_t object{0};                   // the table, or one of its indexes
   std::vector<Expr> prefix;                  // the equality prefix's parameters, in key order
-  std::variant<std::monostate, Range> rest;  // nothing more, or a range
+  ScanRest rest;  // nothing more, or a range
   bool reverse{false};
   bool covering{false};    // every column read comes from the entry's key
   bool for_update{false};  // each row returned is guarded unchanged: never a covering scan
@@ -181,12 +184,15 @@ struct SortPart {
 // row is the one held; the rows of tables read once before that loop stay
 // in hand, and a table looked up per row after it is looked up again above
 // the Sort. With keep n > 0 the sorter holds only the first n (ORDER BY …
-// LIMIT n); 0 holds all.
+// LIMIT n); 0 holds all. With `groups`, its input is a GroupAggregate's
+// groups, under its HAVING: the sorter holds each group's key, its keys are
+// GROUP BY columns, and `payload` is unused.
 struct Sort {
   NodePtr input;
   std::vector<SortPart> keys;
   std::int64_t keep{0};
   std::uint32_t payload{0};
+  bool groups{false};
 };
 
 // The first n rows of Emit's input.
@@ -208,6 +214,69 @@ struct Aggregate {
   NodePtr input;
   Expr agg;
   bool emits{true};  // false under LIMIT 0
+};
+
+// A grouped aggregate (docs/planner_design.md, *GROUP BY as built*): the
+// input's rows in groups of equal `keys`, NULL equal to NULL, and over each
+// group the aggregate calls `aggs`, each once; its rows are the groups. A
+// pipeline breaker over bc_agg_*: each row's group found by its key, a sort
+// key of its key columns, its values folded into the group's slots, then a
+// loop over the groups in the order they first appeared. `streamed`: the
+// input's rows come in groups, each group's rows together, so each group is
+// kept in locals and given when the next one starts, with no structure.
+// With no keys it is one group, given even over no rows, and is streamed. A
+// COUNT(DISTINCT) holds each group's distinct values either way.
+struct GroupAggregate {
+  NodePtr input;
+  std::vector<ColumnRef> keys;
+  std::vector<Expr> aggs;
+  bool streamed{false};
+};
+
+// Where a GroupAggregate keeps what it gives for a group, by bc_agg_* slots
+// (group_layout): slot 0 counts its rows; a BIGINT-like key column (an
+// I64) takes a slot holding its value, folded once; any other key column is
+// read from a row of its table, the group's first, held in a hash table
+// under the group's key, one per such table (`held`); each aggregate takes
+// a slot, AVG two (its sum, then its count), COUNT(*) slot 0. A
+// COUNT(DISTINCT) also keeps a structure of its own, one per argument.
+struct GroupLayout {
+  std::uint32_t slots{1};
+  std::vector<std::optional<std::uint32_t>> key_slot;  // per key: its slot, or nullopt for one read from a held row
+  std::vector<std::uint32_t> agg_slot;                 // per aggregate
+  std::vector<std::uint32_t> held;                     // the tables whose first row each group holds
+  std::vector<ColumnRef> distinct;                     // each COUNT(DISTINCT)'s argument, once
+};
+
+[[nodiscard]] auto group_layout(const std::vector<ColumnRef>& keys, const std::vector<Expr>& aggs) -> GroupLayout {
+  GroupLayout l;
+  for (const auto& k : keys) {
+    if (k.type == PhysType::I64) {
+      l.key_slot.emplace_back(l.slots++);
+      continue;
+    }
+    l.key_slot.emplace_back(std::nullopt);
+    if (std::ranges::find(l.held, k.table) == l.held.end()) l.held.push_back(k.table);
+  }
+  for (const auto& a : aggs) {
+    if (a.fn == Expr::Fn::Count && a.args.empty()) {
+      l.agg_slot.push_back(0);
+      continue;
+    }
+    l.agg_slot.push_back(l.slots);
+    l.slots += a.fn == Expr::Fn::Avg ? 2 : 1;
+    if (a.distinct && std::ranges::find(l.distinct, a.args[0].col) == l.distinct.end()) l.distinct.push_back(a.args[0].col);
+  }
+  return l;
+}
+
+// Result rows of a GroupAggregate's groups: each output a key column of the
+// GroupAggregate below, or one of its aggregates. Its input is the
+// GroupAggregate under a Filter (HAVING), a Sort of its groups and a
+// Limit, or a choice point between two such plans.
+struct GroupEmit {
+  NodePtr input;
+  std::vector<Expr> outputs;
 };
 
 // The columns given, in table order, each from a parameter; the rest keep
@@ -232,7 +301,7 @@ struct Delete {
 
 struct Node {
   std::variant<Empty, PointGet, Scan, NullSplitScan, CountRange, MinFirstEntry, IndexJoin, NestedLoop, HashJoin, Choice,
-               Filter, Sort, Limit, Emit, Aggregate, Insert, Update, Delete>
+               Filter, Sort, Limit, Emit, Aggregate, GroupAggregate, GroupEmit, Insert, Update, Delete>
       op;
 };
 
@@ -252,11 +321,14 @@ struct Computed {
   friend auto operator==(const Computed&, const Computed&) -> bool = default;
 };
 
-// A result column as PostgreSQL names and types it.
+// A result column as PostgreSQL names and types it. An AVG is two of the
+// plan's columns, its sum and its count, both I64, which the API divides as
+// PostgreSQL's numeric division does (`quotient`).
 struct ResultColumn {
   std::string name;
   SqlType sql;
   PhysType type{PhysType::I64};
+  bool quotient{false};
 };
 
 struct Plan {
@@ -385,13 +457,24 @@ private:
     }
   }
 
-  // The scan an operator's rows come from, or null.
+  // The scan an operator's rows come from, or null; a GroupAggregate's,
+  // its input's.
   static auto scan_below(const Node& n) -> const Scan* {
     if (const auto* s = std::get_if<Scan>(&n.op)) return s;
     if (const auto* s = std::get_if<NullSplitScan>(&n.op)) return &s->present;
     if (const auto* f = std::get_if<Filter>(&n.op)) return scan_below(*f->input);
     if (const auto* l = std::get_if<Limit>(&n.op)) return scan_below(*l->input);
     if (const auto* o = std::get_if<Sort>(&n.op)) return scan_below(*o->input);
+    if (const auto* g = std::get_if<GroupAggregate>(&n.op)) return scan_below(*g->input);
+    return nullptr;
+  }
+
+  // The GroupAggregate whose groups a node gives, under its HAVING and a
+  // sort of its groups, or null.
+  static auto group_below(const Node& n) -> const GroupAggregate* {
+    if (const auto* g = std::get_if<GroupAggregate>(&n.op)) return g;
+    if (const auto* f = std::get_if<Filter>(&n.op)) return group_below(*f->input);
+    if (const auto* o = std::get_if<Sort>(&n.op); o != nullptr && o->groups) return group_below(*o->input);
     return nullptr;
   }
 
@@ -450,6 +533,7 @@ private:
       tables_of(*h->probe, out);
       tables_of(*h->build, out);
     }
+    if (const auto* g = std::get_if<GroupAggregate>(&n.op)) tables_of(*g->input, out);
   }
   static auto tables_of(const Node& n) -> std::vector<std::uint32_t> {
     std::vector<std::uint32_t> out;
@@ -553,10 +637,16 @@ private:
 
   // A choice point counts exactly its first plan's range: its object, its
   // prefix's parameters, its bounds and its direction; for a NULL split,
-  // the whole prefix, which holds both of its ranges.
+  // the whole prefix, which holds both of its ranges, or with no prefix the
+  // whole object.
   static void counts_first(const Choice& c, const Scan& first, bool split) {
     auto same_range = [&] {
-      if (split) return std::holds_alternative<std::monostate>(c.counted.rest);
+      // A NULL split's whole prefix; of none, the whole object.
+      if (split && !first.prefix.empty()) return std::holds_alternative<std::monostate>(c.counted.rest);
+      if (split) {
+        const auto* r = std::get_if<Range>(&c.counted.rest);
+        return r != nullptr && r->lo == KeyBound{} && r->hi == KeyBound{};
+      }
       const auto* a = std::get_if<Range>(&c.counted.rest);
       const auto* b = std::get_if<Range>(&first.rest);
       if (a == nullptr || b == nullptr) return a == b;
@@ -647,6 +737,28 @@ private:
               node(taken(op), &n);
               return;
             }
+            // The choice by the budget at a grouped aggregate counts its
+            // input's range; its other plan, streamed, reads the same tables.
+            if (const auto* g = group_below(*op.below)) {
+              const auto* other = group_below(*op.at_or_above);
+              const auto* counted = scan_below(*g->input);
+              if (g->streamed || other == nullptr || !other->streamed) {
+                broken("a choice point at a grouped aggregate whose plans are not a structure and a stream");
+              }
+              if (counted == nullptr || counted->table != op.counted.table) {
+                broken("a choice point at a grouped aggregate that counts another range than its input's");
+              }
+              counts_first(op, *counted, split_below(*g->input));
+              auto a = tables_of(*op.below);
+              auto b = tables_of(*op.at_or_above);
+              std::ranges::sort(a);
+              std::ranges::sort(b);
+              if (a != b || g->keys != other->keys || g->aggs != other->aggs) {
+                broken("a choice point at a grouped aggregate whose other plan groups other rows");
+              }
+              node(taken(op), parent);
+              return;
+            }
             const auto* first = scan_below(*op.below);
             const auto* second = scan_below(*op.at_or_above);
             if (first == nullptr || second == nullptr) {
@@ -658,6 +770,19 @@ private:
             counts_first(op, *first, split_below(*op.below));
             node(taken(op), &n);
           } else if constexpr (std::is_same_v<T, Filter>) {
+            // A HAVING compares a key or an aggregate of the groups below.
+            if (const auto* g = group_below(*op.input)) {
+              for (const auto& c : op.conjuncts) {
+                const auto& lhs = c.args[0];
+                auto known = lhs.kind == Expr::Kind::Column ? std::ranges::find(g->keys, lhs.col) != g->keys.end()
+                                                            : std::ranges::find(g->aggs, lhs) != g->aggs.end();
+                if (!known || c.args[1].kind != Expr::Kind::Param) broken("a HAVING that compares no key or aggregate of its groups");
+                if (lhs.kind == Expr::Kind::Column && lhs.col.type == PhysType::F64) broken("a filter on a DOUBLE column");
+                params(c);
+              }
+              node(*op.input, &n);
+              return;
+            }
             for (const auto& c : op.conjuncts) {
               if (c.kind != Expr::Kind::Compare) continue;
               if (c.args[0].kind == Expr::Kind::Column && c.args[0].col.type == PhysType::F64) {
@@ -670,6 +795,16 @@ private:
           } else if constexpr (std::is_same_v<T, Sort>) {
             if (op.keys.empty()) broken("a sort with no key");
             if (op.keep < 0) broken("a sort that keeps a negative number of rows");
+            if (op.groups) {
+              // The sorter holds each group's key: the groups of a structure.
+              const auto* g = group_below(*op.input);
+              if (g == nullptr || g->streamed) broken("a sort of groups not over a structure of them");
+              for (const auto& k : op.keys) {
+                if (std::ranges::find(g->keys, k.col) == g->keys.end()) broken("a sort of groups by a column not a key");
+              }
+              node(*op.input, &n);
+              return;
+            }
             auto [depth, table] = loops(*op.input);
             if (depth != 1) broken("a sort whose input is not one loop");
             if (table != op.payload) broken("a sort that holds another row than its loop's");
@@ -681,7 +816,9 @@ private:
             }
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Limit>) {
-            if (parent == nullptr || !std::holds_alternative<Emit>(parent->op)) broken("a LIMIT not under the rows emitted");
+            if (parent == nullptr || (!std::holds_alternative<Emit>(parent->op) && !std::holds_alternative<GroupEmit>(parent->op))) {
+              broken("a LIMIT not under the rows emitted");
+            }
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Emit>) {
             for (const auto& t : op.targets) read(t);
@@ -692,6 +829,42 @@ private:
               broken("SUM, MIN or COUNT(DISTINCT) with no argument");
             }
             reads(op.agg);
+            node(*op.input, &n);
+          } else if constexpr (std::is_same_v<T, GroupAggregate>) {
+            auto in = tables_of(*op.input);
+            auto of_input = [&](const ColumnRef& c) { return std::ranges::find(in, c.table) != in.end(); };
+            if (!op.streamed && op.keys.empty()) broken("a structure of groups with no key");
+            for (const auto& k : op.keys) {
+              if (!of_input(k)) broken("a GROUP BY key outside its input's tables");
+              if (op.streamed && k.type != PhysType::I64 && k.type != PhysType::Bool) broken("a streamed GROUP BY key held in no local");
+              read(k);
+            }
+            auto layout = group_layout(op.keys, op.aggs);
+            for (auto t : layout.held) {
+              if (std::ranges::find(covering_, t) != covering_.end()) broken("a structure of groups that holds a covering scan's entry");
+            }
+            for (const auto& a : op.aggs) {
+              if (a.kind != Expr::Kind::Aggregate) broken("an aggregate that is not an aggregate call");
+              if ((a.fn != Expr::Fn::Count || a.distinct) && a.args.empty()) broken("an aggregate call with no argument");
+              if (!a.args.empty() && !of_input(a.args[0].col)) broken("an aggregate's argument outside its input's tables");
+              reads(a);
+            }
+            node(*op.input, &n);
+          } else if constexpr (std::is_same_v<T, GroupEmit>) {
+            // Each output a key or an aggregate of the groups of every plan
+            // the rows may come from.
+            std::vector<const Node*> below{op.input.get()};
+            if (const auto* l = std::get_if<Limit>(&op.input->op)) below = {l->input.get()};
+            if (const auto* c = std::get_if<Choice>(&below[0]->op)) below = {c->below.get(), c->at_or_above.get()};
+            for (const auto* b : below) {
+              const auto* g = group_below(*b);
+              if (g == nullptr) broken("rows of groups over no grouped aggregate");
+              for (const auto& o : op.outputs) {
+                auto known = o.kind == Expr::Kind::Column ? std::ranges::find(g->keys, o.col) != g->keys.end()
+                                                          : std::ranges::find(g->aggs, o) != g->aggs.end();
+                if (!known) broken("a grouped output that is no key or aggregate of its groups");
+              }
+            }
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Insert>) {
             if (op.values.empty()) broken("an insert that sets no column");

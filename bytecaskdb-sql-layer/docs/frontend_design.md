@@ -34,9 +34,11 @@ kind the transformer doesn't take is refused with its position.
   `ALTER TABLE … ADD COLUMN` (`catalog_design.md`, *DDL*).
 - `INSERT … VALUES` of one row, with or without a column list.
 - `SELECT` targets: columns, `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT
-  col)`, `SUM(col)` and `MIN(col)`. There's no `GROUP BY`: an aggregate
-  makes the query ungrouped and it returns exactly one row. A query mixing
-  aggregates and bare columns is refused (42803), as in PostgreSQL.
+  col)`, `SUM(col)`, `MIN(col)`, `MAX(col)` and `AVG(col)`, several of
+  them in any order.
+- `GROUP BY` of columns, and `HAVING`, below. A query with a `GROUP BY`, a
+  `HAVING` or an aggregate is aggregated; without `GROUP BY` it returns
+  exactly one row, or none where its `HAVING` is false.
 - `FROM`: one table, or two joined by a comma or `[INNER] JOIN … ON`.
   Columns may be qualified by the table's name.
 - `UPDATE` and `DELETE` of any number of rows.
@@ -78,12 +80,37 @@ kind the transformer doesn't take is refused with its position.
 - `SUM` over `SMALLINT` or `INTEGER` is `bigint`. Over `BIGINT` or
   `DECIMAL` it is `numeric`, kept at the input's scale. It is NULL over no
   rows.
-- `MIN` is of the column's type, and NULL over no rows. It takes a numeric
-  or temporal column.
-  - `MIN` of a `TEXT`, `VARCHAR` or `BYTEA` column is refused (#534).
+- `AVG` over an integer or `DECIMAL` column is `numeric`: PostgreSQL's
+  `numeric_div` of the sum by the count, at the scale its
+  `select_div_scale` chooses (at least 16 significant digits), rounded
+  half away from zero. Its digits can pass 64 bits, so the plan emits the
+  sum and the count and the API divides them (`average_text`); a result
+  row carries the value as its text. NULL over no rows.
+- `MIN` and `MAX` are of the column's type, and NULL over no rows. They
+  take a numeric or temporal column.
+  - Of a `TEXT`, `VARCHAR` or `BYTEA` column they are refused (#534).
     Keeping the least value seen needs a buffer the plan API doesn't have.
-  - `MIN` of a `REAL` or `DOUBLE PRECISION` column is refused too (*Known
-    differences*).
+  - Of a `REAL` or `DOUBLE PRECISION` column they are refused too (*Known
+    differences*), as are `SUM` and `AVG` of one (42601).
+
+**`GROUP BY` and `HAVING`** (`planner_design.md`, *GROUP BY as built*):
+- `GROUP BY` takes a list of columns of the statement's tables, of any type.
+  NULLs form one group, and a DOUBLE's `-0.0` and `0.0` one (its row shows
+  the value of the group's first row, as PostgreSQL's hashed aggregate
+  does). No expressions, `GROUPING SETS`, `ROLLUP`, `CUBE` or `GROUP BY
+  DISTINCT`.
+- A column the select list, `ORDER BY` or `HAVING` names must be grouped,
+  or of a table whose whole primary key is grouped: PostgreSQL's
+  functional dependency, which the binder honours by grouping by it too.
+  Anything else is 42803, PostgreSQL's message.
+- `HAVING` is a conjunction of comparisons of a grouped column or an
+  aggregate with a parameter. The parameter takes the column's type, or the
+  aggregate's: `COUNT`'s and an integer `SUM`'s `bigint`, a `SUM` of a
+  BIGINT or DECIMAL its numeric, checked as a BIGINT at its scale, `MIN`'s
+  and `MAX`'s their column's. `HAVING` on `AVG` is refused (42601): its
+  quotient is no type a plan holds.
+- `ORDER BY` takes grouped columns; it sorts the groups, and `LIMIT` counts
+  them.
 
 **`FOR UPDATE`**, on a single-table `SELECT`:
 - every row returned is guarded with `bc_guard_unchanged`, and the commit
@@ -96,7 +123,8 @@ kind the transformer doesn't take is refused with its position.
 That includes:
 - `OR`, `NOT`, `IN`, `BETWEEN`, `IS NULL`;
 - subqueries, derived tables, set operations;
-- `GROUP BY`, `HAVING`, `DISTINCT` on the select list;
+- `DISTINCT` on the select list, `GROUP BY` of an expression, and `HAVING`
+  of anything but the comparisons above;
 - outer joins, three or more tables, table aliases;
 - `OFFSET`, `RETURNING`, multi-row `VALUES`;
 - `*`, `/`, string concatenation and functions;
@@ -198,14 +226,19 @@ fail on them.
   refused at bind** ("numeric field overflow"), whatever the column holds.
   PostgreSQL computes the sum and fails only when it doesn't fit the
   column. The machine's literals stay inside 18 digits.
-- **A SUM whose running total leaves `int64_t` fails** (`BC_E_ARITH`). The
+- **A SUM or an AVG whose running total leaves `int64_t` fails** (`BC_E_ARITH`). The
   layer adds in 64 bits, a BIGINT's or a DECIMAL's scaled integer, and the
   statement fails as 22003; PostgreSQL's `SUM` of a BIGINT or NUMERIC is an unbounded `numeric`. Below that the
   sums agree exactly (`test_sum_past_int64_is_an_error`). The machine sums
   no BIGINT column; no TPROC-C sum comes near.
-- **MIN of a REAL or DOUBLE PRECISION column is refused.** PostgreSQL's
-  `MIN` keeps the last of `-0.0` and `0.0` it meets, so its answer depends
-  on the order it reads the rows. The machine takes no `MIN` of a float.
+- **MIN and MAX of a REAL or DOUBLE PRECISION column are refused.**
+  PostgreSQL's `MIN` keeps the last of `-0.0` and `0.0` it meets, so its
+  answer depends on the order it reads the rows. The machine takes no `MIN`
+  or `MAX` of a float.
+- **A HAVING parameter compared with the SUM of a BIGINT or DECIMAL is
+  checked as a BIGINT** at the column's scale before the plan runs: a value
+  past it is 22003, where PostgreSQL compares it with the numeric sum. The
+  machine's values stay inside it.
 - **A unique value an UPDATE moves from one row to another is a
   duplicate.** With a unique index on `u` and rows holding 1 and 2, `SET u
   = u + 1` over both is refused (23505), whatever order the rows are
@@ -223,8 +256,11 @@ fail on them.
   takes. PostgreSQL runs them. Full scans and sorts, which #533 lifted, and
   joins no key reaches, which hash joins lifted (#534), are no longer
   refused.
-- **A sort past the statement's memory budget fails** with 54000, where
-  PostgreSQL spills it to disk (`planner_design.md`, *Memory*).
+- **A sort, or a structure of groups, past the statement's memory budget
+  fails** with 54000, where PostgreSQL spills it to disk
+  (`planner_design.md`, *Memory*).
+- **A filter on a grouped DOUBLE or REAL column in HAVING is refused**
+  (`no plan:`), as a `WHERE`'s is.
 
 Each is a refusal or an error, not a different answer. Everything else in
 the dialect matches PostgreSQL, and the proof machine checks that it does.
