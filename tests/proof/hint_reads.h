@@ -13,15 +13,15 @@
 #include <catch2/catch_test_macros.hpp>
 #include "fault_injector.h"
 #include "invariants.h"
-#include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <format>
 #include <limits>
 #include <optional>
 #include <cstring>
+#include <cerrno>
 #include <string>
 #include <sys/stat.h>
-#include <vector>
 
 namespace bytecask::testing {
 
@@ -110,20 +110,20 @@ inline auto hint_identity(const std::filesystem::path &hint) -> std::string {
 }
 
 // A sibling directory of a database, for a probe run of it. The name carries
-// a timestamp so two probes never collide and an existing directory is never
-// silently wiped — a stale .probe left by an earlier test would be a stale
-// copy of a different DB. Removed when it goes out of scope, however the
-// caller leaves.
+// a timestamp so two probes in one run never collide, and the name is unique
+// enough that a stale probe from a killed run cannot be reused by accident.
+// Removed when it goes out of scope, however the caller leaves; a probe left
+// on disk by a killed run stays (a unique name is the price of not touching
+// anything that might be in use).
 class ProbeDir {
 public:
   explicit ProbeDir(const std::filesystem::path &base) {
     auto norm = base.lexically_normal();
-    if (norm.filename().empty()) norm = norm.parent_path();
+    if (norm.filename().empty()) norm = norm.parent_path();  // trailing '/'
     auto ts = std::chrono::system_clock::now().time_since_epoch().count();
     path_ = norm.parent_path() /
             (norm.filename().string() + ".probe_" +
              std::to_string(ts));
-    std::filesystem::remove_all(path_);
   }
   ~ProbeDir() { std::filesystem::remove_all(path_); }
   ProbeDir(const ProbeDir &) = delete;
@@ -158,14 +158,16 @@ inline auto first_hint_scan_read(const std::filesystem::path &dir,
   REQUIRE_FALSE(data.empty());
   auto hints = data;
   for (auto &hint : hints) hint.replace_extension(".hint");
-
   ProbeDir probe{dir};
   auto replaced = [&](const std::filesystem::path &hint) -> HintReads {
-    // The probe open runs the same open the scan cell is counting, and it
-    // must not run under the cell's fault injector (the one that fails an
-    // io_hint_read), or a damaged/hint-less first file would throw and leave
-    // the probe half-recovered. The strict options the probe gets are the
-    // same opts the open under test uses, so the two runs agree.
+    // The probe open runs the same open the scan cell is counting, with the
+    // same opts. It runs before the caller installs the cell's fault injector
+    // (which fails an io_hint_read), so it is not under the injector — that
+    // is a property of the call order, not of this function. If the probe
+    // open throws, REQUIRE_NOTHROW fails the test instead of unwinding past
+    // an armed injector. The probe is lenient where the cell is lenient
+    // (lenient cells pass .fail_recovery_on_crc_errors = false), and strict
+    // otherwise, so it matches the open under test.
     HintReads grows{};
     REQUIRE_NOTHROW([&] () -> void {
       if (!std::filesystem::exists(probe.path())) {
@@ -174,8 +176,8 @@ inline auto first_hint_scan_read(const std::filesystem::path &dir,
         (void)DB::open(probe.path(), opts);
       }
       grows = hint_reads(probe.path() / hint.filename());
-      REQUIRE(grows.verified);
     }());
+    REQUIRE(grows.verified);
     return grows;
   };
 
@@ -187,6 +189,8 @@ inline auto first_hint_scan_read(const std::filesystem::path &dir,
       work.open_pass += grows.open_pass;
       work.scans = grows.scans;
     }
+    // An empty hint holds no units: its scan reads nothing, and the first
+    // scan read of the open is the one of the next hint that has units.
     if (work.scans) return reads + work.open_pass + 1;
     reads += work.open_pass;
   }

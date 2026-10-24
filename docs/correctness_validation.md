@@ -1147,8 +1147,11 @@ Opening is twice when recovery first replaces the hint: a damaged one is
 read whole to find it damaged, and a missing one is generated from its data
 file. Those replacements are read off a copy of the directory that recovery
 has run over once, since the cell may have damaged every hint itself. The
-copy is opened with strict options (the same `opts` the open under test uses),
-so the probe and the open under test agree on where a scan begins.
+copy is opened with the same `opts` the open under test uses — strict where
+the cell is strict, lenient where it is lenient — so the probe and the open
+under test agree on where a scan begins. The probe runs before the cell's
+fault injector is armed, and a throw in the probe open fails the test instead
+of unwinding past that injector.
 
 The cell also says why its read is a scan read: a failure in one of the
 opens above the scan lets `open` return without that file's keys in lenient
