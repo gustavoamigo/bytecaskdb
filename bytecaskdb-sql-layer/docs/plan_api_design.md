@@ -137,8 +137,10 @@ tables, each wrapped in its own struct type so the C compiler rejects a
 cursor passed as a sorter, with a generation tag so the API rejects a handle
 whose owner has moved on. A stale or foreign handle sets `BC_E_HANDLE`. The
 generation is 64 bits, drawn once per handle from a counter the context
-never resets, so it never repeats: a stale handle never matches a slot a
-later handle reuses. Plans are regenerated from SQL, never stored, so the
+never resets, so it never repeats within a context: a stale handle never
+matches a slot a later handle reuses. Another context's handle is not
+checked for: plans are the compiler's, and use only their own context's
+handles. Plans are regenerated from SQL, never stored, so the
 handles' layout can change with the API.
 
 **Views are handles with a lifetime the API tracks.** A view names bytes
@@ -250,21 +252,36 @@ on every run over the same data. Two things are not charged:
 
 **The write set is bounded as it grows.** It is what the statement keeps
 until commit: its effects (puts, deletes, range deletes and guards), its
-insert claims and locked rows, and the row keys, unique prefixes and
-ranges it wrote. The call that adds to it counts what it adds, as a
-transaction counts what it holds: each buffer's size plus the allocator's
-overhead, and each entry's node or its slot at twice its vector's size, a
-conservative bound on the memory. The bound is:
-- in autocommit, the engine's 1 GiB batch limit;
-- in a transaction, its `max_bytes`, less what its earlier statements
-  hold. `bc_txn_add` checks the whole again before it takes the statement
-  in.
+insert claims and its locked rows. The call that adds to it counts what it
+adds, before it is added, against a bound that depends on where the
+statement runs:
+- **In autocommit**, the engine's 1 GiB batch limit, counted as the engine
+  counts a write plan: each write's entry on disk (a 15-byte header, the
+  key, the value or a range's end key, and a 4-byte CRC), and the two empty
+  batch markers once there are two writes. Guards and claims append
+  nothing and count nothing, so an execution that only guards
+  (`SELECT … FOR UPDATE`), which `bc_ctx_commit` does not submit, is never
+  refused. The engine's rule is not exported by `bytecask.hpp`, so
+  `engine_entry_bytes` restates it, from `docs/file_format.md` (#576).
+- **In a transaction**, its `max_bytes`, counted as the transaction counts
+  what it holds (each buffer's capacity plus the allocator's overhead, an
+  overlay node per effect, each vector at twice its size): `txn_holds`,
+  given the statement's count so far and what the call adds. `bc_txn_add`
+  checks the same count with the same function before it takes the
+  statement in, so the two cannot disagree.
 
-The call that passes it fails with `BC_E_LIMIT` (SQLSTATE 54000), as the
-statement budget does, so a 20M-row `UPDATE` stops at the row that passes
-1 GiB rather than build several first. A bulk `UPDATE` of 100 MB in
-autocommit runs under the 64 MiB statement budget, since only the step's
-rows are charged to it.
+Beside it the statement keeps scratch: the row keys, unique prefixes and
+ranges it wrote, to refuse a second write, and the slots of its effects,
+claims and locks. That is statement memory. In a transaction it is charged
+to the statement budget; in autocommit to nothing, since it grows with the
+writes, which the batch limit bounds, and charging it would refuse a bulk
+write the engine takes.
+
+The call that passes a bound fails with `BC_E_LIMIT` (SQLSTATE 54000), as
+the statement budget does, so a 20M-row `UPDATE` stops at the row that
+passes 1 GiB on disk rather than build several first. A bulk `UPDATE` of
+2M rows of 100 bytes, 260 MB on disk, runs in autocommit under the 64 MiB
+statement budget, since only the step's rows are charged to it.
 
 A charge past the budget is `BC_E_LIMIT` (SQLSTATE 54000), a limit
 the layer sets: checked before the bytes are allocated wherever their size
@@ -338,7 +355,8 @@ detection.
 typedef struct bc_ctx bc_ctx;                       /* opaque; one per executing plan */
 
 /* Handles: an index and a generation, each in its own struct type. The
-   generation is 64 bits: one is drawn per handle, and it never repeats. */
+   generation is 64 bits: one is drawn per handle, and it never repeats
+   within a context. */
 typedef struct { uint32_t i; uint64_t g; } bc_view;   /* bytes the API owns */
 typedef struct { uint32_t i; uint64_t g; } bc_cursor;
 typedef struct { uint32_t i; uint64_t g; } bc_sorter;
@@ -827,8 +845,9 @@ void bc_raise(bc_ctx *, uint32_t constraint, uint32_t object_id);   /* a user er
 
 A plan under snapshot isolation emits no guards. The two plans for the same
 SQL differ only in guard calls, which is how isolation reads in the text.
-The write plan is bounded by the engine's 1 GiB plan limit, counted as it
-grows (*Memory is the statement's*); exceeding it is `BC_E_LIMIT`.
+The write plan is bounded by the engine's 1 GiB plan limit, counted as the
+engine counts it, on disk, as it grows (*Memory is the statement's*);
+exceeding it is `BC_E_LIMIT`.
 
 ## The language
 

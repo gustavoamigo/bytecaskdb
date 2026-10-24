@@ -224,16 +224,16 @@ TEST_CASE("embedded API: a statement over its memory budget is 54000 and leaves 
   CHECK(db->execute("SELECT id, bal FROM acct WHERE id >= $1", {std::int64_t{191}}).rows.size() == 10);
 }
 
-TEST_CASE("embedded API: a bulk UPDATE of 1M rows of 100 bytes runs in the default memory budget",
+TEST_CASE("embedded API: a bulk UPDATE of 2M rows of 100 bytes runs in the default memory budget",
           "[sql][api][memory]") {
   // An optimised build, as CI's release run, runs it as stated. A debug
   // build, as the sanitizers run, takes a tenth of the rows under a tenth of
   // the budget: the same ratio of rows to budget, at a minute's less work.
 #ifdef NDEBUG
-  constexpr std::int64_t kRows = 1'000'000;
+  constexpr std::int64_t kRows = 2'000'000;
   const DatabaseOptions opts{};
 #else
-  constexpr std::int64_t kRows = 100'000;
+  constexpr std::int64_t kRows = 200'000;
   const DatabaseOptions opts{.statement_memory_bytes = DatabaseOptions{}.statement_memory_bytes / 10};
 #endif
   sql_test::TempDir dir{"api_bulk"};
@@ -266,9 +266,10 @@ TEST_CASE("embedded API: a bulk UPDATE of 1M rows of 100 bytes runs in the defau
     CHECK(row_bytes >= 90);
     CHECK(row_bytes <= 110);
   }
-  // Each built row goes when its step ends: 1M of them, 100 MB, pass 64 MiB.
-  // The write set they join is held to the engine's 1 GiB batch limit
-  // instead, and is within it.
+  // Each built row goes when its step ends: 2M of them, 200 MB, pass 64 MiB.
+  // The write set they join is held to the engine's 1 GiB batch limit by
+  // what it appends, about 260 MB: a conservative count of the memory it
+  // holds passed 1 GiB, and refused it.
   auto r = db->execute("UPDATE wide SET n = n + 1 WHERE id >= $1", {std::int64_t{0}});
   CHECK(r.affected == kRows);
   for (std::int64_t id : {std::int64_t{0}, kRows / 2, kRows - 1}) {

@@ -26,7 +26,8 @@ extern "C" {
 typedef struct bc_ctx bc_ctx;                       /* opaque; one per executing plan */
 
 /* Handles: an index and a generation, each in its own struct type. The
-   generation is 64 bits: one is drawn per handle, and it never repeats. */
+   generation is 64 bits: one is drawn per handle, and it never repeats
+   within a context. */
 typedef struct { uint32_t i; uint64_t g; } bc_view;   /* bytes the API owns */
 typedef struct { uint32_t i; uint64_t g; } bc_cursor;
 typedef struct { uint32_t i; uint64_t g; } bc_sorter;

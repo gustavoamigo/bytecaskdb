@@ -739,7 +739,57 @@ auto qty_of(Fixture& f, std::int64_t id) -> std::int64_t {
 }
 }  // namespace
 
-TEST_CASE("plan API: an autocommit write set past the engine's batch limit is BC_E_LIMIT at the call that passes it",
+namespace {
+// Every row of t, its qty set to param 0: the rows it puts are the same size
+// whatever the qty was.
+void set_all(bc_ctx* cx) {
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  int64_t n = 0;
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    bc_row r = bc_row_from(cx, kTbl, row);
+    bc_row_set_param(cx, r, kQtyCol, 0);
+    bc_update(cx, kTbl, row, bc_row_end(cx, r));
+    n = bc_add(cx, n, 1);
+  }
+  bc_emit_count(cx, n);
+}
+
+// SELECT … FOR UPDATE over every row of t; it then sets the qty of the row
+// whose id is param 0, if one is, to 0.
+void lock_all(bc_ctx* cx) {
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  int64_t n = 0;
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    bc_guard_row(cx, kTbl, row);
+    if (bc_col_i64(cx, row, kIdCol) == bc_param_i64(cx, 0)) {
+      bc_row r = bc_row_from(cx, kTbl, row);
+      bc_row_set_i64(cx, r, kQtyCol, 0);
+      bc_update(cx, kTbl, row, bc_row_end(cx, r));
+    }
+    n = bc_add(cx, n, 1);
+  }
+  bc_emit_count(cx, n);
+}
+
+// The bytes the engine appends for a plan that puts each of t's rows as it
+// is now (docs/file_format.md): an entry of a 15-byte header, the key, the
+// value and a 4-byte CRC per row, and two empty markers around them.
+auto rows_on_disk(Fixture& f) -> std::uint64_t {
+  constexpr std::uint64_t kEntry = 15 + 4;
+  Bytes prefix;
+  bytecask::sql::key_put_prefix(prefix, bytecask::sql::kNsRow, kTbl);
+  std::uint64_t bytes = 2 * kEntry;
+  for (const auto& [key, value] : f.db->iter_from({}, prefix)) {
+    if (!std::ranges::equal(std::span{key}.first(std::min(key.size(), prefix.size())), prefix)) break;
+    bytes += kEntry + key.size() + value.size();
+  }
+  return bytes;
+}
+}  // namespace
+
+TEST_CASE("plan API: an autocommit write set is held to the engine's batch limit by its bytes on disk",
           "[sql][algebra][memory]") {
   Fixture f;
   constexpr std::int64_t kRows = 200;
@@ -748,22 +798,53 @@ TEST_CASE("plan API: an autocommit write set past the engine's batch limit is BC
   }
   // The write set is not the statement budget's: 200 updates hold far more
   // than 16 KiB, and each row built goes with its step.
-  CHECK(run(f, bump_all, {}, memory_budget(16u << 10)) == BC_COMMITTED);
+  CHECK(run(f, set_all, {std::int64_t{7}}, memory_budget(16u << 10)) == BC_COMMITTED);
   CHECK(bc_ctx_affected(f.cx) == kRows);
-  CHECK(qty_of(f, 1) == 2);
-  // The batch limit, lowered to 16 KiB: the update that passes it fails the
+  // What the next UPDATE appends: its rows are these rows' size.
+  const auto on_disk = rows_on_disk(f);
+  // A byte short of it: the update that passes the limit fails the
   // statement, whatever its budget, and nothing is committed.
-  bc_ctx_write_bound_for_testing(f.cx, 16u << 10);
-  CHECK(run(f, bump_all, {}) == BC_FAILED);
+  bc_ctx_write_bound_for_testing(f.cx, on_disk - 1);
+  CHECK(run(f, set_all, {std::int64_t{8}}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LIMIT);
-  CHECK(std::string{bc_error_message(f.cx)}.find("batch limit of 16384 bytes") != std::string::npos);
+  CHECK(std::string{bc_error_message(f.cx)}.find("batch limit of " + std::to_string(on_disk - 1) + " bytes") !=
+        std::string::npos);
   CHECK(bc_ctx_affected(f.cx) == -1);
-  CHECK(qty_of(f, 1) == 2);
-  CHECK(qty_of(f, kRows) == kRows + 1);
-  // Under it, the same update commits.
-  bc_ctx_write_bound_for_testing(f.cx, 1u << 20);
-  CHECK(run(f, bump_all, {}) == BC_COMMITTED);
-  CHECK(qty_of(f, kRows) == kRows + 2);
+  CHECK(qty_of(f, 1) == 7);
+  CHECK(qty_of(f, kRows) == 7);
+  // At it, the same update commits: the engine takes the plan.
+  bc_ctx_write_bound_for_testing(f.cx, on_disk);
+  CHECK(run(f, set_all, {std::int64_t{8}}) == BC_COMMITTED);
+  CHECK(qty_of(f, 1) == 8);
+  CHECK(qty_of(f, kRows) == 8);
+}
+
+TEST_CASE("plan API: an autocommit SELECT FOR UPDATE's guards are not held to the batch limit",
+          "[sql][algebra][memory]") {
+  Fixture f;
+  constexpr std::int64_t kRows = 200;
+  for (std::int64_t id = 1; id <= kRows; ++id) {
+    REQUIRE(run(f, insert_plan_ok, {id, bytes("name"), id}) == BC_COMMITTED);
+  }
+  // A guard writes nothing: a guard-only execution commits nothing, and 200
+  // guards are not refused under a limit of one byte.
+  bc_ctx_write_bound_for_testing(f.cx, 1);
+  CHECK(run(f, lock_all, {std::int64_t{0}}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == kRows);
+  // With one write among them, the limit counts that write's entry alone:
+  // one write, no markers.
+  Bytes key, row;
+  bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
+  bytecask::sql::key_put_i64(key, 1, {PhysType::I64});
+  REQUIRE(f.db->get({}, key, row));
+  const auto one_entry = 15 + key.size() + row.size() + 4;  // qty 1 and 0 encode alike
+  bc_ctx_write_bound_for_testing(f.cx, one_entry - 1);
+  CHECK(run(f, lock_all, {std::int64_t{1}}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LIMIT);
+  CHECK(qty_of(f, 1) == 1);
+  bc_ctx_write_bound_for_testing(f.cx, one_entry);
+  CHECK(run(f, lock_all, {std::int64_t{1}}) == BC_COMMITTED);
+  CHECK(qty_of(f, 1) == 0);
 }
 
 TEST_CASE("plan API: a transaction statement's write set past the room left in its bound fails at the call",
@@ -791,6 +872,75 @@ TEST_CASE("plan API: a transaction statement's write set past the room left in i
   bc_txn_free(txn);
   CHECK(qty_of(f, 1) == 1);
   CHECK(qty_of(f, kRows) == kRows);
+}
+
+namespace {
+// set_all as a transaction's one statement under max_bytes: the statement's
+// error, whether bc_txn_add took it in, and, with `commit`, the commit's
+// result (else the transaction is rolled back).
+struct TxnRun {
+  bc_error_code run;
+  std::string message;
+  bool added;
+  int committed;
+};
+auto txn_set_all(Fixture& f, std::uint64_t max_bytes, std::int64_t qty, bool commit, bc_budget budget = {})
+    -> TxnRun {
+  bc_ctx_reset(f.cx);
+  auto* txn = bc_txn_new(&f.bdb, &f.bcat, max_bytes);
+  REQUIRE(txn != nullptr);
+  auto ps = params({qty});
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+  auto ref = sr.get();
+  bc_ctx_begin_txn(f.cx, txn, &ps, budget);
+  bc_ctx_run(f.cx, set_all, &ref);
+  TxnRun out{bc_error(f.cx), bc_error_message(f.cx), false, BC_FAILED};
+  out.added = bc_txn_add(f.cx);
+  bc_ctx_reset(f.cx);
+  if (commit && out.added) out.committed = bc_txn_commit(txn, false);
+  bc_txn_free(txn);
+  return out;
+}
+}  // namespace
+
+TEST_CASE("plan API: a transaction statement's writes and bc_txn_add agree on the bound at its boundary",
+          "[sql][algebra][memory][txn]") {
+  Fixture f;
+  constexpr std::int64_t kRows = 200;
+  for (std::int64_t id = 1; id <= kRows; ++id) {
+    REQUIRE(run(f, insert_plan_ok, {id, bytes("name"), id}) == BC_COMMITTED);
+  }
+  // The least bound the statement runs under, found by bisection.
+  std::uint64_t lo = 1, hi = 64u << 20;
+  REQUIRE(txn_set_all(f, hi, 7, false).run == BC_OK);
+  while (lo < hi) {
+    auto mid = lo + (hi - lo) / 2;
+    if (txn_set_all(f, mid, 7, false).run == BC_OK) {
+      hi = mid;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  // At it, bc_txn_add takes the statement in and the commit lands; a byte
+  // below it, the statement fails at the write that passes it, before
+  // bc_txn_add, which then refuses it.
+  auto at = txn_set_all(f, lo, 7, true);
+  CHECK(at.run == BC_OK);
+  CHECK(at.added);
+  CHECK(at.committed == BC_COMMITTED);
+  CHECK(qty_of(f, kRows) == 7);
+  auto below = txn_set_all(f, lo - 1, 8, true);
+  CHECK(below.run == BC_E_LIMIT);
+  CHECK(below.message.find("transaction's writes would pass its bound of " + std::to_string(lo - 1)) !=
+        std::string::npos);
+  CHECK_FALSE(below.added);
+  CHECK(qty_of(f, kRows) == 7);
+  // The statement's scratch (the rows it wrote, its vectors' slots) is
+  // statement memory: under a bound with room, a budget it passes refuses it.
+  auto budgeted = txn_set_all(f, 1u << 30, 8, false, memory_budget(16u << 10));
+  CHECK(budgeted.run == BC_E_LIMIT);
+  CHECK(budgeted.message.find("memory budget") != std::string::npos);
+  CHECK_FALSE(budgeted.added);
 }
 
 namespace {

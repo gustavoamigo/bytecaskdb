@@ -391,13 +391,15 @@ differences*.
 - **Buffer size.** What a transaction holds, its overlay and its guards,
   is bounded by `TransactionOptions::max_bytes`, default 64 MiB, well below
   the engine's 1 GiB plan limit. A statement's write set is counted as it
-  grows, at the call that adds to it, against the room the transaction has
-  left (`plan_api_design.md`, *The write set is bounded as it grows*), and
-  the bound is checked again before a statement's writes are taken in,
-  from the statement's own pending effects: one that would take the
-  transaction past it fails with `BC_E_LIMIT` (SQLSTATE 54000) without the
-  transaction allocating for it, the transaction is aborted like any failed
-  statement's, and what it held is freed with the abort.
+  grows, at the call that adds to it, as the transaction would hold it
+  (`plan_api_design.md`, *The write set is bounded as it grows*), and the
+  same count is checked again, by the same function, before a statement's
+  writes are taken in: one that would take the transaction past it fails
+  with `BC_E_LIMIT` (SQLSTATE 54000) without the transaction allocating for
+  it, the transaction is aborted like any failed statement's, and what it
+  held is freed with the abort. The statement's scratch (the rows, unique
+  values and ranges it wrote) is charged to its statement budget, not to
+  this bound.
   The count is a conservative bound, never less than the memory held: each
   buffer's capacity plus an allocator overhead, each map node's full size,
   and the guards' and written tables' vectors at the size they could grow
