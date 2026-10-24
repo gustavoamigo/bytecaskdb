@@ -25,10 +25,10 @@ name: Build Python wheels
 on:
   # A change that touches only documentation runs nothing here, as a pull
   # request or as a push to main: no job reads Markdown. Nor does one confined
-  # to the SQL layer, or to the files only other workflows read: the wheels
-  # build the engine's extension alone (bytecaskdb_python), as ci.yml's
-  # paths-ignore says. A change that also touches anything else runs
-  # everything.
+  # to the SQL layer, or to the files only other workflows read (the contract
+  # vocabulary check, and every workflow file but this one): the wheels build
+  # the engine's extension alone (bytecaskdb_python). A change that also
+  # touches anything else runs everything.
   push:
     branches: [main]
     paths-ignore:
@@ -37,7 +37,16 @@ on:
       - "bytecaskdb-sql-layer/**"
       - "scripts/check_contract_vocabulary.py"
       - "scripts/test_check_contract_vocabulary.py"
+      - ".github/workflows/chaos-nightly.yml"
+      - ".github/workflows/ci.yml"
       - ".github/workflows/contract.yml"
+      - ".github/workflows/crash-nightly.yml"
+      - ".github/workflows/fuzz-nightly.yml"
+      - ".github/workflows/isolation-nightly.yml"
+      - ".github/workflows/node-nightly.yml"
+      - ".github/workflows/python-nightly.yml"
+      - ".github/workflows/sanitizers.yml"
+      - ".github/workflows/soak-nightly.yml"
       - ".github/workflows/sql-layer.yml"
       - ".github/workflows/sql-layer-hammerdb-nightly.yml"
   pull_request:
@@ -48,7 +57,16 @@ on:
       - "bytecaskdb-sql-layer/**"
       - "scripts/check_contract_vocabulary.py"
       - "scripts/test_check_contract_vocabulary.py"
+      - ".github/workflows/chaos-nightly.yml"
+      - ".github/workflows/ci.yml"
       - ".github/workflows/contract.yml"
+      - ".github/workflows/crash-nightly.yml"
+      - ".github/workflows/fuzz-nightly.yml"
+      - ".github/workflows/isolation-nightly.yml"
+      - ".github/workflows/node-nightly.yml"
+      - ".github/workflows/python-nightly.yml"
+      - ".github/workflows/sanitizers.yml"
+      - ".github/workflows/soak-nightly.yml"
       - ".github/workflows/sql-layer.yml"
       - ".github/workflows/sql-layer-hammerdb-nightly.yml"
   workflow_dispatch:
