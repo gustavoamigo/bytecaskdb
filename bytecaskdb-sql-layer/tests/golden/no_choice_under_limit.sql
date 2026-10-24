@@ -1,0 +1,1 @@
+SELECT a, b FROM p WHERE a = $1 AND w = $2 ORDER BY b LIMIT 3
