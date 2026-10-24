@@ -244,22 +244,25 @@ def literal(t: Type, v) -> str:
 TOKEN = re.compile(r"'(?:[^']|'')*'|\$(\d+)|%|[^'$%]+|.", re.S)
 
 
-def pg_params(sql: str, params, placeholder: str = "%s") -> tuple[str, list | None]:
-    """$n placeholders to psycopg's (%s, or %t for text format), the
-    parameters in their order. With parameters, psycopg reads every % as a
-    placeholder's, so a literal % becomes %%; a $n inside a string literal
-    is text. A statement without parameters goes as written."""
+def pg_params(sql: str, params, placeholder: str = "s") -> tuple[str, dict | None]:
+    """$n placeholders to psycopg's named ones (%(pn)s, or %(pn)t for text
+    format), and the parameters by name. A name used twice is one parameter,
+    so a $n the statement reuses stays one $n, typed by its first use, as
+    written. With parameters, psycopg reads every % as a placeholder's, so a
+    literal % becomes %%; a $n inside a string literal is text. A statement
+    without parameters goes as written."""
     if not params:
         return sql, None
-    out, order = [], []
+    out, values = [], {}
     for m in TOKEN.finditer(sql):
         token = m.group(0)
         if m.group(1) is not None:
-            order.append(int(m.group(1)) - 1)
-            out.append(placeholder)
+            n = int(m.group(1))
+            values[f"p{n}"] = params[n - 1]
+            out.append(f"%(p{n}){placeholder}")
         else:
             out.append(token.replace("%", "%%"))
-    return "".join(out), [params[i] for i in order]
+    return "".join(out), values
 
 
 FLOAT4_OID = 700
@@ -352,5 +355,5 @@ def run_wire(conn, sql: str, params=()) -> Outcome:
     """A statement on sql_layer_server, as the layer's text with its $n: each
     parameter goes as text (%t), so the server reads it as the type it
     inferred, as it reads HammerDB's."""
-    text, values = pg_params(sql, params, "%t")
+    text, values = pg_params(sql, params, "t")
     return run_psycopg(conn, text, values, sql)

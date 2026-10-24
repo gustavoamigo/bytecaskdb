@@ -165,16 +165,16 @@ TEST_CASE("codegen: MIN from the first entry past the NULLs, or a loop; SUM by a
                        {"k"}});
   f.ddl(CreateIndexDdl{"m_gx", "m", {{"g"}, {"x"}}});
   // x is the ASC part after the prefix: the scan starts past its NULLs, and
-  // its first entry is the least value.
+  // its first entry is the least value, read into a local.
   auto first = generate(f.cat(), "SELECT min(x) FROM m WHERE g = $1").source;
-  CHECK(first.find("bc_key_null(cx, k0);\n  bc_view lo = bc_key_successor(cx, bc_key_end(cx, k0));") !=
+  CHECK(first.find("bc_key_null(cx, k0);\n    bc_view lo = bc_key_successor(cx, bc_key_end(cx, k0));") !=
         std::string::npos);
   CHECK(first.find("if (bc_scan_next(cx, c)) {") != std::string::npos);
-  CHECK(first.find("bc_emit_key_part(cx, IDX_6, bc_scan_key(cx, c), PART_6_2);") != std::string::npos);
+  CHECK(first.find("kv0 = bc_key_part_i64(cx, IDX_6, bc_scan_key(cx, c), PART_6_2);") != std::string::npos);
   CHECK(first.find("while") == std::string::npos);
-  // k is not after the prefix: every entry is read.
+  // k is not after the prefix: every entry is read, as one group's MIN.
   auto loop = generate(f.cat(), "SELECT min(k) FROM m WHERE g = $1").source;
-  CHECK(loop.find("if (!seen || v < m) m = v;") != std::string::npos);
+  CHECK(loop.find("if (!xs0_0 || v0_0 < x0_0) x0_0 = v0_0;") != std::string::npos);
   auto sum = generate(f.cat(), "SELECT sum(x) FROM m WHERE g = $1");
   CHECK(sum.result_names == std::vector<std::string>{"sum"});
   // A BIGINT's SUM is numeric with no declared precision: the total may take

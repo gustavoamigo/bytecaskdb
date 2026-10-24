@@ -116,9 +116,11 @@ The rules, by what they test.
   during a transaction, so no commit conflicts.
 
 **Indexes and reads by a key:**
-- **NUMERIC(6, 2)** joins the column types. The layer takes a DECIMAL
-  parameter as its integer scaled by 10^2 (`oracle.to_layer`); values are
-  drawn at that scale, so both sides hold them exactly.
+- **NUMERIC(6, 2) and NUMERIC(18, 0)** join the column types. The layer
+  takes a DECIMAL parameter as its integer scaled by 10^scale
+  (`oracle.to_layer`); values are drawn at that scale, so both sides hold
+  them exactly. A NUMERIC(18, 0) is an integer of scale 0 to the layer, as
+  a BIGINT is.
 - **CREATE INDEX** of one or two columns, each `ASC` or `DESC`, unique or
   not; a unique one over duplicates is 23505 on both.
 - **SELECT by a key**: an equality prefix of the primary key or of an
@@ -133,8 +135,8 @@ The rules, by what they test.
   conjunct at all, only filters or none: a full scan. A model of the
   planner (`served`) says whether some plan serves it: if not, the layer
   must refuse it with `no plan:` and SQLSTATE 0A000, and PostgreSQL is not
-  asked. Since planner slice 4 it refuses only a filter on a DOUBLE or REAL
-  column no key takes. If it does,
+  asked. It refuses only a filter on a DOUBLE or REAL column no key takes,
+  and a `HAVING` on a grouped one. If it does,
   the rows are compared in `ORDER BY` order, as a multiset within each run
   of equal sort keys, and a run the `LIMIT` cuts must be drawn from
   PostgreSQL's (`oracle.same_rows`, against PostgreSQL's rows without the
@@ -164,8 +166,9 @@ The rules, by what they test.
 **Aggregates, UPDATE and DELETE of many rows:**
 - **SUM and MIN** over the same `WHERE` as `COUNT`, with `LIMIT 0` or 1
   now and then: `SUM` of SMALLINT, INTEGER and NUMERIC(6, 2) columns, `MIN`
-  of those and BIGINT ones. `SUM` of BIGINT is left out: its running total
-  leaves `int64_t` (`frontend_design.md`, *Known differences*).
+  of those and BIGINT and NUMERIC(18, 0) ones. `SUM` of BIGINT and
+  NUMERIC(18, 0) is left out: its running total leaves `int64_t`
+  (`frontend_design.md`, *Known differences*).
 - **UPDATE and DELETE by a key**: the same `WHERE` as `SELECT`, every row
   it matches; the `UPDATE` sets a non-key column to a parameter, or adds
   one to or subtracts one from a SMALLINT, INTEGER or NUMERIC(6, 2) column
@@ -199,6 +202,23 @@ The rules, by what they test.
   scanned by parameters, linked by equalities of columns neither key takes
   (`join_read_once`) or of the scanned table's primary-key columns, which
   its index holds as its key's suffix (`join_read_once_on_keys`).
+
+**GROUP BY and HAVING:**
+- **GROUP BY** of one or two columns of one table, any type, mostly an
+  index's parts after the prefix, so groups stream, under a key path's
+  conjuncts or a full scan; up to three aggregates (`COUNT`, `COUNT(DISTINCT)`,
+  `SUM`, `AVG`, `MIN`, `MAX`), up to two `HAVING` conjuncts on a key or an
+  aggregate, an `ORDER BY` of the keys and a `LIMIT` (`group_by`). With no
+  `GROUP BY`, several aggregates in one row, which the keys answer where
+  they can.
+- **A HAVING parameter the WHERE typed**: `$n` compared with an integer
+  column of scale 0 (SMALLINT, INTEGER, BIGINT or NUMERIC(18, 0)) in the
+  `WHERE`, then with a key or an aggregate of one in the `HAVING`
+  (`having_reuses_a_parameter`).
+- **GROUP BY over a join**: two tables linked by one or two equalities of
+  columns of one type, whatever reaches them, grouped by up to two columns
+  of either table, with the same aggregates, `HAVING`, `ORDER BY` and
+  `LIMIT` (`group_by_join`).
 
 `test_tprocc.py` runs TPROC-C's five transactions through SQL against
 PostgreSQL: a small fixture (one warehouse, two

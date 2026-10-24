@@ -99,8 +99,8 @@ struct CountRange {
 // `counted`'s range; MIN the first entry of `values`, `arg` being the ASC
 // part after its prefix and its range starting past that part's NULLs; MAX
 // its last, the first of the same range scanned in reverse. `values` is
-// `counted` but for that start, and `arg` is set where a MIN or MAX reads
-// it. Slice 1's MIN of one row is one, with a single output.
+// `counted` but for that start, and `arg`, held as an int64_t, is set where
+// a MIN or MAX reads it.
 struct KeyAggregates {
   Scan counted;
   Scan values;
@@ -224,15 +224,16 @@ struct Emit {
   std::vector<ColumnRef> targets;  // from the row, or from the entry's key when the scan covers
 };
 
-// One aggregate row, of COUNT(*), or COUNT, COUNT(DISTINCT), SUM or MIN of
-// its argument's non-NULL values, each held as an int64_t.
+// One aggregate row, of COUNT(*), or COUNT, COUNT(DISTINCT) or SUM of its
+// argument's non-NULL values, each held as an int64_t. Any other aggregate
+// is a GroupAggregate's.
 struct Aggregate {
   NodePtr input;
   Expr agg;
   bool emits{true};  // false under LIMIT 0
 };
 
-// A grouped aggregate (docs/planner_design.md, *GROUP BY as built*): the
+// A grouped aggregate (docs/planner_design.md, *Aggregates*): the
 // input's rows in groups of equal `keys`, NULL equal to NULL, and over each
 // group the aggregate calls `aggs`, each once; its rows are the groups. A
 // pipeline breaker over bc_agg_*: each row's group found by its key, a sort
@@ -359,14 +360,19 @@ struct Computed {
   friend auto operator==(const Computed&, const Computed&) -> bool = default;
 };
 
-// A result column as PostgreSQL names and types it. A NUMERIC, an AVG, is
-// two of the plan's columns, its sum and its count, both I64, which the API
-// divides as PostgreSQL's numeric division does.
+// A result column as PostgreSQL names and types it.
 struct ResultColumn {
   std::string name;
   SqlType sql;
-  PhysType type{PhysType::I64};
 };
+
+// The plan's columns a result column of type `t` is: a NUMERIC, an AVG, two
+// I64, its sum and its count, which the API divides as PostgreSQL's numeric
+// division does; any other one column of its physical type.
+[[nodiscard]] auto plan_columns(SqlType t) -> std::vector<PhysType> {
+  if (t.kind == SqlKind::Numeric) return {PhysType::I64, PhysType::I64};
+  return {phys_type(t)};
+}
 
 struct Plan {
   NodePtr root;
@@ -748,7 +754,15 @@ private:
             if (counts) scan(op.counted);
             if (op.arg) {
               scan(op.values);
+              // Each is read into an int64_t.
+              if (op.arg->type != PhysType::I64) broken("MIN or MAX from the keys of a column not held as I64");
               if (op.values.reverse) broken("MIN or MAX from the first entry of a reverse scan");
+              // An open low end starts at the part's NULLs, ASC's first.
+              const auto* r = std::get_if<Range>(&op.values.rest);
+              if (op.arg->nullable && (r == nullptr || r->lo.kind == KeyBound::Kind::Open ||
+                                       (r->lo.kind == KeyBound::Kind::NullPart && !r->lo.successor))) {
+                broken("MIN or MAX from a range that starts at its part's NULLs");
+              }
               if (op.values.object != op.counted.object || op.values.prefix != op.counted.prefix) {
                 broken("MIN or MAX from another range than the one counted");
               }
@@ -919,8 +933,11 @@ private:
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Aggregate>) {
             if (op.agg.kind != Expr::Kind::Aggregate) broken("an aggregate that is not an aggregate call");
+            if (op.agg.fn != Expr::Fn::Count && op.agg.fn != Expr::Fn::Sum) {
+              broken("an aggregate row of other than COUNT or SUM");
+            }
             if ((op.agg.fn != Expr::Fn::Count || op.agg.distinct) && op.agg.args.empty()) {
-              broken("SUM, MIN or COUNT(DISTINCT) with no argument");
+              broken("SUM or COUNT(DISTINCT) with no argument");
             }
             reads(op.agg);
             node(*op.input, &n);

@@ -85,16 +85,17 @@ from conftest import Oracle
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
 from pgserver import Server, server_binary  # noqa: E402
 
-TYPES = [o.BIGINT, o.INTEGER, o.SMALLINT, o.DOUBLE, o.REAL, o.numeric(6, 2), o.BOOLEAN, o.TEXT, o.varchar(4), o.BYTEA]
+TYPES = [o.BIGINT, o.INTEGER, o.SMALLINT, o.DOUBLE, o.REAL, o.numeric(6, 2), o.numeric(18, 0), o.BOOLEAN, o.TEXT,
+         o.varchar(4), o.BYTEA]
 # Types a column + parameter is supported on, and how PostgreSQL types that
 # parameter: as the column's type (numeric without the modifier).
 ARITHMETIC = {"bigint": "bigint", "smallint": "smallint", "integer": "integer", "numeric(6,2)": "numeric",
               "numeric(18,0)": "numeric"}
 # The columns SUM and MIN are generated over: the types the layer takes, but
-# BIGINT for SUM, whose sum leaves int64 (docs/frontend_design.md, *Known
-# differences*).
+# BIGINT and NUMERIC(18, 0) for SUM, whose sum leaves int64
+# (docs/frontend_design.md, *Known differences*).
 SUMMED = ("smallint", "integer", "numeric(6,2)")
-MINIMISED = SUMMED + ("bigint",)
+MINIMISED = SUMMED + ("bigint", "numeric(18,0)")
 TABLE_NAMES = ["t0", "t1", "t2", "t3"]
 BIGINT_LOW, BIGINT_HIGH = o.BIGINT.low, o.BIGINT.high
 
@@ -239,6 +240,16 @@ def values(t: o.Type) -> st.SearchStrategy:
     return st.binary(max_size=6)
 
 
+def operands(t: o.Type) -> st.SearchStrategy:
+    """An operand of col ± $n: a value as values(t) draws it, a DECIMAL's
+    within 18 digits at its scale. Past them the layer refuses it before the
+    plan runs, where PostgreSQL may complete (docs/frontend_design.md, *Known
+    differences*); NUMERIC(18, 0)'s edges past its precision are 19 digits."""
+    if t.kind != "decimal":
+        return values(t)
+    return values(t).filter(lambda v: abs(v.scaleb(t.scale)) < 10**18)
+
+
 def default_values(t: o.Type) -> st.SearchStrategy:
     """A DEFAULT both sides read the same way from its literal."""
     if t.kind == "int":
@@ -286,9 +297,10 @@ class Reuse:
     n: int
 
 
-# Integer types of scale 0: a $n of one compares exactly with a key or an
-# aggregate of another (docs/frontend_design.md, *GROUP BY and HAVING*).
-INTEGRAL = ("smallint", "integer", "bigint")
+# Integer types of scale 0, a DECIMAL of scale 0 among them: a $n of one
+# compares exactly with a key or an aggregate of another
+# (docs/frontend_design.md, *GROUP BY and HAVING*).
+INTEGRAL = ("smallint", "integer", "bigint", "numeric(18,0)")
 
 
 def param_value(v):
@@ -1251,7 +1263,8 @@ class SqlMachine(RuleBasedStateMachine):
         if col.type.sql in ARITHMETIC and not unique:
             op = data.draw(st.sampled_from(["=", "+", "-"]), label="op")
         small = st.integers(-5, 5).map(lambda n: decimal.Decimal(n) if col.type.kind == "decimal" else n)
-        value = data.draw(st.none() | (small if op != "=" else st.nothing()) | values(col.type), label="value")
+        value = data.draw(st.none() | (small if op != "=" else st.nothing()) |
+                          (values(col.type) if op == "=" else operands(col.type)), label="value")
         self.write(t.name, where, (col.name, op, value))
 
     @precondition(lambda self: self.tables)
@@ -1276,7 +1289,7 @@ class SqlMachine(RuleBasedStateMachine):
             key = tuple(data.draw(st.none() | values(t.column(c).type), label=c) for c in t.pk)
         ty = t.column(col).type
         small = st.integers(-5, 5).map(lambda n: decimal.Decimal(n) if ty.kind == "decimal" else n)
-        operand = data.draw(st.none() | small | values(ty), label="operand")
+        operand = data.draw(st.none() | small | operands(ty), label="operand")
         self.add(name, col, data.draw(st.sampled_from(["+", "-"]), label="op"), operand, key)
 
     @precondition(lambda self: any(c.type.sql in ARITHMETIC and c.name not in t.pk
@@ -1926,9 +1939,11 @@ def test_decimal_is_exact_under_any_context(tmp_path):
 
 def test_placeholders_to_psycopg():
     assert o.pg_params("SELECT 1", ()) == ("SELECT 1", None)
-    assert o.pg_params("SELECT $2, $1", ("a", "b")) == ("SELECT %s, %s", ["b", "a"])
+    assert o.pg_params("SELECT $2, $1", ("a", "b")) == ("SELECT %(p2)s, %(p1)s", {"p1": "a", "p2": "b"})
+    # A $n used twice is one parameter, as the statement wrote it.
+    assert o.pg_params("SELECT $1 WHERE $1 > 0", (5,), "t") == ("SELECT %(p1)t WHERE %(p1)t > 0", {"p1": 5})
     # A % is escaped, and a $n inside a string literal is text.
-    assert o.pg_params("SELECT '50%', '$1 it''s', $1", (7,)) == ("SELECT '50%%', '$1 it''s', %s", [7])
+    assert o.pg_params("SELECT '50%', '$1 it''s', $1", (7,)) == ("SELECT '50%%', '$1 it''s', %(p1)s", {"p1": 7})
 
 
 def test_rows_compare_by_type():
@@ -2831,23 +2846,26 @@ def test_a_grouped_hash_join_and_its_other_plan_both_order_the_groups(dsn):
 
 
 def test_a_having_parameter_typed_by_the_where(dsn):
-    """$1 compared with an INTEGER or SMALLINT column in the WHERE, then with
-    COUNT(*), a SUM, a MAX or a key in the HAVING: PostgreSQL types it by its
-    first use, the WHERE's, and so does the layer."""
+    """$1 compared with an INTEGER, SMALLINT or NUMERIC(18, 0) column in the
+    WHERE, then with COUNT(*), a SUM, a MAX or a key in the HAVING, a
+    NUMERIC(18, 0) one among them: PostgreSQL types it by its first use, the
+    WHERE's, and so does the layer, a DECIMAL of scale 0 being an integer."""
     m = fixed(dsn)
     try:
-        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.SMALLINT), Column("c2", o.BIGINT)],
-                       ["c0"]))
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.SMALLINT), Column("c2", o.BIGINT),
+                              Column("c3", o.numeric(18, 0))], ["c0"]))
         for k in range(12):
-            m.insert("t0", {"c0": k, "c1": k % 3, "c2": None if k % 5 == 0 else k * 10}, all_columns=True)
+            m.insert("t0", {"c0": k, "c1": k % 3, "c2": None if k % 5 == 0 else k * 10,
+                            "c3": None if k % 4 == 0 else decimal.Decimal(k % 5)}, all_columns=True)
         count = ("count", None, None, False)
         havings = (("agg", count), ("agg", ("sum", "t0", "c1", False)), ("agg", ("max", "t0", "c2", False)),
-                   ("col", "t0", "c1"))
-        for col, op in (("c0", ">"), ("c1", "<=")):
+                   ("agg", ("max", "t0", "c3", False)), ("agg", ("min", "t0", "c3", False)), ("col", "t0", "c1"))
+        for col, op in (("c0", ">"), ("c1", "<="), ("c3", ">=")):
             for v in (0, 1, 2, None):
                 for what in havings:
                     aggs = [count] + ([what[1]] if what[0] == "agg" and what[1] != count else [])
                     m.grouped(["t0"], [("t0", col, op, v)], [("t0", "c1")], aggs, [(what, ">", Reuse(1))])
+                m.grouped(["t0"], [("t0", col, op, v)], [("t0", "c3")], [count], [(("col", "t0", "c3"), "<", Reuse(1))])
                 m.grouped(["t0"], [("t0", col, op, v)], [], [count], [(("agg", count), ">", Reuse(1))])
     finally:
         m.teardown()

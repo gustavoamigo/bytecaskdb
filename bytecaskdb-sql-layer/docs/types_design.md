@@ -31,8 +31,7 @@ bind error with the position of the type name.
 
 A result has one more type no column has: `NUMERIC` of no declared
 precision (`SqlKind::Numeric`), `AVG`'s, carried in a result row as its
-text, since its digits can pass 64 bits (`planner_design.md`, *GROUP BY as
-built*). A `SUM` of a `BIGINT` or `DECIMAL` is a `DECIMAL` of no declared
+text, since its digits can pass 64 bits (`planner_design.md`, *Aggregates*). A `SUM` of a `BIGINT` or `DECIMAL` is a `DECIMAL` of no declared
 precision, its scaled `i64`.
 
 Rejected, each for a reason that is not "later": `NUMERIC` with
