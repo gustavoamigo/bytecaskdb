@@ -24,18 +24,33 @@ name: Build Python wheels
 
 on:
   # A change that touches only documentation runs nothing here, as a pull
-  # request or as a push to main: no job reads Markdown. A change that also
-  # touches anything else runs everything.
+  # request or as a push to main: no job reads Markdown. Nor does one confined
+  # to the SQL layer, or to the files only other workflows read: the wheels
+  # build the engine's extension alone (bytecaskdb_python), as ci.yml's
+  # paths-ignore says. A change that also touches anything else runs
+  # everything.
   push:
     branches: [main]
     paths-ignore:
       - "**.md"
       - "docs/**"
+      - "bytecaskdb-sql-layer/**"
+      - "scripts/check_contract_vocabulary.py"
+      - "scripts/test_check_contract_vocabulary.py"
+      - ".github/workflows/contract.yml"
+      - ".github/workflows/sql-layer.yml"
+      - ".github/workflows/sql-layer-hammerdb-nightly.yml"
   pull_request:
     branches: [main]
     paths-ignore:
       - "**.md"
       - "docs/**"
+      - "bytecaskdb-sql-layer/**"
+      - "scripts/check_contract_vocabulary.py"
+      - "scripts/test_check_contract_vocabulary.py"
+      - ".github/workflows/contract.yml"
+      - ".github/workflows/sql-layer.yml"
+      - ".github/workflows/sql-layer-hammerdb-nightly.yml"
   workflow_dispatch:
 
 # Required for GitHub Pages deployment.
