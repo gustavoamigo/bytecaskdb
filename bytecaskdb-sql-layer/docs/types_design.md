@@ -1,19 +1,18 @@
 # SQL types, value semantics and the shared codec
 
-Status: design, decided (#490); the codec it specifies is implemented in
-`bytecaskdb-sql-layer/codec/` with the property tests in
-`bytecaskdb-sql-layer/tests/codec_test.cpp`. This document decides how SQL
-values map onto the four physical types of the plan API
-(`docs/plan_api_design.md`), what nulls, comparisons and arithmetic mean,
-which functions the compiler may call, and the two on-disk formats the
-sql-layer and the MariaDB plugin will share: the key encoding and the row
-format. Nothing in the engine changes.
+Status: **built** (#490): the codec is `bytecaskdb-sql-layer/codec/`, with
+its property tests in `tests/codec_test.cpp`. This covers how SQL values
+map onto the plan API's four physical types (`plan_api_design.md`), what
+nulls, comparisons and arithmetic mean, which functions the compiler may
+call, and the two on-disk formats: the key encoding and the row format,
+which the MariaDB plugin would share (*What the plugin adopts*). Nothing in
+the engine changes for it.
 
 The plan API deals in `i64`, `f64`, `bool` and `bytes`. Everything SQL knows
 beyond those four is a rule the compiler applies: a scale, an epoch, a range
 check, a collation. Those rules live here.
 
-## Stage-1 types
+## Types
 
 The binder accepts these types and rejects every other. A rejected type is a
 bind error with the position of the type name.
@@ -30,9 +29,10 @@ bind error with the position of the type name.
 | `DATE` | `i64` | Days since 1970-01-01, in PostgreSQL's range: 4714-11-24 BC to 5874897-12-31. |
 | `TIME` | `i64` | Microseconds since midnight, in [0, 86 400 000 000]: 24:00:00 included, as in PostgreSQL. |
 
-Rejected in stage 1, each for a reason that is not "later": `NUMERIC` with
+Rejected, each for a reason that is not "later": `NUMERIC` with
 no precision or with p > 18 (does not fit `i64`); `CHAR(n)` (its
-blank-padded comparison is a collation rule, and stage 1 has none);
+blank-padded comparison is a collation rule, and there are no collations
+yet);
 `TIMESTAMP WITH TIME ZONE` (a request carries no time zone yet, #491);
 `INTERVAL`, `UUID`, `JSON`, arrays, enums, composite types, `BIT`, `MONEY`,
 `SERIAL` (sequences are a runtime service, deferred in the plan API).
@@ -116,15 +116,14 @@ SQL's three-valued logic, as PostgreSQL has it:
   present value's `0x01`. Under `DESC` the whole part is inverted and nulls
   sort last. So an `ORDER BY` on an index gives `NULLS FIRST` for `ASC` and
   `NULLS LAST` for `DESC`, as MariaDB and SQLite do; PostgreSQL's default is
-  the reverse. The MVP's plans give PostgreSQL's placement for one nullable
+  the reverse. Today's plans give PostgreSQL's placement for one nullable
   ordered `ASC` index part directly after the equality prefix, by scanning
   its present values and its NULL part as two ranges
   (`docs/frontend_design.md`, *NULLs in an ordered part*); other nullable
   orders are refused (#533).
 - **A null parameter in a key lookup matches nothing**: `WHERE id = $1`
   with `$1` null returns no rows and `UPDATE`/`DELETE` affect none. The
-  compiler emits the null test before building the key, as the prototype's
-  plans do.
+  compiler emits the null test before building the key.
 - **A range never includes nulls.** `NULL < x` is unknown, so a scan of a
   nullable key column with no lower bound starts at the successor of the
   null part, past the null entries that sort first; a lower bound excludes
@@ -184,14 +183,14 @@ result scale fixed by the operator: `+` and `−` keep the common scale; `×`
 has scale s1 + s2; `÷` has the common scale, computed as (a × 10^s) ÷ b and
 rounded half away from zero, which the compiler emits with `bc_mul`,
 `bc_div` and `bc_mod`. Any intermediate outside `i64` is `BC_E_ARITH`:
-a product of two 18-digit values is one, and stage 1 says so rather than
-widening. Assignment to a column rounds to the column's scale and
-range-checks the integer digits (*Stage-1 types*).
+a product of two 18-digit values is one, and the layer says so rather
+than widening. Assignment to a column rounds to the column's scale and
+range-checks the integer digits (*Types*).
 
 **Double arithmetic is plain IEEE 754.** `+ − × ÷` are the C operators, the
 plan language allows them, and every input has a defined result: `1.0 / 0.0`
 is infinity and `0.0 / 0.0` is NaN. PostgreSQL raises on a double division
-by zero and stage 1 does not; it is the one place where the IEEE result is
+by zero and the layer does not; it is the one place where the IEEE result is
 kept, because the subset has no way to raise a numeric error from a double
 expression and a branch per division is not worth the case. Comparison
 follows PostgreSQL: NaN equals NaN and is greater than every other value,
@@ -208,12 +207,12 @@ decimal (scaling, checked; decimal to integer truncates toward zero);
 decimal and double; boolean and integer (0 and 1; any non-zero integer is
 true); timestamp and date (floor and multiplication); text and binary
 (identity, with the UTF-8 check on the way to text, done by the runtime).
-Casts to and from text (`'42'::INTEGER`, `now()::TEXT`) are not in stage 1
+Casts to and from text (`'42'::INTEGER`, `now()::TEXT`) are not supported,
 except for literals, which the binder folds at compile time.
 
 ## The function library
 
-The compiler may emit these in stage 1. Each is either an operator the
+The compiler may emit these. Each is either an operator the
 language has, or a helper declared in `bc_plan.h`, or a value the runtime
 binds as a hidden parameter. Helpers not yet declared are added to the
 header, with tests, by the compiler PR that first emits them (#492); this
@@ -231,7 +230,7 @@ document fixes the set, not the signatures.
 | `EXTRACT(field FROM ts)` for `YEAR`…`SECOND`, `DATE_TRUNC` to a day or coarser | integer arithmetic on the microsecond value and a civil-date helper |
 | `CAST` | *Casts*, above |
 
-Excluded in stage 1: `UPPER`, `LOWER`, `TRIM`, `POSITION`, `LIKE` beyond a
+Excluded: `UPPER`, `LOWER`, `TRIM`, `POSITION`, `LIKE` beyond a
 prefix, regular expressions (all need character semantics or a collation);
 `ROUND`, `TRUNC`, `FLOOR`, `CEIL` on doubles (arithmetic on doubles stays
 plain); `RANDOM`, sequences and `gen_random_uuid` (a plan is pure); text
@@ -256,8 +255,8 @@ namespaces are `0x01` catalog, `0x02` table rows, `0x03` index entries.
 
 Integer SQL types of every width, decimals, timestamps, dates and times are
 `i64` parts; the order they need is the integer order of their stored value,
-which the sign flip gives. Text is a `bytes` part in stage 1; when collations
-arrive, a text part under a non-binary collation is the collation's sort key
+which the sign flip gives. Text is a `bytes` part, compared as bytes; when
+collations arrive, a text part under a non-binary collation is the collation's sort key
 (its weights) written as `bytes`, the row holding the original text. This is
 the slot the plugin's `key_format` 2 uses for `CHARSET_INFO::strnxfrm`
 weights, and the decoder for such a part returns the weights, not the text:
@@ -339,8 +338,7 @@ position; a column whose bit is clear is null, whether the writer set it
 null or did not know the column. That second case is what makes short rows
 work: a row written before a column was added has the column's bit clear
 and reads as null with no further test. `bc_col_null(row, col)` answers from
-the bit, once the column is known not to be damaged (below), and the
-position argument revision 2 of the plan API added to it is not needed; `docs/plan_api_design.md` is updated accordingly. One decoder,
+the bit, once the column is known not to be damaged (below). One decoder,
 `row_column`, reads every column of a stored row, and says it is absent, a
 value, or malformed. Absent is a clear bit, or no bit: NULL. Malformed is a
 header that does not parse, or a set bit for a column the row does not
@@ -348,8 +346,7 @@ hold: a fixed column past the fixed region, a variable slot past `nvar`, or
 a `var_end` that runs past the row. Malformed is `BC_E_CORRUPT` on every
 path that reads a column (`bc_col_*`, `bc_emit_col`, `bc_row_from`, a
 key built from a row, SQL results, `Database::table_rows`), never read as 0,
-empty or NULL (#520). Plans name columns by id since plan API revision 5,
-and the runtime maps an id to its position; the decoder still refuses an
+empty or NULL (#520). Plans name columns by id, and the runtime maps an id to its position; the decoder still refuses an
 offset inside the header or off a word boundary. Nothing is read past
 the end.
 
@@ -376,11 +373,11 @@ var_end offsets are not known until the variable data is laid out in either
 design. A reader loses a little: the trailer is found through `row_bytes`,
 which is in the header anyway, so the structure is described in two places,
 and a row cut short loses its description with its tail, where a header
-survives truncation and names what is missing. Header fields are kept, as
-the plan API's revision 2 has them.
+survives truncation and names what is missing. So the fields are in the
+header.
 
-**The row's length is 32 bits.** The u16 `row_bytes` the prototype carried
-capped a row at 64 KiB, a quarter of what MariaDB allows in a row and below
+**The row's length is 32 bits.** A u16 `row_bytes` would cap a row at
+64 KiB, a quarter of what MariaDB allows in a row and below
 what a `TEXT` column is for. `row_bytes` is u32 and the row's ceiling is the
 engine's value limit: 256 MiB less a byte as a hard ceiling, enforced by
 `bc_row_end` as `BC_E_LIMIT`, and the configured `max_value_bytes`, enforced
@@ -391,8 +388,8 @@ column and the bitmap bounds the column count, so it never nears 64 KiB.
 version of its own: every row belongs to a table, and every table's record
 in the catalog carries the record format, which names the row format its
 positions are for. This row format is the one of record formats 2 and 3
-(3 is the catalog record of #489). The prototype's format 1
-(an 8-byte header, a 16-bit length, a bitmap meaning null) is refused when
+(3 is the catalog record of #489). Format 1, from an earlier build
+(an 8-byte header, a 16-bit length, a bitmap meaning null), is refused when
 the catalog loads, with an error that says the database is from an earlier
 build, so no row of it is ever decoded under this format.
 
@@ -408,8 +405,8 @@ or a variable one by its type. The runtime decodes them with that layout.
 
 ## What the plugin adopts
 
-The plugin keeps its own key and row codecs until the shared ones are proven
-by the hand-written plans and the fault tests (#496). It then adopts them as
+Deferred (#488). The plugin keeps its own key and row codecs. It would adopt
+the shared ones as
 it adopted its last two key formats: a new per-table `key_format` value
 means "the shared key encoding" and a new row-format version means "the
 shared row format"; new tables use them and existing tables keep theirs
@@ -420,8 +417,7 @@ layouts into the codec's neutral input, a mapping from MariaDB's types onto
 the physical types above, and the collation weights taken from
 `CHARSET_INFO` and written as `bytes` parts. The sql-layer gains nothing
 from the plugin and includes nothing of it; the plugin links the sql-layer's
-archive through a header bridge (#488). Nothing in the plugin changes in the
-PR that lands this document.
+archive through a header bridge (#488).
 
 Two things the codec does not decide, the catalog does
 (`docs/catalog_design.md`): index keys are prefixed by the index

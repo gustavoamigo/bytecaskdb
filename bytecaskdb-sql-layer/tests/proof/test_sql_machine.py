@@ -73,7 +73,7 @@ TYPES = [o.BIGINT, o.INTEGER, o.SMALLINT, o.DOUBLE, o.REAL, o.numeric(6, 2), o.B
 ARITHMETIC = {"bigint": "bigint", "smallint": "smallint", "integer": "integer", "numeric(6,2)": "numeric",
               "numeric(18,0)": "numeric"}
 # The columns SUM and MIN are generated over: the types the layer takes, but
-# BIGINT for SUM, whose sum leaves int64 (docs/testing_design.md, *Known
+# BIGINT for SUM, whose sum leaves int64 (docs/frontend_design.md, *Known
 # differences*).
 SUMMED = ("smallint", "integer", "numeric(6,2)")
 MINIMISED = SUMMED + ("bigint",)
@@ -210,7 +210,7 @@ def values(t: o.Type) -> st.SearchStrategy:
         if not t.length:
             return st.text(chars, max_size=6)
         # PostgreSQL truncates a VARCHAR(n) whose excess is only spaces; the
-        # layer refuses it (docs/testing_design.md, *Known differences*).
+        # layer refuses it (docs/frontend_design.md, *Known differences*).
         n = t.length
         return st.text(chars, max_size=n + 2).filter(lambda v: len(v) <= n or v[n:].strip(" "))
     return st.binary(max_size=6)
@@ -521,11 +521,11 @@ class SqlMachine(RuleBasedStateMachine):
             # A refused statement aborts the transaction on both sides, as
             # any statement PostgreSQL refuses does.
             assert self.txn.is_aborted
-            assert o.run_pg(self.pg.conn, "SELECT no_such_column FROM " + name).error == "refused"
+            assert o.run_pg(self.pg.conn, "SELECT no_such_column FROM " + name).error == "42703"
 
     def select(self, name: str, targets: list[str], where: list[tuple[str, str, object]],
                order: list[tuple[str, bool]] = (), limit: int | None = None, count: str | None = None,
-               fn: str = "count", distinct: bool = False) -> None:
+               fn: str = "count", distinct: bool = False, for_update: bool = False) -> None:
         """SELECT targets (or the aggregate fn(count), "*" for COUNT(*))
         WHERE each (column, operator, value) ... ORDER BY ... LIMIT ...: on
         both sides when the planner serves it, else the layer must refuse it
@@ -537,7 +537,7 @@ class SqlMachine(RuleBasedStateMachine):
         conds = [compared(t, c, op, v, i + 1, False) for i, (c, op, v) in enumerate(where)]
         pg_conds = [compared(t, c, op, v, i + 1, True) for i, (c, op, v) in enumerate(where)]
         tail = (" ORDER BY " + ", ".join(c + (" DESC" if d else "") for c, d in order) if order else "") + (
-            f" LIMIT {limit}" if limit is not None else "")
+            f" LIMIT {limit}" if limit is not None else "") + (" FOR UPDATE" if for_update else "")
         sql = f"SELECT {select} FROM {name} WHERE {' AND '.join(conds)}{tail}"
         params = [param_value(v) for _, _, v in where]
         types = [t.column(c).type for c in cols]
@@ -549,7 +549,7 @@ class SqlMachine(RuleBasedStateMachine):
             self.both(sql, params, pg_sql=pg_sql, types=types)  # one row, or none under LIMIT 0
             return
         layer = self.layer(sql, params, types)
-        full = o.run_pg(self.pg.conn, pg_sql.removesuffix(f" LIMIT {limit}" if limit is not None else ""), params)
+        full = o.run_pg(self.pg.conn, pg_sql.removesuffix(" FOR UPDATE").removesuffix(f" LIMIT {limit}" if limit is not None else ""), params)
         assert layer.error == full.error, f"{sql} {params!r}: the layer {layer.error or 'ran it'} ({layer.detail}), PostgreSQL {full.error or 'ran it'} ({full.detail})"
         if layer.error is not None:
             return
@@ -1158,7 +1158,7 @@ def test_every_statement_after_a_failed_one_is_25P02(dsn):
         m.check()
         # A statement refused before it runs aborts a transaction too.
         m.begin()
-        assert m.insert("t9", {"c0": 3}, all_columns=False).error == "refused"
+        assert m.insert("t9", {"c0": 3}, all_columns=False).error == "42P01"
         assert m.lookup("t0", (1,)).error == "25P02"
         m.rollback()
     finally:
@@ -1170,14 +1170,14 @@ def test_create_and_drop_refusals(dsn):
     try:
         t = Table("t0", [Column("c0", o.SMALLINT)], ["c0"])
         assert m.create(t).error is None
-        assert m.create(t).error == "refused"  # already exists
-        assert m.create(Table("t1", [Column("c0", o.BIGINT), Column("c0", o.TEXT)], ["c0"])).error == "refused"
-        assert m.create(Table("t1", [Column("c0", o.BIGINT)], ["zz"])).error == "refused"
+        assert m.create(t).error == "42P07"  # already exists
+        assert m.create(Table("t1", [Column("c0", o.BIGINT), Column("c0", o.TEXT)], ["c0"])).error == "42701"
+        assert m.create(Table("t1", [Column("c0", o.BIGINT)], ["zz"])).error == "42703"
         m.create_without_pk(Table("t1", [Column("c0", o.BIGINT)], []))
-        assert m.drop("t2", if_exists=False).error == "refused"
+        assert m.drop("t2", if_exists=False).error == "42P01"
         assert m.drop("t2", if_exists=True).error is None
         assert m.drop("t0", if_exists=False).error is None
-        assert m.insert("t0", {"c0": 1}, all_columns=False).error == "refused"
+        assert m.insert("t0", {"c0": 1}, all_columns=False).error == "42P01"
         m.check()
     finally:
         m.teardown()
@@ -1620,6 +1620,66 @@ def test_column_plus_parameter_across_bigint_and_scale_0_decimal(dsn):
         m.teardown()
 
 
+def binder_machine(dsn) -> SqlMachine:
+    """A machine with one table of every type a binder fault needs, and a row."""
+    m = fixed(dsn)
+    m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.TEXT), Column("c2", o.DOUBLE),
+                          Column("c3", o.BOOLEAN), Column("c4", o.BYTEA), Column("c5", o.numeric(6, 2)),
+                          Column("c6", o.BIGINT)], ["c0"]))
+    m.create(Table("t1", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.TEXT)], ["c0"]))
+    m.insert("t0", {"c0": 1, "c1": "a", "c2": 1.5, "c3": True, "c4": b"x", "c5": decimal.Decimal("1.50"), "c6": 7},
+             all_columns=True)
+    return m
+
+
+def test_binder_refusals_carry_postgresqls_sqlstate(dsn):
+    """A statement the binder refuses for a fault PostgreSQL also refuses gets
+    PostgreSQL's SQLSTATE (#548). PostgreSQL gets each statement with its $n as
+    written and untyped (run_pg_numbered), as the layer reads it: psycopg
+    would send a repeated $1 as two parameters."""
+    m = binder_machine(dsn)
+    try:
+        for sql, params, state in (
+            ("SELECT c0 FROM nope WHERE c0 = $1", (1,), "42P01"),
+            ("SELECT c0 FROM t0 WHERE t9.c0 = $1", (1,), "42P01"),
+            ("SELECT zz FROM t0 WHERE c0 = $1", (1,), "42703"),
+            ("UPDATE t0 SET zz = $1 WHERE c0 = $2", (1, 2), "42703"),
+            ("SELECT c1 FROM t0, t1 WHERE t0.c0 = $1 AND t1.c0 = $2", (1, 2), "42702"),
+            ("INSERT INTO t0 (c0, c0) VALUES ($1, $2)", (1, 2), "42701"),
+            ("SELECT c1, count(*) FROM t0 WHERE c0 = $1", (1,), "42803"),
+            ("UPDATE t0 SET c1 = count(*) WHERE c0 = $1", (1,), "42803"),
+            # No aggregate of that type: 42883.
+            ("SELECT sum(c1) FROM t0 WHERE c0 = $1", (1,), "42883"),
+            ("SELECT sum(c3) FROM t0 WHERE c0 = $1", (1,), "42883"),
+            ("SELECT min(c4) FROM t0 WHERE c0 = $1", (1,), "42883"),
+            # A $n compared with two columns no operator relates: 42883.
+            ("SELECT c0 FROM t0 WHERE c1 = $1 AND c0 = $1", ("a",), "42883"),
+            ("SELECT c0 FROM t0 WHERE c0 = $1 AND c1 = $1", (1,), "42883"),
+            ("SELECT c0 FROM t0 WHERE c3 = $1 AND c0 = $1", (True,), "42883"),
+            ("SELECT c0 FROM t0 WHERE c2 = $1 AND c3 = $1", (1.5,), "42883"),
+            # A column assigned from a column of a type that has no assignment cast to it: 42804.
+            ("UPDATE t0 SET c6 = c1 WHERE c0 = $1", (1,), "42804"),
+            ("UPDATE t0 SET c6 = c3 WHERE c0 = $1", (1,), "42804"),
+            ("UPDATE t0 SET c3 = c6 WHERE c0 = $1", (1,), "42804"),
+            ("UPDATE t0 SET c2 = c3 WHERE c0 = $1", (1,), "42804"),
+            ("UPDATE t0 SET c4 = c6 WHERE c0 = $1", (1,), "42804"),
+            # 0A000 and 22003.
+            ("SELECT sum(c6) FROM t0 WHERE c0 = $1 FOR UPDATE", (1,), "0A000"),
+            ("UPDATE t0 SET c5 = c5 + 100000000000000000 WHERE c0 = $1", (1,), "22003"),
+        ):
+            layer = o.run_layer(m.db, sql, params)
+            pg = o.run_pg_numbered(m.pg.conn, sql, params)
+            assert layer.error == pg.error == state, (sql, layer, pg)
+        # 42P18, in the same loop: $1 has no use to type it.
+        sql = "SELECT c0 FROM t0 WHERE c0 = $2"
+        layer = o.run_layer(m.db, sql, (1, 1))
+        pg = o.run_pg_numbered(m.pg.conn, sql, (1, 1))
+        assert layer.error == pg.error == "42P18", (sql, layer, pg)
+        m.check()
+    finally:
+        m.teardown()
+
+
 def test_a_computed_bound_past_integer_is_22003_before_the_plan_runs(dsn):
     """WHERE c > $1 - k: $n is an INTEGER, so a $n past INTEGER, int64's edge
     included, is 22003 before the plan runs and its addition (bc_add) never
@@ -1635,6 +1695,57 @@ def test_a_computed_bound_past_integer_is_22003_before_the_plan_runs(dsn):
             for edge in (BIGINT_HIGH, BIGINT_LOW, 2**31, -(2**31) - 1):
                 assert m.layer(sql, (edge,), types).error == "22003", (op, edge)
             assert m.both(sql, (0,), types=types).error is None
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_forms_the_layer_does_not_support_are_refused_without_a_sqlstate(dsn):
+    """A statement PostgreSQL runs, which the layer refuses as a form it does not
+    support, is 42601: the layer claims PostgreSQL's code only where
+    PostgreSQL refuses the statement with it. No row matches a WHERE here, so
+    PostgreSQL's run leaves the two sides alike."""
+    m = binder_machine(dsn)
+    try:
+        for sql, params in (
+            ("UPDATE t0 SET c2 = c6 WHERE c0 = $1", (99,)),  # bigint to double precision
+            ("UPDATE t0 SET c6 = c2 WHERE c0 = $1", (99,)),
+            ("UPDATE t0 SET c1 = c6 WHERE c0 = $1", (99,)),  # any type to text
+            ("UPDATE t0 SET c1 = c3 WHERE c0 = $1", (99,)),
+            ("SELECT c0 FROM t0 WHERE c5 = $1 AND c2 = $1", (1,)),  # numeric and double precision
+            ("SELECT c0 FROM t0 WHERE c2 = $1 AND c6 = $1", (1.5,)),
+            ("UPDATE t0 SET c1 = $1 WHERE c6 = $1 AND c0 = $2", (1, 99)),  # PostgreSQL types the WHERE's $1 first
+            ("UPDATE t0 SET c6 = c6 + $1 WHERE c0 = $2 AND c2 = $1", (1, 99)),
+            ("SELECT sum(c2) FROM t0 WHERE c0 = $1", (1,)),
+            ("SELECT min(c2) FROM t0 WHERE c0 = $1", (1,)),
+            ("SELECT min(c1) FROM t0 WHERE c0 = $1", (1,)),
+        ):
+            layer = o.run_layer(m.db, sql, params)
+            pg = o.run_pg_numbered(m.pg.conn, sql, params)
+            assert pg.error is None, (sql, pg)
+            assert layer.error == "refused" and layer.sqlstate == "42601", (sql, layer)
+        # PostgreSQL refuses an untyped $1 assigned to two columns of different types
+        # (42P08, not 42804): the layer does not claim a code for it either.
+        sql = "UPDATE t0 SET c2 = $1, c6 = $1 WHERE c0 = $2"
+        layer = o.run_layer(m.db, sql, (2.0, 99))
+        pg = o.run_pg_numbered(m.pg.conn, sql, (2.0, 99))
+        assert layer.sqlstate == "42601" and pg.sqlstate == "42P08", (sql, layer, pg)
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_create_table_of_an_existing_name_refuses_in_postgresqls_order(dsn):
+    """A repeated column or a missing key column is refused before an existing
+    name, as PostgreSQL does. (A table without a key, or with a column of an
+    unsupported type or default, never reaches the catalog: the binder refuses
+    it first, 42601, where PostgreSQL says 42P07. The catalog's own order for
+    those is its unit test's.)"""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False)], ["c0"]))
+        assert m.create(Table("t0", [Column("c0", o.BIGINT), Column("c0", o.TEXT)], ["c0"])).error == "42701"
+        assert m.create(Table("t0", [Column("c0", o.BIGINT)], ["zz"])).error == "42703"
         m.check()
     finally:
         m.teardown()
@@ -1758,7 +1869,7 @@ def test_sum_and_min_over_rows_nulls_and_none(dsn):
 def test_sum_past_int64_is_an_error(tmp_path):
     """A SUM whose running total leaves int64, a BIGINT's or a DECIMAL's in its
     scaled integer, fails the statement as SQLSTATE 22003, where PostgreSQL's
-    numeric would hold it (docs/testing_design.md, *Known differences*)."""
+    numeric would hold it (docs/frontend_design.md, *Known differences*)."""
     db = bytecask_sql.open(str(tmp_path))
     try:
         db.execute("CREATE TABLE t (k BIGINT, n BIGINT NOT NULL, v BIGINT, PRIMARY KEY (k, n))")
@@ -1938,6 +2049,38 @@ def test_a_join_on_a_column(dsn):
             m.insert("t3", {"c0": c0, "c1": c1}, all_columns=True)
         m.join_on("t2", "t3", [("c0", ">=", 1)], [("c0", ("col", "c1"))], [], [("t2", "c0"), ("t3", "c1")])
         m.select("t2", [], [("c0", ">=", 1)], count="c1", distinct=True)
+    finally:
+        m.teardown()
+
+
+def test_an_empty_select_list_returns_a_row_of_no_columns_per_match(dsn):
+    """SELECT FROM t WHERE …: one empty row per match, none for no match, and
+    one per row of a range."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER, nullable=False),
+                              Column("c2", o.TEXT)], ["c0", "c1"]))
+        for c1 in (1, 2, 3):
+            m.insert("t0", {"c0": 1, "c1": c1, "c2": "a"}, all_columns=True)
+        m.insert("t0", {"c0": 2, "c1": 1, "c2": None}, all_columns=True)
+        for where in ([("c0", "=", 1), ("c1", "=", 2)], [("c0", "=", 1), ("c1", "=", 9)], [("c0", "=", 9)],
+                      [("c0", "=", None)], [("c0", "=", 1)], [("c0", ">=", 1)]):
+            m.select("t0", [], where)
+        m.select("t0", [], [("c0", "=", 1)], limit=2)
+        # Served from an index alone, with no row read.
+        m.create_index("t0", Index("t0_ix0", [("c2", False)]))
+        for where in ([("c2", "=", "a")], [("c2", "=", None)], [("c2", ">=", "a")]):
+            m.select("t0", [], where)
+        # FOR UPDATE locks what it returns; here, rows of no columns.
+        for where in ([("c0", "=", 1), ("c1", "=", 2)], [("c0", "=", 1)], [("c0", "=", 9)]):
+            m.select("t0", [], where, for_update=True)
+        # A join of two point lookups.
+        m.create(Table("t1", [Column("c0", o.INTEGER, nullable=False)], ["c0"]))
+        m.insert("t1", {"c0": 1}, all_columns=True)
+        m.join(("t0", "t1"), [], ((1, 2), (1,)))
+        m.join(("t0", "t1"), [], ((1, 2), (9,)))
+        m.join(("t0", "t1"), [], ((1, 9), (1,)))
+        m.join(("t0", "t1"), [], ((1, 2), (1,)), on=True)
     finally:
         m.teardown()
 
