@@ -2247,7 +2247,13 @@ void bc_emit_begin(bc_ctx* cx) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return;
   if (!cx->has_ref) {
-    cx->fail(BC_L_PLAN, "the plan declares no schema ref, so no result layout");
+    cx->fail(BC_E_HANDLE, "no plan is running: bc_ctx_run sets the schema ref that declares the result layout");
+    return;
+  }
+  // A SELECT may declare no result types (SELECT FROM t); a plan that writes
+  // tables and declares none returns no rows.
+  if (cx->verified.result_types.empty() && !cx->verified.written.empty()) {
+    cx->fail(BC_L_PLAN, "a plan that writes declares no result types, so it returns no rows");
     return;
   }
   if (cx->emit) {

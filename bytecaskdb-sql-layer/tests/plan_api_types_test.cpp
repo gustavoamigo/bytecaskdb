@@ -700,15 +700,44 @@ void emit_empty_rows(bc_ctx* cx) {
     bc_emit_end(cx);
   }
 }
+
+// Like run, but the ref lists no table written: a SELECT's.
+auto run_read_only(Fixture& f, bc_plan_fn plan) -> int {
+  auto ps = params({});
+  SchemaRef sr{all_objects(f.cat()), {}, all_cols(f.cat()), {}, f.cat().version()};
+  auto ref = sr.get();
+  return bc_execute(f.cx, plan, &ref, &ps, {}, false, 0);
+}
+
+void emit_begin_outside_a_run(bc_ctx* cx) { bc_emit_begin(cx); }
 }  // namespace
 
-TEST_CASE("plan API: a ref that declares no result types allows rows of no columns", "[sql][algebra]") {
+TEST_CASE("plan API: a read-only ref that declares no result types allows rows of no columns", "[sql][algebra]") {
   Fixture f;
-  CHECK(run(f, emit_empty_rows, {}) == BC_COMMITTED);
+  CHECK(run_read_only(f, emit_empty_rows) == BC_COMMITTED);
   CHECK(f.results({}).empty());
   seed_t(f);
-  CHECK(run(f, emit_empty_rows, {}) == BC_COMMITTED);
+  CHECK(run_read_only(f, emit_empty_rows) == BC_COMMITTED);
   CHECK(f.results({}) == std::vector<std::vector<bc_value>>(3));
+  // The empty layout still has no column to emit against.
+  CHECK(run_read_only(f, emit_without_types) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
+}
+
+TEST_CASE("plan API: a write plan returns no rows, and bc_emit_begin needs a running plan", "[sql][algebra]") {
+  Fixture f;
+  seed_t(f);
+  // The ref lists tables written and no result types: an INSERT, UPDATE or DELETE.
+  CHECK(run(f, emit_empty_rows, {}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LAYOUT);
+  CHECK(bc_error_detail(f.cx) == BC_L_PLAN);
+  // Outside bc_ctx_run no ref is set.
+  auto ps = params({});
+  bc_ctx_begin(f.cx, &ps, {});
+  emit_begin_outside_a_run(f.cx);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+  bc_ctx_reset(f.cx);
 }
 
 TEST_CASE("plan API: result rows follow the schema ref's types; limits and types are checked", "[sql][algebra]") {
@@ -719,7 +748,7 @@ TEST_CASE("plan API: result rows follow the schema ref's types; limits and types
   bc_ctx_run(f.cx, emit_without_types, nullptr);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
   bc_ctx_reset(f.cx);
-  // One that declares no result types: the plan emits against nothing.
+  // One that lists tables written and no result types: a write plan returns no rows.
   CHECK(run(f, emit_without_types, {}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
   CHECK(bc_error_detail(f.cx) == BC_L_PLAN);

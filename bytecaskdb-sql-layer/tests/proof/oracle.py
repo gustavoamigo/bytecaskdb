@@ -234,7 +234,7 @@ def raw_text(cur) -> tuple:
     """The rows a cursor holds, as the bytes of their text format, and each
     column's type OID."""
     res = cur.pgresult
-    if res is None or not cur.description:
+    if res is None or cur.description is None:
         return ()
     oids = tuple(res.ftype(c) for c in range(res.nfields))
     return (oids, tuple(tuple(res.get_value(r, c) for c in range(res.nfields)) for r in range(res.ntuples)))
