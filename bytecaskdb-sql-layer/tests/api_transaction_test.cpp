@@ -159,6 +159,41 @@ TEST_CASE("embedded API: a transaction past its buffer bound is BC_E_LIMIT and a
   CHECK(balance(*db, 0) == std::nullopt);
 }
 
+TEST_CASE("embedded API: a statement over its memory budget is 54000 and leaves nothing behind, alone or in a transaction",
+          "[sql][api][txn][memory]") {
+  CHECK_THROWS_AS(Database::open(sql_test::TempDir{"api_mem0"}.path(), {.statement_memory_bytes = 0}),
+                  std::invalid_argument);
+  sql_test::TempDir dir{"api_mem"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 4096});
+  db->execute("CREATE TABLE acct (id BIGINT PRIMARY KEY, bal BIGINT NOT NULL)");
+  for (std::int64_t i = 1; i <= 200; ++i) db->execute("INSERT INTO acct VALUES ($1, $2)", {i, i});
+  auto state = [](auto&& run) -> std::string {
+    try {
+      run();
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "00000";
+  };
+  // 200 result rows, and 200 rows built, each pass 4 KiB.
+  CHECK(state([&] { (void)db->execute("SELECT id, bal FROM acct WHERE id >= $1", {std::int64_t{1}}); }) == "54000");
+  CHECK(state([&] { (void)db->execute("UPDATE acct SET bal = bal + 1 WHERE id >= $1", {std::int64_t{1}}); }) ==
+        "54000");
+  CHECK(balance(*db, 1) == 1);
+  CHECK(balance(*db, 200) == 200);
+  // In a transaction it aborts the transaction: the earlier statement's write goes too.
+  auto t = db->begin();
+  t.execute("INSERT INTO acct VALUES ($1, $2)", {std::int64_t{1000}, std::int64_t{1}});
+  CHECK(state([&] { (void)t.execute("UPDATE acct SET bal = bal + 1 WHERE id >= $1", {std::int64_t{1}}); }) ==
+        "54000");
+  CHECK(t.is_aborted());
+  CHECK(t.commit() == CommitOutcome::RolledBack);
+  CHECK(balance(*db, 1000) == std::nullopt);
+  CHECK(balance(*db, 1) == 1);
+  // The budget is each statement's: one under it runs.
+  CHECK(db->execute("SELECT id, bal FROM acct WHERE id >= $1", {std::int64_t{191}}).rows.size() == 10);
+}
+
 TEST_CASE("embedded API: destroying an open transaction rolls it back; close() ends the open ones",
           "[sql][api][txn]") {
   sql_test::TempDir dir{"api_txn"};

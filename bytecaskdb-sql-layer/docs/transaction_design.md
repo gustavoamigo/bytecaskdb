@@ -406,8 +406,8 @@ differences*.
   into a plan (`CONTRACT.md`, *Plan safety*). An allocation-failure sweep
   over a transaction's statements proves it, as `plan_alloc_faults_test`
   does for executions.
-- **Budget.** Each statement keeps its own `bc_budget`, as each execution
-  does. A transaction-wide budget, or a request deadline turned into one,
+- **Budget.** Each statement keeps its own `bc_budget`, its work and its
+  memory, as each execution does. A transaction-wide budget, or a request deadline turned into one,
   is later (*Later*). Nothing here blocks it: the
   budget is passed per statement.
 - **Duration.** An open transaction holds a snapshot, which keeps the data

@@ -1,13 +1,14 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 5. This specifies the plan API of
+Status: **built**, revision 6 (revision 5 with the statement memory
+budget of `planner_design.md`, *Memory*). This specifies the plan API of
 `bytecaskdb-sql-layer`: the calls a generated plan makes, the guarantees
 they give, and the language plans are written in. `algebra/` implements
 it, except the sorters, the hash tables and the aggregates' slots, whose
 calls set `BC_E_HANDLE` (`bc_plan.h`'s header comment lists what is
 implemented). Nothing in the engine changes for it. `planner_design.md`
-proposes the next changes: a statement memory budget and working sorters
-and hash tables.
+proposes the next changes: the lifetime rule for a loop's views, and
+working sorters and hash tables.
 
 **Plans are only ever ours** (owner decision, 2026-10-20). The layer runs
 only plans its own compiler generates, and nothing is designed for plan
@@ -60,9 +61,10 @@ it, has these properties in every tier, whatever its logic does:
 - **Terminating and bounded.** Every loop is driven by an API iteration,
   there is no recursion and no counted loop, and the API enforces a work
   budget and a deadline. A plan ends within its budget whatever its shape.
-- **Bounded in memory.** The arena and every ephemeral structure have
-  declared limits. Exceeding one is an error, never a spill and never a
-  larger allocation.
+- **Bounded in memory.** A statement's memory has a budget, the
+  `max_bytes` of its `bc_budget`. Every byte the API allocates for the
+  statement is charged to it, and passing it is an error, never a spill
+  (*Memory*, below).
 - **Effect-free until commit.** The only outputs are a write plan and a
   result buffer, both discarded on any error and committed only by the
   runtime after the plan returns.
@@ -174,11 +176,35 @@ snapshot first, raises if the key is taken, and keeps a guard for the race.
 On a retry after a genuine race the check runs again on the fresh snapshot
 and reports the duplicate correctly.
 
-**The arena is the only memory.** Keys, rows, result rows, sorter and hash
-contents live in a bump arena owned by the context and reset after each
-execution. There is no heap allocation on the plan's path and no freeing.
-The arena has a size, blocking structures declare a byte bound at open, and
-exceeding either sets `BC_E_MEMORY`.
+**Memory is the statement's, and charged to its budget.** What the API
+allocates for a statement lives until `bc_ctx_reset`, except a cursor's
+current entry, which it replaces as it steps. Copies (`bc_get`'s records,
+`bc_pin`'s, keys from `bc_key_params` and `bc_key_successor`, decoded key
+parts) go in an arena of 64 KiB chunks, which grows as the statement
+needs and keeps one chunk across resets. Key and row builders hold their
+own key or row, and the result buffer its rows.
+
+Every byte of it is charged to the statement's memory budget,
+`bc_budget::max_bytes` (0: none), as `max_reads` charges work:
+- the keys it builds, as their parts are added, and the copies above;
+- each row a builder finishes;
+- a cursor's bounds and the entry it is on: its key, its value, an index
+  entry's fetched row and its `bc_col_key` keys, released as it steps;
+- each aggregate group's key;
+- each result row, with its 4-byte length.
+
+It counts bytes requested, not the allocator's overhead or the handle
+tables, so the accounting is deterministic: a plan holds the same bytes on
+every run over the same data. The write set is not charged: it is bounded
+by the engine's batch limit, and in a transaction by the transaction's
+bound. A charge past the budget is `BC_E_LIMIT` (SQLSTATE 54000), a limit
+the layer sets: checked before the bytes are allocated wherever their size
+is known first, and otherwise right after, so a statement passes it by at
+most one record. A real allocation failure, `std::bad_alloc`, stays
+`BC_E_MEMORY` (53200). Either error is sticky, so nothing the statement
+did is committed, and inside a transaction it aborts at `bc_txn_add`.
+There is no spill. The embedded API passes `DatabaseOptions::
+statement_memory_bytes`, 64 MiB by default.
 
 **The API meters the work.** `bc_ctx_begin` sets a budget in record reads
 and cursor steps and a deadline. Every read and every step charges the
@@ -259,9 +285,9 @@ enum bc_error_code {
   BC_OK = 0,
   BC_E_IO,          /* std::system_error from the engine */
   BC_E_CORRUPT,     /* CRC mismatch or unparseable record */
-  BC_E_MEMORY,      /* arena exhausted or an ephemeral bound exceeded */
+  BC_E_MEMORY,      /* an allocation failed (std::bad_alloc) */
   BC_E_BUDGET,      /* work budget or deadline exhausted */
-  BC_E_LIMIT,       /* key or value over the engine's limits */
+  BC_E_LIMIT,       /* key or value over the engine's limits, or the statement over its memory budget */
   BC_E_HANDLE,      /* stale, foreign or out-of-range handle, or a table, index or column the plan's
                        bc_schema_ref does not declare, or not of the type used: a plan bug */
   BC_E_ARITH,       /* integer overflow, division by zero, out-of-range conversion */
@@ -304,7 +330,8 @@ enum bc_layout_detail {  /* the detail of BC_E_LAYOUT; every BC_E_LAYOUT carries
 enum bc_commit_result { BC_COMMITTED, BC_CONFLICT, BC_FAILED /* see bc_error */ };
 
 typedef struct {
-  uint64_t max_reads;       /* record reads and cursor steps, together */
+  uint64_t max_reads;       /* record reads and cursor steps, together; 0 = none */
+  uint64_t max_bytes;       /* memory the statement holds, as bytes requested; 0 = none */
   uint64_t deadline_ns;     /* monotonic; 0 = none */
 } bc_budget;
 
@@ -369,7 +396,7 @@ including the handle and bounds checks.
 Called by the server, never by a plan.
 
 ```c
-bc_ctx *bc_ctx_new(bc_db *db, const bc_catalog *cat, uint32_t arena_bytes);
+bc_ctx *bc_ctx_new(bc_db *db, const bc_catalog *cat);
 void    bc_ctx_free(bc_ctx *);
 void    bc_ctx_begin(bc_ctx *, const bc_params *params, bc_budget budget);  /* takes the snapshot */
 void    bc_ctx_run(bc_ctx *, bc_plan_fn plan, const bc_schema_ref *checked_against);
@@ -387,13 +414,13 @@ int     bc_execute(bc_ctx *, bc_plan_fn, const bc_schema_ref *, const bc_params 
 
 | Function | What it does |
 |---|---|
-| `bc_ctx_new` | Allocates a context bound to an open engine and a catalog, with an arena of `arena_bytes`. The arena is allocated once and reused. |
-| `bc_ctx_begin` | Pins a catalog version and takes a snapshot that agrees with it (no DDL committed between the two), binds the parameters, sets the budget. Clears the error. Must precede `bc_ctx_run`. |
+| `bc_ctx_new` | Allocates a context bound to an open engine and a catalog. Its memory is bounded per statement, by the `bc_budget` each begins with, not per context. |
+| `bc_ctx_begin` | Pins a catalog version and takes a snapshot that agrees with it (no DDL committed between the two), binds the parameters, sets the budgets of work and memory. Clears the error. Must precede `bc_ctx_run`. |
 | `bc_ctx_check` | Verifies a `bc_schema_ref` against the pinned version as `bc_ctx_run` does, and runs nothing. False with `BC_E_LAYOUT` where `bc_ctx_run` would refuse the plan. What a server calls to learn whether a cached plan still fits the catalog before it checks parameters against that plan. |
 | `bc_ctx_run` | Verifies the plan's `bc_schema_ref` against the catalog version the context pinned at `bc_ctx_begin`, then calls the plan and returns when it returns. Compatible means: every table and index it names exists; every column it reads or sets exists in its table with the type it was compiled with; every table it writes exists. Verifying also maps each declared column to its offset or slot in the current layout. A null reference is `BC_E_HANDLE`. A plan that fails sets `BC_E_LAYOUT` and does not run; the server recompiles it from the SQL it cached. Adding a column or an index never invalidates a plan, since the runtime maintains whatever indexes the table has; a drop invalidates the plans that name what it drops. There is no version-equality check. |
 | `bc_ctx_commit` | Submits the write plan with `apply_batch`, guarded by `ensure_unchanged` on the catalog record of every table whose keys it writes, so a DDL on such a table committed since the snapshot makes it a conflict: the index entries the runtime wrote follow the pinned version's indexes, and a `CREATE INDEX` committed after the snapshot would otherwise miss the row. `BC_COMMITTED` on success. `BC_CONFLICT` when the engine reports a guard or write-write conflict: nothing was written. `BC_FAILED` when `bc_error` is set, including an error raised during the plan: nothing is committed. A plan with no writes commits nothing and returns `BC_COMMITTED`, whatever it guarded: guards protect writes, and what a read-only execution read is its snapshot's either way. |
 | `bc_ctx_next_result` | Iterates the result buffer. Rows are in the row format of the layout the plan emitted. The runtime, not a plan, sees raw pointers here; valid until `bc_ctx_reset`. |
-| `bc_ctx_reset` | Releases the snapshot, drops the write plan and result buffer, resets the arena, bumps every generation so every handle and view the plan held is invalid. |
+| `bc_ctx_reset` | Releases the snapshot, drops the write plan and result buffer, frees the statement's memory (the arena keeps one chunk) and its charge, bumps every generation so every handle and view the plan held is invalid. |
 | `bc_error_detail`, `bc_ctx_affected` | The constraint kind and object id of a raised error, or for `BC_E_LAYOUT` its class: `bc_ctx_run` refusing the reference (`BC_L_INCOMPATIBLE`, the only one a recompile cures), a row used with a table or column it is not of (`BC_L_ROW`), a malformed plan or reference (`BC_L_PLAN`), or a row of a retired layout generation (`BC_L_RETIRED`). The runtime sets every `BC_E_LAYOUT` with its detail; one without cannot be compiled; the affected-row count the last run recorded. Both read by the runtime after the plan returns. |
 | `bc_execute` | `begin`, `run`, `commit`; on `BC_CONFLICT`, `reset` and repeat up to `max_retries`. A `BC_E_CONSTRAINT` raised by the plan is final: no retry. Returns the commit result of the last attempt, except that a last attempt's conflict on a key it inserted, taken by a concurrent commit, is the duplicate it is: `BC_FAILED` with `BC_C_UNIQUE` on the table or index, as a retry's own check would raise (`docs/transaction_design.md`, *Commit and conflicts*). This is the only place retry lives. |
 
@@ -433,7 +460,7 @@ void     bc_emit_count(bc_ctx *, int64_t affected);   /* write statements: the r
 | Function | What it does |
 |---|---|
 | `bc_param_*` | Reads parameter `i` as bound by `bc_ctx_begin`. A wrong index or type is `BC_E_HANDLE` and a neutral value. Parameter views live until reset. |
-| `bc_emit_begin` … `bc_emit_end` | Appends one result row, in the row format, with the types the plan's `bc_schema_ref` declares in `result_types`. Columns are emitted in that order; a count or type that does not match is `BC_E_LAYOUT`. The row is copied into the result buffer, which is part of the arena. |
+| `bc_emit_begin` … `bc_emit_end` | Appends one result row, in the row format, with the types the plan's `bc_schema_ref` declares in `result_types`. Columns are emitted in that order; a count or type that does not match is `BC_E_LAYOUT`. The row is copied into the result buffer and charged to the memory budget. |
 | `bc_emit_col` | Emits column `col` of a row view: its value, or NULL when the column is null or the row predates it; `BC_E_CORRUPT` for a column marked present that the row does not hold. The type is the column's, and must be the next result column's. One call where a nullable column took an `if` and two emits. |
 | `bc_emit_key_part` | Emits part `part` of an encoded key of `table_or_index`, NULL as NULL: a covering read's column, from `bc_scan_key`, with no row read. A `DOUBLE` part is `BC_E_HANDLE`: the key canonicalises `-0.0` and NaN, so the value comes from the row. |
 | `bc_emit_count` | Records the affected-row count a write statement reports. At most once per plan. |
@@ -478,7 +505,7 @@ runtime's.
 
 ### Keys
 
-Keys are built in the arena in the mem-comparable encoding of *Keys and
+Keys are built in the mem-comparable encoding of *Keys and
 rows* below. A builder is finalized once; its view lives until reset.
 
 ```c
@@ -542,7 +569,7 @@ int64_t   bc_count_range(bc_ctx *, uint32_t table_or_index, bc_view lo, bc_view 
 | `bc_scan_key` | The current entry's full encoded key. | View valid until the cursor steps or closes. | 0 |
 | `bc_scan_row` | The current entry's row, a stored row of the cursor's table. On a table scan it is the entry's value. On a secondary index the runtime builds the row key from the entry's primary-key suffix and reads it, once per entry however often it is asked: the fetch of a non-covering read. An index entry whose row is missing is `BC_E_CORRUPT`, never skipped: the runtime keeps every entry paired with its row, so a missing one is damage. | View valid until the cursor steps or closes. | 0 on a table, 1 record read on an index |
 | `bc_empty` | The empty view. | The zero handle, valid always. | 0 |
-| `bc_key_part_*` | Decodes one part of an encoded key, by position in the key's catalog layout. On a secondary index the index columns come first, then the primary key's parts. `bc_key_part_null` reports a null part; the typed decoders return zero or empty for one. A part number or type that disagrees with the layout is `BC_E_HANDLE`, and so is `bc_key_part_f64` on any part: the key canonicalises a `DOUBLE` (`-0.0` is `0.0`, every NaN one NaN), so it is read from the row. A key that does not parse is `BC_E_CORRUPT`. | Values; a bytes part is unescaped into the arena and lives until reset. | 0 |
+| `bc_key_part_*` | Decodes one part of an encoded key, by position in the key's catalog layout. On a secondary index the index columns come first, then the primary key's parts. `bc_key_part_null` reports a null part; the typed decoders return zero or empty for one. A part number or type that disagrees with the layout is `BC_E_HANDLE`, and so is `bc_key_part_f64` on any part: the key canonicalises a `DOUBLE` (`-0.0` is `0.0`, every NaN one NaN), so it is read from the row. A key that does not parse is `BC_E_CORRUPT`. | Values; a bytes part is unescaped into the arena and lives until reset, charged. | 0 |
 | `bc_count_range` | Counts the live entries in `[lo, hi)` without walking them, stopping at `limit`. Compiles to `Snapshot::count_keys`. The planner's cardinality source and `COUNT(*)` over a key range. | `min(count, limit)`. | at most 2 record reads, whatever the range holds |
 
 A range scan on a secondary index with a fetch of each row costs one read
@@ -585,7 +612,7 @@ void     bc_row_set_bytes(bc_ctx *, bc_row, uint32_t col, bc_view);
 void     bc_row_set_null(bc_ctx *, bc_row, uint32_t col);
 void     bc_row_set_param(bc_ctx *, bc_row, uint32_t col, uint32_t i);   /* parameter i, NULL included */
 bc_view  bc_row_end(bc_ctx *, bc_row);
-bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: lives until reset */
+bc_view  bc_pin(bc_ctx *, bc_view);                 /* a copy that lives until reset */
 ```
 
 | Function | What it does |
@@ -599,29 +626,29 @@ bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: live
 | `bc_row_from` | Starts a row of `table` as a copy of `old`, a row of that table and of its current layout generation (otherwise as for the writes below: `BC_L_ROW`, `BC_L_RETIRED` or `BC_E_CORRUPT`; a `REBUILD`, #503, widens this to any generation). The `UPDATE` pattern: copy, set the assigned columns, end. |
 | `bc_row_set_*`, `bc_row_set_null` | Sets column `col`, which must be of the builder's table. Setting twice keeps the last value. A value outside the column's declared type is `BC_E_CONSTRAINT` with `BC_C_RANGE` and the table's id, and sets nothing: a SMALLINT or INTEGER out of range, a REAL that overflows or underflows float, a TEXT or VARCHAR that is not UTF-8 or holds a NUL, a VARCHAR(n) of more than n code points, a DECIMAL(p, s) of more than p digits, a DATE, TIMESTAMP or TIME outside PostgreSQL's range for it (a TIME from 00:00 to 24:00). A NULL for a NOT NULL column is set, and refused by `bc_row_end`. |
 | `bc_row_set_param` | Sets column `col` to parameter `i`: its value, or null when it is NULL. One call where a nullable column took an `if` and two sets. A parameter whose type is not the column's is `BC_E_HANDLE`; one outside the column's declared type is `BC_C_RANGE`, as above. |
-| `bc_row_end` | Finalizes the row and returns its view, a built row of the builder's table. The row is held with its builder, not in the arena, until reset: a statement that writes many rows builds one per row, so the arena's size does not bound how many it writes. A NOT NULL column that is null, set so or never set and with no default, is `BC_E_CONSTRAINT` with `BC_C_NOT_NULL` and the table's id: checked here, after every value set passed its range check, so a row holding both is `BC_C_RANGE`, as PostgreSQL reports it. A row over the engine's value limit is `BC_E_LIMIT`. |
-| `bc_pin` | Copies a view into the arena so it outlives its cursor, keeping what it is: a pinned row is still a row of its table. The compiler emits it where a plan keeps a cursor's bytes across a step. |
+| `bc_row_end` | Finalizes the row and returns its view, a built row of the builder's table. The row is held with its builder until reset, and charged to the memory budget. A NOT NULL column that is null, set so or never set and with no default, is `BC_E_CONSTRAINT` with `BC_C_NOT_NULL` and the table's id: checked here, after every value set passed its range check, so a row holding both is `BC_C_RANGE`, as PostgreSQL reports it. A row over the engine's value limit is `BC_E_LIMIT`. |
+| `bc_pin` | Copies a view into the arena, charged, so it outlives its cursor, keeping what it is: a pinned row is still a row of its table. The compiler emits it where a plan keeps a cursor's bytes across a step. |
 
 ### Ephemeral structures
 
-All three copy their inputs into the arena and declare a byte bound.
-Exceeding it sets `BC_E_MEMORY`. Their contents live until reset. Iteration
+All three copy their inputs and charge them to the statement's memory
+budget: past it, `BC_E_LIMIT`. Their contents live until reset. Iteration
 order is deterministic: insertion order for hash tables, first-appearance
 order for aggregate groups, sort order for sorters.
 
 ```c
-bc_sorter bc_sorter_open(bc_ctx *, uint32_t bytes);
+bc_sorter bc_sorter_open(bc_ctx *);
 void      bc_sorter_add(bc_ctx *, bc_sorter, bc_view sort_key, bc_view payload);
 int64_t   bc_sorter_count(bc_ctx *, bc_sorter);
 bc_view   bc_sorter_nth(bc_ctx *, bc_sorter, int64_t n);
 bool      bc_sorter_next(bc_ctx *, bc_sorter, bc_view *payload);
 
-bc_hash      bc_hash_open(bc_ctx *, uint32_t bytes);
+bc_hash      bc_hash_open(bc_ctx *);
 void         bc_hash_put(bc_ctx *, bc_hash, bc_view key, bc_view payload);
 bc_hash_iter bc_hash_find(bc_ctx *, bc_hash, bc_view key);
 bool         bc_hash_next(bc_ctx *, bc_hash_iter, bc_view *payload);
 
-bc_agg    bc_agg_open(bc_ctx *, uint32_t bytes, uint32_t slots);
+bc_agg    bc_agg_open(bc_ctx *, uint32_t slots);
 bc_group  bc_agg_group(bc_ctx *, bc_agg, bc_view group_key);
 void      bc_agg_add_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);   /* overflow → BC_E_ARITH */
 void      bc_agg_add_f64(bc_ctx *, bc_group, uint32_t slot, double);
@@ -642,7 +669,7 @@ double    bc_agg_f64(bc_ctx *, bc_group, uint32_t slot);
 | `bc_sorter_next` | Streams payloads in sort order. Each call charges one unit of budget. |
 | `bc_hash_open`, `bc_hash_put` | A multimap for the build side of a hash join. Duplicate keys are kept. |
 | `bc_hash_find`, `bc_hash_next` | Probes: an iterator over every payload stored under `key`, in insertion order. Each `next` charges one unit. |
-| `bc_agg_open` | Grouped accumulators with `slots` numeric slots per group, for `GROUP BY` the plan cannot get from index order. Ungrouped aggregates use one group with an empty key. Implemented with no slots only, for `COUNT(DISTINCT)`: each group's key is held once, and the groups may take `bytes`, each counted as its key's bytes plus a fixed overhead (112 bytes: the index node, the allocator's headers and the first-appearance order entry), so the bound is close to the memory held; past it, `BC_E_MEMORY`. The slot calls are not implemented yet (`BC_E_HANDLE`). |
+| `bc_agg_open` | Grouped accumulators with `slots` numeric slots per group, for `GROUP BY` the plan cannot get from index order. Ungrouped aggregates use one group with an empty key. Implemented with no slots only, for `COUNT(DISTINCT)`: each group's key is held once, and a new group charges its key's bytes. The slot calls are not implemented yet (`BC_E_HANDLE`). |
 | `bc_agg_group` | Finds or creates the group for `group_key`, a mem-comparable byte string. Slots start at zero and null. |
 | `bc_agg_add_*`, `bc_agg_min_*`, `bc_agg_max_*`, `bc_agg_count` | Folds a value into a slot. `SUM`, `MIN`, `MAX`, `COUNT`; `AVG` is a sum slot and a count slot divided at emit. Integer sums are checked. |
 | `bc_agg_next` | Iterates groups in first-appearance order, one unit each. |
@@ -805,7 +832,7 @@ void plan(bc_ctx *cx) {
   }
   bc_view prefix = bc_key_params(cx, IDX_12, 0, 3);
 
-  bc_sorter s = bc_sorter_open(cx, 65536);
+  bc_sorter s = bc_sorter_open(cx);
   bc_cursor c = bc_scan_open(cx, IDX_12, prefix, prefix, BC_SCAN_PREFIX);
   while (bc_scan_next(cx, c)) {                                   /* 1 read per step */
     bc_view row = bc_scan_row(cx, c);                             /* 1 read */
@@ -872,9 +899,9 @@ plugin adopts*; #488).
 - **Sequence allocation.** Auto-increment is a runtime service invoked at
   commit, outside the plan, so the plan stays pure. Until then ids come from
   rows the plan reads and guards.
-- **Streaming results.** The result buffer lives in the arena, so a result
-  set is bounded by it. A statement that returns more than the arena holds
-  is `BC_E_MEMORY`. Streaming rows to the client as they are emitted is
+- **Streaming results.** The result buffer is charged to the statement's
+  memory budget, so a result set is bounded by it. A statement that returns
+  more is `BC_E_LIMIT`. Streaming rows to the client as they are emitted is
   part of the transport design (#487, *Next*), behind the same `bc_emit_*`
   calls.
 - **Spilling sorters and hash tables.** Bounds without spill are right for

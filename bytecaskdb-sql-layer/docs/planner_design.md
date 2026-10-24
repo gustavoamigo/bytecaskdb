@@ -1,6 +1,8 @@
 # The planner: a logical algebra, a search, and compiled pipelines
 
-Status: **design, approved (owner, 2026-10-24); not built.** The first of
+Status: **design, approved (owner, 2026-10-24); the statement memory
+budget of *Memory* is built (`plan_api_design.md`, revision 6), the
+lifetime rule and the rest are not.** The first of
 the post-MVP designs (#487, *Next*). It replaces the planner
 `frontend_design.md` describes under *The current planner*. The parser,
 the plan API and TinyCC are unchanged; the binder's output changes.

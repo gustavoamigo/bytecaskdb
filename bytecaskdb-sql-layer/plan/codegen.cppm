@@ -514,10 +514,6 @@ void open_null_part(Writer& w, const ir::Scan& sc) {
   open_prefix(w, sc);
 }
 
-// What a COUNT(DISTINCT) groups its values in: ample for any key set a
-// statement of the MVP reads; past it the statement fails (BC_E_MEMORY).
-constexpr std::uint32_t kGroupBytes = 16u << 20;
-
 // The aggregate's argument in the entry the cursor `c` is on: its NULL test
 // and its value, from the entry's key when the scan covers, else from `row`,
 // which the loop has read.
@@ -534,7 +530,7 @@ auto arg_of_entry(Writer& w, const ir::Scan& sc, const ir::Column& arg) -> std::
 // whether a value was seen for SUM and MIN, groups for COUNT(DISTINCT).
 void open_aggregate(Writer& w, const ir::Aggregate& a) {
   if (a.distinct) {
-    w.line("bc_agg groups = bc_agg_open(cx, " + std::to_string(kGroupBytes) + "u, 0);");
+    w.line("bc_agg groups = bc_agg_open(cx, 0);");
     return;
   }
   switch (a.fn) {

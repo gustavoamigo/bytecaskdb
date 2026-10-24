@@ -80,7 +80,7 @@ TEST_CASE("tcc: a unique insert raced by another commit conflicts, and its retry
   // commits first; A's range guard on the prefix refuses its commit.
   auto pa = sql_test::params({std::int64_t{1}, sql_test::bytes("a")});
   auto pb = sql_test::params({std::int64_t{2}, sql_test::bytes("a")});
-  auto* other = bc_ctx_new(&f.bdb, &f.bcat, 1u << 20);
+  auto* other = bc_ctx_new(&f.bdb, &f.bcat);
   REQUIRE(other != nullptr);
   bc_ctx_begin(f.cx, &pa, {});
   bc_ctx_run(f.cx, code->fn(), &ref);
@@ -112,7 +112,7 @@ TEST_CASE("tcc: an insert whose last retry conflicts on a key a racing commit to
   // duplicate its retry would have found.
   auto pa = sql_test::params({std::int64_t{1}, sql_test::bytes("a")});
   auto pb = sql_test::params({std::int64_t{2}, sql_test::bytes("a")});
-  auto* other = bc_ctx_new(&f.bdb, &f.bcat, 1u << 20);
+  auto* other = bc_ctx_new(&f.bdb, &f.bcat);
   REQUIRE(other != nullptr);
   bc_ctx_before_commit_for_testing(f.cx, [&] { CHECK(bc_execute(other, code->fn(), &ref, &pb, {}, false, 0) == BC_COMMITTED); });
   CHECK(bc_execute(f.cx, code->fn(), &ref, &pa, {}, false, 0) == BC_FAILED);

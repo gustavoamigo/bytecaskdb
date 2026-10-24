@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 5). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 6). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
@@ -42,9 +42,9 @@ enum bc_error_code {
   BC_OK = 0,
   BC_E_IO,          /* std::system_error from the engine */
   BC_E_CORRUPT,     /* CRC mismatch or unparseable record */
-  BC_E_MEMORY,      /* arena exhausted or an ephemeral bound exceeded */
+  BC_E_MEMORY,      /* an allocation failed (std::bad_alloc) */
   BC_E_BUDGET,      /* work budget or deadline exhausted */
-  BC_E_LIMIT,       /* key or value over the engine's limits */
+  BC_E_LIMIT,       /* key or value over the engine's limits, or the statement over its memory budget */
   BC_E_HANDLE,      /* stale, foreign or out-of-range handle, or a table, index or column the plan's
                        bc_schema_ref does not declare, or not of the type used: a plan bug */
   BC_E_ARITH,       /* integer overflow, division by zero, out-of-range conversion */
@@ -87,7 +87,8 @@ enum bc_layout_detail {  /* the detail of BC_E_LAYOUT; every BC_E_LAYOUT carries
 enum bc_commit_result { BC_COMMITTED, BC_CONFLICT, BC_FAILED /* see bc_error */ };
 
 typedef struct {
-  uint64_t max_reads;       /* record reads and cursor steps, together */
+  uint64_t max_reads;       /* record reads and cursor steps, together; 0 = none */
+  uint64_t max_bytes;       /* memory the statement holds, as bytes requested; 0 = none */
   uint64_t deadline_ns;     /* monotonic; 0 = none */
 } bc_budget;
 
@@ -120,7 +121,7 @@ typedef struct {
 enum bc_type { BC_T_I64 = 1, BC_T_F64 = 2, BC_T_BOOL = 3, BC_T_BYTES = 4 };
 
 /* Runtime: creating, running and committing. Called by the server, never by a plan. */
-bc_ctx *bc_ctx_new(bc_db *db, const bc_catalog *cat, uint32_t arena_bytes);
+bc_ctx *bc_ctx_new(bc_db *db, const bc_catalog *cat);
 void    bc_ctx_free(bc_ctx *);
 void    bc_ctx_begin(bc_ctx *, const bc_params *params, bc_budget budget);  /* takes the snapshot */
 void    bc_ctx_run(bc_ctx *, bc_plan_fn plan, const bc_schema_ref *checked_against);
@@ -266,21 +267,21 @@ void     bc_row_set_bytes(bc_ctx *, bc_row, uint32_t col, bc_view);
 void     bc_row_set_null(bc_ctx *, bc_row, uint32_t col);
 void     bc_row_set_param(bc_ctx *, bc_row, uint32_t col, uint32_t i);   /* parameter i, NULL included */
 bc_view  bc_row_end(bc_ctx *, bc_row);
-bc_view  bc_pin(bc_ctx *, bc_view);                 /* copy into the arena: lives until reset */
+bc_view  bc_pin(bc_ctx *, bc_view);                 /* a copy that lives until reset */
 
 /* Ephemeral structures */
-bc_sorter bc_sorter_open(bc_ctx *, uint32_t bytes);
+bc_sorter bc_sorter_open(bc_ctx *);
 void      bc_sorter_add(bc_ctx *, bc_sorter, bc_view sort_key, bc_view payload);
 int64_t   bc_sorter_count(bc_ctx *, bc_sorter);
 bc_view   bc_sorter_nth(bc_ctx *, bc_sorter, int64_t n);
 bool      bc_sorter_next(bc_ctx *, bc_sorter, bc_view *payload);
 
-bc_hash      bc_hash_open(bc_ctx *, uint32_t bytes);
+bc_hash      bc_hash_open(bc_ctx *);
 void         bc_hash_put(bc_ctx *, bc_hash, bc_view key, bc_view payload);
 bc_hash_iter bc_hash_find(bc_ctx *, bc_hash, bc_view key);
 bool         bc_hash_next(bc_ctx *, bc_hash_iter, bc_view *payload);
 
-bc_agg    bc_agg_open(bc_ctx *, uint32_t bytes, uint32_t slots);
+bc_agg    bc_agg_open(bc_ctx *, uint32_t slots);
 bc_group  bc_agg_group(bc_ctx *, bc_agg, bc_view group_key);
 void      bc_agg_add_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);   /* overflow → BC_E_ARITH */
 void      bc_agg_add_f64(bc_ctx *, bc_group, uint32_t slot, double);

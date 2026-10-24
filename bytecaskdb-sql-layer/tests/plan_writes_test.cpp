@@ -376,7 +376,7 @@ TEST_CASE("plan writes: a concurrent insert of the same key conflicts with no ab
   auto pb = params({std::int64_t{1}, std::int64_t{2}, bytes("b"), std::int64_t{1}});
   SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
   auto ref = sr.get();
-  auto* other = bc_ctx_new(&f.bdb, &f.bcat, 1u << 20);
+  auto* other = bc_ctx_new(&f.bdb, &f.bcat);
   REQUIRE(other != nullptr);
   bc_ctx_begin(f.cx, &pa, {});
   bc_ctx_run(f.cx, insert_w, &ref);
@@ -470,38 +470,38 @@ TEST_CASE("plan writes: the reads each read and write is charged", "[sql][algebr
     REQUIRE(run(f, insert_t, {i, bytes(std::string(1, static_cast<char>('a' + i))), i}) == BC_COMMITTED);
   }
   // A covering read is one unit per entry: it reads no row.
-  CHECK(run(f, covering, {}, {.max_reads = kN, .deadline_ns = 0}) == BC_COMMITTED);
+  CHECK(run(f, covering, {}, {.max_reads = kN, .max_bytes = 0, .deadline_ns = 0}) == BC_COMMITTED);
   CHECK(bc_ctx_affected(f.cx) == kN * (kN + 1) / 2);
-  CHECK(run(f, covering, {}, {.max_reads = kN - 1, .deadline_ns = 0}) == BC_FAILED);
+  CHECK(run(f, covering, {}, {.max_reads = kN - 1, .max_bytes = 0, .deadline_ns = 0}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_BUDGET);
   // A fetch is one more per entry.
-  CHECK(run(f, fetching, {}, {.max_reads = 2 * kN - 1, .deadline_ns = 0}) == BC_FAILED);
+  CHECK(run(f, fetching, {}, {.max_reads = 2 * kN - 1, .max_bytes = 0, .deadline_ns = 0}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_BUDGET);
-  CHECK(run(f, fetching, {}, {.max_reads = 2 * kN, .deadline_ns = 0}) == BC_COMMITTED);
+  CHECK(run(f, fetching, {}, {.max_reads = 2 * kN, .max_bytes = 0, .deadline_ns = 0}) == BC_COMMITTED);
   // An update that moves no entry of a unique index checks nothing: the
   // bc_get is its only read.
-  CHECK(run(f, touch_qty, {std::int64_t{1}, std::int64_t{99}}, {.max_reads = 1, .deadline_ns = 0}) == BC_COMMITTED);
+  CHECK(run(f, touch_qty, {std::int64_t{1}, std::int64_t{99}}, {.max_reads = 1, .max_bytes = 0, .deadline_ns = 0}) == BC_COMMITTED);
   // An insert checks its primary key; one per unique index on top (w has two).
   create_w(f);
-  CHECK(run(f, insert_t, {std::int64_t{50}, bytes("zz"), std::int64_t{1}}, {.max_reads = 1, .deadline_ns = 0}) ==
+  CHECK(run(f, insert_t, {std::int64_t{50}, bytes("zz"), std::int64_t{1}}, {.max_reads = 1, .max_bytes = 0, .deadline_ns = 0}) ==
         BC_COMMITTED);
   CHECK(run(f, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{0}},
-            {.max_reads = 2, .deadline_ns = 0}) == BC_FAILED);
+            {.max_reads = 2, .max_bytes = 0, .deadline_ns = 0}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_BUDGET);
   CHECK(run(f, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{0}},
-            {.max_reads = 3, .deadline_ns = 0}) == BC_COMMITTED);
+            {.max_reads = 3, .max_bytes = 0, .deadline_ns = 0}) == BC_COMMITTED);
   // A range delete of a table with indexes reads each row (t holds kN + 1)
   // and the record past the range, w's first row: each charged before it is
   // read. Of one without, nothing.
-  CHECK(run(f, del_all_t, {}, {.max_reads = kN + 1, .deadline_ns = 0}) == BC_FAILED);
+  CHECK(run(f, del_all_t, {}, {.max_reads = kN + 1, .max_bytes = 0, .deadline_ns = 0}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_BUDGET);
-  CHECK(run(f, del_all_t, {}, {.max_reads = kN + 2, .deadline_ns = 0}) == BC_COMMITTED);
+  CHECK(run(f, del_all_t, {}, {.max_reads = kN + 2, .max_bytes = 0, .deadline_ns = 0}) == BC_COMMITTED);
   CHECK(count_entries(*f.db, bytecask::sql::kNsRow, 1) == 0);
   CHECK(count_entries(*f.db, bytecask::sql::kNsIndex, 3) == 0);
   f.ddl(bytecask::sql::CreateTableDdl{"plain", {Fixture::col("k", PhysType::I64, false)}, {"k"}});
   g_plain = f.cat().table("plain")->id;
   for (std::int64_t i = 1; i <= kN; ++i) REQUIRE(run(f, insert_plain, {i}) == BC_COMMITTED);
-  CHECK(run(f, del_all_plain, {}, {.max_reads = 1, .deadline_ns = 0}) == BC_COMMITTED);  // 0 reads; 0 means no budget
+  CHECK(run(f, del_all_plain, {}, {.max_reads = 1, .max_bytes = 0, .deadline_ns = 0}) == BC_COMMITTED);  // 0 reads; 0 means no budget
   CHECK(count_entries(*f.db, bytecask::sql::kNsRow, g_plain) == 0);
   check_indexes_exact(f);
 }
@@ -705,7 +705,7 @@ TEST_CASE("plan writes: bc_scan_row reads an entry's row once per step", "[sql][
   for (std::int64_t i = 1; i <= kN; ++i) {
     REQUIRE(run(f, insert_t, {i, bytes(std::string(1, static_cast<char>('a' + i))), i}) == BC_COMMITTED);
   }
-  CHECK(run(f, fetch_twice, {}, {.max_reads = 2 * kN, .deadline_ns = 0}) == BC_COMMITTED);
+  CHECK(run(f, fetch_twice, {}, {.max_reads = 2 * kN, .max_bytes = 0, .deadline_ns = 0}) == BC_COMMITTED);
   CHECK(bc_ctx_affected(f.cx) == 2 * kN * (kN + 1) / 2);
 }
 
@@ -796,7 +796,7 @@ TEST_CASE("plan writes: concurrent read-then-write of one row loses no update", 
   std::vector<std::thread> threads;
   for (int t = 0; t < kThreads; ++t) {
     threads.emplace_back([&] {
-      auto* cx = bc_ctx_new(&f.bdb, &f.bcat, 1u << 16);
+      auto* cx = bc_ctx_new(&f.bdb, &f.bcat);
       auto ps = params({std::int64_t{1}});
       for (int i = 0; i < kEach; ++i) {
         if (bc_execute(cx, decrement_qty, &ref, &ps, {}, false, 100000) != BC_COMMITTED) ++failures;
@@ -822,7 +822,7 @@ TEST_CASE("plan writes: a delete racing updates of one row has one outcome", "[s
   SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
   auto ref = sr.get();
   std::vector<bc_ctx*> cxs;
-  for (int t = 0; t < kUpdaters + 1; ++t) cxs.push_back(bc_ctx_new(&f.bdb, &f.bcat, 1u << 16));
+  for (int t = 0; t < kUpdaters + 1; ++t) cxs.push_back(bc_ctx_new(&f.bdb, &f.bcat));
   auto one = params({std::int64_t{1}});
   for (int round = 0; round < kRounds; ++round) {
     INFO("round " << round);

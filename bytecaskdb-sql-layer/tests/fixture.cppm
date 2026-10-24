@@ -52,7 +52,7 @@ struct Fixture {
     }
     bdb = {db.get()};
     bcat = {live.get()};
-    cx = bc_ctx_new(&bdb, &bcat, 1u << 20);
+    cx = bc_ctx_new(&bdb, &bcat);
   }
 
   // The live catalog's current version. The reference is valid until the
