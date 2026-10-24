@@ -76,10 +76,10 @@ static_assert(static_cast<int>(PhysType::Bytes) == BC_T_BYTES);
 namespace {
 
 constexpr std::uint32_t kNoCursor = UINT32_MAX;
-// What an aggregate group holds besides its key's bytes, counted against the
-// aggregate's bound: a map node (tree links, the key's header, the index),
-// the allocator's headers for it and the key, and the order entry.
-constexpr std::uint64_t kGroupOverhead = 112;
+// The arena grows in chunks of this size, or one chunk per copy larger than
+// it. A reset keeps one chunk of this size, so a statement that fits in it
+// allocates no arena.
+constexpr std::size_t kArenaChunk = 64u << 10;
 // What a transaction's bound counts for what it holds: a conservative bound,
 // never less than the memory used. Each heap block costs its capacity plus
 // the allocator's header and rounding (kAllocBytes, an over-estimate); a map
@@ -107,11 +107,14 @@ struct ViewEntry {
   RowKind kind;
 };
 
+// The finished key's view reads buf, which a move of the builder keeps
+// where it is: a key costs its bytes once, charged as its parts are added.
 struct KeyBuilder {
   const KeyLayout* layout;
   Bytes buf;
   std::size_t next_part{0};
   bool done{false};
+  std::uint64_t held{0};  // what buf is charged to the statement's memory budget
 };
 
 struct RowBuilder {
@@ -119,10 +122,9 @@ struct RowBuilder {
   const RowLayout* layout;
   RowWriter writer;
   bool done{false};
-  // The finished row bc_row_end's view reads, held here rather than in the
-  // arena: a statement that writes many rows builds one per row, and the
-  // arena is only reset when the statement ends. A builder lives until
-  // reset, and moving one keeps this buffer where it is.
+  // The finished row bc_row_end's view reads, and charges to the statement's
+  // memory budget. A builder lives until reset, and moving one keeps this
+  // buffer where it is.
   Bytes built;
 };
 
@@ -341,6 +343,7 @@ public:
   [[nodiscard]] auto next(bc_ctx* cx) -> bool;
   [[nodiscard]] auto key() const -> BytesView { return key_; }
   [[nodiscard]] auto value() const -> BytesView { return value_; }
+  [[nodiscard]] auto bound_bytes() const -> std::uint64_t { return lo_.size() + hi_.size(); }
 
 private:
   using Point = std::map<Bytes, std::optional<Bytes>, BytesLess>::const_iterator;
@@ -378,7 +381,17 @@ struct Cursor {
   Bytes row_key;  // the row's key, rebuilt in place: no allocation per entry
   std::uint64_t row_step{0};  // the step `row` was fetched at; 0: none
   std::vector<Bytes> col_keys;  // bc_col_key's keys of the current entry, dropped when it moves
+  std::uint64_t held{0};  // what the buffers above are charged to the statement's memory budget
 };
+
+// What a cursor holds: its bounds and its current entry's bytes.
+auto cursor_bytes(const Cursor& c) -> std::uint64_t {
+  std::uint64_t n = c.prefix.size() + c.lo.size() + c.hi.size() + c.key.size() + c.value.size() + c.row.size() +
+                    c.row_key.size();
+  if (c.entries) n += c.entries->bound_bytes();
+  for (const auto& k : c.col_keys) n += k.size();
+  return n;
+}
 
 
 
@@ -538,8 +551,15 @@ struct bc_ctx {
   std::shared_ptr<const Catalog> pinned;
   Catalog unpinned;
   const Catalog* cat{&unpinned};
-  std::vector<std::byte> arena;
-  std::size_t arena_used{0};
+  // Copies that live until reset, in chunks that never move.
+  struct Chunk {
+    std::unique_ptr<std::byte[]> data;
+    std::size_t size;
+  };
+  std::vector<Chunk> arena;
+  std::size_t chunk_used{0};  // of arena.back()
+  // The bytes the statement holds, as requested: what budget.max_bytes bounds.
+  std::uint64_t mem_used{0};
   std::uint32_t epoch{1};
 
   const bc_params* params{nullptr};
@@ -584,8 +604,6 @@ struct bc_ctx {
   // Each group's key is held once, in `index`; `order` points at it, in
   // first-appearance order (a map node never moves).
   struct Agg {
-    std::uint64_t bound;  // the bytes its groups may hold, kGroupOverhead each included
-    std::uint64_t used{0};
     std::map<Bytes, std::uint32_t, BytesLess> index;
     std::vector<const Bytes*> order;
     std::size_t next{0};
@@ -613,8 +631,7 @@ struct bc_ctx {
   std::uint32_t emit_col{0};
   std::int64_t affected{-1};
 
-  bc_ctx(bytecask::DB* d, LiveCatalog* l, std::uint32_t arena_bytes)
-      : db{d}, live{l}, arena(arena_bytes) {}
+  bc_ctx(bytecask::DB* d, LiveCatalog* l) : db{d}, live{l} {}
 
   auto ok() const -> bool { return error == BC_OK; }
 
@@ -647,15 +664,45 @@ struct bc_ctx {
     return true;
   }
 
-  // Copies bytes into the arena; nullptr (and BC_E_MEMORY) if it is full.
-  auto arena_copy(BytesView b) -> const std::byte* {
-    if (arena.size() - arena_used < b.size()) {
-      fail(BC_E_MEMORY, "arena exhausted");
-      return nullptr;
+  // Charges n bytes to the statement's memory budget: false, and BC_E_LIMIT,
+  // past it. Checked before the bytes are allocated wherever their size is
+  // known first.
+  auto take(std::uint64_t n) -> bool {
+    if (!ok()) return false;
+    if (budget.max_bytes != 0 && n > budget.max_bytes - std::min(mem_used, budget.max_bytes)) {
+      fail(BC_E_LIMIT, "the statement would hold more than its memory budget of " + std::to_string(budget.max_bytes) +
+                           " bytes");
+      return false;
     }
-    auto* p = arena.data() + arena_used;
+    mem_used += n;
+    return true;
+  }
+
+  // Moves what one buffer is charged, `held`, to its size now: a release
+  // always succeeds, growth is take()n.
+  auto rehold(std::uint64_t& held, std::uint64_t now) -> bool {
+    if (now <= held) {
+      mem_used -= held - now;
+      held = now;
+      return true;
+    }
+    if (!take(now - held)) return false;
+    held = now;
+    return true;
+  }
+
+  // Copies bytes into the arena, charged; nullptr (and the error) past the
+  // budget.
+  auto arena_copy(BytesView b) -> const std::byte* {
+    if (!take(b.size())) return nullptr;
+    if (arena.empty() || arena.back().size - chunk_used < b.size()) {
+      auto size = std::max(kArenaChunk, b.size());
+      arena.push_back({std::make_unique_for_overwrite<std::byte[]>(size), size});
+      chunk_used = 0;
+    }
+    auto* p = arena.back().data.get() + chunk_used;
     if (!b.empty()) std::memcpy(p, b.data(), b.size());
-    arena_used += b.size();
+    chunk_used += b.size();
     return p;
   }
 
@@ -840,7 +887,14 @@ struct bc_ctx {
     emit.reset();
     emit_col = 0;
     affected = -1;
-    arena_used = 0;
+    // One chunk is kept for the next statement, unless it was a large copy's.
+    if (!arena.empty() && arena.front().size == kArenaChunk) {
+      arena.resize(1);
+    } else {
+      arena.clear();
+    }
+    chunk_used = 0;
+    mem_used = 0;
     reads = 0;
     ++epoch;
     if (epoch == 0) epoch = 1;  // 0 is the empty view's generation
@@ -1124,6 +1178,8 @@ auto cursor_advance(bc_ctx* cx, Cursor& c) -> bool {
   if (!c.entries->next(cx)) return false;
   auto k = c.entries->key();
   auto v = c.entries->value();
+  // Charged before the copy: the previous entry's bytes are released by it.
+  if (!cx->rehold(c.held, cursor_bytes(c) - c.key.size() - c.value.size() + k.size() + v.size())) return false;
   c.key.assign(k.begin(), k.end());
   c.value.assign(v.begin(), v.end());
   return true;
@@ -1218,6 +1274,9 @@ auto key_builder_part(bc_ctx* cx, bc_key k, std::optional<PhysType> type, bool i
 
 // The part just reserved by key_builder_part.
 auto current_part(const KeyBuilder& b) -> KeyPart { return b.layout->parts[b.next_part - 1]; }
+
+// Charges a builder's key as it now stands, after a part was added.
+void key_held(bc_ctx* cx, KeyBuilder& b) { (void)cx->rehold(b.held, b.buf.size()); }
 
 // A reader positioned on part `part` of `key`, which must be a key of
 // `table_or_index` and, when `want` is given, have a part of that type there.
@@ -1834,9 +1893,9 @@ extern "C" {
 
 // ---------------------------------------------------------------- runtime
 
-bc_ctx* bc_ctx_new(bc_db* db, const bc_catalog* cat, uint32_t arena_bytes) {
+bc_ctx* bc_ctx_new(bc_db* db, const bc_catalog* cat) {
   try {
-    return new bc_ctx(db->db, cat->live, arena_bytes);
+    return new bc_ctx(db->db, cat->live);
   } catch (...) {
     return nullptr;
   }
@@ -2382,13 +2441,17 @@ void bc_emit_end(bc_ctx* cx) {
     cx->fail(BC_L_PLAN, "result row ended with the wrong number of columns");
     return;
   }
-  // prototype: the result buffer is a heap vector, not part of the arena.
-  // The row is encoded straight into it, after its length.
+  // The row is encoded straight into the result buffer, after its length,
+  // and charged with it.
   auto at = cx->results.size();
   cx->results.resize(at + 4);
   if (!cx->emit->finish(cx->results)) {
     cx->results.resize(at);
     cx->fail(BC_E_LIMIT, "result row over the row format's limit");
+    return;
+  }
+  if (!cx->take(cx->results.size() - at)) {
+    cx->results.resize(at);
     return;
   }
   auto n = static_cast<std::uint32_t>(cx->results.size() - at - 4);
@@ -2519,8 +2582,9 @@ bc_key bc_key_begin(bc_ctx* cx, uint32_t table_or_index) {
   BC_GUARD_BEGIN
   const auto* kl = cx->key_layout(table_or_index);
   if (kl == nullptr) return {};
-  KeyBuilder b{kl, {}, 0, false};
+  KeyBuilder b{kl, {}, 0, false, 0};
   bytecask::sql::key_put_prefix(b.buf, kl->ns, table_or_index);
+  if (!cx->rehold(b.held, b.buf.size())) return {};
   cx->keys.push_back(std::move(b));
   return {static_cast<std::uint32_t>(cx->keys.size() - 1), cx->epoch};
   BC_GUARD_END(cx)
@@ -2530,21 +2594,27 @@ bc_key bc_key_begin(bc_ctx* cx, uint32_t table_or_index) {
 void bc_key_i64(bc_ctx* cx, bc_key k, int64_t v) {
   BC_GUARD_BEGIN
   auto* b = key_builder_part(cx, k, PhysType::I64, false);
-  if (b != nullptr) bytecask::sql::key_put_i64(b->buf, v, current_part(*b));
+  if (b == nullptr) return;
+  bytecask::sql::key_put_i64(b->buf, v, current_part(*b));
+  key_held(cx, *b);
   BC_GUARD_END(cx)
 }
 
 void bc_key_f64(bc_ctx* cx, bc_key k, double v) {
   BC_GUARD_BEGIN
   auto* b = key_builder_part(cx, k, PhysType::F64, false);
-  if (b != nullptr) bytecask::sql::key_put_f64(b->buf, v, current_part(*b));
+  if (b == nullptr) return;
+  bytecask::sql::key_put_f64(b->buf, v, current_part(*b));
+  key_held(cx, *b);
   BC_GUARD_END(cx)
 }
 
 void bc_key_bool(bc_ctx* cx, bc_key k, bool v) {
   BC_GUARD_BEGIN
   auto* b = key_builder_part(cx, k, PhysType::Bool, false);
-  if (b != nullptr) bytecask::sql::key_put_bool(b->buf, v, current_part(*b));
+  if (b == nullptr) return;
+  bytecask::sql::key_put_bool(b->buf, v, current_part(*b));
+  key_held(cx, *b);
   BC_GUARD_END(cx)
 }
 
@@ -2553,14 +2623,18 @@ void bc_key_bytes(bc_ctx* cx, bc_key k, bc_view v) {
   auto bytes = cx->resolve(v);
   if (!bytes) return;
   auto* b = key_builder_part(cx, k, PhysType::Bytes, false);
-  if (b != nullptr) bytecask::sql::key_put_bytes(b->buf, *bytes, current_part(*b));
+  if (b == nullptr) return;
+  bytecask::sql::key_put_bytes(b->buf, *bytes, current_part(*b));
+  key_held(cx, *b);
   BC_GUARD_END(cx)
 }
 
 void bc_key_null(bc_ctx* cx, bc_key k) {
   BC_GUARD_BEGIN
   auto* b = key_builder_part(cx, k, std::nullopt, true);
-  if (b != nullptr) bytecask::sql::key_put_null(b->buf, current_part(*b));
+  if (b == nullptr) return;
+  bytecask::sql::key_put_null(b->buf, current_part(*b));
+  key_held(cx, *b);
   BC_GUARD_END(cx)
 }
 
@@ -2569,7 +2643,7 @@ void bc_key_param(bc_ctx* cx, bc_key k, uint32_t i) {
   if (cx->param(i) == nullptr) return;
   auto* b = key_builder_part(cx, k, std::nullopt, false);
   if (b == nullptr) return;
-  (void)put_param_part(cx, b->buf, *b->layout, b->next_part - 1, i);
+  if (put_param_part(cx, b->buf, *b->layout, b->next_part - 1, i)) key_held(cx, *b);
   BC_GUARD_END(cx)
 }
 
@@ -2582,7 +2656,11 @@ bc_view bc_key_end(bc_ctx* cx, bc_key k) {
     return {};
   }
   b->done = true;
-  return key_view(cx, b->buf);
+  if (b->buf.size() > bytecask::sql::kMaxKeyBytes) {
+    cx->fail(BC_E_LIMIT, "key over the engine's key limit");
+    return {};
+  }
+  return cx->make_view(b->buf.data(), b->buf.size());
   BC_GUARD_END(cx)
   return {};
 }
@@ -2667,6 +2745,7 @@ bc_cursor bc_scan_open(bc_ctx* cx, uint32_t table_or_index, bc_view lo, bc_view 
   } else if (!hi_b->empty()) {
     c.hi.assign(hi_b->begin(), hi_b->end());
   }
+  if (!cx->rehold(c.held, cursor_bytes(c))) return {};
   cx->cursors.push_back(std::move(c));
   return {static_cast<std::uint32_t>(cx->cursors.size() - 1), cx->epoch};
   BC_GUARD_END(cx)
@@ -2681,7 +2760,14 @@ bool bc_scan_next(bc_ctx* cx, bc_cursor h) {
   ++c->step;  // every view of the previous entry is now stale
   c->col_keys.clear();
   c->positioned = cursor_advance(cx, *c);
-  if (!c->positioned) c->done = true;
+  if (!c->positioned) {
+    c->done = true;
+    c->key.clear();
+    c->value.clear();
+    c->row.clear();
+    c->row_key.clear();
+  }
+  (void)cx->rehold(c->held, cursor_bytes(*c));
   return c->positioned && cx->ok();
   BC_GUARD_END(cx)
   if (c != nullptr) c->done = true;  // a step that threw ends the scan
@@ -2738,6 +2824,7 @@ bc_view bc_scan_row(bc_ctx* cx, bc_cursor h) {
     return {};
   }
   c->row_step = c->step;  // fetched once per entry, however often it is asked for
+  if (!cx->rehold(c->held, cursor_bytes(*c))) return {};
   return cx->make_view(c->row.data(), c->row.size(), h.i, c->step, table, RowKind::Stored);
   BC_GUARD_END(cx)
   return {};
@@ -2752,6 +2839,11 @@ void bc_scan_close(bc_ctx* cx, bc_cursor h) {
   c->entries.reset();
   c->done = true;
   c->positioned = false;
+  c->key.clear();
+  c->value.clear();
+  c->row.clear();
+  c->row_key.clear();
+  (void)cx->rehold(c->held, cursor_bytes(*c));
   BC_GUARD_END(cx)
 }
 
@@ -2904,9 +2996,11 @@ bc_view bc_col_key(bc_ctx* cx, bc_view row, uint32_t col) {
   // any other row's go in the arena with it.
   auto [cursor, step] = cx->owner(row);
   if (cursor == kNoCursor) return cx->arena_view(key);
-  auto& held = cx->cursors[cursor].col_keys;
-  held.push_back(std::move(key));
-  return cx->make_view(held.back().data(), held.back().size(), cursor, step);
+  auto& c = cx->cursors[cursor];
+  if (!cx->take(key.size())) return {};
+  c.held += key.size();
+  c.col_keys.push_back(std::move(key));
+  return cx->make_view(c.col_keys.back().data(), c.col_keys.back().size(), cursor, step);
   BC_GUARD_END(cx)
   return {};
 }
@@ -3094,6 +3188,7 @@ bc_view bc_row_end(bc_ctx* cx, bc_row r) {
     cx->fail(BC_E_LIMIT, "row over the engine's value limit");
     return {};
   }
+  if (!cx->take(b->built.size())) return {};
   return cx->make_view(b->built.data(), b->built.size(), kNoCursor, 0, b->table, RowKind::Built);
   BC_GUARD_END(cx)
   return {};
@@ -3112,7 +3207,7 @@ bc_view bc_pin(bc_ctx* cx, bc_view v) {
 
 // --------------------------------------------------- ephemeral structures
 
-bc_sorter bc_sorter_open(bc_ctx* cx, uint32_t) {
+bc_sorter bc_sorter_open(bc_ctx* cx) {
   BC_GUARD_BEGIN
   cx->unimplemented("bc_sorter_open");
   return {};
@@ -3141,7 +3236,7 @@ bool bc_sorter_next(bc_ctx* cx, bc_sorter, bc_view*) {
   BC_GUARD_END(cx)
   return {};
 }
-bc_hash bc_hash_open(bc_ctx* cx, uint32_t) {
+bc_hash bc_hash_open(bc_ctx* cx) {
   BC_GUARD_BEGIN
   cx->unimplemented("bc_hash_open");
   return {};
@@ -3164,15 +3259,16 @@ bool bc_hash_next(bc_ctx* cx, bc_hash_iter, bc_view*) {
   return {};
 }
 // Groups only: the slot calls are not implemented yet, so slots must be 0.
-// A group's handle names its index in the aggregate.
-bc_agg bc_agg_open(bc_ctx* cx, uint32_t bytes, uint32_t slots) {
+// A group's handle names its index in the aggregate. A new group charges its
+// key's bytes to the statement's memory budget.
+bc_agg bc_agg_open(bc_ctx* cx, uint32_t slots) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return {};
   if (slots != 0) {
     cx->unimplemented("bc_agg_open with slots");
     return {};
   }
-  cx->aggs.push_back(bc_ctx::Agg{bytes});
+  cx->aggs.push_back({});
   return {static_cast<std::uint32_t>(cx->aggs.size() - 1), cx->epoch};
   BC_GUARD_END(cx)
   return {};
@@ -3184,15 +3280,10 @@ bc_group bc_agg_group(bc_ctx* cx, bc_agg a, bc_view group_key) {
   auto key = cx->resolve(group_key);
   if (!key || !cx->ok()) return {};
   if (auto it = agg->index.find(*key); it != agg->index.end()) return {it->second, cx->epoch};
-  const auto cost = key->size() + kGroupOverhead;
-  if (agg->used + cost > agg->bound) {
-    cx->fail(BC_E_MEMORY, "aggregate over its bound of " + std::to_string(agg->bound) + " bytes");
-    return {};
-  }
+  if (!cx->take(key->size())) return {};
   auto i = static_cast<std::uint32_t>(agg->order.size());
   auto it = agg->index.emplace(Bytes(key->begin(), key->end()), i).first;
   agg->order.push_back(&it->first);
-  agg->used += cost;
   return {i, cx->epoch};
   BC_GUARD_END(cx)
   return {};

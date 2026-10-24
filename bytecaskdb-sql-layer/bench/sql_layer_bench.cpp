@@ -261,7 +261,7 @@ int main() {
 
     bc_db bdb{&db};
     bc_catalog bcat{&live};
-    auto* cx = bc_ctx_new(&bdb, &bcat, 1u << 20);
+    auto* cx = bc_ctx_new(&bdb, &bcat);
     bc_params ps{{std::int64_t{1}}};
 
     RefSpec point{{"customer"}, {}, {{"customer", "c_id"}, {"customer", "c_balance"}}, {PhysType::I64, PhysType::I64}};

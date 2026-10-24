@@ -467,7 +467,7 @@ TEST_CASE("transactions: a read stays in its bounds and passes a deleted range i
   // A budget far below the 390 entries the range and the tombstones hold:
   // the scans read their ten rows, a seek past the range and the record
   // that ends them, and none of the tombstones beyond.
-  bc_budget tight{40, 0};
+  bc_budget tight{40, 0, 0};
   for (std::int64_t reverse : {0, 1}) {
     auto in_range = stmt(f, txn.p, scan_w_range, {std::int64_t{0}, std::int64_t{10}, reverse}, id_c(), tight);
     REQUIRE(in_range.error == BC_OK);
@@ -481,7 +481,7 @@ TEST_CASE("transactions: a read stays in its bounds and passes a deleted range i
   }
   // A budget too small for the rows themselves still ends the scan: the
   // reads it makes are charged.
-  CHECK(stmt(f, txn.p, scan_w_range, {std::int64_t{0}, std::int64_t{10}, std::int64_t{0}}, id_c(), {5, 0}).error ==
+  CHECK(stmt(f, txn.p, scan_w_range, {std::int64_t{0}, std::int64_t{10}, std::int64_t{0}}, id_c(), {5, 0, 0}).error ==
         BC_E_BUDGET);
 }
 
@@ -496,7 +496,7 @@ TEST_CASE("transactions: a reverse scan charges the record at its bound it steps
     for (std::uint64_t budget = 1;; ++budget) {
       REQUIRE(budget < 1000);
       TxnPtr txn{f};
-      auto r = stmt(f, txn.p, scan_w_range, {std::int64_t{0}, std::int64_t{10}, std::int64_t{1}}, id_c(), {budget, 0});
+      auto r = stmt(f, txn.p, scan_w_range, {std::int64_t{0}, std::int64_t{10}, std::int64_t{1}}, id_c(), {budget, 0, 0});
       if (r.error == BC_OK) {
         CHECK(r.rows.size() == 10);
         return budget;
@@ -558,7 +558,7 @@ TEST_CASE("transactions: one context at a time; a commit with a statement open i
           "[sql][txn]") {
   Fixture f;
   create_w(f);
-  auto* other = bc_ctx_new(&f.bdb, &f.bcat, 1u << 20);
+  auto* other = bc_ctx_new(&f.bdb, &f.bcat);
   REQUIRE(other != nullptr);
   auto none = params({});
   {

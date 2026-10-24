@@ -126,7 +126,7 @@ void count_rows(bc_ctx* cx) {
   bc_emit_count(cx, n);
 }
 
-void unimplemented_call(bc_ctx* cx) { bc_sorter_open(cx, 1024); }
+void unimplemented_call(bc_ctx* cx) { bc_sorter_open(cx); }
 }  // namespace
 
 TEST_CASE("plan API: a cursor's views die when it steps", "[sql][algebra]") {
@@ -149,7 +149,7 @@ TEST_CASE("plan API: the budget ends a plan, and scans stay inside their table",
   CHECK(run(f, count_rows, {Bytes{}}) == BC_COMMITTED);
   CHECK(bc_ctx_affected(f.cx) == 5);
 
-  CHECK(run(f, count_rows, {Bytes{}}, {.max_reads = 3, .deadline_ns = 0}) == BC_FAILED);
+  CHECK(run(f, count_rows, {Bytes{}}, {.max_reads = 3, .max_bytes = 0, .deadline_ns = 0}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_BUDGET);
   CHECK(bc_ctx_affected(f.cx) == -1);
 }
@@ -404,11 +404,11 @@ TEST_CASE("plan API: a write committed across a DDL on its table is a conflict",
 
 namespace {
 // COUNT(DISTINCT qty) over t: each non-NULL qty's key grouped, then the
-// groups counted. Param 0 is the aggregate's bound in bytes.
+// groups counted.
 void count_distinct_qty(bc_ctx* cx) {
   bc_view all = bc_key_end(cx, bc_key_begin(cx, kTbl));
   bc_cursor c = bc_scan_open(cx, kTbl, all, all, BC_SCAN_PREFIX);
-  bc_agg a = bc_agg_open(cx, static_cast<uint32_t>(bc_param_i64(cx, 0)), 0);
+  bc_agg a = bc_agg_open(cx, 0);
   while (bc_scan_next(cx, c)) {
     bc_view row = bc_scan_row(cx, c);
     if (bc_col_null(cx, row, kQtyCol)) continue;
@@ -435,7 +435,7 @@ void insert_wide(bc_ctx* cx) {
 void count_distinct_wide(bc_ctx* cx) {
   bc_view all = bc_key_end(cx, bc_key_begin(cx, kWide));
   bc_cursor c = bc_scan_open(cx, kWide, all, all, BC_SCAN_PREFIX);
-  bc_agg a = bc_agg_open(cx, 1u << 20, 0);
+  bc_agg a = bc_agg_open(cx, 0);
   while (bc_scan_next(cx, c)) (void)bc_agg_group(cx, a, bc_col_key(cx, bc_scan_row(cx, c), 1));
   int64_t n = 0;
   while (bc_agg_next(cx, a, nullptr, nullptr)) ++n;
@@ -449,7 +449,7 @@ void stale_col_key(bc_ctx* cx) {
   (void)bc_scan_next(cx, c);
   bc_view k = bc_col_key(cx, bc_scan_row(cx, c), kQtyCol);
   (void)bc_scan_next(cx, c);
-  bc_agg a = bc_agg_open(cx, 1u << 20, 0);
+  bc_agg a = bc_agg_open(cx, 0);
   (void)bc_agg_group(cx, a, k);
   bc_emit_count(cx, 1);
 }
@@ -466,11 +466,19 @@ TEST_CASE("plan API: an aggregate's groups, keyed by a column, and the range che
     REQUIRE(run(f, insert_plan_ok, {id, bytes("n"), qty}) == BC_COMMITTED);
   }
   // Equal values give equal keys: three groups, the NULL skipped.
-  CHECK(run(f, count_distinct_qty, {std::int64_t{1} << 20}) == BC_COMMITTED);
+  CHECK(run(f, count_distinct_qty, {}) == BC_COMMITTED);
   CHECK(bc_ctx_affected(f.cx) == 3);
-  // A bound the keys outgrow is BC_E_MEMORY, never a wrong count.
-  CHECK(run(f, count_distinct_qty, {std::int64_t{8}}) == BC_FAILED);
-  CHECK(bc_error(f.cx) == BC_E_MEMORY);
+  // A memory budget the groups outgrow is BC_E_LIMIT, never a wrong count:
+  // every budget below the one that suffices fails.
+  for (std::uint64_t budget = 1;; ++budget) {
+    REQUIRE(budget < 4096);
+    INFO("budget " << budget);
+    if (run(f, count_distinct_qty, {}, {.max_reads = 0, .max_bytes = budget, .deadline_ns = 0}) == BC_COMMITTED) {
+      CHECK(bc_ctx_affected(f.cx) == 3);
+      break;
+    }
+    CHECK(bc_error(f.cx) == BC_E_LIMIT);
+  }
   // A scan's group key lives as long as its entry, outside the arena.
   CHECK(run(f, stale_col_key, {}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
@@ -487,4 +495,85 @@ TEST_CASE("plan API: an aggregate's groups, keyed by a column, and the range che
   CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
   CHECK(bc_error_detail(f.cx) == ((std::uint32_t{BC_C_RANGE} << 24) | kTbl));
   CHECK(std::string{bc_error_message(f.cx)}.starts_with("integer out of range"));
+}
+
+namespace {
+// SELECT id, name, qty FROM t WHERE id = $1.
+void point_select(bc_ctx* cx) {
+  bool found = false;
+  bc_view row = bc_get(cx, bc_key_params(cx, kTbl, 0, 1), &found);
+  if (!found) return;
+  bc_emit_begin(cx);
+  bc_emit_col(cx, row, kIdCol);
+  bc_emit_col(cx, row, kNameCol);
+  bc_emit_col(cx, row, kQtyCol);
+  bc_emit_end(cx);
+}
+
+// Every row of t, counted: a scan holds one entry at a time.
+void scan_all(bc_ctx* cx) {
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  int64_t n = 0;
+  while (bc_scan_next(cx, c)) n = bc_add(cx, n, bc_col_null(cx, bc_scan_row(cx, c), kQtyCol) ? 0 : 1);
+  bc_emit_count(cx, n);
+}
+
+auto memory_budget(std::uint64_t bytes) -> bc_budget { return {.max_reads = 0, .max_bytes = bytes, .deadline_ns = 0}; }
+}  // namespace
+
+TEST_CASE("plan API: a statement is charged the bytes it holds, exactly, and past its budget fails with BC_E_LIMIT",
+          "[sql][algebra][memory]") {
+  Fixture f;
+  // An insert holds the row it built: its write set is not charged. Row 2
+  // is row 1's size, and measures it.
+  auto row_key = [&](std::int64_t id) {
+    Bytes k;
+    bytecask::sql::key_put_prefix(k, bytecask::sql::kNsRow, kTbl);
+    bytecask::sql::key_put_i64(k, id, f.cat().key_layout(kTbl)->parts[0]);
+    return k;
+  };
+  REQUIRE(run(f, insert_plan_ok, {std::int64_t{2}, bytes("bobby"), std::int64_t{6}}) == BC_COMMITTED);
+  Bytes stored;
+  REQUIRE(f.db->get({}, row_key(2), stored));
+  const auto key = row_key(1);
+  std::vector<bc_value> row1{std::int64_t{1}, bytes("alice"), std::int64_t{5}};
+  CHECK(run(f, insert_plan_ok, row1, memory_budget(stored.size() - 1)) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LIMIT);
+  CHECK(std::string{bc_error_message(f.cx)}.find("memory budget") != std::string::npos);
+  Bytes out;
+  CHECK_FALSE(f.db->get({}, key, out));  // nothing committed
+  CHECK(run(f, insert_plan_ok, row1, memory_budget(stored.size())) == BC_COMMITTED);
+  CHECK(f.db->get({}, key, out));
+
+  // A point read holds the key it built, the row it read and the result row
+  // with its 4-byte length.
+  const std::vector<PhysType> types{PhysType::I64, PhysType::Bytes, PhysType::I64};
+  auto select = [&](bc_budget budget) {
+    auto ps = params({std::int64_t{1}});
+    SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), type_codes(types), f.cat().version()};
+    auto ref = sr.get();
+    return bc_execute(f.cx, point_select, &ref, &ps, budget, false, 0);
+  };
+  REQUIRE(select({}) == BC_COMMITTED);
+  const std::uint8_t* row = nullptr;
+  std::uint32_t len = 0;
+  REQUIRE(bc_ctx_next_result(f.cx, &row, &len));
+  const auto exact = key.size() + stored.size() + 4 + len;
+  CHECK(select(memory_budget(exact)) == BC_COMMITTED);
+  CHECK(f.results(types) == std::vector<std::vector<bc_value>>{row1});
+  CHECK(select(memory_budget(exact - 1)) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_LIMIT);
+  // The budget is the statement's: the next one starts from nothing.
+  CHECK(select(memory_budget(exact)) == BC_COMMITTED);
+}
+
+TEST_CASE("plan API: a scan holds one entry at a time against the memory budget", "[sql][algebra][memory]") {
+  Fixture f;
+  constexpr std::int64_t kRows = 50;
+  for (std::int64_t id = 1; id <= kRows; ++id) {
+    REQUIRE(run(f, insert_plan_ok, {id, bytes("name-" + std::to_string(id)), id}) == BC_COMMITTED);
+  }
+  // 50 rows hold over 1,000 bytes; a scan keeps only its bounds and the entry it is on.
+  CHECK(run(f, scan_all, {}, memory_budget(256)) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == kRows);
 }
