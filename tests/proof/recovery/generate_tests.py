@@ -23,6 +23,7 @@ from tests.proof.recovery.expected_delta import (
     recovery_delta,
 )
 from tests.proof.recovery.fault_point_resolver import (
+    FaultTarget,
     RecoveryFault,
     resolve_recovery_fault,
 )
@@ -159,29 +160,39 @@ def gen_fault_block(
         p.append("  // A hint cannot be regenerated. recovery_prepare_files calls")
         p.append("  // flush_hints_for without a catch, so open fails.")
     p.append("  {")
-    if fault.fail_on_nth is not None:
-        # Before the injector is armed: measuring the read takes reads too,
-        # under an injector of its own.
-        p.append(f"    const int fail_on = {fault.fail_on_nth};")
+    armed = fault.target != FaultTarget.EVERY_CALL
+    if fault.target == FaultTarget.FIRST_CALL:
+        # Before the injector is armed: measuring a hint reads its own, under
+        # an injector of its own.
+        p.append("    const int fail_on = 1;")
+    elif fault.target == FaultTarget.FIRST_SCAN_READ:
+        p.append(f"    const int fail_on = first_hint_scan_read(dir, {opts});")
     p.append(f'    bytecask::testing::ScopedFaultInjector fi{{"{fault.name}"}};')
-    if fault.fail_on_nth is not None:
+    if armed:
         p.append("    fi.inj.fail_on_nth_match = fail_on;")
-    if delta.phase == HintReadPhase.VERIFIED:
-        p.append(f"    auto db = bytecask::DB::open(dir, {opts});")
-        p.append("    // The reads after the failure are the rebuild re-reading the")
-        p.append("    // hint it replaced: no file went unindexed behind its hint.")
-        p.append("    REQUIRE(fi.inj.name_matches > fail_on);")
-        p.append("    CHECK_FALSE(db.is_degraded());")
-        p.extend(gen_key_checks(state))
-        p.append("  }")
-    elif delta.phase == HintReadPhase.SCAN:
+    if delta.open_throws:
+        # What the throw is does not vary by phase: a hint write failure
+        # propagates out of open untouched, and a read failure that is not
+        # answered by a rebuild propagates as the read's own error.
         p.append(f"    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {opts}),")
         p.append("                      std::system_error);")
-        p.append("    REQUIRE(fi.inj.name_matches >= fail_on);")
-        p.append("  }")
+        if armed:
+            p.append("    REQUIRE(fi.inj.name_matches >= fail_on);")
     else:
-        p.append(f"    REQUIRE_THROWS(bytecask::DB::open(dir, {opts}));")
-        p.append("  }")
+        p.append("    const auto hint = first_hint_of(dir);")
+        p.append("    const auto replaced = hint_identity(hint);")
+        p.append(f"    auto db = bytecask::DB::open(dir, {opts});")
+        if armed:
+            p.append("    REQUIRE(fi.inj.name_matches >= fail_on);")
+        p.append("    // Where a hint stood before the open the rebuild replaced it —")
+        p.append("    // a hint that cannot be read is removed and its data file")
+        p.append("    // indexed again — and where the cell left none, the keys below")
+        p.append("    // are the proof: after a read failed, only the data files could")
+        p.append("    // have supplied them.")
+        p.append("    CHECK(hint_identity(hint) != replaced);")
+        p.append("    CHECK_FALSE(db.is_degraded());")
+        p.extend(gen_key_checks(state))
+    p.append("  }")
     return p
 
 
@@ -246,7 +257,9 @@ using bytecask::testing::assert_consistent;
 using bytecask::testing::corrupt_newest_hint;
 using bytecask::testing::drop_all_hints;
 using bytecask::testing::drop_newest_hint;
+using bytecask::testing::first_hint_of;
 using bytecask::testing::first_hint_scan_read;
+using bytecask::testing::hint_identity;
 using bytecask::testing::to_bytes;
 using bytecask::testing::to_string;
 

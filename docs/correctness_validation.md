@@ -1132,6 +1132,8 @@ checkpoint over two phases:
 
 Both run at `recovery_threads = 1` and no other thread count: the injector
 is thread-local and at one thread recovery reads on the thread that opens.
+Arming it across recovery's workers — and with that what a failed read costs
+parallel recovery — is deferred to #599.
 A hint file's first read is always in the pass that verifies it, so the
 verified cell fails read 1. The scan cell finds its read at run time:
 `first_hint_scan_read` (tests/proof/hint_reads.h) walks the file set the way
@@ -1420,7 +1422,7 @@ write on new leader → backward sync → verify convergence).
 
 | File | Role |
 |------|------|
-| [`hint_reads.h`](../tests/proof/hint_reads.h) | `hint_open_pass`, `first_hint_scan_read` — where the reads of a hint file fall, for a test that fails one of them (needs `import bytecask.hint_file`) |
+| [`hint_reads.h`](../tests/proof/hint_reads.h) | `hint_reads`, `first_hint_of`, `hint_identity`, `first_hint_scan_read` — where the reads of a hint file fall, for a test that fails one of them (needs `import bytecask.hint_file`) |
 | [`invariants.h`](../tests/proof/invariants.h) | `capture_baseline`, `assert_consistent`, `assert_delta`, `assert_recoverable`, `assert_resumable`, `assert_keys_recoverable`, `VacuumBaseline`, `capture_vacuum_baseline`, `find_vacuum_target`, `count_structural_entries`, `assert_structural_entries_preserved`, `assert_vacuum_success`, `assert_vacuum_no_change`, `assert_vacuum_recoverable`, `OwnedEntries`, `collect_changes`, `ReplicationBaseline`, `capture_replication_baseline`, `assert_replication_match`, `assert_replication_no_change`, `assert_replication_recovery`, `assert_durable_boundary`, `make_durable`, `durable_watermark`, `apply_delta`, `assert_power_loss_outcome`, `assert_hints_durable`, `assert_stream_survives_power_loss` |
 
 ### Fault injection modes

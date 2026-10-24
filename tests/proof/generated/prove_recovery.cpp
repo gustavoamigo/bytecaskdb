@@ -31,7 +31,9 @@ using bytecask::testing::assert_consistent;
 using bytecask::testing::corrupt_newest_hint;
 using bytecask::testing::drop_all_hints;
 using bytecask::testing::drop_newest_hint;
+using bytecask::testing::first_hint_of;
 using bytecask::testing::first_hint_scan_read;
+using bytecask::testing::hint_identity;
 using bytecask::testing::to_bytes;
 using bytecask::testing::to_string;
 
@@ -193,7 +195,8 @@ TEST_CASE("prove_recovery__crash_hintless__hint_write_fails__t1", "[prove_recove
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 1}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -261,7 +264,8 @@ TEST_CASE("prove_recovery__crash_hintless__hint_write_fails__t4", "[prove_recove
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 4}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -329,7 +333,8 @@ TEST_CASE("prove_recovery__crash_hintless__hint_sync_fails__t1", "[prove_recover
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 1}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -397,7 +402,8 @@ TEST_CASE("prove_recovery__crash_hintless__hint_sync_fails__t4", "[prove_recover
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 4}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -465,7 +471,8 @@ TEST_CASE("prove_recovery__crash_hintless__hint_rename_fails__t1", "[prove_recov
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 1}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -533,7 +540,8 @@ TEST_CASE("prove_recovery__crash_hintless__hint_rename_fails__t4", "[prove_recov
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 4}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -606,10 +614,16 @@ TEST_CASE("prove_recovery__crash_hintless__hint_read_fails_while_verified__t1", 
     const int fail_on = 1;
     bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
     fi.inj.fail_on_nth_match = fail_on;
+    const auto hint = first_hint_of(dir);
+    const auto replaced = hint_identity(hint);
     auto db = bytecask::DB::open(dir, {.recovery_threads = 1});
-    // The reads after the failure are the rebuild re-reading the
-    // hint it replaced: no file went unindexed behind its hint.
-    REQUIRE(fi.inj.name_matches > fail_on);
+    REQUIRE(fi.inj.name_matches >= fail_on);
+    // Where a hint stood before the open the rebuild replaced it —
+    // a hint that cannot be read is removed and its data file
+    // indexed again — and where the cell left none, the keys below
+    // are the proof: after a read failed, only the data files could
+    // have supplied them.
+    CHECK(hint_identity(hint) != replaced);
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;
@@ -718,7 +732,7 @@ TEST_CASE("prove_recovery__crash_hintless__hint_read_fails_during_scan__t1", "[p
   // those that open the first hint with anything to scan is a read
   // of its scan.
   {
-    const int fail_on = first_hint_scan_read(dir);
+    const int fail_on = first_hint_scan_read(dir, {.recovery_threads = 1});
     bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
     fi.inj.fail_on_nth_match = fail_on;
     REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 1}),
@@ -909,7 +923,8 @@ TEST_CASE("prove_recovery__multi_file_hintless__hint_write_fails__t1", "[prove_r
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -977,7 +992,8 @@ TEST_CASE("prove_recovery__multi_file_hintless__hint_write_fails__t4", "[prove_r
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -1045,7 +1061,8 @@ TEST_CASE("prove_recovery__multi_file_hintless__hint_sync_fails__t1", "[prove_re
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -1113,7 +1130,8 @@ TEST_CASE("prove_recovery__multi_file_hintless__hint_sync_fails__t4", "[prove_re
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -1181,7 +1199,8 @@ TEST_CASE("prove_recovery__multi_file_hintless__hint_rename_fails__t1", "[prove_
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -1249,7 +1268,8 @@ TEST_CASE("prove_recovery__multi_file_hintless__hint_rename_fails__t4", "[prove_
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -1322,10 +1342,16 @@ TEST_CASE("prove_recovery__multi_file_hintless__hint_read_fails_while_verified__
     const int fail_on = 1;
     bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
     fi.inj.fail_on_nth_match = fail_on;
+    const auto hint = first_hint_of(dir);
+    const auto replaced = hint_identity(hint);
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1});
-    // The reads after the failure are the rebuild re-reading the
-    // hint it replaced: no file went unindexed behind its hint.
-    REQUIRE(fi.inj.name_matches > fail_on);
+    REQUIRE(fi.inj.name_matches >= fail_on);
+    // Where a hint stood before the open the rebuild replaced it —
+    // a hint that cannot be read is removed and its data file
+    // indexed again — and where the cell left none, the keys below
+    // are the proof: after a read failed, only the data files could
+    // have supplied them.
+    CHECK(hint_identity(hint) != replaced);
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;
@@ -1434,7 +1460,7 @@ TEST_CASE("prove_recovery__multi_file_hintless__hint_read_fails_during_scan__t1"
   // those that open the first hint with anything to scan is a read
   // of its scan.
   {
-    const int fail_on = first_hint_scan_read(dir);
+    const int fail_on = first_hint_scan_read(dir, {.max_file_bytes = 120, .recovery_threads = 1});
     bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
     fi.inj.fail_on_nth_match = fail_on;
     REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}),
@@ -1625,7 +1651,8 @@ TEST_CASE("prove_recovery__damaged_hint__hint_write_fails__t1", "[prove_recovery
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -1693,7 +1720,8 @@ TEST_CASE("prove_recovery__damaged_hint__hint_write_fails__t4", "[prove_recovery
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -1761,7 +1789,8 @@ TEST_CASE("prove_recovery__damaged_hint__hint_sync_fails__t1", "[prove_recovery]
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -1829,7 +1858,8 @@ TEST_CASE("prove_recovery__damaged_hint__hint_sync_fails__t4", "[prove_recovery]
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -1897,7 +1927,8 @@ TEST_CASE("prove_recovery__damaged_hint__hint_rename_fails__t1", "[prove_recover
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -1965,7 +1996,8 @@ TEST_CASE("prove_recovery__damaged_hint__hint_rename_fails__t4", "[prove_recover
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 4}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -2038,10 +2070,16 @@ TEST_CASE("prove_recovery__damaged_hint__hint_read_fails_while_verified__t1", "[
     const int fail_on = 1;
     bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
     fi.inj.fail_on_nth_match = fail_on;
+    const auto hint = first_hint_of(dir);
+    const auto replaced = hint_identity(hint);
     auto db = bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1});
-    // The reads after the failure are the rebuild re-reading the
-    // hint it replaced: no file went unindexed behind its hint.
-    REQUIRE(fi.inj.name_matches > fail_on);
+    REQUIRE(fi.inj.name_matches >= fail_on);
+    // Where a hint stood before the open the rebuild replaced it —
+    // a hint that cannot be read is removed and its data file
+    // indexed again — and where the cell left none, the keys below
+    // are the proof: after a read failed, only the data files could
+    // have supplied them.
+    CHECK(hint_identity(hint) != replaced);
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;
@@ -2150,7 +2188,7 @@ TEST_CASE("prove_recovery__damaged_hint__hint_read_fails_during_scan__t1", "[pro
   // those that open the first hint with anything to scan is a read
   // of its scan.
   {
-    const int fail_on = first_hint_scan_read(dir);
+    const int fail_on = first_hint_scan_read(dir, {.max_file_bytes = 120, .recovery_threads = 1});
     bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
     fi.inj.fail_on_nth_match = fail_on;
     REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.max_file_bytes = 120, .recovery_threads = 1}),
@@ -2362,7 +2400,8 @@ TEST_CASE("prove_recovery__hintless_batched__hint_write_fails__t1", "[prove_reco
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 1}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -2437,7 +2476,8 @@ TEST_CASE("prove_recovery__hintless_batched__hint_write_fails__t4", "[prove_reco
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 4}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -2512,7 +2552,8 @@ TEST_CASE("prove_recovery__hintless_batched__hint_sync_fails__t1", "[prove_recov
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 1}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -2587,7 +2628,8 @@ TEST_CASE("prove_recovery__hintless_batched__hint_sync_fails__t4", "[prove_recov
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 4}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -2662,7 +2704,8 @@ TEST_CASE("prove_recovery__hintless_batched__hint_rename_fails__t1", "[prove_rec
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 1}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -2737,7 +2780,8 @@ TEST_CASE("prove_recovery__hintless_batched__hint_rename_fails__t4", "[prove_rec
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 4}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -2817,10 +2861,16 @@ TEST_CASE("prove_recovery__hintless_batched__hint_read_fails_while_verified__t1"
     const int fail_on = 1;
     bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
     fi.inj.fail_on_nth_match = fail_on;
+    const auto hint = first_hint_of(dir);
+    const auto replaced = hint_identity(hint);
     auto db = bytecask::DB::open(dir, {.recovery_threads = 1});
-    // The reads after the failure are the rebuild re-reading the
-    // hint it replaced: no file went unindexed behind its hint.
-    REQUIRE(fi.inj.name_matches > fail_on);
+    REQUIRE(fi.inj.name_matches >= fail_on);
+    // Where a hint stood before the open the rebuild replaced it —
+    // a hint that cannot be read is removed and its data file
+    // indexed again — and where the cell left none, the keys below
+    // are the proof: after a read failed, only the data files could
+    // have supplied them.
+    CHECK(hint_identity(hint) != replaced);
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;
@@ -2936,7 +2986,7 @@ TEST_CASE("prove_recovery__hintless_batched__hint_read_fails_during_scan__t1", "
   // those that open the first hint with anything to scan is a read
   // of its scan.
   {
-    const int fail_on = first_hint_scan_read(dir);
+    const int fail_on = first_hint_scan_read(dir, {.recovery_threads = 1});
     bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
     fi.inj.fail_on_nth_match = fail_on;
     REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 1}),
@@ -3116,7 +3166,8 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_write_fails__t1", "[prove_re
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 1}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -3177,7 +3228,8 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_write_fails__t4", "[prove_re
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_write"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 4}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -3238,7 +3290,8 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_sync_fails__t1", "[prove_rec
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 1}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -3299,7 +3352,8 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_sync_fails__t4", "[prove_rec
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_sync"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 4}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -3360,7 +3414,8 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_rename_fails__t1", "[prove_r
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 1}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 1}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -3421,7 +3476,8 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_rename_fails__t4", "[prove_r
   // flush_hints_for without a catch, so open fails.
   {
     bytecask::testing::ScopedFaultInjector fi{"io_hint_rename"};
-    REQUIRE_THROWS(bytecask::DB::open(dir, {.recovery_threads = 4}));
+    REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 4}),
+                      std::system_error);
   }
 
   // The fault clears. A hint is an index, not the record: the
@@ -3487,10 +3543,16 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_read_fails_while_verified__t
     const int fail_on = 1;
     bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
     fi.inj.fail_on_nth_match = fail_on;
+    const auto hint = first_hint_of(dir);
+    const auto replaced = hint_identity(hint);
     auto db = bytecask::DB::open(dir, {.recovery_threads = 1});
-    // The reads after the failure are the rebuild re-reading the
-    // hint it replaced: no file went unindexed behind its hint.
-    REQUIRE(fi.inj.name_matches > fail_on);
+    REQUIRE(fi.inj.name_matches >= fail_on);
+    // Where a hint stood before the open the rebuild replaced it —
+    // a hint that cannot be read is removed and its data file
+    // indexed again — and where the cell left none, the keys below
+    // are the proof: after a read failed, only the data files could
+    // have supplied them.
+    CHECK(hint_identity(hint) != replaced);
     CHECK_FALSE(db.is_degraded());
     {
       bytecask::Bytes out;
@@ -3582,7 +3644,7 @@ TEST_CASE("prove_recovery__hintless_range_del__hint_read_fails_during_scan__t1",
   // those that open the first hint with anything to scan is a read
   // of its scan.
   {
-    const int fail_on = first_hint_scan_read(dir);
+    const int fail_on = first_hint_scan_read(dir, {.recovery_threads = 1});
     bytecask::testing::ScopedFaultInjector fi{"io_hint_read"};
     fi.inj.fail_on_nth_match = fail_on;
     REQUIRE_THROWS_AS(bytecask::DB::open(dir, {.recovery_threads = 1}),

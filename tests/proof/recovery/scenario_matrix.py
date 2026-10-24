@@ -29,6 +29,8 @@
 # after entries were applied, so the open throws. The two phases are two
 # failure classes, and they run at one thread only: the injector is
 # thread-local and at one thread recovery reads on the thread that opens.
+# Arming it across recovery's workers, and with that the parallel half of
+# this answer, is #599.
 
 from __future__ import annotations
 

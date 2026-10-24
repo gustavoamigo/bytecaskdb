@@ -3,40 +3,48 @@
 #
 # Maps RecoveryFailureClass to the hint faults, which mirror what the data
 # file already has: write, sync, rename. The read side has one fault point and
-# two phases, so a read class also says which read fails.
+# two phases, so a read class also says which read of it fails.
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Optional
 
 from .scenario_matrix import RecoveryFailureClass
+
+
+class FaultTarget(Enum):
+    # Fail every checkpoint of the name: right where there is one call of it,
+    # the three hint writes.
+    EVERY_CALL = "every_call"
+    # The first checkpoint of the name: a hint file's first read is the one in
+    # the pass that verifies it.
+    FIRST_CALL = "first_call"
+    # The first read of a scan. Where that read falls is a property of the
+    # directory and of the recovery code, so generate_tests.py asks for it at
+    # run time rather than spelling a C++ expression here.
+    FIRST_SCAN_READ = "first_scan_read"
 
 
 @dataclass(frozen=True)
 class RecoveryFault:
     # The FAULT_INJECTION name to arm.
     name: str
-    # A C++ expression for FaultInjector::fail_on_nth_match: which matching
-    # checkpoint fails. None keeps the default — fail every checkpoint of the
-    # name — which is right where there is one call of it, the three hint
-    # writes. A hint is read many times, so a read class names the read that
-    # lands in the phase it models. The generator computes the expression
-    # into a local before it arms the injector.
-    fail_on_nth: Optional[str] = None
+    # Which checkpoint of the name fails.
+    target: FaultTarget = FaultTarget.EVERY_CALL
 
 
 _FAULTS = {
     RecoveryFailureClass.RC1: RecoveryFault("io_hint_write"),
     RecoveryFailureClass.RC2: RecoveryFault("io_hint_sync"),
     RecoveryFailureClass.RC3: RecoveryFault("io_hint_rename"),
-    # A hint's first read is the one in the pass that verifies it.
-    RecoveryFailureClass.RC4: RecoveryFault("io_hint_read", "1"),
-    # The read after those that verify the hint the first data file's scan
-    # reads is the first read of that scan.
-    RecoveryFailureClass.RC5: RecoveryFault(
-        "io_hint_read", "first_hint_scan_read(dir)"
-    ),
+    # The two phases a hint read fails in: what DB::open does about the
+    # failure is decided by the phase, so each phase takes its own cell.
+    RecoveryFailureClass.RC4: RecoveryFault("io_hint_read",
+                                            FaultTarget.FIRST_CALL),
+    RecoveryFailureClass.RC5: RecoveryFault("io_hint_read",
+                                            FaultTarget.FIRST_SCAN_READ),
 }
 
 
