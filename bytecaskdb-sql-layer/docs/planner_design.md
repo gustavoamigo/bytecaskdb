@@ -1,13 +1,12 @@
 # The planner: a logical algebra, a search, and compiled pipelines
 
-Status: **design, approved (owner, 2026-10-24); slices 1 and 3 built,
-and slice 2 but for its choice points** (*Slice 1 as built*, *Slice 2 as
-built*): the pipeline, then System R's search with the cost model, and
-slice 3, *Memory*: the statement budget and the lifetime rule
-(`plan_api_design.md`, revision 7), and #551 with it. The choice points
-(*Choosing at run time*) and slices 4 and 5 are not built. The first of the
-post-MVP designs (#487, *Next*). The parser, the plan API and TinyCC are
-unchanged; the binder's output changed.
+Status: **design, approved (owner, 2026-10-24); slices 1, 2 and 3 built**
+(*Slice 1 as built*, *Slice 2 as built*): the pipeline, then System R's
+search with the cost model and the choice points (*Choice points as
+built*), and slice 3, *Memory*: the statement budget and the lifetime rule
+(`plan_api_design.md`, revision 7), and #551 with it. Slices 4 and 5 are
+not built. The first of the post-MVP designs (#487, *Next*). The parser,
+the plan API and TinyCC are unchanged; the binder's output changed.
 
 ## Why
 
@@ -643,11 +642,13 @@ replaced it.
 
 ## Slice 2 as built
 
-System R's search and the cost model, without the choice points: a bound
-that depends on `$n` takes the fixed selectivities. Every golden plan,
-TPROC-C's and the fixture's, regenerated unchanged, byte for byte, so no
-statement's reads changed. The TPROC-C statements compiled on the
-harness's loaded database, with its counts, give their golden plans too.
+System R's search and the cost model. It was built in two steps: the
+search and the cost model first, a bound that depends on `$n` taking the
+fixed selectivities; then the choice points (*Choice points as built*).
+Through both, every TPROC-C golden plan regenerated unchanged, byte for
+byte, so no TPROC-C statement's reads changed. The TPROC-C statements
+compiled on the harness's loaded database, with its counts, give their
+golden plans too.
 
 **The source.** The search flattens what the statement reads into its
 tables, in `FROM` order, each with the conjuncts on it, and the join's
@@ -663,11 +664,14 @@ Anything else is refused (*What the search refuses*).
 - The point lookup, when the whole primary key is compared for equality.
 - A scan of the primary key and of each index whose first part is
   compared: the equality prefix, the range on the next part, forward or
-  reverse, covering when every column read is in the key and no filter
-  reads the row. A table read once under one row (*Joins*) is covering
-  when nothing reads its columns: no result, aggregate or join conjunct.
-  A scan of the whole primary key by equality is the point lookup, not
-  built twice.
+  reverse. It covers when no filter reads its rows and its key holds every
+  column read from them: the table's result and aggregate columns, and
+  its join conjuncts' columns, which a key built from the row or a filter
+  on the pair reads. One rule for every table, in a join or alone; a
+  covered column is read from the entry's key wherever a row's would be.
+  A table read once under a join conjunct is filtered by it, so that scan
+  reads its rows. A scan of the whole primary key by equality is the point
+  lookup, not built twice.
 - No full scan (slice 4).
 
 **Joins.** Left-deep, bottom up over sets of tables: each set of k tables
@@ -716,6 +720,7 @@ a plan beside the loop over the same scan, and costs decide between them.
 | A join read once | the outer plan's cost, plus the inner scan's |
 | `COUNT(DISTINCT)` | its input's, plus 1 per row (`bc_agg_next`) |
 | Under `LIMIT n` | the cost × n / the rows, when there are more than n |
+| A choice point | the plan's, as compiled, plus 2 for the count |
 
 - **Entries.** A scan reaches the table's rows × 1/10 per
   equality-compared part × 1/3 per range bound. It reaches at most 1 when
@@ -755,6 +760,74 @@ keeps, its parameter drawn as a row's own value:
 - A range's 1/3 is the number to revisit when a workload's choice turns on
   it.
 - The per-row weight of a sort or hash build waits for slice 4.
+
+### Choice points as built
+
+The design's *Choosing at run time*, in the search (`choose`), the physical
+plan (`Choice`) and codegen. Every bound in today's dialect depends on
+`$n`, so every scan's count is unknown when the plan is compiled.
+
+**Where they go.** At each table a plan reads by a scan, outer first: the
+first table's access, or the table read once under one row. Never at a
+point lookup or a lookup by key, nor at a scan whose bounds name at most
+one row (a unique index's whole key). The plan's access path is the first
+plan; the second is another range of the same table, from its access
+paths. Of those whose costs cross the first one's, the cheapest at the
+estimates is taken, so each choice point has exactly two plans. One per
+table, and at most 4 per plan (*Decisions*, 11): past that, the search
+keeps its compile-time choice. A plan of today's dialect holds at most
+one, since a table is read once only under a point lookup.
+
+**The threshold.** Each plan's cost is the whole statement's, as the cost
+model finishes it (a join's lookups, `LIMIT`, `COUNT(DISTINCT)`), with the
+first plan's count as the variable: the threshold is the least count, from
+1 to the table's rows, at which the first plan costs more than the second.
+The two ranges' counts are related where their bounds are: a range whose
+bounds take only conjuncts the other's take holds the other's rows, so its
+count is at least the other's; one whose bounds take more holds at most
+the other's. Costs that only meet, as where one range holds the other's
+rows, never cross, and get no choice point. Neither does a pair whose
+costs cross only past the table's rows, or at a count of 1. So under
+`LIMIT 1` a scan with no filter costs its first entry whatever its count,
+and gets none.
+- `WHERE a = $1 AND b = $2` with indexes on `a` and on `b`, 10,000 rows:
+  each scan reaches 1,000 entries and fetches each row, 2,000. Past 1,000
+  of `a`'s entries its scan costs more than `b`'s: threshold 1,001.
+- The plan's cost is its first plan's plus the count's 2.
+
+**The plan text.**
+
+```c
+int64_t count0 = 0;
+{
+  bc_view lo = …;                     /* the first plan's range, a NULL split's whole prefix */
+  bc_view hi = …;
+  count0 = bc_count_range(cx, IDX_6, lo, hi, 50001);
+}
+if (count0 < 50001) {
+  /* the first plan's scan and filters, then the consumer */
+} else {
+  /* the second plan's, then the consumer again */
+}
+```
+
+The count is limited to the threshold, and its two record reads are
+charged like any read. The consumer, from a join's lookup to the sink, is
+printed once per branch. Each plan's parameters are checked for NULL and
+its `$n ± k` computed before anything is read, as any plan's.
+
+**What `check()` adds.** A choice point counts its first plan's range, with
+a threshold of 0 or more; each plan is a scan of the counted table.
+
+**Golden plans.** None of TPROC-C's gains one. Three statements have two
+ranges of one table: O1 and P5 count `customer`'s by `bc_count_range`,
+whose cost is 2 at any count, and O4's two costs under `LIMIT 1` never
+cross (`orders_i2`'s first entry ends its scan, and the primary key's
+range holds its rows). Every other statement has one range per table, or
+a key lookup. The fixture's
+`choice_pk_or_index`, `choice_read_once` and `choice_update` show one,
+alone, read once under a point lookup, and in an `UPDATE`;
+`no_choice_under_limit` shows the `LIMIT` case.
 
 ### What the search refuses
 
@@ -809,16 +882,21 @@ PostgreSQL runs each of these; it is the one entry of `frontend_design.md`'s
 ### Tests
 
 - **Alternatives agree.** `search_all` returns every plan the search
-  costed, none pruned, cheapest first. `Database::alternatives_for_testing`
-  (the test build) runs each on its own snapshot. The proof machine runs
+  costed, none pruned, cheapest first. `generate_alternatives` prints each,
+  and a plan with choice points twice, its thresholds overridden
+  (`physical::override_thresholds`): INT64_MAX takes every first plan, 0
+  every second. `Database::alternatives_for_testing` (the test build) runs
+  each on its own snapshot. The proof machine runs
   them after every `SELECT`, aggregate and join it compares with
   PostgreSQL, in autocommit, and checks each plan's rows as it checks the
   layer's. An embedded-API test does the same in C++. The machine
   generates the join where both ways apply: a table named by its key in
   parameters, the other scanned by parameters, and an equality of columns
-  neither key takes linking them (`join_read_once`); now and then a new
-  table takes a column type another has, so joins find columns to
-  compare.
+  neither key takes linking them (`join_read_once`, its links on neither
+  table's key); now and then a new table takes a column type another has,
+  so joins find columns to compare. A fixed test runs both plans of a
+  choice point, alone, read once and in an `UPDATE`
+  (`test_both_plans_of_a_choice_point_agree`).
 - **Choices** (`search_test`). Fixed counts choose the join order; a
   range's count chooses `COUNT` from the keys or by a loop; an `ORDER BY`
   keeps the plan in its order where another costs less, and a `LIMIT`
@@ -826,20 +904,19 @@ PostgreSQL runs each of these; it is the one entry of `frontend_design.md`'s
   covering scan a fetching one; a table keyed by parameters alone is read
   once, before the other's scan, covering when nothing reads it, and the
   join's conjuncts filter it and its rows; a refusal names the failure of a
-  plan of every table.
+  plan of every table. Choice points: fixed counts give the threshold the
+  plan prints, at a table alone and read once; none where one range lies
+  inside the other, under a `LIMIT` its scan's first entry ends, or at a
+  unique index or a point lookup.
 - **`physical::check`** (`physical_test`): a nested loop's outer side is
-  one row, its inner side a scan, and an inner filter reads no column but
-  the outer side's.
+  one row, its inner side a scan, or a choice of two, and an inner filter
+  compares a column of the inner table, read from its row, so never over
+  a covering scan, with no column but the outer side's; a choice point
+  counts its first plan's range, and each plan is a scan of its table.
 - **The search's model** in the proof machine (`served`, `join_served`)
   says whether some plan serves a statement, as the search now does.
 - **The harness**, 2 warehouses, 4 threads, 30 s: 237,014 TPM, 106,092
   NOPM, and the consistency conditions hold after the run and in `check`.
-
-### Not built
-
-The choice points (*Choosing at run time*): the search takes the fixed
-selectivities where they would go, and alternatives-agree has no branches
-to run yet.
 
 ## Proposed `CONTRACT.md` changes
 

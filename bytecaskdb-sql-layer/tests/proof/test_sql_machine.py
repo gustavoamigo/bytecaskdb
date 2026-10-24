@@ -688,7 +688,7 @@ class SqlMachine(RuleBasedStateMachine):
             if out.error is None:
                 self.alternatives_agree(sql, params, types, out.rows, None, None)
             return
-        layer = o.run_layer(self.db if self.txn is None else self.txn, sql, [o.to_layer(v, ty) for v, ty in zip(params, types)])
+        layer = self.layer(sql, params, types)
         full = o.run_pg(self.pg.conn, pg_sql, params)
         assert layer.error == full.error, f"{sql} {params!r}: the layer {layer.error or 'ran it'} ({layer.detail}), PostgreSQL {full.error or 'ran it'} ({full.detail})"
         if layer.error is not None:
@@ -1072,7 +1072,7 @@ class SqlMachine(RuleBasedStateMachine):
         a_name, b_name = data.draw(st.permutations(sorted(self.tables)), label="tables")[:2]
         a, b = self.tables[a_name], self.tables[b_name]
         pairs = [(x.name, y.name) for x in b.columns if x.name not in b.pk
-                 for y in a.columns if y.type.sql == x.type.sql]
+                 for y in a.columns if y.name not in a.pk and y.type.sql == x.type.sql]
         if not pairs:
             return
         links = data.draw(st.lists(st.sampled_from(pairs), min_size=1, max_size=2, unique=True), label="links")
@@ -1939,6 +1939,41 @@ def test_count_distinct(dsn):
                 m.select("t0", [], [("c0", "=", key)], count=arg, distinct=True)
             m.select("t0", [], [("c0", "=", 1), ("c1", "=", 3)], count=arg, distinct=True)
             m.select("t0", [], [("c0", "=", 1)], count=arg, distinct=True, limit=0)
+    finally:
+        m.teardown()
+
+
+def test_both_plans_of_a_choice_point_agree(dsn):
+    """Two indexes of one table each reach the rows a WHERE asks for: the
+    plan counts the first one's range when it runs, and scans it, or the
+    other past the threshold (docs/planner_design.md, *Choosing at run
+    time*). Each plan of the choice point, forced in turn, agrees with
+    PostgreSQL, alone, read once under a join, and in an UPDATE."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER), Column("c2", o.INTEGER),
+                              Column("c3", o.INTEGER)], ["c0"]))
+        m.create_index("t0", Index("t0_c1", [("c1", False)]))
+        m.create_index("t0", Index("t0_c2", [("c2", False)]))
+        m.create(Table("t1", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER)], ["c0"]))
+        # c1 = 0 on most rows, c2 spread: some ranges past the threshold, some below.
+        for k in range(120):
+            m.insert("t0", {"c0": k, "c1": None if k % 17 == 0 else (k % 5 if k % 4 == 0 else 0),
+                            "c2": None if k % 13 == 0 else k % 6, "c3": k % 9}, all_columns=True)
+        m.insert("t1", {"c0": 1, "c1": 3}, all_columns=True)
+        sql = "SELECT c0, c3 FROM t0 WHERE c1 = $1 AND c2 = $2"
+        for c1, c2 in ((0, 0), (4, 0), (0, 5), (3, 3), (None, 1), (0, None)):
+            m.select("t0", ["c0", "c3"], [("c1", "=", c1), ("c2", "=", c2)])
+            if c1 is not None and c2 is not None:
+                # Each index's plan carries a choice point, run once per plan.
+                assert len(m.db._alternatives(sql, (c1, c2))) >= 4
+            m.select("t0", ["c0"], [("c1", "=", c1), ("c2", ">=", c2)])
+            m.select("t0", [], [("c1", "=", c1), ("c2", "=", c2)], count="c3")
+            m.join_on("t0", "t1", [("c1", "=", c1), ("c2", "=", c2)], [("c0", ("param", 1))], [],
+                      [("t0", "c0"), ("t1", "c1")], links=[("c1", "c3")])
+        for c1, c2, v in ((0, 0, 50), (4, 2, 60), (0, 4, 70)):
+            m.write("t0", [("c1", "=", c1), ("c2", "=", c2)], set_to=("c3", "=", v))
+        m.check()
     finally:
         m.teardown()
 

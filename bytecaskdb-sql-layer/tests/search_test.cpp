@@ -317,17 +317,20 @@ TEST_CASE("search: costs choose the join order, from the tables' counts", "[sql]
     return has(g, "bc_scan_open(cx, IDX_" + index + ", lo, lo, BC_SCAN_PREFIX)");
   };
 
-  // a small: scan a's 100 entries for x, fetch each row, and look up b by
-  // its key for each of the 100: 2 * 100 + 100.
+  // a small: scan a's 100 entries for x, covering, since a_x's key holds k,
+  // which the result and the join read; and look up b by its key for each
+  // of the 100: 100 + 100.
   auto small_a = plan_sql(cat, sql, {{"a", 1000}, {"b", 1'000'000}});
   CHECK(scans(small_a, a_x));
   CHECK_FALSE(scans(small_a, b_y));
-  CHECK(small_a.cost == Catch::Approx(300));
+  CHECK_FALSE(has(small_a, "bc_scan_row"));
+  CHECK(has(small_a, "bc_key_part_i64(cx, IDX_" + a_x + ", bc_scan_key(cx, c), PART_" + a_x));
+  CHECK(small_a.cost == Catch::Approx(200));
   // b small: the other order.
   auto small_b = plan_sql(cat, sql, {{"a", 1'000'000}, {"b", 1000}});
   CHECK(scans(small_b, b_y));
   CHECK_FALSE(scans(small_b, a_x));
-  CHECK(small_b.cost == Catch::Approx(300));
+  CHECK(small_b.cost == Catch::Approx(200));
   // Equal: FROM order.
   CHECK(scans(plan_sql(cat, sql, {{"a", 1000}, {"b", 1000}}), a_x));
 }
@@ -362,8 +365,10 @@ TEST_CASE("search: a table keyed by parameters alone is read once, before the ot
   });
   REQUIRE(all.size() == 2);
   CHECK(all[0].source == once.source);
+  // t's scan covers: nothing reads its rows. 100 + 100.
   CHECK(has(all[1], "bc_view row1 = bc_get(cx, bc_key_params(cx, TBL_"));
-  CHECK(all[1].cost == Catch::Approx(300));
+  CHECK_FALSE(has(all[1], "bc_scan_row"));
+  CHECK(all[1].cost == Catch::Approx(200));
 }
 
 TEST_CASE("search: a table read once is filtered by the join's conjuncts, which its cost and rows count",
@@ -524,5 +529,115 @@ TEST_CASE("search: search_all returns every plan it costed, cheapest first, the 
   CHECK(plans[0].source == plan_sql(cat, "SELECT count(*) FROM o WHERE a = $1").source);
   // k by the primary key, by o_a and by o_ab; a point lookup keeps its one plan.
   CHECK(all("SELECT a FROM o WHERE k = $1").size() == 1);
-  CHECK(all("SELECT b FROM o WHERE a = $1 AND k >= $2").size() == 3);
+  // Each of the three carries a choice point, and is printed once per
+  // branch.
+  auto ranges = all("SELECT b FROM o WHERE a = $1 AND k >= $2");
+  REQUIRE(ranges.size() == 6);
+  for (std::size_t i = 0; i < ranges.size(); i += 2) {
+    CHECK(has(ranges[i], "bc_count_range(cx, "));
+    CHECK(has(ranges[i], ", lo, hi, INT64_MAX);"));
+    CHECK(has(ranges[i + 1], ", lo, hi, 0);"));
+    CHECK(ranges[i].cost == Catch::Approx(ranges[i + 1].cost));
+  }
+}
+
+namespace {
+
+// The threshold of the plan's first choice point, or -1 without one.
+auto threshold(const GeneratedPlan& g) -> std::int64_t {
+  constexpr std::string_view kIf = "if (count0 < ";
+  auto at = g.source.find(kIf);
+  if (at == std::string::npos) return -1;
+  return std::stoll(g.source.substr(at + kIf.size()));
+}
+
+}  // namespace
+
+TEST_CASE("search: a choice point where two ranges of a table cross, its threshold where their costs do",
+          "[sql][search][cost][choice]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"c",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+                        Fixture::col("b", PhysType::I64, true), Fixture::col("v", PhysType::I64, true)},
+                       {"k"}});
+  f.ddl(CreateIndexDdl{"c_a", "c", {{"a"}}});
+  f.ddl(CreateIndexDdl{"c_b", "c", {{"b"}}});
+  const auto& cat = f.cat();
+  const auto c_a = "IDX_" + std::to_string(cat.table("c")->indexes[0].id);
+  const auto c_b = "IDX_" + std::to_string(cat.table("c")->indexes[1].id);
+  const std::string sql = "SELECT v FROM c WHERE a = $1 AND b = $2";
+
+  // 10,000 rows: each index reaches 1,000 entries and fetches each row,
+  // 2,000. c_a first, by its id: past 1,000 of its entries it costs more
+  // than c_b's estimate.
+  auto g = plan_sql(cat, sql, {{"c", 10'000}});
+  CHECK(threshold(g) == 1001);
+  CHECK(has(g, "count0 = bc_count_range(cx, " + c_a + ", lo, hi, 1001);"));
+  // Each branch scans its index, and filters on the other column.
+  auto below = g.source.find("if (count0 < 1001) {");
+  auto other = g.source.find("} else {", below);
+  REQUIRE(other != std::string::npos);
+  CHECK(g.source.find("bc_scan_open(cx, " + c_a, below) < other);
+  CHECK(g.source.find("bc_scan_open(cx, " + c_b, other) != std::string::npos);
+  // The count's two reads are charged.
+  CHECK(g.cost == Catch::Approx(2000 + 2));
+  // The threshold follows the counts: 1,000 rows, 100 entries; 10 rows,
+  // 1, which fetching costs 2, and a count of 2 passes. A table of one row:
+  // no count passes 1.
+  CHECK(threshold(plan_sql(cat, sql, {{"c", 1000}})) == 101);
+  CHECK(threshold(plan_sql(cat, sql, {{"c", 10}})) == 2);
+  CHECK(threshold(plan_sql(cat, sql, {{"c", 1}})) == -1);
+}
+
+TEST_CASE("search: no choice point where the costs can't cross within the count's range", "[sql][search][cost][choice]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"c",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+                        Fixture::col("b", PhysType::I64, true), Fixture::col("v", PhysType::I64, true)},
+                       {"k"}});
+  f.ddl(CreateIndexDdl{"c_a", "c", {{"a"}}});
+  f.ddl(CreateIndexDdl{"c_ab", "c", {{"a"}, {"b"}}});
+  f.ddl(CreateIndexDdl{"c_v", "c", {{"v"}}, true});
+  const auto& cat = f.cat();
+  const std::map<std::string, std::uint64_t> rows{{"c", 10'000}};
+  // c_ab's range lies inside c_a's: however many entries it holds, c_a's
+  // holds at least as many.
+  auto inside = plan_sql(cat, "SELECT v FROM c WHERE a = $1 AND b = $2", rows);
+  CHECK(has(inside, "bc_key_params(cx, IDX_" + std::to_string(cat.table("c")->indexes[1].id) + ", 0, 2)"));
+  CHECK(threshold(inside) == -1);
+  // Under LIMIT 1, the first entry ends either scan: neither cost grows
+  // with the count.
+  CHECK(threshold(plan_sql(cat, "SELECT k FROM c WHERE a = $1 AND v >= $2 LIMIT 1", rows)) == -1);
+  // A unique index names at most one entry; a point lookup one row.
+  CHECK(threshold(plan_sql(cat, "SELECT k FROM c WHERE a = $1 AND v = $2", rows)) == -1);
+  CHECK(threshold(plan_sql(cat, "SELECT v FROM c WHERE a = $1 AND k = $2", rows)) == -1);
+  // Without a LIMIT, the same two ranges cross.
+  CHECK(threshold(plan_sql(cat, "SELECT k FROM c WHERE a = $1 AND v >= $2", rows)) > 1);
+}
+
+TEST_CASE("search: a table read once carries its choice point under the outer row", "[sql][search][cost][choice]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"c",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+                        Fixture::col("b", PhysType::I64, true), Fixture::col("x", PhysType::I64, true)},
+                       {"k"}});
+  f.ddl(CreateIndexDdl{"c_a", "c", {{"a"}}});
+  f.ddl(CreateIndexDdl{"c_b", "c", {{"b"}}});
+  const auto& cat = f.cat();
+  // t by its key, then c read once by c_a or c_b, each row fetched for the
+  // join's conjunct: 1 + 2 x 1,000, and the count.
+  auto g = plan_sql(cat, "SELECT c.k FROM t, c WHERE t.id = $1 AND c.a = $2 AND c.b = $3 AND c.x = t.qty",
+                    {{"t", 10'000}, {"c", 10'000}});
+  CHECK(threshold(g) == 1001);
+  CHECK(g.cost == Catch::Approx(1 + 2000 + 2));
+  auto get = g.source.find("bc_get(cx, bc_key_params(cx, TBL_");
+  auto count = g.source.find("bc_count_range(");
+  REQUIRE(get != std::string::npos);
+  CHECK(get < count);
+  // Both branches compare c's rows with t's.
+  auto joined = g.source.find("bc_col_i64(cx, row, COL_");
+  CHECK(g.source.find("bc_col_i64(cx, row, COL_", joined + 1) != std::string::npos);
 }

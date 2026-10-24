@@ -140,4 +140,41 @@ TEST_CASE("physical: a nested loop reads its inner scan once, under one outer ro
   CHECK(refusal(plan(loop(get({p(0)}), joined(kId)))).empty());
   refused(plan(loop(get({p(0)}), joined(other))), "reads a column outside its outer side");
   CHECK(refusal(plan(loop(node(physical::IndexJoin{get({p(0)}), 3, {p(0)}}), joined(other)))).empty());
+  // Its first column is the inner table's, read from the inner scan's row:
+  // never another table's, and never over a scan that covers.
+  auto outer_first = node(physical::Filter{inner(), {logical::compare(ast::Compare::Op::Eq, col(kId), col(inner_col))}});
+  refused(plan(loop(get({p(0)}), std::move(outer_first))), "compares a column outside its inner side");
+  auto covered = node(physical::Filter{node(physical::Scan{2, 4, {p(1)}, {}, false, true, false}),
+                                       {logical::compare(ast::Compare::Op::Eq, col(inner_col), col(kId))}});
+  refused(plan(loop(get({p(0)}), std::move(covered))), "reads the row of a covering scan");
+}
+
+TEST_CASE("physical: a choice point counts its first plan's range, and each plan is a scan of its table",
+          "[sql][physical][choice]") {
+  // Of index 3 by p0, or of index 5 by p1, each a scan of table 1.
+  auto by = [](std::uint32_t object, std::uint32_t param) {
+    return physical::Scan{1, object, {p(param)}, {}, false, false, false};
+  };
+  auto choice = [&](physical::Scan counted, physical::NodePtr below, physical::NodePtr at_or_above, std::int64_t t) {
+    return emit(node(physical::Choice{std::move(counted), t, std::move(below), std::move(at_or_above)}));
+  };
+  CHECK(refusal(plan(choice(by(3, 0), node(by(3, 0)), node(by(5, 1)), 100))).empty());
+  // Its thresholds overridden, as alternatives agree runs each plan.
+  CHECK(refusal(plan(choice(by(3, 0), node(by(3, 0)), node(by(5, 1)), 0))).empty());
+  refused(plan(choice(by(3, 0), node(by(3, 0)), node(by(5, 1)), -1)), "negative threshold");
+  refused(plan(choice(by(5, 1), node(by(3, 0)), node(by(5, 1)), 100)), "counts another range");
+  refused(plan(choice(by(3, 0), node(by(3, 0)), get({p(0)}), 100)), "plan is not a scan");
+  auto other_table = by(5, 1);
+  other_table.table = 2;
+  refused(plan(choice(by(3, 0), node(by(3, 0)), node(other_table), 100)), "read another table");
+  refused(plan(choice(by(3, 0), node(by(3, 0)), node(by(5, 2)), 100)), "past the statement's");
+  // A DOUBLE target from a key, on either plan.
+  auto covering = by(5, 1);
+  covering.covering = true;
+  refused(plan(emit(node(physical::Choice{by(3, 0), 100, node(by(3, 0)), node(covering)}), {kD})), "DOUBLE target");
+
+  physical::Plan two = plan(choice(by(3, 0), node(by(3, 0)), node(by(5, 1)), 100));
+  CHECK(physical::choices(two) == 1);
+  physical::override_thresholds(two, 0);
+  CHECK(std::get<physical::Choice>(std::get<physical::Emit>(two.root->op).input->op).threshold == 0);
 }

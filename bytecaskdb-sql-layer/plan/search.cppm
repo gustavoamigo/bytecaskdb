@@ -20,6 +20,9 @@
 //   3. The statement on top: the rows emitted, under LIMIT, or aggregated,
 //      COUNT and MIN also answered from the keys (bc_count_range, a scan's
 //      first entry) where nothing filters the rows.
+//   4. Choice points (*Choosing at run time*): where another range of a
+//      table a plan scans would cost less past some count of the plan's own
+//      range, the plan carries both, picked by bc_count_range when it runs.
 // The interesting order is the ORDER BY's, NULL placement included: no sort
 // exists yet, so a statement whose order no plan gives is refused. A
 // conjunct a key does not express is a filter on the row it reads; an
@@ -63,6 +66,11 @@ using RowCounts = std::function<std::optional<std::uint64_t>(const Table&)>;
 inline constexpr double kUncountedRows = 1'000'000;
 inline constexpr double kEqSelectivity = 1.0 / 10;
 inline constexpr double kRangeSelectivity = 1.0 / 3;
+// bc_count_range's charge: at most two record reads, whatever the range holds.
+inline constexpr double kCountCost = 2;
+// The most choice points one plan carries (*Decisions*, 11); past them the
+// search takes its compile-time choice.
+inline constexpr std::size_t kMaxChoices = 4;
 
 // The cheapest plan for a rewritten logical plan, its cost in Plan::cost.
 // Throws FeatureNotSupported, its message starting "no plan:", when no plan
@@ -351,14 +359,37 @@ auto residual(const Table& t, const Conjuncts& where, const std::vector<const Ex
   return out;
 }
 
-// One table's rows by one access path, costed.
+// One table's rows by one access path. Its cost and rows follow from the
+// entries its range reaches (access_cost, access_rows).
 struct Access {
   std::variant<physical::PointGet, physical::Scan, physical::NullSplitScan> path;
   Conjuncts filters;                       // the conjuncts the path does not express
   std::vector<std::uint32_t> null_checks;  // the parameters the WHERE compares, as the path checks them
-  double cost{0};
-  double rows{0};
+  double entries{1};                       // as the cost model estimates them; 1 for a point lookup
+  double max_entries{1};                   // the most it can reach: 1 when its bounds name at most one row
+  std::vector<std::size_t> keyed;          // the conjuncts of its table's WHERE its key takes, by position
 };
+
+// The scan an access path reads, or null for a point lookup; a NULL split's
+// present values, whose prefix is the split's.
+auto scan_of(const Access& a) -> const physical::Scan* {
+  if (const auto* s = std::get_if<physical::Scan>(&a.path)) return s;
+  if (const auto* s = std::get_if<physical::NullSplitScan>(&a.path)) return &s->present;
+  return nullptr;
+}
+auto scan_of(Access& a) -> physical::Scan* {
+  if (auto* s = std::get_if<physical::Scan>(&a.path)) return s;
+  if (auto* s = std::get_if<physical::NullSplitScan>(&a.path)) return &s->present;
+  return nullptr;
+}
+
+// One read per entry, and one more per row an index scan fetches.
+auto reads_per_entry(const Access& a) -> double {
+  const auto* s = scan_of(a);
+  return s != nullptr && s->object != s->table && !s->covering ? 2 : 1;
+}
+auto access_cost(const Access& a, double entries) -> double { return entries * reads_per_entry(a); }
+auto access_rows(const Access& a, double entries) -> double { return entries * selectivity(a.filters); }
 
 // An access path tried: costed, or the refusal that stopped it.
 struct Tried {
@@ -388,10 +419,11 @@ struct Probe {
 
 // The inner side of a nested loop read once: a table by its own access path,
 // from parameters alone, under an outer side of at most one row; its filters
-// include the join's conjuncts.
+// end with the join's conjuncts, `on`.
 struct Nested {
   std::size_t rel{0};
   Access access;
+  Conjuncts on;
 };
 
 using Step = std::variant<Probe, Nested>;
@@ -621,12 +653,12 @@ private:
 
   // ---------------------------------------------------------- access paths
 
-  // Every access path of a table, costed. `ordered` is the ORDER BY without
-  // the columns its WHERE makes constant; `used` the columns read from each
-  // row, which a scan reads from the entry's key when `may_cover` and it
-  // holds them all.
+  // Every access path of a table. `ordered` is the ORDER BY without the
+  // columns its WHERE makes constant; `read` the columns read from each of
+  // its rows, which a scan with no filter reads from the entry's key when
+  // `may_cover` and the key holds them all: it covers.
   auto accesses(const Rel& rel, const std::vector<OrderItem>& order_by, const std::vector<OrderItem>& ordered,
-                const std::vector<ColumnRef>& used, bool may_cover) -> std::vector<Tried> {
+                const std::vector<ColumnRef>& read, bool may_cover) -> std::vector<Tried> {
     const auto& t = rel.table();
     const auto& where = rel.where;
     const auto n = table_rows(t);
@@ -637,17 +669,21 @@ private:
       a.path = physical::Scan{};
       out.push_back({std::move(a), std::move(r)});
     };
+    auto positions = [&](const std::vector<const Expr*>& used) {
+      std::vector<std::size_t> at;
+      for (const auto* e : used) at.push_back(static_cast<std::size_t>(e - where.data()));
+      return at;
+    };
     // A point lookup returns at most one row: it gives any ORDER BY.
     if (auto k = point_get(t, where)) {
       auto f = residual(t, where, k->used);
       Access a;
       a.null_checks = key_params(k->key);
+      a.keyed = positions(k->used);
       a.path = physical::PointGet{t.id, std::move(k->key), for_update};
       if (!f) {
         out.push_back({std::move(a), std::move(f.error())});
       } else {
-        a.cost = 1;
-        a.rows = selectivity(*f);
         a.filters = std::move(*f);
         out.push_back({std::move(a), std::nullopt});
       }
@@ -707,17 +743,16 @@ private:
       for (const auto* e : b.eq) sc.prefix.push_back(operand_of(*e));
       sc.reverse = *reverse;
       sc.covering = may_cover && f->empty() &&
-                    std::ranges::all_of(used, [&](const ColumnRef& col) { return in_key(t, p, col.col); });
+                    std::ranges::all_of(read, [&](const ColumnRef& col) { return in_key(t, p, col.col); });
       sc.for_update = for_update;
 
       Access a;
       a.null_checks = null_checks;
-      auto entries = n * std::pow(kEqSelectivity, static_cast<double>(run)) *
-                     std::pow(kRangeSelectivity, static_cast<double>(keyed.size() - run));
-      if (run >= p.unique) entries = std::min(entries, 1.0);
-      entries = std::max(entries, 1.0);  // a scan reads at least its first entry
-      a.cost = entries * (!p.is_pk && !sc.covering ? 2 : 1);
-      a.rows = entries * selectivity(*f);
+      a.keyed = positions(keyed);
+      a.max_entries = run >= p.unique ? 1 : n;
+      a.entries = n * std::pow(kEqSelectivity, static_cast<double>(run)) *
+                  std::pow(kRangeSelectivity, static_cast<double>(keyed.size() - run));
+      a.entries = std::max(std::min(a.entries, a.max_entries), 1.0);  // a scan reads at least its first entry
       a.filters = std::move(*f);
       if (split) {
         sc.rest = physical::Range{null_part(true), {}};
@@ -787,26 +822,24 @@ private:
     return out;
   }
 
-  // `filters`, then the join conjuncts `on`, each a filter with its own
-  // operator; refused when one is on a DOUBLE or REAL column, as any filter
-  // is.
-  auto with_joins(Conjuncts filters, const Conjuncts& on) const -> std::expected<Conjuncts, Refusal> {
+  // Why join conjuncts can't be filters, each with its own operator: the
+  // first on a DOUBLE or REAL column, refused as any filter is.
+  auto double_in(const Conjuncts& on) const -> std::optional<Refusal> {
     for (const auto& c : on) {
       for (const auto& col : {c.args[0].col, c.args[1].col}) {
-        if (col.type == PhysType::F64) return std::unexpected(double_filter(name_of(col)));
+        if (col.type == PhysType::F64) return double_filter(name_of(col));
       }
-      filters.push_back(c);
     }
-    return filters;
+    return std::nullopt;
   }
 
   // `q.rels[inner]` read by its whole primary key from parameters and the
-  // columns of `outer`'s tables, or the refusal: at Reach when no equality
-  // names a key column, at Filter for a filter on a DOUBLE.
-  auto probe(const Query& q, std::size_t inner, std::uint32_t outer) const -> std::expected<Probe, Refusal> {
+  // columns of the tables already read, `on` its join conjuncts with them
+  // (joins), or the refusal: at Reach when no equality names a key column, at
+  // Filter for a filter on a DOUBLE.
+  auto probe(const Query& q, std::size_t inner, const Conjuncts& on) const -> std::expected<Probe, Refusal> {
     const auto& rel = q.rels[inner];
     const auto& t = rel.table();
-    auto on = joins(q, inner, outer);
     Probe pr;
     pr.rel = inner;
     std::vector<const Expr*> used;
@@ -833,13 +866,12 @@ private:
     auto f = residual(t, rel.where, used);
     if (!f) return std::unexpected(std::move(f.error()));
     // Every join conjunct the key does not take is a filter.
-    Conjuncts rest;
+    pr.filters = std::move(*f);
     for (std::size_t i = 0; i < on.size(); ++i) {
-      if (std::ranges::find(keyed_on, i) == keyed_on.end()) rest.push_back(on[i]);
+      if (std::ranges::find(keyed_on, i) != keyed_on.end()) continue;
+      if (auto d = double_in({on[i]})) return std::unexpected(std::move(*d));
+      pr.filters.push_back(on[i]);
     }
-    auto filters = with_joins(std::move(*f), rest);
-    if (!filters) return std::unexpected(std::move(filters.error()));
-    pr.filters = std::move(*filters);
     return pr;
   }
 
@@ -875,11 +907,69 @@ private:
     }
   }
 
+  // The columns read from each row of `q.rels[i]`: those of `used` on its
+  // table, and its join conjuncts' columns, which a key built from it or a
+  // filter on the pair reads.
+  static auto read_set(const Query& q, std::size_t i, const std::vector<ColumnRef>& used) -> std::vector<ColumnRef> {
+    const auto id = q.rels[i].table().id;
+    std::vector<ColumnRef> out;
+    for (const auto& c : used) {
+      if (c.table == id) out.push_back(c);
+    }
+    for (const auto& c : q.on) {
+      for (const auto& col : {c.args[0].col, c.args[1].col}) {
+        if (col.table == id) out.push_back(col);
+      }
+    }
+    return out;
+  }
+
+  // An access path read once, under one row: the join's conjuncts `on`
+  // filter its rows, so a scan reads each row and does not cover.
+  static auto read_once(Access a, const Conjuncts& on) -> Access {
+    if (on.empty()) return a;
+    if (auto* sc = scan_of(a)) sc->covering = false;
+    a.filters.insert(a.filters.end(), on.begin(), on.end());
+    return a;
+  }
+
+  // The cost and rows of a candidate, each part's from its entries: the
+  // first table's access, then for each step one key lookup per outer row,
+  // or the access read once. `at`, if given, replaces one access's entries
+  // (0 the first table's, i + 1 step i's).
+  struct Entries {
+    std::size_t at{0};
+    double entries{0};
+  };
+  static auto measure(const Candidate& c, std::optional<Entries> at = std::nullopt) -> std::pair<double, double> {
+    auto entries = [&](std::size_t i, const Access& a) { return at && at->at == i ? at->entries : a.entries; };
+    auto cost = access_cost(c.access, entries(0, c.access));
+    auto rows = access_rows(c.access, entries(0, c.access));
+    for (std::size_t i = 0; i < c.steps.size(); ++i) {
+      if (const auto* pr = std::get_if<Probe>(&c.steps[i])) {
+        cost += rows;
+        rows *= selectivity(pr->filters);
+      } else {
+        const auto& a = std::get<Nested>(c.steps[i]).access;
+        auto x = entries(i + 1, a);
+        cost += access_cost(a, x);
+        rows *= access_rows(a, x);
+      }
+    }
+    return {cost, rows};
+  }
+
+  static void costed(Candidate& c) {
+    if (c.failed) return;
+    std::tie(c.cost, c.rows) = measure(c);
+  }
+
   // Every plan of the whole statement's set of tables, by dynamic
   // programming over sets of tables, each set from the sets one smaller;
   // refused if none. A plan that fails is carried on as far as it reaches,
   // so the refusal names the failure of the furthest stage a plan of every
-  // table reached.
+  // table reached. Each table's access paths are kept in tried_, for the
+  // choice points.
   auto candidates(const Query& q, const std::vector<OrderItem>& order_by, const std::vector<ColumnRef>& used,
                   bool may_cover) -> std::vector<Candidate> {
     const auto n = q.rels.size();
@@ -893,29 +983,16 @@ private:
       if (!constant && !repeated) ordered.push_back(o);
     }
     std::map<std::uint32_t, std::vector<Candidate>> best;
-    // Each table's access paths, and the ones it is read once by, under one
-    // row: a scan of those covers when nothing above reads the table's
-    // columns, its join conjuncts included.
-    std::vector<std::vector<Tried>> tried(n);
-    std::vector<std::vector<Tried>> once(n);
+    tried_.assign(n, {});
     for (std::size_t i = 0; i < n; ++i) {
-      tried[i] = accesses(q.rels[i], order_by, ordered, n == 1 ? used : std::vector<ColumnRef>{}, may_cover && n == 1);
-      const auto id = q.rels[i].table().id;
-      auto unread = std::ranges::none_of(used, [&](const ColumnRef& c) { return c.table == id; }) &&
-                    std::ranges::none_of(q.on, [&](const Expr& c) {
-                      return c.args[0].col.table == id || c.args[1].col.table == id;
-                    });
-      once[i] = n > 1 && may_cover && unread ? accesses(q.rels[i], order_by, ordered, {}, true) : tried[i];
-      for (const auto& a : tried[i]) {
+      tried_[i] = accesses(q.rels[i], order_by, ordered, read_set(q, i, used), may_cover);
+      for (const auto& a : tried_[i]) {
         Candidate c;
         c.first = i;
         c.set = 1u << i;
         c.access = a.access;
         c.failed = a.failed;
-        if (!c.failed) {
-          c.cost = a.access.cost;
-          c.rows = a.access.rows;
-        }
+        costed(c);
         keep(best, std::move(c), full);
       }
     }
@@ -930,8 +1007,10 @@ private:
         }
       }
       for (const auto& [set, t] : extend) {
-        auto pr = probe(q, t, set);
         auto on = joins(q, t, set);
+        auto pr = probe(q, t, on);
+        // Read once, t's rows are filtered by every join conjunct.
+        auto on_double = double_in(on);
         if (!pr && pr.error().stage == Stage::Reach) unkeyed.emplace(std::pair{set, t}, pr.error().why);
         auto outers = best.at(set);  // copied: keep may add to the map
         for (const auto& o : outers) {
@@ -939,37 +1018,21 @@ private:
             Candidate c = o;
             c.set = set | (1u << t);
             c.failed = earlier(o.failed, pr ? std::nullopt : std::optional{pr.error()});
-            if (!c.failed) {
-              c.steps.emplace_back(*pr);
-              c.cost = o.cost + o.rows;  // one key lookup per outer row
-              c.rows = o.rows * selectivity(pr->filters);
-            }
+            if (!c.failed) c.steps.emplace_back(*pr);
+            costed(c);
             keep(best, std::move(c), full);
           }
           // At most one outer row: t read once, by its own scan, the join's
           // conjuncts filtering its rows. Its point lookup is the probe by
           // parameters above.
           if (!o.one_row()) continue;
-          for (const auto& a : once[t]) {
+          for (const auto& a : tried_[t]) {
             if (a.one_row()) continue;
             Candidate c = o;
             c.set = set | (1u << t);
-            Nested ne{t, a.access};
-            auto why = a.failed;
-            if (!why) {
-              auto f = with_joins(std::move(ne.access.filters), on);
-              if (f) {
-                ne.access.filters = std::move(*f);
-              } else {
-                why = std::move(f.error());
-              }
-            }
-            c.failed = earlier(o.failed, why);
-            c.steps.emplace_back(std::move(ne));
-            if (!c.failed) {
-              c.cost = o.cost + a.access.cost;
-              c.rows = o.rows * a.access.rows * selectivity(on);
-            }
+            c.failed = earlier(o.failed, a.failed ? a.failed : on_double);
+            c.steps.emplace_back(Nested{t, read_once(a.access, on), on});
+            costed(c);
             keep(best, std::move(c), full);
           }
         }
@@ -1033,8 +1096,7 @@ private:
   // filters and its scan's range.
   static void access_computed(std::vector<physical::Computed>& comp, const Access& a, std::uint32_t table) {
     for (const auto& f : a.filters) add_computed(comp, operand_of(f), table);
-    const physical::Scan* scan = std::get_if<physical::Scan>(&a.path);
-    if (const auto* split = std::get_if<physical::NullSplitScan>(&a.path)) scan = &split->present;
+    const auto* scan = scan_of(a);
     if (scan == nullptr) return;
     if (const auto* r = std::get_if<physical::Range>(&scan->rest)) {
       for (const auto* b : {&r->lo, &r->hi}) {
@@ -1048,7 +1110,31 @@ private:
     return filtered(std::visit([](const auto& p) { return physical::node(p); }, a.path), a.filters);
   }
 
-  static auto build(const Query& q, const Candidate& c) -> Built {
+  // A choice point at one table of a plan (docs/planner_design.md, *Choosing
+  // at run time*): the access at `at` (0 the first table's, i + 1 step i's)
+  // is the first plan, `other` the second, taken once the count of the
+  // first one's range reaches `threshold`.
+  struct ChoiceAt {
+    std::size_t at{0};
+    Access other;
+    std::int64_t threshold{0};
+  };
+
+  // The access at `at`, or, at a choice point, the choice between it and
+  // the other, the count over its whole range: a NULL split's prefix.
+  static auto leaf_at(const Access& a, std::size_t at, const std::vector<ChoiceAt>& choices) -> physical::NodePtr {
+    auto it = std::ranges::find(choices, at, &ChoiceAt::at);
+    if (it == choices.end()) return leaf(a);
+    physical::Choice ch;
+    ch.counted = *scan_of(a);
+    if (std::holds_alternative<physical::NullSplitScan>(a.path)) ch.counted.rest = std::monostate{};
+    ch.threshold = it->threshold;
+    ch.below = leaf(a);
+    ch.at_or_above = leaf(it->other);
+    return physical::node(std::move(ch));
+  }
+
+  static auto build(const Query& q, const Candidate& c, const std::vector<ChoiceAt>& choices) -> Built {
     Built out;
     access_computed(out.computed, c.access, q.rels[c.first].table().id);
     auto by_column = false;
@@ -1073,7 +1159,7 @@ private:
           for (auto p : std::get<Nested>(step).access.null_checks) add_param(out.null_checks, p);
         }
       }
-      out.rows = leaf(c.access);
+      out.rows = leaf_at(c.access, 0, choices);
     } else if (g != nullptr && !nested) {
       // One outer row: a scan of its whole key's prefix, so one loop serves
       // and each inner key is built only from a row read.
@@ -1084,21 +1170,123 @@ private:
       out.rows = filtered(physical::node(std::move(sc)), c.access.filters);
     } else {
       out.null_checks = c.access.null_checks;
-      out.rows = leaf(c.access);
+      out.rows = leaf_at(c.access, 0, choices);
     }
     // A NULL parameter on any table matches no row.
     if (by_column) {
       for (const auto& rel : q.rels) add_params(out.null_checks, rel.where);
     }
-    for (const auto& step : c.steps) {
-      if (const auto* pr = std::get_if<Probe>(&step)) {
+    // The second plan of each choice point checks and computes what it reads.
+    for (const auto& ch : choices) {
+      for (auto p : ch.other.null_checks) add_param(out.null_checks, p);
+      const auto rel = ch.at == 0 ? c.first : std::get<Nested>(c.steps[ch.at - 1]).rel;
+      access_computed(out.computed, ch.other, q.rels[rel].table().id);
+    }
+    for (std::size_t i = 0; i < c.steps.size(); ++i) {
+      if (const auto* pr = std::get_if<Probe>(&c.steps[i])) {
         auto pairs = physical::node(physical::IndexJoin{std::move(out.rows), q.rels[pr->rel].table().id, pr->key});
         out.rows = filtered(std::move(pairs), pr->filters);
       } else {
-        out.rows = physical::node(physical::NestedLoop{std::move(out.rows), leaf(std::get<Nested>(step).access)});
+        out.rows = physical::node(
+            physical::NestedLoop{std::move(out.rows), leaf_at(std::get<Nested>(c.steps[i]).access, i + 1, choices)});
       }
     }
     return out;
+  }
+
+  // ---------------------------------------------------------- choice points
+
+  // What a finished plan does with its rows, which its cost follows from:
+  // emits them under LIMIT, counts their distinct values, or neither.
+  struct Sink {
+    std::optional<std::int64_t> limit;
+    bool distinct{false};
+  };
+
+  static auto finished_cost(const Sink& s, std::pair<double, double> m) -> double {
+    auto [cost, rows] = m;
+    // COUNT(DISTINCT) steps through its groups once more.
+    if (s.distinct) cost += rows;
+    // A LIMIT stops the loop once it has its rows.
+    if (s.limit && rows > static_cast<double>(*s.limit)) cost *= static_cast<double>(*s.limit) / rows;
+    return cost;
+  }
+
+  // The entries `b`'s range reaches when `a`'s reaches x: at least x when
+  // b's key takes only conjuncts a's takes, so its range holds a's rows; at
+  // most x when a's takes only conjuncts b's takes; else its estimate.
+  static auto entries_beside(const Access& a, const Access& b, double x) -> double {
+    auto within = [](const std::vector<std::size_t>& p, const std::vector<std::size_t>& q) {
+      return std::ranges::all_of(p, [&](std::size_t i) { return std::ranges::find(q, i) != q.end(); });
+    };
+    auto e = b.entries;
+    if (within(b.keyed, a.keyed)) e = std::max(e, x);
+    if (within(a.keyed, b.keyed)) e = std::min(e, x);
+    return std::min(e, b.max_entries);
+  }
+
+  // The least count of the first plan's range, in [1, max], at which it
+  // costs more than the second: the threshold, when the costs cross within
+  // the range, so the count can pick either. Costs that only meet, as where
+  // one range holds the other's rows, never cross. Both grow with the count.
+  static auto crossing(const std::function<double(double)>& first, const std::function<double(double)>& second,
+                       double max) -> std::optional<std::int64_t> {
+    auto reached = [&](std::int64_t x) { return first(static_cast<double>(x)) > second(static_cast<double>(x)); };
+    // A count past INT64_MAX is no count a table holds.
+    auto hi = static_cast<std::int64_t>(std::min(std::floor(max), 0x1p62));
+    std::int64_t lo = 1;
+    if (hi <= lo || reached(lo) || !reached(hi)) return std::nullopt;
+    while (hi - lo > 1) {
+      auto mid = lo + (hi - lo) / 2;
+      (reached(mid) ? hi : lo) = mid;
+    }
+    return hi;
+  }
+
+  // The plan's choice points, at most kMaxChoices: at each table it reads by
+  // a scan, outer first, the second plan is the cheapest other range of the
+  // table whose cost crosses the first one's within the count of its range.
+  // Never at a point lookup, nor at a scan whose bounds name at most one row.
+  auto choose(const Candidate& c, const Sink& sink) const -> std::vector<ChoiceAt> {
+    std::vector<ChoiceAt> out;
+    for (std::size_t at = 0; at <= c.steps.size() && out.size() < kMaxChoices; ++at) {
+      const auto* ne = at == 0 ? nullptr : std::get_if<Nested>(&c.steps[at - 1]);
+      if (at > 0 && ne == nullptr) continue;  // a lookup by key
+      const auto& a = at == 0 ? c.access : ne->access;
+      const auto rel = at == 0 ? c.first : ne->rel;
+      if (scan_of(a) == nullptr || a.max_entries <= 1) continue;
+      auto first = [&](double x) { return finished_cost(sink, measure(c, Entries{at, x})); };
+      std::optional<ChoiceAt> best;
+      auto best_cost = 0.0;
+      for (const auto& tried : tried_[rel]) {
+        if (tried.failed || tried.one_row()) continue;
+        const auto* sb = scan_of(tried.access);
+        if (sb->object == scan_of(a)->object && tried.access.keyed == a.keyed) continue;  // the same range
+        auto b = ne == nullptr ? tried.access : read_once(tried.access, ne->on);
+        auto other = c;
+        (at == 0 ? other.access : std::get<Nested>(other.steps[at - 1]).access) = b;
+        auto second = [&](double x) { return finished_cost(sink, measure(other, Entries{at, entries_beside(a, b, x)})); };
+        auto t = crossing(first, second, a.max_entries);
+        if (!t) continue;
+        auto cost = finished_cost(sink, measure(other));
+        if (!best || cost < best_cost) {
+          best = ChoiceAt{at, std::move(b), *t};
+          best_cost = cost;
+        }
+      }
+      if (best) out.push_back(std::move(*best));
+    }
+    return out;
+  }
+
+  // A candidate finished: its choice points chosen, its rows built and
+  // wrapped by the sink, its cost the sink's plus each count's.
+  template <typename Wrap>
+  auto finish(const Query& q, const Candidate& c, const Sink& sink, const Wrap& wrap) const -> Finished {
+    auto choices = choose(c, sink);
+    auto b = build(q, c, choices);
+    auto cost = finished_cost(sink, measure(c)) + kCountCost * static_cast<double>(choices.size());
+    return {wrap(std::move(b.rows)), std::move(b.null_checks), std::move(b.computed), cost};
   }
 
   // The rows an UPDATE or DELETE writes: each row whole, by a point lookup or
@@ -1113,10 +1301,7 @@ private:
     Query q;
     flatten(in, q);
     if (q.rels.size() != 1) no_plan("a Join where the search plans a table");
-    for (const auto& c : candidates(q, {}, {}, false)) {
-      auto b = build(q, c);
-      out.push_back({wrap(std::move(b.rows)), std::move(b.null_checks), std::move(b.computed), c.cost});
-    }
+    for (const auto& c : candidates(q, {}, {}, false)) out.push_back(finish(q, c, Sink{}, wrap));
     return out;
   }
 
@@ -1194,11 +1379,8 @@ private:
       if (agg == nullptr) {
         std::vector<ColumnRef> targets;
         for (const auto& o : s.project->exprs) targets.push_back(o.expr.col);
-        auto b = build(q, c);
-        // A LIMIT stops the loop once it has its rows.
-        auto cost = c.cost;
-        if (s.limit && c.rows > static_cast<double>(*s.limit)) cost *= static_cast<double>(*s.limit) / c.rows;
-        out.push_back({emit(s, std::move(b.rows), std::move(targets)), std::move(b.null_checks), std::move(b.computed), cost});
+        out.push_back(finish(q, c, Sink{s.limit, false},
+                             [&](physical::NodePtr rows) { return emit(s, std::move(rows), std::move(targets)); }));
         continue;
       }
       // The keys answer an aggregate when nothing filters a row.
@@ -1212,23 +1394,22 @@ private:
         auto may_be_null = arg != nullptr && arg->nullable &&
                            std::ranges::none_of(where, [&](const auto& w) { return on_col(w, arg->col); });
         if (!may_be_null) {
-          auto b = build(q, c);
-          out.push_back({physical::node(physical::CountRange{*scan, emits}), std::move(b.null_checks), std::move(b.computed), 2});
+          auto b = build(q, c, {});
+          out.push_back({physical::node(physical::CountRange{*scan, emits}), std::move(b.null_checks), std::move(b.computed),
+                         kCountCost});
         }
       } else if (scan != nullptr && !agg->distinct && agg->fn == Expr::Fn::Min && !scan->reverse) {
         auto first = *scan;
         if (min_from_first_entry(q.rels[0].table(), first, agg->args[0].col)) {
-          auto b = build(q, c);
+          auto b = build(q, c, {});
           auto cost = first.covering || first.object == first.table ? 1.0 : 2.0;
           out.push_back({physical::node(physical::MinFirstEntry{std::move(first), agg->args[0].col, emits}),
                          std::move(b.null_checks), std::move(b.computed), cost});
         }
       }
-      auto b = build(q, c);
-      // COUNT(DISTINCT) steps through its groups once more.
-      auto cost = c.cost + (agg->distinct ? c.rows : 0);
-      out.push_back({physical::node(physical::Aggregate{std::move(b.rows), *agg, emits}), std::move(b.null_checks),
-                     std::move(b.computed), cost});
+      out.push_back(finish(q, c, Sink{std::nullopt, agg->distinct}, [&](physical::NodePtr rows) {
+        return physical::node(physical::Aggregate{std::move(rows), *agg, emits});
+      }));
     }
     return out;
   }
@@ -1252,6 +1433,7 @@ private:
   const RowCounts& counts_;
   bool all_;
   std::map<std::uint32_t, double> rows_;
+  std::vector<std::vector<Tried>> tried_;  // each table's access paths, in FROM order: the choice points' second plans
   std::vector<Catalog::PlanConstant> constants_;
   std::vector<physical::ResultColumn> result_;
 };
