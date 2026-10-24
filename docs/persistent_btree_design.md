@@ -136,7 +136,7 @@ ceiling 65,535 from the u16 wire field). The layout has to admit a key of
 | D5 | In-node search | 4-byte key heads in the high half of each `u64` slot; lower bound = count of slots below `head << 32`, a branch-free loop clang vectorises; ties resolved by full compare. | Avoids touching the heap for most keys and avoids branch mispredicts. No intrinsics unless `-Rpass=loop-vectorize` shows the loop is scalar. |
 | D6 | Deletion | Lazy: no rebalancing. An emptied node is unlinked and freed; the root collapses when it has one child. | A B+ tree stays correct at any fill. Sibling merge is a follow-up gated by the churn memory tests. |
 | D7 | Reclamation | `VersionChain` from #86, lifted into its own module: chain contract, per-node interval rule, retraction, allocation-free publish. Version tag stamped in the node header at creation. | Reviewed, ASAN/TSAN clean, shape-agnostic. |
-| D8 | Transient | One `BuildSession` per transient: a node is owned iff `tag == session tag`; owned nodes are edited, rebuilt or split in place and freed at once when replaced; foreign nodes are cloned and retired. Discard without publish frees created nodes. | Same rules as #86 with fewer sites (§Garbage). |
+| D8 | Transient | One `BuildSession` per transient: a node is owned iff `tag == session tag`; owned nodes are edited, rebuilt or split in place and freed when the write that replaced them has moved the root; foreign nodes are cloned and retired. Discard without publish frees created nodes. | Same rules as #86 with fewer sites (§Garbage). |
 | D9 | Recovery merge | Consuming `merge(a, b, resolve)` as a two-way ordered merge into a fresh lineage with an append builder, for API parity. A range-parallel k-way merge follows if the recovery gate fails. | Subtree reuse across trees is what made the radix merge complex; sequential rebuild is O(n) with a hot working set. |
 | D10 | Iterators | Stack of `(const Node*, index)` sized to the tree height, a handle pin, a key buffer rebuilt on advance (prefix + suffix). Value iterators skip the buffer. | Same contract as today: a span valid until the next advance, no dangling. |
 | D11 | Persistent one-shot `set`/`erase` | `transient().set().persistent()` | One code path; tests and `u32_map` use these. |
@@ -429,18 +429,23 @@ There are three sites, all in `BuildSession`, against four in #86:
 1. **Superseded.** `mutable_copy` clones a foreign node: the source is
    retired.
 2. **Replaced.** `rebuild` or `split` replaces a node: the old allocation is
-   freed at once if owned, retired if foreign. (`split` of a foreign node
+   freed once the write has moved the root if owned, retired if foreign.
+   Every write runs through `BuildSession::write`, the one place that moves
+   the root and frees what a write replaced; freeing at once left the root
+   on a freed node when an allocation failed between a split and
+   `make_root`. A write that throws leaves the session refusing any other. (`split` of a foreign node
    is `mutable_copy` then `split`, so in practice a split always replaces
    an owned node.)
 3. **Never published.** A session destroyed without `persistent()` frees
    every node it created, found by walking from its root and stopping at
    any node whose tag is not the session's, since a child is never newer
-   than its parent. Its retired list is dropped.
+   than its parent, and the nodes a failed write had replaced, which the
+   walk passes through without freeing. Its retired list is dropped.
 
 The fourth site in #86, a dropped subtree, does not exist: a B+ tree
 erase unlinks only nodes that are empty, and an emptied node is owned
 because the path was made mutable before the erase. Every node this tree
-ever unlinks is freed immediately.
+ever unlinks is freed when the write that unlinked it completes.
 
 Per single-key write the session retires the nodes on one path, three or
 four, and creates their clones. That is the whole cost reclamation has to

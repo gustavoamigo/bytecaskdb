@@ -4,28 +4,36 @@ Reverts #364.
 Guarded-by: "alloc sweep: a transient tree is freed when nothing can be allocated"
 
 diff --git a/bytecaskdb/version_chain.cppm b/bytecaskdb/version_chain.cppm
-index d439b52..3abdd0d 100644
+index 63090a3..1f96a6d 100644
 --- a/bytecaskdb/version_chain.cppm
 +++ b/bytecaskdb/version_chain.cppm
-@@ -56,10 +56,17 @@ void free_node_subtree_if(typename Traits::Node *root,
-                           const Pred &is_garbage) noexcept {
-   if (!root || !is_garbage(root))
+@@ -55,16 +55,20 @@ export inline auto new_version_tag() noexcept -> std::uint64_t {
+ export template <typename Traits, typename Pred, typename Pass>
+ void free_node_subtree_if(typename Traits::Node *root, const Pred &is_garbage,
+                           const Pass &pass_through) noexcept {
+-  if (!root)
++  if (!root || (!is_garbage(root) && !pass_through(root)))
      return;
+-  const bool garbage = is_garbage(root);
+-  if (!garbage && !pass_through(root))
+-    return;
 -  Traits::for_each_child(root, [&](typename Traits::Node *child) {
--    free_node_subtree_if<Traits>(child, is_garbage);
+-    free_node_subtree_if<Traits>(child, is_garbage, pass_through);
 -  });
--  Traits::destroy(root);
+-  if (garbage)
+-    Traits::destroy(root);
 +  std::vector<typename Traits::Node *> stack;
 +  stack.push_back(root);
 +  while (!stack.empty()) {
 +    auto *n = stack.back();
 +    stack.pop_back();
 +    Traits::for_each_child(n, [&](typename Traits::Node *child) {
-+      if (is_garbage(child))
++      if (is_garbage(child) || pass_through(child))
 +        stack.push_back(child);
 +    });
-+    Traits::destroy(n);
++    if (is_garbage(n))
++      Traits::destroy(n);
 +  }
  }
  
- // ---------------------------------------------------------------------------
+ export template <typename Traits, typename Pred>
