@@ -230,9 +230,9 @@ def default_values(t: o.Type) -> st.SearchStrategy:
     return text.map(str.encode) if t.kind == "bytes" else text
 
 
-# What the planner serves (docs/frontend_design.md, *The planner's choices*,
-# as slice 1 builds it), so the machine generates only statements it plans,
-# and checks that the layer refuses the rest with "no plan". -------------
+# What the planner serves (docs/planner_design.md, *The search's choices*),
+# so the machine generates only statements it plans, and checks that the
+# layer refuses the rest with "no plan". ----------------------------------
 
 
 def key_paths(t: Table) -> list[tuple[bool, list[tuple[str, bool]]]]:

@@ -50,9 +50,8 @@ TEST_CASE("timing: prepare, stage by stage", "[.][timing]") {
     auto parse = median_us([&] { (void)ast::parse(sql); });
     auto tree = ast::parse(sql);
     auto bind = median_us([&] { (void)bound::bind(tree, f.cat()); });
-    auto bound = bound::bind(tree, f.cat());
-    auto gen = median_us([&] { (void)generate_plan(bound, f.cat(), sql); });
-    auto src = generate_plan(bound, f.cat(), sql).source;
+    auto gen = median_us([&] { (void)generate_plan(bound::bind(tree, f.cat()), f.cat(), sql); }) - bind;
+    auto src = generate_plan(bound::bind(tree, f.cat()), f.cat(), sql).source;
     auto tcc = median_us([&] { (void)TccPlan::compile(src); });
     std::printf("%-50s %7.1fus %7.1fus %7.1fus %7.1fus\n", sql, parse, bind, gen, tcc);
   }

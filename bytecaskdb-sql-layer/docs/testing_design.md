@@ -39,7 +39,7 @@ every rule, the invariants are checked.
   engine refusal at run time included, fails the test.
 - **Statements the planner serves.** The machine generates only statements
   the planner serves, and a "no plan" refusal
-  (`frontend_design.md`, *What the planner refuses*) fails the test.
+  (`planner_design.md`, *What the search refuses*) fails the test.
   The planner's refusals are tested by their messages in
   `sql_layer_tests`.
 - **Counts agree.** An INSERT, UPDATE or DELETE changes as many rows on both.
