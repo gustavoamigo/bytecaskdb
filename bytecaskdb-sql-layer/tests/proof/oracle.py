@@ -234,7 +234,7 @@ def raw_text(cur) -> tuple:
     """The rows a cursor holds, as the bytes of their text format, and each
     column's type OID."""
     res = cur.pgresult
-    if res is None or not cur.description:
+    if res is None or cur.description is None:
         return ()
     oids = tuple(res.ftype(c) for c in range(res.nfields))
     return (oids, tuple(tuple(res.get_value(r, c) for c in range(res.nfields)) for r in range(res.ntuples)))
@@ -247,8 +247,9 @@ def run_psycopg(conn, text: str, values, sql: str) -> Outcome:
     try:
         with conn.cursor() as cur:
             cur.execute(text, values)
-            rows = cur.fetchall() if cur.description else []
-            oids = [d.type_code for d in cur.description] if cur.description else []
+            # A statement with no columns has an empty description, not None.
+            rows = cur.fetchall() if cur.description is not None else []
+            oids = [d.type_code for d in cur.description] if cur.description is not None else []
             affected = cur.rowcount if changes_rows(sql) else None
             raw = raw_text(cur)
     except (psycopg.OperationalError, psycopg.InterfaceError):

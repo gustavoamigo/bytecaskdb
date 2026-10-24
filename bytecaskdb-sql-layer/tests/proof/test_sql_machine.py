@@ -524,7 +524,7 @@ class SqlMachine(RuleBasedStateMachine):
 
     def select(self, name: str, targets: list[str], where: list[tuple[str, str, object]],
                order: list[tuple[str, bool]] = (), limit: int | None = None, count: str | None = None,
-               fn: str = "count", distinct: bool = False) -> None:
+               fn: str = "count", distinct: bool = False, for_update: bool = False) -> None:
         """SELECT targets (or the aggregate fn(count), "*" for COUNT(*))
         WHERE each (column, operator, value) ... ORDER BY ... LIMIT ...: on
         both sides when the planner serves it, else the layer must refuse it
@@ -536,7 +536,7 @@ class SqlMachine(RuleBasedStateMachine):
         conds = [compared(t, c, op, v, i + 1, False) for i, (c, op, v) in enumerate(where)]
         pg_conds = [compared(t, c, op, v, i + 1, True) for i, (c, op, v) in enumerate(where)]
         tail = (" ORDER BY " + ", ".join(c + (" DESC" if d else "") for c, d in order) if order else "") + (
-            f" LIMIT {limit}" if limit is not None else "")
+            f" LIMIT {limit}" if limit is not None else "") + (" FOR UPDATE" if for_update else "")
         sql = f"SELECT {select} FROM {name} WHERE {' AND '.join(conds)}{tail}"
         params = [param_value(v) for _, _, v in where]
         types = [t.column(c).type for c in cols]
@@ -548,7 +548,7 @@ class SqlMachine(RuleBasedStateMachine):
             self.both(sql, params, pg_sql=pg_sql, types=types)  # one row, or none under LIMIT 0
             return
         layer = self.layer(sql, params, types)
-        full = o.run_pg(self.pg.conn, pg_sql.removesuffix(f" LIMIT {limit}" if limit is not None else ""), params)
+        full = o.run_pg(self.pg.conn, pg_sql.removesuffix(" FOR UPDATE").removesuffix(f" LIMIT {limit}" if limit is not None else ""), params)
         assert layer.error == full.error, f"{sql} {params!r}: the layer {layer.error or 'ran it'} ({layer.detail}), PostgreSQL {full.error or 'ran it'} ({full.detail})"
         if layer.error is not None:
             return
@@ -1829,6 +1829,38 @@ def test_a_join_on_a_column(dsn):
             m.insert("t3", {"c0": c0, "c1": c1}, all_columns=True)
         m.join_on("t2", "t3", [("c0", ">=", 1)], [("c0", ("col", "c1"))], [], [("t2", "c0"), ("t3", "c1")])
         m.select("t2", [], [("c0", ">=", 1)], count="c1", distinct=True)
+    finally:
+        m.teardown()
+
+
+def test_an_empty_select_list_returns_a_row_of_no_columns_per_match(dsn):
+    """SELECT FROM t WHERE …: one empty row per match, none for no match, and
+    one per row of a range."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER, nullable=False),
+                              Column("c2", o.TEXT)], ["c0", "c1"]))
+        for c1 in (1, 2, 3):
+            m.insert("t0", {"c0": 1, "c1": c1, "c2": "a"}, all_columns=True)
+        m.insert("t0", {"c0": 2, "c1": 1, "c2": None}, all_columns=True)
+        for where in ([("c0", "=", 1), ("c1", "=", 2)], [("c0", "=", 1), ("c1", "=", 9)], [("c0", "=", 9)],
+                      [("c0", "=", None)], [("c0", "=", 1)], [("c0", ">=", 1)]):
+            m.select("t0", [], where)
+        m.select("t0", [], [("c0", "=", 1)], limit=2)
+        # Served from an index alone, with no row read.
+        m.create_index("t0", Index("t0_ix0", [("c2", False)]))
+        for where in ([("c2", "=", "a")], [("c2", "=", None)], [("c2", ">=", "a")]):
+            m.select("t0", [], where)
+        # FOR UPDATE locks what it returns; here, rows of no columns.
+        for where in ([("c0", "=", 1), ("c1", "=", 2)], [("c0", "=", 1)], [("c0", "=", 9)]):
+            m.select("t0", [], where, for_update=True)
+        # A join of two point lookups.
+        m.create(Table("t1", [Column("c0", o.INTEGER, nullable=False)], ["c0"]))
+        m.insert("t1", {"c0": 1}, all_columns=True)
+        m.join(("t0", "t1"), [], ((1, 2), (1,)))
+        m.join(("t0", "t1"), [], ((1, 2), (9,)))
+        m.join(("t0", "t1"), [], ((1, 9), (1,)))
+        m.join(("t0", "t1"), [], ((1, 2), (1,)), on=True)
     finally:
         m.teardown()
 
