@@ -395,7 +395,7 @@ public:
   // their order: a $n used with two SQL types that share a physical type
   // (DOUBLE PRECISION and REAL, INTEGER and BIGINT, DECIMALs of two scales)
   // would be read as two values. Refused, where PostgreSQL infers one type
-  // from its first use (docs/testing_design.md, *Known differences*). A
+  // from its first use (docs/frontend_design.md, *Known differences*). A
   // DECIMAL of scale 0 is a BIGINT here (compared_type): its integer is the
   // number itself. A compared or operand $n is range-checked before the plan
   // runs (param_sql): against its column's type without the modifier, and a

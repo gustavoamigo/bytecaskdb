@@ -1,10 +1,10 @@
-# The planner after the MVP: a logical algebra, a search, and compiled pipelines
+# The planner: a logical algebra, a search, and compiled pipelines
 
 Status: **design, for review.** The first of the post-MVP designs (#487,
 *Next*). The direction was agreed with the owner on 2026-10-23
 (*Decisions*); the rest is for review before anything is built. It
-replaces the MVP planner of `frontend_design.md` (*The statement IR*, *The
-planner's choices*). The parser, the plan API and TinyCC are unchanged; the
+replaces the planner `frontend_design.md` describes under *The current
+planner*. The parser, the plan API and TinyCC are unchanged; the
 binder's output changes.
 
 ## Why
@@ -26,7 +26,7 @@ table with `col op $n` conjuncts, and `bound::Join` is exactly two.
 
 ## Standing rules
 
-These are unchanged from the MVP.
+These are unchanged.
 - **Plans are ours.** The compiler generates every plan as a program in
   the C subset of `plan_api_design.md` (*The language*), and only those
   plans are supported.
@@ -96,8 +96,8 @@ A fixed list, applied in order, each to a fixpoint. None needs a cost.
 
 Subquery decorrelation joins the list when #534 brings subqueries.
 
-The MVP's two rewrites of TPROC-C statements (`frontend_design.md`,
-*Decisions*, 3) were made by hand in the statement text, and stay that way.
+The two rewrites of TPROC-C statements (`testing_design.md`, *The TPROC-C
+statements*) were made by hand in the statement text, and stay that way.
 
 ## The search
 

@@ -243,7 +243,7 @@ auto now_us() -> std::int64_t {
 // A DECIMAL(p, 2) value as the layer takes it: its scaled integer.
 auto cents(std::int64_t c) -> Value { return c; }
 
-// history.h_id (docs/frontend_design.md, *Where the statements come from*).
+// history.h_id (docs/testing_design.md, *The TPROC-C statements*).
 constexpr std::uint64_t kMaxRun = (std::uint64_t{1} << 15) - 1;
 constexpr std::size_t kMaxThreads = 256;
 constexpr std::uint64_t kRowsPerThread = std::uint64_t{1} << 40;

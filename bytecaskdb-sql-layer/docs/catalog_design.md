@@ -1,19 +1,15 @@
 # The SQL layer's catalog
 
-Status: design, decided (#489); implemented in
-`bytecaskdb-sql-layer/catalog/`, with the tests in
-`bytecaskdb-sql-layer/tests/catalog_test.cpp` and the TPROC-C schema in
-`tests/tprocc_test.cpp`. This document decides what the catalog records, how
-it is stored under namespace `0x01`, the in-memory form plans resolve
-against and how readers share it, what makes a compiled plan compatible
-with the live catalog, and how each DDL statement of stage 1 writes. It
-agrees with `docs/plan_api_design.md` (revision 5; revision 4 came with it)
-and `docs/types_design.md`; nothing in the engine changes.
+Status: **built** (#489): `bytecaskdb-sql-layer/catalog/`, with its tests in
+`tests/catalog_test.cpp` and the TPROC-C schema in `tests/tprocc_test.cpp`.
+This covers what the catalog records, how it is stored under namespace
+`0x01`, the in-memory form plans resolve against and how readers share it,
+what makes a compiled plan compatible with the live catalog, and how each
+DDL statement writes. Nothing in the engine changes for it.
 
-The catalog is shared with the MariaDB plugin when the plugin adopts the
-sql-layer's formats (#487, *Relationship to the MariaDB plugin*). It is
-written from scratch: the plugin's catalog is positional, keyed by name and
-GPL-2.0, and nothing of it is copied.
+The catalog is written from scratch. The plugin's catalog is positional,
+keyed by name and GPL-2.0, and nothing of it is copied. The plugin would
+share this one only if it adopted the layer's formats (#488).
 
 ## What a table records
 
@@ -21,19 +17,19 @@ GPL-2.0, and nothing of it is copied.
 |---|---|
 | `id` | Permanent object id, from the one counter below. Never reused. |
 | `name` | As the parser hands it over: an unquoted identifier folded to lower case by PostgreSQL's rules, a quoted one exactly as written, so `"Foo"` and `foo` are two tables. Plans never paste a name into C: their constants are named from ids (`TBL_1`, `IDX_3`, `COL_1_2`, `PART_3_0`), so a name need not be an identifier and two objects' constants cannot collide. The plan's header lists what each constant stands for, in `//` lines whose user bytes outside printable ASCII, `\` and `?` are `\xNN` escapes. |
-| `version` | Per-table counter, bumped by every DDL on the table. Not checked by plans (see *Compatibility*); kept for stage 2. |
+| `version` | Per-table counter, bumped by every DDL on the table. Not checked by plans (see *Compatibility*); kept for several schema versions (*Several schema versions*). |
 | `next_col_id` | The next column id. Column ids are permanent and never reused, even after a column is dropped. |
-| columns | Each: permanent `id`, `name`, SQL type (kind, `VARCHAR` length, `DECIMAL` precision and scale), nullability, default. The physical type follows from the SQL type (`docs/types_design.md`, *Stage-1 types*). |
+| columns | Each: permanent `id`, `name`, SQL type (kind, `VARCHAR` length, `DECIMAL` precision and scale), nullability, default. The physical type follows from the SQL type (`types_design.md`, *Types*). |
 | primary key | Column ids, in key order. Always ascending; a primary key column is never null. |
 | indexes | Each: permanent `id`, `name`, unique or not, parts as (column id, `ASC`/`DESC`). |
-| layouts | Each layout generation: its object id, its generation number, `bitmap_bytes`, and its offset table (column id → byte offset or variable slot). The last is current. Stage 1 has one per table; `REBUILD` appends one (#503). |
+| layouts | Each layout generation: its object id, its generation number, `bitmap_bytes`, and its offset table (column id → byte offset or variable slot). The last is current. Each table has one until `REBUILD` exists, which appends one (#503). |
 
 A default is a constant of the column's physical type, or none (null).
-Stage 1 accepts integer, decimal, string and boolean literals, folded at
+DDL accepts integer, decimal, string and boolean literals, folded at
 bind time to the stored value (a `DECIMAL(p, s)` default is stored scaled);
 `TIMESTAMP`, `DATE` and `TIME` defaults, and expressions such as
 `CURRENT_TIMESTAMP`, are refused: a plan cannot see the clock, and literal
-parsing of those types is #492's.
+parsing of those types isn't built.
 
 ## Serialization
 
@@ -64,7 +60,7 @@ record or of an entry, never reorders or reinterprets one. Columns, indexes
 and layouts are length-prefixed entries, so a later format can extend them
 too. A build reads every format from 3 to its own, taking an absent field
 at its default; it refuses a newer format, whose added fields it may not be
-able to ignore safely, and an older one: format 1 holds the prototype's row
+able to ignore safely, and an older one: format 1 holds the earliest build's row
 positions, format 2 (#490's) no SQL types. Both predate any database worth
 reading. The record format also names the row format its positions are
 for; formats 2 and 3 share the 12-byte-header row format.
@@ -254,7 +250,7 @@ disk and in memory, as it was.
 whatever the table holds; the engine's `del_range` removes the keys from the
 key directory as it applies. A `NOT NULL` column added without a default is
 refused, as is a column whose id has no bit in the layout's bitmap (it needs
-a `REBUILD`, not in stage 1). Ids taken by a DDL are not reused, even when
+a `REBUILD`, which doesn't exist yet, #503). Ids taken by a DDL are not reused, even when
 it is dropped later.
 
 **Backfill is one batch, bounded by the engine's 1 GiB plan limit.**
@@ -281,7 +277,9 @@ read-only, or as a follower, does not change it. A database whose `0x01`
 namespace holds a record or a name entry that does not parse is refused at
 open.
 
-## Stage 2: several schema versions, deferred
+## Several schema versions
+
+Deferred.
 
 Serving several schema versions at once (per-version column lists and
 defaults, a session declaring the version it speaks, `DROP COLUMN` as a
@@ -298,7 +296,7 @@ not built. Four choices made here keep it open:
 4. **Append-only serialization**, so the record can grow per-version
    fields without migrating the records already written.
 
-## Validation
+## Tests
 
 `tests/catalog_test.cpp`: the record round-trips; a record cut at every
 byte, with a bad type code, an unknown key column or trailing bytes, and a
