@@ -32,6 +32,28 @@ archive downloads while allowing git, which is why xmake is cloned and built
 rather than installed. The hook is a no-op everywhere else: local checkouts, the
 Dev Container, and Codespaces already have the toolchain.
 
+### Worktrees and editor setup
+
+A git worktree is a bare checkout: no `build/`, so no C++23 module BMIs and no
+`compile_commands.json`, and clangd reports every `import bytecask.*` as
+unresolved until both exist. `scripts/opencode_worktree_setup.sh` builds them —
+`xmake f`, `xmake build bytecask_tests`, then `scripts/gen_compile_commands.sh` —
+writing only gitignored paths. Run it by hand in any new checkout, or after
+switching `BYTECASK_KEYDIR` or the build mode.
+
+OpenCode runs it automatically in a worktree it creates. That setting is per
+project rather than in `opencode.jsonc`, which has no field for it: it is the
+project's `commands.start`, stored in OpenCode's own database. A fresh clone
+sets it once, reading the project ID from the list below:
+
+```bash
+opencode api get /api/project            # find the entry whose canonical path is this repo
+opencode api patch /api/project/<id> \
+  --data '{"commands":{"start":"scripts/opencode_worktree_setup.sh"}}'
+```
+
+Worktrees created before the script existed need it run by hand.
+
 ## Making a change
 
 1. Open an issue or comment on an existing one before starting significant work, so we can discuss direction.
