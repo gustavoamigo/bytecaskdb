@@ -1,0 +1,1 @@
+SELECT id, qty FROM t WHERE name >= $1 ORDER BY qty NULLS FIRST LIMIT 10

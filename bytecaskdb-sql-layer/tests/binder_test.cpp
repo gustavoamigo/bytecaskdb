@@ -332,7 +332,17 @@ TEST_CASE("binder: COUNT, ORDER BY and column + parameter", "[sql][binder]") {
     REQUIRE(keys.size() == 1);
     CHECK(keys[0].expr.col.col == 2u);
     CHECK(keys[0].desc);
+    CHECK(keys[0].nulls_first);  // PostgreSQL's default for DESC
     CHECK(std::get<logical::Limit>(root(b).op).n == 2);
+  }
+  {
+    // NULLS FIRST and NULLS LAST as written; ASC's default is last.
+    auto b = bind_sql(cat, "SELECT id FROM t WHERE name = $1 ORDER BY qty NULLS FIRST, name DESC NULLS LAST, id");
+    const auto& keys = get<logical::Sort>(b).keys;
+    REQUIRE(keys.size() == 3);
+    CHECK(keys[0].nulls_first);
+    CHECK_FALSE(keys[1].nulls_first);
+    CHECK_FALSE(keys[2].nulls_first);
   }
   {
     // The operand is typed and range-checked as the column it is added to.

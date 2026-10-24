@@ -94,7 +94,10 @@ TEST_CASE("physical: check refuses what codegen can't print", "[sql][physical]")
   CHECK(refusal(by_sum).empty());
 
   CHECK(refusal(plan(emit(node(scan({p(0)}, {}, true))))).empty());
-  refused(plan(emit(node(scan({p(0)}, {}, true)), {kD})), "DOUBLE target");
+  refused(plan(emit(node(scan({p(0)}, {}, true)), {kD})), "DOUBLE column read from a key");
+  // A full scan, of the primary key or of an index.
+  CHECK(refusal(plan(emit(node(physical::Scan{1, 1, {}, physical::Range{}, false, false, false})), {})).empty());
+  CHECK(refusal(plan(emit(node(scan({}, physical::Range{}))), {})).empty());
   refused(plan(emit(node(scan({p(0)}, {}, true, true)))), "FOR UPDATE scan that covers");
   CHECK(refusal(plan(emit(node(scan({p(0)}, {}, false, true))))).empty());
   // The NULL split's values start past the NULL part.
@@ -133,7 +136,14 @@ TEST_CASE("physical: a nested loop reads its inner scan once, under one outer ro
     return node(physical::Filter{inner(), {logical::compare(ast::Compare::Op::Eq, col(inner_col), col(c))}});
   };
   CHECK(refusal(plan(loop(get({p(0)}), inner()))).empty());
-  refused(plan(loop(node(scan({p(0)}, {})), inner())), "outer side is not one row");
+  // Under an outer loop, read once per outer row: never with a count of its own.
+  CHECK(refusal(plan(loop(node(scan({p(0)}, {})), inner()))).empty());
+  auto counted = [&] {
+    return node(physical::Choice{physical::Scan{2, 4, {p(1)}, {}, false, false, false}, 10, inner(), inner()});
+  };
+  CHECK(refusal(plan(loop(get({p(0)}), counted()))).empty());
+  refused(plan(loop(node(scan({p(0)}, {})), counted())), "a choice point read once per outer row");
+  refused(plan(loop(node(physical::Insert{1, {{kId, p(0)}}}), inner())), "neither one row nor a loop");
   refused(plan(loop(get({p(0)}), get({p(1)}))), "inner side is not a scan");
   // A join conjunct reads a column of the outer side: of its point lookup,
   // or of a table it looks up by key.
@@ -171,10 +181,79 @@ TEST_CASE("physical: a choice point counts its first plan's range, and each plan
   // A DOUBLE target from a key, on either plan.
   auto covering = by(5, 1);
   covering.covering = true;
-  refused(plan(emit(node(physical::Choice{by(3, 0), 100, node(by(3, 0)), node(covering)}), {kD})), "DOUBLE target");
+  refused(plan(emit(node(physical::Choice{by(3, 0), 100, node(by(3, 0)), node(covering)}), {kD})),
+          "DOUBLE column read from a key");
+
+  // The count is of the first plan's whole range: its prefix's parameters,
+  // its bounds and its direction.
+  auto ranged = [&](logical::Expr lo, bool successor, bool reverse) {
+    auto s = physical::Scan{1, 3, {p(0)}, physical::Range{{physical::KeyBound::Kind::Value, std::move(lo), successor}, {}},
+                            reverse, false, false};
+    return s;
+  };
+  CHECK(refusal(plan(choice(ranged(p(1), false, false), node(ranged(p(1), false, false)), node(by(5, 1)), 9))).empty());
+  refused(plan(choice(ranged(p(0), false, false), node(ranged(p(1), false, false)), node(by(5, 1)), 9)),
+          "counts another range");
+  refused(plan(choice(ranged(p(1), true, false), node(ranged(p(1), false, false)), node(by(5, 1)), 9)),
+          "counts another range");
+  refused(plan(choice(ranged(p(1), false, true), node(ranged(p(1), false, false)), node(by(5, 1)), 9)),
+          "counts another range");
+  refused(plan(choice(by(3, 1), node(by(3, 0)), node(by(5, 1)), 9)), "counts another range");
+  refused(plan(choice(ranged(p(1), false, false), node(by(3, 0)), node(by(5, 1)), 9)), "counts another range");
+  // A NULL split's count is of its whole prefix, which holds both its ranges.
+  auto past_nulls = physical::Range{{physical::KeyBound::Kind::NullPart, std::nullopt, true}, {}};
+  auto split = [&] { return node(physical::NullSplitScan{physical::Scan{1, 3, {p(0)}, past_nulls, false, false, false}}); };
+  CHECK(refusal(plan(choice(by(3, 0), split(), node(by(5, 1)), 9))).empty());
+  refused(plan(choice(physical::Scan{1, 3, {p(0)}, past_nulls, false, false, false}, split(), node(by(5, 1)), 9)),
+          "counts another range");
 
   physical::Plan two = plan(choice(by(3, 0), node(by(3, 0)), node(by(5, 1)), 100));
   CHECK(physical::choices(two) == 1);
-  physical::override_thresholds(two, 0);
+  physical::override_thresholds(two, {0});
   CHECK(std::get<physical::Choice>(std::get<physical::Emit>(two.root->op).input->op).threshold == 0);
+  CHECK_THROWS_AS(physical::override_thresholds(two, {0, 0}), std::logic_error);
+}
+
+TEST_CASE("physical: a DOUBLE column is never read from a key, wherever codegen reads it", "[sql][physical]") {
+  const logical::ColumnRef other{2, 0, PhysType::I64, false};
+  auto col = [](const logical::ColumnRef& c, SqlKind k = SqlKind::BigInt) { return logical::column(c, SqlType{k}); };
+  auto covering = [] { return node(scan({p(0)}, {}, true)); };
+  // The inner key of an index join, built from the outer row.
+  CHECK(refusal(plan(emit(node(physical::IndexJoin{node(scan({p(0)}, {})), 2, {col(kD, SqlKind::Double)}}), {other})))
+            .empty());
+  refused(plan(emit(node(physical::IndexJoin{covering(), 2, {col(kD, SqlKind::Double)}}), {other})),
+          "DOUBLE column read from a key");
+  // A filter's operand, a column of another table.
+  auto by_double = logical::compare(ast::Compare::Op::Eq, col(other), col(kD, SqlKind::Double));
+  refused(plan(emit(node(physical::Filter{node(physical::IndexJoin{covering(), 2, {p(1)}}), {by_double}}), {other})),
+          "DOUBLE column read from a key");
+  // An aggregate's argument.
+  auto min_d = logical::expr(logical::Expr::Kind::Aggregate, SqlType{SqlKind::Double});
+  min_d.fn = logical::Expr::Fn::Min;
+  min_d.args.push_back(col(kD, SqlKind::Double));
+  CHECK(refusal(plan(node(physical::Aggregate{node(scan({p(0)}, {})), min_d, true}))).empty());
+  refused(plan(node(physical::Aggregate{covering(), min_d, true})), "DOUBLE column read from a key");
+}
+
+TEST_CASE("physical: a sort holds the row of its input's one loop, keyed by columns in hand", "[sql][physical]") {
+  auto by_id = std::vector<physical::SortPart>{{kId, true, true}};
+  auto sort = [&](physical::NodePtr in, std::vector<physical::SortPart> keys, std::int64_t keep, std::uint32_t payload) {
+    return emit(node(physical::Sort{std::move(in), std::move(keys), keep, payload}));
+  };
+  CHECK(refusal(plan(sort(node(scan({p(0)}, {})), by_id, 0, 1))).empty());
+  CHECK(refusal(plan(sort(node(scan({p(0)}, {})), by_id, 5, 1))).empty());
+  refused(plan(sort(node(scan({p(0)}, {})), {}, 0, 1)), "a sort with no key");
+  refused(plan(sort(node(scan({p(0)}, {})), by_id, -1, 1)), "negative number of rows");
+  refused(plan(sort(get({p(0)}), by_id, 0, 1)), "input is not one loop");
+  refused(plan(sort(node(scan({p(0)}, {})), by_id, 0, 2)), "another row than its loop's");
+  refused(plan(sort(node(scan({p(0)}, {}, true)), by_id, 0, 1)), "a sort over a covering scan");
+  refused(plan(sort(node(scan({p(0)}, {})), {{{2, 0, PhysType::I64, false}, false, false}}, 0, 1)),
+          "a sort key outside its input's tables");
+  // Two loops, one inside the other: a sorter holds one row per entry.
+  auto inner = node(physical::Scan{2, 4, {p(1)}, {}, false, false, false});
+  refused(plan(sort(node(physical::NestedLoop{node(scan({p(0)}, {})), std::move(inner)}), by_id, 0, 2)),
+          "input is not one loop");
+  // Under one row read once, the inner scan's loop.
+  auto once = node(physical::NestedLoop{get({p(0)}), node(physical::Scan{2, 4, {p(1)}, {}, false, false, false})});
+  CHECK(refusal(plan(sort(std::move(once), by_id, 0, 2))).empty());
 }

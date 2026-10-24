@@ -1,0 +1,1 @@
+SELECT a, b, v FROM p WHERE a = $1 ORDER BY v DESC, w NULLS FIRST, b

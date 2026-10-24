@@ -64,8 +64,10 @@ kind the transformer doesn't take is refused with its position.
   differences*).
 
 **`ORDER BY` and `LIMIT`.**
-- `ORDER BY` takes a list of columns, each `ASC` or `DESC`. Ties come back
-  in any order, as PostgreSQL allows.
+- `ORDER BY` takes a list of columns, each `ASC` or `DESC`, and `NULLS
+  FIRST` or `NULLS LAST`; without them NULLs sort as PostgreSQL's
+  defaults put them, last under `ASC` and first under `DESC`. Ties come
+  back in any order, as PostgreSQL allows. `CREATE INDEX` takes neither.
 - `LIMIT` takes an integer literal or a parameter. `LIMIT NULL` is no
   limit, and a negative limit is refused (2201W), as in PostgreSQL.
 
@@ -213,12 +215,15 @@ fail on them.
   value are 23505 on both
   (`test_one_unique_value_given_to_two_rows_is_23505`). The machine adds to
   no column a unique index holds.
-- **A statement no index scan answers in its order is refused**
-  (`planner_design.md`, *What the search refuses*): a full scan, a sort of
-  the rows read, an `ORDER BY` no scan of a join's first table gives, or
-  one whose NULLs no index that gives it can place as PostgreSQL does.
-  PostgreSQL runs it. This is the one feature gap in the list; #533 closes
-  it.
+- **A statement only a hash join or a filter on a DOUBLE answers is
+  refused** (`planner_design.md`, *Slice 4 as built*, *What the search
+  refuses*): a join no key reaches either way where reading a table once
+  per row of the other costs more than a hash join (slice 5, #534), an
+  `ORDER BY` only a sort gives over such a nested loop of two scans, and a
+  filter on a REAL or DOUBLE PRECISION column no key takes. PostgreSQL runs
+  them. Full scans and sorts, which #533 lifted, are no longer refused.
+- **A sort past the statement's memory budget fails** with 54000, where
+  PostgreSQL spills it to disk (`planner_design.md`, *Memory*).
 
 Each is a refusal or an error, not a different answer. Everything else in
 the dialect matches PostgreSQL, and the proof machine checks that it does.

@@ -394,11 +394,12 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos) -> Select {
       reject("ORDER BY takes columns", pos);
     }
     auto col = expr(sb->node);
-    if (sb->sortby_nulls != PG_QUERY__SORT_BY_NULLS__SORTBY_NULLS_DEFAULT) {
-      reject("NULLS FIRST and NULLS LAST are not supported", col.pos);
-    }
     if (sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_USING) reject("ORDER BY ... USING is not supported", col.pos);
-    sel.order_by.push_back({col.column, sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_DESC, col.pos, col.table});
+    std::optional<bool> nulls_first;
+    if (sb->sortby_nulls == PG_QUERY__SORT_BY_NULLS__SORTBY_NULLS_FIRST) nulls_first = true;
+    if (sb->sortby_nulls == PG_QUERY__SORT_BY_NULLS__SORTBY_NULLS_LAST) nulls_first = false;
+    sel.order_by.push_back({col.column, sb->sortby_dir == PG_QUERY__SORT_BY_DIR__SORTBY_DESC, col.pos, col.table,
+                            nulls_first});
   }
   for (std::size_t i = 0; i < s->n_target_list; ++i) {
     const auto* rt = s->target_list[i]->res_target;

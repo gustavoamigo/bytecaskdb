@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <variant>
+#include <optional>
 #include <vector>
 
 import bytecask.sql.parser;
@@ -107,10 +108,19 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   CHECK(rejected_at("SELECT sum(*) FROM t WHERE id = $1") == 7);
   CHECK(rejected_at("SELECT min(qty + $2) FROM t WHERE id = $1") == 7);
   CHECK(rejected_at("SELECT sum(DISTINCT qty) FROM t WHERE id = $1") == 7);
-  CHECK(rejected_at("SELECT id FROM t WHERE id = $1 ORDER BY id NULLS FIRST") == 40);
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 LIMIT $2"), SqlError);
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 OFFSET 1"), SqlError);
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 ORDER BY qty + $2"), SqlError);
+}
+
+TEST_CASE("parser: ORDER BY takes NULLS FIRST and NULLS LAST; an index does not", "[sql][parser]") {
+  auto s = std::get<Select>(parse("SELECT id FROM t WHERE id = $1 ORDER BY id NULLS FIRST, qty DESC NULLS LAST, name"));
+  REQUIRE(s.order_by.size() == 3);
+  CHECK(s.order_by[0].nulls_first == std::optional<bool>{true});
+  CHECK(s.order_by[1].desc);
+  CHECK(s.order_by[1].nulls_first == std::optional<bool>{false});
+  CHECK_FALSE(s.order_by[2].nulls_first.has_value());
+  CHECK_THROWS_AS(parse("CREATE INDEX u ON t (name NULLS FIRST)"), SqlError);
 }
 
 TEST_CASE("parser: COUNT, ORDER BY, LIMIT and column + parameter", "[sql][parser]") {

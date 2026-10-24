@@ -556,8 +556,8 @@ public:
   // A SELECT of one table, or of two joined: Limit? -> Project | Aggregate
   // -> Sort? -> Filter? -> Get, or a Join of two Gets. The WHERE's conjuncts,
   // a join's ON among them, sit in one Filter above the tables; predicate
-  // pushdown moves each down. No FOR UPDATE on a join yet; its ORDER BY is
-  // the planner's to refuse, unless an aggregate makes it 42803.
+  // pushdown moves each down. No FOR UPDATE on a join yet. An ORDER BY
+  // beside an aggregate is 42803.
   auto select(const ast::Select& s) -> logical::NodePtr {
     auto joined = !s.join.empty();
     const Table* sides[2]{table(s.table, joined ? s.table_pos : s.pos), nullptr};
@@ -604,7 +604,7 @@ public:
     for (const auto& o : s.order_by) {
       auto [t, c] = resolve(column_ref(o));
       if (agg) ungrouped(*t, c->name, o.pos);
-      keys.push_back({logical::column_of(t->id, *c), o.desc});
+      keys.push_back({logical::column_of(t->id, *c), o.desc, o.nulls_first.value_or(o.desc)});
     }
 
     auto rows = joined ? logical::node(logical::Join{logical::node(logical::Get{sides[0], false}),

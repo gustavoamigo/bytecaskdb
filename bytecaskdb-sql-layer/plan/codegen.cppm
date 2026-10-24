@@ -65,20 +65,23 @@ struct GeneratedPlan {
 };
 
 // Plans a bound DML statement, its logical plan rewritten, then searched,
-// its tables costed at `counts`, and prints the cheapest plan. Throws
-// FeatureNotSupported ("no plan: ...") when the search finds none, and
-// std::logic_error if the physical plan fails physical::check, a compiler
-// bug.
-[[nodiscard]] auto generate_plan(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts = {})
-    -> GeneratedPlan;
+// its tables costed at `counts` and its sorts weighed against the
+// statement's memory budget `memory_bytes` (0: none), and prints the
+// cheapest plan. Throws FeatureNotSupported ("no plan: ...") when the search
+// finds none, and std::logic_error if the physical plan fails
+// physical::check, a compiler bug.
+[[nodiscard]] auto generate_plan(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts = {},
+                                 std::uint64_t memory_bytes = 0) -> GeneratedPlan;
 
 // Every plan the search costs for the statement, cheapest first, each
 // printed as generate_plan prints the one it picks (*Tests*, alternatives
-// agree); a plan with choice points twice, its thresholds overridden so it
-// takes every first plan (INT64_MAX), then every second (0). Throws what
+// agree); a plan with choice points once per combination of their
+// branches, its thresholds overridden so each takes its first plan
+// (INT64_MAX) or its second (0), every first first. Throws what
 // generate_plan throws.
 [[nodiscard]] auto generate_alternatives(bound::Bound b, const Catalog& cat, std::string_view sql,
-                                         const RowCounts& counts = {}) -> std::vector<GeneratedPlan>;
+                                         const RowCounts& counts = {}, std::uint64_t memory_bytes = 0)
+    -> std::vector<GeneratedPlan>;
 
 }  // namespace bytecask::sql
 
@@ -356,6 +359,7 @@ private:
     bool covering{false};
     std::uint32_t object{0};
     bool for_update{false};
+    std::string cursor{"c"};  // a covering scan's
   };
 
   // What the root reports when no row can match: nothing for result rows,
@@ -384,7 +388,8 @@ private:
     return std::visit(
         [](const auto& op) -> bool {
           using T = std::decay_t<decltype(op)>;
-          if constexpr (std::is_same_v<T, physical::Scan> || std::is_same_v<T, physical::NullSplitScan>) {
+          if constexpr (std::is_same_v<T, physical::Scan> || std::is_same_v<T, physical::NullSplitScan> ||
+                        std::is_same_v<T, physical::Sort>) {
             return true;
           } else if constexpr (std::is_same_v<T, physical::IndexJoin>) {
             return loops(*op.outer);
@@ -417,7 +422,7 @@ private:
   // "<object>, bc_scan_key(cx, c), <part>)": the arguments that name c's part
   // of the entry the covering scan is on.
   auto key_part(const Binding& b, const ColumnRef& c) -> std::string {
-    return w_.obj(b.object) + ", bc_scan_key(cx, c), " + w_.part(b.object, c) + ")";
+    return w_.obj(b.object) + ", bc_scan_key(cx, " + b.cursor + "), " + w_.part(b.object, c) + ")";
   }
 
   // The index of $n ± k, compared with a column of `table`, in the values
@@ -523,29 +528,34 @@ private:
 
   static auto prefix(const physical::Scan& sc) -> std::vector<KeySrc> { return param_parts(sc.prefix); }
 
-  // `bc_view lo` and `bc_view hi` of a scan's range.
-  void print_range(const physical::Scan& sc, const physical::Range& r) {
-    w_.line("bc_view lo = " + bound(sc, r.lo, true) + ";");
-    w_.line("bc_view hi = " + bound(sc, r.hi, false) + ";");
+  // `bc_view <lo>` and `bc_view <hi>` of a scan's range.
+  void print_range(const physical::Scan& sc, const physical::Range& r, const std::string& lo = "lo",
+                   const std::string& hi = "hi") {
+    w_.line("bc_view " + lo + " = " + bound(sc, r.lo, true) + ";");
+    w_.line("bc_view " + hi + " = " + bound(sc, r.hi, false) + ";");
   }
 
   // `bc_cursor c` over every entry under the key `lo` holds.
-  void open_prefix(const physical::Scan& sc) {
-    w_.line("bc_cursor c = bc_scan_open(cx, " + w_.obj(sc.object) + ", lo, lo, BC_SCAN_PREFIX" +
-            (sc.reverse ? " | BC_SCAN_REVERSE" : "") + ");");
+  void open_prefix(const physical::Scan& sc, const std::string& lo = "lo") {
+    w_.line("bc_cursor " + cursor_ + " = bc_scan_open(cx, " + w_.obj(sc.object) + ", " + lo + ", " + lo +
+            ", BC_SCAN_PREFIX" + (sc.reverse ? " | BC_SCAN_REVERSE" : "") + ");");
   }
 
-  // `bc_view lo`, `bc_view hi` and `bc_cursor c` of the scan.
+  // `bc_view lo`, `bc_view hi` and `bc_cursor c` of the scan; for a choice
+  // point's first plan, `c` alone, on the range its count built.
   void open_scan(const physical::Scan& sc) {
     w_.reads(sc.object);
+    auto counted = std::exchange(counted_, std::nullopt);
+    auto lo = counted ? counted->first : std::string{"lo"};
+    auto hi = counted ? counted->second : std::string{"hi"};
     if (const auto* r = std::get_if<physical::Range>(&sc.rest)) {
-      print_range(sc, *r);
-      w_.line("bc_cursor c = bc_scan_open(cx, " + w_.obj(sc.object) + ", lo, hi, " +
+      if (!counted) print_range(sc, *r);
+      w_.line("bc_cursor " + cursor_ + " = bc_scan_open(cx, " + w_.obj(sc.object) + ", " + lo + ", " + hi + ", " +
               (sc.reverse ? "BC_SCAN_REVERSE" : "BC_SCAN_FORWARD") + ");");
       return;
     }
-    w_.line("bc_view lo = " + key(w_, sc.object, prefix(sc)) + ";");
-    open_prefix(sc);
+    if (!counted) w_.line("bc_view lo = " + key(w_, sc.object, prefix(sc)) + ";");
+    open_prefix(sc, lo);
   }
 
   // The NULL part of a NullSplitScan: every entry under the prefix and NULL.
@@ -562,19 +572,19 @@ private:
   // ends that step (docs/plan_api_design.md, *A loop's step owns what it
   // allocates*).
   void scan_loop(const physical::Scan& sc, const Consume& k) {
-    w_.open("while (" + guard_ + "bc_scan_next(cx, c))");
+    w_.open("while (" + guard_ + "bc_scan_next(cx, " + cursor_ + "))");
     if (!sc.covering) {
       w_.reads(sc.table);
-      w_.line("bc_view " + row_name_ + " = bc_scan_row(cx, c);");
+      w_.line("bc_view " + row_name_ + " = bc_scan_row(cx, " + cursor_ + ");");
     }
-    rows_.push_back({sc.table, row_name_, sc.covering, sc.object, sc.for_update});
+    rows_.push_back({sc.table, row_name_, sc.covering, sc.object, sc.for_update, cursor_});
     auto outer = loop_;
     loop_ = true;
     k();
     loop_ = outer;
     rows_.pop_back();
     w_.close();
-    if (!guard_.empty()) w_.line("bc_scan_close(cx, c);");
+    if (!guard_.empty()) w_.line("bc_scan_close(cx, " + cursor_ + ");");
   }
 
   void produce(const physical::Scan& sc, const Consume& k) {
@@ -585,6 +595,8 @@ private:
   // The present values and the NULL part, each in its own block, in
   // PostgreSQL's order; one LIMIT counter across both.
   void produce(const physical::NullSplitScan& split, const Consume& k) {
+    // Its ranges are its own, not a choice point's count of its prefix.
+    counted_.reset();
     const auto& sc = split.present;
     for (auto nulls : sc.reverse ? std::vector<bool>{true, false} : std::vector<bool>{false, true}) {
       w_.open("");
@@ -599,14 +611,14 @@ private:
     }
   }
 
-  // `bc_view lo` and `bc_view hi` of the scan's whole range, for a count.
-  void print_count_range(const physical::Scan& sc) {
+  // `bc_view <lo>` and `bc_view <hi>` of the scan's whole range, for a count.
+  void print_count_range(const physical::Scan& sc, const std::string& lo = "lo", const std::string& hi = "hi") {
     w_.reads(sc.object);
     if (const auto* r = std::get_if<physical::Range>(&sc.rest)) {
-      print_range(sc, *r);
+      print_range(sc, *r, lo, hi);
     } else {
-      w_.line("bc_view lo = " + key(w_, sc.object, prefix(sc)) + ";");
-      w_.line("bc_view hi = bc_key_successor(cx, lo);");
+      w_.line("bc_view " + lo + " = " + key(w_, sc.object, prefix(sc)) + ";");
+      w_.line("bc_view " + hi + " = bc_key_successor(cx, " + lo + ");");
     }
   }
 
@@ -618,19 +630,19 @@ private:
     if (cr.emits) emit_count("n");
   }
 
-  // The count of the first plan's range, limited to the threshold, in a
-  // block of its own; then each plan, under the condition that picks it,
-  // with the consume printed once in each.
+  // The count of the first plan's range, limited to the threshold; then
+  // each plan, under the condition that picks it, with the consume printed
+  // once in each. The first plan's scan opens on the range the count built.
   void produce(const physical::Choice& ch, const Consume& k) {
-    const auto n = "count" + std::to_string(choices_++);
+    const auto i = std::to_string(choices_++);
+    const auto n = "count" + i;
     const auto t = ch.threshold == std::numeric_limits<std::int64_t>::max() ? std::string{"INT64_MAX"}
                                                                              : std::to_string(ch.threshold);
-    w_.line("int64_t " + n + " = 0;");
-    w_.open("");
-    print_count_range(ch.counted);
-    w_.line(n + " = bc_count_range(cx, " + w_.obj(ch.counted.object) + ", lo, hi, " + t + ");");
-    w_.close();
+    print_count_range(ch.counted, "lo" + i, "hi" + i);
+    w_.line("int64_t " + n + " = bc_count_range(cx, " + w_.obj(ch.counted.object) + ", lo" + i + ", hi" + i + ", " + t +
+            ");");
     w_.open("if (" + n + " < " + t + ")");
+    counted_ = std::pair{"lo" + i, "hi" + i};
     produce(*ch.below, k);
     w_.otherwise();
     produce(*ch.at_or_above, k);
@@ -643,19 +655,20 @@ private:
     if (!m.emits) return;
     const auto& sc = m.scan;
     open_scan(sc);
-    w_.open("if (bc_scan_next(cx, c))");
+    w_.open("if (bc_scan_next(cx, " + cursor_ + "))");
     w_.line("bc_emit_begin(cx);");
     if (sc.covering) {
-      w_.line("bc_emit_key_part(cx, " + w_.obj(sc.object) + ", bc_scan_key(cx, c), " + w_.part(sc.object, m.arg) + ");");
+      w_.line("bc_emit_key_part(cx, " + w_.obj(sc.object) + ", bc_scan_key(cx, " + cursor_ + "), " +
+              w_.part(sc.object, m.arg) + ");");
     } else {
       w_.reads(sc.table);
-      w_.line("bc_emit_col(cx, bc_scan_row(cx, c), " + w_.col(m.arg) + ");");
+      w_.line("bc_emit_col(cx, bc_scan_row(cx, " + cursor_ + "), " + w_.col(m.arg) + ");");
     }
     w_.line("bc_emit_end(cx);");
     w_.otherwise();
     for (const auto& line : no_rows_) w_.line(line);
     w_.close();
-    w_.line("bc_scan_close(cx, c);");
+    w_.line("bc_scan_close(cx, " + cursor_ + ");");
   }
 
   // For each outer row, the inner row its key names. Of an outer column, a
@@ -696,14 +709,56 @@ private:
   }
 
   // The outer side's row, then, if it has one, the inner scan's loop: its
-  // row is row<d>, as an index join's.
+  // row is row<d>, as an index join's. Inside an outer loop, its cursor is
+  // c<d>, so the outer one's stays in reach.
   void produce(const physical::NestedLoop& j, const Consume& k) {
+    const auto outer_loops = loops(*j.outer);
     produce(*j.outer, [&] {
-      auto outer_row = row_name_;
-      row_name_ = "row" + std::to_string(rows_.size());
+      const auto d = std::to_string(rows_.size());
+      auto outer_row = std::exchange(row_name_, "row" + d);
+      auto outer_cursor = outer_loops ? std::exchange(cursor_, "c" + d) : cursor_;
       produce(*j.inner, k);
       row_name_ = outer_row;
+      cursor_ = outer_cursor;
     });
+  }
+
+  // A pipeline breaker: each row of its input added to a sorter, keyed by
+  // bc_sort_key_* from the rows in hand, then a loop over the sorter in sort
+  // order, which binds the row it held. The rows read once before the
+  // input's loop stay in hand; a LIMIT's counter is the sorter loop's.
+  void produce(const physical::Sort& s, const Consume& k) {
+    const auto i = std::to_string(sorts_++);
+    const auto sorter = "s" + i;
+    const auto held = "p" + i;
+    w_.line("bc_sorter " + sorter + " = bc_sorter_open(cx, " + std::to_string(s.keep) + ");");
+    auto guard = std::exchange(guard_, "");
+    std::vector<Binding> in_hand;
+    produce(*s.input, [&] {
+      w_.line("bc_sort_key sk = bc_sort_key_begin(cx);");
+      for (const auto& part : s.keys) {
+        w_.line("bc_sort_key_col(cx, sk, " + row_of(part.col) + ", " + w_.col(part.col) + ", " +
+                (part.desc ? "BC_SORT_DESC" : "BC_SORT_ASC") + ", " +
+                (part.nulls_first ? "BC_SORT_NULLS_FIRST" : "BC_SORT_NULLS_LAST") + ");");
+      }
+      w_.line("bc_sorter_add(cx, " + sorter + ", bc_sort_key_end(cx, sk), " + binding(s.payload).row + ");");
+      // The rows in hand up to the loop's, whose row the sorter holds.
+      in_hand.clear();
+      for (const auto& b : rows_) {
+        in_hand.push_back(b);
+        if (b.table == s.payload) break;
+      }
+    });
+    guard_ = guard;
+    in_hand.back().row = held;
+    w_.line("bc_view " + held + " = bc_empty(cx);");
+    w_.open("while (" + guard_ + "bc_sorter_next(cx, " + sorter + ", &" + held + "))");
+    auto outer_rows = std::exchange(rows_, in_hand);
+    auto outer = std::exchange(loop_, true);
+    k();
+    loop_ = outer;
+    rows_ = outer_rows;
+    w_.close();
   }
 
   void produce(const physical::Filter& f, const Consume& k) {
@@ -742,7 +797,7 @@ private:
       if (rows_.size() == 1 && rows_[0].covering) {
         // Every result column from the entry's key: no row read.
         const auto& b = rows_[0];
-        if (!e.targets.empty()) w_.line("bc_view key = bc_scan_key(cx, c);");
+        if (!e.targets.empty()) w_.line("bc_view key = bc_scan_key(cx, " + b.cursor + ");");
         w_.line("bc_emit_begin(cx);");
         for (const auto& t : e.targets) {
           w_.line("bc_emit_key_part(cx, " + w_.obj(b.object) + ", key, " + w_.part(b.object, t) + ");");
@@ -785,7 +840,7 @@ private:
   auto arg_of_row(const ColumnRef& arg) -> std::pair<std::string, std::string> {
     const auto& b = binding(arg.table);
     if (b.covering) {
-      w_.line("bc_view key = bc_scan_key(cx, c);");
+      w_.line("bc_view key = bc_scan_key(cx, " + b.cursor + ");");
       auto at = w_.obj(b.object) + ", key, " + w_.part(b.object, arg) + ")";
       return {"bc_key_part_null(cx, " + at, "bc_key_part_i64(cx, " + at};
     }
@@ -987,7 +1042,12 @@ private:
   bool loop_{false};             // inside a loop: a miss is `continue`
   std::string guard_;            // a LIMIT's condition on the scan loop
   std::string* hit_{nullptr};    // a one-row aggregate: a miss joins this condition instead
-  int choices_{0};               // the choice points printed: each counts into count<i>
+  int choices_{0};               // the choice points printed: each counts into count<i>, over lo<i> and hi<i>
+  int sorts_{0};                 // the sorts printed: each into sorter s<i>, its row p<i>
+  std::string cursor_{"c"};      // the cursor a scan opens
+  // A choice point's counted range, lo<i> and hi<i>, which its first plan's
+  // scan opens on.
+  std::optional<std::pair<std::string, std::string>> counted_;
 };
 
 // Prints a searched plan, checked first.
@@ -1035,21 +1095,26 @@ auto rewritten(bound::Bound& b) -> logical::Node& {
 
 }  // namespace
 
-auto generate_plan(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts) -> GeneratedPlan {
-  auto p = search(rewritten(b), cat, counts);
+auto generate_plan(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts,
+                   std::uint64_t memory_bytes) -> GeneratedPlan {
+  auto p = search(rewritten(b), cat, counts, memory_bytes);
   return print_plan(p, b.param_types, sql);
 }
 
-auto generate_alternatives(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts)
-    -> std::vector<GeneratedPlan> {
+auto generate_alternatives(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts,
+                           std::uint64_t memory_bytes) -> std::vector<GeneratedPlan> {
   std::vector<GeneratedPlan> out;
-  for (auto& p : search_all(rewritten(b), cat, counts)) {
-    if (physical::choices(p) == 0) {
-      out.push_back(print_plan(p, b.param_types, sql));
-      continue;
-    }
-    for (auto t : {std::numeric_limits<std::int64_t>::max(), std::int64_t{0}}) {
-      physical::override_thresholds(p, t);
+  for (auto& p : search_all(rewritten(b), cat, counts, memory_bytes)) {
+    const auto n = physical::choices(p);
+    // Bit i of a combination takes choice point i's second plan.
+    for (std::uint32_t combination = 0; combination < (1u << n); ++combination) {
+      if (n > 0) {
+        std::vector<std::int64_t> t;
+        for (std::size_t i = 0; i < n; ++i) {
+          t.push_back((combination >> i & 1u) != 0 ? 0 : std::numeric_limits<std::int64_t>::max());
+        }
+        physical::override_thresholds(p, t);
+      }
       out.push_back(print_plan(p, b.param_types, sql));
     }
   }

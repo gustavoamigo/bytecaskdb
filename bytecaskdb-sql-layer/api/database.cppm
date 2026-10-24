@@ -886,7 +886,7 @@ auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
   c->param_sql = std::move(bound.param_sql);
   c->param_table = std::move(bound.param_table);
   c->params = std::move(bound.params);
-  c->plan = std::make_unique<GeneratedPlan>(generate_plan(std::move(bound), *cat, s.sql_, row_counts()));
+  c->plan = std::make_unique<GeneratedPlan>(generate_plan(std::move(bound), *cat, s.sql_, row_counts(), budget_.max_bytes));
   link(*c);
   ++compilations_;
   return c;
@@ -1301,7 +1301,7 @@ auto Database::alternatives_for_testing(std::string_view sql, const std::vector<
   auto param_sql = bound.param_sql;
   auto param_table = bound.param_table;
   std::vector<Rows> out;
-  for (auto& plan : generate_alternatives(std::move(bound), *cat, sql, row_counts())) {
+  for (auto& plan : generate_alternatives(std::move(bound), *cat, sql, row_counts(), budget_.max_bytes)) {
     if (!plan.returns_rows) throw std::logic_error("alternatives of a statement that writes");
     Compiled c;
     c.param_sql = param_sql;

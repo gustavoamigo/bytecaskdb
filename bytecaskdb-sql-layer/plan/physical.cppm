@@ -8,9 +8,9 @@
 // reads the catalog.
 //
 // The operators are Empty, the access paths, the joins (an index nested
-// loop, and a nested loop read once), the choice points, Filter, Limit,
+// loop, and a nested loop), the choice points, Filter, Sort, Limit,
 // Aggregate and the sinks: Emit for result rows, Insert, Update, Delete. No
-// sort and no hash join yet. check() enforces what the types can't express.
+// hash join yet. check() enforces what the types can't express.
 
 module;
 #include <algorithm>
@@ -60,7 +60,8 @@ struct PointGet {
 
 // A scan of the table's primary key or of one of its indexes: every entry
 // under an equality prefix of parameters, or a range of entries after it;
-// forward, or in reverse.
+// forward, or in reverse. A full scan has no prefix and a range open at
+// both ends.
 struct Scan {
   std::uint32_t table{0};
   std::uint32_t object{0};                   // the table, or one of its indexes
@@ -108,11 +109,11 @@ struct IndexJoin {
   std::vector<Expr> inner_key;  // in the inner primary key's order
 };
 
-// A nested loop whose inner side reads parameters alone: for the outer side's
-// one row, if it has one, every row of the inner scan, so the inner side is
-// read at most once. The outer side is a point lookup and lookups by key;
-// the inner side a scan, under the filters on its own table and the join's,
-// which compare its columns with the outer side's.
+// A nested loop whose inner side reads parameters alone: for each outer row,
+// every row of the inner scan, under the filters on its own table and the
+// join's, which compare its columns with the outer side's. Under an outer
+// side of at most one row (a point lookup and lookups by key) the inner
+// side is read at most once; under any other, once per outer row.
 struct NestedLoop {
   NodePtr outer;
   NodePtr inner;
@@ -122,7 +123,8 @@ struct NestedLoop {
 // table's rows by one of two plans, picked when the plan runs by
 // bc_count_range over the first one's range, limited to the threshold. A
 // count below it takes the first, `below`; one that reaches it, the second.
-// Each is a scan under its filters. A threshold of 0 always takes the
+// Each is a scan under its filters, or such a scan sorted: the choice by the
+// memory budget between a sort and a scan in the ORDER BY's order. A threshold of 0 always takes the
 // second, and INT64_MAX the first (override_thresholds).
 struct Choice {
   Scan counted;  // the range counted: the first plan's, its whole prefix for a NULL split
@@ -137,6 +139,28 @@ struct Choice {
 struct Filter {
   NodePtr input;
   std::vector<Expr> conjuncts;
+};
+
+// One part of a sort key: a column of a row in hand, in its direction, its
+// NULLs first or last.
+struct SortPart {
+  ColumnRef col;
+  bool desc{false};
+  bool nulls_first{false};
+};
+
+// A pipeline breaker: every row of its input added to a sorter, keyed by
+// `keys` (bc_sort_key_*), then streamed in that order. A sorter holds one
+// view per row, so the input reads one table in a loop, `payload`, whose
+// row is the one held; the rows of tables read once before that loop stay
+// in hand, and a table looked up per row after it is looked up again above
+// the Sort. With keep n > 0 the sorter holds only the first n (ORDER BY …
+// LIMIT n); 0 holds all.
+struct Sort {
+  NodePtr input;
+  std::vector<SortPart> keys;
+  std::int64_t keep{0};
+  std::uint32_t payload{0};
 };
 
 // The first n rows of Emit's input.
@@ -182,7 +206,7 @@ struct Delete {
 
 struct Node {
   std::variant<Empty, PointGet, Scan, NullSplitScan, CountRange, MinFirstEntry, IndexJoin, NestedLoop, Choice, Filter,
-               Limit, Emit, Aggregate, Insert, Update, Delete>
+               Sort, Limit, Emit, Aggregate, Insert, Update, Delete>
       op;
 };
 
@@ -237,10 +261,11 @@ void check(const Plan& p);
 // The number of choice points in the plan.
 [[nodiscard]] auto choices(const Plan& p) -> std::size_t;
 
-// Sets every choice point's threshold to `t`: the test seam that runs one
-// branch of each (*Tests*, alternatives agree). 0 takes every second plan,
-// INT64_MAX every first.
-void override_thresholds(Plan& p, std::int64_t t);
+// Sets each choice point's threshold, outer first, to the one at its place
+// in `t`: the test seam that runs any combination of branches (*Tests*,
+// alternatives agree). 0 takes a choice point's second plan, INT64_MAX its
+// first. `t` holds one per choice point.
+void override_thresholds(Plan& p, const std::vector<std::int64_t>& t);
 
 }  // namespace bytecask::sql::physical
 
@@ -250,6 +275,23 @@ namespace {
 
 [[noreturn]] void broken(const std::string& rule) { throw std::logic_error{"physical plan: " + rule}; }
 
+// Whether two expressions are the same: kind, operands and values.
+auto same(const Expr& a, const Expr& b) -> bool {
+  if (a.kind != b.kind || a.param != b.param || a.constant != b.constant || !(a.col == b.col) || a.op != b.op ||
+      a.args.size() != b.args.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < a.args.size(); ++i) {
+    if (!same(a.args[i], b.args[i])) return false;
+  }
+  return true;
+}
+
+auto same(const KeyBound& a, const KeyBound& b) -> bool {
+  return a.kind == b.kind && a.successor == b.successor && a.value.has_value() == b.value.has_value() &&
+         (!a.value || same(*a.value, *b.value));
+}
+
 class Checker {
 public:
   explicit Checker(const Plan& p) : p_{p} {}
@@ -258,6 +300,7 @@ public:
     if (p_.constants.empty()) broken("a plan with no constants");
     if (!p_.root) broken("a plan with no operator");
     for (auto n : p_.null_checks) param(n);
+    covering_tables(*p_.root, covering_);
     node(*p_.root, nullptr);
   }
 
@@ -288,6 +331,19 @@ private:
     if (std::ranges::find(p_.computed, computed_of(e, table)) == p_.computed.end()) broken("a $n ± k the plan does not compute");
   }
 
+  // A column codegen reads, from the row or, for a table a covering scan
+  // reads, from the entry's key: never a DOUBLE from a key, whose encoding
+  // writes -0.0 as 0.0 and every NaN as one NaN.
+  void read(const ColumnRef& c) const {
+    if (c.type == PhysType::F64 && std::ranges::find(covering_, c.table) != covering_.end()) {
+      broken("a DOUBLE column read from a key");
+    }
+  }
+  void reads(const Expr& e) const {
+    if (e.kind == Expr::Kind::Column) read(e.col);
+    for (const auto& a : e.args) reads(a);
+  }
+
   void scan(const Scan& s) const {
     if (s.prefix.empty() && std::holds_alternative<std::monostate>(s.rest)) {
       broken("a scan needs an equality prefix or a range");
@@ -314,7 +370,15 @@ private:
     if (const auto* s = std::get_if<NullSplitScan>(&n.op)) return &s->present;
     if (const auto* f = std::get_if<Filter>(&n.op)) return scan_below(*f->input);
     if (const auto* l = std::get_if<Limit>(&n.op)) return scan_below(*l->input);
+    if (const auto* o = std::get_if<Sort>(&n.op)) return scan_below(*o->input);
     return nullptr;
+  }
+
+  static auto split_below(const Node& n) -> bool {
+    if (std::holds_alternative<NullSplitScan>(n.op)) return true;
+    if (const auto* f = std::get_if<Filter>(&n.op)) return split_below(*f->input);
+    if (const auto* o = std::get_if<Sort>(&n.op)) return split_below(*o->input);
+    return false;
   }
 
   // The plans a node's rows may come from: a choice point's two, or itself.
@@ -336,20 +400,68 @@ private:
     return std::nullopt;
   }
 
+  // Each table whose rows a node gives.
+  static void tables_of(const Node& n, std::vector<std::uint32_t>& out) {
+    if (const auto* g = std::get_if<PointGet>(&n.op)) out.push_back(g->table);
+    if (const auto* s = std::get_if<Scan>(&n.op)) out.push_back(s->table);
+    if (const auto* s = std::get_if<NullSplitScan>(&n.op)) out.push_back(s->present.table);
+    if (const auto* f = std::get_if<Filter>(&n.op)) tables_of(*f->input, out);
+    if (const auto* l = std::get_if<Limit>(&n.op)) tables_of(*l->input, out);
+    if (const auto* o = std::get_if<Sort>(&n.op)) tables_of(*o->input, out);
+    if (const auto* c = std::get_if<Choice>(&n.op)) tables_of(*c->below, out);
+    if (const auto* j = std::get_if<IndexJoin>(&n.op)) {
+      tables_of(*j->outer, out);
+      out.push_back(j->inner);
+    }
+    if (const auto* j = std::get_if<NestedLoop>(&n.op)) {
+      tables_of(*j->outer, out);
+      tables_of(*j->inner, out);
+    }
+  }
+  static auto tables_of(const Node& n) -> std::vector<std::uint32_t> {
+    std::vector<std::uint32_t> out;
+    tables_of(n, out);
+    return out;
+  }
+
+  // The loops over a cursor or a sorter that a node's rows come from, one
+  // inside another; and the table the innermost one reads, if any.
+  static auto loops(const Node& n) -> std::pair<std::size_t, std::optional<std::uint32_t>> {
+    if (const auto* s = scan_below(n); s != nullptr && !std::holds_alternative<Sort>(n.op)) return {1, s->table};
+    if (const auto* o = std::get_if<Sort>(&n.op)) return {1, o->payload};
+    if (const auto* f = std::get_if<Filter>(&n.op)) return loops(*f->input);
+    if (const auto* l = std::get_if<Limit>(&n.op)) return loops(*l->input);
+    if (const auto* c = std::get_if<Choice>(&n.op)) return loops(*c->below);
+    if (const auto* j = std::get_if<IndexJoin>(&n.op)) return loops(*j->outer);
+    if (const auto* j = std::get_if<NestedLoop>(&n.op)) {
+      auto [outer, table] = loops(*j->outer);
+      auto [inner, inner_table] = loops(*j->inner);
+      return {outer + inner, inner_table ? inner_table : table};
+    }
+    return {0, std::nullopt};
+  }
+
   // The tables whose rows come from a covering scan's key, not a row.
   static void covering_tables(const Node& n, std::vector<std::uint32_t>& out) {
     if (const auto* s = scan_below(n); s != nullptr && s->covering) out.push_back(s->table);
-    if (const auto* f = std::get_if<Filter>(&n.op)) covering_tables(*f->input, out);
-    if (const auto* l = std::get_if<Limit>(&n.op)) covering_tables(*l->input, out);
-    if (const auto* j = std::get_if<IndexJoin>(&n.op)) covering_tables(*j->outer, out);
-    if (const auto* j = std::get_if<NestedLoop>(&n.op)) {
-      covering_tables(*j->outer, out);
-      covering_tables(*j->inner, out);
-    }
-    if (const auto* c = std::get_if<Choice>(&n.op)) {
-      covering_tables(*c->below, out);
-      covering_tables(*c->at_or_above, out);
-    }
+    std::visit(
+        [&](const auto& op) {
+          using T = std::decay_t<decltype(op)>;
+          if constexpr (std::is_same_v<T, MinFirstEntry>) {
+            if (op.scan.covering) out.push_back(op.scan.table);
+          } else if constexpr (std::is_same_v<T, IndexJoin>) {
+            covering_tables(*op.outer, out);
+          } else if constexpr (std::is_same_v<T, NestedLoop>) {
+            covering_tables(*op.outer, out);
+            covering_tables(*op.inner, out);
+          } else if constexpr (std::is_same_v<T, Choice>) {
+            covering_tables(*op.below, out);
+            covering_tables(*op.at_or_above, out);
+          } else if constexpr (requires { op.input; }) {
+            covering_tables(*op.input, out);
+          }
+        },
+        n.op);
   }
 
   // The inner side of a nested loop, one of its plans: a scan under filters
@@ -357,7 +469,7 @@ private:
   // a parameter or a column of the outer side.
   static void inner_side(const Node& inner, const std::vector<std::uint32_t>& outer) {
     const auto* sc = scan_below(inner);
-    if (sc == nullptr) broken("a nested loop whose inner side is not a scan");
+    if (sc == nullptr || std::holds_alternative<Sort>(inner.op)) broken("a nested loop whose inner side is not a scan");
     for (const auto* in = &inner; const auto* f = std::get_if<Filter>(&in->op); in = f->input.get()) {
       for (const auto& c : f->conjuncts) {
         if (c.kind != Expr::Kind::Compare) continue;
@@ -369,6 +481,24 @@ private:
           broken("a nested loop whose inner filter reads a column outside its outer side");
         }
       }
+    }
+  }
+
+  // A choice point counts exactly its first plan's range: its object, its
+  // prefix's parameters, its bounds and its direction; for a NULL split,
+  // the whole prefix, which holds both of its ranges.
+  static void counts_first(const Choice& c, const Scan& first, bool split) {
+    auto same_range = [&] {
+      if (split) return std::holds_alternative<std::monostate>(c.counted.rest);
+      const auto* a = std::get_if<Range>(&c.counted.rest);
+      const auto* b = std::get_if<Range>(&first.rest);
+      if (a == nullptr || b == nullptr) return a == b;
+      return same(a->lo, b->lo) && same(a->hi, b->hi);
+    };
+    auto same_prefix = c.counted.prefix.size() == first.prefix.size() &&
+                       std::ranges::equal(c.counted.prefix, first.prefix, [](const Expr& a, const Expr& b) { return same(a, b); });
+    if (c.counted.object != first.object || !same_prefix || c.counted.reverse != first.reverse || !same_range()) {
+      broken("a choice point that counts another range than its first plan's");
     }
   }
 
@@ -394,13 +524,22 @@ private:
           } else if constexpr (std::is_same_v<T, MinFirstEntry>) {
             scan(op.scan);
             if (op.scan.reverse) broken("MIN from the first entry of a reverse scan");
+            if (op.scan.covering) read(op.arg);
           } else if constexpr (std::is_same_v<T, IndexJoin>) {
             if (op.inner_key.empty()) broken("a join whose inner key has no part");
-            for (const auto& e : op.inner_key) null_checked(e);
+            for (const auto& e : op.inner_key) {
+              null_checked(e);
+              reads(e);
+            }
             node(*op.outer, &n);
           } else if constexpr (std::is_same_v<T, NestedLoop>) {
             auto outer = one_row_tables(*op.outer);
-            if (!outer) broken("a nested loop whose outer side is not one row");
+            if (!outer) {
+              // Read once per outer row: no count of its own per row.
+              if (loops(*op.outer).first == 0) broken("a nested loop whose outer side is neither one row nor a loop");
+              if (std::holds_alternative<Choice>(op.inner->op)) broken("a choice point read once per outer row");
+              outer = tables_of(*op.outer);
+            }
             for (const auto* b : branches(*op.inner)) inner_side(*b, *outer);
             node(*op.outer, &n);
             node(*op.inner, &n);
@@ -410,13 +549,13 @@ private:
             if (!op.below || !op.at_or_above) broken("a choice point without two plans");
             const auto* first = scan_below(*op.below);
             const auto* second = scan_below(*op.at_or_above);
-            if (first == nullptr || second == nullptr) broken("a choice point whose plan is not a scan");
+            if (first == nullptr || second == nullptr) {
+              broken("a choice point whose plan is not a scan");
+            }
             if (first->table != op.counted.table || second->table != op.counted.table) {
               broken("a choice point whose plans read another table than the one counted");
             }
-            if (first->object != op.counted.object || first->prefix.size() != op.counted.prefix.size()) {
-              broken("a choice point that counts another range than its first plan's");
-            }
+            counts_first(op, *first, split_below(*op.below));
             node(*op.below, &n);
             node(*op.at_or_above, &n);
           } else if constexpr (std::is_same_v<T, Filter>) {
@@ -426,26 +565,34 @@ private:
                 broken("a filter on a DOUBLE column");
               }
               operand(c.args[1], c.args[0].col.table);
+              reads(c);
+            }
+            node(*op.input, &n);
+          } else if constexpr (std::is_same_v<T, Sort>) {
+            if (op.keys.empty()) broken("a sort with no key");
+            if (op.keep < 0) broken("a sort that keeps a negative number of rows");
+            auto [depth, table] = loops(*op.input);
+            if (depth != 1) broken("a sort whose input is not one loop");
+            if (table != op.payload) broken("a sort that holds another row than its loop's");
+            // The sorter holds the row; a covering scan's entry has none.
+            if (std::ranges::find(covering_, op.payload) != covering_.end()) broken("a sort over a covering scan");
+            auto in = tables_of(*op.input);
+            for (const auto& k : op.keys) {
+              if (std::ranges::find(in, k.col.table) == in.end()) broken("a sort key outside its input's tables");
             }
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Limit>) {
             if (parent == nullptr || !std::holds_alternative<Emit>(parent->op)) broken("a LIMIT not under the rows emitted");
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Emit>) {
-            std::vector<std::uint32_t> covering;
-            covering_tables(*op.input, covering);
-            for (const auto& t : op.targets) {
-              // The key encoding writes -0.0 as 0.0 and every NaN as one NaN.
-              if (t.type == PhysType::F64 && std::ranges::find(covering, t.table) != covering.end()) {
-                broken("a DOUBLE target read from a key");
-              }
-            }
+            for (const auto& t : op.targets) read(t);
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Aggregate>) {
             if (op.agg.kind != Expr::Kind::Aggregate) broken("an aggregate that is not an aggregate call");
             if ((op.agg.fn != Expr::Fn::Count || op.agg.distinct) && op.agg.args.empty()) {
               broken("SUM, MIN or COUNT(DISTINCT) with no argument");
             }
+            reads(op.agg);
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Insert>) {
             if (op.values.empty()) broken("an insert that sets no column");
@@ -469,6 +616,7 @@ private:
   }
 
   const Plan& p_;
+  std::vector<std::uint32_t> covering_;  // every table a covering scan reads, in any plan of a choice point
 };
 
 }  // namespace
@@ -507,8 +655,10 @@ auto choices(const Plan& p) -> std::size_t {
   return n;
 }
 
-void override_thresholds(Plan& p, std::int64_t t) {
-  each_choice(*p.root, [&](Choice& c) { c.threshold = t; });
+void override_thresholds(Plan& p, const std::vector<std::int64_t>& t) {
+  if (t.size() != choices(p)) throw std::logic_error{"physical plan: a threshold per choice point"};
+  std::size_t i = 0;
+  each_choice(*p.root, [&](Choice& c) { c.threshold = t[i++]; });
 }
 
 }  // namespace bytecask::sql::physical
