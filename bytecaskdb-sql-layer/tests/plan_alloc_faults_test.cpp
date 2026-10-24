@@ -217,13 +217,18 @@ void id_unset(bc_ctx* cx) {
 TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an exception into the plan",
           "[sql][algebra][alloc]") {
   if (!bytecask::testing::kAllocFaultsAvailable) SKIP("operator new is the sanitizer's in this build");
-  Fixture f;
-  for (std::int64_t i = 1; i <= 3; ++i) {
-    auto ps = params({i, bytes("n" + std::to_string(i)), i * 10});
+  auto seed = [](Fixture& f, std::int64_t id, std::int64_t qty) {
+    auto ps = params({id, bytes("n" + std::to_string(id)), qty});
     SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
     auto ref = sr.get();
     REQUIRE(bc_execute(f.cx, insert_row, &ref, &ps, {}, false, 0) == BC_COMMITTED);
-  }
+  };
+  Fixture f;
+  for (std::int64_t i = 1; i <= 3; ++i) seed(f, i, i * 10);
+  // Its own fixture, so the sort and join cases keep their three rows: one
+  // row at the BIGINT maximum, so qty + 1, the constant form, overflows.
+  Fixture at_max;
+  seed(at_max, 4, std::numeric_limits<std::int64_t>::max());
   struct Case {
     const char* name;
     bc_plan_fn plan;
@@ -271,7 +276,7 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
        {PhysType::I64, PhysType::I64, PhysType::I64},
        BC_OK,
        {{std::int64_t{1}, std::int64_t{10}, std::int64_t{10}}, {std::int64_t{2}, std::int64_t{50}, std::int64_t{30}}}},
-      {"update, qty leaves BIGINT",
+      {"update, qty + $2 leaves BIGINT",
        add_to_qty,
        {std::int64_t{3}, std::numeric_limits<std::int64_t>::max()},
        {},
@@ -280,7 +285,17 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
       {"bc_row_set_null", null_id_set, {}, {}, BC_E_CONSTRAINT},
       {"bc_row_end, a column unset", id_unset, {}, {}, BC_E_CONSTRAINT},
   };
-  for (const auto& c : cases) {
+  const std::vector<Case> at_max_cases{
+      {"update, qty + 1 leaves BIGINT", bump_qty, {std::int64_t{4}}, {}, BC_E_CONSTRAINT},
+  };
+  // One loop in the test's body, not a function of its own: where the
+  // seam is not linked, the code after SKIP must not reference it.
+  std::vector<std::pair<Fixture*, const Case*>> runs;
+  for (const auto& c : cases) runs.emplace_back(&f, &c);
+  for (const auto& c : at_max_cases) runs.emplace_back(&at_max, &c);
+  for (const auto& [on, case_] : runs) {
+    auto& fx = *on;
+    const auto& c = *case_;
     INFO(c.name);
     auto failed = 0;
     for (long nth = 1;; ++nth) {
@@ -288,16 +303,16 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
       // Built outside the count. The run verifies it, so verification's
       // allocations are failed too.
       auto ps = params(c.params);
-      SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), type_codes(c.result),
-                   f.cat().version()};
+      SchemaRef sr{all_objects(fx.cat()), all_tables(fx.cat()), all_cols(fx.cat()), type_codes(c.result),
+                   fx.cat().version()};
       auto ref = sr.get();
-      bc_ctx_begin(f.cx, &ps, {});
+      bc_ctx_begin(fx.cx, &ps, {});
       auto threw = false;
       bytecask::testing::AllocFaultReport report;
       {
         bytecask::testing::ScopedAllocFaults faults{nth, false};
         try {
-          bc_ctx_run(f.cx, c.plan, &ref);
+          bc_ctx_run(fx.cx, c.plan, &ref);
         } catch (...) {
           threw = true;
         }
@@ -305,19 +320,19 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
       }
       INFO("allocation " << nth);
       CHECK_FALSE(threw);
-      auto error = static_cast<int>(bc_error(f.cx));
+      auto error = static_cast<int>(bc_error(fx.cx));
       if (!report.fired) {
         CHECK(error == c.clean);
-        if (!c.rows.empty()) CHECK(f.results(c.result) == c.rows);
-        bc_ctx_reset(f.cx);
+        if (!c.rows.empty()) CHECK(fx.results(c.result) == c.rows);
+        bc_ctx_reset(fx.cx);
         break;
       }
-      bc_ctx_reset(f.cx);  // nothing is committed: the engine is never asked to write
+      bc_ctx_reset(fx.cx);  // nothing is committed: the engine is never asked to write
       CHECK((error == BC_E_MEMORY || error == c.clean));
       // A failed statement's charges go at reset, whatever the throw left
       // charged, and so does the write set's storage past what a reset keeps.
-      CHECK(bc_ctx_held_for_testing(f.cx) == 0);
-      CHECK(bc_ctx_write_set_slots_for_testing(f.cx) <= 4 * bytecask::sql::kKeptWriteSlots);
+      CHECK(bc_ctx_held_for_testing(fx.cx) == 0);
+      CHECK(bc_ctx_write_set_slots_for_testing(fx.cx) <= 4 * bytecask::sql::kKeptWriteSlots);
       ++failed;
     }
     CHECK(failed > 0);  // the plan allocates, and each allocation was failed once
