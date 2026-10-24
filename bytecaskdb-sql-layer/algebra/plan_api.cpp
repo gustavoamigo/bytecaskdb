@@ -15,8 +15,9 @@
 // A loop's step owns what the API allocated during it (docs/plan_api_design.md,
 // *Memory*): the context marks its storage when a cursor or an aggregate
 // moves to an entry, and rolls back to the mark when it moves again, ends or
-// closes. Pins, the contents of structures, the write set and the result
-// rows are kept elsewhere, and outlive the step.
+// closes. Iterating a sorter, an aggregate's groups or a hash table probe is
+// such a loop too. Pins, the contents of structures, the write set and the
+// result rows are kept elsewhere, and outlive the step.
 //
 // The writes (bc_insert, bc_update, bc_delete, bc_del_range) derive every
 // index entry from the row and the pinned catalog version, and run the
@@ -26,6 +27,7 @@
 // bytecaskdb/bytecask_hpp.cpp gives (LLVM 22's abi_tag redeclaration error).
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -43,6 +45,7 @@
 #include <set>
 #include <system_error>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -64,13 +67,20 @@ using bytecask::sql::has_prefix;
 using bytecask::sql::Datum;
 using bytecask::sql::Index;
 using bytecask::sql::kCursorEntryBytes;
+using bytecask::sql::kAggBytes;
+using bytecask::sql::kAggSlotBytes;
 using bytecask::sql::kGroupEntryBytes;
+using bytecask::sql::kHashBytes;
+using bytecask::sql::kHashEntryBytes;
+using bytecask::sql::kHashIterEntryBytes;
 using bytecask::sql::kKeyEntryBytes;
 using bytecask::sql::KeyLayout;
 using bytecask::sql::KeyPart;
 using bytecask::sql::KeyReader;
 using bytecask::sql::LiveCatalog;
 using bytecask::sql::kRowEntryBytes;
+using bytecask::sql::kSortEntryBytes;
+using bytecask::sql::kSorterBytes;
 using bytecask::sql::kViewEntryBytes;
 using bytecask::sql::PhysType;
 using bytecask::sql::RowLayout;
@@ -478,9 +488,112 @@ struct Cursor {
   std::uint64_t held{0};  // what the buffers above are charged to the statement's memory budget
 };
 
+// A view's row-ness, kept with bytes a structure copied, so a row comes back
+// out of it a row of its table, as bc_pin keeps one.
+struct Held {
+  std::uint32_t table{0};
+  RowKind kind{RowKind::None};
+};
+
+// One sorter entry: its sort key and payload in one block, and the order it
+// was added in, which breaks ties between equal keys.
+struct SortEntry {
+  Bytes data;  // the sort key, then the payload
+  std::uint64_t seq;
+  std::uint32_t key_len;
+  Held held;
+
+  [[nodiscard]] auto key() const -> BytesView { return BytesView{data}.first(key_len); }
+  [[nodiscard]] auto payload() const -> BytesView { return BytesView{data}.subspan(key_len); }
+};
+
+auto bytes_cmp(BytesView a, BytesView b) -> std::strong_ordering {
+  return std::lexicographical_compare_three_way(a.begin(), a.end(), b.begin(), b.end(),
+                                                [](std::byte x, std::byte y) {
+                                                  return std::to_integer<int>(x) <=> std::to_integer<int>(y);
+                                                });
+}
+
+// Byte order of the sort keys, then insertion order: a total order, so the
+// sort is stable and a top-n sorter keeps the first n of equal keys.
+[[nodiscard]] auto sort_before(const SortEntry& a, const SortEntry& b) -> bool {
+  auto c = bytes_cmp(a.key(), b.key());
+  return std::is_neq(c) ? std::is_lt(c) : a.seq < b.seq;
+}
+
+// A sorter's entries: with keep 0, every one added, in the order added; with
+// keep n, the first n in sort order, as a heap whose top is the last of them,
+// so an entry that sorts after it is refused without a copy. Sorted on the
+// first bc_sorter_nth or bc_sorter_next, and never added to after.
+struct Sorter {
+  std::uint64_t gen;
+  std::uint64_t keep;  // 0: every entry
+  std::vector<SortEntry> entries;
+  std::uint64_t added{0};
+  bool sorted{false};
+  std::size_t next{0};
+  std::uint32_t scope{kNoStep};  // its loop's step in steps, while bc_sorter_next is on an entry
+  bc_view nth{};                 // the last bc_sorter_nth's view, whose slot the next one takes
+};
+
+constexpr std::uint32_t kNoEntry = UINT32_MAX;
+
+// One payload of a hash table, chained to the next payload of its key.
+struct HashEntry {
+  Bytes payload;
+  std::uint32_t next{kNoEntry};
+  Held held;
+};
+
+// A key's payloads: the first and last entries of its chain.
+struct Chain {
+  std::uint32_t first, last;
+};
+
+struct BytesHash {
+  using is_transparent = void;
+  auto operator()(BytesView b) const -> std::size_t { return static_cast<std::size_t>(row_fingerprint(b)); }
+};
+struct BytesEq {
+  using is_transparent = void;
+  auto operator()(BytesView a, BytesView b) const -> bool { return std::ranges::equal(a, b); }
+};
+
+// A multimap: each key once, its payloads chained in insertion order. An
+// entry is never moved out of nor erased before reset, so a view of its
+// payload stays where it is while the table grows.
+struct Hash {
+  std::uint64_t gen;
+  std::unordered_map<Bytes, Chain, BytesHash, BytesEq> index;
+  std::vector<HashEntry> entries;
+};
+
+// A probe of a hash table, a handle of the step it was made in.
+struct HashIter {
+  std::uint64_t gen;
+  std::uint32_t hash;
+  std::uint32_t next;
+  std::uint32_t scope{kNoStep};  // its loop's step in steps, while bc_hash_next is on a payload
+};
+
+// What an aggregate's slot accumulates, fixed by its first fold.
+enum class SlotKind : std::uint8_t { None, SumI64, SumF64, MinI64, MaxI64, Count };
+
+struct Slot {
+  std::int64_t i{0};  // a sum, a minimum or maximum, or a count
+  double f{0};        // a double sum
+  bool set{false};    // a value was folded in
+};
+
 // The fixed charges cover the entries they stand for. A group is a map node
 // (its links and colour, its key and slot, its block) and its key's own
-// block, both with the allocator's header, and its place in the order.
+// block, both with the allocator's header, and its place in the order. A
+// group's slot, a sorter and a hash table are each their place in a vector,
+// at twice its size, as an aggregate is (below bc_ctx). A sorter entry is
+// its slot, at twice its vector's size, and its block's
+// header. A hash table entry is its slot likewise, and its payload block's
+// header, with a key's node (its link and cached hash, its key and chain,
+// its block), its key's block and its bucket, at twice the node count.
 static_assert(sizeof(ViewEntry) <= kViewEntryBytes);
 static_assert(sizeof(KeyBuilder) <= kKeyEntryBytes);
 static_assert(sizeof(RowBuilder) <= kRowEntryBytes);
@@ -488,6 +601,14 @@ static_assert(sizeof(Cursor) <= kCursorEntryBytes);
 static_assert(4 * sizeof(void*) + sizeof(std::pair<const Bytes, std::uint32_t>) + 2 * kAllocBytes +
                   sizeof(const Bytes*) <=
               kGroupEntryBytes);
+static_assert(2 * sizeof(Slot) <= kAggSlotBytes);
+static_assert(2 * sizeof(Sorter) <= kSorterBytes);
+static_assert(2 * sizeof(Hash) <= kHashBytes);
+static_assert(2 * sizeof(SortEntry) + kAllocBytes <= kSortEntryBytes);
+static_assert(2 * sizeof(HashEntry) + kAllocBytes + 2 * sizeof(void*) + sizeof(std::pair<const Bytes, Chain>) +
+                  2 * kAllocBytes + 2 * sizeof(void*) <=
+              kHashEntryBytes);
+static_assert(sizeof(HashIter) <= kHashIterEntryBytes);
 
 // What a cursor holds: its bounds and its current entry's bytes.
 auto cursor_bytes(const Cursor& c) -> std::uint64_t {
@@ -701,18 +822,22 @@ struct bc_ctx {
   std::vector<Cursor> cursors;
   std::vector<KeyBuilder> keys;
   std::vector<RowBuilder> rows;
+  std::vector<HashIter> hash_iters;
   std::vector<ViewEntry> pinned_views;  // bc_pin's, kept until reset
   // Where each table and the arena stood when a loop moved to its current
   // entry: everything after is the step's.
   struct Mark {
-    std::size_t views, keys, rows, cursors;
+    std::size_t views, keys, rows, cursors, hash_iters;
     Arena::Mark arena;
   };
+  // What drives a loop: a cursor, an aggregate's groups, a sorter or a hash
+  // table probe.
+  enum class Loop : std::uint8_t { Cursor, Agg, Sorter, Probe };
   // The loops on an entry, innermost last: loops nest, so their steps are
-  // a stack. Each names its cursor, or aggregate, and where its step began.
+  // a stack. Each names what drives it and where its step began.
   struct Step {
     std::uint32_t owner;
-    bool agg;
+    Loop loop;
     Mark mark;
   };
   std::vector<Step> steps;
@@ -731,18 +856,26 @@ struct bc_ctx {
   // statement could share one (#507). Kept and reset as written_rows.
   std::set<std::pair<std::uint32_t, Bytes>> unique_written;
   // The aggregates bc_agg_open made: their groups' keys, in first-appearance
-  // order. Kept until reset; a group key's view reads its Bytes, which a
-  // move of the vector keeps where it is.
+  // order, and their slots. Kept until reset; a group key's view reads its
+  // Bytes, which a move of the vector keeps where it is.
   // Each group's key is held once, in `index`; `order` points at it, in
-  // first-appearance order (a map node never moves).
+  // first-appearance order (a map node never moves). Group i's slots are
+  // values[i * slots, (i + 1) * slots).
   struct Agg {
-    std::uint64_t gen;
+    std::uint64_t gen{0};
+    std::uint32_t slots{0};
     std::map<Bytes, std::uint32_t, BytesLess> index;
     std::vector<const Bytes*> order;
+    std::vector<SlotKind> kinds;  // per slot, the same in every group
+    std::vector<Slot> values;
     std::size_t next{0};
     std::uint32_t scope{kNoStep};  // its loop's step in steps, while bc_agg_next is on a group
   };
+  // Sorters, hash tables and aggregates, in the order opened, so their
+  // generations ascend; kept until reset.
   std::vector<Agg> aggs;
+  std::vector<Sorter> sorters;
+  std::vector<Hash> hashes;
   // Where each part of the last key a key-part decoder read starts, so the
   // next part of the same key is found without skipping the earlier ones
   // again. Keyed by the view handle, unique within an execution; dropped
@@ -879,6 +1012,18 @@ struct bc_ctx {
       return {};
     }
     return {static_cast<std::uint32_t>(views.size() - 1), gen};
+  }
+
+  // Points the view `v` names, if it is still live, at other bytes under a
+  // new generation, so its old handle goes stale and its slot and charge
+  // are reused; otherwise makes a new view. Either way `v` names the result.
+  auto remake_view(bc_view& v, BytesView b, std::uint32_t table, RowKind kind) -> bc_view {
+    if (find_view(v) == nullptr) return v = make_view(b.data(), b.size(), kNoCursor, 0, table, kind);
+    if (key_parts.view.i == v.i && key_parts.view.g == v.g) key_parts.view = {};
+    auto gen = next_gen();
+    views[v.i] = ViewEntry{b.data(), 0, gen, static_cast<std::uint32_t>(b.size()), kNoCursor, table, kind};
+    v.g = gen;
+    return v;
   }
 
   // A copy the current step owns, as a view.
@@ -1056,7 +1201,7 @@ struct bc_ctx {
   }
 
   [[nodiscard]] auto mark() const -> Mark {
-    return {views.size(), keys.size(), rows.size(), cursors.size(), arena.mark()};
+    return {views.size(), keys.size(), rows.size(), cursors.size(), hash_iters.size(), arena.mark()};
   }
 
   // Releases what was allocated since `m`, and its charge. Allocates nothing.
@@ -1070,27 +1215,32 @@ struct bc_ctx {
     rows.erase(rows.begin() + static_cast<std::ptrdiff_t>(m.rows), rows.end());
     for (auto i = m.cursors; i < cursors.size(); ++i) released += cursors[i].held + kCursorEntryBytes;
     cursors.erase(cursors.begin() + static_cast<std::ptrdiff_t>(m.cursors), cursors.end());
+    released += (hash_iters.size() - m.hash_iters) * kHashIterEntryBytes;
+    hash_iters.erase(hash_iters.begin() + static_cast<std::ptrdiff_t>(m.hash_iters), hash_iters.end());
     release(released);
   }
 
-  // Starts a step of the loop `owner` drives, a cursor or an aggregate: what
-  // is allocated from here is the step's.
-  void begin_step(std::uint32_t owner, bool is_agg, std::uint32_t& scope) {
-    steps.push_back({owner, is_agg, mark()});
+  // Starts a step of the loop `owner` drives: what is allocated from here
+  // is the step's.
+  void begin_step(std::uint32_t owner, Loop loop, std::uint32_t& scope) {
+    steps.push_back({owner, loop, mark()});
     scope = static_cast<std::uint32_t>(steps.size() - 1);
+  }
+
+  // The loop of `st` is off its entry.
+  void leave_scope(const Step& st) noexcept {
+    switch (st.loop) {
+      case Loop::Cursor: cursors[st.owner].scope = kNoStep; break;
+      case Loop::Agg: aggs[st.owner].scope = kNoStep; break;
+      case Loop::Sorter: sorters[st.owner].scope = kNoStep; break;
+      case Loop::Probe: hash_iters[st.owner].scope = kNoStep; break;
+    }
   }
 
   // Ends step `depth` and every step inside it: their loops are off their
   // entries, and what the steps allocated goes. Allocates nothing.
   void end_steps_from(std::uint32_t depth) noexcept {
-    for (auto i = std::size_t{depth}; i < steps.size(); ++i) {
-      const auto& st = steps[i];
-      if (st.agg) {
-        aggs[st.owner].scope = kNoStep;
-      } else {
-        cursors[st.owner].scope = kNoStep;
-      }
-    }
+    for (auto i = std::size_t{depth}; i < steps.size(); ++i) leave_scope(steps[i]);
     roll_back(steps[depth].mark);
     steps.erase(steps.begin() + depth, steps.end());
   }
@@ -1098,9 +1248,7 @@ struct bc_ctx {
   // Drops every cursor, after the plan has run: the loops' steps end, and
   // what they allocated stays until reset.
   void drop_cursors() noexcept {
-    for (const auto& st : steps) {
-      if (st.agg) aggs[st.owner].scope = kNoStep;
-    }
+    for (const auto& st : steps) leave_scope(st);
     steps.clear();
     cursors.clear();
   }
@@ -1118,6 +1266,9 @@ struct bc_ctx {
     written_rows.clear();
     unique_written.clear();
     aggs.clear();
+    sorters.clear();
+    hashes.clear();
+    hash_iters.clear();
     deleted_ranges.clear();
     claims.clear();
     locks.clear();
@@ -1136,15 +1287,6 @@ struct bc_ctx {
     write_used = 0;
     write_bound = write_limit = autocommit_write_bound;
     reads = 0;
-  }
-
-  // For the one-line stubs, which hold no guard of their own.
-  void unimplemented(const char* fn) noexcept {
-    try {
-      fail(BC_E_HANDLE, std::string{fn} + " is not implemented yet");
-    } catch (...) {
-      fail_current_exception();
-    }
   }
 };
 
@@ -1262,13 +1404,6 @@ void txn_abort(bc_txn* txn) noexcept {
   }
 
 namespace {
-
-auto bytes_cmp(BytesView a, BytesView b) -> std::strong_ordering {
-  return std::lexicographical_compare_three_way(a.begin(), a.end(), b.begin(), b.end(),
-                                                [](std::byte x, std::byte y) {
-                                                  return std::to_integer<int>(x) <=> std::to_integer<int>(y);
-                                                });
-}
 
 // Positions the snapshot's iterator on the first key >= at (forward) or the
 // last key < at (reverse). A reverse seek lands on the last key <= at: a
@@ -3030,7 +3165,7 @@ bool bc_scan_next(bc_ctx* cx, bc_cursor h) {
   auto v = c->entries->value();
   c->key.assign(k.begin(), k.end());
   c->value.assign(v.begin(), v.end());
-  cx->begin_step(h.i, false, c->scope);
+  cx->begin_step(h.i, bc_ctx::Loop::Cursor, c->scope);
   c->positioned = true;
   return cx->ok();
   BC_GUARD_END(cx)
@@ -3470,71 +3605,234 @@ bc_view bc_pin(bc_ctx* cx, bc_view v) {
 }
 
 // --------------------------------------------------- ephemeral structures
+//
+// Each copies what it is given, charged to the statement's memory budget
+// (its bytes and a fixed amount for its node), and keeps it until reset.
+// Iterating one is a loop: a view it hands out is the step's.
 
-bc_sorter bc_sorter_open(bc_ctx* cx) {
-  BC_GUARD_BEGIN
-  cx->unimplemented("bc_sorter_open");
-  return {};
-  BC_GUARD_END(cx)
-  return {};
+extern "C++" {
+namespace {
+
+// The bytes of a view, with what it is: a row stays one in a structure.
+auto resolve_held(bc_ctx* cx, bc_view v) -> std::optional<std::pair<BytesView, Held>> {
+  auto b = cx->resolve(v);
+  if (!b || !cx->ok()) return std::nullopt;
+  Held h;
+  if (const auto* e = cx->find_view(v)) h = {e->table, e->kind};
+  return std::pair{*b, h};
 }
-void bc_sorter_add(bc_ctx* cx, bc_sorter, bc_view, bc_view) { cx->unimplemented("bc_sorter_add"); }
-int64_t bc_sorter_count(bc_ctx* cx, bc_sorter) {
-  BC_GUARD_BEGIN
-  cx->unimplemented("bc_sorter_count");
-  return 0;
-  BC_GUARD_END(cx)
-  return {};
+
+auto held_view(bc_ctx* cx, BytesView b, Held h) -> bc_view {
+  return cx->make_view(b.data(), b.size(), kNoCursor, 0, h.table, h.kind);
 }
-bc_view bc_sorter_nth(bc_ctx* cx, bc_sorter, int64_t) {
-  BC_GUARD_BEGIN
-  cx->unimplemented("bc_sorter_nth");
-  return {};
-  BC_GUARD_END(cx)
-  return {};
+
+auto sorter(bc_ctx* cx, bc_sorter s) -> Sorter* { return cx->resolve_handle(s, cx->sorters, "sorter"); }
+
+// Sorts on the first read; a top-n sorter's heap becomes its first n in order.
+void sort_once(Sorter& s) {
+  if (s.sorted) return;
+  std::ranges::sort(s.entries, sort_before);
+  s.sorted = true;
 }
-bool bc_sorter_next(bc_ctx* cx, bc_sorter, bc_view*) {
-  BC_GUARD_BEGIN
-  cx->unimplemented("bc_sorter_next");
-  return false;
-  BC_GUARD_END(cx)
-  return {};
-}
-bc_hash bc_hash_open(bc_ctx* cx) {
-  BC_GUARD_BEGIN
-  cx->unimplemented("bc_hash_open");
-  return {};
-  BC_GUARD_END(cx)
-  return {};
-}
-void bc_hash_put(bc_ctx* cx, bc_hash, bc_view, bc_view) { cx->unimplemented("bc_hash_put"); }
-bc_hash_iter bc_hash_find(bc_ctx* cx, bc_hash, bc_view) {
-  BC_GUARD_BEGIN
-  cx->unimplemented("bc_hash_find");
-  return {};
-  BC_GUARD_END(cx)
-  return {};
-}
-bool bc_hash_next(bc_ctx* cx, bc_hash_iter, bc_view*) {
-  BC_GUARD_BEGIN
-  cx->unimplemented("bc_hash_next");
-  return false;
-  BC_GUARD_END(cx)
-  return {};
-}
-// Groups only: the slot calls are not implemented yet, so slots must be 0.
-// A group's handle names its index in the aggregate. A new group charges its
-// key's bytes and kGroupEntryBytes, the aggregate's own node, to the
-// statement's memory budget.
-bc_agg bc_agg_open(bc_ctx* cx, uint32_t slots) {
+
+}  // namespace
+}  // extern "C++"
+
+bc_sorter bc_sorter_open(bc_ctx* cx, int64_t keep) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return {};
-  if (slots != 0) {
-    cx->unimplemented("bc_agg_open with slots");
+  if (keep < 0) {
+    cx->fail(BC_E_HANDLE, "a sorter keeps a negative number of entries");
     return {};
   }
+  if (!cx->take(kSorterBytes)) return {};
   auto gen = cx->next_gen();
-  cx->aggs.push_back({gen, {}, {}, 0, kNoStep});
+  cx->sorters.push_back({gen, static_cast<std::uint64_t>(keep), {}, 0, false, 0, kNoStep, {}});
+  return {static_cast<std::uint32_t>(cx->sorters.size() - 1), gen};
+  BC_GUARD_END(cx)
+  return {};
+}
+
+void bc_sorter_add(bc_ctx* cx, bc_sorter h, bc_view sort_key, bc_view payload) {
+  BC_GUARD_BEGIN
+  auto* s = sorter(cx, h);
+  if (s == nullptr) return;
+  if (s->sorted) {
+    cx->fail(BC_E_HANDLE, "bc_sorter_add after the sorter was read");
+    return;
+  }
+  auto key = cx->resolve(sort_key);
+  auto p = resolve_held(cx, payload);
+  if (!key || !p) return;
+  SortEntry e{{}, s->added, 0, p->second};
+  // A view's length, and so a sort key's, fits key_len.
+  static_assert(std::is_same_v<decltype(ViewEntry::len), decltype(SortEntry::key_len)>);
+  e.key_len = static_cast<std::uint32_t>(key->size());
+  auto bytes = key->size() + p->first.size();
+  auto full = s->keep != 0 && s->entries.size() == s->keep;
+  // A top-n sorter that holds n: an entry after the last of them is never
+  // among the first n, and is neither copied nor charged.
+  if (full) {
+    auto& last = s->entries.front();
+    ++s->added;
+    if (std::is_gteq(bytes_cmp(*key, last.key()))) return;  // equal keys: the earlier one stays
+    // It takes the last one's place: only the difference is charged.
+    auto old = last.data.size();
+    if (bytes > old && !cx->take(bytes - old)) return;
+    e.data.reserve(bytes);
+    e.data.assign(key->begin(), key->end());
+    e.data.insert(e.data.end(), p->first.begin(), p->first.end());
+    std::ranges::pop_heap(s->entries, sort_before);
+    s->entries.back() = std::move(e);
+    std::ranges::push_heap(s->entries, sort_before);
+    if (bytes < old) cx->release(old - bytes);
+    return;
+  }
+  if (!cx->take(bytes + kSortEntryBytes)) return;
+  e.data.reserve(bytes);
+  e.data.assign(key->begin(), key->end());
+  e.data.insert(e.data.end(), p->first.begin(), p->first.end());
+  s->entries.push_back(std::move(e));
+  ++s->added;
+  if (s->keep != 0) std::ranges::push_heap(s->entries, sort_before);
+  BC_GUARD_END(cx)
+}
+
+int64_t bc_sorter_count(bc_ctx* cx, bc_sorter h) {
+  BC_GUARD_BEGIN
+  const auto* s = sorter(cx, h);
+  if (s == nullptr) return 0;
+  return std::ssize(s->entries);
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_view bc_sorter_nth(bc_ctx* cx, bc_sorter h, int64_t n) {
+  BC_GUARD_BEGIN
+  auto* s = sorter(cx, h);
+  if (s == nullptr) return {};
+  if (n < 0 || std::cmp_greater_equal(n, s->entries.size())) {
+    cx->fail(BC_E_HANDLE, "bc_sorter_nth past the sorter's entries");
+    return {};
+  }
+  sort_once(*s);
+  const auto& e = s->entries[static_cast<std::size_t>(n)];
+  // The view lives until the next bc_sorter_nth on this sorter, which takes
+  // its slot: a loop over nth holds one view, not one per call.
+  return cx->remake_view(s->nth, e.payload(), e.held.table, e.held.kind);
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bool bc_sorter_next(bc_ctx* cx, bc_sorter h, bc_view* payload) {
+  BC_GUARD_BEGIN
+  auto* s = sorter(cx, h);
+  if (s == nullptr) return false;
+  // Iterating the entries is a loop: its step ends as it moves to the next.
+  if (s->scope != kNoStep) cx->end_steps_from(s->scope);
+  sort_once(*s);
+  if (s->next >= s->entries.size() || !cx->charge()) return false;
+  const auto& e = s->entries[s->next++];
+  cx->begin_step(h.i, bc_ctx::Loop::Sorter, s->scope);
+  auto v = held_view(cx, e.payload(), e.held);
+  if (payload != nullptr) *payload = v;
+  return cx->ok();
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_hash bc_hash_open(bc_ctx* cx) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return {};
+  if (!cx->take(kHashBytes)) return {};
+  auto gen = cx->next_gen();
+  cx->hashes.push_back({gen, {}, {}});
+  return {static_cast<std::uint32_t>(cx->hashes.size() - 1), gen};
+  BC_GUARD_END(cx)
+  return {};
+}
+
+// A payload charges its bytes and kHashEntryBytes, and a key new to the
+// table its own bytes once.
+void bc_hash_put(bc_ctx* cx, bc_hash h, bc_view key, bc_view payload) {
+  BC_GUARD_BEGIN
+  auto* t = cx->resolve_handle(h, cx->hashes, "hash table");
+  if (t == nullptr) return;
+  auto k = cx->resolve(key);
+  auto p = resolve_held(cx, payload);
+  if (!k || !p) return;
+  if (t->entries.size() >= kNoEntry) {
+    cx->fail(BC_E_LIMIT, "a hash table of 2^32 entries");
+    return;
+  }
+  auto it = t->index.find(*k);
+  auto fresh = it == t->index.end();
+  if (!cx->take(p->first.size() + kHashEntryBytes + (fresh ? k->size() : 0))) return;
+  auto at = static_cast<std::uint32_t>(t->entries.size());
+  t->entries.push_back({Bytes(p->first.begin(), p->first.end()), kNoEntry, p->second});
+  if (fresh) {
+    try {
+      t->index.emplace(Bytes(k->begin(), k->end()), Chain{at, at});
+    } catch (...) {
+      t->entries.pop_back();  // no chain reaches it
+      throw;
+    }
+    return;
+  }
+  t->entries[it->second.last].next = at;
+  it->second.last = at;
+  BC_GUARD_END(cx)
+}
+
+bc_hash_iter bc_hash_find(bc_ctx* cx, bc_hash h, bc_view key) {
+  BC_GUARD_BEGIN
+  auto* t = cx->resolve_handle(h, cx->hashes, "hash table");
+  if (t == nullptr) return {};
+  auto k = cx->resolve(key);
+  if (!k || !cx->ok()) return {};
+  auto it = t->index.find(*k);
+  auto gen = cx->next_gen();
+  HashIter probe{gen, h.i, it == t->index.end() ? kNoEntry : it->second.first, kNoStep};
+  if (cx->push_charged(cx->hash_iters, std::move(probe), kHashIterEntryBytes) == nullptr) return {};
+  return {static_cast<std::uint32_t>(cx->hash_iters.size() - 1), gen};
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bool bc_hash_next(bc_ctx* cx, bc_hash_iter h, bc_view* payload) {
+  BC_GUARD_BEGIN
+  auto* probe = cx->resolve_handle(h, cx->hash_iters, "hash table probe");
+  if (probe == nullptr) return false;
+  // Iterating a key's payloads is a loop: its step ends as it moves to the
+  // next. The probe was made before its first step, and outlives it.
+  if (probe->scope != kNoStep) cx->end_steps_from(probe->scope);
+  if (probe->next == kNoEntry || !cx->charge()) return false;
+  const auto& e = cx->hashes[probe->hash].entries[probe->next];
+  probe->next = e.next;
+  cx->begin_step(h.i, bc_ctx::Loop::Probe, probe->scope);
+  auto v = held_view(cx, e.payload, e.held);
+  if (payload != nullptr) *payload = v;
+  return cx->ok();
+  BC_GUARD_END(cx)
+  return {};
+}
+
+static_assert(2 * sizeof(bc_ctx::Agg) <= kAggBytes);
+
+// A group's handle names its index in the aggregate, with the aggregate's
+// generation. Opening one charges kAggBytes and its slots' kinds; a new
+// group charges its key's bytes, kGroupEntryBytes, the
+// aggregate's own node, and kAggSlotBytes per slot to the statement's
+// memory budget.
+bc_agg bc_agg_open(bc_ctx* cx, uint32_t slots) {
+  BC_GUARD_BEGIN
+  if (!cx->take(kAggBytes + std::uint64_t{slots} * sizeof(SlotKind))) return {};
+  bc_ctx::Agg a;
+  a.gen = cx->next_gen();
+  a.slots = slots;
+  a.kinds.assign(slots, SlotKind::None);
+  auto gen = a.gen;
+  cx->aggs.push_back(std::move(a));
   return {static_cast<std::uint32_t>(cx->aggs.size() - 1), gen};
   BC_GUARD_END(cx)
   return {};
@@ -3546,19 +3844,137 @@ bc_group bc_agg_group(bc_ctx* cx, bc_agg a, bc_view group_key) {
   auto key = cx->resolve(group_key);
   if (!key || !cx->ok()) return {};
   if (auto it = agg->index.find(*key); it != agg->index.end()) return {it->second, agg->gen};
-  if (!cx->take(key->size() + kGroupEntryBytes)) return {};
+  if (!cx->take(key->size() + kGroupEntryBytes + std::uint64_t{agg->slots} * kAggSlotBytes)) return {};
   auto i = static_cast<std::uint32_t>(agg->order.size());
+  agg->values.resize(agg->values.size() + agg->slots);
   auto it = agg->index.emplace(Bytes(key->begin(), key->end()), i).first;
   agg->order.push_back(&it->first);
   return {i, agg->gen};
   BC_GUARD_END(cx)
   return {};
 }
-void bc_agg_add_i64(bc_ctx* cx, bc_group, uint32_t, int64_t) { cx->unimplemented("bc_agg_add_i64"); }
-void bc_agg_add_f64(bc_ctx* cx, bc_group, uint32_t, double) { cx->unimplemented("bc_agg_add_f64"); }
-void bc_agg_min_i64(bc_ctx* cx, bc_group, uint32_t, int64_t) { cx->unimplemented("bc_agg_min_i64"); }
-void bc_agg_max_i64(bc_ctx* cx, bc_group, uint32_t, int64_t) { cx->unimplemented("bc_agg_max_i64"); }
-void bc_agg_count(bc_ctx* cx, bc_group, uint32_t) { cx->unimplemented("bc_agg_count"); }
+
+extern "C++" {
+namespace {
+
+// The aggregate a group handle carries the generation of: the aggregates
+// are kept in the order opened, so their generations ascend.
+auto group_agg(bc_ctx* cx, bc_group g) -> bc_ctx::Agg* {
+  if (!cx->ok()) return nullptr;
+  auto it = std::ranges::lower_bound(cx->aggs, g.g, {}, &bc_ctx::Agg::gen);
+  if (it == cx->aggs.end() || it->gen != g.g || g.i >= it->order.size()) {
+    cx->fail(BC_E_HANDLE, "stale or foreign group");
+    return nullptr;
+  }
+  return &*it;
+}
+
+auto slot_kind_name(SlotKind k) -> const char* {
+  switch (k) {
+    case SlotKind::None: return "unused";
+    case SlotKind::SumI64: return "an integer sum";
+    case SlotKind::SumF64: return "a double sum";
+    case SlotKind::MinI64: return "a minimum";
+    case SlotKind::MaxI64: return "a maximum";
+    case SlotKind::Count: return "a count";
+  }
+  return "a slot";
+}
+
+// The slot a fold of `kind` goes to; nullptr and BC_E_HANDLE for a slot out
+// of range, or one an earlier fold made another kind.
+auto fold_slot(bc_ctx* cx, bc_group g, std::uint32_t slot, SlotKind kind) -> Slot* {
+  auto* agg = group_agg(cx, g);
+  if (agg == nullptr) return nullptr;
+  if (slot >= agg->slots) {
+    cx->fail(BC_E_HANDLE, "slot " + std::to_string(slot) + " of an aggregate of " + std::to_string(agg->slots));
+    return nullptr;
+  }
+  auto& k = agg->kinds[slot];
+  if (k != SlotKind::None && k != kind) {
+    cx->fail(BC_E_HANDLE, "slot " + std::to_string(slot) + " is " + slot_kind_name(k) + ", not " + slot_kind_name(kind));
+    return nullptr;
+  }
+  k = kind;
+  return &agg->values[std::size_t{g.i} * agg->slots + slot];
+}
+
+// The slot a read goes to, with its kind; nullptr and BC_E_HANDLE for a
+// slot out of range, or, given `f64`, of the other type than the read's.
+auto read_slot(bc_ctx* cx, bc_group g, std::uint32_t slot, std::optional<bool> f64) -> const Slot* {
+  auto* agg = group_agg(cx, g);
+  if (agg == nullptr) return nullptr;
+  if (slot >= agg->slots) {
+    cx->fail(BC_E_HANDLE, "slot " + std::to_string(slot) + " of an aggregate of " + std::to_string(agg->slots));
+    return nullptr;
+  }
+  auto k = agg->kinds[slot];
+  if (f64 && k != SlotKind::None && (k == SlotKind::SumF64) != *f64) {
+    cx->fail(BC_E_HANDLE, std::string{"slot "} + std::to_string(slot) + " is " + slot_kind_name(k) + ", read as " +
+                              (*f64 ? "a double" : "an integer"));
+    return nullptr;
+  }
+  return &agg->values[std::size_t{g.i} * agg->slots + slot];
+}
+
+}  // namespace
+}  // extern "C++"
+
+void bc_agg_add_i64(bc_ctx* cx, bc_group g, uint32_t slot, int64_t v) {
+  BC_GUARD_BEGIN
+  auto* s = fold_slot(cx, g, slot, SlotKind::SumI64);
+  if (s == nullptr) return;
+  std::int64_t r = 0;
+  if (__builtin_add_overflow(s->i, v, &r)) {
+    cx->fail(BC_E_ARITH, "bigint out of range");
+    return;
+  }
+  s->i = r;
+  s->set = true;
+  BC_GUARD_END(cx)
+}
+// PostgreSQL's float8 sum: a finite sum that overflows is an error, and an
+// infinite or NaN input carries through.
+void bc_agg_add_f64(bc_ctx* cx, bc_group g, uint32_t slot, double v) {
+  BC_GUARD_BEGIN
+  auto* s = fold_slot(cx, g, slot, SlotKind::SumF64);
+  if (s == nullptr) return;
+  auto r = s->f + v;
+  if (std::isinf(r) && !std::isinf(s->f) && !std::isinf(v)) {
+    cx->fail(BC_E_ARITH, "value out of range: overflow");
+    return;
+  }
+  s->f = r;
+  s->set = true;
+  BC_GUARD_END(cx)
+}
+void bc_agg_min_i64(bc_ctx* cx, bc_group g, uint32_t slot, int64_t v) {
+  BC_GUARD_BEGIN
+  auto* s = fold_slot(cx, g, slot, SlotKind::MinI64);
+  if (s == nullptr) return;
+  if (!s->set || v < s->i) s->i = v;
+  s->set = true;
+  BC_GUARD_END(cx)
+}
+void bc_agg_max_i64(bc_ctx* cx, bc_group g, uint32_t slot, int64_t v) {
+  BC_GUARD_BEGIN
+  auto* s = fold_slot(cx, g, slot, SlotKind::MaxI64);
+  if (s == nullptr) return;
+  if (!s->set || v > s->i) s->i = v;
+  s->set = true;
+  BC_GUARD_END(cx)
+}
+void bc_agg_count(bc_ctx* cx, bc_group g, uint32_t slot) {
+  BC_GUARD_BEGIN
+  auto* s = fold_slot(cx, g, slot, SlotKind::Count);
+  if (s == nullptr) return;
+  if (__builtin_add_overflow(s->i, 1, &s->i)) {
+    cx->fail(BC_E_ARITH, "bigint out of range");
+    return;
+  }
+  s->set = true;
+  BC_GUARD_END(cx)
+}
 bool bc_agg_next(bc_ctx* cx, bc_agg a, bc_view* group_key, bc_group* g) {
   BC_GUARD_BEGIN
   auto* agg = cx->resolve_handle(a, cx->aggs, "aggregate");
@@ -3567,25 +3983,33 @@ bool bc_agg_next(bc_ctx* cx, bc_agg a, bc_view* group_key, bc_group* g) {
   if (agg->scope != kNoStep) cx->end_steps_from(agg->scope);
   if (agg->next >= agg->order.size() || !cx->charge()) return false;
   auto i = agg->next++;
-  cx->begin_step(a.i, true, agg->scope);
+  cx->begin_step(a.i, bc_ctx::Loop::Agg, agg->scope);
   const auto& k = *agg->order[i];
   if (group_key != nullptr) *group_key = cx->make_view(k.data(), k.size());
   if (g != nullptr) *g = {static_cast<std::uint32_t>(i), agg->gen};
-  return true;
+  return cx->ok();
   BC_GUARD_END(cx)
   return {};
 }
-int64_t bc_agg_i64(bc_ctx* cx, bc_group, uint32_t) {
+int64_t bc_agg_i64(bc_ctx* cx, bc_group g, uint32_t slot) {
   BC_GUARD_BEGIN
-  cx->unimplemented("bc_agg_i64");
-  return 0;
+  const auto* s = read_slot(cx, g, slot, false);
+  return s == nullptr ? 0 : s->i;
   BC_GUARD_END(cx)
   return {};
 }
-double bc_agg_f64(bc_ctx* cx, bc_group, uint32_t) {
+double bc_agg_f64(bc_ctx* cx, bc_group g, uint32_t slot) {
   BC_GUARD_BEGIN
-  cx->unimplemented("bc_agg_f64");
-  return 0;
+  const auto* s = read_slot(cx, g, slot, true);
+  return s == nullptr ? 0 : s->f;
+  BC_GUARD_END(cx)
+  return {};
+}
+// PostgreSQL's NULL for SUM, MIN, MAX or AVG of a group no value reached.
+bool bc_agg_null(bc_ctx* cx, bc_group g, uint32_t slot) {
+  BC_GUARD_BEGIN
+  const auto* s = read_slot(cx, g, slot, std::nullopt);
+  return s != nullptr && !s->set;
   BC_GUARD_END(cx)
   return {};
 }

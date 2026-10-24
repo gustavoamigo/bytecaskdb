@@ -102,6 +102,65 @@ void join_steps(bc_ctx* cx) {
   bc_emit_i64(cx, n);
   bc_emit_end(cx);
 }
+// SELECT id FROM t ORDER BY name, the first $1 (0: all), added in reverse:
+// a sorter's copies, its sort, and with $1 a top-n's replacements.
+void sort_rows(bc_ctx* cx) {
+  bc_sorter s = bc_sorter_open(cx, bc_param_i64(cx, 0));
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_REVERSE);
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    bc_sorter_add(cx, s, bc_col_key(cx, row, kNameCol), row);
+  }
+  bc_view p = bc_empty(cx);
+  while (bc_sorter_next(cx, s, &p)) {
+    bc_emit_begin(cx);
+    bc_emit_col(cx, p, kIdCol);
+    bc_emit_end(cx);
+  }
+}
+// A hash join of t to itself on qty: a hash table's keys and payloads, and
+// a probe per outer row.
+void hash_join(bc_ctx* cx) {
+  bc_hash h = bc_hash_open(cx);
+  bc_cursor b = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, b)) {
+    bc_view row = bc_scan_row(cx, b);
+    bc_hash_put(cx, h, bc_col_key(cx, row, kQtyCol), row);
+    bc_hash_put(cx, h, bc_col_key(cx, row, kQtyCol), row);
+  }
+  int64_t n = 0;
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_hash_iter it = bc_hash_find(cx, h, bc_col_key(cx, bc_scan_row(cx, c), kQtyCol));
+    bc_view p = bc_empty(cx);
+    while (bc_hash_next(cx, it, &p)) n = bc_add(cx, n, bc_col_i64(cx, p, kQtyCol));
+  }
+  bc_emit_begin(cx);
+  bc_emit_i64(cx, n);
+  bc_emit_end(cx);
+}
+// SELECT COUNT(*), SUM(qty), MAX(qty) FROM t GROUP BY qty > 10: an
+// aggregate's groups and slots.
+void slot_sums(bc_ctx* cx) {
+  bc_agg a = bc_agg_open(cx, 3);
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    int64_t q = bc_col_i64(cx, row, kQtyCol);
+    bc_group g = bc_agg_group(cx, a, q > 10 ? bc_param_bytes(cx, 0) : bc_empty(cx));
+    bc_agg_count(cx, g, 0);
+    bc_agg_add_i64(cx, g, 1, q);
+    bc_agg_max_i64(cx, g, 2, q);
+  }
+  bc_group g{};
+  while (bc_agg_next(cx, a, nullptr, &g)) {
+    bc_emit_begin(cx);
+    bc_emit_i64(cx, bc_agg_i64(cx, g, 0));
+    bc_emit_i64(cx, bc_agg_i64(cx, g, 1));
+    bc_emit_i64(cx, bc_agg_i64(cx, g, 2));
+    bc_emit_end(cx);
+  }
+}
 // NULL for the NOT NULL id: by parameter, by bc_row_set_null, left unset.
 void null_id_param(bc_ctx* cx) {
   bc_row r = bc_row_begin(cx, kTbl);
@@ -151,6 +210,20 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
       {"update", bump_qty, {std::int64_t{3}}, {}, BC_OK},
       {"bc_pin, past one arena chunk", pin_many, {std::int64_t{1}}, {}, BC_OK},
       {"loop steps released, a join", join_steps, {}, {PhysType::I64}, BC_OK, {{std::int64_t{3}}}},
+      {"a sorter",
+       sort_rows,
+       {std::int64_t{0}},
+       {PhysType::I64},
+       BC_OK,
+       {{std::int64_t{1}}, {std::int64_t{2}}, {std::int64_t{3}}}},
+      {"a top-n sorter", sort_rows, {std::int64_t{2}}, {PhysType::I64}, BC_OK, {{std::int64_t{1}}, {std::int64_t{2}}}},
+      {"a hash join", hash_join, {}, {PhysType::I64}, BC_OK, {{std::int64_t{120}}}},
+      {"an aggregate's slots",
+       slot_sums,
+       {bytes("big")},
+       {PhysType::I64, PhysType::I64, PhysType::I64},
+       BC_OK,
+       {{std::int64_t{1}, std::int64_t{10}, std::int64_t{10}}, {std::int64_t{2}, std::int64_t{50}, std::int64_t{30}}}},
       {"bc_row_set_param NULL", null_id_param, {bc_value{}}, {}, BC_E_CONSTRAINT},
       {"bc_row_set_null", null_id_set, {}, {}, BC_E_CONSTRAINT},
       {"bc_row_end, a column unset", id_unset, {}, {}, BC_E_CONSTRAINT},
