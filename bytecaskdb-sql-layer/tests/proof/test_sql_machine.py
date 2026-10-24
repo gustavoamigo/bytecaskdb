@@ -70,7 +70,8 @@ from pgserver import Server, server_binary  # noqa: E402
 TYPES = [o.BIGINT, o.INTEGER, o.SMALLINT, o.DOUBLE, o.REAL, o.numeric(6, 2), o.BOOLEAN, o.TEXT, o.varchar(4), o.BYTEA]
 # Types a column + parameter is supported on, and how PostgreSQL types that
 # parameter: as the column's type (numeric without the modifier).
-ARITHMETIC = {"bigint": "bigint", "smallint": "smallint", "integer": "integer", "numeric(6,2)": "numeric"}
+ARITHMETIC = {"bigint": "bigint", "smallint": "smallint", "integer": "integer", "numeric(6,2)": "numeric",
+              "numeric(18,0)": "numeric"}
 # The columns SUM and MIN are generated over: the types the layer takes, but
 # BIGINT for SUM, whose sum leaves int64 (docs/testing_design.md, *Known
 # differences*).
@@ -587,21 +588,24 @@ class SqlMachine(RuleBasedStateMachine):
             return None
         return self.both(sql, params, pg_sql=f"{pg_head} WHERE {' AND '.join(pg_conds)}", types=types)
 
-    def add(self, name: str, col: str, op: str, operand, key: tuple, literal: bool = False) -> o.Outcome:
-        """UPDATE … SET col = col op $1 WHERE the primary key; with `literal`,
-        the operand is an integer literal in the text, typed by both sides
-        as PostgreSQL types it."""
+    def add(self, name: str, col: str, op: str, operand, key: tuple, literal: bool = False,
+            target: str | None = None) -> o.Outcome:
+        """UPDATE … SET target = col op $1 WHERE the primary key (`target`
+        defaults to col); with `literal`, the operand is an integer literal in
+        the text, typed by both sides as PostgreSQL types it. The sum is in
+        col's type; `target` only checks it on assignment."""
         t = self.tables[name]
+        target = target or col
         first = 1 if literal else 2
         where = " AND ".join(f"{c} = ${i + first}" for i, c in enumerate(t.pk))
         pg_where = " AND ".join(f"{c} = {typed(t, c, i + first)}" for i, c in enumerate(t.pk))
         key_types = [t.column(c).type for c in t.pk]
         if literal:
-            return self.both(f"UPDATE {name} SET {col} = {col} {op} {operand} WHERE {where}", key,
-                             pg_sql=f"UPDATE {name} SET {col} = {col} {op} {operand} WHERE {pg_where}", types=key_types)
+            return self.both(f"UPDATE {name} SET {target} = {col} {op} {operand} WHERE {where}", key,
+                             pg_sql=f"UPDATE {name} SET {target} = {col} {op} {operand} WHERE {pg_where}", types=key_types)
         cast = ARITHMETIC[t.column(col).type.sql]
-        return self.both(f"UPDATE {name} SET {col} = {col} {op} $1 WHERE {where}", (operand, *key),
-                         pg_sql=f"UPDATE {name} SET {col} = {col} {op} $1::{cast} WHERE {pg_where}",
+        return self.both(f"UPDATE {name} SET {target} = {col} {op} $1 WHERE {where}", (operand, *key),
+                         pg_sql=f"UPDATE {name} SET {target} = {col} {op} $1::{cast} WHERE {pg_where}",
                          types=[t.column(col).type] + key_types)
 
     def join(self, names: tuple[str, str], targets: list[tuple[str, str]], keys: tuple[tuple, tuple],
@@ -973,10 +977,11 @@ class SqlMachine(RuleBasedStateMachine):
         else:
             key = tuple(data.draw(st.none() | values(t.column(c).type), label=c) for c in t.pk)
         # Integer literals, typed integer or, past it, bigint: small ones, and
-        # ones at and past SMALLINT's and INTEGER's edges.
-        # BIGINT's own edge, but not on a DECIMAL: the layer refuses an operand of 18 digits or more.
+        # ones at and past SMALLINT's and INTEGER's edges. 2^63 - 1 only on a
+        # BIGINT: a SMALLINT, INTEGER or DECIMAL column refuses it before the
+        # plan runs.
         edges = [32767, 32768, -32768, 2**31 - 1, 2**31, 2**40]
-        if t.column(col).type.kind != "decimal":
+        if t.column(col).type is o.BIGINT:
             edges.append(2**63 - 1)
         literal = data.draw(st.one_of(st.integers(-5, 5), st.sampled_from(edges)), label="literal")
         self.add(name, col, data.draw(st.sampled_from(["+", "-"]), label="op"), literal, key, literal=True)
@@ -1560,6 +1565,46 @@ def test_column_plus_parameter_at_the_edges(dsn):
         # NUMERIC(6, 2).
         m.insert("t0", {"c0": 4, "c1": 0, "c2": 0, "c3": decimal.Decimal("1.00")}, all_columns=True)
         assert m.add("t0", "c3", "+", decimal.Decimal(10**16), (4,)).error == "22003"
+        m.check()
+    finally:
+        m.teardown()
+
+
+def test_column_plus_parameter_across_bigint_and_scale_0_decimal(dsn):
+    """SET target = col ± $1: the sum is in col's type, as PostgreSQL's
+    operator types it, and the target only checks it on assignment. A BIGINT
+    col leaves int64 as "bigint out of range"; a NUMERIC(18, 0) col cannot,
+    its operand being held to 18 digits, so its overflow is the target's.
+    Both are 22003, a NUMERIC(18, 0) of scale 0 being a BIGINT to the layer
+    (#540). A SMALLINT or INTEGER target of a BIGINT col is refused."""
+    m = fixed(dsn)
+    big = 10**18 - 1
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.BIGINT),
+                              Column("c2", o.numeric(18, 0)), Column("c3", o.SMALLINT)], ["c0"]))
+        m.insert("t0", {"c0": 1, "c1": BIGINT_HIGH, "c2": decimal.Decimal(big), "c3": 0}, all_columns=True)
+        m.insert("t0", {"c0": 2, "c1": BIGINT_LOW, "c2": decimal.Decimal(-big), "c3": 0}, all_columns=True)
+        m.insert("t0", {"c0": 3, "c1": 5, "c2": decimal.Decimal(0), "c3": 0}, all_columns=True)
+        d = decimal.Decimal
+        # A NUMERIC(18, 0) col and target: past 18 digits, though not past int64.
+        assert m.add("t0", "c2", "+", d(1), (1,)).error == "22003"
+        assert m.add("t0", "c2", "+", d(big), (1,)).error == "22003"
+        assert m.add("t0", "c2", "-", d(1), (2,)).error == "22003"
+        assert m.add("t0", "c2", "-", d(big), (1,)).error is None  # 0
+        assert m.add("t0", "c2", "+", d(big), (1,)).error is None
+        # A BIGINT col into a NUMERIC(18, 0) target: int64's edge first, then 18 digits.
+        assert m.add("t0", "c1", "+", 1, (1,), target="c2").error == "22003"  # bigint out of range
+        assert m.add("t0", "c1", "-", 1, (2,), target="c2").error == "22003"
+        assert m.add("t0", "c1", "-", 1, (1,), target="c2").error == "22003"  # fits int64, not 18 digits
+        assert m.add("t0", "c1", "+", 1, (3,), target="c2").error is None  # 6
+        assert m.add("t0", "c1", "-", 7, (3,), target="c2").error is None  # -2
+        # A NUMERIC(18, 0) col into a BIGINT target: the sum fits int64 whatever the operand.
+        assert m.add("t0", "c2", "+", d(big), (1,), target="c1").error is None  # 2 * (10^18 - 1)
+        assert m.add("t0", "c2", "-", d(big), (2,), target="c1").error is None
+        assert m.add("t0", "c2", "+", None, (1,), target="c1").error is None
+        sql = "UPDATE t0 SET c3 = c1 + $1 WHERE c0 = $2"
+        out = o.run_layer(m.db, sql, (1, 3))
+        assert out.error == "refused" and "assigned column's type" in out.detail, out
         m.check()
     finally:
         m.teardown()

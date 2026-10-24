@@ -109,7 +109,9 @@ Rules for slice 1 of the front end (#492, `docs/frontend_design.md`):
 - **SET col = col ± $n** on BIGINT, SMALLINT, INTEGER and NUMERIC(6, 2) columns by
   the primary key, operands at and past the type's edges and NULL; on
   PostgreSQL's side `$n` is cast to the column's type, as PostgreSQL
-  types it. BIGINT's edges are int64 itself.
+  types it. BIGINT's edges are int64 itself. The machine does not draw a
+  target other than the column read; `test_column_plus_parameter_across_bigint_and_scale_0_decimal`
+  does, for a BIGINT beside a NUMERIC(18, 0).
 
 Rules for slice 3 (#492):
 - **SET col = col ± n**, n an integer literal, on the same columns: small

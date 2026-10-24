@@ -2417,46 +2417,48 @@ auto arith_fail(bc_ctx* cx, const char* what) -> std::int64_t {
 }
 }  // namespace
 
-int64_t bc_add(bc_ctx* cx, int64_t a, int64_t b) {
+extern "C++" {  // templates cannot have C linkage
+namespace {
+constexpr auto add_overflows = [](std::int64_t a, std::int64_t b, std::int64_t* r) { return __builtin_add_overflow(a, b, r); };
+constexpr auto sub_overflows = [](std::int64_t a, std::int64_t b, std::int64_t* r) { return __builtin_sub_overflow(a, b, r); };
+
+// One int64 + or -, with the failure left to the caller: `overflowed` reports
+// a result outside int64 (BC_E_ARITH, or a BIGINT's range error) and returns
+// the value the failed plan carries on with.
+template <typename Overflows, typename Failure>
+auto checked(bc_ctx* cx, std::int64_t a, std::int64_t b, Overflows overflows, Failure overflowed) -> std::int64_t {
   BC_GUARD_BEGIN
   if (!cx->ok()) return 0;
   std::int64_t r = 0;
-  return __builtin_add_overflow(a, b, &r) ? arith_fail(cx, "integer out of range") : r;
+  return overflows(a, b, &r) ? overflowed() : r;
   BC_GUARD_END(cx)
   return {};
+}
+
+// An int64 overflow of a value stored in a BIGINT is that type's range
+// error, as in PostgreSQL: the one the row builder and bc_check_int raise for
+// the narrower types.
+auto bigint_out_of_range(bc_ctx* cx, std::uint32_t object_id) -> std::int64_t {
+  cx->raise(BC_C_RANGE, object_id, "bigint out of range");
+  return 0;
+}
+}  // namespace
+}  // extern "C++"
+
+int64_t bc_add(bc_ctx* cx, int64_t a, int64_t b) {
+  return checked(cx, a, b, add_overflows, [&] { return arith_fail(cx, "integer out of range"); });
 }
 
 int64_t bc_sub(bc_ctx* cx, int64_t a, int64_t b) {
-  BC_GUARD_BEGIN
-  if (!cx->ok()) return 0;
-  std::int64_t r = 0;
-  return __builtin_sub_overflow(a, b, &r) ? arith_fail(cx, "integer out of range") : r;
-  BC_GUARD_END(cx)
-  return {};
+  return checked(cx, a, b, sub_overflows, [&] { return arith_fail(cx, "integer out of range"); });
 }
 
-// An int64 overflow is a BIGINT leaving its type, as in PostgreSQL: the same
-// range error the row builder and bc_check_int raise for the narrower types.
 int64_t bc_add_bigint(bc_ctx* cx, int64_t a, int64_t b, uint32_t object_id) {
-  BC_GUARD_BEGIN
-  if (!cx->ok()) return 0;
-  std::int64_t r = 0;
-  if (!__builtin_add_overflow(a, b, &r)) return r;
-  cx->raise(BC_C_RANGE, object_id, "bigint out of range");
-  return 0;
-  BC_GUARD_END(cx)
-  return {};
+  return checked(cx, a, b, add_overflows, [&] { return bigint_out_of_range(cx, object_id); });
 }
 
 int64_t bc_sub_bigint(bc_ctx* cx, int64_t a, int64_t b, uint32_t object_id) {
-  BC_GUARD_BEGIN
-  if (!cx->ok()) return 0;
-  std::int64_t r = 0;
-  if (!__builtin_sub_overflow(a, b, &r)) return r;
-  cx->raise(BC_C_RANGE, object_id, "bigint out of range");
-  return 0;
-  BC_GUARD_END(cx)
-  return {};
+  return checked(cx, a, b, sub_overflows, [&] { return bigint_out_of_range(cx, object_id); });
 }
 
 int64_t bc_mul(bc_ctx* cx, int64_t a, int64_t b) {

@@ -51,6 +51,8 @@ using Op = ast::Compare::Op;
 
 [[noreturn]] void no_plan(const std::string& why) { throw SqlError{"no plan: " + why, -1}; }
 
+// `bigint` is the column's SQL type alone: a DECIMAL of scale 0 shares BIGINT's
+// physical type but its operand is held to 18 digits, so its sum cannot leave int64.
 auto column(const Table& t, std::uint32_t id) -> ir::Column {
   const auto& c = *t.column(id);
   return {c.id, c.type, c.nullable, t.id, c.sql.kind == SqlKind::BigInt};

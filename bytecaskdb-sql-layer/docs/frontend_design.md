@@ -582,7 +582,14 @@ its transaction test.
      the column's scale, so the sum stays inside `int64` and the row
      builder's check of it is 22003. A BIGINT's sum can leave `int64`, so the
      plan adds with `bc_add_bigint` / `bc_sub_bigint`, which raise
-     `BC_C_RANGE`, "bigint out of range" (#540).
+     `BC_C_RANGE`, "bigint out of range". Which one is decided by the SQL type
+     of the column read, as PostgreSQL's operator takes its result type from its
+     operands; the assigned column only checks the sum when it is stored. The
+     two differ only for a BIGINT and a `DECIMAL` of scale 0, which the binder
+     takes as one type (a SMALLINT or INTEGER beside a BIGINT is refused): a
+     `DECIMAL(p, 0)` read cannot leave `int64`, its operand held to 18 digits,
+     so its overflow is the assigned column's check ("numeric field overflow").
+     `tests/proof` runs both crossings against PostgreSQL.
    - `FOR UPDATE` (#491, slice B) works with every scan here, `ORDER BY`
      and `LIMIT` included: each row returned is guarded, read from the
      row, never covering. With `COUNT` it is refused, as PostgreSQL
@@ -618,7 +625,7 @@ its transaction test.
      assignment makes, whether PostgreSQL typed the literal integer or
      bigint. On a SMALLINT or INTEGER column a literal of 2^32 or more in
      magnitude is held as 2^32: the sum leaves the column either way, and
-     cannot overflow `int64_t`; a BIGINT column's can, and is 22003 as above (#540).
+     cannot overflow `int64_t`; a BIGINT column's can, and is 22003 as above.
    - `FOR UPDATE` is #538's (#491, slice B).
 4. **Delivery:** the covering prefix scan with `LIMIT 1`, `MIN`, `UPDATE`
    of many rows, `SUM`. As built, with these differences from the design
@@ -644,7 +651,7 @@ its transaction test.
      PostgreSQL's `MIN` keeps whichever of `-0.0` and `0.0` it meets last,
      so its answer depends on the order it reads the rows (*Later*).
    - `SUM` adds with `bc_add`. A running total that leaves `int64_t` (a
-     `DECIMAL`'s scaled integer) is `BC_E_ARITH`, where PostgreSQL's
+     `BIGINT`'s, or a `DECIMAL`'s scaled integer) is `BC_E_ARITH`, where PostgreSQL's
      `numeric` holds it; below that, the sum is PostgreSQL's exactly, past
      18 digits included (*Known differences*). The range check on computed
      values is slice 5's.
@@ -686,7 +693,9 @@ its transaction test.
      computed once, before anything is read, by `bc_check_int` (the
      addition above: the value, `BC_SMALLINT` or `BC_INTEGER`, and the
      table a refusal names), so a sum outside `INTEGER` is 22003 whatever
-     else the statement would read, as PostgreSQL folds it when it binds;
+     else the statement would read, as PostgreSQL folds it when it binds
+     (`$n` is itself checked as an `INTEGER` first, so the addition cannot
+     overflow `int64`);
      a NULL `$n` gives NULL. It bounds a range like a parameter; compared
      by `=` it is a filter, never a key part.
    - `COUNT(DISTINCT col)` groups each non-NULL value in `bc_agg_open`'s
@@ -727,7 +736,7 @@ network, beside `commit_probe`. There is no InnoDB comparison for now
 
 | PostgreSQL | This layer | Why |
 |---|---|---|
-| `SUM` over `BIGINT` or `DECIMAL` is unbounded `numeric`. | A running total past `int64_t`, a `DECIMAL`'s in its scaled integer, fails the statement (`BC_E_ARITH`). | `DECIMAL` is a scaled `int64_t` (`docs/types_design.md`). No TPROC-C sum comes near. |
+| `SUM` over `BIGINT` or `DECIMAL` is unbounded `numeric`. | A running total past `int64_t`, a `BIGINT`'s or a `DECIMAL`'s in its scaled integer, fails the statement (`BC_E_ARITH`). | `DECIMAL` is a scaled `int64_t` (`docs/types_design.md`). No TPROC-C sum comes near. |
 | Comparing columns of different types casts one to the other's. | Refused, in a `WHERE` and a join. | One key encoding per comparison. TPROC-C compares columns of one type only. |
 | A statement no index scan answers in its order runs: a full scan, a sort of the rows read, an `ORDER BY` on a join, or one whose NULLs the chosen index can't place as PostgreSQL does (*NULLs in an ordered part*). | Refused (*What the planner refuses*). | Each would add a sorter (`bc_sorter_*`) or an unbounded read to build and test before the MVP (*Decisions*, 5; #533). No TPROC-C statement needs one. |
 

@@ -280,7 +280,9 @@ auto computed(std::uint32_t i) -> std::string { return "v" + std::to_string(i); 
 
 // Each computed value, once, before anything is read: as PostgreSQL folds
 // $n ± k when it binds, one that leaves INTEGER fails the statement whatever
-// the other parameters are; a NULL $n gives NULL, never an error.
+// the other parameters are; a NULL $n gives NULL, never an error. $n is
+// checked as an INTEGER before the plan runs, so the addition itself cannot
+// overflow int64.
 void print_computed(Writer& w) {
   const auto& comp = w.p().computed;
   for (std::size_t i = 0; i < comp.size(); ++i) {
