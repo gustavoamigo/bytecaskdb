@@ -74,6 +74,7 @@ import tempfile
 
 import bytecask_sql
 import hypothesis.strategies as st
+import pytest
 from hypothesis import note
 from hypothesis.control import currently_in_test_context
 from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, rule, run_state_machine_as_test
@@ -444,7 +445,7 @@ class SqlMachine(RuleBasedStateMachine):
         """Runs a statement on both sides; they must agree. Returns the layer's
         outcome. `types`: each parameter's column type, for the DECIMALs the
         layer takes scaled (o.to_layer)."""
-        layer = self.layer(sql, params, types)
+        layer = self.served(sql, params, self.layer(sql, params, types))
         pg = o.run_pg(self.pg.conn, pg_sql or sql, params)
         if layer.text and pg.text:
             assert layer.text == pg.text, f"{sql} {params!r}: the server sent {layer.text}, PostgreSQL {pg.text}"
@@ -466,6 +467,14 @@ class SqlMachine(RuleBasedStateMachine):
                 f"PostgreSQL's {'' if self.pg_aborted() else 'not '}"
             )
         return layer
+
+    @staticmethod
+    def served(sql: str, params, out: o.Outcome) -> o.Outcome:
+        """`out`, the layer's outcome of a statement the machine predicts the
+        planner serves: a planner refusal fails the step, whatever
+        PostgreSQL does with the statement."""
+        assert not o.is_no_plan(out), f"{sql} {params!r}: predicted served, the planner refused it ({out.detail})"
+        return out
 
     def alternatives_agree(self, sql: str, params, types, full: tuple, key, limit: int | None) -> None:
         """Every plan the search costed for a SELECT returns a correct answer
@@ -593,7 +602,7 @@ class SqlMachine(RuleBasedStateMachine):
             if out.error is None:
                 self.alternatives_agree(sql, params, types, out.rows, None, None)
             return
-        layer = self.layer(sql, params, types)
+        layer = self.served(sql, params, self.layer(sql, params, types))
         full = o.run_pg(self.pg.conn, pg_sql.removesuffix(" FOR UPDATE").removesuffix(f" LIMIT {limit}" if limit is not None else ""), params)
         assert layer.error == full.error, f"{sql} {params!r}: the layer {layer.error or 'ran it'} ({layer.detail}), PostgreSQL {full.error or 'ran it'} ({full.detail})"
         if layer.error is not None:
@@ -731,7 +740,7 @@ class SqlMachine(RuleBasedStateMachine):
             if out.error is None:
                 self.alternatives_agree(sql, params, types, out.rows, None, None)
             return
-        layer = out or self.layer(sql, params, types)
+        layer = self.served(sql, params, out or self.layer(sql, params, types))
         full = o.run_pg(self.pg.conn, pg_sql, params)
         assert layer.error == full.error, f"{sql} {params!r}: the layer {layer.error or 'ran it'} ({layer.detail}), PostgreSQL {full.error or 'ran it'} ({full.detail})"
         if layer.error is not None:
@@ -1636,6 +1645,23 @@ def test_a_parameter_compared_with_two_types_is_refused(dsn):
         assert o.run_pg(m.pg.conn, sql, (1e39,)).rows == ()
         assert o.run_layer(m.db, sql, (1e39,)).error == "refused"
         m.check()
+    finally:
+        m.teardown()
+
+
+def test_a_planner_refusal_never_agrees_with_postgresql(dsn):
+    # PostgreSQL fails the statement with a state the oracle calls
+    # "refused" (22P02); the planner refuses it with no plan. Were both
+    # "refused", a wrong "served" prediction would pass: the step fails.
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT), Column("c1", o.DOUBLE)], ["c0"]))
+        sql = "SELECT c0 FROM t0 WHERE c1 = $1"
+        pg_sql = "SELECT 'x'::bigint"
+        assert o.run_pg(m.pg.conn, pg_sql).error == "refused"
+        assert o.is_no_plan(o.run_layer(m.db, sql, (1.0,)))
+        with pytest.raises(AssertionError, match="predicted served, the planner refused it"):
+            m.both(sql, (1.0,), pg_sql=pg_sql)
     finally:
         m.teardown()
 
