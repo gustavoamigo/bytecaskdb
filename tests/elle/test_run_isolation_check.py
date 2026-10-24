@@ -146,5 +146,139 @@ class NoSequenceTest(unittest.TestCase):
         self.assertTrue(any("missing from final read" in p for p in problems), problems)
 
 
+def txn(index: int, process: int, seq: int | None, puts: dict[int, int],
+        reads: dict[int, list] | None = None, kind: str = "ok") -> list[dict]:
+    """A range workload transaction: a put per (key, write id), then a point
+    read and a scan per start key in reads, the value being the
+    (key, version) pairs it returned. `index` is the invoke's index; the
+    completion follows it."""
+    value = [["put", k, wid] for k, wid in puts.items()]
+    for start, pairs in (reads or {}).items():
+        value.append([["r", start, pairs], ["scan", start, start + 4, pairs]])
+    inv = {"index": index, "process": process, "type": "invoke", "epoch": 0,
+           "value": [["put", k, wid] for k, wid in puts.items()]
+           + [[["r", start, []], ["scan", start, start + 4, []]]
+              for start in (reads or {})]}
+    done = {"index": index + 1, "process": process, "type": kind, "epoch": 0,
+            "value": value}
+    if kind == "ok":
+        done["sequence"] = seq
+    return [inv, done]
+
+
+def info(index: int, process: int, puts: dict[int, int],
+         dels: list[list] | None = None) -> list[dict]:
+    """A range workload transaction whose outcome is unknown (an exception:
+    a failed fdatasync, a kill)."""
+    value = [["put", k, wid] for k, wid in puts.items()] + (dels or [])
+    return [{"index": index, "process": process, "type": "invoke", "epoch": 0,
+             "value": value},
+            {"index": index + 1, "process": process, "type": "info",
+             "epoch": 0, "value": value}]
+
+
+def version(session: int, n: int) -> str:
+    """The version a value stores for write id (session, n)."""
+    ident = (session << 32) | n
+    return f"w{ident >> 32:x}.{ident & 0xffffffff:x}"
+
+
+class HistoryCheckTest(unittest.TestCase):
+    """history_check: the range workload's replay against the commit order
+    (#302). Each test is a history that is right or wrong for one reason."""
+
+    def check(self, history, config="guarded"):
+        return ric.history_check(history, config)[0]
+
+    def base(self) -> list[dict]:
+        """Key 5 holds version (1, 0), committed at sequence 10."""
+        return txn(0, 0, 10, {5: 1 << 32}, {5: [[5, "s5"]]})
+
+    def test_a_consistent_history_passes(self):
+        history = self.base() + txn(10, 1, 20, {6: 2 << 32},
+                                    {5: [[5, version(1, 0)]]})
+        self.assertEqual(self.check(history), [])
+
+    def test_a_read_of_a_version_the_order_does_not_hold_fails(self):
+        history = self.base() + txn(10, 1, 20, {6: 2 << 32},
+                                    {5: [[5, version(3, 0)]]})
+        problems = self.check(history)
+        self.assertTrue(any("read key 5" in p for p in problems), problems)
+
+    def test_a_stale_read_is_an_exposure_unguarded_and_a_violation_guarded(self):
+        # Process 0 replaces key 5 at sequence 20; process 1 reads the version
+        # from sequence 10: a read behind its own position.
+        history = (self.base()
+                   + txn(10, 0, 20, {5: 2 << 32}, {5: [[5, version(1, 0)]]})
+                   + txn(20, 1, 30, {6: 3 << 32},
+                         {5: [[5, version(1, 0)]]}))
+        self.assertTrue(self.check(history, "guarded"))
+        problems, summary = ric.history_check(history, "unguarded")
+        self.assertEqual(problems, [])
+        self.assertGreater(summary["exposures"], 0)
+
+    def test_unguarded_needs_an_exposure_to_prove_anything(self):
+        history = self.base() + txn(10, 1, 20, {6: 2 << 32},
+                                    {6: [[6, version(2, 0)]]})
+        problems = self.check(history, "unguarded")
+        self.assertTrue(any("not shown to reach write skew" in p
+                            for p in problems), problems)
+
+    def test_a_scan_that_misses_a_live_key_fails(self):
+        history = self.base() + txn(10, 1, 20, {6: 2 << 32},
+                                    {5: [[6, version(2, 0)]]})
+        problems = self.check(history)
+        self.assertTrue(any("missed keys [5]" in p for p in problems),
+                        problems)
+
+    def test_a_scan_cannot_show_the_key_the_transaction_inserts(self):
+        # The transaction puts key 5 and scans [5, 9) of the snapshot it made
+        # before the put: its own insert is not there to show.
+        history = self.base() + txn(10, 1, 20, {5: 2 << 32}, {5: []})
+        self.assertEqual(self.check(history), [])
+
+    def test_an_info_write_placed_by_a_later_read_stands_in_the_order(self):
+        # The :info put of (9, 0) on key 5 was there before process 1 read it,
+        # so it is placed just before that read, over the earlier write.
+        history = (self.base() + info(10, 9, {5: 9 << 32})
+                   + txn(20, 1, 20, {6: 1 << 32},
+                         {5: [[5, version(9, 0)]]}))
+        self.assertEqual(self.check(history), [])
+
+    def test_a_key_an_unplaced_info_write_touched_is_not_judged(self):
+        # No committed read named (9, 0): whether it committed is unknown, so
+        # key 5 is unknown from the :info transaction on and a read of either
+        # value is accepted.
+        for read in (version(1, 0), version(9, 0)):
+            history = (self.base() + info(10, 9, {5: 9 << 32})
+                       + txn(20, 1, 20, {6: 1 << 32}, {5: [[5, read]]}))
+            self.assertEqual(self.check(history), [])
+
+    def test_a_committed_write_does_not_settle_a_key_an_info_touched(self):
+        # The :info may have committed after that write, so the key stays
+        # unknown: a read of any value is accepted. It takes the :info's own
+        # value being read back to place it, which the test above covers.
+        history = (self.base() + info(10, 9, {5: 9 << 32})
+                   + txn(20, 1, 20, {5: 2 << 32})
+                   + txn(30, 2, 30, {6: 3 << 32},
+                         {5: [[5, version(4, 0)]]}))
+        self.assertEqual(self.check(history), [])
+
+    def test_an_invoke_without_a_completion_is_ignored(self):
+        history = self.base() + [{"index": 10, "process": 7, "type": "invoke",
+                                  "epoch": 0, "value": [["put", 6, 7 << 32]]}]
+        self.assertEqual(self.check(history), [])
+
+    def test_the_lives_of_a_kill_share_process_ids(self):
+        # A transaction killed at the end of epoch 0 has no completion; the
+        # first completion of epoch 1 belongs to its own invoke.
+        history = (self.base()
+                   + [{"index": 10, "process": 1, "type": "invoke",
+                       "epoch": 1, "value": [["put", 7, 2 << 32]]}]
+                   + txn(20, 0, 20, {6: 1 << 32},
+                         {5: [[5, version(1, 0)]]}))
+        self.assertEqual(self.check(history), [])
+
+
 if __name__ == "__main__":
     unittest.main()

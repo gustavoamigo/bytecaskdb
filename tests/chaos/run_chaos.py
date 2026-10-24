@@ -586,6 +586,8 @@ class Rig:
                 "--element-base", str(e["max_element"] + 1),
                 # The KeyPool starts on the keys the last life was appending to.
                 "--key-base", str(max(0, e["max_key"] + 1 - 8))]
+        if self.args.elle_workload != "append":
+            argv += ["--workload", self.args.elle_workload]
         if "vacuum" in self.args.disable:
             argv.append("--no-vacuum")
         return argv
@@ -638,17 +640,29 @@ class Rig:
             [self.args.worker, "--absorb", str(e["root"] / "manifest.txt"),
              "--config", self.args.config, "--seed", "1",
              "--threads", str(self.args.threads), "--dir", str(final),
-             "--out", str(history_path)],
+             "--out", str(history_path)]
+            + ([] if self.args.elle_workload == "append"
+               else ["--workload", self.args.elle_workload]),
             capture_output=True, text=True, timeout=1200)
         if r.returncode != 0:
             raise Failure(f"--absorb failed: {r.stderr.strip()[-600:]}")
         summary = json.loads(Path(str(history_path) + ".chaos.json").read_text())
         history = json.loads(history_path.read_text())
-        problems = ISOLATION.cross_check(history)
-        if problems:
-            raise Failure("cross-check: " + "; ".join(problems[:5]))
-        verdict = "cross-check clean"
-        if self.args.elle_jar:
+        if self.args.elle_workload == "range":
+            # The range workload has no list-append model: the script's
+            # history checker replays the commit order instead.
+            problems, summary_range = ISOLATION.history_check(
+                history, self.args.config)
+            if problems:
+                raise Failure("history check: " + "; ".join(problems[:5]))
+            verdict = (f"history clean ({summary_range['committed']} committed, "
+                       f"{summary_range['exposures']} exposures)")
+        else:
+            problems = ISOLATION.cross_check(history)
+            if problems:
+                raise Failure("cross-check: " + "; ".join(problems[:5]))
+            verdict = "cross-check clean"
+        if self.args.elle_jar and self.args.elle_workload == "append":
             models = ("strict-serializable" if self.args.config == "guarded"
                       else "snapshot-isolation")
             a = ISOLATION.run_elle(Path(self.args.elle_jar), history_path, models,
@@ -847,6 +861,11 @@ def main() -> int:
                     help="chaos: the single-writer workload, checked per life; "
                          "elle: isolation_history's concurrent writers, checked "
                          "per episode by the cross-check and Elle (#232)")
+    ap.add_argument("--elle-workload", choices=("append", "range"),
+                    default="append",
+                    help="elle: isolation_history's generators. range has no "
+                         "Elle model and is checked by run_isolation_check's "
+                         "history_check (#302)")
     ap.add_argument("--config", choices=("guarded", "unguarded"), default="guarded",
                     help="elle: which isolation configuration to run")
     ap.add_argument("--threads", type=int, default=16, help="elle: writer threads")

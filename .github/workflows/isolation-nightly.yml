@@ -155,6 +155,36 @@ jobs:
           if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
           python3 scripts/run_isolation_check.py $ARGS
 
+      # Range guards, dels and range deletes (#302): scans, point reads, puts,
+      # dels and one-key range deletes over overlapping ranges, checked
+      # against the commit order instead of Elle, whose models have no
+      # counterpart for them. Unguarded must show stale reads every run.
+      - name: Run range workload
+        env:
+          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
+          ROUNDS: ${{ github.event.inputs.rounds || '4' }}
+          SEED: ${{ github.event.inputs.seed || '' }}
+        run: |
+          ARGS="--binary build/linux/x86_64/${{ matrix.mode }}/isolation_history"
+          ARGS="$ARGS --workload range --rounds $ROUNDS"
+          ARGS="$ARGS --txns ${{ matrix.txns }} --out $RUNNER_TEMP/isolation-range"
+          if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
+          python3 scripts/run_isolation_check.py $ARGS
+
+      # The same, with the writer process SIGKILLed and reopened: the history's
+      # :info transactions come from the lives a kill cut short.
+      - name: Run range kill check
+        env:
+          ASAN_OPTIONS: ${{ matrix.sanitizer == 'address' && 'detect_leaks=1' || '' }}
+          ROUNDS: ${{ github.event.inputs.kill_rounds || '4' }}
+          SEED: ${{ github.event.inputs.seed || '' }}
+        run: |
+          ARGS="--binary build/linux/x86_64/${{ matrix.mode }}/isolation_history"
+          ARGS="$ARGS --workload range --kill --rounds $ROUNDS"
+          ARGS="$ARGS --txns ${{ matrix.txns }} --out $RUNNER_TEMP/isolation-range-kill"
+          if [ -n "$SEED" ]; then ARGS="$ARGS --seed $SEED"; fi
+          python3 scripts/run_isolation_check.py $ARGS
+
       # Guarded and unguarded under the chaos rig (#232): chaosfs cuts the
       # power, fails fdatasync with Linux semantics, evicts, fills the disk,
       # stalls, and each writer process ends in a power cut, SIGKILL or clean
@@ -171,6 +201,14 @@ jobs:
               --elle-jar elle-cli.jar --minutes $MINUTES --seed $SEED --lives 6 \
               --max-life-s ${{ matrix.sanitizer == 'address' && '10' || '4' }} \
               --work $RUNNER_TEMP/isolation-chaos-$config
+            # Range guards, dels and range deletes under the same hazards,
+            # checked against the commit order (#302).
+            python3 tests/chaos/run_chaos.py --workload elle --config $config \
+              --elle-workload range \
+              --worker build/linux/x86_64/${{ matrix.mode }}/isolation_history \
+              --minutes $MINUTES --seed $SEED --lives 6 \
+              --max-life-s ${{ matrix.sanitizer == 'address' && '10' || '4' }} \
+              --work $RUNNER_TEMP/isolation-chaos-range-$config
           done
 
       # Leader plus two followers through bootstrap and tailing
@@ -215,14 +253,15 @@ jobs:
         if: failure()
         run: |
           mkdir -p "$RUNNER_TEMP/upload"
-          for d in isolation isolation-cluster isolation-topology isolation-kill; do
+          for d in isolation isolation-range isolation-range-kill \
+                   isolation-cluster isolation-topology isolation-kill; do
             if [ -d "$RUNNER_TEMP/$d" ]; then cp -a "$RUNNER_TEMP/$d" "$RUNNER_TEMP/upload/"; fi
           done
-          for config in guarded unguarded; do
-            if [ -d "$RUNNER_TEMP/isolation-chaos-$config/failure" ]; then
-              mkdir -p "$RUNNER_TEMP/upload/isolation-chaos-$config"
-              cp -a "$RUNNER_TEMP/isolation-chaos-$config/failure" \
-                "$RUNNER_TEMP/upload/isolation-chaos-$config/"
+          for d in isolation-chaos-guarded isolation-chaos-unguarded \
+                   isolation-chaos-range-guarded isolation-chaos-range-unguarded; do
+            if [ -d "$RUNNER_TEMP/$d/failure" ]; then
+              mkdir -p "$RUNNER_TEMP/upload/$d"
+              cp -a "$RUNNER_TEMP/$d/failure" "$RUNNER_TEMP/upload/$d/"
             fi
           done
           find "$RUNNER_TEMP/upload" -maxdepth 2 | sort
