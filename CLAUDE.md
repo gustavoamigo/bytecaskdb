@@ -42,6 +42,14 @@ GitHub Issues are the repository's task tracker, for work not already captured b
 - If the repository does not yet have the necessary test seam, create the smallest practical test harness first.
 - If tests cannot be run, state why clearly and record the blocker in the PR description or a GitHub issue.
 
+### Fault sweeps must reach every structural transition
+
+A fault sweep proves only the paths its workload reaches with the fault armed. Line and MC/DC coverage show a branch ran, not that it ran with each of its allocations failed. The engine's sweep missed #580 because its seed was one leaf no operation filled (#588).
+
+- A sweep over a tree, or over anything else that restructures itself (split, rebuild, collapse, a join of parts built in parallel), includes writes that make every such transition while the structure owns the nodes involved, and writes that make it on nodes it must first copy.
+- The sweep asserts its own reach rather than trusting the seed: it counts the transitions its writes make (`btree_detail::Transition`) and requires each to happen in a write that an injected failure then ended (`sweep_partial_writes` in `tests/alloc_sweep_test.cpp`). A workload that stops reaching one fails the test instead of passing silently.
+- A new structural transition gets a `Transition` value and joins a sweep's required set.
+
 ### Model-based recovery tests
 
 The `[model]` test cases in `tests/bytecask_test.cpp` (random, batch-heavy, delete-heavy, range-delete, and many-frame-hint workloads, plus the vacuum tombstone model) are the primary soundness checks for the DB engine. They run thousands of random operations, close the DB, then reopen under serial and parallel recovery and verify that all key/values and per-file `file_stats` (live_bytes, total_bytes) match a serial baseline.
@@ -117,7 +125,7 @@ These four principles govern every design decision in the codebase, in priority 
 - Wrap checked narrowing conversions in a `narrow<To>(From)` helper that calls `std::in_range` and throws on overflow, rather than scattering `if (!std::in_range<T>) throw` / `static_cast` pairs at every call site.
 - Wrap ugly or unsafe low-level calls (e.g. `reinterpret_cast` through a legacy C-style API) in a small named function so the cast appears once and call sites stay readable (C++ Core Guidelines ES.50 / T.69).
 - Use `std::ssize` (C++20) instead of casting `.size()` to a signed type.
-- Prefer `std::filesystem` utilities over manual file-handle tricks (e.g. `std::filesystem::file_size`).
+- Prefer `std::filesystem` utilities over manual file-handle tricks (e.g. `std::filesystem::file_size`). The exception is listing a directory on a path that must survive a failed allocation: libstdc++'s `directory_iterator` allocates inside a `noexcept` function, so the failure ends the process (#598). Recovery uses `list_directory` (`data_file.cppm`) instead; `alloc sweep: open` and the `recovery_lists_with_directory_iterator` mutation hold it there.
 
 ### Safety through abstraction — compile-time first, runtime second
 
@@ -184,6 +192,15 @@ private:
 - Never store a `std::span` or `std::string_view` in a struct unless you can guarantee the owner outlives the struct, and document that guarantee explicitly.
 - If you see a `// WARNING:` comment excusing a lifetime hazard, treat it as a required design fix, not permanent documentation. Removing the hazard is always the goal.
 - When in doubt, return an owned value (`std::vector<std::byte>`, `std::string`). The borrow optimisation is only worth it when profiling identifies it as a real bottleneck.
+
+### Ownership through failure — prepare, commit, then release
+
+Every owning raw pointer (a key directory node, a buffer, a parcel) has exactly one owner at every instant, including while an exception unwinds. #580 freed a node that the root still reached; #588 found a bulk join that left leaves owned by two loaders. Each became a use-after-free when an allocation failed in that window.
+
+- A mutation of a structure that others can reach, or that its destructor walks, runs in three steps: **prepare** (every allocation, every call that can throw), **commit** (install the result and hand ownership over with operations that cannot throw), **release** (free what was replaced, once nothing reachable points to it). Freeing before the commit point, or allocating after it, is the bug class.
+- The structure enforces the order, not its callers: one commit function moves the root and frees what was replaced (`BuildSession::write`), and a commit step that must not throw is `noexcept` (`BulkLoader::adopt_runs`), so a throw there ends the process rather than leaving a pointer with two owners.
+- A mutation that fails partway and cannot be rolled back leaves the object refusing every use except destruction (`BuildSession::usable`). Never let a caller keep writing to half-changed state.
+- Moving ownership of a batch of pointers is one non-throwing step, or one pointer at a time with the source cleared as each moves. Never copy pointers to the new owner and clear the old owner afterwards, with a throwing call in between.
 
 ### Thread-local state
 

@@ -1,0 +1,22 @@
+Test builds no longer stamp a node freed into the pool, so a node freed
+twice is taken twice without a report where ASan is off. Caught where the
+node pool is on; the guard skips under ASan, which reports it itself.
+Guarded-by: "alloc sweep: a key directory node freed twice ends the test build"
+
+diff --git a/bytecaskdb/btree.cppm b/bytecaskdb/btree.cppm
+index 92b96c5..e27ac35 100644
+--- a/bytecaskdb/btree.cppm
++++ b/bytecaskdb/btree.cppm
+@@ -196,12 +196,6 @@ public:
+       if (s.free.size() < kMaxPooledNodes) {
+         try {
+           s.free.push_back(p);
+-#ifdef BYTECASK_TESTING
+-          // Only a node the pool keeps: its memory stays mapped, so a
+-          // later check reads bytes the pool holds. One freed to operator
+-          // delete is not stamped, and goes unchecked.
+-          std::memcpy(p, &kFreedStamp, sizeof kFreedStamp);
+-#endif
+           return;
+         } catch (...) {  // the list could not grow: free the node instead
+         }

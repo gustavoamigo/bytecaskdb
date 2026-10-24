@@ -16,6 +16,7 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <filesystem>
 #include <limits>
@@ -1835,6 +1836,43 @@ export void sync_directory(const std::filesystem::path &dir,
         std::format("sync_directory: fsync of '{}' failed", dir.string())};
   }
 #endif
+}
+
+// The paths of the entries in `dir`, `.` and `..` left out, in the order
+// the filesystem lists them. std::filesystem::directory_iterator allocates
+// each entry's path inside a noexcept function of libstdc++
+// (_Dir::advance), so an allocation that fails there ends the process, and
+// under GCC 15's runtime with a segmentation fault inside std::terminate
+// (#598). Here a failed allocation throws std::bad_alloc, and an error from
+// opendir or readdir std::system_error.
+export auto list_directory(const std::filesystem::path &dir)
+    -> std::vector<std::filesystem::path> {
+  auto *d = ::opendir(dir.c_str());
+  if (d == nullptr) {
+    throw std::system_error{
+        errno, std::generic_category(),
+        std::format("list_directory: cannot open '{}'", dir.string())};
+  }
+  struct Closer {
+    DIR *d;
+    ~Closer() { ::closedir(d); }
+  } closer{d};
+  std::vector<std::filesystem::path> paths;
+  for (;;) {
+    errno = 0;
+    const auto *entry = ::readdir(d);
+    if (entry == nullptr) {
+      if (errno != 0) {
+        throw std::system_error{
+            errno, std::generic_category(),
+            std::format("list_directory: cannot read '{}'", dir.string())};
+      }
+      return paths;
+    }
+    const std::string_view name{entry->d_name};
+    if (name != "." && name != "..")
+      paths.push_back(dir / name);
+  }
 }
 
 namespace {

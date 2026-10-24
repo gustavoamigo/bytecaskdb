@@ -35,6 +35,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <format>
@@ -43,6 +44,7 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -193,13 +195,54 @@ void expect_reopens(const std::filesystem::path &dir, const KeyValues &expected,
   }
 }
 
-// In the child: prints the stack std::terminate was called from, which still
-// holds the frame the allocation failed in.
-[[noreturn]] void print_stack_and_abort() {
+// How a sweep child ends when std::terminate is called, so the parent tells
+// it from an abort: whether the engine may end the process for want of
+// memory is not settled, but an assertion or a panic that aborts is a bug.
+constexpr int kTerminatedExitCode = 71;
+
+void print_stack() {
   std::array<void *, 64> frames{};
   const auto n = ::backtrace(frames.data(), static_cast<int>(frames.size()));
   ::backtrace_symbols_fd(frames.data(), n, STDERR_FILENO);
-  std::abort();
+}
+
+// The signals a child can die of. Catch2's handlers for them, installed
+// around each test case and inherited through fork, report the death as the
+// running test's failure and write the reporter's output from the child too:
+// with --out, a second report appended to the parent's file. A child goes
+// back to the handlers the process started with instead: a sanitizer's,
+// which still reports the error, or the default action.
+constexpr std::array kFatalSignals{SIGABRT, SIGSEGV, SIGBUS, SIGFPE, SIGILL};
+
+// Taken before main, so before Catch2 installs its own.
+struct StartupHandlers {
+  std::array<struct sigaction, kFatalSignals.size()> act{};
+  StartupHandlers() {
+    for (std::size_t i = 0; i < kFatalSignals.size(); ++i)
+      ::sigaction(kFatalSignals[i], nullptr, &act[i]);
+  }
+  void restore(int sig) const {
+    for (std::size_t i = 0; i < kFatalSignals.size(); ++i)
+      if (kFatalSignals[i] == sig)
+        ::sigaction(sig, &act[i], nullptr);
+  }
+};
+const StartupHandlers g_startup_handlers;
+
+// With BYTECASK_ALLOC_SWEEP_TRACE: a crash prints its stack first.
+void print_stack_and_reraise(int sig) {
+  print_stack();
+  g_startup_handlers.restore(sig);
+  std::raise(sig);
+}
+
+void startup_fatal_signals_in_child(bool trace) {
+  for (const auto sig : kFatalSignals) {
+    if (trace && sig != SIGABRT)
+      std::signal(sig, print_stack_and_reraise);
+    else
+      g_startup_handlers.restore(sig);
+  }
 }
 
 // What an operation does to the state, computed once in the parent so that a
@@ -341,9 +384,14 @@ struct Tally {
   std::vector<std::string> terminations;
 };
 
-// Forks a child for run n and classifies it. Returns whether the fault fired.
-auto run_case(const Operation &op, const Expected &x, const Pass &pass, long n,
-              Tally &tally) -> bool {
+// Forks a child that runs `child` on a fresh directory and classifies it;
+// `judge_dead` judges the directory a child that died left. Returns whether
+// the fault fired.
+auto run_forked(
+    const std::string &label,
+    const std::function<Outcome(const std::filesystem::path &)> &child,
+    const std::function<std::string(const std::filesystem::path &)> &judge_dead,
+    Tally &tally) -> bool {
   TempDir td;
   const auto dir = td.path / "db";
   std::array<int, 2> fds{};
@@ -353,17 +401,26 @@ auto run_case(const Operation &op, const Expected &x, const Pass &pass, long n,
   REQUIRE(pid != -1);
   if (pid == 0) {
     ::close(fds[0]);
-    // Catch2's handler would report the abort as this test's failure and
-    // print a summary from the child; the parent judges it instead.
-    std::signal(SIGABRT, SIG_DFL);
-    if (env_flag("BYTECASK_ALLOC_SWEEP_TRACE")) {
-      std::set_terminate(print_stack_and_abort);
-    } else if (const auto null = ::open("/dev/null", O_WRONLY); null != -1) {
+    const auto trace = env_flag("BYTECASK_ALLOC_SWEEP_TRACE");
+    startup_fatal_signals_in_child(trace);
+    if (trace) {
+      // The stack std::terminate was called from still holds the frame the
+      // allocation failed in.
+      std::set_terminate([] {
+        print_stack();
+        std::_Exit(kTerminatedExitCode);
+      });
+    } else {
+      std::set_terminate([] { std::_Exit(kTerminatedExitCode); });
+    }
+    if (!trace) {
+      if (const auto null = ::open("/dev/null", O_WRONLY); null != -1) {
       // The engine logs what it does about each failure (a hint the worker
       // could not write, …): thousands of lines a sweep, none a finding.
-      ::dup2(null, STDERR_FILENO);
+        ::dup2(null, STDERR_FILENO);
+      }
     }
-    const auto line = encode(run_in_child(op, pass, n, dir));
+    const auto line = encode(child(dir));
     (void)::write(fds[1], line.data(), line.size());
     ::_exit(0);
   }
@@ -398,17 +455,31 @@ auto run_case(const Operation &op, const Expected &x, const Pass &pass, long n,
   int status = 0;
   REQUIRE(::waitpid(pid, &status, 0) == pid);
 
-  const auto label = std::format("{} [{}] N = {}", op.name, pass.name, n);
   Outcome out;
   if (hung) {
     // A hang is never an acceptable outcome, whatever termination is.
     out = {.kind = "hung", .detail = {}, .fired = true};
     tally.failures.push_back(std::format(
         "{}: still running after {} s, killed", label, kRunSeconds));
-  } else if (WIFSIGNALED(status)) {
+  } else if (WIFEXITED(status) && WEXITSTATUS(status) == kTerminatedExitCode) {
     out = {.kind = "terminated", .detail = {}, .fired = true};
     tally.terminations.push_back(label);
-    if (const auto err = judge_terminated(op, x, dir); !err.empty())
+    if (const auto err = judge_dead(dir); !err.empty())
+      tally.failures.push_back(std::format("{}: {}", label, err));
+  } else if (WIFSIGNALED(status) ||
+             (WIFEXITED(status) &&
+              WEXITSTATUS(status) == bytecask::btree_detail::kFreedNodeExitCode)) {
+    // An abort that is not std::terminate (an assertion, a panic), a memory
+    // error, or a key directory node used after it was freed.
+    out = {.kind = "crashed", .detail = {}, .fired = true};
+    tally.failures.push_back(
+        WIFSIGNALED(status)
+            ? std::format("{}: the child was killed by {}", label,
+                          ::strsignal(WTERMSIG(status)))
+            : std::format("{}: the child used a key directory node after it "
+                          "was freed",
+                          label));
+    if (const auto err = judge_dead(dir); !err.empty())
       tally.failures.push_back(std::format("{}: {}", label, err));
   } else if (auto decoded = decode(got); decoded && WIFEXITED(status) &&
                                          WEXITSTATUS(status) == 0) {
@@ -427,8 +498,29 @@ auto run_case(const Operation &op, const Expected &x, const Pass &pass, long n,
   return out.fired;
 }
 
-void alloc_sweep(const Operation &op) {
-  const auto x = expected_of(op);
+// Run n of `op`'s sweep.
+auto run_case(const Operation &op, const Expected &x, const Pass &pass, long n,
+              Tally &tally) -> bool {
+  return run_forked(
+      std::format("{} [{}] N = {}", op.name, pass.name, n),
+      [&](const std::filesystem::path &dir) {
+        return run_in_child(op, pass, n, dir);
+      },
+      [&](const std::filesystem::path &dir) {
+        return judge_terminated(op, x, dir);
+      },
+      tally);
+}
+
+// Runs `run_n(pass, n, tally)` for n = 1, 2, … in each pass until a run
+// the fault never reached, and reports what the runs found.
+// `strict`: a termination fails the test, as with
+// BYTECASK_ALLOC_SWEEP_STRICT, for an operation whose contract says it ends
+// nothing.
+void sweep_passes(
+    const std::string &name,
+    const std::function<bool(const Pass &, long, Tally &)> &run_n,
+    bool strict = false) {
   const auto step = stride();
   Tally tally;
   const char *pass_filter = std::getenv("BYTECASK_ALLOC_SWEEP_PASS");
@@ -437,32 +529,39 @@ void alloc_sweep(const Operation &op) {
         std::string_view{pass_filter} != (pass.cascade ? "cascade" : "one"))
       continue;
     if (const auto only = only_n(); only > 0) {
-      (void)run_case(op, x, pass, only, tally);
+      (void)run_n(pass, only, tally);
       continue;
     }
     long n = 1;
-    while (run_case(op, x, pass, n, tally)) {
+    while (run_n(pass, n, tally)) {
       n += step;
       REQUIRE(n <= kMaxAllocations);
     }
     std::string summary;
     for (const auto &[kind, count] : tally.counts)
       summary += std::format("{}{} {}", summary.empty() ? "" : ", ", count, kind);
-    std::fprintf(stderr, "alloc sweep %s [%s]: %ld runs: %s\n", op.name.c_str(),
+    std::fprintf(stderr, "alloc sweep %s [%s]: %ld runs: %s\n", name.c_str(),
                  pass.name, (n - 1) / step + 1, summary.c_str());
     tally.counts.clear();
   }
   for (const auto &f : tally.failures) FAIL_CHECK(f);
   if (!tally.terminations.empty()) {
     const auto msg = std::format(
-        "{}: {} run(s) terminated the process, the first at {}", op.name,
+        "{}: {} run(s) terminated the process, the first at {}", name,
         tally.terminations.size(), tally.terminations.front());
-    if (env_flag("BYTECASK_ALLOC_SWEEP_STRICT")) {
+    if (strict || env_flag("BYTECASK_ALLOC_SWEEP_STRICT")) {
       FAIL_CHECK(msg);
     } else {
       WARN(msg);
     }
   }
+}
+
+void alloc_sweep(const Operation &op) {
+  const auto x = expected_of(op);
+  sweep_passes(op.name, [&](const Pass &pass, long n, Tally &tally) {
+    return run_case(op, x, pass, n, tally);
+  });
 }
 
 }  // namespace
@@ -536,6 +635,109 @@ TEST_CASE("alloc sweep: resume after a torn append", "[alloc_sweep]") {
   alloc_sweep(resume_torn_operation());
 }
 
+// Recovery under allocation failure. No other sweep opens a DB with a fault
+// armed, so nothing reached the parallel merge or the join of its ranges,
+// where a failed allocation once freed leaves twice (#588). The database
+// has several data files with their hints and enough keys that each range
+// parallel recovery merges spans several key directory leaves; the joins of
+// larger trees are swept in process above. Each run opens a copy with
+// allocation n failing, under serial and under parallel recovery: the open
+// throws std::bad_alloc, or it opens to every key, and either way the
+// directory then reopens, under serial and parallel recovery, to every key.
+// The contract says an open that cannot allocate ends nothing else, so a
+// termination fails the test here (CONTRACT.md, `open`).
+TEST_CASE("alloc sweep: open", "[alloc_sweep]") {
+  TempDir td;
+  const auto src = td.path / "src";
+  Options opts;
+  opts.max_file_bytes = 48 * 1024;
+  KeyValues expected;
+  {
+    auto db = open_db(src, opts);
+    for (int i = 0; i < 1'500; ++i)
+      db->put({.sync = false}, to_bytes(std::format("user:{:05}", i * 7 % 1'500)),
+              to_bytes(std::format("v{}", i)));
+    for (int i = 0; i < 1'500; i += 10)
+      (void)db->del({.sync = false}, to_bytes(std::format("user:{:05}", i)));
+    expected = key_values(*db);
+    db->close();
+  }
+  REQUIRE(std::ranges::count_if(
+              std::filesystem::directory_iterator{src}, [](const auto &e) {
+                return e.path().extension() == ".hint";
+              }) >= 2);
+  for (const unsigned threads : {1U, 4U}) {
+    auto o = opts;
+    o.recovery_threads = threads;
+    const auto name = std::format("open with {} recovery thread(s)", threads);
+    sweep_passes(name, [&](const Pass &pass, long n, Tally &tally) {
+      return run_forked(
+          std::format("{} [{}] N = {}", name, pass.name, n),
+          [&](const std::filesystem::path &dir) {
+            Outcome out;
+            try {
+              std::filesystem::copy(src, dir);
+              std::unique_ptr<DB> db;
+              std::exception_ptr thrown;  // looked at once memory is back
+              {
+                ScopedAllocFaults faults{n, pass.cascade};
+                try {
+                  db = open_db(dir, o);
+                } catch (...) {
+                  thrown = std::current_exception();
+                }
+                out.fired = faults.report().fired;
+              }
+              if (thrown) {
+                try {
+                  std::rethrow_exception(thrown);
+                } catch (const std::bad_alloc &) {
+                } catch (const std::exception &e) {
+                  throw CheckFailed{std::format(
+                      "open threw something other than std::bad_alloc: {}",
+                      e.what())};
+                } catch (...) {
+                  throw CheckFailed{"open threw something that is not a "
+                                    "std::exception"};
+                }
+              }
+              if (db) {
+                expect(key_values(*db) == expected,
+                       "opened to another state");
+                expect_consistent(*db, "opened under the fault");
+                db->close();
+                db.reset();
+                out.kind = "opened";
+              } else {
+                expect(out.fired, "the fault was not reached, yet open threw");
+                out.kind = "threw";
+              }
+              expect_reopens(dir, expected, o, "the reopen");
+            } catch (const CheckFailed &f) {
+              out = {.kind = "error", .detail = f.what, .fired = true};
+            } catch (const std::exception &e) {
+              out = {.kind = "error",
+                     .detail = std::format("a check threw: {}", e.what()),
+                     .fired = true};
+            }
+            return out;
+          },
+          [&](const std::filesystem::path &dir) -> std::string {
+            try {
+              expect_reopens(dir, expected, o, "after the process died");
+            } catch (const CheckFailed &f) {
+              return f.what;
+            } catch (const std::exception &e) {
+              return std::format("after the process died, the reopen threw: {}",
+                                 e.what());
+            }
+            return {};
+          },
+          tally);
+    }, /*strict=*/true);
+  }
+}
+
 
 // ---- The key directory under allocation failure -------------------------
 
@@ -566,14 +768,14 @@ auto deep_tree(KeyStore &res) -> Tree {
 
 }  // namespace
 
-// Runs fn in a forked child with stderr discarded; true if the child exited
-// normally, false if it was ended by a signal (std::terminate aborts).
-auto exits_cleanly_in_child(const std::function<void()> &fn) -> bool {
+// Runs fn in a forked child with stderr discarded; returns its exit status,
+// or 128 plus the signal that ended it (std::terminate aborts).
+auto child_exit_code(const std::function<void()> &fn) -> int {
   std::fflush(nullptr);
   const auto pid = ::fork();
   REQUIRE(pid != -1);
   if (pid == 0) {
-    std::signal(SIGABRT, SIG_DFL);
+    startup_fatal_signals_in_child(false);
     if (const auto null = ::open("/dev/null", O_WRONLY); null != -1)
       ::dup2(null, STDERR_FILENO);
     fn();
@@ -581,7 +783,11 @@ auto exits_cleanly_in_child(const std::function<void()> &fn) -> bool {
   }
   int status = 0;
   REQUIRE(::waitpid(pid, &status, 0) == pid);
-  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+  return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+}
+
+auto exits_cleanly_in_child(const std::function<void()> &fn) -> bool {
+  return child_exit_code(fn) == 0;
 }
 
 // A transient dropped without publishing frees the nodes it created, in a
@@ -607,28 +813,128 @@ TEST_CASE("alloc sweep: a transient tree is freed when nothing can be "
   }));
 }
 
+// Where the node pool is on, ASan is off: a node freed twice would be
+// handed out twice without a report. Test builds stamp a freed node and
+// abort on freeing or walking one, so a double free there ends the run.
+TEST_CASE("alloc sweep: a key directory node freed twice ends the test build",
+          "[alloc_sweep]") {
+  using N = bytecask::btree_detail::Node<std::uint64_t>;
+  using Traits = bytecask::btree_detail::ChainTraits<std::uint64_t>;
+  if constexpr (!bytecask::btree_detail::kNodePoolEnabled) {
+    SKIP("the pool is off: the sanitizer reports a double free itself");
+  } else {
+    CHECK(exits_cleanly_in_child([] {
+      auto *n = N::allocate(bytecask::kBTreeNodeBytes, true, 1, {});
+      N::destroy(n);
+    }));
+    // The stamp's own exit, not any other way of dying.
+    constexpr auto kFreed = bytecask::btree_detail::kFreedNodeExitCode;
+    CHECK(child_exit_code([] {
+            auto *n = N::allocate(bytecask::kBTreeNodeBytes, true, 1, {});
+            N::destroy(n);
+            N::destroy(n);
+          }) == kFreed);
+    CHECK(child_exit_code([] {
+            auto *n = N::allocate(bytecask::kBTreeNodeBytes, true, 1, {});
+            N::destroy(n);
+            (void)Traits::tag(n);
+          }) == kFreed);
+  }
+}
+
 // A write that fails partway leaves the transient's root on nodes that are
 // all alive, and dropping the transient frees each of them once. Each
-// allocation of a run of inserts into an empty tree is failed in turn, once
-// and from there on. Neighbouring keys share 103 bytes and a node's keys
-// far fewer, so separators are long and inner nodes few to a page: the run
-// splits its root leaf, then inner nodes and the inner root, and shrinks
-// inner prefixes, all on nodes it created. A split frees the node it
-// replaces; it used to do so before the root, or a rebuilt node's parent,
-// reached the replacement, and a failure in between left the root on a
-// freed node, which the drop walked and freed again (heap-use-after-free
-// under ASan). Under ASan the node pool is off, so every node allocation is
-// failed. Elsewhere the pool is emptied before each run, so the first
-// splits and the roots over them reach operator new and are counted; nodes
-// the run frees are reused from the pool uncounted (#583).
+// allocation of a workload is failed in turn, once and from there on. A
+// split, rebuild or collapse replaces a node; freeing it before the root, or
+// a rebuilt node's parent, reached the replacement left the root on a freed
+// node when an allocation in between failed, and the drop walked and freed
+// it again (heap-use-after-free under ASan, #580).
 //
-// `fresh()` makes an empty transient, `insert(tr, i)` writes the i-th key,
-// and `check(tr)` publishes a completed run and validates it.
+// Which writes a sweep reaches is decided by its workload, and the engine's
+// sweep once missed that bug because its seed never filled a leaf (#588).
+// So the workload's writes are counted by the structural transition they
+// make (btree_detail::Transition), and the sweep requires two things of it:
+// that a clean run makes every transition in `expected`, and, where every
+// node allocation is counted, that each of them was made by some write that
+// an allocation then failed. Under ASan the node pool is off, so every node
+// allocation is counted. Elsewhere the pool is emptied before each run, so
+// the first allocations of a run reach operator new, but nodes the run frees
+// are reused uncounted (#583) and the second check is skipped.
+//
+// The workload below starts from a published base, so its first writes copy
+// foreign nodes, then: inserts that split the root leaf, inner nodes and the
+// inner root and shrink inner prefixes on nodes the transient owns; erases
+// that leave nodes with dead bytes, and inserts that compact them; and
+// erases of everything it wrote. Those last empty leaves and inner nodes and
+// collapse the root, but on a path the transient already owns nothing
+// allocates after a node empties, so no failure can land there: the sweep
+// over a published tree, below, requires those. `fresh()` makes the
+// transient, `step(tr, i)` runs the i-th write, `check(tr)` publishes a
+// completed run and validates it.
 namespace {
 
-template <typename Fresh, typename Insert, typename Check>
-void sweep_partial_writes(int inserts, const Fresh &fresh,
-                          const Insert &insert, const Check &check) {
+using bytecask::btree_detail::Transition;
+using TransitionCounts =
+    std::array<std::uint64_t, bytecask::btree_detail::kTransitionCount>;
+
+auto transition_counts() noexcept -> TransitionCounts {
+  TransitionCounts c{};
+  for (std::size_t k = 0; k < c.size(); ++k)
+    c[k] = bytecask::btree_detail::transition_counts[k].load(
+        std::memory_order_relaxed);
+  return c;
+}
+
+// A switch, so a new Transition without a name does not compile.
+auto transition_name(Transition t) -> const char * {
+  switch (t) {
+  case Transition::kLeafSplit: return "leaf split";
+  case Transition::kInnerSplit: return "inner split";
+  case Transition::kRootGrowth: return "root growth";
+  case Transition::kPrefixRebuild: return "prefix rebuild";
+  case Transition::kCompaction: return "compaction";
+  case Transition::kLeafEmptied: return "leaf emptied";
+  case Transition::kInnerEmptied: return "inner emptied";
+  case Transition::kRootCollapse: return "root collapse";
+  case Transition::kRunJoin: return "join of sealed runs";
+  case Transition::kLevelBuild: return "inner level build";
+  case Transition::kCount: break;
+  }
+  return "?";
+}
+
+// Set by a Writes::kOnePerStep step once its write has installed its result,
+// before it publishes: a failure after that point is not in the window the
+// sweep is proving, between a node's replacement and the root's move.
+bool g_step_wrote = false;
+void step_wrote() noexcept { g_step_wrote = true; }
+
+// How a workload's writes reach the tree: all through one transient, which
+// must refuse the next write once one has failed, or each through a transient
+// of its own, derived from the version the last one published, as the
+// engine's batches are, and dropped by the step itself when it fails.
+enum class Writes { kOneTransient, kOnePerStep };
+
+template <typename Fresh, typename Step, typename Check>
+void sweep_partial_writes(Writes writes, int steps,
+                          std::initializer_list<Transition> expected,
+                          const Fresh &fresh, const Step &step,
+                          const Check &check) {
+  const bool one_transient = writes == Writes::kOneTransient;
+  {
+    auto tr = fresh();
+    const auto before = transition_counts();
+    for (int i = 0; i < steps; ++i)
+      step(tr, i);
+    const auto after = transition_counts();
+    check(tr);
+    for (const auto t : expected) {
+      INFO("transition: " << transition_name(t));
+      REQUIRE(after[static_cast<std::size_t>(t)] >
+              before[static_cast<std::size_t>(t)]);
+    }
+  }
+  std::array<bool, bytecask::btree_detail::kTransitionCount> failed_in{};
   for (const bool cascade : {false, true}) {
     for (long n = 1;; ++n) {
       REQUIRE(n <= kMaxAllocations);
@@ -638,11 +944,15 @@ void sweep_partial_writes(int inserts, const Fresh &fresh,
       bytecask::btree_detail::node_pool_trim();
       bool threw = false;
       bool fired = false;
+      TransitionCounts before{};
       {
         ScopedAllocFaults faults{n, cascade};
         try {
-          for (int i = 0; i < inserts; ++i)
-            insert(tr, i);
+          for (int i = 0; i < steps; ++i) {
+            before = transition_counts();
+            g_step_wrote = false;
+            step(tr, i);
+          }
         } catch (const std::bad_alloc &) {
           threw = true;
         }
@@ -650,18 +960,103 @@ void sweep_partial_writes(int inserts, const Fresh &fresh,
       }
       if (!fired) {
         check(tr);
-        CHECK_THROWS_AS(insert(tr, 0), std::logic_error);  // consumed
+        if (one_transient)
+          CHECK_THROWS_AS(step(tr, 0), std::logic_error);  // consumed
         break;
       }
-      if (threw)
-        CHECK_THROWS_AS(insert(tr, 0), std::logic_error);
+      if (threw && !g_step_wrote) {
+        // The transitions the failed write began: an allocation failed
+        // inside each, or after it before the write installed its result.
+        const auto after = transition_counts();
+        for (std::size_t k = 0; k < after.size(); ++k)
+          failed_in[k] = failed_in[k] || after[k] > before[k];
+      }
+      if (threw) {
+        if (one_transient)
+          CHECK_THROWS_AS(step(tr, 0), std::logic_error);
+      }
     }  // tr is dropped at the end of each run, after the failure
+  }
+  if constexpr (!bytecask::btree_detail::kNodePoolEnabled) {
+    for (const auto t : expected) {
+      INFO("transition: " << transition_name(t));
+      CHECK(failed_in[static_cast<std::size_t>(t)]);
+    }
   }
 }
 
-auto partial_write_key(int i, int inserts) -> std::string {
-  const auto j = i * 7 % inserts;
-  return std::format("{:03}{}{:03}", j % 40, std::string(100, 'q'), j / 40);
+struct PartialWrite {
+  bool erase{false};
+  std::string key;
+};
+
+// Keys of the workload above. A long ascending family fills leaves in order
+// and splits the root and inner nodes into halves of that family alone, so
+// their prefixes are long; keys that sort before it then reach those nodes
+// with separators that share less, and shrink them. Neighbouring keys of the
+// second set share 103 bytes and a node's keys far fewer, so its separators
+// are long and inner nodes few to a page. Erasing every other key of a
+// stretch leaves its leaves with dead bytes, and erasing a run empties
+// leaves and leaves their parents with dead bytes; writing keys back into
+// both compacts them. Then every key the workload wrote is erased, in key
+// order.
+auto partial_write_workload() -> std::vector<PartialWrite> {
+  constexpr int kFamily = 1'000;
+  constexpr int kMixed = 1'000;
+  const std::string q(100, 'q');
+  std::vector<std::string> keys;
+  for (int i = 0; i < kFamily; ++i)
+    keys.push_back(std::format("5{}{:04}", q, i));
+  for (int i = 0; i < kMixed; ++i) {
+    const auto j = i * 7 % kMixed;
+    keys.push_back(std::format("{:03}{}{:03}", j % 40, q, j / 40));
+  }
+  std::vector<PartialWrite> w;
+  std::set<std::string> live;
+  auto put = [&](const std::string &k) {
+    w.push_back({false, k});
+    live.insert(k);
+  };
+  auto erase = [&](const std::string &k) {
+    w.push_back({true, k});
+    live.erase(k);
+  };
+  for (const auto &k : keys)
+    put(k);
+  auto sorted = keys;
+  std::ranges::sort(sorted);
+  // sorted[0, 1000) is the second set, sorted[1000, 2000) the family.
+  for (std::size_t i = 1'001; i < 1'600; i += 2)
+    erase(sorted[i]);
+  for (std::size_t i = 300; i < 600; ++i)
+    erase(sorted[i]);
+  for (std::size_t i = 1'001; i < 1'600; i += 2)
+    put(sorted[i]);
+  for (std::size_t i = 300; i < 600; ++i)
+    put(sorted[i] + "r");
+  for (const auto &k : std::vector<std::string>{live.begin(), live.end()})
+    erase(k);
+  return w;
+}
+
+// What the base holds: keys that sort after the workload's, so the erases
+// never empty the tree.
+auto partial_write_base_key(int i) -> std::string {
+  return std::format("z{:04}", i);
+}
+constexpr int kPartialWriteBase = 200;
+
+auto partial_write_size(const std::vector<PartialWrite> &w) -> std::size_t {
+  std::set<std::string> live;
+  for (int i = 0; i < kPartialWriteBase; ++i)
+    live.insert(partial_write_base_key(i));
+  for (const auto &op : w) {
+    if (op.erase)
+      live.erase(op.key);
+    else
+      live.insert(op.key);
+  }
+  return live.size();
 }
 
 }  // namespace
@@ -670,28 +1065,39 @@ TEST_CASE("alloc sweep: a transient whose write fails partway is freed once",
           "[alloc_sweep]") {
   // A node a failed write had not yet placed is leaked (#390).
   const ExpectedLeaks leaks;
-  constexpr int kInserts = 1'000;
+  const auto work = partial_write_workload();
   KeyStore res;
-  struct Insert {
-    std::string key;
-    bytecask::BlindRef ref;
-  };
-  std::vector<Insert> run;
-  for (int i = 0; i < kInserts; ++i) {
-    auto k = partial_write_key(i, kInserts);
-    const auto ref = res.ref(k);
-    run.push_back({std::move(k), ref});
+  Tree base;
+  {
+    auto tr = base.transient();
+    for (int i = 0; i < kPartialWriteBase; ++i) {
+      const auto k = partial_write_base_key(i);
+      tr.set(to_bytes(k), res.ref(k), res);
+    }
+    base = std::move(tr).persistent();
   }
+  std::vector<bytecask::BlindRef> refs;
+  for (const auto &op : work)
+    refs.push_back(op.erase ? bytecask::BlindRef{} : res.ref(op.key));
   sweep_partial_writes(
-      kInserts, [] { return Tree{}.transient(); },
+      Writes::kOneTransient, static_cast<int>(work.size()),
+      // A blind leaf is an array, never compacted, and holds no prefix: both
+      // happen to inner nodes only, in the BuildSession::place() the keyed
+      // sweep below reaches for compaction too.
+      {Transition::kLeafSplit, Transition::kInnerSplit, Transition::kRootGrowth,
+       Transition::kPrefixRebuild},
+      [&] { return base.transient(); },
       [&](auto &tr, int i) {
-        const auto &ins = run[static_cast<std::size_t>(i)];
-        tr.set(to_bytes(ins.key), ins.ref, res);
+        const auto u = static_cast<std::size_t>(i);
+        if (work[u].erase)
+          (void)tr.erase(to_bytes(work[u].key), res);
+        else
+          tr.set(to_bytes(work[u].key), refs[u], res);
       },
       [&](auto &tr) {
         const auto t = std::move(tr).persistent();
         (void)t.validate(res);
-        CHECK(t.size() == kInserts);
+        CHECK(t.size() == partial_write_size(work));
       });
 }
 
@@ -701,22 +1107,279 @@ TEST_CASE("alloc sweep: a keyed transient whose write fails partway is freed "
           "once",
           "[alloc_sweep]") {
   const ExpectedLeaks leaks;
-  constexpr int kInserts = 1'000;
-  std::vector<std::string> keys;
-  for (int i = 0; i < kInserts; ++i)
-    keys.push_back(partial_write_key(i, kInserts));
+  const auto work = partial_write_workload();
   using KeyedTree = bytecask::PersistentBTree<std::uint64_t>;
+  KeyedTree base;
+  for (int i = 0; i < kPartialWriteBase; ++i)
+    base = base.set(to_bytes(partial_write_base_key(i)),
+                    static_cast<std::uint64_t>(i));
   sweep_partial_writes(
-      kInserts, [] { return KeyedTree{}.transient(); },
+      Writes::kOneTransient, static_cast<int>(work.size()),
+      {Transition::kLeafSplit, Transition::kInnerSplit, Transition::kRootGrowth,
+       Transition::kPrefixRebuild, Transition::kCompaction},
+      [&] { return base.transient(); },
       [&](auto &tr, int i) {
-        tr.set(to_bytes(keys[static_cast<std::size_t>(i)]),
-               static_cast<std::uint64_t>(i));
+        const auto u = static_cast<std::size_t>(i);
+        if (work[u].erase)
+          (void)tr.erase(to_bytes(work[u].key));
+        else
+          tr.set(to_bytes(work[u].key), static_cast<std::uint64_t>(i));
       },
       [&](auto &tr) {
         const auto t = std::move(tr).persistent();
         (void)t.validate();
-        CHECK(t.size() == kInserts);
+        CHECK(t.size() == partial_write_size(work));
       });
+}
+
+// Erases that empty leaves and inner nodes and collapse the root, each in a
+// transient of its own over the version the last one published, as the
+// engine's batches are. Within one transient nothing on an erase's path
+// allocates once the path is owned, so the sweeps above never fail an
+// allocation in the write that empties a node; here every erase copies a
+// foreign path, retires what it replaces and publishes, and each of those
+// allocations is failed after the node emptied. Separators are long, so
+// inner nodes are few to a page and the base has two levels above its
+// leaves: for the keyed tree, neighbouring keys that share 103 bytes; for
+// the blind tree, whose leaves hold far more, more keys of one family
+// written in order, which split its root into two halves of their own. The
+// base keeps one key in 25 of them, a few to each leaf, so the sweep's
+// erases are the ones that empty nodes.
+TEST_CASE("alloc sweep: an erase from a published tree that fails partway "
+          "frees each node once",
+          "[alloc_sweep]") {
+  const ExpectedLeaks leaks;
+  const std::string q(100, 'q');
+  std::vector<std::string> keys;
+  // The tree keeps its last key, so the last erases collapse the root onto
+  // it. Keys are erased in order.
+  std::vector<std::string> kept;
+  auto keep = [&](const std::vector<std::string> &sorted) {
+    for (std::size_t i = 0; i < sorted.size(); i += 25)
+      kept.push_back(sorted[i]);
+  };
+  auto thinned = [&](const std::string &k) {
+    return !std::ranges::binary_search(kept, k);
+  };
+  const std::initializer_list<Transition> emptied{Transition::kLeafEmptied,
+                                                  Transition::kInnerEmptied,
+                                                  Transition::kRootCollapse};
+  SECTION("blind") {
+    for (int i = 0; i < 1'000; ++i)
+      keys.push_back(std::format("5{}{:04}", q, i));
+    keep(keys);
+    KeyStore res;
+    Tree base;
+    {
+      auto tr = base.transient();
+      for (const auto &k : keys)
+        tr.set(to_bytes(k), res.ref(k), res);
+      base = std::move(tr).persistent();
+      tr = base.transient();
+      for (const auto &k : keys)
+        if (thinned(k))
+          (void)tr.erase(to_bytes(k), res);
+      base = std::move(tr).persistent();
+    }
+    sweep_partial_writes(
+        Writes::kOnePerStep, static_cast<int>(kept.size()) - 1, emptied,
+        [&] { return base; },
+        [&](Tree &t, int i) {
+          auto tr = t.transient();
+          (void)tr.erase(to_bytes(kept[static_cast<std::size_t>(i)]), res);
+          step_wrote();
+          t = std::move(tr).persistent();
+        },
+        [&](Tree &t) {
+          (void)t.validate(res);
+          CHECK(t.size() == 1);
+        });
+  }
+  SECTION("keyed") {
+    for (int i = 0; i < 600; ++i) {
+      const auto j = i * 7 % 600;
+      keys.push_back(std::format("{:03}{}{:03}", j % 40, q, j / 40));
+    }
+    auto sorted = keys;
+    std::ranges::sort(sorted);
+    keep(sorted);
+    using KeyedTree = bytecask::PersistentBTree<std::uint64_t>;
+    KeyedTree base;
+    {
+      auto tr = base.transient();
+      for (const auto &k : keys)
+        tr.set(to_bytes(k), 1);
+      base = std::move(tr).persistent();
+      tr = base.transient();
+      for (const auto &k : keys)
+        if (thinned(k))
+          (void)tr.erase(to_bytes(k));
+      base = std::move(tr).persistent();
+    }
+    sweep_partial_writes(
+        Writes::kOnePerStep, static_cast<int>(kept.size()) - 1, emptied,
+        [&] { return base; },
+        [&](KeyedTree &t, int i) {
+          auto tr = t.transient();
+          (void)tr.erase(to_bytes(kept[static_cast<std::size_t>(i)]));
+          step_wrote();
+          t = std::move(tr).persistent();
+        },
+        [&](KeyedTree &t) {
+          (void)t.validate();
+          CHECK(t.size() == 1);
+        });
+  }
+}
+
+// A bulk build that fails partway frees each node it made once: the leaves
+// a loader sealed, the inner levels built over them, and the leaves a run
+// hands to the loader that joins the runs. concat used to add a run's leaves
+// to the joining loader while the run still owned them, so an allocation
+// failing partway freed each leaf already moved twice, once by each
+// (heap-use-after-free under ASan, #588). Parallel recovery joins its
+// partitions this way. `build(stage)` makes four runs over ascending
+// quarters of the keys, joins them, then builds the same keys with one
+// loader's finish(), and returns both trees' sizes and the lower of their
+// heights; it runs each of those three through `stage`. As in the tree
+// sweeps, the sweep requires the clean run to join runs and build inner
+// levels (Transition::kRunJoin, kLevelBuild), and, under ASan, each to be
+// begun by a stage that a failed allocation then ended. Neighbouring keys
+// share 103 bytes, a node's keys far fewer, so separators are long, inner
+// nodes few to a page, and both trees three levels deep from 1,200 keys.
+namespace {
+
+struct BulkBuilt {
+  std::size_t size{0};
+  std::size_t height{0};
+};
+
+template <typename Build>
+void sweep_bulk_build(std::size_t keys, const Build &build) {
+  constexpr std::array kExpected{Transition::kRunJoin, Transition::kLevelBuild};
+  TransitionCounts stage_before{};
+  auto stage = [&stage_before](auto &&fn) {
+    stage_before = transition_counts();
+    return fn();
+  };
+  {
+    const auto before = transition_counts();
+    (void)build(stage);
+    const auto after = transition_counts();
+    for (const auto t : kExpected) {
+      INFO("transition: " << transition_name(t));
+      REQUIRE(after[static_cast<std::size_t>(t)] >
+              before[static_cast<std::size_t>(t)]);
+    }
+  }
+  std::array<bool, bytecask::btree_detail::kTransitionCount> failed_in{};
+  for (const bool cascade : {false, true}) {
+    for (long n = 1;; ++n) {
+      REQUIRE(n <= kMaxAllocations);
+      INFO("allocation " << n << (cascade ? " and every one after it" : "")
+                         << " failed");
+      bytecask::btree_detail::node_pool_trim();
+      BulkBuilt built;
+      bool fired = false;
+      {
+        ScopedAllocFaults faults{n, cascade};
+        try {
+          built = build(stage);
+        } catch (const std::bad_alloc &) {
+          const auto after = transition_counts();
+          for (std::size_t k = 0; k < after.size(); ++k)
+            failed_in[k] = failed_in[k] || after[k] > stage_before[k];
+        }
+        fired = faults.report().fired;
+      }
+      if (!fired) {
+        CHECK(built.size == 2 * keys);
+        CHECK(built.height >= 3);
+        break;
+      }
+    }
+  }
+  if constexpr (!bytecask::btree_detail::kNodePoolEnabled) {
+    for (const auto t : kExpected) {
+      INFO("transition: " << transition_name(t));
+      CHECK(failed_in[static_cast<std::size_t>(t)]);
+    }
+  }
+}
+
+// n keys in ascending order, in families of `family` that share 103 bytes.
+auto bulk_keys(std::size_t n, std::size_t family) -> std::vector<std::string> {
+  std::vector<std::string> keys;
+  for (std::size_t i = 0; i < n; ++i)
+    keys.push_back(std::format("{:03}{}{:03}", i / family,
+                               std::string(100, 'q'), i % family));
+  return keys;
+}
+
+}  // namespace
+
+TEST_CASE("alloc sweep: a bulk build that fails partway frees each node once",
+          "[alloc_sweep]") {
+  SECTION("blind") {
+    const auto keys = bulk_keys(1'200, 25);
+    const auto quarter = keys.size() / 4;
+    using Loader = bytecask::BlindBulkLoader<bytecask::kBlindLeafBytes>;
+    KeyStore res;
+    std::vector<bytecask::BlindRef> refs;
+    for (const auto &k : keys)
+      refs.push_back(res.ref(k));
+    sweep_bulk_build(keys.size(), [&](auto &stage) {
+      auto runs = stage([&] {
+        std::vector<bytecask::btree_detail::LeafRun<bytecask::BlindRef>> rs;
+        for (std::size_t r = 0; r < 4; ++r) {
+          Loader l;
+          for (std::size_t i = r * quarter; i < (r + 1) * quarter; ++i)
+            l.append(to_bytes(keys[i]), refs[i]);
+          rs.push_back(std::move(l).seal());
+        }
+        return rs;
+      });
+      const auto joined =
+          stage([&] { return Loader::concat(std::move(runs)); });
+      const auto t = stage([&] {
+        Loader whole;
+        for (std::size_t i = 0; i < keys.size(); ++i)
+          whole.append(to_bytes(keys[i]), refs[i]);
+        return std::move(whole).finish();
+      });
+      return BulkBuilt{joined.size() + t.size(),
+                       std::min(joined.validate(res), t.validate(res))};
+    });
+  }
+  SECTION("keyed") {
+    // A keyed leaf shares its keys' prefix, so it ends where a family does;
+    // a family of two leaves leaves a long separator inside it.
+    const auto keys = bulk_keys(1'200, 60);
+    const auto quarter = keys.size() / 4;
+    using Loader = bytecask::btree_detail::BulkLoader<std::uint64_t>;
+    sweep_bulk_build(keys.size(), [&](auto &stage) {
+      auto runs = stage([&] {
+        std::vector<bytecask::btree_detail::LeafRun<std::uint64_t>> rs;
+        for (std::size_t r = 0; r < 4; ++r) {
+          Loader l;
+          for (std::size_t i = r * quarter; i < (r + 1) * quarter; ++i)
+            l.append(to_bytes(keys[i]), i);
+          rs.push_back(std::move(l).seal());
+        }
+        return rs;
+      });
+      const auto joined =
+          stage([&] { return Loader::concat(std::move(runs)); });
+      const auto t = stage([&] {
+        Loader whole;
+        for (std::size_t i = 0; i < keys.size(); ++i)
+          whole.append(to_bytes(keys[i]), i);
+        return std::move(whole).finish();
+      });
+      return BulkBuilt{joined.size() + t.size(),
+                       std::min(joined.validate(), t.validate())};
+    });
+  }
 }
 
 // A version whose publication fails leaves its base as it was, so the base

@@ -1,0 +1,17 @@
+build_parent no longer records which of a level's children an inner node
+of the next level has adopted: a failure partway frees those children twice,
+once under their parent and once from the level. Caught under ASan.
+Guarded-by: "alloc sweep: a bulk build that fails partway frees each node once"
+
+diff --git a/bytecaskdb/btree.cppm b/bytecaskdb/btree.cppm
+index 81244aa..83607ba 100644
+--- a/bytecaskdb/btree.cppm
++++ b/bytecaskdb/btree.cppm
+@@ -1709,7 +1709,6 @@ protected:
+       auto &from = levels_[lvl];
+       adopt_child(lvl + 1, inner,
+                   i == 0 ? std::vector<std::byte>{} : std::move(from.seps[i - 1]));
+-      from.adopted = j;
+       i = j;
+     }
+     levels_[lvl] = Level{};
