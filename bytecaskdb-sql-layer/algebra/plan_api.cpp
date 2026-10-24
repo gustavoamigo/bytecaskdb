@@ -67,8 +67,10 @@ using bytecask::sql::has_prefix;
 using bytecask::sql::Datum;
 using bytecask::sql::Index;
 using bytecask::sql::kCursorEntryBytes;
+using bytecask::sql::kAggBytes;
 using bytecask::sql::kAggSlotBytes;
 using bytecask::sql::kGroupEntryBytes;
+using bytecask::sql::kHashBytes;
 using bytecask::sql::kHashEntryBytes;
 using bytecask::sql::kHashIterEntryBytes;
 using bytecask::sql::kKeyEntryBytes;
@@ -78,6 +80,7 @@ using bytecask::sql::KeyReader;
 using bytecask::sql::LiveCatalog;
 using bytecask::sql::kRowEntryBytes;
 using bytecask::sql::kSortEntryBytes;
+using bytecask::sql::kSorterBytes;
 using bytecask::sql::kViewEntryBytes;
 using bytecask::sql::PhysType;
 using bytecask::sql::RowLayout;
@@ -530,6 +533,7 @@ struct Sorter {
   bool sorted{false};
   std::size_t next{0};
   std::uint32_t scope{kNoStep};  // its loop's step in steps, while bc_sorter_next is on an entry
+  bc_view nth{};                 // the last bc_sorter_nth's view, whose slot the next one takes
 };
 
 constexpr std::uint32_t kNoEntry = UINT32_MAX;
@@ -584,7 +588,9 @@ struct Slot {
 // The fixed charges cover the entries they stand for. A group is a map node
 // (its links and colour, its key and slot, its block) and its key's own
 // block, both with the allocator's header, and its place in the order. A
-// sorter entry is its slot, at twice its vector's size, and its block's
+// group's slot, a sorter and a hash table are each their place in a vector,
+// at twice its size, as an aggregate is (below bc_ctx). A sorter entry is
+// its slot, at twice its vector's size, and its block's
 // header. A hash table entry is its slot likewise, and its payload block's
 // header, with a key's node (its link and cached hash, its key and chain,
 // its block), its key's block and its bucket, at twice the node count.
@@ -595,7 +601,9 @@ static_assert(sizeof(Cursor) <= kCursorEntryBytes);
 static_assert(4 * sizeof(void*) + sizeof(std::pair<const Bytes, std::uint32_t>) + 2 * kAllocBytes +
                   sizeof(const Bytes*) <=
               kGroupEntryBytes);
-static_assert(sizeof(Slot) <= kAggSlotBytes);
+static_assert(2 * sizeof(Slot) <= kAggSlotBytes);
+static_assert(2 * sizeof(Sorter) <= kSorterBytes);
+static_assert(2 * sizeof(Hash) <= kHashBytes);
 static_assert(2 * sizeof(SortEntry) + kAllocBytes <= kSortEntryBytes);
 static_assert(2 * sizeof(HashEntry) + kAllocBytes + 2 * sizeof(void*) + sizeof(std::pair<const Bytes, Chain>) +
                   2 * kAllocBytes + 2 * sizeof(void*) <=
@@ -1004,6 +1012,18 @@ struct bc_ctx {
       return {};
     }
     return {static_cast<std::uint32_t>(views.size() - 1), gen};
+  }
+
+  // Points the view `v` names, if it is still live, at other bytes under a
+  // new generation, so its old handle goes stale and its slot and charge
+  // are reused; otherwise makes a new view. Either way `v` names the result.
+  auto remake_view(bc_view& v, BytesView b, std::uint32_t table, RowKind kind) -> bc_view {
+    if (find_view(v) == nullptr) return v = make_view(b.data(), b.size(), kNoCursor, 0, table, kind);
+    if (key_parts.view.i == v.i && key_parts.view.g == v.g) key_parts.view = {};
+    auto gen = next_gen();
+    views[v.i] = ViewEntry{b.data(), 0, gen, static_cast<std::uint32_t>(b.size()), kNoCursor, table, kind};
+    v.g = gen;
+    return v;
   }
 
   // A copy the current step owns, as a view.
@@ -3625,8 +3645,9 @@ bc_sorter bc_sorter_open(bc_ctx* cx, int64_t keep) {
     cx->fail(BC_E_HANDLE, "a sorter keeps a negative number of entries");
     return {};
   }
+  if (!cx->take(kSorterBytes)) return {};
   auto gen = cx->next_gen();
-  cx->sorters.push_back({gen, static_cast<std::uint64_t>(keep), {}, 0, false, 0, kNoStep});
+  cx->sorters.push_back({gen, static_cast<std::uint64_t>(keep), {}, 0, false, 0, kNoStep, {}});
   return {static_cast<std::uint32_t>(cx->sorters.size() - 1), gen};
   BC_GUARD_END(cx)
   return {};
@@ -3644,10 +3665,8 @@ void bc_sorter_add(bc_ctx* cx, bc_sorter h, bc_view sort_key, bc_view payload) {
   auto p = resolve_held(cx, payload);
   if (!key || !p) return;
   SortEntry e{{}, s->added, 0, p->second};
-  if (key->size() > std::numeric_limits<std::uint32_t>::max()) {
-    cx->fail(BC_E_LIMIT, "a sort key over 4 GiB");
-    return;
-  }
+  // A view's length, and so a sort key's, fits key_len.
+  static_assert(std::is_same_v<decltype(ViewEntry::len), decltype(SortEntry::key_len)>);
   e.key_len = static_cast<std::uint32_t>(key->size());
   auto bytes = key->size() + p->first.size();
   auto full = s->keep != 0 && s->entries.size() == s->keep;
@@ -3683,7 +3702,7 @@ int64_t bc_sorter_count(bc_ctx* cx, bc_sorter h) {
   BC_GUARD_BEGIN
   const auto* s = sorter(cx, h);
   if (s == nullptr) return 0;
-  return static_cast<std::int64_t>(s->entries.size());
+  return std::ssize(s->entries);
   BC_GUARD_END(cx)
   return {};
 }
@@ -3698,7 +3717,9 @@ bc_view bc_sorter_nth(bc_ctx* cx, bc_sorter h, int64_t n) {
   }
   sort_once(*s);
   const auto& e = s->entries[static_cast<std::size_t>(n)];
-  return held_view(cx, e.payload(), e.held);
+  // The view lives until the next bc_sorter_nth on this sorter, which takes
+  // its slot: a loop over nth holds one view, not one per call.
+  return cx->remake_view(s->nth, e.payload(), e.held.table, e.held.kind);
   BC_GUARD_END(cx)
   return {};
 }
@@ -3723,6 +3744,7 @@ bool bc_sorter_next(bc_ctx* cx, bc_sorter h, bc_view* payload) {
 bc_hash bc_hash_open(bc_ctx* cx) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return {};
+  if (!cx->take(kHashBytes)) return {};
   auto gen = cx->next_gen();
   cx->hashes.push_back({gen, {}, {}});
   return {static_cast<std::uint32_t>(cx->hashes.size() - 1), gen};
@@ -3795,13 +3817,16 @@ bool bc_hash_next(bc_ctx* cx, bc_hash_iter h, bc_view* payload) {
   return {};
 }
 
+static_assert(2 * sizeof(bc_ctx::Agg) <= kAggBytes);
+
 // A group's handle names its index in the aggregate, with the aggregate's
-// generation. A new group charges its key's bytes, kGroupEntryBytes, the
+// generation. Opening one charges kAggBytes and its slots' kinds; a new
+// group charges its key's bytes, kGroupEntryBytes, the
 // aggregate's own node, and kAggSlotBytes per slot to the statement's
 // memory budget.
 bc_agg bc_agg_open(bc_ctx* cx, uint32_t slots) {
   BC_GUARD_BEGIN
-  if (!cx->ok()) return {};
+  if (!cx->take(kAggBytes + std::uint64_t{slots} * sizeof(SlotKind))) return {};
   bc_ctx::Agg a;
   a.gen = cx->next_gen();
   a.slots = slots;
@@ -3875,8 +3900,8 @@ auto fold_slot(bc_ctx* cx, bc_group g, std::uint32_t slot, SlotKind kind) -> Slo
 }
 
 // The slot a read goes to, with its kind; nullptr and BC_E_HANDLE for a
-// slot out of range, or of the other type than the read's.
-auto read_slot(bc_ctx* cx, bc_group g, std::uint32_t slot, bool f64) -> const Slot* {
+// slot out of range, or, given `f64`, of the other type than the read's.
+auto read_slot(bc_ctx* cx, bc_group g, std::uint32_t slot, std::optional<bool> f64) -> const Slot* {
   auto* agg = group_agg(cx, g);
   if (agg == nullptr) return nullptr;
   if (slot >= agg->slots) {
@@ -3884,9 +3909,9 @@ auto read_slot(bc_ctx* cx, bc_group g, std::uint32_t slot, bool f64) -> const Sl
     return nullptr;
   }
   auto k = agg->kinds[slot];
-  if (k != SlotKind::None && (k == SlotKind::SumF64) != f64) {
+  if (f64 && k != SlotKind::None && (k == SlotKind::SumF64) != *f64) {
     cx->fail(BC_E_HANDLE, std::string{"slot "} + std::to_string(slot) + " is " + slot_kind_name(k) + ", read as " +
-                              (f64 ? "a double" : "an integer"));
+                              (*f64 ? "a double" : "an integer"));
     return nullptr;
   }
   return &agg->values[std::size_t{g.i} * agg->slots + slot];
@@ -3977,6 +4002,14 @@ double bc_agg_f64(bc_ctx* cx, bc_group g, uint32_t slot) {
   BC_GUARD_BEGIN
   const auto* s = read_slot(cx, g, slot, true);
   return s == nullptr ? 0 : s->f;
+  BC_GUARD_END(cx)
+  return {};
+}
+// PostgreSQL's NULL for SUM, MIN, MAX or AVG of a group no value reached.
+bool bc_agg_null(bc_ctx* cx, bc_group g, uint32_t slot) {
+  BC_GUARD_BEGIN
+  const auto* s = read_slot(cx, g, slot, std::nullopt);
+  return s != nullptr && !s->set;
   BC_GUARD_END(cx)
   return {};
 }

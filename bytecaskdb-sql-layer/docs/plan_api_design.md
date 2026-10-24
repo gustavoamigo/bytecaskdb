@@ -1,7 +1,8 @@
 # Plan API: a physical algebra for generated plans
 
 Status: **built**, revision 8 (revision 7 with the sorters, the hash
-tables and the aggregates' slots built, and `bc_sorter_open`'s `keep`;
+tables and the aggregates' slots built, `bc_sorter_open`'s `keep`, and
+`bc_agg_null`;
 revision 7 added the lifetime rule of a loop's storage, `planner_design.md`,
 *Memory*, 64-bit handle generations, and the write set bounded as it
 grows). This specifies the plan API of `bytecaskdb-sql-layer`: the calls a
@@ -193,6 +194,8 @@ contract every plan is written to:
   A view of a structure's contents (`bc_sorter_next`'s, `bc_sorter_nth`'s,
   `bc_hash_next`'s, `bc_agg_next`'s group key) is a handle like any other:
   it reads the structure's copy, and goes with the step it was made in.
+  A sorter's `bc_sorter_nth` view also goes at the next `bc_sorter_nth` on
+  that sorter, which takes its slot, so a loop over `nth` holds one view.
 - All of it goes when the loop steps again, reaches its end, or its cursor
   closes. Loops nest: an outer loop's step also ends every step inside it.
   So a key built for one probe, an inner row and a group key all go when
@@ -240,6 +243,9 @@ when its step ends or the context is reset:
   cursor or a hash table probe, a fixed amount per handle:
   `kViewEntryBytes`, `kKeyEntryBytes`, `kRowEntryBytes`, `kCursorEntryBytes`
   and `kHashIterEntryBytes` (`algebra/runtime.cppm`);
+- each sorter, hash table and aggregate opened, `kSorterBytes`,
+  `kHashBytes` or `kAggBytes`, and an aggregate a byte per slot for its
+  slots' kinds;
 - each aggregate group's key, `kGroupEntryBytes` for the aggregate's own
   node, and `kAggSlotBytes` per slot;
 - each sorter entry's sort key and payload, and `kSortEntryBytes` for its
@@ -715,8 +721,9 @@ budget: past it, `BC_E_LIMIT` (SQLSTATE 54000), never a spill. Their
 contents outlive the steps that added them and live until reset. Iterating
 one is a loop, whose steps own what they allocate (*Memory*): a view
 `bc_sorter_next` or `bc_hash_next` returns lives until that loop's next
-step, and one `bc_sorter_nth` returns is the step it was made in, like any
-view. Iteration order is deterministic: insertion order for hash tables,
+step, and one `bc_sorter_nth` returns lives until the next
+`bc_sorter_nth` on that sorter, or until the step it was made in ends.
+Iteration order is deterministic: insertion order for hash tables,
 first-appearance order for aggregate groups, sort order for sorters.
 
 ```c
@@ -741,22 +748,24 @@ void      bc_agg_count(bc_ctx *, bc_group, uint32_t slot);
 bool      bc_agg_next(bc_ctx *, bc_agg, bc_view *group_key, bc_group *g);
 int64_t   bc_agg_i64(bc_ctx *, bc_group, uint32_t slot);
 double    bc_agg_f64(bc_ctx *, bc_group, uint32_t slot);
+bool      bc_agg_null(bc_ctx *, bc_group, uint32_t slot);
 ```
 
 | Function | What it does |
 |---|---|
 | `bc_sorter_open` | A sorter for `ORDER BY` the plan cannot get from an index. With `keep` n above 0 it holds at most the first n entries in sort order: `ORDER BY … LIMIT n` (with `OFFSET m`, `keep` is n + m), held in n entries whatever the input. An entry that sorts after the last of n held is neither copied nor charged; one before it takes the last one's place. `keep` 0 holds every entry, so `LIMIT 0` is the plan's to answer without a sorter; a negative `keep` is `BC_E_HANDLE`. |
-| `bc_sorter_add` | Adds a row with its sort key. Entries are ordered by the sort key's bytes, `memcmp` order, so the plan builds the key in the key codec's encoding with the direction and NULL placement it wants (`bc_key_*` on a key whose layout says them, or `bc_col_key`, ascending with NULLs first). Equal keys keep the order they were added in: the sort is stable, and a top-n sorter keeps the earliest of equal keys. Both are copied; a payload that is a row view comes back from the sorter a row of its table, as `bc_pin` keeps it one. |
+| `bc_sorter_add` | Adds a row with its sort key. Entries are ordered by the sort key's bytes, `memcmp` order. The key codec puts NULLs first in an ascending part and last in a descending one, the reverse of PostgreSQL's defaults (`ASC` puts NULLs last, `DESC` first). `bc_col_key` is an ascending part, so it gives `ORDER BY col ASC NULLS FIRST`. For PostgreSQL's `ORDER BY col` (`ASC NULLS LAST`), the plan splits on `bc_col_null`, as `NullSplitScan` splits an index scan: rows with a value go to one sorter keyed `bc_col_key`, rows whose column is NULL to a second keyed `bc_empty`, and the plan reads the first sorter, then the second. For a `DESC` part, or a key of several parts, `bc_key_*` builds it only on an index whose layout declares those parts and directions; the split then places NULLs as PostgreSQL does on the first part only. A sort key with a direction and NULL placement per part, chosen by the plan, has no builder yet (#579). Equal keys keep the order they were added in: the sort is stable, and a top-n sorter keeps the earliest of equal keys. Both are copied; a payload that is a row view comes back from the sorter a row of its table, as `bc_pin` keeps it one. |
 | `bc_sorter_count` | The entries held: those added, or at most `keep`. |
-| `bc_sorter_nth` | The payload of the `n`-th entry in sort order, zero-based; out of range is `BC_E_HANDLE` and an empty view. The first `nth` or `next` sorts; adding after that is `BC_E_HANDLE`. |
+| `bc_sorter_nth` | The payload of the `n`-th entry in sort order, zero-based; out of range is `BC_E_HANDLE` and an empty view. The view lives until the next `bc_sorter_nth` on the same sorter, which takes its slot, so a loop over `nth` holds one view. The first `nth` or `next` sorts; adding after that is `BC_E_HANDLE`. |
 | `bc_sorter_next` | Streams payloads in sort order, once: a loop, each step its own. Each call charges one unit of budget. A plan runs it to its end; one it leaves early keeps its step open until reset, as a scan left without `bc_scan_close` does. |
 | `bc_hash_open`, `bc_hash_put` | A multimap for the build side of a hash join. Keys are compared as bytes. Duplicate keys are kept: a key holds every payload put under it. |
 | `bc_hash_find`, `bc_hash_next` | Probes: `find` makes a probe, a handle of the step it is made in, charged `kHashIterEntryBytes`; `next` iterates every payload stored under `key`, in the order put, a loop whose steps own what they allocate. A key never put finds none. Each `next` charges one unit. |
-| `bc_agg_open` | Grouped accumulators with `slots` numeric slots per group (0 for `COUNT(DISTINCT)`, which needs only the groups), for `GROUP BY` the plan cannot get from index order. Ungrouped aggregates use one group with an empty key. Each group's key is held once, and a new group charges its key's bytes, `kGroupEntryBytes` and `kAggSlotBytes` per slot. |
+| `bc_agg_open` | Grouped accumulators with `slots` numeric slots per group (0 for `COUNT(DISTINCT)`, which needs only the groups), for `GROUP BY` the plan cannot get from index order. Ungrouped aggregates use one group with an empty key. Opening one charges `kAggBytes` and a byte per slot, as `bc_sorter_open` charges `kSorterBytes` and `bc_hash_open` `kHashBytes`: past the budget, the open is `BC_E_LIMIT`. Each group's key is held once, and a new group charges its key's bytes, `kGroupEntryBytes` and `kAggSlotBytes` per slot. |
 | `bc_agg_group` | Finds or creates the group for `group_key`, a mem-comparable byte string. Slots start at zero, with no value folded in. |
 | `bc_agg_add_*`, `bc_agg_min_*`, `bc_agg_max_*`, `bc_agg_count` | Folds a value into a slot: `SUM`, `MIN`, `MAX`, `COUNT`; `AVG` is a sum slot and a count slot divided at emit. A slot's first fold fixes its kind, the same for every group; a fold of another kind, or a slot past `slots`, is `BC_E_HANDLE`. An integer sum, or a count, that overflows is `BC_E_ARITH` ("bigint out of range"); a double sum that overflows from finite values is `BC_E_ARITH` ("value out of range: overflow"), as PostgreSQL's `float8` sum, and an infinite or NaN input carries through. |
 | `bc_agg_next` | Iterates groups in first-appearance order, one unit each. |
 | `bc_agg_i64`, `bc_agg_f64` | Reads a slot: `bc_agg_f64` a double sum, `bc_agg_i64` any other. A slot read as the other type is `BC_E_HANDLE`; one never folded reads zero either way. |
+| `bc_agg_null` | True when no value was folded into the slot in this group, of any kind; a slot past `slots` is `BC_E_HANDLE`. |
 
 **PostgreSQL's NULLs are the plan's.** The slots hold numbers, never
 NULL, so a plan keeps PostgreSQL's semantics this way:
@@ -764,8 +773,9 @@ NULL, so a plan keeps PostgreSQL's semantics this way:
   for it, as `SUM`, `MIN`, `MAX` and `COUNT(col)` ignore NULLs.
   `COUNT(*)` counts every row.
 - `SUM`, `MIN`, `MAX` and `AVG` of a group no value reached are NULL. The
-  plan pairs each with a count slot of the values folded, and emits NULL
-  where it is 0. `COUNT` of such a group is 0.
+  plan emits NULL where `bc_agg_null` is true for the slot; no count slot
+  is needed for it. `AVG` still divides its sum slot by a count slot.
+  `COUNT` of such a group is 0.
 - An aggregate without `GROUP BY` returns one row over no input: the plan
   makes its group, with the empty key, before the input loop, so it exists
   when none arrives. With `GROUP BY`, no input is no groups and no rows.

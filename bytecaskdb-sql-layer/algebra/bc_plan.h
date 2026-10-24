@@ -288,6 +288,7 @@ void      bc_agg_count(bc_ctx *, bc_group, uint32_t slot);
 bool      bc_agg_next(bc_ctx *, bc_agg, bc_view *group_key, bc_group *g);
 int64_t   bc_agg_i64(bc_ctx *, bc_group, uint32_t slot);
 double    bc_agg_f64(bc_ctx *, bc_group, uint32_t slot);
+bool      bc_agg_null(bc_ctx *, bc_group, uint32_t slot);   /* no value folded in: SUM, MIN, MAX, AVG are NULL */
 
 /* Writes: rows, with every index entry the runtime derives from them */
 void bc_insert(bc_ctx *, uint32_t table, bc_view row);

@@ -26,13 +26,16 @@ import bytecask.sql.tests.fixture;
 using namespace sql_test;
 using bytecask::sql::Bytes;
 using bytecask::sql::kCursorEntryBytes;
+using bytecask::sql::kAggBytes;
 using bytecask::sql::kAggSlotBytes;
 using bytecask::sql::kGroupEntryBytes;
+using bytecask::sql::kHashBytes;
 using bytecask::sql::kHashEntryBytes;
 using bytecask::sql::kHashIterEntryBytes;
 using bytecask::sql::kKeyEntryBytes;
 using bytecask::sql::kRowEntryBytes;
 using bytecask::sql::kSortEntryBytes;
+using bytecask::sql::kSorterBytes;
 using bytecask::sql::kViewEntryBytes;
 using bytecask::sql::PhysType;
 
@@ -977,6 +980,59 @@ TEST_CASE("plan API: a sorter returns its payloads in sort key order, equal keys
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
 }
 
+namespace {
+std::vector<std::uint64_t> held_at_nth;  // NOLINT: the plans are captureless
+std::vector<std::int64_t> ids_at_nth;    // NOLINT: likewise
+
+// Every row of t into a sorter, then each entry by bc_sorter_nth outside
+// every loop, as a plan's top-level for over nth reads them: the id of each,
+// and what the statement held after each call. Nothing is emitted, since a
+// result row is charged too.
+void each_nth(bc_ctx* cx) {
+  bc_sorter s = bc_sorter_open(cx, 0);
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    bc_sorter_add(cx, s, bc_col_key(cx, row, kQtyCol), row);
+  }
+  for (int64_t i = 0; i < bc_sorter_count(cx, s); ++i) {
+    bc_view p = bc_sorter_nth(cx, s, i);
+    held_at_nth.push_back(bc_ctx_held_for_testing(cx));
+    ids_at_nth.push_back(bc_col_i64(cx, p, kIdCol));
+  }
+}
+
+// An nth view read after the next bc_sorter_nth on its sorter; with $1, on
+// another sorter, which leaves it live.
+void nth_after_next_nth(bc_ctx* cx) {
+  bc_sorter s = bc_sorter_open(cx, 0);
+  bc_sorter t = bc_sorter_open(cx, 0);
+  bc_sorter_add(cx, s, bc_param_bytes(cx, 0), bc_param_bytes(cx, 0));
+  bc_sorter_add(cx, t, bc_param_bytes(cx, 0), bc_param_bytes(cx, 0));
+  bc_view first = bc_sorter_nth(cx, s, 0);
+  (void)bc_sorter_nth(cx, bc_param_bool(cx, 1) ? t : s, 0);
+  bc_emit_count(cx, bc_bytes_eq(cx, first, bc_param_bytes(cx, 0)) ? 1 : 0);
+}
+}  // namespace
+
+TEST_CASE("plan API: a sorter's nth view lives until the next bc_sorter_nth on it, which takes its slot",
+          "[sql][algebra][structures][memory]") {
+  Fixture f;
+  insert_qtys(f, {3, 1, std::nullopt, 1, 2, 3});
+  held_at_nth.clear();
+  ids_at_nth.clear();
+  CHECK(run(f, each_nth, {}) == BC_COMMITTED);
+  CHECK(ids_at_nth == std::vector<std::int64_t>{3, 2, 4, 5, 1, 6});
+  // One view's charge, whatever the number of calls.
+  REQUIRE(held_at_nth.size() == 6);
+  CHECK(std::ranges::all_of(held_at_nth, [&](auto h) { return h == held_at_nth.front(); }));
+
+  CHECK(run(f, nth_after_next_nth, {bytes("k"), true}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == 1);
+  CHECK(run(f, nth_after_next_nth, {bytes("k"), false}) == BC_FAILED);
+  CHECK(bc_error(f.cx) == BC_E_HANDLE);
+}
+
 TEST_CASE("plan API: a top-n sorter keeps the first n in sort order, the earliest of equal keys",
           "[sql][algebra][structures]") {
   Fixture f;
@@ -1061,7 +1117,7 @@ TEST_CASE("plan API: a hash table returns every payload of a key, in the order p
 namespace {
 // SELECT COUNT(*), COUNT(qty), SUM(qty), MIN(qty), MAX(qty), AVG(qty) FROM t
 // GROUP BY name, as a plan computes PostgreSQL's NULLs: a slot of a group
-// no value reached is NULL, which its COUNT(qty) slot tells. With $1 not
+// no value reached is NULL, which bc_agg_null tells. With $1 not
 // NULL, ungrouped over the rows named $1: its one group is made before the
 // scan, so it exists over no rows.
 void aggregates(bc_ctx* cx) {
@@ -1086,9 +1142,9 @@ void aggregates(bc_ctx* cx) {
   while (bc_agg_next(cx, a, nullptr, &g)) {
     bc_emit_begin(cx);
     bc_emit_i64(cx, bc_agg_i64(cx, g, 0));
-    bool none = bc_agg_i64(cx, g, 1) == 0;
     bc_emit_i64(cx, bc_agg_i64(cx, g, 1));
-    if (none) {
+    // No value folded into the sum is none into any: one slot tells.
+    if (bc_agg_null(cx, g, 2)) {
       bc_emit_null(cx);
       bc_emit_null(cx);
       bc_emit_null(cx);
@@ -1101,6 +1157,27 @@ void aggregates(bc_ctx* cx) {
     }
     bc_emit_end(cx);
   }
+}
+
+// bc_agg_null of a group's six slots, before and after a fold into the
+// first five (an integer sum, a double sum, a minimum, a maximum, a count):
+// the sixth is never folded.
+const std::vector<PhysType> kNulls(6, PhysType::Bool);
+void null_slots(bc_ctx* cx) {
+  bc_agg a = bc_agg_open(cx, 6);
+  bc_group g = bc_agg_group(cx, a, bc_empty(cx));
+  auto emit = [](bc_ctx* c, bc_group h) {
+    bc_emit_begin(c);
+    for (uint32_t slot = 0; slot < 6; ++slot) bc_emit_bool(c, bc_agg_null(c, h, slot));
+    bc_emit_end(c);
+  };
+  emit(cx, g);
+  bc_agg_add_i64(cx, g, 0, 0);
+  bc_agg_add_f64(cx, g, 1, 0);
+  bc_agg_min_i64(cx, g, 2, 0);
+  bc_agg_max_i64(cx, g, 3, 0);
+  bc_agg_count(cx, g, 4);
+  emit(cx, g);
 }
 
 // $1 + $2 in an integer slot, $3 + $4 in a double one.
@@ -1135,6 +1212,11 @@ void slot_past_end(bc_ctx* cx) {
   bc_agg a = bc_agg_open(cx, 1);
   bc_group g = bc_agg_group(cx, a, bc_empty(cx));
   bc_agg_count(cx, g, 1);
+}
+void null_past_end(bc_ctx* cx) {
+  bc_agg a = bc_agg_open(cx, 1);
+  bc_group g = bc_agg_group(cx, a, bc_empty(cx));
+  (void)bc_agg_null(cx, g, 1);
 }
 void foreign_group(bc_ctx* cx) {
   bc_agg a = bc_agg_open(cx, 1);
@@ -1189,7 +1271,13 @@ TEST_CASE("plan API: an aggregate's slots fold SUM, MIN, MAX and COUNT, and an i
   CHECK(run_rows(f, sum_two, {std::int64_t{0}, std::int64_t{0}, HUGE_VAL, 1.0}, two) == BC_COMMITTED);
   CHECK(f.results(two) == std::vector<R>{R{std::int64_t{0}, HUGE_VAL}});
 
-  for (auto plan : {slot_two_ways, slot_read_as_double, slot_past_end, foreign_group}) {
+  // bc_agg_null of each kind of slot: true until a value is folded in, of
+  // either type, and true for a slot never folded.
+  CHECK(run_rows(f, null_slots, {}, kNulls) == BC_COMMITTED);
+  CHECK(f.results(kNulls) == std::vector<R>{R{true, true, true, true, true, true},
+                                            R{false, false, false, false, false, true}});
+
+  for (auto plan : {slot_two_ways, slot_read_as_double, slot_past_end, null_past_end, foreign_group}) {
     CHECK(run(f, plan, {}) == BC_FAILED);
     CHECK(bc_error(f.cx) == BC_E_HANDLE);
   }
@@ -1231,6 +1319,29 @@ void hash_charges(bc_ctx* cx) {
   before = bc_ctx_held_for_testing(cx);
   (void)bc_hash_find(cx, h, k);
   charge_of(cx, before);
+}
+
+// A sorter, a hash table and an aggregate of 3 slots opened.
+void open_charges(bc_ctx* cx) {
+  auto before = bc_ctx_held_for_testing(cx);
+  (void)bc_sorter_open(cx, 0);
+  charge_of(cx, before);
+  before = bc_ctx_held_for_testing(cx);
+  (void)bc_hash_open(cx);
+  charge_of(cx, before);
+  before = bc_ctx_held_for_testing(cx);
+  (void)bc_agg_open(cx, 3);
+  charge_of(cx, before);
+}
+
+// Opens a sorter, a hash table or an aggregate of 3 slots ($1: 0, 1, 2),
+// and emits a count.
+void open_one(bc_ctx* cx) {
+  int64_t which = bc_param_i64(cx, 0);
+  if (which == 0) (void)bc_sorter_open(cx, 0);
+  if (which == 1) (void)bc_hash_open(cx);
+  if (which == 2) (void)bc_agg_open(cx, 3);
+  bc_emit_count(cx, 1);
 }
 
 // A group of an aggregate of 3 slots, keyed by $1.
@@ -1293,6 +1404,25 @@ TEST_CASE("plan API: a sorter, hash table or aggregate entry is charged its byte
   charges.clear();
   CHECK(run(f, slot_charges, {bytes("kk")}) == BC_COMMITTED);
   CHECK(charges == std::vector<std::uint64_t>{2 + kGroupEntryBytes + 3 * kAggSlotBytes});
+  // Opening one: a fixed amount, and an aggregate a byte per slot.
+  charges.clear();
+  CHECK(run(f, open_charges, {}) == BC_COMMITTED);
+  CHECK(charges == std::vector<std::uint64_t>{kSorterBytes, kHashBytes, kAggBytes + 3});
+}
+
+TEST_CASE("plan API: opening a sorter, hash table or aggregate past the memory budget is BC_E_LIMIT",
+          "[sql][algebra][structures][memory]") {
+  Fixture f;
+  const std::uint64_t opens[] = {kSorterBytes, kHashBytes, kAggBytes + 3};
+  for (std::int64_t which = 0; which <= 2; ++which) {
+    INFO("structure " << which);
+    auto bytes_held = opens[static_cast<std::size_t>(which)];
+    // A budget of what the open needs, less one byte, then exactly that.
+    CHECK(run(f, open_one, {which}, memory_budget(bytes_held - 1)) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_LIMIT);  // SQLSTATE 54000
+    CHECK(std::string{bc_error_message(f.cx)}.find("memory budget") != std::string::npos);
+    CHECK(run(f, open_one, {which}, memory_budget(bytes_held)) == BC_COMMITTED);
+  }
 }
 
 TEST_CASE("plan API: a sorter, hash table or aggregate past the memory budget is BC_E_LIMIT, and leaves nothing behind",
