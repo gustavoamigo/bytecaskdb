@@ -1096,7 +1096,20 @@ TEST_CASE("embedded API: every plan the search costed returns the same rows", "[
       {"SELECT k, b FROM o WHERE a = $1 ORDER BY b, k", {i(2)}, true, 1},
       {"SELECT o.k, p.v FROM o, p WHERE a = $1 AND p.k = o.c", {i(1)}, false, 2},
       {"SELECT count(DISTINCT p.v) FROM o, p WHERE a = $1 AND p.k = o.c", {i(3)}, false, 2},
+      // p keyed by a parameter alone: read once, then o's scan; or o's scan
+      // with a lookup of p per row. p's key 3 has no row.
+      {"SELECT o.k, p.v FROM p, o WHERE p.k = $1 AND a = $2", {i(1), i(2)}, false, 4},
+      {"SELECT o.k, p.v FROM p, o WHERE p.k = $1 AND a = $2", {i(3), i(2)}, false, 4},
+      {"SELECT count(*) FROM p, o WHERE p.k = $1 AND a = $2", {i(1), i(2)}, false, 4},
+      {"SELECT o.k FROM p, o WHERE p.k = $1 AND a = $2 ORDER BY o.k LIMIT 3", {i(5), i(1)}, true, 1},
   };
+  const std::string cross = "SELECT o.k, p.v FROM p, o WHERE p.k = $1 AND a = $2";
+  CHECK(db->execute(cross, {i(1), i(2)}).rows.size() == 10);
+  CHECK(db->execute(cross, {i(3), i(2)}).rows.empty());
+  // The parameters execute refuses, out of their column's type among them.
+  (void)db->execute("CREATE TABLE q (k INTEGER PRIMARY KEY)");
+  CHECK_THROWS_AS(db->alternatives_for_testing("SELECT k FROM q WHERE k = $1", {i(std::int64_t{1} << 40)}), ExecError);
+  CHECK_THROWS_AS(db->alternatives_for_testing("SELECT k FROM q WHERE k = $1", {}), ParamError);
   for (const auto& c : cases) {
     INFO(c.sql);
     auto want = db->execute(c.sql, c.params).rows;

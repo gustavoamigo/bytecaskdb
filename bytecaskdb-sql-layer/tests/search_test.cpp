@@ -332,6 +332,67 @@ TEST_CASE("search: costs choose the join order, from the tables' counts", "[sql]
   CHECK(scans(plan_sql(cat, sql, {{"a", 1000}, {"b", 1000}}), a_x));
 }
 
+TEST_CASE("search: a table keyed by parameters alone is read once, before the other table's scan",
+          "[sql][search][cost]") {
+  sql_test::Fixture f;
+  f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
+                       {"k"}});
+  const auto& cat = f.cat();
+  const std::string sql = "SELECT v FROM u, t WHERE k = $1 AND name = $2";
+  // u by its point lookup, 1; then t's 100 entries under name, each row
+  // fetched: 1 + 200. Scanning t first and looking u up for each of its 100
+  // rows would be 200 + 100.
+  auto once = plan_sql(cat, sql, {{"t", 1000}, {"u", 1000}});
+  CHECK(once.cost == Catch::Approx(201));
+  auto get = once.source.find("bc_view row = bc_get(cx, bc_key_params(cx, TBL_");
+  auto missing = once.source.find("if (!found) {\n    return;\n  }");
+  auto scan = once.source.find("bc_scan_open(cx, IDX_");
+  REQUIRE(get != std::string::npos);
+  REQUIRE(missing != std::string::npos);
+  REQUIRE(scan != std::string::npos);
+  // No row of u: the plan ends before t is scanned.
+  CHECK(get < missing);
+  CHECK(missing < scan);
+  CHECK_FALSE(has(once, "found1"));
+  // Both orders are costed; the other is the loop with a lookup per row.
+  auto b = bound::bind(ast::parse(sql), cat);
+  auto all = generate_alternatives(std::move(b), cat, sql, [](const Table& t) -> std::optional<std::uint64_t> {
+    return t.name == "t" || t.name == "u" ? std::optional<std::uint64_t>{1000} : std::nullopt;
+  });
+  REQUIRE(all.size() == 2);
+  CHECK(all[0].source == once.source);
+  CHECK(has(all[1], "bc_view row1 = bc_get(cx, bc_key_params(cx, TBL_"));
+  CHECK(all[1].cost == Catch::Approx(300));
+}
+
+TEST_CASE("search: a refusal names the failure of a plan of every table, not of one table's access",
+          "[sql][search]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"a",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("x", PhysType::I64, true),
+                        Fixture::col("z", PhysType::I64, true)},
+                       {"k"}});
+  f.ddl(CreateIndexDdl{"a_xz", "a", {{"x"}, {"z"}}});
+  f.ddl(CreateTableDdl{"b", {Fixture::col("k", PhysType::I64, false), Fixture::col("y", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateIndexDdl{"b_y", "b", {{"y"}}});
+  auto refused = [&](std::string_view sql) -> std::string {
+    try {
+      (void)plan_sql(f.cat(), sql);
+    } catch (const ast::FeatureNotSupported& e) {
+      return e.what();
+    }
+    return "accepted";
+  };
+  // b's scan by y is not in a.z's order, but no plan reaches both tables:
+  // nothing names b's key from a, nor a's from b.
+  CHECK(refused("SELECT a.k FROM a, b WHERE a.x = $1 AND b.y = $2 AND a.z = b.y ORDER BY a.z") ==
+        "no plan: no equality names b's key");
+  // Keyed by a.z, b joins a, and the plan of both fails on its order alone.
+  CHECK(refused("SELECT a.k FROM a, b WHERE b.y = $1 AND b.k = a.z AND a.x = $2 ORDER BY a.k") ==
+        "no plan: no index of a gives ORDER BY k");
+}
+
 TEST_CASE("search: COUNT from the keys or by a loop, by the count of the range", "[sql][search][cost]") {
   sql_test::Fixture f;
   const auto& cat = f.cat();

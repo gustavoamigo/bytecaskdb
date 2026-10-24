@@ -386,6 +386,8 @@ private:
             return true;
           } else if constexpr (std::is_same_v<T, physical::IndexJoin>) {
             return loops(*op.outer);
+          } else if constexpr (std::is_same_v<T, physical::NestedLoop>) {
+            return true;
           } else if constexpr (requires { op.input; }) {
             return loops(*op.input);
           } else {
@@ -653,6 +655,17 @@ private:
       rows_.push_back({j.inner, row});
       k();
       rows_.pop_back();
+    });
+  }
+
+  // The outer side's row, then, if it has one, the inner scan's loop: its
+  // row is row<d>, as an index join's.
+  void produce(const physical::NestedLoop& j, const Consume& k) {
+    produce(*j.outer, [&] {
+      auto outer_row = row_name_;
+      row_name_ = "row" + std::to_string(rows_.size());
+      produce(*j.inner, k);
+      row_name_ = outer_row;
     });
   }
 

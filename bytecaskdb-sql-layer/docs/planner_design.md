@@ -655,10 +655,17 @@ Anything else is refused (*What the search refuses*).
 - No full scan (slice 4).
 
 **Joins.** Left-deep, bottom up over sets of tables: each set of k tables
-from each set of k − 1 and one more table, read by its whole primary key
-from parameters and the columns of the tables already read. The search
-keeps the cheapest plan per set, the first of equals, so `FROM` order
-breaks ties. The whole statement's plans are all finished, emitted under
+from each set of k − 1 and one more table, read one of two ways:
+- by its whole primary key, from parameters and the columns of the tables
+  already read: an index nested loop, one lookup per outer row;
+- by its own scan, from parameters alone, when the tables already read give
+  at most one row (a point lookup, then lookups by key): a nested loop
+  (`NestedLoop`) that reads it once, and not at all when that row is
+  missing.
+
+The search keeps the cheapest plan per set, the first of equals, so `FROM`
+order breaks ties, and the cheapest of at most one row apart, which the
+second way extends. The whole statement's plans are all finished, emitted under
 `LIMIT` or aggregated, before they are compared, since a `LIMIT` changes
 which is cheaper. Sets are bit masks of up to 32 tables; the dialect has
 two.
@@ -687,7 +694,8 @@ a plan beside the loop over the same scan, and costs decide between them.
 | A scan | its entries; twice that for an index scan that fetches each row |
 | `COUNT` by `bc_count_range` | 2 |
 | `MIN` from the first entry | 1; 2 when it fetches the row |
-| A join | the outer plan's cost, plus 1 per outer row |
+| A join by key | the outer plan's cost, plus 1 per outer row |
+| A join read once | the outer plan's cost, plus the inner scan's |
 | `COUNT(DISTINCT)` | its input's, plus 1 per row (`bc_agg_next`) |
 | Under `LIMIT n` | the cost × n / the rows, when there are more than n |
 
@@ -737,7 +745,8 @@ So these are planned now, where slice 1 refused them:
   its NULLs, but which another path serves;
 - an `ORDER BY` on a join that the first table's scan gives;
 - a join whose second table is keyed by parameters alone, the first one
-  scanned: a key lookup per row of the first.
+  scanned: that table is read once, first, and the other's scan runs only
+  if its row is there.
 
 | # | Refused | Message |
 |---|---|---|
@@ -749,9 +758,15 @@ So these are planned now, where slice 1 refused them:
 
 Where plans fail for different reasons, the refusal is the first one of
 the furthest stage a plan reached: its tables (rows 1 and 2), then the
-order (3), its NULLs (4), and its filters (5). Row 2 names the first table
-in `FROM` order that the largest set planned lacks, and the key columns no
-equality names.
+order (3), its NULLs (4), and its filters (5). Each failure is recorded
+where it happens, with the plan it stops: an access path, or a step that
+adds a table to a set. A plan that fails is carried on as far as its tables
+reach, at the earliest stage of its parts' failures, so a failure counts
+only when its plan reaches every table: a scan of one table not in the
+`ORDER BY`'s order is not the reason a join that never reaches the other
+table is refused. When no plan reaches every table, row 2 names the first
+table in `FROM` order that the largest set planned lacks, and the key
+columns no equality names.
 
 The refusal is a `FeatureNotSupported`, SQLSTATE 0A000, whose message
 starts `no plan:`, raised after binding and before anything runs. It
@@ -783,7 +798,9 @@ PostgreSQL runs each of these; it is the one entry of `frontend_design.md`'s
   range's count chooses `COUNT` from the keys or by a loop; an `ORDER BY`
   keeps the plan in its order where another costs less, and a `LIMIT`
   cuts its cost; a point lookup beats a unique index's one entry, and a
-  covering scan a fetching one.
+  covering scan a fetching one; a table keyed by parameters alone is read
+  once, before the other's scan; a refusal names the failure of a plan of
+  every table.
 - **The search's model** in the proof machine (`served`, `join_served`)
   says whether some plan serves a statement, as the search now does.
 - **The harness**, 2 warehouses, 4 threads, 30 s: 237,014 TPM, 106,092

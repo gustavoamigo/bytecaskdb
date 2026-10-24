@@ -11,8 +11,10 @@
 //      or not. No full scan: a table no key reaches has no access path.
 //   2. Joins: each set of tables from the sets one smaller, the new table
 //      read by its whole primary key from parameters and the other tables'
-//      columns (an index nested loop), keeping the cheapest plan per set and
-//      per interesting order. A plan's order is its first table's scan's;
+//      columns (an index nested loop), or, under at most one row, by its
+//      own scan from parameters alone, read once (a nested loop); keeping
+//      the cheapest plan per set and per interesting order. A plan's order
+//      is its first table's scan's, or, under one row, the scan read once;
 //      a key lookup per row keeps it.
 //   3. The statement on top: the rows emitted, under LIMIT, or aggregated,
 //      COUNT and MIN also answered from the keys (bc_count_range, a scan's
@@ -29,6 +31,7 @@ module;
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <iterator>
 #include <map>
@@ -189,16 +192,31 @@ struct Keyed {
   std::vector<const Expr*> used;
 };
 
+// The first conjunct of `where` that compares `col` equal to a parameter, or
+// null.
+auto key_eq_on(const Conjuncts& where, std::uint32_t col) -> const Expr* {
+  auto it = std::ranges::find_if(where, [&](const Expr& c) { return on_col(c, col) && key_eq(c); });
+  return it == where.end() ? nullptr : &*it;
+}
+
 // The parameter each primary key column is compared equal to, or nullopt.
 auto point_get(const Table& t, const Conjuncts& where) -> std::optional<Keyed> {
   Keyed k;
   for (auto id : t.pk_col_ids) {
-    auto it = std::ranges::find_if(where, [&](const auto& c) { return on_col(c, id) && key_eq(c); });
-    if (it == where.end()) return std::nullopt;
-    k.key.push_back(operand_of(*it));
-    k.used.push_back(&*it);
+    const auto* c = key_eq_on(where, id);
+    if (c == nullptr) return std::nullopt;
+    k.key.push_back(operand_of(*c));
+    k.used.push_back(c);
   }
   return k;
+}
+
+// Every parameter `where` compares, added to `to`: the ones a NULL of which
+// matches no row.
+void add_params(std::vector<std::uint32_t>& to, const Conjuncts& where) {
+  for (const auto& w : where) {
+    if (auto p = param_of(w)) add_param(to, *p);
+  }
 }
 
 auto key_params(const std::vector<Expr>& key) -> std::vector<std::uint32_t> {
@@ -258,9 +276,9 @@ auto bounds(const Path& p, const Conjuncts& where) -> Bounds {
     return it == where.end() ? nullptr : &*it;
   };
   for (const auto& part : p.parts) {
-    auto it = std::ranges::find_if(where, [&](const Expr& w) { return on_col(w, part.col) && key_eq(w); });
-    if (it == where.end()) break;
-    b.eq.push_back(&*it);
+    const auto* c = key_eq_on(where, part.col);
+    if (c == nullptr) break;
+    b.eq.push_back(c);
   }
   auto run = b.eq.size();
   if (run < p.parts.size()) {
@@ -296,36 +314,37 @@ auto in_key(const Table& t, const Path& p, std::uint32_t col) -> bool {
   return std::ranges::any_of(p.parts, [&](const Part& q) { return q.col == col; });
 }
 
-// Why no plan was found: the first refusal of the furthest stage a plan
-// reached. A plan reaches its tables (Reach), gives the ORDER BY (Order),
-// places its NULLs (Nulls), and takes every filter (Filter).
+// Where a plan stopped. A plan reaches its tables (Reach), gives the ORDER
+// BY (Order), places its NULLs (Nulls), and takes every filter (Filter).
 enum class Stage { Reach, Order, Nulls, Filter };
 
-class Refusals {
-public:
-  void note(Stage s, std::string why) {
-    if (!best_ || s > best_->first) best_.emplace(s, std::move(why));
-  }
-  [[nodiscard]] auto past(Stage s) const -> bool { return best_ && best_->first > s; }
-  [[nodiscard]] auto why() const -> const std::string& { return best_->second; }
-
-private:
-  std::optional<std::pair<Stage, std::string>> best_;
+// Why one plan failed: the stage it stopped at.
+struct Refusal {
+  Stage stage{Stage::Reach};
+  std::string why;
 };
 
-// The conjuncts of `where` not in `used`, as filters; nullopt, refused, when
-// one is on a DOUBLE or REAL column: its comparisons need PostgreSQL's NaN
-// and -0.0 rules, which only its key encoding has.
-auto residual(const Table& t, const Conjuncts& where, const std::vector<const Expr*>& used, Refusals& r)
-    -> std::optional<Conjuncts> {
+// The failure of a plan made of two parts: the one at the earlier stage,
+// `a` of equals.
+auto earlier(const std::optional<Refusal>& a, const std::optional<Refusal>& b) -> std::optional<Refusal> {
+  if (!a) return b;
+  if (!b) return a;
+  return b->stage < a->stage ? b : a;
+}
+
+auto double_filter(const std::string& column) -> Refusal {
+  return {Stage::Filter, "a filter on column \"" + column + "\", a REAL or DOUBLE PRECISION, is not supported yet"};
+}
+
+// The conjuncts of `where` not in `used`, as filters; refused when one is on
+// a DOUBLE or REAL column: its comparisons need PostgreSQL's NaN and -0.0
+// rules, which only its key encoding has.
+auto residual(const Table& t, const Conjuncts& where, const std::vector<const Expr*>& used)
+    -> std::expected<Conjuncts, Refusal> {
   Conjuncts out;
   for (const auto& c : where) {
     if (std::ranges::find(used, &c) != used.end()) continue;
-    if (col_of(c).type == PhysType::F64) {
-      r.note(Stage::Filter,
-             "a filter on column \"" + t.column(col_of(c).col)->name + "\", a REAL or DOUBLE PRECISION, is not supported yet");
-      return std::nullopt;
-    }
+    if (col_of(c).type == PhysType::F64) return std::unexpected(double_filter(t.column(col_of(c).col)->name));
     out.push_back(c);
   }
   return out;
@@ -338,6 +357,13 @@ struct Access {
   std::vector<std::uint32_t> null_checks;  // the parameters the WHERE compares, as the path checks them
   double cost{0};
   double rows{0};
+};
+
+// An access path tried: costed, or the refusal that stopped it. A point
+// lookup gives at most one row.
+struct Tried {
+  bool one_row{false};
+  std::expected<Access, Refusal> access;
 };
 
 // A table of the statement and the conjuncts on it.
@@ -357,15 +383,27 @@ struct Probe {
   bool by_column{false};  // a key part is an outer column
 };
 
+// The inner side of a nested loop read once: a table by its own access path,
+// from parameters alone, under an outer side of at most one row.
+struct Nested {
+  std::size_t rel{0};
+  Access access;
+};
+
+using Step = std::variant<Probe, Nested>;
+
 // A left-deep plan for a set of tables: the first by an access path, then
-// each other one by a probe.
+// each other one by a step. A plan the search could not complete is kept,
+// failed, only for the refusal.
 struct Candidate {
   std::size_t first{0};
   Access access;
-  std::vector<Probe> probes;
+  std::vector<Step> steps;
   std::uint32_t set{0};
   double cost{0};
   double rows{0};
+  bool one_row{false};            // a point lookup, then lookups by key: at most one row
+  std::optional<Refusal> failed;  // the stage it stopped at, the earliest of its parts'
 };
 
 // A SELECT's result rows over its source, or one aggregate row.
@@ -579,44 +617,44 @@ private:
   // row, which a scan reads from the entry's key when `may_cover` and it
   // holds them all.
   auto accesses(const Rel& rel, const std::vector<OrderItem>& order_by, const std::vector<OrderItem>& ordered,
-                const std::vector<ColumnRef>& used, bool may_cover) -> std::vector<Access> {
+                const std::vector<ColumnRef>& used, bool may_cover) -> std::vector<Tried> {
     const auto& t = rel.table();
     const auto& where = rel.where;
     const auto n = table_rows(t);
     auto for_update = rel.get->for_update;
-    std::vector<Access> out;
+    std::vector<Tried> out;
+    auto refused = [&](Refusal r) { out.push_back({false, std::unexpected(std::move(r))}); };
     // A point lookup returns at most one row: it gives any ORDER BY.
     if (auto k = point_get(t, where)) {
-      if (auto f = residual(t, where, k->used, refusals_)) {
+      auto f = residual(t, where, k->used);
+      if (!f) {
+        out.push_back({true, std::unexpected(std::move(f.error()))});
+      } else {
         Access a;
         a.null_checks = key_params(k->key);
         a.path = physical::PointGet{t.id, std::move(k->key), for_update};
         a.cost = 1;
         a.rows = selectivity(*f);
         a.filters = std::move(*f);
-        out.push_back(std::move(a));
+        out.push_back({true, std::move(a)});
       }
     }
     std::vector<std::uint32_t> null_checks;
-    for (const auto& w : where) {
-      if (auto p = param_of(w)) add_param(null_checks, *p);
-    }
+    add_params(null_checks, where);
     auto value_bound = [&](const Expr* c, bool successor) -> physical::KeyBound {
       if (c == nullptr) return {};
       return {physical::KeyBound::Kind::Value, operand_of(*c), successor};
     };
     auto null_part = [](bool successor) { return physical::KeyBound{physical::KeyBound::Kind::NullPart, std::nullopt, successor}; };
-    auto reached = false;
     for (const auto& p : paths(t)) {
       auto b = bounds(p, where);
       if (b.eq.empty() && b.lo == nullptr && b.hi == nullptr) continue;
-      reached = true;
       const auto run = b.eq.size();
       if (p.is_pk && run == p.parts.size()) continue;  // the point lookup
       // No sort yet: a path not in the ORDER BY's order is no plan.
       auto reverse = ordered.empty() ? std::optional<bool>{false} : direction(p, run, t.id, ordered);
       if (!reverse) {
-        refusals_.note(Stage::Order, "no index of " + t.name + " gives ORDER BY " + names(order_by));
+        refused({Stage::Order, "no index of " + t.name + " gives ORDER BY " + names(order_by)});
         continue;
       }
       // NULLs in the ordered parts: a part the WHERE compares holds none in
@@ -632,7 +670,7 @@ private:
         auto later_nullable = std::ranges::any_of(ordered.begin() + static_cast<std::ptrdiff_t>(i) + 1, ordered.end(),
                                                   [&](const auto& o) { return t.column(o.col.col)->nullable; });
         if (i != 0 || p.parts[run].desc || later_nullable) {
-          refusals_.note(Stage::Nulls, "ORDER BY " + col->name + " would need its NULLs reordered");
+          refused({Stage::Nulls, "ORDER BY " + col->name + " would need its NULLs reordered"});
           reverse.reset();
         } else {
           split = true;
@@ -644,8 +682,11 @@ private:
       for (const auto* e : {b.lo, b.hi}) {
         if (e != nullptr) keyed.push_back(e);
       }
-      auto f = residual(t, where, keyed, refusals_);
-      if (!f) continue;
+      auto f = residual(t, where, keyed);
+      if (!f) {
+        refused(std::move(f.error()));
+        continue;
+      }
 
       physical::Scan sc;
       sc.table = t.id;
@@ -668,7 +709,7 @@ private:
       if (split) {
         sc.rest = physical::Range{null_part(true), {}};
         a.path = physical::NullSplitScan{std::move(sc)};
-        out.push_back(std::move(a));
+        out.push_back({false, std::move(a)});
         continue;
       }
       if (b.lo != nullptr || b.hi != nullptr) {
@@ -699,9 +740,8 @@ private:
         sc.rest = r;
       }
       a.path = std::move(sc);
-      out.push_back(std::move(a));
+      out.push_back({false, std::move(a)});
     }
-    if (out.empty() && !reached && !point_get(t, where)) refusals_.note(Stage::Reach, "a full scan of " + t.name);
     return out;
   }
 
@@ -714,8 +754,9 @@ private:
   // ----------------------------------------------------------------- joins
 
   // `q.rels[inner]` read by its whole primary key from parameters and the
-  // columns of `outer`'s tables, or nullopt, refused.
-  auto probe(const Query& q, std::size_t inner, std::uint32_t outer) -> std::optional<Probe> {
+  // columns of `outer`'s tables, or the refusal: at Reach when no equality
+  // names a key column, at Filter for a filter on a DOUBLE.
+  auto probe(const Query& q, std::size_t inner, std::uint32_t outer) const -> std::expected<Probe, Refusal> {
     const auto& rel = q.rels[inner];
     const auto& t = rel.table();
     auto in_outer = [&](const ColumnRef& c) {
@@ -740,10 +781,9 @@ private:
     std::vector<std::size_t> keyed_on;
     std::vector<std::string> missing;
     for (auto id : t.pk_col_ids) {
-      auto it = std::ranges::find_if(rel.where, [&](const auto& c) { return on_col(c, id) && key_eq(c); });
-      if (it != rel.where.end()) {
-        pr.key.push_back(operand_of(*it));
-        used.push_back(&*it);
+      if (const auto* c = key_eq_on(rel.where, id)) {
+        pr.key.push_back(operand_of(*c));
+        used.push_back(c);
         continue;
       }
       // Only an equality keys the inner side.
@@ -757,22 +797,15 @@ private:
       pr.by_column = true;
       keyed_on.push_back(static_cast<std::size_t>(jt - on.begin()));
     }
-    if (!missing.empty()) {
-      refusals_.note(Stage::Reach, missing_key(t, missing));
-      return std::nullopt;
-    }
-    auto f = residual(t, rel.where, used, refusals_);
-    if (!f) return std::nullopt;
+    if (!missing.empty()) return std::unexpected(Refusal{Stage::Reach, missing_key(t, missing)});
+    auto f = residual(t, rel.where, used);
+    if (!f) return std::unexpected(std::move(f.error()));
     // Every join conjunct the key does not take is a filter with its own
     // operator, the inner column first.
     for (std::size_t i = 0; i < on.size(); ++i) {
       if (std::ranges::find(keyed_on, i) != keyed_on.end()) continue;
       for (const auto& col : {on[i].args[0].col, on[i].args[1].col}) {
-        if (col.type == PhysType::F64) {
-          refusals_.note(Stage::Filter, "a filter on column \"" + name_of(col) +
-                                            "\", a REAL or DOUBLE PRECISION, is not supported yet");
-          return std::nullopt;
-        }
+        if (col.type == PhysType::F64) return std::unexpected(double_filter(name_of(col)));
       }
       f->push_back(on[i]);
     }
@@ -787,23 +820,33 @@ private:
     return "no equality names " + cols + " of " + t.name + "'s key";
   }
 
-  // Keeps a candidate for its set: every one when the search returns them
-  // all or the set is the whole statement's, whose plans are compared once
-  // finished; else the cheapest, the first of equals. Every candidate is in
-  // the ORDER BY's order, the one interesting order: with no sort, a plan
-  // that is not is never completed.
+  // Keeps a candidate for its set. A complete one: every one when the
+  // search returns them all or the set is the whole statement's, whose plans
+  // are compared once finished; else the cheapest, the first of equals, and
+  // the cheapest of at most one row apart, which a table read once can
+  // extend. A failed one: the furthest per set and kind, the first of
+  // equals. Every candidate is in the ORDER BY's order, the one interesting
+  // order: with no sort, a plan that is not is never completed.
   void keep(std::map<std::uint32_t, std::vector<Candidate>>& best, Candidate c, std::uint32_t full) const {
     auto& v = best[c.set];
-    if (all_ || c.set == full || v.empty()) {
+    if (!c.failed && (all_ || c.set == full)) {
       v.push_back(std::move(c));
-    } else if (c.cost < v.front().cost) {
-      v.front() = std::move(c);
+      return;
+    }
+    auto it = std::ranges::find_if(
+        v, [&](const Candidate& o) { return o.one_row == c.one_row && o.failed.has_value() == c.failed.has_value(); });
+    if (it == v.end()) {
+      v.push_back(std::move(c));
+    } else if (c.failed ? c.failed->stage > it->failed->stage : c.cost < it->cost) {
+      *it = std::move(c);
     }
   }
 
   // Every plan of the whole statement's set of tables, by dynamic
   // programming over sets of tables, each set from the sets one smaller;
-  // refused if none.
+  // refused if none. A plan that fails is carried on as far as it reaches,
+  // so the refusal names the failure of the furthest stage a plan of every
+  // table reached.
   auto candidates(const Query& q, const std::vector<OrderItem>& order_by, const std::vector<ColumnRef>& used,
                   bool may_cover) -> std::vector<Candidate> {
     const auto n = q.rels.size();
@@ -817,17 +860,26 @@ private:
       if (!constant && !repeated) ordered.push_back(o);
     }
     std::map<std::uint32_t, std::vector<Candidate>> best;
+    std::vector<std::vector<Tried>> tried(n);
     for (std::size_t i = 0; i < n; ++i) {
-      for (auto& a : accesses(q.rels[i], order_by, ordered, n == 1 ? used : std::vector<ColumnRef>{}, may_cover && n == 1)) {
+      tried[i] = accesses(q.rels[i], order_by, ordered, n == 1 ? used : std::vector<ColumnRef>{}, may_cover && n == 1);
+      for (const auto& a : tried[i]) {
         Candidate c;
         c.first = i;
         c.set = 1u << i;
-        c.cost = a.cost;
-        c.rows = a.rows;
-        c.access = std::move(a);
+        c.one_row = a.one_row;
+        if (a.access) {
+          c.cost = a.access->cost;
+          c.rows = a.access->rows;
+          c.access = *a.access;
+        } else {
+          c.failed = a.access.error();
+        }
         keep(best, std::move(c), full);
       }
     }
+    // Why a set could not be extended by a table: no equality names its key.
+    std::map<std::pair<std::uint32_t, std::size_t>, std::string> unkeyed;
     for (std::size_t size = 2; size <= n; ++size) {
       std::vector<std::pair<std::uint32_t, std::size_t>> extend;
       for (const auto& [set, cands] : best) {
@@ -838,41 +890,73 @@ private:
       }
       for (const auto& [set, t] : extend) {
         auto pr = probe(q, t, set);
-        if (!pr) continue;
+        if (!pr && pr.error().stage == Stage::Reach) unkeyed.emplace(std::pair{set, t}, pr.error().why);
         auto outers = best.at(set);  // copied: keep may add to the map
         for (const auto& o : outers) {
-          Candidate c = o;
-          c.probes.push_back(*pr);
-          c.set = set | (1u << t);
-          c.cost = o.cost + o.rows;  // one key lookup per outer row
-          c.rows = o.rows * selectivity(pr->filters);
-          keep(best, std::move(c), full);
+          if (pr || pr.error().stage != Stage::Reach) {
+            Candidate c = o;
+            c.set = set | (1u << t);
+            c.failed = earlier(o.failed, pr ? std::nullopt : std::optional{pr.error()});
+            if (!c.failed) {
+              c.steps.emplace_back(*pr);
+              c.cost = o.cost + o.rows;  // one key lookup per outer row
+              c.rows = o.rows * selectivity(pr->filters);
+            }
+            keep(best, std::move(c), full);
+          }
+          // At most one outer row: t read once, by its own scan. Its point
+          // lookup is the probe by parameters above.
+          if (!o.one_row) continue;
+          for (const auto& a : tried[t]) {
+            if (a.one_row) continue;
+            Candidate c = o;
+            c.set = set | (1u << t);
+            c.one_row = false;
+            c.failed = earlier(o.failed, a.access ? std::nullopt : std::optional{a.access.error()});
+            if (!c.failed) {
+              c.steps.emplace_back(Nested{t, *a.access});
+              c.cost = o.cost + a.access->cost;
+              c.rows = o.rows * a.access->rows;
+            }
+            keep(best, std::move(c), full);
+          }
         }
       }
     }
-    auto it = best.find(full);
-    if (it != best.end()) return std::move(it->second);
-    refuse(q, best);
+    std::vector<Candidate> out;
+    if (auto it = best.find(full); it != best.end()) {
+      for (auto& c : it->second) {
+        if (!c.failed) out.push_back(std::move(c));
+      }
+    }
+    if (!out.empty()) return out;
+    refuse(q, best, unkeyed);
   }
 
-  // No plan for the statement: the furthest stage's refusal, or, where none
-  // reached its tables, the table no plan could reach.
-  [[noreturn]] void refuse(const Query& q, const std::map<std::uint32_t, std::vector<Candidate>>& best) {
-    if (refusals_.past(Stage::Reach)) no_plan(refusals_.why());
-    if (q.rels.size() == 1 || best.empty()) no_plan("a full scan of " + q.rels[0].table().name);
-    // The largest set planned, the first of them; the first table it lacks.
-    std::uint32_t largest = 0;
-    for (const auto& [set, cands] : best) {
-      if (std::popcount(set) > std::popcount(largest)) largest = set;
+  // No plan for the statement: the first failure of the furthest stage a
+  // plan of every table reached; where none reached them all, the first
+  // table the largest set planned lacks, by the key no equality names; where
+  // no table was reached, a full scan of the first.
+  [[noreturn]] static void refuse(const Query& q, const std::map<std::uint32_t, std::vector<Candidate>>& best,
+                                  const std::map<std::pair<std::uint32_t, std::size_t>, std::string>& unkeyed) {
+    const auto full = q.rels.size() == 32 ? ~0u : (1u << q.rels.size()) - 1;
+    if (auto it = best.find(full); it != best.end()) {
+      const Refusal* furthest = nullptr;
+      for (const auto& c : it->second) {
+        if (furthest == nullptr || c.failed->stage > furthest->stage) furthest = &*c.failed;
+      }
+      if (furthest != nullptr) no_plan(furthest->why);
     }
-    for (std::size_t i = 0; i < q.rels.size(); ++i) {
-      if ((largest & (1u << i)) != 0) continue;
-      // The key it lacks, as the probe refuses it.
-      Refusals r;
-      std::swap(r, refusals_);
-      auto keyed = probe(q, i, largest).has_value();
-      std::swap(r, refusals_);
-      if (!keyed) no_plan(r.why());
+    // The largest set planned, the first of them; the first table it lacks.
+    std::optional<std::uint32_t> largest;
+    for (const auto& [set, cands] : best) {
+      if (!largest || std::popcount(set) > std::popcount(*largest)) largest = set;
+    }
+    if (largest) {
+      for (std::size_t i = 0; i < q.rels.size(); ++i) {
+        if ((*largest & (1u << i)) != 0) continue;
+        if (auto it = unkeyed.find({*largest, i}); it != unkeyed.end()) no_plan(it->second);
+      }
     }
     no_plan("a full scan of " + q.rels[0].table().name);
   }
@@ -893,56 +977,74 @@ private:
     std::vector<physical::Computed> computed;
   };
 
+  // The $n ± k an access path compares with a column of `table`: in its
+  // filters and its scan's range.
+  static void access_computed(std::vector<physical::Computed>& comp, const Access& a, std::uint32_t table) {
+    for (const auto& f : a.filters) add_computed(comp, operand_of(f), table);
+    const physical::Scan* scan = std::get_if<physical::Scan>(&a.path);
+    if (const auto* split = std::get_if<physical::NullSplitScan>(&a.path)) scan = &split->present;
+    if (scan == nullptr) return;
+    if (const auto* r = std::get_if<physical::Range>(&scan->rest)) {
+      for (const auto* b : {&r->lo, &r->hi}) {
+        if (b->value) add_computed(comp, *b->value, table);
+      }
+    }
+  }
+
+  // An access path's rows, under its filters.
+  static auto leaf(const Access& a) -> physical::NodePtr {
+    return filtered(std::visit([](const auto& p) { return physical::node(p); }, a.path), a.filters);
+  }
+
   static auto build(const Query& q, const Candidate& c) -> Built {
     Built out;
-    const auto& first = q.rels[c.first].table();
-    for (const auto& f : c.access.filters) add_computed(out.computed, operand_of(f), first.id);
-    const physical::Scan* scan = std::get_if<physical::Scan>(&c.access.path);
-    if (const auto* split = std::get_if<physical::NullSplitScan>(&c.access.path)) scan = &split->present;
-    if (scan != nullptr) {
-      if (const auto* r = std::get_if<physical::Range>(&scan->rest)) {
-        for (const auto* b : {&r->lo, &r->hi}) {
-          if (b->value) add_computed(out.computed, *b->value, first.id);
-        }
+    access_computed(out.computed, c.access, q.rels[c.first].table().id);
+    auto by_column = false;
+    auto nested = false;
+    for (const auto& step : c.steps) {
+      if (const auto* pr = std::get_if<Probe>(&step)) {
+        for (const auto& f : pr->filters) add_computed(out.computed, operand_of(f), q.rels[pr->rel].table().id);
+        by_column = by_column || pr->by_column;
+      } else {
+        const auto& ne = std::get<Nested>(step);
+        access_computed(out.computed, ne.access, q.rels[ne.rel].table().id);
+        nested = true;
       }
     }
-    for (const auto& pr : c.probes) {
-      for (const auto& f : pr.filters) add_computed(out.computed, operand_of(f), q.rels[pr.rel].table().id);
-    }
-    auto by_column = std::ranges::any_of(c.probes, [](const Probe& p) { return p.by_column; });
-    physical::NodePtr leaf;
+    const auto* g = std::get_if<physical::PointGet>(&c.access.path);
     if (!by_column) {
       out.null_checks = c.access.null_checks;
-      for (const auto& pr : c.probes) {
-        for (const auto& e : pr.key) {
-          if (e.kind == Expr::Kind::Param) add_param(out.null_checks, e.param);
+      for (const auto& step : c.steps) {
+        if (const auto* pr = std::get_if<Probe>(&step)) {
+          for (const auto& e : pr->key) add_param(out.null_checks, e.param);
+        } else {
+          for (auto p : std::get<Nested>(step).access.null_checks) add_param(out.null_checks, p);
         }
       }
-      leaf = std::visit([](const auto& p) { return physical::node(p); }, c.access.path);
+      out.rows = leaf(c.access);
+    } else if (g != nullptr && !nested) {
+      // One outer row: a scan of its whole key's prefix, so one loop serves
+      // and each inner key is built only from a row read.
+      physical::Scan sc;
+      sc.table = sc.object = g->table;
+      sc.prefix = g->key;
+      sc.for_update = g->for_update;
+      out.rows = filtered(physical::node(std::move(sc)), c.access.filters);
     } else {
-      // A NULL parameter on any table matches no row.
-      if (const auto* g = std::get_if<physical::PointGet>(&c.access.path)) {
-        // One outer row: a scan of its whole key's prefix, so one loop serves
-        // and each inner key is built only from a row read.
-        physical::Scan sc;
-        sc.table = sc.object = g->table;
-        sc.prefix = g->key;
-        sc.for_update = g->for_update;
-        leaf = physical::node(std::move(sc));
-      } else {
-        out.null_checks = c.access.null_checks;
-        leaf = std::visit([](const auto& p) { return physical::node(p); }, c.access.path);
-      }
-      for (const auto& rel : q.rels) {
-        for (const auto& w : rel.where) {
-          if (auto p = param_of(w)) add_param(out.null_checks, *p);
-        }
-      }
+      out.null_checks = c.access.null_checks;
+      out.rows = leaf(c.access);
     }
-    out.rows = filtered(std::move(leaf), c.access.filters);
-    for (const auto& pr : c.probes) {
-      auto pairs = physical::node(physical::IndexJoin{std::move(out.rows), q.rels[pr.rel].table().id, pr.key});
-      out.rows = filtered(std::move(pairs), pr.filters);
+    // A NULL parameter on any table matches no row.
+    if (by_column) {
+      for (const auto& rel : q.rels) add_params(out.null_checks, rel.where);
+    }
+    for (const auto& step : c.steps) {
+      if (const auto* pr = std::get_if<Probe>(&step)) {
+        auto pairs = physical::node(physical::IndexJoin{std::move(out.rows), q.rels[pr->rel].table().id, pr->key});
+        out.rows = filtered(std::move(pairs), pr->filters);
+      } else {
+        out.rows = physical::node(physical::NestedLoop{std::move(out.rows), leaf(std::get<Nested>(step).access)});
+      }
     }
     return out;
   }
@@ -1048,7 +1150,7 @@ private:
         continue;
       }
       // The keys answer an aggregate when nothing filters a row.
-      const auto* scan = c.probes.empty() && c.access.filters.empty() ? std::get_if<physical::Scan>(&c.access.path) : nullptr;
+      const auto* scan = c.steps.empty() && c.access.filters.empty() ? std::get_if<physical::Scan>(&c.access.path) : nullptr;
       if (scan != nullptr && !agg->distinct && agg->fn == Expr::Fn::Count) {
         // Every entry of the range is a row to count, unless the argument can
         // be NULL in one: the WHERE compares every column it names, so those
@@ -1097,7 +1199,6 @@ private:
   const Catalog& cat_;
   const RowCounts& counts_;
   bool all_;
-  Refusals refusals_;
   std::map<std::uint32_t, double> rows_;
   std::vector<Catalog::PlanConstant> constants_;
   std::vector<physical::ResultColumn> result_;

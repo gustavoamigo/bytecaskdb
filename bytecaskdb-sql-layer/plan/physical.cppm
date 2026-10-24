@@ -7,9 +7,10 @@
 // Every id, type and constant name the printer needs is here, so it never
 // reads the catalog.
 //
-// The operators are Empty, the access paths, the joins, Filter, Limit, Aggregate
-// and the sinks: Emit for result rows, Insert, Update, Delete. No sort and no
-// hash join yet. check() enforces what the types can't express.
+// The operators are Empty, the access paths, the joins (an index nested
+// loop, and a nested loop read once), Filter, Limit, Aggregate and the
+// sinks: Emit for result rows, Insert, Update, Delete. No sort and no hash
+// join yet. check() enforces what the types can't express.
 
 module;
 #include <algorithm>
@@ -106,6 +107,15 @@ struct IndexJoin {
   std::vector<Expr> inner_key;  // in the inner primary key's order
 };
 
+// A nested loop whose inner side reads parameters alone: for the outer side's
+// one row, if it has one, every row of the inner scan, so the inner side is
+// read at most once. The outer side is a point lookup and lookups by key;
+// the inner side a scan, under the filters on its own table.
+struct NestedLoop {
+  NodePtr outer;
+  NodePtr inner;
+};
+
 // The rows every conjunct holds for, run as soon as the row is read. NULL
 // on either side of a comparison rejects the row. Never on a DOUBLE or REAL
 // column.
@@ -156,8 +166,8 @@ struct Delete {
 };
 
 struct Node {
-  std::variant<Empty, PointGet, Scan, NullSplitScan, CountRange, MinFirstEntry, IndexJoin, Filter, Limit, Emit,
-               Aggregate, Insert, Update, Delete>
+  std::variant<Empty, PointGet, Scan, NullSplitScan, CountRange, MinFirstEntry, IndexJoin, NestedLoop, Filter, Limit,
+               Emit, Aggregate, Insert, Update, Delete>
       op;
 };
 
@@ -284,6 +294,14 @@ private:
     return nullptr;
   }
 
+  // At most one row, read once: a point lookup, then lookups by key.
+  static auto one_row(const Node& n) -> bool {
+    if (std::holds_alternative<PointGet>(n.op)) return true;
+    if (const auto* j = std::get_if<IndexJoin>(&n.op)) return one_row(*j->outer);
+    if (const auto* f = std::get_if<Filter>(&n.op)) return one_row(*f->input);
+    return false;
+  }
+
   void node(const Node& n, const Node* parent) const {
     std::visit(
         [&](const auto& op) {
@@ -310,6 +328,18 @@ private:
             if (op.inner_key.empty()) broken("a join whose inner key has no part");
             for (const auto& e : op.inner_key) null_checked(e);
             node(*op.outer, &n);
+          } else if constexpr (std::is_same_v<T, NestedLoop>) {
+            if (!one_row(*op.outer)) broken("a nested loop whose outer side is not one row");
+            if (scan_below(*op.inner) == nullptr) broken("a nested loop whose inner side is not a scan");
+            for (const auto* in = op.inner.get(); const auto* f = std::get_if<Filter>(&in->op); in = f->input.get()) {
+              for (const auto& c : f->conjuncts) {
+                if (c.kind == Expr::Kind::Compare && c.args[1].kind == Expr::Kind::Column) {
+                  broken("a nested loop whose inner side reads a column of its outer side");
+                }
+              }
+            }
+            node(*op.outer, &n);
+            node(*op.inner, &n);
           } else if constexpr (std::is_same_v<T, Filter>) {
             for (const auto& c : op.conjuncts) {
               if (c.kind != Expr::Kind::Compare) continue;

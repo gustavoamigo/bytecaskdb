@@ -506,6 +506,9 @@ private:
   // Runs a DML statement on `cx`: autocommit, retried on a conflict, when
   // `txn` is null; else as a statement of `txn`, its writes added to it.
   auto run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn) -> Rows;
+  // Throws ParamError for parameters the plan does not take, and ExecError
+  // BC_C_RANGE for a value outside its parameter's SQL type.
+  static void check_params(const Compiled& c, const std::vector<Value>& params);
   static auto results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows;
   // An autocommit context: one per call in flight, kept for the next.
   [[nodiscard]] auto acquire_context() -> bc_ctx*;
@@ -1007,35 +1010,32 @@ auto Database::fitting_plan(bc_ctx* cx, const Statement& stmt, const std::vector
   return c;
 }
 
+// A value outside its parameter's SQL type is refused before the plan runs,
+// as PostgreSQL refuses a $n it cannot coerce at bind: even one a plan would
+// not read (a key whose other part is NULL). The parameters are checked
+// against the plan that will run, and so against the catalog it was
+// verified against: a DDL since the plan was compiled may have changed what
+// they are (an INTEGER key recreated as BIGINT).
+void Database::check_params(const Compiled& c, const std::vector<Value>& params) {
+  const auto& types = c.plan->param_types;
+  if (params.size() != types.size()) {
+    throw ParamError("statement takes " + std::to_string(types.size()) + " parameters, got " +
+                     std::to_string(params.size()));
+  }
+  for (std::size_t i = 0; i < params.size(); ++i) {
+    if (!datum_fits(params[i], types[i])) throw ParamError("parameter $" + std::to_string(i + 1) + " has the wrong type");
+  }
+  for (std::size_t i = 0; i < params.size(); ++i) {
+    const auto& sql = c.param_sql.at(i);
+    if (!sql) continue;  // assigned only: the row builder checks it, in column order
+    if (auto range = out_of_range(*sql, params[i])) {
+      throw ExecError(*range + " for parameter $" + std::to_string(i + 1), BC_E_CONSTRAINT,
+                      ConstraintDetail{BC_C_RANGE, c.param_table.at(i)}.encode());
+    }
+  }
+}
+
 auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& params, bc_txn* txn) -> Rows {
-  // Throws ParamError for parameters the plan does not take.
-  auto mismatch = [&](const Compiled& c) -> std::string {
-    const auto& types = c.plan->param_types;
-    if (params.size() != types.size()) {
-      return "statement takes " + std::to_string(types.size()) + " parameters, got " + std::to_string(params.size());
-    }
-    for (std::size_t i = 0; i < params.size(); ++i) {
-      if (!datum_fits(params[i], types[i])) return "parameter $" + std::to_string(i + 1) + " has the wrong type";
-    }
-    return {};
-  };
-  // A value outside its parameter's SQL type is refused before the plan
-  // runs, as PostgreSQL refuses a $n it cannot coerce at bind: even one a
-  // plan would not read (a key whose other part is NULL). The parameters are
-  // checked against the plan that will run, and so against the catalog it
-  // was verified against: a DDL since the plan was compiled may have changed
-  // what they are (an INTEGER key recreated as BIGINT).
-  auto check_params = [&](const Compiled& c) {
-    if (auto why = mismatch(c); !why.empty()) throw ParamError(why);
-    for (std::size_t i = 0; i < params.size(); ++i) {
-      const auto& sql = c.param_sql.at(i);
-      if (!sql) continue;  // assigned only: the row builder checks it, in column order
-      if (auto range = out_of_range(*sql, params[i])) {
-        throw ExecError(*range + " for parameter $" + std::to_string(i + 1), BC_E_CONSTRAINT,
-                        ConstraintDetail{BC_C_RANGE, c.param_table.at(i)}.encode());
-      }
-    }
-  };
   bc_params bp{params};
   if (txn != nullptr) {
     // The plan must fit the catalog the transaction pinned at its first
@@ -1067,7 +1067,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
       };
       auto incompatible = [&] { return bc_error(cx) == BC_E_LAYOUT && bc_error_detail(cx) == BC_L_INCOMPATIBLE; };
       try {
-        check_params(*c);
+        check_params(*c, params);
       } catch (...) {
         // Parameters a stale plan refuses may fit the plan it recompiles
         // to: only then is it checked before running.
@@ -1089,7 +1089,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
     }
   }
   auto c = fitting_plan(cx, stmt, params);
-  check_params(*c);
+  check_params(*c, params);
   auto r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget_, sync_commits_, kMaxRetries);
   // bc_ctx_run checks the plan against the catalog it pinned. A plan a DDL
   // made incompatible (BC_E_LAYOUT with BC_L_INCOMPATIBLE) is recompiled
@@ -1098,7 +1098,7 @@ auto Database::run(bc_ctx* cx, const Statement& stmt, const std::vector<Value>& 
   if (r == BC_FAILED && bc_error(cx) == BC_E_LAYOUT && bc_error_detail(cx) == BC_L_INCOMPATIBLE) {
     bc_ctx_reset(cx);
     c = recompile(stmt);
-    check_params(*c);
+    check_params(*c, params);
     r = bc_execute(cx, c->code->fn(), &c->ref, &bp, budget_, sync_commits_, kMaxRetries);
   }
   if (r == BC_CONFLICT) {
@@ -1300,15 +1300,11 @@ auto Database::alternatives_for_testing(std::string_view sql, const std::vector<
   std::vector<Rows> out;
   for (auto& plan : generate_alternatives(std::move(bound), *cat, sql, row_counts())) {
     if (!plan.returns_rows) throw std::logic_error("alternatives of a statement that writes");
-    const auto& types = plan.param_types;
-    if (params.size() != types.size()) throw ParamError("statement takes " + std::to_string(types.size()) + " parameters");
-    for (std::size_t i = 0; i < params.size(); ++i) {
-      if (!datum_fits(params[i], types[i])) throw ParamError("parameter $" + std::to_string(i + 1) + " has the wrong type");
-    }
     Compiled c;
     c.param_sql = param_sql;
     c.param_table = param_table;
     c.plan = std::make_unique<GeneratedPlan>(std::move(plan));
+    check_params(c, params);
     link(c);
     auto* cx = acquire_context();
     try {
