@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 6). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 7). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime

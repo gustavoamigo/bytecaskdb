@@ -8,6 +8,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -21,6 +22,11 @@ import bytecask.sql.tests.fixture;
 
 using namespace sql_test;
 using bytecask::sql::Bytes;
+using bytecask::sql::kCursorEntryBytes;
+using bytecask::sql::kGroupEntryBytes;
+using bytecask::sql::kKeyEntryBytes;
+using bytecask::sql::kRowEntryBytes;
+using bytecask::sql::kViewEntryBytes;
 using bytecask::sql::PhysType;
 
 namespace {
@@ -136,7 +142,7 @@ TEST_CASE("plan API: a cursor's views die when it steps", "[sql][algebra]") {
   }
   CHECK(run(f, keep_view_across_step, {}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
-  CHECK(std::string{bc_error_message(f.cx)}.find("cursor moved") != std::string::npos);
+  CHECK(std::string{bc_error_message(f.cx)}.find("loop moved on") != std::string::npos);
 }
 
 TEST_CASE("plan API: the budget ends a plan, and scans stay inside their table", "[sql][algebra]") {
@@ -524,8 +530,8 @@ auto memory_budget(std::uint64_t bytes) -> bc_budget { return {.max_reads = 0, .
 TEST_CASE("plan API: a statement is charged the bytes it holds, exactly, and past its budget fails with BC_E_LIMIT",
           "[sql][algebra][memory]") {
   Fixture f;
-  // An insert holds the row it built: its write set is not charged. Row 2
-  // is row 1's size, and measures it.
+  // An insert holds the row it built, its builder and its view: its write
+  // set is not charged. Row 2 is row 1's size, and measures it.
   auto row_key = [&](std::int64_t id) {
     Bytes k;
     bytecask::sql::key_put_prefix(k, bytecask::sql::kNsRow, kTbl);
@@ -537,16 +543,17 @@ TEST_CASE("plan API: a statement is charged the bytes it holds, exactly, and pas
   REQUIRE(f.db->get({}, row_key(2), stored));
   const auto key = row_key(1);
   std::vector<bc_value> row1{std::int64_t{1}, bytes("alice"), std::int64_t{5}};
-  CHECK(run(f, insert_plan_ok, row1, memory_budget(stored.size() - 1)) == BC_FAILED);
+  const auto insert_holds = kRowEntryBytes + stored.size() + kViewEntryBytes;
+  CHECK(run(f, insert_plan_ok, row1, memory_budget(insert_holds - 1)) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LIMIT);
   CHECK(std::string{bc_error_message(f.cx)}.find("memory budget") != std::string::npos);
   Bytes out;
   CHECK_FALSE(f.db->get({}, key, out));  // nothing committed
-  CHECK(run(f, insert_plan_ok, row1, memory_budget(stored.size())) == BC_COMMITTED);
+  CHECK(run(f, insert_plan_ok, row1, memory_budget(insert_holds)) == BC_COMMITTED);
   CHECK(f.db->get({}, key, out));
 
-  // A point read holds the key it built, the row it read and the result row
-  // with its 4-byte length.
+  // A point read holds the key it built, the row it read, a view of each,
+  // and the result row with its 4-byte length.
   const std::vector<PhysType> types{PhysType::I64, PhysType::Bytes, PhysType::I64};
   auto select = [&](bc_budget budget) {
     auto ps = params({std::int64_t{1}});
@@ -558,7 +565,7 @@ TEST_CASE("plan API: a statement is charged the bytes it holds, exactly, and pas
   const std::uint8_t* row = nullptr;
   std::uint32_t len = 0;
   REQUIRE(bc_ctx_next_result(f.cx, &row, &len));
-  const auto exact = key.size() + stored.size() + 4 + len;
+  const auto exact = key.size() + stored.size() + 2 * kViewEntryBytes + 4 + len;
   CHECK(select(memory_budget(exact)) == BC_COMMITTED);
   CHECK(f.results(types) == std::vector<std::vector<bc_value>>{row1});
   CHECK(select(memory_budget(exact - 1)) == BC_FAILED);
@@ -573,7 +580,135 @@ TEST_CASE("plan API: a scan holds one entry at a time against the memory budget"
   for (std::int64_t id = 1; id <= kRows; ++id) {
     REQUIRE(run(f, insert_plan_ok, {id, bytes("name-" + std::to_string(id)), id}) == BC_COMMITTED);
   }
-  // 50 rows hold over 1,000 bytes; a scan keeps only its bounds and the entry it is on.
-  CHECK(run(f, scan_all, {}, memory_budget(256)) == BC_COMMITTED);
+  // 50 rows and their views hold over 3,000 bytes; a scan keeps only its
+  // cursor, its bounds, the entry it is on and that entry's view.
+  CHECK(run(f, scan_all, {}, memory_budget(kCursorEntryBytes + 256)) == BC_COMMITTED);
   CHECK(bc_ctx_affected(f.cx) == kRows);
+}
+
+namespace {
+// What the statement held at each step of the plans below.
+std::vector<std::uint64_t> held_at_step;  // NOLINT: the plans are captureless
+
+// Every row of t, and per row: its key built and read again, a row built
+// from it, that row's key rebuilt and a column compared with param 0. What a
+// long scan holds, step by step: views, builders and copies in each step.
+void scan_holding(bc_ctx* cx) {
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  int64_t n = 0;
+  while (bc_scan_next(cx, c)) {
+    held_at_step.push_back(bc_ctx_held_for_testing(cx));
+    bc_view row = bc_scan_row(cx, c);
+    bc_key k = bc_key_begin(cx, kTbl);
+    bc_key_i64(cx, k, bc_col_i64(cx, row, kIdCol));
+    bool found = false;
+    bc_view again = bc_get(cx, bc_key_end(cx, k), &found);
+    bc_view built = bc_row_end(cx, bc_row_from(cx, kTbl, again));
+    if (found && bc_bytes_eq(cx, bc_row_key(cx, kTbl, built), bc_scan_key(cx, c)) &&
+        bc_bytes_eq(cx, bc_col_bytes(cx, built, kNameCol), bc_param_bytes(cx, 0))) {
+      n = bc_add(cx, n, 1);
+    }
+  }
+  bc_emit_count(cx, n);
+}
+
+// A join of t to itself, the inner row read by the primary key the outer
+// row gives, with a COUNT(DISTINCT) of the inner qty: the shape of #551.
+// The inner key, its builder, the inner row and the group key are the
+// outer step's.
+void self_join_distinct(bc_ctx* cx) {
+  bc_agg groups = bc_agg_open(cx, 0);
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    held_at_step.push_back(bc_ctx_held_for_testing(cx));
+    bc_view row = bc_scan_row(cx, c);
+    bool found = false;
+    bc_key k = bc_key_begin(cx, kTbl);
+    bc_key_i64(cx, k, bc_col_i64(cx, row, kIdCol));
+    bc_view inner = bc_get(cx, bc_key_end(cx, k), &found);
+    if (!found || bc_col_null(cx, inner, kQtyCol)) continue;
+    // An inner scan too, opened and run to its end within the outer step.
+    bc_view lo = bc_key_params(cx, kTbl, 0, 0);
+    bc_cursor ic = bc_scan_open(cx, kTbl, lo, lo, BC_SCAN_PREFIX);
+    if (bc_scan_next(cx, ic)) (void)bc_pin(cx, bc_scan_key(cx, ic));
+    bc_scan_close(cx, ic);
+    bc_agg_group(cx, groups, bc_col_key(cx, inner, kQtyCol));
+  }
+  int64_t n = 0;
+  while (bc_agg_next(cx, groups, 0, 0)) n = bc_add(cx, n, 1);
+  bc_emit_count(cx, n);
+}
+
+// The size of one int group key: the null marker and eight bytes.
+constexpr std::uint64_t kIntGroupKey = 9;
+std::uint64_t group_charge = 0;  // NOLINT: the plan is captureless
+// One group made, then found again: what each charged.
+void group_twice(bc_ctx* cx) {
+  bc_agg groups = bc_agg_open(cx, 0);
+  bc_view key = bc_key_params(cx, kTbl, 0, 1);
+  bool found = false;
+  bc_view row = bc_get(cx, key, &found);
+  bc_view group_key = bc_col_key(cx, row, kQtyCol);
+  auto before = bc_ctx_held_for_testing(cx);
+  (void)bc_agg_group(cx, groups, group_key);
+  group_charge = bc_ctx_held_for_testing(cx) - before;
+  (void)bc_agg_group(cx, groups, group_key);
+  bc_emit_count(cx, static_cast<int64_t>(bc_ctx_held_for_testing(cx) - before));
+}
+}  // namespace
+
+TEST_CASE("plan API: a long scan holds the same bytes at every step", "[sql][algebra][memory]") {
+  Fixture f;
+  constexpr std::int64_t kRows = 2000;
+  for (std::int64_t id = 1; id <= kRows; ++id) {
+    REQUIRE(run(f, insert_plan_ok, {id, bytes("name"), id}) == BC_COMMITTED);  // rows of one size
+  }
+  held_at_step.clear();
+  CHECK(run(f, scan_holding, {bytes("name")}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == kRows);
+  REQUIRE(held_at_step.size() == kRows);
+  // Each step's views, builders and copies went at the next step.
+  CHECK(std::ranges::all_of(held_at_step, [&](auto h) { return h == held_at_step.front(); }));
+  // So the scan runs in what one step holds, whatever the number of rows:
+  // each step makes over 300 bytes of handles and copies, 600 KB in all.
+  CHECK(run(f, scan_holding, {bytes("name")}, memory_budget(held_at_step.front() + 2048)) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == kRows);
+}
+
+TEST_CASE("plan API: a join's inner key, row and group key go when its outer row moves on (#551)",
+          "[sql][algebra][memory]") {
+  Fixture f;
+  constexpr std::int64_t kRows = 2000;
+  const std::string name(300, 'n');  // inner rows of 300 bytes and more
+  for (std::int64_t id = 1; id <= kRows; ++id) {
+    REQUIRE(run(f, insert_plan_ok, {id, bytes(name), id % 7}) == BC_COMMITTED);
+  }
+  held_at_step.clear();
+  CHECK(run(f, self_join_distinct, {}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == 7);
+  REQUIRE(held_at_step.size() == kRows);
+  // Once each of the seven groups is made, the outer step holds the same:
+  // only the pins grow, one key per outer row.
+  const auto first = held_at_step[7];
+  for (std::size_t i = 8; i < held_at_step.size(); ++i) {
+    INFO("step " << i);
+    REQUIRE(held_at_step[i] - held_at_step[i - 1] == held_at_step[8] - held_at_step[7]);
+  }
+  const auto per_pin = held_at_step[8] - held_at_step[7];
+  CHECK(per_pin < 64);  // a pin's key and its view: not an inner row
+  // 2,000 inner rows of over 300 bytes pass 600 KB; the join runs in a
+  // budget of a few: what one outer step holds and the pins.
+  const auto budget = first + kRows * per_pin + 4096;
+  CHECK(budget < 128u << 10);
+  CHECK(run(f, self_join_distinct, {}, memory_budget(budget)) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == 7);
+}
+
+TEST_CASE("plan API: an aggregate group is charged its key and the aggregate's own node", "[sql][algebra][memory]") {
+  Fixture f;
+  REQUIRE(run(f, insert_plan_ok, {std::int64_t{1}, bytes("n"), std::int64_t{5}}) == BC_COMMITTED);
+  CHECK(run(f, group_twice, {std::int64_t{1}}) == BC_COMMITTED);
+  CHECK(group_charge == kIntGroupKey + kGroupEntryBytes);
+  // Finding the group again charges nothing.
+  CHECK(bc_ctx_affected(f.cx) == static_cast<std::int64_t>(kIntGroupKey + kGroupEntryBytes));
 }

@@ -701,6 +701,7 @@ def test_a_compared_decimal_finer_than_its_scale_and_nan_are_refused(server):
     ["--sync", "AT_FILE_ROTATION"],
     ["--io-backend", "buffer_pool", "--buffer-pool-size", str(256 << 20), "--buffer-pool-direct-io", "on"],
     ["--io-backend", "MMAP"],
+    ["--statement-memory-bytes", str(1 << 20)],
 ])
 def test_sync_modes_and_io_backends_serve_and_keep_commits(flags):
     """--sync names the plugin's bytecaskdb_sync modes and --io-backend its
@@ -732,6 +733,29 @@ def test_sync_modes_and_io_backends_serve_and_keep_commits(flags):
         shutil.rmtree(directory, ignore_errors=True)
 
 
+def test_statement_memory_bytes_is_every_statement_s_budget():
+    """--statement-memory-bytes is DatabaseOptions::statement_memory_bytes
+    (docs/server_design.md, *Memory*): a statement whose result rows pass it
+    fails with 54000, and one within it runs."""
+    if not server_binary():
+        pytest.skip("BYTECASK_SQL_SERVER is not set: no server to test")
+    directory = tempfile.mkdtemp(prefix="bytecask_sql_mem_")
+    try:
+        s = Server(directory, extra_args=["--statement-memory-bytes", "4096"])
+        try:
+            c = connect(s)
+            table(c)
+            for k in range(1, 201):
+                assert states(run(c, "INSERT INTO t VALUES ($1, $2)", [str(k), "1"])) == []
+            assert states(run(c, "SELECT k, v FROM t WHERE k >= $1", ["1"])) == ["54000"]
+            assert len(data(run(c, "SELECT k, v FROM t WHERE k >= $1", ["191"]))) == 10
+            c.close()
+        finally:
+            assert s.stop() == 0
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 @pytest.mark.parametrize("flags, says", [
     (["--sync", "SOMETIMES"], "--sync"),
     (["--sync-interval-ms", "0"], "sync_interval_ms is 1 to 60000"),
@@ -741,6 +765,8 @@ def test_sync_modes_and_io_backends_serve_and_keep_commits(flags):
     (["--buffer-pool-size", "big"], "--buffer-pool-size"),
     (["--buffer-pool-direct-io", "maybe"], "--buffer-pool-direct-io"),
     (["--io-backend", "buffer_pool", "--buffer-pool-size", "1"], "buffer"),
+    (["--statement-memory-bytes", "lots"], "--statement-memory-bytes"),
+    (["--statement-memory-bytes", "0"], "statement_memory_bytes is at least 1"),
 ])
 def test_sync_and_io_flags_are_validated(flags, says):
     binary = server_binary()

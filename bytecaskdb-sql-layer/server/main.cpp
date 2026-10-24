@@ -7,6 +7,7 @@
 //   sql_layer_server --dir D [--listen 127.0.0.1:5432] [--database NAME] [--max-connections 100]
 //                     [--sync AT_EVERY_COMMIT|AT_INTERVAL|AT_FILE_ROTATION] [--sync-interval-ms 1000]
 //                     [--io-backend pread|mmap|buffer_pool] [--buffer-pool-size BYTES] [--buffer-pool-direct-io on|off]
+//                     [--statement-memory-bytes 67108864]
 //
 // Serves one database directory under one name, by default the directory's
 // last component. Trust authentication only: anyone who reaches the port is
@@ -65,7 +66,8 @@ auto flags(int argc, char** argv) -> std::map<std::string, std::string> {
   for (const auto& [k, v] : out) {
     if (k != "dir" && k != "listen" && k != "database" && k != "max-connections" && k != "sync" &&
         k != "sync-interval-ms" &&
-        k != "io-backend" && k != "buffer-pool-size" && k != "buffer-pool-direct-io") {
+        k != "io-backend" && k != "buffer-pool-size" && k != "buffer-pool-direct-io" &&
+        k != "statement-memory-bytes") {
       throw std::invalid_argument("unknown flag --" + k);
     }
   }
@@ -186,6 +188,14 @@ int main(int argc, char** argv) {
     }
     if (f.contains("buffer-pool-direct-io")) {
       db_opts.buffer_pool.direct_io = on_off("buffer-pool-direct-io", f["buffer-pool-direct-io"]);
+    }
+    if (f.contains("statement-memory-bytes")) {
+      const auto& v = f["statement-memory-bytes"];
+      auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), db_opts.statement_memory_bytes);
+      if (ec != std::errc{} || end != v.data() + v.size()) {
+        throw std::invalid_argument("--statement-memory-bytes takes a number of bytes");
+      }
+      // 0 is Database::open's to refuse, before the server listens.
     }
 
     // SIGINT and SIGTERM go to one thread, which wakes the accept loop
