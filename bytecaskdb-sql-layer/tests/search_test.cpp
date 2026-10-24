@@ -339,11 +339,12 @@ TEST_CASE("search: a table keyed by parameters alone is read once, before the ot
                        {"k"}});
   const auto& cat = f.cat();
   const std::string sql = "SELECT v FROM u, t WHERE k = $1 AND name = $2";
-  // u by its point lookup, 1; then t's 100 entries under name, each row
-  // fetched: 1 + 200. Scanning t first and looking u up for each of its 100
-  // rows would be 200 + 100.
+  // u by its point lookup, 1; then t's 100 entries under name, no row
+  // fetched, since nothing reads t's columns: 1 + 100. Scanning t first and
+  // looking u up for each of its 100 rows would be 200 + 100.
   auto once = plan_sql(cat, sql, {{"t", 1000}, {"u", 1000}});
-  CHECK(once.cost == Catch::Approx(201));
+  CHECK(once.cost == Catch::Approx(101));
+  CHECK_FALSE(has(once, "bc_scan_row"));
   auto get = once.source.find("bc_view row = bc_get(cx, bc_key_params(cx, TBL_");
   auto missing = once.source.find("if (!found) {\n    return;\n  }");
   auto scan = once.source.find("bc_scan_open(cx, IDX_");
@@ -363,6 +364,47 @@ TEST_CASE("search: a table keyed by parameters alone is read once, before the ot
   CHECK(all[0].source == once.source);
   CHECK(has(all[1], "bc_view row1 = bc_get(cx, bc_key_params(cx, TBL_"));
   CHECK(all[1].cost == Catch::Approx(300));
+}
+
+TEST_CASE("search: a table read once is filtered by the join's conjuncts, which its cost and rows count",
+          "[sql][search][cost]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{"u",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true),
+                        Fixture::col("dv", PhysType::F64, true)},
+                       {"k"}});
+  f.ddl(CreateTableDdl{"w",
+                       {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+                        Fixture::col("d", PhysType::F64, true)},
+                       {"k"}});
+  f.ddl(CreateIndexDdl{"w_a", "w", {{"a"}}});
+  const auto& cat = f.cat();
+  // u by its point lookup, then t's 100 entries under name, each row fetched
+  // for the join's conjunct: 1 + 200, and 1 x 100 x 1/10 rows. Under LIMIT 5
+  // that is 201 x 5 / 10. Scanning t first and looking u up for each of its
+  // rows: (200 + 100) x 5 / 10.
+  const std::string sql = "SELECT qty FROM u, t WHERE k = $1 AND name = $2 AND t.qty = u.v";
+  auto once = plan_sql(cat, sql, {{"t", 1000}, {"u", 1000}});
+  CHECK(once.cost == Catch::Approx(201));
+  CHECK(plan_sql(cat, sql + " LIMIT 5", {{"t", 1000}, {"u", 1000}}).cost == Catch::Approx(100.5));
+  // t's rows compared with u's row, inside t's loop.
+  auto scan = once.source.find("bc_view row1 = bc_scan_row(cx, c);");
+  auto joined = once.source.find("bc_col_i64(cx, row1, COL_");
+  REQUIRE(scan != std::string::npos);
+  REQUIRE(joined != std::string::npos);
+  CHECK(scan < joined);
+  CHECK(once.source.find("bc_col_i64(cx, row, COL_", joined) != std::string::npos);
+  // A join conjunct on DOUBLE columns is a filter neither order takes: w's
+  // key is named by nothing, and the conjunct filters w read once, or u
+  // looked up per row.
+  try {
+    (void)plan_sql(cat, "SELECT w.k FROM u, w WHERE u.k = $1 AND w.a = $2 AND w.d = u.dv");
+    FAIL("planned");
+  } catch (const ast::FeatureNotSupported& e) {
+    CHECK(std::string{e.what()} ==
+          "no plan: a filter on column \"d\", a REAL or DOUBLE PRECISION, is not supported yet");
+  }
 }
 
 TEST_CASE("search: a refusal names the failure of a plan of every table, not of one table's access",

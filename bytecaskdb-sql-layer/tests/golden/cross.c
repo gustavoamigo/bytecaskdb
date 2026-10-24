@@ -16,7 +16,6 @@ void plan(bc_ctx *cx) {
   bc_view lo = bc_key_params(cx, IDX_3, 1, 1);
   bc_cursor c = bc_scan_open(cx, IDX_3, lo, lo, BC_SCAN_PREFIX);
   while (bc_scan_next(cx, c)) {
-    bc_view row1 = bc_scan_row(cx, c);
     bc_emit_begin(cx);
     bc_emit_col(cx, row, COL_7_1);
     bc_emit_end(cx);

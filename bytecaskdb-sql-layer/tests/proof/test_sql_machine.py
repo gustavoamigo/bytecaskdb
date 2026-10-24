@@ -31,6 +31,9 @@ a key, and UPDATE and DELETE of every row a key's prefix or range reaches.
 Slice 5: filters on the columns a key does not take, bounds of $n ± k on
 INTEGER columns, COUNT(DISTINCT), and the join of a table reached by its
 parameters to one read by its primary key from the first one's columns.
+Planner slice 2: every plan the search costs agrees (alternatives agree),
+and a join of a table named by its key in parameters to one scanned by
+parameters, linked by an equality of columns neither key takes.
 
 The wire target (docs/server_design.md, *Tests*): with BYTECASK_SQL_SERVER
 set, every statement the layer runs also goes, as the same text with its
@@ -640,12 +643,14 @@ class SqlMachine(RuleBasedStateMachine):
 
     def join_on(self, a_name: str, b_name: str, where_a: list[tuple[str, str, object]],
                 keys_b: list[tuple[str, tuple[str, object]]], filters_b: list[tuple[str, str, object]],
-                targets: list[tuple[str, str]], limit: int | None = None, distinct: tuple[str, str] | None = None) -> None:
+                targets: list[tuple[str, str]], limit: int | None = None, distinct: tuple[str, str] | None = None,
+                links: list[tuple[str, str]] = ()) -> None:
         """SELECT targets (or COUNT(DISTINCT table.col)) FROM a, b WHERE a's
         conjuncts, each of b's key parts equal to a column of a ("col", name)
-        or to a parameter ("param", value), and b's filters: on both sides
-        when the planner serves it, else the layer must refuse it with no
-        plan."""
+        or to a parameter ("param", value), b's filters, and each link (b's
+        column, a's) an equality of a column b's key does not hold with a
+        column of a: on both sides when the planner serves it, else the layer
+        must refuse it with no plan."""
         a, b = self.tables[a_name], self.tables[b_name]
         conds, pg_conds, params, types = [], [], [], []
         def add(t, c, op, v):
@@ -666,6 +671,10 @@ class SqlMachine(RuleBasedStateMachine):
                 add(b, c, "=", v)
         for c, op, v in filters_b:
             add(b, c, op, v)
+        for c, v in links:
+            conds.append(f"{b_name}.{c} = {a_name}.{v}")
+            pg_conds.append(conds[-1])
+            on.append((v, c))
         select = f"count(DISTINCT {distinct[0]}.{distinct[1]})" if distinct else ", ".join(f"{t}.{c}" for t, c in targets)
         tail = f" LIMIT {limit}" if limit is not None else ""
         sql = f"SELECT {select} FROM {a_name}, {b_name} WHERE {' AND '.join(conds)}{tail}"
@@ -749,9 +758,15 @@ class SqlMachine(RuleBasedStateMachine):
         pool = free if free and data.draw(st.integers(0, 4), label="free name?") else TABLE_NAMES
         name = data.draw(st.sampled_from(pool), label="name")
         n = data.draw(st.integers(1, 4), label="columns")
+        # Now and then a type another table has, so joins find columns to
+        # compare.
+        taken = sorted({c.type.sql: c.type for t in self.tables.values() for c in t.columns}.items())
         columns = []
         for i in range(n):
-            ty = data.draw(st.sampled_from(TYPES), label=f"c{i} type")
+            if taken and data.draw(st.integers(0, 2), label=f"c{i} type taken?") == 0:
+                ty = data.draw(st.sampled_from(taken), label=f"c{i} type")[1]
+            else:
+                ty = data.draw(st.sampled_from(TYPES), label=f"c{i} type")
             nullable = data.draw(st.booleans(), label=f"c{i} nullable")
             default = data.draw(st.none() | default_values(ty), label=f"c{i} default")
             columns.append(Column(f"c{i}", ty, nullable, default))
@@ -1045,6 +1060,39 @@ class SqlMachine(RuleBasedStateMachine):
         columns = [(t.name, x.name) for t in (a, b) for x in t.columns]
         targets = data.draw(st.lists(st.sampled_from(columns), min_size=1, max_size=3, unique=True), label="targets")
         self.join_on(a_name, b_name, where_a, keys_b, filters_b, targets,
+                     limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"))
+
+    @precondition(lambda self: len(self.tables) >= 2)
+    @rule(data=st.data())
+    def join_read_once(self, data):
+        # b named by its whole primary key in parameters, a scanned by
+        # parameters, and an equality of columns neither key takes linking
+        # them: b read first and a's scan once, or a's scan with a lookup of
+        # b per row.
+        a_name, b_name = data.draw(st.permutations(sorted(self.tables)), label="tables")[:2]
+        a, b = self.tables[a_name], self.tables[b_name]
+        pairs = [(x.name, y.name) for x in b.columns if x.name not in b.pk
+                 for y in a.columns if y.type.sql == x.type.sql]
+        if not pairs:
+            return
+        links = data.draw(st.lists(st.sampled_from(pairs), min_size=1, max_size=2, unique=True), label="links")
+        rows_b = self.existing_rows(b)
+        row_b = data.draw(st.sampled_from(rows_b), label="b row") if rows_b and data.draw(st.integers(0, 3), label="b row?") else None
+        keys_b = []
+        for c in b.pk:
+            v = row_b[[x.name for x in b.columns].index(c)] if row_b is not None else data.draw(values(b.column(c).type), label=c)
+            keys_b.append((c, ("param", v)))
+        where_a, _, _ = self.where_on_a_path(data, a)
+        if not where_a:
+            return
+        columns = [(t.name, x.name) for t in (a, b) for x in t.columns]
+        if data.draw(st.integers(0, 3), label="COUNT(DISTINCT)?") == 0:
+            t = data.draw(st.sampled_from([a, b]), label="distinct of")
+            self.join_on(a_name, b_name, where_a, keys_b, [], [], links=links,
+                         distinct=(t.name, data.draw(st.sampled_from([x.name for x in t.columns]), label="column")))
+            return
+        targets = data.draw(st.lists(st.sampled_from(columns), min_size=1, max_size=3, unique=True), label="targets")
+        self.join_on(a_name, b_name, where_a, keys_b, [], targets, links=links,
                      limit=data.draw(st.none() | st.sampled_from([0, 1, 3]), label="limit"))
 
     @precondition(lambda self: self.txn is None)
@@ -1843,6 +1891,36 @@ def test_a_join_on_a_column(dsn):
             m.insert("t3", {"c0": c0, "c1": c1}, all_columns=True)
         m.join_on("t2", "t3", [("c0", ">=", 1)], [("c0", ("col", "c1"))], [], [("t2", "c0"), ("t3", "c1")])
         m.select("t2", [], [("c0", ">=", 1)], count="c1", distinct=True)
+    finally:
+        m.teardown()
+
+
+def test_a_table_read_once_joined_on_columns_neither_key_takes(dsn):
+    """FROM a, b with b named by its whole key in parameters, a scanned by
+    parameters, and equalities of columns neither key takes linking them:
+    b read once and a's scan under it, or a's scan with a lookup of b per
+    row. Every plan applies the links; a missing b row or a NULL joins
+    nothing; a link on DOUBLE columns has no plan."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER),
+                              Column("c2", o.DOUBLE), Column("c3", o.INTEGER)], ["c0"]))
+        m.create(Table("t1", [Column("c0", o.INTEGER, nullable=False), Column("c1", o.INTEGER, nullable=False),
+                              Column("c2", o.INTEGER), Column("c3", o.DOUBLE), Column("c4", o.INTEGER)], ["c0", "c1"]))
+        for c0, c1, c3 in ((1, 10, 7), (2, 20, 8), (3, None, 7)):
+            m.insert("t0", {"c0": c0, "c1": c1, "c2": 1.5, "c3": c3}, all_columns=True)
+        for c1, c2, c4 in ((1, 10, 7), (2, 20, 7), (3, None, 7), (4, 10, 8), (5, 30, 7), (6, 10, 7)):
+            m.insert("t1", {"c0": 1, "c1": c1, "c2": c2, "c3": 1.5, "c4": c4}, all_columns=True)
+        targets = [("t1", "c1"), ("t0", "c1")]
+        for key in (1, 2, 3, 9, None):
+            keys = [("c0", ("param", key))]
+            for where in ([("c0", "=", 1)], [("c0", "=", 1), ("c1", ">=", 2), ("c1", "<", 6)], [("c0", "=", None)]):
+                m.join_on("t1", "t0", where, keys, [], targets, links=[("c1", "c2")])
+                m.join_on("t1", "t0", where, keys, [], targets, links=[("c1", "c2"), ("c3", "c4")])
+                m.join_on("t1", "t0", where, keys, [], [], links=[("c1", "c2")], distinct=("t1", "c1"))
+                m.join_on("t1", "t0", where, keys, [], targets, links=[("c1", "c2")], limit=1)
+            # On DOUBLE columns: no plan.
+            m.join_on("t1", "t0", [("c0", "=", 1)], keys, [], targets, links=[("c2", "c3")])
     finally:
         m.teardown()
 

@@ -1,11 +1,11 @@
 # The planner: a logical algebra, a search, and compiled pipelines
 
-Status: **design, approved (owner, 2026-10-24); slices 1 and 2 built,
-slice 2 without its choice points** (*Slice 1 as built*, *Slice 2 as
-built*): the pipeline, then System R's search with the cost model.
-*Memory* is built too: the statement budget and the lifetime rule
-(`plan_api_design.md`, revision 7), and #551 with it; the choice points
-(*Choosing at run time*) and slices 3 to 5 are not. The first of the
+Status: **design, approved (owner, 2026-10-24); slices 1 and 3 built,
+and slice 2 but for its choice points** (*Slice 1 as built*, *Slice 2 as
+built*): the pipeline, then System R's search with the cost model, and
+slice 3, *Memory*: the statement budget and the lifetime rule
+(`plan_api_design.md`, revision 7), and #551 with it. The choice points
+(*Choosing at run time*) and slices 4 and 5 are not built. The first of the
 post-MVP designs (#487, *Next*). The parser, the plan API and TinyCC are
 unchanged; the binder's output changed.
 
@@ -650,8 +650,10 @@ Anything else is refused (*What the search refuses*).
 - A scan of the primary key and of each index whose first part is
   compared: the equality prefix, the range on the next part, forward or
   reverse, covering when every column read is in the key and no filter
-  reads the row. A scan of the whole primary key by equality is the point
-  lookup, not built twice.
+  reads the row. A table read once under one row (*Joins*) is covering
+  when nothing reads its columns: no result, aggregate or join conjunct.
+  A scan of the whole primary key by equality is the point lookup, not
+  built twice.
 - No full scan (slice 4).
 
 **Joins.** Left-deep, bottom up over sets of tables: each set of k tables
@@ -661,7 +663,9 @@ from each set of k − 1 and one more table, read one of two ways:
 - by its own scan, from parameters alone, when the tables already read give
   at most one row (a point lookup, then lookups by key): a nested loop
   (`NestedLoop`) that reads it once, and not at all when that row is
-  missing.
+  missing. The join's conjuncts between it and the tables already read
+  filter its rows, as they filter a lookup's, refused on a DOUBLE or REAL
+  column alike.
 
 The search keeps the cheapest plan per set, the first of equals, so `FROM`
 order breaks ties, and the cheapest of at most one row apart, which the
@@ -703,7 +707,9 @@ a plan beside the loop over the same scan, and costs decide between them.
   equality-compared part × 1/3 per range bound. It reaches at most 1 when
   the prefix covers a unique index's columns, and at least 1.
 - **Rows.** A plan's entries, or 1 for a point lookup, × 1/10 per filter by
-  `=` and 1/3 per other filter.
+  `=` and 1/3 per other filter. A join's rows are the outer plan's × the
+  inner side's (1 for a lookup by key), its join conjuncts counted as
+  filters, whether the inner side is looked up or read once.
 - **A table's rows** are counted when the plan is compiled: `Database`
   counts each table's primary key on one snapshot, as `bc_count_range`
   does, at most two record reads each. Every `WHERE` operand in today's
@@ -793,14 +799,23 @@ PostgreSQL runs each of these; it is the one entry of `frontend_design.md`'s
   (the test build) runs each on its own snapshot. The proof machine runs
   them after every `SELECT`, aggregate and join it compares with
   PostgreSQL, in autocommit, and checks each plan's rows as it checks the
-  layer's. An embedded-API test does the same in C++.
+  layer's. An embedded-API test does the same in C++. The machine
+  generates the join where both ways apply: a table named by its key in
+  parameters, the other scanned by parameters, and an equality of columns
+  neither key takes linking them (`join_read_once`); now and then a new
+  table takes a column type another has, so joins find columns to
+  compare.
 - **Choices** (`search_test`). Fixed counts choose the join order; a
   range's count chooses `COUNT` from the keys or by a loop; an `ORDER BY`
   keeps the plan in its order where another costs less, and a `LIMIT`
   cuts its cost; a point lookup beats a unique index's one entry, and a
   covering scan a fetching one; a table keyed by parameters alone is read
-  once, before the other's scan; a refusal names the failure of a plan of
-  every table.
+  once, before the other's scan, covering when nothing reads it, and the
+  join's conjuncts filter it and its rows; a refusal names the failure of a
+  plan of every table.
+- **`physical::check`** (`physical_test`): a nested loop's outer side is
+  one row, its inner side a scan, and an inner filter reads no column but
+  the outer side's.
 - **The search's model** in the proof machine (`served`, `join_served`)
   says whether some plan serves a statement, as the search now does.
 - **The harness**, 2 warehouses, 4 threads, 30 s: 237,014 TPM, 106,092

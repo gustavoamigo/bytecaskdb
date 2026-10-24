@@ -110,7 +110,8 @@ struct IndexJoin {
 // A nested loop whose inner side reads parameters alone: for the outer side's
 // one row, if it has one, every row of the inner scan, so the inner side is
 // read at most once. The outer side is a point lookup and lookups by key;
-// the inner side a scan, under the filters on its own table.
+// the inner side a scan, under the filters on its own table and the join's,
+// which compare its columns with the outer side's.
 struct NestedLoop {
   NodePtr outer;
   NodePtr inner;
@@ -302,6 +303,14 @@ private:
     return false;
   }
 
+  // Whether a one-row side reads `table`.
+  static auto reads_table(const Node& n, std::uint32_t table) -> bool {
+    if (const auto* g = std::get_if<PointGet>(&n.op)) return g->table == table;
+    if (const auto* j = std::get_if<IndexJoin>(&n.op)) return j->inner == table || reads_table(*j->outer, table);
+    if (const auto* f = std::get_if<Filter>(&n.op)) return reads_table(*f->input, table);
+    return false;
+  }
+
   void node(const Node& n, const Node* parent) const {
     std::visit(
         [&](const auto& op) {
@@ -333,8 +342,9 @@ private:
             if (scan_below(*op.inner) == nullptr) broken("a nested loop whose inner side is not a scan");
             for (const auto* in = op.inner.get(); const auto* f = std::get_if<Filter>(&in->op); in = f->input.get()) {
               for (const auto& c : f->conjuncts) {
-                if (c.kind == Expr::Kind::Compare && c.args[1].kind == Expr::Kind::Column) {
-                  broken("a nested loop whose inner side reads a column of its outer side");
+                if (c.kind == Expr::Kind::Compare && c.args[1].kind == Expr::Kind::Column &&
+                    !reads_table(*op.outer, c.args[1].col.table)) {
+                  broken("a nested loop whose inner filter reads a column outside its outer side");
                 }
               }
             }

@@ -288,7 +288,10 @@ TEST_CASE("codegen: a join is of two point lookups, in FROM order", "[sql][codeg
   REQUIRE(lookup != std::string::npos);
   REQUIRE(scan != std::string::npos);
   CHECK(lookup < scan);
-  CHECK(cross.source.find("bc_view row1 = bc_scan_row(cx, c);") != std::string::npos);
+  // Nothing reads t's columns: its scan covers, and reads no row.
+  CHECK(cross.source.find("bc_scan_row") == std::string::npos);
+  auto read = generate(f.cat(), "SELECT v, qty FROM u, t WHERE k = $1 AND name = $2");
+  CHECK(read.source.find("bc_view row1 = bc_scan_row(cx, c);") != std::string::npos);
   // A join on a column: the outer table reached from its parameters, the
   // inner one read by its whole primary key from the outer row.
   auto loop = generate(f.cat(), "SELECT v FROM t, u WHERE name >= $1 AND k = qty");
